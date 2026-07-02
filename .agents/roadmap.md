@@ -16,7 +16,10 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
   v0.49.0), CI workflow (CPU build + tests), directory tree per design §4.
   DoD: green CI on empty-ish lib.
 - ☐ **M0.2 vt runtime core**: Tensor/dtype/device, step arena + persistent
-  buffers, op dispatch table, CPU scalar reference ops. DoD: op unit tests.
+  buffers, op dispatch table, CPU scalar reference ops. Interface MUST meet
+  the portability requirements in [backends.md](backends.md) (open device
+  enum, unified-memory awareness, per-device queue handles, optional
+  graph-capture hook). DoD: op unit tests.
 - ☐ **M0.3 Parity harness**: `tools/parity/` dump scripts (upstream vLLM on
   dgx.casa produces golden op/layer/logits dumps); C++ test loader +
   threshold framework. DoD: harness runs end-to-end on one op both backends.
@@ -100,4 +103,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 Dense/MoE model families (Llama/Qwen3/Mixtral…) · MTP spec decode · fp8 ·
 sliding window · priority scheduling · YaRN · prompt_logprobs/logit_bias/
 bad_words · tokenize endpoints · full metrics · Qwen3-Next. Then T2 per
-[porting-inventory.md](porting-inventory.md).
+[porting-inventory.md](porting-inventory.md), including backend expansion
+per [backends.md](backends.md): Apple Metal (explorations E1 MLX vs E2
+native MSL first), Vulkan, Intel XPU (loyal port of upstream
+`platforms/xpu`), ANE for encoder/pooling classes (E3).

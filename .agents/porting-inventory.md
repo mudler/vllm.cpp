@@ -236,6 +236,12 @@ server binary), `examples/bench`.
    → C ABI callback registries, added per tier.
 5. **GGUF as a first-class input** (upstream treats it as one loader among many;
    for us it is a gate, including NVFP4 GGUF extension types).
+6. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
+   no equivalent under `vllm/platforms/`; we add them through the mirrored
+   Platform/AttentionBackend/vt-op seams so they behave as vLLM platforms
+   would. Intel is NOT a deviation (upstream `platforms/xpu.py` is ported
+   loyally). Strategy, explorations (MLX, ANE), and binding vt:: interface
+   requirements: `backends.md`.
 
 ## 10. E2E test suites (T0 deliverable)
 

@@ -28,6 +28,10 @@ grammars, streaming/non-streaming, and e2e test suites.
   patch series, environment TODOs.
 - [.agents/vllm-v1-v2.md](.agents/vllm-v1-v2.md) — V1 engine vs "Model Runner
   V2" terminology; we port MRV2.
+- [.agents/backends.md](.agents/backends.md) — backend portability strategy
+  (CUDA/CPU now; Metal, Vulkan, Intel XPU later) via vLLM's own Platform +
+  attention-backend seams; MLX/ANE explorations; binding vt:: interface
+  requirements for M0.2.
 - [.agents/workflow.md](.agents/workflow.md) — **agent operating manual**:
   session protocol, Definition of Done, practicalities.
 - [.agents/porting-inventory.md](.agents/porting-inventory.md) — **living

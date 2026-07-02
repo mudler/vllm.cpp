@@ -26,5 +26,15 @@
   13.0.88, cubin confirmed, smoke kernel ran on GB10, 2/2 tests), CI green
   on GitHub Actions (run 28625582067 for `411c072`). Vendored: doctest
   v2.5.2, nlohmann/json v3.12.0, cpp-httplib v0.49.0. CI access was
-  restored by adding localai-bot as collaborator. NEXT: M0.2 vt runtime
-  core (Tensor/dtype/device, arena, op dispatch, CPU scalar ops).
+  restored by adding localai-bot as collaborator. Final whole-branch review:
+  READY TO CLOSE; deferred minors triaged (BUILD_INTERFACE → M3.5;
+  vllm_test_main warnings + CMake nits → opportunistic in M0.2; smoke.cu
+  placeholder dies in M0.2). NEXT: M0.2 vt runtime core (Tensor/dtype/
+  device, arena, op dispatch, CPU scalar ops).
+- **2026-07-02 (later)** — Backend portability scoped (user): Metal (MLX vs
+  native MSL exploration, ANE for encoder-class only), Vulkan, Intel XPU —
+  strategy in new `backends.md`; portability confined to vLLM's own seams
+  (platforms/ + attention backends + vt op tables); binding vt:: interface
+  requirements added to M0.2 roadmap unit; implementations post-MVP (D10 in
+  design doc; deviation §9.6 for Metal/Vulkan extensions). NVIDIA gate
+  unchanged.

@@ -49,6 +49,13 @@ architectures and quant methods, torch.compile-equivalent graph compilation.
 - **D9 — Port Model Runner V2** (`vllm/v1/worker/gpu/`), not the legacy
   runner: upstream converges on it; PR-portability demands we sit where
   development happens.
+- **D10 — Multi-backend by vLLM's own seams** (user): the architecture must
+  accommodate Apple Metal (MLX/ANE explorations), Vulkan, and Intel XPU
+  without touching engine code — portability lives exclusively in the
+  mirrored `platforms/` + attention-backend registries + vt:: op tables.
+  Binding vt:: interface requirements and per-platform strategy:
+  `.agents/backends.md`. Implementations are post-MVP; the NVIDIA gate is
+  not delayed.
 
 ## 3. Approaches considered (compute layer)
 

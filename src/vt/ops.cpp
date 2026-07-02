@@ -59,10 +59,11 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
   if (residual != nullptr) {
     VT_CHECK(residual->dtype == DType::kF32 && residual->rank == 2 &&
                  residual->shape[0] == x.shape[0] && residual->shape[1] == x.shape[1] &&
-                 residual->IsContiguous(),
-             "rmsnorm: residual must be f32 [T,H] contiguous");
+                 residual->IsContiguous() && residual->device == x.device,
+             "rmsnorm: residual must be f32 [T,H] contiguous on x's device");
   }
-  VT_CHECK(x.device == out.device && x.device == q.device, "rmsnorm: device mismatch");
+  VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
+           "rmsnorm: device mismatch (x/out/weight/queue)");
   reinterpret_cast<RmsNormFn>(GetOp(OpId::kRmsNorm, q.device.type))(q, out, x, weight, args,
                                                                     residual);
 }

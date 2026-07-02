@@ -22,6 +22,9 @@ struct RmsNormArgs {
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma).
 // With residual != nullptr (f32 [T,H]): residual += x first (new residual
 // stream), and that sum is what gets normalized (upstream fused_add_rms_norm).
+// Note: unlike upstream forward_native, the standard path keeps full f32 precision
+// (no x.to(weight.dtype) rounding before the weight multiply); parity tests vs
+// upstream bf16 need bf16-eps tolerance on the non-gemma path.
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 

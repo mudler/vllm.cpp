@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <vector>
 
 #include "vt/ops.h"
@@ -86,4 +87,18 @@ TEST_CASE("rmsnorm multi-row normalizes independently") {
   vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false});
   CHECK(out[0] == doctest::Approx(0.848528f));  // row 0
   CHECK(out[2] == doctest::Approx(0.848528f));  // row 1 same direction
+}
+
+TEST_CASE("rmsnorm accepts bf16 inputs via f32 conversion") {
+  // bf16(3.0)=0x4040, bf16(4.0)=0x4080 are exact; w bf16(1.0)=0x3F80
+  std::vector<uint16_t> x = {0x4040, 0x4080};
+  std::vector<uint16_t> w = {0x3F80, 0x3F80};
+  std::vector<float> out(2, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kBF16, Cpu(), {1, 2});
+  Tensor tw = Tensor::Contiguous(w.data(), DType::kBF16, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false});
+  CHECK(out[0] == doctest::Approx(0.848528f));
+  CHECK(out[1] == doctest::Approx(1.131371f));
 }

@@ -22,6 +22,10 @@ and continue. Follow this protocol every session.
    - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,
      upstream refs);
    - [roadmap.md](roadmap.md) unit status updated;
+   - **`README.md` support tables** (architectures / acceleration /
+     quantization) updated whenever a change alters what is supported, its
+     status, or its tested formats — a family/backend becomes ✅ only when
+     parity-tested per [discipline.md](discipline.md);
    - [state.md](state.md) entry appended (what landed, what's next);
    - commit + push to `main` (user-authorized, for now).
 

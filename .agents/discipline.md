@@ -13,7 +13,7 @@
 - **Every ported file carries a header comment**: upstream path + upstream
   commit hash it was ported from. When re-syncing with upstream, diff that
   file against its recorded commit.
-- **Deviations are exceptional and recorded** in `docs/porting-inventory.md`
+- **Deviations are exceptional and recorded** in `.agents/porting-inventory.md`
   §9 (currently: compute layer replaces torch/Triton with `vt::`; in-process
   queues replace ZMQ; cpp-httplib replaces FastAPI; C-ABI plugins replace
   Python plugins; GGUF promoted to first-class).

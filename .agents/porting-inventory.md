@@ -1,10 +1,26 @@
-# vLLM → vllm.cpp Porting Inventory
+# vLLM → vllm.cpp Porting Inventory (living parity record)
 
-**Upstream reference:** `/home/mudler/_git/vllm` @ `e24d1b24` (2026-07-02, master).
+**Upstream reference:** `/home/mudler/_git/vllm` @ sync point in
+[upstream-sync.md](upstream-sync.md).
 **Rule:** every item lists its upstream path. We port features/capabilities 1:1 —
 same algorithms, same semantics, same names — so that future upstream PRs can be
 translated mechanically. Deviations (there are few, all forced by the no-Python
 constraint) are recorded in §9.
+
+**This document is kept up to date at all times** — it is the static record of
+what vLLM has vs what we have:
+
+- **Status markers**, appended inline to any item as work lands:
+  (none) = not started · 🚧 `<our-commit>` = in progress · ✅ `<our-commit>` =
+  ported & parity-tested. Optionally suffix upstream references:
+  `(vllm#12345)` for the upstream PR(s) an item's behavior comes from.
+- **Every PR/change we introduce** must (a) flip the relevant markers here and
+  (b) append a row to [parity-ledger.md](parity-ledger.md) recording what the
+  change does compared to vLLM, with upstream paths/PR references where they
+  exist. No change to engine behavior merges without its ledger row.
+- When the upstream sync point advances and brings new features, add them here
+  (with their vLLM PR references) in the right tier — the inventory tracks what
+  vLLM has, even for things we haven't scheduled.
 
 **Tiers**
 - **T0 — the Gate.** Everything required to (a) serve Qwen3.6-35B-A3B (NVFP4) and

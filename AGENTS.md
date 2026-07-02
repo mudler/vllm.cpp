@@ -26,17 +26,22 @@ grammars, streaming/non-streaming, and e2e test suites.
   patch series, environment TODOs.
 - [.agents/vllm-v1-v2.md](.agents/vllm-v1-v2.md) — V1 engine vs "Model Runner
   V2" terminology; we port MRV2.
-- [.agents/workflow.md](.agents/workflow.md) — how we work (design-first,
-  TDD/parity, benchmarking honesty, push policy).
+- [.agents/workflow.md](.agents/workflow.md) — **agent operating manual**:
+  session protocol, Definition of Done, practicalities.
+- [.agents/porting-inventory.md](.agents/porting-inventory.md) — **living
+  parity record**: full vLLM feature/architecture inventory, T0 (gate) / T1 /
+  T2 / T3 tiers, upstream paths, inline status markers. Kept up to date with
+  every change.
+- [.agents/parity-ledger.md](.agents/parity-ledger.md) — **append-only
+  ledger**: one row per change we introduce — what it does vs vLLM, upstream
+  PR/commit references, how parity was verified.
+- [.agents/roadmap.md](.agents/roadmap.md) — engineer's work breakdown:
+  milestones M0–M3 as pick-up-able units with DoD; status kept current.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
   decisions, next steps. Update this every working session.
 
 ## Canonical documents (outside .agents/)
 
-- [docs/porting-inventory.md](docs/porting-inventory.md) — the full vLLM
-  feature/architecture inventory with T0 (gate) / T1 / T2 / T3 tier
-  assignments and upstream paths. The porting checklist; keep tiers updated
-  as items land.
 - [docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md](docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md)
   — core architecture design (vt:: tensor runtime, engine mirroring,
   performance plan for the parity gate, milestones M0–M3).

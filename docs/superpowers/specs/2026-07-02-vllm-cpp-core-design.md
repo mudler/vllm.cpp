@@ -3,7 +3,7 @@
 **Date:** 2026-07-02 (rev 2 — gates redefined by user)
 **Status:** Draft — awaiting user review
 **Upstream:** `/home/mudler/_git/vllm` @ `e24d1b24` (2026-07-02, master)
-**Companion:** `docs/porting-inventory.md` (full feature inventory, tiers T0–T3),
+**Companion:** `.agents/porting-inventory.md` (full feature inventory, tiers T0–T3),
 `AGENTS.md` (canonical state + discipline)
 
 ## 1. Goal & gates
@@ -144,7 +144,7 @@ poisoned (matching upstream EngineDeadError semantics).
 
 ## 7. Testing (gate #5)
 
-The five suites from `docs/porting-inventory.md` §10: op parity (upstream
+The five suites from `.agents/porting-inventory.md` §10: op parity (upstream
 golden dumps; CPU + CUDA), engine behavioral (ported `tests/v1/core/`
 semantics incl. hybrid-group allocation), model parity (logits + greedy
 token-for-token on Qwen3-0.6B fast / gate models nightly; safetensors, NVFP4

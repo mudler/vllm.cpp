@@ -3,20 +3,35 @@ project(vllm_cpp VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
-option(VLLM_CPP_CUDA "Build the CUDA backend (auto-detected if unset)" OFF)
+set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121" CACHE STRING "Target CUDA architectures (GB10=121)")
 
+# Resolve the tri-state VLLM_CPP_CUDA into a plain ON/OFF. The normal variable
+# set below intentionally shadows the cache entry so later if(VLLM_CPP_CUDA)
+# checks see the resolved value while the user's cached choice is preserved.
 include(CheckLanguage)
-if(NOT VLLM_CPP_CUDA)
+if(VLLM_CPP_CUDA STREQUAL "AUTO")
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
-    message(STATUS "CUDA toolchain found; enabling VLLM_CPP_CUDA")
+    message(STATUS "CUDA toolchain found; enabling CUDA backend")
     set(VLLM_CPP_CUDA ON)
+  else()
+    set(VLLM_CPP_CUDA OFF)
   endif()
+elseif(VLLM_CPP_CUDA)
+  check_language(CUDA)
+  if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR "VLLM_CPP_CUDA=ON but no CUDA compiler was found. "
+      "Install the CUDA toolkit or configure with -DVLLM_CPP_CUDA=OFF (or AUTO).")
+  endif()
+  set(VLLM_CPP_CUDA ON)
+else()
+  set(VLLM_CPP_CUDA OFF)
 endif()
 if(VLLM_CPP_CUDA)
   enable_language(CUDA)
@@ -26,7 +41,7 @@ endif()
 
 include(cmake/CompilerWarnings.cmake)
 
-configure_file(include/vllm/version.h.in include/vllm/version.h)
+configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
 add_library(vllm STATIC
   src/vllm/version.cpp)

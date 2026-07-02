@@ -15,3 +15,4 @@ Columns:
 | Date / commit | What it does | Upstream equivalent | Parity status |
 |---|---|---|---|
 | 2026-07-02 `462d673` | Project record + inventory established (docs only) | — (meta) | n/a |
+| 2026-07-02 `411c072` | Build skeleton: libvllm static lib, doctest/ctest harness, optional CUDA (sm_121 verified on GB10), CPU CI | — (build infra; no engine behavior; upstream has setup.py/cmake in csrc — not mirrored, deviation §9 compute layer) | CPU ctest + GB10 CUDA smoke + green CI run |

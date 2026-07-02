@@ -11,9 +11,10 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 
 ## M0 — Model correctness on CUDA (single request, greedy)
 
-- ☐ **M0.1 Build skeleton**: CMake (host + CUDA sm_121), third_party vendoring
-  (cpp-httplib, nlohmann/json), CI workflow (CPU build + tests), directory
-  tree per design §4. DoD: green CI on empty-ish lib.
+- ✅ **M0.1 Build skeleton** (`411c072`): CMake (host + CUDA sm_121),
+  third_party vendoring (doctest v2.5.2, nlohmann/json v3.12.0, cpp-httplib
+  v0.49.0), CI workflow (CPU build + tests), directory tree per design §4.
+  DoD: green CI on empty-ish lib.
 - ☐ **M0.2 vt runtime core**: Tensor/dtype/device, step arena + persistent
   buffers, op dispatch table, CPU scalar reference ops. DoD: op unit tests.
 - ☐ **M0.3 Parity harness**: `tools/parity/` dump scripts (upstream vLLM on

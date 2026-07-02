@@ -21,3 +21,10 @@
   headers, and a repeatable 7-step sync cycle (enumerate → classify
   PORT-NOW/INVENTORY/IGNORE → report under `.agents/sync/` → port → re-verify
   → advance pin). Sync tooling + recurring cycle added to roadmap.
+- **2026-07-03** — M0.1 done: repo builds as `libvllm` with tests
+  (doctest/ctest), optional CUDA verified on dgx.casa at sm_121 (nvcc
+  13.0.88, cubin confirmed, smoke kernel ran on GB10, 2/2 tests), CI green
+  on GitHub Actions (run 28625582067 for `411c072`). Vendored: doctest
+  v2.5.2, nlohmann/json v3.12.0, cpp-httplib v0.49.0. CI access was
+  restored by adding localai-bot as collaborator. NEXT: M0.2 vt runtime
+  core (Tensor/dtype/device, arena, op dispatch, CPU scalar ops).

@@ -2,11 +2,13 @@
 
 - **Dev box (no GPU)**: CPU reference backend + engine logic + CI development.
 - **GPU box**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
-  ~119 GB unified memory, 20 cores, CUDA 12.1-era toolkit (verify with
-  `nvcc --version` before kernel work). Unified memory: both gate models fit
+  ~119 GB unified memory, 20 cores, CUDA toolkit 13.0.88 (nvcc); compute
+  capability 12.1 → sm_121. Unified memory: both gate models fit
   in bf16; the machine is memory-bandwidth-bound (~273 GB/s class) — decode
   parity is a bandwidth/launch-overhead game, hence CUDA graphs + fused
   kernels in T0. Keep build/bench artifacts in `~/work/vllm.cpp/` there.
+  - Non-interactive SSH does not put nvcc on PATH — prepend
+    `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
 
 ## Benchmark models on dgx.casa
 

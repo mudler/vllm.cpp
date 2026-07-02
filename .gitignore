@@ -1,0 +1,9 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+*.o
+*.a
+*.so
+.venv/
+__pycache__/

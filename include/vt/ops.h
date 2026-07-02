@@ -14,4 +14,15 @@ void* GetOp(OpId op, DeviceType device);
 // f32 accumulation, all contiguous, same device.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
+struct RmsNormArgs {
+  float eps = 1e-6f;
+  bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma).
+// With residual != nullptr (f32 [T,H]): residual += x first (new residual
+// stream), and that sum is what gets normalized (upstream fused_add_rms_norm).
+void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+             const RmsNormArgs& args, Tensor* residual = nullptr);
+
 }  // namespace vt

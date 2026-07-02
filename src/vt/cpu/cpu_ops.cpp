@@ -1,6 +1,8 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
 
+#include <cmath>
+
 namespace vt::cpu {
 namespace {
 
@@ -27,9 +29,35 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   }
 }
 
+void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                   const RmsNormArgs& args, Tensor* residual) {
+  const int64_t t = x.shape[0], h = x.shape[1];
+  float* o = out.Ptr<float>();
+  for (int64_t i = 0; i < t; ++i) {
+    float* res_row = residual ? residual->Ptr<float>() + i * h : nullptr;
+    float sumsq = 0.0f;
+    for (int64_t j = 0; j < h; ++j) {
+      float v = LoadF32(x, i * h + j);
+      if (res_row) {
+        v += res_row[j];
+        res_row[j] = v;  // new residual stream
+      }
+      sumsq += v * v;
+    }
+    float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
+    for (int64_t j = 0; j < h; ++j) {
+      float v = res_row ? res_row[j] : LoadF32(x, i * h + j);
+      float wj = LoadF32(w, j);
+      if (args.gemma) wj += 1.0f;
+      o[i * h + j] = v * inv * wj;
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmul, DeviceType::kCPU, reinterpret_cast<void*>(&MatmulKernel));
+    RegisterOp(OpId::kRmsNorm, DeviceType::kCPU, reinterpret_cast<void*>(&RmsNormKernel));
   }
 } registrar;
 

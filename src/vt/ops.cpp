@@ -44,4 +44,27 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
 }
 
+using RmsNormFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+
+void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+             const RmsNormArgs& args, Tensor* residual) {
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1, "rmsnorm: x/out rank-2, w rank-1");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1], "rmsnorm: shape mismatch");
+  VT_CHECK(weight.shape[0] == x.shape[1], "rmsnorm: weight size mismatch");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && out.dtype == DType::kF32,
+           "rmsnorm: float in, f32 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
+           "rmsnorm: contiguous required");
+  if (residual != nullptr) {
+    VT_CHECK(residual->dtype == DType::kF32 && residual->rank == 2 &&
+                 residual->shape[0] == x.shape[0] && residual->shape[1] == x.shape[1] &&
+                 residual->IsContiguous(),
+             "rmsnorm: residual must be f32 [T,H] contiguous");
+  }
+  VT_CHECK(x.device == out.device && x.device == q.device, "rmsnorm: device mismatch");
+  reinterpret_cast<RmsNormFn>(GetOp(OpId::kRmsNorm, q.device.type))(q, out, x, weight, args,
+                                                                    residual);
+}
+
 }  // namespace vt

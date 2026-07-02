@@ -49,7 +49,9 @@ add_library(vllm STATIC
   src/vt/backend.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
-  src/vt/cpu/cpu_backend.cpp)
+  src/vt/ops.cpp
+  src/vt/cpu/cpu_backend.cpp
+  src/vt/cpu/cpu_ops.cpp)
 add_library(vllm::vllm ALIAS vllm)
 # Static-init registrars (e.g. the CPU backend) live in archive members no
 # consumer references directly; force-link the whole vllm archive so every

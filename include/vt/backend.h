@@ -12,6 +12,7 @@ class Backend {
  public:
   virtual ~Backend() = default;
 
+  // Returns memory aligned to at least 64 bytes; StepArena depends on this.
   virtual void* Alloc(size_t bytes) = 0;
   virtual void Free(void* p) = 0;
   virtual void Memset(Queue& q, void* p, int value, size_t bytes) = 0;

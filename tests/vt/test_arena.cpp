@@ -1,6 +1,8 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include <doctest/doctest.h>
 
+#include <cstdint>
+
 #include "vt/arena.h"
 
 using vt::Device;
@@ -43,6 +45,14 @@ TEST_CASE("arena overflows loudly") {
   (void)arena.Alloc(DType::kF32, {16});  // 64 bytes
   (void)arena.Alloc(DType::kF32, {16});  // 128 total
   CHECK_THROWS_AS(arena.Alloc(DType::kF32, {1}), std::runtime_error);
+}
+
+TEST_CASE("arena rejects overflowing allocation sizes loudly") {
+  StepArena arena(Cpu(), 256);
+  CHECK_THROWS_AS(arena.Alloc(DType::kI64, {int64_t{1} << 61}), std::runtime_error);
+  (void)arena.Alloc(DType::kF32, {16});  // 64 bytes used
+  CHECK_THROWS_AS(arena.Alloc(DType::kI64, {(int64_t{1} << 61) - 8}), std::runtime_error);
+  CHECK(arena.Used() == 64);  // accounting not corrupted by rejected allocs
 }
 
 TEST_CASE("arena tensors carry device and dtype") {

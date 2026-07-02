@@ -1,6 +1,8 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/arena.h"
 
+#include <cstdint>
+
 namespace vt {
 
 namespace {
@@ -17,8 +19,12 @@ StepArena::~StepArena() { GetBackend(device_.type).Free(base_); }
 
 Tensor StepArena::Alloc(DType dtype, std::initializer_list<int64_t> shape) {
   Tensor t = Tensor::Contiguous(nullptr, dtype, device_, shape);
-  size_t bytes = AlignUp(static_cast<size_t>(t.Numel()) * SizeOf(dtype));
-  VT_CHECK(used_ + bytes <= capacity_, "StepArena overflow");
+  size_t numel = static_cast<size_t>(t.Numel());
+  size_t esize = SizeOf(dtype);
+  VT_CHECK(numel <= (SIZE_MAX - 63) / esize, "StepArena: allocation size overflow");
+  size_t bytes = AlignUp(numel * esize);
+  // used_ <= capacity_ is an invariant, so the subtraction cannot wrap.
+  VT_CHECK(bytes <= capacity_ - used_, "StepArena overflow");
   t.data = base_ + used_;
   used_ += bytes;
   if (used_ > high_water_) high_water_ = used_;

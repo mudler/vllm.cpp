@@ -2,15 +2,21 @@
 
 - **Reference checkout:** `/home/mudler/_git/vllm`, branch `main`
   (https://github.com/vllm-project/vllm).
-- **PARITY PIN:** `e24d1b24` (2026-07-02) — the vLLM commit our current state
-  is defined and verified against. All inventory statuses, golden dumps, file
-  headers, and benchmark baselines are relative to the pin. This line is the
-  single source of truth for it.
+- **STARTING PIN (MVP phase):** `e24d1b24` (2026-07-02) — the vLLM commit we
+  port *from*. During the MVP build-out this is **not a parity claim**: we are
+  not "at" this pin, we are building toward it, and the feature gaps vs this
+  pin are documented in [porting-inventory.md](porting-inventory.md) (tier
+  assignments + status markers = the gap record). Golden dumps, file headers,
+  and benchmark baselines are all taken at this pin so the target stays fixed.
+- Once the MVP gates pass, this line becomes the **PARITY PIN** — a statement
+  of equivalence for the T0 surface — and moves only via sync cycles.
 
 ## Concepts
 
-- **Parity pin** — one repo-wide vLLM commit. "We have feature X" always means
-  "X as of the pin". Never compare against a moving target.
+- **Starting pin (MVP)** — the fixed upstream snapshot the MVP is built
+  against. Gaps vs it are normal and tracked in the inventory, not hidden.
+- **Parity pin (post-MVP)** — one repo-wide vLLM commit. "We have feature X"
+  always means "X as of the pin". Never compare against a moving target.
 - **Per-file pins** — every ported file's header records the upstream path +
   the upstream commit it matches. Normally equal to the parity pin; a file may
   be temporarily ahead (hot-fix port) but never behind without a ledger note.

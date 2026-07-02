@@ -1,290 +1,185 @@
-# vllm.cpp — vLLM V1 Engine Core, Ported to Pure C++
+# vllm.cpp — vLLM V1 Engine, Ported to Pure C++ (Core Design)
 
-**Date:** 2026-07-02
+**Date:** 2026-07-02 (rev 2 — gates redefined by user)
 **Status:** Draft — awaiting user review
-**Reference:** vLLM checkout at `/home/mudler/_git/vllm`, commit `16282a9` (2026-06-10, ~v0.11+)
+**Upstream:** `/home/mudler/_git/vllm` @ `e24d1b24` (2026-07-02, master)
+**Companion:** `docs/porting-inventory.md` (full feature inventory, tiers T0–T3),
+`AGENTS.md` (canonical state + discipline)
 
-## 1. Goal
+## 1. Goal & gates
 
-A faithful C++ port of vLLM's V1 engine core — the architecture that makes vLLM
-fast — with **no PyTorch and no Python** at build or run time. "1:1" means the
-codebase mirrors vLLM's V1 structure class-for-class (EngineCore, Scheduler,
-KVCacheManager, BlockPool, ModelRunner, InputBatch, Sampler, AttentionBackend),
-so that anyone who knows vLLM can navigate vllm.cpp, and future vLLM changes
-can be tracked by diffing against the reference.
+A 1:1 port of vLLM to pure C++ — no Python/PyTorch at build or run time —
+structured so any future upstream PR can be ported mechanically (mirrored
+paths, class names, algorithms; see AGENTS.md discipline).
 
-ggml is a **design reference, not a dependency**: we borrow its philosophy
-(minimal deps, arena allocation, explicit kernels, quantization-friendly data
-layout) but not its static-graph execution model, which is architecturally at
-odds with vLLM's persistent-batch, paged-KV design and would cost us the
-performance we're porting for.
+MVP gates (from AGENTS.md, authoritative): (1) Qwen3.6-35B-A3B-NVFP4 +
+Qwen3.6-27B-NVFP4 served on DGX Spark (GB10, sm_121) at vLLM-parity prefill
+and decode throughput under large concurrency; (2) the same models load from
+GGUF; (3) llama.cpp-style library packaging (C API + example CLI/server);
+(4) tool calling + grammars in the MVP feature set; (5) e2e test suites.
 
-### Non-goals (for this spec; tracked as backlog)
+ggml is a **design reference, not a dependency**: its static-graph execution
+model is architecturally at odds with vLLM's persistent-batch, paged-KV
+design; building on it would forfeit the performance we're porting for.
 
-- All 292 model architectures. We start with one family (Llama-shaped dense
-  decoders) and grow.
-- Distributed serving (TP/PP/DP, Ray), spec decode, LoRA, structured output,
-  multimodal, KV offload/connectors.
-- torch.compile-equivalent graph compilation (`vllm/ir/`, `vllm/kernels/`
-  layers) — we bind kernels directly, which is what those layers bottom out in
-  anyway.
+### Non-goals for MVP (tracked as T1–T3 in the inventory)
+
+Multi-GPU (TP/PP/DP/EP), spec decode (incl. Qwen3.6 MTP — first post-gate
+perf item), LoRA, multimodal, KV offload/connectors, the long tail of model
+architectures and quant methods, torch.compile-equivalent graph compilation.
 
 ## 2. Decisions log
 
-Decisions confirmed by the user:
+- **D1 — No PyTorch** (user).
+- **D2 — No ggml dependency; ggml as example** (user).
+- **D3 — CUDA at step 1** on `dgx.casa` (GB10, sm_121); development over SSH
+  (user). A scalar/SIMD CPU reference backend exists from day one, but only
+  correctness-grade: it runs CI and op-parity tests on non-GPU machines.
+- **D4 — Gate models define T0**: Qwen3.6 family ⇒ hybrid GDN + gated
+  full-attention + 256-expert MoE + NVFP4 are core, not extensions (user).
+- **D5 — GGUF is a gate** alongside safetensors; includes NVFP4 GGUF
+  extension types from the APEX/killgate tooling (user).
+- **D6 — Library-first** like llama.cpp: `libvllm` + stable C API +
+  example CLI/openai-server binaries (user).
+- **D7 — Tool calling + grammars in MVP** (user). Grammars via vendored
+  xgrammar C++ core (upstream's default backend, pure C++), plus GBNF input
+  format as an extension.
+- **D8 — Track upstream master**; sync point recorded in AGENTS.md, ported
+  files carry upstream path + commit headers (user: "port every PR").
+- **D9 — Port Model Runner V2** (`vllm/v1/worker/gpu/`), not the legacy
+  runner: upstream converges on it; PR-portability demands we sit where
+  development happens.
 
-- **D1 — No PyTorch.** Hard constraint.
-- **D2 — No ggml dependency.** ggml's architecture is too distant from
-  vLLM/PyTorch to hit target speed; use it as an example to build on.
+## 3. Approaches considered (compute layer)
 
-Decisions taken by default while the user was away (flagged for review):
+**A. Build on ggml** — rejected (D2): graph-rebuild-per-step vs persistent
+batch, no paged-KV-shaped memory model, scheduler mismatch.
 
-- **D3 — Scope: core engine parity**, not literal full-surface port. The
-  essence of vLLM (~15k of its 108k engine lines) is the deliverable;
-  breadth is backlog.
-- **D4 — CPU-first bring-up, CUDA as the performance milestone.** This dev
-  machine has no NVIDIA GPU, so the engine is developed and validated against
-  a CPU backend locally. The tensor-runtime/backend boundary is designed on
-  day one so CUDA kernels (lifted from vLLM history / FlashAttention) drop in
-  at milestone M3 without touching engine code.
-- **D5 — HF-native model format:** safetensors weights + `config.json` +
-  `tokenizer.json`, exactly what vLLM loads. GGUF support is backlog (it
-  matters for the LocalAI ecosystem, but 1:1 parity testing against vLLM/HF
-  is simpler with the native format).
-- **D6 — First model family: Llama-shaped dense decoders** (Llama 3, Qwen2.5,
-  Mistral) — one forward function covers all three with small deltas.
-- **D7 — Pin the reference** to commit `16282a9`. vLLM moves fast; we port a
-  fixed snapshot and rebase deliberately.
+**B. Own minimal eager tensor runtime (`vt::`) + kernels ported from vLLM's
+own sources (chosen).** vLLM's kernel semantics live in three portable
+places: `csrc/cpu/` SIMD templates (CPU reference), the FLA Triton kernels
+(GDN — port semantics to CUDA), and vLLM-history CUDA kernels + cuBLASLt for
+dense/paged work. mudler's killgate/phase llama.cpp patches provide proven
+GB10 techniques for NVFP4 W4A4 MMA and GDN. Vendor a specific
+CUTLASS/FlashInfer kernel only when a benchmark proves we can't match it.
 
-## 3. Approaches considered
-
-**A. Build on ggml directly** — rejected (user D2, and technical analysis
-agrees). vLLM's speed comes from a persistent input batch mutated in place,
-paged KV with per-step `slot_mapping`/`block_table` tensors, and ragged
-variable-length batched attention. ggml's build-a-graph-then-schedule model
-fights all of that; every step would rebuild graphs and replan memory.
-
-**B. Own minimal tensor runtime + kernels lifted/adapted from vLLM's own
-`csrc/` (chosen).** vLLM's CPU backend (`csrc/cpu/`) contains complete SIMD
-attention/norm/activation kernels (x86 AVX/AMX, NEON, RVV, VSX) as template
-code over raw pointers; torch appears only in orchestration wrappers, so they
-can be adapted with modest surgery. For CUDA later, the classic
-`paged_attention_v1/v2` kernels exist in vLLM's git history as self-contained
-CUDA, and dense GEMM comes from cuBLAS. We get vLLM-grade kernels because they
-*are* vLLM's kernels, wrapped in a runtime shaped like vLLM needs (eager,
-persistent buffers) rather than like ggml.
-
-**C. Assemble from heavyweight C++ deps** (oneDNN, CUTLASS, FlashAttention as
-libraries) — more day-one FLOPs, but a large, slow build with deep
-dependencies, against the spirit of a `.cpp` project. Individual pieces (e.g.
-FlashAttention kernels) can still be vendored selectively inside approach B
-when benchmarks justify it.
+**C. Assemble from heavyweight deps (full CUTLASS/FlashInfer/TRT-LLM stack)**
+— rejected as default posture: build weight, JIT-Python entanglement
+(FlashInfer), and it inverts the "we own the code" premise. Selective
+vendoring stays available inside B.
 
 ## 4. Architecture
 
+Source layout mirrors upstream 1:1 (discipline in AGENTS.md). The only
+net-new subsystem is `vt/` (compute), which replaces torch/Triton/compile:
+
 ```
 vllm.cpp/
-├── CMakeLists.txt
-├── src/
-│   ├── vt/                  # tensor runtime ("vllm tensor") — the ggml-inspired part
-│   │   ├── tensor.h         # Tensor: dtype, shape, strides, device, data ptr
-│   │   ├── alloc.h/.cpp     # arena + pooled allocators; persistent buffers
-│   │   ├── ops.h            # op entry points, dispatched by device
-│   │   └── cpu/             # CPU kernels (adapted from vllm csrc/cpu + own)
-│   │       └── (cuda/ at M3: lifted paged-attn kernels + cuBLAS GEMM)
-│   ├── core/                # Request, SamplingParams, RequestStatus, outputs
-│   │                        #   ← vllm/v1/request.py, sampling_params.py, outputs.py
-│   ├── sched/               # Scheduler, SchedulerOutput, RequestQueue
-│   │                        #   ← vllm/v1/core/sched/
-│   ├── kv/                  # KVCacheManager, BlockPool, block hashing, specs
-│   │                        #   ← vllm/v1/core/{kv_cache_manager,block_pool,kv_cache_utils}.py
-│   │                        #     + vllm/v1/kv_cache_interface.py
-│   ├── worker/              # ModelRunner, InputBatch (persistent), BlockTable
-│   │                        #   ← vllm/v1/worker/gpu/{model_runner,input_batch,block_table}.py
-│   ├── attention/           # AttentionBackend iface + CPU paged-attention impl
-│   │                        #   ← vllm/v1/attention/backend.py + backends/cpu_attn.py
-│   ├── sample/              # Sampler: temperature, penalties, top-k/top-p, logprobs
-│   │                        #   ← vllm/v1/sample/
-│   ├── engine/              # EngineCore step loop, InputProcessor, OutputProcessor,
-│   │                        #   Detokenizer, LLM (sync) + AsyncLLM-style API
-│   │                        #   ← vllm/v1/engine/
-│   ├── models/              # explicit forward fns per architecture + registry
-│   │   └── llama.cpp/.h     #   ← vllm/model_executor/models/llama.py (semantics only)
-│   ├── loader/              # safetensors mmap loader, HF config.json parsing
-│   ├── tokenizer/           # byte-level BPE (tokenizer.json), chat templates
-│   └── server/              # OpenAI-compatible HTTP server (SSE streaming)
-│                            #   ← vllm/entrypoints/openai/ (semantics only)
-├── tools/parity/            # Python-side dump scripts run against ref vLLM/HF
-├── tests/                   # unit + parity + engine behavioral tests
-└── docs/
+├── include/vllm.h              # stable C API (llama.cpp-style, purego-friendly)
+├── include/vllm/*.hpp          # C++ API (LLM, AsyncLLM equivalents)
+├── src/vt/                     # tensor runtime: Tensor{dtype,shape,strides,device,ptr},
+│   ├── alloc.{h,cpp}           #   step arena + persistent buffers (graph-replay friendly)
+│   ├── ops.h                   #   explicit-output ops, device-dispatched
+│   ├── cuda/                   #   PRIMARY: GB10 sm_121 kernels (see §5)
+│   └── cpu/                    #   reference kernels (CI/parity; csrc/cpu-derived)
+├── src/vllm/                   # mirrors upstream python paths, e.g.:
+│   ├── v1/core/sched/scheduler.{h,cpp}      ← vllm/v1/core/sched/scheduler.py
+│   ├── v1/core/{block_pool,kv_cache_manager,kv_cache_coordinator,...}.{h,cpp}
+│   ├── v1/worker/gpu/{model_runner,input_batch,block_table,...}.{h,cpp}   (MRV2)
+│   ├── v1/attention/backends/{gdn_attn,paged_attn,...}.{h,cpp}
+│   ├── v1/sample/…, v1/engine/…, v1/structured_output/…
+│   ├── model_executor/models/{registry,qwen3_5,qwen3,llama,...}.{h,cpp}
+│   ├── model_executor/layers/…             (linear/norms/rope/fused_moe/…)
+│   ├── model_loader/{default_loader,gguf_loader,weight_utils}.{h,cpp}
+│   ├── config/…                            (structs mirroring config dataclasses)
+│   └── entrypoints/openai/…                (server lib used by examples/server)
+├── examples/{cli,server,bench}/
+├── tools/parity/               # Python dump scripts run against upstream (test-time only)
+├── tests/                      # op-parity, engine-behavioral, model-parity, server-e2e
+└── third_party/                # vendored: cpp-httplib, nlohmann/json, xgrammar core
 ```
 
-### 4.1 vt — the tensor runtime
+Engine mechanics (ported semantics, per the upstream map): unified
+token-budget scheduler with chunked prefill and preemption; BlockPool with
+hash-chained prefix caching; **hybrid KV cache coordinator** with two groups
+for the gate models (paged full-attn blocks + GDN conv/temporal state);
+persistent InputBatch with `SchedulerOutput` diffs; split execute/sample;
+sampler pipeline in upstream order; grammar bitmask via structured-output
+manager; EngineCore busy loop on its own thread behind in-process queues;
+OpenAI server with SSE streaming, tool-call parsing, and vLLM metric names.
 
-Eager execution, no graphs, no autograd. A `vt::Tensor` is a POD-ish view:
-dtype (fp32/fp16/bf16/int8/int32...), shape, strides, device, pointer. Memory
-comes from two allocators: a **step arena** (bump allocator reset every engine
-step — activations) and **persistent buffers** (weights, KV cache pages, the
-persistent InputBatch tensors — allocated once, mutated in place, exactly
-mirroring vLLM's design and keeping the door open for CUDA-graph replay at M3).
+## 5. The performance plan (gate #1)
 
-Ops are free functions with explicit outputs (`vt::matmul(out, a, b)`,
-`vt::rms_norm(out, x, w, eps)`, `vt::rope(q, k, positions, ...)`,
-`vt::silu_and_mul(out, x)`, `vt::reshape_and_cache(k, v, kcache, vcache,
-slot_mapping)`, `vt::paged_attention(out, q, kcache, vcache, block_table,
-seq_lens, ...)`, `vt::softmax_sample(...)`). Each op dispatches on device to a
-backend kernel table. The op *set* is exactly what the ported models and
-engine need — we do not build a general tensor library.
+GB10 is unified-memory, bandwidth-bound. Parity levers, in dependency order:
 
-CPU kernels: adapt vLLM's `csrc/cpu/` SIMD template kernels (attention,
-layernorm, activation, the `cpu_types_*.hpp` vector abstraction) by replacing
-their torch orchestration with raw-pointer entry points; GEMM starts with a
-tiled+vectorized fp32/bf16 implementation and can vendor a single-file
-microkernel library later if benchmarks demand.
+1. **NVFP4 W4A4 kernels** for MoE grouped-GEMM and dense GEMM (weights stay
+   fp4 in memory — bandwidth is the currency; killgate patch 0034 is prior
+   art). cuBLASLt for bf16/fp8 paths.
+2. **GDN kernels**: chunked-scan prefill + fused sigmoid-gating recurrence
+   decode, ported from FLA Triton semantics to CUDA; fused post-conv prep +
+   causal conv1d.
+3. **Paged attention** for the 1-in-4 full-attn layers (GQA 16/2, partial
+   RoPE): FA2-style varlen prefill + paged decode tuned for sm_121.
+4. **CUDA graphs** for decode steps (MoE decode is launch-bound; upstream
+   default FULL_AND_PIECEWISE tells us graphs are non-optional) — our own
+   capture/replay over persistent buffers; the vt arena design exists for
+   this.
+5. **Fused small ops**: qk-norm+RoPE+gate (upstream has this exact fusion),
+   rmsnorm+residual, MoE routing top-k.
+6. Async scheduling / batch-queue pipelining if CPU-side becomes the
+   bottleneck at high concurrency (T1 item, promotable).
 
-### 4.2 Engine — the 1:1 part
-
-Class-for-class mapping of the subsystems the Explore map identified:
-
-- **Scheduler** (`sched/`): vLLM V1's unified algorithm — *no prefill/decode
-  distinction*; each request tracks `num_computed_tokens` vs `num_tokens`, and
-  the scheduler assigns tokens per step under a `token_budget`
-  (`max_num_scheduled_tokens`). Chunked prefill falls out naturally; running
-  requests first, then waiting; preemption pops the FCFS tail and requeues.
-  `SchedulerOutput` carries `scheduled_new_reqs` (full data) +
-  `scheduled_cached_reqs` (diffs only), `num_scheduled_tokens`, and finished
-  ids — same wire shape as vLLM so behavior is directly comparable.
-- **KV cache** (`kv/`): `BlockPool` (free list + ref counts +
-  `BlockHash → block` map), `KVCacheManager.allocate_slots()` /
-  `get_computed_blocks()` for hash-based prefix reuse, eviction of cached-but-
-  unreferenced blocks, `FullAttentionSpec` first (SlidingWindow etc. are
-  backlog but the `KVCacheSpec` polymorphism is in from day one). Block
-  hashing follows vLLM: parent-hash-chained hashes over block-sized token
-  spans.
-- **Worker** (`worker/`): persistent `InputBatch` — long-lived per-slot token
-  ids, positions, block tables, sampling params, updated incrementally from
-  `SchedulerOutput` (add new, apply diffs, swap-remove finished). Builds the
-  flattened step inputs: `query_start_loc`, `seq_lens`, `slot_mapping`,
-  `positions` — the same `CommonAttentionMetadata` contract vLLM feeds its
-  attention backends.
-- **Sampler** (`sample/`): vLLM's pipeline order preserved — logits fp32 →
-  (logits processors slot, empty at first) → greedy short-circuit → temperature
-  → penalties (frequency/presence/repetition) → top-k → top-p → sample with
-  per-request RNG (seeded, reproducible) → optional logprobs.
-- **EngineCore** (`engine/`): the canonical `step()`:
-  `scheduler.schedule() → model_runner.execute_model() → sample →
-  scheduler.update_from_output()`. Runs in its own thread with an MPSC input
-  queue and output queue (in-process analog of vLLM's ZMQ split — same
-  boundary, so a multi-process mode remains possible). `OutputProcessor` +
-  incremental `Detokenizer` on the output side. Public API: synchronous `LLM`
-  (offline batch) and callback/stream-based `AsyncLLM` for the server.
-- **Server** (`server/`): OpenAI-compatible `/v1/completions`,
-  `/v1/chat/completions` (SSE streaming), `/v1/models`, `/health`,
-  `/metrics` (Prometheus text). Built on a header-only HTTP lib
-  (cpp-httplib), chat templating starts with built-in per-family templates
-  (full Jinja2 is explicitly out of scope; revisit if needed).
-
-### 4.3 Models, loader, tokenizer
-
-A model is a weights struct + an explicit forward function over `vt` ops
-(no module system): `llama_forward(weights, batch_inputs, kv_cache, arena) →
-logits`. A registry maps HF `config.json` `architectures` →
-loader+forward, mirroring vLLM's model registry. Weights load from
-safetensors via mmap (format is trivial: 8-byte header len + JSON + raw
-tensors), with on-load dtype handling (bf16 native; fp16→bf16/fp32 convert).
-
-Tokenizer: byte-level BPE reading HF `tokenizer.json` — covers Llama 3,
-Qwen2.5, Mistral. Incremental detokenization (vLLM's `detokenizer.py`
-semantics: withhold bytes until UTF-8-complete). SentencePiece-based models
-are backlog.
-
-## 5. Data flow (one engine step)
-
-```
-HTTP req ─→ InputProcessor (tokenize, validate, SamplingParams)
-        ─→ input queue ─→ EngineCore thread:
-   scheduler.schedule()
-     ├─ running reqs: assign tokens under budget; allocate_slots(); preempt if OOM
-     └─ waiting reqs: prefix-cache hit via get_computed_blocks(); admit under budget
-   model_runner.execute_model(SchedulerOutput)
-     ├─ InputBatch.update(): add new / apply diffs / remove finished
-     ├─ build step inputs: token_ids, positions, query_start_loc, seq_lens,
-     │                     slot_mapping, block_table
-     ├─ forward: embed → N × (rmsnorm → qkv → rope → reshape_and_cache →
-     │           paged_attention → o-proj → rmsnorm → mlp) → final norm → lm_head
-     │           (logits only at each sequence's last scheduled token)
-     └─ Sampler → sampled token ids (+ logprobs)
-   scheduler.update_from_output(): append tokens, detect stop, free KV
-        ─→ output queue ─→ OutputProcessor: detokenize incrementally, stream SSE
-```
+Benchmark harness (`examples/bench`, `vllm bench serve` semantics) lands
+*before* kernel tuning; every optimization is measured against the vLLM
+baseline on the same box (vLLM install on dgx.casa is a recorded TODO).
 
 ## 6. Error handling
 
-- Request-level errors (bad params, prompt too long, tokenizer failure) are
-  rejected at `InputProcessor` and never reach the engine — HTTP 4xx with
-  OpenAI-style error JSON.
-- Engine invariants (block accounting, batch consistency) are `assert`-checked
-  in debug and validated by tests; a corrupted engine state is fatal by design
-  (matching vLLM — the engine dies loudly rather than serving garbage).
-- KV exhaustion is not an error: it's preemption + recompute, per the
-  scheduler algorithm.
-- The server returns 503 on engine death; clean shutdown drains the queues.
+Request-level errors rejected at InputProcessor (OpenAI-shaped 4xx JSON,
+matching upstream error shapes). Engine invariants assert in debug; corrupted
+engine state is fatal-loud (upstream behavior). KV exhaustion is preemption,
+not error. Server: 503 on engine death, graceful drain on shutdown. CUDA
+errors: fail the affected requests, mark engine dead if the context is
+poisoned (matching upstream EngineDeadError semantics).
 
-## 7. Testing strategy
+## 7. Testing (gate #5)
 
-Parity-first, per the house style for C++ ports:
-
-1. **Op-level golden tests**: `tools/parity/` Python scripts dump
-   inputs/outputs for each op from the reference vLLM checkout (which may use
-   torch — it's a *test-time* dependency only, never linked); C++ unit tests
-   replay them with max-abs / cosine thresholds.
-2. **Layer/model parity**: per-layer activation dumps for one Llama-3-class
-   model; end-to-end logits parity; greedy decode must match HF/vLLM
-   token-for-token over reference prompts.
-3. **Engine behavioral tests** (no model needed — a tiny fake model runner):
-   scheduler unit tests ported from `tests/v1/core/` (chunked prefill splits,
-   preemption order, budget exhaustion), BlockPool/prefix-cache tests (hash
-   chains, ref counting, eviction), detokenizer UTF-8 edge cases.
-4. **End-to-end**: OpenAI-endpoint tests against a small real model
-   (Qwen2.5-0.5B / Llama-3.2-1B class) — streaming, stop strings, n>1,
-   seeds reproducible.
-5. **Benchmarks** (from M2 on): tokens/s and TTFT vs llama.cpp on CPU, vs
-   vLLM itself once CUDA lands; honest methodology, published in README.
-
-CI: build + unit + behavioral tests on CPU (GitHub Actions); parity suites run
-locally/nightly where reference dumps live.
+The five suites from `docs/porting-inventory.md` §10: op parity (upstream
+golden dumps; CPU + CUDA), engine behavioral (ported `tests/v1/core/`
+semantics incl. hybrid-group allocation), model parity (logits + greedy
+token-for-token on Qwen3-0.6B fast / gate models nightly; safetensors, NVFP4
+and GGUF paths), server e2e conformance (incl. tool-call streaming and
+grammar constraint tests), and the gate benchmark with per-commit regression
+tracking. CI (GitHub Actions, CPU): build + unit + behavioral + 0.6B smoke.
+Nightly (dgx.casa): CUDA parity + gate benchmarks.
 
 ## 8. Milestones
 
-- **M0 — Single-sequence correctness (CPU).** vt runtime + CPU kernels +
-  safetensors loader + tokenizer + Llama forward + greedy decode. Parity vs
-  HF. *(Deliberately llama.cpp-shaped, but structured as vLLM from day one.)*
-- **M1 — The vLLM part.** BlockPool + KVCacheManager + prefix caching +
-  Scheduler (continuous batching, chunked prefill, preemption) + persistent
-  InputBatch + Sampler + EngineCore loop + offline `LLM` API. Behavioral test
-  suite green; multi-request throughput scales on CPU.
-- **M2 — Serving.** OpenAI server (completions/chat/models, SSE), metrics,
-  graceful shutdown. Benchmarks vs llama.cpp published.
-- **M3 — CUDA.** `vt/cuda/` backend: cuBLAS GEMM, paged-attention +
-  reshape_and_cache kernels lifted from vLLM history (FlashAttention vendoring
-  as a fallback/upgrade), CUDA graphs for decode. Benchmark vs vLLM on the
-  same GPU. *(Requires a GPU box; not this machine.)*
-- **Backlog:** more architectures (MoE, MLA, sliding window), GGUF loading,
-  quantization, structured output, spec decode, LoRA, LocalAI backend wiring,
-  TP.
+- **M0 — Model correctness on CUDA.** vt runtime (CUDA + CPU ref), safetensors
+  + GGUF containers, tokenizer (HF json + GGUF vocab), Qwen3.6 forward pass
+  eager bf16 (NVFP4 dequantized on load — fits unified memory), single-request
+  greedy decode parity vs upstream. Everything mirrored-structure from day one.
+- **M1 — The engine.** Hybrid KV cache + BlockPool + prefix caching +
+  scheduler + persistent InputBatch + sampler + EngineCore; offline C++/C API;
+  behavioral suites green; concurrency scales.
+- **M2 — Parity performance.** NVFP4 W4A4 MoE + GDN CUDA kernels + tuned paged
+  attention + CUDA graphs + bench harness; **gate #1 measured and met**.
+- **M3 — Serving MVP.** OpenAI server (streaming, tools, grammars), metrics,
+  CLI, library packaging polish, README (house style), docs. Gates #2–#5
+  validated end-to-end.
+- **Post-MVP:** T1 tier (dense model families, MTP spec decode, fp8, sliding
+  window, priority scheduling, structured-output breadth), then T2.
 
 ## 9. Risks
 
-- **Tokenizer scope creep** — HF tokenizer.json has many pretokenizer/
-  normalizer variants. Mitigation: implement exactly what the first model
-  family needs; hard-fail on unsupported configs with a clear error.
-- **CPU GEMM performance** — matching llama.cpp's mature quantized kernels on
-  CPU is a losing race short-term. Mitigation: M0–M2 optimize for
-  *correctness and engine behavior*; the performance story is CUDA (M3).
-  CPU perf work happens only after profiling, per the optimization loop.
-- **No local GPU** — CUDA milestone needs remote hardware; engine/backend
-  boundary is designed so M3 is additive, not a refactor.
-- **vLLM drift** — pinned to `16282a9` (D7); rebases are deliberate events.
-- **Kernel lift friction** — csrc/cpu kernels are torch-entangled at the
-  wrapper level; if surgery proves costly for some op, write it fresh against
-  the parity dumps instead. The dumps, not the code, are the contract.
+- **GDN + NVFP4 kernel effort** is the long pole; mitigated by killgate/FLA
+  prior art and by bench-first development. Fallback: vendor FlashInfer's
+  Blackwell GDN/attention kernels behind vt ops (deviation §9 of inventory).
+- **Parity target moves** (vLLM improves on GB10): gate measured against the
+  vLLM version pinned at AGENTS.md sync point; re-baseline consciously.
+- **Tokenizer/chat-template scope**: minja-style Jinja subset for Qwen/Llama
+  templates; hard-fail with clear errors on unsupported constructs.
+- **Upstream drift**: mitigated by the sync-point discipline + mirrored
+  structure (AGENTS.md).
+- **xgrammar vendoring**: C++ core but sizeable; isolate behind the
+  structured-output manager interface so it stays swappable.

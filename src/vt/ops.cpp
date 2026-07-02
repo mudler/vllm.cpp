@@ -95,4 +95,28 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   reinterpret_cast<EmbeddingFn>(GetOp(OpId::kEmbedding, q.device.type))(q, out, table, ids);
 }
 
+using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
+
+void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
+              const RopeArgs& args) {
+  VT_CHECK(q_states.rank == 3 && k_states.rank == 3, "rope: q/k rank-3 [T,H,D]");
+  VT_CHECK(q_states.shape[0] == k_states.shape[0] && q_states.shape[2] == k_states.shape[2],
+           "rope: q/k token count and head_dim must match");
+  VT_CHECK(positions.rank == 1 && positions.shape[0] == q_states.shape[0],
+           "rope: positions[T] mismatch");
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "rope: positions i32/i64");
+  VT_CHECK(q_states.dtype == DType::kF32 && k_states.dtype == DType::kF32, "rope: f32 q/k");
+  VT_CHECK(args.rotary_dim > 0 && args.rotary_dim % 2 == 0 &&
+               args.rotary_dim <= q_states.shape[2],
+           "rope: rotary_dim must be even and <= head_dim");
+  VT_CHECK(q_states.IsContiguous() && k_states.IsContiguous() && positions.IsContiguous(),
+           "rope: contiguous required");
+  VT_CHECK(q_states.device == q.device && k_states.device == q.device &&
+               positions.device == q.device,
+           "rope: device mismatch (q/k/positions/queue)");
+  reinterpret_cast<RopeFn>(GetOp(OpId::kRopeNeox, q.device.type))(q, q_states, k_states,
+                                                                  positions, args);
+}
+
 }  // namespace vt

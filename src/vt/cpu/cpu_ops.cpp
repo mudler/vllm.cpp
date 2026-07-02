@@ -79,12 +79,42 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   }
 }
 
+void RopeRotateHead(float* head, int rot, double base, int64_t pos) {
+  const int half = rot / 2;
+  for (int i = 0; i < half; ++i) {
+    double freq = std::pow(base, -2.0 * i / rot);
+    double angle = static_cast<double>(pos) * freq;
+    float c = static_cast<float>(std::cos(angle));
+    float s = static_cast<float>(std::sin(angle));
+    float x = head[i];
+    float y = head[i + half];
+    head[i] = x * c - y * s;
+    head[i + half] = x * s + y * c;
+  }
+}
+
+void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const RopeArgs& args) {
+  const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
+  for (int64_t i = 0; i < t; ++i) {
+    int64_t p = pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
+    for (int64_t hh = 0; hh < hq; ++hh) {
+      RopeRotateHead(qs.Ptr<float>() + (i * hq + hh) * d, args.rotary_dim,
+                     static_cast<double>(args.base), p);
+    }
+    for (int64_t hh = 0; hh < hk; ++hh) {
+      RopeRotateHead(ks.Ptr<float>() + (i * hk + hh) * d, args.rotary_dim,
+                     static_cast<double>(args.base), p);
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmul, DeviceType::kCPU, reinterpret_cast<void*>(&MatmulKernel));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU, reinterpret_cast<void*>(&RmsNormKernel));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU, reinterpret_cast<void*>(&SiluAndMulKernel));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU, reinterpret_cast<void*>(&EmbeddingKernel));
+    RegisterOp(OpId::kRopeNeox, DeviceType::kCPU, reinterpret_cast<void*>(&RopeNeoxKernel));
   }
 } registrar;
 

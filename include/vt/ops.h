@@ -34,4 +34,13 @@ void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
 // out[T,H] = table[ids[t], :]; ids i32/i64, bounds-checked.
 void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
 
+struct RopeArgs {
+  float base = 10000.0f;
+  int rotary_dim = 0;  // <= head_dim; even
+};
+
+// In-place partial NeoX RoPE on q[T,Hq,D] and k[T,Hk,D] (f32), positions[T].
+void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
+              const RopeArgs& args);
+
 }  // namespace vt

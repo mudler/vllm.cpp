@@ -19,8 +19,10 @@ grammars, streaming/non-streaming, and e2e test suites.
 - [.agents/discipline.md](.agents/discipline.md) — **non-negotiable** porting
   rules: mirrored structure, port-don't-reinvent, upstream-commit file
   headers, recorded deviations, parity-first testing.
-- [.agents/upstream-sync.md](.agents/upstream-sync.md) — reference checkout,
-  current sync point, procedure to advance it.
+- [.agents/upstream-sync.md](.agents/upstream-sync.md) — **sync protocol**:
+  the PARITY PIN (the vLLM commit we are parity-comparable against) and the
+  repeatable sync cycle (enumerate → classify → report → port → re-verify →
+  advance pin) that keeps porting upstream PRs a routine task.
 - [.agents/environment.md](.agents/environment.md) — dev box, `dgx.casa`
   (GB10/sm_121) specs, benchmark models, gate-model architecture, prior-art
   patch series, environment TODOs.

@@ -84,6 +84,16 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 - ☐ **M3.6 Server e2e conformance suite** + nightly dgx.casa pipeline.
 - ☐ **M3.7 README + docs** (house style, honest benchmarks). **← MVP done**
 
+## Recurring (any time after M0)
+
+- ☐ **P1 Sync tooling** (`tools/sync/`): automate sync-cycle steps 2–4 of
+  [upstream-sync.md](upstream-sync.md) — enumerate `PIN..TARGET` per ported
+  subtree, map commits to our mirrored files via their headers, draft the
+  classification report. DoD: one command emits a ready-to-review
+  `.agents/sync/` report.
+- 🔁 **Sync cycle** ([upstream-sync.md](upstream-sync.md)) — run on cadence
+  (weekly or on demand); each run is a bounded, self-contained task.
+
 ## Post-MVP (T1 queue, reorder as needed)
 
 Dense/MoE model families (Llama/Qwen3/Mixtral…) · MTP spec decode · fp8 ·

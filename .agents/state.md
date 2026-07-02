@@ -16,3 +16,8 @@
   `roadmap.md` created (M0–M3 broken into PR-sized units with DoD),
   `workflow.md` rewritten as the agent session protocol. NEXT unchanged:
   user review → writing-plans for M0.1.
+- **2026-07-02 (later)** — Upstream sync formalized as a protocol
+  (`upstream-sync.md`): repo-wide PARITY PIN (`e24d1b24`), per-file pins in
+  headers, and a repeatable 7-step sync cycle (enumerate → classify
+  PORT-NOW/INVENTORY/IGNORE → report under `.agents/sync/` → port → re-verify
+  → advance pin). Sync tooling + recurring cycle added to roadmap.

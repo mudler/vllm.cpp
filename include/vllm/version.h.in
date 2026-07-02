@@ -1,0 +1,11 @@
+#pragma once
+#include <string>
+
+#define VLLM_CPP_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define VLLM_CPP_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define VLLM_CPP_VERSION_PATCH @PROJECT_VERSION_PATCH@
+
+namespace vllm {
+// Returns "MAJOR.MINOR.PATCH", plus "+cuda" when built with the CUDA backend.
+std::string Version();
+}  // namespace vllm

@@ -45,7 +45,9 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
 add_library(vllm STATIC
   src/vllm/version.cpp
-  src/vt/dtype.cpp)
+  src/vt/dtype.cpp
+  src/vt/backend.cpp
+  src/vt/cpu/cpu_backend.cpp)
 add_library(vllm::vllm ALIAS vllm)
 target_include_directories(vllm
   PUBLIC include ${CMAKE_CURRENT_BINARY_DIR}/include)

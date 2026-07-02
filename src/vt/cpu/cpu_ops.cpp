@@ -54,10 +54,37 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
   }
 }
 
+void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  float* o = out.Ptr<float>();
+  for (int64_t i = 0; i < t; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      float gate = LoadF32(x, i * 2 * d + j);
+      float up = LoadF32(x, i * 2 * d + d + j);
+      float silu = gate / (1.0f + std::exp(-gate));
+      o[i * d + j] = silu * up;
+    }
+  }
+}
+
+void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
+  const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
+  float* o = out.Ptr<float>();
+  for (int64_t i = 0; i < t; ++i) {
+    int64_t id = ids.dtype == DType::kI32 ? ids.Ptr<int32_t>()[i] : ids.Ptr<int64_t>()[i];
+    VT_CHECK(id >= 0 && id < v, "embedding: id out of range");
+    for (int64_t j = 0; j < h; ++j) {
+      o[i * h + j] = LoadF32(table, id * h + j);
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmul, DeviceType::kCPU, reinterpret_cast<void*>(&MatmulKernel));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU, reinterpret_cast<void*>(&RmsNormKernel));
+    RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU, reinterpret_cast<void*>(&SiluAndMulKernel));
+    RegisterOp(OpId::kEmbedding, DeviceType::kCPU, reinterpret_cast<void*>(&EmbeddingKernel));
   }
 } registrar;
 

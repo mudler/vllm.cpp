@@ -28,4 +28,10 @@ struct RmsNormArgs {
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
+// out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D].
+void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
+
+// out[T,H] = table[ids[t], :]; ids i32/i64, bounds-checked.
+void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
+
 }  // namespace vt

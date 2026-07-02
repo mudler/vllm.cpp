@@ -21,7 +21,7 @@
   headers, and a repeatable 7-step sync cycle (enumerate → classify
   PORT-NOW/INVENTORY/IGNORE → report under `.agents/sync/` → port → re-verify
   → advance pin). Sync tooling + recurring cycle added to roadmap.
-- **2026-07-03** — M0.1 done: repo builds as `libvllm` with tests
+- **2026-07-02 (later)** — M0.1 done: repo builds as `libvllm` with tests
   (doctest/ctest), optional CUDA verified on dgx.casa at sm_121 (nvcc
   13.0.88, cubin confirmed, smoke kernel ran on GB10, 2/2 tests), CI green
   on GitHub Actions (run 28625582067 for `411c072`). Vendored: doctest

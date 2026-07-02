@@ -49,6 +49,12 @@ add_library(vllm STATIC
   src/vt/backend.cpp
   src/vt/cpu/cpu_backend.cpp)
 add_library(vllm::vllm ALIAS vllm)
+# Static-init registrars (e.g. the CPU backend) live in archive members no
+# consumer references directly; force-link the whole vllm archive so every
+# consumer (tests, C API shared lib, benchmarks) gets backend registration.
+if(UNIX AND NOT APPLE)
+  target_link_options(vllm INTERFACE "LINKER:--whole-archive,$<TARGET_FILE:vllm>,--no-whole-archive")
+endif()
 target_include_directories(vllm
   PUBLIC include ${CMAKE_CURRENT_BINARY_DIR}/include)
 target_include_directories(vllm SYSTEM PUBLIC third_party)

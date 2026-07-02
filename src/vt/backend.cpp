@@ -17,6 +17,7 @@ std::array<Backend*, kNumDeviceTypes>& Registry() {
 }  // namespace
 
 Backend& GetBackend(DeviceType type) {
+  VT_CHECK(static_cast<size_t>(type) < kNumDeviceTypes, "invalid device type");
   Backend* b = Registry()[static_cast<size_t>(type)];
   VT_CHECK(b != nullptr, std::string("no backend registered for device type ") +
                              std::to_string(static_cast<int>(type)));

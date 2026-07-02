@@ -1,4 +1,5 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -10,6 +11,7 @@ namespace {
 class CpuBackend final : public Backend {
  public:
   void* Alloc(size_t bytes) override {
+    VT_CHECK(bytes <= SIZE_MAX - 63, "cpu alloc size overflow");
     void* p = std::aligned_alloc(64, ((bytes + 63) / 64) * 64);  // 64B-aligned, padded size
     VT_CHECK(p != nullptr, "cpu alloc failed");
     return p;

@@ -30,6 +30,9 @@ class Backend {
 };
 
 Backend& GetBackend(DeviceType type);
+// Threading contract: all registration must complete before main() runs
+// (backends register via static initializers). After that, GetBackend is
+// lock-free reads only; no synchronization is performed.
 void RegisterBackend(DeviceType type, Backend* backend);
 
 }  // namespace vt

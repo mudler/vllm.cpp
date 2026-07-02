@@ -9,3 +9,4 @@ function(vllm_cpp_add_test name)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
+vllm_cpp_add_test(test_cuda_smoke vt/test_cuda_smoke.cpp)

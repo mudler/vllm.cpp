@@ -51,6 +51,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
+  src/vllm/tokenizer/bpe.cpp
+  src/vllm/tokenizer/tokenizer.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

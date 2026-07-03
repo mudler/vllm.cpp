@@ -26,6 +26,10 @@ TEST_CASE("CPU backend is registered and allocates usable memory") {
   unsigned char dst[64];
   cpu.Copy(q, dst, p, 64);
   CHECK(dst[0] == 0xAB);
+
+  cpu.Synchronize(q);  // no-op on CPU: all prior work already complete
+  CHECK(dst[63] == 0xAB);
+
   cpu.Free(p);
 }
 

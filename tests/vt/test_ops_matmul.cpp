@@ -47,6 +47,22 @@ TEST_CASE("matmul bf16 weights: converts through f32") {
   CHECK(out == 6.0f);
 }
 
+TEST_CASE("matmul bf16 output: same golden within bf16 eps") {
+  // Same golden as the f32 case: out = [[58,64],[139,154]], stored as bf16.
+  std::vector<float> a = {1, 2, 3, 4, 5, 6};
+  std::vector<float> b = {7, 8, 9, 10, 11, 12};
+  std::vector<uint16_t> out(4, 0);
+  Tensor ta = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {2, 3});
+  Tensor tb = Tensor::Contiguous(b.data(), DType::kF32, Cpu(), {3, 2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {2, 2});
+  Queue q = CpuQueue();
+  vt::Matmul(q, to, ta, tb);
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(58.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(64.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[2]) == doctest::Approx(139.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[3]) == doctest::Approx(154.0f).epsilon(0.01));
+}
+
 TEST_CASE("matmul validates shapes loudly") {
   std::vector<float> buf(6, 0.0f);
   Tensor a = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {2, 3});

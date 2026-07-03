@@ -20,6 +20,11 @@ class Backend {
   virtual void Copy(Queue& q, void* dst, const void* src, size_t bytes) = 0;
   virtual Queue CreateQueue() = 0;
 
+  // Blocks until all work previously submitted to the queue has completed.
+  // Default no-op suits synchronous backends (CPU); async backends (CUDA)
+  // override with a stream sync.
+  virtual void Synchronize(Queue&) {}
+
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
 

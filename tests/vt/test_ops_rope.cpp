@@ -2,8 +2,10 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
+#include "vt/dtype.h"
 #include "vt/ops.h"
 
 using vt::Device;
@@ -39,6 +41,35 @@ TEST_CASE("rope neox rotates pairs at pos=1, full rotary") {
   CHECK(qs[2] == doctest::Approx(0.841471f));
   CHECK(qs[3] == doctest::Approx(0.99995f));
   CHECK(ks[0] == doctest::Approx(0.540302f));  // k rotated identically
+}
+
+TEST_CASE("rope bf16 in-place: same pos=1 golden within bf16 eps") {
+  // Same golden as the f32 case; q/k stored as bf16 and rotated in place.
+  // bf16(1.0)=0x3F80, bf16(0.0)=0x0000 are exact.
+  std::vector<uint16_t> qs = {0x3F80, 0x0000, 0x0000, 0x3F80};
+  std::vector<uint16_t> ks = {0x3F80, 0x0000, 0x0000, 0x3F80};
+  std::vector<int32_t> pos = {1};
+  Tensor tq = Tensor::Contiguous(qs.data(), DType::kBF16, Cpu(), {1, 1, 4});
+  Tensor tk = Tensor::Contiguous(ks.data(), DType::kBF16, Cpu(), {1, 1, 4});
+  Tensor tp = Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {1});
+  Queue q{Cpu(), nullptr};
+  vt::RopeNeox(q, tq, tk, tp, RopeArgs{10000.0f, 4});
+  CHECK(vt::BF16ToF32(qs[0]) == doctest::Approx(0.540302f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(qs[1]) == doctest::Approx(-0.00999983f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(qs[2]) == doctest::Approx(0.841471f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(qs[3]) == doctest::Approx(0.99995f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(ks[0]) == doctest::Approx(0.540302f).epsilon(0.01));
+}
+
+TEST_CASE("rope rejects mismatched q/k dtypes") {
+  std::vector<float> qbuf(4, 0.0f);
+  std::vector<uint16_t> kbuf(4, 0);
+  std::vector<int32_t> pos = {0};
+  Tensor tq = Tensor::Contiguous(qbuf.data(), DType::kF32, Cpu(), {1, 1, 4});
+  Tensor tk = Tensor::Contiguous(kbuf.data(), DType::kBF16, Cpu(), {1, 1, 4});
+  Tensor tp = Tensor::Contiguous(pos.data(), DType::kI32, Cpu(), {1});
+  Queue q{Cpu(), nullptr};
+  CHECK_THROWS_AS(vt::RopeNeox(q, tq, tk, tp, RopeArgs{10000.0f, 4}), std::runtime_error);
 }
 
 TEST_CASE("rope pos=0 is identity") {

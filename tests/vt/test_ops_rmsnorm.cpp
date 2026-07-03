@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "vt/dtype.h"
 #include "vt/ops.h"
 
 using vt::Device;
@@ -88,6 +89,34 @@ TEST_CASE("rmsnorm multi-row normalizes independently") {
   vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false});
   CHECK(out[0] == doctest::Approx(0.848528f));  // row 0
   CHECK(out[2] == doctest::Approx(0.848528f));  // row 1 same direction
+}
+
+TEST_CASE("rmsnorm bf16 output: same golden within bf16 eps") {
+  // Same golden as the f32 case: out = [1.697056, 0.565685], stored as bf16.
+  std::vector<float> x = {3.0f, 4.0f};
+  std::vector<float> w = {2.0f, 0.5f};
+  std::vector<uint16_t> out(2, 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 2});
+  Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false});
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(1.697056f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(0.565685f).epsilon(0.01));
+}
+
+TEST_CASE("rmsnorm fused residual stream stays f32-only") {
+  // Residual is kept full precision by design; a bf16 residual must throw.
+  std::vector<float> x = {1.0f, 2.0f};
+  std::vector<uint16_t> res = {0x4000, 0x4000};  // bf16(2.0)
+  std::vector<float> w = {1.0f, 1.0f};
+  std::vector<float> out(2, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 2});
+  Tensor tr = Tensor::Contiguous(res.data(), DType::kBF16, Cpu(), {1, 2});
+  Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  CHECK_THROWS_AS(vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false}, &tr), std::runtime_error);
 }
 
 TEST_CASE("rmsnorm accepts bf16 inputs via f32 conversion") {

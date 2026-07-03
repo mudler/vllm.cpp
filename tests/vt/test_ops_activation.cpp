@@ -1,8 +1,10 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <vector>
 
+#include "vt/dtype.h"
 #include "vt/ops.h"
 
 using vt::Device;
@@ -29,6 +31,18 @@ TEST_CASE("silu_and_mul golden") {
   CHECK(out[1] == doctest::Approx(7.046377f));
 }
 
+TEST_CASE("silu_and_mul bf16 output: same golden within bf16 eps") {
+  // Same golden as the f32 case: out = [2.193176, 7.046377], stored as bf16.
+  std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<uint16_t> out(2, 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 4});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::SiluAndMul(q, to, tx);
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(2.193176f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(7.046377f).epsilon(0.01));
+}
+
 TEST_CASE("silu_and_mul rejects odd inner dim") {
   std::vector<float> x(3, 0.0f);
   std::vector<float> out(1, 0.0f);
@@ -52,6 +66,22 @@ TEST_CASE("embedding gathers rows by id") {
   CHECK(out[1] == 21.0f);
   CHECK(out[2] == 0.0f);
   CHECK(out[3] == 1.0f);
+}
+
+TEST_CASE("embedding bf16 output: same golden within bf16 eps") {
+  // Same golden as the f32 case: [[20,21],[0,1]], stored as bf16.
+  std::vector<float> table = {0, 1, 10, 11, 20, 21};
+  std::vector<int32_t> ids = {2, 0};
+  std::vector<uint16_t> out(4, 0xFFFF);
+  Tensor tt = Tensor::Contiguous(table.data(), DType::kF32, Cpu(), {3, 2});
+  Tensor ti = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {2, 2});
+  Queue q{Cpu(), nullptr};
+  vt::Embedding(q, to, tt, ti);
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(20.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(21.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[2]) == doctest::Approx(0.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[3]) == doctest::Approx(1.0f).epsilon(0.01));
 }
 
 TEST_CASE("embedding bounds-checks ids") {

@@ -15,16 +15,24 @@ float LoadF32(const Tensor& t, int64_t elem_offset) {
   }
 }
 
+// Mirror of LoadF32 for outputs: f32 stores directly, bf16 rounds via F32ToBF16.
+void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
+  switch (t.dtype) {
+    case DType::kF32: t.Ptr<float>()[elem_offset] = v; break;
+    case DType::kBF16: t.Ptr<uint16_t>()[elem_offset] = F32ToBF16(v); break;
+    default: VT_CHECK(false, "StoreF32: unsupported dtype");
+  }
+}
+
 void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
-  float* o = out.Ptr<float>();
   for (int64_t i = 0; i < m; ++i) {
     for (int64_t j = 0; j < n; ++j) {
       float acc = 0.0f;
       for (int64_t p = 0; p < k; ++p) {
         acc += LoadF32(a, i * k + p) * LoadF32(b, p * n + j);
       }
-      o[i * n + j] = acc;
+      StoreF32(out, i * n + j, acc);
     }
   }
 }
@@ -32,7 +40,6 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
-  float* o = out.Ptr<float>();
   for (int64_t i = 0; i < t; ++i) {
     float* res_row = residual ? residual->Ptr<float>() + i * h : nullptr;
     float sumsq = 0.0f;
@@ -49,47 +56,47 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
       float v = res_row ? res_row[j] : LoadF32(x, i * h + j);
       float wj = LoadF32(w, j);
       if (args.gemma) wj += 1.0f;
-      o[i * h + j] = v * inv * wj;
+      StoreF32(out, i * h + j, v * inv * wj);
     }
   }
 }
 
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
-  float* o = out.Ptr<float>();
   for (int64_t i = 0; i < t; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float gate = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
       float silu = gate / (1.0f + std::exp(-gate));
-      o[i * d + j] = silu * up;
+      StoreF32(out, i * d + j, silu * up);
     }
   }
 }
 
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
-  float* o = out.Ptr<float>();
   for (int64_t i = 0; i < t; ++i) {
     int64_t id = ids.dtype == DType::kI32 ? ids.Ptr<int32_t>()[i] : ids.Ptr<int64_t>()[i];
     VT_CHECK(id >= 0 && id < v, "embedding: id out of range");
     for (int64_t j = 0; j < h; ++j) {
-      o[i * h + j] = LoadF32(table, id * h + j);
+      StoreF32(out, i * h + j, LoadF32(table, id * h + j));
     }
   }
 }
 
-void RopeRotateHead(float* head, int rot, double base, int64_t pos) {
+// In-place rotation of one head starting at element head_off; f32 math,
+// stores round back to the tensor's dtype (f32 or bf16).
+void RopeRotateHead(const Tensor& t, int64_t head_off, int rot, double base, int64_t pos) {
   const int half = rot / 2;
   for (int i = 0; i < half; ++i) {
     double freq = std::pow(base, -2.0 * i / rot);
     double angle = static_cast<double>(pos) * freq;
     float c = static_cast<float>(std::cos(angle));
     float s = static_cast<float>(std::sin(angle));
-    float x = head[i];
-    float y = head[i + half];
-    head[i] = x * c - y * s;
-    head[i + half] = x * s + y * c;
+    float x = LoadF32(t, head_off + i);
+    float y = LoadF32(t, head_off + i + half);
+    StoreF32(t, head_off + i, x * c - y * s);
+    StoreF32(t, head_off + i + half, x * s + y * c);
   }
 }
 
@@ -98,23 +105,28 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   for (int64_t i = 0; i < t; ++i) {
     int64_t p = pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
     for (int64_t hh = 0; hh < hq; ++hh) {
-      RopeRotateHead(qs.Ptr<float>() + (i * hq + hh) * d, args.rotary_dim,
-                     static_cast<double>(args.base), p);
+      RopeRotateHead(qs, (i * hq + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
     }
     for (int64_t hh = 0; hh < hk; ++hh) {
-      RopeRotateHead(ks.Ptr<float>() + (i * hk + hh) * d, args.rotary_dim,
-                     static_cast<double>(args.base), p);
+      RopeRotateHead(ks, (i * hk + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
     }
   }
 }
 
 struct Registrar {
   Registrar() {
-    RegisterOp(OpId::kMatmul, DeviceType::kCPU, reinterpret_cast<void*>(&MatmulKernel));
-    RegisterOp(OpId::kRmsNorm, DeviceType::kCPU, reinterpret_cast<void*>(&RmsNormKernel));
-    RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU, reinterpret_cast<void*>(&SiluAndMulKernel));
-    RegisterOp(OpId::kEmbedding, DeviceType::kCPU, reinterpret_cast<void*>(&EmbeddingKernel));
-    RegisterOp(OpId::kRopeNeox, DeviceType::kCPU, reinterpret_cast<void*>(&RopeNeoxKernel));
+    // static_cast against the ops.h aliases ties kernel signatures to the
+    // registration contract at compile time.
+    RegisterOp(OpId::kMatmul, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
+    RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
+    RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kEmbedding, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
   }
 } registrar;
 

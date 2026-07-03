@@ -47,3 +47,14 @@
   pos 131k) — M0.3 goldens need position-scaled tolerance; rmsnorm/silu
   standard paths keep f32 precision vs upstream's pre-multiply dtype
   rounding (documented in ops.h).
+- **2026-07-03 (later)** — M0.3 done (`f063890`): parity harness runs
+  end-to-end — upstream dump scripts on dgx.casa → committed goldens →
+  C++ replay in CI (12/12 ctest; 9 golden op cases: 4 rmsnorm + matmul +
+  silu + embedding + 2 rope, all green). Oracle: pip vLLM 0.24.0 in
+  `~/venvs/vllm-oracle` on dgx.casa; per-op drift checks vs pin `e24d1b24`
+  clean (silu/rope byte-identical; matmul/embedding pure torch) —
+  drift-check discipline documented in `tools/parity/README.md`. Note:
+  M2.1's vLLM-install TODO is partially pre-staged (oracle venv exists;
+  serving baseline still to be measured). NEXT: M0.4 loaders (safetensors
+  + GGUF incl. NVFP4 extension types; remember the `Tensor::Numel`
+  overflow guard is due here — untrusted file metadata).

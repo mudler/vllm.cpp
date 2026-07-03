@@ -20,7 +20,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
   the portability requirements in [backends.md](backends.md) (open device
   enum, unified-memory awareness, per-device queue handles, optional
   graph-capture hook). DoD: op unit tests.
-- ☐ **M0.3 Parity harness**: `tools/parity/` dump scripts (upstream vLLM on
+- ✅ **M0.3 Parity harness** (`f063890`): `tools/parity/` dump scripts (upstream vLLM on
   dgx.casa produces golden op/layer/logits dumps); C++ test loader +
   threshold framework. DoD: harness runs end-to-end on one op both backends.
 - ☐ **M0.4 Loaders**: safetensors mmap loader + HF config.json; GGUF container

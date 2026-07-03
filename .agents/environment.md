@@ -9,6 +9,8 @@
   kernels in T0. Keep build/bench artifacts in `~/work/vllm.cpp/` there.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
+  - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
+    parity oracle (golden op dumps via `tools/parity/`).
 
 ## Benchmark models on dgx.casa
 
@@ -33,5 +35,5 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- vLLM is NOT installed on dgx.casa — install it (or container) to produce
-  the parity baseline + golden dumps before benchmark work.
+- vLLM is now installed on dgx.casa for op-oracle use (`~/venvs/vllm-oracle`,
+  pip 0.24.0); the M2.1 serving baseline still needs to be measured with it.

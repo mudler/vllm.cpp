@@ -53,7 +53,70 @@ def dump_rmsnorm(root):
                   ["x", "weight", "residual_in"], ["out", "residual_out"], TIGHT)
 
 
-DUMPERS = {"rmsnorm": dump_rmsnorm}
+def dump_matmul(root):
+    # Oracle is pure torch (no vLLM layer code): f32-accumulation reference
+    # over bf16-rounded inputs, matching our kernel's accumulation exactly.
+    torch.manual_seed(0)
+    a = torch.randn(16, 64, dtype=torch.bfloat16)
+    b = torch.randn(64, 32, dtype=torch.bfloat16)
+    out = a.float() @ b.float()
+    save_case(root, "matmul_bf16_16x64x32", "matmul",
+              {"a": a, "b": b, "out": out}, {}, ["a", "b"], ["out"], TIGHT)
+
+
+def dump_silu_and_mul(root):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.activation import SiluAndMul
+    with set_current_vllm_config(VllmConfig()):
+        torch.manual_seed(0)
+        x = torch.randn(8, 256, dtype=torch.bfloat16)
+        out = SiluAndMul().forward_native(x)
+        save_case(root, "silu_and_mul_bf16_8x256", "silu_and_mul",
+                  {"x": x, "out": out.float()}, {}, ["x"], ["out"], BF16)
+
+
+def dump_embedding(root):
+    # Oracle is pure torch F.embedding: exact row gather.
+    torch.manual_seed(0)
+    table = torch.randn(64, 32, dtype=torch.bfloat16)
+    ids = torch.randint(0, 64, (32,), dtype=torch.int64)
+    ids[0], ids[1], ids[2], ids[3] = 0, 63, 7, 7  # boundary ids + guaranteed dup
+    out = torch.nn.functional.embedding(ids, table)
+    save_case(root, "embedding_bf16_32ids", "embedding",
+              {"table": table, "ids": ids, "out": out.float()},
+              {}, ["table", "ids"], ["out"], TIGHT)
+
+
+def dump_rope(root):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    with set_current_vllm_config(VllmConfig()):
+        torch.manual_seed(0)
+        rope = get_rope(head_size=64, max_position=200000, is_neox_style=True,
+                        rope_parameters={"rope_type": "default", "rope_theta": 10000,
+                                         "rope_dim": 32}, dtype=torch.float32)
+        args = {"base": float(rope.base), "rotary_dim": 32, "head_size": 64,
+                "num_q_heads": 4, "num_kv_heads": 2,
+                "get_rope_call": ("get_rope(head_size=64, max_position=200000, "
+                                  "is_neox_style=True, rope_parameters={'rope_type': "
+                                  "'default', 'rope_theta': 10000, 'rope_dim': 32}, "
+                                  "dtype=torch.float32)")}
+        for name, pos, tol in (
+                ("rope_f32_pos_short", torch.arange(0, 64, 8, dtype=torch.int64), TIGHT),
+                ("rope_f32_pos_131k", torch.arange(131040, 131104, 8, dtype=torch.int64),
+                 {"atol": 2e-2, "rtol": 0.0})):
+            q = torch.randn(8, 4 * 64, dtype=torch.float32)  # [T, Hq*D] flattened
+            k = torch.randn(8, 2 * 64, dtype=torch.float32)  # [T, Hk*D] flattened
+            q_out, k_out = rope.forward_native(pos, q.clone(), k.clone())
+            save_case(root, name, "rope",
+                      {"q_in": q, "k_in": k, "positions": pos,
+                       "q_out": q_out, "k_out": k_out},
+                      args, ["q_in", "k_in", "positions"], ["q_out", "k_out"], tol)
+
+
+DUMPERS = {"rmsnorm": dump_rmsnorm, "matmul": dump_matmul,
+           "silu_and_mul": dump_silu_and_mul, "embedding": dump_embedding,
+           "rope": dump_rope}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

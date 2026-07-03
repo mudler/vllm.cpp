@@ -30,6 +30,10 @@ vllm_cpp_add_test(test_npy parity/test_npy.cpp)
 target_compile_definitions(test_npy PRIVATE
   VLLM_CPP_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens")
 
+vllm_cpp_add_test(test_tokenizer_parity vllm/test_tokenizer_parity.cpp)
+target_compile_definitions(test_tokenizer_parity PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
 target_compile_definitions(test_op_parity PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

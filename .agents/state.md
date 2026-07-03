@@ -72,3 +72,18 @@
   in `.agents/gguf-nvfp4-notes.md`); the nvidia 35B snapshot was incomplete
   and had to be downloaded fresh. NEXT: finish M0.5 tokenizer (tasks 5-7:
   incremental detokenizer, corpus goldens vs HF tokenizers, records).
+- **2026-07-03 (later)** — M0.5 done (`0baa46e`): tokenizer landed — unicode
+  tables (exhaustive 1.1M-cp oracle-verified), pretokenize scanner, BPE core
+  + tokenizer.json loader (548-string differential vs real Qwen3.6 tokenizer
+  clean except recorded NFC deviation), GGUF vocab source (real-file parity
+  33/33), incremental detokenizer (ported from pinned v1/engine/
+  detokenizer.py, oracle exec'd verbatim, char-window stop parity), 64-entry
+  corpus goldens (HF path in CI; GGUF path diff-empty on dgx.casa). 20/20
+  ctest, CI green. Discoveries: the Qwen3.6 pretokenize regex is a \p{M}
+  variant (\p{M} additions vs classic qwen2) — DISCOVERED and verified vs
+  both gate checkpoints; classic "qwen2" fail-louds until a kQwen2Classic
+  exists; the GGUF pre name is "qwen35"; NFC gap open (normalizer
+  accepted-not-applied) → post-MVP hardening item; kLlama3 regex remains
+  PROVISIONAL. NEXT: M0.6 CUDA baseline ops on dgx.casa (carried items:
+  fn-type aliases → ops.h; embedding GPU bounds contract; widen out-dtype
+  validation for bf16 outputs).

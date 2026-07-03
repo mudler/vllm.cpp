@@ -213,9 +213,9 @@ server binary), `examples/bench`.
   (name mapping GGUF→vLLM params) — T0 (gate). Sharded-state, tensorizer,
   runai, BnB loaders — T3.
 - **Tokenizer**: HF `tokenizer.json` byte-level BPE + Qwen/Llama-3 pretokenizers,
-  incremental detokenization, special-token handling — T0. GGUF-embedded vocab
-  (llama.cpp `tokenizer.ggml.*` metadata) — T0 (gate models must run from bare
-  GGUF). SentencePiece — T1.
+  incremental detokenization, special-token handling — T0 ✅ `0baa46e`.
+  GGUF-embedded vocab (llama.cpp `tokenizer.ggml.*` metadata) — T0 (gate models
+  must run from bare GGUF) ✅ `0baa46e`. SentencePiece — T1.
 
 ## 9. Deviations from upstream (forced, recorded)
 

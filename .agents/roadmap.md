@@ -26,7 +26,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 - ✅ **M0.4 Loaders** (`4aeae62`): safetensors mmap loader + HF config.json; GGUF container
   reader (metadata + tensor table + standard quants; NVFP4 extension types).
   DoD: both parse the gate checkpoints; tensor bytes verified vs Python.
-- ☐ **M0.5 Tokenizer**: byte-level BPE from tokenizer.json + GGUF vocab;
+- ✅ **M0.5 Tokenizer** (`0baa46e`): byte-level BPE from tokenizer.json + GGUF vocab;
   incremental detokenizer. DoD: token-for-token vs HF tokenizers on corpus;
   ported detokenizer edge-case tests.
 - ☐ **M0.6 CUDA baseline ops**: cuBLASLt GEMM, rmsnorm (+Gemma/gated

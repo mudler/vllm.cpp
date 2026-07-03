@@ -806,7 +806,9 @@ bool RunQwen36Norm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   for (int64_t i = 0; i < H; ++i) wf32[static_cast<size_t>(i)] = vt::BF16ToF32(wsrc[i]);
   DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
   DeviceBuf dw(b, q, DType::kF32, {H}, wf32.data());
-  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  // The oracle's GemmaRMSNorm returns bf16 (model dtype); round our output to
+  // bf16 too so the tight 1e-3 golden compares like-for-like.
+  DeviceBuf dout(b, q, DType::kBF16, ShapeOf(x.tensor));
   vt::RmsNormArgs args{m["args"]["eps"].get<float>(), /*gemma=*/true};
   vt::RmsNorm(q, dout.tensor(), dx.tensor(), dw.tensor(), args);
   std::vector<uint8_t> out_host;

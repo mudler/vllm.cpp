@@ -83,7 +83,8 @@ add_library(vllm STATIC
   src/vt/arena.cpp
   src/vt/ops.cpp
   src/vt/cpu/cpu_backend.cpp
-  src/vt/cpu/cpu_ops.cpp)
+  src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_cache.cpp)
 add_library(vllm::vllm ALIAS vllm)
 # Static-init registrars (e.g. the CPU backend) live in archive members no
 # consumer references directly; force-link the whole vllm archive so every
@@ -102,7 +103,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu
-    src/vt/cuda/cuda_moe.cu)
+    src/vt/cuda/cuda_moe.cu
+    src/vt/cuda/cuda_cache.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

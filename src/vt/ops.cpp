@@ -343,4 +343,38 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                                                         value, args);
 }
 
+void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                     Tensor& v_cache, const Tensor& slot_mapping) {
+  VT_CHECK(k.rank == 3 && v.rank == 3,
+           "reshape_and_cache: k/v must be rank-3 [num_tokens,num_kv_heads,head_size]");
+  VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
+           "reshape_and_cache: k_cache/v_cache must be rank-4 "
+           "[num_blocks,block_size,num_kv_heads,head_size]");
+  VT_CHECK(slot_mapping.rank == 1, "reshape_and_cache: slot_mapping must be rank-1 [num_slots]");
+  const int64_t num_kv_heads = k.shape[1], head_size = k.shape[2];
+  VT_CHECK(v.shape[0] == k.shape[0] && v.shape[1] == num_kv_heads && v.shape[2] == head_size,
+           "reshape_and_cache: k and v must share [num_tokens,num_kv_heads,head_size]");
+  VT_CHECK(k_cache.shape[2] == num_kv_heads && k_cache.shape[3] == head_size,
+           "reshape_and_cache: k_cache num_kv_heads/head_size must match k");
+  VT_CHECK(v_cache.shape[0] == k_cache.shape[0] && v_cache.shape[1] == k_cache.shape[1] &&
+               v_cache.shape[2] == k_cache.shape[2] && v_cache.shape[3] == k_cache.shape[3],
+           "reshape_and_cache: k_cache and v_cache must share shape");
+  // Upstream uses slot_mapping.size(0) as the token count: k/v may carry extra
+  // trailing rows (CUDA-graph padding) that are ignored.
+  VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
+           "reshape_and_cache: num_tokens (k.shape[0]) must be >= slot_mapping length");
+  VT_CHECK(IsFloat(k.dtype) && k.dtype == v.dtype && k_cache.dtype == k.dtype &&
+               v_cache.dtype == k.dtype,
+           "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");
+  VT_CHECK(slot_mapping.dtype == DType::kI64, "reshape_and_cache: slot_mapping must be i64");
+  VT_CHECK(k.IsContiguous() && v.IsContiguous() && k_cache.IsContiguous() &&
+               v_cache.IsContiguous() && slot_mapping.IsContiguous(),
+           "reshape_and_cache: contiguous tensors required");
+  VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
+               v_cache.device == q.device && slot_mapping.device == q.device,
+           "reshape_and_cache: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
+  reinterpret_cast<ReshapeAndCacheFn>(GetOp(OpId::kReshapeAndCache, q.device.type))(
+      q, k, v, k_cache, v_cache, slot_mapping);
+}
+
 }  // namespace vt

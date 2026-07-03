@@ -20,6 +20,7 @@ enum class OpId : uint8_t {
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
+  kReshapeAndCache,
   kCount
 };
 
@@ -113,6 +114,8 @@ using MoeCombineFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
+                                   const Tensor&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -259,5 +262,25 @@ void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& w
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// --- Paged KV-cache write (M1.6). Semantics ported from the FlashAttention
+// path of vllm/csrc/.../cache_kernels.cu::reshape_and_cache_flash @ e24d1b24;
+// the NHD cache layout is the one FlashAttentionBackend::get_kv_cache_shape
+// allocates (num_blocks, 2, block_size, num_kv_heads, head_size) — NOT the HND
+// cpu_attn layout.
+//
+// Writes each new per-token K/V into the paged cache at its slot id.
+//   k / v          [num_tokens, num_kv_heads, head_size]   (source rows)
+//   k_cache/v_cache[num_blocks, block_size, num_kv_heads, head_size]  (the two
+//                  dim-1 slices of the flash cache; written in place)
+//   slot_mapping   [num_slots] i64  (num_slots <= num_tokens; the tail of k/v is
+//                  CUDA-graph padding and is ignored)
+// For token t with slot s = slot_mapping[t]: block = s / block_size,
+// offset = s % block_size, and k[t] is copied to k_cache[block, offset, :, :]
+// (all kv-heads, all head_size). A slot s < 0 skips token t (padding). The copy
+// is a raw element copy (the "auto" cache path: cache dtype == k/v dtype, no
+// fp8 scaling — fp8 KV cache is out of T0 scope).
+void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                     Tensor& v_cache, const Tensor& slot_mapping);
 
 }  // namespace vt

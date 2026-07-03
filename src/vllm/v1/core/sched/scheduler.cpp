@@ -270,26 +270,35 @@ SchedulerOutput Scheduler::schedule() {
         kv_cache_manager->get_num_common_prefix_blocks(running[0]->request_id);
   }
 
-  // Construct the scheduler output (MRV1 path — resumed reqs flow through the
-  // cached diff; the V2 model-runner merge is deferred).
+  // Construct the scheduler output (MRV2 / V2 model-runner path — upstream
+  // scheduler.py:1047-1080 `if self.use_v2_model_runner:` branch). Resumed
+  // (PREEMPTED->RUNNING this step) requests fold into scheduled_new_reqs and
+  // are re-sent as FULL new reqs carrying prefill_token_ids, NOT through the
+  // cached diff: the V2 gpu runner (M1.5) asserts every new req has
+  // prefill_token_ids and re-seeds its per-request all_token_ids from it. The
+  // MRV1 path (resumed-as-cached + CachedRequestData.all_token_ids) is NOT
+  // ported (the V2 runner never reads CachedRequestData.all_token_ids).
+  scheduled_new_reqs.insert(scheduled_new_reqs.end(),
+                            scheduled_resumed_reqs.begin(),
+                            scheduled_resumed_reqs.end());
+  scheduled_resumed_reqs.clear();
+
   std::vector<NewRequestData> new_reqs_data;
   new_reqs_data.reserve(scheduled_new_reqs.size());
   for (Request* req : scheduled_new_reqs) {
+    // prefill_token_ids = the request's full token ids (prompt+output; at
+    // prefill this is the prompt). Upstream passes req._all_token_ids.
     new_reqs_data.push_back(NewRequestData::from_request(
-        *req, req_to_new_blocks.at(req->request_id).get_block_ids()));
+        *req, req_to_new_blocks.at(req->request_id).get_block_ids(),
+        req->AllTokenIds()));
   }
 
+  // The cached diff now covers only the already-running reqs; scheduled_resumed_
+  // reqs was cleared above (kept in the signature for upstream fidelity — the V2
+  // branch still passes it, now empty).
   CachedRequestData cached_reqs_data = make_cached_request_data(
       scheduled_running_reqs, scheduled_resumed_reqs, num_scheduled_tokens,
       req_to_new_blocks);
-
-  // Record the request ids scheduled this step (MRV1-only), AFTER building the
-  // cached diff (which reads the PRIOR step's set).
-  prev_step_scheduled_req_ids_.clear();
-  for (const auto& [id, n] : num_scheduled_tokens) {
-    (void)n;
-    prev_step_scheduled_req_ids_.insert(id);
-  }
 
   SchedulerOutput scheduler_output;
   scheduler_output.scheduled_new_reqs = std::move(new_reqs_data);
@@ -325,11 +334,10 @@ CachedRequestData Scheduler::make_cached_request_data(
     if (idx >= num_running_reqs) {
       data.resumed_req_ids.insert(req_id);
     }
-    // MRV1 (use_v2_model_runner == false): propagate the full token ids for
-    // requests not scheduled in the prior step.
-    if (prev_step_scheduled_req_ids_.count(req_id) == 0) {
-      data.all_token_ids[req_id] = req->AllTokenIds();
-    }
+    // MRV2 (V2 model runner): CachedRequestData.all_token_ids is never read by
+    // the runner, so the MRV1 prev-step-gated all_token_ids propagation is
+    // dropped (the field stays empty). Resumed reqs no longer flow here at all
+    // (folded into scheduled_new_reqs with prefill_token_ids upstream).
     data.new_block_ids.push_back(
         req_to_new_blocks.at(req_id).get_block_ids(/*allow_none=*/true));
     data.num_computed_tokens.push_back(req->num_computed_tokens);

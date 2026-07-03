@@ -265,6 +265,77 @@ TEST_CASE("Scheduler.schedule: KV exhaustion preempts the FCFS tail") {
 }
 
 // ---------------------------------------------------------------------------
+// Resumed-as-new (MRV2 output fold): a preempted request that is re-scheduled
+// after KV frees appears in scheduled_new_reqs (NOT the cached diff), carrying
+// prefill_token_ids == its full token ids. This exercises the V2 output tail
+// (upstream scheduler.py `if self.use_v2_model_runner:` branch): resumed reqs
+// are folded into scheduled_new_reqs and re-sent as FULL new reqs so the V2 gpu
+// runner (M1.5) can re-seed its per-request all_token_ids from prefill_token_ids.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: resumed (preempted) request re-enters as new") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/16,
+                                   /*max_num_batched_tokens=*/100,
+                                   /*enable_chunked_prefill=*/true,
+                                   /*num_blocks=*/11, /*block_size=*/16);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/80,
+                                 {"0", "1"});
+  Request* req0 = requests[0].get();
+  Request* req1 = requests[1].get();
+
+  // Fill the KV cache with two 80-token reqs (5 blocks each).
+  AddRequest(*scheduler, std::move(requests[0]));
+  scheduler->schedule();
+  AddRequest(*scheduler, std::move(requests[1]));
+  scheduler->schedule();
+
+  // req0 samples a token -> needs a 6th block; KV is full, so the FCFS tail
+  // (req1) is preempted (KV freed, re-queued to the waiting front).
+  req0->AppendOutputToken(0);
+  scheduler->schedule();
+  REQUIRE(req1->status == RequestStatus::kPreempted);
+  REQUIRE(scheduler->waiting->peek_request() == req1);
+
+  // Free req0's KV so the preempted req1 has room to be re-scheduled.
+  scheduler->finish_requests("0", RequestStatus::kFinishedStopped);
+
+  auto out = scheduler->schedule();
+
+  // The V2 fold: req1 resumes as a NEW req (folded from scheduled_resumed_reqs),
+  // NOT through the cached diff.
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == "1");
+  CHECK(out.scheduled_cached_reqs.num_reqs() == 0);
+  // resumed_req_ids in the cached diff stays empty (resumed folded into new).
+  CHECK(out.scheduled_cached_reqs.resumed_req_ids.empty());
+  CHECK(req1->status == RequestStatus::kRunning);
+
+  // prefill_token_ids carries req1's full token ids so the V2 runner re-seeds
+  // its state; req1 never decoded, so this is its 80-token prompt.
+  const auto& seed = out.scheduled_new_reqs[0].prefill_token_ids;
+  REQUIRE(seed.has_value());
+  CHECK(*seed == req1->AllTokenIds());
+  CHECK(seed->size() == 80);
+}
+
+// ---------------------------------------------------------------------------
+// A first-time (WAITING->RUNNING) new req also carries prefill_token_ids == its
+// full token ids under the MRV2 path (upstream V2 branch seeds every new req).
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: new req carries prefill_token_ids seed") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/10, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  auto out = scheduler->schedule();
+
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  const auto& seed = out.scheduled_new_reqs[0].prefill_token_ids;
+  REQUIRE(seed.has_value());
+  CHECK(*seed == req->AllTokenIds());
+  CHECK(seed->size() == 10);
+}
+
+// ---------------------------------------------------------------------------
 // max_num_seqs cap: only max_num_seqs requests run concurrently. (test_schedule
 // admission bound.)
 // ---------------------------------------------------------------------------

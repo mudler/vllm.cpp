@@ -21,7 +21,9 @@
 //
 // DEFERRED upstream state (marked; T0 never populates these):
 //   NewRequestData: mm_features (multimodal), pooling_params, lora_request,
-//     prompt_embeds, prompt_is_token_ids, prefill_token_ids (v2 model runner).
+//     prompt_embeds, prompt_is_token_ids. prefill_token_ids IS carried now (the
+//     MRV2 / V2 model-runner path — see the field note); the MRV1 path is not
+//     ported.
 //   SchedulerOutput trailing optionals, OMITTED here (a later unit slots them
 //     back in without reshaping the struct): preempted_req_ids /
 //     new_block_ids_to_zero (v2 model runner), has_structured_output_requests /
@@ -78,13 +80,22 @@ struct NewRequestData {
   // Per-KV-cache-group block ids (upstream tuple[list[int], ...]).
   std::vector<std::vector<int>> block_ids;
   int num_computed_tokens = 0;
+  // MRV2 (V2 model runner) full token-id seed: prompt+output at schedule time.
+  // The V2 gpu runner asserts this is present for every new req and seeds its
+  // per-request all_token_ids state from it (model_runner add_requests:
+  // all_token_ids = prefill_token_ids). The MRV1 path passed nullopt; the V2
+  // path passes request.AllTokenIds(). Upstream list[int] | None.
+  std::optional<std::vector<int32_t>> prefill_token_ids;
 
   // from_request: build the full payload from the Request + its allocated
   // per-group block ids. Copies req_id, prompt_token_ids, sampling_params,
-  // block_ids, num_computed_tokens. (Upstream NewRequestData.from_request;
-  // mm/pooling/lora/prompt_embeds/prefill_token_ids DEFERRED.)
-  static NewRequestData from_request(const Request& request,
-                                     std::vector<std::vector<int>> block_ids);
+  // block_ids, num_computed_tokens, and the (optional) prefill_token_ids seed.
+  // The V2 model-runner path passes prefill_token_ids = request.AllTokenIds();
+  // callers that do not need the seed omit it (nullopt). (Upstream
+  // NewRequestData.from_request; mm/pooling/lora/prompt_embeds DEFERRED.)
+  static NewRequestData from_request(
+      const Request& request, std::vector<std::vector<int>> block_ids,
+      std::optional<std::vector<int32_t>> prefill_token_ids = std::nullopt);
 };
 
 // CachedRequestData: the DIFF-only payload for requests scheduled before.

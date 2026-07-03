@@ -10,13 +10,15 @@
 namespace vllm::v1 {
 
 NewRequestData NewRequestData::from_request(
-    const Request& request, std::vector<std::vector<int>> block_ids) {
+    const Request& request, std::vector<std::vector<int>> block_ids,
+    std::optional<std::vector<int32_t>> prefill_token_ids) {
   NewRequestData data;
   data.req_id = request.request_id;
   data.prompt_token_ids = request.prompt_token_ids;
   data.sampling_params = request.sampling_params;
   data.block_ids = std::move(block_ids);
   data.num_computed_tokens = request.num_computed_tokens;
+  data.prefill_token_ids = std::move(prefill_token_ids);
   return data;
 }
 

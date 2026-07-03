@@ -19,12 +19,19 @@
 //     hit, chunked-prefill split via min(num_new_tokens, token_budget),
 //     allocate_slots with full_sequence_must_fit = scheduler_reserve_full_isl,
 //     admit as scheduled_new (WAITING) or scheduled_resumed (PREEMPTED).
-//   * SchedulerOutput assembly: NewRequestData for first-time reqs +
-//     CachedRequestData diff (_make_cached_request_data) for already-running /
-//     resumed reqs, the num_scheduled_tokens map + total, num_common_prefix_
-//     blocks, finished_req_ids; then _update_after_schedule advances
-//     num_computed_tokens (so the next step continues a chunked prefill) and
-//     flips is_prefill_chunk.
+//   * SchedulerOutput assembly (MRV2 / V2 model-runner path — upstream
+//     scheduler.py `if self.use_v2_model_runner:` branch): resumed
+//     (PREEMPTED->RUNNING) reqs fold into scheduled_new_reqs and are re-sent as
+//     FULL NewRequestData carrying prefill_token_ids = request.AllTokenIds()
+//     (the V2 gpu runner asserts prefill_token_ids on every new req and
+//     re-seeds its all_token_ids from it); already-running reqs get the
+//     CachedRequestData diff (_make_cached_request_data) WITHOUT the MRV1
+//     all_token_ids / prev_step_scheduled_req_ids bookkeeping (the V2 runner
+//     never reads CachedRequestData.all_token_ids). Plus the num_scheduled_
+//     tokens map + total, num_common_prefix_blocks, finished_req_ids; then
+//     _update_after_schedule advances num_computed_tokens (so the next step
+//     continues a chunked prefill) and flips is_prefill_chunk. The MRV1 path
+//     (resumed-as-cached) is NOT ported.
 //   * add_request / finish_requests / get_num_unfinished_requests /
 //     get_request_counts / has_finished_requests (T0 subset).
 //
@@ -40,12 +47,13 @@
 //     prefill_capacity_bound), PAUSE state, streaming/resumable sessions,
 //     skipped_waiting, priority scheduling (SchedulingPolicy::kPriority throws).
 //   - Structured-output grammar, LoRA gating, KV-connector / EC-connector,
-//     mamba block-aligned split, the V2 model runner merge (resumed reqs folded
-//     into new_reqs + prefill_token_ids — NewRequestData has no prefill_token_ids
-//     field at T0), defer_block_free / deferred_frees, kv-cache metrics, MFU
-//     perf metrics, log-stats events, take_events / kv_cache_events.
-//   The T0 path follows use_v2_model_runner = false (MRV1), the create_scheduler
-//   default: resumed reqs stay separate and flow through the cached diff.
+//     mamba block-aligned split, defer_block_free / deferred_frees, kv-cache
+//     metrics, MFU perf metrics, log-stats events, take_events /
+//     kv_cache_events.
+//   This ports the MRV2 (V2 model runner, use_v2_model_runner = true) output
+//   path — resumed reqs fold into new_reqs carrying prefill_token_ids — to
+//   match the MRV2 gpu runner M1.5 lands. The MRV1 output path (resumed reqs
+//   stay separate and flow through the cached diff) is NOT ported.
 #ifndef VLLM_V1_CORE_SCHED_SCHEDULER_H_
 #define VLLM_V1_CORE_SCHED_SCHEDULER_H_
 
@@ -134,9 +142,11 @@ class Scheduler {
   void preempt_request(Request* request);
 
   // _make_cached_request_data: build the diff payload for the already-running
-  // (running_reqs) + resumed-from-preemption (resumed_reqs) requests. T0 /
-  // MRV1: use_pp is false so new_token_ids stays empty; all_token_ids is
-  // populated for reqs not scheduled last step.
+  // (running_reqs) + resumed-from-preemption (resumed_reqs) requests. MRV2:
+  // use_pp is false so new_token_ids stays empty, and all_token_ids stays empty
+  // (the V2 runner never reads it). The V2 schedule() tail clears resumed_reqs
+  // before this call (resumed reqs are re-sent as new reqs), so resumed_reqs is
+  // empty in the V2 path — kept in the signature for upstream fidelity.
   CachedRequestData make_cached_request_data(
       const std::vector<Request*>& running_reqs,
       const std::vector<Request*>& resumed_reqs,
@@ -160,9 +170,6 @@ class Scheduler {
   // Scheduler iteration counter (upstream current_step; inert at T0 since
   // next_decode_eligible_step is deferred/0).
   int current_step_ = 0;
-  // MRV1: request ids scheduled in the prior step (gates the all_token_ids
-  // payload in _make_cached_request_data).
-  std::set<std::string> prev_step_scheduled_req_ids_;
 };
 
 }  // namespace vllm::v1

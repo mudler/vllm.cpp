@@ -411,15 +411,38 @@ def _run_router(ops, logits, k, renormalize):
 
 def dump_router_topk(ops, root, dev):
     total = 0
-    for name, T, E, k, dtype, renorm, tol in (
+    for name, T, E, k, dtype, renorm, tol, tie_free in (
             ("moe_router_topk_f32_small", 6, 8, 2, torch.float32, True,
-             TIGHT),
+             TIGHT, False),
             ("moe_router_topk_f32_small_norenorm", 6, 8, 2, torch.float32,
-             False, TIGHT),
+             False, TIGHT, False),
             ("moe_router_topk_bf16_realratio", 16, 256, 8, torch.bfloat16,
-             True, TIGHT)):
+             True, TIGHT, True)):
         torch.manual_seed(0)
-        logits = (torch.randn(T, E, device=dev) * 2.0).to(dtype)
+        logits = torch.randn(T, E, device=dev) * 2.0
+        note_extra = ""
+        if tie_free:
+            # bf16 keeps only 8 mantissa bits, so random logits collide
+            # within a row and torch.topk breaks those ties HIGHER-index
+            # first — the opposite of the production kernel's lowest-index
+            # rule (§3). A correct C++ impl would then mismatch topk_ids on
+            # the tied rows while the (equal) weights silently agree. Break
+            # near-ties with a deterministic per-expert ramp BEFORE the bf16
+            # cast: it barely perturbs the logits (does not change the top-k
+            # structure) yet guarantees a strictly unambiguous ordering.
+            logits = logits + torch.arange(
+                E, device=dev, dtype=torch.float32) * 1e-3
+            note_extra = (" This realratio case is tie-free by construction: "
+                          "logits perturbed by arange*1e-3 pre-bf16 so no "
+                          "row has duplicate f32(bf16) logits (dump-time "
+                          "per-row uniqueness assert enforces it).")
+        logits = logits.to(dtype)
+        # Fail loudly on regeneration if any row still carries duplicate
+        # f32(bf16) logits — a tie would reintroduce the ordering ambiguity.
+        lf = logits.float()
+        for r in range(T):
+            assert torch.unique(lf[r]).numel() == E, \
+                f"{name}: duplicate logits in row {r} (tie-break ambiguity)"
         w, ids = _run_router(ops, logits, k, renorm)
         total += save_case(
             root, name, "moe_router_topk",
@@ -433,9 +456,9 @@ def dump_router_topk(ops, root, dev):
                      "renormalize divides the k selected probs by their sum "
                      "(denom guard: sum>0 else 1, .cu:245-253). Tie-break = "
                      "lowest expert index (.cu:530-537) — not exercised "
-                     "here (random logits), unit-tested in Task 2. "
+                     "here (logits unique per row), unit-tested in Task 2. "
                      "Cross-checked at dump time against pinned "
-                     "cpu_fused_moe.select_experts."},
+                     "cpu_fused_moe.select_experts." + note_extra},
             ["logits"], ["topk_weights", "topk_ids"], tol)
     return total
 

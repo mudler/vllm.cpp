@@ -1010,7 +1010,10 @@ bool RunQwen36Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
   // manifest's 5e-2 atol/rtol is REPORTED (as `violations`) in the message above
   // for the ledger, not gated — 5e-2 is a per-layer bar, wrong at full-model
   // scale. This bound trips only on a real regression, not the accepted gap.
-  constexpr double kLogitGrossBar = 2.0;
+  // Set to ~1.5x the observed 0.994 max gap (review: 2.0 = 2x was loose enough
+  // to miss a regression that roughly doubles the error without flipping these
+  // 16 tokens); exact-greedy above remains the tight primary gate.
+  constexpr double kLogitGrossBar = 1.5;
   REQUIRE(max_gap < kLogitGrossBar);
   return true;
 }

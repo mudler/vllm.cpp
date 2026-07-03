@@ -1,0 +1,73 @@
+{
+ "op": "moe_router_topk",
+ "args": {
+  "num_experts": 256,
+  "top_k": 8,
+  "renormalize": true,
+  "scoring_func": "softmax",
+  "note": "softmax in f32 over ALL experts (kernel converts bf16 logits to f32; topk_softmax_kernels.cu:60-66), greedy top-k (weights descending per token), renormalize divides the k selected probs by their sum (denom guard: sum>0 else 1, .cu:245-253). Tie-break = lowest expert index (.cu:530-537) \u2014 not exercised here (random logits), unit-tested in Task 2. Cross-checked at dump time against pinned cpu_fused_moe.select_experts."
+ },
+ "tensors": {
+  "logits": {
+   "file": "logits.npy",
+   "dtype": "bf16",
+   "shape": [
+    16,
+    256
+   ]
+  },
+  "topk_weights": {
+   "file": "topk_weights.npy",
+   "dtype": "f32",
+   "shape": [
+    16,
+    8
+   ]
+  },
+  "topk_ids": {
+   "file": "topk_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    16,
+    8
+   ]
+  }
+ },
+ "inputs": [
+  "logits"
+ ],
+ "outputs": [
+  "topk_weights",
+  "topk_ids"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "tests/kernels/moe/test_fused_topk.py::torch_topk",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms (is_cpu facade so CustomOp layers pick forward_native)",
+   "vllm.logger",
+   "vllm.envs",
+   "vllm._custom_ops (names only; never called)",
+   "vllm._aiter_ops (rocm_aiter_ops facade, everything disabled)",
+   "vllm.distributed (divide/tp_rank/tp_world_size for activation.py)",
+   "vllm.distributed.eplb.eplb_state (EplbLayerState placeholder)",
+   "vllm.v1.worker.ubatching (dbo_current_ubatch_id=0)",
+   "vllm.v1.attention.backend (AttentionType consts)",
+   "vllm.model_executor.custom_op (CustomOp dispatch shim -> the PINNED forward_native; op_registry dict)",
+   "vllm.model_executor.utils (set_weight_attrs no-op)",
+   "vllm.model_executor.layers.fused_moe.config (RoutingMethodType names)",
+   "vllm.model_executor.layers.fused_moe.utils (moe_kernel_quantize_input identity passthrough \u2014 only the quant_dtype=None branch is reachable)",
+   "vllm.model_executor.layers.quantization.utils.layer_utils (replace_parameter, unused)",
+   "vllm.utils.math_utils / torch_utils (cdiv etc.; direct_register_custom_op no-op)",
+   "tests.kernels.quant_utils (native_w8a8_block_matmul, unreachable for unquantized cases)",
+   "pytest (decorator passthrough, only if not installed)"
+  ]
+ }
+}

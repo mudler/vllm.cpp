@@ -233,7 +233,7 @@ void Tokenizer::FinalizeTables() {
            " with conflicting text");
     }
     slot = t.text;
-    is_added_[static_cast<size_t>(t.id)] = 1;
+    is_added_[static_cast<size_t>(t.id)] = t.special ? 2 : 1;
   }
 }
 
@@ -520,11 +520,18 @@ std::string Tokenizer::Decode(const std::vector<int32_t>& ids) const {
 }
 
 const std::string& Tokenizer::TokenText(int32_t id) const {
-  if (id < 0 || static_cast<size_t>(id) >= token_text_.size() ||
-      token_text_[static_cast<size_t>(id)].empty()) {
-    Fail("unknown token id " + std::to_string(id));
-  }
+  if (!HasToken(id)) Fail("unknown token id " + std::to_string(id));
   return token_text_[static_cast<size_t>(id)];
+}
+
+bool Tokenizer::HasToken(int32_t id) const {
+  return id >= 0 && static_cast<size_t>(id) < token_text_.size() &&
+         !token_text_[static_cast<size_t>(id)].empty();
+}
+
+bool Tokenizer::IsSpecial(int32_t id) const {
+  return id >= 0 && static_cast<size_t>(id) < is_added_.size() &&
+         is_added_[static_cast<size_t>(id)] == 2;
 }
 
 }  // namespace vllm::tok

@@ -53,6 +53,7 @@ add_library(vllm STATIC
   src/vllm/tokenizer/pretokenizer.cpp
   src/vllm/tokenizer/bpe.cpp
   src/vllm/tokenizer/tokenizer.cpp
+  src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

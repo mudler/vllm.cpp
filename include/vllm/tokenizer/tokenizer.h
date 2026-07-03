@@ -51,6 +51,12 @@ class Tokenizer {
   // tokens, literal content for added tokens. Throws on unknown ids.
   const std::string& TokenText(int32_t id) const;
 
+  // True when `id` has an assigned token (in range and not a vocab hole).
+  bool HasToken(int32_t id) const;
+  // True when `id` is an added token carrying the special flag. Drives the
+  // detokenizer's skip_special_tokens; encoding is unaffected.
+  bool IsSpecial(int32_t id) const;
+
   // Number of id slots (max id + 1); ids in [0, VocabSize) may still be
   // unassigned for vocabs with holes.
   int32_t VocabSize() const { return static_cast<int32_t>(token_text_.size()); }
@@ -75,7 +81,8 @@ class Tokenizer {
   MergeRanks merge_ranks_;
   std::vector<SpecialToken> added_tokens_;
   std::vector<std::string> token_text_;  // id -> stored text ("" = unassigned)
-  std::vector<uint8_t> is_added_;        // id -> decode literally
+  // id -> 0 plain vocab, 1 added, 2 added+special. Nonzero decodes literally.
+  std::vector<uint8_t> is_added_;
   SplitPattern pattern_ = SplitPattern::kQwen2;
   int32_t eos_id_ = -1;
   int32_t bos_id_ = -1;

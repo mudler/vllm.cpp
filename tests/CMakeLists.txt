@@ -22,3 +22,8 @@ vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
 target_compile_definitions(test_npy PRIVATE
   VLLM_CPP_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens")
+
+vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
+target_compile_definitions(test_op_parity PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_op_parity PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)

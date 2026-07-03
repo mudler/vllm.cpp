@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+#include "gguf_builder.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
 
@@ -124,6 +126,40 @@ Tokenizer LoadTiny(const std::string& body = kTinyJson) {
 
 std::string WithRegex(const char* regex_json) {
   return ReplaceOnce(kTinyJson, kQwen36RegexJson, regex_json);
+}
+
+// GGUF kv blocks carrying the same oracle-blessed fixture as kTinyJson:
+// tokens indexed 0..21 (index = id), specials expressed via token_type
+// (3=control -> special added token, 4=user-defined -> non-special).
+// Kv order (tests mutate by index): 0=model 1=pre 2=tokens 3=token_type
+// 4=merges 5=eos_token_id.
+std::vector<std::string> TinyGgufKvs() {
+  const std::vector<std::string> tokens = {
+      "h",  "e",  "l",   "o",     "w",  "r",  "d",    "Ġ",      "1",
+      "2",  "ll", "he",  "llo",   "hello",    "Ġw",   "or",     "orld",
+      "Ġworld",   "ld",  "<|end|>",     "<tool>",     "<|end|>of"};
+  std::vector<int32_t> types(19, 1);  // ids 0..18: normal
+  types.insert(types.end(), {3, 4, 3});
+  const std::vector<std::string> merges = {"l l",  "h e", "ll o",
+                                           "he llo",     "Ġ w", "o r",
+                                           "l d",  "or ld",     "Ġw orld"};
+  return {
+      gguf_test::StrKv("tokenizer.ggml.model", "gpt2"),
+      gguf_test::StrKv("tokenizer.ggml.pre", "qwen2"),
+      gguf_test::StrArrayKv("tokenizer.ggml.tokens", tokens),
+      gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types),
+      gguf_test::StrArrayKv("tokenizer.ggml.merges", merges),
+      gguf_test::U32Kv("tokenizer.ggml.eos_token_id", 19),
+  };
+}
+
+// Assembles a zero-tensor GGUF from the kv blocks and loads it via FromGguf.
+Tokenizer LoadGguf(const std::vector<std::string>& kvs) {
+  std::string bytes = gguf_test::Header(3, /*tensor_count=*/0, kvs.size());
+  for (const auto& kv : kvs) bytes += kv;
+  gguf_test::TempFile f(bytes);
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  return Tokenizer::FromGguf(g);
 }
 
 }  // namespace
@@ -378,4 +414,131 @@ TEST_CASE("encode/decode runtime failure modes") {
   CHECK_THROWS_AS((void)tok.Decode({-1}), std::runtime_error);
   CHECK_THROWS_AS((void)tok.Decode({1000000}), std::runtime_error);
   CHECK_THROWS_AS((void)tok.TokenText(1000000), std::runtime_error);
+}
+
+TEST_CASE("FromGguf: matches the FromHfJson-loaded tiny fixture") {
+  const Tokenizer tok = LoadGguf(TinyGgufKvs());
+  const Tokenizer hf = LoadTiny();
+  CHECK(tok.VocabSize() == 22);
+  CHECK(tok.Pattern() == SplitPattern::kQwen2);
+  CHECK(tok.EosId() == 19);  // tokenizer.ggml.eos_token_id kv
+  CHECK(tok.BosId() == -1);  // bos kv absent -> -1
+  REQUIRE(tok.AddedTokens().size() == 3);
+  CHECK(tok.AddedTokens()[0].special);        // 19: control
+  CHECK_FALSE(tok.AddedTokens()[1].special);  // 20: user-defined
+  CHECK(tok.AddedTokens()[2].special);        // 21: control
+
+  // Encode/Decode must agree with the tokenizer.json-loaded equivalent.
+  const std::vector<std::string> corpus = {
+      "hello",      "hello world",        " world",
+      "world",      "hello12",            "",
+      "lll",        "llll",               "hello<|end|> world",
+      "hello<tool>world",                 "hello<|end|>of world"};
+  for (const auto& text : corpus) {
+    CAPTURE(text);
+    const Ids ids = tok.Encode(text);
+    CHECK(ids == hf.Encode(text));
+    CHECK(tok.Decode(ids) == text);
+  }
+  // Oracle ids directly, so both loaders cannot drift together unnoticed.
+  CHECK(tok.Encode("hello world") == Ids{13, 17});
+  CHECK(tok.Encode("hello12") == Ids{13, 8, 9});
+  CHECK(tok.Encode("hello<|end|>of world") == Ids{13, 21, 17});
+  CHECK(tok.TokenText(17) == "Ġworld");
+  CHECK(tok.TokenText(19) == "<|end|>");
+}
+
+TEST_CASE("FromGguf: pre \"llama-bpe\" maps to kLlama3, bos kv honored") {
+  auto kvs = TinyGgufKvs();
+  kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "llama-bpe");
+  kvs.push_back(gguf_test::U32Kv("tokenizer.ggml.bos_token_id", 20));
+  const Tokenizer tok = LoadGguf(kvs);
+  CHECK(tok.Pattern() == SplitPattern::kLlama3);
+  CHECK(tok.BosId() == 20);
+  CHECK(tok.EosId() == 19);
+}
+
+TEST_CASE("FromGguf: token_type unknown(2) and byte(6) stay normal vocab") {
+  auto kvs = TinyGgufKvs();
+  std::vector<int32_t> types(19, 1);
+  types[0] = 6;  // "h" tagged byte
+  types[1] = 2;  // "e" tagged unknown
+  types.insert(types.end(), {3, 4, 3});
+  kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types);
+  const Tokenizer tok = LoadGguf(kvs);
+  CHECK(tok.Encode("hello") == Ids{13});  // h/e still merge via BPE
+  CHECK(tok.AddedTokens().size() == 3);   // and did not become added tokens
+}
+
+TEST_CASE("FromGguf failure modes throw with actionable messages") {
+  SUBCASE("missing tokenizer.ggml.model") {
+    auto kvs = TinyGgufKvs();
+    kvs.erase(kvs.begin());
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "tokenizer.ggml.model");
+  }
+  SUBCASE("non-gpt2 model names the value") {
+    auto kvs = TinyGgufKvs();
+    kvs[0] = gguf_test::StrKv("tokenizer.ggml.model", "llama");
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "llama");
+  }
+  SUBCASE("missing tokenizer.ggml.pre") {
+    auto kvs = TinyGgufKvs();
+    kvs.erase(kvs.begin() + 1);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "tokenizer.ggml.pre");
+  }
+  SUBCASE("unknown pre names the value") {
+    auto kvs = TinyGgufKvs();
+    kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "gpt-2");
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "gpt-2");
+  }
+  SUBCASE("missing tokens array") {
+    auto kvs = TinyGgufKvs();
+    kvs.erase(kvs.begin() + 2);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "tokenizer.ggml.tokens");
+  }
+  SUBCASE("tokens kv of the wrong type") {
+    auto kvs = TinyGgufKvs();
+    kvs[2] = gguf_test::StrKv("tokenizer.ggml.tokens", "x");
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "array");
+  }
+  SUBCASE("token_type length mismatch") {
+    auto kvs = TinyGgufKvs();
+    std::vector<int32_t> types(21, 1);  // 21 != 22 tokens
+    kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "token_type");
+  }
+  SUBCASE("unsupported token_type value names it") {
+    auto kvs = TinyGgufKvs();
+    std::vector<int32_t> types(19, 1);
+    types[0] = 5;  // UNUSED: not one of 1/2/3/4/6
+    types.insert(types.end(), {3, 4, 3});
+    kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "5");
+  }
+  SUBCASE("merge entry without exactly one space") {
+    auto kvs = TinyGgufKvs();
+    kvs[4] = gguf_test::StrArrayKv("tokenizer.ggml.merges", {"l l", "he"});
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "merge");
+    kvs[4] = gguf_test::StrArrayKv("tokenizer.ggml.merges", {"l l o"});
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "merge");
+  }
+  SUBCASE("duplicate merge pair") {
+    auto kvs = TinyGgufKvs();
+    kvs[4] = gguf_test::StrArrayKv("tokenizer.ggml.merges",
+                                   {"l l", "h e", "l l"});
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "duplicate merge");
+  }
+  SUBCASE("duplicate token text") {
+    auto kvs = TinyGgufKvs();
+    auto tokens = std::vector<std::string>{"h", "e", "h"};
+    kvs[2] = gguf_test::StrArrayKv("tokenizer.ggml.tokens", tokens);
+    kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", {1, 1, 1});
+    kvs[5] = gguf_test::U32Kv("tokenizer.ggml.eos_token_id", 0);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "duplicate token text");
+  }
+  SUBCASE("eos id out of range") {
+    auto kvs = TinyGgufKvs();
+    kvs[5] = gguf_test::U32Kv("tokenizer.ggml.eos_token_id", 22);
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "out of range");
+  }
 }

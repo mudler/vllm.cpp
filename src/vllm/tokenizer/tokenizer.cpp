@@ -1,7 +1,7 @@
 // vllm.cpp original (tokenizer); semantics mirror HF tokenizers byte-level
-// BPE. FromHfJson loads an HF tokenizer.json; anything that is not the
-// byte-level BPE family we implement throws loudly (no silent wrong
-// tokenization). FromGguf is Task 4.
+// BPE. FromHfJson loads an HF tokenizer.json; FromGguf loads the same vocab
+// family from GGUF tokenizer.ggml.* kvs. Anything that is not the byte-level
+// BPE family we implement throws loudly (no silent wrong tokenization).
 #include "vllm/tokenizer/tokenizer.h"
 
 #include <cstddef>
@@ -10,6 +10,8 @@
 #include <utility>
 
 #include <nlohmann/json.hpp>
+
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm::tok {
 namespace {
@@ -25,6 +27,31 @@ constexpr const char* kClassicQwen2Regex =
 
 [[noreturn]] void Fail(const std::string& msg) {
   throw std::runtime_error("tokenizer: " + msg);
+}
+
+// Splits a legacy-form merge entry "left right" (exactly one space, both
+// halves nonempty); used by both the HF and GGUF loaders.
+void SplitMergeEntry(const std::string& s, std::string& left,
+                     std::string& right) {
+  const size_t sp = s.find(' ');
+  if (sp == std::string::npos || sp != s.rfind(' ') || sp == 0 ||
+      sp + 1 == s.size()) {
+    Fail("malformed merge entry \"" + s + "\"");
+  }
+  left = s.substr(0, sp);
+  right = s.substr(sp + 1);
+}
+
+// Inserts one merge pair at `rank`; duplicates fail loud (HF silently keeps
+// the LAST rank for duplicates; we keep neither).
+void InsertMerge(MergeRanks& ranks, const std::string& left,
+                 const std::string& right, int32_t rank) {
+  const auto [it, inserted] = ranks.emplace(MergeKey(left, right), rank);
+  if (!inserted) {
+    Fail("duplicate merge pair \"" + left + " " + right + "\" at rank " +
+         std::to_string(rank) + " (first seen at rank " +
+         std::to_string(it->second) + ")");
+  }
 }
 
 // Walks a pre_tokenizer node collecting Split regexes and checking that
@@ -138,6 +165,39 @@ void ExtractBosEos(const json& doc, int32_t& bos, int32_t& eos) {
   eos = id_of(single->back());
 }
 
+// ---- GGUF kv access (FromGguf) ----
+
+const GgufValue& RequireKv(const GgufFile& f, const char* key) {
+  const GgufValue* v = f.FindKv(key);
+  if (v == nullptr) Fail(std::string("GGUF missing kv \"") + key + "\"");
+  return *v;
+}
+
+const std::string& KvString(const GgufFile& f, const char* key) {
+  const GgufValue& v = RequireKv(f, key);
+  if (v.TypeId() != kGgufString) {
+    Fail(std::string("GGUF kv \"") + key + "\" is not a string");
+  }
+  return std::get<std::string>(v.v);
+}
+
+// Array kv whose elements are of GGUF value type `elem_type`. The reader
+// guarantees every element matches the array's declared elem_type, so
+// checking it once here makes the std::get in the callers safe.
+const GgufArray& KvArray(const GgufFile& f, const char* key,
+                         uint32_t elem_type, const char* elem_name) {
+  const GgufValue& v = RequireKv(f, key);
+  if (v.TypeId() != kGgufArray) {
+    Fail(std::string("GGUF kv \"") + key + "\" is not an array");
+  }
+  const GgufArray& arr = std::get<GgufArray>(v.v);
+  if (arr.elem_type != elem_type) {
+    Fail(std::string("GGUF kv \"") + key + "\" is not a " + elem_name +
+         " array");
+  }
+  return arr;
+}
+
 }  // namespace
 
 void Tokenizer::FinalizeTables() {
@@ -233,13 +293,7 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
     std::string left;
     std::string right;
     if (entry.is_string()) {
-      const std::string s = entry.get<std::string>();
-      const size_t sp = s.find(' ');
-      if (sp == std::string::npos || sp != s.rfind(' ')) {
-        Fail("malformed merge entry \"" + s + "\"");
-      }
-      left = s.substr(0, sp);
-      right = s.substr(sp + 1);
+      SplitMergeEntry(entry.get<std::string>(), left, right);
     } else if (entry.is_array() && entry.size() == 2 && entry[0].is_string() &&
                entry[1].is_string()) {
       left = entry[0].get<std::string>();
@@ -252,13 +306,7 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
         right.find(' ') != std::string::npos) {
       Fail("malformed merge entry at rank " + std::to_string(rank));
     }
-    const auto [it, inserted] =
-        tok.merge_ranks_.emplace(MergeKey(left, right), rank);
-    if (!inserted) {
-      Fail("duplicate merge pair \"" + left + " " + right + "\" at rank " +
-           std::to_string(rank) + " (first seen at rank " +
-           std::to_string(it->second) + ")");
-    }
+    InsertMerge(tok.merge_ranks_, left, right, rank);
     ++rank;
   }
 
@@ -290,6 +338,110 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   }
 
   ExtractBosEos(doc, tok.bos_id_, tok.eos_id_);
+  tok.FinalizeTables();
+  return tok;
+}
+
+Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
+  Tokenizer tok;
+
+  // "gpt2" is llama.cpp's name for byte-level BPE (the only family we do).
+  const std::string& model = KvString(f, "tokenizer.ggml.model");
+  if (model != "gpt2") {
+    Fail("unsupported tokenizer.ggml.model \"" + model +
+         "\" (only \"gpt2\" byte-level BPE)");
+  }
+
+  // Pre-tokenizer, by llama.cpp pre name. NOTE: llama.cpp's "qwen2" pre
+  // applies its qwen2 splitting to Qwen2/2.5/3/3.5/3.6 GGUFs alike — its pre
+  // names do not distinguish the \p{M}-aware Qwen3.6 regex variant (the APEX
+  // GGUFs carry arch qwen35moe with pre "qwen2"), so "qwen2" maps onto our
+  // kQwen2, which implements the Qwen3.6 \p{M}-aware regex.
+  const std::string& pre = KvString(f, "tokenizer.ggml.pre");
+  if (pre == "qwen2") {
+    tok.pattern_ = SplitPattern::kQwen2;
+  } else if (pre == "llama-bpe") {
+    tok.pattern_ = SplitPattern::kLlama3;
+  } else {
+    Fail("unsupported tokenizer.ggml.pre \"" + pre + "\"");
+  }
+  // GGUF carries no ignore_merges flag and llama.cpp's BPE has no such
+  // option, so it stays false. (HF Llama-3 sets ignore_merges=true; a
+  // llama-bpe GGUF therefore matches llama.cpp, not HF, on the rare
+  // pretokens where that flag matters. Irrelevant for the qwen2 family.)
+
+  // Vocab: tokens[i] is the string for id i, already in the byte-mapped
+  // alphabet (same convention as HF tokenizer.json). token_type says which
+  // entries are added tokens instead of plain vocab.
+  const GgufArray& tokens =
+      KvArray(f, "tokenizer.ggml.tokens", kGgufString, "string");
+  const GgufArray& types =
+      KvArray(f, "tokenizer.ggml.token_type", kGgufI32, "i32");
+  if (tokens.elems.size() != types.elems.size()) {
+    Fail("tokenizer.ggml.tokens has " + std::to_string(tokens.elems.size()) +
+         " entries but tokenizer.ggml.token_type has " +
+         std::to_string(types.elems.size()));
+  }
+
+  for (size_t i = 0; i < tokens.elems.size(); ++i) {
+    const std::string& text = std::get<std::string>(tokens.elems[i].v);
+    const int32_t type = std::get<int32_t>(types.elems[i].v);
+    const int32_t id = static_cast<int32_t>(i);
+    if (text.empty()) Fail("empty token string at id " + std::to_string(id));
+    switch (type) {
+      case 1:    // normal
+      case 2:    // unknown — still a plain vocab slot for byte-level BPE
+      case 6: {  // byte
+        const auto [it, inserted] = tok.vocab_.emplace(text, id);
+        if (!inserted) {
+          Fail("duplicate token text \"" + text + "\" at ids " +
+               std::to_string(it->second) + " and " + std::to_string(id));
+        }
+        break;
+      }
+      case 3:  // control -> added token, special (detokenizer may skip)
+        tok.added_tokens_.push_back({text, id, /*special=*/true});
+        break;
+      case 4:  // user-defined -> added token, kept on decode
+        tok.added_tokens_.push_back({text, id, /*special=*/false});
+        break;
+      default:
+        Fail("unsupported tokenizer.ggml.token_type " + std::to_string(type) +
+             " for token id " + std::to_string(id));
+    }
+  }
+
+  // Merges are legacy-form "left right" strings.
+  const GgufArray& merges =
+      KvArray(f, "tokenizer.ggml.merges", kGgufString, "string");
+  int32_t rank = 0;
+  for (const auto& entry : merges.elems) {
+    std::string left;
+    std::string right;
+    SplitMergeEntry(std::get<std::string>(entry.v), left, right);
+    InsertMerge(tok.merge_ranks_, left, right, rank);
+    ++rank;
+  }
+
+  // bos/eos ids are optional u32 kvs; absent -> -1 (callers fall back to the
+  // model config, as with FromHfJson).
+  const auto token_id_kv = [&](const char* key) -> int32_t {
+    const GgufValue* v = f.FindKv(key);
+    if (v == nullptr) return -1;
+    if (v->TypeId() != kGgufU32) {
+      Fail(std::string("GGUF kv \"") + key + "\" is not u32");
+    }
+    const uint32_t id = std::get<uint32_t>(v->v);
+    if (id >= tokens.elems.size()) {
+      Fail(std::string(key) + " = " + std::to_string(id) +
+           " out of range (vocab size " + std::to_string(tokens.elems.size()) +
+           ")");
+    }
+    return static_cast<int32_t>(id);
+  };
+  tok.bos_id_ = token_id_kv("tokenizer.ggml.bos_token_id");
+  tok.eos_id_ = token_id_kv("tokenizer.ggml.eos_token_id");
+
   tok.FinalizeTables();
   return tok;
 }

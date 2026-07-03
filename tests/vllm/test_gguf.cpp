@@ -1,63 +1,25 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace {
 
-// Little-endian scalar encoders (GGUF is little-endian on the wire).
-std::string U32Le(uint32_t v) {
-  std::string s(4, '\0');
-  for (int i = 0; i < 4; ++i) s[i] = static_cast<char>((v >> (8 * i)) & 0xff);
-  return s;
-}
-
-std::string U64Le(uint64_t v) {
-  std::string s(8, '\0');
-  for (int i = 0; i < 8; ++i) s[i] = static_cast<char>((v >> (8 * i)) & 0xff);
-  return s;
-}
-
-// GGUF string: u64 LE length + raw bytes (no NUL).
-std::string GStr(const std::string& s) { return U64Le(s.size()) + s; }
-
-// Writes raw bytes to a unique file under the system temp dir; removed in the
-// destructor so test runs don't accumulate files.
-class TempFile {
- public:
-  explicit TempFile(const std::string& bytes) {
-    static int counter = 0;
-    path_ = (std::filesystem::temp_directory_path() /
-             ("vllm_gguf_test_" + std::to_string(counter++) + ".gguf"))
-                .string();
-    std::ofstream out(path_, std::ios::binary);
-    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-  }
-  ~TempFile() { std::remove(path_.c_str()); }
-  const std::string& path() const { return path_; }
-
- private:
-  std::string path_;
-};
-
-// GGUF header for `tensor_count` tensors and `kv_count` kvs.
-std::string Header(uint32_t version, uint64_t tensor_count, uint64_t kv_count) {
-  return "GGUF" + U32Le(version) + U64Le(tensor_count) + U64Le(kv_count);
-}
-
-// Pads to the alignment boundary the way writers do before the data section.
-void PadTo(std::string& bytes, size_t alignment) {
-  while (bytes.size() % alignment != 0) bytes.push_back('\0');
-}
+// Byte-builder helpers (LE encoders, Header, GStr, PadTo, TempFile) live in
+// gguf_builder.h, shared with the tokenizer GGUF-vocab tests.
+using gguf_test::GStr;
+using gguf_test::Header;
+using gguf_test::PadTo;
+using gguf_test::TempFile;
+using gguf_test::U32Le;
+using gguf_test::U64Le;
 
 // One Q8_0 block: f16 scale + 32 int8 quants = 34 bytes.
 std::string Q8Block(uint16_t scale_f16_bits) {

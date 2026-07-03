@@ -1,6 +1,6 @@
 // vllm.cpp original (tokenizer); semantics mirror HF tokenizers byte-level
-// BPE. Loads HF tokenizer.json (FromHfJson) and GGUF vocab (FromGguf, Task 4)
-// into one engine: added-token longest-match pre-pass -> pretokenize ->
+// BPE. Loads HF tokenizer.json (FromHfJson) and GGUF vocab (FromGguf) into
+// one engine: added-token longest-match pre-pass -> pretokenize ->
 // merge-ranked BPE -> vocab ids. Anything unsupported throws loudly.
 #pragma once
 
@@ -34,7 +34,9 @@ class Tokenizer {
   // not byte-level BPE with a recognized Split pre-tokenizer regex (no silent
   // wrong tokenization).
   static Tokenizer FromHfJson(const std::string& tokenizer_json_path);
-  // Loads a GGUF byte-level BPE vocab (tokenizer.ggml.*). Task 4.
+  // Loads a GGUF byte-level BPE vocab (tokenizer.ggml.* kvs). Throws
+  // std::runtime_error unless tokenizer.ggml.model == "gpt2" and
+  // tokenizer.ggml.pre is a recognized pre-tokenizer name.
   static Tokenizer FromGguf(const GgufFile& f);
 
   // Encodes UTF-8 text. No BOS/EOS added (caller policy). Added tokens are

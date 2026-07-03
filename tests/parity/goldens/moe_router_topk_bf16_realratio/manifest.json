@@ -5,7 +5,7 @@
   "top_k": 8,
   "renormalize": true,
   "scoring_func": "softmax",
-  "note": "softmax in f32 over ALL experts (kernel converts bf16 logits to f32; topk_softmax_kernels.cu:60-66), greedy top-k (weights descending per token), renormalize divides the k selected probs by their sum (denom guard: sum>0 else 1, .cu:245-253). Tie-break = lowest expert index (.cu:530-537) \u2014 not exercised here (random logits), unit-tested in Task 2. Cross-checked at dump time against pinned cpu_fused_moe.select_experts."
+  "note": "softmax in f32 over ALL experts (kernel converts bf16 logits to f32; topk_softmax_kernels.cu:60-66), greedy top-k (weights descending per token), renormalize divides the k selected probs by their sum (denom guard: sum>0 else 1, .cu:245-253). Tie-break = lowest expert index (.cu:530-537) \u2014 not exercised here (logits unique per row), unit-tested in Task 2. Cross-checked at dump time against pinned cpu_fused_moe.select_experts. This realratio case is tie-free by construction: exact f32(bf16) duplicates are nudged to the next representable bf16 value (a few ULPs, ascending index order) so no row has duplicate logits; a dump-time per-row uniqueness assert enforces it."
  },
  "tensors": {
   "logits": {

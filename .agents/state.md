@@ -143,3 +143,24 @@
   M0.9 is single-sequence) BEFORE M1, OR M0.9 scope covers just the GDN+MoE
   stack plus a simple dense attention. NEXT: M0.9 Qwen3.6 forward + registry
   (logits parity + greedy decode — the M0 exit criterion).
+- **2026-07-03 (later)** — M0.9 Task 1 done (oracle de-risk): oracle = **pip
+  vLLM 0.24.0** (`~/venvs/vllm-oracle`; the pinned-Python-over-pip-kernels
+  overlay was BLOCKED — post-0.24.0-tag pinned Python expects newer
+  vendored/compiled APIs than the pip wheel ships; every forward-math module is
+  byte-identical to pin `e24d1b24`, only weight-loader plumbing + ROCm differ).
+  Per-layer + full-model goldens dumped for BOTH gate checkpoints
+  (`tests/parity/goldens/qwen36_*_{27b,35b}`) via `tools/parity/dump_qwen36.py`;
+  recipe in `.agents/qwen36-forward-notes.md`. **KEY RE-SCOPE (plan assumption
+  was wrong):** the 27B is **DENSE** (`Qwen3_5ForConditionalGeneration`, hidden
+  5120, 64 layers, **compressed-tensors W4A4**, NO experts) — it does NOT
+  exercise MoE. The **35B** (`Qwen3_5MoeForConditionalGeneration`, 256e/top-8,
+  hidden 2048, 40 layers, **modelopt W4A16**) is the MoE gate. So M0.9
+  correctness targets the **35B PRIMARILY** (its weight-only-4bit→bf16 matches
+  our DequantNvfp4ToBf16 + bf16-matmul path → logit-atol + greedy bar); the
+  **27B dense/W4A4 correctness is DEFERRED** to when compressed-tensors W4A4
+  support lands (~M2.2), and meanwhile is a greedy-token-match-only secondary
+  check. **mRoPE → kRopeNeox for text:** for text-only single-sequence all 3
+  mRoPE position rows equal the token position, so mRoPE collapses exactly to
+  partial NeoX RoPE on `positions[0]` (rotary_dim 64); Task 2 reuses
+  `kRopeNeox`, true section-split mRoPE `[11,11,10]` is multimodal-only and
+  deferred. NEXT: M0.9 Task 2 (dense causal attention op) → Task 3–5.

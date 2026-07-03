@@ -222,9 +222,20 @@ Last-prefill-position argmax == first greedy token (asserted).
 ### mrope positions
 
 `positions` is `[3, T]` i64 (mrope 3 sections). For a TEXT-only prompt the 3
-rows are equal (sequential 0..T-1). Task 2's dense-attention op must implement
-partial mrope RoPE (rotary dim 64, `mrope_section [11,11,10]`,
-`mrope_interleaved: true`). Positions are dumped in the layer goldens.
+rows are EQUAL (sequential 0..T-1). **This is the crux of M0.9's RoPE scope:**
+because all three mRoPE position rows equal the token position, mRoPE collapses
+EXACTLY to partial NeoX RoPE on `positions[0]` with rotary dim 64. The pinned
+model itself gates its fused rotary path on `is_neox_style AND text_only` and
+applies `pos = positions[0]` in that case — i.e. for text-only single-sequence
+the section-split (`mrope_section [11,11,10]`) is never exercised; every section
+uses the same position, so it is identical to feeding `positions[0]` into a
+plain partial NeoX RoPE. **Therefore Task 2 REUSES `kRopeNeox` on
+`positions[0]` (rotary_dim 64) — NO true section-split mRoPE.** The
+`mrope_section [11,11,10]` / `mrope_interleaved: true` values are recorded here
+as a note for completeness but are **NOT needed for M0.9**; true section-split
+mRoPE is multimodal-only (distinct positions per section) and is DEFERRED to
+when the vision/multimodal path lands. Positions are dumped in the layer
+goldens.
 
 ---
 

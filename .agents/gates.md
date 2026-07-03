@@ -4,6 +4,11 @@
    **Qwen3.6-35B-A3B (NVFP4)** and **Qwen3.6-27B (NVFP4)** with prefill AND
    decode throughput matching vLLM at large concurrency (request-rate sweeps,
    measured with our `bench serve` equivalent, same box, same models).
+   Note: the two gate models are DISTINCT quant/arch paths — **35B** is
+   **MoE** (`Qwen3_5MoeForConditionalGeneration`, modelopt **W4A16**), **27B**
+   is **dense** (`Qwen3_5ForConditionalGeneration`, compressed-tensors
+   **W4A4**). Both remain throughput-parity targets, but they exercise
+   different architectures and NVFP4 quant schemes.
 2. **GGUF reading**: the same models load and serve from GGUF files (including
    NVFP4 GGUF extension types from the APEX/killgate tooling), not just
    safetensors.

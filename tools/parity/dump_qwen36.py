@@ -1,4 +1,4 @@
-# vllm.cpp parity harness; oracle = PINNED upstream vLLM checkout (e24d1b24).
+# vllm.cpp parity harness; oracle = pip vLLM 0.24.0 (same release family as pin e24d1b24).
 """Dump Qwen3.6 per-layer + full-model goldens from the pinned vLLM model with
 REAL weights (M0.9 Task 1 — the M0 exit-criterion oracle).
 
@@ -10,18 +10,18 @@ by vLLM itself. We attach forward hooks to capture per-layer hidden states and
 compute logits from the model's own bf16 lm_head. See
 .agents/qwen36-forward-notes.md for the full recipe + rationale.
 
-Run on dgx (GB10, 119 GiB unified) in the oracle venv, with the PINNED Python
-overlaid on the pip-installed compiled kernels so the model MATH is the pinned
-checkout (e24d1b24) while _C/_moe_C/flashinfer come from pip vLLM 0.24.0:
+Run on dgx (GB10, 119 GiB unified) in the pip oracle venv (`~/venvs/vllm-oracle`,
+pip vLLM 0.24.0 — same release family as pin e24d1b24). The pinned-Python-over-
+pip-kernels overlay was TRIED and BLOCKED (the post-0.24.0-tag pinned Python
+expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
+.agents/qwen36-forward-notes.md §3), so pip 0.24.0 is the oracle. Every
+forward-math module in these checkpoints is byte-identical to the pin; only
+weight-loader plumbing + ROCm code differ. The ACTUAL working command (§4):
 
-    # one-time overlay (pinned .py + pip .so), see notes:
-    #   cp -r ~/work/vllm-pin/vllm ~/work/pinenv/vllm
-    #   ln -s each *.so + _version.py from site-packages/vllm into the copy
-    ssh dgx.casa 'cd ~/work/vllm.cpp && \
-        PATH=~/venvs/vllm-oracle/bin:$PATH PYTHONPATH=~/work/pinenv \
-        ~/venvs/vllm-oracle/bin/python tools/parity/dump_qwen36.py \
-            --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/<snap> \
-            --tag 27b --out tests/parity/goldens'
+    ssh dgx.casa 'cd ~/work/vllm.cpp && VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+        PATH=~/venvs/vllm-oracle/bin:$PATH ~/venvs/vllm-oracle/bin/python \
+        tools/parity/dump_qwen36.py --model <snapshot_dir> --tag <27b|35b> \
+        --out tests/parity/goldens'
 
 VLLM_ENABLE_V1_MULTIPROCESSING=0 forces the engine core in-process so the
 forward hooks (and the global CAPT dict they write) live in this process.

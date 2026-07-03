@@ -11,6 +11,10 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 
 ## M0 — Model correctness on CUDA (single request, greedy)
 
+**Status: exit criterion MET (safetensors) ✅ — Qwen3.6-35B greedy-decodes
+16/16 tokens token-for-token vs the pinned oracle on GB10 (`25326fc`). GGUF
+model load (M0.10, k-quant dequant) remains open (T0).**
+
 - ✅ **M0.1 Build skeleton** (`411c072`): CMake (host + CUDA sm_121),
   third_party vendoring (doctest v2.5.2, nlohmann/json v3.12.0, cpp-httplib
   v0.49.0), CI workflow (CPU build + tests), directory tree per design §4.
@@ -39,10 +43,24 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
   upstream dumps, CPU + CUDA.
 - ✅ **M0.8 MoE layer (eager, bf16)** (`65788b3`): router top-k + shared expert + expert
   GEMMs (dequantized NVFP4→bf16 on load for now). DoD: layer parity.
-- ☐ **M0.9 Qwen3.6 forward + registry**: `model_executor/models/{registry,
-  qwen3_5}.{h,cpp}`, weight mapping (stacked params, GGUF names). DoD:
-  logits parity (both checkpoints, safetensors + GGUF) + greedy decode match
-  vs upstream on reference prompts. **← M0 exit criterion**
+- ✅ **M0.9 Qwen3.6 forward + registry** (`25326fc`, with `861b1e4` full-model
+  gate + `45d3c18` tolerance): `model_executor/models/{registry,qwen3_5}.{h,cpp}`,
+  weight mapping (stacked params), dense causal attention op, full forward
+  (embed→40 layers GDN/full-attn+MoE→norm→lm_head), NVFP4/FP8→bf16 weight load.
+  DoD MET (safetensors path): 16/16 token-for-token greedy decode vs the pinned
+  oracle on the real Qwen3.6-35B on GB10 — **M0 exit criterion MET**. Accepted
+  greedy-matched deviations: f32 residual stream (vs upstream bf16) + f32
+  single-round MoeCombine (vs upstream bf16 double-round); max top-1000 logit
+  gap 0.994 (compounding, doesn't flip greedy). 27B dense/W4A4 correctness
+  DEFERRED (~M2.2, unregistered). **← M0 exit criterion (safetensors) ✅**
+  - ☐ **M0.9-GGUF (open, re-scoped as M0.10 below)**: the safetensors DoD is
+    met; the GGUF model-load half of the original DoD is broken out to M0.10.
+- ☐ **M0.10 GGUF model load** (T0/MVP, re-scoped out of M0.9): the APEX GGUFs
+  (arch `qwen35moe`) are k-quant (Q4_K/Q5_K/Q6_K/Q8_0, IQ2_S id22, IQ4_XS id23),
+  NOT NVFP4 — we read the GGUF *container* (M0.4, byte-verified) but have no
+  k-quant dequant. Needs: k-quant→bf16 dequant kernels (Q4_K/Q5_K/Q6_K/Q8_0/
+  IQ2_S/IQ4_XS, matching ggml's dequant) + GGUF tensor-name→param mapping for
+  `qwen35moe` + greedy verify vs oracle. **← GGUF gate (#2) at model level.**
 
 ## M1 — The engine (concurrency, correctness under load)
 

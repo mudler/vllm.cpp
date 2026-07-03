@@ -123,7 +123,7 @@ implementation) is ported at T0.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
-| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForCausalLM` (27B dense-hybrid), `Qwen3_5MoeForCausalLM` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert, GemmaRMSNorm-style `(1+w)` | **T0 (the gate)** |
+| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForCausalLM` (27B dense-hybrid), `Qwen3_5MoeForCausalLM` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert, GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load pending M0.10; 27B W4A4 deferred ~M2.2; serving M1–M3) | **T0 (the gate)** |
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
 | MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |

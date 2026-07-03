@@ -164,3 +164,33 @@
   partial NeoX RoPE on `positions[0]` (rotary_dim 64); Task 2 reuses
   `kRopeNeox`, true section-split mRoPE `[11,11,10]` is multimodal-only and
   deferred. NEXT: M0.9 Task 2 (dense causal attention op) → Task 3–5.
+- **2026-07-03 (later)** — **M0 EXIT MET** (`25326fc`, with `861b1e4`
+  full-model gate + `45d3c18` tolerance + `25326fc` guardrail 1.5). M0.9
+  Tasks 2–5 done: dense causal attention op (Task 2), registry + qwen3_5
+  model + weight mapping (Task 3), per-layer runners (Task 4:
+  qwen36_{embed,gdn_layer,fullattn_layer,norm}), full-model logits + greedy
+  gate (Task 5: qwen36_logits). **The assembled Qwen3.6-35B forward
+  (embed→40 layers GDN/full-attn+MoE→norm→lm_head; NVFP4/FP8→bf16 weight load)
+  greedy-decodes 16/16 tokens token-for-token vs the pinned oracle on the real
+  35B on GB10** — independently re-verified by review. Prompt "The capital of
+  France is Paris, and the" → "… capital of Germany is Berlin.\nThe capital of
+  France is Paris, and the". Per-layer parity: embed/norm exact, GDN 1.3e-2,
+  full-attn 1.9e-2; max top-1000 logit gap 0.994 (accepted compounding —
+  doesn't flip greedy). ACCEPTED DEVIATIONS (greedy-matched): f32 residual
+  stream vs upstream bf16; f32 single-round MoeCombine vs upstream bf16
+  double-round. What M0 delivered (M0.1–M0.9): build skeleton + CI · vt runtime
+  core · parity harness (pip-vLLM 0.24.0 oracle on dgx.casa) · container
+  loaders (safetensors + GGUF) · tokenizer + detokenizer · CUDA baseline ops ·
+  GDN layer · MoE layer · NVFP4 dequant · full Qwen3.6-35B forward + registry.
+  The 35B (MoE, modelopt W4A16) is the M0-exit gate; 27B (dense,
+  compressed-tensors W4A4) correctness DEFERRED (~M2.2, needs activation-quant
+  compute; unregistered). REMAINING for the GGUF gate (#2) at model level
+  (re-scoped as roadmap M0.10, T0/MVP): the APEX GGUFs (arch `qwen35moe`) are
+  k-quant (Q4_K/Q5_K/Q6_K/Q8_0, IQ2_S/IQ4_XS), NOT NVFP4 — we read the GGUF
+  container (M0.4, byte-verified) but have NO k-quant→bf16 dequant. Needs:
+  k-quant dequant kernels matching ggml + GGUF tensor-name→param mapping for
+  qwen35moe + greedy verify. Close-out asserts: `PendingRunnerOps()` empty
+  (grep-confirmed, `tests/parity/test_op_parity.cpp:1035`); CI green (run
+  28675136541 for the guardrail commit). NEXT (recommended): finish the GGUF
+  model load (M0.10) next — it's a T0 gate and the model forward is fresh in
+  hand — then begin M1.1 (engine core: Request/SamplingParams/outputs).

@@ -8,12 +8,16 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
+using vt::Backend;
 using vt::CausalConv1dArgs;
 using vt::Device;
 using vt::DeviceType;
@@ -421,4 +425,472 @@ TEST_CASE("gdn decode: bf16 q/k/v in, bf16 out, f32 state enforced") {
   Tensor tbad = Tensor::Contiguous(bad_state.data(), DType::kBF16, Cpu(), {1, 1, 2, 2});
   CHECK_THROWS_AS(vt::GdnDecode(q, to, tq, tk, tv, tg, tb, tbad, GdnArgs{0.5f}),
                   std::runtime_error);
+}
+
+// ===========================================================================
+// CUDA sections: the CUDA GDN kernels (src/vt/cuda/cuda_gdn.cu) vs the CPU
+// reference on the SAME inputs (fixed seeds). Guarded like test_cuda_ops.cpp:
+// skip cleanly when no GPU is present. Tolerances (M0.6 rope precedent — same
+// f32 math, different libm exp and FMA contraction): f32-in 1e-5; bf16-in
+// 2e-3 (the input BYTES are identical on both sides, so diffs are arithmetic
+// order only, but keep the M0.6 combo values); bf16-out one bf16 ulp (8e-3).
+// f32 states compare at 1e-5 in every combo (state math is f32 on both sides)
+// and conv states at 1e-6 (the write-back is a raw copy, no arithmetic).
+
+namespace {
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+
+Tensor MakeT(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+std::vector<float> RandomF32(size_t n, uint32_t seed, float lo = -2.0f, float hi = 2.0f) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(lo, hi);
+  std::vector<float> v(n);
+  for (auto& x : v) x = dist(rng);
+  return v;
+}
+
+// Packs an f32 master vector into the byte representation of dt (f32 or bf16).
+std::vector<uint8_t> Pack(const std::vector<float>& f, DType dt) {
+  std::vector<uint8_t> out(f.size() * vt::SizeOf(dt));
+  if (dt == DType::kF32) {
+    std::memcpy(out.data(), f.data(), out.size());
+  } else {
+    REQUIRE(dt == DType::kBF16);
+    auto* p = reinterpret_cast<uint16_t*>(out.data());
+    for (size_t i = 0; i < f.size(); ++i) p[i] = vt::F32ToBF16(f[i]);
+  }
+  return out;
+}
+
+std::vector<float> Unpack(const std::vector<uint8_t>& b, DType dt) {
+  const size_t n = b.size() / vt::SizeOf(dt);
+  std::vector<float> out(n);
+  if (dt == DType::kF32) {
+    std::memcpy(out.data(), b.data(), b.size());
+  } else {
+    REQUIRE(dt == DType::kBF16);
+    const auto* p = reinterpret_cast<const uint16_t*>(b.data());
+    for (size_t i = 0; i < n; ++i) out[i] = vt::BF16ToF32(p[i]);
+  }
+  return out;
+}
+
+void CheckClose(const std::vector<float>& got, const std::vector<float>& want, float atol,
+                float rtol) {
+  REQUIRE(got.size() == want.size());
+  size_t bad = 0;
+  size_t first_bad = 0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const float tol = atol + rtol * std::fabs(want[i]);
+    if (!(std::fabs(got[i] - want[i]) <= tol)) {  // catches NaN too
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(want[first_bad]);
+  }
+  CHECK(bad == 0);
+}
+
+struct QueueGuard {
+  Backend& b;
+  Queue q;
+  explicit QueueGuard(Backend& backend) : b(backend), q(backend.CreateQueue()) {}
+  ~QueueGuard() { b.DestroyQueue(q); }
+  QueueGuard(const QueueGuard&) = delete;
+  QueueGuard& operator=(const QueueGuard&) = delete;
+};
+
+// Device buffer + tensor view; uploads on construction when host data given.
+class DeviceTensor {
+ public:
+  DeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+               const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeT(p_, dt, Gpu(), shape);
+  }
+  ~DeviceTensor() { b_.Free(p_); }
+  DeviceTensor(const DeviceTensor&) = delete;
+  DeviceTensor& operator=(const DeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+struct Combo {
+  DType in;
+  DType out;
+  float atol;
+  float rtol;
+};
+constexpr Combo kCudaCombos[] = {
+    {DType::kF32, DType::kF32, 1e-5f, 1e-5f},
+    {DType::kBF16, DType::kF32, 2e-3f, 2e-3f},
+    {DType::kBF16, DType::kBF16, 4e-3f, 8e-3f},
+};
+
+// causal_conv1d_fwd CPU-vs-CUDA on one varlen batch.
+void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,
+                        int64_t c, int64_t k, bool with_bias, bool silu, const Combo& cb,
+                        uint32_t seed) {
+  const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
+  const int64_t t = qsl.back();
+  const auto xf = RandomF32(static_cast<size_t>(t * c), seed);
+  const auto wf = RandomF32(static_cast<size_t>(c * k), seed + 1, -1.0f, 1.0f);
+  const auto bf = RandomF32(static_cast<size_t>(c), seed + 2, -1.0f, 1.0f);
+  const auto stf = RandomF32(static_cast<size_t>(n * c * (k - 1)), seed + 3);
+  const auto xb = Pack(xf, cb.in);
+  const auto wb = Pack(wf, cb.in);
+  const auto bb = Pack(bf, cb.in);
+  const CausalConv1dArgs args{silu};
+
+  // CPU reference (state mutated in place on a copy).
+  std::vector<uint8_t> out_cpu(static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
+  std::vector<float> st_cpu = stf;
+  std::vector<int32_t> qsl_cpu = qsl, his_cpu = his;
+  Tensor tx = MakeT(const_cast<uint8_t*>(xb.data()), cb.in, Cpu(), {t, c});
+  Tensor tw = MakeT(const_cast<uint8_t*>(wb.data()), cb.in, Cpu(), {c, k});
+  Tensor tb = MakeT(const_cast<uint8_t*>(bb.data()), cb.in, Cpu(), {c});
+  Tensor ts = MakeT(st_cpu.data(), DType::kF32, Cpu(), {n, c, k - 1});
+  Tensor tqsl = MakeT(qsl_cpu.data(), DType::kI32, Cpu(), {n + 1});
+  Tensor this_ = MakeT(his_cpu.data(), DType::kI32, Cpu(), {n});
+  Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), {t, c});
+  Queue cq = Q();
+  vt::CausalConv1dFwd(cq, to, tx, tw, with_bias ? &tb : nullptr, ts, tqsl, this_, args);
+
+  // CUDA on the same packed inputs; qsl/has_initial_state live on the DEVICE
+  // (the kernels read them device-side — M0.7 metadata contract).
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, {t, c}, xb.data());
+  DeviceTensor dw(gpu, gq.q, cb.in, {c, k}, wb.data());
+  DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
+  DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stf.data());
+  DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
+  DeviceTensor dhis(gpu, gq.q, DType::kI32, {n}, his.data());
+  DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
+  vt::CausalConv1dFwd(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
+                      with_bias ? &db.tensor() : nullptr, dst.tensor(), dqsl.tensor(),
+                      dhis.tensor(), args);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  std::vector<float> st_gpu(st_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+  dst.Download(gq.q, st_gpu.data());
+
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
+  CheckClose(st_gpu, st_cpu, 1e-6f, 0.0f);  // raw-copy write-back: exact
+}
+
+// causal_conv1d_update CPU-vs-CUDA on one single-token batch.
+void RunConvUpdateCudaCase(int64_t batch, int64_t c, int64_t k, bool with_bias, bool silu,
+                           const Combo& cb, uint32_t seed) {
+  const auto xf = RandomF32(static_cast<size_t>(batch * c), seed);
+  const auto wf = RandomF32(static_cast<size_t>(c * k), seed + 1, -1.0f, 1.0f);
+  const auto bf = RandomF32(static_cast<size_t>(c), seed + 2, -1.0f, 1.0f);
+  const auto stf = RandomF32(static_cast<size_t>(batch * c * (k - 1)), seed + 3);
+  const auto xb = Pack(xf, cb.in);
+  const auto wb = Pack(wf, cb.in);
+  const auto bb = Pack(bf, cb.in);
+  const CausalConv1dArgs args{silu};
+
+  std::vector<uint8_t> out_cpu(static_cast<size_t>(batch * c) * vt::SizeOf(cb.out));
+  std::vector<float> st_cpu = stf;
+  Tensor tx = MakeT(const_cast<uint8_t*>(xb.data()), cb.in, Cpu(), {batch, c});
+  Tensor tw = MakeT(const_cast<uint8_t*>(wb.data()), cb.in, Cpu(), {c, k});
+  Tensor tb = MakeT(const_cast<uint8_t*>(bb.data()), cb.in, Cpu(), {c});
+  Tensor ts = MakeT(st_cpu.data(), DType::kF32, Cpu(), {batch, c, k - 1});
+  Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), {batch, c});
+  Queue cq = Q();
+  vt::CausalConv1dUpdate(cq, to, tx, tw, with_bias ? &tb : nullptr, ts, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, {batch, c}, xb.data());
+  DeviceTensor dw(gpu, gq.q, cb.in, {c, k}, wb.data());
+  DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
+  DeviceTensor dst(gpu, gq.q, DType::kF32, {batch, c, k - 1}, stf.data());
+  DeviceTensor dout(gpu, gq.q, cb.out, {batch, c});
+  vt::CausalConv1dUpdate(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
+                         with_bias ? &db.tensor() : nullptr, dst.tensor(), args);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  std::vector<float> st_gpu(st_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+  dst.Download(gq.q, st_gpu.data());
+
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
+  CheckClose(st_gpu, st_cpu, 1e-6f, 0.0f);  // rolled raw values: exact
+}
+
+// l2norm CPU-vs-CUDA on one shape (rank 2 or 3).
+void RunL2NormCudaCase(const std::vector<int64_t>& shape, const Combo& cb, uint32_t seed) {
+  size_t numel = 1;
+  for (int64_t s : shape) numel *= static_cast<size_t>(s);
+  const auto xf = RandomF32(numel, seed);
+  const auto xb = Pack(xf, cb.in);
+  const vt::L2NormArgs args{1e-6f};
+
+  std::vector<uint8_t> out_cpu(numel * vt::SizeOf(cb.out));
+  Tensor tx = MakeT(const_cast<uint8_t*>(xb.data()), cb.in, Cpu(), shape);
+  Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), shape);
+  Queue cq = Q();
+  vt::L2Norm(cq, to, tx, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, shape, xb.data());
+  DeviceTensor dout(gpu, gq.q, cb.out, shape);
+  vt::L2Norm(gq.q, dout.tensor(), dx.tensor(), args);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
+}
+
+// rmsnorm_gated CPU-vs-CUDA on one [T,D] shape.
+void RunRmsNormGatedCudaCase(int64_t t, int64_t d, bool sigmoid_gate, const Combo& cb,
+                             uint32_t seed) {
+  const auto xf = RandomF32(static_cast<size_t>(t * d), seed);
+  const auto zf = RandomF32(static_cast<size_t>(t * d), seed + 1);
+  const auto wf = RandomF32(static_cast<size_t>(d), seed + 2, -1.0f, 1.0f);
+  const auto xb = Pack(xf, cb.in);
+  const auto zb = Pack(zf, cb.in);
+  const auto wb = Pack(wf, cb.in);
+  const RmsNormGatedArgs args{1e-6f, sigmoid_gate};
+
+  std::vector<uint8_t> out_cpu(static_cast<size_t>(t * d) * vt::SizeOf(cb.out));
+  Tensor tx = MakeT(const_cast<uint8_t*>(xb.data()), cb.in, Cpu(), {t, d});
+  Tensor tz = MakeT(const_cast<uint8_t*>(zb.data()), cb.in, Cpu(), {t, d});
+  Tensor tw = MakeT(const_cast<uint8_t*>(wb.data()), cb.in, Cpu(), {d});
+  Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), {t, d});
+  Queue cq = Q();
+  vt::RmsNormGated(cq, to, tx, tz, tw, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, {t, d}, xb.data());
+  DeviceTensor dz(gpu, gq.q, cb.in, {t, d}, zb.data());
+  DeviceTensor dw(gpu, gq.q, cb.in, {d}, wb.data());
+  DeviceTensor dout(gpu, gq.q, cb.out, {t, d});
+  vt::RmsNormGated(gq.q, dout.tensor(), dx.tensor(), dz.tensor(), dw.tensor(), args);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
+}
+
+// Gdn prefill/decode CPU-vs-CUDA. qsl empty => decode (batch single-token
+// sequences); otherwise varlen prefill with batch ignored.
+void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, int64_t hv,
+                    int64_t dk, int64_t dv, const Combo& cb, uint32_t seed) {
+  const bool decode = qsl.empty();
+  const int64_t t = decode ? batch : qsl.back();
+  const int64_t n = decode ? batch : static_cast<int64_t>(qsl.size()) - 1;
+  const auto qf = RandomF32(static_cast<size_t>(t * hk * dk), seed, -1.0f, 1.0f);
+  const auto kf = RandomF32(static_cast<size_t>(t * hk * dk), seed + 1, -1.0f, 1.0f);
+  const auto vf = RandomF32(static_cast<size_t>(t * hv * dv), seed + 2, -1.0f, 1.0f);
+  const auto gf = RandomF32(static_cast<size_t>(t * hv), seed + 3, -1.0f, 0.0f);
+  const auto betaf = RandomF32(static_cast<size_t>(t * hv), seed + 4, 0.05f, 0.95f);
+  const auto stf = RandomF32(static_cast<size_t>(n * hv * dv * dk), seed + 5, -0.5f, 0.5f);
+  const auto qb = Pack(qf, cb.in);
+  const auto kb = Pack(kf, cb.in);
+  const auto vb = Pack(vf, cb.in);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+
+  std::vector<uint8_t> out_cpu(static_cast<size_t>(t * hv * dv) * vt::SizeOf(cb.out));
+  std::vector<float> st_cpu = stf, g_cpu = gf, beta_cpu = betaf;
+  std::vector<int32_t> qsl_cpu = qsl;
+  Tensor tq = MakeT(const_cast<uint8_t*>(qb.data()), cb.in, Cpu(), {t, hk, dk});
+  Tensor tk = MakeT(const_cast<uint8_t*>(kb.data()), cb.in, Cpu(), {t, hk, dk});
+  Tensor tv = MakeT(const_cast<uint8_t*>(vb.data()), cb.in, Cpu(), {t, hv, dv});
+  Tensor tg = MakeT(g_cpu.data(), DType::kF32, Cpu(), {t, hv});
+  Tensor tbeta = MakeT(beta_cpu.data(), DType::kF32, Cpu(), {t, hv});
+  Tensor ts = MakeT(st_cpu.data(), DType::kF32, Cpu(), {n, hv, dv, dk});
+  Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), {t, hv, dv});
+  Queue cq = Q();
+  if (decode) {
+    vt::GdnDecode(cq, to, tq, tk, tv, tg, tbeta, ts, args);
+  } else {
+    Tensor tqsl = MakeT(qsl_cpu.data(), DType::kI32, Cpu(), {n + 1});
+    vt::GdnPrefill(cq, to, tq, tk, tv, tg, tbeta, ts, tqsl, args);
+  }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dq(gpu, gq.q, cb.in, {t, hk, dk}, qb.data());
+  DeviceTensor dkt(gpu, gq.q, cb.in, {t, hk, dk}, kb.data());
+  DeviceTensor dvt(gpu, gq.q, cb.in, {t, hv, dv}, vb.data());
+  DeviceTensor dg(gpu, gq.q, DType::kF32, {t, hv}, gf.data());
+  DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, hv}, betaf.data());
+  DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, stf.data());
+  DeviceTensor dout(gpu, gq.q, cb.out, {t, hv, dv});
+  if (decode) {
+    vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
+                  dbeta.tensor(), dst.tensor(), args);
+  } else {
+    DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
+    vt::GdnPrefill(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
+                   dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
+  }
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  std::vector<float> st_gpu(st_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+  dst.Download(gq.q, st_gpu.data());
+
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
+  // The state is f32 on both sides in every combo (bf16 inputs are the same
+  // bytes for CPU and CUDA), so it always compares at the f32 tolerance.
+  CheckClose(st_gpu, st_cpu, 1e-5f, 1e-5f);
+}
+
+}  // namespace
+
+TEST_CASE("CUDA causal_conv1d_fwd matches CPU (varlen, bias, dtypes)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 5000;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    RunConvFwdCudaCase({0, 5, 6, 9}, {1, 0, 1}, 10, 4, /*with_bias=*/true, /*silu=*/true, cb,
+                       seed);
+    seed += 10;
+  }
+  // T < K-1 write-back paths (shifted old state / zero left-pad), linear.
+  RunConvFwdCudaCase({0, 1, 3}, {1, 0}, 3, 4, /*with_bias=*/false, /*silu=*/false,
+                     kCudaCombos[0], seed);
+  // Real conv dim (512 channels spans multiple thread blocks per sequence).
+  RunConvFwdCudaCase({0, 9, 16}, {1, 1}, 512, 4, /*with_bias=*/false, /*silu=*/true,
+                     kCudaCombos[0], seed + 10);
+}
+
+TEST_CASE("CUDA causal_conv1d_update matches CPU") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 5200;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    RunConvUpdateCudaCase(4, 7, 4, /*with_bias=*/true, /*silu=*/true, cb, seed);
+    seed += 10;
+  }
+  RunConvUpdateCudaCase(3, 512, 4, /*with_bias=*/false, /*silu=*/true, kCudaCombos[0], seed);
+}
+
+TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 5400;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    RunL2NormCudaCase({5, 127}, cb, seed);
+    RunL2NormCudaCase({3, 2, 128}, cb, seed + 1);
+    seed += 10;
+  }
+  // Row longer than the block (300 > 256) exercises the strided reduction.
+  RunL2NormCudaCase({2, 300}, kCudaCombos[0], seed);
+}
+
+TEST_CASE("CUDA rmsnorm_gated matches CPU (silu and sigmoid gates)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 5600;
+  for (bool sigmoid : {false, true}) {
+    for (const Combo& cb : kCudaCombos) {
+      CAPTURE(sigmoid);
+      CAPTURE(static_cast<int>(cb.in));
+      CAPTURE(static_cast<int>(cb.out));
+      RunRmsNormGatedCudaCase(4, 129, sigmoid, cb, seed);
+      seed += 10;
+    }
+  }
+}
+
+TEST_CASE("CUDA gdn prefill matches CPU (varlen, GQA ratio 3)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 5800;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    RunGdnCudaCase({0, 4, 7}, 0, 2, 6, 16, 8, cb, seed);
+    seed += 10;
+  }
+}
+
+TEST_CASE("CUDA gdn prefill matches CPU (real dims and > blockDim striding)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  // Real head dims (Dk=Dv=128, GQA ratio 2 as in the 35B gate).
+  RunGdnCudaCase({0, 5}, 0, 1, 2, 128, 128, kCudaCombos[0], 6000);
+  // Dv=300 > 256 threads exercises the row-stride loop; Dk=300 the shared
+  // q'/k staging stride.
+  RunGdnCudaCase({0, 3}, 0, 1, 2, 300, 300, kCudaCombos[0], 6010);
+}
+
+TEST_CASE("CUDA gdn decode matches CPU (GQA ratio 3)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 6200;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    RunGdnCudaCase({}, 3, 2, 6, 16, 8, cb, seed);
+    seed += 10;
+  }
 }

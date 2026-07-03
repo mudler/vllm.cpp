@@ -58,3 +58,17 @@
   serving baseline still to be measured). NEXT: M0.4 loaders (safetensors
   + GGUF incl. NVFP4 extension types; remember the `Tensor::Numel`
   overflow guard is due here — untrusted file metadata).
+- **2026-07-03 (later)** — M0.4 done (`4aeae62`, tooling `b8b4bd8`): container
+  loaders landed — hf_config (upstream-loyal rotary defaults), safetensors
+  mmap reader (offset-order-independent, ASan-fuzzed), GGUF v3 reader (std
+  types + fork NVFP4 id 40 / Q1_0 id 41, DoS-capped) + `dump_container` CLI
+  with python truth side (`tools/parity/verify_containers.py`). E2e gate on
+  dgx.casa: 5/5 checkpoints byte-verified vs Python (per-tensor sha256 diff
+  empty) — Qwen3-0.6B safetensors (311 tensors), unsloth 27B NVFP4 (2111),
+  APEX-I-Mini GGUF (733), Coder-30B Q8_0 GGUF (579), nvidia 35B NVFP4
+  safetensors 3 shards (51662+63484+9322 = 124468 tensors, index.json lists
+  all 3 shards, 178s). Discoveries: the APEX GGUFs contain NO NVFP4 tensors
+  (they're IQ2_S/IQ4_XS/k-quants); fork NVFP4 = GGUF type id 40 (documented
+  in `.agents/gguf-nvfp4-notes.md`); the nvidia 35B snapshot was incomplete
+  and had to be downloaded fresh. NEXT: finish M0.5 tokenizer (tasks 5-7:
+  incremental detokenizer, corpus goldens vs HF tokenizers, records).

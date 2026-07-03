@@ -23,7 +23,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 - ✅ **M0.3 Parity harness** (`f063890`): `tools/parity/` dump scripts (upstream vLLM on
   dgx.casa produces golden op/layer/logits dumps); C++ test loader +
   threshold framework. DoD: harness runs end-to-end on one op both backends.
-- ☐ **M0.4 Loaders**: safetensors mmap loader + HF config.json; GGUF container
+- ✅ **M0.4 Loaders** (`4aeae62`): safetensors mmap loader + HF config.json; GGUF container
   reader (metadata + tensor table + standard quants; NVFP4 extension types).
   DoD: both parse the gate checkpoints; tensor bytes verified vs Python.
 - ☐ **M0.5 Tokenizer**: byte-level BPE from tokenizer.json + GGUF vocab;

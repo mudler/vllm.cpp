@@ -15,6 +15,8 @@
 ## Benchmark models on dgx.casa
 
 - `~/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4`
+  (snapshot complete, ~22G, 3 safetensors shards — re-downloaded 2026-07-03
+  after the original snapshot was found incomplete)
 - `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4`
 - `~/work/apex/qwen36_35b/Qwen3.6-35B-A3B-APEX-*.gguf` (GGUF-gate inputs)
 - `~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B` (fast tests)

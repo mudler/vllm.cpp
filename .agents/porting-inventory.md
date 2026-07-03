@@ -50,11 +50,11 @@ what vLLM has vs what we have:
 | InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 |
 | OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 |
-| Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 |
-| Chunked prefill (`enable_chunked_prefill`, on by default) | `config/scheduler.py` | T0 |
-| Budgets: `max_num_batched_tokens`, `max_num_seqs`, `max_num_scheduled_tokens` | `config/scheduler.py` | T0 |
-| Preemption (FCFS tail pop, recompute) + `SchedulerOutput` new/cached diff protocol | `v1/core/sched/{scheduler,output}.py` | T0 |
-| FCFS request queue | `v1/core/sched/request_queue.py` | T0 |
+| Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 ✅ `4f12158` (schedule() running-first + chunked prefill + FCFS preemption; update_from_output + check_stop; priority/spec/structured/async deferred behind 1:1 stubs) |
+| Chunked prefill (`enable_chunked_prefill`, on by default) | `config/scheduler.py` | T0 ✅ `4f12158` |
+| Budgets: `max_num_batched_tokens`, `max_num_seqs`, `max_num_scheduled_tokens` | `config/scheduler.py` | T0 ✅ `2f0ea69` |
+| Preemption (FCFS tail pop, recompute) + `SchedulerOutput` new/cached diff protocol | `v1/core/sched/{scheduler,output}.py` | T0 ✅ `4f12158` (`c65e650` SchedulerOutput/NewRequestData/CachedRequestData in the MRV2 shape — prefill_token_ids + resumed-as-new fold) |
+| FCFS request queue | `v1/core/sched/request_queue.py` | T0 ✅ `2f0ea69` |
 | Priority scheduling (`policy="priority"`) | same | T1 |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill threshold/limits) | `config/scheduler.py` | T1 |
 | Async scheduling (overlap schedule with execution) | `v1/core/sched/async_scheduler.py` | T1 (perf lever for the gate if needed → may promote to T0) |
@@ -210,8 +210,10 @@ server binary), `examples/bench`.
 
 - **Config surface** (`vllm/config/`): port dataclass-for-dataclass as structs with
   identical field names/defaults — T0: `ModelConfig`, `CacheConfig`,
-  `SchedulerConfig`, `DeviceConfig`, `LoadConfig`, `VllmConfig` container +
-  CLI arg names matching `vllm serve` flags. T1/T2: the rest as features land.
+  `SchedulerConfig` (✅ `2f0ea69` — T0 field set incl. un-deferred watermark +
+  scheduler_reserve_full_isl), `DeviceConfig`, `LoadConfig`, `VllmConfig`
+  container + CLI arg names matching `vllm serve` flags. T1/T2: the rest as
+  features land.
 - **Weight loading**: safetensors iterator + `stacked_params_mapping`
   (`qkv_proj`/`gate_up_proj`) + `WeightsMapper` renaming — T0. GGUF loader
   (name mapping GGUF→vLLM params) — T0 (gate). Sharded-state, tensorizer,

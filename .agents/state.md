@@ -282,3 +282,34 @@
   allocate_slots→nullopt, SchedulerOutput new/cached diff); the biggest engine
   unit, ported from `vllm/v1/core/sched/scheduler.py` + `tests/v1/core/
   test_scheduler.py`.
+- **2026-07-03 (later)** — **M1.4 done** (`4f12158`; ports `2f0ea69`
+  SchedulerConfig + FCFS RequestQueue [+ `fc81a43` un-defer fix: watermark +
+  scheduler_reserve_full_isl], `c65e650` SchedulerOutput/NewRequestData/
+  CachedRequestData, `a591a0d`→`f09509c` schedule() re-ported to MRV2,
+  `4f12158` update_from_output + check_stop). **The Scheduler is ported — the
+  schedule→execute→update loop that EngineCore drives is now in place.** Pieces:
+  **SchedulerConfig + FCFS RequestQueue** (T0 field set; watermark +
+  scheduler_reserve_full_isl un-deferred because T0 schedule reads them);
+  **SchedulerOutput + NewRequestData/CachedRequestData** (the scheduler→runner
+  diff value types); **schedule()** (unified token-budget: running-first then
+  waiting, chunked prefill, FCFS preemption via allocate_slots→nullopt);
+  **update_from_output + check_stop** (min_tokens→eos→stop_token_ids→length
+  precedence, free-on-finish, EngineCoreOutput). All reviewed PASS, CI green;
+  verification is behavioral CPU unit tests ported from upstream
+  `tests/v1/core/test_scheduler.py` (FCFS / chunked-prefill / budget /
+  preemption / stop-precedence / resumed-as-new). **ARCH LESSON (recorded):**
+  the scheduler OUTPUT path is COUPLED to the model-runner version — schedule()'s
+  output tail was RE-PORTED from MRV1 to the **MRV2 shape** (`prefill_token_ids`
+  + resumed-as-new fold) at `f09509c` to match the project's MRV2 direction
+  (`.agents/vllm-v1-v2.md`), so it is M1.5-ready. **DEFERRED behind 1:1 stubs:**
+  priority scheduling, spec-decode scheduling hooks, structured-output grammar
+  bitmask, encoder budget, KV-connector, async-scheduling, caching-OFF
+  coordinator path, and EngineCoreOutputs.finished_requests frontend fan-out.
+  **M1.5 WATCH-ITEMS:** (a) `new_block_ids_to_zero` for GDN/SSM state zeroing on
+  fresh blocks; (b) the MRV2 InputBatch consumes `prefill_token_ids` on new reqs
+  + the folded resumed-as-new reqs. Close-out asserts: `PendingRunnerOps()` empty
+  (grep-confirmed — M1.4 added no goldens, `tests/parity/test_op_parity.cpp:1035`
+  kPending = {}); full local ctest 40/40; CI green. NEXT: **M1.5 InputBatch/
+  BlockTable (MRV2)** — the persistent batch (incremental add/diff/swap-remove
+  from SchedulerOutput) + step-input build (query_start_loc/seq_lens/slot_mapping/
+  positions), ported from `vllm/v1/worker/gpu/{input_batch,block_table}.py`.

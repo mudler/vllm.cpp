@@ -91,8 +91,16 @@ vocabulary is ported.**
   test_evict order. All reviewed PASS, CI green, ASan-clean; behavioral CPU
   tests ported from upstream `tests/v1/core/`. Sliding-window/MLA/chunked-local
   specs + mamba align mode + enable_caching=false deferred behind 1:1 stubs.
-- ☐ **M1.4 Scheduler** (unified token-budget, chunked prefill, preemption,
-  SchedulerOutput diffs) + ported scheduler test suite.
+- ✅ **M1.4 Scheduler** (`4f12158`; ports `2f0ea69` SchedulerConfig + FCFS
+  RequestQueue, `c65e650` SchedulerOutput/NewRequestData/CachedRequestData,
+  `a591a0d`→`f09509c` schedule() re-ported to MRV2, `4f12158`
+  update_from_output + check_stop): unified token-budget (running-first,
+  chunked prefill, FCFS preemption via allocate_slots→nullopt), SchedulerOutput
+  new/cached diffs in the MRV2 shape (prefill_token_ids + resumed-as-new fold),
+  update_from_output + check_stop (min_tokens→eos→stop_token_ids→length
+  precedence, free-on-finish). All reviewed PASS, CI green; behavioral CPU tests
+  ported from `tests/v1/core/test_scheduler.py`. Priority/spec-decode/
+  structured/encoder/KV-connector/async deferred behind 1:1 stubs.
 - ☐ **M1.5 InputBatch/BlockTable (MRV2)** persistent batch + step-input build.
 - ☐ **M1.6 Paged attention backend** (varlen prefill + paged decode,
   correctness-grade) + CommonAttentionMetadata builders.

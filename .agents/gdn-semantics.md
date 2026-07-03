@@ -27,7 +27,12 @@ Pinned sources read:
 Config fields (`transformers_utils/configs/qwen3_next.py:204-208` defaults):
 `Hk = linear_num_key_heads` (16), `Hv = linear_num_value_heads` (32),
 `Dk = linear_key_head_dim` (128), `Dv = linear_value_head_dim` (128),
-`K = linear_conv_kernel_dim` (4). Derived (qwen_gdn_linear_attn.py:443-449,
+`K = linear_conv_kernel_dim` (4). **Actual gate models** (config.json read
+on dgx 2026-07-03): Qwen3.6-35B-A3B — Hk16/Hv32/Dk128/Dv128/conv4, no
+`output_gate_type` → silu, rms_norm_eps 1e-6; Qwen3.6-27B — Hk16/**Hv48**
+(GQA ratio 3!)/Dk128/Dv128/conv4, `output_gate_type: "swish"` → silu,
+rms_norm_eps 1e-6. Both gates use silu gating (the sigmoid golden is a
+spare). Derived (qwen_gdn_linear_attn.py:443-449,
 466): `key_dim = Hk*Dk`, `value_dim = Hv*Dv`,
 `conv_dim = 2*key_dim + value_dim`.
 

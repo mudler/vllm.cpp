@@ -26,7 +26,8 @@
 //   long_prefill_token_threshold = int(max_model_len * 0.04) derivation they
 //   gate — in T0 max_num_partial_prefills == 1 so long_prefill_token_threshold
 //   stays 0), is_multimodal_model, disable_chunked_mm_input, scheduler_cls,
-//   disable_hybrid_kv_cache_manager, scheduler_reserve_full_isl, watermark,
+//   disable_hybrid_kv_cache_manager (watermark + scheduler_reserve_full_isl are
+//   NOT deferred — modeled above, read by T0 schedule()),
 //   prefill_schedule_interval, async_scheduling, stream_interval,
 //   compute_hash / get_scheduler_cls.
 //   The partial-prefill and max_long_partial_prefills verify branches are
@@ -83,6 +84,15 @@ struct SchedulerConfig {
 
   // The scheduling policy (fcfs default).
   SchedulerPolicy policy = SchedulerPolicy::kFCFS;
+
+  // NOT deferred — read by the T0 schedule() core (M1.4 Task 3):
+  //   watermark → passed to the KVCacheManager ctor (scheduler.py:275).
+  //   scheduler_reserve_full_isl → passed as `full_sequence_must_fit` into the
+  //     waiting-loop allocate_slots admission call (scheduler.py:914). Its
+  //     upstream default is TRUE, while allocate_slots defaults
+  //     full_sequence_must_fit to false — Task 3 MUST source it from here.
+  double watermark = 0.0;
+  bool scheduler_reserve_full_isl = true;
 
   // Upstream InitVar (stored on ModelConfig); kept here for the T0 subset since
   // ModelConfig is not ported yet. default_factory uses 8192.

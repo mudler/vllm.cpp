@@ -145,7 +145,7 @@ class DeviceTensor {
 
 // Input/output dtype combos per the M0.6 plan, with comparison tolerances:
 // f32-in/f32-out 1e-5; bf16-in/f32-out 2e-3. bf16 outputs (compared after
-// BF16ToF32) get rtol 8e-3 >= one bf16 ulp (2^-8 relative): the GPU tree
+// BF16ToF32) get rtol 8e-3 >= one bf16 ulp (2^-7 ≈ 7.8e-3 relative): the GPU tree
 // reduction and the CPU sequential sum legitimately differ by ~1e-6 in f32,
 // which can flip the final bf16 rounding by one ulp on large rows.
 struct Combo {
@@ -365,6 +365,89 @@ TEST_CASE("CUDA embedding: out-of-range device id throws with the id") {
     // The kernel clamps bad ids, so the stream stays healthy after the throw.
     CHECK_NOTHROW(gpu.Synchronize(gq.q));
   }
+}
+
+TEST_CASE("CUDA matmul (cuBLASLt) matches CPU on odd sizes") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  // Matmul-specific tolerances: cuBLASLt may reduce over K in a different
+  // order than the CPU triple loop (split-K, tensor-core tiles), so even the
+  // all-f32 combo gets 1e-4 instead of the elementwise 1e-5. bf16 inputs are
+  // identical bytes on both sides (products are exact in f32), so bf16-in
+  // stays at 2e-3 and bf16-out at one output ulp, as in kCombos.
+  const Combo combos[] = {
+      {DType::kF32, DType::kF32, 1e-4f, 1e-4f},
+      {DType::kBF16, DType::kF32, 2e-3f, 2e-3f},
+      {DType::kBF16, DType::kBF16, 4e-3f, 8e-3f},
+  };
+  struct Dims {
+    int64_t m, k, n;
+  };
+  // Odd shapes exercise tile tails; {1,257,1} is a pure K-reduction.
+  const Dims dims[] = {{17, 31, 13}, {64, 128, 32}, {1, 257, 1}};
+  uint32_t seed = 3000;
+  for (const Dims& d : dims) {
+    for (const Combo& c : combos) {
+      CAPTURE(d.m);
+      CAPTURE(d.k);
+      CAPTURE(d.n);
+      CAPTURE(static_cast<int>(c.in));
+      CAPTURE(static_cast<int>(c.out));
+      const auto af = RandomF32(static_cast<size_t>(d.m * d.k), seed);
+      const auto bf = RandomF32(static_cast<size_t>(d.k * d.n), seed + 1);
+      const auto ab = Pack(af, c.in);
+      const auto bb = Pack(bf, c.in);
+
+      // CPU reference on the same packed inputs.
+      std::vector<uint8_t> out_cpu(static_cast<size_t>(d.m * d.n) * vt::SizeOf(c.out));
+      Tensor ta = MakeTensor(const_cast<uint8_t*>(ab.data()), c.in, Cpu(), {d.m, d.k});
+      Tensor tb = MakeTensor(const_cast<uint8_t*>(bb.data()), c.in, Cpu(), {d.k, d.n});
+      Tensor to = MakeTensor(out_cpu.data(), c.out, Cpu(), {d.m, d.n});
+      Queue cq{Cpu(), nullptr};
+      vt::Matmul(cq, to, ta, tb);
+
+      // CUDA.
+      QueueGuard gq(gpu);
+      DeviceTensor da(gpu, gq.q, c.in, {d.m, d.k}, ab.data());
+      DeviceTensor db(gpu, gq.q, c.in, {d.k, d.n}, bb.data());
+      DeviceTensor dout(gpu, gq.q, c.out, {d.m, d.n});
+      vt::Matmul(gq.q, dout.tensor(), da.tensor(), db.tensor());
+      std::vector<uint8_t> out_gpu(out_cpu.size());
+      dout.Download(gq.q, out_gpu.data());
+
+      CheckClose(Unpack(out_gpu, c.out), Unpack(out_cpu, c.out), c.atol, c.rtol);
+      seed += 10;
+    }
+  }
+}
+
+TEST_CASE("CUDA matmul: unsupported dtype combo (f16 inputs) throws naming it") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  // The op-level validation admits f16 inputs; the cuBLASLt kernel does not
+  // implement them and must throw before touching the data (left unset).
+  DeviceTensor da(gpu, gq.q, DType::kF16, {4, 8});
+  DeviceTensor db(gpu, gq.q, DType::kF16, {8, 3});
+  DeviceTensor dout(gpu, gq.q, DType::kF32, {4, 3});
+  bool threw = false;
+  try {
+    vt::Matmul(gq.q, dout.tensor(), da.tensor(), db.tensor());
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    const std::string msg = e.what();
+    CAPTURE(msg);
+    CHECK(msg.find("matmul") != std::string::npos);
+    CHECK(msg.find("f16") != std::string::npos);
+  }
+  CHECK(threw);
+  CHECK_NOTHROW(gpu.Synchronize(gq.q));
 }
 
 TEST_CASE("CUDA rope_neox matches CPU (partial rotary, i32/i64 positions)") {

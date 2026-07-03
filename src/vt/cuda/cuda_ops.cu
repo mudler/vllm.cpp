@@ -210,6 +210,9 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
            "cuda embedding: unsupported out dtype");
   const int64_t n = ids.shape[0] * table.shape[1];
   if (n == 0) return;
+  // v == 0 with nonempty ids can never gather anything valid, and the in-kernel
+  // clamp (v - 1) would go out of bounds — throw loudly before launching.
+  VT_CHECK(table.shape[0] > 0, "cuda embedding: empty table (vocab 0) with nonempty ids");
   cudaStream_t s = AsStream(q);
 
   EmbeddingErr* derr = nullptr;

@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -74,7 +75,151 @@ constexpr const char* kLlamaJson = R"({
   "torch_dtype": "float16"
 })";
 
+// Multimodal wrapper config (Qwen3_5MoeForConditionalGeneration): the
+// text-model fields are nested under `text_config`; only architectures,
+// model_type and (here) torch_dtype live at the top level. Mirrors the real 35B
+// config.json structure that LoadHfConfig must resolve via the upstream
+// get_text_config() path.
+constexpr const char* kNestedWrapperJson = R"({
+  "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+  "model_type": "qwen3_5_moe",
+  "torch_dtype": "bfloat16",
+  "vision_config": {
+    "model_type": "qwen3_5_moe",
+    "depth": 27,
+    "hidden_size": 1152
+  },
+  "text_config": {
+    "model_type": "qwen3_5_moe_text",
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "vocab_size": 248320,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                    "full_attention", "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention", "linear_attention",
+                    "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention",
+                    "full_attention", "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention", "linear_attention",
+                    "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention",
+                    "full_attention", "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention", "linear_attention",
+                    "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention",
+                    "full_attention"],
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "rope_theta": 5000000.0,
+    "rms_norm_eps": 1e-06,
+    "max_position_embeddings": 32768
+  }
+})";
+
 }  // namespace
+
+TEST_CASE("LoadHfConfig resolves nested text_config for a wrapper config") {
+  TempJson f(kNestedWrapperJson);
+  vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+
+  // architectures + model_type come from the top-level wrapper.
+  REQUIRE(cfg.architectures.size() == 1);
+  CHECK(cfg.architectures[0] == "Qwen3_5MoeForConditionalGeneration");
+  CHECK(cfg.model_type == "qwen3_5_moe");
+
+  // Text-model fields resolved from the nested text_config, not the wrapper.
+  CHECK(cfg.num_hidden_layers == 40);
+  CHECK(cfg.num_experts == 256);
+  CHECK(cfg.num_experts_per_tok == 8);
+  REQUIRE(cfg.layer_types.size() == 40);
+  CHECK(cfg.layer_types[0] == "linear_attention");
+  CHECK(cfg.layer_types[3] == "full_attention");
+  CHECK(cfg.layer_types[39] == "full_attention");
+  CHECK(cfg.hidden_size == 2048);
+  CHECK(cfg.vocab_size == 248320);
+  CHECK(cfg.num_attention_heads == 16);
+  CHECK(cfg.num_key_value_heads == 2);
+  CHECK(cfg.head_dim == 256);
+  CHECK(cfg.moe_intermediate_size == 512);
+  CHECK(cfg.shared_expert_intermediate_size == 512);
+  CHECK(cfg.linear_num_key_heads == 16);
+  CHECK(cfg.linear_num_value_heads == 32);
+  CHECK(cfg.linear_key_head_dim == 128);
+  CHECK(cfg.linear_value_head_dim == 128);
+  CHECK(cfg.linear_conv_kernel_dim == 4);
+  CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
+  CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6));
+  CHECK(cfg.max_position_embeddings == 32768);
+
+  // partial_rotary_factor absent -> qwen family default 0.25 applies from the
+  // resolved config (0.25 * 256 = 64).
+  CHECK(cfg.rotary_dim == 64);
+
+  // torch_dtype lives only at the top level here; fall back to the wrapper.
+  CHECK(cfg.torch_dtype == "bfloat16");
+
+  // raw keeps the full wrapper doc, including nested sub-configs.
+  CHECK(cfg.raw.at("text_config").at("num_hidden_layers").get<int64_t>() == 40);
+}
+
+TEST_CASE("LoadHfConfig resolves llm_config alias and thinker_config.text_config") {
+  SUBCASE("llm_config alias (upstream _CONFIG_ATTRS_MAPPING)") {
+    TempJson f(R"({
+      "architectures": ["SomeWrapperForCausalLM"],
+      "model_type": "wrapper",
+      "llm_config": {
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 28
+      }
+    })");
+    vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.model_type == "wrapper");
+    CHECK(cfg.hidden_size == 3584);
+    CHECK(cfg.num_hidden_layers == 28);
+  }
+  SUBCASE("thinker_config.text_config") {
+    TempJson f(R"({
+      "architectures": ["ThinkerForConditionalGeneration"],
+      "model_type": "thinker_wrapper",
+      "thinker_config": {
+        "text_config": {
+          "hidden_size": 4096,
+          "num_hidden_layers": 36,
+          "num_attention_heads": 32
+        }
+      }
+    })");
+    vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.model_type == "thinker_wrapper");
+    CHECK(cfg.hidden_size == 4096);
+    CHECK(cfg.num_hidden_layers == 36);
+  }
+}
+
+TEST_CASE("LoadHfConfig on the real 35B config.json (skipped if absent)") {
+  // Point VLLM_CPP_QWEN35_CONFIG at a real
+  // Qwen3_5MoeForConditionalGeneration config.json to exercise this on dgx.
+  const char* env = std::getenv("VLLM_CPP_QWEN35_CONFIG");
+  if (env == nullptr || !std::filesystem::exists(env)) {
+    MESSAGE("skipping: VLLM_CPP_QWEN35_CONFIG not set to an existing file");
+    return;
+  }
+  vllm::HfConfig cfg = vllm::LoadHfConfig(env);
+  CHECK(cfg.num_hidden_layers == 40);
+  CHECK(cfg.num_experts == 256);
+  CHECK(cfg.layer_types.size() == 40);
+}
 
 TEST_CASE("LoadHfConfig parses a Qwen3-Next-like hybrid MoE config") {
   TempJson f(kHybridJson);

@@ -13,6 +13,12 @@ namespace vllm {
 // the pinned upstream config classes (vllm/transformers_utils/configs/
 // qwen3_next.py and friends). Missing optional fields default to 0/empty;
 // missing required fields (model_type, hidden_size, num_hidden_layers) throw.
+//
+// Composite multimodal wrapper configs (e.g.
+// Qwen3_5MoeForConditionalGeneration) nest the text-model fields under a
+// `text_config` sub-dict; LoadHfConfig resolves that nested object as the source
+// of the text fields, mirroring upstream PretrainedConfig.get_text_config().
+// `model_type` and `architectures` are always read from the top-level wrapper.
 struct HfConfig {
   std::string model_type;
   std::vector<std::string> architectures;

@@ -42,6 +42,42 @@ void RequireKey(const nlohmann::json& doc, const char* key,
   }
 }
 
+// Returns a pointer to the object member `key` of `doc` if it exists and is a
+// JSON object, else nullptr.
+const nlohmann::json* FindObject(const nlohmann::json& doc, const char* key) {
+  auto it = doc.find(key);
+  if (it == doc.end() || !it->is_object()) return nullptr;
+  return &*it;
+}
+
+// Resolves the effective "text config" json object, mirroring upstream
+// PretrainedConfig.get_text_config() + the _CONFIG_ATTRS_MAPPING alias
+// {"llm_config": "text_config"} (vllm/transformers_utils/config.py:134) and the
+// thinker_config.text_config path (thinker_uses_mrope, config.py:529). Composite
+// (multimodal wrapper) configs nest the text-model fields under a `text_config`
+// (or `llm_config`, or `thinker_config.text_config`) sub-dict; plain dense
+// configs have no such nesting and resolve to the top-level doc itself.
+const nlohmann::json& ResolveTextConfig(const nlohmann::json& doc) {
+  if (const nlohmann::json* text = FindObject(doc, "text_config")) return *text;
+  if (const nlohmann::json* llm = FindObject(doc, "llm_config")) return *llm;
+  if (const nlohmann::json* thinker = FindObject(doc, "thinker_config")) {
+    if (const nlohmann::json* text = FindObject(*thinker, "text_config")) {
+      return *text;
+    }
+  }
+  return doc;
+}
+
+// True for the Qwen3.5 / Qwen3-Next family, whose upstream config classes
+// default partial_rotary_factor to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92).
+// Both the wrapper's top-level model_type ("qwen3_5_moe") and the nested text
+// model_type ("qwen3_5_moe_text") carry the signal, so we check either.
+bool IsQwen35Family(const std::string& model_type) {
+  return model_type == "qwen3_next" || model_type == "qwen3_5" ||
+         model_type == "qwen3_5_moe" || model_type == "qwen3_5_text" ||
+         model_type == "qwen3_5_moe_text";
+}
+
 }  // namespace
 
 HfConfig LoadHfConfig(const std::string& path) {
@@ -61,63 +97,76 @@ HfConfig LoadHfConfig(const std::string& path) {
                              path);
   }
 
+  // Resolve the effective text config: for multimodal wrapper configs (e.g.
+  // Qwen3_5MoeForConditionalGeneration) the text-model fields are nested under
+  // `text_config`; for plain dense configs `text` aliases `doc`. `architectures`
+  // and `model_type` are always read from the top-level wrapper doc.
+  const nlohmann::json& text = ResolveTextConfig(doc);
+
   RequireKey(doc, "model_type", path);
-  RequireKey(doc, "hidden_size", path);
-  RequireKey(doc, "num_hidden_layers", path);
+  RequireKey(text, "hidden_size", path);
+  RequireKey(text, "num_hidden_layers", path);
 
   HfConfig cfg;
   try {
     cfg.model_type = GetString(doc, "model_type");
     cfg.architectures = GetStringArray(doc, "architectures");
-    cfg.hidden_size = GetInt(doc, "hidden_size", 0);
-    cfg.num_hidden_layers = GetInt(doc, "num_hidden_layers", 0);
-    cfg.vocab_size = GetInt(doc, "vocab_size", 0);
-    cfg.num_attention_heads = GetInt(doc, "num_attention_heads", 0);
+    cfg.hidden_size = GetInt(text, "hidden_size", 0);
+    cfg.num_hidden_layers = GetInt(text, "num_hidden_layers", 0);
+    cfg.vocab_size = GetInt(text, "vocab_size", 0);
+    cfg.num_attention_heads = GetInt(text, "num_attention_heads", 0);
     // Absent -> MHA, per upstream convention.
     cfg.num_key_value_heads =
-        GetInt(doc, "num_key_value_heads", cfg.num_attention_heads);
+        GetInt(text, "num_key_value_heads", cfg.num_attention_heads);
     int64_t derived_head_dim =
         cfg.num_attention_heads > 0 ? cfg.hidden_size / cfg.num_attention_heads
                                     : 0;
     // Upstream only honors an explicit head_dim when it is > 0
     // (model_arch_config_convertor.py:61-75); absent or non-positive falls
     // back to hidden_size / num_attention_heads.
-    cfg.head_dim = GetInt(doc, "head_dim", 0);
+    cfg.head_dim = GetInt(text, "head_dim", 0);
     if (cfg.head_dim <= 0) cfg.head_dim = derived_head_dim;
-    cfg.layer_types = GetStringArray(doc, "layer_types");
-    cfg.intermediate_size = GetInt(doc, "intermediate_size", 0);
+    cfg.layer_types = GetStringArray(text, "layer_types");
+    cfg.intermediate_size = GetInt(text, "intermediate_size", 0);
 
-    cfg.num_experts = GetInt(doc, "num_experts", 0);
-    cfg.num_experts_per_tok = GetInt(doc, "num_experts_per_tok", 0);
-    cfg.moe_intermediate_size = GetInt(doc, "moe_intermediate_size", 0);
+    cfg.num_experts = GetInt(text, "num_experts", 0);
+    cfg.num_experts_per_tok = GetInt(text, "num_experts_per_tok", 0);
+    cfg.moe_intermediate_size = GetInt(text, "moe_intermediate_size", 0);
     cfg.shared_expert_intermediate_size =
-        GetInt(doc, "shared_expert_intermediate_size", 0);
+        GetInt(text, "shared_expert_intermediate_size", 0);
 
-    cfg.linear_num_key_heads = GetInt(doc, "linear_num_key_heads", 0);
-    cfg.linear_num_value_heads = GetInt(doc, "linear_num_value_heads", 0);
-    cfg.linear_key_head_dim = GetInt(doc, "linear_key_head_dim", 0);
-    cfg.linear_value_head_dim = GetInt(doc, "linear_value_head_dim", 0);
-    cfg.linear_conv_kernel_dim = GetInt(doc, "linear_conv_kernel_dim", 0);
+    cfg.linear_num_key_heads = GetInt(text, "linear_num_key_heads", 0);
+    cfg.linear_num_value_heads = GetInt(text, "linear_num_value_heads", 0);
+    cfg.linear_key_head_dim = GetInt(text, "linear_key_head_dim", 0);
+    cfg.linear_value_head_dim = GetInt(text, "linear_value_head_dim", 0);
+    cfg.linear_conv_kernel_dim = GetInt(text, "linear_conv_kernel_dim", 0);
 
-    cfg.rope_theta = GetDouble(doc, "rope_theta", 10000.0);
+    cfg.rope_theta = GetDouble(text, "rope_theta", 10000.0);
     // Partial rotary factor. When the key is absent, upstream Qwen-family
     // config classes default it to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92);
-    // all other models default to full rotary (1.0).
+    // all other models default to full rotary (1.0). The wrapper carries the
+    // qwen signal on the top-level model_type ("qwen3_5_moe") while the nested
+    // text config carries it as "qwen3_5_moe_text" -- check either.
     double default_partial_rotary_factor = 1.0;
-    if (cfg.model_type == "qwen3_next" || cfg.model_type == "qwen3_5" ||
-        cfg.model_type == "qwen3_5_moe") {
+    if (IsQwen35Family(cfg.model_type) ||
+        IsQwen35Family(GetString(text, "model_type"))) {
       default_partial_rotary_factor = 0.25;
     }
     const double partial_rotary_factor = GetDouble(
-        doc, "partial_rotary_factor", default_partial_rotary_factor);
+        text, "partial_rotary_factor", default_partial_rotary_factor);
     // Upstream truncates: int(head_dim * partial_rotary_factor)
     // (rotary_embedding/__init__.py:72).
     cfg.rotary_dim = static_cast<int64_t>(partial_rotary_factor *
                                           static_cast<double>(cfg.head_dim));
 
-    cfg.rms_norm_eps = GetDouble(doc, "rms_norm_eps", 0.0);
-    cfg.max_position_embeddings = GetInt(doc, "max_position_embeddings", 0);
-    cfg.torch_dtype = GetString(doc, "torch_dtype");
+    cfg.rms_norm_eps = GetDouble(text, "rms_norm_eps", 0.0);
+    cfg.max_position_embeddings = GetInt(text, "max_position_embeddings", 0);
+    // torch_dtype lives under the text config for nested wrappers, but some
+    // wrappers only declare it at the top level -- fall back to the wrapper doc.
+    cfg.torch_dtype = GetString(text, "torch_dtype");
+    if (cfg.torch_dtype.empty() && &text != &doc) {
+      cfg.torch_dtype = GetString(doc, "torch_dtype");
+    }
   } catch (const nlohmann::json::exception& e) {
     throw std::runtime_error("hf_config: bad field type in " + path + ": " +
                              e.what());

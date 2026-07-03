@@ -79,6 +79,8 @@ class TempJson {
 //   30 = bytes 8D 21        (continuation byte + '!')
 //   31 = bytes E5 81 9C     (停)
 //   32 = bytes E6 AD A2     (止)
+//   33 = literal "£中"       (£ U+00A3 is IN the byte-map image, 中 U+4E2D is
+//                            not — per-token all-or-nothing fallback case)
 // Fragment tokens are fed to the detokenizer by id (never via Encode), so no
 // merges are needed for them.
 Tokenizer BuildFixture() {
@@ -119,6 +121,7 @@ Tokenizer BuildFixture() {
   vocab[MapBytesToUnicode("\x8D!")] = 30;
   vocab[MapBytesToUnicode("\xE5\x81\x9C")] = 31;
   vocab[MapBytesToUnicode("\xE6\xAD\xA2")] = 32;
+  vocab["\xC2\xA3\xE4\xB8\xAD"] = 33;  // literal "£中", NOT byte-mapped
   doc["model"] = {
       {"type", "BPE"},
       {"ignore_merges", false},
@@ -315,6 +318,17 @@ TEST_CASE("UTF-8 across token boundaries is held back until complete") {
                                                   /*starting_index=*/2);
     CHECK(text == " world");
   }
+}
+
+TEST_CASE("mixed in/out-of-image token passes through verbatim (per-token)") {
+  // HF's ByteLevel decoder reverses the byte map per-TOKEN, all-or-nothing:
+  // 中 (U+4E2D) is outside the bytes_to_unicode image, so the whole token
+  // "£中" passes through as its literal UTF-8 text — even though £ (U+00A3)
+  // alone is in the image (it would byte-map to the single byte A3). A
+  // per-character mapping would emit the corrupt bytes A3 E4 B8 AD.
+  const Tokenizer& tok = Fixture();
+  const auto [text, ids] = RunIncrementalDecode(tok, {13, 33}, true, 0);
+  CHECK(text == "hello\xC2\xA3\xE4\xB8\xAD");  // "hello£中", £ NOT remapped
 }
 
 TEST_CASE(

@@ -408,6 +408,9 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
         break;
       }
       case 3:  // control -> added token, special (detokenizer may skip)
+        // NOTE: real Qwen GGUFs tag FIM/tool tokens control(3) while the HF
+        // json has special=false — skip_special_tokens=true detokenization
+        // diverges between loaders (faithful to each file).
         tok.added_tokens_.push_back({text, id, /*special=*/true});
         break;
       case 4:  // user-defined -> added token, kept on decode

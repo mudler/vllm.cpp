@@ -20,7 +20,8 @@ constexpr size_t kInitialIncrementalDetokenizationOffset = 5;
 
 // Decodes one UTF-8 codepoint at `pos`; writes it to `cp` and returns its
 // byte length. Invalid bytes decode as a 1-byte U+FFFD (which is outside the
-// byte-level bijection image, so they pass through ConvertTokensToString).
+// byte-level bijection image, so the containing token falls back to verbatim
+// pass-through in ConvertTokensToString).
 size_t DecodeUtf8(std::string_view s, size_t pos, uint32_t& cp) {
   const uint8_t b0 = static_cast<uint8_t>(s[pos]);
   size_t len;
@@ -71,28 +72,32 @@ void ConvertIdsToTokens(const tok::Tokenizer& tokenizer,
 }
 
 // TokenizerLike.convert_tokens_to_string for the byte-level BPE family:
-// HF fast tokenizers route this through the ByteLevel decoder, which maps
-// every codepoint in the bytes_to_unicode image back to its byte. Codepoints
-// outside the image (added-token literal content) pass through as raw UTF-8,
-// matching the decoder's behavior on our tokenizers (added-token content is
-// ASCII, which the bijection maps to itself).
+// HF fast tokenizers route this through the ByteLevel decoder, whose byte-map
+// reversal is per-TOKEN all-or-nothing: a token whose every codepoint is in
+// the bytes_to_unicode image is mapped back to its bytes, while a token
+// containing ANY codepoint outside the image (added-token literal content)
+// passes through verbatim as its raw UTF-8 text (tokenizers' ByteLevel
+// decode_chain: try_fold over CHAR_BYTES, unwrap_or the token's own bytes).
 std::string ConvertTokensToString(const std::vector<std::string>& tokens,
                                   size_t begin, size_t end) {
   std::string out;
+  std::string unmapped;  // per-token byte-map reversal attempt
   for (size_t t = begin; t < end; ++t) {
     const std::string& token = tokens[t];
+    unmapped.clear();
+    bool in_image = true;
     size_t pos = 0;
     while (pos < token.size()) {
       uint32_t cp = 0;
-      const size_t len = DecodeUtf8(token, pos, cp);
+      pos += DecodeUtf8(token, pos, cp);
       const int32_t byte = tok::UnicodeToByte(cp);
-      if (byte >= 0) {
-        out.push_back(static_cast<char>(byte));
-      } else {
-        out.append(token, pos, len);
+      if (byte < 0) {
+        in_image = false;
+        break;
       }
-      pos += len;
+      unmapped.push_back(static_cast<char>(byte));
     }
+    out += in_image ? unmapped : token;
   }
   return out;
 }

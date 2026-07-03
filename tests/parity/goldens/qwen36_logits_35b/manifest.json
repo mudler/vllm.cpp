@@ -1,0 +1,94 @@
+{
+ "op": "qwen36_logits",
+ "args": {
+  "vocab_size": 248320,
+  "topk": 1000,
+  "n_greedy": 16,
+  "seqlen": 9,
+  "note": "argmax/top-k over per-position logits = lm_head(norm_out); greedy_ids = temperature-0 decode continuation."
+ },
+ "tensors": {
+  "token_ids": {
+   "file": "token_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    9
+   ]
+  },
+  "argmax": {
+   "file": "argmax.npy",
+   "dtype": "i32",
+   "shape": [
+    9
+   ]
+  },
+  "topk_values": {
+   "file": "topk_values.npy",
+   "dtype": "f32",
+   "shape": [
+    9,
+    1000
+   ]
+  },
+  "topk_indices": {
+   "file": "topk_indices.npy",
+   "dtype": "i32",
+   "shape": [
+    9,
+    1000
+   ]
+  },
+  "greedy_ids": {
+   "file": "greedy_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ]
+  }
+ },
+ "inputs": [
+  "token_ids"
+ ],
+ "outputs": [
+  "argmax",
+  "greedy_ids"
+ ],
+ "tol": {
+  "argmax": "exact",
+  "logits_atol": 0.05,
+  "logits_rtol": 0.05
+ },
+ "oracle": {
+  "source": "pip-vllm:0.24.0",
+  "pin_reference": "e24d1b24",
+  "detail": "vLLM v1 offline engine (pip vllm 0.24.0, same release family as pin e24d1b24). Quantized linears run the real NVFP4 path (cutlass FP4 for compressed-tensors W4A4 [27B] / modelopt W4A16 [35B]); GDN in_proj, embed, norms, lm_head are bf16.",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "model": "/home/mudler/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots/491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+  "prompt": "The capital of France is Paris, and the",
+  "prompt_ids": [
+   760,
+   6511,
+   314,
+   9338,
+   369,
+   11751,
+   11,
+   321,
+   279
+  ],
+  "layer_types_head": [
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "gdn_layer_idx": 0,
+  "full_attn_layer_idx": 3,
+  "note": "Residual-stream in/out reconstructed as hidden+residual (f32). Full-attn layer exercises qk-norm + partial mrope RoPE + GQA + sigmoid output gate. Logits computed via the model's own compute_logits (LogitsProcessor -> lm_head) on the captured post-norm hidden; only argmax + top-1000 kept (budget)."
+ }
+}

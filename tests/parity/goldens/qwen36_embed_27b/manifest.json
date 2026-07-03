@@ -1,0 +1,67 @@
+{
+ "op": "qwen36_embed",
+ "args": {
+  "hidden": 5120,
+  "seqlen": 9
+ },
+ "tensors": {
+  "token_ids": {
+   "file": "token_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    9
+   ]
+  },
+  "embed": {
+   "file": "embed.npy",
+   "dtype": "f32",
+   "shape": [
+    9,
+    5120
+   ]
+  }
+ },
+ "inputs": [
+  "token_ids"
+ ],
+ "outputs": [
+  "embed"
+ ],
+ "tol": {
+  "atol": 0.001,
+  "rtol": 0.001
+ },
+ "oracle": {
+  "source": "pip-vllm:0.24.0",
+  "pin_reference": "e24d1b24",
+  "detail": "vLLM v1 offline engine (pip vllm 0.24.0, same release family as pin e24d1b24). Quantized linears run the real NVFP4 path (cutlass FP4 for compressed-tensors W4A4 [27B] / modelopt W4A16 [35B]); GDN in_proj, embed, norms, lm_head are bf16.",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "model": "/home/mudler/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a",
+  "prompt": "The capital of France is Paris, and the",
+  "prompt_ids": [
+   760,
+   6511,
+   314,
+   9338,
+   369,
+   11751,
+   11,
+   321,
+   279
+  ],
+  "layer_types_head": [
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "gdn_layer_idx": 0,
+  "full_attn_layer_idx": 3,
+  "note": "Residual-stream in/out reconstructed as hidden+residual (f32). Full-attn layer exercises qk-norm + partial mrope RoPE + GQA + sigmoid output gate. Logits computed via the model's own compute_logits (LogitsProcessor -> lm_head) on the captured post-norm hidden; only argmax + top-1000 kept (budget)."
+ }
+}

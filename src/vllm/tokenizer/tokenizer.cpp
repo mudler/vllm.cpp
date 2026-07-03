@@ -252,7 +252,13 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
         right.find(' ') != std::string::npos) {
       Fail("malformed merge entry at rank " + std::to_string(rank));
     }
-    tok.merge_ranks_.emplace(MergeKey(left, right), rank);  // first rank wins
+    const auto [it, inserted] =
+        tok.merge_ranks_.emplace(MergeKey(left, right), rank);
+    if (!inserted) {
+      Fail("duplicate merge pair \"" + left + " " + right + "\" at rank " +
+           std::to_string(rank) + " (first seen at rank " +
+           std::to_string(it->second) + ")");
+    }
     ++rank;
   }
 

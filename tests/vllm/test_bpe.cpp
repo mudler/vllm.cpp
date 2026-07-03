@@ -343,6 +343,17 @@ TEST_CASE("loader failure modes throw with actionable messages") {
         },
         "merge");
   }
+  SUBCASE("duplicate merge pair names the pair") {
+    // HF keeps the LAST rank for duplicates; we keep neither and fail loud.
+    CheckThrowsContains(
+        [&] {
+          LoadTiny(ReplaceOnce(
+              kTinyJson,
+              R"("merges": [["l", "l"], ["h", "e"], ["ll", "o"], ["he", "llo"], ["Ġ", "w"], ["o", "r"], ["l", "d"], ["or", "ld"], ["Ġw", "orld"]])",
+              R"("merges": ["a b", "b c", "a b"])"));
+        },
+        "a b");
+  }
   SUBCASE("added token lstrip/rstrip/single_word semantics unsupported") {
     CheckThrowsContains(
         [&] {

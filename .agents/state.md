@@ -38,3 +38,12 @@
   requirements added to M0.2 roadmap unit; implementations post-MVP (D10 in
   design doc; deviation §9.6 for Metal/Vulkan extensions). NVIDIA gate
   unchanged.
+- **2026-07-03** — M0.2 done: vt runtime core landed (dtype/tensor/backend/
+  arena/dispatch + 5 CPU scalar ref ops, all unit-tested; backends.md
+  interface requirements honored: open device enum, unified-memory flag,
+  per-op Queue, graph-capture hook stubs). NEXT: M0.3 parity harness
+  (upstream golden dumps on dgx.casa + C++ replay). Parity-harness note:
+  upstream RoPE cos/sin cache is f32 and drifts at long context (~1e-2 at
+  pos 131k) — M0.3 goldens need position-scaled tolerance; rmsnorm/silu
+  standard paths keep f32 precision vs upstream's pre-multiply dtype
+  rounding (documented in ops.h).

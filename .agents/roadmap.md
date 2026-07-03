@@ -15,7 +15,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
   third_party vendoring (doctest v2.5.2, nlohmann/json v3.12.0, cpp-httplib
   v0.49.0), CI workflow (CPU build + tests), directory tree per design §4.
   DoD: green CI on empty-ish lib.
-- ☐ **M0.2 vt runtime core**: Tensor/dtype/device, step arena + persistent
+- ✅ **M0.2 vt runtime core** (`8df527e`): Tensor/dtype/device, step arena + persistent
   buffers, op dispatch table, CPU scalar reference ops. Interface MUST meet
   the portability requirements in [backends.md](backends.md) (open device
   enum, unified-memory awareness, per-device queue handles, optional

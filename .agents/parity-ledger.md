@@ -16,3 +16,4 @@ Columns:
 |---|---|---|---|
 | 2026-07-02 `462d673` | Project record + inventory established (docs only) | — (meta) | n/a |
 | 2026-07-02 `411c072` | Build skeleton: libvllm static lib, doctest/ctest harness, optional CUDA (sm_121 verified on GB10), CPU CI | — (build infra; no engine behavior; upstream has setup.py/cmake in csrc — not mirrored, deviation §9 compute layer) | CPU ctest + GB10 CUDA smoke + green CI run |
+| 2026-07-03 `8df527e` | vt runtime core: dtypes(f16/bf16), Tensor views, Backend/Queue abstraction (CPU; unified-memory + graph-capture hooks per backends.md), StepArena, op registry + CPU scalar matmul/rmsnorm(+gemma,+fused-residual)/silu_and_mul/embedding/partial-neox-rope | — (vt is deviation §9.1; op semantics mirror layers/{layernorm,activation}.py + rotary_embedding NeoX) | golden-value op unit tests (upstream dump parity lands in M0.3); reviewers verified op semantics against upstream layernorm.py/activation.py/rotary_embedding sources |

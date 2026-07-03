@@ -252,6 +252,28 @@ TEST_CASE("gguf: array count beyond file size throws") {
   CHECK_THROWS_AS(vllm::GgufFile::Open(tf.path()), std::runtime_error);
 }
 
+TEST_CASE("gguf: array element budget across the file throws") {
+  // A bool array declaring 2e6 elements fits in ~2MB of file bytes, so the
+  // per-array remaining-bytes check passes; only the file-wide element
+  // budget (1e6) rejects it before the ~40x memory amplification.
+  constexpr uint64_t kElems = 2000000;
+  std::string f = Header(3, 0, 1) + GStr("k") + U32Le(9) +  // array kv
+                  U32Le(7) + U64Le(kElems);                 // bool x 2e6
+  f += std::string(kElems, '\1');
+  TempFile tf(f);
+  CHECK_THROWS_WITH_AS(vllm::GgufFile::Open(tf.path()),
+                       doctest::Contains("array element budget exceeded"),
+                       std::runtime_error);
+}
+
+TEST_CASE("gguf: empty array with unknown element type throws") {
+  std::string f = Header(3, 0, 1) + GStr("k") + U32Le(9) +  // array kv
+                  U32Le(999) + U64Le(0);  // elem type 999, count 0
+  TempFile tf(f);
+  CHECK_THROWS_WITH_AS(vllm::GgufFile::Open(tf.path()),
+                       doctest::Contains("999"), std::runtime_error);
+}
+
 TEST_CASE("gguf: unknown kv value type throws") {
   std::string f = Header(3, 0, 1) + GStr("k") + U32Le(99) + U64Le(0);
   TempFile tf(f);

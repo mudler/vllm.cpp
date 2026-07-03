@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -86,7 +87,11 @@ struct Cursor {
   }
 };
 
-GgufValue ReadValue(Cursor& cur, uint32_t type, int depth) {
+// `elems_parsed` is the running RECURSIVE total of array elements parsed so
+// far in this file; it is bounded by kMaxCount so nested arrays cannot
+// multiply the per-array count checks into an amplified allocation.
+GgufValue ReadValue(Cursor& cur, uint32_t type, int depth,
+                    uint64_t& elems_parsed) {
   GgufValue out;
   switch (type) {
     case kGgufU8:
@@ -126,6 +131,11 @@ GgufValue ReadValue(Cursor& cur, uint32_t type, int depth) {
                            std::to_string(kMaxArrayDepth));
       GgufArray arr;
       arr.elem_type = cur.U32("array elem type");
+      // Validate the element type even when the array is empty (the loop
+      // below would otherwise never see an unknown type for count == 0).
+      if (arr.elem_type > kGgufF64)
+        Fail(cur.path, "unknown kv array element type " +
+                           std::to_string(arr.elem_type));
       const uint64_t count = cur.U64("array count");
       // UNTRUSTED count: every element consumes at least 1 byte, so a count
       // beyond the remaining bytes is malformed; reject before allocating.
@@ -133,9 +143,19 @@ GgufValue ReadValue(Cursor& cur, uint32_t type, int depth) {
         Fail(cur.path, "kv array count " + std::to_string(count) +
                            " exceeds remaining file size " +
                            std::to_string(cur.size - cur.pos));
+      // Bound the recursive TOTAL number of array elements in the file: each
+      // parsed element costs sizeof(GgufValue) >> 1 byte of file, so without
+      // this budget a small file could amplify into ~40x its size in memory.
+      // elems_parsed <= kMaxCount holds, so the subtraction cannot underflow.
+      if (count > kMaxCount - elems_parsed)
+        Fail(cur.path, "array element budget exceeded (more than " +
+                           std::to_string(kMaxCount) +
+                           " total array elements)");
+      elems_parsed += count;
       arr.elems.reserve(static_cast<size_t>(count));
       for (uint64_t i = 0; i < count; ++i)
-        arr.elems.push_back(ReadValue(cur, arr.elem_type, depth + 1));
+        arr.elems.push_back(
+            ReadValue(cur, arr.elem_type, depth + 1, elems_parsed));
       out.v = std::move(arr);
       break;
     }
@@ -244,14 +264,17 @@ GgufFile GgufFile::Open(const std::string& path) {
   f.path_ = path;
 
   f.fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (f.fd_ < 0) Fail(path, "cannot open file");
+  if (f.fd_ < 0)
+    Fail(path, std::string("cannot open file: ") + std::strerror(errno));
   struct stat st{};
-  if (::fstat(f.fd_, &st) != 0) Fail(path, "fstat failed");
+  if (::fstat(f.fd_, &st) != 0)
+    Fail(path, std::string("fstat failed: ") + std::strerror(errno));
   if (st.st_size <= 0) Fail(path, "empty file");
   const size_t file_size = static_cast<size_t>(st.st_size);
 
   void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, f.fd_, 0);
-  if (map == MAP_FAILED) Fail(path, "mmap failed");
+  if (map == MAP_FAILED)
+    Fail(path, std::string("mmap failed: ") + std::strerror(errno));
   f.map_ = map;
   f.map_size_ = file_size;
 
@@ -283,11 +306,13 @@ GgufFile GgufFile::Open(const std::string& path) {
     Fail(path, "kv count " + std::to_string(kv_count) +
                    " exceeds sanity cap " + std::to_string(kMaxCount));
 
-  // Metadata kvs.
+  // Metadata kvs. `array_elems` is the file-wide recursive total of array
+  // elements parsed, budgeted at kMaxCount inside ReadValue.
+  uint64_t array_elems = 0;
   for (uint64_t i = 0; i < kv_count; ++i) {
     std::string key = cur.Str("kv key");
     const uint32_t type = cur.U32("kv value type");
-    GgufValue value = ReadValue(cur, type, 0);
+    GgufValue value = ReadValue(cur, type, 0, array_elems);
     auto [it, inserted] = f.kvs_.emplace(std::move(key), std::move(value));
     if (!inserted) Fail(path, "duplicate kv key \"" + it->first + "\"");
   }

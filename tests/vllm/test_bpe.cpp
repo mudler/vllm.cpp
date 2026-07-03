@@ -145,7 +145,7 @@ std::vector<std::string> TinyGgufKvs() {
                                            "l d",  "or ld",     "Ġw orld"};
   return {
       gguf_test::StrKv("tokenizer.ggml.model", "gpt2"),
-      gguf_test::StrKv("tokenizer.ggml.pre", "qwen2"),
+      gguf_test::StrKv("tokenizer.ggml.pre", "qwen35"),
       gguf_test::StrArrayKv("tokenizer.ggml.tokens", tokens),
       gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types),
       gguf_test::StrArrayKv("tokenizer.ggml.merges", merges),
@@ -458,16 +458,19 @@ TEST_CASE("FromGguf: pre \"llama-bpe\" maps to kLlama3, bos kv honored") {
   CHECK(tok.EosId() == 19);
 }
 
-TEST_CASE("FromGguf: token_type unknown(2) and byte(6) stay normal vocab") {
+TEST_CASE(
+    "FromGguf: token_type unknown(2), unused(5), byte(6) stay normal vocab") {
   auto kvs = TinyGgufKvs();
   std::vector<int32_t> types(19, 1);
   types[0] = 6;  // "h" tagged byte
   types[1] = 2;  // "e" tagged unknown
+  types[4] = 5;  // "w" tagged unused (PAD-row padding in real GGUFs)
   types.insert(types.end(), {3, 4, 3});
   kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types);
   const Tokenizer tok = LoadGguf(kvs);
   CHECK(tok.Encode("hello") == Ids{13});  // h/e still merge via BPE
-  CHECK(tok.AddedTokens().size() == 3);   // and did not become added tokens
+  CHECK(tok.AddedTokens().size() == 3);   // none became added tokens
+  CHECK(tok.TokenText(4) == "w");         // unused entry loads as plain vocab
 }
 
 TEST_CASE("FromGguf failure modes throw with actionable messages") {
@@ -491,6 +494,11 @@ TEST_CASE("FromGguf failure modes throw with actionable messages") {
     kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "gpt-2");
     CheckThrowsContains([&] { LoadGguf(kvs); }, "gpt-2");
   }
+  SUBCASE("classic \"qwen2\" pre is rejected, not silently accepted") {
+    auto kvs = TinyGgufKvs();
+    kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "qwen2");
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "kQwen2Classic");
+  }
   SUBCASE("missing tokens array") {
     auto kvs = TinyGgufKvs();
     kvs.erase(kvs.begin() + 2);
@@ -510,10 +518,10 @@ TEST_CASE("FromGguf failure modes throw with actionable messages") {
   SUBCASE("unsupported token_type value names it") {
     auto kvs = TinyGgufKvs();
     std::vector<int32_t> types(19, 1);
-    types[0] = 5;  // UNUSED: not one of 1/2/3/4/6
+    types[0] = 7;  // not one of 1/2/3/4/5/6
     types.insert(types.end(), {3, 4, 3});
     kvs[3] = gguf_test::I32ArrayKv("tokenizer.ggml.token_type", types);
-    CheckThrowsContains([&] { LoadGguf(kvs); }, "5");
+    CheckThrowsContains([&] { LoadGguf(kvs); }, "7");
   }
   SUBCASE("merge entry without exactly one space") {
     auto kvs = TinyGgufKvs();

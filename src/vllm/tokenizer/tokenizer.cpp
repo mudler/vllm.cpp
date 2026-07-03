@@ -352,14 +352,20 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
          "\" (only \"gpt2\" byte-level BPE)");
   }
 
-  // Pre-tokenizer, by llama.cpp pre name. NOTE: llama.cpp's "qwen2" pre
-  // applies its qwen2 splitting to Qwen2/2.5/3/3.5/3.6 GGUFs alike — its pre
-  // names do not distinguish the \p{M}-aware Qwen3.6 regex variant (the APEX
-  // GGUFs carry arch qwen35moe with pre "qwen2"), so "qwen2" maps onto our
-  // kQwen2, which implements the Qwen3.6 \p{M}-aware regex.
+  // Pre-tokenizer, by llama.cpp pre name. llama.cpp DOES distinguish the
+  // \p{M}-aware regex variant: pre "qwen35" selects
+  // LLAMA_VOCAB_PRE_TYPE_QWEN35 whose regex equals our kQwen2 pattern (the
+  // APEX GGUFs carry pre "qwen35"; see llama-vocab.cpp:382,2200 in the
+  // phase93 fork). Pre "qwen2" is the CLASSIC qwen2 regex, which differs on
+  // combining marks and which we do not implement — accepting it would
+  // silently mistokenize real Qwen2.5/Qwen3 GGUFs, so it fails loudly like
+  // the HfJson path.
   const std::string& pre = KvString(f, "tokenizer.ggml.pre");
-  if (pre == "qwen2") {
+  if (pre == "qwen35") {
     tok.pattern_ = SplitPattern::kQwen2;
+  } else if (pre == "qwen2") {
+    Fail("classic qwen2 pre-tokenizer differs on combining marks; add "
+         "kQwen2Classic before accepting");
   } else if (pre == "llama-bpe") {
     tok.pattern_ = SplitPattern::kLlama3;
   } else {
@@ -391,6 +397,8 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     switch (type) {
       case 1:    // normal
       case 2:    // unknown — still a plain vocab slot for byte-level BPE
+      case 5:    // unused — inert PAD-row padding (243x in the APEX GGUF);
+                 // plain vocab entry, unreachable via merges
       case 6: {  // byte
         const auto [it, inserted] = tok.vocab_.emplace(text, id);
         if (!inserted) {

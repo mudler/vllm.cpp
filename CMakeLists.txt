@@ -65,6 +65,7 @@ add_library(vllm STATIC
   src/vllm/v1/core/block_pool.cpp
   src/vllm/v1/core/single_type_kv_cache_manager.cpp
   src/vllm/v1/core/kv_cache_coordinator.cpp
+  src/vllm/v1/core/kv_cache_manager.cpp
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp

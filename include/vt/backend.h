@@ -20,6 +20,11 @@ class Backend {
   virtual void Copy(Queue& q, void* dst, const void* src, size_t bytes) = 0;
   virtual Queue CreateQueue() = 0;
 
+  // Releases a queue obtained from CreateQueue. Default no-op suits backends
+  // whose queues own no resources (CPU); CUDA destroys the underlying stream.
+  // Callers must destroy every queue they create on backends that need it.
+  virtual void DestroyQueue(Queue&) {}
+
   // Blocks until all work previously submitted to the queue has completed.
   // Default no-op suits synchronous backends (CPU); async backends (CUDA)
   // override with a stream sync.

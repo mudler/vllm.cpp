@@ -49,9 +49,11 @@ void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
     uint16_t* out_row = out_bf16 + o * in_dim;
 
     for (int64_t g = 0; g < groups; ++g) {
-      // Group scale: f32(weight_scale) * weight_scale_2, computed in f32 with
-      // the same grouping as torch's tensor_sf.to(f32) * global_scale so the
-      // subsequent bf16 round is bit-exact.
+      // Group scale: f32(weight_scale) * weight_scale_2 (fp8xws2 computed
+      // first), the same-order f32 arithmetic as torch's
+      // tensor_sf.to(f32) * global_scale. Only weight_scale_2 carries >4
+      // significant bits, so C++ matches torch by construction and the
+      // subsequent bf16 store-round is bit-exact.
       const float group_scale = F8E4M3ToF32(scale_row[g]) * weight_scale_2;
 
       const int64_t base_elem = g * kNvfp4GroupSize;

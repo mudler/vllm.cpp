@@ -121,3 +121,25 @@
   trusted; the gdn_attn.py-equivalent metadata builder owns validation).
   NEXT: M0.8 MoE layer (eager, bf16) — router top-k + shared expert;
   dequantized NVFP4→bf16 on load.
+- **2026-07-03 (later)** — M0.8 done (`65788b3`): MoE layer landed CPU+CUDA —
+  router top-k (f32 softmax over all experts, renormalize the k selected
+  probs, lowest-index tie-break) + weighted combine, both CPU+CUDA; the MoE
+  block is composed from existing Matmul + SiluAndMul ops; plus an NVFP4
+  W4A16→bf16 host-side dequant utility (`DequantNvfp4ToBf16`). Verification:
+  5 pinned-oracle MoE goldens, CPU 29/29 + CUDA 29/29 on GB10, racecheck +
+  memcheck clean; NVFP4 dequant is bit-exact (max bf16 diff 0) on real 35B
+  modelopt tensors; three-way check (kernels ↔ `.agents/moe-semantics.md` ↔
+  pinned oracle). `.agents/moe-semantics.md` is the MoE formula record.
+  M0.9 HANDOFF — everything M0.9 assembly needs is now ready: gdn-semantics
+  §6 (g/beta prep) + moe-semantics + NVFP4 dequant (`DequantNvfp4ToBf16`,
+  host-side) + hf_config + tokenizer + all vt ops (GDN, MoE); attention is
+  pending M1. OPEN M0.9 DECISION (record in the M0.9 plan): MoeCombine keeps
+  the routed sum in f32 with a single store-round, whereas upstream §6 does
+  bf16(routed)+bf16(shared) (a double-round, ≤1 bf16 ulp) — M0.9 decides
+  whether the bf16 model output must bit-match upstream. OPEN M0.9 SCOPING
+  QUESTION (record in the M0.9 plan): M0.9 needs the full-attention path for
+  the 1-in-4 non-GDN layers, which currently only lands in M1.6 — M0.9 may
+  need a minimal correctness-grade full-attention forward (non-paged, since
+  M0.9 is single-sequence) BEFORE M1, OR M0.9 scope covers just the GDN+MoE
+  stack plus a simple dense attention. NEXT: M0.9 Qwen3.6 forward + registry
+  (logits parity + greedy decode — the M0 exit criterion).

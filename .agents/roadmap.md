@@ -37,7 +37,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
   (prefill is a sequential recurrence validated against the pinned chunked
   reference; chunked perf kernel lands M2.3). DoD: op parity vs pinned
   upstream dumps, CPU + CUDA.
-- ☐ **M0.8 MoE layer (eager, bf16)**: router top-k + shared expert + expert
+- ✅ **M0.8 MoE layer (eager, bf16)** (`65788b3`): router top-k + shared expert + expert
   GEMMs (dequantized NVFP4→bf16 on load for now). DoD: layer parity.
 - ☐ **M0.9 Qwen3.6 forward + registry**: `model_executor/models/{registry,
   qwen3_5}.{h,cpp}`, weight mapping (stacked params, GGUF names). DoD:

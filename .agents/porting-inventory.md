@@ -125,7 +125,7 @@ implementation) is ported at T0.
 |---|---|---|---|
 | **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForCausalLM` (27B dense-hybrid), `Qwen3_5MoeForCausalLM` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert, GemmaRMSNorm-style `(1+w)` | **T0 (the gate)** |
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
-| MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE (already T0) | T1 |
+| MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |
 | Hybrid others | Jamba, Bamba, NemotronH, FalconH1, Zamba2, LFM2, Kimi-Linear | mamba1/2 kernels | T2 |
 | MLA family | DeepSeek V3/V3.2/V4, Kimi K2.5 | MLA wrapper, latent KV, sparse indexer | T2 |
@@ -150,7 +150,7 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 (modelopt_fp4 + compressed-tensors w4a4_nvfp4)** — gate checkpoints; W4A4 MMA on sm_121 for MoE grouped GEMM + dense | `quantization/modelopt.py`, `compressed_tensors/` | **T0** |
+| **NVFP4 (modelopt_fp4 + compressed-tensors w4a4_nvfp4)** — gate checkpoints; W4A4 MMA on sm_121 for MoE grouped GEMM + dense | `quantization/modelopt.py`, `compressed_tensors/` | **T0** 🚧 `65788b3` (W4A16 dequant-to-bf16 only; native W4A4 MMA M2.2) |
 | **GGUF quants** — container + dequant/matmul for types in our benchmark files (Q4_K/Q5_K/Q6_K/Q8_0/F16/F32 + NVFP4 GGUF extension types from the APEX/killgate tooling) | `quantization/gguf.py`, `model_loader/gguf_loader.py` | **T0 (gate)** |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py` | T1 |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |

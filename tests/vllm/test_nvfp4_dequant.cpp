@@ -77,9 +77,11 @@ TEST_CASE("DequantNvfp4ToBf16 hand-computed block") {
   }
 }
 
-// --- Rounding + multiply-order gate: the ONLY source of bf16 rounding in this
-// dequant is weight_scale_2 (an fp4*fp8 product never exceeds 8 significant
-// bits, so it is always bf16-exact). Force a rounding with ws2 = 1.1f.
+// --- Rounding + multiply-order gate: C++ uses the same-order f32 arithmetic as
+// torch (fp8*ws2 computed first, then fp4*group_scale); only weight_scale_2
+// carries >4 significant bits, so C++ matches torch by construction and the
+// weight_scale_2 round is the ONLY source of bf16 rounding here. Force a
+// rounding with ws2 = 1.1f.
 //
 // fp4 = 1.0 (nibble 0x2), scale = 0x38 (=1.0), ws2 = 1.1f = 0x3F8CCCCD.
 // f32 product = 1.0 * (1.0 * 1.1f) = 0x3F8CCCCD.

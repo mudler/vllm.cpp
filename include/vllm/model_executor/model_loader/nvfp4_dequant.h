@@ -51,6 +51,11 @@ float F8E4M3ToF32(uint8_t byte);
 //   out_bf16          [out_dim, in_dim]    bf16 bit patterns (caller-owned)
 //
 // Requires in_dim % 16 == 0. Aborts (VT_CHECK) otherwise.
+//
+// Does NO internal buffer-size bounds checking: it validates only nulls, dim
+// signs, and in_dim % 16. The caller must size packed, weight_scale_fp8, and
+// out_bf16 to the dims above and should derive those dims from StTensor.shape
+// (the safetensors reader validates every span).
 void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
                         float weight_scale_2, int64_t out_dim, int64_t in_dim,
                         uint16_t* out_bf16);

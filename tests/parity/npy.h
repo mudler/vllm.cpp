@@ -98,17 +98,44 @@ inline NpyArray LoadNpy(const std::string& path) {
   if (rp == std::string::npos)
     throw std::runtime_error("npy: malformed shape in " + path);
   const std::string dims = s.substr(lp + 1, rp - lp - 1);
-  size_t pos = 0;
-  uint64_t total = 1;
-  while (pos < dims.size()) {
-    while (pos < dims.size() && !detail::IsDigit(dims[pos])) ++pos;
-    if (pos >= dims.size()) break;
-    size_t end = pos;
-    while (end < dims.size() && detail::IsDigit(dims[end])) ++end;
-    const int64_t v = std::stoll(dims.substr(pos, end - pos));
+  // Strict tokenizer: comma-separated [0-9]+ tokens; spaces around tokens are
+  // allowed, and a trailing comma is valid ("(3,)"). Anything else (minus
+  // signs, letters, empty inner tokens) is malformed.
+  std::vector<std::string> tokens;
+  size_t start = 0;
+  while (true) {
+    const size_t comma = dims.find(',', start);
+    tokens.push_back(comma == std::string::npos
+                         ? dims.substr(start)
+                         : dims.substr(start, comma - start));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  int64_t total = 1;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    std::string t = tokens[i];
+    const auto b = t.find_first_not_of(" \t");
+    const auto e = t.find_last_not_of(" \t");
+    t = (b == std::string::npos) ? std::string() : t.substr(b, e - b + 1);
+    if (t.empty()) {
+      // Valid only as a trailing comma ("(3,)") or an empty tuple ("()").
+      if (i + 1 == tokens.size()) break;
+      throw std::runtime_error("npy: malformed shape in " + path);
+    }
+    for (char c : t) {
+      if (!detail::IsDigit(c))
+        throw std::runtime_error("npy: malformed shape in " + path);
+    }
+    int64_t v = 0;
+    try {
+      v = std::stoll(t);
+    } catch (const std::exception&) {
+      throw std::runtime_error("npy: bad dim in " + path);
+    }
+    if (v != 0 && total > INT64_MAX / v)
+      throw std::runtime_error("npy: shape overflow in " + path);
+    total *= v;
     arr.shape.push_back(v);
-    total *= static_cast<uint64_t>(v);
-    pos = end;
   }
 
   // element size: digits after the endian char and type char, e.g. "<f4" -> 4.
@@ -122,6 +149,8 @@ inline NpyArray LoadNpy(const std::string& path) {
   if (esize == 0)
     throw std::runtime_error("npy: unsupported descr '" + arr.dtype + "'");
 
+  if (static_cast<size_t>(total) > SIZE_MAX / esize)
+    throw std::runtime_error("npy: size overflow in " + path);
   arr.data.resize(static_cast<size_t>(total) * esize);
   f.read(arr.data.data(), static_cast<std::streamsize>(arr.data.size()));
   if (!f) throw std::runtime_error("npy: truncated payload in " + path);

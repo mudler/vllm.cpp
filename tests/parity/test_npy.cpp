@@ -117,13 +117,36 @@ TEST_CASE("rejects missing file, big-endian, truncated payload") {
   std::remove(ptr.c_str());
 }
 
-TEST_CASE("loads real rmsnorm golden if present") {
+TEST_CASE("rejects oversized, negative, and huge shape dims") {
+  float x = 0;
+  // 2^62 elements * 4 bytes overflows the byte count.
+  auto pov = WriteTemp(
+      "t7.npy",
+      "{'descr': '<f4', 'fortran_order': False, 'shape': (4611686018427387904,), }",
+      &x, 4);
+  CHECK_THROWS_AS(parity::LoadNpy(pov), std::runtime_error);
+  std::remove(pov.c_str());
+
+  // Negative dims must be rejected, not silently normalized.
+  auto pneg = WriteTemp("t8.npy",
+                        "{'descr': '<f4', 'fortran_order': False, 'shape': (2, -3), }",
+                        &x, 4);
+  CHECK_THROWS_AS(parity::LoadNpy(pneg), std::runtime_error);
+  std::remove(pneg.c_str());
+
+  // 25-digit dim does not fit int64 -> bad dim.
+  auto pbig = WriteTemp(
+      "t9.npy",
+      "{'descr': '<f4', 'fortran_order': False, 'shape': (1111111111111111111111111,), }",
+      &x, 4);
+  CHECK_THROWS_AS(parity::LoadNpy(pbig), std::runtime_error);
+  std::remove(pbig.c_str());
+}
+
+TEST_CASE("loads real rmsnorm golden") {
   const std::string p =
       std::string(VLLM_CPP_GOLDENS_DIR) + "/rmsnorm_f32_8x128/x.npy";
-  if (!std::filesystem::exists(p)) {
-    MESSAGE("golden not present, skipping: " << p);
-    return;
-  }
+  REQUIRE(std::filesystem::exists(p));
   auto a = parity::LoadNpy(p);
   CHECK(a.dtype == "<f4");
   REQUIRE(a.shape == std::vector<int64_t>{8, 128});

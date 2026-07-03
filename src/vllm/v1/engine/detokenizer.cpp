@@ -190,6 +190,36 @@ size_t ByteOffsetOfLossyChars(std::string_view s, size_t char_count) {
   return pos;
 }
 
+// Byte offset of the boundary `char_count` lossy characters before the end
+// of `s` (the byte-level equivalent of the Python slices s[:-char_count] /
+// s[:len(s) - char_count]). Walks backwards one lossy character at a time.
+// This is well-defined because in LossyStep's maximal-subpart segmentation a
+// character never contains a non-continuation byte after its first byte, so
+// every non-continuation byte starts a character: the character ending at
+// `end` is either the nearest non-continuation byte within 4 bytes whose
+// maximal subpart reaches exactly `end`, or the single byte at `end - 1`
+// (ASCII, or a stray/leftover continuation byte counting as one "�").
+size_t ByteOffsetBeforeLossyChars(std::string_view s, size_t char_count) {
+  size_t end = s.size();
+  for (size_t n = 0; n < char_count && end > 0; ++n) {
+    size_t start = end - 1;  // default: one-byte character (ASCII or "�")
+    if ((static_cast<uint8_t>(s[end - 1]) & 0xC0) == 0x80) {
+      // Continuation byte: scan back (at most a character's reach) for the
+      // nearest non-continuation byte and adopt it as the character start iff
+      // its maximal subpart ends exactly at `end`.
+      const size_t floor = end >= 4 ? end - 4 : 0;
+      size_t q = end - 1;
+      while (q > floor && (static_cast<uint8_t>(s[q]) & 0xC0) == 0x80) --q;
+      if ((static_cast<uint8_t>(s[q]) & 0xC0) != 0x80) {
+        bool replacement = false;
+        if (q + LossyStep(s.substr(0, end), q, replacement) == end) start = q;
+      }
+    }
+    end = start;
+  }
+  return end;
+}
+
 }  // namespace
 
 std::optional<std::pair<std::string, int64_t>> CheckStopStrings(
@@ -342,10 +372,13 @@ BaseIncrementalDetokenizer::BaseIncrementalDetokenizer(
       min_tokens_(request.min_tokens),
       include_stop_str_in_output_(request.include_stop_str_in_output) {
   // Number of chars to hold back when stop strings are to be excluded from
-  // streamed output.
+  // streamed output. Upstream's `max(len(s) for s in stop) - 1` counts
+  // Python str CHARS, not bytes; measure stop strings the same lossy way.
   if (!stop_.empty() && !include_stop_str_in_output_) {
     size_t max_len = 0;
-    for (const std::string& s : stop_) max_len = std::max(max_len, s.size());
+    for (const std::string& s : stop_) {
+      max_len = std::max(max_len, AnalyzeLossy(s).char_count);
+    }
     stop_buffer_length_ = max_len > 0 ? max_len - 1 : 0;
   } else {
     stop_buffer_length_ = 0;
@@ -403,22 +436,20 @@ std::string BaseIncrementalDetokenizer::GetNextOutputText(bool finished,
                                                           bool delta) {
   // We return the full output text if the sequence is finished.
   const size_t buffer_length = finished ? 0 : stop_buffer_length_;
-  if (!delta) {
-    if (buffer_length == 0) return output_text_;
-    return output_text_.substr(
-        0, output_text_.size() > buffer_length
-               ? output_text_.size() - buffer_length
-               : 0);
-  }
+  // Upstream slices `buffer_length` CHARS off the end of its Python str;
+  // translate that to the byte offset of the same lossy-char boundary so a
+  // streamed view never ends mid-UTF-8-character.
+  const size_t length =
+      buffer_length == 0
+          ? output_text_.size()
+          : ByteOffsetBeforeLossyChars(output_text_, buffer_length);
+  if (!delta) return output_text_.substr(0, length);
 
-  if (output_text_.size() > buffer_length) {
-    const size_t length = output_text_.size() - buffer_length;
-    if (last_output_text_offset_ < length) {
-      std::string next = output_text_.substr(
-          last_output_text_offset_, length - last_output_text_offset_);
-      last_output_text_offset_ = length;
-      return next;
-    }
+  if (last_output_text_offset_ < length) {
+    std::string next = output_text_.substr(
+        last_output_text_offset_, length - last_output_text_offset_);
+    last_output_text_offset_ = length;
+    return next;
   }
   return std::string();
 }

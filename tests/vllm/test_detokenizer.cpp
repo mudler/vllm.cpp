@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -76,6 +77,8 @@ class TempJson {
 //   25 = byte  A9           (second byte of é)
 //   26..29 = single bytes F0, 9F, 8C, 8D
 //   30 = bytes 8D 21        (continuation byte + '!')
+//   31 = bytes E5 81 9C     (停)
+//   32 = bytes E6 AD A2     (止)
 // Fragment tokens are fed to the detokenizer by id (never via Encode), so no
 // merges are needed for them.
 Tokenizer BuildFixture() {
@@ -114,6 +117,8 @@ Tokenizer BuildFixture() {
   vocab[MapBytesToUnicode("\x8C")] = 28;
   vocab[MapBytesToUnicode("\x8D")] = 29;
   vocab[MapBytesToUnicode("\x8D!")] = 30;
+  vocab[MapBytesToUnicode("\xE5\x81\x9C")] = 31;
+  vocab[MapBytesToUnicode("\xE6\xAD\xA2")] = 32;
   doc["model"] = {
       {"type", "BPE"},
       {"ignore_merges", false},
@@ -165,6 +170,33 @@ std::pair<std::string, Ids> RunIncrementalDecode(
     output_text += detokenizer->GetNextOutputText(finished, /*delta=*/true);
   }
   return {output_text, detokenizer->OutputTokenIds()};
+}
+
+// Structural UTF-8 validity: no truncated sequence, no dangling lead byte,
+// no stray continuation byte (what a streamed delta must never contain).
+bool IsValidUtf8(std::string_view s) {
+  size_t i = 0;
+  while (i < s.size()) {
+    const uint8_t b0 = static_cast<uint8_t>(s[i]);
+    size_t len;
+    if (b0 < 0x80) {
+      len = 1;
+    } else if ((b0 & 0xE0) == 0xC0 && b0 >= 0xC2) {
+      len = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+      len = 3;
+    } else if ((b0 & 0xF8) == 0xF0 && b0 <= 0xF4) {
+      len = 4;
+    } else {
+      return false;  // stray continuation or invalid lead
+    }
+    if (i + len > s.size()) return false;  // truncated at end
+    for (size_t j = 1; j < len; ++j) {
+      if ((static_cast<uint8_t>(s[i + j]) & 0xC0) != 0x80) return false;
+    }
+    i += len;
+  }
+  return true;
 }
 
 // Builds a Slow detokenizer directly (for stop-string / delta tests).
@@ -397,6 +429,44 @@ TEST_CASE("stop strings via Update (detokenizer.py stop bookkeeping)") {
     // Non-delta full text also respects the buffer until finished.
     CHECK(det.GetNextOutputText(false, false) == "hello wor");
     CHECK(det.GetNextOutputText(true, false) == "hello world");
+  }
+
+  SUBCASE("multi-byte stop string: hold-back window is chars, not bytes") {
+    DetokenizerRequest request;
+    // 停止: 6 bytes but 2 chars -> upstream buffer = len("停止") - 1 = 1 char.
+    request.stop = {"\xE5\x81\x9C\xE6\xAD\xA2"};
+    auto det = MakeSlow(tok, std::move(request));
+    CHECK_FALSE(det.Update({13}, false).has_value());  // "hello"
+    // Only 1 char is held back (a byte-based window would hold back 5).
+    CHECK(det.GetNextOutputText(false, true) == "hell");
+    CHECK_FALSE(det.Update({31}, false).has_value());  // 停
+    CHECK(det.GetNextOutputText(false, true) == "o");  // 停 held back whole
+    const auto stop = det.Update({32}, false);         // 止 completes 停止
+    REQUIRE(stop.has_value());
+    CHECK(*stop == "\xE5\x81\x9C\xE6\xAD\xA2");
+    CHECK(det.OutputText() == "hello");  // stop string excluded
+    CHECK(det.GetNextOutputText(true, true) == "");
+    CHECK(det.GetNextOutputText(true, false) == "hello");
+  }
+
+  SUBCASE("deltas never end mid-UTF-8-character while holding back") {
+    DetokenizerRequest request;
+    request.stop = {"xyz"};  // len 3 -> buffer 2 chars
+    auto det = MakeSlow(tok, std::move(request));
+    std::string streamed;
+    // "hello" + 🌍 (two byte-fragment tokens) + é (two single-byte tokens)
+    // + " world": the 2-char hold-back lands inside the multi-byte chars if
+    // counted in bytes.
+    for (const int32_t id : {13, 22, 23, 24, 25, 17}) {
+      det.Update({id}, false);
+      const std::string delta = det.GetNextOutputText(false, true);
+      CAPTURE(delta);
+      CHECK(IsValidUtf8(delta));  // no dangling lead/continuation bytes
+      CHECK(IsValidUtf8(det.GetNextOutputText(false, false)));
+      streamed += delta;
+    }
+    streamed += det.GetNextOutputText(true, true);
+    CHECK(streamed == "hello\xF0\x9F\x8C\x8D\xC3\xA9 world");
   }
 
   SUBCASE("stop_terminated excludes the final token from detokenization") {

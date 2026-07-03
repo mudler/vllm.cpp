@@ -6,9 +6,12 @@
 //   reference algorithm and the only concrete implementation.
 // - Text is raw UTF-8 bytes, never lossily re-encoded: where upstream's
 //   Python str carries U+FFFD ("�") for invalid byte runs, we emit the raw
-//   bytes verbatim. The hold-back check (upstream's `endswith("�")`) and the
-//   prefix-length arithmetic replicate Python's lossy character semantics
-//   exactly (see LossyStep in the .cpp).
+//   bytes verbatim. The hold-back check (upstream's `endswith("�")`), the
+//   prefix-length arithmetic, the stop-string hold-back window
+//   (stop_buffer_length_), and the GetNextOutputText slicing all replicate
+//   Python's lossy CHARACTER semantics exactly (see LossyStep in the .cpp),
+//   so streamed views never end mid-UTF-8-character. (An earlier byte-based
+//   hold-back window/slice was a deviation; now resolved.)
 // - DetokenizerRequest carries the detokenization-relevant subset of
 //   upstream's EngineCoreRequest + SamplingParams (no prompt_embeds).
 #pragma once
@@ -119,8 +122,11 @@ class BaseIncrementalDetokenizer : public IncrementalDetokenizer {
   size_t min_tokens_ = 0;
   bool include_stop_str_in_output_ = false;
   // Number of chars to hold back when stop strings are to be excluded from
-  // streamed output.
+  // streamed output. Counted in lossy Python-str CHARS (upstream's
+  // `max(len(s) for s in stop) - 1`), not bytes.
   size_t stop_buffer_length_ = 0;
+  // Byte offset into output_text_ of the last streamed delta's end; always
+  // lands on a lossy-char boundary.
   size_t last_output_text_offset_ = 0;
   std::string output_text_;
 };

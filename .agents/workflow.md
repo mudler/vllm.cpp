@@ -17,6 +17,13 @@ and continue. Follow this protocol every session.
    (specs in `docs/superpowers/specs/`); TDD with the parity harness.
 5. **Close the loop** (Definition of Done for every change):
    - tests green (op-parity / behavioral / e2e as applicable);
+   - **committing parity goldens BEFORE their runner? In the SAME commit, add
+     the op to `PendingRunnerOps()` in `tests/parity/test_op_parity.cpp`** —
+     the harness scans golden dirs eagerly and hard-FAILs an op with no runner
+     (anti-stale-golden gate). Skipping this reddens CI until the runner lands
+     (burned us twice: M0.8 MoE, M0.9 qwen36). The runner task removes the
+     entry; the milestone close-out asserts the set is empty of its ops. Always
+     verify CI green (`gh run list`) after any commit that touches goldens.
    - ported files carry upstream path + commit headers;
    - [porting-inventory.md](porting-inventory.md) status markers flipped;
    - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,

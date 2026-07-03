@@ -78,7 +78,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_ops.cu
-    src/vt/cuda/cuda_gdn.cu)
+    src/vt/cuda/cuda_gdn.cu
+    src/vt/cuda/cuda_moe.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

@@ -9,11 +9,16 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <random>
+#include <stdexcept>
 #include <vector>
 
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
+using vt::Backend;
 using vt::DeviceType;
 using vt::Device;
 using vt::DType;
@@ -218,4 +223,220 @@ TEST_CASE("moe block: tiny hand-computed router -> MLP -> combine") {
   vt::MoeCombine(q, to, teo, tw, nullptr);
   CHECK(out[0] == doctest::Approx(0.7310586f).epsilon(1e-5));
   CHECK(out[1] == doctest::Approx(0.0f).epsilon(1e-6));
+}
+
+// ===========================================================================
+// CUDA parity: the CUDA kernels must match the CPU reference bit-for-bit on the
+// tie-break (indices EXACT) and to 1e-5 on the f32 weights/outputs. Guarded by
+// HasCuda so the CPU-only build skips these. Harness mirrors test_ops_gdn.cpp.
+namespace {
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+
+Tensor MakeT(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+std::vector<float> RandomF32(size_t n, uint32_t seed, float lo = -2.0f, float hi = 2.0f) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(lo, hi);
+  std::vector<float> v(n);
+  for (auto& x : v) x = dist(rng);
+  return v;
+}
+
+std::vector<uint8_t> Pack(const std::vector<float>& f, DType dt) {
+  std::vector<uint8_t> out(f.size() * vt::SizeOf(dt));
+  if (dt == DType::kF32) {
+    std::memcpy(out.data(), f.data(), out.size());
+  } else {
+    REQUIRE(dt == DType::kBF16);
+    auto* p = reinterpret_cast<uint16_t*>(out.data());
+    for (size_t i = 0; i < f.size(); ++i) p[i] = vt::F32ToBF16(f[i]);
+  }
+  return out;
+}
+
+std::vector<float> UnpackF32(const std::vector<uint8_t>& b) {
+  std::vector<float> out(b.size() / sizeof(float));
+  std::memcpy(out.data(), b.data(), b.size());
+  return out;
+}
+
+struct QueueGuard {
+  Backend& b;
+  Queue q;
+  explicit QueueGuard(Backend& backend) : b(backend), q(backend.CreateQueue()) {}
+  ~QueueGuard() { b.DestroyQueue(q); }
+  QueueGuard(const QueueGuard&) = delete;
+  QueueGuard& operator=(const QueueGuard&) = delete;
+};
+
+class DeviceTensor {
+ public:
+  DeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+               const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeT(p_, dt, Gpu(), shape);
+  }
+  ~DeviceTensor() { b_.Free(p_); }
+  DeviceTensor(const DeviceTensor&) = delete;
+  DeviceTensor& operator=(const DeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+// Runs moe_router_topk CPU-vs-CUDA on one logits matrix. Weights toleranced to
+// 1e-5 (f32), ids required EXACT (the lowest-index tie-break must match).
+void RunRouterCudaCase(const std::vector<float>& logits_f32, int64_t t, int64_t e, int k,
+                       bool renorm, DType logit_dt) {
+  const auto lb = Pack(logits_f32, logit_dt);
+  const MoeRouterTopKArgs args{k, renorm};
+
+  std::vector<float> w_cpu(static_cast<size_t>(t * k), 0.0f);
+  std::vector<int32_t> id_cpu(static_cast<size_t>(t * k), -1);
+  Tensor tl = MakeT(const_cast<uint8_t*>(lb.data()), logit_dt, Cpu(), {t, e});
+  Tensor tw = MakeT(w_cpu.data(), DType::kF32, Cpu(), {t, k});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI32, Cpu(), {t, k});
+  Queue cq = Q();
+  vt::MoeRouterTopK(cq, tw, ti, tl, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dl(gpu, gq.q, logit_dt, {t, e}, lb.data());
+  DeviceTensor dw(gpu, gq.q, DType::kF32, {t, k});
+  DeviceTensor did(gpu, gq.q, DType::kI32, {t, k});
+  vt::MoeRouterTopK(gq.q, dw.tensor(), did.tensor(), dl.tensor(), args);
+  std::vector<float> w_gpu(w_cpu.size());
+  std::vector<int32_t> id_gpu(id_cpu.size());
+  dw.Download(gq.q, w_gpu.data());
+  did.Download(gq.q, id_gpu.data());
+
+  for (size_t i = 0; i < w_cpu.size(); ++i) {
+    CHECK(id_gpu[i] == id_cpu[i]);  // tie-break must match bit-for-bit
+    CHECK(w_gpu[i] == doctest::Approx(w_cpu[i]).epsilon(1e-5));
+  }
+}
+
+// Runs moe_combine CPU-vs-CUDA. Expert outputs are the same bytes on both sides
+// (identical f32 accumulation), so out compares at 1e-5.
+void RunCombineCudaCase(int64_t t, int64_t h, int k, DType eo_dt, bool with_shared,
+                        uint32_t seed) {
+  const auto eof = RandomF32(static_cast<size_t>(t * k * h), seed);
+  const auto wf = RandomF32(static_cast<size_t>(t * k), seed + 1, 0.0f, 1.0f);
+  const auto shf = RandomF32(static_cast<size_t>(t * h), seed + 2);
+  const auto eob = Pack(eof, eo_dt);
+  const auto shb = Pack(shf, eo_dt);
+
+  std::vector<uint8_t> out_cpu(static_cast<size_t>(t * h) * sizeof(float));
+  std::vector<float> w = wf;
+  Tensor teo = MakeT(const_cast<uint8_t*>(eob.data()), eo_dt, Cpu(), {t, k, h});
+  Tensor tw = MakeT(w.data(), DType::kF32, Cpu(), {t, k});
+  Tensor tsh = MakeT(const_cast<uint8_t*>(shb.data()), eo_dt, Cpu(), {t, h});
+  Tensor to = MakeT(out_cpu.data(), DType::kF32, Cpu(), {t, h});
+  Queue cq = Q();
+  vt::MoeCombine(cq, to, teo, tw, with_shared ? &tsh : nullptr);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor deo(gpu, gq.q, eo_dt, {t, k, h}, eob.data());
+  DeviceTensor dw(gpu, gq.q, DType::kF32, {t, k}, wf.data());
+  DeviceTensor dsh(gpu, gq.q, eo_dt, {t, h}, shb.data());
+  DeviceTensor dout(gpu, gq.q, DType::kF32, {t, h});
+  vt::MoeCombine(gq.q, dout.tensor(), deo.tensor(), dw.tensor(),
+                 with_shared ? &dsh.tensor() : nullptr);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  dout.Download(gq.q, out_gpu.data());
+
+  const auto oc = UnpackF32(out_cpu), og = UnpackF32(out_gpu);
+  for (size_t i = 0; i < oc.size(); ++i)
+    CHECK(og[i] == doctest::Approx(oc[i]).epsilon(1e-5));
+}
+
+}  // namespace
+
+TEST_CASE("CUDA moe router: top-8 of 256 matches CPU (f32 and bf16 logits)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const int64_t T = 5, E = 256;
+  const int K = 8;
+  const auto logits = RandomF32(static_cast<size_t>(T * E), 7000, -4.0f, 4.0f);
+  for (DType dt : {DType::kF32, DType::kBF16}) {
+    for (bool renorm : {false, true}) {
+      CAPTURE(static_cast<int>(dt));
+      CAPTURE(renorm);
+      RunRouterCudaCase(logits, T, E, K, renorm, dt);
+    }
+  }
+}
+
+TEST_CASE("CUDA moe router: exact-tie tie-break picks lowest index on GPU") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  // All-equal logits over E=256: the greedy top-8 must pick indices 0..7 in
+  // order on the GPU, exactly as the CPU reference does.
+  const int64_t T = 2, E = 256;
+  const int K = 8;
+  std::vector<float> logits(static_cast<size_t>(T * E), 1.5f);
+  RunRouterCudaCase(logits, T, E, K, /*renorm=*/true, DType::kF32);
+  RunRouterCudaCase(logits, T, E, K, /*renorm=*/false, DType::kF32);
+
+  // Partial tie: a block of equal maxes then descending — winners are the tied
+  // block in ascending index order, then the next-highest.
+  std::vector<float> mixed(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) mixed[static_cast<size_t>(e)] = e < 4 ? 3.0f : -0.01f * static_cast<float>(e);
+  RunRouterCudaCase(mixed, 1, E, K, /*renorm=*/true, DType::kF32);
+}
+
+TEST_CASE("CUDA moe combine: weighted sum (+shared) matches CPU") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  for (DType eo_dt : {DType::kF32, DType::kBF16}) {
+    for (bool shared : {false, true}) {
+      CAPTURE(static_cast<int>(eo_dt));
+      CAPTURE(shared);
+      RunCombineCudaCase(4, 2048, 8, eo_dt, shared, 7100);   // real H, top-8
+      RunCombineCudaCase(3, 17, 2, eo_dt, shared, 7150);     // small odd H
+    }
+  }
 }

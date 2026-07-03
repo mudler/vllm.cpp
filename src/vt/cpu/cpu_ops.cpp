@@ -2,6 +2,7 @@
 #include "vt/ops.h"
 
 #include <cmath>
+#include <vector>
 
 namespace vt::cpu {
 namespace {
@@ -113,6 +114,192 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   }
 }
 
+float Silu(float x) { return x / (1.0f + std::exp(-x)); }
+
+// GDN CPU reference kernels. Formulas: .agents/gdn-semantics.md (§ cited per
+// kernel); scalar f32 math throughout, states f32 in place.
+
+// §2 causal_conv1d_fn. Per sequence s (tokens [qsl[s], qsl[s+1])), channel c,
+// token t: window[j] = x token t-(K-1-j), falling back to
+// conv_state[c, (K-1)+(t-i)] (init state) or 0 before the sequence start.
+// Write-back: last K-1 RAW x tokens, left-padded with zeros / shifted old
+// state when T < K-1. Outputs read the OLD state, so the row is buffered
+// before overwrite.
+void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                           const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
+                           const Tensor& his, const CausalConv1dArgs& args) {
+  const int64_t total = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  const int64_t n = conv_state.shape[0];
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  const int32_t* hisp = his.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == total, "causal_conv1d_fwd: bad query_start_loc bounds");
+  std::vector<float> old_row(static_cast<size_t>(width));
+  for (int64_t s = 0; s < n; ++s) {
+    const int64_t begin = qslp[s], end = qslp[s + 1], t_len = end - begin;
+    VT_CHECK(t_len >= 0 && begin >= 0, "causal_conv1d_fwd: query_start_loc not monotonic");
+    const bool init = hisp[s] != 0;
+    float* srow_base = conv_state.Ptr<float>() + s * c_dim * width;
+    for (int64_t c = 0; c < c_dim; ++c) {
+      float* srow = srow_base + c * width;
+      for (int64_t j = 0; j < width; ++j) old_row[static_cast<size_t>(j)] = srow[j];
+      const float b = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
+      for (int64_t t = 0; t < t_len; ++t) {
+        float acc = b;
+        for (int64_t j = 0; j < k; ++j) {
+          const int64_t ti = t - (k - 1 - j);  // token index of window[j]
+          float v = 0.0f;
+          if (ti >= 0) {
+            v = LoadF32(x, (begin + ti) * c_dim + c);
+          } else if (init) {
+            v = old_row[static_cast<size_t>(width + ti)];  // state col (K-1)+(t-i)
+          }
+          acc += LoadF32(w, c * k + j) * v;
+        }
+        StoreF32(out, (begin + t) * c_dim + c, args.silu_activation ? Silu(acc) : acc);
+      }
+      for (int64_t j = 0; j < width; ++j) {
+        const int64_t tj = t_len - width + j;  // new state col j holds token tj
+        float v = 0.0f;
+        if (tj >= 0) {
+          v = LoadF32(x, (begin + tj) * c_dim + c);
+        } else if (init) {
+          v = old_row[static_cast<size_t>(width + tj)];  // shifted old state
+        }
+        srow[j] = v;
+      }
+    }
+  }
+}
+
+// §3 causal_conv1d_update (seqlen==1): read-old-then-roll.
+void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                              const Tensor* bias, Tensor& conv_state,
+                              const CausalConv1dArgs& args) {
+  const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  for (int64_t bt = 0; bt < batch; ++bt) {
+    float* srow_base = conv_state.Ptr<float>() + bt * c_dim * width;
+    for (int64_t c = 0; c < c_dim; ++c) {
+      float* srow = srow_base + c * width;
+      const float xt = LoadF32(x, bt * c_dim + c);
+      float acc = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
+      for (int64_t j = 0; j < width; ++j) acc += LoadF32(w, c * k + j) * srow[j];
+      acc += LoadF32(w, c * k + width) * xt;
+      StoreF32(out, bt * c_dim + c, args.silu_activation ? Silu(acc) : acc);
+      for (int64_t j = 0; j + 1 < width; ++j) srow[j] = srow[j + 1];  // roll left
+      if (width > 0) srow[width - 1] = xt;                            // raw x
+    }
+  }
+}
+
+// §4 l2norm_fwd: y = x * rsqrt(sum(x^2) + eps) over the last dim (plain SUM).
+void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) {
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t rows = x.Numel() / d;
+  for (int64_t r = 0; r < rows; ++r) {
+    float sumsq = 0.0f;
+    for (int64_t j = 0; j < d; ++j) {
+      const float v = LoadF32(x, r * d + j);
+      sumsq += v * v;
+    }
+    const float inv = 1.0f / std::sqrt(sumsq + args.eps);
+    for (int64_t j = 0; j < d; ++j) StoreF32(out, r * d + j, LoadF32(x, r * d + j) * inv);
+  }
+}
+
+// §5 RMSNormGated (norm_before_gate=True, group_size=None):
+// out = x * rsqrt(mean(x^2) + eps) * w * act(gate); act = silu or sigmoid.
+void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
+                        const Tensor& w, const RmsNormGatedArgs& args) {
+  const int64_t t = x.shape[0], d = x.shape[1];
+  for (int64_t i = 0; i < t; ++i) {
+    float sumsq = 0.0f;
+    for (int64_t j = 0; j < d; ++j) {
+      const float v = LoadF32(x, i * d + j);
+      sumsq += v * v;
+    }
+    const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(d) + args.eps);
+    for (int64_t j = 0; j < d; ++j) {
+      const float z = LoadF32(gate, i * d + j);
+      const float act = args.sigmoid_gate ? 1.0f / (1.0f + std::exp(-z)) : Silu(z);
+      StoreF32(out, i * d + j, LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
+    }
+  }
+}
+
+// §7 gated-delta-rule token step, shared by prefill and decode. state points
+// at this sequence's [Hv,Dv,Dk] f32 block; tok indexes the packed q/k/v/g/beta
+// rows. GQA broadcast: v-head hv reads q/k head hv / (Hv/Hk).
+//   q' = q * scale;  S *= exp(g[hv]);  v' = (v - S @ k) * beta[hv];
+//   S += outer(v', k);  out = S @ q'      (k is NOT scaled)
+void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
+                  const Tensor& g, const Tensor& beta, float* state, int64_t tok, float scale,
+                  std::vector<float>& qbuf, std::vector<float>& kbuf,
+                  std::vector<float>& vbuf) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v_in.shape[1], dv = v_in.shape[2];
+  const int64_t ratio = hv_n / hk_n;
+  for (int64_t hv = 0; hv < hv_n; ++hv) {
+    const int64_t hk = hv / ratio;
+    float* s_head = state + hv * dv * dk;  // [Dv, Dk]
+    const float g_t = g.Ptr<float>()[tok * hv_n + hv];
+    const float beta_t = beta.Ptr<float>()[tok * hv_n + hv];
+    const float decay = std::exp(g_t);
+    for (int64_t i = 0; i < dk; ++i) {
+      qbuf[static_cast<size_t>(i)] = LoadF32(q_in, (tok * hk_n + hk) * dk + i) * scale;
+      kbuf[static_cast<size_t>(i)] = LoadF32(k_in, (tok * hk_n + hk) * dk + i);
+    }
+    for (int64_t vi = 0; vi < dv; ++vi) {
+      float* s_row = s_head + vi * dk;
+      float dot = 0.0f;  // (S * exp(g)) @ k, fused with the decay pass
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        s_row[ki] *= decay;
+        dot += s_row[ki] * kbuf[static_cast<size_t>(ki)];
+      }
+      vbuf[static_cast<size_t>(vi)] =
+          (LoadF32(v_in, (tok * hv_n + hv) * dv + vi) - dot) * beta_t;
+    }
+    for (int64_t vi = 0; vi < dv; ++vi) {
+      float* s_row = s_head + vi * dk;
+      float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        s_row[ki] += vbuf[static_cast<size_t>(vi)] * kbuf[static_cast<size_t>(ki)];
+        o += s_row[ki] * qbuf[static_cast<size_t>(ki)];
+      }
+      StoreF32(out, (tok * hv_n + hv) * dv + vi, o);
+    }
+  }
+}
+
+void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                      const Tensor& g, const Tensor& beta, Tensor& state, const Tensor& qsl,
+                      const GdnArgs& args) {
+  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  const int32_t* qslp = qsl.Ptr<int32_t>();
+  VT_CHECK(qslp[0] == 0 && qslp[n] == q_in.shape[0],
+           "gdn_prefill: bad query_start_loc bounds");
+  std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+      vbuf(static_cast<size_t>(dv));
+  for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s], "gdn_prefill: query_start_loc not monotonic");
+    float* s_state = state.Ptr<float>() + s * hv_n * dv * dk;
+    for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
+      GdnTokenStep(out, q_in, k, v, g, beta, s_state, t, args.scale, qbuf, kbuf, vbuf);
+  }
+}
+
+void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                     const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args) {
+  const int64_t batch = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+      vbuf(static_cast<size_t>(dv));
+  for (int64_t bt = 0; bt < batch; ++bt) {
+    float* s_state = state.Ptr<float>() + bt * hv_n * dv * dk;
+    GdnTokenStep(out, q_in, k, v, g, beta, s_state, bt, args.scale, qbuf, kbuf, vbuf);
+  }
+}
+
 struct Registrar {
   Registrar() {
     // static_cast against the ops.h aliases ties kernel signatures to the
@@ -127,6 +314,19 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
+    RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernel)));
+    RegisterOp(
+        OpId::kCausalConv1dUpdate, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernel)));
+    RegisterOp(OpId::kL2Norm, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<L2NormFn>(&L2NormKernel)));
+    RegisterOp(OpId::kRmsNormGated, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernel)));
+    RegisterOp(OpId::kGdnPrefill, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
+    RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
   }
 } registrar;
 

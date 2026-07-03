@@ -18,7 +18,7 @@
   ],
   "chunk_vs_sequential_max_abs_out": 0.000244140625,
   "chunk_vs_sequential_max_abs_state": 0.0022486746311187744,
-  "note": "chunked (FLA_CHUNK_SIZE=64) oracle output on bf16 inputs; out/state dumped as f32 of the oracle's values. Sequential C++ compared at the loose bf16 tolerance."
+  "note": "chunked (FLA_CHUNK_SIZE=64) oracle output on bf16 inputs; out/state dumped as f32 of the oracle's values. Sequential C++ compared at the loose bf16 tolerance. Tolerance tightened 1.5e-2 -> 5e-3 in M0.7 Task 2: the C++ sequential recurrence passes with margin (measured max|diff| out 2.29e-4, state 2.25e-3 on the CPU pass), consistent with the recorded chunk_vs_sequential gap; goldens unchanged."
  },
  "tensors": {
   "q": {
@@ -115,8 +115,8 @@
   "state_out"
  ],
  "tol": {
-  "atol": 0.015,
-  "rtol": 0.015
+  "atol": 0.005,
+  "rtol": 0.005
  },
  "oracle": {
   "source": "pinned:e24d1b24",

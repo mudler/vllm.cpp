@@ -5,7 +5,20 @@
 
 namespace vt {
 
-enum class OpId : uint8_t { kMatmul, kRmsNorm, kSiluAndMul, kRopeNeox, kEmbedding, kCount };
+enum class OpId : uint8_t {
+  kMatmul,
+  kRmsNorm,
+  kSiluAndMul,
+  kRopeNeox,
+  kEmbedding,
+  kCausalConv1dFwd,
+  kCausalConv1dUpdate,
+  kL2Norm,
+  kRmsNormGated,
+  kGdnPrefill,
+  kGdnDecode,
+  kCount
+};
 
 struct RmsNormArgs {
   float eps = 1e-6f;
@@ -15,6 +28,32 @@ struct RmsNormArgs {
 struct RopeArgs {
   float base = 10000.0f;
   int rotary_dim = 0;  // <= head_dim; even
+};
+
+// GDN op args (.agents/gdn-semantics.md is the formula reference; sections
+// cited on each op below).
+struct CausalConv1dArgs {
+  // Upstream `activation` is "silu"/"swish" (→ silu) or None (→ identity);
+  // Qwen GDN always uses silu (gdn-semantics.md §2).
+  bool silu_activation = true;
+};
+
+struct L2NormArgs {
+  float eps = 1e-6f;  // upstream default (gdn-semantics.md §4)
+};
+
+struct RmsNormGatedArgs {
+  float eps = 1e-6f;
+  // Gate activation: silu by default; "sigmoid" allowed by upstream
+  // output_gate_type (gdn-semantics.md §5). norm_before_gate=True and
+  // group_size=None (the only configuration Qwen GDN uses) are baked in.
+  bool sigmoid_gate = false;
+};
+
+struct GdnArgs {
+  // q scale, applied to q only after l2norm; upstream default Dk^-0.5
+  // (gdn-semantics.md §1). Must be set explicitly (> 0).
+  float scale = 0.0f;
 };
 
 // Kernel registration contract. Backends register one kernel per (OpId,
@@ -32,6 +71,19 @@ using RmsNormFn =
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
+using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
+                                   Tensor&, const Tensor&, const Tensor&,
+                                   const CausalConv1dArgs&);
+using CausalConv1dUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                      const Tensor*, Tensor&, const CausalConv1dArgs&);
+using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
+using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                const RmsNormGatedArgs&);
+using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                              const Tensor&, const Tensor&, Tensor&, const Tensor&,
+                              const GdnArgs&);
+using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                             const Tensor&, const Tensor&, Tensor&, const GdnArgs&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -71,5 +123,69 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
 // rounded back on store for bf16.
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
               const RopeArgs& args);
+
+// --- GDN (Gated DeltaNet) ops. Formula reference: .agents/gdn-semantics.md.
+// All GDN state tensors are caller-allocated f32 and updated IN PLACE
+// (upstream computes states in f32 and rounds to the cache dtype on store —
+// that rounding point is M0.9 layer assembly, gdn-semantics.md §1).
+
+// Varlen causal conv over the token stream (gdn-semantics.md §2, upstream
+// causal_conv1d_fn). x[T,C] token-major, weight[C,K], optional bias[C]
+// (nullptr = no bias; Qwen GDN conv has bias=False), conv_state[N,C,K-1] f32
+// in/out (per-sequence slices, gathered — cache_indices/NULL-block handling is
+// M0.9), query_start_loc[N+1] i32 cumulative token offsets (seq s spans
+// [qsl[s], qsl[s+1])), has_initial_state[N] i32 (0/1).
+//   out[c,t] = act(bias[c] + sum_j w[c,j] * window[j]), window[j] = x token
+//   t-(K-1-j), falling back to conv_state (if has_initial_state) or 0 for
+//   tokens before the sequence start. w[:,K-1] multiplies the current token.
+// State write-back: last K-1 RAW x tokens (pre-activation), left-padded with
+// zeros (no init state) or shifted old state when T < K-1.
+void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     const Tensor* bias, Tensor& conv_state, const Tensor& query_start_loc,
+                     const Tensor& has_initial_state, const CausalConv1dArgs& args);
+
+// Single-token conv step (gdn-semantics.md §3, upstream causal_conv1d_update
+// seqlen==1 path). x[B,C] one token per sequence, conv_state[B,C,K-1] f32
+// in/out. Read-old-then-roll:
+//   out[c] = act(bias[c] + sum_j w[c,j] * [conv_state[c,:], x[c]][j])
+//   conv_state[c,:] <- [conv_state[c,1:], x[c]]   (raw x)
+void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                        const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args);
+
+// Rowwise l2 normalization over the LAST dim (gdn-semantics.md §4, upstream
+// l2norm_fwd): y = x * rsqrt(sum(x^2) + eps). Plain SUM, not mean — this is
+// not an rmsnorm. x/out rank 2 or 3 ([rows, D] or [T, H, D]); f32 math.
+void L2Norm(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& args);
+
+// Gated rmsnorm (gdn-semantics.md §5, upstream RMSNormGated with
+// norm_before_gate=True, group_size=None, no bias):
+//   var = mean(x^2 over last dim);  out = x * rsqrt(var + eps) * w * act(z)
+// x/gate/out [T,D], weight [D]; act = silu (or sigmoid, args.sigmoid_gate).
+void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                  const Tensor& weight, const RmsNormGatedArgs& args);
+
+// Gated-delta-rule recurrence over varlen prefill sequences
+// (gdn-semantics.md §7, upstream fused_recurrent_gated_delta_rule — the
+// pinned sequential statement of chunk_gated_delta_rule). q_in/k[T,Hk,Dk]
+// ALREADY l2-normalized (upstream prefill normalizes in fused_post_conv_prep,
+// §4), v[T,Hv,Dv], g/beta[T,Hv] f32 (log-space decay / sigmoid(b), derived
+// upstream per §6), state[N,Hv,Dv,Dk] f32 in/out (zeros for fresh sequences),
+// query_start_loc[N+1] i32. GQA broadcast: v-head hv reads q/k head
+// hv / (Hv/Hk); Hv must be a multiple of Hk. Per token:
+//   q' = q * scale;  S *= exp(g[hv]);  v' = (v - S @ k) * beta[hv];
+//   S += outer(v', k);  out = S @ q'
+// k is NOT scaled. All arithmetic f32.
+void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                const Tensor& g, const Tensor& beta, Tensor& state,
+                const Tensor& query_start_loc, const GdnArgs& args);
+
+// Single-token gated-delta-rule step, one token per sequence
+// (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and
+// state[B,Hv,Dv,Dk] row b for token b. q_in/k must be l2-normalized by the
+// caller (vt::L2Norm) — upstream fuses the l2norm and the §6 g/beta gating
+// into the decode kernel; the decomposition is exact (gdn-semantics.md §4,
+// §9). g/beta derivation from raw a/b/A_log/dt_bias is M0.9.
+void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+               const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args);
 
 }  // namespace vt

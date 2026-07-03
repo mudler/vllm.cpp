@@ -285,6 +285,176 @@ void RunRope(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   RequireMatch("k_out", dk.Download(q, k_host), k_want.tensor, atol, rtol);
 }
 
+// --- GDN runners (M0.7). Goldens are pinned-oracle dumps (Task 1); shapes
+// and tensor names are bound by the manifests under tests/parity/goldens/.
+
+// causal_conv1d_fwd: x [T,C] token-major, conv_state [N,C,K-1] gathered
+// per-sequence slices, query_start_loc [N+1], has_initial_state [N]. The op
+// mutates conv_state in place → run on a device copy of conv_state_in and
+// compare against conv_state_out. bias is null in all committed goldens
+// (Qwen GDN conv has bias=False); a bias tensor is honored if present.
+void RunCausalConv1dFwd(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto w = LoadTensor(dir, m["tensors"]["weight"]);
+  auto st = LoadTensor(dir, m["tensors"]["conv_state_in"]);
+  auto qsl = LoadTensor(dir, m["tensors"]["query_start_loc"]);
+  auto his = LoadTensor(dir, m["tensors"]["has_initial_state"]);
+  auto want_out = LoadTensor(dir, m["tensors"]["out"]);
+  auto want_st = LoadTensor(dir, m["tensors"]["conv_state_out"]);
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dw(b, q, w.dtype, ShapeOf(w.tensor), w.raw.data.data());
+  DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
+  DeviceBuf dqsl(b, q, qsl.dtype, ShapeOf(qsl.tensor), qsl.raw.data.data());
+  DeviceBuf dhis(b, q, his.dtype, ShapeOf(his.tensor), his.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  vt::CausalConv1dArgs args{m["args"]["activation"].get<std::string>() == "silu"};
+  std::optional<Loaded> bias;
+  std::optional<DeviceBuf> dbias;
+  if (m["tensors"].contains("bias")) {
+    bias.emplace(LoadTensor(dir, m["tensors"]["bias"]));
+    dbias.emplace(b, q, bias->dtype, ShapeOf(bias->tensor), bias->raw.data.data());
+  }
+  vt::CausalConv1dFwd(q, dout.tensor(), dx.tensor(), dw.tensor(),
+                      dbias ? &dbias->tensor() : nullptr, dst.tensor(), dqsl.tensor(),
+                      dhis.tensor(), args);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  std::vector<uint8_t> out_host, st_host;
+  RequireMatch("out", dout.Download(q, out_host), want_out.tensor, atol, rtol);
+  RequireMatch("conv_state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
+}
+
+// causal_conv1d_update: x [B,C] one token per sequence, conv_state [B,C,K-1]
+// rolled in place.
+void RunCausalConv1dUpdate(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto w = LoadTensor(dir, m["tensors"]["weight"]);
+  auto st = LoadTensor(dir, m["tensors"]["conv_state_in"]);
+  auto want_out = LoadTensor(dir, m["tensors"]["out"]);
+  auto want_st = LoadTensor(dir, m["tensors"]["conv_state_out"]);
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dw(b, q, w.dtype, ShapeOf(w.tensor), w.raw.data.data());
+  DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  vt::CausalConv1dArgs args{m["args"]["activation"].get<std::string>() == "silu"};
+  std::optional<Loaded> bias;
+  std::optional<DeviceBuf> dbias;
+  if (m["tensors"].contains("bias")) {
+    bias.emplace(LoadTensor(dir, m["tensors"]["bias"]));
+    dbias.emplace(b, q, bias->dtype, ShapeOf(bias->tensor), bias->raw.data.data());
+  }
+  vt::CausalConv1dUpdate(q, dout.tensor(), dx.tensor(), dw.tensor(),
+                         dbias ? &dbias->tensor() : nullptr, dst.tensor(), args);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  std::vector<uint8_t> out_host, st_host;
+  RequireMatch("out", dout.Download(q, out_host), want_out.tensor, atol, rtol);
+  RequireMatch("conv_state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
+}
+
+void RunL2Norm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  vt::L2Norm(q, dout.tensor(), dx.tensor(), vt::L2NormArgs{m["args"]["eps"].get<float>()});
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
+}
+
+void RunRmsNormGated(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto gate = LoadTensor(dir, m["tensors"]["gate"]);
+  auto w = LoadTensor(dir, m["tensors"]["weight"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  // The op bakes in the only configuration Qwen GDN uses (gdn-semantics.md §5).
+  VT_CHECK(m["args"]["norm_before_gate"].get<bool>(), "rmsnorm_gated golden must be norm-first");
+  VT_CHECK(m["args"]["group_size"].is_null(), "rmsnorm_gated golden must be single-group");
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dg(b, q, gate.dtype, ShapeOf(gate.tensor), gate.raw.data.data());
+  DeviceBuf dw(b, q, w.dtype, ShapeOf(w.tensor), w.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  vt::RmsNormGatedArgs args{m["args"]["eps"].get<float>(),
+                            m["args"]["activation"].get<std::string>() == "sigmoid"};
+  vt::RmsNormGated(q, dout.tensor(), dx.tensor(), dg.tensor(), dw.tensor(), args);
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
+}
+
+// gdn_prefill: q/k arrive already l2-normalized in these goldens
+// (q_k_prenormalized, matching the upstream prefill path where
+// fused_post_conv_prep normalizes before the chunk kernel). state is
+// [N,Hv,Dv,Dk] f32 in/out in place.
+void RunGdnPrefill(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto qi = LoadTensor(dir, m["tensors"]["q"]);
+  auto k = LoadTensor(dir, m["tensors"]["k"]);
+  auto v = LoadTensor(dir, m["tensors"]["v"]);
+  auto g = LoadTensor(dir, m["tensors"]["g"]);
+  auto beta = LoadTensor(dir, m["tensors"]["beta"]);
+  auto st = LoadTensor(dir, m["tensors"]["state_in"]);
+  auto qsl = LoadTensor(dir, m["tensors"]["query_start_loc"]);
+  auto want_out = LoadTensor(dir, m["tensors"]["out"]);
+  auto want_st = LoadTensor(dir, m["tensors"]["state_out"]);
+  DeviceBuf dq(b, q, qi.dtype, ShapeOf(qi.tensor), qi.raw.data.data());
+  DeviceBuf dk(b, q, k.dtype, ShapeOf(k.tensor), k.raw.data.data());
+  DeviceBuf dv(b, q, v.dtype, ShapeOf(v.tensor), v.raw.data.data());
+  DeviceBuf dg(b, q, g.dtype, ShapeOf(g.tensor), g.raw.data.data());
+  DeviceBuf dbeta(b, q, beta.dtype, ShapeOf(beta.tensor), beta.raw.data.data());
+  DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
+  DeviceBuf dqsl(b, q, qsl.dtype, ShapeOf(qsl.tensor), qsl.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(v.tensor));
+  vt::GdnArgs args{m["args"]["scale"].get<float>()};
+  vt::GdnPrefill(q, dout.tensor(), dq.tensor(), dk.tensor(), dv.tensor(), dg.tensor(),
+                 dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  std::vector<uint8_t> out_host, st_host;
+  RequireMatch("out", dout.Download(q, out_host), want_out.tensor, atol, rtol);
+  RequireMatch("state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
+}
+
+// gdn_decode: the golden carries BOTH the raw set (q/k/a/b/A_log/dt_bias, as
+// the fused upstream decode kernel consumes) and the derived set
+// (q_l2/k_l2/g/beta, dumped from the pinned l2norm/gating math). The M0.7 op
+// consumes the DERIVED set; the raw-set prep math (softplus gating from
+// a/b/A_log/dt_bias, gdn-semantics.md §6) is M0.9 layer assembly. The runner
+// exercises the decomposed chain M0.9 will use: vt::L2Norm on raw q/k
+// (compared against the dumped q_l2/k_l2), then vt::GdnDecode on the
+// normalized tensors + dumped g/beta.
+void RunGdnDecode(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto qi = LoadTensor(dir, m["tensors"]["q"]);
+  auto k = LoadTensor(dir, m["tensors"]["k"]);
+  auto v = LoadTensor(dir, m["tensors"]["v"]);
+  auto g = LoadTensor(dir, m["tensors"]["g"]);
+  auto beta = LoadTensor(dir, m["tensors"]["beta"]);
+  auto st = LoadTensor(dir, m["tensors"]["state_in"]);
+  auto want_ql2 = LoadTensor(dir, m["tensors"]["q_l2"]);
+  auto want_kl2 = LoadTensor(dir, m["tensors"]["k_l2"]);
+  auto want_out = LoadTensor(dir, m["tensors"]["out"]);
+  auto want_st = LoadTensor(dir, m["tensors"]["state_out"]);
+  DeviceBuf dq(b, q, qi.dtype, ShapeOf(qi.tensor), qi.raw.data.data());
+  DeviceBuf dk(b, q, k.dtype, ShapeOf(k.tensor), k.raw.data.data());
+  DeviceBuf dv(b, q, v.dtype, ShapeOf(v.tensor), v.raw.data.data());
+  DeviceBuf dg(b, q, g.dtype, ShapeOf(g.tensor), g.raw.data.data());
+  DeviceBuf dbeta(b, q, beta.dtype, ShapeOf(beta.tensor), beta.raw.data.data());
+  DeviceBuf dst(b, q, st.dtype, ShapeOf(st.tensor), st.raw.data.data());
+  DeviceBuf dql2(b, q, DType::kF32, ShapeOf(qi.tensor));
+  DeviceBuf dkl2(b, q, DType::kF32, ShapeOf(k.tensor));
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(v.tensor));
+  // In-kernel l2norm eps is 1e-6 (gdn-semantics.md §4).
+  vt::L2NormArgs l2args{1e-6f};
+  vt::L2Norm(q, dql2.tensor(), dq.tensor(), l2args);
+  vt::L2Norm(q, dkl2.tensor(), dk.tensor(), l2args);
+  vt::GdnArgs args{m["args"]["scale"].get<float>()};
+  vt::GdnDecode(q, dout.tensor(), dql2.tensor(), dkl2.tensor(), dv.tensor(), dg.tensor(),
+                dbeta.tensor(), dst.tensor(), args);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  std::vector<uint8_t> ql2_host, kl2_host, out_host, st_host;
+  RequireMatch("q_l2", dql2.Download(q, ql2_host), want_ql2.tensor, atol, rtol);
+  RequireMatch("k_l2", dkl2.Download(q, kl2_host), want_kl2.tensor, atol, rtol);
+  RequireMatch("out", dout.Download(q, out_host), want_out.tensor, atol, rtol);
+  RequireMatch("state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
+}
+
 // Runs every golden case on `dev` and returns how many ran. Both passes use
 // the same manifests and the same tolerances — the committed goldens are the
 // bar for every backend.
@@ -298,7 +468,7 @@ int RunGoldenPass(Device dev) {
     if (!entry.is_directory()) continue;
     fs::path mf = entry.path() / "manifest.json";
     // Non-op golden dirs (e.g. tokenizer_qwen36, owned by
-    // test_tokenizer_parity) carry no manifest.json; the `cases >= 9` floor
+    // test_tokenizer_parity) carry no manifest.json; the `cases >= 24` floor
     // in the callers still guards against op cases silently disappearing.
     if (!fs::exists(mf)) continue;
     json m = json::parse(std::ifstream(mf));
@@ -317,6 +487,18 @@ int RunGoldenPass(Device dev) {
       RunEmbedding(b, q, entry.path(), m);
     } else if (op == "rope") {
       RunRope(b, q, entry.path(), m);
+    } else if (op == "causal_conv1d_fwd") {
+      RunCausalConv1dFwd(b, q, entry.path(), m);
+    } else if (op == "causal_conv1d_update") {
+      RunCausalConv1dUpdate(b, q, entry.path(), m);
+    } else if (op == "l2norm") {
+      RunL2Norm(b, q, entry.path(), m);
+    } else if (op == "rmsnorm_gated") {
+      RunRmsNormGated(b, q, entry.path(), m);
+    } else if (op == "gdn_prefill") {
+      RunGdnPrefill(b, q, entry.path(), m);
+    } else if (op == "gdn_decode") {
+      RunGdnDecode(b, q, entry.path(), m);
     } else {
       FAIL("no runner for op '" << op << "' — add one before committing goldens");
     }
@@ -376,7 +558,7 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  CHECK(cases >= 9);
+  CHECK(cases >= 24);
 }
 
 // Same cases, same tolerances, on the GPU: inputs are uploaded through the
@@ -395,5 +577,5 @@ TEST_CASE("op parity vs upstream goldens (CUDA)") {
     return;
   }
   int cases = RunGoldenPass(Device{DeviceType::kCUDA, 0});
-  CHECK(cases >= 9);
+  CHECK(cases >= 24);
 }

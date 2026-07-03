@@ -268,9 +268,17 @@ class FreeKVCacheBlockQueue {
   KVCacheBlock fake_free_list_tail{-1};
 };
 
-// Forward declaration for generate_block_hash_extra_keys (defined in
-// vllm/v1/request.h; only a const-ref is needed here).
+// Forward declaration for generate_block_hash_extra_keys / the request block
+// hasher (Request is defined in vllm/v1/request.h; only a const-ref is needed
+// here).
 struct Request;
+
+// The request block hasher. Mirrors upstream's
+// `Callable[[Request], list[BlockHash]]` (Request._block_hasher): given a
+// request, returns the block hashes for its newly-complete full blocks (the
+// ones not yet in request.block_hashes). A null BlockHasher mirrors upstream
+// `block_hasher=None` => prefix caching off (update_block_hashes is a no-op).
+using BlockHasher = std::function<std::vector<BlockHash>(const Request&)>;
 
 // generate_block_hash_extra_keys — DEFERRED derivation.
 //
@@ -309,6 +317,17 @@ std::vector<BlockHash> hash_request_tokens(
     const HashFn& hash_function, int block_size,
     const std::vector<int32_t>& token_ids,
     const std::vector<ExtraKeys>& per_block_extra_keys = {});
+
+// Build the incremental request block hasher. Mirrors upstream
+// get_request_block_hasher: the returned closure computes ONLY the not-yet-hashed
+// full blocks of a request (starting at
+// request.block_hashes.size() * hash_block_size), chaining each block's hash
+// onto the previous one (request.block_hashes.back() as the parent). It hashes
+// full blocks only; a partial trailing block is left unhashed. Request stores
+// this closure as _block_hasher and calls it from update_block_hashes() at
+// construction and after each append.
+BlockHasher get_request_block_hasher(int hash_block_size,
+                                     const HashFn& caching_hash_fn);
 
 }  // namespace vllm::v1
 

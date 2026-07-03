@@ -8,39 +8,42 @@
 // (no CUDA, no model): the physical KV memory itself is not touched here, only
 // the block bookkeeping.
 //
-// VERSION NOTE (which upstream is mirrored): the landed kv_cache_utils.{h,cpp}
-// mirror the CLASSIC vLLM V1 block-hashing API — free functions
-// hash_block_tokens / hash_request_tokens that take a pluggable hash_function,
-// BlockHash as raw hash bytes, and make_block_hash_with_group_id packing a
-// 4-byte group id. BlockPool is ported to match THOSE utils, i.e. the classic
-// BlockPool shape:
-//   - cached_block_hash_to_block is a plain
-//     {BlockHashWithGroupId -> {block_id -> KVCacheBlock*}} nesting (the classic
-//     defaultdict(dict)); the e24d1b24 BlockHashToBlockMap single-vs-dict union
-//     optimization is intentionally NOT ported — it is a GC micro-optimization
-//     with identical observable semantics.
-//   - cache_full_blocks carries the classic (block_hashes, hash_fn) parameters:
-//     the caller passes the precomputed per-block hashes (from
-//     hash_request_tokens) and a hash function used to fill in any trailing
-//     blocks whose hashes were not precomputed. The e24d1b24 signature instead
-//     reads request.block_hashes (a Request field not present in the T0 Request
-//     port) and takes hash_block_size on the pool; that path is not portable
-//     against the landed utils, so the classic signature is used.
-// The @ e24d1b24 pin marks the upstream tree tracked for the surrounding V1
-// core; the BlockPool logic mirrored is upstream's classic pre-BlockHashToBlockMap
-// form, consistent with the already-landed classic-hashing utils.
+// API FIDELITY: this mirrors the e24d1b24 BlockPool API 1:1 for the COMMON
+// prefix-caching path. cache_full_blocks takes the pinned signature
+// (request, blocks, num_cached_blocks, num_full_blocks, block_size,
+// kv_cache_group_id, block_mask) and reads request.block_hashes — the per-block
+// hashes the Request computes incrementally via its _block_hasher
+// (get_request_block_hasher). The pool carries hash_block_size (per the pin).
 //
-// DEFERRED, recorded (kept as stubs / no-ops so signatures stay 1:1 and the
-// later units fill them in without a call-site change):
+// DEFERRED behind 1:1 stubs (documented; the gate models — text-only GDN/MoE —
+// never exercise these, and later units fill them in without a call-site change):
+//   - The align / multiple-block-size path in cache_full_blocks
+//     (block_size != hash_block_size, upstream's BlockHashListWithBlockSize):
+//     guarded with a throw. Only the block_size == hash_block_size common case
+//     is ported.
+//   - The partial->full promotion branch inside cache_full_blocks (a "new full
+//     block" that already carries a hash): guarded with a throw. Requires the
+//     deferred partial primitives.
+//   - cache_partial_block / _get_partial_block_hash /
+//     _get_partial_block_parent_hash_and_start: throw-if-called stubs (partial
+//     prefix entries, not needed by the gate models).
+//   - evict_blocks (KV-connector-driven cache eviction): throw-if-called stub.
 //   - KV-cache events: enable_kv_cache_events, kv_event_queue, take_events(),
-//     and the BlockStored / BlockRemoved emission inside cache_full_blocks /
-//     _maybe_evict_cached_block. KVCacheEvent is a placeholder struct; the
-//     emission branches are omitted (marked in the .cpp). This mirrors upstream
-//     vllm/distributed/kv_events.py, deferred with the rest of the V1 event bus.
+//     and the BlockStored / BlockRemoved / AllBlocksCleared emission inside
+//     cache_full_blocks / _remove_cached_block_hashes / reset_prefix_cache.
+//     KVCacheEvent is a placeholder struct; the emission branches are omitted
+//     (marked in the .cpp). Mirrors upstream vllm/distributed/kv_events.py.
 //   - metrics_collector (KVCacheMetricsCollector): the on_block_allocated /
-//     _accessed / _evicted hooks are omitted. Not part of the correctness core.
-//   - cache_partial_block / evict_blocks: not in the classic shape and not
-//     needed by the gate models; omitted.
+//     _accessed / _evicted / reset hooks are omitted. Not part of the
+//     correctness core.
+//   - block_mask: the parameter is present and honored (masked blocks skipped),
+//     but only ever passed None by the ported (non-SWA/non-mamba) call sites.
+//
+// DEVIATION, recorded: the BlockHashToBlockMap single-block-vs-dict union
+// (upstream's GC micro-optimization) is NOT ported. cached_block_hash_to_block
+// is the plain {BlockHashWithGroupId -> {block_id -> KVCacheBlock*}} nesting.
+// Observable semantics are identical (get_one_block / contain / insert / pop
+// map onto the nested-map operations); only the inner GC cost differs.
 //
 // DEVIATIONS, recorded:
 //   - The null block (block_id 0) is made un-allocatable exactly as upstream:
@@ -64,6 +67,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -88,8 +92,11 @@ class BlockPool {
   // Args:
   //   num_gpu_blocks: The number of blocks in the pool (must be > 0).
   //   enable_caching: Whether to enable prefix caching.
+  //   hash_block_size: The block size at which block hashes are computed. The
+  //     actual block size usually equals it; with differently-sized KV cache
+  //     groups it can be a multiple (the align path, DEFERRED).
   //   enable_kv_cache_events: Whether to enable kv cache events (DEFERRED).
-  BlockPool(int64_t num_gpu_blocks, bool enable_caching,
+  BlockPool(int64_t num_gpu_blocks, bool enable_caching, int hash_block_size,
             bool enable_kv_cache_events = false);
 
   // Non-copyable / non-movable (see DEVIATIONS in the file header).
@@ -104,25 +111,39 @@ class BlockPool {
   std::optional<std::vector<KVCacheBlock*>> get_cached_block(
       const BlockHash& block_hash, const std::vector<int>& kv_cache_group_ids);
 
-  // Cache a list of full blocks for prefix caching. Updates each newly-full
-  // block's hash metadata and inserts it into cached_block_hash_to_block.
+  // Cache a list of full blocks for prefix caching. Reads request.block_hashes
+  // (computed incrementally by the Request's _block_hasher), updates each
+  // newly-full block's hash metadata and inserts it into
+  // cached_block_hash_to_block.
   //
-  // block_hashes: the request's per-block hashes; block_hashes[k] is the hash
-  //   of the k-th full block. May be extended in place for trailing blocks
-  //   whose hash was not precomputed (the else branch computes it via hash_fn
-  //   and appends it — matching upstream, which caches it on the request for a
-  //   possible future preemption).
+  // request: the request whose block_hashes drive caching.
+  // blocks: all blocks in the request (the range
+  //   [num_cached_blocks, num_full_blocks) is cached).
   // num_cached_blocks: number of blocks already cached.
   // num_full_blocks: number of blocks that are full and should be cached now.
   // block_size: number of tokens per block.
   // kv_cache_group_id: id of the KV cache group.
-  // hash_fn: the pluggable block-hash function (see kv_cache_utils.h).
-  void cache_full_blocks(const Request& request,
-                         const std::vector<KVCacheBlock*>& blocks,
-                         std::vector<BlockHash>& block_hashes,
-                         int num_cached_blocks, int num_full_blocks,
-                         int block_size, int kv_cache_group_id,
-                         const HashFn& hash_fn);
+  // block_mask: optional mask aligned with blocks[num_cached_blocks:
+  //   num_full_blocks]; masked-off (false) blocks are skipped like null blocks.
+  //   Only ever None from the ported call sites (see header DEFERRED note).
+  //
+  // Common path only (block_size == hash_block_size); the align path and the
+  // partial->full promotion branch are DEFERRED (throw). See the header.
+  void cache_full_blocks(
+      const Request& request, const std::vector<KVCacheBlock*>& blocks,
+      int num_cached_blocks, int num_full_blocks, int block_size,
+      int kv_cache_group_id,
+      const std::optional<std::vector<bool>>& block_mask = std::nullopt);
+
+  // Register a partial prefix-cache entry for an existing block. DEFERRED 1:1
+  // stub (partial primitives, not needed by the gate models): throws if called.
+  std::optional<BlockHashWithGroupId> cache_partial_block(
+      const Request& request, KVCacheBlock* block, int num_tokens,
+      int kv_cache_group_id, int block_size);
+
+  // Evict blocks from the prefix cache by their block IDs (KV-connector-driven).
+  // DEFERRED 1:1 stub: throws if called.
+  void evict_blocks(const std::set<int>& block_ids);
 
   // Get num_blocks new blocks from the free block pool. Does NOT check the
   // prefix cache. Throws std::runtime_error (upstream ValueError) if there are
@@ -132,6 +153,20 @@ class BlockPool {
   // If a block is cached in cached_block_hash_to_block, reset its hash metadata
   // and evict it from the cache. Returns true iff the block was evicted.
   bool _maybe_evict_cached_block(KVCacheBlock* block);
+
+  // Remove every hash key that points to `block` (its primary hash plus any
+  // partial-alias hashes in cached_block_hashes_by_block), reset the block's
+  // hash, and return the keys actually removed from the map. Mirrors upstream
+  // _remove_cached_block_hashes.
+  std::vector<BlockHashWithGroupId> _remove_cached_block_hashes(
+      KVCacheBlock* block);
+
+  // Insert a hash key for `block` into cached_block_hash_to_block. If the block
+  // has no primary hash yet, the key becomes its primary hash (with num_tokens);
+  // otherwise the key is tracked as a partial alias in
+  // cached_block_hashes_by_block. Mirrors upstream _insert_block_hash.
+  void _insert_block_hash(const BlockHashWithGroupId& block_hash_with_group_id,
+                          KVCacheBlock* block, std::optional<int> num_tokens);
 
   // Touch a block: increase its reference count by 1, and remove it from the
   // free queue if it was an eviction candidate (ref_cnt == 0). Used when a
@@ -162,6 +197,7 @@ class BlockPool {
 
   int64_t num_gpu_blocks;
   bool enable_caching;
+  int hash_block_size;
 
   // All kv-cache blocks, indexed by block_id (blocks[0] is the null block).
   std::vector<KVCacheBlock> blocks;
@@ -175,6 +211,14 @@ class BlockPool {
   // used by running requests or sit in the free queue as an eviction candidate.
   std::unordered_map<BlockHashWithGroupId, std::map<int, KVCacheBlock*>>
       cached_block_hash_to_block;
+
+  // {block_id -> set of partial-alias hash keys}. Tracks the extra hash keys
+  // (beyond a block's primary block_hash) that point to the block, so eviction /
+  // reset / promotion can remove every key. Only populated by the deferred
+  // partial primitives; empty on the common path. Mirrors upstream
+  // cached_block_hashes_by_block.
+  std::unordered_map<int, std::set<BlockHashWithGroupId>>
+      cached_block_hashes_by_block;
 
   // The null placeholder block (block_id 0). Its ref_cnt is NOT maintained;
   // it is popped out of the free queue so it can never be allocated.

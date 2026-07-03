@@ -43,7 +43,9 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/request.h"
 
 using vllm::v1::BlockHash;
 using vllm::v1::BlockHashWithGroupId;
@@ -525,4 +527,50 @@ TEST_CASE("hash_request_tokens_partial_block_not_hashed") {
   const std::vector<BlockHash> h6 =
       hash_request_tokens(sha256_cbor, 3, {0, 1, 2, 3, 4, 5});
   CHECK(h7 == h6);
+}
+
+// get_request_block_hasher (the incremental Request._block_hasher): the hashes a
+// Request accumulates must equal the batch hash_request_tokens oracle
+// (byte-exact vs the pin), and appending tokens extends block_hashes only when a
+// new full block completes.
+TEST_CASE("get_request_block_hasher matches hash_request_tokens (byte-exact)") {
+  using vllm::v1::get_request_block_hasher;
+  using vllm::v1::Request;
+  init_none_hash(sha256_cbor, "seed42");
+  const int block_size = 4;
+
+  // 14 tokens -> 3 full blocks; the ctor runs update_block_hashes once.
+  std::vector<int32_t> tokens;
+  for (int i = 0; i < 14; ++i) tokens.push_back(i);
+  Request req("0", tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0,
+              get_request_block_hasher(block_size, sha256_cbor));
+
+  const std::vector<BlockHash> oracle =
+      hash_request_tokens(sha256_cbor, block_size, tokens);
+  REQUIRE(oracle.size() == 3);
+  CHECK(req.block_hashes == oracle);
+
+  // Appending 2 tokens completes a 4th full block (16 tokens total).
+  req.AppendOutputToken(std::vector<int32_t>{14, 15});
+  std::vector<int32_t> tokens16 = tokens;
+  tokens16.push_back(14);
+  tokens16.push_back(15);
+  const std::vector<BlockHash> oracle16 =
+      hash_request_tokens(sha256_cbor, block_size, tokens16);
+  REQUIRE(oracle16.size() == 4);
+  CHECK(req.block_hashes == oracle16);
+  // The first 3 hashes are unchanged (chaining is prefix-stable).
+  CHECK(req.block_hashes[0] == oracle[0]);
+  CHECK(req.block_hashes[1] == oracle[1]);
+  CHECK(req.block_hashes[2] == oracle[2]);
+
+  // Appending 1 token (17 total) does not complete a new full block.
+  req.AppendOutputToken(16);
+  CHECK(req.block_hashes.size() == 4);
+
+  // A Request with no hasher (upstream block_hasher=None) never hashes.
+  Request no_hash("1", tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0);
+  CHECK(no_hash.block_hashes.empty());
+  no_hash.AppendOutputToken(std::vector<int32_t>{14, 15});
+  CHECK(no_hash.block_hashes.empty());
 }

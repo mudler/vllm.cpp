@@ -316,6 +316,65 @@ std::vector<BlockHash> hash_request_tokens(
   return ret;
 }
 
+BlockHasher get_request_block_hasher(int hash_block_size,
+                                     const HashFn& caching_hash_fn) {
+  return [hash_block_size, caching_hash_fn](
+             const Request& request) -> std::vector<BlockHash> {
+    int start_token_idx =
+        static_cast<int>(request.block_hashes.size()) * hash_block_size;
+    const int num_tokens = request.NumTokens();
+
+    // Early stop when there are no new full blocks created.
+    if (start_token_idx + hash_block_size > num_tokens) {
+      return {};
+    }
+
+    int curr_mm_idx = 0;
+    if (start_token_idx > 0) {
+      // curr_mm_idx = -1 indicates the last mm input: we reach this branch only
+      // when the block is completed with generated tokens, so only the last mm
+      // input matters.
+      curr_mm_idx = -1;
+    }
+
+    std::optional<BlockHash> prev_block_hash_value = std::nullopt;
+    if (!request.block_hashes.empty()) {
+      prev_block_hash_value = request.block_hashes.back();
+    }
+
+    // all_token_ids = prompt + output (the T0 no-prompt-embeds path). Upstream
+    // reads request.all_token_ids[start:end]; we materialize it here.
+    std::vector<int32_t> all_token_ids = request.prompt_token_ids;
+    all_token_ids.insert(all_token_ids.end(), request.output_token_ids.begin(),
+                         request.output_token_ids.end());
+
+    std::vector<BlockHash> new_block_hashes;
+    while (true) {
+      const int end_token_idx = start_token_idx + hash_block_size;
+      if (end_token_idx > num_tokens) {
+        // We only hash full blocks.
+        break;
+      }
+
+      // MM and LoRA requests need extra keys (deferred; always none for T0).
+      std::pair<ExtraKeys, int> extra = generate_block_hash_extra_keys(
+          request, start_token_idx, end_token_idx, curr_mm_idx);
+      curr_mm_idx = extra.second;
+
+      std::vector<int32_t> block_tokens(all_token_ids.begin() + start_token_idx,
+                                        all_token_ids.begin() + end_token_idx);
+      BlockHash block_hash = hash_block_tokens(
+          caching_hash_fn, prev_block_hash_value, block_tokens, extra.first);
+
+      new_block_hashes.push_back(block_hash);
+      start_token_idx += hash_block_size;
+      prev_block_hash_value = block_hash;
+    }
+
+    return new_block_hashes;
+  };
+}
+
 void KVCacheBlock::set_block_hash(BlockHashWithGroupId block_hash,
                                   std::optional<int> num_tokens) {
   // "The block already has a hash. This should not happen."

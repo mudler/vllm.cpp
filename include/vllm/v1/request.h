@@ -14,8 +14,7 @@
 // slot these in without reshaping the struct:
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params, structured_output_request,
-//     lora_request, cache_salt (prefix caching salt), block_hashes /
-//     _block_hasher / update_block_hashes (M1.2 BlockPool), events /
+//     lora_request, cache_salt (prefix caching salt), events /
 //     stop_reason / kv_transfer_params, spec_token_ids, priority /
 //     client_index / __lt__ (priority scheduling), streaming / resumable
 //     state, prefill_stats, async-scheduling counters
@@ -48,6 +47,7 @@
 #include <vector>
 
 #include "vllm/sampling_params.h"
+#include "vllm/v1/core/kv_cache_utils.h"  // BlockHash, BlockHasher
 
 namespace vllm::v1 {
 
@@ -106,16 +106,22 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status);
 // A generation request tracked by the V1 engine (T0 field subset). The
 // scheduler / model runner mutate this in place exactly as upstream does.
 struct Request {
+  // block_hasher mirrors upstream's `block_hasher=None` default: null => prefix
+  // caching off (update_block_hashes() is a no-op, block_hashes stays empty).
   Request(std::string request_id, std::vector<int32_t> prompt_token_ids,
-          SamplingParams sampling_params, double arrival_time);
+          SamplingParams sampling_params, double arrival_time,
+          BlockHasher block_hasher = nullptr);
 
   // from_engine_core_request: build a Request from the frontend->core message.
   // Mirrors upstream Request.from_engine_core_request for the T0 fields
   // (request_id, prompt_token_ids, sampling_params, arrival_time); status
   // starts kWaiting, num_computed_tokens 0, output empty. The params arrived
   // already PostInit'd / validated by the frontend, so this does NOT
-  // re-validate (upstream's factory doesn't either).
-  static Request FromEngineCoreRequest(const EngineCoreRequest& request);
+  // re-validate (upstream's factory doesn't either). block_hasher is injected
+  // by the engine exactly as upstream from_engine_core_request(request,
+  // block_hasher).
+  static Request FromEngineCoreRequest(const EngineCoreRequest& request,
+                                       BlockHasher block_hasher = nullptr);
 
   std::string request_id;
   std::vector<int32_t> prompt_token_ids;
@@ -138,11 +144,27 @@ struct Request {
   // num_output_tokens: len(_output_token_ids).
   int NumOutputTokens() const;
 
+  // Per-block hashes of this request's full blocks, computed at
+  // hash_block_size granularity and chained over the full prefix. Populated by
+  // update_block_hashes() via _block_hasher (empty when caching is off).
+  std::vector<BlockHash> block_hashes;
+
+  // The block hasher (upstream _block_hasher). Stored without binding a
+  // back-reference to this Request (upstream avoids the Request->partial->Request
+  // reference cycle); here it is a plain std::function taking the request by
+  // const ref. Null => prefix caching off.
+  BlockHasher block_hasher_;
+
   // append_output_token_ids(int | list[int]): append the sampled token(s) to
-  // output_token_ids. (Upstream also mirrors into _all_token_ids and updates
-  // block hashes; NumTokens recomputes here and block hashing is deferred.)
+  // output_token_ids, then update_block_hashes() (upstream mirrors into
+  // _all_token_ids too; NumTokens recomputes prompt+output here).
   void AppendOutputToken(int32_t token_id);
   void AppendOutputToken(const std::vector<int32_t>& token_ids);
+
+  // update_block_hashes: compute block hashes for any newly-complete full
+  // blocks and append them to block_hashes. No-op when _block_hasher is null.
+  // Mirrors upstream Request.update_block_hashes.
+  void update_block_hashes();
 
   // is_finished / get_finished_reason: delegate to RequestStatus.
   bool IsFinished() const;

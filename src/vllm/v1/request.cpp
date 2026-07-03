@@ -52,22 +52,30 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status) {
 
 Request::Request(std::string request_id,
                  std::vector<int32_t> prompt_token_ids,
-                 SamplingParams sampling_params, double arrival_time)
+                 SamplingParams sampling_params, double arrival_time,
+                 BlockHasher block_hasher)
     : request_id(std::move(request_id)),
       prompt_token_ids(std::move(prompt_token_ids)),
       sampling_params(std::move(sampling_params)),
       num_computed_tokens(0),
       status(RequestStatus::kWaiting),
       arrival_time(arrival_time),
-      num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())) {}
+      num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())),
+      block_hasher_(std::move(block_hasher)) {
+  // Upstream computes the initial block hashes at the end of __init__.
+  update_block_hashes();
+}
 
 // Request.from_engine_core_request (T0 subset). The params were PostInit'd /
 // validated by the frontend before this message was built, so we do NOT
 // re-validate here (upstream's classmethod doesn't either — it just forwards
-// the already-validated sampling_params into the Request constructor).
-Request Request::FromEngineCoreRequest(const EngineCoreRequest& request) {
+// the already-validated sampling_params into the Request constructor). The
+// engine injects block_hasher exactly as upstream.
+Request Request::FromEngineCoreRequest(const EngineCoreRequest& request,
+                                       BlockHasher block_hasher) {
   return Request(request.request_id, request.prompt_token_ids,
-                 request.sampling_params, request.arrival_time);
+                 request.sampling_params, request.arrival_time,
+                 std::move(block_hasher));
 }
 
 // num_tokens: len(_all_token_ids) == prompt + output.
@@ -83,12 +91,24 @@ int Request::NumOutputTokens() const {
 // append_output_token_ids(int).
 void Request::AppendOutputToken(int32_t token_id) {
   output_token_ids.push_back(token_id);
+  update_block_hashes();
 }
 
 // append_output_token_ids(list[int]).
 void Request::AppendOutputToken(const std::vector<int32_t>& token_ids) {
   output_token_ids.insert(output_token_ids.end(), token_ids.begin(),
                           token_ids.end());
+  update_block_hashes();
+}
+
+// Request.update_block_hashes: extend block_hashes with the hasher over any
+// newly-complete full blocks. No-op when the hasher is null (caching off).
+void Request::update_block_hashes() {
+  if (block_hasher_) {
+    std::vector<BlockHash> new_hashes = block_hasher_(*this);
+    block_hashes.insert(block_hashes.end(), new_hashes.begin(),
+                        new_hashes.end());
+  }
 }
 
 bool Request::IsFinished() const { return vllm::v1::IsFinished(status); }

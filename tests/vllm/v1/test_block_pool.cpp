@@ -4,17 +4,16 @@
 //   - test_cache_blocks            -> "cache_full_blocks caches full blocks"
 //   - test_cache_blocks_multi_group-> "cache_full_blocks is group-aware ..."
 //   - test_maybe_evict_cached_block-> "_maybe_evict_cached_block ..."
-// plus the allocate / touch / free-order / eviction-on-reuse / reset /
-// null-block invariants the upstream KVCacheManager cases (test_evict,
-// test_reset_prefix_cache, test_prefill) exercise through the pool.
+//   - test_evict (free order)      -> "free_blocks splits unhashed to the front"
+// plus the allocate / touch / eviction-on-reuse / reset / null-block invariants
+// upstream exercises through the pool (test_reset_prefix_cache, test_prefill).
 //
-// ADAPTATION: the landed block_pool.{h,cpp} mirror the CLASSIC BlockPool shape
-// (cache_full_blocks takes the precomputed block_hashes + a hash_fn; the map is
-// a plain {hash -> {block_id -> block}} nesting). Upstream's e24d1b24 test bodies
-// call the newer signature (reads request.block_hashes, hash_block_size on the
-// pool). The cases below are the same behavioral oracle expressed against the
-// classic signature: block_hashes are computed up front with hash_request_tokens
-// (as upstream's request block hasher does) and passed in.
+// These drive the PINNED e24d1b24 BlockPool API 1:1: cache_full_blocks reads
+// request.block_hashes, which the Request computes incrementally through the
+// injected block hasher (get_request_block_hasher). The pool carries
+// hash_block_size. free_blocks splits freed blocks: those WITHOUT a hash are
+// prepended to the FRONT (immediate reuse), those WITH a hash go to the tail
+// (LRU) — the pinned test_evict free-order oracle.
 //
 // Object-identity comparisons (`block is ...`) are ported as pointer equality.
 #include <doctest/doctest.h>
@@ -32,7 +31,7 @@
 using vllm::v1::BlockHash;
 using vllm::v1::BlockHashWithGroupId;
 using vllm::v1::BlockPool;
-using vllm::v1::hash_request_tokens;
+using vllm::v1::get_request_block_hasher;
 using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheBlock;
 using vllm::v1::make_block_hash_with_group_id;
@@ -41,9 +40,13 @@ using vllm::v1::sha256_cbor;
 
 namespace {
 
-// A Request over the given token ids (no sampling constraints matter here).
-Request MakeRequest(const std::string& id, const std::vector<int32_t>& tokens) {
-  return Request(id, tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0);
+// A Request over the given token ids, with the incremental block hasher injected
+// (so request.block_hashes is populated exactly as upstream make_request does).
+// init_none_hash MUST have been called first (the hasher runs in the ctor).
+Request MakeRequest(const std::string& id, const std::vector<int32_t>& tokens,
+                    int block_size) {
+  return Request(id, tokens, vllm::SamplingParams{}, /*arrival_time=*/0.0,
+                 get_request_block_hasher(block_size, sha256_cbor));
 }
 
 // Token ids 0..n-1, matching upstream's list(range(n)).
@@ -65,7 +68,8 @@ std::vector<int> FreeBlockIds(const BlockPool& pool) {
 }  // namespace
 
 TEST_CASE("BlockPool: construction pops the null block out of the free list") {
-  BlockPool pool(/*num_gpu_blocks=*/10, /*enable_caching=*/true);
+  BlockPool pool(/*num_gpu_blocks=*/10, /*enable_caching=*/true,
+                 /*hash_block_size=*/16);
   // Block 0 is the null placeholder: is_null, never in the free list.
   CHECK(pool.null_block == &pool.blocks[0]);
   CHECK(pool.null_block->block_id == 0);
@@ -80,7 +84,7 @@ TEST_CASE("BlockPool: construction pops the null block out of the free list") {
 }
 
 TEST_CASE("BlockPool: get_new_blocks allocates distinct non-null blocks") {
-  BlockPool pool(10, true);
+  BlockPool pool(10, true, 16);
   auto blocks = pool.get_new_blocks(3);
   CHECK(blocks.size() == 3);
   CHECK(pool.get_num_free_blocks() == 6);
@@ -99,7 +103,7 @@ TEST_CASE("BlockPool: get_new_blocks allocates distinct non-null blocks") {
 }
 
 TEST_CASE("BlockPool: get_new_blocks throws when not enough free blocks") {
-  BlockPool pool(4, true);  // 3 allocatable (block 0 is null).
+  BlockPool pool(4, true, 16);  // 3 allocatable (block 0 is null).
   CHECK(pool.get_num_free_blocks() == 3);
   CHECK_THROWS_AS(pool.get_new_blocks(4), std::runtime_error);
   auto blocks = pool.get_new_blocks(3);  // exhaust the pool
@@ -107,18 +111,15 @@ TEST_CASE("BlockPool: get_new_blocks throws when not enough free blocks") {
   CHECK_THROWS_AS(pool.get_new_blocks(1), std::runtime_error);
 }
 
-// Ported from test_cache_blocks.
+// Ported from test_cache_blocks: cache_full_blocks reads request.block_hashes.
 TEST_CASE("BlockPool: cache_full_blocks caches full blocks for reuse") {
   init_none_hash(sha256_cbor, "seed42");
   const int block_size = 4;
-  BlockPool pool(/*num_gpu_blocks=*/5, /*enable_caching=*/true);
+  BlockPool pool(/*num_gpu_blocks=*/5, /*enable_caching=*/true, block_size);
 
   // Req: 14 tokens -> 3 full blocks of 4, trailing partial not hashed.
-  const std::vector<int32_t> tokens = Iota(14);
-  Request req = MakeRequest("0", tokens);
-  const std::vector<BlockHash> block_hashes =
-      hash_request_tokens(sha256_cbor, block_size, tokens);
-  REQUIRE(block_hashes.size() == 3);
+  Request req = MakeRequest("0", Iota(14), block_size);
+  REQUIRE(req.block_hashes.size() == 3);
 
   // Standalone blocks with ids 0..2 (upstream builds KVCacheBlock(block_id=i)).
   // Reserve so addresses stay stable while the pool map holds pointers to them.
@@ -129,9 +130,8 @@ TEST_CASE("BlockPool: cache_full_blocks caches full blocks for reuse") {
   std::vector<KVCacheBlock*> blocks{&owned[0], &owned[1]};
 
   // Cache 2 full blocks from the start.
-  std::vector<BlockHash> hashes = block_hashes;
-  pool.cache_full_blocks(req, blocks, hashes, /*num_cached=*/0, /*num_full=*/2,
-                         block_size, /*group=*/0, sha256_cbor);
+  pool.cache_full_blocks(req, blocks, /*num_cached=*/0, /*num_full=*/2,
+                         block_size, /*group=*/0);
   CHECK(pool.cached_block_hash_to_block.size() == 2);
   CHECK(owned[0].block_hash().has_value());
   CHECK(owned[1].block_hash().has_value());
@@ -139,17 +139,17 @@ TEST_CASE("BlockPool: cache_full_blocks caches full blocks for reuse") {
   // Cache a block that does not start from the beginning.
   owned.emplace_back(2);
   blocks.push_back(&owned[2]);
-  pool.cache_full_blocks(req, blocks, hashes, /*num_cached=*/2, /*num_full=*/3,
-                         block_size, /*group=*/0, sha256_cbor);
+  pool.cache_full_blocks(req, blocks, /*num_cached=*/2, /*num_full=*/3,
+                         block_size, /*group=*/0);
   CHECK(pool.cached_block_hash_to_block.size() == 3);
   CHECK(owned[2].block_hash().has_value());
 
   // get_cached_block returns the cached block for a prefix hit.
-  auto hit0 = pool.get_cached_block(block_hashes[0], /*groups=*/{0});
+  auto hit0 = pool.get_cached_block(req.block_hashes[0], /*groups=*/{0});
   REQUIRE(hit0.has_value());
   CHECK(hit0->size() == 1);
   CHECK(hit0->front() == &owned[0]);
-  CHECK(pool.get_cached_block(block_hashes[2], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[2], {0}).has_value());
   // A hash that was never cached misses.
   const BlockHash never = "not-a-real-hash";
   CHECK_FALSE(pool.get_cached_block(never, {0}).has_value());
@@ -159,13 +159,10 @@ TEST_CASE("BlockPool: cache_full_blocks caches full blocks for reuse") {
 TEST_CASE("BlockPool: cache_full_blocks is group-aware") {
   init_none_hash(sha256_cbor, "seed42");
   const int block_size = 4;
-  BlockPool pool(10, true);
+  BlockPool pool(10, true, block_size);
 
-  const std::vector<int32_t> tokens = Iota(14);
-  Request req = MakeRequest("0", tokens);
-  const std::vector<BlockHash> block_hashes =
-      hash_request_tokens(sha256_cbor, block_size, tokens);
-  REQUIRE(block_hashes.size() == 3);
+  Request req = MakeRequest("0", Iota(14), block_size);
+  REQUIRE(req.block_hashes.size() == 3);
 
   // Cache 2 blocks for group 0.
   std::vector<KVCacheBlock> g0;
@@ -173,9 +170,9 @@ TEST_CASE("BlockPool: cache_full_blocks is group-aware") {
   g0.emplace_back(0);
   g0.emplace_back(1);
   std::vector<KVCacheBlock*> b0{&g0[0], &g0[1]};
-  std::vector<BlockHash> h0 = block_hashes;
-  pool.cache_full_blocks(req, b0, h0, 0, 2, block_size, /*group=*/0, sha256_cbor);
+  pool.cache_full_blocks(req, b0, 0, 2, block_size, /*group=*/0);
   CHECK(pool.cached_block_hash_to_block.size() == 2);
+  CHECK(req.block_hashes.size() == 3);
 
   // Cache 3 blocks for group 1.
   std::vector<KVCacheBlock> g1;
@@ -184,57 +181,89 @@ TEST_CASE("BlockPool: cache_full_blocks is group-aware") {
   g1.emplace_back(3);
   g1.emplace_back(4);
   std::vector<KVCacheBlock*> b1{&g1[0], &g1[1], &g1[2]};
-  std::vector<BlockHash> h1 = block_hashes;
-  pool.cache_full_blocks(req, b1, h1, 0, 3, block_size, /*group=*/1, sha256_cbor);
+  pool.cache_full_blocks(req, b1, 0, 3, block_size, /*group=*/1);
   CHECK(pool.cached_block_hash_to_block.size() == 5);
 
   // Block hash 0/1: hit for group 0 and 1. Block hash 2: hit for group 1 only.
-  CHECK(pool.get_cached_block(block_hashes[0], {0}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[1], {0}).has_value());
-  CHECK_FALSE(pool.get_cached_block(block_hashes[2], {0}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[0], {1}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[1], {1}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[2], {1}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[0], {0, 1}).has_value());
-  CHECK(pool.get_cached_block(block_hashes[1], {0, 1}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[1], {0}).has_value());
+  CHECK_FALSE(pool.get_cached_block(req.block_hashes[2], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {1}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[1], {1}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[2], {1}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {0, 1}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[1], {0, 1}).has_value());
   // Group 0 misses hash 2, so the multi-group lookup misses.
-  CHECK_FALSE(pool.get_cached_block(block_hashes[2], {0, 1}).has_value());
+  CHECK_FALSE(pool.get_cached_block(req.block_hashes[2], {0, 1}).has_value());
 }
 
-TEST_CASE("BlockPool: free_blocks returns blocks to the pool in the given order") {
-  BlockPool pool(6, true);  // blocks 1..5 allocatable.
-  auto blocks = pool.get_new_blocks(3);  // ids 1, 2, 3
+// Blocks without a hash are prepended to the FRONT (immediate reuse). This is
+// the F1 free_blocks fix.
+TEST_CASE("BlockPool: free_blocks prepends unhashed blocks to the front") {
+  BlockPool pool(6, true, 16);          // blocks 1..5 allocatable.
+  auto blocks = pool.get_new_blocks(3);  // ids 1, 2, 3 (none cached => no hash)
   CHECK(FreeBlockIds(pool) == std::vector<int>{4, 5});
 
-  // Free ordered by eviction priority [3, 2, 1] -> appended to the tail in
-  // that order (order is load-bearing for LRU).
+  // Free ordered [3, 2, 1]; all lack a hash, so all get prepended to the FRONT
+  // in that order (ahead of the pre-existing free blocks 4, 5).
   pool.free_blocks({blocks[2], blocks[1], blocks[0]});
   CHECK(pool.get_num_free_blocks() == 5);
-  CHECK(FreeBlockIds(pool) == std::vector<int>{4, 5, 3, 2, 1});
+  CHECK(FreeBlockIds(pool) == std::vector<int>{3, 2, 1, 4, 5});
   for (auto* b : blocks) {
     CHECK(b->ref_cnt == 0);
   }
 }
 
+// Ported from test_evict's free-order oracle: unhashed (partial) blocks at the
+// head, hashed (full) blocks at the tail — the pinned order shape
+// [6, 10, 5, 4, 3, 2, 1] reproduced at the pool level.
+TEST_CASE("BlockPool: free_blocks splits unhashed-to-front / hashed-to-tail") {
+  init_none_hash(sha256_cbor, "seed42");
+  const int block_size = 4;
+  // 8 blocks: block 0 null, blocks 1..7 allocatable.
+  BlockPool pool(8, true, block_size);
+
+  // 5 full blocks + 1 partial (21 tokens) -> block_hashes has 5 entries.
+  Request req = MakeRequest("0", Iota(5 * block_size + 1), block_size);
+  REQUIRE(req.block_hashes.size() == 5);
+
+  // Allocate 6 blocks (ids 1..6). One free block (id 7) is left pre-existing.
+  auto allocated = pool.get_new_blocks(6);
+  CHECK(FreeBlockIds(pool) == std::vector<int>{7});
+
+  // Cache the first 5 as full blocks (they gain a hash). Block id 6 (the
+  // partial) is never cached, so it stays hashless.
+  std::vector<KVCacheBlock*> full5(allocated.begin(), allocated.begin() + 5);
+  pool.cache_full_blocks(req, full5, 0, 5, block_size, /*group=*/0);
+  for (int i = 0; i < 5; ++i) CHECK(allocated[i]->block_hash().has_value());
+  CHECK(allocated[5]->block_id == 6);
+  CHECK_FALSE(allocated[5]->block_hash().has_value());
+
+  // Free in reverse block order [6, 5, 4, 3, 2, 1] (as KVCacheManager.free does).
+  // unhashed=[6] -> prepended to the front; hashed=[5,4,3,2,1] -> appended to
+  // the tail. Queue before: [7]. Result: [6, 7, 5, 4, 3, 2, 1].
+  std::vector<KVCacheBlock*> rev(allocated.rbegin(), allocated.rend());
+  pool.free_blocks(rev);
+  CHECK(pool.get_num_free_blocks() == 7);
+  CHECK(FreeBlockIds(pool) == std::vector<int>{6, 7, 5, 4, 3, 2, 1});
+}
+
 TEST_CASE("BlockPool: touch prevents a cached block from being evicted") {
   init_none_hash(sha256_cbor, "seed42");
   const int block_size = 4;
-  BlockPool pool(4, true);  // blocks 1..3 allocatable.
+  BlockPool pool(4, true, block_size);  // blocks 1..3 allocatable.
 
-  const std::vector<int32_t> tokens = Iota(4);  // one full block
-  Request req = MakeRequest("0", tokens);
-  std::vector<BlockHash> block_hashes =
-      hash_request_tokens(sha256_cbor, block_size, tokens);
-  REQUIRE(block_hashes.size() == 1);
+  Request req = MakeRequest("0", Iota(4), block_size);  // one full block
+  REQUIRE(req.block_hashes.size() == 1);
 
   // Allocate and cache block 1, then free it: it becomes an eviction candidate
   // (ref_cnt 0, in the free queue) that still carries its hash.
   KVCacheBlock* b = pool.get_new_blocks(1).front();
   std::vector<KVCacheBlock*> one{b};
-  pool.cache_full_blocks(req, one, block_hashes, 0, 1, block_size, 0, sha256_cbor);
+  pool.cache_full_blocks(req, one, 0, 1, block_size, 0);
   pool.free_blocks(one);
   CHECK(b->ref_cnt == 0);
-  CHECK(pool.get_cached_block(block_hashes[0], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
 
   // Touch it (a prefix hit from another request): removed from the free queue,
   // ref_cnt back to 1, so it is no longer an eviction candidate.
@@ -244,33 +273,31 @@ TEST_CASE("BlockPool: touch prevents a cached block from being evicted") {
 
   // Exhaust the remaining free blocks. The touched block must survive.
   pool.get_new_blocks(2);
-  CHECK(pool.get_cached_block(block_hashes[0], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
   CHECK(b->block_hash().has_value());
 }
 
 TEST_CASE("BlockPool: get_new_blocks evicts the LRU cached block on reuse") {
   init_none_hash(sha256_cbor, "seed42");
   const int block_size = 4;
-  BlockPool pool(4, true);  // blocks 1..3 allocatable.
+  BlockPool pool(4, true, block_size);  // blocks 1..3 allocatable.
 
-  const std::vector<int32_t> tokens = Iota(4);
-  Request req = MakeRequest("0", tokens);
-  std::vector<BlockHash> block_hashes =
-      hash_request_tokens(sha256_cbor, block_size, tokens);
+  Request req = MakeRequest("0", Iota(4), block_size);
+  REQUIRE(req.block_hashes.size() == 1);
 
   // Cache block 1 and free it -> eviction candidate at the tail with a hash.
   KVCacheBlock* b = pool.get_new_blocks(1).front();
   std::vector<KVCacheBlock*> one{b};
-  pool.cache_full_blocks(req, one, block_hashes, 0, 1, block_size, 0, sha256_cbor);
+  pool.cache_full_blocks(req, one, 0, 1, block_size, 0);
   pool.free_blocks(one);
-  CHECK(pool.get_cached_block(block_hashes[0], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
   CHECK(pool.get_num_free_blocks() == 3);  // blocks 2, 3, and freed 1 (at tail)
 
   // Allocate all free blocks. Reusing the cached block evicts it from the cache
   // via _maybe_evict_cached_block.
   auto reused = pool.get_new_blocks(3);
   // The cached block is now reused and no longer serves a prefix hit.
-  CHECK_FALSE(pool.get_cached_block(block_hashes[0], {0}).has_value());
+  CHECK_FALSE(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
   CHECK_FALSE(b->block_hash().has_value());  // hash was reset on eviction
   CHECK(pool.cached_block_hash_to_block.empty());
   // b is the last block reused (LRU tail), and it is now allocated.
@@ -281,16 +308,14 @@ TEST_CASE("BlockPool: get_new_blocks evicts the LRU cached block on reuse") {
 TEST_CASE("BlockPool: reset_prefix_cache clears when all blocks are free") {
   init_none_hash(sha256_cbor, "seed42");
   const int block_size = 4;
-  BlockPool pool(4, true);
+  BlockPool pool(4, true, block_size);
 
-  const std::vector<int32_t> tokens = Iota(4);
-  Request req = MakeRequest("0", tokens);
-  std::vector<BlockHash> block_hashes =
-      hash_request_tokens(sha256_cbor, block_size, tokens);
+  Request req = MakeRequest("0", Iota(4), block_size);
+  REQUIRE(req.block_hashes.size() == 1);
 
   KVCacheBlock* b = pool.get_new_blocks(1).front();
   std::vector<KVCacheBlock*> one{b};
-  pool.cache_full_blocks(req, one, block_hashes, 0, 1, block_size, 0, sha256_cbor);
+  pool.cache_full_blocks(req, one, 0, 1, block_size, 0);
 
   // A block is still in use (ref_cnt 1): reset must fail and be a no-op.
   CHECK_FALSE(pool.reset_prefix_cache());
@@ -310,7 +335,8 @@ TEST_CASE("BlockPool: reset_prefix_cache clears when all blocks are free") {
 // entry; eviction removes only the given block and drops the key when its inner
 // map empties.
 TEST_CASE("BlockPool: _maybe_evict_cached_block handles duplicate hashes") {
-  BlockPool pool(/*num_gpu_blocks=*/4, /*enable_caching=*/true);
+  BlockPool pool(/*num_gpu_blocks=*/4, /*enable_caching=*/true,
+                 /*hash_block_size=*/16);
   const BlockHashWithGroupId h0 = make_block_hash_with_group_id("10", 1000);
   const BlockHashWithGroupId h1 = make_block_hash_with_group_id("20", 2000);
   const BlockHashWithGroupId h2 = make_block_hash_with_group_id("30", 3000);
@@ -356,7 +382,7 @@ TEST_CASE("BlockPool: _maybe_evict_cached_block handles duplicate hashes") {
 }
 
 TEST_CASE("BlockPool: caching disabled skips eviction bookkeeping") {
-  BlockPool pool(4, /*enable_caching=*/false);
+  BlockPool pool(4, /*enable_caching=*/false, /*hash_block_size=*/16);
   auto blocks = pool.get_new_blocks(3);
   CHECK(blocks.size() == 3);
   for (auto* b : blocks) {
@@ -365,4 +391,28 @@ TEST_CASE("BlockPool: caching disabled skips eviction bookkeeping") {
   }
   pool.free_blocks(blocks);
   CHECK(pool.get_num_free_blocks() == 3);
+}
+
+// The deferred align path (block_size != hash_block_size) and the deferred
+// partial primitives are guarded 1:1 stubs.
+TEST_CASE("BlockPool: deferred align / partial primitives throw") {
+  init_none_hash(sha256_cbor, "seed42");
+  const int hash_block_size = 4;
+  BlockPool pool(8, true, hash_block_size);
+
+  Request req = MakeRequest("0", Iota(16), hash_block_size);
+  std::vector<KVCacheBlock> owned;
+  owned.reserve(2);
+  owned.emplace_back(0);
+  owned.emplace_back(1);
+  std::vector<KVCacheBlock*> blocks{&owned[0], &owned[1]};
+
+  // block_size != hash_block_size -> align path, DEFERRED.
+  CHECK_THROWS_AS(
+      pool.cache_full_blocks(req, blocks, 0, 1, /*block_size=*/8, 0),
+      std::runtime_error);
+  // cache_partial_block / evict_blocks -> DEFERRED stubs.
+  CHECK_THROWS_AS(pool.cache_partial_block(req, &owned[0], 4, 0, 8),
+                  std::runtime_error);
+  CHECK_THROWS_AS(pool.evict_blocks({1, 2}), std::runtime_error);
 }

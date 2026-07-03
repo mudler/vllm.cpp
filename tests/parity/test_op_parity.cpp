@@ -294,7 +294,10 @@ TEST_CASE("op parity vs upstream goldens") {
   for (const auto& entry : fs::directory_iterator(root)) {
     if (!entry.is_directory()) continue;
     fs::path mf = entry.path() / "manifest.json";
-    REQUIRE(fs::exists(mf));
+    // Non-op golden dirs (e.g. tokenizer_qwen36, owned by
+    // test_tokenizer_parity) carry no manifest.json; the `cases >= 9` floor
+    // below still guards against op cases silently disappearing.
+    if (!fs::exists(mf)) continue;
     json m = json::parse(std::ifstream(mf));
     std::string op = m["op"];
     INFO("case " << entry.path().filename().string());

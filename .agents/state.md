@@ -282,6 +282,39 @@
   allocate_slots→nullopt, SchedulerOutput new/cached diff); the biggest engine
   unit, ported from `vllm/v1/core/sched/scheduler.py` + `tests/v1/core/
   test_scheduler.py`.
+- **2026-07-03 (later)** — **M1.5 done** (`62fdfca`; ports `f3bf0ac`
+  BlockTable+MultiGroupBlockTable, `2d9f693` persistent InputBatch
+  add/remove/condense, `62fdfca` update_states+prepare_inputs). **The persistent
+  batch + step-input build is ported — the bridge from scheduler output to the
+  forward pass.** Pieces: **BlockTable + MultiGroupBlockTable** (V1 host-array
+  block-id storage, `slot_mapping = block_id*block_size + offset`, multi-group
+  fanout); **persistent InputBatch** (add/remove/`condense()` field-by-field
+  densification, MRV2 contract `token_ids = prefill_token_ids`, per-slot sampling
+  arrays staged for M1.7); **update_states + prepare_inputs** (query_start_loc/
+  seq_lens/positions/slot_mapping/logits_indices matched 1:1 vs upstream
+  `_prepare_inputs`). All reviewed PASS, CI green, ASan-clean; behavioral CPU
+  tests ported from `tests/v1/worker/{test_gpu_input_batch,test_gpu_model_runner}
+  .py`. **ARCH DECISION (recorded in `.agents/vllm-v1-v2.md` at `2889abd`):**
+  "MRV2" is TWO axes — the scheduler-output **CONTRACT** (T0, ported via the V1
+  host-array algorithm from `block_table.py` + `gpu_input_batch.py` +
+  `gpu_model_runner.py::_prepare_inputs`) vs the staged worker **STORAGE** (M2:
+  MRV2 gpu/ staged tensors, StagedWriteTensor/UVA/fused-Triton). T0 delivers the
+  contract via the V1 algorithm; staged device storage is deferred to M2.
+  **KEY CARRIED DEPENDENCY — GDN-state zeroing:** SchedulerOutput omits
+  `new_block_ids_to_zero`, so `update_states` cannot zero fresh GDN/mamba blocks.
+  This is INERT at T0 (no batched-GDN forward yet) but MUST be wired when the
+  batched-GDN forward lands (M1.6/M2) — add the field + a zero-block step, or
+  have the block pool zero reused blocks — else stale recurrent state corrupts
+  SSM compute. **DEFERRED:** staged device tensors, swap_states/reorder hook,
+  CUDA-graph padding, LoRA/spec/mm/structured-output slot state, and the sampler
+  bits (generators/allowed_token_ids/bad_words). Close-out asserts:
+  `PendingRunnerOps()` empty (grep-confirmed — M1.5 added no goldens,
+  `tests/parity/test_op_parity.cpp:1035` kPending = {}); CI green. NEXT: **M1.6
+  Paged attention backend** — the KV-cache-aware attention (replaces M0.9's dense
+  attention for the batched/cached path) + the `CommonAttentionMetadata` builder
+  consuming these step inputs (query_start_loc/seq_lens/slot_mapping/block_table);
+  note the GDN backend metadata (prefill/decode segmentation) for the hybrid gate
+  models.
 - **2026-07-03 (later)** — **M1.4 done** (`4f12158`; ports `2f0ea69`
   SchedulerConfig + FCFS RequestQueue [+ `fc81a43` un-defer fix: watermark +
   scheduler_reserve_full_isl], `c65e650` SchedulerOutput/NewRequestData/

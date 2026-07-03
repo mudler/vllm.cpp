@@ -101,7 +101,18 @@ vocabulary is ported.**
   precedence, free-on-finish). All reviewed PASS, CI green; behavioral CPU tests
   ported from `tests/v1/core/test_scheduler.py`. Priority/spec-decode/
   structured/encoder/KV-connector/async deferred behind 1:1 stubs.
-- ☐ **M1.5 InputBatch/BlockTable (MRV2)** persistent batch + step-input build.
+- ✅ **M1.5 InputBatch/BlockTable (MRV2)** persistent batch + step-input build
+  (`62fdfca`; ports `f3bf0ac` BlockTable+MultiGroupBlockTable, `2d9f693`
+  persistent InputBatch add/remove/condense, `62fdfca` update_states+
+  prepare_inputs): V1 host-array block-id storage (slot_mapping=block_id*bs+
+  offset, multi-group fanout), persistent InputBatch (condense() field-by-field
+  densification, MRV2 contract token_ids=prefill_token_ids, per-slot sampling
+  arrays for M1.7), step-input build (query_start_loc/seq_lens/positions/
+  slot_mapping/logits_indices matched 1:1 vs `_prepare_inputs`). ARCH: MRV2 =
+  scheduler-output CONTRACT (T0, V1 host-array algorithm) vs staged worker
+  STORAGE (M2) — see `.agents/vllm-v1-v2.md` (`2889abd`). All reviewed PASS, CI
+  green, ASan-clean; behavioral CPU tests ported from `tests/v1/worker/`. Staged
+  device tensors / CUDA-graph padding / LoRA/spec/mm deferred to M2/T1.
 - ☐ **M1.6 Paged attention backend** (varlen prefill + paged decode,
   correctness-grade) + CommonAttentionMetadata builders.
 - ☐ **M1.7 Sampler** (upstream pipeline order, seeded RNG, logprobs) + GPU

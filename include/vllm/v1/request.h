@@ -51,6 +51,11 @@
 
 namespace vllm::v1 {
 
+// Forward decl: the frontend->core message (vllm/v1/engine/types.h). Declared
+// here so Request::FromEngineCoreRequest can take it by const ref without a
+// circular include (types.h includes this header for FinishReason).
+struct EngineCoreRequest;
+
 // FinishReason (IntEnum): reason a request finished. Int values are
 // load-bearing (compact serialization upstream). Mirrors
 // vllm/v1/engine/__init__.py FinishReason.
@@ -103,6 +108,14 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status);
 struct Request {
   Request(std::string request_id, std::vector<int32_t> prompt_token_ids,
           SamplingParams sampling_params, double arrival_time);
+
+  // from_engine_core_request: build a Request from the frontend->core message.
+  // Mirrors upstream Request.from_engine_core_request for the T0 fields
+  // (request_id, prompt_token_ids, sampling_params, arrival_time); status
+  // starts kWaiting, num_computed_tokens 0, output empty. The params arrived
+  // already PostInit'd / validated by the frontend, so this does NOT
+  // re-validate (upstream's factory doesn't either).
+  static Request FromEngineCoreRequest(const EngineCoreRequest& request);
 
   std::string request_id;
   std::vector<int32_t> prompt_token_ids;

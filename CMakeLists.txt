@@ -59,6 +59,7 @@ add_library(vllm STATIC
   src/vllm/tokenizer/bpe.cpp
   src/vllm/tokenizer/tokenizer.cpp
   src/vllm/v1/request.cpp
+  src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp

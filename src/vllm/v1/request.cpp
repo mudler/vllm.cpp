@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/v1/engine/types.h"  // EngineCoreRequest (for FromEngineCoreRequest)
+
 namespace vllm::v1 {
 
 // RequestStatus.is_finished: finished iff status > PREEMPTED. Relies on the
@@ -58,6 +60,15 @@ Request::Request(std::string request_id,
       status(RequestStatus::kWaiting),
       arrival_time(arrival_time),
       num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())) {}
+
+// Request.from_engine_core_request (T0 subset). The params were PostInit'd /
+// validated by the frontend before this message was built, so we do NOT
+// re-validate here (upstream's classmethod doesn't either — it just forwards
+// the already-validated sampling_params into the Request constructor).
+Request Request::FromEngineCoreRequest(const EngineCoreRequest& request) {
+  return Request(request.request_id, request.prompt_token_ids,
+                 request.sampling_params, request.arrival_time);
+}
 
 // num_tokens: len(_all_token_ids) == prompt + output.
 int Request::NumTokens() const {

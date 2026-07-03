@@ -74,7 +74,9 @@ target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)
-  target_sources(vllm PRIVATE src/vt/cuda/cuda_backend.cu)
+  target_sources(vllm PRIVATE
+    src/vt/cuda/cuda_backend.cu
+    src/vt/cuda/cuda_ops.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

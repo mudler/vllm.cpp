@@ -59,6 +59,11 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
 
 // out[T,H] = table[ids[t], :]; ids i32/i64, bounds-checked; out f32 or bf16.
+// CUDA note (M0.6 decision): ids live on the device, so the CUDA kernel clamps
+// bad ids for the gather (no OOB read), records the first bad id in a device
+// flag, and the wrapper synchronizes the stream and throws before returning.
+// CUDA Embedding is therefore synchronizing for now — correctness-grade;
+// revisit for full async when the model runner needs it (M0.9/M2).
 void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
 
 // In-place partial NeoX RoPE on q[T,Hq,D] and k[T,Hk,D], positions[T].

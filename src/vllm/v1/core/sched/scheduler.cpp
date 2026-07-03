@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -12,6 +13,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "vllm/v1/core/sched/utils.h"  // check_stop
 
 namespace vllm::v1 {
 
@@ -314,6 +317,133 @@ SchedulerOutput Scheduler::schedule() {
 
   update_after_schedule(scheduler_output);
   return scheduler_output;
+}
+
+EngineCoreOutputs Scheduler::update_from_output(
+    const SchedulerOutput& scheduler_output,
+    const ModelRunnerOutput& model_runner_output) {
+  const std::vector<std::vector<int32_t>>& sampled_token_ids =
+      model_runner_output.sampled_token_ids;
+  const std::map<std::string, int>& num_scheduled_tokens =
+      scheduler_output.num_scheduled_tokens;
+
+  std::vector<EngineCoreOutput> outputs;
+  // Requests that stopped this step, split by the queue they must be removed
+  // from (upstream stopped_running_reqs / stopped_preempted_reqs). The KV blocks
+  // are freed and finished_req_ids updated inside the loop, but the owning
+  // requests-map erase is deferred until after these pointers are used to filter
+  // running/waiting (so the Request* stays valid — upstream relies on Python GC).
+  std::set<Request*> stopped_running_reqs;
+  std::set<Request*> stopped_preempted_reqs;
+  std::vector<std::string> finished_ids_to_erase;
+
+  // NOTE(woosuk): upstream iterates num_scheduled_tokens.items() (dict/schedule
+  // order); std::map iterates in sorted key order. The set of outputs is the
+  // same — only their order in the returned vector differs, which is benign
+  // (each EngineCoreOutput is keyed by request_id).
+  for (const auto& [req_id, num_tokens_scheduled] : num_scheduled_tokens) {
+    assert(num_tokens_scheduled > 0);
+    (void)num_tokens_scheduled;
+
+    auto it = requests.find(req_id);
+    if (it == requests.end() || it->second->IsFinished()) {
+      // Already finished — e.g. aborted while the model was executing it.
+      continue;
+    }
+    Request* request = it->second.get();
+
+    const int req_index = model_runner_output.req_id_to_index.at(req_id);
+    // sampled_token_ids[req_index] if sampled_token_ids else []. A request still
+    // being prefilled gets an empty list from the runner.
+    std::vector<int32_t> new_token_ids =
+        sampled_token_ids.empty()
+            ? std::vector<int32_t>{}
+            : sampled_token_ids[static_cast<std::size_t>(req_index)];
+
+    // DEFERRED: speculative-decode acceptance / num_computed rollback; encoder-
+    // input free.
+
+    bool stopped = false;
+    const RequestStatus status_before_stop = request->status;
+
+    // _update_request_with_output: append each generated token, run check_stop
+    // after each, and trim any tokens generated past the stop.
+    if (!new_token_ids.empty()) {
+      for (std::size_t num_new = 1; num_new <= new_token_ids.size(); ++num_new) {
+        request->AppendOutputToken(new_token_ids[num_new - 1]);
+        stopped = check_stop(*request, max_model_len);
+        if (stopped) {
+          new_token_ids.resize(num_new);  // del new_token_ids[num_new:]
+          break;
+        }
+      }
+    }
+    // DEFERRED: pooling stop, structured-output grammar accept.
+
+    std::optional<FinishReason> finish_reason;
+    if (stopped) {
+      // Capture the finish reason before freeing (upstream captures it before
+      // _handle_stopped_request, which may reset the status for resumable reqs —
+      // resumable/streaming is deferred, so _handle_stopped_request is always
+      // "finished" at T0).
+      finish_reason = request->GetFinishedReason();
+      // _free_request + _free_blocks (T0 subset): free the KV blocks and record
+      // the finished id now; defer the requests-map erase (see above).
+      kv_cache_manager->free(*request);
+      finished_req_ids.insert(request->request_id);
+      finished_ids_to_erase.push_back(request->request_id);
+      if (status_before_stop == RequestStatus::kRunning) {
+        stopped_running_reqs.insert(request);
+      } else {
+        stopped_preempted_reqs.insert(request);
+      }
+    }
+
+    // DEFERRED: sample logprobs / prompt logprobs / num_nans_in_logits.
+
+    // Emit an EngineCoreOutput only when the request produced tokens or finished
+    // (upstream's `if new_token_ids or ... or stopped`). A partial-prefill
+    // request that produced neither is skipped: "EngineCore returns no partial
+    // prefill outputs".
+    if (!new_token_ids.empty() || stopped) {
+      EngineCoreOutput out;
+      out.request_id = req_id;
+      out.new_token_ids = new_token_ids;
+      out.finish_reason = finish_reason;
+      // stop_reason is int|str|None upstream; our EngineCoreOutput carries an
+      // optional<string> (see engine/types.h). Only a stop_token_ids match sets
+      // request.stop_reason at T0 — stringify that token id; otherwise nullopt.
+      if (request->stop_reason.has_value()) {
+        out.stop_reason = std::to_string(*request->stop_reason);
+      }
+      outputs.push_back(std::move(out));
+    }
+  }
+
+  // Remove the stopped requests from the running list and the waiting queue.
+  if (!stopped_running_reqs.empty()) {
+    running.erase(
+        std::remove_if(running.begin(), running.end(),
+                       [&](Request* r) {
+                         return stopped_running_reqs.count(r) > 0;
+                       }),
+        running.end());
+  }
+  if (!stopped_preempted_reqs.empty()) {
+    // Rare (a stopped-while-preempted request); remove each from waiting.
+    std::vector<Request*> to_remove(stopped_preempted_reqs.begin(),
+                                    stopped_preempted_reqs.end());
+    waiting->remove_requests(to_remove);
+  }
+  // Now that no queue references them, drop the owning entries (destroys the
+  // finished Request objects — upstream _free_blocks' `del self.requests[...]`).
+  for (const std::string& id : finished_ids_to_erase) {
+    requests.erase(id);
+  }
+
+  EngineCoreOutputs engine_core_outputs;
+  engine_core_outputs.outputs = std::move(outputs);
+  return engine_core_outputs;
 }
 
 CachedRequestData Scheduler::make_cached_request_data(

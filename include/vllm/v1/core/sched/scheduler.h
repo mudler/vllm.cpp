@@ -67,6 +67,7 @@
 #include "vllm/v1/core/kv_cache_manager.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/request_queue.h"
+#include "vllm/v1/engine/types.h"  // ModelRunnerOutput, EngineCoreOutputs
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
 
@@ -103,6 +104,31 @@ class Scheduler {
 
   // schedule(): the core token-budget algorithm. See the file header.
   SchedulerOutput schedule();
+
+  // update_from_output: the final leg of the schedule -> execute -> update loop.
+  // For each scheduled request (iterating scheduler_output.num_scheduled_tokens,
+  // matching upstream's `for req_id ... in num_scheduled_tokens.items()`), it
+  // reads that request's sampled token(s) from model_runner_output via
+  // req_id_to_index, appends them one at a time running check_stop after each
+  // (trimming any tokens past a stop), and on a stop sets the finished status,
+  // frees the request's KV blocks, records its id in finished_req_ids, removes it
+  // from running_/waiting_ and erases it from the requests map. It builds one
+  // EngineCoreOutput per request that produced tokens or finished, and returns
+  // the batched EngineCoreOutputs for the step. A request still in chunked
+  // prefill receives an empty token list from the runner and stays running with
+  // no output. (Upstream scheduler.py::update_from_output, T0 subset.)
+  //
+  // DEFERRED (matches upstream structure): logprobs / prompt_logprobs,
+  // speculative-decode acceptance & num_computed rollback, structured-output
+  // grammar advance, pooling outputs, encoder-input free, KV-connector finish /
+  // invalid-block reload, routed-experts, num_nans_in_logits, spec/perf/spec-
+  // decoding stats, resumable / streaming sessions (so _handle_stopped_request
+  // is always "finished" here), and the per-client_index output fan-out (T0 has
+  // a single client, so a flat EngineCoreOutputs is returned rather than
+  // dict[client_index, EngineCoreOutputs]).
+  EngineCoreOutputs update_from_output(
+      const SchedulerOutput& scheduler_output,
+      const ModelRunnerOutput& model_runner_output);
 
   // get_num_unfinished_requests: len(waiting) + len(running) (T0 subset).
   int get_num_unfinished_requests() const;

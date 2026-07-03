@@ -34,16 +34,20 @@
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/scheduler.h"
+#include "vllm/v1/engine/types.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
 #include "vt/dtype.h"
 
 using vllm::SamplingParams;
 using vllm::SchedulerConfig;
+using vllm::v1::EngineCoreOutputs;
+using vllm::v1::FinishReason;
 using vllm::v1::FullAttentionSpec;
 using vllm::v1::get_request_block_hasher;
 using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheConfig;
+using vllm::v1::ModelRunnerOutput;
 using vllm::v1::Request;
 using vllm::v1::RequestStatus;
 using vllm::v1::Scheduler;
@@ -112,6 +116,22 @@ Request* AddRequest(Scheduler& sched, std::unique_ptr<Request> req) {
   Request* raw = req.get();
   sched.add_request(std::move(req));
   return raw;
+}
+
+// Build a ModelRunnerOutput from an ordered list of (req_id, sampled_tokens),
+// mirroring what the model runner (M1.5) returns: req_ids order + the
+// req_id_to_index map + the ragged sampled_token_ids. An empty token list models
+// a request still in chunked prefill (no sample this step).
+ModelRunnerOutput MakeRunnerOutput(
+    const std::vector<std::pair<std::string, std::vector<int32_t>>>& per_req) {
+  ModelRunnerOutput mro;
+  int idx = 0;
+  for (const auto& [id, toks] : per_req) {
+    mro.req_ids.push_back(id);
+    mro.req_id_to_index[id] = idx++;
+    mro.sampled_token_ids.push_back(toks);
+  }
+  return mro;
 }
 
 }  // namespace
@@ -381,4 +401,180 @@ TEST_CASE("Scheduler: finish_requests removes from waiting + requests map") {
     CHECK(scheduler->requests.count(ids[i]) == 0);
     CHECK(static_cast<int>(scheduler->waiting->size()) == 9 - i);
   }
+}
+
+// ===========================================================================
+// update_from_output — the schedule -> execute -> update loop (M1.4 Task 4).
+// Ported from tests/v1/core/test_scheduler.py @ e24d1b24: the
+// test_update_from_output family, test_stop_via_update_from_output (eos /
+// stop_token_ids / max_tokens / min_tokens), and the partial-prefill
+// "no sampled tokens" case (test_schedule_partial_requests).
+// ===========================================================================
+
+// A sampled token is appended and the request advances (no stop, still running).
+// (test_update_from_output.)
+TEST_CASE("Scheduler.update_from_output: appends the sampled token") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/4, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  auto sched_out = scheduler->schedule();  // prefill 4 tokens
+  REQUIRE(req->num_computed_tokens == 4);
+
+  auto mro = MakeRunnerOutput({{"0", {42}}});
+  EngineCoreOutputs eco = scheduler->update_from_output(sched_out, mro);
+
+  // The token was appended; the request keeps running (max_tokens 16, no eos).
+  REQUIRE(req->output_token_ids.size() == 1);
+  CHECK(req->output_token_ids[0] == 42);
+  CHECK(req->status == RequestStatus::kRunning);
+  CHECK_FALSE(req->IsFinished());
+
+  // EngineCoreOutputs shape: one output carrying the new token, no finish.
+  REQUIRE(eco.outputs.size() == 1);
+  CHECK(eco.outputs[0].request_id == "0");
+  CHECK(eco.outputs[0].new_token_ids == std::vector<int32_t>{42});
+  CHECK_FALSE(eco.outputs[0].finish_reason.has_value());
+  CHECK_FALSE(eco.outputs[0].Finished());
+  CHECK(scheduler->running.size() == 1);
+  CHECK(scheduler->finished_req_ids.empty());
+}
+
+// An EOS token finishes the request: FINISHED_STOPPED, KV freed, id in
+// finished_req_ids, erased from the requests map, finish_reason == stop.
+// (test_stop_via_update_from_output — eos.)
+TEST_CASE("Scheduler.update_from_output: eos token stops the request") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/4, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+  req->sampling_params.eos_token_id = 7;
+
+  auto sched_out = scheduler->schedule();
+  auto mro = MakeRunnerOutput({{"0", {7}}});
+  EngineCoreOutputs eco = scheduler->update_from_output(sched_out, mro);
+
+  REQUIRE(eco.outputs.size() == 1);
+  CHECK(eco.outputs[0].request_id == "0");
+  CHECK(eco.outputs[0].new_token_ids == std::vector<int32_t>{7});
+  REQUIRE(eco.outputs[0].finish_reason.has_value());
+  CHECK(*eco.outputs[0].finish_reason == FinishReason::kStop);
+  CHECK(eco.outputs[0].Finished());
+  // Freed + removed everywhere.
+  CHECK(scheduler->finished_req_ids.count("0") == 1);
+  CHECK(scheduler->requests.count("0") == 0);  // erased from the owning map
+  CHECK(scheduler->running.empty());
+}
+
+// max_tokens reached -> FINISHED_LENGTH_CAPPED / finish_reason == length.
+// (test_stop_via_update_from_output — max_tokens.)
+TEST_CASE("Scheduler.update_from_output: max_tokens length-caps the request") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/4, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+  req->sampling_params.max_tokens = 1;  // one output token is already the cap
+
+  auto sched_out = scheduler->schedule();
+  auto mro = MakeRunnerOutput({{"0", {5}}});  // not eos, not a stop token
+  EngineCoreOutputs eco = scheduler->update_from_output(sched_out, mro);
+
+  REQUIRE(eco.outputs.size() == 1);
+  REQUIRE(eco.outputs[0].finish_reason.has_value());
+  CHECK(*eco.outputs[0].finish_reason == FinishReason::kLength);
+  CHECK(scheduler->finished_req_ids.count("0") == 1);
+  CHECK(scheduler->requests.count("0") == 0);
+}
+
+// min_tokens gates the EOS stop: the same eos token does NOT stop until at least
+// min_tokens output tokens exist. (test_stop_via_update_from_output — min_tokens.)
+TEST_CASE("Scheduler.update_from_output: min_tokens prevents an early eos stop") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/4, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+  req->sampling_params.eos_token_id = 7;
+  req->sampling_params.min_tokens = 2;
+  req->sampling_params.max_tokens = 16;
+
+  // First eos: only 1 output token < min_tokens(2) -> not stopped.
+  auto out0 = scheduler->schedule();
+  auto eco0 = scheduler->update_from_output(out0, MakeRunnerOutput({{"0", {7}}}));
+  CHECK_FALSE(req->IsFinished());
+  REQUIRE(eco0.outputs.size() == 1);
+  CHECK_FALSE(eco0.outputs[0].finish_reason.has_value());
+
+  // Second eos: 2 output tokens >= min_tokens(2) -> stopped.
+  auto out1 = scheduler->schedule();  // decode step (num_new == 1)
+  auto eco1 = scheduler->update_from_output(out1, MakeRunnerOutput({{"0", {7}}}));
+  REQUIRE(eco1.outputs.size() == 1);
+  REQUIRE(eco1.outputs[0].finish_reason.has_value());
+  CHECK(*eco1.outputs[0].finish_reason == FinishReason::kStop);
+  CHECK(scheduler->requests.count("0") == 0);
+}
+
+// A stop_token_ids match stops the request and carries the token id as
+// stop_reason. (test_stop_via_update_from_output — stop_token_ids.)
+TEST_CASE("Scheduler.update_from_output: stop_token_ids match sets stop_reason") {
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/4, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+  req->sampling_params.stop_token_ids = {99};
+  req->sampling_params.max_tokens = 16;
+
+  auto sched_out = scheduler->schedule();
+  auto eco = scheduler->update_from_output(sched_out, MakeRunnerOutput({{"0", {99}}}));
+
+  REQUIRE(eco.outputs.size() == 1);
+  REQUIRE(eco.outputs[0].finish_reason.has_value());
+  CHECK(*eco.outputs[0].finish_reason == FinishReason::kStop);
+  REQUIRE(eco.outputs[0].stop_reason.has_value());
+  CHECK(*eco.outputs[0].stop_reason == "99");
+  CHECK(scheduler->requests.count("0") == 0);
+}
+
+// A request still in chunked prefill receives an empty sampled-token list and
+// gets no output, staying running with its output unchanged.
+// (test_schedule_partial_requests intent.)
+TEST_CASE("Scheduler.update_from_output: prefilling request gets no token") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/16,
+                                   /*max_num_batched_tokens=*/30);
+  auto requests = CreateRequests(/*num_requests=*/1, /*num_tokens=*/80, {"0"});
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  auto sched_out = scheduler->schedule();  // first chunk (30 of 80)
+  REQUIRE(req->num_computed_tokens == 30);
+  REQUIRE(req->is_prefill_chunk);
+
+  // The runner returns an empty token list for a still-prefilling request.
+  auto eco = scheduler->update_from_output(sched_out, MakeRunnerOutput({{"0", {}}}));
+
+  CHECK(eco.outputs.empty());  // no partial-prefill output
+  CHECK(req->output_token_ids.empty());
+  CHECK(req->num_computed_tokens == 30);  // update_from_output does not advance it
+  CHECK(req->status == RequestStatus::kRunning);
+  CHECK(scheduler->requests.count("0") == 1);
+  CHECK(scheduler->finished_req_ids.empty());
+}
+
+// EngineCoreOutputs shape with a mixed batch: two decoding requests each yield
+// one output; a third still-prefilling request yields none.
+TEST_CASE("Scheduler.update_from_output: batched outputs shape") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/16,
+                                   /*max_num_batched_tokens=*/40);
+  // "a"/"b" are short (fully prefill this step); "c" is long (chunked).
+  auto reqs = CreateRequests(/*num_requests=*/2, /*num_tokens=*/4, {"a", "b"});
+  AddRequest(*scheduler, std::move(reqs[0]));
+  AddRequest(*scheduler, std::move(reqs[1]));
+  auto longreq = CreateRequests(/*num_requests=*/1, /*num_tokens=*/60, {"c"});
+  AddRequest(*scheduler, std::move(longreq[0]));
+
+  auto sched_out = scheduler->schedule();
+  REQUIRE(sched_out.num_scheduled_tokens.at("a") == 4);
+  REQUIRE(sched_out.num_scheduled_tokens.at("b") == 4);
+  REQUIRE(sched_out.num_scheduled_tokens.at("c") == 32);  // chunked remainder
+
+  auto eco = scheduler->update_from_output(
+      sched_out, MakeRunnerOutput({{"a", {1}}, {"b", {2}}, {"c", {}}}));
+
+  // "a" and "b" produced a token; "c" (still prefilling) produced none.
+  CHECK(eco.outputs.size() == 2);
+  CHECK(eco.engine_index == 0);
 }

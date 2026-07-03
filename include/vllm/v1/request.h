@@ -15,7 +15,7 @@
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params, structured_output_request,
 //     lora_request, cache_salt (prefix caching salt), events /
-//     stop_reason / kv_transfer_params, spec_token_ids, priority /
+//     kv_transfer_params, spec_token_ids, priority /
 //     client_index / __lt__ (priority scheduling), streaming / resumable
 //     state, prefill_stats, async-scheduling counters
 //     (num_output_placeholders, async_tokens_to_discard,
@@ -134,6 +134,15 @@ struct Request {
   std::vector<int32_t> output_token_ids;
   int num_computed_tokens = 0;
   RequestStatus status = RequestStatus::kWaiting;
+  // stop_reason (upstream Request.stop_reason: int | str | None = None). Set by
+  // check_stop (sched/utils) when a stop_token_ids match ends the request — it
+  // carries the matched token id — and read by update_from_output when it builds
+  // the request's EngineCoreOutput. Un-deferred from the Request deferred list
+  // because M1.4 Task 4 needs it. Repetition detection's string reason
+  // ("repetition_detected") is deferred with sampling_params.repetition_detection,
+  // so at T0 only the int (stop-token) form ever occurs — hence std::optional<int>
+  // rather than a variant<int, string>.
+  std::optional<int> stop_reason;
   double arrival_time = 0.0;
   // Set at construction from prompt_token_ids.size() (upstream:
   // length_from_prompt_token_ids_or_embeds).

@@ -70,6 +70,7 @@ add_library(vllm STATIC
   src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/core/sched/output.cpp
   src/vllm/v1/core/sched/scheduler.cpp
+  src/vllm/v1/core/sched/utils.cpp
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp

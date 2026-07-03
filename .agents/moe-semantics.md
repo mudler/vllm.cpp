@@ -134,6 +134,11 @@ Torch-native pinned statements of the same math (both verified equivalent):
 over all E, greedy top-k with lowest-index tie-break, optional renormalize
 with the `denom > 0 else 1` guard, emits f32 weights + i32 ids.
 
+Golden note: the realratio router case is tie-free by construction (dump-time
+per-row uniqueness assert + deterministic post-bf16 dedup that nudges exact
+f32(bf16) duplicates to the next representable value); the lowest-index
+tie-break rule itself is pinned by Task 2 CPU unit tests, not by this golden.
+
 ## 4. Routed experts: per-expert silu-mul MLP (composes existing ops)
 
 Weights per expert: `w13 [E, 2*I, H]` — **gate_proj rows first (w1, rows

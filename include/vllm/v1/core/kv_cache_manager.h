@@ -42,10 +42,16 @@
 //   request.num_tokens (draft tokens that could be rejected are excluded).
 //
 // DEVIATIONS, recorded:
-//   - Upstream's `new_computed_blocks: KVCacheBlocks | None` (identity-compared
-//     against self.empty_kv_cache_blocks.blocks) is taken here as
-//     std::optional<KVCacheBlocks>; has_value() reproduces the "is not empty"
-//     identity check that gates allocate_new_computed_blocks.
+//   - Upstream's `new_computed_blocks: KVCacheBlocks | None` gates
+//     allocate_new_computed_blocks on the IDENTITY test
+//     `new_computed_block_list is not self.empty_kv_cache_blocks.blocks`; here it
+//     is a std::optional<KVCacheBlocks> and the gate is has_value(). These are
+//     NOT byte-identical: for a PRESENT-but-empty KVCacheBlocks (a non-None value
+//     whose per-group lists are all empty, but which is a distinct object from the
+//     shared empty_kv_cache_blocks) upstream's identity test is False and skips
+//     the call, whereas has_value() is True and makes the call. The divergence is
+//     inert — add_local_computed_blocks with empty blocks + 0 computed tokens is a
+//     no-op — but the semantics are not the same.
 //   - Python tuples of per-group block lists are the coordinator's
 //     KVCacheBlocksTuple (std::vector<std::vector<KVCacheBlock*>>);
 //     KVCacheBlocks.blocks IS that type. get_block_ids returns

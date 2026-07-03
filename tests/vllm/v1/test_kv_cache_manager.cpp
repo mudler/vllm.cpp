@@ -73,6 +73,21 @@ std::unique_ptr<KVCacheManager> MakeManager(KVCacheConfig cfg, int block_size) {
       /*scheduler_block_size=*/block_size, /*hash_block_size=*/block_size);
 }
 
+// Single full-attention group manager with an explicit watermark and (optional)
+// max_model_len — the watermark/reserved/lookahead/admission-cap machinery the
+// existing tests never exercise (they all run with watermark == 0).
+std::unique_ptr<KVCacheManager> MakeFullManager(int block_size, int num_blocks,
+                                                double watermark = 0.0,
+                                                int max_model_len = 8192) {
+  return std::make_unique<KVCacheManager>(
+      MakeFullConfig(block_size, num_blocks), max_model_len,
+      /*scheduler_block_size=*/block_size, /*hash_block_size=*/block_size,
+      /*max_num_batched_tokens=*/std::nullopt, /*enable_caching=*/true,
+      /*use_eagle=*/false, /*log_stats=*/false,
+      /*enable_kv_cache_events=*/false, /*dcp_world_size=*/1,
+      /*pcp_world_size=*/1, watermark);
+}
+
 // Build a request whose token ids are `tokens`, wired with the cbor block hasher
 // so its block_hashes populate at block_size granularity.
 Request MakeRequest(const std::string& id, const std::vector<int32_t>& tokens,
@@ -263,4 +278,173 @@ TEST_CASE("KVCacheManager: allocate_slots over a hybrid full-attn + mamba model"
 
   mgr->free(req0);
   CHECK(mgr->block_pool.get_num_free_blocks() == free_before);
+}
+
+// ---------------------------------------------------------------------------
+// allocate_slots: the watermark / reserved / lookahead / admission-cap paths.
+//
+// These exercise the upstream allocate_slots branches (kv_cache_manager.py @
+// e24d1b24) that M1.4's preemption drives but which no existing test touches
+// (all above run with watermark == 0). Block math is derived from the pinned
+// source; the pool reserves the null block, so num_blocks=N => N-1 usable free.
+// ---------------------------------------------------------------------------
+
+// (1) NON-ZERO WATERMARK. Upstream: watermark_blocks = int(watermark *
+// num_blocks); it is added to required_blocks ONLY for WAITING/PREEMPTED
+// requests AND only when has_scheduled_reqs is true. num_blocks=11 => 10 usable
+// free; watermark 0.5 => watermark_blocks = int(0.5*11) = 5. A fresh WAITING
+// request needing cdiv(96,16)=6 blocks: required = 6 + 5 = 11 > 10 free -> None,
+// even though the 6 blocks would fit without the watermark.
+TEST_CASE(
+    "KVCacheManager: allocate_slots applies the watermark only to "
+    "WAITING/PREEMPTED with scheduled reqs") {
+  init_none_hash(sha256_cbor);
+  const int block_size = 16;
+  const int num_blocks = 11;    // 10 usable free
+  const double watermark = 0.5;  // watermark_blocks = int(0.5*11) = 5
+
+  // 6 blocks worth of tokens; 6 <= 10 free, but 6 + 5 (watermark) = 11 > 10.
+  const std::vector<int32_t> tokens = Range(0, 6 * block_size);
+
+  {
+    auto mgr = MakeFullManager(block_size, num_blocks, watermark);
+    CHECK(mgr->watermark_blocks == 5);
+    Request req = MakeRequest("w", tokens, block_size);  // status defaults WAITING
+    // has_scheduled_reqs=true (default) + WAITING -> watermark applied -> None.
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/6 * block_size);
+    CHECK(!blocks.has_value());
+    CHECK(mgr->block_pool.get_num_free_blocks() == 10);  // nothing consumed
+  }
+
+  {
+    // Same request, but RUNNING -> watermark NOT applied -> the 6 blocks fit.
+    auto mgr = MakeFullManager(block_size, num_blocks, watermark);
+    Request req = MakeRequest("r", tokens, block_size);
+    req.status = vllm::v1::RequestStatus::kRunning;
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/6 * block_size);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 6);
+    CHECK(mgr->block_pool.get_num_free_blocks() == 10 - 6);
+  }
+
+  {
+    // WAITING but has_scheduled_reqs=false -> watermark NOT applied -> fits.
+    auto mgr = MakeFullManager(block_size, num_blocks, watermark);
+    Request req = MakeRequest("ns", tokens, block_size);
+    auto blocks = mgr->allocate_slots(
+        req, /*num_new_tokens=*/6 * block_size, /*num_new_computed_tokens=*/0,
+        /*new_computed_blocks=*/std::nullopt, /*num_lookahead_tokens=*/0,
+        /*num_external_computed_tokens=*/0, /*delay_cache_blocks=*/false,
+        /*num_encoder_tokens=*/0, /*full_sequence_must_fit=*/false,
+        /*reserved_blocks=*/0, /*has_scheduled_reqs=*/false);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 6);
+  }
+}
+
+// (2) reserved_blocks. Upstream: available_blocks = free - reserved_blocks;
+// required_blocks (= num_blocks_to_allocate, watermark 0 here) must be <=
+// available. A 6-block request fits against 10 free but not against
+// (10 - reserved=5) = 5.
+TEST_CASE("KVCacheManager: allocate_slots honors reserved_blocks") {
+  init_none_hash(sha256_cbor);
+  const int block_size = 16;
+  const std::vector<int32_t> tokens = Range(0, 6 * block_size);  // 6 blocks
+
+  {  // reserved_blocks=0 -> available 10 -> 6 fits.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/11);
+    Request req = MakeRequest("res0", tokens, block_size);
+    auto blocks = mgr->allocate_slots(
+        req, /*num_new_tokens=*/6 * block_size, 0, std::nullopt, 0, 0, false, 0,
+        false, /*reserved_blocks=*/0);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 6);
+  }
+
+  {  // reserved_blocks=5 -> available 10-5=5 -> 6 > 5 -> None.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/11);
+    Request req = MakeRequest("res5", tokens, block_size);
+    auto blocks = mgr->allocate_slots(
+        req, /*num_new_tokens=*/6 * block_size, 0, std::nullopt, 0, 0, false, 0,
+        false, /*reserved_blocks=*/5);
+    CHECK(!blocks.has_value());
+    CHECK(mgr->block_pool.get_num_free_blocks() == 10);  // nothing consumed
+  }
+}
+
+// (3) num_lookahead_tokens. Upstream: num_tokens_need_slot =
+// min(num_tokens_main_model + num_lookahead_tokens, max_model_len). A 1-block
+// (16-token) request with a 16-token lookahead needs slots for 32 tokens => 2
+// blocks; without lookahead it is 1 block. A huge lookahead is clamped to
+// max_model_len.
+TEST_CASE("KVCacheManager: allocate_slots allocates for num_lookahead_tokens") {
+  init_none_hash(sha256_cbor);
+  const int block_size = 16;
+  const std::vector<int32_t> tokens = Range(0, block_size);  // 1 block
+
+  {  // lookahead=0 -> 1 block.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/11);
+    Request req = MakeRequest("la0", tokens, block_size);
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/block_size);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 1);
+    CHECK(mgr->block_pool.get_num_free_blocks() == 10 - 1);
+  }
+
+  {  // lookahead=16 -> need_slot=32 -> 2 blocks.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/11);
+    Request req = MakeRequest("la16", tokens, block_size);
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/block_size,
+                                      /*num_new_computed_tokens=*/0,
+                                      /*new_computed_blocks=*/std::nullopt,
+                                      /*num_lookahead_tokens=*/block_size);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 2);
+    CHECK(mgr->block_pool.get_num_free_blocks() == 10 - 2);
+  }
+
+  {  // Huge lookahead clamps to max_model_len=32 -> need_slot=32 -> 2 blocks.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/11, /*watermark=*/0.0,
+                               /*max_model_len=*/32);
+    Request req = MakeRequest("laclamp", tokens, block_size);
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/block_size,
+                                      /*num_new_computed_tokens=*/0,
+                                      /*new_computed_blocks=*/std::nullopt,
+                                      /*num_lookahead_tokens=*/1000);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 2);  // clamped, not 1000/16+1 blocks
+  }
+}
+
+// (4) full_sequence_must_fit admission cap. Upstream: when true, allocate_slots
+// first checks the FULL sequence (min(request.num_tokens, max_model_len)) and
+// returns None up front if it cannot fit, regardless of the incremental
+// num_new_tokens. A 10-block request into a 4-usable-block pool is rejected even
+// when only the first 1-block chunk is being scheduled; without the gate that
+// first chunk would be admitted.
+TEST_CASE(
+    "KVCacheManager: allocate_slots full_sequence_must_fit rejects an "
+    "over-large sequence up front") {
+  init_none_hash(sha256_cbor);
+  const int block_size = 16;
+  const std::vector<int32_t> full = Range(0, 10 * block_size);  // 10 blocks
+
+  {  // 4 usable free; full sequence needs 10 -> rejected before allocating.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/5);  // 4 free
+    Request req = MakeRequest("cap", full, block_size);
+    auto blocks = mgr->allocate_slots(
+        req, /*num_new_tokens=*/block_size,  // only the first 1-block chunk
+        0, std::nullopt, 0, 0, false, 0,
+        /*full_sequence_must_fit=*/true);
+    CHECK(!blocks.has_value());
+    CHECK(mgr->block_pool.get_num_free_blocks() == 4);  // nothing consumed
+  }
+
+  {  // Without the admission cap, the first 1-block chunk is admitted.
+    auto mgr = MakeFullManager(block_size, /*num_blocks=*/5);
+    Request req = MakeRequest("nocap", full, block_size);
+    auto blocks = mgr->allocate_slots(req, /*num_new_tokens=*/block_size);
+    REQUIRE(blocks.has_value());
+    CHECK(blocks->blocks[0].size() == 1);
+  }
 }

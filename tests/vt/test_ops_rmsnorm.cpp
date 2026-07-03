@@ -1,3 +1,4 @@
+// vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include <doctest/doctest.h>
 
 #include <cstdint>

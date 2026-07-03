@@ -10,6 +10,8 @@ enum class OpId : uint8_t { kMatmul, kRmsNorm, kSiluAndMul, kRopeNeox, kEmbeddin
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
 
+// Contract: out must not alias any input tensor (RopeNeox is in-place by design).
+
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32,
 // f32 accumulation, all contiguous, same device.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
@@ -29,6 +31,7 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D].
+// Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
 
 // out[T,H] = table[ids[t], :]; ids i32/i64, bounds-checked.

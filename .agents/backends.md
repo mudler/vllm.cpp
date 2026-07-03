@@ -35,6 +35,7 @@ lives entirely below them.
 - Quantized-weight layout is backend-negotiated: NVFP4 W4A4 is
   NVIDIA-specific; Metal/Vulkan/XPU lean on GGUF quant kernels (k-quants,
   and their own fp4/int4 paths where hardware supports it).
+- Known M0.6 decisions deferred: backend registry is per-DeviceType (multi-GPU needs per-Device or Alloc(Device,...)); kernel fn-type aliases move to ops.h at second-backend registration; op validation currently pins out=f32 (widen for bf16 CUDA outputs).
 
 ## Per-platform status & strategy
 

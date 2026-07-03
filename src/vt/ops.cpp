@@ -17,10 +17,13 @@ bool IsFloat(DType d) { return d == DType::kF32 || d == DType::kF16 || d == DTyp
 }  // namespace
 
 void RegisterOp(OpId op, DeviceType device, void* fn) {
+  VT_CHECK(static_cast<size_t>(op) < static_cast<size_t>(OpId::kCount), "invalid op id");
+  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
   Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] = fn;
 }
 
 void* GetOp(OpId op, DeviceType device) {
+  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
   void* fn = Table()[static_cast<size_t>(op)][static_cast<size_t>(device)];
   VT_CHECK(fn != nullptr, std::string("no kernel for op ") +
                               std::to_string(static_cast<int>(op)) + " on device type " +

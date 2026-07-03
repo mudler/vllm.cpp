@@ -117,6 +117,10 @@ window uses the pre-roll `col*` registers, so semantics are
 overwrites x's buffer upstream (`out = x`, line 1163) and is cast back
 (line 1239). NULL block id 0 skipped (lines 814-817).
 
+**M0.9 assembly note:** upstream overwrites x's buffer in place (out = x); our
+ops.h contract forbids out aliasing inputs — the assembly must allocate a
+distinct conv output buffer.
+
 ## 4. l2norm_fwd — `kL2Norm`
 
 l2norm.py:88-92 (kernel2 is the default path, `USE_DEFAULT_FLA_NORM=0`,
@@ -189,6 +193,10 @@ and emits contiguous `q [T,Hk,Dk]`, `k [T,Hk,Dk]` (both l2-normalized when
 `apply_l2norm=True`), `v [T,Hv,Dv]` (copied, model dtype), `g [T,Hv] f32`,
 `beta [T,Hv] f32`. `output_g_exp=False` on the Triton/FLA path (g stays in
 log space; True only for FlashInfer).
+
+**Oracle caveat:** pinned fused_post_conv_prep only compiles when
+next_pow2(Dk)==next_pow2(Dv) — use equal-pow2 dims for any M0.9 layer-golden
+dumps (real dims 128/128 are fine).
 
 ## 7. The gated-delta-rule recurrence — `kGdnPrefill` / `kGdnDecode` core math
 
@@ -294,4 +302,5 @@ FLA chunk metadata (`chunk_indices/offsets`) is precomputed on CPU
 - Budget: real-dims cases keep Dk=Dv=128 (dims drive the math) but slice
   heads to Hk=1/Hv=2 (GQA ratio 2 preserved); synthetic-small cases use
   Hk=2/Hv=4 with small dims. States dumped as gathered per-sequence slices,
-  f32. Total ≤ 2MB.
+  f32. Total ≤ 2MB. (1.74 MiB actual data; du reports ~2.3M due to 4K block
+  overhead across 121 files — budget assert lives in dump_gdn.py.)

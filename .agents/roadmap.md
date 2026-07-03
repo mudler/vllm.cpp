@@ -32,8 +32,8 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 - ✅ **M0.6 CUDA baseline ops** (`3750954`): cuBLASLt GEMM, rmsnorm (+Gemma/gated
   variants), rope (partial), silu_and_mul, embedding/lm_head. DoD: op parity
   CUDA vs dumps.
-- ✅ **M0.7 GDN layer (eager)** (`ead59d6`): conv1d, chunked-scan prefill,
-  recurrence decode — correctness-grade CUDA ports of FLA semantics
+- ✅ **M0.7 GDN layer (eager)** (`ead59d6`): conv1d, delta-rule prefill scan
+  (chunked perf kernel M2.3), recurrence decode — correctness-grade CUDA ports of FLA semantics
   (prefill is a sequential recurrence validated against the pinned chunked
   reference; chunked perf kernel lands M2.3). DoD: op parity vs pinned
   upstream dumps, CPU + CUDA.

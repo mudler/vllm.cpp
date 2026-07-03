@@ -76,8 +76,12 @@ vocabulary is ported.**
   EngineCore I/O (EngineCoreRequest/Output(s), ModelRunnerOutput, SamplerOutput),
   RequestOutput/CompletionOutput (FinishReason→string). All reviewed PASS, CI
   green throughout; behavioral CPU unit tests, no goldens (structural port).
-- ☐ **M1.2 BlockPool + prefix caching** (hashing, refcount, eviction) +
-  behavioral tests ported from upstream `tests/v1/core/`.
+- ✅ **M1.2 BlockPool + prefix caching** (`5ee2301`; ports `95be067`
+  KVCacheBlock + intrusive LRU FreeKVCacheBlockQueue, `a0a8622` sha256_cbor
+  block hashing, `5ee2301` BlockPool re-ported to pinned e24d1b24 API +
+  Request block-hashes): hashing, refcount, LRU eviction; behavioral tests
+  ported from upstream `tests/v1/core/`. All reviewed PASS, CI green,
+  ASan-clean. Align/partial-block/events deferred behind 1:1 stubs.
 - ☐ **M1.3 Hybrid KVCacheManager/coordinator** (full-attn group + GDN state
   group) + specs + allocate_slots/get_computed_blocks tests.
 - ☐ **M1.4 Scheduler** (unified token-budget, chunked prefill, preemption,

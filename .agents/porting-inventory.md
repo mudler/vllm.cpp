@@ -67,9 +67,9 @@ what vLLM has vs what we have:
 
 | Item | Upstream | Tier |
 |---|---|---|
-| BlockPool: free list, ref counts, LRU eviction, `BlockHash→block` map | `v1/core/block_pool.py` | T0 |
+| ✅ `5ee2301` BlockPool: free list, ref counts, LRU eviction, `BlockHash→block` map | `v1/core/block_pool.py` | T0 |
 | KVCacheManager: `allocate_slots`, `get_computed_blocks`, `free` | `v1/core/kv_cache_manager.py` | T0 |
-| Prefix caching (parent-chained block hashing; xxhash default + sha256) | `v1/core/kv_cache_utils.py`, `config/cache.py` | T0 |
+| ✅ `5ee2301` Prefix caching (parent-chained block hashing; sha256_cbor byte-exact vs upstream — default deviates to sha256_cbor since upstream sha256/pickle default isn't cross-language reproducible; align path hash_block_size≠block_size + cache_partial_block deferred behind 1:1 stubs) | `v1/core/kv_cache_utils.py`, `config/cache.py` | T0 |
 | **Hybrid KV coordinator + per-group managers** (full-attn group + GDN/mamba state group — the gate models are hybrid) | `v1/core/kv_cache_coordinator.py`, `single_type_kv_cache_manager.py` | **T0** |
 | Specs: `FullAttentionSpec`, `MambaSpec` (GDN state), `KVCacheGroupSpec`, `KVCacheConfig` | `v1/kv_cache_interface.py` | T0 |
 | Mamba/GDN prefix-cache retention (`mamba_cache_mode` align, PR #45845) | `v1/core/` | T1 |

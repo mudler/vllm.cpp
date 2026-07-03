@@ -221,3 +221,30 @@
   None/[]) until prompt-embeds arrive. NEXT: **M1.2 BlockPool + prefix caching**
   (the KV-cache foundation — hashing, refcount, LRU eviction; behavioral tests
   ported from upstream `tests/v1/core/`).
+- **2026-07-03 (later)** — **M1.2 done** (`5ee2301`; ports `95be067`
+  KVCacheBlock + intrusive LRU FreeKVCacheBlockQueue, `a0a8622` sha256_cbor
+  block hashing, `2bba0ad` BlockPool, all re-ported/finalized at `5ee2301`).
+  **The KV block store — the prefix-caching heart — is ported 1:1 from
+  e24d1b24.** KVCacheBlock + FreeKVCacheBlockQueue (intrusive LRU free list),
+  sha256_cbor block hashing (parent-chained, group-aware, byte-exact vs
+  upstream cbor2+hashlib on a 2000-hash fuzz), BlockPool (get_new_blocks/
+  cache_full_blocks/get_cached_block/touch/free_blocks LRU-split/evict/
+  reset_prefix_cache) + Request.block_hashes/update_block_hashes. All reviewed
+  PASS, CI green, ASan-clean; behavioral CPU tests ported from upstream
+  tests/v1/core/{test_prefix_caching,test_kv_cache_utils}.py. **IMPORTANT
+  LESSON:** verify the PINNED file's CURRENT api — the classic BlockPool port
+  was caught DIVERGING and had to be re-ported to e24d1b24 (which carries the
+  hybrid-relevant `hash_block_size`); always diff the port against the pin's
+  live source, not a remembered/classic shape. **sha256_cbor-default
+  DEVIATION:** we default the block-hash fn to sha256_cbor because upstream's
+  default (sha256 over pickle) is not cross-language reproducible — the
+  config-wiring task (M1.3+) MUST default to sha256_cbor. **DEFERRED behind
+  1:1 stubs:** align path (hash_block_size≠block_size), cache_partial_block,
+  evict_blocks, kv-cache events, BlockHashToBlockMap union, and
+  generate_block_hash_extra_keys (mm/lora extra keys). Close-out asserts:
+  `PendingRunnerOps()` empty (grep-confirmed — M1.2 added no goldens,
+  `tests/parity/test_op_parity.cpp:1035` kPending = {}); CI green (run
+  28679327251 for `5ee2301`). NEXT: **M1.3 KVCacheManager + hybrid
+  coordinator** — the gate models need a GDN-state group alongside the
+  full-attn block group; assert the literal manager-level test_evict order
+  `[6,10,5,4,3,2,1]`.

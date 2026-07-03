@@ -47,6 +47,7 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
+  src/vllm/config/scheduler.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
@@ -66,6 +67,7 @@ add_library(vllm STATIC
   src/vllm/v1/core/single_type_kv_cache_manager.cpp
   src/vllm/v1/core/kv_cache_coordinator.cpp
   src/vllm/v1/core/kv_cache_manager.cpp
+  src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp

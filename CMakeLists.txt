@@ -61,6 +61,7 @@ add_library(vllm STATIC
   src/vllm/tokenizer/tokenizer.cpp
   src/vllm/v1/request.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
+  src/vllm/v1/core/block_pool.cpp
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vt/dtype.cpp

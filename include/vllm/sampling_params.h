@@ -13,7 +13,7 @@
 //   - thinking_token_budget, repetition_detection (RepetitionDetectionParams),
 //     routed_experts_prompt_start, skip_reading_prefix_cache
 //   - skip_clone / clone(), for_sampler_warmup()
-//   - internal post-init state: output_text_buffer_length, _eos_token_id,
+//   - internal post-init state: output_text_buffer_length,
 //     _all_stop_token_ids (the detokenizer computes its own stop buffer len)
 //   - engine-time helpers: from_optional(), update_from_generation_config(),
 //     update_from_tokenizer(), verify(model_config, ...) and its
@@ -109,6 +109,13 @@ struct SamplingParams {
   bool include_stop_str_in_output = false;
   // How much output each RequestOutput carries.
   RequestOutputKind output_kind = RequestOutputKind::kCumulative;
+
+  // The model's EOS token id. Upstream: `_eos_token_id` — a non-init field set
+  // engine-side by update_from_generation_config, exposed via the read-only
+  // `eos_token_id` property (which is what check_stop reads). It is NOT a
+  // user-facing sampling knob: the engine populates it before the params reach
+  // the scheduler, and Verify() must not validate it (upstream doesn't).
+  std::optional<int32_t> eos_token_id;
 
   // sampling_type (cached_property): greedy when temperature < _SAMPLING_EPS,
   // random_seed when a seed is set, else random.

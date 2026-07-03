@@ -85,8 +85,10 @@ TEST_CASE("RequestStatus::GetFinishedReason mirrors _FINISHED_REASON_MAP") {
 namespace {
 Request MakeRequest(std::vector<int32_t> prompt) {
   vllm::SamplingParams params;
+  // The model's EOS token id rides on sampling_params (upstream
+  // SamplingParams._eos_token_id), engine-populated before construction.
+  params.eos_token_id = 2;
   return Request("req-0", std::move(prompt), params,
-                 /*eos_token_id=*/std::optional<int32_t>{2},
                  /*arrival_time=*/123.0);
 }
 }  // namespace
@@ -99,8 +101,9 @@ TEST_CASE("Request construction sets defaults and prompt count") {
   CHECK(req.output_token_ids.empty());
   CHECK(req.num_computed_tokens == 0);
   CHECK(req.status == RequestStatus::kWaiting);
-  REQUIRE(req.eos_token_id.has_value());
-  CHECK(*req.eos_token_id == 2);
+  // EOS lives on sampling_params, not on Request (upstream fidelity).
+  REQUIRE(req.sampling_params.eos_token_id.has_value());
+  CHECK(*req.sampling_params.eos_token_id == 2);
   CHECK(req.arrival_time == doctest::Approx(123.0));
   CHECK_FALSE(req.IsFinished());
 }

@@ -36,6 +36,22 @@ TEST_CASE("SamplingParams defaults match upstream") {
   CHECK(p.output_kind == RequestOutputKind::kCumulative);
 }
 
+TEST_CASE("eos_token_id lives on SamplingParams (upstream _eos_token_id)") {
+  // Engine-populated field mirroring SamplingParams._eos_token_id (exposed
+  // upstream via the eos_token_id property that check_stop reads).
+  SamplingParams p;
+  // Defaults to unset (upstream default None).
+  CHECK_FALSE(p.eos_token_id.has_value());
+  // Settable by the engine.
+  p.eos_token_id = 2;
+  REQUIRE(p.eos_token_id.has_value());
+  CHECK(*p.eos_token_id == 2);
+  // Verify()/PostInit() ignore it (upstream does not validate _eos_token_id).
+  CHECK_NOTHROW(p.Verify());
+  CHECK_NOTHROW(p.PostInit());
+  CHECK(*p.eos_token_id == 2);
+}
+
 TEST_CASE("enum int values are load-bearing and match upstream") {
   CHECK(static_cast<int>(SamplingType::kGreedy) == 0);
   CHECK(static_cast<int>(SamplingType::kRandom) == 1);

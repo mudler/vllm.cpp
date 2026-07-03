@@ -50,14 +50,12 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status) {
 
 Request::Request(std::string request_id,
                  std::vector<int32_t> prompt_token_ids,
-                 SamplingParams sampling_params,
-                 std::optional<int32_t> eos_token_id, double arrival_time)
+                 SamplingParams sampling_params, double arrival_time)
     : request_id(std::move(request_id)),
       prompt_token_ids(std::move(prompt_token_ids)),
       sampling_params(std::move(sampling_params)),
       num_computed_tokens(0),
       status(RequestStatus::kWaiting),
-      eos_token_id(eos_token_id),
       arrival_time(arrival_time),
       num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())) {}
 

@@ -29,13 +29,14 @@
 //     T0 path).
 //
 // DEVIATIONS, recorded:
-//   - eos_token_id (optional) is carried on Request here; upstream Request does
-//     NOT store it (it rides on EngineCoreRequest and is threaded to the stop
-//     checker separately). Task 3's EngineCoreRequest factory supplies it and
-//     the M1.x stop check needs it, so it lives on Request in this port.
-//   - Direct constructor (id, prompt_ids, sampling_params, eos_token_id,
-//     arrival_time). Upstream builds via Request.from_engine_core_request;
-//     Task 3 adds the EngineCoreRequest factory once that type lands.
+//   - The model's EOS token id is NOT stored on Request (upstream Request does
+//     not store it either). It lives on SamplingParams::eos_token_id (upstream
+//     SamplingParams._eos_token_id, engine-populated), and the M1.x stop check
+//     reads request.sampling_params.eos_token_id exactly as upstream check_stop
+//     (vllm/v1/core/sched/utils.py) does.
+//   - Direct constructor (id, prompt_ids, sampling_params, arrival_time).
+//     Upstream builds via Request.from_engine_core_request; Task 3 adds the
+//     EngineCoreRequest factory once that type lands.
 //   - sampling_params is stored by value (already PostInit'd / validated by the
 //     frontend, exactly as upstream Request just stores already-validated
 //     params — construction here does NOT re-validate).
@@ -101,19 +102,19 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status);
 // scheduler / model runner mutate this in place exactly as upstream does.
 struct Request {
   Request(std::string request_id, std::vector<int32_t> prompt_token_ids,
-          SamplingParams sampling_params,
-          std::optional<int32_t> eos_token_id, double arrival_time);
+          SamplingParams sampling_params, double arrival_time);
 
   std::string request_id;
   std::vector<int32_t> prompt_token_ids;
   // Already PostInit'd / validated by the frontend (upstream stores the
-  // already-validated params; construction here does not re-validate).
+  // already-validated params; construction here does not re-validate). The
+  // model's EOS token id (for the stop check) rides on sampling_params, as
+  // sampling_params.eos_token_id — read it there, matching upstream check_stop.
   SamplingParams sampling_params;
   // Appended to during decode via AppendOutputToken.
   std::vector<int32_t> output_token_ids;
   int num_computed_tokens = 0;
   RequestStatus status = RequestStatus::kWaiting;
-  std::optional<int32_t> eos_token_id;
   double arrival_time = 0.0;
   // Set at construction from prompt_token_ids.size() (upstream:
   // length_from_prompt_token_ids_or_embeds).

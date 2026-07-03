@@ -1,7 +1,6 @@
 // vllm.cpp original (container reader); no upstream mirror.
 #include "vllm/transformers_utils/hf_config.h"
 
-#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -80,7 +79,11 @@ HfConfig LoadHfConfig(const std::string& path) {
     int64_t derived_head_dim =
         cfg.num_attention_heads > 0 ? cfg.hidden_size / cfg.num_attention_heads
                                     : 0;
-    cfg.head_dim = GetInt(doc, "head_dim", derived_head_dim);
+    // Upstream only honors an explicit head_dim when it is > 0
+    // (model_arch_config_convertor.py:61-75); absent or non-positive falls
+    // back to hidden_size / num_attention_heads.
+    cfg.head_dim = GetInt(doc, "head_dim", 0);
+    if (cfg.head_dim <= 0) cfg.head_dim = derived_head_dim;
     cfg.layer_types = GetStringArray(doc, "layer_types");
     cfg.intermediate_size = GetInt(doc, "intermediate_size", 0);
 
@@ -97,14 +100,20 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.linear_conv_kernel_dim = GetInt(doc, "linear_conv_kernel_dim", 0);
 
     cfg.rope_theta = GetDouble(doc, "rope_theta", 10000.0);
-    // Partial rotary (e.g. Qwen3-Next uses 0.25); absent -> full rotary.
-    auto prf = doc.find("partial_rotary_factor");
-    if (prf != doc.end() && !prf->is_null()) {
-      cfg.rotary_dim = static_cast<int64_t>(
-          std::llround(prf->get<double>() * static_cast<double>(cfg.head_dim)));
-    } else {
-      cfg.rotary_dim = cfg.head_dim;
+    // Partial rotary factor. When the key is absent, upstream Qwen-family
+    // config classes default it to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92);
+    // all other models default to full rotary (1.0).
+    double default_partial_rotary_factor = 1.0;
+    if (cfg.model_type == "qwen3_next" || cfg.model_type == "qwen3_5" ||
+        cfg.model_type == "qwen3_5_moe") {
+      default_partial_rotary_factor = 0.25;
     }
+    const double partial_rotary_factor = GetDouble(
+        doc, "partial_rotary_factor", default_partial_rotary_factor);
+    // Upstream truncates: int(head_dim * partial_rotary_factor)
+    // (rotary_embedding/__init__.py:72).
+    cfg.rotary_dim = static_cast<int64_t>(partial_rotary_factor *
+                                          static_cast<double>(cfg.head_dim));
 
     cfg.rms_norm_eps = GetDouble(doc, "rms_norm_eps", 0.0);
     cfg.max_position_embeddings = GetInt(doc, "max_position_embeddings", 0);

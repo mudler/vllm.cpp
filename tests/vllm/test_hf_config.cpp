@@ -150,6 +150,48 @@ TEST_CASE("LoadHfConfig parses a minimal llama-like config with defaults") {
   CHECK(cfg.torch_dtype == "float16");
 }
 
+TEST_CASE("LoadHfConfig applies upstream rotary and head_dim defaults") {
+  SUBCASE("qwen family without partial_rotary_factor defaults to 0.25") {
+    // Upstream Qwen config classes default partial_rotary_factor to 0.25
+    // (qwen3_next.py:240, qwen3_5_moe.py:92).
+    TempJson f(R"({
+      "model_type": "qwen3_5_moe",
+      "hidden_size": 2048,
+      "num_hidden_layers": 4,
+      "num_attention_heads": 16,
+      "head_dim": 256
+    })");
+    vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.head_dim == 256);
+    CHECK(cfg.rotary_dim == 64);  // head_dim / 4
+  }
+  SUBCASE("non-qwen model without partial_rotary_factor uses full rotary") {
+    TempJson f(R"({
+      "model_type": "llama",
+      "hidden_size": 4096,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 32
+    })");
+    vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.head_dim == 128);
+    CHECK(cfg.rotary_dim == 128);
+  }
+  SUBCASE("explicit head_dim of 0 falls back to derived value") {
+    // Upstream honors explicit head_dim only when > 0
+    // (model_arch_config_convertor.py:61-75).
+    TempJson f(R"({
+      "model_type": "llama",
+      "hidden_size": 4096,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 32,
+      "head_dim": 0
+    })");
+    vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.head_dim == 128);   // hidden_size / num_attention_heads
+    CHECK(cfg.rotary_dim == 128);
+  }
+}
+
 TEST_CASE("LoadHfConfig throws when required fields are missing") {
   SUBCASE("missing model_type") {
     TempJson f(R"({"hidden_size": 64, "num_hidden_layers": 2})");

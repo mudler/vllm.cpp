@@ -468,6 +468,7 @@ def dump_router_topk(ops, root, dev):
         for r in range(T):
             assert torch.unique(lf[r]).numel() == E, \
                 f"{name}: duplicate logits in row {r} (tie-break ambiguity)"
+        tie_clause = "logits unique per row" if tie_free else "random logits"
         w, ids = _run_router(ops, logits, k, renorm)
         total += save_case(
             root, name, "moe_router_topk",
@@ -481,7 +482,7 @@ def dump_router_topk(ops, root, dev):
                      "renormalize divides the k selected probs by their sum "
                      "(denom guard: sum>0 else 1, .cu:245-253). Tie-break = "
                      "lowest expert index (.cu:530-537) — not exercised "
-                     "here (logits unique per row), unit-tested in Task 2. "
+                     "here (" + tie_clause + "), unit-tested in Task 2. "
                      "Cross-checked at dump time against pinned "
                      "cpu_fused_moe.select_experts." + note_extra},
             ["logits"], ["topk_weights", "topk_ids"], tol)

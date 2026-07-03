@@ -219,6 +219,108 @@ int InputBatch::add_request(const CachedRequestState& request) {
   return req_index;
 }
 
+SamplingMetadata InputBatch::make_sampling_metadata() const {
+  // Port of gpu_input_batch.py::_make_sampling_metadata (@ e24d1b24). Fills the
+  // dense [0, num_reqs) prefix, matching upstream's field-fill order + the
+  // "skip the copy when not needed" None/[]-defaults.
+  const int n = num_reqs();
+  const size_t nn = static_cast<size_t>(n);
+  SamplingMetadata md;
+
+  md.all_greedy = all_greedy();
+  md.all_random = all_random();
+  md.no_penalties = no_penalties();
+
+  // temperature: None when all_greedy, else the [:num_reqs] slice
+  // (gpu_input_batch.py:834-839).
+  if (!md.all_greedy) {
+    md.temperature = std::vector<float>(temperature_cpu.begin(),
+                                        temperature_cpu.begin() + nn);
+  }
+  // top_p / top_k: None when the corresponding predicate is empty
+  // (gpu_input_batch.py:919-920).
+  if (!no_top_p()) {
+    md.top_p =
+        std::vector<float>(top_p_cpu.begin(), top_p_cpu.begin() + nn);
+  }
+  if (!no_top_k()) {
+    md.top_k =
+        std::vector<int32_t>(top_k_cpu.begin(), top_k_cpu.begin() + nn);
+  }
+
+  // Penalties are always sliced [:num_reqs] in the returned metadata
+  // (gpu_input_batch.py:925-927); the device-copy is what upstream gates on
+  // no_penalties, not the slice itself.
+  md.frequency_penalties = std::vector<float>(
+      frequency_penalties_cpu.begin(), frequency_penalties_cpu.begin() + nn);
+  md.presence_penalties = std::vector<float>(
+      presence_penalties_cpu.begin(), presence_penalties_cpu.begin() + nn);
+  md.repetition_penalties = std::vector<float>(
+      repetition_penalties_cpu.begin(), repetition_penalties_cpu.begin() + nn);
+
+  // prompt_token_ids: only when penalties (or a token-id-consuming proc, always
+  // false at T0) need them (gpu_input_batch.py:861-876). Ragged per-req prompt
+  // slice of token_ids_cpu[:, :num_prompt_tokens].
+  const bool needs_prompt_token_ids = !md.no_penalties;
+  if (needs_prompt_token_ids) {
+    std::vector<std::vector<int32_t>> prompts(nn);
+    for (int i = 0; i < n; ++i) {
+      const int np = num_prompt_tokens[static_cast<size_t>(i)];
+      const size_t row =
+          static_cast<size_t>(i) * static_cast<size_t>(max_model_len);
+      prompts[static_cast<size_t>(i)].assign(
+          token_ids_cpu.begin() + static_cast<std::ptrdiff_t>(row),
+          token_ids_cpu.begin() + static_cast<std::ptrdiff_t>(row) + np);
+    }
+    md.prompt_token_ids = std::move(prompts);
+  }
+
+  // output_token_ids: only when a proc needs them (gpu_input_batch.py:884-894).
+  // At T0 that is !no_penalties (bad_words / logitsprocs_need_output_token_ids
+  // are always empty/false). Empty [] otherwise, matching upstream.
+  const bool needs_output_token_ids = !md.no_penalties;
+  if (needs_output_token_ids) {
+    md.output_token_ids.resize(nn);
+    for (int i = 0; i < n; ++i) {
+      const auto& row = req_output_token_ids[static_cast<size_t>(i)];
+      if (row.has_value()) {
+        md.output_token_ids[static_cast<size_t>(i)] = *row;
+      }
+    }
+  }
+
+  // spec_token_ids: pass the dense prefix (always empty lists at T0). Upstream
+  // passes self.spec_token_ids directly (gpu_input_batch.py:929).
+  md.spec_token_ids = std::vector<std::vector<int32_t>>(
+      spec_token_ids.begin(), spec_token_ids.begin() + nn);
+
+  // ─── Fields whose InputBatch-side tracking is NOT yet landed (marked) ──────
+  // Each is a faithful upstream default (empty/None) with its dependency cite;
+  // wiring them requires per-slot state this InputBatch does not yet keep.
+  //
+  //  * generators (gpu_input_batch.py:921, sourced :413-414 from
+  //    request.generator == sampling_params.seed): InputBatch keeps no per-req
+  //    generator/seed slot yet. Left empty; the seeded RNG + this map's
+  //    population is a Task-2 (random_sample) dependency. Type is present so
+  //    Task 2 can fill req_index -> seed.
+  //  * max_num_logprobs (gpu_input_batch.py:922 / :1122, from the num_logprobs
+  //    dict populated by sampling_params.logprobs): no num_logprobs tracking
+  //    here — left None (no logprobs). Logprobs wiring is an M1.8 dependency.
+  //  * allowed_token_ids_mask (gpu_input_batch.py:896-904) + bad_words_token_ids
+  //    (:932): no has_allowed_token_ids / bad_words slot tracking — left
+  //    None / empty. A Task-3 / M1.8 dependency (SamplingParams also defers
+  //    allowed_token_ids / bad_words_token_ids).
+  //  * min_tokens / logit_bias / min_p (the T0 builtins,
+  //    logits_processor/builtin.py): InputBatch keeps no per-slot min_p array /
+  //    min_tokens+stop set / logit_bias map yet — left empty. Populating them
+  //    (min_p is on SamplingParams; logit_bias / all_stop_token_ids are
+  //    deferred on SamplingParams) is a Task-3 dependency.
+  // md.generators / max_num_logprobs / allowed_token_ids_mask /
+  // bad_words_token_ids / min_tokens / logit_bias / min_p keep their defaults.
+
+  return md;
+}
+
 std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   const auto it = req_id_to_index.find(req_id);
   if (it == req_id_to_index.end()) {

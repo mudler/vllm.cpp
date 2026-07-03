@@ -19,8 +19,9 @@
 //     external_req_id, reasoning_ended / reasoning_parser_kwargs,
 //     abort_immediately, and the params property. (eos_token_id is NOT a field
 //     upstream either — it rides on sampling_params.eos_token_id.)
-//   SamplerOutput: logprobs_tensors detail (kept as an opaque optional flag
-//     here — the tensor payload lands with the sampler/logprobs unit).
+//   SamplerOutput: logprobs_tensors now carries the real LogprobsTensors payload
+//     (vllm/v1/outputs.py, ported at M1.7); the sampler's gather_logprobs fills
+//     it. It stays std::optional (None => no logprobs requested this step).
 //   ModelRunnerOutput: logprobs (LogprobsLists), prompt_logprobs_dict,
 //     pooler_output, kv_connector_output / ec_connector_output (P/D KV
 //     transfer), num_nans_in_logits, cudagraph_stats, routed_experts, and the
@@ -53,6 +54,7 @@
 #include <vector>
 
 #include "vllm/sampling_params.h"
+#include "vllm/v1/outputs.h"  // vllm::v1::LogprobsTensors (SamplerOutput payload)
 #include "vllm/v1/request.h"  // vllm::v1::FinishReason (reused, not redefined)
 
 namespace vllm::v1 {
@@ -78,9 +80,9 @@ struct EngineCoreRequest {
 struct SamplerOutput {
   // [num_reqs, max_num_generated_tokens]; T0 non-spec decode is [num_reqs, 1].
   std::vector<std::vector<int32_t>> sampled_token_ids;
-  // logprobs_tensors upstream (LogprobsTensors | None). Payload deferred; the
-  // engaged/disengaged state is preserved so downstream branching still ports.
-  std::optional<bool> logprobs_tensors;
+  // logprobs_tensors upstream (LogprobsTensors | None): the sampler's
+  // gather_logprobs payload, None when no logprobs were requested this step.
+  std::optional<LogprobsTensors> logprobs_tensors;
 };
 
 // ModelRunnerOutput (vllm/v1/outputs.py): the runner -> scheduler result,

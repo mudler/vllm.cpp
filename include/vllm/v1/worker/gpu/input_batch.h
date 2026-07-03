@@ -77,6 +77,7 @@
 
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/sched/output.h"  // NewRequestData (from_new_request)
+#include "vllm/v1/sample/metadata.h"    // SamplingMetadata (make_sampling_metadata)
 #include "vllm/v1/worker/gpu/block_table.h"
 
 namespace vllm::v1 {
@@ -149,6 +150,14 @@ class InputBatch {
 
   // num_reqs (property): len(req_id_to_index).
   int num_reqs() const { return static_cast<int>(req_id_to_index.size()); }
+
+  // make_sampling_metadata: build a SamplingMetadata for the current dense
+  // [0, num_reqs) prefix from the per-slot arrays + predicates. Port of
+  // gpu_input_batch.py::_make_sampling_metadata (M1.5-deferred, landed at M1.7).
+  // Upstream caches this on self.sampling_metadata and rebuilds it whenever the
+  // batch changes (add_request / condense); here it is recomputed on demand (the
+  // caching + refresh_metadata scheduling is the model runner's concern, M1.8).
+  SamplingMetadata make_sampling_metadata() const;
 
   // Sampling predicates the M1.7 sampler keys on (upstream properties).
   bool all_greedy() const { return random_reqs.empty(); }

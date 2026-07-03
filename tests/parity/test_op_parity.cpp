@@ -1,7 +1,10 @@
 // vllm.cpp original (parity harness); no upstream mirror.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -127,6 +130,15 @@ void RequireMatch(const std::string& name, const Tensor& got, const Tensor& want
                   double atol, double rtol) {
   auto err = CompareTensors(got, want, atol, rtol);
   if (err) FAIL(name << *err);
+  // Opt-in margin report (VLLM_PARITY_PRINT_MARGINS=1): max abs diff per tensor,
+  // to judge how much headroom a passing case has under its tolerance.
+  if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr) {
+    double max_abs = 0.0;
+    for (int64_t i = 0; i < got.Numel(); ++i)
+      max_abs = std::max(max_abs, std::abs(static_cast<double>(AsF32(got, i)) - AsF32(want, i)));
+    std::printf("margin %s: max_abs_diff=%.3e (atol=%.0e rtol=%.0e)\n", name.c_str(), max_abs,
+                atol, rtol);
+  }
 }
 
 void RunRmsNorm(const fs::path& dir, const json& m) {
@@ -156,6 +168,74 @@ void RunRmsNorm(const fs::path& dir, const json& m) {
     vt::RmsNorm(q, out, x.tensor, w.tensor, args);
   }
   RequireMatch("out", out, want.tensor, atol, rtol);
+}
+
+void RunMatmul(const fs::path& dir, const json& m) {
+  auto a = LoadTensor(dir, m["tensors"]["a"]);
+  auto b = LoadTensor(dir, m["tensors"]["b"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  const int64_t rows = a.tensor.shape[0], cols = b.tensor.shape[1];
+  std::vector<float> outbuf(static_cast<size_t>(rows * cols));
+  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {rows, cols});
+  Queue q{Cpu(), nullptr};
+  vt::Matmul(q, out, a.tensor, b.tensor);
+  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
+               m["tol"]["rtol"].get<double>());
+}
+
+void RunSiluAndMul(const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  const int64_t t = x.tensor.shape[0], d = x.tensor.shape[1] / 2;
+  std::vector<float> outbuf(static_cast<size_t>(t * d));
+  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {t, d});
+  Queue q{Cpu(), nullptr};
+  vt::SiluAndMul(q, out, x.tensor);
+  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
+               m["tol"]["rtol"].get<double>());
+}
+
+void RunEmbedding(const fs::path& dir, const json& m) {
+  auto table = LoadTensor(dir, m["tensors"]["table"]);
+  auto ids = LoadTensor(dir, m["tensors"]["ids"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  const int64_t t = ids.tensor.shape[0], h = table.tensor.shape[1];
+  std::vector<float> outbuf(static_cast<size_t>(t * h));
+  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {t, h});
+  Queue q{Cpu(), nullptr};
+  vt::Embedding(q, out, table.tensor, ids.tensor);
+  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
+               m["tol"]["rtol"].get<double>());
+}
+
+// The dump stores q/k flattened [T, H*D] (upstream forward_native convention);
+// vt::RopeNeox is in-place on f32 [T,H,D], so copy into shaped buffers first.
+void RunRope(const fs::path& dir, const json& m) {
+  auto q_in = LoadTensor(dir, m["tensors"]["q_in"]);
+  auto k_in = LoadTensor(dir, m["tensors"]["k_in"]);
+  auto pos = LoadTensor(dir, m["tensors"]["positions"]);
+  auto q_want = LoadTensor(dir, m["tensors"]["q_out"]);
+  auto k_want = LoadTensor(dir, m["tensors"]["k_out"]);
+  const int64_t t = q_in.tensor.shape[0];
+  const int64_t hq = m["args"]["num_q_heads"].get<int64_t>();
+  const int64_t hk = m["args"]["num_kv_heads"].get<int64_t>();
+  const int64_t d = m["args"]["head_size"].get<int64_t>();
+  VT_CHECK(q_in.tensor.dtype == DType::kF32 && k_in.tensor.dtype == DType::kF32,
+           "rope runner requires f32 q_in/k_in (in-place copy buffers are f32)");
+  VT_CHECK(q_in.tensor.Numel() == t * hq * d && k_in.tensor.Numel() == t * hk * d,
+           "rope: q_in/k_in element counts do not match args num_heads*head_size");
+  std::vector<float> qbuf(static_cast<size_t>(t * hq * d));
+  std::vector<float> kbuf(static_cast<size_t>(t * hk * d));
+  std::memcpy(qbuf.data(), q_in.raw.data.data(), qbuf.size() * sizeof(float));
+  std::memcpy(kbuf.data(), k_in.raw.data.data(), kbuf.size() * sizeof(float));
+  Tensor qs = Tensor::Contiguous(qbuf.data(), DType::kF32, Cpu(), {t, hq, d});
+  Tensor ks = Tensor::Contiguous(kbuf.data(), DType::kF32, Cpu(), {t, hk, d});
+  vt::RopeArgs args{m["args"]["base"].get<float>(), m["args"]["rotary_dim"].get<int>()};
+  Queue q{Cpu(), nullptr};
+  vt::RopeNeox(q, qs, ks, pos.tensor, args);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  RequireMatch("q_out", qs, q_want.tensor, atol, rtol);
+  RequireMatch("k_out", ks, k_want.tensor, atol, rtol);
 }
 
 }  // namespace
@@ -202,12 +282,22 @@ TEST_CASE("op parity vs upstream goldens") {
     json m = json::parse(std::ifstream(mf));
     std::string op = m["op"];
     INFO("case " << entry.path().filename().string());
+    if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr)
+      std::printf("case %s\n", entry.path().filename().string().c_str());
     if (op == "rmsnorm") {
       RunRmsNorm(entry.path(), m);
+    } else if (op == "matmul") {
+      RunMatmul(entry.path(), m);
+    } else if (op == "silu_and_mul") {
+      RunSiluAndMul(entry.path(), m);
+    } else if (op == "embedding") {
+      RunEmbedding(entry.path(), m);
+    } else if (op == "rope") {
+      RunRope(entry.path(), m);
     } else {
       FAIL("no runner for op '" << op << "' — add one before committing goldens");
     }
     ++cases;
   }
-  CHECK(cases >= 4);
+  CHECK(cases >= 9);
 }

@@ -1,0 +1,45 @@
+{
+ "op": "embedding",
+ "args": {},
+ "tensors": {
+  "table": {
+   "file": "table.npy",
+   "dtype": "bf16",
+   "shape": [
+    64,
+    32
+   ]
+  },
+  "ids": {
+   "file": "ids.npy",
+   "dtype": "i64",
+   "shape": [
+    32
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    32,
+    32
+   ]
+  }
+ },
+ "inputs": [
+  "table",
+  "ids"
+ ],
+ "outputs": [
+  "out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "vllm_version": "0.24.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

@@ -1,0 +1,46 @@
+{
+ "op": "matmul",
+ "args": {},
+ "tensors": {
+  "a": {
+   "file": "a.npy",
+   "dtype": "bf16",
+   "shape": [
+    16,
+    64
+   ]
+  },
+  "b": {
+   "file": "b.npy",
+   "dtype": "bf16",
+   "shape": [
+    64,
+    32
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    16,
+    32
+   ]
+  }
+ },
+ "inputs": [
+  "a",
+  "b"
+ ],
+ "outputs": [
+  "out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "vllm_version": "0.24.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

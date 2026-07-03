@@ -1,0 +1,37 @@
+{
+ "op": "silu_and_mul",
+ "args": {},
+ "tensors": {
+  "x": {
+   "file": "x.npy",
+   "dtype": "bf16",
+   "shape": [
+    8,
+    256
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    8,
+    128
+   ]
+  }
+ },
+ "inputs": [
+  "x"
+ ],
+ "outputs": [
+  "out"
+ ],
+ "tol": {
+  "atol": 0.008,
+  "rtol": 0.008
+ },
+ "oracle": {
+  "vllm_version": "0.24.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

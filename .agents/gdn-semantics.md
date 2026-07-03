@@ -199,6 +199,7 @@ state `S [Dv, Dk]` (fused_recurrent.py:102-175; fused_sigmoid_gating.py:
     S = initial_state (f32; zeros if none)       (lines 103-120)
     for each token t:
         q_t' = l2norm(q_t) if in-kernel norm     (line 127-129)
+        k_t  = l2norm(k_t) if in-kernel norm     (line 129 / fused_sigmoid_gating.py:140 — k is normalized too; review-verified)
         q_t' = q_t' * scale                      (line 130; scale = Dk^-0.5)
         S    = S * exp(g_t[i_hv])                (line 133-134; scalar per v-head)
         v_t' = v_t - S @ k_t                     (line 139; [Dv] = [Dv,Dk]@[Dk])

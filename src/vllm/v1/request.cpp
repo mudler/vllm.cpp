@@ -88,6 +88,15 @@ int Request::NumOutputTokens() const {
   return static_cast<int>(output_token_ids.size());
 }
 
+// all_token_ids: prompt token ids ++ output token ids (upstream _all_token_ids).
+std::vector<int32_t> Request::AllTokenIds() const {
+  std::vector<int32_t> all;
+  all.reserve(prompt_token_ids.size() + output_token_ids.size());
+  all.insert(all.end(), prompt_token_ids.begin(), prompt_token_ids.end());
+  all.insert(all.end(), output_token_ids.begin(), output_token_ids.end());
+  return all;
+}
+
 // append_output_token_ids(int).
 void Request::AppendOutputToken(int32_t token_id) {
   output_token_ids.push_back(token_id);

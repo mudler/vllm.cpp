@@ -139,10 +139,23 @@ struct Request {
   // length_from_prompt_token_ids_or_embeds).
   int num_prompt_tokens = 0;
 
+  // Whether this request is still in its prefill (context) phase, i.e. it has
+  // scheduled tokens it has not yet computed. Written by the scheduler in
+  // _update_after_schedule (num_computed_tokens < num_tokens + placeholders);
+  // read by the DP-throttle / spec-pad paths (deferred at T0) and, from M1.4
+  // Task 4 onward, by update_from_output. Un-deferred here (was in the Request
+  // deferred list) because scheduler._update_after_schedule sets it 1:1.
+  bool is_prefill_chunk = false;
+
   // num_tokens: len(_all_token_ids) == prompt + output (no prompt_embeds in T0).
   int NumTokens() const;
   // num_output_tokens: len(_output_token_ids).
   int NumOutputTokens() const;
+  // all_token_ids: the prompt token ids followed by the output token ids
+  // (upstream _all_token_ids materialized; here concatenated on demand — no
+  // prompt_embeds in T0). Used by scheduler._make_cached_request_data for the
+  // MRV1 all_token_ids connector-propagation payload.
+  std::vector<int32_t> AllTokenIds() const;
 
   // Per-block hashes of this request's full blocks, computed at
   // hash_block_size granularity and chained over the full prefix. Populated by

@@ -381,3 +381,79 @@ theta 1e7). Tensors: `q,gate,k,v` (pre-norm inputs), `positions[T]`,
 `q_norm_weight,k_norm_weight [D]`, `attn` (pre-gate [T,Hq,D]), `out` (gated
 [T,Hq*D]). Runner `RunDenseAttention` composes gemma-RmsNorm → RopeNeox →
 Attention → sigmoid gate and checks both `attn` and `out`.
+
+---
+
+## 6. Task 3 — 35B weight naming + quant scheme (GROUND TRUTH from the real ckpt)
+
+Read 2026-07-03 from `nvidia/Qwen3.6-35B-A3B-NVFP4` snapshot 491c2f1e with our
+`dump_container` CLI on all 3 shards + `hf_quant_config.json`. **This CORRECTS
+the plan/task assumption that "attn qkv/o are bf16 dense": they are NOT — the
+attention AND GDN projections are per-tensor FP8, and lm_head is NVFP4.** The
+`hf_quant_config.json` is `MIXED_PRECISION` with three weight classes.
+
+Prefix: every language tensor is under `model.language_model.*`; `lm_head.*` is
+top-level. `mtp.*` (19 tensors, shard 3) are EXCLUDED (skip). Shards: layers
+0-16 in shard 1, 16-37 in shard 2, 37-39 + `norm` + `lm_head` in shard 3;
+`embed_tokens` in shard 1. All quantized weights are torch Linear layout
+`[out,in]` → **transpose to Matmul-B `[in,out]` at load**.
+
+**(A) BF16 direct (no dequant):**
+| tensor | shape |
+|---|---|
+| `embed_tokens.weight` | [248320, 2048] (NOT transposed; embed lookup) |
+| `norm.weight` (final) | [2048] |
+| `layers.{L}.input_layernorm.weight` / `.post_attention_layernorm.weight` | [2048] |
+| `layers.{L}.linear_attn.conv1d.weight` | [8192,1,4] → view [8192,4], NOT transposed |
+| `layers.{L}.linear_attn.A_log` / `.dt_bias` | [32] (bf16 on disk; upcast→f32 at load, lossless) |
+| `layers.{L}.linear_attn.norm.weight` | [128] (RMSNormGated over Dv) |
+| `layers.{L}.linear_attn.in_proj_b.weight` / `.in_proj_a.weight` | [32, 2048] → T [2048,32] |
+| `layers.{L}.self_attn.q_norm.weight` / `.k_norm.weight` | [256] (full-attn layers) |
+| `layers.{L}.mlp.gate.weight` (router) | [256, 2048] → T [2048,256] |
+| `layers.{L}.mlp.shared_expert_gate.weight` | [1, 2048] → T [2048,1] |
+
+**(B) FP8 per-tensor E4M3** (`weight F8_E4M3 [out,in]` + `weight_scale F32
+scalar` + `input_scale F32 scalar` UNUSED). Dequant: `w_bf16 =
+bf16(f8_to_f32(weight) * weight_scale)` — reuses `F8E4M3ToF32`, NO group scale,
+NO nibble unpack. All transposed to [in,out]:
+| tensor | shape [out,in] |
+|---|---|
+| `layers.{L}.linear_attn.in_proj_qkv.weight` | [8192, 2048] (q 2048 \| k 2048 \| v 4096; key_dim=Hk·Dk=2048, value_dim=Hv·Dv=4096, conv_dim=8192) |
+| `layers.{L}.linear_attn.in_proj_z.weight` | [4096, 2048] (z gate = value_dim) |
+| `layers.{L}.linear_attn.out_proj.weight` | [2048, 4096] |
+| `layers.{L}.self_attn.q_proj.weight` | [8192, 2048] (=2·Hq·Dh, output-gate doubled: 16·256·2) |
+| `layers.{L}.self_attn.k_proj.weight` / `.v_proj.weight` | [512, 2048] (=Hkv·Dh=2·256) |
+| `layers.{L}.self_attn.o_proj.weight` | [2048, 4096] (in=Hq·Dh=4096) |
+
+**(C) NVFP4 W4A16 modelopt, group 16** (`weight U8 [out,in/2]` + `weight_scale
+F8_E4M3 [out,in/16]` + `weight_scale_2 F32 scalar` + `input_scale F32` UNUSED).
+Dequant = `DequantNvfp4ToBf16` (moe-semantics §8). All transposed to [in,out]:
+| tensor | weight U8 shape | in_dim |
+|---|---|---|
+| `layers.{L}.mlp.experts.{0..255}.gate_proj.weight` / `.up_proj.weight` | [512, 1024] | 2048 |
+| `layers.{L}.mlp.experts.{0..255}.down_proj.weight` | [2048, 256] | 512 |
+| `layers.{L}.mlp.shared_expert.{gate,up,down}_proj.weight` | same as experts | |
+| `lm_head.weight` | [248320, 1024] | 2048 → T [2048,248320] |
+
+gate_proj+up_proj of one expert SHARE one `weight_scale_2`; irrelevant to
+per-tensor dequant.
+
+**GDN in_proj fusion decision (§1c):** the loader KEEPS the four GDN input
+projections SEPARATE (`in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a`),
+each dequant+transposed independently. The pinned `in_proj_qkvz`/`in_proj_ba`
+fusion is an upstream SHARDED-loading naming convenience (concat along the
+output dim); at TP=1 applying each projection as its own matmul is numerically
+identical and simpler for owned-memory + the expert-gather loop. Ditto
+`qkv_proj`/`gate_up_proj`: q/k/v and gate/up are kept separate. §1c explicitly
+permits this ("or keep them separate and adapt the GDN op call").
+
+**Real-tensor spot values** (snapshot 491c2f1e, bf16 bit patterns, baked into
+`tests/vllm/test_qwen36_weights.cpp`): NVFP4 `layers.0.experts.0.down_proj`
+dq[0,0]=0x3C7E, dq[5,17]=0x3BCB; FP8 `layers.3.self_attn.q_proj` scale
+7.6294e-4, dq[0,0]=0x3C0A (f8 0x53), dq[1,5]=0x3CE1 (f8 0x61); router
+`layers.0.mlp.gate` [256,2048] dq[0,0]=0x3BB3.
+
+**Memory model:** the loader materializes every weight into OWNED host bf16
+buffers (A_log/dt_bias as f32) in Matmul-B layout, so the mmap'd
+`SafetensorsFile`s can be released after load. Full 35B bf16 ≈ 70 GB host — fine
+on GB10 unified for M0.9 single-seq correctness; device placement is M1.

@@ -75,4 +75,14 @@ void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
   }
 }
 
+void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
+                      int64_t numel, uint16_t* out_bf16) {
+  VT_CHECK(weight_f8 != nullptr, "fp8 dequant: weight is null");
+  VT_CHECK(out_bf16 != nullptr, "fp8 dequant: output buffer is null");
+  VT_CHECK(numel >= 0, "fp8 dequant: negative numel");
+  for (int64_t i = 0; i < numel; ++i) {
+    out_bf16[i] = vt::F32ToBF16(F8E4M3ToF32(weight_f8[i]) * weight_scale);
+  }
+}
+
 }  // namespace vllm

@@ -60,4 +60,20 @@ void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
                         float weight_scale_2, int64_t out_dim, int64_t in_dim,
                         uint16_t* out_bf16);
 
+// Dequantize a modelopt per-tensor FP8 (W8A16) weight to bf16. The 35B gate
+// checkpoint stores its attention/GDN projections this way (hf_quant_config
+// quant_algo "FP8"): a full E4M3 byte per element plus ONE f32 per-tensor
+// weight_scale (multiplied, not reciprocated); the sibling input_scale is a
+// W8A8 activation-scale placeholder and is UNUSED for the weight-only path.
+//
+//   weight_f8   [numel]  IEEE fp8-e4m3fn bytes (torch Linear layout [out,in])
+//   scale       per-tensor f32 (applied directly)
+//   out_bf16    [numel]  bf16 bit patterns (caller-owned, same numel)
+//
+//   out[i] = bf16( f8_e4m3(weight_f8[i]) * scale )   // f32 mul, RNE
+//
+// No unpacking, no group scale — distinct from the NVFP4 path above.
+void DequantFp8ToBf16(const uint8_t* weight_f8, float weight_scale,
+                      int64_t numel, uint16_t* out_bf16);
+
 }  // namespace vllm

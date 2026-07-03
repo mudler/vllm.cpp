@@ -15,10 +15,12 @@
 #include <vector>
 
 #include "npy.h"
+#include "vt/backend.h"
 #include "vt/ops.h"
 
 namespace fs = std::filesystem;
 using nlohmann::json;
+using vt::Backend;
 using vt::DType;
 using vt::Device;
 using vt::DeviceType;
@@ -32,7 +34,7 @@ Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 struct Loaded {
   parity::NpyArray raw;
   DType dtype;
-  Tensor tensor;  // views raw.data
+  Tensor tensor;  // views raw.data (host memory)
 };
 
 DType DtypeFromName(const std::string& n) {
@@ -42,6 +44,21 @@ DType DtypeFromName(const std::string& n) {
   if (n == "i32") return DType::kI32;
   if (n == "i64") return DType::kI64;
   throw std::runtime_error("unknown dtype " + n);
+}
+
+Tensor MakeTensor(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t acc = 1;
+  for (int d = t.rank - 1; d >= 0; --d) {
+    t.shape[d] = shape[static_cast<size_t>(d)];
+    t.stride[d] = acc;
+    acc *= t.shape[d];
+  }
+  return t;
 }
 
 Loaded LoadTensor(const fs::path& dir, const json& spec) {
@@ -75,18 +92,7 @@ Loaded LoadTensor(const fs::path& dir, const json& spec) {
         "' (" + std::to_string(npy_esize) + " bytes) vs manifest dtype '" +
         spec["dtype"].get<std::string>() + "' (" +
         std::to_string(vt::SizeOf(l.dtype)) + " bytes)");
-  Tensor t;
-  t.data = l.raw.data.data();
-  t.dtype = l.dtype;
-  t.device = Cpu();
-  t.rank = static_cast<int>(shape.size());
-  int64_t acc = 1;
-  for (int d = t.rank - 1; d >= 0; --d) {
-    t.shape[d] = shape[static_cast<size_t>(d)];
-    t.stride[d] = acc;
-    acc *= t.shape[d];
-  }
-  l.tensor = t;
+  l.tensor = MakeTensor(l.raw.data.data(), l.dtype, Cpu(), shape);
   return l;
 }
 
@@ -142,76 +148,119 @@ void RequireMatch(const std::string& name, const Tensor& got, const Tensor& want
   }
 }
 
-void RunRmsNorm(const fs::path& dir, const json& m) {
+// Buffer allocated on the pass's device through its Backend, viewed as a
+// Tensor. On the CPU pass the backend is the CPU backend (Alloc/Copy are
+// plain malloc/memcpy), so both passes run the exact same runner code; the
+// CUDA pass gets real h2d/d2h transfers on the queue's stream. Downloads
+// synchronize the queue before returning so the host buffer is readable.
+class DeviceBuf {
+ public:
+  DeviceBuf(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+            const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (int64_t s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeTensor(p_, dt, q.device, shape);
+  }
+  ~DeviceBuf() { b_.Free(p_); }
+  DeviceBuf(const DeviceBuf&) = delete;
+  DeviceBuf& operator=(const DeviceBuf&) = delete;
+  Tensor& tensor() { return t_; }
+  // Downloads into a host tensor of the same dtype/shape (backed by `store`).
+  Tensor Download(Queue& q, std::vector<uint8_t>& store) {
+    store.resize(bytes_);
+    b_.Copy(q, store.data(), p_, bytes_);
+    b_.Synchronize(q);
+    Tensor host = t_;
+    host.data = store.data();
+    host.device = Cpu();
+    return host;
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+std::vector<int64_t> ShapeOf(const Tensor& t) {
+  return std::vector<int64_t>(t.shape, t.shape + t.rank);
+}
+
+void RunRmsNorm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto x = LoadTensor(dir, m["tensors"]["x"]);
   auto w = LoadTensor(dir, m["tensors"]["weight"]);
   auto want = LoadTensor(dir, m["tensors"]["out"]);
-  std::vector<float> outbuf(static_cast<size_t>(x.tensor.Numel()));
-  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(),
-                                  {x.tensor.shape[0], x.tensor.shape[1]});
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dw(b, q, w.dtype, ShapeOf(w.tensor), w.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
   vt::RmsNormArgs args{m["args"]["eps"].get<float>(), m["args"]["gemma"].get<bool>()};
-  Queue q{Cpu(), nullptr};
   double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
   if (m["args"]["fused_residual"].get<bool>()) {
     auto res = LoadTensor(dir, m["tensors"]["residual_in"]);
     auto res_want = LoadTensor(dir, m["tensors"]["residual_out"]);
-    VT_CHECK(m["tensors"]["residual_in"]["dtype"].get<std::string>() == "f32",
-             "fused-residual runner requires f32 residual_in");
-    std::vector<float> resbuf(outbuf.size());
-    VT_CHECK(res.raw.data.size() == resbuf.size() * sizeof(float),
-             "residual_in byte size does not match the mutable copy buffer");
-    std::memcpy(resbuf.data(), res.raw.data.data(), res.raw.data.size());
-    Tensor rest = Tensor::Contiguous(resbuf.data(), DType::kF32, Cpu(),
-                                     {x.tensor.shape[0], x.tensor.shape[1]});
-    vt::RmsNorm(q, out, x.tensor, w.tensor, args, &rest);
-    RequireMatch("residual", rest, res_want.tensor, atol, rtol);
+    VT_CHECK(res.dtype == DType::kF32, "fused-residual runner requires f32 residual_in");
+    // The op mutates the residual stream in place; run on a device copy and
+    // copy it back for comparison.
+    DeviceBuf dres(b, q, DType::kF32, ShapeOf(res.tensor), res.raw.data.data());
+    vt::RmsNorm(q, dout.tensor(), dx.tensor(), dw.tensor(), args, &dres.tensor());
+    std::vector<uint8_t> res_host;
+    RequireMatch("residual", dres.Download(q, res_host), res_want.tensor, atol, rtol);
   } else {
-    vt::RmsNorm(q, out, x.tensor, w.tensor, args);
+    vt::RmsNorm(q, dout.tensor(), dx.tensor(), dw.tensor(), args);
   }
-  RequireMatch("out", out, want.tensor, atol, rtol);
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor, atol, rtol);
 }
 
-void RunMatmul(const fs::path& dir, const json& m) {
+void RunMatmul(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto a = LoadTensor(dir, m["tensors"]["a"]);
-  auto b = LoadTensor(dir, m["tensors"]["b"]);
+  auto bt = LoadTensor(dir, m["tensors"]["b"]);
   auto want = LoadTensor(dir, m["tensors"]["out"]);
-  const int64_t rows = a.tensor.shape[0], cols = b.tensor.shape[1];
-  std::vector<float> outbuf(static_cast<size_t>(rows * cols));
-  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {rows, cols});
-  Queue q{Cpu(), nullptr};
-  vt::Matmul(q, out, a.tensor, b.tensor);
-  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
-               m["tol"]["rtol"].get<double>());
+  const int64_t rows = a.tensor.shape[0], cols = bt.tensor.shape[1];
+  DeviceBuf da(b, q, a.dtype, ShapeOf(a.tensor), a.raw.data.data());
+  DeviceBuf db(b, q, bt.dtype, ShapeOf(bt.tensor), bt.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, {rows, cols});
+  vt::Matmul(q, dout.tensor(), da.tensor(), db.tensor());
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
 }
 
-void RunSiluAndMul(const fs::path& dir, const json& m) {
+void RunSiluAndMul(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto x = LoadTensor(dir, m["tensors"]["x"]);
   auto want = LoadTensor(dir, m["tensors"]["out"]);
   const int64_t t = x.tensor.shape[0], d = x.tensor.shape[1] / 2;
-  std::vector<float> outbuf(static_cast<size_t>(t * d));
-  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {t, d});
-  Queue q{Cpu(), nullptr};
-  vt::SiluAndMul(q, out, x.tensor);
-  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
-               m["tol"]["rtol"].get<double>());
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, {t, d});
+  vt::SiluAndMul(q, dout.tensor(), dx.tensor());
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
 }
 
-void RunEmbedding(const fs::path& dir, const json& m) {
+void RunEmbedding(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto table = LoadTensor(dir, m["tensors"]["table"]);
   auto ids = LoadTensor(dir, m["tensors"]["ids"]);
   auto want = LoadTensor(dir, m["tensors"]["out"]);
   const int64_t t = ids.tensor.shape[0], h = table.tensor.shape[1];
-  std::vector<float> outbuf(static_cast<size_t>(t * h));
-  Tensor out = Tensor::Contiguous(outbuf.data(), DType::kF32, Cpu(), {t, h});
-  Queue q{Cpu(), nullptr};
-  vt::Embedding(q, out, table.tensor, ids.tensor);
-  RequireMatch("out", out, want.tensor, m["tol"]["atol"].get<double>(),
-               m["tol"]["rtol"].get<double>());
+  DeviceBuf dtab(b, q, table.dtype, ShapeOf(table.tensor), table.raw.data.data());
+  DeviceBuf dids(b, q, ids.dtype, ShapeOf(ids.tensor), ids.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, {t, h});
+  vt::Embedding(q, dout.tensor(), dtab.tensor(), dids.tensor());
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
 }
 
 // The dump stores q/k flattened [T, H*D] (upstream forward_native convention);
-// vt::RopeNeox is in-place on f32 [T,H,D], so copy into shaped buffers first.
-void RunRope(const fs::path& dir, const json& m) {
+// vt::RopeNeox is in-place on f32 [T,H,D], so run on shaped device copies of
+// the inputs and copy both back for comparison.
+void RunRope(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto q_in = LoadTensor(dir, m["tensors"]["q_in"]);
   auto k_in = LoadTensor(dir, m["tensors"]["k_in"]);
   auto pos = LoadTensor(dir, m["tensors"]["positions"]);
@@ -221,22 +270,60 @@ void RunRope(const fs::path& dir, const json& m) {
   const int64_t hq = m["args"]["num_q_heads"].get<int64_t>();
   const int64_t hk = m["args"]["num_kv_heads"].get<int64_t>();
   const int64_t d = m["args"]["head_size"].get<int64_t>();
-  VT_CHECK(q_in.tensor.dtype == DType::kF32 && k_in.tensor.dtype == DType::kF32,
+  VT_CHECK(q_in.dtype == DType::kF32 && k_in.dtype == DType::kF32,
            "rope runner requires f32 q_in/k_in (in-place copy buffers are f32)");
   VT_CHECK(q_in.tensor.Numel() == t * hq * d && k_in.tensor.Numel() == t * hk * d,
            "rope: q_in/k_in element counts do not match args num_heads*head_size");
-  std::vector<float> qbuf(static_cast<size_t>(t * hq * d));
-  std::vector<float> kbuf(static_cast<size_t>(t * hk * d));
-  std::memcpy(qbuf.data(), q_in.raw.data.data(), qbuf.size() * sizeof(float));
-  std::memcpy(kbuf.data(), k_in.raw.data.data(), kbuf.size() * sizeof(float));
-  Tensor qs = Tensor::Contiguous(qbuf.data(), DType::kF32, Cpu(), {t, hq, d});
-  Tensor ks = Tensor::Contiguous(kbuf.data(), DType::kF32, Cpu(), {t, hk, d});
+  DeviceBuf dq(b, q, DType::kF32, {t, hq, d}, q_in.raw.data.data());
+  DeviceBuf dk(b, q, DType::kF32, {t, hk, d}, k_in.raw.data.data());
+  DeviceBuf dpos(b, q, pos.dtype, ShapeOf(pos.tensor), pos.raw.data.data());
   vt::RopeArgs args{m["args"]["base"].get<float>(), m["args"]["rotary_dim"].get<int>()};
-  Queue q{Cpu(), nullptr};
-  vt::RopeNeox(q, qs, ks, pos.tensor, args);
+  vt::RopeNeox(q, dq.tensor(), dk.tensor(), dpos.tensor(), args);
   double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
-  RequireMatch("q_out", qs, q_want.tensor, atol, rtol);
-  RequireMatch("k_out", ks, k_want.tensor, atol, rtol);
+  std::vector<uint8_t> q_host, k_host;
+  RequireMatch("q_out", dq.Download(q, q_host), q_want.tensor, atol, rtol);
+  RequireMatch("k_out", dk.Download(q, k_host), k_want.tensor, atol, rtol);
+}
+
+// Runs every golden case on `dev` and returns how many ran. Both passes use
+// the same manifests and the same tolerances — the committed goldens are the
+// bar for every backend.
+int RunGoldenPass(Device dev) {
+  fs::path root = PARITY_GOLDENS_DIR;
+  REQUIRE(fs::exists(root));
+  Backend& b = vt::GetBackend(dev.type);
+  Queue q = b.CreateQueue();
+  int cases = 0;
+  for (const auto& entry : fs::directory_iterator(root)) {
+    if (!entry.is_directory()) continue;
+    fs::path mf = entry.path() / "manifest.json";
+    // Non-op golden dirs (e.g. tokenizer_qwen36, owned by
+    // test_tokenizer_parity) carry no manifest.json; the `cases >= 9` floor
+    // in the callers still guards against op cases silently disappearing.
+    if (!fs::exists(mf)) continue;
+    json m = json::parse(std::ifstream(mf));
+    std::string op = m["op"];
+    INFO("case " << entry.path().filename().string());
+    if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr)
+      std::printf("case %s (%s)\n", entry.path().filename().string().c_str(),
+                  dev.type == DeviceType::kCUDA ? "cuda" : "cpu");
+    if (op == "rmsnorm") {
+      RunRmsNorm(b, q, entry.path(), m);
+    } else if (op == "matmul") {
+      RunMatmul(b, q, entry.path(), m);
+    } else if (op == "silu_and_mul") {
+      RunSiluAndMul(b, q, entry.path(), m);
+    } else if (op == "embedding") {
+      RunEmbedding(b, q, entry.path(), m);
+    } else if (op == "rope") {
+      RunRope(b, q, entry.path(), m);
+    } else {
+      FAIL("no runner for op '" << op << "' — add one before committing goldens");
+    }
+    ++cases;
+  }
+  b.DestroyQueue(q);
+  return cases;
 }
 
 }  // namespace
@@ -287,36 +374,26 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
   CHECK(inf_want->find("non-finite in want") != std::string::npos);
 }
 
-TEST_CASE("op parity vs upstream goldens") {
-  fs::path root = PARITY_GOLDENS_DIR;
-  REQUIRE(fs::exists(root));
-  int cases = 0;
-  for (const auto& entry : fs::directory_iterator(root)) {
-    if (!entry.is_directory()) continue;
-    fs::path mf = entry.path() / "manifest.json";
-    // Non-op golden dirs (e.g. tokenizer_qwen36, owned by
-    // test_tokenizer_parity) carry no manifest.json; the `cases >= 9` floor
-    // below still guards against op cases silently disappearing.
-    if (!fs::exists(mf)) continue;
-    json m = json::parse(std::ifstream(mf));
-    std::string op = m["op"];
-    INFO("case " << entry.path().filename().string());
-    if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr)
-      std::printf("case %s\n", entry.path().filename().string().c_str());
-    if (op == "rmsnorm") {
-      RunRmsNorm(entry.path(), m);
-    } else if (op == "matmul") {
-      RunMatmul(entry.path(), m);
-    } else if (op == "silu_and_mul") {
-      RunSiluAndMul(entry.path(), m);
-    } else if (op == "embedding") {
-      RunEmbedding(entry.path(), m);
-    } else if (op == "rope") {
-      RunRope(entry.path(), m);
-    } else {
-      FAIL("no runner for op '" << op << "' — add one before committing goldens");
-    }
-    ++cases;
+TEST_CASE("op parity vs upstream goldens (CPU)") {
+  int cases = RunGoldenPass(Cpu());
+  CHECK(cases >= 9);
+}
+
+// Same cases, same tolerances, on the GPU: inputs are uploaded through the
+// CUDA backend, ops run on a CUDA stream, outputs come back d2h for the host
+// compare. Skips cleanly on CPU-only builds and on CUDA builds without a GPU
+// (the CUDA registrar only registers kCUDA when a device is present).
+TEST_CASE("op parity vs upstream goldens (CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
   }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend registered; skipping CUDA parity pass");
+    return;
+  }
+  int cases = RunGoldenPass(Device{DeviceType::kCUDA, 0});
   CHECK(cases >= 9);
 }

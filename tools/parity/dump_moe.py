@@ -409,6 +409,28 @@ def _run_router(ops, logits, k, renormalize):
     return w.float(), ids.to(torch.int32)
 
 
+def _make_rows_unique(logits):
+    """Ensure every row's f32(bf16) values are distinct.
+
+    Nudges each exact duplicate (in ascending index order) to the next
+    representable value of ``logits.dtype`` via ``nextafter(., +inf)`` until
+    it is unused within its row. Deterministic; only colliding entries move,
+    by a few ULPs each, so the top-k routing structure is preserved. Runs on
+    CPU (``.item()``/``nextafter`` per element; rows are tiny).
+    """
+    inf = torch.tensor(float("inf"), device=logits.device, dtype=logits.dtype)
+    out = logits.clone()
+    for r in range(out.shape[0]):
+        seen = set()
+        for c in range(out.shape[1]):
+            v = out[r, c]
+            while v.item() in seen:  # strictly increasing bf16 steps; the
+                v = torch.nextafter(v, inf)  # row has < E prior values, so
+            seen.add(v.item())               # a free slot is found in < E.
+            out[r, c] = v
+    return out
+
+
 def dump_router_topk(ops, root, dev):
     total = 0
     for name, T, E, k, dtype, renorm, tol, tie_free in (
@@ -419,26 +441,29 @@ def dump_router_topk(ops, root, dev):
             ("moe_router_topk_bf16_realratio", 16, 256, 8, torch.bfloat16,
              True, TIGHT, True)):
         torch.manual_seed(0)
-        logits = torch.randn(T, E, device=dev) * 2.0
+        logits = (torch.randn(T, E, device=dev) * 2.0).to(dtype)
         note_extra = ""
         if tie_free:
             # bf16 keeps only 8 mantissa bits, so random logits collide
             # within a row and torch.topk breaks those ties HIGHER-index
             # first — the opposite of the production kernel's lowest-index
             # rule (§3). A correct C++ impl would then mismatch topk_ids on
-            # the tied rows while the (equal) weights silently agree. Break
-            # near-ties with a deterministic per-expert ramp BEFORE the bf16
-            # cast: it barely perturbs the logits (does not change the top-k
-            # structure) yet guarantees a strictly unambiguous ordering.
-            logits = logits + torch.arange(
-                E, device=dev, dtype=torch.float32) * 1e-3
+            # the tied rows while the (equal) weights silently agree. Make
+            # the ordering unambiguous by nudging exact f32(bf16) duplicates
+            # to the next representable bf16 value (deterministic, ascending
+            # index order): only colliding entries move, by a few ULPs each,
+            # so the top-k routing structure is preserved. (A uniform pre-bf16
+            # ramp cannot guarantee this for 256 experts — the step needed to
+            # split adjacent indices at this magnitude exceeds the logit
+            # range and would destroy the routing.)
+            logits = _make_rows_unique(logits)
             note_extra = (" This realratio case is tie-free by construction: "
-                          "logits perturbed by arange*1e-3 pre-bf16 so no "
-                          "row has duplicate f32(bf16) logits (dump-time "
-                          "per-row uniqueness assert enforces it).")
-        logits = logits.to(dtype)
-        # Fail loudly on regeneration if any row still carries duplicate
-        # f32(bf16) logits — a tie would reintroduce the ordering ambiguity.
+                          "exact f32(bf16) duplicates are nudged to the next "
+                          "representable bf16 value (a few ULPs, ascending "
+                          "index order) so no row has duplicate logits; a "
+                          "dump-time per-row uniqueness assert enforces it.")
+        # Fail loudly on regeneration if any row carries duplicate f32(bf16)
+        # logits — a tie would reintroduce the ordering ambiguity.
         lf = logits.float()
         for r in range(T):
             assert torch.unique(lf[r]).numel() == E, \

@@ -638,8 +638,13 @@ void RunMoeBlock(Backend& b, Queue& q, const fs::path& dir, const json& m) {
 // hard-FAILs, preserving the anti-stale-golden gate. Each entry MUST be removed
 // as its runner lands; the milestone close-out asserts this set is empty of the
 // milestone's ops (M0.8: moe_router_topk → Task 2, moe_block → Task 2 runner).
+// M0.9: the qwen36 layer/model goldens landed in Task 1 ahead of the Task 2/4
+// runners (dense-attention op + forward assembly); qwen36_fullattn_layer →
+// Task 2, qwen36_{embed,gdn_layer,norm,logits} → Task 4 layer/forward runners.
 const std::set<std::string>& PendingRunnerOps() {
-  static const std::set<std::string> kPending = {};
+  static const std::set<std::string> kPending = {
+      "qwen36_embed",   "qwen36_gdn_layer", "qwen36_fullattn_layer",
+      "qwen36_norm",    "qwen36_logits"};
   return kPending;
 }
 

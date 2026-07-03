@@ -337,3 +337,161 @@ TEST_CASE("MambaManager: remove_skipped_blocks frees all but the tail state") {
   CHECK(blocks[2] != pool.null_block);
   CHECK(pool.get_num_free_blocks() == free_before + 2);
 }
+
+// ---------------------------------------------------------------------------
+// MambaManager mode "none" prefix caching (the GDN gate-model path). These
+// exercise the manager end-to-end against a real (non-mocked) BlockPool cache
+// populated by cache_blocks, mirroring upstream MambaManager semantics
+// (single-recurrent-state reuse + the same-step reuse deferral).
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "MambaManager (mode none): find_longest_cache_hit -> add_local_computed_blocks"
+    " -> allocate_new_blocks end-to-end") {
+  init_none_hash(sha256_cbor);
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMambaSpec();  // mode "none"
+  MambaManager mgr(spec, pool, /*enable_caching=*/true, 0, 2);
+
+  // Request A: 6 prompt tokens -> 3 full blocks; allocate + cache its state.
+  Request reqA = MakeRequest("A", Iota(6), /*block_size=*/2);
+  REQUIRE(reqA.block_hashes.size() == 3);
+  auto allocatedA = mgr.allocate_new_blocks("A", 6, 6);
+  REQUIRE(allocatedA.size() == 3);
+  mgr.cache_blocks(reqA, /*num_tokens=*/6);
+  // Advance to the next scheduler step so A's just-cached state is reusable
+  // (clears cached_blocks_this_step; the same-step guard is exercised below).
+  mgr.new_step_starts();
+
+  // Request B shares A's first 6 tokens and extends to 8 (4 blocks).
+  Request reqB = MakeRequest("B", Iota(8), 2);
+  REQUIRE(reqB.block_hashes.size() == 4);
+
+  // find_longest_cache_hit keeps only the single rightmost state:
+  // [null, null, state].
+  auto computed = mgr.find_longest_cache_hit(reqB.block_hashes, /*max_length=*/8,
+                                             {0}, pool, *spec,
+                                             /*drop_eagle_block=*/false, 2)[0];
+  REQUIRE(computed.size() == 3);
+  CHECK(computed[0] == pool.null_block);
+  CHECK(computed[1] == pool.null_block);
+  CHECK(computed[2] == allocatedA[2]);  // A's tail state block.
+
+  // add_local_computed_blocks null-front-pads: hit_length = 3 * 2 = 6 tokens,
+  // get_num_skipped_tokens(6) = 5 -> 2 skipped blocks. It drops the 2 leading
+  // nulls from the hit and re-adds 2 null pads, leaving [null, null, state].
+  mgr.add_local_computed_blocks("B", computed,
+                                /*num_local_computed_tokens=*/6,
+                                /*num_external_computed_tokens=*/0);
+  auto& bBlocks = mgr.req_to_blocks["B"];
+  REQUIRE(bBlocks.size() == 3);
+  CHECK(bBlocks[0] == pool.null_block);
+  CHECK(bBlocks[1] == pool.null_block);
+  CHECK(bBlocks[2] == allocatedA[2]);
+  CHECK(mgr.num_cached_block["B"] == 3);
+  // The reused state block was touched: ref_cnt = A(1) + B(1) = 2.
+  CHECK(allocatedA[2]->ref_cnt == 2);
+
+  // allocate_new_blocks completes B to 8 tokens (cdiv(8,2)=4 blocks): exactly
+  // 1 genuinely new block on top of the 3-block hit.
+  int free_before = pool.get_num_free_blocks();
+  auto newB = mgr.allocate_new_blocks("B", 8, 8);
+  REQUIRE(newB.size() == 1);
+  CHECK(mgr.req_to_blocks["B"].size() == 4);
+  CHECK(pool.get_num_free_blocks() == free_before - 1);
+  // Mamba is not a full-attention spec, so no worker block-ids are recorded.
+  CHECK(mgr.take_new_block_ids().empty());
+}
+
+TEST_CASE(
+    "MambaManager (mode none): get_num_blocks_to_allocate defers a same-step "
+    "state reuse, then clears after new_step_starts") {
+  init_none_hash(sha256_cbor);
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMambaSpec();
+  MambaManager mgr(spec, pool, /*enable_caching=*/true, 0, 2);
+
+  // Request A caches its state THIS step.
+  Request reqA = MakeRequest("A", Iota(6), 2);
+  auto allocatedA = mgr.allocate_new_blocks("A", 6, 6);
+  REQUIRE(allocatedA.size() == 3);
+  mgr.cache_blocks(reqA, 6);
+  REQUIRE(!mgr.cached_blocks_this_step.empty());
+
+  // Request B's hit lands on the very block A cached this step.
+  Request reqB = MakeRequest("B", Iota(8), 2);
+  auto computed =
+      mgr.find_longest_cache_hit(reqB.block_hashes, 8, {0}, pool, *spec,
+                                 false, 2)[0];
+  REQUIRE(computed.size() == 3);
+  REQUIRE(computed.back() == allocatedA[2]);
+
+  // Same-step deferral: return num_gpu_blocks + 1 so the request is not
+  // scheduled onto an in-flight state block another request cached this step.
+  CHECK(mgr.get_num_blocks_to_allocate("B", /*num_tokens=*/8, computed,
+                                       /*total_computed_tokens=*/6,
+                                       /*num_tokens_main_model=*/8) ==
+        pool.num_gpu_blocks + 1);
+
+  // After the step boundary the deferral clears; normal accounting yields the
+  // single new block needed to reach cdiv(8,2)=4 blocks from the 3-block hit.
+  mgr.new_step_starts();
+  CHECK(mgr.cached_blocks_this_step.empty());
+  CHECK(mgr.get_num_blocks_to_allocate("B", 8, computed, 6, 8) == 1);
+}
+
+TEST_CASE(
+    "MambaManager (mode none): get_num_skipped_tokens (n-1), "
+    "remove_skipped_blocks frees all but the tail, common prefix is 0") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMambaSpec();
+  MambaManager mgr(spec, pool, /*enable_caching=*/true, 0, 2);
+
+  // Mamba keeps only the last token's state: get_num_skipped_tokens(n) == n-1.
+  CHECK(mgr.get_num_skipped_tokens(6) == 5);
+  CHECK(mgr.get_num_skipped_tokens(1) == 0);
+
+  mgr.allocate_new_blocks("r", 6, 6);  // 3 blocks.
+  int free_before = pool.get_num_free_blocks();
+
+  // num_skipped_tokens(6)=5, 5 // 2 = 2 leading blocks freed; tail survives.
+  mgr.remove_skipped_blocks("r", /*num_computed_tokens=*/6);
+  auto& blocks = mgr.req_to_blocks["r"];
+  REQUIRE(blocks.size() == 3);
+  CHECK(blocks[0] == pool.null_block);
+  CHECK(blocks[1] == pool.null_block);
+  CHECK(blocks[2] != pool.null_block);
+  CHECK(pool.get_num_free_blocks() == free_before + 2);
+
+  // Cascade attention is not supported by mamba.
+  CHECK(mgr.get_num_common_prefix_blocks("r") == 0);
+}
+
+TEST_CASE(
+    "MambaManager (mode none): cache_blocks populates cached_blocks_this_step, "
+    "new_step_starts clears it") {
+  init_none_hash(sha256_cbor);
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMambaSpec();
+  MambaManager mgr(spec, pool, /*enable_caching=*/true, 0, 2);
+
+  Request req = MakeRequest("r", Iota(6), 2);
+  REQUIRE(req.block_hashes.size() == 3);
+  mgr.allocate_new_blocks("r", 6, 6);
+  CHECK(mgr.cached_blocks_this_step.empty());
+
+  mgr.cache_blocks(req, /*num_tokens=*/6);
+  // One entry per newly-cached (non-null, hashed) block.
+  CHECK(mgr.cached_blocks_this_step.size() == 3);
+  CHECK(mgr.cached_blocks_this_step.count(
+            make_block_hash_with_group_id(req.block_hashes[0], 0)) == 1);
+  CHECK(mgr.cached_blocks_this_step.count(
+            make_block_hash_with_group_id(req.block_hashes[2], 0)) == 1);
+
+  mgr.new_step_starts();
+  CHECK(mgr.cached_blocks_this_step.empty());
+}

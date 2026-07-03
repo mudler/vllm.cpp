@@ -244,3 +244,62 @@ TEST_CASE("PostInit normalizes like __post_init__") {
     CHECK_THROWS_AS(p.PostInit(), std::runtime_error);
   }
 }
+
+// Locks the Verify()/PostInit() split so a future refactor cannot silently
+// drop the mandatory __post_init__ normalization + greedy n-check. Upstream
+// always runs __post_init__ at construction; Verify() alone is NOT a
+// substitute (it neither normalizes fields nor enforces the greedy n==1 rule).
+TEST_CASE("PostInit contract: mandatory __post_init__ equivalent") {
+  SUBCASE("Verify() alone accepts a state upstream rejects (greedy, n>1)") {
+    // temperature=0 (greedy) with n=2 is invalid upstream, but Verify() does
+    // not run the greedy n-check, so it must NOT throw here.
+    SamplingParams p;
+    p.temperature = 0.0;
+    p.n = 2;
+    CHECK_NOTHROW(p.Verify());
+    // The SAME object, run through PostInit(), IS rejected — proving Verify()
+    // by itself is insufficient and PostInit() is the enforcing path.
+    CHECK_THROWS_AS(p.PostInit(), std::runtime_error);
+  }
+  SUBCASE("PostInit() forces greedy sub-params at temperature 0") {
+    SamplingParams p;
+    p.temperature = 0.0;
+    p.top_p = 0.5;
+    p.top_k = 20;
+    p.min_p = 0.3;
+    p.PostInit();
+    CHECK(p.top_p == doctest::Approx(1.0));
+    CHECK(p.top_k == 0);
+    CHECK(p.min_p == doctest::Approx(0.0));
+    CHECK(p.Type() == SamplingType::kGreedy);
+  }
+  SUBCASE("PostInit() clamp precedes greedy check: 1e-6 is NOT greedy") {
+    // Locks the ORDER in __post_init__: the (0, _MAX_TEMP) clamp raises a
+    // near-zero positive temperature to _MAX_TEMP (1e-2) BEFORE the
+    // < _SAMPLING_EPS (1e-5) greedy test runs. So temperature=1e-6 ends up
+    // clamped and random, and greedy sub-params are NOT forced.
+    SamplingParams p;
+    p.temperature = 1e-6;
+    p.top_p = 0.5;
+    p.top_k = 20;
+    p.min_p = 0.3;
+    p.PostInit();
+    CHECK(p.temperature == doctest::Approx(vllm::kMaxTemp));
+    CHECK(p.top_p == doctest::Approx(0.5));
+    CHECK(p.top_k == 20);
+    CHECK(p.min_p == doctest::Approx(0.3));
+    CHECK(p.Type() == SamplingType::kRandom);
+  }
+  SUBCASE("PostInit() clamps temperature in (0, _MAX_TEMP) up to _MAX_TEMP") {
+    SamplingParams p;
+    p.temperature = 0.005;  // in (0, 1e-2)
+    p.PostInit();
+    CHECK(p.temperature == doctest::Approx(vllm::kMaxTemp));
+  }
+  SUBCASE("PostInit() drops seed == -1") {
+    SamplingParams p;
+    p.seed = -1;
+    p.PostInit();
+    CHECK_FALSE(p.seed.has_value());
+  }
+}

@@ -114,13 +114,22 @@ struct SamplingParams {
   // random_seed when a seed is set, else random.
   SamplingType Type() const;
 
-  // _verify_args: pure validation. Throws std::runtime_error with the
+  // _verify_args: pure validation only. Throws std::runtime_error with the
   // upstream-equivalent message on any invalid field. const (no mutation).
+  // NOTE: this is NOT sufficient on its own — it does not normalize fields nor
+  // run the greedy n-check, so it accepts states upstream rejects at
+  // construction (e.g. temperature=0 with n=2). Callers that build a
+  // SamplingParams for the engine must call PostInit(), not Verify() alone.
   void Verify() const;
 
-  // __post_init__: normalize in place (clamp near-zero temperature, drop
-  // seed == -1, force greedy sub-params when greedy), then Verify() and the
-  // greedy n-check. Mirrors upstream construction-time behavior.
+  // __post_init__ equivalent: normalize in place (clamp near-zero temperature,
+  // drop seed == -1, force greedy sub-params when greedy), then run Verify()
+  // and the greedy n-check. Upstream ALWAYS runs __post_init__ at construction,
+  // so this is MANDATORY: every SamplingParams that enters the engine must have
+  // PostInit() called on it (the InputProcessor / EngineCoreRequest
+  // construction path in M1.8 does this). Verify() alone is NOT a substitute —
+  // it neither normalizes fields nor enforces the greedy n==1 rule, so a caller
+  // using Verify() by itself would accept invalid states upstream rejects.
   void PostInit();
 
  private:

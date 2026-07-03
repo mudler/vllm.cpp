@@ -96,6 +96,19 @@ struct GDNAttentionMetadata : AttentionMetadata {
   // num_decode_tokens; prefill_state_indices = state_indices[num_decodes:]
   // (gdn_attn.py:340-354). prefill_has_initial_state is the has_initial_state
   // mask sliced to the prefill region (gdn_attn.py:400-403).
+  //
+  // ⚠ CALLER OBLIGATION (GDN-state zeroing) — vt::GdnPrefill/GdnDecode read the
+  // `state` buffer UNCONDITIONALLY (no has_initial_state gate; see
+  // src/vt/cpu/cpu_ops.cpp GdnPrefillKernel). Upstream does NOT pre-zero blocks;
+  // it gathers the state rows then zeros the fresh ones in the LAYER forward,
+  // keyed by this mask: `initial_state = ssm_state[prefill_state_indices];
+  // initial_state[~prefill_has_initial_state] = 0`
+  // (qwen_gdn_linear_attn.py:1512-1513 @ e24d1b24). The batched GDN-layer
+  // assembly (M0.9/runner) MUST replicate that gather-and-zero before calling
+  // vt::GdnPrefill — else a request with prefill_has_initial_state==0 reads a
+  // stale mamba block → silent wrong output. This metadata only DELIVERS the
+  // mask; it cannot zero (host-only, holds no state buffer). Tracked in
+  // .agents/state.md as the M1.5/M1.6 GDN-state-zeroing carry.
   std::optional<std::vector<int32_t>> prefill_query_start_loc;
   std::optional<std::vector<int32_t>> prefill_state_indices;
   std::optional<std::vector<uint8_t>> prefill_has_initial_state;

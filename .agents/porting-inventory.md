@@ -96,7 +96,7 @@ we mirror it.
 | Persistent InputBatch (incremental add/diff/swap-remove) | `v1/worker/gpu/input_batch.py` | T0 ✅ `62fdfca` (add/remove/condense, V1 host-array algorithm; staged device storage deferred M2) |
 | BlockTable tensors + slot mapping | `v1/worker/gpu/block_table.py` | T0 ✅ `62fdfca` (BlockTable+MultiGroupBlockTable host-array, slot_mapping=block_id*bs+offset; staged tensors deferred M2) |
 | Step input build: `query_start_loc`, `seq_lens`, positions, logits indices | `v1/worker/gpu/model_runner.py` | T0 ✅ `62fdfca` (update_states+prepare_inputs matched 1:1 vs `_prepare_inputs`; LoRA/spec/mm slot state deferred M2/T1) |
-| `CommonAttentionMetadata` contract → per-backend builders | `v1/attention/backend.py`, `v1/worker/gpu/attn_utils.py` | T0 |
+| `CommonAttentionMetadata` contract → per-backend builders | `v1/attention/backend.py`, `v1/worker/gpu/attn_utils.py` | T0 ✅ `bd47ce3` (T0 field set + MakeCommonAttentionMetadata from step-inputs; FastPrefill/CrossAttn/dcp/sparse fields deferred) |
 | Split execute/sample (`ExecuteModelState`) for deferred sampling | `v1/worker/gpu/model_runner.py` | T0 |
 | KV tensor allocation from `KVCacheConfig` | same | T0 |
 | CUDA graph capture/replay for decode (our own capture; no torch) | `v1/worker/gpu/cudagraph_utils.py`, `config/compilation.py::cudagraph_mode` | **T0** (parity at high concurrency needs it — MoE decode is launch-bound) |
@@ -108,9 +108,10 @@ we mirror it.
 
 | Item | Upstream | Tier |
 |---|---|---|
-| Backend interface: `AttentionBackend/Impl/MetadataBuilder` | `v1/attention/backend.py` | T0 |
-| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 |
-| **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 |
+| Backend interface: `AttentionBackend/Impl/MetadataBuilder` | `v1/attention/backend.py` | T0 ✅ `bd47ce3` (ABCs + flash NHD get_kv_cache_shape) |
+| `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; CUDA parity dgx-pending) |
+| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 🚧 `c244592` (vt::PagedAttention correctness-grade CPU+CUDA, anchored to M0.9 dense; FlashInfer-class perf + CUDA graphs = M2.4; CUDA parity dgx-pending) |
+| **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 ✅ `370ddaf` (GDNAttentionMetadata decode/prefill split + has_initial_state mask + prefill rebasing; spec segments + align col-gather deferred; GDN-state zeroing = caller obligation, see state.md) |
 | GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` (correctness-grade sequential; chunked perf kernel M2.3) |
 | GDN fused decode recurrence (sigmoid-gating delta rule update) | `layers/fla/ops/{fused_sigmoid_gating,fused_recurrent}.py` | T0 ✅ `ead59d6` (correctness-grade) |
 | GDN post-conv prep (q,k,v,g,beta + L2 norm) + causal conv1d fn/update | `layers/fla/ops/fused_gdn_prefill_post_conv.py`, `layers/mamba/ops/causal_conv1d.py` | T0 ✅ `ead59d6` (l2norm + conv1d only; packed q/k/v split + g/beta prep is M0.9 — gdn-semantics §6) |

@@ -346,3 +346,68 @@
   BlockTable (MRV2)** — the persistent batch (incremental add/diff/swap-remove
   from SchedulerOutput) + step-input build (query_start_loc/seq_lens/slot_mapping/
   positions), ported from `vllm/v1/worker/gpu/{input_batch,block_table}.py`.
+- **2026-07-03 (later)** — **M1.6 done** (`370ddaf`; ports `bd47ce3`
+  CommonAttentionMetadata + AttentionBackend/Impl/MetadataBuilder ABCs + flash
+  NHD get_kv_cache_shape, `e231196`→`7de4f0c` vt::ReshapeAndCache stride-based
+  NHD write [re-ported to index by tensor strides, not shape — the committed KV
+  cache is ONE (num_blocks,2,block_size,H,D) allocation whose k/v are the rank-4
+  STRIDED unbind(1) slices, block stride 2·bs·H·D; the first cut derived strides
+  from shape + required whole-cache contiguity, which THROWS/corrupts on the real
+  slice — mirrors pinned cache_kernels.cu::reshape_and_cache_flash reading
+  key_cache.stride(0/1/2)], `c244592` vt::PagedAttention varlen causal GQA
+  stride-based paged read, `370ddaf` GDNAttentionMetadata segmentation). **The
+  KV-cache-aware attention that replaces M0.9's dense attention for the
+  batched/cached path is in place.** Pieces: **CommonAttentionMetadata** (T0 field
+  set query_start_loc(_cpu)/seq_lens(_cpu)/num_reqs/num_actual_tokens/max_query_len
+  /max_seq_len/block_table_tensor/slot_mapping/causal) + the ABCs; **flash NHD
+  layout** get_kv_cache_shape=(num_blocks,2,block_size,num_kv_heads,head_size)
+  chosen over cpu_attn's HND — the internal cache layout is validated only via the
+  attention OUTPUT (layout-agnostic), so Task2-write and Task3-read just have to
+  agree, which they do (both index by NHD strides); **ReshapeAndCache**
+  (stride-based write, slot→block=slot/bs,offset=slot%bs, -1 skip, CPU+CUDA);
+  **PagedAttention** (per-token causal GQA softmax over paged K/V, GQA
+  kv_head=h/(Hq/Hk), causal p=(seq_lens[r]-query_len)+local inclusive, CPU+CUDA)
+  — **ANCHORED** to M0.9 dense vt::Attention on the single-seq case (genuine
+  independent cross-check, reviewer hand-traced the causal right-alignment 3 ways)
+  + composed-ref batched varlen; **GDNAttentionMetadata** (decode-first
+  split_decodes_and_prefills segmentation, has_initial_state=context_lens>0 mask,
+  prefill-slice rebasing prefill_query_start_loc/state_indices/has_initial_state).
+  All 4 tasks reviewed PASS (Task 2 caught + fixed the stride defect via
+  adversarial review before it reached Task 3); CPU ctest 47/47, warnings-as-errors
+  clean. **CUDA-vs-CPU parity tests are build-guarded (this box is CPU-only) →
+  dgx-pending** for ReshapeAndCache + PagedAttention (not faked).
+  **GDN-STATE-ZEROING CARRY — RE-FRAMED (supersedes the M1.5 `new_block_ids_to_zero`
+  framing above, which was the WRONG mechanism):** upstream does NOT pre-zero
+  mamba blocks in the block pool. The GDN LAYER forward gathers the state rows and
+  zeros the fresh ones keyed by the mask:
+  `initial_state = ssm_state[prefill_state_indices];
+   initial_state[~prefill_has_initial_state] = 0`
+  (qwen_gdn_linear_attn.py:1512-1513 @ e24d1b24). Our vt::GdnPrefill/GdnDecode
+  (src/vt/cpu/cpu_ops.cpp GdnPrefillKernel) read the `state` buffer
+  UNCONDITIONALLY — no has_initial_state gate. So M1.6's GDNAttentionMetadata
+  correctly DELIVERS `has_initial_state`/`prefill_has_initial_state`, but the
+  actual zeroing is a **CALLER OBLIGATION for the batched GDN-layer assembly
+  (M0.9/runner milestone)**: it MUST gather state[prefill_state_indices] then zero
+  rows where prefill_has_initial_state==0 before calling vt::GdnPrefill, else a
+  fresh request reads a stale mamba block → silent wrong output. Documented inline
+  in include/vllm/v1/attention/backends/gdn_attn.h (prefill_has_initial_state
+  doc-comment). **STILL AN OPEN CARRY** for the batched-GDN forward — the current
+  M0.9 single-sequence forward zeros its own state, so this is INERT until a
+  batched GDN step with mixed fresh+continuing requests runs.
+  **mamba_cache_mode="align" DEFERRAL (recorded safe):** GDNAttentionMetadata sets
+  state_indices = block_table column 0, which is correct for mamba_cache_mode ∈
+  {"none","all"} (upstream mamba_get_block_table_tensor returns the table unchanged
+  there). "align" (which gathers the last 1+num_spec blocks) is deferred. Default
+  is "none" (cache.py:134); it only becomes "align" when enable_prefix_caching is
+  ON *and* the hybrid model lacks supports_mamba_prefix_caching (config.py:551-565),
+  which additionally requires chunked prefill — no T0 gate-model run selects it, so
+  col-0 is correct for the T0 path. Wire the align col-gather when prefix caching
+  over mamba layers is enabled (post-MVP). **DEFERRED (M2.4):** the FlashInfer-class
+  perf paged-attention kernel + CUDA graphs (T0 is correctness-grade
+  block-per-(query,head)); the CUDA reshape_and_cache/paged_attention parity
+  confirmation on dgx. Close-out asserts: `PendingRunnerOps()` empty (M1.6 added no
+  parity-manifest goldens — validation is in-test against the dense op + composed
+  reference); CI green. NEXT: **M1.7 Sampler** — the sampling pipeline consuming
+  the per-slot sampling arrays from M1.5's InputBatch + the logits from the forward
+  (upstream pipeline order, seeded RNG, logprobs, GPU top-k/top-p), ported from
+  `vllm/v1/sample/`.

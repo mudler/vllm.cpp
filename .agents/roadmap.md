@@ -113,8 +113,14 @@ vocabulary is ported.**
   STORAGE (M2) — see `.agents/vllm-v1-v2.md` (`2889abd`). All reviewed PASS, CI
   green, ASan-clean; behavioral CPU tests ported from `tests/v1/worker/`. Staged
   device tensors / CUDA-graph padding / LoRA/spec/mm deferred to M2/T1.
-- ☐ **M1.6 Paged attention backend** (varlen prefill + paged decode,
-  correctness-grade) + CommonAttentionMetadata builders.
+- ☑ **M1.6 Paged attention backend** (varlen prefill + paged decode,
+  correctness-grade) + CommonAttentionMetadata builders. Done `bd47ce3`
+  (CommonAttentionMetadata + AttentionBackend/Impl/MetadataBuilder ABCs, flash
+  NHD get_kv_cache_shape) → `e231196`+`7de4f0c` (reshape_and_cache, stride-based
+  NHD write CPU+CUDA) → `c244592` (paged_attention CPU+CUDA, anchored to M0.9
+  dense on the single-seq case) → `370ddaf` (GDNAttentionMetadata segmentation).
+  CPU CI green (47/47); CUDA parity tests build-guarded, dgx-pending. GDN-state
+  zeroing = caller obligation carried to the batched-GDN forward (see state.md).
 - ☐ **M1.7 Sampler** (upstream pipeline order, seeded RNG, logprobs) + GPU
   top-k/top-p; sampler parity tests.
 - ☐ **M1.8 EngineCore + step loop + queues**; InputProcessor/OutputProcessor/

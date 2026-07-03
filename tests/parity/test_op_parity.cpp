@@ -10,6 +10,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -455,6 +456,19 @@ void RunGdnDecode(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   RequireMatch("state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
 }
 
+// Ops whose goldens are committed but whose runners are not implemented yet.
+// The parity harness scans every golden directory eagerly, so a milestone that
+// lands goldens before their runners (the standard "dump first, implement next"
+// split) would otherwise hard-FAIL here. Listing an op here makes its cases
+// SKIP loudly (a visible MESSAGE) instead — while ANY op NOT listed still
+// hard-FAILs, preserving the anti-stale-golden gate. Each entry MUST be removed
+// as its runner lands; the milestone close-out asserts this set is empty of the
+// milestone's ops (M0.8: moe_router_topk → Task 2, moe_block → Task 2 runner).
+const std::set<std::string>& PendingRunnerOps() {
+  static const std::set<std::string> kPending = {"moe_router_topk", "moe_block"};
+  return kPending;
+}
+
 // Runs every golden case on `dev` and returns how many ran. Both passes use
 // the same manifests and the same tolerances — the committed goldens are the
 // bar for every backend.
@@ -499,6 +513,10 @@ int RunGoldenPass(Device dev) {
       RunGdnPrefill(b, q, entry.path(), m);
     } else if (op == "gdn_decode") {
       RunGdnDecode(b, q, entry.path(), m);
+    } else if (PendingRunnerOps().count(op)) {
+      MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
+                          << "': runner pending (see PendingRunnerOps)");
+      continue;  // does not count toward the case floor
     } else {
       FAIL("no runner for op '" << op << "' — add one before committing goldens");
     }

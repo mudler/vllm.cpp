@@ -50,6 +50,7 @@ vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
+vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
 target_compile_definitions(test_npy PRIVATE

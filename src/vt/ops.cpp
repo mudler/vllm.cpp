@@ -392,4 +392,60 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
       q, k, v, k_cache, v_cache, slot_mapping);
 }
 
+void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                    const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                    const Tensor& query_start_loc, const PagedAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && out.rank == 3,
+           "paged_attention: query/out rank-3 [num_actual_tokens,num_q_heads,head_size]");
+  VT_CHECK(k_cache.rank == 4 && v_cache.rank == 4,
+           "paged_attention: k_cache/v_cache rank-4 "
+           "[num_blocks,block_size,num_kv_heads,head_size]");
+  const int64_t num_tokens = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t num_kv_heads = k_cache.shape[2], head_size = k_cache.shape[3];
+  VT_CHECK(out.shape[0] == num_tokens && out.shape[1] == hq && out.shape[2] == d,
+           "paged_attention: out must match query shape");
+  VT_CHECK(d == head_size, "paged_attention: query head_size must match the cache head_size");
+  VT_CHECK(v_cache.shape[0] == k_cache.shape[0] && v_cache.shape[1] == k_cache.shape[1] &&
+               v_cache.shape[2] == num_kv_heads && v_cache.shape[3] == head_size,
+           "paged_attention: k_cache and v_cache must share shape");
+  VT_CHECK(hq >= 1 && num_kv_heads >= 1 && hq % num_kv_heads == 0,
+           "paged_attention: num_q_heads must be a positive multiple of num_kv_heads (GQA)");
+  VT_CHECK(args.scale > 0.0f, "paged_attention: scale must be set (> 0), e.g. head_size^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && IsOutFloat(out.dtype),
+           "paged_attention: float query, f32/bf16 out");
+  VT_CHECK(k_cache.dtype == query.dtype && v_cache.dtype == query.dtype,
+           "paged_attention: query and k_cache/v_cache must share one float dtype (auto path)");
+  // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
+  // query_start_loc [num_reqs+1] i32.
+  VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,
+           "paged_attention: seq_lens must be i32 [num_reqs]");
+  const int64_t num_reqs = seq_lens.shape[0];
+  VT_CHECK(num_reqs >= 1, "paged_attention: num_reqs must be >= 1");
+  VT_CHECK(block_table.rank == 2 && block_table.shape[0] == num_reqs &&
+               block_table.dtype == DType::kI32,
+           "paged_attention: block_table must be i32 [num_reqs, max_blocks]");
+  VT_CHECK(query_start_loc.rank == 1 && query_start_loc.shape[0] == num_reqs + 1 &&
+               query_start_loc.dtype == DType::kI32,
+           "paged_attention: query_start_loc must be i32 [num_reqs+1]");
+  // query/out contiguous; seq_lens/query_start_loc contiguous. The cache and
+  // block_table are read via strides (the cache is the strided NHD unbind slice),
+  // but the per-token page must be head-contiguous (elem stride 1, head stride
+  // head_size) — same guarantee reshape_and_cache relies on.
+  VT_CHECK(query.IsContiguous() && out.IsContiguous() && seq_lens.IsContiguous() &&
+               query_start_loc.IsContiguous(),
+           "paged_attention: query/out/seq_lens/query_start_loc must be contiguous");
+  VT_CHECK(k_cache.stride[3] == 1 && v_cache.stride[3] == 1,
+           "paged_attention: k_cache/v_cache innermost (head_size) stride must be 1");
+  VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
+           "paged_attention: k_cache/v_cache page must be head-contiguous "
+           "(stride[2] == head_size) — the NHD unbind-slice layout");
+  VT_CHECK(query.device == q.device && out.device == q.device && k_cache.device == q.device &&
+               v_cache.device == q.device && block_table.device == q.device &&
+               seq_lens.device == q.device && query_start_loc.device == q.device,
+           "paged_attention: device mismatch (query/out/cache/block_table/seq_lens/"
+           "query_start_loc/queue)");
+  reinterpret_cast<PagedAttentionFn>(GetOp(OpId::kPagedAttention, q.device.type))(
+      q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
+}
+
 }  // namespace vt

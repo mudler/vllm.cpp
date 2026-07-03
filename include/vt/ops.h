@@ -21,6 +21,7 @@ enum class OpId : uint8_t {
   kMoeCombine,
   kAttention,
   kReshapeAndCache,
+  kPagedAttention,
   kCount
 };
 
@@ -71,6 +72,19 @@ struct AttentionArgs {
   bool causal = true;
 };
 
+// Paged attention args (M1.6). Same softmax convention as AttentionArgs — the
+// paged op generalizes the dense M0.9 attention to the varlen/batched/paged
+// case and MUST agree with it on the single-sequence contiguous read.
+struct PagedAttentionArgs {
+  // Softmax scale, applied to the qk dot product (upstream FlashAttentionImpl
+  // self.scale = head_size^-0.5). Must be set explicitly (> 0).
+  float scale = 0.0f;
+  // Causal masking: a query token at absolute position p attends only to key
+  // positions j <= p. True for the decoder path; non-causal carried for
+  // fidelity (matches AttentionArgs.causal).
+  bool causal = true;
+};
+
 // MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).
 struct MoeRouterTopKArgs {
   // Number of experts selected per token (top_k = num_experts_per_tok).
@@ -116,6 +130,9 @@ using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, cons
                              const AttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
+using PagedAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor&, const Tensor&, const Tensor&,
+                                  const PagedAttentionArgs&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -282,5 +299,38 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // fp8 scaling — fp8 KV cache is out of T0 scope).
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping);
+
+// --- Paged attention (M1.6). Correctness-grade varlen prefill + paged decode.
+// Semantics ported from the FlashAttention path
+// vllm/v1/attention/backends/flash_attn.py::FlashAttentionImpl.forward @
+// e24d1b24 (causal GQA softmax over the paged K/V; scale = self.scale). The
+// cache read is the NHD layout FlashAttentionBackend::get_kv_cache_shape
+// allocates (num_blocks, 2, block_size, num_kv_heads, head_size) — NOT cpu_attn's
+// HND arithmetic — and is driven by k_cache/v_cache STRIDES (the two dim-1 unbind
+// slices; block stride 2*bs*H*D). This GENERALIZES the dense M0.9 vt::Attention:
+// on a single contiguous sequence the two ops agree.
+//
+// For each query token t (found via query_start_loc: token t belongs to request
+// r with query_start_loc[r] <= t < query_start_loc[r+1]) at absolute position
+// p = (seq_lens[r] - query_len_r) + (t - query_start_loc[r]) (query_len_r =
+// query_start_loc[r+1] - query_start_loc[r]; seq_lens[r] is the total context
+// INCLUDING this chunk), and q-head h (kv-head g = h / (Hq/Hk)):
+//   for key position j in 0..p (causal) — block = block_table[r, j / block_size],
+//   offset = j % block_size, K = k_cache[block, offset, g, :], V likewise —
+//   s[j] = scale * (query[t,h] · K);  out[t,h,:] = Σ_j softmax(s)_j * V.
+// Softmax/accumulation in f32 (max-subtracted). The current step's K/V must
+// already be in the cache (compose vt::ReshapeAndCache upstream), so no separate
+// key/value args — the read is entirely from the paged cache.
+//
+//   query          [num_actual_tokens, num_q_heads, head_size]  (contiguous)
+//   out            same shape/dtype as query (contiguous)
+//   k_cache/v_cache[num_blocks, block_size, num_kv_heads, head_size]  (the two
+//                  dim-1 slices of the flash cache; STRIDED, read-only)
+//   block_table    [num_reqs, max_blocks] i32  (Task 1's block_table_tensor)
+//   seq_lens       [num_reqs] i32              (context length incl. this step)
+//   query_start_loc[num_reqs + 1] i32          (cumulative query offsets)
+void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                    const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                    const Tensor& query_start_loc, const PagedAttentionArgs& args);
 
 }  // namespace vt

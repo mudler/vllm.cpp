@@ -31,5 +31,5 @@ def save_case(root: pathlib.Path, name: str, op: str, tensors: dict, args: dict,
         np.save(case / f"{key}.npy", _to_numpy(t))
         manifest["tensors"][key] = {"file": f"{key}.npy", "dtype": DTYPE_NAMES[t.dtype],
                                     "shape": list(t.shape)}
-    (case / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    (case / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     print(f"wrote {case}")

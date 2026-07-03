@@ -100,8 +100,9 @@ float AsF32(const Tensor& t, int64_t i) {
 }
 
 // Returns the first-failure description, or nullopt if all elements match.
-// NaN-loud: NaN anywhere (got or want) is a failure — `>` comparisons are
-// silently false for NaN, so the check is `!(diff <= tol)` plus isnan.
+// Non-finite-loud: NaN or Inf anywhere (got or want) is a failure — `>`
+// comparisons are silently false for NaN, so the check is `!(diff <= tol)`
+// plus !isfinite.
 std::optional<std::string> CompareTensors(const Tensor& got, const Tensor& want,
                                           double atol, double rtol) {
   if (got.Numel() != want.Numel()) {
@@ -111,12 +112,12 @@ std::optional<std::string> CompareTensors(const Tensor& got, const Tensor& want,
   for (int64_t i = 0; i < got.Numel(); ++i) {
     double g = AsF32(got, i), w = AsF32(want, i);
     double tol = atol + rtol * std::abs(w);
-    const bool g_nan = std::isnan(g), w_nan = std::isnan(w);
-    if (g_nan || w_nan || !(std::abs(g - w) <= tol)) {
+    const bool g_bad = !std::isfinite(g), w_bad = !std::isfinite(w);
+    if (g_bad || w_bad || !(std::abs(g - w) <= tol)) {
       std::ostringstream os;
       os << "[" << i << "]: got " << g << " want " << w;
-      if (g_nan || w_nan) {
-        os << " (nan in " << (g_nan ? "got" : "want") << ")";
+      if (g_bad || w_bad) {
+        os << " (non-finite in " << (g_bad ? "got" : "want") << ")";
       } else {
         os << " (tol " << tol << ")";
       }
@@ -240,7 +241,7 @@ void RunRope(const fs::path& dir, const json& m) {
 
 }  // namespace
 
-TEST_CASE("CompareTensors is NaN-loud and catches mismatches") {
+TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
   float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
   float b[4] = {1.0f, 2.0f, 3.0f, 4.0f};
   Tensor ta = Tensor::Contiguous(a, DType::kF32, Cpu(), {4});
@@ -261,14 +262,29 @@ TEST_CASE("CompareTensors is NaN-loud and catches mismatches") {
   a[1] = std::nanf("");
   auto nan_got = CompareTensors(ta, tb, 1e-6, 1e-6);
   REQUIRE(nan_got.has_value());
-  CHECK(nan_got->find("nan") != std::string::npos);
+  CHECK(nan_got->find("non-finite in got") != std::string::npos);
   a[1] = 2.0f;
 
   // NaN in want → also an error.
   b[3] = std::nanf("");
   auto nan_want = CompareTensors(ta, tb, 1e-6, 1e-6);
   REQUIRE(nan_want.has_value());
-  CHECK(nan_want->find("nan") != std::string::npos);
+  CHECK(nan_want->find("non-finite in want") != std::string::npos);
+  b[3] = 4.0f;
+
+  // Inf in got → error (Inf-Inf would be NaN and Inf vs finite passes a plain
+  // `>` check only by accident of tol; make it loud regardless).
+  a[0] = INFINITY;
+  auto inf_got = CompareTensors(ta, tb, 1e-6, 1e-6);
+  REQUIRE(inf_got.has_value());
+  CHECK(inf_got->find("non-finite in got") != std::string::npos);
+  a[0] = 1.0f;
+
+  // Inf in want → also an error.
+  b[2] = INFINITY;
+  auto inf_want = CompareTensors(ta, tb, 1e-6, 1e-6);
+  REQUIRE(inf_want.has_value());
+  CHECK(inf_want->find("non-finite in want") != std::string::npos);
 }
 
 TEST_CASE("op parity vs upstream goldens") {

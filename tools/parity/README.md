@@ -15,9 +15,15 @@ drift — see .agents/state.md 2026-07-03 note).
 ## Oracle version vs upstream pin
 
 The oracle venv runs pip vLLM **0.24.0**, which is NEWER than the porting pin
-(`e24d1b24`, see .agents/upstream-sync.md). rmsnorm was verified drift-free.
-Before adding any new dumper (rope, MoE, attention, quant), diff that op's
+(`e24d1b24`, see .agents/upstream-sync.md). rmsnorm, silu_and_mul and rope are
+drift-verified vs the pin (byte-identical); matmul/embedding are pure-torch
+oracles. Before adding any new dumper (MoE, attention, quant), diff that op's
 `forward_native` between the installed 0.24.0 package and the pinned checkout
 at /home/mudler/_git/vllm — if semantics differ, dump from the pinned source
 instead and record how in the manifest args. Manifests always record the
 oracle version, so a silent regen with a different version shows up in git.
+
+Model/layer-level goldens (M0.7+) MUST be dumped from the pinned checkout
+(`PYTHONPATH=/home/mudler/_git/vllm` at the pin), not pip vLLM — per-op drift
+audits don't scale to whole-model forwards. torch version: manifests record it
+(2.11.0); keep the venv's torch matching when regenerating.

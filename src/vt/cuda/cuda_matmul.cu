@@ -5,6 +5,7 @@
 // here, naming the combo — never silently truncates. Compute type is
 // CUBLAS_COMPUTE_32F with f32 scale; all layouts are CUBLASLT_ORDER_ROW so no
 // host-side transposes are needed.
+// Upstream counterpart: torch.matmul/cublas path (no csrc kernel); cuBLASLt is our native equivalent.
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 

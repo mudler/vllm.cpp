@@ -38,6 +38,7 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
 
 // ---------------------------------------------------------------------------
 // rmsnorm: one block per row, shared-memory f32 tree reduction.
+// Upstream csrc counterpart: csrc/layernorm_kernels.cu (rms_norm_kernel / fused_add_rms_norm_kernel) — align signatures post-MVP.
 
 template <typename Tin, typename Tout>
 __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, float* residual,
@@ -107,6 +108,7 @@ void RmsNormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
 
 // ---------------------------------------------------------------------------
 // silu_and_mul: grid-stride over the T*D output elements.
+// Upstream csrc counterpart: csrc/activation_kernels.cu (act_and_mul_kernel<silu>) — align post-MVP.
 
 template <typename Tin, typename Tout>
 __global__ void SiluAndMulKernel(Tout* out, const Tin* x, int64_t n, int64_t d) {
@@ -156,6 +158,7 @@ void SiluAndMulKernelCuda(Queue& q, Tensor& out, const Tensor& x) {
 // synchronizes the stream, reads the flag back, and throws — CUDA Embedding is
 // synchronizing for now (M0.6 decision, see ops.h; revisit for full async in
 // M0.9/M2).
+// No direct csrc counterpart (upstream uses torch embedding); keep vt-native.
 
 struct EmbeddingErr {
   int status;    // 0 = ok, 1 = bad id recorded
@@ -238,6 +241,7 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
 // ---------------------------------------------------------------------------
 // rope_neox: grid-stride over (token, head, rotation pair) across q and k.
 // Angle math in double (pow/cos/sin) to match the CPU reference numerics.
+// Upstream csrc counterpart: csrc/pos_encoding_kernels.cu (rotary_embedding_kernel) — align post-MVP.
 
 template <typename T, typename Tid>
 __global__ void RopeNeoxKernel(T* qs, T* ks, const Tid* pos, int64_t hq, int64_t hk,

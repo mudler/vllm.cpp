@@ -7,3 +7,7 @@ compile_commands.json
 *.so
 .venv/
 __pycache__/
+
+# stray compiler output
+a.out
+*.out

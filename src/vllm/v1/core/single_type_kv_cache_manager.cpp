@@ -110,7 +110,13 @@ void SingleTypeKVCacheManager::add_local_computed_blocks(
     assert(computed.empty());
   }
 
-  req_blocks.insert(req_blocks.end(), num_skipped_blocks, _null_block);
+  // Python `[null] * n` yields [] for n<0; here num_skipped_blocks can be -1
+  // (MambaManager.get_num_skipped_tokens(0) == -1 → -1/block_size, which is 0
+  // for block_size>=2 but -1 at block_size==1). Clamp so a negative count never
+  // reaches insert()'s size_type param (which would wrap to SIZE_MAX). See
+  // M1.3 Task 3 review (division-semantics audit).
+  req_blocks.insert(req_blocks.end(), static_cast<size_t>(std::max(0, num_skipped_blocks)),
+                    _null_block);
   req_blocks.insert(req_blocks.end(), computed.begin(), computed.end());
   num_cached_block[request_id] = static_cast<int>(req_blocks.size());
 }

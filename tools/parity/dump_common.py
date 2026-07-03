@@ -12,6 +12,7 @@ DTYPE_NAMES = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16
 
 
 def _to_numpy(t: torch.Tensor) -> np.ndarray:
+    t = t.detach()
     if t.dtype in (torch.bfloat16, torch.float16):
         return t.contiguous().view(torch.uint16).cpu().numpy()
     return t.contiguous().cpu().numpy()

@@ -16,6 +16,10 @@
 #include <vector>
 
 #include "npy.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
 
@@ -696,6 +700,162 @@ void RunDenseAttention(Backend& b, Queue& q, const fs::path& dir, const json& m)
   RequireMatch("out", tgated, out_want.tensor, atol, rtol);
 }
 
+// --- qwen36 per-layer parity (M0.9 Task 4). These replay a SINGLE real
+// decoder layer / embed / final-norm against the pinned-oracle goldens using
+// the REAL 35B weights (nvidia/Qwen3.6-35B-A3B-NVFP4). They are checkpoint-
+// GATED and dgx-only: when the snapshot is absent (CI, laptops) they SKIP
+// cleanly and do not count toward the case floor (like test_qwen36_weights).
+// The 27B goldens (dense Qwen3_5ForConditionalGeneration, deferred) are always
+// skipped — the 35B MoE loader cannot construct that arch. Each runner returns
+// true iff it actually ran.
+
+// "_35b" -> 35, "_27b" -> 27, else 0.
+int GoldenTag(const fs::path& dir) {
+  const std::string n = dir.filename().string();
+  if (n.size() >= 4) {
+    const std::string s = n.substr(n.size() - 4);
+    if (s == "_35b") return 35;
+    if (s == "_27b") return 27;
+  }
+  return 0;
+}
+
+// Snapshot dir of the pinned 35B checkpoint (contains config.json), or "".
+std::string Find35BSnapshot() {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return "";
+  const fs::path snaps =
+      fs::path(home) /
+      ".cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots";
+  std::error_code ec;
+  if (!fs::is_directory(snaps, ec)) return "";
+  for (const auto& e : fs::directory_iterator(snaps, ec)) {
+    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
+  }
+  return "";
+}
+
+std::optional<vllm::SafetensorsFile> OpenShard(const std::string& snapshot,
+                                               int n) {
+  char name[64];
+  std::snprintf(name, sizeof(name), "model-%05d-of-00003.safetensors", n);
+  const fs::path p = fs::path(snapshot) / name;
+  std::error_code ec;
+  if (!fs::exists(p, ec)) return std::nullopt;
+  return vllm::SafetensorsFile::Open(p.string());
+}
+
+// Common gate: 35B tag + snapshot present. Emits a loud SKIP and returns false
+// otherwise; on success returns true and sets `snap`.
+bool Qwen36Gate(const fs::path& dir, std::string& snap) {
+  if (GoldenTag(dir) != 35) {
+    MESSAGE("SKIP " << dir.filename().string()
+                    << ": only the 35B MoE checkpoint is loadable (27B deferred)");
+    return false;
+  }
+  snap = Find35BSnapshot();
+  if (snap.empty()) {
+    MESSAGE("SKIP " << dir.filename().string()
+                    << ": nvidia/Qwen3.6-35B-A3B-NVFP4 snapshot not present");
+    return false;
+  }
+  return true;
+}
+
+bool RunQwen36Embed(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  std::string snap;
+  if (!Qwen36Gate(dir, snap)) return false;
+  auto shard1 = OpenShard(snap, 1);
+  if (!shard1) {
+    MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
+    return false;
+  }
+  const vllm::StTensor& tab =
+      shard1->Get("model.language_model.embed_tokens.weight");
+  auto ids = LoadTensor(dir, m["tensors"]["token_ids"]);
+  auto want = LoadTensor(dir, m["tensors"]["embed"]);
+  const int64_t vocab = tab.shape[0], H = tab.shape[1], T = ids.tensor.shape[0];
+  DeviceBuf dtab(b, q, DType::kBF16, {vocab, H}, tab.data);
+  DeviceBuf dids(b, q, ids.dtype, ShapeOf(ids.tensor), ids.raw.data.data());
+  DeviceBuf dout(b, q, DType::kF32, {T, H});
+  vt::Embedding(q, dout.tensor(), dtab.tensor(), dids.tensor());
+  std::vector<uint8_t> out_host;
+  RequireMatch("embed", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
+  return true;
+}
+
+bool RunQwen36Norm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  std::string snap;
+  if (!Qwen36Gate(dir, snap)) return false;
+  // The final norm.weight lives in the last shard (layers 37-39 + norm +
+  // lm_head), per .agents/qwen36-forward-notes.md §6.
+  auto shard3 = OpenShard(snap, 3);
+  if (!shard3) {
+    MESSAGE("SKIP " << dir.filename().string() << ": shard 3 not found");
+    return false;
+  }
+  const vllm::StTensor& w = shard3->Get("model.language_model.norm.weight");
+  auto x = LoadTensor(dir, m["tensors"]["hidden_in"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  const int64_t H = w.shape[0];
+  DeviceBuf dx(b, q, x.dtype, ShapeOf(x.tensor), x.raw.data.data());
+  DeviceBuf dw(b, q, DType::kBF16, {H}, w.data);
+  DeviceBuf dout(b, q, DType::kF32, ShapeOf(x.tensor));
+  vt::RmsNormArgs args{m["args"]["eps"].get<float>(), /*gemma=*/false};
+  vt::RmsNorm(q, dout.tensor(), dx.tensor(), dw.tensor(), args);
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), want.tensor,
+               m["tol"]["atol"].get<double>(), m["tol"]["rtol"].get<double>());
+  return true;
+}
+
+// Replays a full GDN or full-attention decoder layer over the residual stream
+// (Qwen3_5ReplayLayer) against the real layer weights and the golden out.
+// Layer 0 (GDN) and layer 3 (full-attn) both live entirely in shard 1.
+// The layer replay drives its own device memory through Qwen3_5ReplayLayer
+// (which resolves the backend from the queue), so the pass Backend is unused.
+bool RunQwen36Layer(Backend& /*b*/, Queue& q, const fs::path& dir, const json& m) {
+  std::string snap;
+  if (!Qwen36Gate(dir, snap)) return false;
+  auto shard1 = OpenShard(snap, 1);
+  if (!shard1) {
+    MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
+    return false;
+  }
+  const vllm::SafetensorsFile& shard = *shard1;
+  const vllm::TensorResolver get =
+      [&shard](const std::string& n) -> const vllm::StTensor& {
+    return shard.Get(n);
+  };
+  const vllm::HfConfig cfg =
+      vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  const int64_t layer_idx = m["args"]["layer_idx"].get<int64_t>();
+  const std::string layer_type = m["args"]["layer_type"].get<std::string>();
+  const vllm::Qwen3_5MoeLayerWeights layer =
+      vllm::LoadQwen3_5MoeLayer(get, layer_type, layer_idx, cfg.num_experts);
+
+  auto x = LoadTensor(dir, m["tensors"]["hidden_in"]);
+  auto pos = LoadTensor(dir, m["tensors"]["positions"]);
+  auto want = LoadTensor(dir, m["tensors"]["out"]);
+  const int64_t T = x.tensor.shape[0], H = x.tensor.shape[1];
+  std::vector<float> hidden_in(static_cast<size_t>(T) * H);
+  std::memcpy(hidden_in.data(), x.raw.data.data(),
+              static_cast<size_t>(T) * H * sizeof(float));
+  // positions[3,T] i64; text-only rows are equal -> use row 0 (§2).
+  std::vector<int32_t> positions(static_cast<size_t>(T));
+  const int64_t* p = pos.tensor.Ptr<int64_t>();
+  for (int64_t t = 0; t < T; ++t)
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(p[t]);
+
+  std::vector<float> out =
+      vllm::Qwen3_5ReplayLayer(layer, cfg, hidden_in, positions, T, q);
+  Tensor got = MakeTensor(out.data(), DType::kF32, Cpu(), {T, H});
+  RequireMatch("out", got, want.tensor, m["tol"]["atol"].get<double>(),
+               m["tol"]["rtol"].get<double>());
+  return true;
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -704,13 +864,12 @@ void RunDenseAttention(Backend& b, Queue& q, const fs::path& dir, const json& m)
 // hard-FAILs, preserving the anti-stale-golden gate. Each entry MUST be removed
 // as its runner lands; the milestone close-out asserts this set is empty of the
 // milestone's ops (M0.8: moe_router_topk → Task 2, moe_block → Task 2 runner).
-// M0.9: the qwen36 layer/model goldens landed in Task 1 ahead of the Task 2/4
-// runners (dense-attention op + forward assembly); qwen36_fullattn_layer →
-// Task 2, qwen36_{embed,gdn_layer,norm,logits} → Task 4 layer/forward runners.
+// M0.9: the qwen36 layer/model goldens landed in Task 1 ahead of the runners.
+// Task 4 landed the per-layer runners (qwen36_{embed,gdn_layer,fullattn_layer,
+// norm}) — checkpoint-gated, dgx-only — so only qwen36_logits (the full-model
+// gate) remains pending for Task 5.
 const std::set<std::string>& PendingRunnerOps() {
-  static const std::set<std::string> kPending = {
-      "qwen36_embed",   "qwen36_gdn_layer", "qwen36_fullattn_layer",
-      "qwen36_norm",    "qwen36_logits"};
+  static const std::set<std::string> kPending = {"qwen36_logits"};
   return kPending;
 }
 
@@ -764,6 +923,12 @@ int RunGoldenPass(Device dev) {
       RunMoeBlock(b, q, entry.path(), m);
     } else if (op == "dense_attention") {
       RunDenseAttention(b, q, entry.path(), m);
+    } else if (op == "qwen36_embed") {
+      if (!RunQwen36Embed(b, q, entry.path(), m)) continue;  // skip (no ckpt)
+    } else if (op == "qwen36_norm") {
+      if (!RunQwen36Norm(b, q, entry.path(), m)) continue;
+    } else if (op == "qwen36_gdn_layer" || op == "qwen36_fullattn_layer") {
+      if (!RunQwen36Layer(b, q, entry.path(), m)) continue;
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");

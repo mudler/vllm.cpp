@@ -18,3 +18,7 @@ vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
+
+vllm_cpp_add_test(test_npy parity/test_npy.cpp)
+target_compile_definitions(test_npy PRIVATE
+  VLLM_CPP_GOLDENS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/parity/goldens")

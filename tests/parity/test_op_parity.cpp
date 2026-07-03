@@ -192,6 +192,39 @@ std::vector<int64_t> ShapeOf(const Tensor& t) {
   return std::vector<int64_t>(t.shape, t.shape + t.rank);
 }
 
+// Stores an f32 value into a host tensor at its declared dtype (f32 direct,
+// bf16 rounded). Mirror of the kernel-side StoreF32 for runner-composed
+// intermediates (shared-expert output).
+void StoreAs(const Tensor& t, int64_t i, float v) {
+  switch (t.dtype) {
+    case DType::kF32: t.Ptr<float>()[i] = v; break;
+    case DType::kBF16: t.Ptr<uint16_t>()[i] = vt::F32ToBF16(v); break;
+    default: throw std::runtime_error("StoreAs: bad dtype");
+  }
+}
+
+// Exact i32 comparison — router indices are an integer contract, never toleranced.
+void RequireExactI32(const std::string& name, const Tensor& got, const Tensor& want) {
+  REQUIRE(got.Numel() == want.Numel());
+  for (int64_t i = 0; i < got.Numel(); ++i) {
+    if (got.Ptr<int32_t>()[i] != want.Ptr<int32_t>()[i])
+      FAIL(name << "[" << i << "]: got " << got.Ptr<int32_t>()[i] << " want "
+                << want.Ptr<int32_t>()[i]);
+  }
+}
+
+// Transposes a row-major [r,c] byte buffer to [c,r], preserving element bytes.
+// Used to feed weight matrices (stored [out,in]) to vt::Matmul, which needs the
+// b operand as [in,out] (the .T that upstream F.linear applies).
+std::vector<uint8_t> TransposeBytes(const char* src, int64_t r, int64_t c, size_t esize) {
+  std::vector<uint8_t> out(static_cast<size_t>(r * c) * esize);
+  for (int64_t i = 0; i < r; ++i)
+    for (int64_t j = 0; j < c; ++j)
+      std::memcpy(out.data() + (static_cast<size_t>(j * r + i)) * esize,
+                  src + (static_cast<size_t>(i * c + j)) * esize, esize);
+  return out;
+}
+
 void RunRmsNorm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   auto x = LoadTensor(dir, m["tensors"]["x"]);
   auto w = LoadTensor(dir, m["tensors"]["weight"]);
@@ -456,6 +489,147 @@ void RunGdnDecode(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   RequireMatch("state_out", dst.Download(q, st_host), want_st.tensor, atol, rtol);
 }
 
+// --- MoE runners (M0.8). Goldens are pinned-oracle dumps (Task 1);
+// .agents/moe-semantics.md is the formula reference.
+
+// moe_router_topk: logits [T,E] -> weights [T,K] f32 + ids [T,K] i32
+// (moe-semantics.md §3). weights are toleranced, ids are an exact match.
+void RunMoeRouterTopK(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto logits = LoadTensor(dir, m["tensors"]["logits"]);
+  auto w_want = LoadTensor(dir, m["tensors"]["topk_weights"]);
+  auto id_want = LoadTensor(dir, m["tensors"]["topk_ids"]);
+  const int64_t t = logits.tensor.shape[0];
+  const int top_k = m["args"]["top_k"].get<int>();
+  const bool renorm = m["args"]["renormalize"].get<bool>();
+  DeviceBuf dlog(b, q, logits.dtype, ShapeOf(logits.tensor), logits.raw.data.data());
+  DeviceBuf dw(b, q, DType::kF32, {t, top_k});
+  DeviceBuf did(b, q, DType::kI32, {t, top_k});
+  vt::MoeRouterTopK(q, dw.tensor(), did.tensor(), dlog.tensor(),
+                    vt::MoeRouterTopKArgs{top_k, renorm});
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+  std::vector<uint8_t> w_host, id_host;
+  RequireMatch("topk_weights", dw.Download(q, w_host), w_want.tensor, atol, rtol);
+  RequireExactI32("topk_ids", did.Download(q, id_host), id_want.tensor);
+}
+
+// moe_block: full Qwen3NextSparseMoeBlock (moe-semantics.md §1-§6). Composes
+// the router (gate F.linear -> MoeRouterTopK), the per-expert silu-mul MLP
+// (Matmul + SiluAndMul + Matmul, §4), the shared expert with sigmoid gate (§5)
+// and the weighted combine (MoeCombine, §6). Intermediates dumped by the oracle
+// (router_logits/topk_*/routed_out/shared_out) are cross-checked; `out` is the
+// layer-level contract. Intermediate buffers use the case (activation) dtype so
+// the bf16 case mirrors the oracle's bf16 activation arithmetic.
+void RunMoeBlock(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto x = LoadTensor(dir, m["tensors"]["x"]);
+  auto gate_w = LoadTensor(dir, m["tensors"]["gate_w"]);
+  auto w13 = LoadTensor(dir, m["tensors"]["w13"]);
+  auto w2 = LoadTensor(dir, m["tensors"]["w2"]);
+  auto wsgu = LoadTensor(dir, m["tensors"]["w_shared_gate_up"]);
+  auto wsd = LoadTensor(dir, m["tensors"]["w_shared_down"]);
+  auto wsg = LoadTensor(dir, m["tensors"]["w_shared_gate"]);
+  auto rl_want = LoadTensor(dir, m["tensors"]["router_logits"]);
+  auto tw_want = LoadTensor(dir, m["tensors"]["topk_weights"]);
+  auto tid_want = LoadTensor(dir, m["tensors"]["topk_ids"]);
+  auto routed_want = LoadTensor(dir, m["tensors"]["routed_out"]);
+  auto shared_want = LoadTensor(dir, m["tensors"]["shared_out"]);
+  auto out_want = LoadTensor(dir, m["tensors"]["out"]);
+
+  const DType act = x.dtype;  // activation/model dtype (§2)
+  const int64_t T = x.tensor.shape[0], H = x.tensor.shape[1];
+  const int64_t E = m["args"]["num_experts"].get<int64_t>();
+  const int64_t I = m["args"]["moe_intermediate"].get<int64_t>();
+  const int64_t Is = m["args"]["shared_intermediate"].get<int64_t>();
+  const int top_k = m["args"]["top_k"].get<int>();
+  const bool renorm = m["args"]["renormalize"].get<bool>();
+  const size_t es = vt::SizeOf(act);
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+
+  DeviceBuf dx(b, q, act, {T, H}, x.raw.data.data());
+
+  // Router: logits = x @ gate_w.T ; softmax/top-k (§2/§3).
+  auto gate_wT = TransposeBytes(gate_w.raw.data.data(), E, H, es);
+  DeviceBuf dgwT(b, q, act, {H, E}, gate_wT.data());
+  DeviceBuf dlogits(b, q, act, {T, E});
+  vt::Matmul(q, dlogits.tensor(), dx.tensor(), dgwT.tensor());
+  DeviceBuf dtw(b, q, DType::kF32, {T, top_k});
+  DeviceBuf dtid(b, q, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(q, dtw.tensor(), dtid.tensor(), dlogits.tensor(),
+                    vt::MoeRouterTopKArgs{top_k, renorm});
+  std::vector<uint8_t> rl_host, tw_host, tid_host;
+  RequireMatch("router_logits", dlogits.Download(q, rl_host), rl_want.tensor, atol, rtol);
+  RequireMatch("topk_weights", dtw.Download(q, tw_host), tw_want.tensor, atol, rtol);
+  Tensor tid_got = dtid.Download(q, tid_host);
+  RequireExactI32("topk_ids", tid_got, tid_want.tensor);
+
+  // Per-expert silu-mul MLP (§4). For each expert e compute the MLP over ALL
+  // tokens, then scatter its rows into the slots routed to e.
+  std::vector<uint8_t> expert_out(static_cast<size_t>(T * top_k * H) * es, 0);
+  const char* w13p = w13.raw.data.data();
+  const char* w2p = w2.raw.data.data();
+  for (int64_t e = 0; e < E; ++e) {
+    auto w13T = TransposeBytes(w13p + static_cast<size_t>(e * 2 * I * H) * es, 2 * I, H, es);
+    auto w2T = TransposeBytes(w2p + static_cast<size_t>(e * H * I) * es, H, I, es);
+    DeviceBuf dw13T(b, q, act, {H, 2 * I}, w13T.data());
+    DeviceBuf dw2T(b, q, act, {I, H}, w2T.data());
+    DeviceBuf dh1(b, q, act, {T, 2 * I});
+    vt::Matmul(q, dh1.tensor(), dx.tensor(), dw13T.tensor());
+    DeviceBuf da(b, q, act, {T, I});
+    vt::SiluAndMul(q, da.tensor(), dh1.tensor());
+    DeviceBuf dy(b, q, act, {T, H});
+    vt::Matmul(q, dy.tensor(), da.tensor(), dw2T.tensor());
+    std::vector<uint8_t> y_host;
+    dy.Download(q, y_host);
+    for (int64_t row = 0; row < T; ++row)
+      for (int k = 0; k < top_k; ++k)
+        if (tid_got.Ptr<int32_t>()[row * top_k + k] == e)
+          std::memcpy(expert_out.data() + (static_cast<size_t>((row * top_k + k) * H)) * es,
+                      y_host.data() + static_cast<size_t>(row * H) * es,
+                      static_cast<size_t>(H) * es);
+  }
+
+  // Routed combine (§4 weighted sum, f32 accumulation).
+  DeviceBuf de(b, q, act, {T, top_k, H}, expert_out.data());
+  DeviceBuf droute(b, q, DType::kF32, {T, H});
+  vt::MoeCombine(q, droute.tensor(), de.tensor(), dtw.tensor(), nullptr);
+  std::vector<uint8_t> route_host;
+  RequireMatch("routed_out", droute.Download(q, route_host), routed_want.tensor, atol, rtol);
+
+  // Shared expert (§5): s = silu(x@Wgate)*x@Wup ; sd = s@Wdown ;
+  // shared = sigmoid(x@Wseg) * sd.
+  auto wsguT = TransposeBytes(wsgu.raw.data.data(), 2 * Is, H, es);
+  DeviceBuf dwsguT(b, q, act, {H, 2 * Is}, wsguT.data());
+  DeviceBuf dgu(b, q, act, {T, 2 * Is});
+  vt::Matmul(q, dgu.tensor(), dx.tensor(), dwsguT.tensor());
+  DeviceBuf dsact(b, q, act, {T, Is});
+  vt::SiluAndMul(q, dsact.tensor(), dgu.tensor());
+  auto wsdT = TransposeBytes(wsd.raw.data.data(), H, Is, es);
+  DeviceBuf dwsdT(b, q, act, {Is, H}, wsdT.data());
+  DeviceBuf dsd(b, q, act, {T, H});
+  vt::Matmul(q, dsd.tensor(), dsact.tensor(), dwsdT.tensor());
+  auto wsgT = TransposeBytes(wsg.raw.data.data(), 1, H, es);
+  DeviceBuf dwsgT(b, q, act, {H, 1}, wsgT.data());
+  DeviceBuf dgl(b, q, act, {T, 1});
+  vt::Matmul(q, dgl.tensor(), dx.tensor(), dwsgT.tensor());
+  std::vector<uint8_t> sd_host, gl_host;
+  Tensor tsd = dsd.Download(q, sd_host);
+  Tensor tgl = dgl.Download(q, gl_host);
+  std::vector<uint8_t> shared_host(static_cast<size_t>(T * H) * es, 0);
+  Tensor t_shared = MakeTensor(shared_host.data(), act, Cpu(), {T, H});
+  for (int64_t row = 0; row < T; ++row) {
+    const float gate = 1.0f / (1.0f + std::exp(-AsF32(tgl, row)));  // sigmoid(gate logit)
+    for (int64_t col = 0; col < H; ++col)
+      StoreAs(t_shared, row * H + col, gate * AsF32(tsd, row * H + col));
+  }
+  RequireMatch("shared_out", t_shared, shared_want.tensor, atol, rtol);
+
+  // Final block output (§6): out = shared + routed.
+  DeviceBuf dsh(b, q, act, {T, H}, shared_host.data());
+  DeviceBuf dout(b, q, DType::kF32, {T, H});
+  vt::MoeCombine(q, dout.tensor(), de.tensor(), dtw.tensor(), &dsh.tensor());
+  std::vector<uint8_t> out_host;
+  RequireMatch("out", dout.Download(q, out_host), out_want.tensor, atol, rtol);
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -465,7 +639,7 @@ void RunGdnDecode(Backend& b, Queue& q, const fs::path& dir, const json& m) {
 // as its runner lands; the milestone close-out asserts this set is empty of the
 // milestone's ops (M0.8: moe_router_topk → Task 2, moe_block → Task 2 runner).
 const std::set<std::string>& PendingRunnerOps() {
-  static const std::set<std::string> kPending = {"moe_router_topk", "moe_block"};
+  static const std::set<std::string> kPending = {};
   return kPending;
 }
 
@@ -513,6 +687,10 @@ int RunGoldenPass(Device dev) {
       RunGdnPrefill(b, q, entry.path(), m);
     } else if (op == "gdn_decode") {
       RunGdnDecode(b, q, entry.path(), m);
+    } else if (op == "moe_router_topk") {
+      RunMoeRouterTopK(b, q, entry.path(), m);
+    } else if (op == "moe_block") {
+      RunMoeBlock(b, q, entry.path(), m);
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");
@@ -576,7 +754,7 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  CHECK(cases >= 24);
+  CHECK(cases >= 29);  // 24 pre-M0.8 + 5 MoE (router x3, block x2)
 }
 
 // Same cases, same tolerances, on the GPU: inputs are uploaded through the

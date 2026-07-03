@@ -265,4 +265,53 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
                                                                         beta, state, args);
 }
 
+void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                   const MoeRouterTopKArgs& args) {
+  VT_CHECK(logits.rank == 2 && weights.rank == 2 && indices.rank == 2,
+           "moe_router_topk: logits/weights/indices rank-2");
+  const int64_t t = logits.shape[0], e = logits.shape[1];
+  VT_CHECK(args.top_k >= 1 && args.top_k <= e,
+           "moe_router_topk: top_k must be in [1, num_experts]");
+  VT_CHECK(weights.shape[0] == t && weights.shape[1] == args.top_k,
+           "moe_router_topk: weights must be [T, top_k]");
+  VT_CHECK(indices.shape[0] == t && indices.shape[1] == args.top_k,
+           "moe_router_topk: indices must be [T, top_k]");
+  VT_CHECK(IsFloat(logits.dtype), "moe_router_topk: logits must be a float dtype");
+  VT_CHECK(weights.dtype == DType::kF32, "moe_router_topk: weights must be f32");
+  VT_CHECK(indices.dtype == DType::kI32, "moe_router_topk: indices must be i32");
+  VT_CHECK(logits.IsContiguous() && weights.IsContiguous() && indices.IsContiguous(),
+           "moe_router_topk: contiguous required");
+  VT_CHECK(logits.device == q.device && weights.device == q.device &&
+               indices.device == q.device,
+           "moe_router_topk: device mismatch (logits/weights/indices/queue)");
+  reinterpret_cast<MoeRouterTopKFn>(GetOp(OpId::kMoeRouterTopK, q.device.type))(
+      q, weights, indices, logits, args);
+}
+
+void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                const Tensor* shared) {
+  VT_CHECK(expert_out.rank == 3 && weights.rank == 2 && out.rank == 2,
+           "moe_combine: expert_out [T,K,H], weights [T,K], out [T,H]");
+  const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
+  VT_CHECK(expert_out.shape[0] == t && expert_out.shape[1] == k && expert_out.shape[2] == h,
+           "moe_combine: expert_out must be [T,K,H] matching out/weights");
+  VT_CHECK(weights.shape[0] == t, "moe_combine: weights token count must match out");
+  VT_CHECK(IsFloat(expert_out.dtype) && IsOutFloat(out.dtype),
+           "moe_combine: float expert_out, f32/bf16 out");
+  VT_CHECK(weights.dtype == DType::kF32, "moe_combine: weights must be f32");
+  VT_CHECK(expert_out.IsContiguous() && weights.IsContiguous() && out.IsContiguous(),
+           "moe_combine: contiguous required");
+  VT_CHECK(expert_out.device == q.device && weights.device == q.device &&
+               out.device == q.device,
+           "moe_combine: device mismatch (expert_out/weights/out/queue)");
+  if (shared != nullptr) {
+    VT_CHECK(shared->rank == 2 && shared->shape[0] == t && shared->shape[1] == h &&
+                 IsFloat(shared->dtype) && shared->IsContiguous() &&
+                 shared->device == q.device,
+             "moe_combine: shared must be float [T,H] contiguous on the queue device");
+  }
+  reinterpret_cast<MoeCombineFn>(GetOp(OpId::kMoeCombine, q.device.type))(q, out, expert_out,
+                                                                          weights, shared);
+}
+
 }  // namespace vt

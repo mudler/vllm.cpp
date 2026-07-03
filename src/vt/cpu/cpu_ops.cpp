@@ -1,6 +1,7 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -300,6 +301,71 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
   }
 }
 
+// §3 router: softmax (f32, over all E) -> greedy top-k (lowest-index tie-break)
+// -> optional renormalize. weights [T,K] f32, indices [T,K] i32.
+void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor& logits,
+                         const MoeRouterTopKArgs& args) {
+  const int64_t t = logits.shape[0], e = logits.shape[1];
+  const int k = args.top_k;
+  std::vector<float> p(static_cast<size_t>(e));
+  std::vector<char> chosen(static_cast<size_t>(e));
+  for (int64_t row = 0; row < t; ++row) {
+    // softmax(logits.float()) with max-subtraction (topk_softmax_kernels.cu).
+    float mx = -INFINITY;
+    for (int64_t j = 0; j < e; ++j) mx = std::max(mx, LoadF32(logits, row * e + j));
+    float sum = 0.0f;
+    for (int64_t j = 0; j < e; ++j) {
+      const float ex = std::exp(LoadF32(logits, row * e + j) - mx);
+      p[static_cast<size_t>(j)] = ex;
+      sum += ex;
+    }
+    for (int64_t j = 0; j < e; ++j) {
+      float& pj = p[static_cast<size_t>(j)];
+      pj = sum > 0.0f ? pj / sum : 0.0f;
+      if (!std::isfinite(pj)) pj = 0.0f;  // NaN/Inf clamp (.cu:136)
+      chosen[static_cast<size_t>(j)] = 0;
+    }
+    // Greedy argmax, k rounds; strict `>` over ascending j -> lowest index wins.
+    float denom = 0.0f;
+    for (int j = 0; j < k; ++j) {
+      int64_t best = -1;
+      float best_v = -INFINITY;
+      for (int64_t idx = 0; idx < e; ++idx) {
+        if (chosen[static_cast<size_t>(idx)]) continue;
+        if (p[static_cast<size_t>(idx)] > best_v) {
+          best_v = p[static_cast<size_t>(idx)];
+          best = idx;
+        }
+      }
+      chosen[static_cast<size_t>(best)] = 1;
+      weights.Ptr<float>()[row * k + j] = best_v;
+      indices.Ptr<int32_t>()[row * k + j] = static_cast<int32_t>(best);
+      denom += best_v;
+    }
+    if (args.renormalize) {
+      if (!(denom > 0.0f)) denom = 1.0f;  // (.cu:245-253) denom<=0 -> 1 guard
+      for (int j = 0; j < k; ++j) weights.Ptr<float>()[row * k + j] /= denom;
+    }
+  }
+}
+
+// §4/§6 weighted scatter-combine: out[t,:] = sum_j w[t,j]*expert_out[t,j,:]
+// (f32 accumulation) + shared[t,:] (optional). Stored at out's dtype.
+void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                      const Tensor* shared) {
+  const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
+  for (int64_t row = 0; row < t; ++row) {
+    for (int64_t col = 0; col < h; ++col) {
+      float acc = 0.0f;
+      for (int64_t j = 0; j < k; ++j)
+        acc += weights.Ptr<float>()[row * k + j] *
+               LoadF32(expert_out, (row * k + j) * h + col);
+      if (shared != nullptr) acc += LoadF32(*shared, row * h + col);
+      StoreF32(out, row * h + col, acc);
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     // static_cast against the ops.h aliases ties kernel signatures to the
@@ -327,6 +393,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    RegisterOp(OpId::kMoeRouterTopK, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernel)));
+    RegisterOp(OpId::kMoeCombine, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
   }
 } registrar;
 

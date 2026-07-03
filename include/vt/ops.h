@@ -17,6 +17,8 @@ enum class OpId : uint8_t {
   kRmsNormGated,
   kGdnPrefill,
   kGdnDecode,
+  kMoeRouterTopK,
+  kMoeCombine,
   kCount
 };
 
@@ -56,6 +58,15 @@ struct GdnArgs {
   float scale = 0.0f;
 };
 
+// MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).
+struct MoeRouterTopKArgs {
+  // Number of experts selected per token (top_k = num_experts_per_tok).
+  int top_k = 0;
+  // renormalize = norm_topk_prob (True for Qwen3.6, moe-semantics.md §1/§3):
+  // divide the k selected softmax probs by their sum (denom>0 guard).
+  bool renormalize = true;
+};
+
 // Kernel registration contract. Backends register one kernel per (OpId,
 // DeviceType); the kernel's signature must match the alias for its op
 // exactly. Register with a static_cast against the alias so signature drift
@@ -84,6 +95,10 @@ using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, con
                               const GdnArgs&);
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const Tensor&, const Tensor&, Tensor&, const GdnArgs&);
+using MoeRouterTopKFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
+using MoeCombineFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -187,5 +202,32 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 // §9). g/beta derivation from raw a/b/A_log/dt_bias is M0.9.
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args);
+
+// --- MoE (sparse mixture-of-experts) ops. Formula reference:
+// .agents/moe-semantics.md. The expert MLP itself is NOT an op — it is composed
+// in the layer/runner from Matmul + SiluAndMul (§4). These two ops cover the
+// pieces composition cannot express: the router top-k/normalize and the
+// weighted scatter-combine.
+
+// Router top-k (moe-semantics.md §3, upstream topk_softmax + fused_topk).
+// logits [T,E] any float dtype; softmax computed in f32 over ALL E experts,
+// greedy top-k (weights emitted in descending order per token), lowest expert
+// index wins ties, then optional renormalize (divide the k probs by their sum,
+// denom<=0 -> 1 guard). weights [T,top_k] f32, indices [T,top_k] i32.
+void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                   const MoeRouterTopKArgs& args);
+
+// Weighted scatter-combine of the per-expert outputs (moe-semantics.md §4/§6).
+//   out[t,:] = sum_j weights[t,j] * expert_out[t,j,:]   (f32 accumulation)
+//              + shared[t,:]                            (when shared != nullptr)
+// expert_out [T,K,H] any float dtype (the K per-slot expert MLP outputs for
+// token t), weights [T,K] f32 (router weights, §3), optional shared [T,H] any
+// float dtype (the shared-expert term, §5). out [T,H] f32 or bf16. The routed
+// f32 sum is stored at out's dtype; the shared term is added in that same store
+// (§6 combine order: shared_output + routed_output). The activation-dtype
+// rounding of the routed sum before the shared add is carried by the caller
+// materializing expert_out/shared in the activation dtype.
+void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                const Tensor* shared = nullptr);
 
 }  // namespace vt

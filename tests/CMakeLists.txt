@@ -27,6 +27,7 @@ vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
+vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 
 vllm_cpp_add_test(test_npy parity/test_npy.cpp)
 target_compile_definitions(test_npy PRIVATE

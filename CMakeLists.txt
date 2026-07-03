@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
+option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121" CACHE STRING "Target CUDA architectures (GB10=121)")
 
@@ -76,4 +77,8 @@ endif()
 if(VLLM_CPP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(VLLM_CPP_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()

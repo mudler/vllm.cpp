@@ -100,6 +100,10 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 
 ## Post-MVP (T1 queue, reorder as needed)
 
+- ☐ **Kernel drop-in alignment** (user-mandated): reshape vt CUDA/ROCm kernel
+  entry points to match upstream csrc signatures so upstream kernels drop in;
+  see [backends.md](backends.md) §drop-in. Start after MVP gates pass.
+
 Dense/MoE model families (Llama/Qwen3/Mixtral…) · MTP spec decode · fp8 ·
 sliding window · priority scheduling · YaRN · prompt_logprobs/logit_bias/
 bad_words · tokenize endpoints · full metrics · Qwen3-Next. Then T2 per

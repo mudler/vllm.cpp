@@ -87,3 +87,18 @@ upstream platform PR ports mechanically.
 - A new backend lands like any port: parity harness (same golden dumps —
   they are backend-independent), behavioral suites unchanged, benchmark
   honesty per [workflow.md](workflow.md).
+
+## Post-MVP: drop-in kernel compatibility with upstream (user-mandated scope)
+
+Once the MVP gates pass, we will shape the kernel layer so that upstream vLLM
+kernels can be **dropped in and work** — at least for CUDA and AMD/ROCm:
+
+- Match upstream kernel entry-point signatures (raw device pointers, shapes/
+  strides, stream argument) at the vt-op adapter boundary, so a kernel lifted
+  from upstream `csrc/` (or its FlashInfer/Triton-compiled equivalents) binds
+  without rewriting — the torch::Tensor wrapper is the only part we replace.
+- Applies to future accelerators too where upstream has kernels (ROCm mirrors
+  CUDA signatures in csrc; XPU via upstream's SYCL contracts).
+- Design work starts after MVP, informed by the M0.6-M2 kernel experience;
+  until then, new vt CUDA kernels should note their upstream csrc counterpart
+  (if one exists) in a comment to make the later alignment mechanical.

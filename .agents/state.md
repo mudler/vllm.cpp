@@ -87,3 +87,7 @@
   PROVISIONAL. NEXT: M0.6 CUDA baseline ops on dgx.casa (carried items:
   fn-type aliases → ops.h; embedding GPU bounds contract; widen out-dtype
   validation for bf16 outputs).
+- **2026-07-03 (later)** — User scoped post-MVP goal: kernel-level drop-in
+  compatibility with upstream vLLM (CUDA/AMD first) — signatures aligned so
+  upstream kernels bind without rewrite. Recorded in backends.md + roadmap
+  post-MVP queue; to be shaped after MVP with M0.6-M2 experience in hand.

@@ -124,3 +124,8 @@ Qwen3.6-35B-A3B NVFP4 dense/MoE), so the reader supports id 40 for those.
 - Expert weights are the NVFP4 target in fork models (MoE `*_exps` 3-d
   tensors), same tensor family APEX-Mini puts in IQ2_S — M2.2 should plan
   for quantized 3-d expert tensors with per-expert row strides in blocks.
+
+**M2.2 kernel-author trap (review finding):** the fork's `ggml_ue4m3_to_fp32`
+returns value × 0.5 to compensate for the 2×-scaled `kvalues_mxfp4` LUT (see
+ggml-impl.h comment; 0x7F decodes to 0). If you write your own UE4M3 decode
+from the bias=7 spec while reusing the fork LUT, you will be 2× off.

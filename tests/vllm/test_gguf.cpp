@@ -380,6 +380,10 @@ TEST_CASE("ggml traits: standard table values") {
   CHECK(vllm::GgmlTraits(12).block_bytes == 144);
   CHECK(vllm::GgmlTraits(13).block_bytes == 176);  // Q5_K
   CHECK(vllm::GgmlTraits(14).block_bytes == 210);  // Q6_K
+  CHECK(vllm::GgmlTraits(22).block_elems == 256);  // IQ2_S (APEX Mini)
+  CHECK(vllm::GgmlTraits(22).block_bytes == 82);
+  CHECK(vllm::GgmlTraits(23).block_elems == 256);  // IQ4_XS (APEX Quality)
+  CHECK(vllm::GgmlTraits(23).block_bytes == 136);
   CHECK(vllm::GgmlTraits(24).block_bytes == 1);    // I8
   CHECK(vllm::GgmlTraits(25).block_bytes == 2);    // I16
   CHECK(vllm::GgmlTraits(26).block_bytes == 4);    // I32
@@ -387,6 +391,56 @@ TEST_CASE("ggml traits: standard table values") {
   CHECK(vllm::GgmlTraits(28).block_bytes == 8);    // F64
   CHECK(vllm::GgmlTraits(30).block_bytes == 2);    // BF16
   CHECK(vllm::GgmlTraits(30).name == std::string("BF16"));
+}
+
+TEST_CASE("ggml traits: killgate fork extension ids (NVFP4, Q1_0, MXFP4)") {
+  // Ids/geometry from mudler's killgate llama.cpp fork
+  // (ggml/include/ggml.h:429-431, ggml/src/ggml-common.h). See
+  // .agents/gguf-nvfp4-notes.md.
+  CHECK(vllm::GgmlTraits(39).block_elems == 32);  // MXFP4: 1 E8M0 + 16 qs
+  CHECK(vllm::GgmlTraits(39).block_bytes == 17);
+  CHECK(vllm::GgmlTraits(39).name == std::string("MXFP4"));
+  CHECK(vllm::GgmlTraits(40).block_elems == 64);  // NVFP4: 4 UE4M3 + 32 qs
+  CHECK(vllm::GgmlTraits(40).block_bytes == 36);
+  CHECK(vllm::GgmlTraits(40).name == std::string("NVFP4"));
+  CHECK(vllm::GgmlTraits(41).block_elems == 128);  // Q1_0: f16 d + 16 qs
+  CHECK(vllm::GgmlTraits(41).block_bytes == 18);
+  CHECK(vllm::GgmlTraits(41).name == std::string("Q1_0"));
+}
+
+TEST_CASE("gguf: synthetic NVFP4 tensor (fork type id 40) nbytes math") {
+  // One tensor, ggml dims [64, 3] (192 elements = 3 NVFP4 blocks), so
+  // nbytes must be 3 * 36 = 108. Layout per killgate fork block_nvfp4:
+  // 4 UE4M3 sub-block scales then 32 bytes of packed e2m1 nibbles.
+  std::string f = Header(3, /*tensors=*/1, /*kvs=*/1);
+  f += GStr("general.alignment") + U32Le(4) + U32Le(32);
+  f += GStr("w_nvfp4") + U32Le(2) + U64Le(64) + U64Le(3) + U32Le(40) +
+       U64Le(0);
+  PadTo(f, 32);
+  std::string block;
+  for (int i = 0; i < 4; ++i) block.push_back(static_cast<char>(0x40 + i));
+  for (int i = 0; i < 32; ++i) block.push_back(static_cast<char>(i));
+  for (int b = 0; b < 3; ++b) f += block;
+  TempFile tf(f);
+
+  vllm::GgufFile g = vllm::GgufFile::Open(tf.path());
+  const vllm::GgufTensorInfo& t = g.Get("w_nvfp4");
+  CHECK(t.ggml_type == 40);
+  CHECK(t.shape == std::vector<int64_t>({3, 64}));
+  REQUIRE(t.nbytes == 108);  // 192 / 64 * 36
+  CHECK(t.data[0] == 0x40);         // first sub-block scale
+  CHECK(t.data[4] == 0x00);         // first packed e2m1 byte
+  CHECK(t.data[36 + 3] == 0x43);    // block 1, 4th scale
+  CHECK(t.data[2 * 36 + 4 + 31] == 31);  // last qs byte of block 2
+
+  // A 96-element NVFP4 tensor is not divisible by the 64-element block.
+  std::string bad = Header(3, 1, 0);
+  bad += GStr("w_bad") + U32Le(1) + U64Le(96) + U32Le(40) + U64Le(0);
+  PadTo(bad, 32);
+  bad += std::string(54, '\0');
+  TempFile tbad(bad);
+  CHECK_THROWS_WITH_AS(vllm::GgufFile::Open(tbad.path()),
+                       doctest::Contains("NVFP4"), std::runtime_error);
 }
 
 TEST_CASE("ggml traits: unknown type id throws") {

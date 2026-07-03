@@ -180,8 +180,14 @@ GgufValue ReadValue(Cursor& cur, uint32_t type, int depth,
 
 // Standard ggml type traits. Ids and block geometry mirror ggml.h's
 // enum ggml_type / type_traits table (llama.cpp); recorded here so the
-// reader has no ggml dependency. Task 5 extends this with the fork-specific
-// NVFP4 ids.
+// reader has no ggml dependency.
+//
+// Ids 39-41 follow mudler's killgate llama.cpp fork
+// (~/llama-phase84-attn-only-source on dgx.casa), which appends
+// GGML_TYPE_NVFP4 = 40 and GGML_TYPE_Q1_0 = 41 after mainline's
+// GGML_TYPE_MXFP4 = 39 (ggml/include/ggml.h:429-431). Block geometry from
+// ggml/src/ggml-common.h and gguf-py/gguf/constants.py GGML_QUANT_SIZES.
+// See .agents/gguf-nvfp4-notes.md for the full layout writeup.
 const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
   switch (type) {
     case 0: {
@@ -220,6 +226,18 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 210, "Q6_K"};
       return &t;
     }
+    case 22: {
+      // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
+      // Used by the APEX "Mini" GGUFs for expert weights.
+      static constexpr GgmlTypeTraits t{256, 82, "IQ2_S"};
+      return &t;
+    }
+    case 23: {
+      // block_iq4_xs: f16 d + u16 scales_h + QK_K/64 scales_l + QK_K/2 qs
+      // = 2 + 2 + 4 + 128. Used by the APEX "Quality" GGUFs.
+      static constexpr GgmlTypeTraits t{256, 136, "IQ4_XS"};
+      return &t;
+    }
     case 24: {
       static constexpr GgmlTypeTraits t{1, 1, "I8"};
       return &t;
@@ -242,6 +260,28 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
     }
     case 30: {
       static constexpr GgmlTypeTraits t{1, 2, "BF16"};
+      return &t;
+    }
+    case 39: {
+      // block_mxfp4: u8 E8M0 scale + 16 bytes packed 4-bit e2m1
+      // (fork ggml-common.h:205-210; same id/geometry as mainline).
+      static constexpr GgmlTypeTraits t{32, 17, "MXFP4"};
+      return &t;
+    }
+    case 40: {
+      // Killgate fork extension: block_nvfp4 = 4 u8 UE4M3 scales (one per
+      // 16-element sub-block) + 32 bytes packed 4-bit e2m1 => 64 elems in
+      // 36 bytes. No per-tensor scale tensor; blocks are self-contained.
+      // Fork ggml-common.h:211-217, ggml.h:430, gguf-py constants.py
+      // GGML_QUANT_SIZES: (64, 4 + 32).
+      static constexpr GgmlTypeTraits t{64, 36, "NVFP4"};
+      return &t;
+    }
+    case 41: {
+      // Killgate fork extension: block_q1_0 = f16 d + QK1_0/8 bit-packed
+      // quants => 128 elems in 18 bytes (fork ggml-common.h:177-182,
+      // ggml.h:431).
+      static constexpr GgmlTypeTraits t{128, 18, "Q1_0"};
       return &t;
     }
     default:

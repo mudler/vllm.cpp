@@ -45,6 +45,7 @@ configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
 add_library(vllm STATIC
   src/vllm/version.cpp
+  src/vllm/transformers_utils/hf_config.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

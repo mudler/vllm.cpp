@@ -9,6 +9,7 @@ function(vllm_cpp_add_test name)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
+vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_cuda_smoke vt/test_cuda_smoke.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)
 vllm_cpp_add_test(test_backend vt/test_backend.cpp)

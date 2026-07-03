@@ -19,6 +19,8 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/registry.h"
+#include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
@@ -863,6 +865,146 @@ bool RunQwen36Layer(Backend& /*b*/, Queue& q, const fs::path& dir, const json& m
   return true;
 }
 
+// Argmax over one logit row [vocab]. Strict `>` keeps the FIRST maximum on
+// ties (lowest index), matching torch.argmax / vLLM greedy tie-breaking.
+int32_t ArgmaxRow(const float* row, int64_t vocab) {
+  int32_t best = 0;
+  float bv = row[0];
+  for (int64_t i = 1; i < vocab; ++i)
+    if (row[i] > bv) {
+      bv = row[i];
+      best = static_cast<int32_t>(i);
+    }
+  return best;
+}
+
+// --- Full-model logits parity + greedy decode — the M0 EXIT GATE (M0.9 Task 5).
+// Loads the WHOLE real 35B MoE checkpoint (all 3 shards, NVFP4/FP8 dequant +
+// transpose), resolves the forward through the model REGISTRY (exercising
+// ResolveModelForward), runs it on the pinned-oracle prompt, and asserts:
+//   (a) per-position logits track the oracle's top-1000 within a loose tol
+//       (measured/reported; the compounded 40-layer bf16-dequant gap);
+//   (b) the last-prefill-position argmax == the oracle's first greedy token;
+//   (c) autoregressive temperature-0 (greedy) decode reproduces the oracle's
+//       greedy token sequence TOKEN-FOR-TOKEN (the real M0-exit bar — exact).
+// Checkpoint-GATED + dgx-only (SKIPs cleanly without the 35B snapshot; the 27B
+// logits golden always SKIPs — dense arch, not loadable by the MoE loader).
+bool RunQwen36Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
+                     const json& m) {
+  std::string snap;
+  if (!Qwen36Gate(dir, snap)) return false;
+  std::vector<vllm::SafetensorsFile> shards;
+  for (int n = 1; n <= 3; ++n) {
+    auto s = OpenShard(snap, n);
+    if (!s) {
+      MESSAGE("SKIP " << dir.filename().string() << ": shard " << n
+                      << " not found");
+      return false;
+    }
+    shards.push_back(std::move(*s));
+  }
+  const vllm::HfConfig cfg =
+      vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  MESSAGE("qwen36_logits: loading full 35B weights (dequant + transpose)...");
+  const vllm::Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, cfg);
+  // Registry: architecture string -> forward (closes the Task 4 minor). This is
+  // the path a serving loader would take (config.architectures -> forward fn).
+  const vllm::ModelForwardFn forward = vllm::ResolveModelForward(cfg);
+
+  auto ids_l = LoadTensor(dir, m["tensors"]["token_ids"]);
+  const int64_t T0 = ids_l.tensor.shape[0];
+  const int32_t* idp = ids_l.tensor.Ptr<int32_t>();
+  std::vector<int32_t> token_ids(idp, idp + T0);
+  std::vector<int32_t> positions(static_cast<size_t>(T0));
+  for (int64_t t = 0; t < T0; ++t) positions[static_cast<size_t>(t)] =
+      static_cast<int32_t>(t);
+
+  const int64_t vocab = cfg.vocab_size;
+  MESSAGE("qwen36_logits: prefill forward on T=" << T0 << " (vocab " << vocab
+                                                 << ")...");
+  std::vector<float> logits = forward(token_ids, positions, weights, cfg, q);
+  REQUIRE(static_cast<int64_t>(logits.size()) == T0 * vocab);
+
+  // (a) top-1000 logit gap vs oracle. Loose tol (bf16-dequant vs the oracle's
+  // real NVFP4/FP8 GEMM, compounded over 40 layers + the f32-residual and
+  // f32-single-round MoeCombine deviations). Reported; the REAL bar is greedy.
+  auto tv = LoadTensor(dir, m["tensors"]["topk_values"]);   // f32 [T,1000]
+  auto ti = LoadTensor(dir, m["tensors"]["topk_indices"]);  // i32 [T,1000]
+  const int64_t topk = tv.tensor.shape[1];
+  const float* tvp = tv.tensor.Ptr<float>();
+  const int32_t* tip = ti.tensor.Ptr<int32_t>();
+  const double logit_atol = m["tol"]["logits_atol"].get<double>();
+  const double logit_rtol = m["tol"]["logits_rtol"].get<double>();
+  double max_gap = 0.0;
+  int64_t violations = 0;
+  for (int64_t t = 0; t < T0; ++t)
+    for (int64_t k = 0; k < topk; ++k) {
+      const int32_t idx = tip[t * topk + k];
+      const double got = logits[static_cast<size_t>(t) * vocab + idx];
+      const double want = tvp[t * topk + k];
+      const double gap = std::abs(got - want);
+      max_gap = std::max(max_gap, gap);
+      if (gap > logit_atol + logit_rtol * std::abs(want)) ++violations;
+    }
+
+  // (b) per-position prefill argmax vs oracle (informational; greedy only uses
+  // the last position, but a full match is a stronger correctness signal).
+  auto amx = LoadTensor(dir, m["tensors"]["argmax"]);  // i32 [T]
+  const int32_t* amp = amx.tensor.Ptr<int32_t>();
+  int argmax_match = 0;
+  for (int64_t t = 0; t < T0; ++t)
+    if (ArgmaxRow(&logits[static_cast<size_t>(t) * vocab], vocab) == amp[t])
+      ++argmax_match;
+
+  // (c) greedy decode: feed the argmax back, extend positions, and reproduce
+  // the oracle's continuation token-for-token. Step 0 reuses the prefill logits.
+  auto gid = LoadTensor(dir, m["tensors"]["greedy_ids"]);  // i32 [n_greedy]
+  const int64_t n_greedy = gid.tensor.shape[0];
+  const int32_t* gp = gid.tensor.Ptr<int32_t>();
+  std::vector<int32_t> ids = token_ids;
+  std::vector<int32_t> pos = positions;
+  std::vector<int32_t> produced;
+  int greedy_match = 0;
+  std::vector<float> cur = logits;  // prefill forward serves step 0
+  for (int64_t s = 0; s < n_greedy; ++s) {
+    const int64_t T = static_cast<int64_t>(ids.size());
+    const int32_t next =
+        ArgmaxRow(&cur[static_cast<size_t>(T - 1) * vocab], vocab);
+    produced.push_back(next);
+    if (next != gp[s]) break;  // first divergence — stop; greedy_match records it
+    ++greedy_match;
+    ids.push_back(next);
+    pos.push_back(static_cast<int32_t>(pos.size()));
+    if (s + 1 < n_greedy) cur = forward(ids, pos, weights, cfg, q);
+  }
+
+  // Decode the produced continuation for a human-readable coherence check.
+  std::string cont;
+  try {
+    const vllm::tok::Tokenizer tk =
+        vllm::tok::Tokenizer::FromHfJson((fs::path(snap) / "tokenizer.json").string());
+    cont = tk.Decode(produced);
+  } catch (const std::exception& e) {
+    cont = std::string("(decode unavailable: ") + e.what() + ")";
+  }
+
+  MESSAGE("qwen36_logits M0-EXIT: greedy_match=" << greedy_match << "/"
+          << n_greedy << " tokens (token-for-token); last-prefill argmax=="
+          << "first-greedy: " << (produced.empty() ? 0 : produced[0]) << " vs "
+          << gp[0] << "; per-pos argmax_match=" << argmax_match << "/" << T0
+          << "; max top-1000 logit gap=" << max_gap << " (atol/rtol bar "
+          << logit_atol << "/" << logit_rtol << ", " << violations
+          << " over-tol); continuation=\"" << cont << "\"");
+
+  // Hard gates. Greedy is EXACT and MUST match token-for-token (the M0 exit).
+  REQUIRE(greedy_match == n_greedy);
+  // Loose logit bar (reported above); a miss here with greedy still matching is
+  // the compounded bf16-dequant gap, not a token flip — investigate, do not
+  // loosen greedy. Kept as a REQUIRE so a regression surfaces.
+  REQUIRE(violations == 0);
+  return true;
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -873,10 +1015,11 @@ bool RunQwen36Layer(Backend& /*b*/, Queue& q, const fs::path& dir, const json& m
 // milestone's ops (M0.8: moe_router_topk → Task 2, moe_block → Task 2 runner).
 // M0.9: the qwen36 layer/model goldens landed in Task 1 ahead of the runners.
 // Task 4 landed the per-layer runners (qwen36_{embed,gdn_layer,fullattn_layer,
-// norm}) — checkpoint-gated, dgx-only — so only qwen36_logits (the full-model
-// gate) remains pending for Task 5.
+// norm}); Task 5 landed qwen36_logits (the full-model M0-exit gate). All
+// checkpoint-gated + dgx-only. This set is now EMPTY — every committed golden
+// has a runner (the anti-stale-golden gate is fully closed for M0).
 const std::set<std::string>& PendingRunnerOps() {
-  static const std::set<std::string> kPending = {"qwen36_logits"};
+  static const std::set<std::string> kPending = {};
   return kPending;
 }
 
@@ -936,6 +1079,8 @@ int RunGoldenPass(Device dev) {
       if (!RunQwen36Norm(b, q, entry.path(), m)) continue;
     } else if (op == "qwen36_gdn_layer" || op == "qwen36_fullattn_layer") {
       if (!RunQwen36Layer(b, q, entry.path(), m)) continue;
+    } else if (op == "qwen36_logits") {
+      if (!RunQwen36Logits(b, q, entry.path(), m)) continue;
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");

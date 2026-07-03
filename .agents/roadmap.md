@@ -64,7 +64,18 @@ model load (M0.10, k-quant dequant) remains open (T0).**
 
 ## M1 — The engine (concurrency, correctness under load)
 
-- ☐ **M1.1 core/ Request + SamplingParams + outputs** (T0 field set).
+**Status: begun 🚧 — M1.1 (engine core types) done; the shared engine
+vocabulary is ported.**
+
+- ✅ **M1.1 core/ Request + SamplingParams + outputs** (T0 field set)
+  (`b888645`/`fabf48f` SamplingParams, `4320dae`/`a43eaf8` Request+RequestStatus,
+  `cd13ec3` EngineCore I/O types, `4d477eb` RequestOutput; close-out adds the
+  `RequestOutput.prompt_logprobs` opaque placeholder):
+  SamplingParams (Verify/PostInit == `__post_init__`, eos on params),
+  Request + RequestStatus (12-status ordering, IsFinished, FinishReason map),
+  EngineCore I/O (EngineCoreRequest/Output(s), ModelRunnerOutput, SamplerOutput),
+  RequestOutput/CompletionOutput (FinishReason→string). All reviewed PASS, CI
+  green throughout; behavioral CPU unit tests, no goldens (structural port).
 - ☐ **M1.2 BlockPool + prefix caching** (hashing, refcount, eviction) +
   behavioral tests ported from upstream `tests/v1/core/`.
 - ☐ **M1.3 Hybrid KVCacheManager/coordinator** (full-attn group + GDN state

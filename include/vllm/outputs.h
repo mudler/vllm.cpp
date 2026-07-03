@@ -18,7 +18,8 @@
 //   CompletionOutput: routed_experts (np.ndarray [seq_len,layer_num,topk]),
 //     lora_request; logprobs detail (SampleLogprobs payload) is kept as an
 //     opaque optional flag until the sampler/logprobs unit lands.
-//   RequestOutput: prompt_logprobs (PromptLogprobs detail), metrics
+//   RequestOutput: prompt_logprobs detail (PromptLogprobs payload) is kept as
+//     an opaque optional flag until the sampler/logprobs unit lands; metrics
 //     (RequestStateStats), lora_request, encoder_prompt /
 //     encoder_prompt_token_ids (encoder/decoder models), num_cached_tokens
 //     (prefix-cache hit count), kv_transfer_params (P/D remote K/V), the
@@ -103,6 +104,11 @@ struct RequestOutput {
   std::vector<int32_t> prompt_token_ids;
   // The output sequences of the request (one per requested `n`).
   std::vector<CompletionOutput> outputs;
+  // PromptLogprobs | None upstream (required-positional; None on the plain
+  // generate path). Payload deferred; the engaged/disengaged state is kept as
+  // an opaque optional flag (mirrors CompletionOutput.logprobs) until the
+  // sampler/logprobs unit lands.
+  std::optional<bool> prompt_logprobs;
   // Whether the whole request is finished.
   bool finished = false;
 

@@ -84,6 +84,9 @@ TEST_CASE("RequestOutput default construction (generate path fields)") {
   CHECK(*req.prompt == "hi");
   CHECK(req.prompt_token_ids.size() == 2);
   CHECK(req.outputs.empty());
+  // Deferred logprobs placeholder starts disengaged (nullopt), mirroring
+  // CompletionOutput.logprobs.
+  CHECK_FALSE(req.prompt_logprobs.has_value());
   CHECK_FALSE(req.finished);
   CHECK_FALSE(req.Finished());
 }

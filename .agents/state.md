@@ -194,3 +194,30 @@
   28675136541 for the guardrail commit). NEXT (recommended): finish the GGUF
   model load (M0.10) next — it's a T0 gate and the model forward is fresh in
   hand — then begin M1.1 (engine core: Request/SamplingParams/outputs).
+- **2026-07-03 (later)** — **M1.1 done** (`4d477eb` final port; ports `b888645`/`fabf48f`
+  SamplingParams, `4320dae`/`a43eaf8` Request+RequestStatus, `cd13ec3` EngineCore
+  I/O types, `4d477eb` RequestOutput). **M1 (the engine) has begun.** The shared
+  engine vocabulary is now ported 1:1: SamplingParams (Verify/PostInit ==
+  `__post_init__`, eos_token_id on the params object per upstream, NOT on
+  Request), Request + RequestStatus (12-status ordering, IsFinished, the
+  FinishReason map), EngineCore I/O (EngineCoreRequest/EngineCoreOutput(s),
+  ModelRunnerOutput, SamplerOutput), and the public RequestOutput/CompletionOutput
+  (FinishReason→string via FINISH_REASON_STRINGS). All four ports were reviewed
+  PASS; CI green throughout; verification is behavioral CPU unit tests
+  (validation throws, status/finish-reason maps, string mapping) — no goldens, a
+  structural port. This close-out also adds `RequestOutput.prompt_logprobs`
+  (opaque `std::optional<bool>` placeholder, default nullopt) for symmetry with
+  CompletionOutput.logprobs (Task 4 review Important). CONTRACTS carried forward:
+  (1) **PostInit contract** — SamplingParams::PostInit mirrors `__post_init__`
+  and MUST be run by the constructing unit (M1.8 InputProcessor); the type does
+  not self-invoke it. DEFERRED-FIELDS carryovers for later units:
+  (2) **stop_reason → variant at M1.8 OutputProcessor** — currently
+  `std::optional<std::string>` (T0 deviation); upstream `int|str|None` fidelity
+  for the API is restored when the OutputProcessor lands.
+  (3) **logprobs placeholders → sampler unit** — CompletionOutput.logprobs and
+  RequestOutput.prompt_logprobs are opaque optionals (engaged/disengaged flag);
+  the SampleLogprobs/PromptLogprobs payloads land with the sampler/logprobs unit.
+  (4) **prompt_token_ids non-optional** — a plain vector (empty == upstream
+  None/[]) until prompt-embeds arrive. NEXT: **M1.2 BlockPool + prefix caching**
+  (the KV-cache foundation — hashing, refcount, LRU eviction; behavioral tests
+  ported from upstream `tests/v1/core/`).

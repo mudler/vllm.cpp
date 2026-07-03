@@ -248,3 +248,37 @@
   coordinator** — the gate models need a GDN-state group alongside the
   full-attn block group; assert the literal manager-level test_evict order
   `[6,10,5,4,3,2,1]`.
+- **2026-07-03 (later)** — **M1.3 done** (`75caf38`; ports `bae8f7a`
+  KVCacheSpec/KVCacheConfig, `ec6f4be`+`9f30013` SingleTypeKVCacheManager,
+  `5fdbb7b`+fix KVCacheCoordinator/HybridKVCacheCoordinator, `c708753`+
+  `75caf38` KVCacheManager). **The hybrid KV allocator is ported 1:1 from
+  e24d1b24** — the gate models' GDN recurrent-state group alongside the
+  full-attn block groups. Pieces: **KVCacheSpec hierarchy + KVCacheConfig**
+  (FullAttentionSpec/AttentionSpec/MambaSpec `page_size_bytes` byte-exact vs
+  upstream); **SingleTypeKVCacheManager** (FullAttentionManager = left→right
+  multi-block prefix; MambaManager = right→left single recurrent state,
+  `[NULL..state]`, skip-all-but-tail — mode-none gate path + same-step deferral
+  covered); **KVCacheCoordinator + HybridKVCacheCoordinator** (cross-group
+  `find_longest_cache_hit` = fixed-point MIN/intersection, full-attn-first
+  bounded shrink); **KVCacheManager** (allocate_slots line-by-line:
+  accounting/watermark/OOM→nullopt/admission-cap; literal test_evict order;
+  hybrid prefill). All reviewed PASS, CI green, ASan-clean; behavioral CPU tests
+  ported from upstream `tests/v1/core/{test_prefix_caching,
+  test_single_type_kv_cache_manager}.py` (allocate/OOM/watermark/hybrid/
+  literal-evict-order). **LESSONS / DEVIATIONS:** (a) **VERIFY-CURRENT-PINNED-API
+  is now a proven habit** — it caught classic-BlockPool in M1.2 and here caught
+  `add_local_computed_blocks` / `get_num_common_prefix_blocks(running_request_id)`
+  / `get_num_skipped_tokens`; always diff the port against the pin's live source.
+  (b) **Python-floor vs C++-trunc division audit** — MambaManager
+  `get_num_skipped_tokens` is the *sole* negative-operand source; spot-fixed
+  (including the `block_size==1` SIZE_MAX crash), no blanket floor_div applied.
+  (c) **sha256_cbor-default deviation still pending config-wiring** (carried from
+  M1.2). (d) **DEFERRED behind 1:1 stubs:** sliding-window/MLA/chunked-local
+  specs, mamba `align` mode, `enable_caching=false` NoPrefixCache, take_events/
+  stats. Close-out asserts: `PendingRunnerOps()` empty (grep-confirmed — M1.3
+  added no goldens, `tests/parity/test_op_parity.cpp:1035` kPending = {}); CI
+  green. NEXT: **M1.4 Scheduler** — the unified token-budget scheduling
+  (running-first then waiting, chunked prefill, FCFS preemption via
+  allocate_slots→nullopt, SchedulerOutput new/cached diff); the biggest engine
+  unit, ported from `vllm/v1/core/sched/scheduler.py` + `tests/v1/core/
+  test_scheduler.py`.

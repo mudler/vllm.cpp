@@ -82,8 +82,15 @@ vocabulary is ported.**
   Request block-hashes): hashing, refcount, LRU eviction; behavioral tests
   ported from upstream `tests/v1/core/`. All reviewed PASS, CI green,
   ASan-clean. Align/partial-block/events deferred behind 1:1 stubs.
-- ☐ **M1.3 Hybrid KVCacheManager/coordinator** (full-attn group + GDN state
-  group) + specs + allocate_slots/get_computed_blocks tests.
+- ✅ **M1.3 Hybrid KVCacheManager/coordinator** (`75caf38`; ports `bae8f7a`
+  KVCacheSpec/Config, `ec6f4be`+`9f30013` SingleTypeKVCacheManager
+  (FullAttention+Mamba/GDN), `5fdbb7b` KVCacheCoordinator+Hybrid, `c708753`+
+  `75caf38` KVCacheManager): full-attn block group + GDN/mamba recurrent-state
+  group; page_size_bytes byte-exact; cross-group MIN-intersection prefix hit;
+  allocate_slots (accounting/watermark/OOM→nullopt/admission-cap) + literal
+  test_evict order. All reviewed PASS, CI green, ASan-clean; behavioral CPU
+  tests ported from upstream `tests/v1/core/`. Sliding-window/MLA/chunked-local
+  specs + mamba align mode + enable_caching=false deferred behind 1:1 stubs.
 - ☐ **M1.4 Scheduler** (unified token-budget, chunked prefill, preemption,
   SchedulerOutput diffs) + ported scheduler test suite.
 - ☐ **M1.5 InputBatch/BlockTable (MRV2)** persistent batch + step-input build.

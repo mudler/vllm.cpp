@@ -9,6 +9,7 @@ function(vllm_cpp_add_test name)
 endfunction()
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
+vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)

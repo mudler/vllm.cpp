@@ -1,0 +1,100 @@
+{
+ "op": "causal_conv1d_fwd",
+ "args": {
+  "activation": "silu",
+  "bias": null,
+  "dim": 512,
+  "width": 4,
+  "seqlens": [
+   9,
+   7
+  ],
+  "note": "x dumped token-major [T,dim]; oracle ran on x.transpose(0,1) channel-last. conv_state slices are cache lines 1..N (line 0 = NULL block)."
+ },
+ "tensors": {
+  "x": {
+   "file": "x.npy",
+   "dtype": "f32",
+   "shape": [
+    16,
+    512
+   ]
+  },
+  "weight": {
+   "file": "weight.npy",
+   "dtype": "f32",
+   "shape": [
+    512,
+    4
+   ]
+  },
+  "conv_state_in": {
+   "file": "conv_state_in.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    512,
+    3
+   ]
+  },
+  "query_start_loc": {
+   "file": "query_start_loc.npy",
+   "dtype": "i32",
+   "shape": [
+    3
+   ]
+  },
+  "has_initial_state": {
+   "file": "has_initial_state.npy",
+   "dtype": "i32",
+   "shape": [
+    2
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    16,
+    512
+   ]
+  },
+  "conv_state_out": {
+   "file": "conv_state_out.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    512,
+    3
+   ]
+  }
+ },
+ "inputs": [
+  "x",
+  "weight",
+  "conv_state_in",
+  "query_start_loc",
+  "has_initial_state"
+ ],
+ "outputs": [
+  "out",
+  "conv_state_out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "mamba/ops/causal_conv1d.py::causal_conv1d_fn",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

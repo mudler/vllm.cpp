@@ -1,0 +1,134 @@
+{
+ "op": "gdn_prefill",
+ "args": {
+  "scale": 0.08838834764831845,
+  "Hk": 1,
+  "Hv": 2,
+  "Dk": 128,
+  "Dv": 128,
+  "seqlens": [
+   20,
+   12
+  ],
+  "use_qk_l2norm_in_kernel": false,
+  "q_k_prenormalized": true,
+  "with_initial_state": [
+   true,
+   false
+  ],
+  "chunk_vs_sequential_max_abs_out": 0.000244140625,
+  "chunk_vs_sequential_max_abs_state": 0.0022486746311187744,
+  "note": "chunked (FLA_CHUNK_SIZE=64) oracle output on bf16 inputs; out/state dumped as f32 of the oracle's values. Sequential C++ compared at the loose bf16 tolerance."
+ },
+ "tensors": {
+  "q": {
+   "file": "q.npy",
+   "dtype": "bf16",
+   "shape": [
+    32,
+    1,
+    128
+   ]
+  },
+  "k": {
+   "file": "k.npy",
+   "dtype": "bf16",
+   "shape": [
+    32,
+    1,
+    128
+   ]
+  },
+  "v": {
+   "file": "v.npy",
+   "dtype": "bf16",
+   "shape": [
+    32,
+    2,
+    128
+   ]
+  },
+  "g": {
+   "file": "g.npy",
+   "dtype": "f32",
+   "shape": [
+    32,
+    2
+   ]
+  },
+  "beta": {
+   "file": "beta.npy",
+   "dtype": "f32",
+   "shape": [
+    32,
+    2
+   ]
+  },
+  "state_in": {
+   "file": "state_in.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    128,
+    128
+   ]
+  },
+  "query_start_loc": {
+   "file": "query_start_loc.npy",
+   "dtype": "i32",
+   "shape": [
+    3
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    32,
+    2,
+    128
+   ]
+  },
+  "state_out": {
+   "file": "state_out.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    2,
+    128,
+    128
+   ]
+  }
+ },
+ "inputs": [
+  "q",
+  "k",
+  "v",
+  "g",
+  "beta",
+  "state_in",
+  "query_start_loc"
+ ],
+ "outputs": [
+  "out",
+  "state_out"
+ ],
+ "tol": {
+  "atol": 0.015,
+  "rtol": 0.015
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "fla/ops/chunk.py::chunk_gated_delta_rule",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

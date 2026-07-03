@@ -1,0 +1,47 @@
+{
+ "op": "l2norm",
+ "args": {
+  "eps": 1e-06
+ },
+ "tensors": {
+  "x": {
+   "file": "x.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    6
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    6
+   ]
+  }
+ },
+ "inputs": [
+  "x"
+ ],
+ "outputs": [
+  "out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "fla/ops/l2norm.py::l2norm_fwd",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

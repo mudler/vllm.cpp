@@ -517,14 +517,20 @@ def dump_gdn_decode(ops, root, dev):
         state_out = cache[1:].clone()
 
         # Derived tensors for the decomposed C++ chain (L2Norm -> GdnDecode
-        # taking g/beta): computed by the PINNED fused_post_conv_prep.
-        mixed = torch.cat([q.reshape(B, -1), k.reshape(B, -1),
-                           v.reshape(B, -1)], dim=-1).contiguous()
-        q_l2, k_l2, v2, g, beta = ops.post_conv.fused_post_conv_prep(
-            conv_output=mixed, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
-            num_k_heads=Hk, head_k_dim=Dk, head_v_dim=Dv,
-            apply_l2norm=True, output_g_exp=False)
-        assert torch.equal(v2, v)
+        # taking g/beta), all from PINNED code: q/k via l2norm_fwd (same
+        # formula/eps as the in-kernel norm, l2norm.py:88-92 vs
+        # fused_sigmoid_gating.py:138-140); g/beta via the gating branch of
+        # fused_post_conv_prep run on a dummy equal-dims conv output (the
+        # pinned kernel only compiles with BK==BV; g/beta depend only on
+        # a/b/A_log/dt_bias, fused_gdn_prefill_post_conv.py:127-149).
+        q_l2 = ops.l2norm.l2norm_fwd(q)
+        k_l2 = ops.l2norm.l2norm_fwd(k)
+        D0 = 16
+        dummy = torch.zeros(B, 2 * Hk * D0 + Hv * D0, device=dev)
+        _, _, _, g, beta = ops.post_conv.fused_post_conv_prep(
+            conv_output=dummy, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+            num_k_heads=Hk, head_k_dim=D0, head_v_dim=D0,
+            apply_l2norm=False, output_g_exp=False)
         total += save_case(
             root, name, "gdn_decode",
             "fla/ops/fused_sigmoid_gating.py::"
@@ -537,8 +543,9 @@ def dump_gdn_decode(ops, root, dev):
              "batch": B, "use_qk_l2norm_in_kernel": True,
              "softplus_threshold": 20.0,
              "note": "q/k are raw (l2norm applied IN-kernel, eps 1e-6). "
-                     "q_l2/k_l2/g/beta are derived via the pinned "
-                     "fused_post_conv_prep for the decomposed C++ chain "
+                     "q_l2/k_l2 derived via pinned l2norm_fwd and g/beta "
+                     "via the pinned fused_post_conv_prep gating branch, "
+                     "for the decomposed C++ chain "
                      "L2Norm -> GdnDecode(q_l2,k_l2,v,g,beta). States are "
                      "gathered per-seq slices (cache line 0 = NULL block)."},
             ["q", "k", "v", "a", "b", "A_log", "dt_bias", "state_in"],

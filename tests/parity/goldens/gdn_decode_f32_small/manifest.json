@@ -1,0 +1,167 @@
+{
+ "op": "gdn_decode",
+ "args": {
+  "scale": 0.25,
+  "Hk": 2,
+  "Hv": 4,
+  "Dk": 16,
+  "Dv": 32,
+  "batch": 3,
+  "use_qk_l2norm_in_kernel": true,
+  "softplus_threshold": 20.0,
+  "note": "q/k are raw (l2norm applied IN-kernel, eps 1e-6). q_l2/k_l2 derived via pinned l2norm_fwd and g/beta via the pinned fused_post_conv_prep gating branch, for the decomposed C++ chain L2Norm -> GdnDecode(q_l2,k_l2,v,g,beta). States are gathered per-seq slices (cache line 0 = NULL block)."
+ },
+ "tensors": {
+  "q": {
+   "file": "q.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    2,
+    16
+   ]
+  },
+  "k": {
+   "file": "k.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    2,
+    16
+   ]
+  },
+  "v": {
+   "file": "v.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4,
+    32
+   ]
+  },
+  "a": {
+   "file": "a.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  "b": {
+   "file": "b.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  "A_log": {
+   "file": "A_log.npy",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  },
+  "dt_bias": {
+   "file": "dt_bias.npy",
+   "dtype": "f32",
+   "shape": [
+    4
+   ]
+  },
+  "state_in": {
+   "file": "state_in.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4,
+    32,
+    16
+   ]
+  },
+  "q_l2": {
+   "file": "q_l2.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    2,
+    16
+   ]
+  },
+  "k_l2": {
+   "file": "k_l2.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    2,
+    16
+   ]
+  },
+  "g": {
+   "file": "g.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  "beta": {
+   "file": "beta.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4,
+    32
+   ]
+  },
+  "state_out": {
+   "file": "state_out.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    4,
+    32,
+    16
+   ]
+  }
+ },
+ "inputs": [
+  "q",
+  "k",
+  "v",
+  "a",
+  "b",
+  "A_log",
+  "dt_bias",
+  "state_in"
+ ],
+ "outputs": [
+  "out",
+  "state_out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "fla/ops/fused_sigmoid_gating.py::fused_sigmoid_gating_delta_rule_update",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

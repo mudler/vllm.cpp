@@ -1,0 +1,129 @@
+{
+ "op": "gdn_prefill",
+ "args": {
+  "scale": 0.25,
+  "Hk": 2,
+  "Hv": 4,
+  "Dk": 16,
+  "Dv": 32,
+  "seqlens": [
+   5,
+   7
+  ],
+  "use_qk_l2norm_in_kernel": false,
+  "q_k_prenormalized": true,
+  "with_initial_state": true,
+  "note": "oracle is the pinned sequential kernel fused_recurrent_gated_delta_rule: the pinned chunk_gated_delta_rule wrapper asserts q.dtype != float32 (chunk.py:213), so f32 goldens cannot come from the chunked path. bf16 cases below DO use chunk_gated_delta_rule."
+ },
+ "tensors": {
+  "q": {
+   "file": "q.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    2,
+    16
+   ]
+  },
+  "k": {
+   "file": "k.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    2,
+    16
+   ]
+  },
+  "v": {
+   "file": "v.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    4,
+    32
+   ]
+  },
+  "g": {
+   "file": "g.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "beta": {
+   "file": "beta.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    4
+   ]
+  },
+  "state_in": {
+   "file": "state_in.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    32,
+    16
+   ]
+  },
+  "query_start_loc": {
+   "file": "query_start_loc.npy",
+   "dtype": "i32",
+   "shape": [
+    3
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    12,
+    4,
+    32
+   ]
+  },
+  "state_out": {
+   "file": "state_out.npy",
+   "dtype": "f32",
+   "shape": [
+    2,
+    4,
+    32,
+    16
+   ]
+  }
+ },
+ "inputs": [
+  "q",
+  "k",
+  "v",
+  "g",
+  "beta",
+  "state_in",
+  "query_start_loc"
+ ],
+ "outputs": [
+  "out",
+  "state_out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "fla/ops/fused_recurrent.py::fused_recurrent_gated_delta_rule",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

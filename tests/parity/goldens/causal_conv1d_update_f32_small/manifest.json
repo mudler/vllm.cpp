@@ -1,0 +1,81 @@
+{
+ "op": "causal_conv1d_update",
+ "args": {
+  "activation": "silu",
+  "bias": null,
+  "dim": 16,
+  "width": 4,
+  "batch": 3,
+  "note": "conv_state slices are cache lines 1..B (line 0 = NULL block)."
+ },
+ "tensors": {
+  "x": {
+   "file": "x.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    16
+   ]
+  },
+  "weight": {
+   "file": "weight.npy",
+   "dtype": "f32",
+   "shape": [
+    16,
+    4
+   ]
+  },
+  "conv_state_in": {
+   "file": "conv_state_in.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    16,
+    3
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    16
+   ]
+  },
+  "conv_state_out": {
+   "file": "conv_state_out.npy",
+   "dtype": "f32",
+   "shape": [
+    3,
+    16,
+    3
+   ]
+  }
+ },
+ "inputs": [
+  "x",
+  "weight",
+  "conv_state_in"
+ ],
+ "outputs": [
+  "out",
+  "conv_state_out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "source": "pinned:e24d1b24",
+  "callable": "mamba/ops/causal_conv1d.py::causal_conv1d_update",
+  "torch": "2.11.0",
+  "device": "NVIDIA GB10",
+  "stubbed_infra": [
+   "vllm.triton_utils",
+   "vllm.platforms",
+   "vllm.v1.attention.backends.utils (PAD_SLOT_ID/NULL_BLOCK_ID consts)",
+   "vllm.utils.math_utils",
+   "vllm.utils.platform_utils"
+  ]
+ }
+}

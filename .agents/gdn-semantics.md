@@ -273,6 +273,13 @@ FLA chunk metadata (`chunk_indices/offsets`) is precomputed on CPU
   sequential kernel) because the pinned chunk wrapper hard-rejects f32
   (chunk.py:213). The sequential-vs-chunked gap is measured on the shared
   bf16 case and recorded in its manifest (`args.chunk_vs_sequential_*`).
+  **Measured on GB10 (2026-07-03)**: max|diff| out `2.44e-4`, state
+  `2.25e-3` — bf16-rounding scale, comfortably inside the 1.5e-2 golden
+  tolerance. (The plan's "f32 sequential vs f32 chunked ~1e-4" check is not
+  runnable at this pin — chunked has no f32 path — so the bf16-input gap is
+  the recorded evidence.) Decode decomposition (pinned l2norm_fwd + g/beta
+  + norm-free `fused_recurrent` vs the fused sigmoid-gating kernel)
+  validated at dump time to ~2e-7.
 - `gdn_decode` oracle: `fused_sigmoid_gating_delta_rule_update` exactly as
   the decode call site invokes it (in-kernel l2norm + gating); derived
   l2norm-ed q/k and g/beta are ALSO stored (computed by the pinned

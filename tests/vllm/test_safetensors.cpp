@@ -182,12 +182,35 @@ TEST_CASE("safetensors: overlapping data_offsets throw") {
   CHECK_THROWS_AS(vllm::SafetensorsFile::Open(f.path()), std::runtime_error);
 }
 
-TEST_CASE("safetensors: descending data_offsets across entries throw") {
+TEST_CASE("safetensors: reverse-offset key order is accepted") {
+  // JSON key order need not match data-offset order: the official reader
+  // sorts entries by offset before validating, so "a" at [8,16) listed
+  // before "b" at [0,8) is a valid file and must Open.
   const char* header =
       R"({"a":{"dtype":"F32","shape":[2],"data_offsets":[8,16]},)"
       R"("b":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}})";
-  TempFile f(MakeSafetensors(header, std::string(16, '\0')));
-  CHECK_THROWS_AS(vllm::SafetensorsFile::Open(f.path()), std::runtime_error);
+  std::string data(16, '\0');
+  const float vals[4] = {1.0f, 2.0f, 3.0f, 4.0f};  // b = {1,2}, a = {3,4}
+  std::memcpy(data.data(), vals, 16);
+  TempFile f(MakeSafetensors(header, data));
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  REQUIRE(st.Names() == std::vector<std::string>({"a", "b"}));
+  float a0, b0;
+  std::memcpy(&a0, st.Get("a").data, 4);
+  std::memcpy(&b0, st.Get("b").data, 4);
+  CHECK(a0 == 3.0f);
+  CHECK(b0 == 1.0f);
+}
+
+TEST_CASE("safetensors: overlapping data_offsets in reverse order throw") {
+  // Overlap must be caught regardless of key order: sorted spans are
+  // [0,16) then [8,24).
+  const char* header =
+      R"({"a":{"dtype":"F32","shape":[4],"data_offsets":[8,24]},)"
+      R"("b":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}})";
+  TempFile f(MakeSafetensors(header, std::string(24, '\0')));
+  CHECK_THROWS_WITH_AS(vllm::SafetensorsFile::Open(f.path()),
+                       doctest::Contains("overlap"), std::runtime_error);
 }
 
 TEST_CASE("safetensors: gap between tensors is tolerated") {
@@ -313,5 +336,20 @@ TEST_CASE("safetensors index: missing file / missing weight_map throw") {
                   std::runtime_error);
   TempFile bad_value(R"({"weight_map":{"a":1}})");
   CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(bad_value.path()),
+                  std::runtime_error);
+}
+
+TEST_CASE("safetensors index: shard names with path components throw") {
+  // The index is untrusted; shard names must be plain filenames, never
+  // paths that could traverse outside the model directory.
+  TempFile slash(R"({"weight_map":{"a":"sub/model.safetensors"}})");
+  CHECK_THROWS_WITH_AS(vllm::LoadSafetensorsIndex(slash.path()),
+                       doctest::Contains("plain filename"),
+                       std::runtime_error);
+  TempFile dotdot(R"({"weight_map":{"a":"..secret.safetensors"}})");
+  CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(dotdot.path()),
+                  std::runtime_error);
+  TempFile traverse(R"({"weight_map":{"a":"../../etc/passwd"}})");
+  CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(traverse.path()),
                   std::runtime_error);
 }

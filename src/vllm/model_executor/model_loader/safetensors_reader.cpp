@@ -6,10 +6,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #include <nlohmann/json.hpp>
@@ -91,10 +93,16 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
   if (!duplicate.empty()) Fail(path, "duplicate entry \"" + duplicate + "\"");
   if (!doc.is_object()) Fail(path, "JSON header is not an object");
 
+  // (begin, end, name) per tensor entry, collected while walking the header
+  // and validated for overlaps after sorting by offset. The official reader
+  // (safetensors 0.7.0) sorts entries by data offset before its layout check,
+  // so JSON key order carries no meaning; matching that keeps us from
+  // rejecting files the reference implementation accepts.
+  std::vector<std::tuple<uint64_t, uint64_t, std::string>> spans;
+
   try {
-    // Walk entries in header-appearance order so the ascending-offsets check
-    // below matches the layout order the header claims.
-    uint64_t prev_end = 0;
+    // Walk entries in header-appearance order (which fixes Names() order);
+    // offset validation happens over the sorted spans below.
     for (const std::string& name : order) {
       const nlohmann::json& entry = doc.at(name);
       if (name == "__metadata__") {
@@ -130,16 +138,7 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
         Fail(path, "tensor \"" + name + "\" data_offsets end " +
                        std::to_string(end) + " exceeds data section size " +
                        std::to_string(data_section));
-      // The official spec additionally requires the entries' ranges to tile
-      // [0, data_section) contiguously in header order. We enforce the
-      // safety-relevant part (ascending, non-overlapping) but deliberately
-      // tolerate gaps: some third-party writers pad/align tensors, and a gap
-      // cannot make a span escape the mapping.
-      if (begin < prev_end)
-        Fail(path, "tensor \"" + name +
-                       "\" data_offsets overlap the previous entry or are "
-                       "not ascending");
-      prev_end = end;
+      spans.emplace_back(begin, end, name);
 
       t.nbytes = static_cast<size_t>(end - begin);
       t.data = data_base + begin;
@@ -171,6 +170,23 @@ SafetensorsFile SafetensorsFile::Open(const std::string& path) {
     }
   } catch (const nlohmann::json::exception& e) {
     Fail(path, std::string("bad header field type: ") + e.what());
+  }
+
+  // Overlap check over the offset-sorted spans, mirroring the official
+  // reader's sort-then-validate order. The official reader additionally
+  // rejects gaps (the ranges must tile [0, data_section) exactly); we
+  // deliberately tolerate gaps as an accept-side-only relaxation, since some
+  // third-party writers pad/align tensors and a gap cannot make a span
+  // escape the mapping.
+  std::sort(spans.begin(), spans.end());
+  uint64_t prev_end = 0;
+  const std::string* prev_name = nullptr;
+  for (const auto& [begin, end, name] : spans) {
+    if (begin < prev_end)
+      Fail(path, "tensor \"" + name + "\" data_offsets overlap tensor \"" +
+                     *prev_name + "\"");
+    prev_end = end;
+    prev_name = &name;
   }
 
   return f;
@@ -246,7 +262,17 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
     if (!file.is_string())
       Fail(index_json_path,
            "weight_map value for \"" + tensor + "\" is not a string");
-    weight_map.emplace(tensor, file.get<std::string>());
+    std::string shard = file.get<std::string>();
+    // UNTRUSTED index: shard names must be plain filenames next to the
+    // index, never paths. Reject separators and parent references so a
+    // hostile index cannot traverse outside the model directory.
+    if (shard.find('/') != std::string::npos ||
+        shard.find("..") != std::string::npos)
+      Fail(index_json_path, "weight_map value \"" + shard + "\" for \"" +
+                                tensor +
+                                "\" must be a plain filename (no '/' or "
+                                "\"..\")");
+    weight_map.emplace(tensor, std::move(shard));
   }
   return weight_map;
 }

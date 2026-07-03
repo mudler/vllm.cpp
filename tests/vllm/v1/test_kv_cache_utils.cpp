@@ -1,5 +1,6 @@
-// Tests for KVCacheBlock + FreeKVCacheBlockQueue (M1.2 Task 1), ported from
-// vllm/tests/v1/core/test_kv_cache_utils.py @ e24d1b24.
+// Tests for KVCacheBlock + FreeKVCacheBlockQueue (M1.2 Task 1) and the
+// parent-chained, group-aware prefix-cache block hashing (M1.2 Task 2), ported
+// from vllm/tests/v1/core/test_kv_cache_utils.py @ e24d1b24.
 //
 // Ported cases (the FreeKVCacheBlockQueue / KVCacheBlock behavioral oracle):
 //   - test_kv_cache_block
@@ -10,26 +11,67 @@
 //   - test_free_kv_cache_block_queue_popleft_n
 //   - test_free_kv_cache_block_queue_get_all_free_blocks
 //
+// Ported hashing cases (Task 2 behavioral oracle):
+//   - test_none_hash (seeded reproducibility; different seeds differ)
+//   - test_hash_block_tokens (byte-exact vs sha256_cbor)
+//   - test_request_block_hasher (mm extra keys, chaining; byte-exact)
+//   - test_hash_request_tokens_no_mm_inputs (chaining; byte-exact)
+// Plus structural checks the upstream parametrization asserts across hashers:
+// parent chaining changes the hash, group id differentiates, the partial last
+// block is not hashed, and NONE_HASH is used as the first-block parent.
+//
+// HASH-FUNCTION FIDELITY: upstream parametrizes these over `sha256` (pickle) and
+// `sha256_cbor` (cbor2 canonical). We port `sha256_cbor` BYTE-FOR-BYTE (see the
+// header) and pin absolute goldens against it; `sha256` (pickle) is out of scope
+// for byte-parity but its structural invariants are identical and are covered
+// here. Goldens were generated with cbor2 6.1.2 + hashlib (canonical=True); the
+// raw-CBOR checks below independently prove the serialization matches
+// `cbor2.dumps(x, canonical=True)`.
+//
 // Object-identity comparisons in the upstream tests (`block is blocks[i]`,
 // `get_all_free_blocks() == blocks`) are ported as pointer-equality checks,
 // since the queue links the same KVCacheBlock objects the pool owns.
 //
 // NOTE: test_kv_cache_block upstream builds the hash via
-// make_block_hash_with_group_id (a Task 2 helper). Task 1 has no hashing yet,
-// so the hash key is constructed directly as a byte-string BlockHashWithGroupId.
+// make_block_hash_with_group_id; Task 2 now provides it, and the case below uses
+// it (Task 1 constructed the packed key directly).
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/v1/core/kv_cache_utils.h"
 
+using vllm::v1::BlockHash;
 using vllm::v1::BlockHashWithGroupId;
+using vllm::v1::CborValue;
+using vllm::v1::ExtraKey;
+using vllm::v1::ExtraKeys;
 using vllm::v1::FreeKVCacheBlockQueue;
+using vllm::v1::hash_block_tokens;
+using vllm::v1::hash_request_tokens;
+using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheBlock;
+using vllm::v1::make_block_hash_with_group_id;
+using vllm::v1::sha256_cbor;
 
 namespace {
+
+// Lowercase hex of a byte string, for comparing digests to cbor2+hashlib
+// goldens.
+std::string ToHex(const std::string& bytes) {
+  static const char* kDigits = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (unsigned char c : bytes) {
+    out.push_back(kDigits[c >> 4]);
+    out.push_back(kDigits[c & 0xf]);
+  }
+  return out;
+}
 
 // Build n KVCacheBlocks with block_id = 0..n-1. Reserve up front so no
 // reallocation happens; moving the returned vector preserves element addresses
@@ -72,11 +114,10 @@ TEST_CASE("test_kv_cache_block") {
   block.decr_ref();
   CHECK(block.ref_cnt == 0);
 
-  // Test block hash setting and resetting. (Upstream uses
-  // make_block_hash_with_group_id(BlockHash(b"abc"), 0); Task 1 constructs the
-  // packed key directly.)
-  BlockHashWithGroupId block_hash =
-      std::string("abc") + std::string("\x00\x00\x00\x00", 4);
+  // Test block hash setting and resetting. Upstream:
+  // make_block_hash_with_group_id(BlockHash(b"abc"), 0).
+  BlockHashWithGroupId block_hash = make_block_hash_with_group_id("abc", 0);
+  CHECK(block_hash == std::string("abc") + std::string("\x00\x00\x00\x00", 4));
   block.set_block_hash(block_hash);
   CHECK(block.block_hash().has_value());
   CHECK(block.block_hash().value() == block_hash);
@@ -312,4 +353,176 @@ TEST_CASE("test_free_kv_cache_block_queue_get_all_free_blocks") {
   queue.append(block_to_remove);
   CHECK(queue.get_all_free_blocks() ==
         std::vector<KVCacheBlock*>{b[1], b[3], b[4], b[2]});
+}
+
+// ---------------------------------------------------------------------------
+// Task 2: block hashing.
+// ---------------------------------------------------------------------------
+
+// Independently prove CborValue::Encode() == cbor2.dumps(x, canonical=True).
+TEST_CASE("cbor_value_canonical_encoding") {
+  CHECK(ToHex(CborValue::Bytes("123").Encode()) == "43313233");
+  CHECK(ToHex(CborValue::Array({CborValue::Int(1), CborValue::Int(2),
+                                CborValue::Int(3)})
+                  .Encode()) == "83010203");
+  CHECK(ToHex(CborValue::Text("seed42").Encode()) == "66736565643432");
+  CHECK(ToHex(CborValue::Null().Encode()) == "f6");
+  // Negative ints (multi-modal offsets can be negative).
+  CHECK(ToHex(CborValue::Int(-1).Encode()) == "20");
+  CHECK(ToHex(CborValue::Int(-3).Encode()) == "22");
+  CHECK(ToHex(CborValue::Int(-257).Encode()) == "390100");
+  // Minimal-width integer arguments.
+  CHECK(ToHex(CborValue::UInt(23).Encode()) == "17");
+  CHECK(ToHex(CborValue::UInt(24).Encode()) == "1818");
+  CHECK(ToHex(CborValue::UInt(255).Encode()) == "18ff");
+  CHECK(ToHex(CborValue::UInt(256).Encode()) == "190100");
+  CHECK(ToHex(CborValue::UInt(65536).Encode()) == "1a00010000");
+  // The full (parent, tokens, extra_keys) tuple upstream feeds the hasher.
+  CborValue tuple = CborValue::Array(
+      {CborValue::Bytes("123"),
+       CborValue::Array({CborValue::Int(1), CborValue::Int(2), CborValue::Int(3)}),
+       CborValue::Array({CborValue::Text("key1"), CborValue::Text("key2")})});
+  CHECK(ToHex(tuple.Encode()) ==
+        "83433132338301020382646b657931646b657932");
+}
+
+// test_none_hash: seeded init is reproducible (== sha256_cbor(text(seed))),
+// yields non-empty 32-byte hashes, and different seeds differ.
+TEST_CASE("test_none_hash") {
+  init_none_hash(sha256_cbor, "seed42");
+  CHECK(vllm::v1::NONE_HASH.size() == 32);
+  CHECK(ToHex(vllm::v1::NONE_HASH) ==
+        "4dee92a73b42a5488db700713f330b42f7c8b90ae46143db43aef808eb2099d7");
+  CHECK(vllm::v1::NONE_HASH == sha256_cbor(CborValue::Text("seed42")));
+
+  const BlockHash seed42 = vllm::v1::NONE_HASH;
+  init_none_hash(sha256_cbor, "different seed");
+  CHECK(vllm::v1::NONE_HASH != seed42);
+
+  // Unseeded: 32 random bytes, non-empty (upstream os.urandom(32)).
+  init_none_hash(sha256_cbor);
+  CHECK(vllm::v1::NONE_HASH.size() == 32);
+}
+
+// test_hash_block_tokens: block_hash == hash_fn((parent, tokens, extra_keys)),
+// pinned byte-for-byte against sha256_cbor.
+TEST_CASE("test_hash_block_tokens") {
+  const BlockHash parent = "123";
+  const std::vector<int32_t> tokens = {1, 2, 3};
+  const ExtraKeys extra = std::vector<ExtraKey>{ExtraKey(std::string("key1")),
+                                                ExtraKey(std::string("key2"))};
+
+  const BlockHash block_hash = hash_block_tokens(sha256_cbor, parent, tokens, extra);
+  const BlockHash expected = sha256_cbor(CborValue::Array(
+      {CborValue::Bytes("123"),
+       CborValue::Array({CborValue::Int(1), CborValue::Int(2), CborValue::Int(3)}),
+       CborValue::Array({CborValue::Text("key1"), CborValue::Text("key2")})}));
+  CHECK(block_hash == expected);
+  CHECK(ToHex(block_hash) ==
+        "75f96f75f082518549ca45da83610d619f8c63528c78f8aef470d43f1647317d");
+}
+
+// test_hash_request_tokens_no_mm_inputs: 6 tokens at block_size 3 -> 2 hashes,
+// each chaining the previous (block 1 depends on block 0), pinned byte-for-byte.
+TEST_CASE("test_hash_request_tokens_no_mm_inputs") {
+  init_none_hash(sha256_cbor, "seed42");
+  const std::vector<int32_t> tokens = {0, 1, 2, 3, 4, 5};
+  const std::vector<BlockHash> hashes = hash_request_tokens(sha256_cbor, 3, tokens);
+
+  REQUIRE(hashes.size() == 2);
+  CHECK(hashes[0] == sha256_cbor(CborValue::Array(
+                         {CborValue::Bytes(vllm::v1::NONE_HASH),
+                          CborValue::Array({CborValue::Int(0), CborValue::Int(1),
+                                            CborValue::Int(2)}),
+                          CborValue::Null()})));
+  CHECK(hashes[1] == sha256_cbor(CborValue::Array(
+                         {CborValue::Bytes(hashes[0]),
+                          CborValue::Array({CborValue::Int(3), CborValue::Int(4),
+                                            CborValue::Int(5)}),
+                          CborValue::Null()})));
+  CHECK(ToHex(hashes[0]) ==
+        "210559fa9941d0cd01ae4176a437cd8865c50b64e06af48138364280356c9aa9");
+  CHECK(ToHex(hashes[1]) ==
+        "855499304e237ca9bbbfff065f17f73d26744f5f30766249bb6e8f80f1bdf89a");
+}
+
+// test_request_block_hasher: per-block mm extra keys (("hashN", 0),), chained,
+// pinned byte-for-byte.
+TEST_CASE("test_request_block_hasher") {
+  init_none_hash(sha256_cbor, "seed42");
+  const std::vector<int32_t> tokens = {0, 1, 2, 3, 4, 5};
+  const std::vector<ExtraKeys> per_block = {
+      std::vector<ExtraKey>{ExtraKey(std::pair<std::string, int64_t>("hash1", 0))},
+      std::vector<ExtraKey>{ExtraKey(std::pair<std::string, int64_t>("hash2", 0))},
+  };
+  const std::vector<BlockHash> hashes =
+      hash_request_tokens(sha256_cbor, 3, tokens, per_block);
+
+  REQUIRE(hashes.size() == 2);
+  CHECK(ToHex(hashes[0]) ==
+        "ae58025bbbd9b4375741f34b9ac177fe0ce7fa4bac8c57483ee86116bb92ee92");
+  CHECK(ToHex(hashes[1]) ==
+        "3b3218c497c0e23fa619550c8d57781f7f740d70214c4e1e6a54593a5da40911");
+  // Different mm keys -> different hashes than the no-mm chain.
+  const std::vector<BlockHash> no_mm = hash_request_tokens(sha256_cbor, 3, tokens);
+  CHECK(hashes[0] != no_mm[0]);
+  CHECK(hashes[1] != no_mm[1]);
+}
+
+// Parent chaining: block N's hash depends on block N-1's (and on NONE_HASH for
+// block 0).
+TEST_CASE("hash_block_tokens_parent_chaining") {
+  init_none_hash(sha256_cbor, "seed42");
+  const std::vector<int32_t> block0 = {0, 1, 2};
+  const std::vector<int32_t> block1 = {3, 4, 5};
+
+  const BlockHash h0 = hash_block_tokens(sha256_cbor, std::nullopt, block0);
+  // A falsy parent (nullopt or empty) uses NONE_HASH as the parent.
+  CHECK(hash_block_tokens(sha256_cbor, BlockHash(), block0) == h0);
+  CHECK(h0 == hash_block_tokens(sha256_cbor, vllm::v1::NONE_HASH, block0));
+
+  const BlockHash h1_after_h0 = hash_block_tokens(sha256_cbor, h0, block1);
+  const BlockHash h1_after_none = hash_block_tokens(sha256_cbor, std::nullopt, block1);
+  // Same tokens, different parent -> different hash.
+  CHECK(h1_after_h0 != h1_after_none);
+}
+
+// Group id differentiation via make_block_hash_with_group_id / get_block_hash /
+// get_group_id.
+TEST_CASE("block_hash_with_group_id") {
+  const BlockHash bh = hash_block_tokens(sha256_cbor, std::nullopt, {1, 2, 3});
+  const BlockHashWithGroupId g0 = make_block_hash_with_group_id(bh, 0);
+  const BlockHashWithGroupId g1 = make_block_hash_with_group_id(bh, 1);
+
+  // Same block hash, different group id -> different packed key.
+  CHECK(g0 != g1);
+  CHECK(g0.size() == bh.size() + 4);
+
+  // Round-trip both components.
+  CHECK(vllm::v1::get_block_hash(g0) == bh);
+  CHECK(vllm::v1::get_block_hash(g1) == bh);
+  CHECK(vllm::v1::get_group_id(g0) == 0u);
+  CHECK(vllm::v1::get_group_id(g1) == 1u);
+
+  // 4-byte big-endian group-id encoding.
+  const BlockHashWithGroupId big = make_block_hash_with_group_id("abc", 0x01020304u);
+  CHECK(big == std::string("abc") + std::string("\x01\x02\x03\x04", 4));
+  CHECK(vllm::v1::get_group_id(big) == 0x01020304u);
+}
+
+// Partial last block is not hashed: only full blocks produce a hash.
+TEST_CASE("hash_request_tokens_partial_block_not_hashed") {
+  init_none_hash(sha256_cbor, "seed42");
+  // 7 tokens at block_size 3 -> 2 full blocks, trailing partial ignored.
+  const std::vector<BlockHash> h7 =
+      hash_request_tokens(sha256_cbor, 3, {0, 1, 2, 3, 4, 5, 6});
+  CHECK(h7.size() == 2);
+  // Fewer tokens than a block -> no hashes.
+  CHECK(hash_request_tokens(sha256_cbor, 3, {0, 1}).empty());
+  // Exactly one block.
+  CHECK(hash_request_tokens(sha256_cbor, 3, {0, 1, 2}).size() == 1);
+  // The full-block prefix of a longer sequence matches the shorter one.
+  const std::vector<BlockHash> h6 =
+      hash_request_tokens(sha256_cbor, 3, {0, 1, 2, 3, 4, 5});
+  CHECK(h7 == h6);
 }

@@ -3,12 +3,318 @@
 // coordination note, and recorded deviations.
 #include "vllm/v1/core/kv_cache_utils.h"
 
+#include <array>
 #include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <random>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+#include "vllm/v1/request.h"
+
 namespace vllm::v1 {
+namespace {
+
+// --- SHA-256 -----------------------------------------------------------------
+// A compact, self-contained SHA-256 (FIPS 180-4). Vendored because the project
+// has no crypto dependency; it matches Python's hashlib.sha256 digest so the
+// ported sha256_cbor block-hash vectors line up byte-for-byte.
+
+constexpr std::array<uint32_t, 64> kSha256K = {
+    0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu,
+    0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u, 0xd807aa98u, 0x12835b01u,
+    0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u,
+    0xc19bf174u, 0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+    0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau, 0x983e5152u,
+    0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u,
+    0x06ca6351u, 0x14292967u, 0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu,
+    0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+    0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u,
+    0xd6990624u, 0xf40e3585u, 0x106aa070u, 0x19a4c116u, 0x1e376c08u,
+    0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu,
+    0x682e6ff3u, 0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+    0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u};
+
+inline uint32_t Rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+
+std::string Sha256(const std::string& data) {
+  uint32_t h[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                   0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+
+  // Padding: append 0x80, then zeros, then the 64-bit big-endian bit length.
+  std::string msg = data;
+  const uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
+  msg.push_back(static_cast<char>(0x80));
+  while (msg.size() % 64 != 56) msg.push_back('\0');
+  for (int i = 7; i >= 0; --i) {
+    msg.push_back(static_cast<char>((bit_len >> (i * 8)) & 0xff));
+  }
+
+  const auto byte = [&](size_t i) {
+    return static_cast<uint32_t>(static_cast<unsigned char>(msg[i]));
+  };
+  for (size_t off = 0; off < msg.size(); off += 64) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+      w[i] = (byte(off + i * 4) << 24) | (byte(off + i * 4 + 1) << 16) |
+             (byte(off + i * 4 + 2) << 8) | byte(off + i * 4 + 3);
+    }
+    for (int i = 16; i < 64; ++i) {
+      const uint32_t s0 = Rotr(w[i - 15], 7) ^ Rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const uint32_t s1 = Rotr(w[i - 2], 17) ^ Rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+      const uint32_t s1 = Rotr(e, 6) ^ Rotr(e, 11) ^ Rotr(e, 25);
+      const uint32_t ch = (e & f) ^ (~e & g);
+      const uint32_t t1 = hh + s1 + ch + kSha256K[i] + w[i];
+      const uint32_t s0 = Rotr(a, 2) ^ Rotr(a, 13) ^ Rotr(a, 22);
+      const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      const uint32_t t2 = s0 + maj;
+      hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+
+  std::string digest(32, '\0');
+  for (int i = 0; i < 8; ++i) {
+    digest[i * 4 + 0] = static_cast<char>((h[i] >> 24) & 0xff);
+    digest[i * 4 + 1] = static_cast<char>((h[i] >> 16) & 0xff);
+    digest[i * 4 + 2] = static_cast<char>((h[i] >> 8) & 0xff);
+    digest[i * 4 + 3] = static_cast<char>(h[i] & 0xff);
+  }
+  return digest;
+}
+
+// Append a CBOR head (major type in the top 3 bits + minimal-width argument).
+void CborHead(std::string& out, uint8_t major, uint64_t arg) {
+  const uint8_t mt = static_cast<uint8_t>(major << 5);
+  if (arg < 24) {
+    out.push_back(static_cast<char>(mt | static_cast<uint8_t>(arg)));
+  } else if (arg < 0x100ULL) {
+    out.push_back(static_cast<char>(mt | 24));
+    out.push_back(static_cast<char>(arg & 0xff));
+  } else if (arg < 0x10000ULL) {
+    out.push_back(static_cast<char>(mt | 25));
+    for (int i = 1; i >= 0; --i) out.push_back(static_cast<char>((arg >> (i * 8)) & 0xff));
+  } else if (arg < 0x100000000ULL) {
+    out.push_back(static_cast<char>(mt | 26));
+    for (int i = 3; i >= 0; --i) out.push_back(static_cast<char>((arg >> (i * 8)) & 0xff));
+  } else {
+    out.push_back(static_cast<char>(mt | 27));
+    for (int i = 7; i >= 0; --i) out.push_back(static_cast<char>((arg >> (i * 8)) & 0xff));
+  }
+}
+
+// Convert one ExtraKey into its CborValue (text, or a [text, int] array).
+CborValue ExtraKeyToCbor(const ExtraKey& key) {
+  if (const auto* s = std::get_if<std::string>(&key)) {
+    return CborValue::Text(*s);
+  }
+  const auto& pair = std::get<std::pair<std::string, int64_t>>(key);
+  return CborValue::Array({CborValue::Text(pair.first), CborValue::Int(pair.second)});
+}
+
+}  // namespace
+
+// --- CborValue ---------------------------------------------------------------
+
+CborValue CborValue::UInt(uint64_t value) {
+  CborValue v;
+  v.type_ = Type::kUInt;
+  v.arg_ = value;
+  return v;
+}
+
+CborValue CborValue::Int(int64_t value) {
+  if (value >= 0) return UInt(static_cast<uint64_t>(value));
+  CborValue v;
+  v.type_ = Type::kNInt;
+  // Major type 1 encodes -1 - value; for value < 0 this is a non-negative arg.
+  v.arg_ = static_cast<uint64_t>(-(value + 1));
+  return v;
+}
+
+CborValue CborValue::Bytes(std::string bytes) {
+  CborValue v;
+  v.type_ = Type::kBytes;
+  v.str_ = std::move(bytes);
+  return v;
+}
+
+CborValue CborValue::Text(std::string text) {
+  CborValue v;
+  v.type_ = Type::kText;
+  v.str_ = std::move(text);
+  return v;
+}
+
+CborValue CborValue::Array(std::vector<CborValue> items) {
+  CborValue v;
+  v.type_ = Type::kArray;
+  v.items_ = std::move(items);
+  return v;
+}
+
+CborValue CborValue::Null() {
+  CborValue v;
+  v.type_ = Type::kNull;
+  return v;
+}
+
+void CborValue::Encode(std::string& out) const {
+  switch (type_) {
+    case Type::kUInt:
+      CborHead(out, 0, arg_);
+      break;
+    case Type::kNInt:
+      CborHead(out, 1, arg_);
+      break;
+    case Type::kBytes:
+      CborHead(out, 2, str_.size());
+      out += str_;
+      break;
+    case Type::kText:
+      CborHead(out, 3, str_.size());
+      out += str_;
+      break;
+    case Type::kArray:
+      CborHead(out, 4, items_.size());
+      for (const auto& item : items_) item.Encode(out);
+      break;
+    case Type::kNull:
+      out.push_back(static_cast<char>(0xf6));
+      break;
+  }
+}
+
+std::string CborValue::Encode() const {
+  std::string out;
+  Encode(out);
+  return out;
+}
+
+BlockHash sha256_cbor(const CborValue& value) { return Sha256(value.Encode()); }
+
+// --- Block-hash packing ------------------------------------------------------
+
+BlockHashWithGroupId make_block_hash_with_group_id(const BlockHash& block_hash,
+                                                   uint32_t group_id) {
+  BlockHashWithGroupId key = block_hash;
+  key.push_back(static_cast<char>((group_id >> 24) & 0xff));
+  key.push_back(static_cast<char>((group_id >> 16) & 0xff));
+  key.push_back(static_cast<char>((group_id >> 8) & 0xff));
+  key.push_back(static_cast<char>(group_id & 0xff));
+  return key;
+}
+
+BlockHash get_block_hash(const BlockHashWithGroupId& key) {
+  assert(key.size() >= 4);
+  return key.substr(0, key.size() - 4);
+}
+
+uint32_t get_group_id(const BlockHashWithGroupId& key) {
+  assert(key.size() >= 4);
+  const size_t n = key.size();
+  const auto b = [&](size_t i) {
+    return static_cast<uint32_t>(static_cast<unsigned char>(key[i]));
+  };
+  return (b(n - 4) << 24) | (b(n - 3) << 16) | (b(n - 2) << 8) | b(n - 1);
+}
+
+// --- NONE_HASH ---------------------------------------------------------------
+
+BlockHash NONE_HASH;
+
+void init_none_hash(const HashFn& hash_fn, std::optional<std::string> seed) {
+  if (seed.has_value()) {
+    NONE_HASH = hash_fn(CborValue::Text(*seed));
+    return;
+  }
+  // No seed (upstream os.urandom(32)): 32 random bytes.
+  std::random_device rd;
+  std::string bytes(32, '\0');
+  for (int i = 0; i < 32; ++i) {
+    bytes[i] = static_cast<char>(rd() & 0xff);
+  }
+  NONE_HASH = bytes;
+}
+
+// --- Hashing -----------------------------------------------------------------
+
+std::pair<ExtraKeys, int> generate_block_hash_extra_keys(const Request& /*request*/,
+                                                         int /*start_token_idx*/,
+                                                         int /*end_token_idx*/,
+                                                         int start_mm_idx) {
+  // T0 Request carries no mm/LoRA/salt/embeds, so there are never extra keys.
+  return {std::nullopt, start_mm_idx};
+}
+
+BlockHash hash_block_tokens(const HashFn& hash_function,
+                            const std::optional<BlockHash>& parent_block_hash,
+                            const std::vector<int32_t>& curr_block_token_ids,
+                            const ExtraKeys& extra_keys) {
+  // Upstream: `if not parent_block_hash: parent_block_hash = NONE_HASH`. Python
+  // treats both None and empty bytes as falsy.
+  const BlockHash& parent = (parent_block_hash.has_value() && !parent_block_hash->empty())
+                                ? *parent_block_hash
+                                : NONE_HASH;
+
+  std::vector<CborValue> token_items;
+  token_items.reserve(curr_block_token_ids.size());
+  for (int32_t token_id : curr_block_token_ids) {
+    token_items.push_back(CborValue::Int(token_id));
+  }
+
+  CborValue extra_value = CborValue::Null();
+  if (extra_keys.has_value()) {
+    std::vector<CborValue> extra_items;
+    extra_items.reserve(extra_keys->size());
+    for (const ExtraKey& key : *extra_keys) {
+      extra_items.push_back(ExtraKeyToCbor(key));
+    }
+    extra_value = CborValue::Array(std::move(extra_items));
+  }
+
+  CborValue input = CborValue::Array({CborValue::Bytes(parent),
+                                      CborValue::Array(std::move(token_items)),
+                                      std::move(extra_value)});
+  return hash_function(input);
+}
+
+std::vector<BlockHash> hash_request_tokens(
+    const HashFn& hash_function, int block_size,
+    const std::vector<int32_t>& token_ids,
+    const std::vector<ExtraKeys>& per_block_extra_keys) {
+  std::vector<BlockHash> ret;
+  const int num_tokens = static_cast<int>(token_ids.size());
+  std::optional<BlockHash> prev_block_hash = std::nullopt;
+  int start_token_idx = 0;
+  size_t block_idx = 0;
+  const ExtraKeys no_extra_keys = std::nullopt;
+  // Only hash full blocks; a partial trailing block is left unhashed.
+  while (start_token_idx + block_size <= num_tokens) {
+    const int end_token_idx = start_token_idx + block_size;
+    std::vector<int32_t> block_tokens(token_ids.begin() + start_token_idx,
+                                      token_ids.begin() + end_token_idx);
+    const ExtraKeys& extra_keys = block_idx < per_block_extra_keys.size()
+                                      ? per_block_extra_keys[block_idx]
+                                      : no_extra_keys;
+    BlockHash block_hash =
+        hash_block_tokens(hash_function, prev_block_hash, block_tokens, extra_keys);
+    ret.push_back(block_hash);
+    prev_block_hash = block_hash;
+    start_token_idx += block_size;
+    ++block_idx;
+  }
+  return ret;
+}
 
 void KVCacheBlock::set_block_hash(BlockHashWithGroupId block_hash,
                                   std::optional<int> num_tokens) {

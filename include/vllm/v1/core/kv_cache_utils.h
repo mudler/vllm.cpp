@@ -8,6 +8,28 @@
 // middle-removal of an arbitrary cached-but-free block behave identically to
 // upstream.
 //
+// Scope (M1.2 Task 2): the parent-chained, group-aware prefix-cache block
+// hashing — NONE_HASH (the first-block sentinel), make_block_hash_with_group_id
+// / get_block_hash / get_group_id (packing a BlockHash + 4-byte big-endian group
+// id), hash_block_tokens (each block's hash chains the parent hash + this
+// block's token ids + optional extra keys), hash_request_tokens (the per-request
+// block-hash loop — N hashes for N full blocks, partial trailing block NOT
+// hashed) and the pluggable hash function.
+//
+// HASH FUNCTION FIDELITY: upstream's hash function is `Callable[[Any], bytes]`;
+// its two reproducible implementations are `sha256` (pickle serialization) and
+// `sha256_cbor` (cbor2 canonical serialization), both SHA-256 of the serialized
+// input (vllm/utils/hashing.py). We port `sha256_cbor` BYTE-FOR-BYTE: our
+// `CborValue` is the stand-in for Python's "Any", `CborValue::Encode()` matches
+// `cbor2.dumps(x, canonical=True)` for the value shapes block hashing produces,
+// and `sha256_cbor(value)` == `hashlib.sha256(cbor2.dumps(...)).digest()`. The
+// `sha256` (pickle) variant is intentionally NOT ported: Python's pickle opcode
+// stream is impractical to reproduce in C++, and its expected test vectors are
+// value-identical structurally to the CBOR ones (the upstream tests parametrize
+// both and assert the same chaining/group/partial invariants). The hash function
+// stays pluggable (`HashFn`) exactly as upstream so a caller may inject another
+// hasher, but the shipped concrete hasher is `sha256_cbor`.
+//
 // Field/method names are kept EXACTLY as upstream (snake_case: block_id,
 // ref_cnt, prev_free_block, next_free_block, popleft, remove, append,
 // get_all_free_blocks, num_free_blocks, reset_hash, ...) — this overrides the
@@ -38,20 +60,101 @@
 #ifndef VLLM_V1_CORE_KV_CACHE_UTILS_H_
 #define VLLM_V1_CORE_KV_CACHE_UTILS_H_
 
+#include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace vllm::v1 {
 
 // BlockHash represents the hash of a single KV-cache block used for prefix
-// caching. Upstream: `NewType("BlockHash", bytes)`. Task 2 owns the hashing.
+// caching. Upstream: `NewType("BlockHash", bytes)`. Held as raw bytes.
 using BlockHash = std::string;
 
 // BlockHashWithGroupId combines a BlockHash with its KV cache group ID, packed
-// into raw bytes. Upstream: `NewType("BlockHashWithGroupId", bytes)`. Task 2
-// adds the pack/unpack helpers.
+// into raw bytes: the BlockHash bytes followed by the group id as 4 big-endian
+// bytes. Upstream: `NewType("BlockHashWithGroupId", bytes)`.
 using BlockHashWithGroupId = std::string;
+
+// ---------------------------------------------------------------------------
+// Block-hash packing (make_block_hash_with_group_id / get_block_hash /
+// get_group_id). Mirrors upstream: the group id is encoded using 4 bytes in
+// big-endian order and appended to the block-hash bytes, avoiding tuple
+// allocation while still allowing both components to be recovered.
+// ---------------------------------------------------------------------------
+
+// Pack a BlockHash and group id into a BlockHashWithGroupId.
+BlockHashWithGroupId make_block_hash_with_group_id(const BlockHash& block_hash,
+                                                   uint32_t group_id);
+
+// Extract the BlockHash from a BlockHashWithGroupId (all but the last 4 bytes).
+BlockHash get_block_hash(const BlockHashWithGroupId& key);
+
+// Extract the group id from a BlockHashWithGroupId (last 4 bytes, big-endian).
+uint32_t get_group_id(const BlockHashWithGroupId& key);
+
+// ---------------------------------------------------------------------------
+// The pluggable hash function and its canonical-CBOR concrete implementation.
+// ---------------------------------------------------------------------------
+
+// A minimal canonical-CBOR value model: our stand-in for Python's "Any" that
+// upstream feeds to the hash function. It supports exactly the value shapes that
+// occur in block-hash inputs (unsigned/negative ints, byte strings, UTF-8 text,
+// arrays, and null) and serializes them with canonical encoding
+// (definite-length, minimal-width integers) — byte-for-byte identical to
+// `cbor2.dumps(x, canonical=True)` for those shapes.
+class CborValue {
+ public:
+  static CborValue UInt(uint64_t value);
+  static CborValue Int(int64_t value);
+  static CborValue Bytes(std::string bytes);
+  static CborValue Text(std::string text);
+  static CborValue Array(std::vector<CborValue> items);
+  static CborValue Null();
+
+  // Append this value's canonical CBOR encoding to out.
+  void Encode(std::string& out) const;
+  // This value's canonical CBOR encoding.
+  std::string Encode() const;
+
+ private:
+  enum class Type { kUInt, kNInt, kBytes, kText, kArray, kNull };
+  Type type_ = Type::kNull;
+  // kUInt: the value; kNInt: -1 - value (the CBOR "argument" of major type 1).
+  uint64_t arg_ = 0;
+  std::string str_;               // kBytes / kText payload.
+  std::vector<CborValue> items_;  // kArray payload.
+};
+
+// The hash function type. Mirrors upstream `Callable[[Any], bytes]`; our "Any"
+// is CborValue and "bytes" is BlockHash.
+using HashFn = std::function<BlockHash(const CborValue&)>;
+
+// SHA-256 over the canonical-CBOR serialization of value. Byte-for-byte
+// identical to upstream `vllm.utils.hashing.sha256_cbor`.
+BlockHash sha256_cbor(const CborValue& value);
+
+// A single extra key for a block hash: either a text string (a LoRA name or a
+// cache salt) or an (identifier, offset) pair (a multi-modal input). Mirrors the
+// heterogeneous Python objects upstream places in the extra_keys tuple.
+using ExtraKey = std::variant<std::string, std::pair<std::string, int64_t>>;
+
+// The optional tuple of extra keys for one block. std::nullopt mirrors Python
+// `None` (no extra keys), which hashes distinctly from an empty tuple.
+using ExtraKeys = std::optional<std::vector<ExtraKey>>;
+
+// The hash seed for the first block of any prefix block sequence. Set globally
+// by init_none_hash. Upstream: module-global `NONE_HASH`.
+extern BlockHash NONE_HASH;
+
+// Initialize NONE_HASH. Mirrors upstream init_none_hash: with a seed (upstream's
+// PYTHONHASHSEED), NONE_HASH = hash_fn(text(seed)) for reproducibility; without
+// one, NONE_HASH = 32 random bytes (upstream os.urandom(32)).
+void init_none_hash(const HashFn& hash_fn,
+                    std::optional<std::string> seed = std::nullopt);
 
 // KV-cache block metadata. Mirrors upstream's @dataclass(slots=True)
 // KVCacheBlock. The prev_free_block / next_free_block links form the intrusive
@@ -164,6 +267,48 @@ class FreeKVCacheBlockQueue {
   KVCacheBlock fake_free_list_head{-1};
   KVCacheBlock fake_free_list_tail{-1};
 };
+
+// Forward declaration for generate_block_hash_extra_keys (defined in
+// vllm/v1/request.h; only a const-ref is needed here).
+struct Request;
+
+// generate_block_hash_extra_keys — DEFERRED derivation.
+//
+// Upstream derives a block's extra hash keys from a Request's multi-modal
+// features, LoRA name, cache salt, and prompt embeddings. None of those Request
+// fields exist in the T0 Request port (see include/vllm/v1/request.h DEFERRED
+// list), and the gate models (text-only GDN/MoE) never populate them. For a
+// Request with no mm/LoRA/salt/embeds, upstream returns (None, start_mm_idx)
+// unchanged — which is exactly what this returns. The signature is kept 1:1 so
+// the mm/LoRA/salt/embeds branches can be filled in without a call-site change
+// once those Request fields land.
+std::pair<ExtraKeys, int> generate_block_hash_extra_keys(const Request& request,
+                                                         int start_token_idx,
+                                                         int end_token_idx,
+                                                         int start_mm_idx);
+
+// Compute the hash of one block's contents chained onto the preceding block(s).
+// Mirrors upstream hash_block_tokens: the hash key is
+// hash_function((parent_block_hash, tuple(token_ids), extra_keys)). A falsy
+// parent (nullopt or an empty hash, matching Python `if not parent_block_hash`)
+// is replaced with NONE_HASH. The current block is assumed full.
+BlockHash hash_block_tokens(const HashFn& hash_function,
+                            const std::optional<BlockHash>& parent_block_hash,
+                            const std::vector<int32_t>& curr_block_token_ids,
+                            const ExtraKeys& extra_keys = std::nullopt);
+
+// Compute the list of block hashes for a request's token ids at block_size
+// granularity. Mirrors the core loop of upstream get_request_block_hasher's
+// request_block_hasher (computing from an empty prefix): each full block's hash
+// chains the previous block's hash, so hash N depends on hash N-1; a partial
+// trailing block is NOT hashed (so 6 tokens at block_size 3 yields 2 hashes).
+// per_block_extra_keys supplies the extra keys for each block by index (the
+// Request-bound generation is deferred, see generate_block_hash_extra_keys);
+// blocks past its end use no extra keys.
+std::vector<BlockHash> hash_request_tokens(
+    const HashFn& hash_function, int block_size,
+    const std::vector<int32_t>& token_ids,
+    const std::vector<ExtraKeys>& per_block_extra_keys = {});
 
 }  // namespace vllm::v1
 

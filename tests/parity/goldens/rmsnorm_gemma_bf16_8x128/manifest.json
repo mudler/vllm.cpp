@@ -1,0 +1,49 @@
+{
+ "op": "rmsnorm",
+ "args": {
+  "eps": 1e-06,
+  "gemma": true,
+  "fused_residual": false
+ },
+ "tensors": {
+  "x": {
+   "file": "x.npy",
+   "dtype": "bf16",
+   "shape": [
+    8,
+    128
+   ]
+  },
+  "weight": {
+   "file": "weight.npy",
+   "dtype": "bf16",
+   "shape": [
+    128
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    8,
+    128
+   ]
+  }
+ },
+ "inputs": [
+  "x",
+  "weight"
+ ],
+ "outputs": [
+  "out"
+ ],
+ "tol": {
+  "atol": 0.008,
+  "rtol": 0.008
+ },
+ "oracle": {
+  "vllm_version": "0.24.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

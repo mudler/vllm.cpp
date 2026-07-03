@@ -57,6 +57,42 @@ TEST_CASE("slice advances pointer and keeps strides") {
   CHECK(c.Offset({1, 0}) == 4);  // strides preserved
 }
 
+TEST_CASE("huge shapes overflow loudly instead of wrapping") {
+  float buf[1];
+  // (1 << 21)^3 * 2 == 2^65 overflows int64 during stride accumulation.
+  CHECK_THROWS_AS(
+      Tensor::Contiguous(buf, DType::kF32, Cpu(), {1 << 21, 1 << 21, 1 << 21, 2}),
+      std::runtime_error);
+  // 2^62 * 4 == 2^64 overflows even at rank 2.
+  CHECK_THROWS_AS(
+      Tensor::Contiguous(buf, DType::kF32, Cpu(), {int64_t{1} << 62, 4}),
+      std::runtime_error);
+  // Near-limit but non-overflowing shape stays fine ((1 << 20)^3 * 2 == 2^61).
+  Tensor big = Tensor::Contiguous(buf, DType::kF32, Cpu(), {1 << 20, 1 << 20, 1 << 20, 2});
+  CHECK(big.Numel() == int64_t{1} << 61);
+}
+
+TEST_CASE("Numel guards hand-built tensors") {
+  Tensor t;
+  t.rank = 2;
+
+  t.shape[0] = int64_t{1} << 62;
+  t.shape[1] = 4;
+  CHECK_THROWS_AS(t.Numel(), std::runtime_error);  // 2^64 overflows
+
+  t.shape[0] = 3;
+  t.shape[1] = -2;
+  CHECK_THROWS_AS(t.Numel(), std::runtime_error);  // negative dim is loud, not UB
+
+  t.shape[0] = 0;
+  t.shape[1] = int64_t{1} << 62;
+  CHECK(t.Numel() == 0);  // zero dim short-circuits safely
+
+  t.shape[0] = 6;
+  t.shape[1] = 7;
+  CHECK(t.Numel() == 42);
+}
+
 TEST_CASE("bounds are checked loudly") {
   float buf[4];
   Tensor t = Tensor::Contiguous(buf, DType::kF32, Cpu(), {2, 2});

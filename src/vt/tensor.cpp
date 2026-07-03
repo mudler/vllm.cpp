@@ -1,7 +1,18 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/tensor.h"
 
+#include <limits>
+
 namespace vt {
+
+namespace {
+// True when acc * dim stays within int64. A zero dim short-circuits (product is
+// zero); a negative dim always fails since acc is kept non-negative, so
+// hand-built tensors with garbage shapes throw instead of hitting signed UB.
+bool MulFits(int64_t acc, int64_t dim) {
+  return dim == 0 || acc <= std::numeric_limits<int64_t>::max() / dim;
+}
+}  // namespace
 
 Tensor Tensor::Contiguous(void* data, DType dtype, Device device,
                           std::initializer_list<int64_t> shape) {
@@ -20,6 +31,7 @@ Tensor Tensor::Contiguous(void* data, DType dtype, Device device,
   int64_t acc = 1;
   for (int d = t.rank - 1; d >= 0; --d) {
     t.stride[d] = acc;
+    VT_CHECK(MulFits(acc, t.shape[d]), "tensor shape overflow");
     acc *= t.shape[d];
   }
   return t;
@@ -27,7 +39,10 @@ Tensor Tensor::Contiguous(void* data, DType dtype, Device device,
 
 int64_t Tensor::Numel() const {
   int64_t n = 1;
-  for (int d = 0; d < rank; ++d) n *= shape[d];
+  for (int d = 0; d < rank; ++d) {
+    VT_CHECK(MulFits(n, shape[d]), "tensor shape overflow");
+    n *= shape[d];
+  }
   return n;
 }
 

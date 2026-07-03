@@ -47,6 +47,7 @@ add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/transformers_utils/hf_config.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp
+  src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

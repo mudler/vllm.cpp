@@ -27,22 +27,36 @@ cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handl
 
 // Word is the raw storage type (uint32_t for f32, uint16_t for f16/bf16): the
 // auto cache path is a bit-exact copy, so no dtype-aware conversion is needed.
+//
+// CRITICAL (M1.6 Task-2): destination is indexed from TENSOR STRIDES, not from
+// k_cache.shape. K/V are the two dim-1 unbind slices of one (num_blocks, 2,
+// block_size, H, D) allocation, so their block stride is 2*bs*H*D (NOT bs*H*D)
+// and they are NON-contiguous rank-4 views. Mirrors pinned cache_kernels.cu @
+// e24d1b24 (host ~L797-801 sources key_stride/block_stride/page_stride/
+// head_stride from the tensor strides; kernel ~L337-347 does key_dst =
+// key_cache + block_idx*block_stride + block_offset*page_stride). The wrapper
+// guarantees head_stride == head_size && elem stride == 1 (the NHD unbind
+// slice), so the per-token page is one dense run of n_elems inside the block —
+// pinned's is_contiguous_heads fast path; here the threads stride that run.
 template <typename Word>
-__global__ void ReshapeAndCacheKernel(const Word* __restrict__ key,
-                                      const Word* __restrict__ value, Word* __restrict__ key_cache,
-                                      Word* __restrict__ value_cache,
-                                      const int64_t* __restrict__ slot_mapping, int64_t block_size,
-                                      int64_t n_elems) {
+__global__ void ReshapeAndCacheKernel(
+    const Word* __restrict__ key, const Word* __restrict__ value,
+    Word* __restrict__ key_cache, Word* __restrict__ value_cache,
+    const int64_t* __restrict__ slot_mapping, int64_t block_size, int64_t n_elems,
+    int64_t k_block_stride, int64_t k_page_stride, int64_t v_block_stride,
+    int64_t v_page_stride, int64_t k_tok_stride, int64_t v_tok_stride) {
   const int64_t token = blockIdx.x;
   const int64_t slot = slot_mapping[token];
   if (slot < 0) return;  // padded token → skip
   const int64_t block = slot / block_size;
   const int64_t offset = slot % block_size;
-  const int64_t dst = (block * block_size + offset) * n_elems;  // NHD element offset
-  const int64_t src = token * n_elems;
+  const int64_t kdst = block * k_block_stride + offset * k_page_stride;  // element offset
+  const int64_t vdst = block * v_block_stride + offset * v_page_stride;
+  const int64_t ksrc = token * k_tok_stride;
+  const int64_t vsrc = token * v_tok_stride;
   for (int64_t e = threadIdx.x; e < n_elems; e += blockDim.x) {
-    key_cache[dst + e] = key[src + e];
-    value_cache[dst + e] = value[src + e];
+    key_cache[kdst + e] = key[ksrc + e];
+    value_cache[vdst + e] = value[vsrc + e];
   }
 }
 
@@ -52,6 +66,12 @@ void ReshapeAndCacheKernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tenso
   const int64_t block_size = k_cache.shape[1];
   const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];
   if (num_slots == 0 || n_elems == 0) return;
+  const int64_t k_block_stride = k_cache.stride[0];
+  const int64_t k_page_stride = k_cache.stride[1];
+  const int64_t v_block_stride = v_cache.stride[0];
+  const int64_t v_page_stride = v_cache.stride[1];
+  const int64_t k_tok_stride = k.stride[0];
+  const int64_t v_tok_stride = v.stride[0];
   const unsigned grid = static_cast<unsigned>(num_slots);
   const unsigned block = static_cast<unsigned>(n_elems < 512 ? n_elems : 512);
   const cudaStream_t s = AsStream(q);
@@ -60,12 +80,14 @@ void ReshapeAndCacheKernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tenso
     case 4:
       ReshapeAndCacheKernel<uint32_t><<<grid, block, 0, s>>>(
           k.Ptr<uint32_t>(), v.Ptr<uint32_t>(), k_cache.Ptr<uint32_t>(), v_cache.Ptr<uint32_t>(),
-          slots, block_size, n_elems);
+          slots, block_size, n_elems, k_block_stride, k_page_stride, v_block_stride,
+          v_page_stride, k_tok_stride, v_tok_stride);
       break;
     case 2:
       ReshapeAndCacheKernel<uint16_t><<<grid, block, 0, s>>>(
           k.Ptr<uint16_t>(), v.Ptr<uint16_t>(), k_cache.Ptr<uint16_t>(), v_cache.Ptr<uint16_t>(),
-          slots, block_size, n_elems);
+          slots, block_size, n_elems, k_block_stride, k_page_stride, v_block_stride,
+          v_page_stride, k_tok_stride, v_tok_stride);
       break;
     default: VT_CHECK(false, "cuda reshape_and_cache: unsupported dtype element size");
   }

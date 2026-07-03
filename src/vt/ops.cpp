@@ -367,9 +367,24 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
                v_cache.dtype == k.dtype,
            "reshape_and_cache: k/v/k_cache/v_cache must share one float dtype (auto cache path)");
   VT_CHECK(slot_mapping.dtype == DType::kI64, "reshape_and_cache: slot_mapping must be i64");
-  VT_CHECK(k.IsContiguous() && v.IsContiguous() && k_cache.IsContiguous() &&
-               v_cache.IsContiguous() && slot_mapping.IsContiguous(),
-           "reshape_and_cache: contiguous tensors required");
+  // The paged KV cache is ONE (num_blocks, 2, block_size, H, D) allocation;
+  // k_cache/v_cache are the two dim-1 unbind slices, i.e. rank-4 STRIDED views
+  // (block stride 2*bs*H*D, not bs*H*D). We therefore must NOT require the cache
+  // to be contiguous — indexing is driven by k_cache/v_cache strides (mirroring
+  // pinned cache_kernels.cu::reshape_and_cache_flash, which reads block/page/
+  // head strides from key_cache.stride(0/1/2)). We only require what the copy
+  // actually needs: the innermost element access is well-defined (elem stride 1)
+  // and the per-token page is dense (head stride == head_size, i.e. dim-2/3
+  // packed), which holds for the NHD unbind slice. The input k/v rows and
+  // slot_mapping must be contiguous (upstream reads k/v inner packed, applying
+  // only key.stride(0) for the token, and indexes slot_mapping directly).
+  VT_CHECK(k.IsContiguous() && v.IsContiguous() && slot_mapping.IsContiguous(),
+           "reshape_and_cache: k/v inputs and slot_mapping must be contiguous");
+  VT_CHECK(k_cache.stride[3] == 1 && v_cache.stride[3] == 1,
+           "reshape_and_cache: k_cache/v_cache innermost (head_size) stride must be 1");
+  VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
+           "reshape_and_cache: k_cache/v_cache page must be head-contiguous "
+           "(stride[2] == head_size) — the NHD unbind-slice layout");
   VT_CHECK(k.device == q.device && v.device == q.device && k_cache.device == q.device &&
                v_cache.device == q.device && slot_mapping.device == q.device,
            "reshape_and_cache: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");

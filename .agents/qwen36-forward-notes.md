@@ -302,3 +302,82 @@ Re-dump command (per model):
       PATH=~/venvs/vllm-oracle/bin:$PATH ~/venvs/vllm-oracle/bin/python \
       tools/parity/dump_qwen36.py --model <snapshot_dir> --tag <27b|35b> \
       --out tests/parity/goldens'
+
+---
+
+## 5. Task 2 — dense causal attention op (EXACT formula, cites)
+
+Source of truth: pinned `vllm/model_executor/models/qwen3_next.py::Qwen3NextAttention`
+(the 35B `Qwen3_5MoeForConditionalGeneration` reuses this exact class for its
+1-in-4 `full_attention` layers; forward math is byte-identical to the pin, §0.4).
+Lines cited are in that file.
+
+**The full-attn layer forward** (`Qwen3NextAttention.forward`, L381-392):
+1. `qkv, _ = self.qkv_proj(hidden_states)`  — QKV+gate projection (Task 4/caller).
+2. `q, k, v, gate = self._project_qkv_gate(qkv, positions)`  — the op's core.
+3. `attn_output = self.attn(q, k, v)`  — causal scaled-dot-product attention.
+4. `if gate is not None: attn_output = attn_output * torch.sigmoid(gate)`  — output gate.
+5. `output[:], _ = self.o_proj(attn_output)`  — output projection (Task 4/caller).
+
+**`_project_qkv_gate` eager path** (the reference; the fused Triton kernel L336-357
+is a CUDA-only optimization that is numerically the same, gated on
+`attn_output_gate AND is_neox_style AND is_cuda AND text_only`, L318-323):
+- **Gate split** (L359-367): `attn_output_gate=True` (config, notes §1), so
+  `q_gate, k, v = qkv.split([q_size*2, kv_size, kv_size], -1)`. Then
+  `q_gate.view(T, num_heads, 2*head_dim)`, `torch.chunk(q_gate, 2, dim=-1)` →
+  `q` = first `head_dim` per head, `gate` = second `head_dim` per head. So per
+  q-head the projection lays out `[q(head_dim) | gate(head_dim)]` contiguously.
+- **qk-norm** (L372-377): `q = self.q_norm(q.view(-1, num_heads, head_dim))`,
+  `k = self.k_norm(k.view(-1, num_kv_heads, head_dim))`. `q_norm`/`k_norm` are
+  `Qwen3NextRMSNorm = GemmaRMSNorm` (import alias L27) over `head_dim` (=256),
+  `eps=rms_norm_eps` (1e-6). **GEMMA-style** → weight applied as `(1 + w)`, math
+  in f32 (the fused path passes `q_norm.weight.float() + 1.0`, L347-348, confirming
+  gemma). Per-(token,head) normalization over the head_dim axis.
+- **RoPE** (L378): `q, k = self.rotary_emb(positions, q, k)`. `rotary_emb =
+  get_rope(head_size=256, rope_parameters=..., ...)`. `partial_rotary_factor 0.25`
+  → **rotary_dim = 64**, `is_neox_style=True`, partial NeoX (first 64 dims of each
+  head rotate, dims 64..255 pass through). For text-only single-seq, `positions`
+  is mRoPE `[3,T]` with all three rows equal, so this is EXACTLY partial NeoX RoPE
+  on `positions[0]` (§2 proof). → **reuse `kRopeNeox` on `positions[0]`,
+  rotary_dim 64.**
+- **v** is NOT normed and NOT roped.
+
+**Attention** (`self.attn`, L294-309, an `Attention(num_heads, head_dim, scaling,
+num_kv_heads=..., attn_type=DECODER)`): causal scaled-dot-product.
+- `scaling = head_dim ** -0.5` (L254) = `256 ** -0.5` ≈ 0.0625.
+- GQA: `num_heads=16` q-heads, `num_kv_heads=2` kv-heads (35B, notes §1). q-head
+  `h` reads kv-head `h // (num_heads // num_kv_heads)` = `h // 8`.
+- `scores[i,j] = scaling * (q[i,h] · k[j,g])` for `j <= i` else `-inf`; row
+  softmax (f32); `out[i,h] = Σ_j softmax_j · v[j,g]`.
+
+**Output gate** (L390-391): `attn_output * sigmoid(gate)`, elementwise over
+`[T, num_heads*head_dim]`. `gate` is the pre-sigmoid second half of the per-head
+q-projection (above). Sigmoid is on the RAW gate (no norm/rope on gate).
+
+### op decomposition (matches the M0.8 MoE precedent: thin new kernel + compose)
+
+The only piece composition cannot express is the **causal GQA scaled-dot-product
+attention** → new op **`vt::Attention` / `OpId::kAttention`** (CPU+CUDA, f32
+softmax accumulation). qk-norm reuses `vt::RmsNorm` (gemma) over `head_dim`; RoPE
+reuses `vt::RopeNeox` (rotary_dim 64); the gate-split (slicing the fused q/gate)
+and the `sigmoid(gate)` multiply are elementwise and handled by the caller
+(Task 4 layer / the parity runner), exactly like the MoE shared-expert sigmoid is
+composed in `RunMoeBlock`. So Task 2 does NOT deliver the full LAYER (the
+qkv/o projections are Task 4) → **`qwen36_fullattn_layer` STAYS in
+PendingRunnerOps** (Task 4 removes it). Task 2's own op golden is
+`dense_attention_*` (dedicated, NOT in the allowlist → its runner runs in CI).
+
+**`kAttention` contract:** `query [T,Hq,D]`, `key [T,Hk,D]`, `value [T,Hk,D]`,
+`out [T,Hq,D]`; `AttentionArgs{scale, causal}`; `Hq % Hk == 0`; f32 or bf16 in,
+f32/bf16 out, f32 math. q/k arrive POST-norm+POST-rope; v raw.
+
+### `dense_attention_*` golden (op-level, `tools/parity/dump_ops.py::dump_attention`)
+
+Oracle: vLLM `GemmaRMSNorm.forward_native` (qk-norm) + `get_rope(...).forward_native`
+(partial NeoX, same API as `dump_rope`) + pure-torch causal GQA sdpa (f32) +
+`torch.sigmoid` gate — every piece pinned-equivalent. Two f32 cases: `_small`
+(T=6,Hq=4,Hk=2,D=8,rotary 4) and `_realdims` (T=9,Hq=4,Hk=2,D=256,rotary 64,
+theta 1e7). Tensors: `q,gate,k,v` (pre-norm inputs), `positions[T]`,
+`q_norm_weight,k_norm_weight [D]`, `attn` (pre-gate [T,Hq,D]), `out` (gated
+[T,Hq*D]). Runner `RunDenseAttention` composes gemma-RmsNorm → RopeNeox →
+Attention → sigmoid gate and checks both `attn` and `out`.

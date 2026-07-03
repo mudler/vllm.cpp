@@ -4,6 +4,7 @@
 // accumulation, double-precision RoPE angles matching the CPU reference.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <stdexcept>
 #include <string>
@@ -301,6 +302,101 @@ void RopeNeoxKernelCuda(Queue& q, Tensor& qs, Tensor& ks, const Tensor& pos,
   }
 }
 
+// ---------------------------------------------------------------------------
+// attention: one block per (query i, q-head h); block threads cooperate over
+// the head_dim and stream the keys with an online (flash-style) softmax. The
+// online update is algebraically identical to the CPU two-pass reference
+// (qwen36-forward-notes.md §5); f32 accumulation. Correctness-grade (M0.9).
+
+template <typename Tin, typename Tout>
+__global__ void AttentionKernel(Tout* out, const Tin* query, const Tin* key, const Tin* value,
+                                int64_t hq, int64_t hk, int64_t d, int64_t t, float scale,
+                                bool causal) {
+  const int64_t i = blockIdx.x;  // query position
+  const int64_t h = blockIdx.y;  // q-head
+  const int64_t g = h / (hq / hk);
+  const int64_t jmax = causal ? i : t - 1;
+  const int64_t qoff = (i * hq + h) * d;
+
+  extern __shared__ float smem[];
+  float* acc = smem;                    // [d] running output accumulator
+  float* red = smem + d;                // [blockDim.x] reduction scratch
+  __shared__ float s_score, s_m, s_l;   // block-wide score / running max / denom
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) acc[e] = 0.0f;
+  if (threadIdx.x == 0) {
+    s_m = -CUDART_INF_F;
+    s_l = 0.0f;
+  }
+  __syncthreads();
+
+  for (int64_t j = 0; j <= jmax; ++j) {
+    const int64_t koff = (j * hk + g) * d;
+    float part = 0.0f;
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      part += Load(query, qoff + e) * Load(key, koff + e);
+    red[threadIdx.x] = part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) s_score = red[0] * scale;
+    __syncthreads();
+
+    const float s = s_score;
+    const float m_new = fmaxf(s_m, s);
+    const float corr = expf(s_m - m_new);  // 0 on the first key (s_m == -inf)
+    const float p = expf(s - m_new);
+    const int64_t voff = (j * hk + g) * d;
+    for (int64_t e = threadIdx.x; e < d; e += blockDim.x)
+      acc[e] = acc[e] * corr + p * Load(value, voff + e);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      s_l = s_l * corr + p;
+      s_m = m_new;
+    }
+    __syncthreads();
+  }
+
+  const float inv = 1.0f / s_l;
+  for (int64_t e = threadIdx.x; e < d; e += blockDim.x) Store(out, qoff + e, acc[e] * inv);
+}
+
+template <typename Tin>
+void LaunchAttention(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const AttentionArgs& args) {
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  if (t == 0 || hq == 0 || d == 0) return;
+  const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
+  switch (out.dtype) {
+    case DType::kF32:
+      AttentionKernel<Tin, float><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk, d, t,
+          args.scale, args.causal);
+      break;
+    case DType::kBF16:
+      AttentionKernel<Tin, __nv_bfloat16><<<grid, kBlock, shmem, s>>>(
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), hq, hk,
+          d, t, args.scale, args.causal);
+      break;
+    default: VT_CHECK(false, "cuda attention: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "attention launch");
+}
+
+void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                         const Tensor& value, const AttentionArgs& args) {
+  switch (query.dtype) {
+    case DType::kF32: LaunchAttention<float>(AsStream(q), out, query, key, value, args); break;
+    case DType::kBF16:
+      LaunchAttention<__nv_bfloat16>(AsStream(q), out, query, key, value, args);
+      break;
+    default: VT_CHECK(false, "cuda attention: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -314,6 +410,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
+    RegisterOp(OpId::kAttention, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
   }
 } registrar;
 

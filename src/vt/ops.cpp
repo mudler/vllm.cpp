@@ -314,4 +314,33 @@ void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& w
                                                                           weights, shared);
 }
 
+void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+               const Tensor& value, const AttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "attention: query/key/value/out rank-3 [T,H,D]");
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
+           "attention: query/key/value token count must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
+           "attention: out must be [T,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "attention: Hq must be a positive multiple of Hk (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "attention: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "attention: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "attention: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "attention: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "attention: device mismatch (query/key/value/out/queue)");
+  reinterpret_cast<AttentionFn>(GetOp(OpId::kAttention, q.device.type))(q, out, query, key,
+                                                                        value, args);
+}
+
 }  // namespace vt

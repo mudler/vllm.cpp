@@ -1,0 +1,111 @@
+{
+ "op": "dense_attention",
+ "args": {
+  "eps": 1e-06,
+  "base": 10000.0,
+  "rotary_dim": 4,
+  "scale": 0.3535533905932738,
+  "head_dim": 8,
+  "num_q_heads": 4,
+  "num_kv_heads": 2,
+  "causal": true
+ },
+ "tensors": {
+  "q": {
+   "file": "q.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    4,
+    8
+   ]
+  },
+  "gate": {
+   "file": "gate.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    4,
+    8
+   ]
+  },
+  "k": {
+   "file": "k.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    2,
+    8
+   ]
+  },
+  "v": {
+   "file": "v.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    2,
+    8
+   ]
+  },
+  "positions": {
+   "file": "positions.npy",
+   "dtype": "i64",
+   "shape": [
+    6
+   ]
+  },
+  "q_norm_weight": {
+   "file": "q_norm_weight.npy",
+   "dtype": "f32",
+   "shape": [
+    8
+   ]
+  },
+  "k_norm_weight": {
+   "file": "k_norm_weight.npy",
+   "dtype": "f32",
+   "shape": [
+    8
+   ]
+  },
+  "attn": {
+   "file": "attn.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    4,
+    8
+   ]
+  },
+  "out": {
+   "file": "out.npy",
+   "dtype": "f32",
+   "shape": [
+    6,
+    32
+   ]
+  }
+ },
+ "inputs": [
+  "q",
+  "gate",
+  "k",
+  "v",
+  "positions",
+  "q_norm_weight",
+  "k_norm_weight"
+ ],
+ "outputs": [
+  "attn",
+  "out"
+ ],
+ "tol": {
+  "atol": 0.0002,
+  "rtol": 0.0002
+ },
+ "oracle": {
+  "vllm_version": "0.24.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

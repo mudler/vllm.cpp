@@ -630,6 +630,72 @@ void RunMoeBlock(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   RequireMatch("out", dout.Download(q, out_host), out_want.tensor, atol, rtol);
 }
 
+// dense_attention: the op-level golden for the Qwen3NextAttention core
+// (qwen36-forward-notes.md §5). Composes the full core exactly as the Task 4
+// full-attn layer will: per-head gemma-RMSNorm on q and k (vt::RmsNorm over
+// head_dim), partial NeoX RoPE (vt::RopeNeox on positions), causal GQA
+// scaled-dot-product (the new vt::Attention op), then the sigmoid output gate
+// (elementwise, host-composed like RunMoeBlock's shared-expert gate). q/gate/k/v
+// are the PRE-norm projection split; `attn` (pre-gate) and `out` (gated) are the
+// checked contracts. All f32 — the op-level golden isolates the attention math.
+void RunDenseAttention(Backend& b, Queue& q, const fs::path& dir, const json& m) {
+  auto qin = LoadTensor(dir, m["tensors"]["q"]);
+  auto gate = LoadTensor(dir, m["tensors"]["gate"]);
+  auto k = LoadTensor(dir, m["tensors"]["k"]);
+  auto v = LoadTensor(dir, m["tensors"]["v"]);
+  auto pos = LoadTensor(dir, m["tensors"]["positions"]);
+  auto qnw = LoadTensor(dir, m["tensors"]["q_norm_weight"]);
+  auto knw = LoadTensor(dir, m["tensors"]["k_norm_weight"]);
+  auto attn_want = LoadTensor(dir, m["tensors"]["attn"]);
+  auto out_want = LoadTensor(dir, m["tensors"]["out"]);
+
+  const int64_t T = qin.tensor.shape[0];
+  const int64_t Hq = m["args"]["num_q_heads"].get<int64_t>();
+  const int64_t Hk = m["args"]["num_kv_heads"].get<int64_t>();
+  const int64_t D = m["args"]["head_dim"].get<int64_t>();
+  const float eps = m["args"]["eps"].get<float>();
+  const float base = m["args"]["base"].get<float>();
+  const int rotary_dim = m["args"]["rotary_dim"].get<int>();
+  const float scale = m["args"]["scale"].get<float>();
+  const bool causal = m["args"]["causal"].get<bool>();
+  VT_CHECK(qin.dtype == DType::kF32, "dense_attention runner requires f32 q (in-place rope)");
+  double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
+
+  // Per-head gemma-RMSNorm: normalize over head_dim, so view q/k as [T*H, D].
+  DeviceBuf dq(b, q, DType::kF32, {T * Hq, D}, qin.raw.data.data());
+  DeviceBuf dk(b, q, DType::kF32, {T * Hk, D}, k.raw.data.data());
+  DeviceBuf dqnw(b, q, DType::kF32, ShapeOf(qnw.tensor), qnw.raw.data.data());
+  DeviceBuf dknw(b, q, DType::kF32, ShapeOf(knw.tensor), knw.raw.data.data());
+  DeviceBuf dqn(b, q, DType::kF32, {T * Hq, D});
+  DeviceBuf dkn(b, q, DType::kF32, {T * Hk, D});
+  vt::RmsNormArgs nargs{eps, /*gemma=*/true};
+  vt::RmsNorm(q, dqn.tensor(), dq.tensor(), dqnw.tensor(), nargs);
+  vt::RmsNorm(q, dkn.tensor(), dk.tensor(), dknw.tensor(), nargs);
+
+  // Partial NeoX RoPE in place on the normed q/k, viewed as [T,H,D].
+  Tensor qn3 = MakeTensor(dqn.tensor().data, DType::kF32, q.device, {T, Hq, D});
+  Tensor kn3 = MakeTensor(dkn.tensor().data, DType::kF32, q.device, {T, Hk, D});
+  DeviceBuf dpos(b, q, pos.dtype, ShapeOf(pos.tensor), pos.raw.data.data());
+  vt::RopeNeox(q, qn3, kn3, dpos.tensor(), vt::RopeArgs{base, rotary_dim});
+
+  // Causal GQA scaled-dot-product attention (the new op). v is raw [T,Hk,D].
+  DeviceBuf dv(b, q, DType::kF32, {T, Hk, D}, v.raw.data.data());
+  DeviceBuf dattn(b, q, DType::kF32, {T, Hq, D});
+  vt::Attention(q, dattn.tensor(), qn3, kn3, dv.tensor(), vt::AttentionArgs{scale, causal});
+  std::vector<uint8_t> attn_host;
+  Tensor tattn = dattn.Download(q, attn_host);
+  RequireMatch("attn", tattn, attn_want.tensor, atol, rtol);
+
+  // Sigmoid output gate (elementwise, host-composed): out = attn * sigmoid(gate).
+  std::vector<uint8_t> gated(static_cast<size_t>(T * Hq * D) * sizeof(float), 0);
+  Tensor tgated = MakeTensor(gated.data(), DType::kF32, Cpu(), {T, Hq, D});
+  for (int64_t i = 0; i < T * Hq * D; ++i) {
+    const float g = 1.0f / (1.0f + std::exp(-AsF32(gate.tensor, i)));
+    StoreAs(tgated, i, AsF32(tattn, i) * g);
+  }
+  RequireMatch("out", tgated, out_want.tensor, atol, rtol);
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -696,6 +762,8 @@ int RunGoldenPass(Device dev) {
       RunMoeRouterTopK(b, q, entry.path(), m);
     } else if (op == "moe_block") {
       RunMoeBlock(b, q, entry.path(), m);
+    } else if (op == "dense_attention") {
+      RunDenseAttention(b, q, entry.path(), m);
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");
@@ -759,7 +827,7 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  CHECK(cases >= 29);  // 24 pre-M0.8 + 5 MoE (router x3, block x2)
+  CHECK(cases >= 31);  // 24 pre-M0.8 + 5 MoE + 2 dense_attention (M0.9 Task 2)
 }
 
 // Same cases, same tolerances, on the GPU: inputs are uploaded through the
@@ -778,5 +846,5 @@ TEST_CASE("op parity vs upstream goldens (CUDA)") {
     return;
   }
   int cases = RunGoldenPass(Device{DeviceType::kCUDA, 0});
-  CHECK(cases >= 24);
+  CHECK(cases >= 26);
 }

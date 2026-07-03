@@ -114,9 +114,79 @@ def dump_rope(root):
                       args, ["q_in", "k_in", "positions"], ["q_out", "k_out"], tol)
 
 
+def _attention_case(root, name, T, Hq, Hk, D, rotary_dim, base, eps, tol):
+    """Dense causal attention op golden (qwen36-forward-notes.md §5).
+
+    Oracle: vLLM GemmaRMSNorm.forward_native (qk-norm, gemma (1+w), f32) +
+    get_rope(...).forward_native (partial NeoX, same API as dump_rope) +
+    pure-torch causal GQA scaled-dot-product (f32) + torch.sigmoid gate. Every
+    piece is pinned-equivalent to Qwen3NextAttention's core. Tensors: q/gate/k/v
+    are the PRE-norm projection split (q = pre-norm query, gate = pre-sigmoid
+    output gate, both per-head [T,Hq,D]); `attn` is the pre-gate attention output
+    [T,Hq,D]; `out` is the gated output flattened [T,Hq*D].
+    """
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    with set_current_vllm_config(VllmConfig()):
+        torch.manual_seed(0)
+        q = torch.randn(T, Hq, D, dtype=torch.float32)
+        gate = torch.randn(T, Hq, D, dtype=torch.float32)
+        k = torch.randn(T, Hk, D, dtype=torch.float32)
+        v = torch.randn(T, Hk, D, dtype=torch.float32)
+        positions = torch.arange(T, dtype=torch.int64)
+
+        q_norm = GemmaRMSNorm(D, eps=eps).to(torch.float32)
+        k_norm = GemmaRMSNorm(D, eps=eps).to(torch.float32)
+        q_norm.weight.data.normal_()
+        k_norm.weight.data.normal_()
+        qn = q_norm.forward_native(q.clone())  # per-head RMSNorm over D
+        kn = k_norm.forward_native(k.clone())
+
+        rope = get_rope(head_size=D, max_position=200000, is_neox_style=True,
+                        rope_parameters={"rope_type": "default", "rope_theta": base,
+                                         "rope_dim": rotary_dim}, dtype=torch.float32)
+        qf, kf = rope.forward_native(positions, qn.reshape(T, Hq * D).clone(),
+                                     kn.reshape(T, Hk * D).clone())
+        qr = qf.reshape(T, Hq, D)
+        kr = kf.reshape(T, Hk, D)
+
+        scale = D ** -0.5
+        rep = Hq // Hk
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+        attn = torch.empty(T, Hq, D, dtype=torch.float32)
+        for h in range(Hq):
+            g = h // rep
+            scores = (qr[:, h, :] @ kr[:, g, :].T) * scale  # [T,T]
+            scores = scores.masked_fill(mask, float("-inf"))
+            probs = torch.softmax(scores, dim=-1)
+            attn[:, h, :] = probs @ v[:, g, :]  # v is NOT normed/roped
+        gated = (attn * torch.sigmoid(gate)).reshape(T, Hq * D)
+
+        args = {"eps": eps, "base": float(rope.base), "rotary_dim": rotary_dim,
+                "scale": scale, "head_dim": D, "num_q_heads": Hq, "num_kv_heads": Hk,
+                "causal": True}
+        save_case(root, name, "dense_attention",
+                  {"q": q, "gate": gate, "k": k, "v": v, "positions": positions,
+                   "q_norm_weight": q_norm.weight.data, "k_norm_weight": k_norm.weight.data,
+                   "attn": attn, "out": gated},
+                  args,
+                  ["q", "gate", "k", "v", "positions", "q_norm_weight", "k_norm_weight"],
+                  ["attn", "out"], tol)
+
+
+def dump_attention(root):
+    TOL = {"atol": 2e-4, "rtol": 2e-4}
+    # small hand-scale case (GQA ratio 2), and real head_dim/rotary few-heads.
+    _attention_case(root, "dense_attention_f32_small", T=6, Hq=4, Hk=2, D=8,
+                    rotary_dim=4, base=10000.0, eps=1e-6, tol=TOL)
+    _attention_case(root, "dense_attention_f32_realdims", T=9, Hq=4, Hk=2, D=256,
+                    rotary_dim=64, base=1e7, eps=1e-6, tol=TOL)
+
+
 DUMPERS = {"rmsnorm": dump_rmsnorm, "matmul": dump_matmul,
            "silu_and_mul": dump_silu_and_mul, "embedding": dump_embedding,
-           "rope": dump_rope}
+           "rope": dump_rope, "attention": dump_attention}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

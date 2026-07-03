@@ -19,6 +19,7 @@ enum class OpId : uint8_t {
   kGdnDecode,
   kMoeRouterTopK,
   kMoeCombine,
+  kAttention,
   kCount
 };
 
@@ -56,6 +57,17 @@ struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
   // (gdn-semantics.md §1). Must be set explicitly (> 0).
   float scale = 0.0f;
+};
+
+// Dense causal attention args (.agents/qwen36-forward-notes.md §5 is the
+// formula reference — Qwen3NextAttention's core scaled-dot-product).
+struct AttentionArgs {
+  // Softmax scale, applied to the qk dot product. Upstream sets it to
+  // head_dim^-0.5 (Qwen3NextAttention.scaling). Must be set explicitly (> 0).
+  float scale = 0.0f;
+  // Causal masking: key position j attends only when j <= query position i.
+  // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
+  bool causal = true;
 };
 
 // MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).
@@ -99,6 +111,8 @@ using MoeRouterTopKFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
 using MoeCombineFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
+using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                             const AttentionArgs&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -229,5 +243,21 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 // materializing expert_out/shared in the activation dtype.
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
                 const Tensor* shared = nullptr);
+
+// --- Dense causal attention (M0.9). Formula reference:
+// .agents/qwen36-forward-notes.md §5 (pinned Qwen3NextAttention core).
+//
+// Causal scaled-dot-product attention with GQA broadcast over a single packed
+// sequence. query [T,Hq,D], key/value [T,Hk,D], out [T,Hq,D]; Hq a multiple of
+// Hk (q-head h reads kv-head h / (Hq/Hk)). q/k arrive ALREADY qk-normed and
+// RoPE'd (compose vt::RmsNorm + vt::RopeNeox upstream); v is raw. The output
+// gate (sigmoid) is applied by the caller (it is elementwise on the projection
+// split, not attention math). Per q-head h (kv-head g), query i:
+//   s[j] = scale * (query[i,h] · key[j,g])   for j <= i (causal), else -inf
+//   p    = softmax_j(s)                       (f32, max-subtracted)
+//   out[i,h] = Σ_j p[j] * value[j,g]
+// f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
+void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+               const Tensor& value, const AttentionArgs& args);
 
 }  // namespace vt

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace vt::cpu {
@@ -366,6 +367,54 @@ void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tenso
   }
 }
 
+// Dense causal attention (qwen36-forward-notes.md §5). Causal scaled-dot-product
+// with GQA broadcast over a single packed sequence. query [T,Hq,D],
+// key/value [T,Hk,D], out [T,Hq,D]. Per q-head h (kv-head g = h/(Hq/Hk)) and
+// query i: softmax over keys j<=i of scale*(q·k), then weighted sum of v. f32
+// softmax with online max-subtraction for numerical stability.
+void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key,
+                     const Tensor& value, const AttentionArgs& args) {
+  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t hk = key.shape[1];
+  const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
+  const float scale = args.scale;
+  std::vector<float> probs(static_cast<size_t>(t));
+  std::vector<float> acc(static_cast<size_t>(d));
+  for (int64_t h = 0; h < hq; ++h) {
+    const int64_t g = h / qpk;
+    for (int64_t i = 0; i < t; ++i) {
+      const int64_t jmax = args.causal ? i : t - 1;  // causal: keys 0..i
+      const int64_t qoff = (i * hq + h) * d;
+      // Pass 1: scores + running max.
+      float m = -std::numeric_limits<float>::infinity();
+      for (int64_t j = 0; j <= jmax; ++j) {
+        const int64_t koff = (j * hk + g) * d;
+        float dot = 0.0f;
+        for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+        dot *= scale;
+        probs[static_cast<size_t>(j)] = dot;
+        if (dot > m) m = dot;
+      }
+      // Pass 2: exp + normalization denominator.
+      float denom = 0.0f;
+      for (int64_t j = 0; j <= jmax; ++j) {
+        float e = std::exp(probs[static_cast<size_t>(j)] - m);
+        probs[static_cast<size_t>(j)] = e;
+        denom += e;
+      }
+      const float inv = 1.0f / denom;  // denom >= 1 (j==i term is exp(0)=1)
+      // Pass 3: weighted sum of v (f32 accumulation), stored at out's dtype.
+      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+      for (int64_t j = 0; j <= jmax; ++j) {
+        const float p = probs[static_cast<size_t>(j)] * inv;
+        const int64_t voff = (j * hk + g) * d;
+        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+      }
+      for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     // static_cast against the ops.h aliases ties kernel signatures to the
@@ -397,6 +446,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernel)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
+    RegisterOp(OpId::kAttention, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
   }
 } registrar;
 

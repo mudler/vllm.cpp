@@ -22,7 +22,7 @@ and OpenAI-compatible server.
 
 | Backend | Hardware | Status |
 |---|---|---|
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121) | 🚧 in development (M0; toolchain verified on-device) |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121) | 🚧 in development (M0.6: baseline ops parity-verified on GB10) |
 | CPU | x86-64 reference (correctness/CI grade) | 🚧 in development (M0) |
 | Metal | Apple Silicon (MLX vs native MSL under exploration) | 🗓 planned (post-MVP) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |

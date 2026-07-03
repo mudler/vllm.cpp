@@ -29,7 +29,7 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 - ✅ **M0.5 Tokenizer** (`0baa46e`): byte-level BPE from tokenizer.json + GGUF vocab;
   incremental detokenizer. DoD: token-for-token vs HF tokenizers on corpus;
   ported detokenizer edge-case tests.
-- ☐ **M0.6 CUDA baseline ops**: cuBLASLt GEMM, rmsnorm (+Gemma/gated
+- ✅ **M0.6 CUDA baseline ops** (`3750954`): cuBLASLt GEMM, rmsnorm (+Gemma/gated
   variants), rope (partial), silu_and_mul, embedding/lm_head. DoD: op parity
   CUDA vs dumps.
 - ☐ **M0.7 GDN layer (eager)**: conv1d, chunked-scan prefill, recurrence

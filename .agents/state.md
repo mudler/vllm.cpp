@@ -91,3 +91,18 @@
   compatibility with upstream vLLM (CUDA/AMD first) — signatures aligned so
   upstream kernels bind without rewrite. Recorded in backends.md + roadmap
   post-MVP queue; to be shaped after MVP with M0.6-M2 experience in hand.
+- **2026-07-03 (later)** — M0.6 done (`3750954`): CUDA baseline ops landed —
+  real CUDA backend (GB10, replaces M0.1 smoke placeholder; cudaMalloc/
+  cudaMemcpyAsync-Default/streams, Synchronize/DestroyQueue virtuals),
+  CUDA kernels for rmsnorm(+gemma,+fused-residual)/silu_and_mul/embedding
+  (device-flag bounds check, sync-time throw)/rope_neox, cuBLASLt matmul
+  (bf16/f32, f32 compute). Carried M0.2 items closed: fn-type aliases in
+  ops.h with static_cast registration ties; out-dtype widened to bf16-or-f32
+  (unsupported combos throw). Parity gate: test_op_parity runners factored
+  onto the Backend interface — 9/9 CPU + 9/9 CUDA golden cases pass on
+  dgx.casa at the SAME upstream-anchored tolerances (full ctest 21/21);
+  CI (CPU-only) green. CUDA kernels carry upstream-counterpart comments per
+  backends.md §drop-in. NEXT: M0.7 GDN layer (eager) — conv1d, chunked-scan
+  prefill, recurrence decode; model-level goldens MUST dump from the PINNED
+  checkout per tools/parity/README.md (pip oracle is fine for pure-op cases
+  only); FLA chunk semantics → CUDA correctness-grade.

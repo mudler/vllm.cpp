@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -40,9 +42,36 @@ DType DtypeFromName(const std::string& n) {
 }
 
 Loaded LoadTensor(const fs::path& dir, const json& spec) {
-  Loaded l{parity::LoadNpy((dir / spec["file"].get<std::string>()).string()),
+  const std::string file = spec["file"].get<std::string>();
+  Loaded l{parity::LoadNpy((dir / file).string()),
            DtypeFromName(spec["dtype"].get<std::string>()), {}};
   std::vector<int64_t> shape = spec["shape"].get<std::vector<int64_t>>();
+  if (shape.size() < 1 || shape.size() > 4)
+    throw std::runtime_error("rank out of range for vt::Tensor: " + file +
+                             " has rank " + std::to_string(shape.size()));
+  // Cross-check the npy header against the manifest: shape must match
+  // element-wise, and the descr element size must match the manifest dtype.
+  if (l.raw.shape != shape) {
+    auto fmt = [](const std::vector<int64_t>& s) {
+      std::ostringstream os;
+      os << "[";
+      for (size_t i = 0; i < s.size(); ++i) os << (i ? "," : "") << s[i];
+      os << "]";
+      return os.str();
+    };
+    throw std::runtime_error("shape mismatch for " + file + ": npy header " +
+                             fmt(l.raw.shape) + " vs manifest " + fmt(shape));
+  }
+  // descr is e.g. "<f4": element size is the digits after endian + type char.
+  size_t npy_esize = 0;
+  for (size_t i = 2; i < l.raw.dtype.size(); ++i)
+    npy_esize = npy_esize * 10 + static_cast<size_t>(l.raw.dtype[i] - '0');
+  if (npy_esize != vt::SizeOf(l.dtype))
+    throw std::runtime_error(
+        "dtype size mismatch for " + file + ": npy descr '" + l.raw.dtype +
+        "' (" + std::to_string(npy_esize) + " bytes) vs manifest dtype '" +
+        spec["dtype"].get<std::string>() + "' (" +
+        std::to_string(vt::SizeOf(l.dtype)) + " bytes)");
   Tensor t;
   t.data = l.raw.data.data();
   t.dtype = l.dtype;
@@ -67,16 +96,37 @@ float AsF32(const Tensor& t, int64_t i) {
   }
 }
 
-void CompareTensors(const std::string& name, const Tensor& got, const Tensor& want,
-                    double atol, double rtol) {
-  REQUIRE(got.Numel() == want.Numel());
+// Returns the first-failure description, or nullopt if all elements match.
+// NaN-loud: NaN anywhere (got or want) is a failure — `>` comparisons are
+// silently false for NaN, so the check is `!(diff <= tol)` plus isnan.
+std::optional<std::string> CompareTensors(const Tensor& got, const Tensor& want,
+                                          double atol, double rtol) {
+  if (got.Numel() != want.Numel()) {
+    return "element count mismatch: got " + std::to_string(got.Numel()) +
+           " want " + std::to_string(want.Numel());
+  }
   for (int64_t i = 0; i < got.Numel(); ++i) {
     double g = AsF32(got, i), w = AsF32(want, i);
     double tol = atol + rtol * std::abs(w);
-    if (std::abs(g - w) > tol) {
-      FAIL(name << "[" << i << "]: got " << g << " want " << w << " (tol " << tol << ")");
+    const bool g_nan = std::isnan(g), w_nan = std::isnan(w);
+    if (g_nan || w_nan || !(std::abs(g - w) <= tol)) {
+      std::ostringstream os;
+      os << "[" << i << "]: got " << g << " want " << w;
+      if (g_nan || w_nan) {
+        os << " (nan in " << (g_nan ? "got" : "want") << ")";
+      } else {
+        os << " (tol " << tol << ")";
+      }
+      return os.str();
     }
   }
+  return std::nullopt;
+}
+
+void RequireMatch(const std::string& name, const Tensor& got, const Tensor& want,
+                  double atol, double rtol) {
+  auto err = CompareTensors(got, want, atol, rtol);
+  if (err) FAIL(name << *err);
 }
 
 void RunRmsNorm(const fs::path& dir, const json& m) {
@@ -92,19 +142,54 @@ void RunRmsNorm(const fs::path& dir, const json& m) {
   if (m["args"]["fused_residual"].get<bool>()) {
     auto res = LoadTensor(dir, m["tensors"]["residual_in"]);
     auto res_want = LoadTensor(dir, m["tensors"]["residual_out"]);
+    VT_CHECK(m["tensors"]["residual_in"]["dtype"].get<std::string>() == "f32",
+             "fused-residual runner requires f32 residual_in");
     std::vector<float> resbuf(outbuf.size());
-    std::memcpy(resbuf.data(), res.raw.data.data(), resbuf.size() * 4);
+    VT_CHECK(res.raw.data.size() == resbuf.size() * sizeof(float),
+             "residual_in byte size does not match the mutable copy buffer");
+    std::memcpy(resbuf.data(), res.raw.data.data(), res.raw.data.size());
     Tensor rest = Tensor::Contiguous(resbuf.data(), DType::kF32, Cpu(),
                                      {x.tensor.shape[0], x.tensor.shape[1]});
     vt::RmsNorm(q, out, x.tensor, w.tensor, args, &rest);
-    CompareTensors("residual", rest, res_want.tensor, atol, rtol);
+    RequireMatch("residual", rest, res_want.tensor, atol, rtol);
   } else {
     vt::RmsNorm(q, out, x.tensor, w.tensor, args);
   }
-  CompareTensors("out", out, want.tensor, atol, rtol);
+  RequireMatch("out", out, want.tensor, atol, rtol);
 }
 
 }  // namespace
+
+TEST_CASE("CompareTensors is NaN-loud and catches mismatches") {
+  float a[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  float b[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  Tensor ta = Tensor::Contiguous(a, DType::kF32, Cpu(), {4});
+  Tensor tb = Tensor::Contiguous(b, DType::kF32, Cpu(), {4});
+
+  // Exact match → no error.
+  CHECK(!CompareTensors(ta, tb, 1e-6, 1e-6).has_value());
+
+  // Plain mismatch → error naming the offending index.
+  b[2] = 3.5f;
+  auto err = CompareTensors(ta, tb, 1e-6, 1e-6);
+  REQUIRE(err.has_value());
+  CHECK(err->find("[2]") != std::string::npos);
+  b[2] = 3.0f;
+
+  // NaN in got → error, reported explicitly (a plain |g-w| > tol comparator
+  // is silently false for NaN and would pass).
+  a[1] = std::nanf("");
+  auto nan_got = CompareTensors(ta, tb, 1e-6, 1e-6);
+  REQUIRE(nan_got.has_value());
+  CHECK(nan_got->find("nan") != std::string::npos);
+  a[1] = 2.0f;
+
+  // NaN in want → also an error.
+  b[3] = std::nanf("");
+  auto nan_want = CompareTensors(ta, tb, 1e-6, 1e-6);
+  REQUIRE(nan_want.has_value());
+  CHECK(nan_want->find("nan") != std::string::npos);
+}
 
 TEST_CASE("op parity vs upstream goldens") {
   fs::path root = PARITY_GOLDENS_DIR;

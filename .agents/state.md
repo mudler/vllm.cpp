@@ -106,3 +106,18 @@
   prefill, recurrence decode; model-level goldens MUST dump from the PINNED
   checkout per tools/parity/README.md (pip oracle is fine for pure-op cases
   only); FLA chunk semantics → CUDA correctness-grade.
+- **2026-07-03 (later)** — M0.7 done (`ead59d6`): GDN ops landed CPU+CUDA —
+  causal conv1d fwd/update, l2norm, gated rmsnorm, gated-delta-rule
+  prefill/decode. Correctness-grade scope call recorded in the ledger:
+  prefill is a sequential recurrence validated against the pinned chunked
+  reference (measured chunk-vs-sequential gap 2.4e-4 out / 2.3e-3 state,
+  bf16); the chunked perf kernel lands M2.3. Verification: 15 pinned-oracle
+  goldens, 24/24 CPU + 24/24 CUDA parity on GB10, racecheck clean; three-way
+  check (kernels ↔ `.agents/gdn-semantics.md` ↔ pinned oracle) at f32 noise.
+  `.agents/gdn-semantics.md` is the formula record (all math cited to pinned
+  sources) and serves as M0.9's assembly reference. Deferred to M0.9: g/beta
+  derivation (gdn-semantics §6 — the ops take g/beta as inputs) and
+  metadata-integrity ownership (prefill/decode segmentation inputs are
+  trusted; the gdn_attn.py-equivalent metadata builder owns validation).
+  NEXT: M0.8 MoE layer (eager, bf16) — router top-k + shared expert;
+  dequantized NVFP4→bf16 on load.

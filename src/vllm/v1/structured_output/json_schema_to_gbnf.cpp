@@ -73,6 +73,11 @@ std::string JsonValueToGbnfLiteral(const nlohmann::json& value) {
 // caller can drop straight into a sequence.
 class Converter {
  public:
+  // `prefix` is prepended to every generated rule name, so multiple Converters
+  // sharing ONE primitives block (the structural-tag composition) do not collide
+  // (default "" == the standalone behavior).
+  explicit Converter(std::string prefix = "") : prefix_(std::move(prefix)) {}
+
   std::string Convert(const nlohmann::json& schema) {
     const std::string root_expr = Visit(schema);
     std::string out = kPrimitivesBlock;
@@ -88,12 +93,22 @@ class Converter {
     return out;
   }
 
+  // Lower `schema` to a GBNF element expression WITHOUT emitting the primitives
+  // block or a `root` wrapper; the generated schema-specific rules are exposed
+  // via rules(). Used by StructuralTagToGbnf, which emits ONE primitives block
+  // and stitches several lowered bodies together (a per-tag `prefix` keeps their
+  // generated rule names disjoint).
+  std::string LowerElement(const nlohmann::json& schema) { return Visit(schema); }
+  const std::vector<std::pair<std::string, std::string>>& rules() const {
+    return rules_;
+  }
+
  private:
   // Register a fresh named rule with the given body; return its name. Names are
-  // "r<N>" — disjoint from every primitive rule name (none of which start "r"
-  // followed by a digit) and from "root".
+  // "<prefix>r<N>" — disjoint from every primitive rule name (none of which start
+  // "r" followed by a digit) and from "root".
   std::string NewRule(std::string body) {
-    std::string name = "r" + std::to_string(counter_++);
+    std::string name = prefix_ + "r" + std::to_string(counter_++);
     rules_.emplace_back(name, std::move(body));
     return name;
   }
@@ -325,7 +340,33 @@ class Converter {
 
   std::vector<std::pair<std::string, std::string>> rules_;
   int counter_ = 0;
+  std::string prefix_;
 };
+
+// Escape a RAW byte string into a GBNF double-quoted string literal matching
+// those exact bytes (escapes `"` and `\`, emits control bytes as `\xHH`, passes
+// through the rest). Unlike JsonValueToGbnfLiteral this takes the raw bytes
+// directly (no JSON serialization) — used for the structural-tag begin/end
+// delimiters (e.g. `<tool_call>\n`).
+std::string RawStringToGbnfLiteral(const std::string& raw) {
+  std::string out = "\"";
+  for (const char ch : raw) {
+    const auto b = static_cast<unsigned char>(ch);
+    if (ch == '"' || ch == '\\') {
+      out += '\\';
+      out += ch;
+    } else if (b < 0x20) {
+      static const char* kHex = "0123456789abcdef";
+      out += "\\x";
+      out += kHex[(b >> 4) & 0xF];
+      out += kHex[b & 0xF];
+    } else {
+      out += ch;
+    }
+  }
+  out += '"';
+  return out;
+}
 
 }  // namespace
 
@@ -368,6 +409,56 @@ std::string WrapSchemaAsToolCallGbnf(
   std::string out =
       "root ::= \"<tool_call>\\n\" _toolcallbody \"\\n</tool_call>\"\n";
   out += inner;
+  return out;
+}
+
+std::string StructuralTagToGbnf(const std::vector<StructuralTagBody>& tags,
+                                bool stop_after_first) {
+  if (tags.empty()) {
+    throw std::runtime_error(
+        "StructuralTagToGbnf: at least one tag is required");
+  }
+  // ONE shared primitives block; each tag lowers its content schema under a
+  // per-tag rule-name prefix so the generated rules never collide.
+  std::string out = kPrimitivesBlock;
+  std::string root_alt;   // "tag0 | tag1 | ..."
+  std::string tag_rules;  // "tagI ::= ...\n" + each tag's schema rules
+  for (std::size_t i = 0; i < tags.size(); ++i) {
+    const StructuralTagBody& t = tags[i];
+
+    // The tag BODY element: any-JSON `value` for content_schema == true, else the
+    // schema lowered to an element (its rules carried under the "t<i>_" prefix).
+    std::string body_expr;
+    std::vector<std::pair<std::string, std::string>> body_rules;
+    if (t.content_schema.is_boolean()) {
+      if (!t.content_schema.get<bool>()) {
+        throw std::runtime_error(
+            "StructuralTagToGbnf: content_schema `false` matches nothing");
+      }
+      body_expr = "value";  // any well-formed JSON value
+    } else {
+      Converter conv("t" + std::to_string(i) + "_");
+      body_expr = conv.LowerElement(t.content_schema);
+      body_rules = conv.rules();
+    }
+
+    const std::string begin_lit = RawStringToGbnfLiteral(t.begin);
+    const std::string end_lit = RawStringToGbnfLiteral(t.end);
+    const std::string tag_name = "tag" + std::to_string(i);
+    tag_rules += tag_name + " ::= " + begin_lit + " " + body_expr + " " +
+                 end_lit + "\n";
+    for (const auto& r : body_rules) {
+      tag_rules += r.first + " ::= " + r.second + "\n";
+    }
+    if (i != 0) root_alt += " | ";
+    root_alt += tag_name;
+  }
+
+  // stop_after_first => exactly one tag; else (at_least_one) => one-or-more.
+  out += "\nroot ::= (";
+  out += root_alt;
+  out += stop_after_first ? ")\n" : ")+\n";
+  out += tag_rules;
   return out;
 }
 

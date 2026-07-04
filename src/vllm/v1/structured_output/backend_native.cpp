@@ -1340,9 +1340,81 @@ NativeStructuredOutputBackend::compile_grammar(
       // json_object == any well-formed JSON value (the spec string is empty).
       gbnf = JsonObjectGbnf();
       break;
-    case StructuredOutputOptions::kStructuralTag:
-      throw std::runtime_error(
-          "native backend: STRUCTURAL_TAG is deferred (see backend_types.h)");
+    case StructuredOutputOptions::kStructuralTag: {
+      // The native structural-tag SPEC (§9 original; the STRUCTURAL_TAG SEAM is
+      // 1:1 with vLLM — StructuredOutputOptions::kStructuralTag +
+      // structural_tag param + this compile branch, backend_xgrammar.py:96-110 —
+      // but the spec CONTENT is backend-private, mirroring xgrammar's own
+      // internal spec). Shape (mirrors vLLM's StructuralTag / TagFormat /
+      // TriggeredTagsFormat, tool_parsers/structural_tag_registry.py:213-269):
+      //   {"lazy": bool,                 // TriggeredTagsFormat vs forced
+      //    "triggers": [str],            // literal substring triggers (lazy)
+      //    "stop_after_first": bool,     // exactly-one vs one-or-more tags
+      //    "tags": [{"begin": str,       // TagFormat.begin literal
+      //              "content_schema": <schema|true>,  // TagFormat.content
+      //              "end": str}]}       // TagFormat.end literal
+      nlohmann::json spec;
+      try {
+        spec = nlohmann::json::parse(grammar_spec);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("native backend: structural-tag spec is not valid "
+                        "JSON: ") +
+            e.what());
+      }
+      if (!spec.is_object()) {
+        throw std::runtime_error(
+            "native backend: structural-tag spec must be a JSON object");
+      }
+      const bool lazy = spec.value("lazy", false);
+      const bool stop_after_first = spec.value("stop_after_first", false);
+
+      if (!spec.contains("tags") || !spec["tags"].is_array() ||
+          spec["tags"].empty()) {
+        throw std::runtime_error(
+            "native backend: structural-tag spec needs a non-empty `tags` "
+            "array");
+      }
+      std::vector<StructuralTagBody> bodies;
+      for (const auto& tag : spec["tags"]) {
+        if (!tag.is_object() || !tag.contains("begin") ||
+            !tag.contains("end")) {
+          throw std::runtime_error(
+              "native backend: each structural-tag `tags` entry needs `begin` "
+              "and `end`");
+        }
+        StructuralTagBody body;
+        body.begin = tag.at("begin").get<std::string>();
+        body.end = tag.at("end").get<std::string>();
+        // content_schema defaults to `true` (any JSON) when absent.
+        body.content_schema =
+            tag.contains("content_schema") ? tag["content_schema"] : nlohmann::json(true);
+        bodies.push_back(std::move(body));
+      }
+
+      std::string st_gbnf = StructuralTagToGbnf(bodies, stop_after_first);
+
+      if (lazy) {
+        // A lazy structural tag is INERT until a trigger word appears, then the
+        // matcher (Task 1) constrains the tag body. Route through the lazy
+        // compile with the spec's trigger words.
+        std::vector<std::string> triggers;
+        if (spec.contains("triggers")) {
+          if (!spec["triggers"].is_array()) {
+            throw std::runtime_error(
+                "native backend: structural-tag `triggers` must be an array");
+          }
+          for (const auto& tr : spec["triggers"]) {
+            triggers.push_back(tr.get<std::string>());
+          }
+        }
+        return compile_lazy_grammar(st_gbnf, std::move(triggers), {});
+      }
+      // A non-lazy (required / named) structural tag is FORCED from token 0:
+      // compile it like a normal GBNF grammar (fall through).
+      gbnf = std::move(st_gbnf);
+      break;
+    }
   }
   auto compiled = std::make_shared<NativeCompiledGrammar>(
       GbnfParser(gbnf).Parse());

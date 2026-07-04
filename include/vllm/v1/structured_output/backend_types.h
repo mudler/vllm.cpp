@@ -16,8 +16,6 @@
 // torch.Tensor of dtype int32 shape [max_num_seqs, ceil(vocab/32)].
 //
 // DEFERRED (marked, cite upstream), slotted in later without reshaping:
-//   - StructuredOutputOptions::kStructuralTag — upstream member STRUCTURAL_TAG
-//     (backend_types.py:25); the structural-tag path is deferred at T0.
 //   - StructuredOutputBackend's dataclass fields vllm_config / tokenizer
 //     (backend_types.py:102-103): the CONCRETE backend (Task 4) takes
 //     (vllm_config, tokenizer, vocab_size) at construction; the ABC stays pure so
@@ -42,9 +40,9 @@ enum class StructuredOutputOptions {
   kRegex,
   kGrammar,
   kChoice,
-  // DEFERRED at T0 (upstream STRUCTURAL_TAG). Present so the enum matches
-  // upstream 1:1; get_structured_output_key maps to it, but no backend compiles
-  // it yet (Task 4+).
+  // Upstream STRUCTURAL_TAG (backend_types.py:25). get_structured_output_key
+  // maps `structural_tag` to it; the native backend compiles it (M3.3b Task 2 —
+  // a lazy/triggered or forced tag-body grammar, backend_native.cpp).
   kStructuralTag,
 };
 

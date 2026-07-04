@@ -701,3 +701,212 @@ TEST_CASE("native lazy: fill==accept invariant holds POST-trigger") {
   }
   backend->destroy();
 }
+
+// ───────────────────── M3.3b Task 2: STRUCTURAL_TAG native compile ───────────
+// The native structural-tag SPEC (our own JSON — the SEAM is 1:1 with vLLM, the
+// content is backend-private, see backend_native.cpp):
+//   {"lazy": bool, "triggers": [str], "stop_after_first": bool,
+//    "tags": [{"begin": str, "content_schema": <schema|true>, "end": str}]}
+// compile_grammar(kStructuralTag, spec) parses it and builds a grammar: each tag
+// -> begin-literal + JSON body (schema-lowered, or any-JSON when content_schema
+// is true) + end-literal; MULTIPLE tags -> an alternation; stop_after_first ->
+// exactly one tag, else one-or-more; lazy -> the Task-1 lazy matcher triggered by
+// `triggers`, else forced from token 0. Driven token-by-token over the same real
+// BPE fixture whose vocab spells the `<tool_call>`/`{`/digit/`}`/`</tool_call>`
+// wrapper (LazyFixture, above).
+namespace {
+
+std::unique_ptr<NativeGrammar> CompileStructural(
+    NativeStructuredOutputBackend& backend, const std::string& spec) {
+  std::unique_ptr<StructuredOutputGrammar> g =
+      backend.compile_grammar(StructuredOutputOptions::kStructuralTag, spec);
+  return std::unique_ptr<NativeGrammar>(
+      static_cast<NativeGrammar*>(g.release()));
+}
+
+// A LAZY structural tag: triggered by `<tool_call>`, a single tag whose body is
+// an integer schema wrapped as `<tool_call>` <int> `</tool_call>`.
+const char* const kLazyIntStructuralTag = R"JSON({
+  "lazy": true,
+  "triggers": ["<tool_call>"],
+  "stop_after_first": true,
+  "tags": [
+    {"begin": "<tool_call>", "content_schema": {"type": "integer"},
+     "end": "</tool_call>"}
+  ]
+})JSON";
+
+}  // namespace
+
+// (b) A LAZY structural-tag spec is inert until the trigger, then constrains the
+// JSON body to the tag's schema, and terminates when the tag completes.
+TEST_CASE("native structural-tag: lazy spec is inert then constrains after the "
+          "trigger") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileStructural(*backend, kLazyIntStructuralTag);
+
+  // Before the trigger: inert — every token allowed (free text) + terminable.
+  CHECK(LazyAllowed(*g, 14));        // "Z" (a letter)
+  CHECK(LazyAllowed(*g, 9));         // "{"
+  CHECK(LazyAllowed(*g, kLazyEos));  // a plain reply may end
+  CHECK(g->is_terminated());
+
+  // The trigger fires: after `<tool_call>` the body is constrained to an integer.
+  REQUIRE(g->accept_tokens("r", {16}));  // "<tool_call>"
+  CHECK_FALSE(g->is_terminated());       // mid tool-call
+  CHECK(LazyAllowed(*g, 11));            // a digit "5"
+  CHECK(LazyAllowed(*g, 12));            // "0"
+  CHECK_FALSE(LazyAllowed(*g, 14));      // a letter is forbidden
+  CHECK_FALSE(LazyAllowed(*g, 0));       // "<" forbidden
+  CHECK_FALSE(LazyAllowed(*g, 9));       // "{" forbidden (integer, not object)
+  CHECK_FALSE(LazyAllowed(*g, kLazyEos));
+
+  REQUIRE(g->accept_tokens("r", {11}));  // "5" (the integer)
+  CHECK(LazyAllowed(*g, 18));            // the end literal "</tool_call>"
+  CHECK(LazyAllowed(*g, 12));            // integer may continue with a digit
+  REQUIRE(g->accept_tokens("r", {18}));  // "</tool_call>"
+  CHECK(g->is_terminated());             // the tag completed
+}
+
+// A plain reply that never triggers stays free and can end (no tool call forced).
+TEST_CASE("native structural-tag: lazy spec, a reply that never triggers stays "
+          "free") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileStructural(*backend, kLazyIntStructuralTag);
+  REQUIRE(g->accept_tokens("r", {15, 14, 15}));  // "P","Z","P" free text
+  CHECK(LazyAllowed(*g, 14));
+  CHECK(g->is_terminated());
+  REQUIRE(g->accept_tokens("r", {kLazyEos}));
+  CHECK(g->is_terminated());
+}
+
+// (c) A NON-LAZY (required) spec is FORCED from token 0 and matches one-or-more
+// tags; the alternation of two tags is exercised (begin `<tool_call>` OR `{`).
+TEST_CASE("native structural-tag: non-lazy required spec is forced from token 0, "
+          "one-or-more, alternation") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileStructural(*backend, R"JSON({
+    "lazy": false,
+    "stop_after_first": false,
+    "tags": [
+      {"begin": "<tool_call>", "content_schema": {"type": "integer"},
+       "end": "</tool_call>"},
+      {"begin": "{", "content_schema": {"type": "integer"}, "end": "}"}
+    ]
+  })JSON");
+
+  // FORCED from token 0: NOT inert — only a tag's begin-literal opens.
+  CHECK_FALSE(g->is_terminated());
+  CHECK(LazyAllowed(*g, 0));         // "<"  (tag A begin)
+  CHECK(LazyAllowed(*g, 16));        // "<tool_call>" (tag A begin)
+  CHECK(LazyAllowed(*g, 9));         // "{"  (tag B begin — alternation)
+  CHECK_FALSE(LazyAllowed(*g, 14));  // "Z" forbidden (forced, not free)
+  CHECK_FALSE(LazyAllowed(*g, 11));  // "5" forbidden (must open a tag first)
+  CHECK_FALSE(LazyAllowed(*g, kLazyEos));  // ≥1 tag required
+
+  // Drive tag A: <tool_call> 5 </tool_call>.
+  REQUIRE(g->accept_tokens("r", {16}));  // "<tool_call>"
+  CHECK(LazyAllowed(*g, 11));            // integer digit
+  CHECK_FALSE(LazyAllowed(*g, 9));       // not "{" (tag A body is an integer)
+  REQUIRE(g->accept_tokens("r", {11}));  // "5"
+  REQUIRE(g->accept_tokens("r", {18}));  // "</tool_call>"
+  // one-or-more: after one tag it may STOP (accepting) or start ANOTHER.
+  CHECK(LazyAllowed(*g, kLazyEos));      // accepting -> EOS allowed
+  CHECK(LazyAllowed(*g, 16));            // may start another tag A
+  CHECK(LazyAllowed(*g, 9));             // ...or tag B ("{")
+}
+
+// (d) A NAMED (stop_after_first) spec is forced and matches EXACTLY ONE tag.
+TEST_CASE("native structural-tag: named spec (stop_after_first) is exactly one "
+          "tag") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileStructural(*backend, R"JSON({
+    "lazy": false,
+    "stop_after_first": true,
+    "tags": [
+      {"begin": "<tool_call>", "content_schema": {"type": "integer"},
+       "end": "</tool_call>"}
+    ]
+  })JSON");
+
+  CHECK_FALSE(g->is_terminated());
+  CHECK(LazyAllowed(*g, 16));  // forced: the begin literal
+  CHECK_FALSE(LazyAllowed(*g, 14));
+
+  REQUIRE(g->accept_tokens("r", {16}));  // "<tool_call>"
+  REQUIRE(g->accept_tokens("r", {11}));  // "5"
+  REQUIRE(g->accept_tokens("r", {18}));  // "</tool_call>"
+  CHECK(g->is_terminated());             // exactly one tag -> complete
+  CHECK_FALSE(LazyAllowed(*g, 16));      // cannot start another tag
+  CHECK_FALSE(LazyAllowed(*g, 9));
+  CHECK(LazyAllowed(*g, kLazyEos));      // only EOS follows
+}
+
+// (e) content_schema: true -> any well-formed JSON value inside the tag.
+TEST_CASE("native structural-tag: content_schema true allows any JSON inside") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileStructural(*backend, R"JSON({
+    "lazy": true,
+    "triggers": ["<tool_call>"],
+    "stop_after_first": true,
+    "tags": [
+      {"begin": "<tool_call>", "content_schema": true, "end": "</tool_call>"}
+    ]
+  })JSON");
+
+  REQUIRE(g->accept_tokens("r", {16}));  // "<tool_call>" (trigger)
+  CHECK_FALSE(g->is_terminated());
+  CHECK(LazyAllowed(*g, 11));            // a number ("5") is a JSON value
+  CHECK(LazyAllowed(*g, 9));             // an object ("{") is a JSON value
+  CHECK(LazyAllowed(*g, 3));             // "t" opens the literal "true"
+  CHECK_FALSE(LazyAllowed(*g, 14));      // "Z" is not a JSON value start
+  REQUIRE(g->accept_tokens("r", {11}));  // "5" (a number value)
+  REQUIRE(g->accept_tokens("r", {18}));  // "</tool_call>"
+  CHECK(g->is_terminated());
+}
+
+// A malformed / empty structural-tag spec throws loudly.
+TEST_CASE("native structural-tag: malformed spec throws") {
+  auto backend = MakeLazyBackend();
+  CHECK_THROWS(CompileStructural(*backend, "{not valid json"));
+  CHECK_THROWS(CompileStructural(*backend, R"({"tags": []})"));  // no tags
+  CHECK_THROWS(CompileStructural(
+      *backend, R"({"lazy": true, "tags": [{"begin":"<tool_call>","end":"</tool_call>"}]})"));  // lazy but no triggers
+}
+
+// (f) THE INVARIANT holds POST-trigger for a structural-tag lazy grammar: once
+// triggered it behaves like a normal grammar, so fill_bitmask == accept_tokens
+// over the WHOLE vocab at every state along the tag body.
+TEST_CASE("native structural-tag: fill==accept invariant holds POST-trigger") {
+  auto backend = MakeLazyBackend();
+  const int vocab = LazyVocabSize();
+  const std::vector<std::vector<int32_t>> prefixes = {
+      {16},          // after "<tool_call>" -> expects an integer digit
+      {16, 11},      // after "5"           -> more digits or "</tool_call>"
+  };
+  for (const auto& prefix : prefixes) {
+    auto filled = CompileStructural(*backend, kLazyIntStructuralTag);
+    REQUIRE(filled->accept_tokens("p", prefix));
+    REQUIRE_FALSE(filled->is_terminated());
+
+    TokenBitmask bm;
+    bm.num_seqs = 1;
+    bm.num_words = BitmaskWordsForVocab(vocab);
+    bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+    filled->fill_bitmask(bm, 0);
+
+    for (int32_t t = 0; t < vocab; ++t) {
+      const bool fill_allows =
+          (bm.data[static_cast<std::size_t>(t >> 5)] &
+           static_cast<int32_t>(1u << (static_cast<uint32_t>(t) & 31u))) != 0;
+      auto probe = CompileStructural(*backend, kLazyIntStructuralTag);
+      REQUIRE(probe->accept_tokens("p", prefix));
+      const bool accept_allows = probe->accept_tokens("t", {t});
+      INFO("prefix_len=" << prefix.size() << " token=" << t
+                         << " fill=" << fill_allows
+                         << " accept=" << accept_allows);
+      CHECK(fill_allows == accept_allows);
+    }
+  }
+  backend->destroy();
+}

@@ -49,6 +49,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -87,5 +88,31 @@ std::string JsonObjectGbnf();
 // (the kGrammar native compile path) — NOT structured_outputs.json.
 std::string WrapSchemaAsToolCallGbnf(
     const nlohmann::json& tool_call_object_schema);
+
+// One structural-tag body (M3.3b Task 2): a literal `begin`, a `content_schema`
+// (a JSON schema, or boolean `true` == any JSON value), and a literal `end`.
+// Mirrors vLLM's xgrammar TagFormat (begin / content=JSONSchemaFormat / end;
+// tool_parsers/structural_tag_registry.py:224-231). `begin`/`end` are raw byte
+// literals (NOT JSON — they carry the tag delimiters, e.g. `<tool_call>`).
+struct StructuralTagBody {
+  std::string begin;
+  nlohmann::json content_schema;  // a schema object, or boolean `true`
+  std::string end;
+};
+
+// Build a GBNF grammar whose `root` matches the structural-tag bodies (M3.3b
+// Task 2 — the native STRUCTURAL_TAG compile; §9 original, the SEAM is 1:1 with
+// vLLM but the emitted grammar is backend-private). Each tag lowers to
+//   tagI ::= "<begin>" <content> "<end>"
+// where <content> is the schema lowered via JsonSchemaToGbnf (or the any-JSON
+// `value` rule when content_schema is `true`). MULTIPLE tags combine into an
+// alternation. `stop_after_first` (vLLM TagsWithSeparatorFormat.stop_after_first,
+// structural_tag_registry.py:260) => `root ::= (tag0 | tag1 | ...)` (exactly one
+// tag); otherwise (at_least_one) => `root ::= (tag0 | ...)+` (one-or-more). The
+// caller decides lazy vs forced (a lazy grammar wraps this GBNF with the
+// triggers; a forced grammar compiles it directly). Throws on an empty tag list
+// or a `false`/unsupported content schema.
+std::string StructuralTagToGbnf(const std::vector<StructuralTagBody>& tags,
+                                bool stop_after_first);
 
 }  // namespace vllm::v1

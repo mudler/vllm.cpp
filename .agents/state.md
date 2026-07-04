@@ -904,3 +904,24 @@
   Aggregate gate-#1 progress this session: ~1000×→~48× (65× load + ~14× decode),
   all measured on real GB10 with correctness preserved (16/16 token match) at every
   step. Still an active campaign toward parity.
+- **2026-07-04 (GEMM tiling ~2× banked + ★ DEFINITIVE gate-#1 profile: 88% host-bound ★)**
+  — `1409037`. Tiled the NVFP4 GEMMs (shared-mem, coalesced fp4 decode, size-gated
+  so decode-small keeps the naive L2-resident path) → **GEMM GPU-time ~2×**
+  (MatmulNvfp4 4.9×, incl. killing a 1.04s prefill lm_head spike; grouped 1.96×),
+  paged gate 16/16 correct. **BUT end-to-end FLAT** — and nsys gave the DEFINITIVE
+  finding: the 35B forward is **88% HOST-API-BOUND** (cudaMemcpyAsync 67.5%/81k calls
+  + cudaMalloc 20.5%/62k + cudaFree 5.9%; GPU kernels only ~25% of wall). So every
+  compute win so far (fp4-resident, fused MoE, GEMM tiling) is BANKED — they don't
+  surface until the host overhead is eliminated. **★ THE remaining gate-#1 gap (~44×)
+  is almost entirely HOST-API OVERHEAD, precisely measured ★.** THE unlock: (1) make
+  the decode forward FULLY device-resident (eliminate the 81k per-op Download/upload
+  memcpys — NOT the tiny-copy device-chaining that regressed at M2.x, but keeping ALL
+  40 layers' activations on-device end-to-end, host touches only the small inputs +
+  the final logits); (2) a persistent/graph-friendly pool (eliminate the 62k mallocs);
+  (3) **M2.5 CUDA graphs** — capture the decode step over persistent buffers, replay
+  per token (a captured graph has ZERO per-op host API calls → kills the 88%). The
+  MoE is now fixed-shape (M2.4) so the step is capturable. This is THE big remaining
+  decode win + it makes all the banked compute speedups finally pay off. After that:
+  GDN scan (~20% GPU), NVFP4 MMA, FP8 on-device. Gate-#1 aggregate this session:
+  ~1000×→~44× (measured), with the exact remaining bottleneck (88% host API) now
+  pinpointed → the path to parity is clear + measure-driven.

@@ -442,3 +442,262 @@ TEST_CASE("native: fill_bitmask agrees with accept_tokens for every vocab token"
   }
   backend->destroy();
 }
+
+// ─────────────────────────── M3.3b: LAZY grammar triggers ───────────────────
+// A LAZY grammar (llama.cpp awaiting_trigger mechanism, src/llama-grammar.cpp
+// :1339-1427) is INERT (every token allowed) until a trigger WORD (a literal
+// substring of the decoded output, e.g. `<tool_call>`) or a trigger TOKEN id
+// appears; then it activates + REPLAYS the buffered bytes so the following JSON
+// is grammar-constrained. This is exactly vLLM's xgrammar StructuralTag /
+// TriggeredTagsFormat, implemented natively. Below: a lazy tool-call grammar
+// `<tool_call>{<digit>}</tool_call>` driven token-by-token over a real BPE
+// fixture whose vocab spells the wrapper + a tiny JSON body.
+namespace {
+
+// EOS for the lazy fixture.
+constexpr int32_t kLazyEos = 40;
+
+// A real byte-level BPE fixture. All tokens are printable-ASCII (identity
+// byte-map). Single-char tokens spell `<tool_call>{<digit>}</tool_call>`; the
+// multi-char tokens 16-19 let a trigger fire from ONE token and MID-token (the
+// replay path): 17=`<tool_call>{` (trigger + first JSON byte), 19=`P<tool_call>{`
+// (free-text `P` straddling the trigger start).
+Tokenizer BuildLazyFixture() {
+  json vocab = {
+      {"<", 0},  {">", 1},  {"/", 2},  {"t", 3},  {"o", 4},  {"l", 5},
+      {"_", 6},  {"c", 7},  {"a", 8},  {"{", 9},  {"}", 10}, {"5", 11},
+      {"0", 12}, {"9", 13}, {"Z", 14}, {"P", 15}, {"<tool_call>", 16},
+      {"<tool_call>{", 17}, {"</tool_call>", 18}, {"P<tool_call>{", 19}};
+
+  json doc;
+  doc["version"] = "1.0";
+  doc["added_tokens"] = json::array(
+      {{{"id", kLazyEos}, {"content", "<eos>"}, {"special", true}}});
+  doc["normalizer"] = nullptr;
+  doc["pre_tokenizer"] = {
+      {"type", "Sequence"},
+      {"pretokenizers",
+       json::array(
+           {{{"type", "Split"},
+             {"pattern",
+              {{"Regex",
+                R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"}}},
+             {"behavior", "Isolated"},
+             {"invert", false}},
+            {{"type", "ByteLevel"},
+             {"add_prefix_space", false},
+             {"trim_offsets", false},
+             {"use_regex", false}}})}};
+  doc["model"] = {{"type", "BPE"},
+                  {"ignore_merges", false},
+                  {"vocab", vocab},
+                  {"merges", json::array()}};
+  TempJson f(doc.dump());
+  return Tokenizer::FromHfJson(f.path());
+}
+
+const Tokenizer& LazyFixture() {
+  static const Tokenizer tok = BuildLazyFixture();
+  return tok;
+}
+
+int LazyVocabSize() { return static_cast<int>(LazyFixture().VocabSize()); }
+
+std::unique_ptr<NativeStructuredOutputBackend> MakeLazyBackend() {
+  return std::make_unique<NativeStructuredOutputBackend>(
+      LazyFixture(), LazyVocabSize(), std::vector<int32_t>{kLazyEos});
+}
+
+std::unique_ptr<NativeGrammar> CompileLazy(
+    NativeStructuredOutputBackend& backend, const std::string& gbnf,
+    std::vector<std::string> words, std::vector<int32_t> tokens = {}) {
+  std::unique_ptr<StructuredOutputGrammar> g =
+      backend.compile_lazy_grammar(gbnf, std::move(words), std::move(tokens));
+  return std::unique_ptr<NativeGrammar>(
+      static_cast<NativeGrammar*>(g.release()));
+}
+
+bool LazyAllowed(NativeGrammar& g, int32_t t) {
+  TokenBitmask bm;
+  bm.num_seqs = 1;
+  bm.num_words = BitmaskWordsForVocab(LazyVocabSize());
+  bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+  g.fill_bitmask(bm, 0);
+  const int32_t word = bm.data[static_cast<std::size_t>(t >> 5)];
+  return (word & (1 << (t & 31))) != 0;
+}
+
+// The wrapped tool-call grammar: `<tool_call>` + a tiny JSON body `{<digit>}` +
+// `</tool_call>`. After the trigger, only `{`, then a digit, `}`, the closing
+// tag are valid — a schema-constrained body.
+const char* const kToolGrammar =
+    "root ::= \"<tool_call>\" \"{\" [0-9] \"}\" \"</tool_call>\"";
+
+}  // namespace
+
+// (a) Before the trigger the grammar is INERT: every token is allowed (free
+// text) and the grammar may terminate (a plain reply can end).
+TEST_CASE("native lazy: before the trigger every token is allowed (inert)") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+
+  // fill_bitmask allows ALL tokens (a letter, `{`, `<`, and even EOS).
+  CHECK(LazyAllowed(*g, 14));       // "Z" (a letter)
+  CHECK(LazyAllowed(*g, 9));        // "{"
+  CHECK(LazyAllowed(*g, 0));        // "<"
+  CHECK(LazyAllowed(*g, 3));        // "t"
+  CHECK(LazyAllowed(*g, kLazyEos)); // EOS (a plain reply may end)
+  CHECK(g->is_terminated());        // awaiting == accepting (plain reply can end)
+
+  // accept_tokens succeeds on arbitrary free text.
+  CHECK(g->accept_tokens("r", {14}));  // "Z"
+  CHECK(g->accept_tokens("r", {15}));  // "P"
+  CHECK(g->accept_tokens("r", {9}));   // "{" as free text (no tool call yet)
+  // Still awaiting (no trigger) -> still all allowed + terminable.
+  CHECK(LazyAllowed(*g, 14));
+  CHECK(LazyAllowed(*g, kLazyEos));
+  CHECK(g->is_terminated());
+}
+
+// (b) Feed free text then the trigger `<tool_call>` -> awaiting flips; AFTER the
+// trigger the grammar CONSTRAINS the JSON body; terminates only when complete.
+TEST_CASE("native lazy: after the trigger the grammar constrains the JSON") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+
+  REQUIRE(g->accept_tokens("r", {14}));  // "Z" (free text)
+  CHECK(g->is_terminated());             // still just a plain reply
+
+  REQUIRE(g->accept_tokens("r", {16}));  // "<tool_call>" (the trigger)
+  CHECK_FALSE(g->is_terminated());       // triggered: mid tool-call
+  CHECK(LazyAllowed(*g, 9));             // only "{" opens the body
+  CHECK_FALSE(LazyAllowed(*g, 14));      // a letter is forbidden now
+  CHECK_FALSE(LazyAllowed(*g, 0));       // "<" forbidden
+  CHECK_FALSE(LazyAllowed(*g, kLazyEos)); // not accepting mid tool-call
+
+  REQUIRE(g->accept_tokens("r", {9}));   // "{"
+  CHECK(LazyAllowed(*g, 11));            // a digit "5"
+  CHECK_FALSE(LazyAllowed(*g, 9));       // another "{" forbidden
+  REQUIRE(g->accept_tokens("r", {11}));  // "5"
+  REQUIRE(g->accept_tokens("r", {10}));  // "}"
+  CHECK_FALSE(g->is_terminated());       // still needs "</tool_call>"
+  REQUIRE(g->accept_tokens("r", {18}));  // "</tool_call>"
+  CHECK(g->is_terminated());             // full <tool_call>{5}</tool_call>
+}
+
+// (c) REPLAY: the trigger fires MID-token; the byte AFTER the trigger in the same
+// token must advance the FSM (the replay covers [start, end) of the buffer).
+TEST_CASE("native lazy: trigger fires mid-token and the next byte advances") {
+  auto backend = MakeLazyBackend();
+
+  SUBCASE("whole token = trigger + first JSON byte") {
+    auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+    REQUIRE(g->accept_tokens("r", {17}));  // "<tool_call>{" in ONE token
+    CHECK_FALSE(g->is_terminated());
+    CHECK(LazyAllowed(*g, 11));            // next required byte is a DIGIT (post {)
+    CHECK_FALSE(LazyAllowed(*g, 9));       // NOT another "{" (already consumed)
+  }
+  SUBCASE("token straddles the trigger start (leading free text discarded)") {
+    auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+    REQUIRE(g->accept_tokens("r", {19}));  // "P<tool_call>{": P is free text
+    CHECK(LazyAllowed(*g, 11));            // digit next (replay started at "<")
+    CHECK_FALSE(LazyAllowed(*g, 9));       // "{" already consumed
+  }
+}
+
+// (d) A plain reply that never emits the trigger stays all-allowed throughout and
+// can terminate — no tool call is ever forced.
+TEST_CASE("native lazy: a reply that never triggers stays free and can end") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+  REQUIRE(g->accept_tokens("r", {15, 14, 15}));  // "P","Z","P"
+  CHECK(LazyAllowed(*g, 14));       // still all allowed
+  CHECK(LazyAllowed(*g, 9));
+  CHECK(g->is_terminated());        // may end (no tool call forced)
+  REQUIRE(g->accept_tokens("r", {kLazyEos}));  // end the plain reply
+  CHECK(g->is_terminated());
+  CHECK_FALSE(g->accept_tokens("r", {14}));    // nothing follows EOS
+}
+
+// (e) Rollback across the trigger boundary restores awaiting + the buffer; reset
+// restores awaiting = lazy.
+TEST_CASE("native lazy: rollback across the trigger boundary restores awaiting") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+  REQUIRE(g->accept_tokens("r", {16}));  // trigger fires
+  CHECK_FALSE(g->is_terminated());
+  CHECK(LazyAllowed(*g, 9));             // constrained: "{"
+  CHECK_FALSE(LazyAllowed(*g, 14));      // "Z" forbidden
+
+  g->rollback(1);                        // back across the trigger boundary
+  CHECK(g->is_terminated());             // awaiting again -> terminable
+  CHECK(LazyAllowed(*g, 14));            // all allowed again ("Z")
+  CHECK(LazyAllowed(*g, 9));             // and "{"
+  CHECK(LazyAllowed(*g, kLazyEos));      // EOS allowed again
+
+  REQUIRE(g->accept_tokens("r", {16}));  // re-fire the trigger
+  CHECK(LazyAllowed(*g, 9));
+  CHECK_FALSE(LazyAllowed(*g, 14));
+
+  g->reset();                            // reset -> awaiting = lazy
+  CHECK(g->is_terminated());
+  CHECK(LazyAllowed(*g, 14));
+}
+
+// A trigger TOKEN id (not a word) activates the grammar; the token's bytes then
+// advance the FSM through the "<tool_call>" literal.
+TEST_CASE("native lazy: a trigger TOKEN id activates the grammar") {
+  auto backend = MakeLazyBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, /*words=*/{}, /*tokens=*/{16});
+  CHECK(g->is_terminated());             // awaiting
+  CHECK(LazyAllowed(*g, 14));            // all allowed
+  REQUIRE(g->accept_tokens("r", {16}));  // trigger TOKEN
+  CHECK_FALSE(g->is_terminated());
+  CHECK(LazyAllowed(*g, 9));             // constrained: "{"
+  CHECK_FALSE(LazyAllowed(*g, 14));
+}
+
+// A lazy grammar with no triggers at all is rejected (it would never activate).
+TEST_CASE("native lazy: compile_lazy_grammar rejects an empty trigger set") {
+  auto backend = MakeLazyBackend();
+  CHECK_THROWS(backend->compile_lazy_grammar(kToolGrammar, {}, {}));
+}
+
+// (f) THE INVARIANT holds POST-trigger: once triggered the grammar behaves like a
+// normal grammar, so fill_bitmask == accept_tokens over the WHOLE vocab at every
+// state along the JSON body.
+TEST_CASE("native lazy: fill==accept invariant holds POST-trigger") {
+  auto backend = MakeLazyBackend();
+  const int vocab = LazyVocabSize();
+  const std::vector<std::vector<int32_t>> prefixes = {
+      {16},             // after "<tool_call>"  -> expects "{"
+      {16, 9},          // after "{"            -> expects a digit
+      {16, 9, 11},      // after a digit        -> expects "}"
+      {16, 9, 11, 10},  // after "}"            -> expects "</tool_call>"
+  };
+  for (const auto& prefix : prefixes) {
+    auto filled = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+    REQUIRE(filled->accept_tokens("p", prefix));
+    REQUIRE_FALSE(filled->is_terminated());  // triggered, mid tool-call
+
+    TokenBitmask bm;
+    bm.num_seqs = 1;
+    bm.num_words = BitmaskWordsForVocab(vocab);
+    bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+    filled->fill_bitmask(bm, 0);
+
+    for (int32_t t = 0; t < vocab; ++t) {
+      const bool fill_allows =
+          (bm.data[static_cast<std::size_t>(t >> 5)] &
+           static_cast<int32_t>(1u << (static_cast<uint32_t>(t) & 31u))) != 0;
+      auto probe = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+      REQUIRE(probe->accept_tokens("p", prefix));
+      const bool accept_allows = probe->accept_tokens("t", {t});
+      INFO("prefix_len=" << prefix.size() << " token=" << t
+                         << " fill=" << fill_allows
+                         << " accept=" << accept_allows);
+      CHECK(fill_allows == accept_allows);
+    }
+  }
+  backend->destroy();
+}

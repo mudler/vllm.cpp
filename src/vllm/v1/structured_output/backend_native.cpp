@@ -993,45 +993,154 @@ struct NativeBackendShared {
 struct NativeGrammar::Snapshot {
   State state;
   bool done = false;  // reached by consuming EOS/stop; nothing may follow
+  // ---- lazy / awaiting-trigger state (mirror llama-grammar.h:143-146) ----
+  // `awaiting`: the grammar is still inert, buffering free text, waiting for a
+  // trigger word/token. `trigger_buffer` accumulates the decoded bytes; each
+  // buffered token's byte span in the buffer is recorded so we can REPLAY the
+  // bytes from the trigger point into the FSM (mirror trigger_buffer_positions).
+  bool awaiting = false;
+  std::string trigger_buffer;
+  // {token_id, {byte_start, byte_end}} in trigger_buffer.
+  std::vector<std::pair<int32_t, std::pair<std::size_t, std::size_t>>>
+      trigger_positions;
 };
 
 NativeGrammar::NativeGrammar(std::shared_ptr<const NativeBackendShared> shared,
-                             std::shared_ptr<const NativeCompiledGrammar> grammar)
-    : shared_(std::move(shared)), grammar_(std::move(grammar)) {
-  history_.push_back(Snapshot{InitState(*grammar_), false});
+                             std::shared_ptr<const NativeCompiledGrammar> grammar,
+                             LazyGrammarConfig lazy_config)
+    : shared_(std::move(shared)),
+      grammar_(std::move(grammar)),
+      lazy_(lazy_config.lazy),
+      trigger_words_(std::move(lazy_config.trigger_words)),
+      trigger_tokens_(std::move(lazy_config.trigger_tokens)) {
+  // awaiting is initialized to true for lazy grammars ONLY (llama-grammar.h:143).
+  Snapshot init;
+  init.state = InitState(*grammar_);
+  init.awaiting = lazy_;
+  history_.push_back(std::move(init));
 }
 
 NativeGrammar::~NativeGrammar() = default;
 
+// Advance one snapshot by one token. Mirrors the two llama.cpp phases:
+//   - awaiting_trigger (llama-grammar.cpp:1387-1426): buffer free text, detect a
+//     trigger token/word, and REPLAY the buffered bytes from the trigger point;
+//   - active FSM (llama-grammar.cpp:1429-1438): the normal byte-by-byte advance.
+// Returns false iff the token is rejected (a grammar-invalid byte in the active
+// phase, or trigger bytes that don't fit the grammar). While awaiting (before a
+// trigger fires) ANY token is accepted — the model may emit arbitrary free text.
+bool NativeGrammar::advance_snapshot(Snapshot& snap, int32_t token) const {
+  if (snap.done) return false;  // nothing follows EOS
+
+  auto bytes_for = [&](int32_t t) -> const std::string* {
+    auto it = shared_->token_bytes.find(t);
+    return it == shared_->token_bytes.end() ? nullptr : &it->second;
+  };
+  const auto& stops = shared_->stop_token_ids;
+  const bool is_stop =
+      std::find(stops.begin(), stops.end(), token) != stops.end();
+
+  if (snap.awaiting) {
+    // A stop/EOS token while awaiting: the model finished a PLAIN reply and never
+    // triggered a tool call. For a lazy grammar this is allowed (the model may
+    // just answer in text) — accept it and terminate. (llama.cpp masks EOG via
+    // allow_eog; a never-triggered lazy grammar here accepts EOS unconditionally.)
+    if (is_stop) {
+      snap.done = true;
+      return true;
+    }
+
+    // A trigger TOKEN (llama-grammar.cpp:1388-1393): flip active, drop the buffer,
+    // and advance the FSM by THIS token's bytes.
+    if (std::find(trigger_tokens_.begin(), trigger_tokens_.end(), token) !=
+        trigger_tokens_.end()) {
+      snap.awaiting = false;
+      snap.trigger_buffer.clear();
+      snap.trigger_positions.clear();
+      const std::string* b = bytes_for(token);
+      if (b != nullptr) {
+        State s = snap.state;
+        for (const char ch : *b) {
+          s = AcceptByte(*grammar_, s, static_cast<uint8_t>(ch));
+          if (s.empty()) return false;  // trigger token's bytes not grammar-valid
+        }
+        snap.state = std::move(s);
+      }
+      return true;
+    }
+
+    // Otherwise a free-text token (llama-grammar.cpp:1394-1425): append its bytes
+    // to the buffer (recording the byte span) and search for a trigger WORD.
+    const std::string* b = bytes_for(token);
+    if (b != nullptr) {
+      const std::size_t tok_start = snap.trigger_buffer.size();
+      snap.trigger_positions.push_back(
+          {token, {tok_start, tok_start + b->size()}});
+      snap.trigger_buffer += *b;
+
+      // A literal substring find over each trigger word; take the EARLIEST match
+      // (mirror llama-grammar.cpp:1399-1401's find over the buffer).
+      std::size_t start = std::string::npos;
+      for (const std::string& word : trigger_words_) {
+        if (word.empty()) continue;
+        const std::size_t pos = snap.trigger_buffer.find(word);
+        if (pos != std::string::npos && (start == std::string::npos || pos < start)) {
+          start = pos;
+        }
+      }
+      if (start != std::string::npos) {
+        // TRIGGER FIRES. Replay the buffered bytes that overlap [start, end) into
+        // the FSM (mirror llama-grammar.cpp:1402-1421). Bytes before `start` were
+        // free text and are discarded; the trigger word itself AND any bytes after
+        // it in the same token advance the grammar — so `<tool_call>{` fires on
+        // `<tool_call>` yet the `{` still advances into the JSON.
+        snap.awaiting = false;
+        State s = snap.state;
+        for (const auto& entry : snap.trigger_positions) {
+          const std::size_t te = entry.second.second;    // token byte end
+          if (te <= start) continue;                      // entirely free text
+          const std::size_t ts = entry.second.first;      // token byte start
+          const std::size_t piece_start = ts < start ? start : ts;  // partial token
+          for (std::size_t i = piece_start; i < te; ++i) {
+            s = AcceptByte(*grammar_, s,
+                           static_cast<uint8_t>(snap.trigger_buffer[i]));
+            if (s.empty()) return false;  // post-trigger bytes not grammar-valid
+          }
+        }
+        snap.state = std::move(s);
+        snap.trigger_buffer.clear();
+        snap.trigger_positions.clear();
+      }
+    }
+    // A token while awaiting (buffered free text, whether or not it fired) is OK.
+    return true;
+  }
+
+  // ---- active FSM: the normal byte-by-byte advance (unchanged) ----
+  if (is_stop) {
+    if (!IsAccepting(snap.state)) return false;
+    snap.done = true;
+    return true;
+  }
+  // A regular token: recover its raw bytes and advance the FSM byte-by-byte. A
+  // token with no byte representation (added/special/hole) is not matchable.
+  const std::string* b = bytes_for(token);
+  if (b == nullptr) return false;
+  State s = snap.state;
+  for (const char ch : *b) {
+    s = AcceptByte(*grammar_, s, static_cast<uint8_t>(ch));
+    if (s.empty()) return false;
+  }
+  snap.state = std::move(s);
+  return true;
+}
+
 bool NativeGrammar::accept_tokens(const std::string& /*request_id*/,
                                   const std::vector<int32_t>& tokens) {
   for (const int32_t token : tokens) {
-    const Snapshot& cur = history_.back();
-    if (cur.done) return false;  // nothing follows EOS
-
-    const auto& stops = shared_->stop_token_ids;
-    if (std::find(stops.begin(), stops.end(), token) != stops.end()) {
-      if (!IsAccepting(cur.state)) return false;
-      history_.push_back(Snapshot{cur.state, true});
-      continue;
-    }
-
-    // A regular token: recover its raw bytes and advance the FSM byte-by-byte.
-    // A token with no byte representation (added/special/hole) is not matchable.
-    auto it = shared_->token_bytes.find(token);
-    if (it == shared_->token_bytes.end()) return false;
-
-    State s = cur.state;
-    bool ok = true;
-    for (const char ch : it->second) {
-      s = AcceptByte(*grammar_, s, static_cast<uint8_t>(ch));
-      if (s.empty()) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) return false;
-    history_.push_back(Snapshot{std::move(s), false});
+    Snapshot next = history_.back();  // copy; becomes the new head on success
+    if (!advance_snapshot(next, token)) return false;
+    history_.push_back(std::move(next));
   }
   return true;
 }
@@ -1041,27 +1150,7 @@ std::vector<int32_t> NativeGrammar::validate_tokens(
   std::vector<int32_t> accepted;
   Snapshot cur = history_.back();  // copy; do not mutate the real state
   for (const int32_t token : tokens) {
-    if (cur.done) break;
-    const auto& stops = shared_->stop_token_ids;
-    if (std::find(stops.begin(), stops.end(), token) != stops.end()) {
-      if (!IsAccepting(cur.state)) break;
-      cur.done = true;
-      accepted.push_back(token);
-      continue;
-    }
-    auto it = shared_->token_bytes.find(token);
-    if (it == shared_->token_bytes.end()) break;
-    State s = cur.state;
-    bool ok = true;
-    for (const char ch : it->second) {
-      s = AcceptByte(*grammar_, s, static_cast<uint8_t>(ch));
-      if (s.empty()) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) break;
-    cur.state = std::move(s);
+    if (!advance_snapshot(cur, token)) break;
     accepted.push_back(token);
   }
   return accepted;
@@ -1076,12 +1165,23 @@ void NativeGrammar::rollback(int num_tokens) {
 
 bool NativeGrammar::is_terminated() {
   const Snapshot& cur = history_.back();
-  return cur.done || IsFullyMatched(cur.state);
+  if (cur.done) return true;
+  // A lazy grammar STILL awaiting its trigger is "accepting" — a never-triggered
+  // plain-text reply is a complete output that may end at any point (incl. EOS),
+  // so termination is allowed and the manager leaves the row all-allowed (the
+  // full-mask branch, manager.cpp:56-63) rather than constraining. The scheduler
+  // still feeds sampled tokens to accept_tokens (not gated by is_terminated), so
+  // a later trigger is processed. Once triggered, normal termination applies.
+  if (cur.awaiting) return true;
+  return IsFullyMatched(cur.state);
 }
 
 void NativeGrammar::reset() {
   history_.clear();
-  history_.push_back(Snapshot{InitState(*grammar_), false});
+  Snapshot init;
+  init.state = InitState(*grammar_);
+  init.awaiting = lazy_;  // reset -> awaiting = lazy_ (llama-grammar.h:143)
+  history_.push_back(std::move(init));
 }
 
 void NativeGrammar::fill_bitmask(TokenBitmask& bitmask, int batch_index) {
@@ -1110,6 +1210,20 @@ void NativeGrammar::fill_bitmask(TokenBitmask& bitmask, int batch_index) {
     // (and any token) returns false in the done state, so fill must allow none.
     // (The manager never fills a terminated row anyway — !is_terminated() guard —
     // so this branch is defensive; agreement matters for the differential test.)
+    return;
+  }
+
+  if (cur.awaiting) {
+    // LAZY grammar still awaiting its trigger: impose NO constraint — EVERY token
+    // (incl. EOS) is allowed (the model may emit arbitrary free text or start a
+    // tool call). Mirror llama_grammar_apply_impl's no-op mask
+    // (llama-grammar.cpp:1342-1344): set the whole row ALLOWED and return. The
+    // padding bits above vocab_size in the last word are harmless (no token
+    // maps there).
+    for (int w = 0; w < num_words; ++w) {
+      bitmask.data[base + static_cast<std::size_t>(w)] =
+          static_cast<int32_t>(-1);
+    }
     return;
   }
 
@@ -1233,6 +1347,25 @@ NativeStructuredOutputBackend::compile_grammar(
   auto compiled = std::make_shared<NativeCompiledGrammar>(
       GbnfParser(gbnf).Parse());
   return std::make_unique<NativeGrammar>(shared_, std::move(compiled));
+}
+
+std::unique_ptr<StructuredOutputGrammar>
+NativeStructuredOutputBackend::compile_lazy_grammar(
+    const std::string& gbnf, std::vector<std::string> trigger_words,
+    std::vector<int32_t> trigger_tokens) {
+  if (trigger_words.empty() && trigger_tokens.empty()) {
+    throw std::runtime_error(
+        "native backend: a lazy grammar needs at least one trigger word or "
+        "token (else it would never activate)");
+  }
+  auto compiled = std::make_shared<NativeCompiledGrammar>(
+      GbnfParser(gbnf).Parse());
+  LazyGrammarConfig cfg;
+  cfg.lazy = true;
+  cfg.trigger_words = std::move(trigger_words);
+  cfg.trigger_tokens = std::move(trigger_tokens);
+  return std::make_unique<NativeGrammar>(shared_, std::move(compiled),
+                                         std::move(cfg));
 }
 
 TokenBitmask NativeStructuredOutputBackend::allocate_token_bitmask(

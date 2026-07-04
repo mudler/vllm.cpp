@@ -175,6 +175,9 @@ TEST_CASE("CUDA moe_grouped_gemm_nvfp4 matches the per-expert reference") {
   for (int64_t e = 0; e < E; ++e) experts.push_back(MakeNvfp4Weight(N, K, 5000 + static_cast<uint32_t>(e)));
   const auto act_f = RandomF32(static_cast<size_t>(T * K), 9001);
   const auto act_bf16 = ToBf16(act_f);
+  // The kernel reads bf16 activations, so the reference must too (round-trip).
+  std::vector<float> act_r(act_f.size());
+  for (size_t i = 0; i < act_r.size(); ++i) act_r[i] = vt::BF16ToF32(act_bf16[i]);
 
   // Routing: pair p -> token p/top_k, expert a deterministic pseudo-choice.
   std::vector<int32_t> expert_ids(static_cast<size_t>(P));
@@ -201,7 +204,7 @@ TEST_CASE("CUDA moe_grouped_gemm_nvfp4 matches the per-expert reference") {
     for (int64_t n = 0; n < N; ++n) {
       float acc = 0.0f;
       for (int64_t k = 0; k < K; ++k)
-        acc += act_f[static_cast<size_t>(r * K + k)] *
+        acc += act_r[static_cast<size_t>(r * K + k)] *
                vt::BF16ToF32(deq[static_cast<size_t>(e)][static_cast<size_t>(n * K + k)]);
       ref[static_cast<size_t>(p * N + n)] = acc;
     }
@@ -249,6 +252,8 @@ TEST_CASE("CUDA moe_grouped_gemm_nvfp4 identity row_map (down-projection path)")
   for (int64_t e = 0; e < E; ++e) experts.push_back(MakeNvfp4Weight(N, K, 6000 + static_cast<uint32_t>(e)));
   const auto act_f = RandomF32(static_cast<size_t>(P * K), 6100);
   const auto act_bf16 = ToBf16(act_f);
+  std::vector<float> act_r(act_f.size());
+  for (size_t i = 0; i < act_r.size(); ++i) act_r[i] = vt::BF16ToF32(act_bf16[i]);
   std::vector<int32_t> expert_ids{0, 2, 1, 2};
 
   std::vector<float> ref(static_cast<size_t>(P * N), 0.0f);
@@ -261,7 +266,7 @@ TEST_CASE("CUDA moe_grouped_gemm_nvfp4 identity row_map (down-projection path)")
     for (int64_t n = 0; n < N; ++n) {
       float acc = 0.0f;
       for (int64_t k = 0; k < K; ++k)
-        acc += act_f[static_cast<size_t>(p * K + k)] * vt::BF16ToF32(deq[static_cast<size_t>(n * K + k)]);
+        acc += act_r[static_cast<size_t>(p * K + k)] * vt::BF16ToF32(deq[static_cast<size_t>(n * K + k)]);
       ref[static_cast<size_t>(p * N + n)] = acc;
     }
   }

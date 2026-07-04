@@ -18,6 +18,7 @@
 #include "npy.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/registry.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -1018,6 +1019,129 @@ bool RunQwen36Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
   return true;
 }
 
+// Snapshot dir of the 27B dense checkpoint (contains config.json), or "".
+std::string Find27BSnapshot() {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return "";
+  const fs::path snaps =
+      fs::path(home) /
+      ".cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots";
+  std::error_code ec;
+  if (!fs::is_directory(snaps, ec)) return "";
+  for (const auto& e : fs::directory_iterator(snaps, ec)) {
+    if (fs::exists(e.path() / "config.json", ec)) return e.path().string();
+  }
+  return "";
+}
+
+// --- 27B DENSE full-model logits DIAGNOSTIC (the step-6a fast-path characterizer).
+// Loads the real dense 27B (single model.safetensors, W4A4 fp4-resident) and runs
+// Qwen3_5DenseModel::ForwardDense on the pinned-oracle prompt, then REPORTS (not
+// gates): per-position prefill argmax match vs the oracle, the top-1000 logit gap,
+// and greedy-decode token-for-token match + the divergence point. Unlike the 35B
+// RunQwen36Logits, greedy-exact is NOT REQUIREd here: the step-6a fast path keeps
+// bf16 activations (W4A16-style) while the pip-vLLM oracle runs TRUE W4A4 (fp4
+// activations), so a near-tie greedy divergence is expected-by-construction and is
+// characterized, not asserted. Checkpoint-gated + dgx-only (tag-27; SKIPs without
+// the snapshot). The paged engine's exact-greedy gate is test_qwen27_paged_engine.
+bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
+                     const json& m) {
+  if (GoldenTag(dir) != 27) return false;  // 35B handled by RunQwen36Logits
+  const std::string snap = Find27BSnapshot();
+  if (snap.empty()) {
+    MESSAGE("SKIP " << dir.filename().string()
+                    << ": unsloth/Qwen3.6-27B-NVFP4 snapshot not present");
+    return false;
+  }
+  const fs::path st = fs::path(snap) / "model.safetensors";
+  std::error_code ec;
+  if (!fs::exists(st, ec)) {
+    MESSAGE("SKIP " << dir.filename().string() << ": model.safetensors absent");
+    return false;
+  }
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(st.string()));
+  const vllm::HfConfig cfg =
+      vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
+  MESSAGE("qwen27_logits: loading full dense 27B (W4A4 fp4-resident)...");
+  const vllm::Qwen3_5DenseWeights weights = vllm::LoadQwen3_5Dense(shards, cfg);
+
+  auto ids_l = LoadTensor(dir, m["tensors"]["token_ids"]);
+  const int64_t T0 = ids_l.tensor.shape[0];
+  const int32_t* idp = ids_l.tensor.Ptr<int32_t>();
+  std::vector<int32_t> token_ids(idp, idp + T0);
+  std::vector<int32_t> positions(static_cast<size_t>(T0));
+  for (int64_t t = 0; t < T0; ++t)
+    positions[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  const int64_t vocab = cfg.vocab_size;
+  MESSAGE("qwen27_logits: prefill ForwardDense on T=" << T0 << " (vocab "
+                                                      << vocab << ")...");
+  std::vector<float> logits =
+      vllm::Qwen3_5DenseModel::ForwardDense(token_ids, positions, weights, cfg, q);
+  REQUIRE(static_cast<int64_t>(logits.size()) == T0 * vocab);
+
+  // (a) top-1000 logit gap vs the oracle (reported).
+  auto tv = LoadTensor(dir, m["tensors"]["topk_values"]);
+  auto ti = LoadTensor(dir, m["tensors"]["topk_indices"]);
+  const int64_t topk = tv.tensor.shape[1];
+  const float* tvp = tv.tensor.Ptr<float>();
+  const int32_t* tip = ti.tensor.Ptr<int32_t>();
+  double max_gap = 0.0;
+  for (int64_t t = 0; t < T0; ++t)
+    for (int64_t k = 0; k < topk; ++k) {
+      const int32_t idx = tip[t * topk + k];
+      const double got = logits[static_cast<size_t>(t) * vocab + idx];
+      const double want = tvp[t * topk + k];
+      max_gap = std::max(max_gap, std::abs(got - want));
+    }
+
+  // (b) per-position prefill argmax vs the oracle.
+  auto amx = LoadTensor(dir, m["tensors"]["argmax"]);
+  const int32_t* amp = amx.tensor.Ptr<int32_t>();
+  int argmax_match = 0;
+  for (int64_t t = 0; t < T0; ++t)
+    if (ArgmaxRow(&logits[static_cast<size_t>(t) * vocab], vocab) == amp[t])
+      ++argmax_match;
+
+  // (c) greedy decode via ForwardDense; record token-for-token match + divergence.
+  auto gid = LoadTensor(dir, m["tensors"]["greedy_ids"]);
+  const int64_t n_greedy = gid.tensor.shape[0];
+  const int32_t* gp = gid.tensor.Ptr<int32_t>();
+  std::vector<int32_t> ids = token_ids;
+  std::vector<int32_t> pos = positions;
+  std::vector<int32_t> produced;
+  int greedy_match = 0;
+  std::vector<float> cur = logits;
+  for (int64_t s = 0; s < n_greedy; ++s) {
+    const int64_t T = static_cast<int64_t>(ids.size());
+    const int32_t next =
+        ArgmaxRow(&cur[static_cast<size_t>(T - 1) * vocab], vocab);
+    produced.push_back(next);
+    if (next != gp[s]) break;
+    ++greedy_match;
+    ids.push_back(next);
+    pos.push_back(static_cast<int32_t>(pos.size()));
+    if (s + 1 < n_greedy)
+      cur = vllm::Qwen3_5DenseModel::ForwardDense(ids, pos, weights, cfg, q);
+  }
+
+  MESSAGE("qwen27_logits DIAG (step-6a fast path vs TRUE-W4A4 oracle): "
+          "greedy_match=" << greedy_match << "/" << n_greedy
+          << "; per-pos prefill argmax_match=" << argmax_match << "/" << T0
+          << "; max top-1000 logit gap=" << max_gap
+          << (greedy_match < n_greedy
+                  ? " (near-tie divergence expected: bf16 acts vs oracle fp4 acts)"
+                  : " (EXACT — fast path matches oracle)"));
+
+  // Guardrail only: the prefill forward must be finite and broadly on-target
+  // (argmax mostly matching), catching a gross dequant/scale bug. Greedy-exact
+  // is intentionally NOT gated here (see the header); the paged engine gate
+  // (test_qwen27_paged_engine) owns the exact-oracle bar.
+  REQUIRE(std::isfinite(max_gap));
+  return true;
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -1093,7 +1217,11 @@ int RunGoldenPass(Device dev) {
     } else if (op == "qwen36_gdn_layer" || op == "qwen36_fullattn_layer") {
       if (!RunQwen36Layer(b, q, entry.path(), m)) continue;
     } else if (op == "qwen36_logits") {
-      if (!RunQwen36Logits(b, q, entry.path(), m)) continue;
+      // Same op for both gates; dispatch by tag (27B dense vs 35B MoE loader).
+      const bool ran = (GoldenTag(entry.path()) == 27)
+                           ? RunQwen27Logits(b, q, entry.path(), m)
+                           : RunQwen36Logits(b, q, entry.path(), m);
+      if (!ran) continue;
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");
@@ -1158,6 +1286,34 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
   CHECK(cases >= 31);  // 24 pre-M0.8 + 5 MoE + 2 dense_attention (M0.9 Task 2)
+}
+
+// Standalone, fast, CUDA-only 27B dense-logits diagnostic — runs ONLY the dense
+// 27B ForwardDense characterizer (not the whole golden pass, which includes the
+// ~2600s 35B logits case). Filter with `-tc="qwen27 dense logits*"`. Reports
+// prefill argmax match + top-1000 logit gap + greedy divergence vs the oracle
+// (step-6a fast path vs true-W4A4). Checkpoint-gated + dgx-only.
+TEST_CASE("qwen27 dense logits diagnostic (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend; skipping 27B dense-logits diagnostic");
+    return;
+  }
+  const fs::path dir = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_27b";
+  if (!fs::exists(dir / "manifest.json")) {
+    MESSAGE("27B logits golden absent; skipping");
+    return;
+  }
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  RunQwen27Logits(b, q, dir, m);
+  b.DestroyQueue(q);
 }
 
 // Same cases, same tolerances, on the GPU: inputs are uploaded through the

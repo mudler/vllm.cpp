@@ -159,7 +159,11 @@ target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
 
-# Dense 27B W4A4 greedy acceptance gate SCAFFOLD (checkpoint-gated, dgx-only;
-# skips on CPU/CI and until the 27B forward + GPU W4A4 GEMM exist). See
-# .agents/qwen27b-w4a4-notes.md §5.
+# Dense 27B W4A4 greedy acceptance gate (checkpoint-gated, dgx-only; skips on
+# CPU/CI when the real snapshot is absent). Counterpart to the 35B gate; asserts
+# the paged dense engine reproduces the pip-vLLM oracle greedy continuation
+# token-for-token via the fp4-resident W4A4 GEMM. See qwen27b-w4a4-notes.md §5.
 vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)
+target_compile_definitions(test_qwen27_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen27_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)

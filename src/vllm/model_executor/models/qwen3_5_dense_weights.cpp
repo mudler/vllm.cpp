@@ -89,6 +89,49 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
+// One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
+// in the on-disk [N=out, K=in] orientation vt::MatmulNvfp4 reads directly (notes
+// §5 step-6a — the throughput path; NO bf16 materialization). Reads the CT
+// tensor names `<proj>.weight_packed` (U8 [out,in/2]), `<proj>.weight_scale`
+// (F8_E4M3 [out,in/16], LINEAR non-swizzled) and `<proj>.weight_global_scale`
+// (F32 scalar). The CT global scale is stored as a DIVISOR, so scale2 is its
+// RECIPROCAL (notes §3.3) — the ONLY math delta vs the modelopt LoadNvfp4Raw;
+// the byte encoding (E2M1 nibbles + fp8-e4m3 group-16 scale) is identical, so the
+// existing M2.7 tensor-core GEMM carries these bit-for-bit as the CPU dequant
+// reference (DequantCtNvfp4WeightToF32). Activation-quant is dropped (bf16
+// activations, W4A16-style) — the on-disk `input_global_scale` is not read.
+Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
+  const StTensor& packed = get(proj + ".weight_packed");
+  VT_CHECK(packed.dtype == "U8",
+           "qwen3_5 dense: expected U8 weight_packed for " + proj);
+  VT_CHECK(packed.shape.size() == 2,
+           "qwen3_5 dense: expected 2-D weight_packed for " + proj);
+  const int64_t out_dim = packed.shape[0];
+  const int64_t in_dim = packed.shape[1] * 2;
+  VT_CHECK(in_dim % 16 == 0,
+           "qwen3_5 dense: NVFP4 in_dim must be a multiple of 16 for " + proj);
+  const StTensor& ws = get(proj + ".weight_scale");
+  VT_CHECK(ws.dtype == "F8_E4M3",
+           "qwen3_5 dense: expected F8_E4M3 weight_scale for " + proj);
+  const float wgs_disk = ReadF32Scalar(get(proj + ".weight_global_scale"));
+  VT_CHECK(wgs_disk != 0.0F,
+           "qwen3_5 dense: zero weight_global_scale (divisor) for " + proj);
+
+  Nvfp4Weight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.scale2 = 1.0F / wgs_disk;  // CT stores 1/scale (divisor) -> reciprocate
+  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+  VT_CHECK(packed.nbytes == r.packed.bytes.size(),
+           "qwen3_5 dense: packed byte-size mismatch for " + proj);
+  std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+           "qwen3_5 dense: scale byte-size mismatch for " + proj);
+  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  return r;
+}
+
 GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
@@ -97,8 +140,8 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base)
   g.in_proj_z = LoadBf16Transposed(get, la + "in_proj_z.weight");
   g.in_proj_b = LoadBf16Transposed(get, la + "in_proj_b.weight");
   g.in_proj_a = LoadBf16Transposed(get, la + "in_proj_a.weight");
-  // out_proj: W4A4-quantized -> materialize to bf16 [value_dim, H].
-  g.out_proj = MaterializeCtNvfp4Bf16Transposed(get, la + "out_proj");
+  // out_proj: W4A4-quantized -> fp4-resident (throughput path, notes §5 step-6a).
+  g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
   const StTensor& conv = get(la + "conv1d.weight");
   VT_CHECK(conv.shape.size() == 3 && conv.shape[1] == 1,
@@ -115,23 +158,23 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
                                    const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  // q/k/v/o_proj: all W4A4-quantized -> materialize to bf16 (Matmul-B layout).
-  a.q_proj = MaterializeCtNvfp4Bf16Transposed(get, sa + "q_proj");
-  a.k_proj = MaterializeCtNvfp4Bf16Transposed(get, sa + "k_proj");
-  a.v_proj = MaterializeCtNvfp4Bf16Transposed(get, sa + "v_proj");
-  a.o_proj = MaterializeCtNvfp4Bf16Transposed(get, sa + "o_proj");
+  // q/k/v/o_proj: all W4A4-quantized -> fp4-resident (throughput path, §5 6a).
+  a.q_proj_fp4 = LoadCtNvfp4Raw(get, sa + "q_proj");
+  a.k_proj_fp4 = LoadCtNvfp4Raw(get, sa + "k_proj");
+  a.v_proj_fp4 = LoadCtNvfp4Raw(get, sa + "v_proj");
+  a.o_proj_fp4 = LoadCtNvfp4Raw(get, sa + "o_proj");
   a.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
   return a;
 }
 
-// Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> materialize to bf16.
+// Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> fp4-resident (§5 6a).
 DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const std::string& base) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
-  m.gate_proj = MaterializeCtNvfp4Bf16Transposed(get, mlp + "gate_proj");
-  m.up_proj = MaterializeCtNvfp4Bf16Transposed(get, mlp + "up_proj");
-  m.down_proj = MaterializeCtNvfp4Bf16Transposed(get, mlp + "down_proj");
+  m.gate_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "gate_proj");
+  m.up_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "up_proj");
+  m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
   return m;
 }
 

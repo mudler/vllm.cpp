@@ -12,6 +12,22 @@ parity on `dgx.casa` (GB10), loading from safetensors **and GGUF**, shipped
 llama.cpp-style as a library + example CLI/OpenAI server, with tool calling,
 grammars, streaming/non-streaming, and e2e test suites.
 
+## STANDING DIRECTIVE — MIRROR vLLM across ALL features (don't ask, mirror)
+
+Feature parity with vLLM across all features is the policy. When vLLM already
+does something a certain way, **mirror it** — do not stop to ask which way to go.
+If vLLM supports MULTIPLE modes (e.g. nvfp4 W4A4 has both true-fp4-activations
+AND a `use_a16` bf16-activation mode, over a capability-gated kernel family:
+cutlass / flashinfer / marlin / emulation), **support them all** and mirror
+vLLM's selection logic, including what it selects on GB10/sm_121. Only escalate
+genuine PRODUCT/scope calls vLLM can't answer (e.g. "is model X in the MVP?"),
+never "how should feature X behave?" (→ mirror vLLM).
+
+**GROUND EVERY CHECK IN vLLM SOURCE.** Do not decide behavior from memory or
+assumption — read the actual pinned vLLM code (`/home/mudler/_git/vllm` @ the
+parity pin `e24d1b24`) every time, cite `file:line`, and mirror what you find.
+This applies to every subagent and every design/parity check.
+
 ## STANDING DIRECTIVE — always compare vs vLLM (the oracle), same workload
 
 Every change that could affect correctness OR performance MUST be compared

@@ -417,6 +417,23 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   return dout;
 }
 
+// Same as MatmulNvfp4F32D but bf16 output (the down/o/out_proj sinks that feed
+// the residual add). CUDA: fp4-resident vt::MatmulNvfp4 (bf16 out). CPU: the
+// DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
+DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
+  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  DBuf dout(d, DType::kBF16, {M, N});
+  if (d.q.device.type == vt::DeviceType::kCUDA) {
+    Nvfp4Dev dw = ResidentNvfp4(d, w);
+    vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
+  } else {
+    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
+    vt::Matmul(d.q, dout.t(), x, dwb.t());
+  }
+  return dout;
+}
+
 // --- Paged-path helpers (M1.8 Task 3) --------------------------------------
 
 // Non-owning strided view over dim0 [row_offset, row_offset+rows) of a
@@ -552,7 +569,10 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
-  return MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+  // fp4-resident W4A4 out_proj (real 27B, notes §3.6) when populated; else bf16.
+  return !w.out_proj_fp4.Empty()
+             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
+             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
 // --- Batched PAGED GDN block (M1.8 Task 3). Same conv1d + l2norm + q/k/v/g/beta
@@ -697,7 +717,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
-  return MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+  // fp4-resident W4A4 out_proj (real 27B, notes §3.6) when populated; else bf16.
+  return !w.out_proj_fp4.Empty()
+             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
+             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
 // --- Dense full_attention block. qwen36-forward-notes.md §5; pinned
@@ -712,9 +735,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   const float base = static_cast<float>(cfg.rope_theta);
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf qgate = MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
+  // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
+  const bool fp4 = !w.q_proj_fp4.Empty();
+  DBuf qgate = fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+                   : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
+  DBuf kf = fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+                : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
+  DBuf vf = fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+                : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head the projection lays out [q(Dh) | gate(Dh)] (§5) —
   // device op producing q[T,Hq,Dh] and gate[T,Hq,Dh].
@@ -745,7 +774,8 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
                       Reshape(gatef.t(), {T, Hq * Dh}));
-  return MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  return fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
+             : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
 }
 
 // --- Batched PAGED full_attention block (M1.8 Task 3). Identical q/k/v prep to
@@ -769,9 +799,15 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "full-attn paged: KV cache head dims mismatch config");
 
-  DBuf qgate = MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
+  // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
+  const bool fp4 = !w.q_proj_fp4.Empty();
+  DBuf qgate = fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+                   : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
+  DBuf kf = fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+                : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
+  DBuf vf = fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+                : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head [q(Dh) | gate(Dh)] (§5) — device op.
   DBuf qf(d, DType::kF32, {T, Hq, Dh});
@@ -812,7 +848,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
                       Reshape(gatef.t(), {T, Hq * Dh}));
-  return MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  return fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
+             : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
 }
 
 // Per-expert silu-mul MLP over the gathered token rows `x` [n, H] bf16 ->
@@ -1099,11 +1136,17 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
 DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh, int64_t T) {
   const int64_t I = cfg.intermediate_size;
-  DBuf gate = MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
-  DBuf up = MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
+  // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
+  // bf16 path (synthetic CPU tests). Exactly one representation is filled.
+  const bool fp4 = !w.gate_proj_fp4.Empty();
+  DBuf gate = fp4 ? MatmulNvfp4F32D(d, dh, w.gate_proj_fp4)
+                  : MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
+  DBuf up = fp4 ? MatmulNvfp4F32D(d, dh, w.up_proj_fp4)
+                : MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
   DBuf act(d, DType::kBF16, {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
-  return MatmulBf16D(d, act.t(), w.down_proj);     // [T,H] bf16
+  return fp4 ? MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4)
+             : MatmulBf16D(d, act.t(), w.down_proj);  // [T,H] bf16
 }
 
 // One dense decoder layer (notes §2). Same residual/norm thread as RunLayer, but

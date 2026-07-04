@@ -42,6 +42,14 @@ struct DenseMlpWeights {
   OwnedTensor gate_proj;  // bf16 [H, I]
   OwnedTensor up_proj;    // bf16 [H, I]
   OwnedTensor down_proj;  // bf16 [I, H]
+
+  // W4A4 fp4-resident variants (compressed-tensors NVFP4, notes §5 step-6a). On
+  // the real 27B CUDA load these are populated (kept in the on-disk [N=out,K=in]
+  // orientation vt::MatmulNvfp4 reads) and the bf16 fields above are left EMPTY;
+  // the synthetic CPU tests populate the bf16 fields and leave these empty.
+  Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
+  Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
+  Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
 };
 
 // One dense decoder layer: input/post norms + one attention variant + dense MLP.

@@ -89,6 +89,12 @@ struct GdnLayerWeights {
   OwnedTensor dt_bias;        // f32  [Hv]
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
+
+  // 27B W4A4 fp4-resident variant of out_proj (compressed-tensors NVFP4, notes
+  // §3.6). When populated (real 27B CUDA load) the forward calls vt::MatmulNvfp4
+  // on it and out_proj above is left EMPTY; the 35B / synthetic loaders populate
+  // the bf16 out_proj and leave this empty. Exactly one is filled.
+  Nvfp4Weight out_proj_fp4;   // [N=H, K=value_dim]
 };
 
 // Full (dense causal) attention layer weights.
@@ -99,6 +105,16 @@ struct FullAttnLayerWeights {
   OwnedTensor o_proj;   // bf16 [Hq*Dh, H]    (FP8 dequant + T)
   OwnedTensor q_norm;   // bf16 [Dh]
   OwnedTensor k_norm;   // bf16 [Dh]
+
+  // 27B W4A4 fp4-resident variants of q/k/v/o_proj (compressed-tensors NVFP4,
+  // notes §3.6). Populated on the real 27B CUDA load; the 35B / synthetic
+  // loaders populate the bf16 fields above and leave these empty (exactly one
+  // set filled). Each kept in the on-disk [N=out, K=in] orientation MatmulNvfp4
+  // reads directly.
+  Nvfp4Weight q_proj_fp4;  // [N=2*Hq*Dh, K=H]
+  Nvfp4Weight k_proj_fp4;  // [N=Hkv*Dh,  K=H]
+  Nvfp4Weight v_proj_fp4;  // [N=Hkv*Dh,  K=H]
+  Nvfp4Weight o_proj_fp4;  // [N=H,       K=Hq*Dh]
 };
 
 // Sparse-MoE block (router + per-expert MLP + shared expert). Per-expert and

@@ -885,3 +885,22 @@
   ★ Gate #1 is no longer "unmeasured/blind" — it's an active, measured optimization
   campaign with the first ~15× aggregate win (10× decode + 65× load) landed on real
   hardware. ★
+- **2026-07-04 (M2.x — pooled allocator +36%, profile corrected to launch-bound)** —
+  `origin/main` (DevicePool behind DBuf). The post-M2.2b bottleneck was a
+  **cudaMalloc/cudaFree sync storm** (thousands of tiny scratch allocs/decode-step,
+  each device-syncing), NOT host↔device data movement (cheap on GB10's UNIFIED
+  memory — a load-bearing correction to the plan's assumption). A pooled device
+  allocator (reuse freed blocks) took decode **2.31→3.15 output tok/s (+36%)**,
+  gate token-for-token green on GB10. A MoE device-chaining experiment REGRESSED
+  (unified memory made the removed Downloads cheaper than the tiny async copies it
+  added) → reverted (documented). **Gate-#1 gap: ~66×→~48× vs vLLM (153/1377).**
+  **CORRECTED PROFILE:** the decode is now LAUNCH-OVERHEAD bound (many tiny kernels/
+  token; the ~16 per-expert MoE GEMMs the dominant launch count) — GB10 is
+  explicitly launch-overhead+bandwidth bound (environment.md), so this is expected.
+  RE-PRIORITIZED next steps: (1) **M2.5 CUDA graphs** — capture the decode step over
+  the pool's now-stable device pointers, replay per token (the classic launch-bound
+  fix); (2) **M2.4 fused MoE** — one token-tiled kernel vs 16 tiny per-expert GEMMs;
+  (3) GEMM tiling for the tiny-m decode GEMMs; (4) M2.2c FP8 attn/GDN on-device.
+  Aggregate gate-#1 progress this session: ~1000×→~48× (65× load + ~14× decode),
+  all measured on real GB10 with correctness preserved (16/16 token match) at every
+  step. Still an active campaign toward parity.

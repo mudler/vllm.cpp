@@ -260,6 +260,133 @@ void ApplyTopKTopPCuda(Queue& q, Tensor& logits, const Tensor* k, const Tensor* 
   backend.Free(perm);
 }
 
+// --- apply_penalties (fused repetition + frequency + presence) --------------
+__global__ void ApplyPenaltiesKernel(float* logits, const int8_t* prompt_mask,
+                                     const int32_t* output_bin_counts, const int8_t* output_mask,
+                                     const float* freq, const float* pres, const float* rep,
+                                     int64_t n, int64_t v) {
+  const int64_t total = n * v;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += step) {
+    const int64_t row = idx / v;
+    float x = logits[idx];
+    if (prompt_mask[idx] || output_mask[idx]) {
+      const float r = rep[row];
+      x = x > 0.0f ? x / r : x * r;
+    }
+    x -= freq[row] * static_cast<float>(output_bin_counts[idx]);
+    x -= pres[row] * static_cast<float>(output_mask[idx]);
+    logits[idx] = x;
+  }
+}
+
+void ApplyPenaltiesCuda(Queue& q, Tensor& logits, const Tensor& prompt_mask,
+                        const Tensor& output_bin_counts, const Tensor& output_mask,
+                        const Tensor& frequency_penalties, const Tensor& presence_penalties,
+                        const Tensor& repetition_penalties) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  ApplyPenaltiesKernel<<<GridFor(n * v), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), prompt_mask.Ptr<int8_t>(), output_bin_counts.Ptr<int32_t>(),
+      output_mask.Ptr<int8_t>(), frequency_penalties.Ptr<float>(), presence_penalties.Ptr<float>(),
+      repetition_penalties.Ptr<float>(), n, v);
+  Check(cudaGetLastError(), "apply_penalties launch");
+}
+
+// --- apply_min_p (block-per-row softmax, thread 0 threshold + mask) ----------
+__global__ void ApplyMinPKernel(float* logits, const float* min_p, int64_t v) {
+  const int64_t row = blockIdx.x;
+  const float m = min_p[row];
+  if (m <= 0.0f) return;
+  float* r = logits + row * v;
+  __shared__ float red[kBlock];
+
+  float mx = kNegInf;
+  for (int64_t j = threadIdx.x; j < v; j += blockDim.x) mx = fmaxf(mx, r[j]);
+  red[threadIdx.x] = mx;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+    __syncthreads();
+  }
+  const float rowmax = red[0];
+  __syncthreads();
+
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < v; j += blockDim.x) acc += expf(r[j] - rowmax);
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float sum = red[0];
+  __syncthreads();
+
+  // max prob == exp(rowmax - rowmax)/sum == 1/sum, so threshold = m / sum.
+  const float thr = m / sum;
+  for (int64_t j = threadIdx.x; j < v; j += blockDim.x)
+    if (expf(r[j] - rowmax) / sum < thr) r[j] = kNegInf;
+}
+
+void ApplyMinPCuda(Queue& q, Tensor& logits, const Tensor& min_p) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  ApplyMinPKernel<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(logits.Ptr<float>(),
+                                                                        min_p.Ptr<float>(), v);
+  Check(cudaGetLastError(), "apply_min_p launch");
+}
+
+// --- sparse scatter ops (logit-bias add / -inf token mask) ------------------
+__global__ void ApplyLogitBiasKernel(float* logits, const int32_t* rows, const int32_t* cols,
+                                     const float* biases, int64_t v, int64_t m) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; k < m; k += step)
+    logits[static_cast<int64_t>(rows[k]) * v + cols[k]] += biases[k];
+}
+
+void ApplyLogitBiasCuda(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
+                        const Tensor& biases) {
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  if (m == 0) return;
+  ApplyLogitBiasKernel<<<GridFor(m), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), rows.Ptr<int32_t>(), cols.Ptr<int32_t>(), biases.Ptr<float>(), v, m);
+  Check(cudaGetLastError(), "apply_logit_bias launch");
+}
+
+__global__ void ApplyTokenMaskKernel(float* logits, const int32_t* rows, const int32_t* cols,
+                                     int64_t v, int64_t m) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; k < m; k += step)
+    logits[static_cast<int64_t>(rows[k]) * v + cols[k]] = kNegInf;
+}
+
+void ApplyTokenMaskCuda(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols) {
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  if (m == 0) return;
+  ApplyTokenMaskKernel<<<GridFor(m), kBlock, 0, AsStream(q)>>>(logits.Ptr<float>(),
+                                                              rows.Ptr<int32_t>(),
+                                                              cols.Ptr<int32_t>(), v, m);
+  Check(cudaGetLastError(), "apply_token_mask launch");
+}
+
+// --- apply_allowed_token_ids (masked_fill, mask TRUE == exclude) -------------
+__global__ void ApplyAllowedTokenIdsKernel(float* logits, const int8_t* mask, int64_t total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += step)
+    if (mask[idx]) logits[idx] = kNegInf;
+}
+
+void ApplyAllowedTokenIdsCuda(Queue& q, Tensor& logits, const Tensor& mask) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  ApplyAllowedTokenIdsKernel<<<GridFor(n * v), kBlock, 0, AsStream(q)>>>(logits.Ptr<float>(),
+                                                                         mask.Ptr<int8_t>(), n * v);
+  Check(cudaGetLastError(), "apply_allowed_token_ids launch");
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kApplyTemperature, DeviceType::kCUDA,
@@ -274,6 +401,17 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ComputeLogprobsFn>(&ComputeLogprobsCuda)));
     RegisterOp(OpId::kRandomSample, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleCuda)));
+    RegisterOp(OpId::kApplyPenalties, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ApplyPenaltiesFn>(&ApplyPenaltiesCuda)));
+    RegisterOp(OpId::kApplyMinP, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ApplyMinPFn>(&ApplyMinPCuda)));
+    RegisterOp(OpId::kApplyLogitBias, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ApplyLogitBiasFn>(&ApplyLogitBiasCuda)));
+    RegisterOp(OpId::kApplyTokenMask, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskCuda)));
+    RegisterOp(
+        OpId::kApplyAllowedTokenIds, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<ApplyAllowedTokenIdsFn>(&ApplyAllowedTokenIdsCuda)));
   }
 } registrar;
 

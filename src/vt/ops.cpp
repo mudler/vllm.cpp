@@ -529,4 +529,84 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
+namespace {
+// [num_reqs, vocab] tensor of a required dtype, contiguous, on the queue device.
+void CheckSamplingMatrix(const Queue& q, const Tensor& t, int64_t n, int64_t v, DType dt,
+                         const char* name, const char* what) {
+  VT_CHECK(t.rank == 2 && t.shape[0] == n && t.shape[1] == v && t.dtype == dt &&
+               t.IsContiguous() && t.device == q.device,
+           std::string(name) + ": " + what + " must be [num_reqs, vocab] of the expected dtype, "
+                                             "contiguous on the queue device");
+}
+// [num_reqs] f32 vector.
+void CheckSamplingVec(const Queue& q, const Tensor& t, int64_t n, const char* name,
+                      const char* what) {
+  VT_CHECK(t.rank == 1 && t.shape[0] == n && t.dtype == DType::kF32 && t.IsContiguous() &&
+               t.device == q.device,
+           std::string(name) + ": " + what + " must be f32 [num_reqs] contiguous on the device");
+}
+}  // namespace
+
+void ApplyPenalties(Queue& q, Tensor& logits, const Tensor& prompt_mask,
+                    const Tensor& output_bin_counts, const Tensor& output_mask,
+                    const Tensor& frequency_penalties, const Tensor& presence_penalties,
+                    const Tensor& repetition_penalties) {
+  const int64_t n = CheckSamplingLogits(q, logits, "apply_penalties");
+  const int64_t v = logits.shape[1];
+  CheckSamplingMatrix(q, prompt_mask, n, v, DType::kI8, "apply_penalties", "prompt_mask");
+  CheckSamplingMatrix(q, output_mask, n, v, DType::kI8, "apply_penalties", "output_mask");
+  CheckSamplingMatrix(q, output_bin_counts, n, v, DType::kI32, "apply_penalties",
+                      "output_bin_counts");
+  CheckSamplingVec(q, frequency_penalties, n, "apply_penalties", "frequency_penalties");
+  CheckSamplingVec(q, presence_penalties, n, "apply_penalties", "presence_penalties");
+  CheckSamplingVec(q, repetition_penalties, n, "apply_penalties", "repetition_penalties");
+  reinterpret_cast<ApplyPenaltiesFn>(GetOp(OpId::kApplyPenalties, q.device.type))(
+      q, logits, prompt_mask, output_bin_counts, output_mask, frequency_penalties,
+      presence_penalties, repetition_penalties);
+}
+
+void ApplyMinP(Queue& q, Tensor& logits, const Tensor& min_p) {
+  const int64_t n = CheckSamplingLogits(q, logits, "apply_min_p");
+  CheckSamplingVec(q, min_p, n, "apply_min_p", "min_p");
+  reinterpret_cast<ApplyMinPFn>(GetOp(OpId::kApplyMinP, q.device.type))(q, logits, min_p);
+}
+
+namespace {
+// The (rows, cols) pair-list shape shared by ApplyLogitBias / ApplyTokenMask.
+void CheckPairList(const Queue& q, const Tensor& rows, const Tensor& cols, const char* name) {
+  VT_CHECK(rows.rank == 1 && cols.rank == 1 && rows.shape[0] == cols.shape[0],
+           std::string(name) + ": rows and cols must be equal-length rank-1 [m]");
+  VT_CHECK(rows.dtype == DType::kI32 && cols.dtype == DType::kI32,
+           std::string(name) + ": rows/cols must be i32");
+  VT_CHECK(rows.IsContiguous() && cols.IsContiguous() && rows.device == q.device &&
+               cols.device == q.device,
+           std::string(name) + ": rows/cols must be contiguous on the queue device");
+}
+}  // namespace
+
+void ApplyLogitBias(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
+                    const Tensor& biases) {
+  CheckSamplingLogits(q, logits, "apply_logit_bias");
+  CheckPairList(q, rows, cols, "apply_logit_bias");
+  VT_CHECK(biases.rank == 1 && biases.shape[0] == rows.shape[0] && biases.dtype == DType::kF32 &&
+               biases.IsContiguous() && biases.device == q.device,
+           "apply_logit_bias: biases must be f32 [m] contiguous on the queue device");
+  reinterpret_cast<ApplyLogitBiasFn>(GetOp(OpId::kApplyLogitBias, q.device.type))(q, logits, rows,
+                                                                                  cols, biases);
+}
+
+void ApplyTokenMask(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols) {
+  CheckSamplingLogits(q, logits, "apply_token_mask");
+  CheckPairList(q, rows, cols, "apply_token_mask");
+  reinterpret_cast<ApplyTokenMaskFn>(GetOp(OpId::kApplyTokenMask, q.device.type))(q, logits, rows,
+                                                                                  cols);
+}
+
+void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask) {
+  const int64_t n = CheckSamplingLogits(q, logits, "apply_allowed_token_ids");
+  CheckSamplingMatrix(q, mask, n, logits.shape[1], DType::kI8, "apply_allowed_token_ids", "mask");
+  reinterpret_cast<ApplyAllowedTokenIdsFn>(GetOp(OpId::kApplyAllowedTokenIds, q.device.type))(
+      q, logits, mask);
+}
+
 }  // namespace vt

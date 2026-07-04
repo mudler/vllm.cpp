@@ -233,6 +233,95 @@ void RandomSampleKernel(Queue&, Tensor& token_ids, const Tensor& probs, const Te
   }
 }
 
+// --- apply_penalties (utils.py::apply_penalties + the apply_repetition_penalties
+// custom op, _custom_ops.py::apply_repetition_penalties_torch). Single fused
+// elementwise pass matching the exact OpenAI-defined formula. In place.
+void ApplyPenaltiesKernel(Queue&, Tensor& logits, const Tensor& prompt_mask,
+                          const Tensor& output_bin_counts, const Tensor& output_mask,
+                          const Tensor& frequency_penalties, const Tensor& presence_penalties,
+                          const Tensor& repetition_penalties) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  float* lp = logits.Ptr<float>();
+  const int8_t* pm = prompt_mask.Ptr<int8_t>();
+  const int8_t* om = output_mask.Ptr<int8_t>();
+  const int32_t* oc = output_bin_counts.Ptr<int32_t>();
+  const float* freq = frequency_penalties.Ptr<float>();
+  const float* pres = presence_penalties.Ptr<float>();
+  const float* rep = repetition_penalties.Ptr<float>();
+  for (int64_t i = 0; i < n; ++i) {
+    float* row = lp + i * v;
+    const int8_t* pmr = pm + i * v;
+    const int8_t* omr = om + i * v;
+    const int32_t* ocr = oc + i * v;
+    const float r = rep[i], fr = freq[i], pr = pres[i];
+    for (int64_t j = 0; j < v; ++j) {
+      // repetition: present in prompt OR output -> divide/multiply by r by sign.
+      if (pmr[j] || omr[j]) {
+        row[j] = row[j] > 0.0f ? row[j] / r : row[j] * r;
+      }
+      // frequency (output count) then presence (output presence).
+      row[j] -= fr * static_cast<float>(ocr[j]);
+      row[j] -= pr * static_cast<float>(omr[j]);
+    }
+  }
+}
+
+// apply (builtin.py::MinPLogitsProcessor.apply). Per row softmax -> max prob ->
+// mask probs < min_p*max to -inf. min_p==0 rows are untouched (threshold 0).
+void ApplyMinPKernel(Queue&, Tensor& logits, const Tensor& min_p) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  float* lp = logits.Ptr<float>();
+  const float* mp = min_p.Ptr<float>();
+  for (int64_t i = 0; i < n; ++i) {
+    const float m = mp[i];
+    if (m <= 0.0f) continue;  // no-op row (matches min_p_count / zero-threshold)
+    float* row = lp + i * v;
+    float mx = kNegInf;
+    for (int64_t j = 0; j < v; ++j) mx = std::max(mx, row[j]);
+    float sum = 0.0f;
+    std::vector<float> probs(static_cast<size_t>(v));
+    for (int64_t j = 0; j < v; ++j) {
+      const float e = std::exp(row[j] - mx);
+      probs[static_cast<size_t>(j)] = e;
+      sum += e;
+    }
+    float pmax = 0.0f;
+    for (int64_t j = 0; j < v; ++j) pmax = std::max(pmax, probs[static_cast<size_t>(j)] / sum);
+    const float thr = m * pmax;
+    for (int64_t j = 0; j < v; ++j)
+      if (probs[static_cast<size_t>(j)] / sum < thr) row[j] = kNegInf;
+  }
+}
+
+// apply (builtin.py::LogitBiasLogitsProcessor.apply) — logits[(rows,cols)] += bias.
+void ApplyLogitBiasKernel(Queue&, Tensor& logits, const Tensor& rows, const Tensor& cols,
+                          const Tensor& biases) {
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  float* lp = logits.Ptr<float>();
+  const int32_t* rp = rows.Ptr<int32_t>();
+  const int32_t* cp = cols.Ptr<int32_t>();
+  const float* bp = biases.Ptr<float>();
+  for (int64_t k = 0; k < m; ++k) lp[static_cast<int64_t>(rp[k]) * v + cp[k]] += bp[k];
+}
+
+// Sparse -inf scatter (min-tokens / bad-words). logits[(rows,cols)] = -inf.
+void ApplyTokenMaskKernel(Queue&, Tensor& logits, const Tensor& rows, const Tensor& cols) {
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  float* lp = logits.Ptr<float>();
+  const int32_t* rp = rows.Ptr<int32_t>();
+  const int32_t* cp = cols.Ptr<int32_t>();
+  for (int64_t k = 0; k < m; ++k) lp[static_cast<int64_t>(rp[k]) * v + cp[k]] = kNegInf;
+}
+
+// masked_fill_(mask, -inf) — mask TRUE means EXCLUDE (sampler.py:396-397).
+void ApplyAllowedTokenIdsKernel(Queue&, Tensor& logits, const Tensor& mask) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  float* lp = logits.Ptr<float>();
+  const int8_t* mk = mask.Ptr<int8_t>();
+  for (int64_t idx = 0; idx < n * v; ++idx)
+    if (mk[idx]) lp[idx] = kNegInf;
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kApplyTemperature, DeviceType::kCPU,
@@ -247,6 +336,17 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ComputeLogprobsFn>(&ComputeLogprobsKernel)));
     RegisterOp(OpId::kRandomSample, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleKernel)));
+    RegisterOp(OpId::kApplyPenalties, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ApplyPenaltiesFn>(&ApplyPenaltiesKernel)));
+    RegisterOp(OpId::kApplyMinP, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ApplyMinPFn>(&ApplyMinPKernel)));
+    RegisterOp(OpId::kApplyLogitBias, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ApplyLogitBiasFn>(&ApplyLogitBiasKernel)));
+    RegisterOp(OpId::kApplyTokenMask, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernel)));
+    RegisterOp(
+        OpId::kApplyAllowedTokenIds, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<ApplyAllowedTokenIdsFn>(&ApplyAllowedTokenIdsKernel)));
   }
 } registrar;
 

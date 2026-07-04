@@ -28,6 +28,11 @@ enum class OpId : uint8_t {
   kComputeProbs,
   kComputeLogprobs,
   kRandomSample,
+  kApplyPenalties,
+  kApplyMinP,
+  kApplyLogitBias,
+  kApplyTokenMask,
+  kApplyAllowedTokenIds,
   kCount
 };
 
@@ -146,6 +151,14 @@ using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
 using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
+// bottom of this header for the full contracts.
+using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor&, const Tensor&, const Tensor&);
+using ApplyMinPFn = void (*)(Queue&, Tensor&, const Tensor&);
+using ApplyLogitBiasFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
+using ApplyTokenMaskFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using ApplyAllowedTokenIdsFn = void (*)(Queue&, Tensor&, const Tensor&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -407,5 +420,54 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
 // determinism + distribution.
 void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+
+// --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
+// vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py
+// (apply_repetition_penalties), vllm/v1/sample/ops/bad_words.py, and
+// vllm/v1/sample/logits_processor/builtin.py @ e24d1b24. The Sampler pipeline
+// (M1.7 Task 4) composes these over the model's final logits [num_reqs, vocab]
+// (row-major f32). Every op is correctness-grade CPU + CUDA. The higher-level
+// ported entry points (src/vllm/v1/sample/ops/{penalties,bad_words}.{h,cpp},
+// src/vllm/v1/sample/logits_processor/builtin.{h,cpp}) build the per-request
+// derived tensors from the host SamplingMetadata and call these ops.
+
+// apply_penalties (utils.py::apply_penalties + _custom_ops.py::
+// apply_repetition_penalties_torch). Fuses the repetition penalty and the
+// frequency / presence subtractions into a single elementwise pass over the
+// pre-computed masks/counts. Per element (row i, col j):
+//   penalty = (prompt_mask[i,j] || output_mask[i,j]) ? rep[i] : 1.0
+//   logits *= (logits > 0) ? 1/penalty : penalty            (repetition)
+//   logits -= frequency_penalties[i] * output_bin_counts[i,j]
+//   logits -= presence_penalties[i] * output_mask[i,j]
+// prompt_mask / output_mask [num_reqs, vocab] i8 (0/1), output_bin_counts
+// [num_reqs, vocab] i32, frequency/presence/repetition [num_reqs] f32. In place.
+void ApplyPenalties(Queue& q, Tensor& logits, const Tensor& prompt_mask,
+                    const Tensor& output_bin_counts, const Tensor& output_mask,
+                    const Tensor& frequency_penalties, const Tensor& presence_penalties,
+                    const Tensor& repetition_penalties);
+
+// apply (builtin.py::MinPLogitsProcessor.apply). Per row: probs = softmax(logits),
+// pmax = max_j probs; mask probs < min_p[i] * pmax to -inf. Rows with min_p[i]==0
+// are unaffected (threshold 0). IS argmax-invariant (the max-prob token survives).
+// logits [num_reqs, vocab] f32 in place; min_p [num_reqs] f32.
+void ApplyMinP(Queue& q, Tensor& logits, const Tensor& min_p);
+
+// apply (builtin.py::LogitBiasLogitsProcessor.apply) — the sparse scatter-add
+// `logits[(rows, cols)] += biases`. rows/cols [m] i32 (flattened (req, token)
+// pairs), biases [m] f32. NOT argmax-invariant. In place.
+void ApplyLogitBias(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
+                    const Tensor& biases);
+
+// Sparse scatter of -inf at the (rows[k], cols[k]) positions — the primitive
+// behind builtin.py::MinTokensLogitsProcessor.apply (index_put_ of -inf over the
+// stop-token slice) AND bad_words.py::apply_bad_words (block the final n-gram
+// token). rows/cols [m] i32. In place.
+void ApplyTokenMask(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols);
+
+// sampler.py:396-397 `logits.masked_fill_(allowed_token_ids_mask, -inf)`. Sets
+// logits[i,j] = -inf wherever mask[i,j] != 0. The mask is TRUE for tokens to
+// EXCLUDE (gpu_input_batch.py fills the row True then clears the allowed ids to
+// False). mask [num_reqs, vocab] i8. In place.
+void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask);
 
 }  // namespace vt

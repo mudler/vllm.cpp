@@ -220,12 +220,17 @@ sampler + `use_v2_model_runner`-style padded drafting come with it.
 | Prometheus metric names **1:1** (`vllm:num_requests_running`, `vllm:time_to_first_token_seconds`, `vllm:kv_cache_usage_perc`, …) | `v1/metrics/` | T0 (core set), T1 (full set) |
 | OTLP tracing | `config/observability.py` | T2 |
 
-**Library packaging (llama.cpp-style) — T0:** core built as `libvllm` (static +
-shared) with a stable **C API** (`include/vllm.h`: engine create/destroy, add
-request, poll/stream outputs, tokenize, abort — cgo/purego-friendly for LocalAI)
-plus the richer C++ API (`include/vllm/*.hpp`) mirroring `LLM`/`AsyncLLM`.
-Examples: `examples/cli` (interactive generate), `examples/server` (the OpenAI
-server binary), `examples/bench`.
+**Library packaging (llama.cpp-style) — T0 ✅ `0b252ec`:** core built as `libvllm`
+(static + shared; the shared lib's linker version-script exports ONLY the 11
+`vllm_*` C ABI symbols — nm-verified + ctest-enforced) with a stable **C API**
+(`include/vllm.h`: `vllm_engine_load`/`free`, `vllm_complete` [blocking],
+`vllm_complete_stream` + `vllm_token_callback` [streaming/early-stop],
+`vllm_string_free`/`vllm_completion_free`, `vllm_last_error`, `vllm_version`;
+opaque handles, no-throw-across-ABI, thread-local error, unique per-call request
+ids — cgo/purego-friendly for LocalAI; ASan-clean + dlopen-smoke-proven). The
+richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
+Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
+`examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.
 
 ## 8. Config, loading, tokenizer
 

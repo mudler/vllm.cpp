@@ -178,8 +178,15 @@ vocabulary is ported.**
   streaming tool-call deltas, grammar-forced JSON for required/named.
 - ☐ **M3.4 Grammars**: xgrammar core vendored, structured-output manager +
   scheduler bitmask integration, GBNF input.
-- ☐ **M3.5 C API + packaging**: `include/vllm.h`, shared/static lib,
+- ☑ **M3.5 C API + packaging**: `include/vllm.h`, shared/static lib,
   examples/cli. DoD: LocalAI-style consumption smoke test via dlopen/purego.
+  Done `d6a3f39` (pure-C ABI: opaque handles, no-throw, thread-local error,
+  vllm_complete) → `12ce21c` (vllm_complete_stream + callback + early-stop) →
+  `0b252ec` (libvllm.so/.a exporting ONLY the 11 vllm_* symbols [nm-verified +
+  ctest-enforced], examples/cli, dlopen smoke) → review-fix (unique per-call
+  request ids + RAII abort — fixed an ASan-confirmed heap-UAF on mid-stream
+  error). Reviewed PASS after fix; ASan/UBSan clean; C-header compile-checked.
+  DoD MET. (Chat-via-C-API/embeddings/LoRA deferred.)
 - ☐ **M3.6 Server e2e conformance suite** + nightly dgx.casa pipeline.
 - ☐ **M3.7 README + docs** (house style, honest benchmarks). **← MVP done**
 

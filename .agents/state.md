@@ -590,3 +590,37 @@
   shared lib, LocalAI-style dlopen smoke) → **M3.6 conformance suite** → **M3.7
   docs**. Also outstanding: **M0.10 GGUF model load** (k-quant dequant) and the
   **dgx bring-up** (CUDA kernels + 35B paged gate on GB10, scripts/dgx-bringup.sh).
+- **2026-07-04 (M3.5 done — C API + libvllm packaging)** — The library-first
+  packaging MVP gate is met. `0b252ec` (+ `d6a3f39` C-ABI core, `12ce21c`
+  streaming, UAF/export review-fix). **A header-less FFI consumer (LocalAI via
+  purego/cgo) can dlopen libvllm.so, dlsym the 11 vllm_* symbols, and drive
+  generation** — proven by test_dlopen. Pieces: pure-C `include/vllm.h` (opaque
+  vllm_engine handle, POD param structs, vllm_status, no-throw-across-boundary +
+  thread-local vllm_last_error, documented ownership, VLLM_ABI_VERSION); the impl
+  over the M1.8 LLMEngine (vllm_complete blocking, vllm_complete_stream +
+  vllm_token_callback with early-stop, both SanitizeUtf8'd so the C strings are
+  always valid UTF-8); a shared model_loader (LoadedEngine) shared by the C-API +
+  examples/server; libvllm.so/.a with a linker version-script exporting ONLY the
+  11 vllm_* symbols (nm-verified + a ctest [VerifyExports.cmake] that fails if any
+  C++ internal leaks); examples/cli (vllm-cli, llama.cpp-style) + examples/server;
+  install rules. **The adversarial review caught a real, ASan-confirmed
+  heap-use-after-free** (both entry points reused a fixed request_id "0", and the
+  stream path only aborted on the callback-stop branch — a mid-stream exception
+  left "0" registered → the next add_request("0") freed-and-reinserted while the
+  scheduler held the old Request). FIXED: unique per-call request ids (a per-handle
+  atomic counter) so a leaked request can't collide + a RAII RequestGuard that
+  aborts on EVERY exit path (early-stop, throwing callback, mid-stream error),
+  noexcept dtor. Regression test (a throwing callback → VLLM_ERR_RUNTIME + engine
+  stays reusable) is ASan-clean. Also fixed VerifyExports.cmake (CMP0057 for
+  IN_LIST). Also added upstream-faithful LLMEngine::abort_request +
+  OutputProcessor::abort_requests (needed for the stream early-stop teardown).
+  CPU ctest 66/66; ASan/UBSan clean; C-header compiles as C11 -Werror.
+  **DEPENDENCY DEVIATION:** none new (the C API is an original packaging layer,
+  §9, like vt::/the minja engine). **CARRY (minor):** the no-throw guarantee has
+  an OOM hole (SetError allocates inside the catch → a bad_alloc could escape);
+  the C-API real-weights (safetensors/GGUF) load path is unexercised on the CPU
+  box. NEXT toward the serving MVP: **M3.4 grammars** (xgrammar core + structured-
+  output manager + scheduler bitmask — needed by M3.3 forced-JSON) → **M3.3 tool
+  calling** (tools/tool_choice, Qwen/Hermes parsers, streaming tool-call deltas) →
+  **M3.6 conformance suite** → **M3.7 docs**. Plus **M0.10 GGUF model load** and
+  the **dgx bring-up** (CUDA kernels + 35B paged gate on GB10).

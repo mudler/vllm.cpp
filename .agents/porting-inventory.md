@@ -298,8 +298,18 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    reference) + a `Qwen3_5DenseWeights` constructor overload; `execute_model`
    dispatches to the dense forward when `dense_weights_` is set. `initialize_kv_cache`
    is unchanged (config-driven; same hybrid backbone). Full LoadedEngine dense
-   dispatch (arch-select in `model_loader.cpp`) is a small follow-up, gated behind
-   the W4A4 GPU GEMM (qwen27b-w4a4-notes.md §5 step 6).
+   dispatch is now WIRED (CPU): `LoadedEngine` carries the SAME `{moe,dense}_weights_`
+   pair (`std::optional<Qwen3_5MoeWeights>` / `std::optional<Qwen3_5DenseWeights>`,
+   was a single `Qwen3_5MoeWeights weights_`) + a `Qwen3_5DenseWeights` constructor
+   overload driving the runner's dense overload; `FromModelDir` arch-selects on
+   `LoadedEngine::IsDenseArch` (`num_experts==0` → `LoadQwen3_5Dense`, else
+   `LoadQwen3_5Moe`). Everything between (Executor/EngineCore/processors) was
+   already arch-agnostic (touches the runner only via `ModelRunnerBase`), so NO
+   change was needed there — the MoE-typing was confined to the runner + the
+   loader. CPU-proven by `test_loaded_engine_dense.cpp` (IsDenseArch dispatch +
+   dense stack generates deterministically through the full LLMEngine loop). The
+   remaining 27B steps are all GPU-gated (oracle golden → W4A4 GEMM 6a → flip
+   `kW4A4ForwardReady`, qwen27b-w4a4-notes.md §5 steps 5-7).
 8. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
    no equivalent under `vllm/platforms/`; we add them through the mirrored
    Platform/AttentionBackend/vt-op seams so they behave as vLLM platforms

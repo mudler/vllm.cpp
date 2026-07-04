@@ -111,7 +111,7 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
-      weights_(std::move(weights)),
+      moe_weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
       max_model_len_(params.max_model_len > 0
                          ? params.max_model_len
@@ -124,7 +124,7 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
-      runner_(config_, weights_, kv_cfg_, SelectQueue(),
+      runner_(config_, *moe_weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
@@ -139,6 +139,51 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                   params.block_size > 0 ? params.block_size : 32,
                   vllm::v1::sha256_cbor)) {
   (void)hash_ready_;
+}
+
+// DENSE-arch overload (27B). Identical to the MoE constructor except dense_weights_
+// carries the model and runner_ is built through the GPUModelRunner dense overload
+// (Qwen3_5DenseModel::Forward). Every other member is arch-agnostic.
+LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
+                           tok::Tokenizer tokenizer, const EngineParams& params)
+    : hash_ready_(EnsureNoneHash()),
+      config_(std::move(config)),
+      dense_weights_(std::move(weights)),
+      tokenizer_(std::move(tokenizer)),
+      max_model_len_(params.max_model_len > 0
+                         ? params.max_model_len
+                         : static_cast<int>(config_.max_position_embeddings)),
+      kv_cfg_(MakeKvConfig(config_,
+                           params.block_size > 0 ? params.block_size : 32,
+                           params.num_blocks > 0 ? params.num_blocks : 256)),
+      scheduler_(MakeSchedulerConfig(
+                     max_model_len_,
+                     params.max_num_seqs > 0 ? params.max_num_seqs : 8),
+                 kv_cfg_, params.block_size > 0 ? params.block_size : 32,
+                 /*enable_caching=*/true),
+      runner_(config_, *dense_weights_, kv_cfg_, SelectQueue(),
+              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_model_len_,
+              /*max_num_batched_tokens=*/
+              max_model_len_ * (params.max_num_seqs > 0 ? params.max_num_seqs
+                                                        : 8)),
+      executor_(runner_),
+      engine_core_(scheduler_, executor_),
+      input_processor_(tokenizer_, config_),
+      output_processor_(&tokenizer_),
+      engine_(input_processor_, engine_core_, output_processor_,
+              vllm::v1::get_request_block_hasher(
+                  params.block_size > 0 ? params.block_size : 32,
+                  vllm::v1::sha256_cbor)) {
+  (void)hash_ready_;
+}
+
+bool LoadedEngine::IsDenseArch(const HfConfig& config) {
+  // The dense 27B (Qwen3_5ForConditionalGeneration, text_config qwen3_5_text)
+  // has no experts; the MoE 35B (Qwen3_5MoeForConditionalGeneration) sets
+  // num_experts > 0. num_experts is the structural discriminator between the two
+  // Qwen3.5 gate arches sharing this hybrid backbone.
+  return config.num_experts == 0;
 }
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
@@ -166,6 +211,18 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
   std::vector<vllm::SafetensorsFile> shards = LoadShards(model_dir);
+
+  // Arch-select: the dense 27B (Qwen3_5ForConditionalGeneration, num_experts==0)
+  // routes to LoadQwen3_5Dense + the dense engine constructor; the MoE 35B stays
+  // on LoadQwen3_5Moe. Both drive the SAME stack below via the {moe,dense}_weights_
+  // pair (the runner already carries either arch).
+  if (LoadedEngine::IsDenseArch(config)) {
+    Qwen3_5DenseWeights weights = vllm::LoadQwen3_5Dense(shards, config);
+    shards.clear();  // the mmap'd shards may be released after the load.
+    return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
+                                          std::move(tokenizer), params);
+  }
+
   Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, config);
   shards.clear();  // the mmap'd shards may be released after the load.
 

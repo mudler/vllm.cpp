@@ -28,7 +28,10 @@ batched GDN state for GDN, via a new `RunDenseLayerPaged` reusing the 35B
 (`test_qwen27_dense_forward.cpp`: routing + materialization + finite/deterministic
 forward + MLP-wired, 4 cases / 280 assertions; `test_qwen27_paged_forward.cpp`:
 the paged==dense anchor + multi-block + decode-via-cache + GDN-state-zeroing, 4
-cases / 8 assertions, CPU-green). The full CPU ctest suite (86 targets) stays
+cases / 8 assertions, CPU-green). The full LoadedEngine dense dispatch is now
+wired (arch-select in `model_loader.cpp` + a `{moe,dense}` weights pair on
+`LoadedEngine`, CPU-proven by `test_loaded_engine_dense.cpp`) — the 27B is FULLY
+CPU-wired end-to-end. The full CPU ctest suite (87 targets) stays
 green. What is NOT done and is GPU-gated: the pip-vLLM oracle greedy golden
 capture (step 5), the W4A4 matmul kernel wiring (step 6), and flipping
 `kW4A4ForwardReady` to close the gate (step 7). §5 is the ordered plan, GPU steps
@@ -320,10 +323,18 @@ Legend: **[CPU]** doable on the dev box now; **[GPU]** needs the free GB10.
    (block_size<T non-contiguous), decode-via-KV-cache, and GDN-state-zeroing on a
    garbage-seeded mamba block — all within tolerance (`max|diff|` 0 on the
    zeroing/mixed-batch gate). Deviations recorded in porting-inventory §9.
-   Full LoadedEngine dense loading (config-arch dispatch in `model_loader.cpp` →
-   `LoadQwen3_5Dense` + a dense `LoadedEngine`/executor path) is NOT wired here —
-   the executor/engine stack is MoE-typed; that end-to-end plumbing is a small
-   follow-up once the GPU GEMM (step 6) makes a full 27B run meaningful.
+   ✅ Full LoadedEngine dense loading is now WIRED (CPU): `model_loader.cpp`
+   arch-selects on `LoadedEngine::IsDenseArch` (`num_experts==0` → `LoadQwen3_5Dense`,
+   else `LoadQwen3_5Moe`) and `LoadedEngine` carries the SAME `{moe,dense}` weights
+   pair (two `std::optional<...>` members + a `Qwen3_5DenseWeights` constructor
+   overload driving the runner's dense overload). The Executor/EngineCore/processors
+   were already arch-agnostic (they touch the runner only through `ModelRunnerBase`),
+   so the MoE-typing was confined to the runner (previous commit) + the loader — no
+   deeper MoE assumption resisted the pointer-pair. CPU-proven by
+   `tests/vllm/entrypoints/test_loaded_engine_dense.cpp` (IsDenseArch dispatch + the
+   dense stack generating deterministically through the whole LLMEngine loop), the
+   dense sibling of the 35B `test_llm_engine.cpp`. The 27B is now FULLY CPU-wired
+   end-to-end; the only remaining steps are the GPU ones (steps 5-7).
 
 4. **[CPU] ✅ DONE — greedy-parity gate scaffold.**
    `test_qwen27_paged_engine.cpp` resolves the `unsloth/Qwen3.6-27B-NVFP4`

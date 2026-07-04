@@ -411,3 +411,58 @@
   the per-slot sampling arrays from M1.5's InputBatch + the logits from the forward
   (upstream pipeline order, seeded RNG, logprobs, GPU top-k/top-p), ported from
   `vllm/v1/sample/`.
+- **2026-07-04** — **M1.7 done** (`38a8846`; ports `ff366c6` SamplingMetadata +
+  LogprobsTensors + make_sampling_metadata, `f940fa3`+hardening core sampling
+  ops, `aac5138` penalties/masks/builtins, `38a8846`+hardening Sampler.forward
+  pipeline). **The V1 sampling pipeline that turns the forward's logits into
+  sampled tokens (+ logprobs) is in place — the last engine primitive before the
+  M1.8 step loop.** Pieces: **SamplingMetadata** (T0 field subset from M1.5
+  InputBatch's per-slot arrays via make_sampling_metadata; logitsprocs plugin
+  graph flattened to the 3 builtin fields min_tokens/logit_bias/min_p);
+  **LogprobsTensors** (fleshes out the SamplerOutput logprobs payload — replaced
+  the M1.1 opaque `optional<bool>`); **core ops** ApplyTemperature (temp<eps→1.0
+  guard) / GreedyArgmax (lowest-index tie-break, **bit-exact vs torch.argmax**) /
+  ApplyTopKTopP (sort-based pytorch path + apply_top_k_only fast path, ties-at-
+  threshold kept) / ComputeProbs+ComputeLogprobs / RandomSample; **penalties**
+  (rep on prompt|output union with sign-split divide/multiply, freq*count,
+  pres*presence) + **masks** (bad-words n-gram suffix block, allowed-ids
+  TRUE=exclude polarity) + **builtins** (min-tokens floor, logit-bias add, min-p
+  prob threshold — argmax-invariance recorded: min_p=T, min_tokens/logit_bias=F);
+  **Sampler.forward** (the exact ORDER: raw-logprobs snapshot BEFORE mutation →
+  allowed → bad-words → non-argmax-invariant procs → penalties → sample{greedy
+  snapshot; all_greedy early-return; temperature; argmax-invariant min_p;
+  top_k_top_p; random; where(temp<eps) merge} → gather_logprobs with
+  batched_count_greater_than ranks [`>=`, 1-based]). All 4 tasks reviewed PASS;
+  each caught+fixed a real issue via adversarial review (Task 2: k>=1 guard +
+  statistical CUDA-random test; Task 4: where-merge test hardened against
+  predicate inversion). CPU ctest 52/52, warnings-as-errors clean.
+  **RNG DEVIATION (accepted, recorded):** RandomSample ports the exponential-noise
+  gumbel-max ALGORITHM (`q~Exp(1)` via splitmix64 hash of (seed,row,col) +
+  inverse-CDF `-log(U)`, `argmax(probs/q)`, per-request seed override) — it is
+  deterministic + distribution-correct (N=100k freq matches softmax within 3%),
+  but is **NOT bit-exact vs torch's Philox4x32 + its exponential_() transform**.
+  Greedy stays the bit-exact parity gate (argmax over f32 logits); random parity
+  bit-exactness = **T1 carry (torch-Philox)**. This is consistent with the
+  project's accepted-deviation discipline (greedy-matched deviations don't flip
+  the M0-exit gate). **CUDA sampling kernels (cpu_sample/cuda_sample + the
+  penalty/mask/builtin ops) are build-guarded — dgx-pending** on GB10 (this box
+  is CPU-only; the CPU↔CUDA random parity test is statistical [>=98% row
+  agreement] because host libm vs CUDA libdevice `log` can ULP-flip a near-tied
+  argmax). **M1.8 WIRING DEPENDENCY (carry):** make_sampling_metadata emits empty
+  defaults for generators/seeds, min_p/min_tokens/logit_bias, allowed_token_ids_
+  mask, bad_words, and num_logprobs — the M1.5 InputBatch does not yet TRACK these
+  per-slot (even though SamplingParams carries seed/logprobs/min_p/min_tokens);
+  SamplingMetadata carries the fields ready to populate, so M1.8 (or an InputBatch
+  extension) must wire the per-slot tracking + copy into make_sampling_metadata
+  for these features to activate. Until then the sampler runs correctly on
+  temperature/top-k/top-p/penalties (which ARE tracked) but the untracked
+  features are inert. **DEFERRED (1:1 stubs):** logprob_token_ids (generative-
+  scoring), spec-decode bonus-token (predict_bonus_token), thinking-budget,
+  logprobs_mode variants beyond raw/processed; FlashInfer fused sampler = M2.4.
+  Close-out asserts: `PendingRunnerOps()` empty (M1.7 added no parity-manifest
+  goldens — validated in-test vs composed reference); CI green. NEXT: **M1.8
+  EngineCore + step loop** — the schedule→execute→sample→update loop wiring the
+  M1.4 Scheduler + M1.5 InputBatch/prepare_inputs + M1.6 paged attention + M0.9
+  forward + M1.7 Sampler into the batched model runner, + the InputProcessor/
+  OutputProcessor + the per-slot sampling-state tracking the above dependency
+  needs, ported from `vllm/v1/engine/core.py` + `vllm/v1/worker/gpu_model_runner.py`.

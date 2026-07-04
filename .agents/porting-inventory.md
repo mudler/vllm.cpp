@@ -169,16 +169,33 @@ repetition_penalty`, `seed`, `stop`/`stop_token_ids`, `include_stop_str_in_outpu
 `skip_special_tokens`, `output_kind` (CUMULATIVE/DELTA/FINAL_ONLY); pipeline order
 exactly as `v1/sample/sampler.py` (fp32 logits → processors → greedy short-circuit
 → temperature → penalties → top-k/top-p → seeded sample → logprobs), GPU top-k/
-top-p kernels (`v1/sample/ops/`). **T0 (MVP, user-mandated): grammars/structured outputs** — port
+top-p kernels (`v1/sample/ops/`).
+**✅ Sampler ported (M1.7, `38a8846`):** the full ordered `Sampler.forward`
+pipeline (raw-logprobs snapshot → allowed-ids → bad-words → min-tokens/logit-bias →
+penalties → greedy/temperature/min-p/top-k/top-p/random → where(temp<eps) merge →
+gather_logprobs+ranks), `SamplingMetadata`/`LogprobsTensors`/`make_sampling_metadata`,
+core ops (ApplyTemperature/GreedyArgmax/ApplyTopKTopP/ComputeProbs/ComputeLogprobs/
+RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA (CUDA
+dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
+from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
+random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
+bit-exact parity deferred to T1**. Deferred (marked stubs): logprob_token_ids
+(generative-scoring), spec-decode bonus-token, thinking-budget, logprobs_mode
+variants beyond raw/processed. **InputBatch-side tracking of seeds/min_p/min_tokens/
+logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
+(make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
+them yet; SamplingMetadata carries the fields ready to populate).
+**T0 (MVP, user-mandated): grammars/structured outputs** — port
 `v1/structured_output/` (manager, grammar bitmask applied as a logits processor,
 `get_grammar_bitmask` scheduler integration) with the **xgrammar C++ core** as
 the backend (upstream's default; it is a C++ library — vendorable without
 Python), covering `json` (schema), `json_object`, `regex`, `choice`, `grammar`
 (EBNF), plus **llama.cpp-style GBNF** grammar input as a vllm.cpp extension.
-T1: `logit_bias`, `allowed_token_ids`, `bad_words`, `prompt_logprobs`,
-`logprob_token_ids`, additional backends (guidance/outlines), reasoning
-parsers, beam search wrapper, thinking budget, repetition detection. T2:
-rejection sampler (spec decode), routed-experts return.
+T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
+(guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
+repetition detection, torch-Philox bit-exact random parity. T2: rejection
+sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/
+`bad_words` promoted to T0 — ported at M1.7 `aac5138`.)
 
 **Spec decode** (`v1/spec_decode/`): all T2, ordered — MTP (Qwen3.6 ships MTP
 weights; biggest single-model win) → ngram → EAGLE3 → dspark/suffix. Rejection

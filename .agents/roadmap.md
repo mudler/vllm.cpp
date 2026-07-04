@@ -121,8 +121,15 @@ vocabulary is ported.**
   dense on the single-seq case) → `370ddaf` (GDNAttentionMetadata segmentation).
   CPU CI green (47/47); CUDA parity tests build-guarded, dgx-pending. GDN-state
   zeroing = caller obligation carried to the batched-GDN forward (see state.md).
-- ☐ **M1.7 Sampler** (upstream pipeline order, seeded RNG, logprobs) + GPU
-  top-k/top-p; sampler parity tests.
+- ☑ **M1.7 Sampler** (upstream pipeline order, seeded RNG, logprobs) + GPU
+  top-k/top-p; sampler parity tests. Done `ff366c6` (SamplingMetadata +
+  LogprobsTensors + make_sampling_metadata) → `f940fa3`+hardening (core ops:
+  temperature/greedy-argmax/top-k/top-p/random gumbel-max) → `aac5138`
+  (penalties + bad-words/allowed-ids masks + min-tokens/logit-bias/min-p
+  builtins) → `38a8846`+hardening (Sampler.forward ordered pipeline + logprobs
+  gather + ranks). Greedy bit-exact (the M0-exit primitive); random RNG
+  distribution-correct, torch-Philox bit-parity = T1 carry. CPU CI 52/52;
+  CUDA sampling kernels dgx-pending. Reviewed PASS (4 tasks).
 - ☐ **M1.8 EngineCore + step loop + queues**; InputProcessor/OutputProcessor/
   Detokenizer integration; offline C++ `LLM` API. DoD: multi-request
   behavioral suite green; deterministic outputs under concurrency.

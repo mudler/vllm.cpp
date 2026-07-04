@@ -14,6 +14,7 @@ vllm_cpp_add_test(test_hf_config vllm/test_hf_config.cpp)
 vllm_cpp_add_test(test_safetensors vllm/test_safetensors.cpp)
 vllm_cpp_add_test(test_gguf vllm/test_gguf.cpp)
 vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
+vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
 vllm_cpp_add_test(test_qwen36_weights vllm/test_qwen36_weights.cpp)
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
@@ -154,3 +155,8 @@ vllm_cpp_add_test(test_qwen36_paged_engine parity/test_qwen36_paged_engine.cpp)
 target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
+
+# Dense 27B W4A4 greedy acceptance gate SCAFFOLD (checkpoint-gated, dgx-only;
+# skips on CPU/CI and until the 27B forward + GPU W4A4 GEMM exist). See
+# .agents/qwen27b-w4a4-notes.md §5.
+vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)

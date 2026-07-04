@@ -65,6 +65,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_reader.cpp
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
+  src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp

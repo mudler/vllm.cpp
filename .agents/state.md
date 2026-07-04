@@ -1018,3 +1018,34 @@
   Generation` arch + compressed-tensors W4A4 load/dequant + greedy parity vs the oracle) —
   27B checkpoint IS present on dgx (`~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-
   NVFP4`). 27B's W4A4 GPU kernels need GB10 later (serialize behind the 35B kernel jobs).
+
+## 2026-07-04 — 27B (dense W4A4) CPU-first correctness scaffolding
+
+Kicked off the 27B gate (co-equal MVP, ZERO prior bring-up) as a CPU-only
+workstream (GPU reserved for the 35B kernel job — no GPU touched; only read-only
+dgx inspection of the checkpoint).
+
+- **Surveyed** the real `unsloth/Qwen3.6-27B-NVFP4` checkpoint (config.json +
+  safetensors manifest, read-only on dgx) + pinned upstream `e24d1b24` →
+  new pinned doc **`.agents/qwen27b-w4a4-notes.md`** (arch dims, layer pattern,
+  SHARED-vs-NEW vs the 35B, the compressed-tensors W4A4 format from the actual
+  manifest, and the ordered bring-up plan with GPU-gated steps marked).
+- **Two surprises (recorded, they change the plan):** (1) the 27B is
+  `Qwen3_5ForConditionalGeneration` — a **VL multimodal** model (vision tower +
+  image/video tokens), not plain text → implement the TEXT path first, defer the
+  ViT. (2) quant is compressed-tensors **W4A4** (activations also fp4, dynamic
+  per-token), but the WEIGHT encoding == modelopt NVFP4 (names + a reciprocal
+  global scale aside) → the existing M2.7 W4A16 tensor-core GEMM can carry the
+  27B weights with a 1-line fix (fast path); true W4A4 fp4-MMA is a measured
+  follow-up (killgate 0034/0035 saw it regress on GB10).
+- **Landed (CPU-green, clean -Werror rebuild):** the CPU W4A4 dequant +
+  activation-quant emulation reference `nvfp4_emulation.h/.cpp` (mirrors
+  `nvfp4_emulation_utils.py` + `compressed_tensors_w4a4_nvfp4.py` +
+  `kernels/linear/nvfp4/emulation.py`), unit-tested `test_ct_nvfp4_emulation`
+  (81 assert), and the skipping greedy-parity gate scaffold
+  `test_qwen27_paged_engine.cpp`. Full suite 84/84 (no 35B regression).
+- **Next (notes §5):** config+loader plumbing (recognize the dense arch, route
+  bf16 vs W4A4 by name, materialize W4A4→bf16 via `DequantCtNvfp4WeightToF32`) →
+  dense forward assembly (reuse 35B GDN/attn, swap MoE→dense SwiGLU) → [GPU]
+  capture the pip-vLLM greedy golden + wire the W4A4 GEMM (fast path 6a) → flip
+  `kW4A4ForwardReady`.

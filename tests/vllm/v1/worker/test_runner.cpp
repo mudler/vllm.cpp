@@ -419,6 +419,85 @@ TEST_CASE("runner: four-way ordering identity (mixed decode+prefill)") {
   CHECK(ib2.token_id(1, p_tokens_before) == mro.sampled_token_ids[1][0]);
 }
 
+// A 3-request mixed batch admitted [P0 prefill, P1 prefill, D decode]. The
+// decode-first reorder must pull D to the front, moving ≥2 requests. Rather than
+// hard-code the exact post-partition permutation (upstream does a MINIMUM-SWAP
+// partition, not a stable sort — [P0,P1,D] -> swap(0,2) -> [D,P1,P0]), this asserts
+// the order-INDEPENDENT invariant: whatever slot each request lands in, EVERY
+// per-slot field (seq_len, fa block, GDN state index, seed, token count) still
+// resolves to that SAME request. A field left behind during a swap_states chain
+// would desync exactly one of these against the req_id at its slot.
+TEST_CASE("runner: 3-request reorder keeps every per-slot field self-consistent") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+
+  SamplingParams p0_params;
+  p0_params.temperature = 0.7;
+  p0_params.top_k = 2;
+  p0_params.seed = 111;
+  p0_params.PostInit();
+  SamplingParams p1_params;
+  p1_params.temperature = 0.7;
+  p1_params.top_k = 2;
+  p1_params.seed = 222;
+  p1_params.PostInit();
+
+  // Per-request expected fields, keyed by req_id (order-independent oracle).
+  struct Expect {
+    int seq_len;
+    int fa_block;
+    int gdn_state;
+    unsigned seed;  // 0 = greedy / no generator
+    int tokens;
+  };
+  const std::map<std::string, Expect> want = {
+      {"D", {4, 0, 0, 0, 4}},     // decode: prompt3+out1, fa block 0, gdn 0, greedy
+      {"P0", {5, 2, 1, 111, 5}},  // prefill 5, fa block 2, gdn 1, seed 111
+      {"P1", {4, 4, 2, 222, 4}},  // prefill 4, fa block 4, gdn 2, seed 222
+  };
+
+  NewRequestData p0 = MakeNewReq("P0", {1, 2, 3, 4, 5}, {}, /*num_computed=*/0,
+                                 /*fa_blocks=*/{2, 3}, /*gdn_block=*/1, p0_params);
+  NewRequestData p1 = MakeNewReq("P1", {10, 11, 12, 13}, {}, /*num_computed=*/0,
+                                 /*fa_blocks=*/{4, 5}, /*gdn_block=*/2, p1_params);
+  NewRequestData d = MakeNewReq("D", {6, 7, 8}, {9}, /*num_computed=*/3,
+                                /*fa_blocks=*/{0, 1}, /*gdn_block=*/0, Greedy());
+
+  SchedulerOutput so = NewStep({p0, p1, d}, {{"P0", 5}, {"P1", 4}, {"D", 1}});
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  const auto& ib = runner.input_batch();
+  REQUIRE(ib.num_reqs() == 3);
+  // Decode must lead after the reorder.
+  CHECK(*ib.req_ids[0] == "D");
+
+  const auto& am = runner.last_attn_meta();
+  const auto& gm = runner.last_gdn_meta();
+  const auto sm = ib.make_sampling_metadata();
+  const int cols = am.block_table_num_cols;
+  REQUIRE(gm.non_spec_state_indices_tensor.has_value());
+
+  // For each occupied slot, cross-check ALL five per-slot fields against the
+  // oracle for whichever request landed there.
+  for (int i = 0; i < ib.num_reqs(); ++i) {
+    REQUIRE(ib.req_ids[static_cast<size_t>(i)].has_value());
+    const std::string rid = *ib.req_ids[static_cast<size_t>(i)];
+    const Expect& e = want.at(rid);
+    CHECK(am.seq_lens[static_cast<size_t>(i)] == e.seq_len);
+    CHECK(am.block_table_tensor[static_cast<size_t>(i * cols)] == e.fa_block);
+    CHECK((*gm.non_spec_state_indices_tensor)[static_cast<size_t>(i)] == e.gdn_state);
+    CHECK(ib.num_tokens_no_spec[static_cast<size_t>(i)] == e.tokens);
+    if (e.seed == 0) {
+      CHECK(sm.generators.count(i) == 0);
+    } else {
+      REQUIRE(sm.generators.count(i) == 1);
+      CHECK(sm.generators.at(i) == e.seed);
+    }
+  }
+}
+
 // ─── 3. Single-request greedy decode over N steps ────────────────────────────
 TEST_CASE("runner: single-request greedy decode over N steps (KV grows, feedback)") {
   const HfConfig c = MakeConfig();

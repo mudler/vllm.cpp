@@ -162,15 +162,67 @@ class DBuf {
   Tensor t_;
 };
 
-// A view over an owned host weight tensor (already in Matmul-B layout [in,out]).
-DBuf WeightBuf(Dev d, const OwnedTensor& w) {
-  std::vector<int64_t> shape(w.shape, w.shape + w.rank);
-  return DBuf(d, w.dtype, shape, w.bytes.data());
-}
-
 float SizeF(int64_t n) { return static_cast<float>(n); }
 float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 float Sigmoid(float x) { return 1.0F / (1.0F + std::exp(-x)); }
+
+// Upcast a bf16 owned weight to an f32 host buffer (lossless). The CUDA norm /
+// conv kernels require the weight dtype to match the activation dtype; where
+// activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
+// replay), the bf16 weight must be presented as f32.
+std::vector<float> WeightF32(const OwnedTensor& w) {
+  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  const int64_t n = w.Numel();
+  std::vector<float> out(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  return out;
+}
+
+// Device-resident raw-dtype view over an owned weight, uploaded ONCE (lazily)
+// and reused across every forward step (mirrors ResidentNvfp4). The forward's
+// bf16/f32 weights (embed table, layernorms, attention/GDN projections, router)
+// were re-uploaded per op — the ~600MB embed table alone re-copied every step —
+// dominating the measured 67.5%-of-wall cudaMemcpyAsync. Caching kills the
+// re-upload: the shared_ptr in the (const) weight owns the device buffer for the
+// model's lifetime. On CPU the bytes are already host-resident, so a direct view
+// avoids the copy. The weight is a read-only matmul-B / norm / embed operand, so
+// the const_cast is safe. `shape` defaults to the owned shape.
+Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
+  if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
+  if (d.q.device.type != vt::DeviceType::kCUDA)
+    return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
+                      shape);
+  if (!w.d_dev) {
+    const size_t nb = w.bytes.size();
+    void* p = d.b.Alloc(nb);
+    d.b.Copy(d.q, p, w.bytes.data(), nb);
+    Backend* bk = &d.b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
+}
+
+// Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
+// CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
+// activation dtype (GDN conv1d / gated-norm, attention qk-norm). `shape` is the
+// logical view (e.g. {conv_dim, Kw}).
+Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
+                         const std::vector<int64_t>& shape) {
+  if (!w.d_dev_f32) {
+    std::vector<float> f = WeightF32(w);
+    if (d.q.device.type != vt::DeviceType::kCUDA) {
+      auto* buf = new std::vector<float>(std::move(f));
+      w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
+    } else {
+      const size_t nb = f.size() * sizeof(float);
+      void* p = d.b.Alloc(nb);
+      d.b.Copy(d.q, p, f.data(), nb);
+      Backend* bk = &d.b;
+      w.d_dev_f32 = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    }
+  }
+  return MakeTensor(w.d_dev_f32.get(), DType::kF32, d.q.device, shape);
+}
 
 // y[M,N] f32 = x[M,K] bf16 @ w[K,N] (w owns [K,N] bf16). f32 output keeps the
 // GEMM's f32 accumulation for the f32 glue that consumes it.
@@ -178,9 +230,9 @@ std::vector<float> MatmulF32(Dev d, const std::vector<uint16_t>& x, int64_t M,
                              int64_t K, const OwnedTensor& w) {
   const int64_t N = w.shape[1];
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
-  DBuf dw = WeightBuf(d, w);
+  Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kF32, {M, N});
-  vt::Matmul(d.q, dout.t(), dx.t(), dw.t());
+  vt::Matmul(d.q, dout.t(), dx.t(), dw);
   std::vector<float> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
   return out;
@@ -192,9 +244,9 @@ std::vector<uint16_t> MatmulBf16(Dev d, const std::vector<uint16_t>& x, int64_t 
                                  int64_t K, const OwnedTensor& w) {
   const int64_t N = w.shape[1];
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
-  DBuf dw = WeightBuf(d, w);
+  Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kBF16, {M, N});
-  vt::Matmul(d.q, dout.t(), dx.t(), dw.t());
+  vt::Matmul(d.q, dout.t(), dx.t(), dw);
   std::vector<uint16_t> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
   return out;
@@ -203,18 +255,6 @@ std::vector<uint16_t> MatmulBf16(Dev d, const std::vector<uint16_t>& x, int64_t 
 std::vector<uint16_t> ToBf16(const std::vector<float>& x) {
   std::vector<uint16_t> out(x.size());
   for (size_t i = 0; i < x.size(); ++i) out[i] = vt::F32ToBF16(x[i]);
-  return out;
-}
-
-// Upcast a bf16 owned weight to an f32 host buffer (lossless). The CUDA norm /
-// conv kernels require the weight dtype to match the activation dtype; where
-// activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
-// replay), the bf16 weight must be presented as f32.
-std::vector<float> WeightF32(const OwnedTensor& w) {
-  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
-  const int64_t n = w.Numel();
-  std::vector<float> out(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
   return out;
 }
 
@@ -397,8 +437,7 @@ std::vector<uint16_t> GdnBlock(Dev d, const GdnLayerWeights& w,
 
   // Causal conv1d over the token stream (silu activation), fresh zero state.
   DBuf dmixed(d, DType::kF32, {T, conv_dim}, mixed.data());
-  std::vector<float> cw = WeightF32(w.conv1d_weight);  // match f32 x on CUDA
-  DBuf dcw(d, DType::kF32, {conv_dim, Kw}, cw.data());
+  Tensor dcw = ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dstate(d, DType::kF32, {1, conv_dim, Kw - 1});
   dstate.Zero(d);
   const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
@@ -406,7 +445,7 @@ std::vector<uint16_t> GdnBlock(Dev d, const GdnLayerWeights& w,
   DBuf dqsl(d, DType::kI32, {2}, qsl);
   DBuf dhis(d, DType::kI32, {1}, his);
   DBuf dconv(d, DType::kF32, {T, conv_dim});
-  vt::CausalConv1dFwd(d.q, dconv.t(), dmixed.t(), dcw.t(), nullptr, dstate.t(),
+  vt::CausalConv1dFwd(d.q, dconv.t(), dmixed.t(), dcw, nullptr, dstate.t(),
                       dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
   std::vector<float> conv(static_cast<size_t>(T) * conv_dim);
   dconv.Download(d, conv.data());
@@ -462,11 +501,10 @@ std::vector<uint16_t> GdnBlock(Dev d, const GdnLayerWeights& w,
   // Gated RMSNorm over Dv with the z gate (gdn-semantics.md §5), viewing the
   // core output and z as [T*Hv, Dv]; then flatten heads and out-project.
   DBuf dz(d, DType::kF32, {T * Hv, Dv}, z.data());
-  std::vector<float> nw = WeightF32(w.norm_weight);  // match f32 x on CUDA
-  DBuf dnw(d, DType::kF32, {Dv}, nw.data());
+  Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
   DBuf dgated(d, DType::kF32, {T * Hv, Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
-  vt::RmsNormGated(d.q, dgated.t(), core2, dz.t(), dnw.t(),
+  vt::RmsNormGated(d.q, dgated.t(), core2, dz.t(), dnw,
                    vt::RmsNormGatedArgs{eps, false});
   std::vector<float> gated(static_cast<size_t>(T) * value_dim);
   dgated.Download(d, gated.data());
@@ -514,8 +552,7 @@ std::vector<uint16_t> GdnBlockPaged(Dev d, const GdnLayerWeights& w,
   // Causal conv1d over the token stream, PERSISTENT conv_state (gathered by the
   // per-request state indices, updated in place, scattered back).
   DBuf dmixed(d, DType::kF32, {T, conv_dim}, mixed.data());
-  std::vector<float> cw = WeightF32(w.conv1d_weight);
-  DBuf dcw(d, DType::kF32, {conv_dim, Kw}, cw.data());
+  Tensor dcw = ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dconv(d, DType::kF32, {T, conv_dim});
   const int64_t conv_row_elems = conv_dim * (Kw - 1);
   if (np > 0) {
@@ -530,7 +567,7 @@ std::vector<uint16_t> GdnBlockPaged(Dev d, const GdnLayerWeights& w,
     std::vector<int32_t> his(his_u8.begin(), his_u8.end());
     DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
     DBuf dhis(d, DType::kI32, {nreq}, his.data());
-    vt::CausalConv1dFwd(d.q, dconv.t(), dmixed.t(), dcw.t(), nullptr, dcs.t(),
+    vt::CausalConv1dFwd(d.q, dconv.t(), dmixed.t(), dcw, nullptr, dcs.t(),
                         dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
     ScatterRows(d, state.conv_state, dcs.ptr(), sidx, conv_row_elems);
   } else {
@@ -540,7 +577,7 @@ std::vector<uint16_t> GdnBlockPaged(Dev d, const GdnLayerWeights& w,
     std::vector<int32_t> didx(sidx.begin(), sidx.begin() + nd);
     DBuf dcs(d, DType::kF32, {nd, conv_dim, Kw - 1});
     GatherRows(d, dcs.ptr(), state.conv_state, didx, conv_row_elems);
-    vt::CausalConv1dUpdate(d.q, dconv.t(), dmixed.t(), dcw.t(), nullptr, dcs.t(),
+    vt::CausalConv1dUpdate(d.q, dconv.t(), dmixed.t(), dcw, nullptr, dcs.t(),
                            vt::CausalConv1dArgs{true});
     ScatterRows(d, state.conv_state, dcs.ptr(), didx, conv_row_elems);
   }
@@ -635,11 +672,10 @@ std::vector<uint16_t> GdnBlockPaged(Dev d, const GdnLayerWeights& w,
 
   // Gated RMSNorm over Dv with the z gate, flatten heads, out-project.
   DBuf dz(d, DType::kF32, {T * Hv, Dv}, z.data());
-  std::vector<float> nw = WeightF32(w.norm_weight);
-  DBuf dnw(d, DType::kF32, {Dv}, nw.data());
+  Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
   DBuf dgated(d, DType::kF32, {T * Hv, Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
-  vt::RmsNormGated(d.q, dgated.t(), core2, dz.t(), dnw.t(),
+  vt::RmsNormGated(d.q, dgated.t(), core2, dz.t(), dnw,
                    vt::RmsNormGatedArgs{eps, false});
   std::vector<float> gated(static_cast<size_t>(T) * value_dim);
   dgated.Download(d, gated.data());
@@ -680,16 +716,15 @@ std::vector<uint16_t> FullAttnBlock(Dev d, const FullAttnLayerWeights& w,
   }
 
   // Per-head gemma-RMSNorm over Dh, then partial NeoX RoPE on positions[0].
-  std::vector<float> qnw = WeightF32(w.q_norm);  // match f32 q/k on CUDA
-  std::vector<float> knw = WeightF32(w.k_norm);
+  // qk-norm weights f32-resident (uploaded once, reused every step).
   DBuf dq(d, DType::kF32, {T * Hq, Dh}, qf.data());
   DBuf dqn(d, DType::kF32, {T * Hq, Dh});
-  DBuf dqw(d, DType::kF32, {Dh}, qnw.data());
-  vt::RmsNorm(d.q, dqn.t(), dq.t(), dqw.t(), vt::RmsNormArgs{eps, true});
+  Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+  vt::RmsNorm(d.q, dqn.t(), dq.t(), dqw, vt::RmsNormArgs{eps, true});
   DBuf dk(d, DType::kF32, {T * Hkv, Dh}, kf.data());
   DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  DBuf dkw(d, DType::kF32, {Dh}, knw.data());
-  vt::RmsNorm(d.q, dkn.t(), dk.t(), dkw.t(), vt::RmsNormArgs{eps, true});
+  Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+  vt::RmsNorm(d.q, dkn.t(), dk.t(), dkw, vt::RmsNormArgs{eps, true});
 
   DBuf dpos(d, DType::kI32, {T}, positions.data());
   Tensor qn3 = Reshape(dqn.t(), {T, Hq, Dh});
@@ -753,16 +788,15 @@ std::vector<uint16_t> FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w,
   }
 
   // Per-head gemma-RMSNorm over Dh, then partial NeoX RoPE on positions.
-  std::vector<float> qnw = WeightF32(w.q_norm);
-  std::vector<float> knw = WeightF32(w.k_norm);
+  // qk-norm weights f32-resident (uploaded once, reused every step).
   DBuf dq(d, DType::kF32, {T * Hq, Dh}, qf.data());
   DBuf dqn(d, DType::kF32, {T * Hq, Dh});
-  DBuf dqw(d, DType::kF32, {Dh}, qnw.data());
-  vt::RmsNorm(d.q, dqn.t(), dq.t(), dqw.t(), vt::RmsNormArgs{eps, true});
+  Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+  vt::RmsNorm(d.q, dqn.t(), dq.t(), dqw, vt::RmsNormArgs{eps, true});
   DBuf dk(d, DType::kF32, {T * Hkv, Dh}, kf.data());
   DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  DBuf dkw(d, DType::kF32, {Dh}, knw.data());
-  vt::RmsNorm(d.q, dkn.t(), dk.t(), dkw.t(), vt::RmsNormArgs{eps, true});
+  Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+  vt::RmsNorm(d.q, dkn.t(), dk.t(), dkw, vt::RmsNormArgs{eps, true});
 
   DBuf dpos(d, DType::kI32, {T}, positions.data());
   Tensor qn3 = Reshape(dqn.t(), {T, Hq, Dh});
@@ -873,9 +907,9 @@ std::vector<uint16_t> MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const H
   // Hidden states resident once; router logits + top-k stay on device (the ids
   // [T,top_k] are the pair expert ids, the weights [T,top_k] feed the combine).
   DBuf dh(d, DType::kBF16, {T, H}, h.data());
-  DBuf drg = WeightBuf(d, w.router_gate);                 // [H,E] bf16
+  Tensor drg = ResidentWeight(d, w.router_gate);          // [H,E] bf16
   DBuf dlog(d, DType::kBF16, {T, E});
-  vt::Matmul(d.q, dlog.t(), dh.t(), drg.t());             // logits [T,E]
+  vt::Matmul(d.q, dlog.t(), dh.t(), drg);                 // logits [T,E]
   DBuf dtw(d, DType::kF32, {T, top_k});
   DBuf dtid(d, DType::kI32, {T, top_k});
   vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
@@ -1030,11 +1064,10 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   DBuf dh(d, DType::kBF16, {T, H}, hidden.data());
-  DBuf dw_in(d, layer.input_layernorm.dtype, {H},
-             layer.input_layernorm.bytes.data());
+  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
   // Qwen3NextRMSNorm == GemmaRMSNorm (weight applied as 1+w).
-  vt::RmsNorm(d.q, dhn.t(), dh.t(), dw_in.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dhn.t(), dh.t(), dw_in, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> hn(static_cast<size_t>(T) * H);
   dhn.Download(d, hn.data());
@@ -1045,10 +1078,9 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
           : FullAttnBlock(d, layer.attn, cfg, hn, positions, T);
 
   DBuf datt(d, DType::kBF16, {T, H}, attn.data());
-  DBuf dw_post(d, layer.post_attention_layernorm.dtype, {H},
-               layer.post_attention_layernorm.bytes.data());
+  Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dh2.t(), datt.t(), dw_post.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dh2.t(), datt.t(), dw_post, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> h2(static_cast<size_t>(T) * H);
   dh2.Download(d, h2.data());
@@ -1071,10 +1103,9 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   DBuf dh(d, DType::kBF16, {T, H}, hidden.data());
-  DBuf dw_in(d, layer.input_layernorm.dtype, {H},
-             layer.input_layernorm.bytes.data());
+  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dhn.t(), dh.t(), dw_in.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dhn.t(), dh.t(), dw_in, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> hn(static_cast<size_t>(T) * H);
   dhn.Download(d, hn.data());
@@ -1090,10 +1121,9 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   }
 
   DBuf datt(d, DType::kBF16, {T, H}, attn.data());
-  DBuf dw_post(d, layer.post_attention_layernorm.dtype, {H},
-               layer.post_attention_layernorm.bytes.data());
+  Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dh2.t(), datt.t(), dw_post.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dh2.t(), datt.t(), dw_post, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> h2(static_cast<size_t>(T) * H);
   dh2.Download(d, h2.data());
@@ -1132,11 +1162,10 @@ std::vector<float> Qwen3_5Model::Forward(
            "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
 
   // Embed: hidden = embed_tokens[token_ids] (bf16). residual = 0 (f32).
-  DBuf dtab(d, weights.embed_tokens.dtype, {vocab, H},
-            weights.embed_tokens.bytes.data());
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf dembed(d, DType::kBF16, {T, H});
-  vt::Embedding(d.q, dembed.t(), dtab.t(), dids.t());
+  vt::Embedding(d.q, dembed.t(), dtab, dids.t());
   std::vector<uint16_t> hidden(static_cast<size_t>(T) * H);
   dembed.Download(d, hidden.data());
 
@@ -1156,9 +1185,9 @@ std::vector<float> Qwen3_5Model::Forward(
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   DBuf dh(d, DType::kBF16, {T, H}, hidden.data());
-  DBuf dfn(d, weights.final_norm.dtype, {H}, weights.final_norm.bytes.data());
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dnorm.t(), dh.t(), dfn.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dnorm.t(), dh.t(), dfn, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> normed(static_cast<size_t>(T) * H);
   dnorm.Download(d, normed.data());
@@ -1186,11 +1215,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Embed: hidden = embed_tokens[token_ids] (bf16). residual = 0 (f32).
-  DBuf dtab(d, weights.embed_tokens.dtype, {vocab, H},
-            weights.embed_tokens.bytes.data());
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   DBuf dembed(d, DType::kBF16, {T, H});
-  vt::Embedding(d.q, dembed.t(), dtab.t(), dids.t());
+  vt::Embedding(d.q, dembed.t(), dtab, dids.t());
   std::vector<uint16_t> hidden(static_cast<size_t>(T) * H);
   dembed.Download(d, hidden.data());
 
@@ -1203,10 +1231,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   DBuf dh(d, DType::kBF16, {T, H}, hidden.data());
-  DBuf dfn(d, weights.final_norm.dtype, {H}, weights.final_norm.bytes.data());
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
   DBuf dnorm(d, DType::kBF16, {T, H});
   // Final norm is GemmaRMSNorm too (weight applied as 1+w).
-  vt::RmsNorm(d.q, dnorm.t(), dh.t(), dfn.t(), vt::RmsNormArgs{eps, true},
+  vt::RmsNorm(d.q, dnorm.t(), dh.t(), dfn, vt::RmsNormArgs{eps, true},
               &res.t());
   std::vector<uint16_t> normed(static_cast<size_t>(T) * H);
   dnorm.Download(d, normed.data());

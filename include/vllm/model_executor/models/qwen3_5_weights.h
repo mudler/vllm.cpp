@@ -44,6 +44,15 @@ struct OwnedTensor {
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
+
+  // Lazily-populated device-resident copies (CUDA forward only; null on host or
+  // before first use). Uploaded ONCE and reused across every forward step so the
+  // model's bf16/f32 weights (embed table, norms, attention/GDN projections,
+  // router) stop re-uploading per op. d_dev holds the raw-dtype bytes; d_dev_f32
+  // holds a bf16->f32 upcast (the CUDA norm/conv kernels want f32 when the
+  // activation is f32). The shared_ptr deleter frees through the vt Backend.
+  mutable std::shared_ptr<void> d_dev;
+  mutable std::shared_ptr<void> d_dev_f32;
 };
 
 // Device-resident NVFP4 W4A16 weight (M2.2b). The modelopt packed fp4 codes +

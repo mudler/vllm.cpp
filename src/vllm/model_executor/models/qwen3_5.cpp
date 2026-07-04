@@ -270,24 +270,46 @@ std::vector<float> MatmulNvfp4F32(Dev d, const std::vector<uint16_t>& x, int64_t
   return out;
 }
 
-// y[M,N] bf16 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
-// in for MatmulBf16 (expert down projection).
-std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int64_t M,
-                                      int64_t K, const Nvfp4Weight& w) {
-  const int64_t N = w.n;
-  DBuf dx(d, DType::kBF16, {M, K}, x.data());
-  DBuf dout(d, DType::kBF16, {M, N});
+// --- Device-resident matmul helpers (M2.x staging elimination) --------------
+// out (device) = x (device) @ w, NO host round-trip. The bf16 weight is uploaded
+// through a pooled DBuf (its storage returns to the pool, not the driver — safe
+// under the queue's stream ordering, like every other DBuf). fp4 weights are
+// read in place via the resident device copy (ResidentNvfp4), so no upload at
+// all. These let a block chain op->op without downloading intermediates.
+
+void MatmulDev(Dev d, Tensor& out, const Tensor& x, const OwnedTensor& w) {
+  DBuf dw = WeightBuf(d, w);
+  vt::Matmul(d.q, out, x, dw.t());
+}
+
+void MatmulNvfp4Dev(Dev d, Tensor& out, const Tensor& x, const Nvfp4Weight& w) {
   if (d.q.device.type == vt::DeviceType::kCUDA) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
-    vt::MatmulNvfp4(d.q, dout.t(), dx.t(), dw.packed, dw.scale, w.scale2);
+    vt::MatmulNvfp4(d.q, out, x, dw.packed, dw.scale, w.scale2);
   } else {
+    const int64_t K = x.shape[1], N = w.n;
     std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
     DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
-    vt::Matmul(d.q, dout.t(), dx.t(), dwb.t());
+    vt::Matmul(d.q, out, x, dwb.t());
   }
-  std::vector<uint16_t> out(static_cast<size_t>(M) * N);
-  dout.Download(d, out.data());
-  return out;
+}
+
+// act[n,I] bf16 = silu(gate[n,I]) * up[n,I], all device-resident. Builds the
+// [n,2I] concat SiluAndMul expects (gate | up per row, via device copies) then
+// runs vt::SiluAndMul — bit-identical to the host F32ToBF16(Silu(hg)*hu) it
+// replaces (same gate/(1+exp(-gate))*up formula, same f32->bf16 store).
+void SiluMulDev(Dev d, Tensor& act, const Tensor& gate, const Tensor& up, int64_t n,
+                int64_t I) {
+  DBuf dcat(d, DType::kF32, {n, 2 * I});
+  const size_t rb = static_cast<size_t>(I) * vt::SizeOf(DType::kF32);
+  auto* cp = static_cast<char*>(dcat.ptr());
+  for (int64_t r = 0; r < n; ++r) {
+    d.b.Copy(d.q, cp + static_cast<size_t>(r) * 2 * rb,
+             static_cast<const char*>(gate.data) + static_cast<size_t>(r) * rb, rb);
+    d.b.Copy(d.q, cp + static_cast<size_t>(r) * 2 * rb + rb,
+             static_cast<const char*>(up.data) + static_cast<size_t>(r) * rb, rb);
+  }
+  vt::SiluAndMul(d.q, act, dcat.t());
 }
 
 // --- Paged-path helpers (M1.8 Task 3) --------------------------------------
@@ -775,37 +797,16 @@ std::vector<uint16_t> FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w,
   return MatmulBf16(d, gated, T, Hq * Dh, w.o_proj);  // [T,H]
 }
 
-// Per-expert silu-mul MLP over the gathered token rows `x` [n, H] bf16 ->
-// [n, H] bf16 (moe-semantics.md §4; gate/up/down kept separate at TP=1).
-std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
-                                const OwnedTensor& up, const OwnedTensor& down,
-                                const std::vector<uint16_t>& x, int64_t n,
-                                int64_t H, int64_t I) {
-  std::vector<float> hg = MatmulF32(d, x, n, H, gate);  // [n,I]
-  std::vector<float> hu = MatmulF32(d, x, n, H, up);    // [n,I]
-  std::vector<uint16_t> act(static_cast<size_t>(n) * I);
-  for (size_t i = 0; i < act.size(); ++i)
-    act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
-  return MatmulBf16(d, act, n, I, down);  // [n,H]
-}
-
-// fp4-resident per-expert silu-mul MLP (M2.2b): identical to ExpertMlp but the
-// gate/up/down NVFP4 weights are read on-device via vt::MatmulNvfp4.
-std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
-                                     const Nvfp4Weight& up, const Nvfp4Weight& down,
-                                     const std::vector<uint16_t>& x, int64_t n,
-                                     int64_t H, int64_t I) {
-  std::vector<float> hg = MatmulNvfp4F32(d, x, n, H, gate);  // [n,I]
-  std::vector<float> hu = MatmulNvfp4F32(d, x, n, H, up);    // [n,I]
-  std::vector<uint16_t> act(static_cast<size_t>(n) * I);
-  for (size_t i = 0; i < act.size(); ++i)
-    act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
-  return MatmulNvfp4Bf16(d, act, n, I, down);  // [n,H]
-}
-
 // --- Sparse-MoE block (moe-semantics.md §1-§6). Router top-k over ALL experts,
 // then the ACTIVATED-EXPERT token-gather loop (not O(E)-dense), shared expert
 // with sigmoid gate, and the weighted combine. h [T*H] bf16 -> [T*H] bf16.
+//
+// M2.x: the block input is kept device-resident (`dh`) and the activated-expert
+// MLP chains gate -> silu-mul -> down device-to-device (no per-op Download).
+// Only the small router top-k indices come to the host (the gather needs them);
+// the router weights and every activation stay on-device. The shared expert's
+// sigmoid output gate has no device kernel yet, so it keeps its host path — a
+// small residual hop, dwarfed by the eliminated per-expert round-trips.
 std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
                                const HfConfig& cfg,
                                const std::vector<uint16_t>& h, int64_t T) {
@@ -818,16 +819,20 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   // (synthetic / GGUF). Exactly one set is populated (see qwen3_5_weights.h).
   const bool fp4 = !w.expert_gate_fp4.empty();
 
+  // Resident copy of the block input: the router and the per-expert gather both
+  // read it, device-to-device, with no host round-trip.
+  DBuf dh(d, DType::kBF16, {T, H}, h.data());
+
   // Router: logits = x @ gate.T (bf16, §2), softmax/top-k/renormalize (§3).
-  std::vector<uint16_t> logits = MatmulBf16(d, h, T, H, w.router_gate);  // [T,E]
-  DBuf dlog(d, DType::kBF16, {T, E}, logits.data());
+  DBuf dlog(d, DType::kBF16, {T, E});
+  MatmulDev(d, dlog.t(), dh.t(), w.router_gate);
   DBuf dtw(d, DType::kF32, {T, top_k});
   DBuf dtid(d, DType::kI32, {T, top_k});
   vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
                     vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
-  std::vector<float> weights(static_cast<size_t>(T) * top_k);
+  // Only the top-k indices are downloaded (the host gather needs them); the
+  // weights stay resident and feed MoeCombine directly.
   std::vector<int32_t> ids(static_cast<size_t>(T) * top_k);
-  dtw.Download(d, weights.data());
   dtid.Download(d, ids.data());
 
   // Activated-expert gather: per expert, the (token, slot) pairs routed to it.
@@ -838,32 +843,47 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
       lists[static_cast<size_t>(ids[static_cast<size_t>(t) * top_k + j])]
           .push_back({t, j});
 
-  std::vector<uint16_t> expert_out(static_cast<size_t>(T) * top_k * H, 0);
+  // Per-slot expert outputs [T, top_k, H], device-resident. Every (t,j) slot is
+  // written by its routed expert; zero first so MoeCombine's dense read is
+  // well-defined regardless.
+  DBuf deo(d, DType::kBF16, {T, top_k, H});
+  deo.Zero(d);
   for (int64_t e = 0; e < E; ++e) {
     const auto& list = lists[static_cast<size_t>(e)];
     if (list.empty()) continue;
     const int64_t n = static_cast<int64_t>(list.size());
-    std::vector<uint16_t> xg(static_cast<size_t>(n) * H);
-    for (int64_t r = 0; r < n; ++r)
-      std::memcpy(xg.data() + static_cast<size_t>(r) * H,
-                  h.data() + static_cast<size_t>(list[r].first) * H,
-                  static_cast<size_t>(H) * sizeof(uint16_t));
-    std::vector<uint16_t> y =
-        fp4 ? ExpertMlpNvfp4(d, w.expert_gate_fp4[static_cast<size_t>(e)],
-                             w.expert_up_fp4[static_cast<size_t>(e)],
-                             w.expert_down_fp4[static_cast<size_t>(e)], xg, n, H, I)
-            : ExpertMlp(d, w.expert_gate[static_cast<size_t>(e)],
-                        w.expert_up[static_cast<size_t>(e)],
-                        w.expert_down[static_cast<size_t>(e)], xg, n, H, I);
+    std::vector<int32_t> tok(static_cast<size_t>(n));
+    std::vector<int32_t> slot(static_cast<size_t>(n));
     for (int64_t r = 0; r < n; ++r) {
-      const int64_t t = list[r].first, j = list[r].second;
-      std::memcpy(expert_out.data() + static_cast<size_t>(t * top_k + j) * H,
-                  y.data() + static_cast<size_t>(r) * H,
-                  static_cast<size_t>(H) * sizeof(uint16_t));
+      const auto& p = list[static_cast<size_t>(r)];
+      tok[static_cast<size_t>(r)] = static_cast<int32_t>(p.first);
+      slot[static_cast<size_t>(r)] = static_cast<int32_t>(p.first * top_k + p.second);
     }
+    // Gather this expert's token rows from the resident hidden (device copy),
+    // then chain gate/up -> silu-mul -> down entirely on-device.
+    DBuf dxg(d, DType::kBF16, {n, H});
+    GatherRows(d, dxg.ptr(), dh.t(), tok, H);
+    DBuf dg(d, DType::kF32, {n, I});
+    DBuf du(d, DType::kF32, {n, I});
+    DBuf dact(d, DType::kBF16, {n, I});
+    DBuf dy(d, DType::kBF16, {n, H});
+    if (fp4) {
+      MatmulNvfp4Dev(d, dg.t(), dxg.t(), w.expert_gate_fp4[static_cast<size_t>(e)]);
+      MatmulNvfp4Dev(d, du.t(), dxg.t(), w.expert_up_fp4[static_cast<size_t>(e)]);
+      SiluMulDev(d, dact.t(), dg.t(), du.t(), n, I);
+      MatmulNvfp4Dev(d, dy.t(), dact.t(), w.expert_down_fp4[static_cast<size_t>(e)]);
+    } else {
+      MatmulDev(d, dg.t(), dxg.t(), w.expert_gate[static_cast<size_t>(e)]);
+      MatmulDev(d, du.t(), dxg.t(), w.expert_up[static_cast<size_t>(e)]);
+      SiluMulDev(d, dact.t(), dg.t(), du.t(), n, I);
+      MatmulDev(d, dy.t(), dact.t(), w.expert_down[static_cast<size_t>(e)]);
+    }
+    // Scatter the expert output into its per-slot rows of deo (device copy).
+    ScatterRows(d, deo.t(), dy.ptr(), slot, H);
   }
 
   // Shared expert (moe-semantics.md §5): silu-mul MLP then sigmoid(x@Wseg)*out.
+  // Host path (its sigmoid output gate has no device kernel yet).
   std::vector<float> sg = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_gate_proj_fp4)
                               : MatmulF32(d, h, T, H, w.shared_gate_proj);  // [T,Is]
   std::vector<float> su = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_up_proj_fp4)
@@ -883,11 +903,10 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   }
 
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
-  DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());
-  DBuf dwt(d, DType::kF32, {T, top_k}, weights.data());
+  // deo + dtw are already device-resident; only the shared term is uploaded.
   DBuf dsh(d, DType::kBF16, {T, H}, shared.data());
   DBuf dout(d, DType::kBF16, {T, H});
-  vt::MoeCombine(d.q, dout.t(), deo.t(), dwt.t(), &dsh.t());
+  vt::MoeCombine(d.q, dout.t(), deo.t(), dtw.t(), &dsh.t());
   std::vector<uint16_t> out(static_cast<size_t>(T) * H);
   dout.Download(d, out.data());
   return out;

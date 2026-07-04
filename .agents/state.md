@@ -837,3 +837,27 @@
   kernels + CUDA graphs. The M2.1 bench will quantify the gap vs the vLLM oracle.
   REMAINING: M2 throughput parity (the perf kernels + the measured gate #1); the
   APEX GGUF greedy (point the paged gate at a Compact/Balanced .gguf).
+- **2026-07-04 (★ gate-#1 THROUGHPUT MEASURED on GB10 vs vLLM ★)** — With GB10
+  access confirmed, ran the M2.1 harness on the real 35B and the vLLM oracle
+  (0.24.0) on the IDENTICAL workload (8 prompts × 256 in × 32 out). **vLLM: 1377
+  total tok/s / 153 output tok/s / 1.20 req/s** (optimized). **Ours: correctness-
+  grade — did NOT finish in >80 min** (GPU ~0% the whole time, 82GB host RSS;
+  single-seq ~0.2 output tok/s from the paged gate). **The gap is ~1000× (≈3
+  orders of magnitude)** — the expected, un-optimized-forward delta. **★ MVP GATE
+  STATUS (hardware-grounded) ★:** Gate #2 (GGUF read/load) ✅ path done; gates #3-#5
+  (serving MVP: OpenAI API, tools, grammars, C-API, conformance) ✅ built + CPU-
+  tested + the CUDA build passes 79/79 on GB10; **engine CORRECTNESS ✅ 100% on
+  real GB10** (all kernels + both 35B gates, real model). **Gate #1 (throughput
+  parity vs vLLM) is OPEN and now precisely MEASURED** — our correctness-grade
+  forward is ~1000× slower, GPU-idle, CPU-dequant/staging-bound. Closing it is the
+  **M2.2-M2.6 GPU perf-kernel work**, which is now fully unblocked (GB10 access +
+  the M2.1 harness + the recorded vLLM baseline + the profiling insight). **The
+  highest-leverage M2 order (from the GPU-idle profile):** (1) M2.2 on-device NVFP4
+  W4A16 GEMM — keep weights fp4 in device memory, eliminate the 40-min CPU dequant
+  + the 70GB bf16 host tensors + the per-op weight upload (this is the dominant
+  cost); (2) staged on-device KV/weight storage (the MRV2 axis deferred at M1.5/M1.8)
+  — eliminate per-op host↔device copies; (3) M2.5 CUDA graphs for decode; (4) M2.3/
+  M2.4 fused GDN/MoE + paged-attn tuning. This is substantial multi-session GPU
+  work; the CPU-side MVP is complete + hardware-validated, and gate #1 is the
+  remaining, now-unblocked, measured target. NOTE: `~/venvs/vllm-oracle` needed
+  `pip install ninja` (JIT) to run the baseline (fixed).

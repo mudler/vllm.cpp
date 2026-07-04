@@ -512,14 +512,14 @@ __global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
   const int64_t hk = hv / (hv_n / hk_n);
   const int64_t tok0 = tok0a[gc], len = lena[gc];
   __shared__ float kk[kChunk * kChunk];  // K K^T (row i, col j)
-  __shared__ float bs[kChunk];           // beta
+  __shared__ float ed[kChunk * kChunk];  // exp(G_i - G_j), j<=i (bounded <=1), else 0
+  __shared__ float gs[kChunk];           // G_i (local cumsum)
+  __shared__ float bs[kChunk];           // beta_i
   __shared__ float eg[kChunk];           // exp(G_i)
-  __shared__ float egi[kChunk];          // 1/exp(G_i)
   for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
     bs[i] = beta[(tok0 + i) * hv_n + hv];
-    const float e = expf(gcum[(tok0 + i) * hv_n + hv]);
-    eg[i] = e;
-    egi[i] = 1.0f / e;
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
   }
   __syncthreads();
   for (int64_t idx = threadIdx.x; idx < len * len; idx += blockDim.x) {
@@ -529,31 +529,28 @@ __global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
     const int64_t jb = (tok0 + j) * hk_n * dk + hk * dk;
     for (int64_t d = 0; d < dk; ++d) dot += Load(k, ib + d) * Load(k, jb + d);
     kk[i * kChunk + j] = dot;
+    ed[i * kChunk + j] = j <= i ? expf(gs[i] - gs[j]) : 0.0f;  // G non-increasing -> <=1
   }
   __syncthreads();
-  // u column vi: u_i = beta_i (v_i - eG_i * sum_{j<i} KK[i,j] * (u_j/eG_j))
+  // u column vi: u_i = beta_i (v_i - sum_{j<i} exp(G_i-G_j) KK[i,j] u_j)
   for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x) {
-    float ucol[kChunk], us[kChunk];
+    float ucol[kChunk];
     for (int64_t i = 0; i < len; ++i) {
       float s = 0.0f;
-      for (int64_t j = 0; j < i; ++j) s += kk[i * kChunk + j] * us[j];
+      for (int64_t j = 0; j < i; ++j) s += ed[i * kChunk + j] * kk[i * kChunk + j] * ucol[j];
       const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
-      const float ui = bs[i] * (vi_val - eg[i] * s);
-      ucol[i] = ui;
-      us[i] = ui * egi[i];
+      ucol[i] = bs[i] * (vi_val - s);
     }
     for (int64_t i = 0; i < len; ++i) u[(tok0 + i) * hv_n * dv + hv * dv + vi] = ucol[i];
   }
-  // w column ki: w_i = beta_i eG_i (k_i - sum_{j<i} KK[i,j] * (w_j/eG_j))
+  // w column ki: w_i = beta_i (exp(G_i) k_i - sum_{j<i} exp(G_i-G_j) KK[i,j] w_j)
   for (int64_t ki = threadIdx.x; ki < dk; ki += blockDim.x) {
-    float wcol[kChunk], ws[kChunk];
+    float wcol[kChunk];
     for (int64_t i = 0; i < len; ++i) {
       float s = 0.0f;
-      for (int64_t j = 0; j < i; ++j) s += kk[i * kChunk + j] * ws[j];
+      for (int64_t j = 0; j < i; ++j) s += ed[i * kChunk + j] * kk[i * kChunk + j] * wcol[j];
       const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
-      const float wi = bs[i] * eg[i] * (ki_val - s);
-      wcol[i] = wi;
-      ws[i] = wi * egi[i];
+      wcol[i] = bs[i] * (eg[i] * ki_val - s);
     }
     for (int64_t i = 0; i < len; ++i) w[(tok0 + i) * hv_n * dk + hv * dk + ki] = wcol[i];
   }
@@ -574,7 +571,8 @@ __global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, 
   const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
   const int64_t boh_n = boh[n];
   const int64_t sd = dv * dk;
-  extern __shared__ float hsh[];  // [Dv, Dk] running state
+  extern __shared__ float hsh[];      // [Dv, Dk] running state
+  __shared__ float decay[kChunk];     // exp(G_last - G_i), i<=last (bounded <=1)
   float* s_head = state + (n * hv_n + hv) * sd;
   for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hsh[e] = s_head[e];
   __syncthreads();
@@ -584,8 +582,12 @@ __global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, 
     const int64_t tok0 = begin + it * kChunk;
     const int64_t rem = seqlen - it * kChunk;
     const int64_t len = rem < kChunk ? rem : kChunk;
-    float* hstart = hstate + gc * sd;  // chunk-start snapshot for step D
+    float* hstart = hstate + (gc * hv_n + hv) * sd;  // chunk-start snapshot for step D
     for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hstart[e] = hsh[e];
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = threadIdx.x; i < len; i += blockDim.x)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
     __syncthreads();
     // v_new[i,vi] = u[i,vi] - sum_ki w[i,ki] * hsh[vi,ki]
     for (int64_t idx = threadIdx.x; idx < len * dv; idx += blockDim.x) {
@@ -597,16 +599,13 @@ __global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, 
       v_new[(tok0 + i) * hv_n * dv + hv * dv + vi] = acc;
     }
     __syncthreads();
-    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
-    const float eglast = expf(glast);
     // hsh[vi,ki] = hsh[vi,ki]*exp(G_last) + sum_i k[i,ki]*v_new[i,vi]*exp(G_last-G_i)
     for (int64_t idx = threadIdx.x; idx < sd; idx += blockDim.x) {
       const int64_t vi = idx / dk, ki = idx % dk;
       float acc = hsh[idx] * eglast;
       for (int64_t i = 0; i < len; ++i) {
-        const float decay = eglast * expf(-gcum[(tok0 + i) * hv_n + hv]);
         acc += Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) *
-               v_new[(tok0 + i) * hv_n * dv + hv * dv + vi] * decay;
+               v_new[(tok0 + i) * hv_n * dv + hv * dv + vi] * decay[i];
       }
       hsh[idx] = acc;
     }
@@ -627,14 +626,14 @@ __global__ void GdnChunkOKernel(Tout* out, const Tin* q, const Tin* k, const flo
   const int64_t hk = hv / (hv_n / hk_n);
   const int64_t tok0 = tok0a[gc], len = lena[gc];
   const int64_t sd = dv * dk;
-  const float* hstart = hstate + gc * sd;
+  const float* hstart = hstate + (gc * hv_n + hv) * sd;
   __shared__ float qk[kChunk * kChunk];  // q_i . k_j
+  __shared__ float ed[kChunk * kChunk];  // exp(G_i - G_j), j<=i (bounded <=1), else 0
+  __shared__ float gs[kChunk];           // G_i
   __shared__ float eg[kChunk];           // exp(G_i)
-  __shared__ float egi[kChunk];          // 1/exp(G_i)
   for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
-    const float e = expf(gcum[(tok0 + i) * hv_n + hv]);
-    eg[i] = e;
-    egi[i] = 1.0f / e;
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
   }
   __syncthreads();
   for (int64_t idx = threadIdx.x; idx < len * len; idx += blockDim.x) {
@@ -644,20 +643,21 @@ __global__ void GdnChunkOKernel(Tout* out, const Tin* q, const Tin* k, const flo
     const int64_t jb = (tok0 + j) * hk_n * dk + hk * dk;
     for (int64_t d = 0; d < dk; ++d) dot += Load(q, ib + d) * Load(k, jb + d);
     qk[i * kChunk + j] = dot;
+    ed[i * kChunk + j] = j <= i ? expf(gs[i] - gs[j]) : 0.0f;
   }
   __syncthreads();
   for (int64_t idx = threadIdx.x; idx < len * dv; idx += blockDim.x) {
     const int64_t i = idx / dv, vi = idx % dv;
-    // cross-chunk: q_i . h_start[vi,:]
+    // cross-chunk: exp(G_i) * (q_i . h_start[vi,:])
     float cross = 0.0f;
     const int64_t qb = (tok0 + i) * hk_n * dk + hk * dk;
     const float* hrow = hstart + vi * dk;
     for (int64_t d = 0; d < dk; ++d) cross += Load(q, qb + d) * hrow[d];
-    // intra-chunk causal: sum_{j<=i} QK[i,j] * (v_new_j / eG_j)
+    // intra-chunk causal: sum_{j<=i} exp(G_i-G_j) QK[i,j] v_new_j
     float intra = 0.0f;
     for (int64_t j = 0; j <= i; ++j)
-      intra += qk[i * kChunk + j] * egi[j] * v_new[(tok0 + j) * hv_n * dv + hv * dv + vi];
-    const float o = scale * eg[i] * (cross + intra);
+      intra += ed[i * kChunk + j] * qk[i * kChunk + j] * v_new[(tok0 + j) * hv_n * dv + hv * dv + vi];
+    const float o = scale * (eg[i] * cross + intra);
     Store(out, (tok0 + i) * hv_n * dv + hv * dv + vi, o);
   }
 }
@@ -755,8 +755,7 @@ void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tens
            "cuda gdn_prefill(chunked): unsupported q dtype (f32/bf16 only)");
   VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
            "cuda gdn_prefill(chunked): q/k/v dtypes must match");
-  const int64_t n_seq = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
-                dk = state.shape[3];
+  const int64_t n_seq = state.shape[0], hv_n = state.shape[1], dv = state.shape[2];
   if (n_seq == 0 || hv_n == 0 || dv == 0) return;
   const int64_t hk_n = q_in.shape[1];
   VT_CHECK(hk_n > 0 && hv_n % hk_n == 0,

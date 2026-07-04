@@ -1005,3 +1005,16 @@
   end-to-end correctness gate (paged greedy 16/16 on the real 35B) is green, so any weights-test
   red is most likely a stale per-tensor golden / snapshot-version mismatch, NOT a dequant
   regression — CONFIRM on a free-box GB10 run between kernel jobs (non-blocking).
+- **2026-07-04 (MVP definition SHARPENED by user + scope decisions)** — user calls:
+  (1) **27B is co-equal in-MVP** (35B + 27B BOTH at vLLM throughput = the MVP; not deferred).
+  (2) **`/metrics` Prometheus DROPPED** from MVP → post-MVP (gates.md gate #4 updated).
+  (3) **MVP = both gate models at vLLM speed, full stop.** Explicitly POST-MVP, ordered:
+  (a) more architectures, (b) more/faster CUDA kernels, (c) **design-lift to import vLLM
+  kernels directly (csrc drop-in → cut maintenance)**, (d) a systematic sweep of vLLM
+  features/archs/accelerators we lack → decide follow-up. Do NOT start post-MVP until both
+  models hit parity. gates.md banner records this. IMPLICATION: the 35B throughput campaign
+  (GDN scan in progress → decode GEMV/argmax) continues, AND a 27B/W4A4 bring-up starts as a
+  parallel CPU-first workstream (correctness scaffolding: the dense `Qwen3_5ForConditional
+  Generation` arch + compressed-tensors W4A4 load/dequant + greedy parity vs the oracle) —
+  27B checkpoint IS present on dgx (`~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-
+  NVFP4`). 27B's W4A4 GPU kernels need GB10 later (serialize behind the 35B kernel jobs).

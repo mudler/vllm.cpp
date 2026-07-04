@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -723,6 +724,10 @@ void RunRmsNormGatedCudaCase(int64_t t, int64_t d, bool sigmoid_gate, const Comb
 // sequences); otherwise varlen prefill with batch ignored.
 void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, int64_t hv,
                     int64_t dk, int64_t dv, const Combo& cb, uint32_t seed) {
+  // Pin this CPU-vs-CUDA case to the SEQUENTIAL prefill scan (tight tol): the
+  // chunk-parallel path reassociates the accumulation and is validated
+  // separately against the sequential kernel below. Decode is always sequential.
+  setenv("VT_GDN_CHUNKED", "0", 1);
   const bool decode = qsl.empty();
   const int64_t t = decode ? batch : qsl.back();
   const int64_t n = decode ? batch : static_cast<int64_t>(qsl.size()) - 1;
@@ -781,6 +786,92 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, 
   // The state is f32 on both sides in every combo (bf16 inputs are the same
   // bytes for CPU and CUDA), so it always compares at the f32 tolerance.
   CheckClose(st_gpu, st_cpu, 1e-5f, 1e-5f);
+}
+
+// Chunk-parallel prefill (VT_GDN_CHUNKED, default) vs the sequential scan
+// (VT_GDN_CHUNKED=0), same inputs, same binary. The chunked path is the M2
+// prefill perf kernel (cuda_gdn.cu GdnChunk*); it must reproduce the sequential
+// recurrence within GDN tolerance (fp reassociation only). Covers >=2 chunks +
+// a partial tail and multiple heads / varlen sequences.
+void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
+                               int64_t dk, int64_t dv, const Combo& cb, uint32_t seed,
+                               float atol, float rtol) {
+  const int64_t t = qsl.back();
+  const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
+  auto qf = RandomF32(static_cast<size_t>(t * hk * dk), seed, -1.0f, 1.0f);
+  auto kf = RandomF32(static_cast<size_t>(t * hk * dk), seed + 1, -1.0f, 1.0f);
+  // L2-normalize q/k per (token, head) over Dk, exactly as the real GDN path
+  // does before the scan. Un-normalized k makes the delta-rule recurrence
+  // (S += outer(v - S@k, k)) explode exponentially — an ill-conditioned input
+  // both scans blow up on identically; normalization keeps it contractive so
+  // the chunked-vs-sequential comparison measures the kernel, not fp chaos.
+  auto l2norm = [&](std::vector<float>& x) {
+    for (int64_t r = 0; r < t * hk; ++r) {
+      double ss = 0.0;
+      for (int64_t d = 0; d < dk; ++d) ss += static_cast<double>(x[r * dk + d]) * x[r * dk + d];
+      const float inv = static_cast<float>(1.0 / std::sqrt(ss + 1e-6));
+      for (int64_t d = 0; d < dk; ++d) x[r * dk + d] *= inv;
+    }
+  };
+  l2norm(qf);
+  l2norm(kf);
+  const auto vf = RandomF32(static_cast<size_t>(t * hv * dv), seed + 2, -1.0f, 1.0f);
+  // g in [-0.5, 0]: a realistic log-decay range; cumulative over a chunk stays
+  // well within f32 exp range so both paths are numerically sane.
+  const auto gf = RandomF32(static_cast<size_t>(t * hv), seed + 3, -0.5f, 0.0f);
+  const auto betaf = RandomF32(static_cast<size_t>(t * hv), seed + 4, 0.05f, 0.95f);
+  const auto stf = RandomF32(static_cast<size_t>(n * hv * dv * dk), seed + 5, -0.5f, 0.5f);
+  const auto qb = Pack(qf, cb.in);
+  const auto kb = Pack(kf, cb.in);
+  const auto vb = Pack(vf, cb.in);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  std::vector<uint8_t> out_seq(static_cast<size_t>(t * hv * dv) * vt::SizeOf(cb.out));
+  std::vector<uint8_t> out_chunk(out_seq.size());
+  std::vector<float> st_seq(stf.size()), st_chunk(stf.size());
+
+  auto run = [&](const char* toggle, std::vector<uint8_t>& out_bytes, std::vector<float>& st_out) {
+    setenv("VT_GDN_CHUNKED", toggle, 1);
+    DeviceTensor dq(gpu, gq.q, cb.in, {t, hk, dk}, qb.data());
+    DeviceTensor dkt(gpu, gq.q, cb.in, {t, hk, dk}, kb.data());
+    DeviceTensor dvt(gpu, gq.q, cb.in, {t, hv, dv}, vb.data());
+    DeviceTensor dg(gpu, gq.q, DType::kF32, {t, hv}, gf.data());
+    DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, hv}, betaf.data());
+    DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, stf.data());
+    DeviceTensor dout(gpu, gq.q, cb.out, {t, hv, dv});
+    DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
+    vt::GdnPrefill(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
+                   dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
+    dout.Download(gq.q, out_bytes.data());
+    dst.Download(gq.q, st_out.data());
+  };
+  run("0", out_seq, st_seq);
+  run("1", out_chunk, st_chunk);
+
+  {
+    auto os = Unpack(out_seq, cb.out), oc = Unpack(out_chunk, cb.out);
+    float mad = 0.0f, mrd = 0.0f;
+    size_t argmax = 0;
+    for (size_t i = 0; i < os.size(); ++i) {
+      const float ad = std::fabs(oc[i] - os[i]);
+      if (ad > mad) {
+        mad = ad;
+        argmax = i;
+      }
+      const float rd = ad / (std::fabs(os[i]) + 1e-6f);
+      if (rd > mrd) mrd = rd;
+    }
+    MESSAGE("out max|diff|=" << mad << " at i=" << argmax << " seq=" << os[argmax]
+                            << " chunk=" << oc[argmax] << " maxrel=" << mrd);
+    float smad = 0.0f;
+    for (size_t i = 0; i < st_seq.size(); ++i)
+      smad = std::max(smad, std::fabs(st_chunk[i] - st_seq[i]));
+    MESSAGE("state max|diff|=" << smad);
+  }
+  CheckClose(Unpack(out_chunk, cb.out), Unpack(out_seq, cb.out), atol, rtol);
+  CheckClose(st_chunk, st_seq, atol, rtol);
 }
 
 }  // namespace
@@ -893,4 +984,34 @@ TEST_CASE("CUDA gdn decode matches CPU (GQA ratio 3)") {
     RunGdnCudaCase({}, 3, 2, 6, 16, 8, cb, seed);
     seed += 10;
   }
+}
+
+// The M2 chunk-parallel prefill scan vs the sequential scan (same binary),
+// real head dims Dk=Dv=128 (the gate model), GQA ratio 2, multiple heads.
+// 150 tokens = 2 full chunks (64) + a partial tail (22) exercises the chunk
+// boundary and the partial-tail masking.
+TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  // f32 in/out: reassociation-only diffs. bf16 in: bf16-rounding scale.
+  const Combo f32 = {DType::kF32, DType::kF32, 5e-3f, 5e-3f};
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  // Isolation ladder: single partial chunk (intra only), one exact chunk, two
+  // chunks (first cross-chunk state pass), then the partial-tail cases.
+  RunGdnChunkedVsSequential({0, 40}, 1, 1, 128, 128, f32, 6900, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 64}, 1, 1, 128, 128, f32, 6910, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 128}, 1, 1, 128, 128, f32, 6920, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, f32, 7000, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, bf16, 7010, 3e-2f, 3e-2f);
+  // Multi-sequence varlen: two sequences of differing chunk counts packed
+  // together (chunk-offset / per-seq state layout).
+  RunGdnChunkedVsSequential({0, 150, 200}, 2, 4, 128, 128, f32, 7020, 5e-3f, 5e-3f);
+  // GQA ratio 2 at the real gate shape (Hk=16/Hv=32 sliced to Hk=4/Hv=8).
+  RunGdnChunkedVsSequential({0, 130}, 4, 8, 128, 128, f32, 7030, 5e-3f, 5e-3f);
+  // Restore default for any later cases.
+  setenv("VT_GDN_CHUNKED", "1", 1);
+  (void)f32;
+  (void)bf16;
 }

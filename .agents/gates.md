@@ -1,5 +1,14 @@
 # The gates (definition of MVP success)
 
+> **MVP FOCUS (user, 2026-07-04): get BOTH gate models (35B MoE/W4A16 + 27B
+> dense/W4A4) running at vLLM's throughput — that IS the MVP.** Gate #1 on both
+> models is the bar. Everything below (#2–#5) supports it. Explicitly POST-MVP,
+> in order: (a) more model architectures; (b) more/faster CUDA kernels; (c)
+> **lift the design so we can import kernels directly from vLLM** (drop-in csrc
+> alignment → reduce our maintenance burden); (d) a systematic **sweep of vLLM
+> features / architectures / accelerators we lack** to decide follow-up. Do NOT
+> start post-MVP work until both models hit parity.
+
 1. **Throughput parity vs vLLM** on `dgx.casa` (DGX Spark, GB10): serve
    **Qwen3.6-35B-A3B (NVFP4)** and **Qwen3.6-27B (NVFP4)** with prefill AND
    decode throughput matching vLLM at large concurrency (request-rate sweeps,
@@ -18,8 +27,9 @@
 4. **MVP features**: OpenAI completions/chat, **both streaming (SSE) and
    non-streaming** responses, **tool calling** (Qwen + Hermes parsers, auto
    tool choice), **grammars/structured outputs** (xgrammar C++ core: JSON
-   schema/regex/choice/EBNF + GBNF extension), core sampling surface,
-   Prometheus metrics with vLLM's metric names.
+   schema/regex/choice/EBNF + GBNF extension), core sampling surface.
+   (Prometheus `/metrics` endpoint DROPPED from MVP — user decision 2026-07-04,
+   moved to post-MVP.)
 5. **E2E test suites**: op parity vs upstream dumps, engine behavioral tests
    (ported from upstream `tests/v1/core/` semantics), model parity
    (logits + greedy token-for-token), server conformance, gate benchmark

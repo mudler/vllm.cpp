@@ -231,6 +231,18 @@ OutputProcessorOutput OutputProcessor::process_outputs(
   return result;
 }
 
+void OutputProcessor::abort_requests(
+    const std::vector<std::string>& request_ids) {
+  // output_processor.py:534 (T0 subset): remove each request's state so it stops
+  // counting as unfinished. Reuse FinishRequest for the map/external-id cleanup;
+  // unknown ids are a no-op (matching upstream's silent skip).
+  for (const std::string& req_id : request_ids) {
+    auto it = request_states_.find(req_id);
+    if (it == request_states_.end()) continue;
+    FinishRequest(*it->second);  // erases the entry (invalidates it).
+  }
+}
+
 void OutputProcessor::FinishRequest(RequestState& req_state) {
   // output_processor.py:695-707. Copy the ids before erasing — erasing the map
   // entry destroys `req_state`.

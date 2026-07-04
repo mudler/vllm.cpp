@@ -146,6 +146,14 @@ class OutputProcessor {
   OutputProcessorOutput process_outputs(
       const EngineCoreOutputs& engine_core_outputs);
 
+  // abort_requests (output_processor.py:534, the T0 subset): drop the tracked
+  // RequestState for each id so a client-initiated abort (e.g. the C-ABI
+  // streaming early-stop) fully tears the request down and it no longer counts
+  // toward has_unfinished_requests(). Unknown ids are ignored. The upstream
+  // parent_req / pooling / queue bookkeeping stays deferred (see the file
+  // header); at T0 this is a map erase mirroring FinishRequest.
+  void abort_requests(const std::vector<std::string>& request_ids);
+
  private:
   // _finish_request (:695): remove the finished req state from the maps.
   void FinishRequest(RequestState& req_state);

@@ -30,6 +30,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* `bool` in the streaming callback signature: native in C++, needs <stdbool.h>
+ * when this header is compiled as C. */
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -156,6 +162,37 @@ VLLM_API void vllm_engine_free(vllm_engine* engine);
 VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
                                    const vllm_sampling_params* params,
                                    vllm_completion* out);
+
+/* ── Streaming completion (M3.5 Task 2) ───────────────────────────────────────
+ * vllm_token_callback: invoked once per engine-step delta for the streaming
+ * request, then once more with finished == true to carry the finish.
+ *   - delta_text: the incremental text produced since the previous call, as a
+ *     NUL-terminated, well-formed UTF-8 C string. It is BORROWED — valid ONLY
+ *     for the duration of the call; copy it if you need to retain it. The final
+ *     finished == true call may carry an empty delta_text ("").
+ *   - finished: true on the terminal call (the request ended: EOS / stop /
+ *     length / abort). The callback is not invoked again for this request.
+ *   - user_data: the opaque pointer passed to vllm_complete_stream, round-tripped
+ *     unchanged (e.g. an accumulator the callback appends to).
+ * RETURN false to STOP generation early: the library aborts the in-flight
+ * request (tears it down so the engine stays usable) and returns VLLM_OK. Return
+ * true to keep generating. The callback is C code and MUST NOT throw across the
+ * ABI (any C++ exception it raises is caught and mapped to a status). */
+typedef bool (*vllm_token_callback)(const char* delta_text, bool finished,
+                                    void* user_data);
+
+/* Run a single streaming completion for `prompt` with `params`, invoking `cb`
+ * per delta (see vllm_token_callback). BLOCKING: drives the engine loop to a
+ * natural finish, an early stop (cb returned false), or an error before
+ * returning. Returns VLLM_OK on success (including an early stop), or a
+ * VLLM_ERR_* code (vllm_last_error() set). `engine`, `prompt`, `params` and `cb`
+ * must be non-NULL; `user_data` may be NULL. Sampled generation (temperature > 0
+ * with a seed) is supported and deterministic for a fixed seed. */
+VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
+                                          const char* prompt,
+                                          const vllm_sampling_params* params,
+                                          vllm_token_callback cb,
+                                          void* user_data);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

@@ -68,6 +68,16 @@ std::vector<RequestOutput> LLMEngine::step() {
   return request_outputs;
 }
 
+void LLMEngine::abort_request(const std::string& request_id) {
+  // llm_engine.py:230 abort_request: drop the request from the output processor
+  // (so has_unfinished_requests() no longer counts it) and from the engine core
+  // (scheduler finish_requests -> FINISHED_ABORTED). Upstream aborts the output
+  // processor first, then the engine core; both are no-ops for unknown ids.
+  const std::vector<std::string> ids = {request_id};
+  output_processor_.abort_requests(ids);
+  engine_core_.abort_requests(ids);
+}
+
 RequestOutput LLMEngine::generate(const std::string& prompt,
                                   SamplingParams params,
                                   const std::string& request_id) {

@@ -86,6 +86,14 @@ class LLMEngine {
   // abort any reqs the detokenizer stopped -> return the RequestOutputs.
   std::vector<RequestOutput> step();
 
+  // abort_request (llm_engine.py:230 abort_request): client-initiated teardown of
+  // an in-flight request. Mirrors upstream order — output_processor.abort_requests
+  // THEN engine_core.abort_requests — so the request stops counting toward
+  // has_unfinished_requests() AND is dropped from the scheduler. Unknown /
+  // already-finished ids are a no-op. Used by the C-ABI streaming early-stop
+  // (vllm_complete_stream) to tear down when the callback returns false.
+  void abort_request(const std::string& request_id);
+
   // has_unfinished_requests (llm_engine.py:191): drives the generate loop. The DP
   // term is deferred (single engine at T0).
   bool has_unfinished_requests() const {

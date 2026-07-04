@@ -19,6 +19,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/version.h"
@@ -62,10 +63,12 @@ const char* CanonicalFinishReason(const std::string& reason) {
 }
 
 // Translate the C sampling POD into vllm::SamplingParams and run PostInit()
-// (mandatory normalization + validation). Forces CUMULATIVE output so the
-// blocking generate() driver returns the full text. Throws std::runtime_error
-// (via Verify/PostInit) on invalid params.
-vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c) {
+// (mandatory normalization + validation). `output_kind` selects CUMULATIVE (the
+// blocking generate() driver returns the full text) vs DELTA (the streaming
+// driver gets one incremental delta per step). Throws std::runtime_error (via
+// Verify/PostInit) on invalid params.
+vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
+                                      vllm::RequestOutputKind output_kind) {
   vllm::SamplingParams sp;
   sp.temperature = static_cast<double>(c.temperature);
   sp.top_p = static_cast<double>(c.top_p);
@@ -90,7 +93,7 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c) {
       if (c.stop[i] != nullptr) sp.stop.emplace_back(c.stop[i]);
     }
   }
-  sp.output_kind = vllm::RequestOutputKind::kCumulative;
+  sp.output_kind = output_kind;
   sp.PostInit();
   return sp;
 }
@@ -184,7 +187,8 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   try {
-    const vllm::SamplingParams sp = ToSamplingParams(*params);
+    const vllm::SamplingParams sp =
+        ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
     const vllm::RequestOutput result =
         engine->loaded->engine().generate(prompt, sp);
 
@@ -212,6 +216,71 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
     return VLLM_ERR_RUNTIME;
   } catch (...) {
     SetError("vllm_complete: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
+                                          const char* prompt,
+                                          const vllm_sampling_params* params,
+                                          vllm_token_callback cb,
+                                          void* user_data) {
+  if (engine == nullptr || prompt == nullptr || params == nullptr ||
+      cb == nullptr) {
+    SetError("vllm_complete_stream: engine, prompt, params or cb is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    // DELTA output_kind: each step yields one incremental delta (mirrors the M3.1
+    // OpenAI streaming path, serving_completion.cpp). PostInit runs inside.
+    const vllm::SamplingParams sp =
+        ToSamplingParams(*params, vllm::RequestOutputKind::kDelta);
+
+    // One prompt per call -> its own request id. add_request + drive step()
+    // directly (like serving_completion) — no new LLMEngine driver needed.
+    const std::string request_id = "0";
+    vllm::v1::LLMEngine& e = engine->loaded->engine();
+    e.add_request(request_id, prompt, sp);
+
+    bool stopped_by_callback = false;
+    while (e.has_unfinished_requests()) {
+      for (const vllm::RequestOutput& res : e.step()) {
+        if (res.request_id != request_id) continue;
+        for (const vllm::CompletionOutput& output : res.outputs) {
+          // SanitizeUtf8: the raw-bytes detokenizer can emit invalid/truncated
+          // UTF-8; the callback gets a well-formed, NUL-terminated C string
+          // (embedded NULs cannot survive a C string either). See serving_utils.
+          const std::string delta =
+              vllm::entrypoints::openai::SanitizeUtf8(output.text);
+          const bool finished = res.finished;
+          // Callback owns the borrow only for this call; false => stop early.
+          const bool keep_going = cb(delta.c_str(), finished, user_data);
+          if (!keep_going) {
+            stopped_by_callback = true;
+            break;
+          }
+        }
+        if (stopped_by_callback) break;
+      }
+      if (stopped_by_callback) break;
+    }
+
+    if (stopped_by_callback) {
+      // Early stop: tear the in-flight request down so the engine stays usable.
+      // A no-op if it already finished on this very delta.
+      e.abort_request(request_id);
+    }
+    // On a natural finish the DELTA path already delivered a final res.finished
+    // == true delta to the callback (make_request_output sets finished on the
+    // last delta), so no extra terminal call is needed here.
+
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& ex) {
+    SetError(std::string("vllm_complete_stream: ") + ex.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_complete_stream: unknown error");
     return VLLM_ERR_UNKNOWN;
   }
 }

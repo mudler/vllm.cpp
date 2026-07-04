@@ -24,6 +24,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -247,6 +248,71 @@ vllm_sampling_params GreedyParams(int32_t max_tokens) {
   return sp;
 }
 
+// A seeded SAMPLED config (temperature > 0 + a fixed seed) -> the M1.7 sampler
+// drives generation, but a fixed seed makes two runs deterministic.
+vllm_sampling_params SeededSampledParams(int32_t max_tokens, uint64_t seed) {
+  vllm_sampling_params sp = vllm_sampling_params_default();
+  sp.temperature = 0.8f;
+  sp.top_k = 0;   // consider all tokens.
+  sp.top_p = 1.0f;
+  sp.max_tokens = max_tokens;
+  sp.has_seed = 1;
+  sp.seed = seed;
+  return sp;
+}
+
+// ─── Streaming callback accumulator (user_data round-trip) ───────────────────
+struct StreamAccumulator {
+  std::string text;          // concatenation of all delta_text.
+  int deltas = 0;            // number of callback invocations.
+  bool saw_finished = false;  // a final call with finished == true arrived.
+  bool all_valid_utf8 = true;  // every delta_text was well-formed UTF-8.
+  int stop_after = -1;       // if >= 0, return false once `deltas` reaches it.
+};
+
+// Minimal UTF-8 well-formedness check (rejects stray continuation bytes,
+// overlong / truncated sequences) — proves no invalid bytes reach the callback.
+bool IsValidUtf8(const std::string& s) {
+  size_t i = 0;
+  const size_t n = s.size();
+  while (i < n) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    size_t len = 0;
+    if (c < 0x80) {
+      len = 1;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+    } else {
+      return false;  // stray continuation / invalid lead byte.
+    }
+    if (i + len > n) return false;  // truncated.
+    for (size_t k = 1; k < len; ++k) {
+      if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+    }
+    i += len;
+  }
+  return true;
+}
+
+// The C callback: appends the delta, tracks finish + UTF-8 validity, and honors
+// the early-stop threshold. Signature matches vllm_token_callback exactly.
+bool AccumulateCb(const char* delta_text, bool finished, void* user_data) {
+  auto* acc = static_cast<StreamAccumulator*>(user_data);
+  acc->deltas += 1;
+  if (delta_text != nullptr) {
+    const std::string d(delta_text);
+    if (!IsValidUtf8(d)) acc->all_valid_utf8 = false;
+    acc->text += d;
+  }
+  if (finished) acc->saw_finished = true;
+  if (acc->stop_after >= 0 && acc->deltas >= acc->stop_after) return false;
+  return true;
+}
+
 }  // namespace
 
 // ─── (a) greedy complete: deterministic non-empty text + reason + counts ─────
@@ -353,6 +419,106 @@ TEST_CASE("capi: string / completion free helpers are leak-free and null-safe") 
   vllm_string_free(nullptr);
   vllm_completion_free(nullptr);
   vllm_engine_free(nullptr);
+
+  vllm_engine_free(eng);
+}
+
+// ─── (f) streaming == blocking: deltas concatenate to the blocking result ────
+TEST_CASE("capi: vllm_complete_stream deltas concatenate to the blocking result") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = GreedyParams(6);
+
+  // Blocking reference.
+  vllm_completion blocking;
+  REQUIRE(vllm_complete(eng, "hello", &sp, &blocking) == VLLM_OK);
+  REQUIRE(blocking.text != nullptr);
+
+  // Streaming: accumulate every delta via the user_data pointer.
+  StreamAccumulator acc;
+  const vllm_status st =
+      vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &acc);
+
+  CHECK(st == VLLM_OK);
+  CHECK(acc.deltas > 0);
+  CHECK(acc.saw_finished);                    // a final finished=true call.
+  CHECK(acc.all_valid_utf8);                  // (d) no invalid bytes reached us.
+  // The streaming boundary sanitizes UTF-8 per delta (a raw-bytes detokenizer
+  // can emit an invalid multibyte); blocking vllm_complete returns the raw text.
+  // So the invariant is: concat(deltas) == SanitizeUtf8(blocking text).
+  const std::string sanitized_blocking =
+      vllm::entrypoints::openai::SanitizeUtf8(std::string(blocking.text));
+  CHECK(acc.text == sanitized_blocking);
+
+  vllm_completion_free(&blocking);
+  vllm_engine_free(eng);
+}
+
+// ─── (g) early-stop: cb returns false -> generation stops, request torn down ──
+TEST_CASE("capi: vllm_complete_stream early-stop tears the request down cleanly") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = GreedyParams(10);
+
+  // Stop after the 2nd delta -> far fewer than max_tokens (10) deltas.
+  StreamAccumulator acc;
+  acc.stop_after = 2;
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &acc) == VLLM_OK);
+  CHECK(acc.deltas == 2);  // stopped early, did not run to max_tokens.
+
+  // The engine must be reusable: a subsequent full call works (proves the
+  // early-stopped request was aborted, not left lingering as unfinished).
+  StreamAccumulator acc2;
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &acc2) == VLLM_OK);
+  CHECK(acc2.saw_finished);
+  CHECK(acc2.deltas > 2);  // this one runs to natural finish.
+
+  // And blocking still works on the same engine after an early-stop.
+  vllm_completion out;
+  CHECK(vllm_complete(eng, "hello", &sp, &out) == VLLM_OK);
+  CHECK(out.text != nullptr);
+  vllm_completion_free(&out);
+
+  vllm_engine_free(eng);
+}
+
+// ─── (h) seeded SAMPLED run is deterministic across two calls ────────────────
+TEST_CASE("capi: seeded sampled streaming is deterministic across two calls") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = SeededSampledParams(6, /*seed=*/1234u);
+
+  StreamAccumulator a;
+  StreamAccumulator b;
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &a) == VLLM_OK);
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &b) == VLLM_OK);
+
+  CHECK(a.saw_finished);
+  CHECK(b.saw_finished);
+  CHECK(a.text == b.text);      // same seed -> identical sampled output.
+  CHECK(a.deltas == b.deltas);
+
+  vllm_engine_free(eng);
+}
+
+// ─── (i) null-argument path for the streaming API ────────────────────────────
+TEST_CASE("capi: vllm_complete_stream null arguments return INVALID_ARGUMENT") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+  vllm_sampling_params sp = GreedyParams(4);
+  StreamAccumulator acc;
+
+  CHECK(vllm_complete_stream(nullptr, "hi", &sp, &AccumulateCb, &acc) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_stream(eng, nullptr, &sp, &AccumulateCb, &acc) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_stream(eng, "hi", nullptr, &AccumulateCb, &acc) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_complete_stream(eng, "hi", &sp, nullptr, &acc) ==
+        VLLM_ERR_INVALID_ARGUMENT);
 
   vllm_engine_free(eng);
 }

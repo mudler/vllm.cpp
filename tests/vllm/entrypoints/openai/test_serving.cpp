@@ -66,7 +66,9 @@ using vllm::entrypoints::openai::OpenAIServingCompletion;
 using vllm::entrypoints::openai::ShapeChatDelta;
 using vllm::entrypoints::openai::ShapeChatMessage;
 using vllm::entrypoints::openai::ShapedChatMessage;
+using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
 using vllm::entrypoints::openai::ToolChoice;
+using vllm::entrypoints::openai::ToolChoiceForcedSchema;
 using vllm::entrypoints::openai::ToolParser;
 using vllm::entrypoints::openai::ToolsEnabled;
 using vllm::tok::Tokenizer;
@@ -701,6 +703,109 @@ TEST_CASE("serving_chat: tool_choice none disables tool extraction") {
   REQUIRE(shaped.message.content.has_value());
   CHECK(*shaped.message.content == model_output);
   CHECK(*shaped.finish_reason == "stop");
+}
+
+// ─── M3.3 Task 4: grammar-forced JSON for tool_choice=required / named ────────
+namespace {
+// ToolRequest() + a second tool (set_alarm), for required-with-multiple tests.
+ChatCompletionRequest TwoToolRequest() {
+  ChatCompletionRequest r = ToolRequest();
+  ChatCompletionToolsParam tool2;
+  tool2.type = "function";
+  tool2.function.name = "set_alarm";
+  tool2.function.parameters = nlohmann::json::parse(
+      R"({"type":"object","properties":{"time":{"type":"string"}},)"
+      R"("required":["time"]})");
+  r.tools->push_back(tool2);
+  return r;
+}
+}  // namespace
+
+// (a) named tool_choice -> forced schema = {name:const, arguments:params},
+//     flowing onto the SamplingParams the engine receives.
+TEST_CASE("serving_chat: tool_choice named forces the tool's {name,arguments} schema") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tool_choice = ToolChoice{"function", std::string("get_weather")};
+  const auto schema = ToolChoiceForcedSchema(req);
+  REQUIRE(schema.has_value());
+  CHECK(schema->at("type") == "object");
+  CHECK(schema->at("properties").at("name").at("const") == "get_weather");
+  // arguments == the tool's declared parameters schema.
+  CHECK(schema->at("properties").at("arguments") ==
+        *req.tools->at(0).function.parameters);
+  CHECK(schema->at("required") == json::array({"name", "arguments"}));
+  CHECK(schema->at("additionalProperties") == false);
+
+  // (e) The forced schema flows to structured_outputs.json.
+  SamplingParams sp = req.to_sampling_params(16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->json.has_value());
+  CHECK(json::parse(*sp.structured_outputs->json) == *schema);
+}
+
+// A named tool with NO parameters -> arguments constrained to any JSON (`true`).
+TEST_CASE("serving_chat: named tool without parameters forces arguments=any") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tools->at(0).function.parameters = std::nullopt;
+  req.tool_choice = ToolChoice{"function", std::string("get_weather")};
+  const auto schema = ToolChoiceForcedSchema(req);
+  REQUIRE(schema.has_value());
+  CHECK(schema->at("properties").at("arguments") == true);
+}
+
+// (b) required with ONE tool -> that tool's schema (no anyOf).
+TEST_CASE("serving_chat: tool_choice required with one tool forces that tool") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tool_choice = ToolChoice{"required", std::nullopt};
+  const auto schema = ToolChoiceForcedSchema(req);
+  REQUIRE(schema.has_value());
+  CHECK_FALSE(schema->contains("anyOf"));
+  CHECK(schema->at("properties").at("name").at("const") == "get_weather");
+}
+
+// (c) required with MULTIPLE tools -> anyOf alternation of the per-tool schemas.
+TEST_CASE("serving_chat: tool_choice required with multiple tools forces anyOf") {
+  ChatCompletionRequest req = TwoToolRequest();
+  req.tool_choice = ToolChoice{"required", std::nullopt};
+  const auto schema = ToolChoiceForcedSchema(req);
+  REQUIRE(schema.has_value());
+  REQUIRE(schema->contains("anyOf"));
+  REQUIRE(schema->at("anyOf").size() == 2);
+  CHECK(schema->at("anyOf").at(0).at("properties").at("name").at("const") ==
+        "get_weather");
+  CHECK(schema->at("anyOf").at(1).at("properties").at("name").at("const") ==
+        "set_alarm");
+
+  // It flows onto the SamplingParams (and Verify accepts the single json field).
+  SamplingParams sp = req.to_sampling_params(16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->json.has_value());
+  CHECK(json::parse(*sp.structured_outputs->json) == *schema);
+}
+
+// (d) auto tool_choice -> NO forced grammar (unset / explicit "auto").
+TEST_CASE("serving_chat: tool_choice auto forces no grammar") {
+  ChatCompletionRequest req = ToolRequest();  // tool_choice unset == auto default
+  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
+  req.tool_choice = ToolChoice{"auto", std::nullopt};
+  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
+
+  SamplingParams sp = req.to_sampling_params(16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  CHECK_FALSE(sp.structured_outputs.has_value());  // untouched -> unset
+}
+
+// none tool_choice / no tools -> no forced grammar.
+TEST_CASE("serving_chat: tool_choice none (and no tools) forces no grammar") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tool_choice = ToolChoice{"none", std::nullopt};
+  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
+
+  ChatCompletionRequest bare;
+  bare.messages = {ChatMessage{"user", std::string("hi")}};
+  CHECK_FALSE(ToolChoiceForcedSchema(bare).has_value());
 }
 
 // ─── (b/d) STREAM tool call: the delta sequence carries tool_calls[index=0,

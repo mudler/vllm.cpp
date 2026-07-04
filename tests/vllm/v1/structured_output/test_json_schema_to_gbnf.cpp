@@ -319,11 +319,60 @@ TEST_CASE("JsonSchemaToGbnf: top-level typed array") {
                       R"([1])"));  // integer, not string
 }
 
+// ─── (f) anyOf / oneOf -> alternation (M3.3 Task 4: tool_choice=required) ─────
+// anyOf of two DISJOINT object schemas (distinct `name` const) — the shape
+// tool_choice=required forces over multiple tools.
+TEST_CASE("JsonSchemaToGbnf: anyOf accepts either alternative, rejects neither") {
+  auto backend = MakeBackend();
+  const std::string schema =
+      R"({"anyOf":[)"
+      R"({"type":"object","properties":{"name":{"const":"a"},)"
+      R"("v":{"type":"integer"}},"required":["name","v"]},)"
+      R"({"type":"object","properties":{"name":{"const":"b"},)"
+      R"("v":{"type":"string"}},"required":["name","v"]}]})";
+  // nlohmann sorts keys -> canonical order name, then v.
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema,
+                R"({"name":"a","v":7})"));    // alt A
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema,
+                R"({"name":"b","v":"x"})"));  // alt B
+  // Neither alternative matches: wrong const, or A's name with B's value type.
+  CHECK_FALSE(Matches(*backend, StructuredOutputOptions::kJson, schema,
+                      R"({"name":"c","v":7})"));
+  CHECK_FALSE(Matches(*backend, StructuredOutputOptions::kJson, schema,
+                      R"({"name":"a","v":"x"})"));
+}
+
+// oneOf lowers to the same alternation (primitive alternatives here).
+TEST_CASE("JsonSchemaToGbnf: oneOf lowers to an alternation") {
+  auto backend = MakeBackend();
+  const std::string schema =
+      R"({"oneOf":[{"type":"integer"},{"type":"boolean"}]})";
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema, R"(42)"));
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema, R"(true)"));
+  CHECK_FALSE(Matches(*backend, StructuredOutputOptions::kJson, schema, R"("s")"));
+}
+
+// A nested anyOf (a property value that is a union of two types).
+TEST_CASE("JsonSchemaToGbnf: nested anyOf inside a property") {
+  auto backend = MakeBackend();
+  const std::string schema =
+      R"({"type":"object","properties":{)"
+      R"("x":{"anyOf":[{"type":"integer"},{"type":"string"}]}},)"
+      R"("required":["x"]})";
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema, R"({"x":5})"));
+  CHECK(Matches(*backend, StructuredOutputOptions::kJson, schema, R"({"x":"hi"})"));
+  CHECK_FALSE(Matches(*backend, StructuredOutputOptions::kJson, schema,
+                      R"({"x":true})"));
+}
+
 // An unsupported schema construct throws (loud, not silent mis-constraint).
 TEST_CASE("JsonSchemaToGbnf: unsupported constructs throw") {
-  CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"anyOf":[{"type":"string"}]})")));
+  CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"allOf":[{"type":"string"}]})")));
+  CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"not":{"type":"string"}})")));
   CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"$ref":"#/defs/x"})")));
   CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"type":"widget"})")));
+  // anyOf/oneOf must be a non-empty array.
+  CHECK_THROWS(JsonSchemaToGbnf(json::parse(R"({"anyOf":[]})")));
   // The native backend surfaces a schema that is not valid JSON as a throw.
   auto backend = MakeBackend();
   CHECK_THROWS(backend->compile_grammar(StructuredOutputOptions::kJson,

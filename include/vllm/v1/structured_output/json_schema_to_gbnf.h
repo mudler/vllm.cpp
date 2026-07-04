@@ -20,6 +20,11 @@
 //     generic any-array rule,
 //   - `enum` (an alternation of the JSON-serialized values),
 //   - `const` (the single JSON-serialized value),
+//   - `anyOf` / `oneOf` (top-level OR nested): a GBNF alternation of the
+//     sub-schemas — `root ::= (schemaA | schemaB | ...)`. Powers
+//     tool_choice=required over multiple tools. `oneOf`'s exclusivity is
+//     APPROXIMATED as a union (overlapping alternatives are both accepted);
+//     exact for the disjoint tool-call schemas it is used for,
 //   - string / number / integer / boolean / null primitives,
 //   - nested objects / arrays (recursive rule generation),
 //   - JSON inter-token whitespace flexibility (an optional-whitespace rule
@@ -38,8 +43,9 @@
 //     output remains valid.
 //   - string `pattern` / `format`, numeric `minimum` / `maximum` /
 //     `multipleOf`, array `minItems` / `maxItems` / tuple `items`, `$ref`,
-//     `anyOf` / `oneOf` / `allOf`, `not` are NOT constrained (ignored where
-//     harmless; a `$ref`/`false` schema throws). Documented, not silent.
+//     `allOf`, `not` are NOT constrained (ignored where harmless; a
+//     `$ref`/`allOf`/`not`/`false` schema throws). `anyOf`/`oneOf` ARE now
+//     lowered (see the supported subset above). Documented, not silent.
 #pragma once
 
 #include <string>

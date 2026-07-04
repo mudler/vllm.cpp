@@ -124,11 +124,35 @@ class Converter {
       return "value";
     }
     // Unsupported combinators: fail loud rather than mis-constrain.
-    for (const char* key : {"$ref", "anyOf", "oneOf", "allOf", "not"}) {
+    for (const char* key : {"$ref", "allOf", "not"}) {
       if (schema.contains(key)) {
         throw std::runtime_error(
             std::string("JsonSchemaToGbnf: unsupported schema keyword '") + key +
             "'");
+      }
+    }
+    // `anyOf` / `oneOf` -> a GBNF alternation of the sub-schemas (a natural GBNF
+    // fit: `( A | B | ... )`). Each alternative is lowered recursively (it
+    // registers its own rules) and combined with `|` inside a group. NOTE:
+    // `oneOf` ("exactly one matches") is APPROXIMATED as a union — when the
+    // sub-schemas overlap the grammar accepts a value matching more than one; for
+    // the DISJOINT schemas this powers (tool_choice=required over tools with
+    // distinct `name` consts) the union is exact. See json_schema_to_gbnf.h.
+    for (const char* key : {"anyOf", "oneOf"}) {
+      if (schema.contains(key)) {
+        const nlohmann::json& alts = schema[key];
+        if (!alts.is_array() || alts.empty()) {
+          throw std::runtime_error(std::string("JsonSchemaToGbnf: `") + key +
+                                   "` must be a non-empty array");
+        }
+        std::string body;
+        bool first = true;
+        for (const auto& sub : alts) {
+          if (!first) body += " | ";
+          first = false;
+          body += Visit(sub);
+        }
+        return "(" + body + ")";
       }
     }
     if (schema.contains("const")) {

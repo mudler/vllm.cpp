@@ -36,6 +36,7 @@
 
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -254,4 +255,66 @@ TEST_CASE("response_format json_schema constrains decoding end to end (native ba
   CHECK(runner.last_grammar_present);
   REQUIRE(runner.last_grammar_req_ids.size() == 1);
   CHECK(runner.last_grammar_req_ids[0] == "req0");
+}
+
+// M3.3 Task 4: a tool_choice=required forced tool-call schema flows the same
+// path (ApplyToolChoiceStructuredOutput -> structured_outputs.json -> Request ->
+// grammar_init -> constrained decode) and yields a live JSON grammar.
+TEST_CASE("tool_choice required forces a tool-call JSON grammar end to end (native backend)") {
+  using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
+  using vllm::entrypoints::openai::ChatCompletionToolsParam;
+  using vllm::entrypoints::openai::ChatMessage;
+  using vllm::entrypoints::openai::ToolChoice;
+
+  // A chat request with one tool + tool_choice="required".
+  ChatCompletionRequest req;
+  req.messages = {ChatMessage{"user", std::string("weather?")}};
+  ChatCompletionToolsParam tool;
+  tool.type = "function";
+  tool.function.name = "get_weather";
+  tool.function.parameters = json::parse(
+      R"({"type":"object","properties":{"city":{"type":"string"}},)"
+      R"("required":["city"]})");
+  req.tools = std::vector<ChatCompletionToolsParam>{tool};
+  req.tool_choice = ToolChoice{"required", std::nullopt};
+
+  // The forced tool-call schema flows onto the SamplingParams.
+  SamplingParams sp = req.to_sampling_params(/*default_max_tokens=*/16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->json.has_value());
+
+  // The engine, with a NATIVE-backed manager shared by scheduler + core.
+  StructuredOutputManager manager(
+      /*max_num_seqs=*/8, MakeNativeBackendFactory(Fixture(), VocabSize(),
+                                                   std::vector<int32_t>{kEos}));
+  auto scheduler = CreateScheduler(&manager);
+  RunnerStub runner;
+  Executor executor(runner);
+  EngineCore engine(*scheduler, executor, &manager);
+
+  std::vector<int32_t> prompt = {10, 11, 12, 13};
+  auto request = std::make_unique<Request>("tc0", prompt, sp,
+                                           /*arrival_time=*/0.0, Hasher());
+  engine.add_request(std::move(request));
+
+  // grammar_init compiled the forced tool-call schema into a live JSON grammar.
+  Request* r = scheduler->requests.at("tc0").get();
+  REQUIRE(r->structured_output_request.has_value());
+  REQUIRE(r->structured_output_request->grammar != nullptr);
+
+  // It is a JSON-object grammar: the opening '{' is allowed, a letter is not.
+  auto& grammar = *r->structured_output_request->grammar;
+  const int32_t open_brace = static_cast<int32_t>(kChars.find('{'));
+  const int32_t letter_a = static_cast<int32_t>(kChars.find('a'));
+  CHECK(grammar.validate_tokens({open_brace}) == std::vector<int32_t>{open_brace});
+  CHECK(grammar.validate_tokens({letter_a}).empty());
+
+  // EngineCore.step threads a NON-NULL GrammarOutput naming the req.
+  auto [outputs, model_executed] = engine.step();
+  (void)outputs;
+  CHECK(model_executed);
+  CHECK(runner.last_grammar_present);
+  REQUIRE(runner.last_grammar_req_ids.size() == 1);
+  CHECK(runner.last_grammar_req_ids[0] == "tc0");
 }

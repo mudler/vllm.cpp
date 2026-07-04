@@ -23,6 +23,31 @@ bool IsNamedToolChoice(const ChatCompletionRequest& request) {
   return request.tool_choice.has_value() &&
          request.tool_choice->mode == "function";
 }
+
+// _get_function_parameters (tool_parsers/structural_tag_registry.py:207): the
+// forced "arguments" constraint is the tool's `parameters` schema, or `true`
+// (any JSON) when it declares none. JSON-schema `true` lowers to `value` in
+// JsonSchemaToGbnf.
+nlohmann::json ToolArgumentsSchema(const FunctionDefinition& fn) {
+  if (fn.parameters.has_value()) return *fn.parameters;
+  return true;
+}
+
+// The per-tool forced object schema {"name": const <fn>, "arguments": <params>}
+// — the INNER content of a Hermes structural-tag tool call
+// (tool_parsers/structural_tag_registry.py:213-234), expressed as a JSON schema
+// JsonSchemaToGbnf can lower (const + object properties + required).
+nlohmann::json ToolCallObjectSchema(const ChatCompletionToolsParam& tool) {
+  nlohmann::json props = nlohmann::json::object();
+  props["name"] = nlohmann::json{{"const", tool.function.name}};
+  props["arguments"] = ToolArgumentsSchema(tool.function);
+  nlohmann::json schema = nlohmann::json::object();
+  schema["type"] = "object";
+  schema["properties"] = std::move(props);
+  schema["required"] = nlohmann::json::array({"name", "arguments"});
+  schema["additionalProperties"] = false;
+  return schema;
+}
 }  // namespace
 
 std::string DefaultChatPromptFallback(
@@ -53,6 +78,58 @@ bool ToolsEnabled(const ChatCompletionRequest& request) {
     return false;
   }
   return true;
+}
+
+std::optional<nlohmann::json> ToolChoiceForcedSchema(
+    const ChatCompletionRequest& request) {
+  // No tools, or tool_choice="none": nothing is forced.
+  if (!ToolsEnabled(request)) return std::nullopt;
+  if (!request.tools.has_value() || request.tools->empty()) return std::nullopt;
+  // Only "required" and the named ("function") form force a grammar. "auto" (and
+  // the tools-present default, tool_choice unset) let the model decide — no
+  // constraint (structural_tag_registry.py:109 returns None for non-strict auto).
+  if (!request.tool_choice.has_value()) return std::nullopt;
+
+  const std::vector<ChatCompletionToolsParam>& tools = *request.tools;
+  const ToolChoice& tc = *request.tool_choice;
+
+  if (tc.mode == "function") {
+    // The single named tool (validated to exist upstream, protocol.py:886-895).
+    const std::string name = tc.function_name.value_or("");
+    for (const ChatCompletionToolsParam& tool : tools) {
+      if (tool.function.name == name) return ToolCallObjectSchema(tool);
+    }
+    // A named choice matching no tool: leave unconstrained (upstream 400s at
+    // validation before this point).
+    return std::nullopt;
+  }
+
+  if (tc.mode == "required") {
+    // A tool call for ANY listed tool. One tool -> that tool's schema directly;
+    // multiple -> an anyOf alternation (structural_tag_registry.py:262-267 forces
+    // any of the tools' tags; JsonSchemaToGbnf lowers a top-level anyOf).
+    if (tools.size() == 1) return ToolCallObjectSchema(tools.front());
+    nlohmann::json any_of = nlohmann::json::array();
+    for (const ChatCompletionToolsParam& tool : tools) {
+      any_of.push_back(ToolCallObjectSchema(tool));
+    }
+    return nlohmann::json{{"anyOf", std::move(any_of)}};
+  }
+
+  return std::nullopt;  // "auto" / any other value.
+}
+
+void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
+                                     SamplingParams& sampling_params) {
+  const std::optional<nlohmann::json> forced = ToolChoiceForcedSchema(request);
+  if (!forced.has_value()) return;
+  // The forced tool-call schema IS the structured-output constraint (it replaces
+  // any response_format constraint — a forced tool call carries none in
+  // practice). structured_outputs then holds exactly `json` (one constraint).
+  StructuredOutputsParams so;
+  so.json = forced->dump();
+  sampling_params.structured_outputs = std::move(so);
+  sampling_params.structured_outputs->Verify();  // exactly-one-constraint check.
 }
 
 ShapedChatMessage ShapeChatMessage(
@@ -151,6 +228,12 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const bool named_tool_choice = IsNamedToolChoice(request);
 
   SamplingParams sampling_params = request.to_sampling_params();
+
+  // tool_choice=required / named FORCES a grammar (structured_outputs.json) so
+  // the constrained decode emits a valid tool call before add_request (upstream
+  // builds an xgrammar StructuralTag; chat_completion/serving.py ->
+  // tool_parsers/structural_tag_registry.py). auto/none: no-op.
+  ApplyToolChoiceStructuredOutput(request, sampling_params);
 
   // Single prompt → sub_request_id == request_id (chat_completion/serving.py:293).
   const std::string engine_request_id = request_id;

@@ -29,8 +29,11 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
+#include "vllm/sampling_params.h"
 #include "vllm/v1/engine/llm_engine.h"
 
 namespace vllm::entrypoints::openai {
@@ -91,6 +94,36 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            const std::string& delta_text,
                                            const ChatCompletionRequest& request,
                                            ToolParser* parser);
+
+// Ported from: vllm/entrypoints/openai/chat_completion/serving.py @ e24d1b24
+// (the tool_choice -> forced structured output; upstream builds an xgrammar
+// StructuralTag via tool_parsers/structural_tag_registry.py). The JSON schema an
+// emitted tool call MUST match when tool_choice FORCES one — the named
+// ("function") tool, or "required" (any listed tool). Returns nullopt for
+// "auto"/"none" / no tools (model decides / disabled).
+//
+// Shape mirrors the upstream Hermes structural tag's INNER tool-call content
+// (structural_tag_registry.py:213-234) `{"name": "<fn>", "arguments":
+// <fn.parameters>}`:
+//   named / one tool         -> {"type":"object",
+//                                "properties":{"name":{"const":"<fn>"},
+//                                              "arguments":<params|true>},
+//                                "required":["name","arguments"],
+//                                "additionalProperties":false}
+//   required, multiple tools -> {"anyOf":[<per-tool object schema>, ...]}
+// DEVIATION (§9): our structured_outputs.json constrains the tool-call JSON
+// OBJECT only, NOT the literal `<tool_call>...</tool_call>` wrapper the upstream
+// structural tag also forces (our GBNF json path cannot emit surrounding literal
+// text). The tool parser (Task 2/3) extracts the wrapped call from the output.
+std::optional<nlohmann::json> ToolChoiceForcedSchema(
+    const ChatCompletionRequest& request);
+
+// Apply ToolChoiceForcedSchema onto `sampling_params`: sets
+// structured_outputs.json = the forced schema (dumped) so the decode is
+// CONSTRAINED to a valid tool call. No-op for auto/none. Called in
+// create_chat_completion before add_request.
+void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
+                                     SamplingParams& sampling_params);
 
 class OpenAIServingChat {
  public:

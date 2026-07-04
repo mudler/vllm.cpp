@@ -861,3 +861,27 @@
   work; the CPU-side MVP is complete + hardware-validated, and gate #1 is the
   remaining, now-unblocked, measured target. NOTE: `~/venvs/vllm-oracle` needed
   `pip install ninja` (JIT) to run the baseline (fixed).
+- **2026-07-04 (★ M2.2b — FIRST MEASURED gate-#1 SPEEDUP on GB10: ~1000×→~66× ★)** —
+  `faafc36`+`63a1f8c`. Kept the NVFP4 weights (MoE experts + shared + lm_head, the
+  dominant ~22GB) fp4-RESIDENT on the GPU (raw packed+scales, uploaded once) instead
+  of the ~40-min CPU dequant to ~70GB bf16 host tensors, and wired the forward's
+  MoE/shared/lm_head matmuls to vt::MatmulNvfp4 (M2.2a's on-device dequant-GEMM).
+  Also fixed a real bug: LoadedEngine hardcoded a CPU queue (SelectQueue → CUDA when
+  a GPU is present — without this the forward silently ran the CPU dequant reference).
+  **VALIDATED ON REAL GB10:** test_qwen36_paged_engine PASSES on CUDA (45.5s, 16/16
+  token-for-token vs the M0-exit golden — the real 35B greedy through the fp4-resident
+  paged forward, correctness preserved). **MEASURED (vllm-bench, real 35B, 4×128×16):**
+  load ~40min→~37s (~65×), host RSS ~82GB→42GB, output 0.2→2.31 tok/s (~10×), total
+  20.88 tok/s. **Gate-#1 gap vs the vLLM baseline (153 out/1377 total) went from ~1000×
+  to ~66×** — the measured GPU-idle/CPU-dequant root cause is ELIMINATED (the biggest
+  single win). CPU ctest green (the change is CUDA-path; CPU keeps bf16). **THE
+  REMAINING ~66× (prioritized, from the new profile):** (1) per-op host↔device STAGING
+  — every DBuf still downloads to host after each matmul + the MoE gather/GDN/attn glue
+  run in host loops → keep the step's activations + KV on-device across the forward
+  (M2.x, the MRV2 staged-storage axis) + M2.5 CUDA-graph decode capture; (2) the naive
+  one-thread-per-output MatmulNvfp4 kernel → tiling/MMA (M2.2a perf follow-up); (3)
+  M2.2c FP8 attn/GDN weights on-device (still bf16-on-host). Each is a real GPU-kernel
+  effort but now measure-driven (the harness + baseline + the profile point the way).
+  ★ Gate #1 is no longer "unmeasured/blind" — it's an active, measured optimization
+  campaign with the first ~15× aggregate win (10× decode + 65× load) landed on real
+  hardware. ★

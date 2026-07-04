@@ -34,7 +34,6 @@ unsigned GridFor(int64_t n) {
 // (mirrors cuda_moe.cu; __float2bfloat16 is round-to-nearest-even, same as the
 // host F32ToBF16).
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
-__device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
 

@@ -148,6 +148,20 @@ class InputBatch {
   // array + the block-table rows. (Upstream InputBatch.condense.)
   void condense();
 
+  // swap_states(i1, i2): swap the two slots' per-slot state in place (the token
+  // prefix, num_* scalars, block-table rows, sampling params, and the per-req
+  // seed), fixing req_id_to_index. Mirrors gpu_input_batch.py::swap_states
+  // (@ e24d1b24) — the primitive the runner's decode-first reorder
+  // (reorder_batch_to_split_decodes_and_prefills, M1.8 Task 4) drives. Only the
+  // active token prefix (max active count of the two rows) is copied, exactly
+  // as upstream (copying full max_model_len rows is unnecessary during
+  // reordering). DEFERRED (T0 always empty/absent): is_token_ids /
+  // req_prompt_embeds / request_lora_mapping / num_accepted_tokens /
+  // bad_words_token_ids / allowed_token_ids_mask + the batch_update_builder.moved
+  // logitsprocs tracking. The membership *_reqs sets are keyed by req_id (not
+  // slot), so they need no swap.
+  void swap_states(int i1, int i2);
+
   // num_reqs (property): len(req_id_to_index).
   int num_reqs() const { return static_cast<int>(req_id_to_index.size()); }
 
@@ -216,6 +230,17 @@ class InputBatch {
   // Per-slot output token ids (nullopt on a freed slot). Consumed by the M1.7
   // sampler for penalties; mirrors upstream req_output_token_ids.
   std::vector<std::optional<std::vector<int32_t>>> req_output_token_ids;
+
+  // Per-slot RNG seed (nullopt = no per-request seed). Sourced from
+  // sampling_params.seed at add_request (upstream request.generator ==
+  // sampling_params.seed; gpu_input_batch.py:413-414). make_sampling_metadata
+  // emits it as SamplingMetadata.generators (req_index -> seed) so seeded random
+  // sampling is deterministic; a request without a seed uses the sampler's
+  // batch-default RNG (upstream NOTE at gpu_input_batch.py:251-252). This CLOSES
+  // the M1.7 sampling-state seed carry. min_p / min_tokens / logit_bias /
+  // allowed_token_ids / bad_words per-slot tracking stay DEFERRED (see
+  // make_sampling_metadata).
+  std::vector<std::optional<int64_t>> seeds;
 
   // Per-slot speculative token ids. DEFERRED: always empty at T0, kept so
   // _get_active_token_count / condense swap match upstream exactly.

@@ -126,6 +126,7 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len,
   frequency_penalties_cpu.assign(n, 0.0f);
   presence_penalties_cpu.assign(n, 0.0f);
   repetition_penalties_cpu.assign(n, 0.0f);
+  seeds.assign(n, std::nullopt);
 }
 
 int InputBatch::register_add_request() {
@@ -216,6 +217,9 @@ int InputBatch::add_request(const CachedRequestState& request) {
     repetition_penalties_reqs[req_id] = 1;
   }
 
+  // Per-request RNG seed (upstream request.generator == sampling_params.seed).
+  seeds[static_cast<size_t>(req_index)] = sp.seed;
+
   return req_index;
 }
 
@@ -294,15 +298,21 @@ SamplingMetadata InputBatch::make_sampling_metadata() const {
   md.spec_token_ids = std::vector<std::vector<int32_t>>(
       spec_token_ids.begin(), spec_token_ids.begin() + nn);
 
+  // generators (gpu_input_batch.py:921, sourced :413-414 from request.generator
+  // == sampling_params.seed): req_index -> seed for every seeded request in the
+  // dense prefix. WIRED at M1.8 Task 4 from the per-slot `seeds` array; requests
+  // without a seed are absent (they use the sampler's batch-default RNG,
+  // upstream NOTE :251-252). CLOSES the M1.7 seed carry.
+  for (int i = 0; i < n; ++i) {
+    if (seeds[static_cast<size_t>(i)].has_value()) {
+      md.generators[i] = static_cast<uint64_t>(*seeds[static_cast<size_t>(i)]);
+    }
+  }
+
   // ─── Fields whose InputBatch-side tracking is NOT yet landed (marked) ──────
   // Each is a faithful upstream default (empty/None) with its dependency cite;
   // wiring them requires per-slot state this InputBatch does not yet keep.
   //
-  //  * generators (gpu_input_batch.py:921, sourced :413-414 from
-  //    request.generator == sampling_params.seed): InputBatch keeps no per-req
-  //    generator/seed slot yet. Left empty; the seeded RNG + this map's
-  //    population is a Task-2 (random_sample) dependency. Type is present so
-  //    Task 2 can fill req_index -> seed.
   //  * max_num_logprobs (gpu_input_batch.py:922 / :1122, from the num_logprobs
   //    dict populated by sampling_params.logprobs): no num_logprobs tracking
   //    here — left None (no logprobs). Logprobs wiring is an M1.8 dependency.
@@ -333,6 +343,7 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   req_ids[static_cast<size_t>(req_index)] = std::nullopt;
   req_output_token_ids[static_cast<size_t>(req_index)] = std::nullopt;
   spec_token_ids[static_cast<size_t>(req_index)].clear();
+  seeds[static_cast<size_t>(req_index)] = std::nullopt;
   block_table.clear_row(req_index);
 
   // Discard from the sampling-predicate sets (LoRA / generators / logprobs /
@@ -435,6 +446,9 @@ void InputBatch::condense() {
         presence_penalties_cpu[static_cast<size_t>(last_req_index)];
     repetition_penalties_cpu[static_cast<size_t>(empty_index)] =
         repetition_penalties_cpu[static_cast<size_t>(last_req_index)];
+    seeds[static_cast<size_t>(empty_index)] =
+        seeds[static_cast<size_t>(last_req_index)];
+    seeds[static_cast<size_t>(last_req_index)] = std::nullopt;
 
     // Decrement last_req_index since it is now empty.
     --last_req_index;
@@ -449,6 +463,68 @@ void InputBatch::condense() {
   // reset), which is deferred to M1.7; reset it here so any trailing removed
   // indices (trimmed above) do not leak into the next step's bookkeeping.
   removed_tracker_ = RemovedTracker();
+}
+
+void InputBatch::swap_states(int i1, int i2) {
+  // Port of gpu_input_batch.py::swap_states (@ e24d1b24). See input_batch.h for
+  // the deferred (T0-empty) fields skipped here.
+  if (i1 == i2) {
+    return;
+  }
+  const std::optional<std::string> old_id_i1 = req_ids[static_cast<size_t>(i1)];
+  const std::optional<std::string> old_id_i2 = req_ids[static_cast<size_t>(i2)];
+
+  // Only swap the active token prefix (max active count of the two rows).
+  const int max_active = std::max(get_active_token_count(i1),
+                                  get_active_token_count(i2));
+
+  std::swap(req_ids[static_cast<size_t>(i1)], req_ids[static_cast<size_t>(i2)]);
+  std::swap(req_output_token_ids[static_cast<size_t>(i1)],
+            req_output_token_ids[static_cast<size_t>(i2)]);
+  std::swap(spec_token_ids[static_cast<size_t>(i1)],
+            spec_token_ids[static_cast<size_t>(i2)]);
+
+  if (old_id_i1.has_value()) {
+    req_id_to_index[*old_id_i1] = i2;
+  }
+  if (old_id_i2.has_value()) {
+    req_id_to_index[*old_id_i2] = i1;
+  }
+
+  std::swap(num_tokens_no_spec[static_cast<size_t>(i1)],
+            num_tokens_no_spec[static_cast<size_t>(i2)]);
+  std::swap(num_prompt_tokens[static_cast<size_t>(i1)],
+            num_prompt_tokens[static_cast<size_t>(i2)]);
+  std::swap(num_computed_tokens_cpu[static_cast<size_t>(i1)],
+            num_computed_tokens_cpu[static_cast<size_t>(i2)]);
+
+  // Swap the active token prefix of the two rows (upstream copies only
+  // max_active_token_count columns).
+  const size_t row1 =
+      static_cast<size_t>(i1) * static_cast<size_t>(max_model_len);
+  const size_t row2 =
+      static_cast<size_t>(i2) * static_cast<size_t>(max_model_len);
+  for (int c = 0; c < max_active; ++c) {
+    std::swap(token_ids_cpu[row1 + static_cast<size_t>(c)],
+              token_ids_cpu[row2 + static_cast<size_t>(c)]);
+  }
+
+  block_table.swap_row(i1, i2);
+
+  // Sampling params (autoregressive models; pooling DEFERRED).
+  std::swap(temperature_cpu[static_cast<size_t>(i1)],
+            temperature_cpu[static_cast<size_t>(i2)]);
+  std::swap(top_p_cpu[static_cast<size_t>(i1)],
+            top_p_cpu[static_cast<size_t>(i2)]);
+  std::swap(top_k_cpu[static_cast<size_t>(i1)],
+            top_k_cpu[static_cast<size_t>(i2)]);
+  std::swap(frequency_penalties_cpu[static_cast<size_t>(i1)],
+            frequency_penalties_cpu[static_cast<size_t>(i2)]);
+  std::swap(presence_penalties_cpu[static_cast<size_t>(i1)],
+            presence_penalties_cpu[static_cast<size_t>(i2)]);
+  std::swap(repetition_penalties_cpu[static_cast<size_t>(i1)],
+            repetition_penalties_cpu[static_cast<size_t>(i2)]);
+  std::swap(seeds[static_cast<size_t>(i1)], seeds[static_cast<size_t>(i2)]);
 }
 
 }  // namespace vllm::v1

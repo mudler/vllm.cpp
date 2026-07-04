@@ -2,23 +2,29 @@
 //
 // The ToolParser ABC + the ExtractedToolCallInformation result shape
 // (upstream: vllm/entrypoints/openai/engine/protocol.py:338) + the
-// ToolParserManager factory (get_tool_parser). T0 scope is the NON-STREAMING
-// extract_tool_calls path; the streaming method (extract_tool_calls_streaming)
-// is Task 3 and is only declared here as a marked stub.
+// ToolParserManager factory (get_tool_parser). Covers the NON-STREAMING
+// extract_tool_calls (Task 2) AND the STREAMING extract_tool_calls_streaming
+// (Task 3 — the stateful incremental parse).
 //
 // DEVIATIONS from upstream shape (all T0-scoped):
 //   - The upstream ToolParser.__init__ takes a tokenizer (+ tools). For the
-//     gate model's non-streaming Hermes path the tokenizer is NEVER read
-//     (it is only used for is_mistral_tokenizer detection and, in streaming,
-//     the vocab / special-token ids). We therefore give the ABC a default
-//     ctor and defer the tokenizer wiring to Task 3 (streaming).
+//     gate model's Hermes path the tokenizer is NEVER read (it is only used for
+//     is_mistral_tokenizer detection and, in the pythonic parsers, the vocab).
+//     We therefore give the ABC a default ctor and drop the tokenizer wiring.
+//   - The upstream streaming signature also takes the previous/current/delta
+//     TOKEN-ID spans (abstract_tool_parser.py:201-217). The Hermes streaming
+//     parse is TEXT-only (it never reads the token ids), so we drop those three
+//     params to keep the serving seam small — documented deviation.
 //   - ToolParserManager's lazy/plugin registry collapses to a small hand-wired
 //     get_tool_parser() factory over the two T0 formats.
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
 
@@ -50,8 +56,31 @@ class ToolParser {
       const std::string& model_output,
       const ChatCompletionRequest& request) = 0;
 
-  // TODO(M3.3 Task 3): extract_tool_calls_streaming (abstract_tool_parser.py:201)
-  // — the incremental streaming parse (DeltaToolCall chunks). Not ported here.
+  // Ported from: abstract_tool_parser.py:201 (extract_tool_calls_streaming). The
+  // INCREMENTAL streaming parse: given the accumulated `previous_text`, the new
+  // `current_text` (= previous_text + delta_text) and the `delta_text` fragment,
+  // return the DeltaMessage to emit (plain content before the first tool call,
+  // or one/more DeltaToolCall entries: the name-first chunk then argument
+  // deltas), or nullopt when there is nothing new to send yet. STATEFUL — the
+  // parser instance carries the per-request streaming state (prev_tool_call_arr,
+  // streamed_args_for_tool, …), so ONE parser must live for the whole stream.
+  // Default: NotImplementedError-equivalent (abstract_tool_parser.py:218).
+  virtual std::optional<DeltaMessage> extract_tool_calls_streaming(
+      const std::string& previous_text, const std::string& current_text,
+      const std::string& delta_text, const ChatCompletionRequest& request);
+
+ protected:
+  // Streaming state (abstract_tool_parser.py:78-92 __init__). Held per request.
+  //   prev_tool_call_arr: the tool call being parsed, one dict per index (we use
+  //     a JSON object per entry — keys "name"/"arguments" set as they arrive).
+  //   current_tool_id / current_tool_name_sent: the index of the tool currently
+  //     being streamed + whether its name was already emitted (unused by Hermes,
+  //     which tracks completion via prev_tool_call_arr; kept for shape fidelity).
+  //   streamed_args_for_tool: per-index, the argument text already sent.
+  std::vector<nlohmann::json> prev_tool_call_arr;
+  int current_tool_id = -1;
+  bool current_tool_name_sent = false;
+  std::vector<std::string> streamed_args_for_tool;
 };
 
 // Ported from: vllm/tool_parsers/abstract_tool_parser.py:235

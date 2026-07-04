@@ -5,11 +5,21 @@
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
 #include "vllm/entrypoints/openai/tool_parsers/qwen3.h"
 
 namespace vllm::entrypoints::openai {
+
+// abstract_tool_parser.py:218 — the base raises NotImplementedError; derived
+// streaming-capable parsers (Hermes) override this.
+std::optional<DeltaMessage> ToolParser::extract_tool_calls_streaming(
+    const std::string& /*previous_text*/, const std::string& /*current_text*/,
+    const std::string& /*delta_text*/, const ChatCompletionRequest& /*request*/) {
+  throw std::runtime_error(
+      "ToolParser::extract_tool_calls_streaming has not been implemented!");
+}
 
 std::string make_tool_call_id() {
   // Upstream: f"chatcmpl-tool-{random_uuid()}" with random_uuid() == the hex of

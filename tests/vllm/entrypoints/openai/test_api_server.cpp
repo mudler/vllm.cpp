@@ -288,7 +288,9 @@ const Tokenizer& Fixture() {
 }
 
 // In-vocab chat prompt seam (the fixture vocab is ids 0..21).
-std::string InVocabChatPrompt(const std::vector<ChatMessage>& messages, bool) {
+std::string InVocabChatPrompt(
+    const std::vector<ChatMessage>& messages, bool,
+    const std::vector<vllm::entrypoints::openai::ChatCompletionToolsParam>&) {
   std::string p;
   for (const ChatMessage& m : messages)
     if (m.content.has_value()) p += *m.content;

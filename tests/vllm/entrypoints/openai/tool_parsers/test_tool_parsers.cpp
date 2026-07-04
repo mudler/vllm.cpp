@@ -132,6 +132,120 @@ TEST_CASE("Qwen3: gate-model Hermes format parses") {
   CHECK(info.tool_calls[0].function.arguments == "{\"q\":\"cats\"}");
 }
 
+// ─── Streaming (extract_tool_calls_streaming) — Task 3 ───────────────────────
+
+namespace {
+// Drive the stateful streaming parser over a sequence of delta fragments,
+// accumulating previous/current text exactly as serving_chat does. Returns the
+// emitted DeltaMessages (nullopt deltas are dropped, matching serving).
+std::vector<DeltaMessage> DriveStream(HermesToolParser& parser,
+                                      const std::vector<std::string>& deltas) {
+  std::vector<DeltaMessage> out;
+  std::string previous;
+  ChatCompletionRequest req;
+  for (const std::string& delta : deltas) {
+    const std::string current = previous + delta;
+    auto dm = parser.extract_tool_calls_streaming(previous, current, delta, req);
+    previous = current;
+    if (dm.has_value()) out.push_back(std::move(*dm));
+  }
+  return out;
+}
+}  // namespace
+
+// (h) A tool call streamed fragment-by-fragment: name-first DeltaToolCall (with
+//     index+id+function.name), then function.arguments diffs; args concatenate
+//     to the complete JSON argument object.
+TEST_CASE("Hermes streaming: name-first then argument deltas") {
+  HermesToolParser parser;
+  // Fragment the canonical Hermes block across several deltas.
+  const std::vector<std::string> deltas = {
+      "<tool_call>",  "{\"name\": \"get_",  "weather\", ",
+      "\"arguments\": {\"ci", "ty\": \"Par", "is\"}}", "</tool_call>"};
+  const std::vector<DeltaMessage> msgs = DriveStream(parser, deltas);
+
+  // Collect the tool-call deltas across all emitted messages.
+  std::optional<std::string> id;
+  std::optional<std::string> name;
+  std::string args;
+  int name_deltas = 0;
+  for (const DeltaMessage& m : msgs) {
+    CHECK_FALSE(m.content.has_value());  // no leading content
+    if (!m.tool_calls.has_value()) continue;
+    for (const DeltaToolCall& tc : *m.tool_calls) {
+      CHECK(tc.index == 0);
+      if (tc.function.name.has_value()) {
+        ++name_deltas;
+        name = tc.function.name;
+        id = tc.id;
+        CHECK(tc.type.has_value());
+        CHECK(*tc.type == "function");
+      }
+      if (tc.function.arguments.has_value()) args += *tc.function.arguments;
+    }
+  }
+  // The name is emitted exactly once, with an id.
+  CHECK(name_deltas == 1);
+  REQUIRE(name.has_value());
+  CHECK(*name == "get_weather");
+  REQUIRE(id.has_value());
+  CHECK(id->rfind("chatcmpl-tool-", 0) == 0);
+  // The argument diffs concatenate to the complete arguments object.
+  CHECK(args == "{\"city\": \"Paris\"}");
+}
+
+// (i) Leading content before the tool call is streamed as content deltas.
+TEST_CASE("Hermes streaming: leading content then tool call") {
+  HermesToolParser parser;
+  const std::vector<std::string> deltas = {
+      "Let me ", "check.\n", "<tool_call>",
+      "{\"name\": \"f\", \"arguments\": {\"x\": 1}}", "</tool_call>"};
+  const std::vector<DeltaMessage> msgs = DriveStream(parser, deltas);
+
+  std::string content;
+  bool saw_tool = false;
+  for (const DeltaMessage& m : msgs) {
+    if (m.content.has_value()) content += *m.content;
+    if (m.tool_calls.has_value() && !m.tool_calls->empty()) saw_tool = true;
+  }
+  CHECK(content == "Let me check.\n");
+  CHECK(saw_tool);
+}
+
+// (j) Two sequential tool calls stream with the index incrementing.
+TEST_CASE("Hermes streaming: two tool calls increment the index") {
+  HermesToolParser parser;
+  const std::vector<std::string> deltas = {
+      "<tool_call>{\"name\": \"a\", \"arguments\": {\"x\": 1}}</tool_call>",
+      "<tool_call>{\"name\": \"b\", \"arguments\": {\"y\": 2}}</tool_call>"};
+  const std::vector<DeltaMessage> msgs = DriveStream(parser, deltas);
+
+  std::vector<int> name_indices;
+  for (const DeltaMessage& m : msgs) {
+    if (!m.tool_calls.has_value()) continue;
+    for (const DeltaToolCall& tc : *m.tool_calls) {
+      if (tc.function.name.has_value()) name_indices.push_back(tc.index);
+    }
+  }
+  REQUIRE(name_indices.size() == 2);
+  CHECK(name_indices[0] == 0);
+  CHECK(name_indices[1] == 1);
+}
+
+// (k) Plain content with no tool call streams straight through as content.
+TEST_CASE("Hermes streaming: plain content passes through") {
+  HermesToolParser parser;
+  const std::vector<std::string> deltas = {"The ", "weather ", "is sunny."};
+  const std::vector<DeltaMessage> msgs = DriveStream(parser, deltas);
+
+  std::string content;
+  for (const DeltaMessage& m : msgs) {
+    CHECK_FALSE(m.tool_calls.has_value());
+    if (m.content.has_value()) content += *m.content;
+  }
+  CHECK(content == "The weather is sunny.");
+}
+
 // (g) The factory returns the right parser by name.
 TEST_CASE("Factory: get_tool_parser by name") {
   auto hermes = get_tool_parser("hermes");

@@ -27,13 +27,23 @@ constexpr bool kLstripBlocks = true;
 
 // ─── Runtime value ───────────────────────────────────────────────────────────
 struct Value {
-  enum class Kind { kUndefined, kNull, kBool, kInt, kString, kList, kObject };
+  enum class Kind {
+    kUndefined,
+    kNull,
+    kBool,
+    kInt,
+    kString,
+    kList,
+    kObject,
+    kJson  // opaque JSON subtree (tool schemas); rendered via `| tojson`.
+  };
   Kind kind = Kind::kUndefined;
   bool b = false;
   long long i = 0;
   std::string s;
   std::shared_ptr<std::vector<Value>> list;
   std::shared_ptr<std::map<std::string, Value>> obj;
+  std::shared_ptr<nlohmann::json> json;
 
   static Value Undefined() { return Value{}; }
   static Value Null() {
@@ -71,6 +81,12 @@ struct Value {
     v.obj = std::make_shared<std::map<std::string, Value>>(std::move(x));
     return v;
   }
+  static Value Json(nlohmann::json x) {
+    Value v;
+    v.kind = Kind::kJson;
+    v.json = std::make_shared<nlohmann::json>(std::move(x));
+    return v;
+  }
 };
 
 bool Truthy(const Value& v) {
@@ -88,6 +104,12 @@ bool Truthy(const Value& v) {
       return !v.list->empty();
     case Value::Kind::kObject:
       return true;
+    case Value::Kind::kJson:
+      // Python truthiness of the JSON value (null/empty container → false).
+      return !v.json->is_null() &&
+             !((v.json->is_object() || v.json->is_array() ||
+                v.json->is_string()) &&
+               v.json->empty());
   }
   return false;
 }
@@ -138,7 +160,7 @@ std::string LineCol(const std::string& src, std::size_t pos) {
 struct Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 struct Expr {
-  enum class K { kLit, kVar, kMember, kIndex, kBin, kUnary, kMethod };
+  enum class K { kLit, kVar, kMember, kIndex, kBin, kUnary, kMethod, kFilter };
   K k;
   Value lit;                    // kLit
   std::string name;             // kVar / kMember(name) / kMethod(name) / kBin,kUnary(op)
@@ -403,7 +425,26 @@ class ExprParser {
         m->b = idx;
         e = m;
       } else if (IsOp("|")) {
-        Fail("Jinja filters ('|') are not supported (minja-subset) at " + where_);
+        // Jinja filter. Only `tojson` is supported (M3.3 tool rendering); any
+        // other filter is a loud error, as before.
+        Advance();
+        if (cur_.t != ETok::T::kName) {
+          Fail("expected filter name after '|' at " + where_);
+        }
+        const std::string fname = cur_.s;
+        Advance();
+        if (IsOp("(")) {
+          Fail("filter arguments are not supported (minja-subset) at " + where_);
+        }
+        if (fname != "tojson") {
+          Fail("filter '|" + fname +
+               "' is not supported (minja-subset) at " + where_);
+        }
+        auto m = std::make_shared<Expr>();
+        m->k = Expr::K::kFilter;
+        m->a = e;
+        m->name = fname;
+        e = m;
       } else if (IsOp("(")) {
         Fail("function calls are not supported (minja-subset) at " + where_);
       } else {
@@ -793,10 +834,54 @@ using Env = std::map<std::string, Value>;
 
 Value Eval(const ExprPtr& e, Env& env, const std::string& where);
 
+// Wrap a JSON node as a Value: scalars become native Values (so string compares
+// / truthiness work); containers stay opaque kJson (rendered via `| tojson`).
+Value JsonToValue(const nlohmann::json& j) {
+  if (j.is_null()) return Value::Null();
+  if (j.is_boolean()) return Value::Bool(j.get<bool>());
+  if (j.is_number_integer() || j.is_number_unsigned()) {
+    return Value::Int(j.get<long long>());
+  }
+  if (j.is_string()) return Value::Str(j.get<std::string>());
+  return Value::Json(j);  // float / object / array
+}
+
+// Convert a Value back to JSON for the `tojson` filter.
+nlohmann::json ValueToJson(const Value& v, const std::string& where) {
+  switch (v.kind) {
+    case Value::Kind::kUndefined:
+    case Value::Kind::kNull:
+      return nullptr;
+    case Value::Kind::kBool:
+      return v.b;
+    case Value::Kind::kInt:
+      return v.i;
+    case Value::Kind::kString:
+      return v.s;
+    case Value::Kind::kJson:
+      return *v.json;
+    case Value::Kind::kList: {
+      nlohmann::json arr = nlohmann::json::array();
+      for (const Value& item : *v.list) arr.push_back(ValueToJson(item, where));
+      return arr;
+    }
+    case Value::Kind::kObject: {
+      nlohmann::json o = nlohmann::json::object();
+      for (const auto& [k, val] : *v.obj) o[k] = ValueToJson(val, where);
+      return o;
+    }
+  }
+  Fail("cannot serialize value at " + where);
+}
+
 Value EvalMember(const Value& obj, const std::string& name) {
   if (obj.kind == Value::Kind::kObject) {
     auto it = obj.obj->find(name);
     if (it != obj.obj->end()) return it->second;
+  }
+  if (obj.kind == Value::Kind::kJson && obj.json->is_object()) {
+    auto it = obj.json->find(name);
+    if (it != obj.json->end()) return JsonToValue(*it);
   }
   return Value::Undefined();
 }
@@ -937,6 +1022,15 @@ Value Eval(const ExprPtr& e, Env& env, const std::string& where) {
       }
       Fail("unsupported method '." + e->name + "()' (minja-subset) at " + where);
     }
+    case Expr::K::kFilter: {
+      Value a = Eval(e->a, env, where);
+      if (e->name == "tojson") {
+        // Jinja `tojson`: serialize the value to a compact JSON string
+        // (ensure_ascii=False equivalent — nlohmann emits UTF-8 directly).
+        return Value::Str(ValueToJson(a, where).dump());
+      }
+      Fail("unsupported filter '|" + e->name + "' (minja-subset) at " + where);
+    }
   }
   Fail("internal: bad expr node");
 }
@@ -1019,11 +1113,28 @@ void Exec(const std::vector<StmtPtr>& body, Env& env, std::string& out,
 }  // namespace
 
 // ─── Public API ──────────────────────────────────────────────────────────────
-std::string apply_chat_template(const std::string& template_str,
-                                const std::vector<openai::ChatMessage>& messages,
-                                bool add_generation_prompt,
-                                const std::string& bos_token,
-                                const std::string& eos_token) {
+namespace {
+// Rebuild the OpenAI tool JSON object the request carried, so `{{ tool | tojson
+// }}` renders exactly what transformers' apply_chat_template(tools=...) sees:
+//   {"type": <t>, "function": {"name": .., "description"?: .., "parameters"?: ..}}
+nlohmann::json ToolToJson(const openai::ChatCompletionToolsParam& t) {
+  nlohmann::json fn = nlohmann::json::object();
+  fn["name"] = t.function.name;
+  if (t.function.description.has_value()) {
+    fn["description"] = *t.function.description;
+  }
+  if (t.function.parameters.has_value()) {
+    fn["parameters"] = *t.function.parameters;
+  }
+  return nlohmann::json{{"type", t.type}, {"function", std::move(fn)}};
+}
+}  // namespace
+
+std::string apply_chat_template(
+    const std::string& template_str,
+    const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
+    const std::string& bos_token, const std::string& eos_token,
+    const std::vector<openai::ChatCompletionToolsParam>& tools) {
   // Parse.
   std::vector<Tok> toks = Lex(template_str);
   StmtParser parser(std::move(toks), template_str);
@@ -1044,6 +1155,15 @@ std::string apply_chat_template(const std::string& template_str,
   env["add_generation_prompt"] = Value::Bool(add_generation_prompt);
   env["bos_token"] = Value::Str(bos_token);
   env["eos_token"] = Value::Str(eos_token);
+  // `tools` — a list of opaque JSON tool objects for the template's tool branch
+  // (`{% if tools %}` / `{% for tool in tools %}{{ tool | tojson }}`). Empty list
+  // when no tools (falsy), matching transformers passing tools=None.
+  std::vector<Value> tool_values;
+  tool_values.reserve(tools.size());
+  for (const openai::ChatCompletionToolsParam& t : tools) {
+    tool_values.push_back(Value::Json(ToolToJson(t)));
+  }
+  env["tools"] = Value::List(std::move(tool_values));
 
   std::string out;
   Exec(program, env, out, "<template>");
@@ -1056,8 +1176,10 @@ openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
   return [tmpl = std::move(template_str), bos = std::move(bos_token),
           eos = std::move(eos_token)](
              const std::vector<openai::ChatMessage>& messages,
-             bool add_generation_prompt) {
-    return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos);
+             bool add_generation_prompt,
+             const std::vector<openai::ChatCompletionToolsParam>& tools) {
+    return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos,
+                               tools);
   };
 }
 

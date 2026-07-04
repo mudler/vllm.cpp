@@ -2,11 +2,12 @@
 //
 // Hermes2ProToolParser — the `<tool_call>{json}</tool_call>` format. This is
 // the format the gate model Qwen3.6-35B (qwen35moe) emits (docs/features/
-// tool_calling.md:317 maps Qwen non-Coder models to `hermes`). Only the
-// NON-STREAMING extract_tool_calls is ported here (Task 2); the streaming
-// method + adjust_request are Task 3.
+// tool_calling.md:317 maps Qwen non-Coder models to `hermes`). Ports both the
+// NON-STREAMING extract_tool_calls (Task 2) and the STREAMING incremental parse
+// extract_tool_calls_streaming (Task 3).
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "vllm/entrypoints/openai/protocol.h"
@@ -23,9 +24,21 @@ class HermesToolParser : public ToolParser {
       const std::string& model_output,
       const ChatCompletionRequest& request) override;
 
+  // hermes_tool_parser.py:204 (extract_tool_calls_streaming). Re-parses the full
+  // current_text each call, diffing against the sent state to emit only new
+  // content / tool names / argument fragments.
+  std::optional<DeltaMessage> extract_tool_calls_streaming(
+      const std::string& previous_text, const std::string& current_text,
+      const std::string& delta_text,
+      const ChatCompletionRequest& request) override;
+
   // hermes_tool_parser.py:36-37 — the tool-call marker tokens.
   static constexpr const char* kToolCallStartToken = "<tool_call>";
   static constexpr const char* kToolCallEndToken = "</tool_call>";
+
+ private:
+  // hermes_tool_parser.py:57 — how much non-tool-call content has been sent.
+  std::size_t sent_content_idx_ = 0;
 };
 
 }  // namespace vllm::entrypoints::openai

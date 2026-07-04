@@ -17,12 +17,15 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 
 using vllm::entrypoints::apply_chat_template;
 using vllm::entrypoints::ChatTemplateError;
 using vllm::entrypoints::MakeChatTemplatePromptFn;
+using vllm::entrypoints::openai::ChatCompletionToolsParam;
 using vllm::entrypoints::openai::ChatMessage;
 
 namespace {
@@ -91,7 +94,8 @@ TEST_CASE("chat_template: MakeChatTemplatePromptFn adapts to the ChatPromptFn se
       "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
       "<|im_start|>user\nHello, who are you?<|im_end|>\n"
       "<|im_start|>assistant\n";
-  CHECK(fn(SystemUser(), /*add_generation_prompt=*/true) == expected);
+  CHECK(fn(SystemUser(), /*add_generation_prompt=*/true, /*tools=*/{}) ==
+        expected);
 }
 
 // ─── (a) interpolation + `+` concat ──────────────────────────────────────────
@@ -170,4 +174,72 @@ TEST_CASE("chat_template: unsupported constructs throw ChatTemplateError") {
   // Unbalanced endfor.
   CHECK_THROWS_AS(apply_chat_template("{% endfor %}", {}, false),
                   ChatTemplateError);
+}
+
+// ─── M3.3 Task 3: tools rendered into the prompt via the tool branch ─────────
+namespace {
+// A minja-subset tool template mirroring the Qwen3.6/Hermes tool-system-prompt
+// shape (the full qwen35.jinja tool branch uses namespace/macros/is-tests/`[::-1]`
+// slicing beyond the subset; this reproduces its tool-schema injection using the
+// constructs the engine supports + the M3.3 `tojson` filter).
+const char* kToolTemplate =
+    "{%- if tools %}"
+    "<|im_start|>system\n# Tools\n<tools>"
+    "{%- for tool in tools %}\n{{ tool | tojson }}{%- endfor %}"
+    "\n</tools><|im_end|>\n"
+    "{%- endif %}"
+    "{%- for message in messages %}"
+    "<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n"
+    "{%- endfor %}";
+
+std::vector<ChatCompletionToolsParam> WeatherTool() {
+  ChatCompletionToolsParam t;
+  t.type = "function";
+  t.function.name = "get_weather";
+  t.function.description = "Get the weather for a city.";
+  t.function.parameters = nlohmann::json::parse(
+      R"({"type":"object","properties":{"city":{"type":"string"}}})");
+  return {t};
+}
+}  // namespace
+
+TEST_CASE("chat_template: tools render the function schemas into the prompt") {
+  const std::vector<ChatMessage> msgs = {
+      ChatMessage{"user", std::string("weather?")}};
+  const std::string out = apply_chat_template(
+      kToolTemplate, msgs, /*add_generation_prompt=*/false, /*bos=*/"",
+      /*eos=*/"", WeatherTool());
+
+  // The tool system prompt + the schema JSON (name/description/parameters) are
+  // present, and the user turn follows.
+  CHECK(out.find("# Tools") != std::string::npos);
+  CHECK(out.find("<tools>") != std::string::npos);
+  CHECK(out.find("\"name\":\"get_weather\"") != std::string::npos);
+  CHECK(out.find("\"description\":\"Get the weather for a city.\"") !=
+        std::string::npos);
+  CHECK(out.find("\"parameters\"") != std::string::npos);
+  CHECK(out.find("\"type\":\"function\"") != std::string::npos);
+  CHECK(out.find("<|im_start|>user\nweather?<|im_end|>") != std::string::npos);
+}
+
+TEST_CASE("chat_template: no tools leaves the tool branch out (falsy tools)") {
+  const std::vector<ChatMessage> msgs = {
+      ChatMessage{"user", std::string("hi")}};
+  const std::string out =
+      apply_chat_template(kToolTemplate, msgs, /*add_generation_prompt=*/false);
+  CHECK(out.find("# Tools") == std::string::npos);
+  // The `{%- endfor %}` left-trim drops the loop body's trailing newline.
+  CHECK(out == "<|im_start|>user\nhi<|im_end|>");
+}
+
+// `tojson` serializes a nested tool schema faithfully.
+TEST_CASE("chat_template: tojson filter serializes the tool object") {
+  const std::string out =
+      apply_chat_template("{{ tools[0] | tojson }}", {}, false, "", "",
+                          WeatherTool());
+  const nlohmann::json j = nlohmann::json::parse(out);
+  CHECK(j.at("type") == "function");
+  CHECK(j.at("function").at("name") == "get_weather");
+  CHECK(j.at("function").at("parameters").at("properties").at("city").at("type") ==
+        "string");
 }

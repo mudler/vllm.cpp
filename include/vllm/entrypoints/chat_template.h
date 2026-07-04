@@ -61,11 +61,17 @@ class ChatTemplateError : public std::runtime_error {
 //   add_generation_prompt appends the assistant generation header when the
 //                         template gates on it (Qwen: `<|im_start|>assistant\n`)
 //   bos_token / eos_token exposed to the template as `bos_token` / `eos_token`
+//   tools                 the available function schemas, exposed to the template
+//                         as `tools` (a list of the OpenAI tool JSON objects) for
+//                         the `{% if tools %}...{{ tool | tojson }}...{% endif %}`
+//                         branch. Empty => the `tools` variable is an empty list
+//                         (falsy). Requires the `tojson` filter (M3.3 minja ext).
 // Throws ChatTemplateError on any unsupported construct or evaluation error.
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
-    const std::string& bos_token = "", const std::string& eos_token = "");
+    const std::string& bos_token = "", const std::string& eos_token = "",
+    const std::vector<openai::ChatCompletionToolsParam>& tools = {});
 
 // Adapt a chat template to Task 2's ChatPromptFn seam (serving_chat.h). The
 // returned callable renders `template_str` for the messages + generation flag it

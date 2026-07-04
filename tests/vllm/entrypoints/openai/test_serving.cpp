@@ -9,6 +9,8 @@
 // serving.py @ e24d1b24.
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
+#include "vllm/entrypoints/openai/tool_parsers/abstract.h"
+#include "vllm/entrypoints/openai/tool_parsers/hermes.h"
 
 #include <doctest/doctest.h>
 
@@ -48,13 +50,25 @@ using vllm::Qwen3_5MoeWeights;
 using vllm::SamplingParams;
 using vllm::SchedulerConfig;
 using vllm::entrypoints::openai::ChatCompletionRequest;
+using vllm::entrypoints::openai::ChatCompletionResponseChoice;
+using vllm::entrypoints::openai::ChatCompletionResponseStreamChoice;
 using vllm::entrypoints::openai::ChatCompletionResult;
+using vllm::entrypoints::openai::ChatCompletionToolsParam;
 using vllm::entrypoints::openai::ChatMessage;
 using vllm::entrypoints::openai::CompletionRequest;
 using vllm::entrypoints::openai::CompletionResult;
 using vllm::entrypoints::openai::DefaultChatPromptFallback;
+using vllm::entrypoints::openai::DeltaMessage;
+using vllm::entrypoints::openai::get_tool_parser;
+using vllm::entrypoints::openai::HermesToolParser;
 using vllm::entrypoints::openai::OpenAIServingChat;
 using vllm::entrypoints::openai::OpenAIServingCompletion;
+using vllm::entrypoints::openai::ShapeChatDelta;
+using vllm::entrypoints::openai::ShapeChatMessage;
+using vllm::entrypoints::openai::ShapedChatMessage;
+using vllm::entrypoints::openai::ToolChoice;
+using vllm::entrypoints::openai::ToolParser;
+using vllm::entrypoints::openai::ToolsEnabled;
 using vllm::tok::Tokenizer;
 using vllm::v1::EngineCore;
 using vllm::v1::Executor;
@@ -476,7 +490,9 @@ namespace {
 // In-vocab prompt seam for the engine-driven chat tests (the fixture vocab is
 // ids 0..23; a "role: content" join contains out-of-vocab bytes). Task 3's real
 // template renderer replaces this — here it stands in as the injected seam.
-std::string InVocabChatPrompt(const std::vector<ChatMessage>& messages, bool) {
+std::string InVocabChatPrompt(
+    const std::vector<ChatMessage>& messages, bool,
+    const std::vector<ChatCompletionToolsParam>&) {
   std::string p;
   for (const ChatMessage& m : messages) {
     if (m.content.has_value()) p += *m.content;
@@ -579,4 +595,213 @@ TEST_CASE("serving_chat: stream cadence is role delta, content deltas, finish, D
   CHECK(streamed == full_content);
   REQUIRE(last_finish.has_value());
   CHECK(*last_finish == "length");
+}
+
+// ─── M3.3 Task 3: tool-call serving wiring ───────────────────────────────────
+namespace {
+// A request carrying one tool (get_weather) with tool_choice defaulting to auto.
+ChatCompletionRequest ToolRequest(bool stream = false) {
+  ChatCompletionRequest r;
+  r.messages = {ChatMessage{"user", std::string("weather in Paris?")}};
+  r.stream = stream;
+  ChatCompletionToolsParam tool;
+  tool.type = "function";
+  tool.function.name = "get_weather";
+  tool.function.description = "Get the weather for a city.";
+  tool.function.parameters = nlohmann::json::parse(
+      R"({"type":"object","properties":{"city":{"type":"string"}},)"
+      R"("required":["city"]})");
+  r.tools = std::vector<ChatCompletionToolsParam>{tool};
+  return r;
+}
+}  // namespace
+
+// ─── (a) NON-STREAM tool call: a forced <tool_call> output → the response
+//     message carries tool_calls + finish_reason="tool_calls" ──────────────────
+TEST_CASE("serving_chat: non-stream tool call shapes tool_calls + finish_reason") {
+  const ChatCompletionRequest req = ToolRequest();
+  REQUIRE(ToolsEnabled(req));
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  REQUIRE(parser != nullptr);
+
+  // Mocked model output (the synthetic engine can't emit a real tool call).
+  const std::string model_output =
+      "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": "
+      "\"Paris\"}}\n</tool_call>";
+  ShapedChatMessage shaped =
+      ShapeChatMessage("assistant", model_output, std::string("stop"), req,
+                       parser.get());
+
+  CHECK(shaped.message.role == "assistant");
+  REQUIRE(shaped.message.tool_calls.has_value());
+  REQUIRE(shaped.message.tool_calls->size() == 1);
+  const auto& tc = (*shaped.message.tool_calls)[0];
+  CHECK(tc.type == "function");
+  CHECK(tc.function.name == "get_weather");
+  CHECK(tc.function.arguments == "{\"city\":\"Paris\"}");
+  CHECK(tc.id.rfind("chatcmpl-tool-", 0) == 0);
+  // No leading content before the tool call.
+  CHECK_FALSE(shaped.message.content.has_value());
+  REQUIRE(shaped.finish_reason.has_value());
+  CHECK(*shaped.finish_reason == "tool_calls");
+
+  // The serialized OpenAI response omits content(null)/keeps tool_calls.
+  ChatCompletionResponseChoice choice;
+  choice.message = shaped.message;
+  choice.finish_reason = shaped.finish_reason;
+  json j = choice;
+  CHECK(j.at("finish_reason") == "tool_calls");
+  CHECK(j.at("message").at("content").is_null());
+  REQUIRE(j.at("message").contains("tool_calls"));
+  CHECK(j.at("message").at("tool_calls").at(0).at("function").at("name") ==
+        "get_weather");
+}
+
+// ─── (a2) Leading content before the tool call is preserved on the message ────
+TEST_CASE("serving_chat: non-stream tool call keeps leading content") {
+  const ChatCompletionRequest req = ToolRequest();
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  const std::string model_output =
+      "Let me check.\n<tool_call>{\"name\": \"get_weather\", \"arguments\": "
+      "{\"city\": \"Paris\"}}</tool_call>";
+  ShapedChatMessage shaped = ShapeChatMessage(
+      "assistant", model_output, std::string("stop"), req, parser.get());
+  REQUIRE(shaped.message.content.has_value());
+  CHECK(*shaped.message.content == "Let me check.\n");
+  REQUIRE(shaped.message.tool_calls.has_value());
+  CHECK((*shaped.message.tool_calls)[0].function.name == "get_weather");
+  CHECK(*shaped.finish_reason == "tool_calls");
+}
+
+// ─── (e) content-only (tools present but no <tool_call>) → normal message ─────
+TEST_CASE("serving_chat: non-stream content-only with tools is a normal message") {
+  const ChatCompletionRequest req = ToolRequest();
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  const std::string model_output = "The weather in Paris is sunny.";
+  ShapedChatMessage shaped = ShapeChatMessage(
+      "assistant", model_output, std::string("length"), req, parser.get());
+  REQUIRE(shaped.message.content.has_value());
+  CHECK(*shaped.message.content == model_output);
+  CHECK_FALSE(shaped.message.tool_calls.has_value());
+  CHECK(*shaped.finish_reason == "length");  // passthrough, not "tool_calls"
+}
+
+// ─── tool_choice="none" disables extraction (backward compat) ────────────────
+TEST_CASE("serving_chat: tool_choice none disables tool extraction") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tool_choice = ToolChoice{"none", std::nullopt};
+  CHECK_FALSE(ToolsEnabled(req));
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  const std::string model_output =
+      "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}</tool_call>";
+  ShapedChatMessage shaped = ShapeChatMessage(
+      "assistant", model_output, std::string("stop"), req, parser.get());
+  // With tools disabled the <tool_call> text is passed through as content.
+  CHECK_FALSE(shaped.message.tool_calls.has_value());
+  REQUIRE(shaped.message.content.has_value());
+  CHECK(*shaped.message.content == model_output);
+  CHECK(*shaped.finish_reason == "stop");
+}
+
+// ─── (b/d) STREAM tool call: the delta sequence carries tool_calls[index=0,
+//     id, function.name] first, then function.arguments deltas ────────────────
+TEST_CASE("serving_chat: streaming tool call emits name-first then arg deltas") {
+  const ChatCompletionRequest req = ToolRequest(/*stream=*/true);
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+
+  // The model output arrives fragmented across deltas (what the engine streams).
+  const std::vector<std::string> deltas = {
+      "<tool_call>", "{\"name\": \"get_weather\", ",
+      "\"arguments\": {\"city\": ", "\"Paris\"}}", "</tool_call>"};
+
+  // Drive ShapeChatDelta exactly as serving_chat's streaming loop does, then
+  // serialize each emitted DeltaMessage into a chat.completion.chunk.
+  std::string previous;
+  bool tools_streamed = false;
+  std::optional<std::string> streamed_id;
+  std::optional<std::string> streamed_name;
+  std::string streamed_args;
+  int name_chunks = 0;
+  for (const std::string& delta : deltas) {
+    const std::string current = previous + delta;
+    std::optional<DeltaMessage> dm =
+        ShapeChatDelta(previous, current, delta, req, parser.get());
+    previous = current;
+    if (!dm.has_value()) continue;
+    if (dm->tool_calls.has_value() && !dm->tool_calls->empty()) {
+      tools_streamed = true;
+    }
+    // Serialize as the stream chunk (the same DeltaMessage the SSE carries).
+    ChatCompletionResponseStreamChoice choice;
+    choice.delta = *dm;
+    json jc = choice;
+    if (jc.at("delta").contains("tool_calls")) {
+      for (const auto& tcj : jc.at("delta").at("tool_calls")) {
+        CHECK(tcj.at("index") == 0);
+        const auto& fn = tcj.at("function");
+        if (fn.contains("name")) {
+          ++name_chunks;
+          streamed_name = fn.at("name").get<std::string>();
+          REQUIRE(tcj.contains("id"));
+          streamed_id = tcj.at("id").get<std::string>();
+          CHECK(tcj.at("type") == "function");
+        }
+        if (fn.contains("arguments")) {
+          streamed_args += fn.at("arguments").get<std::string>();
+        }
+      }
+    }
+  }
+  CHECK(tools_streamed);
+  CHECK(name_chunks == 1);  // the name is emitted exactly once
+  REQUIRE(streamed_name.has_value());
+  CHECK(*streamed_name == "get_weather");
+  REQUIRE(streamed_id.has_value());
+  CHECK(streamed_id->rfind("chatcmpl-tool-", 0) == 0);
+  CHECK(streamed_args == "{\"city\": \"Paris\"}");
+
+  // The finish-reason rule the serving loop applies on the terminal chunk.
+  const std::string finish = (tools_streamed) ? "tool_calls" : "stop";
+  CHECK(finish == "tool_calls");
+}
+
+// ─── (e) STREAM backward compat: tools present, content-only output over the
+//     REAL engine → normal role/content/finish cadence (no tool_calls) ─────────
+TEST_CASE("serving_chat: streaming with tools but content-only is unchanged") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const Tokenizer& tok = Fixture();
+  const int kN = 5;
+
+  Harness h(c, w, tok);
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+  ChatCompletionRequest req =
+      MakeChatRequest({ChatMessage{"user", std::string("hello")}}, kN, true);
+  // Attach tools: the synthetic model won't emit <tool_call>, so the stream
+  // must still be plain content with finish_reason from the engine.
+  ChatCompletionToolsParam tool;
+  tool.function.name = "noop";
+  req.tools = std::vector<ChatCompletionToolsParam>{tool};
+
+  ChatCompletionResult res = serving.create_chat_completion(req);
+  REQUIRE(res.streaming);
+  CHECK(res.sse_chunks.back() == "data: [DONE]\n\n");
+
+  std::string streamed;
+  std::optional<std::string> last_finish;
+  for (size_t i = 1; i + 1 < res.sse_chunks.size(); ++i) {
+    json j = json::parse(SsePayload(res.sse_chunks[i]));
+    const auto& choice = j.at("choices").at(0);
+    const auto& delta = choice.at("delta");
+    CHECK_FALSE(delta.contains("tool_calls"));  // no tool call emitted
+    if (delta.contains("content")) {
+      streamed += delta.at("content").get<std::string>();
+    }
+    if (!choice.at("finish_reason").is_null()) {
+      last_finish = choice.at("finish_reason").get<std::string>();
+    }
+  }
+  CHECK_FALSE(streamed.empty());
+  REQUIRE(last_finish.has_value());
+  CHECK(*last_finish == "length");  // engine finish, NOT "tool_calls"
 }

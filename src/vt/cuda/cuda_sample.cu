@@ -189,7 +189,7 @@ void RandomSampleCuda(Queue& q, Tensor& token_ids, const Tensor& probs, const Te
 __global__ void TopKMaskKernel(float* sorted, const int32_t* k, int64_t v) {
   const int64_t row = blockIdx.x;
   const int32_t kv = k[row];
-  if (kv >= v) return;  // k == vocab: no-op
+  if (kv >= v || kv < 1) return;  // k>=vocab no-op; k<1 invalid — keep s[v-kv] in-bounds
   float* s = sorted + row * v;
   const float threshold = s[v - kv];  // sorted ascending: index v-k is k-th largest
   for (int64_t j = threadIdx.x; j < v; j += blockDim.x)

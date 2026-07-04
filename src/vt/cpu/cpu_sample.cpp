@@ -59,7 +59,7 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
 // Per row, threshold = the k-th largest value (topk.values gathered at k-1);
 // k == vocab is a no-op (threshold -inf). masked_fill_(logits < threshold, -inf).
 void ApplyTopKOnlyRow(float* row, int64_t v, int32_t k) {
-  if (k >= v) return;  // no_top_k row: nothing to mask
+  if (k >= v || k < 1) return;  // no_top_k row (k>=v) or invalid k(<1): nothing to mask
   // k-th largest = element at index (k-1) of the descending order. nth_element on
   // a copy gives that pivot value without a full sort.
   std::vector<float> tmp(row, row + v);
@@ -85,9 +85,14 @@ void ApplyTopKTopPSortRow(float* row, int64_t v, const int32_t* k_ptr, const flo
   if (k_ptr != nullptr) {
     const int64_t k = *k_ptr;
     // top_k_mask = logits_sort < logits_sort[vocab-k] (the k-th largest).
-    const float threshold = sorted[static_cast<size_t>(v - k)];
-    for (int64_t s = 0; s < v; ++s)
-      if (sorted[static_cast<size_t>(s)] < threshold) sorted[static_cast<size_t>(s)] = kNegInf;
+    // k >= v is a no-op (threshold = sorted[<=0], masks nothing); k < 1 is
+    // invalid upstream (SamplingParams guarantees k in [1, vocab]) — guard both
+    // to keep the sorted[v-k] index in-bounds.
+    if (k >= 1 && k < v) {
+      const float threshold = sorted[static_cast<size_t>(v - k)];
+      for (int64_t s = 0; s < v; ++s)
+        if (sorted[static_cast<size_t>(s)] < threshold) sorted[static_cast<size_t>(s)] = kNegInf;
+    }
   }
 
   if (p_ptr != nullptr) {

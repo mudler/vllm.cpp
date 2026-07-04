@@ -66,6 +66,7 @@ add_library(vllm STATIC
   src/vllm/v1/sample/ops/penalties.cpp
   src/vllm/v1/sample/ops/bad_words.cpp
   src/vllm/v1/sample/logits_processor/builtin.cpp
+  src/vllm/v1/sample/sampler.cpp
   src/vllm/v1/kv_cache_interface.cpp
   src/vllm/v1/core/kv_cache_utils.cpp
   src/vllm/v1/core/block_pool.cpp

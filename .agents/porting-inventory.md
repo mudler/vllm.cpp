@@ -275,7 +275,21 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    → C ABI callback registries, added per tier.
 5. **GGUF as a first-class input** (upstream treats it as one loader among many;
    for us it is a gate, including NVFP4 GGUF extension types).
-6. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
+7. **Explicit owned-tensor model weights** (no `nn.Module`/`AutoWeightsLoader`).
+   The dense 27B (`Qwen3_5ForConditionalGeneration`, text_config `qwen3_5_text`)
+   loads through `LoadQwen3_5Dense` into `Qwen3_5DenseWeights` — mirroring the
+   35B's `LoadQwen3_5Moe` — with the MoE block replaced by a `DenseMlpWeights`
+   SwiGLU MLP. Two recorded remaps: (a) the compressed-tensors NVFP4 W4A4 tensor
+   NAMES (`weight_packed`/`weight_scale`/`weight_global_scale`/`input_global_scale`)
+   vs the 35B modelopt names (`weight`/`weight_scale`/`weight_scale_2`/`input_scale`);
+   (b) on the CPU correctness path every W4A4 Linear is MATERIALIZED to bf16 at
+   load (`MaterializeCtNvfp4Bf16Transposed` → `DequantCtNvfp4WeightToF32`) so the
+   existing bf16 forward carries it — the fp4-resident tensor-core GEMM reuse is
+   the later GPU step (qwen27b-w4a4-notes.md §5 steps 6-7), not a permanent
+   deviation. Per-Linear bf16-vs-W4A4 routing is `IsQwen27QuantizedLinear`
+   (encodes the checkpoint `ignore` list, §3.6). Text path only; the ViT/merger
+   and MTP head are deferred stubs.
+8. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
    no equivalent under `vllm/platforms/`; we add them through the mirrored
    Platform/AttentionBackend/vt-op seams so they behave as vLLM platforms
    would. Intel is NOT a deviation (upstream `platforms/xpu.py` is ported

@@ -7,6 +7,8 @@
 // .agents/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
 #include "vllm/model_executor/models/qwen3_5.h"
 
+#include "vllm/model_executor/models/qwen3_5_dense.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -1089,6 +1091,46 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
 }
 
+// --- Dense SwiGLU MLP block (the 27B's replacement for the MoE block; notes
+// §2). down( silu(gate(x)) * up(x) ), intermediate = cfg.intermediate_size.
+// Mirrors the shared-expert silu-mul MLP (no router, no expert gather, no output
+// gate). h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device). Reused by the dense
+// forward below; the gate/up/down weights are W4A4-materialized-to-bf16 at load.
+DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
+                   const Tensor& dh, int64_t T) {
+  const int64_t I = cfg.intermediate_size;
+  DBuf gate = MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
+  DBuf up = MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
+  DBuf act(d, DType::kBF16, {T, I});
+  vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
+  return MatmulBf16D(d, act.t(), w.down_proj);     // [T,H] bf16
+}
+
+// One dense decoder layer (notes §2). Same residual/norm thread as RunLayer, but
+// the MoE block is swapped for the dense SwiGLU MLP; the GDN / full-attention
+// blocks are the 35B helpers reused verbatim. `hidden` (bf16 [T,H]) is the delta;
+// `res` (f32 [T,H]) the accumulator.
+void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
+                   const HfConfig& cfg, DBuf& hidden, DBuf& res,
+                   const std::vector<int32_t>& positions, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+
+  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
+  DBuf dhn(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+
+  DBuf attn = layer.is_linear_attention
+                  ? GdnBlock(d, layer.gdn, cfg, dhn.t(), T)
+                  : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
+
+  Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
+  DBuf dh2(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+
+  hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+}
+
 // Batched PAGED decoder layer (M1.8 Task 3). Same residual/norm/MoE thread as
 // RunLayer, but the attention block reads/writes the paged KV cache
 // (full-attn: attn_kv) or the persistent GDN mamba state (GDN: gdn_state).
@@ -1294,6 +1336,49 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   DBuf dlogits = weights.lm_head_fp4.Empty()
                      ? MatmulF32D(d, dnorm.t(), weights.lm_head)
                      : MatmulNvfp4F32D(d, dnorm.t(), weights.lm_head_fp4);
+  std::vector<float> logits(static_cast<size_t>(T) * vocab);
+  dlogits.Download(d, logits.data());
+  return logits;
+}
+
+std::vector<float> Qwen3_5DenseModel::ForwardDense(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  const int64_t vocab = config.vocab_size;
+  VT_CHECK(T > 0, "qwen3_5 dense forward: empty token_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "qwen3_5 dense forward: positions length must equal token count");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
+           "qwen3_5 dense forward: weights.layers size must equal num_hidden_layers");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
+  // For a TEXT-only step the three mRoPE position streams are identical, so the
+  // partial NeoX RoPE in FullAttnBlock degenerates to 1-D RoPE over `positions`
+  // (notes §2). The vision tower / image-video merger are DEFERRED.
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  DBuf hidden(d, DType::kBF16, {T, H});
+  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+
+  DBuf res(d, DType::kF32, {T, H});
+  res.Zero(d);
+
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+    RunDenseLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
+                  positions, T);
+
+  // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
+  DBuf dnorm(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
+
+  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
+  DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;

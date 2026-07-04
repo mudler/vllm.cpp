@@ -10,11 +10,20 @@ pinned upstream checkout `/home/mudler/_git/vllm` @ `e24d1b24`. Cites are
 Checkpoint (read-only on dgx):
 `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4`.
 
-STATUS (2026-07-04): CPU-first correctness scaffolding only. Delivered: the CPU
-W4A4 dequant + activation-quant reference (`nvfp4_emulation.h`, unit-tested) and
-the skipping greedy-parity gate scaffold (`test_qwen27_paged_engine.cpp`). The
-27B forward + the GB10 W4A4 GPU GEMM are NOT yet written — §5 is the ordered
-plan, GPU-gated steps marked.
+STATUS (2026-07-04): CPU-first correctness path LANDED (§5 steps 1-4). Delivered:
+the CPU W4A4 dequant + activation-quant reference (`nvfp4_emulation.h`,
+unit-tested); the dense loader (`LoadQwen3_5Dense` → `Qwen3_5DenseWeights`,
+`qwen3_5_dense.h`/`qwen3_5_dense_weights.cpp`) that routes each Linear bf16 vs
+W4A4-materialized-to-bf16 by name (`IsQwen27QuantizedLinear` +
+`MaterializeCtNvfp4Bf16Transposed`); the dense TEXT forward
+(`Qwen3_5DenseModel::ForwardDense` in `qwen3_5.cpp`, reusing the 35B GDN +
+gated-attn + norm helpers with the MoE block swapped for the dense SwiGLU MLP);
+and CPU unit tests (`test_qwen27_dense_forward.cpp`: routing + materialization +
+finite/deterministic forward + MLP-wired, 4 cases / 280 assertions, CPU-green).
+The full CPU ctest suite (83 targets) stays green. What is NOT done and is GPU-gated: the
+pip-vLLM oracle greedy golden capture (step 5), the W4A4 matmul kernel wiring
+(step 6), and flipping `kW4A4ForwardReady` to close the gate (step 7). §5 is the
+ordered plan, GPU steps marked.
 
 ---
 
@@ -250,22 +259,37 @@ Legend: **[CPU]** doable on the dev box now; **[GPU]** needs the free GB10.
    the pinned emulation math (`test_ct_nvfp4_emulation.cpp`, 6 cases / 81
    assertions, CPU-green). This is the CPU-truth the GPU GEMM validates against.
 
-2. **[CPU] Config + loader plumbing.** Recognize
-   `Qwen3_5ForConditionalGeneration` (dense; `is_moe=false`), read `text_config`
-   (§1), the compressed-tensors quant block + the `ignore` list, and
-   `partial_rotary_factor`/`mrope_section`/`output_gate_type`/`attn_output_gate`
-   from `HfConfig.raw`. Add a dense-MLP + W4A4 weight-loader path (mirror the
-   existing modelopt loader in `qwen3_5_weights.cpp`): route bf16 vs W4A4 by name
-   (§3.6); for the CPU reference forward, materialize each W4A4 linear to bf16
-   via `DequantCtNvfp4WeightToF32` (as the 35B loader dequants modelopt).
-   Mirror upstream names so the port stays mechanical; record the tensor-name
-   remap in porting-inventory §9.
+2. **[CPU] ✅ DONE — Config + loader plumbing.** `LoadHfConfig` already
+   recognizes `Qwen3_5ForConditionalGeneration` via the `text_config`/
+   `qwen3_5_text` resolution (partial_rotary_factor default 0.25 → rotary_dim 64;
+   `num_experts` reads 0 = dense). `LoadQwen3_5Dense`
+   (`qwen3_5_dense.h`/`qwen3_5_dense_weights.cpp`) mirrors `LoadQwen3_5Moe`:
+   `Qwen3_5DenseWeights` = embed + final_norm + bf16 `lm_head` + per-layer
+   `Qwen3_5DenseLayerWeights` (reused `GdnLayerWeights`/`FullAttnLayerWeights` +
+   new `DenseMlpWeights`). Each Linear is routed bf16 vs W4A4-materialized-to-bf16
+   by `IsQwen27QuantizedLinear` (encodes the §3.6 `ignore` list) and materialized
+   via `MaterializeCtNvfp4Bf16Transposed` → `DequantCtNvfp4WeightToF32` (reads the
+   CT `weight_packed`/`weight_scale`/`weight_global_scale` names; the on-disk
+   `input_global_scale` activation divisor is IGNORED on this bf16-activation path
+   — the step-6a fast path). Tensor-name remap recorded in porting-inventory §9.7.
 
-3. **[CPU] Dense forward assembly.** New `Qwen3_5Model::ForwardDense`-style path
-   for the dense arch: reuse the 35B GDN + full-attn + norm components, swap the
-   MoE block for the dense SwiGLU MLP (§2), wire the quantized linears. Validate
-   per-layer activations + greedy on CPU where feasible (full 64-layer CPU
-   greedy is slow — the authoritative gate is GPU, step 6).
+3. **[CPU] ✅ DONE — Dense forward assembly.** `Qwen3_5DenseModel::ForwardDense`
+   (in `qwen3_5.cpp`, so it reuses the file-local `GdnBlock`/`FullAttnBlock`/norm/
+   `DBuf`/matmul helpers verbatim) mirrors `Qwen3_5Model::ForwardDense`: embed →
+   N `RunDenseLayer` (input_layernorm → GDN|full-attn → post_attn_layernorm →
+   `DenseMlpBlock`) → final RMSNorm → bf16 `lm_head`. `DenseMlpBlock` =
+   `down( silu(gate(x)) * up(x) )` (the shared-expert silu-mul, no router/gate).
+   Text-only: the three mRoPE streams coincide so partial NeoX RoPE degenerates to
+   1-D over `positions` (§2). CPU-validated on a synthetic small hybrid model
+   (finite + deterministic logits; MLP-perturbation moves the output). The ViT +
+   image/video merger + MTP head are DEFERRED (text-first, §0.1) — no stub code,
+   the loader simply does not request `model.visual.*`/`mtp.*`.
+   ⚠ REMAINING before step 5/7 flips the gate: (a) a paged `Qwen3_5DenseModel`
+   forward + a runner route (the 35B rides `Qwen3_5Model::Forward` + the runner;
+   the dense arch needs the analogous paged path OR the runner extended to the
+   dense weights) — the dense ForwardDense here is the single-sequence reference,
+   as the 35B's ForwardDense was before its paged refactor; (b) mrope_section
+   handling for genuine multimodal positions (inert for text).
 
 4. **[CPU] ✅ DONE — greedy-parity gate scaffold.**
    `test_qwen27_paged_engine.cpp` resolves the `unsloth/Qwen3.6-27B-NVFP4`

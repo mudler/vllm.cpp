@@ -91,6 +91,8 @@ add_library(vllm STATIC
   src/vllm/v1/engine/llm_engine.cpp
   src/vllm/v1/executor/executor.cpp
   src/vllm/entrypoints/openai/protocol.cpp
+  src/vllm/entrypoints/openai/serving_completion.cpp
+  src/vllm/entrypoints/openai/serving_chat.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

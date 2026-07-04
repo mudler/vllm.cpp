@@ -1,0 +1,500 @@
+// Ported from: vllm/v1/sample/ops/topk_topp_sampler.py + vllm/v1/sample/sampler.py @ e24d1b24.
+// Core sampling-op unit tests (M1.7 Task 2). Composed-reference goldens: each op
+// is validated against hand-computed expecteds (argmax tie-break, temperature +
+// eps guard, sort-based top-k/top-p masking + the apply_top_k_only fast-path
+// parity, log_softmax / softmax) exactly the way M0.8/M1.6 validated their ops.
+// greedy_argmax is the bit-exact parity primitive (lowest-index tie-break vs
+// torch.argmax). random_sample is validated by ALGORITHM (exponential-noise
+// gumbel-max), DETERMINISM (fixed seed), and DISTRIBUTION (large-N frequency ≈
+// softmax) — bit-exact-vs-torch-Philox is the documented M1.7 deferral.
+#include <doctest/doctest.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+using vt::Backend;
+using vt::Device;
+using vt::DeviceType;
+using vt::DType;
+using vt::Queue;
+using vt::Tensor;
+
+namespace {
+Device Cpu() { return Device{DeviceType::kCPU, 0}; }
+Queue Q() { return Queue{Cpu(), nullptr}; }
+constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+
+Tensor F32_2(std::vector<float>& v, int64_t a, int64_t b) {
+  return Tensor::Contiguous(v.data(), DType::kF32, Cpu(), {a, b});
+}
+Tensor F32_1(std::vector<float>& v, int64_t a) {
+  return Tensor::Contiguous(v.data(), DType::kF32, Cpu(), {a});
+}
+Tensor I32_1(std::vector<int32_t>& v, int64_t a) {
+  return Tensor::Contiguous(v.data(), DType::kI32, Cpu(), {a});
+}
+Tensor I64_1(std::vector<int64_t>& v, int64_t a) {
+  return Tensor::Contiguous(v.data(), DType::kI64, Cpu(), {a});
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// apply_temperature (sampler.py::apply_temperature). In-place /= temp per row.
+TEST_CASE("apply_temperature: divides each row by its temperature") {
+  std::vector<float> logits = {2.0f, 4.0f, 8.0f,
+                               3.0f, 6.0f, 9.0f};
+  std::vector<float> temp = {2.0f, 3.0f};
+  Tensor tl = F32_2(logits, 2, 3), tt = F32_1(temp, 2);
+  Queue q = Q();
+  vt::ApplyTemperature(q, tl, tt, /*all_random=*/true);
+  CHECK(logits[0] == doctest::Approx(1.0f));
+  CHECK(logits[1] == doctest::Approx(2.0f));
+  CHECK(logits[2] == doctest::Approx(4.0f));
+  CHECK(logits[3] == doctest::Approx(1.0f));
+  CHECK(logits[4] == doctest::Approx(2.0f));
+  CHECK(logits[5] == doctest::Approx(3.0f));
+}
+
+TEST_CASE("apply_temperature: !all_random guards temp<eps greedy rows (unchanged)") {
+  // Row 0 is greedy (temp 0 < eps) -> temp replaced by 1.0, row unchanged.
+  // Row 1 is random (temp 0.5) -> divided.
+  std::vector<float> logits = {2.0f, 4.0f,
+                               2.0f, 4.0f};
+  std::vector<float> temp = {0.0f, 0.5f};
+  Tensor tl = F32_2(logits, 2, 2), tt = F32_1(temp, 2);
+  Queue q = Q();
+  vt::ApplyTemperature(q, tl, tt, /*all_random=*/false);
+  CHECK(logits[0] == doctest::Approx(2.0f));  // unchanged (divided by 1.0)
+  CHECK(logits[1] == doctest::Approx(4.0f));
+  CHECK(logits[2] == doctest::Approx(4.0f));  // 2 / 0.5
+  CHECK(logits[3] == doctest::Approx(8.0f));  // 4 / 0.5
+}
+
+// ---------------------------------------------------------------------------
+// greedy_argmax (sampler.py::greedy_sample). Lowest-index tie-break, bit-exact
+// vs torch.argmax (first occurrence of the max via strict `>`).
+TEST_CASE("greedy_argmax: picks the max index") {
+  std::vector<float> logits = {0.1f, 5.0f, 0.2f, 0.3f,
+                               9.0f, 1.0f, 1.0f, 2.0f};
+  std::vector<int64_t> ids(2, -1);
+  Tensor tl = F32_2(logits, 2, 4), ti = I64_1(ids, 2);
+  Queue q = Q();
+  vt::GreedyArgmax(q, ti, tl);
+  CHECK(ids[0] == 1);
+  CHECK(ids[1] == 0);
+}
+
+TEST_CASE("greedy_argmax: tie resolves to the LOWEST index (torch.argmax)") {
+  // [1,3,3,2] -> the two 3s tie; torch.argmax returns the FIRST -> index 1.
+  // A wrong (last-wins) tie-break would return 2, so this case flips.
+  std::vector<float> logits = {1.0f, 3.0f, 3.0f, 2.0f};
+  std::vector<int64_t> ids(1, -1);
+  Tensor tl = F32_2(logits, 1, 4), ti = I64_1(ids, 1);
+  Queue q = Q();
+  vt::GreedyArgmax(q, ti, tl);
+  CHECK(ids[0] == 1);
+}
+
+// ---------------------------------------------------------------------------
+// apply_top_k_top_p — top-k only (apply_top_k_only fast path when p is null).
+TEST_CASE("apply_top_k: keeps exactly k distinct values, masks the rest to -inf") {
+  // logits [1,2,3,4,5], k=3 -> keep {3,4,5} (idx 2,3,4), mask idx 0,1.
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+  std::vector<int32_t> k = {3};
+  Tensor tl = F32_2(logits, 1, 5), tk = I32_1(k, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, &tk, /*p=*/nullptr);
+  CHECK(logits[0] == kNegInf);
+  CHECK(logits[1] == kNegInf);
+  CHECK(logits[2] == doctest::Approx(3.0f));
+  CHECK(logits[3] == doctest::Approx(4.0f));
+  CHECK(logits[4] == doctest::Approx(5.0f));
+}
+
+TEST_CASE("apply_top_k: ties AT the threshold are kept (can keep > k, torch semantics)") {
+  // logits [3,3,3,1], k=1. The k-th largest value is 3; torch masks strictly
+  // `< 3`, so ALL three 3s survive (>k kept), only the 1 is masked.
+  std::vector<float> logits = {3.0f, 3.0f, 3.0f, 1.0f};
+  std::vector<int32_t> k = {1};
+  Tensor tl = F32_2(logits, 1, 4), tk = I32_1(k, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, &tk, nullptr);
+  CHECK(logits[0] == doctest::Approx(3.0f));
+  CHECK(logits[1] == doctest::Approx(3.0f));
+  CHECK(logits[2] == doctest::Approx(3.0f));
+  CHECK(logits[3] == kNegInf);
+}
+
+TEST_CASE("apply_top_k: k == vocab is a no-op") {
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<int32_t> k = {4};
+  Tensor tl = F32_2(logits, 1, 4), tk = I32_1(k, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, &tk, nullptr);
+  CHECK(logits[0] == doctest::Approx(1.0f));
+  CHECK(logits[1] == doctest::Approx(2.0f));
+  CHECK(logits[2] == doctest::Approx(3.0f));
+  CHECK(logits[3] == doctest::Approx(4.0f));
+}
+
+TEST_CASE("apply_top_k_only path == sort path on the same input (test_topk_impl_equivalence)") {
+  // Ported from tests/v1/sample/test_topk_topp_sampler.py::test_topk_impl_equivalence:
+  // apply_top_k_top_p(k, p=None) [fast path] must match apply_top_k_top_p(k, p=1.0)
+  // [sort path with a no-op top-p].
+  std::vector<float> base = {0.5f, -1.0f, 2.0f, 3.5f, -4.0f, 1.25f, 0.0f, 7.0f};
+  std::vector<float> a = base, b = base;
+  std::vector<int32_t> k = {3};
+  std::vector<float> noop_p = {1.0f};
+  Queue q = Q();
+
+  Tensor ta = F32_2(a, 1, 8), tk1 = I32_1(k, 1);
+  vt::ApplyTopKTopP(q, ta, &tk1, nullptr);  // fast path
+
+  std::vector<int32_t> k2 = {3};
+  Tensor tb = F32_2(b, 1, 8), tk2 = I32_1(k2, 1), tp = F32_1(noop_p, 1);
+  vt::ApplyTopKTopP(q, tb, &tk2, &tp);  // sort path with no-op top-p
+
+  for (size_t i = 0; i < base.size(); ++i) {
+    if (std::isinf(a[i]) || std::isinf(b[i])) {
+      CHECK(std::isinf(a[i]));
+      CHECK(std::isinf(b[i]));
+    } else {
+      CHECK(a[i] == doctest::Approx(b[i]));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// apply_top_k_top_p — top-p (sort-based path).
+TEST_CASE("apply_top_p: keeps the smallest tail whose cumulative prob >= p") {
+  // logits chosen so softmax == [0.1,0.2,0.3,0.4]. p=0.7 -> 1-p=0.3.
+  // Ascending cumsum [0.1,0.3,0.6,1.0]; mask cumsum<=0.3 -> idx0,idx1 masked
+  // (keep last always). Kept {0.3,0.4} sum 0.7 >= p.
+  std::vector<float> logits = {std::log(0.1f), std::log(0.2f), std::log(0.3f), std::log(0.4f)};
+  std::vector<float> p = {0.7f};
+  Tensor tl = F32_2(logits, 1, 4), tp = F32_1(p, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, /*k=*/nullptr, &tp);
+  CHECK(logits[0] == kNegInf);
+  CHECK(logits[1] == kNegInf);
+  CHECK(logits[2] == doctest::Approx(std::log(0.3f)));
+  CHECK(logits[3] == doctest::Approx(std::log(0.4f)));
+}
+
+TEST_CASE("apply_top_p: at-least-one — the argmax always survives") {
+  // p=0.05 -> 1-p=0.95; every non-top position is masked, only the largest
+  // prob (idx3) is force-kept by mask[:, -1] = false.
+  std::vector<float> logits = {std::log(0.1f), std::log(0.2f), std::log(0.3f), std::log(0.4f)};
+  std::vector<float> p = {0.05f};
+  Tensor tl = F32_2(logits, 1, 4), tp = F32_1(p, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, nullptr, &tp);
+  CHECK(logits[0] == kNegInf);
+  CHECK(logits[1] == kNegInf);
+  CHECK(logits[2] == kNegInf);
+  CHECK(logits[3] == doctest::Approx(std::log(0.4f)));
+}
+
+TEST_CASE("apply_top_k_top_p: combined k then p") {
+  // softmax == [0.1,0.2,0.3,0.4]; k=3 masks the smallest (idx0). Re-softmax over
+  // {0.2,0.3,0.4}/0.9, cumsum [0,0.2222,0.5556,1.0], 1-p=0.3 masks idx1 too.
+  std::vector<float> logits = {std::log(0.1f), std::log(0.2f), std::log(0.3f), std::log(0.4f)};
+  std::vector<int32_t> k = {3};
+  std::vector<float> p = {0.7f};
+  Tensor tl = F32_2(logits, 1, 4), tk = I32_1(k, 1), tp = F32_1(p, 1);
+  Queue q = Q();
+  vt::ApplyTopKTopP(q, tl, &tk, &tp);
+  CHECK(logits[0] == kNegInf);
+  CHECK(logits[1] == kNegInf);
+  CHECK(logits[2] == doctest::Approx(std::log(0.3f)));
+  CHECK(logits[3] == doctest::Approx(std::log(0.4f)));
+}
+
+// ---------------------------------------------------------------------------
+// compute_logprobs / compute_probs — log_softmax / softmax (f32, max-subtracted).
+TEST_CASE("compute_logprobs: matches hand-computed log_softmax") {
+  std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+  std::vector<float> out(3, 0.0f);
+  Tensor tl = F32_2(logits, 1, 3), to = F32_2(out, 1, 3);
+  Queue q = Q();
+  vt::ComputeLogprobs(q, to, tl);
+  // lse = log(e^1+e^2+e^3) = 3 + log(e^-2+e^-1+1).
+  const float lse = 3.0f + std::log(std::exp(-2.0f) + std::exp(-1.0f) + 1.0f);
+  CHECK(out[0] == doctest::Approx(1.0f - lse));
+  CHECK(out[1] == doctest::Approx(2.0f - lse));
+  CHECK(out[2] == doctest::Approx(3.0f - lse));
+  CHECK(std::exp(out[0]) + std::exp(out[1]) + std::exp(out[2]) == doctest::Approx(1.0f));
+}
+
+TEST_CASE("compute_probs: matches hand-computed softmax") {
+  std::vector<float> logits = {std::log(1.0f), std::log(2.0f), std::log(3.0f), std::log(4.0f)};
+  std::vector<float> out(4, 0.0f);
+  Tensor tl = F32_2(logits, 1, 4), to = F32_2(out, 1, 4);
+  Queue q = Q();
+  vt::ComputeProbs(q, to, tl);
+  CHECK(out[0] == doctest::Approx(0.1f));
+  CHECK(out[1] == doctest::Approx(0.2f));
+  CHECK(out[2] == doctest::Approx(0.3f));
+  CHECK(out[3] == doctest::Approx(0.4f));
+}
+
+// ---------------------------------------------------------------------------
+// random_sample — exponential-noise gumbel-max.
+TEST_CASE("random_sample: deterministic under a fixed seed") {
+  std::vector<float> probs = {0.1f, 0.2f, 0.3f, 0.4f,
+                              0.4f, 0.3f, 0.2f, 0.1f};
+  std::vector<int64_t> seeds = {123, 456};
+  std::vector<int64_t> a(2, -1), b(2, -1);
+  Queue q = Q();
+  Tensor tp = F32_2(probs, 2, 4), ts = I64_1(seeds, 2);
+  Tensor ta = I64_1(a, 2), tb = I64_1(b, 2);
+  vt::RandomSample(q, ta, tp, ts);
+  vt::RandomSample(q, tb, tp, ts);
+  CHECK(a[0] == b[0]);
+  CHECK(a[1] == b[1]);
+  CHECK(a[0] >= 0);
+  CHECK(a[0] < 4);
+}
+
+TEST_CASE("random_sample: a per-request seed override changes only that row") {
+  std::vector<float> probs = {0.25f, 0.25f, 0.25f, 0.25f,
+                              0.25f, 0.25f, 0.25f, 0.25f};
+  std::vector<int64_t> seeds_a = {111, 222};
+  std::vector<int64_t> seeds_c = {111, 999};  // row 1 seed changed
+  std::vector<int64_t> out_a(2, -1), out_c(2, -1);
+  Queue q = Q();
+  Tensor tp = F32_2(probs, 2, 4);
+  Tensor tsa = I64_1(seeds_a, 2), tsc = I64_1(seeds_c, 2);
+  Tensor toa = I64_1(out_a, 2), toc = I64_1(out_c, 2);
+  vt::RandomSample(q, toa, tp, tsa);
+  vt::RandomSample(q, toc, tp, tsc);
+  CHECK(out_a[0] == out_c[0]);  // row 0 seed unchanged -> same draw
+}
+
+TEST_CASE("random_sample: large-N empirical frequency approximates softmax probs") {
+  // The exponential race gives P(argmax(p/q)) == p exactly; check the empirical
+  // frequency over N independent rows (each row's noise is seeded by its index)
+  // matches [0.1,0.2,0.3,0.4] within a loose Monte-Carlo tolerance.
+  const int64_t N = 100000;
+  const float target[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+  std::vector<float> probs(static_cast<size_t>(N) * 4);
+  for (int64_t i = 0; i < N; ++i)
+    for (int j = 0; j < 4; ++j) probs[static_cast<size_t>(i * 4 + j)] = target[j];
+  std::vector<int64_t> seeds(static_cast<size_t>(N), 20260703);  // shared batch seed
+  std::vector<int64_t> out(static_cast<size_t>(N), -1);
+  Queue q = Q();
+  Tensor tp = F32_2(probs, N, 4), ts = I64_1(seeds, N), to = I64_1(out, N);
+  vt::RandomSample(q, to, tp, ts);
+
+  int64_t counts[4] = {0, 0, 0, 0};
+  for (int64_t i = 0; i < N; ++i) {
+    REQUIRE(out[static_cast<size_t>(i)] >= 0);
+    REQUIRE(out[static_cast<size_t>(i)] < 4);
+    counts[out[static_cast<size_t>(i)]]++;
+  }
+  for (int j = 0; j < 4; ++j) {
+    const float freq = static_cast<float>(counts[j]) / static_cast<float>(N);
+    CHECK(freq == doctest::Approx(target[j]).epsilon(0.03));  // ~3% Monte-Carlo tol
+  }
+}
+
+// ===========================================================================
+// CPU-vs-CUDA parity. Correctness-grade CUDA kernels must match the CPU
+// reference: greedy_argmax / top-k / top-p indices EXACT; temperature /
+// logprobs / probs to 1e-5; random_sample uses the SAME deterministic hash RNG,
+// so token ids must match EXACTLY. Guarded by HasCuda (dgx-pending on CPU-only
+// CI). Harness mirrors test_ops_moe.cpp.
+namespace {
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+
+Tensor MakeT(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+struct QueueGuard {
+  Backend& b;
+  Queue q;
+  explicit QueueGuard(Backend& backend) : b(backend), q(backend.CreateQueue()) {}
+  ~QueueGuard() { b.DestroyQueue(q); }
+  QueueGuard(const QueueGuard&) = delete;
+  QueueGuard& operator=(const QueueGuard&) = delete;
+};
+
+class DeviceTensor {
+ public:
+  DeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+               const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeT(p_, dt, Gpu(), shape);
+  }
+  ~DeviceTensor() { b_.Free(p_); }
+  DeviceTensor(const DeviceTensor&) = delete;
+  DeviceTensor& operator=(const DeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+std::vector<float> RandomLogits(size_t n, uint32_t seed) {
+  std::vector<float> v(n);
+  // simple xorshift for reproducible pseudo-random logits in [-5, 5)
+  uint32_t s = seed ? seed : 1;
+  for (auto& x : v) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    x = (static_cast<float>(s) / static_cast<float>(UINT32_MAX)) * 10.0f - 5.0f;
+  }
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("CUDA greedy_argmax / temperature / top-k-p / logprobs match CPU") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping (dgx-pending)");
+    return;
+  }
+  const int64_t N = 6, V = 512;
+  const auto logits = RandomLogits(static_cast<size_t>(N * V), 4242);
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  Queue cq = Q();
+
+  // greedy_argmax: indices must be bit-exact.
+  {
+    std::vector<float> lc = logits;
+    std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+    vt::GreedyArgmax(cq, ti, tl);
+    DeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, logits.data());
+    DeviceTensor did(gpu, gq.q, DType::kI64, {N});
+    vt::GreedyArgmax(gq.q, did.tensor(), dl.tensor());
+    std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+    did.Download(gq.q, id_gpu.data());
+    for (size_t i = 0; i < id_cpu.size(); ++i) CHECK(id_gpu[i] == id_cpu[i]);
+  }
+
+  // compute_logprobs: 1e-5.
+  {
+    std::vector<float> lp_cpu(static_cast<size_t>(N * V));
+    std::vector<float> lc = logits;
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor to = MakeT(lp_cpu.data(), DType::kF32, Cpu(), {N, V});
+    vt::ComputeLogprobs(cq, to, tl);
+    DeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, logits.data());
+    DeviceTensor dout(gpu, gq.q, DType::kF32, {N, V});
+    vt::ComputeLogprobs(gq.q, dout.tensor(), dl.tensor());
+    std::vector<float> lp_gpu(lp_cpu.size());
+    dout.Download(gq.q, lp_gpu.data());
+    for (size_t i = 0; i < lp_cpu.size(); ++i)
+      CHECK(lp_gpu[i] == doctest::Approx(lp_cpu[i]).epsilon(1e-5));
+  }
+
+  // top-k + top-p: masked positions and kept values must match exactly.
+  {
+    std::vector<float> lc = logits, lg = logits;
+    std::vector<int32_t> k(static_cast<size_t>(N), 32);
+    std::vector<float> p(static_cast<size_t>(N), 0.8f);
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor tk = MakeT(k.data(), DType::kI32, Cpu(), {N});
+    Tensor tp = MakeT(p.data(), DType::kF32, Cpu(), {N});
+    vt::ApplyTopKTopP(cq, tl, &tk, &tp);
+    DeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, lg.data());
+    DeviceTensor dk(gpu, gq.q, DType::kI32, {N}, k.data());
+    DeviceTensor dp(gpu, gq.q, DType::kF32, {N}, p.data());
+    vt::ApplyTopKTopP(gq.q, dl.tensor(), &dk.tensor(), &dp.tensor());
+    std::vector<float> out_gpu(lc.size());
+    dl.Download(gq.q, out_gpu.data());
+    for (size_t i = 0; i < lc.size(); ++i) {
+      if (std::isinf(lc[i])) {
+        CHECK(std::isinf(out_gpu[i]));
+      } else {
+        CHECK(out_gpu[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+      }
+    }
+  }
+}
+
+TEST_CASE("CUDA random_sample matches CPU exactly (same deterministic hash RNG)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping (dgx-pending)");
+    return;
+  }
+  const int64_t N = 64, V = 128;
+  // Build a valid probability matrix (softmax of random logits).
+  auto logits = RandomLogits(static_cast<size_t>(N * V), 909);
+  std::vector<float> probs(static_cast<size_t>(N * V));
+  for (int64_t i = 0; i < N; ++i) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < V; ++j) mx = std::max(mx, logits[static_cast<size_t>(i * V + j)]);
+    float sum = 0.0f;
+    for (int64_t j = 0; j < V; ++j) {
+      const float e = std::exp(logits[static_cast<size_t>(i * V + j)] - mx);
+      probs[static_cast<size_t>(i * V + j)] = e;
+      sum += e;
+    }
+    for (int64_t j = 0; j < V; ++j) probs[static_cast<size_t>(i * V + j)] /= sum;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(N));
+  for (int64_t i = 0; i < N; ++i) seeds[static_cast<size_t>(i)] = 700 + i;
+
+  std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+  Tensor tp = MakeT(probs.data(), DType::kF32, Cpu(), {N, V});
+  Tensor ts = MakeT(seeds.data(), DType::kI64, Cpu(), {N});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+  Queue cq = Q();
+  vt::RandomSample(cq, ti, tp, ts);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dp(gpu, gq.q, DType::kF32, {N, V}, probs.data());
+  DeviceTensor ds(gpu, gq.q, DType::kI64, {N}, seeds.data());
+  DeviceTensor did(gpu, gq.q, DType::kI64, {N});
+  vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+  did.Download(gq.q, id_gpu.data());
+  for (size_t i = 0; i < id_cpu.size(); ++i) CHECK(id_gpu[i] == id_cpu[i]);
+}

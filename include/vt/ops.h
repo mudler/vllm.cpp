@@ -22,6 +22,12 @@ enum class OpId : uint8_t {
   kAttention,
   kReshapeAndCache,
   kPagedAttention,
+  kApplyTemperature,
+  kGreedyArgmax,
+  kApplyTopKTopP,
+  kComputeProbs,
+  kComputeLogprobs,
+  kRandomSample,
   kCount
 };
 
@@ -133,6 +139,13 @@ using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&
 using PagedAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&, const Tensor&, const Tensor&,
                                   const PagedAttentionArgs&);
+// --- V1 sampling ops (M1.7 Task 2). See the sampling-op section at the bottom.
+using ApplyTemperatureFn = void (*)(Queue&, Tensor&, const Tensor&, bool);
+using GreedyArgmaxFn = void (*)(Queue&, Tensor&, const Tensor&);
+using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
+using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
+using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
+using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -332,5 +345,67 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args);
+
+// --- V1 sampling ops (M1.7 Task 2). Ported from
+// vllm/v1/sample/ops/topk_topp_sampler.py + vllm/v1/sample/sampler.py @ e24d1b24.
+// The Sampler pipeline (M1.7 Task 4) composes these over the model's final
+// logits `[num_reqs, vocab_size]` (row-major f32). Every op is correctness-grade
+// CPU + CUDA and indexes contiguous rows; greedy_argmax is the bit-exact parity
+// primitive (matches torch.argmax's lowest-index tie-break).
+
+// _SAMPLING_EPS (sampler.py:17). Greedy rows carry temperature < this; the
+// temperature guard and the greedy/random where-merge both key off it.
+constexpr float kSamplingEps = 1e-5f;
+
+// apply_temperature (sampler.py::Sampler.apply_temperature). In-place per-row
+// `logits[i] /= temp[i]`. When `!all_random`, greedy rows (temp < eps) would
+// divide by ~0, so temp is first replaced per-row with `where(temp<eps, 1.0,
+// temp)` (upstream comment: "Avoid division by zero if there are greedy
+// requests"). logits [num_reqs, vocab] f32 in place; temp [num_reqs] f32.
+void ApplyTemperature(Queue& q, Tensor& logits, const Tensor& temp, bool all_random);
+
+// greedy_sample (sampler.py::Sampler.greedy_sample) = argmax(logits, dim=-1).
+// LOWEST-INDEX tie-break: torch.argmax returns the FIRST occurrence of the max,
+// so a strict `>` scan (keep the first max) is bit-exact vs torch on f32 logits.
+// This is the M0-exit parity gate primitive. token_ids [num_reqs] i64 (torch
+// argmax returns int64); logits [num_reqs, vocab] f32.
+void GreedyArgmax(Queue& q, Tensor& token_ids, const Tensor& logits);
+
+// apply_top_k_top_p (topk_topp_sampler.py::apply_top_k_top_p_pytorch, the CPU
+// allow_cpu_sync path). Masks non-top-k / non-top-p logits to -inf IN PLACE.
+// k [num_reqs] i32 (nullptr => skip top-k), p [num_reqs] f32 (nullptr => skip
+// top-p); per-row. When p is nullptr and k given, uses the no-sort
+// apply_top_k_only fast path; otherwise the sort-based path (top-k threshold =
+// the k-th largest, ties at the threshold kept; top-p = smallest tail whose
+// cumulative prob >= p, at-least-one). logits [num_reqs, vocab] f32.
+void ApplyTopKTopP(Queue& q, Tensor& logits, const Tensor* k, const Tensor* p);
+
+// probs = softmax(logits, dim=-1) in f32 (forward_native's
+// `logits.softmax(dim=-1, dtype=torch.float32)`; numerically stable, row-max
+// subtracted). probs/logits [num_reqs, vocab] f32.
+void ComputeProbs(Queue& q, Tensor& probs, const Tensor& logits);
+
+// compute_logprobs (sampler.py::Sampler.compute_logprobs) =
+// log_softmax(logits, dim=-1) in f32 (row-max subtracted, log-sum-exp).
+// logprobs/logits [num_reqs, vocab] f32.
+void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
+
+// random_sample (topk_topp_sampler.py::random_sample +
+// sample_with_exponential_noise): exponential-noise gumbel-max. For each element
+// draw q ~ Exponential(1); pick `argmax_j(probs[i,j] / q[i,j])`. Per-request
+// seeded RNG: `seeds[i]` is the resolved per-row seed (the Sampler picks the
+// per-request override from `SamplingMetadata.generators` or the batch default —
+// M1.7 Task 4). token_ids [num_reqs] i64; probs [num_reqs, vocab] f32;
+// seeds [num_reqs] i64.
+//
+// RNG DEVIATION (recorded, T1 carry): the Exponential(1) draws come from a
+// deterministic splitmix64 hash of (seed, row, vocab_index) mapped through the
+// inverse-CDF q = -log(U), U in (0,1). This is distribution-correct (the
+// exponential race gives P(argmax) == softmax, validated at large N) and
+// reproducible under a fixed seed, but is NOT bit-exact vs torch's Philox4x32
+// `exponential_()` — exact random-sampling parity vs torch is the documented
+// M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
+// determinism + distribution.
+void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
 
 }  // namespace vt

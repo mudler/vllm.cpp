@@ -448,4 +448,85 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
       q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
 }
 
+namespace {
+// Shared checks for the sampling ops: logits [num_reqs, vocab] f32, contiguous,
+// on the queue device. Returns num_reqs for downstream per-row-metadata checks.
+int64_t CheckSamplingLogits(const Queue& q, const Tensor& logits, const char* name) {
+  VT_CHECK(logits.rank == 2, std::string(name) + ": logits must be rank-2 [num_reqs, vocab]");
+  VT_CHECK(logits.dtype == DType::kF32, std::string(name) + ": logits must be f32");
+  VT_CHECK(logits.IsContiguous(), std::string(name) + ": logits must be contiguous");
+  VT_CHECK(logits.device == q.device, std::string(name) + ": logits device must match queue");
+  return logits.shape[0];
+}
+}  // namespace
+
+void ApplyTemperature(Queue& q, Tensor& logits, const Tensor& temp, bool all_random) {
+  const int64_t n = CheckSamplingLogits(q, logits, "apply_temperature");
+  VT_CHECK(temp.rank == 1 && temp.shape[0] == n && temp.dtype == DType::kF32 &&
+               temp.IsContiguous() && temp.device == q.device,
+           "apply_temperature: temp must be f32 [num_reqs] contiguous on the queue device");
+  reinterpret_cast<ApplyTemperatureFn>(GetOp(OpId::kApplyTemperature, q.device.type))(
+      q, logits, temp, all_random);
+}
+
+void GreedyArgmax(Queue& q, Tensor& token_ids, const Tensor& logits) {
+  const int64_t n = CheckSamplingLogits(q, logits, "greedy_argmax");
+  VT_CHECK(token_ids.rank == 1 && token_ids.shape[0] == n && token_ids.dtype == DType::kI64 &&
+               token_ids.IsContiguous() && token_ids.device == q.device,
+           "greedy_argmax: token_ids must be i64 [num_reqs] contiguous on the queue device");
+  reinterpret_cast<GreedyArgmaxFn>(GetOp(OpId::kGreedyArgmax, q.device.type))(q, token_ids,
+                                                                              logits);
+}
+
+void ApplyTopKTopP(Queue& q, Tensor& logits, const Tensor* k, const Tensor* p) {
+  const int64_t n = CheckSamplingLogits(q, logits, "apply_top_k_top_p");
+  // Both None => no-op (upstream apply_top_k_top_p returns logits unchanged).
+  if (k == nullptr && p == nullptr) return;
+  if (k != nullptr) {
+    VT_CHECK(k->rank == 1 && k->shape[0] == n && k->dtype == DType::kI32 && k->IsContiguous() &&
+                 k->device == q.device,
+             "apply_top_k_top_p: k must be i32 [num_reqs] contiguous on the queue device");
+  }
+  if (p != nullptr) {
+    VT_CHECK(p->rank == 1 && p->shape[0] == n && p->dtype == DType::kF32 && p->IsContiguous() &&
+                 p->device == q.device,
+             "apply_top_k_top_p: p must be f32 [num_reqs] contiguous on the queue device");
+  }
+  reinterpret_cast<ApplyTopKTopPFn>(GetOp(OpId::kApplyTopKTopP, q.device.type))(q, logits, k, p);
+}
+
+void ComputeProbs(Queue& q, Tensor& probs, const Tensor& logits) {
+  const int64_t n = CheckSamplingLogits(q, logits, "compute_probs");
+  VT_CHECK(probs.rank == 2 && probs.shape[0] == n && probs.shape[1] == logits.shape[1] &&
+               probs.dtype == DType::kF32 && probs.IsContiguous() && probs.device == q.device,
+           "compute_probs: probs must be f32 [num_reqs, vocab] contiguous matching logits");
+  reinterpret_cast<ComputeProbsFn>(GetOp(OpId::kComputeProbs, q.device.type))(q, probs, logits);
+}
+
+void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits) {
+  const int64_t n = CheckSamplingLogits(q, logits, "compute_logprobs");
+  VT_CHECK(logprobs.rank == 2 && logprobs.shape[0] == n && logprobs.shape[1] == logits.shape[1] &&
+               logprobs.dtype == DType::kF32 && logprobs.IsContiguous() &&
+               logprobs.device == q.device,
+           "compute_logprobs: logprobs must be f32 [num_reqs, vocab] contiguous matching logits");
+  reinterpret_cast<ComputeLogprobsFn>(GetOp(OpId::kComputeLogprobs, q.device.type))(q, logprobs,
+                                                                                    logits);
+}
+
+void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds) {
+  VT_CHECK(probs.rank == 2, "random_sample: probs must be rank-2 [num_reqs, vocab]");
+  VT_CHECK(probs.dtype == DType::kF32, "random_sample: probs must be f32");
+  VT_CHECK(probs.IsContiguous(), "random_sample: probs must be contiguous");
+  VT_CHECK(probs.device == q.device, "random_sample: probs device must match queue");
+  const int64_t n = probs.shape[0];
+  VT_CHECK(token_ids.rank == 1 && token_ids.shape[0] == n && token_ids.dtype == DType::kI64 &&
+               token_ids.IsContiguous() && token_ids.device == q.device,
+           "random_sample: token_ids must be i64 [num_reqs] contiguous on the queue device");
+  VT_CHECK(seeds.rank == 1 && seeds.shape[0] == n && seeds.dtype == DType::kI64 &&
+               seeds.IsContiguous() && seeds.device == q.device,
+           "random_sample: seeds must be i64 [num_reqs] contiguous on the queue device");
+  reinterpret_cast<RandomSampleFn>(GetOp(OpId::kRandomSample, q.device.type))(q, token_ids, probs,
+                                                                              seeds);
+}
+
 }  // namespace vt

@@ -976,3 +976,17 @@
   breakdown by kernel, then attack the dominant cost (almost certainly the NVFP4 GEMM → a
   tensor-core MMA kernel, the killgate prior art). GPU is free — keep it serialized to one
   workstream. Restart `local-ai-worker` when the measurement campaign pauses.
+- **2026-07-04 (M2.7 tensor-core NVFP4 GEMM — gap 16.8×→7.5×; prefill bottleneck now GDN scan)**
+  — `bc0a8d7`. Moved the prefill-dominant fp4 W4A16 GEMMs (MoE grouped + dense projections)
+  onto Blackwell tensor cores (bf16 WMMA, dequant-into-shared) + device-side expert grouping
+  for the MoE (counting sort → dense per-expert GEMM, weight-reuse + tensor cores). Correctness
+  preserved (paged gate 16/16, unit 4/4, CPU 82/82, -Werror clean). **Free-box measured vs
+  vLLM:** prefill TTFT 14.4→6.1s (2.36×), 8×1024×128 total 70→157 tok/s (2.24×), batched TTFT
+  100→32.8s (3.05×). **Gap to vLLM CLOSED 16.8×→7.5×** (vLLM 1181 total / 131 output). nsys:
+  fp4 MoE GEMM 70.7%→11.6% of prefill; **the prefill bottleneck MOVED to `GdnScanKernel`
+  (63.8%)** — the gated-delta-net recurrence, a sequential-scan problem (needs chunk-parallel
+  scan, NOT MMA). HONEST: kernel below bf16 peak (~3-4 TFLOP/s useful; win is part tensor-core
+  part expert-grouping) — tuning headroom remains. NEXT LEVERS (measured): (1) **GDN chunked/
+  parallel scan** — now 63.8% of prefill, THE next prefill lever; (2) M2.8 decode fp4-GEMV +
+  fast-argmax (the ~100× argmax, the naive M=1 fp4 GEMV, route the cublas bf16 gemvx to fp4).
+  GPU stays free+serialized (LocalAI worker down, restart disabled per user directive).

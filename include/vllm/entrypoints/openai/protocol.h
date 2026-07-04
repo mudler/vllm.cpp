@@ -71,6 +71,32 @@ struct ErrorResponse {
 };
 
 // ---------------------------------------------------------------------------
+// response_format — engine/protocol.py (shared by both request types)
+// ---------------------------------------------------------------------------
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:123
+// (JsonSchemaResponseFormat). The wire `schema` field is aliased to
+// `json_schema` (pydantic name-conflict workaround upstream); we keep the schema
+// as a raw nlohmann::json (the constraint layer serializes it). `strict` /
+// `description` are parsed but not load-bearing at T0.
+struct JsonSchemaResponseFormat {
+  std::string name;
+  std::optional<std::string> description;
+  // The JSON Schema object (wire key "schema").
+  std::optional<nlohmann::json> json_schema;
+  std::optional<bool> strict;
+};
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:156 (ResponseFormat).
+// `type` is one of "text" | "json_object" | "json_schema". structural_tag is
+// deferred (M3.4 STRUCTURAL_TAG stub); a structural_tag response_format parses
+// but does not map to a constraint at T0.
+struct ResponseFormat {
+  std::string type;
+  std::optional<JsonSchemaResponseFormat> json_schema;
+};
+
+// ---------------------------------------------------------------------------
 // Completions — completion/protocol.py
 // ---------------------------------------------------------------------------
 
@@ -108,6 +134,11 @@ struct CompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+
+  // response_format (completion/protocol.py:106): {type: "text"|"json_object"|
+  // "json_schema", json_schema?} — normalized into structured_outputs in
+  // to_sampling_params (M3.4 Task 5).
+  std::optional<ResponseFormat> response_format;
 
   // to_sampling_params — completion/protocol.py:260. Maps each OpenAI field 1:1
   // onto our SamplingParams (resolving None sampling knobs to _DEFAULT_SAMPLING_
@@ -206,6 +237,9 @@ struct ChatCompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+
+  // response_format (chat_completion/protocol.py:210). See CompletionRequest.
+  std::optional<ResponseFormat> response_format;
 
   // to_sampling_params — chat_completion/protocol.py:585. See CompletionRequest.
   SamplingParams to_sampling_params(

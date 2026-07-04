@@ -230,3 +230,91 @@ TEST_CASE("ErrorResponse shape") {
   CHECK(j["error"]["type"] == "BadRequestError");
   CHECK(j["error"]["code"] == 400);
 }
+
+// ─── response_format -> structured_outputs (M3.4 Task 5) ─────────────────────
+// chat_completion/protocol.py:629-658 + completion/protocol.py:309-338.
+
+// json_schema -> structured_outputs.json = the serialized schema.
+TEST_CASE("ChatCompletionRequest response_format json_schema -> structured_outputs.json") {
+  auto j = json::parse(R"({
+    "messages": [{"role":"user","content":"hi"}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "person",
+        "schema": {"type":"object","properties":{"age":{"type":"integer"}},
+                   "required":["age"]}
+      }
+    }
+  })");
+  auto req = j.get<ChatCompletionRequest>();
+  REQUIRE(req.response_format.has_value());
+  CHECK(req.response_format->type == "json_schema");
+  REQUIRE(req.response_format->json_schema.has_value());
+  REQUIRE(req.response_format->json_schema->json_schema.has_value());
+
+  SamplingParams sp = req.to_sampling_params();
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->json.has_value());
+  CHECK_FALSE(sp.structured_outputs->json_object.value_or(false));
+  // The stored json is the serialized schema (round-trips to the same object).
+  const json parsed = json::parse(*sp.structured_outputs->json);
+  CHECK(parsed["type"] == "object");
+  CHECK(parsed["required"][0] == "age");
+  // Exactly one constraint set (PostInit / Verify passed).
+  CHECK(sp.structured_outputs->all_constraints_none() == false);
+}
+
+// json_object -> structured_outputs.json_object = true.
+TEST_CASE("ChatCompletionRequest response_format json_object -> json_object=true") {
+  auto j = json::parse(R"({
+    "messages": [{"role":"user","content":"hi"}],
+    "response_format": {"type": "json_object"}
+  })");
+  auto req = j.get<ChatCompletionRequest>();
+  SamplingParams sp = req.to_sampling_params();
+  REQUIRE(sp.structured_outputs.has_value());
+  CHECK(sp.structured_outputs->json_object.value_or(false) == true);
+  CHECK_FALSE(sp.structured_outputs->json.has_value());
+}
+
+// type "text" (and absent) -> no structured-output constraint.
+TEST_CASE("ChatCompletionRequest response_format text/absent -> no structured_outputs") {
+  {
+    auto req = json::parse(R"({"messages":[{"role":"user","content":"hi"}],
+                               "response_format":{"type":"text"}})")
+                   .get<ChatCompletionRequest>();
+    SamplingParams sp = req.to_sampling_params();
+    CHECK_FALSE(sp.structured_outputs.has_value());
+  }
+  {
+    auto req = json::parse(R"({"messages":[{"role":"user","content":"hi"}]})")
+                   .get<ChatCompletionRequest>();
+    SamplingParams sp = req.to_sampling_params();
+    CHECK_FALSE(sp.structured_outputs.has_value());
+  }
+}
+
+// The completion endpoint carries the same mapping.
+TEST_CASE("CompletionRequest response_format json_schema -> structured_outputs.json") {
+  auto j = json::parse(R"({
+    "prompt": "hi",
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {"name":"n","schema":{"type":"string"}}
+    }
+  })");
+  auto req = j.get<CompletionRequest>();
+  SamplingParams sp = req.to_sampling_params();
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->json.has_value());
+  CHECK(json::parse(*sp.structured_outputs->json)["type"] == "string");
+}
+
+// A json_schema response_format WITHOUT the json_schema field is a 400
+// (validate_response_format throws at parse).
+TEST_CASE("response_format json_schema without json_schema field throws") {
+  CHECK_THROWS(json::parse(R"({"messages":[],
+                              "response_format":{"type":"json_schema"}})")
+                   .get<ChatCompletionRequest>());
+}

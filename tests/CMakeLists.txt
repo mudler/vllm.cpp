@@ -43,6 +43,8 @@ vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
 vllm_cpp_add_test(test_apply_grammar_bitmask vllm/v1/structured_output/test_apply_grammar_bitmask.cpp)
 vllm_cpp_add_test(test_backend_native vllm/v1/structured_output/test_backend_native.cpp)
+vllm_cpp_add_test(test_json_schema_to_gbnf vllm/v1/structured_output/test_json_schema_to_gbnf.cpp)
+vllm_cpp_add_test(test_response_format_e2e vllm/v1/structured_output/test_response_format_e2e.cpp)
 vllm_cpp_add_test(test_engine_types vllm/test_engine_types.cpp)
 vllm_cpp_add_test(test_engine_core vllm/v1/test_engine_core.cpp)
 vllm_cpp_add_test(test_input_processor vllm/v1/test_input_processor.cpp)

@@ -372,13 +372,19 @@ TEST_CASE("native: MakeNativeBackendFactory builds a working backend") {
   backend->destroy();
 }
 
-// JSON is deferred to Task 5: compile_grammar throws.
-TEST_CASE("native: JSON/json_object throw (deferred to M3.4 Task 5)") {
+// JSON / json_object now compile (M3.4 Task 5: JSON-schema -> GBNF). The
+// schema-acceptance behavior is covered in test_json_schema_to_gbnf.cpp (this
+// fixture's vocab has no JSON-structural single-char tokens); here we only
+// assert the compile path no longer throws and yields a grammar. A malformed
+// schema still throws.
+TEST_CASE("native: JSON/json_object compile (M3.4 Task 5)") {
   auto backend = MakeBackend();
+  CHECK_NOTHROW(backend->compile_grammar(StructuredOutputOptions::kJson,
+                                         R"({"type":"object"})"));
+  CHECK_NOTHROW(
+      backend->compile_grammar(StructuredOutputOptions::kJsonObject, ""));
   CHECK_THROWS(backend->compile_grammar(StructuredOutputOptions::kJson,
-                                        R"({"type":"object"})"));
-  CHECK_THROWS(backend->compile_grammar(StructuredOutputOptions::kJsonObject,
-                                        ""));
+                                        "{not valid json"));
 }
 
 // ─── THE INVARIANT: fill_bitmask(t) == accept_tokens([t]) over the WHOLE vocab ──

@@ -29,6 +29,7 @@
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/tokenizer/unicode_data.h"
+#include "vllm/v1/structured_output/json_schema_to_gbnf.h"
 
 namespace vllm::v1 {
 namespace {
@@ -1207,11 +1208,24 @@ NativeStructuredOutputBackend::compile_grammar(
     case StructuredOutputOptions::kRegex:
       gbnf = RegexToGbnf(grammar_spec).Convert();
       break;
-    case StructuredOutputOptions::kJson:
+    case StructuredOutputOptions::kJson: {
+      // The spec is the JSON schema string (get_structured_output_key stores
+      // the json.dumps form). Parse it, then lower to GBNF (§9 original).
+      nlohmann::json schema;
+      try {
+        schema = nlohmann::json::parse(grammar_spec);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(
+            std::string("native backend: JSON schema is not valid JSON: ") +
+            e.what());
+      }
+      gbnf = JsonSchemaToGbnf(schema);
+      break;
+    }
     case StructuredOutputOptions::kJsonObject:
-      throw std::runtime_error(
-          "native backend: JSON / json_object (JSON-schema -> GBNF) is M3.4 "
-          "Task 5; not yet implemented");
+      // json_object == any well-formed JSON value (the spec string is empty).
+      gbnf = JsonObjectGbnf();
+      break;
     case StructuredOutputOptions::kStructuralTag:
       throw std::runtime_error(
           "native backend: STRUCTURAL_TAG is deferred (see backend_types.h)");

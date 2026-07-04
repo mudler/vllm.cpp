@@ -4,7 +4,10 @@
 
 #include "vllm/entrypoints/openai/protocol.h"
 
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vllm::entrypoints::openai {
@@ -53,6 +56,79 @@ nlohmann::json OrNull(const std::optional<std::string>& v) {
   return nullptr;
 }
 
+// Parse the OpenAI `response_format` object (engine/protocol.py:156 ResponseFormat
+// + :123 JsonSchemaResponseFormat). Mirrors validate_response_format
+// (completion/protocol.py:387 / chat_completion/protocol.py:700): a present
+// response_format needs a string `type`, and `json_schema` type requires the
+// json_schema field (its `schema` alias). Throws on a malformed shape (surfaces
+// as a 400 bad request).
+void ParseResponseFormat(const nlohmann::json& j,
+                         std::optional<ResponseFormat>& out) {
+  auto it = j.find("response_format");
+  if (it == j.end() || it->is_null()) return;
+  const nlohmann::json& rf = *it;
+  if (!rf.is_object()) {
+    throw std::runtime_error("response_format must be an object");
+  }
+  ResponseFormat r;
+  if (auto t = rf.find("type"); t != rf.end() && t->is_string()) {
+    r.type = t->get<std::string>();
+  } else {
+    throw std::runtime_error("response_format requires a string 'type'");
+  }
+  if (auto js = rf.find("json_schema"); js != rf.end() && js->is_object()) {
+    JsonSchemaResponseFormat jsr;
+    GetOr(*js, "name", jsr.name);
+    GetOpt(*js, "description", jsr.description);
+    // The schema is carried on the wire as `schema` (aliased to json_schema).
+    if (auto sc = js->find("schema"); sc != js->end() && !sc->is_null()) {
+      jsr.json_schema = *sc;
+    }
+    GetOpt(*js, "strict", jsr.strict);
+    r.json_schema = std::move(jsr);
+  }
+  // validate_response_format: json_schema type must carry the json_schema field.
+  if (r.type == "json_schema" && !r.json_schema.has_value()) {
+    throw std::runtime_error(
+        "When response_format type is 'json_schema', the 'json_schema' field "
+        "must be provided.");
+  }
+  out = std::move(r);
+}
+
+// Normalize a parsed response_format into SamplingParams.structured_outputs
+// (completion/protocol.py:309-338 / chat_completion/protocol.py:629-658):
+//   json_object -> structured_outputs.json_object = true
+//   json_schema -> structured_outputs.json = the schema (serialized)
+//   text / absent -> no structured-output constraint.
+// Merges onto any existing structured_outputs (upstream `replace(...)`), though
+// at T0 nothing else populates it.
+void ApplyResponseFormat(const std::optional<ResponseFormat>& rf,
+                         SamplingParams& sp) {
+  if (!rf.has_value()) return;
+  StructuredOutputsParams so =
+      sp.structured_outputs.value_or(StructuredOutputsParams{});
+  bool enabled = false;
+  if (rf->type == "json_object") {
+    so.json_object = true;
+    enabled = true;
+  } else if (rf->type == "json_schema") {
+    // Parse-time validation guarantees json_schema is present; a json_schema
+    // WITHOUT a `schema` payload means "any JSON object" (upstream passes
+    // json=None through, which the engine treats as json_object); mirror that by
+    // requiring the schema here and falling back only when absent.
+    if (rf->json_schema.has_value() &&
+        rf->json_schema->json_schema.has_value()) {
+      so.json = rf->json_schema->json_schema->dump();
+    } else {
+      so.json_object = true;
+    }
+    enabled = true;
+  }
+  // "text" (or any other type, e.g. deferred structural_tag) -> no constraint.
+  if (enabled) sp.structured_outputs = std::move(so);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -95,6 +171,7 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
+  ParseResponseFormat(j, r.response_format);
 }
 
 void from_json(const nlohmann::json& j, ChatMessage& m) {
@@ -133,6 +210,7 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
+  ParseResponseFormat(j, r.response_format);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +245,8 @@ SamplingParams CompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // response_format -> structured_outputs (completion/protocol.py:309-338).
+  ApplyResponseFormat(response_format, sp);
   sp.PostInit();
   return sp;
 }
@@ -202,6 +282,8 @@ SamplingParams ChatCompletionRequest::to_sampling_params(
   sp.include_stop_str_in_output = include_stop_str_in_output;
   sp.output_kind =
       stream ? RequestOutputKind::kDelta : RequestOutputKind::kFinalOnly;
+  // response_format -> structured_outputs (chat_completion/protocol.py:629-658).
+  ApplyResponseFormat(response_format, sp);
   sp.PostInit();
   return sp;
 }

@@ -1070,3 +1070,17 @@ dgx inspection of the checkpoint).
   greedy + throughput gates vs oracle. CONCURRENCY LESSON: two code-writing subagents on the same
   working tree caused a commit-bundling mislabel (`2ce938f`) — use worktree isolation or explicit-
   path staging for parallel code-writers, never `git add -A` while a subagent is mid-write.
+- **2026-07-04 (27B FULLY CPU-WIRED END-TO-END — second gate model runs through the engine on CPU)**
+  Through `0f12f18`, the 27B (dense/W4A4/text-path) is assembled end-to-end on CPU: arch-select
+  in `model_loader.cpp` (`IsDenseArch`: num_experts==0 → `LoadQwen3_5Dense`) → dense weights →
+  the (arch-agnostic) Executor/EngineCore/LLMEngine stack → `Qwen3_5DenseModel::Forward` (paged)
+  → runner dense route. MoE-typing was confined to just GPUModelRunner (`{moe,dense}` pointer
+  pair) + LoadedEngine (`optional<Moe>/optional<Dense>`); the rest of the stack is arch-agnostic
+  via `ModelRunnerBase`. NO 35B regression (MoE path byte-equivalent). CPU suite **87/87**.
+  The 27B reused the 35B backbone + paged machinery + engine stack wholesale — only genuinely new
+  code: dense SwiGLU MLP, W4A4→bf16 loader routing, IsDenseArch dispatch. 27B REMAINING = only
+  GPU steps (serialize behind the 35B kernel jobs): capture pip-vLLM greedy oracle golden → wire
+  the M2.7 tensor-core GEMM for the dense linears (6a: reciprocal global-scale + CT name remap,
+  bf16 activations, NO new kernel) → flip `kW4A4ForwardReady` → close 27B greedy + throughput
+  gates vs vLLM. 35B in parallel: M2.8 landed `5da39b0` (fast decode argmax + vectorized M=1 fp4
+  GEMV); agent finalizing (gemvx→fp4 routing + measurement) — measured decode gap pending.

@@ -300,6 +300,34 @@ TEST_CASE("qwen35 paged: full-prefill batch-of-1 equals dense forward") {
   CHECK(d < 1e-2);
 }
 
+// Same anchor but block_size < T with NON-CONTIGUOUS blocks {2,0}, so the
+// sequence spans a KV block boundary and the multi-column block_table
+// indirection + the 2*bs*H*D block stride are actually exercised at the model
+// level (the ≤block-size anchors above keep every token in block 0). A stride
+// or block-table-wiring regression that the single-block anchors miss fails here.
+TEST_CASE("qwen35 paged: multi-block full-prefill (block_size<T) equals dense") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6, vocab = c.vocab_size;
+  std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+
+  const std::vector<float> dense = Qwen3_5Model::ForwardDense(ids, pos, w, c, q);
+
+  // block_size=4: tokens 0-3 → block 2, tokens 4-5 → block 0 (non-contiguous).
+  CachePool pool(c, /*num_blocks=*/8, /*block_size=*/4);
+  const CommonAttentionMetadata am = PrefillAttnMeta(T, {2, 0}, 4, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(T, 0);
+  const std::vector<float> paged = Qwen3_5Model::Forward(
+      ids, pos, am, gm, pool.attn_kv, pool.gdn_state, w, c, q);
+
+  REQUIRE(paged.size() == static_cast<size_t>(T * vocab));
+  const double d = MaxAbsDiff(paged, dense, paged.size());
+  MESSAGE("paged==dense multi-block max|diff| = " << d);
+  CHECK(d < 1e-2);
+}
+
 TEST_CASE("qwen35 paged: decode via KV cache equals dense over full sequence") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);

@@ -542,6 +542,13 @@ TEST_CASE("llm_engine: a stop string ends the request through the full loop") {
   CHECK(*result.outputs[0].stop_reason == stop);
   // The reqs_to_abort feedback tore the request down in the EngineCore too.
   CHECK_FALSE(h.engine.has_unfinished_requests());
+  // ...AND reached the SCHEDULER: a string stop is invisible to the scheduler's
+  // token-level check_stop, so ONLY the reqs_to_abort -> abort_requests feedback
+  // removes it. has_unfinished_requests() above only reflects OutputProcessor
+  // state (which erases on finish regardless); this asserts the abort genuinely
+  // propagated to the scheduler, so the request is not silently left running
+  // (leaked KV + wasted compute) if the feedback were dropped.
+  CHECK(h.scheduler.get_num_unfinished_requests() == 0);
   // Output truncated before the stop string (include_stop_str_in_output=false).
   CHECK(result.outputs[0].text.find(stop) == std::string::npos);
 }

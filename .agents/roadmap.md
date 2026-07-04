@@ -55,12 +55,19 @@ model load (M0.10, k-quant dequant) remains open (T0).**
   DEFERRED (~M2.2, unregistered). **← M0 exit criterion (safetensors) ✅**
   - ☐ **M0.9-GGUF (open, re-scoped as M0.10 below)**: the safetensors DoD is
     met; the GGUF model-load half of the original DoD is broken out to M0.10.
-- ☐ **M0.10 GGUF model load** (T0/MVP, re-scoped out of M0.9): the APEX GGUFs
+- ☑ **M0.10 GGUF model load** (T0/MVP, re-scoped out of M0.9): the APEX GGUFs
   (arch `qwen35moe`) are k-quant (Q4_K/Q5_K/Q6_K/Q8_0, IQ2_S id22, IQ4_XS id23),
-  NOT NVFP4 — we read the GGUF *container* (M0.4, byte-verified) but have no
-  k-quant dequant. Needs: k-quant→bf16 dequant kernels (Q4_K/Q5_K/Q6_K/Q8_0/
-  IQ2_S/IQ4_XS, matching ggml's dequant) + GGUF tensor-name→param mapping for
-  `qwen35moe` + greedy verify vs oracle. **← GGUF gate (#2) at model level.**
+  NOT NVFP4. Done `6ef3f12` (k-quant dequant: F32/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/Q3_K
+  → f32/bf16, byte-exact vs ggml-quants.c — reviewed PASS, line-by-line verified)
+  → `1a4db5c` (GGUF → Qwen3_5MoeWeights loader: qwen tensor-name mapping, the
+  convert-time transform INVERSIONS [norm w+1, ssm_a=-exp(A_log), V-head
+  grouped→tiled reorder], MoE expert 3-d split, HfConfigFromGguf, model_loader
+  `.gguf` routing — reviewed PASS, transforms verified vs the safetensors loader +
+  forward + convert script). CPU 76/76 (synthetic-GGUF tests). **← GGUF gate (#2)
+  at model level — CPU path done.** DEFERRED: IQ2_S/IQ4_XS i-quants (Mini/Quality
+  variants; Compact/Balanced are pure K-quant+Q8_0+F32 → work now); the real APEX
+  GGUF end-to-end greedy parity vs the safetensors 35B is dgx-pending (quant
+  fidelity + real 16k/32v head dims).
 
 ## M1 — The engine (concurrency, correctness under load)
 

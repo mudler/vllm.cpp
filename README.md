@@ -13,7 +13,7 @@ and OpenAI-compatible server.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | 🚧 forward parity (M0.9, greedy-verified on GB10) | 🗓 pending (k-quant dequant) | 🚧 in development (M0; serving M1–M3) |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | 🚧 forward parity (M0.9, greedy-verified on GB10) | 🚧 load path done (k-quant dequant + qwen35moe loader; real-file parity dgx-pending) | 🚧 in development (M0–M3; engine + OpenAI server + tools + grammars on CPU) |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -33,7 +33,7 @@ and OpenAI-compatible server.
 | Format | Status |
 |---|---|
 | NVFP4 (W4A4, Blackwell) | 🚧 in development (MVP gate) |
-| GGUF quants (k-quants, Q8_0, …) | 🚧 in development (MVP gate) |
+| GGUF quants (Q4_K/Q5_K/Q6_K/Q3_K, Q8_0, F32) | 🚧 dequant + qwen35moe load path done on CPU (real-file greedy parity dgx-pending); IQ2_S/IQ4_XS i-quants pending |
 | fp8, MXFP4 | 🗓 planned (post-MVP T1) |
 
 Legend: ✅ supported & parity-tested · 🚧 in development · 🗓 planned.

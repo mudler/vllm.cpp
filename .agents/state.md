@@ -722,3 +722,30 @@
   a stricter/more-helpful default, documented). NEXT toward the serving MVP: **M3.6
   conformance suite** + **M3.7 docs**; plus **M0.10 GGUF model load** and the **dgx
   bring-up** (CUDA kernels + 35B paged gate on GB10).
+- **2026-07-04 (M0.10 done — GGUF model load, CPU path)** — The user-mandated
+  "can we read gguf" gate is met on the CPU-testable path. `1a4db5c` (+ `6ef3f12`).
+  Pieces: **k-quant DEQUANT** (gguf_dequant.{h,cpp}: F32/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/
+  Q3_K block bytes → f32/bf16, ggml block formats ported byte-for-byte — the
+  reviewer diffed every unpack + get_scale_min_k4 + the Q3_K aux shuffle line-by-
+  line vs ggml-quants.c and hand-computed Q4_K/Q3_K, NO divergence); **the GGUF →
+  Qwen3_5MoeWeights LOADER** (qwen3_5_gguf_weights.{h,cpp}: qwen35moe/qwen3next
+  tensor-name mapping → the SAME OwnedTensor bf16 targets the safetensors loader
+  produces [shared M0.9 forward, transpose delta ZERO because the reader reverses
+  ggml dims to torch [out,in]], the convert-time transform INVERSIONS [norm w+1,
+  ssm_a=-exp(A_log)→a_log=log(-ssm_a), the V-head grouped→tiled reorder], MoE
+  expert 3-d split, HfConfigFromGguf); **model_loader `.gguf` routing**. Both tasks
+  reviewed PASS (dequant byte-exact vs ggml; loader transforms verified vs the
+  safetensors loader + forward + convert script — the V-head reorder index math
+  hand-traced with num_v=4≠num_k=2). CPU ctest 76/76 (clean rebuild); the tests use
+  synthetic GGUFs (gguf_builder.h) with value-level assertions. **DEPENDENCY
+  DEVIATION:** none — the GGUF loader is original (§9), ggml is a FORMAT reference
+  only (no ggml build/runtime dep). **DEFERRED:** IQ2_S(22)/IQ4_XS(23) i-quants
+  (codebook-based; the Compact/Balanced APEX variants are pure K-quant+Q8_0+F32 →
+  load now; Mini/Quality need i-quants — they throw a clear error); the qwen3next
+  combined `ssm_ba` name (target is qwen35moe). **DGX-PENDING:** the real APEX
+  Compact/Balanced GGUF end-to-end load + greedy parity vs the safetensors 35B
+  (quant fidelity + the real 16k/32v head dims are exercised only synthetically on
+  CPU). Run on GB10 via a model dir pointing at ~/work/apex/qwen36_35b/*.gguf.
+  NEXT toward the serving MVP: **M3.6 conformance suite** + **M3.7 docs/README**;
+  and the **dgx bring-up** (the whole CUDA stack + the 35B paged greedy gate + this
+  GGUF greedy gate on GB10 — scripts/dgx-bringup.sh).

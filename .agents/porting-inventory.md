@@ -159,7 +159,7 @@ long-context uses it). T2: the rest.
 | Method | Upstream | Tier |
 |---|---|---|
 | **NVFP4 (modelopt_fp4 + compressed-tensors w4a4_nvfp4)** — gate checkpoints; W4A4 MMA on sm_121 for MoE grouped GEMM + dense | `quantization/modelopt.py`, `compressed_tensors/` | **T0** 🚧 `65788b3` (W4A16 dequant-to-bf16 only; native W4A4 MMA M2.2) |
-| **GGUF quants** — container + dequant/matmul for types in our benchmark files (Q4_K/Q5_K/Q6_K/Q8_0/F16/F32 + NVFP4 GGUF extension types from the APEX/killgate tooling) | `quantization/gguf.py`, `model_loader/gguf_loader.py` | **T0 (gate)** |
+| **GGUF quants** — container + dequant/matmul for types in our benchmark files (Q4_K/Q5_K/Q6_K/Q8_0/F16/F32 + NVFP4 GGUF extension types from the APEX/killgate tooling) | `quantization/gguf.py`, `model_loader/gguf_loader.py` | **T0 (gate)** ✅ `1a4db5c` (dequant F32/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/Q3_K byte-exact vs ggml + the qwen35moe GGUF loader [name mapping, convert-transform inversions, expert split, HfConfig] + model_loader `.gguf` routing; IQ2_S/IQ4_XS i-quants deferred; real-APEX greedy parity dgx-pending) |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py` | T1 |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
 | AWQ/GPTQ (+Marlin), compressed-tensors int schemes | various | T2 |

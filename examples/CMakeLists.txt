@@ -10,6 +10,14 @@ add_executable(dequant_nvfp4 dequant_nvfp4/main.cpp)
 target_link_libraries(dequant_nvfp4 PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(dequant_nvfp4)
 
+# vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
+# measurement tool. Links the full C++ engine (vllm::vllm) so it can build both a
+# synthetic CPU engine (no --model) and a real loaded engine (--model on dgx).
+add_executable(vllm-bench bench/main.cpp)
+target_link_libraries(vllm-bench PRIVATE vllm::vllm)
+target_include_directories(vllm-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+vllm_cpp_set_warnings(vllm-bench)
+
 # vllm-cli: a llama.cpp-style client driven ENTIRELY through the C ABI. It links
 # the packaged SHARED libvllm (vllm_shared) using only the public include/vllm.h,
 # proving library-first consumption (M3.5 Task 3).

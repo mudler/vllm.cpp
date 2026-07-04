@@ -1,0 +1,134 @@
+// vllm-bench — the M2.1 throughput/latency benchmark harness for vllm.cpp.
+//
+// This is the tool that MEASURES gate #1 (throughput parity vs vLLM,
+// .agents/gates.md): it drives the V1 LLMEngine step() loop at a fixed
+// concurrency and reports request/output/total token throughput plus
+// TTFT/TPOT/ITL/E2EL, with a prefill-vs-decode split. The metrics + report
+// format mirror `vllm bench serve` / `vllm bench throughput`
+// (vllm/benchmarks/serve.py + throughput.py) so the numbers are directly
+// comparable to a vLLM run on the same box, model and workload. See
+// examples/bench/bench_core.h for the cited metric mapping.
+//
+//   vllm-bench [--model <dir|.gguf>] [--num-prompts N] [--input-len L]
+//              [--output-len O] [--concurrency C] [--seed S]
+//              [--temperature T]
+//
+// With NO --model it builds a SYNTHETIC tiny CPU engine so the harness runs on
+// the dev box (toy weights => meaningless numbers; the point is the harness).
+// On dgx.casa with a real --model it is the parity-measurement tool, e.g.:
+//
+//   ./vllm-bench --model <snapshot-dir-of-Qwen3.6-35B-A3B-NVFP4>
+//                --num-prompts 200 --input-len 1024 --output-len 128
+//                --concurrency 64
+//
+// Compare its throughput block against, on the SAME box + model files:
+//   ~/venvs/vllm-oracle/bin/vllm bench throughput --model <same>
+//                --input-len 1024 --output-len 128 --num-prompts 200
+// Both runs go in .agents/parity-ledger.md (the lead records them).
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <string>
+
+#include "bench_core.h"
+
+namespace {
+
+using vllm::bench::BenchConfig;
+
+void Usage(const char* argv0, std::FILE* out) {
+  std::fprintf(
+      out,
+      "usage: %s [--model <dir|.gguf>] [--num-prompts N] [--input-len L]\n"
+      "          [--output-len O] [--concurrency C] [--seed S]\n"
+      "          [--temperature T]\n"
+      "\n"
+      "Throughput/latency benchmark over the vllm.cpp V1 LLMEngine, mirroring\n"
+      "`vllm bench serve` metrics. With no --model, a synthetic CPU engine runs\n"
+      "(numbers meaningless; smoke only). Defaults: --num-prompts 8 "
+      "--input-len 16\n"
+      "--output-len 16 --concurrency 4 --seed 0 --temperature 0 (greedy).\n",
+      argv0);
+}
+
+const char* NextArg(int argc, char** argv, int& i) {
+  if (i + 1 >= argc) {
+    std::fprintf(stderr, "vllm-bench: missing value for '%s'\n", argv[i]);
+    Usage(argv[0], stderr);
+    std::exit(2);
+  }
+  return argv[++i];
+}
+
+bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string flag = argv[i];
+    if (flag == "--model") {
+      cfg.model_path = NextArg(argc, argv, i);
+    } else if (flag == "--num-prompts") {
+      cfg.num_prompts = std::atoi(NextArg(argc, argv, i));
+    } else if (flag == "--input-len") {
+      cfg.input_len = std::atoi(NextArg(argc, argv, i));
+    } else if (flag == "--output-len") {
+      cfg.output_len = std::atoi(NextArg(argc, argv, i));
+    } else if (flag == "--concurrency") {
+      cfg.concurrency = std::atoi(NextArg(argc, argv, i));
+    } else if (flag == "--seed") {
+      cfg.seed = std::strtoull(NextArg(argc, argv, i), nullptr, 10);
+    } else if (flag == "--temperature") {
+      cfg.temperature = std::atof(NextArg(argc, argv, i));
+    } else if (flag == "-h" || flag == "--help") {
+      Usage(argv[0], stdout);
+      exit_code = 0;
+      return false;
+    } else {
+      std::fprintf(stderr, "vllm-bench: unknown argument '%s'\n", flag.c_str());
+      Usage(argv[0], stderr);
+      exit_code = 2;
+      return false;
+    }
+  }
+  if (cfg.num_prompts <= 0 || cfg.input_len <= 0 || cfg.output_len <= 0 ||
+      cfg.concurrency <= 0) {
+    std::fprintf(stderr,
+                 "vllm-bench: --num-prompts/--input-len/--output-len/"
+                 "--concurrency must be positive\n");
+    exit_code = 2;
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  BenchConfig cfg;
+  int exit_code = 0;
+  if (!ParseArgs(argc, argv, cfg, exit_code)) {
+    return exit_code;
+  }
+
+  std::fprintf(stderr,
+               "vllm-bench: %s engine | num_prompts=%d input_len=%d "
+               "output_len=%d concurrency=%d seed=%llu temp=%.2f\n",
+               cfg.model_path.empty() ? "SYNTHETIC (no --model)"
+                                       : cfg.model_path.c_str(),
+               cfg.num_prompts, cfg.input_len, cfg.output_len, cfg.concurrency,
+               static_cast<unsigned long long>(cfg.seed), cfg.temperature);
+
+  try {
+    const vllm::bench::BenchResult res = vllm::bench::RunBench(cfg);
+    vllm::bench::PrintReport(cfg, res, stdout);
+    if (res.completed != cfg.num_prompts) {
+      std::fprintf(stderr,
+                   "vllm-bench: only %d/%d requests completed\n", res.completed,
+                   cfg.num_prompts);
+      return 1;
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "vllm-bench: failed: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}

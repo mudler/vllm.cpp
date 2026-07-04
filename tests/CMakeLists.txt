@@ -72,6 +72,12 @@ if(VLLM_CPP_SERVER)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 
+# M2.1: the benchmark harness smoke — drives the synthetic engine through the
+# full admission + step() measurement loop (shares examples/bench/bench_core.h
+# with the vllm-bench CLI).
+vllm_cpp_add_test(test_bench examples/test_bench.cpp)
+target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench)
+
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)

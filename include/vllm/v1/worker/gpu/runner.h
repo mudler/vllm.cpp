@@ -53,6 +53,7 @@
 #define VLLM_V1_WORKER_GPU_RUNNER_H_
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -83,6 +84,31 @@ namespace vllm::v1 {
 bool reorder_batch_to_split_decodes_and_prefills(
     InputBatch& input_batch, const SchedulerOutput& scheduler_output,
     int decode_threshold = 1);
+
+// apply_grammar_bitmask (vllm/v1/structured_output/utils.py::apply_grammar_bitmask
+// @ e24d1b24, M3.4 Task 3). Applies the per-step structured-output grammar mask
+// to the gathered [num_logits, vocab] f32 `logits` (the exact tensor the runner
+// feeds Sampler::forward), IN PLACE, BEFORE sampling.
+//
+// The `grammar_output` bitmask rows are COMPACTED — one row per structured
+// request, ordered as `grammar_output.structured_output_request_ids`. `logits`
+// rows are in the runner's DENSE batch order (`req_ids`, one per active request).
+// This reorders each structured req's compacted bitmask row onto its dense logits
+// row (utils.py:112-140), unpacks it (bit (t & 31) of word (t >> 5) SET => token t
+// ALLOWED; CLEAR => FORBIDDEN), and sets every forbidden token's logit to -inf
+// (reusing the M1.7 apply_allowed_token_ids -inf masking). Non-structured rows are
+// untouched (all-allowed).
+//
+// `scheduled_spec_decode_tokens` supplies each req's spec-token count so the
+// per-req logit offset (utils.py:117-118,134-138) matches upstream; spec-decode is
+// deferred at T0, so the runner passes an EMPTY map (offset 0 => exactly one
+// bitmask row per structured req, aligned to its dense logits row).
+void apply_grammar_bitmask(
+    const GrammarOutput& grammar_output,
+    const std::vector<std::string>& req_ids,
+    const std::map<std::string, std::vector<int32_t>>&
+        scheduled_spec_decode_tokens,
+    vt::Queue& queue, vt::Tensor& logits);
 
 // The batched paged model runner (upstream GPUModelRunner, T0 slice).
 class GPUModelRunner final : public ModelRunnerBase {

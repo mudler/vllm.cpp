@@ -7,11 +7,14 @@
 #include "vllm/v1/worker/gpu/runner.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
+#include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vt/tensor.h"
 
 namespace vllm::v1 {
@@ -105,6 +108,95 @@ bool reorder_batch_to_split_decodes_and_prefills(
     }
   }
   return true;
+}
+
+// ─── apply_grammar_bitmask ──────────────────────────────────────────────────
+// Ported from: vllm/v1/structured_output/utils.py::apply_grammar_bitmask @
+// e24d1b24. See runner.h for the compacted-vs-dense contract + the bit sense.
+void apply_grammar_bitmask(
+    const GrammarOutput& grammar_output,
+    const std::vector<std::string>& req_ids,
+    const std::map<std::string, std::vector<int32_t>>&
+        scheduled_spec_decode_tokens,
+    vt::Queue& queue, vt::Tensor& logits) {
+  const TokenBitmask& bitmask = grammar_output.grammar_bitmask;
+  // No structured request scheduled this step => nothing to mask (no-op).
+  if (grammar_output.structured_output_request_ids.empty() ||
+      bitmask.num_seqs == 0) {
+    return;
+  }
+  const int64_t num_logits = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+
+  // struct_out_req_batch_indices: for each structured req, the logit row = its
+  // dense batch index + the cumulative spec-token offset ahead of it
+  // (utils.py:112-120). At T0 scheduled_spec_decode_tokens is empty, so the
+  // offset stays 0 and logit_index == batch_index.
+  const std::set<std::string> struct_out_req_ids(
+      grammar_output.structured_output_request_ids.begin(),
+      grammar_output.structured_output_request_ids.end());
+  std::unordered_map<std::string, int> struct_out_req_batch_indices;
+  {
+    int cumulative_offset = 0;
+    for (int batch_index = 0;
+         batch_index < static_cast<int>(req_ids.size()); ++batch_index) {
+      const std::string& req_id = req_ids[static_cast<size_t>(batch_index)];
+      const int logit_index = batch_index + cumulative_offset;
+      const auto sit = scheduled_spec_decode_tokens.find(req_id);
+      if (sit != scheduled_spec_decode_tokens.end()) {
+        cumulative_offset += static_cast<int>(sit->second.size());
+      }
+      if (struct_out_req_ids.count(req_id) != 0) {
+        struct_out_req_batch_indices[req_id] = logit_index;
+      }
+    }
+  }
+
+  // Reorder the compacted bitmask onto the dense logits rows and unpack it into a
+  // per-row EXCLUDE mask (utils.py:124-140 reorder + the bit unpack). Rows for
+  // non-structured requests stay all-false (all tokens allowed). The
+  // apply_allowed_token_ids op reads TRUE == "exclude this token" (-> -inf), so a
+  // token is excluded exactly when its grammar bit is CLEAR (forbidden).
+  std::vector<std::vector<uint8_t>> exclude(
+      static_cast<size_t>(num_logits),
+      std::vector<uint8_t>(static_cast<size_t>(vocab), 0));
+  int cumulative_index = 0;
+  for (const std::string& req_id :
+       grammar_output.structured_output_request_ids) {
+    int num_spec_tokens = 0;
+    const auto sit = scheduled_spec_decode_tokens.find(req_id);
+    if (sit != scheduled_spec_decode_tokens.end()) {
+      num_spec_tokens = static_cast<int>(sit->second.size());
+    }
+    const auto bit = struct_out_req_batch_indices.find(req_id);
+    if (bit != struct_out_req_batch_indices.end()) {
+      const int logit_idx = bit->second;
+      for (int i = 0; i < 1 + num_spec_tokens; ++i) {
+        const int bitmask_row = cumulative_index + i;
+        const int logit_row = logit_idx + i;
+        if (logit_row < 0 || logit_row >= static_cast<int>(num_logits) ||
+            bitmask_row < 0 || bitmask_row >= bitmask.num_seqs) {
+          continue;
+        }
+        const int32_t* words =
+            bitmask.data.data() +
+            static_cast<size_t>(bitmask_row) *
+                static_cast<size_t>(bitmask.num_words);
+        std::vector<uint8_t>& row = exclude[static_cast<size_t>(logit_row)];
+        for (int64_t t = 0; t < vocab; ++t) {
+          const int32_t word = words[static_cast<size_t>(t >> 5)];
+          const bool allowed =
+              ((word >> static_cast<int>(t & 31)) & 1) != 0;
+          if (!allowed) row[static_cast<size_t>(t)] = 1;
+        }
+      }
+    }
+    cumulative_index += 1 + num_spec_tokens;
+  }
+
+  // Set every forbidden token's logit to -inf (reuse the M1.7 sampler op; CPU +
+  // CUDA counterparts both exist — CUDA path is dgx-pending like the sampler).
+  apply_allowed_token_ids(queue, logits, exclude);
 }
 
 // ─── GPUModelRunner ─────────────────────────────────────────────────────────
@@ -294,10 +386,6 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
 ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::optional<GrammarOutput>& grammar_output) {
-  // grammar_output carries the per-step structured-output bitmask (M3.4 Task 2
-  // threads it here; Task 3 applies it via apply_grammar_bitmask before
-  // sampling). Unused at T0 — the no-grammar path is a no-op.
-  (void)grammar_output;
   ModelRunnerOutput out;
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {
@@ -322,6 +410,15 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   vt::Tensor logits = vt::Tensor::Contiguous(
       sampled_logits.data(), vt::DType::kF32, queue_.device,
       {static_cast<int64_t>(num_reqs), vocab});
+
+  // Apply the structured-output grammar bitmask (utils.py apply_grammar_bitmask)
+  // to the gathered [num_reqs, vocab] logits BEFORE sampling, when a structured
+  // request is scheduled this step (gpu_model_runner.py:4462-4466). Spec-decode
+  // is deferred at T0, so pass an empty spec-token map (per-req offset 0).
+  if (grammar_output.has_value()) {
+    apply_grammar_bitmask(*grammar_output, exec_state_.req_ids, {}, queue_,
+                          logits);
+  }
 
   // SamplingMetadata in the SAME dense [0, num_reqs) order (M1.7; CLOSES the
   // make_sampling_metadata wiring dep). Then Sampler.forward.

@@ -240,6 +240,88 @@ TEST_CASE("CUDA moe_grouped_gemm_nvfp4 matches the per-expert reference") {
   CheckClose(got, ref, 2e-3f, 2e-3f);
 }
 
+// Large-P case (P>=32): exercises the shared-memory TILED grouped-GEMM path (the
+// launch gates on P; the P=6 case above exercises the naive path). Same per-row
+// reference: grouped GEMM row p == single-expert dequant matmul for expert_ids[p].
+TEST_CASE("CUDA moe_grouped_gemm_nvfp4 tiled path (large P) matches per-expert reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  const int64_t E = 7;
+  const int64_t T = 20;
+  const int64_t top_k = 2;
+  const int64_t P = T * top_k;  // 40 >= 32 => tiled path
+  const int64_t K = 80;   // multiple of 16 but NOT of BK=32 => partial last K-tile
+  const int64_t N = 130;  // odd, crosses the BN=128 tile boundary
+
+  std::vector<Nvfp4Weight> experts;
+  for (int64_t e = 0; e < E; ++e)
+    experts.push_back(MakeNvfp4Weight(N, K, 8000 + static_cast<uint32_t>(e)));
+  const auto act_f = RandomF32(static_cast<size_t>(T * K), 8100);
+  const auto act_bf16 = ToBf16(act_f);
+  std::vector<float> act_r(act_f.size());
+  for (size_t i = 0; i < act_r.size(); ++i) act_r[i] = vt::BF16ToF32(act_bf16[i]);
+
+  std::vector<int32_t> expert_ids(static_cast<size_t>(P));
+  std::vector<int32_t> row_map(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p) {
+    row_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
+    expert_ids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 5 + 2) % E);
+  }
+
+  std::vector<std::vector<uint16_t>> deq(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) {
+    deq[static_cast<size_t>(e)].resize(static_cast<size_t>(N * K));
+    vllm::DequantNvfp4ToBf16(experts[static_cast<size_t>(e)].packed.data(),
+                             experts[static_cast<size_t>(e)].scale.data(),
+                             experts[static_cast<size_t>(e)].scale2, N, K,
+                             deq[static_cast<size_t>(e)].data());
+  }
+  std::vector<float> ref(static_cast<size_t>(P * N), 0.0f);
+  for (int64_t p = 0; p < P; ++p) {
+    const int64_t e = expert_ids[static_cast<size_t>(p)];
+    const int64_t r = row_map[static_cast<size_t>(p)];
+    for (int64_t n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int64_t k = 0; k < K; ++k)
+        acc += act_r[static_cast<size_t>(r * K + k)] *
+               vt::BF16ToF32(deq[static_cast<size_t>(e)][static_cast<size_t>(n * K + k)]);
+      ref[static_cast<size_t>(p * N + n)] = acc;
+    }
+  }
+
+  QueueGuard gq(gpu);
+  DeviceTensor dact(gpu, gq.q, DType::kBF16, {T, K}, act_bf16.data());
+  DeviceTensor deids(gpu, gq.q, DType::kI32, {P}, expert_ids.data());
+  DeviceTensor drow(gpu, gq.q, DType::kI32, {P}, row_map.data());
+  std::vector<std::unique_ptr<DeviceTensor>> packed_bufs, scale_bufs;
+  std::vector<int64_t> pp(static_cast<size_t>(E)), sp(static_cast<size_t>(E));
+  std::vector<float> s2(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) {
+    packed_bufs.push_back(std::make_unique<DeviceTensor>(
+        gpu, gq.q, DType::kI8, std::vector<int64_t>{N, K / 2},
+        experts[static_cast<size_t>(e)].packed.data()));
+    scale_bufs.push_back(std::make_unique<DeviceTensor>(
+        gpu, gq.q, DType::kI8, std::vector<int64_t>{N, K / 16},
+        experts[static_cast<size_t>(e)].scale.data()));
+    pp[static_cast<size_t>(e)] = reinterpret_cast<int64_t>(packed_bufs.back()->ptr());
+    sp[static_cast<size_t>(e)] = reinterpret_cast<int64_t>(scale_bufs.back()->ptr());
+    s2[static_cast<size_t>(e)] = experts[static_cast<size_t>(e)].scale2;
+  }
+  DeviceTensor dpp(gpu, gq.q, DType::kI64, {E}, pp.data());
+  DeviceTensor dsp(gpu, gq.q, DType::kI64, {E}, sp.data());
+  DeviceTensor ds2(gpu, gq.q, DType::kF32, {E}, s2.data());
+  DeviceTensor dout(gpu, gq.q, DType::kF32, {P, N});
+  vt::MoeGroupedGemmNvfp4(gq.q, dout.tensor(), dact.tensor(), deids.tensor(), &drow.tensor(),
+                          dpp.tensor(), dsp.tensor(), ds2.tensor());
+  std::vector<float> got(static_cast<size_t>(P * N));
+  dout.Download(gq.q, got.data());
+  CheckClose(got, ref, 2e-3f, 2e-3f);
+}
+
 // Null row_map => identity (act row p). Exercises the down-projection path.
 TEST_CASE("CUDA moe_grouped_gemm_nvfp4 identity row_map (down-projection path)") {
   if (!HasCuda()) {

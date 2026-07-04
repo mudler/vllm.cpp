@@ -208,7 +208,11 @@ TEST_CASE("CUDA matmul_nvfp4 matches Matmul(act, dequant(w).T) on odd shapes") {
     int64_t m, k, n;
   };
   // K is a multiple of 16 (one group at 16); odd M/N exercise the grid tails.
-  const Dims dims[] = {{1, 16, 1}, {5, 64, 13}, {17, 128, 32}, {3, 256, 7}};
+  // The large-m cases (m>=32) exercise the shared-memory TILED kernel path; the
+  // small-m cases exercise the naive one-thread-per-output path (the launch gates
+  // on m). Odd m/n/k-tile boundaries hit both kernels' tail guards.
+  const Dims dims[] = {{1, 16, 1},   {5, 64, 13},   {17, 128, 32}, {3, 256, 7},
+                       {64, 128, 70}, {33, 80, 40}, {96, 48, 129}};
   uint32_t seed = 4000;
   for (const Dims& d : dims) {
     CAPTURE(d.m);

@@ -227,6 +227,39 @@ size_t ByteOffsetBeforeLossyChars(std::string_view s, size_t char_count) {
 
 }  // namespace
 
+size_t ByteOffsetOfLastCompleteUtf8Char(std::string_view s) {
+  if (s.empty()) return 0;
+  // Walk back over trailing continuation bytes (0x80..0xBF) to the lead byte.
+  // A single character carries at most 3 continuation bytes; a longer run is
+  // structurally invalid and can never be completed, so we don't hold it back.
+  size_t cont = 0;
+  size_t i = s.size();
+  while (i > 0 && (static_cast<uint8_t>(s[i - 1]) & 0xC0) == 0x80) {
+    --i;
+    if (++cont > 3) return s.size();  // over-long continuation run: emit raw
+  }
+  if (i == 0) return s.size();  // continuations with no lead in view: emit raw
+
+  const uint8_t lead = static_cast<uint8_t>(s[i - 1]);
+  size_t need;  // continuation bytes this lead requires
+  if (lead < 0x80) {
+    return s.size();  // ASCII: the trailing bytes are a complete unit already
+  } else if ((lead & 0xE0) == 0xC0) {
+    need = 1;  // 0xC0..0xDF: 2-byte sequence
+  } else if ((lead & 0xF0) == 0xE0) {
+    need = 2;  // 0xE0..0xEF: 3-byte sequence
+  } else if ((lead & 0xF8) == 0xF0) {
+    need = 3;  // 0xF0..0xF7: 4-byte sequence
+  } else {
+    return s.size();  // 0xF8..0xFF: invalid lead, non-completable -> emit raw
+  }
+  // cont == need: the sequence is complete (ends on a boundary).
+  // cont  > need: an extra stray continuation byte trails a complete char; it
+  //   is non-completable -> emit raw.
+  // cont  < need: truncated but completable -> hold back from the lead byte.
+  return cont < need ? i - 1 : s.size();
+}
+
 std::optional<std::pair<std::string, int64_t>> CheckStopStrings(
     std::string_view output_text, size_t new_char_count,
     const std::vector<std::string>& stop, bool include_in_output) {
@@ -444,15 +477,28 @@ std::string BaseIncrementalDetokenizer::GetNextOutputText(bool finished,
   // Upstream slices `buffer_length` CHARS off the end of its Python str;
   // translate that to the byte offset of the same lossy-char boundary so a
   // streamed view never ends mid-UTF-8-character.
-  const size_t length =
+  size_t length =
       buffer_length == 0
           ? output_text_.size()
           : ByteOffsetBeforeLossyChars(output_text_, buffer_length);
+  // A streamed (not-finished) view must end on a complete UTF-8 character so a
+  // multi-byte codepoint split across tokens is never emitted half-formed
+  // (which would make the OpenAI server's json::dump reject the delta). This
+  // applies ALWAYS, independent of stop_buffer_length_ — when there are no stop
+  // strings (stop_buffer_length_ == 0) the stop-string window holds nothing
+  // back, so this UTF-8 boundary is the only thing that does. When finished we
+  // emit everything (any trailing raw/lossy bytes flush in the final text).
+  if (!finished) {
+    length = ByteOffsetOfLastCompleteUtf8Char(
+        std::string_view(output_text_).substr(0, length));
+  }
   if (!delta) return output_text_.substr(0, length);
 
   if (last_output_text_offset_ < length) {
     std::string next = output_text_.substr(
         last_output_text_offset_, length - last_output_text_offset_);
+    // Only advance to the emitted (complete) boundary; any held-back incomplete
+    // tail is emitted on a later call once subsequent tokens complete it.
     last_output_text_offset_ = length;
     return next;
   }

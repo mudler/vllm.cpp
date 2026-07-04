@@ -7,11 +7,17 @@
 // - Text is raw UTF-8 bytes, never lossily re-encoded: where upstream's
 //   Python str carries U+FFFD ("�") for invalid byte runs, we emit the raw
 //   bytes verbatim. The hold-back check (upstream's `endswith("�")`), the
-//   prefix-length arithmetic, the stop-string hold-back window
-//   (stop_buffer_length_), and the GetNextOutputText slicing all replicate
-//   Python's lossy CHARACTER semantics exactly (see LossyStep in the .cpp),
-//   so streamed views never end mid-UTF-8-character. (An earlier byte-based
-//   hold-back window/slice was a deviation; now resolved.)
+//   prefix-length arithmetic, and the stop-string hold-back window
+//   (stop_buffer_length_) all replicate Python's lossy CHARACTER semantics
+//   exactly (see LossyStep in the .cpp). On top of that, GetNextOutputText
+//   ALWAYS trims a streamed (not-finished) view to the last complete UTF-8
+//   character via ByteOffsetOfLastCompleteUtf8Char, independent of
+//   stop_buffer_length_ — so a multi-byte codepoint split across tokens is
+//   never streamed half-formed (which would make the server's json::dump
+//   reject the delta), even when there are no stop strings
+//   (stop_buffer_length_ == 0). Genuinely invalid, non-completable trailing
+//   bytes still pass through raw so the stream never stalls. (An earlier
+//   byte-based hold-back window/slice was a deviation; now resolved.)
 // - DetokenizerRequest carries the detokenization-relevant subset of
 //   upstream's EngineCoreRequest + SamplingParams (no prompt_embeds).
 #pragma once
@@ -38,6 +44,18 @@ struct DetokenizerRequest {
   bool include_stop_str_in_output = false;
   size_t min_tokens = 0;
 };
+
+// Byte offset at which a streamed view of `s` must end so it never cuts a
+// multi-byte UTF-8 character in half. Returns s.size() when `s` already ends on
+// a complete character boundary; otherwise the offset of the START of a
+// truncated-but-COMPLETABLE trailing sequence (a lead byte whose continuation
+// bytes have not all arrived yet), so those bytes are held back until a later
+// token completes them. Genuinely invalid / non-completable trailing bytes (a
+// stray continuation byte, an over-full sequence, an invalid lead) are NOT held
+// back — they pass through as raw bytes (the recorded raw-bytes deviation) so
+// the stream never stalls. This is the deviation-specific guard that keeps
+// streamed deltas structurally valid UTF-8 regardless of stop_buffer_length_.
+size_t ByteOffsetOfLastCompleteUtf8Char(std::string_view s);
 
 // check_stop_strings: checks if any stop strings are matched and returns
 // {stop_string, truncate_to} if so. `truncate_to` is the byte length to

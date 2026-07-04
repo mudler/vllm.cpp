@@ -37,6 +37,7 @@
 using nlohmann::json;
 using vllm::tok::MapBytesToUnicode;
 using vllm::tok::Tokenizer;
+using vllm::v1::ByteOffsetOfLastCompleteUtf8Char;
 using vllm::v1::CheckStopStrings;
 using vllm::v1::ConvertPromptIdsToTokens;
 using vllm::v1::DetokenizeIncrementally;
@@ -508,6 +509,63 @@ TEST_CASE("stop strings via Update (detokenizer.py stop bookkeeping)") {
     REQUIRE(stop.has_value());
     CHECK(*stop == "hello");
     CHECK(det2.OutputText() == "");
+  }
+}
+
+TEST_CASE("ByteOffsetOfLastCompleteUtf8Char holds back only completable tails") {
+  // Complete inputs: the whole string is returned (nothing held back).
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("") == 0);
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("hello") == 5);          // ASCII
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("h\xC3\xA9") == 3);      // é complete
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xE5\x81\x9C") == 3);   // 停 complete
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xF0\x9F\x8C\x8D") == 4);  // 🌍
+
+  // Truncated-but-COMPLETABLE trailing lead: hold back from the lead byte.
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("hi\xC3") == 2);            // é lead only
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("hi\xE5\x81") == 2);        // 2 of 3
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xF0") == 0);             // 1 of 4
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xF0\x9F") == 0);        // 2 of 4
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("ab\xF0\x9F\x8C") == 2);  // 3 of 4
+
+  // A COMPLETE multibyte char with trailing text stays complete.
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xF0\x9F\x8C\x8D!") == 5);
+
+  // Genuinely INVALID / non-completable trailing bytes are emitted raw (no
+  // stall): a lone continuation byte, a run of >3 continuations, an over-full
+  // sequence, an invalid F8.. lead.
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("a\x80") == 2);          // stray cont
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("a\x80\x80\x80\x80") == 5);  // >3 cont
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("\xC3\xA9\xA9") == 3);   // extra cont
+  CHECK(ByteOffsetOfLastCompleteUtf8Char("a\xFF") == 2);          // invalid lead
+}
+
+TEST_CASE("streamed deltas are always valid UTF-8 (no stop strings)") {
+  const Tokenizer& tok = Fixture();
+  // The exact bug scenario: stop_buffer_length_ == 0, a multi-byte char split
+  // across >=2 Update() calls. Every non-final delta must be structurally
+  // valid UTF-8; concatenated deltas == the full text.
+  const std::vector<std::vector<int32_t>> streams = {
+      {22, 23},              // 🌍 over 2 byte-fragment tokens
+      {26, 27, 28, 29},      // 🌍 over 4 single-byte tokens
+      {24, 25},              // é over 2 single-byte tokens
+      {13, 22, 23, 24, 25},  // "hello" + 🌍 + é
+  };
+  for (const auto& ids : streams) {
+    DetokenizerRequest request;  // no stop strings -> stop_buffer_length_ == 0
+    auto det = MakeSlow(tok, std::move(request));
+    std::string streamed;
+    for (size_t i = 0; i < ids.size(); ++i) {
+      det.Update({ids[i]}, false);
+      const bool finished = i + 1 == ids.size();
+      const std::string delta = det.GetNextOutputText(finished, /*delta=*/true);
+      CAPTURE(delta);
+      if (!finished) CHECK(IsValidUtf8(delta));  // never split mid-character
+      // Non-delta cumulative view is also valid mid-stream.
+      if (!finished) CHECK(IsValidUtf8(det.GetNextOutputText(false, false)));
+      streamed += delta;
+    }
+    CHECK(IsValidUtf8(streamed));
+    CHECK(streamed == det.OutputText());
   }
 }
 

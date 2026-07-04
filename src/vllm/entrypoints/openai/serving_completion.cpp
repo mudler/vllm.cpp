@@ -8,6 +8,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/openai/serving_utils.h"
+
 namespace vllm::entrypoints::openai {
 
 OpenAIServingCompletion::OpenAIServingCompletion(v1::LLMEngine& engine,
@@ -58,7 +60,11 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
           CompletionResponseStreamChoice choice;
           choice.index = 0;  // output.index + prompt_idx * num_choices; T0 == 0
-          choice.text = delta_text;
+          // SanitizeUtf8: our detokenizer keeps raw bytes (not upstream's lossy
+          // str), so a split/invalid multibyte run here would make the chunk's
+          // json dump() below throw → 500. Replace invalid subparts with U+FFFD
+          // (matches upstream str semantics). See serving_utils.h.
+          choice.text = SanitizeUtf8(delta_text);
           choice.finish_reason = output.finish_reason;
 
           CompletionStreamResponse chunk;
@@ -90,7 +96,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
   for (const CompletionOutput& output : final_res.outputs) {
     CompletionResponseChoice choice;
     choice.index = static_cast<int>(response.choices.size());
-    choice.text = output.text;  // echo deferred
+    choice.text = SanitizeUtf8(output.text);  // echo deferred; see serving_utils.h
     choice.finish_reason = output.finish_reason;
     response.choices.push_back(std::move(choice));
     num_generated_tokens += static_cast<int>(output.token_ids.size());

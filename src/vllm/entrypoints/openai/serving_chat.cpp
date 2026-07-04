@@ -8,6 +8,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/entrypoints/openai/serving_utils.h"
+
 namespace vllm::entrypoints::openai {
 
 namespace {
@@ -102,7 +104,9 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
           ChatCompletionResponseStreamChoice choice;
           choice.index = 0;
           // The content delta (:613 DeltaMessage(content=delta_text)).
-          choice.delta.content = delta_text;
+          // SanitizeUtf8 (see serving_utils.h): raw-byte deltas may carry an
+          // invalid/split multibyte run that would make dump() below throw.
+          choice.delta.content = SanitizeUtf8(delta_text);
           // :663-705 finish_reason set only on the terminal chunk (else None).
           if (output.finish_reason.has_value()) {
             choice.finish_reason = *output.finish_reason;  // else "stop" (:692)
@@ -138,7 +142,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     ChatCompletionResponseChoice choice;
     choice.index = output.index;
     choice.message.role = kAssistantRole;
-    choice.message.content = output.text;  // reasoning / tool_calls deferred
+    // reasoning / tool_calls deferred; SanitizeUtf8 per serving_utils.h.
+    choice.message.content = SanitizeUtf8(output.text);
     // finish_reason = output.finish_reason or "stop" (:956-960).
     choice.finish_reason = output.finish_reason.value_or("stop");
     response.choices.push_back(std::move(choice));

@@ -9,6 +9,17 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
 option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
+# The OpenAI HTTP server (M3.1 Task 4) is gated so the core build stays lean when
+# the vendored cpp-httplib transport header is absent. cpp-httplib is a
+# header-only MIT HTTP TRANSPORT lib (llama.cpp's choice) — a transport-dep
+# deviation, NOT a compute/ML dependency (consistent with the no-pytorch/no-ggml
+# rule).
+option(VLLM_CPP_SERVER "Build the OpenAI HTTP server (needs third_party/httplib/httplib.h)" ON)
+if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httplib/httplib.h")
+  message(WARNING "VLLM_CPP_SERVER=ON but third_party/httplib/httplib.h is missing; "
+    "disabling the server target. Vendor cpp-httplib to enable it.")
+  set(VLLM_CPP_SERVER OFF)
+endif()
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121" CACHE STRING "Target CUDA architectures (GB10=121)")
 
@@ -92,8 +103,10 @@ add_library(vllm STATIC
   src/vllm/v1/executor/executor.cpp
   src/vllm/entrypoints/chat_template.cpp
   src/vllm/entrypoints/openai/protocol.cpp
+  src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp
+  src/vllm/entrypoints/openai/serving_models.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp
@@ -129,6 +142,18 @@ if(VLLM_CPP_CUDA)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
+endif()
+
+# OpenAI HTTP server (M3.1 Task 4): the api_server.cpp translation unit pulls in
+# the vendored cpp-httplib transport header, so it is compiled into the library
+# only when VLLM_CPP_SERVER is enabled. httplib needs threads (and sockets).
+if(VLLM_CPP_SERVER)
+  find_package(Threads REQUIRED)
+  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
+  target_link_libraries(vllm PUBLIC Threads::Threads)
+  # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party
+  # is already a SYSTEM include on the vllm target).
 endif()
 
 if(VLLM_CPP_BUILD_TESTS)

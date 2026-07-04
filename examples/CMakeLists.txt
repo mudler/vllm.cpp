@@ -9,3 +9,10 @@ vllm_cpp_set_warnings(tokenize)
 add_executable(dequant_nvfp4 dequant_nvfp4/main.cpp)
 target_link_libraries(dequant_nvfp4 PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(dequant_nvfp4)
+
+# The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
+if(VLLM_CPP_SERVER)
+  add_executable(server server/main.cpp)
+  target_link_libraries(server PRIVATE vllm::vllm)
+  vllm_cpp_set_warnings(server)
+endif()

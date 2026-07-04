@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -57,8 +59,54 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
   return MakeTensor(src.data, src.dtype, src.device, shape);
 }
 
+// Process-wide caching device allocator (M2.x staging elimination). Both
+// cudaMalloc AND cudaFree SYNCHRONIZE the whole device, so the per-op DBuf
+// alloc/free churn in the forward (thousands of tiny scratch buffers per decode
+// step — dominated by the MoE expert loop) was itself a sync storm, larger than
+// the Download() syncs. This pool reuses freed blocks (keyed by exact byte size)
+// instead of hitting cudaMalloc/cudaFree, so after a brief warm-up almost every
+// DBuf lifetime is sync-free.
+//
+// Reuse is safe under the forward's single-queue (single-stream) ordering: a
+// block returned to the pool is only handed back out on the same queue, and CUDA
+// stream ordering guarantees the op that last touched the block has completed
+// before any reused op runs — no host sync needed. Blocks are never returned to
+// the driver (leak at process exit, like the cublasLt workspace); the pool is
+// bounded by the forward's peak concurrent scratch. The pool is backend-agnostic
+// (CPU malloc/free too — a harmless bounded cache there).
+class DevicePool {
+ public:
+  void* Get(Backend& b, size_t bytes) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = free_.find(bytes);
+      if (it != free_.end() && !it->second.empty()) {
+        void* p = it->second.back();
+        it->second.pop_back();
+        return p;
+      }
+    }
+    return b.Alloc(bytes);
+  }
+  void Put(size_t bytes, void* p) {
+    std::lock_guard<std::mutex> lk(mu_);
+    free_[bytes].push_back(p);
+  }
+
+ private:
+  std::mutex mu_;
+  std::unordered_map<size_t, std::vector<void*>> free_;
+};
+
+DevicePool& Pool() {
+  static DevicePool p;
+  return p;
+}
+
 // Owned device allocation + tensor view. On CPU the backend's Alloc/Copy are
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
+// Allocation is routed through the DevicePool so the buffer's storage is reused
+// rather than freed to the driver (avoiding the cudaMalloc/cudaFree sync).
 class DBuf {
  public:
   DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
@@ -67,11 +115,12 @@ class DBuf {
     int64_t numel = 1;
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    p_ = b_->Alloc(bytes_ == 0 ? 1 : bytes_);
+    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
+    p_ = Pool().Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
   }
-  ~DBuf() { b_->Free(p_); }
+  ~DBuf() { Pool().Put(alloc_bytes_, p_); }
   DBuf(const DBuf&) = delete;
   DBuf& operator=(const DBuf&) = delete;
 
@@ -89,6 +138,7 @@ class DBuf {
   Backend* b_;
   void* p_ = nullptr;
   size_t bytes_ = 0;
+  size_t alloc_bytes_ = 0;
   Tensor t_;
 };
 

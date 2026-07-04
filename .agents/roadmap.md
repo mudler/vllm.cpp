@@ -130,10 +130,21 @@ vocabulary is ported.**
   gather + ranks). Greedy bit-exact (the M0-exit primitive); random RNG
   distribution-correct, torch-Philox bit-parity = T1 carry. CPU CI 52/52;
   CUDA sampling kernels dgx-pending. Reviewed PASS (4 tasks).
-- ☐ **M1.8 EngineCore + step loop + queues**; InputProcessor/OutputProcessor/
+- ☑ **M1.8 EngineCore + step loop + queues**; InputProcessor/OutputProcessor/
   Detokenizer integration; offline C++ `LLM` API. DoD: multi-request
   behavioral suite green; deterministic outputs under concurrency.
-  **← M1 exit criterion**
+  **← M1 exit criterion ✅ MET.** Done `88821f3` (Executor pass-through +
+  EngineCore step loop) → `73a9509` (InputProcessor, closes M1.1 PostInit carry)
+  → `f1ae018`+multiblock (forward dense→paged refactor: ReshapeAndCache +
+  PagedAttention + batched GDN persistent-state + GDN-zeroing; paged==dense
+  bit-exact) → `9949f87`+3req (batched runner: KV alloc, decode-first reorder,
+  execute/sample/write-back, four-way ordering identity; closes M1.7 seed carry)
+  → `c7ba3a5` (OutputProcessor: detokenize + string-stop + reqs_to_abort) →
+  `c1859d9`+abort-assert (LLMEngine wiring + e2e). **The full V1 engine loop
+  runs end-to-end on CPU**: greedy determinism, 2-request concurrent, streaming
+  ==non-streaming, max_tokens + stop-string, all green (58/58). Reviewed PASS
+  (6 tasks). GDN-state zeroing WIRED (M1.6 carry closed). **35B greedy through
+  the paged loop on dgx = pending (CPU-only box).** ← **M1 CLOSED.**
 
 ## M2 — Parity performance (gate #1)
 

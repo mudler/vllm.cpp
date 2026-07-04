@@ -40,15 +40,17 @@ what vLLM has vs what we have:
 
 | Item | Upstream | Tier |
 |---|---|---|
-| EngineCore + `step()` (schedule → execute → sample → update) | `v1/engine/core.py` | T0 |
-| `SamplingParams` (+ Verify/PostInit == `__post_init__`, eos on params) | `vllm/sampling_params.py` | T0 ✅ `b888645`/`fabf48f` (structural port; PostInit MUST be run by the constructing unit — M1.8) |
+| EngineCore + `step()` (schedule → execute → sample → update) | `v1/engine/core.py` | T0 ✅ `88821f3` (step loop + add/abort; batch-queue/async/DP/grammar deferred) |
+| Executor pass-through seam (over the runner; no collective_rpc/Ray/multiproc) | `v1/executor/{abstract,uniproc_executor}.py` | T0 ✅ `88821f3` (ModelRunnerBase ABC + direct pass-through) |
+| LLMEngine (add_request/step/generate; offline C++ LLM) | `v1/engine/llm_engine.py` | T0 ✅ `c1859d9` (synchronous text path; e2e greedy/concurrent/streaming/stop) |
+| `SamplingParams` (+ Verify/PostInit == `__post_init__`, eos on params) | `vllm/sampling_params.py` | T0 ✅ `b888645`/`fabf48f` (structural port) + PostInit/Verify now RUN by the InputProcessor `73a9509` (M1.8 constructing unit — carry closed; NOTE: the `verify(model_config)` validator family — only `_validate_logprobs` matters — is dropped at T0, inert since logprobs tracking is deferred) |
 | `Request` + `RequestStatus` (12-status ordering, IsFinished, FinishReason map) | `v1/request.py` | T0 ✅ `4320dae`/`a43eaf8` (behavioral unit tests; eos moved to SamplingParams per upstream) |
 | EngineCore I/O types (`EngineCoreRequest`/`EngineCoreOutput(s)`, `ModelRunnerOutput`, `SamplerOutput`) | `v1/engine/__init__.py`, `v1/outputs.py` | T0 ✅ `cd13ec3` (structural port) |
 | `RequestOutput` / `CompletionOutput` (public result carriers; FinishReason→string) | `vllm/outputs.py` | T0 ✅ `4d477eb` (+ prompt_logprobs opaque placeholder at M1.1 close-out; logprobs payloads deferred to sampler unit) |
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
 | Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 |
-| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 |
-| OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 |
+| InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
+| OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` (process_outputs: detokenize + string-stop + reqs_to_abort feedback; streaming DELTA/CUMULATIVE/FINAL_ONLY; logprobs/pooling deferred) |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 |
 | Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 ✅ `4f12158` (schedule() running-first + chunked prefill + FCFS preemption; update_from_output + check_stop; priority/spec/structured/async deferred behind 1:1 stubs) |
 | Chunked prefill (`enable_chunked_prefill`, on by default) | `config/scheduler.py` | T0 ✅ `4f12158` |
@@ -97,8 +99,9 @@ we mirror it.
 | BlockTable tensors + slot mapping | `v1/worker/gpu/block_table.py` | T0 ✅ `62fdfca` (BlockTable+MultiGroupBlockTable host-array, slot_mapping=block_id*bs+offset; staged tensors deferred M2) |
 | Step input build: `query_start_loc`, `seq_lens`, positions, logits indices | `v1/worker/gpu/model_runner.py` | T0 ✅ `62fdfca` (update_states+prepare_inputs matched 1:1 vs `_prepare_inputs`; LoRA/spec/mm slot state deferred M2/T1) |
 | `CommonAttentionMetadata` contract → per-backend builders | `v1/attention/backend.py`, `v1/worker/gpu/attn_utils.py` | T0 ✅ `bd47ce3` (T0 field set + MakeCommonAttentionMetadata from step-inputs; FastPrefill/CrossAttn/dcp/sparse fields deferred) |
-| Split execute/sample (`ExecuteModelState`) for deferred sampling | `v1/worker/gpu/model_runner.py` | T0 |
-| KV tensor allocation from `KVCacheConfig` | same | T0 |
+| Split execute/sample (`ExecuteModelState`) for deferred sampling | `v1/worker/gpu/model_runner.py` | T0 ✅ `9949f87` (GPUModelRunner: execute_model→nullopt / sample_tokens; decode-first reorder + InputBatch::swap_states; logits_indices gather; sampled-token write-back; four-way ordering identity gated) |
+| KV tensor allocation from `KVCacheConfig` | same | T0 ✅ `9949f87` (per-full-attn-layer (nb,2,bs,H,D) + per-GDN-layer ssm/conv-state buffers, f32 at T0; bf16 cache = M2) |
+| Batched paged forward (Qwen3.6: ReshapeAndCache+PagedAttention + batched GDN persistent-state + GDN-zeroing) | `models/qwen3_next.py`, `mamba/qwen_gdn_linear_attn.py` | T0 ✅ `f1ae018` (paged==dense bit-exact; M0.9 dense kept as ForwardDense) |
 | CUDA graph capture/replay for decode (our own capture; no torch) | `v1/worker/gpu/cudagraph_utils.py`, `config/compilation.py::cudagraph_mode` | **T0** (parity at high concurrency needs it — MoE decode is launch-bound) |
 | Dummy runs / warmup / memory profiling | same | T0 |
 | LoRA runner mixin | `v1/worker/lora_model_runner_mixin.py` | T2 |

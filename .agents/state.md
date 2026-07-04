@@ -466,3 +466,61 @@
   forward + M1.7 Sampler into the batched model runner, + the InputProcessor/
   OutputProcessor + the per-slot sampling-state tracking the above dependency
   needs, ported from `vllm/v1/engine/core.py` + `vllm/v1/worker/gpu_model_runner.py`.
+- **2026-07-04** — **M1.8 done → M1 CLOSED** (`c1859d9`; ports `88821f3`
+  Executor+EngineCore, `73a9509` InputProcessor, `f1ae018`+multiblock forward
+  dense→paged, `9949f87`+3req batched runner, `c7ba3a5` OutputProcessor,
+  `c1859d9`+abort-assert LLMEngine). **THE V1 ENGINE RUNS END-TO-END ON CPU** —
+  schedule→execute→(paged forward + paged attention + batched GDN + MoE)→sample
+  →detokenize→output, driven by LLMEngine.generate. Pieces: **Executor
+  pass-through** (over ModelRunnerBase; collective_rpc/Ray/multiproc/Future
+  collapsed to a direct call); **EngineCore.step** (has_requests→schedule→
+  execute_model→sample_tokens→update_from_output; batch-queue/async/DP/grammar
+  deferred); **InputProcessor** (text→EngineCoreRequest; RUNS SamplingParams
+  PostInit/Verify — closes the M1.1 carry; max_tokens default + eos/stop wiring);
+  **the forward dense→paged refactor** (Qwen3_5Model::Forward: full-attn now
+  ReshapeAndCache+PagedAttention over the paged NHD KV cache, GDN now batched
+  GDNAttentionMetadata + PERSISTENT ssm/conv-state — M0.9 dense kept as
+  ForwardDense, registry unchanged so the dgx M0-exit gate is preserved);
+  **GPUModelRunner** (KV alloc from KVCacheConfig, decode-first reorder +
+  InputBatch::swap_states, execute_model/sample_tokens split, logits_indices
+  gather, make_sampling_metadata + Sampler, sampled-token write-back);
+  **OutputProcessor** (incremental detokenize + STRING-level stop + reqs_to_abort
+  feedback; streaming DELTA/CUMULATIVE/FINAL_ONLY); **LLMEngine** (add_request/
+  step/generate). All 6 tasks reviewed PASS; each adversarial review caught+fixed
+  a real gap (Task2 verify-note, Task3 multiblock-anchor, Task4 3-req-chain
+  self-consistency, Task6 abort-reaches-scheduler negative-control-verified).
+  **KEY CORRECTNESS RESULTS:** paged forward == M0.9 dense **bit-exact**
+  (max|diff|=0) incl. multi-block non-contiguous; decode-via-KV-cache exact; GDN
+  fresh-vs-continuing (zeroing negative control fails 4.8e-2); the **four-way
+  ordering identity** (attention seq_lens/block_table, logits_indices,
+  SamplingMetadata row, write-back slot all agree post-decode-first-reorder);
+  LLMEngine e2e greedy determinism + 2-req concurrent + streaming==non-streaming
+  + max_tokens + stop-string→abort→scheduler-empty. CPU ctest 58/58,
+  warnings-as-errors clean.
+  **ARCH DECISION (recorded in .agents/vllm-v1-v2.md):** the MRV2 persistent-slot
+  staged sampler + idx_mapping is axis-2 STORAGE (deferred to M2); M1.7's
+  SamplingMetadata is the axis-1 CONTRACT via the V1 host-array algorithm, and it
+  COMPOSES on ONE dense order (no idx_mapping needed) because prepare_inputs +
+  attention metadata + logits gather + sampling + write-back all index the dense
+  [0,num_reqs) order. The decode-first reorder IS axis-1 (applied here).
+  **CARRIES CLOSED:** GDN-state zeroing (M1.6 caller obligation — now WIRED in the
+  forward's GDN block: gather state[prefill_state_indices] + zero rows where
+  prefill_has_initial_state==0); M1.7 seed tracking (wired into InputBatch::seeds
+  → SamplingMetadata.generators). **STILL DEFERRED (marked):** MRV2 staged
+  per-slot buffers + idx_mapping (M2); the InputBatch-side per-slot tracking of
+  min_p/min_tokens/logit_bias/allowed_token_ids/bad_words/num_logprobs (temperature
+  /top_p/top_k/penalties/seed ARE tracked — those sampler features work; the rest
+  are inert until wired); prompt-logprobs; the EngineCoreOutputs.finished_requests
+  DP-signalling field (safe at T0, revisit if a future OutputProcessor consumes it);
+  cudagraphs/spec/LoRA/mm/PP/DP/grammar. **DGX-PENDING (milestone acceptance):**
+  the real 35B greedy completion through the FULL paged loop on dgx.casa (this box
+  is CPU-only) — the e2e correctness is proven on the synthetic hybrid-MoE model;
+  the 35B numerical parity vs the M0-exit result via the paged batched engine is
+  the outstanding gate. Also dgx-pending: ALL the CUDA kernels added across
+  M1.6/M1.7 (reshape_and_cache, paged_attention, the sampling ops) — build-guarded,
+  never run on GPU here. Close-out asserts: PendingRunnerOps() empty; CI green.
+  NEXT: **M2 — Parity performance (gate #1)**: the throughput benchmark harness vs
+  vLLM on dgx.casa (GB10) for Qwen3.6-35B-A3B-NVFP4, GPU perf kernels (FlashInfer-
+  class paged attention, chunked-scan GDN, fused MoE), CUDA graphs, bf16 KV cache,
+  the MRV2 staged device storage — AND the dgx bring-up of the whole M1 stack
+  (run the CUDA kernels + the 35B paged greedy gate on real hardware).

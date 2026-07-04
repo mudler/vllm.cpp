@@ -624,3 +624,49 @@
   calling** (tools/tool_choice, Qwen/Hermes parsers, streaming tool-call deltas) →
   **M3.6 conformance suite** → **M3.7 docs**. Plus **M0.10 GGUF model load** and
   the **dgx bring-up** (CUDA kernels + 35B paged gate on GB10).
+- **2026-07-04 (M3.4 done — grammars / structured output)** — Constrained
+  decoding (JSON-schema, json_object, regex, choice, GBNF/EBNF) works end-to-end
+  through the OpenAI server on CPU. `a66eef6` (+ `8343c4c` ABCs, `1351f88`
+  manager/plumbing, `9b640ee` apply, `74eec60` native engine, fixes). **ARCH
+  DECISION (Path C, recorded in the plan + consistent with the vllm-v1-v2
+  contract-vs-storage pattern):** the parity-critical STRUCTURED-OUTPUT INTEGRATION
+  is ported 1:1 (StructuredOutputManager, Scheduler::get_grammar_bitmask + the
+  accept_tokens FSM advance, GrammarOutput, the runner apply_grammar_bitmask, the
+  StructuredOutputBackend/StructuredOutputGrammar ABCs + the request key — what
+  future PRs touch), and the GRAMMAR ENGINE is a from-scratch NATIVE backend (§9,
+  ORIGINAL, like vt::/the minja chat engine) behind that ported seam. **xgrammar
+  vendoring is a LATER parity-completion milestone** (a 2nd backend behind the SAME
+  proven seam — upstream itself has 4 pluggable backends, so a native backend is a
+  backend ADDITION, not a divergence; delivers the user's explicit "GBNF like
+  llama.cpp" mandate). The bitmask INTERFACE ([num_reqs, ceil(vocab/32)] int32,
+  bit set=allowed→-inf) is backend-invariant, so the scheduler/runner/sampler
+  plumbing is written once and never changes when xgrammar lands. Pieces: the ABCs
+  + key mapping; the manager (synchronous compile at T0, batched bitmask fill,
+  -1 all-allowed inactive rows, should_advance/should_fill_bitmask = return-true
+  stubs [reasoning-gating deferred]); GrammarOutput + get_grammar_bitmask + the
+  accept_tokens advance; apply_grammar_bitmask in the runner (reuses the M1.7
+  -inf masking op); **the native engine** (GBNF/EBNF parser + a stack-based
+  push-down FSM matcher + a token-byte TRIE built once at compile → fill_bitmask
+  as a single DFS over trie×FSM = sub-O(vocab), NOT per-token; byte-alignment via
+  the tokenizer's inverse GPT-2 byte map; EOS allowed only at an accepting state;
+  regex→GBNF + choice→GBNF); **JSON-schema→GBNF** (object required/optional
+  comma-subset, types, enum/const, nested, json_object = a real JSON grammar;
+  unsupported constructs THROW); **OpenAI response_format** wired through
+  to_sampling_params → structured_outputs → the engine → grammar_init → constrained
+  decode. **THE LOAD-BEARING INVARIANT** (fill_bitmask marks a token allowed IFF
+  accept_tokens accepts it — else the sampler could emit grammar-INVALID output)
+  is structurally guaranteed (shared AcceptByte + shared byte strings + exact
+  pruning) AND guarded by an EXHAUSTIVE differential test (every vocab token × 8
+  grammars/prefixes). Both adversarial reviews (Task 4, Task 5) PASS after fixing a
+  real over-permit each (done-state EOS agreement; a required-key-not-in-properties
+  that would accept schema-invalid JSON → now throws). CPU ctest 71/71.
+  **DEPENDENCY DEVIATION:** the native grammar engine + JSON-schema→GBNF are
+  original (§9); no external dep added (xgrammar deferred). **DEFERRED:**
+  STRUCTURAL_TAG, reasoning/thinking gating, spec-decode multi-row bitmask, async
+  ThreadPoolExecutor compile, key-order flexibility (fixed order = over-constrain,
+  safe), xgrammar-parity (whitespace-flexibility/exotic-schema — xgrammar-only
+  until vendored), guidance/outlines backends. NEXT toward the serving MVP: **M3.3
+  tool calling** (now UNBLOCKED for forced-JSON — tools/tool_choice, Qwen/Hermes
+  parsers, streaming tool-call deltas, grammar-forced JSON for required/named via
+  M3.4) → **M3.6 conformance suite** → **M3.7 docs**. Plus **M0.10 GGUF model
+  load** and the **dgx bring-up** (CUDA kernels + 35B paged gate on GB10).

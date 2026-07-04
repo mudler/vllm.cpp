@@ -176,8 +176,21 @@ vocabulary is ported.**
   (namespace/tojson/reversed) = M3.3/M3.4.
 - ☐ **M3.3 Tool calling**: tools/tool_choice, Qwen + Hermes parsers,
   streaming tool-call deltas, grammar-forced JSON for required/named.
-- ☐ **M3.4 Grammars**: xgrammar core vendored, structured-output manager +
-  scheduler bitmask integration, GBNF input.
+- ☑ **M3.4 Grammars**: structured-output manager + scheduler bitmask integration
+  + GBNF/JSON-schema input. **DECISION (Path C, see plan + vllm-v1-v2 pattern):**
+  ported the INTEGRATION layer 1:1 (StructuredOutputManager, get_grammar_bitmask,
+  GrammarOutput, apply_grammar_bitmask, the StructuredOutputBackend/Grammar ABCs —
+  the parity surface) with a from-scratch NATIVE backend (§9) behind that seam;
+  **xgrammar vendoring = a later parity-completion milestone** (a 2nd backend
+  behind the same proven seam, like upstream's 4). Done `8343c4c` (ABCs+key) →
+  `1351f88` (manager+scheduler+EngineCore plumbing) → `9b640ee` (apply_grammar_
+  bitmask in runner, set=allowed→-inf) → `74eec60`+fix (native GBNF/regex/choice
+  engine: parser + push-down FSM + byte-trie sub-O(vocab) fill; fill==accept
+  invariant guarded by an exhaustive differential test) → `a66eef6`+fix
+  (JSON-schema→GBNF + json_object + OpenAI response_format wiring, e2e). Reviewed
+  PASS (Tasks 4+5, each caught+fixed a real over-permit). CPU 71/71. Covers
+  JSON-schema/json_object/regex/choice/GBNF; STRUCTURAL_TAG + reasoning-gating +
+  spec-decode + xgrammar-parity deferred.
 - ☑ **M3.5 C API + packaging**: `include/vllm.h`, shared/static lib,
   examples/cli. DoD: LocalAI-style consumption smoke test via dlopen/purego.
   Done `d6a3f39` (pure-C ABI: opaque handles, no-throw, thread-local error,

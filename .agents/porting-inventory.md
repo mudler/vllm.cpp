@@ -188,12 +188,19 @@ variants beyond raw/processed. **InputBatch-side tracking of seeds/min_p/min_tok
 logit_bias/allowed/bad_words + num_logprobs is an M1.8 wiring dependency**
 (make_sampling_metadata emits empty defaults today — the InputBatch doesn't store
 them yet; SamplingMetadata carries the fields ready to populate).
-**T0 (MVP, user-mandated): grammars/structured outputs** — port
-`v1/structured_output/` (manager, grammar bitmask applied as a logits processor,
-`get_grammar_bitmask` scheduler integration) with the **xgrammar C++ core** as
-the backend (upstream's default; it is a C++ library — vendorable without
-Python), covering `json` (schema), `json_object`, `regex`, `choice`, `grammar`
-(EBNF), plus **llama.cpp-style GBNF** grammar input as a vllm.cpp extension.
+**T0 (MVP, user-mandated): grammars/structured outputs** — ✅ **`a66eef6`** (M3.4).
+The INTEGRATION layer ported 1:1 (`v1/structured_output/` manager + backend_types
+ABCs + request key; `get_grammar_bitmask` scheduler integration + `GrammarOutput`
++ `apply_grammar_bitmask` runner masking, set=allowed→-inf; EngineCore→sample_tokens
+seam) — the parity surface. The grammar ENGINE is a from-scratch **NATIVE backend
+(§9, ORIGINAL)** behind that seam: GBNF/EBNF parser + push-down FSM + token-byte
+trie (sub-O(vocab) fill; fill==accept invariant guarded by an exhaustive
+differential test), covering `json` (schema→GBNF), `json_object`, `regex`,
+`choice`, `grammar`(EBNF/GBNF) + OpenAI `response_format`. **The xgrammar C++ core
+is DEFERRED to a later parity-completion milestone** (a 2nd backend behind the SAME
+proven seam — mirrors upstream's own 4 pluggable backends; not a parity deviation).
+Deferred: STRUCTURAL_TAG, reasoning-gating, spec-decode multi-row, key-order
+flexibility, whitespace-flexibility/exotic-schema parity (xgrammar-only until vendored).
 T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection

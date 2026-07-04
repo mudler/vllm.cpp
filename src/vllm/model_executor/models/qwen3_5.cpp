@@ -103,6 +103,26 @@ DevicePool& Pool() {
   return p;
 }
 
+// Round an allocation size up to a coarse bucket so the DevicePool (keyed by
+// exact byte size) HITS across steps whose token count T varies (prefill chunks,
+// concurrency batches shrinking as requests finish). Without bucketing, every
+// distinct T produced a fresh cudaMalloc/cudaFree (each a full device sync) —
+// the measured 62k-cudaMalloc / 20.5%-of-wall host-API storm. Bucketing to a
+// ~1/8 granularity (waste <= 12.5%) collapses the size histogram to a handful of
+// reused blocks. The pool is bounded by ~1.125x peak scratch; on GB10's unified
+// memory the over-allocation is cheap. Numerically inert: DBuf copies/zeros/
+// downloads use the EXACT byte count, only the backing block is (over-)sized.
+size_t BucketBytes(size_t bytes) {
+  if (bytes <= 256) return 256;
+  // Granularity = highest power of two <= bytes, shifted down by 3 (1/8 of the
+  // magnitude). Round bytes up to the next multiple of that granularity.
+  size_t g = 1;
+  while ((g << 1) <= bytes) g <<= 1;
+  g >>= 3;
+  if (g < 256) g = 256;
+  return (bytes + g - 1) / g * g;
+}
+
 // Owned device allocation + tensor view. On CPU the backend's Alloc/Copy are
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
 // Allocation is routed through the DevicePool so the buffer's storage is reused
@@ -115,7 +135,7 @@ class DBuf {
     int64_t numel = 1;
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
+    alloc_bytes_ = BucketBytes(bytes_ == 0 ? 1 : bytes_);
     p_ = Pool().Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);

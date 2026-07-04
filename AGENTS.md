@@ -12,6 +12,16 @@ parity on `dgx.casa` (GB10), loading from safetensors **and GGUF**, shipped
 llama.cpp-style as a library + example CLI/OpenAI server, with tool calling,
 grammars, streaming/non-streaming, and e2e test suites.
 
+## STANDING DIRECTIVE — always compare vs vLLM (the oracle), same workload
+
+Every change that could affect correctness OR performance MUST be compared
+apples-to-apples against vLLM and both numbers + the ratio recorded in the
+ledger: **correctness** vs the pinned pip-vLLM oracle (`~/venvs/vllm-oracle`),
+**performance** vs `vllm bench throughput` on the *identical* workload. Never
+re-base the bench config without re-running vLLM on it. This is non-negotiable
+and applies to subagents. Full rule: [.agents/gates.md](.agents/gates.md)
+§ PROTOCOL DIRECTIVE.
+
 ## Index
 
 - [.agents/mission.md](.agents/mission.md) — what this project is and is not.

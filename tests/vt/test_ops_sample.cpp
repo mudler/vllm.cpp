@@ -458,6 +458,48 @@ TEST_CASE("CUDA greedy_argmax / temperature / top-k-p / logprobs match CPU") {
   }
 }
 
+// Exercises the two-pass multi-block argmax over a realistic vocab (many blocks
+// per row): random rows, cross-block ties (lowest index must win), and an
+// all-(-inf) row (must return index 0) -- all bit-exact vs the CPU reference.
+TEST_CASE("CUDA greedy_argmax: large vocab, cross-block ties, all-(-inf) row") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping (dgx-pending)");
+    return;
+  }
+  const int64_t N = 5, V = 151936;  // Qwen3 vocab: spans ~594 blocks per row
+  auto logits = RandomLogits(static_cast<size_t>(N * V), 9137);
+
+  // Row 1: two equal maxima far apart and across block boundaries; the CPU/GPU
+  // must both return the LOWER index. Place them well above the random range.
+  logits[1 * V + 40000] = 100.0f;
+  logits[1 * V + 130000] = 100.0f;  // tie -> expect 40000
+  // Row 2: unique max at a high index (past many blocks).
+  logits[2 * V + 151900] = 250.0f;
+  // Row 3: all -inf -> expect index 0.
+  for (int64_t j = 0; j < V; ++j) logits[3 * V + j] = -INFINITY;
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  Queue cq = Q();
+
+  std::vector<float> lc = logits;
+  std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+  Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+  vt::GreedyArgmax(cq, ti, tl);
+
+  DeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, logits.data());
+  DeviceTensor did(gpu, gq.q, DType::kI64, {N});
+  vt::GreedyArgmax(gq.q, did.tensor(), dl.tensor());
+  std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+  did.Download(gq.q, id_gpu.data());
+
+  for (size_t i = 0; i < id_cpu.size(); ++i) CHECK(id_gpu[i] == id_cpu[i]);
+  CHECK(id_gpu[1] == 40000);   // tie resolves to the lower index
+  CHECK(id_gpu[2] == 151900);  // high-index unique max
+  CHECK(id_gpu[3] == 0);       // all -inf -> index 0
+}
+
 TEST_CASE("CUDA random_sample agrees with CPU on the vast majority of rows") {
   // NOTE: host and device compute q = -log(U) in double via different libm
   // (host libm vs CUDA libdevice). IEEE-754 does NOT require correctly-rounded

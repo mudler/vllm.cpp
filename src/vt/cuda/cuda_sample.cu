@@ -18,6 +18,7 @@
 #include <thrust/sort.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -80,8 +81,94 @@ void ApplyTemperatureCuda(Queue& q, Tensor& logits, const Tensor& temp, bool all
   Check(cudaGetLastError(), "apply_temperature launch");
 }
 
-// --- greedy_argmax (single-threaded per row: exact lowest-index tie-break) ---
-__global__ void GreedyArgmaxKernel(int64_t* out, const float* logits, int64_t v) {
+// --- greedy_argmax (two-pass multi-block reduction, exact lowest-index tie) ---
+// The old kernel was a single block of a single thread scanning the whole vocab
+// (~151k) serially -- ~7.5 ms/token on the decode path (a single-SM, latency-
+// bound scan). Here we grid-stride the vocab across many blocks (pass 1 -> per-
+// block partials) and reduce the partials (pass 2), keeping torch.argmax
+// semantics: the maximum value wins; on ties the LOWEST index wins. The reduce
+// operator compares the true global index (not thread/block order) so the tie-
+// break is order-independent. Unfilled lanes carry (-inf, INT64_MAX) so a real
+// index -- even one whose logit is -inf (all-masked row) -- always beats an empty
+// lane, yielding index 0 for an all-(-inf) row, exactly like the CPU reference.
+__device__ inline void ArgReduce(float& av, int64_t& ai, float bv, int64_t bi) {
+  if (bv > av || (bv == av && bi < ai)) {
+    av = bv;
+    ai = bi;
+  }
+}
+
+constexpr int64_t kArgSentinel = 0x7fffffffffffffffLL;  // INT64_MAX
+
+__global__ void ArgmaxPartialKernel(float* part_val, int64_t* part_idx, const float* logits,
+                                    int64_t v, int blocks_per_row) {
+  const int64_t row = blockIdx.y;
+  const int blk = blockIdx.x;
+  const float* r = logits + row * v;
+  __shared__ float sv[kBlock];
+  __shared__ int64_t si[kBlock];
+
+  float bv = kNegInf;
+  int64_t bi = kArgSentinel;
+  const int64_t stride = static_cast<int64_t>(blocks_per_row) * blockDim.x;
+  for (int64_t j = static_cast<int64_t>(blk) * blockDim.x + threadIdx.x; j < v; j += stride)
+    ArgReduce(bv, bi, r[j], j);
+
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sv[threadIdx.x], si[threadIdx.x], sv[threadIdx.x + s], si[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    part_val[row * blocks_per_row + blk] = sv[0];
+    part_idx[row * blocks_per_row + blk] = si[0];
+  }
+}
+
+__global__ void ArgmaxFinalKernel(int64_t* out, const float* part_val, const int64_t* part_idx,
+                                  int blocks_per_row) {
+  const int64_t row = blockIdx.x;
+  const float* pv = part_val + row * blocks_per_row;
+  const int64_t* pi = part_idx + row * blocks_per_row;
+  __shared__ float sv[kBlock];
+  __shared__ int64_t si[kBlock];
+
+  float bv = kNegInf;
+  int64_t bi = kArgSentinel;
+  for (int j = threadIdx.x; j < blocks_per_row; j += blockDim.x) ArgReduce(bv, bi, pv[j], pi[j]);
+
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sv[threadIdx.x], si[threadIdx.x], sv[threadIdx.x + s], si[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[row] = (si[0] == kArgSentinel) ? 0 : si[0];
+}
+
+// Persistent scratch for the argmax partials -- grown on demand and kept alive
+// (a few KB), so the decode path never pays a cudaMalloc/cudaFree per token.
+float* g_argmax_val = nullptr;
+int64_t* g_argmax_idx = nullptr;
+size_t g_argmax_cap = 0;  // capacity in elements
+
+void EnsureArgmaxScratch(size_t elems) {
+  if (elems <= g_argmax_cap) return;
+  if (g_argmax_val) cudaFree(g_argmax_val);
+  if (g_argmax_idx) cudaFree(g_argmax_idx);
+  Check(cudaMalloc(&g_argmax_val, elems * sizeof(float)), "argmax scratch val");
+  Check(cudaMalloc(&g_argmax_idx, elems * sizeof(int64_t)), "argmax scratch idx");
+  g_argmax_cap = elems;
+}
+
+// Legacy single-block single-thread argmax (bit-exact reference). Retained behind
+// VT_FAST_ARGMAX=0 for same-binary A/B against the two-pass kernel above.
+__global__ void GreedyArgmaxKernelSlow(int64_t* out, const float* logits, int64_t v) {
   const int64_t row = blockIdx.x;
   if (threadIdx.x != 0) return;
   const float* r = logits + row * v;
@@ -96,11 +183,37 @@ __global__ void GreedyArgmaxKernel(int64_t* out, const float* logits, int64_t v)
   out[row] = best;
 }
 
+bool FastArgmaxEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FAST_ARGMAX");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
+
 void GreedyArgmaxCuda(Queue& q, Tensor& token_ids, const Tensor& logits) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  GreedyArgmaxKernel<<<static_cast<unsigned>(n), 1, 0, AsStream(q)>>>(token_ids.Ptr<int64_t>(),
-                                                                      logits.Ptr<float>(), v);
+  cudaStream_t s = AsStream(q);
+
+  if (!FastArgmaxEnabled()) {
+    GreedyArgmaxKernelSlow<<<static_cast<unsigned>(n), 1, 0, s>>>(token_ids.Ptr<int64_t>(),
+                                                                 logits.Ptr<float>(), v);
+    Check(cudaGetLastError(), "greedy_argmax launch (slow)");
+    return;
+  }
+
+  // One block per kBlock vocab elements, capped so pass 2 fits a single block.
+  int bpr = static_cast<int>((v + kBlock - 1) / kBlock);
+  if (bpr > kBlock) bpr = kBlock;  // pass 2 reduces bpr partials with kBlock threads
+  if (bpr < 1) bpr = 1;
+
+  EnsureArgmaxScratch(static_cast<size_t>(n) * bpr);
+  dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
+  ArgmaxPartialKernel<<<grid1, kBlock, 0, s>>>(g_argmax_val, g_argmax_idx, logits.Ptr<float>(), v,
+                                               bpr);
+  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(token_ids.Ptr<int64_t>(),
+                                                                g_argmax_val, g_argmax_idx, bpr);
   Check(cudaGetLastError(), "greedy_argmax launch");
 }
 

@@ -74,6 +74,16 @@ bool WmmaEnabled() {
   return on;
 }
 
+// M=1/decode-path 128-bit vectorized fp4 weight loads (A/B; default ON). Set
+// VT_FP4_VEC=0 to force the byte-wise scalar reduction (bit-identical, slower).
+bool Fp4VecEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_VEC");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
+
 // f32 load/store overloads: bf16 converts on the way in/out, math is f32.
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
@@ -112,25 +122,66 @@ __device__ __forceinline__ void DecodeFp4Byte(uint8_t b, float gs, float& w_lo, 
   w_hi = __bfloat162float(__float2bfloat16(hi_mag * gs));
 }
 
-// Naive one-thread-per-output NVFP4 dequant-GEMM (grid.x over N, grid.y over M).
-// Retained for SMALL m (decode): there the weight fits L2 so coalescing buys
-// little, and this kernel avoids the tiled kernel's shared-mem/sync overhead —
-// measured faster than the tiled path below for small m/N (GB10 nsys, 2026-07-04).
-template <typename Tin, typename Tout>
-__global__ void MatmulNvfp4KernelNaive(Tout* out, const Tin* act, const uint8_t* packed,
-                                       const uint8_t* scale, float scale2, int64_t m_rows,
-                                       int64_t n_cols, int64_t k_dim) {
-  const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t m = blockIdx.y;
-  if (n >= n_cols || m >= m_rows) return;
+// Decode + accumulate the 4 packed bytes (8 fp4 elements) held in one 32-bit
+// word, at activation offset `base`. Byte b (little-endian: (word>>8b)&0xff)
+// carries elements base+2b (low nibble) and base+2b+1 (high nibble) -- the exact
+// element order of the scalar loop, so this stays bit-identical.
+template <typename Tin>
+__device__ __forceinline__ void AccumFp4Word(float& acc, uint32_t word, float gs, const Tin* arow,
+                                             int64_t base) {
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const uint8_t byte = static_cast<uint8_t>((word >> (b * 8)) & 0xffu);
+    float w_lo, w_hi;
+    DecodeFp4Byte(byte, gs, w_lo, w_hi);
+    acc += Load(arow, base + 2 * b) * w_lo;
+    acc += Load(arow, base + 2 * b + 1) * w_hi;
+  }
+}
 
-  const int64_t packed_cols = k_dim / 2;
+// One output column's fp4 W4A16 dot product: acc = sum_k act[k] * dequant(w[k]).
+// Bandwidth-optimized for the M=1/decode path -- the packed weight row is read
+// with 128-bit (uint4 = 16 byte = 2 group-16) loads instead of byte-at-a-time,
+// cutting the weight LDG count 16x and issuing full-width memory transactions.
+// The accumulation order is unchanged (group ascending, byte ascending, low then
+// high nibble) so the result is BIT-IDENTICAL to the scalar loop below; only the
+// load width differs. Falls back to the scalar path when the row is not 16-byte
+// aligned (k_dim not a multiple of 32) or has an odd group tail.
+template <typename Tin>
+__device__ __forceinline__ float Fp4ColDot(const uint8_t* prow, const uint8_t* srow,
+                                            const Tin* arow, int64_t k_dim, float scale2,
+                                            bool use_vec) {
   const int64_t groups = k_dim / 16;
-  const uint8_t* prow = packed + n * packed_cols;
-  const uint8_t* srow = scale + n * groups;
-  const Tin* arow = act + m * k_dim;
-
   float acc = 0.0f;
+  const bool aligned16 = use_vec && ((k_dim / 2) % 16 == 0) &&
+                         ((reinterpret_cast<uintptr_t>(prow) & 0xf) == 0);
+  if (aligned16) {
+    const uint4* prow4 = reinterpret_cast<const uint4*>(prow);
+    const int64_t cpairs = groups / 2;  // each uint4 spans two group-16 blocks
+    for (int64_t c = 0; c < cpairs; ++c) {
+      const uint4 pk = prow4[c];
+      const float gs0 = F8E4M3ToF32Dev(srow[2 * c]) * scale2;      // group 2c   (bytes 0..7)
+      const float gs1 = F8E4M3ToF32Dev(srow[2 * c + 1]) * scale2;  // group 2c+1 (bytes 8..15)
+      const int64_t base0 = (2 * c) * 16;
+      const int64_t base1 = (2 * c + 1) * 16;
+      AccumFp4Word(acc, pk.x, gs0, arow, base0);      // group 2c   elems 0..7
+      AccumFp4Word(acc, pk.y, gs0, arow, base0 + 8);  // group 2c   elems 8..15
+      AccumFp4Word(acc, pk.z, gs1, arow, base1);      // group 2c+1 elems 0..7
+      AccumFp4Word(acc, pk.w, gs1, arow, base1 + 8);  // group 2c+1 elems 8..15
+    }
+    if (groups & 1) {  // odd trailing group: scalar tail (same order)
+      const int64_t g = groups - 1;
+      const float gs = F8E4M3ToF32Dev(srow[g]) * scale2;
+      const int64_t base = g * 16;
+      for (int j = 0; j < 8; ++j) {
+        float w_lo, w_hi;
+        DecodeFp4Byte(prow[g * 8 + j], gs, w_lo, w_hi);
+        acc += Load(arow, base + 2 * j) * w_lo;
+        acc += Load(arow, base + 2 * j + 1) * w_hi;
+      }
+    }
+    return acc;
+  }
   for (int64_t g = 0; g < groups; ++g) {
     const float gs = F8E4M3ToF32Dev(srow[g]) * scale2;
     const int64_t base = g * 16;
@@ -141,7 +192,29 @@ __global__ void MatmulNvfp4KernelNaive(Tout* out, const Tin* act, const uint8_t*
       acc += Load(arow, base + 2 * j + 1) * w_hi;
     }
   }
-  Store(out, m * n_cols + n, acc);
+  return acc;
+}
+
+// Naive one-thread-per-output NVFP4 dequant-GEMM (grid.x over N, grid.y over M).
+// Retained for SMALL m (decode): there the weight fits L2 so coalescing buys
+// little, and this kernel avoids the tiled kernel's shared-mem/sync overhead —
+// measured faster than the tiled path below for small m/N (GB10 nsys, 2026-07-04).
+// The weight row is read 128-bit-wide via Fp4ColDot (bit-identical to the scalar
+// reduction); this is the M2.8 decode-path bandwidth optimization.
+template <typename Tin, typename Tout>
+__global__ void MatmulNvfp4KernelNaive(Tout* out, const Tin* act, const uint8_t* packed,
+                                       const uint8_t* scale, float scale2, int64_t m_rows,
+                                       int64_t n_cols, int64_t k_dim, bool use_vec) {
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t m = blockIdx.y;
+  if (n >= n_cols || m >= m_rows) return;
+
+  const int64_t packed_cols = k_dim / 2;
+  const int64_t groups = k_dim / 16;
+  const uint8_t* prow = packed + n * packed_cols;
+  const uint8_t* srow = scale + n * groups;
+  const Tin* arow = act + m * k_dim;
+  Store(out, m * n_cols + n, Fp4ColDot(prow, srow, arow, k_dim, scale2, use_vec));
 }
 
 // Shared-memory tiled NVFP4 dequant-GEMM. out[m,n] = sum_k act[m,k] *
@@ -350,7 +423,7 @@ void Launch(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& packed
     const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(m));
     MatmulNvfp4KernelNaive<Tin, Tout><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), act.Ptr<Tin>(), packed.Ptr<uint8_t>(), scale.Ptr<uint8_t>(), scale2, m, n,
-        k);
+        k, Fp4VecEnabled());
     Check(cudaGetLastError(), "kernel launch (naive)");
     return;
   }
@@ -410,7 +483,8 @@ template <typename Tin, typename Tout>
 __global__ void MoeGroupedGemmNvfp4KernelNaive(Tout* out, const Tin* act, const int32_t* expert_ids,
                                                const int32_t* row_map, const int64_t* packed_ptrs,
                                                const int64_t* scale_ptrs, const float* scale2s,
-                                               int64_t p_rows, int64_t n_cols, int64_t k_dim) {
+                                               int64_t p_rows, int64_t n_cols, int64_t k_dim,
+                                               bool use_vec) {
   const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (n >= n_cols) return;
   const int64_t packed_cols = k_dim / 2;
@@ -424,18 +498,7 @@ __global__ void MoeGroupedGemmNvfp4KernelNaive(Tout* out, const Tin* act, const 
     const uint8_t* prow = packed + n * packed_cols;
     const uint8_t* srow = scale + n * groups;
     const Tin* arow = act + r * k_dim;
-    float acc = 0.0f;
-    for (int64_t g = 0; g < groups; ++g) {
-      const float gs = F8E4M3ToF32Dev(srow[g]) * scale2;
-      const int64_t base = g * 16;
-      for (int j = 0; j < 8; ++j) {
-        float w_lo, w_hi;
-        DecodeFp4Byte(prow[g * 8 + j], gs, w_lo, w_hi);
-        acc += Load(arow, base + 2 * j) * w_lo;
-        acc += Load(arow, base + 2 * j + 1) * w_hi;
-      }
-    }
-    Store(out, p * n_cols + n, acc);
+    Store(out, p * n_cols + n, Fp4ColDot(prow, srow, arow, k_dim, scale2, use_vec));
   }
 }
 
@@ -712,7 +775,7 @@ void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor&
     MoeGroupedGemmNvfp4KernelNaive<Tin, Tout><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), act.Ptr<Tin>(), expert_ids.Ptr<int32_t>(),
         row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr, packed_ptrs.Ptr<int64_t>(),
-        scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), p, n, k);
+        scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), p, n, k, Fp4VecEnabled());
     Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (naive)");
     return;
   }

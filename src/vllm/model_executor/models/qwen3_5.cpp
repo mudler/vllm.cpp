@@ -7,10 +7,13 @@
 // .agents/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
 #include "vllm/model_executor/models/qwen3_5.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -101,6 +104,39 @@ class DevicePool {
 DevicePool& Pool() {
   static DevicePool p;
   return p;
+}
+
+// --- Fused-MoE per-layer resident constants (M2.5 Phase 2, CUDA-graph unblock) -
+// MoeBlockFusedCuda used to rebuild + re-upload, EVERY forward step, a set of
+// per-layer CONSTANT device buffers: the E fp4-expert device-pointer/scale
+// arrays (gate/up/down packed+scale ptrs, scale2) and the pair->token row map
+// (tok_map, a function of T only). Those uploads copy from HOST STACK temporaries
+// — illegal to have inside a CUDA-graph capture region (their host addresses
+// dangle on replay). They are also pure per-step waste (the values never change).
+// This process-lifetime cache (keyed by the layer's MoeBlockWeights address)
+// uploads them ONCE, during the pre-warm forward, so the captured region only
+// READS resident device buffers — no host-sourced copy, nothing to dangle. The
+// device buffers leak at process exit (like the cublasLt workspace / the resident
+// weights); they are bounded by (num_layers * (9*E + one tok_map per distinct T)).
+struct MoeFusedResident {
+  void* gp = nullptr;  // i64 [E] device: expert gate packed ptrs
+  void* gs = nullptr;  // i64 [E] device: expert gate scale ptrs
+  void* up = nullptr;  // i64 [E] device: expert up packed ptrs
+  void* us = nullptr;  // i64 [E] device: expert up scale ptrs
+  void* dp = nullptr;  // i64 [E] device: expert down packed ptrs
+  void* ds = nullptr;  // i64 [E] device: expert down scale ptrs
+  void* g2 = nullptr;  // f32 [E] device: expert gate scale2
+  void* u2 = nullptr;  // f32 [E] device: expert up scale2
+  void* d2 = nullptr;  // f32 [E] device: expert down scale2
+  std::unordered_map<int64_t, void*> tok_map;  // T -> i32 [T*top_k] device
+  bool ready = false;
+};
+
+MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
+  static std::mutex mu;
+  static std::unordered_map<const MoeBlockWeights*, MoeFusedResident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[w];
 }
 
 // Owned device allocation + tensor view. On CPU the backend's Alloc/Copy are
@@ -857,48 +893,81 @@ DBuf MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
                     vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
   Tensor eids = Reshape(dtid.t(), {P});                   // [P] i32 expert ids
 
-  // Per-expert fp4-resident device pointer arrays (packed/scale/scale2) for the
-  // gate/up/down projections, gathered once (residency is uploaded lazily + kept
-  // in each weight's shared_ptr — after warm-up these Get()s are pointer reads).
-  std::vector<int64_t> gp(E), gs(E), up(E), us(E), dp(E), ds(E);
-  std::vector<float> g2(E), u2(E), d2(E);
-  for (int64_t e = 0; e < E; ++e) {
-    const size_t se = static_cast<size_t>(e);
-    Nvfp4Dev g = ResidentNvfp4(d, w.expert_gate_fp4[se]);
-    Nvfp4Dev u = ResidentNvfp4(d, w.expert_up_fp4[se]);
-    Nvfp4Dev dn = ResidentNvfp4(d, w.expert_down_fp4[se]);
-    gp[se] = reinterpret_cast<int64_t>(g.packed.data);
-    gs[se] = reinterpret_cast<int64_t>(g.scale.data);
-    up[se] = reinterpret_cast<int64_t>(u.packed.data);
-    us[se] = reinterpret_cast<int64_t>(u.scale.data);
-    dp[se] = reinterpret_cast<int64_t>(dn.packed.data);
-    ds[se] = reinterpret_cast<int64_t>(dn.scale.data);
-    g2[se] = w.expert_gate_fp4[se].scale2;
-    u2[se] = w.expert_up_fp4[se].scale2;
-    d2[se] = w.expert_down_fp4[se].scale2;
+  // Per-layer RESIDENT fp4-expert device pointer/scale arrays + pair->token map
+  // (MoeResidentFor cache): uploaded ONCE (here on first touch, during the
+  // pre-warm forward), then read on every step — no per-step host-sourced upload,
+  // so nothing dangles inside a captured graph. residency of the expert weights
+  // themselves is still lazy through ResidentNvfp4 (their shared_ptr owns the
+  // device copy); we capture the resulting stable device pointers once.
+  MoeFusedResident& mr = MoeResidentFor(&w);
+  if (!mr.ready) {
+    std::vector<int64_t> gp(E), gs(E), up(E), us(E), dp(E), ds(E);
+    std::vector<float> g2(E), u2(E), d2(E);
+    for (int64_t e = 0; e < E; ++e) {
+      const size_t se = static_cast<size_t>(e);
+      Nvfp4Dev g = ResidentNvfp4(d, w.expert_gate_fp4[se]);
+      Nvfp4Dev u = ResidentNvfp4(d, w.expert_up_fp4[se]);
+      Nvfp4Dev dn = ResidentNvfp4(d, w.expert_down_fp4[se]);
+      gp[se] = reinterpret_cast<int64_t>(g.packed.data);
+      gs[se] = reinterpret_cast<int64_t>(g.scale.data);
+      up[se] = reinterpret_cast<int64_t>(u.packed.data);
+      us[se] = reinterpret_cast<int64_t>(u.scale.data);
+      dp[se] = reinterpret_cast<int64_t>(dn.packed.data);
+      ds[se] = reinterpret_cast<int64_t>(dn.scale.data);
+      g2[se] = w.expert_gate_fp4[se].scale2;
+      u2[se] = w.expert_up_fp4[se].scale2;
+      d2[se] = w.expert_down_fp4[se].scale2;
+    }
+    const size_t eb = static_cast<size_t>(E) * sizeof(int64_t);
+    const size_t fb = static_cast<size_t>(E) * sizeof(float);
+    auto up_i64 = [&](const std::vector<int64_t>& h) {
+      void* p = d.b.Alloc(eb);
+      d.b.Copy(d.q, p, h.data(), eb);
+      return p;
+    };
+    auto up_f32 = [&](const std::vector<float>& h) {
+      void* p = d.b.Alloc(fb);
+      d.b.Copy(d.q, p, h.data(), fb);
+      return p;
+    };
+    mr.gp = up_i64(gp); mr.gs = up_i64(gs); mr.up = up_i64(up);
+    mr.us = up_i64(us); mr.dp = up_i64(dp); mr.ds = up_i64(ds);
+    mr.g2 = up_f32(g2); mr.u2 = up_f32(u2); mr.d2 = up_f32(d2);
+    mr.ready = true;
   }
-  DBuf dgp(d, DType::kI64, {E}, gp.data()), dgs(d, DType::kI64, {E}, gs.data());
-  DBuf dup(d, DType::kI64, {E}, up.data()), dus(d, DType::kI64, {E}, us.data());
-  DBuf ddp(d, DType::kI64, {E}, dp.data()), dds(d, DType::kI64, {E}, ds.data());
-  DBuf dg2(d, DType::kF32, {E}, g2.data()), du2(d, DType::kF32, {E}, u2.data());
-  DBuf dd2(d, DType::kF32, {E}, d2.data());
-
-  // Gate/up read the token hidden: pair p -> token p/top_k.
-  std::vector<int32_t> tok_map(static_cast<size_t>(P));
-  for (int64_t p = 0; p < P; ++p) tok_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
-  DBuf dtok(d, DType::kI32, {P}, tok_map.data());
+  // Resident pair->token row map for this T (function of T + top_k only).
+  auto tok_it = mr.tok_map.find(T);
+  if (tok_it == mr.tok_map.end()) {
+    std::vector<int32_t> tok_map(static_cast<size_t>(P));
+    for (int64_t p = 0; p < P; ++p)
+      tok_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
+    const size_t tb = static_cast<size_t>(P) * sizeof(int32_t);
+    void* p = d.b.Alloc(tb);
+    d.b.Copy(d.q, p, tok_map.data(), tb);
+    tok_it = mr.tok_map.emplace(T, p).first;
+  }
+  Tensor dgp = MakeTensor(mr.gp, DType::kI64, d.q.device, {E});
+  Tensor dgs = MakeTensor(mr.gs, DType::kI64, d.q.device, {E});
+  Tensor dup = MakeTensor(mr.up, DType::kI64, d.q.device, {E});
+  Tensor dus = MakeTensor(mr.us, DType::kI64, d.q.device, {E});
+  Tensor ddp = MakeTensor(mr.dp, DType::kI64, d.q.device, {E});
+  Tensor dds = MakeTensor(mr.ds, DType::kI64, d.q.device, {E});
+  Tensor dg2 = MakeTensor(mr.g2, DType::kF32, d.q.device, {E});
+  Tensor du2 = MakeTensor(mr.u2, DType::kF32, d.q.device, {E});
+  Tensor dd2 = MakeTensor(mr.d2, DType::kF32, d.q.device, {E});
+  Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
 
   // Grouped gate/up GEMM over all pairs (one launch each), silu-mul, grouped
   // down GEMM (act = per-pair silu output, identity row-map). expert_out lands
   // as [T,top_k,H] contiguous — exactly what MoeCombine consumes.
   DBuf dgate(d, DType::kF32, {P, I});
   DBuf dup_out(d, DType::kF32, {P, I});
-  vt::MoeGroupedGemmNvfp4(d.q, dgate.t(), dh, eids, &dtok.t(), dgp.t(), dgs.t(), dg2.t());
-  vt::MoeGroupedGemmNvfp4(d.q, dup_out.t(), dh, eids, &dtok.t(), dup.t(), dus.t(), du2.t());
+  vt::MoeGroupedGemmNvfp4(d.q, dgate.t(), dh, eids, &dtok, dgp, dgs, dg2);
+  vt::MoeGroupedGemmNvfp4(d.q, dup_out.t(), dh, eids, &dtok, dup, dus, du2);
   DBuf dact(d, DType::kBF16, {P, I});
   vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup_out.t());
   DBuf ddown(d, DType::kBF16, {P, H});
-  vt::MoeGroupedGemmNvfp4(d.q, ddown.t(), dact.t(), eids, nullptr, ddp.t(), dds.t(), dd2.t());
+  vt::MoeGroupedGemmNvfp4(d.q, ddown.t(), dact.t(), eids, nullptr, ddp, dds, dd2);
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
   // Shared expert + weighted combine (out = shared + sum_j w_j * expert_out_j),
@@ -1056,39 +1125,50 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
 
 }  // namespace
 
-std::vector<float> Qwen3_5Model::Forward(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
-    const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
-    const HfConfig& config, vt::Queue& queue) {
+// Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
+// KEPT OUTSIDE THE CUDA-GRAPH (M2.5 Phase 2): the CUDA Embedding op allocates a
+// device bounds-check flag (cudaMalloc/cudaFree) and syncs the stream, all of
+// which are illegal inside a capture region — and it consumes host token_ids.
+// The graph driver runs this per step into its PERSISTENT hidden buffer, then
+// captures/replays ForwardLayers over that fixed hidden address.
+static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
+                      const Qwen3_5MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
-  VT_CHECK(T > 0, "qwen3_5 paged forward: empty token_ids");
-  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
-           "qwen3_5 paged forward: positions length must equal token count");
-  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
-           "qwen3_5 paged forward: weights.layers size must equal num_hidden_layers");
-  VT_CHECK(attn_meta.num_actual_tokens == T,
-           "qwen3_5 paged forward: attn_meta.num_actual_tokens must equal T");
-  Dev d{vt::GetBackend(queue.device.type), queue};
-  const float eps = static_cast<float>(config.rms_norm_eps);
-
-  // Count the KV groups' layers so the per-layer cache indexing is checkable.
-  int64_t n_full = 0, n_gdn = 0;
-  for (const auto& l : weights.layers)
-    (l.is_linear_attention ? n_gdn : n_full) += 1;
-  VT_CHECK(static_cast<int64_t>(attn_kv.size()) == n_full,
-           "qwen3_5 paged forward: attn_kv count must equal full-attn layer count");
-  VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
-           "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
-
-  // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+}
+
+// The CAPTURABLE paged forward region: everything AFTER the embedding — the
+// residual stream (res=0), the N paged decoder layers, the final RMSNorm and the
+// lm_head — returning the [T,vocab] f32 logits as a device DBuf (NO host
+// Download; the caller Downloads, or the graph keeps it resident as the graph's
+// output). `hidden_in` is the embedded input (a view over the graph's persistent
+// hidden buffer on the replay path); it is COPIED into a working buffer so the
+// layers' in-place residual thread never disturbs the persistent embedding.
+// Split out of Forward (M2.5 Phase 2) so the exact op sequence is what the graph
+// captures/replays; every per-step-varying input is read from a HOST vector
+// argument (positions / the metadata vectors), whose host->device copies are
+// capturable on GB10 (pageable memory access) and which the graph driver keeps
+// persistent + mutates in place so replays pick up each new token's inputs.
+static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
+                          const std::vector<int32_t>& positions,
+                          const CommonAttentionMetadata& attn_meta,
+                          const GDNAttentionMetadata& gdn_meta,
+                          const std::vector<PagedKvCache>& attn_kv,
+                          const std::vector<GdnStateCache>& gdn_state,
+                          const Qwen3_5MoeWeights& weights, const HfConfig& config) {
+  const int64_t T = hidden_in.shape[0];
+  const int64_t H = config.hidden_size;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  // Working copy of the embedded hidden (device->device; captured). RunLayerPaged
+  // reassigns `hidden` per layer, so this must NOT alias the persistent buffer.
+  DBuf hidden(d, DType::kBF16, {T, H});
+  d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
+           static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
   DBuf res(d, DType::kF32, {T, H});
   res.Zero(d);
@@ -1109,13 +1189,69 @@ std::vector<float> Qwen3_5Model::Forward(
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
-  // lm_head: fp4-resident (M2.2b) when populated, else the bf16/GGUF path. This
-  // is the ONE host Download of the whole forward (the [T,vocab] logits).
-  DBuf dlogits = weights.lm_head_fp4.Empty()
-                     ? MatmulF32D(d, dnorm.t(), weights.lm_head)
-                     : MatmulNvfp4F32D(d, dnorm.t(), weights.lm_head_fp4);
-  std::vector<float> logits(static_cast<size_t>(T) * vocab);
-  dlogits.Download(d, logits.data());
+  // lm_head: fp4-resident (M2.2b) when populated, else the bf16/GGUF path.
+  return weights.lm_head_fp4.Empty()
+             ? MatmulF32D(d, dnorm.t(), weights.lm_head)
+             : MatmulNvfp4F32D(d, dnorm.t(), weights.lm_head_fp4);
+}
+
+// Full eager paged forward body: embed (host token_ids) then the capturable
+// layer region. Used by Qwen3_5Model::Forward and the graph driver's eager
+// fallback / cold-shape pre-warm step (one contiguous stream, no capture).
+static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
+                        const std::vector<int32_t>& positions,
+                        const CommonAttentionMetadata& attn_meta,
+                        const GDNAttentionMetadata& gdn_meta,
+                        const std::vector<PagedKvCache>& attn_kv,
+                        const std::vector<GdnStateCache>& gdn_state,
+                        const Qwen3_5MoeWeights& weights, const HfConfig& config) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  DBuf hidden(d, DType::kBF16, {T, H});
+  EmbedInto(d, hidden, token_ids, weights, config);
+  return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
+                       gdn_state, weights, config);
+}
+
+// Shared shape/count validation for the paged forward entry points.
+static void CheckPagedForward(const std::vector<int32_t>& token_ids,
+                              const std::vector<int32_t>& positions,
+                              const CommonAttentionMetadata& attn_meta,
+                              const std::vector<PagedKvCache>& attn_kv,
+                              const std::vector<GdnStateCache>& gdn_state,
+                              const Qwen3_5MoeWeights& weights,
+                              const HfConfig& config) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  VT_CHECK(T > 0, "qwen3_5 paged forward: empty token_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "qwen3_5 paged forward: positions length must equal token count");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
+           "qwen3_5 paged forward: weights.layers size must equal num_hidden_layers");
+  VT_CHECK(attn_meta.num_actual_tokens == T,
+           "qwen3_5 paged forward: attn_meta.num_actual_tokens must equal T");
+  int64_t n_full = 0, n_gdn = 0;
+  for (const auto& l : weights.layers)
+    (l.is_linear_attention ? n_gdn : n_full) += 1;
+  VT_CHECK(static_cast<int64_t>(attn_kv.size()) == n_full,
+           "qwen3_5 paged forward: attn_kv count must equal full-attn layer count");
+  VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
+           "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
+}
+
+std::vector<float> Qwen3_5Model::Forward(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue) {
+  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
+                    config);
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                             gdn_state, weights, config);
+  std::vector<float> logits(static_cast<size_t>(T) * config.vocab_size);
+  dlogits.Download(d, logits.data());  // the ONE host Download of the forward.
   return logits;
 }
 
@@ -1190,6 +1326,211 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   std::vector<float> out(static_cast<size_t>(T) * H);
   for (size_t i = 0; i < out.size(); ++i)
     out[i] = res_host[i] + vt::BF16ToF32(hidden_host[i]);
+  return out;
+}
+
+// ─── Qwen3_5DecodeGraph (decode CUDA-graph driver) ──────────────────────────
+namespace {
+
+// Overwrite dst's CONTENTS from src WITHOUT changing dst.data() when the sizes
+// already match (preserves the fixed address a captured host->device copy reads
+// from); reallocate only when the shape actually changed.
+template <typename T>
+void CopyInPlace(std::vector<T>& dst, const std::vector<T>& src) {
+  if (dst.size() != src.size()) {
+    dst = src;
+  } else {
+    std::copy(src.begin(), src.end(), dst.begin());
+  }
+}
+template <typename T>
+void CopyInPlace(std::optional<std::vector<T>>& dst,
+                 const std::optional<std::vector<T>>& src) {
+  if (!src.has_value()) {
+    dst.reset();
+    return;
+  }
+  if (!dst.has_value()) dst.emplace();
+  CopyInPlace(*dst, *src);
+}
+
+// The SHAPE key a captured decode graph is valid for. Beyond num_reqs (== T for
+// decode) it includes the block-table column count and the GDN mamba-state
+// indices, because both are BAKED into the captured op stream (the block-table
+// copy size / the per-row GDN gather offsets). Any change re-captures.
+struct DecodeShapeKey {
+  int64_t T = -1;
+  int fa_cols = -1;
+  std::vector<int32_t> gdn_state_indices;
+  bool operator==(const DecodeShapeKey& o) const {
+    return T == o.T && fa_cols == o.fa_cols &&
+           gdn_state_indices == o.gdn_state_indices;
+  }
+};
+
+DecodeShapeKey MakeShapeKey(const std::vector<int32_t>& token_ids,
+                            const v1::CommonAttentionMetadata& attn_meta,
+                            const v1::GDNAttentionMetadata& gdn_meta) {
+  DecodeShapeKey k;
+  k.T = static_cast<int64_t>(token_ids.size());
+  k.fa_cols = attn_meta.block_table_num_cols;
+  if (gdn_meta.non_spec_state_indices_tensor.has_value())
+    k.gdn_state_indices = *gdn_meta.non_spec_state_indices_tensor;
+  return k;
+}
+
+}  // namespace
+
+struct Qwen3_5DecodeGraph::Impl {
+  Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q)
+      : weights(w), config(c), queue(q) {
+    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
+    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    Backend& b = vt::GetBackend(queue.device.type);
+    enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
+              b.SupportsGraphCapture();
+  }
+
+  const Qwen3_5MoeWeights& weights;
+  const HfConfig& config;
+  vt::Queue queue;
+  bool enabled = false;
+
+  // Persistent host inputs (fixed addresses across replays of a shape).
+  std::vector<int32_t> token_ids;
+  std::vector<int32_t> positions;
+  v1::CommonAttentionMetadata attn_meta;
+  v1::GDNAttentionMetadata gdn_meta;
+
+  std::unique_ptr<DBuf> logits;  // held graph-output buffer (not pool-returned)
+  std::unique_ptr<DBuf> hidden;  // persistent embed target (fixed address; the
+                                 // captured layer region reads it, embedding
+                                 // writes it OUTSIDE the graph each step)
+
+  bool captured = false;
+  DecodeShapeKey cap_key;
+  DecodeShapeKey warm_key;
+  bool warm_valid = false;
+  int64_t replays = 0;
+
+  // Copy this step's inputs into the persistent host buffers IN PLACE (same
+  // addresses on an unchanged shape) so a replay re-reads the new token.
+  void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
+               const v1::CommonAttentionMetadata& am,
+               const v1::GDNAttentionMetadata& gm) {
+    CopyInPlace(token_ids, tok);
+    CopyInPlace(positions, pos);
+    // Attention metadata: in-place the H2D-copied vectors, assign the scalars.
+    CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
+    CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
+    CopyInPlace(attn_meta.seq_lens, am.seq_lens);
+    CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
+    attn_meta.num_reqs = am.num_reqs;
+    attn_meta.num_actual_tokens = am.num_actual_tokens;
+    attn_meta.max_query_len = am.max_query_len;
+    attn_meta.max_seq_len = am.max_seq_len;
+    attn_meta.block_table_num_cols = am.block_table_num_cols;
+    attn_meta.causal = am.causal;
+    // GDN metadata: in-place the (optional) index/offset vectors, copy scalars.
+    CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
+                gm.non_spec_state_indices_tensor);
+    CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
+    CopyInPlace(gdn_meta.has_initial_state, gm.has_initial_state);
+    CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
+    CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
+    CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
+    gdn_meta.num_prefills = gm.num_prefills;
+    gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
+    gdn_meta.num_decodes = gm.num_decodes;
+    gdn_meta.num_decode_tokens = gm.num_decode_tokens;
+    gdn_meta.num_actual_tokens = gm.num_actual_tokens;
+  }
+};
+
+Qwen3_5DecodeGraph::Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights,
+                                       const HfConfig& config, vt::Queue queue)
+    : impl_(std::make_unique<Impl>(weights, config, queue)) {}
+
+Qwen3_5DecodeGraph::~Qwen3_5DecodeGraph() = default;
+
+bool Qwen3_5DecodeGraph::captured() const { return impl_->captured; }
+int64_t Qwen3_5DecodeGraph::replay_count() const { return impl_->replays; }
+
+std::vector<float> Qwen3_5DecodeGraph::Step(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const v1::CommonAttentionMetadata& attn_meta,
+    const v1::GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state) {
+  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
+                    impl_->weights, impl_->config);
+  Backend& b = vt::GetBackend(impl_->queue.device.type);
+  Dev d{b, impl_->queue};
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t vocab = impl_->config.vocab_size;
+  std::vector<float> out(static_cast<size_t>(T) * static_cast<size_t>(vocab));
+
+  // Eager fallback (capture disabled / non-CUDA): identical to Forward.
+  if (!impl_->enabled) {
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                          gdn_state, impl_->weights, impl_->config);
+    lg.Download(d, out.data());
+    return out;
+  }
+
+  // Update the persistent host inputs (in place) to this step's token.
+  impl_->Refresh(token_ids, positions, attn_meta, gdn_meta);
+  const DecodeShapeKey key = MakeShapeKey(token_ids, attn_meta, gdn_meta);
+  const int64_t H = impl_->config.hidden_size;
+
+  // Fast path: a graph is captured for this shape. Embed OUTSIDE the graph into
+  // the persistent hidden buffer, then relaunch the captured layer region.
+  if (impl_->captured && key == impl_->cap_key) {
+    EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
+    b.Replay(impl_->queue);
+    ++impl_->replays;
+    impl_->logits->Download(d, out.data());
+    return out;
+  }
+
+  // The pool + residency were warmed for this shape by the previous (eager)
+  // step: CAPTURE the layer region once, then launch it. Capture RECORDS (does
+  // not execute); the Replay is the single real execution that advances the
+  // caches. Embedding runs OUTSIDE the capture region (it mallocs/syncs a
+  // bounds-check flag and consumes host token_ids).
+  if (impl_->warm_valid && key == impl_->warm_key) {
+    EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
+    b.BeginCapture(impl_->queue);
+    DBuf lg = ForwardLayers(d, impl_->hidden->t(), impl_->positions,
+                            impl_->attn_meta, impl_->gdn_meta, attn_kv, gdn_state,
+                            impl_->weights, impl_->config);
+    b.EndCapture(impl_->queue);
+    impl_->logits = std::make_unique<DBuf>(std::move(lg));
+    impl_->captured = true;
+    impl_->cap_key = key;
+    b.Replay(impl_->queue);
+    impl_->replays = 1;
+    impl_->logits->Download(d, out.data());
+    return out;
+  }
+
+  // Cold shape: run one EAGER step (pre-warms the DevicePool + resident weights /
+  // fused-MoE constants for this shape) and defer capture to the next step. This
+  // is a real decode step (its output is used); nothing is wasted. (Re)allocate
+  // the persistent hidden buffer to this shape's T so the next-step capture bakes
+  // its fixed address.
+  impl_->hidden = std::make_unique<DBuf>(d, DType::kBF16,
+                                         std::vector<int64_t>{T, H});
+  EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
+  {
+    DBuf lg = ForwardLayers(d, impl_->hidden->t(), impl_->positions,
+                            impl_->attn_meta, impl_->gdn_meta, attn_kv, gdn_state,
+                            impl_->weights, impl_->config);
+    lg.Download(d, out.data());
+  }
+  impl_->warm_key = key;
+  impl_->warm_valid = true;
+  impl_->captured = false;  // any prior-shape graph is now stale
   return out;
 }
 

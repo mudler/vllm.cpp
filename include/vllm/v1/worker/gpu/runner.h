@@ -54,6 +54,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -173,6 +174,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::vector<float>> conv_buf_;       // per GDN layer
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
+
+  // Decode CUDA-graph driver (M2.5 Phase 2), created lazily on the first
+  // pure-decode step of an fp4/CUDA model. Captures the decode forward once per
+  // batch shape and replays it per token (mirrors vLLM's decode CUDAGraph
+  // capture). nullptr on CPU / bf16 / when disabled — those keep the eager path.
+  std::unique_ptr<Qwen3_5DecodeGraph> decode_graph_;
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -99,6 +100,58 @@ class Qwen3_5Model {
                                          const std::vector<int32_t>& positions,
                                          const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue);
+};
+
+// Decode-step CUDA-graph driver (M2.5 Phase 2, gate-#1 decode-launch unlock).
+// Wraps the paged forward COMPUTE body (embed -> layers -> lm_head) in a
+// capture-once / replay-per-token CUDA graph for PURE-DECODE batches, collapsing
+// the ~thousands of per-step kernel-launch + memcpy host-API calls into a single
+// cudaGraphLaunch. Mirrors vLLM's decode CUDAGraph capture: capture keyed on the
+// batch SHAPE, per-step-varying inputs threaded through PERSISTENT buffers, and
+// decode-only (prefill / mixed batches stay eager, kept off this path by the
+// runner).
+//
+// ── vt-runtime realization (deviations, so upstream ports mechanically) ──────
+//   * PERSISTENT INPUTS are the HOST step vectors (token_ids / positions / the
+//     attention+GDN metadata), held here and MUTATED IN PLACE each step. On GB10
+//     (pageable memory access) the forward's host->device input copies are
+//     capturable, so a replay re-reads each new token's inputs from the fixed
+//     host addresses — no separate device staging buffers (vLLM keeps torch
+//     tensors on-GPU; here the "buffer" is the host vector the copy reads from).
+//   * The GDN mamba-state gather offsets and the block-table column count are
+//     BAKED at capture, so the SHAPE key includes them; any change re-captures.
+//   * A cold shape runs one EAGER step first (pre-warms the DevicePool + the
+//     resident weights / fused-MoE constants) so the capture region does zero
+//     cudaMalloc; the next same-shape step captures, and subsequent ones replay.
+//   * VLLM_CPP_CUDAGRAPH=0 disables capture (always eager) for the A/B and as a
+//     safety valve. Non-CUDA devices always run eager.
+class Qwen3_5DecodeGraph {
+ public:
+  Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights, const HfConfig& config,
+                     vt::Queue queue);
+  ~Qwen3_5DecodeGraph();
+  Qwen3_5DecodeGraph(const Qwen3_5DecodeGraph&) = delete;
+  Qwen3_5DecodeGraph& operator=(const Qwen3_5DecodeGraph&) = delete;
+
+  // One PURE-DECODE step. Returns [T, vocab] f32 logits, bit-identical to
+  // Qwen3_5Model::Forward for the same inputs/caches. attn_kv / gdn_state are the
+  // runner's persistent caches (stable addresses across steps). The caller must
+  // only route pure-decode batches here (all query_len==1, no prefill).
+  std::vector<float> Step(const std::vector<int32_t>& token_ids,
+                          const std::vector<int32_t>& positions,
+                          const v1::CommonAttentionMetadata& attn_meta,
+                          const v1::GDNAttentionMetadata& gdn_meta,
+                          const std::vector<PagedKvCache>& attn_kv,
+                          const std::vector<GdnStateCache>& gdn_state);
+
+  // Diagnostics (A/B + tests): is a graph currently captured, and how many
+  // replays have run since the last (re)capture.
+  bool captured() const;
+  int64_t replay_count() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 // Per-layer parity replay: runs ONE decoder layer over the combined residual

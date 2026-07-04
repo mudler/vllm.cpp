@@ -175,6 +175,26 @@ std::vector<float> ReferenceMatmul(const Nvfp4Weight& w, const std::vector<uint1
   return out;
 }
 
+// Same dequant-then-matmul reference, but with f32 activations: dequant to bf16
+// [N, K], then out[m,n] = sum_k act_f32[m,k] * f32(bf16_weight[n,k]) in f32 — an
+// apples-to-apples reference for the f32-activation kernel path (same weight
+// bytes, same f32 accumulation, only the reduction order differs).
+std::vector<float> ReferenceMatmulF32Act(const Nvfp4Weight& w, const std::vector<float>& act_f32,
+                                         int64_t m, int64_t k, int64_t n) {
+  std::vector<uint16_t> w_deq(static_cast<size_t>(n * k));  // [N, K] bf16
+  vllm::DequantNvfp4ToBf16(w.packed.data(), w.scale.data(), w.scale2, n, k, w_deq.data());
+  std::vector<float> out(static_cast<size_t>(m * n), 0.0f);
+  for (int64_t i = 0; i < m; ++i)
+    for (int64_t j = 0; j < n; ++j) {
+      float acc = 0.0f;
+      for (int64_t p = 0; p < k; ++p)
+        acc += act_f32[static_cast<size_t>(i * k + p)] *
+               vt::BF16ToF32(w_deq[static_cast<size_t>(j * k + p)]);
+      out[static_cast<size_t>(i * n + j)] = acc;
+    }
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("CUDA matmul_nvfp4 matches Matmul(act, dequant(w).T) on odd shapes") {
@@ -242,10 +262,7 @@ TEST_CASE("CUDA matmul_nvfp4: f32 activations also match the reference") {
   const int64_t m = 4, k = 128, n = 9;
   const Nvfp4Weight w = MakeNvfp4Weight(n, k, 7000);
   const auto act_f = RandomF32(static_cast<size_t>(m * k), 7001);
-  // The reference multiplies bf16(act); feed the same bf16 act so the only
-  // difference vs the f32-act kernel is act rounding — still within tolerance.
-  const auto act_bf16 = ToBf16(act_f);
-  const std::vector<float> ref = ReferenceMatmul(w, act_bf16, m, k, n);
+  const std::vector<float> ref = ReferenceMatmulF32Act(w, act_f, m, k, n);
 
   QueueGuard gq(gpu);
   DeviceTensor dact(gpu, gq.q, DType::kF32, {m, k}, act_f.data());
@@ -255,8 +272,9 @@ TEST_CASE("CUDA matmul_nvfp4: f32 activations also match the reference") {
   vt::MatmulNvfp4(gq.q, dout.tensor(), dact.tensor(), dpacked.tensor(), dscale.tensor(), w.scale2);
   std::vector<float> got(static_cast<size_t>(m * n));
   dout.Download(gq.q, got.data());
-  // f32 act vs bf16-act reference: allow one bf16 act ulp on the products.
-  CheckClose(got, ref, 8e-3f, 8e-3f);
+  // Same weight bytes + f32 accumulation on both sides; only reduction order
+  // differs — matmul tolerance.
+  CheckClose(got, ref, 2e-3f, 2e-3f);
 }
 
 TEST_CASE("matmul_nvfp4 validates shapes loudly (CPU dispatch)") {

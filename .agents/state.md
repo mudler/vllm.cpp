@@ -554,3 +554,39 @@
   full CUDA ctest + the checkpoint-gated 35B forward gate on GB10. A "35B greedy
   through the paged LLMEngine" test still needs writing (RunQwen36Logits exercises
   ForwardDense, not the paged engine).
+- **2026-07-04 (M3.1/M3.2 done — OpenAI serving)** — The OpenAI-compatible HTTP
+  server runs over the M1.8 LLMEngine on CPU. `23d9f2c` (+ `9b5c2c5` protocol,
+  `9afc099` serving handlers, `a99a65e` chat template, `1313061` detok UTF-8 fix,
+  + engine-mutex). Pieces: **protocol types** (Completion/ChatCompletion request→
+  to_sampling_params + response/stream/usage/error shapes, nlohmann/json; upstream
+  split protocol.py per-endpoint — collapsed to one mirrored file); **serving
+  handlers** (decoupled from HTTP: full Response non-stream / vector-of-SSE-chunks
+  stream, chat role-delta-first cadence, ChatPromptFn seam); **minja-subset Jinja
+  chat-template engine** (an original component like vt::; for/if/elif/else/set/
+  interpolation + whitespace-control trim_blocks/lstrip_blocks + `-` markers,
+  verified byte-identical to jinja2 on the Qwen3 template, loud-error on
+  unsupported constructs); **cpp-httplib HTTP server** (routes + SSE via chunked
+  content provider + OpenAI error shapes/status + `/v1/models` + a std::mutex
+  serializing engine-touching requests since the LLMEngine is stateful/not
+  thread-safe) + **examples/server CLI** (loads config/tokenizer/safetensors →
+  LLMEngine, wires the real chat template). All reviewed PASS; the Task-4 review
+  caught the missing engine-serialization (fixed + a 6-client concurrency test).
+  Also fixed the detokenizer streamed-delta UTF-8 boundary (`1313061`) + added
+  serving-boundary SanitizeUtf8 (raw-bytes detok → U+FFFD for invalid runs before
+  json::dump, matching upstream str semantics — the recorded carry, CLOSED).
+  CPU ctest 63/63. **DEPENDENCY DEVIATION (recorded):** cpp-httplib (MIT,
+  header-only, third_party/httplib/) behind the VLLM_CPP_SERVER CMake option — a
+  transport dep, not a compute/ML dep (consistent with the no-pytorch/no-ggml
+  rule); the minja-subset Jinja engine is likewise original.
+  **DEFERRED:** tools/tool_choice (M3.3), grammars/xgrammar (M3.4), logprobs
+  payload, n>1 multiple choices, the `/metrics` endpoint, C-API + packaging
+  (M3.5), GGUF model load (M0.10). **CARRY:** the example server's real-weights
+  (safetensors 35B) load path is structured but unexercised on the CPU box (needs
+  dgx or a downloaded checkpoint); real-model end-to-end serving is validated only
+  on the synthetic model so far. NEXT (toward the serving MVP per protocol): **M3.3
+  tool calling** (tools/tool_choice, Qwen/Hermes tool-parsers, streaming tool-call
+  deltas, grammar-forced JSON) → **M3.4 grammars** (xgrammar core + structured-
+  output manager + scheduler bitmask) → **M3.5 C-API + packaging** (include/vllm.h,
+  shared lib, LocalAI-style dlopen smoke) → **M3.6 conformance suite** → **M3.7
+  docs**. Also outstanding: **M0.10 GGUF model load** (k-quant dequant) and the
+  **dgx bring-up** (CUDA kernels + 35B paged gate on GB10, scripts/dgx-bringup.sh).

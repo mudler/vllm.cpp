@@ -161,9 +161,19 @@ vocabulary is ported.**
 
 ## M3 — Serving MVP (gates #2–#5 validated)
 
-- ☐ **M3.1 OpenAI server**: completions/chat, SSE + non-streaming, models/
-  health/version/metrics endpoints, error shapes.
-- ☐ **M3.2 Chat templates** (minja-subset) for Qwen/Llama families.
+- ☑ **M3.1 OpenAI server**: completions/chat, SSE + non-streaming, models/
+  health/version/metrics endpoints, error shapes. Done `9b5c2c5` (protocol types
+  + to_sampling_params) → `9afc099` (serving_completion/chat, decoupled from HTTP)
+  → `23d9f2c` (cpp-httplib server + routes + SSE + SanitizeUtf8 + examples/server)
+  → `+`mutex (engine serialization). Reviewed PASS. CPU 63/63 incl. a real-socket
+  smoke + 6-client concurrency test. (metrics endpoint deferred; logprobs payload
+  M3.x.)
+- ☑ **M3.2 Chat templates** (minja-subset) for Qwen/Llama families. Done `a99a65e`
+  (an original minja-subset Jinja engine: for/if/elif/else/set/interpolation +
+  whitespace-control incl. trim_blocks/lstrip_blocks, verified byte-identical to
+  jinja2 on the Qwen3 template; loud-error on unsupported constructs). Injected
+  into serving_chat via the ChatPromptFn seam. Tool/think template branches
+  (namespace/tojson/reversed) = M3.3/M3.4.
 - ☐ **M3.3 Tool calling**: tools/tool_choice, Qwen + Hermes parsers,
   streaming tool-call deltas, grammar-forced JSON for required/named.
 - ☐ **M3.4 Grammars**: xgrammar core vendored, structured-output manager +

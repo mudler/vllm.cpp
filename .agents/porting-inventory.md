@@ -208,8 +208,8 @@ sampler + `use_v2_model_runner`-style padded drafting come with it.
 
 | Item | Upstream | Tier |
 |---|---|---|
-| `/v1/completions`, `/v1/chat/completions` (SSE streaming), `/v1/models`, `/health`, `/version`, `/metrics` | `entrypoints/openai/` | T0 |
-| Chat templating (Jinja subset needed by Qwen/Llama templates; engine: minja-style) | `entrypoints/chat_utils.py` | T0 |
+| `/v1/completions`, `/v1/chat/completions` (SSE streaming), `/v1/models`, `/health`, `/version`, `/metrics` | `entrypoints/openai/` | T0 ✅ `23d9f2c` (protocol+serving+cpp-httplib server+SanitizeUtf8+engine-mutex+examples/server; `/metrics` deferred; logprobs payload M3.x) |
+| Chat templating (Jinja subset needed by Qwen/Llama templates; engine: minja-style) | `entrypoints/chat_utils.py` | T0 ✅ `a99a65e` (original minja-subset Jinja engine, Qwen3.6 byte-identical to jinja2; tool/think branches M3.3/M3.4) |
 | **Tool/function calling** (user-mandated MVP): `tools`/`tool_choice` in chat API, auto-tool-choice, streaming tool-call deltas, tool-call parsers for the gate models (Qwen family + Hermes format first; others T1), grammar-forced JSON for `tool_choice=required`/named | `entrypoints/openai/tool_parsers/`, `chat_completion/` | T0 |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | T1 |
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | T2 |

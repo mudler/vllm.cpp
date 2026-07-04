@@ -1165,6 +1165,44 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
 }
 
+// Batched PAGED dense decoder layer (27B; notes §5). Identical residual/norm
+// thread + paged attention wiring as RunLayerPaged, but the MoE block is swapped
+// for the dense SwiGLU MLP (DenseMlpBlock) and the layer carries dense weights.
+// The GDN / full-attn paged blocks are the 35B helpers reused VERBATIM. Exactly
+// one of {attn_kv, gdn_state} is non-null (per layer type).
+void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
+                        const HfConfig& cfg, DBuf& hidden, DBuf& res,
+                        const std::vector<int32_t>& positions,
+                        const CommonAttentionMetadata& attn_meta,
+                        const GDNAttentionMetadata& gdn_meta,
+                        const PagedKvCache* attn_kv,
+                        const GdnStateCache* gdn_state, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+
+  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
+  DBuf dhn(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+
+  DBuf attn = [&] {
+    if (layer.is_linear_attention) {
+      VT_CHECK(gdn_state != nullptr,
+               "paged dense layer: GDN layer needs a GdnStateCache");
+      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), gdn_meta, *gdn_state, T);
+    }
+    VT_CHECK(attn_kv != nullptr,
+             "paged dense layer: full-attn layer needs a PagedKvCache");
+    return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), positions, attn_meta,
+                              *attn_kv, T);
+  }();
+
+  Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
+  DBuf dh2(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+
+  hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
+}
+
 }  // namespace
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
@@ -1371,6 +1409,74 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     RunDenseLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
                   positions, T);
+
+  // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
+  DBuf dnorm(d, DType::kBF16, {T, H});
+  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
+
+  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
+  DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
+  std::vector<float> logits(static_cast<size_t>(T) * vocab);
+  dlogits.Download(d, logits.data());
+  return logits;
+}
+
+std::vector<float> Qwen3_5DenseModel::Forward(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  // Same shape/count contract as Qwen3_5Model::Forward (CheckPagedForward), over
+  // the dense weights. One PagedKvCache per full-attn layer, one GdnStateCache
+  // per GDN layer, in layer order.
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  const int64_t vocab = config.vocab_size;
+  VT_CHECK(T > 0, "qwen3_5 dense paged forward: empty token_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "qwen3_5 dense paged forward: positions length must equal token count");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
+           "qwen3_5 dense paged forward: weights.layers size must equal "
+           "num_hidden_layers");
+  VT_CHECK(attn_meta.num_actual_tokens == T,
+           "qwen3_5 dense paged forward: attn_meta.num_actual_tokens must equal T");
+  int64_t n_full = 0, n_gdn = 0;
+  for (const auto& l : weights.layers) (l.is_linear_attention ? n_gdn : n_full) += 1;
+  VT_CHECK(static_cast<int64_t>(attn_kv.size()) == n_full,
+           "qwen3_5 dense paged forward: attn_kv count must equal full-attn layers");
+  VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
+           "qwen3_5 dense paged forward: gdn_state count must equal GDN layers");
+
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
+  // Text-only: the three mRoPE streams coincide so partial NeoX RoPE degenerates
+  // to 1-D RoPE over `positions` (notes §2); the vision tower is DEFERRED.
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  DBuf hidden(d, DType::kBF16, {T, H});
+  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+
+  DBuf res(d, DType::kF32, {T, H});
+  res.Zero(d);
+
+  // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
+  // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the
+  // 35B paged forward).
+  int64_t fa_idx = 0, gdn_idx = 0;
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    const Qwen3_5DenseLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
+    const PagedKvCache* kv =
+        layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
+    const GdnStateCache* gs =
+        layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
+    RunDenseLayerPaged(d, layer, config, hidden, res, positions, attn_meta,
+                       gdn_meta, kv, gs, T);
+  }
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});

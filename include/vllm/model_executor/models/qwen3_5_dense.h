@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, GdnStateCache + v1 attention metadata
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
@@ -98,6 +99,26 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // logits [T, vocab] f32 (T = token_ids.size()). CPU or CUDA per `queue`.
 class Qwen3_5DenseModel {
  public:
+  // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.
+  // Same signature/structure (paged KV cache for the full-attn layers, batched
+  // GDN recurrent state for the GDN layers, the f32 residual thread), reusing the
+  // 35B GDN/FullAttn paged machinery VERBATIM with the dense SwiGLU MLP
+  // (RunDenseLayerPaged) in place of the MoE block. One PagedKvCache per full-attn
+  // layer + one GdnStateCache per GDN layer, in layer order. Returns
+  // [num_actual_tokens, vocab] f32 logits (lm_head applied). Runs on `queue`'s
+  // device. See qwen3_5.h::Qwen3_5Model::Forward for the metadata contract.
+  static std::vector<float> Forward(const std::vector<int32_t>& token_ids,
+                                    const std::vector<int32_t>& positions,
+                                    const v1::CommonAttentionMetadata& attn_meta,
+                                    const v1::GDNAttentionMetadata& gdn_meta,
+                                    const std::vector<PagedKvCache>& attn_kv,
+                                    const std::vector<GdnStateCache>& gdn_state,
+                                    const Qwen3_5DenseWeights& weights,
+                                    const HfConfig& config, vt::Queue& queue);
+
+  // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
+  // for a single non-paged sequence and returns logits [T, vocab] f32 (T =
+  // token_ids.size()). Retained as the paged==dense parity reference.
   static std::vector<float> ForwardDense(const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const Qwen3_5DenseWeights& weights,

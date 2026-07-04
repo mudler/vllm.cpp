@@ -60,6 +60,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
@@ -125,6 +126,17 @@ class GPUModelRunner final : public ModelRunnerBase {
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
+  // DENSE-arch overload (27B, Qwen3_5ForConditionalGeneration / num_experts==0).
+  // Identical to the MoE constructor except the model runs through the dense
+  // weights + the paged dense forward (Qwen3_5DenseModel::Forward). The KV-cache
+  // layout is config-driven (same GDN + full-attn hybrid backbone), so
+  // initialize_kv_cache is unchanged. `config` and `weights` must outlive the
+  // runner. The MoE-only fp4 decode-graph fast path stays inert on this arch.
+  GPUModelRunner(const HfConfig& config, const Qwen3_5DenseWeights& weights,
+                 const KVCacheConfig& kv_cache_config, vt::Queue queue,
+                 int max_num_reqs, int max_model_len,
+                 int max_num_batched_tokens);
+
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) override;
@@ -158,7 +170,11 @@ class GPUModelRunner final : public ModelRunnerBase {
                                           int* num_cols) const;
 
   const HfConfig& config_;
-  const Qwen3_5MoeWeights& weights_;
+  // Exactly one of {moe_weights_, dense_weights_} is non-null, selecting the MoE
+  // (35B) or dense (27B) forward. Held by pointer (not reference) so the single
+  // runner class carries either arch; both are borrowed (must outlive the runner).
+  const Qwen3_5MoeWeights* moe_weights_ = nullptr;
+  const Qwen3_5DenseWeights* dense_weights_ = nullptr;
   vt::Queue queue_;
   InputBatch input_batch_;
   Sampler sampler_;

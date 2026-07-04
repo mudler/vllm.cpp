@@ -10,7 +10,7 @@ pinned upstream checkout `/home/mudler/_git/vllm` @ `e24d1b24`. Cites are
 Checkpoint (read-only on dgx):
 `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4`.
 
-STATUS (2026-07-04): CPU-first correctness path LANDED (§5 steps 1-4). Delivered:
+STATUS (2026-07-04): CPU-first correctness path LANDED (§5 steps 1-4b). Delivered:
 the CPU W4A4 dequant + activation-quant reference (`nvfp4_emulation.h`,
 unit-tested); the dense loader (`LoadQwen3_5Dense` → `Qwen3_5DenseWeights`,
 `qwen3_5_dense.h`/`qwen3_5_dense_weights.cpp`) that routes each Linear bf16 vs
@@ -18,12 +18,21 @@ W4A4-materialized-to-bf16 by name (`IsQwen27QuantizedLinear` +
 `MaterializeCtNvfp4Bf16Transposed`); the dense TEXT forward
 (`Qwen3_5DenseModel::ForwardDense` in `qwen3_5.cpp`, reusing the 35B GDN +
 gated-attn + norm helpers with the MoE block swapped for the dense SwiGLU MLP);
-and CPU unit tests (`test_qwen27_dense_forward.cpp`: routing + materialization +
-finite/deterministic forward + MLP-wired, 4 cases / 280 assertions, CPU-green).
-The full CPU ctest suite (83 targets) stays green. What is NOT done and is GPU-gated: the
-pip-vLLM oracle greedy golden capture (step 5), the W4A4 matmul kernel wiring
-(step 6), and flipping `kW4A4ForwardReady` to close the gate (step 7). §5 is the
-ordered plan, GPU steps marked.
+the batched PAGED dense forward (`Qwen3_5DenseModel::Forward`, same signature/
+structure as the 35B `Qwen3_5Model::Forward` — paged KV cache for full-attn,
+batched GDN state for GDN, via a new `RunDenseLayerPaged` reusing the 35B
+`GdnBlockPaged`/`FullAttnBlockPaged` VERBATIM) + the runner route (a dense-arch
+`GPUModelRunner` constructor overload holding `Qwen3_5DenseWeights` and routing
+`execute_model` to the dense forward; the MoE reference member became a
+`{moe,dense}_weights_` pointer pair); and CPU unit tests
+(`test_qwen27_dense_forward.cpp`: routing + materialization + finite/deterministic
+forward + MLP-wired, 4 cases / 280 assertions; `test_qwen27_paged_forward.cpp`:
+the paged==dense anchor + multi-block + decode-via-cache + GDN-state-zeroing, 4
+cases / 8 assertions, CPU-green). The full CPU ctest suite (86 targets) stays
+green. What is NOT done and is GPU-gated: the pip-vLLM oracle greedy golden
+capture (step 5), the W4A4 matmul kernel wiring (step 6), and flipping
+`kW4A4ForwardReady` to close the gate (step 7). §5 is the ordered plan, GPU steps
+marked.
 
 ---
 
@@ -284,17 +293,43 @@ Legend: **[CPU]** doable on the dev box now; **[GPU]** needs the free GB10.
    (finite + deterministic logits; MLP-perturbation moves the output). The ViT +
    image/video merger + MTP head are DEFERRED (text-first, §0.1) — no stub code,
    the loader simply does not request `model.visual.*`/`mtp.*`.
-   ⚠ REMAINING before step 5/7 flips the gate: (a) a paged `Qwen3_5DenseModel`
-   forward + a runner route (the 35B rides `Qwen3_5Model::Forward` + the runner;
-   the dense arch needs the analogous paged path OR the runner extended to the
-   dense weights) — the dense ForwardDense here is the single-sequence reference,
-   as the 35B's ForwardDense was before its paged refactor; (b) mrope_section
-   handling for genuine multimodal positions (inert for text).
+   `ForwardDense` is retained as the single-sequence parity reference (the
+   paged==dense anchor), exactly as the 35B's `ForwardDense`.
+   ⚠ REMAINING before step 7 flips the gate (all GPU-gated now): (a) the W4A4
+   matmul kernel (step 6); (b) mrope_section handling for genuine multimodal
+   positions (inert for text).
+
+3b. **[CPU] ✅ DONE — Paged dense path + runner wiring.**
+   `Qwen3_5DenseModel::Forward` (in `qwen3_5.cpp`) is the batched/paged 27B text
+   forward with the SAME signature/structure as `Qwen3_5Model::Forward`: paged KV
+   cache (`PagedKvCache`) for the full-attn layers + batched GDN recurrent state
+   (`GdnStateCache`) for the GDN layers + the f32 residual thread, per-layer
+   `fa_idx`/`gdn_idx` indexing identical to the 35B. It reuses the 35B
+   `GdnBlockPaged`/`FullAttnBlockPaged` + paged machinery VERBATIM via a new
+   `RunDenseLayerPaged` (a copy of `RunLayerPaged` with `DenseMlpBlock` in place
+   of `MoeBlock` and `Qwen3_5DenseLayerWeights` in place of the MoE weights). No
+   dense CUDA-graph driver (the MoE `Qwen3_5DecodeGraph` is an fp4/CUDA decode
+   optimization; the dense path runs eager, as its GPU GEMM is step 6). Runner
+   route: `GPUModelRunner` gained a `Qwen3_5DenseWeights` constructor overload;
+   its MoE reference member became a `{moe,dense}_weights_` pointer pair, and
+   `execute_model` routes to `Qwen3_5DenseModel::Forward` when `dense_weights_` is
+   set (the MoE-only fp4 decode-graph fast path stays inert on the dense arch).
+   `initialize_kv_cache` is unchanged (config-driven; same hybrid backbone).
+   CPU-validated by `test_qwen27_paged_forward.cpp` (the 27B analogue of the 35B
+   `test_qwen35_paged_forward.cpp`): paged==dense full-prefill, multi-block
+   (block_size<T non-contiguous), decode-via-KV-cache, and GDN-state-zeroing on a
+   garbage-seeded mamba block — all within tolerance (`max|diff|` 0 on the
+   zeroing/mixed-batch gate). Deviations recorded in porting-inventory §9.
+   Full LoadedEngine dense loading (config-arch dispatch in `model_loader.cpp` →
+   `LoadQwen3_5Dense` + a dense `LoadedEngine`/executor path) is NOT wired here —
+   the executor/engine stack is MoE-typed; that end-to-end plumbing is a small
+   follow-up once the GPU GEMM (step 6) makes a full 27B run meaningful.
 
 4. **[CPU] ✅ DONE — greedy-parity gate scaffold.**
    `test_qwen27_paged_engine.cpp` resolves the `unsloth/Qwen3.6-27B-NVFP4`
    snapshot and SKIPS (checkpoint-gated + `kW4A4ForwardReady=false`). Compiles
-   + links on CPU; flip the flag when steps 3+6 land.
+   + links on CPU; flip the flag when step 6 lands (the paged forward is now
+   ready — step 3b).
 
 5. **[GPU] Capture the pip-vLLM oracle greedy golden** (AGENTS.md STANDING
    DIRECTIVE; gates.md §PROTOCOL). Run pip-vLLM (`~/venvs/vllm-oracle`) on the

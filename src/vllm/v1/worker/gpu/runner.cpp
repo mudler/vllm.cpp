@@ -220,7 +220,22 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                                vt::Queue queue, int max_num_reqs,
                                int max_model_len, int max_num_batched_tokens)
     : config_(config),
-      weights_(weights),
+      moe_weights_(&weights),
+      queue_(queue),
+      input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
+                   static_cast<int>(config.vocab_size),
+                   group_block_sizes(kv_cache_config),
+                   group_block_sizes(kv_cache_config)) {
+  initialize_kv_cache(kv_cache_config);
+}
+
+GPUModelRunner::GPUModelRunner(const HfConfig& config,
+                               const Qwen3_5DenseWeights& weights,
+                               const KVCacheConfig& kv_cache_config,
+                               vt::Queue queue, int max_num_reqs,
+                               int max_model_len, int max_num_batched_tokens)
+    : config_(config),
+      dense_weights_(&weights),
       queue_(queue),
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
@@ -384,12 +399,20 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
   const bool fp4_cuda = queue_.device.type == vt::DeviceType::kCUDA &&
-                        !weights_.layers.empty() &&
-                        !weights_.layers.front().moe.expert_gate_fp4.empty();
+                        moe_weights_ != nullptr &&
+                        !moe_weights_->layers.empty() &&
+                        !moe_weights_->layers.front().moe.expert_gate_fp4.empty();
   std::vector<float> logits;
-  if (pure_decode && num_reqs == 1 && fp4_cuda) {
+  if (dense_weights_ != nullptr) {
+    // DENSE arch (27B): the eager paged dense forward. Same paged KV/GDN-state
+    // machinery, dense SwiGLU MLP in place of the MoE block. The MoE-only fp4
+    // decode-graph fast path does not apply here.
+    logits = Qwen3_5DenseModel::Forward(token_ids, positions, attn_meta, gdn_meta,
+                                        attn_kv_, gdn_state_, *dense_weights_,
+                                        config_, queue_);
+  } else if (pure_decode && num_reqs == 1 && fp4_cuda) {
     if (!decode_graph_) {
-      decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(weights_, config_,
+      decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(*moe_weights_, config_,
                                                            queue_);
     }
     logits = decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
@@ -397,7 +420,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   } else {
     logits =
         Qwen3_5Model::Forward(token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                              gdn_state_, weights_, config_, queue_);
+                              gdn_state_, *moe_weights_, config_, queue_);
   }
 
   // Stash for sample_tokens (upstream ExecuteModelState).

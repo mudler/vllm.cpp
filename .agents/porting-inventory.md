@@ -131,7 +131,7 @@ implementation) is ported at T0.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
-| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense forward + W4A4 GPU GEMM pending (GPU-gated). serving M1–M3 | **T0 (the gate)** |
+| **Qwen3.5/3.6 hybrid (incl. MoE)** | `Qwen3_5ForConditionalGeneration` (27B dense-hybrid, **VL multimodal** wrapper — vision_config present), `Qwen3_5MoeForConditionalGeneration` / `qwen35moe` (35B-A3B) | GDN layers ×3 : 1 gated full-attn (qk-norm, partial RoPE 64d, output gate), MoE 256e top-8 + shared expert (35B) / **dense SwiGLU MLP** (27B), GemmaRMSNorm-style `(1+w)` — ✅ `25326fc` (35B forward correctness-grade, **safetensors**; 16/16 greedy on GB10 = M0 exit; GGUF k-quant load M0.10). **27B (co-equal gate):** CPU-first scaffolding started — arch/quant surveyed (`.agents/qwen27b-w4a4-notes.md`: dense hybrid, W4A4, **and a VL wrapper — text path first, ViT deferred**), CPU W4A4 emulation reference + skipping greedy-parity gate landed; dense loader + single-seq `ForwardDense` + batched PAGED `Qwen3_5DenseModel::Forward` (paged==dense CPU-anchored) + `GPUModelRunner` dense route all landed CPU-green; W4A4 GPU GEMM + oracle golden pending (GPU-gated). serving M1–M3 | **T0 (the gate)** |
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
 | MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |
@@ -288,7 +288,18 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    the later GPU step (qwen27b-w4a4-notes.md §5 steps 6-7), not a permanent
    deviation. Per-Linear bf16-vs-W4A4 routing is `IsQwen27QuantizedLinear`
    (encodes the checkpoint `ignore` list, §3.6). Text path only; the ViT/merger
-   and MTP head are deferred stubs.
+   and MTP head are deferred stubs. The batched PAGED 27B forward is
+   `Qwen3_5DenseModel::Forward` — same signature/structure as the 35B
+   `Qwen3_5Model::Forward`, reusing the file-local `GdnBlockPaged`/
+   `FullAttnBlockPaged`/paged machinery VERBATIM via `RunDenseLayerPaged` (the
+   only delta vs `RunLayerPaged` is `DenseMlpBlock` in place of `MoeBlock`).
+   Runner deviation: `GPUModelRunner` now carries EITHER arch via a
+   `{moe,dense}_weights_` pointer pair (was a single `Qwen3_5MoeWeights&`
+   reference) + a `Qwen3_5DenseWeights` constructor overload; `execute_model`
+   dispatches to the dense forward when `dense_weights_` is set. `initialize_kv_cache`
+   is unchanged (config-driven; same hybrid backbone). Full LoadedEngine dense
+   dispatch (arch-select in `model_loader.cpp`) is a small follow-up, gated behind
+   the W4A4 GPU GEMM (qwen27b-w4a4-notes.md §5 step 6).
 8. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
    no equivalent under `vllm/platforms/`; we add them through the mirrored
    Platform/AttentionBackend/vt-op seams so they behave as vLLM platforms

@@ -262,8 +262,11 @@ struct CompletionStreamResponse {
 // when tool_calls is empty the key is omitted (upstream _serialize pop).
 struct ChatMessage {
   std::string role;
-  std::optional<std::string> content;
-  std::optional<std::vector<ToolCall>> tool_calls;
+  // Default member initializers so a 2-field aggregate init
+  // `ChatMessage{role, content}` (used across the serving/chat-template tests)
+  // does not trip -Werror=missing-field-initializers now that tool_calls exists.
+  std::optional<std::string> content{};
+  std::optional<std::vector<ToolCall>> tool_calls{};
 };
 
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:350 (DeltaMessage).

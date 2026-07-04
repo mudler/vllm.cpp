@@ -40,3 +40,33 @@ device wrapper. The MRV2 staged-tensor storage is **deferred to M2**, when the
 MRV1-shape admission code (`resumed_from_preemption` / `resumed_req_ids` /
 per-req `all_token_ids`) is **NOT** ported — it is dead under our MRV2
 scheduler.
+
+## The same two axes apply to the SAMPLER and the RUNNER LOOP (M1.7/M1.8)
+
+The MRV2 sampler (`gpu/sample/sampler.py` + `gpu/sample/states.py`) is **axis (2)
+storage**: persistent per-slot GPU buffers (`SamplingStates`/`PenaltiesState`/
+`LogitBiasState`/`BadWordsState` on `UvaBackedTensor`s), populated by
+`Sampler.add_request` + `apply_staged_writes` at admission and read back at sample
+time through `input_batch.idx_mapping`. We do **NOT** port that at T0.
+
+M1.7 ported axis (1) — the sampling **contract** — via the V1 host-array algorithm:
+`SamplingMetadata` + `_make_sampling_metadata` (from V1 `gpu_input_batch.py`), built
+fresh each step in the **dense `[0, num_reqs)` InputBatch order**. This composes
+cleanly because our M1.5 `prepare_inputs` (V1 `_prepare_inputs`) emits `input_ids`/
+`positions`/`query_start_loc`/`seq_lens`/`slot_mapping`/`logits_indices` in that
+**same single dense order** — so attention metadata (M1.6), the gathered logits
+(`hidden_states[logits_indices]`), the `SamplingMetadata` rows, and the sampled-token
+write-back all align on ONE order. **No `idx_mapping` slot-indirection is needed at
+T0** — that indirection is a consequence of the MRV2 *persistent-slot staged
+storage* (axis 2), which we defer to M2. When the `vt`-device staged buffers land
+(M2), the sampler moves to persistent-slot buffers + `idx_mapping`, matching
+`gpu/sample/sampler.py`.
+
+**One ordering nuance that IS axis-1 (must port at M1.8):** the runner reorders the
+batch **decode-first-then-prefill** (`reorder_batch_to_split_decodes_and_prefills`)
+before building metadata, because the GDN/mamba split (`split_decodes_and_prefills`,
+ported in M1.6 GDN metadata) assumes decodes lead. This is a *semantic* ordering both
+V1 and MRV2 need for the hybrid path, not a storage detail — M1.8 applies it so all
+four consumers see the same decode-first order. It is **inert for the single-sequence
+gate-model bring-up** (batch of 1) and for pure-decode / pure-prefill batches; it only
+bites a MIXED decode+prefill batch on the hybrid (GDN) model.

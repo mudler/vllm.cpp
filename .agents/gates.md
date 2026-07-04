@@ -24,3 +24,23 @@
    (ported from upstream `tests/v1/core/` semantics), model parity
    (logits + greedy token-for-token), server conformance, gate benchmark
    regression tracking. CI-runnable on CPU (0.6B model); nightly on dgx.casa.
+
+## PROTOCOL DIRECTIVE — always compare vs vLLM (the oracle), on the SAME workload
+
+vLLM is the parity oracle for BOTH correctness and performance. Every change
+that could affect either MUST be compared against vLLM, apples-to-apples, and
+BOTH numbers recorded in the [parity ledger](parity-ledger.md):
+
+- **Correctness:** op dumps + model logits/greedy vs the pinned pip-vLLM oracle
+  (`~/venvs/vllm-oracle` on dgx.casa, forward-math-identical to the pin). A new
+  op/model change is not "done" until it matches the vLLM oracle (or the
+  deviation is recorded as accepted with the reason).
+- **Performance (gate #1):** every perf/kernel change is measured with our
+  `vllm-bench` AND the vLLM baseline (`vllm bench throughput`) on the **IDENTICAL
+  workload** (same model, input-len, output-len, num-prompts, concurrency, same
+  box) — never quote our number without the vLLM number on the same config, and
+  never re-base the bench config without re-running vLLM on it. Record the ratio
+  (ours / vLLM) so gate-#1 progress is always a parity delta, not an absolute.
+- Rationale: the prime directive is 1:1 vLLM parity; "faster than before" is
+  meaningless without "how far from vLLM." A perf win that doesn't move the vLLM
+  ratio (e.g. a banked compute win under a host-bound profile) must say so.

@@ -1084,3 +1084,19 @@ dgx inspection of the checkpoint).
   bf16 activations, NO new kernel) → flip `kW4A4ForwardReady` → close 27B greedy + throughput
   gates vs vLLM. 35B in parallel: M2.8 landed `5da39b0` (fast decode argmax + vectorized M=1 fp4
   GEMV); agent finalizing (gemvx→fp4 routing + measurement) — measured decode gap pending.
+- **2026-07-04 (GROUNDED W4A4 spec — true-W4A4 is vLLM's path AND the fast one; killgate worry debunked)**
+  `8e320aa`. Per the mirror-vLLM + ground-in-source directive, read pinned vLLM: the 27B runs
+  **TRUE W4A4** (`use_a16=False`, config-driven by `input_activations` presence, NOT hardware) via
+  **`cutlass_scaled_fp4_mm_sm120a`** (native Cutlass fp4×fp4) on sm_121 — FlashInfer-cutlass wrapper
+  is numerically identical if installed. This is what vLLM's measured 47.5 tok/s ran → the authoritative
+  kernel to MIRROR. **Impl spec (mirrors vLLM names, cited to source):** `ScaledFp4Quant` (per-token
+  per-16-group activation bf16→fp4, math from csrc nvfp4_utils.cuh, activation global scale used
+  DIRECTLY not reciprocated) + `MatmulNvfp4Fp4Wmma` (fp4×fp4, two fp8 scale streams, single
+  `alpha=input_global_scale·weight_global_scale`); plumbing reuses `Nvfp4Weight`/`LoadCtNvfp4Raw`,
+  forward swaps `MatmulNvfp4Bf16D→MatmulNvfp4Fp4Wmma(ScaledFp4Quant(x),W.fp4,W.wscale,alpha)` gated on
+  fp4 presence (35B untouched). **KILLGATE WORRY DEBUNKED (source-grounded):** the "W4A4 FP4-MMA
+  regressed on GB10" (0034/0035) was on the 35B W4A16 checkpoint (artificial, no fp4 activations) with
+  a hand-rolled/Marlin kernel — NOT vLLM's sm120a — so it does NOT imply true-W4A4 is slow for the 27B.
+  → true-W4A4 gives BOTH token-exact correctness AND vLLM-comparable speed; the 6a a16 path is retired
+  to vLLM's Marlin-W4A16 fallback role. Ordered plan in notes §7.6. 27B W4A4 impl QUEUED behind the
+  35B PagedAttention GPU job (serialize). In parallel now: 35B PagedAttention lever (running).

@@ -3,19 +3,45 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. This is GPU-kernel work — build + validate on GB10 via `ssh dgx.casa` (non-interactive SSH works; sync `~/work/vllm.cpp`, `export PATH=/usr/local/cuda/bin:$PATH`, build `-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121`).
 
 **Goal:** Close gate #1 — throughput parity vs vLLM for Qwen3.6-35B-A3B-NVFP4 on GB10 at
-large concurrency (prefill + decode). **Measured baseline (2026-07-04, GB10, 8×256×32):
-vLLM 0.24.0 = 1377 total tok/s / 153 output tok/s; ours (correctness-grade) = ~1000×
-slower, GPU-idle, CPU-dequant/staging-bound.** The M2.1 harness (`examples/bench`
-→ `vllm-bench`) measures our side; run `vllm bench throughput` on `~/venvs/vllm-oracle`
-(needs `ninja` on PATH) for the baseline. Record numbers here as each kernel lands.
+large concurrency (prefill + decode). **First CLEAN free-box measurement (2026-07-04, GB10,
+0% contention, 8×1024×128 enforce-eager): vLLM 0.24.0 = 1124 total / 124.9 output tok/s;
+ours = 70.2 total / 7.8 output → ~16× slower** (down from ~1000× at M2 start). The M2.1
+harness (`examples/bench` → `vllm-bench`) measures our side; run `vllm bench throughput` on
+`~/venvs/vllm-oracle` (`ninja` on PATH) for the baseline. Record numbers here as each kernel
+lands. STANDING DIRECTIVE: always compare vs vLLM apples-to-apples (AGENTS.md, gates.md).
 
-**THE PROFILE (measured, load-bearing):** the correctness-grade forward runs GPU at ~0%
-with 82GB host RSS. The bottleneck is NOT GPU compute — it is (a) the CPU-side
-NVFP4→bf16 dequant at LOAD (builds ~70GB of bf16 host tensors, ~40 min), and (b) per-op
-host↔device staging (each op uploads bf16 weights from host, runs, discards). So the
-priority order below is dictated by the profile, NOT the roadmap's original numbering.
+**THE PROFILE — v3 (2026-07-04, nsys free-box, load-bearing; SUPERSEDES the v1 "GPU-idle,
+CPU-dequant-bound" and v2 "88% host-API launch-overhead" theories — BOTH now fixed).** After
+the device-resident-weights work (M2.2b) and the async-on-stream device-resident forward
+(Phase 1, `f95b131`), **both prefill and decode are GPU-COMPUTE-bound.** CUDA-graph capture
+(`2999431`) confirmed it: graphs bought only +2.6% single-stream / −7% at batch-8 because host
+launch overhead is already hidden behind the GPU. The remaining ~16× is raw fp4-kernel speed:
+- **PREFILL (14.7s single-prompt TTFT; the batched-TTFT ~100s is the #1 throughput killer):**
+  GPU-bound on the fp4 path. **fp4 MoE grouped GEMM = 70.7%** (`MoeGroupedGemmNvfp4Tiled`
+  gate/up 47% + down 23%), GdnScan 19%, PagedAttn 5%, fp4 projections 4%. The fp4 GEMMs are
+  hand-tiled **CUDA-core** at ~20 TFLOP/s (tensor-core `nvjet` ops are <0.2%) — far below
+  GB10 fp4 tensor-core peak. → **tensor-core NVFP4 MMA is THE prefill unlock (~75% of prefill).**
+- **DECODE (65ms TPOT, M=1, weight-bandwidth-bound):** naive fp4 GEMV ~55%
+  (`MatmulNvfp4KernelNaive` 28% + `MoeGroupedGemmNvfp4KernelNaive` 22% + down 5%), cublas bf16
+  `gemvx` 14% (should be on the fp4 path), **`GreedyArgmaxKernel` 11.8% = 7.5ms/token, a
+  single-block vocab reduction ~100× improvable**, GdnScan 5%, PagedAttn 2%. MMA does NOT help
+  M=1 → decode needs a separate **fp4-GEMV + fast-argmax** pass, not the prefill MMA.
 
-## Priority order (highest-leverage first, per the GPU-idle profile)
+## Priority order (highest-leverage first, per the v3 GPU-compute-bound profile)
+
+### M2.7 — tensor-core NVFP4 MMA GEMM (THE prefill unlock — IN PROGRESS 2026-07-04)
+Move the fp4 W4A16 GEMMs (MoE grouped + dense projections) off hand-tiled CUDA cores onto
+tensor cores: dequant the fp4 weight tile into shared memory as bf16 (group-16 fp8 scale + f32
+scale2), then `mma.sync`/`wmma` bf16×bf16 MMA, f32 acc. Attacks ~75% of prefill. Stretch:
+native block-scaled fp4 MMA (sm_121 tcgen05) skipping the bf16 materialization. Correctness:
+new-MMA == old-tiled (synthetic) → paged gate 16/16 → measure prefill TTFT vs vLLM.
+
+### M2.8 — decode fp4-GEMV + fast-argmax (the decode gap, separate from MMA)
+(a) An optimized M=1 fp4 GEMV replacing the `...Naive` kernels (~55% of decode); (b) route the
+14% cublas bf16 `gemvx` (out_proj/router) onto the fp4 path; (c) a multi-block/warp-reduce
+`GreedyArgmaxKernel` (11.8% of decode, ~100× headroom — cheap, high-ROI).
+
+### (historical) Priority order per the earlier GPU-idle / host-overhead profiles — DONE
 
 ### M2.2a — NVFP4 W4A16 dequant-GEMM kernel (THE unblocker)
 The dominant cost. Implement a CUDA GEMM that takes NVFP4 weights **directly in device

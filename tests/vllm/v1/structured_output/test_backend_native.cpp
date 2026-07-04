@@ -380,3 +380,59 @@ TEST_CASE("native: JSON/json_object throw (deferred to M3.4 Task 5)") {
   CHECK_THROWS(backend->compile_grammar(StructuredOutputOptions::kJsonObject,
                                         ""));
 }
+
+// ─── THE INVARIANT: fill_bitmask(t) == accept_tokens([t]) over the WHOLE vocab ──
+// This is the load-bearing correctness guard for constrained decoding: the set of
+// tokens fill_bitmask marks ALLOWED must be EXACTLY the set accept_tokens would
+// accept from the same state. If fill ever allowed a token accept rejects, the
+// sampler could pick a grammar-INVALID token. Differentially check every vocab id
+// across several grammars and prefix states (recompiling a fresh grammar per token
+// so accept_tokens' state mutation doesn't leak). Recommended by the Task-4 review.
+TEST_CASE("native: fill_bitmask agrees with accept_tokens for every vocab token") {
+  auto backend = MakeBackend();
+  const int vocab = VocabSize();
+
+  struct Case {
+    StructuredOutputOptions type;
+    std::string spec;
+    std::vector<int32_t> prefix;  // tokens to accept before checking
+  };
+  const std::vector<Case> cases = {
+      {StructuredOutputOptions::kGrammar, "root ::= \"yes\" | \"no\"", {}},
+      {StructuredOutputOptions::kGrammar, "root ::= \"yes\" | \"no\"", {5}},  // "ye"
+      {StructuredOutputOptions::kGrammar, "root ::= [0-9]+", {}},
+      {StructuredOutputOptions::kGrammar, "root ::= [0-9] [0-9]", {}},
+      {StructuredOutputOptions::kGrammar, "root ::= [0-9] [0-9]", {22}},  // "0" (1 digit)
+      {StructuredOutputOptions::kGrammar, "root ::= \"yes\"", {}},
+      {StructuredOutputOptions::kChoice, R"(["yes","no","bird"])", {}},
+      {StructuredOutputOptions::kRegex, "[0-9]+", {}},
+  };
+
+  for (const Case& c : cases) {
+    // Fill once on a grammar advanced through the prefix.
+    auto filled = Compile(*backend, c.type, c.spec);
+    REQUIRE(filled != nullptr);
+    if (!c.prefix.empty()) REQUIRE(filled->accept_tokens("p", c.prefix));
+
+    TokenBitmask bm;
+    bm.num_seqs = 1;
+    bm.num_words = BitmaskWordsForVocab(vocab);
+    bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+    filled->fill_bitmask(bm, 0);
+
+    for (int32_t t = 0; t < vocab; ++t) {
+      const bool fill_allows =
+          (bm.data[static_cast<std::size_t>(t >> 5)] &
+           static_cast<int32_t>(1u << (static_cast<uint32_t>(t) & 31u))) != 0;
+      // Fresh grammar at the same prefix state, then probe accept([t]).
+      auto probe = Compile(*backend, c.type, c.spec);
+      if (!c.prefix.empty()) REQUIRE(probe->accept_tokens("p", c.prefix));
+      const bool accept_allows = probe->accept_tokens("t", {t});
+      INFO("grammar='" << c.spec << "' prefix_len=" << c.prefix.size()
+                       << " token=" << t << " fill=" << fill_allows
+                       << " accept=" << accept_allows);
+      CHECK(fill_allows == accept_allows);
+    }
+  }
+  backend->destroy();
+}

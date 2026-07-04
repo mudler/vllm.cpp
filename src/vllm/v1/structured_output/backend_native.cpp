@@ -1103,9 +1103,12 @@ void NativeGrammar::fill_bitmask(TokenBitmask& bitmask, int batch_index) {
   };
 
   if (cur.done) {
-    // Terminated by EOS already: only EOS remains (the manager normally does not
-    // fill a terminated row, but be safe).
-    for (const int32_t sid : shared_->stop_token_ids) set_bit(sid);
+    // EOS already consumed: the derivation is complete and NOTHING more may be
+    // emitted, so leave the whole row clear (all-forbidden). This keeps
+    // fill_bitmask and accept_tokens in EXACT agreement — accept_tokens([EOS])
+    // (and any token) returns false in the done state, so fill must allow none.
+    // (The manager never fills a terminated row anyway — !is_terminated() guard —
+    // so this branch is defensive; agreement matters for the differential test.)
     return;
   }
 

@@ -45,6 +45,7 @@ vllm_cpp_add_test(test_engine_core vllm/v1/test_engine_core.cpp)
 vllm_cpp_add_test(test_input_processor vllm/v1/test_input_processor.cpp)
 target_compile_definitions(test_input_processor PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+vllm_cpp_add_test(test_output_processor vllm/v1/test_output_processor.cpp)
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)

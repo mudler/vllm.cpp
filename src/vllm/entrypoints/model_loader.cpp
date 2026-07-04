@@ -23,9 +23,19 @@ namespace fs = std::filesystem;
 
 namespace {
 
-vt::Queue CpuQueue() {
-  // T0 runs the reference CPU backend (matches examples/server/main.cpp). The
-  // CUDA/dgx path selects a device queue in a later milestone.
+vt::Queue SelectQueue() {
+  // M2.2b: run the engine forward on the CUDA device when the backend is
+  // available (GB10), so the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
+  // on-device instead of the CPU dequant reference. Falls back to the reference
+  // CPU backend when built without CUDA or when no usable GPU is present at
+  // runtime (GetBackend(kCUDA) throws if the probe left it unregistered).
+#ifdef VLLM_CPP_CUDA
+  try {
+    return vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
+  } catch (const std::exception&) {
+    // No usable GPU; fall through to CPU.
+  }
+#endif
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
@@ -114,7 +124,7 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
-      runner_(config_, weights_, kv_cfg_, CpuQueue(),
+      runner_(config_, weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/

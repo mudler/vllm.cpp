@@ -138,3 +138,10 @@ vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
 target_compile_definitions(test_op_parity PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_op_parity PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
+
+# Paged-engine 35B greedy acceptance gate (checkpoint-gated, dgx-only; skips on
+# CPU/CI when the real snapshot is absent). Counterpart to RunQwen36Logits.
+vllm_cpp_add_test(test_qwen36_paged_engine parity/test_qwen36_paged_engine.cpp)
+target_compile_definitions(test_qwen36_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen36_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)

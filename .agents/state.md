@@ -524,3 +524,33 @@
   class paged attention, chunked-scan GDN, fused MoE), CUDA graphs, bf16 KV cache,
   the MRV2 staged device storage — AND the dgx bring-up of the whole M1 stack
   (run the CUDA kernels + the 35B paged greedy gate on real hardware).
+- **2026-07-04 (M3.1 in progress — serving MVP)** — Started M3 (serving) since
+  M1 is CPU-complete and M2 (throughput) needs dgx hardware to measure. M3.1
+  plan committed (docs/superpowers/plans/2026-07-04-m3.1-openai-server.md).
+  DONE: **Task 1 OpenAI protocol types** (`9b5c2c5` — CompletionRequest/
+  ChatCompletionRequest + to_sampling_params, response/stream/usage/error shapes,
+  nlohmann/json; upstream split protocol.py into engine/completion/chat_completion
+  modules — collapsed into one mirrored protocol.{h,cpp}); **Task 2 serving
+  handlers** (`9afc099` — OpenAIServingCompletion/Chat decoupled from HTTP: return
+  a full Response (non-stream) or a vector of SSE `data:` chunk strings (stream)
+  ending `data: [DONE]`; completion cadence + chat role-delta-first cadence;
+  ChatPromptFn seam for the Task-3 template; drives the M1.8 LLMEngine; 60/60
+  green). Also fixed a detokenizer streaming bug (`1313061`): GetNextOutputText
+  now always trims streamed deltas to a complete UTF-8 boundary (was only guarded
+  when stop_buffer_length_>0). REMAINING M3.1: Task 3 (minja-subset chat template
+  for Qwen3.6, swaps into the ChatPromptFn seam), Task 4 (HTTP layer — vendored
+  cpp-httplib + routes + examples/server CLI), Task 5 (records).
+  **CARRY — serving UTF-8 sanitization:** our detokenizer keeps RAW bytes (not
+  upstream's Python-str U+FFFD) for byte-exact OutputText; a genuinely-invalid
+  multibyte run (mid-string orphan) can persist in output_text_ and make
+  nlohmann::json::dump() THROW → 500 on both stream deltas and the final response.
+  Real greedy Qwen produces valid UTF-8 so this is mostly a synthetic-model edge,
+  but a robust server must lossy-encode to valid UTF-8 (U+FFFD for invalid runs,
+  via the existing LossyStep helper) at the serving/RequestOutput boundary before
+  json::dump — matching upstream's str semantics. Wire in Task 4 (or a serving
+  helper). NOT blocking real-model streaming. **CARRY — dgx bring-up:** all
+  M1.6/M1.7 CUDA kernels + the M1.8 batched-runner CUDA path + the 35B paged
+  greedy gate remain unrun (CPU-only box); scripts/dgx-bringup.sh (`+`) runs the
+  full CUDA ctest + the checkpoint-gated 35B forward gate on GB10. A "35B greedy
+  through the paged LLMEngine" test still needs writing (RunQwen36Logits exercises
+  ForwardDense, not the paged engine).

@@ -97,6 +97,71 @@ struct ResponseFormat {
 };
 
 // ---------------------------------------------------------------------------
+// Tool / function calling — engine/protocol.py + chat_completion/protocol.py
+// (M3.3 Task 1)
+// ---------------------------------------------------------------------------
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:246
+// (FunctionDefinition). `parameters` is the JSON-Schema object for the
+// function's arguments (upstream dict[str,Any]|None). `strict` / `defer_loading`
+// are parsed-and-ignored at T0 (deferred).
+struct FunctionDefinition {
+  std::string name;
+  std::optional<std::string> description;
+  std::optional<nlohmann::json> parameters;
+};
+
+// Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:165
+// (ChatCompletionToolsParam). `defer_loading` deferred.
+struct ChatCompletionToolsParam {
+  std::string type = "function";
+  FunctionDefinition function;
+};
+
+// Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:218
+// (ChatCompletionRequest.tool_choice) union + :188
+// (ChatCompletionNamedToolChoiceParam). The upstream union is
+// "none"|"auto"|"required"|{type:"function",function:{name}}. We model both the
+// string and named-object forms as one struct: `mode` is one of
+// "none"/"auto"/"required"/"function"; `function_name` is set only for the named
+// (mode=="function") form.
+struct ToolChoice {
+  std::string mode;  // "none" | "auto" | "required" | "function"
+  std::optional<std::string> function_name;
+};
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:310 (FunctionCall).
+// The internal `id` field (excluded from serialization upstream) is deferred.
+struct FunctionCall {
+  std::string name;
+  std::string arguments;  // JSON-encoded arguments string (OpenAI spec).
+};
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:319 (ToolCall).
+struct ToolCall {
+  std::string id;
+  std::string type = "function";
+  FunctionCall function;
+};
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:325
+// (DeltaFunctionCall).
+struct DeltaFunctionCall {
+  std::optional<std::string> name;
+  std::optional<std::string> arguments;
+};
+
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:331 (DeltaToolCall).
+// `index` is required; id/type/function are per-chunk optional (name-first, then
+// arguments deltas).
+struct DeltaToolCall {
+  int index = 0;
+  std::optional<std::string> id;
+  std::optional<std::string> type;
+  DeltaFunctionCall function;
+};
+
+// ---------------------------------------------------------------------------
 // Completions — completion/protocol.py
 // ---------------------------------------------------------------------------
 
@@ -192,17 +257,22 @@ struct CompletionStreamResponse {
 // ---------------------------------------------------------------------------
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:57
-// (ChatMessage). T0: bare-string content; refusal / tool_calls / audio etc.
-// deferred.
+// (ChatMessage). T0: bare-string content; refusal / audio / function_call
+// (legacy) deferred. A response message carries EITHER content OR tool_calls;
+// when tool_calls is empty the key is omitted (upstream _serialize pop).
 struct ChatMessage {
   std::string role;
   std::optional<std::string> content;
+  std::optional<std::vector<ToolCall>> tool_calls;
 };
 
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:350 (DeltaMessage).
+// `tool_calls` is a list defaulting to empty upstream (serialized only when
+// non-empty); modeled here as optional to mean "absent/empty".
 struct DeltaMessage {
   std::optional<std::string> role;
   std::optional<std::string> content;
+  std::optional<std::vector<DeltaToolCall>> tool_calls;
 };
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:193
@@ -240,6 +310,16 @@ struct ChatCompletionRequest {
 
   // response_format (chat_completion/protocol.py:210). See CompletionRequest.
   std::optional<ResponseFormat> response_format;
+
+  // tools / tool_choice (chat_completion/protocol.py:217-224). `tools` is the
+  // list of available functions; `tool_choice` selects the calling mode. When
+  // absent both stay nullopt (backward compat). The serving-layer default
+  // (tool_choice="auto" when tools present, else "none") is applied downstream
+  // (chat_completion/protocol.py:828-831), not here.
+  // DEFERRED (parsed-and-ignored): parallel_tool_calls (protocol.py:240) and the
+  // legacy `functions` / `function_call` fields.
+  std::optional<std::vector<ChatCompletionToolsParam>> tools;
+  std::optional<ToolChoice> tool_choice;
 
   // to_sampling_params — chat_completion/protocol.py:585. See CompletionRequest.
   SamplingParams to_sampling_params(
@@ -290,6 +370,7 @@ struct ChatCompletionStreamResponse {
 // ---------------------------------------------------------------------------
 void from_json(const nlohmann::json& j, CompletionRequest& r);
 void from_json(const nlohmann::json& j, ChatMessage& m);
+void from_json(const nlohmann::json& j, ChatCompletionToolsParam& t);
 void from_json(const nlohmann::json& j, ChatCompletionRequest& r);
 
 void to_json(nlohmann::json& j, const UsageInfo& u);
@@ -299,6 +380,10 @@ void to_json(nlohmann::json& j, const CompletionResponseChoice& c);
 void to_json(nlohmann::json& j, const CompletionResponse& r);
 void to_json(nlohmann::json& j, const CompletionResponseStreamChoice& c);
 void to_json(nlohmann::json& j, const CompletionStreamResponse& r);
+void to_json(nlohmann::json& j, const FunctionCall& f);
+void to_json(nlohmann::json& j, const ToolCall& t);
+void to_json(nlohmann::json& j, const DeltaFunctionCall& f);
+void to_json(nlohmann::json& j, const DeltaToolCall& t);
 void to_json(nlohmann::json& j, const ChatMessage& m);
 void to_json(nlohmann::json& j, const DeltaMessage& m);
 void to_json(nlohmann::json& j, const ChatCompletionResponseChoice& c);

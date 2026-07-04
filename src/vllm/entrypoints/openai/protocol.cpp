@@ -129,6 +129,42 @@ void ApplyResponseFormat(const std::optional<ResponseFormat>& rf,
   if (enabled) sp.structured_outputs = std::move(so);
 }
 
+// Parse the OpenAI `tool_choice` union (chat_completion/protocol.py:218-224):
+// a string "none"|"auto"|"required", or a named-function object
+// {type:"function", function:{name}}. Mirrors the object-form validation
+// (chat_completion/protocol.py:864-884): an object tool_choice requires a
+// `function` object carrying a string `name`. Throws on a malformed shape
+// (surfaces as a 400). An absent key leaves tool_choice unset (the serving layer
+// applies the "auto when tools present else none" default upstream).
+void ParseToolChoice(const nlohmann::json& j, std::optional<ToolChoice>& out) {
+  auto it = j.find("tool_choice");
+  if (it == j.end() || it->is_null()) return;
+  const nlohmann::json& tc = *it;
+  ToolChoice choice;
+  if (tc.is_string()) {
+    choice.mode = tc.get<std::string>();
+  } else if (tc.is_object()) {
+    // Named-function choice: {type:"function", function:{name}}.
+    auto fn = tc.find("function");
+    if (fn == tc.end() || !fn->is_object()) {
+      throw std::runtime_error(
+          "Expected field `function` in `tool_choice`! Correct usage: "
+          "`{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}`");
+    }
+    auto name = fn->find("name");
+    if (name == fn->end() || !name->is_string()) {
+      throw std::runtime_error(
+          "Expected field `name` in `function` in `tool_choice`! Correct usage: "
+          "`{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}`");
+    }
+    choice.mode = "function";
+    choice.function_name = name->get<std::string>();
+  } else {
+    throw std::runtime_error("Invalid value for `tool_choice`.");
+  }
+  out = std::move(choice);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -182,6 +218,21 @@ void from_json(const nlohmann::json& j, ChatMessage& m) {
   }
 }
 
+// Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:165
+// (ChatCompletionToolsParam) + engine/protocol.py:246 (FunctionDefinition).
+void from_json(const nlohmann::json& j, ChatCompletionToolsParam& t) {
+  GetOr(j, "type", t.type);  // defaults to "function".
+  if (auto it = j.find("function"); it != j.end() && it->is_object()) {
+    const nlohmann::json& fn = *it;
+    GetOr(fn, "name", t.function.name);
+    GetOpt(fn, "description", t.function.description);
+    // `parameters` is the JSON-Schema object (kept as raw json).
+    if (auto p = fn.find("parameters"); p != fn.end() && !p->is_null()) {
+      t.function.parameters = *p;
+    }
+  }
+}
+
 void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   if (auto it = j.find("messages"); it != j.end() && it->is_array()) {
     r.messages = it->get<std::vector<ChatMessage>>();
@@ -211,6 +262,13 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
   ParseResponseFormat(j, r.response_format);
+  // tools / tool_choice (chat_completion/protocol.py:217-224).
+  if (auto it = j.find("tools"); it != j.end() && it->is_array()) {
+    r.tools = it->get<std::vector<ChatCompletionToolsParam>>();
+  }
+  ParseToolChoice(j, r.tool_choice);
+  // DEFERRED: parallel_tool_calls, legacy functions / function_call — parsed and
+  // ignored (nlohmann skips unknown keys; no field mapped here at T0).
 }
 
 // ---------------------------------------------------------------------------
@@ -351,14 +409,55 @@ void to_json(nlohmann::json& j, const CompletionStreamResponse& r) {
   if (r.usage.has_value()) j["usage"] = *r.usage;
 }
 
-void to_json(nlohmann::json& j, const ChatMessage& m) {
-  j = nlohmann::json{{"role", m.role}, {"content", OrNull(m.content)}};
+// engine/protocol.py:310 (FunctionCall). Only name + arguments on the wire (the
+// internal id is excluded upstream).
+void to_json(nlohmann::json& j, const FunctionCall& f) {
+  j = nlohmann::json{{"name", f.name}, {"arguments", f.arguments}};
 }
 
+// engine/protocol.py:319 (ToolCall). {id, type:"function", function{...}}.
+void to_json(nlohmann::json& j, const ToolCall& t) {
+  j = nlohmann::json{
+      {"id", t.id},
+      {"type", t.type},
+      {"function", t.function},
+  };
+}
+
+// engine/protocol.py:325 (DeltaFunctionCall). name/arguments emitted only when
+// present (per-chunk deltas).
+void to_json(nlohmann::json& j, const DeltaFunctionCall& f) {
+  j = nlohmann::json::object();
+  if (f.name.has_value()) j["name"] = *f.name;
+  if (f.arguments.has_value()) j["arguments"] = *f.arguments;
+}
+
+// engine/protocol.py:331 (DeltaToolCall). index is always present; id/type
+// emitted only on the chunk that introduces the call.
+void to_json(nlohmann::json& j, const DeltaToolCall& t) {
+  j = nlohmann::json{{"index", t.index}, {"function", t.function}};
+  if (t.id.has_value()) j["id"] = *t.id;
+  if (t.type.has_value()) j["type"] = *t.type;
+}
+
+// chat_completion/protocol.py:57 (ChatMessage). content is always serialized
+// (null when a tool call carries no text); tool_calls is emitted only when
+// non-empty (upstream _serialize pops an empty list).
+void to_json(nlohmann::json& j, const ChatMessage& m) {
+  j = nlohmann::json{{"role", m.role}, {"content", OrNull(m.content)}};
+  if (m.tool_calls.has_value() && !m.tool_calls->empty()) {
+    j["tool_calls"] = *m.tool_calls;
+  }
+}
+
+// engine/protocol.py:350 (DeltaMessage). tool_calls emitted only when non-empty.
 void to_json(nlohmann::json& j, const DeltaMessage& m) {
   j = nlohmann::json::object();
   if (m.role.has_value()) j["role"] = *m.role;
   if (m.content.has_value()) j["content"] = *m.content;
+  if (m.tool_calls.has_value() && !m.tool_calls->empty()) {
+    j["tool_calls"] = *m.tool_calls;
+  }
 }
 
 void to_json(nlohmann::json& j, const ChatCompletionResponseChoice& c) {

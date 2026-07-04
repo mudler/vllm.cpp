@@ -318,3 +318,164 @@ TEST_CASE("response_format json_schema without json_schema field throws") {
                               "response_format":{"type":"json_schema"}})")
                    .get<ChatCompletionRequest>());
 }
+
+// ─── M3.3 Task 1: tools / tool_choice / tool_calls ───────────────────────────
+// engine/protocol.py:246,310-335 + chat_completion/protocol.py:57,165-224,350.
+
+// (a) tools:[{type,function{name,description,parameters}}] + tool_choice:"auto".
+TEST_CASE("ChatCompletionRequest tools + tool_choice=auto parses") {
+  auto j = json::parse(R"({
+    "messages": [{"role":"user","content":"weather?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the weather",
+        "parameters": {"type":"object","properties":{"city":{"type":"string"}},
+                       "required":["city"]}
+      }
+    }],
+    "tool_choice": "auto"
+  })");
+  auto req = j.get<ChatCompletionRequest>();
+
+  REQUIRE(req.tools.has_value());
+  REQUIRE(req.tools->size() == 1);
+  CHECK((*req.tools)[0].type == "function");
+  CHECK((*req.tools)[0].function.name == "get_weather");
+  REQUIRE((*req.tools)[0].function.description.has_value());
+  CHECK(*(*req.tools)[0].function.description == "Get the weather");
+  REQUIRE((*req.tools)[0].function.parameters.has_value());
+  CHECK((*(*req.tools)[0].function.parameters)["type"] == "object");
+  CHECK((*(*req.tools)[0].function.parameters)["required"][0] == "city");
+
+  REQUIRE(req.tool_choice.has_value());
+  CHECK(req.tool_choice->mode == "auto");
+  CHECK_FALSE(req.tool_choice->function_name.has_value());
+}
+
+// (b) named tool_choice object -> mode=function + function_name.
+TEST_CASE("ChatCompletionRequest named tool_choice object parses") {
+  auto j = json::parse(R"({
+    "messages": [{"role":"user","content":"hi"}],
+    "tools": [{"type":"function","function":{"name":"get_weather"}}],
+    "tool_choice": {"type":"function","function":{"name":"get_weather"}}
+  })");
+  auto req = j.get<ChatCompletionRequest>();
+  REQUIRE(req.tool_choice.has_value());
+  CHECK(req.tool_choice->mode == "function");
+  REQUIRE(req.tool_choice->function_name.has_value());
+  CHECK(*req.tool_choice->function_name == "get_weather");
+}
+
+// (c) tool_choice:"required" / "none" string forms parse.
+TEST_CASE("ChatCompletionRequest tool_choice required/none string forms") {
+  {
+    auto req = json::parse(R"({"messages":[],"tool_choice":"required"})")
+                   .get<ChatCompletionRequest>();
+    REQUIRE(req.tool_choice.has_value());
+    CHECK(req.tool_choice->mode == "required");
+  }
+  {
+    auto req = json::parse(R"({"messages":[],"tool_choice":"none"})")
+                   .get<ChatCompletionRequest>();
+    REQUIRE(req.tool_choice.has_value());
+    CHECK(req.tool_choice->mode == "none");
+  }
+}
+
+// (f) no tools/tool_choice -> fields absent (backward compat).
+TEST_CASE("ChatCompletionRequest without tools -> nullopt (backward compat)") {
+  auto req = json::parse(R"({"messages":[{"role":"user","content":"hi"}]})")
+                 .get<ChatCompletionRequest>();
+  CHECK_FALSE(req.tools.has_value());
+  CHECK_FALSE(req.tool_choice.has_value());
+}
+
+// (d) response message carrying tool_calls serializes to exact OpenAI shape.
+TEST_CASE("ChatMessage with tool_calls serializes to OpenAI shape") {
+  ChatCompletionResponse resp;
+  resp.id = "chatcmpl-1";
+  resp.created = 1;
+  resp.model = "m";
+  ChatCompletionResponseChoice choice;
+  choice.index = 0;
+  choice.message.role = "assistant";
+  choice.message.content = std::nullopt;  // no content when calling a tool
+  ToolCall tc;
+  tc.id = "call_abc";
+  tc.function.name = "get_weather";
+  tc.function.arguments = R"({"city":"Paris"})";
+  choice.message.tool_calls = std::vector<ToolCall>{tc};
+  choice.finish_reason = "tool_calls";
+  resp.choices.push_back(choice);
+  resp.usage = UsageInfo{3, 7, 4};
+
+  json j = resp;
+  const auto& msg = j["choices"][0]["message"];
+  CHECK(msg["role"] == "assistant");
+  // content is null (tool call, no text).
+  CHECK(msg["content"].is_null());
+  REQUIRE(msg["tool_calls"].is_array());
+  REQUIRE(msg["tool_calls"].size() == 1);
+  CHECK(msg["tool_calls"][0]["id"] == "call_abc");
+  CHECK(msg["tool_calls"][0]["type"] == "function");
+  CHECK(msg["tool_calls"][0]["function"]["name"] == "get_weather");
+  CHECK(msg["tool_calls"][0]["function"]["arguments"] == R"({"city":"Paris"})");
+  CHECK(j["choices"][0]["finish_reason"] == "tool_calls");
+}
+
+// A message WITHOUT tool_calls omits the key entirely (upstream serializer pop).
+TEST_CASE("ChatMessage without tool_calls omits the key") {
+  ChatMessage m;
+  m.role = "assistant";
+  m.content = "hello";
+  json j = m;
+  CHECK(j["content"] == "hello");
+  CHECK(j.contains("tool_calls") == false);
+}
+
+// (e) stream DeltaMessage tool_calls: name-first chunk then arguments delta.
+TEST_CASE("DeltaMessage tool_calls stream shape (index-based)") {
+  // First chunk: index + id + function.name.
+  {
+    DeltaMessage d;
+    DeltaToolCall dtc;
+    dtc.index = 0;
+    dtc.id = "call_abc";
+    dtc.type = "function";
+    dtc.function.name = "get_weather";
+    d.tool_calls = std::vector<DeltaToolCall>{dtc};
+    json j = d;
+    REQUIRE(j["tool_calls"].is_array());
+    CHECK(j["tool_calls"][0]["index"] == 0);
+    CHECK(j["tool_calls"][0]["id"] == "call_abc");
+    CHECK(j["tool_calls"][0]["type"] == "function");
+    CHECK(j["tool_calls"][0]["function"]["name"] == "get_weather");
+    // arguments omitted when unset in this chunk.
+    CHECK(j["tool_calls"][0]["function"].contains("arguments") == false);
+  }
+  // Subsequent chunk: index + function.arguments delta only.
+  {
+    DeltaMessage d;
+    DeltaToolCall dtc;
+    dtc.index = 0;
+    dtc.function.arguments = R"({"city":)";
+    d.tool_calls = std::vector<DeltaToolCall>{dtc};
+    json j = d;
+    CHECK(j["tool_calls"][0]["index"] == 0);
+    CHECK(j["tool_calls"][0]["function"]["arguments"] == R"({"city":)");
+    CHECK(j["tool_calls"][0]["function"].contains("name") == false);
+    CHECK(j["tool_calls"][0].contains("id") == false);
+    CHECK(j["tool_calls"][0].contains("type") == false);
+  }
+}
+
+// A delta WITHOUT tool_calls omits the key (unchanged content-only path).
+TEST_CASE("DeltaMessage without tool_calls omits the key") {
+  DeltaMessage d;
+  d.content = "hi";
+  json j = d;
+  CHECK(j["content"] == "hi");
+  CHECK(j.contains("tool_calls") == false);
+}

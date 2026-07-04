@@ -33,6 +33,7 @@ enum class OpId : uint8_t {
   kApplyLogitBias,
   kApplyTokenMask,
   kApplyAllowedTokenIds,
+  kMatmulNvfp4,
   kCount
 };
 
@@ -115,6 +116,8 @@ struct MoeRouterTopKArgs {
 // these types. A kernel that does not support a validated dtype combination
 // must throw loudly, never silently truncate.
 using MatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using MatmulNvfp4Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -168,6 +171,34 @@ void* GetOp(OpId op, DeviceType device);
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32 or
 // bf16, f32 accumulation, all contiguous, same device.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// out[M,N] = act[M,K] @ dequant(w).T  — the modelopt W4A16_NVFP4 dequant-GEMM
+// (M2.2a). The NVFP4 weight is read DIRECTLY from device memory and dequantized
+// on the fly in the kernel (no host bf16 weight materialization); it is the
+// drop-in equivalent of Matmul(act, DequantNvfp4ToBf16(w).T) but with the fp4
+// weight kept resident on-device.
+//
+// The weight is a torch Linear weight [N=out_features, K=in_features] in the
+// modelopt W4A16_NVFP4 layout (identical decode to
+// vllm::DequantNvfp4ToBf16 — the authoritative reference):
+//   weight_packed [N, K/2]  i8 bytes: two 4-bit E2M1 (fp4) codes per byte,
+//                           low nibble = input elem 2i, high nibble = 2i+1;
+//                           nibble bit 3 is the sign, bits 0..2 index the
+//                           E2M1 magnitude LUT {0,.5,1,1.5,2,3,4,6}.
+//   weight_scale  [N, K/16] i8 bytes: one IEEE fp8-e4m3fn scale per 16-elem
+//                           input group (LINEAR layout, multiply not reciprocal).
+//   weight_scale_2          per-tensor f32 global scale (amax/2688), multiplied.
+// Group scale = f32(weight_scale[n, k/16]) * weight_scale_2 (f32), then the
+// dequanted weight is ROUNDED TO BF16 before the multiply — bit-for-bit the
+// value DequantNvfp4ToBf16 stores — so the two paths differ only in K-reduction
+// order (matmul tolerance), not in the per-element product. These are IEEE
+// fp8-e4m3fn scales: the GGUF killgate fork's UE4M3 x0.5 LUT trap does NOT apply.
+//
+// act [M,K] f32/bf16, out [M,N] f32/bf16, f32 accumulation. K must be a
+// multiple of 16. CUDA only (no CPU kernel registered — the CPU reference path
+// is DequantNvfp4ToBf16 + Matmul).
+void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
+                 const Tensor& weight_scale, float weight_scale_2);
 
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma);
 // out f32 or bf16 (computed in f32, rounded on store).

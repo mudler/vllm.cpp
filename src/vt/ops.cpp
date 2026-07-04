@@ -46,6 +46,31 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
 }
 
+void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
+                 const Tensor& weight_scale, float weight_scale_2) {
+  VT_CHECK(act.rank == 2 && weight_packed.rank == 2 && weight_scale.rank == 2 && out.rank == 2,
+           "matmul_nvfp4: act/weight_packed/weight_scale/out must be rank-2");
+  const int64_t m = act.shape[0], k = act.shape[1], n = weight_packed.shape[0];
+  VT_CHECK(k % 16 == 0, "matmul_nvfp4: K (act inner dim) must be a multiple of 16");
+  VT_CHECK(weight_packed.shape[1] == k / 2,
+           "matmul_nvfp4: weight_packed must be [N, K/2] (two fp4 codes per byte)");
+  VT_CHECK(weight_scale.shape[0] == n && weight_scale.shape[1] == k / 16,
+           "matmul_nvfp4: weight_scale must be [N, K/16] (one fp8 scale per 16-elem group)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_nvfp4: out must be [M, N]");
+  VT_CHECK(IsFloat(act.dtype) && IsOutFloat(out.dtype),
+           "matmul_nvfp4: float act, f32/bf16 out");
+  VT_CHECK(weight_packed.dtype == DType::kI8 && weight_scale.dtype == DType::kI8,
+           "matmul_nvfp4: weight_packed/weight_scale must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(act.IsContiguous() && weight_packed.IsContiguous() && weight_scale.IsContiguous() &&
+               out.IsContiguous(),
+           "matmul_nvfp4: contiguous tensors required");
+  VT_CHECK(act.device == q.device && weight_packed.device == q.device &&
+               weight_scale.device == q.device && out.device == q.device,
+           "matmul_nvfp4: device mismatch (act/weight_packed/weight_scale/out/queue)");
+  reinterpret_cast<MatmulNvfp4Fn>(GetOp(OpId::kMatmulNvfp4, q.device.type))(
+      q, out, act, weight_packed, weight_scale, weight_scale_2);
+}
+
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual) {
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1, "rmsnorm: x/out rank-2, w rank-1");

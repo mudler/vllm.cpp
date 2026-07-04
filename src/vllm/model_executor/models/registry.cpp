@@ -12,7 +12,11 @@ ModelForwardFn ResolveModelForward(const std::string& architecture) {
   // (Qwen3_5ForConditionalGeneration) is a separate arch/forward (deferred, see
   // the M0.9 plan); it is intentionally not registered here.
   if (architecture == "Qwen3_5MoeForConditionalGeneration") {
-    return &Qwen3_5Model::Forward;
+    // ModelForwardFn is the M0.9 dense single-sequence signature (the dgx
+    // M0-exit greedy gate). The M1.8 batched PAGED Qwen3_5Model::Forward is a
+    // different signature (attn metadata + KV caches) and is driven directly by
+    // the runner (M1.8 Task 4), not through this string registry.
+    return &Qwen3_5Model::ForwardDense;
   }
   throw std::runtime_error("vllm: no model registered for architecture '" +
                            architecture + "'");

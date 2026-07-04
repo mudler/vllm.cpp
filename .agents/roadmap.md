@@ -222,8 +222,17 @@ vocabulary is ported.**
   request ids + RAII abort — fixed an ASan-confirmed heap-UAF on mid-stream
   error). Reviewed PASS after fix; ASan/UBSan clean; C-header compile-checked.
   DoD MET. (Chat-via-C-API/embeddings/LoRA deferred.)
-- ☐ **M3.6 Server e2e conformance suite** + nightly dgx.casa pipeline.
-- ☐ **M3.7 README + docs** (house style, honest benchmarks). **← MVP done**
+- ☑ **M3.6 Server e2e conformance suite** (`34d3d7b` — 23 cases/252 assertions
+  over the real cpp-httplib socket: completions/chat stream+non-stream,
+  tool_choice auto-relaxed, grammars/response_format, error shapes, endpoints,
+  UTF-8 safety, concurrency; no contract violations). + nightly dgx.casa pipeline
+  (dgx-side, pending GB10 bring-up).
+- ☑ **M3.7 README + docs** (`this commit` — house-style README with the built
+  CPU capabilities, quick-start [build/serve/CLI/C-API], honest support tables +
+  a Status & caveats section flagging the dgx-pending real-model/throughput gates).
+  **← MVP: CPU-side milestones DONE; the remaining acceptance gates are the dgx
+  bring-up (CUDA kernels + 35B paged greedy + throughput-parity-vs-vLLM on GB10),
+  which need the hardware — `scripts/dgx-bringup.sh`.**
 
 ## Recurring (any time after M0)
 

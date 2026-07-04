@@ -749,3 +749,39 @@
   NEXT toward the serving MVP: **M3.6 conformance suite** + **M3.7 docs/README**;
   and the **dgx bring-up** (the whole CUDA stack + the 35B paged greedy gate + this
   GGUF greedy gate on GB10 — scripts/dgx-bringup.sh).
+- **2026-07-04 (M3.6 + M3.7 done — MVP CPU-side milestones COMPLETE)** — `34d3d7b`
+  (M3.6 conformance) + this commit (M3.7 docs). **M3.6:** a comprehensive OpenAI
+  server conformance suite (tests/vllm/entrypoints/openai/test_conformance.cpp — 23
+  cases / 252 assertions) driving the REAL cpp-httplib server over an ephemeral
+  socket: completions + chat (stream + non-stream, cadence, multi-turn), tool
+  calling (tool_choice=auto RELAXED = not forced, named/required shapes), grammars
+  (response_format json_object/json_schema accepted, malformed → 400), error shapes
+  (400/404 + OpenAI ErrorResponse), endpoints (/v1/models, /health, /version), UTF-8
+  safety (emoji fixture → no 500), and concurrency (6 clients, engine mutex). No
+  contract violations surfaced; no server changes needed. CPU ctest 77/77 (clean
+  rebuild). **M3.7:** rewrote README.md to reflect the built state — a "What's
+  implemented (CPU)" section (engine core, paged forward, sampler, OpenAI server +
+  tools + grammars, libvllm C-API packaging), a Quick start (build / serve /
+  vllm-cli / C-API), updated support tables, and an honest "Status & caveats"
+  section distinguishing behavioral (CPU-validated) from numerical (dgx-pending:
+  the real 35B greedy/logits through the paged engine, the CUDA kernels, and the
+  throughput-parity-vs-vLLM benchmark on GB10). Verified the example binary names
+  (build/examples/server, build/examples/vllm-cli). **★ MVP MILESTONE STATUS ★:**
+  ALL CPU-implementable MVP milestones are COMPLETE + recorded: M0 (35B forward,
+  M0-exit greedy on GB10), M1 (V1 engine end-to-end on CPU), M3.1 OpenAI server,
+  M3.2 chat templates, M3.3 tools (+ relaxed auto), M3.4 grammars, M3.5 C-API/
+  packaging, M3.6 conformance, M3.7 docs, M0.10 GGUF load (CPU path). **THE
+  REMAINING MVP GATES ALL NEED GB10 HARDWARE (can't run on this CPU-only box):**
+  (1) **M2 — throughput parity vs vLLM** (the #1 gate: GPU perf kernels [FlashInfer-
+  class paged attention, chunked-scan GDN, fused MoE], CUDA graphs, bf16 KV cache,
+  MRV2 staged storage — measured on GB10 at large concurrency for Qwen3.6-35B-A3B-
+  NVFP4); (2) the **dgx bring-up** — run ALL the build-guarded CUDA kernels
+  (M1.6/M1.7 attention/sampler, the batched runner) + the **35B greedy through the
+  paged LLMEngine** + the **35B GGUF greedy** on GB10 (scripts/dgx-bringup.sh runs
+  the CUDA ctest + the checkpoint-gated forward gate; a "35B greedy through the
+  paged engine" test still needs writing — RunQwen36Logits today exercises the
+  DENSE ForwardDense, not the paged engine). These are hardware-gated: they need
+  the user's `ssh dgx.casa` (GB10, ~/.cache/.../Qwen3.6-35B-A3B-NVFP4 + ~/work/apex/
+  qwen36_35b/*.gguf). NEXT (when hardware is available): M2 perf + the dgx bring-up.
+  On CPU there is no further MVP work — the remaining items are M2 GPU perf (needs
+  GB10 to measure) and the hardware validation.

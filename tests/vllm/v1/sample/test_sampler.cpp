@@ -65,27 +65,51 @@ TEST_CASE("Sampler: all-greedy batch returns the argmax per row, no logprobs") {
 
 // ---------------------------------------------------------------------------
 // Mixed greedy + random: the temp<eps where-merge picks greedy for the greedy
-// row and random for the random row. Row 1 is a peaked distribution so the
-// random draw is deterministic for the assertion.
+// row and random for the random row.
+//
+// This case is DELIBERATELY constructed so an INVERTED merge predicate (picking
+// random where temp<eps) fails deterministically — a peaked greedy row cannot do
+// that, because greedy-argmax always equals the mode the random path samples
+// from, so on a peaked row both branches coincide. Instead row 0 is UNIFORM over
+// 8 tokens: its greedy argmax is index 0 (lowest-index tie-break), but its random
+// draw under the fixed seed lands elsewhere (asserted below via an all-random
+// reference). So merge-correct => row 0 == 0; merge-inverted => row 0 == the
+// random draw (!= 0) => the test bites.
 TEST_CASE("Sampler: mixed batch merges greedy (temp<eps) and random per row") {
-  // Row 0 (greedy, temp 0): argmax at index 3.
+  const int64_t V = 8;
+  // Row 0 (greedy, temp 0): uniform -> argmax 0 by tie-break; random draw != 0.
   // Row 1 (random, temp 1): logit 100 at index 2 -> softmax ~= one-hot(2).
-  std::vector<float> logits = {0.0f, 1.0f, 2.0f, 3.0f,
-                               0.0f, 0.0f, 100.0f, 0.0f};
-  Tensor tl = Logits(logits, 2, 4);
+  std::vector<float> logits(2 * V, 0.0f);
+  logits[V + 2] = 100.0f;
   SamplingMetadata sm;
   sm.all_greedy = false;
   sm.all_random = false;
   sm.temperature = std::vector<float>{0.0f, 1.0f};
+  sm.generators[0] = 424242;    // fixed seed for the (greedy) row 0's random path
   sm.generators[1] = 20260704;  // per-request seed for the random row
   sm.max_num_logprobs = std::nullopt;
 
   Sampler sampler;
   Queue q = Q();
+  Tensor tl = Logits(logits, 2, V);
   auto out = sampler.forward(q, tl, sm);
 
-  CHECK(out.sampled_token_ids[0][0] == 3);  // greedy row -> argmax
+  CHECK(out.sampled_token_ids[0][0] == 0);  // greedy row -> argmax (tie-break)
   CHECK(out.sampled_token_ids[1][0] == 2);  // random row -> the dominant token
+
+  // Reference: what the RANDOM path alone produces for row 0 under the same seed.
+  // It must differ from the greedy argmax (0), proving the merge above genuinely
+  // selected greedy — an inverted predicate would have emitted this value.
+  std::vector<float> row0(logits.begin(), logits.begin() + V);
+  SamplingMetadata rnd;
+  rnd.all_greedy = false;
+  rnd.all_random = true;
+  rnd.temperature = std::vector<float>{1.0f};
+  rnd.generators[0] = 424242;
+  rnd.max_num_logprobs = std::nullopt;
+  Tensor trow0 = Logits(row0, 1, V);
+  auto ref = sampler.forward(q, trow0, rnd);
+  CHECK(ref.sampled_token_ids[0][0] != 0);  // random draw diverges from greedy
 }
 
 // ---------------------------------------------------------------------------

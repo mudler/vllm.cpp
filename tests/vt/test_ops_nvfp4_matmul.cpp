@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -279,6 +280,98 @@ TEST_CASE("CUDA matmul_nvfp4: f32 activations also match the reference") {
   // Same weight bytes + f32 accumulation on both sides; only reduction order
   // differs — matmul tolerance.
   CheckClose(got, ref, 2e-3f, 2e-3f);
+}
+
+// Per-pair reference for the grouped MoE GEMM: out[p,n] = sum_k
+// act[row_map[p], k] * f32(bf16_dequant(W_{eids[p]})[n,k]), bf16 act * f32 weight,
+// f32 accumulation — same operands as one MatmulNvfp4 per pair's expert.
+TEST_CASE("CUDA moe_grouped_gemm_nvfp4 (WMMA) matches per-expert dequant-matmul") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  struct Case {
+    int64_t E, N, K, M_act, P;
+  };
+  // E=8: mostly single-tile experts (P/E ~ 30 < BM=64). E=4,P=320: avg 80 rows
+  // => multi-tile experts (exercises the ragged tile map + boundary). Odd N/K
+  // tails hit the WMMA edge guards. All P >= 32 => the grouped WMMA path.
+  const Case cases[] = {{8, 48, 128, 40, 240}, {4, 70, 96, 50, 320}, {5, 64, 160, 30, 200}};
+  uint32_t seed = 9000;
+  for (const Case& c : cases) {
+    CAPTURE(c.E);
+    CAPTURE(c.N);
+    CAPTURE(c.K);
+    CAPTURE(c.P);
+    std::vector<Nvfp4Weight> w(static_cast<size_t>(c.E));
+    for (int64_t e = 0; e < c.E; ++e)
+      w[static_cast<size_t>(e)] = MakeNvfp4Weight(c.N, c.K, seed + 1 + static_cast<uint32_t>(e));
+    const auto act_f = RandomF32(static_cast<size_t>(c.M_act * c.K), seed + 500);
+    const auto act_bf16 = ToBf16(act_f);
+
+    std::mt19937 rng(seed + 999);
+    std::uniform_int_distribution<int> edist(0, static_cast<int>(c.E - 1));
+    std::uniform_int_distribution<int> rdist(0, static_cast<int>(c.M_act - 1));
+    std::vector<int32_t> eids(static_cast<size_t>(c.P)), rmap(static_cast<size_t>(c.P));
+    for (int64_t p = 0; p < c.P; ++p) {
+      eids[static_cast<size_t>(p)] = edist(rng);
+      rmap[static_cast<size_t>(p)] = rdist(rng);
+    }
+
+    // CPU reference.
+    std::vector<std::vector<uint16_t>> w_deq(static_cast<size_t>(c.E));
+    for (int64_t e = 0; e < c.E; ++e) {
+      w_deq[static_cast<size_t>(e)].resize(static_cast<size_t>(c.N * c.K));
+      vllm::DequantNvfp4ToBf16(w[static_cast<size_t>(e)].packed.data(),
+                               w[static_cast<size_t>(e)].scale.data(),
+                               w[static_cast<size_t>(e)].scale2, c.N, c.K,
+                               w_deq[static_cast<size_t>(e)].data());
+    }
+    std::vector<float> ref(static_cast<size_t>(c.P * c.N), 0.0f);
+    for (int64_t p = 0; p < c.P; ++p) {
+      const int e = eids[static_cast<size_t>(p)];
+      const int r = rmap[static_cast<size_t>(p)];
+      for (int64_t n = 0; n < c.N; ++n) {
+        float acc = 0.0f;
+        for (int64_t kk = 0; kk < c.K; ++kk)
+          acc += vt::BF16ToF32(act_bf16[static_cast<size_t>(r * c.K + kk)]) *
+                 vt::BF16ToF32(w_deq[static_cast<size_t>(e)][static_cast<size_t>(n * c.K + kk)]);
+        ref[static_cast<size_t>(p * c.N + n)] = acc;
+      }
+    }
+
+    QueueGuard gq(gpu);
+    DeviceTensor dact(gpu, gq.q, DType::kBF16, {c.M_act, c.K}, act_bf16.data());
+    DeviceTensor deids(gpu, gq.q, DType::kI32, {c.P}, eids.data());
+    DeviceTensor drmap(gpu, gq.q, DType::kI32, {c.P}, rmap.data());
+    // Upload each expert's weight; collect device pointers into the ptr arrays.
+    std::vector<std::unique_ptr<DeviceTensor>> dpacked, dscale;
+    std::vector<int64_t> hpacked(static_cast<size_t>(c.E)), hscale(static_cast<size_t>(c.E));
+    std::vector<float> hscale2(static_cast<size_t>(c.E));
+    for (int64_t e = 0; e < c.E; ++e) {
+      dpacked.push_back(std::make_unique<DeviceTensor>(gpu, gq.q, DType::kI8, std::vector<int64_t>{c.N, c.K / 2},
+                                                       w[static_cast<size_t>(e)].packed.data()));
+      dscale.push_back(std::make_unique<DeviceTensor>(gpu, gq.q, DType::kI8, std::vector<int64_t>{c.N, c.K / 16},
+                                                      w[static_cast<size_t>(e)].scale.data()));
+      hpacked[static_cast<size_t>(e)] =
+          reinterpret_cast<int64_t>(dpacked.back()->tensor().data);
+      hscale[static_cast<size_t>(e)] = reinterpret_cast<int64_t>(dscale.back()->tensor().data);
+      hscale2[static_cast<size_t>(e)] = w[static_cast<size_t>(e)].scale2;
+    }
+    DeviceTensor dpp(gpu, gq.q, DType::kI64, {c.E}, hpacked.data());
+    DeviceTensor dsp(gpu, gq.q, DType::kI64, {c.E}, hscale.data());
+    DeviceTensor ds2(gpu, gq.q, DType::kF32, {c.E}, hscale2.data());
+    DeviceTensor dout(gpu, gq.q, DType::kF32, {c.P, c.N});
+
+    vt::MoeGroupedGemmNvfp4(gq.q, dout.tensor(), dact.tensor(), deids.tensor(), &drmap.tensor(),
+                            dpp.tensor(), dsp.tensor(), ds2.tensor());
+    std::vector<float> got(static_cast<size_t>(c.P * c.N));
+    dout.Download(gq.q, got.data());
+    CheckClose(got, ref, 2e-3f, 3e-3f);
+    seed += 100;
+  }
 }
 
 TEST_CASE("matmul_nvfp4 validates shapes loudly (CPU dispatch)") {

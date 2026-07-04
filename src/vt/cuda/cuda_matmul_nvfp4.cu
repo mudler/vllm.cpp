@@ -27,13 +27,28 @@
 // per-element decode is byte-for-byte the naive kernel's (same nibble order,
 // group-16 fp8-e4m3 scale, scale2, bf16-round) so the GEMM stays token-for-token
 // correct; only the K-reduction order changes (tiled), within matmul tolerance.
+//
+// Layout (M2.6-wmma): the PREFILL (large-M) bf16 path runs on Blackwell TENSOR
+// CORES. The fp4 weight tile is decoded into shared memory AS BF16 (CUDA-core
+// decode, same bf16-rounded value) and the bf16 activation tile is staged into
+// shared; each warp then runs nvcuda::wmma m16n16k16 bf16xbf16 -> f32 over the
+// tile (mirrors a cutlass W4A16 dequant-GEMM). For the MoE grouped GEMM the P
+// token-major pair-rows are first GROUPED BY EXPERT on device (counting sort +
+// ragged per-BM-tile map) so each expert's weight is decoded once per row tile
+// and fed to the tensor cores — buying both the ~BM-x weight-bandwidth reduction
+// the per-pair kernel lacked and the tensor-core MMA. VT_NVFP4_WMMA=0 falls back
+// to the CUDA-core tiled kernels (A/B toggle). Small-M decode keeps the naive
+// kernel (graph-safe). Measured GB10: 1024-token prefill TTFT 14.4s -> 6.1s.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
+#include <mma.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "vt/ops.h"
 
@@ -48,6 +63,16 @@ void Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// Tensor-core (bf16 WMMA) NVFP4 GEMM path toggle (A/B; default ON). Set
+// VT_NVFP4_WMMA=0 to fall back to the CUDA-core tiled kernels (baseline).
+bool WmmaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NVFP4_WMMA");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
 
 // f32 load/store overloads: bf16 converts on the way in/out, math is f32.
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
@@ -209,6 +234,107 @@ __global__ void MatmulNvfp4Tiled(Tout* out, const Tin* act, const uint8_t* packe
   }
 }
 
+// --- Tensor-core (bf16 WMMA) NVFP4 W4A16 GEMM (M2.6 prefill unlock) ----------
+// Same math as MatmulNvfp4Tiled (out[m,n] = sum_k act[m,k] * bf16(e2m1(w[n,k]) *
+// group_scale[n,k/16])) but the K-reduction runs on Blackwell tensor cores. The
+// fp4 weight tile is dequantized INTO SHARED as bf16 (CUDA-core dequant, exactly
+// DecodeFp4Byte's bf16-rounded value) and the bf16 activation tile is staged into
+// shared; each warp then runs wmma m16n16k16 bf16xbf16 -> f32 over the tile. This
+// mirrors a cutlass W4A16 dequant-GEMM (block tile [BM x BN], warp tiling
+// [WARPS_M x WARPS_N], K-loop over BK; dequant on CUDA cores, MMA on tensor
+// cores). BF16 activations only — the f32-act large-M case keeps the CUDA-core
+// tiled path (no test exercises f32-act large-M, and the model feeds bf16).
+namespace wmma = nvcuda::wmma;
+
+template <typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
+__global__ void MatmulNvfp4Wmma(Tout* out, const __nv_bfloat16* act, const uint8_t* packed,
+                                const uint8_t* scale, float scale2, int64_t m_rows,
+                                int64_t n_cols, int64_t k_dim) {
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M;  // rows a warp owns
+  constexpr int WNPER = BN / WARPS_N;  // cols a warp owns
+  constexpr int MF = WMPER / 16;       // wmma M-fragments per warp
+  constexpr int NF = WNPER / 16;       // wmma N-fragments per warp
+  __shared__ __nv_bfloat16 As[BM * BK];
+  __shared__ __nv_bfloat16 Ws[BN * BK];
+  __shared__ float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32;
+  const int wm = warp / WARPS_N;
+  const int wn = warp % WARPS_N;
+  const int64_t row0 = static_cast<int64_t>(blockIdx.y) * BM;
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const int64_t packed_cols = k_dim / 2;
+  const int64_t groups = k_dim / 16;
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+  for (int64_t kt = 0; kt < k_dim; kt += BK) {
+    // Stage the bf16 activation tile [BM][BK] (coalesced, act is K-contiguous).
+    for (int idx = tid; idx < BM * BK; idx += kThreads) {
+      const int r = idx / BK, c = idx % BK;
+      const int64_t gr = row0 + r;
+      As[idx] = (gr < m_rows && kt + c < k_dim) ? act[gr * k_dim + kt + c]
+                                                : __float2bfloat16(0.0f);
+    }
+    // Decode the fp4 weight tile [BN][BK] into shared bf16 (coalesced packed-byte
+    // reads; one byte -> two consecutive K elements), stored [BN][BK] so a
+    // col_major wmma B-load with ldm=BK yields B[k,n] = weight[n,k].
+    for (int idx = tid; idx < BN * (BK / 2); idx += kThreads) {
+      const int nl = idx / (BK / 2), bc = idx % (BK / 2), kl = 2 * bc;
+      const int64_t gn = col0 + nl;
+      if (gn < n_cols && kt + kl < k_dim) {
+        const uint8_t b = packed[gn * packed_cols + kt / 2 + bc];
+        const float gs = F8E4M3ToF32Dev(scale[gn * groups + (kt + kl) / 16]) * scale2;
+        float w_lo, w_hi;
+        DecodeFp4Byte(b, gs, w_lo, w_hi);
+        Ws[nl * BK + kl] = __float2bfloat16(w_lo);
+        Ws[nl * BK + kl + 1] = __float2bfloat16(w_hi);
+      } else {
+        Ws[nl * BK + kl] = __float2bfloat16(0.0f);
+        Ws[nl * BK + kl + 1] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni)
+        wmma::load_matrix_sync(bf[ni], &Ws[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) wmma::mma_sync(acc[mi][ni], af[mi], bf[ni], acc[mi][ni]);
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni)
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[mi][ni], BN, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gr = row0 + r, gc = col0 + c;
+    if (gr < m_rows && gc < n_cols) Store(out, gr * n_cols + gc, Cs[idx]);
+  }
+}
+
 // Below this many activation rows the naive one-thread-per-output kernel wins
 // (weight L2-resident, tiling overhead not amortized); at/above it the tiled
 // register-blocked kernel wins (weight streamed, coalescing + reuse pay off).
@@ -227,6 +353,22 @@ void Launch(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& packed
         k);
     Check(cudaGetLastError(), "kernel launch (naive)");
     return;
+  }
+  // BF16 activations at large M run on tensor cores (wmma bf16 -> f32). Tile
+  // [BM x BN] = 64x64, BK=32, warps 2x2 (128 threads); each warp owns 32x32 =
+  // 2x2 wmma m16n16k16 fragments. Dequant into shared bf16 stays on CUDA cores.
+  if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+    if (WmmaEnabled()) {
+    constexpr int BM = 64, BN = 64, BK = 32, WARPS_M = 2, WARPS_N = 2;
+    constexpr int kThreads = WARPS_M * WARPS_N * 32;
+    const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN),
+                    static_cast<unsigned>((m + BM - 1) / BM));
+    MatmulNvfp4Wmma<Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
+        out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), packed.Ptr<uint8_t>(), scale.Ptr<uint8_t>(),
+        scale2, m, n, k);
+    Check(cudaGetLastError(), "kernel launch (wmma)");
+    return;
+    }
   }
   // GB10-tuned tile: [BM x BN] = 64x64, BK=32, [TM x TN] = 4x4 => 256
   // threads/block. Weight tile is loaded once per block and reused across all BM
@@ -360,10 +502,209 @@ __global__ void MoeGroupedGemmNvfp4Tiled(Tout* out, const Tin* act, const int32_
   }
 }
 
+// --- Expert-grouped tensor-core (bf16 WMMA) MoE grouped GEMM (M2.6) ----------
+// The MoE pairs are token-major (row p uses expert eids[p], NOT expert-sorted),
+// so the per-pair tiled kernel above re-reads each expert's whole weight once per
+// row (no cross-row reuse) AND cannot feed tensor cores (M=1 per weight). This
+// path first GROUPS the P pair-rows by expert on device (counting sort), then
+// runs a dense bf16 WMMA GEMM per expert over its contiguous row block — the
+// weight is decoded once per BM-row tile (mirrors cutlass/Marlin grouped MoE:
+// token-sorted activations + per-tile expert map, ragged tail masked). Grouping
+// buys BOTH the ~BM-x weight-bandwidth reduction and the tensor-core MMA. Runs
+// only for large P (prefill), which is never CUDA-graph-captured, so the
+// stream-ordered scratch alloc below is safe; small-P decode keeps the naive
+// kernel. Row bookkeeping over sorted positions:
+//   sp[pos] = original pair index p (output row = out[sp[pos], :])
+//   sr[pos] = source activation row = row_map ? row_map[p] : p
+constexpr int kGroupBM = 64;
+
+__global__ void MoeHistKernel(const int32_t* eids, int32_t* count, int64_t p_rows) {
+  const int64_t p = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (p < p_rows) atomicAdd(&count[eids[p]], 1);
+}
+
+// Exclusive prefix sum of count[E] -> offset[E] (E small; single thread serial).
+__global__ void MoeOffsetsKernel(const int32_t* count, int32_t* offset, int e_count) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int32_t acc = 0;
+  for (int e = 0; e < e_count; ++e) {
+    offset[e] = acc;
+    acc += count[e];
+  }
+}
+
+__global__ void MoeScatterKernel(const int32_t* eids, const int32_t* row_map,
+                                 const int32_t* offset, int32_t* cursor, int32_t* sp, int32_t* sr,
+                                 int64_t p_rows) {
+  const int64_t p = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (p >= p_rows) return;
+  const int e = eids[p];
+  const int pos = offset[e] + atomicAdd(&cursor[e], 1);
+  sp[pos] = static_cast<int32_t>(p);
+  sr[pos] = row_map != nullptr ? row_map[p] : static_cast<int32_t>(p);
+}
+
+// Build the ragged per-BM-tile expert map (no tile crosses an expert boundary);
+// pad the unused tail tiles with tile_rows=0 (grid.y is an upper bound). Single
+// thread serial over E (small).
+__global__ void MoeTileMapKernel(const int32_t* count, const int32_t* offset, int32_t* tile_expert,
+                                 int32_t* tile_row0, int32_t* tile_rows, int e_count, int bm,
+                                 int max_tiles) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  int t = 0;
+  for (int e = 0; e < e_count; ++e) {
+    const int c = count[e], o = offset[e];
+    for (int off = 0; off < c; off += bm) {
+      tile_expert[t] = e;
+      tile_row0[t] = o + off;
+      tile_rows[t] = (c - off < bm) ? (c - off) : bm;
+      ++t;
+    }
+  }
+  for (; t < max_tiles; ++t) tile_rows[t] = 0;
+}
+
+template <typename Tin, typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
+__global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t* sp,
+                                        const int32_t* sr, const int64_t* packed_ptrs,
+                                        const int64_t* scale_ptrs, const float* scale2s,
+                                        const int32_t* tile_expert, const int32_t* tile_row0,
+                                        const int32_t* tile_rows, int64_t n_cols, int64_t k_dim) {
+  const int rcount = tile_rows[blockIdx.y];
+  if (rcount == 0) return;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  __shared__ __nv_bfloat16 As[BM * BK];
+  __shared__ __nv_bfloat16 Ws[BN * BK];
+  __shared__ float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int e = tile_expert[blockIdx.y];
+  const int row0 = tile_row0[blockIdx.y];
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const int64_t packed_cols = k_dim / 2, groups = k_dim / 16;
+  const auto* packed = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(packed_ptrs[e]));
+  const auto* scale = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(scale_ptrs[e]));
+  const float scale2 = scale2s[e];
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+  for (int64_t kt = 0; kt < k_dim; kt += BK) {
+    for (int idx = tid; idx < BM * BK; idx += kThreads) {
+      const int r = idx / BK, c = idx % BK;
+      __nv_bfloat16 v = __float2bfloat16(0.0f);
+      if (r < rcount && kt + c < k_dim) {
+        const int64_t srow = sr[row0 + r];
+        v = static_cast<__nv_bfloat16>(act[srow * k_dim + kt + c]);
+      }
+      As[idx] = v;
+    }
+    for (int idx = tid; idx < BN * (BK / 2); idx += kThreads) {
+      const int nl = idx / (BK / 2), bc = idx % (BK / 2), kl = 2 * bc;
+      const int64_t gn = col0 + nl;
+      if (gn < n_cols && kt + kl < k_dim) {
+        const uint8_t b = packed[gn * packed_cols + kt / 2 + bc];
+        const float gs = F8E4M3ToF32Dev(scale[gn * groups + (kt + kl) / 16]) * scale2;
+        float w_lo, w_hi;
+        DecodeFp4Byte(b, gs, w_lo, w_hi);
+        Ws[nl * BK + kl] = __float2bfloat16(w_lo);
+        Ws[nl * BK + kl + 1] = __float2bfloat16(w_hi);
+      } else {
+        Ws[nl * BK + kl] = __float2bfloat16(0.0f);
+        Ws[nl * BK + kl + 1] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni)
+        wmma::load_matrix_sync(bf[ni], &Ws[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) wmma::mma_sync(acc[mi][ni], af[mi], bf[ni], acc[mi][ni]);
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni)
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[mi][ni], BN, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gc = col0 + c;
+    if (r < rcount && gc < n_cols) Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc,
+                                         Cs[idx]);
+  }
+}
+
+// Groups P pairs by expert on device then runs the WMMA grouped GEMM. Scratch is
+// stream-ordered (prefill-only; not graph-captured).
+template <typename Tin, typename Tout>
+void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                       const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
+                       const Tensor& scale2s, int64_t p, int64_t n, int64_t k, int64_t e_count) {
+  constexpr int BM = kGroupBM, BN = 64, BK = 32, WARPS_M = 2, WARPS_N = 2;
+  const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
+  // Single scratch block, int32 sub-slices: count,offset,cursor [E]; sp,sr [P];
+  // tile_expert,tile_row0,tile_rows [max_tiles].
+  const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
+  int32_t* scratch = nullptr;
+  Check(cudaMallocAsync(&scratch, static_cast<size_t>(n_i32) * sizeof(int32_t), s),
+        "moe grouped scratch alloc");
+  int32_t* count = scratch;
+  int32_t* offset = count + e_count;
+  int32_t* cursor = offset + e_count;
+  int32_t* sp = cursor + e_count;
+  int32_t* sr = sp + p;
+  int32_t* tile_expert = sr + p;
+  int32_t* tile_row0 = tile_expert + max_tiles;
+  int32_t* tile_rows = tile_row0 + max_tiles;
+
+  Check(cudaMemsetAsync(count, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s), "memset count");
+  Check(cudaMemsetAsync(cursor, 0, static_cast<size_t>(e_count) * sizeof(int32_t), s),
+        "memset cursor");
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  const int32_t* rmap = row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr;
+  const int hb = 256;
+  MoeHistKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, count, p);
+  MoeOffsetsKernel<<<1, 1, 0, s>>>(count, offset, static_cast<int>(e_count));
+  MoeScatterKernel<<<static_cast<unsigned>((p + hb - 1) / hb), hb, 0, s>>>(eids, rmap, offset,
+                                                                          cursor, sp, sr, p);
+  MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
+                                   static_cast<int>(e_count), BM, max_tiles);
+
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
+  MoeGroupedGemmNvfp4Wmma<Tin, Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
+      out.Ptr<Tout>(), act.Ptr<Tin>(), sp, sr, packed_ptrs.Ptr<int64_t>(),
+      scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), tile_expert, tile_row0, tile_rows, n, k);
+  Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (wmma)");
+  Check(cudaFreeAsync(scratch, s), "moe grouped scratch free");
+}
+
 template <typename Tin, typename Tout>
 void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                    const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
-                   const Tensor& scale2s, int64_t p, int64_t n, int64_t k) {
+                   const Tensor& scale2s, int64_t p, int64_t n, int64_t k, int64_t e_count) {
   const int64_t y = p < 65535 ? p : 65535;  // grid.y max; kernel strides over p
   if (p < kTileMinRows) {
     constexpr int kBlock = 256;
@@ -374,6 +715,14 @@ void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor&
         scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), p, n, k);
     Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (naive)");
     return;
+  }
+  // Large-P (prefill) bf16: expert-grouped tensor-core (WMMA) path.
+  if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+    if (WmmaEnabled()) {
+      LaunchGroupedWmma<Tin, Tout>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs,
+                                   scale2s, p, n, k, e_count);
+      return;
+    }
   }
   constexpr int BN = 128, BK = 32;  // 128 threads/block; weight tile 128x32
   const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(y));
@@ -387,15 +736,15 @@ void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor&
 template <typename Tin>
 void LaunchGroupedByOut(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                         const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
-                        const Tensor& scale2s, int64_t p, int64_t n, int64_t k) {
+                        const Tensor& scale2s, int64_t p, int64_t n, int64_t k, int64_t e_count) {
   switch (out.dtype) {
     case DType::kF32:
       LaunchGrouped<Tin, float>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s,
-                                p, n, k);
+                                p, n, k, e_count);
       break;
     case DType::kBF16:
       LaunchGrouped<Tin, __nv_bfloat16>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs,
-                                        scale2s, p, n, k);
+                                        scale2s, p, n, k, e_count);
       break;
     default: VT_CHECK(false, "cuda moe_grouped_gemm_nvfp4: unsupported out dtype (f32/bf16 only)");
   }
@@ -407,15 +756,16 @@ void MoeGroupedGemmNvfp4KernelCuda(Queue& q, Tensor& out, const Tensor& act,
                                    const Tensor& scale2s) {
   const int64_t p = out.shape[0], n = out.shape[1], k = act.shape[1];
   if (p == 0 || n == 0) return;
+  const int64_t e_count = packed_ptrs.shape[0];  // number of experts
   cudaStream_t s = AsStream(q);
   switch (act.dtype) {
     case DType::kF32:
       LaunchGroupedByOut<float>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s,
-                                p, n, k);
+                                p, n, k, e_count);
       break;
     case DType::kBF16:
       LaunchGroupedByOut<__nv_bfloat16>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs,
-                                        scale2s, p, n, k);
+                                        scale2s, p, n, k, e_count);
       break;
     default: VT_CHECK(false, "cuda moe_grouped_gemm_nvfp4: unsupported act dtype (f32/bf16 only)");
   }

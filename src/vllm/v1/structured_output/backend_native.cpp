@@ -1277,17 +1277,39 @@ NativeStructuredOutputBackend::NativeStructuredOutputBackend(
     shared->stop_token_ids = std::move(stop_token_ids);
   }
 
-  // Excluded ids: every added token (special OR not — added tokens carry literal
-  // content, not byte-mapped bytes) and every stop token. These are never
-  // grammar-matchable mid-derivation.
-  std::unordered_set<int32_t> excluded;
-  for (const auto& at : tokenizer.AddedTokens()) excluded.insert(at.id);
-  for (const int32_t sid : shared->stop_token_ids) excluded.insert(sid);
+  // Only STOP/EOS tokens are excluded from the trie + id->bytes table: they must
+  // never be matchable mid-derivation (fill_bitmask allows them solely at an
+  // accepting state). ADDED tokens ARE matchable — an added token is a structural
+  // marker (e.g. `<tool_call>`/`</tool_call>` in the real Qwen3.6 vocab, each a
+  // SINGLE added token, special:false) whose `content` string IS the byte
+  // sequence a grammar literal matches. Excluding them broke lazy tool-calling:
+  // the `<tool_call>` WORD trigger never buffered/fired, and the active FSM could
+  // never consume the `</tool_call>` end literal. So added tokens go in the trie
+  // keyed by their RAW content bytes (no byte-level UnmapUnicodeToBytes), while
+  // regular vocab tokens keep the byte-level-alphabet unmap path.
+  std::unordered_set<int32_t> stop_set(shared->stop_token_ids.begin(),
+                                       shared->stop_token_ids.end());
 
-  // Build the token-byte trie + the id->bytes table (used by accept_tokens).
+  // Added tokens first: insert their literal `content` (an added token's text IS
+  // the grammar-matchable byte string). Track them so the byte-level pass below
+  // does not also try to unmap them.
+  std::unordered_set<int32_t> added_ids;
+  for (const auto& at : tokenizer.AddedTokens()) {
+    added_ids.insert(at.id);
+    if (at.id < 0 || at.id >= vocab_size) continue;  // out of bitmask range
+    if (stop_set.count(at.id) != 0) continue;  // stop/EOS: not matchable mid-derivation
+    if (at.text.empty()) continue;
+    shared->trie.Insert(at.text, at.id);
+    shared->token_bytes[at.id] = at.text;
+  }
+
+  // Regular byte-level vocab tokens: unmap the byte-level alphabet to raw bytes.
+  // (The trie stores a LIST of ids per terminal node and fill_bitmask sets every
+  // one, so an added token and a regular token producing the same bytes coexist.)
   for (int32_t id = 0; id < vocab_size; ++id) {
     if (!tokenizer.HasToken(id)) continue;  // vocab hole
-    if (excluded.count(id) != 0) continue;
+    if (stop_set.count(id) != 0) continue;  // stop/EOS
+    if (added_ids.count(id) != 0) continue;  // already inserted as literal content
     std::string raw;
     try {
       raw = tok::UnmapUnicodeToBytes(tokenizer.TokenText(id));

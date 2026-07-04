@@ -276,13 +276,18 @@ TEST_CASE("native: EOS allowed only at an accepting state") {
   CHECK_FALSE(g->accept_tokens("r", {14}));    // nothing follows EOS
 }
 
-// The non-special ADDED token (<tool>) and any excluded id are never matchable.
-TEST_CASE("native: added/special tokens are never grammar-matchable") {
+// ADDED tokens are matchable by their LITERAL content bytes (a structural marker
+// like `<tool>` is a grammar literal, mirroring the real Qwen3.6 `<tool_call>`);
+// only STOP/EOS tokens stay non-matchable mid-derivation. (This test previously
+// asserted the OLD exclude-all-added behavior, which broke lazy tool-calling —
+// see the "added-marker" section below for the regression it caused.)
+TEST_CASE("native: added tokens match by content; stop tokens stay excluded") {
   auto backend = MakeBackend();
-  // A permissive grammar that would accept the literal bytes "<tool>".
+  // A permissive grammar that accepts the literal bytes of "<tool>".
   auto g = Compile(*backend, StructuredOutputOptions::kGrammar,
                    R"(root ::= [<a-z>]+)");
-  CHECK_FALSE(Allowed(*g, 41));  // "<tool>" added token, not in the trie
+  CHECK(Allowed(*g, 41));       // "<tool>" (non-special added) IS matchable now
+  CHECK_FALSE(Allowed(*g, kEos));  // the stop/EOS token is NOT matchable mid-grammar
 }
 
 // (f) perf: fill_bitmask visits far fewer trie nodes than the vocab size.
@@ -700,6 +705,168 @@ TEST_CASE("native lazy: fill==accept invariant holds POST-trigger") {
     }
   }
   backend->destroy();
+}
+
+// ───────── M3.3b: ADDED-token structural markers (real-Qwen3.6 shape) ─────────
+// The REAL Qwen3.6 tokenizer emits `<tool_call>`/`</tool_call>` each as a SINGLE
+// ADDED token (special:false, ids 248058/248059), NOT as regular BPE sub-text.
+// An added token carries LITERAL content bytes; the grammar's `<tool_call>`
+// literal must match that content, so added markers MUST live in the trie +
+// token_bytes (keyed by their raw content). This fixture mirrors that shape:
+// `<tool_call>`/`</tool_call>` are ADDED tokens (single ids), the JSON body is
+// regular single-char tokens. (The earlier LazyFixture spells the wrapper with
+// REGULAR vocab tokens, so it does NOT exercise this path.)
+namespace {
+
+constexpr int32_t kAddedToolOpen = 10;   // "<tool_call>"  (added, special:false)
+constexpr int32_t kAddedToolClose = 11;  // "</tool_call>" (added, special:false)
+constexpr int32_t kAddedEos = 12;        // "<eos>"        (added, special:true)
+
+Tokenizer BuildAddedFixture() {
+  json vocab = {{"{", 0}, {"}", 1}, {"5", 2}, {"Z", 3}, {"P", 4}};
+
+  json doc;
+  doc["version"] = "1.0";
+  doc["added_tokens"] = json::array(
+      {{{"id", kAddedToolOpen}, {"content", "<tool_call>"}, {"special", false}},
+       {{"id", kAddedToolClose},
+        {"content", "</tool_call>"},
+        {"special", false}},
+       {{"id", kAddedEos}, {"content", "<eos>"}, {"special", true}}});
+  doc["normalizer"] = nullptr;
+  doc["pre_tokenizer"] = {
+      {"type", "Sequence"},
+      {"pretokenizers",
+       json::array(
+           {{{"type", "Split"},
+             {"pattern",
+              {{"Regex",
+                R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"}}},
+             {"behavior", "Isolated"},
+             {"invert", false}},
+            {{"type", "ByteLevel"},
+             {"add_prefix_space", false},
+             {"trim_offsets", false},
+             {"use_regex", false}}})}};
+  doc["model"] = {{"type", "BPE"},
+                  {"ignore_merges", false},
+                  {"vocab", vocab},
+                  {"merges", json::array()}};
+  TempJson f(doc.dump());
+  return Tokenizer::FromHfJson(f.path());
+}
+
+const Tokenizer& AddedFixture() {
+  static const Tokenizer tok = BuildAddedFixture();
+  return tok;
+}
+
+int AddedVocabSize() { return static_cast<int>(AddedFixture().VocabSize()); }
+
+std::unique_ptr<NativeStructuredOutputBackend> MakeAddedBackend() {
+  return std::make_unique<NativeStructuredOutputBackend>(
+      AddedFixture(), AddedVocabSize(), std::vector<int32_t>{kAddedEos});
+}
+
+bool AddedAllowed(NativeGrammar& g, int32_t t) {
+  TokenBitmask bm;
+  bm.num_seqs = 1;
+  bm.num_words = BitmaskWordsForVocab(AddedVocabSize());
+  bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+  g.fill_bitmask(bm, 0);
+  const int32_t word = bm.data[static_cast<std::size_t>(t >> 5)];
+  return (word & (1 << (t & 31))) != 0;
+}
+
+}  // namespace
+
+// (a) The WORD trigger `<tool_call>` FIRES when the model emits the `<tool_call>`
+// ADDED token (a single id) — proving the added token is buffered as its literal
+// content. BEFORE the fix the added token was excluded from token_bytes, so it
+// was never buffered, the WORD trigger never fired, and auto tool-calling was a
+// silent no-op for the real model.
+TEST_CASE("native added-marker: WORD trigger fires on the <tool_call> ADDED token") {
+  auto backend = MakeAddedBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+
+  REQUIRE(g->accept_tokens("r", {3}));  // "Z" free text
+  CHECK(g->is_terminated());            // still just a plain reply (awaiting)
+
+  REQUIRE(g->accept_tokens("r", {kAddedToolOpen}));  // the ADDED trigger token
+  CHECK_FALSE(g->is_terminated());       // triggered: now mid tool-call
+  CHECK(AddedAllowed(*g, 0));            // only "{" opens the body
+  CHECK_FALSE(AddedAllowed(*g, 3));      // a letter is forbidden now
+  CHECK_FALSE(AddedAllowed(*g, kAddedEos));  // not accepting mid tool-call
+}
+
+// (b) The FULL tool call completes when `</tool_call>` is the closing ADDED
+// token: <tool_call>(added) + "{" + digit + "}" + </tool_call>(added) -> the FSM
+// consumes the closing marker's literal content and terminates. BEFORE the fix
+// `</tool_call>` was excluded from token_bytes, so the active FSM could never
+// consume it and the tool call could never complete.
+TEST_CASE("native added-marker: full tool call completes via </tool_call> ADDED token") {
+  auto backend = MakeAddedBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+
+  REQUIRE(g->accept_tokens("r", {kAddedToolOpen}));  // "<tool_call>" (added)
+  REQUIRE(g->accept_tokens("r", {0}));               // "{"
+  REQUIRE(g->accept_tokens("r", {2}));               // "5" (a digit)
+  REQUIRE(g->accept_tokens("r", {1}));               // "}"
+  CHECK_FALSE(g->is_terminated());                   // still needs "</tool_call>"
+  REQUIRE(g->accept_tokens("r", {kAddedToolClose}));  // "</tool_call>" (added)
+  CHECK(g->is_terminated());  // full <tool_call>{5}</tool_call>
+}
+
+// (c) THE fill==accept differential invariant still holds with the added-token
+// vocab, at every state along the tool-call body (fill and accept share the same
+// trie/token_bytes source, so this is preserved by construction — verify it).
+TEST_CASE("native added-marker: fill==accept invariant holds with added markers") {
+  auto backend = MakeAddedBackend();
+  const int vocab = AddedVocabSize();
+  const std::vector<std::vector<int32_t>> prefixes = {
+      {},                                       // awaiting (inert)
+      {kAddedToolOpen},                         // after "<tool_call>" -> "{"
+      {kAddedToolOpen, 0},                      // after "{"           -> digit
+      {kAddedToolOpen, 0, 2},                   // after digit         -> "}"
+      {kAddedToolOpen, 0, 2, 1},                // after "}"           -> "</tool_call>"
+  };
+  for (const auto& prefix : prefixes) {
+    auto filled = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+    if (!prefix.empty()) REQUIRE(filled->accept_tokens("p", prefix));
+
+    TokenBitmask bm;
+    bm.num_seqs = 1;
+    bm.num_words = BitmaskWordsForVocab(vocab);
+    bm.data.assign(static_cast<std::size_t>(bm.num_words), 0);
+    filled->fill_bitmask(bm, 0);
+
+    for (int32_t t = 0; t < vocab; ++t) {
+      const bool fill_allows =
+          (bm.data[static_cast<std::size_t>(t >> 5)] &
+           static_cast<int32_t>(1u << (static_cast<uint32_t>(t) & 31u))) != 0;
+      auto probe = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+      if (!prefix.empty()) REQUIRE(probe->accept_tokens("p", prefix));
+      const bool accept_allows = probe->accept_tokens("t", {t});
+      INFO("prefix_len=" << prefix.size() << " token=" << t
+                         << " fill=" << fill_allows
+                         << " accept=" << accept_allows);
+      CHECK(fill_allows == accept_allows);
+    }
+  }
+  backend->destroy();
+}
+
+// (d) A plain reply that never emits `<tool_call>` stays free throughout and can
+// terminate — the added markers being matchable does NOT force a tool call.
+TEST_CASE("native added-marker: a plain reply never triggers and stays free") {
+  auto backend = MakeAddedBackend();
+  auto g = CompileLazy(*backend, kToolGrammar, {"<tool_call>"});
+  REQUIRE(g->accept_tokens("r", {4, 3, 4}));  // "P","Z","P"
+  CHECK(AddedAllowed(*g, 3));                  // still all allowed
+  CHECK(AddedAllowed(*g, 0));
+  CHECK(g->is_terminated());                   // may end (no tool call forced)
+  REQUIRE(g->accept_tokens("r", {kAddedEos}));  // end the plain reply
+  CHECK(g->is_terminated());
 }
 
 // ───────────────────── M3.3b Task 2: STRUCTURAL_TAG native compile ───────────

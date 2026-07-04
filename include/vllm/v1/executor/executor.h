@@ -22,8 +22,9 @@
 //   - initialize_from_config / determine_available_memory / get_kv_cache_specs
 //     / supported_tasks / add_lora / sleep / wake_up / check_health / shutdown
 //     and the rest of the WorkerBase RPC surface,
-//   - grammar_output arg to sample_tokens (T0 = null / no structured output),
 //   - take_draft_token_ids (spec-decode), KVOutputAggregator (P/D transfer).
+// grammar_output arg to sample_tokens is THREADED as of M3.4 Task 2 (forwarded
+// to the runner; Task 3 consumes it).
 #pragma once
 
 #include <optional>
@@ -49,8 +50,12 @@ class Executor {
       const SchedulerOutput& scheduler_output);
 
   // sample_tokens: drive the runner's sampling. Mirrors
-  // Executor.sample_tokens -> collective_rpc("sample_tokens")[0].
-  ModelRunnerOutput sample_tokens();
+  // Executor.sample_tokens(grammar_output) -> collective_rpc("sample_tokens",
+  // args=(grammar_output,))[0] (abstract.py:242-245). grammar_output is the
+  // scheduler's per-step structured-output payload (nullopt when no structured
+  // request is scheduled); forwarded to the runner (Task 3 consumes it).
+  ModelRunnerOutput sample_tokens(
+      const std::optional<GrammarOutput>& grammar_output = std::nullopt);
 
  private:
   ModelRunnerBase& runner_;

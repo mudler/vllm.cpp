@@ -58,12 +58,23 @@
 
 namespace vllm::v1 {
 
+class StructuredOutputManager;  // vllm/v1/structured_output/manager.h
+
 // The inner engine loop (T0 subset). Holds non-owning references to the
 // Scheduler (M1.4) and the Executor; both outlive the EngineCore.
 class EngineCore {
  public:
-  EngineCore(Scheduler& scheduler, Executor& executor)
-      : scheduler_(scheduler), executor_(executor) {}
+  // structured_output_manager (upstream core.py:134 the EngineCore constructs it;
+  // core.py:153 passes it to the Scheduler; core.py:876 add_request calls
+  // grammar_init): the engine's StructuredOutputManager. Optional (null) to keep
+  // the M1.8 tests building a bare EngineCore; when null, structured output is a
+  // no-op. When provided, it must be the SAME manager the Scheduler was built
+  // with (so get_grammar_bitmask/should_advance see the compiled grammars).
+  EngineCore(Scheduler& scheduler, Executor& executor,
+             StructuredOutputManager* structured_output_manager = nullptr)
+      : scheduler_(scheduler),
+        executor_(executor),
+        structured_output_manager_(structured_output_manager) {}
 
   // add_request: hand a new request to the scheduler (which takes ownership).
   // Mirrors EngineCore.add_request -> scheduler.add_request (validation +
@@ -83,6 +94,9 @@ class EngineCore {
  private:
   Scheduler& scheduler_;
   Executor& executor_;
+  // The engine's StructuredOutputManager (null when structured output is not
+  // wired). Non-owning; must outlive the EngineCore. See the ctor note.
+  StructuredOutputManager* structured_output_manager_ = nullptr;
 };
 
 }  // namespace vllm::v1

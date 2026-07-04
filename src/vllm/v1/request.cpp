@@ -62,6 +62,10 @@ Request::Request(std::string request_id,
       arrival_time(arrival_time),
       num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())),
       block_hasher_(std::move(block_hasher)) {
+  // request.py:87-92: build the per-request structured-output state from the
+  // sampling params (nullopt when there is no structured-output constraint).
+  structured_output_request =
+      StructuredOutputRequest::from_sampling_params(&this->sampling_params);
   // Upstream computes the initial block hashes at the end of __init__.
   update_block_hashes();
 }

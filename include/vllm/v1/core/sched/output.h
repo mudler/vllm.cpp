@@ -64,6 +64,7 @@
 #include <vector>
 
 #include "vllm/sampling_params.h"
+#include "vllm/v1/structured_output/backend_types.h"  // TokenBitmask
 
 namespace vllm::v1 {
 
@@ -156,8 +157,24 @@ struct SchedulerOutput {
   // mm_hash strings whose encoder outputs can be freed. DEFERRED: empty in T0.
   std::vector<std::string> free_encoder_mm_hashes;
 
+  // Whether any structured-output request is scheduled this step and past its
+  // prefill (upstream SchedulerOutput.has_structured_output_requests, set in
+  // _update_after_schedule scheduler.py:1186). Gates get_grammar_bitmask.
+  bool has_structured_output_requests = false;
+
   // make_empty: an empty step output.
   static SchedulerOutput make_empty();
+};
+
+// GrammarOutput (output.py:262-267): the per-step structured-output payload the
+// scheduler produces (get_grammar_bitmask) and the runner consumes
+// (apply_grammar_bitmask, Task 3). The bitmask rows are ordered exactly as
+// structured_output_request_ids.
+struct GrammarOutput {
+  // ids of structured output requests.
+  std::vector<std::string> structured_output_request_ids;
+  // Bitmask ordered as structured_output_request_ids.
+  TokenBitmask grammar_bitmask;
 };
 
 }  // namespace vllm::v1

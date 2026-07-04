@@ -19,6 +19,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,8 @@
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
+#include "vllm/v1/structured_output/backend_types.h"
+#include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vt/dtype.h"
 
@@ -50,6 +53,11 @@ using vllm::v1::Request;
 using vllm::v1::Scheduler;
 using vllm::v1::SchedulerOutput;
 using vllm::v1::sha256_cbor;
+using vllm::v1::StructuredOutputBackend;
+using vllm::v1::StructuredOutputGrammar;
+using vllm::v1::StructuredOutputManager;
+using vllm::v1::StructuredOutputOptions;
+using vllm::v1::TokenBitmask;
 using vt::DType;
 
 namespace {
@@ -80,9 +88,17 @@ class RunnerStub : public ModelRunnerBase {
     return std::nullopt;                 // MRV2: forward done, no output yet.
   }
 
-  ModelRunnerOutput sample_tokens() override {
+  ModelRunnerOutput sample_tokens(
+      const std::optional<vllm::v1::GrammarOutput>& grammar_output) override {
     ++sample_calls;
     sample_order = ++global_seq_;
+    // Record whether the EngineCore threaded a grammar_output to sampling and,
+    // if so, its structured-req ids (M3.4 Task 2 seam).
+    last_grammar_present = grammar_output.has_value();
+    last_grammar_req_ids.clear();
+    if (grammar_output.has_value()) {
+      last_grammar_req_ids = grammar_output->structured_output_request_ids;
+    }
     // Build the ModelRunnerOutput from the stashed step: one canned token per
     // scheduled request (the test keeps prefills single-step, so every
     // scheduled request completes and samples this step).
@@ -102,6 +118,8 @@ class RunnerStub : public ModelRunnerBase {
   int sample_order = 0;
   int last_total_scheduled = 0;
   std::vector<std::string> last_scheduled_ids;
+  bool last_grammar_present = false;
+  std::vector<std::string> last_grammar_req_ids;
 
  private:
   SchedulerOutput stashed_output_;
@@ -148,6 +166,80 @@ std::unique_ptr<Request> MakeRequest(const std::string& id, int num_tokens = 4) 
   std::vector<int32_t> prompt(num_tokens, /*value=*/std::stoi(id) + 1);
   return std::make_unique<Request>(id, prompt, params, /*arrival_time=*/0.0,
                                    block_hasher);
+}
+
+// --- M3.4 Task 2 (e): structured-output seam mocks -------------------------
+class MockGrammar : public StructuredOutputGrammar {
+ public:
+  bool accept_tokens(const std::string&,
+                     const std::vector<int32_t>&) override {
+    return true;
+  }
+  std::vector<int32_t> validate_tokens(
+      const std::vector<int32_t>& tokens) override {
+    return tokens;
+  }
+  void rollback(int) override {}
+  void fill_bitmask(TokenBitmask& bitmask, int batch_index) override {
+    const int base = batch_index * bitmask.num_words;
+    for (int w = 0; w < bitmask.num_words; ++w) {
+      bitmask.data[base + w] = 0x2A;
+    }
+  }
+  bool is_terminated() override { return false; }
+  void reset() override {}
+};
+
+class MockBackend : public StructuredOutputBackend {
+ public:
+  std::unique_ptr<StructuredOutputGrammar> compile_grammar(
+      StructuredOutputOptions, const std::string&) override {
+    return std::make_unique<MockGrammar>();
+  }
+  TokenBitmask allocate_token_bitmask(int max_num_seqs) override {
+    TokenBitmask m;
+    m.num_seqs = max_num_seqs;
+    m.num_words = 4;  // vocab 100 -> ceil(100/32)
+    m.data.assign(static_cast<std::size_t>(max_num_seqs) * m.num_words, 0);
+    return m;
+  }
+  void destroy() override {}
+};
+
+std::unique_ptr<Request> MakeStructuredRequest(const std::string& id,
+                                               int num_tokens = 4) {
+  static bool none_hash_initialized = false;
+  if (!none_hash_initialized) {
+    init_none_hash(sha256_cbor);
+    none_hash_initialized = true;
+  }
+  auto block_hasher = get_request_block_hasher(16, sha256_cbor);
+  SamplingParams params;
+  params.max_tokens = 16;
+  vllm::StructuredOutputsParams so;
+  so.grammar = R"(root ::= "a")";
+  params.structured_outputs = so;
+  std::vector<int32_t> prompt(num_tokens, /*value=*/std::stoi(id) + 1);
+  return std::make_unique<Request>(id, prompt, params, /*arrival_time=*/0.0,
+                                   block_hasher);
+}
+
+std::unique_ptr<Scheduler> CreateSchedulerWithManager(
+    StructuredOutputManager* mgr) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 10000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  return std::make_unique<Scheduler>(cfg, kv_cfg, /*block_size=*/16,
+                                     /*enable_caching=*/true, mgr);
 }
 
 }  // namespace
@@ -277,4 +369,47 @@ TEST_CASE("EngineCore.abort_requests: finishes the request; next step is empty")
   CHECK_FALSE(model_executed);
   CHECK(runner.execute_calls == 1);
   CHECK(runner.sample_calls == 1);
+}
+
+// ---------------------------------------------------------------------------
+// (e) M3.4 Task 2: EngineCore.step threads the GrammarOutput to sample_tokens.
+// A structured request flows grammar_init (add_request) -> get_grammar_bitmask
+// (step) -> sample_tokens(grammar_output); the runner records receiving it.
+// A plain request threads nullopt (no-op, no regression).
+// ---------------------------------------------------------------------------
+TEST_CASE("EngineCore.step: a structured request threads grammar_output to sample_tokens") {
+  StructuredOutputManager manager(
+      /*max_num_seqs=*/16, []() { return std::make_unique<MockBackend>(); });
+  auto scheduler = CreateSchedulerWithManager(&manager);
+  RunnerStub runner;
+  Executor executor(runner);
+  EngineCore engine(*scheduler, executor, &manager);
+
+  engine.add_request(MakeStructuredRequest("0"));
+  // grammar_init ran in add_request: the grammar was compiled + stored.
+  REQUIRE(scheduler->requests.at("0")->structured_output_request->grammar !=
+          nullptr);
+
+  auto [outputs, model_executed] = engine.step();
+  (void)outputs;
+  CHECK(model_executed);
+  // The EngineCore produced a GrammarOutput and threaded it to sample_tokens.
+  CHECK(runner.last_grammar_present);
+  REQUIRE(runner.last_grammar_req_ids.size() == 1);
+  CHECK(runner.last_grammar_req_ids[0] == "0");
+}
+
+TEST_CASE("EngineCore.step: a plain request threads nullopt grammar_output") {
+  StructuredOutputManager manager(
+      /*max_num_seqs=*/16, []() { return std::make_unique<MockBackend>(); });
+  auto scheduler = CreateSchedulerWithManager(&manager);
+  RunnerStub runner;
+  Executor executor(runner);
+  EngineCore engine(*scheduler, executor, &manager);
+
+  engine.add_request(MakeRequest("0"));
+  engine.step();
+
+  CHECK_FALSE(runner.last_grammar_present);
+  CHECK(runner.last_grammar_req_ids.empty());
 }

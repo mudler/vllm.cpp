@@ -101,7 +101,8 @@ class GPUModelRunner final : public ModelRunnerBase {
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) override;
-  ModelRunnerOutput sample_tokens() override;
+  ModelRunnerOutput sample_tokens(
+      const std::optional<GrammarOutput>& grammar_output) override;
 
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
   InputBatch& input_batch() { return input_batch_; }

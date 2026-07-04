@@ -5,9 +5,20 @@
 
 #include <optional>
 
+#include "vllm/v1/core/sched/output.h"          // GrammarOutput
+#include "vllm/v1/structured_output/manager.h"  // StructuredOutputManager
+
 namespace vllm::v1 {
 
 void EngineCore::add_request(std::unique_ptr<Request> request) {
+  // core.py:870-876 (preprocess_add_request): compile the request's grammar
+  // before scheduling it. Upstream runs this in the input-processing thread; at
+  // T0 it is synchronous here. No-op for a non-structured request or when no
+  // manager is wired.
+  if (structured_output_manager_ != nullptr &&
+      request->use_structured_output()) {
+    structured_output_manager_->grammar_init(*request);
+  }
   // core.py:403 self.scheduler.add_request(request). The upstream request_id
   // type / pooling-task / kv_transfer validation and the abort_immediately
   // hook are deferred (see the file header).
@@ -38,12 +49,16 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   SchedulerOutput scheduler_output = scheduler_.schedule();
 
   // core.py:491-499 execute the forward, then sample. The MRV2 runner's
-  // execute_model returns None ("forward done"), so we always call
-  // sample_tokens; grammar_output is null at T0 (structured output deferred).
+  // execute_model returns None ("forward done"), so we always call sample_tokens.
   std::optional<ModelRunnerOutput> model_output =
       executor_.execute_model(scheduler_output);
+  // core.py:492 grammar_output = self.scheduler.get_grammar_bitmask(...). Nullopt
+  // when no structured request is scheduled (or no manager is wired); threaded to
+  // sample_tokens (Task 3 consumes it).
+  const std::optional<GrammarOutput> grammar_output =
+      scheduler_.get_grammar_bitmask(scheduler_output);
   if (!model_output.has_value()) {
-    model_output = executor_.sample_tokens();
+    model_output = executor_.sample_tokens(grammar_output);
   }
 
   // core.py:503 self._process_aborts_queue() — deferred (no in-flight aborts at

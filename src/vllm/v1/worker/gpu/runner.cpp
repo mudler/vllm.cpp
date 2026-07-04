@@ -292,7 +292,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   return std::nullopt;  // MRV2 split: forward done, sample separately.
 }
 
-ModelRunnerOutput GPUModelRunner::sample_tokens() {
+ModelRunnerOutput GPUModelRunner::sample_tokens(
+    const std::optional<GrammarOutput>& grammar_output) {
+  // grammar_output carries the per-step structured-output bitmask (M3.4 Task 2
+  // threads it here; Task 3 applies it via apply_grammar_bitmask before
+  // sampling). Unused at T0 — the no-grammar path is a no-op.
+  (void)grammar_output;
   ModelRunnerOutput out;
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {

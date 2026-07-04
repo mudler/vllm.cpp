@@ -59,6 +59,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -73,6 +74,8 @@
 
 namespace vllm::v1 {
 
+class StructuredOutputManager;  // vllm/v1/structured_output/manager.h
+
 // The V1 Scheduler (T0 subset). Owns the Request lifetime (a map of owning
 // unique_ptr); running_ and waiting_ hold non-owning raw pointers into it,
 // exactly as upstream where the running list and waiting queue alias the same
@@ -86,8 +89,15 @@ class Scheduler {
   // scheduler_reserve_full_isl, max_model_len) + the kv_cache_config, block
   // size, and the prefix-caching flag (upstream cache_config.enable_prefix_
   // caching). enable_caching is passed straight to the KVCacheManager.
+  // structured_output_manager (upstream core.py:153 passes it into the
+  // Scheduler ctor): the engine's StructuredOutputManager, used by
+  // get_grammar_bitmask + the update_from_output FSM advance. Optional (null) to
+  // stay backward-compatible with the M1.4/M1.8 tests that build a bare
+  // scheduler — when null, structured output is a no-op (get_grammar_bitmask
+  // returns nullopt; no grammar advance).
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
-            int block_size, bool enable_caching = false);
+            int block_size, bool enable_caching = false,
+            StructuredOutputManager* structured_output_manager = nullptr);
 
   // add_request: enqueue a new request into waiting_ and register it in the
   // requests_ map (the scheduler takes ownership). (Upstream add_request T0
@@ -104,6 +114,15 @@ class Scheduler {
 
   // schedule(): the core token-budget algorithm. See the file header.
   SchedulerOutput schedule();
+
+  // get_grammar_bitmask (scheduler.py:1477-1499): collect the scheduled
+  // structured-output request ids (skipping requests still in a prefill chunk),
+  // in num_scheduled_tokens order, and ask the StructuredOutputManager to fill
+  // their per-step token bitmask. Returns nullopt when there are no structured
+  // reqs this step (or no manager is wired). The rows of the returned bitmask are
+  // ordered exactly as GrammarOutput.structured_output_request_ids.
+  std::optional<GrammarOutput> get_grammar_bitmask(
+      const SchedulerOutput& scheduler_output);
 
   // update_from_output: the final leg of the schedule -> execute -> update loop.
   // For each scheduled request (iterating scheduler_output.num_scheduled_tokens,
@@ -180,8 +199,14 @@ class Scheduler {
       const std::map<std::string, KVCacheBlocks>& req_to_new_blocks);
 
   // _update_after_schedule: advance num_computed_tokens for every scheduled
-  // request, refresh is_prefill_chunk, and flush finished/preempted id sets.
-  void update_after_schedule(const SchedulerOutput& scheduler_output);
+  // request, refresh is_prefill_chunk, set has_structured_output_requests, and
+  // flush finished/preempted id sets. Takes scheduler_output by mutable ref (it
+  // writes has_structured_output_requests, matching scheduler.py:1186).
+  void update_after_schedule(SchedulerOutput& scheduler_output);
+
+  // The engine's StructuredOutputManager (upstream scheduler.py:94), or null when
+  // structured output is not wired (M1.4/M1.8 tests). Non-owning.
+  StructuredOutputManager* structured_output_manager_ = nullptr;
 
   SchedulerConfig scheduler_config_;
   KVCacheConfig kv_cache_config_;

@@ -13,7 +13,7 @@
 // DEFERRED upstream Request state, intentionally omitted here — later units
 // slot these in without reshaping the struct:
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
-//     mm_features (multimodal), pooling_params, structured_output_request,
+//     mm_features (multimodal), pooling_params,
 //     lora_request, cache_salt (prefix caching salt), events /
 //     kv_transfer_params, spec_token_ids, priority /
 //     client_index / __lt__ (priority scheduling), streaming / resumable
@@ -47,7 +47,8 @@
 #include <vector>
 
 #include "vllm/sampling_params.h"
-#include "vllm/v1/core/kv_cache_utils.h"  // BlockHash, BlockHasher
+#include "vllm/v1/core/kv_cache_utils.h"       // BlockHash, BlockHasher
+#include "vllm/v1/structured_output/request.h"  // StructuredOutputRequest
 
 namespace vllm::v1 {
 
@@ -130,6 +131,14 @@ struct Request {
   // model's EOS token id (for the stop check) rides on sampling_params, as
   // sampling_params.eos_token_id — read it there, matching upstream check_stop.
   SamplingParams sampling_params;
+  // structured_output_request (request.py:87-92): the per-request structured
+  // output state (constraint params + the compiled grammar), or nullopt when the
+  // request has no structured-output constraint. Populated at construction from
+  // sampling_params.structured_outputs; the grammar is compiled later by the
+  // StructuredOutputManager (grammar_init). Its unique_ptr grammar makes Request
+  // move-only (it was never copied — the scheduler owns it via unique_ptr).
+  std::optional<StructuredOutputRequest> structured_output_request;
+
   // Appended to during decode via AppendOutputToken.
   std::vector<int32_t> output_token_ids;
   int num_computed_tokens = 0;
@@ -187,6 +196,12 @@ struct Request {
   // blocks and append them to block_hashes. No-op when _block_hasher is null.
   // Mirrors upstream Request.update_block_hashes.
   void update_block_hashes();
+
+  // use_structured_output (request.py:243-244): whether this request carries a
+  // structured-output constraint (structured_output_request is set).
+  bool use_structured_output() const {
+    return structured_output_request.has_value();
+  }
 
   // is_finished / get_finished_reason: delegate to RequestStatus.
   bool IsFinished() const;

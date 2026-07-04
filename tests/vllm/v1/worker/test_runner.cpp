@@ -398,7 +398,7 @@ TEST_CASE("runner: four-way ordering identity (mixed decode+prefill)") {
   CHECK(d_tokens_before == 4);
   CHECK(p_tokens_before == 5);
 
-  ModelRunnerOutput mro = runner.sample_tokens();
+  ModelRunnerOutput mro = runner.sample_tokens(std::nullopt);
 
   // The output order + index map match the dense (reordered) order.
   REQUIRE(mro.req_ids.size() == 2);
@@ -511,7 +511,7 @@ TEST_CASE("runner: single-request greedy decode over N steps (KV grows, feedback
   SchedulerOutput s1 =
       NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
   CHECK_FALSE(runner.execute_model(s1).has_value());
-  ModelRunnerOutput m1 = runner.sample_tokens();
+  ModelRunnerOutput m1 = runner.sample_tokens(std::nullopt);
   REQUIRE(m1.sampled_token_ids.size() == 1);
   REQUIRE(m1.sampled_token_ids[0].size() == 1);
   const int32_t tok1 = m1.sampled_token_ids[0][0];
@@ -539,7 +539,7 @@ TEST_CASE("runner: single-request greedy decode over N steps (KV grows, feedback
     // prepare_inputs must have read the previously sampled token as the input.
     CHECK(runner.last_step().input_token_ids == std::vector<int32_t>{prev});
     CHECK(runner.last_step().positions == std::vector<int64_t>{computed});
-    ModelRunnerOutput md = runner.sample_tokens();
+    ModelRunnerOutput md = runner.sample_tokens(std::nullopt);
     REQUIRE(md.sampled_token_ids[0].size() == 1);
     prev = md.sampled_token_ids[0][0];
     computed += 1;
@@ -568,7 +568,7 @@ TEST_CASE("runner: 2-request greedy batch samples each from its own logits row")
        {"B", static_cast<int>(b_prompt.size())}});
 
   CHECK_FALSE(runner.execute_model(so).has_value());
-  ModelRunnerOutput mro = runner.sample_tokens();
+  ModelRunnerOutput mro = runner.sample_tokens(std::nullopt);
 
   REQUIRE(mro.req_ids.size() == 2);
   // Both prefills -> no reorder; dense order == admission order [A, B].

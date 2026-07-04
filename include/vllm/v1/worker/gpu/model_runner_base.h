@@ -21,8 +21,11 @@
 // ABC (see src/vllm/v1/executor/executor.h). DEVIATION recorded in the
 // porting inventory §9 (in-process direct call replaces the worker RPC seam).
 //
+// grammar_output arg to sample_tokens: THREADED as of M3.4 Task 2 (the scheduler
+// produces it via get_grammar_bitmask; nullopt when no structured request is
+// scheduled). Task 3 consumes it (apply_grammar_bitmask before sampling).
+//
 // DEFERRED (marked; slots in without reshaping the interface):
-//   - grammar_output arg to sample_tokens (T0 = null / no structured output),
 //   - non_block / Future return (T0 = synchronous),
 //   - take_draft_token_ids (spec-decode), execute_dummy_batch, the KV-cache
 //     init / profiling / LoRA / pooling RPC methods on WorkerBase.
@@ -50,10 +53,15 @@ class ModelRunnerBase {
   virtual std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) = 0;
 
-  // sample_tokens: gather logits from the stashed hidden states, sample the
-  // next token(s), and produce the ModelRunnerOutput the scheduler consumes.
-  // (grammar_output is deferred at T0 — see the file header.)
-  virtual ModelRunnerOutput sample_tokens() = 0;
+  // sample_tokens: gather logits from the stashed hidden states, apply the
+  // structured-output grammar bitmask (when present), sample the next token(s),
+  // and produce the ModelRunnerOutput the scheduler consumes. grammar_output is
+  // the per-step structured-output payload (nullopt when no structured request
+  // is scheduled); mirrors upstream sample_tokens(grammar_output)
+  // (model_runner.py:1358). M3.4 Task 2 THREADS it here; Task 3 consumes it
+  // (apply_grammar_bitmask before _sample). The no-grammar path is unchanged.
+  virtual ModelRunnerOutput sample_tokens(
+      const std::optional<GrammarOutput>& grammar_output) = 0;
 };
 
 }  // namespace vllm::v1

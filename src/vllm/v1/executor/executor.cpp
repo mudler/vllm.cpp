@@ -11,10 +11,12 @@ std::optional<ModelRunnerOutput> Executor::execute_model(
   return runner_.execute_model(scheduler_output);
 }
 
-ModelRunnerOutput Executor::sample_tokens() {
+ModelRunnerOutput Executor::sample_tokens(
+    const std::optional<GrammarOutput>& grammar_output) {
   // Upstream: output = collective_rpc("sample_tokens", args=(grammar_output,));
-  // return output[0]. grammar_output is null at T0 (structured output deferred).
-  return runner_.sample_tokens();
+  // return output[0]. Forward the scheduler's structured-output payload to the
+  // runner (nullopt when no structured request is scheduled).
+  return runner_.sample_tokens(grammar_output);
 }
 
 }  // namespace vllm::v1

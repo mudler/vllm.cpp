@@ -14,7 +14,8 @@
 #include <utility>
 #include <vector>
 
-#include "vllm/v1/core/sched/utils.h"  // check_stop
+#include "vllm/v1/core/sched/utils.h"           // check_stop
+#include "vllm/v1/structured_output/manager.h"  // StructuredOutputManager
 
 namespace vllm::v1 {
 
@@ -36,11 +37,13 @@ SchedulingPolicy ToQueuePolicy(SchedulerPolicy policy) {
 
 Scheduler::Scheduler(SchedulerConfig scheduler_config,
                      KVCacheConfig kv_cache_config, int block_size,
-                     bool enable_caching)
+                     bool enable_caching,
+                     StructuredOutputManager* structured_output_manager)
     : max_num_running_reqs(scheduler_config.max_num_seqs),
       max_num_scheduled_tokens(
           scheduler_config.ResolvedMaxNumScheduledTokens()),
       max_model_len(scheduler_config.max_model_len),
+      structured_output_manager_(structured_output_manager),
       scheduler_config_(scheduler_config),
       kv_cache_config_(kv_cache_config),
       long_prefill_token_threshold_(
@@ -319,6 +322,46 @@ SchedulerOutput Scheduler::schedule() {
   return scheduler_output;
 }
 
+std::optional<GrammarOutput> Scheduler::get_grammar_bitmask(
+    const SchedulerOutput& scheduler_output) {
+  // scheduler.py:1477-1499.
+  // Collect the scheduled request ids that use structured output. The
+  // corresponding rows of the bitmask will be in this order.
+  if (!scheduler_output.has_structured_output_requests) {
+    return std::nullopt;
+  }
+  // Without a manager wired, structured output is a no-op (backward-compat with
+  // the M1.4/M1.8 tests). Upstream always has a manager.
+  if (structured_output_manager_ == nullptr) {
+    return std::nullopt;
+  }
+
+  std::vector<std::string> structured_output_request_ids;
+  for (const auto& [req_id, num_tokens] : scheduler_output.num_scheduled_tokens) {
+    (void)num_tokens;
+    auto it = requests.find(req_id);
+    if (it != requests.end() && it->second->use_structured_output() &&
+        !it->second->is_prefill_chunk) {
+      structured_output_request_ids.push_back(req_id);
+    }
+  }
+  if (structured_output_request_ids.empty()) {
+    return std::nullopt;
+  }
+
+  std::optional<TokenBitmask> bitmask = structured_output_manager_->grammar_bitmask(
+      requests, structured_output_request_ids,
+      scheduler_output.scheduled_spec_decode_tokens);
+  if (!bitmask.has_value()) {
+    return std::nullopt;
+  }
+
+  GrammarOutput out;
+  out.structured_output_request_ids = std::move(structured_output_request_ids);
+  out.grammar_bitmask = std::move(*bitmask);
+  return out;
+}
+
 EngineCoreOutputs Scheduler::update_from_output(
     const SchedulerOutput& scheduler_output,
     const ModelRunnerOutput& model_runner_output) {
@@ -378,7 +421,24 @@ EngineCoreOutputs Scheduler::update_from_output(
         }
       }
     }
-    // DEFERRED: pooling stop, structured-output grammar accept.
+    // DEFERRED: pooling stop.
+
+    // scheduler.py:1636-1651: advance the structured-output FSM by the sampled
+    // tokens. Only when the request produced tokens and the manager says the FSM
+    // should advance (should_advance is true for any structured request at T0).
+    // A grammar that rejects the sampled tokens is unexpected: terminate the
+    // request with FINISHED_ERROR. No-op when no manager is wired.
+    if (!new_token_ids.empty() && structured_output_manager_ != nullptr &&
+        structured_output_manager_->should_advance(*request)) {
+      auto& struct_output_request = request->structured_output_request;
+      assert(struct_output_request.has_value());
+      assert(struct_output_request->grammar != nullptr);
+      if (!struct_output_request->grammar->accept_tokens(req_id, new_token_ids)) {
+        request->status = RequestStatus::kFinishedError;
+        // (upstream also sets request.resumable = false; resumable is deferred.)
+        stopped = true;
+      }
+    }
 
     std::optional<FinishReason> finish_reason;
     if (stopped) {
@@ -485,7 +545,7 @@ CachedRequestData Scheduler::make_cached_request_data(
   return data;
 }
 
-void Scheduler::update_after_schedule(const SchedulerOutput& scheduler_output) {
+void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   // Advance num_computed_tokens AFTER building the output so a chunked prefill
   // resumes on the next step; refresh is_prefill_chunk.
   for (const auto& [req_id, num_scheduled_token] :
@@ -495,6 +555,10 @@ void Scheduler::update_after_schedule(const SchedulerOutput& scheduler_output) {
     // num_output_placeholders == 0 at T0.
     request->is_prefill_chunk =
         request->num_computed_tokens < request->NumTokens();
+    // scheduler.py:1186: a structured request that is past its prefill chunk
+    // needs a grammar bitmask this step.
+    scheduler_output.has_structured_output_requests |=
+        request->use_structured_output() && !request->is_prefill_chunk;
   }
   // Flush the finished / preempted id sets (assign fresh sets so the already
   // copied-out scheduler_output is unaffected).

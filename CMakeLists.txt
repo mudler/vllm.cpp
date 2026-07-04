@@ -94,6 +94,8 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/runner.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
+  src/vllm/v1/structured_output/backend_types.cpp
+  src/vllm/v1/structured_output/request.cpp
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vllm/v1/engine/core.cpp

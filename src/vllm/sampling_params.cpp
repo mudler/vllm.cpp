@@ -132,7 +132,44 @@ void SamplingParams::VerifyGreedySampling() const {
   }
 }
 
+void StructuredOutputsParams::Verify() const {
+  // __post_init__ (sampling_params.py:90-111): exactly one constraint field.
+  const int count = (json.has_value() ? 1 : 0) + (regex.has_value() ? 1 : 0) +
+                    (choice.has_value() ? 1 : 0) +
+                    (grammar.has_value() ? 1 : 0) +
+                    (json_object.has_value() ? 1 : 0) +
+                    (structural_tag.has_value() ? 1 : 0);
+  if (count > 1) {
+    throw std::runtime_error(
+        "You can only use one kind of structured outputs constraint but "
+        "multiple are specified.");
+  }
+  if (count < 1) {
+    throw std::runtime_error(
+        "You must use one kind of structured outputs constraint but none are "
+        "specified.");
+  }
+}
+
+bool StructuredOutputsParams::all_constraints_none() const {
+  // sampling_params.py:113-127.
+  return !json.has_value() && !regex.has_value() && !choice.has_value() &&
+         !grammar.has_value() && !json_object.has_value() &&
+         !structural_tag.has_value();
+}
+
+bool StructuredOutputsParams::all_non_structural_tag_constraints_none() const {
+  // sampling_params.py:129-142.
+  return !json.has_value() && !regex.has_value() && !choice.has_value() &&
+         !grammar.has_value() && !json_object.has_value();
+}
+
 void SamplingParams::PostInit() {
+  if (structured_outputs.has_value()) {
+    // Upstream runs StructuredOutputsParams.__post_init__ at its construction;
+    // as a plain struct here it is validated at the enclosing PostInit().
+    structured_outputs->Verify();
+  }
   if (temperature > 0.0 && temperature < kMaxTemp) {
     // Maxed out to _MAX_TEMP to avoid nan/inf in downstream tensors.
     temperature = std::max(temperature, kMaxTemp);

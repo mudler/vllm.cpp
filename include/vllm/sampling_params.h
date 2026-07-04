@@ -7,8 +7,9 @@
 //
 // DEFERRED (T1/T2) upstream fields, intentionally omitted here — a future
 // porter slots them in without reshaping the struct:
-//   - structured_outputs (StructuredOutputsParams), logit_bias,
+//   - logit_bias,
 //     allowed_token_ids, bad_words / _bad_words_token_ids, extra_args
+//   (structured_outputs (StructuredOutputsParams) is now ported below — M3.4)
 //   - logprob_token_ids, flat_logprobs, num_logprobs()
 //   - thinking_token_budget, repetition_detection (RepetitionDetectionParams),
 //     routed_experts_prompt_start, skip_reading_prefix_cache
@@ -64,6 +65,52 @@ enum class RequestOutputKind : int {
   kFinalOnly = 2,
 };
 
+// StructuredOutputsParams (sampling_params.py:72-142 @ e24d1b24). Exactly one
+// of json / json_object / regex / choice / grammar / structural_tag selects the
+// structured-output constraint; the rest are lowering options. Field names 1:1
+// with upstream.
+//
+// DEVIATIONS, recorded:
+//   - upstream `json: str | dict | None` — here std::optional<std::string>: the
+//     caller (OpenAI response_format layer, M3.4 Task 5) pre-serializes a dict
+//     schema to its JSON string, mirroring upstream's `json.dumps` str branch in
+//     get_structured_output_key.
+//   - upstream `json_object: bool | None = None` — kept as std::optional<bool>
+//     so has_value() faithfully mirrors upstream's `is not None` in the
+//     mutual-exclusion count (a bare bool cannot distinguish unset from False).
+//   - `_backend` / `_backend_was_auto` are init=False upstream (set only by the
+//     Processor); ported as `backend` / `backend_was_auto`.
+struct StructuredOutputsParams {
+  // One of these selects the constraint (sampling_params.py:73-78).
+  std::optional<std::string> json;
+  std::optional<std::string> regex;
+  std::optional<std::vector<std::string>> choice;
+  std::optional<std::string> grammar;
+  std::optional<bool> json_object;
+  // Other lowering options (sampling_params.py:80-83).
+  bool disable_any_whitespace = false;
+  bool disable_additional_properties = false;
+  std::optional<std::string> whitespace_pattern;
+  std::optional<std::string> structural_tag;
+  // sampling_params.py:85-88 (_backend / _backend_was_auto): CAUTION — set only
+  // by the Processor's structured-output validation.
+  std::optional<std::string> backend;
+  bool backend_was_auto = false;
+
+  // __post_init__ (sampling_params.py:90-111): exactly one constraint field must
+  // be set. Throws std::runtime_error (upstream ValueError) on count != 1. Not
+  // run automatically for a plain struct — SamplingParams::PostInit() calls it.
+  void Verify() const;
+
+  // all_constraints_none (sampling_params.py:113-127): true iff none of the six
+  // constraint fields is set.
+  bool all_constraints_none() const;
+
+  // all_non_structural_tag_constraints_none (sampling_params.py:129-142): true
+  // iff none of the five non-structural-tag constraint fields is set.
+  bool all_non_structural_tag_constraints_none() const;
+};
+
 // Sampling parameters for text generation (T0 field subset). Defaults match
 // upstream SamplingParams exactly.
 struct SamplingParams {
@@ -109,6 +156,11 @@ struct SamplingParams {
   bool include_stop_str_in_output = false;
   // How much output each RequestOutput carries.
   RequestOutputKind output_kind = RequestOutputKind::kCumulative;
+
+  // structured_outputs (SamplingParams.structured_outputs @ e24d1b24): the
+  // structured-output / guided-decoding constraint, or unset. PostInit()
+  // validates it (mutual exclusion) when present.
+  std::optional<StructuredOutputsParams> structured_outputs;
 
   // The model's EOS token id. Upstream: `_eos_token_id` — a non-init field set
   // engine-side by update_from_generation_config, exposed via the read-only

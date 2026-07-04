@@ -13,7 +13,8 @@ Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
 
 **Status: exit criterion MET (safetensors) ✅ — Qwen3.6-35B greedy-decodes
 16/16 tokens token-for-token vs the pinned oracle on GB10 (`25326fc`). GGUF
-model load (M0.10, k-quant dequant) remains open (T0).**
+model load (M0.10, k-quant dequant) DONE on the CPU path (`6ef3f12`); real APEX
+GGUF greedy parity vs safetensors remains dgx-pending (T0).**
 
 - ✅ **M0.1 Build skeleton** (`411c072`): CMake (host + CUDA sm_121),
   third_party vendoring (doctest v2.5.2, nlohmann/json v3.12.0, cpp-httplib

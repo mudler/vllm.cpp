@@ -13,8 +13,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "vt/ops.h"
 
@@ -24,6 +26,15 @@ namespace {
 constexpr int kBlock = 256;
 // CUDA grid.y is limited to 65535; sequence/batch counts map to grid.y below.
 constexpr int64_t kMaxGridY = 65535;
+// FLA chunk size (fla/ops/utils.py FLA_CHUNK_SIZE=64). The chunked GDN prefill
+// scan (below) processes tokens in chunks of this many; the intra-chunk work is
+// parallel across chunks and the cross-chunk state recurrence is sequential.
+constexpr int kChunk = 64;
+// Head-dim ceiling for the chunked path: local per-column arrays are sized to
+// kChunk and the delta-h kernel stages the [Dv,Dk] state in shared memory
+// (Dv*Dk*4B). Dk=Dv=128 is the real gate dim; larger dims fall back to the
+// sequential scan (which strides arbitrary dims).
+constexpr int64_t kChunkMaxDim = 128;
 
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -436,9 +447,378 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
   }
 }
 
+// ===========================================================================
+// Chunk-parallel GDN prefill scan (gdn-semantics.md §7 "chunked oracle").
+//
+// Mirrors vLLM's FLA chunked gated delta rule (fla/ops/chunk.py + sub-ops).
+// The sequential GdnScanKernel carries the [Dv,Dk] state one token at a time,
+// so a T-token prefill has sequential depth T. This path splits the sequence
+// into chunks of kChunk tokens: the intra-chunk work (steps A/B/D below) is
+// INDEPENDENT across chunks (parallel across the whole grid), and only the
+// cross-chunk state recurrence (step C) is sequential — depth ceil(T/kChunk).
+//
+// Math (derived from the sequential recurrence; exact up to fp reassociation,
+// validated chunked-vs-sequential on GB10):
+//   G = local cumsum of the log-decay g within each chunk (inclusive).
+//   A[i,j] = beta_i * exp(G_i - G_j) * (k_i . k_j),  j<i   (chunk_scaled_dot_kkt)
+//   u = (I+A)^{-1} (beta (.) v)                            (solve_tril+recompute_w_u)
+//   w = (I+A)^{-1} (beta (.) exp(G) (.) k)                 (fused via fwd-subst)
+//   v_new = u - w @ h_start^T                              (chunk_delta_h)
+//   h_end = h_start*exp(G_last) + sum_i k_i (x) v_new_i*exp(G_last-G_i)
+//   o_i   = scale * exp(G_i) * ( q_i.h_start[v]
+//                              + sum_{j<=i} exp(-G_j)(q_i.k_j) v_new_j )  (chunk_fwd_o)
+// (I+A) is unit lower-triangular so u,w are obtained by forward substitution,
+// which replaces the explicit solve_tril inverse — numerically equivalent, and
+// still fully chunk-parallel because each column solves independently.
+//
+// vllm.cpp original (inventory deviation §9): an original fused CUDA kernel set
+// structured to map onto the FLA sub-ops (cumsum / scaled_dot_kkt+solve_tril+
+// wy / chunk_delta_h / chunk_fwd_o) so a future csrc/FLA drop-in is mechanical.
+
+bool ChunkedPrefillEnabled() {
+  // A/B toggle: default ON. VT_GDN_CHUNKED=0 falls back to the sequential scan.
+  // Read each call (prefill is coarse-grained, so getenv cost is negligible and
+  // it lets the unit test drive both paths in one process).
+  const char* e = std::getenv("VT_GDN_CHUNKED");
+  return e == nullptr || e[0] != '0';
+}
+
+// Step A — chunk_local_cumsum (fla/ops/cumsum.py): inclusive prefix sum of g
+// within each chunk, per (chunk, v-head). One block per (chunk, v-head).
+__global__ void GdnChunkCumsumKernel(float* gcum, const float* g, const int32_t* tok0a,
+                                     const int32_t* lena, int64_t hv_n) {
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  if (threadIdx.x != 0) return;  // tiny (<=kChunk) serial scan per chunk-head
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  float acc = 0.0f;
+  for (int64_t i = 0; i < len; ++i) {
+    acc += g[(tok0 + i) * hv_n + hv];
+    gcum[(tok0 + i) * hv_n + hv] = acc;
+  }
+}
+
+// Step B — chunk_scaled_dot_kkt + solve_tril + recompute_w_u fused
+// (fla/ops/{chunk_scaled_dot_kkt,solve_tril,wy_fast}.py). One block per
+// (chunk, v-head): build K K^T in shared, then forward-substitute the two
+// WY columns u (from beta.v) and w (from beta.exp(G).k). Each output column
+// (vi for u, ki for w) is an independent forward solve → no cross-thread
+// dependency in the substitution.
+template <typename Tin>
+__global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
+                                 const float* beta, const float* gcum, const int32_t* tok0a,
+                                 const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
+                                 int64_t dv) {
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  __shared__ float kk[kChunk * kChunk];  // K K^T (row i, col j)
+  __shared__ float bs[kChunk];           // beta
+  __shared__ float eg[kChunk];           // exp(G_i)
+  __shared__ float egi[kChunk];          // 1/exp(G_i)
+  for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
+    bs[i] = beta[(tok0 + i) * hv_n + hv];
+    const float e = expf(gcum[(tok0 + i) * hv_n + hv]);
+    eg[i] = e;
+    egi[i] = 1.0f / e;
+  }
+  __syncthreads();
+  for (int64_t idx = threadIdx.x; idx < len * len; idx += blockDim.x) {
+    const int64_t i = idx / len, j = idx % len;
+    float dot = 0.0f;
+    const int64_t ib = (tok0 + i) * hk_n * dk + hk * dk;
+    const int64_t jb = (tok0 + j) * hk_n * dk + hk * dk;
+    for (int64_t d = 0; d < dk; ++d) dot += Load(k, ib + d) * Load(k, jb + d);
+    kk[i * kChunk + j] = dot;
+  }
+  __syncthreads();
+  // u column vi: u_i = beta_i (v_i - eG_i * sum_{j<i} KK[i,j] * (u_j/eG_j))
+  for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x) {
+    float ucol[kChunk], us[kChunk];
+    for (int64_t i = 0; i < len; ++i) {
+      float s = 0.0f;
+      for (int64_t j = 0; j < i; ++j) s += kk[i * kChunk + j] * us[j];
+      const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
+      const float ui = bs[i] * (vi_val - eg[i] * s);
+      ucol[i] = ui;
+      us[i] = ui * egi[i];
+    }
+    for (int64_t i = 0; i < len; ++i) u[(tok0 + i) * hv_n * dv + hv * dv + vi] = ucol[i];
+  }
+  // w column ki: w_i = beta_i eG_i (k_i - sum_{j<i} KK[i,j] * (w_j/eG_j))
+  for (int64_t ki = threadIdx.x; ki < dk; ki += blockDim.x) {
+    float wcol[kChunk], ws[kChunk];
+    for (int64_t i = 0; i < len; ++i) {
+      float s = 0.0f;
+      for (int64_t j = 0; j < i; ++j) s += kk[i * kChunk + j] * ws[j];
+      const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
+      const float wi = bs[i] * eg[i] * (ki_val - s);
+      wcol[i] = wi;
+      ws[i] = wi * egi[i];
+    }
+    for (int64_t i = 0; i < len; ++i) w[(tok0 + i) * hv_n * dk + hv * dk + ki] = wcol[i];
+  }
+}
+
+// Step C — chunk_delta_h (fla/ops/chunk_delta_h.py): the cross-chunk state
+// recurrence. One block per (sequence, v-head), SEQUENTIAL over the sequence's
+// chunks. The running [Dv,Dk] state lives in shared memory; each chunk snapshots
+// its start state into hstate (consumed by step D), emits v_new, and advances
+// the state. This is the only sequential-across-chunks kernel.
+template <typename Tin>
+__global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, const Tin* k,
+                                     const float* u, const float* w, const float* gcum,
+                                     const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                     int64_t dk, int64_t hv_n, int64_t dv) {
+  const int64_t n = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;
+  extern __shared__ float hsh[];  // [Dv, Dk] running state
+  float* s_head = state + (n * hv_n + hv) * sd;
+  for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hsh[e] = s_head[e];
+  __syncthreads();
+  const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  for (int64_t it = 0; it < nt; ++it) {
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * kChunk;
+    const int64_t rem = seqlen - it * kChunk;
+    const int64_t len = rem < kChunk ? rem : kChunk;
+    float* hstart = hstate + gc * sd;  // chunk-start snapshot for step D
+    for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hstart[e] = hsh[e];
+    __syncthreads();
+    // v_new[i,vi] = u[i,vi] - sum_ki w[i,ki] * hsh[vi,ki]
+    for (int64_t idx = threadIdx.x; idx < len * dv; idx += blockDim.x) {
+      const int64_t i = idx / dv, vi = idx % dv;
+      float acc = u[(tok0 + i) * hv_n * dv + hv * dv + vi];
+      const int64_t wb = (tok0 + i) * hv_n * dk + hv * dk;
+      const float* hrow = hsh + vi * dk;
+      for (int64_t d = 0; d < dk; ++d) acc -= w[wb + d] * hrow[d];
+      v_new[(tok0 + i) * hv_n * dv + hv * dv + vi] = acc;
+    }
+    __syncthreads();
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    // hsh[vi,ki] = hsh[vi,ki]*exp(G_last) + sum_i k[i,ki]*v_new[i,vi]*exp(G_last-G_i)
+    for (int64_t idx = threadIdx.x; idx < sd; idx += blockDim.x) {
+      const int64_t vi = idx / dk, ki = idx % dk;
+      float acc = hsh[idx] * eglast;
+      for (int64_t i = 0; i < len; ++i) {
+        const float decay = eglast * expf(-gcum[(tok0 + i) * hv_n + hv]);
+        acc += Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) *
+               v_new[(tok0 + i) * hv_n * dv + hv * dv + vi] * decay;
+      }
+      hsh[idx] = acc;
+    }
+    __syncthreads();
+  }
+  for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) s_head[e] = hsh[e];  // final state
+}
+
+// Step D — chunk_fwd_o (fla/ops/chunk_o.py): the output. One block per
+// (chunk, v-head): the cross-chunk term q.h_start plus the intra-chunk causal
+// term sum_{j<=i} exp(G_i-G_j)(q_i.k_j) v_new_j, both scaled.
+template <typename Tin, typename Tout>
+__global__ void GdnChunkOKernel(Tout* out, const Tin* q, const Tin* k, const float* v_new,
+                                const float* hstate, const float* gcum, const int32_t* tok0a,
+                                const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
+                                int64_t dv, float scale) {
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int64_t sd = dv * dk;
+  const float* hstart = hstate + gc * sd;
+  __shared__ float qk[kChunk * kChunk];  // q_i . k_j
+  __shared__ float eg[kChunk];           // exp(G_i)
+  __shared__ float egi[kChunk];          // 1/exp(G_i)
+  for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
+    const float e = expf(gcum[(tok0 + i) * hv_n + hv]);
+    eg[i] = e;
+    egi[i] = 1.0f / e;
+  }
+  __syncthreads();
+  for (int64_t idx = threadIdx.x; idx < len * len; idx += blockDim.x) {
+    const int64_t i = idx / len, j = idx % len;
+    float dot = 0.0f;
+    const int64_t ib = (tok0 + i) * hk_n * dk + hk * dk;
+    const int64_t jb = (tok0 + j) * hk_n * dk + hk * dk;
+    for (int64_t d = 0; d < dk; ++d) dot += Load(q, ib + d) * Load(k, jb + d);
+    qk[i * kChunk + j] = dot;
+  }
+  __syncthreads();
+  for (int64_t idx = threadIdx.x; idx < len * dv; idx += blockDim.x) {
+    const int64_t i = idx / dv, vi = idx % dv;
+    // cross-chunk: q_i . h_start[vi,:]
+    float cross = 0.0f;
+    const int64_t qb = (tok0 + i) * hk_n * dk + hk * dk;
+    const float* hrow = hstart + vi * dk;
+    for (int64_t d = 0; d < dk; ++d) cross += Load(q, qb + d) * hrow[d];
+    // intra-chunk causal: sum_{j<=i} QK[i,j] * (v_new_j / eG_j)
+    float intra = 0.0f;
+    for (int64_t j = 0; j <= i; ++j)
+      intra += qk[i * kChunk + j] * egi[j] * v_new[(tok0 + j) * hv_n * dv + hv * dv + vi];
+    const float o = scale * eg[i] * (cross + intra);
+    Store(out, (tok0 + i) * hv_n * dv + hv * dv + vi, o);
+  }
+}
+
+template <typename Tin, typename Tout>
+void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                          const std::vector<int32_t>& tok0h,
+                          const std::vector<int32_t>& lenh, const std::vector<int32_t>& bohh,
+                          const Tensor& qsl, int64_t n_seq, int64_t nt_tot, const GdnArgs& args) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  const int64_t t_tot = out.shape[0];
+
+  // Device scratch (stream-ordered; freed after the kernels on the same stream).
+  float* gcum = nullptr;
+  float* u = nullptr;
+  float* w = nullptr;
+  float* v_new = nullptr;
+  float* hstate = nullptr;
+  int32_t* d_tok0 = nullptr;
+  int32_t* d_len = nullptr;
+  int32_t* d_boh = nullptr;
+  Check(cudaMallocAsync(&gcum, static_cast<size_t>(t_tot * hv_n) * sizeof(float), s),
+        "gdn chunked gcum alloc");
+  Check(cudaMallocAsync(&u, static_cast<size_t>(t_tot * hv_n * dv) * sizeof(float), s),
+        "gdn chunked u alloc");
+  Check(cudaMallocAsync(&w, static_cast<size_t>(t_tot * hv_n * dk) * sizeof(float), s),
+        "gdn chunked w alloc");
+  Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_tot * hv_n * dv) * sizeof(float), s),
+        "gdn chunked v_new alloc");
+  Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(float), s),
+        "gdn chunked hstate alloc");
+  Check(cudaMallocAsync(&d_tok0, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
+        "gdn chunked tok0 alloc");
+  Check(cudaMallocAsync(&d_len, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
+        "gdn chunked len alloc");
+  Check(cudaMallocAsync(&d_boh, static_cast<size_t>(n_seq) * sizeof(int32_t), s),
+        "gdn chunked boh alloc");
+  Check(cudaMemcpyAsync(d_tok0, tok0h.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, s),
+        "gdn chunked tok0 upload");
+  Check(cudaMemcpyAsync(d_len, lenh.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, s),
+        "gdn chunked len upload");
+  Check(cudaMemcpyAsync(d_boh, bohh.data(), static_cast<size_t>(n_seq) * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, s),
+        "gdn chunked boh upload");
+  // The host index vectors must outlive the async uploads; the caller syncs the
+  // stream before they go out of scope.
+
+  const dim3 grid_chunk(static_cast<unsigned>(nt_tot), static_cast<unsigned>(hv_n));
+  const dim3 grid_seq(static_cast<unsigned>(n_seq), static_cast<unsigned>(hv_n));
+
+  GdnChunkCumsumKernel<<<grid_chunk, 32, 0, s>>>(gcum, g.Ptr<float>(), d_tok0, d_len, hv_n);
+  Check(cudaGetLastError(), "gdn chunked cumsum launch");
+
+  GdnChunkWUKernel<Tin><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),
+                                                   beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n,
+                                                   dk, hv_n, dv);
+  Check(cudaGetLastError(), "gdn chunked wu launch");
+
+  const size_t hsh_bytes = static_cast<size_t>(dv * dk) * sizeof(float);
+  auto* delta_kernel = GdnChunkDeltaHKernel<Tin>;
+  if (hsh_bytes > 48 * 1024) {
+    Check(cudaFuncSetAttribute(delta_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(hsh_bytes)),
+          "gdn chunked delta_h shared opt-in");
+  }
+  delta_kernel<<<grid_seq, 256, hsh_bytes, s>>>(state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(),
+                                                u, w, gcum, qsl.Ptr<int32_t>(), d_boh, hk_n, dk,
+                                                hv_n, dv);
+  Check(cudaGetLastError(), "gdn chunked delta_h launch");
+
+  GdnChunkOKernel<Tin, Tout><<<grid_chunk, 256, 0, s>>>(out.Ptr<Tout>(), q_in.Ptr<Tin>(),
+                                                        k.Ptr<Tin>(), v_new, hstate, gcum,
+                                                        d_tok0, d_len, hk_n, dk, hv_n, dv,
+                                                        args.scale);
+  Check(cudaGetLastError(), "gdn chunked o launch");
+
+  Check(cudaFreeAsync(gcum, s), "gdn chunked gcum free");
+  Check(cudaFreeAsync(u, s), "gdn chunked u free");
+  Check(cudaFreeAsync(w, s), "gdn chunked w free");
+  Check(cudaFreeAsync(v_new, s), "gdn chunked v_new free");
+  Check(cudaFreeAsync(hstate, s), "gdn chunked hstate free");
+  Check(cudaFreeAsync(d_tok0, s), "gdn chunked tok0 free");
+  Check(cudaFreeAsync(d_len, s), "gdn chunked len free");
+  Check(cudaFreeAsync(d_boh, s), "gdn chunked boh free");
+}
+
+void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                           const Tensor& qsl, const GdnArgs& args) {
+  VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
+           "cuda gdn_prefill(chunked): unsupported q dtype (f32/bf16 only)");
+  VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+           "cuda gdn_prefill(chunked): q/k/v dtypes must match");
+  const int64_t n_seq = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+                dk = state.shape[3];
+  if (n_seq == 0 || hv_n == 0 || dv == 0) return;
+  const int64_t hk_n = q_in.shape[1];
+  VT_CHECK(hk_n > 0 && hv_n % hk_n == 0,
+           "cuda gdn_prefill(chunked): Hv must be a multiple of Hk");
+  cudaStream_t s = AsStream(q);
+
+  // Host chunk layout from query_start_loc (small D2H copy + sync — negligible
+  // vs a whole prefill; the sequential path avoids it, this path needs the
+  // per-sequence chunk counts to size scratch and grids).
+  std::vector<int32_t> qslh(static_cast<size_t>(n_seq) + 1);
+  Check(cudaMemcpyAsync(qslh.data(), qsl.Ptr<int32_t>(),
+                        (static_cast<size_t>(n_seq) + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                        s),
+        "gdn chunked qsl download");
+  Check(cudaStreamSynchronize(s), "gdn chunked qsl sync");
+
+  std::vector<int32_t> tok0h, lenh, bohh(static_cast<size_t>(n_seq));
+  int32_t nt_tot = 0;
+  for (int64_t n = 0; n < n_seq; ++n) {
+    bohh[static_cast<size_t>(n)] = nt_tot;
+    const int32_t begin = qslh[static_cast<size_t>(n)];
+    const int32_t len = qslh[static_cast<size_t>(n) + 1] - begin;
+    const int32_t nt = (len + kChunk - 1) / kChunk;
+    for (int32_t it = 0; it < nt; ++it) {
+      const int32_t rem = len - it * kChunk;
+      tok0h.push_back(begin + it * kChunk);
+      lenh.push_back(rem < kChunk ? rem : kChunk);
+    }
+    nt_tot += nt;
+  }
+  if (nt_tot == 0) return;
+
+  if (q_in.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchChunkedPrefill<float, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh, bohh,
+                                         qsl, n_seq, nt_tot, args);
+    else
+      LaunchChunkedPrefill<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
+                                                 bohh, qsl, n_seq, nt_tot, args);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchChunkedPrefill<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
+                                                 bohh, qsl, n_seq, nt_tot, args);
+    else
+      LaunchChunkedPrefill<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h,
+                                                         lenh, bohh, qsl, n_seq, nt_tot, args);
+  }
+  // Keep the host index vectors alive until every async upload has completed.
+  Check(cudaStreamSynchronize(s), "gdn chunked launch sync");
+}
+
 void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                           const Tensor& qsl, const GdnArgs& args) {
+  const int64_t dv = state.shape[2], dk = state.shape[3];
+  // Chunked path (default) for real head dims; the sequential scan handles the
+  // arbitrary-dim corners (the CUDA op tests exercise Dv=Dk=300) and the A/B
+  // fallback (VT_GDN_CHUNKED=0).
+  if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f) {
+    GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
+    return;
+  }
   GdnScanCuda(q, out, q_in, k, v, g, beta, state, qsl.Ptr<int32_t>(), args, "gdn_prefill");
 }
 

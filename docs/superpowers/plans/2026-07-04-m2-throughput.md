@@ -3,12 +3,14 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. This is GPU-kernel work — build + validate on GB10 via `ssh dgx.casa` (non-interactive SSH works; sync `~/work/vllm.cpp`, `export PATH=/usr/local/cuda/bin:$PATH`, build `-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121`).
 
 **Goal:** Close gate #1 — throughput parity vs vLLM for Qwen3.6-35B-A3B-NVFP4 on GB10 at
-large concurrency (prefill + decode). **First CLEAN free-box measurement (2026-07-04, GB10,
-0% contention, 8×1024×128 enforce-eager): vLLM 0.24.0 = 1124 total / 124.9 output tok/s;
-ours = 70.2 total / 7.8 output → ~16× slower** (down from ~1000× at M2 start). The M2.1
-harness (`examples/bench` → `vllm-bench`) measures our side; run `vllm bench throughput` on
-`~/venvs/vllm-oracle` (`ninja` on PATH) for the baseline. Record numbers here as each kernel
-lands. STANDING DIRECTIVE: always compare vs vLLM apples-to-apples (AGENTS.md, gates.md).
+large concurrency (prefill + decode). **Latest free-box measurement (2026-07-04, GB10, 0%
+contention, 8×1024×128 enforce-eager, AFTER M2.7): vLLM 0.24.0 = 1181.78 total / 131.31 output
+tok/s; ours = 157.27 total / 17.47 output → ~7.5× slower** (down from ~1000× at M2 start, and
+from ~16.8× before M2.7). The M2.1 harness (`examples/bench` → `vllm-bench`) measures our side;
+run `vllm bench throughput` on `~/venvs/vllm-oracle` (`ninja` on PATH) for the baseline. Record
+numbers here as each kernel lands. STANDING DIRECTIVE: always compare vs vLLM apples-to-apples,
+and STATE THE CONFIG each time — ~7.5× is vs enforce-eager (1181/131); the gap vs full-graph
+vLLM (1377/153) is larger (AGENTS.md, gates.md §PROTOCOL DIRECTIVE).
 
 **THE PROFILE — v3 (2026-07-04, nsys free-box, load-bearing; SUPERSEDES the v1 "GPU-idle,
 CPU-dequant-bound" and v2 "88% host-API launch-overhead" theories — BOTH now fixed).** After
@@ -29,12 +31,28 @@ launch overhead is already hidden behind the GPU. The remaining ~16× is raw fp4
 
 ## Priority order (highest-leverage first, per the v3 GPU-compute-bound profile)
 
-### M2.7 — tensor-core NVFP4 MMA GEMM (THE prefill unlock — IN PROGRESS 2026-07-04)
-Move the fp4 W4A16 GEMMs (MoE grouped + dense projections) off hand-tiled CUDA cores onto
-tensor cores: dequant the fp4 weight tile into shared memory as bf16 (group-16 fp8 scale + f32
-scale2), then `mma.sync`/`wmma` bf16×bf16 MMA, f32 acc. Attacks ~75% of prefill. Stretch:
-native block-scaled fp4 MMA (sm_121 tcgen05) skipping the bf16 materialization. Correctness:
-new-MMA == old-tiled (synthetic) → paged gate 16/16 → measure prefill TTFT vs vLLM.
+### PROFILE MOVED after M2.7 (2026-07-04, `bc0a8d7`) — re-profile the prefill
+M2.7 landed and the fp4 MoE GEMM dropped **70.7% → 11.6%** of prefill. The prefill bottleneck
+is now **`GdnScanKernel` = 63.8%** (the gated-delta-net recurrence). So the current top prefill
+lever is **M2.3 (GDN chunked scan)**, NOT the MoE GEMM. Post-M2.7 prefill shares: GdnScan 63.8%,
+fp4 MoE GEMM 11.6% (wmma), PagedAttn ~5%, fp4 projections ~4%.
+
+### M2.3 — GDN chunk-parallel prefill scan (THE prefill lever now — IN PROGRESS 2026-07-04)
+`GdnScanKernel` (`cuda_gdn.cu:350`) is a SEQUENTIAL recurrence used for both prefill (scans all
+prompt tokens one-at-a-time per layer → 63.8% of prefill) and decode (1-step, fine). Replace the
+PREFILL path with a **chunk-parallel scan** mirroring vLLM's FLA `model_executor/layers/fla/ops/
+chunk.py` (+ chunk_scaled_dot_kkt / solve_tril / wy_fast / chunk_delta_h / chunk_o / cumsum):
+parallelize within-chunk via matmuls, pass the `[Dk×Dv]` state sequentially across chunks. Keep
+the decode 1-step recurrence untouched. Reference: `.agents/gdn-semantics.md`. Correctness:
+chunked == sequential (synthetic, ≥2 chunks + tail) → paged gate 16/16 → measure prefill TTFT.
+
+### M2.7 — tensor-core NVFP4 MMA GEMM (THE earlier prefill unlock — DONE `bc0a8d7`)
+Moved the fp4 W4A16 GEMMs (MoE grouped + dense projections) off hand-tiled CUDA cores onto
+tensor cores (`nvcuda::wmma` bf16×bf16→f32, dequant-into-shared) + device-side expert-grouping
+(counting sort → dense per-expert GEMM). **RESULT: prefill TTFT 14.4→6.1s (2.36×), 8×1024×128
+total 70→157 tok/s (2.24×), gap 16.8×→7.5×; paged gate 16/16.** Tuning headroom remains (kernel
+~3-4 TFLOP/s, below bf16 peak — larger tiles / cp.async / drop ragged-BM waste). Native fp4-MMA
+stretch not attempted (low leverage now GDN dominates).
 
 ### M2.8 — decode fp4-GEMV + fast-argmax (the decode gap, separate from MMA)
 (a) An optimized M=1 fp4 GEMV replacing the `...Naive` kernels (~55% of decode); (b) route the

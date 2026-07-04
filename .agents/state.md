@@ -990,3 +990,18 @@
   parallel scan** — now 63.8% of prefill, THE next prefill lever; (2) M2.8 decode fp4-GEMV +
   fast-argmax (the ~100× argmax, the naive M=1 fp4 GEMV, route the cublas bf16 gemvx to fp4).
   GPU stays free+serialized (LocalAI worker down, restart disabled per user directive).
+- **2026-07-04 (state survey + record hygiene)** — read-only survey subagent mapped the whole
+  MVP surface. Findings acted on: (1) refreshed the M2 plan to the post-M2.7 reality (GDN
+  chunked scan is now the #1 prefill lever at 63.8%, NOT the already-done MoE GEMM; gap 7.5×,
+  config stated); (2) fixed the roadmap M0 header (M0.10 GGUF CPU load is DONE `6ef3f12`, real-
+  GGUF parity dgx-pending — header had said "remains open"). OPEN DECISIONS surfaced to the
+  user: (a) **27B W4A4 gate scope** — gates.md makes 27B a co-equal throughput gate model but
+  every roadmap/inventory marker defers it (~M2.2); need an explicit "MVP = 35B-only vs 35B+27B"
+  call; (b) **`/metrics` Prometheus endpoint** — gate #4 names it explicitly, currently deferred.
+  RECORD CORRECTION: the `test_qwen36_weights` red reported at `2999431` (Phase 2, "79/80,
+  asserts bf16 experts") was MIS-described — the test is checkpoint-gated and actually asserts
+  U8/NVFP4 experts + F8_E4M3 attn (tests/vllm/test_qwen36_weights.cpp:92,76) vs torch goldens
+  from snapshot 491c2f1e. It SKIPs without the checkpoint; M2.7 reported 82/82. The real
+  end-to-end correctness gate (paged greedy 16/16 on the real 35B) is green, so any weights-test
+  red is most likely a stale per-tensor golden / snapshot-version mismatch, NOT a dequant
+  regression — CONFIRM on a free-box GB10 run between kernel jobs (non-blocking).

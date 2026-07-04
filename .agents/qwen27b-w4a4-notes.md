@@ -390,3 +390,188 @@ Legend: **[CPU]** doable on the dev box now; **[GPU]** needs the free GB10.
 - Both are **GPU-gated** and run LATER (box currently reserved for the 35B
   kernel job + kept clean for throughput measurement). This session set them up
   (the CPU reference + the skipping gate) but ran neither.
+
+---
+
+## 7. TRUE W4A4 (fp4×fp4) — kernel selection + impl spec (grounded 2026-07-04)
+
+All cites `file:line` relative to `/home/mudler/_git/vllm` @ `e24d1b24`.
+This section supersedes §5's "6a fast path is the recommended primary" framing:
+**the 6a fast path is NOT what vLLM runs, and the parity-ledger proved it is not
+token-exact** (`parity-ledger.md` 27B row: 6a greedy **6/16 mismatch** — tokens
+0-5 exact, diverges at tok6 on a "\n"/"\n\n" near-tie; prefill argmax 9/9 exact,
+top-1000 logit gap 1.25; the divergence is *bf16 activations vs the oracle's
+true fp4 activations* tipping a near-tie). To be token-for-token exact vs vLLM we
+MUST mirror the **true W4A4 fp4×fp4** path (§5 step 6b), below.
+
+### 7.1 DEFINITIVE ANSWER — what vLLM runs for THIS checkpoint on GB10/sm_121
+
+**Mode.** `use_a16` is decided purely by the checkpoint config, NOT hardware:
+`compressed_tensors.py:696-705` — `if input_quant is None: return
+CompressedTensorsW4A4Fp4(use_a16=True)` (weight-only, Marlin), `else return
+CompressedTensorsW4A4Fp4()` (`use_a16=False`, true W4A4). The 27B config HAS
+`input_activations` (§3.1, num_bits 4, dynamic "local") ⇒ `input_quant` is not
+None ⇒ **`use_a16=False` → TRUE W4A4 fp4×fp4** is what this checkpoint selects.
+The `use_a16` shortcut we currently have corresponds to vLLM's *other* branch
+(`use_a16=True`), which this checkpoint does **not** take.
+
+**Kernel selection** (`kernels/linear/__init__.py:842-943`,
+`init_nvfp4_linear_kernel`; CUDA priority list `:407-424`). For `use_a16=False`,
+`linear_backend="auto"` (default), it walks `_POSSIBLE_NVFP4_KERNELS[CUDA]` in
+order, taking the first whose `is_supported()` passes. On sm_121 (compute
+capability 121):
+
+1. `FlashInferCuteDslNvFp4LinearKernel` — `flashinfer.py:34-42` requires
+   `is_device_capability_family(100)`. `interface.py:465-478`: family = cc//10;
+   121//10=12 ≠ 100//10=10 ⇒ **SKIP** (it is sm_10x only).
+2. `FlashInferCutlassNvFp4LinearKernel` — `flashinfer.py:105-119` requires
+   `cutlass_fp4_supported() AND has_device_capability(100) AND has_flashinfer()`.
+   `has_device_capability(100)` = cc≥100 (`interface.py:417-439`) → 121≥100 True.
+   ⇒ **WINS iff FlashInfer is installed** in the venv.
+3. `CutlassNvFp4LinearKernel` — `cutlass.py:23-29` requires
+   `cutlass_fp4_supported()` only. ⇒ **WINS if FlashInfer is absent.**
+4. Marlin / FlashInferTrtllm / FlashInferCudnn / Fbgemm / Emulation — fallbacks.
+
+`cutlass_fp4_supported()` (`nvfp4_utils.py:56-61`) → C++
+`cutlass_scaled_mm_supports_fp4(121)` (`nvfp4_scaled_mm_entry.cu:71-87`): returns
+true for cc∈[120,130) **iff the wheel was built with `ENABLE_NVFP4_SM120`** (the
+Blackwell/SM120a fp4 kernel). The GEMM itself dispatches sm∈[120,130) →
+`cutlass_scaled_fp4_mm_sm120a` (`nvfp4_scaled_mm_entry.cu:59-64`). So the
+**authoritative kernel to mirror is the CUTLASS SM120a fp4×fp4 GEMM**
+(`cutlass_scaled_fp4_mm` → `..._sm120a`); the FlashInfer-cutlass wrapper, when
+present, calls a numerically equivalent cutlass fp4 GEMM (same operand/scale/
+alpha contract, `flashinfer.py:135-176`) — mirroring the native cutlass path
+covers both. (Note `FlashInferB12x`, the SM120 CuTe-DSL warp-MMA kernel, is
+**excluded from auto-selection**, `__init__.py:410-412` — opt-in only.) Whether
+the measured 47.5 tok/s vLLM run used FlashInfer-cutlass or native cutlass is a
+one-line probe (log the kernel class in `init_nvfp4_linear_kernel:937`); both are
+the same math, so it does not change our spec.
+
+**For `use_a16=True` (the OTHER branch, for reference):**
+`__init__.py:881-883` — `linear_backend=="auto" and use_a16` **forces
+`MarlinNvFp4LinearKernel`** (`marlin.py:18-57`, W4A16 weight-only, bf16
+activations, no activation-quant). That is the mode our current
+`MatmulNvfp4Wmma` shortcut approximates; this checkpoint does not use it.
+
+### 7.2 The activation-quant op (the NEW W4A4 piece) — grounded on the REAL kernel
+
+vLLM dynamically quantizes bf16/fp16 activations → fp4 **per token, per 16-elem
+group** via `scaled_fp4_quant(x, layer.input_global_scale_inv, ...)` (called by
+every real kernel, e.g. `cutlass.py:56-62`). The global scale passed is
+`input_global_scale_inv` = the **on-disk activation divisor, used DIRECTLY (not
+reciprocated)** (`compressed_tensors_w4a4_nvfp4.py:132-134`; same as the
+emulation path `emulation.py:39-46`). The C++ kernel math
+(`csrc/.../fp4/nvfp4_utils.cuh:241-297`, `cvt_warp_fp16_to_fp4`) is:
+
+    SFScaleVal = input_global_scale_inv            # on-disk divisor (2688/amax_act)
+    vecMax  = max_j |x[j]|                          # over the 16-elem group
+    SFValue = SFScaleVal * (vecMax / 6.0)          # 6.0 = FP4_E2M1_MAX
+    fp8SF   = fp8_e4m3(SFValue)                     # the STORED per-group block scale
+    SFValue = float(fp8SF)                          # round-trip through fp8
+    outputScale = SFValue!=0 ? SFScaleVal / SFValue : 0    # via fast reciprocal
+    for each element:  fp4 = e2m1_round( x_j * outputScale )   # cast_to_fp4 buckets
+
+This is **byte-identical in intent** to `ref_nvfp4_quant`
+(`nvfp4_emulation_utils.py:427-441`) + `cast_to_fp4` (`:413-424`) — which is what
+our CPU `RefNvfp4QuantDequant` already mirrors (§3.4). PARITY NUANCE: the real
+CUDA kernel uses `reciprocal_approximate_ftz` (`nvfp4_utils.cuh:157-166,283-286`)
+where the emulation uses exact division; the difference is sub-bucket and almost
+never flips an e2m1 bucket, but it is the one place our fp4-quant op could
+diverge from the oracle by 1 ULP → keep it in mind if a token near-ties.
+Output layout: packed uint8 `[m, k/2]` + fp8-e4m3 block scales `[m, k/16]` in a
+**swizzled** (128×4 / 8×4) layout for cutlass (`_custom_ops.py:73-92, 1492-1560`);
+our own WMMA GEMM can keep the block scales in **linear** layout (we own both
+producer and consumer) and skip the swizzle.
+
+### 7.3 The fp4×fp4 GEMM contract to mirror (cutlass sm120a)
+
+`cutlass_scaled_fp4_mm(a_fp4, b_fp4, a_blockscale, b_blockscale, alpha,
+out_dtype)` (`cutlass.py:64-71`, `_custom_ops.py:702-714`) computes, per output
+`[m,n]`:
+
+    out[m,n] = alpha * Σ_k ( a_fp4[m,k] · a_scale_fp8[m, k/16] )
+                             · ( b_fp4[n,k] · b_scale_fp8[n, k/16] )
+
+- `a_fp4` = per-token-quantized activations (§7.2); `a_scale_fp8` = its fp8 block
+  scales (RAW stored fp8 values as f32, NOT divided by any global).
+- `b_fp4` = the on-disk `weight_packed`; `b_scale_fp8` = the on-disk
+  `weight_scale` (fp8, group-16), swizzled for cutlass (`cutlass.py:35-43`,
+  `swizzle_blockscale` `nvfp4_utils.py:13-53`) — linear for our WMMA.
+- **`alpha = input_global_scale · weight_global_scale`** — the product of the two
+  *reciprocated* globals (`compressed_tensors_w4a4_nvfp4.py:135-138`;
+  `weight_global_scale = 1/divisor` `:110-114`, `input_global_scale = 1/divisor`
+  `:126-129`). Algebraically this folds both on-disk divisors: since both
+  x_dq = a_fp4·a_scale_fp8/input_div and w_dq = b_fp4·b_scale_fp8/weight_div,
+  `Σ x_dq·w_dq = alpha · Σ (a_fp4·a_scale_fp8)(b_fp4·b_scale_fp8)` with
+  `alpha = 1/(input_div·weight_div)`. This is the exact `run_nvfp4_emulations`
+  numeric result (§3.5) — our CPU `RunNvfp4Emulation` is its reference.
+
+**Δ vs our current M2.7 `MatmulNvfp4Wmma`** (fp4×bf16, W4A16): (a) the A operand is
+now *fp4 with its own per-token fp8 group scales*, not bf16 — so the MMA is
+fp4×fp4 (Blackwell fp4 tensor cores) with TWO block-scale streams, not one; (b) a
+single scalar `alpha` folds both globals (our W4A16 kernel applies only the
+weight global as `scale2`); (c) A must be produced by the §7.2 activation-quant op
+each forward (the per-token-quant tax).
+
+### 7.4 How it plugs into our `vt` runtime (names chosen to mirror vLLM)
+
+- **Activation-quant op** `ScaledFp4Quant` (mirror `scaled_fp4_quant`): bf16
+  `[m,k]` + scalar `input_global_scale_inv` → (packed-fp4 `[m,k/2]`, fp8 block
+  scale `[m,k/16]` linear). CUDA kernel = §7.2 math; the CPU reference is the
+  existing `RefNvfp4QuantDequant` split into quant-only. Reuse `F32ToF8E4M3`,
+  `CastToFp4`, `kNvfp4GroupSize`.
+- **GEMM op** `MatmulNvfp4Fp4Wmma` (mirror `cutlass_scaled_fp4_mm` /
+  `cutlass_scaled_fp4_mm_sm120a`): fp4 A + fp8 A-scale + fp4 B (`Nvfp4Weight`) +
+  fp8 B-scale + scalar `alpha` → out `[m,n]`, per §7.3. Sibling to
+  `MatmulNvfp4Wmma`; unit-test vs `RunNvfp4Emulation`.
+- **Weight side** reuses `Nvfp4Weight` / `LoadCtNvfp4Raw` (already carries CT
+  `weight_packed`/`weight_scale` + `scale2 = 1/weight_global_scale`). ADD: load
+  `input_global_scale` (on-disk divisor) → store `input_global_scale_inv` and
+  precompute `alpha = (1/input_divisor)·(1/weight_divisor)` at load (mirror
+  `process_weights_after_loading`), so the forward passes `alpha` + `inv` to the
+  two ops. The bf16-activation `MaterializeCtNvfp4Bf16Transposed` path stays as
+  the correctness-grade fallback.
+- **27B dense forward**: each quantized Linear (§3.6) becomes
+  `MatmulNvfp4Fp4Wmma( ScaledFp4Quant(x, inv), W.fp4, W.wscale, alpha )` instead
+  of `MatmulNvfp4Bf16D`. Gate on `Nvfp4Weight` presence exactly as today so the
+  35B/bf16 paths are untouched.
+
+### 7.5 killgate "W4A4 FP4-MMA regressed on GB10" — source-grounded caveat
+
+The regression claim is cited in `parity-ledger.md` (M2.7 row) as *killgate
+0034/0035: W4A4 FP4-MMA regressed on GB10*. `~/killgate_series/` does **not exist
+on this dev box** (it lived on dgx), so I could only cross-check via the ledger.
+Two things de-rate that claim for OUR decision: (1) it was measured on the **35B
+modelopt W4A16** checkpoint, which has **no fp4 activations** — i.e. an *artificial*
+fp4-activation experiment, not a real W4A4 checkpoint; and (2) it was a
+hand-rolled / Marlin-grouped fp4-MMA, **not** vLLM's selected
+`cutlass_scaled_fp4_mm_sm120a`. So it is evidence that *a naive fp4-MMA lost to
+the W4A16 WMMA at 35B shapes*, NOT that vLLM's tuned sm120a path is slow. The 27B
+question is different: vLLM *actually runs* sm120a fp4×fp4 here (§7.1) and we owe
+token-exactness (6a already fails 6/16, §7 intro). Treat 6b throughput as a
+measured experiment vs the sm120a-class kernel, not an assumed loss.
+
+### 7.6 Ordered implementation plan (correctness-first; GPU steps marked)
+
+1. **[CPU]** Split `ScaledFp4Quant` CPU reference out of `RefNvfp4QuantDequant`
+   (quant-only: emit packed fp4 + fp8 block scale). Unit-test vs the existing
+   emulation numbers + a hand golden (fast-reciprocal nuance noted §7.2).
+2. **[GPU]** `ScaledFp4Quant` CUDA kernel (§7.2). Unit-test device-vs-CPU on
+   random bf16 (allow ≤1 ULP on the fast-reciprocal path).
+3. **[GPU]** `MatmulNvfp4Fp4Wmma` CUDA kernel (§7.3, fp4×fp4 + two fp8 scale
+   streams + scalar alpha). Unit-test vs `RunNvfp4Emulation` (the CPU truth) on
+   random shapes incl. odd N/K tails — same rig as `test_ops_nvfp4_matmul`.
+4. **[GPU]** Capture the pip-vLLM **true-W4A4** greedy golden on
+   `unsloth/Qwen3.6-27B-NVFP4` (§5 step 5; supersedes the 6a golden). Log the
+   selected kernel class (`init_nvfp4_linear_kernel:937`) to confirm
+   flashinfer-cutlass vs native cutlass — one light dispatch line, no throughput
+   run.
+5. **[GPU]** Wire the two ops into the 27B dense forward (§7.4); flip
+   `kW4A4ForwardReady`; run `test_qwen27_paged_engine` **token-for-token** vs the
+   step-4 true-W4A4 golden (this is what closes the correctness gate that 6a
+   failed).
+6. **[GPU]** `vllm bench throughput` vs ours on the identical GB10 workload;
+   record both + ratio in parity-ledger. Compare 6b (true fp4×fp4) against the 6a
+   fast path as a measured A/B — keep whichever wins throughput *among the
+   token-exact options* (6a is not token-exact, so if 6b is slower we still need
+   6b for the correctness gate, and 6a can only remain as an opt-in speed mode).

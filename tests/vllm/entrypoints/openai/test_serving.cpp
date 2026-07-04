@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@ using vllm::entrypoints::openai::ShapeChatMessage;
 using vllm::entrypoints::openai::ShapedChatMessage;
 using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
 using vllm::entrypoints::openai::ToolChoice;
-using vllm::entrypoints::openai::ToolChoiceForcedSchema;
+using vllm::entrypoints::openai::ToolChoiceStructuralTagSpec;
 using vllm::entrypoints::openai::ToolParser;
 using vllm::entrypoints::openai::ToolsEnabled;
 using vllm::tok::Tokenizer;
@@ -706,7 +707,11 @@ TEST_CASE("serving_chat: tool_choice none disables tool extraction") {
   CHECK(*shaped.finish_reason == "stop");
 }
 
-// ─── M3.3 Task 4: grammar-forced JSON for tool_choice=required / named ────────
+// ─── M3.3b Task 3: tool_choice -> STRUCTURAL-TAG spec (auto lazy, required/named
+//     forced). ApplyToolChoiceStructuredOutput now sets structured_outputs
+//     .structural_tag (the native lazy/forced compile), NOT the old forced-json
+//     grammar. Mirrors vLLM get_hermes_structural_tag (structural_tag_registry.py
+//     :237-269) + _hermes_tool_tags (:213-234). ──────────────────────────────
 namespace {
 // ToolRequest() + a second tool (set_alarm), for required-with-multiple tests.
 ChatCompletionRequest TwoToolRequest() {
@@ -720,101 +725,177 @@ ChatCompletionRequest TwoToolRequest() {
   r.tools->push_back(tool2);
   return r;
 }
+
+// The distinct tool names covered by a spec's `tags` (each tool -> 2 variants).
+std::set<std::string> TagBeginNames(const json& spec) {
+  std::set<std::string> names;
+  for (const auto& tag : spec.at("tags")) {
+    names.insert(tag.at("begin").get<std::string>());
+  }
+  return names;
+}
 }  // namespace
 
-// (a) named tool_choice -> forced schema = {name:const, arguments:params},
-//     flowing onto the SamplingParams the engine receives.
-TEST_CASE("serving_chat: tool_choice named forces the tool's {name,arguments} schema") {
-  ChatCompletionRequest req = ToolRequest();
-  req.tool_choice = ToolChoice{"function", std::string("get_weather")};
-  const auto schema = ToolChoiceForcedSchema(req);
-  REQUIRE(schema.has_value());
-  CHECK(schema->at("type") == "object");
-  CHECK(schema->at("properties").at("name").at("const") == "get_weather");
-  // arguments == the tool's declared parameters schema.
-  CHECK(schema->at("properties").at("arguments") ==
-        *req.tools->at(0).function.parameters);
-  CHECK(schema->at("required") == json::array({"name", "arguments"}));
-  CHECK(schema->at("additionalProperties") == false);
+// (a) tool_choice=auto (+ tools) -> a LAZY structural tag: lazy:true, triggers
+//     ["<tool_call>"], NOT forced (the whole point — a plain reply stays free).
+TEST_CASE("serving_chat: tool_choice auto -> LAZY structural tag (not forced)") {
+  ChatCompletionRequest req = ToolRequest();  // tool_choice unset == auto default
+  const auto spec_unset = ToolChoiceStructuralTagSpec(req);
+  REQUIRE(spec_unset.has_value());
+  CHECK(spec_unset->at("lazy") == true);
+  CHECK(spec_unset->at("triggers") == json::array({"<tool_call>"}));
+  CHECK(spec_unset->at("stop_after_first") == false);
 
-  // (e) The forced schema flows to structured_outputs.grammar as the WRAPPED
-  // `<tool_call>…</tool_call>` GBNF (NOT bare .json) so the Hermes/Qwen parser
-  // can extract the constrained tool call. See test_tool_choice_grammar for the
-  // loop-closing extraction proof.
+  // Explicit "auto" behaves identically.
+  req.tool_choice = ToolChoice{"auto", std::nullopt};
+  const auto spec = ToolChoiceStructuralTagSpec(req);
+  REQUIRE(spec.has_value());
+  CHECK(spec->at("lazy") == true);
+  CHECK(spec->at("triggers") == json::array({"<tool_call>"}));
+
+  // Two surface variants per tool (structural_tag_registry.py:219-221): begins
+  // carry the baked-in name + arguments prefix; content is the params schema.
+  REQUIRE(spec->at("tags").size() == 2);
+  CHECK(spec->at("tags").at(0).at("begin") ==
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": ");
+  CHECK(spec->at("tags").at(0).at("end") == "}\n</tool_call>");
+  CHECK(spec->at("tags").at(1).at("begin") ==
+        "<tool_call>{\"name\": \"get_weather\", \"arguments\": ");
+  CHECK(spec->at("tags").at(1).at("end") == "}</tool_call>");
+  CHECK(spec->at("tags").at(0).at("content_schema") ==
+        *req.tools->at(0).function.parameters);
+
+  // It flows onto the SamplingParams as structured_outputs.structural_tag (the
+  // ONE constraint; json/grammar stay unset), passing Verify().
   SamplingParams sp = req.to_sampling_params(16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->structural_tag.has_value());
   CHECK_FALSE(sp.structured_outputs->json.has_value());
-  REQUIRE(sp.structured_outputs->grammar.has_value());
-  CHECK(*sp.structured_outputs->grammar ==
-        vllm::v1::WrapSchemaAsToolCallGbnf(*schema));
+  CHECK_FALSE(sp.structured_outputs->grammar.has_value());
+  // The serialized spec parses back to the LAZY form (the user-facing payoff:
+  // auto does NOT force a tool call from token 0).
+  const json flowed = json::parse(*sp.structured_outputs->structural_tag);
+  CHECK(flowed.at("lazy") == true);
+  CHECK(flowed.at("triggers") == json::array({"<tool_call>"}));
 }
 
-// A named tool with NO parameters -> arguments constrained to any JSON (`true`).
-TEST_CASE("serving_chat: named tool without parameters forces arguments=any") {
+// A tool with NO parameters -> content_schema constrained to any JSON (`true`).
+TEST_CASE("serving_chat: tool without parameters -> content_schema=any (true)") {
   ChatCompletionRequest req = ToolRequest();
   req.tools->at(0).function.parameters = std::nullopt;
   req.tool_choice = ToolChoice{"function", std::string("get_weather")};
-  const auto schema = ToolChoiceForcedSchema(req);
-  REQUIRE(schema.has_value());
-  CHECK(schema->at("properties").at("arguments") == true);
+  const auto spec = ToolChoiceStructuralTagSpec(req);
+  REQUIRE(spec.has_value());
+  CHECK(spec->at("tags").at(0).at("content_schema") == true);
 }
 
-// (b) required with ONE tool -> that tool's schema (no anyOf).
-TEST_CASE("serving_chat: tool_choice required with one tool forces that tool") {
-  ChatCompletionRequest req = ToolRequest();
-  req.tool_choice = ToolChoice{"required", std::nullopt};
-  const auto schema = ToolChoiceForcedSchema(req);
-  REQUIRE(schema.has_value());
-  CHECK_FALSE(schema->contains("anyOf"));
-  CHECK(schema->at("properties").at("name").at("const") == "get_weather");
-}
-
-// (c) required with MULTIPLE tools -> anyOf alternation of the per-tool schemas.
-TEST_CASE("serving_chat: tool_choice required with multiple tools forces anyOf") {
+// (d) tool_choice=required -> FORCED (lazy:false), stop_after_first:false, one
+//     tag-pair per tool.
+TEST_CASE("serving_chat: tool_choice required -> forced structural tag (>=1)") {
   ChatCompletionRequest req = TwoToolRequest();
   req.tool_choice = ToolChoice{"required", std::nullopt};
-  const auto schema = ToolChoiceForcedSchema(req);
-  REQUIRE(schema.has_value());
-  REQUIRE(schema->contains("anyOf"));
-  REQUIRE(schema->at("anyOf").size() == 2);
-  CHECK(schema->at("anyOf").at(0).at("properties").at("name").at("const") ==
-        "get_weather");
-  CHECK(schema->at("anyOf").at(1).at("properties").at("name").at("const") ==
-        "set_alarm");
+  const auto spec = ToolChoiceStructuralTagSpec(req);
+  REQUIRE(spec.has_value());
+  CHECK(spec->at("lazy") == false);
+  CHECK(spec->at("stop_after_first") == false);
+  CHECK_FALSE(spec->contains("triggers"));  // forced from token 0, no trigger.
+  // Both tools appear (each with two surface variants -> 4 tags).
+  REQUIRE(spec->at("tags").size() == 4);
+  CHECK(TagBeginNames(*spec) ==
+        std::set<std::string>{
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": ",
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": ",
+            "<tool_call>\n{\"name\": \"set_alarm\", \"arguments\": ",
+            "<tool_call>{\"name\": \"set_alarm\", \"arguments\": "});
 
-  // It flows onto the SamplingParams as the WRAPPED anyOf grammar (Verify accepts
-  // the single grammar field). The root emits `<tool_call>\n` (A|B) `\n</tool_call>`.
   SamplingParams sp = req.to_sampling_params(16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
-  CHECK_FALSE(sp.structured_outputs->json.has_value());
-  REQUIRE(sp.structured_outputs->grammar.has_value());
-  CHECK(*sp.structured_outputs->grammar ==
-        vllm::v1::WrapSchemaAsToolCallGbnf(*schema));
+  REQUIRE(sp.structured_outputs->structural_tag.has_value());
+  CHECK_FALSE(sp.structured_outputs->grammar.has_value());
+  CHECK(json::parse(*sp.structured_outputs->structural_tag).at("lazy") == false);
 }
 
-// (d) auto tool_choice -> NO forced grammar (unset / explicit "auto").
-TEST_CASE("serving_chat: tool_choice auto forces no grammar") {
-  ChatCompletionRequest req = ToolRequest();  // tool_choice unset == auto default
-  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
-  req.tool_choice = ToolChoice{"auto", std::nullopt};
-  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
+// (e) tool_choice=named ("function") -> FORCED exactly one (lazy:false,
+//     stop_after_first:true), ONLY the chosen tool's tags.
+TEST_CASE("serving_chat: tool_choice named -> forced one (stop_after_first)") {
+  ChatCompletionRequest req = TwoToolRequest();
+  req.tool_choice = ToolChoice{"function", std::string("set_alarm")};
+  const auto spec = ToolChoiceStructuralTagSpec(req);
+  REQUIRE(spec.has_value());
+  CHECK(spec->at("lazy") == false);
+  CHECK(spec->at("stop_after_first") == true);
+  // Only the named tool's two variants (not the other tool).
+  REQUIRE(spec->at("tags").size() == 2);
+  CHECK(TagBeginNames(*spec) ==
+        std::set<std::string>{
+            "<tool_call>\n{\"name\": \"set_alarm\", \"arguments\": ",
+            "<tool_call>{\"name\": \"set_alarm\", \"arguments\": "});
 
   SamplingParams sp = req.to_sampling_params(16);
   ApplyToolChoiceStructuredOutput(req, sp);
-  CHECK_FALSE(sp.structured_outputs.has_value());  // untouched -> unset
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->structural_tag.has_value());
+  const json flowed = json::parse(*sp.structured_outputs->structural_tag);
+  CHECK(flowed.at("stop_after_first") == true);
 }
 
-// none tool_choice / no tools -> no forced grammar.
-TEST_CASE("serving_chat: tool_choice none (and no tools) forces no grammar") {
+// A named choice matching NO listed tool -> no constraint (upstream 400s first).
+TEST_CASE("serving_chat: named choice with no matching tool -> no tag") {
+  ChatCompletionRequest req = ToolRequest();
+  req.tool_choice = ToolChoice{"function", std::string("does_not_exist")};
+  CHECK_FALSE(ToolChoiceStructuralTagSpec(req).has_value());
+}
+
+// (f) tool_choice=none / no tools -> NO structural tag (model unconstrained).
+TEST_CASE("serving_chat: tool_choice none (and no tools) -> no structural tag") {
   ChatCompletionRequest req = ToolRequest();
   req.tool_choice = ToolChoice{"none", std::nullopt};
-  CHECK_FALSE(ToolChoiceForcedSchema(req).has_value());
+  CHECK_FALSE(ToolChoiceStructuralTagSpec(req).has_value());
 
   ChatCompletionRequest bare;
   bare.messages = {ChatMessage{"user", std::string("hi")}};
-  CHECK_FALSE(ToolChoiceForcedSchema(bare).has_value());
+  CHECK_FALSE(ToolChoiceStructuralTagSpec(bare).has_value());
+
+  // ApplyToolChoiceStructuredOutput leaves structured_outputs untouched (unset).
+  SamplingParams sp = req.to_sampling_params(16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  CHECK_FALSE(sp.structured_outputs.has_value());
+}
+
+// (b)+(c) auto is RELAXED end-to-end at the serving layer: a plain-text output
+//     (no `<tool_call>`) shapes a NORMAL message (finish_reason="stop", no
+//     tool_calls) — the model was NOT forced — while a `<tool_call>{...}` output
+//     shapes tool_calls + finish_reason="tool_calls".
+TEST_CASE("serving_chat: auto -> plain reply is NOT forced into a tool call") {
+  ChatCompletionRequest req = ToolRequest();  // auto default
+  req.tool_choice = ToolChoice{"auto", std::nullopt};
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  REQUIRE(parser != nullptr);
+
+  // (b) The model chose to just reply (no trigger) -> plain content message.
+  const std::string plain = "It is sunny in Paris today.";
+  ShapedChatMessage reply = ShapeChatMessage(
+      "assistant", plain, std::string("stop"), req, parser.get());
+  CHECK_FALSE(reply.message.tool_calls.has_value());
+  REQUIRE(reply.message.content.has_value());
+  CHECK(*reply.message.content == plain);
+  REQUIRE(reply.finish_reason.has_value());
+  CHECK(*reply.finish_reason == "stop");
+
+  // (c) The model chose to call the tool -> tool_calls + "tool_calls".
+  std::unique_ptr<ToolParser> parser2 = get_tool_parser("hermes");
+  const std::string called =
+      "<tool_call>{\"name\": \"get_weather\", \"arguments\": "
+      "{\"city\": \"Paris\"}}</tool_call>";
+  ShapedChatMessage call = ShapeChatMessage(
+      "assistant", called, std::string("stop"), req, parser2.get());
+  REQUIRE(call.message.tool_calls.has_value());
+  REQUIRE(call.message.tool_calls->size() == 1);
+  CHECK((*call.message.tool_calls)[0].function.name == "get_weather");
+  REQUIRE(call.finish_reason.has_value());
+  CHECK(*call.finish_reason == "tool_calls");
 }
 
 // ─── (b/d) STREAM tool call: the delta sequence carries tool_calls[index=0,

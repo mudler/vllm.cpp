@@ -95,34 +95,42 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            const ChatCompletionRequest& request,
                                            ToolParser* parser);
 
-// Ported from: vllm/entrypoints/openai/chat_completion/serving.py @ e24d1b24
-// (the tool_choice -> forced structured output; upstream builds an xgrammar
-// StructuralTag via tool_parsers/structural_tag_registry.py). The JSON schema an
-// emitted tool call MUST match when tool_choice FORCES one — the named
-// ("function") tool, or "required" (any listed tool). Returns nullopt for
-// "auto"/"none" / no tools (model decides / disabled).
+// Ported from: vllm/tool_parsers/structural_tag_registry.py @ e24d1b24
+// (get_hermes_structural_tag:237-269 + _hermes_tool_tags:213-234). Build the
+// Hermes STRUCTURAL-TAG spec from a request's tools + tool_choice — the DECODE
+// constraint that steers a tool call. Returns nullopt for "none" / no tools.
 //
-// Shape mirrors the upstream Hermes structural tag's INNER tool-call content
-// (structural_tag_registry.py:213-234) `{"name": "<fn>", "arguments":
-// <fn.parameters>}`:
-//   named / one tool         -> {"type":"object",
-//                                "properties":{"name":{"const":"<fn>"},
-//                                              "arguments":<params|true>},
-//                                "required":["name","arguments"],
-//                                "additionalProperties":false}
-//   required, multiple tools -> {"anyOf":[<per-tool object schema>, ...]}
-// This is the INNER tool-call object schema. ApplyToolChoiceStructuredOutput
-// wraps it (WrapSchemaAsToolCallGbnf) in the literal `<tool_call>...</tool_call>`
-// wrapper before constraining the decode, mirroring the upstream structural tag.
-std::optional<nlohmann::json> ToolChoiceForcedSchema(
+// The spec is our native structural-tag JSON (backend_native.cpp kStructuralTag;
+// the SEAM is 1:1 with vLLM's xgrammar StructuralTag, the content backend-private):
+//   {"lazy": bool, "triggers": [str], "stop_after_first": bool,
+//    "tags": [{"begin": str, "content_schema": <schema|true>, "end": str}]}
+// Each tool contributes TWO tags (vLLM's two Hermes surface variants,
+// structural_tag_registry.py:219-221): the tool name is baked into `begin`
+// (`<tool_call>\n{"name": "<fn>", "arguments": ` and the compact
+// `<tool_call>{"name": "<fn>", "arguments": `), `content_schema` is the tool's
+// `parameters` (or `true` = any JSON when absent, _get_function_parameters:207),
+// and `end` closes the wrapper (`}\n</tool_call>` / `}</tool_call>`).
+//
+// tool_choice -> spec (get_hermes_structural_tag:248-267):
+//   auto (or unset default) -> LAZY: {lazy:true, triggers:["<tool_call>"],
+//       tags:[all tools]} — plain text is FREE until the `<tool_call>` trigger,
+//       then the tool-call JSON is constrained (TriggeredTagsFormat, :249-254).
+//       NOT forced: the model may just reply.
+//   required -> FORCED >=1: {lazy:false, stop_after_first:false, tags:[all
+//       tools]} (TagsWithSeparatorFormat at_least_one, :262-267).
+//   named ("function") -> FORCED exactly one: {lazy:false,
+//       stop_after_first:true, tags:[that one tool]} (+stop_after_first, :255-261).
+std::optional<nlohmann::json> ToolChoiceStructuralTagSpec(
     const ChatCompletionRequest& request);
 
-// Apply ToolChoiceForcedSchema onto `sampling_params`: sets
-// structured_outputs.grammar = WrapSchemaAsToolCallGbnf(forced schema) so the
-// decode is CONSTRAINED to a WRAPPED tool call
-// (`<tool_call>\n{...}\n</tool_call>`) the Hermes/Qwen parser extracts — for both
-// stream and non-stream. No-op for auto/none. Called in create_chat_completion
-// before add_request.
+// Apply ToolChoiceStructuralTagSpec onto `sampling_params`: sets
+// structured_outputs.structural_tag = dump(spec) (the ONE structured-output
+// constraint; json/grammar stay unset) and re-runs Verify(). No-op for
+// auto/none with no tools. For auto this is a LAZY tag (the model may reply in
+// plain text OR emit a `<tool_call>` — NOT forced); required/named force a call.
+// This SUBSUMES the old WrapSchemaAsToolCallGbnf forced-json path — the native
+// structural-tag compile handles the `<tool_call>` wrapper for ALL cases. Called
+// in create_chat_completion before add_request.
 void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
                                      SamplingParams& sampling_params);
 

@@ -260,17 +260,12 @@ TEST_CASE("response_format json_schema constrains decoding end to end (native ba
   CHECK(runner.last_grammar_req_ids[0] == "req0");
 }
 
-// M3.3: a tool_choice=required forced tool-call schema flows the same path
-// (ApplyToolChoiceStructuredOutput -> structured_outputs.grammar -> Request ->
-// grammar_init -> constrained decode) and yields a live grammar that emits the
-// WRAPPED `<tool_call>…</tool_call>` tool call the Hermes/Qwen parser extracts.
-TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (native backend)") {
-  using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
+namespace {
+// A one-tool chat request (get_weather{city:string}) at a given tool_choice.
+ChatCompletionRequest WeatherToolRequest(
+    vllm::entrypoints::openai::ToolChoice choice) {
   using vllm::entrypoints::openai::ChatCompletionToolsParam;
   using vllm::entrypoints::openai::ChatMessage;
-  using vllm::entrypoints::openai::ToolChoice;
-
-  // A chat request with one tool + tool_choice="required".
   ChatCompletionRequest req;
   req.messages = {ChatMessage{"user", std::string("weather?")}};
   ChatCompletionToolsParam tool;
@@ -280,15 +275,35 @@ TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (n
       R"({"type":"object","properties":{"city":{"type":"string"}},)"
       R"("required":["city"]})");
   req.tools = std::vector<ChatCompletionToolsParam>{tool};
-  req.tool_choice = ToolChoice{"required", std::nullopt};
+  req.tool_choice = std::move(choice);
+  return req;
+}
 
-  // The forced tool-call schema flows onto the SamplingParams as the WRAPPED
-  // GBNF grammar (structured_outputs.grammar, NOT bare .json).
+std::vector<int32_t> EncodeChars(const std::string& text) {
+  std::vector<int32_t> ids;
+  for (const char ch : text) ids.push_back(static_cast<int32_t>(kChars.find(ch)));
+  return ids;
+}
+}  // namespace
+
+// M3.3b Task 3: tool_choice=required flows the same path
+// (ApplyToolChoiceStructuredOutput -> structured_outputs.structural_tag ->
+// Request -> grammar_init -> constrained decode) and yields a live grammar
+// FORCED from token 0 to the WRAPPED `<tool_call>…</tool_call>` tool call.
+TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (native backend)") {
+  using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
+  using vllm::entrypoints::openai::ToolChoice;
+
+  ChatCompletionRequest req = WeatherToolRequest(ToolChoice{"required", std::nullopt});
+
+  // The forced tool-call constraint flows onto the SamplingParams as the native
+  // structural_tag (NOT bare .json, NOT the old .grammar).
   SamplingParams sp = req.to_sampling_params(/*default_max_tokens=*/16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
   CHECK_FALSE(sp.structured_outputs->json.has_value());
-  REQUIRE(sp.structured_outputs->grammar.has_value());
+  CHECK_FALSE(sp.structured_outputs->grammar.has_value());
+  REQUIRE(sp.structured_outputs->structural_tag.has_value());
 
   // The engine, with a NATIVE-backed manager shared by scheduler + core.
   StructuredOutputManager manager(
@@ -304,15 +319,14 @@ TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (n
                                            /*arrival_time=*/0.0, Hasher());
   engine.add_request(std::move(request));
 
-  // grammar_init compiled the forced tool-call schema into a live grammar.
+  // grammar_init compiled the structural tag into a live grammar.
   Request* r = scheduler->requests.at("tc0").get();
   REQUIRE(r->structured_output_request.has_value());
   REQUIRE(r->structured_output_request->grammar != nullptr);
 
-  // It is the WRAPPED tool-call grammar: the first byte must be '<' (the
-  // `<tool_call>` wrapper), and a BARE '{' is REJECTED at the start — this is
-  // what makes the constrained output extractable by the Hermes/Qwen parser
-  // (the bare-JSON bug this fix closes).
+  // It is FORCED + WRAPPED: the first byte must be '<' (the `<tool_call>`
+  // wrapper), and a BARE '{' is REJECTED at the start — this is what makes the
+  // constrained output extractable by the Hermes/Qwen parser.
   auto& grammar = *r->structured_output_request->grammar;
   const int32_t open_angle = static_cast<int32_t>(kChars.find('<'));
   const int32_t open_brace = static_cast<int32_t>(kChars.find('{'));
@@ -326,4 +340,63 @@ TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (n
   CHECK(runner.last_grammar_present);
   REQUIRE(runner.last_grammar_req_ids.size() == 1);
   CHECK(runner.last_grammar_req_ids[0] == "tc0");
+}
+
+// M3.3b Task 3 — THE PAYOFF, end to end over the native backend: tool_choice=auto
+// flows a LAZY structural tag through the SAME wiring (structural_tag ->
+// grammar_init -> live grammar). Through the real seam the compiled grammar is
+// INERT before `<tool_call>` (a plain reply — a letter, EOS — is allowed, so auto
+// does NOT force a tool call) and CONSTRAINED after the `<tool_call>` trigger (the
+// tool-call JSON is required). The lazy trigger works through the real seam.
+TEST_CASE("tool_choice auto is LAZY (relaxed) end to end (native backend)") {
+  using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
+  using vllm::entrypoints::openai::ToolChoice;
+
+  ChatCompletionRequest req = WeatherToolRequest(ToolChoice{"auto", std::nullopt});
+  SamplingParams sp = req.to_sampling_params(/*default_max_tokens=*/16);
+  ApplyToolChoiceStructuredOutput(req, sp);
+  REQUIRE(sp.structured_outputs.has_value());
+  REQUIRE(sp.structured_outputs->structural_tag.has_value());
+  CHECK(json::parse(*sp.structured_outputs->structural_tag).at("lazy") == true);
+
+  StructuredOutputManager manager(
+      /*max_num_seqs=*/8, MakeNativeBackendFactory(Fixture(), VocabSize(),
+                                                   std::vector<int32_t>{kEos}));
+  auto scheduler = CreateScheduler(&manager);
+  RunnerStub runner;
+  Executor executor(runner);
+  EngineCore engine(*scheduler, executor, &manager);
+
+  std::vector<int32_t> prompt = {10, 11, 12, 13};
+  auto request = std::make_unique<Request>("auto0", prompt, sp,
+                                           /*arrival_time=*/0.0, Hasher());
+  engine.add_request(std::move(request));
+
+  Request* r = scheduler->requests.at("auto0").get();
+  REQUIRE(r->structured_output_request.has_value());
+  REQUIRE(r->structured_output_request->grammar != nullptr);
+  auto& grammar = *r->structured_output_request->grammar;
+
+  // BEFORE the trigger: the grammar is INERT — a free letter, a bare '{' AND EOS
+  // are all allowed (a plain reply, not a forced tool call).
+  const int32_t letter_a = static_cast<int32_t>(kChars.find('a'));
+  const int32_t open_brace = static_cast<int32_t>(kChars.find('{'));
+  CHECK(grammar.validate_tokens({letter_a}) == std::vector<int32_t>{letter_a});
+  CHECK(grammar.validate_tokens({open_brace}) == std::vector<int32_t>{open_brace});
+  CHECK(grammar.validate_tokens({kEos}) == std::vector<int32_t>{kEos});
+
+  // Feed the `<tool_call>` trigger — free text while awaiting, then the tag body
+  // is CONSTRAINED: a free letter is now REJECTED, but the variant openers
+  // (`\n` / `{`) are accepted.
+  REQUIRE(grammar.accept_tokens("auto0", EncodeChars("<tool_call>")));
+  const int32_t newline = static_cast<int32_t>(kChars.find('\n'));
+  CHECK(grammar.validate_tokens({letter_a}).empty());  // constrained now.
+  CHECK(grammar.validate_tokens({newline}) == std::vector<int32_t>{newline});
+  CHECK(grammar.validate_tokens({open_brace}) == std::vector<int32_t>{open_brace});
+
+  // The wiring still threads a live grammar to the runner.
+  auto [outputs, model_executed] = engine.step();
+  (void)outputs;
+  CHECK(model_executed);
+  CHECK(runner.last_grammar_present);
 }

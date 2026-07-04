@@ -516,3 +516,60 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
   h.server.stop();
   server_thread.join();
 }
+
+// Concurrent clients must not race the stateful (non-thread-safe) LLMEngine:
+// httplib services requests on a worker-thread pool, so the api_server serializes
+// engine-touching requests with a mutex. This fires N concurrent completion
+// requests and asserts every one returns a well-formed 200 (no crash, no
+// corrupted/empty body). Without the mutex this races the shared scheduler/runner
+// /KV state (a TSan/ASan build would flag it; even plain builds can crash/garble).
+TEST_CASE("api_server: concurrent requests are serialized (no engine race)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  constexpr int kClients = 6;
+  std::vector<std::thread> clients;
+  std::vector<int> statuses(kClients, -1);
+  std::vector<std::string> texts(kClients);
+  for (int i = 0; i < kClients; ++i) {
+    clients.emplace_back([&, i]() {
+      httplib::Client client("127.0.0.1", port);
+      client.set_read_timeout(30, 0);
+      auto res = client.Post(
+          "/v1/completions",
+          R"({"prompt":"hello","max_tokens":4,"temperature":0.0})",
+          "application/json");
+      if (res) {
+        statuses[static_cast<size_t>(i)] = res->status;
+        try {
+          json j = json::parse(res->body);
+          texts[static_cast<size_t>(i)] =
+              j.at("choices").at(0).at("text").get<std::string>();
+        } catch (...) {
+          statuses[static_cast<size_t>(i)] = -2;  // malformed body
+        }
+      }
+    });
+  }
+  for (auto& t : clients) t.join();
+
+  for (int i = 0; i < kClients; ++i) {
+    CHECK(statuses[static_cast<size_t>(i)] == 200);
+    CHECK_FALSE(texts[static_cast<size_t>(i)].empty());
+  }
+  // All greedy on the same prompt → identical deterministic output, which also
+  // confirms no cross-request state bleed.
+  for (int i = 1; i < kClients; ++i)
+    CHECK(texts[static_cast<size_t>(i)] == texts[0]);
+
+  h.server.stop();
+  server_thread.join();
+}

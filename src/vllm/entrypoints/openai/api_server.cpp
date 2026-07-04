@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <exception>
+#include <mutex>
 #include <utility>
 
 #include <httplib/httplib.h>
@@ -16,6 +17,13 @@ namespace vllm::entrypoints::openai {
 // Opaque httplib::Server (pimpl — keeps httplib.h out of api_server.h).
 struct ApiServer::Impl {
   httplib::Server server;
+  // The LLMEngine (+ Scheduler + runner + KV cache) is stateful and NOT
+  // thread-safe, but httplib services requests on a worker-thread pool. Serialize
+  // every engine-touching request so two concurrent clients cannot interleave
+  // add_request/step and corrupt the shared engine state. T0 = one request at a
+  // time (correct, not concurrent-throughput); true in-flight batching of
+  // multiple HTTP requests through one engine loop is a later async redesign.
+  std::mutex engine_mutex;
 };
 
 namespace {
@@ -75,6 +83,7 @@ ApiServer::DispatchResult ApiServer::handle_completions(
 
   CompletionResult result;
   try {
+    std::lock_guard<std::mutex> engine_lock(impl_->engine_mutex);
     result = completion_.create_completion(request);
   } catch (const std::exception& e) {
     return MakeError(500, "InternalServerError", e.what());
@@ -118,6 +127,7 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
 
   ChatCompletionResult result;
   try {
+    std::lock_guard<std::mutex> engine_lock(impl_->engine_mutex);
     result = chat_.create_chat_completion(request);
   } catch (const std::exception& e) {
     return MakeError(500, "InternalServerError", e.what());

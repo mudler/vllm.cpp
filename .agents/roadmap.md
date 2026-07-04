@@ -174,8 +174,23 @@ vocabulary is ported.**
   jinja2 on the Qwen3 template; loud-error on unsupported constructs). Injected
   into serving_chat via the ChatPromptFn seam. Tool/think template branches
   (namespace/tojson/reversed) = M3.3/M3.4.
-- ☐ **M3.3 Tool calling**: tools/tool_choice, Qwen + Hermes parsers,
-  streaming tool-call deltas, grammar-forced JSON for required/named.
+- ☑ **M3.3 Tool calling**: tools/tool_choice, Qwen + Hermes parsers,
+  streaming tool-call deltas, grammar-forced JSON for required/named. Done
+  `b315ef8` (protocol tools/tool_choice/ToolCall/DeltaToolCall) → `a14ce92`
+  (Hermes/Qwen3 `<tool_call>` parsers; gate model = Hermes format) → `fe5034d`
+  (streaming parser + serving_chat wiring + chat-template tools via minja tojson)
+  → `bdb4838`/`caa6fa4` (forced-JSON for required/named). Reviewed — the review
+  caught a real drop (forced JSON was bare, parser needs the wrapper; fixed).
+  **M3.3b — RELAXED tool_choice=auto (lazy grammar triggers)** `6ba00d0`+`bcfe9f0`
+  +`e6e497b`+`18e3efb`: per user feedback (can't force `<tool_call>` on auto — the
+  model may just reply). Analyzed BOTH llama.cpp (lazy grammar/awaiting_trigger) +
+  vLLM (xgrammar StructuralTag) → ported vLLM's STRUCTURAL_TAG seam 1:1 +
+  implemented the lazy matcher natively (awaiting no-op mask + trigger detect +
+  replay). auto → lazy (free text until `<tool_call>`, then constrain); required/
+  named → forced; none → nothing. Reviewed PASS. Fixed a gate-model bug: `<tool_call>`
+  /`</tool_call>` are ADDED tokens in Qwen3.6 → made added tokens grammar-matchable
+  by literal content. CPU 73/73 (clean rebuild). Deferred: Coder-XML/Mistral/
+  pythonic parsers, parallel-tool streaming edge cases.
 - ☑ **M3.4 Grammars**: structured-output manager + scheduler bitmask integration
   + GBNF/JSON-schema input. **DECISION (Path C, see plan + vllm-v1-v2 pattern):**
   ported the INTEGRATION layer 1:1 (StructuredOutputManager, get_grammar_bitmask,

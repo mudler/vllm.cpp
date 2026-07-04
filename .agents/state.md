@@ -670,3 +670,55 @@
   parsers, streaming tool-call deltas, grammar-forced JSON for required/named via
   M3.4) → **M3.6 conformance suite** → **M3.7 docs**. Plus **M0.10 GGUF model
   load** and the **dgx bring-up** (CUDA kernels + 35B paged gate on GB10).
+- **2026-07-04 (M3.3 + M3.3b done — tool calling with RELAXED auto)** — OpenAI
+  tool/function calling works over the chat server, and the KEY design point (per
+  user feedback) is handled: `tool_choice=auto` is RELAXED — the model may reply
+  in plain text OR call a tool. `18e3efb` (+ the M3.3 commits b315ef8/a14ce92/
+  fe5034d/bdb4838/caa6fa4 + the M3.3b commits 6ba00d0/bcfe9f0/e6e497b/18e3efb).
+  M3.3 pieces: tools/tool_choice protocol + ToolCall/DeltaToolCall; the Hermes/
+  Qwen3 `<tool_call>{json}</tool_call>` parsers (gate model qwen35moe = Hermes
+  format, verified via the tokenizer goldens) — non-streaming extract_tool_calls
+  + the incremental streaming parser (re-parse-and-diff, args deltas concatenate
+  to the full args); serving_chat wiring (tool_calls + finish_reason="tool_calls",
+  streaming deltas); chat-template tools rendering (extended the minja engine with
+  a `tojson` filter + a JSON value kind). **M3.3b — the RELAXED-auto design
+  (USER-DIRECTED):** the user flagged that forcing `<tool_call>` on auto is wrong
+  (the model might just reply). I cloned + analyzed BOTH llama.cpp (its lazy
+  grammar / grammar-triggers / awaiting_trigger mechanism, src/llama-grammar.cpp:
+  1339-1427) AND vLLM (its xgrammar **StructuralTag** — TriggeredTagsFormat for
+  auto, TagsWithSeparatorFormat at_least_one/stop_after_first for required/named).
+  **RECONCILED DESIGN (recorded in the plan):** vLLM's integration is
+  grammar-agnostic (the lazy behavior lives INSIDE the matcher), so the 1:1 PARITY
+  SEAM is vLLM's **STRUCTURAL_TAG** (a `structural_tag` param on
+  StructuredOutputsParams, keyed (kStructuralTag, spec), compile_grammar(
+  kStructuralTag, spec) — this UN-DEFERS the M3.4 STRUCTURAL_TAG stub), and we
+  implement the **lazy matcher NATIVELY** (the llama.cpp mechanism: while awaiting,
+  fill_bitmask = all-allowed [no constraint] + accept_tokens buffers free text and
+  watches for the trigger word `<tool_call>`; on match, flip active + REPLAY the
+  buffered bytes from the trigger offset so the JSON after `<tool_call>` is
+  constrained). serving_chat maps tool_choice → the structural-tag spec: auto =
+  lazy TriggeredTags (NOT forced), required = at_least_one, named = stop_after_first,
+  none = nothing. The manager/scheduler/apply are UNCHANGED (grammar-agnostic).
+  **Reviews caught + fixed two real bugs:** (1) the forced-JSON path emitted BARE
+  JSON but the parser needs the `<tool_call>` wrapper → the forced tool call was
+  dropped (fixed by forcing the wrapper in the grammar, then subsumed by the
+  structural-tag approach); (2) **`<tool_call>`/`</tool_call>` are ADDED tokens (id
+  248058/248059, special:false) in the REAL Qwen3.6 tokenizer** — the native
+  backend excluded ALL added tokens from the trie/byte-decode, so the WORD trigger
+  never fired + `</tool_call>` couldn't be consumed → auto tool calling was a
+  silent no-op for the gate model. FIXED: added tokens are now grammar-matchable by
+  their LITERAL CONTENT bytes (except stop/EOS), so the trigger fires + the call
+  completes. The M3.3b review (PASS/PASS) confirmed auto does NOT force (triple-
+  locked: fill all-allowed + is_terminated-while-awaiting + manager full-mask
+  path), the replay is byte-identical to llama.cpp (mid-token/straddling verified),
+  and the post-trigger fill==accept invariant holds. CPU ctest 73/73 (clean rebuild).
+  **NOTE (process):** a subagent's incremental build reported green while main's
+  full -Werror build was red (a header field added without a default initializer);
+  now doing CLEAN rebuilds after header changes (recorded in memory). **DEFERRED:**
+  Coder-XML/Mistral/pythonic tool parsers, TOKEN-id triggers in the structural-tag
+  spec (only WORD triggers — added-token literal matching covers the gate model),
+  parallel-tool streaming edges, the VLLM_ENFORCE_STRICT_TOOL_CALLING gating (vLLM's
+  default auto sets no constraint; we always set the lazy tag when tools present —
+  a stricter/more-helpful default, documented). NEXT toward the serving MVP: **M3.6
+  conformance suite** + **M3.7 docs**; plus **M0.10 GGUF model load** and the **dgx
+  bring-up** (CUDA kernels + 35B paged gate on GB10).

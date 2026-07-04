@@ -424,6 +424,78 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
   }
 }
 
+// --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
+// small host-side loops between the big decode ops; all math f32, dims inferred
+// from the tensor shapes.
+
+float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+// out[i] = F32ToBF16(in[i]); out bf16, in f32, same element count.
+void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  for (int64_t i = 0; i < n; ++i) StoreF32(out, i, LoadF32(in, i));
+}
+
+// Split fused [T, Hq*2*Dh] q/gate projection into q_out/gate_out [T,Hq,Dh].
+void AttnGateSplitKernel(Queue&, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  for (int64_t i = 0; i < t; ++i) {
+    for (int64_t h = 0; h < hq; ++h) {
+      const int64_t base = i * (hq * 2 * dh) + h * 2 * dh;  // start of (i,h) pair
+      const int64_t out_off = (i * hq + h) * dh;
+      for (int64_t d = 0; d < dh; ++d) {
+        StoreF32(q_out, out_off + d, LoadF32(qgate, base + d));
+        StoreF32(gate_out, out_off + d, LoadF32(qgate, base + dh + d));
+      }
+    }
+  }
+}
+
+// out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])); out bf16, attn/gate f32.
+void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn, const Tensor& gate) {
+  const int64_t n = out.Numel();
+  for (int64_t i = 0; i < n; ++i) StoreF32(out, i, LoadF32(attn, i) * Sigmoid(LoadF32(gate, i)));
+}
+
+// GDN g/beta from raw projections (gdn-semantics.md §6). softplus threshold 20.
+void GdnGBetaKernel(Queue&, Tensor& g_out, Tensor& beta_out, const Tensor& araw,
+                    const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias) {
+  const int64_t t = g_out.shape[0], hv = g_out.shape[1];
+  for (int64_t i = 0; i < t; ++i) {
+    for (int64_t h = 0; h < hv; ++h) {
+      const int64_t idx = i * hv + h;
+      const float x = LoadF32(araw, idx) + LoadF32(dt_bias, h);
+      const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus
+      StoreF32(g_out, idx, -std::exp(LoadF32(a_log, h)) * sp);
+      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
+    }
+  }
+}
+
+// Split GDN conv [T, 2*key_dim+value_dim] into q/k [T,key_dim] and v [T,value_dim].
+void GdnConvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv) {
+  const int64_t t = conv.shape[0], key_dim = q_out.Numel() / t, value_dim = v_out.Numel() / t;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t row = i * conv_dim;
+    for (int64_t j = 0; j < key_dim; ++j) {
+      StoreF32(q_out, i * key_dim + j, LoadF32(conv, row + j));
+      StoreF32(k_out, i * key_dim + j, LoadF32(conv, row + key_dim + j));
+    }
+    for (int64_t j = 0; j < value_dim; ++j)
+      StoreF32(v_out, i * value_dim + j, LoadF32(conv, row + 2 * key_dim + j));
+  }
+}
+
+// out[t,c] = F32ToBF16(sigmoid(gl[t]) * sd[t*H+c]); shared-expert sigmoid gate.
+void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor& gl) {
+  const int64_t t = out.shape[0], h = out.shape[1];
+  for (int64_t i = 0; i < t; ++i) {
+    const float g = Sigmoid(LoadF32(gl, i));
+    for (int64_t c = 0; c < h; ++c) StoreF32(out, i * h + c, g * LoadF32(sd, i * h + c));
+  }
+}
+
 struct Registrar {
   Registrar() {
     // static_cast against the ops.h aliases ties kernel signatures to the
@@ -459,6 +531,18 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
     RegisterOp(OpId::kAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
+    RegisterOp(OpId::kAttnGateSplit, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernel)));
+    RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16Kernel)));
+    RegisterOp(OpId::kGdnGBeta, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GdnGBetaFn>(&GdnGBetaKernel)));
+    RegisterOp(OpId::kGdnConvSplit, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GdnConvSplitFn>(&GdnConvSplitKernel)));
+    RegisterOp(OpId::kSharedExpertGate, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<SharedExpertGateFn>(&SharedExpertGateKernel)));
   }
 } registrar;
 

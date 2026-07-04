@@ -152,6 +152,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu
     src/vt/cuda/cuda_moe.cu
+    src/vt/cuda/cuda_glue.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_sample.cu)

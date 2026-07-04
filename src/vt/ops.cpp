@@ -678,4 +678,112 @@ void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask) {
       q, logits, mask);
 }
 
+// --- Qwen3.6 elementwise "glue" ops (M0.9 forward). ------------------------
+
+void CastBf16(Queue& q, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kBF16, "cast_bf16: out must be bf16");
+  VT_CHECK(in.dtype == DType::kF32, "cast_bf16: in must be f32");
+  VT_CHECK(out.Numel() == in.Numel(), "cast_bf16: out/in must have the same element count");
+  VT_CHECK(out.IsContiguous() && in.IsContiguous(), "cast_bf16: contiguous required");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "cast_bf16: device mismatch (out/in/queue)");
+  reinterpret_cast<CastBf16Fn>(GetOp(OpId::kCastBf16, q.device.type))(q, out, in);
+}
+
+void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
+  VT_CHECK(q_out.rank == 3 && gate_out.rank == 3, "attn_gate_split: q_out/gate_out rank-3 [T,Hq,Dh]");
+  VT_CHECK(qgate.rank == 2, "attn_gate_split: qgate rank-2 [T, Hq*2*Dh]");
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  VT_CHECK(gate_out.shape[0] == t && gate_out.shape[1] == hq && gate_out.shape[2] == dh,
+           "attn_gate_split: gate_out must match q_out [T,Hq,Dh]");
+  VT_CHECK(qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
+           "attn_gate_split: qgate must be [T, Hq*2*Dh]");
+  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32 &&
+               qgate.dtype == DType::kF32,
+           "attn_gate_split: q_out/gate_out/qgate must be f32");
+  VT_CHECK(q_out.IsContiguous() && gate_out.IsContiguous() && qgate.IsContiguous(),
+           "attn_gate_split: contiguous required");
+  VT_CHECK(q_out.device == q.device && gate_out.device == q.device && qgate.device == q.device,
+           "attn_gate_split: device mismatch (q_out/gate_out/qgate/queue)");
+  reinterpret_cast<AttnGateSplitFn>(GetOp(OpId::kAttnGateSplit, q.device.type))(q, q_out, gate_out,
+                                                                                qgate);
+}
+
+void SigmoidGateBf16(Queue& q, Tensor& out, const Tensor& attn, const Tensor& gate) {
+  VT_CHECK(out.dtype == DType::kBF16, "sigmoid_gate_bf16: out must be bf16");
+  VT_CHECK(attn.dtype == DType::kF32 && gate.dtype == DType::kF32,
+           "sigmoid_gate_bf16: attn/gate must be f32");
+  VT_CHECK(out.Numel() == attn.Numel() && out.Numel() == gate.Numel(),
+           "sigmoid_gate_bf16: out/attn/gate must have the same element count");
+  VT_CHECK(out.IsContiguous() && attn.IsContiguous() && gate.IsContiguous(),
+           "sigmoid_gate_bf16: contiguous required");
+  VT_CHECK(out.device == q.device && attn.device == q.device && gate.device == q.device,
+           "sigmoid_gate_bf16: device mismatch (out/attn/gate/queue)");
+  reinterpret_cast<SigmoidGateBf16Fn>(GetOp(OpId::kSigmoidGateBf16, q.device.type))(q, out, attn,
+                                                                                    gate);
+}
+
+void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, const Tensor& braw,
+              const Tensor& a_log, const Tensor& dt_bias) {
+  VT_CHECK(g_out.rank == 2 && beta_out.rank == 2 && araw.rank == 2 && braw.rank == 2,
+           "gdn_g_beta: g_out/beta_out/araw/braw rank-2 [T,Hv]");
+  const int64_t t = g_out.shape[0], hv = g_out.shape[1];
+  VT_CHECK(beta_out.shape[0] == t && beta_out.shape[1] == hv && araw.shape[0] == t &&
+               araw.shape[1] == hv && braw.shape[0] == t && braw.shape[1] == hv,
+           "gdn_g_beta: g_out/beta_out/araw/braw must all be [T,Hv]");
+  VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv && dt_bias.rank == 1 && dt_bias.shape[0] == hv,
+           "gdn_g_beta: a_log/dt_bias must be [Hv]");
+  VT_CHECK(g_out.dtype == DType::kF32 && beta_out.dtype == DType::kF32 &&
+               araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
+               a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
+           "gdn_g_beta: all tensors must be f32");
+  VT_CHECK(g_out.IsContiguous() && beta_out.IsContiguous() && araw.IsContiguous() &&
+               braw.IsContiguous() && a_log.IsContiguous() && dt_bias.IsContiguous(),
+           "gdn_g_beta: contiguous required");
+  VT_CHECK(g_out.device == q.device && beta_out.device == q.device && araw.device == q.device &&
+               braw.device == q.device && a_log.device == q.device && dt_bias.device == q.device,
+           "gdn_g_beta: device mismatch (g_out/beta_out/araw/braw/a_log/dt_bias/queue)");
+  reinterpret_cast<GdnGBetaFn>(GetOp(OpId::kGdnGBeta, q.device.type))(q, g_out, beta_out, araw,
+                                                                      braw, a_log, dt_bias);
+}
+
+void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv) {
+  VT_CHECK(conv.rank == 2, "gdn_conv_split: conv rank-2 [T, conv_dim]");
+  const int64_t t = conv.shape[0];
+  VT_CHECK(t > 0, "gdn_conv_split: T must be > 0");
+  VT_CHECK(q_out.Numel() % t == 0 && k_out.Numel() % t == 0 && v_out.Numel() % t == 0,
+           "gdn_conv_split: q_out/k_out/v_out element counts must be divisible by T");
+  const int64_t key_dim = q_out.Numel() / t, value_dim = v_out.Numel() / t;
+  VT_CHECK(k_out.Numel() / t == key_dim, "gdn_conv_split: q_out and k_out must share key_dim");
+  VT_CHECK(conv.shape[1] == 2 * key_dim + value_dim,
+           "gdn_conv_split: conv_dim must be 2*key_dim + value_dim");
+  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 &&
+               v_out.dtype == DType::kF32 && conv.dtype == DType::kF32,
+           "gdn_conv_split: all tensors must be f32");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
+               conv.IsContiguous(),
+           "gdn_conv_split: contiguous required");
+  VT_CHECK(q_out.device == q.device && k_out.device == q.device && v_out.device == q.device &&
+               conv.device == q.device,
+           "gdn_conv_split: device mismatch (q_out/k_out/v_out/conv/queue)");
+  reinterpret_cast<GdnConvSplitFn>(GetOp(OpId::kGdnConvSplit, q.device.type))(q, q_out, k_out,
+                                                                              v_out, conv);
+}
+
+void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl) {
+  VT_CHECK(out.rank == 2, "shared_expert_gate: out rank-2 [T,H]");
+  const int64_t t = out.shape[0], h = out.shape[1];
+  VT_CHECK(out.dtype == DType::kBF16, "shared_expert_gate: out must be bf16");
+  VT_CHECK(sd.dtype == DType::kF32 && gl.dtype == DType::kF32,
+           "shared_expert_gate: sd/gl must be f32");
+  VT_CHECK(sd.Numel() == t * h, "shared_expert_gate: sd must have T*H elements matching out");
+  VT_CHECK(gl.Numel() == t, "shared_expert_gate: gl must have T elements (one gate per token)");
+  VT_CHECK(out.IsContiguous() && sd.IsContiguous() && gl.IsContiguous(),
+           "shared_expert_gate: contiguous required");
+  VT_CHECK(out.device == q.device && sd.device == q.device && gl.device == q.device,
+           "shared_expert_gate: device mismatch (out/sd/gl/queue)");
+  reinterpret_cast<SharedExpertGateFn>(GetOp(OpId::kSharedExpertGate, q.device.type))(q, out, sd,
+                                                                                      gl);
+}
+
 }  // namespace vt

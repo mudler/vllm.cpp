@@ -36,6 +36,12 @@ enum class OpId : uint8_t {
   kMatmulNvfp4,
   kMoeGroupedGemmNvfp4,
   kMoeSiluMul,
+  kCastBf16,
+  kAttnGateSplit,
+  kSigmoidGateBf16,
+  kGdnGBeta,
+  kGdnConvSplit,
+  kSharedExpertGate,
   kCount
 };
 
@@ -124,6 +130,16 @@ using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
+// loops so the decode step can run entirely on-device (CUDA-graph capture).
+// All math in f32; dims are inferred from the tensor shapes (no args structs).
+using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using AttnGateSplitFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&);
+using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using GdnGBetaFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                            const Tensor&);
+using GdnConvSplitFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&);
+using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -541,5 +557,55 @@ void ApplyTokenMask(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& 
 // EXCLUDE (gpu_input_batch.py fills the row True then clears the allowed ids to
 // False). mask [num_reqs, vocab] i8. In place.
 void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask);
+
+// --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These fuse the small
+// host-side reshape/split/activation loops that sit between the big ops in the
+// decode forward, so the whole decode step stays on-device (CUDA-graph
+// capturable). All arithmetic is f32; every dimension is inferred from the
+// tensor shapes (no args structs). CPU + CUDA.
+
+// out[i] = F32ToBF16(in[i]); out bf16, in f32, same element count. The plain
+// f32 -> bf16 activation-dtype cast used before feeding a bf16-consuming op.
+void CastBf16(Queue& q, Tensor& out, const Tensor& in);
+
+// Splits the fused q/gate attention projection into its two halves. qgate is
+// [T, Hq*2*Dh] contiguous, laid out per (t,hq) as [q(Dh) | gate(Dh)]; q_out and
+// gate_out are [T,Hq,Dh]. For t in [0,T), hq in [0,Hq):
+//   q_out[t,hq,:]    = qgate row t at offset (hq*2*Dh)      .. +Dh
+//   gate_out[t,hq,:] = qgate row t at offset (hq*2*Dh + Dh) .. +2*Dh
+// T/Hq/Dh are inferred from q_out's shape. All f32.
+void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate);
+
+// out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])), sigmoid(x)=1/(1+exp(-x)); out
+// bf16, attn/gate f32, same element count. The sigmoid output-gate applied to
+// the attention result before the o_proj (elementwise on the projection split).
+void SigmoidGateBf16(Queue& q, Tensor& out, const Tensor& attn, const Tensor& gate);
+
+// Derives the GDN per-head decay g and gate beta from the raw projections
+// (gdn-semantics.md §6). g_out/beta_out/araw/braw are [T,Hv]; a_log/dt_bias are
+// [Hv]. For t in [0,T), hv in [0,Hv), idx=t*Hv+hv:
+//   x  = araw[idx] + dt_bias[hv]
+//   sp = softplus(x) = (x > 20) ? x : log1p(exp(x))    (threshold 20)
+//   g_out[idx]    = -exp(a_log[hv]) * sp
+//   beta_out[idx] = sigmoid(braw[idx])
+// T/Hv inferred from g_out's shape. All f32.
+void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, const Tensor& braw,
+              const Tensor& a_log, const Tensor& dt_bias);
+
+// Splits the GDN mixed-qkv conv output into its q/k/v parts. conv is
+// [T, conv_dim] contiguous, laid out per row as [q(key_dim) | k(key_dim) |
+// v(value_dim)], conv_dim = 2*key_dim + value_dim. q_out/k_out are [T,key_dim],
+// v_out is [T,value_dim]; for each row t:
+//   q_out row = conv row [0, key_dim);  k_out row = conv row [key_dim, 2*key_dim);
+//   v_out row = conv row [2*key_dim, 2*key_dim + value_dim)
+// T = conv.shape[0]; key_dim = q_out.Numel()/T, value_dim = v_out.Numel()/T
+// (rows treated row-major). All f32.
+void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv);
+
+// out[t,c] = F32ToBF16(sigmoid(gl[t]) * sd[t*H+c]); out bf16 [T,H], sd f32
+// [T,H], gl f32 with T elements (shape [T] or [T,1]). The shared-expert
+// sigmoid gate (moe-semantics.md §5), applied per token to the shared MLP
+// output. T inferred from out.shape[0], H = out.Numel()/T.
+void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
 
 }  // namespace vt

@@ -785,3 +785,27 @@
   qwen36_35b/*.gguf). NEXT (when hardware is available): M2 perf + the dgx bring-up.
   On CPU there is no further MVP work — the remaining items are M2 GPU perf (needs
   GB10 to measure) and the hardware validation.
+- **2026-07-04 (M2.1 harness done — the gate-#1 measurement tool)** — `57cd5af`.
+  `examples/bench` (`vllm-bench`) drives the LLMEngine at configurable concurrency
+  (--model/--num-prompts/--input-len/--output-len/--concurrency) and reports the
+  vLLM-comparable throughput/latency metrics (mirrored from vllm/benchmarks/
+  serve.py: request/output/total-token throughput, TTFT/TPOT/ITL/E2EL mean/median/
+  p99) + a prefill-vs-decode split. CPU synthetic smoke green (the numbers are
+  meaningless on toy weights — the harness is the deliverable); ctest 79/79.
+  **This is the CPU half of M2.1** — the throughput-PARITY measurement (run
+  vllm-bench on the real 35B + `vllm bench throughput` on the ~/venvs/vllm-oracle
+  baseline at large concurrency, record both in the ledger) is dgx-pending.
+  **★ CPU-IMPLEMENTABLE MVP SURFACE NOW FULLY EXHAUSTED ★** — everything the MVP
+  needs that can be built AND validated on a CPU-only box is done + green + recorded
+  (M0, M1, M3.1-M3.7, M0.10, the dgx bring-up harness + the paged-engine 35B gate,
+  the M2.1 bench harness). The genuinely-remaining MVP gates are HARDWARE-BOUND and
+  need `ssh dgx.casa` (GB10): (1) **M2.2-M2.6 GPU PERF KERNELS** (NVFP4 W4A4 GEMM/
+  MoE, GDN fused kernels, paged-attn tuning, CUDA graphs, fusions) — these can be
+  WRITTEN under CUDA guards but their whole POINT is MEASURED speedup, which needs
+  the GPU; writing unmeasurable kernels is low-value; (2) the **dgx BRING-UP RUN**
+  (scripts/dgx-bringup.sh: the CUDA-kernel parity suite + the M0-exit dense gate +
+  the paged-engine 35B greedy gate + the APEX GGUF greedy) — needs the hardware +
+  the checkpoints; (3) the **M2 throughput-parity measurement** (vllm-bench vs the
+  vLLM oracle on GB10 → the ledger parity table = gate #1). NEXT (needs GB10): run
+  the dgx bring-up; then M2.2+ perf kernels driven by real measurements from the
+  M2.1 harness.

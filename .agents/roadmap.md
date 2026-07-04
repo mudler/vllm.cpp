@@ -155,8 +155,14 @@ vocabulary is ported.**
 
 ## M2 — Parity performance (gate #1)
 
-- ☐ **M2.1 bench harness** (`examples/bench`, `vllm bench serve` semantics) +
+- 🚧 **M2.1 bench harness** (`examples/bench`, `vllm bench serve` semantics) +
   vLLM baseline installed & measured on dgx.casa (record numbers in ledger).
+  **Harness DONE** `57cd5af` (`examples/bench` → `vllm-bench`: concurrency
+  admission loop over the LLMEngine, vLLM-comparable metrics [req/output/total
+  throughput, TTFT/TPOT/ITL/E2EL mean/median/p99, prefill-vs-decode split],
+  mirrored from `vllm/benchmarks/serve.py`; CPU synthetic smoke green). **PENDING
+  (GB10):** run it on the real 35B + the vLLM oracle (`~/venvs/vllm-oracle`) at
+  large concurrency and record the parity numbers in the ledger.
 - ☐ **M2.2 NVFP4 W4A4 GEMM/MoE kernels** (killgate prior art; weights stay
   fp4 in memory). DoD: op parity + measured speedup.
 - ☐ **M2.3 GDN kernel tuning** (fused post-conv, fused recurrence).

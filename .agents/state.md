@@ -959,3 +959,20 @@
   is the open measurement item (needs LocalAI idle). NEXT: Phase 2 CUDA-graph capture (hoist
   per-token inputs to persistent device buffers, pre-warm pool, wire BeginCapture/Replay into
   GPUModelRunner) — the big decode-gap unlock, now unblocked.
+- **2026-07-04 (PIVOTAL — first clean free-box vLLM comparison; CUDA graphs disproven as the unlock)**
+  — `2999431`. Phase 2 landed decode CUDA-graph capture correctly (paged gate 16/16 WITH
+  graph active, mirrors vLLM, gated to num_reqs==1 with zero batched regression) BUT the
+  result is a **load-bearing negative**: graphs recover only +2.6% single-stream and regress
+  −7% at batch-8. Phase 1's async-on-stream work already hid host launch overhead behind the
+  GPU → **decode is now GPU-COMPUTE-BOUND, not host-bound**. The user stopped the LocalAI
+  worker (GPU 91%→0%), enabling the FIRST honest apples-to-apples free-box measurement vs
+  vLLM (8×1024×128 enforce-eager): **vLLM 1124 total / 124.9 output tok/s vs ours 70.2 total /
+  7.8 output → ~16× slower**, dominated by **prefill (TTFT ~100s)** + slow reference kernels.
+  **STRATEGIC RE-ORIENTATION of gate #1:** the remaining ~16× is GPU-KERNEL + PREFILL COMPUTE
+  SPEED — the naive NVFP4 dequant-GEMM (no tensor-core MMA), the GDN scan, and attention need
+  to become cutlass/flashinfer-class. Host-overhead optimizations (graphs, device-resident
+  forward) are DONE and were worth ~1000×→~16×; the last gap is raw kernel throughput.
+  NEXT (measure-first): nsys-profile the free-box PREFILL + decode to get the GPU-time
+  breakdown by kernel, then attack the dominant cost (almost certainly the NVFP4 GEMM → a
+  tensor-core MMA kernel, the killgate prior art). GPU is free — keep it serialized to one
+  workstream. Restart `local-ai-worker` when the measurement campaign pauses.

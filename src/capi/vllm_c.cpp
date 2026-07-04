@@ -198,7 +198,12 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
     }
     const vllm::CompletionOutput& o = result.outputs[0];
 
-    char* text = DupString(o.text);
+    // The raw-bytes detokenizer can leave invalid/truncated UTF-8 in the text,
+    // which a NUL-terminated C string cannot safely carry (embedded NULs would
+    // truncate it; invalid bytes break UTF-8 consumers). Sanitize to valid UTF-8
+    // (U+FFFD for invalid runs) exactly as the streaming path does — the C ABI
+    // always hands out well-formed UTF-8.
+    char* text = DupString(vllm::entrypoints::openai::SanitizeUtf8(o.text));
     if (text == nullptr) {
       SetError("vllm_complete: out-of-memory copying completion text");
       return VLLM_ERR_RUNTIME;

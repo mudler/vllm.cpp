@@ -944,3 +944,18 @@
   loops] eliminated so the step is pure-async-on-stream, then capture/replay); (2) prefill
   fusions + the NVFP4 MMA GEMM (the ~27× total gap); (3) GDN scan (~20% GPU); (4) M2.2c FP8
   on-device. GB10 iteration (each validation loads the 35B) is the campaign's rate limiter.
+- **2026-07-04 (device-resident forward +46%, decode now SYNC-FREE → CUDA graphs unblocked)**
+  — `f95b131`. Device-ified the mid-forward host glue (6 new elementwise vt ops for the
+  attention gate/sigmoid, GDN g-beta/conv-split, shared-expert gate; device-resident matmul
+  helpers returning DBuf; blocks thread hidden/res as device tensors). The fp4+CUDA decode
+  body is now PURE async-on-stream (only Embedding + final-logits Download remain host) — THE
+  prerequisite for CUDA-graph capture. GB10: paged gate 16/16 token-for-token, CPU 82/82.
+  **Measured +46% output/+76% per-stream decode** (fair A/B under LocalAI contention). Gate-#1
+  campaign continues: ~1000× → now the decode step is device-resident + sync-free, ready for
+  the CUDA-graph capture that collapses the ~88% host-API overhead (the ~9× decode gap).
+  **MEASUREMENT NOTE (directive):** the box's LocalAI service was pinning the GPU ~89% during
+  this window, depressing absolutes + blocking a free-box apples-to-apples vLLM re-measure —
+  the fair same-conditions A/B (+46%) stands; a free-box both-sides re-measure vs vLLM 131/1181
+  is the open measurement item (needs LocalAI idle). NEXT: Phase 2 CUDA-graph capture (hoist
+  per-token inputs to persistent device buffers, pre-warm pool, wire BeginCapture/Replay into
+  GPUModelRunner) — the big decode-gap unlock, now unblocked.

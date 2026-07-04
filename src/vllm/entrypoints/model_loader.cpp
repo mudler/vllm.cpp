@@ -11,7 +11,9 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 
@@ -132,6 +134,18 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
   const fs::path dir(model_dir);
+
+  // A single `.gguf` file: config + weights + tokenizer all come from the
+  // GGUF (M0.10). The engine stack below is unchanged.
+  if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
+    vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
+    HfConfig config = vllm::HfConfigFromGguf(gguf);
+    tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
+    Qwen3_5MoeWeights weights = vllm::LoadQwen3_5MoeFromGguf(gguf, config);
+    return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
+                                          std::move(tokenizer), params);
+  }
+
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
     throw std::runtime_error("model path is not a directory: " + model_dir);
   }

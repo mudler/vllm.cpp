@@ -66,6 +66,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_dequant.cpp
   src/vllm/model_executor/model_loader/nvfp4_dequant.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
+  src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
   src/vllm/model_executor/models/registry.cpp
   src/vllm/tokenizer/unicode_data.cpp

@@ -143,45 +143,50 @@ __global__ void MoeGroupedGemmNvfp4Kernel(Tout* out, const Tin* act, const int32
   const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
   const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t p = blockIdx.y;
-  if (n >= n_cols || p >= p_rows) return;
-
-  const int64_t e = expert_ids[p];
-  const int64_t r = row_map != nullptr ? row_map[p] : p;
-  const auto* packed = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(packed_ptrs[e]));
-  const auto* scale = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(scale_ptrs[e]));
-  const float scale2 = scale2s[e];
-
+  if (n >= n_cols) return;
   const int64_t packed_cols = k_dim / 2;
   const int64_t groups = k_dim / 16;
-  const uint8_t* prow = packed + n * packed_cols;
-  const uint8_t* srow = scale + n * groups;
-  const Tin* arow = act + r * k_dim;
 
-  float acc = 0.0f;
-  for (int64_t g = 0; g < groups; ++g) {
-    const float gs = F8E4M3ToF32Dev(srow[g]) * scale2;
-    const int64_t base = g * 16;
-    for (int j = 0; j < 8; ++j) {
-      const uint8_t b = prow[g * 8 + j];
-      const uint8_t low = b & 0x0Fu;
-      const uint8_t high = b >> 4;
-      const float lo_mag = e2m1[low & 0x7u] * ((low & 0x8u) ? -1.0f : 1.0f);
-      const float hi_mag = e2m1[high & 0x7u] * ((high & 0x8u) ? -1.0f : 1.0f);
-      const float w_lo = __bfloat162float(__float2bfloat16(lo_mag * gs));
-      const float w_hi = __bfloat162float(__float2bfloat16(hi_mag * gs));
-      acc += Load(arow, base + 2 * j) * w_lo;
-      acc += Load(arow, base + 2 * j + 1) * w_hi;
+  // Grid-stride over the pair rows: P = T*top_k can exceed the gridDim.y max
+  // (65535), so blockIdx.y strides rather than indexing p directly (a long
+  // prefill chunk with a large token count would otherwise blow the y-grid cap).
+  for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
+    const int64_t e = expert_ids[p];
+    const int64_t r = row_map != nullptr ? row_map[p] : p;
+    const auto* packed = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(packed_ptrs[e]));
+    const auto* scale = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(scale_ptrs[e]));
+    const float scale2 = scale2s[e];
+
+    const uint8_t* prow = packed + n * packed_cols;
+    const uint8_t* srow = scale + n * groups;
+    const Tin* arow = act + r * k_dim;
+
+    float acc = 0.0f;
+    for (int64_t g = 0; g < groups; ++g) {
+      const float gs = F8E4M3ToF32Dev(srow[g]) * scale2;
+      const int64_t base = g * 16;
+      for (int j = 0; j < 8; ++j) {
+        const uint8_t b = prow[g * 8 + j];
+        const uint8_t low = b & 0x0Fu;
+        const uint8_t high = b >> 4;
+        const float lo_mag = e2m1[low & 0x7u] * ((low & 0x8u) ? -1.0f : 1.0f);
+        const float hi_mag = e2m1[high & 0x7u] * ((high & 0x8u) ? -1.0f : 1.0f);
+        const float w_lo = __bfloat162float(__float2bfloat16(lo_mag * gs));
+        const float w_hi = __bfloat162float(__float2bfloat16(hi_mag * gs));
+        acc += Load(arow, base + 2 * j) * w_lo;
+        acc += Load(arow, base + 2 * j + 1) * w_hi;
+      }
     }
+    Store(out, p * n_cols + n, acc);
   }
-  Store(out, p * n_cols + n, acc);
 }
 
 template <typename Tin, typename Tout>
 void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                    const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
                    const Tensor& scale2s, int64_t p, int64_t n, int64_t k) {
-  const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(p));
+  const int64_t y = p < 65535 ? p : 65535;  // grid.y max; kernel strides over p
+  const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(y));
   MoeGroupedGemmNvfp4Kernel<Tin, Tout><<<grid, kBlock, 0, s>>>(
       out.Ptr<Tout>(), act.Ptr<Tin>(), expert_ids.Ptr<int32_t>(),
       row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr, packed_ptrs.Ptr<int64_t>(),

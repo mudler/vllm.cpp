@@ -80,7 +80,10 @@ namespace {
 
 constexpr int32_t kCannedToken = 3;   // a valid in-vocab id the stub "samples".
 constexpr int32_t kEos = 200;
-const std::string kChars = "{}[]\":,. -0123456789abcdefghijklmnopqrstuvwxyz";
+// Includes the `<`, `>`, `/`, `_` and newline bytes the WRAPPED tool-call
+// grammar (`<tool_call>\n{...}\n</tool_call>`) needs so it is drivable here.
+const std::string kChars =
+    "{}[]\":,. -0123456789abcdefghijklmnopqrstuvwxyz<>/_\n";
 
 class TempJson {
  public:
@@ -257,10 +260,11 @@ TEST_CASE("response_format json_schema constrains decoding end to end (native ba
   CHECK(runner.last_grammar_req_ids[0] == "req0");
 }
 
-// M3.3 Task 4: a tool_choice=required forced tool-call schema flows the same
-// path (ApplyToolChoiceStructuredOutput -> structured_outputs.json -> Request ->
-// grammar_init -> constrained decode) and yields a live JSON grammar.
-TEST_CASE("tool_choice required forces a tool-call JSON grammar end to end (native backend)") {
+// M3.3: a tool_choice=required forced tool-call schema flows the same path
+// (ApplyToolChoiceStructuredOutput -> structured_outputs.grammar -> Request ->
+// grammar_init -> constrained decode) and yields a live grammar that emits the
+// WRAPPED `<tool_call>…</tool_call>` tool call the Hermes/Qwen parser extracts.
+TEST_CASE("tool_choice required forces a wrapped tool-call grammar end to end (native backend)") {
   using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
   using vllm::entrypoints::openai::ChatCompletionToolsParam;
   using vllm::entrypoints::openai::ChatMessage;
@@ -278,11 +282,13 @@ TEST_CASE("tool_choice required forces a tool-call JSON grammar end to end (nati
   req.tools = std::vector<ChatCompletionToolsParam>{tool};
   req.tool_choice = ToolChoice{"required", std::nullopt};
 
-  // The forced tool-call schema flows onto the SamplingParams.
+  // The forced tool-call schema flows onto the SamplingParams as the WRAPPED
+  // GBNF grammar (structured_outputs.grammar, NOT bare .json).
   SamplingParams sp = req.to_sampling_params(/*default_max_tokens=*/16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
-  REQUIRE(sp.structured_outputs->json.has_value());
+  CHECK_FALSE(sp.structured_outputs->json.has_value());
+  REQUIRE(sp.structured_outputs->grammar.has_value());
 
   // The engine, with a NATIVE-backed manager shared by scheduler + core.
   StructuredOutputManager manager(
@@ -298,17 +304,20 @@ TEST_CASE("tool_choice required forces a tool-call JSON grammar end to end (nati
                                            /*arrival_time=*/0.0, Hasher());
   engine.add_request(std::move(request));
 
-  // grammar_init compiled the forced tool-call schema into a live JSON grammar.
+  // grammar_init compiled the forced tool-call schema into a live grammar.
   Request* r = scheduler->requests.at("tc0").get();
   REQUIRE(r->structured_output_request.has_value());
   REQUIRE(r->structured_output_request->grammar != nullptr);
 
-  // It is a JSON-object grammar: the opening '{' is allowed, a letter is not.
+  // It is the WRAPPED tool-call grammar: the first byte must be '<' (the
+  // `<tool_call>` wrapper), and a BARE '{' is REJECTED at the start — this is
+  // what makes the constrained output extractable by the Hermes/Qwen parser
+  // (the bare-JSON bug this fix closes).
   auto& grammar = *r->structured_output_request->grammar;
+  const int32_t open_angle = static_cast<int32_t>(kChars.find('<'));
   const int32_t open_brace = static_cast<int32_t>(kChars.find('{'));
-  const int32_t letter_a = static_cast<int32_t>(kChars.find('a'));
-  CHECK(grammar.validate_tokens({open_brace}) == std::vector<int32_t>{open_brace});
-  CHECK(grammar.validate_tokens({letter_a}).empty());
+  CHECK(grammar.validate_tokens({open_angle}) == std::vector<int32_t>{open_angle});
+  CHECK(grammar.validate_tokens({open_brace}).empty());
 
   // EngineCore.step threads a NON-NULL GrammarOutput naming the req.
   auto [outputs, model_executed] = engine.step();

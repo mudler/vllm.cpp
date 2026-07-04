@@ -38,6 +38,7 @@
 #include "vllm/v1/engine/llm_engine.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/structured_output/json_schema_to_gbnf.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -736,12 +737,17 @@ TEST_CASE("serving_chat: tool_choice named forces the tool's {name,arguments} sc
   CHECK(schema->at("required") == json::array({"name", "arguments"}));
   CHECK(schema->at("additionalProperties") == false);
 
-  // (e) The forced schema flows to structured_outputs.json.
+  // (e) The forced schema flows to structured_outputs.grammar as the WRAPPED
+  // `<tool_call>…</tool_call>` GBNF (NOT bare .json) so the Hermes/Qwen parser
+  // can extract the constrained tool call. See test_tool_choice_grammar for the
+  // loop-closing extraction proof.
   SamplingParams sp = req.to_sampling_params(16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
-  REQUIRE(sp.structured_outputs->json.has_value());
-  CHECK(json::parse(*sp.structured_outputs->json) == *schema);
+  CHECK_FALSE(sp.structured_outputs->json.has_value());
+  REQUIRE(sp.structured_outputs->grammar.has_value());
+  CHECK(*sp.structured_outputs->grammar ==
+        vllm::v1::WrapSchemaAsToolCallGbnf(*schema));
 }
 
 // A named tool with NO parameters -> arguments constrained to any JSON (`true`).
@@ -777,12 +783,15 @@ TEST_CASE("serving_chat: tool_choice required with multiple tools forces anyOf")
   CHECK(schema->at("anyOf").at(1).at("properties").at("name").at("const") ==
         "set_alarm");
 
-  // It flows onto the SamplingParams (and Verify accepts the single json field).
+  // It flows onto the SamplingParams as the WRAPPED anyOf grammar (Verify accepts
+  // the single grammar field). The root emits `<tool_call>\n` (A|B) `\n</tool_call>`.
   SamplingParams sp = req.to_sampling_params(16);
   ApplyToolChoiceStructuredOutput(req, sp);
   REQUIRE(sp.structured_outputs.has_value());
-  REQUIRE(sp.structured_outputs->json.has_value());
-  CHECK(json::parse(*sp.structured_outputs->json) == *schema);
+  CHECK_FALSE(sp.structured_outputs->json.has_value());
+  REQUIRE(sp.structured_outputs->grammar.has_value());
+  CHECK(*sp.structured_outputs->grammar ==
+        vllm::v1::WrapSchemaAsToolCallGbnf(*schema));
 }
 
 // (d) auto tool_choice -> NO forced grammar (unset / explicit "auto").

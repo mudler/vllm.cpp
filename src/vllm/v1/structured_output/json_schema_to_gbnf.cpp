@@ -341,4 +341,34 @@ std::string JsonObjectGbnf() {
   return out;
 }
 
+std::string WrapSchemaAsToolCallGbnf(
+    const nlohmann::json& tool_call_object_schema) {
+  // Lower the tool-call object schema. Convert() emits exactly one `root ::=`
+  // line (the primitives block defines no rule named "root"); it is the JSON
+  // value the constrained decode would emit BARE. Rename it to an inner rule so
+  // we can wrap it with the `<tool_call>` literals in a fresh `root`.
+  std::string inner = JsonSchemaToGbnf(tool_call_object_schema);
+  const std::string marker = "\nroot ::= ";
+  const std::size_t pos = inner.find(marker);
+  if (pos == std::string::npos) {
+    throw std::runtime_error(
+        "WrapSchemaAsToolCallGbnf: lowered grammar has no 'root' rule to wrap");
+  }
+  // The name "_toolcallbody" starts with '_' (a valid GBNF rule-name start) and
+  // does not collide with any primitive rule or with "root".
+  inner.replace(pos, marker.size(), "\n_toolcallbody ::= ");
+
+  // Prepend the wrapping root. The GBNF string literals carry the exact Hermes
+  // wrapper bytes: `<tool_call>\n` (begin) and `\n</tool_call>` (end). The `\n`
+  // are GBNF escapes (parsed to newline); `<`, `>`, `/` are literal bytes the
+  // string-literal path emits verbatim. The Hermes parser's
+  // `<tool_call>(.*?)</tool_call>` (DOTALL) captures `\n{...}\n`, then `.strip()`
+  // trims the leading/trailing newline before json.loads — so the inner JSON is
+  // extracted verbatim.
+  std::string out =
+      "root ::= \"<tool_call>\\n\" _toolcallbody \"\\n</tool_call>\"\n";
+  out += inner;
+  return out;
+}
+
 }  // namespace vllm::v1

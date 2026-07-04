@@ -65,4 +65,27 @@ std::string JsonSchemaToGbnf(const nlohmann::json& schema);
 // number / boolean / null, arbitrarily nested).
 std::string JsonObjectGbnf();
 
+// Wrap a tool-call OBJECT schema into a GBNF grammar whose `root` emits the
+// literal Hermes/Qwen `<tool_call>` wrapper around the schema-constrained JSON:
+//
+//   root ::= "<tool_call>\n" <schema-constrained JSON object> "\n</tool_call>"
+//
+// Used for tool_choice="required" / a named function: upstream vLLM forces the
+// literal `<tool_call>` wrapper via an xgrammar StructuralTag
+// (tool_parsers/structural_tag_registry.py:213-234 — begin `<tool_call>\n{"name":
+// "`, end `}\n</tool_call>`) so the constrained decode is WRAPPED and the same
+// Hermes regex parser (`<tool_call>(.*?)</tool_call>`, DOTALL) extracts it. Our
+// json-only GBNF path emitted BARE JSON with no wrapper, so the parser's
+// `find("<tool_call>")` guard dropped the forced call. This restores the wrapper
+// IN THE GRAMMAR: the emitted output is `<tool_call>\n{...}\n</tool_call>`, which
+// BOTH extract_tool_calls (non-stream) and extract_tool_calls_streaming extract.
+//
+// Implementation: lower `tool_call_object_schema` via JsonSchemaToGbnf, rename
+// its generated `root` rule to an inner rule, and prepend a new `root` that wraps
+// it in the `<tool_call>\n` … `\n</tool_call>` literals. The grammar REJECTS bare
+// JSON (root's first byte must be `<`). Route it through structured_outputs.grammar
+// (the kGrammar native compile path) — NOT structured_outputs.json.
+std::string WrapSchemaAsToolCallGbnf(
+    const nlohmann::json& tool_call_object_schema);
+
 }  // namespace vllm::v1

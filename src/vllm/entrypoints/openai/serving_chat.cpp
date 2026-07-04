@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/v1/structured_output/json_schema_to_gbnf.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -125,9 +126,15 @@ void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
   if (!forced.has_value()) return;
   // The forced tool-call schema IS the structured-output constraint (it replaces
   // any response_format constraint — a forced tool call carries none in
-  // practice). structured_outputs then holds exactly `json` (one constraint).
+  // practice). Route it through `grammar` (the kGrammar native compile path), NOT
+  // `json`: WrapSchemaAsToolCallGbnf lowers the schema AND forces the literal
+  // `<tool_call>\n{...}\n</tool_call>` wrapper the Hermes/Qwen parser requires
+  // (upstream forces it via an xgrammar StructuralTag). A bare-JSON `json`
+  // constraint emitted an unwrapped object the parser's `find("<tool_call>")`
+  // guard dropped. structured_outputs then holds exactly `grammar` (one
+  // constraint); `json` stays unset.
   StructuredOutputsParams so;
-  so.json = forced->dump();
+  so.grammar = vllm::v1::WrapSchemaAsToolCallGbnf(*forced);
   sampling_params.structured_outputs = std::move(so);
   sampling_params.structured_outputs->Verify();  // exactly-one-constraint check.
 }
@@ -229,9 +236,10 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
 
   SamplingParams sampling_params = request.to_sampling_params();
 
-  // tool_choice=required / named FORCES a grammar (structured_outputs.json) so
-  // the constrained decode emits a valid tool call before add_request (upstream
-  // builds an xgrammar StructuralTag; chat_completion/serving.py ->
+  // tool_choice=required / named FORCES a grammar (structured_outputs.grammar,
+  // the WRAPPED `<tool_call>…</tool_call>` GBNF) so the constrained decode emits
+  // a valid, parser-extractable tool call before add_request (upstream builds an
+  // xgrammar StructuralTag; chat_completion/serving.py ->
   // tool_parsers/structural_tag_registry.py). auto/none: no-op.
   ApplyToolChoiceStructuredOutput(request, sampling_params);
 

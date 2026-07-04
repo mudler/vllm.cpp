@@ -111,17 +111,18 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
 //                                "required":["name","arguments"],
 //                                "additionalProperties":false}
 //   required, multiple tools -> {"anyOf":[<per-tool object schema>, ...]}
-// DEVIATION (§9): our structured_outputs.json constrains the tool-call JSON
-// OBJECT only, NOT the literal `<tool_call>...</tool_call>` wrapper the upstream
-// structural tag also forces (our GBNF json path cannot emit surrounding literal
-// text). The tool parser (Task 2/3) extracts the wrapped call from the output.
+// This is the INNER tool-call object schema. ApplyToolChoiceStructuredOutput
+// wraps it (WrapSchemaAsToolCallGbnf) in the literal `<tool_call>...</tool_call>`
+// wrapper before constraining the decode, mirroring the upstream structural tag.
 std::optional<nlohmann::json> ToolChoiceForcedSchema(
     const ChatCompletionRequest& request);
 
 // Apply ToolChoiceForcedSchema onto `sampling_params`: sets
-// structured_outputs.json = the forced schema (dumped) so the decode is
-// CONSTRAINED to a valid tool call. No-op for auto/none. Called in
-// create_chat_completion before add_request.
+// structured_outputs.grammar = WrapSchemaAsToolCallGbnf(forced schema) so the
+// decode is CONSTRAINED to a WRAPPED tool call
+// (`<tool_call>\n{...}\n</tool_call>`) the Hermes/Qwen parser extracts — for both
+// stream and non-stream. No-op for auto/none. Called in create_chat_completion
+// before add_request.
 void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
                                      SamplingParams& sampling_params);
 

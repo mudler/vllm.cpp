@@ -86,6 +86,7 @@ add_library(vllm STATIC
   src/vllm/v1/engine/types.cpp
   src/vllm/v1/engine/detokenizer.cpp
   src/vllm/v1/engine/core.cpp
+  src/vllm/v1/engine/input_processor.cpp
   src/vllm/v1/executor/executor.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp

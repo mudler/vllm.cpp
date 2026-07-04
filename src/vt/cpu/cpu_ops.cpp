@@ -76,6 +76,15 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   }
 }
 
+void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
+  const int64_t n = out.Numel();
+  for (int64_t i = 0; i < n; ++i) {
+    const float g = LoadF32(gate, i);
+    const float silu = g / (1.0f + std::exp(-g));
+    StoreF32(out, i, silu * LoadF32(up, i));
+  }
+}
+
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
   for (int64_t i = 0; i < t; ++i) {
@@ -425,6 +434,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,

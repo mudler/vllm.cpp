@@ -217,6 +217,61 @@ void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const
   }
 }
 
+// ---------------------------------------------------------------------------
+// moe_silu_mul (moe-semantics.md §4): out[i] = silu(gate[i]) * up[i], the fused
+// activation between the grouped gate/up and down GEMMs. f32 math (silu via
+// expf), rounded on store — the same accepted expf-vs-std::exp deviation the CPU
+// reference carries (the routed sum is bf16-robust; the greedy gate is stable).
+template <typename Tg, typename Tu, typename Tout>
+__global__ void MoeSiluMulKernel(Tout* out, const Tg* gate, const Tu* up, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const float g = Load(gate, i);
+    const float s = g / (1.0f + expf(-g));
+    Store(out, i, s * Load(up, i));
+  }
+}
+
+template <typename Tg, typename Tu, typename Tout>
+void LaunchSiluMul(cudaStream_t s, Tensor& out, const Tensor& gate, const Tensor& up, int64_t n) {
+  MoeSiluMulKernel<Tg, Tu, Tout>
+      <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<Tout>(), gate.Ptr<Tg>(), up.Ptr<Tu>(), n);
+  Check(cudaGetLastError(), "moe_silu_mul launch");
+}
+
+template <typename Tg, typename Tu>
+void SiluMulByOut(cudaStream_t s, Tensor& out, const Tensor& gate, const Tensor& up, int64_t n) {
+  if (out.dtype == DType::kF32) {
+    LaunchSiluMul<Tg, Tu, float>(s, out, gate, up, n);
+  } else {
+    LaunchSiluMul<Tg, Tu, __nv_bfloat16>(s, out, gate, up, n);
+  }
+}
+
+template <typename Tg>
+void SiluMulByUp(cudaStream_t s, Tensor& out, const Tensor& gate, const Tensor& up, int64_t n) {
+  if (up.dtype == DType::kF32) {
+    SiluMulByOut<Tg, float>(s, out, gate, up, n);
+  } else {
+    SiluMulByOut<Tg, __nv_bfloat16>(s, out, gate, up, n);
+  }
+}
+
+void MoeSiluMulKernelCuda(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
+  VT_CHECK(gate.dtype == DType::kF32 || gate.dtype == DType::kBF16,
+           "cuda moe_silu_mul: unsupported gate dtype (f32/bf16 only)");
+  VT_CHECK(up.dtype == DType::kF32 || up.dtype == DType::kBF16,
+           "cuda moe_silu_mul: unsupported up dtype (f32/bf16 only)");
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  cudaStream_t s = AsStream(q);
+  if (gate.dtype == DType::kF32) {
+    SiluMulByUp<float>(s, out, gate, up, n);
+  } else {
+    SiluMulByUp<__nv_bfloat16>(s, out, gate, up, n);
+  }
+}
+
 // Registers the CUDA MoE kernels during static init (pre-main, like the M0.6
 // ops in cuda_ops.cu). Filling the op table is harmless on machines without a
 // GPU: the kCUDA backend never registers there, so no CUDA queue can dispatch.
@@ -226,6 +281,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelCuda)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernelCuda)));
+    RegisterOp(OpId::kMoeSiluMul, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelCuda)));
   }
 } registrar;
 

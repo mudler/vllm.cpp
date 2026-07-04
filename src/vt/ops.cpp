@@ -71,6 +71,50 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
       q, out, act, weight_packed, weight_scale, weight_scale_2);
 }
 
+void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                         const Tensor* row_map, const Tensor& packed_ptrs,
+                         const Tensor& scale_ptrs, const Tensor& scale2s) {
+  VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_nvfp4: out/act must be rank-2");
+  const int64_t p = out.shape[0], k = act.shape[1], e = scale2s.shape[0];
+  VT_CHECK(k % 16 == 0, "moe_grouped_gemm_nvfp4: K (act inner dim) must be a multiple of 16");
+  VT_CHECK(expert_ids.Numel() == p,
+           "moe_grouped_gemm_nvfp4: expert_ids must have P entries (one per out row)");
+  VT_CHECK(expert_ids.dtype == DType::kI32, "moe_grouped_gemm_nvfp4: expert_ids must be i32");
+  VT_CHECK(packed_ptrs.Numel() == e && scale_ptrs.Numel() == e,
+           "moe_grouped_gemm_nvfp4: packed_ptrs/scale_ptrs must have E entries");
+  VT_CHECK(packed_ptrs.dtype == DType::kI64 && scale_ptrs.dtype == DType::kI64,
+           "moe_grouped_gemm_nvfp4: packed_ptrs/scale_ptrs must be i64 (device pointers)");
+  VT_CHECK(scale2s.dtype == DType::kF32, "moe_grouped_gemm_nvfp4: scale2s must be f32");
+  VT_CHECK(IsFloat(act.dtype) && IsOutFloat(out.dtype),
+           "moe_grouped_gemm_nvfp4: float act, f32/bf16 out");
+  VT_CHECK(act.IsContiguous() && out.IsContiguous() && expert_ids.IsContiguous() &&
+               packed_ptrs.IsContiguous() && scale_ptrs.IsContiguous() && scale2s.IsContiguous(),
+           "moe_grouped_gemm_nvfp4: contiguous tensors required");
+  VT_CHECK(act.device == q.device && out.device == q.device && expert_ids.device == q.device &&
+               packed_ptrs.device == q.device && scale_ptrs.device == q.device &&
+               scale2s.device == q.device,
+           "moe_grouped_gemm_nvfp4: device mismatch");
+  if (row_map != nullptr) {
+    VT_CHECK(row_map->Numel() == p && row_map->dtype == DType::kI32 && row_map->IsContiguous() &&
+                 row_map->device == q.device,
+             "moe_grouped_gemm_nvfp4: row_map must be contiguous i32 [P] on the queue device");
+  }
+  reinterpret_cast<MoeGroupedGemmNvfp4Fn>(GetOp(OpId::kMoeGroupedGemmNvfp4, q.device.type))(
+      q, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s);
+}
+
+void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
+  VT_CHECK(gate.Numel() == out.Numel() && up.Numel() == out.Numel(),
+           "moe_silu_mul: out/gate/up must have the same element count");
+  VT_CHECK(IsFloat(gate.dtype) && IsFloat(up.dtype) && IsOutFloat(out.dtype),
+           "moe_silu_mul: float gate/up, f32/bf16 out");
+  VT_CHECK(out.IsContiguous() && gate.IsContiguous() && up.IsContiguous(),
+           "moe_silu_mul: contiguous tensors required");
+  VT_CHECK(out.device == q.device && gate.device == q.device && up.device == q.device,
+           "moe_silu_mul: device mismatch (out/gate/up/queue)");
+  reinterpret_cast<MoeSiluMulFn>(GetOp(OpId::kMoeSiluMul, q.device.type))(q, out, gate, up);
+}
+
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual) {
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1, "rmsnorm: x/out rank-2, w rank-1");

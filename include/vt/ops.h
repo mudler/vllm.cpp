@@ -34,6 +34,8 @@ enum class OpId : uint8_t {
   kApplyTokenMask,
   kApplyAllowedTokenIds,
   kMatmulNvfp4,
+  kMoeGroupedGemmNvfp4,
+  kMoeSiluMul,
   kCount
 };
 
@@ -118,6 +120,10 @@ struct MoeRouterTopKArgs {
 using MatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MatmulNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using MoeGroupedGemmNvfp4Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
+             const Tensor&, const Tensor&);
+using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -199,6 +205,41 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // is DequantNvfp4ToBf16 + Matmul).
 void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
                  const Tensor& weight_scale, float weight_scale_2);
+
+// --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
+// projection for ALL (token, activated-expert) pairs at once, instead of the
+// per-expert loop of tiny MatmulNvfp4 launches (the launch-overhead-bound decode
+// bottleneck). For each output row p (a (token,slot) pair):
+//   out[p, :] = act[row_map ? row_map[p] : p, :] @ dequant(W[expert_ids[p]]).T
+// where W[e] is the modelopt W4A16_NVFP4 weight [N=out, K=in] of expert e (same
+// on-the-fly decode as vt::MatmulNvfp4, bit-for-bit vllm::DequantNvfp4ToBf16).
+// The E per-expert weights are passed as DEVICE POINTER ARRAYS (the fp4-resident
+// buffers, M2.2b) indexed by expert id — no weight gather/copy:
+//   out          [P, N] f32/bf16 (P = num (token,expert) pairs)
+//   act          [R, K] f32/bf16 (R rows; gate/up read the token hidden [T,H],
+//                down reads the per-pair silu output [P,I])
+//   expert_ids   [P] i32  (device; the router's top-k indices, [T,top_k] viewed
+//                as [P] — pair p = token p/top_k, slot p%top_k)
+//   row_map      [P] i32  (device) or nullptr: act row for output row p (nullptr
+//                => identity p; gate/up pass token-of-pair = p/top_k)
+//   packed_ptrs  [E] i64  (device) each entry = (uintptr_t) of expert e's packed
+//                [N,K/2] i8 buffer
+//   scale_ptrs   [E] i64  (device) each entry = (uintptr_t) of expert e's scale
+//                [N,K/16] i8 buffer
+//   scale2s      [E] f32  (device) per-expert weight_scale_2
+// K = act.shape[1] (multiple of 16), N = out.shape[1], P = out.shape[0]. f32
+// accumulation, per-row bit-identical to the per-expert MatmulNvfp4. CUDA only
+// (the CPU MoE path keeps the per-expert dequant+matmul reference).
+void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                         const Tensor* row_map, const Tensor& packed_ptrs,
+                         const Tensor& scale_ptrs, const Tensor& scale2s);
+
+// out[R,I] = silu(gate[R,I]) * up[R,I]  (moe-semantics.md §4; the fused-MoE
+// element-wise activation between the grouped gate/up and down GEMMs). gate/up
+// f32 or bf16, out f32/bf16; silu/mul computed in f32, rounded on store. Unlike
+// vt::SiluAndMul (single [T,2D] input), this takes the two separately-produced
+// projections so no concat/copy is needed. CPU + CUDA.
+void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma);
 // out f32 or bf16 (computed in f32, rounded on store).

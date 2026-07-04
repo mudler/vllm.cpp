@@ -803,6 +803,119 @@ std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
   return MatmulNvfp4Bf16(d, act, n, I, down);  // [n,H]
 }
 
+// Shared-expert MLP (moe-semantics.md §5): silu-mul MLP then sigmoid(x@Wseg) *
+// out. Same host-glue path for both the reference and fused MoE (the shared
+// expert is a single dense MLP over all T tokens, not a per-expert loop, so it
+// is not part of the M2.4 launch-count reduction). h [T*H] bf16 -> shared
+// [T*H] bf16 (the `shared` term the combine adds).
+std::vector<uint16_t> SharedExpert(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                                   const std::vector<uint16_t>& h, int64_t T, bool fp4) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t Is = cfg.shared_expert_intermediate_size;
+  std::vector<float> sg = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_gate_proj_fp4)
+                              : MatmulF32(d, h, T, H, w.shared_gate_proj);  // [T,Is]
+  std::vector<float> su = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_up_proj_fp4)
+                              : MatmulF32(d, h, T, H, w.shared_up_proj);    // [T,Is]
+  std::vector<uint16_t> sact(static_cast<size_t>(T) * Is);
+  for (size_t i = 0; i < sact.size(); ++i)
+    sact[i] = vt::F32ToBF16(Silu(sg[i]) * su[i]);
+  std::vector<float> sd = fp4 ? MatmulNvfp4F32(d, sact, T, Is, w.shared_down_proj_fp4)
+                              : MatmulF32(d, sact, T, Is, w.shared_down_proj);  // [T,H]
+  std::vector<float> gl = MatmulF32(d, h, T, H, w.shared_gate);                 // [T,1]
+  std::vector<uint16_t> shared(static_cast<size_t>(T) * H);
+  for (int64_t t = 0; t < T; ++t) {
+    const float gate = Sigmoid(gl[static_cast<size_t>(t)]);
+    for (int64_t c = 0; c < H; ++c)
+      shared[static_cast<size_t>(t) * H + c] =
+          vt::F32ToBF16(gate * sd[static_cast<size_t>(t) * H + c]);
+  }
+  return shared;
+}
+
+// --- Fused MoE block (M2.4). CUDA + fp4-resident only. Replaces the per-expert
+// loop of tiny MatmulNvfp4 launches (each with a host round-trip Download) with
+// ~3 GROUPED NVFP4 GEMM launches over ALL (token, activated-expert) pairs, kept
+// entirely on-device (no host round-trip in the expert compute). The router
+// top-k indices [T,top_k] ARE the per-pair expert ids (viewed as [P=T*top_k]);
+// gate/up read the token hidden via a row-map (pair p -> token p/top_k), down
+// reads the per-pair silu output. The E fp4-resident expert weights are indexed
+// by device pointer arrays. Result is per-pair bit-identical to ExpertMlpNvfp4
+// (same on-the-fly NVFP4 decode + f32 accumulation); the combine + shared expert
+// match MoeBlock exactly. h [T*H] bf16 -> [T*H] bf16.
+std::vector<uint16_t> MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                                        const std::vector<uint16_t>& h, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+
+  // Hidden states resident once; router logits + top-k stay on device (the ids
+  // [T,top_k] are the pair expert ids, the weights [T,top_k] feed the combine).
+  DBuf dh(d, DType::kBF16, {T, H}, h.data());
+  DBuf drg = WeightBuf(d, w.router_gate);                 // [H,E] bf16
+  DBuf dlog(d, DType::kBF16, {T, E});
+  vt::Matmul(d.q, dlog.t(), dh.t(), drg.t());             // logits [T,E]
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+  Tensor eids = Reshape(dtid.t(), {P});                   // [P] i32 expert ids
+
+  // Per-expert fp4-resident device pointer arrays (packed/scale/scale2) for the
+  // gate/up/down projections, gathered once (residency is uploaded lazily + kept
+  // in each weight's shared_ptr — after warm-up these Get()s are pointer reads).
+  std::vector<int64_t> gp(E), gs(E), up(E), us(E), dp(E), ds(E);
+  std::vector<float> g2(E), u2(E), d2(E);
+  for (int64_t e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    Nvfp4Dev g = ResidentNvfp4(d, w.expert_gate_fp4[se]);
+    Nvfp4Dev u = ResidentNvfp4(d, w.expert_up_fp4[se]);
+    Nvfp4Dev dn = ResidentNvfp4(d, w.expert_down_fp4[se]);
+    gp[se] = reinterpret_cast<int64_t>(g.packed.data);
+    gs[se] = reinterpret_cast<int64_t>(g.scale.data);
+    up[se] = reinterpret_cast<int64_t>(u.packed.data);
+    us[se] = reinterpret_cast<int64_t>(u.scale.data);
+    dp[se] = reinterpret_cast<int64_t>(dn.packed.data);
+    ds[se] = reinterpret_cast<int64_t>(dn.scale.data);
+    g2[se] = w.expert_gate_fp4[se].scale2;
+    u2[se] = w.expert_up_fp4[se].scale2;
+    d2[se] = w.expert_down_fp4[se].scale2;
+  }
+  DBuf dgp(d, DType::kI64, {E}, gp.data()), dgs(d, DType::kI64, {E}, gs.data());
+  DBuf dup(d, DType::kI64, {E}, up.data()), dus(d, DType::kI64, {E}, us.data());
+  DBuf ddp(d, DType::kI64, {E}, dp.data()), dds(d, DType::kI64, {E}, ds.data());
+  DBuf dg2(d, DType::kF32, {E}, g2.data()), du2(d, DType::kF32, {E}, u2.data());
+  DBuf dd2(d, DType::kF32, {E}, d2.data());
+
+  // Gate/up read the token hidden: pair p -> token p/top_k.
+  std::vector<int32_t> tok_map(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p) tok_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
+  DBuf dtok(d, DType::kI32, {P}, tok_map.data());
+
+  // Grouped gate/up GEMM over all pairs (one launch each), silu-mul, grouped
+  // down GEMM (act = per-pair silu output, identity row-map). expert_out lands
+  // as [T,top_k,H] contiguous — exactly what MoeCombine consumes.
+  DBuf dgate(d, DType::kF32, {P, I});
+  DBuf dup_out(d, DType::kF32, {P, I});
+  vt::MoeGroupedGemmNvfp4(d.q, dgate.t(), dh.t(), eids, &dtok.t(), dgp.t(), dgs.t(), dg2.t());
+  vt::MoeGroupedGemmNvfp4(d.q, dup_out.t(), dh.t(), eids, &dtok.t(), dup.t(), dus.t(), du2.t());
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup_out.t());
+  DBuf ddown(d, DType::kBF16, {P, H});
+  vt::MoeGroupedGemmNvfp4(d.q, ddown.t(), dact.t(), eids, nullptr, ddp.t(), dds.t(), dd2.t());
+  Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+
+  // Shared expert + weighted combine (out = shared + sum_j w_j * expert_out_j).
+  std::vector<uint16_t> shared = SharedExpert(d, w, cfg, h, T, true);
+  DBuf dsh(d, DType::kBF16, {T, H}, shared.data());
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &dsh.t());
+  std::vector<uint16_t> out(static_cast<size_t>(T) * H);
+  dout.Download(d, out.data());
+  return out;
+}
+
 // --- Sparse-MoE block (moe-semantics.md §1-§6). Router top-k over ALL experts,
 // then the ACTIVATED-EXPERT token-gather loop (not O(E)-dense), shared expert
 // with sigmoid gate, and the weighted combine. h [T*H] bf16 -> [T*H] bf16.
@@ -813,10 +926,16 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   const int64_t E = cfg.num_experts;
   const int64_t top_k = cfg.num_experts_per_tok;
   const int64_t I = cfg.moe_intermediate_size;
-  const int64_t Is = cfg.shared_expert_intermediate_size;
   // fp4-resident NVFP4 experts/shared (M2.2b real-ckpt CUDA load) vs bf16
   // (synthetic / GGUF). Exactly one set is populated (see qwen3_5_weights.h).
   const bool fp4 = !w.expert_gate_fp4.empty();
+
+  // M2.4 fused MoE: CUDA + fp4-resident does the expert compute in ~3 grouped
+  // GEMM launches on-device (no per-expert loop of host round-trips). The CPU
+  // path (and the bf16/GGUF path) keeps the per-expert reference below — the
+  // fused output is per-pair bit-identical to it (same NVFP4 decode).
+  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA)
+    return MoeBlockFusedCuda(d, w, cfg, h, T);
 
   // Router: logits = x @ gate.T (bf16, §2), softmax/top-k/renormalize (§3).
   std::vector<uint16_t> logits = MatmulBf16(d, h, T, H, w.router_gate);  // [T,E]
@@ -864,23 +983,7 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   }
 
   // Shared expert (moe-semantics.md §5): silu-mul MLP then sigmoid(x@Wseg)*out.
-  std::vector<float> sg = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_gate_proj_fp4)
-                              : MatmulF32(d, h, T, H, w.shared_gate_proj);  // [T,Is]
-  std::vector<float> su = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_up_proj_fp4)
-                              : MatmulF32(d, h, T, H, w.shared_up_proj);    // [T,Is]
-  std::vector<uint16_t> sact(static_cast<size_t>(T) * Is);
-  for (size_t i = 0; i < sact.size(); ++i)
-    sact[i] = vt::F32ToBF16(Silu(sg[i]) * su[i]);
-  std::vector<float> sd = fp4 ? MatmulNvfp4F32(d, sact, T, Is, w.shared_down_proj_fp4)
-                              : MatmulF32(d, sact, T, Is, w.shared_down_proj);  // [T,H]
-  std::vector<float> gl = MatmulF32(d, h, T, H, w.shared_gate);           // [T,1]
-  std::vector<uint16_t> shared(static_cast<size_t>(T) * H);
-  for (int64_t t = 0; t < T; ++t) {
-    const float gate = Sigmoid(gl[static_cast<size_t>(t)]);
-    for (int64_t c = 0; c < H; ++c)
-      shared[static_cast<size_t>(t) * H + c] =
-          vt::F32ToBF16(gate * sd[static_cast<size_t>(t) * H + c]);
-  }
+  std::vector<uint16_t> shared = SharedExpert(d, w, cfg, h, T, fp4);
 
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
   DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());

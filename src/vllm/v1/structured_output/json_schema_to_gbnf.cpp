@@ -212,6 +212,21 @@ class Converter {
       return false;
     };
 
+    // A `required` key that is NOT declared in `properties` cannot be turned into
+    // a grammar member, so its requiredness would be silently unenforced —
+    // over-permitting schema-INVALID JSON (missing that key). Per this converter's
+    // "throw rather than mis-constrain" invariant (json_schema_to_gbnf.h), reject
+    // it loudly instead. (In practice function-calling / response_format schemas
+    // always list every required key in properties.)
+    for (const std::string& r : required) {
+      if (!props.contains(r)) {
+        throw std::runtime_error(
+            "json schema -> gbnf: required key '" + r +
+            "' is not declared in 'properties' (unsupported — would not be "
+            "enforced)");
+      }
+    }
+
     // Per property (in schema/key order): the "member" element
     //   "\"<key>\"" ws ":" ws <value-expr>
     // and whether it is required.

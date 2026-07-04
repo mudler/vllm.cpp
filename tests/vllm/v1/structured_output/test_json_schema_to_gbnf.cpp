@@ -328,4 +328,8 @@ TEST_CASE("JsonSchemaToGbnf: unsupported constructs throw") {
   auto backend = MakeBackend();
   CHECK_THROWS(backend->compile_grammar(StructuredOutputOptions::kJson,
                                         "{not json"));
+  // A `required` key not declared in `properties` would be silently unenforced
+  // (over-permit) — must throw rather than mis-constrain.
+  CHECK_THROWS(JsonSchemaToGbnf(json::parse(
+      R"({"type":"object","properties":{"a":{"type":"integer"}},"required":["z"]})")));
 }

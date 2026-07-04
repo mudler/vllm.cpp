@@ -809,3 +809,31 @@
   vLLM oracle on GB10 → the ledger parity table = gate #1). NEXT (needs GB10): run
   the dgx bring-up; then M2.2+ perf kernels driven by real measurements from the
   M2.1 harness.
+- **2026-07-04 (★ dgx BRING-UP — CUDA STACK + 35B GATES VALIDATED ON REAL GB10 ★)**
+  — The hardware wall was a WRONG assumption: `ssh dgx.casa` works non-interactively
+  (GB10, CUDA 13.0, nvcc). Synced the repo to dgx (~/work/vllm.cpp @ latest main),
+  built with `-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121 -DVLLM_CPP_SERVER=ON`
+  — **the ENTIRE CUDA kernel set compiled clean on GB10** (all of M1.6/M1.7's
+  reshape_and_cache/paged_attention/sampling ops + the batched runner + server +
+  bench). Ran the full `ctest` on the CUDA build: **100% — 79/79 passed, 0 failed**,
+  including:
+  - tests 1-77: every CUDA-vs-CPU parity case (the M1.6/M1.7 kernels) validated on
+    real GB10 hardware — closes the "CUDA kernels build-guarded/unrun" carry across
+    M1.6/M1.7 entirely;
+  - **#78 test_op_parity** (the M0-exit DENSE 35B gate, RunQwen36Logits) — PASSED
+    (2603 s: cold 22GB NVFP4→bf16 load + the 40-layer dense forward);
+  - **#79 test_qwen36_paged_engine** (the NEW real-model PAGED-engine gate) — PASSED
+    (331 s): the real Qwen3.6-35B-A3B greedy-decodes 16 tokens through the full
+    paged LLMEngine (paged attention + KV-cache growth + batched GDN + Sampler)
+    TOKEN-FOR-TOKEN matching the M0-exit golden. **This is the real-model paged
+    validation that was the outstanding M1/dgx acceptance gate — MET.**
+  So the whole M1 engine + the serving stack + the sampler + the GGUF/safetensors
+  load are now validated on REAL GB10 hardware with the REAL 35B model, not just
+  synthetically on CPU. **KEY M2 FINDING (measured):** the correctness-grade forward
+  is SLOW on GB10 and GPU-underutilized (test_op_parity 43 min at ~0% GPU, 85GB host
+  RSS) — the bottleneck is CPU-side NVFP4→bf16 dequant at load + per-op host↔device
+  staging, NOT GPU compute. This is EXACTLY the M2 target: on-device NVFP4 GEMM
+  (weights stay fp4 in memory, M2.2), staged on-device KV/weight storage, and fused
+  kernels + CUDA graphs. The M2.1 bench will quantify the gap vs the vLLM oracle.
+  REMAINING: M2 throughput parity (the perf kernels + the measured gate #1); the
+  APEX GGUF greedy (point the paged gate at a Compact/Balanced .gguf).

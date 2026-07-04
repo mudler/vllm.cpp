@@ -6,6 +6,14 @@
 # section bounds, __gmon_start__, ...) are always emitted global regardless of
 # the version script; those are allow-listed. Invoked as a ctest:
 #   cmake -DVLLM_SHARED_LIB=<path> -P cmake/VerifyExports.cmake
+# In script mode (`cmake -P`) policies default to unset, so `IN_LIST` (a CMP0057
+# operator) is NOT recognized and the allow-list branch below errors out. Opt in
+# so the allow-list actually runs (without this the script fails on the FIRST
+# non-vllm_* symbol with an "Unknown arguments" error rather than the intended
+# leak message — and would false-fail on a clean lib whose linker keeps a benign
+# global symbol).
+cmake_policy(SET CMP0057 NEW)
+
 if(NOT DEFINED VLLM_SHARED_LIB)
   message(FATAL_ERROR "VerifyExports: VLLM_SHARED_LIB not set")
 endif()

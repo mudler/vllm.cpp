@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -476,6 +477,48 @@ TEST_CASE("capi: vllm_complete_stream early-stop tears the request down cleanly"
   CHECK(acc2.deltas > 2);  // this one runs to natural finish.
 
   // And blocking still works on the same engine after an early-stop.
+  vllm_completion out;
+  CHECK(vllm_complete(eng, "hello", &sp, &out) == VLLM_OK);
+  CHECK(out.text != nullptr);
+  vllm_completion_free(&out);
+
+  vllm_engine_free(eng);
+}
+
+// A callback that THROWS mid-stream (a C++ FFI consumer's callback can raise).
+bool ThrowingCb(const char* /*delta_text*/, bool /*finished*/, void* user_data) {
+  auto* n = static_cast<int*>(user_data);
+  ++(*n);
+  if (*n >= 1) throw std::runtime_error("callback boom");
+  return true;
+}
+
+// ─── (g2) a throwing callback / mid-stream error must NOT poison the engine ───
+// Regression for a heap-use-after-free: the stream path formerly aborted the
+// in-flight request ONLY on the callback-returns-false branch, and both entry
+// points reused a FIXED request id "0". An exception escaping the loop left "0"
+// registered; the NEXT call's add_request("0") freed-and-reinserted the key while
+// the scheduler still held the old Request → UAF in Request::NumTokens(). The fix
+// = unique per-call ids + a RAII guard that aborts on every exit path. This test
+// throws from the callback, then reuses the engine (a plain build corrupts /
+// ASan flags UAF without the fix).
+TEST_CASE("capi: a throwing stream callback leaves the engine reusable (no UAF)") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+  vllm_sampling_params sp = GreedyParams(10);
+
+  // The throwing callback unwinds out of vllm_complete_stream; the ABI catches it
+  // and returns a runtime error (never throws across the boundary).
+  int calls = 0;
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &ThrowingCb, &calls) ==
+        VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("boom") != std::string::npos);
+
+  // The engine must still be fully usable — the aborted request left no dangling
+  // state, and the next call uses a fresh id so it cannot collide.
+  StreamAccumulator acc;
+  CHECK(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &acc) == VLLM_OK);
+  CHECK(acc.saw_finished);
   vllm_completion out;
   CHECK(vllm_complete(eng, "hello", &sp, &out) == VLLM_OK);
   CHECK(out.text != nullptr);

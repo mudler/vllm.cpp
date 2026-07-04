@@ -8,6 +8,8 @@
 // llama.cpp's llama.h (handle-based load -> complete -> free).
 #include "vllm.h"
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -27,9 +29,35 @@
 // The opaque handle: owns the whole C++ engine stack behind LoadedEngine.
 struct vllm_engine {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded;
+  // Monotonic per-handle request-id source. Each vllm_complete[_stream] call
+  // uses a FRESH id so a request left in-flight by a mid-call exception can never
+  // collide with a later call's id — a collision would make LLMEngine.add_request
+  // free-and-reinsert the same key while the scheduler still holds the old
+  // (now-freed) Request → heap-use-after-free. Unique ids + the RequestGuard
+  // below make the engine safely reusable after ANY mid-request error.
+  std::atomic<uint64_t> next_request_id{0};
 };
 
 namespace {
+
+// RAII: aborts an in-flight request on scope exit (incl. exception unwind) unless
+// disarmed after a clean finish. abort_request is a safe no-op on an already-
+// finished/unknown id, and we swallow any exception so the noexcept dtor can't
+// std::terminate during unwind. This guarantees no request is left registered
+// after a throwing callback or a mid-stream runtime error.
+struct RequestGuard {
+  vllm::v1::LLMEngine& engine;
+  std::string id;
+  bool armed = true;
+  ~RequestGuard() {
+    if (!armed) return;
+    try {
+      engine.abort_request(id);
+    } catch (...) {  // NOLINT(bugprone-empty-catch) — dtor must not throw
+    }
+  }
+  void disarm() { armed = false; }
+};
 
 // Thread-local last-error string. Set on every non-OK return; read by
 // vllm_last_error(). Thread-local so concurrent callers on different threads do
@@ -189,8 +217,14 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
   try {
     const vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
-    const vllm::RequestOutput result =
-        engine->loaded->engine().generate(prompt, sp);
+    vllm::v1::LLMEngine& e = engine->loaded->engine();
+    const std::string request_id =
+        std::to_string(engine->next_request_id.fetch_add(1));
+    // If generate() throws mid-loop the request is torn down by the guard; a
+    // clean return means it already finished, so disarm.
+    RequestGuard guard{e, request_id};
+    const vllm::RequestOutput result = e.generate(prompt, sp, request_id);
+    guard.disarm();
 
     if (result.outputs.empty()) {
       SetError("vllm_complete: engine produced no output sequence");
@@ -241,10 +275,14 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
     const vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kDelta);
 
-    // One prompt per call -> its own request id. add_request + drive step()
-    // directly (like serving_completion) — no new LLMEngine driver needed.
-    const std::string request_id = "0";
+    // One prompt per call -> its own FRESH request id. add_request + drive step()
+    // directly (like serving_completion) — no new LLMEngine driver needed. The
+    // guard tears the request down on EVERY exit path (early-stop, a throwing
+    // callback, or a mid-stream step() error) so the engine stays reusable.
     vllm::v1::LLMEngine& e = engine->loaded->engine();
+    const std::string request_id =
+        std::to_string(engine->next_request_id.fetch_add(1));
+    RequestGuard guard{e, request_id};
     e.add_request(request_id, prompt, sp);
 
     bool stopped_by_callback = false;
@@ -270,14 +308,12 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
       if (stopped_by_callback) break;
     }
 
-    if (stopped_by_callback) {
-      // Early stop: tear the in-flight request down so the engine stays usable.
-      // A no-op if it already finished on this very delta.
-      e.abort_request(request_id);
-    }
-    // On a natural finish the DELTA path already delivered a final res.finished
-    // == true delta to the callback (make_request_output sets finished on the
-    // last delta), so no extra terminal call is needed here.
+    // On early stop the guard aborts the in-flight request. On a natural finish
+    // the request already left the engine (the DELTA path delivered a final
+    // res.finished==true delta to the callback), so the guard's abort would be a
+    // no-op — but disarm to skip it. If a step()/callback threw, we never reach
+    // here and the guard fires during unwind.
+    if (!stopped_by_callback) guard.disarm();
 
     ClearError();
     return VLLM_OK;

@@ -9,9 +9,11 @@
 
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -143,6 +145,98 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
   const int64_t n = w.Numel();
   std::vector<float> out(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  return out;
+}
+
+// --- NVFP4 fp4-resident weight helpers (M2.2b) ------------------------------
+
+// Device-resident views over an Nvfp4Weight's packed + scale buffers. Valid for
+// the lifetime of the weight (the buffers are owned by the weight's shared_ptr).
+struct Nvfp4Dev {
+  Tensor packed;
+  Tensor scale;
+};
+
+// Upload packed + scale to the device ONCE (lazily, on first use) and keep them
+// resident: the shared_ptr in the (const) weight owns the device buffer across
+// every forward step, so subsequent calls reuse the resident copy — no per-op
+// weight staging. CUDA path only; the deleter frees through the vt Backend.
+Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
+  if (!w.d_packed) {
+    const size_t pb = w.packed.bytes.size();
+    void* p = d.b.Alloc(pb);
+    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
+    Backend* bk = &d.b;
+    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  if (!w.d_scale) {
+    const size_t sb = w.scale.bytes.size();
+    void* p = d.b.Alloc(sb);
+    d.b.Copy(d.q, p, w.scale.bytes.data(), sb);
+    Backend* bk = &d.b;
+    w.d_scale = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  Nvfp4Dev r;
+  r.packed = MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k / 2});
+  r.scale = MakeTensor(w.d_scale.get(), DType::kI8, d.q.device, {w.n, w.k / 16});
+  return r;
+}
+
+// Host reference dequant of an fp4 weight to bf16 [K=in, N=out] (Matmul-B
+// layout) — the CPU fallback for the fp4 path (no CPU MatmulNvfp4 kernel). Only
+// exercised when a real fp4 checkpoint is run on the host device; the CUDA path
+// never dequants. Bit-for-bit vllm::DequantNvfp4ToBf16 + transpose.
+std::vector<uint16_t> DequantNvfp4ToBLayout(const Nvfp4Weight& w) {
+  const int64_t out_dim = w.n, in_dim = w.k;
+  std::vector<uint16_t> oi(static_cast<size_t>(out_dim) * in_dim);
+  DequantNvfp4ToBf16(reinterpret_cast<const uint8_t*>(w.packed.bytes.data()),
+                     reinterpret_cast<const uint8_t*>(w.scale.bytes.data()),
+                     w.scale2, out_dim, in_dim, oi.data());
+  std::vector<uint16_t> io(static_cast<size_t>(in_dim) * out_dim);
+  for (int64_t r = 0; r < out_dim; ++r)
+    for (int64_t c = 0; c < in_dim; ++c)
+      io[static_cast<size_t>(c) * out_dim + r] =
+          oi[static_cast<size_t>(r) * in_dim + c];
+  return io;
+}
+
+// y[M,N] f32 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
+// in for MatmulF32 where the weight is NVFP4 (experts/shared/lm_head).
+std::vector<float> MatmulNvfp4F32(Dev d, const std::vector<uint16_t>& x, int64_t M,
+                                  int64_t K, const Nvfp4Weight& w) {
+  const int64_t N = w.n;
+  DBuf dx(d, DType::kBF16, {M, K}, x.data());
+  DBuf dout(d, DType::kF32, {M, N});
+  if (d.q.device.type == vt::DeviceType::kCUDA) {
+    Nvfp4Dev dw = ResidentNvfp4(d, w);
+    vt::MatmulNvfp4(d.q, dout.t(), dx.t(), dw.packed, dw.scale, w.scale2);
+  } else {
+    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
+    vt::Matmul(d.q, dout.t(), dx.t(), dwb.t());
+  }
+  std::vector<float> out(static_cast<size_t>(M) * N);
+  dout.Download(d, out.data());
+  return out;
+}
+
+// y[M,N] bf16 = x[M,K] bf16 @ dequant(w).T, w fp4-resident [N=out, K=in]. Drops
+// in for MatmulBf16 (expert down projection).
+std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int64_t M,
+                                      int64_t K, const Nvfp4Weight& w) {
+  const int64_t N = w.n;
+  DBuf dx(d, DType::kBF16, {M, K}, x.data());
+  DBuf dout(d, DType::kBF16, {M, N});
+  if (d.q.device.type == vt::DeviceType::kCUDA) {
+    Nvfp4Dev dw = ResidentNvfp4(d, w);
+    vt::MatmulNvfp4(d.q, dout.t(), dx.t(), dw.packed, dw.scale, w.scale2);
+  } else {
+    std::vector<uint16_t> wb = DequantNvfp4ToBLayout(w);
+    DBuf dwb(d, DType::kBF16, {K, N}, wb.data());
+    vt::Matmul(d.q, dout.t(), dx.t(), dwb.t());
+  }
+  std::vector<uint16_t> out(static_cast<size_t>(M) * N);
+  dout.Download(d, out.data());
   return out;
 }
 
@@ -645,6 +739,20 @@ std::vector<uint16_t> ExpertMlp(Dev d, const OwnedTensor& gate,
   return MatmulBf16(d, act, n, I, down);  // [n,H]
 }
 
+// fp4-resident per-expert silu-mul MLP (M2.2b): identical to ExpertMlp but the
+// gate/up/down NVFP4 weights are read on-device via vt::MatmulNvfp4.
+std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
+                                     const Nvfp4Weight& up, const Nvfp4Weight& down,
+                                     const std::vector<uint16_t>& x, int64_t n,
+                                     int64_t H, int64_t I) {
+  std::vector<float> hg = MatmulNvfp4F32(d, x, n, H, gate);  // [n,I]
+  std::vector<float> hu = MatmulNvfp4F32(d, x, n, H, up);    // [n,I]
+  std::vector<uint16_t> act(static_cast<size_t>(n) * I);
+  for (size_t i = 0; i < act.size(); ++i)
+    act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
+  return MatmulNvfp4Bf16(d, act, n, I, down);  // [n,H]
+}
+
 // --- Sparse-MoE block (moe-semantics.md §1-§6). Router top-k over ALL experts,
 // then the ACTIVATED-EXPERT token-gather loop (not O(E)-dense), shared expert
 // with sigmoid gate, and the weighted combine. h [T*H] bf16 -> [T*H] bf16.
@@ -656,6 +764,9 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   const int64_t top_k = cfg.num_experts_per_tok;
   const int64_t I = cfg.moe_intermediate_size;
   const int64_t Is = cfg.shared_expert_intermediate_size;
+  // fp4-resident NVFP4 experts/shared (M2.2b real-ckpt CUDA load) vs bf16
+  // (synthetic / GGUF). Exactly one set is populated (see qwen3_5_weights.h).
+  const bool fp4 = !w.expert_gate_fp4.empty();
 
   // Router: logits = x @ gate.T (bf16, §2), softmax/top-k/renormalize (§3).
   std::vector<uint16_t> logits = MatmulBf16(d, h, T, H, w.router_gate);  // [T,E]
@@ -688,9 +799,12 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
                   h.data() + static_cast<size_t>(list[r].first) * H,
                   static_cast<size_t>(H) * sizeof(uint16_t));
     std::vector<uint16_t> y =
-        ExpertMlp(d, w.expert_gate[static_cast<size_t>(e)],
-                  w.expert_up[static_cast<size_t>(e)],
-                  w.expert_down[static_cast<size_t>(e)], xg, n, H, I);
+        fp4 ? ExpertMlpNvfp4(d, w.expert_gate_fp4[static_cast<size_t>(e)],
+                             w.expert_up_fp4[static_cast<size_t>(e)],
+                             w.expert_down_fp4[static_cast<size_t>(e)], xg, n, H, I)
+            : ExpertMlp(d, w.expert_gate[static_cast<size_t>(e)],
+                        w.expert_up[static_cast<size_t>(e)],
+                        w.expert_down[static_cast<size_t>(e)], xg, n, H, I);
     for (int64_t r = 0; r < n; ++r) {
       const int64_t t = list[r].first, j = list[r].second;
       std::memcpy(expert_out.data() + static_cast<size_t>(t * top_k + j) * H,
@@ -700,12 +814,15 @@ std::vector<uint16_t> MoeBlock(Dev d, const MoeBlockWeights& w,
   }
 
   // Shared expert (moe-semantics.md §5): silu-mul MLP then sigmoid(x@Wseg)*out.
-  std::vector<float> sg = MatmulF32(d, h, T, H, w.shared_gate_proj);  // [T,Is]
-  std::vector<float> su = MatmulF32(d, h, T, H, w.shared_up_proj);    // [T,Is]
+  std::vector<float> sg = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_gate_proj_fp4)
+                              : MatmulF32(d, h, T, H, w.shared_gate_proj);  // [T,Is]
+  std::vector<float> su = fp4 ? MatmulNvfp4F32(d, h, T, H, w.shared_up_proj_fp4)
+                              : MatmulF32(d, h, T, H, w.shared_up_proj);    // [T,Is]
   std::vector<uint16_t> sact(static_cast<size_t>(T) * Is);
   for (size_t i = 0; i < sact.size(); ++i)
     sact[i] = vt::F32ToBF16(Silu(sg[i]) * su[i]);
-  std::vector<float> sd = MatmulF32(d, sact, T, Is, w.shared_down_proj);  // [T,H]
+  std::vector<float> sd = fp4 ? MatmulNvfp4F32(d, sact, T, Is, w.shared_down_proj_fp4)
+                              : MatmulF32(d, sact, T, Is, w.shared_down_proj);  // [T,H]
   std::vector<float> gl = MatmulF32(d, h, T, H, w.shared_gate);           // [T,1]
   std::vector<uint16_t> shared(static_cast<size_t>(T) * H);
   for (int64_t t = 0; t < T; ++t) {
@@ -873,7 +990,10 @@ std::vector<float> Qwen3_5Model::Forward(
   std::vector<uint16_t> normed(static_cast<size_t>(T) * H);
   dnorm.Download(d, normed.data());
 
-  return MatmulF32(d, normed, T, H, weights.lm_head);  // [num_actual_tokens, vocab]
+  // lm_head: fp4-resident (M2.2b) when populated, else the bf16/GGUF path.
+  return weights.lm_head_fp4.Empty()
+             ? MatmulF32(d, normed, T, H, weights.lm_head)
+             : MatmulNvfp4F32(d, normed, T, H, weights.lm_head_fp4);
 }
 
 std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_ids,
@@ -918,7 +1038,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   std::vector<uint16_t> normed(static_cast<size_t>(T) * H);
   dnorm.Download(d, normed.data());
 
-  return MatmulF32(d, normed, T, H, weights.lm_head);  // [T, vocab] f32
+  // lm_head: fp4-resident (M2.2b) when populated, else the bf16/GGUF path.
+  return weights.lm_head_fp4.Empty()
+             ? MatmulF32(d, normed, T, H, weights.lm_head)
+             : MatmulNvfp4F32(d, normed, T, H, weights.lm_head_fp4);  // [T, vocab]
 }
 
 std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,

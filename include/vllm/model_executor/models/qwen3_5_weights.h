@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,28 @@ struct OwnedTensor {
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
+};
+
+// Device-resident NVFP4 W4A16 weight (M2.2b). The modelopt packed fp4 codes +
+// fp8-e4m3 group scales + per-tensor scale, kept RAW in the ORIGINAL torch
+// [N=out_features, K=in_features] orientation vt::MatmulNvfp4 expects (NOT
+// transposed to Matmul-B [in,out], and NOT dequanted to bf16). Keeping the
+// ~22GB fp4 as fp4 avoids the M2.2-profile CPU dequant (~40 min) + the ~70GB
+// bf16 host tensors. On the CUDA path the forward uploads packed+scale to the
+// GPU ONCE (lazily, on first use — the mutable device handles below) and reads
+// them in place across every step; on the host path it dequants for reference.
+struct Nvfp4Weight {
+  OwnedTensor packed;   // i8 [N, K/2]   two 4-bit E2M1 codes per byte
+  OwnedTensor scale;    // i8 [N, K/16]  one fp8-e4m3 scale per 16-elem group
+  float scale2 = 0.0F;  // per-tensor global scale (amax/2688), multiplied
+  int64_t n = 0;        // out_features
+  int64_t k = 0;        // in_features (K % 16 == 0)
+  bool Empty() const { return packed.Empty(); }
+
+  // Lazily-populated device-resident copies (CUDA forward only; null on host or
+  // before first use). The shared_ptr deleter frees through the vt Backend.
+  mutable std::shared_ptr<void> d_packed;
+  mutable std::shared_ptr<void> d_scale;
 };
 
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B
@@ -81,6 +104,17 @@ struct MoeBlockWeights {
   OwnedTensor shared_gate_proj;  // bf16 [H, Is]
   OwnedTensor shared_up_proj;    // bf16 [H, Is]
   OwnedTensor shared_down_proj;  // bf16 [Is, H]
+
+  // M2.2b fp4-resident variants of the NVFP4 expert/shared projections. When
+  // populated (real-checkpoint CUDA load) the forward calls vt::MatmulNvfp4 on
+  // these and the bf16 fields above are left EMPTY; the synthetic / GGUF loaders
+  // populate the bf16 fields and leave these empty. Exactly one set is filled.
+  std::vector<Nvfp4Weight> expert_gate_fp4;  // E * [N=I, K=H]
+  std::vector<Nvfp4Weight> expert_up_fp4;    // E * [N=I, K=H]
+  std::vector<Nvfp4Weight> expert_down_fp4;  // E * [N=H, K=I]
+  Nvfp4Weight shared_gate_proj_fp4;  // [N=Is, K=H]
+  Nvfp4Weight shared_up_proj_fp4;    // [N=Is, K=H]
+  Nvfp4Weight shared_down_proj_fp4;  // [N=H, K=Is]
 };
 
 // One decoder layer: input/post norms + one attention variant + the MoE block.
@@ -97,7 +131,8 @@ struct Qwen3_5MoeLayerWeights {
 struct Qwen3_5MoeWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
-  OwnedTensor lm_head;       // bf16 [H, vocab]  (NVFP4 dequant + T)
+  OwnedTensor lm_head;       // bf16 [H, vocab]  (bf16/GGUF path; empty when fp4)
+  Nvfp4Weight lm_head_fp4;   // [N=vocab, K=H]   (M2.2b fp4-resident; else empty)
   std::vector<Qwen3_5MoeLayerWeights> layers;
 };
 

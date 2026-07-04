@@ -137,9 +137,11 @@ OwnedTensor LoadFp8Transposed(const TensorResolver& get,
 }
 
 // NVFP4 W4A16 projection `<proj>.weight` U8 [out,in/2] + `.weight_scale` F8
-// [out,in/16] + `.weight_scale_2` f32 scalar -> owned bf16 [in, out].
-OwnedTensor LoadNvfp4Transposed(const TensorResolver& get,
-                                const std::string& proj) {
+// [out,in/16] + `.weight_scale_2` f32 scalar -> RAW fp4-resident Nvfp4Weight
+// (M2.2b). No dequant, no transpose: the bytes are kept in the on-disk
+// [N=out, K=in] orientation vt::MatmulNvfp4 reads directly. This is the
+// storage refactor that removes the ~40-min CPU dequant + ~70GB bf16 tensors.
+Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   const StTensor& w = get(proj + ".weight");
   VT_CHECK(w.dtype == "U8",
            "qwen3_5 weights: expected U8 for " + proj + ".weight");
@@ -147,16 +149,26 @@ OwnedTensor LoadNvfp4Transposed(const TensorResolver& get,
            "qwen3_5 weights: expected 2-D packed weight for " + proj);
   const int64_t out_dim = w.shape[0];
   const int64_t in_dim = w.shape[1] * 2;
+  VT_CHECK(in_dim % 16 == 0,
+           "qwen3_5 weights: NVFP4 in_dim must be a multiple of 16 for " + proj);
   const StTensor& ws = get(proj + ".weight_scale");
+  VT_CHECK(ws.dtype == "F8_E4M3",
+           "qwen3_5 weights: expected F8_E4M3 for " + proj + ".weight_scale");
   const float ws2 = ReadF32Scalar(get(proj + ".weight_scale_2"));
 
-  std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
-  DequantNvfp4ToBf16(w.data, ws.data, ws2, out_dim, in_dim, dq.data());
-
-  OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(dq.data(), out_dim, in_dim,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
-  return o;
+  Nvfp4Weight r;
+  r.n = out_dim;
+  r.k = in_dim;
+  r.scale2 = ws2;
+  r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
+  VT_CHECK(w.nbytes == r.packed.bytes.size(),
+           "qwen3_5 weights: packed byte-size mismatch for " + proj);
+  std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
+  VT_CHECK(ws.nbytes == r.scale.bytes.size(),
+           "qwen3_5 weights: scale byte-size mismatch for " + proj);
+  std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  return r;
 }
 
 GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
@@ -198,19 +210,22 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
   MoeBlockWeights m;
   m.router_gate = LoadBf16Transposed(get, mlp + "gate.weight");
   m.shared_gate = LoadBf16Transposed(get, mlp + "shared_expert_gate.weight");
-  m.expert_gate.reserve(static_cast<size_t>(num_experts));
-  m.expert_up.reserve(static_cast<size_t>(num_experts));
-  m.expert_down.reserve(static_cast<size_t>(num_experts));
+  // M2.2b: the NVFP4 expert + shared projections are kept fp4-resident (raw
+  // packed + scales, no dequant/transpose); the bf16 expert_*/shared_*_proj
+  // fields stay EMPTY. The forward calls vt::MatmulNvfp4 on the fp4 fields.
+  m.expert_gate_fp4.reserve(static_cast<size_t>(num_experts));
+  m.expert_up_fp4.reserve(static_cast<size_t>(num_experts));
+  m.expert_down_fp4.reserve(static_cast<size_t>(num_experts));
   for (int64_t e = 0; e < num_experts; ++e) {
     const std::string ex = mlp + "experts." + std::to_string(e) + ".";
-    m.expert_gate.push_back(LoadNvfp4Transposed(get, ex + "gate_proj"));
-    m.expert_up.push_back(LoadNvfp4Transposed(get, ex + "up_proj"));
-    m.expert_down.push_back(LoadNvfp4Transposed(get, ex + "down_proj"));
+    m.expert_gate_fp4.push_back(LoadNvfp4Raw(get, ex + "gate_proj"));
+    m.expert_up_fp4.push_back(LoadNvfp4Raw(get, ex + "up_proj"));
+    m.expert_down_fp4.push_back(LoadNvfp4Raw(get, ex + "down_proj"));
   }
   const std::string se = mlp + "shared_expert.";
-  m.shared_gate_proj = LoadNvfp4Transposed(get, se + "gate_proj");
-  m.shared_up_proj = LoadNvfp4Transposed(get, se + "up_proj");
-  m.shared_down_proj = LoadNvfp4Transposed(get, se + "down_proj");
+  m.shared_gate_proj_fp4 = LoadNvfp4Raw(get, se + "gate_proj");
+  m.shared_up_proj_fp4 = LoadNvfp4Raw(get, se + "up_proj");
+  m.shared_down_proj_fp4 = LoadNvfp4Raw(get, se + "down_proj");
   return m;
 }
 
@@ -265,7 +280,7 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
   w.embed_tokens =
       LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
   w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
-  w.lm_head = LoadNvfp4Transposed(get, "lm_head");
+  w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5MoeLayer(

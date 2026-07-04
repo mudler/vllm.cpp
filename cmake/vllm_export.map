@@ -1,0 +1,14 @@
+# Linker version script for the packaged shared libvllm.so (M3.5 Task 3).
+#
+# Exports ONLY the stable C ABI (include/vllm.h): every `vllm_*` symbol stays
+# global, and every C++ internal (vt::, vllm::, tokenizer, engine, ...) is
+# localized. This is what makes libvllm.so an ABI-stable, dlopen/FFI-consumable
+# artifact — an nm -D of the .so shows the C ABI and nothing else. Applied via
+# `-Wl,--version-script` to the vllm_shared target; independent of per-TU
+# visibility so it holds even for the default-visibility core archive.
+VLLM_ABI_1 {
+  global:
+    vllm_*;
+  local:
+    *;
+};

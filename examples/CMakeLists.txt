@@ -10,6 +10,13 @@ add_executable(dequant_nvfp4 dequant_nvfp4/main.cpp)
 target_link_libraries(dequant_nvfp4 PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(dequant_nvfp4)
 
+# vllm-cli: a llama.cpp-style client driven ENTIRELY through the C ABI. It links
+# the packaged SHARED libvllm (vllm_shared) using only the public include/vllm.h,
+# proving library-first consumption (M3.5 Task 3).
+add_executable(vllm-cli cli/main.cpp)
+target_link_libraries(vllm-cli PRIVATE vllm::shared)
+vllm_cpp_set_warnings(vllm-cli)
+
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)

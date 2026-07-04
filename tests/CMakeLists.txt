@@ -68,6 +68,31 @@ add_library(vllm_capi_c_check STATIC capi/c_header_compile.c)
 target_link_libraries(vllm_capi_c_check PRIVATE vllm::vllm)
 target_compile_options(vllm_capi_c_check PRIVATE
   $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror -std=c11>)
+
+# ── Packaging DoD (M3.5 Task 3): dlopen the built libvllm.so + verify exports ──
+# These are gated on the shared-lib target existing. The dlopen smoke test links
+# ONLY the doctest main + ${CMAKE_DL_LIBS} (NOT libvllm) — it resolves the whole
+# C ABI at runtime via dlsym, proving a header-less FFI consumer works.
+if(TARGET vllm_shared)
+  add_executable(test_dlopen capi/test_dlopen.cpp)
+  target_link_libraries(test_dlopen PRIVATE vllm_test_main ${CMAKE_DL_LIBS})
+  # Only the public header for the ABI *types*; the .so path is injected so the
+  # test dlopen()s the exact artifact this build produced.
+  target_include_directories(test_dlopen PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_definitions(test_dlopen PRIVATE
+    VLLM_SHARED_LIB_PATH="$<TARGET_FILE:vllm_shared>")
+  vllm_cpp_set_warnings(test_dlopen)
+  add_test(NAME test_dlopen COMMAND test_dlopen)
+
+  # Export-set verification: fail if libvllm.so leaks any non-`vllm_*` dynamic
+  # symbol (i.e. C++ internals). Runs nm via cmake -P.
+  if(UNIX AND NOT APPLE)
+    add_test(NAME capi_shared_exports_only_abi
+      COMMAND ${CMAKE_COMMAND}
+        "-DVLLM_SHARED_LIB=$<TARGET_FILE:vllm_shared>"
+        -P "${CMAKE_SOURCE_DIR}/cmake/VerifyExports.cmake")
+  endif()
+endif()
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)

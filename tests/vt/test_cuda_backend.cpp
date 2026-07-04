@@ -95,6 +95,57 @@ TEST_CASE("CUDA backend: Synchronize drains pending work") {
   cuda.DestroyQueue(q);
 }
 
+TEST_CASE("CUDA backend: graph capture/replay re-executes captured ops") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& cuda = vt::GetBackend(DeviceType::kCUDA);
+  CHECK(cuda.SupportsGraphCapture());
+  Queue q = cuda.CreateQueue();
+  constexpr size_t kBytes = 64 * 1024;
+
+  // Persistent device buffers (allocated ONCE, fixed pointers across replays —
+  // the M2.5 decode-capture contract). src feeds a captured d2d copy into dst.
+  void* src = cuda.Alloc(kBytes);
+  void* dst = cuda.Alloc(kBytes);
+
+  std::vector<unsigned char> p1(kBytes, 0x11);
+  std::vector<unsigned char> p2(kBytes, 0x22);
+  cuda.Copy(q, src, p1.data(), kBytes);  // load pattern 1 (pre-capture)
+  cuda.Memset(q, dst, 0, kBytes);
+  cuda.Synchronize(q);
+
+  // Capture a single d2d copy (recorded, NOT executed during capture).
+  cuda.BeginCapture(q);
+  cuda.Copy(q, dst, src, kBytes);
+  cuda.EndCapture(q);
+
+  // Replay #1 -> dst should become pattern 1 (proves the graph ran at all).
+  cuda.Replay(q);
+  cuda.Synchronize(q);
+  std::vector<unsigned char> back(kBytes, 0);
+  cuda.Copy(q, back.data(), dst, kBytes);
+  cuda.Synchronize(q);
+  CHECK(back.front() == 0x11);
+  CHECK(back.back() == 0x11);
+
+  // Mutate the (same-pointer) src, replay again -> dst must reflect the NEW src,
+  // proving replay RE-EXECUTES the captured copy over the persistent buffers
+  // (exactly how the decode graph picks up each new token's inputs).
+  cuda.Copy(q, src, p2.data(), kBytes);
+  cuda.Replay(q);
+  cuda.Synchronize(q);
+  cuda.Copy(q, back.data(), dst, kBytes);
+  cuda.Synchronize(q);
+  CHECK(back.front() == 0x22);
+  CHECK(back.back() == 0x22);
+
+  cuda.Free(src);
+  cuda.Free(dst);
+  cuda.DestroyQueue(q);
+}
+
 TEST_CASE("CUDA backend: unified-memory flag report") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");

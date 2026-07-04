@@ -55,11 +55,46 @@ class CudaBackend final : public Backend {
     Check(cudaStreamSynchronize(AsStream(q)), "cudaStreamSynchronize");
   }
   bool UnifiedMemory() const override { return unified_memory_; }
-  // SupportsGraphCapture stays at the base-class false until M2.5.
+
+  // --- CUDA-graph capture/replay (M2.5, gate-#1 decode-launch unlock) ---------
+  // Capture the ops issued on the queue's stream between Begin/EndCapture into a
+  // replayable graph, then Replay it per decode token. This collapses the whole
+  // decode step's thousands of host-side kernel-launch + memcpy API calls (the
+  // measured 88%-of-wall host-API overhead) into a single cudaGraphLaunch.
+  //
+  // Capture contract (the caller must honour it, else capture aborts):
+  //   * every op in the region runs ASYNC on THIS stream (no Synchronize, no
+  //     default-stream work, no host<->device blocking copies);
+  //   * NO cudaMalloc/cudaFree inside the region — the scratch pool must be
+  //     pre-warmed so every allocation is a pool hit (a miss calls cudaMalloc,
+  //     which is illegal during capture and aborts it);
+  //   * the captured pointers must stay valid + fixed across replays (persistent
+  //     buffers); only their CONTENTS change between replays (new token id /
+  //     position / slot / block-table, written by an async copy on the stream
+  //     BEFORE Replay, or captured as part of the graph).
+  bool SupportsGraphCapture() const override { return true; }
+  void BeginCapture(Queue& q) override {
+    Check(cudaStreamBeginCapture(AsStream(q), cudaStreamCaptureModeThreadLocal),
+          "cudaStreamBeginCapture");
+  }
+  void EndCapture(Queue& q) override {
+    cudaGraph_t graph = nullptr;
+    Check(cudaStreamEndCapture(AsStream(q), &graph), "cudaStreamEndCapture");
+    if (exec_ != nullptr) {
+      cudaGraphExecDestroy(exec_);
+      exec_ = nullptr;
+    }
+    Check(cudaGraphInstantiate(&exec_, graph, 0), "cudaGraphInstantiate");
+    cudaGraphDestroy(graph);
+  }
+  void Replay(Queue& q) override {
+    Check(cudaGraphLaunch(exec_, AsStream(q)), "cudaGraphLaunch");
+  }
 
  private:
   int device_ = 0;
   bool unified_memory_ = false;
+  cudaGraphExec_t exec_ = nullptr;  // last instantiated captured graph
 };
 
 // Registers kCUDA during static init (registration must complete before

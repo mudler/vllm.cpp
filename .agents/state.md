@@ -925,3 +925,22 @@
   GDN scan (~20% GPU), NVFP4 MMA, FP8 on-device. Gate-#1 aggregate this session:
   ~1000×→~44× (measured), with the exact remaining bottleneck (88% host API) now
   pinpointed → the path to parity is clear + measure-driven.
+- **2026-07-04 (device-resident weights +38% + APPLES-TO-APPLES vLLM gap, directive-honored)**
+  — `69eab0d`. Weights were re-uploaded to the device EVERY op (esp. the ~600MB embed
+  table per forward) — a lazy per-OwnedTensor device cache (upload-once) fixed it → **+38%
+  on the 8×128×64 config**. Per the new always-compare-vs-vLLM directive, measured BOTH
+  sides on the SAME workload (8×128×64 conc4, GB10): **ours 14.33 output tok/s / 43.05
+  total** vs **vLLM 0.24.0 enforce-eager 131.3 output / 1181.8 total** (gpu-mem 0.7,
+  coexisting with the box's LocalAI service). **Gate-#1 gap: ~9.2× decode output, ~27×
+  total (prefill-dominated), eager-vs-eager.** (vs FULL vLLM with cuda-graphs ~153/1377:
+  larger — the graph delta IS our next unlock.) The decode gap (~9×) is now modest; the
+  total gap (~27×) is prefill (vLLM's fused prefill kernels + graphs). **Directive lesson
+  (and a good stress test of it):** getting the matching vLLM number required capping
+  gpu-mem around LocalAI + retrying a transient profiling race — measuring vs vLLM surfaces
+  the REAL shared-box conditions. Aggregate gate-#1 this session: ~1000× → ~9× decode /
+  ~27× total (all measured on real GB10, correctness preserved at every step). REMAINING:
+  (1) **CUDA graphs** (decode host-API kill → the ~9× decode gap; the capture hook `536253f`
+  is in place, needs the mid-forward host glue [Download/Synchronize + GDN/attn/gather host
+  loops] eliminated so the step is pure-async-on-stream, then capture/replay); (2) prefill
+  fusions + the NVFP4 MMA GEMM (the ~27× total gap); (3) GDN scan (~20% GPU); (4) M2.2c FP8
+  on-device. GB10 iteration (each validation loads the 35B) is the campaign's rate limiter.

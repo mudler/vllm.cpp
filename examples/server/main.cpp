@@ -19,16 +19,16 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
-#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
-#include <vector>
 
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
@@ -116,56 +116,6 @@ Args ParseArgs(int argc, char** argv) {
   return a;
 }
 
-// Build a hybrid KV-cache config (one full-attention group + one GDN/mamba
-// group) sized from the HfConfig. Mirrors the test harness MakeKvConfig; the
-// runner keys off the spec KIND (not the group-id strings), so this generalizes
-// to any layer count. block_size == the caller's --block-size (unified).
-vllm::v1::KVCacheConfig MakeKvConfig(const HfConfig& c, int block_size,
-                                     int num_blocks) {
-  const int Hkv = static_cast<int>(c.num_key_value_heads);
-  const int Dh = static_cast<int>(c.head_dim);
-  const int Hv = static_cast<int>(c.linear_num_value_heads);
-  const int Dv = static_cast<int>(c.linear_value_head_dim);
-  const int Dk = static_cast<int>(c.linear_key_head_dim);
-  const int Kw = static_cast<int>(c.linear_conv_kernel_dim);
-  const int key_dim = static_cast<int>(c.linear_num_key_heads) * Dk;
-  const int value_dim = Hv * Dv;
-  const int conv_dim = 2 * key_dim + value_dim;
-
-  vllm::v1::KVCacheConfig kv;
-  kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"fa"},
-      std::make_shared<vllm::v1::FullAttentionSpec>(block_size, Hkv, Dh,
-                                                    vt::DType::kF32));
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"gdn"},
-      std::make_shared<vllm::v1::MambaSpec>(
-          block_size,
-          std::vector<std::vector<int64_t>>{{Hv, Dv, Dk}, {conv_dim, Kw - 1}},
-          std::vector<vt::DType>{vt::DType::kF32, vt::DType::kF32}));
-  return kv;
-}
-
-std::vector<vllm::SafetensorsFile> LoadShards(const std::string& model_dir) {
-  std::vector<std::string> paths;
-  for (const auto& e : fs::directory_iterator(model_dir)) {
-    if (e.is_regular_file() && e.path().extension() == ".safetensors") {
-      paths.push_back(e.path().string());
-    }
-  }
-  if (paths.empty()) {
-    throw std::runtime_error("no *.safetensors shards found in " + model_dir);
-  }
-  std::sort(paths.begin(), paths.end());
-  std::vector<vllm::SafetensorsFile> shards;
-  shards.reserve(paths.size());
-  for (const std::string& p : paths) {
-    shards.push_back(vllm::SafetensorsFile::Open(p));
-  }
-  return shards;
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -185,49 +135,21 @@ int main(int argc, char** argv) {
                                   : dir.parent_path().filename().string())
             : args.served_model_name;
 
-    std::cerr << "server: loading config " << config_path << "\n";
-    const HfConfig config = vllm::LoadHfConfig(config_path);
-
-    std::cerr << "server: loading tokenizer " << tokenizer_path << "\n";
-    const vllm::tok::Tokenizer tokenizer =
-        vllm::tok::Tokenizer::FromHfJson(tokenizer_path);
-
-    std::cerr << "server: loading weights from " << args.model_dir << "\n";
-    std::vector<vllm::SafetensorsFile> shards = LoadShards(args.model_dir);
-    const Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, config);
-    shards.clear();  // the mmap'd shards may be released after the load.
-
-    const int max_model_len = args.max_model_len > 0
-                                  ? args.max_model_len
-                                  : static_cast<int>(config.max_position_embeddings);
-
-    // ── Engine stack (mirrors the M1.8 wiring in test_llm_engine.cpp). ──────
-    vllm::v1::init_none_hash(vllm::v1::sha256_cbor);
-
-    vllm::SchedulerConfig sched_cfg;
-    sched_cfg.max_num_seqs = 8;
-    sched_cfg.max_num_batched_tokens = max_model_len * 8;
-    sched_cfg.enable_chunked_prefill = true;
-    sched_cfg.max_model_len = max_model_len;
-    sched_cfg.watermark = 0.0;
-
-    const vllm::v1::KVCacheConfig kv_cfg =
-        MakeKvConfig(config, args.block_size, args.num_blocks);
-
-    vllm::v1::Scheduler scheduler(sched_cfg, kv_cfg, args.block_size,
-                                  /*enable_caching=*/true);
-    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-    vllm::v1::GPUModelRunner runner(config, weights, kv_cfg, queue,
-                                    /*max_num_reqs=*/8, max_model_len,
-                                    /*max_num_batched_tokens=*/max_model_len * 8);
-    vllm::v1::Executor executor(runner);
-    vllm::v1::EngineCore engine_core(scheduler, executor);
-    vllm::v1::InputProcessor input_processor(tokenizer, config);
-    vllm::v1::OutputProcessor output_processor(&tokenizer);
-    vllm::v1::LLMEngine engine(
-        input_processor, engine_core, output_processor,
-        vllm::v1::get_request_block_hasher(args.block_size,
-                                           vllm::v1::sha256_cbor));
+    // ── Load the model + build the full engine stack via the shared loader
+    // (src/vllm/entrypoints/model_loader.cpp) — the same path the C ABI drives.
+    // It loads config.json + tokenizer.json + *.safetensors and wires the M1.8
+    // LLMEngine over Scheduler + runner + KV + processors. ─────────────────────
+    std::cerr << "server: loading model from " << args.model_dir << " (config "
+              << config_path << ", tokenizer " << tokenizer_path << ")\n";
+    vllm::entrypoints::EngineParams engine_params;
+    engine_params.block_size = args.block_size;
+    engine_params.num_blocks = args.num_blocks;
+    engine_params.max_model_len = args.max_model_len;  // 0 => from config.
+    std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
+        vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
+                                                      engine_params);
+    vllm::v1::LLMEngine& engine = loaded->engine();
+    const vllm::tok::Tokenizer& tokenizer = loaded->tokenizer();
 
     // ── OpenAI serving handlers. The chat handler is wired with the real chat
     // template (Task 3) when tokenizer_config.json carries one; otherwise it

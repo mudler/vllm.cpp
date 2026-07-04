@@ -102,6 +102,8 @@ add_library(vllm STATIC
   src/vllm/v1/engine/llm_engine.cpp
   src/vllm/v1/executor/executor.cpp
   src/vllm/entrypoints/chat_template.cpp
+  src/vllm/entrypoints/model_loader.cpp
+  src/capi/vllm_c.cpp
   src/vllm/entrypoints/openai/protocol.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
@@ -126,6 +128,9 @@ if(UNIX AND NOT APPLE)
 endif()
 target_include_directories(vllm
   PUBLIC include ${CMAKE_CURRENT_BINARY_DIR}/include)
+# The C ABI impl reaches its internal test-hook header as "capi/engine_handle.h"
+# (an internal, non-installed header under src/); src is a PRIVATE search path.
+target_include_directories(vllm PRIVATE src)
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
 if(VLLM_CPP_CUDA)

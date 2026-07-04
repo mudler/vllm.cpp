@@ -56,6 +56,18 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
+
+# C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
+# engine via the internal MakeEngineHandle hook (reached under src/).
+vllm_cpp_add_test(test_capi capi/test_capi.cpp)
+target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Pure-C compile check: include/vllm.h must compile as C11 with no C++ leaks.
+enable_language(C)
+add_library(vllm_capi_c_check STATIC capi/c_header_compile.c)
+target_link_libraries(vllm_capi_c_check PRIVATE vllm::vllm)
+target_compile_options(vllm_capi_c_check PRIVATE
+  $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror -std=c11>)
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)

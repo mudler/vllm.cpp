@@ -66,6 +66,9 @@ vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # M3.6: the OpenAI server CONFORMANCE suite — the full API contract exercised
+  # end to end over the REAL cpp-httplib server on an ephemeral port.
+  vllm_cpp_add_test(test_openai_conformance vllm/entrypoints/openai/test_conformance.cpp)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

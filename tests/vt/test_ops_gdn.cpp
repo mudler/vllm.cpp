@@ -850,26 +850,6 @@ void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int6
   run("0", out_seq, st_seq);
   run("1", out_chunk, st_chunk);
 
-  {
-    auto os = Unpack(out_seq, cb.out), oc = Unpack(out_chunk, cb.out);
-    float mad = 0.0f, mrd = 0.0f;
-    size_t argmax = 0;
-    for (size_t i = 0; i < os.size(); ++i) {
-      const float ad = std::fabs(oc[i] - os[i]);
-      if (ad > mad) {
-        mad = ad;
-        argmax = i;
-      }
-      const float rd = ad / (std::fabs(os[i]) + 1e-6f);
-      if (rd > mrd) mrd = rd;
-    }
-    MESSAGE("out max|diff|=" << mad << " at i=" << argmax << " seq=" << os[argmax]
-                            << " chunk=" << oc[argmax] << " maxrel=" << mrd);
-    float smad = 0.0f;
-    for (size_t i = 0; i < st_seq.size(); ++i)
-      smad = std::max(smad, std::fabs(st_chunk[i] - st_seq[i]));
-    MESSAGE("state max|diff|=" << smad);
-  }
   CheckClose(Unpack(out_chunk, cb.out), Unpack(out_seq, cb.out), atol, rtol);
   CheckClose(st_chunk, st_seq, atol, rtol);
 }

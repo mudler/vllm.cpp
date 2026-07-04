@@ -1049,3 +1049,24 @@ dgx inspection of the checkpoint).
   dense forward assembly (reuse 35B GDN/attn, swap MoE→dense SwiGLU) → [GPU]
   capture the pip-vLLM greedy golden + wire the W4A4 GEMM (fast path 6a) → flip
   `kW4A4ForwardReady`.
+- **2026-07-04 (TWO MVP tracks landed — 35B gap 7.5×→5.84×; 27B bring-up: shares 35B backbone)**
+  35B: **M2.3 GDN chunk-parallel prefill scan** (`2ce938f`, mirrors FLA chunk.py; GDN scan 3.0×
+  faster, batched TTFT 33.2→19.4s, total 155.6→202.5 tok/s, **gap 7.5×→5.84×**, paged gate 16/16,
+  found+fixed a multi-head hstate bug). Prefill bottleneck MOVED to `PagedAttentionKernel` 28.6%
+  (FlashInfer-class GQA 16/2 = next prefill lever) then GdnChunkDeltaH 18.5%.
+  27B: **CPU-first W4A4 bring-up** (`559e5cc`). TWO PLAN-CHANGING FINDINGS: (1) the 27B is a
+  **VL-multimodal** model (`Qwen3_5ForConditionalGeneration` + vision_config) — do the TEXT path
+  first, defer the ViT (T1/T2). (2) It **shares the 35B hybrid backbone wholesale** (GDN, gated
+  attn, RoPE, Gemma norm — GQA ratio 3 vs 2 is a dims-only change); the ONLY new structure is the
+  **dense SwiGLU MLP** (vs MoE) + the W4A4 quant. CRUCIALLY the **W4A4 weight encoding == modelopt
+  NVFP4 byte-identical** (CT just stores globals as divisors) → the existing **M2.7 tensor-core
+  GEMM can carry the 27B with a one-line `1/weight_global_scale` reciprocal + name remap (bf16
+  activations, W4A16-style)** — the FAST PATH to 27B correctness+throughput, NO new kernel. True
+  fp4×fp4 MMA (6b) is a risky optional (killgate 0034/0035 saw W4A4 fp4-MMA regress on GB10).
+  Landed: CPU W4A4 dequant/activation reference + `test_ct_nvfp4_emulation` 6/81 assert, skipping
+  27B greedy gate scaffold, `.agents/qwen27b-w4a4-notes.md`. Full suite **84/84**.
+  27B REMAINING (ordered): [CPU] loader plumbing + dense forward assembly (reuse 35B, MoE→SwiGLU);
+  [GPU] capture pip-vLLM greedy oracle golden → wire the M2.7 GEMM (reciprocal fast path) → close
+  greedy + throughput gates vs oracle. CONCURRENCY LESSON: two code-writing subagents on the same
+  working tree caused a commit-bundling mislabel (`2ce938f`) — use worktree isolation or explicit-
+  path staging for parallel code-writers, never `git add -A` while a subagent is mid-write.

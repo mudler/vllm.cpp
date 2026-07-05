@@ -14,6 +14,7 @@
 // scales into the atom layout Sm1xxBlkScaledConfig::tile_atom_to_shape_SF{A,B}
 // reads. See .agents/cutlass-dropin-feasibility.md and qwen27b-w4a4-notes.md §7.
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -249,6 +250,15 @@ void SwizzleBlockscaleKernelCuda(Queue& q, Tensor& out_swizzled, const Tensor& i
 // ordered, async.
 __global__ void SetScalar(float* p, float v) { *p = v; }
 
+// bf16 -> f32 for the f32-output projections (q/k/v/gate/up sinks): the cutlass
+// epilogue only emits bf16/half, so an f32 out is produced by casting a bf16
+// scratch. Same value the bf16 epilogue rounds to.
+__global__ void CastBf16ToF32Kernel(float* out, const __nv_bfloat16* in, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+    out[i] = __bfloat162float(in[i]);
+}
+
 // ---- MatmulNvfp4Cutlass registered op --------------------------------------
 void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
                                   const Tensor& a_sf_sw, const Tensor& b_packed,
@@ -264,8 +274,25 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
   Check(cudaMallocAsync(&d_alpha, sizeof(float), s), "cudaMallocAsync alpha");
   SetScalar<<<1, 1, 0, s>>>(d_alpha, alpha);
 
-  Fp4GemmDispatch<cutlass::bfloat16_t>(out.data, a_packed.data, b_packed.data, a_sf_sw.data,
+  const bool out_f32 = (out.dtype == DType::kF32);
+  void* d_out = out.data;
+  void* bf16_scratch = nullptr;
+  if (out_f32) {
+    Check(cudaMallocAsync(&bf16_scratch, static_cast<size_t>(m) * n * sizeof(__nv_bfloat16), s),
+          "cudaMallocAsync bf16 scratch");
+    d_out = bf16_scratch;
+  }
+
+  Fp4GemmDispatch<cutlass::bfloat16_t>(d_out, a_packed.data, b_packed.data, a_sf_sw.data,
                                        b_sf_sw.data, d_alpha, m, n, k, s);
+
+  if (out_f32) {
+    const int64_t total = static_cast<int64_t>(m) * n;
+    const int blocks = static_cast<int>((total + 255) / 256);
+    CastBf16ToF32Kernel<<<blocks, 256, 0, s>>>(
+        static_cast<float*>(out.data), static_cast<const __nv_bfloat16*>(bf16_scratch), total);
+    Check(cudaFreeAsync(bf16_scratch, s), "cudaFreeAsync bf16 scratch");
+  }
 
   Check(cudaFreeAsync(d_alpha, s), "cudaFreeAsync alpha");
   Check(cudaGetLastError(), "matmul_nvfp4_cutlass launch");

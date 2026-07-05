@@ -322,6 +322,25 @@ Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   return r;
 }
 
+#ifdef VT_CUTLASS_NVFP4
+// Resident SWIZZLED weight block scale for the cutlass fp4 GEMM. Computed ONCE
+// (lazily) from the resident linear d_scale via vt::SwizzleBlockscale and kept
+// on the weight's shared_ptr. Shape [round_up(n,128), round_up(k/16,4)].
+Tensor ResidentNvfp4ScaleSwizzled(Dev d, const Nvfp4Weight& w) {
+  auto round_up = [](int64_t x, int64_t y) { return (x + y - 1) / y * y; };
+  const int64_t Np = round_up(w.n, 128), Kp = round_up(w.k / 16, 4);
+  if (!w.d_scale_sw) {
+    Nvfp4Dev dw = ResidentNvfp4(d, w);  // ensures d_scale (linear device copy)
+    void* p = d.b.Alloc(static_cast<size_t>(Np * Kp));
+    Backend* bk = &d.b;
+    w.d_scale_sw = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    Tensor sw = MakeTensor(p, DType::kI8, d.q.device, {Np, Kp});
+    vt::SwizzleBlockscale(d.q, sw, dw.scale);
+  }
+  return MakeTensor(w.d_scale_sw.get(), DType::kI8, d.q.device, {Np, Kp});
+}
+#endif  // VT_CUTLASS_NVFP4
+
 // Host reference dequant of an fp4 weight to bf16 [K=in, N=out] (Matmul-B
 // layout) — the CPU fallback for the fp4 path (no CPU MatmulNvfp4 kernel). Only
 // exercised when a real fp4 checkpoint is run on the host device; the CUDA path
@@ -416,6 +435,26 @@ bool TrueW4A4Enabled() {
   return on;
 }
 
+#ifdef VT_CUTLASS_NVFP4
+// cutlass sm120a fp4xfp4 GEMM path toggle (opt-in; VT_NVFP4_CUTLASS=1). Routes the
+// 27B true-W4A4 projections through vt::MatmulNvfp4Cutlass (the lifted vLLM
+// near-peak kernel) instead of our emulation-grade MatmulNvfp4Fp4. Mirrors vLLM's
+// actual kernel (notes §7.1). NOTE (measured 2026-07-05): swapping ONLY the GEMM
+// to real cutlass does NOT recover vLLM's native token stream (198) — the 27B
+// still yields the emulation stream (271); tok6 is a near-tie tipped by the
+// aggregate of the non-fp4 forward numerics, not the fp4 GEMM. So this toggle is
+// a THROUGHPUT lever (near-peak prefill), correctness-neutral (still reproduces
+// vLLM's own emulation stream token-for-token). Only meaningful when the cutlass
+// TU was compiled (VT_CUTLASS_NVFP4).
+bool NvfpCutlassEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NVFP4_CUTLASS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+#endif
+
 // TRUE W4A4 (fp4 activations x fp4 weights) device GEMM — the 27B path (notes §7).
 // ScaledFp4Quant(x) -> per-token fp4 activations + fp8 block scales, then the
 // fp4xfp4 GEMM with the folded alpha (= vllm cutlass_scaled_fp4_mm_sm120a). CUDA
@@ -428,6 +467,19 @@ DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dty
   vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
   Nvfp4Dev dw = ResidentNvfp4(d, w);
   DBuf dout(d, out_dtype, {M, N});
+#ifdef VT_CUTLASS_NVFP4
+  if (NvfpCutlassEnabled()) {
+    // Swizzle the per-token activation scale into the cutlass atom layout (the
+    // weight scale is swizzled once, cached). Then the lifted sm120a fp4xfp4 GEMM.
+    auto round_up = [](int64_t v, int64_t y) { return (v + y - 1) / y * y; };
+    const int64_t Mp = round_up(M, 128), Kp = round_up(K / 16, 4);
+    DBuf a_sf_sw(d, DType::kI8, {Mp, Kp});  // SwizzleBlockscale zero-fills padding
+    vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale.t());
+    Tensor b_sf_sw = ResidentNvfp4ScaleSwizzled(d, w);
+    vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed.t(), a_sf_sw.t(), dw.packed, b_sf_sw, w.alpha);
+    return dout;
+  }
+#endif
   vt::MatmulNvfp4Fp4(d.q, dout.t(), a_packed.t(), a_scale.t(), dw.packed, dw.scale, w.alpha);
   return dout;
 }

@@ -87,6 +87,10 @@ struct Nvfp4Weight {
   // before first use). The shared_ptr deleter frees through the vt Backend.
   mutable std::shared_ptr<void> d_packed;
   mutable std::shared_ptr<void> d_scale;
+  // Lazily-populated SWIZZLED weight block scale for the cutlass sm120a fp4 GEMM
+  // path (VT_NVFP4_CUTLASS): [round_up(n,128), round_up(k/16,4)] in the cutlass
+  // atom layout, computed once from d_scale via vt::SwizzleBlockscale.
+  mutable std::shared_ptr<void> d_scale_sw;
 };
 
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B

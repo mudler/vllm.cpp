@@ -148,7 +148,8 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
   VT_CHECK(b_packed.shape[1] == k / 2,
            "matmul_nvfp4_cutlass: b_packed must be [N, K/2] (K matches a_packed)");
   VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_nvfp4_cutlass: out must be [M, N]");
-  VT_CHECK(out.dtype == DType::kBF16, "matmul_nvfp4_cutlass: out must be bf16 (sm120a epilogue)");
+  VT_CHECK(out.dtype == DType::kBF16 || out.dtype == DType::kF32,
+           "matmul_nvfp4_cutlass: out must be bf16 or f32 (bf16 epilogue, f32 via cast)");
   VT_CHECK(a_packed.dtype == DType::kI8 && a_sf_sw.dtype == DType::kI8 &&
                b_packed.dtype == DType::kI8 && b_sf_sw.dtype == DType::kI8,
            "matmul_nvfp4_cutlass: packed/scale operands must be i8 (raw fp4/fp8 bytes)");

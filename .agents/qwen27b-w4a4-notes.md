@@ -678,3 +678,59 @@ which we meet token-for-token.
    fast path as a measured A/B — keep whichever wins throughput *among the
    token-exact options* (6a is not token-exact, so if 6b is slower we still need
    6b for the correctness gate, and 6a can only remain as an opt-in speed mode).
+
+---
+
+## 7.8 CUTLASS sm120a fp4×fp4 drop-in — IMPLEMENTED + GB10-measured (2026-07-05)
+
+Executed the Phase-1 cutlass drop-in (branch `worktree-agent-a45b404b8aa3ca530`,
+NOT merged to main). Cites `file:line` vs `/home/mudler/_git/vllm` @ e24d1b24.
+
+**STEP 0 (grounded, cited).** Only the **27B** (compressed-tensors W4A4) uses
+`cutlass_scaled_fp4_mm_sm120a`. The **35B** (`nvidia/Qwen3.6-35B-A3B-NVFP4`)
+declares `quant_algo: MIXED_PRECISION` (`modelopt.py:_resolve_quant_algo` +
+`quantized_layers`): its `linear_attn.*` projections are **FP8** (W8A8) and its
+`mlp.experts` are **W4A16_NVFP4** → `ModelOptNvFp4FusedMoE(use_a16=True)`
+(`modelopt.py:1409,2525-2528`) → **Marlin W4A16, bf16 activations**. The 35B never
+touches the sm120a fp4×fp4 kernel; it would need a W4A16/Marlin variant (grouped,
+weight-only). So Phase-1 targets the 27B dense projections, correctly.
+
+**What was vendored/lifted.** `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu` = 1:1 lift
+of `cutlass_scaled_fp4_mm_sm120a` (Fp4GemmSm120 + args_from_options + runGemm +
+dispatch), torch::stable::Tensor → vt::Tensor raw pointers, workspace via
+cudaMallocAsync, alpha written by a 1-thread kernel (no sync H2D). `vt::MatmulNvfp4Cutlass`
+(f32 out via bf16 epilogue + cast) + `vt::SwizzleBlockscale` (lift of vLLM
+`swizzle_blockscale`, `nvfp4_utils.py:13-53`: pad M→128,K→4, reshape
+[M/128,4,32,K/4,4], permute (0,1,4,3,2,5)). CUTLASS v4.4.2 header-only via
+`-DVLLM_CPP_CUTLASS_DIR` (dgx: `~/cutlass_probe`). REUSED: `ScaledFp4Quant`,
+`Nvfp4Weight.alpha/input_global_scale_inv`. NEW: the cutlass TU + the swizzle.
+
+**Correctness (measured GB10, CUDA 13.0.88).** Unit: `MatmulNvfp4Cutlass` (both
+scales swizzled) == the emulation truth (`MatmulNvfp4Fp4`, itself == vllm
+`RunNvfp4Emulation`) within 0.19% (max_abs 0.50 vs ref_absmax 263.5).
+test_ops_nvfp4_fp4 1851/1851; full CUDA build green under `-Werror=all-warnings`.
+**27B gate:** with the REAL cutlass kernel the greedy stream is still
+`{...19241,13, 271, 248068,271,248069,271,4639,369,4252,13,271}` — **tok6=271, NOT
+the oracle 198** (tokens 0–5 exact). Identical with exact- and fast-reciprocal
+activation quant. ⇒ **swapping only the fp4 GEMM does NOT flip the tok6 near-tie**
+("\n" 198 vs "\n\n" 271). The tie is tipped by the aggregate of the NON-fp4 forward
+numerics (paged attention / GDN / RMSNorm) vs vLLM's flashinfer stack — not the fp4
+kernel. Supersedes §7.7's framing: even the exact cutlass kernel yields 271, so
+198 recovery is NOT GEMM-limited. `kW4A4ForwardReady` stays **false**; the fp4-GEMM
+correctness bar is logit/emulation parity (met), not the 198 token gate.
+
+**Throughput (per-GEMM microbench through the vt op, 27B shapes, GB10).**
+cutlass prefill (M=4096): gate/up **300**, qkv **302**, down **213** TFLOPS; M=256
+**144**; decode M=16 **~10** (cutlass dense small-M regime). Our existing paths on
+the same shapes: true-W4A4 WMMA ~6 TFLOPS, W4A16 6a ~8 TFLOPS (both ≪ cutlass).
+1024³ 51 TFLOPS (per-call host setup dominates small problems). NOT yet measured:
+end-to-end tok/s A/B (VT_NVFP4_CUTLASS=1 vs default) + `vllm bench throughput`.
+
+**Phase-2.** (a) end-to-end 27B tok/s A/B + vllm-bench (prefill should win big,
+decode may not — cutlass dense is small-M-inefficient; persistent workspace/alpha
++ a decode-specialized path needed). (b) The grouped/MoE cutlass kernel
+(`run_fp4_blockwise_scaled_group_mm_sm120`) for the 35B is a SEPARATE effort — but
+note the 35B experts are W4A16 (Marlin), not fp4×fp4, so that grouped fp4 kernel
+does not apply to the 35B either; it would apply to a W4A4 MoE checkpoint. (c) The
+198 gate needs full-stack flashinfer bit-parity (attn+GDN+norm), out of scope for
+the GEMM drop-in.

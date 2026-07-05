@@ -85,6 +85,21 @@ if(VLLM_CPP_CUDA)
     message(STATUS "CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM disabled "
                    "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
   endif()
+  # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
+  # torch-free slice of vLLM's moe/marlin_moe_wna16 under src/vt/cuda/marlin/
+  # (marlin-dropin-feasibility.md). NO external dependency — the kernel is
+  # standalone CUDA + inline PTX. Enabled on sm_12xa (compiles to native sm_121
+  # SASS). The two vendored TUs + the vt launcher are isolated with their own
+  # compile options (see below); gated by VT_MARLIN_NVFP4.
+  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa)" ON)
+  if(VLLM_CPP_MARLIN AND VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+     AND EXISTS "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin/core/scalar_type.hpp")
+    set(VLLM_CPP_MARLIN ON)
+    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored, sm_12xa)")
+  else()
+    set(VLLM_CPP_MARLIN OFF)
+    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs sm_12xa + vendored slice)")
+  endif()
 endif()
 
 include(cmake/CompilerWarnings.cmake)
@@ -209,6 +224,26 @@ if(VLLM_CPP_CUDA)
     set_source_files_properties(src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
+  endif()
+  # Marlin NVFP4 MoE: two vendored TUs (the marlin_mm dispatcher + the generated
+  # bf16 NVFP4 kernel instantiations) + the vt::Tensor launcher. All three need
+  #  * -static-global-template-stub=false so the __global__ Marlin<> template
+  #    instantiations get external linkage across the two vendored TUs (nvcc 13
+  #    defaults to static stubs -> undefined refs at link; verified on GB10);
+  #  * -isystem the vendored root so kernel-side warnings (e.g. #20280) are
+  #    exempt from the global -Werror=all-warnings; the general build stays strict;
+  #  * --expt-relaxed-constexpr (scalar_type.hpp constexpr).
+  if(VLLM_CPP_MARLIN)
+    set(_MARLIN_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin")
+    set(_MARLIN_SRCS
+      src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/marlin_mm_moe.cu
+      src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu
+      src/vt/cuda/cuda_moe_marlin.cu)
+    target_sources(vllm PRIVATE ${_MARLIN_SRCS})
+    target_compile_definitions(vllm PUBLIC VT_MARLIN_NVFP4=1)
+    set_source_files_properties(${_MARLIN_SRCS} PROPERTIES
+      COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
   endif()
 endif()
 

@@ -228,6 +228,7 @@ class DBuf {
   }
 
   Tensor& t() { return t_; }
+  const Tensor& t() const { return t_; }
   void* ptr() { return p_; }
   size_t bytes() const { return bytes_; }
   void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
@@ -901,6 +902,56 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
+// PERSISTENT per-step input device buffers (decode host-tax #2): the flattened
+// positions + the full-attn metadata (slot_mapping/block_table/seq_lens/
+// query_start_loc) + the GDN decode state indices, uploaded to the device ONCE
+// per step and read by EVERY layer — mirrors vLLM's persistent input buffers in
+// gpu_model_runner.py (self.input_batch.{positions,slot_mapping,block_table,
+// seq_lens,query_start_loc} device tensors, refreshed once per step). Collapses
+// the previous per-full-attn-layer (×10) and per-GDN-layer (×30) H2D re-uploads —
+// each a BLOCKING pageable cudaMemcpyAsync that serialized the decode stream
+// (nsys: ~110 blocking copies/step ≈ 5.1s host-stall in an 8s decode window) — to
+// ONE upload per input, per step. The buffers live for the whole layer loop (held
+// by the caller). Bit-exact (same bytes, uploaded once instead of per layer).
+// Graph-safe: on the num_reqs==1 decode-graph the single upload is captured from
+// the persistent host metadata address (same as the per-layer copies were) and
+// replayed.
+struct StepDevInputs {
+  DBuf positions;        // i32 [T]
+  DBuf slot_mapping;     // i64 [T]
+  DBuf block_table;      // i32 [num_reqs, cols]
+  DBuf seq_lens;         // i32 [num_reqs]
+  DBuf query_start_loc;  // i32 [num_reqs+1]
+  DBuf gdn_state_idx;    // i32 [num_decodes] (decode path; else a 1-elem stub)
+  bool has_gdn_idx = false;
+};
+
+StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
+                                 const CommonAttentionMetadata& am,
+                                 const GDNAttentionMetadata& gm) {
+  const int64_t T = static_cast<int64_t>(positions.size());
+  StepDevInputs s{
+      DBuf(d, DType::kI32, {T}, positions.data()),
+      DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
+      DBuf(d, DType::kI32, {am.num_reqs, am.block_table_num_cols},
+           am.block_table_tensor.data()),
+      DBuf(d, DType::kI32, {am.num_reqs}, am.seq_lens.data()),
+      DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
+      DBuf(d, DType::kI32, {1}),  // gdn stub (replaced below on a decode step)
+      false,
+  };
+  // GDN decode state indices: the leading num_decodes entries of the non-spec
+  // state-index vector, SHARED by causal_conv1d_update + the fused decode
+  // recurrence across ALL 30 GDN layers (was re-uploaded 60×/step). Present only
+  // when the step contains decodes.
+  if (gm.num_decodes > 0 && gm.non_spec_state_indices_tensor.has_value()) {
+    s.gdn_state_idx = DBuf(d, DType::kI32, {gm.num_decodes},
+                           gm.non_spec_state_indices_tensor->data());
+    s.has_gdn_idx = true;
+  }
+  return s;
+}
+
 // --- Batched PAGED GDN block (M1.8 Task 3). Same conv1d + l2norm + q/k/v/g/beta
 // prep + gated-norm + out_proj as GdnBlock, but driven by the batched
 // GDNAttentionMetadata segmentation over the PERSISTENT ssm_state/conv_state:
@@ -910,7 +961,8 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 // recurrence split L1480-1559; the ssm gather+ZERO L1513-1514, scatter L1532).
 // h [T*H] bf16 -> [T*H] bf16.
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
-                   const Tensor& h, const GDNAttentionMetadata& meta,
+                   const Tensor& h, const StepDevInputs& sdi,
+                   const GDNAttentionMetadata& meta,
                    const GdnStateCache& state, int64_t T) {
   const int64_t Hk = cfg.linear_num_key_heads;
   const int64_t Hv = cfg.linear_num_value_heads;
@@ -970,11 +1022,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // vector (its leading nd entries are the decode slots; decodes lead the batch)
     // — NOT a stack-local copy, so the decode-CUDA-graph replay (num_reqs==1) can
     // re-read this H2D copy from a fixed host address across replays.
-    const auto& sidx = *meta.non_spec_state_indices_tensor;
-    DBuf didx_dev(d, DType::kI32, {nd}, sidx.data());
+    // State slot indices from the PERSISTENT per-step buffer (uploaded once,
+    // shared by conv-update + the ssm recurrence across all GDN layers).
+    Tensor gidx = sdi.gdn_state_idx.t();
     Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
     vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr, conv_cache,
-                           vt::CausalConv1dArgs{true}, &didx_dev.t());
+                           vt::CausalConv1dArgs{true}, &gidx);
   }
 
   // Split conv output into q[T,Hk,Dk] | k[T,Hk,Dk] | v[T,Hv,Dv] (device op).
@@ -1009,8 +1062,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // slot (mirrors fla fused_recurrent ssm_state_indices) — no per-request
     // gather+scatter (the other two host<->device copies per sequence per layer).
     // Persistent metadata source (see the conv branch) for graph-replay safety.
-    const auto& sidx = *meta.non_spec_state_indices_tensor;
-    DBuf didx_dev(d, DType::kI32, {nd}, sidx.data());
+    Tensor gidx = sdi.gdn_state_idx.t();
     Tensor ssm_cache = state.ssm_state;  // mutable view over the shared buffer
     Tensor q_dec = SubView(dql2.t(), 0, nd_tok);
     Tensor k_dec = SubView(dkl2.t(), 0, nd_tok);
@@ -1019,7 +1071,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor b_dec = SubView(dbeta.t(), 0, nd_tok);
     Tensor o_dec = SubView(dcore.t(), 0, nd_tok);
     vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec, ssm_cache,
-                  vt::GdnArgs{scale}, &didx_dev.t());
+                  vt::GdnArgs{scale}, &gidx);
   }
   if (np > 0) {
     const auto& pidx = *meta.prefill_state_indices;
@@ -1132,7 +1184,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
 // qwen3_next.py::Qwen3NextAttention.forward @ e24d1b24 (self.attn(q,k,v) is the
 // reshape_and_cache + paged read). h [T*H] bf16 -> [T*H] bf16.
 DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
-                        const Tensor& h, const std::vector<int32_t>& positions,
+                        const Tensor& h, const StepDevInputs& sdi,
                         const CommonAttentionMetadata& meta, const PagedKvCache& kv,
                         int64_t T) {
   const int64_t Hq = cfg.num_attention_heads;
@@ -1172,27 +1224,29 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
   vt::RmsNorm(d.q, dkn.t(), Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
 
-  DBuf dpos(d, DType::kI32, {T}, positions.data());
+  // positions/slot_mapping/block_table/seq_lens/query_start_loc are the PERSISTENT
+  // per-step device buffers (uploaded once, read by every layer) — no per-layer
+  // H2D re-upload. sdi.* Tensors are const views over the shared DBufs.
+  Tensor dpos = sdi.positions.t();
   Tensor qn3 = Reshape(dqn.t(), {T, Hq, Dh});
   Tensor kn3 = Reshape(dkn.t(), {T, Hkv, Dh});
-  vt::RopeNeox(d.q, qn3, kn3, dpos.t(), vt::RopeArgs{base, rot});
+  vt::RopeNeox(d.q, qn3, kn3, dpos, vt::RopeArgs{base, rot});
 
   Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
 
   // Write the new K/V into the paged cache, then read K/V from the cache.
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
-  DBuf dslot(d, DType::kI64, {T}, meta.slot_mapping.data());
-  DBuf dblk(d, DType::kI32, {meta.num_reqs, meta.block_table_num_cols},
-            meta.block_table_tensor.data());
-  DBuf dsl(d, DType::kI32, {meta.num_reqs}, meta.seq_lens.data());
-  DBuf dqsl(d, DType::kI32, {meta.num_reqs + 1}, meta.query_start_loc.data());
-  vt::ReshapeAndCache(d.q, kn3, v3, k_cache, v_cache, dslot.t());
+  Tensor dslot = sdi.slot_mapping.t();
+  Tensor dblk = sdi.block_table.t();
+  Tensor dsl = sdi.seq_lens.t();
+  Tensor dqsl = sdi.query_start_loc.t();
+  vt::ReshapeAndCache(d.q, kn3, v3, k_cache, v_cache, dslot);
 
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
-  vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk.t(), dsl.t(),
-                     dqsl.t(), vt::PagedAttentionArgs{scale, meta.causal});
+  vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl,
+                     dqsl, vt::PagedAttentionArgs{scale, meta.causal});
 
   // Sigmoid output gate then o-project (§5) — device op.
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
@@ -1712,7 +1766,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
 // (full-attn: attn_kv) or the persistent GDN mamba state (GDN: gdn_state).
 // Exactly one of {attn_kv, gdn_state} is non-null (per layer type).
 void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
-                   DBuf& hidden, DBuf& res, const std::vector<int32_t>& positions,
+                   DBuf& hidden, DBuf& res, const StepDevInputs& sdi,
                    const CommonAttentionMetadata& attn_meta,
                    const GDNAttentionMetadata& gdn_meta,
                    const PagedKvCache* attn_kv, const GdnStateCache* gdn_state,
@@ -1727,10 +1781,10 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
       VT_CHECK(gdn_state != nullptr, "paged layer: GDN layer needs a GdnStateCache");
-      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), gdn_meta, *gdn_state, T);
+      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), sdi, gdn_meta, *gdn_state, T);
     }
     VT_CHECK(attn_kv != nullptr, "paged layer: full-attn layer needs a PagedKvCache");
-    return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), positions, attn_meta,
+    return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
 
@@ -1748,7 +1802,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
 // one of {attn_kv, gdn_state} is non-null (per layer type).
 void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
                         const HfConfig& cfg, DBuf& hidden, DBuf& res,
-                        const std::vector<int32_t>& positions,
+                        const StepDevInputs& sdi,
                         const CommonAttentionMetadata& attn_meta,
                         const GDNAttentionMetadata& gdn_meta,
                         const PagedKvCache* attn_kv,
@@ -1764,11 +1818,11 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     if (layer.is_linear_attention) {
       VT_CHECK(gdn_state != nullptr,
                "paged dense layer: GDN layer needs a GdnStateCache");
-      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), gdn_meta, *gdn_state, T);
+      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), sdi, gdn_meta, *gdn_state, T);
     }
     VT_CHECK(attn_kv != nullptr,
              "paged dense layer: full-attn layer needs a PagedKvCache");
-    return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), positions, attn_meta,
+    return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
                               *attn_kv, T);
   }();
 
@@ -1829,6 +1883,11 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   DBuf res(d, DType::kF32, {T, H});
   res.Zero(d);
 
+  // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
+  // state indices) into persistent device buffers all layers read — replaces the
+  // per-layer H2D re-uploads (the decode host-stall root; see StepDevInputs).
+  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
@@ -1836,7 +1895,7 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
-    RunLayerPaged(d, layer, config, hidden, res, positions, attn_meta, gdn_meta,
+    RunLayerPaged(d, layer, config, hidden, res, sdi, attn_meta, gdn_meta,
                   kv, gs, T);
   }
 
@@ -2069,6 +2128,9 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   DBuf res(d, DType::kF32, {T, H});
   res.Zero(d);
 
+  // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
+  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the
   // 35B paged forward).
@@ -2079,7 +2141,7 @@ std::vector<float> Qwen3_5DenseModel::Forward(
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
-    RunDenseLayerPaged(d, layer, config, hidden, res, positions, attn_meta,
+    RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T);
   }
 

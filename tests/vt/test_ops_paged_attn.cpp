@@ -596,3 +596,54 @@ TEST_CASE("paged_attention CUDA matches CPU (batched varlen, GQA, block-spanning
   for (size_t i = 0; i < ref.size(); ++i)
     CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
 }
+
+// ===========================================================================
+// CUDA parity at the GATE-MODEL config: head_dim 256, GQA 16q/2kv. This is the
+// M2.4 flash prefill path's real shape — head_dim 256 means the warp-per-row
+// kernel distributes 8 elements per lane (epl=8), and prefill lengths that span
+// several BN key-tiles exercise the cross-tile online-softmax rescale. The
+// smaller D=32 case above only covers epl=1, so this pins the production path.
+// Guarded by HasCuda; dgx-pending on CPU-only boxes.
+// ===========================================================================
+TEST_CASE("paged_attention CUDA matches CPU at head_dim 256 (gate config, epl=8)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping paged_attention D=256 parity (dgx-pending)");
+    return;
+  }
+  const int64_t Hq = 16, Hk = 2, D = 256, block_size = 16;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  // 3 reqs: a long prefill (seq 100, spans multiple BN=32 key-tiles), a decode
+  // at seq 133, and a short prefill chunk (len 3, seq 140).
+  std::vector<int32_t> qsl = {0, 100, 101, 104};
+  std::vector<int32_t> seq_lens = {100, 133, 140};
+  const int64_t num_tokens = 104;
+  const int64_t num_reqs = 3;
+  const int64_t num_blocks = 64, page = Hk * D, max_blocks = 9;
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 2024);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 137);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 179);
+  // block tables (num_reqs x max_blocks); non-identity, disjoint blocks.
+  std::vector<int32_t> block_table = {5,  0,  11, 3,  0,  0, 0, 0, 0,   // req0 seq100 → 7 blocks
+                                      2,  17, 9,  20, 1,  8, 0, 0, 0,   // req1 seq133 → 9 blocks
+                                      30, 4,  22, 15, 6, 19, 7, 12, 0};  // req2 seq140 → 9 blocks
+
+  std::vector<float> ref = ComposedPagedRef(q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq,
+                                            Hk, D, block_size, scale, true);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {num_tokens, Hq, D}, q.data());
+  DeviceTensor dkc(gpu, g.q, DType::kF32, {num_blocks, block_size, Hk, D}, kc.data());
+  DeviceTensor dvc(gpu, g.q, DType::kF32, {num_blocks, block_size, Hk, D}, vc.data());
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {num_tokens, Hq, D});
+  vt::PagedAttention(g.q, dout.tensor(), dq.tensor(), dkc.tensor(), dvc.tensor(), dbt.tensor(),
+                     dsl.tensor(), dqsl.tensor(), PagedAttentionArgs{scale, true});
+  std::vector<float> got(static_cast<size_t>(num_tokens * Hq * D), 0.0f);
+  dout.Download(g.q, got.data());
+
+  for (size_t i = 0; i < ref.size(); ++i)
+    CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
+}

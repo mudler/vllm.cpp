@@ -403,8 +403,39 @@ DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   return dout;
 }
 
+// TRUE W4A4 toggle (A/B; default ON — mirrors vLLM, which runs this checkpoint as
+// use_a16=False true-W4A4, notes §7.1). Set VT_W4A4_TRUE=0 to fall back to the
+// W4A16 6a fast path (bf16 activations) for a throughput A/B. Only affects
+// weights that carry the activation-quant globals (27B; alpha>0) — the 35B
+// (alpha==0) is untouched regardless.
+bool TrueW4A4Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_W4A4_TRUE");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
+
+// TRUE W4A4 (fp4 activations x fp4 weights) device GEMM — the 27B path (notes §7).
+// ScaledFp4Quant(x) -> per-token fp4 activations + fp8 block scales, then the
+// fp4xfp4 GEMM with the folded alpha (= vllm cutlass_scaled_fp4_mm_sm120a). CUDA
+// only; the CPU fp4 path uses the bf16-dequant fallback in the callers. out_dtype
+// f32 or bf16.
+DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
+  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  DBuf a_packed(d, DType::kI8, {M, K / 2});
+  DBuf a_scale(d, DType::kI8, {M, K / 16});
+  vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
+  Nvfp4Dev dw = ResidentNvfp4(d, w);
+  DBuf dout(d, out_dtype, {M, N});
+  vt::MatmulNvfp4Fp4(d.q, dout.t(), a_packed.t(), a_scale.t(), dw.packed, dw.scale, w.alpha);
+  return dout;
+}
+
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
+    return MatmulNvfp4Fp4D(d, x, w, DType::kF32);
   DBuf dout(d, DType::kF32, {M, N});
   if (d.q.device.type == vt::DeviceType::kCUDA) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
@@ -422,6 +453,8 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
 // DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
 DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
+    return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
   DBuf dout(d, DType::kBF16, {M, N});
   if (d.q.device.type == vt::DeviceType::kCUDA) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);

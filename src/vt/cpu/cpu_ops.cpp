@@ -85,6 +85,146 @@ void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up)
   }
 }
 
+// --- TRUE W4A4 (fp4xfp4) helpers + kernels (notes §7). Self-contained fp8/fp4
+// codec (vt does not depend on vllm), bit-matching vllm::F8E4M3ToF32 /
+// F32ToF8E4M3 / CastToFp4 / kE2M1Lut so the op equals vllm::RunNvfp4Emulation.
+constexpr float kFp4Max = 6.0F;    // E2M1 max magnitude
+constexpr float kFp8Max = 448.0F;  // fp8-e4m3fn max finite
+constexpr float kE2M1[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+
+inline float ClampF(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
+inline float RecipF(float x) { return x == 0.0F ? 0.0F : 1.0F / x; }
+
+// IEEE fp8-e4m3fn byte -> f32 (bit-matches vllm::F8E4M3ToF32).
+float Fp8ToF32(uint8_t byte) {
+  const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
+  const uint32_t exp = static_cast<uint32_t>(byte >> 3) & 0xFU;
+  const uint32_t mant = static_cast<uint32_t>(byte) & 0x7U;
+  const float sm = sign ? -1.0F : 1.0F;
+  if (exp == 0xFU && mant == 0x7U) return std::numeric_limits<float>::quiet_NaN();
+  if (exp == 0U) return sm * (static_cast<float>(mant) * (1.0F / 512.0F));
+  const float mantissa = 1.0F + static_cast<float>(mant) * (1.0F / 8.0F);
+  return sm * std::ldexp(mantissa, static_cast<int>(exp) - 7);
+}
+
+// f32 -> fp8-e4m3fn byte, round-to-nearest-even saturating (bit-matches
+// vllm::F32ToF8E4M3).
+uint8_t F32ToFp8(float f) {
+  if (std::isnan(f)) return 0x7FU;
+  const uint8_t sign = std::signbit(f) ? 0x80U : 0x00U;
+  const float a = std::fabs(f);
+  if (!std::isfinite(a) || a >= kFp8Max) return static_cast<uint8_t>(sign | 0x7EU);
+  if (a == 0.0F) return sign;
+  int e2 = 0;
+  const float frac = std::frexp(a, &e2);
+  int exp_field = (e2 - 1) + 7;
+  if (exp_field <= 0) {
+    const double qd = static_cast<double>(a) * 512.0;
+    const int qi = static_cast<int>(std::nearbyint(qd));
+    if (qi <= 0) return sign;
+    if (qi < 8) return static_cast<uint8_t>(sign | static_cast<uint8_t>(qi));
+    return static_cast<uint8_t>(sign | (1U << 3));
+  }
+  const double sig = static_cast<double>(frac) * 2.0;
+  int mi = static_cast<int>(std::nearbyint(sig * 8.0));
+  if (mi == 16) {
+    mi = 8;
+    exp_field += 1;
+  }
+  const int mant = mi - 8;
+  if (exp_field > 15 || (exp_field == 15 && mant >= 7)) {
+    return static_cast<uint8_t>(sign | 0x7EU);
+  }
+  return static_cast<uint8_t>(sign | (static_cast<uint8_t>(exp_field) << 3) |
+                              static_cast<uint8_t>(mant));
+}
+
+// f32 -> E2M1 nibble (bit-matches vllm::CastToFp4 + Fp4ToNibble). Input pre-scaled.
+uint8_t F32ToFp4Nibble(float x) {
+  const float a = std::fabs(x);
+  uint8_t idx = 7;  // 6.0
+  if (a <= 0.25F) idx = 0;
+  else if (a < 0.75F) idx = 1;
+  else if (a <= 1.25F) idx = 2;
+  else if (a < 1.75F) idx = 3;
+  else if (a <= 2.5F) idx = 4;
+  else if (a < 3.5F) idx = 5;
+  else if (a <= 5.0F) idx = 6;
+  if (idx == 0) return 0;
+  return static_cast<uint8_t>((x < 0.0F ? 0x8U : 0x0U) | idx);
+}
+
+inline float Nibble(uint8_t nib) {
+  return kE2M1[nib & 0x7U] * ((nib & 0x8U) ? -1.0F : 1.0F);
+}
+
+// ScaledFp4Quant CPU kernel: x [M,K] float -> out_packed [M,K/2] i8 + out_scale
+// [M,K/16] i8. Per-token, per-16-group; equals vllm::RefScaledFp4Quant.
+void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
+                          float input_global_scale_inv) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  constexpr int kBS = 16;
+  const int64_t groups = k / kBS;
+  const float gs_recip = RecipF(input_global_scale_inv);
+  auto* packed = out_packed.Ptr<uint8_t>();
+  auto* scale = out_scale.Ptr<uint8_t>();
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t g = 0; g < groups; ++g) {
+      const int64_t base = g * kBS;
+      float vec_max = 0.0F;
+      for (int j = 0; j < kBS; ++j) vec_max = std::fmax(vec_max, std::fabs(LoadF32(x, i * k + base + j)));
+      float sc = ClampF(input_global_scale_inv * (vec_max * (1.0F / kFp4Max)), -kFp8Max, kFp8Max);
+      const uint8_t sc_f8 = F32ToFp8(sc);
+      scale[i * groups + g] = sc_f8;
+      const float block_scale = Fp8ToF32(sc_f8) * gs_recip;
+      const float out_scale_v = RecipF(block_scale);
+      for (int j = 0; j < kBS; j += 2) {
+        const float lo = ClampF(LoadF32(x, i * k + base + j) * out_scale_v, -kFp4Max, kFp4Max);
+        const float hi = ClampF(LoadF32(x, i * k + base + j + 1) * out_scale_v, -kFp4Max, kFp4Max);
+        packed[(i * k + base + j) / 2] =
+            static_cast<uint8_t>(F32ToFp4Nibble(lo) | (F32ToFp4Nibble(hi) << 4));
+      }
+    }
+  }
+}
+
+// MatmulNvfp4Fp4 CPU kernel: out[m,n] = alpha * Σ_k (a_fp4·f8(a_scale))·(b_fp4·
+// f8(b_scale)). Equals vllm::RunNvfp4Emulation up to K-reduction order.
+void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
+                          const Tensor& b_packed, const Tensor& b_scale, float alpha) {
+  const int64_t m = a_packed.shape[0], k = a_packed.shape[1] * 2, n = b_packed.shape[0];
+  constexpr int kBS = 16;
+  const int64_t groups = k / kBS;
+  const auto* ap = a_packed.Ptr<uint8_t>();
+  const auto* as = a_scale.Ptr<uint8_t>();
+  const auto* bp = b_packed.Ptr<uint8_t>();
+  const auto* bs = b_scale.Ptr<uint8_t>();
+  std::vector<float> arow(static_cast<size_t>(k));
+  for (int64_t i = 0; i < m; ++i) {
+    // Decode a_fp4·a_scale_fp8 for this row once (reused across N columns).
+    for (int64_t g = 0; g < groups; ++g) {
+      const float asf = Fp8ToF32(as[i * groups + g]);
+      for (int j = 0; j < kBS / 2; ++j) {
+        const uint8_t byte = ap[(i * k + g * kBS) / 2 + j];
+        arow[static_cast<size_t>(g * kBS + 2 * j)] = Nibble(byte & 0x0FU) * asf;
+        arow[static_cast<size_t>(g * kBS + 2 * j + 1)] = Nibble(byte >> 4) * asf;
+      }
+    }
+    for (int64_t col = 0; col < n; ++col) {
+      float acc = 0.0F;
+      for (int64_t g = 0; g < groups; ++g) {
+        const float bsf = Fp8ToF32(bs[col * groups + g]);
+        for (int j = 0; j < kBS / 2; ++j) {
+          const uint8_t byte = bp[(col * k + g * kBS) / 2 + j];
+          acc += arow[static_cast<size_t>(g * kBS + 2 * j)] * (Nibble(byte & 0x0FU) * bsf);
+          acc += arow[static_cast<size_t>(g * kBS + 2 * j + 1)] * (Nibble(byte >> 4) * bsf);
+        }
+      }
+      StoreF32(out, i * n + col, alpha * acc);
+    }
+  }
+}
+
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
   for (int64_t i = 0; i < t; ++i) {
@@ -508,6 +648,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
+    RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
+    RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4Kernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,

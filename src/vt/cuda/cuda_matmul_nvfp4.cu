@@ -40,6 +40,7 @@
 // to the CUDA-core tiled kernels (A/B toggle). Small-M decode keeps the naive
 // kernel (graph-safe). Measured GB10: 1024-token prefill TTFT 14.4s -> 6.1s.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <mma.h>
@@ -850,12 +851,267 @@ void MatmulNvfp4KernelCuda(Queue& q, Tensor& out, const Tensor& act, const Tenso
   }
 }
 
+// --- TRUE W4A4 (fp4 activations x fp4 weights) — the 27B path (notes §7) --------
+// vt::ScaledFp4Quant (mirror vllm scaled_fp4_quant / cvt_warp_fp16_to_fp4) +
+// vt::MatmulNvfp4Fp4 (mirror cutlass_scaled_fp4_mm_sm120a). The GEMM here is the
+// CORRECTNESS-FIRST compute: both fp4 operands are dequantized to bf16 in shared
+// and the K-reduction runs on the bf16 tensor cores (numerically the exact
+// vllm::RunNvfp4Emulation result — what the true-W4A4 oracle golden should match),
+// then the accumulator is scaled by the folded `alpha`. The native block-scaled
+// fp4xfp4 MMA (Blackwell mxf4 tensor cores) is the throughput follow-up (notes
+// §7.6 step 6); the bf16-dequant path is the token-exact fallback.
+
+// IEEE fp8-e4m3fn RNE-saturating cast (hardware conversion == vllm F32ToF8E4M3).
+__device__ __forceinline__ uint8_t F32ToFp8Dev(float f) {
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
+}
+
+// f32 -> E2M1 nibble (bit-matches vllm CastToFp4 + Fp4ToNibble). Input pre-scaled.
+__device__ __forceinline__ uint8_t CastToFp4NibbleDev(float x) {
+  const float a = fabsf(x);
+  uint8_t idx;
+  if (a <= 0.25f) idx = 0;
+  else if (a < 0.75f) idx = 1;
+  else if (a <= 1.25f) idx = 2;
+  else if (a < 1.75f) idx = 3;
+  else if (a <= 2.5f) idx = 4;
+  else if (a < 3.5f) idx = 5;
+  else if (a <= 5.0f) idx = 6;
+  else idx = 7;
+  if (idx == 0) return 0;
+  return static_cast<uint8_t>((x < 0.0f ? 0x8u : 0x0u) | idx);
+}
+
+// ScaledFp4Quant: one thread per (row, 16-group). Emits packed fp4 [M,K/2] +
+// fp8 block scale [M,K/16]. Exact-division reciprocal to match the CPU truth
+// (the real vllm kernel uses reciprocal_approximate_ftz — sub-bucket delta,
+// notes §7.2). Tin f32/bf16.
+template <typename Tin>
+__global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin* x,
+                                     float input_global_scale, int64_t m_rows, int64_t k_dim) {
+  const int64_t groups = k_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= m_rows * groups) return;
+  const int64_t row = gid / groups;
+  const int64_t g = gid % groups;
+  const int64_t base = row * k_dim + g * 16;
+  float vmax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(Load(x, base + j)));
+  float sc = input_global_scale * (vmax * (1.0f / 6.0f));
+  sc = fminf(fmaxf(sc, -448.0f), 448.0f);
+  const uint8_t sc8 = F32ToFp8Dev(sc);
+  scale[row * groups + g] = sc8;
+  const float gs_recip = input_global_scale == 0.0f ? 0.0f : 1.0f / input_global_scale;
+  const float block_scale = F8E4M3ToF32Dev(sc8) * gs_recip;
+  const float out_scale = block_scale == 0.0f ? 0.0f : 1.0f / block_scale;
+#pragma unroll
+  for (int j = 0; j < 16; j += 2) {
+    const float lo = fminf(fmaxf(Load(x, base + j) * out_scale, -6.0f), 6.0f);
+    const float hi = fminf(fmaxf(Load(x, base + j + 1) * out_scale, -6.0f), 6.0f);
+    packed[(base + j) / 2] =
+        static_cast<uint8_t>(CastToFp4NibbleDev(lo) | (CastToFp4NibbleDev(hi) << 4));
+  }
+}
+
+void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
+                              float input_global_scale_inv) {
+  const int64_t m = x.shape[0], k = x.shape[1];
+  if (m == 0 || k == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int64_t total = m * (k / 16);
+  constexpr int kBlock = 256;
+  const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
+  auto* pk = out_packed.Ptr<uint8_t>();
+  auto* sc = out_scale.Ptr<uint8_t>();
+  switch (x.dtype) {
+    case DType::kF32:
+      ScaledFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(pk, sc, x.Ptr<float>(),
+                                                          input_global_scale_inv, m, k);
+      break;
+    case DType::kBF16:
+      ScaledFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+          pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k);
+      break;
+    default: VT_CHECK(false, "cuda scaled_fp4_quant: unsupported x dtype (f32/bf16 only)");
+  }
+  Check(cudaGetLastError(), "scaled_fp4_quant kernel launch");
+}
+
+// Naive fp4xfp4 GEMM (small-M / decode). out[m,n] = alpha * sum_k
+// (a_fp4[m,k]·f8(a_scale[m,k/16]))·(b_fp4[n,k]·f8(b_scale[n,k/16])). One thread
+// per output; decode both operands on the fly. Bit-consistent with the WMMA path
+// (same per-element decode), only K-order differs.
+template <typename Tout>
+__global__ void MatmulNvfp4Fp4Naive(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
+                                    const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
+                                    int64_t m_rows, int64_t n_cols, int64_t k_dim) {
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t m = blockIdx.y;
+  if (n >= n_cols || m >= m_rows) return;
+  const int64_t packed_cols = k_dim / 2;
+  const int64_t groups = k_dim / 16;
+  const uint8_t* aprow = a_packed + m * packed_cols;
+  const uint8_t* asrow = a_scale + m * groups;
+  const uint8_t* bprow = b_packed + n * packed_cols;
+  const uint8_t* bsrow = b_scale + n * groups;
+  float acc = 0.0f;
+  for (int64_t g = 0; g < groups; ++g) {
+    const float asf = F8E4M3ToF32Dev(asrow[g]);
+    const float bsf = F8E4M3ToF32Dev(bsrow[g]);
+    for (int j = 0; j < 8; ++j) {
+      const uint8_t ab = aprow[g * 8 + j];
+      const uint8_t bb = bprow[g * 8 + j];
+      const float a_lo = kE2M1[ab & 0x7u] * ((ab & 0x8u) ? -1.0f : 1.0f) * asf;
+      const float a_hi = kE2M1[(ab >> 4) & 0x7u] * ((ab & 0x80u) ? -1.0f : 1.0f) * asf;
+      const float b_lo = kE2M1[bb & 0x7u] * ((bb & 0x8u) ? -1.0f : 1.0f) * bsf;
+      const float b_hi = kE2M1[(bb >> 4) & 0x7u] * ((bb & 0x80u) ? -1.0f : 1.0f) * bsf;
+      acc += a_lo * b_lo + a_hi * b_hi;
+    }
+  }
+  Store(out, m * n_cols + n, alpha * acc);
+}
+
+// Decode a fp4 tile [ROWS][BK] (packed [ROWS][K/2], fp8 group scales [ROWS][K/16])
+// into shared bf16 `dst` [ROWS][BK]. `outer0` = the tile's first row in the full
+// [ROWS_total][K] operand; used by both the A (M) and B (N) operands (symmetric).
+template <int BK>
+__device__ __forceinline__ void DecodeFp4TileToShared(__nv_bfloat16* dst, const uint8_t* packed,
+                                                      const uint8_t* scale, int64_t outer0,
+                                                      int64_t outer_max, int64_t kt, int64_t k_dim,
+                                                      int tid, int kThreads, int tile_rows) {
+  const int64_t packed_cols = k_dim / 2;
+  const int64_t groups = k_dim / 16;
+  for (int idx = tid; idx < tile_rows * (BK / 2); idx += kThreads) {
+    const int nl = idx / (BK / 2), bc = idx % (BK / 2), kl = 2 * bc;
+    const int64_t gn = outer0 + nl;
+    if (gn < outer_max && kt + kl < k_dim) {
+      const uint8_t b = packed[gn * packed_cols + kt / 2 + bc];
+      const float gs = F8E4M3ToF32Dev(scale[gn * groups + (kt + kl) / 16]);
+      float w_lo, w_hi;
+      DecodeFp4Byte(b, gs, w_lo, w_hi);
+      dst[nl * BK + kl] = __float2bfloat16(w_lo);
+      dst[nl * BK + kl + 1] = __float2bfloat16(w_hi);
+    } else {
+      dst[nl * BK + kl] = __float2bfloat16(0.0f);
+      dst[nl * BK + kl + 1] = __float2bfloat16(0.0f);
+    }
+  }
+}
+
+// Tensor-core (bf16 WMMA) fp4xfp4 GEMM: decode BOTH operands to bf16 in shared,
+// run wmma m16n16k16, scale the accumulator by alpha at store. Same tiling as
+// MatmulNvfp4Wmma; the only additions are the A-operand fp4 decode and the alpha.
+template <typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N>
+__global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
+                                   const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
+                                   int64_t m_rows, int64_t n_cols, int64_t k_dim) {
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  __shared__ __nv_bfloat16 As[BM * BK];
+  __shared__ __nv_bfloat16 Ws[BN * BK];
+  __shared__ float Cs[BM * BN];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int64_t row0 = static_cast<int64_t>(blockIdx.y) * BM;
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+  for (int64_t kt = 0; kt < k_dim; kt += BK) {
+    DecodeFp4TileToShared<BK>(As, a_packed, a_scale, row0, m_rows, kt, k_dim, tid, kThreads, BM);
+    DecodeFp4TileToShared<BK>(Ws, b_packed, b_scale, col0, n_cols, kt, k_dim, tid, kThreads, BN);
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], &As[(wm * WMPER + mi * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni)
+        wmma::load_matrix_sync(bf[ni], &Ws[(wn * WNPER + ni * 16) * BK + kk * 16], BK);
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) wmma::mma_sync(acc[mi][ni], af[mi], bf[ni], acc[mi][ni]);
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni)
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[mi][ni], BN, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gr = row0 + r, gc = col0 + c;
+    if (gr < m_rows && gc < n_cols) Store(out, gr * n_cols + gc, alpha * Cs[idx]);
+  }
+}
+
+template <typename Tout>
+void LaunchFp4Fp4(cudaStream_t s, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
+                  const Tensor& b_packed, const Tensor& b_scale, float alpha, int64_t m, int64_t n,
+                  int64_t k) {
+  auto* ap = a_packed.Ptr<uint8_t>();
+  auto* as = a_scale.Ptr<uint8_t>();
+  auto* bp = b_packed.Ptr<uint8_t>();
+  auto* bs = b_scale.Ptr<uint8_t>();
+  if (m < kTileMinRows || !WmmaEnabled()) {
+    constexpr int kBlock = 256;
+    const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(m));
+    MatmulNvfp4Fp4Naive<Tout><<<grid, kBlock, 0, s>>>(out.Ptr<Tout>(), ap, as, bp, bs, alpha, m, n,
+                                                      k);
+    Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (naive)");
+    return;
+  }
+  constexpr int BM = 64, BN = 64, BK = 32, WARPS_M = 2, WARPS_N = 2;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>((m + BM - 1) / BM));
+  MatmulNvfp4Fp4Wmma<Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
+      out.Ptr<Tout>(), ap, as, bp, bs, alpha, m, n, k);
+  Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (wmma)");
+}
+
+void MatmulNvfp4Fp4KernelCuda(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
+                              const Tensor& b_packed, const Tensor& b_scale, float alpha) {
+  const int64_t m = a_packed.shape[0], k = a_packed.shape[1] * 2, n = b_packed.shape[0];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = AsStream(q);
+  switch (out.dtype) {
+    case DType::kF32:
+      LaunchFp4Fp4<float>(s, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n, k);
+      break;
+    case DType::kBF16:
+      LaunchFp4Fp4<__nv_bfloat16>(s, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n, k);
+      break;
+    default: VT_CHECK(false, "cuda matmul_nvfp4_fp4: unsupported out dtype (f32/bf16 only)");
+  }
+}
+
 // Registers the CUDA NVFP4 dequant-GEMM during static init (table fill only, no
 // CUDA calls — see cuda_ops.cu for the pre-main discipline rationale).
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmulNvfp4, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fn>(&MatmulNvfp4KernelCuda)));
+    RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernelCuda)));
+    RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4KernelCuda)));
     RegisterOp(OpId::kMoeGroupedGemmNvfp4, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<MoeGroupedGemmNvfp4Fn>(&MoeGroupedGemmNvfp4KernelCuda)));

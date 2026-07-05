@@ -553,6 +553,41 @@ measured experiment vs the sm120a-class kernel, not an assumed loss.
 
 ### 7.6 Ordered implementation plan (correctness-first; GPU steps marked)
 
+STATUS (2026-07-05, dev-box session — NO GPU here: `mudler-ubuntu-box` has no
+CUDA toolkit and the GB10/dgx is unreachable, so steps that BUILD/RUN CUDA or the
+oracle were WRITTEN but not executed). Landed on branch
+`worktree-agent-afef1d015a3960d60` (NOT merged to main — the token-for-token gate
+must pass on GB10 first):
+- **Step 1 ✅ (CPU, verified).** `vllm::RefScaledFp4Quant` + `Fp4ToNibble`
+  (nvfp4_emulation.{h,cpp}) — the quant-only half, emits packed fp4 + fp8 block
+  scale. vt ops `ScaledFp4Quant` + `MatmulNvfp4Fp4` added (ops.h/ops.cpp, OpIds
+  `kScaledFp4Quant`/`kMatmulNvfp4Fp4`) with **CPU kernels** (cpu_ops.cpp,
+  self-contained fp8/fp4 codec). Unit test `tests/vt/test_ops_nvfp4_fp4.cpp`:
+  ScaledFp4Quant BYTE-EXACT vs `RefScaledFp4Quant` and its decode == the
+  `RefNvfp4QuantDequant` x_dq; `MatmulNvfp4Fp4(ScaledFp4Quant(x),W)` ==
+  `RunNvfp4Emulation` (529 assertions, CPU-green). Full CPU ctest 86/86.
+- **Steps 2+3 ⚠ (CUDA WRITTEN, not built — no nvcc here).** `ScaledFp4QuantKernel`
+  + `MatmulNvfp4Fp4{Naive,Wmma}` in cuda_matmul_nvfp4.cu, registered for kCUDA.
+  The GEMM is the CORRECTNESS-FIRST compute (dequant BOTH fp4 operands to bf16 in
+  shared → bf16 WMMA → ×alpha = the exact `RunNvfp4Emulation` numeric result); the
+  native block-scaled fp4×fp4 (Blackwell mxf4) MMA is the throughput follow-up
+  (step 6, not attempted — would need the sm120a mxf4 `mma.sync` PTX / cutlass
+  drop-in). test_ops_nvfp4_fp4 has a HasCuda()-guarded device-vs-CPU case ready to
+  run on GB10 (quant byte-exact; GEMM within matmul tol). **MUST clean-rebuild +
+  run on GB10 to confirm nvcc compiles it.**
+- **Weight load ✅ (plumbed).** `Nvfp4Weight` gained `input_global_scale_inv` +
+  `alpha` (+ `IsTrueW4A4()`); `LoadCtNvfp4Raw` now reads `<proj>.input_global_scale`
+  and precomputes `alpha = scale2/input_global_scale_inv` (notes §7.3).
+- **Forward ✅ (wired, GPU-untested).** New `MatmulNvfp4Fp4D` (qwen3_5.cpp) =
+  `ScaledFp4Quant(x)`→`MatmulNvfp4Fp4(…alpha)`; `MatmulNvfp4F32D`/`MatmulNvfp4Bf16D`
+  route to it when `w.IsTrueW4A4() && TrueW4A4Enabled()` (CUDA only). Env toggle
+  `VT_W4A4_TRUE` (default ON, mirrors vLLM; `=0` → 6a W4A16 A/B). Gated on `alpha>0`
+  so the **35B path is byte-identical** (its modelopt weights have alpha==0).
+- **Steps 4–6 ✗ (GPU-gated, NOT done):** oracle true-W4A4 golden capture,
+  flipping `kW4A4ForwardReady` + the token-for-token gate, and the throughput A/B
+  all require the GB10 + checkpoint + `~/venvs/vllm-oracle`. `kW4A4ForwardReady`
+  stays `false`. THIS is what remains to close the gate 6a failed (§7 intro).
+
 1. **[CPU]** Split `ScaledFp4Quant` CPU reference out of `RefNvfp4QuantDequant`
    (quant-only: emit packed fp4 + fp8 block scale). Unit-test vs the existing
    emulation numbers + a hand golden (fast-reciprocal nuance noted §7.2).

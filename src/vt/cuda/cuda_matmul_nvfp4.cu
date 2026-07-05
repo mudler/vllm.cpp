@@ -85,6 +85,17 @@ bool Fp4VecEnabled() {
   return on;
 }
 
+// Decode-specialized MoE grouped GEMM path toggle (M2.9; A/B, default ON). Set
+// VT_MOE_DECODE=0 to force the prefill-tuned BM=64 WMMA tile for small-M decode
+// (the pre-M2.9 behavior) for same-binary A/B. See LaunchGrouped for the gate.
+bool MoeDecodeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_DECODE");
+    return e == nullptr || (e[0] != '0');
+  }();
+  return on;
+}
+
 // f32 load/store overloads: bf16 converts on the way in/out, math is f32.
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
@@ -720,20 +731,51 @@ __global__ void MoeGroupedGemmNvfp4Wmma(Tout* out, const Tin* act, const int32_t
   }
 }
 
-// Groups P pairs by expert on device then runs the WMMA grouped GEMM. Scratch is
-// stream-ordered (prefill-only; not graph-captured).
-template <typename Tin, typename Tout>
+// Persistent scratch for the MoE expert-grouping counting-sort + ragged tile map
+// (grown on demand, kept alive) so the decode path never pays the per-call
+// cudaMallocAsync/cudaFreeAsync — at conc-8 the grouped GEMM runs ~80x/step, and
+// the stream-ordered alloc/free serialize behind the (occupancy-bound) kernel.
+// Mirrors the argmax persistent-scratch discipline (cuda_sample.cu). The model
+// forward drives ONE CUDA stream, so consecutive grouped-GEMM calls are already
+// serialized on the stream => reusing one buffer is race-free (the hist/scatter/
+// tilemap kernels rewrite it every call). cudaMalloc (not async) fires once at
+// warmup / on growth, never on the steady-state decode path.
+int32_t* g_moe_scratch = nullptr;
+size_t g_moe_scratch_cap = 0;  // capacity in int32 elements
+int32_t* EnsureMoeScratch(int64_t elems) {
+  if (static_cast<size_t>(elems) > g_moe_scratch_cap) {
+    if (g_moe_scratch) cudaFree(g_moe_scratch);
+    Check(cudaMalloc(&g_moe_scratch, static_cast<size_t>(elems) * sizeof(int32_t)),
+          "moe grouped persistent scratch");
+    g_moe_scratch_cap = static_cast<size_t>(elems);
+  }
+  return g_moe_scratch;
+}
+
+// Small-M decode gate for the grouped WMMA path: at/below this many (token,expert)
+// pairs we run the decode-specialized BM=16 tile (mirrors vLLM fused_moe's
+// BLOCK_SIZE_M=16 for small M — moe_align_block_size pads each expert's ragged
+// token run to block_size, one block per (expert-segment x N-tile), NOT a full
+// prefill tile per expert). conc-8 decode = 8 tok x top_k 8 = 64 pairs; conc-64
+// still fits. Above it (prefill), the BM=64 tile stays byte-identical.
+constexpr int64_t kMoeDecodeMaxP = 512;
+constexpr int kMoeDecodeBM = 16;
+
+// Groups P pairs by expert on device (the moe_align_block_size analog) then runs
+// the WMMA grouped GEMM over the ragged per-tile expert map. Templated on the
+// M-tile so the decode path can size the tile to the ~1-row-per-expert reality
+// (BM=16, one warp of M) while prefill keeps the large-M BM=64 tile. Persistent
+// scratch (no per-call malloc/free). Not graph-captured on either path.
+template <typename Tin, typename Tout, int BM, int WARPS_M, int WARPS_N>
 void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                        const Tensor* row_map, const Tensor& packed_ptrs, const Tensor& scale_ptrs,
                        const Tensor& scale2s, int64_t p, int64_t n, int64_t k, int64_t e_count) {
-  constexpr int BM = kGroupBM, BN = 64, BK = 32, WARPS_M = 2, WARPS_N = 2;
+  constexpr int BN = 64, BK = 32;
   const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
   // Single scratch block, int32 sub-slices: count,offset,cursor [E]; sp,sr [P];
   // tile_expert,tile_row0,tile_rows [max_tiles].
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
-  int32_t* scratch = nullptr;
-  Check(cudaMallocAsync(&scratch, static_cast<size_t>(n_i32) * sizeof(int32_t), s),
-        "moe grouped scratch alloc");
+  int32_t* scratch = EnsureMoeScratch(n_i32);
   int32_t* count = scratch;
   int32_t* offset = count + e_count;
   int32_t* cursor = offset + e_count;
@@ -762,7 +804,6 @@ void LaunchGroupedWmma(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
       out.Ptr<Tout>(), act.Ptr<Tin>(), sp, sr, packed_ptrs.Ptr<int64_t>(),
       scale_ptrs.Ptr<int64_t>(), scale2s.Ptr<float>(), tile_expert, tile_row0, tile_rows, n, k);
   Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (wmma)");
-  Check(cudaFreeAsync(scratch, s), "moe grouped scratch free");
 }
 
 template <typename Tin, typename Tout>
@@ -780,11 +821,19 @@ void LaunchGrouped(cudaStream_t s, Tensor& out, const Tensor& act, const Tensor&
     Check(cudaGetLastError(), "moe_grouped_gemm_nvfp4 kernel launch (naive)");
     return;
   }
-  // Large-P (prefill) bf16: expert-grouped tensor-core (WMMA) path.
+  // bf16: expert-grouped tensor-core (WMMA) path. Decode/small-M (p small) runs
+  // the BM=16 decode tile (vLLM BLOCK_SIZE_M=16 for small M); prefill/large-M
+  // keeps the byte-identical BM=64 tile.
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
     if (WmmaEnabled()) {
-      LaunchGroupedWmma<Tin, Tout>(s, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs,
-                                   scale2s, p, n, k, e_count);
+      if (MoeDecodeEnabled() && p <= kMoeDecodeMaxP) {
+        LaunchGroupedWmma<Tin, Tout, kMoeDecodeBM, 1, 2>(s, out, act, expert_ids, row_map,
+                                                         packed_ptrs, scale_ptrs, scale2s, p, n, k,
+                                                         e_count);
+      } else {
+        LaunchGroupedWmma<Tin, Tout, kGroupBM, 2, 2>(s, out, act, expert_ids, row_map, packed_ptrs,
+                                                     scale_ptrs, scale2s, p, n, k, e_count);
+      }
       return;
     }
   }

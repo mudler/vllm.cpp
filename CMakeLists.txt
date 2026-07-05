@@ -55,6 +55,36 @@ if(VLLM_CPP_CUDA)
   if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a")
     add_compile_definitions(VT_FP4_MMA_SM120A=1)
   endif()
+  # CUTLASS (header-only, v4.4.2) for the sm120a NVFP4 block-scaled fp4xfp4 GEMM
+  # drop-in (cuda_matmul_nvfp4_cutlass.cu). Vendored slice under third_party/cutlass
+  # by default; override with -DVLLM_CPP_CUTLASS_DIR=<cutlass root> (must contain
+  # include/ + tools/util/include/). The TU is enabled only when the dir exists and
+  # the arch is sm_12xa (the block-scaled fp4 collective is Blackwell-only).
+  set(VLLM_CPP_CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass"
+      CACHE PATH "CUTLASS source root (include/ + tools/util/include/)")
+  # Opt-in FetchContent fallback (mirrors vLLM's own CUTLASS_REVISION v4.4.2): if
+  # no vendored/pointed cutlass tree is present, -DVLLM_CPP_CUTLASS_FETCH=ON pulls
+  # v4.4.2 (header-only). Default OFF so a tight-disk box (dgx) builds against an
+  # existing clone via -DVLLM_CPP_CUTLASS_DIR instead of a 200MB download.
+  option(VLLM_CPP_CUTLASS_FETCH "FetchContent CUTLASS v4.4.2 if not found locally" OFF)
+  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+     AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
+     AND VLLM_CPP_CUTLASS_FETCH)
+    include(FetchContent)
+    FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+      GIT_TAG v4.4.2 GIT_SHALLOW ON)
+    FetchContent_MakeAvailable(cutlass)
+    set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
+  endif()
+  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+     AND EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    set(VLLM_CPP_CUTLASS ON)
+    message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm120a NVFP4 cutlass GEMM")
+  else()
+    set(VLLM_CPP_CUTLASS OFF)
+    message(STATUS "CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM disabled "
+                   "(set -DVLLM_CPP_CUTLASS_DIR=<cutlass> or -DVLLM_CPP_CUTLASS_FETCH=ON)")
+  endif()
 endif()
 
 include(cmake/CompilerWarnings.cmake)
@@ -167,6 +197,19 @@ if(VLLM_CPP_CUDA)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)
+  # The cutlass sm120a NVFP4 GEMM TU is isolated: its own heavy cutlass include
+  # tree + relaxed-constexpr/extended-lambda, so it never touches the general
+  # build. Gated by VT_CUTLASS_NVFP4 so the host op path no-ops if not compiled.
+  if(VLLM_CPP_CUTLASS)
+    target_sources(vllm PRIVATE src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu)
+    target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1)
+    # cutlass headers reach via -isystem so their internal deprecation warnings
+    # are exempt from the global -Werror=all-warnings (the general build stays
+    # strict). --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.
+    set_source_files_properties(src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu PROPERTIES
+      COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
+  endif()
 endif()
 
 # OpenAI HTTP server (M3.1 Task 4): the api_server.cpp translation unit pulls in

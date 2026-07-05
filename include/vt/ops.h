@@ -36,6 +36,8 @@ enum class OpId : uint8_t {
   kMatmulNvfp4,
   kScaledFp4Quant,
   kMatmulNvfp4Fp4,
+  kMatmulNvfp4Cutlass,
+  kSwizzleBlockscale,
   kMoeGroupedGemmNvfp4,
   kMoeSiluMul,
   kCastBf16,
@@ -132,6 +134,9 @@ using ScaledFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using MatmulNvfp4CutlassFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
@@ -254,6 +259,23 @@ void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tenso
 // K a multiple of 16. CPU + CUDA.
 void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
                     const Tensor& b_packed, const Tensor& b_scale, float alpha);
+
+// SwizzleBlockscale (mirror vllm swizzle_blockscale, nvfp4_utils.py:13-53): pad a
+// LINEAR fp8-e4m3 block-scale [rows, groups] to [round_up(rows,128),
+// round_up(groups,4)] and block-interleave into the atom layout the cutlass
+// sm120a fp4 GEMM reads (Sm1xxBlkScaledConfig::tile_atom_to_shape_SF{A,B}). Both
+// tensors i8 (raw fp8 bytes). Used once per weight (B_sf, at load) and per step
+// (A_sf, after ScaledFp4Quant). CUDA (+ CPU reference).
+void SwizzleBlockscale(Queue& q, Tensor& out_swizzled, const Tensor& in_linear);
+
+// MatmulNvfp4Cutlass (lift of vllm cutlass_scaled_fp4_mm_sm120a — the near-peak
+// Blackwell block-scaled fp4xfp4 GEMM). Same numeric contract as MatmulNvfp4Fp4
+// but the two fp8 block-scale streams MUST be pre-swizzled (SwizzleBlockscale):
+//   a_sf_sw [round_up(M,128), round_up(K/16,4)], b_sf_sw [round_up(N,128), ...].
+// a_packed [M,K/2], b_packed [N,K/2] raw fp4 (e2m1x2). alpha = (1/input_divisor)
+// ·(1/weight_divisor). out [M,N] bf16. CUDA-only (sm120a). K,N % 32 == 0.
+void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_sf_sw,
+                        const Tensor& b_packed, const Tensor& b_sf_sw, float alpha);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

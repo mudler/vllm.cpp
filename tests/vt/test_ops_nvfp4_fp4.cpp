@@ -9,8 +9,10 @@
 // CPU-only (also the reference the future CUDA kernels validate against).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -237,3 +239,101 @@ TEST_CASE("matmul_nvfp4_fp4 validates shapes loudly") {
   Queue q = CpuQueue();
   CHECK_THROWS_AS(vt::MatmulNvfp4Fp4(q, o, ap, as, bp, bs, 1.0F), std::runtime_error);
 }
+
+#ifdef VT_CUTLASS_NVFP4
+namespace {
+float Bf16ToFloat(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+int64_t RoundUp(int64_t x, int64_t y) { return (x + y - 1) / y * y; }
+}  // namespace
+
+// The cutlass sm120a fp4xfp4 GEMM (MatmulNvfp4Cutlass, with SwizzleBlockscale on
+// both scale streams) must reproduce the emulation truth (MatmulNvfp4Fp4 with
+// LINEAR scales, itself proven == vllm::RunNvfp4Emulation) within GEMM tol. This
+// is the load-bearing drop-in validation: the swizzle layout + the lifted cutlass
+// kernel + the bf16 epilogue all agree with the reference.
+TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+
+  const int64_t M = 96, K = 512, N = 256;  // K,N % 32 == 0
+  std::mt19937 rng(202);
+  std::normal_distribution<float> nd(0.0F, 2.0F);
+  std::uniform_int_distribution<int> byte_d(0, 255);
+  std::uniform_real_distribution<float> scale_d(0.05F, 4.0F);
+
+  std::vector<float> x(static_cast<size_t>(M * K));
+  for (auto& v : x) v = nd(rng);
+  std::vector<uint8_t> w_packed(static_cast<size_t>(N * K / 2));
+  for (auto& v : w_packed) v = static_cast<uint8_t>(byte_d(rng));
+  std::vector<uint8_t> w_scale(static_cast<size_t>(N * K / 16));
+  for (auto& v : w_scale) v = vllm::F32ToF8E4M3(scale_d(rng));
+  const float input_global_scale = 8.2F, weight_global_scale = 5.5F;
+  const float alpha = (1.0F / input_global_scale) * (1.0F / weight_global_scale);
+
+  // Emulation reference (CPU, f32) — the truth.
+  std::vector<uint8_t> cpu_ap(static_cast<size_t>(M * K / 2), 0), cpu_as(static_cast<size_t>(M * K / 16), 0);
+  std::vector<float> cpu_out(static_cast<size_t>(M * N), 0);
+  {
+    Queue cq = CpuQueue();
+    Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {M, K});
+    Tensor tp = Tensor::Contiguous(cpu_ap.data(), DType::kI8, Cpu(), {M, K / 2});
+    Tensor ts = Tensor::Contiguous(cpu_as.data(), DType::kI8, Cpu(), {M, K / 16});
+    vt::ScaledFp4Quant(cq, tp, ts, tx, input_global_scale);
+    Tensor tbp = Tensor::Contiguous(w_packed.data(), DType::kI8, Cpu(), {N, K / 2});
+    Tensor tbs = Tensor::Contiguous(w_scale.data(), DType::kI8, Cpu(), {N, K / 16});
+    Tensor to = Tensor::Contiguous(cpu_out.data(), DType::kF32, Cpu(), {M, N});
+    vt::MatmulNvfp4Fp4(cq, to, tp, ts, tbp, tbs, alpha);
+  }
+
+  const int64_t Mp = RoundUp(M, 128), Np = RoundUp(N, 128), Kp = RoundUp(K / 16, 4);
+  auto up = [&](const void* h, size_t nb) { void* p = b.Alloc(nb); b.Copy(gq, p, h, nb); return p; };
+  void* dx = up(x.data(), x.size() * sizeof(float));
+  void* dbp = up(w_packed.data(), w_packed.size());
+  void* dbs = up(w_scale.data(), w_scale.size());
+  void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
+  void* das = b.Alloc(static_cast<size_t>(M * K / 16));
+  void* dasw = b.Alloc(static_cast<size_t>(Mp * Kp));
+  void* dbsw = b.Alloc(static_cast<size_t>(Np * Kp));
+  void* dout = b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));  // bf16
+  b.Memset(gq, dasw, 0, static_cast<size_t>(Mp * Kp));
+  b.Memset(gq, dbsw, 0, static_cast<size_t>(Np * Kp));
+
+  Tensor tx = GpuTensor({M, K}); tx.data = dx; tx.dtype = DType::kF32; tx.device = Gpu();
+  Tensor tap = GpuTensor({M, K / 2}); tap.data = dap; tap.dtype = DType::kI8; tap.device = Gpu();
+  Tensor tas = GpuTensor({M, K / 16}); tas.data = das; tas.dtype = DType::kI8; tas.device = Gpu();
+  Tensor tasw = GpuTensor({Mp, Kp}); tasw.data = dasw; tasw.dtype = DType::kI8; tasw.device = Gpu();
+  Tensor tbp = GpuTensor({N, K / 2}); tbp.data = dbp; tbp.dtype = DType::kI8; tbp.device = Gpu();
+  Tensor tbs = GpuTensor({N, K / 16}); tbs.data = dbs; tbs.dtype = DType::kI8; tbs.device = Gpu();
+  Tensor tbsw = GpuTensor({Np, Kp}); tbsw.data = dbsw; tbsw.dtype = DType::kI8; tbsw.device = Gpu();
+  Tensor to = GpuTensor({M, N}); to.data = dout; to.dtype = DType::kBF16; to.device = Gpu();
+
+  vt::ScaledFp4Quant(gq, tap, tas, tx, input_global_scale);
+  vt::SwizzleBlockscale(gq, tasw, tas);
+  vt::SwizzleBlockscale(gq, tbsw, tbs);
+  vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
+
+  std::vector<uint16_t> g_out(static_cast<size_t>(M * N));
+  b.Copy(gq, g_out.data(), dout, g_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+
+  double max_abs = 0.0, ref_absmax = 0.0;
+  for (size_t i = 0; i < g_out.size(); ++i) {
+    const float got = Bf16ToFloat(g_out[i]);
+    max_abs = std::max(max_abs, std::abs(static_cast<double>(got) - cpu_out[i]));
+    ref_absmax = std::max(ref_absmax, std::abs(static_cast<double>(cpu_out[i])));
+  }
+  // bf16 output (8-bit mantissa) vs f32 emulation: relative tol ~ bf16 ULP + the
+  // fp4-MMA vs emulation reduction-order delta. Assert small relative error.
+  MESSAGE("cutlass max_abs=" << max_abs << " ref_absmax=" << ref_absmax);
+  CHECK(max_abs <= 0.03 * ref_absmax + 1e-3);
+
+  for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
+  b.DestroyQueue(gq);
+}
+#endif  // VT_CUTLASS_NVFP4

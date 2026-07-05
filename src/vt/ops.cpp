@@ -120,6 +120,50 @@ void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor&
       q, out, a_packed, a_scale, b_packed, b_scale, alpha);
 }
 
+void SwizzleBlockscale(Queue& q, Tensor& out_swizzled, const Tensor& in_linear) {
+  VT_CHECK(in_linear.rank == 2 && out_swizzled.rank == 2,
+           "swizzle_blockscale: rank-2 tensors required");
+  const int64_t rows = in_linear.shape[0], cols = in_linear.shape[1];
+  auto round_up = [](int64_t x, int64_t y) { return (x + y - 1) / y * y; };
+  VT_CHECK(out_swizzled.shape[0] == round_up(rows, 128) &&
+               out_swizzled.shape[1] == round_up(cols, 4),
+           "swizzle_blockscale: out must be [round_up(rows,128), round_up(cols,4)]");
+  VT_CHECK(in_linear.dtype == DType::kI8 && out_swizzled.dtype == DType::kI8,
+           "swizzle_blockscale: i8 (raw fp8) operands required");
+  VT_CHECK(in_linear.IsContiguous() && out_swizzled.IsContiguous(),
+           "swizzle_blockscale: contiguous tensors required");
+  VT_CHECK(in_linear.device == q.device && out_swizzled.device == q.device,
+           "swizzle_blockscale: device mismatch");
+  reinterpret_cast<SwizzleBlockscaleFn>(GetOp(OpId::kSwizzleBlockscale, q.device.type))(
+      q, out_swizzled, in_linear);
+}
+
+void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_sf_sw,
+                        const Tensor& b_packed, const Tensor& b_sf_sw, float alpha) {
+  VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_sf_sw.rank == 2 && b_packed.rank == 2 &&
+               b_sf_sw.rank == 2,
+           "matmul_nvfp4_cutlass: all tensors must be rank-2");
+  const int64_t m = a_packed.shape[0], k = a_packed.shape[1] * 2, n = b_packed.shape[0];
+  VT_CHECK(k % 32 == 0 && n % 32 == 0, "matmul_nvfp4_cutlass: K and N must be multiples of 32");
+  VT_CHECK(b_packed.shape[1] == k / 2,
+           "matmul_nvfp4_cutlass: b_packed must be [N, K/2] (K matches a_packed)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_nvfp4_cutlass: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kBF16, "matmul_nvfp4_cutlass: out must be bf16 (sm120a epilogue)");
+  VT_CHECK(a_packed.dtype == DType::kI8 && a_sf_sw.dtype == DType::kI8 &&
+               b_packed.dtype == DType::kI8 && b_sf_sw.dtype == DType::kI8,
+           "matmul_nvfp4_cutlass: packed/scale operands must be i8 (raw fp4/fp8 bytes)");
+  auto round_up = [](int64_t x, int64_t y) { return (x + y - 1) / y * y; };
+  VT_CHECK(a_sf_sw.shape[0] == round_up(m, 128) && a_sf_sw.shape[1] == round_up(k / 16, 4),
+           "matmul_nvfp4_cutlass: a_sf must be swizzled [round_up(M,128), round_up(K/16,4)]");
+  VT_CHECK(b_sf_sw.shape[0] == round_up(n, 128) && b_sf_sw.shape[1] == round_up(k / 16, 4),
+           "matmul_nvfp4_cutlass: b_sf must be swizzled [round_up(N,128), round_up(K/16,4)]");
+  VT_CHECK(out.device == q.device && a_packed.device == q.device && a_sf_sw.device == q.device &&
+               b_packed.device == q.device && b_sf_sw.device == q.device,
+           "matmul_nvfp4_cutlass: device mismatch");
+  reinterpret_cast<MatmulNvfp4CutlassFn>(GetOp(OpId::kMatmulNvfp4Cutlass, q.device.type))(
+      q, out, a_packed, a_sf_sw, b_packed, b_sf_sw, alpha);
+}
+
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,
                          const Tensor& scale_ptrs, const Tensor& scale2s) {

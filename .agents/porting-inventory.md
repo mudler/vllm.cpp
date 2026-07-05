@@ -316,6 +316,24 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    would. Intel is NOT a deviation (upstream `platforms/xpu.py` is ported
    loyally). Strategy, explorations (MLX, ANE), and binding vt:: interface
    requirements: `backends.md`.
+9. **Vendored CUTLASS (sm120a NVFP4 GEMM)**: `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`
+   is a 1:1 lift of vLLM's `cutlass_scaled_fp4_mm_sm120a`
+   (`csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu` @
+   e24d1b24) — the near-peak Blackwell block-scaled fp4xfp4 GEMM (cutlass example
+   79b). The ONLY change is the host surface: `torch::stable::Tensor` → `vt::Tensor`
+   (raw pointers), `torch::stable::empty`/DeviceGuard → `cudaMallocAsync` + our
+   stream; the CollectiveBuilder config + Fp4GemmSm120 are verbatim. `vt::SwizzleBlockscale`
+   is the lift of vLLM `swizzle_blockscale` (`nvfp4_utils.py:13-53`). This is the
+   "vendor a CUTLASS kernel only when a benchmark proves we can't match it" clause
+   of §9.1: our hand-written fp4 GEMM ran ~15% of peak, cutlass ~300 TFLOPS on the
+   27B prefill projections (measured GB10). CUTLASS v4.4.2 is header-only (torch-free),
+   provided via `-DVLLM_CPP_CUTLASS_DIR` (default `third_party/cutlass`), mirroring
+   vLLM's own FetchContent(v4.4.2). The TU is isolated (own `-isystem` cutlass tree
+   + `--expt-relaxed-constexpr`, sm_12xa only, ~37s compile) and gated by
+   `VT_CUTLASS_NVFP4`; the op is opt-in (`VT_NVFP4_CUTLASS`) so no existing path
+   changes. Only the 27B (compressed-tensors W4A4) uses it; the 35B is FP8 + Marlin
+   W4A16 (never the sm120a fp4xfp4 kernel — grounded in `modelopt.py` MIXED_PRECISION
+   per-layer resolve).
 
 ## 10. E2E test suites (T0 deliverable)
 

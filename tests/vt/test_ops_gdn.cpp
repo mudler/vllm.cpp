@@ -316,6 +316,73 @@ TEST_CASE("causal_conv1d_update: bias + rolling state, hand-computed") {
   CHECK(state[1] == doctest::Approx(5.0f));        // raw x appended
 }
 
+// Indexed in-place path (fla fused_recurrent ssm_state_indices / mamba
+// causal_conv1d_update conv_state_indices): operating on SCATTERED slots of a
+// larger persistent cache must equal the compact op then gather/scatter. This is
+// the decode memcpy-tax elimination path (no per-request state gather/scatter).
+TEST_CASE("gdn decode + conv update: indexed in-place == compact reference") {
+  Queue q = Q();
+  const float scale = 0.70710678f;
+  // Two single-token sequences (Hk=Hv=1, Dk=Dv=2), scattered onto cache slots
+  // {2, 0} of a 3-slot cache — slot 1 is a sentinel that must stay untouched.
+  std::vector<int32_t> idx = {2, 0};
+
+  SUBCASE("gdn decode") {
+    std::vector<float> qv = {0.3f, -0.7f, 0.5f, 0.1f}, kv = {0.2f, 0.9f, -0.4f, 0.6f};
+    std::vector<float> vv = {1.0f, -0.5f, 0.2f, 0.8f}, gv = {-0.1f, -0.3f}, bv = {0.5f, 0.9f};
+    std::vector<float> s0 = {1.0f, 2.0f, 3.0f, 4.0f}, s1 = {-1.0f, 0.5f, 0.25f, -0.75f};
+    // Compact reference: state rows [seq0; seq1].
+    std::vector<float> ref(s0);
+    ref.insert(ref.end(), s1.begin(), s1.end());
+    std::vector<float> refout(4, 0.0f);
+    {
+      Tensor tq = T3(qv, 2, 1, 2), tk = T3(kv, 2, 1, 2), tv = T3(vv, 2, 1, 2);
+      Tensor tg = T2(gv, 2, 1), tb = T2(bv, 2, 1), ts = T4(ref, 2, 1, 2, 2), to = T3(refout, 2, 1, 2);
+      vt::GdnDecode(q, to, tq, tk, tv, tg, tb, ts, GdnArgs{scale});
+    }
+    // Indexed: 3-slot cache, seq0->slot2, seq1->slot0, slot1 = junk sentinel.
+    std::vector<float> cache(3 * 4, 999.0f);
+    for (int i = 0; i < 4; ++i) { cache[2 * 4 + i] = s0[i]; cache[0 * 4 + i] = s1[i]; }
+    std::vector<float> out(4, 0.0f);
+    {
+      Tensor tq = T3(qv, 2, 1, 2), tk = T3(kv, 2, 1, 2), tv = T3(vv, 2, 1, 2);
+      Tensor tg = T2(gv, 2, 1), tb = T2(bv, 2, 1), ts = T4(cache, 3, 1, 2, 2), to = T3(out, 2, 1, 2);
+      Tensor tidx = Ti(idx);
+      vt::GdnDecode(q, to, tq, tk, tv, tg, tb, ts, GdnArgs{scale}, &tidx);
+    }
+    for (int i = 0; i < 4; ++i) CHECK(out[i] == doctest::Approx(refout[i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[2 * 4 + i] == doctest::Approx(ref[i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[0 * 4 + i] == doctest::Approx(ref[4 + i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[1 * 4 + i] == doctest::Approx(999.0f));  // untouched
+  }
+
+  SUBCASE("causal_conv1d_update") {
+    // x[B=2, C=2], w[C=2, K=3], state row [C, K-1=2] per sequence.
+    std::vector<float> x = {5.0f, -1.0f, 2.0f, 0.5f};
+    std::vector<float> w = {0.25f, 0.5f, 1.0f, -0.5f, 0.3f, 0.8f};
+    std::vector<float> st0 = {1.0f, 2.0f, -1.0f, 0.5f}, st1 = {0.2f, -0.3f, 0.7f, 1.1f};
+    std::vector<float> ref(st0);
+    ref.insert(ref.end(), st1.begin(), st1.end());
+    std::vector<float> refout(4, 0.0f);
+    {
+      Tensor tx = T2(x, 2, 2), tw = T2(w, 2, 3), ts = T3(ref, 2, 2, 2), to = T2(refout, 2, 2);
+      vt::CausalConv1dUpdate(q, to, tx, tw, nullptr, ts, CausalConv1dArgs{true});
+    }
+    std::vector<float> cache(3 * 2 * 2, 999.0f);
+    for (int i = 0; i < 4; ++i) { cache[2 * 4 + i] = st0[i]; cache[0 * 4 + i] = st1[i]; }
+    std::vector<float> out(4, 0.0f);
+    {
+      Tensor tx = T2(x, 2, 2), tw = T2(w, 2, 3), ts = T3(cache, 3, 2, 2), to = T2(out, 2, 2);
+      Tensor tidx = Ti(idx);
+      vt::CausalConv1dUpdate(q, to, tx, tw, nullptr, ts, CausalConv1dArgs{true}, &tidx);
+    }
+    for (int i = 0; i < 4; ++i) CHECK(out[i] == doctest::Approx(refout[i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[2 * 4 + i] == doctest::Approx(ref[i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[0 * 4 + i] == doctest::Approx(ref[4 + i]).epsilon(1e-6));
+    for (int i = 0; i < 4; ++i) CHECK(cache[1 * 4 + i] == doctest::Approx(999.0f));  // untouched
+  }
+}
+
 // Conv fwd/update consistency: feeding tokens one at a time through the update
 // op must match a prefill over the same tokens (same state trajectory).
 TEST_CASE("causal_conv1d update chain equals fwd over the same tokens") {

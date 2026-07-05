@@ -133,16 +133,27 @@ void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
 // Upstream counterpart: layers/mamba/ops/causal_conv1d.py
 // (causal_conv1d_update Triton kernel, seqlen==1 path) — align post-MVP.
 
+// cache_idx (optional; mirrors mamba causal_conv1d_update conv_state_indices): when
+// non-null, token bt's state row is the persistent-cache slot cache_idx[bt] (idx < 0 ==
+// NULL block → skip, leaving out untouched), so the caller need not gather/scatter.
 template <typename Tin, typename Tout>
 __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
-                                         const Tin* bias, float* conv_state, int64_t n,
-                                         int64_t c_dim, int64_t k, bool silu) {
+                                         const Tin* bias, float* conv_state,
+                                         const int32_t* cache_idx, int64_t n, int64_t c_dim,
+                                         int64_t k, bool silu) {
   const int64_t width = k - 1;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
        idx += step) {
+    const int64_t bt = idx / c_dim;
     const int64_t c = idx % c_dim;
-    float* srow = conv_state + idx * width;  // idx = bt * c_dim + c; row [K-1]
+    int64_t srow_off = idx;  // compact: row == bt (idx = bt*c_dim + c)
+    if (cache_idx != nullptr) {
+      const int32_t slot = cache_idx[bt];
+      if (slot < 0) continue;  // NULL block
+      srow_off = static_cast<int64_t>(slot) * c_dim + c;
+    }
+    float* srow = conv_state + srow_off * width;  // row [K-1]
     const float xt = Load(x, idx);
     float acc = bias != nullptr ? Load(bias, c) : 0.0f;
     for (int64_t j = 0; j < width; ++j) acc += Load(w, c * k + j) * srow[j];
@@ -155,11 +166,12 @@ __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
 
 template <typename Tin, typename Tout>
 void LaunchConvUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args) {
+                      const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
+                      const CausalConv1dArgs& args) {
   const int64_t n = x.shape[0] * x.shape[1], c = x.shape[1], k = w.shape[1];
   CausalConv1dUpdateKernel<Tin, Tout><<<GridFor(n), kBlock, 0, s>>>(
       out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<float>(), n, c, k, args.silu_activation);
+      conv_state.Ptr<float>(), cache_idx, n, c, k, args.silu_activation);
   Check(cudaGetLastError(), "causal_conv1d_update launch");
 }
 
@@ -192,24 +204,26 @@ void ConvFwdKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
 
 void ConvUpdateKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                           const Tensor* bias, Tensor& conv_state,
-                          const CausalConv1dArgs& args) {
+                          const Tensor* conv_state_indices, const CausalConv1dArgs& args) {
   VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
            "cuda causal_conv1d_update: unsupported x dtype (f32/bf16 only)");
   VT_CHECK(w.dtype == x.dtype && (bias == nullptr || bias->dtype == x.dtype),
            "cuda causal_conv1d_update: weight/bias dtype must match x");
   if (x.shape[0] * x.shape[1] == 0) return;
+  const int32_t* ci =
+      conv_state_indices != nullptr ? conv_state_indices->Ptr<int32_t>() : nullptr;
   cudaStream_t s = AsStream(q);
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      LaunchConvUpdate<float, float>(s, out, x, w, bias, conv_state, args);
+      LaunchConvUpdate<float, float>(s, out, x, w, bias, conv_state, ci, args);
     } else {
-      LaunchConvUpdate<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, args);
+      LaunchConvUpdate<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, ci, args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      LaunchConvUpdate<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, args);
+      LaunchConvUpdate<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, ci, args);
     } else {
-      LaunchConvUpdate<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, args);
+      LaunchConvUpdate<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, ci, args);
     }
   }
 }
@@ -432,7 +446,7 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
 //
 // state_idx (optional; mirrors fla ssm_state_indices IS_CONTINUOUS_BATCHING
 // :104-116): when non-null the block reads/writes persistent-cache row
-// state_idx[i_n] (idx<=0 == NULL block → zero the output, skip), so the caller
+// state_idx[i_n] (idx<0 == NULL block → zero the output, skip), so the caller
 // need not gather/scatter per-request state rows. When null the state is the
 // compact [n,Hv,Dv,Dk] buffer and the state row == i_n.
 template <typename Tin, typename Tout>
@@ -449,11 +463,12 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   const int vi = static_cast<int>(threadIdx.x);
   const int64_t vrow = vbase + vi;  // this lane's value-state row
 
-  // Persistent-cache indirection (fla ssm_state_indices). idx<=0 == NULL block.
+  // Persistent-cache indirection (fla ssm_state_indices). idx<0 == NULL block
+  // (our state slots are 0-indexed and slot 0 is valid, so the sentinel is < 0).
   int64_t row = i_n;
   if (state_idx != nullptr) {
     const int32_t si = state_idx[i_n];
-    if (si <= 0) {
+    if (si < 0) {
       if (vrow < dv) Store(out, (i_n * hv_n + hv) * dv + vrow, 0.0f);
       return;
     }
@@ -1289,17 +1304,21 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 
 void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                         const GdnArgs& args) {
+                         const Tensor* state_idx, const GdnArgs& args) {
+  const int32_t* si = state_idx != nullptr ? state_idx->Ptr<int32_t>() : nullptr;
   // Fused (batch × Hv × value-tile) parallel decode — the fla fused_recurrent
-  // mirror (compact state, row == i_n). Replaces the batch-serial GdnScanKernel
-  // decode branch (M2.x GDN decode throughput). A/B: VT_GDN_FUSED_DECODE=0 falls
-  // back to the sequential scan for same-binary before/after measurement.
+  // mirror. state_idx != null => in-place on the FULL persistent cache at slot
+  // state_idx[i_n] (mirrors fla ssm_state_indices); null => compact state (row ==
+  // i_n). Replaces the batch-serial GdnScanKernel decode branch (M2.x GDN decode
+  // throughput). A/B: VT_GDN_FUSED_DECODE=0 falls back to the sequential scan for
+  // same-binary before/after measurement — but ONLY for the compact path (the scan
+  // has no ssm_state_indices indirection), so the indexed path always uses fused.
   const char* e = std::getenv("VT_GDN_FUSED_DECODE");
-  if (e != nullptr && e[0] == '0') {
+  if (si == nullptr && e != nullptr && e[0] == '0') {
     GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
     return;
   }
-  GdnDecodeFusedCuda(q, out, q_in, k, v, g, beta, state, nullptr, args);
+  GdnDecodeFusedCuda(q, out, q_in, k, v, g, beta, state, si, args);
 }
 
 // Registers the CUDA GDN kernels during static init (pre-main, like the M0.6

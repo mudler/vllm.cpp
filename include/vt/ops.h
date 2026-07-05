@@ -181,7 +181,8 @@ using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
                                    Tensor&, const Tensor&, const Tensor&,
                                    const CausalConv1dArgs&);
 using CausalConv1dUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
-                                      const Tensor*, Tensor&, const CausalConv1dArgs&);
+                                      const Tensor*, Tensor&, const Tensor*,
+                                      const CausalConv1dArgs&);
 using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
 using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                 const RmsNormGatedArgs&);
@@ -189,7 +190,8 @@ using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, con
                               const Tensor&, const Tensor&, Tensor&, const Tensor&,
                               const GdnArgs&);
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
-                             const Tensor&, const Tensor&, Tensor&, const GdnArgs&);
+                             const Tensor&, const Tensor&, Tensor&, const Tensor*,
+                             const GdnArgs&);
 using MoeRouterTopKFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
 using MoeCombineFn =
@@ -435,8 +437,14 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 // in/out. Read-old-then-roll:
 //   out[c] = act(bias[c] + sum_j w[c,j] * [conv_state[c,:], x[c]][j])
 //   conv_state[c,:] <- [conv_state[c,1:], x[c]]   (raw x)
+// conv_state_indices (optional; mirrors mamba causal_conv1d_update conv_state_indices /
+// cache_indices): when non-null, row bt reads/writes the persistent cache slot
+// conv_state_indices[bt] (conv_state is then the FULL [num_slots,C,K-1] cache), so the
+// caller need not gather/scatter per-request rows. When null, conv_state is compact
+// [batch,C,K-1] and row == bt.
 void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
-                        const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args);
+                        const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
+                        const Tensor* conv_state_indices = nullptr);
 
 // Rowwise l2 normalization over the LAST dim (gdn-semantics.md §4, upstream
 // l2norm_fwd): y = x * rsqrt(sum(x^2) + eps). Plain SUM, not mean — this is
@@ -471,8 +479,13 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 // caller (vt::L2Norm) — upstream fuses the l2norm and the §6 g/beta gating
 // into the decode kernel; the decomposition is exact (gdn-semantics.md §4,
 // §9). g/beta derivation from raw a/b/A_log/dt_bias is M0.9.
+// state_idx (optional; mirrors fla fused_recurrent_gated_delta_rule ssm_state_indices):
+// when non-null, row bt reads/writes the persistent cache slot state_idx[bt] (state is
+// then the FULL [num_slots,Hv,Dv,Dk] cache), so the caller need not gather/scatter
+// per-request state rows. When null, state is compact [batch,Hv,Dv,Dk] and row == bt.
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
-               const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args);
+               const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
+               const Tensor* state_idx = nullptr);
 
 // --- MoE (sparse mixture-of-experts) ops. Formula reference:
 // .agents/moe-semantics.md. The expert MLP itself is NOT an op — it is composed

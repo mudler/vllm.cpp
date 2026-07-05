@@ -424,12 +424,21 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 }
 
 void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
-                        const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args) {
+                        const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
+                        const Tensor* conv_state_indices) {
   CheckConvCommon(q, out, x, weight, bias, conv_state, "causal_conv1d_update");
-  VT_CHECK(conv_state.shape[0] == x.shape[0],
-           "causal_conv1d_update: one conv_state row per token required");
+  if (conv_state_indices == nullptr) {
+    VT_CHECK(conv_state.shape[0] == x.shape[0],
+             "causal_conv1d_update: one conv_state row per token required");
+  } else {
+    // In-place indexed path: conv_state is the FULL cache; one index per token.
+    CheckI32Meta(q, *conv_state_indices, x.shape[0], "causal_conv1d_update",
+                 "conv_state_indices");
+    VT_CHECK(conv_state.shape[0] >= x.shape[0],
+             "causal_conv1d_update: indexed cache must have >= batch rows");
+  }
   reinterpret_cast<CausalConv1dUpdateFn>(GetOp(OpId::kCausalConv1dUpdate, q.device.type))(
-      q, out, x, weight, bias, conv_state, args);
+      q, out, x, weight, bias, conv_state, conv_state_indices, args);
 }
 
 void L2Norm(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& args) {
@@ -475,12 +484,20 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 }
 
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
-               const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args) {
+               const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
+               const Tensor* state_idx) {
   CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_decode");
-  VT_CHECK(state.shape[0] == q_in.shape[0],
-           "gdn_decode: one state row per token required (single-token sequences)");
-  reinterpret_cast<GdnDecodeFn>(GetOp(OpId::kGdnDecode, q.device.type))(q, out, q_in, k, v, g,
-                                                                        beta, state, args);
+  if (state_idx == nullptr) {
+    VT_CHECK(state.shape[0] == q_in.shape[0],
+             "gdn_decode: one state row per token required (single-token sequences)");
+  } else {
+    // In-place indexed path: state is the FULL cache; one slot index per token.
+    CheckI32Meta(q, *state_idx, q_in.shape[0], "gdn_decode", "state_idx");
+    VT_CHECK(state.shape[0] >= q_in.shape[0],
+             "gdn_decode: indexed cache must have >= batch rows");
+  }
+  reinterpret_cast<GdnDecodeFn>(GetOp(OpId::kGdnDecode, q.device.type))(
+      q, out, q_in, k, v, g, beta, state, state_idx, args);
 }
 
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,

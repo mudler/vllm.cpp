@@ -322,13 +322,23 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   }
 }
 
-// §3 causal_conv1d_update (seqlen==1): read-old-then-roll.
+// §3 causal_conv1d_update (seqlen==1): read-old-then-roll. conv_state_indices
+// (optional; mirrors mamba conv_state_indices): token bt's row is cache slot
+// idx[bt] (idx<0 == NULL block → skip); null => compact row == bt.
 void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                               const Tensor* bias, Tensor& conv_state,
+                              const Tensor* conv_state_indices,
                               const CausalConv1dArgs& args) {
   const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  const int32_t* cache_idx =
+      conv_state_indices != nullptr ? conv_state_indices->Ptr<int32_t>() : nullptr;
   for (int64_t bt = 0; bt < batch; ++bt) {
-    float* srow_base = conv_state.Ptr<float>() + bt * c_dim * width;
+    int64_t srow_row = bt;
+    if (cache_idx != nullptr) {
+      if (cache_idx[bt] < 0) continue;  // NULL block
+      srow_row = cache_idx[bt];
+    }
+    float* srow_base = conv_state.Ptr<float>() + srow_row * c_dim * width;
     for (int64_t c = 0; c < c_dim; ++c) {
       float* srow = srow_base + c * width;
       const float xt = LoadF32(x, bt * c_dim + c);
@@ -440,13 +450,27 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
 }
 
 void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
-                     const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args) {
+                     const Tensor& g, const Tensor& beta, Tensor& state,
+                     const Tensor* state_idx, const GdnArgs& args) {
   const int64_t batch = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2],
                 dk = state.shape[3];
+  const int32_t* sidx = state_idx != nullptr ? state_idx->Ptr<int32_t>() : nullptr;
   std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
       vbuf(static_cast<size_t>(dv));
   for (int64_t bt = 0; bt < batch; ++bt) {
-    float* s_state = state.Ptr<float>() + bt * hv_n * dv * dk;
+    // state_idx != null => in-place on the FULL cache at slot sidx[bt] (fla
+    // ssm_state_indices); sidx[bt]<0 == NULL block → zero out; null => row == bt.
+    int64_t srow = bt;
+    if (sidx != nullptr) {
+      if (sidx[bt] < 0) {
+        for (int64_t hv = 0; hv < hv_n; ++hv)
+          for (int64_t d = 0; d < dv; ++d)
+            StoreF32(out, (bt * hv_n + hv) * dv + d, 0.0f);
+        continue;
+      }
+      srow = sidx[bt];
+    }
+    float* s_state = state.Ptr<float>() + srow * hv_n * dv * dk;
     GdnTokenStep(out, q_in, k, v, g, beta, s_state, bt, args.scale, qbuf, kbuf, vbuf);
   }
 }

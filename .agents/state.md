@@ -1184,3 +1184,23 @@ dgx inspection of the checkpoint).
   Same-binary A/B win: decode +5.5% (1024/128) / +7.0% (256/512), TTFT −4.8%/−5.6%, peak RSS −1.19GB.
   Opposite sign to the reference W8A16 GEMV (−5-7%) — cutlass W8A8 beats cublas bf16. NEXT lever:
   GdnScan (30.6% decode) + PagedAttention (14%).
+- **2026-07-05 (DECODE MEMCPY TAX KILLED — GDN state gather/scatter → in-place `ssm/conv_state_indices`; +24-34% conc-64, MERGED)**
+  Measure-first STEP 1 (nsys, 35B conc-64) resolved the plateau-root "187k copies/run": they are
+  NOT metadata H2D re-uploads but the **GDN recurrent-state GATHER/SCATTER**. The ssm/conv state
+  caches are HOST `std::vector`s (GB10 unified memory), so `GatherRows`=H2D and `ScatterRows`=D2H,
+  one `cudaMemcpyAsync` per sequence per GDN layer → 30 GDN × 64 seq × 2 caches × 2 = **7,680/step**
+  (nsys: 142k H2D + 77k D2H, only 27 true D2D; D2H 77,241 ≈ 76,800 exact). `cudaMemcpyAsync` = 40%
+  of host-API; decode-window GPU-busy ~**52%** (48% idle, single stream, host-issue-starved). FIX
+  (mirror fla): plumb `ssm_state_indices` (`vt::GdnDecode` state_idx — the fused kernel already
+  supported it; fixed `si<=0`→`si<0` null sentinel for 0-indexed slots) + `conv_state_indices`
+  (`vt::CausalConv1dUpdate`) → decode recurrence + conv run IN PLACE on the persistent unified cache
+  at each seq's slot, no gather/scatter. Graph-replay-safe (index uploaded from the PERSISTENT
+  `non_spec_state_indices` vector, not a stack-local — the num_reqs==1 decode-graph re-reads a fixed
+  host address). Prefill untouched. **CORRECT: 35B 16/16 (eager+graph); `test_ops_gdn` 25/25 (+new
+  indexed==compact); mixed anchor 4/4; 27B/dense `test_qwen27_paged_forward` 5/5; `test_runner` 5/5;
+  clean -Werror.** **MEASURED (same-box A/B): decode memcpy 155,875→29,041/window (−81%); 256/64
+  conc-64 448.25→599.72 (+33.8%), TPOT 538→353ms; GATE 1024/128 conc-64 504.92→627.88 (+24.4%);
+  conc-8 +21%; scaling conc8→64 1.40×→1.54×.** The copies WERE critical-path (opposite the conc-8
+  batched-graph NEUTRAL — the tax scales with batch). 27B dense shares `GdnBlockPaged` → benefits
+  identically. vs vLLM conc-64=2768: 627.88 = ~4.4× off; decode still ~44% busy. NEXT: per-step
+  logits D2H+sync, the remaining ~1,452 full-attn metadata H2D/step, PagedAttention decode.

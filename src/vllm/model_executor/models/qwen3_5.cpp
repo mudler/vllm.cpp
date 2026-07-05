@@ -960,15 +960,21 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                         dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
     ScatterRows(d, state.conv_state, dcs.ptr(), sidx, conv_row_elems);
   } else {
-    // Pure decode: single-token conv step per sequence.
-    // qwen_gdn_linear_attn.py:1376-1388.
+    // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
+    // conv_state at each sequence's slot (mirrors mamba causal_conv1d_update
+    // conv_state_indices, qwen_gdn_linear_attn.py:1376-1388). Passing the state
+    // indices to the op eliminates the per-request gather+scatter — the two
+    // host<->device (unified-cache) copies per sequence per layer that dominate
+    // the decode memcpy tax (they scale with concurrency, flattening throughput).
+    // Upload the decode state-slot indices straight from the PERSISTENT metadata
+    // vector (its leading nd entries are the decode slots; decodes lead the batch)
+    // — NOT a stack-local copy, so the decode-CUDA-graph replay (num_reqs==1) can
+    // re-read this H2D copy from a fixed host address across replays.
     const auto& sidx = *meta.non_spec_state_indices_tensor;
-    std::vector<int32_t> didx(sidx.begin(), sidx.begin() + nd);
-    DBuf dcs(d, DType::kF32, {nd, conv_dim, Kw - 1});
-    GatherRows(d, dcs.ptr(), state.conv_state, didx, conv_row_elems);
-    vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
-                           vt::CausalConv1dArgs{true});
-    ScatterRows(d, state.conv_state, dcs.ptr(), didx, conv_row_elems);
+    DBuf didx_dev(d, DType::kI32, {nd}, sidx.data());
+    Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
+    vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr, conv_cache,
+                           vt::CausalConv1dArgs{true}, &didx_dev.t());
   }
 
   // Split conv output into q[T,Hk,Dk] | k[T,Hk,Dk] | v[T,Hv,Dv] (device op).
@@ -999,19 +1005,21 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 
   // Recurrence — decode segment first (leading nd_tok tokens), then prefill.
   if (nd > 0) {
+    // Decode recurrence IN PLACE on the persistent ssm_state at each sequence's
+    // slot (mirrors fla fused_recurrent ssm_state_indices) — no per-request
+    // gather+scatter (the other two host<->device copies per sequence per layer).
+    // Persistent metadata source (see the conv branch) for graph-replay safety.
     const auto& sidx = *meta.non_spec_state_indices_tensor;
-    std::vector<int32_t> didx(sidx.begin(), sidx.begin() + nd);
-    DBuf dss(d, DType::kF32, {nd, Hv, Dv, Dk});
-    GatherRows(d, dss.ptr(), state.ssm_state, didx, ssm_row_elems);
+    DBuf didx_dev(d, DType::kI32, {nd}, sidx.data());
+    Tensor ssm_cache = state.ssm_state;  // mutable view over the shared buffer
     Tensor q_dec = SubView(dql2.t(), 0, nd_tok);
     Tensor k_dec = SubView(dkl2.t(), 0, nd_tok);
     Tensor v_dec = SubView(vf.t(), 0, nd_tok);
     Tensor g_dec = SubView(dg.t(), 0, nd_tok);
     Tensor b_dec = SubView(dbeta.t(), 0, nd_tok);
     Tensor o_dec = SubView(dcore.t(), 0, nd_tok);
-    vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec, dss.t(),
-                  vt::GdnArgs{scale});
-    ScatterRows(d, state.ssm_state, dss.ptr(), didx, ssm_row_elems);
+    vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec, ssm_cache,
+                  vt::GdnArgs{scale}, &didx_dev.t());
   }
   if (np > 0) {
     const auto& pidx = *meta.prefill_state_indices;

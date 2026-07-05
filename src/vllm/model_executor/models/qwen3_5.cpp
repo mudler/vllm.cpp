@@ -527,10 +527,160 @@ DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dty
   return dout;
 }
 
+#ifdef VT_MARLIN_NVFP4
+// --- Dense NVFP4 W4A16 Marlin (M0.8 dense sibling of the MoE grouped GEMM).
+// The 35B's dense NVFP4 projections (shared-expert gate/up/down + lm_head) run
+// at decode (m=8) through MatmulNvfp4's naive one-thread-per-output kernel, which
+// re-dequants the whole weight column PER activation row (8x redundant dequant,
+// ~19% of decode GPU per the nsys profile). Route them through the SAME vendored,
+// bit-exact Marlin W4A16 GEMM as the MoE experts, run as a SINGLE-expert grouped
+// GEMM (E=1, top_k=1): y[M,N] = x[M,K] @ dequant(W[N,K]).T. Repack is load-time
+// (BuildMarlinDenseResident); the align inputs are trivial (all tokens -> expert
+// 0) and cached per token count. Gated by VT_NVFP4_MARLIN (MarlinMoeEnabled()).
+struct MarlinDenseResident {
+  void* w = nullptr;  // i32 [K/16, N*2]  Marlin-interleaved weight
+  void* s = nullptr;  // fp8 [K/16, N]    processed S0E5M3 scales
+  void* g = nullptr;  // f32 [1]          processed global scale
+  int64_t n = 0, k = 0;
+  bool ready = false;
+};
+
+MarlinDenseResident& MarlinDenseResidentFor(const Nvfp4Weight* w) {
+  static std::mutex mu;
+  static std::unordered_map<const Nvfp4Weight*, MarlinDenseResident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[w];
+}
+
+// Repack one dense NVFP4 weight into the resident Marlin layout, then free the
+// fp4 device originals (Marlin is the only consumer once the gate is on) so peak
+// weight memory stays flat. Same repack primitives as BuildMoeMarlinResident;
+// the single weight is its own "expert" (E=1), so combined_scale_factor is taken
+// over just this scale buffer.
+void BuildMarlinDenseResident(Dev d, const Nvfp4Weight& w, MarlinDenseResident& mr) {
+  if (mr.ready) return;
+  const int K = static_cast<int>(w.k);
+  const int N = static_cast<int>(w.n);
+  void* stream = d.q.handle;
+  const size_t w_i32 = static_cast<size_t>(K / 16) * (static_cast<size_t>(N) * 2);
+  const size_t s_b = static_cast<size_t>(K / 16) * N;
+  mr.w = d.b.Alloc(w_i32 * 4);
+  mr.s = d.b.Alloc(s_b);
+  mr.g = d.b.Alloc(sizeof(float));
+  mr.n = w.n;
+  mr.k = w.k;
+  std::vector<const uint8_t*> bufs{reinterpret_cast<const uint8_t*>(w.scale.bytes.data())};
+  std::vector<size_t> lens{w.scale.bytes.size()};
+  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+  Nvfp4Dev dw = ResidentNvfp4(d, w);
+  vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, static_cast<uint32_t*>(mr.w),
+                                     static_cast<const uint8_t*>(dw.packed.data), K, N);
+  vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dw.scale.data),
+                                      static_cast<uint8_t*>(mr.s), K, N, sf);
+  const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.scale2, sf);
+  d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  d.b.Synchronize(d.q);  // repack done -> safe to free the fp4 originals
+  w.d_packed.reset();
+  w.d_scale.reset();
+  mr.ready = true;
+}
+
+// Trivial single-expert moe_align inputs (all M tokens -> expert 0), cached per
+// token count M (decode M is constant, so this runs once). Avoids a per-GEMM
+// moe_align launch + allocations for the ~120 dense Marlin GEMMs of a step.
+struct DenseAlignCache {
+  void* sorted = nullptr;  // i32 [max_tok]
+  void* expert = nullptr;  // i32 [max_blk] (all 0)
+  void* numpad = nullptr;  // i32 [1]
+  void* topkw = nullptr;   // f32 [M] (ones; unused since mul_topk_weights=false)
+  int block = 0, max_tok = 0, max_blk = 0;
+};
+
+DenseAlignCache& DenseAlignFor(Dev d, int M) {
+  static std::mutex mu;
+  static std::unordered_map<int, DenseAlignCache> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = cache.find(M);
+  if (it != cache.end()) return it->second;
+  DenseAlignCache c;
+  c.block = vt::cuda::MarlinMoeAlignBlockSizeSelect(M, 1, 1);
+  vt::cuda::MarlinMoeAlignSizes(M, 1, 1, c.block, &c.max_tok, &c.max_blk);
+  c.sorted = d.b.Alloc(static_cast<size_t>(c.max_tok) * sizeof(int32_t));
+  c.expert = d.b.Alloc(static_cast<size_t>(c.max_blk) * sizeof(int32_t));
+  c.numpad = d.b.Alloc(sizeof(int32_t));
+  c.topkw = d.b.Alloc(static_cast<size_t>(M) * sizeof(float));
+  void* tid = d.b.Alloc(static_cast<size_t>(M) * sizeof(int32_t));
+  d.b.Memset(d.q, tid, 0, static_cast<size_t>(M) * sizeof(int32_t));  // topk_ids = 0 -> expert 0
+  vt::cuda::MarlinMoeAlignBlockSize(d.q.handle, static_cast<const int32_t*>(tid), M, 1, 1, c.block,
+                                    static_cast<int32_t*>(c.sorted),
+                                    static_cast<int32_t*>(c.expert),
+                                    static_cast<int32_t*>(c.numpad));
+  std::vector<float> ones(static_cast<size_t>(M), 1.0F);
+  d.b.Copy(d.q, c.topkw, ones.data(), ones.size() * sizeof(float));
+  d.b.Synchronize(d.q);
+  d.b.Free(tid);
+  return cache.emplace(M, c).first->second;
+}
+
+// Shared zeroed reduction workspace for the dense Marlin GEMMs (sms*4 i32 locks,
+// mirror marlin_make_workspace_new). Memset to zero before each launch.
+void* DenseMarlinWorkspace(Dev d, int* out_sms) {
+  static std::mutex mu;
+  static void* ws = nullptr;
+  static int sms = 0;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!ws) {
+    sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
+    ws = d.b.Alloc(static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  }
+  *out_sms = sms;
+  return ws;
+}
+
+// y[M,N] = x[M,K] bf16 @ dequant(w).T via the single-expert Marlin W4A16 GEMM.
+DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
+  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  MarlinDenseResident& mr = MarlinDenseResidentFor(&w);
+  if (!mr.ready) BuildMarlinDenseResident(d, w, mr);
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
+  int sms = 0;
+  void* ws = DenseMarlinWorkspace(d, &sms);
+  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+
+  // Marlin's output is bf16 (c_type=kBFloat16); an f32 result is the bf16 output
+  // upcast (same value it rounds to — mirror of the cutlass f32-scratch cast).
+  DBuf outbf(d, DType::kBF16, {M, N});
+  Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, N * 2});
+  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, N});
+  Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+  Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+  Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
+  Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
+  Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
+  Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
+  vt::MoeGroupedGemmNvfp4Marlin(
+      d.q, outbf.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
+      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(N),
+                        static_cast<int>(K), false});
+  if (out_dtype == DType::kBF16) return outbf;
+  DBuf out(d, DType::kF32, {M, N});
+  vt::CastF32(d.q, out.t(), outbf.t());
+  return out;
+}
+#endif  // VT_MARLIN_NVFP4
+
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kF32);
+#ifdef VT_MARLIN_NVFP4
+  // NVFP4 W4A16 dense (shared expert / lm_head): the load-time-repacked Marlin
+  // GEMM replaces the naive redundant-dequant kernel when VT_NVFP4_MARLIN=1.
+  // Marlin requires a bf16 activation (the 35B dense NVFP4 sinks all are).
+  if (d.q.device.type == vt::DeviceType::kCUDA && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
+      x.dtype == DType::kBF16)
+    return MatmulNvfp4MarlinD(d, x, w, DType::kF32);
+#endif
   DBuf dout(d, DType::kF32, {M, N});
   if (d.q.device.type == vt::DeviceType::kCUDA) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
@@ -550,6 +700,11 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
+#ifdef VT_MARLIN_NVFP4
+  if (d.q.device.type == vt::DeviceType::kCUDA && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
+      x.dtype == DType::kBF16)
+    return MatmulNvfp4MarlinD(d, x, w, DType::kBF16);
+#endif
   DBuf dout(d, DType::kBF16, {M, N});
   if (d.q.device.type == vt::DeviceType::kCUDA) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
@@ -1669,6 +1824,35 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: attn_kv count must equal full-attn layer count");
   VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
            "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
+}
+
+void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
+                                         const HfConfig& config, vt::Queue& queue) {
+#ifdef VT_MARLIN_NVFP4
+  if (queue.device.type != vt::DeviceType::kCUDA || !MarlinMoeEnabled()) return;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  for (const auto& layer : weights.layers) {
+    const MoeBlockWeights& moe = layer.moe;
+    if (!moe.expert_gate_fp4.empty())
+      BuildMoeMarlinResident(d, moe, config, MoeMarlinResidentFor(&moe));
+    if (!moe.shared_gate_proj_fp4.Empty())
+      BuildMarlinDenseResident(d, moe.shared_gate_proj_fp4,
+                               MarlinDenseResidentFor(&moe.shared_gate_proj_fp4));
+    if (!moe.shared_up_proj_fp4.Empty())
+      BuildMarlinDenseResident(d, moe.shared_up_proj_fp4,
+                               MarlinDenseResidentFor(&moe.shared_up_proj_fp4));
+    if (!moe.shared_down_proj_fp4.Empty())
+      BuildMarlinDenseResident(d, moe.shared_down_proj_fp4,
+                               MarlinDenseResidentFor(&moe.shared_down_proj_fp4));
+  }
+  if (!weights.lm_head_fp4.Empty())
+    BuildMarlinDenseResident(d, weights.lm_head_fp4, MarlinDenseResidentFor(&weights.lm_head_fp4));
+  d.b.Synchronize(d.q);
+#else
+  (void)weights;
+  (void)config;
+  (void)queue;
+#endif
 }
 
 std::vector<float> Qwen3_5Model::Forward(

@@ -807,6 +807,16 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in) {
   reinterpret_cast<CastBf16Fn>(GetOp(OpId::kCastBf16, q.device.type))(q, out, in);
 }
 
+void CastF32(Queue& q, Tensor& out, const Tensor& in) {
+  VT_CHECK(out.dtype == DType::kF32, "cast_f32: out must be f32");
+  VT_CHECK(in.dtype == DType::kBF16, "cast_f32: in must be bf16");
+  VT_CHECK(out.Numel() == in.Numel(), "cast_f32: out/in must have the same element count");
+  VT_CHECK(out.IsContiguous() && in.IsContiguous(), "cast_f32: contiguous required");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "cast_f32: device mismatch (out/in/queue)");
+  reinterpret_cast<CastF32Fn>(GetOp(OpId::kCastF32, q.device.type))(q, out, in);
+}
+
 void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   VT_CHECK(q_out.rank == 3 && gate_out.rank == 3, "attn_gate_split: q_out/gate_out rank-3 [T,Hq,Dh]");
   VT_CHECK(qgate.rank == 2, "attn_gate_split: qgate rank-2 [T, Hq*2*Dh]");

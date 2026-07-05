@@ -100,6 +100,13 @@ class Qwen3_5Model {
                                          const std::vector<int32_t>& positions,
                                          const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue);
+
+  // Eager (load-time) Marlin NVFP4 repack of every layer's routed experts +
+  // dense shared-expert/lm_head projections, so the first request pays no
+  // first-touch repack (previously a TTFT spike). No-op unless the build has
+  // VT_MARLIN_NVFP4 and the runtime gate VT_NVFP4_MARLIN=1 on a CUDA queue.
+  static void PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
+                                    const HfConfig& config, vt::Queue& queue);
 };
 
 // Decode-step CUDA-graph driver (M2.5 Phase 2, gate-#1 decode-launch unlock).

@@ -227,6 +227,10 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
   initialize_kv_cache(kv_cache_config);
+  // Eager Marlin NVFP4 repack (VT_NVFP4_MARLIN=1): repack all experts + dense
+  // shared/lm_head weights at LOAD time so the first request pays no first-touch
+  // repack. No-op on CPU / bf16 / when the gate is off.
+  Qwen3_5Model::PrepareMarlinResident(weights, config, queue_);
 }
 
 GPUModelRunner::GPUModelRunner(const HfConfig& config,

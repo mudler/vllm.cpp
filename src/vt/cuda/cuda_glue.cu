@@ -55,6 +55,21 @@ void CastBf16KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   Check(cudaGetLastError(), "cast_bf16 launch");
 }
 
+// cast_f32: out[i] = f32(in[i]). bf16 -> f32 upcast, thread per element.
+__global__ void CastF32Kernel(float* out, const __nv_bfloat16* in, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+    out[i] = __bfloat162float(in[i]);
+}
+
+void CastF32KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  CastF32Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<float>(),
+                                                        in.Ptr<__nv_bfloat16>(), n);
+  Check(cudaGetLastError(), "cast_f32 launch");
+}
+
 // ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh]. Thread per
 // output element (flat index over T*Hq*Dh); (i,h,d) recovered from it.
@@ -196,6 +211,8 @@ struct Registrar {
   Registrar() {
     RegisterOp(OpId::kCastBf16, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelCuda)));
+    RegisterOp(OpId::kCastF32, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelCuda)));
     RegisterOp(OpId::kAttnGateSplit, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernelCuda)));
     RegisterOp(

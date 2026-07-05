@@ -41,6 +41,7 @@ enum class OpId : uint8_t {
   kMoeGroupedGemmNvfp4,
   kMoeSiluMul,
   kCastBf16,
+  kCastF32,
   kAttnGateSplit,
   kSigmoidGateBf16,
   kGdnGBeta,
@@ -159,6 +160,7 @@ using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
 using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using CastF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using AttnGateSplitFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&);
 using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using GdnGBetaFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -658,6 +660,11 @@ void ApplyAllowedTokenIds(Queue& q, Tensor& logits, const Tensor& mask);
 // out[i] = F32ToBF16(in[i]); out bf16, in f32, same element count. The plain
 // f32 -> bf16 activation-dtype cast used before feeding a bf16-consuming op.
 void CastBf16(Queue& q, Tensor& out, const Tensor& in);
+
+// out[i] = f32(in[i]); out f32, in bf16, same element count. The bf16 -> f32
+// upcast used to expose a bf16-only GEMM (Marlin) as an f32 result, matching the
+// value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
+void CastF32(Queue& q, Tensor& out, const Tensor& in);
 
 // Splits the fused q/gate attention projection into its two halves. qgate is
 // [T, Hq*2*Dh] contiguous, laid out per (t,hq) as [q(Dh) | gate(Dh)]; q_out and

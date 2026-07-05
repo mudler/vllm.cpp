@@ -882,13 +882,26 @@ __device__ __forceinline__ uint8_t CastToFp4NibbleDev(float x) {
   return static_cast<uint8_t>((x < 0.0f ? 0x8u : 0x0u) | idx);
 }
 
+// Opt-in switch for the NATIVE block-scaled fp4xfp4 MMA + its matching
+// fast-reciprocal activation quant (mirror of vllm's flashinfer-cutlass sm120a
+// path). DEFAULT OFF: the default forward keeps the bf16-dequant WMMA GEMM +
+// exact-division quant, which is byte-identical to the CPU RefScaledFp4Quant /
+// RunNvfp4Emulation reference (and reproduces vllm's EMULATION token stream).
+// Set VT_NVFP4_FP4_NATIVE=1 to select the native sm120a-mirror path (validated
+// bit-exact vs the CPU reference; on the 27B near-tie it still lands on vllm's
+// emulation token, not cutlass's — see notes §7.2 / the qwen27 gate).
+inline bool NativeFp4MmaEnabled() {
+  const char* e = std::getenv("VT_NVFP4_FP4_NATIVE");
+  return e && e[0] == '1';
+}
+
 // ScaledFp4Quant: one thread per (row, 16-group). Emits packed fp4 [M,K/2] +
-// fp8 block scale [M,K/16]. Exact-division reciprocal to match the CPU truth
-// (the real vllm kernel uses reciprocal_approximate_ftz — sub-bucket delta,
-// notes §7.2). Tin f32/bf16.
+// fp8 block scale [M,K/16]. Reciprocal selected by approx_recip (notes §7.2).
+// Tin f32/bf16.
 template <typename Tin>
 __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin* x,
-                                     float input_global_scale, int64_t m_rows, int64_t k_dim) {
+                                     float input_global_scale, int64_t m_rows, int64_t k_dim,
+                                     bool approx_recip) {
   const int64_t groups = k_dim / 16;
   const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (gid >= m_rows * groups) return;
@@ -902,9 +915,22 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
   scale[row * groups + g] = sc8;
-  const float gs_recip = input_global_scale == 0.0f ? 0.0f : 1.0f / input_global_scale;
-  const float block_scale = F8E4M3ToF32Dev(sc8) * gs_recip;
-  const float out_scale = block_scale == 0.0f ? 0.0f : 1.0f / block_scale;
+  // outputScale = SFScaleVal / SFValue. In native mode (approx_recip) this uses
+  // the fast approximate reciprocal, mirroring the NATIVE vllm cvt_warp_fp16_to_fp4
+  // (nvfp4_utils.cuh:283-286 reciprocal_approximate_ftz) — the sub-bucket delta
+  // the sm120a oracle uses. Default (emulation-grade) uses exact division, which
+  // is byte-identical to the CPU RefScaledFp4Quant reference (notes §7.2).
+  const float sfv = F8E4M3ToF32Dev(sc8);
+  float out_scale = 0.0f;
+  if (sfv != 0.0f) {
+    if (approx_recip) {
+      float rcp;
+      asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(sfv));
+      out_scale = input_global_scale * rcp;
+    } else {
+      out_scale = input_global_scale / sfv;
+    }
+  }
 #pragma unroll
   for (int j = 0; j < 16; j += 2) {
     const float lo = fminf(fmaxf(Load(x, base + j) * out_scale, -6.0f), 6.0f);
@@ -924,14 +950,15 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
   auto* sc = out_scale.Ptr<uint8_t>();
+  const bool approx = NativeFp4MmaEnabled();  // native path -> fast-reciprocal quant
   switch (x.dtype) {
     case DType::kF32:
       ScaledFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(pk, sc, x.Ptr<float>(),
-                                                          input_global_scale_inv, m, k);
+                                                          input_global_scale_inv, m, k, approx);
       break;
     case DType::kBF16:
       ScaledFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
-          pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k);
+          pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k, approx);
       break;
     default: VT_CHECK(false, "cuda scaled_fp4_quant: unsupported x dtype (f32/bf16 only)");
   }
@@ -1062,6 +1089,104 @@ __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uin
   }
 }
 
+// --- NATIVE block-scaled fp4xfp4 MMA (Blackwell sm120a mxf4nvf4 tensor cores) --
+// Mirrors vllm's cutlass_scaled_fp4_mm_sm120a: the fp4 operands and their fp8
+// (e4m3) group-16 block scales are fed DIRECTLY to the block-scaled tensor-core
+// MMA (no bf16 dequant), fp32 accumulate, then x alpha. This is the true W4A4
+// GEMM the 27B oracle golden was captured with (native != bf16-dequant on
+// near-ties). Only compiled when the TU is built for the architecture-specific
+// sm_120a/sm_121a target (__CUDA_ARCH_SPECIFIC__); the host gates the launch on
+// the VT_FP4_MMA_SM120A build define so non-a builds keep the bf16 path.
+//
+// The per-thread operand/scale layout was validated device-vs-CPU bit-exact on
+// GB10 sm_121a (m16n8k64 e2m1, scale_vec::4X ue4m3):
+//   lane: g=lane/4 (0..7), t=lane%4 (0..3)
+//   A frags a0(row g, k=t*8+j) a1(row g+8,..) a2(row g,32+t*8+j) a3(row g+8,..)
+//   B frags b0(n g, k=t*8+j)   b1(n g,32+t*8+j);  nibble j -> k-elem j
+//   D       d0(g,t*2) d1(g,t*2+1) d2(g+8,t*2) d3(g+8,t*2+1)
+//   A scale: row r held in lane (r%8)*4 + (r>=8?1:0), byte b = k-block b
+//   B scale: col n held in lane n*4,                  byte b = k-block b
+__device__ __forceinline__ uint8_t GetNib(const uint8_t* p, int64_t row, int64_t col, int64_t k) {
+  const uint8_t byte = p[row * (k / 2) + col / 2];
+  return (col & 1) ? static_cast<uint8_t>(byte >> 4) : static_cast<uint8_t>(byte & 0xFu);
+}
+
+template <typename Tout>
+__global__ void MatmulNvfp4Fp4Native(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,
+                                     const uint8_t* b_packed, const uint8_t* b_scale, float alpha,
+                                     int64_t M, int64_t N, int64_t K) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int g = lane / 4, t = lane % 4;
+  const int64_t m0 = static_cast<int64_t>(blockIdx.y) * 16;
+  const int64_t n0 = static_cast<int64_t>(blockIdx.x) * 8;
+  const int64_t groups = K / 16;
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#if defined(__CUDA_ARCH_SPECIFIC__)
+  for (int64_t k0 = 0; k0 < K; k0 += 64) {
+    const int64_t rA = m0 + g, rA8 = m0 + g + 8, rB = n0 + g;
+    uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0, b0 = 0, b1 = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int64_t ka = k0 + t * 8 + j, kb = k0 + 32 + t * 8 + j;
+      if (rA < M) {
+        if (ka < K) a0 |= static_cast<uint32_t>(GetNib(a_packed, rA, ka, K)) << (4 * j);
+        if (kb < K) a2 |= static_cast<uint32_t>(GetNib(a_packed, rA, kb, K)) << (4 * j);
+      }
+      if (rA8 < M) {
+        if (ka < K) a1 |= static_cast<uint32_t>(GetNib(a_packed, rA8, ka, K)) << (4 * j);
+        if (kb < K) a3 |= static_cast<uint32_t>(GetNib(a_packed, rA8, kb, K)) << (4 * j);
+      }
+      if (rB < N) {
+        if (ka < K) b0 |= static_cast<uint32_t>(GetNib(b_packed, rB, ka, K)) << (4 * j);
+        if (kb < K) b1 |= static_cast<uint32_t>(GetNib(b_packed, rB, kb, K)) << (4 * j);
+      }
+    }
+    // 1.0 in fp8-e4m3 = 0x38: harmless default for unused/tail scale bytes.
+    uint32_t sfa = 0x38383838u, sfb = 0x38383838u;
+    const int64_t scaleRowA = (t == 0) ? (m0 + g) : (t == 1 ? (m0 + g + 8) : -1);
+    if (scaleRowA >= 0 && scaleRowA < M) {
+      uint32_t v = 0;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const int64_t gc = k0 / 16 + b;
+        const uint8_t sv = (gc < groups) ? a_scale[scaleRowA * groups + gc] : 0x38u;
+        v |= static_cast<uint32_t>(sv) << (8 * b);
+      }
+      sfa = v;
+    }
+    if (t == 0) {
+      const int64_t cB = n0 + g;
+      if (cB < N) {
+        uint32_t v = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int64_t gc = k0 / 16 + b;
+          const uint8_t sv = (gc < groups) ? b_scale[cB * groups + gc] : 0x38u;
+          v |= static_cast<uint32_t>(sv) << (8 * b);
+        }
+        sfb = v;
+      }
+    }
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X."
+        "f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, "
+        "%14, {%15, %16}, %17, {%18, %19};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "f"(d0), "f"(d1), "f"(d2), "f"(d3),
+          "r"(sfa), "n"(0), "n"(0), "r"(sfb), "n"(0), "n"(0));
+  }
+#else
+  (void)a_packed; (void)a_scale; (void)b_packed; (void)b_scale; (void)groups; (void)t; (void)g;
+#endif
+  const int64_t r = m0 + g, r8 = m0 + g + 8, c0 = n0 + t * 2, c1 = n0 + t * 2 + 1;
+  if (r < M && c0 < N) Store(out, r * N + c0, alpha * d0);
+  if (r < M && c1 < N) Store(out, r * N + c1, alpha * d1);
+  if (r8 < M && c0 < N) Store(out, r8 * N + c0, alpha * d2);
+  if (r8 < M && c1 < N) Store(out, r8 * N + c1, alpha * d3);
+}
+
 template <typename Tout>
 void LaunchFp4Fp4(cudaStream_t s, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
                   const Tensor& b_packed, const Tensor& b_scale, float alpha, int64_t m, int64_t n,
@@ -1070,6 +1195,14 @@ void LaunchFp4Fp4(cudaStream_t s, Tensor& out, const Tensor& a_packed, const Ten
   auto* as = a_scale.Ptr<uint8_t>();
   auto* bp = b_packed.Ptr<uint8_t>();
   auto* bs = b_scale.Ptr<uint8_t>();
+#if defined(VT_FP4_MMA_SM120A)
+  if (NativeFp4MmaEnabled()) {
+    const dim3 grid(static_cast<unsigned>((n + 7) / 8), static_cast<unsigned>((m + 15) / 16));
+    MatmulNvfp4Fp4Native<Tout><<<grid, 32, 0, s>>>(out.Ptr<Tout>(), ap, as, bp, bs, alpha, m, n, k);
+    Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (native sm120a)");
+    return;
+  }
+#endif
   if (m < kTileMinRows || !WmmaEnabled()) {
     constexpr int kBlock = 256;
     const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(m));

@@ -575,6 +575,74 @@ must pass on GB10 first):
   drop-in). test_ops_nvfp4_fp4 has a HasCuda()-guarded device-vs-CPU case ready to
   run on GB10 (quant byte-exact; GEMM within matmul tol). **MUST clean-rebuild +
   run on GB10 to confirm nvcc compiles it.**
+
+---
+
+## 7.7 NATIVE sm120a fp4×fp4 MMA — implemented + GB10-grounded (2026-07-05)
+
+Executed §7.6 step 6 (native block-scaled fp4×fp4) end-to-end on dgx (GB10,
+sm_121, CUDA 13.0.88, nvcc V13.0.88). All results below are measured, not assumed.
+
+**STEP 0 — vLLM native vs emulation on the gate prompt (hardware A/B).**
+Prompt `"The capital of France is Paris, and the"`, greedy 16, `unsloth/Qwen3.6-27B-NVFP4`,
+`~/venvs/vllm-oracle` (vLLM 0.24.0, flashinfer 0.6.12), enforce_eager.
+- NATIVE (auto-selected `FlashInferCutlassNvFp4LinearKernel` →
+  `get_gemm_sm120_module_cutlass_fp4`, confirms §7.1): greedy tok6 = **198**
+  (== the oracle golden `greedy_ids.npy`).
+- EMULATION (forced via `VLLM_DISABLED_KERNELS=` the 7 higher-priority nvfp4
+  kernels → `EmulationNvFp4LinearKernel`): greedy tok6 = **271**, full 16-tok
+  stream `{...13, 271, 248068, 271, 248069, 271, 4639, 369, 4252, 13, 271}`.
+- ⇒ **PROVEN on hardware**: vLLM's own emulation ≠ its native cutlass on this
+  near-tie. Our C++ true-W4A4 path reproduces the EMULATION stream token-for-token
+  (all 16), i.e. we faithfully mirror vLLM's reference; only the flashinfer-cutlass
+  sm120a kernel yields 198.
+
+**STEP 1 — feasibility of an ORIGINAL native block-scaled fp4×fp4 MMA (no cutlass link).**
+FEASIBLE, but architecture-specific. The NVFP4 warp MMA
+`mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3`
+(e2m1 operands, ue4m3 group-16 scales) **assembles and RUNS correctly on
+`sm_121a`/`sm_120a`** but is **rejected on base `sm_121`**: ptxas
+`error: Instruction 'mma with block scale' not supported on .target 'sm_121'`.
+So the TU must be built for the arch-specific target (`-gencode
+arch=compute_121a,code=sm_121a`; `-arch=sm_121a` alone drops the `a` for exe
+builds). Guard macro = `__CUDA_ARCH_SPECIFIC__` (==1210 for sm_121a, undefined for
+sm_121). No WMMA C++ API for fp4 (`mma.h` has no e2m1 fragment) — inline PTX only.
+The exact m16n8k64 fragment + `scale_vec::4X` scale-operand layout was
+reverse-engineered device-vs-CPU on GB10 and validated **bit-exact** (maxrel 0.0)
+on random full GEMMs incl. K/M/N tails:
+  - lane g=lane/4 (0..7), t=lane%4 (0..3); nibble j → k-elem j (low nibble low k).
+  - A frags a0(row g,k=t·8+j) a1(row g+8,·) a2(row g,32+·) a3(row g+8,·); B b0(n g,k=t·8+j) b1(n g,32+·).
+  - D d0(g,t·2) d1(g,t·2+1) d2(g+8,t·2) d3(g+8,t·2+1).
+  - A-scale: row r → lane (r%8)·4 + (r≥8?1:0), byte b = k-block b. B-scale: col n → lane n·4, byte b = k-block b. thread_id=byte_id=0.
+
+**STEP 2 — implemented.** `MatmulNvfp4Fp4Native` (warp-per-16×8-tile, the above
+layout, K looped in 64-chunks, tails zero-padded) + fast-reciprocal
+(`rcp.approx.ftz.f32`) activation quant, both gated behind runtime env
+`VT_NVFP4_FP4_NATIVE=1` (**default OFF**) and build define `VT_FP4_MMA_SM120A`
+(set when `CMAKE_CUDA_ARCHITECTURES` matches `12[01]a`; repo default bumped to
+`121a`). `test_ops_nvfp4_fp4` passes both default and native (1850/1850).
+- **27B gate with native ON: still tok6 = 271** (identical 16-tok stream to vLLM
+  emulation). Our independent, bit-correct native MMA lands on the SAME side of the
+  near-tie as emulation; it does NOT bit-reproduce flashinfer-cutlass's specific
+  accumulation order + quant → 198 is not recovered. This is the documented
+  acceptable outcome (§7 intro / task STEP 2 caveat): matching cutlass's 198
+  requires bit-matching its exact reduction tree + flashinfer's scaled_fp4_quant,
+  which an original kernel cannot without the cutlass/flashinfer drop-in.
+- **35B gate: 16/16 SUCCESS** on the sm_121a build (W4A16 path untouched; arch
+  bump is numerically safe).
+
+**STEP 3 — throughput: NOT measured (vllm-bench).** The native kernel is an
+unoptimized warp-per-(16×8) tile (no shared-memory operand reuse) so it is
+expected SLOWER than the existing shared-mem-tiled bf16 WMMA path for prefill;
+it needs tiling work before it is a throughput lever. Left as follow-up.
+
+**Decision.** Native path kept **opt-in, not default**: it gives identical
+correctness (271, == vLLM emulation) to the faster default bf16 path and unknown
+(likely worse) throughput, so defaulting it would risk a throughput regression
+with no correctness gain. NOT merged to main; committed to this branch. To recover
+the 198 golden, the remaining honest option is the cutlass/flashinfer sm120a
+drop-in (post-MVP); the correctness bar for our path is logit/emulation parity,
+which we meet token-for-token.
 - **Weight load ✅ (plumbed).** `Nvfp4Weight` gained `input_global_scale_inv` +
   `alpha` (+ `IsTrueW4A4()`); `LoadCtNvfp4Raw` now reads `<proj>.input_global_scale`
   and precomputes `alpha = scale2/input_global_scale_inv` (notes §7.3).

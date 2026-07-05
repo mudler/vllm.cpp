@@ -966,6 +966,22 @@ TEST_CASE("CUDA gdn decode matches CPU (GQA ratio 3)") {
   }
 }
 
+// Batched decode at the REAL gate head dims (Dk=Dv=128, GQA ratio 2), multiple
+// sequences: exercises the fused (batch × Hv × value-tile) decode grid — each
+// (seq, v-head) fans out over NV=ceil(Dv/BV)=4 value tiles, and the batch of
+// 8 single-token sequences advances 8 independent [Dv,Dk] states in one launch.
+// This is the path the paged decode step drives; it must match the sequential
+// per-sequence CPU reference token-for-token (state included).
+TEST_CASE("CUDA gdn decode matches CPU (real dims, batched multi-seq)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  RunGdnCudaCase({}, 8, 16, 32, 128, 128, kCudaCombos[0], 6300);  // f32 (the real GDN dtype)
+  RunGdnCudaCase({}, 8, 16, 32, 128, 128, kCudaCombos[2], 6310);  // bf16 in/out
+  RunGdnCudaCase({}, 5, 2, 2, 128, 128, kCudaCombos[0], 6320);    // GQA ratio 1, odd batch
+}
+
 // The M2 chunk-parallel prefill scan vs the sequential scan (same binary),
 // real head dims Dk=Dv=128 (the gate model), GQA ratio 2, multiple heads.
 // 150 tokens = 2 full chunks (64) + a partial tail (22) exercises the chunk

@@ -414,6 +414,150 @@ void LaunchGdnScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor
   Check(cudaGetLastError(), "gdn scan launch");
 }
 
+void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
+                 const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
+                 const GdnArgs& args, const char* name);  // fwd decl (corner-dim fallback)
+
+// ---------------------------------------------------------------------------
+// Fused single-step DECODE recurrence — the (batch × Hv × value-tile) parallel
+// grid mirror of fla fused_recurrent_gated_delta_rule_fwd_kernel at T==1
+// (vllm/model_executor/layers/fla/ops/fused_recurrent.py:27-175; grid
+// (NK=1, NV, N*HV) at :217; b_h[BV,BK] register-resident, loaded once :103-120,
+// single step :122-149). Each block owns one (sequence, v-head, BV-value-tile).
+// vs the sequential GdnScanKernel (which streams the [Dv,Dk] state from GLOBAL
+// four times per token, strided by Dk so uncoalesced): here the [BV,Dk] slice is
+// staged into shared ONCE via a COALESCED load, updated in place, and written
+// back ONCE — two coalesced global passes instead of four strided ones. The grid
+// spans n*Hv*NV blocks so decode parallelizes across the whole batch.
+//
+// state_idx (optional; mirrors fla ssm_state_indices IS_CONTINUOUS_BATCHING
+// :104-116): when non-null the block reads/writes persistent-cache row
+// state_idx[i_n] (idx<=0 == NULL block → zero the output, skip), so the caller
+// need not gather/scatter per-request state rows. When null the state is the
+// compact [n,Hv,Dv,Dk] buffer and the state row == i_n.
+template <typename Tin, typename Tout>
+__global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
+                                     const float* g, const float* beta, float* state,
+                                     const int32_t* state_idx, int64_t hk_n, int64_t dk,
+                                     int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  const int64_t i_v = blockIdx.x;         // value-dim tile
+  const int64_t i_nh = blockIdx.y;        // fused (sequence, v-head)
+  const int64_t i_n = i_nh / hv_n;        // sequence == decode token index
+  const int64_t hv = i_nh % hv_n;         // v-head
+  const int64_t hk = hv / (hv_n / hk_n);  // GQA-mapped k-head
+  const int64_t vbase = i_v * bv;
+  const int vi = static_cast<int>(threadIdx.x);
+  const int64_t vrow = vbase + vi;  // this lane's value-state row
+
+  // Persistent-cache indirection (fla ssm_state_indices). idx<=0 == NULL block.
+  int64_t row = i_n;
+  if (state_idx != nullptr) {
+    const int32_t si = state_idx[i_n];
+    if (si <= 0) {
+      if (vrow < dv) Store(out, (i_n * hv_n + hv) * dv + vrow, 0.0f);
+      return;
+    }
+    row = si;
+  }
+
+  const int64_t sdk = dk + 1;  // padded shared row stride (kills the 32-way conflict)
+  extern __shared__ float smem[];
+  float* bq = smem;       // [dk]  q' = q*scale
+  float* bk = bq + dk;    // [dk]  k
+  float* sbh = bk + dk;   // [bv * sdk]  padded [BV,Dk] state slice
+  const int64_t vrows = (dv - vbase) < bv ? (dv - vbase) : bv;  // valid rows in tile
+  const int64_t tile = vrows * dk;                              // valid elems
+
+  // q'(=q*scale) and k for this (token, head) — broadcast to every lane.
+  const int64_t qkbase = (i_n * hk_n + hk) * dk;
+  for (int64_t i = vi; i < dk; i += blockDim.x) {
+    bq[i] = Load(q, qkbase + i) * scale;
+    bk[i] = Load(k, qkbase + i);
+  }
+  // Coalesced load of the [BV,Dk] state slice into padded shared.
+  float* s_head = state + (row * hv_n + hv) * dv * dk + vbase * dk;  // [<=bv, dk]
+  for (int64_t e = vi; e < bv * dk; e += blockDim.x)
+    sbh[(e / dk) * sdk + e % dk] = e < tile ? s_head[e] : 0.0f;
+  __syncthreads();
+
+  if (vrow < dv) {
+    const float decay = expf(g[i_n * hv_n + hv]);
+    const float beta_t = beta[i_n * hv_n + hv];
+    float* r = sbh + vi * sdk;
+    float dot = 0.0f;  // (S * exp(g)) @ k, fused with the decay pass
+    for (int64_t c = 0; c < dk; ++c) {
+      r[c] *= decay;
+      dot += r[c] * bk[c];
+    }
+    const float vp = (Load(v, (i_n * hv_n + hv) * dv + vrow) - dot) * beta_t;
+    float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+    for (int64_t c = 0; c < dk; ++c) {
+      r[c] += vp * bk[c];
+      o += r[c] * bq[c];
+    }
+    Store(out, (i_n * hv_n + hv) * dv + vrow, o);
+  }
+  __syncthreads();
+
+  // Coalesced write-back of the updated slice.
+  for (int64_t e = vi; e < tile; e += blockDim.x) s_head[e] = sbh[(e / dk) * sdk + e % dk];
+}
+
+template <typename Tin, typename Tout>
+void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
+                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                          const int32_t* state_idx, int64_t n, const GdnArgs& args) {
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  const int64_t bv = dv < 32 ? dv : 32;   // fla BV cap of 32; any dv via tail guard
+  const int64_t nv = (dv + bv - 1) / bv;  // value-dim tiles (fla NV)
+  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(n * hv_n));
+  const size_t shmem =
+      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
+  GdnDecodeFusedKernel<Tin, Tout><<<grid, static_cast<unsigned>(bv), shmem, s>>>(
+      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+      beta.Ptr<float>(), state.Ptr<float>(), state_idx, hk_n, dk, hv_n, dv, bv, args.scale);
+  Check(cudaGetLastError(), "gdn decode(fused) launch");
+}
+
+// Decode dispatch. state_idx == nullptr: compact [n,Hv,Dv,Dk] state (row==i_n).
+// Falls back to the sequential scan for the rare corner dims whose [BV,Dk]
+// shared slice would exceed the 48 KB default budget (the real gate Dk=128 and
+// every decode unit dim are well under).
+void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                        const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                        const int32_t* state_idx, const GdnArgs& args) {
+  VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
+           "cuda gdn_decode: unsupported q dtype (f32/bf16 only)");
+  VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
+           "cuda gdn_decode: q/k/v dtypes must match");
+  const int64_t n = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  if (n == 0 || hv_n == 0 || dv == 0) return;
+  VT_CHECK(n * hv_n <= kMaxGridY, "cuda gdn_decode: too many (seq×head) blocks (grid.y limit)");
+  const int64_t bv = dv < 32 ? dv : 32;
+  const size_t shmem =
+      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
+  if (shmem > 48 * 1024) {  // corner-dim fallback (no decode test hits this; real dims are 128)
+    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
+    return;
+  }
+  cudaStream_t s = AsStream(q);
+  if (q_in.dtype == DType::kF32) {
+    if (out.dtype == DType::kF32)
+      LaunchGdnDecodeFused<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args);
+    else
+      LaunchGdnDecodeFused<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx, n,
+                                                 args);
+  } else {
+    if (out.dtype == DType::kF32)
+      LaunchGdnDecodeFused<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
+                                                 args);
+    else
+      LaunchGdnDecodeFused<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state,
+                                                         state_idx, n, args);
+  }
+}
+
 // Shared wrapper body: qsl_ptr == nullptr → decode (n = batch = state rows;
 // ops.cpp validated state.shape[0] == T for decode / query_start_loc [N+1] on
 // the queue's device for prefill).
@@ -1146,7 +1290,16 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                          const GdnArgs& args) {
-  GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
+  // Fused (batch × Hv × value-tile) parallel decode — the fla fused_recurrent
+  // mirror (compact state, row == i_n). Replaces the batch-serial GdnScanKernel
+  // decode branch (M2.x GDN decode throughput). A/B: VT_GDN_FUSED_DECODE=0 falls
+  // back to the sequential scan for same-binary before/after measurement.
+  const char* e = std::getenv("VT_GDN_FUSED_DECODE");
+  if (e != nullptr && e[0] == '0') {
+    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
+    return;
+  }
+  GdnDecodeFusedCuda(q, out, q_in, k, v, g, beta, state, nullptr, args);
 }
 
 // Registers the CUDA GDN kernels during static init (pre-main, like the M0.6

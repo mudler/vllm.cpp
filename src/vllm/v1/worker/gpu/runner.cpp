@@ -441,20 +441,18 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // THE FORWARD (Task 3, over the persistent KV caches). Returns the full
   // [num_actual_tokens, vocab] f32 logits (lm_head already applied).
   //
-  // DECODE CUDA-GRAPH path (M2.5 Phase 2): a single-stream PURE-DECODE step
-  // (num_reqs==1, one token, no prefill) on an fp4/CUDA model is routed through
-  // the Qwen3_5DecodeGraph, which captures the forward once per batch shape and
-  // replays it per token. The graph's output is bit-identical to Forward.
+  // DECODE CUDA-GRAPH path (M2.5): a PURE-DECODE step (every request one token,
+  // no prefill) on an fp4/CUDA model is routed through the Qwen3_5DecodeGraph,
+  // which captures the forward once per PADDED batch size and replays it per
+  // step. The graph's real-row output is bit-identical to Forward.
   //
-  // WHY num_reqs==1 ONLY (measured, GB10 free-box A/B): after M2.5 Phase 1 made
-  // the decode forward async-on-stream, the host launch overhead is largely
-  // hidden behind the GPU, so graph capture recovers only ~2.6% at num_reqs==1
-  // (TPOT 67.2 -> 65.5 ms) and is neutral-to-slightly-negative at num_reqs==8
-  // (larger per-kernel work + more captured GDN-gather nodes). Restricting to
-  // num_reqs==1 keeps the single-stream latency win without regressing batched
-  // decode throughput (the gate-#1 workload). Batched decode stays eager; a
-  // captured SET of small batch sizes (vLLM's cudagraph_capture_sizes) is future
-  // work but the measured headroom is small. Prefill / mixed / bf16 / CPU always
+  // BATCHED (num_reqs>1) — the gate-#1 lever: at conc-64 kernel-launch overhead
+  // is ~24% of the decode wall (~1.4k cudaLaunchKernel/step -> 1 cudaGraphLaunch).
+  // The batch is padded up to the nearest captured size {1,2,4,8,16,32,64}
+  // (mirrors vLLM cudagraph_capture_sizes + pad-to-nearest,
+  // compilation/cuda_graph.py); the padded rows are inert (BuildPaddedDecode).
+  // The decode forward is row-independent, so padding cannot perturb the real
+  // rows. Beyond 64 (kMaxDecodeGraphBatch) / prefill / mixed / bf16 / dense / CPU
   // stay eager.
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
@@ -462,6 +460,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
                         moe_weights_ != nullptr &&
                         !moe_weights_->layers.empty() &&
                         !moe_weights_->layers.front().moe.expert_gate_fp4.empty();
+  constexpr int kMaxDecodeGraphBatch = 64;  // largest captured size
   std::vector<float> logits;
   if (dense_weights_ != nullptr) {
     // DENSE arch (27B): the eager paged dense forward. Same paged KV/GDN-state
@@ -470,7 +469,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     logits = Qwen3_5DenseModel::Forward(token_ids, positions, attn_meta, gdn_meta,
                                         attn_kv_, gdn_state_, *dense_weights_,
                                         config_, queue_);
-  } else if (pure_decode && num_reqs == 1 && fp4_cuda) {
+  } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
     if (!decode_graph_) {
       decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(*moe_weights_, config_,
                                                            queue_);

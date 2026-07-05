@@ -128,3 +128,56 @@ TEST_CASE("qwen36 paged-engine greedy acceptance gate (dgx-only, 35B)") {
   REQUIRE(static_cast<int>(got.size()) == kMaxTokens);
   CHECK(got == want_greedy_ids);
 }
+
+// BATCHED decode CUDA-graph acceptance gate (num_reqs>1). Submits N identical
+// greedy requests so the engine, once all are past prefill, runs PURE-DECODE
+// steps with num_reqs==N through the batched Qwen3_5DecodeGraph (padded up to the
+// nearest captured size — N=6 pads to 8, exercising 2 INERT padding rows). Each
+// request is independent (own KV + GDN state), so each MUST reproduce the same
+// oracle greedy continuation token-for-token; a corrupted real row (padding
+// leaking into a real slot) or a bad batched replay would diverge. This is the
+// conc>1 counterpart to the num_reqs==1 gate above.
+TEST_CASE("qwen36 paged-engine batched-graph greedy gate (dgx-only, 35B)") {
+  const std::string snap = Find35BSnapshot();
+  if (snap.empty()) {
+    MESSAGE(
+        "35B checkpoint absent; skipping (dgx-only) — "
+        "nvidia/Qwen3.6-35B-A3B-NVFP4 snapshot not present");
+    return;
+  }
+
+  const std::string kPrompt = "The capital of France is Paris, and the";
+  const fs::path golden = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_35b";
+  const std::vector<int32_t> want_greedy_ids =
+      LoadI32Npy(golden / "greedy_ids.npy");
+  const int kMaxTokens = static_cast<int>(want_greedy_ids.size());  // 16
+  const int kN = 6;  // pure-decode num_reqs==6 -> padded to captured size 8
+
+  MESSAGE("qwen36_paged_engine(batched): loading 35B via FromModelDir...");
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
+      vllm::entrypoints::LoadedEngine::FromModelDir(
+          snap, vllm::entrypoints::EngineParams{});
+
+  MESSAGE("qwen36_paged_engine(batched): greedy-decoding " << kN
+          << " concurrent requests x " << kMaxTokens << " tokens...");
+  for (int i = 0; i < kN; ++i)
+    loaded->engine().add_request("r" + std::to_string(i), kPrompt,
+                                 Greedy(kMaxTokens));
+
+  std::map<std::string, vllm::RequestOutput> finished;
+  while (loaded->engine().has_unfinished_requests()) {
+    for (vllm::RequestOutput& out : loaded->engine().step())
+      if (out.finished) finished[out.request_id] = std::move(out);
+  }
+
+  // Every concurrent request reproduces the oracle continuation exactly.
+  REQUIRE(static_cast<int>(finished.size()) == kN);
+  for (int i = 0; i < kN; ++i) {
+    const std::string id = "r" + std::to_string(i);
+    REQUIRE(finished.count(id) == 1);
+    REQUIRE(finished[id].outputs.size() == 1);
+    const std::vector<int32_t>& g = finished[id].outputs[0].token_ids;
+    REQUIRE(static_cast<int>(g.size()) == kMaxTokens);
+    CHECK(g == want_greedy_ids);
+  }
+}

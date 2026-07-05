@@ -38,6 +38,16 @@ class Backend {
   virtual void BeginCapture(Queue& q);
   virtual void EndCapture(Queue& q);
   virtual void Replay(Queue& q);
+
+  // Multi-graph handle API (M2.5 batched decode graph): a driver that captures a
+  // SET of graphs (one per padded decode batch size) owns each instantiated
+  // graph as an opaque handle and selects the right one per step. EndCaptureGraph
+  // returns the just-captured graph (does NOT store it in the backend);
+  // ReplayGraph launches a specific one; DestroyGraph frees it. (BeginCapture is
+  // shared — capture is a stream-global mode.)
+  virtual void* EndCaptureGraph(Queue& q);
+  virtual void ReplayGraph(Queue& q, void* graph);
+  virtual void DestroyGraph(void* graph);
 };
 
 Backend& GetBackend(DeviceType type);

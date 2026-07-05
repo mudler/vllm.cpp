@@ -91,6 +91,25 @@ class CudaBackend final : public Backend {
     Check(cudaGraphLaunch(exec_, AsStream(q)), "cudaGraphLaunch");
   }
 
+  // Multi-graph handle API (batched decode graph): instantiate the just-captured
+  // stream graph and hand the exec back as an opaque handle the driver owns +
+  // selects per padded batch size. Unlike EndCapture, nothing is stored here.
+  void* EndCaptureGraph(Queue& q) override {
+    cudaGraph_t graph = nullptr;
+    Check(cudaStreamEndCapture(AsStream(q), &graph), "cudaStreamEndCapture");
+    cudaGraphExec_t exec = nullptr;
+    Check(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate");
+    cudaGraphDestroy(graph);
+    return reinterpret_cast<void*>(exec);
+  }
+  void ReplayGraph(Queue& q, void* graph) override {
+    Check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph), AsStream(q)),
+          "cudaGraphLaunch");
+  }
+  void DestroyGraph(void* graph) override {
+    if (graph != nullptr) cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph));
+  }
+
  private:
   int device_ = 0;
   bool unified_memory_ = false;

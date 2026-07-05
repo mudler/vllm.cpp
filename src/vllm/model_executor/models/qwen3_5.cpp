@@ -10,9 +10,11 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -2212,29 +2214,91 @@ void CopyInPlace(std::optional<std::vector<T>>& dst,
   CopyInPlace(*dst, *src);
 }
 
-// The SHAPE key a captured decode graph is valid for. Beyond num_reqs (== T for
-// decode) it includes the block-table column count and the GDN mamba-state
-// indices, because both are BAKED into the captured op stream (the block-table
-// copy size / the per-row GDN gather offsets). Any change re-captures.
-struct DecodeShapeKey {
-  int64_t T = -1;
-  int fa_cols = -1;
-  std::vector<int32_t> gdn_state_indices;
-  bool operator==(const DecodeShapeKey& o) const {
-    return T == o.T && fa_cols == o.fa_cols &&
-           gdn_state_indices == o.gdn_state_indices;
-  }
-};
+// The SET of decode batch sizes we capture a graph for (mirrors vLLM's
+// cudagraph_capture_sizes = [1,2,4] + range(8,…) capped to max_num_seqs;
+// compilation/cuda_graph.py + config/compilation.py:678-690 @ e24d1b24). A real
+// decode batch of B requests is PADDED up to the smallest captured size >= B and
+// that size's graph is replayed; the padded rows are inert (see BuildPaddedDecode).
+constexpr std::array<int64_t, 7> kDecodeGraphSizes = {1, 2, 4, 8, 16, 32, 64};
+constexpr int64_t kMaxDecodeGraphBatch = 64;
 
-DecodeShapeKey MakeShapeKey(const std::vector<int32_t>& token_ids,
-                            const v1::CommonAttentionMetadata& attn_meta,
-                            const v1::GDNAttentionMetadata& gdn_meta) {
-  DecodeShapeKey k;
-  k.T = static_cast<int64_t>(token_ids.size());
-  k.fa_cols = attn_meta.block_table_num_cols;
-  if (gdn_meta.non_spec_state_indices_tensor.has_value())
-    k.gdn_state_indices = *gdn_meta.non_spec_state_indices_tensor;
-  return k;
+// Smallest captured size >= b, or -1 when b exceeds the largest (caller runs
+// eager). vLLM pads the batch to the nearest captured size the same way.
+int64_t PadToCaptureSize(int64_t b) {
+  for (int64_t s : kDecodeGraphSizes)
+    if (s >= b) return s;
+  return -1;
+}
+
+// Build the S-padded PURE-DECODE inputs from the real B-request step (B<=S). The
+// decode forward is ROW-INDEPENDENT (paged attn is per-request causal, GDN
+// recurrence is per-sequence, MoE/router/norm/lm_head are per-token — no cross-
+// row reduction), so appending S-B INERT rows cannot perturb the real rows'
+// logits. The padding rows are made inert exactly as vLLM's cudagraph padding:
+//   * token id / position 0 (embed row is discarded);
+//   * slot_mapping = -1  → ReshapeAndCache skips the KV write (cuda_cache.cu:50);
+//   * gdn state index = -1 → causal_conv1d_update / GdnDecode skip the in-place
+//     mamba/conv update (cuda_gdn.cu:153,471), so no real state slot is touched;
+//   * seq_lens = 1 + block_table row 0 → PagedAttention does a valid in-bounds
+//     read of block 0 whose output row is discarded (never returned to the caller).
+// The real prefix [0,B) is copied verbatim, so at S==B this is a bit-identical
+// rebuild of the eager inputs (the S==B graph output equals Forward exactly).
+void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
+                       const std::vector<int32_t>& pos,
+                       const v1::CommonAttentionMetadata& am,
+                       const v1::GDNAttentionMetadata& gm,
+                       std::vector<int32_t>& tok_out,
+                       std::vector<int32_t>& pos_out,
+                       v1::CommonAttentionMetadata& am_out,
+                       v1::GDNAttentionMetadata& gm_out) {
+  const int64_t B = static_cast<int64_t>(tok.size());
+  const int64_t cols = am.block_table_num_cols;
+
+  tok_out.assign(static_cast<size_t>(S), 0);
+  pos_out.assign(static_cast<size_t>(S), 0);
+  std::copy(tok.begin(), tok.end(), tok_out.begin());
+  std::copy(pos.begin(), pos.end(), pos_out.begin());
+
+  am_out = am;  // carries causal + block_table_num_cols + max_seq_len
+  am_out.num_reqs = static_cast<int>(S);
+  am_out.num_actual_tokens = static_cast<int>(S);
+  am_out.max_query_len = 1;  // pure decode
+  am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
+  std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
+            am_out.slot_mapping.begin());
+  am_out.seq_lens.assign(static_cast<size_t>(S), 1);
+  std::copy(am.seq_lens.begin(), am.seq_lens.end(), am_out.seq_lens.begin());
+  am_out.block_table_tensor.assign(static_cast<size_t>(S * cols), 0);
+  std::copy(am.block_table_tensor.begin(), am.block_table_tensor.end(),
+            am_out.block_table_tensor.begin());
+  am_out.query_start_loc.resize(static_cast<size_t>(S + 1));
+  for (int64_t i = 0; i <= S; ++i)
+    am_out.query_start_loc[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+  gm_out = gm;
+  gm_out.num_prefills = 0;
+  gm_out.num_prefill_tokens = 0;
+  gm_out.num_decodes = static_cast<int>(S);
+  gm_out.num_decode_tokens = static_cast<int>(S);
+  gm_out.num_actual_tokens = static_cast<int>(S);
+  {
+    std::vector<int32_t> si(static_cast<size_t>(S), -1);  // inert padding slots
+    if (gm.non_spec_state_indices_tensor.has_value())
+      std::copy(gm.non_spec_state_indices_tensor->begin(),
+                gm.non_spec_state_indices_tensor->end(), si.begin());
+    gm_out.non_spec_state_indices_tensor = std::move(si);
+  }
+  {
+    std::vector<int32_t> q(static_cast<size_t>(S + 1));
+    for (int64_t i = 0; i <= S; ++i) q[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    gm_out.non_spec_query_start_loc = std::move(q);
+  }
+  // Pure decode (num_prefills==0): the prefill-only fields are unused.
+  gm_out.has_initial_state.reset();
+  gm_out.prefill_query_start_loc.reset();
+  gm_out.prefill_state_indices.reset();
+  gm_out.prefill_has_initial_state.reset();
+  (void)B;
 }
 
 }  // namespace
@@ -2248,61 +2312,70 @@ struct Qwen3_5DecodeGraph::Impl {
     enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
               b.SupportsGraphCapture();
   }
+  ~Impl() {
+    Backend& b = vt::GetBackend(queue.device.type);
+    for (auto& kv : slots)
+      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+  }
+
+  // One captured padded batch size. Owns its OWN persistent host inputs (the
+  // captured graph's host->device copies bake these addresses, so each size needs
+  // its own fixed-address buffers), its persistent embed target + logits output,
+  // and its instantiated graph. The state machine per slot mirrors the original
+  // single-shape driver: cold (eager pre-warm) → warm (capture+replay) → replay.
+  struct SizeSlot {
+    std::vector<int32_t> token_ids;   // [S]
+    std::vector<int32_t> positions;   // [S]
+    v1::CommonAttentionMetadata attn_meta;
+    v1::GDNAttentionMetadata gdn_meta;
+    std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
+    std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
+    int fa_cols = -1;                 // captured block-table column count
+    bool captured = false;
+    bool warm = false;
+    int64_t replays = 0;
+
+    // In-place refresh of the persistent host inputs (fixed addresses once the
+    // slot's vectors reach size S) so a replay re-reads this step's tokens.
+    void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
+                 const v1::CommonAttentionMetadata& am,
+                 const v1::GDNAttentionMetadata& gm) {
+      CopyInPlace(token_ids, tok);
+      CopyInPlace(positions, pos);
+      CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
+      CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
+      CopyInPlace(attn_meta.seq_lens, am.seq_lens);
+      CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
+      attn_meta.num_reqs = am.num_reqs;
+      attn_meta.num_actual_tokens = am.num_actual_tokens;
+      attn_meta.max_query_len = am.max_query_len;
+      attn_meta.max_seq_len = am.max_seq_len;
+      attn_meta.block_table_num_cols = am.block_table_num_cols;
+      attn_meta.causal = am.causal;
+      CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
+                  gm.non_spec_state_indices_tensor);
+      CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
+      CopyInPlace(gdn_meta.has_initial_state, gm.has_initial_state);
+      CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
+      CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
+      CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
+      gdn_meta.num_prefills = gm.num_prefills;
+      gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
+      gdn_meta.num_decodes = gm.num_decodes;
+      gdn_meta.num_decode_tokens = gm.num_decode_tokens;
+      gdn_meta.num_actual_tokens = gm.num_actual_tokens;
+    }
+  };
 
   const Qwen3_5MoeWeights& weights;
   const HfConfig& config;
   vt::Queue queue;
   bool enabled = false;
 
-  // Persistent host inputs (fixed addresses across replays of a shape).
-  std::vector<int32_t> token_ids;
-  std::vector<int32_t> positions;
-  v1::CommonAttentionMetadata attn_meta;
-  v1::GDNAttentionMetadata gdn_meta;
-
-  std::unique_ptr<DBuf> logits;  // held graph-output buffer (not pool-returned)
-  std::unique_ptr<DBuf> hidden;  // persistent embed target (fixed address; the
-                                 // captured layer region reads it, embedding
-                                 // writes it OUTSIDE the graph each step)
-
-  bool captured = false;
-  DecodeShapeKey cap_key;
-  DecodeShapeKey warm_key;
-  bool warm_valid = false;
-  int64_t replays = 0;
-
-  // Copy this step's inputs into the persistent host buffers IN PLACE (same
-  // addresses on an unchanged shape) so a replay re-reads the new token.
-  void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
-               const v1::CommonAttentionMetadata& am,
-               const v1::GDNAttentionMetadata& gm) {
-    CopyInPlace(token_ids, tok);
-    CopyInPlace(positions, pos);
-    // Attention metadata: in-place the H2D-copied vectors, assign the scalars.
-    CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
-    CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
-    CopyInPlace(attn_meta.seq_lens, am.seq_lens);
-    CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
-    attn_meta.num_reqs = am.num_reqs;
-    attn_meta.num_actual_tokens = am.num_actual_tokens;
-    attn_meta.max_query_len = am.max_query_len;
-    attn_meta.max_seq_len = am.max_seq_len;
-    attn_meta.block_table_num_cols = am.block_table_num_cols;
-    attn_meta.causal = am.causal;
-    // GDN metadata: in-place the (optional) index/offset vectors, copy scalars.
-    CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
-                gm.non_spec_state_indices_tensor);
-    CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
-    CopyInPlace(gdn_meta.has_initial_state, gm.has_initial_state);
-    CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
-    CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
-    CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
-    gdn_meta.num_prefills = gm.num_prefills;
-    gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
-    gdn_meta.num_decodes = gm.num_decodes;
-    gdn_meta.num_decode_tokens = gm.num_decode_tokens;
-    gdn_meta.num_actual_tokens = gm.num_actual_tokens;
-  }
+  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  int64_t replays = 0;                // total replays (diagnostics)
+  bool any_captured = false;          // diagnostics: at least one live graph
 };
 
 Qwen3_5DecodeGraph::Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights,
@@ -2311,7 +2384,7 @@ Qwen3_5DecodeGraph::Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights,
 
 Qwen3_5DecodeGraph::~Qwen3_5DecodeGraph() = default;
 
-bool Qwen3_5DecodeGraph::captured() const { return impl_->captured; }
+bool Qwen3_5DecodeGraph::captured() const { return impl_->any_captured; }
 int64_t Qwen3_5DecodeGraph::replay_count() const { return impl_->replays; }
 
 std::vector<float> Qwen3_5DecodeGraph::Step(
@@ -2324,71 +2397,96 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
                     impl_->weights, impl_->config);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
-  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t B = static_cast<int64_t>(token_ids.size());
   const int64_t vocab = impl_->config.vocab_size;
-  std::vector<float> out(static_cast<size_t>(T) * static_cast<size_t>(vocab));
+  const int64_t H = impl_->config.hidden_size;
+  std::vector<float> out(static_cast<size_t>(B) * static_cast<size_t>(vocab));
 
-  // Eager fallback (capture disabled / non-CUDA): identical to Forward.
-  if (!impl_->enabled) {
+  // Pick the padded batch size (smallest captured size >= B). Eager fallback when
+  // capture is disabled / non-CUDA / B exceeds the largest captured size.
+  const int64_t S = PadToCaptureSize(B);
+  if (!impl_->enabled || S < 0) {
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);
-    lg.Download(d, out.data());
+    // ForwardBody returns [B,vocab]; download the real rows only.
+    b.Copy(d.q, out.data(), lg.ptr(), out.size() * sizeof(float));
+    b.Synchronize(d.q);
     return out;
   }
 
-  // Update the persistent host inputs (in place) to this step's token.
-  impl_->Refresh(token_ids, positions, attn_meta, gdn_meta);
-  const DecodeShapeKey key = MakeShapeKey(token_ids, attn_meta, gdn_meta);
-  const int64_t H = impl_->config.hidden_size;
+  // Pad this step's real B-request inputs up to S (inert padding rows), then
+  // refresh THIS size's persistent host buffers in place.
+  Impl::SizeSlot& s = impl_->slots[S];
+  const int cols = attn_meta.block_table_num_cols;
+  std::vector<int32_t> ptok, ppos;
+  v1::CommonAttentionMetadata pam;
+  v1::GDNAttentionMetadata pgm;
+  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                    pam, pgm);
 
-  // Fast path: a graph is captured for this shape. Embed OUTSIDE the graph into
-  // the persistent hidden buffer, then relaunch the captured layer region.
-  if (impl_->captured && key == impl_->cap_key) {
-    EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
-    b.Replay(impl_->queue);
+  // A block-table column-count change reallocates the persistent block_table (the
+  // captured H2D copy's source address moves) → invalidate this slot's graph and
+  // re-warm/re-capture.
+  const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
+  s.Refresh(ptok, ppos, pam, pgm);
+  s.fa_cols = cols;
+  if (cols_changed && s.graph != nullptr) {
+    b.DestroyGraph(s.graph);
+    s.graph = nullptr;
+    s.captured = false;
+    s.warm = false;
+  }
+
+  auto download_real = [&](DBuf& logits) {
+    // logits is [S,vocab]; copy the first B rows to the caller.
+    b.Copy(d.q, out.data(), logits.ptr(), out.size() * sizeof(float));
+    b.Synchronize(d.q);
+  };
+
+  // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
+  // persistent hidden buffer, then relaunch the captured layer region.
+  if (s.captured) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    b.ReplayGraph(impl_->queue, s.graph);
+    ++s.replays;
     ++impl_->replays;
-    impl_->logits->Download(d, out.data());
+    download_real(*s.logits);
     return out;
   }
 
-  // The pool + residency were warmed for this shape by the previous (eager)
-  // step: CAPTURE the layer region once, then launch it. Capture RECORDS (does
-  // not execute); the Replay is the single real execution that advances the
-  // caches. Embedding runs OUTSIDE the capture region (it mallocs/syncs a
-  // bounds-check flag and consumes host token_ids).
-  if (impl_->warm_valid && key == impl_->warm_key) {
-    EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
+  // Warm: the pool + residency were warmed for this size by the previous (eager)
+  // step. CAPTURE the layer region once, instantiate the graph, then launch it.
+  if (s.warm) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     b.BeginCapture(impl_->queue);
-    DBuf lg = ForwardLayers(d, impl_->hidden->t(), impl_->positions,
-                            impl_->attn_meta, impl_->gdn_meta, attn_kv, gdn_state,
-                            impl_->weights, impl_->config);
-    b.EndCapture(impl_->queue);
-    impl_->logits = std::make_unique<DBuf>(std::move(lg));
-    impl_->captured = true;
-    impl_->cap_key = key;
-    b.Replay(impl_->queue);
-    impl_->replays = 1;
-    impl_->logits->Download(d, out.data());
+    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                            s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                            impl_->config);
+    s.graph = b.EndCaptureGraph(impl_->queue);
+    s.logits = std::make_unique<DBuf>(std::move(lg));
+    s.captured = true;
+    impl_->any_captured = true;
+    b.ReplayGraph(impl_->queue, s.graph);
+    s.replays = 1;
+    ++impl_->replays;
+    download_real(*s.logits);
     return out;
   }
 
-  // Cold shape: run one EAGER step (pre-warms the DevicePool + resident weights /
-  // fused-MoE constants for this shape) and defer capture to the next step. This
-  // is a real decode step (its output is used); nothing is wasted. (Re)allocate
-  // the persistent hidden buffer to this shape's T so the next-step capture bakes
-  // its fixed address.
-  impl_->hidden = std::make_unique<DBuf>(d, DType::kBF16,
-                                         std::vector<int64_t>{T, H});
-  EmbedInto(d, *impl_->hidden, impl_->token_ids, impl_->weights, impl_->config);
+  // Cold size: run one EAGER step (pre-warms the DevicePool + resident weights /
+  // fused-MoE constants for this size) and defer capture to the next same-size
+  // step. This is a real decode step (its padded output's real rows are used;
+  // nothing is wasted). (Re)allocate the persistent hidden buffer to this size.
+  s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
+  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   {
-    DBuf lg = ForwardLayers(d, impl_->hidden->t(), impl_->positions,
-                            impl_->attn_meta, impl_->gdn_meta, attn_kv, gdn_state,
-                            impl_->weights, impl_->config);
-    lg.Download(d, out.data());
+    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                            s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                            impl_->config);
+    download_real(lg);
   }
-  impl_->warm_key = key;
-  impl_->warm_valid = true;
-  impl_->captured = false;  // any prior-shape graph is now stale
+  s.warm = true;
+  s.captured = false;
   return out;
 }
 

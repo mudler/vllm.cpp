@@ -8,6 +8,9 @@ namespace vt {
 void Backend::BeginCapture(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }
 void Backend::EndCapture(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }
 void Backend::Replay(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }
+void* Backend::EndCaptureGraph(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); return nullptr; }
+void Backend::ReplayGraph(Queue&, void*) { VT_CHECK(false, "graph capture unsupported on this backend"); }
+void Backend::DestroyGraph(void*) {}
 
 namespace {
 std::array<Backend*, kNumDeviceTypes>& Registry() {

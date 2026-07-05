@@ -121,6 +121,15 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   r.n = out_dim;
   r.k = in_dim;
   r.scale2 = 1.0F / wgs_disk;  // CT stores 1/scale (divisor) -> reciprocate
+  // TRUE W4A4 (notes §7): the on-disk activation divisor drives vt::ScaledFp4Quant
+  // (used DIRECTLY), and alpha folds both reciprocated globals for the fp4xfp4
+  // GEMM: alpha = (1/input_divisor)·(1/weight_divisor). input_global_scale is a
+  // per-tensor F32 scalar present on every 27B quantized Linear (§3.2).
+  const float igs_disk = ReadF32Scalar(get(proj + ".input_global_scale"));
+  VT_CHECK(igs_disk != 0.0F,
+           "qwen3_5 dense: zero input_global_scale (divisor) for " + proj);
+  r.input_global_scale_inv = igs_disk;   // on-disk divisor, used directly
+  r.alpha = r.scale2 * (1.0F / igs_disk);
   r.packed = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 2});
   VT_CHECK(packed.nbytes == r.packed.bytes.size(),
            "qwen3_5 dense: packed byte-size mismatch for " + proj);

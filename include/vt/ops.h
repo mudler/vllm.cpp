@@ -34,6 +34,8 @@ enum class OpId : uint8_t {
   kApplyTokenMask,
   kApplyAllowedTokenIds,
   kMatmulNvfp4,
+  kScaledFp4Quant,
+  kMatmulNvfp4Fp4,
   kMoeGroupedGemmNvfp4,
   kMoeSiluMul,
   kCastBf16,
@@ -126,6 +128,10 @@ struct MoeRouterTopKArgs {
 using MatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MatmulNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using ScaledFp4QuantFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
+using MatmulNvfp4Fp4Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
@@ -221,6 +227,33 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // is DequantNvfp4ToBf16 + Matmul).
 void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
                  const Tensor& weight_scale, float weight_scale_2);
+
+// --- TRUE W4A4 (fp4 activations x fp4 weights) — the 27B path (notes §7). Mirror
+// of vllm's dynamic activation quant + cutlass_scaled_fp4_mm_sm120a.
+//
+// ScaledFp4Quant (mirror vllm scaled_fp4_quant): dynamically per-token, per-16-
+// group quantizes a bf16/f32 activation [M,K] to fp4, emitting the two streams
+// the fp4xfp4 GEMM consumes:
+//   out_packed [M, K/2]  i8  low-nibble-first E2M1 (a_fp4)
+//   out_scale  [M, K/16] i8  fp8-e4m3fn block scales (a_scale_fp8, RAW — the GEMM
+//                            folds 1/input_global_scale into `alpha`)
+// `input_global_scale_inv` is the ON-DISK activation divisor (2688/amax_act) used
+// DIRECTLY. K a multiple of 16. Math = vllm cvt_warp_fp16_to_fp4 (notes §7.2) /
+// the CPU vllm::RefScaledFp4Quant. CPU + CUDA.
+void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
+                    float input_global_scale_inv);
+
+// MatmulNvfp4Fp4 (mirror vllm cutlass_scaled_fp4_mm / ..._sm120a; notes §7.3):
+//   out[m,n] = alpha * Σ_k ( a_fp4[m,k]·a_scale_fp8[m,k/16] )
+//                            · ( b_fp4[n,k]·b_scale_fp8[n,k/16] )
+// a_packed [M,K/2] / a_scale [M,K/16] are ScaledFp4Quant's outputs; b_packed
+// [N,K/2] / b_scale [N,K/16] are the on-disk weight_packed / weight_scale (RAW
+// fp8, LINEAR — no swizzle: we own producer and consumer). `alpha` folds both
+// on-disk globals: alpha = (1/input_divisor)·(1/weight_divisor). f32 accumulation;
+// out [M,N] f32/bf16. This is the exact vllm::RunNvfp4Emulation numeric result.
+// K a multiple of 16. CPU + CUDA.
+void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
+                    const Tensor& b_packed, const Tensor& b_scale, float alpha);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

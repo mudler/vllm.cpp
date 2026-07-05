@@ -80,6 +80,22 @@ float CastToFp4(float x) {
   return m * sign;
 }
 
+uint8_t Fp4ToNibble(float v) {
+  const float a = std::fabs(v);
+  // Map the exact E2M1 magnitude to its 3-bit LUT index (a is one of the
+  // CastToFp4 outputs {0,.5,1,1.5,2,3,4,6}). Nearest-index guards float equality.
+  uint8_t idx = 7;  // 6.0
+  if (a < 0.25F) idx = 0;        // 0
+  else if (a < 0.75F) idx = 1;   // 0.5
+  else if (a < 1.25F) idx = 2;   // 1
+  else if (a < 1.75F) idx = 3;   // 1.5
+  else if (a < 2.5F) idx = 4;    // 2
+  else if (a < 3.5F) idx = 5;    // 3
+  else if (a < 5.0F) idx = 6;    // 4
+  if (idx == 0) return 0;  // canonical +0 (both 0x0 and 0x8 decode to 0)
+  return static_cast<uint8_t>((std::signbit(v) ? 0x8U : 0x0U) | idx);
+}
+
 namespace {
 
 // get_reciprocal (nvfp4_emulation_utils.py:403-410) for scalars: 0 stays 0.
@@ -125,6 +141,51 @@ void RefNvfp4QuantDequant(const float* x, int64_t m, int64_t n,
         const float clipped = ClampF(scaled, -kFloat4E2M1Max, kFloat4E2M1Max);
         const float fp4 = CastToFp4(clipped);
         dq_row[base + j] = fp4 * block_scale;
+      }
+    }
+  }
+}
+
+void RefScaledFp4Quant(const float* x, int64_t m, int64_t n,
+                       float input_global_scale, uint8_t* out_packed,
+                       uint8_t* out_scale_fp8, int block_size) {
+  VT_CHECK(x != nullptr, "scaled_fp4_quant: x is null");
+  VT_CHECK(out_packed != nullptr, "scaled_fp4_quant: out_packed is null");
+  VT_CHECK(out_scale_fp8 != nullptr, "scaled_fp4_quant: out_scale is null");
+  VT_CHECK(block_size > 0 && n % block_size == 0,
+           "scaled_fp4_quant: n must be a multiple of block_size");
+  VT_CHECK(block_size % 2 == 0, "scaled_fp4_quant: block_size must be even");
+
+  const int64_t blocks = n / block_size;
+  const float gs_recip = Reciprocal(input_global_scale);
+  const float fp4_max_recip = 1.0F / kFloat4E2M1Max;  // FLOAT4_E2M1_MAX_RECIPROCAL
+
+  for (int64_t i = 0; i < m; ++i) {
+    const float* x_row = x + i * n;
+    uint8_t* packed_row = out_packed + i * (n / 2);
+    uint8_t* scale_row = out_scale_fp8 + i * blocks;
+    for (int64_t b = 0; b < blocks; ++b) {
+      const int64_t base = b * block_size;
+      float vec_max = 0.0F;
+      for (int j = 0; j < block_size; ++j) {
+        vec_max = std::fmax(vec_max, std::fabs(x_row[base + j]));
+      }
+      // Per-group block scale (identical to RefNvfp4QuantDequant), stored RAW as
+      // fp8 (this is a_scale_fp8 — the GEMM multiplies by it and folds 1/global
+      // into alpha).
+      float scale = input_global_scale * (vec_max * fp4_max_recip);
+      scale = ClampF(scale, -kFloat8E4M3Max, kFloat8E4M3Max);
+      const uint8_t scale_f8 = F32ToF8E4M3(scale);
+      scale_row[b] = scale_f8;
+      const float block_scale = F8E4M3ToF32(scale_f8) * gs_recip;
+      const float output_scale = Reciprocal(block_scale);
+      for (int j = 0; j < block_size; j += 2) {
+        const float lo = CastToFp4(
+            ClampF(x_row[base + j] * output_scale, -kFloat4E2M1Max, kFloat4E2M1Max));
+        const float hi = CastToFp4(
+            ClampF(x_row[base + j + 1] * output_scale, -kFloat4E2M1Max, kFloat4E2M1Max));
+        packed_row[(base + j) / 2] =
+            static_cast<uint8_t>(Fp4ToNibble(lo) | (Fp4ToNibble(hi) << 4));
       }
     }
   }

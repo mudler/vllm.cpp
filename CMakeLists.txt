@@ -21,7 +21,7 @@ if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httpl
   set(VLLM_CPP_SERVER OFF)
 endif()
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
-set(VLLM_CPP_CUDA_ARCHITECTURES "121" CACHE STRING "Target CUDA architectures (GB10=121)")
+set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_121)")
 
 # Resolve the tri-state VLLM_CPP_CUDA into a plain ON/OFF. The normal variable
 # set below intentionally shadows the cache entry so later if(VLLM_CPP_CUDA)
@@ -49,6 +49,12 @@ if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES})
+  # The native block-scaled fp4xfp4 MMA (cuda_matmul_nvfp4.cu) needs the
+  # architecture-specific sm_12xa target. Advertise it to the code so the host
+  # launcher enables the native path only when it was actually compiled in.
+  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a")
+    add_compile_definitions(VT_FP4_MMA_SM120A=1)
+  endif()
 endif()
 
 include(cmake/CompilerWarnings.cmake)

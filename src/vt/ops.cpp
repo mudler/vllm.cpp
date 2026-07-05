@@ -71,6 +71,55 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
       q, out, act, weight_packed, weight_scale, weight_scale_2);
 }
 
+void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
+                    float input_global_scale_inv) {
+  VT_CHECK(x.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
+           "scaled_fp4_quant: x/out_packed/out_scale must be rank-2");
+  const int64_t m = x.shape[0], k = x.shape[1];
+  VT_CHECK(k % 16 == 0, "scaled_fp4_quant: K (inner dim) must be a multiple of 16");
+  VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == k / 2,
+           "scaled_fp4_quant: out_packed must be [M, K/2]");
+  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == k / 16,
+           "scaled_fp4_quant: out_scale must be [M, K/16]");
+  VT_CHECK(IsFloat(x.dtype), "scaled_fp4_quant: float x required");
+  VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
+           "scaled_fp4_quant: out_packed/out_scale must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(x.IsContiguous() && out_packed.IsContiguous() && out_scale.IsContiguous(),
+           "scaled_fp4_quant: contiguous tensors required");
+  VT_CHECK(x.device == q.device && out_packed.device == q.device && out_scale.device == q.device,
+           "scaled_fp4_quant: device mismatch (x/out_packed/out_scale/queue)");
+  reinterpret_cast<ScaledFp4QuantFn>(GetOp(OpId::kScaledFp4Quant, q.device.type))(
+      q, out_packed, out_scale, x, input_global_scale_inv);
+}
+
+void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
+                    const Tensor& b_packed, const Tensor& b_scale, float alpha) {
+  VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_scale.rank == 2 && b_packed.rank == 2 &&
+               b_scale.rank == 2,
+           "matmul_nvfp4_fp4: all tensors must be rank-2");
+  const int64_t m = a_packed.shape[0], k = a_packed.shape[1] * 2, n = b_packed.shape[0];
+  VT_CHECK(k % 16 == 0, "matmul_nvfp4_fp4: K (inner dim) must be a multiple of 16");
+  VT_CHECK(a_scale.shape[0] == m && a_scale.shape[1] == k / 16,
+           "matmul_nvfp4_fp4: a_scale must be [M, K/16]");
+  VT_CHECK(b_packed.shape[1] == k / 2,
+           "matmul_nvfp4_fp4: b_packed must be [N, K/2] (K matches a_packed)");
+  VT_CHECK(b_scale.shape[0] == n && b_scale.shape[1] == k / 16,
+           "matmul_nvfp4_fp4: b_scale must be [N, K/16]");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_nvfp4_fp4: out must be [M, N]");
+  VT_CHECK(IsOutFloat(out.dtype), "matmul_nvfp4_fp4: f32/bf16 out");
+  VT_CHECK(a_packed.dtype == DType::kI8 && a_scale.dtype == DType::kI8 &&
+               b_packed.dtype == DType::kI8 && b_scale.dtype == DType::kI8,
+           "matmul_nvfp4_fp4: packed/scale operands must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(out.IsContiguous() && a_packed.IsContiguous() && a_scale.IsContiguous() &&
+               b_packed.IsContiguous() && b_scale.IsContiguous(),
+           "matmul_nvfp4_fp4: contiguous tensors required");
+  VT_CHECK(out.device == q.device && a_packed.device == q.device && a_scale.device == q.device &&
+               b_packed.device == q.device && b_scale.device == q.device,
+           "matmul_nvfp4_fp4: device mismatch");
+  reinterpret_cast<MatmulNvfp4Fp4Fn>(GetOp(OpId::kMatmulNvfp4Fp4, q.device.type))(
+      q, out, a_packed, a_scale, b_packed, b_scale, alpha);
+}
+
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,
                          const Tensor& scale_ptrs, const Tensor& scale2s) {

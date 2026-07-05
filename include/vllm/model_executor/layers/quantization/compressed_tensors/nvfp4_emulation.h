@@ -54,6 +54,29 @@ uint8_t F32ToF8E4M3(float f);
 // fixed half-open bucket boundaries. Input is expected pre-clamped to [-6, 6].
 float CastToFp4(float x);
 
+// Encode an E2M1 (fp4) value (a CastToFp4 magnitude {0,.5,1,1.5,2,3,4,6}, signed)
+// to its packed nibble: bit 3 = sign, bits 0..2 index kE2M1Lut. Inverse of the
+// nibble decode in DequantCtNvfp4WeightToF32 / cuda DecodeFp4Byte — decoding the
+// returned nibble via kE2M1Lut reproduces `v`. Zero encodes as the canonical +0
+// nibble 0x0 (both 0x0 and 0x8 decode to 0).
+uint8_t Fp4ToNibble(float v);
+
+// scaled_fp4_quant — the quant-only half of RefNvfp4QuantDequant (mirror vllm
+// scaled_fp4_quant / cvt_warp_fp16_to_fp4, csrc/.../fp4/nvfp4_utils.cuh:241-297;
+// notes §7.2). Dynamically per-token, per-16-group quantizes a row-major [m, n]
+// f32 activation to fp4, emitting the two on-disk streams the true W4A4 GEMM
+// consumes:
+//   out_packed    [m, n/2]   U8, low-nibble-first E2M1 (a_fp4)
+//   out_scale_fp8 [m, n/16]  fp8-e4m3fn bytes, LINEAR (a_scale_fp8 — the RAW
+//                            stored block scale, NOT divided by any global)
+// `input_global_scale` is the ON-DISK activation divisor (2688/amax_act), used
+// DIRECTLY (NOT reciprocated) — vllm passes layer.input_global_scale_inv. Same
+// per-block scale/round as RefNvfp4QuantDequant, so decoding the outputs as
+// a_fp4·f8(a_scale_fp8)/input_global_scale reproduces its x_dq. n % block_size==0.
+void RefScaledFp4Quant(const float* x, int64_t m, int64_t n,
+                       float input_global_scale, uint8_t* out_packed,
+                       uint8_t* out_scale_fp8, int block_size = kNvfp4GroupSize);
+
 // ref_nvfp4_quant + dequant round-trip (nvfp4_emulation_utils.py:427-466) over
 // a row-major [m, n] f32 activation (n % block_size == 0). Emulates the dynamic
 // per-token, per-16-group activation quantization the W4A4 GEMM applies, then

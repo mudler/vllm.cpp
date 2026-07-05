@@ -66,10 +66,22 @@ struct OwnedTensor {
 struct Nvfp4Weight {
   OwnedTensor packed;   // i8 [N, K/2]   two 4-bit E2M1 codes per byte
   OwnedTensor scale;    // i8 [N, K/16]  one fp8-e4m3 scale per 16-elem group
-  float scale2 = 0.0F;  // per-tensor global scale (amax/2688), multiplied
+  float scale2 = 0.0F;  // per-tensor weight global scale (1/divisor), multiplied
   int64_t n = 0;        // out_features
   int64_t k = 0;        // in_features (K % 16 == 0)
   bool Empty() const { return packed.Empty(); }
+
+  // TRUE W4A4 fields (27B compressed-tensors NVFP4; notes §7). Populated ONLY on
+  // the 27B CT load (LoadCtNvfp4Raw); left 0 for the 35B modelopt W4A16 weights
+  // (which have no activation quant) so `IsTrueW4A4()` gates the 27B alone.
+  //   input_global_scale_inv = the ON-DISK activation divisor (2688/amax_act),
+  //     passed DIRECTLY to vt::ScaledFp4Quant.
+  //   alpha = (1/input_divisor)·(1/weight_divisor) = scale2/input_global_scale_inv,
+  //     the single scalar vt::MatmulNvfp4Fp4 multiplies the fp4xfp4 accumulator by.
+  float input_global_scale_inv = 0.0F;
+  float alpha = 0.0F;
+  // True when the activation-quant globals were loaded (27B true-W4A4 path).
+  bool IsTrueW4A4() const { return alpha > 0.0F; }
 
   // Lazily-populated device-resident copies (CUDA forward only; null on host or
   // before first use). The shared_ptr deleter frees through the vt Backend.

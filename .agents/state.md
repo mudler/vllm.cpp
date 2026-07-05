@@ -1115,3 +1115,14 @@ dgx inspection of the checkpoint).
   — confirm vLLM-emulation also gives 271 (→ we mirror the reference); (2) implement the NATIVE fp4×fp4
   MMA (mirror cutlass sm120a) = the faithful mirror AND the 27B speed path; native accum may resolve
   the tie. Correctness bar if native still tie-flips: logit-parity + emulation-token-match (both met).
+- **2026-07-05 (27B W4A4 LANDED on main `a799fa1`; correctness resolved; pivot to SPEED)**
+  Merged the 27B true-W4A4 dense path (default dequant-compute, correct-grade) + the native
+  sm120a block-scaled fp4×fp4 MMA (opt-in `VT_NVFP4_FP4_NATIVE=1`, bit-exact vLLM-emulation
+  parity, maxrel 0.0) + CMake arch 121→121a. 35B 16/16 preserved; CPU build green; gate skips
+  (`kW4A4ForwardReady=false`, documented: production-198 = post-MVP cutlass drop-in). 27B
+  CORRECTNESS = token-for-token parity with vLLM's emulation REFERENCE (met, hardware-grounded).
+  MVP now = pure SPEED: 35B ~6.1×, 27B ~16× off vLLM. Next shared-kernel levers (benefit BOTH via
+  the shared GDN/backbone): (1) `GdnChunkDeltaH` tensor-core (~25% of 35B prefill, top kernel
+  after M2.4 PagedAttn); (2) 27B GDN hstate OOM fix (Hv=48/value_dim 6144 OOMs at 8×1024 —
+  blocks 27B target-concurrency measurement); (3) fp8 W8A16 GEMV (decode, both); (4) native-fp4
+  MMA tiling (27B GEMM speed lever). Post-MVP: cutlass sm120a drop-in for bit-exact prod parity.

@@ -263,6 +263,57 @@ double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b, size
   return m;
 }
 
+// Full-attn metadata for ONE chunked-prefill step of a single request: a chunk
+// of `qlen` new tokens whose first token sits at absolute position `context`
+// (context == num_computed_tokens). seq_lens = context + qlen so the paged
+// attention attends causally over the already-cached context + this chunk
+// (cpu_paged_attn.cpp: context = seq_lens - query_len). Positions/slots are
+// laid out contiguously from `context` in a single block table `blocks`.
+CommonAttentionMetadata ChunkAttnMeta(int64_t context, int64_t qlen,
+                                      const std::vector<int32_t>& blocks,
+                                      int64_t block_size) {
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(qlen);
+  m.query_start_loc = {0, static_cast<int32_t>(qlen)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(context + qlen)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(qlen);
+  m.max_seq_len = static_cast<int>(context + qlen);
+  m.block_table_num_cols = static_cast<int>(blocks.size());
+  m.block_table_tensor = blocks;
+  for (int64_t t = 0; t < qlen; ++t) {
+    const int64_t abs_pos = context + t;
+    const int64_t blk = blocks[static_cast<size_t>(abs_pos / block_size)];
+    m.slot_mapping.push_back(blk * block_size + abs_pos % block_size);
+  }
+  m.causal = true;
+  return m;
+}
+
+// GDN metadata for ONE chunked-prefill step of a single request. When
+// `has_initial` is true (context > 0, a resumed chunk) the GDN layer must
+// CONTINUE from the saved recurrent + conv state for state index `sidx`
+// (prefill_has_initial_state=1 => the gather is NOT zeroed), mirroring the
+// builder's has_initial_state = context_lens > 0 (gdn_attn.cpp build()).
+GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) {
+  GDNAttentionMetadata g;
+  g.num_prefills = 1;
+  g.num_prefill_tokens = static_cast<int>(qlen);
+  g.num_decodes = 0;
+  g.num_decode_tokens = 0;
+  g.num_actual_tokens = static_cast<int>(qlen);
+  const uint8_t hi = has_initial ? 1 : 0;
+  g.has_initial_state = std::vector<uint8_t>{hi};
+  g.non_spec_state_indices_tensor = std::vector<int32_t>{sidx};
+  g.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
+  g.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(qlen)};
+  g.prefill_state_indices = std::vector<int32_t>{sidx};
+  g.prefill_has_initial_state = std::vector<uint8_t>{hi};
+  return g;
+}
+
 }  // namespace
 
 TEST_CASE("qwen27 dense paged: full-prefill batch-of-1 equals dense forward") {
@@ -427,4 +478,67 @@ TEST_CASE("qwen27 dense paged: GDN state zeroing protects a fresh req in a mixed
   MESSAGE("dense mixed-batch fresh-A vs standalone-A max|diff| = " << d
           << " (garbage-seeded mamba block, zeroing must scrub)");
   CHECK(d < 1e-2);
+}
+
+// CHUNKED PREFILL state continuity (the 27B OOM fix's correctness gate): a
+// GDN-hybrid sequence prefilled in ONE shot must produce logits bit-identical
+// to the SAME sequence prefilled in SEVERAL chunked-prefill steps over the
+// persistent KV + GDN (ssm + conv) state. Each resumed chunk carries
+// has_initial_state=1 so the GDN recurrence continues from the saved state, the
+// causal conv1d reads its saved window, and the full-attn layer attends over the
+// already-cached context. If any of those re-zeroed / dropped state, the resumed
+// chunks would diverge from the one-shot reference. Proves the state-continuity
+// machinery the enabled chunked prefill relies on.
+TEST_CASE("qwen27 dense paged: one-shot prefill == chunked prefill (state continuity)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5DenseWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t T = 6, vocab = c.vocab_size;
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+  const std::vector<int32_t> blocks = {0, 1};  // block_size 8 => all in block 0
+
+  // One-shot reference: full prefill of the whole sequence (fresh state).
+  CachePool ref_pool(c, /*num_blocks=*/8, /*block_size=*/8);
+  const CommonAttentionMetadata ref_am = PrefillAttnMeta(T, blocks, 8, 0);
+  const GDNAttentionMetadata ref_gm = PrefillGdnMeta(T, 0);
+  const std::vector<float> one_shot = Qwen3_5DenseModel::Forward(
+      ids, pos, ref_am, ref_gm, ref_pool.attn_kv, ref_pool.gdn_state, w, c, q);
+  REQUIRE(one_shot.size() == static_cast<size_t>(T * vocab));
+
+  // Drive the SAME sequence split at these cumulative boundaries, resuming each
+  // chunk from the persisted state. Two splittings: {3,3} and {2,2,2} (multiple
+  // resumptions). state index 0 for all chunks (single request, single block).
+  auto run_chunked = [&](const std::vector<int64_t>& chunk_lens) {
+    CachePool pool(c, /*num_blocks=*/8, /*block_size=*/8);
+    int64_t context = 0;
+    std::vector<float> last_logits;
+    for (const int64_t qlen : chunk_lens) {
+      std::vector<int32_t> cids(ids.begin() + context,
+                                ids.begin() + context + qlen);
+      std::vector<int32_t> cpos(pos.begin() + context,
+                                pos.begin() + context + qlen);
+      const CommonAttentionMetadata am = ChunkAttnMeta(context, qlen, blocks, 8);
+      const GDNAttentionMetadata gm =
+          ChunkGdnMeta(qlen, /*sidx=*/0, /*has_initial=*/context > 0);
+      last_logits = Qwen3_5DenseModel::Forward(cids, cpos, am, gm, pool.attn_kv,
+                                               pool.gdn_state, w, c, q);
+      context += qlen;
+    }
+    return last_logits;  // logits of the FINAL chunk's tokens.
+  };
+
+  for (const std::vector<int64_t>& split :
+       std::vector<std::vector<int64_t>>{{3, 3}, {2, 2, 2}}) {
+    const std::vector<float> chunked = run_chunked(split);
+    const int64_t tail = split.back();
+    REQUIRE(chunked.size() == static_cast<size_t>(tail * vocab));
+    // Compare the final chunk's logits against the matching one-shot tail rows.
+    std::vector<float> ref_tail(
+        one_shot.begin() + static_cast<int64_t>(T - tail) * vocab, one_shot.end());
+    const double d = MaxAbsDiff(chunked, ref_tail, chunked.size());
+    MESSAGE("chunked (split tail=" << tail << ") vs one-shot max|diff| = " << d
+            << " (must be ~0 — bit-identical state continuity)");
+    CHECK(d < 1e-4);
+  }
 }

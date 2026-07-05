@@ -67,6 +67,18 @@ struct BenchConfig {
   uint64_t seed = 0;       // prompt-generation RNG seed.
   double temperature = 0;  // <= 0 => greedy (deterministic).
   bool quiet = false;      // suppress per-progress logging to stderr.
+  // Per-step token budget (chunked-prefill knob). 0 => the engine's bounded
+  // default (ResolveMaxNumBatchedTokens). Exposed so the GB10 memory ramp can
+  // bound the per-step GDN prefill activation explicitly (the 27B 8x1024 OOM
+  // fix): a smaller budget splits a big prefill batch across more steps.
+  int max_num_batched_tokens = 0;
+  // KV/GDN-state cache blocks to preallocate. 0 => the heuristic below
+  // (concurrency * seq_blocks * 2). Exposed for the GB10 memory ramp: the
+  // preallocated f32 KV + GDN mamba-state cache scales with num_blocks and is the
+  // dominant unified-memory consumer at high concurrency, SEPARATE from the
+  // (chunked-prefill-bounded) per-step activation. Setting it to just enough for
+  // C concurrent (input+output)-long sequences keeps peak RAM bounded.
+  int num_blocks = 0;
 };
 
 // ── Per-request timing record (client-side, exactly what serve.py records). ────
@@ -386,7 +398,11 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     // concurrent (input+output)-long sequences at the default block size.
     params.block_size = 32;
     const int seq_blocks = (cfg.input_len + cfg.output_len + 31) / 32 + 1;
-    params.num_blocks = std::max(cfg.concurrency * seq_blocks * 2, 256);
+    params.num_blocks = cfg.num_blocks > 0
+                            ? cfg.num_blocks
+                            : std::max(cfg.concurrency * seq_blocks * 2, 256);
+    // Chunked-prefill per-step budget (0 => engine bounded default).
+    params.max_num_batched_tokens = cfg.max_num_batched_tokens;
     loaded = vllm::entrypoints::LoadedEngine::FromModelDir(cfg.model_path, params);
     for (int i = 0; i < cfg.num_prompts; ++i) {
       prompts.push_back(detail::BuildPrompt(

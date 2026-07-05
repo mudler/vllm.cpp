@@ -42,7 +42,7 @@ void Usage(const char* argv0, std::FILE* out) {
       out,
       "usage: %s [--model <dir|.gguf>] [--num-prompts N] [--input-len L]\n"
       "          [--output-len O] [--concurrency C] [--seed S]\n"
-      "          [--temperature T]\n"
+      "          [--temperature T] [--max-num-batched-tokens B]\n"
       "\n"
       "Throughput/latency benchmark over the vllm.cpp V1 LLMEngine, mirroring\n"
       "`vllm bench serve` metrics. With no --model, a synthetic CPU engine runs\n"
@@ -78,6 +78,10 @@ bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
       cfg.seed = std::strtoull(NextArg(argc, argv, i), nullptr, 10);
     } else if (flag == "--temperature") {
       cfg.temperature = std::atof(NextArg(argc, argv, i));
+    } else if (flag == "--max-num-batched-tokens") {
+      cfg.max_num_batched_tokens = std::atoi(NextArg(argc, argv, i));
+    } else if (flag == "--num-blocks") {
+      cfg.num_blocks = std::atoi(NextArg(argc, argv, i));
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], stdout);
       exit_code = 0;

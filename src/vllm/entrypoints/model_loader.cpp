@@ -58,6 +58,34 @@ std::vector<vllm::SafetensorsFile> LoadShards(const std::string& model_dir) {
   return shards;
 }
 
+// Resolve the per-step token budget (max_num_batched_tokens) for chunked
+// prefill. An explicit EngineParams override wins; otherwise use a FIXED bounded
+// default that does NOT scale with max_num_seqs, so a long/many-request prefill
+// is split across steps and the per-step GDN chunked-scan activation stays
+// bounded regardless of concurrency (the 27B 8x1024 conc-8 OOM fix — the old
+// max_model_len*max_num_seqs product ran the whole 8192-token prefill in one
+// step). Mirrors vLLM's chunked-prefill relationship: a bounded
+// max_num_batched_tokens (DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048,
+// vllm/config/scheduler.py:42 @ e24d1b24). Invariants mirrored from
+// SchedulerConfig.verify_max_model_len (vllm/config/scheduler.py:87): the budget
+// must be >= max_num_seqs (every running seq needs at least one token/step). For
+// tiny models whose whole workload is smaller than the default we keep the old
+// (max_model_len*max_num_seqs) ceiling so no behavior changes there.
+int ResolveMaxNumBatchedTokens(const EngineParams& params, int max_model_len) {
+  const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
+  if (params.max_num_batched_tokens > 0) {
+    // Explicit override; still honor the >= max_num_seqs invariant.
+    return std::max(params.max_num_batched_tokens, seqs);
+  }
+  int budget = vllm::SchedulerConfig::kDefaultMaxNumBatchedTokens;  // 2048
+  // Never exceed the whole workload's ceiling (tiny-model no-op preservation).
+  const long ceiling = static_cast<long>(max_model_len) * seqs;
+  if (ceiling > 0 && static_cast<long>(budget) > ceiling) {
+    budget = static_cast<int>(ceiling);
+  }
+  return std::max(budget, seqs);
+}
+
 }  // namespace
 
 bool LoadedEngine::EnsureNoneHash() {
@@ -68,11 +96,12 @@ bool LoadedEngine::EnsureNoneHash() {
   return true;
 }
 
-vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(int max_model_len,
-                                                        int max_num_seqs) {
+vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
+    int max_model_len, int max_num_seqs, int max_num_batched_tokens) {
   vllm::SchedulerConfig cfg;
   cfg.max_num_seqs = max_num_seqs;
-  cfg.max_num_batched_tokens = max_model_len * max_num_seqs;
+  // Bounded per-step budget (chunked prefill). See ResolveMaxNumBatchedTokens.
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
   cfg.enable_chunked_prefill = true;
   cfg.max_model_len = max_model_len;
   cfg.watermark = 0.0;
@@ -121,15 +150,15 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            params.num_blocks > 0 ? params.num_blocks : 256)),
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
-                     params.max_num_seqs > 0 ? params.max_num_seqs : 8),
+                     params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+                     ResolveMaxNumBatchedTokens(params, max_model_len_)),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *moe_weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
-              max_model_len_ * (params.max_num_seqs > 0 ? params.max_num_seqs
-                                                        : 8)),
+              ResolveMaxNumBatchedTokens(params, max_model_len_)),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
@@ -158,15 +187,15 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                            params.num_blocks > 0 ? params.num_blocks : 256)),
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
-                     params.max_num_seqs > 0 ? params.max_num_seqs : 8),
+                     params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+                     ResolveMaxNumBatchedTokens(params, max_model_len_)),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *dense_weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
-              max_model_len_ * (params.max_num_seqs > 0 ? params.max_num_seqs
-                                                        : 8)),
+              ResolveMaxNumBatchedTokens(params, max_model_len_)),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),

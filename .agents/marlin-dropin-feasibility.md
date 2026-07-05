@@ -174,3 +174,59 @@ two lifted launchers, the NVFP4 kernel instantiation, and the load-time repack.
   so the expectation is positive, but it must be *measured*, not assumed.
 - Probe artifacts on the box: `~/work/marlin-probe/` (staged csrc + generated
   kernels + compiled `.o`s); dense run harness `/tmp/marlin_nvfp4_run.py`.
+
+---
+
+## 7. STEP 1-2 DONE + kernel proven BIT-EXACT (branch `feature/marlin-nvfp4`)
+
+**2026-07-05, GB10 sm_121a, CUDA 13.0.** Executed the lift:
+
+- **Vendored** the torch-free Marlin slice into `src/vt/cuda/marlin/` (see
+  porting-inventory §9.10). The ONLY torch coupling (`STD_TORCH_CHECK`) is
+  replaced by `vt_marlin_check.h`. `marlin_mm_moe.cu` = `ops.cu:1-542` (the
+  `marlin_mm` dispatcher); the torch launcher (`:543`) is dropped for a thin
+  vt::Tensor launcher. Generated the **NVFP4-bf16-only** instantiation (15
+  configs) via a trimmed `generate_kernels.py` — the selector references only
+  the kernels we compile.
+- **`vt::MoeGroupedGemmNvfp4Marlin`** (`src/vt/cuda/cuda_moe_marlin.cu`) +
+  OpId/`MoeMarlinArgs`/Fn/dispatcher in `ops.{h,cpp}`. Mirrors the NVFP4 branch
+  of `moe_wna16_marlin_gemm` (no act-order/zp/bias/8-bit-act branches; group
+  size 16, bf16 act/out, `use_fp32_reduce`).
+- **CMake gate `VLLM_CPP_MARLIN`** (sm_12xa). Critical flag:
+  `-static-global-template-stub=false` — nvcc 13 gives `__global__` template
+  instantiations *static* linkage by default, so the `Marlin<>` addresses taken
+  in the dispatcher's `kernel_selector.h` are **undefined at link** across TUs
+  (reproduced on GB10). With the flag, cross-TU linkage resolves.
+
+**Build**: the full in-tree CUDA build (`-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a`) is GREEN with Marlin ON — `libvllm` + all
+test executables link (cross-TU `Marlin<>` symbols resolve in-tree). 0 errors.
+
+**Correctness (unit)**: `tools/marlin/` — vLLM's own repack
+(`prepare_nvfp4_moe_layer_for_marlin` recipe) + `moe_wna16_marlin_gemm` golden
+vs OUR vendored `marlin_mm` on the IDENTICAL repacked inputs:
+```
+cosine=1.00000238  rel_err=0.000e+00  bitexact_frac=1.0000  max_abs_diff=0
+VERDICT: BIT-EXACT
+```
+The kernel lift is numerically proven. The kernel is retired as a risk.
+
+### STILL PENDING (the branch is NOT merged — kernel proven, integration not)
+1. **Load-time repack in C++** (the crux, now fully de-risked by the harness).
+   Mirror `prepare_nvfp4_moe_layer_for_marlin` (`marlin_utils_fp4.py`):
+   per-expert `gptq_marlin_repack(qweight=w[i].view(int32).T, size_k, size_n,
+   num_bits=4)`; scales `marlin_permute_scales(s=scale[i].T, size_k, size_n,
+   group_size=16)` → `nvfp4_marlin_process_scales(·, scale_factor)` with
+   `scale_factor=_nvfp4_compute_scale_factor(all_scales)`; global
+   `nvfp4_marlin_process_global_scale(scale_2) / scale_factor`. For the 35B
+   (K=2048 %128==0, I=512 %64==0) NO padding is needed. **Vendor
+   `gptq_marlin_repack.cu`/`awq_marlin_repack.cu` (gptq_marlin_moe_repack)
+   torch-free the same way** rather than reimplement the interleave permutation.
+2. **`moe_align_block_size`** port (produces sorted_token_ids / expert_ids /
+   num_tokens_past_padded) — vendor `csrc/moe/moe_align_sum_kernels.cu`.
+3. **Wire** into `qwen3_5.cpp` MoE block: repack the resident fp4 expert weights
+   at load, swap the 3 `vt::MoeGroupedGemmNvfp4` call sites for
+   `vt::MoeGroupedGemmNvfp4Marlin` gated `VT_NVFP4_MARLIN=1`.
+4. **35B `test_qwen36_paged_engine` 16/16** token-for-token, 27B unaffected.
+5. **A/B**: Marlin MoE-GEMM TFLOPS + 35B total/output/TTFT/TPOT before→after +
+   vs `vllm bench throughput` (was 5.18×).

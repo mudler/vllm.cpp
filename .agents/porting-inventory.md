@@ -335,6 +335,32 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    W4A16 (never the sm120a fp4xfp4 kernel — grounded in `modelopt.py` MIXED_PRECISION
    per-layer resolve).
 
+10. **Vendored Marlin (NVFP4 W4A16 grouped-MoE GEMM — the 35B experts)**:
+    `src/vt/cuda/marlin/` is a torch-free 1:1 vendor of vLLM's
+    `moe/marlin_moe_wna16` @ e24d1b24 (`marlin_template.h`, `marlin.cuh`,
+    `marlin_dtypes.cuh`, `dequant.h`, `marlin_mma.h`, `kernel.h`,
+    `core/scalar_type.hpp`, + the generated NVFP4-bf16 instantiation). The ONLY
+    change is the ONE torch coupling: `STD_TORCH_CHECK` (from
+    `<torch/headeronly/util/Exception.h>`) → `vt_marlin_check.h` (a throwing
+    macro). `marlin_mm_moe.cu` = vLLM `ops.cu:1-542` (the `marlin_mm` dispatcher);
+    the torch host launcher (`moe_wna16_marlin_gemm:543`) is replaced by the
+    torch-free `vt::MoeGroupedGemmNvfp4Marlin` (`src/vt/cuda/cuda_moe_marlin.cu`)
+    mirroring the NVFP4 branch (`b_type=kFE2M1f`, `s_type=kFE4M3fn`,
+    `group_blocks=1`, bf16 act/out). Gated `VT_MARLIN_NVFP4` (CMake
+    `VLLM_CPP_MARLIN`, sm_12xa). The two vendored TUs build with
+    `-static-global-template-stub=false` (nvcc 13 makes `__global__` template
+    instantiations static by default → undefined cross-TU refs at link; verified
+    on GB10), `-isystem` (warning isolation), `--expt-relaxed-constexpr`.
+    **Verified GB10 sm_121a (2026-07-05): the vendored `marlin_mm` is BIT-EXACT
+    vs vLLM's own `moe_wna16_marlin_gemm`** (rel_err=0, `tools/marlin/`). This is
+    the "vendor a proven kernel when we can't match it" clause of §9.1: the
+    hand-written wmma MoE GEMM ran ~15% of peak; Marlin is vLLM's tuned M-small
+    W4A16 kernel. STILL PENDING (branch `feature/marlin-nvfp4`, not merged): the
+    C++ load-time repack (mirror `prepare_nvfp4_moe_layer_for_marlin` —
+    `gptq_marlin_moe_repack` + `marlin_permute_scales` +
+    `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
+    port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

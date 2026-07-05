@@ -71,6 +71,24 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
       q, out, act, weight_packed, weight_scale, weight_scale_2);
 }
 
+void MatmulFp8(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight,
+               float weight_scale) {
+  VT_CHECK(act.rank == 2 && weight.rank == 2 && out.rank == 2,
+           "matmul_fp8: act/weight/out must be rank-2");
+  const int64_t m = act.shape[0], k = act.shape[1], n = weight.shape[0];
+  VT_CHECK(weight.shape[1] == k,
+           "matmul_fp8: weight must be [N, K] (one fp8 byte per element, K = act inner dim)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_fp8: out must be [M, N]");
+  VT_CHECK(IsFloat(act.dtype) && IsOutFloat(out.dtype), "matmul_fp8: float act, f32/bf16 out");
+  VT_CHECK(weight.dtype == DType::kI8, "matmul_fp8: weight must be i8 (raw fp8-e4m3 bytes)");
+  VT_CHECK(act.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "matmul_fp8: contiguous tensors required");
+  VT_CHECK(act.device == q.device && weight.device == q.device && out.device == q.device,
+           "matmul_fp8: device mismatch (act/weight/out/queue)");
+  reinterpret_cast<MatmulFp8Fn>(GetOp(OpId::kMatmulFp8, q.device.type))(q, out, act, weight,
+                                                                        weight_scale);
+}
+
 void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
                     float input_global_scale_inv) {
   VT_CHECK(x.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,

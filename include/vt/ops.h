@@ -34,6 +34,7 @@ enum class OpId : uint8_t {
   kApplyTokenMask,
   kApplyAllowedTokenIds,
   kMatmulNvfp4,
+  kMatmulFp8,
   kScaledFp4Quant,
   kMatmulNvfp4Fp4,
   kMoeGroupedGemmNvfp4,
@@ -128,6 +129,8 @@ struct MoeRouterTopKArgs {
 using MatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MatmulNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using MatmulFp8Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
 using ScaledFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
 using MatmulNvfp4Fp4Fn =
@@ -227,6 +230,25 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // is DequantNvfp4ToBf16 + Matmul).
 void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
                  const Tensor& weight_scale, float weight_scale_2);
+
+// out[M,N] = act[M,K] @ dequant(w).T — the per-tensor FP8 (W8A16) dequant-GEMM.
+// The fp8 weight is read DIRECTLY from device memory and dequantized on the fly
+// in the kernel (no host bf16 weight materialization); it is the drop-in
+// equivalent of Matmul(act, DequantFp8ToBf16(w).T) but with the fp8 weight kept
+// resident on-device (halves its bandwidth AND memory vs the bf16 field).
+//
+// The weight is a torch Linear weight [N=out_features, K=in_features] stored as
+// raw IEEE fp8-e4m3fn bytes (one byte per element, NOT packed, NOT transposed):
+//   weight [N, K]  i8 bytes: each byte an fp8-e4m3fn code.
+//   weight_scale   per-tensor f32 scale, multiplied.
+// Decode = F32ToBF16(f8_e4m3(byte) * weight_scale) — bit-for-bit the value
+// vllm::DequantFp8ToBf16 stores (the authoritative reference), so this GEMM and
+// Matmul(act, DequantFp8ToBf16(w).T) differ only in K-reduction order (matmul
+// tolerance), not in the per-element product. K has no alignment constraint
+// (byte-per-element). act [M,K] f32/bf16, out [M,N] f32/bf16, f32 accumulation.
+// CPU + CUDA.
+void MatmulFp8(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight,
+               float weight_scale);
 
 // --- TRUE W4A4 (fp4 activations x fp4 weights) — the 27B path (notes §7). Mirror
 // of vllm's dynamic activation quant + cutlass_scaled_fp4_mm_sm120a.

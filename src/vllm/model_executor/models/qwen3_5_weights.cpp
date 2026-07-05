@@ -3,6 +3,7 @@
 // (.agents/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -114,26 +115,59 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
+// fp8-resident opt-in toggle (default OFF). The default dequants the fp8 attn/
+// GDN projections to bf16 AT LOAD (LoadFp8Transposed) and runs the cublas/vt
+// bf16 GEMM — the historically-fastest path. VT_FP8_RESIDENT=1 keeps the fp8
+// bytes resident and dequants in the vt::MatmulFp8 GEMV (half the weight
+// bandwidth AND memory), which is bit-identical but MEASURED SLOWER on GB10: the
+// hand-written W8A16 GEMV does not beat cublas bf16 gemvx for these projections
+// (they are a small share of decode, and M=1 decode is launch/latency-bound —
+// see the M2.x fp8-resident A/B). Kept opt-in for future kernel work; default
+// preserves the fast path so main is not regressed.
+bool Fp8ResidentEnabled() {
+  const char* e = std::getenv("VT_FP8_RESIDENT");
+  return e != nullptr && e[0] == '1';
+}
+
 // Per-tensor FP8 projection `<proj>.weight` [out,in] + `<proj>.weight_scale`
-// scalar -> owned bf16 [in, out] (dequant then transpose).
-OwnedTensor LoadFp8Transposed(const TensorResolver& get,
-                              const std::string& proj) {
+// scalar -> owned bf16 [in, out] (dequant then transpose). The A=OFF leg of the
+// fp8-resident toggle (pre-M2.x behavior).
+OwnedTensor LoadFp8Transposed(const TensorResolver& get, const std::string& proj) {
+  const StTensor& w = get(proj + ".weight");
+  VT_CHECK(w.dtype == "F8_E4M3",
+           "qwen3_5 weights: expected F8_E4M3 for " + proj + ".weight");
+  VT_CHECK(w.shape.size() == 2, "qwen3_5 weights: expected 2-D weight for " + proj);
+  const int64_t out_dim = w.shape[0];
+  const int64_t in_dim = w.shape[1];
+  const float scale = ReadF32Scalar(get(proj + ".weight_scale"));
+  std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
+  DequantFp8ToBf16(w.data, scale, out_dim * in_dim, dq.data());
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+  TransposeBf16(dq.data(), out_dim, in_dim, reinterpret_cast<uint16_t*>(o.bytes.data()));
+  return o;
+}
+
+// Per-tensor FP8 projection `<proj>.weight` F8_E4M3 [out,in] + `.weight_scale`
+// scalar -> RAW fp8-resident Fp8Weight (no dequant, no transpose: the bytes are
+// kept in the on-disk [N=out, K=in] orientation vt::MatmulFp8 reads directly).
+// The fp8-resident analogue of LoadNvfp4Raw: halves the projection's device
+// memory (fp8 = 1/2 bf16) and defers the dequant into the decode GEMV kernel,
+// bit-for-bit vllm::DequantFp8ToBf16.
+Fp8Weight LoadFp8Raw(const TensorResolver& get, const std::string& proj) {
   const StTensor& w = get(proj + ".weight");
   VT_CHECK(w.dtype == "F8_E4M3",
            "qwen3_5 weights: expected F8_E4M3 for " + proj + ".weight");
   VT_CHECK(w.shape.size() == 2,
            "qwen3_5 weights: expected 2-D weight for " + proj);
-  const int64_t out_dim = w.shape[0];
-  const int64_t in_dim = w.shape[1];
-  const float scale = ReadF32Scalar(get(proj + ".weight_scale"));
-
-  std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
-  DequantFp8ToBf16(w.data, scale, out_dim * in_dim, dq.data());
-
-  OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(dq.data(), out_dim, in_dim,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
-  return o;
+  Fp8Weight r;
+  r.n = w.shape[0];
+  r.k = w.shape[1];
+  r.scale = ReadF32Scalar(get(proj + ".weight_scale"));
+  r.packed = MakeOwned(vt::DType::kI8, {r.n, r.k});
+  VT_CHECK(w.nbytes == r.packed.bytes.size(),
+           "qwen3_5 weights: fp8 byte-size mismatch for " + proj);
+  std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  return r;
 }
 
 // NVFP4 W4A16 projection `<proj>.weight` U8 [out,in/2] + `.weight_scale` F8
@@ -174,9 +208,17 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  g.in_proj_qkv = LoadFp8Transposed(get, la + "in_proj_qkv");
-  g.in_proj_z = LoadFp8Transposed(get, la + "in_proj_z");
-  g.out_proj = LoadFp8Transposed(get, la + "out_proj");
+  // fp8-resident (35B W8A16): kept raw fp8, dequant deferred into the GEMV.
+  // VT_FP8_RESIDENT=0 restores dequant-at-load into the bf16 fields (A/B).
+  if (Fp8ResidentEnabled()) {
+    g.in_proj_qkv_fp8 = LoadFp8Raw(get, la + "in_proj_qkv");
+    g.in_proj_z_fp8 = LoadFp8Raw(get, la + "in_proj_z");
+    g.out_proj_fp8 = LoadFp8Raw(get, la + "out_proj");
+  } else {
+    g.in_proj_qkv = LoadFp8Transposed(get, la + "in_proj_qkv");
+    g.in_proj_z = LoadFp8Transposed(get, la + "in_proj_z");
+    g.out_proj = LoadFp8Transposed(get, la + "out_proj");
+  }
   g.in_proj_b = LoadBf16Transposed(get, la + "in_proj_b.weight");
   g.in_proj_a = LoadBf16Transposed(get, la + "in_proj_a.weight");
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
@@ -195,10 +237,19 @@ FullAttnLayerWeights LoadAttn(const TensorResolver& get,
                               const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  a.q_proj = LoadFp8Transposed(get, sa + "q_proj");
-  a.k_proj = LoadFp8Transposed(get, sa + "k_proj");
-  a.v_proj = LoadFp8Transposed(get, sa + "v_proj");
-  a.o_proj = LoadFp8Transposed(get, sa + "o_proj");
+  // fp8-resident (35B W8A16): kept raw fp8, dequant deferred into the GEMV.
+  // VT_FP8_RESIDENT=0 restores dequant-at-load into the bf16 fields (A/B).
+  if (Fp8ResidentEnabled()) {
+    a.q_proj_fp8 = LoadFp8Raw(get, sa + "q_proj");
+    a.k_proj_fp8 = LoadFp8Raw(get, sa + "k_proj");
+    a.v_proj_fp8 = LoadFp8Raw(get, sa + "v_proj");
+    a.o_proj_fp8 = LoadFp8Raw(get, sa + "o_proj");
+  } else {
+    a.q_proj = LoadFp8Transposed(get, sa + "q_proj");
+    a.k_proj = LoadFp8Transposed(get, sa + "k_proj");
+    a.v_proj = LoadFp8Transposed(get, sa + "v_proj");
+    a.o_proj = LoadFp8Transposed(get, sa + "o_proj");
+  }
   a.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
   return a;

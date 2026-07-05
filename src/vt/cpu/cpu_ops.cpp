@@ -40,6 +40,28 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   }
 }
 
+// Per-tensor FP8 (W8A16) dequant-GEMM: out[m,n] = sum_k act[m,k] *
+// bf16(f8_e4m3(w[n,k]) * scale), the fp8 weight [N=out, K=in] read raw and
+// dequantized on the fly. Bit-for-bit vllm::DequantFp8ToBf16 (round through bf16
+// before the multiply), so it equals Matmul(act, DequantFp8ToBf16(w).T) modulo
+// K-reduction order. Fp8ToF32 is defined below (shared with the fp4 path).
+float Fp8ToF32(uint8_t byte);
+void MatmulFp8Kernel(Queue&, Tensor& out, const Tensor& act, const Tensor& weight, float scale) {
+  const int64_t m = act.shape[0], k = act.shape[1], n = weight.shape[0];
+  const auto* w = weight.Ptr<uint8_t>();
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < n; ++j) {
+      const uint8_t* wrow = w + j * k;
+      float acc = 0.0f;
+      for (int64_t p = 0; p < k; ++p) {
+        const float wv = BF16ToF32(F32ToBF16(Fp8ToF32(wrow[p]) * scale));
+        acc += LoadF32(act, i * k + p) * wv;
+      }
+      StoreF32(out, i * n + j, acc);
+    }
+  }
+}
+
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -642,6 +664,8 @@ struct Registrar {
     // registration contract at compile time.
     RegisterOp(OpId::kMatmul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
+    RegisterOp(OpId::kMatmulFp8, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFp8Fn>(&MatmulFp8Kernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,

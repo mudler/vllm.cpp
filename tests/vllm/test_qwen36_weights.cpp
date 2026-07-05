@@ -46,6 +46,15 @@ uint16_t Bf16At(const vllm::OwnedTensor& t, int64_t i) {
   return reinterpret_cast<const uint16_t*>(t.bytes.data())[i];
 }
 
+// Dequant the raw fp8 byte at flat index i of an fp8-resident weight to its
+// bf16 bit pattern (per-tensor scale) — the deferred-dequant analogue of the
+// old transposed-bf16 golden checks.
+uint16_t Fp8DequantAt(const vllm::Fp8Weight& w, int64_t i) {
+  uint16_t out = 0;
+  vllm::DequantFp8ToBf16(w.packed.bytes.data() + i, w.scale, 1, &out);
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
@@ -142,7 +151,10 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(dq[1 * in_dim + 5] == 0x3CE1);
   }
 
-  SUBCASE("transpose + full-layer load: GDN (layer 0) and full-attn (layer 3)") {
+  SUBCASE("default (bf16 dequant-at-load) full-layer load: GDN + full-attn") {
+    // Default VT_FP8_RESIDENT off: fp8 attn/GDN projections are dequant'd to bf16
+    // at load and transposed to Matmul-B layout (the historically-fast path).
+    unsetenv("VT_FP8_RESIDENT");
     // A small expert count keeps the test fast; the loop/shared-expert/router
     // path is what we're proving, not all 256 experts (that is Task 5).
     const int64_t kExperts = 4;
@@ -150,10 +162,11 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     const vllm::Qwen3_5MoeLayerWeights gdn =
         vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, kExperts);
     CHECK(gdn.is_linear_attention);
-    // in_proj_qkv transposed to [H=2048, conv_dim=8192].
+    // in_proj_qkv transposed to [H=2048, conv_dim=8192]; fp8 field left EMPTY.
     REQUIRE(gdn.gdn.in_proj_qkv.rank == 2);
     CHECK(gdn.gdn.in_proj_qkv.shape[0] == 2048);
     CHECK(gdn.gdn.in_proj_qkv.shape[1] == 8192);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.Empty());
     // conv1d collapsed to [conv_dim, K].
     CHECK(gdn.gdn.conv1d_weight.shape[0] == 8192);
     CHECK(gdn.gdn.conv1d_weight.shape[1] == 4);
@@ -162,30 +175,26 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(gdn.gdn.a_log.shape[0] == 32);
     // norm over Dv=128.
     CHECK(gdn.gdn.norm_weight.shape[0] == 128);
-    // Router gate transposed to [H, E].
+    // Router gate transposed to [H, E], transpose value-preserving (golden 0x3BB3).
     CHECK(gdn.moe.router_gate.shape[0] == 2048);
     CHECK(gdn.moe.router_gate.shape[1] == 256);
-    // Router gate transpose is value-preserving: gate[0,0] on disk == [0,0]
-    // after transpose (corner is invariant). Golden 0x3BB3.
     CHECK(Bf16At(gdn.moe.router_gate, 0) == 0x3BB3);
-    // Expert 0 down_proj transposed to [I=512, H=2048]; dequant[o,i] -> [i,o],
-    // so pre-transpose dq[5,17] lands at [17,5] = 17*out(2048)+5... but this is
-    // the transposed buffer [512,2048]; index = 17*2048 + 5.
-    REQUIRE(gdn.moe.expert_down.size() == static_cast<size_t>(kExperts));
-    CHECK(gdn.moe.expert_down[0].shape[0] == 512);
-    CHECK(gdn.moe.expert_down[0].shape[1] == 2048);
-    CHECK(Bf16At(gdn.moe.expert_down[0], 17 * 2048 + 5) == 0x3BCB);
-    CHECK(Bf16At(gdn.moe.expert_down[0], 0) == 0x3C7E);
+    // Expert down_proj is NVFP4 fp4-resident (M2.2b): raw [N=H=2048, K=I=512],
+    // the bf16 expert_down field left EMPTY (the MoE fp4-resident refactor moved
+    // these to the _fp4 fields).
+    CHECK(gdn.moe.expert_down.empty());
+    REQUIRE(gdn.moe.expert_down_fp4.size() == static_cast<size_t>(kExperts));
+    CHECK(gdn.moe.expert_down_fp4[0].n == 2048);
+    CHECK(gdn.moe.expert_down_fp4[0].k == 512);
 
     const vllm::Qwen3_5MoeLayerWeights attn =
         vllm::LoadQwen3_5MoeLayer(get, "full_attention", 3, kExperts);
     CHECK_FALSE(attn.is_linear_attention);
-    // q_proj transposed to [H=2048, 2*Hq*Dh=8192].
+    // q_proj transposed to [H=2048, 2*Hq*Dh=8192]; golden bf16 corners.
     CHECK(attn.attn.q_proj.shape[0] == 2048);
     CHECK(attn.attn.q_proj.shape[1] == 8192);
-    // q_proj transpose value-preserving at the corner: dq[0,0] golden 0x3C0A.
+    CHECK(attn.attn.q_proj_fp8.Empty());
     CHECK(Bf16At(attn.attn.q_proj, 0) == 0x3C0A);
-    // dq[1,5] pre-transpose -> transposed[5,1] = 5*out(8192)+1.
     CHECK(Bf16At(attn.attn.q_proj, 5 * 8192 + 1) == 0x3CE1);
     // qk-norm over head_dim=256.
     CHECK(attn.attn.q_norm.shape[0] == 256);
@@ -193,5 +202,37 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     // o_proj transposed to [Hq*Dh=4096, H=2048].
     CHECK(attn.attn.o_proj.shape[0] == 4096);
     CHECK(attn.attn.o_proj.shape[1] == 2048);
+  }
+
+  SUBCASE("fp8-resident (VT_FP8_RESIDENT=1) full-layer load: raw fp8 kept") {
+    // Opt-in fp8-resident: the fp8 projections are kept RAW [N=out, K=in] (no
+    // dequant, no transpose); the bf16 fields are EMPTY. Deferred dequant is
+    // bit-identical to the load-dequant (Fp8DequantAt reproduces the golden bf16).
+    setenv("VT_FP8_RESIDENT", "1", 1);
+    const int64_t kExperts = 4;
+
+    const vllm::Qwen3_5MoeLayerWeights gdn =
+        vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, kExperts);
+    CHECK(gdn.gdn.in_proj_qkv.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_qkv_fp8.Empty());
+    CHECK(gdn.gdn.in_proj_qkv_fp8.n == 8192);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.k == 2048);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.scale > 0.0F);
+
+    const vllm::Qwen3_5MoeLayerWeights attn =
+        vllm::LoadQwen3_5MoeLayer(get, "full_attention", 3, kExperts);
+    CHECK(attn.attn.q_proj.Empty());
+    REQUIRE_FALSE(attn.attn.q_proj_fp8.Empty());
+    CHECK(attn.attn.q_proj_fp8.n == 8192);
+    CHECK(attn.attn.q_proj_fp8.k == 2048);
+    // Byte [0,0] dequants to the same golden 0x3C0A as the load-dequant path.
+    CHECK(Fp8DequantAt(attn.attn.q_proj_fp8, 0 * 2048 + 0) == 0x3C0A);
+    // Reference dq[1,5] -> raw [n=1,k=5] = 1*2048 + 5.
+    CHECK(Fp8DequantAt(attn.attn.q_proj_fp8, 1 * 2048 + 5) == 0x3CE1);
+    CHECK(attn.attn.o_proj.Empty());
+    REQUIRE_FALSE(attn.attn.o_proj_fp8.Empty());
+    CHECK(attn.attn.o_proj_fp8.n == 2048);
+    CHECK(attn.attn.o_proj_fp8.k == 4096);
+    unsetenv("VT_FP8_RESIDENT");
   }
 }

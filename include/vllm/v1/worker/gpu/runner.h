@@ -57,6 +57,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -168,6 +169,18 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Build the [num_reqs, num_cols] committed block-table slice for a KV group.
   std::vector<int32_t> gather_block_table(int group_id, int num_reqs,
                                           int* num_cols) const;
+  // Rewrite the GDN group's block-table col 0 (the mamba-state pool block-id,
+  // scattered over the shared [0, num_blocks) attention pool) into a COMPACT
+  // per-sequence state slot in [0, gdn_state_slots_). The GDN mamba state is one
+  // recurrent state per SEQUENCE (vLLM MambaSpec "none": block_table is
+  // (#reqs, 1); max_memory_usage_bytes == 1 page/seq), so the state cache is
+  // sized by max_num_reqs — NOT the attention num_blocks (which grows with
+  // concurrency×seq_len and made the f32 ssm_state the dominant memory
+  // consumer). The map is keyed on the pool block-id (stable per sequence across
+  // steps + condense), so states persist correctly; slots of finished sequences
+  // are reclaimed. Only col 0 is read by the GDN builder (state indices).
+  void remap_gdn_state_slots(std::vector<int32_t>& gdn_bt, int gdn_cols,
+                             int num_reqs);
 
   const HfConfig& config_;
   // Exactly one of {moe_weights_, dense_weights_} is non-null, selecting the MoE
@@ -183,6 +196,15 @@ class GPUModelRunner final : public ModelRunnerBase {
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
   int64_t num_blocks_ = 0;
+  // Persistent-batch capacity = max concurrent sequences. The GDN mamba-state
+  // cache is sized by this (one recurrent state per sequence), decoupled from
+  // the attention num_blocks. See remap_gdn_state_slots.
+  int max_num_reqs_ = 0;
+  int64_t gdn_state_slots_ = 0;
+  // Compact GDN state-slot allocator: pool block-id (block_table col 0) -> slot
+  // in [0, gdn_state_slots_); free list of unused slots.
+  std::unordered_map<int32_t, int32_t> gdn_slot_of_block_;
+  std::vector<int32_t> gdn_free_slots_;
 
   // Owned KV-cache backing storage (host at T0) + the views the forward reads.
   std::vector<std::vector<float>> full_attn_buf_;  // per full-attn layer

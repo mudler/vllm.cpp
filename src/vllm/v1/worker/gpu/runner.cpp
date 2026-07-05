@@ -13,8 +13,10 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
+#include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
 
 namespace vllm::v1 {
@@ -226,6 +228,7 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
+  max_num_reqs_ = max_num_reqs;
   initialize_kv_cache(kv_cache_config);
   // Eager Marlin NVFP4 repack (VT_NVFP4_MARLIN=1): repack all experts + dense
   // shared/lm_head weights at LOAD time so the first request pays no first-touch
@@ -245,11 +248,21 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    static_cast<int>(config.vocab_size),
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
+  max_num_reqs_ = max_num_reqs;
   initialize_kv_cache(kv_cache_config);
 }
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   num_blocks_ = kv_cache_config.num_blocks;
+  // GDN mamba-state slots = max concurrent sequences (one recurrent state per
+  // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
+  // a test path that skipped the ctor arg) by falling back to num_blocks.
+  gdn_state_slots_ = max_num_reqs_ > 0 ? max_num_reqs_ : num_blocks_;
+  gdn_slot_of_block_.clear();
+  gdn_free_slots_.clear();
+  gdn_free_slots_.reserve(static_cast<size_t>(gdn_state_slots_));
+  for (int64_t s = gdn_state_slots_ - 1; s >= 0; --s)
+    gdn_free_slots_.push_back(static_cast<int32_t>(s));
 
   // Resolve the full-attn + GDN(mamba) KV group ids (T0 gate models: exactly one
   // of each). The block-table group order == kv_cache_groups order.
@@ -294,9 +307,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
     if (is_gdn) {
       ssm_buf_.emplace_back(
-          static_cast<size_t>(num_blocks_ * Hv * Dv * Dk), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk), 0.0f);
       conv_buf_.emplace_back(
-          static_cast<size_t>(num_blocks_ * conv_dim * (Kw - 1)), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)), 0.0f);
     } else {
       full_attn_buf_.emplace_back(
           static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh), 0.0f);
@@ -319,9 +332,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
     gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), vt::DType::kF32,
-                                          dev, {num_blocks_, Hv, Dv, Dk});
+                                          dev, {gdn_state_slots_, Hv, Dv, Dk});
     gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), vt::DType::kF32,
-                                           dev, {num_blocks_, conv_dim, Kw - 1});
+                                           dev,
+                                           {gdn_state_slots_, conv_dim, Kw - 1});
     gdn_state_.push_back(gs);
   }
 }
@@ -336,6 +350,43 @@ std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
   const size_t n = static_cast<size_t>(num_reqs) * static_cast<size_t>(cols);
   return std::vector<int32_t>(dev.begin(),
                               dev.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+void GPUModelRunner::remap_gdn_state_slots(std::vector<int32_t>& gdn_bt,
+                                           int gdn_cols, int num_reqs) {
+  if (gdn_cols <= 0 || num_reqs <= 0) return;
+  // The persistent batch holds EVERY live sequence, so col 0 over [0, num_reqs)
+  // is exactly the set of alive mamba-state pool block-ids this step.
+  std::unordered_set<int32_t> alive;
+  alive.reserve(static_cast<size_t>(num_reqs));
+  for (int r = 0; r < num_reqs; ++r)
+    alive.insert(gdn_bt[static_cast<size_t>(r) * static_cast<size_t>(gdn_cols)]);
+  // Reclaim slots of sequences that have finished (their block-id is gone).
+  for (auto it = gdn_slot_of_block_.begin(); it != gdn_slot_of_block_.end();) {
+    if (alive.find(it->first) == alive.end()) {
+      gdn_free_slots_.push_back(it->second);
+      it = gdn_slot_of_block_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // Assign/reuse a compact slot per live sequence and rewrite col 0 in place.
+  for (int r = 0; r < num_reqs; ++r) {
+    const size_t off = static_cast<size_t>(r) * static_cast<size_t>(gdn_cols);
+    const int32_t blk = gdn_bt[off];
+    auto it = gdn_slot_of_block_.find(blk);
+    int32_t slot;
+    if (it != gdn_slot_of_block_.end()) {
+      slot = it->second;
+    } else {
+      VT_CHECK(!gdn_free_slots_.empty(),
+               "GDN state slots exhausted: live sequences exceed max_num_reqs");
+      slot = gdn_free_slots_.back();
+      gdn_free_slots_.pop_back();
+      gdn_slot_of_block_.emplace(blk, slot);
+    }
+    gdn_bt[off] = slot;
+  }
 }
 
 std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
@@ -370,8 +421,13 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // GDN KV group metadata: the same step over the GDN group's block table,
   // segmented decode-first by the GDN builder (M1.6 Task 4).
   int gdn_cols = 0;
-  const std::vector<int32_t> gdn_bt =
+  std::vector<int32_t> gdn_bt =
       gather_block_table(gdn_group_id_, num_reqs, &gdn_cols);
+  // Remap the scattered mamba-state pool block-ids (col 0) to compact per-
+  // sequence state slots in [0, gdn_state_slots_), so the GDN state cache is
+  // sized by max_num_reqs (one recurrent state per sequence) rather than the
+  // attention num_blocks. Only col 0 (state indices) is read downstream.
+  remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs);
   const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
       step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);
   GDNAttentionMetadataBuilder gdn_builder;

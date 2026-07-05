@@ -487,7 +487,15 @@ TEST_CASE("runner: 3-request reorder keeps every per-slot field self-consistent"
     const Expect& e = want.at(rid);
     CHECK(am.seq_lens[static_cast<size_t>(i)] == e.seq_len);
     CHECK(am.block_table_tensor[static_cast<size_t>(i * cols)] == e.fa_block);
-    CHECK((*gm.non_spec_state_indices_tensor)[static_cast<size_t>(i)] == e.gdn_state);
+    // GDN state index is now the COMPACT per-sequence state slot
+    // (remap_gdn_state_slots): the raw mamba pool block-id (col 0, scattered
+    // over the shared attention pool) is remapped to a slot in
+    // [0, gdn_state_slots_) assigned in first-appearance order, so the GDN state
+    // cache is sized by max_num_reqs (one recurrent state per sequence) rather
+    // than num_blocks. For a single step of all-new requests that slot is
+    // exactly the batch row i, whichever request landed there.
+    (void)e.gdn_state;
+    CHECK((*gm.non_spec_state_indices_tensor)[static_cast<size_t>(i)] == i);
     CHECK(ib.num_tokens_no_spec[static_cast<size_t>(i)] == e.tokens);
     if (e.seed == 0) {
       CHECK(sm.generators.count(i) == 0);

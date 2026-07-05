@@ -197,6 +197,29 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
       q, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s);
 }
 
+void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                               const Tensor& b_scales, const Tensor& global_scale,
+                               Tensor& workspace, const Tensor& sorted_token_ids,
+                               const Tensor& expert_ids, const Tensor& num_tokens_past_padded,
+                               const Tensor& topk_weights, const MoeMarlinArgs& args) {
+  VT_CHECK(a.rank == 2 && c.rank == 2, "moe_marlin: a/c must be rank-2");
+  VT_CHECK(a.dtype == DType::kBF16 && c.dtype == DType::kBF16, "moe_marlin: a/c must be bf16");
+  VT_CHECK(args.size_k % 16 == 0, "moe_marlin: size_k must be a multiple of 16 (group size)");
+  VT_CHECK(a.shape[0] == args.size_m && a.shape[1] == args.size_k,
+           "moe_marlin: a shape must be [size_m, size_k]");
+  VT_CHECK(b_q_weight.rank == 3, "moe_marlin: b_q_weight must be rank-3 [E, K/16, N*8/pack]");
+  VT_CHECK(expert_ids.dtype == DType::kI32 && sorted_token_ids.dtype == DType::kI32 &&
+               num_tokens_past_padded.dtype == DType::kI32,
+           "moe_marlin: align tensors must be i32");
+  VT_CHECK(global_scale.dtype == DType::kF32 && topk_weights.dtype == DType::kF32,
+           "moe_marlin: global_scale/topk_weights must be f32");
+  VT_CHECK(workspace.dtype == DType::kI32, "moe_marlin: workspace must be i32 (reduction locks)");
+  reinterpret_cast<MoeGroupedGemmNvfp4MarlinFn>(
+      GetOp(OpId::kMoeGroupedGemmNvfp4Marlin, q.device.type))(
+      q, c, a, b_q_weight, b_scales, global_scale, workspace, sorted_token_ids, expert_ids,
+      num_tokens_past_padded, topk_weights, args);
+}
+
 void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
   VT_CHECK(gate.Numel() == out.Numel() && up.Numel() == out.Numel(),
            "moe_silu_mul: out/gate/up must have the same element count");

@@ -46,6 +46,7 @@ enum class OpId : uint8_t {
   kGdnGBeta,
   kGdnConvSplit,
   kSharedExpertGate,
+  kMoeGroupedGemmNvfp4Marlin,
   kCount
 };
 
@@ -140,6 +141,19 @@ using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
+// Marlin NVFP4 W4A16 grouped-MoE GEMM (lift of vLLM moe_wna16_marlin_gemm; see
+// MoeGroupedGemmNvfp4Marlin below). Scalar params travel in MoeMarlinArgs.
+struct MoeMarlinArgs {
+  int moe_block_size = 0;  // vLLM moe_align_block_size block (16..64, or 8)
+  int top_k = 0;
+  int size_m = 0;  // number of tokens (rows of `a`)
+  int size_n = 0;  // output features
+  int size_k = 0;  // input features (contraction; multiple of 16)
+  bool mul_topk_weights = false;  // fold topk_weights into the output (down proj)
+};
+using MoeGroupedGemmNvfp4MarlinFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, Tensor&,
+             const Tensor&, const Tensor&, const Tensor&, const Tensor&, const MoeMarlinArgs&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
@@ -304,6 +318,28 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,
                          const Tensor& scale_ptrs, const Tensor& scale2s);
+
+// MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
+// the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One
+// launch computes the grouped expert projection over all padded (token,expert)
+// blocks. Inputs mirror the NVFP4 branch: b_type=kFE2M1f + s_type=kFE4M3fn,
+// group size 16, bf16 activation/output.
+//   c            [size_m*top_k, size_n] bf16 (out; the per-(token,slot) result)
+//   a            [size_m, size_k]        bf16 (token hidden)
+//   b_q_weight   [E, size_k/16, size_n*8/pack] i32 — Marlin-interleaved fp4
+//                (from the load-time gptq_marlin_moe_repack)
+//   b_scales     [E, size_k/16, size_n]  fp8-e4m3 (processed:
+//                marlin_permute_scales + nvfp4_marlin_process_scales)
+//   global_scale [E]                     f32 (nvfp4_marlin_process_global_scale)
+//   workspace    [>= sms*4 or per-tile]  i32 (zeroed reduction locks)
+//   sorted_token_ids / expert_ids / num_tokens_past_padded / topk_weights:
+//                the moe_align_block_size outputs (int32 / int32 / int32 / f32).
+// CUDA-only (Blackwell sm_12xa; needs the vendored Marlin TUs, VT_MARLIN_NVFP4).
+void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
+                               const Tensor& b_scales, const Tensor& global_scale,
+                               Tensor& workspace, const Tensor& sorted_token_ids,
+                               const Tensor& expert_ids, const Tensor& num_tokens_past_padded,
+                               const Tensor& topk_weights, const MoeMarlinArgs& args);
 
 // out[R,I] = silu(gate[R,I]) * up[R,I]  (moe-semantics.md §4; the fused-MoE
 // element-wise activation between the grouped gate/up and down GEMMs). gate/up

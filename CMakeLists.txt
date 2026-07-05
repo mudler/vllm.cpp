@@ -238,7 +238,8 @@ if(VLLM_CPP_CUDA)
     set(_MARLIN_SRCS
       src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/marlin_mm_moe.cu
       src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu
-      src/vt/cuda/cuda_moe_marlin.cu)
+      src/vt/cuda/cuda_moe_marlin.cu
+      src/vt/cuda/cuda_marlin_repack.cu)
     target_sources(vllm PRIVATE ${_MARLIN_SRCS})
     target_compile_definitions(vllm PUBLIC VT_MARLIN_NVFP4=1)
     set_source_files_properties(${_MARLIN_SRCS} PROPERTIES

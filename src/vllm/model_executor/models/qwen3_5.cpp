@@ -24,6 +24,9 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#ifdef VT_MARLIN_NVFP4
+#include "vt/cuda/marlin_repack.h"
+#endif
 
 namespace vllm {
 namespace {
@@ -140,6 +143,46 @@ MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
   std::lock_guard<std::mutex> lk(mu);
   return cache[w];
 }
+
+#ifdef VT_MARLIN_NVFP4
+// --- Marlin NVFP4 W4A16 MoE: per-layer resident repacked weights (M0.8 drop-in).
+// When VT_NVFP4_MARLIN=1, the routed experts are repacked ONCE at first touch
+// into Marlin's interleaved layout (gptq_marlin_moe_repack + S0E5M3 scales +
+// processed global scales, all bit-exact to vLLM — tools/marlin/repack_*), and
+// the wmma-fp4 fused path is replaced by moe_wna16_marlin_gemm. The original
+// per-expert fp4 device copies are freed after repack (the wmma path is unused
+// when the gate is on) so peak weight memory stays flat. Buffers leak at exit
+// (like the wmma resident / cublasLt workspace).
+struct MoeMarlinResident {
+  void* w_gate = nullptr;  // i32 [E, K/16, N*2]  (gate: size_k=K, size_n=N)
+  void* w_up = nullptr;    // i32 [E, K/16, N*2]
+  void* w_down = nullptr;  // i32 [E, N/16, K*2]  (down: size_k=N, size_n=K)
+  void* s_gate = nullptr;  // fp8 [E, K/16, N]
+  void* s_up = nullptr;
+  void* s_down = nullptr;  // fp8 [E, N/16, K]
+  void* g_gate = nullptr;  // f32 [E]
+  void* g_up = nullptr;
+  void* g_down = nullptr;
+  void* workspace = nullptr;  // i32 [sms]
+  int sms = 0;
+  bool ready = false;
+};
+
+MoeMarlinResident& MoeMarlinResidentFor(const MoeBlockWeights* w) {
+  static std::mutex mu;
+  static std::unordered_map<const MoeBlockWeights*, MoeMarlinResident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[w];
+}
+
+bool MarlinMoeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_NVFP4_MARLIN");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+#endif  // VT_MARLIN_NVFP4
 
 // Owned device allocation + tensor view. On CPU the backend's Alloc/Copy are
 // malloc/memcpy; on CUDA they are cudaMalloc / h2d-d2h on the queue's stream.
@@ -1105,6 +1148,184 @@ DBuf MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 // --- Sparse-MoE block (moe-semantics.md §1-§6). Router top-k over ALL experts,
 // then the ACTIVATED-EXPERT token-gather loop (not O(E)-dense), shared expert
 // with sigmoid gate, and the weighted combine. h [T*H] bf16 -> [T*H] bf16.
+#ifdef VT_MARLIN_NVFP4
+// Build (once) the per-layer resident Marlin repacked experts. Repacks all E
+// routed experts' gate/up/down (weight interleave + S0E5M3 scales + processed
+// global scales) from the resident fp4 buffers, then frees the fp4 originals.
+void BuildMoeMarlinResident(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                            MoeMarlinResident& mr) {
+  const int E = static_cast<int>(cfg.num_experts);
+  const int K = static_cast<int>(cfg.hidden_size);
+  const int N = static_cast<int>(cfg.moe_intermediate_size);
+  void* stream = d.q.handle;
+
+  const int sms = vt::cuda::MarlinDeviceSms(d.q.device.index);
+  mr.sms = sms;
+
+  const size_t wg_i32 = static_cast<size_t>(K / 16) * (N * 2);  // gate/up weight elems
+  const size_t wd_i32 = static_cast<size_t>(N / 16) * (K * 2);  // down weight elems
+  const size_t sg_b = static_cast<size_t>(K / 16) * N;          // gate/up scale bytes
+  const size_t sd_b = static_cast<size_t>(N / 16) * K;          // down scale bytes
+
+  mr.w_gate = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+  mr.w_up = d.b.Alloc(static_cast<size_t>(E) * wg_i32 * 4);
+  mr.w_down = d.b.Alloc(static_cast<size_t>(E) * wd_i32 * 4);
+  mr.s_gate = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+  mr.s_up = d.b.Alloc(static_cast<size_t>(E) * sg_b);
+  mr.s_down = d.b.Alloc(static_cast<size_t>(E) * sd_b);
+  mr.g_gate = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.g_up = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  mr.g_down = d.b.Alloc(static_cast<size_t>(E) * sizeof(float));
+  // marlin_make_workspace_new(device, max_blocks_per_sm=4): sms*4 int32 locks.
+  mr.workspace = d.b.Alloc(static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+
+  // combined_scale_factor: w13 = gate+up jointly (mirror vLLM), w2 = down alone.
+  std::vector<const uint8_t*> gu_bufs;
+  std::vector<size_t> gu_lens;
+  std::vector<const uint8_t*> dn_bufs;
+  std::vector<size_t> dn_lens;
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    gu_bufs.push_back(reinterpret_cast<const uint8_t*>(w.expert_gate_fp4[se].scale.bytes.data()));
+    gu_lens.push_back(w.expert_gate_fp4[se].scale.bytes.size());
+    gu_bufs.push_back(reinterpret_cast<const uint8_t*>(w.expert_up_fp4[se].scale.bytes.data()));
+    gu_lens.push_back(w.expert_up_fp4[se].scale.bytes.size());
+    dn_bufs.push_back(reinterpret_cast<const uint8_t*>(w.expert_down_fp4[se].scale.bytes.data()));
+    dn_lens.push_back(w.expert_down_fp4[se].scale.bytes.size());
+  }
+  const float sf_gu = vt::cuda::MarlinNvfp4CombinedScaleFactor(gu_bufs, gu_lens);
+  const float sf_dn = vt::cuda::MarlinNvfp4CombinedScaleFactor(dn_bufs, dn_lens);
+
+  std::vector<float> gg(E), gu(E), gd(E);
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    Nvfp4Dev g = ResidentNvfp4(d, w.expert_gate_fp4[se]);
+    Nvfp4Dev u = ResidentNvfp4(d, w.expert_up_fp4[se]);
+    Nvfp4Dev dn = ResidentNvfp4(d, w.expert_down_fp4[se]);
+    auto* wg = static_cast<uint32_t*>(mr.w_gate) + se * wg_i32;
+    auto* wu = static_cast<uint32_t*>(mr.w_up) + se * wg_i32;
+    auto* wd = static_cast<uint32_t*>(mr.w_down) + se * wd_i32;
+    auto* sgp = static_cast<uint8_t*>(mr.s_gate) + se * sg_b;
+    auto* sup = static_cast<uint8_t*>(mr.s_up) + se * sg_b;
+    auto* sdp = static_cast<uint8_t*>(mr.s_down) + se * sd_b;
+    const auto* pg = static_cast<const uint8_t*>(g.packed.data);
+    const auto* pu = static_cast<const uint8_t*>(u.packed.data);
+    const auto* pd = static_cast<const uint8_t*>(dn.packed.data);
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wg, pg, K, N);
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wu, pu, K, N);
+    vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, wd, pd, N, K);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(g.scale.data), sgp, K, N,
+                                        sf_gu);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(u.scale.data), sup, K, N,
+                                        sf_gu);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dn.scale.data), sdp, N, K,
+                                        sf_dn);
+    gg[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.expert_gate_fp4[se].scale2, sf_gu);
+    gu[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.expert_up_fp4[se].scale2, sf_gu);
+    gd[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(w.expert_down_fp4[se].scale2, sf_dn);
+  }
+  d.b.Copy(d.q, mr.g_gate, gg.data(), gg.size() * sizeof(float));
+  d.b.Copy(d.q, mr.g_up, gu.data(), gu.size() * sizeof(float));
+  d.b.Copy(d.q, mr.g_down, gd.data(), gd.size() * sizeof(float));
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  d.b.Synchronize(d.q);  // repack done → safe to free fp4 originals
+
+  for (int e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    w.expert_gate_fp4[se].d_packed.reset();
+    w.expert_gate_fp4[se].d_scale.reset();
+    w.expert_up_fp4[se].d_packed.reset();
+    w.expert_up_fp4[se].d_scale.reset();
+    w.expert_down_fp4[se].d_packed.reset();
+    w.expert_down_fp4[se].d_scale.reset();
+  }
+  mr.ready = true;
+}
+
+// Marlin fused MoE block: same router/silu/combine as MoeBlockFusedCuda, but the
+// 3 grouped GEMMs are moe_wna16_marlin_gemm over the resident repacked experts.
+// Marlin's per-pair output layout (row = t*top_k+k) matches dgate/dup/ddown, so
+// MoeSiluMul + MoeCombine are unchanged. Per-pair equivalent to the wmma path
+// (same weight-only fp4 dequant), so token-for-token identical.
+DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                             const Tensor& dh, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+  void* stream = d.q.handle;
+
+  MoeMarlinResident& mr = MoeMarlinResidentFor(&w);
+  if (!mr.ready) BuildMoeMarlinResident(d, w, cfg, mr);
+
+  // Router (identical to MoeBlockFusedCuda).
+  Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] bf16
+  DBuf dlog(d, DType::kBF16, {T, E});
+  vt::Matmul(d.q, dlog.t(), dh, drg);
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+
+  // moe_align_block_size over the router top-k ids.
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(T),
+                                                            static_cast<int>(top_k),
+                                                            static_cast<int>(E));
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(static_cast<int>(T), static_cast<int>(top_k), static_cast<int>(E),
+                                block, &max_tok, &max_blk);
+  DBuf sorted_ids(d, DType::kI32, {max_tok});
+  DBuf expert_ids(d, DType::kI32, {max_blk});
+  DBuf num_pad(d, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(
+      stream, static_cast<const int32_t*>(dtid.t().data), static_cast<int>(T),
+      static_cast<int>(top_k), static_cast<int>(E), block,
+      static_cast<int32_t*>(sorted_ids.t().data), static_cast<int32_t*>(expert_ids.t().data),
+      static_cast<int32_t*>(num_pad.t().data));
+
+  Tensor wg = MakeTensor(mr.w_gate, DType::kI32, d.q.device, {E, H / 16, I * 2});
+  Tensor wu = MakeTensor(mr.w_up, DType::kI32, d.q.device, {E, H / 16, I * 2});
+  Tensor wd = MakeTensor(mr.w_down, DType::kI32, d.q.device, {E, I / 16, H * 2});
+  Tensor sg = MakeTensor(mr.s_gate, DType::kI8, d.q.device, {E, H / 16, I});
+  Tensor su = MakeTensor(mr.s_up, DType::kI8, d.q.device, {E, H / 16, I});
+  Tensor sd = MakeTensor(mr.s_down, DType::kI8, d.q.device, {E, I / 16, H});
+  Tensor gg = MakeTensor(mr.g_gate, DType::kF32, d.q.device, {E});
+  Tensor gu = MakeTensor(mr.g_up, DType::kF32, d.q.device, {E});
+  Tensor gd = MakeTensor(mr.g_down, DType::kF32, d.q.device, {E});
+  Tensor ws = MakeTensor(mr.workspace, DType::kI32, d.q.device, {mr.sms * 4});
+
+  const int bi = block, tki = static_cast<int>(top_k);
+  const int Ti = static_cast<int>(T), Hi = static_cast<int>(H), Ii = static_cast<int>(I);
+  const int Pi = static_cast<int>(P);
+
+  DBuf dgate(d, DType::kBF16, {P, I});
+  DBuf dup_out(d, DType::kBF16, {P, I});
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, dgate.t(), dh, wg, sg, gg, ws, sorted_ids.t(), expert_ids.t(),
+                                num_pad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, tki, Ti, Ii, Hi, false});
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, dup_out.t(), dh, wu, su, gu, ws, sorted_ids.t(),
+                                expert_ids.t(), num_pad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, tki, Ti, Ii, Hi, false});
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup_out.t());
+
+  DBuf ddown(d, DType::kBF16, {P, H});
+  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(d.q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted_ids.t(),
+                                expert_ids.t(), num_pad.t(), dtw.t(),
+                                vt::MoeMarlinArgs{bi, 1, Pi, Hi, Ii, false});
+  Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+
+  DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
+  return dout;
+}
+#endif  // VT_MARLIN_NVFP4
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -1120,8 +1341,12 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // The bf16 / CPU / GGUF reference below keeps the per-expert token-gather
   // path on host (not the capture target); the fused output is per-pair
   // bit-identical to it (same NVFP4 decode).
-  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA)
+  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA) {
+#ifdef VT_MARLIN_NVFP4
+    if (MarlinMoeEnabled()) return MoeBlockFusedMarlinCuda(d, w, cfg, dh, T);
+#endif
     return MoeBlockFusedCuda(d, w, cfg, dh, T);
+  }
 
   // Reference path: download the hidden once, then gather + per-expert MLP.
   std::vector<uint16_t> h(static_cast<size_t>(T) * H);

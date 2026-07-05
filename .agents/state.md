@@ -1158,3 +1158,17 @@ dgx inspection of the checkpoint).
   dominate 35B prefill; and GdnChunkWU (now 11%, the #1 GDN kernel) — its KKᵀ Gram + solve is the next GDN
   lever.** 27B shares the identical (now TF32) GDN kernels → benefits by the same mechanism (correctness
   confirmed via `test_qwen27_paged_forward`). Pushed to main.
+- **2026-07-05 (STRATEGIC PIVOT: cutlass sm120a fp4 GEMM drop-in — feasibility GO, `f3eca1c`)**
+  Inflection: 35B at 5.18×, remaining ~5× is hand-written-vs-cutlass efficiency (our fp4 GEMMs ~15%
+  of peak; cutlass sm120a near-peak). Per mirror-vLLM + the post-MVP "import vLLM kernels" plan,
+  pulling the cutlass drop-in FORWARD as the parity path. **Feasibility GO (build-probed on GB10):**
+  dense `cutlass_scaled_fp4_mm_sm120a` (103 TFLOPS) + grouped MoE `run_fp4_blockwise_scaled_group_mm
+  _sm120` (125 TFLOPS) both COMPILE+RUN on sm_121a/nvcc13; CUTLASS v4.4.2 header-only torch-free
+  (~50 lines vt glue/kernel); sm_121∈[120,130) → sm120a IS the GB10 path. Amdahl: closes ~2.2-2.4× of
+  the 5.18× residual (fp4 GEMMs ~41% decode + ~41% prefill) — biggest single lever. Real work = the
+  W4A4 conversion (per-token activation fp4-quant + ue4m3 scales + scale SWIZZLE to cutlass padded
+  atom layout — tested CPU refs exist in nvfp4_emulation.h + qwen27b-w4a4-notes §3.4). Notes:
+  `.agents/cutlass-dropin-feasibility.md`. NEXT: Phase 1 dense drop-in → parity+measure → Phase 2 MoE
+  grouped → wire both models. NOTE: 202MB cutlass probe clone left at ~/cutlass_probe on dgx (97%
+  disk / 126G free). OPEN grounding Q for Phase 1: does the 35B (modelopt NVFP4) run W4A4 or W4A16 in
+  vLLM (which cutlass kernel) — the 27B is cleanly W4A4.

@@ -1126,3 +1126,19 @@ dgx inspection of the checkpoint).
   after M2.4 PagedAttn); (2) 27B GDN hstate OOM fix (Hv=48/value_dim 6144 OOMs at 8×1024 —
   blocks 27B target-concurrency measurement); (3) fp8 W8A16 GEMV (decode, both); (4) native-fp4
   MMA tiling (27B GEMM speed lever). Post-MVP: cutlass sm120a drop-in for bit-exact prod parity.
+- **2026-07-05 (27B UNBLOCKED at the gate config — chunked prefill; first 8×1024 measurement)**
+  `a456824`. Root cause (grounded): `model_loader.cpp` set per-step token budget = max_model_len×
+  max_num_seqs (millions) → 8×1024 prefill ran in ONE step → GDN activation OOM that REBOOTED the
+  box. Fix: `ResolveMaxNumBatchedTokens()` = vLLM's DEFAULT 2048 (fixed, concurrency-independent) →
+  prefills split across steps, bounded activation. GDN state continuity was ALREADY correct
+  (verified: scheduler splits on num_computed_tokens, `has_initial_state=context_lens>0`, state
+  gather zeros only fresh rows — mirrors qwen_gdn_linear_attn.py:1513). NEW test: one-shot vs
+  chunked prefill **bit-identical max|diff|=0** (CPU+GPU). 35B **16/16** chunked-on (−1.4% noise,
+  LOWER peak RAM). 27B anchor 5/5. **27B @ 8×1024×128 conc-8 NOW FITS (peak 104.6GB, 8/8, no
+  reboot — was instant OOM).** FIRST gate-config measurement: **ours 35.57 total / 3.95 output vs
+  vLLM 396.98 / 44.11 = ~11.2× off** (live vLLM works now — ninja on subprocess PATH). ⚠ 27B peak
+  104.6GB is near the 110GB reboot line — the f32 KV+GDN-state cache (num_blocks-sized, ~91GB
+  floor) is the real bulk → NEXT 27B memory lever: **bf16 KV+state cache** (mirror vLLM's bf16
+  mamba state, halves it → safety headroom). NEXT throughput: GDN DeltaH/ChunkO WMMA (35B ~50%
+  prefill, both models), 27B perf kernels (11.2×). MVP: 35B ~7.4×, 27B ~11.2× — both measurable,
+  both correct.

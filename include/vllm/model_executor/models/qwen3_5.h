@@ -104,7 +104,8 @@ class Qwen3_5Model {
   // Eager (load-time) Marlin NVFP4 repack of every layer's routed experts +
   // dense shared-expert/lm_head projections, so the first request pays no
   // first-touch repack (previously a TTFT spike). No-op unless the build has
-  // VT_MARLIN_NVFP4 and the runtime gate VT_NVFP4_MARLIN=1 on a CUDA queue.
+  // VT_MARLIN_NVFP4 and the runtime gate is on (default ON; VT_NVFP4_MARLIN=0
+  // opts out) on a CUDA queue.
   static void PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
                                     const HfConfig& config, vt::Queue& queue);
 };

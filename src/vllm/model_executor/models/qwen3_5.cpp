@@ -176,9 +176,13 @@ MoeMarlinResident& MoeMarlinResidentFor(const MoeBlockWeights* w) {
 }
 
 bool MarlinMoeEnabled() {
+  // Default ON: the vendored Marlin NVFP4 W4A16 GEMM is the validated 35B path
+  // (measured gate +22%, decode-heavy +80%, 16/16 token-for-token vs the pinned
+  // oracle — see parity-ledger). Only an explicit VT_NVFP4_MARLIN=0 opts back out
+  // to the naive redundant-dequant / cublas bf16 GEMM (kept as an escape hatch).
   static const bool on = [] {
     const char* e = std::getenv("VT_NVFP4_MARLIN");
-    return e && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }

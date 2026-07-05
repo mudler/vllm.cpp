@@ -1142,3 +1142,19 @@ dgx inspection of the checkpoint).
   mamba state, halves it → safety headroom). NEXT throughput: GDN DeltaH/ChunkO WMMA (35B ~50%
   prefill, both models), 27B perf kernels (11.2×). MVP: 35B ~7.4×, 27B ~11.2× — both measurable,
   both correct.
+- **2026-07-05 (GDN DeltaH+ChunkO tensor-cored — WMMA/TF32; the coupled fix; 35B prefill 1.39× TTFT, POSITIVE)**
+  Rewrote the two top GDN prefill kernels (`cuda_gdn.cu` `GdnChunkDeltaH`/`GdnChunkO`) as WMMA
+  16×16 tile matmuls (f32 accumulate), mirroring FLA `tl.dot` (chunk_delta_h.py:176/278, chunk_o.py:111/113/137).
+  **LOAD-BEARING GROUNDING CORRECTION:** the task premise "Model path (bf16)" is WRONG — nsys proved the
+  35B GDN runs the **f32** kernels (`GdnChunkDeltaHKernel<float>` 24.8% + `GdnChunkO<float>` 17.6% + WU 6.8%
+  = 49% of prefill); the bf16 path is never invoked. So the real lever is **TF32 WMMA on the f32 path**
+  (fragments templated on dtype: f32→`precision::tf32` 16×16×8, bf16→native 16×16×16 kept for a future bf16
+  GDN). Fit GB10's 99KB shared with f32 state resident by folding per-row decay into K (V2 reads V_new from
+  global) + ChunkO buffer aliasing. **Correctness ALL GREEN:** 35B paged **16/16** (TF32 held every argmax),
+  `test_ops_gdn` 23/23, 27B one-shot==chunked **diff=0**. **Measured (8×1024×128 conc-8, same-base A/B):**
+  kernels **DeltaH 8.9×, ChunkO 10.6×** faster (nsys same-workload); **TTFT 11930→8602 ms (1.39×), total
+  215.18→243.11 tok/s (+13%)**; vs vLLM oracle 1326.66 → ratio **6.17×→5.46× off**. DeltaH+ChunkO share
+  42.4%→7.2%. **NEXT (grounded): the MoE NVFP4 grouped GEMMs (26%+13%) + dense MatmulNvfp4 (15.5%) now
+  dominate 35B prefill; and GdnChunkWU (now 11%, the #1 GDN kernel) — its KKᵀ Gram + solve is the next GDN
+  lever.** 27B shares the identical (now TF32) GDN kernels → benefits by the same mechanism (correctness
+  confirmed via `test_qwen27_paged_forward`). Pushed to main.

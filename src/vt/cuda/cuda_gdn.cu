@@ -12,10 +12,12 @@
 // unchecked (correctness-grade — the M0.9 builder owns metadata integrity).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "vt/ops.h"
@@ -503,8 +505,8 @@ __global__ void GdnChunkCumsumKernel(float* gcum, const float* g, const int32_t*
 // WY columns u (from beta.v) and w (from beta.exp(G).k). Each output column
 // (vi for u, ki for w) is an independent forward solve → no cross-thread
 // dependency in the substitution.
-template <typename Tin>
-__global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
+template <typename Tin, typename TSc>
+__global__ void GdnChunkWUKernel(TSc* u, TSc* w, const Tin* k, const Tin* v,
                                  const float* beta, const float* gcum, const int32_t* tok0a,
                                  const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
                                  int64_t dv) {
@@ -541,7 +543,8 @@ __global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
       const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
       ucol[i] = bs[i] * (vi_val - s);
     }
-    for (int64_t i = 0; i < len; ++i) u[(tok0 + i) * hv_n * dv + hv * dv + vi] = ucol[i];
+    for (int64_t i = 0; i < len; ++i)
+      Store(u, (tok0 + i) * hv_n * dv + hv * dv + vi, ucol[i]);
   }
   // w column ki: w_i = beta_i (exp(G_i) k_i - sum_{j<i} exp(G_i-G_j) KK[i,j] w_j)
   for (int64_t ki = threadIdx.x; ki < dk; ki += blockDim.x) {
@@ -552,7 +555,8 @@ __global__ void GdnChunkWUKernel(float* u, float* w, const Tin* k, const Tin* v,
       const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
       wcol[i] = bs[i] * (eg[i] * ki_val - s);
     }
-    for (int64_t i = 0; i < len; ++i) w[(tok0 + i) * hv_n * dk + hv * dk + ki] = wcol[i];
+    for (int64_t i = 0; i < len; ++i)
+      Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
   }
 }
 
@@ -662,6 +666,269 @@ __global__ void GdnChunkOKernel(Tout* out, const Tin* q, const Tin* k, const flo
   }
 }
 
+// ===========================================================================
+// Tensor-core (WMMA) DeltaH + ChunkO — the top prefill cost (nsys: DeltaH ~25%
+// + ChunkO ~18% of 35B prefill). These replace the CUDA-core cooperative
+// dot-products with WMMA 16x16 matmuls, f32 accumulate, mirroring FLA's tl.dot
+// tiling (chunk_delta_h.py:176 v_new = u - w@hᵀ, :278 h += (k⊙decay)ᵀ@v_new;
+// chunk_o.py:111 q@hᵀ, :113 q@kᵀ, :137 A@v_new). Templated on the data/scratch
+// dtype TD: bf16 inputs use native bf16 fragments (16x16x16); f32 inputs use
+// TF32 fragments (16x16x8, mantissa rounded to 19 bits) — the real 35B GDN runs
+// f32, so TF32 is the path that actually hits the model. Running state H[Dv,Dk]
+// stays f32 in shared (FLA keeps b_h in f32 registers); scratch dtype = TD.
+namespace wmma = nvcuda::wmma;
+constexpr int kWM = 16;   // WMMA tile M/N
+constexpr int kNB = 32;   // DeltaH V1 output column block (Dv must be a multiple)
+
+// Per-dtype WMMA config: fragment types, K-tile width, and a load that rounds
+// f32 -> tf32 in place (bf16 loads natively).
+template <typename TD>
+struct WmmaCfg;
+template <>
+struct WmmaCfg<__nv_bfloat16> {
+  static constexpr int WK = 16;
+  using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
+  using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, __nv_bfloat16, wmma::row_major>;
+  using Acol = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, __nv_bfloat16, wmma::col_major>;
+  using Brow = wmma::fragment<wmma::matrix_b, kWM, kWM, WK, __nv_bfloat16, wmma::row_major>;
+  using Bcol = wmma::fragment<wmma::matrix_b, kWM, kWM, WK, __nv_bfloat16, wmma::col_major>;
+  template <typename F>
+  __device__ static void load(F& f, const __nv_bfloat16* p, int ld) {
+    wmma::load_matrix_sync(f, p, ld);
+  }
+};
+template <>
+struct WmmaCfg<float> {
+  static constexpr int WK = 8;
+  using Acc = wmma::fragment<wmma::accumulator, kWM, kWM, WK, float>;
+  using Arow = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, wmma::precision::tf32, wmma::row_major>;
+  using Acol = wmma::fragment<wmma::matrix_a, kWM, kWM, WK, wmma::precision::tf32, wmma::col_major>;
+  using Brow = wmma::fragment<wmma::matrix_b, kWM, kWM, WK, wmma::precision::tf32, wmma::row_major>;
+  using Bcol = wmma::fragment<wmma::matrix_b, kWM, kWM, WK, wmma::precision::tf32, wmma::col_major>;
+  template <typename F>
+  __device__ static void load(F& f, const float* p, int ld) {
+    wmma::load_matrix_sync(f, p, ld);
+    for (int i = 0; i < f.num_elements; ++i) f.x[i] = wmma::__float_to_tf32(f.x[i]);
+  }
+};
+
+// DeltaH (WMMA). One block per (sequence, v-head), SEQUENTIAL over chunks.
+// f32 running state Hf[Dv,Dk] resident in dynamic shared; a pool is reused by
+// the two matmuls. Per chunk: snapshot start-state -> TD hstate; V1 v_new=u-W@Hᵀ
+// (Hᵀ via a bf16/tf32 slice Hb of Hf); V2 folds the per-row decay into K so the
+// rank update H = H*exp(G_last) + V_newᵀ@(K⊙decay) reads V_new straight from
+// global (no staging). f32 accumulate.
+template <typename TD>
+__global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, const TD* k,
+                                         const TD* u, const TD* w, const float* gcum,
+                                         const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                         int64_t dk, int64_t hv_n, int64_t dv) {
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t n = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  float* Hf = reinterpret_cast<float*>(smem_raw);       // [Dv,Dk] f32 state
+  char* pool = smem_raw + sd * sizeof(float);           // reused by V1/V2
+  __shared__ float decay[kChunk];
+
+  float* s_head = state + (n * hv_n + hv) * sd;
+  for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = s_head[e];
+  __syncthreads();
+
+  const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  for (int64_t it = 0; it < nt; ++it) {
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * kChunk;
+    const int64_t rem = seqlen - it * kChunk;
+    const int64_t len = rem < kChunk ? rem : kChunk;
+    TD* hstart = hstate + (gc * hv_n + hv) * sd;
+    for (int64_t e = tid; e < sd; e += blockDim.x) Store(hstart, e, Hf[e]);
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = tid; i < len; i += blockDim.x)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
+    __syncthreads();
+
+    // --- V1: v_new = u - W @ Hᵀ  ([len,Dk]@[Dk,Dv] -> [len,Dv]) ---
+    TD* Hb = reinterpret_cast<TD*>(pool);                        // [kNB,Dk] TD slice of Hf
+    float* sTile = reinterpret_cast<float*>(Hb + kNB * dk);      // [kChunk,kNB] f32
+    for (int64_t nb = 0; nb < dv; nb += kNB) {
+      for (int64_t e = tid; e < kNB * dk; e += blockDim.x)
+        Store(Hb, e, Hf[(nb + e / dk) * dk + e % dk]);
+      __syncthreads();
+      const int ntiles = (kChunk / kWM) * (kNB / kWM);
+      for (int t = warp; t < ntiles; t += nwarps) {
+        const int rt = t % (kChunk / kWM), ct = t / (kChunk / kWM);
+        const int i0 = rt * kWM, vi0 = static_cast<int>(nb) + ct * kWM;
+        typename Cfg::Acc acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (int64_t kk = 0; kk < dk; kk += WK) {
+          typename Cfg::Arow a;
+          typename Cfg::Bcol b;
+          Cfg::load(a, w + (tok0 + i0) * hv_n * dk + hv * dk + kk, hv_n * dk);
+          Cfg::load(b, Hb + (vi0 - nb) * dk + kk, dk);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sTile + i0 * kNB + ct * kWM, acc, kNB, wmma::mem_row_major);
+      }
+      __syncthreads();
+      for (int64_t e = tid; e < kChunk * kNB; e += blockDim.x) {
+        const int64_t i = e / kNB, cvi = e % kNB;
+        if (i < len) {
+          const float uv = Load(u, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi);
+          Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uv - sTile[i * kNB + cvi]);
+        }
+      }
+      __syncthreads();
+    }
+
+    // --- V2: H = H*exp(G_last) + V_newᵀ @ (K⊙decay)  ([Dv,len]@[len,Dk]) ---
+    TD* Kd = reinterpret_cast<TD*>(pool);                       // [kChunk,Dk] TD, decay-scaled
+    for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+      const int64_t i = e / dk, ki = e % dk;
+      Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+    }
+    __syncthreads();
+    const int ntiles2 = (dv / kWM) * (dk / kWM);
+    for (int t = warp; t < ntiles2; t += nwarps) {
+      const int vt = t % (dv / kWM), kt = t / (dv / kWM);
+      const int vi0 = vt * kWM, ki0 = kt * kWM;
+      typename Cfg::Acc acc;
+      wmma::load_matrix_sync(acc, Hf + vi0 * dk + ki0, dk, wmma::mem_row_major);
+      for (int x = 0; x < acc.num_elements; ++x) acc.x[x] *= eglast;
+      for (int ii = 0; ii < kChunk; ii += WK) {
+        typename Cfg::Acol a;  // A[vi,i] = V_new[i,vi], col-major straight from global v_new
+        typename Cfg::Brow b;  // B[i,ki] = Kd[i,ki]
+        Cfg::load(a, v_new + (tok0 + ii) * hv_n * dv + hv * dv + vi0, hv_n * dv);
+        Cfg::load(b, Kd + ii * dk + ki0, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(Hf + vi0 * dk + ki0, acc, dk, wmma::mem_row_major);
+    }
+    __syncthreads();
+  }
+  for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
+}
+
+// ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
+// (decay-weighted, causal-masked); o = scale*(exp(G)*cross + A@V_new). Buffers
+// alias: Ks (used only for qk) is reused as outc after qk.
+template <typename TD, typename Tout>
+__global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const TD* v_new,
+                                    const TD* hstate, const float* gcum, const int32_t* tok0a,
+                                    const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
+                                    int64_t dv, float scale) {
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int64_t sd = dv * dk;
+  const TD* hstart = hstate + (gc * hv_n + hv) * sd;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  const size_t r2 = static_cast<size_t>(kChunk * dk) * sizeof(TD) > static_cast<size_t>(kChunk * dv) * 4
+                        ? static_cast<size_t>(kChunk * dk) * sizeof(TD)
+                        : static_cast<size_t>(kChunk * dv) * 4;
+  TD* Qs = reinterpret_cast<TD*>(smem_raw);                                    // [kChunk,Dk]
+  char* p2 = smem_raw + static_cast<size_t>(kChunk * dk) * sizeof(TD);         // Ks | outc
+  TD* Ks = reinterpret_cast<TD*>(p2);
+  float* outc = reinterpret_cast<float*>(p2);
+  float* qks = reinterpret_cast<float*>(p2 + r2);                             // [kChunk,kChunk]
+  TD* As = reinterpret_cast<TD*>(qks + kChunk * kChunk);                       // [kChunk,kChunk]
+  __shared__ float gs[kChunk], eg[kChunk];
+
+  for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+    const int64_t i = e / dk, d = e % dk;
+    const bool in = i < len;
+    Store(Qs, e, in ? Load(q, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+    Store(Ks, e, in ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+  }
+  for (int64_t i = tid; i < len; i += blockDim.x) {
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
+  }
+  __syncthreads();
+
+  // qk = Q @ Kᵀ  [kChunk,kChunk]
+  const int nqk = (kChunk / kWM) * (kChunk / kWM);
+  for (int t = warp; t < nqk; t += nwarps) {
+    const int it = t % (kChunk / kWM), jt = t / (kChunk / kWM);
+    const int i0 = it * kWM, j0 = jt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t kk = 0; kk < dk; kk += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Qs + i0 * dk + kk, dk);
+      Cfg::load(b, Ks + j0 * dk + kk, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(qks + i0 * kChunk + j0, acc, kChunk, wmma::mem_row_major);
+  }
+  __syncthreads();
+  // A[i,j] = exp(G_i - G_j) * qk[i,j] for j<=i (causal), else 0.
+  for (int64_t e = tid; e < kChunk * kChunk; e += blockDim.x) {
+    const int64_t i = e / kChunk, j = e % kChunk;
+    float a = 0.0f;
+    if (i < len && j < len && j <= i) a = expf(gs[i] - gs[j]) * qks[e];
+    Store(As, e, a);
+  }
+  __syncthreads();
+
+  // cross = Q @ Hstartᵀ  [kChunk,Dv] -> outc (aliases Ks, now free)
+  const int ncr = (kChunk / kWM) * (dv / kWM);
+  for (int t = warp; t < ncr; t += nwarps) {
+    const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+    const int i0 = it * kWM, vi0 = vt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t kk = 0; kk < dk; kk += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Qs + i0 * dk + kk, dk);
+      Cfg::load(b, hstart + vi0 * dk + kk, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(outc + i0 * dv + vi0, acc, dv, wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int64_t e = tid; e < kChunk * dv; e += blockDim.x) {
+    const int64_t i = e / dv;
+    outc[e] *= i < len ? eg[i] : 0.0f;
+  }
+  __syncthreads();
+  // outc = eg*cross + A @ V_new ; o = scale * outc
+  for (int t = warp; t < ncr; t += nwarps) {
+    const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+    const int i0 = it * kWM, vi0 = vt * kWM;
+    typename Cfg::Acc acc;
+    wmma::load_matrix_sync(acc, outc + i0 * dv + vi0, dv, wmma::mem_row_major);
+    for (int jj = 0; jj < kChunk; jj += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Brow b;
+      Cfg::load(a, As + i0 * kChunk + jj, kChunk);
+      Cfg::load(b, v_new + (tok0 + jj) * hv_n * dv + hv * dv + vi0, hv_n * dv);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(outc + i0 * dv + vi0, acc, dv, wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int64_t e = tid; e < kChunk * dv; e += blockDim.x) {
+    const int64_t i = e / dv, vi = e % dv;
+    if (i < len) Store(out, (tok0 + i) * hv_n * dv + hv * dv + vi, scale * outc[e]);
+  }
+}
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
@@ -672,24 +939,37 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t t_tot = out.shape[0];
 
+  // Scratch dtype tracks the input dtype: f32 scratch consumed by TF32
+  // fragments (the real 35B GDN, f32), bf16 scratch by native bf16 fragments
+  // (the coupled bf16 path). The tensor cores read the scratch natively.
+  using TSc = Tin;
+  // WMMA is used for both dtypes when the head dims tile cleanly (the routing
+  // in GdnPrefillKernelCuda guarantees this for bf16; f32 corners fall back to
+  // the CUDA-core chunked kernels below).
+  const bool wmma = (dk % kWM == 0 && dv % kNB == 0);
+  // u/w/v_new are over-allocated by kChunk rows so the WMMA kernels can read
+  // full BT-row tiles past a partial-tail chunk without going out of bounds
+  // (the extra rows contribute nothing: masked/discarded).
+  const int64_t t_pad = t_tot + kChunk;
+
   // Device scratch (stream-ordered; freed after the kernels on the same stream).
   float* gcum = nullptr;
-  float* u = nullptr;
-  float* w = nullptr;
-  float* v_new = nullptr;
-  float* hstate = nullptr;
+  TSc* u = nullptr;
+  TSc* w = nullptr;
+  TSc* v_new = nullptr;
+  TSc* hstate = nullptr;
   int32_t* d_tok0 = nullptr;
   int32_t* d_len = nullptr;
   int32_t* d_boh = nullptr;
   Check(cudaMallocAsync(&gcum, static_cast<size_t>(t_tot * hv_n) * sizeof(float), s),
         "gdn chunked gcum alloc");
-  Check(cudaMallocAsync(&u, static_cast<size_t>(t_tot * hv_n * dv) * sizeof(float), s),
+  Check(cudaMallocAsync(&u, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
         "gdn chunked u alloc");
-  Check(cudaMallocAsync(&w, static_cast<size_t>(t_tot * hv_n * dk) * sizeof(float), s),
+  Check(cudaMallocAsync(&w, static_cast<size_t>(t_pad * hv_n * dk) * sizeof(TSc), s),
         "gdn chunked w alloc");
-  Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_tot * hv_n * dv) * sizeof(float), s),
+  Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
         "gdn chunked v_new alloc");
-  Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(float), s),
+  Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(TSc), s),
         "gdn chunked hstate alloc");
   Check(cudaMallocAsync(&d_tok0, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
         "gdn chunked tok0 alloc");
@@ -715,28 +995,66 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   GdnChunkCumsumKernel<<<grid_chunk, 32, 0, s>>>(gcum, g.Ptr<float>(), d_tok0, d_len, hv_n);
   Check(cudaGetLastError(), "gdn chunked cumsum launch");
 
-  GdnChunkWUKernel<Tin><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),
-                                                   beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n,
-                                                   dk, hv_n, dv);
+  GdnChunkWUKernel<Tin, TSc><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),
+                                                        beta.Ptr<float>(), gcum, d_tok0, d_len,
+                                                        hk_n, dk, hv_n, dv);
   Check(cudaGetLastError(), "gdn chunked wu launch");
 
-  const size_t hsh_bytes = static_cast<size_t>(dv * dk) * sizeof(float);
-  auto* delta_kernel = GdnChunkDeltaHKernel<Tin>;
-  if (hsh_bytes > 48 * 1024) {
-    Check(cudaFuncSetAttribute(delta_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(hsh_bytes)),
-          "gdn chunked delta_h shared opt-in");
-  }
-  delta_kernel<<<grid_seq, 256, hsh_bytes, s>>>(state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(),
-                                                u, w, gcum, qsl.Ptr<int32_t>(), d_boh, hk_n, dk,
-                                                hv_n, dv);
-  Check(cudaGetLastError(), "gdn chunked delta_h launch");
+  auto opt_in = [](void* kernel, size_t bytes, const char* what) {
+    if (bytes > 48 * 1024)
+      Check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(bytes)),
+            what);
+  };
 
-  GdnChunkOKernel<Tin, Tout><<<grid_chunk, 256, 0, s>>>(out.Ptr<Tout>(), q_in.Ptr<Tin>(),
-                                                        k.Ptr<Tin>(), v_new, hstate, gcum,
-                                                        d_tok0, d_len, hk_n, dk, hv_n, dv,
-                                                        args.scale);
-  Check(cudaGetLastError(), "gdn chunked o launch");
+  if (wmma) {
+    // WMMA tensor-core path (TF32 for f32 in, native bf16 for bf16 in).
+    // Zero v_new so the over-allocated tail rows the matmuls may sweep
+    // (their A operand is 0 there, but 0*NaN=NaN on the tensor core) are finite.
+    Check(cudaMemsetAsync(v_new, 0, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
+          "gdn chunked v_new zero");
+    const size_t sz = sizeof(TSc);
+    const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
+    const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
+    const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
+    opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
+           "gdn chunked delta_h(wmma) shared opt-in");
+    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, 256, delta_bytes, s>>>(
+        state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+        hk_n, dk, hv_n, dv);
+    Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+
+    const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
+                          ? static_cast<size_t>(kChunk * dk) * sz
+                          : static_cast<size_t>(kChunk * dv) * 4;
+    const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
+                                static_cast<size_t>(kChunk * kChunk) * 4 +
+                                static_cast<size_t>(kChunk * kChunk) * sz;
+    opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
+           "gdn chunked o(wmma) shared opt-in");
+    GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, 256, chunko_bytes, s>>>(
+        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+        hk_n, dk, hv_n, dv, args.scale);
+    Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
+  } else if constexpr (std::is_same<Tin, float>::value) {
+    // CUDA-core fallback — only reached for f32 corner dims (bf16 non-WMMA dims
+    // are routed to the sequential scan upstream).
+    const size_t hsh_bytes = static_cast<size_t>(dv * dk) * sizeof(float);
+    opt_in(reinterpret_cast<void*>(GdnChunkDeltaHKernel<Tin>), hsh_bytes,
+           "gdn chunked delta_h shared opt-in");
+    GdnChunkDeltaHKernel<Tin><<<grid_seq, 256, hsh_bytes, s>>>(
+        state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+        hk_n, dk, hv_n, dv);
+    Check(cudaGetLastError(), "gdn chunked delta_h launch");
+
+    GdnChunkOKernel<Tin, Tout><<<grid_chunk, 256, 0, s>>>(out.Ptr<Tout>(), q_in.Ptr<Tin>(),
+                                                          k.Ptr<Tin>(), v_new, hstate, gcum,
+                                                          d_tok0, d_len, hk_n, dk, hv_n, dv,
+                                                          args.scale);
+    Check(cudaGetLastError(), "gdn chunked o launch");
+  } else {
+    VT_CHECK(false, "cuda gdn_prefill(chunked): bf16 requires WMMA-friendly head dims");
+  }
 
   Check(cudaFreeAsync(gcum, s), "gdn chunked gcum free");
   Check(cudaFreeAsync(u, s), "gdn chunked u free");
@@ -813,8 +1131,12 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
   const int64_t dv = state.shape[2], dk = state.shape[3];
   // Chunked path (default) for real head dims; the sequential scan handles the
   // arbitrary-dim corners (the CUDA op tests exercise Dv=Dk=300) and the A/B
-  // fallback (VT_GDN_CHUNKED=0).
-  if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f) {
+  // fallback (VT_GDN_CHUNKED=0). The bf16 chunked path is WMMA (tensor-core),
+  // which tiles at 16 and 32 — bf16 dims that are not WMMA-friendly fall back
+  // to the sequential scan (real gate dims Dk=Dv=128 satisfy both).
+  const bool wmma_ok = q_in.dtype != DType::kBF16 || (dk % kWM == 0 && dv % kNB == 0);
+  if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f &&
+      wmma_ok) {
     GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
     return;
   }

@@ -469,6 +469,38 @@ DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   return dout;
 }
 
+// Device-resident view over an Fp8Weight's raw fp8 [N,K] bytes, uploaded ONCE
+// (lazily) and reused across every forward step (mirror ResidentNvfp4). The
+// shared_ptr in the (const) weight owns the device buffer for the model lifetime.
+Tensor ResidentFp8(Dev d, const Fp8Weight& w) {
+  if (!w.d_packed) {
+    const size_t pb = w.packed.bytes.size();
+    void* p = d.b.Alloc(pb);
+    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
+    Backend* bk = &d.b;
+    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  }
+  return MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k});
+}
+
+// y[M,N] = x[M,K] (bf16/f32 device) @ dequant(w).T via the lifted vLLM cutlass
+// W8A8 fp8 GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
+// checkpoint input_scale) then vt::MatmulFp8Cutlass with the folded alpha
+// (= input_scale·weight_scale). out dtype f32 (q/k/v, in_proj_qkv/z sinks) or
+// bf16 (o/out_proj residual sinks). CUDA-only (sm120a; the 35B W8A8 path is
+// CUDA-resident — fp8 fields are only populated on the CUDA load, VT_FP8_CUTLASS).
+DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
+  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
+  VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
+           "MatmulFp8CutlassD: the fp8 W8A8 cutlass path is CUDA-only");
+  DBuf a_fp8(d, DType::kI8, {M, K});
+  vt::QuantFp8Static(d.q, a_fp8.t(), x, w.input_scale);
+  Tensor wdev = ResidentFp8(d, w);
+  DBuf dout(d, out_dtype, {M, N});
+  vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
+  return dout;
+}
+
 // TRUE W4A4 toggle (A/B; default ON — mirrors vLLM, which runs this checkpoint as
 // use_a16=False true-W4A4, notes §7.1). Set VT_W4A4_TRUE=0 to fall back to the
 // W4A16 6a fast path (bf16 activations) for a throughput A/B. Only affects
@@ -801,8 +833,12 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  DBuf mixed = MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = MatmulF32D(d, h, w.in_proj_z);         // [T,value_dim]
+  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
+  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
+                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
+                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
+  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
+                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -856,8 +892,11 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
-  // fp4-resident W4A4 out_proj (real 27B, notes §3.6) when populated; else bf16.
-  return !w.out_proj_fp4.Empty()
+  // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
+  // §3.6), else bf16 (default / GGUF).
+  return !w.out_proj_fp8.Empty()
+             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+         : !w.out_proj_fp4.Empty()
              ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
@@ -891,8 +930,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  DBuf mixed = MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = MatmulF32D(d, h, w.in_proj_z);         // [T,value_dim]
+  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
+  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
+                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
+                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
+  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
+                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -1004,8 +1047,11 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
-  // fp4-resident W4A4 out_proj (real 27B, notes §3.6) when populated; else bf16.
-  return !w.out_proj_fp4.Empty()
+  // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
+  // §3.6), else bf16 (default / GGUF).
+  return !w.out_proj_fp8.Empty()
+             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+         : !w.out_proj_fp4.Empty()
              ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
@@ -1025,12 +1071,16 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
   // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
   const bool fp4 = !w.q_proj_fp4.Empty();
-  DBuf qgate = fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
-                   : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
-                : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
-                : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
+  DBuf qgate = fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+               : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+                     : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
+  DBuf kf = fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+            : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+                  : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
+  DBuf vf = fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+            : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+                  : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head the projection lays out [q(Dh) | gate(Dh)] (§5) —
   // device op producing q[T,Hq,Dh] and gate[T,Hq,Dh].
@@ -1061,8 +1111,9 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
                       Reshape(gatef.t(), {T, Hq * Dh}));
-  return fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
-             : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
+         : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
+               : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
 }
 
 // --- Batched PAGED full_attention block (M1.8 Task 3). Identical q/k/v prep to
@@ -1089,12 +1140,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
   // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
   const bool fp4 = !w.q_proj_fp4.Empty();
-  DBuf qgate = fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
-                   : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
-                : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
-                : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
+  DBuf qgate = fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+               : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+                     : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
+  DBuf kf = fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+            : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+                  : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
+  DBuf vf = fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+            : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+                  : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head [q(Dh) | gate(Dh)] (§5) — device op.
   DBuf qf(d, DType::kF32, {T, Hq, Dh});
@@ -1135,8 +1190,9 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
                       Reshape(gatef.t(), {T, Hq * Dh}));
-  return fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
-             : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
+         : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
+               : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
 }
 
 // Per-expert silu-mul MLP over the gathered token rows `x` [n, H] bf16 ->

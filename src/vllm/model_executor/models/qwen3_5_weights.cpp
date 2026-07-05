@@ -3,6 +3,7 @@
 // (.agents/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -114,6 +115,43 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
+// cutlass W8A8 fp8 path opt-in (default OFF). The default dequants the fp8 attn/
+// GDN projections to bf16 AT LOAD (LoadFp8Transposed) and runs the cublas/vt
+// bf16 W8A16 GEMM. VT_FP8_CUTLASS=1 keeps the fp8 bytes resident + loads the
+// static input_scale, and the forward runs the lifted vLLM cutlass W8A8 GEMM
+// (static per-tensor activation quant + fp8 tensor cores) — mirroring vLLM's
+// actual scheme for these projections (the checkpoint IS W8A8). Load-time gate
+// so the default bf16 path is byte-for-byte untouched (main not regressed).
+bool Fp8CutlassEnabled() {
+  const char* e = std::getenv("VT_FP8_CUTLASS");
+  return e != nullptr && e[0] == '1';
+}
+
+// Per-tensor FP8 projection `<proj>.weight` F8_E4M3 [out,in] + `.weight_scale`
+// scalar + `.input_scale` scalar -> RAW fp8-resident W8A8 Fp8Weight (no dequant,
+// no transpose: the bytes stay in the on-disk [N=out, K=in] orientation the
+// cutlass W8A8 GEMM reads directly). `alpha = input_scale * weight_scale` is
+// precomputed (per-tensor scalars) — the folded scalar vt::MatmulFp8Cutlass
+// multiplies the fp8 accumulator by (mirror vLLM ScaledEpilogue for per-tensor).
+Fp8Weight LoadFp8Raw(const TensorResolver& get, const std::string& proj) {
+  const StTensor& w = get(proj + ".weight");
+  VT_CHECK(w.dtype == "F8_E4M3",
+           "qwen3_5 weights: expected F8_E4M3 for " + proj + ".weight");
+  VT_CHECK(w.shape.size() == 2,
+           "qwen3_5 weights: expected 2-D weight for " + proj);
+  Fp8Weight r;
+  r.n = w.shape[0];
+  r.k = w.shape[1];
+  r.weight_scale = ReadF32Scalar(get(proj + ".weight_scale"));
+  r.input_scale = ReadF32Scalar(get(proj + ".input_scale"));
+  r.alpha = r.input_scale * r.weight_scale;
+  r.packed = MakeOwned(vt::DType::kI8, {r.n, r.k});
+  VT_CHECK(w.nbytes == r.packed.bytes.size(),
+           "qwen3_5 weights: fp8 byte-size mismatch for " + proj);
+  std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  return r;
+}
+
 // Per-tensor FP8 projection `<proj>.weight` [out,in] + `<proj>.weight_scale`
 // scalar -> owned bf16 [in, out] (dequant then transpose).
 OwnedTensor LoadFp8Transposed(const TensorResolver& get,
@@ -174,9 +212,17 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  g.in_proj_qkv = LoadFp8Transposed(get, la + "in_proj_qkv");
-  g.in_proj_z = LoadFp8Transposed(get, la + "in_proj_z");
-  g.out_proj = LoadFp8Transposed(get, la + "out_proj");
+  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
+  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
+  if (Fp8CutlassEnabled()) {
+    g.in_proj_qkv_fp8 = LoadFp8Raw(get, la + "in_proj_qkv");
+    g.in_proj_z_fp8 = LoadFp8Raw(get, la + "in_proj_z");
+    g.out_proj_fp8 = LoadFp8Raw(get, la + "out_proj");
+  } else {
+    g.in_proj_qkv = LoadFp8Transposed(get, la + "in_proj_qkv");
+    g.in_proj_z = LoadFp8Transposed(get, la + "in_proj_z");
+    g.out_proj = LoadFp8Transposed(get, la + "out_proj");
+  }
   g.in_proj_b = LoadBf16Transposed(get, la + "in_proj_b.weight");
   g.in_proj_a = LoadBf16Transposed(get, la + "in_proj_a.weight");
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
@@ -195,10 +241,19 @@ FullAttnLayerWeights LoadAttn(const TensorResolver& get,
                               const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  a.q_proj = LoadFp8Transposed(get, sa + "q_proj");
-  a.k_proj = LoadFp8Transposed(get, sa + "k_proj");
-  a.v_proj = LoadFp8Transposed(get, sa + "v_proj");
-  a.o_proj = LoadFp8Transposed(get, sa + "o_proj");
+  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
+  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
+  if (Fp8CutlassEnabled()) {
+    a.q_proj_fp8 = LoadFp8Raw(get, sa + "q_proj");
+    a.k_proj_fp8 = LoadFp8Raw(get, sa + "k_proj");
+    a.v_proj_fp8 = LoadFp8Raw(get, sa + "v_proj");
+    a.o_proj_fp8 = LoadFp8Raw(get, sa + "o_proj");
+  } else {
+    a.q_proj = LoadFp8Transposed(get, sa + "q_proj");
+    a.k_proj = LoadFp8Transposed(get, sa + "k_proj");
+    a.v_proj = LoadFp8Transposed(get, sa + "v_proj");
+    a.o_proj = LoadFp8Transposed(get, sa + "o_proj");
+  }
   a.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
   return a;

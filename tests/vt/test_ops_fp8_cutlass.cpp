@@ -1,0 +1,240 @@
+// vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
+// Validates the lifted vLLM cutlass W8A8 fp8 path — vt::QuantFp8Static (static
+// per-tensor activation quant) + vt::MatmulFp8Cutlass (per-tensor fp8 GEMM,
+// alpha = input_scale·weight_scale) — against a host W8A8 reference (dequant both
+// operands, matmul) within fp8/bf16 tolerance. CUDA-only; SKIPs cleanly with no
+// GPU (the fp8 cutlass op is sm120a-only, no CPU kernel).
+#include <doctest/doctest.h>
+
+#include <cmath>
+#include <cstdint>
+#include <random>
+#include <stdexcept>
+#include <vector>
+
+#include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // F32ToF8E4M3
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+namespace {
+
+using vt::Backend;
+using vt::Device;
+using vt::DeviceType;
+using vt::DType;
+using vt::Queue;
+using vt::Tensor;
+
+bool HasCuda() {
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
+
+Tensor MakeTensor(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+struct QueueGuard {
+  Backend& b;
+  Queue q;
+  explicit QueueGuard(Backend& backend) : b(backend), q(backend.CreateQueue()) {}
+  ~QueueGuard() { b.DestroyQueue(q); }
+  QueueGuard(const QueueGuard&) = delete;
+  QueueGuard& operator=(const QueueGuard&) = delete;
+};
+
+class DeviceTensor {
+ public:
+  DeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+               const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeTensor(p_, dt, Gpu(), shape);
+  }
+  ~DeviceTensor() { b_.Free(p_); }
+  DeviceTensor(const DeviceTensor&) = delete;
+  DeviceTensor& operator=(const DeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+float Bf16ToF32(uint16_t h) { return vt::BF16ToF32(h); }
+
+void CheckClose(const std::vector<float>& got, const std::vector<float>& want, float atol,
+                float rtol) {
+  REQUIRE(got.size() == want.size());
+  size_t bad = 0, first_bad = 0;
+  float max_abs = 0.0f;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const float tol = atol + rtol * std::fabs(want[i]);
+    const float diff = std::fabs(got[i] - want[i]);
+    if (diff > max_abs) max_abs = diff;
+    if (!(diff <= tol)) {
+      if (bad == 0) first_bad = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    CAPTURE(bad);
+    CAPTURE(first_bad);
+    CAPTURE(got[first_bad]);
+    CAPTURE(want[first_bad]);
+    CAPTURE(max_abs);
+  }
+  CHECK(bad == 0);
+}
+
+// Host W8A8 reference for one (M,N,K): static-quant the f32 activation to fp8,
+// then out[m,n] = alpha * Σ_k f8val(a[m,k]) * f8val(b[n,k]) — the exact math the
+// GPU (QuantFp8Static + MatmulFp8Cutlass) computes, only the K-reduction order
+// differs (matmul tolerance).
+void RunCase(int M, int N, int K, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
+  std::uniform_int_distribution<int> ub(0, 255);
+
+  const float input_scale = 0.035f;   // ~ amax_act / 448 for the [-2,2] range
+  const float weight_scale = 0.017f;  // arbitrary positive per-tensor weight scale
+  const float alpha = input_scale * weight_scale;
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  for (auto& v : x) v = ux(rng);
+
+  // Random non-NaN fp8-e4m3fn weight bytes [N,K].
+  std::vector<uint8_t> b_fp8(static_cast<size_t>(N) * K);
+  for (auto& b : b_fp8) {
+    int byte = ub(rng);
+    if ((byte & 0x7F) == 0x7F) byte &= ~0x7;  // avoid NaN encodings (0x7F/0xFF)
+    b = static_cast<uint8_t>(byte);
+  }
+
+  // Host static activation quant (bit-identical to the GPU quant kernel).
+  std::vector<uint8_t> a_fp8(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < x.size(); ++i)
+    a_fp8[i] = vllm::F32ToF8E4M3(x[i] / input_scale);
+
+  // Host reference dot products.
+  std::vector<float> ref(static_cast<size_t>(M) * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k)
+        acc += vllm::F8E4M3ToF32(a_fp8[static_cast<size_t>(m) * K + k]) *
+               vllm::F8E4M3ToF32(b_fp8[static_cast<size_t>(n) * K + k]);
+      ref[static_cast<size_t>(m) * N + n] = alpha * acc;
+    }
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+
+  // GPU path A: quant on device (from f32 x) then the cutlass GEMM.
+  DeviceTensor dx(b, g.q, DType::kF32, {M, K}, x.data());
+  DeviceTensor da(b, g.q, DType::kI8, {M, K});
+  vt::QuantFp8Static(g.q, da.tensor(), dx.tensor(), input_scale);
+  // Verify the device quant matches the host quant bit-for-bit.
+  std::vector<uint8_t> a_gpu(a_fp8.size());
+  da.Download(g.q, a_gpu.data());
+  CHECK(a_gpu == a_fp8);
+
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+  DeviceTensor dout(b, g.q, DType::kBF16, {M, N});
+  vt::MatmulFp8Cutlass(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+  std::vector<uint16_t> out_h(static_cast<size_t>(M) * N);
+  dout.Download(g.q, out_h.data());
+  std::vector<float> got(out_h.size());
+  for (size_t i = 0; i < out_h.size(); ++i) got[i] = Bf16ToF32(out_h[i]);
+
+  // bf16 output + f32 tensor-core reduction (different K order): fp8/bf16 tol.
+  CheckClose(got, ref, /*atol=*/2e-2f, /*rtol=*/3e-2f);
+}
+
+}  // namespace
+
+TEST_CASE("fp8 cutlass W8A8 GEMM matches host W8A8 reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cutlass W8A8 test");
+    return;
+  }
+  // Cover both M-dispatch configs (M<=256 pingpong 64-tile; M>256 default
+  // 128-tile) and the small-M decode shapes (M=1/8) + a prefill shape.
+  RunCase(1, 256, 128, 1);
+  RunCase(8, 512, 256, 2);
+  RunCase(16, 128, 512, 3);
+  RunCase(64, 256, 256, 4);
+  RunCase(200, 320, 128, 5);
+  RunCase(512, 256, 256, 6);
+  RunCase(1024, 128, 256, 7);
+}
+
+TEST_CASE("fp8 cutlass W8A8 GEMM f32-output path matches bf16") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cutlass f32-out test");
+    return;
+  }
+  // f32 out is the bf16 epilogue value cast up; same reference within tol.
+  const int M = 8, N = 256, K = 256;
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
+  std::uniform_int_distribution<int> ub(0, 255);
+  const float input_scale = 0.03f, weight_scale = 0.02f, alpha = input_scale * weight_scale;
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  for (auto& v : x) v = ux(rng);
+  std::vector<uint8_t> b_fp8(static_cast<size_t>(N) * K);
+  for (auto& bb : b_fp8) {
+    int byte = ub(rng);
+    if ((byte & 0x7F) == 0x7F) byte &= ~0x7;
+    bb = static_cast<uint8_t>(byte);
+  }
+  std::vector<uint8_t> a_fp8(x.size());
+  for (size_t i = 0; i < x.size(); ++i) a_fp8[i] = vllm::F32ToF8E4M3(x[i] / input_scale);
+  std::vector<float> ref(static_cast<size_t>(M) * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k)
+        acc += vllm::F8E4M3ToF32(a_fp8[static_cast<size_t>(m) * K + k]) *
+               vllm::F8E4M3ToF32(b_fp8[static_cast<size_t>(n) * K + k]);
+      ref[static_cast<size_t>(m) * N + n] = alpha * acc;
+    }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor da(b, g.q, DType::kI8, {M, K}, a_fp8.data());
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+  DeviceTensor dout(b, g.q, DType::kF32, {M, N});
+  vt::MatmulFp8Cutlass(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+  std::vector<float> got(static_cast<size_t>(M) * N);
+  dout.Download(g.q, got.data());
+  CheckClose(got, ref, 2e-2f, 3e-2f);
+}

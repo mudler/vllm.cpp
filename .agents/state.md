@@ -1172,3 +1172,15 @@ dgx inspection of the checkpoint).
   grouped → wire both models. NOTE: 202MB cutlass probe clone left at ~/cutlass_probe on dgx (97%
   disk / 126G free). OPEN grounding Q for Phase 1: does the 35B (modelopt NVFP4) run W4A4 or W4A16 in
   vLLM (which cutlass kernel) — the 27B is cleanly W4A4.
+
+- **2026-07-05 (cutlass FP8 W8A8 drop-in — the #2 decode lever, MERGED)**
+  Lifted vLLM's `cutlass_scaled_mm_sm120_fp8` → `vt::MatmulFp8Cutlass` (new gated TU
+  `cuda_matmul_fp8_cutlass.cu`) + `vt::QuantFp8Static` (static per-tensor act quant) + fp8-resident
+  `Fp8Weight`/`LoadFp8Raw` (loads the previously-ignored `input_scale`; `alpha=input_scale·weight_scale`
+  folded into the LinearCombination `alpha_ptr`, per-tensor so identical to vLLM's ScaledEpilogue).
+  Wired the 7 FP8 projections (attn q/k/v/o + GDN in_proj_qkv/z/out_proj) fp8→fp4→bf16, load-time gate
+  `VT_FP8_CUTLASS=1`. Unit 23/23 (bit-exact quant + W8A8-ref GEMM); **35B paged engine 16/16
+  token-for-token with the W8A8 path** (near-tie held, identical to bf16 default); 27B unaffected.
+  Same-binary A/B win: decode +5.5% (1024/128) / +7.0% (256/512), TTFT −4.8%/−5.6%, peak RSS −1.19GB.
+  Opposite sign to the reference W8A16 GEMV (−5-7%) — cutlass W8A8 beats cublas bf16. NEXT lever:
+  GdnScan (30.6% decode) + PagedAttention (14%).

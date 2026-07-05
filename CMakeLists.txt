@@ -216,12 +216,18 @@ if(VLLM_CPP_CUDA)
   # tree + relaxed-constexpr/extended-lambda, so it never touches the general
   # build. Gated by VT_CUTLASS_NVFP4 so the host op path no-ops if not compiled.
   if(VLLM_CPP_CUTLASS)
-    target_sources(vllm PRIVATE src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu)
-    target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1)
+    # Both cutlass GEMM TUs share the same isolated heavy-include discipline.
+    # NVFP4 W4A4 (VT_CUTLASS_NVFP4) + per-tensor W8A8 fp8 (VT_CUTLASS_FP8).
+    target_sources(vllm PRIVATE
+      src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu
+      src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+    target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1 VT_CUTLASS_FP8=1)
     # cutlass headers reach via -isystem so their internal deprecation warnings
     # are exempt from the global -Werror=all-warnings (the general build stays
     # strict). --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.
-    set_source_files_properties(src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu PROPERTIES
+    set_source_files_properties(
+      src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu
+      src/vt/cuda/cuda_matmul_fp8_cutlass.cu PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
   endif()

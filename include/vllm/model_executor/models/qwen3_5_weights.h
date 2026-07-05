@@ -93,6 +93,32 @@ struct Nvfp4Weight {
   mutable std::shared_ptr<void> d_scale_sw;
 };
 
+// Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN
+// in_proj_qkv/z/out_proj projections (checkpoint: weight F8_E4M3 + f32
+// weight_scale + f32 input_scale, activations W8A8 static per-tensor). Raw IEEE
+// fp8-e4m3fn bytes kept in the ORIGINAL torch [N=out_features, K=in_features]
+// orientation the cutlass W8A8 GEMM reads directly (NOT transposed to Matmul-B
+// [in,out], NOT dequanted to bf16 — halves the projection's device memory vs the
+// bf16 field and defers all scaling into the GEMM). On the CUDA path the forward
+// uploads the bytes ONCE (lazily; the mutable device handle below) and reads them
+// in place across every step. Populated only on the real 35B CUDA load with the
+// cutlass W8A8 path enabled (LoadFp8Raw); the bf16 field it replaces is left
+// EMPTY. `alpha = input_scale * weight_scale` is precomputed at load (both scales
+// are per-tensor scalars) — the single fused scalar vt::MatmulFp8Cutlass applies.
+struct Fp8Weight {
+  OwnedTensor packed;         // i8 [N, K]  one fp8-e4m3fn byte per element
+  float weight_scale = 0.0F;  // per-tensor weight_scale (dequant(w) = f8(w)*this)
+  float input_scale = 0.0F;   // per-tensor activation scale (quant a = a/this)
+  float alpha = 0.0F;         // input_scale * weight_scale (folded GEMM scalar)
+  int64_t n = 0;              // out_features
+  int64_t k = 0;              // in_features
+  bool Empty() const { return packed.Empty(); }
+
+  // Lazily-populated device-resident copy (CUDA forward only; null on host or
+  // before first use). The shared_ptr deleter frees through the vt Backend.
+  mutable std::shared_ptr<void> d_packed;
+};
+
 // Gated-DeltaNet (linear_attention) layer weights. Projections in Matmul-B
 // layout [in, out]; conv1d [conv_dim, K]; a_log/dt_bias f32 [Hv]; norm bf16.
 struct GdnLayerWeights {
@@ -111,6 +137,15 @@ struct GdnLayerWeights {
   // on it and out_proj above is left EMPTY; the 35B / synthetic loaders populate
   // the bf16 out_proj and leave this empty. Exactly one is filled.
   Nvfp4Weight out_proj_fp4;   // [N=H, K=value_dim]
+
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
+  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
+  // in_proj_qkv/z/out_proj above are then left EMPTY and the forward calls
+  // vt::MatmulFp8Cutlass. The 27B (bf16 in_proj + fp4 out_proj) and GGUF/synthetic
+  // (bf16) loaders leave these empty. The forward checks fp8, then fp4, then bf16.
+  Fp8Weight in_proj_qkv_fp8;  // [N=conv_dim, K=H]
+  Fp8Weight in_proj_z_fp8;    // [N=value_dim, K=H]
+  Fp8Weight out_proj_fp8;     // [N=H, K=value_dim]
 };
 
 // Full (dense causal) attention layer weights.
@@ -131,6 +166,16 @@ struct FullAttnLayerWeights {
   Nvfp4Weight k_proj_fp4;  // [N=Hkv*Dh,  K=H]
   Nvfp4Weight v_proj_fp4;  // [N=Hkv*Dh,  K=H]
   Nvfp4Weight o_proj_fp4;  // [N=H,       K=Hq*Dh]
+
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
+  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
+  // q/k/v/o_proj above are then left EMPTY and the forward calls
+  // vt::MatmulFp8Cutlass. The 27B (fp4) and GGUF/synthetic (bf16) loaders leave
+  // these empty. The forward checks fp8, then fp4, then falls back to bf16.
+  Fp8Weight q_proj_fp8;  // [N=2*Hq*Dh, K=H]
+  Fp8Weight k_proj_fp8;  // [N=Hkv*Dh,  K=H]
+  Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]
+  Fp8Weight o_proj_fp8;  // [N=H,       K=Hq*Dh]
 };
 
 // Sparse-MoE block (router + per-expert MLP + shared expert). Per-expert and

@@ -164,6 +164,38 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
   reinterpret_cast<MatmulNvfp4CutlassFn>(GetOp(OpId::kMatmulNvfp4Cutlass, q.device.type))(
       q, out, a_packed, a_sf_sw, b_packed, b_sf_sw, alpha);
 }
+void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale) {
+  VT_CHECK(x.rank == 2 && out_fp8.rank == 2, "quant_fp8_static: x/out must be rank-2");
+  VT_CHECK(out_fp8.shape[0] == x.shape[0] && out_fp8.shape[1] == x.shape[1],
+           "quant_fp8_static: out must match x shape [M,K]");
+  VT_CHECK(IsFloat(x.dtype), "quant_fp8_static: float x (f32/bf16) required");
+  VT_CHECK(out_fp8.dtype == DType::kI8, "quant_fp8_static: out must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(x.IsContiguous() && out_fp8.IsContiguous(),
+           "quant_fp8_static: contiguous tensors required");
+  VT_CHECK(x.device == q.device && out_fp8.device == q.device,
+           "quant_fp8_static: device mismatch (x/out/queue)");
+  reinterpret_cast<QuantFp8StaticFn>(GetOp(OpId::kQuantFp8Static, q.device.type))(q, out_fp8, x,
+                                                                                  input_scale);
+}
+void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                      float alpha) {
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
+           "matmul_fp8_cutlass: all tensors must be rank-2");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  VT_CHECK(k % 16 == 0 && n % 16 == 0, "matmul_fp8_cutlass: K and N must be multiples of 16");
+  VT_CHECK(b_fp8.shape[1] == k, "matmul_fp8_cutlass: b_fp8 must be [N, K] (K matches a_fp8)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_fp8_cutlass: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kBF16 || out.dtype == DType::kF32,
+           "matmul_fp8_cutlass: out must be bf16 or f32 (bf16 epilogue, f32 via cast)");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_cutlass: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && b_fp8.IsContiguous(),
+           "matmul_fp8_cutlass: contiguous tensors required");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device,
+           "matmul_fp8_cutlass: device mismatch");
+  reinterpret_cast<MatmulFp8CutlassFn>(GetOp(OpId::kMatmulFp8Cutlass, q.device.type))(
+      q, out, a_fp8, b_fp8, alpha);
+}
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,

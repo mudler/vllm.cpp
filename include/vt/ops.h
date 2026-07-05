@@ -37,6 +37,8 @@ enum class OpId : uint8_t {
   kScaledFp4Quant,
   kMatmulNvfp4Fp4,
   kMatmulNvfp4Cutlass,
+  kMatmulFp8Cutlass,
+  kQuantFp8Static,
   kSwizzleBlockscale,
   kMoeGroupedGemmNvfp4,
   kMoeSiluMul,
@@ -138,6 +140,9 @@ using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+using MatmulFp8CutlassFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
@@ -292,6 +297,31 @@ void SwizzleBlockscale(Queue& q, Tensor& out_swizzled, const Tensor& in_linear);
 // ·(1/weight_divisor). out [M,N] bf16. CUDA-only (sm120a). K,N % 32 == 0.
 void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_sf_sw,
                         const Tensor& b_packed, const Tensor& b_sf_sw, float alpha);
+
+// --- Per-tensor FP8 W8A8 (the 35B attn q/k/v/o + GDN in_proj_qkv/z/out_proj).
+// Mirror of vLLM's static-scale fp8 linear: static per-tensor activation quant +
+// cutlass_scaled_mm_sm120_fp8. The checkpoint stores weight F8_E4M3 + a f32
+// per-tensor weight_scale + a f32 per-tensor input_scale (both applied directly:
+// dequant(w)=f8(w)*weight_scale, dequant(a)=f8(a)*input_scale).
+
+// QuantFp8Static (mirror vLLM static_scaled_fp8_quant, is_scale_inverted=False):
+//   out_fp8[i] = fp8_e4m3( clamp(x[i] / input_scale, -448, 448) )   // RNE hw cvt
+// Static per-tensor scale (NOT dynamic/per-token). x [M,K] f32/bf16, out [M,K]
+// i8 (raw fp8-e4m3fn bytes). CUDA only (the 35B W8A8 path is CUDA-resident).
+void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
+
+// MatmulFp8Cutlass (lift of vLLM cutlass_scaled_mm_sm120_fp8 — the per-tensor
+// W8A8 fp8 GEMM vLLM selects on sm120/GB10). Same math as vLLM's ScaledEpilogue
+//   out[M,N] = scale_a * (scale_b * (A_fp8 @ B_fp8^T))
+// but the two PER-TENSOR static scales are folded into one scalar
+//   alpha = input_scale * weight_scale
+// (identical for per-tensor scalars; a single fused f32 multiply vs vLLM's
+// sequential scale_a·(scale_b·acc) — within fp8 tolerance, ported deviation).
+// a_fp8 [M,K] (= QuantFp8Static output), b_fp8 [N,K] the on-disk raw fp8-e4m3fn
+// weight (K contiguous). out [M,N] bf16 (cutlass epilogue) or f32 (via cast).
+// K,N multiples of 16 (128-bit fp8 alignment). CUDA-only (sm120a).
+void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                      float alpha);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

@@ -1100,3 +1100,18 @@ dgx inspection of the checkpoint).
   → true-W4A4 gives BOTH token-exact correctness AND vLLM-comparable speed; the 6a a16 path is retired
   to vLLM's Marlin-W4A16 fallback role. Ordered plan in notes §7.6. 27B W4A4 impl QUEUED behind the
   35B PagedAttention GPU job (serialize). In parallel now: 35B PagedAttention lever (running).
+- **2026-07-05 (27B true-W4A4 gate: logit-correct + matches vLLM emulation, but token-6 near-tie
+  differs from NATIVE-kernel oracle; 35B preserved 16/16)** — Drove the GB10 gate directly (agents
+  flaked: one DNS mis-diagnosis, one punted to a background waiter). Branch `9a1af52` builds clean
+  on GB10 (nvcc `-Werror=all-warnings`). Result: **35B `test_qwen36_paged_engine` PASSED 16/16**
+  (fp4-gating kept it byte-identical); **27B `test_qwen27_paged_engine` FAILED** — ours `{...13,271,
+  248068,...}` vs oracle `{...13,198,760,...}`, **tokens 0-5 exact ("capital of Germany is Berlin."),
+  diverges at token 6 (271 vs 198)** — the SAME near-tie as the a16 path. ROOT CAUSE (grounded): our
+  `MatmulNvfp4Fp4` DEQUANTS fp4→bf16 + bf16 compute (proven == vLLM `run_nvfp4_emulations` on CPU,
+  529 assert), but the oracle golden was captured from vLLM's NATIVE `cutlass_scaled_fp4_mm_sm120a`;
+  **emulation ≠ native on near-ties** (notes §7.2: `reciprocal_approximate_ftz` vs exact division,
+  1-ULP → tips token 6). So we correctly mirror vLLM's REFERENCE (emulation) but not its native-kernel
+  greedy. Branch NOT merged (gate red, correct). NEXT (grounded, no-ask per mirror-vLLM): (1) diagnostic
+  — confirm vLLM-emulation also gives 271 (→ we mirror the reference); (2) implement the NATIVE fp4×fp4
+  MMA (mirror cutlass sm120a) = the faithful mirror AND the 27B speed path; native accum may resolve
+  the tie. Correctness bar if native still tie-flips: logit-parity + emulation-token-match (both met).

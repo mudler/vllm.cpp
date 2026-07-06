@@ -302,14 +302,22 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   }
 
   const vt::Device dev = queue_.device;
+  // bf16 GDN state caches on CUDA (vLLM default mamba_cache_dtype auto → model
+  // dtype), f32 on CPU (the CPU GDN ops are f32-only; the exact-value CPU tests
+  // assume f32). The CUDA GDN decode/conv kernels read bf16 → f32 → write bf16.
+  gdn_cache_dtype_ =
+      dev.type == vt::DeviceType::kCUDA ? vt::DType::kBF16 : vt::DType::kF32;
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
         config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
     if (is_gdn) {
+      // State caches: bf16 on CUDA (vLLM default), f32 on CPU (f32-only CPU ops).
+      // Raw bytes sized by gdn_cache_dtype_; 0 bytes == +0.0f in both dtypes.
+      const size_t es = vt::SizeOf(gdn_cache_dtype_);
       ssm_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk) * es, uint8_t{0});
       conv_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)) * es, uint8_t{0});
     } else {
       full_attn_buf_.emplace_back(
           static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh), 0.0f);
@@ -331,9 +339,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
-    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), vt::DType::kF32,
+    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), gdn_cache_dtype_,
                                           dev, {gdn_state_slots_, Hv, Dv, Dk});
-    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), vt::DType::kF32,
+    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), gdn_cache_dtype_,
                                            dev,
                                            {gdn_state_slots_, conv_dim, Kw - 1});
     gdn_state_.push_back(gs);

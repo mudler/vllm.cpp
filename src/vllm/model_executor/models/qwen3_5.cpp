@@ -817,6 +817,39 @@ void ScatterRows(Dev d, const Tensor& dst, const void* src,
     d.b.Copy(d.q, dp + static_cast<size_t>(idx[s]) * rb, sp + s * rb, rb);
 }
 
+// Gather idx-indexed rows of a persistent GDN state cache into a fresh f32
+// working buffer. On CUDA the cache is bf16 (vLLM default mamba_cache_dtype
+// auto → model dtype): gather the raw bf16 rows then upcast — fla reads the
+// bf16 cache into f32 registers (fused_recurrent.py:102). On CPU the cache is
+// f32: gather directly. The f32 buffer is what the f32 GdnPrefill/CausalConv1dFwd
+// consume; the bf16 round-trip lives only at the cache boundary.
+DBuf GatherStateF32(Dev d, const Tensor& cache, const std::vector<int32_t>& idx,
+                    int64_t row_elems, const std::vector<int64_t>& shape) {
+  DBuf f32buf(d, DType::kF32, shape);
+  if (cache.dtype == DType::kBF16) {
+    DBuf bf(d, DType::kBF16, shape);
+    GatherRows(d, bf.ptr(), cache, idx, row_elems);
+    vt::CastF32(d.q, f32buf.t(), bf.t());
+  } else {
+    GatherRows(d, f32buf.ptr(), cache, idx, row_elems);
+  }
+  return f32buf;
+}
+
+// Inverse of GatherStateF32: downcast the f32 working buffer to the cache dtype
+// (bf16 on CUDA / f32 on CPU) and scatter it back to the idx-indexed slots.
+void ScatterStateF32(Dev d, const Tensor& cache, DBuf& f32buf,
+                     const std::vector<int32_t>& idx, int64_t row_elems,
+                     const std::vector<int64_t>& shape) {
+  if (cache.dtype == DType::kBF16) {
+    DBuf bf(d, DType::kBF16, shape);
+    vt::CastBf16(d.q, bf.t(), f32buf.t());
+    ScatterRows(d, cache, bf.ptr(), idx, row_elems);
+  } else {
+    ScatterRows(d, cache, f32buf.ptr(), idx, row_elems);
+  }
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -1003,14 +1036,17 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     const auto& qsl_full = *meta.non_spec_query_start_loc;
     const auto& his_u8 = *meta.has_initial_state;
     const int64_t nreq = static_cast<int64_t>(sidx.size());
-    DBuf dcs(d, DType::kF32, {nreq, conv_dim, Kw - 1});
-    GatherRows(d, dcs.ptr(), state.conv_state, sidx, conv_row_elems);
+    // Gather the persistent conv_state rows into an f32 working buffer (bf16
+    // cache on CUDA → upcast; f32 cache on CPU → direct), run the f32
+    // CausalConv1dFwd, then downcast + scatter back to the cache.
+    const std::vector<int64_t> cs_shape = {nreq, conv_dim, Kw - 1};
+    DBuf dcs = GatherStateF32(d, state.conv_state, sidx, conv_row_elems, cs_shape);
     std::vector<int32_t> his(his_u8.begin(), his_u8.end());
     DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
     DBuf dhis(d, DType::kI32, {nreq}, his.data());
     vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
                         dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
-    ScatterRows(d, state.conv_state, dcs.ptr(), sidx, conv_row_elems);
+    ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems, cs_shape);
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
     // conv_state at each sequence's slot (mirrors mamba causal_conv1d_update
@@ -1077,12 +1113,16 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     const auto& pidx = *meta.prefill_state_indices;
     const auto& p_his = *meta.prefill_has_initial_state;
     const auto& p_qsl = *meta.prefill_query_start_loc;
-    DBuf dss(d, DType::kF32, {np, Hv, Dv, Dk});
-    GatherRows(d, dss.ptr(), state.ssm_state, pidx, ssm_row_elems);
+    // Gather the persistent ssm_state rows into an f32 working buffer (bf16 cache
+    // on CUDA → upcast; f32 cache on CPU → direct), run the f32 chunked GdnPrefill
+    // (fla reads the initial_state in f32, writes the final_state), then downcast +
+    // scatter back to the cache.
+    const std::vector<int64_t> ss_shape = {np, Hv, Dv, Dk};
+    DBuf dss = GatherStateF32(d, state.ssm_state, pidx, ssm_row_elems, ss_shape);
     // ⚠ GDN-STATE ZEROING (M1.6 caller obligation, qwen_gdn_linear_attn.py:1514):
     // vt::GdnPrefill reads `state` unconditionally, so zero the gathered rows
     // for fresh requests (prefill_has_initial_state==0) — else a fresh request
-    // reads a stale mamba block.
+    // reads a stale mamba block. Zero the f32 working rows.
     const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
     for (size_t s = 0; s < p_his.size(); ++s)
       if (p_his[s] == 0)
@@ -1096,7 +1136,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor o_pre = SubView(dcore.t(), nd_tok, np_tok);
     vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
                    dpqsl.t(), vt::GdnArgs{scale});
-    ScatterRows(d, state.ssm_state, dss.ptr(), pidx, ssm_row_elems);
+    ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems, ss_shape);
   }
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.

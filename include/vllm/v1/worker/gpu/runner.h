@@ -208,8 +208,17 @@ class GPUModelRunner final : public ModelRunnerBase {
 
   // Owned KV-cache backing storage (host at T0) + the views the forward reads.
   std::vector<std::vector<float>> full_attn_buf_;  // per full-attn layer
-  std::vector<std::vector<float>> ssm_buf_;        // per GDN layer
-  std::vector<std::vector<float>> conv_buf_;       // per GDN layer
+  // GDN recurrent + conv state caches. On CUDA they are bf16 (gdn_cache_dtype_),
+  // mirroring vLLM's default mamba_cache_dtype/mamba_ssm_cache_dtype="auto" →
+  // model dtype (bf16 for Qwen3-Next): fla fused_recurrent reads bf16 → f32
+  // registers → writes bf16, which the CUDA GDN decode/conv kernels replicate.
+  // This halves the decode recurrent-state read/write traffic and the resident
+  // state-cache footprint. On CPU (the unit tests) they stay f32 — the CPU GDN
+  // ops are f32-only and the exact-value tests assume f32. Backing storage is
+  // raw bytes sized by gdn_cache_dtype_ (0 bytes == +0.0f in both f32 and bf16).
+  vt::DType gdn_cache_dtype_ = vt::DType::kF32;
+  std::vector<std::vector<uint8_t>> ssm_buf_;   // per GDN layer (raw bytes)
+  std::vector<std::vector<uint8_t>> conv_buf_;  // per GDN layer (raw bytes)
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
 

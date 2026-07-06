@@ -936,9 +936,11 @@ void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   VT_CHECK(k_out.Numel() / t == key_dim, "gdn_conv_split: q_out and k_out must share key_dim");
   VT_CHECK(conv.shape[1] == 2 * key_dim + value_dim,
            "gdn_conv_split: conv_dim must be 2*key_dim + value_dim");
-  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 &&
-               v_out.dtype == DType::kF32 && conv.dtype == DType::kF32,
-           "gdn_conv_split: all tensors must be f32");
+  // q/k/v out may be f32 OR bf16 (coupled GDN bf16 path); conv stays f32.
+  VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
+               k_out.dtype == q_out.dtype && v_out.dtype == q_out.dtype &&
+               conv.dtype == DType::kF32,
+           "gdn_conv_split: q/k/v out f32 or bf16 (same dtype), conv f32");
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                conv.IsContiguous(),
            "gdn_conv_split: contiguous required");
@@ -976,12 +978,18 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
            "gdn_post_conv: g_out/beta_out/araw/braw must all be [T,Hv]");
   VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv && dt_bias.rank == 1 && dt_bias.shape[0] == hv,
            "gdn_post_conv: a_log/dt_bias must be [Hv]");
-  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 &&
-               v_out.dtype == DType::kF32 && g_out.dtype == DType::kF32 &&
-               beta_out.dtype == DType::kF32 && conv.dtype == DType::kF32 &&
-               araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
-               a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
-           "gdn_post_conv: all tensors must be f32");
+  // q/k/v activations may be f32 OR bf16 (coupled GDN bf16 path, VT_GDN_BF16):
+  // bf16 feeds the WMMA chunk-scan as native bf16 fragments. All three must share
+  // one dtype (the scan requires q.dtype==k.dtype==v.dtype). g/beta and the
+  // conv/araw/braw/a_log/dt_bias inputs stay f32 — FLA keeps the gates f32.
+  VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
+               k_out.dtype == q_out.dtype && v_out.dtype == q_out.dtype,
+           "gdn_post_conv: q_out/k_out/v_out must be f32 or bf16, same dtype");
+  VT_CHECK(g_out.dtype == DType::kF32 && beta_out.dtype == DType::kF32 &&
+               conv.dtype == DType::kF32 && araw.dtype == DType::kF32 &&
+               braw.dtype == DType::kF32 && a_log.dtype == DType::kF32 &&
+               dt_bias.dtype == DType::kF32,
+           "gdn_post_conv: g/beta/conv/araw/braw/a_log/dt_bias must be f32");
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                g_out.IsContiguous() && beta_out.IsContiguous() && conv.IsContiguous() &&
                araw.IsContiguous() && braw.IsContiguous() && a_log.IsContiguous() &&

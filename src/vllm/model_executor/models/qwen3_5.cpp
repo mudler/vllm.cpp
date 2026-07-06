@@ -892,6 +892,26 @@ bool GlueFuseEnabled() {
   return on;
 }
 
+// Coupled GDN bf16 activations (the measured #1 prefill lever). Default ON. When
+// on, the GDN chunk-scan matmul-INPUT activations (q/k/v out of the post-conv
+// prep, hence the derived u/w/v_new/hstate scratch — those follow the input
+// dtype in cuda_gdn.cu's LaunchChunkedPrefill) are bf16, so the WMMA chunk trio
+// (WU Gram / DeltaH / ChunkO) runs on native bf16 tensor-core fragments (2× vs
+// TF32) AND moves half the activation/scratch bytes. The recurrent ssm_state,
+// the g log-decay + its cumsum, beta, and the WMMA f32 accumulators stay f32 —
+// mirroring vLLM FLA's dtype split (chunk_delta_h.py final_state=torch.float32
+// while v_new/w are k.dtype=bf16; wy_fast.py u/w = k.new_empty bf16; chunk_o.py
+// b_o/b_A f32 accumulators, o stored bf16). The op-level bf16 WMMA path is the
+// same one test_ops_gdn's bf16 chunked-vs-sequential case exercises (3e-2 tol).
+// A/B: VT_GDN_BF16=0 restores the f32/TF32 activations in the same binary.
+DType GdnActDType() {
+  static const bool bf16 = [] {
+    const char* e = std::getenv("VT_GDN_BF16");
+    return e == nullptr || e[0] != '0';
+  }();
+  return bf16 ? DType::kBF16 : DType::kF32;
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -936,17 +956,21 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // fused_gdn_prefill_post_conv), or the four per-op launches when disabled.
   Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
   Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
-  DBuf vf(d, DType::kF32, {T, Hv, Dv});
+  // Coupled bf16 (VT_GDN_BF16, default ON): the matmul-input activations q/k/v
+  // feed the WMMA chunk trio as native bf16 (halved traffic + bf16 fragments);
+  // g/beta/state stay f32 (FLA's split). VT_GDN_BF16=0 keeps f32/TF32.
+  const DType actdt = GdnActDType();
+  DBuf vf(d, actdt, {T, Hv, Dv});
   DBuf g(d, DType::kF32, {T, Hv});
   DBuf beta(d, DType::kF32, {T, Hv});
-  DBuf dql2(d, DType::kF32, {T, Hk, Dk});
-  DBuf dkl2(d, DType::kF32, {T, Hk, Dk});
+  DBuf dql2(d, actdt, {T, Hk, Dk});
+  DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
     vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw.t(),
                     braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
-    DBuf qf(d, DType::kF32, {T, Hk, Dk});
-    DBuf kf(d, DType::kF32, {T, Hk, Dk});
+    DBuf qf(d, actdt, {T, Hk, Dk});
+    DBuf kf(d, actdt, {T, Hk, Dk});
     Tensor q2 = Reshape(qf.t(), {T, key_dim});
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});
@@ -1123,17 +1147,20 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // launches when disabled. g/beta uniform over all tokens; recurrence segments.
   Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
   Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
-  DBuf vf(d, DType::kF32, {T, Hv, Dv});
+  // Coupled bf16 (VT_GDN_BF16, default ON): matmul-input activations q/k/v are
+  // bf16 (native WMMA fragments + halved traffic); g/beta/state f32 (FLA split).
+  const DType actdt = GdnActDType();
+  DBuf vf(d, actdt, {T, Hv, Dv});
   DBuf dg(d, DType::kF32, {T, Hv});
   DBuf dbeta(d, DType::kF32, {T, Hv});
-  DBuf dql2(d, DType::kF32, {T, Hk, Dk});
-  DBuf dkl2(d, DType::kF32, {T, Hk, Dk});
+  DBuf dql2(d, actdt, {T, Hk, Dk});
+  DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
     vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw.t(),
                     braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
-    DBuf qf(d, DType::kF32, {T, Hk, Dk});
-    DBuf kf(d, DType::kF32, {T, Hk, Dk});
+    DBuf qf(d, actdt, {T, Hk, Dk});
+    DBuf kf(d, actdt, {T, Hk, Dk});
     Tensor q2 = Reshape(qf.t(), {T, key_dim});
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});

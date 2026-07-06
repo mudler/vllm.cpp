@@ -1195,7 +1195,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   const int rot = static_cast<int>(cfg.rotary_dim);
   const float base = static_cast<float>(cfg.rope_theta);
   const float eps = static_cast<float>(cfg.rms_norm_eps);
-  VT_CHECK(kv.dtype == DType::kBF16, "full-attn paged: KV cache must be bf16");
+  VT_CHECK(kv.dtype == DType::kBF16 || kv.dtype == DType::kF32,
+           "full-attn paged: KV cache must be bf16 or f32");
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "full-attn paged: KV cache head dims mismatch config");
 
@@ -1236,15 +1237,23 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
 
   Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
 
-  // bf16 KV cache: down-cast the rope'd f32 K and the f32 V to bf16 for the cache
-  // write (the "auto" ReshapeAndCache copy requires cache dtype == k/v dtype).
-  // The query stays f32 (Phase 1: f32 query · bf16 cache, f32-accumulate softmax —
-  // the cache reads convert bf16→f32 in the attention kernel). Mirrors vLLM's
-  // bf16 flash_attn KV store (halves KV memory).
+  // KV-cache dtype: the production runner allocates a bf16 cache (mirrors vLLM's
+  // bf16 flash_attn KV store, halves KV memory); the paged==dense unit anchors
+  // allocate an f32 cache to stay bit-exact. The "auto" ReshapeAndCache copy
+  // requires cache dtype == k/v dtype, so down-cast the rope'd f32 K and the f32
+  // V to bf16 only when the cache is bf16. The query stays f32 either way
+  // (Phase 1: f32 query · <cache-dtype> cache, f32-accumulate softmax — the
+  // attention kernel converts bf16 cache reads to f32).
+  Tensor kw = kn3;
+  Tensor vw = v3;
   DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
-  vt::CastBf16(d.q, kbf.t(), kn3);
-  vt::CastBf16(d.q, vbf.t(), v3);
+  if (kv.dtype == DType::kBF16) {
+    vt::CastBf16(d.q, kbf.t(), kn3);
+    vt::CastBf16(d.q, vbf.t(), v3);
+    kw = kbf.t();
+    vw = vbf.t();
+  }
 
   // Write the new K/V into the paged cache, then read K/V from the cache.
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
@@ -1253,7 +1262,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dblk = sdi.block_table.t();
   Tensor dsl = sdi.seq_lens.t();
   Tensor dqsl = sdi.query_start_loc.t();
-  vt::ReshapeAndCache(d.q, kbf.t(), vbf.t(), k_cache, v_cache, dslot);
+  vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
 
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));

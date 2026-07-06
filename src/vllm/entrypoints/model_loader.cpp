@@ -77,7 +77,13 @@ int ResolveMaxNumBatchedTokens(const EngineParams& params, int max_model_len) {
     // Explicit override; still honor the >= max_num_seqs invariant.
     return std::max(params.max_num_batched_tokens, seqs);
   }
-  int budget = vllm::SchedulerConfig::kDefaultMaxNumBatchedTokens;  // 2048
+  // GB10-tuned default: 4096. Measured +8.2% total throughput vs 2048 at the
+  // 35B gate (conc-64, in1024/out128) from packing more prefill tokens/step;
+  // 27B conc-8 is safe (peak ~56GB of 119GB, no OOM) and neutral. This is BELOW
+  // vLLM's runtime default (8192, vllm/config/scheduler.py API path) but above
+  // the DEFAULT_MAX_NUM_BATCHED_TOKENS=2048 floor — the memory-safe sweet spot
+  // on GB10's 119GB unified LPDDR5X (8192 measured worse, 16384 OOMs/reboots).
+  int budget = 4096;
   // Never exceed the whole workload's ceiling (tiny-model no-op preservation).
   const long ceiling = static_cast<long>(max_model_len) * seqs;
   if (ceiling > 0 && static_cast<long>(budget) > ceiling) {

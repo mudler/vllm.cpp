@@ -1361,8 +1361,14 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   if (wu_wmma) {
     const size_t wu_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TSc) +
                             static_cast<size_t>(kChunk * kChunk) * sizeof(float);
-    opt_in(reinterpret_cast<void*>(GdnChunkWUWmmaKernel<TSc>), wu_bytes,
-           "gdn chunked wu(wmma) shared opt-in");
+    // Always opt in: the f32/TF32 dynamic request is exactly 48 KiB, which plus
+    // the static gs/bs/eg overflows the 48 KiB default (opt_in's ">" guard would
+    // miss the boundary). Setting the max-dynamic attribute unconditionally is a
+    // no-op when the request already fits.
+    Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkWUWmmaKernel<TSc>),
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(wu_bytes)),
+          "gdn chunked wu(wmma) shared opt-in");
     GdnChunkWUWmmaKernel<TSc><<<grid_chunk, 256, wu_bytes, s>>>(
         u, w, k.Ptr<Tin>(), v.Ptr<Tin>(), beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n, dk, hv_n,
         dv);

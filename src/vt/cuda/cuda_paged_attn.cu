@@ -160,6 +160,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
 // ===========================================================================
 constexpr int kDecWarps = 8;  // warps per block (block = 256 threads)
 constexpr int kDecEpl = 8;    // head_dim elems per lane: d == 32 * 8 == 256
+constexpr int kDecGqaQG = 8;  // GQA reuse group: q-heads per KV head (gate qpk=8)
 
 // Load kDecEpl(=8) contiguous head-dim elems for `lane` (elems [lane*8,lane*8+8))
 // as one coalesced 128-bit transaction per lane (adjacent lanes -> adjacent
@@ -280,6 +281,153 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
       for (int i = 0; i < kDecEpl; ++i) acc[i] += sc * o_sh[w * d + lane * kDecEpl + i];
     }
     const float inv = 1.0f / gl;
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) Store(out, qoff + lane * kDecEpl + i, acc[i] * inv);
+  }
+}
+
+// ===========================================================================
+// DECODE path, GQA-FUSED (VT_ATTN_DECODE_GQA, default ON; =0 -> the per-q-head
+// opt kernel above). Mirrors vLLM's FlashDecoding grid (vllm/v1/attention/
+// backends/flash_attn.py @ e24d1b24 :1356 flash_decoding_ctas = num_reqs *
+// num_kv_heads * cdiv(num_queries_per_kv, q_tile_size); q_tile_size=128 >= the
+// gate's qpk=8 so ALL q-heads of a KV head land in ONE CTA) and FlashAttention-2
+// GQA (num_queries_per_kv grouping): load each KV head's K/V ONCE and attend all
+// its query heads, instead of the per-q-head opt kernel's 8x redundant K/V reads.
+//
+// The opt kernel above launches grid.y = hq (one block per q-head); the QG q-heads
+// sharing a KV head (gate: hq=16, num_kv_heads=2 -> QG=qpk=8) each re-stream the
+// FULL K/V of that KV head from DRAM -> 8x redundant KV traffic on a memory-bound
+// kernel. This kernel launches grid.y = num_kv_heads (one block per KV head); the
+// 8 warps stride the KV as before, but each key's K/V row is loaded ONCE and
+// reused across QG independent online-softmax accumulators (running m/l/O per
+// q-head, all in registers). KV DRAM/L2 traffic drops ~QG (=8x). Warp-stride,
+// warp-shuffle Q.Kᵀ, register softmax and the cross-warp flash merge are kept
+// byte-identical to the opt kernel; only the KV load is amortized over QG heads.
+// All per-q-head numerics are EXACT vs the opt kernel (same key order, same math).
+//   grid = (num_tokens, num_kv_heads); block = kDecWarps * 32.
+//   Shared: o_sh[kDecWarps*QG*d] | m_sh[kDecWarps*QG] | l_sh[kDecWarps*QG] (f32).
+// ===========================================================================
+template <typename TQ, typename TKV, typename Tout, int QG>
+__global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const TKV* k_cache,
+                                              const TKV* v_cache, const int32_t* block_table,
+                                              const int32_t* seq_lens,
+                                              const int32_t* query_start_loc, int64_t num_reqs,
+                                              int64_t hq, int64_t num_kv_heads, int64_t d,
+                                              int64_t block_size, int64_t bt_row, int64_t bt_col,
+                                              int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+                                              int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
+                                              float scale, bool causal) {
+  const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
+  const int64_t g = blockIdx.y;  // KV head (shared by QG q-heads)
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+
+  // Locate request r owning token t (same device scan as the opt kernel).
+  int64_t r = -1, q0 = 0, q1 = 0;
+  for (int64_t rr = 0; rr < num_reqs; ++rr) {
+    const int64_t a = query_start_loc[rr], b = query_start_loc[rr + 1];
+    if (t >= a && t < b) {
+      r = rr;
+      q0 = a;
+      q1 = b;
+      break;
+    }
+  }
+  if (r < 0) return;  // padding token beyond the last request
+
+  const int64_t query_len = q1 - q0;
+  const int64_t seqlen = seq_lens[r];
+  const int64_t context = seqlen - query_len;
+  const int64_t p = context + (t - q0);
+  const int64_t jmax = causal ? p : seqlen - 1;
+  const int64_t h0 = g * QG;  // first q-head sharing this KV head (QG == qpk)
+
+  // This lane's query slice for ALL QG heads, loaded once (128-bit coalesced/head).
+  float q_reg[QG][kDecEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh)
+    LoadRow8(query, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+
+  float m[QG], l[QG];
+  float o_reg[QG][kDecEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    m[hh] = -CUDART_INF_F;
+    l[hh] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) o_reg[hh][i] = 0.0f;
+  }
+
+  // Warp-strided scan over keys: the KV row is loaded ONCE per key and reused
+  // across all QG q-heads (the 8x KV-traffic reduction vs the opt kernel).
+  for (int64_t j = warp; j <= jmax; j += kDecWarps) {
+    const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+    const int64_t off = j % block_size;
+    float k_reg[kDecEpl];
+    LoadRow8(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+
+    float s_h[QG];  // per-q-head score for this key (broadcast to all lanes)
+#pragma unroll
+    for (int hh = 0; hh < QG; ++hh) {
+      float dot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kDecEpl; ++i) dot += q_reg[hh][i] * k_reg[i];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, o);
+      s_h[hh] = __shfl_sync(0xffffffffu, dot, 0) * scale;  // full-head score to lanes
+    }
+
+    float v_reg[kDecEpl];
+    LoadRow8(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
+#pragma unroll
+    for (int hh = 0; hh < QG; ++hh) {
+      const float m_new = fmaxf(m[hh], s_h[hh]);
+      const float corr = expf(m[hh] - m_new);  // 0 on the first key (m == -inf)
+      const float pw = expf(s_h[hh] - m_new);
+#pragma unroll
+      for (int i = 0; i < kDecEpl; ++i) o_reg[hh][i] = o_reg[hh][i] * corr + pw * v_reg[i];
+      l[hh] = l[hh] * corr + pw;
+      m[hh] = m_new;
+    }
+  }
+
+  // Cross-warp flash merge: partials -> shared, then each warp reduces the head(s)
+  // it owns (warp hh -> heads hh, hh+kDecWarps, ...). Layout: o_sh[warp][head][d].
+  extern __shared__ float smem[];
+  float* o_sh = smem;                                                     // [kDecWarps*QG*d]
+  float* m_sh = o_sh + static_cast<size_t>(kDecWarps) * QG * d;           // [kDecWarps*QG]
+  float* l_sh = m_sh + static_cast<size_t>(kDecWarps) * QG;               // [kDecWarps*QG]
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    float* dst = o_sh + (static_cast<size_t>(warp) * QG + hh) * d + lane * kDecEpl;
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) dst[i] = o_reg[hh][i];
+    if (lane == 0) {
+      m_sh[warp * QG + hh] = m[hh];
+      l_sh[warp * QG + hh] = l[hh];
+    }
+  }
+  __syncthreads();
+
+  for (int hh = warp; hh < QG; hh += kDecWarps) {
+    float gm = -CUDART_INF_F;
+#pragma unroll
+    for (int w = 0; w < kDecWarps; ++w) gm = fmaxf(gm, m_sh[w * QG + hh]);
+    float gl = 0.0f;
+    float acc[kDecEpl];
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) acc[i] = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kDecWarps; ++w) {
+      const float sc = expf(m_sh[w * QG + hh] - gm);  // empty warp: exp(-inf) == 0
+      gl += l_sh[w * QG + hh] * sc;
+      const float* src = o_sh + (static_cast<size_t>(w) * QG + hh) * d + lane * kDecEpl;
+#pragma unroll
+      for (int i = 0; i < kDecEpl; ++i) acc[i] += sc * src[i];
+    }
+    const float inv = 1.0f / gl;
+    const int64_t qoff = (t * hq + (h0 + hh)) * d;
 #pragma unroll
     for (int i = 0; i < kDecEpl; ++i) Store(out, qoff + lane * kDecEpl + i, acc[i] * inv);
   }
@@ -1089,6 +1237,19 @@ bool DecodeOptEnabled() {
   return enabled;
 }
 
+// GQA-fused decode: one block per (token, KV head), K/V loaded once and reused
+// across the QG q-heads of that KV head (mirrors vLLM FlashDecoding's num_reqs*
+// num_kv_heads CTA grid). Default ON; opt-out via VT_ATTN_DECODE_GQA=0 (falls
+// back to the per-q-head opt kernel). Composable with VT_ATTN_DECODE_OPT (the
+// GQA path is the further-optimized decode kernel; only active when OPT is on).
+bool DecodeGqaEnabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_ATTN_DECODE_GQA");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return enabled;
+}
+
 // --- Launchers -------------------------------------------------------------
 
 template <typename TQ, typename TKV, typename Tout>
@@ -1099,6 +1260,35 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
                   int64_t block_size) {
   const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
   if (DecodeOptEnabled() && d == 32 * kDecEpl) {
+    // GQA-fused decode (grid.y = num_kv_heads): stage each KV head's K/V ONCE and
+    // attend all QG q-heads of that head, killing the opt kernel's 8x redundant
+    // KV traffic. Mirrors vLLM FlashDecoding's num_reqs*num_kv_heads CTA grid.
+    // Eligible when qpk = hq/num_kv_heads equals the templated group size.
+    const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
+    if (DecodeGqaEnabled() && qpk == kDecGqaQG && num_kv_heads > 0 &&
+        hq == num_kv_heads * qpk) {
+      constexpr int QG = kDecGqaQG;
+      const int gblock = kDecWarps * 32;
+      const size_t gshmem =
+          (static_cast<size_t>(kDecWarps) * QG * d + 2ull * kDecWarps * QG) * sizeof(float);
+      auto* gkernel = PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG>;
+      if (gshmem > 48u * 1024u) {
+        Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(gkernel),
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(gshmem)),
+              "paged decode-gqa smem opt-in");
+      }
+      const dim3 gqa_grid(static_cast<unsigned>(num_tokens),
+                          static_cast<unsigned>(num_kv_heads));
+      gkernel<<<gqa_grid, gblock, gshmem, s>>>(
+          out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
+          block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+          num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
+          k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
+          v_cache.stride[1], v_cache.stride[2], args.scale, args.causal);
+      Check(cudaGetLastError(), "paged_attention decode-gqa launch");
+      return;
+    }
     // FlashInfer-style warp-split-KV decode: coalesced 128-bit K/V loads,
     // warp-shuffle online softmax (no per-key block barrier), register O.
     const int block = kDecWarps * 32;

@@ -1481,9 +1481,30 @@ std::vector<uint16_t> ExpertMlpNvfp4(Dev d, const Nvfp4Weight& gate,
 // out. Device-resident (M2.5 Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16
 // (device); the silu-mul + sigmoid-gate are device ops (not host loops), so the
 // shared expert adds no host round-trip to the captured decode step.
-DBuf SharedExpert(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
-                  const Tensor& h, int64_t T, bool fp4) {
-  const int64_t H = cfg.hidden_size;
+// MoE glue-kernel fusion (VT_MOE_GLUE_FUSE, default ON): fold the shared-expert
+// sigmoid gate into the weighted MoeCombine (one launch, no shared [T,H]
+// round-trip) instead of a separate SharedExpertGate kernel. Bit-identical to
+// the two-kernel path (see MoeCombineGate). VT_MOE_GLUE_FUSE=0 restores the
+// unfused SharedExpertGate + MoeCombine sequence for A/B.
+bool MoeGlueFuseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_GLUE_FUSE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// Shared-expert pre-gate parts: sd [T,H] f32 (down projection) and gl [T,1] f32
+// (gate logit), before the sigmoid gate + bf16 round. The unfused SharedExpert
+// applies SharedExpertGate to these; the fused MoeBlock passes them straight to
+// MoeCombineGate.
+struct SharedExpertParts {
+  DBuf sd;
+  DBuf gl;
+};
+
+SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                                      const Tensor& h, int64_t T, bool fp4) {
   const int64_t Is = cfg.shared_expert_intermediate_size;
   DBuf sg = fp4 ? MatmulNvfp4F32D(d, h, w.shared_gate_proj_fp4)
                 : MatmulF32D(d, h, w.shared_gate_proj);  // [T,Is]
@@ -1494,8 +1515,15 @@ DBuf SharedExpert(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   DBuf sd = fp4 ? MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4)
                 : MatmulF32D(d, sact.t(), w.shared_down_proj);  // [T,H] f32
   DBuf gl = MatmulF32D(d, h, w.shared_gate);                    // [T,1] f32
+  return {std::move(sd), std::move(gl)};
+}
+
+DBuf SharedExpert(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                  const Tensor& h, int64_t T, bool fp4) {
+  const int64_t H = cfg.hidden_size;
+  SharedExpertParts p = SharedExpertUngated(d, w, cfg, h, T, fp4);
   DBuf shared(d, DType::kBF16, {T, H});
-  vt::SharedExpertGate(d.q, shared.t(), sd.t(), gl.t());  // sigmoid(gl)*sd -> bf16
+  vt::SharedExpertGate(d.q, shared.t(), p.sd.t(), p.gl.t());  // sigmoid(gl)*sd -> bf16
   return shared;
 }
 
@@ -1607,10 +1635,16 @@ DBuf MoeBlockFusedCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
   // Shared expert + weighted combine (out = shared + sum_j w_j * expert_out_j),
-  // all device-resident (no host round-trip).
-  DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
+  // all device-resident (no host round-trip). MoE glue fusion folds the shared
+  // sigmoid gate into the combine (one launch, no shared [T,H] round-trip).
   DBuf dout(d, DType::kBF16, {T, H});
-  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
+  if (MoeGlueFuseEnabled()) {
+    SharedExpertParts sp = SharedExpertUngated(d, w, cfg, dh, T, true);
+    vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), sp.sd.t(), sp.gl.t());
+  } else {
+    DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
+    vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
+  }
   return dout;
 }
 
@@ -1788,9 +1822,15 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
                                 vt::MoeMarlinArgs{bi, 1, Pi, Hi, Ii, false});
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
-  DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
   DBuf dout(d, DType::kBF16, {T, H});
-  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
+  if (MoeGlueFuseEnabled()) {
+    // Fuse shared-expert gate into the combine (one launch, no shared round-trip).
+    SharedExpertParts sp = SharedExpertUngated(d, w, cfg, dh, T, true);
+    vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), sp.sd.t(), sp.gl.t());
+  } else {
+    DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
+    vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
+  }
   return dout;
 }
 #endif  // VT_MARLIN_NVFP4

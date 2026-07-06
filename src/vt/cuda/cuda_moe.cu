@@ -218,6 +218,77 @@ void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const
 }
 
 // ---------------------------------------------------------------------------
+// moe_combine_gate (MoE glue fusion): MoeCombine with the shared-expert gate
+// fused inline. Instead of a pre-materialized bf16 `shared` buffer (produced by
+// a separate SharedExpertGate launch + read back here), it takes sd [T,H] f32
+// and gl [T,1] f32 and computes the shared term per element as
+//   bf16(sigmoid(gl[row]) * sd[idx])  -> re-added in f32,
+// which is bit-identical to SharedExpertGate's store (Store<bf16>, round-to-
+// nearest-even) followed by MoeCombine's Load(shared) (bf16 -> f32). Saves one
+// kernel launch and the shared [T,H] global write+read per MoE layer. Mirrors
+// vLLM's fused weight-and-reduce (layers/fused_moe/moe_fused_mul_sum.py,
+// topk_weight_and_reduce.py moe_sum) extended to fold the shared contribution.
+__device__ inline float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+template <typename Teo, typename Tout>
+__global__ void MoeCombineGateKernel(Tout* out, const Teo* expert_out, const float* weights,
+                                     const float* sd, const float* gl, int64_t t, int64_t h,
+                                     int k) {
+  const int64_t n = t * h;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    const int64_t row = idx / h;
+    const int64_t col = idx % h;
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j)
+      acc += weights[row * k + j] * Load(expert_out, (row * k + j) * h + col);
+    // Shared-expert gate, rounded through bf16 exactly as SharedExpertGate's
+    // store, then re-added in f32 (matches MoeCombine's Load(shared) bf16->f32).
+    const float sv = SigmoidF(gl[row]) * sd[idx];
+    acc += __bfloat162float(__float2bfloat16(sv));
+    Store(out, idx, acc);
+  }
+}
+
+template <typename Teo, typename Tout>
+void LaunchCombineGate(cudaStream_t s, Tensor& out, const Tensor& expert_out,
+                       const Tensor& weights, const Tensor& sd, const Tensor& gl, int64_t t,
+                       int64_t h, int k) {
+  MoeCombineGateKernel<Teo, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
+      out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(), sd.Ptr<float>(),
+      gl.Ptr<float>(), t, h, k);
+  Check(cudaGetLastError(), "moe_combine_gate launch");
+}
+
+template <typename Teo>
+void DispatchOutGate(cudaStream_t s, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                     const Tensor& sd, const Tensor& gl, int64_t t, int64_t h, int k) {
+  if (out.dtype == DType::kF32) {
+    LaunchCombineGate<Teo, float>(s, out, expert_out, weights, sd, gl, t, h, k);
+  } else {
+    LaunchCombineGate<Teo, __nv_bfloat16>(s, out, expert_out, weights, sd, gl, t, h, k);
+  }
+}
+
+void MoeCombineGateKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out,
+                              const Tensor& weights, const Tensor& sd, const Tensor& gl) {
+  VT_CHECK(expert_out.dtype == DType::kF32 || expert_out.dtype == DType::kBF16,
+           "cuda moe_combine_gate: unsupported expert_out dtype (f32/bf16 only)");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "cuda moe_combine_gate: unsupported out dtype (f32/bf16 only)");
+  const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
+  if (t == 0 || h == 0) return;
+  cudaStream_t s = AsStream(q);
+  if (expert_out.dtype == DType::kF32) {
+    DispatchOutGate<float>(s, out, expert_out, weights, sd, gl, t, h, static_cast<int>(k));
+  } else {
+    DispatchOutGate<__nv_bfloat16>(s, out, expert_out, weights, sd, gl, t, h,
+                                   static_cast<int>(k));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // moe_silu_mul (moe-semantics.md §4): out[i] = silu(gate[i]) * up[i], the fused
 // activation between the grouped gate/up and down GEMMs. f32 math (silu via
 // expf), rounded on store — the same accepted expf-vs-std::exp deviation the CPU
@@ -281,6 +352,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelCuda)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernelCuda)));
+    RegisterOp(OpId::kMoeCombineGate, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MoeCombineGateFn>(&MoeCombineGateKernelCuda)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelCuda)));
   }

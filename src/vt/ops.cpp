@@ -555,6 +555,31 @@ void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& w
                                                                           weights, shared);
 }
 
+void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                    const Tensor& sd, const Tensor& gl) {
+  VT_CHECK(expert_out.rank == 3 && weights.rank == 2 && out.rank == 2,
+           "moe_combine_gate: expert_out [T,K,H], weights [T,K], out [T,H]");
+  const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
+  VT_CHECK(expert_out.shape[0] == t && expert_out.shape[1] == k && expert_out.shape[2] == h,
+           "moe_combine_gate: expert_out must be [T,K,H] matching out/weights");
+  VT_CHECK(weights.shape[0] == t, "moe_combine_gate: weights token count must match out");
+  VT_CHECK(IsFloat(expert_out.dtype) && IsOutFloat(out.dtype),
+           "moe_combine_gate: float expert_out, f32/bf16 out");
+  VT_CHECK(weights.dtype == DType::kF32, "moe_combine_gate: weights must be f32");
+  VT_CHECK(sd.dtype == DType::kF32 && sd.rank == 2 && sd.shape[0] == t && sd.shape[1] == h,
+           "moe_combine_gate: sd must be f32 [T,H]");
+  VT_CHECK(gl.dtype == DType::kF32 && gl.Numel() == t,
+           "moe_combine_gate: gl must be f32 with T elements");
+  VT_CHECK(expert_out.IsContiguous() && weights.IsContiguous() && out.IsContiguous() &&
+               sd.IsContiguous() && gl.IsContiguous(),
+           "moe_combine_gate: contiguous required");
+  VT_CHECK(expert_out.device == q.device && weights.device == q.device &&
+               out.device == q.device && sd.device == q.device && gl.device == q.device,
+           "moe_combine_gate: device mismatch");
+  reinterpret_cast<MoeCombineGateFn>(GetOp(OpId::kMoeCombineGate, q.device.type))(
+      q, out, expert_out, weights, sd, gl);
+}
+
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,

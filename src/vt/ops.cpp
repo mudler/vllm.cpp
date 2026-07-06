@@ -949,6 +949,53 @@ void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
                                                                               v_out, conv);
 }
 
+void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
+                 Tensor& beta_out, const Tensor& conv, const Tensor& araw, const Tensor& braw,
+                 const Tensor& a_log, const Tensor& dt_bias, const L2NormArgs& args) {
+  // Fusion of GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta; validation is the
+  // union of those four ops (same shape/dtype/device/contiguity contracts).
+  VT_CHECK(conv.rank == 2, "gdn_post_conv: conv rank-2 [T, conv_dim]");
+  VT_CHECK(q_out.rank == 3 && k_out.rank == 3 && v_out.rank == 3,
+           "gdn_post_conv: q_out/k_out/v_out rank-3 [T,H,D]");
+  const int64_t t = conv.shape[0];
+  VT_CHECK(t > 0, "gdn_post_conv: T must be > 0");
+  VT_CHECK(q_out.shape[0] == t && k_out.shape[0] == t && v_out.shape[0] == t,
+           "gdn_post_conv: q_out/k_out/v_out leading dim must be T");
+  const int64_t hk = q_out.shape[1], dk = q_out.shape[2];
+  const int64_t hv = v_out.shape[1], dv = v_out.shape[2];
+  VT_CHECK(k_out.shape[1] == hk && k_out.shape[2] == dk,
+           "gdn_post_conv: q_out and k_out must share [T,Hk,Dk]");
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  VT_CHECK(conv.shape[1] == 2 * key_dim + value_dim,
+           "gdn_post_conv: conv_dim must be 2*key_dim + value_dim");
+  VT_CHECK(g_out.rank == 2 && beta_out.rank == 2 && araw.rank == 2 && braw.rank == 2,
+           "gdn_post_conv: g_out/beta_out/araw/braw rank-2 [T,Hv]");
+  VT_CHECK(g_out.shape[0] == t && g_out.shape[1] == hv && beta_out.shape[0] == t &&
+               beta_out.shape[1] == hv && araw.shape[0] == t && araw.shape[1] == hv &&
+               braw.shape[0] == t && braw.shape[1] == hv,
+           "gdn_post_conv: g_out/beta_out/araw/braw must all be [T,Hv]");
+  VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv && dt_bias.rank == 1 && dt_bias.shape[0] == hv,
+           "gdn_post_conv: a_log/dt_bias must be [Hv]");
+  VT_CHECK(q_out.dtype == DType::kF32 && k_out.dtype == DType::kF32 &&
+               v_out.dtype == DType::kF32 && g_out.dtype == DType::kF32 &&
+               beta_out.dtype == DType::kF32 && conv.dtype == DType::kF32 &&
+               araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
+               a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
+           "gdn_post_conv: all tensors must be f32");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
+               g_out.IsContiguous() && beta_out.IsContiguous() && conv.IsContiguous() &&
+               araw.IsContiguous() && braw.IsContiguous() && a_log.IsContiguous() &&
+               dt_bias.IsContiguous(),
+           "gdn_post_conv: contiguous required");
+  VT_CHECK(q_out.device == q.device && k_out.device == q.device && v_out.device == q.device &&
+               g_out.device == q.device && beta_out.device == q.device && conv.device == q.device &&
+               araw.device == q.device && braw.device == q.device && a_log.device == q.device &&
+               dt_bias.device == q.device,
+           "gdn_post_conv: device mismatch");
+  reinterpret_cast<GdnPostConvFn>(GetOp(OpId::kGdnPostConv, q.device.type))(
+      q, q_out, k_out, v_out, g_out, beta_out, conv, araw, braw, a_log, dt_bias, args);
+}
+
 void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl) {
   VT_CHECK(out.rank == 2, "shared_expert_gate: out rank-2 [T,H]");
   const int64_t t = out.shape[0], h = out.shape[1];

@@ -976,6 +976,92 @@ TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {
   RunL2NormCudaCase({2, 300}, kCudaCombos[0], seed);
 }
 
+// gdn_post_conv: (1) CPU fused == CPU composed (GdnConvSplit + GdnGBeta +
+// L2Norm x2), bit-exact; (2) CUDA fused == CPU fused, within tol. All f32.
+void RunGdnPostConvCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t dv, uint32_t seed) {
+  const int64_t key_dim = hk * dk, value_dim = hv * dv, conv_dim = 2 * key_dim + value_dim;
+  const auto conv = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
+  const auto araw = RandomF32(static_cast<size_t>(t * hv), seed + 1, -1.0f, 1.0f);
+  const auto braw = RandomF32(static_cast<size_t>(t * hv), seed + 2, -1.0f, 1.0f);
+  const auto alog = RandomF32(static_cast<size_t>(hv), seed + 3, -1.0f, 1.0f);
+  const auto dtb = RandomF32(static_cast<size_t>(hv), seed + 4, -1.0f, 1.0f);
+  const vt::L2NormArgs args{1e-6f};
+  Queue cq = Q();
+  Tensor tconv = MakeT(const_cast<float*>(conv.data()), DType::kF32, Cpu(), {t, conv_dim});
+  Tensor taraw = MakeT(const_cast<float*>(araw.data()), DType::kF32, Cpu(), {t, hv});
+  Tensor tbraw = MakeT(const_cast<float*>(braw.data()), DType::kF32, Cpu(), {t, hv});
+  Tensor talog = MakeT(const_cast<float*>(alog.data()), DType::kF32, Cpu(), {hv});
+  Tensor tdtb = MakeT(const_cast<float*>(dtb.data()), DType::kF32, Cpu(), {hv});
+
+  // Composed CPU reference.
+  std::vector<float> rq(t * hk * dk), rk(t * hk * dk), rv(t * value_dim), rg(t * hv), rb(t * hv);
+  {
+    std::vector<float> sq(t * key_dim), sk(t * key_dim);
+    Tensor tsq = MakeT(sq.data(), DType::kF32, Cpu(), {t, key_dim});
+    Tensor tsk = MakeT(sk.data(), DType::kF32, Cpu(), {t, key_dim});
+    Tensor tv = MakeT(rv.data(), DType::kF32, Cpu(), {t, value_dim});
+    vt::GdnConvSplit(cq, tsq, tsk, tv, tconv);
+    Tensor tg = MakeT(rg.data(), DType::kF32, Cpu(), {t, hv});
+    Tensor tbo = MakeT(rb.data(), DType::kF32, Cpu(), {t, hv});
+    vt::GdnGBeta(cq, tg, tbo, taraw, tbraw, talog, tdtb);
+    Tensor tq3 = MakeT(sq.data(), DType::kF32, Cpu(), {t, hk, dk});
+    Tensor tk3 = MakeT(sk.data(), DType::kF32, Cpu(), {t, hk, dk});
+    Tensor trq = MakeT(rq.data(), DType::kF32, Cpu(), {t, hk, dk});
+    Tensor trk = MakeT(rk.data(), DType::kF32, Cpu(), {t, hk, dk});
+    vt::L2Norm(cq, trq, tq3, args);
+    vt::L2Norm(cq, trk, tk3, args);
+  }
+
+  // Fused CPU.
+  std::vector<float> fq(t * hk * dk), fk(t * hk * dk), fv(t * value_dim), fg(t * hv), fb(t * hv);
+  Tensor tfq = MakeT(fq.data(), DType::kF32, Cpu(), {t, hk, dk});
+  Tensor tfk = MakeT(fk.data(), DType::kF32, Cpu(), {t, hk, dk});
+  Tensor tfv = MakeT(fv.data(), DType::kF32, Cpu(), {t, hv, dv});
+  Tensor tfg = MakeT(fg.data(), DType::kF32, Cpu(), {t, hv});
+  Tensor tfb = MakeT(fb.data(), DType::kF32, Cpu(), {t, hv});
+  vt::GdnPostConv(cq, tfq, tfk, tfv, tfg, tfb, tconv, taraw, tbraw, talog, tdtb, args);
+  CheckClose(fq, rq, 0.0f, 0.0f);  // bit-exact vs composed
+  CheckClose(fk, rk, 0.0f, 0.0f);
+  CheckClose(fv, rv, 0.0f, 0.0f);
+  CheckClose(fg, rg, 0.0f, 0.0f);
+  CheckClose(fb, rb, 0.0f, 0.0f);
+
+  if (!HasCuda()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dconv(gpu, gq.q, DType::kF32, {t, conv_dim}, conv.data());
+  DeviceTensor daraw(gpu, gq.q, DType::kF32, {t, hv}, araw.data());
+  DeviceTensor dbraw(gpu, gq.q, DType::kF32, {t, hv}, braw.data());
+  DeviceTensor dalog(gpu, gq.q, DType::kF32, {hv}, alog.data());
+  DeviceTensor ddtb(gpu, gq.q, DType::kF32, {hv}, dtb.data());
+  DeviceTensor dgq(gpu, gq.q, DType::kF32, {t, hk, dk});
+  DeviceTensor dgk(gpu, gq.q, DType::kF32, {t, hk, dk});
+  DeviceTensor dgv(gpu, gq.q, DType::kF32, {t, hv, dv});
+  DeviceTensor dgg(gpu, gq.q, DType::kF32, {t, hv});
+  DeviceTensor dgb(gpu, gq.q, DType::kF32, {t, hv});
+  vt::GdnPostConv(gq.q, dgq.tensor(), dgk.tensor(), dgv.tensor(), dgg.tensor(), dgb.tensor(),
+                  dconv.tensor(), daraw.tensor(), dbraw.tensor(), dalog.tensor(), ddtb.tensor(),
+                  args);
+  std::vector<float> gq_q(fq.size()), gq_k(fk.size()), gq_v(fv.size()), gq_g(fg.size()),
+      gq_b(fb.size());
+  dgq.Download(gq.q, gq_q.data());
+  dgk.Download(gq.q, gq_k.data());
+  dgv.Download(gq.q, gq_v.data());
+  dgg.Download(gq.q, gq_g.data());
+  dgb.Download(gq.q, gq_b.data());
+  CheckClose(gq_q, fq, 1e-5f, 1e-5f);
+  CheckClose(gq_k, fk, 1e-5f, 1e-5f);
+  CheckClose(gq_v, fv, 1e-6f, 0.0f);  // raw copy: exact
+  CheckClose(gq_g, fg, 1e-5f, 1e-5f);
+  CheckClose(gq_b, fb, 1e-5f, 1e-5f);
+}
+
+TEST_CASE("gdn_post_conv fused == composed (CPU) and CUDA matches (real dims, striding)") {
+  RunGdnPostConvCase(5, 2, 6, 128, 128, 7100);   // GQA ratio 3, Dk==blockDim/2
+  RunGdnPostConvCase(3, 4, 4, 300, 128, 7200);   // Dk 300 > blockDim(256): strided
+  RunGdnPostConvCase(1, 1, 2, 64, 64, 7300);     // T==1 (decode-shaped)
+}
+
 TEST_CASE("CUDA rmsnorm_gated matches CPU (silu and sigmoid gates)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");

@@ -651,6 +651,51 @@ void GdnConvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, con
   }
 }
 
+// Fused GDN post-conv prep: GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta in
+// one pass (mirror of fla fused_gdn_prefill_post_conv). Bit-for-bit equal to
+// composing those four ops (same f32 math, same softplus threshold 20).
+void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
+                       Tensor& beta_out, const Tensor& conv, const Tensor& araw,
+                       const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias,
+                       const L2NormArgs& args) {
+  const int64_t t = conv.shape[0];
+  const int64_t hk = q_out.shape[1], dk = q_out.shape[2];
+  const int64_t hv = v_out.shape[1], dv = v_out.shape[2];
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t row = i * conv_dim;
+    // q/k: split then l2norm over Dk, per head (plain SUM of squares, §4).
+    for (int64_t h = 0; h < hk; ++h) {
+      float qss = 0.0f, kss = 0.0f;
+      for (int64_t j = 0; j < dk; ++j) {
+        const float qv = LoadF32(conv, row + h * dk + j);
+        const float kv = LoadF32(conv, row + key_dim + h * dk + j);
+        qss += qv * qv;
+        kss += kv * kv;
+      }
+      const float qinv = 1.0f / std::sqrt(qss + args.eps);
+      const float kinv = 1.0f / std::sqrt(kss + args.eps);
+      for (int64_t j = 0; j < dk; ++j) {
+        const int64_t o = (i * hk + h) * dk + j;
+        StoreF32(q_out, o, LoadF32(conv, row + h * dk + j) * qinv);
+        StoreF32(k_out, o, LoadF32(conv, row + key_dim + h * dk + j) * kinv);
+      }
+    }
+    // v: plain copy.
+    for (int64_t j = 0; j < value_dim; ++j)
+      StoreF32(v_out, i * value_dim + j, LoadF32(conv, row + 2 * key_dim + j));
+    // g/beta from a/b + A_log/dt_bias (§6).
+    for (int64_t h = 0; h < hv; ++h) {
+      const int64_t idx = i * hv + h;
+      const float x = LoadF32(araw, idx) + LoadF32(dt_bias, h);
+      const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus
+      StoreF32(g_out, idx, -std::exp(LoadF32(a_log, h)) * sp);
+      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
+    }
+  }
+}
+
 // out[t,c] = F32ToBF16(sigmoid(gl[t]) * sd[t*H+c]); shared-expert sigmoid gate.
 void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor& gl) {
   const int64_t t = out.shape[0], h = out.shape[1];
@@ -709,6 +754,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnGBetaFn>(&GdnGBetaKernel)));
     RegisterOp(OpId::kGdnConvSplit, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnConvSplitFn>(&GdnConvSplitKernel)));
+    RegisterOp(OpId::kGdnPostConv, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
     RegisterOp(OpId::kSharedExpertGate, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SharedExpertGateFn>(&SharedExpertGateKernel)));
   }

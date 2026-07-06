@@ -482,8 +482,8 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
                                         config_, queue_);
   } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
     if (!decode_graph_) {
-      decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(*moe_weights_, config_,
-                                                           queue_);
+      decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(
+          *moe_weights_, config_, queue_, gdn_state_slots_);
     }
     logits = decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
                                  attn_kv_, gdn_state_);

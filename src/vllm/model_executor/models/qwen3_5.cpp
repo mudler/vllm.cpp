@@ -2337,10 +2337,19 @@ constexpr std::array<int64_t, 7> kDecodeGraphSizes = {1, 2, 4, 8, 16, 32, 64};
 constexpr int64_t kMaxDecodeGraphBatch = 64;
 
 // Smallest captured size >= b, or -1 when b exceeds the largest (caller runs
-// eager). vLLM pads the batch to the nearest captured size the same way.
-int64_t PadToCaptureSize(int64_t b) {
+// eager). The result is CAPPED at `cap` (== max_num_seqs == the GDN state-cache
+// slot count): a decode batch is never padded beyond max_num_seqs, mirroring
+// vLLM's decode cudagraph dispatcher ("already caps batch sizes at max_num_seqs",
+// compilation.py:1438-1444 @ e24d1b24). Without this cap a batch of B requests
+// (B <= max_num_seqs) could pad up to the next fixed size (e.g. B=24 -> 32) and
+// overrun the max_num_seqs-sized conv/ssm state cache, tripping the
+// causal_conv1d_update `conv_state.shape[0] >= x.shape[0]` guard. cap is always
+// >= b here (the caller only routes num_reqs <= max_num_seqs), so the clamped
+// value still satisfies size >= b; `cap` itself becomes a captured size.
+int64_t PadToCaptureSize(int64_t b, int64_t cap) {
+  if (b > cap) return -1;  // never pad DOWN below the real batch (eager fallback)
   for (int64_t s : kDecodeGraphSizes)
-    if (s >= b) return s;
+    if (s >= b) return std::min(s, cap);
   return -1;
 }
 
@@ -2418,8 +2427,9 @@ void BuildPaddedDecode(int64_t S, const std::vector<int32_t>& tok,
 }  // namespace
 
 struct Qwen3_5DecodeGraph::Impl {
-  Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q)
-      : weights(w), config(c), queue(q) {
+  Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q,
+       int64_t max_reqs)
+      : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
     const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
     const bool env_on = (env == nullptr) || std::string(env) != "0";
     Backend& b = vt::GetBackend(queue.device.type);
@@ -2485,6 +2495,7 @@ struct Qwen3_5DecodeGraph::Impl {
   const Qwen3_5MoeWeights& weights;
   const HfConfig& config;
   vt::Queue queue;
+  int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
   bool enabled = false;
 
   std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
@@ -2493,8 +2504,9 @@ struct Qwen3_5DecodeGraph::Impl {
 };
 
 Qwen3_5DecodeGraph::Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights,
-                                       const HfConfig& config, vt::Queue queue)
-    : impl_(std::make_unique<Impl>(weights, config, queue)) {}
+                                       const HfConfig& config, vt::Queue queue,
+                                       int64_t max_num_reqs)
+    : impl_(std::make_unique<Impl>(weights, config, queue, max_num_reqs)) {}
 
 Qwen3_5DecodeGraph::~Qwen3_5DecodeGraph() = default;
 
@@ -2518,7 +2530,7 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
 
   // Pick the padded batch size (smallest captured size >= B). Eager fallback when
   // capture is disabled / non-CUDA / B exceeds the largest captured size.
-  const int64_t S = PadToCaptureSize(B);
+  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0) {
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);

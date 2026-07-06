@@ -137,8 +137,12 @@ class Qwen3_5Model {
 //     safety valve. Non-CUDA devices always run eager.
 class Qwen3_5DecodeGraph {
  public:
+  // max_num_reqs == the runner's max_num_seqs (== the GDN state-cache slot count).
+  // The padded decode batch is capped at this value so it never exceeds the
+  // mamba/GDN state cache (mirrors vLLM: the decode cudagraph dispatcher "already
+  // caps batch sizes at max_num_seqs", compilation.py:1438-1444 @ e24d1b24).
   Qwen3_5DecodeGraph(const Qwen3_5MoeWeights& weights, const HfConfig& config,
-                     vt::Queue queue);
+                     vt::Queue queue, int64_t max_num_reqs);
   ~Qwen3_5DecodeGraph();
   Qwen3_5DecodeGraph(const Qwen3_5DecodeGraph&) = delete;
   Qwen3_5DecodeGraph& operator=(const Qwen3_5DecodeGraph&) = delete;

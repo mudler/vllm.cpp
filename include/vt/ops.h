@@ -49,6 +49,7 @@ enum class OpId : uint8_t {
   kGdnGBeta,
   kGdnConvSplit,
   kSharedExpertGate,
+  kMoeCombineGate,
   kMoeGroupedGemmNvfp4Marlin,
   kGdnPostConv,
   kCount
@@ -211,6 +212,8 @@ using MoeRouterTopKFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
 using MoeCombineFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
+using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
@@ -528,6 +531,16 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 // materializing expert_out/shared in the activation dtype.
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
                 const Tensor* shared = nullptr);
+
+// --- Fused MoE combine + shared-expert gate (MoE glue fusion). Equivalent to
+// SharedExpertGate(shared=bf16(sigmoid(gl)*sd)) followed by MoeCombine(...,shared),
+// but in ONE launch: the shared term is gated inline (sigmoid(gl[t])*sd[t,c],
+// rounded through bf16 exactly as SharedExpertGate's store, then re-added in f32)
+// and folded into the top-k weighted reduction. Removes the separate
+// SharedExpertGate launch and the shared [T,H] global round-trip. Bit-identical
+// to the two-kernel path. sd [T,H] f32, gl [T,1] f32.
+void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
+                    const Tensor& sd, const Tensor& gl);
 
 // --- Dense causal attention (M0.9). Formula reference:
 // .agents/qwen36-forward-notes.md §5 (pinned Qwen3NextAttention core).

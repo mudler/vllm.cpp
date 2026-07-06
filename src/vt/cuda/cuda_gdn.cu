@@ -1150,6 +1150,101 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
   }
 }
 
+// Step B (WMMA) — chunk_scaled_dot_kkt Gram on tensor cores. The scalar
+// GdnChunkWUKernel spends its bulk in the O(BT²·Dk) Gram K@Kᵀ (prefill's last
+// scalar-float GDN chunk kernel, ~22% GPU). This replaces that cooperative
+// dot-product with a WMMA 16x16 matmul, f32 accumulate — exactly the qk=Q@Kᵀ
+// block of GdnChunkOWmmaKernel but with K in both operands (mirrors FLA
+// chunk_scaled_dot_kkt.py:86 b_A += tl.dot(b_kb, tl.trans(b_k))). The
+// exp(G_i−G_j) diff is folded into the Gram (chunk_scaled_dot_kkt.py:92
+// b_A = b_A*exp(b_g_diff)) so the shared A[i,j] holds exp(G_i−G_j)·(k_i·k_j)
+// masked to the strict-lower (causal) triangle. The two WY forward
+// substitutions (u from β⊙v, w from β⊙exp(G)⊙k) stay f32 — they carry a
+// sequential i→i dependency (solve_tril.py:84 loop) that is not a matmul.
+// TD scratch dtype: bf16 native fragments; f32 uses TF32 (WmmaCfg), the path
+// the real 35B GDN (f32) hits — same precision regime as DeltaH/O.
+template <typename TD>
+__global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, const float* beta,
+                                     const float* gcum, const int32_t* tok0a, const int32_t* lena,
+                                     int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv) {
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  TD* Ks = reinterpret_cast<TD*>(smem_raw);                 // [kChunk,Dk] staged K (zero-padded)
+  float* kk = reinterpret_cast<float*>(Ks + kChunk * dk);   // [kChunk,kChunk] Gram -> A
+  __shared__ float gs[kChunk];                              // G_i (local cumsum)
+  __shared__ float bs[kChunk];                              // beta_i
+  __shared__ float eg[kChunk];                              // exp(G_i)
+
+  // Stage K into shared, zero past len so tail (partial-chunk) tiles are finite
+  // and never read past the k input's t_tot rows (mirrors ChunkO's Ks staging).
+  for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+    const int64_t i = e / dk, d = e % dk;
+    Store(Ks, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+  }
+  for (int64_t i = tid; i < len; i += blockDim.x) {
+    bs[i] = beta[(tok0 + i) * hv_n + hv];
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
+  }
+  __syncthreads();
+
+  // kk = K @ Kᵀ  [kChunk,kChunk]  (Arow = K[i,:], Bcol = K[j,:] read as Kᵀ)
+  const int nkk = (kChunk / kWM) * (kChunk / kWM);
+  for (int t = warp; t < nkk; t += nwarps) {
+    const int it = t % (kChunk / kWM), jt = t / (kChunk / kWM);
+    const int i0 = it * kWM, j0 = jt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t d = 0; d < dk; d += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Ks + i0 * dk + d, dk);
+      Cfg::load(b, Ks + j0 * dk + d, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(kk + i0 * kChunk + j0, acc, kChunk, wmma::mem_row_major);
+  }
+  __syncthreads();
+  // A[i,j] = exp(G_i − G_j) · kk[i,j] for j<i (strict-lower causal), else 0.
+  for (int64_t e = tid; e < kChunk * kChunk; e += blockDim.x) {
+    const int64_t i = e / kChunk, j = e % kChunk;
+    kk[e] = (i < len && j < i) ? expf(gs[i] - gs[j]) * kk[e] : 0.0f;
+  }
+  __syncthreads();
+
+  // u column vi: u_i = beta_i (v_i − sum_{j<i} A[i,j] u_j)  (f32 forward solve)
+  for (int64_t vi = tid; vi < dv; vi += blockDim.x) {
+    float ucol[kChunk];
+    for (int64_t i = 0; i < len; ++i) {
+      float sfs = 0.0f;
+      for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * ucol[j];
+      const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
+      ucol[i] = bs[i] * (vi_val - sfs);
+    }
+    for (int64_t i = 0; i < len; ++i)
+      Store(u, (tok0 + i) * hv_n * dv + hv * dv + vi, ucol[i]);
+  }
+  // w column ki: w_i = beta_i (exp(G_i) k_i − sum_{j<i} A[i,j] w_j)
+  for (int64_t ki = tid; ki < dk; ki += blockDim.x) {
+    float wcol[kChunk];
+    for (int64_t i = 0; i < len; ++i) {
+      float sfs = 0.0f;
+      for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * wcol[j];
+      const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
+      wcol[i] = bs[i] * (eg[i] * ki_val - sfs);
+    }
+    for (int64_t i = 0; i < len; ++i)
+      Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
+  }
+}
+
 // Builds the per-chunk layout (tok0/len) + per-seq base-offset (boh) arrays
 // DIRECTLY on the device from the device query_start_loc — the exact loop the
 // host used to run after a D2H copy+sync. Single-thread (n_seq is small, ~batch
@@ -1251,17 +1346,39 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   GdnChunkCumsumKernel<<<grid_chunk, 32, 0, s>>>(gcum, g.Ptr<float>(), d_tok0, d_len, hv_n);
   Check(cudaGetLastError(), "gdn chunked cumsum launch");
 
-  GdnChunkWUKernel<Tin, TSc><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),
-                                                        beta.Ptr<float>(), gcum, d_tok0, d_len,
-                                                        hk_n, dk, hv_n, dv);
-  Check(cudaGetLastError(), "gdn chunked wu launch");
-
   auto opt_in = [](void* kernel, size_t bytes, const char* what) {
     if (bytes > 48 * 1024)
       Check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(bytes)),
             what);
   };
+
+  // Step B (WY u/w). WMMA tensor-core Gram when the WMMA path is active (same
+  // dim gate as DeltaH/O); A/B: VT_GDN_WU_WMMA=0 forces the scalar-float kernel
+  // (also the f32-corner fallback and the unit-test scalar reference path).
+  const char* wu_env = std::getenv("VT_GDN_WU_WMMA");
+  const bool wu_wmma = wmma && (wu_env == nullptr || wu_env[0] != '0');
+  if (wu_wmma) {
+    const size_t wu_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TSc) +
+                            static_cast<size_t>(kChunk * kChunk) * sizeof(float);
+    // Always opt in: the f32/TF32 dynamic request is exactly 48 KiB, which plus
+    // the static gs/bs/eg overflows the 48 KiB default (opt_in's ">" guard would
+    // miss the boundary). Setting the max-dynamic attribute unconditionally is a
+    // no-op when the request already fits.
+    Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkWUWmmaKernel<TSc>),
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(wu_bytes)),
+          "gdn chunked wu(wmma) shared opt-in");
+    GdnChunkWUWmmaKernel<TSc><<<grid_chunk, 256, wu_bytes, s>>>(
+        u, w, k.Ptr<Tin>(), v.Ptr<Tin>(), beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n, dk, hv_n,
+        dv);
+    Check(cudaGetLastError(), "gdn chunked wu(wmma) launch");
+  } else {
+    GdnChunkWUKernel<Tin, TSc><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),
+                                                          beta.Ptr<float>(), gcum, d_tok0, d_len,
+                                                          hk_n, dk, hv_n, dv);
+    Check(cudaGetLastError(), "gdn chunked wu launch");
+  }
 
   if (wmma) {
     // WMMA tensor-core path (TF32 for f32 in, native bf16 for bf16 in).

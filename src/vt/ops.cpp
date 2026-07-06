@@ -648,8 +648,11 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
   VT_CHECK(args.scale > 0.0f, "paged_attention: scale must be set (> 0), e.g. head_size^-0.5");
   VT_CHECK(IsFloat(query.dtype) && IsOutFloat(out.dtype),
            "paged_attention: float query, f32/bf16 out");
-  VT_CHECK(k_cache.dtype == query.dtype && v_cache.dtype == query.dtype,
-           "paged_attention: query and k_cache/v_cache must share one float dtype (auto path)");
+  // The KV cache may be a DIFFERENT float dtype than the query (Phase-1 bf16 KV
+  // cache: f32 query · bf16 cache — the kernel converts bf16 cache reads to f32
+  // and accumulates in f32). Require only that K and V share one float dtype.
+  VT_CHECK(IsFloat(k_cache.dtype) && k_cache.dtype == v_cache.dtype,
+           "paged_attention: k_cache/v_cache must share one float dtype");
   // metadata: block_table [num_reqs, max_blocks] i32, seq_lens [num_reqs] i32,
   // query_start_loc [num_reqs+1] i32.
   VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,

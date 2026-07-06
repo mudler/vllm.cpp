@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <set>
@@ -305,8 +306,13 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // bf16 GDN state caches on CUDA (vLLM default mamba_cache_dtype auto → model
   // dtype), f32 on CPU (the CPU GDN ops are f32-only; the exact-value CPU tests
   // assume f32). The CUDA GDN decode/conv kernels read bf16 → f32 → write bf16.
-  gdn_cache_dtype_ =
-      dev.type == vt::DeviceType::kCUDA ? vt::DType::kBF16 : vt::DType::kF32;
+  // A/B: VT_GDN_STATE_F32=1 forces the f32 cache (same-binary before/after of the
+  // bf16 state-traffic lever), mirroring VT_GDN_FUSED_DECODE / VT_GDN_CHUNKED.
+  const char* f32env = std::getenv("VT_GDN_STATE_F32");
+  const bool force_f32 = f32env != nullptr && f32env[0] == '1';
+  gdn_cache_dtype_ = (dev.type == vt::DeviceType::kCUDA && !force_f32)
+                         ? vt::DType::kBF16
+                         : vt::DType::kF32;
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
         config_.layer_types[static_cast<size_t>(l)] == "linear_attention";

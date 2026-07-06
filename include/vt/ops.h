@@ -187,7 +187,7 @@ using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
 using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
                                    Tensor&, const Tensor&, const Tensor&,
-                                   const CausalConv1dArgs&);
+                                   const CausalConv1dArgs&, const Tensor*);
 using CausalConv1dUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                       const Tensor*, Tensor&, const Tensor*,
                                       const CausalConv1dArgs&);
@@ -196,7 +196,7 @@ using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, c
                                 const RmsNormGatedArgs&);
 using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                               const Tensor&, const Tensor&, Tensor&, const Tensor&,
-                              const GdnArgs&);
+                              const GdnArgs&, const Tensor*, const Tensor*);
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const Tensor&, const Tensor&, Tensor&, const Tensor*,
                              const GdnArgs&);
@@ -436,9 +436,16 @@ void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positi
 //   tokens before the sequence start. w[:,K-1] multiplies the current token.
 // State write-back: last K-1 RAW x tokens (pre-activation), left-padded with
 // zeros (no init state) or shifted old state when T < K-1.
+// cache_idx (optional; mirrors the causal_conv1d_update conv_state_indices, moved to
+// the varlen prefill path): when non-null, sequence s reads/writes the persistent
+// conv_state cache slot cache_idx[s] (conv_state is then the FULL [num_slots,C,K-1]
+// cache) so the caller need not gather/scatter the per-request rows — the prefill
+// analog of the decode in-place fix (109eb36). When null, conv_state is compact
+// [nreq,C,K-1] and row == s. The number of sequences is has_initial_state.shape[0].
 void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, Tensor& conv_state, const Tensor& query_start_loc,
-                     const Tensor& has_initial_state, const CausalConv1dArgs& args);
+                     const Tensor& has_initial_state, const CausalConv1dArgs& args,
+                     const Tensor* cache_idx = nullptr);
 
 // Single-token conv step (gdn-semantics.md §3, upstream causal_conv1d_update
 // seqlen==1 path). x[B,C] one token per sequence, conv_state[B,C,K-1] f32
@@ -477,9 +484,19 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
 //   q' = q * scale;  S *= exp(g[hv]);  v' = (v - S @ k) * beta[hv];
 //   S += outer(v', k);  out = S @ q'
 // k is NOT scaled. All arithmetic f32.
+// state_idx (optional; mirrors fla fused_recurrent_gated_delta_rule ssm_state_indices,
+// the prefill analog of the decode in-place fix 109eb36): when non-null, sequence s
+// reads/writes the persistent ssm_state cache slot state_idx[s] (state is then the FULL
+// [num_slots,Hv,Dv,Dk] cache) so the caller need not gather/scatter per-request rows.
+// has_initial_state (optional, paired with state_idx): when the s-th flag is 0 the
+// sequence is FRESH — the recurrence starts from a ZERO state instead of the (possibly
+// stale) cache slot, mirroring upstream's gather+ZERO (qwen_gdn_linear_attn.py:1513-1514).
+// When state_idx is null, state is compact [np,Hv,Dv,Dk] (row == s) and the caller is
+// responsible for pre-zeroing fresh rows (has_initial_state ignored).
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                 const Tensor& g, const Tensor& beta, Tensor& state,
-                const Tensor& query_start_loc, const GdnArgs& args);
+                const Tensor& query_start_loc, const GdnArgs& args,
+                const Tensor* state_idx = nullptr, const Tensor* has_initial_state = nullptr);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

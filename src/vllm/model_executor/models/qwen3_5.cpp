@@ -962,6 +962,14 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
 // qwen_gdn_linear_attn.py::_forward_core @ e24d1b24 (conv split L1360-1388;
 // recurrence split L1480-1559; the ssm gather+ZERO L1513-1514, scatter L1532).
 // h [T*H] bf16 -> [T*H] bf16.
+// A/B toggle (default ON): VT_GDN_PREFILL_INPLACE=0 restores the gather/scatter prefill
+// state staging (compact working buffer + GatherRows/ScatterRows) for same-binary
+// before/after measurement of the in-place fix (the prefill analog of the decode fix).
+bool GdnPrefillInplace() {
+  const char* e = std::getenv("VT_GDN_PREFILL_INPLACE");
+  return e == nullptr || e[0] != '0';
+}
+
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
@@ -1005,14 +1013,26 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     const auto& qsl_full = *meta.non_spec_query_start_loc;
     const auto& his_u8 = *meta.has_initial_state;
     const int64_t nreq = static_cast<int64_t>(sidx.size());
-    DBuf dcs(d, DType::kF32, {nreq, conv_dim, Kw - 1});
-    GatherRows(d, dcs.ptr(), state.conv_state, sidx, conv_row_elems);
     std::vector<int32_t> his(his_u8.begin(), his_u8.end());
     DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
     DBuf dhis(d, DType::kI32, {nreq}, his.data());
-    vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
-                        dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
-    ScatterRows(d, state.conv_state, dcs.ptr(), sidx, conv_row_elems);
+    if (GdnPrefillInplace()) {
+      // IN PLACE on the persistent conv_state cache at each sequence's slot (the prefill
+      // analog of the decode conv in-place fix 109eb36; mirrors the moved
+      // conv_state_indices). Eliminates the per-request GatherRows/ScatterRows (the
+      // host<->unified-cache copies that dominate the prefill memcpy tax). The init flag
+      // already makes fresh sequences ignore the slot's stale columns.
+      DBuf dsidx(d, DType::kI32, {nreq}, sidx.data());
+      Tensor conv_cache = state.conv_state;  // mutable view over the FULL persistent cache
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, conv_cache,
+                          dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true}, &dsidx.t());
+    } else {
+      DBuf dcs(d, DType::kF32, {nreq, conv_dim, Kw - 1});
+      GatherRows(d, dcs.ptr(), state.conv_state, sidx, conv_row_elems);
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
+                          dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
+      ScatterRows(d, state.conv_state, dcs.ptr(), sidx, conv_row_elems);
+    }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
     // conv_state at each sequence's slot (mirrors mamba causal_conv1d_update
@@ -1079,16 +1099,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     const auto& pidx = *meta.prefill_state_indices;
     const auto& p_his = *meta.prefill_has_initial_state;
     const auto& p_qsl = *meta.prefill_query_start_loc;
-    DBuf dss(d, DType::kF32, {np, Hv, Dv, Dk});
-    GatherRows(d, dss.ptr(), state.ssm_state, pidx, ssm_row_elems);
-    // ⚠ GDN-STATE ZEROING (M1.6 caller obligation, qwen_gdn_linear_attn.py:1514):
-    // vt::GdnPrefill reads `state` unconditionally, so zero the gathered rows
-    // for fresh requests (prefill_has_initial_state==0) — else a fresh request
-    // reads a stale mamba block.
-    const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
-    for (size_t s = 0; s < p_his.size(); ++s)
-      if (p_his[s] == 0)
-        d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
     DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
     Tensor q_pre = SubView(dql2.t(), nd_tok, np_tok);
     Tensor k_pre = SubView(dkl2.t(), nd_tok, np_tok);
@@ -1103,9 +1113,32 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // this call. Device-resident metadata, mirroring the decode StepDevInputs fix.
     vt::GdnArgs gdn_args{scale};
     gdn_args.query_start_loc_host = p_qsl.data();
-    vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                   dpqsl.t(), gdn_args);
-    ScatterRows(d, state.ssm_state, dss.ptr(), pidx, ssm_row_elems);
+    if (GdnPrefillInplace()) {
+      // IN PLACE on the persistent ssm_state cache at each sequence's slot (the prefill
+      // analog of the decode fix 109eb36; mirrors fla ssm_state_indices). Eliminates
+      // the per-request GatherRows/ScatterRows AND the host zeroing loop: the kernel
+      // reads/writes the slot directly and starts fresh sequences (has_initial_state==0)
+      // from a ZERO state — the moved gather+ZERO (qwen_gdn_linear_attn.py:1513-1514).
+      DBuf dpidx(d, DType::kI32, {np}, pidx.data());
+      std::vector<int32_t> p_his_i32(p_his.begin(), p_his.end());
+      DBuf dphis(d, DType::kI32, {np}, p_his_i32.data());
+      Tensor ssm_cache = state.ssm_state;  // mutable view over the FULL persistent cache
+      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, ssm_cache, dpqsl.t(),
+                     gdn_args, &dpidx.t(), &dphis.t());
+    } else {
+      DBuf dss(d, DType::kF32, {np, Hv, Dv, Dk});
+      GatherRows(d, dss.ptr(), state.ssm_state, pidx, ssm_row_elems);
+      // ⚠ GDN-STATE ZEROING (M1.6 caller obligation, qwen_gdn_linear_attn.py:1514):
+      // vt::GdnPrefill reads `state` unconditionally, so zero the gathered rows
+      // for fresh requests (prefill_has_initial_state==0) — else a fresh request
+      // reads a stale mamba block.
+      const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
+      for (size_t s = 0; s < p_his.size(); ++s)
+        if (p_his[s] == 0)
+          d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
+      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(), dpqsl.t(), gdn_args);
+      ScatterRows(d, state.ssm_state, dss.ptr(), pidx, ssm_row_elems);
+    }
   }
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.

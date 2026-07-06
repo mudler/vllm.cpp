@@ -278,9 +278,12 @@ float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 // before overwrite.
 void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                            const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                           const Tensor& his, const CausalConv1dArgs& args) {
+                           const Tensor& his, const CausalConv1dArgs& args,
+                           const Tensor* cache_idx) {
   const int64_t total = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
-  const int64_t n = conv_state.shape[0];
+  const int32_t* cip = cache_idx != nullptr ? cache_idx->Ptr<int32_t>() : nullptr;
+  // With cache_idx, conv_state is the FULL cache; sequence count comes from his.
+  const int64_t n = cip != nullptr ? his.shape[0] : conv_state.shape[0];
   const int32_t* qslp = qsl.Ptr<int32_t>();
   const int32_t* hisp = his.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == total, "causal_conv1d_fwd: bad query_start_loc bounds");
@@ -289,7 +292,8 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
     const int64_t begin = qslp[s], end = qslp[s + 1], t_len = end - begin;
     VT_CHECK(t_len >= 0 && begin >= 0, "causal_conv1d_fwd: query_start_loc not monotonic");
     const bool init = hisp[s] != 0;
-    float* srow_base = conv_state.Ptr<float>() + s * c_dim * width;
+    const int64_t srow_slot = cip != nullptr ? cip[s] : s;  // in-place cache slot
+    float* srow_base = conv_state.Ptr<float>() + srow_slot * c_dim * width;
     for (int64_t c = 0; c < c_dim; ++c) {
       float* srow = srow_base + c * width;
       for (int64_t j = 0; j < width; ++j) old_row[static_cast<size_t>(j)] = srow[j];
@@ -433,9 +437,14 @@ void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Ten
 
 void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                       const Tensor& g, const Tensor& beta, Tensor& state, const Tensor& qsl,
-                      const GdnArgs& args) {
-  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
-                dk = state.shape[3];
+                      const GdnArgs& args, const Tensor* state_idx,
+                      const Tensor* has_initial_state) {
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  const int32_t* sip = state_idx != nullptr ? state_idx->Ptr<int32_t>() : nullptr;
+  const int32_t* hisp = has_initial_state != nullptr ? has_initial_state->Ptr<int32_t>() : nullptr;
+  // With state_idx, state is the FULL cache; sequence count comes from state_idx.
+  const int64_t n = sip != nullptr ? state_idx->shape[0] : state.shape[0];
+  const int64_t sd = hv_n * dv * dk;
   const int32_t* qslp = qsl.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == q_in.shape[0],
            "gdn_prefill: bad query_start_loc bounds");
@@ -443,7 +452,12 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
       vbuf(static_cast<size_t>(dv));
   for (int64_t s = 0; s < n; ++s) {
     VT_CHECK(qslp[s + 1] >= qslp[s], "gdn_prefill: query_start_loc not monotonic");
-    float* s_state = state.Ptr<float>() + s * hv_n * dv * dk;
+    const int64_t slot = sip != nullptr ? sip[s] : s;  // in-place cache slot
+    float* s_state = state.Ptr<float>() + slot * sd;
+    // Fresh sequence: recurrence starts from ZERO state (mirrors gather+ZERO). Only
+    // in the indexed path — the compact path is pre-zeroed by the caller.
+    if (sip != nullptr && hisp != nullptr && hisp[s] == 0)
+      std::fill(s_state, s_state + sd, 0.0f);
     for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
       GdnTokenStep(out, q_in, k, v, g, beta, s_state, t, args.scale, qbuf, kbuf, vbuf);
   }

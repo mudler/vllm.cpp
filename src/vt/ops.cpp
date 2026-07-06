@@ -414,13 +414,20 @@ void CheckI32Meta(const Queue& q, const Tensor& t, int64_t expect_len, const cha
 
 void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, Tensor& conv_state, const Tensor& query_start_loc,
-                     const Tensor& has_initial_state, const CausalConv1dArgs& args) {
+                     const Tensor& has_initial_state, const CausalConv1dArgs& args,
+                     const Tensor* cache_idx) {
   CheckConvCommon(q, out, x, weight, bias, conv_state, "causal_conv1d_fwd");
-  const int64_t n = conv_state.shape[0];
+  // With cache_idx, conv_state is the FULL persistent cache; the sequence count comes
+  // from has_initial_state (one flag per sequence), NOT conv_state.shape[0].
+  const int64_t n = cache_idx != nullptr ? has_initial_state.shape[0] : conv_state.shape[0];
   CheckI32Meta(q, query_start_loc, n + 1, "causal_conv1d_fwd", "query_start_loc");
   CheckI32Meta(q, has_initial_state, n, "causal_conv1d_fwd", "has_initial_state");
+  if (cache_idx != nullptr) {
+    CheckI32Meta(q, *cache_idx, n, "causal_conv1d_fwd", "cache_idx");
+    VT_CHECK(conv_state.shape[0] >= n, "causal_conv1d_fwd: indexed cache must have >= nreq rows");
+  }
   reinterpret_cast<CausalConv1dFwdFn>(GetOp(OpId::kCausalConv1dFwd, q.device.type))(
-      q, out, x, weight, bias, conv_state, query_start_loc, has_initial_state, args);
+      q, out, x, weight, bias, conv_state, query_start_loc, has_initial_state, args, cache_idx);
 }
 
 void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
@@ -476,11 +483,21 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
 
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                 const Tensor& g, const Tensor& beta, Tensor& state,
-                const Tensor& query_start_loc, const GdnArgs& args) {
+                const Tensor& query_start_loc, const GdnArgs& args, const Tensor* state_idx,
+                const Tensor* has_initial_state) {
   CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_prefill");
-  CheckI32Meta(q, query_start_loc, state.shape[0] + 1, "gdn_prefill", "query_start_loc");
+  // With state_idx, state is the FULL persistent cache; the sequence count comes from
+  // state_idx (one slot per sequence), NOT state.shape[0].
+  const int64_t n_seq = state_idx != nullptr ? state_idx->shape[0] : state.shape[0];
+  CheckI32Meta(q, query_start_loc, n_seq + 1, "gdn_prefill", "query_start_loc");
+  if (state_idx != nullptr) {
+    CheckI32Meta(q, *state_idx, n_seq, "gdn_prefill", "state_idx");
+    VT_CHECK(state.shape[0] >= n_seq, "gdn_prefill: indexed cache must have >= n_seq rows");
+    if (has_initial_state != nullptr)
+      CheckI32Meta(q, *has_initial_state, n_seq, "gdn_prefill", "has_initial_state");
+  }
   reinterpret_cast<GdnPrefillFn>(GetOp(OpId::kGdnPrefill, q.device.type))(
-      q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+      q, out, q_in, k, v, g, beta, state, query_start_loc, args, state_idx, has_initial_state);
 }
 
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,

@@ -72,11 +72,17 @@ __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
 // Upstream counterpart: layers/mamba/ops/causal_conv1d.py (causal_conv1d_fn
 // Triton kernel) — align post-MVP.
 
+// cache_idx (optional; mirrors the causal_conv1d_update conv_state_indices, moved to the
+// varlen prefill path): when non-null, sequence s reads/writes the persistent cache slot
+// cache_idx[s] (conv_state is then the FULL cache), eliminating the per-request
+// gather/scatter — the prefill analog of the decode in-place fix. The init flag already
+// makes fresh sequences ignore the (stale) slot's old columns, so no separate zeroing is
+// needed; the write-back overwrites the slot with the sequence's tail state.
 template <typename Tin, typename Tout>
 __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, const Tin* bias,
                                       float* conv_state, const int32_t* qsl,
-                                      const int32_t* his, int64_t c_dim, int64_t k,
-                                      bool silu) {
+                                      const int32_t* his, const int32_t* cache_idx,
+                                      int64_t c_dim, int64_t k, bool silu) {
   const int64_t s = blockIdx.y;
   const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (c >= c_dim) return;
@@ -84,7 +90,8 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
   const int64_t begin = qsl[s];
   const int64_t t_len = qsl[s + 1] - begin;
   const bool init = his[s] != 0;
-  float* srow = conv_state + (s * c_dim + c) * width;
+  const int64_t slot = cache_idx != nullptr ? cache_idx[s] : s;  // in-place cache slot
+  float* srow = conv_state + (slot * c_dim + c) * width;
   const float b = bias != nullptr ? Load(bias, c) : 0.0f;
   for (int64_t t = 0; t < t_len; ++t) {
     float acc = b;
@@ -117,12 +124,14 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
 template <typename Tin, typename Tout>
 void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                    const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                   const Tensor& his, const CausalConv1dArgs& args) {
-  const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
+                   const Tensor& his, const int32_t* cache_idx, const CausalConv1dArgs& args) {
+  // With cache_idx, conv_state is the FULL cache; the sequence count is his.shape[0].
+  const int64_t n = cache_idx != nullptr ? his.shape[0] : conv_state.shape[0];
+  const int64_t c = x.shape[1], k = w.shape[1];
   const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock), static_cast<unsigned>(n));
   CausalConv1dFwdKernel<Tin, Tout><<<grid, kBlock, 0, s>>>(
       out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k,
+      conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), cache_idx, c, k,
       args.silu_activation);
   Check(cudaGetLastError(), "causal_conv1d_fwd launch");
 }
@@ -177,26 +186,29 @@ void LaunchConvUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
 
 void ConvFwdKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                        const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                       const Tensor& his, const CausalConv1dArgs& args) {
+                       const Tensor& his, const CausalConv1dArgs& args,
+                       const Tensor* cache_idx) {
   VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
            "cuda causal_conv1d_fwd: unsupported x dtype (f32/bf16 only)");
   VT_CHECK(w.dtype == x.dtype && (bias == nullptr || bias->dtype == x.dtype),
            "cuda causal_conv1d_fwd: weight/bias dtype must match x");
-  const int64_t n = conv_state.shape[0];
+  const int32_t* ci = cache_idx != nullptr ? cache_idx->Ptr<int32_t>() : nullptr;
+  // With cache_idx, conv_state is the FULL cache; the sequence count is his.shape[0].
+  const int64_t n = ci != nullptr ? his.shape[0] : conv_state.shape[0];
   if (n == 0 || x.shape[1] == 0) return;
   VT_CHECK(n <= kMaxGridY, "cuda causal_conv1d_fwd: too many sequences (grid.y limit)");
   cudaStream_t s = AsStream(q);
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      LaunchConvFwd<float, float>(s, out, x, w, bias, conv_state, qsl, his, args);
+      LaunchConvFwd<float, float>(s, out, x, w, bias, conv_state, qsl, his, ci, args);
     } else {
-      LaunchConvFwd<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his, args);
+      LaunchConvFwd<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his, ci, args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      LaunchConvFwd<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, qsl, his, args);
+      LaunchConvFwd<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, qsl, his, ci, args);
     } else {
-      LaunchConvFwd<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his,
+      LaunchConvFwd<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his, ci,
                                                   args);
     }
   }
@@ -373,18 +385,28 @@ void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor
 // Upstream counterpart: layers/fla/ops/{fused_recurrent,fused_sigmoid_gating}.py
 // Triton kernels (chunked variant: chunk.py, lands M2.3) — align post-MVP.
 
+// state_idx (optional; prefill in-place, mirrors GdnPrefill's): sequence s reads/writes
+// the persistent cache slot state_idx[s]; his[s]==0 marks a FRESH sequence whose state
+// starts from zero (mirrors the gather+ZERO). Null => compact state (row == s), caller
+// pre-zeroes (unchanged op-test path). Only the prefill call passes these.
 template <typename Tin, typename Tout>
 __global__ void GdnScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
                               const float* g, const float* beta, float* state,
-                              const int32_t* qsl, int64_t hk_n, int64_t dk, int64_t hv_n,
-                              int64_t dv, float scale) {
+                              const int32_t* qsl, const int32_t* state_idx, const int32_t* his,
+                              int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv, float scale) {
   const int64_t s = blockIdx.y;   // sequence (prefill) or token (decode)
   const int64_t hv = blockIdx.x;  // v-head
   const int64_t hk = hv / (hv_n / hk_n);
   extern __shared__ float smem[];  // [dk] q' then [dk] k
   float* q_sh = smem;
   float* k_sh = smem + dk;
-  float* s_head = state + (s * hv_n + hv) * dv * dk;  // [Dv, Dk]
+  const int64_t slot = state_idx != nullptr ? state_idx[s] : s;  // in-place cache slot
+  float* s_head = state + (slot * hv_n + hv) * dv * dk;          // [Dv, Dk]
+  // Fresh sequence: start the recurrence from a zero state (each thread owns its Dv
+  // rows exclusively, so no barrier is needed before the token loop reads them).
+  if (state_idx != nullptr && his != nullptr && his[s] == 0)
+    for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x)
+      for (int64_t ki = 0; ki < dk; ++ki) s_head[vi * dk + ki] = 0.0f;
   const int64_t begin = qsl != nullptr ? qsl[s] : s;
   const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
   for (int64_t t = begin; t < end; ++t) {
@@ -417,20 +439,23 @@ __global__ void GdnScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* 
 template <typename Tin, typename Tout>
 void LaunchGdnScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                    const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                   const int32_t* qsl, int64_t n, const GdnArgs& args) {
+                   const int32_t* qsl, const int32_t* state_idx, const int32_t* his, int64_t n,
+                   const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
   const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
   GdnScanKernel<Tin, Tout><<<grid, kBlock, shmem, s>>>(
       out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
-      beta.Ptr<float>(), state.Ptr<float>(), qsl, hk_n, dk, hv_n, dv, args.scale);
+      beta.Ptr<float>(), state.Ptr<float>(), qsl, state_idx, his, hk_n, dk, hv_n, dv, args.scale);
   Check(cudaGetLastError(), "gdn scan launch");
 }
 
 void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                  const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
-                 const GdnArgs& args, const char* name);  // fwd decl (corner-dim fallback)
+                 const GdnArgs& args, const char* name, const int32_t* state_idx = nullptr,
+                 const int32_t* his = nullptr,
+                 int64_t n_seq = -1);  // fwd decl (corner-dim fallback)
 
 // ---------------------------------------------------------------------------
 // Fused single-step DECODE recurrence — the (batch × Hv × value-tile) parallel
@@ -640,13 +665,15 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
 // the queue's device for prefill).
 void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                  const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
-                 const GdnArgs& args, const char* name) {
+                 const GdnArgs& args, const char* name, const int32_t* state_idx,
+                 const int32_t* his, int64_t n_seq) {
   VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
            std::string("cuda ") + name + ": unsupported q dtype (f32/bf16 only)");
   VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
            std::string("cuda ") + name + ": q/k/v dtypes must match");
-  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
-                dk = state.shape[3];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  // With state_idx, state is the FULL cache; the caller passes the sequence count.
+  const int64_t n = state_idx != nullptr ? n_seq : state.shape[0];
   if (n == 0 || hv_n == 0 || dv == 0) return;
   VT_CHECK(n <= kMaxGridY, std::string("cuda ") + name + ": too many sequences (grid.y limit)");
   VT_CHECK(2 * static_cast<size_t>(dk) * sizeof(float) <= 48 * 1024,
@@ -654,18 +681,19 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
   cudaStream_t s = AsStream(q);
   if (q_in.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      LaunchGdnScan<float, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+      LaunchGdnScan<float, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx, his, n,
+                                  args);
     } else {
-      LaunchGdnScan<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
-                                          args);
+      LaunchGdnScan<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx,
+                                          his, n, args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      LaunchGdnScan<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
-                                          args);
+      LaunchGdnScan<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx,
+                                          his, n, args);
     } else {
       LaunchGdnScan<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr,
-                                                  n, args);
+                                                  state_idx, his, n, args);
     }
   }
 }
@@ -789,7 +817,8 @@ __global__ void GdnChunkWUKernel(TSc* u, TSc* w, const Tin* k, const Tin* v,
 template <typename Tin>
 __global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, const Tin* k,
                                      const float* u, const float* w, const float* gcum,
-                                     const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                     const int32_t* qsl, const int32_t* boh,
+                                     const int32_t* state_idx, const int32_t* his, int64_t hk_n,
                                      int64_t dk, int64_t hv_n, int64_t dv) {
   const int64_t n = blockIdx.x, hv = blockIdx.y;
   const int64_t hk = hv / (hv_n / hk_n);
@@ -798,8 +827,12 @@ __global__ void GdnChunkDeltaHKernel(float* state, float* hstate, float* v_new, 
   const int64_t sd = dv * dk;
   extern __shared__ float hsh[];      // [Dv, Dk] running state
   __shared__ float decay[kChunk];     // exp(G_last - G_i), i<=last (bounded <=1)
-  float* s_head = state + (n * hv_n + hv) * sd;
-  for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hsh[e] = s_head[e];
+  // In-place: sequence n reads/writes the persistent cache slot state_idx[n]. Fresh
+  // sequences (his[n]==0) start from a ZERO state (mirrors the gather+ZERO).
+  const int64_t slot = state_idx != nullptr ? state_idx[n] : n;
+  const bool init = (his == nullptr) || his[n] != 0;
+  float* s_head = state + (slot * hv_n + hv) * sd;
+  for (int64_t e = threadIdx.x; e < sd; e += blockDim.x) hsh[e] = init ? s_head[e] : 0.0f;
   __syncthreads();
   const int64_t nt = (seqlen + kChunk - 1) / kChunk;
   for (int64_t it = 0; it < nt; ++it) {
@@ -942,8 +975,9 @@ struct WmmaCfg<float> {
 template <typename TD>
 __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, const TD* k,
                                          const TD* u, const TD* w, const float* gcum,
-                                         const int32_t* qsl, const int32_t* boh, int64_t hk_n,
-                                         int64_t dk, int64_t hv_n, int64_t dv) {
+                                         const int32_t* qsl, const int32_t* boh,
+                                         const int32_t* state_idx, const int32_t* his,
+                                         int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv) {
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t n = blockIdx.x, hv = blockIdx.y;
@@ -959,8 +993,12 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
   char* pool = smem_raw + sd * sizeof(float);           // reused by V1/V2
   __shared__ float decay[kChunk];
 
-  float* s_head = state + (n * hv_n + hv) * sd;
-  for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = s_head[e];
+  // In-place: sequence n reads/writes the persistent cache slot state_idx[n]. Fresh
+  // sequences (his[n]==0) start from a ZERO state (mirrors the gather+ZERO).
+  const int64_t slot = state_idx != nullptr ? state_idx[n] : n;
+  const bool init = (his == nullptr) || his[n] != 0;
+  float* s_head = state + (slot * hv_n + hv) * sd;
+  for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = init ? s_head[e] : 0.0f;
   __syncthreads();
 
   const int64_t nt = (seqlen + kChunk - 1) / kChunk;
@@ -1175,13 +1213,34 @@ __global__ void GdnBuildChunkMeta(int32_t* tok0, int32_t* lenv, int32_t* boh,
   }
 }
 
+// Persistent chunked-prefill scratch (grown on demand, kept alive), mirroring the MoE
+// EnsureMoeScratch discipline: the model forward drives ONE stream, so consecutive GDN
+// prefill layers are serialized on it => reusing one buffer is race-free (each layer
+// rewrites every region before reading it). Removes the 8 cudaMallocAsync + 8
+// cudaFreeAsync PER GDN LAYER PER PREFILL STEP — the stream-ordered alloc/free that
+// serialized behind the (already-launched) chunk kernels and starved the GPU (the
+// prefill analog of the decode in-place fix). cudaMalloc (not async) fires once at
+// warmup / on growth, never on the steady-state prefill path (shapes plateau at the
+// max prefill token count). Prefill is never CUDA-graph-captured, so the growth malloc
+// is safe. One char pool, sub-regions carved 256B-aligned (over-aligned for any dtype).
+char* g_gdn_prefill_scratch = nullptr;
+size_t g_gdn_prefill_scratch_cap = 0;
+char* EnsureGdnPrefillScratch(size_t bytes) {
+  if (bytes > g_gdn_prefill_scratch_cap) {
+    if (g_gdn_prefill_scratch) cudaFree(g_gdn_prefill_scratch);
+    Check(cudaMalloc(&g_gdn_prefill_scratch, bytes), "gdn prefill persistent scratch");
+    g_gdn_prefill_scratch_cap = bytes;
+  }
+  return g_gdn_prefill_scratch;
+}
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                           const std::vector<int32_t>& tok0h,
                           const std::vector<int32_t>& lenh, const std::vector<int32_t>& bohh,
-                          const Tensor& qsl, int64_t n_seq, int64_t nt_tot, bool dev_meta,
-                          const GdnArgs& args) {
+                          const Tensor& qsl, const int32_t* state_idx, const int32_t* his,
+                          int64_t n_seq, int64_t nt_tot, bool dev_meta, const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t t_tot = out.shape[0];
@@ -1199,31 +1258,28 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // (the extra rows contribute nothing: masked/discarded).
   const int64_t t_pad = t_tot + kChunk;
 
-  // Device scratch (stream-ordered; freed after the kernels on the same stream).
-  float* gcum = nullptr;
-  TSc* u = nullptr;
-  TSc* w = nullptr;
-  TSc* v_new = nullptr;
-  TSc* hstate = nullptr;
-  int32_t* d_tok0 = nullptr;
-  int32_t* d_len = nullptr;
-  int32_t* d_boh = nullptr;
-  Check(cudaMallocAsync(&gcum, static_cast<size_t>(t_tot * hv_n) * sizeof(float), s),
-        "gdn chunked gcum alloc");
-  Check(cudaMallocAsync(&u, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
-        "gdn chunked u alloc");
-  Check(cudaMallocAsync(&w, static_cast<size_t>(t_pad * hv_n * dk) * sizeof(TSc), s),
-        "gdn chunked w alloc");
-  Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
-        "gdn chunked v_new alloc");
-  Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(TSc), s),
-        "gdn chunked hstate alloc");
-  Check(cudaMallocAsync(&d_tok0, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
-        "gdn chunked tok0 alloc");
-  Check(cudaMallocAsync(&d_len, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
-        "gdn chunked len alloc");
-  Check(cudaMallocAsync(&d_boh, static_cast<size_t>(n_seq) * sizeof(int32_t), s),
-        "gdn chunked boh alloc");
+  // Device scratch — ONE persistent grown-on-demand pool, carved into 256B-aligned
+  // sub-regions (replaces 8 cudaMallocAsync + 8 cudaFreeAsync per layer per step).
+  auto align = [](size_t x) { return (x + 255) & ~static_cast<size_t>(255); };
+  const size_t b_gcum = align(static_cast<size_t>(t_tot * hv_n) * sizeof(float));
+  const size_t b_u = align(static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc));
+  const size_t b_w = align(static_cast<size_t>(t_pad * hv_n * dk) * sizeof(TSc));
+  const size_t b_vnew = align(static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc));
+  const size_t b_hstate = align(static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(TSc));
+  const size_t b_tok0 = align(static_cast<size_t>(nt_tot) * sizeof(int32_t));
+  const size_t b_len = align(static_cast<size_t>(nt_tot) * sizeof(int32_t));
+  const size_t b_boh = align(static_cast<size_t>(n_seq) * sizeof(int32_t));
+  const size_t total = b_gcum + b_u + b_w + b_vnew + b_hstate + b_tok0 + b_len + b_boh;
+  char* base = EnsureGdnPrefillScratch(total);
+  size_t off = 0;
+  float* gcum = reinterpret_cast<float*>(base + off); off += b_gcum;
+  TSc* u = reinterpret_cast<TSc*>(base + off); off += b_u;
+  TSc* w = reinterpret_cast<TSc*>(base + off); off += b_w;
+  TSc* v_new = reinterpret_cast<TSc*>(base + off); off += b_vnew;
+  TSc* hstate = reinterpret_cast<TSc*>(base + off); off += b_hstate;
+  int32_t* d_tok0 = reinterpret_cast<int32_t*>(base + off); off += b_tok0;
+  int32_t* d_len = reinterpret_cast<int32_t*>(base + off); off += b_len;
+  int32_t* d_boh = reinterpret_cast<int32_t*>(base + off); off += b_boh;
   if (dev_meta) {
     // Device-resident metadata: fill d_tok0/d_len/d_boh on the device from the
     // device qsl (no host-vector H2D, no launch sync — the caller does not sync).
@@ -1277,7 +1333,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
            "gdn chunked delta_h(wmma) shared opt-in");
     GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, 256, delta_bytes, s>>>(
         state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv);
+        state_idx, his, hk_n, dk, hv_n, dv);
     Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
 
     const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
@@ -1300,7 +1356,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
            "gdn chunked delta_h shared opt-in");
     GdnChunkDeltaHKernel<Tin><<<grid_seq, 256, hsh_bytes, s>>>(
         state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv);
+        state_idx, his, hk_n, dk, hv_n, dv);
     Check(cudaGetLastError(), "gdn chunked delta_h launch");
 
     GdnChunkOKernel<Tin, Tout><<<grid_chunk, 256, 0, s>>>(out.Ptr<Tout>(), q_in.Ptr<Tin>(),
@@ -1311,25 +1367,21 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   } else {
     VT_CHECK(false, "cuda gdn_prefill(chunked): bf16 requires WMMA-friendly head dims");
   }
-
-  Check(cudaFreeAsync(gcum, s), "gdn chunked gcum free");
-  Check(cudaFreeAsync(u, s), "gdn chunked u free");
-  Check(cudaFreeAsync(w, s), "gdn chunked w free");
-  Check(cudaFreeAsync(v_new, s), "gdn chunked v_new free");
-  Check(cudaFreeAsync(hstate, s), "gdn chunked hstate free");
-  Check(cudaFreeAsync(d_tok0, s), "gdn chunked tok0 free");
-  Check(cudaFreeAsync(d_len, s), "gdn chunked len free");
-  Check(cudaFreeAsync(d_boh, s), "gdn chunked boh free");
+  // Scratch is persistent (EnsureGdnPrefillScratch) — no per-call free. The next GDN
+  // prefill layer on this stream rewrites every region before it reads it.
 }
 
 void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                           const Tensor& qsl, const GdnArgs& args) {
+                           const Tensor& qsl, const GdnArgs& args, const int32_t* state_idx,
+                           const int32_t* his, int64_t n_seq_in) {
   VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
            "cuda gdn_prefill(chunked): unsupported q dtype (f32/bf16 only)");
   VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
            "cuda gdn_prefill(chunked): q/k/v dtypes must match");
-  const int64_t n_seq = state.shape[0], hv_n = state.shape[1], dv = state.shape[2];
+  // With state_idx, state is the FULL cache; the real sequence count is n_seq_in.
+  const int64_t n_seq = state_idx != nullptr ? n_seq_in : state.shape[0];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2];
   if (n_seq == 0 || hv_n == 0 || dv == 0) return;
   const int64_t hk_n = q_in.shape[1];
   VT_CHECK(hk_n > 0 && hv_n % hk_n == 0,
@@ -1381,18 +1433,20 @@ void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tens
   if (q_in.dtype == DType::kF32) {
     if (out.dtype == DType::kF32)
       LaunchChunkedPrefill<float, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh, bohh,
-                                         qsl, n_seq, nt_tot, dev_meta, args);
+                                         qsl, state_idx, his, n_seq, nt_tot, dev_meta, args);
     else
       LaunchChunkedPrefill<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
-                                                 bohh, qsl, n_seq, nt_tot, dev_meta, args);
+                                                 bohh, qsl, state_idx, his, n_seq, nt_tot,
+                                                 dev_meta, args);
   } else {
     if (out.dtype == DType::kF32)
       LaunchChunkedPrefill<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
-                                                 bohh, qsl, n_seq, nt_tot, dev_meta, args);
+                                                 bohh, qsl, state_idx, his, n_seq, nt_tot,
+                                                 dev_meta, args);
     else
       LaunchChunkedPrefill<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h,
-                                                         lenh, bohh, qsl, n_seq, nt_tot, dev_meta,
-                                                         args);
+                                                         lenh, bohh, qsl, state_idx, his, n_seq,
+                                                         nt_tot, dev_meta, args);
   }
   // FALLBACK only: keep the host index vectors alive until the async uploads
   // finish. dev_meta builds the arrays on-device (no host vectors) so it does NOT
@@ -1402,8 +1456,17 @@ void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tens
 
 void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                          const Tensor& qsl, const GdnArgs& args) {
+                          const Tensor& qsl, const GdnArgs& args, const Tensor* state_idx,
+                          const Tensor* has_initial_state) {
   const int64_t dv = state.shape[2], dk = state.shape[3];
+  // state_idx (optional; in-place on the FULL persistent ssm_state cache at slot
+  // state_idx[s], the prefill analog of the decode fix) + has_initial_state (fresh
+  // sequences start from zero — the moved gather+ZERO). n_seq is the true sequence
+  // count (state.shape[0] is the whole cache when indexed).
+  const int32_t* si = state_idx != nullptr ? state_idx->Ptr<int32_t>() : nullptr;
+  const int32_t* hisp =
+      has_initial_state != nullptr ? has_initial_state->Ptr<int32_t>() : nullptr;
+  const int64_t n_seq = state_idx != nullptr ? state_idx->shape[0] : state.shape[0];
   // Chunked path (default) for real head dims; the sequential scan handles the
   // arbitrary-dim corners (the CUDA op tests exercise Dv=Dk=300) and the A/B
   // fallback (VT_GDN_CHUNKED=0). The bf16 chunked path is WMMA (tensor-core),
@@ -1412,10 +1475,11 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
   const bool wmma_ok = q_in.dtype != DType::kBF16 || (dk % kWM == 0 && dv % kNB == 0);
   if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f &&
       wmma_ok) {
-    GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
+    GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args, si, hisp, n_seq);
     return;
   }
-  GdnScanCuda(q, out, q_in, k, v, g, beta, state, qsl.Ptr<int32_t>(), args, "gdn_prefill");
+  GdnScanCuda(q, out, q_in, k, v, g, beta, state, qsl.Ptr<int32_t>(), args, "gdn_prefill", si,
+              hisp, n_seq);
 }
 
 void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,

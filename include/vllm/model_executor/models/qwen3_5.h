@@ -85,6 +85,15 @@ class Qwen3_5Model {
   //
   // Runs on `queue`'s device (CPU or CUDA). Throws (VT_CHECK/runtime_error) on
   // any shape/config mismatch.
+  //
+  // `logits_indices` (optional): the per-request last-token row indices
+  // (query_start_loc[1:] - 1). When non-empty AND a proper subset of the T
+  // rows (prefill/mixed: len < T), the final hidden rows are GATHERED on-device
+  // BEFORE lm_head — mirroring vLLM gpu_model_runner.py:4364-4365
+  // (sample_hidden_states = hidden_states[logits_indices];
+  //  compute_logits(sample_hidden_states)) — so lm_head runs on len(indices)
+  // rows and the return is [num_reqs, vocab] in request order. Empty (default)
+  // or pure-decode (len == T) keeps the full [num_actual_tokens, vocab] return.
   static std::vector<float> Forward(const std::vector<int32_t>& token_ids,
                                     const std::vector<int32_t>& positions,
                                     const v1::CommonAttentionMetadata& attn_meta,
@@ -92,7 +101,8 @@ class Qwen3_5Model {
                                     const std::vector<PagedKvCache>& attn_kv,
                                     const std::vector<GdnStateCache>& gdn_state,
                                     const Qwen3_5MoeWeights& weights,
-                                    const HfConfig& config, vt::Queue& queue);
+                                    const HfConfig& config, vt::Queue& queue,
+                                    const std::vector<int32_t>& logits_indices = {});
 
   // Dense single-sequence reference forward (M0.9). Runs the whole model for a
   // single non-paged sequence and returns logits [T, vocab] f32 (T =

@@ -593,12 +593,18 @@ bool TrueW4A4Enabled() {
 // path; its dense/MoE NVFP4 run the Marlin W4A16 branch. So this default-flip
 // cannot affect the 35B.
 //
-// THROUGHPUT lever, correctness-NEUTRAL: BOTH the cutlass and emulation paths
-// reproduce vLLM's OWN emulation token stream (tok6=271) token-for-token. Swapping
-// ONLY the GEMM to real cutlass does NOT recover vLLM's native flashinfer stream
-// (198) — the 27B still yields 271; tok6 is a razor near-tie tipped by the
-// aggregate non-fp4 forward numerics, not the fp4 GEMM (measured 2026-07-05).
-// Only meaningful when the cutlass TU was compiled (VT_CUTLASS_NVFP4).
+// THROUGHPUT lever, near-emulation correctness. Swapping the GEMM to real cutlass
+// does NOT recover vLLM's native flashinfer stream (198) — the 27B still yields
+// tok6=271; tok6 is a razor near-tie tipped by the aggregate non-fp4 forward
+// numerics, not the fp4 GEMM (measured 2026-07-05). MEASURED 2026-07-06: cutlass
+// is ~0.19% off the emulation-grade MatmulNvfp4Fp4 (test_ops_nvfp4_fp4, NOT
+// bit-exact), so on the near-tie-dense 27B greedy gate it reproduces emulation on
+// the semantic tokens (0-7) then DETERMINISTICALLY flips a later whitespace
+// near-tie at tok8 (271 "\n\n" -> 198 "\n"). Output stays coherent; the token-exact
+// correctness gate therefore pins the emulation-grade reference (VT_NVFP4_CUTLASS=0)
+// while this default carries the throughput win — see
+// tests/parity/test_qwen27_paged_engine.cpp. Only meaningful when the cutlass TU
+// was compiled (VT_CUTLASS_NVFP4).
 bool NvfpCutlassEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_NVFP4_CUTLASS");

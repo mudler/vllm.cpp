@@ -17,8 +17,10 @@
 //   4. CUDA-vs-CPU parity (guarded by HasCuda; dgx-pending on CPU-only boxes).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -595,6 +597,114 @@ TEST_CASE("paged_attention CUDA matches CPU (batched varlen, GQA, block-spanning
 
   for (size_t i = 0; i < ref.size(); ++i)
     CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
+}
+
+// ===========================================================================
+// bf16 TENSOR-CORE (WMMA) prefill parity. The WMMA flash path fires only for a
+// bf16 KV cache (the deployment path — vLLM's bf16 flash_attn store); it casts
+// the f32 query to bf16 and runs QKᵀ / P·V on the tensor cores with f32 online
+// softmax. Validate at the gate config (head_dim 256, GQA 16q/2kv, multi-tile
+// prefill) against the f32 composed reference computed on the SAME bf16-rounded
+// K/V — so the residual is query-bf16 + bf16-matmul rounding only (bf16 tol).
+// Guarded by HasCuda; dgx-pending on CPU-only boxes.
+// ===========================================================================
+namespace {
+// f32 -> bf16 round-to-nearest-even (host; the test .cpp is not nvcc-compiled).
+inline uint16_t F32ToBf16Bits(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  const uint32_t rounding = 0x7fffu + ((x >> 16) & 1u);
+  return static_cast<uint16_t>((x + rounding) >> 16);
+}
+inline float Bf16BitsToF32(uint16_t b) {
+  uint32_t x = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &x, sizeof(f));
+  return f;
+}
+}  // namespace
+
+TEST_CASE("paged_attention CUDA WMMA (bf16 cache) matches f32 ref at head_dim 256") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping paged_attention WMMA bf16 parity (dgx-pending)");
+    return;
+  }
+  const int64_t Hq = 16, Hk = 2, D = 256, block_size = 16;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  std::vector<int32_t> qsl = {0, 100, 101, 104};
+  std::vector<int32_t> seq_lens = {100, 133, 140};
+  const int64_t num_tokens = 104;
+  const int64_t num_reqs = 3;
+  const int64_t num_blocks = 64, page = Hk * D, max_blocks = 9;
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 2024);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 137);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 179);
+  std::vector<int32_t> block_table = {5,  0,  11, 3,  0,  0, 0, 0, 0,
+                                      2,  17, 9,  20, 1,  8, 0, 0, 0,
+                                      30, 4,  22, 15, 6, 19, 7, 12, 0};
+
+  // Round K/V to bf16 (bit-identical to what the kernel reads), and build the
+  // f32 reference on those same values so only the compute rounding remains.
+  std::vector<uint16_t> kc_b(kc.size()), vc_b(vc.size());
+  std::vector<float> kc_r(kc.size()), vc_r(vc.size());
+  for (size_t i = 0; i < kc.size(); ++i) {
+    kc_b[i] = F32ToBf16Bits(kc[i]);
+    kc_r[i] = Bf16BitsToF32(kc_b[i]);
+    vc_b[i] = F32ToBf16Bits(vc[i]);
+    vc_r[i] = Bf16BitsToF32(vc_b[i]);
+  }
+  std::vector<float> ref = ComposedPagedRef(q, kc_r, vc_r, block_table, max_blocks, seq_lens, qsl,
+                                            Hq, Hk, D, block_size, scale, true);
+
+  // Build the ENGINE cache layout: a single (num_blocks, 2, block_size, Hk, D)
+  // bf16 allocation; K = unbind(1)[0], V = unbind(1)[1] (block stride 2*bs*Hk*D,
+  // V at element offset bs*Hk*D). This is the M1.6 layout trap — the strided
+  // slice the runner really feeds PagedAttention (KvSlice, qwen3_5.cpp:778).
+  const int64_t within = block_size * Hk * D;
+  std::vector<uint16_t> combined(static_cast<size_t>(num_blocks * 2 * within), 0);
+  for (int64_t b = 0; b < num_blocks; ++b)
+    for (int64_t e = 0; e < within; ++e) {
+      combined[static_cast<size_t>((b * 2 + 0) * within + e)] = kc_b[static_cast<size_t>(b * within + e)];
+      combined[static_cast<size_t>((b * 2 + 1) * within + e)] = vc_b[static_cast<size_t>(b * within + e)];
+    }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {num_tokens, Hq, D}, q.data());
+  // Allocate as rank-1 (kMaxRank=4; the true (nb,2,bs,Hk,D) is rank 5) then build
+  // strided rank-4 K/V views into it.
+  DeviceTensor dcache(gpu, g.q, DType::kBF16, {num_blocks * 2 * within}, combined.data());
+  auto SliceView = [&](int which) {
+    Tensor t = dcache.tensor();
+    t.data = static_cast<char*>(t.data) +
+             static_cast<size_t>(which) * static_cast<size_t>(within) * vt::SizeOf(DType::kBF16);
+    t.rank = 4;
+    t.shape[0] = num_blocks;
+    t.shape[1] = block_size;
+    t.shape[2] = Hk;
+    t.shape[3] = D;
+    t.stride[0] = 2 * within;
+    t.stride[1] = Hk * D;
+    t.stride[2] = D;
+    t.stride[3] = 1;
+    return t;
+  };
+  Tensor kview = SliceView(0);
+  Tensor vview = SliceView(1);
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {num_tokens, Hq, D});
+  vt::PagedAttention(g.q, dout.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                     dsl.tensor(), dqsl.tensor(), PagedAttentionArgs{scale, true});
+  std::vector<float> got(static_cast<size_t>(num_tokens * Hq * D), 0.0f);
+  dout.Download(g.q, got.data());
+
+  double max_abs = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    max_abs = std::max(max_abs, std::abs(static_cast<double>(got[i]) - ref[i]));
+  MESSAGE("WMMA bf16 prefill max_abs_err vs f32 ref = " << max_abs);
+  CHECK(max_abs < 5e-2);
 }
 
 // ===========================================================================

@@ -7,8 +7,9 @@
 // bf16 tensors. Quant schemes per weight class (verified against the real ckpt,
 // .agents/qwen36-forward-notes.md §6):
 //   - MoE experts + shared_expert + lm_head : NVFP4 W4A16 (DequantNvfp4ToBf16)
-//   - attention (q/k/v/o) + GDN (in_proj_qkv/z, out_proj) : per-tensor FP8
-//     (DequantFp8ToBf16) — NOT bf16 as the task first assumed
+//   - attention (q/k/v/o) + GDN (in_proj_qkv/z, out_proj) : per-tensor FP8 W8A8
+//     — fp8-resident by DEFAULT (VT_DENSE_NATIVE, native cutlass W8A8 GEMM);
+//     DequantFp8ToBf16 only when VT_DENSE_NATIVE=0. NOT bf16 as first assumed.
 //   - everything else (embeds, norms, router gate, conv1d, A_log/dt_bias,
 //     in_proj_a/b) : bf16 (A_log/dt_bias upcast to f32)
 //
@@ -138,11 +139,12 @@ struct GdnLayerWeights {
   // the bf16 out_proj and leave this empty. Exactly one is filled.
   Nvfp4Weight out_proj_fp4;   // [N=H, K=value_dim]
 
-  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
-  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
+  // real 35B CUDA+cutlass load (VT_DENSE_NATIVE, native ON); the bf16
   // in_proj_qkv/z/out_proj above are then left EMPTY and the forward calls
-  // vt::MatmulFp8Cutlass. The 27B (bf16 in_proj + fp4 out_proj) and GGUF/synthetic
-  // (bf16) loaders leave these empty. The forward checks fp8, then fp4, then bf16.
+  // vt::MatmulFp8Cutlass. VT_DENSE_NATIVE=0 flips back to the bf16 fields. The 27B
+  // (bf16 in_proj + fp4 out_proj) and GGUF/synthetic (bf16) loaders leave these
+  // empty. The forward checks fp8, then fp4, then bf16.
   Fp8Weight in_proj_qkv_fp8;  // [N=conv_dim, K=H]
   Fp8Weight in_proj_z_fp8;    // [N=value_dim, K=H]
   Fp8Weight out_proj_fp8;     // [N=H, K=value_dim]
@@ -167,11 +169,11 @@ struct FullAttnLayerWeights {
   Nvfp4Weight v_proj_fp4;  // [N=Hkv*Dh,  K=H]
   Nvfp4Weight o_proj_fp4;  // [N=H,       K=Hq*Dh]
 
-  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
-  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
-  // q/k/v/o_proj above are then left EMPTY and the forward calls
-  // vt::MatmulFp8Cutlass. The 27B (fp4) and GGUF/synthetic (bf16) loaders leave
-  // these empty. The forward checks fp8, then fp4, then falls back to bf16.
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
+  // real 35B CUDA+cutlass load (VT_DENSE_NATIVE, native ON); the bf16 q/k/v/o_proj
+  // above are then left EMPTY and the forward calls vt::MatmulFp8Cutlass.
+  // VT_DENSE_NATIVE=0 flips back to the bf16 fields. The 27B (fp4) and GGUF/
+  // synthetic (bf16) loaders leave these empty. Forward checks fp8, fp4, then bf16.
   Fp8Weight q_proj_fp8;  // [N=2*Hq*Dh, K=H]
   Fp8Weight k_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]

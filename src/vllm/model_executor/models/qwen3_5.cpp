@@ -550,7 +550,8 @@ Tensor ResidentFp8(Dev d, const Fp8Weight& w) {
 // checkpoint input_scale) then vt::MatmulFp8Cutlass with the folded alpha
 // (= input_scale·weight_scale). out dtype f32 (q/k/v, in_proj_qkv/z sinks) or
 // bf16 (o/out_proj residual sinks). CUDA-only (sm120a; the 35B W8A8 path is
-// CUDA-resident — fp8 fields are only populated on the CUDA load, VT_FP8_CUTLASS).
+// CUDA-resident — fp8 fields are populated by DEFAULT on the CUDA+cutlass load,
+// VT_DENSE_NATIVE; VT_DENSE_NATIVE=0 leaves them empty -> the bf16 MatmulF32D).
 DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,

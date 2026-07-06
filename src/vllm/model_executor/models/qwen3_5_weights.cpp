@@ -115,16 +115,35 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
-// cutlass W8A8 fp8 path opt-in (default OFF). The default dequants the fp8 attn/
-// GDN projections to bf16 AT LOAD (LoadFp8Transposed) and runs the cublas/vt
-// bf16 W8A16 GEMM. VT_FP8_CUTLASS=1 keeps the fp8 bytes resident + loads the
-// static input_scale, and the forward runs the lifted vLLM cutlass W8A8 GEMM
-// (static per-tensor activation quant + fp8 tensor cores) — mirroring vLLM's
-// actual scheme for these projections (the checkpoint IS W8A8). Load-time gate
-// so the default bf16 path is byte-for-byte untouched (main not regressed).
-bool Fp8CutlassEnabled() {
-  const char* e = std::getenv("VT_FP8_CUTLASS");
-  return e != nullptr && e[0] == '1';
+// Native-precision dense projections — the #1 decode-throughput lever
+// (VT_DENSE_NATIVE, DEFAULT ON). The 35B attn q/k/v/o + GDN in_proj_qkv/z/
+// out_proj are per-tensor FP8 W8A8 in the checkpoint (weight F8_E4M3 +
+// weight_scale + input_scale). Default (native): keep the fp8 bytes RESIDENT
+// (LoadFp8Raw) + load the static input_scale, and the forward runs the lifted
+// vLLM cutlass sm120 W8A8 GEMM (vt::MatmulFp8Cutlass — static per-tensor
+// activation quant + fp8 tensor cores), mirroring vLLM's actual scheme for these
+// projections (the checkpoint IS W8A8) and HALVING their weight bytes vs bf16.
+// VT_DENSE_NATIVE=0 (or the legacy VT_FP8_CUTLASS=0) restores the dequant-fp8->
+// bf16-AT-LOAD path (LoadFp8Transposed into the bf16 fields + cublas bf16 W8A16)
+// for the parent's A/B — that was the previous, slower default (the dense GEMMs
+// running bf16 = the profiled +59ms/step decode gap vs vLLM's native fp8).
+//   The other dense NVFP4 sinks (shared-expert gate/up/down + lm_head) are
+// ALREADY native by default: they are kept fp4-resident (LoadNvfp4Raw) and run
+// through the Marlin W4A16 GEMM at decode (MarlinMoeEnabled(); their activations
+// are bf16 so Marlin engages) — not gated here, native in both A/B settings.
+//   Guarded by VT_CUTLASS_FP8: a build WITHOUT the fp8 cutlass kernel (CPU /
+// no-cutlass) always dequants to bf16 (never routes to an uncompiled GEMM), so
+// only a CUDA+cutlass build defaults to fp8-resident.
+bool DenseNativeEnabled() {
+#ifdef VT_CUTLASS_FP8
+  const char* dn = std::getenv("VT_DENSE_NATIVE");
+  if (dn != nullptr && dn[0] == '0') return false;
+  const char* legacy = std::getenv("VT_FP8_CUTLASS");  // back-compat opt-out
+  if (legacy != nullptr && legacy[0] == '0') return false;
+  return true;
+#else
+  return false;
+#endif
 }
 
 // Per-tensor FP8 projection `<proj>.weight` F8_E4M3 [out,in] + `.weight_scale`
@@ -212,9 +231,9 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
-  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
-  if (Fp8CutlassEnabled()) {
+  // W8A8 cutlass (35B), DEFAULT: keep raw fp8 + input_scale, run the lifted
+  // cutlass GEMM. VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields.
+  if (DenseNativeEnabled()) {
     g.in_proj_qkv_fp8 = LoadFp8Raw(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8Raw(get, la + "in_proj_z");
     g.out_proj_fp8 = LoadFp8Raw(get, la + "out_proj");
@@ -241,9 +260,9 @@ FullAttnLayerWeights LoadAttn(const TensorResolver& get,
                               const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
-  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
-  if (Fp8CutlassEnabled()) {
+  // W8A8 cutlass (35B), DEFAULT: keep raw fp8 + input_scale, run the lifted
+  // cutlass GEMM. VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields.
+  if (DenseNativeEnabled()) {
     a.q_proj_fp8 = LoadFp8Raw(get, sa + "q_proj");
     a.k_proj_fp8 = LoadFp8Raw(get, sa + "k_proj");
     a.v_proj_fp8 = LoadFp8Raw(get, sa + "v_proj");

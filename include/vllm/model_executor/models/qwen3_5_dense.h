@@ -115,6 +115,9 @@ class Qwen3_5DenseModel {
   // layer + one GdnStateCache per GDN layer, in layer order. Returns
   // [num_actual_tokens, vocab] f32 logits (lm_head applied). Runs on `queue`'s
   // device. See qwen3_5.h::Qwen3_5Model::Forward for the metadata contract.
+  // `logits_indices` (optional): identical semantics to
+  // Qwen3_5Model::Forward — gather the per-request last-token hidden rows
+  // on-device before lm_head (prefill/mixed) so the return is [num_reqs, vocab].
   static std::vector<float> Forward(const std::vector<int32_t>& token_ids,
                                     const std::vector<int32_t>& positions,
                                     const v1::CommonAttentionMetadata& attn_meta,
@@ -122,7 +125,8 @@ class Qwen3_5DenseModel {
                                     const std::vector<PagedKvCache>& attn_kv,
                                     const std::vector<GdnStateCache>& gdn_state,
                                     const Qwen3_5DenseWeights& weights,
-                                    const HfConfig& config, vt::Queue& queue);
+                                    const HfConfig& config, vt::Queue& queue,
+                                    const std::vector<int32_t>& logits_indices = {});
 
   // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
   // for a single non-paged sequence and returns logits [T, vocab] f32 (T =

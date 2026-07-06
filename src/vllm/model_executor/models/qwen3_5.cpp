@@ -1985,7 +1985,8 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const GDNAttentionMetadata& gdn_meta,
                           const std::vector<PagedKvCache>& attn_kv,
                           const std::vector<GdnStateCache>& gdn_state,
-                          const Qwen3_5MoeWeights& weights, const HfConfig& config) {
+                          const Qwen3_5MoeWeights& weights, const HfConfig& config,
+                          const std::vector<int32_t>& logits_indices = {}) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -2020,6 +2021,23 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
+  // Logits gather (perf): mirror vLLM's gather-BEFORE-lm_head. On a prefill/mixed
+  // step (len(logits_indices) < T) gather only the per-request last-token hidden
+  // rows [num_reqs,H] and run lm_head on those → [num_reqs,vocab]. This is the
+  // whole win: lm_head over ~num_reqs rows instead of T, and only that tiny
+  // logits tensor is materialized/Downloaded. Pure-decode / graph replay pass
+  // empty indices (identity) so the full [T,vocab] path is unchanged.
+  const bool do_gather = !logits_indices.empty() &&
+                         static_cast<int64_t>(logits_indices.size()) < T;
+  if (do_gather) {
+    const int64_t n_out = static_cast<int64_t>(logits_indices.size());
+    DBuf dgather(d, DType::kBF16, {n_out, H});
+    GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
+    return weights.lm_head_fp4.Empty()
+               ? MatmulF32D(d, dgather.t(), weights.lm_head)
+               : MatmulNvfp4F32D(d, dgather.t(), weights.lm_head_fp4);
+  }
+
   // lm_head: fp4-resident (M2.2b) when populated, else the bf16/GGUF path.
   return weights.lm_head_fp4.Empty()
              ? MatmulF32D(d, dnorm.t(), weights.lm_head)
@@ -2035,13 +2053,14 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const GDNAttentionMetadata& gdn_meta,
                         const std::vector<PagedKvCache>& attn_kv,
                         const std::vector<GdnStateCache>& gdn_state,
-                        const Qwen3_5MoeWeights& weights, const HfConfig& config) {
+                        const Qwen3_5MoeWeights& weights, const HfConfig& config,
+                        const std::vector<int32_t>& logits_indices = {}) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
-                       gdn_state, weights, config);
+                       gdn_state, weights, config, logits_indices);
 }
 
 // Shared shape/count validation for the paged forward entry points.
@@ -2103,15 +2122,18 @@ std::vector<float> Qwen3_5Model::Forward(
     const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
-    const HfConfig& config, vt::Queue& queue) {
+    const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices) {
   CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
                     config);
   Dev d{vt::GetBackend(queue.device.type), queue};
-  const int64_t T = static_cast<int64_t>(token_ids.size());
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                             gdn_state, weights, config);
-  std::vector<float> logits(static_cast<size_t>(T) * config.vocab_size);
-  dlogits.Download(d, logits.data());  // the ONE host Download of the forward.
+                             gdn_state, weights, config, logits_indices);
+  // dlogits is [n_out, vocab]: n_out == num_reqs when gathered (prefill/mixed),
+  // else T. Download exactly the produced rows (the ONE host Download).
+  const int64_t n_out = dlogits.t().shape[0];
+  std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
+  dlogits.Download(d, logits.data());
   return logits;
 }
 
@@ -2208,7 +2230,7 @@ std::vector<float> Qwen3_5DenseModel::Forward(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
   // Same shape/count contract as Qwen3_5Model::Forward (CheckPagedForward), over
   // the dense weights. One PagedKvCache per full-attn layer, one GdnStateCache
   // per GDN layer, in layer order.
@@ -2266,7 +2288,19 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   DBuf dnorm(d, DType::kBF16, {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
+  // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
   // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
+  const bool do_gather = !logits_indices.empty() &&
+                         static_cast<int64_t>(logits_indices.size()) < T;
+  if (do_gather) {
+    const int64_t n_out = static_cast<int64_t>(logits_indices.size());
+    DBuf dgather(d, DType::kBF16, {n_out, H});
+    GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
+    DBuf dlogits = MatmulF32D(d, dgather.t(), weights.lm_head);
+    std::vector<float> logits(static_cast<size_t>(n_out) * vocab);
+    dlogits.Download(d, logits.data());
+    return logits;
+  }
   DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());

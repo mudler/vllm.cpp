@@ -22,6 +22,19 @@
 
 namespace vllm::v1 {
 
+// Logits-gather A/B toggle (perf). Default ON: the forward gathers the
+// per-request last-token hidden rows BEFORE lm_head (prefill/mixed), so lm_head
+// runs on num_reqs rows and only [num_reqs,vocab] is Downloaded. VT_LOGITS_GATHER=0
+// restores the old full [num_actual_tokens,vocab] path (lm_head over all tokens,
+// full D2H, host re-gather in sample_tokens). Both are token-for-token identical.
+static bool LogitsGatherEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LOGITS_GATHER");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
 bool reorder_batch_to_split_decodes_and_prefills(
     InputBatch& input_batch, const SchedulerOutput& scheduler_output,
@@ -449,8 +462,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   const std::vector<int32_t>& token_ids = step.input_token_ids;
   std::vector<int32_t> positions(step.positions.begin(), step.positions.end());
 
-  // THE FORWARD (Task 3, over the persistent KV caches). Returns the full
-  // [num_actual_tokens, vocab] f32 logits (lm_head already applied).
+  // THE FORWARD (Task 3, over the persistent KV caches). Returns f32 logits
+  // (lm_head already applied): [num_reqs, vocab] when the gather-before-lm_head
+  // path is on (prefill/mixed) or pure-decode, else the full
+  // [num_actual_tokens, vocab] (VT_LOGITS_GATHER=0).
   //
   // DECODE CUDA-GRAPH path (M2.5): a PURE-DECODE step (every request one token,
   // no prefill) on an fp4/CUDA model is routed through the Qwen3_5DecodeGraph,
@@ -472,6 +487,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
                         !moe_weights_->layers.empty() &&
                         !moe_weights_->layers.front().moe.expert_gate_fp4.empty();
   constexpr int kMaxDecodeGraphBatch = 64;  // largest captured size
+  // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
+  // Empty when the toggle is off → old full-logits path. The eager forwards skip
+  // the gather when it is a no-op (pure decode: len == num_actual_tokens).
+  const std::vector<int32_t> kNoGather;
+  const std::vector<int32_t>& gather_li =
+      LogitsGatherEnabled() ? step.logits_indices : kNoGather;
   std::vector<float> logits;
   if (dense_weights_ != nullptr) {
     // DENSE arch (27B): the eager paged dense forward. Same paged KV/GDN-state
@@ -479,7 +500,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // decode-graph fast path does not apply here.
     logits = Qwen3_5DenseModel::Forward(token_ids, positions, attn_meta, gdn_meta,
                                         attn_kv_, gdn_state_, *dense_weights_,
-                                        config_, queue_);
+                                        config_, queue_, gather_li);
   } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
     if (!decode_graph_) {
       decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(
@@ -490,7 +511,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   } else {
     logits =
         Qwen3_5Model::Forward(token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                              gdn_state_, *moe_weights_, config_, queue_);
+                              gdn_state_, *moe_weights_, config_, queue_, gather_li);
   }
 
   // Stash for sample_tokens (upstream ExecuteModelState).
@@ -518,22 +539,39 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 
   const int64_t vocab = config_.vocab_size;
 
-  // Gather the logits_indices rows: [num_actual_tokens, vocab] -> [num_reqs,
-  // vocab] (upstream hidden_states[input_batch.logits_indices] -> compute_logits;
-  // our Forward already applied lm_head, so we gather the logit rows directly).
-  std::vector<float> sampled_logits(static_cast<size_t>(num_reqs) *
-                                    static_cast<size_t>(vocab));
-  for (int i = 0; i < num_reqs; ++i) {
-    const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
-    std::memcpy(
-        sampled_logits.data() + static_cast<size_t>(i) * static_cast<size_t>(vocab),
-        exec_state_.logits.data() +
-            static_cast<size_t>(row) * static_cast<size_t>(vocab),
-        static_cast<size_t>(vocab) * sizeof(float));
+  // Gather the logits_indices rows into per-request order (upstream
+  // hidden_states[input_batch.logits_indices] -> compute_logits; our Forward
+  // already applied lm_head, so we gather the logit rows directly).
+  //
+  // When the forward returns exactly num_reqs rows the rows are ALREADY in
+  // request order — either the gather-before-lm_head path (prefill/mixed) or a
+  // pure-decode / decode-graph step (one row per request, logits_indices is the
+  // identity). Use them directly; no host re-gather / no full-logits copy.
+  // Otherwise (full [num_actual_tokens,vocab], VT_LOGITS_GATHER=0) re-gather on
+  // host via logits_indices, exactly as before.
+  const int64_t n_rows =
+      vocab > 0 ? static_cast<int64_t>(exec_state_.logits.size()) / vocab : 0;
+  std::vector<float> sampled_logits;  // outlives the sampler when used
+  vt::Tensor logits;
+  if (n_rows == num_reqs) {
+    logits = vt::Tensor::Contiguous(
+        exec_state_.logits.data(), vt::DType::kF32, queue_.device,
+        {static_cast<int64_t>(num_reqs), vocab});
+  } else {
+    sampled_logits.resize(static_cast<size_t>(num_reqs) *
+                          static_cast<size_t>(vocab));
+    for (int i = 0; i < num_reqs; ++i) {
+      const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
+      std::memcpy(
+          sampled_logits.data() + static_cast<size_t>(i) * static_cast<size_t>(vocab),
+          exec_state_.logits.data() +
+              static_cast<size_t>(row) * static_cast<size_t>(vocab),
+          static_cast<size_t>(vocab) * sizeof(float));
+    }
+    logits = vt::Tensor::Contiguous(
+        sampled_logits.data(), vt::DType::kF32, queue_.device,
+        {static_cast<int64_t>(num_reqs), vocab});
   }
-  vt::Tensor logits = vt::Tensor::Contiguous(
-      sampled_logits.data(), vt::DType::kF32, queue_.device,
-      {static_cast<int64_t>(num_reqs), vocab});
 
   // Apply the structured-output grammar bitmask (utils.py apply_grammar_bitmask)
   // to the gathered [num_reqs, vocab] logits BEFORE sampling, when a structured

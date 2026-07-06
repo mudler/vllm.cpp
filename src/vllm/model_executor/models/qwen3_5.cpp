@@ -2661,8 +2661,19 @@ struct Qwen3_5DecodeGraph::Impl {
   Impl(const Qwen3_5MoeWeights& w, const HfConfig& c, vt::Queue q,
        int64_t max_reqs)
       : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
-    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
-    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    // Batched decode CUDA-graph gate. VLLM_CPP_BATCHED_DECODE_GRAPH is the
+    // purpose-named A/B toggle for THIS feature ("1"/any non-"0" → on, "0" →
+    // eager decode); when it is unset the legacy VLLM_CPP_CUDAGRAPH still
+    // applies, and when neither is set the graph is ON (the merged main default,
+    // so an un-env'd run is unchanged). Either env set to "0" forces the eager
+    // ForwardBody path so the parent can measure graph-on vs graph-off cleanly.
+    const char* bdg_env = std::getenv("VLLM_CPP_BATCHED_DECODE_GRAPH");
+    const char* cg_env = std::getenv("VLLM_CPP_CUDAGRAPH");
+    bool env_on = true;  // default ON (current main behavior)
+    if (bdg_env != nullptr)
+      env_on = std::string(bdg_env) != "0";
+    else if (cg_env != nullptr)
+      env_on = std::string(cg_env) != "0";
     Backend& b = vt::GetBackend(queue.device.type);
     enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
               b.SupportsGraphCapture();

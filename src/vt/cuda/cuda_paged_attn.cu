@@ -146,6 +146,146 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
 }
 
 // ===========================================================================
+// DECODE path, OPTIMIZED (VT_ATTN_DECODE_OPT, default ON; =0 -> block kernel).
+// Mirrors FlashInfer BatchDecodeWithPagedKVCache / vLLM's paged decode attention
+// access pattern: each of kDecWarps warps STRIDES over the KV sequence (warp w
+// owns keys w, w+kDecWarps, ...); per lane holds a 128-bit-vectorized head_dim
+// slice (8 elems at d=256), the q.k score is a warp-shuffle reduction (NONE of
+// the block kernel's ~4 __syncthreads/key), and the online softmax (running
+// max/sum + weighted-V accumulator) lives entirely in registers. A single
+// cross-warp flash merge combines the per-warp partials at the end. Coalesced
+// uint4 K/V loads saturate the bf16 KV-cache bandwidth. head_dim is fixed to 256
+// (the gate model); other head_dims fall back to the block kernel. Fully
+// device-side (scans query_start_loc) -> CUDA-graph capturable.
+// ===========================================================================
+constexpr int kDecWarps = 8;  // warps per block (block = 256 threads)
+constexpr int kDecEpl = 8;    // head_dim elems per lane: d == 32 * 8 == 256
+
+// Load kDecEpl(=8) contiguous head-dim elems for `lane` (elems [lane*8,lane*8+8))
+// as one coalesced 128-bit transaction per lane (adjacent lanes -> adjacent
+// 16B words). bf16: one uint4 (8 x bf16); f32: two uint4 (8 x f32).
+__device__ inline void LoadRow8(const __nv_bfloat16* p, int64_t base, int lane, float r[8]) {
+  const uint4 w = reinterpret_cast<const uint4*>(p + base)[lane];
+  const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) r[i] = __bfloat162float(h[i]);
+}
+__device__ inline void LoadRow8(const float* p, int64_t base, int lane, float r[8]) {
+  const uint4 a = reinterpret_cast<const uint4*>(p + base)[lane * 2];
+  const uint4 b = reinterpret_cast<const uint4*>(p + base)[lane * 2 + 1];
+  const float* fa = reinterpret_cast<const float*>(&a);
+  const float* fb = reinterpret_cast<const float*>(&b);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    r[i] = fa[i];
+    r[i + 4] = fb[i];
+  }
+}
+
+template <typename TQ, typename TKV, typename Tout>
+__global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const TKV* k_cache,
+                                              const TKV* v_cache, const int32_t* block_table,
+                                              const int32_t* seq_lens,
+                                              const int32_t* query_start_loc, int64_t num_reqs,
+                                              int64_t hq, int64_t num_kv_heads, int64_t d,
+                                              int64_t block_size, int64_t bt_row, int64_t bt_col,
+                                              int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+                                              int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
+                                              float scale, bool causal) {
+  const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
+  const int64_t h = blockIdx.y;  // q-head
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+
+  // Locate request r owning token t (same device scan as the block kernel).
+  int64_t r = -1, q0 = 0, q1 = 0;
+  for (int64_t rr = 0; rr < num_reqs; ++rr) {
+    const int64_t a = query_start_loc[rr], b = query_start_loc[rr + 1];
+    if (t >= a && t < b) {
+      r = rr;
+      q0 = a;
+      q1 = b;
+      break;
+    }
+  }
+  if (r < 0) return;  // padding token beyond the last request
+
+  const int64_t query_len = q1 - q0;
+  const int64_t seqlen = seq_lens[r];
+  const int64_t context = seqlen - query_len;
+  const int64_t p = context + (t - q0);
+  const int64_t jmax = causal ? p : seqlen - 1;
+  const int64_t g = h / (hq / num_kv_heads);
+  const int64_t qoff = (t * hq + h) * d;
+
+  float q_reg[kDecEpl];
+  LoadRow8(query, qoff, lane, q_reg);  // this lane's query slice, loaded once
+
+  float m = -CUDART_INF_F, l = 0.0f;
+  float o_reg[kDecEpl];
+#pragma unroll
+  for (int i = 0; i < kDecEpl; ++i) o_reg[i] = 0.0f;
+
+  // Warp-strided scan over keys: warp-shuffle q.k, register online softmax.
+  for (int64_t j = warp; j <= jmax; j += kDecWarps) {
+    const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+    const int64_t off = j % block_size;
+    float k_reg[kDecEpl];
+    LoadRow8(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+    float dot = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) dot += q_reg[i] * k_reg[i];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, o);
+    dot = __shfl_sync(0xffffffffu, dot, 0);  // broadcast full-head score to lanes
+
+    const float s = dot * scale;
+    const float m_new = fmaxf(m, s);
+    const float corr = expf(m - m_new);  // 0 on the first key (m == -inf)
+    const float pw = expf(s - m_new);
+    float v_reg[kDecEpl];
+    LoadRow8(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) o_reg[i] = o_reg[i] * corr + pw * v_reg[i];
+    l = l * corr + pw;
+    m = m_new;
+  }
+
+  // Cross-warp flash merge: partials -> shared, warp 0 reduces + normalizes.
+  extern __shared__ float smem[];
+  float* o_sh = smem;                  // [kDecWarps * d]
+  float* m_sh = o_sh + kDecWarps * d;  // [kDecWarps]
+  float* l_sh = m_sh + kDecWarps;      // [kDecWarps]
+#pragma unroll
+  for (int i = 0; i < kDecEpl; ++i) o_sh[warp * d + lane * kDecEpl + i] = o_reg[i];
+  if (lane == 0) {
+    m_sh[warp] = m;
+    l_sh[warp] = l;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float gm = -CUDART_INF_F;
+#pragma unroll
+    for (int w = 0; w < kDecWarps; ++w) gm = fmaxf(gm, m_sh[w]);
+    float gl = 0.0f;
+    float acc[kDecEpl];
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) acc[i] = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kDecWarps; ++w) {
+      const float sc = expf(m_sh[w] - gm);  // empty warp: exp(-inf) == 0
+      gl += l_sh[w] * sc;
+#pragma unroll
+      for (int i = 0; i < kDecEpl; ++i) acc[i] += sc * o_sh[w * d + lane * kDecEpl + i];
+    }
+    const float inv = 1.0f / gl;
+#pragma unroll
+    for (int i = 0; i < kDecEpl; ++i) Store(out, qoff + lane * kDecEpl + i, acc[i] * inv);
+  }
+}
+
+// ===========================================================================
 // PREFILL path: FlashAttention-style tiled kernel.
 //   grid  = (num_tiles, hq); block = dim3(32, BM) → BM warps, one query row each.
 //   tiles[i] = (request r, first local query row) — never crosses a request.
@@ -939,6 +1079,16 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
 }
 
 
+// Optimized warp-split-KV decode attention (FlashInfer BatchDecode access
+// pattern). Default ON; opt-out via VT_ATTN_DECODE_OPT=0 (the block kernel).
+bool DecodeOptEnabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_ATTN_DECODE_OPT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return enabled;
+}
+
 // --- Launchers -------------------------------------------------------------
 
 template <typename TQ, typename TKV, typename Tout>
@@ -948,6 +1098,21 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
                   int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
                   int64_t block_size) {
   const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
+  if (DecodeOptEnabled() && d == 32 * kDecEpl) {
+    // FlashInfer-style warp-split-KV decode: coalesced 128-bit K/V loads,
+    // warp-shuffle online softmax (no per-key block barrier), register O.
+    const int block = kDecWarps * 32;
+    const size_t shmem =
+        (static_cast<size_t>(kDecWarps) * d + 2 * kDecWarps) * sizeof(float);
+    PagedAttentionDecodeOptKernel<TQ, TKV, Tout><<<grid, block, shmem, s>>>(
+        out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
+        block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+        num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
+        k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
+        v_cache.stride[1], v_cache.stride[2], args.scale, args.causal);
+    Check(cudaGetLastError(), "paged_attention decode-opt launch");
+    return;
+  }
   const size_t shmem = (static_cast<size_t>(d) + kPagedBlock) * sizeof(float);
   PagedAttentionKernel<TQ, TKV, Tout><<<grid, kPagedBlock, shmem, s>>>(
       out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),

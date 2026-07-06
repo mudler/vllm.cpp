@@ -11,3 +11,4 @@ __pycache__/
 # stray compiler output
 a.out
 *.out
+.claude/worktrees/

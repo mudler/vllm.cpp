@@ -207,9 +207,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<int32_t> gdn_free_slots_;
 
   // Owned KV-cache backing storage (host at T0) + the views the forward reads.
-  std::vector<std::vector<float>> full_attn_buf_;  // per full-attn layer
-  std::vector<std::vector<float>> ssm_buf_;        // per GDN layer
-  std::vector<std::vector<float>> conv_buf_;       // per GDN layer
+  // full_attn_buf_ is bf16 (uint16_t words) — the paged KV cache stores K/V in
+  // bf16, mirroring vLLM's bf16 flash_attn KV store (halves KV memory).
+  std::vector<std::vector<uint16_t>> full_attn_buf_;  // per full-attn layer (bf16)
+  std::vector<std::vector<float>> ssm_buf_;           // per GDN layer
+  std::vector<std::vector<float>> conv_buf_;          // per GDN layer
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
 

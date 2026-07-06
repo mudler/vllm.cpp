@@ -283,6 +283,15 @@ class DBuf {
   const Tensor& t() const { return t_; }
   void* ptr() { return p_; }
   size_t bytes() const { return bytes_; }
+  size_t alloc_bytes() const { return alloc_bytes_; }
+  // Relinquish ownership of the pool block WITHOUT returning it (the dtor becomes
+  // a no-op). The caller takes over the Pool().Put obligation for `alloc_bytes()`.
+  // The Tensor view (t()) still holds the raw data pointer after this.
+  void* Release() {
+    void* p = p_;
+    p_ = nullptr;
+    return p;
+  }
   void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
   // Copies the buffer back to host and blocks until the queue is idle.
   void Download(Dev d, void* host) {
@@ -2088,6 +2097,40 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
 }
 
+// Transfer a freshly-produced [rows, vocab] device logits DBuf into an OWNING
+// ForwardLogits (the sampler-on-device return). The pool block's lifetime moves
+// into a shared_ptr whose deleter returns it to the DevicePool — so there is NO
+// per-step cudaMalloc/cudaFree and the buffer safely outlives sampling (the
+// runner holds the ForwardLogits across execute_model -> sample_tokens).
+static ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t vocab) {
+  ForwardLogits fl;
+  fl.rows = dlogits.t().shape[0];
+  fl.vocab = vocab;
+  fl.device_tensor = dlogits.t();  // view (raw data ptr survives Release)
+  const size_t alloc = dlogits.alloc_bytes();
+  void* p = dlogits.Release();     // dtor now a no-op; we own the Pool().Put
+  fl.device_storage = std::shared_ptr<void>(
+      p, [alloc](void* q) { Pool().Put(alloc, q); });
+  (void)d;
+  return fl;
+}
+
+// Wrap the first `rows` rows of an EXTERNALLY-owned (persistent) device logits
+// buffer as a NON-owning ForwardLogits view (the decode-graph slot keeps the
+// storage alive across steps; each replay overwrites it, so the sampler may
+// mutate the view in place). Rows are contiguous (row-major), so the first `rows`
+// rows are a plain prefix view over `base`.
+static ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows,
+                                      int64_t vocab) {
+  ForwardLogits fl;
+  fl.rows = rows;
+  fl.vocab = vocab;
+  fl.device_tensor = MakeTensor(base, DType::kF32, device, {rows, vocab});
+  // Non-owning: keep on_device() true without taking ownership of `base`.
+  fl.device_storage = std::shared_ptr<void>(base, [](void*) {});
+  return fl;
+}
+
 void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue) {
 #ifdef VT_MARLIN_NVFP4
@@ -2135,6 +2178,23 @@ std::vector<float> Qwen3_5Model::Forward(
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+ForwardLogits Qwen3_5Model::ForwardDevice(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices) {
+  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
+                    config);
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                             gdn_state, weights, config, logits_indices);
+  // Keep the [n_out, vocab] logits ON DEVICE (no Download) — the sampler reads
+  // them directly.
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
 std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_ids,
@@ -2224,13 +2284,19 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   return logits;
 }
 
-std::vector<float> Qwen3_5DenseModel::Forward(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
-    const std::vector<PagedKvCache>& attn_kv,
-    const std::vector<GdnStateCache>& gdn_state,
-    const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+// Dense paged forward COMPUTE body: embed -> N paged dense layers -> final norm
+// -> (optional gather-before-)lm_head. Returns the [n_out, vocab] f32 logits as a
+// DEVICE DBuf (n_out == num_reqs when gathered, else T). Shared by the host
+// Forward (which Downloads) and ForwardDevice (which keeps it on device).
+static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
+                             const std::vector<int32_t>& positions,
+                             const CommonAttentionMetadata& attn_meta,
+                             const GDNAttentionMetadata& gdn_meta,
+                             const std::vector<PagedKvCache>& attn_kv,
+                             const std::vector<GdnStateCache>& gdn_state,
+                             const Qwen3_5DenseWeights& weights,
+                             const HfConfig& config,
+                             const std::vector<int32_t>& logits_indices) {
   // Same shape/count contract as Qwen3_5Model::Forward (CheckPagedForward), over
   // the dense weights. One PagedKvCache per full-attn layer, one GdnStateCache
   // per GDN layer, in layer order.
@@ -2252,7 +2318,6 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
            "qwen3_5 dense paged forward: gdn_state count must equal GDN layers");
 
-  Dev d{vt::GetBackend(queue.device.type), queue};
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
@@ -2289,22 +2354,47 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
+  // lm_head is unquantized bf16 in the 27B (notes §3.6).
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    DBuf dlogits = MatmulF32D(d, dgather.t(), weights.lm_head);
-    std::vector<float> logits(static_cast<size_t>(n_out) * vocab);
-    dlogits.Download(d, logits.data());
-    return logits;
+    return MatmulF32D(d, dgather.t(), weights.lm_head);
   }
-  DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
-  std::vector<float> logits(static_cast<size_t>(T) * vocab);
+  return MatmulF32D(d, dnorm.t(), weights.lm_head);
+}
+
+std::vector<float> Qwen3_5DenseModel::Forward(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                                  attn_kv, gdn_state, weights, config,
+                                  logits_indices);
+  const int64_t n_out = dlogits.t().shape[0];
+  std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+ForwardLogits Qwen3_5DenseModel::ForwardDevice(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                                  attn_kv, gdn_state, weights, config,
+                                  logits_indices);
+  return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
 std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
@@ -2547,7 +2637,7 @@ Qwen3_5DecodeGraph::~Qwen3_5DecodeGraph() = default;
 bool Qwen3_5DecodeGraph::captured() const { return impl_->any_captured; }
 int64_t Qwen3_5DecodeGraph::replay_count() const { return impl_->replays; }
 
-std::vector<float> Qwen3_5DecodeGraph::Step(
+ForwardLogits Qwen3_5DecodeGraph::Step(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const v1::GDNAttentionMetadata& gdn_meta,
@@ -2560,18 +2650,19 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
   const int64_t B = static_cast<int64_t>(token_ids.size());
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
-  std::vector<float> out(static_cast<size_t>(B) * static_cast<size_t>(vocab));
 
-  // Pick the padded batch size (smallest captured size >= B). Eager fallback when
-  // capture is disabled / non-CUDA / B exceeds the largest captured size.
+  // The step returns the [B, vocab] real-row logits ON DEVICE — NO full-logits
+  // D2H / Synchronize here (removed: the per-step drain). The captured/warm paths
+  // return a NON-owning view over the slot's persistent [S,vocab] logits (the
+  // first B rows are the real requests; the padded rows follow). Stream ordering
+  // guarantees the sampler's later reads see the replay's writes; the next
+  // same-size replay overwrites the buffer, so in-place sampler mutation is safe.
   const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
   if (!impl_->enabled || S < 0) {
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);
-    // ForwardBody returns [B,vocab]; download the real rows only.
-    b.Copy(d.q, out.data(), lg.ptr(), out.size() * sizeof(float));
-    b.Synchronize(d.q);
-    return out;
+    // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
+    return WrapDeviceLogits(d, std::move(lg), vocab);
   }
 
   // Pad this step's real B-request inputs up to S (inert padding rows), then
@@ -2597,12 +2688,6 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
     s.warm = false;
   }
 
-  auto download_real = [&](DBuf& logits) {
-    // logits is [S,vocab]; copy the first B rows to the caller.
-    b.Copy(d.q, out.data(), logits.ptr(), out.size() * sizeof(float));
-    b.Synchronize(d.q);
-  };
-
   // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
   // persistent hidden buffer, then relaunch the captured layer region.
   if (s.captured) {
@@ -2610,8 +2695,7 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;
-    download_real(*s.logits);
-    return out;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
   // Warm: the pool + residency were warmed for this size by the previous (eager)
@@ -2629,8 +2713,7 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
     b.ReplayGraph(impl_->queue, s.graph);
     s.replays = 1;
     ++impl_->replays;
-    download_real(*s.logits);
-    return out;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
   }
 
   // Cold size: run one EAGER step (pre-warms the DevicePool + resident weights /
@@ -2639,15 +2722,18 @@ std::vector<float> Qwen3_5DecodeGraph::Step(
   // nothing is wasted). (Re)allocate the persistent hidden buffer to this size.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
-  {
-    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
-                            s.gdn_meta, attn_kv, gdn_state, impl_->weights,
-                            impl_->config);
-    download_real(lg);
-  }
+  DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
+                          attn_kv, gdn_state, impl_->weights, impl_->config);
   s.warm = true;
   s.captured = false;
-  return out;
+  // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
+  ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
+  if (fl.rows != B) {
+    fl.rows = B;
+    fl.device_tensor =
+        MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+  }
+  return fl;
 }
 
 }  // namespace vllm

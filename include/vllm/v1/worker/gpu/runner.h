@@ -226,7 +226,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   // ExecuteModelState — hidden_states + input_batch handoff, here the full
   // logits + the dense-order step). num_reqs == 0 marks a 0-token flush step.
   struct ExecuteModelState {
-    std::vector<float> logits;  // [num_actual_tokens, vocab] f32, row-major
+    // The forward result. DEFAULT: a DEVICE-resident [num_reqs, vocab] logits
+    // buffer (ForwardLogits::device_*) fed straight to the sampler — NO per-step
+    // full-logits D2H. On the VT_LOGITS_GATHER=0 opt-out it carries host logits
+    // ([num_actual_tokens, vocab]) and sample_tokens re-gathers on host as before.
+    ForwardLogits logits;
     int num_actual_tokens = 0;
     int num_reqs = 0;
     StepInputs step;

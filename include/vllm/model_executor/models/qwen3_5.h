@@ -27,6 +27,9 @@
 #include <memory>
 #include <vector>
 
+// (ForwardLogits carries either a device-resident logits buffer or a host copy;
+//  see the struct below.)
+
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
@@ -66,6 +69,31 @@ struct GdnStateCache {
   vt::Tensor conv_state;  // [num_state_blocks, conv_dim, K-1] f32, in/out
 };
 
+// Forward result carrier (M-logits-on-device). The default hot path keeps the
+// lm_head output ON DEVICE and hands it straight to the sampler (whose argmax /
+// temperature / top-k/top-p kernels already run on-device — sampler.py never
+// copies the full [num_reqs, vocab] logits to host, only the sampled token ids).
+// This removes the per-step synchronous D2H of the full logits (~num_reqs*vocab*4
+// bytes) that drained the stream every prefill AND decode step.
+//
+//   * DEVICE path (default): `device_storage` owns the pool-backed device buffer
+//     (its deleter returns the block to the model's DevicePool, so there is NO
+//     per-step cudaMalloc/cudaFree); `device_tensor` is the [rows, vocab] f32 view
+//     over it. `rows == num_reqs` on the gather-before-lm_head path (prefill/mixed)
+//     or a pure-decode / decode-graph step. The buffer must outlive sampling —
+//     the runner holds this whole struct across execute_model -> sample_tokens.
+//   * HOST path (VT_LOGITS_GATHER=0 opt-out): `host` holds the row-major
+//     [rows, vocab] f32 logits (Downloaded in the forward), `device_storage` is
+//     null. The runner re-gathers the per-request rows on host, exactly as before.
+struct ForwardLogits {
+  std::vector<float> host;                // non-empty on the HOST path
+  std::shared_ptr<void> device_storage;   // owns the device buffer on the DEVICE path
+  vt::Tensor device_tensor;               // [rows, vocab] view, valid iff on_device()
+  int64_t rows = 0;
+  int64_t vocab = 0;
+  bool on_device() const { return static_cast<bool>(device_storage); }
+};
+
 class Qwen3_5Model {
  public:
   // Batched PAGED forward (M1.8 Task 3, the central refactor). Runs the whole
@@ -103,6 +131,21 @@ class Qwen3_5Model {
                                     const Qwen3_5MoeWeights& weights,
                                     const HfConfig& config, vt::Queue& queue,
                                     const std::vector<int32_t>& logits_indices = {});
+
+  // DEVICE-resident variant of Forward (the sampler-on-device hot path). Same
+  // contract/args as Forward, but returns the lm_head output as a pool-backed
+  // DEVICE buffer (ForwardLogits::device_*) WITHOUT the full-logits D2H — the
+  // caller feeds it straight into the sampler. `rows == num_reqs` on the
+  // gather-before-lm_head path (prefill/mixed) or pure-decode.
+  static ForwardLogits ForwardDevice(const std::vector<int32_t>& token_ids,
+                                     const std::vector<int32_t>& positions,
+                                     const v1::CommonAttentionMetadata& attn_meta,
+                                     const v1::GDNAttentionMetadata& gdn_meta,
+                                     const std::vector<PagedKvCache>& attn_kv,
+                                     const std::vector<GdnStateCache>& gdn_state,
+                                     const Qwen3_5MoeWeights& weights,
+                                     const HfConfig& config, vt::Queue& queue,
+                                     const std::vector<int32_t>& logits_indices = {});
 
   // Dense single-sequence reference forward (M0.9). Runs the whole model for a
   // single non-paged sequence and returns logits [T, vocab] f32 (T =
@@ -157,16 +200,19 @@ class Qwen3_5DecodeGraph {
   Qwen3_5DecodeGraph(const Qwen3_5DecodeGraph&) = delete;
   Qwen3_5DecodeGraph& operator=(const Qwen3_5DecodeGraph&) = delete;
 
-  // One PURE-DECODE step. Returns [T, vocab] f32 logits, bit-identical to
+  // One PURE-DECODE step. Returns the [B, vocab] f32 logits as a DEVICE-resident
+  // ForwardLogits (the captured graph's output stays on device — a view over the
+  // slot's persistent logits buffer; the eager fallback owns a pool block), fed
+  // straight to the sampler with NO full-logits D2H. Bit-identical to
   // Qwen3_5Model::Forward for the same inputs/caches. attn_kv / gdn_state are the
   // runner's persistent caches (stable addresses across steps). The caller must
   // only route pure-decode batches here (all query_len==1, no prefill).
-  std::vector<float> Step(const std::vector<int32_t>& token_ids,
-                          const std::vector<int32_t>& positions,
-                          const v1::CommonAttentionMetadata& attn_meta,
-                          const v1::GDNAttentionMetadata& gdn_meta,
-                          const std::vector<PagedKvCache>& attn_kv,
-                          const std::vector<GdnStateCache>& gdn_state);
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const v1::GDNAttentionMetadata& gdn_meta,
+                     const std::vector<PagedKvCache>& attn_kv,
+                     const std::vector<GdnStateCache>& gdn_state);
 
   // Diagnostics (A/B + tests): is a graph currently captured, and how many
   // replays have run since the last (re)capture.

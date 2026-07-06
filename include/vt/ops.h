@@ -121,6 +121,16 @@ struct PagedAttentionArgs {
   // positions j <= p. True for the decoder path; non-causal carried for
   // fidelity (matches AttentionArgs.causal).
   bool causal = true;
+  // OPTIONAL host-resident query_start_loc[num_reqs+1] (same values as the
+  // device `query_start_loc` tensor). When set, the CUDA prefill flash/WMMA
+  // launchers size the per-request query-tile grid from these host values and
+  // build the device tile array with a device meta-kernel, avoiding the
+  // per-layer D2H copy + cudaStreamSynchronize that drained the pipeline every
+  // full-attention prefill layer (~10-12 syncs/step; prefill only 43.7%
+  // GPU-busy). nullptr => the launcher falls back to the D2H+sync (op unit tests
+  // / callers without a host qsl). Mirrors GdnArgs::query_start_loc_host and the
+  // decode StepDevInputs device-resident metadata pattern.
+  const int32_t* query_start_loc_host = nullptr;
 };
 
 // MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).

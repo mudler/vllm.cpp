@@ -349,8 +349,11 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
            std::string(name) + ": conv_state must be [N,C,K-1]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
-  VT_CHECK(conv_state.dtype == DType::kF32,
-           std::string(name) + ": conv_state must be f32 (in/out, in place)");
+  VT_CHECK(conv_state.dtype == DType::kF32 ||
+               (conv_state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
+           std::string(name) +
+               ": conv_state must be f32, or bf16 on CUDA (in/out, in place; bf16 = "
+               "vLLM default mamba_cache_dtype, read/written in f32 registers)");
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
                conv_state.IsContiguous(),
            std::string(name) + ": contiguous required");
@@ -391,8 +394,11 @@ void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const
            std::string(name) + ": float q/k/v, f32/bf16 out");
   VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
            std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
-  VT_CHECK(state.dtype == DType::kF32,
-           std::string(name) + ": state must be f32 (in/out, in place)");
+  VT_CHECK(state.dtype == DType::kF32 ||
+               (state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
+           std::string(name) +
+               ": state must be f32, or bf16 on CUDA (in/out, in place; bf16 = vLLM "
+               "default mamba_ssm_cache_dtype, read/written in f32 registers)");
   VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
                g.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
            std::string(name) + ": contiguous required");

@@ -1135,6 +1135,97 @@ TEST_CASE("CUDA gdn decode matches CPU (real dims, batched multi-seq)") {
   RunGdnCudaCase({}, 5, 2, 2, 128, 128, kCudaCombos[0], 6320);    // GQA ratio 1, odd batch
 }
 
+// bf16 persistent state cache (vLLM default mamba_cache_dtype=auto→bf16) vs the
+// f32 cache, SAME f32 q/k/v/g/beta and SAME initial state (the f32 master packed
+// to bf16). The decode kernel reads bf16 → f32 registers → writes bf16 (mirrors
+// fla fused_recurrent). This quantifies the one-step read/compute/write-back
+// drift the bf16 cache introduces relative to the f32 cache. Real gate dims
+// (Dk=Dv=128, Hv=32, GQA 2). Nsim decode steps chained to expose accumulation.
+TEST_CASE("CUDA gdn decode: bf16 state cache drift vs f32 (real dims, chained steps)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const int64_t batch = 8, hk = 16, hv = 32, dk = 128, dv = 128;
+  const int64_t t = batch, n = batch;
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+  const int steps = 16;  // chain 16 decode steps to accumulate the bf16 round-trip
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+
+  // f32 initial state master (identical for both caches).
+  const auto stf = RandomF32(static_cast<size_t>(n * hv * dv * dk), 7005, -0.5f, 0.5f);
+  const auto st_bf = Pack(stf, DType::kBF16);
+
+  DeviceTensor dst_f32(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, stf.data());
+  DeviceTensor dst_bf(gpu, gq.q, DType::kBF16, {n, hv, dv, dk}, st_bf.data());
+  DeviceTensor dout_ref(gpu, gq.q, DType::kF32, {t, hv, dv});
+  DeviceTensor dout_bf(gpu, gq.q, DType::kF32, {t, hv, dv});
+
+  float max_out = 0.0f, max_st = 0.0f, sum2_out = 0.0f;
+  size_t cnt_out = 0;
+  for (int s = 0; s < steps; ++s) {
+    // Fresh per-step q/k/v/g/beta (a distinct token each step). The real decode
+    // feeds L2-NORMALIZED q,k (dql2/dkl2, unit norm over Dk) — normalize here so
+    // the recurrence is in the model's stable regime (unnormalized 128-dim k
+    // makes the rank-1 delta updates blow up, which is not the real workload).
+    auto qf = RandomF32(static_cast<size_t>(t * hk * dk), 7100u + s, -1.0f, 1.0f);
+    auto kf = RandomF32(static_cast<size_t>(t * hk * dk), 7200u + s, -1.0f, 1.0f);
+    auto l2norm_rows = [dk](std::vector<float>& x) {
+      for (size_t r = 0; r + static_cast<size_t>(dk) <= x.size(); r += static_cast<size_t>(dk)) {
+        float ss = 0.0f;
+        for (int64_t c = 0; c < dk; ++c) ss += x[r + c] * x[r + c];
+        const float inv = 1.0f / std::sqrt(ss + 1e-6f);
+        for (int64_t c = 0; c < dk; ++c) x[r + c] *= inv;
+      }
+    };
+    l2norm_rows(qf);
+    l2norm_rows(kf);
+    const auto vf = RandomF32(static_cast<size_t>(t * hv * dv), 7300u + s, -1.0f, 1.0f);
+    const auto gf = RandomF32(static_cast<size_t>(t * hv), 7400u + s, -1.0f, 0.0f);
+    const auto betaf = RandomF32(static_cast<size_t>(t * hv), 7500u + s, 0.05f, 0.95f);
+    DeviceTensor dq(gpu, gq.q, DType::kF32, {t, hk, dk}, qf.data());
+    DeviceTensor dk_(gpu, gq.q, DType::kF32, {t, hk, dk}, kf.data());
+    DeviceTensor dv_(gpu, gq.q, DType::kF32, {t, hv, dv}, vf.data());
+    DeviceTensor dg(gpu, gq.q, DType::kF32, {t, hv}, gf.data());
+    DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, hv}, betaf.data());
+
+    vt::GdnDecode(gq.q, dout_ref.tensor(), dq.tensor(), dk_.tensor(), dv_.tensor(), dg.tensor(),
+                  dbeta.tensor(), dst_f32.tensor(), args);
+    vt::GdnDecode(gq.q, dout_bf.tensor(), dq.tensor(), dk_.tensor(), dv_.tensor(), dg.tensor(),
+                  dbeta.tensor(), dst_bf.tensor(), args);
+
+    std::vector<float> o_ref(static_cast<size_t>(t * hv * dv));
+    std::vector<float> o_bf(static_cast<size_t>(t * hv * dv));
+    dout_ref.Download(gq.q, o_ref.data());
+    dout_bf.Download(gq.q, o_bf.data());
+    for (size_t i = 0; i < o_ref.size(); ++i) {
+      const float diff = std::fabs(o_bf[i] - o_ref[i]);
+      max_out = std::max(max_out, diff);
+      sum2_out += diff * diff;
+      ++cnt_out;
+    }
+  }
+  // Final-state drift after the 16 chained steps (worst-case accumulation).
+  std::vector<uint8_t> st_bf_out(st_bf.size());
+  std::vector<float> st_ref_out(stf.size());
+  dst_bf.Download(gq.q, st_bf_out.data());
+  dst_f32.Download(gq.q, st_ref_out.data());
+  const auto st_bf_f = Unpack(st_bf_out, DType::kBF16);
+  for (size_t i = 0; i < st_ref_out.size(); ++i)
+    max_st = std::max(max_st, std::fabs(st_bf_f[i] - st_ref_out[i]));
+
+  const float rms_out = std::sqrt(sum2_out / static_cast<float>(cnt_out));
+  MESSAGE("bf16-state decode drift over " << steps << " chained steps: out max|Δ|=" << max_out
+          << " rms=" << rms_out << " ; final-state max|Δ|=" << max_st);
+  // bf16 carries ~8 mantissa bits (~4e-3 relative). One rank-1 update per step
+  // keeps the state O(1); after 16 steps the drift stays well within a loose
+  // bf16-scale bound. This is the faithful mirror of vLLM's bf16 cache.
+  CHECK(max_out < 5e-2f);
+  CHECK(max_st < 5e-2f);
+}
+
 // The M2 chunk-parallel prefill scan vs the sequential scan (same binary),
 // real head dims Dk=Dv=128 (the gate model), GQA ratio 2, multiple heads.
 // 150 tokens = 2 full chunks (64) + a partial tail (22) exercises the chunk

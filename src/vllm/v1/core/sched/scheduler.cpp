@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
@@ -317,6 +319,35 @@ SchedulerOutput Scheduler::schedule() {
   // current step) — copied out here, then flushed in _update_after_schedule.
   scheduler_output.finished_req_ids = finished_req_ids;
   // free_encoder_mm_hashes stays empty (encoder deferred).
+
+  // Optional per-step composition trace (env VT_SCHED_LOG=1). Zero cost when
+  // unset: the getenv is read once into a function-local static. Mirrors the
+  // fields SchedulerOutput exposes so the step fill can be inspected at
+  // concurrency. A request scheduled >1 token this step is prefill (chunked
+  // prefill / first admission); exactly 1 token is a decode (T0 has no spec).
+  static const bool kSchedLog = [] {
+    const char* v = std::getenv("VT_SCHED_LOG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  if (kSchedLog) {
+    int prefill_seqs = 0;
+    int decode_seqs = 0;
+    for (const auto& [id, n] : num_scheduled_tokens) {
+      (void)id;
+      if (n > 1) {
+        ++prefill_seqs;
+      } else {
+        ++decode_seqs;
+      }
+    }
+    std::fprintf(stderr,
+                 "SCHED step=%d tokens=%d budget=%d prefill_seqs=%d "
+                 "decode_seqs=%d running=%d waiting=%d\n",
+                 current_step_, total_num_scheduled_tokens,
+                 max_num_scheduled_tokens, prefill_seqs, decode_seqs,
+                 static_cast<int>(running.size()),
+                 static_cast<int>(waiting->size()));
+  }
 
   update_after_schedule(scheduler_output);
   return scheduler_output;

@@ -1313,33 +1313,109 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
   Check(cudaGetLastError(), "paged_attention decode launch");
 }
 
+// Per-request query-tile layout, built DIRECTLY on the device from the device
+// query_start_loc — the exact loop the host used to run after a D2H copy+sync.
+// Each request r contributes ceil(qlen_r / tile_m) tiles {r, ts}; ts steps by
+// tile_m over [0, qlen_r). Single-thread (num_reqs is small, ~batch size); writes
+// exactly num_tiles entries (num_tiles precomputed on the host from the SAME qsl
+// values via the host-resident query_start_loc, so the grid + d_tiles allocation
+// match bit-for-bit). Lets the prefill launchers stay device-resident: no D2H, no
+// cudaStreamSynchronize (the per-layer prefill host-tax; see
+// PagedAttentionArgs::query_start_loc_host). Mirrors GdnBuildChunkMeta.
+__global__ void PagedFlashBuildTiles(int2* tiles, const int32_t* qsl, int num_reqs, int tile_m) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  int nt = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    const int32_t qlen = qsl[r + 1] - qsl[r];
+    for (int32_t ts = 0; ts < qlen; ts += tile_m) {
+      tiles[nt].x = r;
+      tiles[nt].y = ts;
+      ++nt;
+    }
+  }
+}
+
+// Prefill no-sync (device-resident tile metadata) is opt-out via
+// VT_ATTN_PREFILL_NOSYNC=0 — the A/B "before" that restores the per-layer D2H
+// copy + cudaStreamSynchronize. Evaluated once. Only takes effect when the caller
+// supplies a host-resident query_start_loc (args.query_start_loc_host); the op
+// unit tests pass nullptr and always use the D2H+sync host build.
+bool PrefillNoSyncEnabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_ATTN_PREFILL_NOSYNC");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return enabled;
+}
+
+// Build the per-request query-tile array for a prefill launch. Returns num_tiles
+// and fills *out_tiles with a stream-ordered device allocation of num_tiles int2
+// entries; the caller frees it with cudaFreeAsync(*out_tiles, s) after the
+// consuming kernel. Two paths:
+//   - NOSYNC (args.query_start_loc_host != nullptr && VT_ATTN_PREFILL_NOSYNC!=0):
+//     num_tiles is summed on the host from the host qsl (sizes the grid + alloc,
+//     no D2H); PagedFlashBuildTiles fills the device array from the device qsl on
+//     the SAME stream. No D2H, no cudaStreamSynchronize — mirrors the GDN
+//     GdnBuildChunkMeta / decode StepDevInputs device-resident metadata fix.
+//   - legacy (host qsl absent, or opt-out): D2H copy of query_start_loc +
+//     cudaStreamSynchronize, host tile build, H2D of the host tile vector.
+// Returns 0 when there are no tiles (caller returns early — nothing to launch).
+int BuildPrefillTiles(cudaStream_t s, const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                      int64_t num_reqs, int tile_m, int2** out_tiles) {
+  *out_tiles = nullptr;
+  if (args.query_start_loc_host != nullptr && PrefillNoSyncEnabled()) {
+    // Device-resident: size the grid from the host qsl (no D2H), build the device
+    // tile array from the device qsl with a meta-kernel (no sync).
+    const int32_t* qslh = args.query_start_loc_host;
+    int num_tiles = 0;
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      const int32_t qlen = qslh[r + 1] - qslh[r];
+      num_tiles += (qlen + tile_m - 1) / tile_m;
+    }
+    if (num_tiles == 0) return 0;
+    Check(cudaMallocAsync(out_tiles, static_cast<size_t>(num_tiles) * sizeof(int2), s),
+          "paged prefill tiles alloc");
+    PagedFlashBuildTiles<<<1, 1, 0, s>>>(*out_tiles, query_start_loc.Ptr<int32_t>(),
+                                         static_cast<int>(num_reqs), tile_m);
+    Check(cudaGetLastError(), "paged prefill build-tiles launch");
+    return num_tiles;
+  }
+  // Legacy: D2H copy of query_start_loc + cudaStreamSynchronize, then host build.
+  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
+  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, s),
+        "paged prefill qsl D2H");
+  Check(cudaStreamSynchronize(s), "paged prefill qsl sync");
+  std::vector<int2> tiles;
+  tiles.reserve(static_cast<size_t>(num_reqs));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
+    for (int32_t ts = 0; ts < qlen; ts += tile_m) tiles.push_back(int2{static_cast<int>(r), ts});
+  }
+  const int num_tiles = static_cast<int>(tiles.size());
+  if (num_tiles == 0) return 0;
+  Check(cudaMallocAsync(out_tiles, tiles.size() * sizeof(int2), s), "paged prefill tiles alloc");
+  // Pageable H2D: the copy consumes the host `tiles` buffer synchronously (staged
+  // into a pinned buffer before return), so the stack-local vector may die on
+  // return without a sync — matching the pre-existing launcher behavior.
+  Check(cudaMemcpyAsync(*out_tiles, tiles.data(), tiles.size() * sizeof(int2),
+                        cudaMemcpyHostToDevice, s),
+        "paged prefill tiles H2D");
+  return num_tiles;
+}
+
 template <typename TQ, typename TKV, typename Tout>
 void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                         const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                         const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
                         int64_t d, int64_t num_reqs, int64_t num_kv_heads, int64_t block_size) {
-  // Read query_start_loc D2H (prefill is not graph-captured) to build per-request
-  // query tiles: each request's [0, qlen) rows split into ceil(qlen/BM) tiles.
-  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
-  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, s),
-        "paged flash qsl D2H");
-  Check(cudaStreamSynchronize(s), "paged flash qsl sync");
-
-  std::vector<int2> tiles;
-  tiles.reserve(static_cast<size_t>(num_reqs));
-  for (int64_t r = 0; r < num_reqs; ++r) {
-    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
-    for (int32_t ts = 0; ts < qlen; ts += kBM) tiles.push_back(int2{static_cast<int>(r), ts});
-  }
-  const int num_tiles = static_cast<int>(tiles.size());
-  if (num_tiles == 0) return;
-
+  // Per-request query tiles: each request's [0, qlen) rows split into
+  // ceil(qlen/BM) tiles. Device-resident when a host qsl is supplied (no per-layer
+  // D2H+sync; see BuildPrefillTiles), else D2H+sync host build.
   int2* d_tiles = nullptr;
-  Check(cudaMallocAsync(&d_tiles, tiles.size() * sizeof(int2), s), "paged flash tiles alloc");
-  Check(cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice,
-                        s),
-        "paged flash tiles H2D");
+  const int num_tiles =
+      BuildPrefillTiles(s, query_start_loc, args, num_reqs, kBM, &d_tiles);
+  if (num_tiles == 0) return;
 
   const int bn = kBN;
   const size_t shmem = static_cast<size_t>(2) * bn * d * sizeof(float);
@@ -1368,27 +1444,12 @@ void LaunchPrefillWmma(cudaStream_t s, Tensor& out, const Tensor& query, const T
                        const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                        const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
                        int64_t d, int64_t num_reqs, int64_t num_kv_heads, int64_t block_size) {
-  // Same host-side tile build as LaunchPrefillFlash (prefill is not graph-captured).
-  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
-  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, s),
-        "paged wmma qsl D2H");
-  Check(cudaStreamSynchronize(s), "paged wmma qsl sync");
-
-  std::vector<int2> tiles;
-  tiles.reserve(static_cast<size_t>(num_reqs));
-  for (int64_t r = 0; r < num_reqs; ++r) {
-    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
-    for (int32_t ts = 0; ts < qlen; ts += kWmmaM) tiles.push_back(int2{static_cast<int>(r), ts});
-  }
-  const int num_tiles = static_cast<int>(tiles.size());
-  if (num_tiles == 0) return;
-
+  // Same per-request tile build as LaunchPrefillFlash: device-resident when a host
+  // qsl is supplied (no per-layer D2H+sync), else D2H+sync host build.
   int2* d_tiles = nullptr;
-  Check(cudaMallocAsync(&d_tiles, tiles.size() * sizeof(int2), s), "paged wmma tiles alloc");
-  Check(cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice,
-                        s),
-        "paged wmma tiles H2D");
+  const int num_tiles =
+      BuildPrefillTiles(s, query_start_loc, args, num_reqs, kWmmaM, &d_tiles);
+  if (num_tiles == 0) return;
 
   const size_t bf16_bytes =
       (static_cast<size_t>(kWmmaM) * d + 2ull * kWmmaBN * d + static_cast<size_t>(kWmmaM) * kWmmaBN) *
@@ -1424,26 +1485,12 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
                           const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                           const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
                           int64_t d, int64_t num_reqs, int64_t num_kv_heads, int64_t block_size) {
-  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
-  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, s),
-        "paged wmma-gqa qsl D2H");
-  Check(cudaStreamSynchronize(s), "paged wmma-gqa qsl sync");
-
-  std::vector<int2> tiles;
-  tiles.reserve(static_cast<size_t>(num_reqs));
-  for (int64_t r = 0; r < num_reqs; ++r) {
-    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
-    for (int32_t ts = 0; ts < qlen; ts += kWmmaM) tiles.push_back(int2{static_cast<int>(r), ts});
-  }
-  const int num_tiles = static_cast<int>(tiles.size());
-  if (num_tiles == 0) return;
-
+  // Device-resident tile build when a host qsl is supplied (no per-layer
+  // D2H+sync); else D2H+sync host build. Same layout as LaunchPrefillWmma.
   int2* d_tiles = nullptr;
-  Check(cudaMallocAsync(&d_tiles, tiles.size() * sizeof(int2), s), "paged wmma-gqa tiles alloc");
-  Check(cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice,
-                        s),
-        "paged wmma-gqa tiles H2D");
+  const int num_tiles =
+      BuildPrefillTiles(s, query_start_loc, args, num_reqs, kWmmaM, &d_tiles);
+  if (num_tiles == 0) return;
 
   const size_t bf16_bytes =
       (static_cast<size_t>(QG) * kWmmaM * d + 2ull * kGqaBN * d + static_cast<size_t>(kWmmaM) * kGqaBN) *
@@ -1481,26 +1528,12 @@ void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query
                                 const Tensor& query_start_loc, const PagedAttentionArgs& args,
                                 int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
                                 int64_t block_size) {
-  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
-  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, s),
-        "paged wmma-flash2 qsl D2H");
-  Check(cudaStreamSynchronize(s), "paged wmma-flash2 qsl sync");
-
-  std::vector<int2> tiles;
-  tiles.reserve(static_cast<size_t>(num_reqs));
-  for (int64_t r = 0; r < num_reqs; ++r) {
-    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
-    for (int32_t ts = 0; ts < qlen; ts += kWmmaM) tiles.push_back(int2{static_cast<int>(r), ts});
-  }
-  const int num_tiles = static_cast<int>(tiles.size());
-  if (num_tiles == 0) return;
-
+  // Device-resident tile build when a host qsl is supplied (no per-layer
+  // D2H+sync); else D2H+sync host build. Same layout as LaunchPrefillWmmaGqa.
   int2* d_tiles = nullptr;
-  Check(cudaMallocAsync(&d_tiles, tiles.size() * sizeof(int2), s), "paged wmma-flash2 tiles alloc");
-  Check(cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice,
-                        s),
-        "paged wmma-flash2 tiles H2D");
+  const int num_tiles =
+      BuildPrefillTiles(s, query_start_loc, args, num_reqs, kWmmaM, &d_tiles);
+  if (num_tiles == 0) return;
 
   const size_t bf16_bytes =
       (static_cast<size_t>(QG) * kWmmaM * d + static_cast<size_t>(kF2BN) * d +

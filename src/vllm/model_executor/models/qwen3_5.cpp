@@ -1437,8 +1437,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
 
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
-  vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl,
-                     dqsl, vt::PagedAttentionArgs{scale, meta.causal});
+  // Hand the prefill flash/WMMA launchers the HOST query_start_loc (already
+  // materialized per step by the attention metadata build) so they size the
+  // query-tile grid from these host values + a device meta-kernel, skipping the
+  // per-layer D2H copy + cudaStreamSynchronize that drained the pipeline every
+  // full-attention prefill layer (~10-12 syncs/step; prefill only 43.7%
+  // GPU-busy). meta.query_start_loc outlives this call. Device-resident metadata,
+  // mirroring the GDN GdnArgs::query_start_loc_host / decode StepDevInputs fix.
+  vt::PagedAttentionArgs pa_args{scale, meta.causal};
+  pa_args.query_start_loc_host = meta.query_start_loc.data();
+  vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
   // Sigmoid output gate then o-project (§5) — device op.
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});

@@ -19,8 +19,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "cutlass/cutlass.h"
 
@@ -46,6 +49,50 @@ void Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// Persistent per-stream GEMM scratch (alpha scalar + grown-on-demand cutlass
+// workspace + bf16 output staging). Replaces the per-call cudaMallocAsync /
+// cudaFreeAsync churn (up to 3 async allocs + frees PER GEMM). Reuse is safe
+// under the forward's single-stream ordering: a buffer handed to one GEMM is
+// fully consumed before the next GEMM on the SAME stream is issued. Buffers grow
+// monotonically and leak at process exit. VT_CUTLASS_NOPOOL=1 restores per-call.
+struct StreamScratch {
+  float* alpha = nullptr;
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
+  void* bf16 = nullptr;
+  size_t bf16_bytes = 0;
+};
+
+bool CutlassPoolEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_CUTLASS_NOPOOL");
+    return !(e != nullptr && e[0] == '1');
+  }();
+  return on;
+}
+
+StreamScratch& ScratchFor(cudaStream_t s) {
+  static std::mutex mu;
+  static std::unordered_map<cudaStream_t, StreamScratch> m;
+  std::lock_guard<std::mutex> lk(mu);
+  return m[s];
+}
+
+void* EnsureScratch(void** buf, size_t* have, size_t need, cudaStream_t s, const char* what) {
+  if (need > *have) {
+    if (*buf != nullptr) Check(cudaFreeAsync(*buf, s), "cudaFreeAsync scratch grow");
+    Check(cudaMallocAsync(buf, need, s), what);
+    *have = need;
+  }
+  return *buf;
+}
+
+float* PersistentAlpha(cudaStream_t s) {
+  StreamScratch& sc = ScratchFor(s);
+  if (sc.alpha == nullptr) Check(cudaMallocAsync(&sc.alpha, sizeof(float), s), "cudaMallocAsync alpha");
+  return sc.alpha;
+}
 
 #define VT_CUTLASS_CHECK(status)                                                    \
   do {                                                                              \
@@ -177,13 +224,20 @@ void RunGemm(void* D, const void* A, const void* B, const void* A_sf, const void
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   void* workspace = nullptr;
+  const bool pool = CutlassPoolEnabled();
   if (workspace_size > 0) {
-    Check(cudaMallocAsync(&workspace, workspace_size, stream), "cudaMallocAsync workspace");
+    if (pool) {
+      StreamScratch& sc = ScratchFor(stream);
+      workspace = EnsureScratch(&sc.workspace, &sc.workspace_bytes, workspace_size, stream,
+                                "cudaMallocAsync workspace");
+    } else {
+      Check(cudaMallocAsync(&workspace, workspace_size, stream), "cudaMallocAsync workspace");
+    }
   }
   VT_CUTLASS_CHECK(gemm.can_implement(arguments));
   VT_CUTLASS_CHECK(gemm.initialize(arguments, workspace, stream));
   VT_CUTLASS_CHECK(gemm.run(arguments, workspace, stream));
-  if (workspace) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
+  if (workspace && !pool) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
 }
 
 // Dispatch by M (vLLM cutlass_fp4_gemm_dispatch, :202-231). OutType = bf16.
@@ -270,16 +324,26 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
 
   // alpha lives on device (cutlass epilogue reads alpha_ptr). Pool-backed async
   // alloc + a 1-thread write kernel; no host<->device sync on the hot path.
+  const bool pool = CutlassPoolEnabled();
   float* d_alpha = nullptr;
-  Check(cudaMallocAsync(&d_alpha, sizeof(float), s), "cudaMallocAsync alpha");
+  if (pool) {
+    d_alpha = PersistentAlpha(s);
+  } else {
+    Check(cudaMallocAsync(&d_alpha, sizeof(float), s), "cudaMallocAsync alpha");
+  }
   SetScalar<<<1, 1, 0, s>>>(d_alpha, alpha);
 
   const bool out_f32 = (out.dtype == DType::kF32);
   void* d_out = out.data;
   void* bf16_scratch = nullptr;
   if (out_f32) {
-    Check(cudaMallocAsync(&bf16_scratch, static_cast<size_t>(m) * n * sizeof(__nv_bfloat16), s),
-          "cudaMallocAsync bf16 scratch");
+    const size_t need = static_cast<size_t>(m) * n * sizeof(__nv_bfloat16);
+    if (pool) {
+      StreamScratch& sc = ScratchFor(s);
+      bf16_scratch = EnsureScratch(&sc.bf16, &sc.bf16_bytes, need, s, "cudaMallocAsync bf16 scratch");
+    } else {
+      Check(cudaMallocAsync(&bf16_scratch, need, s), "cudaMallocAsync bf16 scratch");
+    }
     d_out = bf16_scratch;
   }
 
@@ -291,10 +355,10 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
     const int blocks = static_cast<int>((total + 255) / 256);
     CastBf16ToF32Kernel<<<blocks, 256, 0, s>>>(
         static_cast<float*>(out.data), static_cast<const __nv_bfloat16*>(bf16_scratch), total);
-    Check(cudaFreeAsync(bf16_scratch, s), "cudaFreeAsync bf16 scratch");
+    if (!pool) Check(cudaFreeAsync(bf16_scratch, s), "cudaFreeAsync bf16 scratch");
   }
 
-  Check(cudaFreeAsync(d_alpha, s), "cudaFreeAsync alpha");
+  if (!pool) Check(cudaFreeAsync(d_alpha, s), "cudaFreeAsync alpha");
   Check(cudaGetLastError(), "matmul_nvfp4_cutlass launch");
 }
 

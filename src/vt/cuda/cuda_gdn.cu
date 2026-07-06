@@ -285,6 +285,88 @@ void L2NormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& 
 }
 
 // ---------------------------------------------------------------------------
+// gdn_post_conv: fused split + q/k l2norm + g/beta gating (mirror of fla
+// fused_gdn_prefill_post_conv _fused_post_conv_kernel, grid (L, H+HV)). One
+// launch replaces GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta. Bit-for-bit
+// equal: the q/k blocks (i_head < Hk) reuse the EXACT L2NormRowKernel shared-mem
+// tree reduction; the trailing (i_head == Hk) block does the v copy + the §6
+// g/beta gating (softplus threshold 20), identical to GdnConvSplit/GdnGBeta.
+__global__ void GdnPostConvKernel(float* q_out, float* k_out, float* v_out, float* g_out,
+                                  float* beta_out, const float* conv, const float* araw,
+                                  const float* braw, const float* a_log, const float* dt_bias,
+                                  int64_t hk, int64_t dk, int64_t hv, int64_t dv, float eps) {
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t tok = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t row = tok * conv_dim;
+  if (head < hk) {
+    __shared__ float partial[kBlock];
+    const float* qin = conv + row + head * dk;
+    const float* kin = conv + row + key_dim + head * dk;
+    float* qo = q_out + (tok * hk + head) * dk;
+    float* ko = k_out + (tok * hk + head) * dk;
+    // ---- q l2norm (plain SUM of squares over Dk, §4) ----
+    float acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
+      const float v = qin[j];
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float qinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) qo[j] = qin[j] * qinv;
+    __syncthreads();
+    // ---- k l2norm ----
+    acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
+      const float v = kin[j];
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float kinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) ko[j] = kin[j] * kinv;
+  } else {
+    // v copy + §6 g/beta for this token.
+    const float* vin = conv + row + 2 * key_dim;
+    float* vo = v_out + tok * value_dim;
+    for (int64_t j = threadIdx.x; j < value_dim; j += kBlock) vo[j] = vin[j];
+    for (int64_t h = threadIdx.x; h < hv; h += kBlock) {
+      const int64_t idx = tok * hv + h;
+      const float x = araw[idx] + dt_bias[h];
+      const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
+      g_out[idx] = -expf(a_log[h]) * sp;
+      beta_out[idx] = 1.0f / (1.0f + expf(-braw[idx]));
+    }
+  }
+}
+
+void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
+                           Tensor& beta_out, const Tensor& conv, const Tensor& araw,
+                           const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias,
+                           const L2NormArgs& args) {
+  const int64_t t = conv.shape[0];
+  const int64_t hk = q_out.shape[1], dk = q_out.shape[2];
+  const int64_t hv = v_out.shape[1], dv = v_out.shape[2];
+  if (t == 0) return;
+  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hk + 1));
+  GdnPostConvKernel<<<grid, kBlock, 0, AsStream(q)>>>(
+      q_out.Ptr<float>(), k_out.Ptr<float>(), v_out.Ptr<float>(), g_out.Ptr<float>(),
+      beta_out.Ptr<float>(), conv.Ptr<float>(), araw.Ptr<float>(), braw.Ptr<float>(),
+      a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, args.eps);
+  Check(cudaGetLastError(), "gdn_post_conv launch");
+}
+
+// ---------------------------------------------------------------------------
 // rmsnorm_gated (gdn-semantics.md §5): one block per row, same reduction; var
 // is a MEAN (unlike §4), norm first, then act(gate) (norm_before_gate=True,
 // group_size=None — the only configuration Qwen GDN uses, baked in).
@@ -1382,6 +1464,29 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
 
   if (wmma) {
     // WMMA tensor-core path (TF32 for f32 in, native bf16 for bf16 in).
+    // Occupancy: DeltaH and O are pinned to 1 resident block per SM by their
+    // ~96 KiB dynamic shared (GB10: 100 KiB/SM). At the legacy 256-thread
+    // (8-warp) block that single block realizes only 8/48 = 16.7% of the SM's
+    // peak warp slots, while their registers (DeltaH 80, O 74 per thread) would
+    // admit far more resident warps within that one block. Both kernels' tensor-
+    // core tile loops are already warp-strided (t = warp; t < ntiles; t += nwarps)
+    // and every elementwise/staging loop strides by blockDim.x, so the block
+    // simply scales with width — more warps in the one resident block hide the
+    // WMMA + global-load latency the 8-warp block could not (mirrors the
+    // GdnDecodeFused 1-warp -> multi-warp occupancy win). Measured GB10 optima
+    // (35B f32 dims, T=2048): DeltaH is bottlenecked by its 64-tile V2 rank
+    // update and keeps scaling to 768 threads (24 warps, 50% occ, -32% per call:
+    // 2.70 -> 1.84 ms); its 80 regs/thread cap the block at 65 536/80 = 819, so
+    // 768 is the top warp-multiple that still fits 1 block/SM. O saturates at 512
+    // threads (16 warps, 33% occ, -25%: 1.65 -> 1.23 ms) — its smaller 16/32-tile
+    // phases leave the extra 768-block warps idle, a hair slower. Both stay
+    // 1 block/SM (shared-bound). A/B: VT_GDN_OCC_BLOCK forces BOTH to a fixed
+    // thread count (=256 recovers the pre-occupancy 8-warp path).
+    unsigned occ_delta = 768u, occ_o = 512u;
+    if (const char* e = std::getenv("VT_GDN_OCC_BLOCK")) {
+      const int v = std::atoi(e);
+      if (v >= 32 && v <= 1024) occ_delta = occ_o = (static_cast<unsigned>(v) / 32u) * 32u;
+    }
     // Zero v_new so the over-allocated tail rows the matmuls may sweep
     // (their A operand is 0 there, but 0*NaN=NaN on the tensor core) are finite.
     Check(cudaMemsetAsync(v_new, 0, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
@@ -1392,7 +1497,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
     opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
            "gdn chunked delta_h(wmma) shared opt-in");
-    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, 256, delta_bytes, s>>>(
+    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
         state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
         hk_n, dk, hv_n, dv);
     Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
@@ -1405,7 +1510,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
                                 static_cast<size_t>(kChunk * kChunk) * sz;
     opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
            "gdn chunked o(wmma) shared opt-in");
-    GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, 256, chunko_bytes, s>>>(
+    GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
         out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
         hk_n, dk, hv_n, dv, args.scale);
     Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
@@ -1567,6 +1672,8 @@ struct Registrar {
         reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&ConvUpdateKernelCuda)));
     RegisterOp(OpId::kL2Norm, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<L2NormFn>(&L2NormKernelCuda)));
+    RegisterOp(OpId::kGdnPostConv, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernelCuda)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernelCuda)));
     RegisterOp(OpId::kGdnPrefill, DeviceType::kCUDA,

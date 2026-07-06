@@ -11,7 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -84,28 +87,75 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // the driver (leak at process exit, like the cublasLt workspace); the pool is
 // bounded by the forward's peak concurrent scratch. The pool is backend-agnostic
 // (CPU malloc/free too — a harmless bounded cache there).
+//
+// SIZE-CLASS BUCKETING (prefill sync-cudaMalloc kill). Keying the pool on the
+// EXACT byte size defeats reuse during prefill: under continuous batching each
+// engine step processes a different token count T (prefill-chunk tokens + decode
+// tokens), so every [T,*] scratch is a byte size that step-1 never saw — an
+// exact-key MISS -> a SYNCHRONOUS cudaMalloc (device-serializing, does NOT
+// overlap compute) on the forward's host thread, thousands per prefill. Rounding
+// the request UP to a size class (keep the top `kClassBits` significant bits;
+// <=1/2^kClassBits ~ 6.25% over-allocation) makes nearby-T scratch of the same
+// op share ONE block, so after warm-up almost every prefill DBuf is a pool hit.
+// The returned block is >= the requested bytes (the Tensor view uses only the
+// logical prefix), and Put/Get round identically so a block always returns to
+// its own class bucket. VT_POOL_EXACT=1 restores exact keying (A/B measurement).
 class DevicePool {
  public:
   void* Get(Backend& b, size_t bytes) {
+    const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = free_.find(bytes);
+      auto it = free_.find(key);
       if (it != free_.end() && !it->second.empty()) {
         void* p = it->second.back();
         it->second.pop_back();
+        ++hits_;
         return p;
       }
+      ++misses_;
     }
-    return b.Alloc(bytes);
+    return b.Alloc(key);
   }
   void Put(size_t bytes, void* p) {
+    const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
-    free_[bytes].push_back(p);
+    free_[key].push_back(p);
+  }
+
+  ~DevicePool() {
+    if (std::getenv("VT_POOL_STATS") != nullptr) {
+      const uint64_t h = hits_.load(), m = misses_.load();
+      const double rate = (h + m) ? 100.0 * static_cast<double>(h) / static_cast<double>(h + m) : 0.0;
+      std::fprintf(stderr,
+                   "[DevicePool] hits=%llu misses(cudaMalloc)=%llu hit-rate=%.2f%% distinct-classes=%zu\n",
+                   static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
+                   rate, free_.size());
+    }
   }
 
  private:
+  // Round `bytes` up so it keeps at most kClassBits leading significant bits.
+  // Exact keying when VT_POOL_EXACT=1 (A/B). Small sizes (< 2^kClassBits) key
+  // exactly — there are few of them and the waste would be proportionally large.
+  static size_t ClassOf(size_t bytes) {
+    static const bool exact = [] {
+      const char* e = std::getenv("VT_POOL_EXACT");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (exact || bytes == 0) return bytes == 0 ? 1 : bytes;
+    constexpr int kClassBits = 4;  // <=6.25% over-allocation per class
+    const int msb = 63 - __builtin_clzll(static_cast<unsigned long long>(bytes));
+    if (msb < kClassBits) return bytes;
+    const int shift = msb - kClassBits;
+    const size_t mask = (static_cast<size_t>(1) << shift) - 1;
+    return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
+  }
+
   std::mutex mu_;
   std::unordered_map<size_t, std::vector<void*>> free_;
+  std::atomic<uint64_t> hits_{0};
+  std::atomic<uint64_t> misses_{0};
 };
 
 DevicePool& Pool() {
@@ -819,6 +869,20 @@ void ScatterRows(Dev d, const Tensor& dst, const void* src,
     d.b.Copy(d.q, dp + static_cast<size_t>(idx[s]) * rb, sp + s * rb, rb);
 }
 
+// Prefill launch-gap fusion (perf/glue-fuse): fold the GDN post-conv glue chain
+// GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta (4 launches) into ONE
+// vt::GdnPostConv launch, and the gated-RMSNorm + CastBf16 pair (2 launches)
+// into a single RmsNormGated writing bf16 directly (layernorm_guard.py:57
+// `out.to(dtype)`). Bit-for-bit vs the unfused chain. VT_GLUE_FUSE=0 restores
+// the per-op path for A/B measurement (default ON).
+bool GlueFuseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GLUE_FUSE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -857,28 +921,32 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dstate.t(),
                       dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
 
-  // Split conv output into q[T,Hk,Dk] | k[T,Hk,Dk] | v[T,Hv,Dv] (device op).
-  DBuf qf(d, DType::kF32, {T, Hk, Dk});
-  DBuf kf(d, DType::kF32, {T, Hk, Dk});
-  DBuf vf(d, DType::kF32, {T, Hv, Dv});
-  Tensor q2 = Reshape(qf.t(), {T, key_dim});
-  Tensor k2 = Reshape(kf.t(), {T, key_dim});
-  Tensor v2 = Reshape(vf.t(), {T, value_dim});
-  vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-
-  // g/beta from a/b + A_log/dt_bias (gdn-semantics.md §6) — device op.
+  // Post-conv prep (gdn-semantics.md §1 layout, §4 l2norm, §6 g/beta): split the
+  // conv output into q|k|v, l2-normalize q/k over Dk, derive g/beta. Fused into a
+  // single vt::GdnPostConv launch (perf/glue-fuse; mirror fla
+  // fused_gdn_prefill_post_conv), or the four per-op launches when disabled.
   Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
   Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
+  DBuf vf(d, DType::kF32, {T, Hv, Dv});
   DBuf g(d, DType::kF32, {T, Hv});
   DBuf beta(d, DType::kF32, {T, Hv});
-  vt::GdnGBeta(d.q, g.t(), beta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
-
-  // L2-normalize q,k over Dk (gdn-semantics.md §4), then the gated-delta-rule
-  // recurrence (§7). scale = Dk^-0.5, applied to q only inside the op.
   DBuf dql2(d, DType::kF32, {T, Hk, Dk});
   DBuf dkl2(d, DType::kF32, {T, Hk, Dk});
-  vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
-  vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
+  if (GlueFuseEnabled()) {
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw.t(),
+                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+  } else {
+    DBuf qf(d, DType::kF32, {T, Hk, Dk});
+    DBuf kf(d, DType::kF32, {T, Hk, Dk});
+    Tensor q2 = Reshape(qf.t(), {T, key_dim});
+    Tensor k2 = Reshape(kf.t(), {T, key_dim});
+    Tensor v2 = Reshape(vf.t(), {T, value_dim});
+    vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
+    vt::GdnGBeta(d.q, g.t(), beta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
+    vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
+  }
+  // scale = Dk^-0.5, applied to q only inside the gated-delta-rule recurrence.
   DBuf dssm(d, DType::kF32, {1, Hv, Dv, Dk});
   dssm.Zero(d);
   DBuf dcore(d, DType::kF32, {T, Hv, Dv});
@@ -889,12 +957,20 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // Gated RMSNorm over Dv with the z gate (gdn-semantics.md §5), viewing the
   // core output and z as [T*Hv, Dv]; cast to bf16, flatten heads, out-project.
   Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
-  DBuf dgated(d, DType::kF32, {T * Hv, Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
-  vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+  // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
+  // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
+  // keeps the f32 RmsNormGated + separate CastBf16 pair.
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
-  vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  if (GlueFuseEnabled()) {
+    Tensor gated2 = Reshape(gated_bf16.t(), {T * Hv, Dv});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+  } else {
+    DBuf dgated(d, DType::kF32, {T * Hv, Dv});
+    vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
   return !w.out_proj_fp8.Empty()
@@ -1032,28 +1108,32 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                            vt::CausalConv1dArgs{true}, &gidx);
   }
 
-  // Split conv output into q[T,Hk,Dk] | k[T,Hk,Dk] | v[T,Hv,Dv] (device op).
-  DBuf qf(d, DType::kF32, {T, Hk, Dk});
-  DBuf kf(d, DType::kF32, {T, Hk, Dk});
-  DBuf vf(d, DType::kF32, {T, Hv, Dv});
-  Tensor q2 = Reshape(qf.t(), {T, key_dim});
-  Tensor k2 = Reshape(kf.t(), {T, key_dim});
-  Tensor v2 = Reshape(vf.t(), {T, value_dim});
-  vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-
-  // g/beta from a/b + A_log/dt_bias (gdn-semantics.md §6) — device op. Uniform
-  // over all tokens; the recurrence below segments them.
+  // Post-conv prep (§1 layout, §4 l2norm, §6 g/beta): split q|k|v, l2-normalize
+  // q/k over Dk, derive g/beta. Fused into one vt::GdnPostConv launch
+  // (perf/glue-fuse; mirror fla fused_gdn_prefill_post_conv), or four per-op
+  // launches when disabled. g/beta uniform over all tokens; recurrence segments.
   Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
   Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
+  DBuf vf(d, DType::kF32, {T, Hv, Dv});
   DBuf dg(d, DType::kF32, {T, Hv});
   DBuf dbeta(d, DType::kF32, {T, Hv});
-  vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
-
-  // L2-normalize q,k over Dk (gdn-semantics.md §4), scale = Dk^-0.5 (q only).
   DBuf dql2(d, DType::kF32, {T, Hk, Dk});
   DBuf dkl2(d, DType::kF32, {T, Hk, Dk});
-  vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
-  vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
+  if (GlueFuseEnabled()) {
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw.t(),
+                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+  } else {
+    DBuf qf(d, DType::kF32, {T, Hk, Dk});
+    DBuf kf(d, DType::kF32, {T, Hk, Dk});
+    Tensor q2 = Reshape(qf.t(), {T, key_dim});
+    Tensor k2 = Reshape(kf.t(), {T, key_dim});
+    Tensor v2 = Reshape(vf.t(), {T, value_dim});
+    vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
+    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
+    vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
+  }
+  // scale = Dk^-0.5 (q only, inside the recurrence).
   DBuf dcore(d, DType::kF32, {T, Hv, Dv});
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   const int64_t ssm_row_elems = Hv * Dv * Dk;
@@ -1110,12 +1190,20 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.
   Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
-  DBuf dgated(d, DType::kF32, {T * Hv, Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
-  vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+  // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
+  // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
+  // keeps the f32 RmsNormGated + separate CastBf16 pair.
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
-  vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  if (GlueFuseEnabled()) {
+    Tensor gated2 = Reshape(gated_bf16.t(), {T * Hv, Dv});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+  } else {
+    DBuf dgated(d, DType::kF32, {T * Hv, Dv});
+    vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
+  }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
   return !w.out_proj_fp8.Empty()

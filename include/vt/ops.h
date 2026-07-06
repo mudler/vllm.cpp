@@ -50,6 +50,7 @@ enum class OpId : uint8_t {
   kGdnConvSplit,
   kSharedExpertGate,
   kMoeGroupedGemmNvfp4Marlin,
+  kGdnPostConv,
   kCount
 };
 
@@ -179,6 +180,12 @@ using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
 using GdnGBetaFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                             const Tensor&);
 using GdnConvSplitFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&);
+// Fused GDN post-conv prep (mirror of fla fused_gdn_prefill_post_conv):
+// conv-split + q/k l2norm + g/beta gating in ONE launch. eps travels in
+// L2NormArgs (the q/k l2norm eps; softplus threshold 20 baked in as in GdnGBeta).
+using GdnPostConvFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, Tensor&, Tensor&, const Tensor&,
+                               const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                               const L2NormArgs&);
 using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
@@ -750,6 +757,21 @@ void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, con
 // T = conv.shape[0]; key_dim = q_out.Numel()/T, value_dim = v_out.Numel()/T
 // (rows treated row-major). All f32.
 void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv);
+
+// Fused GDN post-conv preparation (launch-count fusion; mirror of upstream
+// vllm/model_executor/layers/fla/ops/fused_gdn_prefill_post_conv.py
+// _fused_post_conv_kernel — "split → l2norm*2 → gating" in a single kernel,
+// grid (L, H+HV)). Replaces the GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta
+// four-launch chain with one launch, bit-for-bit equal to composing them:
+//   [q|k|v]     = split(conv[T, 2*key_dim+value_dim])   (GdnConvSplit)
+//   q_out,k_out = l2norm(q), l2norm(k) over Dk           (L2Norm, args.eps)
+//   v_out       = v                                      (copy)
+//   g_out,beta_out from araw/braw + a_log/dt_bias        (GdnGBeta, §6)
+// q_out/k_out [T,Hk,Dk] (l2-normed), v_out [T,Hv,Dv], g_out/beta_out [T,Hv];
+// conv [T, 2*Hk*Dk + Hv*Dv]; araw/braw [T,Hv]; a_log/dt_bias [Hv]. All f32.
+void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
+                 Tensor& beta_out, const Tensor& conv, const Tensor& araw, const Tensor& braw,
+                 const Tensor& a_log, const Tensor& dt_bias, const L2NormArgs& args);
 
 // out[t,c] = F32ToBF16(sigmoid(gl[t]) * sd[t*H+c]); out bf16 [T,H], sd f32
 // [T,H], gl f32 with T elements (shape [T] or [T,1]). The shared-expert

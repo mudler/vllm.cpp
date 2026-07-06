@@ -22,8 +22,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "core/scalar_type.hpp"
 #include "libtorch_stable/moe/marlin_moe_wna16/marlin_mm.h"
@@ -41,6 +44,50 @@ void Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// Persistent C_tmp workspace pool (VT_MARLIN_WS_POOL, default ON).
+//
+// vLLM allocates c_tmp — the fp32 global-reduce scratch — per moe_wna16_marlin_gemm
+// call (torch::stable::new_empty, ops.cu:708-715), but that goes through PyTorch's
+// CACHING device allocator, so it is a cheap pool hit, NOT a raw cudaMalloc. Our
+// port had replaced it with a raw cudaMallocAsync + cudaFreeAsync PER GEMM (3 per
+// MoE layer x num_layers x step). Stream-ordered async alloc/free serialize on the
+// forward's host thread and were the #1 steady-state prefill idle (nsys: ~3893
+// cudaMallocAsync ~1.1s host-time, ~242ms idle at the memset->Marlin boundary).
+//
+// This mirrors PyTorch's caching allocator with a persistent, grown-on-demand
+// buffer PER STREAM, reused every call. c_tmp is scratch the kernel fully writes
+// before it reads (vLLM uses new_empty — uninitialized; there is NO zero-on-entry
+// invariant, unlike the `workspace` locks), so reuse is race-free under the
+// forward's single-stream ordering: the prior GEMM's kernels complete before the
+// next GEMM on the SAME stream is issued. The buffer grows monotonically and leaks
+// at process exit (like the cublasLt workspace / the resident Marlin workspace).
+// VT_MARLIN_WS_POOL=0 restores the per-call cudaMallocAsync/cudaFreeAsync (A/B).
+bool MarlinWsPoolEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_WS_POOL");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// Ensure the per-stream c_tmp scratch holds >= `bytes`; regrow (async) if short.
+float* EnsureCtmp(cudaStream_t s, size_t bytes) {
+  struct Scratch {
+    void* p = nullptr;
+    size_t cap = 0;
+  };
+  static std::mutex mu;
+  static std::unordered_map<cudaStream_t, Scratch> pool;
+  std::lock_guard<std::mutex> lk(mu);
+  Scratch& sc = pool[s];
+  if (bytes > sc.cap) {
+    if (sc.p != nullptr) Check(cudaFreeAsync(sc.p, s), "cudaFreeAsync c_tmp grow");
+    Check(cudaMallocAsync(&sc.p, bytes, s), "cudaMallocAsync c_tmp (pool)");
+    sc.cap = bytes;
+  }
+  return static_cast<float*>(sc.p);
+}
 
 // vt::MoeGroupedGemmNvfp4Marlin registered kernel.
 void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
@@ -79,11 +126,17 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   const int64_t sorted_len = sorted_token_ids.shape[0];
   float* c_tmp = nullptr;
   int64_t c_tmp_elems = 0;
+  bool c_tmp_pooled = false;
   if (use_fp32_reduce && !use_atomic_add) {
     c_tmp_elems = static_cast<int64_t>(size_n) * sorted_len;
     if (moe_block_size == 8) c_tmp_elems *= 2;
-    Check(cudaMallocAsync(&c_tmp, static_cast<size_t>(c_tmp_elems) * sizeof(float), s),
-          "cudaMallocAsync c_tmp");
+    const size_t c_tmp_bytes = static_cast<size_t>(c_tmp_elems) * sizeof(float);
+    if (MarlinWsPoolEnabled()) {
+      c_tmp = EnsureCtmp(s, c_tmp_bytes);  // persistent per-stream, reused
+      c_tmp_pooled = true;
+    } else {
+      Check(cudaMallocAsync(&c_tmp, c_tmp_bytes, s), "cudaMallocAsync c_tmp");
+    }
   }
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
@@ -96,7 +149,7 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
       s, /*thread_k=*/-1, /*thread_n=*/-1, sms, /*blocks_per_sm=*/0, use_atomic_add,
       use_fp32_reduce, /*is_zp_float=*/false);
 
-  if (c_tmp) Check(cudaFreeAsync(c_tmp, s), "cudaFreeAsync c_tmp");
+  if (c_tmp && !c_tmp_pooled) Check(cudaFreeAsync(c_tmp, s), "cudaFreeAsync c_tmp");
   Check(cudaGetLastError(), "moe_marlin marlin_mm launch");
 }
 

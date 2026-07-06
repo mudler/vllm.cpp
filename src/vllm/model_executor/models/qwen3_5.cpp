@@ -11,7 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -84,28 +87,75 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // the driver (leak at process exit, like the cublasLt workspace); the pool is
 // bounded by the forward's peak concurrent scratch. The pool is backend-agnostic
 // (CPU malloc/free too — a harmless bounded cache there).
+//
+// SIZE-CLASS BUCKETING (prefill sync-cudaMalloc kill). Keying the pool on the
+// EXACT byte size defeats reuse during prefill: under continuous batching each
+// engine step processes a different token count T (prefill-chunk tokens + decode
+// tokens), so every [T,*] scratch is a byte size that step-1 never saw — an
+// exact-key MISS -> a SYNCHRONOUS cudaMalloc (device-serializing, does NOT
+// overlap compute) on the forward's host thread, thousands per prefill. Rounding
+// the request UP to a size class (keep the top `kClassBits` significant bits;
+// <=1/2^kClassBits ~ 6.25% over-allocation) makes nearby-T scratch of the same
+// op share ONE block, so after warm-up almost every prefill DBuf is a pool hit.
+// The returned block is >= the requested bytes (the Tensor view uses only the
+// logical prefix), and Put/Get round identically so a block always returns to
+// its own class bucket. VT_POOL_EXACT=1 restores exact keying (A/B measurement).
 class DevicePool {
  public:
   void* Get(Backend& b, size_t bytes) {
+    const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = free_.find(bytes);
+      auto it = free_.find(key);
       if (it != free_.end() && !it->second.empty()) {
         void* p = it->second.back();
         it->second.pop_back();
+        ++hits_;
         return p;
       }
+      ++misses_;
     }
-    return b.Alloc(bytes);
+    return b.Alloc(key);
   }
   void Put(size_t bytes, void* p) {
+    const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
-    free_[bytes].push_back(p);
+    free_[key].push_back(p);
+  }
+
+  ~DevicePool() {
+    if (std::getenv("VT_POOL_STATS") != nullptr) {
+      const uint64_t h = hits_.load(), m = misses_.load();
+      const double rate = (h + m) ? 100.0 * static_cast<double>(h) / static_cast<double>(h + m) : 0.0;
+      std::fprintf(stderr,
+                   "[DevicePool] hits=%llu misses(cudaMalloc)=%llu hit-rate=%.2f%% distinct-classes=%zu\n",
+                   static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
+                   rate, free_.size());
+    }
   }
 
  private:
+  // Round `bytes` up so it keeps at most kClassBits leading significant bits.
+  // Exact keying when VT_POOL_EXACT=1 (A/B). Small sizes (< 2^kClassBits) key
+  // exactly — there are few of them and the waste would be proportionally large.
+  static size_t ClassOf(size_t bytes) {
+    static const bool exact = [] {
+      const char* e = std::getenv("VT_POOL_EXACT");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (exact || bytes == 0) return bytes == 0 ? 1 : bytes;
+    constexpr int kClassBits = 4;  // <=6.25% over-allocation per class
+    const int msb = 63 - __builtin_clzll(static_cast<unsigned long long>(bytes));
+    if (msb < kClassBits) return bytes;
+    const int shift = msb - kClassBits;
+    const size_t mask = (static_cast<size_t>(1) << shift) - 1;
+    return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
+  }
+
   std::mutex mu_;
   std::unordered_map<size_t, std::vector<void*>> free_;
+  std::atomic<uint64_t> hits_{0};
+  std::atomic<uint64_t> misses_{0};
 };
 
 DevicePool& Pool() {

@@ -686,6 +686,259 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
   }
 }
 
+// ===========================================================================
+// PREFILL path, TENSOR-CORE (WMMA) FlashAttention-2 with REGISTER-RESIDENT O.
+// (VT_ATTN_FLASH2, default ON; VT_ATTN_FLASH2=0 -> proven PagedFlashWmmaGqaKernel.)
+//
+// STEP-1 measured limiter of PagedFlashWmmaGqaKernel on GB10/sm_121: the f32
+// running-O accumulator Osm[QG,16,d] = 32 KiB (QG=2, d=256) dominates a 86.4 KiB
+// shared footprint, capping the kernel at floor(102400/86400) = 1 block/SM =
+// 8 warps/SM = 16.7% theoretical occupancy (registers allow 5 blocks; not the
+// limit). A latency-bound kernel at 16.7% occupancy sits at ~1% of the bf16
+// tensor roofline. THE fix mirrors FlashAttention-2 (Dao 2023; vllm/v1/attention/
+// backends/flash_attn.py @ e24d1b24 delegates to flash_attn_varlen_func, whose
+// CUTLASS kernel keeps the O accumulator in registers across the K/V loop):
+// hold O in the WMMA accumulator FRAGMENTS (registers) instead of shared. This
+// removes the 32 KiB Osm; shared drops to ~36 KiB -> 2 blocks/SM = 16 warps/SM =
+// 33% occupancy (2x), doubling the latency-hiding warps at fixed registers.
+//
+// Register-O layout: each of the 8 warps owns a contiguous 2-n-tile (32-col)
+// slice of O for BOTH QG heads -> 4 accumulator fragments per warp (2 heads x
+// 2 n-tiles), 32 f32/thread. The online-softmax per-row corr rescale is applied
+// to a fragment WITHOUT relying on the (opaque) accumulator element layout: a
+// corr tile corrbuf[i][j]=corr[row i] is loaded into an accumulator fragment with
+// the SAME type/layout as O, so element-wise Ofrag.x[k] *= cfrag.x[k] scales
+// O(i,j) by corr(i) exactly (both fragments share the deterministic x[k]<->(i,j)
+// map). K and V SHARE one [BN,d] bf16 buffer via a two-phase tile (K-phase does
+// QKᵀ+softmax for all QG heads into Pb[QG]; V-phase overwrites with V and does
+// P·V), which frees the shared budget the register-O reclaim needs. All softmax
+// numerics (sequential-over-keys running max/sum, f32) are identical to the GQA
+// kernel; only O storage + K/V staging change.
+//
+//   grid = (num_tiles, hq/QG); block = kWmmaWarps(=8) warps.
+//   Shared: Qb[QG,16,d] | KVb[BN,d] | Pb[QG,16,BN] (bf16) ; Ssm[16,BN] |
+//   corrbuf[QG,16,16] (f32). O lives in registers (accumulator fragments).
+// ===========================================================================
+constexpr int kF2BN = 32;  // keys per K/V tile (K and V share KVb, two-phase).
+
+template <typename TQ, typename TKV, typename Tout, int QG>
+__global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const TKV* k_cache,
+                                              const TKV* v_cache, const int32_t* block_table,
+                                              const int32_t* seq_lens,
+                                              const int32_t* query_start_loc, const int2* tiles,
+                                              int num_tiles, int hq, int num_kv_heads, int d,
+                                              int block_size, int64_t bt_row, int64_t bt_col,
+                                              int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
+                                              int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
+                                              float scale, bool causal) {
+  const int tile_idx = blockIdx.x;
+  const int grp = blockIdx.y;
+  if (tile_idx >= num_tiles) return;
+
+  const int h0 = grp * QG;
+  const int g = h0 / (hq / num_kv_heads);
+
+  const int2 td = tiles[tile_idx];
+  const int r = td.x;
+  const int local0 = td.y;
+  const int q0 = query_start_loc[r];
+  const int q1 = query_start_loc[r + 1];
+  const int qlen = q1 - q0;
+  const int seqlen = seq_lens[r];
+  const int context = seqlen - qlen;
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32;
+  const int nwarps = static_cast<int>(blockDim.x) / 32;  // 8
+  const int nthreads = static_cast<int>(blockDim.x);
+
+  extern __shared__ char smem_raw[];
+  __nv_bfloat16* Qb = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+  __nv_bfloat16* KVb = Qb + QG * kWmmaM * d;
+  __nv_bfloat16* Pb = KVb + kF2BN * d;
+  float* Ssm = reinterpret_cast<float*>(Pb + QG * kWmmaM * kF2BN);
+  float* corrbuf = Ssm + kWmmaM * kF2BN;  // [QG][16][16]
+  __shared__ float s_m[QG][kWmmaM], s_l[QG][kWmmaM];
+
+  const int nqk = d / kWmmaM;          // QKᵀ k-steps
+  const int nqk_n = kF2BN / kWmmaM;    // QKᵀ n-tiles = 2
+  // Each warp owns n-tiles [2*warp, 2*warp+2) of O for both heads -> 4 fragments.
+  const int kNtPerWarp = 2;  // npv_n(16) / nwarps(8)
+
+  // O accumulator lives in registers: Of[hh][j], j in [0,kNtPerWarp).
+  AccFrag Of[QG][2];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh)
+#pragma unroll
+    for (int j = 0; j < kNtPerWarp; ++j) attn_wmma::fill_fragment(Of[hh][j], 0.0f);
+
+  // Stage Q (cast bf16) for all QG heads.
+  for (int e = tid; e < QG * kWmmaM * d; e += nthreads) {
+    const int hh = e / (kWmmaM * d);
+    const int rem = e - hh * kWmmaM * d;
+    const int row = rem / d, col = rem % d;
+    const int local_row = local0 + row;
+    __nv_bfloat16 qv = __float2bfloat16(0.0f);
+    if (local_row < qlen) {
+      const int h = h0 + hh;
+      const int64_t qoff = (static_cast<int64_t>(q0 + local_row) * hq + h) * d;
+      qv = __float2bfloat16(Load(query, qoff + col));
+    }
+    Qb[e] = qv;
+  }
+  for (int i = tid; i < QG * kWmmaM; i += nthreads) {
+    s_m[i / kWmmaM][i % kWmmaM] = -CUDART_INF_F;
+    s_l[i / kWmmaM][i % kWmmaM] = 0.0f;
+  }
+  __syncthreads();
+
+  const int last_row = min(local0 + kWmmaM, qlen) - 1;
+  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+
+  for (int j0 = 0; j0 <= block_jmax; j0 += kF2BN) {
+    const int tile_keys = min(kF2BN, block_jmax - j0 + 1);
+
+    // ---- K-phase: stage K into KVb.
+    for (int idx = tid; idx < kF2BN * d; idx += nthreads) {
+      const int kk = idx / d, ee = idx % d;
+      if (kk < tile_keys) {
+        const int j = j0 + kk;
+        const int blk = block_table[static_cast<int64_t>(r) * bt_row + (j / block_size) * bt_col];
+        const int off = j % block_size;
+        KVb[idx] = __float2bfloat16(Load(k_cache, static_cast<int64_t>(blk) * kc_blk +
+                                                      static_cast<int64_t>(off) * kc_pg +
+                                                      static_cast<int64_t>(g) * kc_hd + ee));
+      } else {
+        KVb[idx] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+    // Per head: S = Qh·Kᵀ (WMMA) -> online softmax -> Pb[hh], corrbuf[hh].
+    for (int hh = 0; hh < QG; ++hh) {
+      __nv_bfloat16* Qh = Qb + hh * kWmmaM * d;
+      __nv_bfloat16* Ph = Pb + hh * kWmmaM * kF2BN;
+      for (int nt = warp; nt < nqk_n; nt += nwarps) {
+        const int jj0 = nt * kWmmaM;
+        AccFrag acc;
+        attn_wmma::fill_fragment(acc, 0.0f);
+        for (int kk = 0; kk < nqk; ++kk) {
+          ArowFrag a;
+          BcolFrag b;
+          attn_wmma::load_matrix_sync(a, Qh + kk * kWmmaM, d);
+          attn_wmma::load_matrix_sync(b, KVb + jj0 * d + kk * kWmmaM, d);
+          attn_wmma::mma_sync(acc, a, b, acc);
+        }
+        attn_wmma::store_matrix_sync(Ssm + jj0, acc, kF2BN, attn_wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      float* cbuf = corrbuf + hh * kWmmaM * kWmmaM;
+      if (tid < kWmmaM) {
+        const int i = tid;
+        const int local_row = local0 + i;
+        const bool active = local_row < qlen;
+        const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+        float row_max = -CUDART_INF_F;
+        for (int jj = 0; jj < tile_keys; ++jj) {
+          const int j = j0 + jj;
+          if (j <= jmax_i) {
+            const float s = Ssm[i * kF2BN + jj] * scale;
+            Ssm[i * kF2BN + jj] = s;
+            row_max = fmaxf(row_max, s);
+          }
+        }
+        const float m_old = s_m[hh][i];
+        const float m_new = fmaxf(m_old, row_max);
+        const float corr = (m_new == -CUDART_INF_F) ? 1.0f : __expf(m_old - m_new);
+        float row_sum = 0.0f;
+        for (int jj = 0; jj < kF2BN; ++jj) {
+          const int j = j0 + jj;
+          float p = 0.0f;
+          if (jj < tile_keys && j <= jmax_i) {
+            p = __expf(Ssm[i * kF2BN + jj] - m_new);
+            row_sum += p;
+          }
+          Ph[i * kF2BN + jj] = __float2bfloat16(p);
+        }
+        s_l[hh][i] = s_l[hh][i] * corr + row_sum;
+        s_m[hh][i] = m_new;
+        for (int c = 0; c < kWmmaM; ++c) cbuf[i * kWmmaM + c] = corr;  // broadcast row corr
+      }
+      __syncthreads();
+    }
+
+    // ---- V-phase: overwrite KVb with V.
+    for (int idx = tid; idx < kF2BN * d; idx += nthreads) {
+      const int kk = idx / d, ee = idx % d;
+      if (kk < tile_keys) {
+        const int j = j0 + kk;
+        const int blk = block_table[static_cast<int64_t>(r) * bt_row + (j / block_size) * bt_col];
+        const int off = j % block_size;
+        KVb[idx] = __float2bfloat16(Load(v_cache, static_cast<int64_t>(blk) * vc_blk +
+                                                      static_cast<int64_t>(off) * vc_pg +
+                                                      static_cast<int64_t>(g) * vc_hd + ee));
+      } else {
+        KVb[idx] = __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+
+    // O_reg = O_reg*corr + Ph·V for each owned (head, n-tile). corr via a fragment
+    // of identical accumulator layout -> element-wise multiply is exact per row.
+    for (int hh = 0; hh < QG; ++hh) {
+      __nv_bfloat16* Ph = Pb + hh * kWmmaM * kF2BN;
+      float* cbuf = corrbuf + hh * kWmmaM * kWmmaM;
+      AccFrag cfrag;
+      attn_wmma::load_matrix_sync(cfrag, cbuf, kWmmaM, attn_wmma::mem_row_major);
+#pragma unroll
+      for (int j = 0; j < kNtPerWarp; ++j) {
+        const int nt = warp * kNtPerWarp + j;
+        AccFrag& acc = Of[hh][j];
+#pragma unroll
+        for (int k = 0; k < acc.num_elements; ++k) acc.x[k] *= cfrag.x[k];
+        for (int kk = 0; kk < nqk_n; ++kk) {
+          ArowFrag a;  // P[16,BN] row-major
+          BrowFrag b;  // V[BN,d] row-major
+          attn_wmma::load_matrix_sync(a, Ph + kk * kWmmaM, kF2BN);
+          attn_wmma::load_matrix_sync(b, KVb + (kk * kWmmaM) * d + nt * kWmmaM, d);
+          attn_wmma::mma_sync(acc, a, b, acc);
+        }
+      }
+    }
+    __syncthreads();  // before next tile overwrites KVb/Pb/Ssm/corrbuf
+  }
+
+  // Normalize by the softmax denominator and store active rows. Each warp stages
+  // its owned O fragments to a private [16,16] f32 slot in KVb (bf16, free now)
+  // reinterpreted as f32, then its 32 lanes scatter them to global with the 1/l
+  // normalization. Warp slots are disjoint (warp*256 f32 < KVb's 4096 f32).
+  __syncthreads();
+  float* store_scr = reinterpret_cast<float*>(KVb) + warp * kWmmaM * kWmmaM;
+  const int lane = tid & 31;
+  for (int hh = 0; hh < QG; ++hh) {
+    const int h = h0 + hh;
+#pragma unroll
+    for (int j = 0; j < kNtPerWarp; ++j) {
+      const int nt = warp * kNtPerWarp + j;
+      attn_wmma::store_matrix_sync(store_scr, Of[hh][j], kWmmaM, attn_wmma::mem_row_major);
+      __syncwarp();
+      for (int idx = lane; idx < kWmmaM * kWmmaM; idx += 32) {
+        const int row = idx / kWmmaM, col = idx % kWmmaM;
+        const int local_row = local0 + row;
+        if (local_row < qlen) {
+          const float inv = 1.0f / s_l[hh][row];
+          const int gcol = nt * kWmmaM + col;
+          const int64_t qoff = (static_cast<int64_t>(q0 + local_row) * hq + h) * d;
+          Store(out, qoff + gcol, store_scr[idx] * inv);
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
+
 // --- Launchers -------------------------------------------------------------
 
 template <typename TQ, typename TKV, typename Tout>
@@ -864,6 +1117,66 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-gqa tiles free");
 }
 
+// FlashAttention-2 restructured GQA prefill launcher (VT_ATTN_FLASH2). Same host
+// tile build as LaunchPrefillWmmaGqa; BN=kF2BN, K/V share one shared buffer.
+template <typename TQ, typename TKV, typename Tout, int QG>
+void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query,
+                                const Tensor& k_cache, const Tensor& v_cache,
+                                const Tensor& block_table, const Tensor& seq_lens,
+                                const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                                int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
+                                int64_t block_size) {
+  std::vector<int32_t> qsl(static_cast<size_t>(num_reqs + 1));
+  Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(), qsl.size() * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, s),
+        "paged wmma-flash2 qsl D2H");
+  Check(cudaStreamSynchronize(s), "paged wmma-flash2 qsl sync");
+
+  std::vector<int2> tiles;
+  tiles.reserve(static_cast<size_t>(num_reqs));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    const int32_t qlen = qsl[static_cast<size_t>(r + 1)] - qsl[static_cast<size_t>(r)];
+    for (int32_t ts = 0; ts < qlen; ts += kWmmaM) tiles.push_back(int2{static_cast<int>(r), ts});
+  }
+  const int num_tiles = static_cast<int>(tiles.size());
+  if (num_tiles == 0) return;
+
+  int2* d_tiles = nullptr;
+  Check(cudaMallocAsync(&d_tiles, tiles.size() * sizeof(int2), s), "paged wmma-flash2 tiles alloc");
+  Check(cudaMemcpyAsync(d_tiles, tiles.data(), tiles.size() * sizeof(int2), cudaMemcpyHostToDevice,
+                        s),
+        "paged wmma-flash2 tiles H2D");
+
+  const size_t bf16_bytes =
+      (static_cast<size_t>(QG) * kWmmaM * d + static_cast<size_t>(kF2BN) * d +
+       static_cast<size_t>(QG) * kWmmaM * kF2BN) *
+      sizeof(__nv_bfloat16);
+  const size_t f32_bytes =
+      (static_cast<size_t>(kWmmaM) * kF2BN + static_cast<size_t>(QG) * kWmmaM * kWmmaM) *
+      sizeof(float);
+  const size_t shmem = bf16_bytes + f32_bytes;
+  auto* kernel = PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG>;
+  if (shmem > 48u * 1024u) {
+    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(shmem)),
+          "paged wmma-flash2 smem opt-in");
+  }
+  const int num_groups = static_cast<int>(hq) / QG;
+  const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(num_groups));
+  const dim3 block(32 * kWmmaWarps);
+  kernel<<<grid, block, shmem, s>>>(
+      out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
+      block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), d_tiles,
+      num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
+      static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
+      k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+      args.scale, args.causal);
+  Check(cudaGetLastError(), "paged_attention prefill wmma-flash2 launch");
+  Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2 tiles free");
+}
+
+
 // Prefill flash is opt-out via VT_PAGED_FLASH=0 (A/B toggle vs the decode-grade
 // block kernel). Evaluated once.
 bool PrefillFlashEnabled() {
@@ -889,6 +1202,17 @@ bool PrefillWmmaEnabled() {
 bool PrefillWmmaGqaEnabled() {
   static const bool enabled = [] {
     const char* e = std::getenv("VT_ATTN_GQA");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return enabled;
+}
+
+// FlashAttention-2 restructured GQA prefill (BN=64, K/V share one shared buffer,
+// QKᵀ over 4 warps) — the measured-limiter fix over PagedFlashWmmaGqaKernel.
+// Default ON; opt-out via VT_ATTN_FLASH2=0 (falls back to the proven GQA kernel).
+bool PrefillWmmaFlash2Enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_ATTN_FLASH2");
     return !(e != nullptr && e[0] == '0');
   }();
   return enabled;
@@ -928,10 +1252,16 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
   const bool gqa = wmma && PrefillWmmaGqaEnabled() && (qpk % kGqaQG == 0) &&
                    (hq % kGqaQG == 0);
+  const bool flash2 = gqa && PrefillWmmaFlash2Enabled();
   const bool prefill = is_prefill && d <= kMaxEpl * 32 && PrefillFlashEnabled();
   switch (out.dtype) {
     case DType::kF32:
-      if (gqa) {
+      if (flash2) {
+        LaunchPrefillWmmaGqaFlash2<TQ, TKV, float, kGqaQG>(s, out, query, k_cache, v_cache,
+                                                          block_table, seq_lens,
+                                                          query_start_loc, args, hq, d,
+                                                          num_reqs, num_kv_heads, block_size);
+      } else if (gqa) {
         LaunchPrefillWmmaGqa<TQ, TKV, float, kGqaQG>(s, out, query, k_cache, v_cache, block_table,
                                                      seq_lens, query_start_loc, args, hq, d,
                                                      num_reqs, num_kv_heads, block_size);
@@ -950,7 +1280,12 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       }
       break;
     case DType::kBF16:
-      if (gqa) {
+      if (flash2) {
+        LaunchPrefillWmmaGqaFlash2<TQ, TKV, __nv_bfloat16, kGqaQG>(s, out, query, k_cache, v_cache,
+                                                          block_table, seq_lens,
+                                                          query_start_loc, args, hq, d,
+                                                          num_reqs, num_kv_heads, block_size);
+      } else if (gqa) {
         LaunchPrefillWmmaGqa<TQ, TKV, __nv_bfloat16, kGqaQG>(
             s, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args, hq, d,
             num_reqs, num_kv_heads, block_size);

@@ -341,14 +341,27 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   }
 
   const vt::Device dev = queue_.device;
+  // bf16 GDN state caches on CUDA (vLLM default mamba_cache_dtype auto → model
+  // dtype), f32 on CPU (the CPU GDN ops are f32-only; the exact-value CPU tests
+  // assume f32). The CUDA GDN decode/conv kernels read bf16 → f32 → write bf16.
+  // A/B: VT_GDN_STATE_BF16=0 forces the f32 cache (same-binary before/after of
+  // the bf16 state-traffic lever), mirroring VT_GDN_FUSED_DECODE / VT_GDN_CHUNKED.
+  const char* bf16env = std::getenv("VT_GDN_STATE_BF16");
+  const bool force_f32 = bf16env != nullptr && bf16env[0] == '0';
+  gdn_cache_dtype_ = (dev.type == vt::DeviceType::kCUDA && !force_f32)
+                         ? vt::DType::kBF16
+                         : vt::DType::kF32;
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
         config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
     if (is_gdn) {
+      // State caches: bf16 on CUDA (vLLM default), f32 on CPU (f32-only CPU ops).
+      // Raw bytes sized by gdn_cache_dtype_; 0 bytes == +0.0f in both dtypes.
+      const size_t es = vt::SizeOf(gdn_cache_dtype_);
       ssm_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk) * es, uint8_t{0});
       conv_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)), 0.0f);
+          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)) * es, uint8_t{0});
     } else {
       // KV cache stored in kv_dtype (bf16 default; f32 if VT_KV_CACHE_F32). 0
       // bytes == 0.0 in both bf16 and f32. bf16 halves KV memory vs f32.
@@ -374,9 +387,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
-    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), vt::DType::kF32,
+    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), gdn_cache_dtype_,
                                           dev, {gdn_state_slots_, Hv, Dv, Dk});
-    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), vt::DType::kF32,
+    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), gdn_cache_dtype_,
                                            dev,
                                            {gdn_state_slots_, conv_dim, Kw - 1});
     gdn_state_.push_back(gs);

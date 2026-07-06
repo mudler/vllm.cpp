@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <set>
@@ -284,6 +285,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // (matches Qwen3_5Model::Forward's per-layer fa_idx / gdn_idx indexing).
   const int64_t Hkv = config_.num_key_value_heads;
   const int64_t Dh = config_.head_dim;
+  // Paged KV-cache dtype: bf16 (vLLM's bf16 flash_attn KV store — halves KV
+  // memory) unless VT_KV_CACHE_F32 is set (same-binary f32-vs-bf16 A/B).
+  const char* kv_f32_env = std::getenv("VT_KV_CACHE_F32");
+  const vt::DType kv_dtype =
+      (kv_f32_env != nullptr && kv_f32_env[0] == '1') ? vt::DType::kF32
+                                                      : vt::DType::kBF16;
   const int64_t Hk = config_.linear_num_key_heads;
   const int64_t Hv = config_.linear_num_value_heads;
   const int64_t Dk = config_.linear_key_head_dim;
@@ -311,10 +318,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       conv_buf_.emplace_back(
           static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)), 0.0f);
     } else {
-      // bf16 KV cache: uint16_t words, 0 == bf16 0.0. Halves KV memory vs f32.
+      // KV cache stored in kv_dtype (bf16 default; f32 if VT_KV_CACHE_F32). 0
+      // bytes == 0.0 in both bf16 and f32. bf16 halves KV memory vs f32.
       full_attn_buf_.emplace_back(
-          static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh),
-          static_cast<uint16_t>(0));
+          static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh) *
+              static_cast<size_t>(vt::SizeOf(kv_dtype)),
+          static_cast<uint8_t>(0));
     }
   }
 
@@ -323,7 +332,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   for (auto& b : full_attn_buf_) {
     PagedKvCache kv;
     kv.data = b.data();
-    kv.dtype = vt::DType::kBF16;
+    kv.dtype = kv_dtype;
     kv.num_blocks = num_blocks_;
     kv.block_size = fa_block_size;
     kv.num_kv_heads = Hkv;

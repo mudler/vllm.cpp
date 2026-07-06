@@ -87,6 +87,14 @@ struct GdnArgs {
   // q scale, applied to q only after l2norm; upstream default Dk^-0.5
   // (gdn-semantics.md §1). Must be set explicitly (> 0).
   float scale = 0.0f;
+  // OPTIONAL host-resident query_start_loc[N+1] (same values as the device
+  // `query_start_loc` tensor). When set, the CUDA chunked-prefill path builds
+  // its chunk layout from these host values + a device meta-kernel, avoiding
+  // the per-layer D2H copy + cudaStreamSynchronize (the prefill host-tax — it
+  // forced host↔GPU lockstep every GDN layer, ~67% GPU-idle). nullptr => the
+  // path falls back to the D2H+sync (op tests / callers without host qsl).
+  // Mirrors the decode StepDevInputs device-resident metadata pattern.
+  const int32_t* query_start_loc_host = nullptr;
 };
 
 // Dense causal attention args (.agents/qwen36-forward-notes.md §5 is the

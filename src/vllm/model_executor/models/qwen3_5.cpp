@@ -1096,8 +1096,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor g_pre = SubView(dg.t(), nd_tok, np_tok);
     Tensor b_pre = SubView(dbeta.t(), nd_tok, np_tok);
     Tensor o_pre = SubView(dcore.t(), nd_tok, np_tok);
+    // Hand the CUDA chunked-prefill path the HOST query_start_loc (p_qsl, already
+    // materialized on the host by the GDN attention metadata build) so it skips
+    // the per-layer D2H copy + cudaStreamSynchronize that forced host↔GPU
+    // lockstep every GDN prefill layer (~67% GPU-idle in prefill). p_qsl outlives
+    // this call. Device-resident metadata, mirroring the decode StepDevInputs fix.
+    vt::GdnArgs gdn_args{scale};
+    gdn_args.query_start_loc_host = p_qsl.data();
     vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                   dpqsl.t(), vt::GdnArgs{scale});
+                   dpqsl.t(), gdn_args);
     ScatterRows(d, state.ssm_state, dss.ptr(), pidx, ssm_row_elems);
   }
 

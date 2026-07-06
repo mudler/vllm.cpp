@@ -1150,12 +1150,38 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
   }
 }
 
+// Builds the per-chunk layout (tok0/len) + per-seq base-offset (boh) arrays
+// DIRECTLY on the device from the device query_start_loc — the exact loop the
+// host used to run after a D2H copy+sync. Single-thread (n_seq is small, ~batch
+// size); writes exactly nt_tot entries into tok0/lenv (nt_tot precomputed on the
+// host from the same qsl values, so grid/scratch sizing matches bit-for-bit).
+// Lets the chunked-prefill path stay device-resident: no D2H sync, no host-vector
+// H2D + launch sync (the prefill host-tax; see GdnArgs::query_start_loc_host).
+__global__ void GdnBuildChunkMeta(int32_t* tok0, int32_t* lenv, int32_t* boh,
+                                  const int32_t* qsl, int64_t n_seq) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  int32_t nt = 0;
+  for (int64_t n = 0; n < n_seq; ++n) {
+    boh[n] = nt;
+    const int32_t begin = qsl[n];
+    const int32_t len = qsl[n + 1] - begin;
+    const int32_t ntn = (len + kChunk - 1) / kChunk;
+    for (int32_t it = 0; it < ntn; ++it) {
+      const int32_t rem = len - it * kChunk;
+      tok0[nt] = begin + it * kChunk;
+      lenv[nt] = rem < kChunk ? rem : kChunk;
+      ++nt;
+    }
+  }
+}
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
                           const std::vector<int32_t>& tok0h,
                           const std::vector<int32_t>& lenh, const std::vector<int32_t>& bohh,
-                          const Tensor& qsl, int64_t n_seq, int64_t nt_tot, const GdnArgs& args) {
+                          const Tensor& qsl, int64_t n_seq, int64_t nt_tot, bool dev_meta,
+                          const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const int64_t t_tot = out.shape[0];
@@ -1198,17 +1224,26 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
         "gdn chunked len alloc");
   Check(cudaMallocAsync(&d_boh, static_cast<size_t>(n_seq) * sizeof(int32_t), s),
         "gdn chunked boh alloc");
-  Check(cudaMemcpyAsync(d_tok0, tok0h.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
-                        cudaMemcpyHostToDevice, s),
-        "gdn chunked tok0 upload");
-  Check(cudaMemcpyAsync(d_len, lenh.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
-                        cudaMemcpyHostToDevice, s),
-        "gdn chunked len upload");
-  Check(cudaMemcpyAsync(d_boh, bohh.data(), static_cast<size_t>(n_seq) * sizeof(int32_t),
-                        cudaMemcpyHostToDevice, s),
-        "gdn chunked boh upload");
-  // The host index vectors must outlive the async uploads; the caller syncs the
-  // stream before they go out of scope.
+  if (dev_meta) {
+    // Device-resident metadata: fill d_tok0/d_len/d_boh on the device from the
+    // device qsl (no host-vector H2D, no launch sync — the caller does not sync).
+    // tok0h/lenh/bohh are empty here; nt_tot was precomputed on the host from the
+    // same qsl values, so grid_chunk.x + the hstate size match bit-for-bit.
+    GdnBuildChunkMeta<<<1, 1, 0, s>>>(d_tok0, d_len, d_boh, qsl.Ptr<int32_t>(), n_seq);
+    Check(cudaGetLastError(), "gdn chunked build-meta launch");
+  } else {
+    Check(cudaMemcpyAsync(d_tok0, tok0h.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
+                          cudaMemcpyHostToDevice, s),
+          "gdn chunked tok0 upload");
+    Check(cudaMemcpyAsync(d_len, lenh.data(), static_cast<size_t>(nt_tot) * sizeof(int32_t),
+                          cudaMemcpyHostToDevice, s),
+          "gdn chunked len upload");
+    Check(cudaMemcpyAsync(d_boh, bohh.data(), static_cast<size_t>(n_seq) * sizeof(int32_t),
+                          cudaMemcpyHostToDevice, s),
+          "gdn chunked boh upload");
+    // The host index vectors must outlive the async uploads; the caller syncs the
+    // stream before they go out of scope.
+  }
 
   const dim3 grid_chunk(static_cast<unsigned>(nt_tot), static_cast<unsigned>(hv_n));
   const dim3 grid_seq(static_cast<unsigned>(n_seq), static_cast<unsigned>(hv_n));
@@ -1301,27 +1336,43 @@ void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tens
            "cuda gdn_prefill(chunked): Hv must be a multiple of Hk");
   cudaStream_t s = AsStream(q);
 
-  // Host chunk layout from query_start_loc (small D2H copy + sync — negligible
-  // vs a whole prefill; the sequential path avoids it, this path needs the
-  // per-sequence chunk counts to size scratch and grids).
+  // Chunk layout from query_start_loc. FAST PATH (dev_meta): the caller handed us
+  // the host-resident qsl (args.query_start_loc_host) — the SAME values already
+  // materialized on the host by the GDN attention-metadata build — so we read
+  // them directly (no D2H copy, no cudaStreamSynchronize) and let a device kernel
+  // fill the per-chunk arrays. This kills the per-GDN-layer host↔GPU lockstep that
+  // left the prefill ~67% GPU-idle. FALLBACK (host qsl null: op tests / callers
+  // without it): the original D2H copy + sync to read qsl on the host.
+  const bool dev_meta = args.query_start_loc_host != nullptr;
   std::vector<int32_t> qslh(static_cast<size_t>(n_seq) + 1);
-  Check(cudaMemcpyAsync(qslh.data(), qsl.Ptr<int32_t>(),
-                        (static_cast<size_t>(n_seq) + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost,
-                        s),
-        "gdn chunked qsl download");
-  Check(cudaStreamSynchronize(s), "gdn chunked qsl sync");
+  if (dev_meta) {
+    for (int64_t i = 0; i <= n_seq; ++i) qslh[static_cast<size_t>(i)] = args.query_start_loc_host[i];
+  } else {
+    Check(cudaMemcpyAsync(qslh.data(), qsl.Ptr<int32_t>(),
+                          (static_cast<size_t>(n_seq) + 1) * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost, s),
+          "gdn chunked qsl download");
+    Check(cudaStreamSynchronize(s), "gdn chunked qsl sync");
+  }
 
-  std::vector<int32_t> tok0h, lenh, bohh(static_cast<size_t>(n_seq));
+  // nt_tot (total chunks) is always computed on the host — it sizes the grids and
+  // the hstate scratch. In dev_meta mode the GdnBuildChunkMeta device kernel
+  // recomputes the identical layout from the same qsl values, so nt_tot matches
+  // bit-for-bit; the host tok0h/lenh/bohh vectors are then left empty (unused).
+  std::vector<int32_t> tok0h, lenh, bohh;
   int32_t nt_tot = 0;
   for (int64_t n = 0; n < n_seq; ++n) {
-    bohh[static_cast<size_t>(n)] = nt_tot;
     const int32_t begin = qslh[static_cast<size_t>(n)];
     const int32_t len = qslh[static_cast<size_t>(n) + 1] - begin;
     const int32_t nt = (len + kChunk - 1) / kChunk;
-    for (int32_t it = 0; it < nt; ++it) {
-      const int32_t rem = len - it * kChunk;
-      tok0h.push_back(begin + it * kChunk);
-      lenh.push_back(rem < kChunk ? rem : kChunk);
+    if (!dev_meta) {
+      if (bohh.empty()) bohh.resize(static_cast<size_t>(n_seq));
+      bohh[static_cast<size_t>(n)] = nt_tot;
+      for (int32_t it = 0; it < nt; ++it) {
+        const int32_t rem = len - it * kChunk;
+        tok0h.push_back(begin + it * kChunk);
+        lenh.push_back(rem < kChunk ? rem : kChunk);
+      }
     }
     nt_tot += nt;
   }
@@ -1330,20 +1381,23 @@ void GdnPrefillChunkedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tens
   if (q_in.dtype == DType::kF32) {
     if (out.dtype == DType::kF32)
       LaunchChunkedPrefill<float, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh, bohh,
-                                         qsl, n_seq, nt_tot, args);
+                                         qsl, n_seq, nt_tot, dev_meta, args);
     else
       LaunchChunkedPrefill<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
-                                                 bohh, qsl, n_seq, nt_tot, args);
+                                                 bohh, qsl, n_seq, nt_tot, dev_meta, args);
   } else {
     if (out.dtype == DType::kF32)
       LaunchChunkedPrefill<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, tok0h, lenh,
-                                                 bohh, qsl, n_seq, nt_tot, args);
+                                                 bohh, qsl, n_seq, nt_tot, dev_meta, args);
     else
       LaunchChunkedPrefill<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, tok0h,
-                                                         lenh, bohh, qsl, n_seq, nt_tot, args);
+                                                         lenh, bohh, qsl, n_seq, nt_tot, dev_meta,
+                                                         args);
   }
-  // Keep the host index vectors alive until every async upload has completed.
-  Check(cudaStreamSynchronize(s), "gdn chunked launch sync");
+  // FALLBACK only: keep the host index vectors alive until the async uploads
+  // finish. dev_meta builds the arrays on-device (no host vectors) so it does NOT
+  // sync here — the whole point (host runs ahead, GPU stays fed across layers).
+  if (!dev_meta) Check(cudaStreamSynchronize(s), "gdn chunked launch sync");
 }
 
 void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,

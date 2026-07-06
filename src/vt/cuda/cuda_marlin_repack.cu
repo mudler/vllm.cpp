@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -257,15 +258,36 @@ int MarlinDeviceSms(int device) {
   return sms;
 }
 
+// M-adaptive block_size_m: default ON, mirrors vLLM exactly. VT_MARLIN_MBLOCKS1=0
+// restores the pre-parity behavior (unconditional clamp to >=16) for A/B.
+bool MarlinAdaptiveMblocks() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MARLIN_MBLOCKS1");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 int MarlinMoeAlignBlockSizeSelect(int num_tokens, int top_k, int num_experts) {
-  // vLLM marlin_moe.py block_size_m selection (bf16 path), clamped to >=16 to
-  // stay off the m_block_size_8 special kernel.
+  // Mirror of vLLM marlin_moe.py:317-322 (pin e24d1b24):
+  //   for block_size_m in [8, 16, 32, 48, 64]:
+  //     if M * topk / E / block_size_m < 0.9: break
+  //   if input_dtype is not None and input_dtype.itemsize == 1:  # 8-bit act only
+  //     block_size_m = max(block_size_m, 16)
+  // For the NVFP4 W4A16 bf16-activation path, input_dtype = get_marlin_input_dtype()
+  // = None (VLLM_MARLIN_INPUT_DTYPE unset by default), so the >=16 clamp does NOT
+  // apply — decode legitimately selects block_size_m=8, routing to the
+  // m_block_size_8=true kernel (<128,1,8,4>/<256,1,8,8>) which halves M-tile padding
+  // vs a block_size_m=16 tile (thread_m_blocks=1 either way). The kernel + c_tmp*2
+  // (cuda_moe_marlin.cu, ops.cu:714) already support block==8.
   int bs = 8;
   for (int cand : {8, 16, 32, 48, 64}) {
     bs = cand;
     if (static_cast<double>(num_tokens) * top_k / num_experts / cand < 0.9) break;
   }
-  return bs < 16 ? 16 : bs;
+  // Fallback path: the old unconditional clamp (stays off the m_block_size_8 kernel).
+  if (!MarlinAdaptiveMblocks()) return bs < 16 ? 16 : bs;
+  return bs;
 }
 
 void MarlinMoeAlignSizes(int num_tokens, int top_k, int num_experts, int block_size,

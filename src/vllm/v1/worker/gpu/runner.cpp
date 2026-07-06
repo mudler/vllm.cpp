@@ -17,6 +17,7 @@
 #include <unordered_set>
 
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
+#include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
 
@@ -30,6 +31,24 @@ namespace vllm::v1 {
 static bool LogitsGatherEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_LOGITS_GATHER");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// GPU-sampling A/B toggle (perf). Default ON: the forward keeps the [num_reqs,
+// vocab] logits ON DEVICE and the sampler (argmax / temperature / top-k/top-p —
+// all device kernels, mirroring vllm/v1/sample/sampler.py which never copies the
+// full logits to host) reads them directly; only the sampled token ids (~num_reqs
+// * 4 bytes) cross to host. VT_GPU_SAMPLE=0 restores the OLD path: Download the
+// full [num_reqs, vocab] logits to host, then sample from the host copy — for the
+// A/B on the same binary. Token-for-token identical (same on-device sampler
+// kernels either way; only the logits' residence differs). Requires the
+// gather-before-lm_head path (default); with VT_LOGITS_GATHER=0 the forward
+// already returns host logits, so this toggle is a no-op there.
+static bool GpuSampleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GPU_SAMPLE");
     return e == nullptr || e[0] != '0';
   }();
   return on;
@@ -490,28 +509,53 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
+  const bool gather = LogitsGatherEnabled();
   const std::vector<int32_t> kNoGather;
-  const std::vector<int32_t>& gather_li =
-      LogitsGatherEnabled() ? step.logits_indices : kNoGather;
-  std::vector<float> logits;
+  const std::vector<int32_t>& gather_li = gather ? step.logits_indices : kNoGather;
+
+  // Wrap a full [T,vocab] HOST logits vector (the VT_LOGITS_GATHER=0 opt-out) as a
+  // ForwardLogits::host — sample_tokens re-gathers the per-request rows on host.
+  auto host_logits = [&](std::vector<float>&& h) {
+    ForwardLogits fl;
+    fl.vocab = config_.vocab_size;
+    fl.rows = fl.vocab > 0 ? static_cast<int64_t>(h.size()) / fl.vocab : 0;
+    fl.host = std::move(h);
+    return fl;
+  };
+
+  // THE FORWARD. DEFAULT (gather ON): the *Device entry points keep the
+  // [num_reqs,vocab] logits ON DEVICE and hand them to the sampler with no
+  // full-logits D2H. VT_LOGITS_GATHER=0: the host Forward returns full
+  // [T,vocab] logits and sample_tokens re-gathers on host (unchanged path).
+  ForwardLogits logits;
   if (dense_weights_ != nullptr) {
     // DENSE arch (27B): the eager paged dense forward. Same paged KV/GDN-state
     // machinery, dense SwiGLU MLP in place of the MoE block. The MoE-only fp4
     // decode-graph fast path does not apply here.
-    logits = Qwen3_5DenseModel::Forward(token_ids, positions, attn_meta, gdn_meta,
-                                        attn_kv_, gdn_state_, *dense_weights_,
-                                        config_, queue_, gather_li);
+    logits = gather
+                 ? Qwen3_5DenseModel::ForwardDevice(
+                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                       gdn_state_, *dense_weights_, config_, queue_, gather_li)
+                 : host_logits(Qwen3_5DenseModel::Forward(
+                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                       gdn_state_, *dense_weights_, config_, queue_, gather_li));
   } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
     if (!decode_graph_) {
       decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(
           *moe_weights_, config_, queue_, gdn_state_slots_);
     }
+    // Decode graph output is device-resident [num_reqs,vocab] (one row/request in
+    // request order); the gather toggle is a no-op for pure decode (T==num_reqs).
     logits = decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
                                  attn_kv_, gdn_state_);
   } else {
-    logits =
-        Qwen3_5Model::Forward(token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                              gdn_state_, *moe_weights_, config_, queue_, gather_li);
+    logits = gather
+                 ? Qwen3_5Model::ForwardDevice(
+                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                       gdn_state_, *moe_weights_, config_, queue_, gather_li)
+                 : host_logits(Qwen3_5Model::Forward(
+                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                       gdn_state_, *moe_weights_, config_, queue_, gather_li));
   }
 
   // Stash for sample_tokens (upstream ExecuteModelState).
@@ -539,32 +583,50 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 
   const int64_t vocab = config_.vocab_size;
 
-  // Gather the logits_indices rows into per-request order (upstream
-  // hidden_states[input_batch.logits_indices] -> compute_logits; our Forward
-  // already applied lm_head, so we gather the logit rows directly).
+  // Assemble the [num_reqs, vocab] logits the sampler runs on. Three cases:
   //
-  // When the forward returns exactly num_reqs rows the rows are ALREADY in
-  // request order — either the gather-before-lm_head path (prefill/mixed) or a
-  // pure-decode / decode-graph step (one row per request, logits_indices is the
-  // identity). Use them directly; no host re-gather / no full-logits copy.
-  // Otherwise (full [num_actual_tokens,vocab], VT_LOGITS_GATHER=0) re-gather on
-  // host via logits_indices, exactly as before.
-  const int64_t n_rows =
-      vocab > 0 ? static_cast<int64_t>(exec_state_.logits.size()) / vocab : 0;
-  std::vector<float> sampled_logits;  // outlives the sampler when used
+  //  (A) DEVICE path (default, gather ON): the forward already produced exactly
+  //      num_reqs rows in request order, ON DEVICE — hand the sampler the device
+  //      tensor directly (its argmax / temperature / top-k/top-p kernels run
+  //      on-device; only the sampled token ids come back). No full-logits D2H.
+  //  (A') VT_GPU_SAMPLE=0 A/B: Download the device [num_reqs,vocab] logits to a
+  //      host buffer and sample from it (the OLD download-then-sample path).
+  //  (B) HOST path (VT_LOGITS_GATHER=0): full [num_actual_tokens,vocab] host
+  //      logits — re-gather the per-request rows on host via logits_indices,
+  //      exactly as before.
+  std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits;
-  if (n_rows == num_reqs) {
+  ForwardLogits& fl = exec_state_.logits;
+  if (fl.on_device()) {
+    VT_CHECK(fl.rows == num_reqs,
+             "sample_tokens: device logits rows must equal num_reqs");
+    if (GpuSampleEnabled()) {
+      logits = fl.device_tensor;  // (A) sample straight off device
+    } else {
+      // (A') download then sample (A/B: reproduce the pre-change host path).
+      sampled_logits.resize(static_cast<size_t>(num_reqs) *
+                            static_cast<size_t>(vocab));
+      vt::Backend& b = vt::GetBackend(queue_.device.type);
+      b.Copy(queue_, sampled_logits.data(), fl.device_tensor.data,
+             sampled_logits.size() * sizeof(float));
+      b.Synchronize(queue_);
+      logits = vt::Tensor::Contiguous(
+          sampled_logits.data(), vt::DType::kF32, queue_.device,
+          {static_cast<int64_t>(num_reqs), vocab});
+    }
+  } else if (fl.rows == num_reqs) {
     logits = vt::Tensor::Contiguous(
-        exec_state_.logits.data(), vt::DType::kF32, queue_.device,
+        fl.host.data(), vt::DType::kF32, queue_.device,
         {static_cast<int64_t>(num_reqs), vocab});
   } else {
+    // (B) VT_LOGITS_GATHER=0: re-gather num_reqs rows from full [T,vocab] host.
     sampled_logits.resize(static_cast<size_t>(num_reqs) *
                           static_cast<size_t>(vocab));
     for (int i = 0; i < num_reqs; ++i) {
       const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
       std::memcpy(
           sampled_logits.data() + static_cast<size_t>(i) * static_cast<size_t>(vocab),
-          exec_state_.logits.data() +
+          fl.host.data() +
               static_cast<size_t>(row) * static_cast<size_t>(vocab),
           static_cast<size_t>(vocab) * sizeof(float));
     }

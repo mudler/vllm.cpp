@@ -40,13 +40,15 @@ namespace vllm {
 // (num_blocks, 2, block_size, num_kv_heads, head_size) referenced by base ptr +
 // dims. Rank 5 exceeds vt::kMaxRank (4), so the buffer is carried raw and the
 // Forward builds the two unbind(1) rank-4 strided K/V views (block stride
-// 2*bs*H*D; see .agents backend.h + cpu_cache.cpp). dtype MUST match the f32
-// q/k/v the T0 full-attn path produces (the "auto" ReshapeAndCache copy requires
-// cache dtype == k/v dtype). The runner (M1.8 Task 4) owns/allocates it; the
-// Forward writes into it in place.
+// 2*bs*H*D; see .agents backend.h + cpu_cache.cpp). dtype is bf16 — the full-attn
+// path down-casts its f32 K/V to bf16 before the write (the "auto" ReshapeAndCache
+// copy requires cache dtype == k/v dtype); this mirrors vLLM's bf16 flash_attn KV
+// store and halves KV memory. The query stays f32; the attention kernel converts
+// the bf16 cache reads to f32 and accumulates in f32. The runner (M1.8 Task 4)
+// owns/allocates it; the Forward writes into it in place.
 struct PagedKvCache {
   void* data = nullptr;
-  vt::DType dtype = vt::DType::kF32;
+  vt::DType dtype = vt::DType::kBF16;
   int64_t num_blocks = 0;
   int64_t block_size = 0;
   int64_t num_kv_heads = 0;

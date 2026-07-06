@@ -311,8 +311,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       conv_buf_.emplace_back(
           static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)), 0.0f);
     } else {
+      // bf16 KV cache: uint16_t words, 0 == bf16 0.0. Halves KV memory vs f32.
       full_attn_buf_.emplace_back(
-          static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh), 0.0f);
+          static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh),
+          static_cast<uint16_t>(0));
     }
   }
 
@@ -321,7 +323,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   for (auto& b : full_attn_buf_) {
     PagedKvCache kv;
     kv.data = b.data();
-    kv.dtype = vt::DType::kF32;
+    kv.dtype = vt::DType::kBF16;
     kv.num_blocks = num_blocks_;
     kv.block_size = fa_block_size;
     kv.num_kv_heads = Hkv;

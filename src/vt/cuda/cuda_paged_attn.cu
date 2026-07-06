@@ -66,9 +66,9 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __fl
 // position p, and streams keys 0..p (causal) from the paged cache with a
 // block-cooperative online (flash) softmax. Fully device-side / graph-safe.
 // ===========================================================================
-template <typename Tin, typename Tout>
-__global__ void PagedAttentionKernel(Tout* out, const Tin* query, const Tin* k_cache,
-                                     const Tin* v_cache, const int32_t* block_table,
+template <typename TQ, typename TKV, typename Tout>
+__global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_cache,
+                                     const TKV* v_cache, const int32_t* block_table,
                                      const int32_t* seq_lens, const int32_t* query_start_loc,
                                      int64_t num_reqs, int64_t hq, int64_t num_kv_heads, int64_t d,
                                      int64_t block_size, int64_t bt_row, int64_t bt_col,
@@ -152,9 +152,9 @@ __global__ void PagedAttentionKernel(Tout* out, const Tin* query, const Tin* k_c
 // reused across the rows → bandwidth amortization). Per key: warp-shuffle dot,
 // online-softmax rescale of the register accumulator. No per-key block sync.
 // ===========================================================================
-template <typename Tin, typename Tout>
-__global__ void PagedFlashKernel(Tout* out, const Tin* query, const Tin* k_cache,
-                                 const Tin* v_cache, const int32_t* block_table,
+template <typename TQ, typename TKV, typename Tout>
+__global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
+                                 const TKV* v_cache, const int32_t* block_table,
                                  const int32_t* seq_lens, const int32_t* query_start_loc,
                                  const int2* tiles, int num_tiles, int hq, int num_kv_heads, int d,
                                  int block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk,
@@ -269,7 +269,7 @@ __global__ void PagedFlashKernel(Tout* out, const Tin* query, const Tin* k_cache
 
 // --- Launchers -------------------------------------------------------------
 
-template <typename Tin, typename Tout>
+template <typename TQ, typename TKV, typename Tout>
 void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                   const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                   const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t num_tokens,
@@ -277,8 +277,8 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
                   int64_t block_size) {
   const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
   const size_t shmem = (static_cast<size_t>(d) + kPagedBlock) * sizeof(float);
-  PagedAttentionKernel<Tin, Tout><<<grid, kPagedBlock, shmem, s>>>(
-      out.Ptr<Tout>(), query.Ptr<Tin>(), k_cache.Ptr<Tin>(), v_cache.Ptr<Tin>(),
+  PagedAttentionKernel<TQ, TKV, Tout><<<grid, kPagedBlock, shmem, s>>>(
+      out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
       block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), num_reqs,
       hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
       k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1],
@@ -286,7 +286,7 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
   Check(cudaGetLastError(), "paged_attention decode launch");
 }
 
-template <typename Tin, typename Tout>
+template <typename TQ, typename TKV, typename Tout>
 void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                         const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                         const Tensor& query_start_loc, const PagedAttentionArgs& args, int64_t hq,
@@ -316,7 +316,7 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
 
   const int bn = kBN;
   const size_t shmem = static_cast<size_t>(2) * bn * d * sizeof(float);
-  auto* kernel = PagedFlashKernel<Tin, Tout>;
+  auto* kernel = PagedFlashKernel<TQ, TKV, Tout>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -326,7 +326,7 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(hq));
   const dim3 block(32, kBM);
   kernel<<<grid, block, shmem, s>>>(
-      out.Ptr<Tout>(), query.Ptr<Tin>(), k_cache.Ptr<Tin>(), v_cache.Ptr<Tin>(),
+      out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
       block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), d_tiles,
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
@@ -346,7 +346,10 @@ bool PrefillFlashEnabled() {
   return enabled;
 }
 
-template <typename Tin>
+// TQ = query dtype, TKV = KV-cache dtype (decoupled: Phase-1 bf16 KV cache keeps
+// an f32 query with a bf16 cache — attention still accumulates in f32, the cache
+// reads convert bf16→f32 via Load()). Tout is dispatched here from out.dtype.
+template <typename TQ, typename TKV>
 void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                  const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                  const Tensor& query_start_loc, const PagedAttentionArgs& args) {
@@ -362,27 +365,47 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   switch (out.dtype) {
     case DType::kF32:
       if (prefill) {
-        LaunchPrefillFlash<Tin, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
-                                       query_start_loc, args, hq, d, num_reqs, num_kv_heads,
-                                       block_size);
+        LaunchPrefillFlash<TQ, TKV, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                           query_start_loc, args, hq, d, num_reqs, num_kv_heads,
+                                           block_size);
       } else {
-        LaunchDecode<Tin, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
-                                 query_start_loc, args, num_tokens, hq, d, num_reqs, num_kv_heads,
-                                 block_size);
+        LaunchDecode<TQ, TKV, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                     query_start_loc, args, num_tokens, hq, d, num_reqs,
+                                     num_kv_heads, block_size);
       }
       break;
     case DType::kBF16:
       if (prefill) {
-        LaunchPrefillFlash<Tin, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table,
-                                               seq_lens, query_start_loc, args, hq, d, num_reqs,
-                                               num_kv_heads, block_size);
+        LaunchPrefillFlash<TQ, TKV, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table,
+                                                   seq_lens, query_start_loc, args, hq, d, num_reqs,
+                                                   num_kv_heads, block_size);
       } else {
-        LaunchDecode<Tin, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table, seq_lens,
-                                         query_start_loc, args, num_tokens, hq, d, num_reqs,
-                                         num_kv_heads, block_size);
+        LaunchDecode<TQ, TKV, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                             query_start_loc, args, num_tokens, hq, d, num_reqs,
+                                             num_kv_heads, block_size);
       }
       break;
     default: VT_CHECK(false, "cuda paged_attention: unsupported out dtype");
+  }
+}
+
+// Dispatch on (query dtype, KV-cache dtype). Both f32 and bf16 caches are valid
+// (Phase-1 bf16 KV cache mirrors vLLM's bf16 flash_attn KV store); the query may
+// independently be f32 (Phase 1) or bf16.
+template <typename TQ>
+void LaunchPagedByKv(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
+                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {
+  switch (k_cache.dtype) {
+    case DType::kF32:
+      LaunchPaged<TQ, float>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                             query_start_loc, args);
+      break;
+    case DType::kBF16:
+      LaunchPaged<TQ, __nv_bfloat16>(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                     query_start_loc, args);
+      break;
+    default: VT_CHECK(false, "cuda paged_attention: unsupported KV-cache dtype (f32/bf16 only)");
   }
 }
 
@@ -392,12 +415,12 @@ void PagedAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const 
                               const PagedAttentionArgs& args) {
   switch (query.dtype) {
     case DType::kF32:
-      LaunchPaged<float>(AsStream(q), out, query, k_cache, v_cache, block_table, seq_lens,
-                         query_start_loc, args);
+      LaunchPagedByKv<float>(AsStream(q), out, query, k_cache, v_cache, block_table, seq_lens,
+                             query_start_loc, args);
       break;
     case DType::kBF16:
-      LaunchPaged<__nv_bfloat16>(AsStream(q), out, query, k_cache, v_cache, block_table, seq_lens,
-                                 query_start_loc, args);
+      LaunchPagedByKv<__nv_bfloat16>(AsStream(q), out, query, k_cache, v_cache, block_table,
+                                     seq_lens, query_start_loc, args);
       break;
     default: VT_CHECK(false, "cuda paged_attention: unsupported input dtype (f32/bf16 only)");
   }

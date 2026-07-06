@@ -1266,7 +1266,8 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
 template <typename TD>
 __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, const float* beta,
                                      const float* gcum, const int32_t* tok0a, const int32_t* lena,
-                                     int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv) {
+                                     int64_t hk_n, int64_t dk, int64_t hv_n, int64_t dv,
+                                     int fuse_solve) {
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -1319,29 +1320,71 @@ __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, con
   }
   __syncthreads();
 
-  // u column vi: u_i = beta_i (v_i − sum_{j<i} A[i,j] u_j)  (f32 forward solve)
-  for (int64_t vi = tid; vi < dv; vi += blockDim.x) {
-    float ucol[kChunk];
-    for (int64_t i = 0; i < len; ++i) {
-      float sfs = 0.0f;
-      for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * ucol[j];
-      const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
-      ucol[i] = bs[i] * (vi_val - sfs);
+  // Two WY forward substitutions, each a strict-lower solve with a serial i→i
+  // dependency chain (solve_tril.py:84 loop, mirrored below):
+  //   u column vi: u_i = beta_i (v_i − Σ_{j<i} A[i,j] u_j)
+  //   w column ki: w_i = beta_i (exp(G_i) k_i − Σ_{j<i} A[i,j] w_j)
+  // FUSED (default): both passes share ONE loop over dv+dk columns so the u
+  // solve (threads [0,dv)) and w solve (threads [dv,dv+dk)) run concurrently.
+  // The legacy form ran them back to back on the SAME dv threads while the
+  // remaining dv..blockDim threads sat idle — the two ~O(len²) serial chains
+  // executed in series and only ~dv of the 256 threads ever worked. Fusing
+  // them into one pass overlaps the chains (warp-uniform branch: warps 0-3
+  // solve u, warps 4-7 solve w) and puts all 256 threads to work, roughly
+  // halving the block's serial-solve latency — the WU kernel's dominant
+  // non-matmul cost. Identical math to the sequential form.
+  // A/B: VT_GDN_CHUNK_FUSE=0 restores the two back-to-back passes.
+  if (fuse_solve) {
+    for (int64_t c = tid; c < dv + dk; c += blockDim.x) {
+      if (c < dv) {
+        const int64_t vi = c;
+        float ucol[kChunk];
+        for (int64_t i = 0; i < len; ++i) {
+          float sfs = 0.0f;
+          for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * ucol[j];
+          const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
+          ucol[i] = bs[i] * (vi_val - sfs);
+        }
+        for (int64_t i = 0; i < len; ++i)
+          Store(u, (tok0 + i) * hv_n * dv + hv * dv + vi, ucol[i]);
+      } else {
+        const int64_t ki = c - dv;
+        float wcol[kChunk];
+        for (int64_t i = 0; i < len; ++i) {
+          float sfs = 0.0f;
+          for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * wcol[j];
+          const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
+          wcol[i] = bs[i] * (eg[i] * ki_val - sfs);
+        }
+        for (int64_t i = 0; i < len; ++i)
+          Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
+      }
     }
-    for (int64_t i = 0; i < len; ++i)
-      Store(u, (tok0 + i) * hv_n * dv + hv * dv + vi, ucol[i]);
-  }
-  // w column ki: w_i = beta_i (exp(G_i) k_i − sum_{j<i} A[i,j] w_j)
-  for (int64_t ki = tid; ki < dk; ki += blockDim.x) {
-    float wcol[kChunk];
-    for (int64_t i = 0; i < len; ++i) {
-      float sfs = 0.0f;
-      for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * wcol[j];
-      const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
-      wcol[i] = bs[i] * (eg[i] * ki_val - sfs);
+  } else {
+    // u column vi: u_i = beta_i (v_i − sum_{j<i} A[i,j] u_j)  (f32 forward solve)
+    for (int64_t vi = tid; vi < dv; vi += blockDim.x) {
+      float ucol[kChunk];
+      for (int64_t i = 0; i < len; ++i) {
+        float sfs = 0.0f;
+        for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * ucol[j];
+        const float vi_val = Load(v, (tok0 + i) * hv_n * dv + hv * dv + vi);
+        ucol[i] = bs[i] * (vi_val - sfs);
+      }
+      for (int64_t i = 0; i < len; ++i)
+        Store(u, (tok0 + i) * hv_n * dv + hv * dv + vi, ucol[i]);
     }
-    for (int64_t i = 0; i < len; ++i)
-      Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
+    // w column ki: w_i = beta_i (exp(G_i) k_i − sum_{j<i} A[i,j] w_j)
+    for (int64_t ki = tid; ki < dk; ki += blockDim.x) {
+      float wcol[kChunk];
+      for (int64_t i = 0; i < len; ++i) {
+        float sfs = 0.0f;
+        for (int64_t j = 0; j < i; ++j) sfs += kk[i * kChunk + j] * wcol[j];
+        const float ki_val = Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki);
+        wcol[i] = bs[i] * (eg[i] * ki_val - sfs);
+      }
+      for (int64_t i = 0; i < len; ++i)
+        Store(w, (tok0 + i) * hv_n * dk + hv * dk + ki, wcol[i]);
+    }
   }
 }
 
@@ -1458,6 +1501,11 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // (also the f32-corner fallback and the unit-test scalar reference path).
   const char* wu_env = std::getenv("VT_GDN_WU_WMMA");
   const bool wu_wmma = wmma && (wu_env == nullptr || wu_env[0] != '0');
+  // Fuse the u and w WY forward-substitution solves into one concurrent pass
+  // (default ON). VT_GDN_CHUNK_FUSE=0 restores the legacy back-to-back solves
+  // for the parent's A/B measurement.
+  const char* fuse_env = std::getenv("VT_GDN_CHUNK_FUSE");
+  const int fuse_solve = (fuse_env == nullptr || fuse_env[0] != '0') ? 1 : 0;
   if (wu_wmma) {
     const size_t wu_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TSc) +
                             static_cast<size_t>(kChunk * kChunk) * sizeof(float);
@@ -1471,7 +1519,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
           "gdn chunked wu(wmma) shared opt-in");
     GdnChunkWUWmmaKernel<TSc><<<grid_chunk, 256, wu_bytes, s>>>(
         u, w, k.Ptr<Tin>(), v.Ptr<Tin>(), beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n, dk, hv_n,
-        dv);
+        dv, fuse_solve);
     Check(cudaGetLastError(), "gdn chunked wu(wmma) launch");
   } else {
     GdnChunkWUKernel<Tin, TSc><<<grid_chunk, 128, 0, s>>>(u, w, k.Ptr<Tin>(), v.Ptr<Tin>(),

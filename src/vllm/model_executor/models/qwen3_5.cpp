@@ -577,20 +577,38 @@ bool TrueW4A4Enabled() {
 }
 
 #ifdef VT_CUTLASS_NVFP4
-// cutlass sm120a fp4xfp4 GEMM path toggle (opt-in; VT_NVFP4_CUTLASS=1). Routes the
-// 27B true-W4A4 projections through vt::MatmulNvfp4Cutlass (the lifted vLLM
-// near-peak kernel) instead of our emulation-grade MatmulNvfp4Fp4. Mirrors vLLM's
-// actual kernel (notes §7.1). NOTE (measured 2026-07-05): swapping ONLY the GEMM
-// to real cutlass does NOT recover vLLM's native token stream (198) — the 27B
-// still yields the emulation stream (271); tok6 is a near-tie tipped by the
-// aggregate of the non-fp4 forward numerics, not the fp4 GEMM. So this toggle is
-// a THROUGHPUT lever (near-peak prefill), correctness-neutral (still reproduces
-// vLLM's own emulation stream token-for-token). Only meaningful when the cutlass
-// TU was compiled (VT_CUTLASS_NVFP4).
+// cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
+// VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
+// flipped on: absence of the env selects cutlass; VT_NVFP4_CUTLASS=0 is the
+// opt-out to the emulation-grade path). Routes the 27B true-W4A4 projections
+// through vt::MatmulNvfp4Cutlass (the lifted vLLM near-peak kernel) instead of
+// our emulation-grade MatmulNvfp4Fp4. Mirrors vLLM, which auto-selects the
+// cutlass/flashinfer sm120a fp4×fp4 kernel for CT-W4A4
+// (compressed_tensors_w4a4_nvfp4.py; notes §7.1). MEASURED same-binary A/B
+// 37.21→124.33 tok/s (3.34×), gap vs vLLM 11.2×→3.19× (parity-ledger row 66).
+//
+// 27B-ONLY BY CONSTRUCTION: NvfpCutlassEnabled() is reached ONLY from
+// MatmulNvfp4Fp4D, itself guarded by `w.IsTrueW4A4()` (alpha>0 — the 27B W4A4
+// alone). The 35B is W4A16 (alpha==0, IsTrueW4A4()==false) and never enters this
+// path; its dense/MoE NVFP4 run the Marlin W4A16 branch. So this default-flip
+// cannot affect the 35B.
+//
+// THROUGHPUT lever, near-emulation correctness. Swapping the GEMM to real cutlass
+// does NOT recover vLLM's native flashinfer stream (198) — the 27B still yields
+// tok6=271; tok6 is a razor near-tie tipped by the aggregate non-fp4 forward
+// numerics, not the fp4 GEMM (measured 2026-07-05). MEASURED 2026-07-06: cutlass
+// is ~0.19% off the emulation-grade MatmulNvfp4Fp4 (test_ops_nvfp4_fp4, NOT
+// bit-exact), so on the near-tie-dense 27B greedy gate it reproduces emulation on
+// the semantic tokens (0-7) then DETERMINISTICALLY flips a later whitespace
+// near-tie at tok8 (271 "\n\n" -> 198 "\n"). Output stays coherent; the token-exact
+// correctness gate therefore pins the emulation-grade reference (VT_NVFP4_CUTLASS=0)
+// while this default carries the throughput win — see
+// tests/parity/test_qwen27_paged_engine.cpp. Only meaningful when the cutlass TU
+// was compiled (VT_CUTLASS_NVFP4).
 bool NvfpCutlassEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_NVFP4_CUTLASS");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }

@@ -54,7 +54,26 @@ compiled/JIT/Inductor code, DUMPING the generated kernel** — `TORCH_LOGS=outpu
 source for flashinfer. A fusion "absent from vLLM's csrc" may live in flashinfer
 (e.g. `add_rmsnorm_fp4quant` — the fused Add+RMSNorm+FP4-quant we initially and
 WRONGLY declared nonexistent). Verify the whole chain as necessary. This applies to
-every subagent and every design/parity check. Full method:
+every subagent and every design/parity check.
+
+**TRACE THE EXECUTION, not just the code — nsys BOTH vLLM and ours before any perf
+comparison.** Reading source finds the DISPATCH LOGIC + the AVAILABLE kernels; it does
+NOT tell you what ACTUALLY RAN, because vLLM's real kernels are resolved at RUNTIME and
+are invisible to the source: cuBLASLt/cutlass HEURISTICS pick the kernel per call
+(nvjet_sm121 vs cutlass_80), flashinfer AUTOTUNE picks the tactic, torch.compile
+CODEGENS kernels, backend selection is a capability probe, and runtime-linked deps the
+source never names run (we found vLLM executes **TensorRT-LLM** `delayStreamKernel` +
+`flash::flash_fwd_kernel` + runs the GDN as cutlass GEMMs — NONE of which our three
+code-only scans surfaced; they found buildable levers that measured NEUTRAL, while one
+`nsys` of vLLM revealed the actual structural differences). So for ANY throughput/parity
+work: `nsys profile` the vLLM oracle AND our engine on the SAME workload, diff the actual
+GPU-kernel lists (`nsys stats --report cuda_gpu_kern_sum`), and let THAT — what vLLM's
+stack really resolved to on this GPU — drive which kernels you then read in source and
+mirror. Code-comparison alone is necessary but NOT sufficient; the execution trace is
+the ground truth for "what vLLM is faster at". (Caveat: a graphed-vLLM nsys is
+warmup/JIT/capture-contaminated — the kernel NAMES are reliable, the %s need a
+steady-state/warmup-excluded capture.) This applies to every subagent and every parity
+check. Full method:
 [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § Verify the
 whole chain.
 

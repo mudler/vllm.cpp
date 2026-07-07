@@ -112,3 +112,35 @@ may you conclude a lever is genuinely irreducible for eager-C++ — and say exac
   many that are plain code/config/dtype/algorithm diffs — but prove it, don't assume
   it. The CLEAN nsys slice of OURS (above) tells you WHERE to look; the dep chain
   tells you WHAT vLLM actually runs there.
+
+## Trace the EXECUTION, not just the code (nsys BOTH sides FIRST)
+
+**Code-comparison finds buildable levers; execution-tracing finds what vLLM actually
+runs. They DIVERGE, and the trace wins.** (Proven 2026-07-07: three exhaustive
+code-only scans produced bf16/fusion levers that measured NEUTRAL, and concluded a
+"ceiling" — then ONE `nsys` of the vLLM oracle revealed vLLM runs `flash::flash_fwd_kernel`
+for attention, executes the GDN as **cutlass GEMMs** (no dedicated chunk kernel like our
+WMMA), links **TensorRT-LLM** kernels, and gets `nvjet_sm121` where we get the sm_80
+`cutlass_80` kernel — structural differences NONE of the code scans surfaced.)
+
+WHY they diverge: vLLM's real kernels are resolved at RUNTIME, invisible to source —
+cuBLASLt/cutlass heuristics, flashinfer autotune, torch.compile codegen, capability-probed
+backend selection, and runtime-linked deps (TRT-LLM) the source never names.
+
+THE METHOD — do this BEFORE and DURING any parity/throughput work:
+1. **nsys BOTH** the vLLM oracle (`~/venvs/vllm-oracle`, graphed = production) AND our
+   engine on the IDENTICAL workload: `nsys profile -t cuda -o OUT --stats=false <cmd>`
+   then `nsys stats --force-export=true --report cuda_gpu_kern_sum OUT.nsys-rep`.
+2. **Diff the actual GPU-kernel lists.** For each of OUR hot kernels, find what vLLM runs
+   for the same op (by kernel name + count + time). The DIFFERENCES (vLLM runs kernel X,
+   we run kernel Y; vLLM has N launches, we have 3N; vLLM's op is a fused Triton, ours is
+   3 kernels) are the parity gaps — concrete, not inferred.
+3. **THEN read source** for the divergent kernels — use the trace to know WHICH dep kernel
+   to open (flash_fwd traits, the cutlass GEMM config nvjet picks, the TRT-LLM kernel) and
+   mirror it. The trace tells you WHAT is faster; the source tells you HOW to port it.
+4. Caveat: a graphed-vLLM nsys is warmup/JIT/capture-contaminated — kernel NAMES are
+   reliable; for reliable %/time, capture STEADY-STATE (long run so warmup amortizes, or
+   an nsys capture-range that excludes warmup).
+
+Code-only comparison is necessary but NOT sufficient. If you have not nsys'd vLLM on the
+workload, you do not yet know where the gap is — you are guessing.

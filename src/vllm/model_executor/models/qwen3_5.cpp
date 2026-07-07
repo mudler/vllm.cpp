@@ -1434,10 +1434,13 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
-  // q_proj output bf16 (VT_BF16_GEMM_OUT rank-2): halves the large [T,2*Hq*Dh] qgate
-  // GEMM write + the AttnGateSplit read; the templated AttnGateSplit upcasts to f32
-  // qf/gatef, so qk-norm/RoPE/attention are unchanged. k/v stay f32 (k-norm weight is
-  // f32; V feeds vt::Attention/ReshapeAndCache which need f32 here).
+  // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
+  // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
+  // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
+  // Mirrors vLLM's bf16 model dtype (nvfp4 output_dtype = x.dtype = bf16). The
+  // templated AttnGateSplit upcasts qgate to f32 qf/gatef; k-norm takes a bf16
+  // k_norm weight (see dkw); V is consumed bf16 (cache/attention handle it below).
+  // fp8 (35B) + bf16-weight fallback stay f32.
   const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
                    ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
@@ -1446,14 +1449,16 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt)
             : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
-            : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
+                                          : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, DType::kF32)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt)
             : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
-            : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
+                                          : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head the projection lays out [q(Dh) | gate(Dh)] (§5) —
@@ -1467,7 +1472,11 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
   vt::RmsNorm(d.q, dqn.t(), Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
   DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+  // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
+  // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
+  // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32 dkn.
+  Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                              : ResidentWeightF32(d, w.k_norm, {Dh});
   vt::RmsNorm(d.q, dkn.t(), Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
 
   DBuf dpos(d, DType::kI32, {T}, positions.data());
@@ -1477,6 +1486,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
 
   // Causal GQA scaled-dot-product attention, scale = Dh^-0.5.
   Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
+  // vt::Attention requires q/k/v the same float dtype; qn3/kn3 are f32 after
+  // norm+rope, so upcast a bf16 V (VT_BF16_GEMM_OUT fp4 path) back to f32. This is
+  // the reference (non-paged) path — not perf-critical, so the small cast is fine.
+  std::optional<DBuf> v3f32;
+  if (v3.dtype == DType::kBF16) {
+    v3f32.emplace(d, DType::kF32, std::vector<int64_t>{T, Hkv, Dh});
+    vt::CastF32(d.q, v3f32->t(), v3);
+    v3 = v3f32->t();
+  }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
@@ -1530,10 +1548,13 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
-  // q_proj output bf16 (VT_BF16_GEMM_OUT rank-2): halves the large [T,2*Hq*Dh] qgate
-  // GEMM write + the AttnGateSplit read; the templated AttnGateSplit upcasts to f32
-  // qf/gatef, so qk-norm/RoPE/attention are unchanged. k/v stay f32 (k-norm weight is
-  // f32; V feeds vt::Attention/ReshapeAndCache which need f32 here).
+  // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
+  // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
+  // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
+  // Mirrors vLLM's bf16 model dtype (nvfp4 output_dtype = x.dtype = bf16). The
+  // templated AttnGateSplit upcasts qgate to f32 qf/gatef; k-norm takes a bf16
+  // k_norm weight (see dkw); V is consumed bf16 (cache/attention handle it below).
+  // fp8 (35B) + bf16-weight fallback stay f32.
   const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
                    ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
@@ -1542,14 +1563,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt)
             : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
-            : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
+            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
+                                          : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, DType::kF32)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt)
             : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
-            : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
+            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
+                                          : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
   // Gate split: per q-head [q(Dh) | gate(Dh)] (§5) — device op.
@@ -1562,7 +1585,11 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
   vt::RmsNorm(d.q, dqn.t(), Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
   DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+  // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
+  // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
+  // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32 dkn.
+  Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                              : ResidentWeightF32(d, w.k_norm, {Dh});
   vt::RmsNorm(d.q, dkn.t(), Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
 
   // positions/slot_mapping/block_table/seq_lens/query_start_loc are the PERSISTENT
@@ -1588,9 +1615,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
   if (kv.dtype == DType::kBF16) {
     vt::CastBf16(d.q, kbf.t(), kn3);
-    vt::CastBf16(d.q, vbf.t(), v3);
     kw = kbf.t();
-    vw = vbf.t();
+    // V may already be bf16 (VT_BF16_GEMM_OUT: the fp4 v_proj GEMM emits bf16
+    // directly, removing the cutlass CastBf16ToF32 + this CastBf16 round-trip);
+    // only down-cast when the GEMM produced f32 V.
+    if (v3.dtype == DType::kBF16) {
+      vw = v3;
+    } else {
+      vt::CastBf16(d.q, vbf.t(), v3);
+      vw = vbf.t();
+    }
   }
 
   // Write the new K/V into the paged cache, then read K/V from the cache.

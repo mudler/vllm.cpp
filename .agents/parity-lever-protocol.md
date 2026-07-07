@@ -144,3 +144,16 @@ THE METHOD — do this BEFORE and DURING any parity/throughput work:
 
 Code-only comparison is necessary but NOT sufficient. If you have not nsys'd vLLM on the
 workload, you do not yet know where the gap is — you are guessing.
+
+**Converge on vLLM's execution path — CLEAN UP superseded/dormant kernels.** When the
+trace shows we REINVENTED a kernel the code-reading hid (e.g. hand-WMMA GDN chunk vs
+vLLM's GDN-as-cutlass-GEMM; hand-WMMA attention vs vLLM's flash_fwd; the sm_80 in_proj vs
+nvjet), mirror vLLM's structure, make it the DEFAULT (A/B behind a toggle → flip default
+once it wins), then DELETE the reinvented CUDA kernel or explicitly DEMOTE it to a
+documented fallback. Do NOT leave two competing default CUDA paths — that fights the
+"structured so every upstream vLLM PR ports mechanically" premise and rots. This is
+`port-don't-reinvent` (discipline.md) enforced by the trace. KEEP genuine fallbacks (the
+CPU kernels, the non-cutlass emulation reference, other-backend paths per backends.md,
+correctness oracles) — gated + documented as fallbacks, never the default. (We reimplement
+the same algorithm/STRUCTURE vLLM runs — we cannot byte-copy Triton/CuTe-DSL into C++ — so
+"mirror the execution" = match what kernel/structure runs, then remove our alternative.)

@@ -22,11 +22,15 @@ jobs:
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
           fi
+          # Enforce on the FIRST-PARENT mainline (the commits the submitter
+          # directly lands on the target branch, incl. merge commits which are
+          # skipped below). Merged-in feature-branch commits are owned by the
+          # submitter via the merge and are not re-checked here.
           # New branch / unreachable base (all-zero SHA): only check the tip commit.
           if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             commits="$head"
           else
-            commits="$(git rev-list "${base}..${head}")"
+            commits="$(git rev-list --first-parent "${base}..${head}")"
           fi
           fail=0
           for c in $commits; do

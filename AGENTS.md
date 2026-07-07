@@ -53,6 +53,36 @@ re-base the bench config without re-running vLLM on it. This is non-negotiable
 and applies to subagents. Full rule: [.agents/gates.md](.agents/gates.md)
 § PROTOCOL DIRECTIVE.
 
+## STANDING DIRECTIVE — when stuck, SCAN vLLM vs ours (never accept a "ceiling")
+
+**Same architecture, same model, same GPU → if vLLM hits a number, we CAN too.**
+An apparent perf/parity "ceiling" is NEVER real — it means there are SPECIFIC
+implementation/config differences we haven't found yet. Do NOT conclude "diffuse
+per-op efficiency / hardware ceiling / hand-kernel exhausted" and stop. (Proven
+~4× in one session: every declared ceiling dissolved into a concrete lever once
+compared against vLLM — dense bf16→fp8 +6%, prefill-attn vectorized staging
++8.1%, GDN tensor-core WY-solve +4.5%, mnbt config +2.7%; the 35B went
+0.79×→0.985× *after* the floor was supposedly "hit".)
+
+**The loop: SCAN → RE-ADAPT → FIND LEVERS — especially when a lever search
+stalls.** Run a **dynamic Workflow** that fans out **many** sub-agents to
+deep-compare vLLM's throughput HOT PATH against ours **from a VARIETY of angles**
+— by subsystem (forward dtype/casts, GDN/MoE/attention kernels, norm/rope fusion,
+cudagraph/compile, quant dispatch, scheduler/batching, KV-cache, per-step host
+overhead) AND by lens on the same area (kernel wall-time, memory traffic, launch
+count, dtype/precision, tile/config, algorithm/fusion, occupancy), plus
+adversarial "refute we-match-vLLM" + completeness ("what haven't we looked at?")
+critics. Overlapping coverage is good — it finds blind spots. Each agent reads
+BOTH the
+pinned vLLM (`/home/mudler/_git/vllm` @ the parity pin) AND our source, cites
+`file:line` on both sides, and reports what vLLM does DIFFERENTLY that makes it
+faster. Then verify each diff adversarially (real? on the gate hot path?), rank
+by gain÷effort, drive the top lever, re-measure vs vLLM, repeat. Full protocol:
+[.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md). Caveat: a
+real per-op comparison needs a CLEAN slice of OURS (not inferred proportions),
+and distinguish the few vLLM edges that are build-specific (Inductor/DeepGEMM
+fusions) — which eager-C++ can't 1:1 replicate — from the many we CAN.
+
 ## Policy for AI-Assisted Contributions
 
 This project follows the Linux kernel project's [guidelines for AI coding
@@ -72,6 +102,9 @@ submitting AI-assisted code, read
 
 - [.agents/mission.md](.agents/mission.md) — what this project is and is not.
 - [.agents/gates.md](.agents/gates.md) — the 5 MVP gates (success definition).
+- [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) — the
+  **scan → re-adapt → find levers** loop: never accept a "ceiling"; when stuck,
+  dynamic-workflow-scan vLLM's hot path vs ours to find the specific diffs.
 - [.agents/discipline.md](.agents/discipline.md) — **non-negotiable** porting
   rules: mirrored structure, port-don't-reinvent, upstream-commit file
   headers, recorded deviations, parity-first testing.

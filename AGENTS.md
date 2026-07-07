@@ -5,6 +5,15 @@ read this first, follow the links that matter for your task, and keep the
 record updated (append to the state log) — commit it with your changes.
 Push directly to `main`.
 
+**Keep `README.md` (the user-facing status) CURRENT.** Whenever the *externally
+visible* status changes — a gate passes, a model/quant/backend moves state, a
+throughput number materially shifts, a feature lands — update the matching
+README section/table row in the SAME change (its ⚠️ header, the architecture /
+acceleration / quantization tables, and "Status & caveats"). The README must
+never lag reality: no "pending"/"not yet confirmed" for something that now
+works, and no overclaim for something that doesn't. It is part of the record,
+kept honest and current alongside the ledger.
+
 **Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
 message. This asserts the contributor (human or AI-assisted) has read this
 AGENTS.md and follows the protocol. **CI rejects any commit lacking it**

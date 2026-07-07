@@ -5,11 +5,15 @@ no Python, no PyTorch, no ggml at runtime. Same V1 architecture, same
 algorithms, same serving surface; usable as a library (llama.cpp-style) with a
 C API, an example CLI, and an OpenAI-compatible server.
 
-> ⚠️ **Pre-release, under heavy development.** The engine and serving layer are
-> built and behaviorally tested on CPU; end-to-end validation on the real
-> benchmark model (Qwen3.6-35B-A3B) and the throughput/parity gates run on
-> NVIDIA GB10 (DGX Spark) and are **not yet confirmed** — see *Status &
-> caveats*. The tables track real, tested support and are kept current as work
+> ⚠️ **Pre-release, under heavy development.** Both NVFP4 gate models —
+> **Qwen3.6-35B-A3B** (MoE hybrid) and **Qwen3.6-27B** (dense W4A4) — now run the
+> full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
+> **token-exact greedy gates passing**, and throughput is measured against vLLM
+> on real hardware. We **beat vLLM run eager** on both models; against vLLM's
+> *production* config (CUDA graphs + torch.compile) we are at **near-parity**
+> (≈0.90× on the 27B, ≈0.96× on the 35B) and are **actively closing the last few
+> percent** to full parity via a measured, execution-traced roadmap — see
+> *Status*. The tables track real, tested support and are kept current as work
 > lands (see `.agents/`).
 
 ## What's implemented (CPU, behaviorally tested)
@@ -67,7 +71,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ forward parity (greedy-verified on GB10, M0 exit) | 🚧 load path done (k-quant dequant + qwen35moe loader; real-file parity dgx-pending) | 🚧 engine + server + tools + grammars done on CPU; real-model + throughput gates on GB10 pending |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass**; throughput near-parity vs vLLM | 🚧 load path done (k-quant dequant + qwen35moe loader; real-file parity dgx-pending) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack + both greedy gates on GB10**; 🚧 throughput parity being closed |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -77,7 +81,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | ✅ engine + serving end-to-end |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121) | 🚧 kernels ported (attention/GDN/MoE/sampler/cache); baseline ops parity-verified on GB10; the full paged stack + 35B greedy gate + throughput parity are **dgx bring-up pending** |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **full paged stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, WMMA attention/GDN, CUDA-graph decode); both 27B + 35B greedy gates pass token-exact; throughput measured vs vLLM (near-parity, beats eager) — 🚧 **closing the last few % to full parity** |
 | Metal | Apple Silicon (MLX vs native MSL under exploration) | 🗓 planned (post-MVP) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
 | SYCL / XPU | Intel GPUs | 🗓 planned (post-MVP) |
@@ -86,7 +90,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | 🚧 W4A16 dequant + forward done (35B safetensors); W4A4 dense ~M2.2 |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, cutlass sm120a fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass |
 | GGUF quants (Q4_K/Q5_K/Q6_K/Q3_K, Q8_0, F32) | 🚧 dequant (byte-exact vs ggml) + qwen35moe load path done on CPU; real-file greedy parity dgx-pending; IQ2_S/IQ4_XS i-quants pending |
 | fp8, MXFP4 | 🗓 planned (post-MVP T1) |
 
@@ -94,13 +98,23 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 
 ## Status & caveats (honest)
 
-- **Behavioral vs numerical:** the engine, sampler, server, tools and grammars are
-  validated on CPU with a synthetic model + adversarial review (correct shapes,
-  framing, semantics, streaming, error contracts). The **real Qwen3.6-35B-A3B**
-  greedy/logits parity through the *paged batched engine*, all CUDA kernels, and
-  the **throughput-parity-vs-vLLM** benchmark run on **GB10** and are the
-  outstanding acceptance gates — `scripts/dgx-bringup.sh` runs the CUDA suite +
-  the 35B gate on dgx.casa.
+- **Where we are (GB10 / DGX Spark, sm_121a):** both NVFP4 gate models run the full
+  paged engine end-to-end with **token-exact greedy gates passing**, and all CUDA
+  kernels are validated on real hardware. **Throughput, measured vs vLLM on the same
+  workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
+  *production* config (CUDA graphs + torch.compile — the honest bar) we are at
+  ≈**0.90×** (27B, conc-16) / **0.96×** (35B), i.e. near-parity, consistent across
+  concurrency.
+- **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
+  total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
+  concurrency operating point). We do not stop at "near parity." The remaining gap is
+  being closed by an **execution-traced roadmap**: we `nsys`-profile vLLM's *actual*
+  kernels (not just its source) and mirror what it runs — FlashAttention, cuBLASLt/
+  `nvjet_sm121` GEMM steering, hardware `cvt.e2m1x2` fp4 quant, merged projection
+  GEMMs, GDN chunk tuning — which an execution trace shows is enough to reach parity.
+  Every step is A/B-measured and gate-checked; the full record is in the
+  [parity ledger](.agents/parity-ledger.md). `scripts/dgx-bringup.sh` runs the CUDA
+  suite + the gates on dgx.casa.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF
   only). Original runtime/packaging components (the `vt` op runtime, the minja
   chat-template engine, the native grammar backend, the C API) are documented as

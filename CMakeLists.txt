@@ -252,6 +252,32 @@ if(VLLM_CPP_CUDA)
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
   endif()
+  # Vendored FlashAttention-2 sm_121a prefill. The exact FA-2 source vLLM builds
+  # as _vllm_fa2_C (vllm-project/flash-attention @ 2c839c33) — its
+  # flash_fwd_splitkv kernel is what vLLM's nsys trace shows for prefill on GB10.
+  # Compiled torch-free against our CUTLASS: 3 stub headers replace the ATen/c10
+  # surface (PhiloxCudaState POD + C10_CUDA_CHECK), and fa2_compat_prelude.h is
+  # force-included for the std headers ATen pulled in transitively — the upstream
+  # (auto-generated) FA sources stay byte-for-byte pristine. Opt-in at build with
+  # -DVLLM_CPP_FLASH_ATTN=ON (needs CUTLASS); runtime gate VT_ATTN_FA2=1 (default
+  # OFF) so the proven WMMA prefill stays default until validated token-for-token.
+  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill kernel (needs CUTLASS)" OFF)
+  if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS)
+    set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
+    set(_FA2_KERNEL_SRCS
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu)
+    target_sources(vllm PRIVATE
+      src/vt/cuda/cuda_flash_attn_fa2.cu
+      ${_FA2_KERNEL_SRCS})
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_FLASH_ATTN)
+    set_source_files_properties(
+      src/vt/cuda/cuda_flash_attn_fa2.cu
+      ${_FA2_KERNEL_SRCS} PROPERTIES
+      COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
+    message(STATUS "FlashAttention-2 sm_121a prefill: ENABLED (opt-in VT_ATTN_FA2=1)")
+  endif()
 endif()
 
 # OpenAI HTTP server (M3.1 Task 4): the api_server.cpp translation unit pulls in

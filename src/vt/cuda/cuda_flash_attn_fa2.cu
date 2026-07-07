@@ -46,6 +46,24 @@ void Check(cudaError_t err, const char* what) {
 
 inline int RoundMultiple(int x, int m) { return (x + m - 1) / m * m; }
 
+// FA-2's kernel is bf16 in / bf16 out. The production full-attn prefill hands us
+// an f32 query (residual-stream precision) and an f32 output tensor with a bf16
+// KV cache (see qwen3_5.cpp FullAttnBlockPaged). We cast f32→bf16 on the way in
+// and bf16→f32 on the way out so FA-2 engages for the f32-output path too; a
+// native-bf16 query/out is used in place (no copy). Casts are flat over the
+// contiguous [total_q, hq, d] buffers.
+__global__ void CastF32ToBf16Kernel(const float* __restrict__ in,
+                                    __nv_bfloat16* __restrict__ out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __float2bfloat16(in[i]);
+}
+
+__global__ void CastBf16ToF32Kernel(const __nv_bfloat16* __restrict__ in,
+                                    float* __restrict__ out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
 }  // namespace
 
 // Launch FA-2 paged prefill for a bf16 query + bf16 KV cache, head_dim 256.
@@ -90,19 +108,53 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   float* softmax_lse = nullptr;
   Check(cudaMallocAsync(&softmax_lse, sizeof(float) * hq * total_q, s), "softmax_lse alloc");
 
+  // FA-2's kernel is bf16. Cast the query to bf16 when the caller hands us an f32
+  // query (production full-attn prefill), and target a bf16 output buffer when the
+  // caller's output is f32; both are cast back after. Native-bf16 in/out are used
+  // in place. Buffers are contiguous [total_q, hq, d].
+  const int64_t n_qo = total_q * hq * d;
+  const int cast_threads = 256;
+  const unsigned cast_blocks =
+      static_cast<unsigned>((n_qo + cast_threads - 1) / cast_threads);
+
+  __nv_bfloat16* q_bf = nullptr;  // owned bf16 query (only when query is f32)
+  void* q_kernel_ptr = query.data;
+  int64_t q_row_stride = query.stride[0];
+  int64_t q_head_stride = query.stride[1];
+  if (query.dtype == DType::kF32) {
+    Check(cudaMallocAsync(&q_bf, sizeof(__nv_bfloat16) * n_qo, s), "fa2 q bf16 alloc");
+    CastF32ToBf16Kernel<<<cast_blocks, cast_threads, 0, s>>>(query.Ptr<float>(), q_bf, n_qo);
+    Check(cudaGetLastError(), "fa2 q f32->bf16 cast");
+    q_kernel_ptr = q_bf;
+    q_row_stride = hq * d;  // contiguous temp
+    q_head_stride = d;
+  }
+
+  __nv_bfloat16* o_bf = nullptr;  // owned bf16 output (only when out is f32)
+  void* o_kernel_ptr = out.data;
+  int64_t o_row_stride = out.stride[0];
+  int64_t o_head_stride = out.stride[1];
+  const bool out_is_f32 = out.dtype == DType::kF32;
+  if (out_is_f32) {
+    Check(cudaMallocAsync(&o_bf, sizeof(__nv_bfloat16) * n_qo, s), "fa2 o bf16 alloc");
+    o_kernel_ptr = o_bf;
+    o_row_stride = hq * d;  // contiguous temp
+    o_head_stride = d;
+  }
+
   FLASH_NAMESPACE::Flash_fwd_params p{};  // zero-init: nulls knew/rotary/alibi/accum/leftpad
   p.is_bf16 = true;
 
-  p.q_ptr = query.data;
+  p.q_ptr = q_kernel_ptr;
   p.k_ptr = k_cache.data;
   p.v_ptr = v_cache.data;
-  p.o_ptr = out.data;
+  p.o_ptr = o_kernel_ptr;
 
   // Strides in ELEMENTS. Varlen q/o: no batch stride (cu_seqlens_q drives offset).
-  p.q_row_stride = query.stride[0];
-  p.q_head_stride = query.stride[1];
-  p.o_row_stride = out.stride[0];
-  p.o_head_stride = out.stride[1];
+  p.q_row_stride = q_row_stride;
+  p.q_head_stride = q_head_stride;
+  p.o_row_stride = o_row_stride;
+  p.o_head_stride = o_head_stride;
   // Paged k/v [num_blocks, block_size, num_kv_heads, d]:
   //   batch_stride = per-block, row_stride = per page-position, head_stride = per head.
   p.k_batch_stride = k_cache.stride[0];
@@ -163,6 +215,15 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
   }
   Check(cudaGetLastError(), "splitkv dispatch launch");
+
+  // Cast the bf16 result back into the caller's f32 output (contiguous), and free
+  // the scratch buffers (async on the same stream — safe, ordered after the cast).
+  if (out_is_f32) {
+    CastBf16ToF32Kernel<<<cast_blocks, cast_threads, 0, s>>>(o_bf, out.Ptr<float>(), n_qo);
+    Check(cudaGetLastError(), "fa2 o bf16->f32 cast");
+    Check(cudaFreeAsync(o_bf, s), "fa2 o bf16 free");
+  }
+  if (q_bf != nullptr) Check(cudaFreeAsync(q_bf, s), "fa2 q bf16 free");
   Check(cudaFreeAsync(softmax_lse, s), "softmax_lse free");
 }
 

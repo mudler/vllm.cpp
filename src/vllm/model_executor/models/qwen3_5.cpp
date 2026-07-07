@@ -23,6 +23,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <optional>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
@@ -606,6 +607,21 @@ bool TrueW4A4Enabled() {
 bool FuseSiluQuantEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_SILU_QUANT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// QUANTIZE-ONCE: q/k/v (and gate/up) share their input activation AND their on-disk
+// input_global_scale (verified: 27B layer-3 q/k/v all 28.75; gate/up 812/476), so we
+// can ScaledFp4Quant the shared activation ONCE and feed each projection's fp4xfp4
+// GEMM the same packed/scale — removing the 2-3x redundant per-projection quant of
+// [T,H] (mirrors vLLM's fused qkv/gate_up MergedColumnParallelLinear = one quant).
+// Bit-identical only when the shared input_global_scale_inv match (guarded at the
+// call site). Default OFF; VT_FUSE_QUANT_ONCE=1 enables.
+bool FuseQuantOnceEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSE_QUANT_ONCE");
     return e != nullptr && e[0] == '1';
   }();
   return on;
@@ -1387,13 +1403,33 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
   const bool fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
-  DBuf qgate = fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+  // QUANTIZE-ONCE for q/k/v: shared activation h + shared input_global_scale -> one
+  // ScaledFp4Quant feeding all three fp4 GEMMs (removes 2 redundant [T,H] quants).
+  const bool fuse_qkv =
+      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+      w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
+      w.q_proj_fp4.input_global_scale_inv == w.k_proj_fp4.input_global_scale_inv &&
+      w.q_proj_fp4.input_global_scale_inv == w.v_proj_fp4.input_global_scale_inv;
+  std::optional<DBuf> qkv_ap, qkv_as;
+  if (fuse_qkv) {
+    const int64_t H = h.shape[1];
+    qkv_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
+    qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
+    vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
+  }
+  DBuf qgate = fuse_qkv
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, DType::kF32)
+               : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
                : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+  DBuf kf = fuse_qkv
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)
+            : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
             : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+  DBuf vf = fuse_qkv
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, DType::kF32)
+            : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
             : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
@@ -1457,13 +1493,33 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
   const bool fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
-  DBuf qgate = fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+  // QUANTIZE-ONCE for q/k/v: shared activation h + shared input_global_scale -> one
+  // ScaledFp4Quant feeding all three fp4 GEMMs (removes 2 redundant [T,H] quants).
+  const bool fuse_qkv =
+      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+      w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
+      w.q_proj_fp4.input_global_scale_inv == w.k_proj_fp4.input_global_scale_inv &&
+      w.q_proj_fp4.input_global_scale_inv == w.v_proj_fp4.input_global_scale_inv;
+  std::optional<DBuf> qkv_ap, qkv_as;
+  if (fuse_qkv) {
+    const int64_t H = h.shape[1];
+    qkv_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
+    qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
+    vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
+  }
+  DBuf qgate = fuse_qkv
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, DType::kF32)
+               : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
                : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+  DBuf kf = fuse_qkv
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)
+            : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
             : fp4 ? MatmulNvfp4F32D(d, h, w.k_proj_fp4)
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+  DBuf vf = fuse_qkv
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, DType::kF32)
+            : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
             : fp4 ? MatmulNvfp4F32D(d, h, w.v_proj_fp4)
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
@@ -2048,10 +2104,25 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
-  DBuf gate = fp4 ? MatmulNvfp4F32D(d, dh, w.gate_proj_fp4)
-                  : MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
-  DBuf up = fp4 ? MatmulNvfp4F32D(d, dh, w.up_proj_fp4)
-                : MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
+  // QUANTIZE-ONCE for gate/up: shared activation dh + shared input_global_scale ->
+  // one ScaledFp4Quant feeding both fp4 GEMMs (removes 1 redundant [T,H] quant).
+  const bool fuse_gu =
+      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+      w.gate_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
+      w.gate_proj_fp4.input_global_scale_inv == w.up_proj_fp4.input_global_scale_inv;
+  std::optional<DBuf> gu_ap, gu_as;
+  if (fuse_gu) {
+    const int64_t H = dh.shape[1];
+    gu_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
+    gu_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
+    vt::ScaledFp4Quant(d.q, gu_ap->t(), gu_as->t(), dh, w.gate_proj_fp4.input_global_scale_inv);
+  }
+  DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, DType::kF32)
+              : fp4 ? MatmulNvfp4F32D(d, dh, w.gate_proj_fp4)
+                    : MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
+  DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, DType::kF32)
+            : fp4 ? MatmulNvfp4F32D(d, dh, w.up_proj_fp4)
+                  : MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
   // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
   // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.

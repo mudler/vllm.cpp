@@ -149,11 +149,21 @@ workload, you do not yet know where the gap is — you are guessing.
 trace shows we REINVENTED a kernel the code-reading hid (e.g. hand-WMMA GDN chunk vs
 vLLM's GDN-as-cutlass-GEMM; hand-WMMA attention vs vLLM's flash_fwd; the sm_80 in_proj vs
 nvjet), mirror vLLM's structure, make it the DEFAULT (A/B behind a toggle → flip default
-once it wins), then DELETE the reinvented CUDA kernel or explicitly DEMOTE it to a
-documented fallback. Do NOT leave two competing default CUDA paths — that fights the
-"structured so every upstream vLLM PR ports mechanically" premise and rots. This is
-`port-don't-reinvent` (discipline.md) enforced by the trace. KEEP genuine fallbacks (the
-CPU kernels, the non-cutlass emulation reference, other-backend paths per backends.md,
-correctness oracles) — gated + documented as fallbacks, never the default. (We reimplement
-the same algorithm/STRUCTURE vLLM runs — we cannot byte-copy Triton/CuTe-DSL into C++ — so
-"mirror the execution" = match what kernel/structure runs, then remove our alternative.)
+once it wins), then clean up the superseded kernel. Do NOT leave two competing default
+CUDA paths — that fights the "structured so every upstream vLLM PR ports mechanically"
+premise and rots. This is `port-don't-reinvent` (discipline.md) enforced by the trace.
+
+**DEFAULT TO DEMOTE, NOT DELETE — check cross-backend value FIRST.** Before removing any
+superseded kernel, verify it has NO ongoing value for: the multi-backend roadmap
+(**CPU now; Vulkan / hipBLAS/ROCm / Metal / Intel XPU later** — `backends.md`), the
+correctness oracle/reference, or a capability fallback (non-cutlass builds, GPUs without
+the fast path). The vt:: OP INTERFACE is the portable contract and ALWAYS stays; the
+CPU kernel and any GENERIC/vendor-neutral implementation are the backbone other backends
+port FROM — KEEP them. Only DELETE a kernel that is a PURE CUDA-vendor-specific
+reinvention with no reference/fallback/cross-backend use (e.g. a hand-WMMA path fully
+superseded by the vLLM-mirrored cutlass/cuBLASLt kernel AND not needed by any other
+backend). When in doubt, GATE it as a documented fallback rather than delete — a demoted,
+labeled fallback costs little; a deleted portability asset is expensive to rebuild. (We
+reimplement the same algorithm/STRUCTURE vLLM runs — we cannot byte-copy Triton/CuTe-DSL
+into C++ — so "mirror the execution" = match what kernel/structure runs, then demote/
+remove our now-redundant CUDA alternative, keeping every reference/portable path.)

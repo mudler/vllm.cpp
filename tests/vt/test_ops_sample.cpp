@@ -218,6 +218,220 @@ TEST_CASE("apply_top_k_top_p: combined k then p") {
 }
 
 // ---------------------------------------------------------------------------
+// Sort-FREE top-k/top-p masking — the exact scalar mirror of the CUDA
+// `ApplyTopKTopPRowKernel` (src/vt/cuda/cuda_sample.cu). The CUDA kernel replaced
+// the per-row full-vocab thrust sort + <<<n,1>>> serial cumsum + blocking sync
+// with a block-cooperative pivot-bracket THRESHOLD search (mirroring flashinfer's
+// TopK/TopPRenormProb; sampling.cuh). This scalar reference computes the SAME
+// threshold math sequentially so the algorithm can be validated on CPU-only CI
+// (the .cu itself needs nvcc). It is cross-checked below against the independent
+// sort-based reference (vt::ApplyTopKTopP CPU path, `ApplyTopKTopPSortRow`).
+//
+// Distribution equivalence: for DISTINCT logits the kept set is identical to the
+// sort path. The ONLY divergence is the measure-zero case of tokens with exactly
+// equal probability straddling the top-p / top-k boundary: the sort path splits a
+// tie group (keeping some, dropping others of equal prob, by stable index order),
+// while the threshold path — like flashinfer — keeps/drops whole tie groups
+// atomically. Real f32 model logits are effectively continuous, so this never
+// fires; the cross-check below uses distinct logits.
+namespace {
+constexpr float kSFNegInf = -std::numeric_limits<float>::infinity();
+
+// count(row[j] > x) over the whole row.
+int SFCountGt(const float* r, int64_t v, float x) {
+  int c = 0;
+  for (int64_t j = 0; j < v; ++j)
+    if (r[j] > x) ++c;
+  return c;
+}
+
+// k-th largest value (torch top-k threshold): mask masks logits STRICTLY below it,
+// keeping >= it (ties at the threshold survive). Found via a two-pivot bracket that
+// pins `low` to the largest value with count(row>low) >= k; the k-th largest is then
+// the smallest value strictly greater than `low` (min_gt_low at convergence).
+float SFTopKThreshold(const float* r, int64_t v, int32_t k, float mn, float mx) {
+  if (SFCountGt(r, v, mn) < k) return mn;  // k-th largest == global min => no-op
+  float low = mn, high = mx, min_gt_low = mx, max_le_high = low;
+  do {
+    const float p0 = (2.0f * low + high) / 3.0f;
+    const float p1 = (low + 2.0f * high) / 3.0f;
+    const int c0 = SFCountGt(r, v, p0);
+    const int c1 = SFCountGt(r, v, p1);
+    min_gt_low = high;
+    max_le_high = low;
+    for (int64_t j = 0; j < v; ++j) {
+      if (r[j] > low) min_gt_low = std::min(min_gt_low, r[j]);
+      if (r[j] <= high) max_le_high = std::max(max_le_high, r[j]);
+    }
+    if (c1 >= k) {
+      low = p1;
+    } else if (c0 >= k) {
+      low = p0;
+      high = std::min(p1, max_le_high);
+    } else {
+      high = std::min(p0, max_le_high);
+    }
+  } while (min_gt_low != max_le_high);
+  return min_gt_low;  // smallest value strictly > low == k-th largest
+}
+
+// The sort-free mask: identical result to vt::ApplyTopKTopP for distinct logits.
+void SFApplyTopKTopPRow(float* r, int64_t v, const int32_t* kptr, const float* pptr) {
+  float mx = kSFNegInf, mn = std::numeric_limits<float>::infinity();
+  for (int64_t j = 0; j < v; ++j) {
+    mx = std::max(mx, r[j]);
+    if (r[j] != kSFNegInf) mn = std::min(mn, r[j]);  // min over FINITE logits
+  }
+
+  // --- top-k threshold (keep row[j] >= threshold_k) ---
+  float threshold_k = kSFNegInf;  // -inf => keep all
+  const bool topk = (kptr != nullptr);
+  const int32_t k = topk ? *kptr : 0;
+  if (topk && k >= 1 && k < v) threshold_k = SFTopKThreshold(r, v, k, mn, mx);
+  auto survivor = [&](int64_t j) { return r[j] >= threshold_k; };
+
+  // --- top-p threshold over the survivors (keep survivor with e_j > low) ---
+  float low = -1.0f;  // on e=exp(row-mx) in (0,1]; -1 => keep every survivor
+  const bool topp = (pptr != nullptr);
+  const float p = topp ? *pptr : 1.0f;
+  if (topp && p < 1.0f) {
+    float denom = 0.0f;
+    for (int64_t j = 0; j < v; ++j)
+      if (survivor(j)) denom += std::exp(r[j] - mx);
+    const float target = p * denom;  // cumulative survivor mass to keep
+    float hi = 1.0f;                  // max survivor e == exp(mx-mx) == 1
+    low = 0.0f;  // denom==0 (no survivors) => loop skipped; row masked fully anyway
+    float min_gt_low = hi, max_le_high = 0.0f;
+    for (int iter = 0; denom > 0.0f && iter < 128; ++iter) {
+      const float p0 = (2.0f * low + hi) / 3.0f;
+      const float p1 = (low + 2.0f * hi) / 3.0f;
+      float a0 = 0.0f, a1 = 0.0f;
+      min_gt_low = hi;
+      max_le_high = low;
+      for (int64_t j = 0; j < v; ++j) {
+        if (!survivor(j)) continue;
+        const float e = std::exp(r[j] - mx);
+        if (e > p0) a0 += e;
+        if (e > p1) a1 += e;
+        if (e > low) min_gt_low = std::min(min_gt_low, e);
+        if (e <= hi) max_le_high = std::max(max_le_high, e);
+      }
+      if (a1 >= target) {
+        low = p1;
+      } else if (a0 >= target) {
+        low = p0;
+        hi = std::min(p1, max_le_high);
+      } else {
+        hi = std::min(p0, max_le_high);
+      }
+      if (min_gt_low == max_le_high) break;
+    }
+  }
+
+  for (int64_t j = 0; j < v; ++j) {
+    const bool keep = survivor(j) && (low < 0.0f || std::exp(r[j] - mx) > low);
+    if (!keep) r[j] = kSFNegInf;
+  }
+}
+
+// xorshift, matching the RandomLogits generator style, but scaled to distinct
+// values (the sort path and the threshold path agree exactly only off-tie).
+std::vector<float> DistinctLogits(int64_t v, uint32_t seed) {
+  std::vector<float> out(static_cast<size_t>(v));
+  uint32_t s = seed ? seed : 1;
+  for (auto& x : out) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    x = (static_cast<float>(s) / static_cast<float>(UINT32_MAX)) * 20.0f - 10.0f;
+  }
+  return out;
+}
+}  // namespace
+
+TEST_CASE("sort-free top-k/top-p == sort-based reference (distinct logits, many rows)") {
+  // Validate the exact algorithm the CUDA kernel runs against the independent
+  // sort-based CPU reference over randomized (k, p) and vocab sizes.
+  struct Cfg {
+    int64_t v;
+    int32_t k;   // 0 => no top-k
+    float p;     // <=0 => no top-p
+  };
+  const std::vector<Cfg> cfgs = {
+      {512, 32, 0.8f},  {512, 0, 0.9f},   {512, 40, -1.f}, {256, 1, 0.5f},
+      {256, 200, 0.95f}, {1000, 50, 0.7f}, {129, 7, 0.99f}, {777, 300, 0.3f},
+  };
+  for (size_t c = 0; c < cfgs.size(); ++c) {
+    const Cfg& cfg = cfgs[c];
+    for (uint32_t seed = 1; seed <= 12; ++seed) {
+      std::vector<float> ref = DistinctLogits(cfg.v, seed * 2654435761u + static_cast<uint32_t>(c));
+      std::vector<float> got = ref;
+      const bool has_k = cfg.k > 0;
+      const bool has_p = cfg.p > 0.0f;
+      std::vector<int32_t> kv = {cfg.k};
+      std::vector<float> pv = {cfg.p};
+
+      // sort-based reference (the current CPU parity target).
+      Tensor tref = F32_2(ref, 1, cfg.v);
+      Tensor tk = I32_1(kv, 1), tp = F32_1(pv, 1);
+      Queue q = Q();
+      vt::ApplyTopKTopP(q, tref, has_k ? &tk : nullptr, has_p ? &tp : nullptr);
+
+      // sort-free algorithm (mirror of the CUDA kernel).
+      SFApplyTopKTopPRow(got.data(), cfg.v, has_k ? &cfg.k : nullptr, has_p ? &pv[0] : nullptr);
+
+      for (int64_t j = 0; j < cfg.v; ++j) {
+        if (std::isinf(ref[static_cast<size_t>(j)])) {
+          CHECK(std::isinf(got[static_cast<size_t>(j)]));  // masked in both
+        } else {
+          CHECK_FALSE(std::isinf(got[static_cast<size_t>(j)]));  // kept in both
+          CHECK(got[static_cast<size_t>(j)] == doctest::Approx(ref[static_cast<size_t>(j)]));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("sort-free top-k/top-p == sort-based reference (with pre-masked -inf logits)") {
+  // Upstream procs (min_p / bad_words / min_tokens / allowed_token_ids) mask
+  // logits to -inf BEFORE top_k_top_p runs. The threshold search must treat -inf
+  // as bottom (its finite-min bracket) and reproduce the sort path's kept set.
+  struct Cfg { int64_t v; int32_t k; float p; };
+  const std::vector<Cfg> cfgs = {
+      {512, 32, 0.8f}, {512, 0, 0.9f}, {600, 64, -1.f}, {300, 5, 0.6f}, {256, 250, 0.95f},
+  };
+  for (size_t c = 0; c < cfgs.size(); ++c) {
+    const Cfg& cfg = cfgs[c];
+    for (uint32_t seed = 1; seed <= 10; ++seed) {
+      std::vector<float> ref = DistinctLogits(cfg.v, seed * 40503u + 7u + static_cast<uint32_t>(c));
+      // Mask ~1/5 of the row to -inf (deterministic scatter), leaving enough finite.
+      for (int64_t j = 0; j < cfg.v; ++j)
+        if ((j * 2654435761u + seed) % 5u == 0) ref[static_cast<size_t>(j)] = kNegInf;
+      std::vector<float> got = ref;
+      const bool has_k = cfg.k > 0;
+      const bool has_p = cfg.p > 0.0f;
+      std::vector<int32_t> kv = {cfg.k};
+      std::vector<float> pv = {cfg.p};
+
+      Tensor tref = F32_2(ref, 1, cfg.v);
+      Tensor tk = I32_1(kv, 1), tp = F32_1(pv, 1);
+      Queue q = Q();
+      vt::ApplyTopKTopP(q, tref, has_k ? &tk : nullptr, has_p ? &tp : nullptr);
+      SFApplyTopKTopPRow(got.data(), cfg.v, has_k ? &cfg.k : nullptr, has_p ? &pv[0] : nullptr);
+
+      for (int64_t j = 0; j < cfg.v; ++j) {
+        if (std::isinf(ref[static_cast<size_t>(j)])) {
+          CHECK(std::isinf(got[static_cast<size_t>(j)]));
+        } else {
+          CHECK_FALSE(std::isinf(got[static_cast<size_t>(j)]));
+          CHECK(got[static_cast<size_t>(j)] == doctest::Approx(ref[static_cast<size_t>(j)]));
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // compute_logprobs / compute_probs — log_softmax / softmax (f32, max-subtracted).
 TEST_CASE("compute_logprobs: matches hand-computed log_softmax") {
   std::vector<float> logits = {1.0f, 2.0f, 3.0f};

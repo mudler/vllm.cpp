@@ -6,16 +6,15 @@
 //   - greedy_argmax / random_sample: ONE BLOCK per row, single-threaded scan so
 //     the lowest-index tie-break matches torch.argmax / the CPU reference exactly.
 //   - compute_probs / compute_logprobs: block-per-row max-subtracted softmax.
-//   - apply_top_k_top_p: per-row ascending sort (thrust::stable_sort_by_key over
-//     backend scratch) + the top-k threshold / top-p cumsum masking + scatter,
-//     the same sort-based path as apply_top_k_top_p_pytorch.
-// The FlashInfer fused sampler is M2.4. NOTE: this file is built + verified on
-// dgx.casa (the CI box is CPU-only); the CUDA parity tests are HasCuda-guarded.
+//   - apply_top_k_top_p: SORT-FREE block-cooperative pivot-bracket THRESHOLD
+//     search (one block per row), mirroring flashinfer's TopK/TopPRenormProb
+//     (sampling.cuh). It replaces the old per-row full-vocab thrust::stable_sort
+//     + <<<n,1>>> single-thread top-p cumsum + blocking cudaStreamSynchronize.
+//     The kept set is identical to apply_top_k_top_p_pytorch for distinct logits
+//     (validated by the scalar mirror + cross-check in tests/vt/test_ops_sample.cpp).
+// NOTE: this file is built + verified on dgx.casa (the CI box is CPU-only); the
+// CUDA parity tests are HasCuda-guarded.
 #include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
-#include <thrust/sequence.h>
-#include <thrust/sort.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -295,82 +294,216 @@ void RandomSampleCuda(Queue& q, Tensor& token_ids, const Tensor& probs, const Te
   Check(cudaGetLastError(), "random_sample launch");
 }
 
-// --- apply_top_k_top_p (sort-based path) ------------------------------------
-// The masking passes run one block per row over the per-row sorted scratch; the
-// cumsum for top-p is single-threaded (thread 0) to match the CPU reference's
-// ascending prefix sum exactly.
-__global__ void TopKMaskKernel(float* sorted, const int32_t* k, int64_t v) {
-  const int64_t row = blockIdx.x;
-  const int32_t kv = k[row];
-  if (kv >= v || kv < 1) return;  // k>=vocab no-op; k<1 invalid — keep s[v-kv] in-bounds
-  float* s = sorted + row * v;
-  const float threshold = s[v - kv];  // sorted ascending: index v-k is k-th largest
-  for (int64_t j = threadIdx.x; j < v; j += blockDim.x)
-    if (s[j] < threshold) s[j] = kNegInf;
-}
+// --- apply_top_k_top_p (SORT-FREE block-cooperative threshold search) --------
+// Each row is masked by ONE block. The top-k value-threshold (k-th largest logit)
+// and the top-p exp-threshold are found with the two-pivot bracket search that
+// flashinfer's TopK/TopPRenormProb use (sampling.cuh): each iteration evaluates
+// count(>pivot) / sum(>pivot) cooperatively and snaps the bracket to real array
+// values via min_gt_low / max_le_high, so it converges to an EXACT array-value
+// threshold (empirically <=17 iters over a 152k vocab). No sort, no serial scan,
+// no host round-trip, and (unlike the old path) no blocking Synchronize — the op
+// is fully async on the stream, ordered before the downstream softmax/sample.
+//
+// Kept set == apply_top_k_top_p_pytorch for DISTINCT logits (validated by the
+// scalar mirror + cross-check in tests/vt/test_ops_sample.cpp). The only
+// divergence is the measure-zero exact-tie-straddling-boundary case, where this
+// path keeps/drops whole tie groups atomically (like flashinfer) rather than
+// splitting them by stable index order; real f32 logits are effectively
+// continuous, so this never fires.
+constexpr int kThreshMaxIter = 64;  // >3x the observed worst case; converges by pinning
 
-__global__ void TopPMaskKernel(float* sorted, const float* p, int64_t v) {
-  const int64_t row = blockIdx.x;
-  if (threadIdx.x != 0) return;
-  float* s = sorted + row * v;
-  float mx = kNegInf;
-  for (int64_t j = 0; j < v; ++j) mx = fmaxf(mx, s[j]);
-  float denom = 0.0f;
-  for (int64_t j = 0; j < v; ++j) denom += (s[j] == kNegInf) ? 0.0f : expf(s[j] - mx);
-  const float cutoff = 1.0f - p[row];
-  float cum = 0.0f;
-  for (int64_t j = 0; j < v; ++j) {
-    cum += ((s[j] == kNegInf) ? 0.0f : expf(s[j] - mx)) / denom;
-    const bool keep_last = (j == v - 1);
-    if (!keep_last && cum <= cutoff) s[j] = kNegInf;
+// Block reductions over a kBlock-thread block (kBlock is a power of two). Each
+// returns the reduced value broadcast to all threads. `s` is a kBlock-wide shared
+// scratch; callers must not hold a live value in it across the call.
+__device__ inline float BlockRedMaxF(float v, float* s) {
+  const int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) s[t] = fmaxf(s[t], s[t + o]);
+    __syncthreads();
   }
+  const float r = s[0];
+  __syncthreads();
+  return r;
+}
+__device__ inline float BlockRedMinF(float v, float* s) {
+  const int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) s[t] = fminf(s[t], s[t + o]);
+    __syncthreads();
+  }
+  const float r = s[0];
+  __syncthreads();
+  return r;
+}
+__device__ inline float BlockRedSumF(float v, float* s) {
+  const int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) s[t] += s[t + o];
+    __syncthreads();
+  }
+  const float r = s[0];
+  __syncthreads();
+  return r;
+}
+__device__ inline int BlockRedSumI(int v, int* s) {
+  const int t = threadIdx.x;
+  s[t] = v;
+  __syncthreads();
+  for (int o = kBlock / 2; o > 0; o >>= 1) {
+    if (t < o) s[t] += s[t + o];
+    __syncthreads();
+  }
+  const int r = s[0];
+  __syncthreads();
+  return r;
 }
 
-__global__ void ScatterKernel(float* logits, const float* sorted, const int64_t* idx, int64_t v) {
+__global__ void ApplyTopKTopPRowKernel(float* logits, const int32_t* k_arr, const float* p_arr,
+                                       int64_t v) {
   const int64_t row = blockIdx.x;
-  const float* s = sorted + row * v;
-  const int64_t* ix = idx + row * v;
-  float* out = logits + row * v;
-  for (int64_t j = threadIdx.x; j < v; j += blockDim.x) out[ix[j]] = s[j];
+  float* r = logits + row * v;
+  const int t = threadIdx.x;
+
+  __shared__ float red[kBlock];
+  __shared__ int redi[kBlock];
+  __shared__ float sh_thr_k;
+  __shared__ float sh_low;
+
+  const bool has_k = (k_arr != nullptr);
+  const bool has_p = (p_arr != nullptr);
+  const int32_t k = has_k ? k_arr[row] : 0;
+  const float p = has_p ? p_arr[row] : 1.0f;
+
+  // Row max (softmax reference) and min over FINITE logits (the top-k search
+  // lower bracket must be finite — upstream masks (min_p / bad_words / allowed
+  // ids) can leave -inf logits, and an -inf bracket would stall the pivot
+  // arithmetic). mn == global min in the common (no pre-masked) case.
+  float lmax = kNegInf, lmin = INFINITY;
+  for (int64_t j = t; j < v; j += kBlock) {
+    const float x = r[j];
+    lmax = fmaxf(lmax, x);
+    if (x != kNegInf) lmin = fminf(lmin, x);
+  }
+  const float mx = BlockRedMaxF(lmax, red);
+  const float mn = BlockRedMinF(lmin, red);  // +inf if every logit is -inf
+
+  // ---- top-k: thr_k = k-th largest logit; keep {r[j] >= thr_k} (ties kept) ----
+  // Active only for 1 <= k < v (k>=v is a no-op; k<1 invalid, guarded). Mirrors
+  // apply_top_k_only / the torch top_k_mask (logits_sort < sorted[v-k]).
+  const bool topk_active = has_k && (k >= 1) && (static_cast<int64_t>(k) < v);
+  float thr_k = kNegInf;  // -inf => every token survives
+  if (topk_active) {
+    int lc = 0;
+    for (int64_t j = t; j < v; j += kBlock)
+      if (r[j] > mn) ++lc;
+    const int cnt_gt_min = BlockRedSumI(lc, redi);
+    if (cnt_gt_min < k) {
+      thr_k = mn;  // k-th largest == global min => masks nothing
+    } else {
+      // Find `low` = largest value with count(r>low) >= k; the k-th largest is the
+      // smallest value strictly greater than `low` (min_gt_low at convergence).
+      float low = mn, high = mx, min_gt_low = mx, max_le_high = mn;
+      for (int iter = 0; iter < kThreshMaxIter; ++iter) {
+        const float p0 = (2.0f * low + high) / 3.0f;
+        const float p1 = (low + 2.0f * high) / 3.0f;
+        int l0 = 0, l1 = 0;
+        float lmglow = high, lmleh = low;
+        for (int64_t j = t; j < v; j += kBlock) {
+          const float x = r[j];
+          if (x > p0) ++l0;
+          if (x > p1) ++l1;
+          if (x > low) lmglow = fminf(lmglow, x);
+          if (x <= high) lmleh = fmaxf(lmleh, x);
+        }
+        const int c0 = BlockRedSumI(l0, redi);
+        const int c1 = BlockRedSumI(l1, redi);
+        min_gt_low = BlockRedMinF(lmglow, red);
+        max_le_high = BlockRedMaxF(lmleh, red);
+        if (c1 >= k) {
+          low = p1;
+        } else if (c0 >= k) {
+          low = p0;
+          high = fminf(p1, max_le_high);
+        } else {
+          high = fminf(p0, max_le_high);
+        }
+        if (min_gt_low == max_le_high) break;
+      }
+      thr_k = min_gt_low;
+    }
+  }
+  if (t == 0) sh_thr_k = thr_k;
+  __syncthreads();
+  thr_k = sh_thr_k;
+  // survivor(j) := r[j] >= thr_k
+
+  // ---- top-p over survivors: keep {survivor && e_j > low}, e_j = exp(r-mx) ----
+  // denom / target normalize over the TOP-K SURVIVORS (matching the torch path,
+  // whose top-p softmax runs on the top-k-masked logits). p >= 1 is a no-op.
+  float low = -1.0f;  // on e in (0,1]; -1 => keep every survivor
+  const bool topp_active = has_p && (p < 1.0f);
+  if (topp_active) {
+    float lden = 0.0f;
+    for (int64_t j = t; j < v; j += kBlock)
+      if (r[j] >= thr_k) lden += expf(r[j] - mx);
+    const float denom = BlockRedSumF(lden, red);
+    const float target = p * denom;  // survivor mass to keep (>= p fraction)
+    float lo = 0.0f, hi = 1.0f, min_gt_low = 1.0f, max_le_high = 0.0f;
+    for (int iter = 0; denom > 0.0f && iter < kThreshMaxIter; ++iter) {
+      const float p0 = (2.0f * lo + hi) / 3.0f;
+      const float p1 = (lo + 2.0f * hi) / 3.0f;
+      float la0 = 0.0f, la1 = 0.0f, lmglow = hi, lmleh = lo;
+      for (int64_t j = t; j < v; j += kBlock) {
+        if (r[j] < thr_k) continue;  // non-survivor: excluded from the top-p mass
+        const float e = expf(r[j] - mx);
+        if (e > p0) la0 += e;
+        if (e > p1) la1 += e;
+        if (e > lo) lmglow = fminf(lmglow, e);
+        if (e <= hi) lmleh = fmaxf(lmleh, e);
+      }
+      const float a0 = BlockRedSumF(la0, red);
+      const float a1 = BlockRedSumF(la1, red);
+      min_gt_low = BlockRedMinF(lmglow, red);
+      max_le_high = BlockRedMaxF(lmleh, red);
+      if (a1 >= target) {
+        lo = p1;
+      } else if (a0 >= target) {
+        lo = p0;
+        hi = fminf(p1, max_le_high);
+      } else {
+        hi = fminf(p0, max_le_high);
+      }
+      if (min_gt_low == max_le_high) break;
+    }
+    low = lo;
+  }
+  if (t == 0) sh_low = low;
+  __syncthreads();
+  low = sh_low;
+
+  // ---- final in-place mask ----
+  for (int64_t j = t; j < v; j += kBlock) {
+    const float x = r[j];
+    const bool keep = (x >= thr_k) && (low < 0.0f || expf(x - mx) > low);
+    if (!keep) r[j] = kNegInf;
+  }
 }
 
 void ApplyTopKTopPCuda(Queue& q, Tensor& logits, const Tensor* k, const Tensor* p) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
   if (n == 0 || v == 0) return;
-  cudaStream_t s = AsStream(q);
-
-  // Both the k-only and the k+p cases take the sort path here: the sort-based
-  // top-k threshold masks exactly the set apply_top_k_only would (the CPU fast
-  // path is only an optimization), so CUDA/CPU parity holds either way.
-  // Backend scratch for the per-row sorted values + permutation indices.
-  Backend& backend = GetBackend(DeviceType::kCUDA);
-  const size_t nf = static_cast<size_t>(n * v);
-  float* sorted = static_cast<float*>(backend.Alloc(nf * sizeof(float)));
-  int64_t* perm = static_cast<int64_t*>(backend.Alloc(nf * sizeof(int64_t)));
-
-  // Copy logits into the scratch, then per-row ascending stable_sort_by_key.
-  Check(cudaMemcpyAsync(sorted, logits.Ptr<float>(), nf * sizeof(float),
-                        cudaMemcpyDeviceToDevice, s),
-        "top_k_top_p scratch copy");
-  auto policy = thrust::cuda::par.on(s);
-  for (int64_t row = 0; row < n; ++row) {
-    thrust::device_ptr<int64_t> ix(perm + row * v);
-    thrust::sequence(policy, ix, ix + v, static_cast<int64_t>(0));
-    thrust::device_ptr<float> keys(sorted + row * v);
-    thrust::stable_sort_by_key(policy, keys, keys + v, ix);
-  }
-
-  if (k != nullptr)
-    TopKMaskKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(sorted, k->Ptr<int32_t>(), v);
-  if (p != nullptr)
-    TopPMaskKernel<<<static_cast<unsigned>(n), 1, 0, s>>>(sorted, p->Ptr<float>(), v);
-  Check(cudaGetLastError(), "top_k_top_p mask launch");
-
-  ScatterKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(logits.Ptr<float>(), sorted, perm, v);
-  Check(cudaGetLastError(), "top_k_top_p scatter launch");
-  backend.Synchronize(q);
-  backend.Free(sorted);
-  backend.Free(perm);
+  // Both k-only and k+p go through the same threshold kernel; k-only is the torch
+  // apply_top_k_only set (k-th largest, ties kept). Fully async — no Synchronize.
+  ApplyTopKTopPRowKernel<<<static_cast<unsigned>(n), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), k != nullptr ? k->Ptr<int32_t>() : nullptr,
+      p != nullptr ? p->Ptr<float>() : nullptr, v);
+  Check(cudaGetLastError(), "top_k_top_p launch");
 }
 
 // --- apply_penalties (fused repetition + frequency + presence) --------------

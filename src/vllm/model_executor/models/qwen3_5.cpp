@@ -618,11 +618,13 @@ bool FuseSiluQuantEnabled() {
 // GEMM the same packed/scale — removing the 2-3x redundant per-projection quant of
 // [T,H] (mirrors vLLM's fused qkv/gate_up MergedColumnParallelLinear = one quant).
 // Bit-identical only when the shared input_global_scale_inv match (guarded at the
-// call site). Default OFF; VT_FUSE_QUANT_ONCE=1 enables.
+// call site). DEFAULT ON (bit-identical + measured +0.3-0.5% on the 27B prefill,
+// mirrors vLLM's fused qkv/gate_up MergedColumnParallelLinear); VT_FUSE_QUANT_ONCE=0
+// restores per-projection quant for an A/B.
 bool FuseQuantOnceEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_QUANT_ONCE");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || (e[0] != '0');
   }();
   return on;
 }

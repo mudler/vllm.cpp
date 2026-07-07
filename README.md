@@ -86,6 +86,30 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
 | SYCL / XPU | Intel GPUs | 🗓 planned (post-MVP) |
 
+### Kernels & target hardware
+
+Every op has a portable **CPU reference** (the correctness oracle + the backbone
+other backends port from) and a **CUDA** implementation that mirrors the kernel
+vLLM actually runs (cited to upstream / its deps — flashinfer, cutlass, cuBLASLt).
+
+| Op / kernel | Implementation (upstream it mirrors) | CPU | CUDA · Blackwell (GB10, sm_121a) |
+|---|---|:--:|---|
+| Dense **W4A4** GEMM | cutlass fp4×fp4 (sm120a) + fp8 W8A8 — vLLM `cutlass_scaled_mm` | ✅ ref | ✅ |
+| MoE **W4A16** GEMM | Marlin + fp4-resident — vLLM `marlin` / `fused_moe` | ✅ ref | ✅ |
+| FP8 / bf16 projection GEMM | cuBLASLt col-major-TN → `nvjet_sm121` | ✅ ref | ✅ |
+| Prefill attention | flash-style WMMA (vLLM `flash_fwd`); vendored FA-2 🚧 wiring | ✅ ref | ✅ · FA-2 🚧 |
+| Decode attention (paged) | FlashInfer-style paged, GQA-fused | ✅ ref | ✅ |
+| GDN / linear-attn (chunk) | tensor-core WY solve — FLA `chunk_delta` | ✅ ref | ✅ |
+| Fused RMSNorm→fp4 quant | flashinfer `add_rmsnorm_fp4quant` | ✅ ref | ✅ |
+| Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
+| CUDA-graph decode | captured decode step (vLLM cudagraph) | — | ✅ (both models) |
+| Sampling (greedy/top-k/top-p/penalties) | vLLM V1 sampler, on-GPU sort-free | ✅ | ✅ |
+| RMSNorm / RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
+
+Arch fallbacks: cutlass fp4×fp4 needs **sm_120a+**; WMMA paths need **sm_80+**;
+cuBLASLt and the software fp4 ladder are portable across CUDA arches. Non-CUDA
+backends (Metal/Vulkan/ROCm/XPU) are 🗓 post-MVP and will port from the CPU ref.
+
 ## Quantization
 
 | Format | Status |

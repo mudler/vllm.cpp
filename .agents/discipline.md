@@ -6,10 +6,30 @@
   (C++-case-adjusted only where unavoidable). A vLLM developer must be able to
   navigate this repo blind; a PR touching `scheduler.py` maps to exactly one
   place here.
-- **Port, don't reinvent.** Read the upstream implementation before writing
-  any subsystem. Algorithms, edge cases, defaults, and even comments' intent
-  come from upstream. When upstream has a design quirk, we keep it (and note
-  why it exists) rather than "improving" it — divergence kills PR portability.
+- **Port, don't reinvent — GROUND EVERY IMPLEMENTATION IN UPSTREAM SOURCE.**
+  Read the upstream implementation before writing *any* subsystem OR kernel, and
+  mirror it. Algorithms, edge cases, defaults, PTX/intrinsics, tile/config
+  values, and even comments' intent come from upstream. When upstream has a
+  design quirk, we keep it (and note why it exists) rather than "improving" it —
+  divergence kills PR portability.
+  - **"Upstream" includes the whole chain, not just the vLLM repo.** The kernels
+    vLLM actually runs live in its DEPS — **flashinfer** (CuTe-DSL fp4/fp8 GEMMs,
+    fused norm+quant, `blackwell_sm12x`), **cutlass**, **cuBLASLt** (`nvjet`),
+    **DeepGEMM**, **TensorRT-LLM**, torch/Inductor codegen. Ground in *that*
+    source (read it, and for JIT/compiled code dump the generated kernel), then
+    port the same structure. See [parity-lever-protocol.md § Verify the whole
+    chain] and § Trace the execution.
+  - **Writing from scratch is EXCEPTIONAL — only when strictly necessary**, i.e.
+    no upstream (vLLM *or* dep) implementation exists to mirror, or the upstream
+    form is genuinely un-portable to eager-C++ (proven, not assumed — cite the
+    dep `file:line` / dumped kernel showing why). When you must, record the
+    reason in `.agents/porting-inventory.md` §9. A hand-rolled reinvention of
+    something upstream already does is a defect, not an optimization.
+  - **Every new kernel/implementation cites what it was ported FROM** — the
+    upstream `file:line` (vLLM or dep) in the code/commit. "Grounded in upstream"
+    means a reviewer can open that source and see we mirrored it. (User,
+    2026-07-07: *"every implementation you do should be grounded by upstream
+    source code, you should not re-implement things from scratch."*)
 - **Every ported file carries a header comment**: upstream path + upstream
   commit hash it was ported from. When re-syncing with upstream, diff that
   file against its recorded commit.

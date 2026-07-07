@@ -53,6 +53,18 @@ re-base the bench config without re-running vLLM on it. This is non-negotiable
 and applies to subagents. Full rule: [.agents/gates.md](.agents/gates.md)
 § PROTOCOL DIRECTIVE.
 
+**Acceptance rule — match or beat vLLM on EVERY axis, never below.** Benchmark
+against vLLM on ALL axes (total + output throughput, req/s, TTFT, TPOT/ITL, peak
+memory), BOTH gate models, at their large-concurrency operating point; ours must
+be ≥ vLLM (throughput) / ≤ vLLM (latency, memory) on every one, with correctness
+(16/16 token-for-token) as a precondition you may never trade off. Below vLLM on
+any axis = an open gap, not a done change; "near parity" is NOT met.
+**Reproduction is a gate:** record the exact repro recipe (commit, full command,
+seed, build, vLLM oracle cmd), re-run ≥2–3× to confirm within run-noise, use a
+same-binary A/B, and run only on an idle box (contended runs are void). A number
+that doesn't reproduce does not count. Full protocol:
+[.agents/benchmark-protocol.md](.agents/benchmark-protocol.md).
+
 ## STANDING DIRECTIVE — when stuck, SCAN vLLM vs ours (never accept a "ceiling")
 
 **Same architecture, same model, same GPU → if vLLM hits a number, we CAN too.**
@@ -105,6 +117,10 @@ submitting AI-assisted code, read
 - [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) — the
   **scan → re-adapt → find levers** loop: never accept a "ceiling"; when stuck,
   dynamic-workflow-scan vLLM's hot path vs ours to find the specific diffs.
+- [.agents/benchmark-protocol.md](.agents/benchmark-protocol.md) — **match or
+  beat vLLM on EVERY axis (never below)**; how to benchmark vs vLLM on all axes,
+  both models; **reproduction is a gate** (record recipe, re-run to confirm,
+  idle box, same-binary A/B).
 - [.agents/discipline.md](.agents/discipline.md) — **non-negotiable** porting
   rules: mirrored structure, port-don't-reinvent, upstream-commit file
   headers, recorded deviations, parity-first testing.

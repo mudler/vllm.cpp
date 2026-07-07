@@ -1072,6 +1072,55 @@ struct WmmaCfg<float> {
   }
 };
 
+// 128-bit (int4/float4) staging: one coalesced 16-byte transfer moves N=16/
+// sizeof(TD) activations (8 bf16 / 4 f32), addressed ONCE per group instead of
+// per element. Uf/Sf unpack/pack to f32 lanes with the SAME __bfloat162float /
+// __float2bfloat16(RNE) the scalar Load/Store use, so every staged value is
+// bit-identical; Cpy is a raw 16-byte copy (bf16↔f32 round-trip is the identity
+// for a value already in TD, so a direct copy reproduces Load→Store exactly).
+// This is the DeltaH/ChunkO analogue of the prefill-attention K/V-staging win.
+template <typename TD>
+struct V128;
+template <>
+struct V128<__nv_bfloat16> {
+  static constexpr int N = 8;
+  __device__ static void Uf(const __nv_bfloat16* p, float* f) {
+    const int4 v = *reinterpret_cast<const int4*>(p);
+    const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) f[i] = __bfloat162float(b[i]);
+  }
+  __device__ static void Sf(__nv_bfloat16* p, const float* f) {
+    int4 v;
+    __nv_bfloat16* b = reinterpret_cast<__nv_bfloat16*>(&v);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) b[i] = __float2bfloat16(f[i]);
+    *reinterpret_cast<int4*>(p) = v;
+  }
+  __device__ static void Sf0(__nv_bfloat16* p) { *reinterpret_cast<int4*>(p) = int4{0, 0, 0, 0}; }
+  __device__ static void Cpy(__nv_bfloat16* d, const __nv_bfloat16* s) {
+    *reinterpret_cast<int4*>(d) = *reinterpret_cast<const int4*>(s);
+  }
+};
+template <>
+struct V128<float> {
+  static constexpr int N = 4;
+  __device__ static void Uf(const float* p, float* f) {
+    const float4 v = *reinterpret_cast<const float4*>(p);
+    f[0] = v.x;
+    f[1] = v.y;
+    f[2] = v.z;
+    f[3] = v.w;
+  }
+  __device__ static void Sf(float* p, const float* f) {
+    *reinterpret_cast<float4*>(p) = float4{f[0], f[1], f[2], f[3]};
+  }
+  __device__ static void Sf0(float* p) { *reinterpret_cast<float4*>(p) = float4{0, 0, 0, 0}; }
+  __device__ static void Cpy(float* d, const float* s) {
+    *reinterpret_cast<float4*>(d) = *reinterpret_cast<const float4*>(s);
+  }
+};
+
 // DeltaH (WMMA). One block per (sequence, v-head), SEQUENTIAL over chunks.
 // f32 running state Hf[Dv,Dk] resident in dynamic shared; a pool is reused by
 // the two matmuls. Per chunk: snapshot start-state -> TD hstate; V1 v_new=u-W@Hᵀ
@@ -1082,8 +1131,9 @@ template <typename TD>
 __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, const TD* k,
                                          const TD* u, const TD* w, const float* gcum,
                                          const int32_t* qsl, const int32_t* boh, int64_t hk_n,
-                                         int64_t dk, int64_t hv_n, int64_t dv) {
+                                         int64_t dk, int64_t hv_n, int64_t dv, bool vec) {
   using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t n = blockIdx.x, hv = blockIdx.y;
   const int64_t hk = hv / (hv_n / hk_n);
@@ -1099,7 +1149,11 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
   __shared__ float decay[kChunk];
 
   float* s_head = state + (n * hv_n + hv) * sd;
-  for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = s_head[e];
+  if (vec)
+    for (int64_t g = tid; g < sd / 4; g += blockDim.x)
+      V128<float>::Cpy(Hf + g * 4, s_head + g * 4);
+  else
+    for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = s_head[e];
   __syncthreads();
 
   const int64_t nt = (seqlen + kChunk - 1) / kChunk;
@@ -1109,7 +1163,15 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
     const int64_t rem = seqlen - it * kChunk;
     const int64_t len = rem < kChunk ? rem : kChunk;
     TD* hstart = hstate + (gc * hv_n + hv) * sd;
-    for (int64_t e = tid; e < sd; e += blockDim.x) Store(hstart, e, Hf[e]);
+    if (vec)
+      for (int64_t g = tid; g < sd / V::N; g += blockDim.x) {
+        float f[V::N];
+#pragma unroll
+        for (int j = 0; j < V::N; ++j) f[j] = Hf[g * V::N + j];
+        V::Sf(hstart + g * V::N, f);
+      }
+    else
+      for (int64_t e = tid; e < sd; e += blockDim.x) Store(hstart, e, Hf[e]);
     const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
     const float eglast = expf(glast);
     for (int64_t i = tid; i < len; i += blockDim.x)
@@ -1120,8 +1182,16 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
     TD* Hb = reinterpret_cast<TD*>(pool);                        // [kNB,Dk] TD slice of Hf
     float* sTile = reinterpret_cast<float*>(Hb + kNB * dk);      // [kChunk,kNB] f32
     for (int64_t nb = 0; nb < dv; nb += kNB) {
-      for (int64_t e = tid; e < kNB * dk; e += blockDim.x)
-        Store(Hb, e, Hf[(nb + e / dk) * dk + e % dk]);
+      if (vec)
+        for (int64_t g = tid; g < (kNB * dk) / V::N; g += blockDim.x) {
+          float f[V::N];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) f[j] = Hf[nb * dk + g * V::N + j];
+          V::Sf(Hb + g * V::N, f);
+        }
+      else
+        for (int64_t e = tid; e < kNB * dk; e += blockDim.x)
+          Store(Hb, e, Hf[(nb + e / dk) * dk + e % dk]);
       __syncthreads();
       const int ntiles = (kChunk / kWM) * (kNB / kWM);
       for (int t = warp; t < ntiles; t += nwarps) {
@@ -1139,22 +1209,51 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
         wmma::store_matrix_sync(sTile + i0 * kNB + ct * kWM, acc, kNB, wmma::mem_row_major);
       }
       __syncthreads();
-      for (int64_t e = tid; e < kChunk * kNB; e += blockDim.x) {
-        const int64_t i = e / kNB, cvi = e % kNB;
-        if (i < len) {
-          const float uv = Load(u, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi);
-          Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uv - sTile[i * kNB + cvi]);
+      if (vec)
+        for (int64_t g = tid; g < (kChunk * kNB) / V::N; g += blockDim.x) {
+          const int64_t base = g * V::N;
+          const int64_t i = base / kNB, cvi = base % kNB;
+          if (i < len) {
+            float uf[V::N];
+            V::Uf(u + (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uf);
+#pragma unroll
+            for (int j = 0; j < V::N; ++j) uf[j] -= sTile[i * kNB + cvi + j];
+            V::Sf(v_new + (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uf);
+          }
         }
-      }
+      else
+        for (int64_t e = tid; e < kChunk * kNB; e += blockDim.x) {
+          const int64_t i = e / kNB, cvi = e % kNB;
+          if (i < len) {
+            const float uv = Load(u, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi);
+            Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uv - sTile[i * kNB + cvi]);
+          }
+        }
       __syncthreads();
     }
 
     // --- V2: H = H*exp(G_last) + V_newᵀ @ (K⊙decay)  ([Dv,len]@[len,Dk]) ---
     TD* Kd = reinterpret_cast<TD*>(pool);                       // [kChunk,Dk] TD, decay-scaled
-    for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
-      const int64_t i = e / dk, ki = e % dk;
-      Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
-    }
+    if (vec)
+      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+        const int64_t base = g * V::N;
+        const int64_t i = base / dk, ki = base % dk;
+        if (i < len) {
+          float kf[V::N];
+          V::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
+          const float d = decay[i];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) kf[j] *= d;
+          V::Sf(Kd + base, kf);
+        } else {
+          V::Sf0(Kd + base);
+        }
+      }
+    else
+      for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+        const int64_t i = e / dk, ki = e % dk;
+        Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+      }
     __syncthreads();
     const int ntiles2 = (dv / kWM) * (dk / kWM);
     for (int t = warp; t < ntiles2; t += nwarps) {
@@ -1174,7 +1273,11 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
     }
     __syncthreads();
   }
-  for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
+  if (vec)
+    for (int64_t g = tid; g < sd / 4; g += blockDim.x)
+      V128<float>::Cpy(s_head + g * 4, Hf + g * 4);
+  else
+    for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
 }
 
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
@@ -1184,8 +1287,9 @@ template <typename TD, typename Tout>
 __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const TD* v_new,
                                     const TD* hstate, const float* gcum, const int32_t* tok0a,
                                     const int32_t* lena, int64_t hk_n, int64_t dk, int64_t hv_n,
-                                    int64_t dv, float scale) {
+                                    int64_t dv, float scale, bool vec) {
   using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
   const int64_t hk = hv / (hv_n / hk_n);
@@ -1207,12 +1311,25 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
   TD* As = reinterpret_cast<TD*>(qks + kChunk * kChunk);                       // [kChunk,kChunk]
   __shared__ float gs[kChunk], eg[kChunk];
 
-  for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
-    const int64_t i = e / dk, d = e % dk;
-    const bool in = i < len;
-    Store(Qs, e, in ? Load(q, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
-    Store(Ks, e, in ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
-  }
+  if (vec)
+    for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+      const int64_t base = g * V::N;
+      const int64_t i = base / dk, d = base % dk;
+      if (i < len) {
+        V::Cpy(Qs + base, q + (tok0 + i) * hk_n * dk + hk * dk + d);
+        V::Cpy(Ks + base, k + (tok0 + i) * hk_n * dk + hk * dk + d);
+      } else {
+        V::Sf0(Qs + base);
+        V::Sf0(Ks + base);
+      }
+    }
+  else
+    for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+      const int64_t i = e / dk, d = e % dk;
+      const bool in = i < len;
+      Store(Qs, e, in ? Load(q, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+      Store(Ks, e, in ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+    }
   for (int64_t i = tid; i < len; i += blockDim.x) {
     gs[i] = gcum[(tok0 + i) * hv_n + hv];
     eg[i] = expf(gs[i]);
@@ -1719,6 +1836,19 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       const int v = std::atoi(e);
       if (v >= 32 && v <= 1024) occ_delta = occ_o = (static_cast<unsigned>(v) / 32u) * 32u;
     }
+    // The f32/TF32 DeltaH instantiation is register-heavier (96 vs the bf16 path's
+    // 70); regs×threads must fit the 64K/SM register file, so 96×768 would exceed
+    // it and fail to launch. Cap the f32 block at 640 (still 20 warps). f32 is the
+    // correctness-only corner (the benchmarked 35B GDN is bf16), so the marginal
+    // occupancy drop is immaterial; the bf16 hot path keeps its tuned 768.
+    if (sizeof(TSc) == 4 && occ_delta > 640u) occ_delta = 640u;
+    // 128-bit (int4/float4) staging for the DeltaH/ChunkO gmem+smem copy loops
+    // (measured ~32%/13% of those kernels): address-once + one coalesced 16-byte
+    // transfer per 8 bf16 / 4 f32, no per-element bf16↔f32 round-trip. Values are
+    // bit-identical (same RNE convert), so chunked==sequential is unchanged. A/B:
+    // VT_GDN_DELTAH_VEC=0 restores the scalar per-element staging in the same binary.
+    const char* dvec_env = std::getenv("VT_GDN_DELTAH_VEC");
+    const bool dvec = (dvec_env == nullptr || dvec_env[0] != '0');
     // Zero v_new so the over-allocated tail rows the matmuls may sweep
     // (their A operand is 0 there, but 0*NaN=NaN on the tensor core) are finite.
     Check(cudaMemsetAsync(v_new, 0, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
@@ -1731,7 +1861,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
            "gdn chunked delta_h(wmma) shared opt-in");
     GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
         state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv);
+        hk_n, dk, hv_n, dv, dvec);
     Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
 
     const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
@@ -1744,7 +1874,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
            "gdn chunked o(wmma) shared opt-in");
     GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
         out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
-        hk_n, dk, hv_n, dv, args.scale);
+        hk_n, dk, hv_n, dv, args.scale, dvec);
     Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
   } else if constexpr (std::is_same<Tin, float>::value) {
     // CUDA-core fallback — only reached for f32 corner dims (bf16 non-WMMA dims

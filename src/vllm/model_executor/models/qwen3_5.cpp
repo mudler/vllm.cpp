@@ -586,6 +586,26 @@ DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dty
   return dout;
 }
 
+// Same per-tensor W8A8 fp8 GEMM as MatmulFp8CutlassD but on an ALREADY-quantized
+// activation `a_fp8` [M,K] (the QuantFp8Static output). Lets two projections that
+// carry the SAME input_scale (GDN in_proj_qkv+z) share ONE activation quant of h
+// instead of re-quantizing h once per projection — the fp8 activation bytes are
+// identical when the input_scale matches, so the two GEMMs are bit-for-bit what
+// the two independent MatmulFp8CutlassD calls produced (mirror vLLM in_proj_qkvz,
+// ONE MergedColumnParallelLinear → one activation quant). CUDA-only.
+DBuf MatmulFp8PrequantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, DType out_dtype) {
+  const int64_t M = a_fp8.shape[0], N = w.n;
+  VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
+           "MatmulFp8PrequantD: the fp8 W8A8 path is CUDA-only");
+  Tensor wdev = ResidentFp8(d, w);
+  DBuf dout(d, out_dtype, {M, N});
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8, wdev, w.alpha);
+  else
+    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8, wdev, w.alpha);
+  return dout;
+}
+
 // TRUE W4A4 toggle (A/B; default ON — mirrors vLLM, which runs this checkpoint as
 // use_a16=False true-W4A4, notes §7.1). Set VT_W4A4_TRUE=0 to fall back to the
 // W4A16 6a fast path (bf16 activations) for a throughput A/B. Only affects
@@ -1004,6 +1024,53 @@ DType ResidualDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
+// GDN in_proj qkv+z quant fusion (default ON). vLLM builds `in_proj_qkvz` as ONE
+// MergedColumnParallelLinear (qwen_gdn_linear_attn.py:480-486) → ONE fp8 GEMM +
+// ONE static activation quant of the hidden state h, then `.split()`s the output
+// into qkv/z. OUR old path ran two independent MatmulFp8CutlassD (in_proj_qkv,
+// in_proj_z), each of which re-quantized the SAME h to fp8 — so h was quantized to
+// fp8 TWICE per GDN layer. This fuses that into ONE QuantFp8Static shared by both
+// projections' GEMMs (see GdnInProjQkvZ). It is enabled ONLY when the two
+// projections carry an IDENTICAL per-tensor input_scale (verified true for all 30
+// GDN layers of the 35B checkpoint); in that case the shared quant is BIT-FOR-BIT
+// what the two separate quants produced, so the two fp8 GEMMs (kept separate, each
+// with its own weight_scale/alpha — more precise than requantizing both to a
+// shared max weight_scale) get identical inputs and the block output is unchanged.
+// VT_GDN_INPROJ_FUSE=0 restores the 2-quant path (parent A/B).
+bool GdnInprojFuseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_INPROJ_FUSE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// The GDN in_proj qkv (mixed [T,conv_dim]) and z ([T,value_dim]) projections of h.
+// fp8 (35B): ONE shared QuantFp8Static of h then two fp8 GEMMs reuse the fp8
+// activation (fuse-gate ON and matching input_scale); else the old per-projection
+// MatmulFp8CutlassD (2 quants). bf16 / GGUF: plain matmuls (no activation quant to
+// share) — unchanged. See GdnInprojFuseEnabled for the semantics.
+struct GdnQkvZ {
+  DBuf mixed;  // [T, conv_dim]
+  DBuf z;      // [T, value_dim]
+};
+GdnQkvZ GdnInProjQkvZ(Dev d, const GdnLayerWeights& w, const Tensor& h) {
+  if (!w.in_proj_qkv_fp8.Empty()) {
+    const Fp8Weight& wq = w.in_proj_qkv_fp8;
+    const Fp8Weight& wz = w.in_proj_z_fp8;
+    if (GdnInprojFuseEnabled() && wq.input_scale == wz.input_scale) {
+      const int64_t M = h.shape[0], K = h.shape[1];
+      DBuf a_fp8(d, DType::kI8, {M, K});
+      vt::QuantFp8Static(d.q, a_fp8.t(), h, wq.input_scale);  // ONE quant of h
+      return GdnQkvZ{MatmulFp8PrequantD(d, a_fp8.t(), wq, DType::kF32),
+                     MatmulFp8PrequantD(d, a_fp8.t(), wz, DType::kF32)};
+    }
+    return GdnQkvZ{MatmulFp8CutlassD(d, h, wq, DType::kF32),
+                   MatmulFp8CutlassD(d, h, wz, DType::kF32)};
+  }
+  return GdnQkvZ{MatmulF32D(d, h, w.in_proj_qkv), MatmulF32D(d, h, w.in_proj_z)};
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -1021,12 +1088,11 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
-  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
-                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
-                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  // qkv+z: fp8 (35B) shares ONE QuantFp8Static of h across both GEMMs (fuse-gate,
+  // GdnInProjQkvZ) — no duplicate h-quant; else bf16 (default / GGUF).
+  GdnQkvZ qkvz = GdnInProjQkvZ(d, w, h);
+  DBuf& mixed = qkvz.mixed;                        // [T,conv_dim]
+  DBuf& z = qkvz.z;                                // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -1185,12 +1251,11 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
-  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
-                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
-                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  // qkv+z: fp8 (35B) shares ONE QuantFp8Static of h across both GEMMs (fuse-gate,
+  // GdnInProjQkvZ) — no duplicate h-quant; else bf16 (default / GGUF).
+  GdnQkvZ qkvz = GdnInProjQkvZ(d, w, h);
+  DBuf& mixed = qkvz.mixed;                        // [T,conv_dim]
+  DBuf& z = qkvz.z;                                // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 

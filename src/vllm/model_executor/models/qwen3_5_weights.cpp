@@ -115,16 +115,30 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
-// cutlass W8A8 fp8 path opt-in (default OFF). The default dequants the fp8 attn/
-// GDN projections to bf16 AT LOAD (LoadFp8Transposed) and runs the cublas/vt
-// bf16 W8A16 GEMM. VT_FP8_CUTLASS=1 keeps the fp8 bytes resident + loads the
-// static input_scale, and the forward runs the lifted vLLM cutlass W8A8 GEMM
-// (static per-tensor activation quant + fp8 tensor cores) — mirroring vLLM's
-// actual scheme for these projections (the checkpoint IS W8A8). Load-time gate
-// so the default bf16 path is byte-for-byte untouched (main not regressed).
-bool Fp8CutlassEnabled() {
-  const char* e = std::getenv("VT_FP8_CUTLASS");
-  return e != nullptr && e[0] == '1';
+// Native-precision dense projections — keep the 35B's per-tensor FP8 W8A8 attn
+// (q/k/v/o) + GDN (in_proj_qkv/z, out_proj) weights RESIDENT in fp8 (LoadFp8Raw)
+// + load the static input_scale, so the forward runs a native fp8 W8A8 GEMM
+// (static per-tensor activation quant + fp8 tensor cores — either the cutlass
+// sm120 kernel or, by default, cuBLASLt fp8; see MatmulFp8CutlassD /
+// DenseCublasLtFp8Enabled). Mirrors vLLM's actual scheme (the checkpoint IS
+// W8A8) and HALVES those projections' weight bytes vs bf16.
+//   DEFAULT ON (VT_DENSE_NATIVE) on a CUDA+cutlass build. VT_DENSE_NATIVE=0 (or
+// the legacy VT_FP8_CUTLASS=0) restores the dequant-fp8->bf16-AT-LOAD path
+// (LoadFp8Transposed into the bf16 fields + cublas bf16 W8A16) — the previous
+// default, kept for the parent's A/B (and the only path on a build WITHOUT the
+// fp8 cutlass kernel, guarded by VT_CUTLASS_FP8 so we never route to an
+// uncompiled GEMM). The dense NVFP4 sinks (shared-expert + lm_head) are already
+// native (fp4-resident + Marlin W4A16) and not gated here.
+bool DenseNativeEnabled() {
+#ifdef VT_CUTLASS_FP8
+  const char* dn = std::getenv("VT_DENSE_NATIVE");
+  if (dn != nullptr && dn[0] == '0') return false;
+  const char* legacy = std::getenv("VT_FP8_CUTLASS");  // back-compat opt-out
+  if (legacy != nullptr && legacy[0] == '0') return false;
+  return true;
+#else
+  return false;
+#endif
 }
 
 // Per-tensor FP8 projection `<proj>.weight` F8_E4M3 [out,in] + `.weight_scale`
@@ -212,9 +226,9 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 GdnLayerWeights LoadGdn(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
-  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
-  if (Fp8CutlassEnabled()) {
+  // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8 GEMM.
+  // VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields (parent A/B).
+  if (DenseNativeEnabled()) {
     g.in_proj_qkv_fp8 = LoadFp8Raw(get, la + "in_proj_qkv");
     g.in_proj_z_fp8 = LoadFp8Raw(get, la + "in_proj_z");
     g.out_proj_fp8 = LoadFp8Raw(get, la + "out_proj");
@@ -241,9 +255,9 @@ FullAttnLayerWeights LoadAttn(const TensorResolver& get,
                               const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  // W8A8 cutlass (35B): keep raw fp8 + input_scale, run the lifted cutlass GEMM.
-  // VT_FP8_CUTLASS=0 restores dequant-at-load into the bf16 fields (default A/B).
-  if (Fp8CutlassEnabled()) {
+  // W8A8 fp8 (35B), DEFAULT: keep raw fp8 + input_scale, run the native fp8 GEMM.
+  // VT_DENSE_NATIVE=0 restores dequant-at-load into the bf16 fields (parent A/B).
+  if (DenseNativeEnabled()) {
     a.q_proj_fp8 = LoadFp8Raw(get, sa + "q_proj");
     a.k_proj_fp8 = LoadFp8Raw(get, sa + "k_proj");
     a.v_proj_fp8 = LoadFp8Raw(get, sa + "v_proj");

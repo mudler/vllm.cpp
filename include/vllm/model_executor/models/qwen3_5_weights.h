@@ -138,11 +138,12 @@ struct GdnLayerWeights {
   // the bf16 out_proj and leave this empty. Exactly one is filled.
   Nvfp4Weight out_proj_fp4;   // [N=H, K=value_dim]
 
-  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
-  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
-  // in_proj_qkv/z/out_proj above are then left EMPTY and the forward calls
-  // vt::MatmulFp8Cutlass. The 27B (bf16 in_proj + fp4 out_proj) and GGUF/synthetic
-  // (bf16) loaders leave these empty. The forward checks fp8, then fp4, then bf16.
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
+  // real 35B CUDA+cutlass load (VT_DENSE_NATIVE); the bf16 in_proj_qkv/z/out_proj
+  // above are then left EMPTY and the forward calls the native fp8 GEMM (cuBLASLt
+  // fp8 by default, or cutlass fp8 under VT_DENSE_CUBLASLT_FP8=0). VT_DENSE_NATIVE
+  // =0 flips back to the bf16 fields. The 27B (bf16 in_proj + fp4 out_proj) and
+  // GGUF/synthetic (bf16) loaders leave these empty. Forward checks fp8, fp4, bf16.
   Fp8Weight in_proj_qkv_fp8;  // [N=conv_dim, K=H]
   Fp8Weight in_proj_z_fp8;    // [N=value_dim, K=H]
   Fp8Weight out_proj_fp8;     // [N=H, K=value_dim]
@@ -167,11 +168,12 @@ struct FullAttnLayerWeights {
   Nvfp4Weight v_proj_fp4;  // [N=Hkv*Dh,  K=H]
   Nvfp4Weight o_proj_fp4;  // [N=H,       K=Hq*Dh]
 
-  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated on the real 35B
-  // CUDA load with the cutlass W8A8 path enabled (VT_FP8_CUTLASS); the bf16
-  // q/k/v/o_proj above are then left EMPTY and the forward calls
-  // vt::MatmulFp8Cutlass. The 27B (fp4) and GGUF/synthetic (bf16) loaders leave
-  // these empty. The forward checks fp8, then fp4, then falls back to bf16.
+  // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
+  // real 35B CUDA+cutlass load (VT_DENSE_NATIVE); the bf16 q/k/v/o_proj above are
+  // then left EMPTY and the forward calls the native fp8 GEMM (cuBLASLt fp8 by
+  // default, or cutlass fp8 under VT_DENSE_CUBLASLT_FP8=0). VT_DENSE_NATIVE=0
+  // flips back to the bf16 fields. The 27B (fp4) and GGUF/synthetic (bf16)
+  // loaders leave these empty. Forward checks fp8, then fp4, then bf16.
   Fp8Weight q_proj_fp8;  // [N=2*Hq*Dh, K=H]
   Fp8Weight k_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]

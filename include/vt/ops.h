@@ -38,6 +38,7 @@ enum class OpId : uint8_t {
   kMatmulNvfp4Fp4,
   kMatmulNvfp4Cutlass,
   kMatmulFp8Cutlass,
+  kMatmulFp8CublasLt,
   kQuantFp8Static,
   kSwizzleBlockscale,
   kMoeGroupedGemmNvfp4,
@@ -161,6 +162,8 @@ using MatmulNvfp4Fp4Fn =
 using MatmulNvfp4CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulFp8CutlassFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
+using MatmulFp8CublasLtFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -352,6 +355,24 @@ void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scal
 // K,N multiples of 16 (128-bit fp8 alignment). CUDA-only (sm120a).
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha);
+
+// MatmulFp8CublasLt — cuBLASLt FP8 (e4m3) dense GEMM, the native equivalent of
+// vLLM's cuBLASLt fp8 path (the `nvjet_sm121_qqtst_*` / `qq*` kernels that
+// torch._scaled_mm / cublasLt select for the 35B's fp8 dense projections on
+// GB10/sm_121a). Same host surface + same math as MatmulFp8Cutlass — both fold
+// the two per-tensor static scales into one f32 alpha (= input_scale*weight_
+// scale) applied to the fp32 accumulator:
+//   out[M,N] = alpha * (A_fp8[M,K] @ B_fp8[N,K]^T)
+// but routed through cublasLtMatmul (CUBLAS_COMPUTE_32F, e4m3 A/B, f32 scale)
+// instead of the cutlass sm120 kernel. cuBLASLt fp8 requires the TN layout
+// (contraction K contiguous for both operands) — a_fp8 [M,K] and b_fp8 [N,K]
+// row-major already satisfy it. a_fp8 [M,K] (= QuantFp8Static output), b_fp8
+// [N,K] the on-disk raw fp8-e4m3fn weight (K contiguous). out [M,N] bf16 or f32
+// (cublasLt writes the requested output type directly). K,N multiples of 16.
+// CUDA-only. Falls back to the cutlass fp8 GEMM if cublasLt has no fp8 heuristic
+// for a given shape (keeps the correctness gate robust on odd M).
+void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                       float alpha);
 
 // --- Fused MoE grouped NVFP4 GEMM (M2.4). One kernel launch computes the expert
 // projection for ALL (token, activated-expert) pairs at once, instead of the

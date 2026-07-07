@@ -6,6 +6,10 @@
 // CUBLAS_COMPUTE_32F with f32 scale; all layouts are CUBLASLT_ORDER_ROW so no
 // host-side transposes are needed.
 // Upstream counterpart: torch.matmul/cublas path (no csrc kernel); cuBLASLt is our native equivalent.
+//
+// Also hosts MatmulFp8CublasLt (see the block comment near the bottom): the
+// cuBLASLt FP8 (e4m3) dense GEMM — the native equivalent of vLLM's cuBLASLt fp8
+// path (nvjet_sm121_qqtst_* kernels) — reusing this same handle + workspace.
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
@@ -176,12 +180,96 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
           "cublasLtMatmul");
 }
 
+// ---- cuBLASLt FP8 (e4m3) dense GEMM ---------------------------------------
+// The native equivalent of vLLM's cuBLASLt fp8 dense path (the
+// `nvjet_sm121_qqtst_*` / `qq*` kernels torch._scaled_mm / cublasLt select for
+// the 35B fp8 projections on GB10/sm_121a). Reuses the SAME cublasLt handle +
+// 32 MB workspace as the bf16 dense GEMM above; only the matmul descriptor
+// changes to the fp8 config: CUBLAS_COMPUTE_32F, e4m3 A/B, f32 scale.
+//
+// cuBLASLt fp8 requires the "TN" layout — the contraction dim K must be the
+// contiguous (leading) dim of BOTH operands. Our activation a_fp8 [M,K] and
+// weight b_fp8 [N,K] are row-major (K contiguous), so they already satisfy it
+// with no host-side transpose. We compute the row-major out[M,N] as its
+// column-major transpose out^T[N,M] = op(weight,T)[N,K] @ op(act,N)[K,M]:
+//   A = weight  : col-major [K,N] (rows=K,cols=N,ld=K), TRANSA=OP_T  (= [N,K] row-major)
+//   B = act     : col-major [K,M] (rows=K,cols=M,ld=K), TRANSB=OP_N  (= [M,K] row-major)
+//   C = D = out : col-major [N,M] (rows=N,cols=M,ld=N)               (= [M,N] row-major)
+// The two per-tensor static scales are folded into the host alpha (=
+// input_scale*weight_scale) applied to the fp32 accumulator — identical math to
+// MatmulFp8Cutlass (per-tensor scalars: dequant = fp8 * scale, and
+// alpha*(A_fp8@B_fp8) reproduces sum dequant(a)*dequant(w)). If cublasLt has no
+// fp8 heuristic for a given shape (e.g. tiny M on some drivers), we fall back to
+// the already-16/16-validated cutlass fp8 GEMM so the correctness gate holds.
+void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                                 float alpha) {
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  if (k == 0) {  // empty reduction: out = 0 (f32 and bf16 zero are all-zero bytes)
+    CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "fp8 k=0 memset");
+    return;
+  }
+
+  const LtContext ctx = GetContext(q.device.index);
+  const cudaDataType_t out_type = out.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF;
+
+  DescGuard desc;
+  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "fp8 cublasLtMatmulDescCreate");
+  const cublasOperation_t op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)),
+          "fp8 set TRANSA=T");
+  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)),
+          "fp8 set TRANSB=N");
+
+  // Column-major layouts (default order — NOT ORDER_ROW; fp8 needs the native
+  // col-major TN form). See the derivation in the block comment above.
+  LayoutGuard la, lb, lc;
+  CheckLt(cublasLtMatrixLayoutCreate(&la.v, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(n), k),
+          "fp8 Adesc (weight)");
+  CheckLt(cublasLtMatrixLayoutCreate(&lb.v, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(m), k),
+          "fp8 Bdesc (act)");
+  CheckLt(cublasLtMatrixLayoutCreate(&lc.v, out_type, static_cast<uint64_t>(n),
+                                     static_cast<uint64_t>(m), n),
+          "fp8 Cdesc (out)");
+
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "fp8 cublasLtMatmulPreferenceCreate");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "fp8 set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
+
+  cublasLtMatmulHeuristicResult_t heur{};
+  int returned = 0;
+  const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+      ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v, /*requestedAlgoCount=*/1, &heur,
+      &returned);
+  if (hst != CUBLAS_STATUS_SUCCESS || returned == 0) {
+    // No cublasLt fp8 kernel for this shape/config -> keep the gate robust by
+    // routing to the already-validated cutlass fp8 GEMM (same fp8 math).
+    ::vt::MatmulFp8Cutlass(q, out, a_fp8, b_fp8, alpha);
+    return;
+  }
+
+  // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
+  const float beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b_fp8.data, la.v, a_fp8.data, lb.v, &beta,
+                         out.data, lc.v, out.data, lc.v, &heur.algo, ctx.workspace, kWorkspaceBytes,
+                         s),
+          "fp8 cublasLtMatmul");
+}
+
 // Registers the CUDA matmul during static init (table fill only, no CUDA
 // calls — see cuda_ops.cu for the rationale).
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernelCuda)));
+    RegisterOp(OpId::kMatmulFp8CublasLt, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MatmulFp8CublasLtFn>(&MatmulFp8CublasLtKernelCuda)));
   }
 } registrar;
 

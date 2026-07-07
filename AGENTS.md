@@ -38,10 +38,25 @@ vLLM's selection logic, including what it selects on GB10/sm_121. Only escalate
 genuine PRODUCT/scope calls vLLM can't answer (e.g. "is model X in the MVP?"),
 never "how should feature X behave?" (→ mirror vLLM).
 
-**GROUND EVERY CHECK IN vLLM SOURCE.** Do not decide behavior from memory or
-assumption — read the actual pinned vLLM code (`/home/mudler/_git/vllm` @ the
-parity pin `e24d1b24`) every time, cite `file:line`, and mirror what you find.
-This applies to every subagent and every design/parity check.
+**GROUND EVERY CHECK IN THE WHOLE EXECUTION CHAIN, not just the vLLM repo.** vLLM
+is an ORCHESTRATION layer — the kernels that actually run (and that make it fast)
+live in its DEPENDENCIES: **flashinfer** (CuTe-DSL / cutlass fp4·fp8 GEMMs, fused
+norm+quant, MoE, sm_121 "blackwell_sm12x" kernels), **cutlass**, **cuBLASLt**
+(nvjet), **DeepGEMM**, and **torch/Inductor** (the fused Triton it codegens). Read
+the actual pinned vLLM code (`/home/mudler/_git/vllm` @ pin `e24d1b24`) AND, as
+needed, the installed dep source (`~/venvs/vllm-oracle/lib/python3.12/site-packages/`
+— e.g. `flashinfer/cute_dsl/*.py`, `flashinfer/gemm/`), cite `file:line` on every
+side, and mirror what you find. **NEVER declare a lever "build-specific",
+"unverifiable", or "out of reach" without first inspecting the dep chain and, for
+compiled/JIT/Inductor code, DUMPING the generated kernel** — `TORCH_LOGS=output_code`
+/ `TORCH_COMPILE_DEBUG=1` for Inductor Triton; nsys kernel names +
+`cublasLtMatmulAlgoGetHeuristic` for cuBLASLt selection; the CuTe-DSL / cutlass
+source for flashinfer. A fusion "absent from vLLM's csrc" may live in flashinfer
+(e.g. `add_rmsnorm_fp4quant` — the fused Add+RMSNorm+FP4-quant we initially and
+WRONGLY declared nonexistent). Verify the whole chain as necessary. This applies to
+every subagent and every design/parity check. Full method:
+[.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § Verify the
+whole chain.
 
 ## STANDING DIRECTIVE — always compare vs vLLM (the oracle), same workload
 

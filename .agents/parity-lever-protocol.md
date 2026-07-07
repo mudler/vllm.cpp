@@ -76,9 +76,39 @@ In one session the loop turned every "ceiling" into a concrete lever and took th
   dense at 72ms when it was 15ms, and named two neutral levers).
 - vLLM's baselines **drift** — always re-measure the vLLM denominator on the
   IDENTICAL workload (e.g. 35B 2768→3145, 27B 397→452 across re-measures).
-- Distinguish the few vLLM edges that are **build-specific** (Inductor epilogue
-  fusion, DeepGEMM, flashinfer-cutlass exact accumulation) — which eager-C++
-  cannot replicate 1:1 — from the many that are plain code/config diffs we CAN.
 - Compare at the **right operating point**: "large concurrency" is the gate; a
   single-wave (np=conc) measurement hides sustained-load effects, and a
   memory-tight model may need a different concurrency than the 35B.
+
+## Verify the WHOLE chain (vLLM is orchestration; the kernels live in its deps)
+
+**Do not scope "what vLLM does" to the vLLM repo.** vLLM dispatches to kernels in
+its dependencies; a lever "absent from vLLM's `csrc/`" often lives one layer down.
+Before calling anything "build-specific / unverifiable / out of reach", inspect the
+chain and, for compiled/JIT code, DUMP the generated kernel:
+
+- **flashinfer** (`~/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/`):
+  the real fp4/fp8 GEMMs + fused kernels, many as **readable CuTe-DSL Python** — e.g.
+  `cute_dsl/add_rmsnorm_fp4quant.py` (fused Add+RMSNorm+FP4-quant), `cute_dsl/
+  rmsnorm_fp4quant.py`, `gemm/` (the fp4 GEMM + its tactic selection),
+  `fused_moe/cute_dsl/blackwell_sm12x/` (sm_121-specific). CuTe-DSL is portable — read
+  it and hand-write the equivalent CUDA. (This is how we found the rms+fp4 fusion we
+  had WRONGLY declared nonexistent from vLLM's csrc alone — 2026-07-07.)
+- **cuBLASLt kernel selection** (closed, but OBSERVABLE): `nsys` shows the exact
+  kernel name (e.g. `cutlass_80_tensorop_*` sm_80 vs `nvjet_sm121_*`); probe
+  `cublasLtMatmulAlgoGetHeuristic` to see what it picks for a given shape/dtype
+  (e.g. bf16→f32 vs bf16→bf16 output) before assuming a reselect.
+- **torch/Inductor**: run the real oracle with `TORCH_LOGS=output_code` /
+  `TORCH_COMPILE_DEBUG=1` and READ the generated Triton — the fusions are a specific,
+  finite set for these specific ops, not "arbitrary". Most are hand-portable once read.
+- **cutlass / DeepGEMM**: vendored + in flashinfer; read the actual tile/config/
+  scheduler the dep instantiates for our shapes and mirror it.
+
+Only after reading the dep source AND (for JIT/compiled) dumping the generated kernel
+may you conclude a lever is genuinely irreducible for eager-C++ — and say exactly why
+(cite the dep file:line / the dumped kernel). The default assumption is PORTABLE.
+
+- Distinguish the few genuinely irreducible edges (proven so by the above) from the
+  many that are plain code/config/dtype/algorithm diffs — but prove it, don't assume
+  it. The CLEAN nsys slice of OURS (above) tells you WHERE to look; the dep chain
+  tells you WHAT vLLM actually runs there.

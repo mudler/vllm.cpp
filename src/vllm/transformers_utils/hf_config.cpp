@@ -159,6 +159,46 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.rotary_dim = static_cast<int64_t>(partial_rotary_factor *
                                           static_cast<double>(cfg.head_dim));
 
+    // RoPE completeness guard (dep-audit 2026-07-07): we implement ONLY plain
+    // (unscaled) NeoX RoPE (RopeNeox, cuda_ops.cu). vLLM's get_rope bakes
+    // yarn/linear/llama3/longrope/mrope/dynamic scaling into a cos_sin_cache
+    // (rotary_embedding/__init__.py). A checkpoint declaring any such variant would
+    // otherwise be SILENTLY given unscaled embeddings — wrong output, no error signal.
+    // HARD-FAIL at load instead; relax per-variant as each is implemented.
+    // NOTE: `rope_type: "default"` with an `mrope_section` (the Qwen3.6 gate models)
+    // is TEXT-SAFE: for text-only input all mrope position dims equal the text
+    // position, so interleaved mrope collapses to plain NeoX — our text path is
+    // correct. (mrope only diverges for multimodal image/video positions, which we
+    // do not serve yet; guard that when the ViT path lands.) Only a genuine SCALING
+    // rope_type (yarn/linear/llama3/longrope/dynamic) would silently miscompute here.
+    for (const char* rope_key : {"rope_scaling", "rope_parameters"}) {
+      const nlohmann::json* rs = FindObject(text, rope_key);
+      if (rs == nullptr) continue;  // absent or null => plain NeoX, fine
+      std::string rtype = GetString(*rs, "rope_type");
+      if (rtype.empty()) rtype = GetString(*rs, "type");
+      const bool is_plain = rtype.empty() || rtype == "default";
+      if (!is_plain) {
+        throw std::runtime_error(
+            "hf_config: checkpoint declares rope " + std::string(rope_key) +
+            " type '" + rtype +
+            "' which vllm.cpp does not implement yet (only plain unscaled NeoX RoPE). "
+            "Refusing to load rather than silently emit unscaled embeddings; implement "
+            "the variant (cos_sin_cache in RopeNeox) before using this checkpoint.");
+      }
+    }
+    // rope_theta / partial_rotary_factor may live under the newer nested
+    // `rope_parameters` (Qwen3.6) rather than at the text_config top level. Prefer
+    // the nested values when present so we don't silently fall back to the 10000
+    // default when the checkpoint sets e.g. rope_theta=1e7. (dep-audit 2026-07-07)
+    if (const nlohmann::json* rp = FindObject(text, "rope_parameters")) {
+      const double rp_theta = GetDouble(*rp, "rope_theta", cfg.rope_theta);
+      if (rp_theta != cfg.rope_theta) cfg.rope_theta = rp_theta;
+      const double rp_prf = GetDouble(*rp, "partial_rotary_factor", partial_rotary_factor);
+      if (rp_prf != partial_rotary_factor) {
+        cfg.rotary_dim = static_cast<int64_t>(rp_prf * static_cast<double>(cfg.head_dim));
+      }
+    }
+
     cfg.rms_norm_eps = GetDouble(text, "rms_norm_eps", 0.0);
     cfg.max_position_embeddings = GetInt(text, "max_position_embeddings", 0);
     // torch_dtype lives under the text config for nested wrappers, but some

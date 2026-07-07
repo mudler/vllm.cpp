@@ -92,6 +92,31 @@ void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tenso
       q, out_packed, out_scale, x, input_global_scale_inv);
 }
 
+void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
+                     const Tensor& up, float input_global_scale_inv) {
+  VT_CHECK(gate.rank == 2 && up.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
+           "silu_mul_fp4_quant: gate/up/out_packed/out_scale must be rank-2");
+  const int64_t m = gate.shape[0], i = gate.shape[1];
+  VT_CHECK(up.shape[0] == m && up.shape[1] == i, "silu_mul_fp4_quant: gate/up shape mismatch");
+  VT_CHECK(i % 16 == 0, "silu_mul_fp4_quant: I (inner dim) must be a multiple of 16");
+  VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == i / 2,
+           "silu_mul_fp4_quant: out_packed must be [M, I/2]");
+  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
+           "silu_mul_fp4_quant: out_scale must be [M, I/16]");
+  VT_CHECK(IsFloat(gate.dtype) && gate.dtype == up.dtype,
+           "silu_mul_fp4_quant: gate/up must be the same float dtype");
+  VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
+           "silu_mul_fp4_quant: out_packed/out_scale must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(gate.IsContiguous() && up.IsContiguous() && out_packed.IsContiguous() &&
+               out_scale.IsContiguous(),
+           "silu_mul_fp4_quant: contiguous tensors required");
+  VT_CHECK(gate.device == q.device && up.device == q.device && out_packed.device == q.device &&
+               out_scale.device == q.device,
+           "silu_mul_fp4_quant: device mismatch");
+  reinterpret_cast<SiluMulFp4QuantFn>(GetOp(OpId::kSiluMulFp4Quant, q.device.type))(
+      q, out_packed, out_scale, gate, up, input_global_scale_inv);
+}
+
 void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
                     const Tensor& b_packed, const Tensor& b_scale, float alpha) {
   VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_scale.rank == 2 && b_packed.rank == 2 &&

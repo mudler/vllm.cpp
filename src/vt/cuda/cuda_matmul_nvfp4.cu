@@ -1014,6 +1014,88 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
   Check(cudaGetLastError(), "scaled_fp4_quant kernel launch");
 }
 
+// FUSED silu-mul -> NVFP4 quant (mirror vllm ActivationQuantFusionPass /
+// silu_and_mul_nvfp4_quant, act_quant_fusion.py:40 + activation_nvfp4_quant_fusion
+// _kernels.cu). Removes the bf16 intermediate the unfused MoeSiluMul(->bf16) +
+// ScaledFp4Quant writes+reads on the memory-bound prefill. One thread per
+// (row, 16-group), same grid as ScaledFp4QuantKernel. gate/up are [M,I] (our
+// two-input MoeSiluMul form, qwen3_5.cpp DenseMlpBlock). BIT-IDENTICAL to
+// MoeSiluMul(->bf16) then ScaledFp4Quant: silu(gate)*up is ROUNDED THROUGH bf16
+// (MoeSiluMul stores bf16) before quant, reusing the exact ScaledFp4Quant epilogue.
+template <typename Tin>
+__global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin* gate,
+                                      const Tin* up, float input_global_scale, int64_t m_rows,
+                                      int64_t i_dim, bool approx_recip) {
+  const int64_t groups = i_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= m_rows * groups) return;
+  const int64_t row = gid / groups;
+  const int64_t g = gid % groups;
+  const int64_t base = row * i_dim + g * 16;
+  // silu(gate)*up, rounded through bf16 (== MoeSiluMul store to bf16, cuda_ops.cu:149).
+  float v[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const float gg = Load(gate, base + j);
+    const float uu = Load(up, base + j);
+    const float sm = (gg / (1.0f + expf(-gg))) * uu;
+    v[j] = __bfloat162float(__float2bfloat16(sm));
+  }
+  // --- exact ScaledFp4QuantKernel epilogue (cuda_matmul_nvfp4.cu:960-989) over v ---
+  float vmax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(v[j]));
+  float sc = input_global_scale * (vmax * (1.0f / 6.0f));
+  sc = fminf(fmaxf(sc, -448.0f), 448.0f);
+  const uint8_t sc8 = F32ToFp8Dev(sc);
+  scale[row * groups + g] = sc8;
+  const float sfv = F8E4M3ToF32Dev(sc8);
+  float out_scale = 0.0f;
+  if (sfv != 0.0f) {
+    if (approx_recip) {
+      float rcp;
+      asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(sfv));
+      out_scale = input_global_scale * rcp;
+    } else {
+      out_scale = input_global_scale / sfv;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 16; j += 2) {
+    const float lo = fminf(fmaxf(v[j] * out_scale, -6.0f), 6.0f);
+    const float hi = fminf(fmaxf(v[j + 1] * out_scale, -6.0f), 6.0f);
+    packed[(base + j) / 2] =
+        static_cast<uint8_t>(CastToFp4NibbleDev(lo) | (CastToFp4NibbleDev(hi) << 4));
+  }
+}
+
+void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                               const Tensor& gate, const Tensor& up,
+                               float input_global_scale_inv) {
+  const int64_t m = gate.shape[0], i = gate.shape[1];
+  if (m == 0 || i == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int64_t total = m * (i / 16);
+  constexpr int kBlock = 256;
+  const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
+  auto* pk = out_packed.Ptr<uint8_t>();
+  auto* sc = out_scale.Ptr<uint8_t>();
+  const bool approx = NativeFp4MmaEnabled();  // pair fused/unfused reciprocal choice
+  switch (gate.dtype) {
+    case DType::kF32:
+      SiluMulFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(
+          pk, sc, gate.Ptr<float>(), up.Ptr<float>(), input_global_scale_inv, m, i, approx);
+      break;
+    case DType::kBF16:
+      SiluMulFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+          pk, sc, gate.Ptr<__nv_bfloat16>(), up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m,
+          i, approx);
+      break;
+    default: VT_CHECK(false, "cuda silu_mul_fp4_quant: unsupported dtype (f32/bf16 only)");
+  }
+  Check(cudaGetLastError(), "silu_mul_fp4_quant kernel launch");
+}
+
 // Naive fp4xfp4 GEMM (small-M / decode). out[m,n] = alpha * sum_k
 // (a_fp4[m,k]·f8(a_scale[m,k/16]))·(b_fp4[n,k]·f8(b_scale[n,k/16])). One thread
 // per output; decode both operands on the fly. Bit-consistent with the WMMA path
@@ -1292,6 +1374,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fn>(&MatmulNvfp4KernelCuda)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernelCuda)));
+    RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<SiluMulFp4QuantFn>(&SiluMulFp4QuantKernelCuda)));
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4KernelCuda)));
     RegisterOp(OpId::kMoeGroupedGemmNvfp4, DeviceType::kCUDA,

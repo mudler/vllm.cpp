@@ -228,6 +228,66 @@ TEST_CASE("scaled_fp4_quant + matmul_nvfp4_fp4 CUDA == CPU") {
   b.DestroyQueue(gq);
 }
 
+TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 6.7F;
+
+  auto run_check = [&](int64_t M, int64_t I) {
+    std::mt19937 rng(static_cast<unsigned>(99 + M * 131 + I));
+    std::normal_distribution<float> nd(0.0F, 2.0F);
+    std::vector<float> gate(static_cast<size_t>(M * I)), up(static_cast<size_t>(M * I));
+    for (auto& v : gate) v = nd(rng);
+    for (auto& v : up) v = nd(rng);
+
+    auto upl = [&](const void* h, size_t nb) { void* p = b.Alloc(nb); b.Copy(gq, p, h, nb); return p; };
+    void* dgate = upl(gate.data(), gate.size() * sizeof(float));
+    void* dup = upl(up.data(), up.size() * sizeof(float));
+    Tensor tgate = GpuTensor({M, I}); tgate.data = dgate; tgate.dtype = DType::kF32; tgate.device = Gpu();
+    Tensor tup = GpuTensor({M, I}); tup.data = dup; tup.dtype = DType::kF32; tup.device = Gpu();
+
+    // Unfused reference: MoeSiluMul -> bf16 act, then ScaledFp4Quant.
+    void* dact = b.Alloc(static_cast<size_t>(M * I) * sizeof(uint16_t));
+    void* dref_ap = b.Alloc(static_cast<size_t>(M * I / 2));
+    void* dref_as = b.Alloc(static_cast<size_t>(M * I / 16));
+    Tensor tact = GpuTensor({M, I}); tact.data = dact; tact.dtype = DType::kBF16; tact.device = Gpu();
+    Tensor tref_ap = GpuTensor({M, I / 2}); tref_ap.data = dref_ap; tref_ap.dtype = DType::kI8; tref_ap.device = Gpu();
+    Tensor tref_as = GpuTensor({M, I / 16}); tref_as.data = dref_as; tref_as.dtype = DType::kI8; tref_as.device = Gpu();
+    vt::MoeSiluMul(gq, tact, tgate, tup);
+    vt::ScaledFp4Quant(gq, tref_ap, tref_as, tact, input_global_scale);
+
+    // Fused.
+    void* dfu_ap = b.Alloc(static_cast<size_t>(M * I / 2));
+    void* dfu_as = b.Alloc(static_cast<size_t>(M * I / 16));
+    Tensor tfu_ap = GpuTensor({M, I / 2}); tfu_ap.data = dfu_ap; tfu_ap.dtype = DType::kI8; tfu_ap.device = Gpu();
+    Tensor tfu_as = GpuTensor({M, I / 16}); tfu_as.data = dfu_as; tfu_as.dtype = DType::kI8; tfu_as.device = Gpu();
+    vt::SiluMulFp4Quant(gq, tfu_ap, tfu_as, tgate, tup, input_global_scale);
+
+    std::vector<uint8_t> ref_ap(static_cast<size_t>(M * I / 2)), ref_as(static_cast<size_t>(M * I / 16));
+    std::vector<uint8_t> fu_ap(static_cast<size_t>(M * I / 2)), fu_as(static_cast<size_t>(M * I / 16));
+    b.Copy(gq, ref_ap.data(), dref_ap, ref_ap.size());
+    b.Copy(gq, ref_as.data(), dref_as, ref_as.size());
+    b.Copy(gq, fu_ap.data(), dfu_ap, fu_ap.size());
+    b.Copy(gq, fu_as.data(), dfu_as, fu_as.size());
+    b.Synchronize(gq);
+
+    size_t pmis = 0, smis = 0;
+    for (size_t i = 0; i < ref_ap.size(); ++i) pmis += (fu_ap[i] != ref_ap[i]);
+    for (size_t i = 0; i < ref_as.size(); ++i) smis += (fu_as[i] != ref_as[i]);
+    CHECK(pmis == 0);  // fused packed fp4 == unfused, byte-for-byte
+    CHECK(smis == 0);  // fused fp8 block scales == unfused, byte-for-byte
+
+    for (void* p : {dgate, dup, dact, dref_ap, dref_as, dfu_ap, dfu_as}) b.Free(p);
+  };
+
+  run_check(1, 64);      // decode single-row
+  run_check(8, 256);     // small batch, many groups/row
+  run_check(40, 128);    // prefill-ish
+  run_check(37, 2048);   // the real 27B intermediate_size class, non-32-aligned M
+  b.DestroyQueue(gq);
+}
+
 TEST_CASE("matmul_nvfp4_fp4 validates shapes loudly") {
   std::vector<uint8_t> buf(64, 0);
   std::vector<float> ob(16, 0);

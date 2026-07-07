@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -1383,6 +1384,153 @@ __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, con
   }
 }
 
+// Step B (WMMA, VEC path — VT_GDN_CHUNK_VEC, default). FLA-faithful WY: the
+// scalar GdnChunkWUWmmaKernel above spends ~73% of its time (measured GB10
+// ablation) in the O(BT²·(Dv+Dk)) per-column forward-substitution — Dv+Dk=256
+// independent length-BT serial solves through LOCAL memory (ucol/wcol spill,
+// STACK:256), latency/throughput-bound at 256-thread occupancy. This mirrors
+// vLLM's FLA instead: fold β into A (chunk_scaled_dot_kkt.py:86-92
+// b_kb=b_k*b_beta, b_A*=exp(g_diff), strict-lower mask), compute the [BT,BT]
+// triangular inverse T=(I+A)⁻¹ ONCE in shared f32 (solve_tril.py — column
+// forward-subst, no local spill, BT² not BT²·(Dv+Dk) work), then apply on the
+// TENSOR CORES: u=T@(β⊙v), w=T@(β⊙exp(G)⊙k) (wy_fast.recompute_w_u_fwd). The
+// inverse-then-apply is algebraically identical to the fused forward-solve
+// ((I+A)u=β⊙v ⇒ u_i=β_i(v_i−Σ_{j<i}exp(G_i−G_j)KK[i,j]u_j)); T is rounded to TD
+// (bf16 native / f32→TF32) before the WMMA apply, the same precision regime FLA
+// uses (solve_tril output_dtype=k.dtype). Compact aliased shared arena (2 regions,
+// reused across the Gram/inverse/apply phases → 2 blocks/SM on GB10, vs a naive
+// 1-block/SM layout that leaves the serial inverse + staging occupancy-starved):
+//   R0 = max(Ks[BT,Dk], Tf[BT,BT]f32): Gram-K → inverse-T(f32) → apply-operand(TD)
+//   R1 = max(Am[BT,BT]f32, Tb[BT,BT]TD + Osh[BT,kOBlk]f32): Gram-out/A → T(TD)+apply-out
+// The apply streams u then w in column blocks of kOBlk (per-pass operand build,
+// so only ONE [BT,Dcol] operand is resident) — keeps the peak at ~40 KiB (bf16).
+constexpr int kOBlk = 64;  // WMMA apply output column block (multiple of kWM)
+template <typename TD>
+__global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
+                                        const float* beta, const float* gcum,
+                                        const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
+                                        int64_t dk, int64_t hv_n, int64_t dv) {
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  const int64_t BT = kChunk;
+  const size_t s0a = static_cast<size_t>(BT * dk) * sizeof(TD);
+  const size_t s0b = static_cast<size_t>(BT * BT) * sizeof(float);
+  const size_t s0 = s0a > s0b ? s0a : s0b;
+  char* R0 = smem_raw;
+  char* R1 = smem_raw + s0;
+  TD* Ks = reinterpret_cast<TD*>(R0);       // [BT,Dk] TD  (Gram in)
+  float* Tf = reinterpret_cast<float*>(R0);  // [BT,BT] f32 (inverse; aliases Ks)
+  TD* Bop = reinterpret_cast<TD*>(R0);      // [BT,Dcol] TD (apply operand; aliases R0)
+  float* Am = reinterpret_cast<float*>(R1);  // [BT,BT] f32 (Gram out → A)
+  TD* Tb = reinterpret_cast<TD*>(R1);       // [BT,BT] TD  (T; aliases Am after inverse)
+  float* Osh = reinterpret_cast<float*>(R1 + static_cast<size_t>(BT * BT) * sizeof(TD));  // [BT,kOBlk] f32
+  __shared__ float gs[kChunk], bs[kChunk], eg[kChunk];
+
+  // Stage K into shared (zero past len so tail tiles are finite).
+  for (int64_t e = tid; e < BT * dk; e += blockDim.x) {
+    const int64_t i = e / dk, d = e % dk;
+    Store(Ks, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+  }
+  for (int64_t i = tid; i < len; i += blockDim.x) {
+    bs[i] = beta[(tok0 + i) * hv_n + hv];
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
+  }
+  __syncthreads();
+
+  // Gram Am = K@Kᵀ  [BT,BT] f32 (Arow=K[i,:], Bcol=K[j,:] read as Kᵀ).
+  const int nkk = (BT / kWM) * (BT / kWM);
+  for (int t = warp; t < nkk; t += nwarps) {
+    const int it = t % (BT / kWM), jt = t / (BT / kWM);
+    const int i0 = it * kWM, j0 = jt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t d = 0; d < dk; d += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Ks + i0 * dk + d, dk);
+      Cfg::load(b, Ks + j0 * dk + d, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(Am + i0 * BT + j0, acc, BT, wmma::mem_row_major);
+  }
+  __syncthreads();
+
+  // A[i,j] = β_i·exp(G_i−G_j)·KK[i,j] for j<i (strict-lower causal), else 0 (in place).
+  for (int64_t e = tid; e < BT * BT; e += blockDim.x) {
+    const int64_t i = e / BT, j = e % BT;
+    Am[e] = (i < len && j < i) ? bs[i] * expf(gs[i] - gs[j]) * Am[e] : 0.0f;
+  }
+  __syncthreads();  // Ks (R0) free → Tf aliases it.
+
+  // T = (I + A)⁻¹, unit lower-triangular, column-wise forward-substitution in
+  // shared f32 (no local spill). Column c: T[c,c]=1, T[i,c]=−Σ_{m=c}^{i−1} A[i,m]T[m,c].
+  for (int64_t e = tid; e < BT * BT; e += blockDim.x) Tf[e] = 0.0f;
+  __syncthreads();
+  for (int64_t c = tid; c < BT; c += blockDim.x) {
+    Tf[c * BT + c] = 1.0f;
+    if (c < len)
+      for (int64_t i = c + 1; i < len; ++i) {
+        float sfs = 0.0f;
+        for (int64_t m = c; m < i; ++m) sfs += Am[i * BT + m] * Tf[m * BT + c];
+        Tf[i * BT + c] = -sfs;
+      }
+  }
+  __syncthreads();
+  for (int64_t e = tid; e < BT * BT; e += blockDim.x) Store(Tb, e, Tf[e]);  // T(f32) → Tb(TD), Am free
+  __syncthreads();
+
+  // Apply on the tensor cores: u = T @ (β⊙v), w = T @ (β⊙exp(G)⊙k). Each pass
+  // rebuilds ONE [BT,Dcol] operand in R0 (Tf now free), streams the output in
+  // kOBlk-wide column blocks through Osh (store_matrix_sync f32 → TD global).
+  for (int p = 0; p < 2; ++p) {
+    TD* dst = (p == 0 ? u : w);
+    const int64_t dcol = (p == 0 ? dv : dk);
+    const int64_t stride = (p == 0 ? hv_n * dv : hv_n * dk);
+    const int64_t hoff = (p == 0 ? hv * dv : hv * dk);
+    for (int64_t e = tid; e < BT * dcol; e += blockDim.x) {
+      const int64_t i = e / dcol, c = e % dcol;
+      float val = 0.0f;
+      if (i < len)
+        val = p == 0 ? bs[i] * Load(v, (tok0 + i) * hv_n * dv + hv * dv + c)
+                     : bs[i] * eg[i] * Load(k, (tok0 + i) * hk_n * dk + hk * dk + c);
+      Store(Bop, e, val);
+    }
+    __syncthreads();
+    for (int64_t cb = 0; cb < dcol; cb += kOBlk) {
+      const int bw = static_cast<int>(dcol - cb < kOBlk ? dcol - cb : kOBlk);  // block width
+      const int ntiles = (static_cast<int>(BT) / kWM) * (bw / kWM);
+      for (int t = warp; t < ntiles; t += nwarps) {
+        const int it = t % (static_cast<int>(BT) / kWM), ct = t / (static_cast<int>(BT) / kWM);
+        const int i0 = it * kWM, c0 = ct * kWM;
+        typename Cfg::Acc acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (int64_t jj = 0; jj < BT; jj += WK) {
+          typename Cfg::Arow a;  // T[i0:,jj:]
+          typename Cfg::Brow b;  // Bop[jj:, cb+c0:]
+          Cfg::load(a, Tb + i0 * BT + jj, BT);
+          Cfg::load(b, Bop + jj * dcol + cb + c0, dcol);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(Osh + i0 * bw + c0, acc, bw, wmma::mem_row_major);
+      }
+      __syncthreads();
+      for (int64_t e = tid; e < BT * bw; e += blockDim.x) {
+        const int64_t i = e / bw, c = e % bw;
+        if (i < len) Store(dst, (tok0 + i) * stride + hoff + cb + c, Osh[e]);
+      }
+      __syncthreads();
+    }
+  }
+}
+
 // Builds the per-chunk layout (tok0/len) + per-seq base-offset (boh) arrays
 // DIRECTLY on the device from the device query_start_loc — the exact loop the
 // host used to run after a D2H copy+sync. Single-thread (n_seq is small, ~batch
@@ -1496,7 +1644,35 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // (also the f32-corner fallback and the unit-test scalar reference path).
   const char* wu_env = std::getenv("VT_GDN_WU_WMMA");
   const bool wu_wmma = wmma && (wu_env == nullptr || wu_env[0] != '0');
-  if (wu_wmma) {
+  // VEC path (default): replace the per-column WY forward-substitution (measured
+  // ~73% of the scalar-solve WU kernel) with a single [BT,BT] triangular inverse
+  // + tensor-core apply (GdnChunkWUWmmaVecKernel, mirrors FLA solve_tril+
+  // recompute_w_u). VT_GDN_CHUNK_VEC=0 keeps the WMMA-Gram/scalar-solve kernel.
+  const char* vec_env = std::getenv("VT_GDN_CHUNK_VEC");
+  // Compact aliased arena (see kernel): R0=max(Ks[BT,Dk], Tf[BT,BT]f32),
+  // R1=max(Am[BT,BT]f32, Tb[BT,BT]TD + Osh[BT,kOBlk]f32). bf16 ~40 KiB (2 blocks/SM),
+  // f32/TF32 ~64 KiB (1 block/SM). Both fit the GB10 99 KiB opt-in; the guard keeps
+  // the fallback safe on devices/corners with a smaller opt-in budget.
+  const size_t r0 = std::max(static_cast<size_t>(kChunk * dk) * sizeof(TSc),
+                             static_cast<size_t>(kChunk * kChunk) * sizeof(float));
+  const size_t r1 = std::max(static_cast<size_t>(kChunk * kChunk) * sizeof(float),
+                             static_cast<size_t>(kChunk * kChunk) * sizeof(TSc) +
+                                 static_cast<size_t>(kChunk * kOBlk) * sizeof(float));
+  const size_t vec_bytes = r0 + r1;
+  int smem_optin = 48 * 1024;
+  cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+  const bool wu_vec = wu_wmma && (vec_env == nullptr || vec_env[0] != '0') &&
+                      vec_bytes <= static_cast<size_t>(smem_optin);
+  if (wu_vec) {
+    Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkWUWmmaVecKernel<TSc>),
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(vec_bytes)),
+          "gdn chunked wu(vec) shared opt-in");
+    GdnChunkWUWmmaVecKernel<TSc><<<grid_chunk, 256, vec_bytes, s>>>(
+        u, w, k.Ptr<Tin>(), v.Ptr<Tin>(), beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n, dk, hv_n,
+        dv);
+    Check(cudaGetLastError(), "gdn chunked wu(vec) launch");
+  } else if (wu_wmma) {
     const size_t wu_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TSc) +
                             static_cast<size_t>(kChunk * kChunk) * sizeof(float);
     // Always opt in: the f32/TF32 dynamic request is exactly 48 KiB, which plus

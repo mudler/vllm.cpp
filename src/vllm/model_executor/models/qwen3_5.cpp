@@ -986,6 +986,24 @@ DType GdnActDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
+// bf16 residual stream (default ON). vLLM runs the 35B in bf16
+// (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
+// dtype across all 48 layers, and Qwen3NextRMSNorm==GemmaRMSNorm's fused_add_rms_norm
+// adds x into the residual and stores it bf16 while accumulating the variance in f32
+// (csrc/layernorm_kernels.cu). OUR residual was f32 — a more-precise accepted
+// deviation that doubled the residual memory traffic (read+write per RmsNorm, 2×
+// per layer). Making `res` bf16 mirrors vLLM exactly (the RmsNorm kernel keeps its
+// f32 variance/normalize accumulation regardless — only the residual load/store
+// dtype changes) and halves that traffic. A/B: VT_BF16_RESIDUAL=0 restores the f32
+// residual in the same binary.
+DType ResidualDType() {
+  static const bool bf16 = [] {
+    const char* e = std::getenv("VT_BF16_RESIDUAL");
+    return e == nullptr || e[0] != '0';
+  }();
+  return bf16 ? DType::kBF16 : DType::kF32;
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -2162,7 +2180,7 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, DType::kF32, {T, H});
+  DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
 
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
@@ -2375,7 +2393,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, DType::kF32, {T, H});
+  DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -2421,7 +2439,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, DType::kF32, {T, H});
+  DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -2484,7 +2502,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, DType::kF32, {T, H});
+  DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.

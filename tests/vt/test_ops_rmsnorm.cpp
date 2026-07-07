@@ -105,18 +105,45 @@ TEST_CASE("rmsnorm bf16 output: same golden within bf16 eps") {
   CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(0.565685f).epsilon(0.01));
 }
 
-TEST_CASE("rmsnorm fused residual stream stays f32-only") {
-  // Residual is kept full precision by design; a bf16 residual must throw.
-  std::vector<float> x = {1.0f, 2.0f};
-  std::vector<uint16_t> res = {0x4000, 0x4000};  // bf16(2.0)
+TEST_CASE("rmsnorm fused residual: f32 (full precision) or bf16 (vLLM model dtype)") {
+  // The residual stream may be f32 (full-precision) OR bf16. A bf16 residual mirrors
+  // vLLM's bf16 model_config.dtype: fused_add_rms_norm adds x into the residual,
+  // stores it back in the model dtype, and accumulates the variance in f32. Both add
+  // x into the residual IN PLACE and normalize that sum. Here 1+2=3 and 2+2=4 are
+  // exactly representable in bf16, so f32 and bf16 residuals give the same result.
   std::vector<float> w = {1.0f, 1.0f};
-  std::vector<float> out(2, 0.0f);
-  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 2});
-  Tensor tr = Tensor::Contiguous(res.data(), DType::kBF16, Cpu(), {1, 2});
-  Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {2});
-  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
-  Queue q{Cpu(), nullptr};
-  CHECK_THROWS_AS(vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false}, &tr), std::runtime_error);
+
+  SUBCASE("f32 residual (byte-identical to the pre-bf16 path)") {
+    std::vector<float> x = {1.0f, 2.0f};
+    std::vector<float> res = {2.0f, 2.0f};
+    std::vector<float> out(2, 0.0f);
+    Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 2});
+    Tensor tr = Tensor::Contiguous(res.data(), DType::kF32, Cpu(), {1, 2});
+    Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {2});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+    Queue q{Cpu(), nullptr};
+    vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false}, &tr);
+    CHECK(res[0] == doctest::Approx(3.0f));  // new stream, updated in place
+    CHECK(res[1] == doctest::Approx(4.0f));
+    CHECK(out[0] == doctest::Approx(0.848528f));
+    CHECK(out[1] == doctest::Approx(1.131371f));
+  }
+
+  SUBCASE("bf16 residual (now valid — mirrors vLLM)") {
+    std::vector<float> x = {1.0f, 2.0f};
+    std::vector<uint16_t> res = {0x4000, 0x4000};  // bf16(2.0), bf16(2.0)
+    std::vector<float> out(2, 0.0f);
+    Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 2});
+    Tensor tr = Tensor::Contiguous(res.data(), DType::kBF16, Cpu(), {1, 2});
+    Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {2});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+    Queue q{Cpu(), nullptr};
+    vt::RmsNorm(q, to, tx, tw, RmsNormArgs{0.0f, false}, &tr);
+    CHECK(vt::BF16ToF32(res[0]) == doctest::Approx(3.0f));  // stored bf16, in place
+    CHECK(vt::BF16ToF32(res[1]) == doctest::Approx(4.0f));
+    CHECK(out[0] == doctest::Approx(0.848528f));
+    CHECK(out[1] == doctest::Approx(1.131371f));
+  }
 }
 
 TEST_CASE("rmsnorm accepts bf16 inputs via f32 conversion") {

@@ -294,10 +294,11 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
            "rmsnorm: contiguous required");
   if (residual != nullptr) {
-    VT_CHECK(residual->dtype == DType::kF32 && residual->rank == 2 &&
+    VT_CHECK((residual->dtype == DType::kF32 || residual->dtype == DType::kBF16) &&
+                 residual->rank == 2 &&
                  residual->shape[0] == x.shape[0] && residual->shape[1] == x.shape[1] &&
                  residual->IsContiguous() && residual->device == x.device,
-             "rmsnorm: residual must be f32 [T,H] contiguous on x's device");
+             "rmsnorm: residual must be f32/bf16 [T,H] contiguous on x's device");
   }
   VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
            "rmsnorm: device mismatch (x/out/weight/queue)");

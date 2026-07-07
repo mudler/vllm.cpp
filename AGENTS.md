@@ -5,6 +5,21 @@ read this first, follow the links that matter for your task, and keep the
 record updated (append to the state log) — commit it with your changes.
 Push directly to `main`.
 
+**Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
+message. This asserts the contributor (human or AI-assisted) has read this
+AGENTS.md and follows the protocol. **CI rejects any commit lacking it**
+(see `.github/workflows/ci.yml` → `commit-protocol-tag`). It is a one-line
+trailer, e.g.:
+
+```
+<your commit subject>
+
+<body…>
+
+FOLLOWING_AGENTS_PROTOCOL
+Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]
+```
+
 **TL;DR:** 1:1 port of vLLM to pure C++ (no Python/PyTorch; ggml as example,
 not dependency), structured so every future upstream vLLM PR can be ported
 mechanically. MVP gate: Qwen3.6-35B-A3B + 27B (NVFP4) at vLLM throughput
@@ -37,6 +52,21 @@ ledger: **correctness** vs the pinned pip-vLLM oracle (`~/venvs/vllm-oracle`),
 re-base the bench config without re-running vLLM on it. This is non-negotiable
 and applies to subagents. Full rule: [.agents/gates.md](.agents/gates.md)
 § PROTOCOL DIRECTIVE.
+
+## Policy for AI-Assisted Contributions
+
+This project follows the Linux kernel project's [guidelines for AI coding
+assistants](https://docs.kernel.org/process/coding-assistants.html). Before
+submitting AI-assisted code, read
+[.agents/ai-coding-assistants.md](.agents/ai-coding-assistants.md). Key rules:
+
+- **No `Signed-off-by` from AI.** Only the human submitter may sign off on the
+  Developer Certificate of Origin.
+- **No `Co-Authored-By: <AI>` trailers.** The human contributor owns the change.
+- **Use an `Assisted-by:` trailer** to attribute AI involvement. Format:
+  `Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]`.
+- **The human submitter is responsible** for reviewing, testing, and
+  understanding every line of generated code.
 
 ## Index
 

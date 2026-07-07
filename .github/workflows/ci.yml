@@ -4,6 +4,45 @@ on:
     branches: [main]
   pull_request:
 jobs:
+  commit-protocol-tag:
+    # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
+    # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          # New branch / unreachable base (all-zero SHA): only check the tip commit.
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            commits="$head"
+          else
+            commits="$(git rev-list "${base}..${head}")"
+          fi
+          fail=0
+          for c in $commits; do
+            # Skip merge commits (>1 parent) — they are not authored content.
+            if [ "$(git rev-list --parents -n1 "$c" | wc -w)" -gt 2 ]; then continue; fi
+            if ! git log -1 --format=%B "$c" | grep -q 'FOLLOWING_AGENTS_PROTOCOL'; then
+              echo "::error::commit $c is missing the FOLLOWING_AGENTS_PROTOCOL trailer — read AGENTS.md"
+              git log -1 --oneline "$c"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more commits lack FOLLOWING_AGENTS_PROTOCOL. See AGENTS.md / .agents/ai-coding-assistants.md."
+            exit 1
+          fi
+          echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
   build-test-cpu:
     runs-on: ubuntu-latest
     steps:

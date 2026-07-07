@@ -6,11 +6,27 @@ Below vLLM on any axis is **NOT accepted** — it is an open gap to close, and t
 MVP is not met until every axis is at parity or above. "Near parity" (0.9×,
 0.98×) does **not** count. Equal-or-above, never below.
 
+## The denominator is vLLM's PRODUCTION config (CUDA graphs ON) — never `--enforce-eager`
+
+**The bar is vLLM's REAL/production throughput, which uses CUDA graphs**
+(piecewise/full cudagraph + torch.compile). `vllm bench throughput` with
+`--enforce-eager` measures a HANDICAPPED vLLM (no graphs) and is **NOT** the bar.
+MEASURED 2026-07-07 (27B, in1024/out128, conc-16, np96, GM0.6, same box):
+**vLLM graphed 758.91 vs vLLM eager 634.28 = +19.6%.** The `--enforce-eager`
+baseline was an obsolete near-term crutch from when our own engine was eager;
+now that our engine has CUDA graphs, the honest, apples-to-apples denominator is
+**graphed vLLM** (drop `--enforce-eager`). Match-or-beat is measured against THAT.
+(Subtlety worth noting, not an excuse: much of vLLM's eager→graphed jump is
+Python per-op dispatch elimination that our C++ never paid — indeed our C++ eager
+≈ vLLM eager — so the *real* target inside the +19.6% is vLLM's graph-hidden +
+tuned PREFILL/compute kernels, which IS closable, not the Python tax.)
+
 ## The axes — measure ALL of them, BOTH gate models, at the operating point
 
 vLLM is the ground truth on every one. Re-measure vLLM on the IDENTICAL workload
 each time (its baselines drift — 35B 2768→3145, 27B 397→452 across re-measures);
-never compare against a stale denominator.
+never compare against a stale denominator. **And measure vLLM in its production
+CUDA-graph config (see above), not `--enforce-eager`.**
 
 **Higher-is-better — ours must be ≥ vLLM:**
 - Total token throughput (tok/s) — the primary gate axis.

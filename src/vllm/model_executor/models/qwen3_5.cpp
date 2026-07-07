@@ -629,6 +629,20 @@ bool FuseQuantOnceEnabled() {
   return on;
 }
 
+// BF16 GEMM OUTPUTS (prefill-lever-scan rank 1-2): the fp4 gate/up (and later q/k/v)
+// projections currently output f32 (MatmulNvfp4F32D); vLLM keeps them bf16 (model
+// dtype). Emitting bf16 halves the GEMM output write + the downstream glue read
+// traffic (MoeSiluMul) on the memory-bound prefill. NOT bit-identical (gate/up are
+// bf16-rounded before silu) but MORE faithful to vLLM's bf16 model dtype — validated
+// by the token-exact gate. Default OFF for A/B; VT_BF16_GEMM_OUT=1 enables.
+bool Bf16GemmOutEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_BF16_GEMM_OUT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
 // VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
@@ -2119,12 +2133,18 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     gu_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, gu_ap->t(), gu_as->t(), dh, w.gate_proj_fp4.input_global_scale_inv);
   }
-  DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, DType::kF32)
-              : fp4 ? MatmulNvfp4F32D(d, dh, w.gate_proj_fp4)
-                    : MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
-  DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, DType::kF32)
-            : fp4 ? MatmulNvfp4F32D(d, dh, w.up_proj_fp4)
-                  : MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
+  // gate/up output bf16 (VT_BF16_GEMM_OUT, rank-1 lever) — matches vLLM bf16 dtype,
+  // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
+  // templated on the input dtype so both work.
+  const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out)
+              : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
+                                            : MatmulNvfp4F32D(d, dh, w.gate_proj_fp4))
+                    : MatmulF32D(d, dh, w.gate_proj);  // [T,I]
+  DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, gu_out)
+            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.up_proj_fp4)
+                                          : MatmulNvfp4F32D(d, dh, w.up_proj_fp4))
+                  : MatmulF32D(d, dh, w.up_proj);      // [T,I]
   // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
   // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.

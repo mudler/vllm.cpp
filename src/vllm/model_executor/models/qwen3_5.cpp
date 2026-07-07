@@ -2990,12 +2990,16 @@ struct Qwen3_5DenseDecodeGraph::Impl {
               b.SupportsGraphCapture();
   }
   ~Impl() {
+    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+      std::fprintf(stderr, "[DenseDecodeGraph] dense-27B decode graph: %lld total "
+                           "replays across %zu captured size(s)\n",
+                   static_cast<long long>(replays), slots.size());
     Backend& b = vt::GetBackend(queue.device.type);
     for (auto& kv : slots)
       if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
   }
 
-  // One captured padded batch size (mirror of Qwen3_5DecodeGraph::Impl::SizeSlot).
+  // One captured padded batch size (mirror of Qwen3_5DenseDecodeGraph SizeSlot).
   struct SizeSlot {
     std::vector<int32_t> token_ids;   // [S]
     std::vector<int32_t> positions;   // [S]
@@ -3132,6 +3136,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     s.logits = std::make_unique<DBuf>(std::move(lg));
     s.captured = true;
     impl_->any_captured = true;
+    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+      std::fprintf(stderr, "[DenseDecodeGraph] captured dense-27B decode graph "
+                           "for padded size S=%lld (real B=%lld)\n",
+                   static_cast<long long>(S), static_cast<long long>(B));
     b.ReplayGraph(impl_->queue, s.graph);
     s.replays = 1;
     ++impl_->replays;

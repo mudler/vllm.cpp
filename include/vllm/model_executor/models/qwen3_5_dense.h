@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -149,6 +150,52 @@ class Qwen3_5DenseModel {
                                          const Qwen3_5DenseWeights& weights,
                                          const HfConfig& config,
                                          vt::Queue& queue);
+};
+
+// 27B DENSE decode CUDA-graph driver — the dense sibling of Qwen3_5DecodeGraph
+// (qwen3_5.h). Captures the PURE-DECODE dense forward once per PADDED batch size
+// (kDecodeGraphSizes {1,2,4,8,16,32,64}, capped at max_num_reqs) and replays it
+// per token, removing the per-step host tax (the ~62k cudaMalloc/step + kernel
+// launch overhead) that the eager dense decode paid every step. The embedding is
+// kept outside the capture region and run per step into a persistent hidden
+// buffer; every per-call scratch is pool-backed / resident (DevicePool + the fp4
+// GEMM StreamScratch pools + resident weights) so the captured region does zero
+// cudaMalloc after a cold pre-warm. Bit-identical to Qwen3_5DenseModel::Forward
+// for the same inputs/caches (same op sequence: DenseEmbedInto + DenseForward
+// Layers). VLLM_CPP_CUDAGRAPH=0 disables capture (always eager). The 35B MoE
+// graph (Qwen3_5DecodeGraph) is a separate driver and is untouched.
+class Qwen3_5DenseDecodeGraph {
+ public:
+  // max_num_reqs == the runner's max_num_seqs (== the GDN state-cache slot count);
+  // the padded decode batch is capped at this so it never exceeds the mamba/GDN
+  // state cache (mirrors vLLM's decode cudagraph dispatcher, compilation.py).
+  Qwen3_5DenseDecodeGraph(const Qwen3_5DenseWeights& weights, const HfConfig& config,
+                          vt::Queue queue, int64_t max_num_reqs);
+  ~Qwen3_5DenseDecodeGraph();
+  Qwen3_5DenseDecodeGraph(const Qwen3_5DenseDecodeGraph&) = delete;
+  Qwen3_5DenseDecodeGraph& operator=(const Qwen3_5DenseDecodeGraph&) = delete;
+
+  // One PURE-DECODE step. Returns the [B, vocab] f32 logits as a DEVICE-resident
+  // ForwardLogits (the captured graph's output stays on device — a view over the
+  // slot's persistent logits buffer; the eager fallback owns a pool block), fed
+  // straight to the sampler with NO full-logits D2H. Bit-identical to
+  // Qwen3_5DenseModel::Forward for the same inputs/caches. The caller must only
+  // route pure-decode batches here (all query_len==1, no prefill).
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const v1::GDNAttentionMetadata& gdn_meta,
+                     const std::vector<PagedKvCache>& attn_kv,
+                     const std::vector<GdnStateCache>& gdn_state);
+
+  // Diagnostics (A/B + tests): is a graph currently captured, and how many
+  // replays have run since the last (re)capture.
+  bool captured() const;
+  int64_t replay_count() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace vllm

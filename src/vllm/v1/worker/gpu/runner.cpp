@@ -54,6 +54,22 @@ static bool GpuSampleEnabled() {
   return on;
 }
 
+// 27B DENSE decode CUDA-graph toggle (the dense sibling of the 35B MoE decode
+// graph). Default ON: a pure-decode step on the fp4/CUDA dense (27B) model is
+// routed through Qwen3_5DenseDecodeGraph (capture-once/replay-per-token), which
+// removes the per-step host tax (the ~62k synchronous cudaMalloc + serial kernel
+// launches the eager dense decode paid EVERY step). VLLM_CPP_DENSE_DECODE_GRAPH=0
+// restores the eager Qwen3_5DenseModel::ForwardDevice/Forward path (the fallback,
+// and the A/B baseline). Inner capture is additionally gated by VLLM_CPP_CUDAGRAPH
+// (shared with the MoE graph); with it off the driver runs its eager fallback.
+static bool DenseDecodeGraphEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VLLM_CPP_DENSE_DECODE_GRAPH");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
 bool reorder_batch_to_split_decodes_and_prefills(
     InputBatch& input_batch, const SchedulerOutput& scheduler_output,
@@ -510,14 +526,22 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // (mirrors vLLM cudagraph_capture_sizes + pad-to-nearest,
   // compilation/cuda_graph.py); the padded rows are inert (BuildPaddedDecode).
   // The decode forward is row-independent, so padding cannot perturb the real
-  // rows. Beyond 64 (kMaxDecodeGraphBatch) / prefill / mixed / bf16 / dense / CPU
-  // stay eager.
+  // rows. Beyond 64 (kMaxDecodeGraphBatch) / prefill / mixed / bf16 / CPU stay
+  // eager. The DENSE (27B) fp4 model has its OWN decode graph (dense_decode_
+  // graph_, the sibling of decode_graph_) under the same gate.
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
   const bool fp4_cuda = queue_.device.type == vt::DeviceType::kCUDA &&
                         moe_weights_ != nullptr &&
                         !moe_weights_->layers.empty() &&
                         !moe_weights_->layers.front().moe.expert_gate_fp4.empty();
+  // Dense (27B) fp4/CUDA gate — the sibling of fp4_cuda for the dense decode
+  // graph. True when the dense MLP projections are fp4-resident (the real 27B
+  // CUDA load); the synthetic CPU tests leave them empty and stay eager.
+  const bool fp4_cuda_dense = queue_.device.type == vt::DeviceType::kCUDA &&
+                              dense_weights_ != nullptr &&
+                              !dense_weights_->layers.empty() &&
+                              !dense_weights_->layers.front().mlp.gate_proj_fp4.Empty();
   constexpr int kMaxDecodeGraphBatch = 64;  // largest captured size
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
@@ -542,16 +566,33 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // [T,vocab] logits and sample_tokens re-gathers on host (unchanged path).
   ForwardLogits logits;
   if (dense_weights_ != nullptr) {
-    // DENSE arch (27B): the eager paged dense forward. Same paged KV/GDN-state
-    // machinery, dense SwiGLU MLP in place of the MoE block. The MoE-only fp4
-    // decode-graph fast path does not apply here.
-    logits = gather
-                 ? Qwen3_5DenseModel::ForwardDevice(
-                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                       gdn_state_, *dense_weights_, config_, queue_, gather_li)
-                 : host_logits(Qwen3_5DenseModel::Forward(
-                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                       gdn_state_, *dense_weights_, config_, queue_, gather_li));
+    // DENSE arch (27B). A PURE-DECODE fp4/CUDA step is routed through the dense
+    // decode CUDA-graph (capture-once/replay-per-token) under the SAME gate as
+    // the 35B MoE graph — removing the per-step host tax (the ~62k synchronous
+    // cudaMalloc + serial kernel launches the eager dense decode paid EVERY
+    // step). VLLM_CPP_DENSE_DECODE_GRAPH=0 restores the eager path (fallback +
+    // A/B baseline). Prefill / mixed / bf16 / CPU / >64 stay eager.
+    if (DenseDecodeGraphEnabled() && pure_decode && fp4_cuda_dense &&
+        num_reqs <= kMaxDecodeGraphBatch) {
+      if (!dense_decode_graph_) {
+        dense_decode_graph_ = std::make_unique<Qwen3_5DenseDecodeGraph>(
+            *dense_weights_, config_, queue_, gdn_state_slots_);
+      }
+      // Device-resident [num_reqs,vocab] (one row/request in request order); the
+      // gather toggle is a no-op for pure decode (T==num_reqs).
+      logits = dense_decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
+                                         attn_kv_, gdn_state_);
+    } else {
+      // Eager paged dense forward. Same paged KV/GDN-state machinery, dense
+      // SwiGLU MLP in place of the MoE block.
+      logits = gather
+                   ? Qwen3_5DenseModel::ForwardDevice(
+                         token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                         gdn_state_, *dense_weights_, config_, queue_, gather_li)
+                   : host_logits(Qwen3_5DenseModel::Forward(
+                         token_ids, positions, attn_meta, gdn_meta, attn_kv_,
+                         gdn_state_, *dense_weights_, config_, queue_, gather_li));
+    }
   } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
     if (!decode_graph_) {
       decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(

@@ -230,6 +230,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   // batch shape and replays it per token (mirrors vLLM's decode CUDAGraph
   // capture). nullptr on CPU / bf16 / when disabled — those keep the eager path.
   std::unique_ptr<Qwen3_5DecodeGraph> decode_graph_;
+  // 27B DENSE decode CUDA-graph driver, created lazily on the first pure-decode
+  // step of an fp4/CUDA dense model. The dense sibling of decode_graph_; captures
+  // the dense decode forward once per batch shape and replays it per token.
+  // nullptr on CPU / bf16 / when the 27B-specific toggle (VLLM_CPP_DENSE_DECODE_
+  // GRAPH=0) is off — those keep the eager Qwen3_5DenseModel::Forward path.
+  std::unique_ptr<Qwen3_5DenseDecodeGraph> dense_decode_graph_;
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

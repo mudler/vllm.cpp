@@ -2196,9 +2196,15 @@ bool PrefillFlash2VecEnabled() {
   return enabled;
 }
 
-// Default query-tile size when VT_ATTN_PREFILL_BM is unset (the microbench-
-// selected best BM). See PrefillBM() / the BM-kernel header for the tradeoff.
-constexpr int kPrefillBMDefault = 32;
+// Default query-tile size when VT_ATTN_PREFILL_BM is unset. Microbench (GB10,
+// 8x1024..2x4096 prefill) picked BM=16 with the *restructured* BM kernel: it is
+// result-identical to the old Vec kernel but fills more of the 8 warps in QKᵀ at
+// the SAME 128-reg / 40-KiB / 2-block-per-SM occupancy -> a steady 5-6% kernel
+// win (8.93->8.40 ms/layer at 8x1024). Larger BM (32/64) REGRESSED 15-25%: at
+// 64 KiB/block it drops to 1 block/SM (100 KiB smem/SM cap), and this
+// sync/latency-bound kernel loses more to the halved occupancy than it saves on
+// the halved K/V re-streaming. See PrefillBM() / the BM-kernel header.
+constexpr int kPrefillBMDefault = 16;
 
 // Larger-query-tile Flash2 prefill (BM = query rows per block). Amortizes K/V
 // re-streaming — a seqlen L causal prefill re-reads K/V (L/BM)·(qpk/QG) times per

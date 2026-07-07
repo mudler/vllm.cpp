@@ -634,11 +634,12 @@ bool FuseQuantOnceEnabled() {
 // dtype). Emitting bf16 halves the GEMM output write + the downstream glue read
 // traffic (MoeSiluMul) on the memory-bound prefill. NOT bit-identical (gate/up are
 // bf16-rounded before silu) but MORE faithful to vLLM's bf16 model dtype — validated
-// by the token-exact gate. Default OFF for A/B; VT_BF16_GEMM_OUT=1 enables.
+// by the token-exact gate. DEFAULT ON (measured 27B +5.4% standard / +12.5% prefill-
+// heavy, gate 9/9; matches vLLM bf16 dtype); VT_BF16_GEMM_OUT=0 restores f32 for an A/B.
 bool Bf16GemmOutEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_BF16_GEMM_OUT");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || (e[0] != '0');
   }();
   return on;
 }

@@ -944,6 +944,172 @@ inline bool NativeFp4MmaEnabled() {
   return e && e[0] == '1';
 }
 
+// Opt-in switch for the HARDWARE-PTX NVFP4 activation quant (mirror of vllm's
+// cvt_fp16_to_fp4 / cvt_warp_fp16_to_fp4, nvfp4_quant_kernels.cu +
+// nvfp4_utils.cuh). DEFAULT OFF for same-binary A/B: the default quant keeps the
+// portable 8-branch scalar magnitude ladder (CastToFp4NibbleDev), which is the
+// cross-backend correctness reference (byte-identical to the CPU op /
+// vllm::RefScaledFp4Quant). Set VT_HW_FP4_QUANT=1 to select the sm_121a hardware
+// path: 256-bit vector loads, __habs2/__hmax2 block max-abs, and the per-pair fp4
+// quant via the HARDWARE `cvt.rn.satfinite.e2m1x2.f32` op instead of the software
+// ladder. Read every call (uncached) so the unit test can flip it in-process and
+// the caller can A/B by relaunching the binary with the env flipped.
+inline bool HwFp4QuantEnabled() {
+  const char* e = std::getenv("VT_HW_FP4_QUANT");
+  return e && e[0] == '1';
+}
+
+// Device availability of the hardware fp4-quant primitives: the 256-bit
+// `ld.global.nc.v8.u32` load and the `cvt.rn.satfinite.e2m1x2.f32` conversion
+// both require SM100+ (Blackwell) with the CUDA 12.9+ toolkit. Mirrors vllm's
+// VLLM_256B_PTX_ENABLED gate (cuda_vec_utils.cuh:23). On GB10 sm_121a this is 1;
+// a non-Blackwell compile takes the portable fallback below (the same scalar
+// ladder as the default path), so this TU still builds for any arch.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(CUDART_VERSION) && \
+    (CUDART_VERSION >= 12090)
+  #define VT_HW_FP4_QUANT_DEVICE_AVAILABLE 1
+#else
+  #define VT_HW_FP4_QUANT_DEVICE_AVAILABLE 0
+#endif
+
+// Two packed uint32 = 8 bytes = 16 e2m1 nibbles (one 16-element group).
+struct u32x2_fp4 {
+  uint32_t lo, hi;
+};
+
+// Fast reciprocal (mirror vllm reciprocal_approximate_ftz, nvfp4_utils.cuh:158).
+__device__ __forceinline__ float ReciprocalApproxFtz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(b) : "f"(a));
+  return b;
+}
+
+// Convert 16 pre-scaled f32 values (8 float2 pairs) into 16 packed e2m1 nibbles.
+// VERBATIM mirror of vllm::fp32_vec16_to_e2m1 (nvfp4_utils.cuh:118): eight
+// `cvt.rn.satfinite.e2m1x2.f32` ops, each converting one float2 (x -> low nibble,
+// y -> high nibble) to a packed e2m1x2 byte, assembled into two b32 words. The
+// `.satfinite` modifier saturates magnitudes > 6.0 to the max e2m1 value, so NO
+// pre-clamp is needed (unlike the ladder). This is the HARDWARE op vllm production
+// runs; on non-SM100 it falls back to the scalar ladder for a portable build.
+__device__ __forceinline__ u32x2_fp4 Fp32Vec16ToE2m1(float2 (&array)[8]) {
+  u32x2_fp4 out;
+#if VT_HW_FP4_QUANT_DEVICE_AVAILABLE
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0;\n"
+      ".reg .b8 b1;\n"
+      ".reg .b8 b2;\n"
+      ".reg .b8 b3;\n"
+      ".reg .b8 b4;\n"
+      ".reg .b8 b5;\n"
+      ".reg .b8 b6;\n"
+      ".reg .b8 b7;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b0,  %3,  %2;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b1,  %5,  %4;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b2,  %7,  %6;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b3,  %9,  %8;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b4, %11, %10;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b5, %13, %12;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b6, %15, %14;\n"
+      "cvt.rn.satfinite.e2m1x2.f32   b7, %17, %16;\n"
+      "mov.b32 %0, {b0, b1, b2, b3};\n"
+      "mov.b32 %1, {b4, b5, b6, b7};\n"
+      "}\n"
+      : "=r"(out.lo), "=r"(out.hi)
+      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
+        "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y),
+        "f"(array[4].x), "f"(array[4].y), "f"(array[5].x), "f"(array[5].y),
+        "f"(array[6].x), "f"(array[6].y), "f"(array[7].x), "f"(array[7].y));
+#else
+  // Portable fallback (non-SM100 build): the scalar magnitude ladder, packed in
+  // the SAME nibble order the hardware op produces (elem 2i -> low nibble of byte
+  // i, elem 2i+1 -> high nibble). Keeps the TU buildable for any target.
+  uint32_t w[2] = {0u, 0u};
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const uint8_t byte = static_cast<uint8_t>(
+        CastToFp4NibbleDev(fminf(fmaxf(array[i].x, -6.0f), 6.0f)) |
+        (CastToFp4NibbleDev(fminf(fmaxf(array[i].y, -6.0f), 6.0f)) << 4));
+    w[i >> 2] |= static_cast<uint32_t>(byte) << (8 * (i & 3));
+  }
+  out.lo = w[0];
+  out.hi = w[1];
+#endif
+  return out;
+}
+
+// Vectorized 256-bit load of 16 bf16 activations (32 bytes) into 8 float2 pairs,
+// plus the group max-abs via __habs2/__hmax2 (mirror vllm cvt_warp_fp16_to_fp4
+// reduction, nvfp4_utils.cuh:223-238). Falls back to two 128-bit __ldg loads on
+// non-SM100. `p` must be 32-byte aligned (guaranteed: bf16 row = k_dim*2 bytes
+// with k_dim %16 == 0, group offset = g*32 bytes).
+__device__ __forceinline__ void LoadBf16x16(float2 (&f2)[8], float& vmax,
+                                            const __nv_bfloat16* p) {
+  uint32_t r[8];
+#if VT_HW_FP4_QUANT_DEVICE_AVAILABLE
+  asm volatile(
+      "ld.global.nc.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]),
+        "=r"(r[6]), "=r"(r[7])
+      : "l"(reinterpret_cast<const void*>(p)));
+#else
+  const uint4 lo = __ldg(reinterpret_cast<const uint4*>(p));
+  const uint4 hi = __ldg(reinterpret_cast<const uint4*>(p) + 1);
+  r[0] = lo.x; r[1] = lo.y; r[2] = lo.z; r[3] = lo.w;
+  r[4] = hi.x; r[5] = hi.y; r[6] = hi.z; r[7] = hi.w;
+#endif
+  const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(r);
+  __nv_bfloat162 amax = __habs2(b2[0]);
+#pragma unroll
+  for (int i = 1; i < 8; ++i) amax = __hmax2(amax, __habs2(b2[i]));
+  vmax = float(__hmax(amax.x, amax.y));
+#pragma unroll
+  for (int i = 0; i < 8; ++i) f2[i] = __bfloat1622float2(b2[i]);
+}
+
+// Vectorized load of 16 f32 activations (64 bytes = 4x float4) into 8 float2 pairs
+// + the group max-abs. The f32 input is a test/CPU-parity path; the production
+// activation quant is bf16 (LoadBf16x16).
+__device__ __forceinline__ void LoadF32x16(float2 (&f2)[8], float& vmax, const float* p) {
+  vmax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float4 v = __ldg(reinterpret_cast<const float4*>(p) + i);
+    f2[2 * i] = make_float2(v.x, v.y);
+    f2[2 * i + 1] = make_float2(v.z, v.w);
+    vmax = fmaxf(vmax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+  }
+}
+
+// Hardware NVFP4 quant epilogue for one 16-element group (mirror the NVFP4 branch
+// of vllm::cvt_warp_fp16_to_fp4, nvfp4_utils.cuh:261-301). Given the 8 float2
+// pairs and their max-abs, computes the E4M3 block scale (same satfinite cast as
+// the ladder -> byte-identical scale), the fast-approx-reciprocal output scale
+// (vllm nvfp4_utils.cuh:284-286 — the ONLY numerical departure from the ladder's
+// exact division, and the reason the packed nibbles can differ at a bucket
+// boundary), and the packed 8-byte fp4 group via the hardware cvt. Output layout
+// is IDENTICAL to the ladder kernel: scale byte at *scale_out, packed group as a
+// single 64-bit store (elem 2i -> low nibble of byte i, 2i+1 -> high nibble).
+__device__ __forceinline__ void QuantGroupHwFp4(float2 (&f2)[8], float vmax,
+                                                float input_global_scale, uint8_t* scale_out,
+                                                uint8_t* packed_group) {
+  float sfv_f = input_global_scale * (vmax * (1.0f / 6.0f));
+  const uint8_t sc8 = F32ToFp8Dev(sfv_f);  // __nv_fp8_e4m3(SFValue), satfinite E4M3
+  *scale_out = sc8;
+  const float sfv = F8E4M3ToF32Dev(sc8);  // == float(e4m3)
+  float out_scale = 0.0f;
+  if (sfv != 0.0f)
+    out_scale = ReciprocalApproxFtz(sfv * ReciprocalApproxFtz(input_global_scale));
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    f2[i].x *= out_scale;
+    f2[i].y *= out_scale;
+  }
+  const u32x2_fp4 packed = Fp32Vec16ToE2m1(f2);
+  *reinterpret_cast<uint64_t*>(packed_group) =
+      (static_cast<uint64_t>(packed.hi) << 32) | static_cast<uint64_t>(packed.lo);
+}
+
 // ScaledFp4Quant: one thread per (row, 16-group). Emits packed fp4 [M,K/2] +
 // fp8 block scale [M,K/16]. Reciprocal selected by approx_recip (notes §7.2).
 // Tin f32/bf16.
@@ -989,6 +1155,30 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   }
 }
 
+// HARDWARE-PTX variant of ScaledFp4Quant (mirror vllm cvt_fp16_to_fp4): same grid
+// (one thread per (row, 16-group)) and IDENTICAL output layout as the ladder
+// kernel above, but the load is 256-bit vectorized, the max-abs uses __habs2/
+// __hmax2, and the fp4 pack runs on the hardware `cvt.rn.satfinite.e2m1x2.f32`.
+// Selected by VT_HW_FP4_QUANT (default OFF); host-gated on the sm_12xa build.
+template <typename Tin>
+__global__ void ScaledFp4QuantKernelHw(uint8_t* packed, uint8_t* scale, const Tin* x,
+                                       float input_global_scale, int64_t m_rows, int64_t k_dim) {
+  const int64_t groups = k_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= m_rows * groups) return;
+  const int64_t row = gid / groups;
+  const int64_t g = gid % groups;
+  const int64_t base = row * k_dim + g * 16;
+  float2 f2[8];
+  float vmax;
+  if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+    LoadBf16x16(f2, vmax, x + base);
+  } else {
+    LoadF32x16(f2, vmax, x + base);
+  }
+  QuantGroupHwFp4(f2, vmax, input_global_scale, &scale[row * groups + g], packed + base / 2);
+}
+
 void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
                               float input_global_scale_inv) {
   const int64_t m = x.shape[0], k = x.shape[1];
@@ -999,6 +1189,25 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
   auto* sc = out_scale.Ptr<uint8_t>();
+#if defined(VT_FP4_MMA_SM120A)
+  // Hardware-PTX quant path (sm_12xa builds only): mirrors vllm production. The
+  // scalar ladder below stays the CPU/non-Blackwell fallback + correctness ref.
+  if (HwFp4QuantEnabled()) {
+    switch (x.dtype) {
+      case DType::kF32:
+        ScaledFp4QuantKernelHw<float><<<grid, kBlock, 0, s>>>(pk, sc, x.Ptr<float>(),
+                                                              input_global_scale_inv, m, k);
+        break;
+      case DType::kBF16:
+        ScaledFp4QuantKernelHw<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+            pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k);
+        break;
+      default: VT_CHECK(false, "cuda scaled_fp4_quant: unsupported x dtype (f32/bf16 only)");
+    }
+    Check(cudaGetLastError(), "scaled_fp4_quant kernel launch (hw)");
+    return;
+  }
+#endif
   const bool approx = NativeFp4MmaEnabled();  // native path -> fast-reciprocal quant
   switch (x.dtype) {
     case DType::kF32:
@@ -1069,6 +1278,40 @@ __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin
   }
 }
 
+// HARDWARE-PTX variant of the fused silu-mul -> NVFP4 quant. Identical grid and
+// output layout as the ladder kernel; only the fp4-pack epilogue is the hardware
+// path (QuantGroupHwFp4). silu(gate)*up is still computed per element and rounded
+// through bf16 (== MoeSiluMul store) so, given the same VT_HW_FP4_QUANT toggle,
+// this stays byte-identical to MoeSiluMul(->bf16) then the hardware ScaledFp4Quant.
+template <typename Tin>
+__global__ void SiluMulFp4QuantKernelHw(uint8_t* packed, uint8_t* scale, const Tin* gate,
+                                        const Tin* up, float input_global_scale, int64_t m_rows,
+                                        int64_t i_dim) {
+  const int64_t groups = i_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= m_rows * groups) return;
+  const int64_t row = gid / groups;
+  const int64_t g = gid % groups;
+  const int64_t base = row * i_dim + g * 16;
+  float2 f2[8];
+  float vmax = 0.0f;
+#pragma unroll
+  for (int i2 = 0; i2 < 8; ++i2) {
+    float e[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int64_t j = 2 * i2 + t;
+      const float gg = Load(gate, base + j);
+      const float uu = Load(up, base + j);
+      const float sm = (gg / (1.0f + expf(-gg))) * uu;
+      e[t] = __bfloat162float(__float2bfloat16(sm));  // round through bf16
+      vmax = fmaxf(vmax, fabsf(e[t]));
+    }
+    f2[i2] = make_float2(e[0], e[1]);
+  }
+  QuantGroupHwFp4(f2, vmax, input_global_scale, &scale[row * groups + g], packed + base / 2);
+}
+
 void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
                                const Tensor& gate, const Tensor& up,
                                float input_global_scale_inv) {
@@ -1080,6 +1323,25 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
   auto* sc = out_scale.Ptr<uint8_t>();
+#if defined(VT_FP4_MMA_SM120A)
+  // Hardware-PTX fused epilogue (sm_12xa builds only); ladder stays the fallback.
+  if (HwFp4QuantEnabled()) {
+    switch (gate.dtype) {
+      case DType::kF32:
+        SiluMulFp4QuantKernelHw<float><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<float>(), up.Ptr<float>(), input_global_scale_inv, m, i);
+        break;
+      case DType::kBF16:
+        SiluMulFp4QuantKernelHw<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<__nv_bfloat16>(), up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m,
+            i);
+        break;
+      default: VT_CHECK(false, "cuda silu_mul_fp4_quant: unsupported dtype (f32/bf16 only)");
+    }
+    Check(cudaGetLastError(), "silu_mul_fp4_quant kernel launch (hw)");
+    return;
+  }
+#endif
   const bool approx = NativeFp4MmaEnabled();  // pair fused/unfused reciprocal choice
   switch (gate.dtype) {
     case DType::kF32:

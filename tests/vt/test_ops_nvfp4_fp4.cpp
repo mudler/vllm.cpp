@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -42,6 +43,22 @@ float DecodeActElem(const uint8_t* packed, const uint8_t* scale, int64_t k, int6
   const float mag = vllm::kE2M1Lut[nib & 0x7U] * ((nib & 0x8U) ? -1.0F : 1.0F);
   const float sf = vllm::F8E4M3ToF32(scale[row * groups + col / 16]);
   return mag * sf / input_global_scale;  // block_scale = sf/global
+}
+
+// Round-to-nearest-even f32 -> bf16 (matches CUDA __float2bfloat16 for finite
+// inputs), used to feed the device bf16 quant path the exact values it reads.
+uint16_t F32ToBf16Bits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, sizeof(u));
+  const uint32_t lsb = (u >> 16) & 1U;
+  u += 0x7FFFU + lsb;
+  return static_cast<uint16_t>(u >> 16);
+}
+float Bf16BitsToF32(uint16_t b) {
+  const uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
 }
 }  // namespace
 
@@ -225,6 +242,112 @@ TEST_CASE("scaled_fp4_quant + matmul_nvfp4_fp4 CUDA == CPU") {
     CHECK(g_out[i] == doctest::Approx(cpu_out[i]).epsilon(0.02).scale(1.0));
 
   for (void* p : {dx, dbp, dbs, dap, das, dout}) b.Free(p);
+  b.DestroyQueue(gq);
+}
+
+// Hardware-PTX activation quant (VT_HW_FP4_QUANT=1): the sm_121a path that mirrors
+// vllm production (256-bit loads + `cvt.rn.satfinite.e2m1x2.f32`). Validated
+// against the CPU ladder op (== vllm::RefScaledFp4Quant / emulation truth):
+//   * block scales are BYTE-EXACT (same E4M3 satfinite cast of global*vmax/6);
+//   * packed nibbles are near-exact — the e2m1 rounding is round-to-nearest-even
+//     (the ladder's <=/< thresholds ARE the RNE midpoints, so they agree), and
+//     the ONLY departure is vllm's fast-approx-reciprocal output scale
+//     (nvfp4_utils.cuh:284-286) vs the ladder's exact division, which can flip a
+//     nibble only when a scaled value sits on a bucket boundary. So a small,
+//     benign mismatch fraction is EXPECTED and is MORE faithful to vllm than the
+//     byte-identical ladder;
+//   * the decode round-trips x within the NVFP4 group-scale error bound.
+// Runs both f32 (LoadF32x16) and bf16 (256-bit LoadBf16x16) input paths.
+TEST_CASE("scaled_fp4_quant HW path (VT_HW_FP4_QUANT) == vllm cvt reference") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 7.9F;
+
+  auto run = [&](int64_t M, int64_t K, bool bf16_in) {
+    std::mt19937 rng(static_cast<unsigned>(31 + M * 17 + K + (bf16_in ? 1 : 0)));
+    std::normal_distribution<float> nd(0.0F, 2.5F);
+    // x rounded through bf16 so the device (which reads bf16 or converts f32) and
+    // the CPU reference read bit-identical values.
+    std::vector<float> x(static_cast<size_t>(M * K));
+    std::vector<uint16_t> x_bf16(static_cast<size_t>(M * K));
+    for (size_t idx = 0; idx < x.size(); ++idx) {
+      const uint16_t bits = F32ToBf16Bits(nd(rng));
+      x_bf16[idx] = bits;
+      x[idx] = Bf16BitsToF32(bits);
+    }
+
+    // CPU ladder op (exact division) = the correctness reference.
+    std::vector<uint8_t> cpu_ap(static_cast<size_t>(M * K / 2), 0);
+    std::vector<uint8_t> cpu_as(static_cast<size_t>(M * K / 16), 0);
+    {
+      Queue cq = CpuQueue();
+      Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {M, K});
+      Tensor tp = Tensor::Contiguous(cpu_ap.data(), DType::kI8, Cpu(), {M, K / 2});
+      Tensor ts = Tensor::Contiguous(cpu_as.data(), DType::kI8, Cpu(), {M, K / 16});
+      vt::ScaledFp4Quant(cq, tp, ts, tx, input_global_scale);
+    }
+
+    // Device hardware path (toggle ON only inside this case).
+    ::setenv("VT_HW_FP4_QUANT", "1", 1);
+    void* dx = nullptr;
+    Tensor tx = GpuTensor({M, K});
+    if (bf16_in) {
+      dx = b.Alloc(x_bf16.size() * sizeof(uint16_t));
+      b.Copy(gq, dx, x_bf16.data(), x_bf16.size() * sizeof(uint16_t));
+      tx.dtype = DType::kBF16;
+    } else {
+      dx = b.Alloc(x.size() * sizeof(float));
+      b.Copy(gq, dx, x.data(), x.size() * sizeof(float));
+      tx.dtype = DType::kF32;
+    }
+    tx.data = dx;
+    tx.device = Gpu();
+    void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
+    void* das = b.Alloc(static_cast<size_t>(M * K / 16));
+    Tensor tap = GpuTensor({M, K / 2}); tap.data = dap; tap.dtype = DType::kI8; tap.device = Gpu();
+    Tensor tas = GpuTensor({M, K / 16}); tas.data = das; tas.dtype = DType::kI8; tas.device = Gpu();
+    vt::ScaledFp4Quant(gq, tap, tas, tx, input_global_scale);
+    std::vector<uint8_t> hw_ap(static_cast<size_t>(M * K / 2)), hw_as(static_cast<size_t>(M * K / 16));
+    b.Copy(gq, hw_ap.data(), dap, hw_ap.size());
+    b.Copy(gq, hw_as.data(), das, hw_as.size());
+    b.Synchronize(gq);
+    ::unsetenv("VT_HW_FP4_QUANT");
+
+    // (1) Block scales byte-exact vs the ladder (same E4M3 cast).
+    size_t scale_mismatch = 0;
+    for (size_t idx = 0; idx < hw_as.size(); ++idx) scale_mismatch += (hw_as[idx] != cpu_as[idx]);
+    CHECK(scale_mismatch == 0);
+
+    // (2) Packed nibbles near-exact; a handful of approx-reciprocal boundary flips
+    //     are expected (and are the FAITHFUL vllm production behavior).
+    size_t packed_mismatch = 0;
+    for (size_t idx = 0; idx < hw_ap.size(); ++idx) packed_mismatch += (hw_ap[idx] != cpu_ap[idx]);
+    MESSAGE("HW-vs-ladder packed byte mismatch " << packed_mismatch << "/" << hw_ap.size()
+                                                  << " (bf16_in=" << bf16_in << ")");
+    CHECK(packed_mismatch <= hw_ap.size() / 16 + 2);
+
+    // (3) Decode round-trips x within the NVFP4 group-scale bound: the largest gap
+    //     between adjacent e2m1 codes is 2.0 in the scaled domain, so the per-elem
+    //     reconstruction error is <= block_scale (+ E4M3 scale slack).
+    const int64_t groups = K / 16;
+    for (int64_t r = 0; r < M; ++r)
+      for (int64_t c = 0; c < K; ++c) {
+        const float decode =
+            DecodeActElem(hw_ap.data(), hw_as.data(), K, r, c, input_global_scale);
+        const float block_scale =
+            vllm::F8E4M3ToF32(hw_as[static_cast<size_t>(r * groups + c / 16)]) / input_global_scale;
+        const float ref = x[static_cast<size_t>(r * K + c)];
+        CHECK(std::fabs(decode - ref) <= 1.1F * block_scale + 1e-3F);
+      }
+
+    b.Free(dx); b.Free(dap); b.Free(das);
+  };
+
+  run(1, 64, false);     // decode single row, f32 load path
+  run(1, 64, true);      // decode single row, 256-bit bf16 load path
+  run(8, 256, true);     // small batch, many groups/row (bf16)
+  run(37, 2048, true);   // 27B intermediate_size class, non-32-aligned M (bf16)
   b.DestroyQueue(gq);
 }
 

@@ -433,10 +433,12 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma);
 // out f32 or bf16 (computed in f32, rounded on store).
-// With residual != nullptr (f32 [T,H]): residual += x first (new residual
+// With residual != nullptr (f32 OR bf16 [T,H]): residual += x first (new residual
 // stream), and that sum is what gets normalized (upstream fused_add_rms_norm).
-// The residual stream stays f32-only by design — full precision is kept
-// across layers even when out is bf16.
+// The variance/normalize accumulation is always f32; the residual load/store dtype
+// follows the tensor. A bf16 residual mirrors vLLM's bf16 model dtype (the add is
+// rounded to bf16 before the f32 variance, matching csrc fused_add_rms_norm); a f32
+// residual keeps full precision across layers (the byte-identical previous path).
 // Note: unlike upstream forward_native, the standard path keeps full f32 precision
 // (no x.to(weight.dtype) rounding before the weight multiply); parity tests vs
 // upstream bf16 need bf16-eps tolerance on the non-gemma path.

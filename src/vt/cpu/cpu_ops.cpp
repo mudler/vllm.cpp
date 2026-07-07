@@ -44,19 +44,20 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
   for (int64_t i = 0; i < t; ++i) {
-    float* res_row = residual ? residual->Ptr<float>() + i * h : nullptr;
+    const int64_t rbase = i * h;
     float sumsq = 0.0f;
     for (int64_t j = 0; j < h; ++j) {
       float v = LoadF32(x, i * h + j);
-      if (res_row) {
-        v += res_row[j];
-        res_row[j] = v;  // new residual stream
+      if (residual) {
+        v += LoadF32(*residual, rbase + j);   // add in f32
+        StoreF32(*residual, rbase + j, v);     // new residual stream (rounds to its dtype)
+        v = LoadF32(*residual, rbase + j);     // re-read rounded value (bf16-faithful)
       }
       sumsq += v * v;
     }
     float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
     for (int64_t j = 0; j < h; ++j) {
-      float v = res_row ? res_row[j] : LoadF32(x, i * h + j);
+      float v = residual ? LoadF32(*residual, rbase + j) : LoadF32(x, i * h + j);
       float wj = LoadF32(w, j);
       if (args.gemma) wj += 1.0f;
       StoreF32(out, i * h + j, v * inv * wj);

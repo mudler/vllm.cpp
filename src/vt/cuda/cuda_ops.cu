@@ -37,25 +37,36 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);  // round-to-nearest-even, same as host F32ToBF16
 }
 
+// Round-trip a f32 value through the residual store dtype so the variance below
+// squares the SAME rounded value that gets written back to the residual stream —
+// mirrors vLLM fused_add_rms_norm, whose bf16 residual add (`z += residual`) rounds
+// to the model dtype before the f32 variance (layernorm_kernels.cu). Identity for a
+// f32 residual, so the previous f32-residual path stays byte-for-byte unchanged.
+template <typename Tres> __device__ inline float ResRound(float v);
+template <> __device__ inline float ResRound<float>(float v) { return v; }
+template <> __device__ inline float ResRound<__nv_bfloat16>(float v) {
+  return __bfloat162float(__float2bfloat16(v));
+}
+
 // ---------------------------------------------------------------------------
 // rmsnorm: one block per row, shared-memory f32 tree reduction.
 // Upstream csrc counterpart: csrc/layernorm_kernels.cu (rms_norm_kernel / fused_add_rms_norm_kernel) — align signatures post-MVP.
 
-template <typename Tin, typename Tout>
-__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, float* residual,
+template <typename Tin, typename Tout, typename Tres>
+__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual,
                                  int64_t h, float eps, bool gemma) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * h;
   Tout* orow = out + row * h;
-  float* rrow = residual == nullptr ? nullptr : residual + row * h;
+  Tres* rrow = residual == nullptr ? nullptr : residual + row * h;
 
   __shared__ float partial[kBlock];
   float acc = 0.0f;
   for (int64_t j = threadIdx.x; j < h; j += kBlock) {
     float v = Load(xrow, j);
     if (rrow != nullptr) {
-      v += rrow[j];
-      rrow[j] = v;  // new residual stream, updated in place (f32)
+      v = ResRound<Tres>(v + Load(rrow, j));  // new residual stream: f32 add, round to Tres
+      Store(rrow, j, v);                       // updated in place (f32 or bf16)
     }
     acc += v * v;
   }
@@ -67,10 +78,28 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, float* r
   }
   const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
   for (int64_t j = threadIdx.x; j < h; j += kBlock) {
-    const float v = rrow != nullptr ? rrow[j] : Load(xrow, j);
+    const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
     float wj = Load(w, j);
     if (gemma) wj += 1.0f;
     Store(orow, j, v * inv * wj);
+  }
+}
+
+// Dispatch the residual store dtype (f32 or bf16). A bf16 residual mirrors vLLM's
+// bf16 model dtype (model_config.dtype=bfloat16): the residual stream is bf16, only
+// the variance/normalize accumulation below stays f32. A f32 residual (or none)
+// takes the byte-identical previous path.
+template <typename Tin, typename Tout>
+void LaunchRmsNormRes(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                      const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h) {
+  if (residual != nullptr && residual->dtype == DType::kBF16) {
+    RmsNormRowKernel<Tin, Tout, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__nv_bfloat16>(), h,
+        args.eps, args.gemma);
+  } else {
+    float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
+    RmsNormRowKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
   }
 }
 
@@ -79,16 +108,13 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
-  float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
   const unsigned rows = static_cast<unsigned>(t);
   switch (out.dtype) {
     case DType::kF32:
-      RmsNormRowKernel<Tin, float><<<rows, kBlock, 0, s>>>(
-          out.Ptr<float>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
+      LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h);
       break;
     case DType::kBF16:
-      RmsNormRowKernel<Tin, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
-          out.Ptr<__nv_bfloat16>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma);
+      LaunchRmsNormRes<Tin, __nv_bfloat16>(s, out, x, w, args, residual, rows, h);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported out dtype");
   }

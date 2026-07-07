@@ -196,6 +196,26 @@ void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& 
   reinterpret_cast<MatmulFp8CutlassFn>(GetOp(OpId::kMatmulFp8Cutlass, q.device.type))(
       q, out, a_fp8, b_fp8, alpha);
 }
+void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
+                       float alpha) {
+  // Same argument contract as MatmulFp8Cutlass (drop-in fp8 dense GEMM).
+  VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,
+           "matmul_fp8_cublaslt: all tensors must be rank-2");
+  const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
+  VT_CHECK(k % 16 == 0 && n % 16 == 0, "matmul_fp8_cublaslt: K and N must be multiples of 16");
+  VT_CHECK(b_fp8.shape[1] == k, "matmul_fp8_cublaslt: b_fp8 must be [N, K] (K matches a_fp8)");
+  VT_CHECK(out.shape[0] == m && out.shape[1] == n, "matmul_fp8_cublaslt: out must be [M, N]");
+  VT_CHECK(out.dtype == DType::kBF16 || out.dtype == DType::kF32,
+           "matmul_fp8_cublaslt: out must be bf16 or f32");
+  VT_CHECK(a_fp8.dtype == DType::kI8 && b_fp8.dtype == DType::kI8,
+           "matmul_fp8_cublaslt: a_fp8/b_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(out.IsContiguous() && a_fp8.IsContiguous() && b_fp8.IsContiguous(),
+           "matmul_fp8_cublaslt: contiguous tensors required");
+  VT_CHECK(out.device == q.device && a_fp8.device == q.device && b_fp8.device == q.device,
+           "matmul_fp8_cublaslt: device mismatch");
+  reinterpret_cast<MatmulFp8CublasLtFn>(GetOp(OpId::kMatmulFp8CublasLt, q.device.type))(
+      q, out, a_fp8, b_fp8, alpha);
+}
 
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,

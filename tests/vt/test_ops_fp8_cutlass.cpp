@@ -120,7 +120,7 @@ void CheckClose(const std::vector<float>& got, const std::vector<float>& want, f
 // then out[m,n] = alpha * Σ_k f8val(a[m,k]) * f8val(b[n,k]) — the exact math the
 // GPU (QuantFp8Static + MatmulFp8Cutlass) computes, only the K-reduction order
 // differs (matmul tolerance).
-void RunCase(int M, int N, int K, uint32_t seed) {
+void RunCase(int M, int N, int K, uint32_t seed, bool cublaslt = false) {
   std::mt19937 rng(seed);
   std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
   std::uniform_int_distribution<int> ub(0, 255);
@@ -170,7 +170,10 @@ void RunCase(int M, int N, int K, uint32_t seed) {
 
   DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
   DeviceTensor dout(b, g.q, DType::kBF16, {M, N});
-  vt::MatmulFp8Cutlass(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+  if (cublaslt)
+    vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+  else
+    vt::MatmulFp8Cutlass(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
   std::vector<uint16_t> out_h(static_cast<size_t>(M) * N);
   dout.Download(g.q, out_h.data());
   std::vector<float> got(out_h.size());
@@ -234,6 +237,65 @@ TEST_CASE("fp8 cutlass W8A8 GEMM f32-output path matches bf16") {
   DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
   DeviceTensor dout(b, g.q, DType::kF32, {M, N});
   vt::MatmulFp8Cutlass(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+  std::vector<float> got(static_cast<size_t>(M) * N);
+  dout.Download(g.q, got.data());
+  CheckClose(got, ref, 2e-2f, 3e-2f);
+}
+
+TEST_CASE("fp8 cuBLASLt W8A8 GEMM matches host W8A8 reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cuBLASLt W8A8 test");
+    return;
+  }
+  // Same shapes as the cutlass case (small-M decode + prefill), routed through
+  // vt::MatmulFp8CublasLt (the cuBLASLt e4m3 TN path). Validates the col-major
+  // TN layout derivation against the host W8A8 reference. Shapes with no fp8
+  // cublasLt heuristic transparently fall back to the cutlass GEMM (still fp8).
+  RunCase(1, 256, 128, 1, /*cublaslt=*/true);
+  RunCase(8, 512, 256, 2, /*cublaslt=*/true);
+  RunCase(16, 128, 512, 3, /*cublaslt=*/true);
+  RunCase(64, 256, 256, 4, /*cublaslt=*/true);
+  RunCase(200, 320, 128, 5, /*cublaslt=*/true);
+  RunCase(512, 256, 256, 6, /*cublaslt=*/true);
+  RunCase(1024, 128, 256, 7, /*cublaslt=*/true);
+}
+
+TEST_CASE("fp8 cuBLASLt W8A8 GEMM f32-output path matches reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cuBLASLt f32-out test");
+    return;
+  }
+  // cuBLASLt writes f32 out directly (no bf16 staging); same reference within tol.
+  const int M = 8, N = 256, K = 256;
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
+  std::uniform_int_distribution<int> ub(0, 255);
+  const float input_scale = 0.03f, weight_scale = 0.02f, alpha = input_scale * weight_scale;
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  for (auto& v : x) v = ux(rng);
+  std::vector<uint8_t> b_fp8(static_cast<size_t>(N) * K);
+  for (auto& bb : b_fp8) {
+    int byte = ub(rng);
+    if ((byte & 0x7F) == 0x7F) byte &= ~0x7;
+    bb = static_cast<uint8_t>(byte);
+  }
+  std::vector<uint8_t> a_fp8(x.size());
+  for (size_t i = 0; i < x.size(); ++i) a_fp8[i] = vllm::F32ToF8E4M3(x[i] / input_scale);
+  std::vector<float> ref(static_cast<size_t>(M) * N, 0.0f);
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k)
+        acc += vllm::F8E4M3ToF32(a_fp8[static_cast<size_t>(m) * K + k]) *
+               vllm::F8E4M3ToF32(b_fp8[static_cast<size_t>(n) * K + k]);
+      ref[static_cast<size_t>(m) * N + n] = alpha * acc;
+    }
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor da(b, g.q, DType::kI8, {M, K}, a_fp8.data());
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+  DeviceTensor dout(b, g.q, DType::kF32, {M, N});
+  vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
   std::vector<float> got(static_cast<size_t>(M) * N);
   dout.Download(g.q, got.data());
   CheckClose(got, ref, 2e-2f, 3e-2f);

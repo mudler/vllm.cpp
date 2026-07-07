@@ -545,21 +545,44 @@ Tensor ResidentFp8(Dev d, const Fp8Weight& w) {
   return MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k});
 }
 
-// y[M,N] = x[M,K] (bf16/f32 device) @ dequant(w).T via the lifted vLLM cutlass
-// W8A8 fp8 GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
-// checkpoint input_scale) then vt::MatmulFp8Cutlass with the folded alpha
-// (= input_scale·weight_scale). out dtype f32 (q/k/v, in_proj_qkv/z sinks) or
-// bf16 (o/out_proj residual sinks). CUDA-only (sm120a; the 35B W8A8 path is
-// CUDA-resident — fp8 fields are only populated on the CUDA load, VT_FP8_CUTLASS).
+// cuBLASLt FP8 dense GEMM toggle (VT_DENSE_CUBLASLT_FP8, DEFAULT ON when the fp8
+// weights are resident). Routes the fp8 dense projections through vt::
+// MatmulFp8CublasLt (cuBLASLt e4m3 — the native equivalent of vLLM's measured-
+// FASTER nvjet_sm121_qqtst fp8 kernels) instead of vt::MatmulFp8Cutlass (our
+// cutlass sm120 fp8 GEMM, measured NEUTRAL vs bf16 at M=64/sm_121a). The
+// activation quant + fp8-resident weight are IDENTICAL for both — only the GEMM
+// backend differs, so both are the same fp8 W8A8 math (vLLM's scheme).
+// VT_DENSE_CUBLASLT_FP8=0 restores the cutlass fp8 GEMM (the previous, validated
+// path) for the parent's authoritative A/B.
+bool DenseCublasLtFp8Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_DENSE_CUBLASLT_FP8");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// y[M,N] = x[M,K] (bf16/f32 device) @ dequant(w).T via a per-tensor W8A8 fp8
+// GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
+// checkpoint input_scale) then an fp8 GEMM with the folded alpha
+// (= input_scale·weight_scale). By DEFAULT the GEMM is cuBLASLt fp8 (vt::
+// MatmulFp8CublasLt — mirrors vLLM's nvjet_qqtst fp8 dense); VT_DENSE_CUBLASLT_
+// FP8=0 selects the cutlass sm120 fp8 GEMM (vt::MatmulFp8Cutlass). out dtype f32
+// (q/k/v, in_proj_qkv/z sinks) or bf16 (o/out_proj residual sinks). CUDA-only
+// (the 35B W8A8 path is CUDA-resident — fp8 fields are populated by DEFAULT on
+// the CUDA+cutlass load, VT_DENSE_NATIVE).
 DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
   VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
-           "MatmulFp8CutlassD: the fp8 W8A8 cutlass path is CUDA-only");
+           "MatmulFp8CutlassD: the fp8 W8A8 path is CUDA-only");
   DBuf a_fp8(d, DType::kI8, {M, K});
   vt::QuantFp8Static(d.q, a_fp8.t(), x, w.input_scale);
   Tensor wdev = ResidentFp8(d, w);
   DBuf dout(d, out_dtype, {M, N});
-  vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
+  else
+    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
   return dout;
 }
 

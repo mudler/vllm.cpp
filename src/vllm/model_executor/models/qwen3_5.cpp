@@ -2458,25 +2458,16 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   return logits;
 }
 
-// Dense paged forward COMPUTE body: embed -> N paged dense layers -> final norm
-// -> (optional gather-before-)lm_head. Returns the [n_out, vocab] f32 logits as a
-// DEVICE DBuf (n_out == num_reqs when gathered, else T). Shared by the host
-// Forward (which Downloads) and ForwardDevice (which keeps it on device).
-static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
-                             const std::vector<int32_t>& positions,
-                             const CommonAttentionMetadata& attn_meta,
-                             const GDNAttentionMetadata& gdn_meta,
-                             const std::vector<PagedKvCache>& attn_kv,
-                             const std::vector<GdnStateCache>& gdn_state,
-                             const Qwen3_5DenseWeights& weights,
-                             const HfConfig& config,
-                             const std::vector<int32_t>& logits_indices) {
-  // Same shape/count contract as Qwen3_5Model::Forward (CheckPagedForward), over
-  // the dense weights. One PagedKvCache per full-attn layer, one GdnStateCache
-  // per GDN layer, in layer order.
+// Shared shape/count validation for the dense paged forward entry points (the
+// 27B analogue of CheckPagedForward). Same contract, over the dense weights.
+static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
+                                   const std::vector<int32_t>& positions,
+                                   const CommonAttentionMetadata& attn_meta,
+                                   const std::vector<PagedKvCache>& attn_kv,
+                                   const std::vector<GdnStateCache>& gdn_state,
+                                   const Qwen3_5DenseWeights& weights,
+                                   const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
-  const int64_t H = config.hidden_size;
-  const int64_t vocab = config.vocab_size;
   VT_CHECK(T > 0, "qwen3_5 dense paged forward: empty token_ids");
   VT_CHECK(static_cast<int64_t>(positions.size()) == T,
            "qwen3_5 dense paged forward: positions length must equal token count");
@@ -2491,16 +2482,58 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
            "qwen3_5 dense paged forward: attn_kv count must equal full-attn layers");
   VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
            "qwen3_5 dense paged forward: gdn_state count must equal GDN layers");
+}
 
-  const float eps = static_cast<float>(config.rms_norm_eps);
-
-  // Embed: hidden = embed_tokens[token_ids] (bf16, device-resident). res = 0.
-  // Text-only: the three mRoPE streams coincide so partial NeoX RoPE degenerates
-  // to 1-D RoPE over `positions` (notes §2); the vision tower is DEFERRED.
+// Dense embed (27B): hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident
+// table). The 27B analogue of EmbedInto — KEPT OUTSIDE THE CUDA-GRAPH for the
+// same reasons (the Embedding op allocs a bounds-check flag + syncs, and it
+// consumes host token_ids). The dense-graph driver runs this per step into its
+// PERSISTENT hidden buffer, then captures/replays DenseForwardLayers over that
+// fixed address. Text-only: the three mRoPE streams coincide so the partial NeoX
+// RoPE degenerates to 1-D RoPE over `positions` (notes §2); vision tower DEFERRED.
+static void DenseEmbedInto(Dev d, DBuf& hidden,
+                           const std::vector<int32_t>& token_ids,
+                           const Qwen3_5DenseWeights& weights,
+                           const HfConfig& config) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  const int64_t vocab = config.vocab_size;
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+}
+
+// The CAPTURABLE dense paged forward region (27B): everything AFTER the embedding
+// — the residual stream (res=0), the N paged dense decoder layers, the final
+// RMSNorm and the bf16 lm_head — returning the [n_out,vocab] f32 logits as a
+// device DBuf (NO host Download). The 27B analogue of ForwardLayers; split out so
+// the exact op sequence is what the graph captures/replays. `hidden_in` is the
+// embedded input (a view over the graph's persistent hidden buffer on the replay
+// path); it is COPIED into a working buffer so the layers' in-place residual
+// thread never disturbs the persistent embedding. All per-step-varying inputs are
+// read from HOST vector args (positions / metadata), whose host->device copies
+// are capturable on GB10; the driver keeps them persistent + mutates in place.
+// Every per-call scratch is pool-backed (DevicePool) or resident/StreamScratch-
+// pooled (the cutlass/emulation fp4 GEMMs, cublas lm_head) so a cold pre-warm at
+// this size makes the capture region do ZERO cudaMalloc.
+static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
+                               const std::vector<int32_t>& positions,
+                               const CommonAttentionMetadata& attn_meta,
+                               const GDNAttentionMetadata& gdn_meta,
+                               const std::vector<PagedKvCache>& attn_kv,
+                               const std::vector<GdnStateCache>& gdn_state,
+                               const Qwen3_5DenseWeights& weights,
+                               const HfConfig& config,
+                               const std::vector<int32_t>& logits_indices = {}) {
+  const int64_t T = hidden_in.shape[0];
+  const int64_t H = config.hidden_size;
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
+  // Paged reassigns `hidden` per layer, so this must NOT alias the persistent buf.
+  DBuf hidden(d, DType::kBF16, {T, H});
+  d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
+           static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
   DBuf res(d, ResidualDType(), {T, H});
   res.Zero(d);
@@ -2528,7 +2561,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
-  // lm_head is unquantized bf16 in the 27B (notes §3.6).
+  // lm_head is unquantized bf16 in the 27B (notes §3.6). Pure-decode / graph
+  // replay pass empty indices (identity) → the full [T,vocab] path.
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
   if (do_gather) {
@@ -2538,6 +2572,30 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
     return MatmulF32D(d, dgather.t(), weights.lm_head);
   }
   return MatmulF32D(d, dnorm.t(), weights.lm_head);
+}
+
+// Full eager dense paged forward body: embed (host token_ids) then the capturable
+// dense layer region. Used by Qwen3_5DenseModel::Forward/ForwardDevice and the
+// dense-graph driver's eager fallback / cold-shape pre-warm step (one contiguous
+// stream, no capture). Returns [n_out,vocab] f32 (n_out == num_reqs when gathered,
+// else T). Shared op sequence with the graph so eager output == replay output.
+static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
+                             const std::vector<int32_t>& positions,
+                             const CommonAttentionMetadata& attn_meta,
+                             const GDNAttentionMetadata& gdn_meta,
+                             const std::vector<PagedKvCache>& attn_kv,
+                             const std::vector<GdnStateCache>& gdn_state,
+                             const Qwen3_5DenseWeights& weights,
+                             const HfConfig& config,
+                             const std::vector<int32_t>& logits_indices) {
+  CheckDensePagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
+                         weights, config);
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  DBuf hidden(d, DType::kBF16, {T, H});
+  DenseEmbedInto(d, hidden, token_ids, weights, config);
+  return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
+                            gdn_state, weights, config, logits_indices);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -2898,6 +2956,197 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
   DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, s.gdn_meta,
                           attn_kv, gdn_state, impl_->weights, impl_->config);
+  s.warm = true;
+  s.captured = false;
+  // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
+  ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), vocab);
+  if (fl.rows != B) {
+    fl.rows = B;
+    fl.device_tensor =
+        MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+  }
+  return fl;
+}
+
+// ─── Qwen3_5DenseDecodeGraph (27B dense decode CUDA-graph driver) ────────────
+// The 27B DENSE sibling of Qwen3_5DecodeGraph. Same cold→warm→replay state
+// machine, same padded-batch capture set (kDecodeGraphSizes), same persistent
+// fixed-address host inputs and persistent embed/logits buffers — but it drives
+// the dense forward (DenseForwardLayers over DenseEmbedInto) instead of the MoE
+// forward. It reuses the weight-agnostic PadToCaptureSize / BuildPaddedDecode
+// verbatim. The dense W4A4 projections' per-call scratch is already persistent
+// (the cutlass StreamScratch pool / the emulation path's pool-backed DBufs / the
+// cublas lm_head), so a cold pre-warm at each size makes the capture region do
+// ZERO cudaMalloc — mirroring the MoE path's EnsureMoeScratch/EnsureCtmp/pool
+// discipline. The 35B MoE graph is UNTOUCHED.
+struct Qwen3_5DenseDecodeGraph::Impl {
+  Impl(const Qwen3_5DenseWeights& w, const HfConfig& c, vt::Queue q,
+       int64_t max_reqs)
+      : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
+    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
+    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    Backend& b = vt::GetBackend(queue.device.type);
+    enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
+              b.SupportsGraphCapture();
+  }
+  ~Impl() {
+    Backend& b = vt::GetBackend(queue.device.type);
+    for (auto& kv : slots)
+      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+  }
+
+  // One captured padded batch size (mirror of Qwen3_5DecodeGraph::Impl::SizeSlot).
+  struct SizeSlot {
+    std::vector<int32_t> token_ids;   // [S]
+    std::vector<int32_t> positions;   // [S]
+    v1::CommonAttentionMetadata attn_meta;
+    v1::GDNAttentionMetadata gdn_meta;
+    std::unique_ptr<DBuf> hidden;     // [S,H] bf16 persistent embed target
+    std::unique_ptr<DBuf> logits;     // [S,vocab] f32 held graph output
+    void* graph = nullptr;            // instantiated cudaGraphExec (opaque)
+    int fa_cols = -1;                 // captured block-table column count
+    bool captured = false;
+    bool warm = false;
+    int64_t replays = 0;
+
+    // In-place refresh of the persistent host inputs (fixed addresses once the
+    // slot's vectors reach size S) so a replay re-reads this step's tokens.
+    void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
+                 const v1::CommonAttentionMetadata& am,
+                 const v1::GDNAttentionMetadata& gm) {
+      CopyInPlace(token_ids, tok);
+      CopyInPlace(positions, pos);
+      CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
+      CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
+      CopyInPlace(attn_meta.seq_lens, am.seq_lens);
+      CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
+      attn_meta.num_reqs = am.num_reqs;
+      attn_meta.num_actual_tokens = am.num_actual_tokens;
+      attn_meta.max_query_len = am.max_query_len;
+      attn_meta.max_seq_len = am.max_seq_len;
+      attn_meta.block_table_num_cols = am.block_table_num_cols;
+      attn_meta.causal = am.causal;
+      CopyInPlace(gdn_meta.non_spec_state_indices_tensor,
+                  gm.non_spec_state_indices_tensor);
+      CopyInPlace(gdn_meta.non_spec_query_start_loc, gm.non_spec_query_start_loc);
+      CopyInPlace(gdn_meta.has_initial_state, gm.has_initial_state);
+      CopyInPlace(gdn_meta.prefill_query_start_loc, gm.prefill_query_start_loc);
+      CopyInPlace(gdn_meta.prefill_state_indices, gm.prefill_state_indices);
+      CopyInPlace(gdn_meta.prefill_has_initial_state, gm.prefill_has_initial_state);
+      gdn_meta.num_prefills = gm.num_prefills;
+      gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
+      gdn_meta.num_decodes = gm.num_decodes;
+      gdn_meta.num_decode_tokens = gm.num_decode_tokens;
+      gdn_meta.num_actual_tokens = gm.num_actual_tokens;
+    }
+  };
+
+  const Qwen3_5DenseWeights& weights;
+  const HfConfig& config;
+  vt::Queue queue;
+  int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
+  bool enabled = false;
+
+  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  int64_t replays = 0;                // total replays (diagnostics)
+  bool any_captured = false;          // diagnostics: at least one live graph
+};
+
+Qwen3_5DenseDecodeGraph::Qwen3_5DenseDecodeGraph(const Qwen3_5DenseWeights& weights,
+                                                 const HfConfig& config,
+                                                 vt::Queue queue,
+                                                 int64_t max_num_reqs)
+    : impl_(std::make_unique<Impl>(weights, config, queue, max_num_reqs)) {}
+
+Qwen3_5DenseDecodeGraph::~Qwen3_5DenseDecodeGraph() = default;
+
+bool Qwen3_5DenseDecodeGraph::captured() const { return impl_->any_captured; }
+int64_t Qwen3_5DenseDecodeGraph::replay_count() const { return impl_->replays; }
+
+ForwardLogits Qwen3_5DenseDecodeGraph::Step(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const v1::CommonAttentionMetadata& attn_meta,
+    const v1::GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state) {
+  CheckDensePagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
+                         impl_->weights, impl_->config);
+  Backend& b = vt::GetBackend(impl_->queue.device.type);
+  Dev d{b, impl_->queue};
+  const int64_t B = static_cast<int64_t>(token_ids.size());
+  const int64_t vocab = impl_->config.vocab_size;
+  const int64_t H = impl_->config.hidden_size;
+
+  // Returns the [B,vocab] real-row logits ON DEVICE (no D2H). The captured/warm
+  // paths return a NON-owning view over the slot's persistent [S,vocab] logits
+  // (first B rows are the real requests). Stream ordering guarantees the sampler
+  // sees the replay's writes; the next same-size replay overwrites the buffer.
+  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  if (!impl_->enabled || S < 0) {
+    DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                               gdn_state, impl_->weights, impl_->config, {});
+    return WrapDeviceLogits(d, std::move(lg), vocab);
+  }
+
+  // Pad this step's real B-request inputs up to S (inert padding rows), then
+  // refresh THIS size's persistent host buffers in place.
+  Impl::SizeSlot& s = impl_->slots[S];
+  const int cols = attn_meta.block_table_num_cols;
+  std::vector<int32_t> ptok, ppos;
+  v1::CommonAttentionMetadata pam;
+  v1::GDNAttentionMetadata pgm;
+  BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+                    pam, pgm);
+
+  // A block-table column-count change reallocates the persistent block_table (the
+  // captured H2D copy's source address moves) → invalidate this slot's graph.
+  const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
+  s.Refresh(ptok, ppos, pam, pgm);
+  s.fa_cols = cols;
+  if (cols_changed && s.graph != nullptr) {
+    b.DestroyGraph(s.graph);
+    s.graph = nullptr;
+    s.captured = false;
+    s.warm = false;
+  }
+
+  // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
+  // persistent hidden buffer, then relaunch the captured dense layer region.
+  if (s.captured) {
+    DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    b.ReplayGraph(impl_->queue, s.graph);
+    ++s.replays;
+    ++impl_->replays;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Warm: the pool + residency were warmed for this size by the previous (eager)
+  // step. CAPTURE the dense layer region once, instantiate the graph, launch it.
+  if (s.warm) {
+    DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    b.BeginCapture(impl_->queue);
+    DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                                 s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                                 impl_->config);
+    s.graph = b.EndCaptureGraph(impl_->queue);
+    s.logits = std::make_unique<DBuf>(std::move(lg));
+    s.captured = true;
+    impl_->any_captured = true;
+    b.ReplayGraph(impl_->queue, s.graph);
+    s.replays = 1;
+    ++impl_->replays;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Cold size: run one EAGER step (pre-warms the DevicePool + resident weights /
+  // fp4-GEMM StreamScratch pools for this size) and defer capture to the next
+  // same-size step. This is a real decode step (its padded output's real rows are
+  // used). (Re)allocate the persistent hidden buffer to this size.
+  s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
+  DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
+                               s.gdn_meta, attn_kv, gdn_state, impl_->weights,
+                               impl_->config);
   s.warm = true;
   s.captured = false;
   // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.

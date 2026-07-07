@@ -77,13 +77,15 @@ int ResolveMaxNumBatchedTokens(const EngineParams& params, int max_model_len) {
     // Explicit override; still honor the >= max_num_seqs invariant.
     return std::max(params.max_num_batched_tokens, seqs);
   }
-  // GB10-tuned default: 4096. Measured +8.2% total throughput vs 2048 at the
-  // 35B gate (conc-64, in1024/out128) from packing more prefill tokens/step;
-  // 27B conc-8 is safe (peak ~56GB of 119GB, no OOM) and neutral. This is BELOW
-  // vLLM's runtime default (8192, vllm/config/scheduler.py API path) but above
-  // the DEFAULT_MAX_NUM_BATCHED_TOKENS=2048 floor — the memory-safe sweet spot
-  // on GB10's 119GB unified LPDDR5X (8192 measured worse, 16384 OOMs/reboots).
-  int budget = 4096;
+  // GB10-tuned, CONCURRENCY-AWARE default: 8192 at high concurrency (>=32),
+  // else 4096. Measured: at the 35B gate (conc-64, in1024/out128) mnbt=8192 is
+  // +2.7% over 4096 (which is itself +8.2% over 2048) — bigger prefill chunks
+  // amortize per-token GEMM/attention work across the many running seqs. But at
+  // LOW concurrency (27B gate conc-8, np=8) mnbt=8192 is -10% (all 8 prompts
+  // prefill in one step -> no prefill/decode pipelining), so those keep 4096.
+  // Matches vLLM's runtime default (8192) at scale; both are memory-safe on
+  // GB10's 119GB (35B conc-64 peak 54GB, 27B conc-8 peak 56GB; 16384 OOMs).
+  int budget = seqs >= 32 ? 8192 : 4096;
   // Never exceed the whole workload's ceiling (tiny-model no-op preservation).
   const long ceiling = static_cast<long>(max_model_len) * seqs;
   if (ceiling > 0 && static_cast<long>(budget) > ceiling) {

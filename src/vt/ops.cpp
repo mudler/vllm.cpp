@@ -954,9 +954,10 @@ void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgat
            "attn_gate_split: gate_out must match q_out [T,Hq,Dh]");
   VT_CHECK(qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
            "attn_gate_split: qgate must be [T, Hq*2*Dh]");
-  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32 &&
-               qgate.dtype == DType::kF32,
-           "attn_gate_split: q_out/gate_out/qgate must be f32");
+  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32,
+           "attn_gate_split: q_out/gate_out must be f32");
+  VT_CHECK(qgate.dtype == DType::kF32 || qgate.dtype == DType::kBF16,
+           "attn_gate_split: qgate must be f32 or bf16 (bf16 = VT_BF16_GEMM_OUT q_proj)");
   VT_CHECK(q_out.IsContiguous() && gate_out.IsContiguous() && qgate.IsContiguous(),
            "attn_gate_split: contiguous required");
   VT_CHECK(q_out.device == q.device && gate_out.device == q.device && qgate.device == q.device,

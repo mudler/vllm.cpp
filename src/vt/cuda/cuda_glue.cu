@@ -34,6 +34,7 @@ unsigned GridFor(int64_t n) {
 // (mirrors cuda_moe.cu; __float2bfloat16 is round-to-nearest-even, same as the
 // host F32ToBF16).
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
+__device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
 
@@ -73,7 +74,8 @@ void CastF32KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
 // ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh]. Thread per
 // output element (flat index over T*Hq*Dh); (i,h,d) recovered from it.
-__global__ void AttnGateSplitKernel(float* q_out, float* gate_out, const float* qgate, int64_t t,
+template <typename Tin>
+__global__ void AttnGateSplitKernel(float* q_out, float* gate_out, const Tin* qgate, int64_t t,
                                     int64_t hq, int64_t dh) {
   const int64_t n = t * hq * dh;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -92,8 +94,19 @@ void AttnGateSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& gate_out, const Te
   const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
   const int64_t n = t * hq * dh;
   if (n == 0) return;
-  AttnGateSplitKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-      q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<float>(), t, hq, dh);
+  // qgate may be f32 (default) or bf16 (VT_BF16_GEMM_OUT — the q_proj GEMM emits bf16);
+  // q_out/gate_out stay f32 (the qk-norm/RoPE chain reads f32). Load() upcasts.
+  switch (qgate.dtype) {
+    case DType::kF32:
+      AttnGateSplitKernel<float><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+          q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<float>(), t, hq, dh);
+      break;
+    case DType::kBF16:
+      AttnGateSplitKernel<__nv_bfloat16><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+          q_out.Ptr<float>(), gate_out.Ptr<float>(), qgate.Ptr<__nv_bfloat16>(), t, hq, dh);
+      break;
+    default: VT_CHECK(false, "attn_gate_split: qgate must be f32 or bf16");
+  }
   Check(cudaGetLastError(), "attn_gate_split launch");
 }
 

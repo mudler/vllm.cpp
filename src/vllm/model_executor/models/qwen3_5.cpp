@@ -1434,10 +1434,16 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
+  // q_proj output bf16 (VT_BF16_GEMM_OUT rank-2): halves the large [T,2*Hq*Dh] qgate
+  // GEMM write + the AttnGateSplit read; the templated AttnGateSplit upcasts to f32
+  // qf/gatef, so qk-norm/RoPE/attention are unchanged. k/v stay f32 (k-norm weight is
+  // f32; V feeds vt::Attention/ReshapeAndCache which need f32 here).
+  const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, DType::kF32)
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
                : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
-               : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
+                                             : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)
@@ -1524,10 +1530,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
+  // q_proj output bf16 (VT_BF16_GEMM_OUT rank-2): halves the large [T,2*Hq*Dh] qgate
+  // GEMM write + the AttnGateSplit read; the templated AttnGateSplit upcasts to f32
+  // qf/gatef, so qk-norm/RoPE/attention are unchanged. k/v stay f32 (k-norm weight is
+  // f32; V feeds vt::Attention/ReshapeAndCache which need f32 here).
+  const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, DType::kF32)
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
                : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
-               : fp4 ? MatmulNvfp4F32D(d, h, w.q_proj_fp4)
+               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
+                                             : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, DType::kF32)

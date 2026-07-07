@@ -20,7 +20,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,6 +49,86 @@ void Check(cudaError_t err, const char* what) {
 }
 
 inline int RoundMultiple(int x, int m) { return (x + m - 1) / m * m; }
+
+// vLLM/FA-2's split-KV heuristic, ported verbatim from flash-attn's
+// flash_fwd_launch_template.h / flash_api.cpp num_splits_heuristic. Given the
+// grid work (batch * nheads * num_m_blocks), the SM count, and the number of KV
+// n-blocks, it picks num_splits>1 to fill idle SMs when the base grid is small.
+// This is exactly the path vLLM's nsys trace shows (flash_fwd_splitkv_kernel,
+// Split=TRUE) — for a large-grid prefill it returns 1 (main kernel writes O
+// directly, no combine), for a small grid it returns >1 (KV split + combine).
+inline int NumSplitsHeuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks,
+                              int max_splits) {
+  // If we have enough to almost fill the SMs, then just use 1 split.
+  if (batch_nheads_mblocks >= 0.8f * num_SMs) return 1;
+  max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+  float max_efficiency = 0.f;
+  std::vector<float> efficiency;
+  efficiency.reserve(max_splits);
+  auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+  // Some splits are not eligible: if the last split has fewer n-blocks than the
+  // others, load balancing is poor — skip those (mirrors upstream).
+  auto is_split_eligible = [&ceildiv, num_n_blocks](int num_splits) {
+    return num_splits == 1 ||
+           ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+  };
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) {
+      efficiency.push_back(0.f);
+    } else {
+      float n_waves = static_cast<float>(batch_nheads_mblocks * num_splits) / num_SMs;
+      float eff = n_waves / std::ceil(n_waves);
+      if (eff > max_efficiency) max_efficiency = eff;
+      efficiency.push_back(eff);
+    }
+  }
+  for (int num_splits = 1; num_splits <= max_splits; ++num_splits) {
+    if (!is_split_eligible(num_splits)) continue;
+    if (efficiency[num_splits - 1] >= 0.85f * max_efficiency) return num_splits;
+  }
+  return 1;
+}
+
+// Persistent (grow-only) device scratch for the split-KV accumulators. Mirrors
+// vLLM's set_params_splitkv softmax_lse_accum / out_accum tensors:
+//   oaccum   [num_splits, b, h, seqlen_q, d_rounded] f32
+//   lseaccum [num_splits, b, h, seqlen_q]            f32
+// Allocated once and reused across layers/forwards (not a per-call malloc).
+struct SplitKvAccumPool {
+  std::mutex mu;
+  float* oaccum = nullptr;
+  float* lseaccum = nullptr;
+  size_t oaccum_floats = 0;
+  size_t lseaccum_floats = 0;
+
+  // Ensure both buffers hold at least the requested float counts (grow-only).
+  void Ensure(size_t need_o, size_t need_lse) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (need_o > oaccum_floats) {
+      if (oaccum) cudaFree(oaccum);
+      if (cudaMalloc(&oaccum, need_o * sizeof(float)) != cudaSuccess) {
+        oaccum = nullptr;
+        oaccum_floats = 0;
+        throw std::runtime_error("cuda flash-attn-2 prefill: split-KV oaccum pool alloc failed");
+      }
+      oaccum_floats = need_o;
+    }
+    if (need_lse > lseaccum_floats) {
+      if (lseaccum) cudaFree(lseaccum);
+      if (cudaMalloc(&lseaccum, need_lse * sizeof(float)) != cudaSuccess) {
+        lseaccum = nullptr;
+        lseaccum_floats = 0;
+        throw std::runtime_error("cuda flash-attn-2 prefill: split-KV lseaccum pool alloc failed");
+      }
+      lseaccum_floats = need_lse;
+    }
+  }
+};
+
+SplitKvAccumPool& AccumPool() {
+  static SplitKvAccumPool pool;
+  return pool;
+}
 
 // FA-2's kernel is bf16 in / bf16 out. The production full-attn prefill hands us
 // an f32 query (residual-stream precision) and an f32 output tensor with a bf16
@@ -203,12 +287,86 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.block_table_batch_stride = block_table.stride[0];
   p.page_block_size = static_cast<int>(block_size);
 
-  p.num_splits = 1;         // paged varlen: no KV split (Split=false, direct O write)
   p.unpadded_lse = true;    // LSE is [nheads, total_q]
   p.seqlenq_ngroups_swapped = false;
 
+  // -- SPLIT-KV heuristic (mirrors vLLM's set_params_splitkv) -----------------
+  // The splitkv dispatch uses kBlockM=64 and, for hdim256, kBlockN=64. num_splits
+  // splits the KV (n) dimension across extra CTAs so idle SMs get work when the
+  // base grid (b * h * m_blocks) is small; the combine kernel then reduces the
+  // partials into O. For a large prefill grid the heuristic returns 1 (Split=false,
+  // main kernel writes O directly — identical to the pre-split behaviour).
+  constexpr int kSplitKvBlockM = 64;                        // run_mha_fwd_splitkv_dispatch
+  constexpr int kSplitKvBlockN = 64;                        // hdim256 -> kBlockN=64
+  const int num_m_blocks = (max_seqlen_q + kSplitKvBlockM - 1) / kSplitKvBlockM;
+  const int num_n_blocks = (max_seqlen_k + kSplitKvBlockN - 1) / kSplitKvBlockN;
+  int num_SMs = 48;
+  {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&num_SMs, cudaDevAttrMultiProcessorCount, dev);
+  }
+  const int batch_nheads_mblocks =
+      static_cast<int>(num_reqs) * static_cast<int>(hq) * num_m_blocks;
+  int num_splits = NumSplitsHeuristic(batch_nheads_mblocks, num_SMs, num_n_blocks, 128);
+
+  // Optional override for A/B probing: VT_ATTN_FA2_SPLITS forces num_splits (the
+  // heuristic returns 1 for large prefill grids, so this is the only way to
+  // exercise/measure the Split=TRUE + combine path on those shapes). Clamped to
+  // [1,128]. The uniform-seqlen benchmark keeps the combine's batched O-write
+  // valid; ragged varlen would need the packed O-write the combine kernel lacks.
+  if (const char* ov = std::getenv("VT_ATTN_FA2_SPLITS")) {
+    int forced = std::atoi(ov);
+    if (forced >= 1) num_splits = std::min(forced, 128);
+  }
+  num_splits = std::max(1, std::min(num_splits, num_n_blocks));  // can't split more than n-blocks
+  p.num_splits = num_splits;
+
+  // The combine kernel writes the final O with batched/padded addressing:
+  //   o_ptr + batch_idx*o_batch_stride + head_idx*o_head_stride + row*o_row_stride
+  // For our varlen-packed O [total_q,hq,d] this is exact only for UNIFORM seqlens
+  // with o_batch_stride = seqlen_q * o_row_stride (row runs [0,seqlen_q) per seq).
+  // It is ignored by the num_splits==1 direct path (that uses cu_seqlens_q), so
+  // setting it here is harmless when no split occurs.
+  p.o_batch_stride = static_cast<int64_t>(max_seqlen_q) * o_row_stride;
+
+  float* oaccum = nullptr;
+  float* lseaccum = nullptr;
+  if (num_splits > 1) {
+    // oaccum [num_splits,b,h,seqlen_q,d_rounded], lseaccum [num_splits,b,h,seqlen_q]
+    // (+ one kBlockM row of margin per (b*h) so the last m-block's full-tile store
+    // stays in-bounds). Persistent pool, reused across the 40 layers.
+    const size_t bh = static_cast<size_t>(num_reqs) * static_cast<size_t>(hq);
+    const size_t per_split_lse = bh * static_cast<size_t>(p.seqlen_q);
+    const size_t per_split_o = per_split_lse * static_cast<size_t>(p.d_rounded);
+    const size_t margin_o = bh * static_cast<size_t>(kSplitKvBlockM) *
+                            static_cast<size_t>(p.d_rounded);
+    const size_t margin_lse = bh * static_cast<size_t>(kSplitKvBlockM);
+    AccumPool().Ensure(static_cast<size_t>(num_splits) * per_split_o + margin_o,
+                       static_cast<size_t>(num_splits) * per_split_lse + margin_lse);
+    oaccum = AccumPool().oaccum;
+    lseaccum = AccumPool().lseaccum;
+    p.oaccum_ptr = oaccum;
+    p.softmax_lseaccum_ptr = lseaccum;
+  }
+
+  // One-shot diagnostic: report the gate shape and the num_splits actually used.
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    std::fprintf(stderr,
+                 "[FA2 split-KV] b=%lld hq=%lld d=%lld max_sq=%d max_sk=%d "
+                 "m_blocks=%d n_blocks=%d SMs=%d batch*h*mblk=%d -> num_splits=%d%s\n",
+                 static_cast<long long>(num_reqs), static_cast<long long>(hq),
+                 static_cast<long long>(d), max_seqlen_q, max_seqlen_k, num_m_blocks,
+                 num_n_blocks, num_SMs, batch_nheads_mblocks, num_splits,
+                 std::getenv("VT_ATTN_FA2_SPLITS") ? " (forced)" : " (heuristic)");
+  }
+
   // head_dim 256 is gated by the caller. Causal is per-layer (qwen3.5 mixes full-
   // attn causal / GDN); dispatch both instantiations (compiled for sm_121a).
+  // run_mha_fwd_splitkv_dispatch runs the Split kernel AND, when num_splits>1, the
+  // flash_fwd_splitkv_combine reduction kernel — exactly vLLM's path.
   if (args.causal) {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
   } else {

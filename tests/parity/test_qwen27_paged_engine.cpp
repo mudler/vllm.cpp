@@ -69,34 +69,21 @@ vllm::SamplingParams Greedy(int max_tokens) {
   return sp;
 }
 
-// The 27B fp4-resident W4A4 GEMM path (§5 step-6a) + the dense forward are wired.
-// This gate now RUNS on dgx and closes token-for-token against the vLLM-EMULATION
-// oracle golden (greedy_ids_emulation.npy, tok6=271; captured by
-// tools/parity/dump_27b_emulation_greedy.py against the pip-vLLM oracle forced to
-// EmulationNvFp4LinearKernel via VLLM_DISABLED_KERNELS).
+// The 27B fp4-resident W4A4 GEMM path + the dense forward are wired. This gate
+// RUNS on dgx and closes token-for-token against vLLM's PRODUCTION greedy
+// continuation (greedy_ids.npy, tok6=198) under the DEFAULT config.
 //
-// CORRECTNESS BAR = token-for-token parity with vLLM's OWN emulation reference
-// (the 271 stream) — the faithful reference our fp4 W4A4 forward mirrors. We do
-// NOT gate against the production-198 stream (greedy_ids.npy): 198 is vLLM's
-// NATIVE flashinfer/cutlass-sm120a full-stack result on a razor whitespace
-// near-tie (tok6 198 "\n" vs 271 "\n\n"); recovering it is a POST-MVP full-stack
-// flashinfer drop-in.
-//
-// THE GATE PINS THE DETERMINISTIC EMULATION-GRADE fp4 REFERENCE (VT_NVFP4_CUTLASS=0)
-// for this token-exact assertion — our hand-written vt::MatmulNvfp4Fp4, the
-// bit-faithful mirror of vLLM's EmulationNvFp4LinearKernel, which reproduces the
-// emulation golden 16/16 (MEASURED 2026-07-06; ledger row 56). The cutlass sm120a
-// kernel is the COMPILED + RUNTIME DEFAULT (NvfpCutlassEnabled default-ON,
-// qwen3_5.cpp) — the ~3.19× 27B throughput lever — but it is only ~0.19% off
-// emulation (NOT bit-exact; test_ops_nvfp4_fp4, ledger row 65), so on this
-// near-tie-dense continuation it DETERMINISTICALLY flips a whitespace near-tie at
-// tok8 (271 "\n\n" -> 198 "\n"), the SAME class of tie that separates vLLM's own
-// emulation (271) from its native kernel (198). Cutlass-default output stays
-// coherent (" capital of Germany is Berlin.") and is identical to emulation on
-// every SEMANTIC token (0-7); its GEMM correctness is covered by
-// test_ops_nvfp4_fp4 and its end-to-end win by the throughput A/B. So this
-// token-exact math gate pins the deterministic reference; the throughput default
-// is validated separately (division of labour, not a cutlass regression).
+// CORRECTNESS BAR = token-for-token parity with vLLM's PRODUCTION (native
+// flashinfer/cutlass-sm120a) output. MEASURED 2026-07-07: the default stack —
+// cutlass sm120a fp4 GEMM (NvfpCutlassEnabled default-ON, qwen3_5.cpp) + bf16
+// residual (VT_BF16_RESIDUAL default-ON) — reproduces the 198 stream 16/16, i.e.
+// it is PRODUCTION-TOKEN-EXACT (matches vLLM's real serving output, not just the
+// degenerate emulation-271 reference). This is the strongest bar and is what the
+// gate asserts. The emulation path (VT_NVFP4_CUTLASS=0, hand-written
+// vt::MatmulNvfp4Fp4 mirroring vLLM's EmulationNvFp4LinearKernel) yields the
+// degenerate 271 stream and is kept only as an opt-out (greedy_ids_emulation.npy
+// covers it). tok6 is the razor whitespace near-tie (198 "\n" vs 271 "\n\n") —
+// the default now lands on the production side.
 constexpr bool kW4A4ForwardReady = true;
 
 }  // namespace
@@ -118,23 +105,21 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
     return;
   }
 
-  // Pin the DETERMINISTIC emulation-grade fp4 reference for this token-exact gate
-  // (see kW4A4ForwardReady note): the cutlass sm120a default is a throughput lever
-  // that deterministically flips a whitespace near-tie at tok8 vs vLLM's emulation
-  // reference. setenv BEFORE the engine loads so NvfpCutlassEnabled()'s lazy static
-  // init observes it. The compiled cutlass path itself is unaffected (still the
-  // production default); this only fixes the reference kernel for the assertion.
-  setenv("VT_NVFP4_CUTLASS", "0", /*overwrite=*/1);
-
+  // Run the DEFAULT config (cutlass sm120a fp4 GEMM + bf16 residual, both
+  // default-ON) — it reproduces vLLM's PRODUCTION greedy continuation
+  // token-for-token (tok6=198), so assert the PRODUCTION golden below. Do NOT
+  // force VT_NVFP4_CUTLASS=0; that opt-out gives the degenerate emulation-271
+  // stream, which is the weaker reference.
   const std::string kPrompt = "The capital of France is Paris, and the";
   const fs::path golden = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_27b";
   const std::vector<int32_t> want_prompt_ids =
       LoadI32Npy(golden / "token_ids.npy");
-  // Assert against the vLLM-EMULATION continuation (tok6=271), the faithful
-  // reference our fp4 W4A4 forward mirrors token-for-token — NOT the native
-  // production-198 stream in greedy_ids.npy (see kW4A4ForwardReady note above).
+  // Assert the vLLM PRODUCTION continuation (greedy_ids.npy, tok6=198) — the
+  // default cutlass+bf16-residual stack reproduces it token-for-token, the
+  // strongest correctness bar. (greedy_ids_emulation.npy = the degenerate
+  // emulation-271 reference for the VT_NVFP4_CUTLASS=0 opt-out only.)
   const std::vector<int32_t> want_greedy_ids =
-      LoadI32Npy(golden / "greedy_ids_emulation.npy");
+      LoadI32Npy(golden / "greedy_ids.npy");
   const int kMaxTokens = static_cast<int>(want_greedy_ids.size());  // 16
 
   MESSAGE("qwen27_paged_engine: loading full 27B via FromModelDir("

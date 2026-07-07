@@ -122,6 +122,89 @@ struct sm120_fp4_config_default {
   using PerSmTileShape_MNK = Shape<_256, _128, _128>;
 };
 
+// ---- Alternative SM120 blockscaled configs for the VT_FP4_GEMM_CFG autotune
+// sweep (perf lever; the 27B/35B prefill fp4 W4A4 GEMM is the single biggest
+// prefill bucket) ------------------------------------------------------------
+// Selected at runtime for the LARGE-M (prefill) branch only; the small-M
+// (decode) branch stays on sm120_fp4_config_M256 unchanged. Every alternative
+// keeps the collective's numerics-relevant knobs IDENTICAL to the default —
+// same ClusterShape<1,1,1>, same K-tile 128, same
+// KernelScheduleAuto/EpilogueScheduleAuto, same alpha / scale-swizzle /
+// epilogue plumbing — and differs ONLY in the (M,N) tile shape and/or the tile
+// scheduler. The sm120 block-scaled fp4 MMA accumulates over K in the same
+// order for every output element regardless of the M/N tiling (there is no
+// split-K here: the tile scheduler hands each CTA whole output tiles), so
+// cfg 1..4 are byte-for-byte equal to cfg 0 in result — only speed differs.
+//
+// Constraints grounded in flashinfer's sm120 dense block-scaled GEMM
+// (dense_blockscaled_gemm_sm120_b12x.py): SM120/GB10 GeForce has NO
+// tcgen05 / 2-CTA / multi-cluster tensor MMA, so ClusterShape is ALWAYS
+// <1,1,1>; tile_k is fixed at 128 (= sf_vec_size*8); tile_m/tile_n must be
+// divisible by 64. Candidate (M,N) tiles mirror flashinfer's own SM120 tile
+// set (_SM100_MMA_TILER_MN_CANDIDATES, cluster forced to (1,1) on sm120):
+// 128x128 is flashinfer's large-M default (_select_default_sm120_mma_tiler
+// returns (128,128) for m>128), 128x256 the big-N tile for the wide gate/up
+// projections (N=17408). 256x256 is intentionally NOT offered: the sm120
+// cooperative kernel spreads a tile_m*tile_n f32 accumulator over 256 MMA
+// threads, so 256x256 = 256 regs/thread exceeds the ~232-reg budget and would
+// fail can_implement.
+
+// cfg 1: flashinfer's SM120 large-M default tile (128x128), persistent sched.
+struct sm120_fp4_config_alt1 {
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileScheduler = cutlass::gemm::PersistentScheduler;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using PerSmTileShape_MNK = Shape<_128, _128, _128>;
+};
+
+// cfg 2: big-N tile (128x256) for the wide gate/up projections, persistent.
+struct sm120_fp4_config_alt2 {
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileScheduler = cutlass::gemm::PersistentScheduler;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _256, _128>;
+  using PerSmTileShape_MNK = Shape<_128, _256, _128>;
+};
+
+// cfg 3: default tile (256x128) with the NON-persistent (data-parallel) tile
+// scheduler — a scheduler A/B against cfg 0 at the same tile.
+struct sm120_fp4_config_alt3 {
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileScheduler = void;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_256, _128, _128>;
+  using PerSmTileShape_MNK = Shape<_256, _128, _128>;
+};
+
+// cfg 4: flashinfer's 128x128 tile with the NON-persistent tile scheduler.
+struct sm120_fp4_config_alt4 {
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileScheduler = void;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using PerSmTileShape_MNK = Shape<_128, _128, _128>;
+};
+
+// Runtime selector. VT_FP4_GEMM_CFG in [0..kFp4GemmMaxCfg]: 0 (unset / empty /
+// out-of-range) = today's EXACT default path (byte-identical); 1..4 pick the
+// alternatives above for the large-M (prefill) branch. Read once, cached.
+constexpr int kFp4GemmMaxCfg = 4;
+int Fp4GemmCfg() {
+  static const int cfg = [] {
+    const char* e = std::getenv("VT_FP4_GEMM_CFG");
+    if (e == nullptr || e[0] == '\0') return 0;
+    const int v = std::atoi(e);
+    if (v < 0 || v > kFp4GemmMaxCfg) return 0;  // guard: unknown → default
+    return v;
+  }();
+  return cfg;
+}
+
 template <typename Config, typename OutType>
 struct Fp4GemmSm120 {
   using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
@@ -252,11 +335,36 @@ void Fp4GemmDispatch(void* D, const void* A, const void* B, const void* A_sf, co
   };
   uint32_t const mp2 = std::max<uint32_t>(16u, next_pow_2(static_cast<uint32_t>(m)));
   if (mp2 <= 256) {
+    // Small-M (decode) branch — unchanged, not part of the prefill sweep.
     RunGemm<typename Fp4GemmSm120<sm120_fp4_config_M256, OutType>::Gemm>(
         D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  } else {
-    RunGemm<typename Fp4GemmSm120<sm120_fp4_config_default, OutType>::Gemm>(
-        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    return;
+  }
+  // Large-M (prefill) branch — config selectable via VT_FP4_GEMM_CFG for the
+  // autotune sweep. cfg 0 (unset/default) dispatches sm120_fp4_config_default,
+  // i.e. the exact prior path (byte-identical result). cfg 1..4 are the same
+  // math at a different tile/scheduler (see the config structs above).
+  switch (Fp4GemmCfg()) {
+    case 1:
+      RunGemm<typename Fp4GemmSm120<sm120_fp4_config_alt1, OutType>::Gemm>(
+          D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+      return;
+    case 2:
+      RunGemm<typename Fp4GemmSm120<sm120_fp4_config_alt2, OutType>::Gemm>(
+          D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+      return;
+    case 3:
+      RunGemm<typename Fp4GemmSm120<sm120_fp4_config_alt3, OutType>::Gemm>(
+          D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+      return;
+    case 4:
+      RunGemm<typename Fp4GemmSm120<sm120_fp4_config_alt4, OutType>::Gemm>(
+          D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+      return;
+    default:
+      RunGemm<typename Fp4GemmSm120<sm120_fp4_config_default, OutType>::Gemm>(
+          D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+      return;
   }
 }
 

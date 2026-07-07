@@ -1204,3 +1204,31 @@ dgx inspection of the checkpoint).
   batched-graph NEUTRAL — the tax scales with batch). 27B dense shares `GdnBlockPaged` → benefits
   identically. vs vLLM conc-64=2768: 627.88 = ~4.4× off; decode still ~44% busy. NEXT: per-step
   logits D2H+sync, the remaining ~1,452 full-attn metadata H2D/step, PagedAttention decode.
+
+## 2026-07-07 — HONEST RE-BASELINE (graphed vLLM) + bf16-forward prefill lever
+
+**Campaign-correcting finding:** all prior vLLM denominators used `--enforce-eager`
+(no CUDA graphs / no torch.compile) — a handicapped vLLM. The honest bar is GRAPHED
+vLLM (production). Re-measured clean same-session: **35B 0.961×, 27B 0.857×** (27B
+0.79× at big-context in4096/out512). We already BEAT eager vLLM on both (35B 1.17×,
+27B 1.03×). Benchmark-protocol.md updated to mandate the graphed denominator.
+
+**Gap located = PREFILL** (27B 0.70× prefill-heavy vs 0.93× decode-near-parity). A
+48-agent dynamic scan ranked the portable levers; #1 root cause: we upcast fp4-GEMM
+outputs to f32 and run glue at 2× vLLM's bf16 width (the "bf16-forward" program,
+~10-12%).
+
+**Merged this session:** 27B correctness gate redesign (non-flaky, vLLM-deterministic
+span); benchmark protocol → graphed vLLM; 27B dense decode CUDA graph (+1.9%);
+quantize-once q/k/v+gate/up (+0.4%, bit-identical, default ON); **bf16 gate/up GEMM
+outputs (+5.4% standard / +12.5% prefill-heavy, default ON) — 27B 0.857×→0.907×.**
+Shelved: silu+fp4-quant fusion (−2%, less parallel than the 2 tuned kernels).
+
+**NEXT (bf16-forward program, scan-ranked, each needs a bf16 glue/conv kernel variant):**
+(2) q/k/v bf16 + bf16 AttnGateSplit/SigmoidGate (~1.5-3%); (4) GDN in_proj + bf16 conv
+(~1.5-2.4% + speculative cuBLASLt off the sm_80 kernel, 30 layers); (3) fuse
+AttnGateSplit+qk-norm+RoPE 4→1 (~1-2%); (5) blocked-16 triangular inverse in GDN WU
+(~1-2.5%, the one new algorithm win). Verified dead-ends: cutlass config (byte-identical
+to vLLM), rms+nvfp4 fusion, prefill CUDA-graph. Build-specific out-of-reach: flashinfer
+autotuned fp4 GEMM + whole-graph Inductor fusion. Guardrail: keep GDN g/beta + ssm_state
+f32. LocalAI worker kept DOWN (dgx perf work ongoing).

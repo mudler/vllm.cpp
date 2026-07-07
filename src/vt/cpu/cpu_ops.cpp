@@ -189,6 +189,18 @@ void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const T
   }
 }
 
+// SiluMulFp4Quant CPU fallback = the exact composite (bf16 intermediate then
+// quant) — which IS the definition of correctness for the CUDA fused kernel. The
+// bf16 scratch reproduces the round-through-bf16 the CUDA kernel folds in.
+void SiluMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
+                           const Tensor& up, float input_global_scale_inv) {
+  const int64_t m = gate.shape[0], i = gate.shape[1];
+  std::vector<uint16_t> tmp(static_cast<size_t>(m) * static_cast<size_t>(i));
+  Tensor act = Tensor::Contiguous(tmp.data(), DType::kBF16, gate.device, {m, i});
+  MoeSiluMulKernel(q, act, gate, up);
+  ScaledFp4QuantKernel(q, out_packed, out_scale, act, input_global_scale_inv);
+}
+
 // MatmulNvfp4Fp4 CPU kernel: out[m,n] = alpha * Σ_k (a_fp4·f8(a_scale))·(b_fp4·
 // f8(b_scale)). Equals vllm::RunNvfp4Emulation up to K-reduction order.
 void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
@@ -720,6 +732,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
+    RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<SiluMulFp4QuantFn>(&SiluMulFp4QuantKernel)));
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4Kernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,

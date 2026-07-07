@@ -599,6 +599,18 @@ bool TrueW4A4Enabled() {
   return on;
 }
 
+// FUSE silu-mul with the down_proj activation quant (mirror vllm
+// ActivationQuantFusionPass / silu_and_mul_nvfp4_quant) — one kernel, no bf16
+// intermediate. Default OFF until measured; VT_FUSE_SILU_QUANT=1 enables. Only the
+// 27B true-W4A4 dense MLP is affected (the down_proj quantizes its activation).
+bool FuseSiluQuantEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSE_SILU_QUANT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
 // VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
@@ -642,28 +654,39 @@ bool NvfpCutlassEnabled() {
 // fp4xfp4 GEMM with the folded alpha (= vllm cutlass_scaled_fp4_mm_sm120a). CUDA
 // only; the CPU fp4 path uses the bf16-dequant fallback in the callers. out_dtype
 // f32 or bf16.
-DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  DBuf a_packed(d, DType::kI8, {M, K / 2});
-  DBuf a_scale(d, DType::kI8, {M, K / 16});
-  vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
+// The fp4xfp4 GEMM from PRE-QUANTIZED activations (a_packed [M,K/2] + a_scale
+// [M,K/16], the ScaledFp4Quant outputs). Factored out of MatmulNvfp4Fp4D so a
+// fused producer (SiluMulFp4Quant / RmsNormResFp4Quant) can feed the GEMM directly
+// without the bf16 intermediate. out_dtype f32 or bf16.
+DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
+                           const Nvfp4Weight& w, DType out_dtype) {
+  const int64_t M = a_packed.shape[0], N = w.n;
   Nvfp4Dev dw = ResidentNvfp4(d, w);
   DBuf dout(d, out_dtype, {M, N});
 #ifdef VT_CUTLASS_NVFP4
   if (NvfpCutlassEnabled()) {
     // Swizzle the per-token activation scale into the cutlass atom layout (the
     // weight scale is swizzled once, cached). Then the lifted sm120a fp4xfp4 GEMM.
+    const int64_t K = a_packed.shape[1] * 2;
     auto round_up = [](int64_t v, int64_t y) { return (v + y - 1) / y * y; };
     const int64_t Mp = round_up(M, 128), Kp = round_up(K / 16, 4);
     DBuf a_sf_sw(d, DType::kI8, {Mp, Kp});  // SwizzleBlockscale zero-fills padding
-    vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale.t());
+    vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale);
     Tensor b_sf_sw = ResidentNvfp4ScaleSwizzled(d, w);
-    vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed.t(), a_sf_sw.t(), dw.packed, b_sf_sw, w.alpha);
+    vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed, a_sf_sw.t(), dw.packed, b_sf_sw, w.alpha);
     return dout;
   }
 #endif
-  vt::MatmulNvfp4Fp4(d.q, dout.t(), a_packed.t(), a_scale.t(), dw.packed, dw.scale, w.alpha);
+  vt::MatmulNvfp4Fp4(d.q, dout.t(), a_packed, a_scale, dw.packed, dw.scale, w.alpha);
   return dout;
+}
+
+DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
+  const int64_t M = x.shape[0], K = x.shape[1];
+  DBuf a_packed(d, DType::kI8, {M, K / 2});
+  DBuf a_scale(d, DType::kI8, {M, K / 16});
+  vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
+  return MatmulNvfp4Fp4DirectD(d, a_packed.t(), a_scale.t(), w, out_dtype);
 }
 
 #ifdef VT_MARLIN_NVFP4
@@ -2029,6 +2052,16 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                   : MatmulF32D(d, dh, w.gate_proj);  // [T,I] f32
   DBuf up = fp4 ? MatmulNvfp4F32D(d, dh, w.up_proj_fp4)
                 : MatmulF32D(d, dh, w.up_proj);      // [T,I] f32
+  // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
+  // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
+  // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.
+  if (fp4 && FuseSiluQuantEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+      w.down_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
+    DBuf ap(d, DType::kI8, {T, I / 2}), as(d, DType::kI8, {T, I / 16});
+    vt::SiluMulFp4Quant(d.q, ap.t(), as.t(), gate.t(), up.t(),
+                        w.down_proj_fp4.input_global_scale_inv);
+    return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16);
+  }
   DBuf act(d, DType::kBF16, {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
   return fp4 ? MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4)

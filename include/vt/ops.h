@@ -35,6 +35,7 @@ enum class OpId : uint8_t {
   kApplyAllowedTokenIds,
   kMatmulNvfp4,
   kScaledFp4Quant,
+  kSiluMulFp4Quant,
   kMatmulNvfp4Fp4,
   kMatmulNvfp4Cutlass,
   kMatmulFp8Cutlass,
@@ -157,6 +158,8 @@ using MatmulNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using ScaledFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
+using SiluMulFp4QuantFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
@@ -301,6 +304,18 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
 // the CPU vllm::RefScaledFp4Quant. CPU + CUDA.
 void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
                     float input_global_scale_inv);
+
+// SiluMulFp4Quant (mirror vllm ActivationQuantFusionPass / silu_and_mul_nvfp4_quant):
+// FUSES silu(gate)*up with the NVFP4 activation quant into one kernel, removing the
+// bf16 intermediate that the unfused MoeSiluMul(->bf16 [M,I]) + ScaledFp4Quant path
+// writes+reads (a memory-traffic win on the prefill). gate/up are [M,I] (our
+// two-input MoeSiluMul form). Outputs match ScaledFp4Quant's contract:
+//   out_packed [M, I/2]  i8   out_scale [M, I/16] i8
+// BIT-IDENTICAL to MoeSiluMul(gate,up -> bf16) then ScaledFp4Quant(bf16): the
+// silu*up value is rounded through bf16 before quant. I a multiple of 16. CPU+CUDA
+// (CPU fallback = the composite sequence).
+void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
+                     const Tensor& up, float input_global_scale_inv);
 
 // MatmulNvfp4Fp4 (mirror vllm cutlass_scaled_fp4_mm / ..._sm120a; notes §7.3):
 //   out[m,n] = alpha * Σ_k ( a_fp4[m,k]·a_scale_fp8[m,k/16] )

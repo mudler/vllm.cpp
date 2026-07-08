@@ -602,6 +602,182 @@ void AttentionKernelCuda(Queue& q, Tensor& out, const Tensor& query, const Tenso
   }
 }
 
+// ---------------------------------------------------------------------------
+// fused_chain (TDR Phase 0): realize ANY FusedRecipe over the Phase-0 vocabulary
+// {kAdd, kMul, kRmsNorm}, selected at runtime by VT_FUSED_TIER (FusedTier()):
+//   Tier 0 (default): walk the steps calling the ALREADY-REGISTERED vt:: ops (the
+//     residual-add + RMSNorm idiom folds onto vt::RmsNorm(residual)).
+//   Tier 1: one interpreter kernel — one block per row, shared-mem tree reduction
+//     (the RmsNormRowKernel / AttnQkNormRopeGateKernel skeleton), walking the
+//     recipe in a single HBM pass. Bit-for-bit equal to the CUDA RmsNorm(residual)
+//     golden: same f32 tree reduction, gemma (1+w), and Tres-rounded residual add.
+// Operand ROLES resolve to the typed pointers: kIn/kWeight->Tin, kResidual->Tres,
+// kOut->Tout. The recipe POD is passed BY VALUE into the kernel (small, no heap).
+
+template <typename Tin, typename Tout, typename Tres>
+struct FusedCtx {
+  const Tin* x;
+  const Tin* w;
+  Tres* res;
+  Tout* out;
+  int64_t h;
+};
+
+template <typename Tin, typename Tout, typename Tres>
+__device__ inline float FusedLoadDev(FOperand o, const FusedCtx<Tin, Tout, Tres>& c, int64_t row,
+                                     int64_t j) {
+  switch (o) {
+    case FOperand::kIn: return Load(c.x, row * c.h + j);
+    case FOperand::kResidual: return Load(c.res, row * c.h + j);
+    case FOperand::kWeight: return Load(c.w, j);
+    case FOperand::kOut: return Load(c.out, row * c.h + j);
+  }
+  return 0.0f;
+}
+
+template <typename Tin, typename Tout, typename Tres>
+__device__ inline void FusedStoreDev(FOperand o, const FusedCtx<Tin, Tout, Tres>& c, int64_t row,
+                                     int64_t j, float v) {
+  switch (o) {
+    case FOperand::kResidual: Store(c.res, row * c.h + j, v); break;
+    case FOperand::kOut: Store(c.out, row * c.h + j, v); break;
+    case FOperand::kIn:
+    case FOperand::kWeight: break;  // read-only operands (validated host-side)
+  }
+}
+
+// Tier 1 — interpreter: one block per row walks the whole recipe.
+template <typename Tin, typename Tout, typename Tres>
+__global__ void FusedChainInterpKernel(FusedCtx<Tin, Tout, Tres> c, float eps, FusedRecipe r) {
+  const int64_t row = blockIdx.x;
+  const int64_t h = c.h;
+  __shared__ float partial[kBlock];
+  for (int s = 0; s < r.n; ++s) {
+    const FStep st = r.steps[s];
+    if (st.op == FOp::kRmsNorm) {
+      float acc = 0.0f;
+      for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+        const float v = FusedLoadDev(st.a, c, row, j);
+        acc += v * v;  // kMeanSquare, f32
+      }
+      partial[threadIdx.x] = acc;
+      __syncthreads();
+      for (int stride = kBlock / 2; stride > 0; stride /= 2) {
+        if (static_cast<int>(threadIdx.x) < stride)
+          partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+      }
+      const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
+      for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+        const float v = FusedLoadDev(st.a, c, row, j);
+        float wj = FusedLoadDev(st.b, c, row, j);
+        if (st.gemma) wj += 1.0f;
+        FusedStoreDev(st.out, c, row, j, v * inv * wj);
+      }
+      __syncthreads();
+    } else {  // kAdd / kMul — elementwise over the row
+      for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+        const float a = FusedLoadDev(st.a, c, row, j);
+        const float b = FusedLoadDev(st.b, c, row, j);
+        FusedStoreDev(st.out, c, row, j, st.op == FOp::kAdd ? a + b : a * b);
+      }
+      __syncthreads();  // writes (e.g. residual) visible before the next step reads
+    }
+  }
+}
+
+template <typename Tin, typename Tout, typename Tres>
+void LaunchFusedInterp(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& weight,
+                       Tensor* residual, const FusedRecipe& r, float eps) {
+  const int64_t t = x.shape[0], h = x.shape[1];
+  if (t == 0 || h == 0) return;
+  FusedCtx<Tin, Tout, Tres> c{x.Ptr<Tin>(), weight.Ptr<Tin>(),
+                              residual == nullptr ? nullptr : residual->Ptr<Tres>(),
+                              out.Ptr<Tout>(), h};
+  FusedChainInterpKernel<Tin, Tout, Tres><<<static_cast<unsigned>(t), kBlock, 0, s>>>(c, eps, r);
+  Check(cudaGetLastError(), "fused_chain interp launch");
+}
+
+// Resolve the (Tin, Tout, Tres) triple and launch the interpreter. Tres follows
+// the residual dtype (f32 or bf16); with no residual it is unused (pass float).
+template <typename Tin, typename Tout>
+void LaunchFusedInterpRes(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& weight,
+                          Tensor* residual, const FusedRecipe& r, float eps) {
+  if (residual != nullptr && residual->dtype == DType::kBF16) {
+    LaunchFusedInterp<Tin, Tout, __nv_bfloat16>(s, out, x, weight, residual, r, eps);
+  } else {
+    LaunchFusedInterp<Tin, Tout, float>(s, out, x, weight, residual, r, eps);
+  }
+}
+
+// Tier 0 — composite: fold the residual-add + RMSNorm idiom onto the REGISTERED
+// vt::RmsNorm(residual) fused primitive (keeps x/weight in one dtype, residual
+// separate — the CUDA RmsNorm kernel requires w.dtype == x.dtype). Same walker
+// shape as the CPU Tier-0.
+void FusedChainComposite(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                         Tensor* residual, const FusedRecipe& r, float eps) {
+  bool residual_add_pending = false;
+  for (int s = 0; s < r.n; ++s) {
+    const FStep& st = r.steps[s];
+    if (st.op == FOp::kAdd) {
+      VT_CHECK(st.out == FOperand::kResidual && st.a == FOperand::kIn &&
+                   st.b == FOperand::kResidual && residual != nullptr,
+               "fused_chain composite: only residual-add (out=res,a=in,b=res) is supported");
+      residual_add_pending = true;
+    } else if (st.op == FOp::kMul) {
+      VT_CHECK(false, "fused_chain composite: kMul has no registered primitive yet (Phase 1)");
+    } else {  // kRmsNorm
+      VT_CHECK(st.reduce == FReduce::kMeanSquare && st.out == FOperand::kOut &&
+                   st.b == FOperand::kWeight,
+               "fused_chain composite: rmsnorm must write kOut with a kWeight");
+      if (residual_add_pending) {
+        VT_CHECK(st.a == FOperand::kResidual,
+                 "fused_chain composite: rmsnorm after residual-add must read kResidual");
+        vt::RmsNorm(q, out, x, weight, RmsNormArgs{eps, st.gemma}, residual);
+        residual_add_pending = false;
+      } else {
+        const Tensor& a = (st.a == FOperand::kIn) ? x : *residual;
+        vt::RmsNorm(q, out, a, weight, RmsNormArgs{eps, st.gemma}, nullptr);
+      }
+    }
+  }
+}
+
+void FusedChainKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                          Tensor* residual, const FusedRecipe& r, float eps) {
+  if (FusedTier() != 1) {
+    FusedChainComposite(q, out, x, weight, residual, r, eps);
+    return;
+  }
+  VT_CHECK(weight.dtype == x.dtype, "cuda fused_chain: weight dtype must match x");
+  cudaStream_t s = AsStream(q);
+  switch (x.dtype) {
+    case DType::kF32:
+      switch (out.dtype) {
+        case DType::kF32:
+          LaunchFusedInterpRes<float, float>(s, out, x, weight, residual, r, eps);
+          break;
+        case DType::kBF16:
+          LaunchFusedInterpRes<float, __nv_bfloat16>(s, out, x, weight, residual, r, eps);
+          break;
+        default: VT_CHECK(false, "cuda fused_chain: unsupported out dtype");
+      }
+      break;
+    case DType::kBF16:
+      switch (out.dtype) {
+        case DType::kF32:
+          LaunchFusedInterpRes<__nv_bfloat16, float>(s, out, x, weight, residual, r, eps);
+          break;
+        case DType::kBF16:
+          LaunchFusedInterpRes<__nv_bfloat16, __nv_bfloat16>(s, out, x, weight, residual, r, eps);
+          break;
+        default: VT_CHECK(false, "cuda fused_chain: unsupported out dtype");
+      }
+      break;
+    default: VT_CHECK(false, "cuda fused_chain: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
 // Registers the CUDA kernels during static init (pre-main, like the CPU ops).
 // Filling the op table is harmless on machines without a GPU: the kCUDA
 // backend never registers there, so no CUDA queue can exist to dispatch with.
@@ -623,6 +799,8 @@ struct Registrar {
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelCuda)));
     RegisterOp(OpId::kAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
+    RegisterOp(OpId::kFusedChain, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernelCuda)));
   }
 } registrar;
 

@@ -1,6 +1,7 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #pragma once
 
+#include "vt/fused_recipe.h"
 #include "vt/tensor.h"
 
 namespace vt {
@@ -56,6 +57,7 @@ enum class OpId : uint8_t {
   kGdnPostConv,
   kRopeCosSinCache,
   kAttnQkNormRopeGate,
+  kFusedChain,
   kCount
 };
 
@@ -262,6 +264,11 @@ using ApplyMinPFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ApplyLogitBiasFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
 using ApplyTokenMaskFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using ApplyAllowedTokenIdsFn = void (*)(Queue&, Tensor&, const Tensor&);
+// --- Fused declarative recipe (TDR Phase 0). One op dispatches ANY FusedRecipe
+// through the existing table; the recipe is the single source of truth walked by
+// the backend's Tier-0 composite / Tier-1 interpreter (see FusedChain below).
+using FusedChainFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, Tensor*, const FusedRecipe&, float);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
@@ -469,6 +476,24 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 // upstream bf16 need bf16-eps tolerance on the non-gemma path.
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
+
+// --- Fused declarative recipe (TDR Phase 0; see include/vt/recipes.h and
+// .agents/fusion-architecture-2026-07-08.md). Runs `recipe` — a backend-agnostic
+// constexpr FusedRecipe — over its operands, producing `out`. The op is realized
+// per backend in tiers selected by VT_FUSED_TIER (default 0 = Tier-0 composite,
+// which walks the recipe through the already-registered primitives; 1 = Tier-1
+// single-pass interpreter). Every tier is bit-identical (f32 accumulation order,
+// gemma (1+w), residual-add rounding) — the recipe is the single source of truth.
+//
+// Operand contract (Phase-0 vocabulary): out [T,H] f32/bf16, x [T,H] float,
+// weight [H] float, optional residual [T,H] f32/bf16 (in/out, updated in place by
+// a kAdd->kResidual step). `eps` is the runtime RMSNorm epsilon (the only runtime
+// scalar; structural constants like gemma live in the recipe). For
+// kFusedAddRmsNorm this is bit-identical to RmsNorm(out, x, weight, {eps, gemma=
+// true}, residual). NOT YET wired into any model forward (Phase 0 is framework +
+// op + test only) — the engine stays byte-identical.
+void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
+                const FusedRecipe& recipe, float eps);
 
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.

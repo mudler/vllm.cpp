@@ -1232,3 +1232,37 @@ AttnGateSplit+qk-norm+RoPE 4→1 (~1-2%); (5) blocked-16 triangular inverse in G
 to vLLM), rms+nvfp4 fusion, prefill CUDA-graph. Build-specific out-of-reach: flashinfer
 autotuned fp4 GEMM + whole-graph Inductor fusion. Guardrail: keep GDN g/beta + ssm_state
 f32. LocalAI worker kept DOWN (dgx perf work ongoing).
+
+## 2026-07-08 — Methodology re-grounding + `vt::tile` portable pipeline component
+
+**Course correction (user re-grounded on AGENTS.md).** Mid-session a Triton-AOT
+"CUDA fast-path" was sanctioned and PROVEN end-to-end on dgx (token-exact rmsnorm
+via `triton.tools.compile`+`link`, runtime Triton-free; branch `perf/triton-fastpath`).
+On re-reading the canon it was **re-rejected as a compile-target**: it violates
+mission.md ("no Python at BUILD or run time") + discipline.md 33-47 ("Kernel-DSL is
+a PORTING REFERENCE, NEVER a compile-target; do NOT AOT-compile Triton/CuTe-DSL to
+cubin"). The AOT branch is **shelved, kept OFF as a measurement oracle only** (compile
+FLA's exact kernel to get the ground-truth "what Triton codegen achieves" target).
+
+**Endorsed path (user: "can't we have a component that does what triton does, and use
+it internally?").** Build **`vt::tile`** — a PORTABLE C++ async-pipeline/tile
+abstraction grounded 1:1 in CUTLASS/CuTe. It encodes what Triton's *compiler* does —
+software pipelining (multi-stage async gmem→smem double-buffer + barrier scheduling),
+swizzled smem, MMA lowering — as reusable C++ primitives behind a backend-neutral seam
+(CUDA supplies cp.async/TMA atoms; Metal/Vulkan/CPU supply theirs). Pure C++, no
+build-Python, portable, SCALES. Fully canon-consistent (discipline blesses porting
+CuTe/CUTLASS C++). Design record: `.agents/tile-pipeline-component-2026-07-08.md`.
+
+**Ground truth (trace-execution).** On GB10 (sm_121) vLLM runs the **FLA Triton
+`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`** (the CuTe-DSL GDN path is opt-in +
+SM10.x-only per `qwen_gdn_linear_attn.py:152-210`; the profile confirmed the FLA name).
+The codegen we lack = Triton's Blackwell async pipeline (`cp.async` Ampere → TMA+mbarrier BW).
+
+**Built this session:** `include/vt/cuda/tile/cp_async.cuh` — Rung-1 primitive
+(SM80 cp.async atom + fence/wait + `PipelineState`), ported 1:1 from
+`cute/arch/copy_sm80.hpp` + `cutlass/pipeline/sm90_pipeline.hpp`, cited. **In flight
+(worktree agent):** GDN `delta_h` re-ported against it (`GdnChunkDeltaHTilePipeKernel`,
+toggle `VT_GDN_TILE_PIPE`) — two levers: keep `v_new` in smem across V1→V2 (kill the
+gmem round-trip FLA avoids) + N-stage cp.async prefetch of the streamed k/u/w tiles.
+Gate: `test_ops_gdn` token-exact + gate A/B vs the hand kernel. Rung-2 (TMA+mbarrier)
+only if Rung-1 lags; retarget to chunk_o if delta_h's sequential structure caps the win.

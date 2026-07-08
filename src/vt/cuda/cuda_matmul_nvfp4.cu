@@ -963,7 +963,22 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   float sc = input_global_scale * (vmax * (1.0f / 6.0f));
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
-  scale[row * groups + g] = sc8;
+  scale[row * groups + g] = sc8;  // LINEAR store; a separate SwizzleBlockscaleKernel reorders.
+  // PART B (VT_SWIZZLE_IN_QUANT direct-emit, FOLLOW-UP — not yet shipped): store sc8
+  // DIRECTLY at vLLM's swizzled offset here, eliminating the separate
+  // SwizzleBlockscaleKernel pass. Verified bit-identical to
+  // cuda_matmul_nvfp4_cutlass.cu SwizzleBlockscaleKernel:
+  //   numKTiles = round_up(groups,4)/4;  Kp = numKTiles*4  (swizzled cols)
+  //   mTileIdx=row>>7; outerMIdx=row&31; innerMIdx=(row>>5)&3; kTileIdx=g>>2; innerKIdx=g&3;
+  //   sfOff = ((mTileIdx*numKTiles + kTileIdx)*32 + outerMIdx)*16 + innerMIdx*4 + innerKIdx;
+  //   scale[sfOff] = sc8;   // scale buffer must be the swizzled [round_up(M,128), Kp] shape
+  // (row&31 == (row%128)%32 and (row>>5)&3 == (row%128)/32 since 128 is a multiple of 32, so
+  // this equals SwizzleBlockscaleKernel's ((((a0*(Kp/4)+a3)*32+a2)*4+a1)*4+a4) exactly.)
+  // STRUCTURAL WORK REQUIRED (why it is a follow-up, not shipped here): the padding slots
+  // rows[M,round_up(M,128)) / cols[groups,Kp) must be pre-zeroed (SwizzleBlockscaleKernel
+  // zero-fills them) and this must be a SEPARATE quant mode — the linear scale is still
+  // consumed by the non-cutlass WMMA MatmulNvfp4Fp4 path — so the ScaledFp4Quant op gains a
+  // swizzled-output variant used ONLY on the cutlass fuse sites. GPU-validate against the gate.
   // outputScale = SFScaleVal / SFValue. In native mode (approx_recip) this uses
   // the fast approximate reciprocal, mirroring the NATIVE vllm cvt_warp_fp16_to_fp4
   // (nvfp4_utils.cuh:283-286 reciprocal_approximate_ftz) — the sub-bucket delta

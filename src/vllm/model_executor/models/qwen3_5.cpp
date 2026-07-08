@@ -697,6 +697,25 @@ bool NvfpCutlassEnabled() {
   }();
   return on;
 }
+
+// SWIZZLE-ONCE dedup (prefill-gap-scan quant-hw-swizzle lever). The fused qkv/
+// gate-up projections share ONE ScaledFp4Quant activation + its LINEAR fp8 block
+// scale, but each MatmulNvfp4Fp4DirectD re-runs the identical internal
+// SwizzleBlockscale on that SAME shared scale — 3x for a fused qkv, 2x for gate/up
+// (the nsys "2,856 SwizzleBlockscaleKernel launches" per short prefill). When ON we
+// swizzle the shared activation SF exactly ONCE per fuse-site and pass the already-
+// swizzled SF into each projection GEMM (skipping its internal re-swizzle), removing
+// the redundant per-projection re-swizzles. BIT-IDENTICAL: SwizzleBlockscale is a
+// pure deterministic reorder of the linear SF, so one swizzled buffer reused across
+// the projections equals each projection swizzling independently. Default OFF until
+// GPU-gated (token-exact vs OFF by construction); VT_SWIZZLE_IN_QUANT=1 enables.
+bool SwizzleInQuantEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_SWIZZLE_IN_QUANT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
 #endif
 
 // TRUE W4A4 (fp4 activations x fp4 weights) device GEMM — the 27B path (notes §7).
@@ -708,8 +727,14 @@ bool NvfpCutlassEnabled() {
 // [M,K/16], the ScaledFp4Quant outputs). Factored out of MatmulNvfp4Fp4D so a
 // fused producer (SiluMulFp4Quant / RmsNormResFp4Quant) can feed the GEMM directly
 // without the bf16 intermediate. out_dtype f32 or bf16.
+// `a_sf_sw_pre` (VT_SWIZZLE_IN_QUANT dedup, default nullptr): a fused qkv/gate-up
+// caller may swizzle the SHARED activation SF once and pass the already-swizzled
+// buffer here, so this projection reuses it instead of re-running the identical
+// internal SwizzleBlockscale. When null (the default / every non-fused caller) the
+// per-projection swizzle path below is unchanged (byte-identical).
 DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
-                           const Nvfp4Weight& w, DType out_dtype) {
+                           const Nvfp4Weight& w, DType out_dtype,
+                           [[maybe_unused]] const Tensor* a_sf_sw_pre = nullptr) {
   const int64_t M = a_packed.shape[0], N = w.n;
   Nvfp4Dev dw = ResidentNvfp4(d, w);
   DBuf dout(d, out_dtype, {M, N});
@@ -720,9 +745,16 @@ DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
     const int64_t K = a_packed.shape[1] * 2;
     auto round_up = [](int64_t v, int64_t y) { return (v + y - 1) / y * y; };
     const int64_t Mp = round_up(M, 128), Kp = round_up(K / 16, 4);
+    Tensor b_sf_sw = ResidentNvfp4ScaleSwizzled(d, w);
+    // SWIZZLE-ONCE dedup: the shared activation SF was already swizzled ONCE by the
+    // fused caller — reuse it (bit-identical to re-swizzling here) and skip our
+    // internal SwizzleBlockscale for this projection.
+    if (a_sf_sw_pre != nullptr) {
+      vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed, *a_sf_sw_pre, dw.packed, b_sf_sw, w.alpha);
+      return dout;
+    }
     DBuf a_sf_sw(d, DType::kI8, {Mp, Kp});  // SwizzleBlockscale zero-fills padding
     vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale);
-    Tensor b_sf_sw = ResidentNvfp4ScaleSwizzled(d, w);
     vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed, a_sf_sw.t(), dw.packed, b_sf_sw, w.alpha);
     return dout;
   }
@@ -730,6 +762,22 @@ DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
   vt::MatmulNvfp4Fp4(d.q, dout.t(), a_packed, a_scale, dw.packed, dw.scale, w.alpha);
   return dout;
 }
+
+#ifdef VT_CUTLASS_NVFP4
+// SWIZZLE-ONCE dedup helper (VT_SWIZZLE_IN_QUANT). Swizzle the shared fused-site
+// activation block scale [M, groups] into the cutlass atom layout [round_up(M,128),
+// round_up(groups,4)] exactly ONCE; the returned buffer is fed to each projection
+// GEMM via MatmulNvfp4Fp4DirectD's a_sf_sw_pre. Shape/bytes are identical to the
+// buffer MatmulNvfp4Fp4DirectD would build internally (M=a_packed.shape[0],
+// groups=K/16), so reuse is bit-identical to per-projection swizzling.
+DBuf SwizzleActScaleOnce(Dev d, const Tensor& a_scale) {
+  const int64_t M = a_scale.shape[0], groups = a_scale.shape[1];
+  auto round_up = [](int64_t v, int64_t y) { return (v + y - 1) / y * y; };
+  DBuf a_sf_sw(d, DType::kI8, {round_up(M, 128), round_up(groups, 4)});
+  vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale);
+  return a_sf_sw;
+}
+#endif
 
 DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
   const int64_t M = x.shape[0], K = x.shape[1];
@@ -1507,6 +1555,18 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
+  // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared qkv activation SF ONCE
+  // and feed the already-swizzled SF to all three q/k/v GEMMs (skipping each one's
+  // internal SwizzleBlockscale). nullptr (OFF / non-cutlass) = per-projection
+  // swizzle, byte-identical to the current path.
+  const Tensor* qkv_sf_sw_p = nullptr;
+#ifdef VT_CUTLASS_NVFP4
+  std::optional<DBuf> qkv_sf_sw;
+  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+    qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
+    qkv_sf_sw_p = &qkv_sf_sw->t();
+  }
+#endif
   // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
   // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
   // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
@@ -1516,19 +1576,22 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   // fp8 (35B) + bf16-weight fallback stay f32.
   const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
+                                           qkv_sf_sw_p)
                : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
                : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
+                                        qkv_sf_sw_p)
             : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
+                                        qkv_sf_sw_p)
             : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
@@ -1635,6 +1698,18 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
     qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
   }
+  // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared qkv activation SF ONCE
+  // and feed the already-swizzled SF to all three q/k/v GEMMs (skipping each one's
+  // internal SwizzleBlockscale). nullptr (OFF / non-cutlass) = per-projection
+  // swizzle, byte-identical to the current path.
+  const Tensor* qkv_sf_sw_p = nullptr;
+#ifdef VT_CUTLASS_NVFP4
+  std::optional<DBuf> qkv_sf_sw;
+  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+    qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
+    qkv_sf_sw_p = &qkv_sf_sw->t();
+  }
+#endif
   // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
   // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
   // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
@@ -1644,19 +1719,22 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // fp8 (35B) + bf16-weight fallback stay f32.
   const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
   DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt)
+                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
+                                           qkv_sf_sw_p)
                : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
                : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
+                                        qkv_sf_sw_p)
             : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt)
+                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
+                                        qkv_sf_sw_p)
             : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
@@ -2278,15 +2356,29 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     gu_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
     vt::ScaledFp4Quant(d.q, gu_ap->t(), gu_as->t(), dh, w.gate_proj_fp4.input_global_scale_inv);
   }
+  // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared gate/up activation SF
+  // ONCE and feed the already-swizzled SF to both GEMMs (skipping each one's
+  // internal SwizzleBlockscale). nullptr (OFF / non-cutlass) = per-projection
+  // swizzle, byte-identical to the current path.
+  const Tensor* gu_sf_sw_p = nullptr;
+#ifdef VT_CUTLASS_NVFP4
+  std::optional<DBuf> gu_sf_sw;
+  if (fuse_gu && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+    gu_sf_sw.emplace(SwizzleActScaleOnce(d, gu_as->t()));
+    gu_sf_sw_p = &gu_sf_sw->t();
+  }
+#endif
   // gate/up output bf16 (VT_BF16_GEMM_OUT, rank-1 lever) — matches vLLM bf16 dtype,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
-  DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out)
+  DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
+                                              gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
                                             : MatmulNvfp4F32D(d, dh, w.gate_proj_fp4))
                     : MatmulF32D(d, dh, w.gate_proj);  // [T,I]
-  DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, gu_out)
+  DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, gu_out,
+                                            gu_sf_sw_p)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.up_proj_fp4)
                                           : MatmulNvfp4F32D(d, dh, w.up_proj_fp4))
                   : MatmulF32D(d, dh, w.up_proj);      // [T,I]

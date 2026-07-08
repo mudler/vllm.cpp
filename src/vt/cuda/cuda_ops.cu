@@ -329,6 +329,185 @@ void RopeNeoxKernelCuda(Queue& q, Tensor& qs, Tensor& ks, const Tensor& pos,
 }
 
 // ---------------------------------------------------------------------------
+// rope_cos_sin_cache: precompute the batch's cos|sin ONCE per step (grid-stride
+// over (token, pair)) so the fused preamble below does zero in-kernel
+// transcendentals. Angle math in DOUBLE + f32 cast — bit-for-bit RopeNeoxKernel's
+// c/sn. cos_sin[t, i]=cos, cos_sin[t, half+i]=sin. Mirrors vLLM's cos_sin_cache
+// (RotaryEmbedding._compute_cos_sin_cache; read by fla fused_qk_norm_rope.py:95).
+
+template <typename Tid>
+__global__ void RopeCosSinCacheKernel(float* cos_sin, const Tid* pos, int64_t t, int rot,
+                                      int64_t half, double base) {
+  const int64_t n = t * half;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    const int64_t pair = idx % half;
+    const int64_t tok = idx / half;
+    const int64_t p = static_cast<int64_t>(pos[tok]);
+    const double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+    const double angle = static_cast<double>(p) * freq;
+    cos_sin[tok * rot + pair] = static_cast<float>(cos(angle));
+    cos_sin[tok * rot + half + pair] = static_cast<float>(sin(angle));
+  }
+}
+
+void RopeCosSinCacheKernelCuda(Queue& q, Tensor& cos_sin, const Tensor& pos, const RopeArgs& args) {
+  const int64_t t = cos_sin.shape[0];
+  const int64_t half = args.rotary_dim / 2;
+  const int64_t n = t * half;
+  if (n == 0) return;
+  cudaStream_t s = AsStream(q);
+  const double base = static_cast<double>(args.base);
+  if (pos.dtype == DType::kI32) {
+    RopeCosSinCacheKernel<int32_t><<<GridFor(n), kBlock, 0, s>>>(
+        cos_sin.Ptr<float>(), pos.Ptr<int32_t>(), t, args.rotary_dim, half, base);
+  } else {
+    RopeCosSinCacheKernel<int64_t><<<GridFor(n), kBlock, 0, s>>>(
+        cos_sin.Ptr<float>(), pos.Ptr<int64_t>(), t, args.rotary_dim, half, base);
+  }
+  Check(cudaGetLastError(), "rope_cos_sin_cache launch");
+}
+
+// ---------------------------------------------------------------------------
+// attn_qk_norm_rope_gate: the fused full-attention preamble — one launch replacing
+// AttnGateSplit + RmsNorm(q) + RmsNorm(k) + RopeNeox. Grid (T, Hq+Hkv); one block
+// per (token, head) does the shared-mem gemma-RMSNorm tree reduction over Dh (reuses
+// RmsNormRowKernel's math), then partial NeoX RoPE reading the precomputed cos_sin
+// cache (no per-element pow/cos/sin), then passes the gate half through (q heads).
+// Structure mirrors GdnPostConvKernel (cuda_gdn.cu). Bit-for-bit equal to the four
+// composed ops for f32 out; templated on Tsrc (qgate/kf) and Tout (q/k/gate).
+// Mirrors vLLM's fused_qk_rmsnorm_rope (fla fused_qk_norm_rope.py:95-102).
+
+// gemma-RMSNorm one element: (v*inv)*(gemma ? w+1 : w) — matches RmsNormRowKernel.
+__device__ inline float GemmaNormElem(float v, float inv, float w, bool gemma) {
+  float wj = w;
+  if (gemma) wj += 1.0f;
+  return v * inv * wj;
+}
+
+template <typename Tsrc, typename Tout>
+__global__ void AttnQkNormRopeGateKernel(Tout* q_out, Tout* k_out, Tout* gate_out,
+                                         const Tsrc* qgate, const Tsrc* kf, const float* q_norm,
+                                         const float* k_norm, const float* cos_sin, int64_t hq,
+                                         int64_t hkv, int64_t dh, int rot, int64_t half, float eps,
+                                         bool gemma) {
+  const int64_t tok = blockIdx.x;
+  const int64_t head = blockIdx.y;  // [0, hq+hkv)
+  const bool is_q = head < hq;
+
+  const Tsrc* src;
+  const float* w;
+  Tout* out;
+  int64_t gate_base = 0;  // only meaningful for q heads
+  if (is_q) {
+    const int64_t qrow = tok * (hq * 2 * dh) + head * 2 * dh;
+    src = qgate + qrow;       // q half [0,dh)
+    gate_base = qrow + dh;    // gate half [dh,2dh)
+    w = q_norm;
+    out = q_out + (tok * hq + head) * dh;
+  } else {
+    const int64_t hk = head - hq;
+    src = kf + tok * (hkv * dh) + hk * dh;
+    w = k_norm;
+    out = k_out + (tok * hkv + hk) * dh;
+  }
+
+  // ---- gemma-RMSNorm reduction over Dh (f32 variance) ----
+  __shared__ float partial[kBlock];
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < dh; j += kBlock) {
+    const float v = Load(src, j);
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(dh) + eps);
+
+  // ---- partial NeoX RoPE + write (recompute the paired normed elems; no shared
+  // round-trip). Matches RopeNeoxKernel: out[i]=x*c - y*sn, out[i+half]=x*sn + y*c
+  // with x=normed[i], y=normed[i+half]; dims [rot,Dh) normed but unrotated. ----
+  const float* cs = cos_sin + tok * rot;
+  for (int64_t j = threadIdx.x; j < dh; j += kBlock) {
+    if (j < half) {
+      const float ni = GemmaNormElem(Load(src, j), inv, w[j], gemma);
+      const float nih = GemmaNormElem(Load(src, j + half), inv, w[j + half], gemma);
+      Store(out, j, ni * cs[j] - nih * cs[half + j]);
+    } else if (j < rot) {
+      const int64_t i = j - half;
+      const float ni = GemmaNormElem(Load(src, i), inv, w[i], gemma);
+      const float nih = GemmaNormElem(Load(src, i + half), inv, w[i + half], gemma);
+      Store(out, j, ni * cs[half + i] + nih * cs[i]);
+    } else {
+      Store(out, j, GemmaNormElem(Load(src, j), inv, w[j], gemma));
+    }
+  }
+
+  // ---- gate passthrough (q heads only): the raw gate half, no norm/rope ----
+  if (is_q) {
+    Tout* go = gate_out + (tok * hq + head) * dh;
+    for (int64_t j = threadIdx.x; j < dh; j += kBlock) Store(go, j, Load(qgate, gate_base + j));
+  }
+}
+
+template <typename Tsrc, typename Tout>
+void LaunchAttnPreamble(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                        const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                        const Tensor& k_norm, const Tensor& cos_sin, const RmsNormArgs& na,
+                        const RopeArgs& ra) {
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  const int64_t hkv = k_out.shape[1];
+  const int64_t half = ra.rotary_dim / 2;
+  if (t == 0) return;
+  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq + hkv));
+  AttnQkNormRopeGateKernel<Tsrc, Tout><<<grid, kBlock, 0, s>>>(
+      q_out.Ptr<Tout>(), k_out.Ptr<Tout>(), gate_out.Ptr<Tout>(), qgate.Ptr<Tsrc>(),
+      kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(), hq, hkv, dh,
+      ra.rotary_dim, half, na.eps, na.gemma);
+  Check(cudaGetLastError(), "attn_qk_norm_rope_gate launch");
+}
+
+template <typename Tsrc>
+void LaunchAttnPreambleOut(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                           const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                           const Tensor& k_norm, const Tensor& cos_sin, const RmsNormArgs& na,
+                           const RopeArgs& ra) {
+  switch (q_out.dtype) {
+    case DType::kF32:
+      LaunchAttnPreamble<Tsrc, float>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
+                                      cos_sin, na, ra);
+      break;
+    case DType::kBF16:
+      LaunchAttnPreamble<Tsrc, __nv_bfloat16>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
+                                              cos_sin, na, ra);
+      break;
+    default: VT_CHECK(false, "cuda attn_qk_norm_rope_gate: unsupported out dtype");
+  }
+}
+
+void AttnQkNormRopeGateKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                                  const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                                  const Tensor& k_norm, const Tensor& cos_sin,
+                                  const RmsNormArgs& na, const RopeArgs& ra) {
+  cudaStream_t s = AsStream(q);
+  switch (qgate.dtype) {
+    case DType::kF32:
+      LaunchAttnPreambleOut<float>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm, cos_sin,
+                                   na, ra);
+      break;
+    case DType::kBF16:
+      LaunchAttnPreambleOut<__nv_bfloat16>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
+                                           cos_sin, na, ra);
+      break;
+    default: VT_CHECK(false, "cuda attn_qk_norm_rope_gate: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // attention: one block per (query i, q-head h); block threads cooperate over
 // the head_dim and stream the keys with an online (flash-style) softmax. The
 // online update is algebraically identical to the CPU two-pass reference
@@ -436,6 +615,12 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
+    RegisterOp(
+        OpId::kRopeCosSinCache, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernelCuda)));
+    RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelCuda)));
     RegisterOp(OpId::kAttention, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernelCuda)));
   }

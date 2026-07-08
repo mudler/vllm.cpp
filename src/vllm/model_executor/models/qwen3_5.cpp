@@ -612,6 +612,23 @@ bool FuseSiluQuantEnabled() {
   return on;
 }
 
+// FUSE the full-attention preamble (prefill-gap-scan dominant lever): the 4-5
+// separate f32 kernels before the attention kernel (AttnGateSplit + q-RMSNorm +
+// k-RMSNorm + partial NeoX RoPE, the last recomputing cos/sin transcendentals in
+// DOUBLE per element/head/layer) collapse into ONE launch that reads a precomputed
+// cos_sin cache — mirror of vLLM's fused_qk_rmsnorm_rope (fla
+// fused_qk_norm_rope.py:95-102, zero in-kernel transcendentals). Default OFF until
+// GPU-gated; VT_FUSE_ATTN_PREAMBLE=1 enables. The fused kernel emits f32 q/k/gate,
+// byte-for-byte the current 4-kernel intermediates (the query stays f32 for
+// PagedAttention), so ON is token-exact vs OFF.
+bool FuseAttnPreambleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSE_ATTN_PREAMBLE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // QUANTIZE-ONCE: q/k/v (and gate/up) share their input activation AND their on-disk
 // input_global_scale (verified: 27B layer-3 q/k/v all 28.75; gate/up 812/476), so we
 // can ScaledFp4Quant the shared activation ONCE and feed each projection's fp4xfp4
@@ -1205,6 +1222,11 @@ struct StepDevInputs {
   DBuf query_start_loc;  // i32 [num_reqs+1]
   DBuf gdn_state_idx;    // i32 [num_decodes] (decode path; else a 1-elem stub)
   bool has_gdn_idx = false;
+  // f32 [T, rotary_dim] cos|sin cache for the fused full-attn preamble, built ONCE
+  // per step (VT_FUSE_ATTN_PREAMBLE) and reused by every full-attn layer; a 1-elem
+  // stub when the toggle is off (has_attn_cos_sin=false).
+  DBuf attn_cos_sin;
+  bool has_attn_cos_sin = false;
 };
 
 StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
@@ -1220,6 +1242,8 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
       DBuf(d, DType::kI32, {1}),  // gdn stub (replaced below on a decode step)
       false,
+      DBuf(d, DType::kF32, {1}),  // attn cos|sin stub (filled by MaybeBuildAttnCosSin)
+      false,
   };
   // GDN decode state indices: the leading num_decodes entries of the non-spec
   // state-index vector, SHARED by causal_conv1d_update + the fused decode
@@ -1231,6 +1255,21 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
     s.has_gdn_idx = true;
   }
   return s;
+}
+
+// Build the per-step fused-preamble cos|sin cache into `sdi` (once per step,
+// reused by every full-attn layer's fused preamble) when VT_FUSE_ATTN_PREAMBLE is
+// on. No-op otherwise, so the default forward path is byte-identical. Uses the
+// PERSISTENT sdi.positions device buffer (same source the RopeNeox path reads) so
+// the fill is a single device kernel — eager and graph-replay identical.
+void MaybeBuildAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg, int64_t T) {
+  if (!FuseAttnPreambleEnabled()) return;
+  const int rot = static_cast<int>(cfg.rotary_dim);
+  if (rot <= 0) return;
+  sdi.attn_cos_sin = DBuf(d, DType::kF32, {T, rot});
+  vt::RopeCosSinCache(d.q, sdi.attn_cos_sin.t(), sdi.positions.t(),
+                      vt::RopeArgs{static_cast<float>(cfg.rope_theta), rot});
+  sdi.has_attn_cos_sin = true;
 }
 
 // --- Batched PAGED GDN block (M1.8 Task 3). Same conv1d + l2norm + q/k/v/g/beta
@@ -1495,28 +1534,42 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
-  // Gate split: per q-head the projection lays out [q(Dh) | gate(Dh)] (§5) —
-  // device op producing q[T,Hq,Dh] and gate[T,Hq,Dh].
-  DBuf qf(d, DType::kF32, {T, Hq, Dh});
+  // Split q|gate + per-head gemma-RMSNorm(q,k) + partial NeoX RoPE + gate
+  // passthrough, producing q[T,Hq,Dh]/k[T,Hkv,Dh] (normed+RoPE'd) and the raw
+  // gate[T,Hq,Dh]. VT_FUSE_ATTN_PREAMBLE collapses the four ops into ONE launch
+  // reading a precomputed cos_sin cache; it emits f32 q/k/gate — byte-identical
+  // intermediates to the four-op path (value-exact). OFF keeps the exact original
+  // AttnGateSplit + RmsNorm(q) + RmsNorm(k) + RopeNeox sequence.
+  DBuf dq3(d, DType::kF32, {T, Hq, Dh});
+  DBuf dk3(d, DType::kF32, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
-  vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
-
-  // Per-head gemma-RMSNorm over Dh, then partial NeoX RoPE on positions[0].
-  DBuf dqn(d, DType::kF32, {T * Hq, Dh});
-  Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
-  vt::RmsNorm(d.q, dqn.t(), Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-  DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-  // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-  // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32 dkn.
-  Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
-                                              : ResidentWeightF32(d, w.k_norm, {Dh});
-  vt::RmsNorm(d.q, dkn.t(), Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
-
-  DBuf dpos(d, DType::kI32, {T}, positions.data());
-  Tensor qn3 = Reshape(dqn.t(), {T, Hq, Dh});
-  Tensor kn3 = Reshape(dkn.t(), {T, Hkv, Dh});
-  vt::RopeNeox(d.q, qn3, kn3, dpos.t(), vt::RopeArgs{base, rot});
+  if (FuseAttnPreambleEnabled() && rot > 0) {
+    DBuf dpos(d, DType::kI32, {T}, positions.data());
+    DBuf cos_sin(d, DType::kF32, {T, rot});
+    vt::RopeCosSinCache(d.q, cos_sin.t(), dpos.t(), vt::RopeArgs{base, rot});
+    Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+    Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate.t(),
+                           Reshape(kf.t(), {T, Hkv * Dh}), dqw, dkw, cos_sin.t(),
+                           vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
+  } else {
+    DBuf qf(d, DType::kF32, {T, Hq, Dh});
+    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
+    Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+    Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
+    vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
+    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
+    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
+    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                                : ResidentWeightF32(d, w.k_norm, {Dh});
+    Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
+    vt::RmsNorm(d.q, dkn2d, Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
+    DBuf dpos(d, DType::kI32, {T}, positions.data());
+    vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
+  }
+  Tensor qn3 = dq3.t();
+  Tensor kn3 = dk3.t();
 
   // Causal GQA scaled-dot-product attention, scale = Dh^-0.5.
   Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
@@ -1609,30 +1662,41 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
 
-  // Gate split: per q-head [q(Dh) | gate(Dh)] (§5) — device op.
-  DBuf qf(d, DType::kF32, {T, Hq, Dh});
+  // Split q|gate + per-head gemma-RMSNorm(q,k) + partial NeoX RoPE + gate
+  // passthrough. VT_FUSE_ATTN_PREAMBLE (default OFF) collapses the four ops into
+  // ONE launch reading the per-step cos_sin cache (sdi.attn_cos_sin, built once by
+  // MaybeBuildAttnCosSin and reused by all 11 full-attn layers) — mirror of vLLM's
+  // fused_qk_rmsnorm_rope (fla fused_qk_norm_rope.py:95-102, zero in-kernel
+  // transcendentals). Emits f32 q/k/gate: byte-identical intermediates to the
+  // four-op path (the query stays f32 for PagedAttention), so ON is token-exact.
+  // positions/slot_mapping/... are the PERSISTENT per-step device buffers; sdi.*
+  // Tensors are const views over the shared DBufs (no per-layer H2D re-upload).
+  DBuf dq3(d, DType::kF32, {T, Hq, Dh});
+  DBuf dk3(d, DType::kF32, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
-  vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
-
-  // Per-head gemma-RMSNorm over Dh, then partial NeoX RoPE on positions.
-  DBuf dqn(d, DType::kF32, {T * Hq, Dh});
-  Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
-  vt::RmsNorm(d.q, dqn.t(), Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-  DBuf dkn(d, DType::kF32, {T * Hkv, Dh});
-  // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-  // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-  // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32 dkn.
-  Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
-                                              : ResidentWeightF32(d, w.k_norm, {Dh});
-  vt::RmsNorm(d.q, dkn.t(), Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
-
-  // positions/slot_mapping/block_table/seq_lens/query_start_loc are the PERSISTENT
-  // per-step device buffers (uploaded once, read by every layer) — no per-layer
-  // H2D re-upload. sdi.* Tensors are const views over the shared DBufs.
-  Tensor dpos = sdi.positions.t();
-  Tensor qn3 = Reshape(dqn.t(), {T, Hq, Dh});
-  Tensor kn3 = Reshape(dkn.t(), {T, Hkv, Dh});
-  vt::RopeNeox(d.q, qn3, kn3, dpos, vt::RopeArgs{base, rot});
+  if (FuseAttnPreambleEnabled() && sdi.has_attn_cos_sin) {
+    Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+    Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
+    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate.t(),
+                           Reshape(kf.t(), {T, Hkv * Dh}), dqw, dkw, sdi.attn_cos_sin.t(),
+                           vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
+  } else {
+    DBuf qf(d, DType::kF32, {T, Hq, Dh});
+    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
+    Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
+    Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
+    vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
+    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
+    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
+    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                                : ResidentWeightF32(d, w.k_norm, {Dh});
+    Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
+    vt::RmsNorm(d.q, dkn2d, Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
+    vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
+  }
+  Tensor qn3 = dq3.t();
+  Tensor kn3 = dk3.t();
 
   Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
 
@@ -2394,6 +2458,8 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // state indices) into persistent device buffers all layers read — replaces the
   // per-layer H2D re-uploads (the decode host-stall root; see StepDevInputs).
   StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+  // Build the fused-preamble cos|sin cache ONCE (VT_FUSE_ATTN_PREAMBLE); no-op OFF.
+  MaybeBuildAttnCosSin(d, sdi, config, T);
 
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
@@ -2747,6 +2813,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
   StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+  // Build the fused-preamble cos|sin cache ONCE (VT_FUSE_ATTN_PREAMBLE); no-op OFF.
+  MaybeBuildAttnCosSin(d, sdi, config, T);
 
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the

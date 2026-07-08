@@ -379,6 +379,63 @@ void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positi
                                                                   positions, args);
 }
 
+void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const RopeArgs& args) {
+  VT_CHECK(cos_sin.rank == 2, "rope_cos_sin_cache: cos_sin rank-2 [T, rotary_dim]");
+  VT_CHECK(cos_sin.dtype == DType::kF32, "rope_cos_sin_cache: cos_sin must be f32");
+  VT_CHECK(positions.rank == 1 && positions.shape[0] == cos_sin.shape[0],
+           "rope_cos_sin_cache: positions[T] must match cos_sin leading dim");
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "rope_cos_sin_cache: positions i32/i64");
+  VT_CHECK(args.rotary_dim > 0 && args.rotary_dim % 2 == 0 && cos_sin.shape[1] == args.rotary_dim,
+           "rope_cos_sin_cache: cos_sin second dim must equal an even rotary_dim");
+  VT_CHECK(cos_sin.IsContiguous() && positions.IsContiguous(),
+           "rope_cos_sin_cache: contiguous required");
+  VT_CHECK(cos_sin.device == q.device && positions.device == q.device,
+           "rope_cos_sin_cache: device mismatch (cos_sin/positions/queue)");
+  reinterpret_cast<RopeCosSinCacheFn>(GetOp(OpId::kRopeCosSinCache, q.device.type))(q, cos_sin,
+                                                                                    positions, args);
+}
+
+void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                        const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                        const Tensor& k_norm, const Tensor& cos_sin,
+                        const RmsNormArgs& norm_args, const RopeArgs& rope_args) {
+  VT_CHECK(q_out.rank == 3 && k_out.rank == 3 && gate_out.rank == 3,
+           "attn_qk_norm_rope_gate: q_out/k_out/gate_out rank-3 [T,H,Dh]");
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  const int64_t hkv = k_out.shape[1];
+  VT_CHECK(k_out.shape[0] == t && k_out.shape[2] == dh, "attn_qk_norm_rope_gate: k_out [T,Hkv,Dh]");
+  VT_CHECK(gate_out.shape[0] == t && gate_out.shape[1] == hq && gate_out.shape[2] == dh,
+           "attn_qk_norm_rope_gate: gate_out must match q_out [T,Hq,Dh]");
+  VT_CHECK(qgate.rank == 2 && qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
+           "attn_qk_norm_rope_gate: qgate must be [T, Hq*2*Dh]");
+  VT_CHECK(kf.rank == 2 && kf.shape[0] == t && kf.shape[1] == hkv * dh,
+           "attn_qk_norm_rope_gate: kf must be [T, Hkv*Dh]");
+  VT_CHECK(q_norm.rank == 1 && q_norm.shape[0] == dh && k_norm.rank == 1 && k_norm.shape[0] == dh,
+           "attn_qk_norm_rope_gate: q_norm/k_norm must be [Dh]");
+  VT_CHECK(cos_sin.rank == 2 && cos_sin.shape[0] == t && cos_sin.shape[1] == rope_args.rotary_dim,
+           "attn_qk_norm_rope_gate: cos_sin must be [T, rotary_dim]");
+  VT_CHECK(rope_args.rotary_dim > 0 && rope_args.rotary_dim % 2 == 0 && rope_args.rotary_dim <= dh,
+           "attn_qk_norm_rope_gate: rotary_dim must be even and <= Dh");
+  VT_CHECK(IsOutFloat(q_out.dtype) && k_out.dtype == q_out.dtype && gate_out.dtype == q_out.dtype,
+           "attn_qk_norm_rope_gate: q/k/gate out f32 or bf16 (same dtype)");
+  VT_CHECK(IsFloat(qgate.dtype) && kf.dtype == qgate.dtype,
+           "attn_qk_norm_rope_gate: qgate/kf float, same dtype");
+  VT_CHECK(q_norm.dtype == DType::kF32 && k_norm.dtype == DType::kF32 &&
+               cos_sin.dtype == DType::kF32,
+           "attn_qk_norm_rope_gate: q_norm/k_norm/cos_sin must be f32");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && gate_out.IsContiguous() &&
+               qgate.IsContiguous() && kf.IsContiguous() && q_norm.IsContiguous() &&
+               k_norm.IsContiguous() && cos_sin.IsContiguous(),
+           "attn_qk_norm_rope_gate: contiguous required");
+  VT_CHECK(q_out.device == q.device && k_out.device == q.device && gate_out.device == q.device &&
+               qgate.device == q.device && kf.device == q.device && q_norm.device == q.device &&
+               k_norm.device == q.device && cos_sin.device == q.device,
+           "attn_qk_norm_rope_gate: device mismatch");
+  reinterpret_cast<AttnQkNormRopeGateFn>(GetOp(OpId::kAttnQkNormRopeGate, q.device.type))(
+      q, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm, cos_sin, norm_args, rope_args);
+}
+
 namespace {
 // Shared shape/dtype/device validation for the two conv ops. x/out [T,C],
 // weight [C,K], optional bias [C], conv_state [N,C,K-1] f32.

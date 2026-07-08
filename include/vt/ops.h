@@ -54,6 +54,8 @@ enum class OpId : uint8_t {
   kMoeCombineGate,
   kMoeGroupedGemmNvfp4Marlin,
   kGdnPostConv,
+  kRopeCosSinCache,
+  kAttnQkNormRopeGate,
   kCount
 };
 
@@ -203,6 +205,14 @@ using GdnConvSplitFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&
 using GdnPostConvFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, Tensor&, Tensor&, const Tensor&,
                                const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                const L2NormArgs&);
+// Per-step RoPE cos|sin cache fill (fused-attn-preamble prep): cos_sin[T,rot] f32
+// from positions[T] (RopeArgs.base/rotary_dim). Cols [0,rot/2)=cos, [rot/2,rot)=sin.
+using RopeCosSinCacheFn = void (*)(Queue&, Tensor&, const Tensor&, const RopeArgs&);
+// Fused full-attention preamble (split q|gate + gemma qk-RMSNorm + partial NeoX
+// RoPE-from-cache + gate passthrough) in ONE launch. See AttnQkNormRopeGate below.
+using AttnQkNormRopeGateFn =
+    void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+             const Tensor&, const Tensor&, const RmsNormArgs&, const RopeArgs&);
 using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
@@ -477,6 +487,49 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
 // rounded back on store for bf16.
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
               const RopeArgs& args);
+
+// --- Fused full-attention preamble (default-OFF prefill lever; mirror of vLLM's
+// fused_qk_rmsnorm_rope / fla fused_qk_norm_rope.py:95-102, which reads a
+// precomputed cos_sin_cache with ZERO in-kernel transcendentals). Two ops:
+//
+// RopeCosSinCache: precompute the batch's cos|sin ONCE per step so the fused
+// preamble kernel below does no per-element pow/cos/sin (the current RopeNeox
+// recomputes them in DOUBLE per element, per head, per layer). Fills
+// cos_sin[T, rotary_dim] f32 from positions[T]: for token t, pair i in
+// [0, rotary_dim/2):
+//   freq  = base^(-2i/rotary_dim)            (double, matching RopeNeox)
+//   angle = positions[t] * freq             (double)
+//   cos_sin[t, i]              = (f32) cos(angle)
+//   cos_sin[t, rotary_dim/2+i] = (f32) sin(angle)
+// The double-precision angle + f32 cast reproduce RopeNeox's per-element c/sn
+// BIT-FOR-BIT, so the cached rotation is token-exact vs the inline path.
+// positions i32/i64; cos_sin f32 [T, rotary_dim]. CPU + CUDA.
+void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const RopeArgs& args);
+
+// AttnQkNormRopeGate: the fused full-attention preamble — one launch replacing the
+// AttnGateSplit + RmsNorm(q) + RmsNorm(k) + RopeNeox four-kernel chain, removing
+// their f32 HBM intermediate round-trips. Grid (T, Hq+Hkv), one block per
+// (token, head); the block reduces over Dh (gemma-RMSNorm), then applies partial
+// NeoX RoPE reading the precomputed cos_sin cache. Bit-for-bit equal to composing
+// the four ops when the outputs are f32 (the wired default): the gemma RMSNorm
+// (f32 variance, weight as (1+w)) and the RoPE (x*c - y*sn / x*sn + y*c from the
+// same f32 c/sn) are the identical f32 arithmetic; only launch-count and HBM
+// traffic change. The output dtype is templated (f32 keeps the PagedAttention f32
+// query contract; bf16 halves the writes but rounds q/k/gate — a GPU-gated A/B).
+//   qgate   [T, Hq*2*Dh]  f32/bf16 — the fused q|gate projection (per head [q|gate])
+//   kf      [T, Hkv*Dh]   f32/bf16 — the k projection
+//   q_norm/k_norm [Dh]    f32      — the per-head gemma-RMSNorm weights
+//   cos_sin [T, rot]      f32      — RopeCosSinCache output (rot = rope_args.rotary_dim)
+//   q_out   [T, Hq, Dh]   f32/bf16 — gemma-RMSNorm'd + RoPE'd q
+//   k_out   [T, Hkv, Dh]  f32/bf16 — gemma-RMSNorm'd + RoPE'd k
+//   gate_out[T, Hq, Dh]   f32/bf16 — the raw gate half (passthrough, no norm/rope)
+// norm_args: eps + gemma (must be gemma=true for Qwen). rope_args: rotary_dim (the
+// partial rotation width; base is unused — the cache is precomputed). q_out/k_out/
+// gate_out share one dtype; qgate/kf share one dtype. CPU + CUDA.
+void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                        const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                        const Tensor& k_norm, const Tensor& cos_sin,
+                        const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 
 // --- GDN (Gated DeltaNet) ops. Formula reference: .agents/gdn-semantics.md.
 // All GDN state tensors are caller-allocated f32 and updated IN PLACE

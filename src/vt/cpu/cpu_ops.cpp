@@ -280,6 +280,94 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
+// Per-step RoPE cos|sin cache fill (fused-attn-preamble prep). cos_sin[T,rot] f32:
+// cols [0,half)=cos, [half,rot)=sin. Angle math in DOUBLE + f32 cast, matching
+// RopeRotateHead/RopeNeoxKernel element-for-element so the cache reproduces the
+// inline rotation bit-for-bit.
+void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, const RopeArgs& args) {
+  const int64_t t = cos_sin.shape[0];
+  const int rot = args.rotary_dim;
+  const int64_t half = rot / 2;
+  const double base = static_cast<double>(args.base);
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t p =
+        positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i] : positions.Ptr<int64_t>()[i];
+    for (int64_t pair = 0; pair < half; ++pair) {
+      const double freq = std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+      const double angle = static_cast<double>(p) * freq;
+      StoreF32(cos_sin, i * rot + pair, static_cast<float>(std::cos(angle)));
+      StoreF32(cos_sin, i * rot + half + pair, static_cast<float>(std::sin(angle)));
+    }
+  }
+}
+
+// gemma-RMSNorm one element: (v*inv)*(gemma ? w+1 : w) — matches RmsNormKernel's
+// `v * inv * wj` (wj = w [+1 if gemma]) grouping and order exactly.
+float GemmaNormElem(float v, float inv, float w, bool gemma) {
+  float wj = w;
+  if (gemma) wj += 1.0f;
+  return v * inv * wj;
+}
+
+// Fused full-attention preamble: split q|gate + gemma qk-RMSNorm(Dh) + partial
+// NeoX RoPE (from the cos_sin cache) + gate passthrough, in one pass. Bit-for-bit
+// equal (f32 out) to AttnGateSplit + RmsNorm(q) + RmsNorm(k) + RopeNeox composed:
+// the variance is f32, the weight is applied as (1+w), and the rotation reuses the
+// same f32 c/sn the cache holds (x*c - y*sn / x*sn + y*c). Tail dims [rot,Dh) are
+// normed but unrotated.
+void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
+                              const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const RmsNormArgs& na, const RopeArgs& ra) {
+  const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
+  const int64_t hkv = k_out.shape[1];
+  const int rot = ra.rotary_dim;
+  const int64_t half = rot / 2;
+  const bool gemma = na.gemma;
+  // Normalize one head row (src..src+Dh) into out.., applying partial NeoX RoPE
+  // from cs[0..rot). Recomputes normed[i]/normed[i+half] where paired.
+  auto do_head = [&](const Tensor& src, int64_t src_off, const Tensor& w, const Tensor& out,
+                     int64_t out_off, const float* cs) {
+    float ss = 0.0f;
+    for (int64_t j = 0; j < dh; ++j) {
+      const float v = LoadF32(src, src_off + j);
+      ss += v * v;
+    }
+    const float inv = 1.0f / std::sqrt(ss / static_cast<float>(dh) + na.eps);
+    for (int64_t j = 0; j < dh; ++j) {
+      if (j < half) {
+        const float ni = GemmaNormElem(LoadF32(src, src_off + j), inv, LoadF32(w, j), gemma);
+        const float nih =
+            GemmaNormElem(LoadF32(src, src_off + j + half), inv, LoadF32(w, j + half), gemma);
+        StoreF32(out, out_off + j, ni * cs[j] - nih * cs[half + j]);
+      } else if (j < rot) {
+        const int64_t i = j - half;
+        const float ni = GemmaNormElem(LoadF32(src, src_off + i), inv, LoadF32(w, i), gemma);
+        const float nih =
+            GemmaNormElem(LoadF32(src, src_off + i + half), inv, LoadF32(w, i + half), gemma);
+        StoreF32(out, out_off + j, ni * cs[half + i] + nih * cs[i]);
+      } else {
+        StoreF32(out, out_off + j,
+                 GemmaNormElem(LoadF32(src, src_off + j), inv, LoadF32(w, j), gemma));
+      }
+    }
+  };
+  for (int64_t tok = 0; tok < t; ++tok) {
+    const float* cs = cos_sin.Ptr<float>() + tok * rot;
+    for (int64_t h = 0; h < hq; ++h) {
+      const int64_t qrow = tok * (hq * 2 * dh) + h * 2 * dh;
+      do_head(qgate, qrow, q_norm, q_out, (tok * hq + h) * dh, cs);
+      // gate passthrough: the second Dh of each (t,h) q|gate pair (no norm/rope).
+      const int64_t gbase = qrow + dh;
+      const int64_t gout = (tok * hq + h) * dh;
+      for (int64_t j = 0; j < dh; ++j) StoreF32(gate_out, gout + j, LoadF32(qgate, gbase + j));
+    }
+    for (int64_t h = 0; h < hkv; ++h) {
+      do_head(kf, tok * (hkv * dh) + h * dh, k_norm, k_out, (tok * hkv + h) * dh, cs);
+    }
+  }
+}
+
 // GDN CPU reference kernels. Formulas: .agents/gdn-semantics.md (§ cited per
 // kernel); scalar f32 math throughout, states f32 in place.
 
@@ -771,6 +859,11 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnConvSplitFn>(&GdnConvSplitKernel)));
     RegisterOp(OpId::kGdnPostConv, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
+    RegisterOp(OpId::kRopeCosSinCache, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
+    RegisterOp(
+        OpId::kAttnQkNormRopeGate, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernel)));
     RegisterOp(OpId::kSharedExpertGate, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SharedExpertGateFn>(&SharedExpertGateKernel)));
   }

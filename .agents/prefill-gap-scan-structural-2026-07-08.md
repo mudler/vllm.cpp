@@ -69,3 +69,22 @@ HARDEST-WORTH-LONG-WORK: #3 and #5. Single recommended next big lever: **#3**.
 4. **#3 glue-chain fusion** (XL) via fused-recipe skeleton — the big lever, gated on (3).
 5. **#2 GDN WY blocked inverse** (L, ~2%) — the algorithm we lack.
 6. Reassess with a fresh vLLM-vs-ours profile.
+
+## Implementation refinements (grounded 2026-07-08, post-scan)
+- **#1 fp8 plan-cache:** `MatmulFp8CublasLtKernelCuda` (cuda_matmul.cu:204-263) recreates
+  desc+3 layouts+preference AND re-runs `cublasLtMatmulAlgoGetHeuristic` (:247) EVERY call.
+  FIX: per-device `unordered_map<key,Plan>` keyed by `(m,n,k,out_type)`, storing PERSISTENT
+  desc+la+lb+lc+algo (not the RAII Guards — those destroy on scope). On hit skip create+
+  heuristic → straight to `cublasLtMatmul`. `valid=false` entry caches the "no fp8 heuristic
+  → cutlass fallback" decision too. Leak plans at exit (like ctx.handle). Isolated file.
+- **#3 real surface is NARROWER than the scan headline:** our GDN post-conv prep is ALREADY
+  fused (`vt::GdnPostConv` under `GlueFuseEnabled`, qwen3_5.cpp:1425 — mirrors
+  fla/ops/fused_gdn_prefill_post_conv.py:152). Remaining unfused surface = (a) per-layer
+  residual-ADD + RMSNorm (+quant terminal) chains feeding each GEMM — vLLM's Inductor fuses
+  add+RMSNorm into one triton kernel, we run add/rmsnorm/quant as separate HBM round-trips;
+  (b) FullAttnBlock glue (dq3/dk3/gatef/dattn/gated, qwen3_5.cpp:1602-1660). NOTE (scan [3]):
+  rmsnorm→nvfp4 fusion alone is NOT a deficit-closer (vLLM also runs 2 kernels there) — the
+  win is the ADD+RMSNorm fuse + residual-on-chip + launch-count reduction across the chain.
+  BUILD ON: the TDR fused-recipe skeleton (include/vt/fused_recipe.h — kAdd/kRmsNorm/kMul +
+  roles) already exists; #3 Phase-1 = the Tier-1 interpreter kernel walking the add+RMSNorm
+  chain in one pass, residual on-chip. GATE on the nsys host-trace (launch-idle) first.

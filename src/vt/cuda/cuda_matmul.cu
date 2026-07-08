@@ -201,6 +201,93 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 // alpha*(A_fp8@B_fp8) reproduces sum dequant(a)*dequant(w)). If cublasLt has no
 // fp8 heuristic for a given shape (e.g. tiny M on some drivers), we fall back to
 // the already-16/16-validated cutlass fp8 GEMM so the correctness gate holds.
+// FP8 cuBLASLt PLAN CACHE (parity-lever 2026-07-08 #1, .agents/prefill-gap-scan-
+// structural-2026-07-08.md). The descriptor objects + the heuristic-selected algo
+// depend ONLY on (m,n,k,out_type) + the fixed TN/COMPUTE_32F config — so recreating
+// the desc/3 layouts/preference AND re-running cublasLtMatmulAlgoGetHeuristic on
+// EVERY call is pure host-side waste for shapes that repeat every layer/step. vLLM
+// runs its fp8 GEMM (torch._scaled_mm) INSIDE the compiled graph with the plan reused
+// (vllm/model_executor/kernels/linear/scaled_mm/pytorch.py:87) — the per-call
+// heuristic search idles the launch queue between GEMMs on the 19.7% fp8 bucket. We
+// pay the plan ONCE per shape and reuse it (mirrors torch's cuBLASLt plan cache).
+struct Fp8Plan {
+  cublasLtMatmulDesc_t desc = nullptr;  // persistent handles (NOT the RAII guards);
+  cublasLtMatrixLayout_t la = nullptr;  // leaked at exit like LtContext (bounded:
+  cublasLtMatrixLayout_t lb = nullptr;  // one plan per distinct problem shape).
+  cublasLtMatrixLayout_t lc = nullptr;
+  cublasLtMatmulAlgo_t algo{};
+  bool has_algo = false;  // false => no fp8 heuristic for this shape => cutlass fallback
+                          // (the fallback DECISION is cached too, so we never re-search).
+};
+struct Fp8Key {
+  int device;
+  int64_t m, n, k;
+  bool out_bf16;
+  bool operator==(const Fp8Key& o) const {
+    return device == o.device && m == o.m && n == o.n && k == o.k && out_bf16 == o.out_bf16;
+  }
+};
+struct Fp8KeyHash {
+  size_t operator()(const Fp8Key& kk) const {
+    size_t h = std::hash<int64_t>{}(kk.m);
+    h = h * 1000003u ^ std::hash<int64_t>{}(kk.n);
+    h = h * 1000003u ^ std::hash<int64_t>{}(kk.k);
+    h = h * 1000003u ^ std::hash<int>{}(kk.device);
+    h = h * 1000003u ^ static_cast<size_t>(kk.out_bf16);
+    return h;
+  }
+};
+
+// Returns the cached plan for this shape, building (desc + col-major layouts +
+// heuristic) once on miss. std::unordered_map keeps element pointers stable across
+// later inserts, and a built plan is immutable, so the returned pointer is safe to
+// use outside the lock (in cublasLtMatmul).
+const Fp8Plan* GetFp8Plan(const LtContext& ctx, int device, int64_t m, int64_t n, int64_t k,
+                          cudaDataType_t out_type) {
+  static std::mutex mu;
+  static std::unordered_map<Fp8Key, Fp8Plan, Fp8KeyHash> plans;
+  const Fp8Key key{device, m, n, k, out_type == CUDA_R_16BF};
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = plans.find(key);
+  if (it != plans.end()) return &it->second;
+
+  Fp8Plan p;
+  CheckLt(cublasLtMatmulDescCreate(&p.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "fp8 cublasLtMatmulDescCreate (cache)");
+  const cublasOperation_t op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+  CheckLt(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)),
+          "fp8 set TRANSA=T");
+  CheckLt(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)),
+          "fp8 set TRANSB=N");
+  // Column-major layouts (default order — NOT ORDER_ROW; fp8 needs the native
+  // col-major TN form). See the derivation in the block comment above.
+  CheckLt(cublasLtMatrixLayoutCreate(&p.la, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(n), k),
+          "fp8 Adesc (weight)");
+  CheckLt(cublasLtMatrixLayoutCreate(&p.lb, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(m), k),
+          "fp8 Bdesc (act)");
+  CheckLt(cublasLtMatrixLayoutCreate(&p.lc, out_type, static_cast<uint64_t>(n),
+                                     static_cast<uint64_t>(m), n),
+          "fp8 Cdesc (out)");
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "fp8 cublasLtMatmulPreferenceCreate");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "fp8 set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
+  cublasLtMatmulHeuristicResult_t heur{};
+  int returned = 0;
+  const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
+      ctx.handle, p.desc, p.la, p.lb, p.lc, p.lc, pref.v, /*requestedAlgoCount=*/1, &heur,
+      &returned);
+  if (hst == CUBLAS_STATUS_SUCCESS && returned > 0) {
+    p.algo = heur.algo;
+    p.has_algo = true;
+  }
+  auto res = plans.emplace(key, p);
+  return &res.first->second;
+}
+
 void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                                  float alpha) {
   const int64_t m = a_fp8.shape[0], k = a_fp8.shape[1], n = b_fp8.shape[0];
@@ -213,52 +300,20 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
 
   const LtContext ctx = GetContext(q.device.index);
   const cudaDataType_t out_type = out.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF;
-
-  DescGuard desc;
-  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
-          "fp8 cublasLtMatmulDescCreate");
-  const cublasOperation_t op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
-  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)),
-          "fp8 set TRANSA=T");
-  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)),
-          "fp8 set TRANSB=N");
-
-  // Column-major layouts (default order — NOT ORDER_ROW; fp8 needs the native
-  // col-major TN form). See the derivation in the block comment above.
-  LayoutGuard la, lb, lc;
-  CheckLt(cublasLtMatrixLayoutCreate(&la.v, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
-                                     static_cast<uint64_t>(n), k),
-          "fp8 Adesc (weight)");
-  CheckLt(cublasLtMatrixLayoutCreate(&lb.v, CUDA_R_8F_E4M3, static_cast<uint64_t>(k),
-                                     static_cast<uint64_t>(m), k),
-          "fp8 Bdesc (act)");
-  CheckLt(cublasLtMatrixLayoutCreate(&lc.v, out_type, static_cast<uint64_t>(n),
-                                     static_cast<uint64_t>(m), n),
-          "fp8 Cdesc (out)");
-
-  PrefGuard pref;
-  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "fp8 cublasLtMatmulPreferenceCreate");
-  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
-          "fp8 set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
-
-  cublasLtMatmulHeuristicResult_t heur{};
-  int returned = 0;
-  const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
-      ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v, /*requestedAlgoCount=*/1, &heur,
-      &returned);
-  if (hst != CUBLAS_STATUS_SUCCESS || returned == 0) {
+  const Fp8Plan* plan = GetFp8Plan(ctx, q.device.index, m, n, k, out_type);
+  if (!plan->has_algo) {
     // No cublasLt fp8 kernel for this shape/config -> keep the gate robust by
-    // routing to the already-validated cutlass fp8 GEMM (same fp8 math).
+    // routing to the already-validated cutlass fp8 GEMM (same fp8 math). The
+    // decision is cached, so we never re-run the heuristic to reach this branch.
     ::vt::MatmulFp8Cutlass(q, out, a_fp8, b_fp8, alpha);
     return;
   }
 
   // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
   const float beta = 0.0f;
-  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b_fp8.data, la.v, a_fp8.data, lb.v, &beta,
-                         out.data, lc.v, out.data, lc.v, &heur.algo, ctx.workspace, kWorkspaceBytes,
-                         s),
+  CheckLt(cublasLtMatmul(ctx.handle, plan->desc, &alpha, b_fp8.data, plan->la, a_fp8.data, plan->lb,
+                         &beta, out.data, plan->lc, out.data, plan->lc, &plan->algo, ctx.workspace,
+                         kWorkspaceBytes, s),
           "fp8 cublasLtMatmul");
 }
 

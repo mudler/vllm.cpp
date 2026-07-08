@@ -2402,8 +2402,18 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
       const size_t delta_bytes =
           static_cast<size_t>(bv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc>), delta_bytes,
-             "gdn chunked delta_h(wmma,vsplit) shared opt-in");
+      // Always opt in (mirror GdnChunkWUWmmaKernel): the bf16 V-split delta_bytes
+      // is EXACTLY 48 KiB (32 KiB [BV,Dk] f32 slice + 16 KiB bf16 pool), so the
+      // opt_in helper's strict ">48 KiB" guard would SKIP the attribute, and
+      // 48 KiB dynamic + the static decay[] (256 B) overflows the 48 KiB default
+      // cap on total per-block shared → cudaErrorInvalidValue at launch. Setting
+      // the max-dynamic attribute unconditionally is a no-op when it already fits
+      // and correctly raises the cap at the boundary (f32 V-split = 64 KiB already
+      // trips the helper's guard, but do it uniformly for both dtypes).
+      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(delta_bytes)),
+            "gdn chunked delta_h(wmma,vsplit) shared opt-in");
       const dim3 grid_seq_vs(static_cast<unsigned>(n_seq), static_cast<unsigned>(hv_n),
                              static_cast<unsigned>(nv));
       GdnChunkDeltaHWmmaVSplitKernel<TSc><<<grid_seq_vs, occ_delta, delta_bytes, s>>>(
@@ -2418,8 +2428,13 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
                                   static_cast<size_t>(kChunk * kChunk) * 4 +
                                   static_cast<size_t>(kChunk * kChunk) * sz;
-      opt_in(reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout>), chunko_bytes,
-             "gdn chunked o(wmma,vsplit) shared opt-in");
+      // ChunkO V-split is 56 KiB (bf16) / 96 KiB (f32) — both already trip the
+      // opt_in guard, but set the attribute unconditionally too so the boundary
+      // can never bite (e.g. a future BV/NV that lands the bf16 arena on 48 KiB).
+      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(chunko_bytes)),
+            "gdn chunked o(wmma,vsplit) shared opt-in");
       const dim3 grid_chunk_vs(static_cast<unsigned>(nt_tot), static_cast<unsigned>(hv_n),
                                static_cast<unsigned>(nv));
       GdnChunkOWmmaVSplitKernel<TSc, Tout><<<grid_chunk_vs, occ_o, chunko_bytes, s>>>(

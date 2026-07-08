@@ -1673,6 +1673,51 @@ __global__ void GdnBuildChunkMeta(int32_t* tok0, int32_t* lenv, int32_t* boh,
   }
 }
 
+// Slack-only v_new zeroing (default OFF; VT_GDN_SLACK_MEMSET=1 enables). The
+// full-buffer cudaMemsetAsync of v_new below zeros [0,t_pad) rows, but DeltaH V1
+// writes EVERY real token row [0,t_tot) before any read that needs it, so zeroing
+// those is dead (~97% of the buffer at real prefill lengths). Only the per-seq
+// last-partial-chunk slack rows the WMMA tiles over-sweep (DeltaH-V2 @ :1268 /
+// ChunkO @ :1397 read a full kChunk-row tile per chunk and multiply the slack
+// rows by a 0 mask — Kd/As — so 0*NaN=NaN unless those rows are finite) must be
+// zeroed. Mirrors FLA masking with boundary_check instead of a memset
+// (chunk_delta_h.py:355 v_new=torch.empty_like(u), stored/loaded boundary_check=(0,1)).
+bool GdnSlackMemsetEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_SLACK_MEMSET");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// Zeros ONLY v_new's per-sequence last-partial-chunk slack rows, exactly the rows
+// the WMMA tiles over-read past each sequence's real tokens:
+//   [qsl[n]+seqlen_n, qsl[n]+ceil(seqlen_n/kChunk)*kChunk) x [0,dv)
+// (tok0 = qsl[n]+it*kChunk tight packing, cf. GdnBuildChunkMeta). One block per
+// (sequence, v-head) — grid (n_seq, hv_n), mirroring grid_seq. Idempotent: when a
+// slack range overlaps the next sequence's real rows (middle sequences) DeltaH V1
+// overwrites them with real finite values anyway; the invariant is only finiteness
+// before the masked V2/ChunkO reads. The LAST sequence's slack range covers the
+// over-read prefix of the trailing global pad; rows past it (up to t_pad) are
+// never read, so they stay uninitialized (as the real-row reads already assume).
+// Runs BEFORE DeltaH, same stream ordering as the full memset it replaces.
+template <typename TD>
+__global__ void GdnChunkVNewSlackZeroKernel(TD* v_new, const int32_t* qsl, int64_t hv_n,
+                                            int64_t dv) {
+  const int64_t n = blockIdx.x, hv = blockIdx.y;
+  const int64_t begin = qsl[n];
+  const int64_t seqlen = qsl[n + 1] - begin;
+  const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  const int64_t r0 = begin + seqlen;         // first slack row (== qsl[n+1])
+  const int64_t r1 = begin + nt * kChunk;    // one past the last over-read row
+  const int64_t nrow = r1 - r0;              // == 0 when seqlen is a kChunk multiple
+  if (nrow <= 0) return;
+  for (int64_t e = threadIdx.x; e < nrow * dv; e += blockDim.x) {
+    const int64_t i = e / dv, d = e % dv;
+    Store(v_new, (r0 + i) * hv_n * dv + hv * dv + d, 0.0f);
+  }
+}
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
@@ -1851,8 +1896,16 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const bool dvec = (dvec_env == nullptr || dvec_env[0] != '0');
     // Zero v_new so the over-allocated tail rows the matmuls may sweep
     // (their A operand is 0 there, but 0*NaN=NaN on the tensor core) are finite.
-    Check(cudaMemsetAsync(v_new, 0, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
-          "gdn chunked v_new zero");
+    // VT_GDN_SLACK_MEMSET zeros ONLY the per-seq partial-chunk slack rows (the
+    // ~3% actually over-read); default OFF keeps the byte-identical full memset.
+    if (GdnSlackMemsetEnabled()) {
+      GdnChunkVNewSlackZeroKernel<TSc><<<grid_seq, 128, 0, s>>>(v_new, qsl.Ptr<int32_t>(), hv_n,
+                                                                dv);
+      Check(cudaGetLastError(), "gdn chunked v_new slack-zero launch");
+    } else {
+      Check(cudaMemsetAsync(v_new, 0, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
+            "gdn chunked v_new zero");
+    }
     const size_t sz = sizeof(TSc);
     const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
     const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;

@@ -1042,6 +1042,28 @@ DType GdnActDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
+// GDN recurrence-OUTPUT + z-gate in bf16 (default OFF; VT_GDN_OUT_BF16=1 enables).
+// vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
+// FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
+// upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
+// `dcore` (recurrence out) + `z` were f32 (a more-precise deviation that doubled
+// the [T,Hv,Dv] core traffic in/out of GdnDecode/GdnPrefill AND the gated-norm
+// read). When ON, `dcore` is bf16 (GdnDecode/GdnPrefill already dispatch a Tout=bf16
+// path so they store bf16 directly), `z` is bf16 (MatmulBf16D), and the gated-norm
+// weight is loaded native bf16 (RmsNormGated requires gate/weight dtype == x dtype)
+// — the norm's variance/normalize math stays f32-accumulated regardless, so only
+// the core/z I/O dtype changes. ssm_state, g (+cumsum), and beta stay f32 (FLA's
+// split). Distinct from the earlier VT_BF16_GDN (in_proj/conv/z-gate, neutral):
+// this lever is the f32 `dcore` recurrence output that attempt left untouched.
+// A/B: VT_GDN_OUT_BF16 unset restores the byte-identical f32 dcore/z path.
+DType GdnOutDType() {
+  static const bool bf16 = [] {
+    const char* e = std::getenv("VT_GDN_OUT_BF16");
+    return e != nullptr && e[0] == '1';
+  }();
+  return bf16 ? DType::kBF16 : DType::kF32;
+}
+
 // bf16 residual stream (default ON). vLLM runs the 35B in bf16
 // (model_config.dtype=bfloat16): qwen3_next.py keeps `residual` as the bf16 hidden
 // dtype across all 48 layers, and Qwen3NextRMSNorm==GemmaRMSNorm's fused_add_rms_norm
@@ -1245,8 +1267,14 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
                    ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
                    : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
-                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
+  // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
+  // byte-identical f32 path.
+  const DType outdt = GdnOutDType();
+  DBuf z = !w.in_proj_z_fp8.Empty()
+               ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt)
+           : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
+                                   : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -1320,8 +1348,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
     vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
   }
-  // scale = Dk^-0.5 (q only, inside the recurrence).
-  DBuf dcore(d, DType::kF32, {T, Hv, Dv});
+  // scale = Dk^-0.5 (q only, inside the recurrence). dcore (recurrence output /
+  // core_attn_out) is bf16 under VT_GDN_OUT_BF16 — GdnDecode/GdnPrefill store the
+  // Tout=bf16 path directly (mirror FLA chunk_o.py o bf16); else the f32 default.
+  DBuf dcore(d, outdt, {T, Hv, Dv});
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   const int64_t ssm_row_elems = Hv * Dv * Dk;
 
@@ -1380,7 +1410,11 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.
-  Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
+  // Weight follows core/z dtype (RmsNormGated requires w.dtype == x.dtype): native
+  // bf16 under VT_GDN_OUT_BF16 (the norm still accumulates variance in f32), else
+  // the f32 upcast. Mirrors the q_norm/k_norm resident-weight dtype gate.
+  Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
+                                     : ResidentWeightF32(d, w.norm_weight, {Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into

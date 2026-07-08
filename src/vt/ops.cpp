@@ -331,6 +331,35 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
+                const FusedRecipe& recipe, float eps) {
+  // Phase-0 operand contract mirrors RmsNorm(residual): x/out [T,H], weight [H],
+  // optional residual [T,H] f32/bf16. Recipe structure is validated by the
+  // backend realization; here we gate the tensor shapes/dtypes/devices so a bad
+  // call fails at the chokepoint, not inside a kernel.
+  VT_CHECK(recipe.n >= 1 && recipe.n <= kMaxFusedSteps, "fused_chain: empty/oversized recipe");
+  VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
+           "fused_chain: x/out rank-2, weight rank-1");
+  VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
+           "fused_chain: out shape must match x");
+  VT_CHECK(weight.shape[0] == x.shape[1], "fused_chain: weight size mismatch");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
+           "fused_chain: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous(),
+           "fused_chain: contiguous required");
+  if (residual != nullptr) {
+    VT_CHECK((residual->dtype == DType::kF32 || residual->dtype == DType::kBF16) &&
+                 residual->rank == 2 && residual->shape[0] == x.shape[0] &&
+                 residual->shape[1] == x.shape[1] && residual->IsContiguous() &&
+                 residual->device == x.device,
+             "fused_chain: residual must be f32/bf16 [T,H] contiguous on x's device");
+  }
+  VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
+           "fused_chain: device mismatch (x/out/weight/queue)");
+  reinterpret_cast<FusedChainFn>(GetOp(OpId::kFusedChain, q.device.type))(q, out, x, weight,
+                                                                          residual, recipe, eps);
+}
+
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   VT_CHECK(x.rank == 2 && out.rank == 2, "silu_and_mul: rank-2 required");
   VT_CHECK(x.shape[1] % 2 == 0, "silu_and_mul: inner dim must be even");

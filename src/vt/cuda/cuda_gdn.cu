@@ -1177,6 +1177,13 @@ __global__ void GdnChunkOKernel(Tout* out, const Tin* q, const Tin* k, const flo
 namespace wmma = nvcuda::wmma;
 constexpr int kWM = 16;   // WMMA tile M/N
 constexpr int kNB = 32;   // DeltaH V1 output column block (Dv must be a multiple)
+// V-split (VT_GDN_CHUNK_VSPLIT): number of blocks the DeltaH/ChunkO grid is split
+// into along Dv (grid.z). BV = Dv/kVSplitNV; each block owns a [BV,Dk] state slice
+// instead of the full [Dv,Dk] — lifts DeltaH from 1 to 2 resident blocks/SM on the
+// bf16 hot path. Mirrors FLA's chunk_delta_h/chunk_o grid=(cdiv(V,BV),...) tiling
+// (chunk_delta_h.py:357-358, chunk_o.py:170-171). BV must be a multiple of kNB
+// (DeltaH V1 output-column tiling); NV=2 → BV=64 at the real gate dim Dv=128.
+constexpr int kVSplitNV = 2;
 
 // Per-dtype WMMA config: fragment types, K-tile width, and a load that rounds
 // f32 -> tf32 in place (bf16 loads natively).
@@ -1544,6 +1551,329 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
   }
 }
 
+// ---------------------------------------------------------------------------
+// V-split DeltaH / ChunkO (VT_GDN_CHUNK_VSPLIT, default OFF) — the FLA
+// grid=(cdiv(V,BV), ...) mirror of the full-state kernels above. The full-state
+// GdnChunkDeltaHWmmaKernel holds the ENTIRE [Dv,Dk] f32 running state in dynamic
+// shared (~64 KiB f32 slice + pool ≈ 80/96 KiB), which pins the kernel to 1
+// resident block/SM. FLA instead grids (cdiv(V,BV), N*H) and keeps only a
+// [BV,64] state tile per block (chunk_delta_h.py:86-92 b_h1..b_h4 in registers;
+// grid at :357-358). This mirror splits Dv across grid.z=NV blocks: block
+// (…, i_v) owns V-rows/cols [i_v*BV, (i_v+1)*BV) with a [BV,Dk] state slice
+// (~32 KiB f32 / ~16 KiB bf16 pool → 48 KiB total → 2 resident blocks/SM on the
+// bf16 hot path). hstate/state/v_new slices are disjoint across i_v.
+//
+// TOKEN-EXACT (this is the token-exact chunked-prefill golden's kernel): the
+// V-split is along the OUTPUT (Dv) dimension, and each output V-row is computed
+// INDEPENDENTLY of the others —
+//   DeltaH: v_new[i,vi] = u[i,vi] − Σ_ki w[i,ki]·H[vi,ki]  (only H row vi)
+//           H[vi,ki]    = H[vi,ki]·e^{G_last} + Σ_i V_new[i,vi]·(k⊙decay)[i,ki]
+//                                               (only H row vi + V_new col vi)
+//   ChunkO: o[i,vi]     = scale·(e^{G_i}·Q_i·Hstart[vi,:] + Σ_{j≤i} A[i,j]·V_new[j,vi])
+// so splitting Dv changes WHICH rows/cols a block computes, never any element's
+// f32 accumulation order (same WMMA kWM tiling over the same Dk/chunk-row
+// reductions, same f32 accumulators). Each block reproduces its slice's reduction
+// byte-for-byte → identical to the full-state kernel. cp.async pipelining of the
+// staging loads (FLA num_stages) is a follow-up (the occupancy lift is the
+// V-split itself); it is deferred rather than shipped unverified on GPU.
+
+// DeltaH, V-split. One block per (sequence, v-head, i_v). SEQUENTIAL over chunks.
+// f32 running state Hf[BV,Dk] resident in dynamic shared; pool reused by V1/V2.
+// Structurally identical to GdnChunkDeltaHWmmaKernel with dv→bv in the state slice
+// and V-loop bounds, and the v_new/state/hstate offsets shifted by vbase.
+template <typename TD>
+__global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_new, const TD* k,
+                                               const TD* u, const TD* w, const float* gcum,
+                                               const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                               int64_t dk, int64_t hv_n, int64_t dv, int64_t bv,
+                                               bool vec) {
+  using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t n = blockIdx.x, hv = blockIdx.y;
+  const int64_t vbase = static_cast<int64_t>(blockIdx.z) * bv;  // first V-row this block owns
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;    // full per-head [Dv,Dk] stride (state/hstate)
+  const int64_t sdv = bv * dk;   // this block's [BV,Dk] slice
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  float* Hf = reinterpret_cast<float*>(smem_raw);   // [BV,Dk] f32 state slice
+  char* pool = smem_raw + sdv * sizeof(float);       // reused by V1/V2
+  __shared__ float decay[kChunk];
+
+  float* s_head = state + (n * hv_n + hv) * sd + vbase * dk;  // [BV,Dk] slice
+  if (vec)
+    for (int64_t g = tid; g < sdv / 4; g += blockDim.x)
+      V128<float>::Cpy(Hf + g * 4, s_head + g * 4);
+  else
+    for (int64_t e = tid; e < sdv; e += blockDim.x) Hf[e] = s_head[e];
+  __syncthreads();
+
+  const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  for (int64_t it = 0; it < nt; ++it) {
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * kChunk;
+    const int64_t rem = seqlen - it * kChunk;
+    const int64_t len = rem < kChunk ? rem : kChunk;
+    TD* hstart = hstate + (gc * hv_n + hv) * sd + vbase * dk;  // [BV,Dk] slice
+    if (vec)
+      for (int64_t g = tid; g < sdv / V::N; g += blockDim.x) {
+        float f[V::N];
+#pragma unroll
+        for (int j = 0; j < V::N; ++j) f[j] = Hf[g * V::N + j];
+        V::Sf(hstart + g * V::N, f);
+      }
+    else
+      for (int64_t e = tid; e < sdv; e += blockDim.x) Store(hstart, e, Hf[e]);
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = tid; i < len; i += blockDim.x)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
+    __syncthreads();
+
+    // --- V1: v_new = u - W @ Hᵀ  ([len,Dk]@[Dk,BV] -> [len,BV]) ---
+    TD* Hb = reinterpret_cast<TD*>(pool);                        // [kNB,Dk] TD slice of Hf
+    float* sTile = reinterpret_cast<float*>(Hb + kNB * dk);      // [kChunk,kNB] f32
+    for (int64_t nb = 0; nb < bv; nb += kNB) {                   // nb LOCAL to the BV slice
+      if (vec)
+        for (int64_t g = tid; g < (kNB * dk) / V::N; g += blockDim.x) {
+          float f[V::N];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) f[j] = Hf[nb * dk + g * V::N + j];
+          V::Sf(Hb + g * V::N, f);
+        }
+      else
+        for (int64_t e = tid; e < kNB * dk; e += blockDim.x)
+          Store(Hb, e, Hf[(nb + e / dk) * dk + e % dk]);
+      __syncthreads();
+      const int ntiles = (kChunk / kWM) * (kNB / kWM);
+      for (int t = warp; t < ntiles; t += nwarps) {
+        const int rt = t % (kChunk / kWM), ct = t / (kChunk / kWM);
+        const int i0 = rt * kWM, vi0 = static_cast<int>(nb) + ct * kWM;  // vi0 LOCAL to slice
+        typename Cfg::Acc acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (int64_t kk = 0; kk < dk; kk += WK) {
+          typename Cfg::Arow a;
+          typename Cfg::Bcol b;
+          Cfg::load(a, w + (tok0 + i0) * hv_n * dk + hv * dk + kk, hv_n * dk);
+          Cfg::load(b, Hb + (vi0 - nb) * dk + kk, dk);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sTile + i0 * kNB + ct * kWM, acc, kNB, wmma::mem_row_major);
+      }
+      __syncthreads();
+      if (vec)
+        for (int64_t g = tid; g < (kChunk * kNB) / V::N; g += blockDim.x) {
+          const int64_t base = g * V::N;
+          const int64_t i = base / kNB, cvi = base % kNB;
+          if (i < len) {
+            float uf[V::N];
+            V::Uf(u + (tok0 + i) * hv_n * dv + hv * dv + vbase + nb + cvi, uf);
+#pragma unroll
+            for (int j = 0; j < V::N; ++j) uf[j] -= sTile[i * kNB + cvi + j];
+            V::Sf(v_new + (tok0 + i) * hv_n * dv + hv * dv + vbase + nb + cvi, uf);
+          }
+        }
+      else
+        for (int64_t e = tid; e < kChunk * kNB; e += blockDim.x) {
+          const int64_t i = e / kNB, cvi = e % kNB;
+          if (i < len) {
+            const float uv = Load(u, (tok0 + i) * hv_n * dv + hv * dv + vbase + nb + cvi);
+            Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + vbase + nb + cvi,
+                  uv - sTile[i * kNB + cvi]);
+          }
+        }
+      __syncthreads();
+    }
+
+    // --- V2: H = H*exp(G_last) + V_newᵀ @ (K⊙decay)  ([BV,len]@[len,Dk]) ---
+    TD* Kd = reinterpret_cast<TD*>(pool);                       // [kChunk,Dk] TD, decay-scaled
+    if (vec)
+      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+        const int64_t base = g * V::N;
+        const int64_t i = base / dk, ki = base % dk;
+        if (i < len) {
+          float kf[V::N];
+          V::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
+          const float d = decay[i];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) kf[j] *= d;
+          V::Sf(Kd + base, kf);
+        } else {
+          V::Sf0(Kd + base);
+        }
+      }
+    else
+      for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+        const int64_t i = e / dk, ki = e % dk;
+        Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+      }
+    __syncthreads();
+    const int nvt = static_cast<int>(bv) / kWM;
+    const int ntiles2 = nvt * (dk / kWM);
+    for (int t = warp; t < ntiles2; t += nwarps) {
+      const int vt = t % nvt, kt = t / nvt;
+      const int lvi0 = vt * kWM, ki0 = kt * kWM;         // lvi0 LOCAL to Hf slice
+      const int64_t gvi0 = vbase + lvi0;                 // GLOBAL V-row for v_new
+      typename Cfg::Acc acc;
+      wmma::load_matrix_sync(acc, Hf + lvi0 * dk + ki0, dk, wmma::mem_row_major);
+      for (int x = 0; x < acc.num_elements; ++x) acc.x[x] *= eglast;
+      for (int ii = 0; ii < kChunk; ii += WK) {
+        typename Cfg::Acol a;  // A[vi,i] = V_new[i,vi], col-major from global v_new
+        typename Cfg::Brow b;  // B[i,ki] = Kd[i,ki]
+        Cfg::load(a, v_new + (tok0 + ii) * hv_n * dv + hv * dv + gvi0, hv_n * dv);
+        Cfg::load(b, Kd + ii * dk + ki0, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(Hf + lvi0 * dk + ki0, acc, dk, wmma::mem_row_major);
+    }
+    __syncthreads();
+  }
+  if (vec)
+    for (int64_t g = tid; g < sdv / 4; g += blockDim.x)
+      V128<float>::Cpy(s_head + g * 4, Hf + g * 4);
+  else
+    for (int64_t e = tid; e < sdv; e += blockDim.x) s_head[e] = Hf[e];
+}
+
+// ChunkO, V-split. One block per (chunk, v-head, i_v). Computes V-cols
+// [vbase, vbase+bv). cross (Q@Hstartᵀ) and A@V_new act on the [BV] slice; qk=Q@Kᵀ
+// and A are V-independent and recomputed per V-block (as FLA recomputes b_A inside
+// each i_v program, chunk_o.py:90-113). Structurally identical to
+// GdnChunkOWmmaKernel with dv→bv in the outc slice / V-loop bounds and the
+// hstart/v_new/out offsets shifted by vbase.
+template <typename TD, typename Tout>
+__global__ void GdnChunkOWmmaVSplitKernel(Tout* out, const TD* q, const TD* k, const TD* v_new,
+                                          const TD* hstate, const float* gcum,
+                                          const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
+                                          int64_t dk, int64_t hv_n, int64_t dv, int64_t bv,
+                                          float scale, bool vec) {
+  using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
+  constexpr int WK = Cfg::WK;
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t vbase = static_cast<int64_t>(blockIdx.z) * bv;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int64_t sd = dv * dk;
+  const TD* hstart = hstate + (gc * hv_n + hv) * sd + vbase * dk;  // [BV,Dk] slice
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  const size_t r2 =
+      static_cast<size_t>(kChunk * dk) * sizeof(TD) > static_cast<size_t>(kChunk * bv) * 4
+          ? static_cast<size_t>(kChunk * dk) * sizeof(TD)
+          : static_cast<size_t>(kChunk * bv) * 4;
+  TD* Qs = reinterpret_cast<TD*>(smem_raw);                              // [kChunk,Dk]
+  char* p2 = smem_raw + static_cast<size_t>(kChunk * dk) * sizeof(TD);   // Ks | outc
+  TD* Ks = reinterpret_cast<TD*>(p2);
+  float* outc = reinterpret_cast<float*>(p2);                            // [kChunk,BV]
+  float* qks = reinterpret_cast<float*>(p2 + r2);                        // [kChunk,kChunk]
+  TD* As = reinterpret_cast<TD*>(qks + kChunk * kChunk);                 // [kChunk,kChunk]
+  __shared__ float gs[kChunk], eg[kChunk];
+
+  if (vec)
+    for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+      const int64_t base = g * V::N;
+      const int64_t i = base / dk, d = base % dk;
+      if (i < len) {
+        V::Cpy(Qs + base, q + (tok0 + i) * hk_n * dk + hk * dk + d);
+        V::Cpy(Ks + base, k + (tok0 + i) * hk_n * dk + hk * dk + d);
+      } else {
+        V::Sf0(Qs + base);
+        V::Sf0(Ks + base);
+      }
+    }
+  else
+    for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+      const int64_t i = e / dk, d = e % dk;
+      const bool in = i < len;
+      Store(Qs, e, in ? Load(q, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+      Store(Ks, e, in ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+    }
+  for (int64_t i = tid; i < len; i += blockDim.x) {
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
+  }
+  __syncthreads();
+
+  // qk = Q @ Kᵀ  [kChunk,kChunk]  (V-independent; recomputed per V-block, as FLA)
+  const int nqk = (kChunk / kWM) * (kChunk / kWM);
+  for (int t = warp; t < nqk; t += nwarps) {
+    const int it = t % (kChunk / kWM), jt = t / (kChunk / kWM);
+    const int i0 = it * kWM, j0 = jt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t kk = 0; kk < dk; kk += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Qs + i0 * dk + kk, dk);
+      Cfg::load(b, Ks + j0 * dk + kk, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(qks + i0 * kChunk + j0, acc, kChunk, wmma::mem_row_major);
+  }
+  __syncthreads();
+  // A[i,j] = exp(G_i - G_j) * qk[i,j] for j<=i (causal), else 0.
+  for (int64_t e = tid; e < kChunk * kChunk; e += blockDim.x) {
+    const int64_t i = e / kChunk, j = e % kChunk;
+    float a = 0.0f;
+    if (i < len && j < len && j <= i) a = expf(gs[i] - gs[j]) * qks[e];
+    Store(As, e, a);
+  }
+  __syncthreads();
+
+  // cross = Q @ Hstartᵀ  [kChunk,BV] -> outc (aliases Ks, now free)
+  const int nvt = static_cast<int>(bv) / kWM;
+  const int ncr = (kChunk / kWM) * nvt;
+  for (int t = warp; t < ncr; t += nwarps) {
+    const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+    const int i0 = it * kWM, lvi0 = vt * kWM;            // lvi0 LOCAL to the BV slice
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t kk = 0; kk < dk; kk += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Qs + i0 * dk + kk, dk);
+      Cfg::load(b, hstart + lvi0 * dk + kk, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(outc + i0 * bv + lvi0, acc, static_cast<int>(bv), wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int64_t e = tid; e < kChunk * bv; e += blockDim.x) {
+    const int64_t i = e / bv;
+    outc[e] *= i < len ? eg[i] : 0.0f;
+  }
+  __syncthreads();
+  // outc = eg*cross + A @ V_new ; o = scale * outc
+  for (int t = warp; t < ncr; t += nwarps) {
+    const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+    const int i0 = it * kWM, lvi0 = vt * kWM;
+    const int64_t gvi0 = vbase + lvi0;                   // GLOBAL V-col for v_new
+    typename Cfg::Acc acc;
+    wmma::load_matrix_sync(acc, outc + i0 * bv + lvi0, static_cast<int>(bv), wmma::mem_row_major);
+    for (int jj = 0; jj < kChunk; jj += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Brow b;
+      Cfg::load(a, As + i0 * kChunk + jj, kChunk);
+      Cfg::load(b, v_new + (tok0 + jj) * hv_n * dv + hv * dv + gvi0, hv_n * dv);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(outc + i0 * bv + lvi0, acc, static_cast<int>(bv), wmma::mem_row_major);
+  }
+  __syncthreads();
+  for (int64_t e = tid; e < kChunk * bv; e += blockDim.x) {
+    const int64_t i = e / bv, lvi = e % bv;
+    if (i < len) Store(out, (tok0 + i) * hv_n * dv + hv * dv + vbase + lvi, scale * outc[e]);
+  }
+}
+
 // Step B (WMMA) — chunk_scaled_dot_kkt Gram on tensor cores. The scalar
 // GdnChunkWUKernel spends its bulk in the O(BT²·Dk) Gram K@Kᵀ (prefill's last
 // scalar-float GDN chunk kernel, ~22% GPU). This replaces that cooperative
@@ -1828,6 +2158,15 @@ bool GdnSlackMemsetEnabled() {
   return on;
 }
 
+// V-split toggle (VT_GDN_CHUNK_VSPLIT=1 enables; default OFF → byte-identical
+// full-state kernels). Read each call (like ChunkedPrefillEnabled, NOT the cached
+// GdnSlackMemsetEnabled) so the unit test can drive the full-state and V-split
+// paths in one process; prefill is coarse-grained so getenv cost is negligible.
+bool GdnChunkVSplitEnabled() {
+  const char* e = std::getenv("VT_GDN_CHUNK_VSPLIT");
+  return e != nullptr && e[0] == '1';
+}
+
 // Zeros ONLY v_new's per-sequence last-partial-chunk slack rows, exactly the rows
 // the WMMA tiles over-read past each sequence's real tokens:
 //   [qsl[n]+seqlen_n, qsl[n]+ceil(seqlen_n/kChunk)*kChunk) x [0,dv)
@@ -2045,28 +2384,72 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
             "gdn chunked v_new zero");
     }
     const size_t sz = sizeof(TSc);
-    const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
-    const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
-    const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-    opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
-           "gdn chunked delta_h(wmma) shared opt-in");
-    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
-        state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv, dvec);
-    Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+    // V-split (VT_GDN_CHUNK_VSPLIT, default OFF): grid.z=NV blocks, each owning a
+    // Dv-slice of BV=Dv/NV rows (DeltaH) / cols (ChunkO) with a [BV,Dk] state
+    // slice instead of the full [Dv,Dk] — lifts DeltaH from ~80 KiB (1 block/SM)
+    // to ~48 KiB (2 blocks/SM) on the bf16 hot path. Requires BV a multiple of
+    // kNB (DeltaH V1 output-column tiling); else the full-state kernels run. OFF
+    // dispatches the EXACT full-state kernels below — byte-identical.
+    // NOTE: at the default occ_delta/occ_o (768/512) the V-split kernel is
+    // register-limited to 1 block/SM (valid, same occupancy as full-state); to
+    // realize 2 resident blocks/SM sweep VT_GDN_OCC_BLOCK down (≈448/384) on the
+    // gate — 2 blocks need ≤~468 threads at DeltaH's ~70 regs/thread.
+    const int nv = kVSplitNV;
+    const int64_t bv = dv / nv;
+    const bool vsplit = GdnChunkVSplitEnabled() && (dv % nv == 0) && (bv % kNB == 0);
+    if (vsplit) {
+      const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
+      const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
+      const size_t delta_bytes =
+          static_cast<size_t>(bv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc>), delta_bytes,
+             "gdn chunked delta_h(wmma,vsplit) shared opt-in");
+      const dim3 grid_seq_vs(static_cast<unsigned>(n_seq), static_cast<unsigned>(hv_n),
+                             static_cast<unsigned>(nv));
+      GdnChunkDeltaHWmmaVSplitKernel<TSc><<<grid_seq_vs, occ_delta, delta_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv, bv, dvec);
+      Check(cudaGetLastError(), "gdn chunked delta_h(wmma,vsplit) launch");
 
-    const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
-                          ? static_cast<size_t>(kChunk * dk) * sz
-                          : static_cast<size_t>(kChunk * dv) * 4;
-    const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
-                                static_cast<size_t>(kChunk * kChunk) * 4 +
-                                static_cast<size_t>(kChunk * kChunk) * sz;
-    opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
-           "gdn chunked o(wmma) shared opt-in");
-    GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
-        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
-        hk_n, dk, hv_n, dv, args.scale, dvec);
-    Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
+      const size_t r2 =
+          static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * bv) * 4
+              ? static_cast<size_t>(kChunk * dk) * sz
+              : static_cast<size_t>(kChunk * bv) * 4;
+      const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
+                                  static_cast<size_t>(kChunk * kChunk) * 4 +
+                                  static_cast<size_t>(kChunk * kChunk) * sz;
+      opt_in(reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout>), chunko_bytes,
+             "gdn chunked o(wmma,vsplit) shared opt-in");
+      const dim3 grid_chunk_vs(static_cast<unsigned>(nt_tot), static_cast<unsigned>(hv_n),
+                               static_cast<unsigned>(nv));
+      GdnChunkOWmmaVSplitKernel<TSc, Tout><<<grid_chunk_vs, occ_o, chunko_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+          hk_n, dk, hv_n, dv, bv, args.scale, dvec);
+      Check(cudaGetLastError(), "gdn chunked o(wmma,vsplit) launch");
+    } else {
+      const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
+      const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
+      const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
+             "gdn chunked delta_h(wmma) shared opt-in");
+      GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv, dvec);
+      Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+
+      const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
+                            ? static_cast<size_t>(kChunk * dk) * sz
+                            : static_cast<size_t>(kChunk * dv) * 4;
+      const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
+                                  static_cast<size_t>(kChunk * kChunk) * 4 +
+                                  static_cast<size_t>(kChunk * kChunk) * sz;
+      opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
+             "gdn chunked o(wmma) shared opt-in");
+      GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+          hk_n, dk, hv_n, dv, args.scale, dvec);
+      Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
+    }
   } else if constexpr (std::is_same<Tin, float>::value) {
     // CUDA-core fallback — only reached for f32 corner dims (bf16 non-WMMA dims
     // are routed to the sequential scan upstream).

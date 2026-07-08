@@ -1255,3 +1255,30 @@ TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)
   (void)f32;
   (void)bf16;
 }
+
+// V-split chunked prefill (VT_GDN_CHUNK_VSPLIT=1) vs the sequential scan, same
+// inputs, same binary. The V-split kernels (GdnChunk{DeltaH,O}WmmaVSplitKernel)
+// grid grid.z=NV blocks each owning a Dv-slice of BV=Dv/NV rows/cols; the split
+// is along the OUTPUT dim (each V-row/col is computed independently) so it must
+// reproduce the full-state chunked path — and thus the sequential scan — within
+// GDN tolerance. Same shape ladder as the full-state anchor above.
+TEST_CASE("CUDA gdn prefill chunked V-split matches sequential (VT_GDN_CHUNK_VSPLIT)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo f32 = {DType::kF32, DType::kF32, 5e-3f, 5e-3f};
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_CHUNK_VSPLIT", "1", 1);
+  RunGdnChunkedVsSequential({0, 40}, 1, 1, 128, 128, f32, 6900, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 64}, 1, 1, 128, 128, f32, 6910, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 128}, 1, 1, 128, 128, f32, 6920, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, f32, 7000, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, bf16, 7010, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 2, 4, 128, 128, f32, 7020, 5e-3f, 5e-3f);
+  RunGdnChunkedVsSequential({0, 130}, 4, 8, 128, 128, f32, 7030, 5e-3f, 5e-3f);
+  // Restore default for any later cases.
+  setenv("VT_GDN_CHUNK_VSPLIT", "0", 1);
+  (void)f32;
+  (void)bf16;
+}

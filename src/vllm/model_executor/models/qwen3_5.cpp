@@ -602,12 +602,13 @@ bool TrueW4A4Enabled() {
 
 // FUSE silu-mul with the down_proj activation quant (mirror vllm
 // ActivationQuantFusionPass / silu_and_mul_nvfp4_quant) — one kernel, no bf16
-// intermediate. Default OFF until measured; VT_FUSE_SILU_QUANT=1 enables. Only the
-// 27B true-W4A4 dense MLP is affected (the down_proj quantizes its activation).
+// intermediate. Default ON (opt-out VT_FUSE_SILU_QUANT=0): MEASURED +2.4% prefill-
+// heavy, token-exact (the earlier "-2%" was the stale software quant ladder, not the
+// fusion). Only the 27B true-W4A4 dense MLP is affected (down_proj quantizes its act).
 bool FuseSiluQuantEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_SILU_QUANT");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return on;
 }

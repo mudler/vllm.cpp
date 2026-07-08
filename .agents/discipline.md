@@ -30,6 +30,21 @@
     means a reviewer can open that source and see we mirrored it. (User,
     2026-07-07: *"every implementation you do should be grounded by upstream
     source code, you should not re-implement things from scratch."*)
+  - **Kernel-DSL source (Triton / CuTe-DSL / Inductor-generated) is a 1:1 PORTING
+    REFERENCE, NEVER a compile-target.** READ the Triton/CuTe-DSL kernel — it is
+    the exact fusion spec (the WHAT *and* the HOW at algorithm level) — and hand-
+    transcribe it into our **portable** C++/`vt::` (with a CPU reference), citing
+    the source `file:line`. Do **NOT** AOT-compile Triton/CuTe-DSL to PTX/cubin or
+    otherwise link vendor-*generated* kernels: that re-imports CUDA lock-in and
+    breaks the multi-backend contract (the `vt::` op interface + CPU ref + portable
+    structure that Vulkan / Metal / ROCm / XPU port FROM). CuTe-DSL is Python sugar
+    over CuTe (the C++ CUTLASS library) → its kernels port to C++ CUTLASS/EVT
+    near-mechanically; Triton (tile IR: block-pointers, `boundary_check`) ports to
+    C++/CUDA with understanding (done: the GDN chunk). Reuse the fusion **PATTERN**
+    (the finite chain set vLLM/Inductor fuse — see the parity-lever prefill scan),
+    realized portably; never the vendor's generated binary. (User, 2026-07-08:
+    *"get from triton/cute-dsl the base to build ours ported 1:1"*; *"triton/cute-dsl
+    would make it less portable?"*)
 - **Every ported file carries a header comment**: upstream path + upstream
   commit hash it was ported from. When re-syncing with upstream, diff that
   file against its recorded commit.

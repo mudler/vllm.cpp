@@ -103,6 +103,10 @@ if(VLLM_CPP_CUDA)
 endif()
 
 include(cmake/CompilerWarnings.cmake)
+# Triton AOT toolchain (build-time kernel->cubin, CUDA-only). Defines the gated
+# option VLLM_CPP_TRITON (default OFF) + add_triton_kernel(); with the option OFF
+# this include is inert (no Python, no generated sources). Wired below under CUDA.
+include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
@@ -251,6 +255,36 @@ if(VLLM_CPP_CUDA)
     set_source_files_properties(${_MARLIN_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
+  endif()
+
+  # ── Triton AOT fast-path (VLLM_CPP_TRITON, CUDA-only, default OFF) ───────────
+  # Build-time: each add_triton_kernel() compiles a @triton.jit kernel to a cubin
+  # embedded in a generated C launcher and links a stable dispatcher, both linked
+  # into libvllm. Runtime dispatch (behind VT_TRITON_RMSNORM) is in cuda_ops.cu;
+  # the hand kernel stays the default fallback. OFF => none of this runs and the
+  # build is byte-identical. The proof kernel is an A/B-able RmsNorm (gemma, f32).
+  if(VLLM_CPP_TRITON)
+    # The generated launchers are plain C (driver API); enable C for libvllm.
+    enable_language(C)
+    add_triton_kernel(VT_TRITON_RMSNORM_SRCS
+      "${CMAKE_SOURCE_DIR}/triton_kernels/rmsnorm.py"   # KERNEL_PY
+      rmsnorm_fwd                                        # KERNEL_NAME (@triton.jit fn)
+      rmsnorm_fwd                                        # OUT_BASE (stable symbol prefix)
+      # SIGNATURE: out*, x*, w* (fp32, 16B-aligned), n_rows i32, n_cols i32,
+      # eps fp32, BLOCK_SIZE constexpr=4096 (row width must be <= 4096).
+      "*fp32:16, *fp32:16, *fp32:16, i32, i32, fp32, 4096"
+      "n_rows,1,1"                                       # GRID (one program per row)
+      8                                                  # NUM_WARPS
+      3)                                                 # NUM_STAGES
+    target_sources(vllm PRIVATE ${VT_TRITON_RMSNORM_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_TRITON_RMSNORM_SRCS_INCLUDE_DIR})
+    # PUBLIC so the compile guard + the generated header reach any TU of vllm and
+    # its consumers (the A/B test checks #ifdef VLLM_CPP_TRITON).
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON=1)
+    # The generated launchers call the CUDA driver API (cuModuleLoadData /
+    # cuLaunchKernel), which lives in libcuda — the FindCUDAToolkit driver target
+    # is CUDA::cuda_driver (NOT cudart).
+    target_link_libraries(vllm PUBLIC CUDA::cuda_driver)
   endif()
 endif()
 

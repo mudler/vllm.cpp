@@ -6,10 +6,22 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 #include "vt/ops.h"
+
+#ifdef VLLM_CPP_TRITON
+// AOT-generated stable dispatcher (triton.tools.link output; see
+// cmake/TritonAOT.cmake). Plain C symbols — wrap in extern "C" so this C++ TU
+// links against them unmangled. rmsnorm_fwd_default(stream, out, x, w, n_rows,
+// n_cols, eps) launches the EMBEDDED cubin via the CUDA driver API (no Triton /
+// Python at runtime). The .h #include <cuda.h> for CUresult/CUstream/CUdeviceptr.
+extern "C" {
+#include "rmsnorm_fwd.h"
+}
+#endif
 
 namespace vt::cuda {
 namespace {
@@ -121,9 +133,45 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   Check(cudaGetLastError(), "rmsnorm launch");
 }
 
+#ifdef VLLM_CPP_TRITON
+// VT_TRITON_RMSNORM=1 routes CUDA RmsNorm through the AOT Triton cubin, but ONLY
+// for the exact configuration the proof kernel implements: f32 x/out/weight, the
+// gemma (1 + w) variant, and NO fused residual. Every other call falls through to
+// the hand kernel below, so the toggle is a safe drop-in. Read fresh each call so
+// a test can flip the path within one process (mirrors FusedTier()).
+bool TritonRmsNormEnabled() {
+  const char* e = std::getenv("VT_TRITON_RMSNORM");
+  return e != nullptr && e[0] == '1';
+}
+
+// Returns true iff it handled the op (launched the Triton kernel or there was
+// nothing to do); false means "not applicable, use the hand path".
+bool TryTritonRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                      const RmsNormArgs& args, const Tensor* residual) {
+  if (!TritonRmsNormEnabled()) return false;
+  if (residual != nullptr || !args.gemma) return false;
+  if (x.dtype != DType::kF32 || out.dtype != DType::kF32 || w.dtype != DType::kF32) return false;
+  const int64_t t = x.shape[0], h = x.shape[1];
+  if (t == 0 || h == 0) return true;  // empty: nothing to launch, treat as handled
+  // Device pointers (>=256B aligned by cudaMalloc) satisfy the launcher's *fp32:16
+  // alignment specialization. The stable symbol is resolved by triton.tools.link,
+  // so no hash is hardcoded here.
+  const CUresult r = rmsnorm_fwd_default(
+      s, reinterpret_cast<CUdeviceptr>(out.Ptr<float>()),
+      reinterpret_cast<CUdeviceptr>(x.Ptr<float>()),
+      reinterpret_cast<CUdeviceptr>(w.Ptr<float>()), static_cast<int32_t>(t),
+      static_cast<int32_t>(h), args.eps);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda rmsnorm(triton): launcher returned non-success");
+  return true;
+}
+#endif  // VLLM_CPP_TRITON
+
 void RmsNormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
   VT_CHECK(w.dtype == x.dtype, "cuda rmsnorm: weight dtype must match x");
+#ifdef VLLM_CPP_TRITON
+  if (TryTritonRmsNorm(AsStream(q), out, x, w, args, residual)) return;
+#endif
   switch (x.dtype) {
     case DType::kF32: LaunchRmsNorm<float>(AsStream(q), out, x, w, args, residual); break;
     case DType::kBF16:

@@ -200,6 +200,17 @@ class InputBatch {
   std::vector<std::optional<std::string>> req_ids;
   std::unordered_map<std::string, int> req_id_to_index;
 
+  // Async-decode (VT_ASYNC_DECODE) prev-step sampled-token mapping. Mirror of
+  // vLLM InputBatch.prev_req_id_to_index (gpu_input_batch.py): the req_id -> slot
+  // index of the batch AS IT WAS when the previous step's tokens were sampled into
+  // the runner's device prev_sampled_token_ids buffer. The runner uses it to build
+  // the next step's input_ids ON-GPU (dst[cur_slot] = prev_sampled[prev_slot]).
+  // `prev_sampled_valid` is cleared on ANY structural change to the batch
+  // (remove_request / condense) so a reshaped batch never reads a stale mapping —
+  // the runner then falls back to the host token path for that step.
+  std::unordered_map<std::string, int> prev_req_id_to_index;
+  bool prev_sampled_valid = false;
+
   // Per-slot token buffer, flat [max_num_reqs, max_model_len] row-major.
   std::vector<int32_t> token_ids_cpu;
   // Per-slot scalar arrays [max_num_reqs].

@@ -633,8 +633,28 @@ void ApplyAllowedTokenIdsCuda(Queue& q, Tensor& logits, const Tensor& mask) {
   Check(cudaGetLastError(), "apply_allowed_token_ids launch");
 }
 
+// GatherTokens (async-decode next-input build; VT_ASYNC_DECODE). Mirror of vLLM's
+// _prepare_input_ids ON-GPU token scatter (input_ids.gpu.copy_(prev_sampled)):
+// dst[i] = (int32) src[index[i]]. One grid-stride pass; keeps the sampled token
+// ON DEVICE so the blocking token D2H leaves the decode critical path.
+__global__ void GatherTokensKernel(int32_t* dst, const int64_t* src, const int32_t* index,
+                                   int64_t n) {
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    dst[i] = static_cast<int32_t>(src[index[i]]);
+}
+
+void GatherTokensCuda(Queue& q, Tensor& dst, const Tensor& src, const Tensor& index) {
+  const int64_t n = dst.shape[0];
+  if (n == 0) return;
+  GatherTokensKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+      dst.Ptr<int32_t>(), src.Ptr<int64_t>(), index.Ptr<int32_t>(), n);
+  Check(cudaGetLastError(), "gather_tokens launch");
+}
+
 struct Registrar {
   Registrar() {
+    RegisterOp(OpId::kGatherTokens, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<GatherTokensFn>(&GatherTokensCuda)));
     RegisterOp(OpId::kApplyTemperature, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<ApplyTemperatureFn>(&ApplyTemperatureCuda)));
     RegisterOp(OpId::kGreedyArgmax, DeviceType::kCUDA,

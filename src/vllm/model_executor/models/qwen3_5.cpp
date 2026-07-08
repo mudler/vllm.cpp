@@ -2314,11 +2314,21 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
 // The graph driver runs this per step into its PERSISTENT hidden buffer, then
 // captures/replays ForwardLayers over that fixed hidden address.
 static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
-                      const Qwen3_5MoeWeights& weights, const HfConfig& config) {
+                      const Qwen3_5MoeWeights& weights, const HfConfig& config,
+                      const int32_t* device_token_ids = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  // Async-decode (VT_ASYNC_DECODE): read the input ids from the DEVICE buffer the
+  // runner built on-GPU (vt::GatherTokens), skipping the per-step host->device
+  // token upload. Byte-identical to the host path when device_token_ids == null.
+  if (device_token_ids != nullptr) {
+    Tensor dids = MakeTensor(const_cast<int32_t*>(device_token_ids), DType::kI32,
+                             d.q.device, {T});
+    vt::Embedding(d.q, hidden.t(), dtab, dids);
+    return;
+  }
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
@@ -2410,11 +2420,12 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const std::vector<PagedKvCache>& attn_kv,
                         const std::vector<GdnStateCache>& gdn_state,
                         const Qwen3_5MoeWeights& weights, const HfConfig& config,
-                        const std::vector<int32_t>& logits_indices = {}) {
+                        const std::vector<int32_t>& logits_indices = {},
+                        const int32_t* device_token_ids = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
-  EmbedInto(d, hidden, token_ids, weights, config);
+  EmbedInto(d, hidden, token_ids, weights, config, device_token_ids);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices);
 }
@@ -2533,12 +2544,13 @@ ForwardLogits Qwen3_5Model::ForwardDevice(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
     const HfConfig& config, vt::Queue& queue,
-    const std::vector<int32_t>& logits_indices) {
+    const std::vector<int32_t>& logits_indices, const int32_t* device_token_ids) {
   CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
                     config);
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                             gdn_state, weights, config, logits_indices);
+                             gdn_state, weights, config, logits_indices,
+                             device_token_ids);
   // Keep the [n_out, vocab] logits ON DEVICE (no Download) — the sampler reads
   // them directly.
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
@@ -2667,11 +2679,20 @@ static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
 static void DenseEmbedInto(Dev d, DBuf& hidden,
                            const std::vector<int32_t>& token_ids,
                            const Qwen3_5DenseWeights& weights,
-                           const HfConfig& config) {
+                           const HfConfig& config,
+                           const int32_t* device_token_ids = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
+  // Async-decode (VT_ASYNC_DECODE): read the input ids from the on-GPU-built
+  // DEVICE buffer instead of uploading host token_ids. Null => host path (identical).
+  if (device_token_ids != nullptr) {
+    Tensor dids = MakeTensor(const_cast<int32_t*>(device_token_ids), DType::kI32,
+                             d.q.device, {T});
+    vt::Embedding(d.q, hidden.t(), dtab, dids);
+    return;
+  }
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
@@ -2760,13 +2781,14 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<GdnStateCache>& gdn_state,
                              const Qwen3_5DenseWeights& weights,
                              const HfConfig& config,
-                             const std::vector<int32_t>& logits_indices) {
+                             const std::vector<int32_t>& logits_indices,
+                             const int32_t* device_token_ids = nullptr) {
   CheckDensePagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
                          weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
-  DenseEmbedInto(d, hidden, token_ids, weights, config);
+  DenseEmbedInto(d, hidden, token_ids, weights, config, device_token_ids);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices);
 }
@@ -2794,11 +2816,12 @@ ForwardLogits Qwen3_5DenseModel::ForwardDevice(
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const int32_t* device_token_ids) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                   attn_kv, gdn_state, weights, config,
-                                  logits_indices);
+                                  logits_indices, device_token_ids);
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 

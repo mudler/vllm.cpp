@@ -65,6 +65,23 @@ class Sampler {
   SamplerOutput forward(vt::Queue& q, vt::Tensor& logits,
                         const SamplingMetadata& sampling_metadata) const;
 
+  // Async-decode device greedy fast path (VT_ASYNC_DECODE). When this batch is a
+  // pure all-greedy step with NO active logits processor (no penalties / bad_words
+  // / allowed_token_ids / min_tokens / logit_bias) and NO logprobs request — the
+  // exact conditions under which forward()'s all-greedy result is a bare
+  // argmax(logits) — run vt::GreedyArgmax straight into the caller-provided DEVICE
+  // int64 buffer `out_device_ids` [num_reqs] and return true, WITHOUT the blocking
+  // full-token download (DeviceBuffer::download's Synchronize) forward() performs.
+  // The token ids stay ON DEVICE so the runner can build the next step's input_ids
+  // on-GPU and read them back on a side stream (mirroring vLLM's
+  // prev_sampled_token_ids). The GreedyArgmax kernel + its lowest-index tie-break
+  // are UNCHANGED — only the RESIDENCE of the result differs, so the tokens are
+  // BIT-IDENTICAL to forward()'s greedy path. Returns false (does nothing) when
+  // any of the above conditions fails; the caller must then fall back to forward().
+  bool sample_greedy_device(vt::Queue& q, vt::Tensor& logits,
+                            vt::Tensor& out_device_ids,
+                            const SamplingMetadata& sampling_metadata) const;
+
  private:
   // Sampler.sample. Runs steps 7a-7f; returns the [num_reqs] host token ids.
   std::vector<int64_t> sample(vt::Queue& q, vt::Tensor& logits,

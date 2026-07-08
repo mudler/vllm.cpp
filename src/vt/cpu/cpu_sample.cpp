@@ -322,8 +322,22 @@ void ApplyAllowedTokenIdsKernel(Queue&, Tensor& logits, const Tensor& mask) {
     if (mk[idx]) lp[idx] = kNegInf;
 }
 
+// GatherTokens (async-decode next-input build; VT_ASYNC_DECODE). Mirror of vLLM's
+// _prepare_input_ids ON-GPU token scatter: dst[i] = (int32) src[index[i]]. On CPU
+// (unified + synchronous) this is a plain gather; it is exercised so the async
+// path is correctness-checkable off-GPU.
+void GatherTokensKernel(Queue&, Tensor& dst, const Tensor& src, const Tensor& index) {
+  const int64_t n = dst.shape[0];
+  int32_t* d = dst.Ptr<int32_t>();
+  const int64_t* s = src.Ptr<int64_t>();
+  const int32_t* idx = index.Ptr<int32_t>();
+  for (int64_t i = 0; i < n; ++i) d[i] = static_cast<int32_t>(s[idx[i]]);
+}
+
 struct Registrar {
   Registrar() {
+    RegisterOp(OpId::kGatherTokens, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GatherTokensFn>(&GatherTokensKernel)));
     RegisterOp(OpId::kApplyTemperature, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ApplyTemperatureFn>(&ApplyTemperatureKernel)));
     RegisterOp(OpId::kGreedyArgmax, DeviceType::kCPU,

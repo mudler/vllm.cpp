@@ -137,6 +137,12 @@ class Qwen3_5Model {
   // DEVICE buffer (ForwardLogits::device_*) WITHOUT the full-logits D2H — the
   // caller feeds it straight into the sampler. `rows == num_reqs` on the
   // gather-before-lm_head path (prefill/mixed) or pure-decode.
+  //
+  // `device_token_ids` (async-decode, VT_ASYNC_DECODE): when non-null it is a
+  // DEVICE i32 [T] buffer holding the input token ids (built on-GPU from the prev
+  // step's retained sampled tokens); the embedding reads it instead of the host
+  // `token_ids` (which is then used only for its length T). Default null keeps the
+  // host-token path byte-for-byte.
   static ForwardLogits ForwardDevice(const std::vector<int32_t>& token_ids,
                                      const std::vector<int32_t>& positions,
                                      const v1::CommonAttentionMetadata& attn_meta,
@@ -145,7 +151,8 @@ class Qwen3_5Model {
                                      const std::vector<GdnStateCache>& gdn_state,
                                      const Qwen3_5MoeWeights& weights,
                                      const HfConfig& config, vt::Queue& queue,
-                                     const std::vector<int32_t>& logits_indices = {});
+                                     const std::vector<int32_t>& logits_indices = {},
+                                     const int32_t* device_token_ids = nullptr);
 
   // Dense single-sequence reference forward (M0.9). Runs the whole model for a
   // single non-paged sequence and returns logits [T, vocab] f32 (T =

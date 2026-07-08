@@ -110,6 +110,32 @@ class CudaBackend final : public Backend {
     if (graph != nullptr) cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph));
   }
 
+  // --- Cross-stream events (async-decode side-stream readback) -----------------
+  // cudaEvent with timing disabled (the cheapest sync-only event). The copy
+  // stream waits on the main stream's sample-done event before the D2H, and the
+  // host blocks on the copy-done event only when the tokens are consumed.
+  void* CreateEvent() override {
+    cudaEvent_t ev = nullptr;
+    Check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+    return reinterpret_cast<void*>(ev);
+  }
+  void DestroyEvent(void* event) override {
+    if (event != nullptr) cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event));
+  }
+  void RecordEvent(Queue& q, void* event) override {
+    if (event != nullptr)
+      Check(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), AsStream(q)), "cudaEventRecord");
+  }
+  void StreamWaitEvent(Queue& q, void* event) override {
+    if (event != nullptr)
+      Check(cudaStreamWaitEvent(AsStream(q), reinterpret_cast<cudaEvent_t>(event), 0),
+            "cudaStreamWaitEvent");
+  }
+  void SyncEvent(void* event) override {
+    if (event != nullptr)
+      Check(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)), "cudaEventSynchronize");
+  }
+
  private:
   int device_ = 0;
   bool unified_memory_ = false;

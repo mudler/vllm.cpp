@@ -212,6 +212,35 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
   return sampled;
 }
 
+bool Sampler::sample_greedy_device(vt::Queue& q, vt::Tensor& logits,
+                                   vt::Tensor& out_device_ids,
+                                   const SamplingMetadata& sm) const {
+  // Only the pure all-greedy, no-logits-processor, no-logprobs case matches a bare
+  // argmax(logits) — the value forward()'s all-greedy branch returns (it takes the
+  // greedy snapshot BEFORE temperature and returns immediately). Any active
+  // processor would mutate the logits inside forward() first, so the argmax could
+  // differ; fall back (return false). min_p is argmax-invariant (the max-prob token
+  // always survives), so it does not gate this path.
+  if (!sm.all_greedy) return false;
+  if (sm.max_num_logprobs.has_value()) return false;
+  if (!sm.no_penalties) return false;
+  if (!sm.bad_words_token_ids.empty()) return false;
+  if (sm.allowed_token_ids_mask.has_value()) return false;
+  if (!sm.min_tokens.empty()) return false;
+  if (!sm.logit_bias.empty()) return false;
+
+  VT_CHECK(logits.rank == 2, "sampler(greedy-device): logits must be [num_reqs, vocab]");
+  VT_CHECK(logits.dtype == vt::DType::kF32, "sampler(greedy-device): logits must be f32");
+  const int64_t n = logits.shape[0];
+  VT_CHECK(out_device_ids.rank == 1 && out_device_ids.shape[0] == n &&
+               out_device_ids.dtype == vt::DType::kI64,
+           "sampler(greedy-device): out_device_ids must be i64 [num_reqs]");
+  // SAME kernel + lowest-index tie-break as forward()'s greedy snapshot
+  // (GreedyArgmaxHost); the result simply stays on device (no download/sync).
+  vt::GreedyArgmax(q, out_device_ids, logits);
+  return true;
+}
+
 SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
                                const SamplingMetadata& sm) const {
   VT_CHECK(logits.rank == 2, "sampler: logits must be [num_reqs, vocab]");

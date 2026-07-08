@@ -844,6 +844,20 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
+void GatherTokens(Queue& q, Tensor& dst, const Tensor& src, const Tensor& index) {
+  VT_CHECK(dst.rank == 1 && dst.dtype == DType::kI32 && dst.IsContiguous() &&
+               dst.device == q.device,
+           "gather_tokens: dst must be i32 [n] contiguous on the queue device");
+  const int64_t n = dst.shape[0];
+  VT_CHECK(index.rank == 1 && index.shape[0] == n && index.dtype == DType::kI32 &&
+               index.IsContiguous() && index.device == q.device,
+           "gather_tokens: index must be i32 [n] contiguous on the queue device");
+  VT_CHECK(src.rank == 1 && src.dtype == DType::kI64 && src.IsContiguous() &&
+               src.device == q.device,
+           "gather_tokens: src must be i64 [m] contiguous on the queue device");
+  reinterpret_cast<GatherTokensFn>(GetOp(OpId::kGatherTokens, q.device.type))(q, dst, src, index);
+}
+
 namespace {
 // [num_reqs, vocab] tensor of a required dtype, contiguous, on the queue device.
 void CheckSamplingMatrix(const Queue& q, const Tensor& t, int64_t n, int64_t v, DType dt,

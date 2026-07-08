@@ -54,6 +54,7 @@ enum class OpId : uint8_t {
   kMoeCombineGate,
   kMoeGroupedGemmNvfp4Marlin,
   kGdnPostConv,
+  kGatherTokens,
   kCount
 };
 
@@ -244,6 +245,7 @@ using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
 using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using GatherTokensFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
 // bottom of this header for the full contracts.
 using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -720,6 +722,19 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
 // determinism + distribution.
 void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+
+// GatherTokens (async-decode next-input build; VT_ASYNC_DECODE). Mirror of vLLM's
+// _prepare_input_ids ON-GPU token scatter (gpu_model_runner.py:1819-1837 —
+// `input_ids.gpu[:n].copy_(prev_sampled_token_ids[idx], non_blocking=True)`):
+// builds the next decode step's int32 input token ids ON DEVICE from the retained
+// device sampled tokens, so the sampled token never round-trips through host on
+// the decode critical path. Per element:
+//   dst[i] = static_cast<int32_t>(src[index[i]])   for i in [0, dst.shape[0])
+// dst [n] i32 (the next input_ids), src [m] i64 (the greedy_argmax output — the
+// exact residence of the token; the argmax range fits i32), index [n] i32 (this-
+// step slot -> the prev-step sampled row, prev_req_id_to_index). All contiguous,
+// same device. CPU + CUDA. Bounds are caller-guaranteed (index in [0, m)).
+void GatherTokens(Queue& q, Tensor& dst, const Tensor& src, const Tensor& index);
 
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
 // vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py

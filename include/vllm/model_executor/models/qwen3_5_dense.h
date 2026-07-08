@@ -133,6 +133,9 @@ class Qwen3_5DenseModel {
   // as Forward but returns the lm_head output as a pool-backed DEVICE buffer
   // (ForwardLogits::device_*) with NO full-logits D2H. See
   // Qwen3_5Model::ForwardDevice.
+  // `device_token_ids` (async-decode, VT_ASYNC_DECODE): non-null => a DEVICE i32
+  // [T] input-token buffer the embedding reads instead of host `token_ids`; see
+  // Qwen3_5Model::ForwardDevice. Default null keeps the host-token path.
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
@@ -140,7 +143,8 @@ class Qwen3_5DenseModel {
       const std::vector<PagedKvCache>& attn_kv,
       const std::vector<GdnStateCache>& gdn_state,
       const Qwen3_5DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
-      const std::vector<int32_t>& logits_indices = {});
+      const std::vector<int32_t>& logits_indices = {},
+      const int32_t* device_token_ids = nullptr);
 
   // Dense single-sequence reference forward (M0.9 anchor). Runs the whole model
   // for a single non-paged sequence and returns logits [T, vocab] f32 (T =

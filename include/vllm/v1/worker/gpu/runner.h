@@ -138,6 +138,10 @@ class GPUModelRunner final : public ModelRunnerBase {
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
+  // Frees the lazily-allocated async-decode device buffers / copy stream / events
+  // (VT_ASYNC_DECODE). No-op unless the async path was ever exercised.
+  ~GPUModelRunner() override;
+
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) override;
@@ -252,7 +256,27 @@ class GPUModelRunner final : public ModelRunnerBase {
     CommonAttentionMetadata attn_meta;
     GDNAttentionMetadata gdn_meta;
     std::vector<std::string> req_ids;  // dense order (== input_batch order)
+    // Async-decode (VT_ASYNC_DECODE): this step was an eager pure-decode step with
+    // device logits, so sample_tokens keeps the sampled tokens ON DEVICE (the
+    // greedy fast path) and reads them back on the side stream instead of the
+    // blocking full-token download. False => the current synchronous path.
+    bool async_sample = false;
   } exec_state_;
+
+  // ─── Async-decode device state (VT_ASYNC_DECODE) ────────────────────────────
+  // Lazily allocated on the first async-eligible step (ensure_async_resources),
+  // freed in the destructor. All no-op / unallocated when the toggle is OFF.
+  // Mirrors vLLM's prev_sampled_token_ids (kept on GPU) + the AsyncGPUModelRunner
+  // Output copy stream + event (gpu_model_runner.py:268-296, 1819-1837, 3687).
+  void ensure_async_resources();
+  void* async_prev_sampled_ = nullptr;  // device i64 [max_num_reqs]: retained argmax
+  void* async_next_input_ = nullptr;    // device i32 [max_num_reqs]: on-GPU next input_ids
+  void* async_remap_ = nullptr;         // device i32 [max_num_reqs]: cur slot -> prev slot
+  std::vector<int64_t> async_host_tokens_;  // side-stream D2H staging [max_num_reqs]
+  vt::Queue async_copy_queue_{};        // side (copy) stream; handle==nullptr until created
+  void* async_sample_done_ = nullptr;   // event: main-stream greedy-argmax complete
+  void* async_copy_done_ = nullptr;     // event: side-stream token D2H complete
+  bool async_ready_ = false;            // async buffers / stream / events allocated
 };
 
 }  // namespace vllm::v1

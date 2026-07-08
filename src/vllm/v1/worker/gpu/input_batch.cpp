@@ -339,6 +339,10 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   const int req_index = it->second;
   req_id_to_index.erase(it);
 
+  // A structural change invalidates the async-decode prev-step mapping (the
+  // device prev_sampled buffer no longer aligns with a reshaped batch).
+  prev_sampled_valid = false;
+
   removed_tracker_.removed_append(req_index);
   req_ids[static_cast<size_t>(req_index)] = std::nullopt;
   req_output_token_ids[static_cast<size_t>(req_index)] = std::nullopt;

@@ -1513,12 +1513,23 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
                               wmma::mem_row_major);
     }
     __syncthreads();
+    // 16-byte-vectorized snapshot: one Hf32 read serves both hstate(bf16) and the
+    // V1 operand Hbf. VN = 8 bf16 / 4 f32 per coalesced transfer (V128).
+    constexpr int VN = V128<TD>::N;
     TD* hsnap = hstate + (gc * hv_n + hv) * sd;
-    for (int64_t e = tid; e < BV * dk; e += blockDim.x) {
+    for (int64_t e = tid * VN; e < BV * dk; e += (int64_t)blockDim.x * VN) {
+      float f[VN];
+#pragma unroll
+      for (int j = 0; j < VN; j += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(Hf32 + e + j);
+        f[j] = v.x;
+        f[j + 1] = v.y;
+        f[j + 2] = v.z;
+        f[j + 3] = v.w;
+      }
       const int64_t r = e / dk, c = e % dk;
-      const float f = Hf32[r * dk + c];
-      Store(hsnap, (i_v * BV + r) * dk + c, f);
-      Store(Hbf, e, f);
+      V128<TD>::Sf(hsnap + (i_v * BV + r) * dk + c, f);
+      V128<TD>::Sf(Hbf + e, f);
     }
     __syncthreads();
 
@@ -1537,23 +1548,35 @@ __global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, con
     }
     __syncthreads();
     // subtract u, write v_new(global)+Vbf(on-chip); zero the partial-tail rows.
-    for (int64_t e = tid; e < BT * BV; e += blockDim.x) {
+    // 16-byte-vectorized: a VN-group shares one row i (BV is a multiple of VN).
+    for (int64_t e = tid * VN; e < BT * BV; e += (int64_t)blockDim.x * VN) {
       const int64_t i = e / BV, cvi = e % BV;
       if (i < len) {
-        const float bv =
-            Load(u, (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi) - Braw[i * BV + cvi];
-        Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, bv);
-        Store(Vbf, e, bv);
+        float uf[VN];
+        V128<TD>::Uf(u + (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, uf);
+#pragma unroll
+        for (int j = 0; j < VN; ++j) uf[j] -= Braw[i * BV + cvi + j];
+        V128<TD>::Sf(v_new + (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, uf);
+        V128<TD>::Sf(Vbf + e, uf);
       } else {
-        Store(Vbf, e, 0.0f);
+        V128<TD>::Sf0(Vbf + e);
       }
     }
     __syncthreads();
 
     // (c) decay folded into K (Kd = k⊙decay, tail rows 0) + b_h *= exp(g_last)
-    for (int64_t e = tid; e < BT * dk; e += blockDim.x) {
+    for (int64_t e = tid * VN; e < BT * dk; e += (int64_t)blockDim.x * VN) {
       const int64_t i = e / dk, ki = e % dk;
-      Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+      if (i < len) {
+        float kf[VN];
+        V128<TD>::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
+        const float d = decay[i];
+#pragma unroll
+        for (int j = 0; j < VN; ++j) kf[j] *= d;
+        V128<TD>::Sf(Kd + e, kf);
+      } else {
+        V128<TD>::Sf0(Kd + e);
+      }
     }
     for (int kt = 0; kt < NK; ++kt) {
       for (int x = 0; x < h1[kt].num_elements; ++x) h1[kt].x[x] *= eglast;

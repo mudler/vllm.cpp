@@ -1418,6 +1418,171 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
     for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
 }
 
+// ----------------------------------------------------------------------------
+// DeltaH (REGISTER-tiled, vt::tile Rung-1). FAITHFUL 1:1 port of FLA's
+// chunk_gated_delta_rule_fwd_kernel_h_blockdim64 (H held in ACCUMULATOR
+// REGISTERS across the chunk loop, NOT in 64 KiB of shared memory) — the true
+// CUTLASS-style persistent-accumulator threadblock GEMM. Frees smem for the
+// N-stage cp.async input ring (STEP 2 / VT_GDN_TILE_PIPE_CPASYNC).
+//
+// Ported FROM:
+//   vllm/model_executor/layers/fla/ops/chunk_delta_h.py:43-315
+//     chunk_gated_delta_rule_fwd_kernel_h_blockdim64 (pin e24d1b24). Grid
+//     (cdiv(V,BV), N*H); b_h1/b_h2 = [BV,64] f32 register accumulators (K-split
+//     at 64: K=128 -> two halves); per-seq SEQUENTIAL over chunks.
+//   include/cute/arch/copy_sm80.hpp:40-193 (the cp.async ring — STEP 2 only).
+// Specialized to the gate shape: K=V=128, BT=64, USE_G=1, USE_GK=0,
+// USE_INITIAL_STATE=1, STORE_FINAL_STATE=1, SAVE_NEW_VALUE=1, IS_VARLEN=1,
+// USE_EXP2=0. Requires dk==128 (two K-halves), dv%BV==0, blockDim.x==(BV/16)*32.
+//
+// Warp ownership (persistent accumulators): warp w owns v-rows
+// [w*16, w*16+16) of this block's v-slice, ALL K columns -> Cfg::Acc
+// h1[NK],h2[NK] (NK=64/16=4) per warp = 8 f32 accumulator fragments, live across
+// the whole chunk loop. nwarps == BV/16 (each warp = 16 v-rows).
+//
+// Per chunk: (a) snapshot start-state -> hstate(bf16); (b) V1 b_v = u - W@b_hᵀ
+// (b_hᵀ built by storing the accumulators to a transient smem tile and loading
+// it col-major — the ONLY smem the persistent state touches); store v_new; (c)
+// decay folded into K + b_h *= exp(g_last) (algebraically identical to FLA's
+// decay-on-b_v: per-row scalar, same as GdnChunkDeltaHWmmaKernel, ref-verified);
+// (e) V2 b_h += b_vᵀ @ (K⊙decay) accumulated DIRECTLY into the persistent
+// fragments. Epilogue: b_h -> state(f32). w/u read straight from global; k
+// staged into the decay-scaled Kd tile; v_new kept on-chip (Vbf) for V2.
+template <typename TD, int BV>
+__global__ void GdnChunkDeltaHRegKernel(float* state, TD* hstate, TD* v_new, const TD* k,
+                                        const TD* u, const TD* w, const float* gcum,
+                                        const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                        int64_t dk, int64_t hv_n, int64_t dv) {
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  constexpr int BT = kChunk;         // 64
+  constexpr int NK = 64 / kWM;       // 4 k-subtiles per K-half
+  const int64_t i_v = blockIdx.x, i_nh = blockIdx.y;
+  const int64_t n = i_nh / hv_n, hv = i_nh % hv_n;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32;
+
+  // Transient smem arena. Region A (Hf32 | Braw | Kd) and Region B (Hbf | Vbf)
+  // alias by phase (syncthreads-separated): the persistent state lives in
+  // registers, so NONE of this is resident across chunks — that is what frees
+  // smem for the STEP-2 ring.
+  const int64_t rA0 = BV * dk * (int64_t)sizeof(float);            // Hf32
+  const int64_t rA1 = BT * BV * (int64_t)sizeof(float);            // Braw
+  const int64_t rA2 = BT * dk * (int64_t)sizeof(TD);               // Kd
+  int64_t regA = rA0 > rA1 ? rA0 : rA1;
+  regA = regA > rA2 ? regA : rA2;
+  extern __shared__ char smem_raw[];
+  float* Hf32 = reinterpret_cast<float*>(smem_raw);          // [BV,dk] f32 (region A)
+  float* Braw = reinterpret_cast<float*>(smem_raw);          // [BT,BV] f32 (aliases A)
+  TD* Kd = reinterpret_cast<TD*>(smem_raw);                  // [BT,dk] TD  (aliases A)
+  TD* Hbf = reinterpret_cast<TD*>(smem_raw + regA);          // [BV,dk] TD  (region B)
+  TD* Vbf = reinterpret_cast<TD*>(smem_raw + regA);          // [BT,BV] TD  (aliases B)
+  __shared__ float decay[BT];
+
+  float* sH = state + (n * hv_n + hv) * sd;
+  const int64_t vrow0 = i_v * BV + warp * kWM;  // this warp's first (global) v-row
+
+  // init: b_h += h0  (USE_INITIAL_STATE=1; state carries h0)
+  typename Cfg::Acc h1[NK], h2[NK];
+  for (int kt = 0; kt < NK; ++kt) {
+    wmma::load_matrix_sync(h1[kt], sH + vrow0 * dk + kt * kWM, dk, wmma::mem_row_major);
+    wmma::load_matrix_sync(h2[kt], sH + vrow0 * dk + 64 + kt * kWM, dk, wmma::mem_row_major);
+  }
+
+  const int64_t nt = (seqlen + BT - 1) / BT;
+  for (int64_t it = 0; it < nt; ++it) {
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * BT;
+    const int64_t rem = seqlen - it * BT;
+    const int64_t len = rem < BT ? rem : BT;
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = tid; i < len; i += blockDim.x)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
+
+    // (a) snapshot: store the persistent accumulators to Hf32, then convert to
+    // hstate(bf16) AND to the bf16 V1 operand Hbf (one fragment-store serves
+    // both). f32 path: Hbf is a plain copy (TD==float).
+    for (int kt = 0; kt < NK; ++kt) {
+      wmma::store_matrix_sync(Hf32 + (warp * kWM) * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
+      wmma::store_matrix_sync(Hf32 + (warp * kWM) * dk + 64 + kt * kWM, h2[kt], dk,
+                              wmma::mem_row_major);
+    }
+    __syncthreads();
+    TD* hsnap = hstate + (gc * hv_n + hv) * sd;
+    for (int64_t e = tid; e < BV * dk; e += blockDim.x) {
+      const int64_t r = e / dk, c = e % dk;
+      const float f = Hf32[r * dk + c];
+      Store(hsnap, (i_v * BV + r) * dk + c, f);
+      Store(Hbf, e, f);
+    }
+    __syncthreads();
+
+    // (b) V1: b_v[BT,BV] = W[BT,K] @ b_hᵀ[K,BV]  (warp w owns BT-rows [w*16:+16])
+    for (int bvc = 0; bvc < BV / kWM; ++bvc) {
+      typename Cfg::Acc acc;
+      wmma::fill_fragment(acc, 0.0f);
+      for (int64_t kk = 0; kk < dk; kk += WK) {
+        typename Cfg::Arow a;   // W[t,k]
+        typename Cfg::Bcol b;   // b_hᵀ[k,v] = Hbf[v,k] loaded col-major
+        Cfg::load(a, w + (tok0 + warp * kWM) * hv_n * dk + hv * dk + kk, hv_n * dk);
+        Cfg::load(b, Hbf + bvc * kWM * dk + kk, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(Braw + (warp * kWM) * BV + bvc * kWM, acc, BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+    // subtract u, write v_new(global)+Vbf(on-chip); zero the partial-tail rows.
+    for (int64_t e = tid; e < BT * BV; e += blockDim.x) {
+      const int64_t i = e / BV, cvi = e % BV;
+      if (i < len) {
+        const float bv =
+            Load(u, (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi) - Braw[i * BV + cvi];
+        Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, bv);
+        Store(Vbf, e, bv);
+      } else {
+        Store(Vbf, e, 0.0f);
+      }
+    }
+    __syncthreads();
+
+    // (c) decay folded into K (Kd = k⊙decay, tail rows 0) + b_h *= exp(g_last)
+    for (int64_t e = tid; e < BT * dk; e += blockDim.x) {
+      const int64_t i = e / dk, ki = e % dk;
+      Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+    }
+    for (int kt = 0; kt < NK; ++kt) {
+      for (int x = 0; x < h1[kt].num_elements; ++x) h1[kt].x[x] *= eglast;
+      for (int x = 0; x < h2[kt].num_elements; ++x) h2[kt].x[x] *= eglast;
+    }
+    __syncthreads();
+
+    // (e) V2: b_h[BV,64] += b_vᵀ[BV,BT] @ Kd[BT,64] — accumulate into the
+    // persistent fragments directly. matrix_a = Vbf col-major (A[v,t]=Vbf[t,v]).
+    for (int64_t tt = 0; tt < BT; tt += WK) {
+      typename Cfg::Acol a;
+      Cfg::load(a, Vbf + warp * kWM + tt * BV, BV);
+      for (int kt = 0; kt < NK; ++kt) {
+        typename Cfg::Brow b1, b2;
+        Cfg::load(b1, Kd + tt * dk + kt * kWM, dk);
+        wmma::mma_sync(h1[kt], a, b1, h1[kt]);
+        Cfg::load(b2, Kd + tt * dk + 64 + kt * kWM, dk);
+        wmma::mma_sync(h2[kt], a, b2, h2[kt]);
+      }
+    }
+    __syncthreads();
+  }
+  // epilogue: b_h -> state(f32) directly (fragment f32 -> f32 global, no convert)
+  for (int kt = 0; kt < NK; ++kt) {
+    wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
+    wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
+  }
+}
+
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
 // (decay-weighted, causal-masked); o = scale*(exp(G)*cross + A@V_new). Buffers
 // alias: Ks (used only for qk) is reused as outc after qk.
@@ -2048,12 +2213,39 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
     const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
     const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-    opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
-           "gdn chunked delta_h(wmma) shared opt-in");
-    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
-        state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv, dvec);
-    Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+    // REGISTER-tiled delta_h (vt::tile Rung-1): H in accumulator registers, smem
+    // freed for the STEP-2 cp.async ring. Faithful FLA blockdim64 port. Opt-in
+    // VT_GDN_TILE_PIPE=1; requires dk==128 (two K-halves) and dv%BV==0. BV=64
+    // (grid.x=dv/BV, 4 warps/block); the persistent-accumulator restructure is
+    // the real fix for the H-in-smem-starves-the-ring neutral of the prior add-on.
+    const char* tp_env = std::getenv("VT_GDN_TILE_PIPE");
+    const bool tile_pipe = tp_env != nullptr && tp_env[0] == '1' && dk == 128 && (dv % 64 == 0);
+    if (tile_pipe) {
+      constexpr int BV = 64;
+      const int64_t rA0 = static_cast<int64_t>(BV * dk) * sizeof(float);
+      const int64_t rA1 = static_cast<int64_t>(kChunk * BV) * sizeof(float);
+      const int64_t rA2 = static_cast<int64_t>(kChunk * dk) * sz;
+      int64_t regA = rA0 > rA1 ? rA0 : rA1;
+      regA = regA > rA2 ? regA : rA2;
+      const int64_t rB0 = static_cast<int64_t>(BV * dk) * sz;
+      const int64_t rB1 = static_cast<int64_t>(kChunk * BV) * sz;
+      const size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
+      const dim3 grid_reg(static_cast<unsigned>(dv / BV),
+                          static_cast<unsigned>(n_seq * hv_n));
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHRegKernel<TSc, BV>), reg_bytes,
+             "gdn chunked delta_h(reg) shared opt-in");
+      GdnChunkDeltaHRegKernel<TSc, BV><<<grid_reg, (BV / kWM) * 32, reg_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv);
+      Check(cudaGetLastError(), "gdn chunked delta_h(reg) launch");
+    } else {
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
+             "gdn chunked delta_h(wmma) shared opt-in");
+      GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv, dvec);
+      Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+    }
 
     const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
                           ? static_cast<size_t>(kChunk * dk) * sz

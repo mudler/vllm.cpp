@@ -15,7 +15,6 @@
 #include <mma.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -2233,19 +2232,12 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       const size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
       const dim3 grid_reg(static_cast<unsigned>(dv / BV),
                           static_cast<unsigned>(n_seq * hv_n));
-      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHRegKernel<TSc, BV>), reg_bytes,
-             "gdn chunked delta_h(reg) shared opt-in");
-      if (std::getenv("VT_GDN_TP_DEBUG")) {
-        cudaFuncAttributes fa{};
-        cudaError_t ge = cudaFuncGetAttributes(
-            &fa, reinterpret_cast<void*>(GdnChunkDeltaHRegKernel<TSc, BV>));
-        std::fprintf(stderr,
-                     "[tp] reg_bytes=%zu optinAttr=%d numRegs=%d maxThreads=%d staticShared=%zu "
-                     "grid=(%u,%u) block=%u getattr=%s\n",
-                     reg_bytes, fa.maxDynamicSharedSizeBytes, fa.numRegs, fa.maxThreadsPerBlock,
-                     fa.sharedSizeBytes, grid_reg.x, grid_reg.y,
-                     static_cast<unsigned>((BV / kWM) * 32), cudaGetErrorString(ge));
-      }
+      // Always opt in: the bf16 request is exactly 48 KiB, which the default
+      // 48896-byte cap rejects (opt_in's ">" guard would miss the boundary).
+      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkDeltaHRegKernel<TSc, BV>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(reg_bytes)),
+            "gdn chunked delta_h(reg) shared opt-in");
       GdnChunkDeltaHRegKernel<TSc, BV><<<grid_reg, (BV / kWM) * 32, reg_bytes, s>>>(
           state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
           hk_n, dk, hv_n, dv);

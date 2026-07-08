@@ -2252,7 +2252,14 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       regA = regA > rA2 ? regA : rA2;
       const int64_t rB0 = static_cast<int64_t>(BV * dk) * sz;
       const int64_t rB1 = static_cast<int64_t>(kChunk * BV) * sz;
-      const size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
+      size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
+      // Occupancy-sensitivity probe: pad the smem request to force 1 block/SM
+      // (2->1), the same occupancy a 2-stage cp.async ring would impose. If this
+      // regresses the kernel, the ring is doomed by the occupancy halving.
+      if (const char* pe = std::getenv("VT_GDN_TILE_PIPE_PAD")) {
+        const size_t pad = static_cast<size_t>(std::atoi(pe)) * 1024;
+        if (pad > reg_bytes) reg_bytes = pad;
+      }
       const dim3 grid_reg(static_cast<unsigned>(dv / BV),
                           static_cast<unsigned>(n_seq * hv_n));
       // Always opt in: the bf16 request is exactly 48 KiB, which the default

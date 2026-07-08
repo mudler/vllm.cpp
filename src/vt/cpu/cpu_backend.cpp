@@ -21,6 +21,10 @@ class CpuBackend final : public Backend {
   void Copy(Queue&, void* dst, const void* src, size_t bytes) override {
     std::memcpy(dst, src, bytes);
   }
+  // No-op: on the CPU backend host and device are one memory space, so there is
+  // nothing to page-lock (and no async copy to unblock).
+  void PinHost(void* /*ptr*/, size_t /*bytes*/) override {}
+  void UnpinHost(void* /*ptr*/) override {}
   Queue CreateQueue() override { return Queue{Device{DeviceType::kCPU, 0}, nullptr}; }
   bool UnifiedMemory() const override { return true; }
 };

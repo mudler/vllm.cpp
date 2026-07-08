@@ -18,6 +18,13 @@ class Backend {
   virtual void Memset(Queue& q, void* p, int value, size_t bytes) = 0;
   // Same-device or host<->device transfer; on CPU this is memcpy.
   virtual void Copy(Queue& q, void* dst, const void* src, size_t bytes) = 0;
+  // Page-lock (pin) / release a host memory range so host<->device copies over it
+  // are truly ASYNC w.r.t. the host thread. A cudaMemcpyAsync over PAGEABLE host
+  // memory is synchronous (it blocks the caller), so pinning a long-lived host
+  // staging/state buffer lets the host run ahead of the copies. CUDA: cudaHost
+  // Register / cudaHostUnregister. CPU: no-op (host and device share one space).
+  virtual void PinHost(void* ptr, size_t bytes) = 0;
+  virtual void UnpinHost(void* ptr) = 0;
   virtual Queue CreateQueue() = 0;
 
   // Releases a queue obtained from CreateQueue. Default no-op suits backends

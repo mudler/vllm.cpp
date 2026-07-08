@@ -70,6 +70,24 @@ static bool DenseDecodeGraphEnabled() {
   return on;
 }
 
+// GDN-state host-pin toggle (perf). Default OFF. When ON (and the backend is
+// CUDA), the per-GDN-layer ssm/conv host state caches are page-locked
+// (cudaHostRegister) once at init so the prefill gather/scatter cudaMemcpyAsync
+// over them run TRULY ASYNC w.r.t. the host thread. A cudaMemcpyAsync over
+// PAGEABLE host memory is synchronous (it blocks the caller), which serialized
+// the ~31 GDN layers per prefill step (measured ~42% host idle blocked on
+// cudaMemcpyAsync at concurrency-32); pinning lets the host run ahead. vLLM pins
+// its host<->device staging buffers for the same reason. OFF is byte-identical:
+// no cudaHostRegister is called and nothing about the buffers changes. Reads
+// VT_PIN_GDN_STATE (env "1" => ON, mirroring the OFF-default toggle style).
+static bool PinGdnStateEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_PIN_GDN_STATE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
 bool reorder_batch_to_split_decodes_and_prefills(
     InputBatch& input_batch, const SchedulerOutput& scheduler_output,
@@ -409,6 +427,36 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                                            dev,
                                            {gdn_state_slots_, conv_dim, Kw - 1});
     gdn_state_.push_back(gs);
+  }
+
+  // Page-lock the GDN state caches so the prefill gather/scatter cudaMemcpyAsync
+  // over them are truly async (VT_PIN_GDN_STATE, default OFF; CUDA only). Done
+  // HERE — after the emplace loop above fixed each vector's final .data() and
+  // these buffers are never resized again — so we never pin a pointer a later
+  // reallocation would invalidate. Only the GDN state buffers are pinned;
+  // full_attn_buf_ is read in place via indices and never cudaMemcpy'd. OFF is a
+  // no-op (byte-identical): PinGdnStateEnabled() false => nothing happens here.
+  if (PinGdnStateEnabled() && dev.type == vt::DeviceType::kCUDA) {
+    vt::Backend& b = vt::GetBackend(dev.type);
+    for (size_t g = 0; g < ssm_buf_.size(); ++g) {
+      if (!ssm_buf_[g].empty()) b.PinHost(ssm_buf_[g].data(), ssm_buf_[g].size());
+      if (!conv_buf_[g].empty()) b.PinHost(conv_buf_[g].data(), conv_buf_[g].size());
+    }
+    gdn_state_pinned_ = true;
+  }
+}
+
+GPUModelRunner::~GPUModelRunner() {
+  // Release the GDN state caches page-locked in initialize_kv_cache, BEFORE the
+  // backing std::vectors free their storage (cudaHostUnregister needs the still-
+  // live pointers). gdn_state_pinned_ is only ever true on the CUDA + toggle-ON
+  // path, so the default OFF path runs no unpin (byte-identical teardown).
+  if (gdn_state_pinned_) {
+    vt::Backend& b = vt::GetBackend(queue_.device.type);
+    for (size_t g = 0; g < ssm_buf_.size(); ++g) {
+      if (!ssm_buf_[g].empty()) b.UnpinHost(ssm_buf_[g].data());
+      if (!conv_buf_[g].empty()) b.UnpinHost(conv_buf_[g].data());
+    }
   }
 }
 

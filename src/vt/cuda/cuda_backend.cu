@@ -41,6 +41,20 @@ class CudaBackend final : public Backend {
   void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
     Check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, AsStream(q)), "cudaMemcpyAsync");
   }
+  // Page-lock a host range so cudaMemcpyAsync over it is truly async w.r.t. the
+  // host thread (a copy over PAGEABLE host memory is synchronous, serializing the
+  // caller). cudaHostRegister pins the pages in place (no realloc). An already-
+  // registered range is benign (an earlier PinHost already locked it) — clear the
+  // error and treat it as success rather than throw, so a double-pin can't abort.
+  void PinHost(void* ptr, size_t bytes) override {
+    cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterDefault);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) {
+      cudaGetLastError();  // consume the sticky error, treat as already-pinned
+      return;
+    }
+    Check(err, "cudaHostRegister");
+  }
+  void UnpinHost(void* ptr) override { Check(cudaHostUnregister(ptr), "cudaHostUnregister"); }
   Queue CreateQueue() override {
     cudaStream_t stream = nullptr;
     Check(cudaStreamCreate(&stream), "cudaStreamCreate");

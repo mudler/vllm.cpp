@@ -138,6 +138,11 @@ class GPUModelRunner final : public ModelRunnerBase {
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
+  // Unregisters the GDN state caches page-locked in initialize_kv_cache (only
+  // when VT_PIN_GDN_STATE was ON — see gdn_state_pinned_), before the backing
+  // std::vectors free their storage.
+  ~GPUModelRunner() override;
+
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) override;
@@ -222,6 +227,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::DType gdn_cache_dtype_ = vt::DType::kF32;
   std::vector<std::vector<uint8_t>> ssm_buf_;   // per GDN layer (raw bytes)
   std::vector<std::vector<uint8_t>> conv_buf_;  // per GDN layer (raw bytes)
+  // True iff ssm_buf_/conv_buf_ were page-locked (cudaHostRegister) in
+  // initialize_kv_cache under VT_PIN_GDN_STATE; gates the destructor's unpin so
+  // we never cudaHostUnregister memory we did not register. Default OFF path
+  // leaves this false and never touches the buffers.
+  bool gdn_state_pinned_ = false;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
 

@@ -115,6 +115,109 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tiled causal_conv1d_fwd (VT_CONV_TILED, default OFF) — the (token-tile x
+// channel-tile) mirror of the FLA/vLLM causal_conv1d Triton kernel. The scalar
+// CausalConv1dFwdKernel above rereads each x value K times (once per tap it lands
+// on) and is serial per (seq, channel); this stages a [BLOCK_M+width, BLOCK_N]
+// x-tile into shared ONCE (each x read ~once vs K times, the halo aside) and lets
+// BLOCK_M token rows reuse the same sliding window, with consecutive threads over
+// the channel dim so the global x loads and out stores are coalesced.
+//
+// NUMERICALLY IDENTICAL to the scalar kernel (token-exact): for every output
+// (token t, channel c) it accumulates acc = bias; for j in [0,k): acc += w[c*k+j]
+// * v_j — the SAME tap ORDER (j=0 oldest .. j=k-1 newest, bias first) over the
+// SAME f32 values. v_j is fetched from the shared tile, but the tile is filled by
+// the identical Load(x,...) / conv_state reads the scalar kernel does, so each v_j
+// is bit-for-bit the same float; a conv is a fixed sum of k<=~4 f32 products, and
+// preserving its accumulation order keeps a razor-thin greedy argmax from flipping.
+// One block owns a (channel-tile, sequence) and loops token-tiles of BLOCK_M, then
+// performs the (K-1) state write-back byte-identically to the scalar kernel
+// (ascending j, same read-before-overwrite ordering). Causal masking, the (K-1)
+// left-pad / conv_state prepend (has_initial_state), per-channel weight + optional
+// bias, silu/identity, and the [token, c_dim] output layout are all preserved.
+// PREFILL only — the decode CausalConv1dUpdate path is untouched.
+constexpr int kConvTileM = 16;  // token tile (rows per block)
+constexpr int kConvTileN = 32;  // channel tile (a warp — coalesced x loads/stores)
+
+template <typename Tin, typename Tout>
+__global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w,
+                                           const Tin* bias, float* conv_state,
+                                           const int32_t* qsl, const int32_t* his, int64_t c_dim,
+                                           int64_t k, bool silu) {
+  const int64_t width = k - 1;
+  const int64_t s = blockIdx.y;  // sequence
+  const int tx = static_cast<int>(threadIdx.x);
+  const int ty = static_cast<int>(threadIdx.y);
+  const int64_t c = static_cast<int64_t>(blockIdx.x) * kConvTileN + tx;  // channel
+  const bool active = c < c_dim;
+  const int64_t begin = qsl[s];
+  const int64_t t_len = qsl[s + 1] - begin;
+  const bool init = his[s] != 0;
+  // Own conv_state row [K-1] for this (seq, channel); prefill state is f32.
+  float* srow = active ? conv_state + (s * c_dim + c) * width : nullptr;
+  const float b = (active && bias != nullptr) ? Load(bias, c) : 0.0f;
+
+  extern __shared__ float sh[];  // [(kConvTileM + width) * kConvTileN], slot-major
+
+  // t_len is uniform across the block (s == blockIdx.y), so every thread runs the
+  // same iteration count and hits every __syncthreads() below in lockstep.
+  for (int64_t t0 = 0; t0 < t_len; t0 += kConvTileM) {
+    // Cooperative, coalesced load of the tile: (K-1) history halo + BLOCK_M window.
+    for (int64_t slot = ty; slot < kConvTileM + width; slot += blockDim.y) {
+      const int64_t tok = t0 - width + slot;  // token index within the sequence
+      float val = 0.0f;
+      if (active) {
+        if (tok >= 0 && tok < t_len) {
+          val = Load(x, (begin + tok) * c_dim + c);
+        } else if (tok < 0 && init) {
+          val = srow[width + tok];  // old conv_state col (K-1)+tok, in [0,width)
+        }
+      }
+      sh[slot * kConvTileN + tx] = val;
+    }
+    __syncthreads();
+    // One output token per row: token t reads window slots [ty, ty+k), i.e. the
+    // taps ti = t-(k-1)..t, matching the scalar kernel's ti = t-(k-1-j).
+    const int64_t t = t0 + ty;
+    if (active && t < t_len) {
+      float acc = b;
+      for (int64_t j = 0; j < k; ++j) {  // SAME order as the scalar kernel
+        acc += Load(w, c * k + j) * sh[(ty + j) * kConvTileN + tx];
+      }
+      Store(out, (begin + t) * c_dim + c, silu ? Silu(acc) : acc);
+    }
+    __syncthreads();  // all reads of sh done before the next tile overwrites it
+  }
+
+  // State write-back (byte-identical to the scalar kernel): last K-1 RAW x tokens,
+  // left-padded with zeros (no init state) or shifted old state when T < K-1. One
+  // row (ty == 0) writes each channel's state; ascending j reads old col t_len+j
+  // (>= j, unwritten), so no already-written slot is reread.
+  if (active && ty == 0) {
+    for (int64_t j = 0; j < width; ++j) {
+      const int64_t tj = t_len - width + j;
+      float val = 0.0f;
+      if (tj >= 0) {
+        val = Load(x, (begin + tj) * c_dim + c);
+      } else if (init) {
+        val = srow[width + tj];
+      }
+      srow[j] = val;
+    }
+  }
+}
+
+// Toggle: default OFF (byte-identical scalar dispatch). Cached static reader
+// (GdnSlackMemsetEnabled style) — VT_CONV_TILED=1 selects the tiled kernel.
+bool ConvTiledEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_CONV_TILED");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 template <typename Tin, typename Tout>
 void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                    const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
@@ -126,6 +229,40 @@ void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
       conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k,
       args.silu_activation);
   Check(cudaGetLastError(), "causal_conv1d_fwd launch");
+}
+
+// Tiled launcher (VT_CONV_TILED=1). Block = (kConvTileN channels, kConvTileM
+// tokens); grid = (channel-tiles, sequences) — same sequence-per-grid.y layout as
+// the scalar launcher, so the n <= kMaxGridY guard already covers grid.y. Dynamic
+// shared holds the [(BLOCK_M+width) x BLOCK_N] x-tile (width = k-1).
+template <typename Tin, typename Tout>
+void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                        const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
+                        const Tensor& his, const CausalConv1dArgs& args) {
+  const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
+  const int64_t width = k - 1;
+  const dim3 grid(static_cast<unsigned>((c + kConvTileN - 1) / kConvTileN),
+                  static_cast<unsigned>(n));
+  const dim3 block(kConvTileN, kConvTileM);
+  const size_t shmem = static_cast<size_t>(kConvTileM + width) * kConvTileN * sizeof(float);
+  CausalConv1dFwdTiledKernel<Tin, Tout><<<grid, block, shmem, s>>>(
+      out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
+      conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k,
+      args.silu_activation);
+  Check(cudaGetLastError(), "causal_conv1d_fwd(tiled) launch");
+}
+
+// Dispatch on the toggle. tiled == false forwards to the EXACT scalar launcher
+// (byte-identical grid/block/kernel), so VT_CONV_TILED unset/0 is a no-op.
+template <typename Tin, typename Tout>
+void DispatchConvFwd(bool tiled, cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                     const Tensor* bias, Tensor& conv_state, const Tensor& qsl, const Tensor& his,
+                     const CausalConv1dArgs& args) {
+  if (tiled) {
+    LaunchConvFwdTiled<Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args);
+  } else {
+    LaunchConvFwd<Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,18 +337,19 @@ void ConvFwdKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
   if (n == 0 || x.shape[1] == 0) return;
   VT_CHECK(n <= kMaxGridY, "cuda causal_conv1d_fwd: too many sequences (grid.y limit)");
   cudaStream_t s = AsStream(q);
+  const bool tiled = ConvTiledEnabled();  // VT_CONV_TILED (default OFF)
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      LaunchConvFwd<float, float>(s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<float, float>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
     } else {
-      LaunchConvFwd<float, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<float, __nv_bfloat16>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      LaunchConvFwd<__nv_bfloat16, float>(s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<__nv_bfloat16, float>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
     } else {
-      LaunchConvFwd<__nv_bfloat16, __nv_bfloat16>(s, out, x, w, bias, conv_state, qsl, his,
-                                                  args);
+      DispatchConvFwd<__nv_bfloat16, __nv_bfloat16>(tiled, s, out, x, w, bias, conv_state, qsl,
+                                                    his, args);
     }
   }
 }

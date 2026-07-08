@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 
+#include "vt/cuda/tile/cp_async.cuh"  // portable async-pipeline primitive (Rung-1)
+
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
@@ -1418,6 +1420,239 @@ __global__ void GdnChunkDeltaHWmmaKernel(float* state, TD* hstate, TD* v_new, co
     for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
 }
 
+// DeltaH (WMMA) — TILE-PIPE variant (Rung-1 of the vt::tile async-pipeline
+// component; see .agents/tile-pipeline-component-2026-07-08.md). Bit-identical
+// math to GdnChunkDeltaHWmmaKernel above; two portability-grounded structural
+// changes drawn straight from the FLA reference:
+//
+//  Lever 1 — v_new stays LOCAL across V1->V2 (no gmem round-trip). FLA keeps
+//    b_v in registers and reuses it for the rank update (chunk_delta_h.py:196
+//    `b_v = tl.load(p_v) - b_v`, :226 `b_v = b_v.to(...)`, :233
+//    `b_h += tl.trans(tl.dot(b_k, b_v))` — b_v is NEVER reloaded from HBM). Our
+//    WMMA kernel wrote v_new to global in V1 and RE-READ it from global in V2;
+//    here V1 also stages v_new into a resident smem tile `Vs`[BT,Dv] and V2's
+//    A-operand loads from Vs. We STILL write v_new to global (downstream
+//    GdnChunkOWmmaKernel consumes it) — only the V2 self-read moves on-chip.
+//    Enabled (stage_vnew) only when Vs fits the smem opt-in (bf16 hot path:
+//    64K Hf + 16K pool + 16K Vs = 96K <= 99K; f32 corner would need 128K, so it
+//    keeps the global read — correctness-only, not the perf target).
+//
+//  Lever 2 — cp.async staging of the streamed K tile (cp_async_k). FLA's
+//    blockdim64 kernel is autotuned over num_stages in {2,3,4} (async gmem->smem
+//    double-buffering). The [Dv,Dk] f32 state pinned in 64K smem leaves < 35K —
+//    too little for a 2-stage input ring (2x16K per tile) — so we cannot mirror
+//    the full multistage double-buffer without moving H to registers (a larger
+//    rewrite). What fits: single-buffered async load of K into the existing Kd
+//    pool via the primitive (cute/arch/copy_sm80.hpp:99-152 SM80_CP_ASYNC_
+//    CACHEGLOBAL_ZFILL), overlapping K's HBM latency with the V1->V2 boundary
+//    work. Predicated (pred=false ZFILL) handles the partial last chunk exactly
+//    like the baseline's `i<len ? ... : 0` slack-zero.
+//
+// Ported FROM: vllm/model_executor/layers/fla/ops/chunk_delta_h.py
+//   (chunk_gated_delta_rule_fwd_kernel_h_blockdim64) + cutlass
+//   include/cute/arch/copy_sm80.hpp:99-193 (via include/vt/cuda/tile/cp_async.cuh).
+template <typename TD>
+__global__ void GdnChunkDeltaHTilePipeKernel(float* state, TD* hstate, TD* v_new, const TD* k,
+                                             const TD* u, const TD* w, const float* gcum,
+                                             const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                             int64_t dk, int64_t hv_n, int64_t dv, bool vec,
+                                             bool stage_vnew, bool cp_async_k) {
+  using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
+  namespace tile = vt::cuda::tile;
+  constexpr int WK = Cfg::WK;
+  const int64_t n = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  float* Hf = reinterpret_cast<float*>(smem_raw);  // [Dv,Dk] f32 state
+  char* pool = smem_raw + sd * sizeof(float);      // reused by V1/V2 (Hb+sTile / Kd)
+  // Resident v_new tile [kChunk,Dv], laid out contiguous (i outer, vi inner) so
+  // V2's col-major A-load uses ld=Dv. Placed after the max(V1,V2) pool footprint.
+  const size_t pool_v1 =
+      static_cast<size_t>(kNB * dk) * sizeof(TD) + static_cast<size_t>(kChunk * kNB) * 4;
+  const size_t pool_v2 = static_cast<size_t>(kChunk * dk) * sizeof(TD);
+  const size_t pool_bytes = pool_v1 > pool_v2 ? pool_v1 : pool_v2;
+  TD* Vs = stage_vnew ? reinterpret_cast<TD*>(pool + pool_bytes) : nullptr;
+  __shared__ float decay[kChunk];
+
+  float* s_head = state + (n * hv_n + hv) * sd;
+  if (vec)
+    for (int64_t g = tid; g < sd / 4; g += blockDim.x)
+      V128<float>::Cpy(Hf + g * 4, s_head + g * 4);
+  else
+    for (int64_t e = tid; e < sd; e += blockDim.x) Hf[e] = s_head[e];
+  __syncthreads();
+
+  const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  for (int64_t it = 0; it < nt; ++it) {
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * kChunk;
+    const int64_t rem = seqlen - it * kChunk;
+    const int64_t len = rem < kChunk ? rem : kChunk;
+    TD* hstart = hstate + (gc * hv_n + hv) * sd;
+    if (vec)
+      for (int64_t g = tid; g < sd / V::N; g += blockDim.x) {
+        float f[V::N];
+#pragma unroll
+        for (int j = 0; j < V::N; ++j) f[j] = Hf[g * V::N + j];
+        V::Sf(hstart + g * V::N, f);
+      }
+    else
+      for (int64_t e = tid; e < sd; e += blockDim.x) Store(hstart, e, Hf[e]);
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = tid; i < len; i += blockDim.x)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
+    // Zero the partial-chunk slack rows of Vs (i>=len): V2 sweeps all kChunk rows
+    // and 0*Kd must stay finite. Full chunks (len==kChunk) are fully overwritten
+    // by V1, so this only runs on the last chunk. Mirrors the global slack-zero.
+    if (stage_vnew && len < kChunk)
+      for (int64_t e = static_cast<int64_t>(len) * dv + tid; e < static_cast<int64_t>(kChunk) * dv;
+           e += blockDim.x)
+        Store(Vs, e, 0.0f);
+    __syncthreads();
+
+    // --- V1: v_new = u - W @ Hᵀ  ([len,Dk]@[Dk,Dv] -> [len,Dv]) ---
+    TD* Hb = reinterpret_cast<TD*>(pool);                   // [kNB,Dk] TD slice of Hf
+    float* sTile = reinterpret_cast<float*>(Hb + kNB * dk);  // [kChunk,kNB] f32
+    for (int64_t nb = 0; nb < dv; nb += kNB) {
+      if (vec)
+        for (int64_t g = tid; g < (kNB * dk) / V::N; g += blockDim.x) {
+          float f[V::N];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) f[j] = Hf[nb * dk + g * V::N + j];
+          V::Sf(Hb + g * V::N, f);
+        }
+      else
+        for (int64_t e = tid; e < kNB * dk; e += blockDim.x)
+          Store(Hb, e, Hf[(nb + e / dk) * dk + e % dk]);
+      __syncthreads();
+      const int ntiles = (kChunk / kWM) * (kNB / kWM);
+      for (int t = warp; t < ntiles; t += nwarps) {
+        const int rt = t % (kChunk / kWM), ct = t / (kChunk / kWM);
+        const int i0 = rt * kWM, vi0 = static_cast<int>(nb) + ct * kWM;
+        typename Cfg::Acc acc;
+        wmma::fill_fragment(acc, 0.0f);
+        for (int64_t kk = 0; kk < dk; kk += WK) {
+          typename Cfg::Arow a;
+          typename Cfg::Bcol b;
+          Cfg::load(a, w + (tok0 + i0) * hv_n * dk + hv * dk + kk, hv_n * dk);
+          Cfg::load(b, Hb + (vi0 - nb) * dk + kk, dk);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sTile + i0 * kNB + ct * kWM, acc, kNB, wmma::mem_row_major);
+      }
+      __syncthreads();
+      if (vec)
+        for (int64_t g = tid; g < (kChunk * kNB) / V::N; g += blockDim.x) {
+          const int64_t base = g * V::N;
+          const int64_t i = base / kNB, cvi = base % kNB;
+          if (i < len) {
+            float uf[V::N];
+            V::Uf(u + (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uf);
+#pragma unroll
+            for (int j = 0; j < V::N; ++j) uf[j] -= sTile[i * kNB + cvi + j];
+            V::Sf(v_new + (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, uf);
+            if (stage_vnew) V::Sf(Vs + i * dv + nb + cvi, uf);  // lever 1: keep local
+          }
+        }
+      else
+        for (int64_t e = tid; e < kChunk * kNB; e += blockDim.x) {
+          const int64_t i = e / kNB, cvi = e % kNB;
+          if (i < len) {
+            const float uv = Load(u, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi);
+            const float nv = uv - sTile[i * kNB + cvi];
+            Store(v_new, (tok0 + i) * hv_n * dv + hv * dv + nb + cvi, nv);
+            if (stage_vnew) Store(Vs, i * dv + nb + cvi, nv);  // lever 1: keep local
+          }
+        }
+      __syncthreads();
+    }
+
+    // --- V2: H = H*exp(G_last) + V_newᵀ @ (K⊙decay)  ([Dv,len]@[len,Dk]) ---
+    TD* Kd = reinterpret_cast<TD*>(pool);  // [kChunk,Dk] TD, decay-scaled
+    if (cp_async_k) {
+      // lever 2: async gmem->smem load of the raw K tile, then scale in place.
+      // Bit-identical to the sync V::Uf/scale/V::Sf below: cp.async copies the
+      // exact TD bytes (ZFILL on the i>=len tail), the decay multiply is the
+      // same f32 path. One 16B (V::N-wide) transfer per thread-group.
+      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+        const int64_t base = g * V::N;
+        const int64_t i = base / dk, ki = base % dk;
+        tile::cp_async_cg<16>(Kd + base, k + (tok0 + i) * hk_n * dk + hk * dk + ki, i < len);
+      }
+      tile::cp_async_fence();
+      tile::cp_async_wait<0>();
+      __syncthreads();
+      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+        const int64_t base = g * V::N;
+        const int64_t i = base / dk;
+        if (i < len) {
+          float kf[V::N];
+          V::Uf(Kd + base, kf);
+          const float d = decay[i];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) kf[j] *= d;
+          V::Sf(Kd + base, kf);
+        }
+      }
+    } else if (vec) {
+      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+        const int64_t base = g * V::N;
+        const int64_t i = base / dk, ki = base % dk;
+        if (i < len) {
+          float kf[V::N];
+          V::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
+          const float d = decay[i];
+#pragma unroll
+          for (int j = 0; j < V::N; ++j) kf[j] *= d;
+          V::Sf(Kd + base, kf);
+        } else {
+          V::Sf0(Kd + base);
+        }
+      }
+    } else {
+      for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+        const int64_t i = e / dk, ki = e % dk;
+        Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+      }
+    }
+    __syncthreads();
+    const int ntiles2 = (dv / kWM) * (dk / kWM);
+    for (int t = warp; t < ntiles2; t += nwarps) {
+      const int vt = t % (dv / kWM), kt = t / (dv / kWM);
+      const int vi0 = vt * kWM, ki0 = kt * kWM;
+      typename Cfg::Acc acc;
+      wmma::load_matrix_sync(acc, Hf + vi0 * dk + ki0, dk, wmma::mem_row_major);
+      for (int x = 0; x < acc.num_elements; ++x) acc.x[x] *= eglast;
+      for (int ii = 0; ii < kChunk; ii += WK) {
+        typename Cfg::Acol a;  // A[vi,i] = V_new[i,vi]
+        typename Cfg::Brow b;  // B[i,ki] = Kd[i,ki]
+        // lever 1: read v_new from the resident smem tile (ld=Dv), else global.
+        if (stage_vnew)
+          Cfg::load(a, Vs + ii * dv + vi0, dv);
+        else
+          Cfg::load(a, v_new + (tok0 + ii) * hv_n * dv + hv * dv + vi0, hv_n * dv);
+        Cfg::load(b, Kd + ii * dk + ki0, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(Hf + vi0 * dk + ki0, acc, dk, wmma::mem_row_major);
+    }
+    __syncthreads();
+  }
+  if (vec)
+    for (int64_t g = tid; g < sd / 4; g += blockDim.x)
+      V128<float>::Cpy(s_head + g * 4, Hf + g * 4);
+  else
+    for (int64_t e = tid; e < sd; e += blockDim.x) s_head[e] = Hf[e];
+}
+
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
 // (decay-weighted, causal-masked); o = scale*(exp(G)*cross + A@V_new). Buffers
 // alias: Ks (used only for qk) is reused as outc after qk.
@@ -2048,12 +2283,34 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
     const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
     const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-    opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
-           "gdn chunked delta_h(wmma) shared opt-in");
-    GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
-        state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-        hk_n, dk, hv_n, dv, dvec);
-    Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+    // TILE-PIPE variant (Rung-1 of vt::tile): keeps v_new on-chip across V1->V2
+    // (lever 1) and cp.async-stages the K tile (lever 2). VT_GDN_TILE_PIPE=1
+    // selects it; the baseline GdnChunkDeltaHWmmaKernel stays for A/B. Vs (the
+    // resident v_new tile, [kChunk,Dv]*sz) is added only when the augmented
+    // footprint fits the smem opt-in — bf16 hot path (96K) fits; the f32 corner
+    // would need 128K, so it keeps the global v_new read (correctness-only).
+    const char* tp_env = std::getenv("VT_GDN_TILE_PIPE");
+    const bool tile_pipe = tp_env != nullptr && tp_env[0] == '1';
+    if (tile_pipe) {
+      const char* ca_env = std::getenv("VT_GDN_TILE_PIPE_CPASYNC");
+      const bool cp_async_k = ca_env == nullptr || ca_env[0] != '0';  // default ON
+      const size_t vs_bytes = static_cast<size_t>(kChunk * dv) * sz;
+      const bool stage_vnew = (delta_bytes + vs_bytes) <= static_cast<size_t>(smem_optin);
+      const size_t tp_bytes = delta_bytes + (stage_vnew ? vs_bytes : 0);
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHTilePipeKernel<TSc>), tp_bytes,
+             "gdn chunked delta_h(tile-pipe) shared opt-in");
+      GdnChunkDeltaHTilePipeKernel<TSc><<<grid_seq, occ_delta, tp_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv, dvec, stage_vnew, cp_async_k);
+      Check(cudaGetLastError(), "gdn chunked delta_h(tile-pipe) launch");
+    } else {
+      opt_in(reinterpret_cast<void*>(GdnChunkDeltaHWmmaKernel<TSc>), delta_bytes,
+             "gdn chunked delta_h(wmma) shared opt-in");
+      GdnChunkDeltaHWmmaKernel<TSc><<<grid_seq, occ_delta, delta_bytes, s>>>(
+          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+          hk_n, dk, hv_n, dv, dvec);
+      Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
+    }
 
     const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
                           ? static_cast<size_t>(kChunk * dk) * sz

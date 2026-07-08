@@ -142,8 +142,47 @@ THE METHOD — do this BEFORE and DURING any parity/throughput work:
    reliable; for reliable %/time, capture STEADY-STATE (long run so warmup amortizes, or
    an nsys capture-range that excludes warmup).
 
-Code-only comparison is necessary but NOT sufficient. If you have not nsys'd vLLM on the
+Code-only comparison is necessary but NOT sufficient. If you have not PROFILED vLLM on the
 workload, you do not yet know where the gap is — you are guessing.
+
+### MANDATORY during autonomous porting: profile vLLM's ACTUAL kernels, port 1:1 what it runs
+
+**"At-parity" inferred from SOURCE is NOT parity — you must MEASURE it.** (Proven
+2026-07-08, per user: *"this kind of profiling is what we have to put as a rule in our
+protocol to follow during porting autonomously"*; *"if vllm has these numbers, I don't see
+why we can't by porting 1:1 every component to the vllm execution path."*) A whole session
+was spent concluding our fp4/fp8 GEMM + attention were "at-parity" by reading that both use
+cutlass/nvjet — while the measured TOTAL stayed 0.82×. **The tell: a total-vs-parts
+CONTRADICTION.** If every component reads "at-parity" from source but the end-to-end number
+is not, then a component you LABELED at-parity is NOT — and only vLLM's actual per-kernel
+profile finds it. When it landed, the 0.82× dissolved into a concrete finite port list:
+vLLM runs GDN `chunk_..._h_blockdim64` (V-split) + `merge_16x16_to_64x64_inverse` (blocked-
+inverse) + heavily-fused `triton_..._add_rms_norm[_scaled_fp4_quant]` chains + a specific
+`flash_fwd_splitkv<256,64,64,4>` + the `nvjet...TST...TNNN` fp8 variant — none of which the
+source scan surfaced as gaps. **The gap is never a ceiling; it is the specific kernels vLLM
+runs that we haven't matched 1:1.**
+
+**THE WORKING RECIPE (nsys BREAKS vLLM's V1 EngineCore on GB10 — use vLLM's own torch
+profiler):**
+1. OURS: `nsys profile -t cuda ... ; nsys stats --report cuda_gpu_kern_sum` (works for us).
+2. vLLM: nsys fails (EngineCore init). Use the LLM-API torch profiler instead — a Python
+   script (run under `~/venvs/vllm-oracle/bin/python`) with these NON-obvious requirements:
+   - Wrap the body in `if __name__ == '__main__':` — vLLM uses `spawn` (CUDA pre-init) which
+     re-imports the module; an unguarded top-level `LLM(...)` double-inits and crashes.
+   - `LLM(model=..., profiler_config=ProfilerConfig(profiler="torch", torch_profiler_dir="/tmp/vprof3"))`
+     (`from vllm.config.profiler import ProfilerConfig`) — v0.24.0's API. The old
+     `VLLM_TORCH_PROFILER_DIR` env is UNRECOGNIZED (warns "Unknown env var") and `start_profile`
+     then no-ops → fails.
+   - `warmup generate → llm.start_profile() → generate ×3 (graphed steady state) → llm.stop_profile()`.
+   - Fit GPU mem: a crashed run can leak a ~65 GiB CUDA context with NO owning process (only a
+     reset/reboot clears it); drop `gpu_memory_utilization` (e.g. 0.35) so `request_memory`
+     doesn't ValueError on startup.
+   - Parse the `*.pt.trace.json.gz` chrome trace: aggregate `traceEvents` with `cat=='kernel'`
+     by name, sum `dur`, rank — that IS vLLM's per-kernel GPU breakdown.
+3. DIFF vLLM's kernel list vs OURS → each divergence (vLLM runs X, we run Y / vLLM fuses N→1)
+   is a port target. Port 1:1 from the dep source the trace names (FLA/flashinfer/cutlass),
+   cite it, realize PORTABLY (see discipline.md: DSL source is a reference, never a compile-
+   target). Re-measure. Repeat until the kernel lists match.
 
 **Converge on vLLM's execution path — CLEAN UP superseded/dormant kernels.** When the
 trace shows we REINVENTED a kernel the code-reading hid (e.g. hand-WMMA GDN chunk vs

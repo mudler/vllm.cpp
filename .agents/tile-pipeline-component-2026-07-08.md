@@ -76,3 +76,15 @@ A/B win (in1024/out128 conc32) vs the current hand kernel — same-binary toggle
 Kept OFF as a **measurement oracle** — it can compile FLA's exact kernel to cubin
 to give us the ground-truth "what Triton's codegen achieves" number to target,
 without shipping it. Not merged; violates the canon for shipping.
+
+## Campaign sequence (user, 2026-07-08: "after that we chase the other levers then reassess")
+
+1. **delta_h faithful register-tiled port** (H in accumulator registers, smem freed
+   for the cp.async ring) — the true 1:1 FLA blockdim64. Rung-1 staging-add-on was
+   token-exact but NEUTRAL: our H-in-64KiB-smem starves the ring; FLA holds H in
+   registers (`b_h1..b_h4`). IN PROGRESS.
+2. **chunk_o** via `vt::tile` (no persistent state → ring fits, more parallel).
+3. **recompute_w_u** via `vt::tile`.
+4. **fused norm+quant chains** (~8%) — the TDR/fused-recipe framework (fusion, not
+   just pipelining). Reuses the component where staging applies.
+5. **Reassess** — re-profile vLLM vs ours, re-rank the residual gap.

@@ -142,6 +142,14 @@ struct Request {
   // Appended to during decode via AppendOutputToken.
   std::vector<int32_t> output_token_ids;
   int num_computed_tokens = 0;
+  // num_output_placeholders (upstream Request.num_output_placeholders, driven by
+  // AsyncScheduler): the count of sampled tokens this request has been SCHEDULED
+  // for but whose update_from_output (the AppendOutputToken) has not yet run —
+  // the async depth-2 pipeline defers that. schedule() adds it to NumTokens() so
+  // num_new_tokens stays 1 per decode step even though the output token has not
+  // been appended yet; update_from_output decrements it as tokens land. Stays 0
+  // on the synchronous path (VT_ASYNC_DECODE off), so every use is a no-op there.
+  int num_output_placeholders = 0;
   RequestStatus status = RequestStatus::kWaiting;
   // stop_reason (upstream Request.stop_reason: int | str | None = None). Set by
   // check_stop (sched/utils) when a stop_token_ids match ends the request — it

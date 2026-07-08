@@ -148,6 +148,19 @@ class GPUModelRunner final : public ModelRunnerBase {
   ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output) override;
 
+  // Async-decode pipeline seam (VT_ASYNC_DECODE). execute_model_async runs the
+  // forward + sample and, for an eager pure-decode all-greedy step with
+  // allow_defer set, returns a PendingModelOutput holding the recorded (NOT
+  // synced) side-stream readback event + the device slot; finalize_output syncs
+  // it and materializes the host ModelRunnerOutput (with the deferred token
+  // write-back). Any non-eligible step (or allow_defer=false) returns a ready
+  // pending computed synchronously (write-back in line). See runner.cpp.
+  PendingModelOutput execute_model_async(
+      const SchedulerOutput& scheduler_output,
+      const std::optional<GrammarOutput>& grammar_output,
+      bool allow_defer) override;
+  ModelRunnerOutput finalize_output(PendingModelOutput& pending) override;
+
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
   InputBatch& input_batch() { return input_batch_; }
   const InputBatch& input_batch() const { return input_batch_; }
@@ -185,6 +198,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   // are reclaimed. Only col 0 is read by the GDN builder (state indices).
   void remap_gdn_state_slots(std::vector<int32_t>& gdn_bt, int gdn_cols,
                              int num_reqs);
+  // Zero the ssm + conv recurrent-state row of `slot` across every GDN layer — a
+  // fresh sequence starts from a zero mamba state. remap_gdn_state_slots calls
+  // this the first time it assigns a slot to a new pool block-id (a new sequence)
+  // when the async pipeline is on: with VT_ASYNC_DECODE a finishing request's
+  // speculative step advances its state one EXTRA time before its slot is
+  // reclaimed, so a reused slot's stale state (relied upon to be zero for a fresh
+  // seq — a 1-token prompt is GDN-decode-classified, so has_initial_state never
+  // gates it) would perturb the next request's greedy argmax. 0 bytes == +0.0 in
+  // both f32 and bf16 caches.
+  void zero_gdn_state_slot(int32_t slot);
 
   const HfConfig& config_;
   // Exactly one of {moe_weights_, dense_weights_} is non-null, selecting the MoE
@@ -261,6 +284,10 @@ class GPUModelRunner final : public ModelRunnerBase {
     // greedy fast path) and reads them back on the side stream instead of the
     // blocking full-token download. False => the current synchronous path.
     bool async_sample = false;
+    // Which ping-pong async slot (0/1) THIS step's device sample + readback use.
+    // Chosen in execute_model (opposite the previous async step's slot) so a
+    // step N pending and step N+1's in-flight forward never alias a buffer.
+    int async_slot = 0;
   } exec_state_;
 
   // ─── Async-decode device state (VT_ASYNC_DECODE) ────────────────────────────
@@ -268,14 +295,39 @@ class GPUModelRunner final : public ModelRunnerBase {
   // freed in the destructor. All no-op / unallocated when the toggle is OFF.
   // Mirrors vLLM's prev_sampled_token_ids (kept on GPU) + the AsyncGPUModelRunner
   // Output copy stream + event (gpu_model_runner.py:268-296, 1819-1837, 3687).
+  //
+  // DOUBLE-BUFFERED (kAsyncSlots == 2): with the depth-2 engine pipeline, step N
+  // is still un-finalized (its readback copy possibly in flight on the side
+  // stream, its device tokens still needed as the source of step N+1's on-GPU
+  // input build) while step N+1's forward + sample are issued on the main stream.
+  // Step N and N+1 therefore use OPPOSITE slots so N+1's argmax write into
+  // prev_sampled cannot clobber N's not-yet-synced readback (a cross-stream
+  // hazard), and next_input/remap/host/events likewise never alias. finalize(N)
+  // host-syncs slot N's copy event before step N+2 (same parity) reuses it.
   void ensure_async_resources();
-  void* async_prev_sampled_ = nullptr;  // device i64 [max_num_reqs]: retained argmax
-  void* async_next_input_ = nullptr;    // device i32 [max_num_reqs]: on-GPU next input_ids
-  void* async_remap_ = nullptr;         // device i32 [max_num_reqs]: cur slot -> prev slot
-  std::vector<int64_t> async_host_tokens_;  // side-stream D2H staging [max_num_reqs]
+  // sample_tokens_impl: the shared sampler body behind sample_tokens (defer=false
+  // => a fully host-ready PendingModelOutput, write-back in line) and the async
+  // pipeline (defer=true => an eager pure-decode greedy step returns a DEFERRED
+  // pending whose readback event is recorded but not synced, finalized later).
+  PendingModelOutput sample_tokens_impl(
+      const std::optional<GrammarOutput>& grammar_output, bool defer);
+  // finalize_async_slot: host-sync the slot's readback copy, build the
+  // ModelRunnerOutput from the host staging buffer, and apply the deferred token
+  // write-back into the InputBatch by req_id (skipping any request already
+  // removed from the batch — a finished/aborted req whose speculative token is
+  // discarded). Shared by the in-line (allow_defer=false) and deferred paths.
+  ModelRunnerOutput finalize_async_slot(int slot,
+                                        const std::vector<std::string>& req_ids,
+                                        int num_reqs);
+  static constexpr int kAsyncSlots = 2;
+  void* async_prev_sampled_[kAsyncSlots] = {nullptr, nullptr};  // device i64 [max_num_reqs]: retained argmax
+  void* async_next_input_[kAsyncSlots] = {nullptr, nullptr};    // device i32 [max_num_reqs]: on-GPU next input_ids
+  void* async_remap_[kAsyncSlots] = {nullptr, nullptr};         // device i32 [max_num_reqs]: cur slot -> prev slot
+  std::vector<int64_t> async_host_tokens_[kAsyncSlots];  // side-stream D2H staging [max_num_reqs]
+  void* async_sample_done_[kAsyncSlots] = {nullptr, nullptr};   // event: main-stream greedy-argmax complete
+  void* async_copy_done_[kAsyncSlots] = {nullptr, nullptr};     // event: side-stream token D2H complete
   vt::Queue async_copy_queue_{};        // side (copy) stream; handle==nullptr until created
-  void* async_sample_done_ = nullptr;   // event: main-stream greedy-argmax complete
-  void* async_copy_done_ = nullptr;     // event: side-stream token D2H complete
+  int async_prev_slot_ = -1;            // slot the PREVIOUS async step sampled into (-1 = none)
   bool async_ready_ = false;            // async buffers / stream / events allocated
 };
 

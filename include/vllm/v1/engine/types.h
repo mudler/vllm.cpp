@@ -98,6 +98,41 @@ struct ModelRunnerOutput {
   std::vector<std::vector<int32_t>> sampled_token_ids;
 };
 
+// ─── Async-decode pipeline (VT_ASYNC_DECODE) ────────────────────────────────
+// A step's in-flight result, mirroring vLLM's AsyncGPUModelRunnerOutput
+// (vllm/v1/worker/gpu_model_runner.py:242-332): the runner records the sampled
+// tokens' side-stream readback event but does NOT synchronize it, so the engine
+// can issue the next step's forward+sample before it blocks on this one. The
+// depth-2 batch queue (core.cpp) holds these; finalize_output() later syncs the
+// event and materializes the host ModelRunnerOutput.
+//
+// Two shapes:
+//   * ready == true  — the output is already host-ready (the synchronous /
+//     non-async-eligible path computed it and did its write-back in line). The
+//     `output` field carries the complete ModelRunnerOutput; finalize is a move.
+//   * ready == false — an async-eligible eager pure-decode greedy step: the
+//     tokens live in the runner's double-buffered device slot `async_slot`, the
+//     side-stream copy event is recorded (not synced). finalize_output() syncs
+//     it, builds the ModelRunnerOutput from the host staging buffer, and applies
+//     the deferred token write-back into the runner's InputBatch (by req_id).
+struct PendingModelOutput {
+  bool ready = false;
+  ModelRunnerOutput output;  // valid iff ready == true
+
+  // Async finalize bookkeeping (valid iff ready == false). `async_slot` selects
+  // which of the runner's two ping-pong device/host/event buffers this step
+  // owns (depth-2 => at most two in flight, on opposite parities, no collision).
+  int async_slot = -1;
+  int num_reqs = 0;
+  std::vector<std::string> req_ids;  // dense (post-reorder) order at sample time
+};
+
+// AsyncDecodeEnabled (VT_ASYNC_DECODE): the single source of truth for the async
+// pipeline toggle, shared by the runner (device-token / greedy-device path) and
+// the EngineCore (depth-2 batch queue). Read once. Default OFF => the entire
+// pipeline is byte-identical to the synchronous path.
+bool AsyncDecodeEnabled();
+
 // EngineCoreOutput (vllm/v1/engine/__init__.py): the per-request core -> frontend
 // delta. msgspec.Struct upstream; a plain value carrier here.
 struct EngineCoreOutput {

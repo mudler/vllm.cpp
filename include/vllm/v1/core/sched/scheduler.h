@@ -95,9 +95,17 @@ class Scheduler {
   // stay backward-compatible with the M1.4/M1.8 tests that build a bare
   // scheduler — when null, structured output is a no-op (get_grammar_bitmask
   // returns nullopt; no grammar advance).
+  // async_scheduling (upstream: the AsyncScheduler subclass, selected by
+  // scheduler_config.async_scheduling): when true the scheduler reserves a
+  // num_output_placeholders slot per scheduled decode so num_new_tokens stays
+  // correct while the depth-2 engine pipeline defers update_from_output. Defaults
+  // to AsyncDecodeEnabled() so it tracks VT_ASYNC_DECODE (the engine's step_async
+  // toggle) automatically; a synchronous-drive unit test that hand-simulates the
+  // runner (appending tokens itself, no update_from_output) passes false.
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
             int block_size, bool enable_caching = false,
-            StructuredOutputManager* structured_output_manager = nullptr);
+            StructuredOutputManager* structured_output_manager = nullptr,
+            bool async_scheduling = AsyncDecodeEnabled());
 
   // add_request: enqueue a new request into waiting_ and register it in the
   // requests_ map (the scheduler takes ownership). (Upstream add_request T0
@@ -214,6 +222,8 @@ class Scheduler {
   int long_prefill_token_threshold_;
   bool enable_chunked_prefill_;
   bool scheduler_reserve_full_isl_;
+  // Async scheduling (num_output_placeholders) enabled — see the ctor note.
+  bool async_scheduling_;
   // T0: 0 (no speculative decode / eagle).
   int num_lookahead_tokens_ = 0;
   // T0: 1 (not a diffusion model).

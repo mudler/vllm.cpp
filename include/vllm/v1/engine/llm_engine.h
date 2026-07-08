@@ -95,9 +95,14 @@ class LLMEngine {
   void abort_request(const std::string& request_id);
 
   // has_unfinished_requests (llm_engine.py:191): drives the generate loop. The DP
-  // term is deferred (single engine at T0).
+  // term is deferred (single engine at T0). The engine_core has_pending() term
+  // mirrors vLLM's has_work() `bool(self.batch_queue)` (core.py:1252): with the
+  // async depth-2 pipeline ON, keep stepping until the in-flight queue is drained
+  // so the last real token flushes and any speculative overflow step is discarded
+  // (via update_from_output's finished-request skip). Always false when OFF.
   bool has_unfinished_requests() const {
-    return output_processor_.has_unfinished_requests();
+    return output_processor_.has_unfinished_requests() ||
+           engine_core_.has_pending();
   }
   // get_num_unfinished_requests (llm_engine.py:188).
   int get_num_unfinished_requests() const {

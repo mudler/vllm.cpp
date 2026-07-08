@@ -32,9 +32,10 @@
 #pragma once
 
 #include <optional>
+#include <utility>
 
 #include "vllm/v1/core/sched/output.h"  // SchedulerOutput
-#include "vllm/v1/engine/types.h"       // ModelRunnerOutput
+#include "vllm/v1/engine/types.h"       // ModelRunnerOutput, PendingModelOutput
 
 namespace vllm::v1 {
 
@@ -62,6 +63,42 @@ class ModelRunnerBase {
   // (apply_grammar_bitmask before _sample). The no-grammar path is unchanged.
   virtual ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output) = 0;
+
+  // ─── Async-decode pipeline seam (VT_ASYNC_DECODE) ──────────────────────────
+  // execute_model_async: run the forward AND sample for this step, but return a
+  // PendingModelOutput WITHOUT blocking on the sampled-token readback when the
+  // step is async-eligible (eager pure-decode all-greedy) and `allow_defer` is
+  // set — the tokens stay on device, the side-stream copy event is recorded (not
+  // synced), and the deferred host write-back is applied later in finalize_output.
+  // Mirrors vLLM's execute_model(non_block=True) returning an
+  // AsyncGPUModelRunnerOutput (gpu_model_runner.py:242-296). `allow_defer=false`
+  // forces a fully synchronous, host-ready result (used when the engine cannot
+  // overlap this step, e.g. a prefill / batch reshape).
+  //
+  // DEFAULT (this base / test doubles): synchronous — run execute_model then
+  // sample_tokens now and hand back a `ready` pending. Overridden by the real
+  // GPUModelRunner to implement the true device-token deferral.
+  virtual PendingModelOutput execute_model_async(
+      const SchedulerOutput& scheduler_output,
+      const std::optional<GrammarOutput>& grammar_output,
+      bool allow_defer) {
+    (void)allow_defer;
+    PendingModelOutput pending;
+    std::optional<ModelRunnerOutput> forward = execute_model(scheduler_output);
+    pending.output = forward.has_value() ? std::move(*forward)
+                                         : sample_tokens(grammar_output);
+    pending.ready = true;
+    return pending;
+  }
+
+  // finalize_output: block on the pending step's readback event (if any), apply
+  // the deferred write-back, and produce the host ModelRunnerOutput the scheduler
+  // consumes. Mirrors AsyncGPUModelRunnerOutput.get_output()
+  // (gpu_model_runner.py:290-332). DEFAULT: the pending is already host-ready
+  // (produced synchronously above) — hand back its output.
+  virtual ModelRunnerOutput finalize_output(PendingModelOutput& pending) {
+    return std::move(pending.output);
+  }
 };
 
 }  // namespace vllm::v1

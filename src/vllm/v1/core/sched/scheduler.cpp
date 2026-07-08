@@ -38,7 +38,8 @@ SchedulingPolicy ToQueuePolicy(SchedulerPolicy policy) {
 Scheduler::Scheduler(SchedulerConfig scheduler_config,
                      KVCacheConfig kv_cache_config, int block_size,
                      bool enable_caching,
-                     StructuredOutputManager* structured_output_manager)
+                     StructuredOutputManager* structured_output_manager,
+                     bool async_scheduling)
     : max_num_running_reqs(scheduler_config.max_num_seqs),
       max_num_scheduled_tokens(
           scheduler_config.ResolvedMaxNumScheduledTokens()),
@@ -50,7 +51,8 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
           scheduler_config.long_prefill_token_threshold),
       enable_chunked_prefill_(scheduler_config.enable_chunked_prefill),
       scheduler_reserve_full_isl_(
-          scheduler_config.scheduler_reserve_full_isl) {
+          scheduler_config.scheduler_reserve_full_isl),
+      async_scheduling_(async_scheduling) {
   // Scheduling policy -> the waiting (FCFS) queue.
   waiting = create_request_queue(ToQueuePolicy(scheduler_config.policy));
 
@@ -133,9 +135,13 @@ SchedulerOutput Scheduler::schedule() {
   while (req_index < running.size() && token_budget > 0) {
     Request* request = running[req_index];
 
-    // num_tokens_with_spec == num_tokens at T0 (no spec tokens);
-    // num_output_placeholders == 0 (async scheduling deferred).
-    int num_new_tokens = request->NumTokens() - request->num_computed_tokens;
+    // num_tokens_with_spec == num_tokens at T0 (no spec tokens). Add
+    // num_output_placeholders (scheduler.py:473-477): with async scheduling the
+    // sampled tokens of prior in-flight steps are not appended to NumTokens() yet,
+    // so they are counted here as placeholders — keeping num_new_tokens == 1 per
+    // decode step. 0 on the synchronous path (byte-identical).
+    int num_new_tokens = request->NumTokens() + request->num_output_placeholders -
+                         request->num_computed_tokens;
     if (0 < long_prefill_token_threshold_ &&
         long_prefill_token_threshold_ < num_new_tokens) {
       num_new_tokens = long_prefill_token_threshold_;
@@ -421,6 +427,17 @@ EngineCoreOutputs Scheduler::update_from_output(
         }
       }
     }
+    // async_scheduler.py:66-68: retire this step's reserved placeholder(s) now
+    // that the real tokens have been appended (mirrors -= len(new_token_ids)).
+    // No-op on the synchronous path (num_output_placeholders stays 0). A request
+    // that finished this step is freed below regardless of its residual count.
+    if (async_scheduling_ && request->num_output_placeholders > 0) {
+      request->num_output_placeholders -=
+          static_cast<int>(new_token_ids.size());
+      if (request->num_output_placeholders < 0) {
+        request->num_output_placeholders = 0;
+      }
+    }
     // DEFERRED: pooling stop.
 
     // scheduler.py:1636-1651: advance the structured-output FSM by the sampled
@@ -552,13 +569,23 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
        scheduler_output.num_scheduled_tokens) {
     Request* request = requests.at(req_id).get();
     request->num_computed_tokens += num_scheduled_token;
-    // num_output_placeholders == 0 at T0.
+    // scheduler.py:1183-1185 is_prefill_chunk uses the placeholders value from
+    // BEFORE this step's async increment below (a decode req that just sampled is
+    // NOT a prefill chunk: num_computed == NumTokens()+placeholders_before).
     request->is_prefill_chunk =
-        request->num_computed_tokens < request->NumTokens();
+        request->num_computed_tokens <
+        request->NumTokens() + request->num_output_placeholders;
     // scheduler.py:1186: a structured request that is past its prefill chunk
     // needs a grammar bitmask this step.
     scheduler_output.has_structured_output_requests |=
         request->use_structured_output() && !request->is_prefill_chunk;
+    // async_scheduler.py:26-41: reserve a placeholder for the token this step
+    // will sample (num_sampled_tokens_per_step, == 1 at T0; no spec) for every
+    // request past its prefill chunk — the update_from_output that appends it is
+    // deferred by the depth-2 pipeline. No-op on the synchronous path.
+    if (async_scheduling_ && !request->is_prefill_chunk) {
+      request->num_output_placeholders += num_sampled_tokens_per_step_;
+    }
   }
   // Flush the finished / preempted id sets (assign fresh sets so the already
   // copied-out scheduler_output is unaffected).

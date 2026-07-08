@@ -83,8 +83,15 @@ std::unique_ptr<Scheduler> CreateScheduler(int max_num_seqs = 16,
       std::make_shared<FullAttentionSpec>(block_size, /*num_kv_heads=*/1,
                                           /*head_size=*/1, DType::kF32));
 
+  // These cases drive the scheduler SYNCHRONOUSLY, hand-simulating the runner
+  // (they AppendOutputToken themselves without calling update_from_output), so
+  // they exercise the synchronous scheduler contract regardless of the
+  // VT_ASYNC_DECODE env: async_scheduling=false disables the num_output_
+  // placeholders reservation (which assumes the pipeline defers update_from_output).
   return std::make_unique<Scheduler>(cfg, kv_cfg, block_size,
-                                     /*enable_caching=*/true);
+                                     /*enable_caching=*/true,
+                                     /*structured_output_manager=*/nullptr,
+                                     /*async_scheduling=*/false);
 }
 
 // Mirror of test utils.create_requests (T0 subset): prompts of `num_tokens`

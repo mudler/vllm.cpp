@@ -45,14 +45,16 @@
 // __init__ config/plugin/GC-freeze setup (T0 wires refs directly).
 #pragma once
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "vllm/v1/core/sched/output.h"     // SchedulerOutput
 #include "vllm/v1/core/sched/scheduler.h"  // Scheduler
-#include "vllm/v1/engine/types.h"          // EngineCoreOutputs
+#include "vllm/v1/engine/types.h"          // EngineCoreOutputs, PendingModelOutput
 #include "vllm/v1/executor/executor.h"     // Executor
 #include "vllm/v1/request.h"               // Request
 
@@ -89,9 +91,49 @@ class EngineCore {
   // step: one iteration of the engine loop. Returns the per-client outputs map
   // (single client at T0) and whether the model was executed
   // (total_num_scheduled_tokens > 0). See the file header for the full order.
+  // When VT_ASYNC_DECODE is set this dispatches to the depth-2 batch-queue
+  // variant (step_with_batch_queue); otherwise the synchronous path (unchanged).
   std::pair<std::map<int, EngineCoreOutputs>, bool> step();
 
+  // has_pending: whether the async batch queue still holds in-flight steps whose
+  // outputs have not been drained. The driver loop (LLMEngine) keeps stepping
+  // while this is true so the pipeline is fully flushed (and any speculative
+  // overflow step is discarded). Always false on the synchronous path.
+  bool has_pending() const { return !batch_queue_.empty(); }
+
  private:
+  // The synchronous step (core.py:479-508) — the exact current path.
+  std::pair<std::map<int, EngineCoreOutputs>, bool> step_sync();
+  // The depth-2 async step (core.py:519-632 step_with_batch_queue): schedule +
+  // issue forward/sample non-blocking, push onto batch_queue_; block on and
+  // update_from_output the OLDEST pending only when the queue is full (or no more
+  // work), so step N's host output-processing overlaps step N+1's GPU forward.
+  std::pair<std::map<int, EngineCoreOutputs>, bool> step_async();
+
+  // An in-flight step held in the batch queue: the SchedulerOutput that produced
+  // it (needed by update_from_output) + the runner's pending (device tokens +
+  // recorded readback event), synced/finalized when popped.
+  struct PendingStep {
+    SchedulerOutput scheduler_output;
+    PendingModelOutput pending;
+  };
+
+  // Whether a scheduled step is a pure-decode continuation the pipeline may
+  // overlap: no new/resumed requests, no finished-request removals, no structured
+  // output, every scheduled req exactly one token. Anything else (prefill, chunk,
+  // reshape, flush) is finalized WITHOUT deferral after draining the queue, so a
+  // host-token step never reads an InputBatch whose write-back is still pending.
+  static bool is_overlappable_decode(const SchedulerOutput& scheduler_output);
+
+  // Finalize + update_from_output one popped pending, merging its per-client
+  // outputs into `out`.
+  void finalize_and_update(PendingStep& step,
+                           std::map<int, EngineCoreOutputs>& out);
+
+  // Depth-2 in-flight queue (empty + unused on the synchronous path).
+  static constexpr std::size_t kBatchQueueSize = 2;
+  std::deque<PendingStep> batch_queue_;
+
   Scheduler& scheduler_;
   Executor& executor_;
   // The engine's StructuredOutputManager (null when structured output is not

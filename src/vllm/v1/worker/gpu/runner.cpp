@@ -68,13 +68,8 @@ static bool GpuSampleEnabled() {
 // the current (blocking) path — when ON, a pure-decode fp4/CUDA step that would
 // use the graph is instead routed through the eager device path so async engages;
 // with the graph forced off (VLLM_CPP_CUDAGRAPH=0) the A/B is eager-vs-eager.
-static bool AsyncDecodeEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_ASYNC_DECODE");
-    return e != nullptr && e[0] == '1';
-  }();
-  return on;
-}
+// AsyncDecodeEnabled() is defined once in engine/types.cpp (shared with the
+// EngineCore's depth-2 batch queue) so the runner and engine never disagree.
 
 // 27B DENSE decode CUDA-graph toggle (the dense sibling of the 35B MoE decode
 // graph). Default ON: a pure-decode step on the fp4/CUDA dense (27B) model is
@@ -326,28 +321,34 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
 GPUModelRunner::~GPUModelRunner() {
   if (!async_ready_) return;
   vt::Backend& b = vt::GetBackend(queue_.device.type);
-  if (async_prev_sampled_ != nullptr) b.Free(async_prev_sampled_);
-  if (async_next_input_ != nullptr) b.Free(async_next_input_);
-  if (async_remap_ != nullptr) b.Free(async_remap_);
-  b.DestroyEvent(async_sample_done_);
-  b.DestroyEvent(async_copy_done_);
+  for (int s = 0; s < kAsyncSlots; ++s) {
+    if (async_prev_sampled_[s] != nullptr) b.Free(async_prev_sampled_[s]);
+    if (async_next_input_[s] != nullptr) b.Free(async_next_input_[s]);
+    if (async_remap_[s] != nullptr) b.Free(async_remap_[s]);
+    b.DestroyEvent(async_sample_done_[s]);
+    b.DestroyEvent(async_copy_done_[s]);
+  }
   b.DestroyQueue(async_copy_queue_);
 }
 
 // Lazily allocate the async-decode device buffers + side copy stream + events on
 // the first async-eligible step (VT_ASYNC_DECODE). Sized by max_num_reqs (the
-// pure-decode batch is one token per request). No-op after the first call.
+// pure-decode batch is one token per request), DOUBLE-BUFFERED (two slots) so the
+// depth-2 pipeline's two in-flight steps never alias a buffer. No-op after the
+// first call.
 void GPUModelRunner::ensure_async_resources() {
   if (async_ready_) return;
   vt::Backend& b = vt::GetBackend(queue_.device.type);
   const size_t nmax = static_cast<size_t>(max_num_reqs_ > 0 ? max_num_reqs_ : 1);
-  async_prev_sampled_ = b.Alloc(nmax * sizeof(int64_t));
-  async_next_input_ = b.Alloc(nmax * sizeof(int32_t));
-  async_remap_ = b.Alloc(nmax * sizeof(int32_t));
-  async_host_tokens_.assign(nmax, 0);
+  for (int s = 0; s < kAsyncSlots; ++s) {
+    async_prev_sampled_[s] = b.Alloc(nmax * sizeof(int64_t));
+    async_next_input_[s] = b.Alloc(nmax * sizeof(int32_t));
+    async_remap_[s] = b.Alloc(nmax * sizeof(int32_t));
+    async_host_tokens_[s].assign(nmax, 0);
+    async_sample_done_[s] = b.CreateEvent();
+    async_copy_done_[s] = b.CreateEvent();
+  }
   async_copy_queue_ = b.CreateQueue();
-  async_sample_done_ = b.CreateEvent();
-  async_copy_done_ = b.CreateEvent();
   async_ready_ = true;
 }
 
@@ -506,8 +507,28 @@ void GPUModelRunner::remap_gdn_state_slots(std::vector<int32_t>& gdn_bt,
       slot = gdn_free_slots_.back();
       gdn_free_slots_.pop_back();
       gdn_slot_of_block_.emplace(blk, slot);
+      // New sequence -> zero its (possibly reused) recurrent-state slot so the
+      // async speculative step of a prior request can't leak into it. Gated on
+      // the async toggle to keep the synchronous path byte-identical (it relies
+      // on the construction-zeroed slots + coincidence-free reuse, unchanged).
+      if (AsyncDecodeEnabled()) {
+        zero_gdn_state_slot(slot);
+      }
     }
     gdn_bt[off] = slot;
+  }
+}
+
+void GPUModelRunner::zero_gdn_state_slot(int32_t slot) {
+  if (gdn_state_slots_ <= 0 || slot < 0) return;
+  const size_t s = static_cast<size_t>(slot);
+  for (std::vector<uint8_t>& buf : ssm_buf_) {
+    const size_t row = buf.size() / static_cast<size_t>(gdn_state_slots_);
+    if (row > 0) std::memset(buf.data() + s * row, 0, row);
+  }
+  for (std::vector<uint8_t>& buf : conv_buf_) {
+    const size_t row = buf.size() / static_cast<size_t>(gdn_state_slots_);
+    if (row > 0) std::memset(buf.data() + s * row, 0, row);
   }
 }
 
@@ -622,9 +643,20 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   const bool async_sample =
       AsyncDecodeEnabled() && pure_decode && gather && GpuSampleEnabled();
   const int32_t* async_dev_tokens = nullptr;  // device i32 [num_reqs] next input_ids
+  // THIS step's ping-pong slot: opposite the previous async step's (async_prev_
+  // slot_), so an un-finalized step N (buffers still live) and step N+1's forward
+  // never alias. sample_tokens reads exec_state_.async_slot to match.
+  const int cur_slot =
+      (async_prev_slot_ >= 0) ? (1 - async_prev_slot_) : 0;
   if (async_sample) {
     ensure_async_resources();
-    if (input_batch_.prev_sampled_valid && num_reqs <= max_num_reqs_) {
+    exec_state_.async_slot = cur_slot;
+    // Build step N+1's input_ids ON-GPU from the PREVIOUS async step's retained
+    // device tokens (async_prev_sampled_[async_prev_slot_]) into THIS step's
+    // next_input slot. Requires the previous step to have kept its tokens on
+    // device (prev_sampled_valid) and every current req to have been in it.
+    if (input_batch_.prev_sampled_valid && async_prev_slot_ >= 0 &&
+        num_reqs <= max_num_reqs_) {
       std::vector<int32_t> remap(static_cast<size_t>(num_reqs));
       bool ok = true;
       for (int i = 0; i < num_reqs; ++i) {
@@ -635,17 +667,17 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       }
       if (ok) {
         vt::Backend& b = vt::GetBackend(queue_.device.type);
-        b.Copy(queue_, async_remap_, remap.data(),
+        b.Copy(queue_, async_remap_[cur_slot], remap.data(),
                static_cast<size_t>(num_reqs) * sizeof(int32_t));
-        vt::Tensor dst = vt::Tensor::Contiguous(async_next_input_, vt::DType::kI32,
+        vt::Tensor dst = vt::Tensor::Contiguous(async_next_input_[cur_slot], vt::DType::kI32,
                                                 queue_.device, {static_cast<int64_t>(num_reqs)});
-        vt::Tensor src = vt::Tensor::Contiguous(async_prev_sampled_, vt::DType::kI64,
-                                                queue_.device,
+        vt::Tensor src = vt::Tensor::Contiguous(async_prev_sampled_[async_prev_slot_],
+                                                vt::DType::kI64, queue_.device,
                                                 {static_cast<int64_t>(max_num_reqs_)});
-        vt::Tensor idx = vt::Tensor::Contiguous(async_remap_, vt::DType::kI32,
+        vt::Tensor idx = vt::Tensor::Contiguous(async_remap_[cur_slot], vt::DType::kI32,
                                                 queue_.device, {static_cast<int64_t>(num_reqs)});
         vt::GatherTokens(queue_, dst, src, idx);
-        async_dev_tokens = static_cast<const int32_t*>(async_next_input_);
+        async_dev_tokens = static_cast<const int32_t*>(async_next_input_[cur_slot]);
       }
     }
   }
@@ -728,6 +760,13 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 
 ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::optional<GrammarOutput>& grammar_output) {
+  // The synchronous seam (sync EngineCore, tests): sample + finalize in line.
+  PendingModelOutput pending = sample_tokens_impl(grammar_output, /*defer=*/false);
+  return std::move(pending.output);
+}
+
+PendingModelOutput GPUModelRunner::sample_tokens_impl(
+    const std::optional<GrammarOutput>& grammar_output, bool defer) {
   ModelRunnerOutput out;
   // Async-decode invariant: prev_sampled_valid is TRUE only if THIS step actually
   // retains its sampled tokens in async_prev_sampled_ (the greedy success path
@@ -736,7 +775,10 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   input_batch_.prev_sampled_valid = false;
   const int num_reqs = exec_state_.num_reqs;
   if (num_reqs == 0) {
-    return out;  // 0-token flush step (nothing sampled).
+    PendingModelOutput p;
+    p.ready = true;
+    p.output = std::move(out);  // 0-token flush step (nothing sampled).
+    return p;
   }
 
   const int64_t vocab = config_.vocab_size;
@@ -810,55 +852,58 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // this an eager pure-decode device-logits step and the batch is all-greedy with
   // no active logits processor, keep the sampled token ON DEVICE (sample_greedy_
   // device runs the SAME GreedyArgmax kernel — bit-identical to sampler_.forward's
-  // greedy path — into async_prev_sampled_) and read it back on the SIDE copy
-  // stream, event-synced, instead of the blocking full-token download. The token
-  // write-back + ModelRunnerOutput are identical to the synchronous path; it also
-  // records prev_req_id_to_index / prev_sampled_valid for the NEXT step's on-GPU
-  // input build. Any non-eligible condition falls through to the synchronous path.
+  // greedy path — into async_prev_sampled_[slot]) and issue a SIDE-stream readback
+  // (event recorded, NOT synced). It records prev_req_id_to_index /
+  // prev_sampled_valid / async_prev_slot_ for the NEXT step's on-GPU input build
+  // RIGHT HERE (before this call returns) so step N+1's forward can start without
+  // waiting on this step's host readback — the whole point of the pipeline.
+  //   * defer == true  (depth-2 engine): return a DEFERRED pending; the host
+  //     readback + token write-back happen later in finalize_output, overlapping
+  //     step N+1's GPU forward.
+  //   * defer == false (sync seam): finalize the slot IN LINE (readback + write-
+  //     back now) — token-identical, one blocking readback, no overlap.
+  // Any non-eligible condition falls through to the synchronous sampler below.
   if (exec_state_.async_sample && exec_state_.logits.on_device() && async_ready_) {
-    vt::Tensor prev = vt::Tensor::Contiguous(async_prev_sampled_, vt::DType::kI64,
+    const int slot = exec_state_.async_slot;
+    vt::Tensor prev = vt::Tensor::Contiguous(async_prev_sampled_[slot], vt::DType::kI64,
                                              queue_.device,
                                              {static_cast<int64_t>(num_reqs)});
     if (sampler_.sample_greedy_device(queue_, logits, prev, sm)) {
       vt::Backend& b = vt::GetBackend(queue_.device.type);
       // Side-stream, non-blocking token D2H: the copy stream waits for the main
-      // stream's argmax, copies, records copy_done; the host blocks on copy_done
-      // ONLY where the tokens are consumed just below. (Moving that host block PAST
-      // the next forward is the engine-loop async-output companion — deferred: our
-      // EngineCore consumes sampled_token_ids in-step via update_from_output, so
-      // the tokens must be host-ready before sample_tokens returns.)
-      b.RecordEvent(queue_, async_sample_done_);
-      b.StreamWaitEvent(async_copy_queue_, async_sample_done_);
-      b.Copy(async_copy_queue_, async_host_tokens_.data(), async_prev_sampled_,
+      // stream's argmax (sample_done[slot]), copies into host staging[slot], and
+      // records copy_done[slot]. NO SyncEvent here — finalize_async_slot(slot)
+      // blocks on it, either now (defer=false) or after the next forward is
+      // issued (defer=true, the overlap win).
+      b.RecordEvent(queue_, async_sample_done_[slot]);
+      b.StreamWaitEvent(async_copy_queue_, async_sample_done_[slot]);
+      b.Copy(async_copy_queue_, async_host_tokens_[slot].data(),
+             async_prev_sampled_[slot],
              static_cast<size_t>(num_reqs) * sizeof(int64_t));
-      b.RecordEvent(async_copy_queue_, async_copy_done_);
-      b.SyncEvent(async_copy_done_);
+      b.RecordEvent(async_copy_queue_, async_copy_done_[slot]);
 
+      // Record THIS step's mapping for step N+1's on-GPU input build. The device
+      // tokens in async_prev_sampled_[slot] stay live (this slot is not reused
+      // until step N+2) so step N+1 can gather from them without the host readback.
       input_batch_.prev_req_id_to_index.clear();
-      out.req_ids.reserve(static_cast<size_t>(num_reqs));
-      out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
       for (int i = 0; i < num_reqs; ++i) {
-        const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
-        out.req_ids.push_back(req_id);
-        out.req_id_to_index[req_id] = i;
-        const int32_t tok =
-            static_cast<int32_t>(async_host_tokens_[static_cast<size_t>(i)]);
-        out.sampled_token_ids.push_back({tok});
-        // Same write-back as the synchronous path (single non-spec decode token).
-        const int n = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)];
-        const size_t idx = static_cast<size_t>(i) *
-                               static_cast<size_t>(input_batch_.max_model_len) +
-                           static_cast<size_t>(n);
-        if (idx < input_batch_.token_ids_cpu.size())
-          input_batch_.token_ids_cpu[idx] = tok;
-        input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] = n + 1;
-        auto& out_ids = input_batch_.req_output_token_ids[static_cast<size_t>(i)];
-        if (out_ids.has_value()) out_ids->push_back(tok);
-        // Record this step's slot for the NEXT step's on-GPU input build.
-        input_batch_.prev_req_id_to_index[req_id] = i;
+        input_batch_.prev_req_id_to_index[exec_state_.req_ids[static_cast<size_t>(i)]] = i;
       }
       input_batch_.prev_sampled_valid = true;
-      return out;
+      async_prev_slot_ = slot;
+
+      PendingModelOutput p;
+      p.async_slot = slot;
+      p.num_reqs = num_reqs;
+      p.req_ids = exec_state_.req_ids;  // dense (post-reorder) order at sample time
+      if (defer) {
+        p.ready = false;  // finalize_output syncs + writes back later.
+        return p;
+      }
+      // Synchronous seam: finalize the slot now (block on the readback).
+      p.ready = true;
+      p.output = finalize_async_slot(slot, p.req_ids, num_reqs);
+      return p;
     }
   }
 
@@ -895,7 +940,90 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       }
     }
   }
+  PendingModelOutput p;
+  p.ready = true;  // synchronous sampler: output already host-ready + written back.
+  p.output = std::move(out);
+  return p;
+}
+
+// finalize_async_slot: host-sync the slot's readback copy, materialize the
+// ModelRunnerOutput from the host staging buffer, and apply the DEFERRED token
+// write-back into the InputBatch. Mirrors AsyncGPUModelRunnerOutput.get_output()
+// (gpu_model_runner.py:290-332). Shared by the in-line (defer=false) and depth-2
+// deferred paths. The write-back resolves each request's slot by req_id at THIS
+// moment (not the captured sample-time slot): a request removed from the batch
+// since sampling (finished / aborted) is SKIPPED — its speculative token is
+// discarded, exactly as update_from_output skips it on the scheduler side.
+ModelRunnerOutput GPUModelRunner::finalize_async_slot(
+    int slot, const std::vector<std::string>& req_ids, int num_reqs) {
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  // Block on the side-stream readback (a no-op on CPU; the real host<->GPU wait
+  // on CUDA). After this the tokens are host-ready in async_host_tokens_[slot].
+  b.SyncEvent(async_copy_done_[slot]);
+
+  ModelRunnerOutput out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = req_ids[static_cast<size_t>(i)];
+    out.req_ids.push_back(req_id);
+    out.req_id_to_index[req_id] = i;
+    const int32_t tok =
+        static_cast<int32_t>(async_host_tokens_[slot][static_cast<size_t>(i)]);
+    out.sampled_token_ids.push_back({tok});
+    // Deferred write-back at the request's CURRENT slot (looked up by id; a
+    // finished/removed request is absent -> skip, discarding its speculative
+    // token). token_ids_cpu / num_tokens_no_spec grow exactly as the synchronous
+    // path, just one step later (the next forward already consumed the ON-DEVICE
+    // token, not this host value).
+    const auto it = input_batch_.req_id_to_index.find(req_id);
+    if (it == input_batch_.req_id_to_index.end()) {
+      continue;
+    }
+    const int r = it->second;
+    const int n = input_batch_.num_tokens_no_spec[static_cast<size_t>(r)];
+    const size_t idx = static_cast<size_t>(r) *
+                           static_cast<size_t>(input_batch_.max_model_len) +
+                       static_cast<size_t>(n);
+    if (idx < input_batch_.token_ids_cpu.size()) {
+      input_batch_.token_ids_cpu[idx] = tok;
+    }
+    input_batch_.num_tokens_no_spec[static_cast<size_t>(r)] = n + 1;
+    auto& out_ids = input_batch_.req_output_token_ids[static_cast<size_t>(r)];
+    if (out_ids.has_value()) out_ids->push_back(tok);
+  }
   return out;
+}
+
+// execute_model_async: run the forward + sample for this step. When async is ON
+// and the step is eager pure-decode all-greedy AND allow_defer is set, returns a
+// DEFERRED PendingModelOutput (device tokens + recorded-not-synced readback);
+// otherwise a host-ready pending. Mirrors execute_model(non_block=True) building
+// an AsyncGPUModelRunnerOutput (gpu_model_runner.py:242-296).
+PendingModelOutput GPUModelRunner::execute_model_async(
+    const SchedulerOutput& scheduler_output,
+    const std::optional<GrammarOutput>& grammar_output, bool allow_defer) {
+  std::optional<ModelRunnerOutput> forward = execute_model(scheduler_output);
+  if (forward.has_value()) {
+    // A non-MRV2 / 0-token flush that produced the output directly.
+    PendingModelOutput p;
+    p.ready = true;
+    p.output = std::move(*forward);
+    return p;
+  }
+  return sample_tokens_impl(grammar_output, allow_defer);
+}
+
+// finalize_output: block on the pending step's readback and materialize its host
+// ModelRunnerOutput (with the deferred write-back). Mirrors
+// AsyncGPUModelRunnerOutput.get_output() (gpu_model_runner.py:290-332). A ready
+// pending (synchronous / non-async step) is handed back with no blocking.
+ModelRunnerOutput GPUModelRunner::finalize_output(PendingModelOutput& pending) {
+  if (pending.ready) {
+    return std::move(pending.output);
+  }
+  return finalize_async_slot(pending.async_slot, pending.req_ids,
+                             pending.num_reqs);
 }
 
 }  // namespace vllm::v1

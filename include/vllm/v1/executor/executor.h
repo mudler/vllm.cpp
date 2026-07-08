@@ -57,6 +57,19 @@ class Executor {
   ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output = std::nullopt);
 
+  // execute_and_sample_async: the async-pipeline seam (VT_ASYNC_DECODE). Mirrors
+  // execute_model(non_block=True) + sample_tokens(non_block=True) returning an
+  // AsyncGPUModelRunnerOutput future; here it fuses the runner's execute_model +
+  // sample into a PendingModelOutput that is NOT synced when allow_defer is set
+  // and the step is eager pure-decode all-greedy (the depth-2 overlap case).
+  PendingModelOutput execute_and_sample_async(
+      const SchedulerOutput& scheduler_output,
+      const std::optional<GrammarOutput>& grammar_output, bool allow_defer);
+
+  // finalize_output: block on a pending step's readback event and materialize the
+  // host ModelRunnerOutput (mirrors future.result() / get_output()).
+  ModelRunnerOutput finalize_output(PendingModelOutput& pending);
+
  private:
   ModelRunnerBase& runner_;
 };

@@ -19,4 +19,21 @@ ModelRunnerOutput Executor::sample_tokens(
   return runner_.sample_tokens(grammar_output);
 }
 
+PendingModelOutput Executor::execute_and_sample_async(
+    const SchedulerOutput& scheduler_output,
+    const std::optional<GrammarOutput>& grammar_output, bool allow_defer) {
+  // Upstream: execute_model(non_block=True) then sample_tokens(non_block=True),
+  // returning an AsyncGPUModelRunnerOutput future. T0 single-worker: a direct
+  // fused call on the runner returning the pending (device tokens + recorded
+  // readback event) WITHOUT syncing when allow_defer and the step is eligible.
+  return runner_.execute_model_async(scheduler_output, grammar_output,
+                                     allow_defer);
+}
+
+ModelRunnerOutput Executor::finalize_output(PendingModelOutput& pending) {
+  // Upstream: future.result() -> AsyncGPUModelRunnerOutput.get_output() (blocks
+  // on the copy event). T0: a direct call on the runner.
+  return runner_.finalize_output(pending);
+}
+
 }  // namespace vllm::v1

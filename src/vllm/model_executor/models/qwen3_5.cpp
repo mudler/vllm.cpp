@@ -644,6 +644,30 @@ bool Bf16GemmOutEnabled() {
   return on;
 }
 
+// HOIST GDN PREFILL METADATA (VT_HOIST_GDN_PREFILL_META): the batched-paged GDN
+// PREFILL branches rebuild step-constant metadata as fresh pageable-source H2D
+// DBuf uploads INSIDE the per-layer forward — the conv branch's
+// non_spec_query_start_loc + has_initial_state (u8->i32), the ssm branch's
+// prefill_query_start_loc — so they re-upload once per GDN layer (~30/step). Each
+// is a BLOCKING cudaMemcpyAsync from pageable std::vector memory that stalls until
+// the prior layer's kernels drain, serializing the GDN layers within a prefill
+// step. These all derive from the STEP-level GDNAttentionMetadata (identical
+// across every GDN layer), so they are hoisted — exactly like the decode
+// StepDevInputs fix — to ONE upload per step (built in BuildStepDevInputs,
+// consumed as const device views). Bit-exact (same bytes, uploaded once instead
+// of per layer). The state gather/scatter indices (non_spec/prefill_state_indices)
+// are host-driven (GatherStateF32/ScatterStateF32 iterate them on the host to
+// offset row copies), NOT H2D uploads, so they are untouched. Default OFF until
+// GPU-gated; VT_HOIST_GDN_PREFILL_META=1 enables. OFF is byte-identical to the
+// current per-layer path (the guard falls through to the unchanged construction).
+bool HoistGdnPrefillMetaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_HOIST_GDN_PREFILL_META");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
 // VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
@@ -1183,6 +1207,16 @@ struct StepDevInputs {
   DBuf query_start_loc;  // i32 [num_reqs+1]
   DBuf gdn_state_idx;    // i32 [num_decodes] (decode path; else a 1-elem stub)
   bool has_gdn_idx = false;
+  // GDN PREFILL step-constant metadata (VT_HOIST_GDN_PREFILL_META): built ONCE
+  // per step from the GDNAttentionMetadata (identical across all ~30 GDN layers),
+  // consumed by GdnBlockPaged's conv + ssm prefill branches as const device views
+  // instead of the per-layer DBuf re-uploads. Present only on a prefill step
+  // (num_prefills>0) with the toggle ON; else 1-elem stubs. Upstream only
+  // populates has_initial_state when num_prefills>0 (gdn_attn.py:389-405).
+  DBuf non_spec_query_start_loc;  // i32 [nreq+1] (conv prefill dqsl)
+  DBuf has_initial_state;         // i32 [nreq]   (conv prefill dhis, u8->i32)
+  DBuf prefill_query_start_loc;   // i32 [np+1]   (ssm prefill dpqsl)
+  bool has_gdn_prefill = false;
 };
 
 StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
@@ -1198,6 +1232,10 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
       DBuf(d, DType::kI32, {1}),  // gdn stub (replaced below on a decode step)
       false,
+      DBuf(d, DType::kI32, {1}),  // non_spec_query_start_loc stub (prefill hoist)
+      DBuf(d, DType::kI32, {1}),  // has_initial_state stub (prefill hoist)
+      DBuf(d, DType::kI32, {1}),  // prefill_query_start_loc stub (prefill hoist)
+      false,
   };
   // GDN decode state indices: the leading num_decodes entries of the non-spec
   // state-index vector, SHARED by causal_conv1d_update + the fused decode
@@ -1207,6 +1245,27 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
     s.gdn_state_idx = DBuf(d, DType::kI32, {gm.num_decodes},
                            gm.non_spec_state_indices_tensor->data());
     s.has_gdn_idx = true;
+  }
+  // GDN PREFILL step-constant metadata (VT_HOIST_GDN_PREFILL_META): hoist the
+  // conv branch's non_spec_query_start_loc + has_initial_state (u8->i32) and the
+  // ssm branch's prefill_query_start_loc out of the per-GDN-layer forward to ONE
+  // upload per step (was 3 uploads × ~30 GDN layers). Guarded on the toggle so
+  // OFF stays byte-identical (no extra uploads). Populated only when the step has
+  // prefills — matches the per-layer `if (np > 0)` branches and upstream's
+  // has_initial_state (only set when num_prefills>0). Shapes/dtypes mirror the
+  // per-layer DBufs exactly: [nreq+1], [nreq] (u8->i32 cast), [np+1] i32.
+  if (HoistGdnPrefillMetaEnabled() && gm.num_prefills > 0) {
+    const auto& qsl_full = *gm.non_spec_query_start_loc;
+    const auto& his_u8 = *gm.has_initial_state;
+    const auto& p_qsl = *gm.prefill_query_start_loc;
+    std::vector<int32_t> his(his_u8.begin(), his_u8.end());
+    s.non_spec_query_start_loc = DBuf(
+        d, DType::kI32, {static_cast<int64_t>(qsl_full.size())}, qsl_full.data());
+    s.has_initial_state =
+        DBuf(d, DType::kI32, {static_cast<int64_t>(his.size())}, his.data());
+    s.prefill_query_start_loc =
+        DBuf(d, DType::kI32, {static_cast<int64_t>(p_qsl.size())}, p_qsl.data());
+    s.has_gdn_prefill = true;
   }
   return s;
 }
@@ -1259,19 +1318,30 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // Any prefill: conv over the WHOLE non-spec stream (decodes lead, each with
     // has_initial_state=1). qwen_gdn_linear_attn.py:1360-1375.
     const auto& sidx = *meta.non_spec_state_indices_tensor;
-    const auto& qsl_full = *meta.non_spec_query_start_loc;
-    const auto& his_u8 = *meta.has_initial_state;
     const int64_t nreq = static_cast<int64_t>(sidx.size());
     // Gather the persistent conv_state rows into an f32 working buffer (bf16
     // cache on CUDA → upcast; f32 cache on CPU → direct), run the f32
-    // CausalConv1dFwd, then downcast + scatter back to the cache.
+    // CausalConv1dFwd, then downcast + scatter back to the cache. The gather/
+    // scatter iterate `sidx` on the HOST to offset row copies — not an H2D upload.
     const std::vector<int64_t> cs_shape = {nreq, conv_dim, Kw - 1};
     DBuf dcs = GatherStateF32(d, state.conv_state, sidx, conv_row_elems, cs_shape);
-    std::vector<int32_t> his(his_u8.begin(), his_u8.end());
-    DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
-    DBuf dhis(d, DType::kI32, {nreq}, his.data());
+    // Step-constant conv metadata (non_spec_query_start_loc [nreq+1] +
+    // has_initial_state [nreq], u8->i32): consumed from the per-step StepDevInputs
+    // when hoisted (VT_HOIST_GDN_PREFILL_META), else rebuilt per-layer here (OFF is
+    // byte-identical to the previous path — same shapes/bytes, one upload/layer).
+    const bool hoist = HoistGdnPrefillMetaEnabled() && sdi.has_gdn_prefill;
+    std::optional<DBuf> dqsl_l, dhis_l;
+    if (!hoist) {
+      const auto& qsl_full = *meta.non_spec_query_start_loc;
+      const auto& his_u8 = *meta.has_initial_state;
+      std::vector<int32_t> his(his_u8.begin(), his_u8.end());
+      dqsl_l.emplace(d, DType::kI32, std::vector<int64_t>{nreq + 1}, qsl_full.data());
+      dhis_l.emplace(d, DType::kI32, std::vector<int64_t>{nreq}, his.data());
+    }
+    Tensor dqsl_t = hoist ? sdi.non_spec_query_start_loc.t() : dqsl_l->t();
+    Tensor dhis_t = hoist ? sdi.has_initial_state.t() : dhis_l->t();
     vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
-                        dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
+                        dqsl_t, dhis_t, vt::CausalConv1dArgs{true});
     ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems, cs_shape);
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
@@ -1360,7 +1430,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     for (size_t s = 0; s < p_his.size(); ++s)
       if (p_his[s] == 0)
         d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
-    DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
+    // Step-constant prefill_query_start_loc [np+1] i32: consumed from the per-step
+    // StepDevInputs when hoisted (VT_HOIST_GDN_PREFILL_META), else rebuilt per-layer
+    // (OFF is byte-identical). The HOST pointer p_qsl.data() below (gdn_args
+    // .query_start_loc_host) is a separate on-host hint — kept regardless.
+    const bool hoist = HoistGdnPrefillMetaEnabled() && sdi.has_gdn_prefill;
+    std::optional<DBuf> dpqsl_l;
+    if (!hoist)
+      dpqsl_l.emplace(d, DType::kI32, std::vector<int64_t>{np + 1}, p_qsl.data());
+    Tensor dpqsl_t = hoist ? sdi.prefill_query_start_loc.t() : dpqsl_l->t();
     Tensor q_pre = SubView(dql2.t(), nd_tok, np_tok);
     Tensor k_pre = SubView(dkl2.t(), nd_tok, np_tok);
     Tensor v_pre = SubView(vf.t(), nd_tok, np_tok);
@@ -1375,7 +1453,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     vt::GdnArgs gdn_args{scale};
     gdn_args.query_start_loc_host = p_qsl.data();
     vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                   dpqsl.t(), gdn_args);
+                   dpqsl_t, gdn_args);
     ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems, ss_shape);
   }
 

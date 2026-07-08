@@ -1282,3 +1282,36 @@ TEST_CASE("CUDA gdn prefill chunked V-split matches sequential (VT_GDN_CHUNK_VSP
   (void)f32;
   (void)bf16;
 }
+
+// V-split + cp.async pipelining (VT_GDN_CHUNK_VSPLIT=1 VT_GDN_CHUNK_CPASYNC=1) vs
+// the sequential scan. cp.async changes only WHEN the streaming k / hstart tiles
+// arrive in shared, never their VALUE or the WMMA f32 accumulation order, so the
+// pipelined path MUST stay token-exact. cp.async is bf16-only (the f32 dispatch
+// runs plain V-split); the bf16 cases here exercise the DeltaH k-ring + ChunkO
+// hstart-prefetch, the f32 cases confirm the toggle is a safe no-op there.
+TEST_CASE("CUDA gdn prefill chunked V-split+cp.async matches sequential (VT_GDN_CHUNK_CPASYNC)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo f32 = {DType::kF32, DType::kF32, 5e-3f, 5e-3f};
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_CHUNK_VSPLIT", "1", 1);
+  setenv("VT_GDN_CHUNK_CPASYNC", "1", 1);
+  // bf16 (the cp.async hot path): single partial chunk, exact chunk, 2 chunks +
+  // partial tail, multi-head, multi-sequence varlen — covers the ring prime, the
+  // per-chunk prefetch, the partial-tail async bounds, and the drain.
+  RunGdnChunkedVsSequential({0, 40}, 1, 1, 128, 128, bf16, 8100, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 128}, 1, 1, 128, 128, bf16, 8110, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, bf16, 8120, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 2, 4, 128, 128, bf16, 8130, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 130}, 4, 8, 128, 128, bf16, 8140, 3e-2f, 3e-2f);
+  // f32: cp.async is bf16-only, so this runs plain V-split — confirms the toggle
+  // is a safe no-op on the f32 path.
+  RunGdnChunkedVsSequential({0, 150}, 2, 4, 128, 128, f32, 8150, 5e-3f, 5e-3f);
+  // Restore defaults for any later cases.
+  setenv("VT_GDN_CHUNK_CPASYNC", "0", 1);
+  setenv("VT_GDN_CHUNK_VSPLIT", "0", 1);
+  (void)f32;
+  (void)bf16;
+}

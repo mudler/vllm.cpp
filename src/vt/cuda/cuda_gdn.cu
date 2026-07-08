@@ -11,6 +11,7 @@
 // reference validates qsl bounds/monotonicity host-side; here bad metadata is
 // unchecked (correctness-grade — the M0.9 builder owns metadata integrity).
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>  // __pipeline_memcpy_async/commit/wait_prior (cp.async, sm_80+)
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -1581,7 +1582,18 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
 // f32 running state Hf[BV,Dk] resident in dynamic shared; pool reused by V1/V2.
 // Structurally identical to GdnChunkDeltaHWmmaKernel with dv→bv in the state slice
 // and V-loop bounds, and the v_new/state/hstate offsets shifted by vbase.
-template <typename TD>
+//
+// CP (VT_GDN_CHUNK_CPASYNC): 2-stage cp.async ring that PREFETCHES chunk it+1's raw
+// k-tile into the OTHER of two [kChunk,Dk] shared buffers (kring) while chunk it's
+// V1 computes, then builds Kd IN-PLACE in kring[it&1] (×decay) for V2 — emulating
+// FLA's num_stages software pipeline over the per-chunk global k load. The Hf state
+// slice stays SINGLE-buffered (the big one). TOKEN-EXACT: cp.async moves the exact
+// bf16 bytes of k (Load(kring)==Load(k)), the in-place ×decay reproduces the sync
+// build's Kd bit-for-bit, and the WMMA reads Kd in the same tile order — only WHEN k
+// arrives changes, never its value or the f32 accumulation. Only rows [0,len) are
+// async-copied (never past the chunk, matching the sync bounds); the multiply zeros
+// the [len,kChunk) tail. CP=false compiles out the ring and is byte-identical.
+template <typename TD, bool CP>
 __global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_new, const TD* k,
                                                const TD* u, const TD* w, const float* gcum,
                                                const int32_t* qsl, const int32_t* boh, int64_t hk_n,
@@ -1602,7 +1614,17 @@ __global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_n
 
   extern __shared__ char smem_raw[];
   float* Hf = reinterpret_cast<float*>(smem_raw);   // [BV,Dk] f32 state slice
-  char* pool = smem_raw + sdv * sizeof(float);       // reused by V1/V2
+  // CP layout: [Hf][kring: 2×[kChunk,Dk] TD prefetch ring][pool: V1 Hb+sTile].
+  // non-CP layout: [Hf][pool: max(V1, V2) reused]. kring is persistent across the
+  // chunk (prefetch issued before V1) so it cannot alias the V1 pool.
+  [[maybe_unused]] TD* kring = nullptr;  // CP-only; unused in the CP=false instance
+  char* pool;
+  if constexpr (CP) {
+    kring = reinterpret_cast<TD*>(smem_raw + sdv * sizeof(float));
+    pool = smem_raw + sdv * sizeof(float) + 2 * static_cast<size_t>(kChunk * dk) * sizeof(TD);
+  } else {
+    pool = smem_raw + sdv * sizeof(float);  // reused by V1/V2
+  }
   __shared__ float decay[kChunk];
 
   float* s_head = state + (n * hv_n + hv) * sd + vbase * dk;  // [BV,Dk] slice
@@ -1614,11 +1636,42 @@ __global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_n
   __syncthreads();
 
   const int64_t nt = (seqlen + kChunk - 1) / kChunk;
+  // Prime stage 0 with chunk 0's raw k rows [0,len0) (CP only). gpr = 16 B cp.async
+  // groups per k row (V::N = 8 bf16 per group).
+  if constexpr (CP) {
+    if (nt > 0) {
+      const int gpr = static_cast<int>(dk) / V::N;
+      const int64_t len0 = seqlen < kChunk ? seqlen : kChunk;
+      for (int64_t idx = tid; idx < len0 * gpr; idx += blockDim.x) {
+        const int64_t i = idx / gpr, g = idx % gpr;
+        __pipeline_memcpy_async(kring + i * dk + g * V::N,
+                                k + (begin + i) * hk_n * dk + hk * dk + g * V::N, 16);
+      }
+      __pipeline_commit();
+    }
+  }
   for (int64_t it = 0; it < nt; ++it) {
     const int64_t gc = boh_n + it;
     const int64_t tok0 = begin + it * kChunk;
     const int64_t rem = seqlen - it * kChunk;
     const int64_t len = rem < kChunk ? rem : kChunk;
+    // Prefetch chunk it+1's raw k into the OTHER ring stage (CP only), issued
+    // before V1 so its global load overlaps V1's WMMA.
+    if constexpr (CP) {
+      if (it + 1 < nt) {
+        const int gpr = static_cast<int>(dk) / V::N;
+        const int64_t tok0n = begin + (it + 1) * kChunk;
+        const int64_t remn = seqlen - (it + 1) * kChunk;
+        const int64_t lenn = remn < kChunk ? remn : kChunk;
+        TD* dstk = kring + ((it + 1) & 1) * static_cast<int64_t>(kChunk * dk);
+        for (int64_t idx = tid; idx < lenn * gpr; idx += blockDim.x) {
+          const int64_t i = idx / gpr, g = idx % gpr;
+          __pipeline_memcpy_async(dstk + i * dk + g * V::N,
+                                  k + (tok0n + i) * hk_n * dk + hk * dk + g * V::N, 16);
+        }
+        __pipeline_commit();
+      }
+    }
     TD* hstart = hstate + (gc * hv_n + hv) * sd + vbase * dk;  // [BV,Dk] slice
     if (vec)
       for (int64_t g = tid; g < sdv / V::N; g += blockDim.x) {
@@ -1691,27 +1744,45 @@ __global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_n
     }
 
     // --- V2: H = H*exp(G_last) + V_newᵀ @ (K⊙decay)  ([BV,len]@[len,Dk]) ---
-    TD* Kd = reinterpret_cast<TD*>(pool);                       // [kChunk,Dk] TD, decay-scaled
-    if (vec)
-      for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
-        const int64_t base = g * V::N;
-        const int64_t i = base / dk, ki = base % dk;
-        if (i < len) {
-          float kf[V::N];
-          V::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
-          const float d = decay[i];
-#pragma unroll
-          for (int j = 0; j < V::N; ++j) kf[j] *= d;
-          V::Sf(Kd + base, kf);
-        } else {
-          V::Sf0(Kd + base);
-        }
-      }
-    else
+    TD* Kd;
+    if constexpr (CP) {
+      // Chunk it's raw k was prefetched into kring[it&1]; wait for it (leaving the
+      // it+1 prefetch in flight, or drain all on the last chunk), then build Kd
+      // IN-PLACE: kring[it&1][i,ki] = (i<len)? k*decay : 0. Load(kring) reads the
+      // byte-identical bf16 k, so Kd matches the sync build bit-for-bit.
+      if (it + 1 < nt)
+        __pipeline_wait_prior(1);
+      else
+        __pipeline_wait_prior(0);
+      __syncthreads();
+      Kd = kring + (it & 1) * static_cast<int64_t>(kChunk * dk);
       for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
-        const int64_t i = e / dk, ki = e % dk;
-        Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+        const int64_t i = e / dk;
+        Store(Kd, e, i < len ? Load(Kd, e) * decay[i] : 0.0f);
       }
+    } else {
+      Kd = reinterpret_cast<TD*>(pool);  // [kChunk,Dk] TD, decay-scaled
+      if (vec)
+        for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+          const int64_t base = g * V::N;
+          const int64_t i = base / dk, ki = base % dk;
+          if (i < len) {
+            float kf[V::N];
+            V::Uf(k + (tok0 + i) * hk_n * dk + hk * dk + ki, kf);
+            const float d = decay[i];
+#pragma unroll
+            for (int j = 0; j < V::N; ++j) kf[j] *= d;
+            V::Sf(Kd + base, kf);
+          } else {
+            V::Sf0(Kd + base);
+          }
+        }
+      else
+        for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+          const int64_t i = e / dk, ki = e % dk;
+          Store(Kd, e, i < len ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + ki) * decay[i] : 0.0f);
+        }
+    }
     __syncthreads();
     const int nvt = static_cast<int>(bv) / kWM;
     const int ntiles2 = nvt * (dk / kWM);
@@ -1746,7 +1817,14 @@ __global__ void GdnChunkDeltaHWmmaVSplitKernel(float* state, TD* hstate, TD* v_n
 // each i_v program, chunk_o.py:90-113). Structurally identical to
 // GdnChunkOWmmaKernel with dv→bv in the outc slice / V-loop bounds and the
 // hstart/v_new/out offsets shifted by vbase.
-template <typename TD, typename Tout>
+//
+// CP (VT_GDN_CHUNK_CPASYNC): ChunkO has ONE chunk per block (no chunk loop to ring
+// across), so cp.async PREFETCHES the cross operand hstart [BV,Dk] into a shared Hs
+// buffer up front and overlaps that global load with the (hstart-independent) Qs/Ks
+// staging + qk=Q@Kᵀ + A build; cross then reads Hs. TOKEN-EXACT: Hs is a byte copy
+// of hstart, read with the same tiling, so the WMMA fragments/accumulation are
+// identical. CP=false compiles out Hs and is byte-identical.
+template <typename TD, typename Tout, bool CP>
 __global__ void GdnChunkOWmmaVSplitKernel(Tout* out, const TD* q, const TD* k, const TD* v_new,
                                           const TD* hstate, const float* gcum,
                                           const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
@@ -1775,6 +1853,14 @@ __global__ void GdnChunkOWmmaVSplitKernel(Tout* out, const TD* q, const TD* k, c
   float* outc = reinterpret_cast<float*>(p2);                            // [kChunk,BV]
   float* qks = reinterpret_cast<float*>(p2 + r2);                        // [kChunk,kChunk]
   TD* As = reinterpret_cast<TD*>(qks + kChunk * kChunk);                 // [kChunk,kChunk]
+  [[maybe_unused]] TD* Hs = nullptr;  // [BV,Dk] hstart prefetch; CP-only
+  if constexpr (CP) {
+    Hs = As + kChunk * kChunk;
+    // Prefetch hstart -> Hs (contiguous [BV,Dk]); overlaps the staging/qk/A below.
+    for (int64_t g = tid; g < (bv * dk) / V::N; g += blockDim.x)
+      __pipeline_memcpy_async(Hs + g * V::N, hstart + g * V::N, 16);
+    __pipeline_commit();
+  }
   __shared__ float gs[kChunk], eg[kChunk];
 
   if (vec)
@@ -1828,7 +1914,14 @@ __global__ void GdnChunkOWmmaVSplitKernel(Tout* out, const TD* q, const TD* k, c
   }
   __syncthreads();
 
-  // cross = Q @ Hstartᵀ  [kChunk,BV] -> outc (aliases Ks, now free)
+  // cross = Q @ Hstartᵀ  [kChunk,BV] -> outc (aliases Ks, now free). CP: consume
+  // the prefetched Hs (drain the async group first); else read hstart from global.
+  const TD* hsrc = hstart;
+  if constexpr (CP) {
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    hsrc = Hs;
+  }
   const int nvt = static_cast<int>(bv) / kWM;
   const int ncr = (kChunk / kWM) * nvt;
   for (int t = warp; t < ncr; t += nwarps) {
@@ -1840,7 +1933,7 @@ __global__ void GdnChunkOWmmaVSplitKernel(Tout* out, const TD* q, const TD* k, c
       typename Cfg::Arow a;
       typename Cfg::Bcol b;
       Cfg::load(a, Qs + i0 * dk + kk, dk);
-      Cfg::load(b, hstart + lvi0 * dk + kk, dk);
+      Cfg::load(b, hsrc + lvi0 * dk + kk, dk);
       wmma::mma_sync(acc, a, b, acc);
     }
     wmma::store_matrix_sync(outc + i0 * bv + lvi0, acc, static_cast<int>(bv), wmma::mem_row_major);
@@ -2167,6 +2260,15 @@ bool GdnChunkVSplitEnabled() {
   return e != nullptr && e[0] == '1';
 }
 
+// cp.async software-pipelining toggle (VT_GDN_CHUNK_CPASYNC=1; default OFF). Only
+// meaningful WITH VT_GDN_CHUNK_VSPLIT=1 and only on the bf16 hot path (the f32
+// V-split ChunkO already uses ~96 KiB, no room for the extra stage). Read each
+// call, same rationale as GdnChunkVSplitEnabled.
+bool GdnChunkCpAsyncEnabled() {
+  const char* e = std::getenv("VT_GDN_CHUNK_CPASYNC");
+  return e != nullptr && e[0] == '1';
+}
+
 // Zeros ONLY v_new's per-sequence last-partial-chunk slack rows, exactly the rows
 // the WMMA tiles over-read past each sequence's real tokens:
 //   [qsl[n]+seqlen_n, qsl[n]+ceil(seqlen_n/kChunk)*kChunk) x [0,dv)
@@ -2398,49 +2500,77 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const int64_t bv = dv / nv;
     const bool vsplit = GdnChunkVSplitEnabled() && (dv % nv == 0) && (bv % kNB == 0);
     if (vsplit) {
+      // cp.async software-pipelining (VT_GDN_CHUNK_CPASYNC, bf16 hot path only —
+      // f32 ChunkO is already ~96 KiB with no room for the extra stage). Only the
+      // bf16 LaunchChunkedPrefill instantiation compiles the CP=true kernels
+      // (if constexpr), so <float,true> is never instantiated. cpasync is read only
+      // inside the bf16 if-constexpr block (unused in the f32 instance).
+      [[maybe_unused]] const bool cpasync = GdnChunkCpAsyncEnabled();
       const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
       const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
-      const size_t delta_bytes =
-          static_cast<size_t>(bv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-      // Always opt in (mirror GdnChunkWUWmmaKernel): the bf16 V-split delta_bytes
-      // is EXACTLY 48 KiB (32 KiB [BV,Dk] f32 slice + 16 KiB bf16 pool), so the
-      // opt_in helper's strict ">48 KiB" guard would SKIP the attribute, and
-      // 48 KiB dynamic + the static decay[] (256 B) overflows the 48 KiB default
-      // cap on total per-block shared → cudaErrorInvalidValue at launch. Setting
-      // the max-dynamic attribute unconditionally is a no-op when it already fits
-      // and correctly raises the cap at the boundary (f32 V-split = 64 KiB already
-      // trips the helper's guard, but do it uniformly for both dtypes).
-      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc>),
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(delta_bytes)),
-            "gdn chunked delta_h(wmma,vsplit) shared opt-in");
+      const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * bv) * 4
+                            ? static_cast<size_t>(kChunk * dk) * sz
+                            : static_cast<size_t>(kChunk * bv) * 4;
+      const size_t chunko_base = static_cast<size_t>(kChunk * dk) * sz + r2 +
+                                 static_cast<size_t>(kChunk * kChunk) * 4 +
+                                 static_cast<size_t>(kChunk * kChunk) * sz;
       const dim3 grid_seq_vs(static_cast<unsigned>(n_seq), static_cast<unsigned>(hv_n),
                              static_cast<unsigned>(nv));
-      GdnChunkDeltaHWmmaVSplitKernel<TSc><<<grid_seq_vs, occ_delta, delta_bytes, s>>>(
-          state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
-          hk_n, dk, hv_n, dv, bv, dvec);
-      Check(cudaGetLastError(), "gdn chunked delta_h(wmma,vsplit) launch");
-
-      const size_t r2 =
-          static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * bv) * 4
-              ? static_cast<size_t>(kChunk * dk) * sz
-              : static_cast<size_t>(kChunk * bv) * 4;
-      const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
-                                  static_cast<size_t>(kChunk * kChunk) * 4 +
-                                  static_cast<size_t>(kChunk * kChunk) * sz;
-      // ChunkO V-split is 56 KiB (bf16) / 96 KiB (f32) — both already trip the
-      // opt_in guard, but set the attribute unconditionally too so the boundary
-      // can never bite (e.g. a future BV/NV that lands the bf16 arena on 48 KiB).
-      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout>),
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(chunko_bytes)),
-            "gdn chunked o(wmma,vsplit) shared opt-in");
       const dim3 grid_chunk_vs(static_cast<unsigned>(nt_tot), static_cast<unsigned>(hv_n),
                                static_cast<unsigned>(nv));
-      GdnChunkOWmmaVSplitKernel<TSc, Tout><<<grid_chunk_vs, occ_o, chunko_bytes, s>>>(
-          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
-          hk_n, dk, hv_n, dv, bv, args.scale, dvec);
-      Check(cudaGetLastError(), "gdn chunked o(wmma,vsplit) launch");
+      bool launched = false;
+      if constexpr (std::is_same<Tin, __nv_bfloat16>::value) {
+        if (cpasync) {
+          // DeltaH CP: [Hf bv*dk*4][kring 2×kChunk*dk*sz][V1 pool v1] = 80 KiB (bf16).
+          const size_t delta_bytes = static_cast<size_t>(bv * dk) * sizeof(float) +
+                                     2 * static_cast<size_t>(kChunk * dk) * sz + v1;
+          Check(cudaFuncSetAttribute(
+                    reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc, true>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(delta_bytes)),
+                "gdn chunked delta_h(wmma,vsplit,cpasync) shared opt-in");
+          GdnChunkDeltaHWmmaVSplitKernel<TSc, true><<<grid_seq_vs, occ_delta, delta_bytes, s>>>(
+              state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(),
+              d_boh, hk_n, dk, hv_n, dv, bv, dvec);
+          Check(cudaGetLastError(), "gdn chunked delta_h(wmma,vsplit,cpasync) launch");
+          // ChunkO CP: base + Hs[bv*dk*sz] hstart prefetch = 72 KiB (bf16).
+          const size_t chunko_bytes = chunko_base + static_cast<size_t>(bv * dk) * sz;
+          Check(cudaFuncSetAttribute(
+                    reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout, true>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(chunko_bytes)),
+                "gdn chunked o(wmma,vsplit,cpasync) shared opt-in");
+          GdnChunkOWmmaVSplitKernel<TSc, Tout, true><<<grid_chunk_vs, occ_o, chunko_bytes, s>>>(
+              out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+              hk_n, dk, hv_n, dv, bv, args.scale, dvec);
+          Check(cudaGetLastError(), "gdn chunked o(wmma,vsplit,cpasync) launch");
+          launched = true;
+        }
+      }
+      if (!launched) {
+        // Plain V-split (CP=false): bf16 without cpasync + all f32. Always opt in
+        // (mirror GdnChunkWUWmmaKernel): the bf16 delta_bytes is EXACTLY 48 KiB
+        // (32 KiB [BV,Dk] f32 slice + 16 KiB pool), so the opt_in helper's strict
+        // ">48 KiB" guard would SKIP the attribute, and 48 KiB dynamic + the static
+        // decay[] overflows the 48 KiB default cap → cudaErrorInvalidValue. Setting
+        // the attribute unconditionally is a no-op when it already fits.
+        const size_t delta_bytes =
+            static_cast<size_t>(bv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
+        Check(cudaFuncSetAttribute(
+                  reinterpret_cast<void*>(GdnChunkDeltaHWmmaVSplitKernel<TSc, false>),
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(delta_bytes)),
+              "gdn chunked delta_h(wmma,vsplit) shared opt-in");
+        GdnChunkDeltaHWmmaVSplitKernel<TSc, false><<<grid_seq_vs, occ_delta, delta_bytes, s>>>(
+            state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(), d_boh,
+            hk_n, dk, hv_n, dv, bv, dvec);
+        Check(cudaGetLastError(), "gdn chunked delta_h(wmma,vsplit) launch");
+        Check(cudaFuncSetAttribute(
+                  reinterpret_cast<void*>(GdnChunkOWmmaVSplitKernel<TSc, Tout, false>),
+                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(chunko_base)),
+              "gdn chunked o(wmma,vsplit) shared opt-in");
+        GdnChunkOWmmaVSplitKernel<TSc, Tout, false><<<grid_chunk_vs, occ_o, chunko_base, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+            hk_n, dk, hv_n, dv, bv, args.scale, dvec);
+        Check(cudaGetLastError(), "gdn chunked o(wmma,vsplit) launch");
+      }
     } else {
       const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
       const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;

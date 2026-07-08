@@ -3,6 +3,8 @@
 // deviations and deferrals.
 #include "vllm/v1/engine/core.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 #include "vllm/v1/core/sched/output.h"          // GrammarOutput
@@ -178,6 +180,20 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step_async() {
     // (not synced) readback event, pushed onto the queue.
     PendingModelOutput pending = executor_.execute_and_sample_async(
         scheduler_output, grammar_output, /*allow_defer=*/true);
+    // [ASYNC-DEBUG] count deferred (overlapped) vs inline pendings to PROVE the
+    // async pipeline actually engages (VT_ASYNC_DEBUG=1). Single-threaded loop.
+    if (std::getenv("VT_ASYNC_DEBUG") != nullptr) {
+      static long g_deferred = 0, g_inline = 0;
+      if (pending.ready) {
+        ++g_inline;
+      } else {
+        ++g_deferred;
+      }
+      if ((g_deferred + g_inline) % 500 == 1) {
+        std::fprintf(stderr, "[ASYNC-DEBUG] deferred(overlapped)=%ld inline=%ld\n",
+                     g_deferred, g_inline);
+      }
+    }
     // A pending that is already host-ready has NO readback to overlap (a runner
     // that does not defer, e.g. the CPU-only / stub path). When the queue is
     // empty there is also no earlier in-flight step whose FIFO order it must

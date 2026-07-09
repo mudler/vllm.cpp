@@ -398,13 +398,24 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     GATES (GB10 sm_121a): token-exact — `test_ops_gdn` 450/450 (incl. a new
     gate-shape Triton-vs-sequential case at H=48 and H=32) + 27B greedy 16/16 AND
     35B greedy 16/16 single & batched-graph, all through the Triton path.
-    MEASURED 27B e2e (same-binary A/B, VT_GDN_DELTAH_TRITON on vs hand off, GB10):
-    conc16/np96 in1024/out128 hand 712.96 -> Triton 716.10 tok/s = +0.44%
-    (clean, non-overlapping arms). HONEST: a real, token-exact per-kernel win, but
-    delta_h is only ~5-6% of GPU kernel time so the e2e move is small and does NOT
-    reach 27B >=1.0x alone — closing the full GDN ~1.9x codegen gap needs `chunk_o`
-    + `recompute_w_u` ported to the same AOT path (the next kernels on this
-    sanction). Kept default-OFF pending that rollout + the flip-to-default decision.
+    MEASURED (GB10, idle-flocked box, 27B NVFP4). delta_h KERNEL (same-binary nsys
+    A/B, in1024/out4, 240 launches, control kernels ±1% ⇒ clean isolation): hand
+    `GdnChunkDeltaHRegRingKernel` 1685.4 µs → Triton
+    `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` 1180.7 µs/launch = **−29.9%
+    (1.43×)** — the Triton WMMA codegen substantially beats our best hand kernel,
+    VALIDATING the sanction's premise (the residual WAS compiler codegen). But
+    delta_h is only ~19% of GDN chunk-kernel GPU time (the profile shows WU ~25% and
+    ChunkO ~20% are LARGER), so GDN aggregate −5.7% ⇒ GDN µs/tok gap vs vLLM's FLA
+    (128 vs 71.7 = ~1.79×) closes to ~1.68×. E2E (same-binary A/B, 3 reps,
+    non-overlapping arms) vs FRESH graphed vLLM: conc16/np96 in1024/out128 hand
+    712.96 → Triton 716.10 tok/s (+0.44%), vLLM 766.62 ⇒ **0.930×→0.934×**;
+    conc32/np192 hand 859.21 → Triton 866.59 (+0.86%), vLLM 1043.17 ⇒
+    **0.824×→0.831×**. HONEST VERDICT: delta_h Triton is a real, clean, token-exact
+    per-kernel win that PROVES the Triton fast-path closes the codegen gap on the
+    kernel it targets, but delta_h alone does NOT reach 27B ≥1.0× MVP parity (e2e
+    +0.4–0.9%). Reaching parity needs the SAME AOT treatment on the two LARGER GDN
+    kernels — `chunk_o` (~20%) and `recompute_w_u` (~25%) — the next rollout on this
+    sanction. Kept default-OFF pending that rollout + the flip-to-default decision.
 
 ## 10. E2E test suites (T0 deliverable)
 

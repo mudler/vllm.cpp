@@ -1452,3 +1452,23 @@ The remaining sub-percent needs either a fragile FMA match (T3, risks the greedy
 non-portable work. NEXT: pivot to the broader MVP (GGUF, tools, grammars, server, e2e, more
 models) or accept the floor — a priority call. Also: main CI is RED from a pre-existing
 runner-OOM (`cmake --build -j` unbounded parallel-link, ci.yml:57), NOT a code regression.
+
+## 2026-07-09 — FRESH parity A/B vs GRAPHED vLLM (both models, @ c7ba80e)
+
+Same-box, same-workload, graphed (production) vLLM denominator. Total token throughput:
+- **35B (conc64/np200): ours 3175.4 / vLLM 3282.0 = 0.967×** (near parity, ~3% behind). Ours
+  +2.8% over stale (the 3 wins show), but vLLM's denominator also drifted +2.2% → net ratio
+  0.962→0.967. Below vLLM on all 3 throughput axes.
+- **27B (conc16/np96): ours 644.3 / vLLM 770.8 = 0.836×** (the MORE-BEHIND gate). Flat vs stale
+  0.857× (denominator drift + noise, not a regression). At conc32/np192: ours 855.0 (+3% over
+  stale — wins DO show) / stale vLLM 1051.5 ≈ 0.81× (vLLM not re-measured there).
+- **MEMORY: we WIN big** — ours 52.8GB (35B) / 60.5GB (27B) vs vLLM ~80.6 / ~86.4GB (GM0.6):
+  ours is ~65% of vLLM's peak (28-30GB less). ✅ on the memory axis.
+- vLLM offline bench → no vLLM TTFT/TPOT (no latency A/B). Ours: 35B TPOT 147ms, 27B 176ms.
+
+**HONEST re-opened question (the more-behind gate):** the 27B is fp4-dense-GEMM-DOMINATED
+(45.8% of its prefill). The reassess called GEMM "at vendor-parity" but that was SOURCE-INFERRED
+(both cutlass) — NOT measured, because vLLM can't be nsys-profiled on GB10. vLLM AUTOTUNES its
+fp4 GEMM (flashinfer AutoTuner) while we run a FIXED cutlass config — the exact "don't infer
+at-parity from source" trap. So the 27B's ~16-19% gap MAY be substantially the fp4 GEMM, an
+UNEXAMINED lever. Worth measuring before declaring the 27B at the floor.

@@ -6242,3 +6242,46 @@ Verification on this local RTX:
 
 NEXT local work: evaluate Gemma 4 small models for 16GB VRAM fit and vLLM support, then port/verify
 one small model path in vllm.cpp so local apples-to-apples vLLM benchmarking is meaningful.
+
+## 2026-07-09 — Local Gemma 4 vLLM oracle benchmark sweep (RTX 5070 Ti / 16GB)
+
+Stayed on the `local-blackwell-environment` branch and kept the work scoped to this local NixOS
+machine. Nix remains the primary path; Docker was not needed. Extended the CUDA dev shell for
+Python/vLLM JIT use:
+- added GCC runtime lib path so PyTorch wheels can import `libstdc++.so.6`;
+- added cuRAND and CUDA include outputs so FlashInfer sampling JIT can find `curand.h`;
+- documented the required runtime env, especially `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`
+  to avoid Triton's NixOS-hostile `/sbin/ldconfig` probe.
+
+Model selection:
+- `google/gemma-4-E4B-it` was the desired larger small-model target, but bf16 vLLM OOMs during
+  model initialization on this 16GB GPU (about 14.38GiB process memory plus ~1GiB already held by
+  desktop/other GPU processes).
+- `google/gemma-4-E4B-it-qat-mobile-transformers` has official Gemma QAT metadata, but vLLM 0.24
+  rejects `quant_method: gemma`.
+- `google/gemma-4-E2B-it` is the largest Gemma 4 target that ran cleanly in vLLM bf16 here.
+  Its text stack is 35 layers, hidden 1536, 8 heads / 1 KV head, head dim 256, sliding window 512.
+
+vLLM oracle setup:
+- `.venv-vllm`: vLLM 0.24.0, torch 2.11.0+cu130.
+- PyTorch sees `NVIDIA GeForce RTX 5070 Ti`, capability `(12, 0)`.
+- Gemma 4 forces `TRITON_ATTN` because heterogeneous head dimensions disable FA4.
+- E2B bf16 model load uses about 9.9GiB GPU memory.
+
+Benchmark results, random synthetic dataset, `--max-model-len 4096`, `--gpu-memory-utilization
+0.88`, output length 128:
+- 1024 input, N=32: 11.20 req/s, 12,907.16 total tok/s, 1,434.13 output tok/s.
+- 1024 input, N=64: 13.36 req/s, 15,389.86 total tok/s, 1,709.98 output tok/s.
+- 1024 input, N=96: 14.11 req/s, 16,253.51 total tok/s, 1,805.95 output tok/s.
+- 1024 input, N=112: 14.34 req/s, 16,522.27 total tok/s, 1,835.81 output tok/s.
+- 1024 input, N=128: OOM during first execution step on a 192MiB allocation.
+- 2048 input, N=64: 7.51 req/s, 16,333.15 total tok/s, 960.77 output tok/s.
+- 2048 input, N=80: OOM during first execution step on a 192MiB allocation.
+
+Practical local ceilings from this sweep:
+- 1024/128: N=112 is the largest tested useful setting; N=128 initializes but OOMs.
+- 2048/128: N=64 is the largest tested useful setting; N=80 initializes but OOMs.
+
+Important caveat: vllm.cpp does not yet support Gemma 4 full-engine inference, so these are vLLM
+oracle numbers only. Next meaningful local perf work is to add/verify a Gemma 4 E2B path in
+vllm.cpp (or choose another model the project can actually run), then run apples-to-apples.

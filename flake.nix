@@ -37,8 +37,16 @@
             cuda.cuda_nvcc
             cuda.cuda_nvtx
             cuda.libcublas
+            cuda.libcurand
           ];
-          cudaLibPath = pkgs.lib.makeLibraryPath cudaPackages;
+          cudaRuntimePackages = cudaPackages ++ [
+            pkgs.gcc14.cc.lib
+          ];
+          cudaLibPath = pkgs.lib.makeLibraryPath cudaRuntimePackages;
+          cudaIncludePath = pkgs.lib.concatStringsSep ":" [
+            (pkgs.lib.makeSearchPathOutput "dev" "include" cudaPackages)
+            (pkgs.lib.makeSearchPathOutput "include" "include" cudaPackages)
+          ];
         in
         {
           default = pkgs.mkShell {
@@ -64,10 +72,16 @@
             # so nvidia-smi/CUDA runtime probing can find libcuda and NVML.
             LD_LIBRARY_PATH = "${cudaLibPath}:/run/opengl-driver/lib";
             LIBRARY_PATH = "${cudaLibPath}:/run/opengl-driver/lib";
+            CPATH = "${cudaIncludePath}";
+            C_INCLUDE_PATH = "${cudaIncludePath}";
+            CPLUS_INCLUDE_PATH = "${cudaIncludePath}";
 
             shellHook = ''
               export LD_LIBRARY_PATH="${cudaLibPath}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export LIBRARY_PATH="${cudaLibPath}:/run/opengl-driver/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}"
+              export CPATH="${cudaIncludePath}''${CPATH:+:$CPATH}"
+              export C_INCLUDE_PATH="${cudaIncludePath}''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+              export CPLUS_INCLUDE_PATH="${cudaIncludePath}''${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
               export CMAKE_CUDA_COMPILER="${cuda.cuda_nvcc}/bin/nvcc"
               export CMAKE_CUDA_HOST_COMPILER="${pkgs.gcc14}/bin/g++"
               echo "vllm.cpp CUDA dev shell"

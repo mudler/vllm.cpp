@@ -58,6 +58,7 @@ enum class OpId : uint8_t {
   kRopeCosSinCache,
   kAttnQkNormRopeGate,
   kFusedChain,
+  kRmsNormQuantFp8,
   kCount
 };
 
@@ -173,6 +174,9 @@ using MatmulFp8CutlassFn =
 using MatmulFp8CublasLtFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
 using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
+using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
+                                   const Tensor& /*x*/, const Tensor& /*weight*/,
+                                   const RmsNormArgs&, Tensor* /*residual*/, float /*input_scale*/);
 using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
@@ -374,6 +378,27 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
 // Static per-tensor scale (NOT dynamic/per-token). x [M,K] f32/bf16, out [M,K]
 // i8 (raw fp8-e4m3fn bytes). CUDA only (the 35B W8A8 path is CUDA-resident).
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale);
+
+// RmsNormQuantFp8 (fused fp8 RMSNorm -> static per-tensor activation quant). One
+// HBM pass mirrors vLLM's Inductor `fused_add_rms_norm_static_fp8_quant`
+// (vllm/compilation/passes/fusion/rms_quant_fusion.py:124) — the RMSNorm producer
+// that directly emits the fp8 activation so the standalone QuantFp8Static pass (and
+// its bf16 round-trip) disappears. The activation is quantized ONCE and shared by
+// every projection that reads it (the fp8 analog of the fp4 quantize-once), so
+// callers feed the single fp8 to all shared GEMMs (see MatmulFp8CutlassPreQuantD).
+//   res += x  (rounded to res dtype, as fused_add_rms_norm);
+//   n = rmsnorm(res, weight)  (gemma -> weight applied as 1+w);
+//   b = bf16(n);  out_fp8[i] = fp8_e4m3( b * (1/input_scale) )   // RNE hw cvt
+// BIT-IDENTICAL to RmsNorm(bf16 out, x, weight, {eps,gemma}, res) followed by
+// QuantFp8Static(out_fp8, that bf16, input_scale) — the bf16-intermediate form the
+// current path already rounds through (the RMSNorm output IS bf16 before the quant).
+// out_fp8 [T,H] i8 (raw fp8-e4m3fn bytes). out_bf16 optional [T,H] bf16 (the normed
+// activation, emitted only when a bf16 consumer of it coexists at the site — e.g.
+// the GDN in_proj_a/b; nullptr for full-attn q/k/v where nothing reads it). x [T,H]
+// / weight [H] float; residual optional [T,H] f32/bf16 (in/out). CUDA + CPU.
+void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
+                     const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
+                     float input_scale);
 
 // MatmulFp8Cutlass (lift of vLLM cutlass_scaled_mm_sm120_fp8 — the per-tensor
 // W8A8 fp8 GEMM vLLM selects on sm120/GB10). Same math as vLLM's ScaledEpilogue

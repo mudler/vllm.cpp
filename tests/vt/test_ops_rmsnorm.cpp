@@ -2,8 +2,10 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <random>
 #include <vector>
 
+#include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // F32ToF8E4M3
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -144,6 +146,72 @@ TEST_CASE("rmsnorm fused residual: f32 (full precision) or bf16 (vLLM model dtyp
     CHECK(out[0] == doctest::Approx(0.848528f));
     CHECK(out[1] == doctest::Approx(1.131371f));
   }
+}
+
+// RmsNormQuantFp8 (fused fp8 RMSNorm -> static quant) must be BIT-IDENTICAL to the
+// split path RmsNorm(bf16 out, residual) then static_scaled_fp8_quant of that bf16
+// (BF16ToF32(bf16) / input_scale). Validated on CPU against vllm::F32ToF8E4M3 (the
+// same RNE-saturating e4m3 the CPU kernel's F32ToFp8 mirrors), covering the two
+// residual dtypes and the optional bf16 side-output.
+TEST_CASE("rmsnorm_quant_fp8 is bit-identical to RmsNorm(bf16)+static fp8 quant") {
+  const int64_t T = 5, H = 96;  // H a multiple of 16 (fp8 GEMM alignment)
+  const float eps = 1e-6f, input_scale = 0.035f, inv_scale = 1.0f / input_scale;
+  std::mt19937 rng(1234);
+  std::uniform_real_distribution<float> ux(-3.0f, 3.0f);
+
+  auto run = [&](bool bf16_residual, bool want_bf16_out) {
+    std::vector<float> x(static_cast<size_t>(T) * H);
+    std::vector<float> w(H);
+    for (auto& v : x) v = ux(rng);
+    for (auto& v : w) v = ux(rng) * 0.1f;
+
+    // Reference: vt::RmsNorm to a bf16 output (its own residual copy), then quant.
+    std::vector<uint16_t> ref_bf16(static_cast<size_t>(T) * H, 0);
+    std::vector<float> res_f32_ref(static_cast<size_t>(T) * H);
+    std::vector<uint16_t> res_bf16_ref(static_cast<size_t>(T) * H, 0);
+    for (int64_t i = 0; i < T * H; ++i) {
+      const float rv = ux(rng);
+      res_f32_ref[static_cast<size_t>(i)] = rv;
+      res_bf16_ref[static_cast<size_t>(i)] = vt::F32ToBF16(rv);
+    }
+    std::vector<float> res_f32_fused = res_f32_ref;    // separate copies (updated in place)
+    std::vector<uint16_t> res_bf16_fused = res_bf16_ref;
+
+    Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {T, H});
+    Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {H});
+    Tensor to_bf16 = Tensor::Contiguous(ref_bf16.data(), DType::kBF16, Cpu(), {T, H});
+    Tensor tr_ref = bf16_residual
+                        ? Tensor::Contiguous(res_bf16_ref.data(), DType::kBF16, Cpu(), {T, H})
+                        : Tensor::Contiguous(res_f32_ref.data(), DType::kF32, Cpu(), {T, H});
+    Queue q{Cpu(), nullptr};
+    vt::RmsNorm(q, to_bf16, tx, tw, RmsNormArgs{eps, true}, &tr_ref);
+    std::vector<uint8_t> ref_fp8(static_cast<size_t>(T) * H);
+    for (size_t i = 0; i < ref_fp8.size(); ++i)
+      ref_fp8[i] = vllm::F32ToF8E4M3(vt::BF16ToF32(ref_bf16[i]) * inv_scale);
+
+    // Fused: RmsNormQuantFp8 producing fp8 (+ optional bf16), same inputs.
+    std::vector<uint8_t> got_fp8(static_cast<size_t>(T) * H, 0);
+    std::vector<uint16_t> got_bf16(static_cast<size_t>(T) * H, 0);
+    Tensor tofp8 = Tensor::Contiguous(got_fp8.data(), DType::kI8, Cpu(), {T, H});
+    Tensor tobf16 = Tensor::Contiguous(got_bf16.data(), DType::kBF16, Cpu(), {T, H});
+    Tensor tr_fused = bf16_residual
+                          ? Tensor::Contiguous(res_bf16_fused.data(), DType::kBF16, Cpu(), {T, H})
+                          : Tensor::Contiguous(res_f32_fused.data(), DType::kF32, Cpu(), {T, H});
+    vt::RmsNormQuantFp8(q, tofp8, want_bf16_out ? &tobf16 : nullptr, tx, tw,
+                        RmsNormArgs{eps, true}, &tr_fused, input_scale);
+
+    CHECK(got_fp8 == ref_fp8);              // fp8 byte-exact vs the split path
+    if (want_bf16_out) CHECK(got_bf16 == ref_bf16);  // bf16 side-output byte-exact
+    if (bf16_residual)
+      CHECK(res_bf16_fused == res_bf16_ref);         // residual stream updated identically
+    else
+      CHECK(res_f32_fused == res_f32_ref);
+  };
+
+  run(/*bf16_residual=*/false, /*want_bf16_out=*/true);
+  run(/*bf16_residual=*/false, /*want_bf16_out=*/false);
+  run(/*bf16_residual=*/true, /*want_bf16_out=*/true);
+  run(/*bf16_residual=*/true, /*want_bf16_out=*/false);
 }
 
 TEST_CASE("rmsnorm accepts bf16 inputs via f32 conversion") {

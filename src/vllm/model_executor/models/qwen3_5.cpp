@@ -587,6 +587,48 @@ DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dty
   return dout;
 }
 
+// Pre-quantized fp8 analog of MatmulFp8CutlassD: the activation is ALREADY the
+// static-quant fp8 [M,K] (produced ONCE — either by RmsNormQuantFp8 or a shared
+// quant — and fed to every projection reading it), so this SKIPS the internal
+// QuantFp8Static and runs only the fp8 GEMM. The fp8 counterpart of
+// MatmulNvfp4Fp4DirectD; each GEMM still applies its own folded alpha (= shared
+// input_scale · this projection's weight_scale), so the result is identical to
+// MatmulFp8CutlassD(x) when a_fp8 == QuantFp8Static(x, w.input_scale).
+DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, DType out_dtype) {
+  const int64_t M = a_fp8.shape[0], N = w.n;
+  VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
+           "MatmulFp8CutlassPreQuantD: the fp8 W8A8 path is CUDA-only");
+  Tensor wdev = ResidentFp8(d, w);
+  DBuf dout(d, out_dtype, {M, N});
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8, wdev, w.alpha);
+  else
+    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8, wdev, w.alpha);
+  return dout;
+}
+
+// FUSE fp8 RMSNorm -> static quant + quantize-once (35B W8A8): fold the input-
+// layernorm (residual-add + gemma RMSNorm) and the shared activation's fp8 quant
+// into ONE pass (vt::RmsNormQuantFp8, mirror vLLM Inductor
+// fused_add_rms_norm_static_fp8_quant, rms_quant_fusion.py:124), feeding the SINGLE
+// fp8 activation to every projection that reads it (attn q/k/v; GDN in_proj_qkv/z)
+// via MatmulFp8CutlassPreQuantD — removing the standalone QuantFp8Static pass + its
+// bf16 round-trip AND the redundant per-projection re-quant of the same [T,H].
+// Bit-identical (bf16-intermediate form); only fires when the shared projections
+// carry ONE input_scale (guarded at the RunLayer site — the real 35B q/k/v and
+// in_proj_qkv/z do). DEFAULT ON: token-exact (op-level byte-identical + 35B greedy
+// 16/16) and a clean same-binary win at the gate shape (in1024/out128 conc32 np192:
+// +0.85% total & prefill tok/s, every ON run > every OFF run; nsys: the input-fed
+// QuantFp8Static instances drop 130->40 per step, folded into RmsNormQuantFp8). The
+// 27B (no fp8 weights) never fires it. VT_FUSE_RMSNORM_FP8QUANT=0 opts out for an A/B.
+bool FuseRmsNormFp8QuantEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSE_RMSNORM_FP8QUANT");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
 // TRUE W4A4 toggle (A/B; default ON — mirrors vLLM, which runs this checkpoint as
 // use_a16=False true-W4A4, notes §7.1). Set VT_W4A4_TRUE=0 to fall back to the
 // W4A16 6a fast path (bf16 activations) for a throughput A/B. Only affects
@@ -1153,7 +1195,7 @@ DType ResidualDType() {
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
 // trips (the g/beta prep + conv split are device ops, not host loops).
 DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
-              const Tensor& h, int64_t T) {
+              const Tensor& h, int64_t T, const Tensor* h_fp8 = nullptr) {
   const int64_t Hk = cfg.linear_num_key_heads;
   const int64_t Hv = cfg.linear_num_value_heads;
   const int64_t Dk = cfg.linear_key_head_dim;
@@ -1165,12 +1207,17 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
+  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
+  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
+  // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
+                   ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
+                            : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
                    : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  DBuf z = !w.in_proj_z_fp8.Empty() ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32)
-                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  DBuf z = !w.in_proj_z_fp8.Empty()
+               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, DType::kF32)
+                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32))
+               : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -1332,7 +1379,7 @@ void MaybeBuildAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg, int64_
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const StepDevInputs& sdi,
                    const GDNAttentionMetadata& meta,
-                   const GdnStateCache& state, int64_t T) {
+                   const GdnStateCache& state, int64_t T, const Tensor* h_fp8 = nullptr) {
   const int64_t Hk = cfg.linear_num_key_heads;
   const int64_t Hv = cfg.linear_num_value_heads;
   const int64_t Dk = cfg.linear_key_head_dim;
@@ -1351,16 +1398,20 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
 
   // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF).
+  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
+  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
+  // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32)
+                   ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
+                            : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
                    : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
   // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
   // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
   // byte-identical f32 path.
   const DType outdt = GdnOutDType();
   DBuf z = !w.in_proj_z_fp8.Empty()
-               ? MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt)
+               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
+                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
@@ -1530,7 +1581,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 // Qwen3NextAttention. h [T*H] bf16 -> [T*H] bf16.
 DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                    const Tensor& h, const std::vector<int32_t>& positions,
-                   int64_t T) {
+                   int64_t T, const Tensor* h_fp8 = nullptr) {
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
@@ -1579,21 +1630,24 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   DBuf qgate = fuse_qkv
                    ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
                                            qkv_sf_sw_p)
-               : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+               : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.q_proj_fp8, DType::kF32)
+                            : MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32))
                : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
                                         qkv_sf_sw_p)
-            : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.k_proj_fp8, DType::kF32)
+                         : MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32))
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
                                         qkv_sf_sw_p)
-            : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.v_proj_fp8, DType::kF32)
+                         : MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32))
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
@@ -1669,7 +1723,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
 DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
                         const Tensor& h, const StepDevInputs& sdi,
                         const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                        int64_t T) {
+                        int64_t T, const Tensor* h_fp8 = nullptr) {
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
@@ -1722,21 +1776,24 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf qgate = fuse_qkv
                    ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
                                            qkv_sf_sw_p)
-               : fp8 ? MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32)
+               : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.q_proj_fp8, DType::kF32)
+                            : MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32))
                : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
                                              : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
                      : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
   DBuf kf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
                                         qkv_sf_sw_p)
-            : fp8 ? MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32)
+            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.k_proj_fp8, DType::kF32)
+                         : MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32))
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
                   : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
   DBuf vf = fuse_qkv
                 ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
                                         qkv_sf_sw_p)
-            : fp8 ? MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32)
+            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.v_proj_fp8, DType::kF32)
+                         : MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32))
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
                                           : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
                   : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
@@ -2304,6 +2361,58 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// Returns true (+ fills *scale) when the layer's input-fed fp8 projections share
+// ONE static input_scale, so a single RmsNormQuantFp8 can quantize the shared
+// activation once and feed them all (attn q/k/v; GDN in_proj_qkv/z). The fp8
+// analog of the fp4 fuse_qkv input_global_scale guard; exact float equality (only
+// fuse when the checkpoint scales are truly identical).
+bool Fp8SharedInputScale(bool is_linear_attention, const GdnLayerWeights& g,
+                         const FullAttnLayerWeights& a, float* scale) {
+  if (is_linear_attention) {
+    if (g.in_proj_qkv_fp8.Empty() || g.in_proj_z_fp8.Empty()) return false;
+    if (g.in_proj_qkv_fp8.input_scale != g.in_proj_z_fp8.input_scale) return false;
+    *scale = g.in_proj_qkv_fp8.input_scale;
+    return true;
+  }
+  if (a.q_proj_fp8.Empty() || a.k_proj_fp8.Empty() || a.v_proj_fp8.Empty()) return false;
+  if (a.q_proj_fp8.input_scale != a.k_proj_fp8.input_scale ||
+      a.q_proj_fp8.input_scale != a.v_proj_fp8.input_scale)
+    return false;
+  *scale = a.q_proj_fp8.input_scale;
+  return true;
+}
+
+// Input-layernorm producer shared by RunLayer / RunLayerPaged: residual-add +
+// gemma RMSNorm -> bf16 `dhn`. With VT_FUSE_RMSNORM_FP8QUANT (35B, shared fp8
+// input_scale) it ALSO emits the shared static-quant fp8 activation in the SAME
+// pass (vt::RmsNormQuantFp8, mirror vLLM Inductor fused_add_rms_norm_static_fp8_
+// quant), returned so the block feeds it to q/k/v (or in_proj_qkv/z) once. GDN's
+// in_proj_a/b still read bf16 `dhn`, so it is emitted there; full-attn reads only
+// the fp8, so bf16 `dhn` is skipped. std::nullopt (no fp8) = the byte-identical
+// plain RmsNorm path.
+std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer,
+                                      const HfConfig& cfg, DBuf& hidden, DBuf& res, DBuf& dhn,
+                                      int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const float eps = static_cast<float>(cfg.rms_norm_eps);
+  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
+  float fp8_scale = 0.0F;
+  const bool fuse = FuseRmsNormFp8QuantEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+                    Fp8SharedInputScale(layer.is_linear_attention, layer.gdn, layer.attn,
+                                        &fp8_scale);
+  if (fuse) {
+    std::optional<DBuf> dhn_fp8;
+    dhn_fp8.emplace(d, DType::kI8, std::vector<int64_t>{T, H});
+    Tensor* out_bf16 = layer.is_linear_attention ? &dhn.t() : nullptr;
+    vt::RmsNormQuantFp8(d.q, dhn_fp8->t(), out_bf16, hidden.t(), dw_in,
+                        vt::RmsNormArgs{eps, true}, &res.t(), fp8_scale);
+    return dhn_fp8;
+  }
+  // Qwen3NextRMSNorm == GemmaRMSNorm (weight applied as 1+w). res += hidden.
+  vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  return std::nullopt;
+}
+
 // One decoder layer over the fused residual stream. `hidden` (bf16 [T*H]) is
 // the previous block's output (the delta); `res` (f32 [T,H], device) is the
 // accumulator. Mirrors qwen3_next.py::Qwen3NextDecoderLayer.forward:
@@ -2317,14 +2426,13 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
-  // Qwen3NextRMSNorm == GemmaRMSNorm (weight applied as 1+w). res += hidden.
-  vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
+  const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
   DBuf attn = layer.is_linear_attention
-                  ? GdnBlock(d, layer.gdn, cfg, dhn.t(), T)
-                  : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
+                  ? GdnBlock(d, layer.gdn, cfg, dhn.t(), T, h_fp8)
+                  : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T, h_fp8);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
@@ -2437,18 +2545,18 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
+  std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
+  const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
   DBuf attn = [&] {
     if (layer.is_linear_attention) {
       VT_CHECK(gdn_state != nullptr, "paged layer: GDN layer needs a GdnStateCache");
-      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), sdi, gdn_meta, *gdn_state, T);
+      return GdnBlockPaged(d, layer.gdn, cfg, dhn.t(), sdi, gdn_meta, *gdn_state, T, h_fp8);
     }
     VT_CHECK(attn_kv != nullptr, "paged layer: full-attn layer needs a PagedKvCache");
     return FullAttnBlockPaged(d, layer.attn, cfg, dhn.t(), sdi, attn_meta,
-                              *attn_kv, T);
+                              *attn_kv, T, h_fp8);
   }();
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});

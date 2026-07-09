@@ -2412,12 +2412,14 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // + tensor-core apply (GdnChunkWUWmmaVecKernel, mirrors FLA solve_tril+
   // recompute_w_u). VT_GDN_CHUNK_VEC=0 keeps the WMMA-Gram/scalar-solve kernel.
   const char* vec_env = std::getenv("VT_GDN_CHUNK_VEC");
-  // VT_GDN_WY_BLOCKED (default OFF): swap ONLY the vec kernel's triangular-inverse
+  // VT_GDN_WY_BLOCKED (DEFAULT ON at the gate shape; =0 restores serial-f32): swap ONLY the vec kernel's triangular-inverse
   // phase for the FLA blocked tensor-core inverse (four 16×16 diagonal forward-subs
   // + six 16×16 Schur merges) instead of the serial ~BT-deep column solve. Requires
-  // BT == kChunk == 4·kWM == 64 (the merge_16x16_to_64x64 block structure).
+  // BT == kChunk == 4·kWM == 64 (the merge_16x16_to_64x64 block structure). Greedy 16/16-vs-oracle
+  // token-exact on BOTH gate models (35B single+batched, 27B tie-free prefix); the tf32
+  // WMMA Schur merges hold vs vLLM's ieee inverse. test_ops_gdn 423/423.
   const char* blk_env = std::getenv("VT_GDN_WY_BLOCKED");
-  const bool wy_blocked = kChunk == 4 * kWM && blk_env != nullptr && blk_env[0] == '1';
+  const bool wy_blocked = kChunk == 4 * kWM && (blk_env == nullptr || blk_env[0] != '0');
   // Compact aliased arena (see kernel): R0=max(Ks[BT,Dk], Tf[BT,BT]f32),
   // R1=max(Am[BT,BT]f32, Tb[BT,BT]TD + Osh[BT,kOBlk]f32). bf16 ~40 KiB (2 blocks/SM),
   // f32/TF32 ~64 KiB (1 block/SM). Both fit the GB10 99 KiB opt-in; the guard keeps

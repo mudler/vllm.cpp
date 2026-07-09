@@ -1640,3 +1640,26 @@ the GDN chunk: closing the codegen gap needs the Triton CUDA fast-path (branch p
 proven end-to-end) — a human canon decision (Triton-for-CUDA-perf-behind-vt:: vs accept the portable
 floor + pursue the broader MVP).** Kept VT_GDN_TMA DEFAULT OFF (proven-correct, memcheck-clean, available
 lever); did NOT roll out to WU/ChunkO (their copy isn't the bottleneck either — same compute-floor logic).
+
+## 2026-07-09 — DECISIVE: portable async-pipeline EXHAUSTED on the GDN-chunk codegen gap → MVP needs a canon decision
+
+Built Rung-2 vt::tile (TMA+mbarrier, `include/vt/cuda/tile/tma_pipeline.cuh`, ported 1:1 from
+CUTLASS `arch/barrier.h` + `cute/arch/copy_sm90_tma.hpp`, sm_121a-verified, token-exact 423/423 +
+27B/35B 16/16, merged 9d4b45c default-OFF). delta_h ladder (nsys, same-binary): no-ring 464.1 →
+cp.async-ring 401.5 → **TMA 386.4 ms**. TMA vs ring = −3.8% (closes ~none of the ~1.9× GDN gap).
+**The delta_h kernel has a ~386ms COMPUTE floor** — the cp.async ring already hid 63 of 78 ms of
+exposed copy; TMA (strictly-better copy) hid only ~15 ms more. So the ~1.9× residual vs vLLM's
+Triton is NOT the copy/pipeline mechanism — it is the **WMMA compute codegen + kernel scheduling
+(Triton's compiler capability)**. Rung-1 (cp.async) + Rung-2 (TMA) BOTH proven insufficient.
+
+**CONCLUSION (decision-critical): the portable async-pipeline lever is EXHAUSTED on the
+codegen-bound GDN chunk kernels.** The MVP (27B ≥1.0×) is blocked by this codegen gap. The
+portable vt::tile playbook closed the STRUCTURE (register-tiling, blocked-inverse, bf16, delta_h
+−22%) but cannot close Triton's WMMA-compute codegen. The ONLY known path to 27B parity is the
+Triton CUDA fast-path (branch perf/triton-fastpath, PROVEN toolchain, behind the vt:: seam with
+CPU-ref preserved) — which CONFLICTS with the canon (discipline.md "no compile-target" +
+mission.md "no build-Python"). This is a genuine MVP-vs-canon conflict, now PROVEN by exhausting
+the portable path: the "no compile-target" rule was premised on portable working (disproven for
+these kernels); mirror-vLLM (PRIME POLICY) + the ≥1.0× MVP both point to Triton. A HUMAN decision.
+(One untried portable compute-side lever remains — 128B-swizzle + warp-specialization of the WMMA
+— but the evidence assesses it as the same compiler-capability class = likely partial.)

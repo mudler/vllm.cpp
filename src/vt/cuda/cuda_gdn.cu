@@ -27,6 +27,21 @@
 #include "vt/cuda/tile/tma_pipeline.cuh"
 #include "vt/ops.h"
 
+#ifdef VLLM_CPP_TRITON
+// SANCTIONED CUDA-only Triton AOT fast-path for the GDN delta_h state recurrence
+// (see .agents/discipline.md "SANCTIONED EXCEPTION" + porting-inventory.md §9).
+// AOT-generated stable dispatchers (triton.tools.link output; see
+// cmake/TritonAOT.cmake, triton_kernels/chunk_delta_h.py). Plain C symbols; the
+// launcher loads the EMBEDDED cubin via the CUDA driver API — no Triton/Python at
+// runtime. One spec per gate-model GDN shape: h48 (Qwen3.6-27B), h32 (35B).
+// gdn_deltah_hNN_default(stream, k, v, w, v_new, g, gk, h, h0, ht, cu_seqlens,
+//   chunk_offsets, T, NH) launches the FLA chunk_gated_delta_rule_fwd_kernel.
+extern "C" {
+#include "gdn_deltah_h48.h"
+#include "gdn_deltah_h32.h"
+}
+#endif
+
 namespace vt::cuda {
 namespace {
 
@@ -2569,6 +2584,41 @@ __global__ void GdnChunkVNewSlackZeroKernel(TD* v_new, const int32_t* qsl, int64
   }
 }
 
+#ifdef VLLM_CPP_TRITON
+// SANCTIONED Triton AOT fast-path dispatch for GDN delta_h (the state recurrence).
+// Returns true iff it launched the Triton kernel (caller then skips the hand
+// path). Runtime toggle VT_GDN_DELTAH_TRITON: must be "1" to enable (default OFF
+// even in the VLLM_CPP_TRITON build until the token-exact win is proven — then the
+// default flips to on). Fires ONLY for the exact bf16 gate-model GDN shapes the two
+// AOT specializations were pinned to (K=V=128, Hg=16, H in {48,32}); any other
+// shape/dtype returns false so the preserved hand-C++ GdnChunkDeltaHRegRingKernel
+// (and the CPU reference) still handle it — the portable contract is intact. The
+// buffer layout is a verified 1:1 drop-in (strides checked against FLA), so the
+// Triton kernel consumes the SAME device buffers our other chunk kernels produced.
+bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_bfloat16* v_new,
+                     const __nv_bfloat16* k, const __nv_bfloat16* u, const __nv_bfloat16* w,
+                     const float* gcum, const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                     int64_t dk, int64_t hv_n, int64_t dv, int64_t n_seq, int64_t t_tot) {
+  const char* e = std::getenv("VT_GDN_DELTAH_TRITON");
+  if (e == nullptr || e[0] != '1') return false;  // opt-in until proven; A/B toggle
+  if (dk != 128 || dv != 128 || hk_n != 16) return false;
+  if (hv_n != 48 && hv_n != 32) return false;
+  auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
+  const int32_t T = static_cast<int32_t>(t_tot);      // overwritten per-seq (IS_VARLEN)
+  const int32_t NH = static_cast<int32_t>(n_seq * hv_n);  // grid-y = N*H (grid carrier)
+  // state serves as BOTH FLA h0 (loaded before the loop) and ht (stored at the end);
+  // the full h0 read precedes any ht write, so aliasing the same pointer is safe.
+  const CUresult r =
+      hv_n == 48
+          ? gdn_deltah_h48_default(s, D(k), D(u), D(w), D(v_new), D(gcum), 0, D(hstate), D(state),
+                                   D(state), D(qsl), D(boh), T, NH)
+          : gdn_deltah_h32_default(s, D(k), D(u), D(w), D(v_new), D(gcum), 0, D(hstate), D(state),
+                                   D(state), D(qsl), D(boh), T, NH);
+  VT_CHECK(r == CUDA_SUCCESS, "cuda gdn delta_h(triton): launcher returned non-success");
+  return true;
+}
+#endif  // VLLM_CPP_TRITON
+
 template <typename Tin, typename Tout>
 void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
@@ -2778,9 +2828,23 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     // MEASURED (35B NVFP4, in1024/out8, GB10): delta_h 441us baseline ->
     // 398us reg-no-ring -> 345us reg+ring (0.78x); e2e in1024/out128 conc32 np192
     // +0.85% total & prefill, TTFT/TPOT lower. Token-exact (test_ops_gdn 423/423).
+    // SANCTIONED Triton AOT fast-path (bf16 gate shapes only, opt-in via
+    // VT_GDN_DELTAH_TRITON=1). If it fires it launches delta_h into the SAME
+    // buffers and we skip the hand kernels; otherwise the preserved hand-C++
+    // path below runs unchanged (portable contract intact).
+    bool triton_deltah = false;
+#ifdef VLLM_CPP_TRITON
+    if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {
+      triton_deltah =
+          TryTritonDeltaH(s, state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum,
+                          qsl.Ptr<int32_t>(), d_boh, hk_n, dk, hv_n, dv, n_seq, t_tot);
+    }
+#endif
     const char* tp_env = std::getenv("VT_GDN_TILE_PIPE");
     const bool tile_pipe = (tp_env == nullptr || tp_env[0] != '0') && dk == 128 && (dv % 64 == 0);
-    if (tile_pipe) {
+    if (triton_deltah) {
+      // delta_h already launched by the Triton fast-path; skip the hand kernels.
+    } else if (tile_pipe) {
       constexpr int BV = 64;
       const int64_t rA0 = static_cast<int64_t>(BV * dk) * sizeof(float);
       const int64_t rA1 = static_cast<int64_t>(kChunk * BV) * sizeof(float);

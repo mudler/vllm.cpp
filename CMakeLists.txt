@@ -103,6 +103,11 @@ if(VLLM_CPP_CUDA)
 endif()
 
 include(cmake/CompilerWarnings.cmake)
+# Triton AOT toolchain (build-time kernel->cubin, CUDA-only). Defines the gated
+# option VLLM_CPP_TRITON (default OFF) + add_triton_kernel(); with the option OFF
+# this include is inert (no Python, no generated sources). Wired below under CUDA
+# for the SANCTIONED GDN delta_h fast-path (see .agents/discipline.md).
+include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
@@ -251,6 +256,43 @@ if(VLLM_CPP_CUDA)
     set_source_files_properties(${_MARLIN_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
+  endif()
+
+  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
+  # Build-time compile of the FLA chunk_delta_h state-recurrence kernel to cubins
+  # embedded in libvllm; runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
+  # cuda_gdn.cu with the hand-C++ GdnChunkDeltaHRegRingKernel preserved as the
+  # default fallback. OFF => none of this runs and the build is byte-identical.
+  # Two specializations, one per gate-model GDN shape (both K=V=128, Hg=16, BT=64;
+  # only H=num_value_heads differs): 27B H=48, 35B H=32. Signature order matches
+  # triton_kernels/chunk_delta_h.py arg list; pinned flags USE_G=1,USE_GK=0,
+  # USE_INITIAL_STATE=1,STORE_FINAL_STATE=1,SAVE_NEW_VALUE=1,IS_VARLEN=1,USE_EXP2=0.
+  if(VLLM_CPP_TRITON)
+    enable_language(C)  # the AOT launchers are plain C (CUDA driver API)
+    # Winning autotune knobs for the gate shape (BV,warps,stages); overridable to
+    # re-sweep without editing this file. gridX = cdiv(V=128, BV) baked per spec.
+    set(VT_GDN_DELTAH_BV     64 CACHE STRING "delta_h Triton BV (32 or 64)")
+    set(VT_GDN_DELTAH_WARPS  4  CACHE STRING "delta_h Triton num_warps")
+    set(VT_GDN_DELTAH_STAGES 3  CACHE STRING "delta_h Triton num_stages")
+    math(EXPR _DELTAH_GX "(128 + ${VT_GDN_DELTAH_BV} - 1) / ${VT_GDN_DELTAH_BV}")
+    set(_DELTAH_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_delta_h.py")
+    set(_DELTAH_KFN chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
+    # Signature (26 args): k v w v_new g gk h h0 ht cu_seqlens chunk_offsets T NH
+    #   H Hg K V BT BV USE_G USE_GK USE_INITIAL_STATE STORE_FINAL_STATE
+    #   SAVE_NEW_VALUE IS_VARLEN USE_EXP2. dtypes: k/v/w/v_new/h bf16, g/h0/ht fp32.
+    set(_DELTAH_SIG_TAIL "*bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, @H@, 16, 128, 128, 64, ${VT_GDN_DELTAH_BV}, 1, 0, 1, 1, 1, 1, 0")
+    set(_DELTAH_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32")
+    foreach(_H 48 32)
+      string(REPLACE "@H@" "${_H}" _sig "${_DELTAH_SIG_HEAD}, ${_DELTAH_SIG_TAIL}")
+      add_triton_kernel(VT_GDN_DELTAH_${_H}_SRCS
+        "${_DELTAH_KPY}" ${_DELTAH_KFN} gdn_deltah_h${_H}
+        "${_sig}" "${_DELTAH_GX},NH,1"
+        ${VT_GDN_DELTAH_WARPS} ${VT_GDN_DELTAH_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_DELTAH_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_DELTAH_${_H}_SRCS_INCLUDE_DIR})
+    endforeach()
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON=1)
+    target_link_libraries(vllm PUBLIC CUDA::cuda_driver)
   endif()
 endif()
 

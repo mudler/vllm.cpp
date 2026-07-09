@@ -1255,3 +1255,28 @@ TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)
   (void)f32;
   (void)bf16;
 }
+
+// SANCTIONED Triton AOT delta_h fast-path, token-exact at the EXACT gate-model GDN
+// shapes (K=V=128, Hk=16, Hv in {48,32} = Qwen3.6-27B / 35B). The chunked path with
+// VT_GDN_DELTAH_TRITON=1 routes delta_h through the AOT cubin; it is compared vs the
+// sequential scan exactly like the hand path above. In a build WITHOUT VLLM_CPP_TRITON
+// the env is inert (the chunked path stays hand-C++), so this case is valid in both
+// builds — it only exercises Triton in the VLLM_CPP_TRITON build. bf16 tolerance
+// matches the hand chunked-vs-sequential cases (same per-head delta-rule math).
+TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate shape") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_DELTAH_TRITON", "1", 1);  // opt into the Triton path (inert if not built)
+  // Two chunks + partial tail (150 tok) exercises the cross-chunk state recurrence,
+  // which is the delta_h kernel. 27B shape (Hk16/Hv48) then 35B shape (Hk16/Hv32).
+  RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16, 7100, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16, 7110, 3e-2f, 3e-2f);
+  // Multi-sequence varlen at the 27B shape (differing chunk counts + chunk offsets).
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16, 7120, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+  (void)bf16;
+}

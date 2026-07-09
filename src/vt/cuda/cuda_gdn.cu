@@ -2034,11 +2034,56 @@ __global__ void GdnChunkWUWmmaKernel(TD* u, TD* w, const TD* k, const TD* v, con
 // The apply streams u then w in column blocks of kOBlk (per-pass operand build,
 // so only ONE [BT,Dcol] operand is resident) — keeps the peak at ~40 KiB (bf16).
 constexpr int kOBlk = 64;  // WMMA apply output column block (multiple of kWM)
+
+// Blocked triangular-inverse Schur merge (mirrors FLA solve_tril.py
+// merge_16x16_to_64x64_inverse_kernel:356-390, off-diagonal fill). Called by ONE
+// warp to compute the [16,16] off-diagonal inverse block
+//   T(bi,bj) = -T(bi,bi) @ ( Σ_{k=bj}^{bi-1} A(bi,k) @ T(k,bj) )
+// on the tensor cores, where A is the strict-lower [BT,BT] f32 matrix (Am, the
+// beta/decay-folded K@Kᵀ) and T is the running [BT,BT] f32 inverse (Tf). The two
+// diagonal-inverse operands T(bi,bi)/T(k,bj) and the A(bi,k) blocks must already
+// be resident in Tf/Am. `Pw` is a per-warp [16,16] f32 scratch. Result is stored
+// (negated) into the (bi,bj) block of Tf. The inverse is carried in f32 shared for
+// BOTH kernel dtypes (Am/Tf/Pw are f32; the apply rounds Tf→Tb(TD) afterwards), so
+// the merges use the f32/TF32 WMMA config unconditionally — the same precision the
+// f32 apply already runs at (solve_tril output_dtype=k.dtype).
+__device__ inline void WyMerge(float* Tf, const float* Am, float* Pw, int64_t BT, int bi,
+                               int bj) {
+  using Cfg = WmmaCfg<float>;
+  constexpr int WK = Cfg::WK;
+  // P = Σ_{bk=bj}^{bi-1} A(bi,bk) @ T(bk,bj)  (f32 accumulate over the block chain).
+  typename Cfg::Acc accP;
+  wmma::fill_fragment(accP, 0.0f);
+  for (int bk = bj; bk < bi; ++bk) {
+    for (int kk = 0; kk < kWM; kk += WK) {
+      typename Cfg::Arow a;  // A(bi,bk)[:, kk:kk+WK]
+      typename Cfg::Brow b;  // T(bk,bj)[kk:kk+WK, :]
+      Cfg::load(a, Am + (bi * kWM) * BT + (bk * kWM) + kk, BT);
+      Cfg::load(b, Tf + (bk * kWM + kk) * BT + (bj * kWM), BT);
+      wmma::mma_sync(accP, a, b, accP);
+    }
+  }
+  wmma::store_matrix_sync(Pw, accP, kWM, wmma::mem_row_major);
+  __syncwarp();
+  // T(bi,bj) = -T(bi,bi) @ P.
+  typename Cfg::Acc accT;
+  wmma::fill_fragment(accT, 0.0f);
+  for (int kk = 0; kk < kWM; kk += WK) {
+    typename Cfg::Arow a;  // T(bi,bi)[:, kk:kk+WK]
+    typename Cfg::Brow b;  // P[kk:kk+WK, :]
+    Cfg::load(a, Tf + (bi * kWM) * BT + (bi * kWM) + kk, BT);
+    Cfg::load(b, Pw + kk * kWM, kWM);
+    wmma::mma_sync(accT, a, b, accT);
+  }
+  for (int i = 0; i < accT.num_elements; ++i) accT.x[i] = -accT.x[i];
+  wmma::store_matrix_sync(Tf + (bi * kWM) * BT + (bj * kWM), accT, BT, wmma::mem_row_major);
+}
+
 template <typename TD>
 __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
                                         const float* beta, const float* gcum,
                                         const int32_t* tok0a, const int32_t* lena, int64_t hk_n,
-                                        int64_t dk, int64_t hv_n, int64_t dv) {
+                                        int64_t dk, int64_t hv_n, int64_t dv, bool blocked) {
   using Cfg = WmmaCfg<TD>;
   constexpr int WK = Cfg::WK;
   const int64_t gc = blockIdx.x, hv = blockIdx.y;
@@ -2099,20 +2144,64 @@ __global__ void GdnChunkWUWmmaVecKernel(TD* u, TD* w, const TD* k, const TD* v,
   }
   __syncthreads();  // Ks (R0) free → Tf aliases it.
 
-  // T = (I + A)⁻¹, unit lower-triangular, column-wise forward-substitution in
-  // shared f32 (no local spill). Column c: T[c,c]=1, T[i,c]=−Σ_{m=c}^{i−1} A[i,m]T[m,c].
+  // T = (I + A)⁻¹, unit lower-triangular. Two solvers (VT_GDN_WY_BLOCKED):
   for (int64_t e = tid; e < BT * BT; e += blockDim.x) Tf[e] = 0.0f;
   __syncthreads();
-  for (int64_t c = tid; c < BT; c += blockDim.x) {
-    Tf[c * BT + c] = 1.0f;
-    if (c < len)
-      for (int64_t i = c + 1; i < len; ++i) {
-        float sfs = 0.0f;
-        for (int64_t m = c; m < i; ++m) sfs += Am[i * BT + m] * Tf[m * BT + c];
-        Tf[i * BT + c] = -sfs;
+  if (!blocked) {
+    // Serial (fallback/default): column-wise forward-substitution in shared f32
+    // (no local spill). Column c: T[c,c]=1, T[i,c]=−Σ_{m=c}^{i−1} A[i,m]T[m,c].
+    // Only BT of the blockDim.x threads work (one dependent chain per column,
+    // the longest ~BT·(BT−1)/2 deep) — the phase the blocked path shortens.
+    for (int64_t c = tid; c < BT; c += blockDim.x) {
+      Tf[c * BT + c] = 1.0f;
+      if (c < len)
+        for (int64_t i = c + 1; i < len; ++i) {
+          float sfs = 0.0f;
+          for (int64_t m = c; m < i; ++m) sfs += Am[i * BT + m] * Tf[m * BT + c];
+          Tf[i * BT + c] = -sfs;
+        }
+    }
+    __syncthreads();
+  } else {
+    // Blocked tensor-core inverse (mirrors FLA solve_tril.py
+    // merge_16x16_to_64x64_inverse_kernel:238-390). BT=64 → four 16×16 diagonal
+    // blocks solved by a short (≤16-deep) per-block forward-substitution, then six
+    // off-diagonal blocks filled by tensor-core Schur merges (T(i,j) = −T(i,i)·
+    // Σ_{j≤k<i} A(i,k)·T(k,j)), scheduled by merge distance so each phase's inputs
+    // are ready. Cuts the serial critical path from ~BT-deep (~2016 dep FMAs on one
+    // thread) to ~16-deep-per-block + a handful of 16×16 MMAs. Same [BT,BT] f32 Tf
+    // result → identical apply/store below. Partial tails (len<BT) fall out for
+    // free: Am is pre-zeroed past len (above) so out-of-range blocks invert to I /
+    // merge to 0, and the apply masks rows ≥ len. Requires BT == 4·kWM (== 64).
+    __shared__ __align__(16) float Pw[3][kWM * kWM];  // per-warp Schur scratch (≤3 concurrent)
+    // Diagonal: 4 blocks × 16 columns = 64 independent within-block column solves.
+    for (int p = tid; p < 4 * kWM; p += blockDim.x) {
+      const int bd = p / kWM;         // diagonal block 0..3
+      const int base = bd * kWM;      // block covers rows/cols [base, base+16)
+      const int c = base + (p % kWM);  // global column
+      Tf[c * BT + c] = 1.0f;
+      if (c < len) {
+        const int64_t iend = base + kWM < len ? base + kWM : len;
+        for (int64_t i = c + 1; i < iend; ++i) {
+          float sfs = 0.0f;
+          for (int64_t m = c; m < i; ++m) sfs += Am[i * BT + m] * Tf[m * BT + c];
+          Tf[i * BT + c] = -sfs;
+        }
       }
+    }
+    __syncthreads();
+    // Off-diagonal Schur merges, phased by distance (deps: T(i,j) needs T(k,j),
+    // k<i, same column). Distance 1: (1,0)(2,1)(3,2); 2: (2,0)(3,1); 3: (3,0).
+    if (warp == 0) WyMerge(Tf, Am, Pw[0], BT, 1, 0);
+    else if (warp == 1) WyMerge(Tf, Am, Pw[1], BT, 2, 1);
+    else if (warp == 2) WyMerge(Tf, Am, Pw[2], BT, 3, 2);
+    __syncthreads();
+    if (warp == 0) WyMerge(Tf, Am, Pw[0], BT, 2, 0);
+    else if (warp == 1) WyMerge(Tf, Am, Pw[1], BT, 3, 1);
+    __syncthreads();
+    if (warp == 0) WyMerge(Tf, Am, Pw[0], BT, 3, 0);
+    __syncthreads();
   }
-  __syncthreads();
   for (int64_t e = tid; e < BT * BT; e += blockDim.x) Store(Tb, e, Tf[e]);  // T(f32) → Tb(TD), Am free
   __syncthreads();
 
@@ -2323,6 +2412,14 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // + tensor-core apply (GdnChunkWUWmmaVecKernel, mirrors FLA solve_tril+
   // recompute_w_u). VT_GDN_CHUNK_VEC=0 keeps the WMMA-Gram/scalar-solve kernel.
   const char* vec_env = std::getenv("VT_GDN_CHUNK_VEC");
+  // VT_GDN_WY_BLOCKED (DEFAULT ON at the gate shape; =0 restores serial-f32): swap ONLY the vec kernel's triangular-inverse
+  // phase for the FLA blocked tensor-core inverse (four 16×16 diagonal forward-subs
+  // + six 16×16 Schur merges) instead of the serial ~BT-deep column solve. Requires
+  // BT == kChunk == 4·kWM == 64 (the merge_16x16_to_64x64 block structure). Greedy 16/16-vs-oracle
+  // token-exact on BOTH gate models (35B single+batched, 27B tie-free prefix); the tf32
+  // WMMA Schur merges hold vs vLLM's ieee inverse. test_ops_gdn 423/423.
+  const char* blk_env = std::getenv("VT_GDN_WY_BLOCKED");
+  const bool wy_blocked = kChunk == 4 * kWM && (blk_env == nullptr || blk_env[0] != '0');
   // Compact aliased arena (see kernel): R0=max(Ks[BT,Dk], Tf[BT,BT]f32),
   // R1=max(Am[BT,BT]f32, Tb[BT,BT]TD + Osh[BT,kOBlk]f32). bf16 ~40 KiB (2 blocks/SM),
   // f32/TF32 ~64 KiB (1 block/SM). Both fit the GB10 99 KiB opt-in; the guard keeps
@@ -2344,7 +2441,7 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
           "gdn chunked wu(vec) shared opt-in");
     GdnChunkWUWmmaVecKernel<TSc><<<grid_chunk, 256, vec_bytes, s>>>(
         u, w, k.Ptr<Tin>(), v.Ptr<Tin>(), beta.Ptr<float>(), gcum, d_tok0, d_len, hk_n, dk, hv_n,
-        dv);
+        dv, wy_blocked);
     Check(cudaGetLastError(), "gdn chunked wu(vec) launch");
   } else if (wu_wmma) {
     const size_t wu_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TSc) +

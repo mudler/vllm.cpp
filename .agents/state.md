@@ -1320,3 +1320,40 @@ residual-add+RMSNorm+quant and silu+mul+cvt_fp4 into single passes / GEMM epilog
 (mirror vLLM Inductor fusions) via the TDR fused-recipe skeleton. Then #2 GDN-chunk
 efficiency (25.6%, High — apply the vt::tile register-tiled method to ChunkO/WU + the
 WY blocked inverse). #3 kill Cast passes (~2.3%, Low — fold f32→bf16 into producers).
+
+## 2026-07-09 — GDN WY blocked tensor-core triangular inverse (lever #2) — POSITIVE, default OFF
+
+**VT_GDN_WY_BLOCKED (default OFF; branch perf/gdn-wy-blocked-inverse, commit a2d2198).**
+Swapped ONLY the WY vec kernel's (I+A)⁻¹ phase (GdnChunkWUWmmaVecKernel) for the FLA
+blocked tensor-core inverse (solve_tril.py merge_16x16_to_64x64_inverse_kernel:238-390):
+four 16×16 diagonal blocks by a short (≤16-deep) per-block column forward-sub + six
+off-diagonal blocks by 16×16 tensor-core Schur merges (T(i,j) = −T(i,i)·Σ_{j≤k<i}
+A(i,k)·T(k,j)), phased by merge distance. Replaces the serial ~BT-deep column
+forward-sub (~2016 dependent FMAs on ONE of 256 threads, 64/256 util). Gram / apply
+untouched; same [BT,BT] f32 Tf feeds the apply. New device helper WyMerge; +106/−12 LOC.
+
+**CONFIRMS the serial inverse WAS the hot phase of GdnChunkWU.** Same-binary nsys A/B
+(in1024/out16 np32 conc32, 150 launches): GdnChunkWU **531.07→449.30 ms = −15.4%**, while
+the sibling GDN kernels stayed in noise — ChunkO 365.99→368.07 (+0.6%), DeltaHRegRing
+344.08→340.44 (−1.1%). GdnChunkWU dropped 7.8%→6.7% of GPU busy. So the ~64-deep serial
+column inverse really was ~15% of the WU kernel, and the blocked tensor-core inverse cut it.
+
+**Token-exact:** test_ops_gdn 423/423 BOTH toggles (f32@5e-3, bf16@3e-2; varlen/multi-seq/
+partial-tail/GQA) + compute-sanitizer memcheck 0 errors. Partial tails fall out for free
+(Am pre-zeroed past len ⇒ out-of-range blocks invert to I / merge to 0; apply masks rows≥len).
+
+**E2E (35B NVFP4, GB10, idle box, in1024/out128 conc32 np192 mnbt8192):** baseline
+(BLOCKED=0, 3 runs) total 2817.8 / prefill 2504.8 / meanTTFT 2029.3; blocked (BLOCKED=1,
+2 runs) total 2833.1 / prefill 2518.4 / meanTTFT 2006.1 = **+0.54% total, +0.54% prefill,
+−1.1% TTFT** — clean (baseline spread ±0.1%; min blocked 2832.1 > max baseline 2821.0, no
+overlap). Small e2e because GdnChunkWU is ~7-8% of GPU kern time (a 15% cut ⇒ ~1.2% GPU
+work ⇒ ~0.5% e2e), same shape as the delta_h win (−15.4%→+0.54% here vs −22%→+0.85% there).
+
+**DEFAULT OFF (deliberate).** The merges use the tf32 WMMA config (the inverse is carried in
+f32 shared for both kernel dtypes; consistent with the tf32 apply). vLLM's FLA instead
+defaults FLA_TRIL_PRECISION=ieee (full-f32 dots), so blocked-on is numerically distinct from
+BOTH our serial-f32 baseline AND vLLM's ieee blocked inverse. Flipping the production default
+therefore needs a greedy 16/16-vs-oracle confirmation on 35B+27B (the bar delta_h cleared) —
+not run here. RECOMMEND: default-on after that greedy check; optionally raise the merges to a
+tf32x3/ieee-equivalent to match vLLM's precision exactly. This is a real GPU-work cut and a
+clean down-payment on the "GDN-chunk efficiency (25.6%)" campaign lever.

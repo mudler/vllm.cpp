@@ -19,11 +19,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 
@@ -120,6 +122,46 @@ struct sm120_fp4_config_default {
   using ClusterShape = Shape<_1, _1, _1>;
   using MmaTileShape = Shape<_256, _128, _128>;
   using PerSmTileShape_MNK = Shape<_256, _128, _128>;
+};
+
+// ---- Autotunable tile set (mirrors flashinfer's sm120/121 fp4 cutlass configs)
+// The flashinfer FlashInferCutlassNvFp4LinearKernel autotuner (the WHAT vLLM
+// selects among with enable_flashinfer_autotune=True on GB10) tunes over 8 CTA
+// tile shapes, all with 1x1x1 cluster on this target. Source (flashinfer 0.5.x):
+//   - jit/gemm/core.py::gen_gemm_sm120_module_cutlass_fp4 cta_m_n_k_list, and
+//   - include/flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h
+//     CutlassFp4GemmRunner::getConfigs() (CutlassTileConfigSM120 enum).
+// The 8 (CTA_M, CTA_N, CTA_K) tiles (K already the true cutlass tile-K, i.e. the
+// enum's "…64B"/"…128B" doubled to 128/256):
+//   128x32x128  128x32x256  128x64x128  128x64x256
+//   128x128x128 128x128x256 256x128x128 128x256x128
+//
+// We instantiate the four N>=128 tiles — {128x128x128, 128x128x256,
+// 256x128x128, 128x256x128}. The four narrow-N tiles (N in {32,64}) do NOT
+// compile through our block-scaled CollectiveBuilder: the scale-factor TMA needs
+// the CTA tile N to equal the SF atom N (= max(128, TileN)), so N<128 trips
+// "TMA requires CTA_Tile and SLayout top-level size equivalence" (cute
+// copy_traits_sm90_tma.hpp). flashinfer supports them via a different epilogue
+// (arch::OpClassTensorOp + explicit TmaWarpSpecialized, ElementC=void) which we
+// intentionally do NOT adopt here — it would rework the proven fixed-dispatch
+// configs. The N>=128 subset is exactly where the measured 6.1%/M=4096 prefill
+// headroom lives (large-M dense projections); narrow-N tiles only help tiny
+// M/N where the M<=256 config already ties/beats vLLM. Two of the four
+// (128x128x128, 256x128x128) are the fixed-dispatch configs above; the template
+// realizes 128x128x256 and 128x256x128 (schedules stay Auto as the two proven
+// configs — the builder resolves KernelTmaWarpSpecializedCooperativeBlockScaled
+// -Sm120 per tile, matching flashinfer's KernelTmaWarpSpecializedCooperative).
+// flashinfer also tunes StreamK + swap_ab variants; we take the DP-persistent
+// subset (large-M prefill favors the DP scheduler) to bound nvcc time + binary.
+template <int TileM, int TileN, int TileK,
+          typename Sched = cutlass::gemm::PersistentScheduler>
+struct sm120_fp4_tile {
+  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using TileScheduler = Sched;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
+  using PerSmTileShape_MNK = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 };
 
 template <typename Config, typename OutType>
@@ -260,6 +302,161 @@ void Fp4GemmDispatch(void* D, const void* A, const void* B, const void* A_sf, co
   }
 }
 
+// ---- Per-shape tile autotune (VT_FP4_AUTOTUNE, default OFF) -----------------
+// Mirrors vLLM's FlashInferCutlassNvFp4LinearKernel autotune (choose_one over
+// the tile candidates): on first sight of a (Mbucket,N,K) shape, micro-bench the
+// instantiated tiles on the REAL operands and cache the winner keyed by the
+// shape. The projection shapes repeat every layer/step, so the one-time tune
+// amortizes to ~0. Default OFF; the fixed 2-way M-dispatch above is the
+// baseline/fallback (and candidate 0/1 are byte-identical to it). OutType is
+// always bf16 here (the epilogue only emits bf16; f32-out projections go through
+// a bf16 scratch upstream), so the candidate table is bf16-only.
+using Fp4RunFn = void (*)(void*, const void*, const void*, const void*, const void*,
+                          const float*, int, int, int, cudaStream_t);
+
+template <typename Config>
+void RunTileBf16(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
+                 const float* alpha, int m, int n, int k, cudaStream_t s) {
+  RunGemm<typename Fp4GemmSm120<Config, cutlass::bfloat16_t>::Gemm>(D, A, B, A_sf, B_sf, alpha, m,
+                                                                    n, k, s);
+}
+
+struct Fp4Candidate {
+  const char* name;
+  Fp4RunFn run;
+};
+
+// The candidate set = flashinfer's four N>=128 sm120 tiles. Index 0/1 are the
+// fixed-dispatch baselines (identical to the OFF path); 2/3 are the extra tiles.
+const std::vector<Fp4Candidate>& Fp4Candidates() {
+  static const std::vector<Fp4Candidate> c = {
+      {"128x128x128", &RunTileBf16<sm120_fp4_config_M256>},     // baseline for M<=256
+      {"256x128x128", &RunTileBf16<sm120_fp4_config_default>},  // baseline for M>256
+      {"128x128x256", &RunTileBf16<sm120_fp4_tile<128, 128, 256>>},
+      {"128x256x128", &RunTileBf16<sm120_fp4_tile<128, 256, 128>>},
+  };
+  return c;
+}
+
+bool Fp4AutotuneEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_AUTOTUNE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+bool Fp4AutotuneVerbose() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_AUTOTUNE_VERBOSE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+uint32_t NextPow2M(int m) {
+  auto next_pow_2 = [](uint32_t v) {
+    if (v <= 1) return 1u;
+    v--;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    return v + 1;
+  };
+  return std::max<uint32_t>(16u, next_pow_2(static_cast<uint32_t>(m)));
+}
+
+struct Fp4ShapeKey {
+  uint32_t mp2;
+  int n;
+  int k;
+  bool operator==(const Fp4ShapeKey& o) const { return mp2 == o.mp2 && n == o.n && k == o.k; }
+};
+struct Fp4ShapeKeyHash {
+  size_t operator()(const Fp4ShapeKey& x) const {
+    return (std::hash<uint32_t>{}(x.mp2) * 1000003u) ^ (std::hash<int>{}(x.n) * 9176u) ^
+           std::hash<int>{}(x.k);
+  }
+};
+
+constexpr float kFp4Inf = 3.4e38f;
+
+// Time one candidate on the real operands (warmup + iters); kFp4Inf on failure
+// (unsupported tile / cutlass error) so the selector skips it. Runs write D
+// (garbage between candidates); the caller re-runs the winner for the real out.
+float Fp4TimeCandidate(const Fp4Candidate& cand, void* D, const void* A, const void* B,
+                       const void* A_sf, const void* B_sf, const float* alpha, int m, int n, int k,
+                       cudaStream_t s) {
+  constexpr int kWarm = 3, kIter = 10;
+  cudaEvent_t e0 = nullptr, e1 = nullptr;
+  try {
+    for (int i = 0; i < kWarm; ++i) cand.run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+    Check(cudaEventCreate(&e0), "autotune event create e0");
+    Check(cudaEventCreate(&e1), "autotune event create e1");
+    Check(cudaEventRecord(e0, s), "autotune record e0");
+    for (int i = 0; i < kIter; ++i) cand.run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+    Check(cudaEventRecord(e1, s), "autotune record e1");
+    Check(cudaEventSynchronize(e1), "autotune sync");
+    float ms = 0.0f;
+    Check(cudaEventElapsedTime(&ms, e0, e1), "autotune elapsed");
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    return ms / kIter;
+  } catch (const std::exception&) {
+    if (e0 != nullptr) cudaEventDestroy(e0);
+    if (e1 != nullptr) cudaEventDestroy(e1);
+    cudaGetLastError();  // clear any sticky launch error from the failed candidate
+    return kFp4Inf;
+  }
+}
+
+// Pick + cache the best tile candidate index for a (Mbucket,N,K) shape.
+int Fp4SelectPlan(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
+                  const float* alpha, int m, int n, int k, cudaStream_t s) {
+  const uint32_t mp2 = NextPow2M(m);
+  const Fp4ShapeKey key{mp2, n, k};
+  static std::mutex mu;
+  static std::unordered_map<Fp4ShapeKey, int, Fp4ShapeKeyHash> plans;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = plans.find(key);
+    if (it != plans.end()) return it->second;
+  }
+  const auto& cands = Fp4Candidates();
+  const int baseline = (mp2 <= 256) ? 0 : 1;
+  std::vector<float> t(cands.size(), kFp4Inf);
+  for (size_t i = 0; i < cands.size(); ++i)
+    t[i] = Fp4TimeCandidate(cands[i], D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+  int best = baseline;
+  for (size_t i = 0; i < cands.size(); ++i)
+    if (t[i] < t[best]) best = static_cast<int>(i);
+  // Hysteresis: only leave the proven baseline when the winner is clearly faster
+  // (>1%). Rejects measurement noise and keeps token output stable run-to-run
+  // (the 16/16 token-exact gate); the measured headroom is ~6.1%, so a real
+  // winner clears 1% easily.
+  const int chosen = (t[best] < t[baseline] * 0.99f) ? best : baseline;
+  if (Fp4AutotuneVerbose()) {
+    fprintf(stderr,
+            "[VT_FP4_AUTOTUNE] M=%d(mp2=%u) N=%d K=%d -> %s (%.1f us); baseline %s (%.1f us)\n", m,
+            mp2, n, k, cands[static_cast<size_t>(chosen)].name, t[static_cast<size_t>(chosen)] * 1000.0f,
+            cands[static_cast<size_t>(baseline)].name, t[static_cast<size_t>(baseline)] * 1000.0f);
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    plans.emplace(key, chosen);
+  }
+  return chosen;
+}
+
+// bf16-out fp4 GEMM entry: fixed dispatch (default) or per-shape autotuned tile.
+void Fp4GemmRunBf16(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
+                    const float* alpha, int m, int n, int k, cudaStream_t s) {
+  if (!Fp4AutotuneEnabled()) {
+    Fp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+    return;
+  }
+  const int idx = Fp4SelectPlan(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+  Fp4Candidates()[static_cast<size_t>(idx)].run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+}
+
 // ---- SwizzleBlockscale kernel (lift of vllm swizzle_blockscale) ------------
 // Linear fp8 block scale [rows, cols] -> swizzled [Mp=round_up(rows,128),
 // Kp=round_up(cols,4)] in the cutlass atom layout. Mapping (vLLM reshape
@@ -347,8 +544,8 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
     d_out = bf16_scratch;
   }
 
-  Fp4GemmDispatch<cutlass::bfloat16_t>(d_out, a_packed.data, b_packed.data, a_sf_sw.data,
-                                       b_sf_sw.data, d_alpha, m, n, k, s);
+  Fp4GemmRunBf16(d_out, a_packed.data, b_packed.data, a_sf_sw.data, b_sf_sw.data, d_alpha, m, n, k,
+                 s);
 
   if (out_f32) {
     const int64_t total = static_cast<int64_t>(m) * n;

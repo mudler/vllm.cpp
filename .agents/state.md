@@ -1375,3 +1375,30 @@ gate (kernels too small a prefill fraction). The meaningful remaining e2e gap is
 front (bigger, but spread across cutlass-3.x/Marlin/cuBLASLt epilogues — XL, CUDA-specific)
 OR a different axis (27B-specific, decode, features). This is a strategic fork for the user's
 steer — the autonomous GDN thread is measurably exhausted for e2e gains.
+
+## 2026-07-09 — REASSESS (both models, prefill+decode): near the portable parity floor
+
+Measured 27B + 35B, prefill AND decode (delta_h+WY landed). Decisive:
+- **e2e ≈ 53% prefill / 47% decode** (both models). **Decode is GPU-BOUND (87-93% busy),
+  GEMM-at-parity → NO decode lever** (the old "decode host-starved ~44%" was an nsys
+  CUDA-graph-collapse artifact; `--cuda-graph-trace=node` shows ~90% busy). 35B decode ≥
+  vLLM; 27B decode is memory-BW-bound (vLLM pays it too).
+- **GEMM at vendor-parity in ALL 4 profiles** (fp4 cutlass sm120 / Marlin; the bf16 15-33%
+  is GDN in_proj which the checkpoint recipe keeps bf16 — vLLM too). Entire lever surface
+  is NON-GEMM. (Caveat: vLLM autotunes fp4 via flashinfer AutoTuner vs our fixed cutlass
+  config — a small non-structural GEMM residual possible.)
+- **27B's biggest lever is NOT attention** (5.9% pref / 2.2% dec — refuted); it's GEMM-heavy
+  (dense fp4 crowds out non-GEMM), so its non-GEMM excess is SMALLER than the 35B's. The 27B
+  is the more-behind gate but hides no bigger lever; it improves via the SHARED glue/GDN work.
+- **Biggest remaining e2e lever = 35B prefill glue-chain fusion** (glue 25.3% pref ×53% =
+  13.4% e2e at 1.9× vLLM). Portable partial (fold add+RMSNorm+quant + silu+mul+fp4-quant via
+  the TDR skeleton) ≈ **~3% e2e, Med, canon-compliant**; the FULL ~6% needs XL CUDA-specific
+  cutlass/Marlin EVT epilogue fusion. GDN-chunk register-tiling is DIMINISHING (delta_h
+  +0.85% → WY +0.54% → ChunkO 0% e2e; each kernel too small a prefill fraction).
+
+**BOTTOM LINE: the remaining gap is DIFFUSE. No single lever >~6% e2e; only one (35B prefill
+glue) >~3%. We are near the practical PORTABLE parity floor** — GEMM at parity, decode
+GPU-bound at parity, attention/fp8 non-levers. The recommended next lever is the PORTABLE
+vt:: glue-chain fusion (~3% e2e, Med, via include/vt/fused_recipe.h TDR skeleton +
+GlueFuseEnabled in qwen3_5.cpp); the last ~3% beyond that needs XL CUDA-specific EVT (a
+portability tradeoff = a user decision).

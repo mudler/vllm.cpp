@@ -250,21 +250,28 @@ bool MarlinMoeEnabled() {
   return on;
 }
 
-// Fused w13 grouped GEMM (VT_MOE_FUSED_W13, default OFF until GPU-gated): run the
-// routed experts' gate+up as ONE Marlin grouped GEMM over the N-concatenated w13
-// weights (size_n=2I, output [P,2I]) + one SiluAndMul over the halves, instead of
-// TWO grouped GEMMs (+2 workspace memsets, 2 schedule passes) + MoeSiluMul. This
-// is exactly vLLM's marlin_moe.py shape: ONE moe_wna16_marlin_gemm with
+// Fused w13 grouped GEMM (VT_MOE_FUSED_W13, DEFAULT ON): run the routed
+// experts' gate+up as ONE Marlin grouped GEMM over the N-concatenated w13
+// weights (size_n=2I, output [P,2I]) + one SiluAndMul over the halves, instead
+// of TWO grouped GEMMs (+2 workspace memsets, 2 schedule passes) + MoeSiluMul;
+// same fusion for the shared-expert gate_up (SharedGateUpFusedMarlinD). This is
+// exactly vLLM's marlin_moe.py shape: ONE moe_wna16_marlin_gemm with
 // size_n = w13_num_shards * N into intermediate_cache1 [M*topk, 2N]
 // (fused_moe/experts/marlin_moe.py:133-160), then silu_and_mul on the [:N]/[N:]
 // halves (:162-170). At the 35B decode shape (I=512, top_k=8, many tiny
 // latency-bound tiles) the second GEMM's fixed costs are pure overhead.
+// GATED ON (GB10, 2026-07-10): fused-vs-split BIT-EXACT (test_ops_moe_grouped
+// probe), 35B greedy 16/16-vs-oracle BOTH arms, and a clean same-binary A/B win
+// (in1024/out128 np200 conc-64, 3+3 interleaved reps: 3166.85 -> 3262.28 tok/s
+// = +3.01%, TPOT -3.1%, TTFT -1.4%; MoE-expert fusion alone +0.53%, the rest
+// from the shared-expert gate_up fusion). VT_MOE_FUSED_W13=0 opts back out to
+// the split two-GEMM layout for A/B.
 // The layout choice is made at LOAD (BuildMoeMarlinResident builds either the
 // fused or the split resident), so A/B = two runs of the same binary.
 bool MoeFusedW13Enabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_MOE_FUSED_W13");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }

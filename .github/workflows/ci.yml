@@ -54,6 +54,8 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
       - name: Build
-        run: cmake --build build -j
+        # Bounded parallelism: a bare `-j` lets Make link ALL test executables at
+        # once, which OOM-kills the runner (ld signal 9) during the parallel link.
+        run: cmake --build build -j 2
       - name: Test
         run: ctest --test-dir build --output-on-failure

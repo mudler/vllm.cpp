@@ -10,9 +10,10 @@ C API, an example CLI, and an OpenAI-compatible server.
 > full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
 > **token-exact greedy gates passing**, and throughput is measured against vLLM
 > on real hardware. We **beat vLLM run eager** on both models; against vLLM's
-> *production* config (CUDA graphs + torch.compile) we are at **near-parity**
-> (≈0.90× on the 27B, ≈0.96× on the 35B) and are **actively closing the last few
-> percent** to full parity via a measured, execution-traced roadmap — see
+> *production* config (CUDA graphs + torch.compile) the **35B is near-parity
+> (≈0.97×)** and the **27B is ≈0.84×** on total throughput — and we use **~35%
+> less peak GPU memory** on both (a decisive win on that axis). We are **actively
+> closing the remaining gap** via a measured, execution-traced roadmap — see
 > *Status*. The tables track real, tested support and are kept current as work
 > lands (see `.agents/`).
 
@@ -126,19 +127,23 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   paged engine end-to-end with **token-exact greedy gates passing**, and all CUDA
   kernels are validated on real hardware. **Throughput, measured vs vLLM on the same
   workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
-  *production* config (CUDA graphs + torch.compile — the honest bar) we are at
-  ≈**0.90×** (27B, conc-16) / **0.96×** (35B), i.e. near-parity, consistent across
-  concurrency.
+  *production* config (CUDA graphs + torch.compile — the honest bar) the **35B is
+  ≈0.97× (near parity)** and the **27B is ≈0.84×** on total throughput, while we use
+  **~35% less peak GPU memory** on both. The 35B is essentially at parity; the 27B's
+  residual is concentrated in the GDN linear-attention **chunk kernels**, which remain
+  ~1.9× slower than vLLM's Triton/FLA — a kernel-**codegen** gap (not a dtype or
+  algorithm gap), the next frontier.
 - **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
   total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
-  concurrency operating point). We do not stop at "near parity." The remaining gap is
-  being closed by an **execution-traced roadmap**: we `nsys`-profile vLLM's *actual*
-  kernels (not just its source) and mirror what it runs — FlashAttention, cuBLASLt/
-  `nvjet_sm121` GEMM steering, hardware `cvt.e2m1x2` fp4 quant, merged projection
-  GEMMs, GDN chunk tuning — which an execution trace shows is enough to reach parity.
-  Every step is A/B-measured and gate-checked; the full record is in the
-  [parity ledger](.agents/parity-ledger.md). `scripts/dgx-bringup.sh` runs the CUDA
-  suite + the gates on dgx.casa.
+  concurrency operating point). We do not stop at "near parity." The gap is being
+  closed by an **execution-traced roadmap**: we `nsys`- and torch-profile vLLM's
+  *actual* kernels (not just its source) and mirror what it runs. Recent measured,
+  token-exact, default-on wins: register-tiled GDN `delta_h` + `cp.async` ring, a
+  blocked tensor-core WY triangular inverse, fused fp8 RMSNorm→quant (quantize-once),
+  and bf16 GDN input I/O. A per-shape fp4-GEMM autotune (**+5.8%** on the 27B at high
+  concurrency) is available via `VT_FP4_AUTOTUNE=1`. Every step is A/B-measured and
+  gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
+  `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF
   only). Original runtime/packaging components (the `vt` op runtime, the minja
   chat-template engine, the native grammar backend, the C API) are documented as

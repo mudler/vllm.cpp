@@ -1563,3 +1563,30 @@ Big memory win (~65% of vLLM's peak).** Remaining: fp4 GEMM per-shape autotune (
 BOTH models — our fixed 2-config vs vLLM's 8-config); in_proj_qkv cuBLASLt SM80-pick (~1%). The
 BIG 27B gap (chunk codegen ~1.9×) needs Triton/a compiler, not portable hand-C++ — the session's
 original portable-vs-Triton dilemma, now with data showing the portable playbook's limit.
+
+## 2026-07-09 — fp4 GEMM per-shape autotune (27B +5.8%) + SESSION CLOSE
+
+fp4 GEMM per-shape tile autotune (`VT_FP4_AUTOTUNE`, `cuda_matmul_nvfp4_cutlass.cu`, merged
+3ac839d): mirrors flashinfer's SM120 CutlassTileConfig set (instantiated the 4 N≥128 tiles;
+the N<128 tiles need a different block-scaled epilogue we didn't adopt), per-shape micro-bench
++ cache (like the fp8 plan-cache) with >1% hysteresis. **27B +1.6% (conc16) / +5.8% (conc32,
+M=8192) e2e**, kernel −16% to −57%, token-exact 16/16 both models. **35B inert** (its dense is
+fp8 cuBLASLt, not this cutlass GEMM — corrects the "helps 35B" premise). **Default OFF** pending
+a CUDA-graph-capture safety check (autotune's `cudaEventSync` is illegal mid-capture; both gates
+passed with it ON → empirically safe, but verify before the global flip). Available via
+`VT_FP4_AUTOTUNE=1`.
+
+**=== SESSION CLOSE (2026-07-09) ===**
+FIVE measured, token-exact wins this session, built on the new portable `vt::tile` component
+(which reversed the old "portable-C++ ceiling" belief): (1) delta_h register-tiled + cp.async
+ring +0.85% [default-on]; (2) WY blocked tensor-core inverse +0.54% [default-on]; (3) fp8
+RMSNorm→quant + quantize-once +0.85% [default-on]; (4) GDN input-side bf16 +0.7-0.8% [default-on];
+(5) fp4 GEMM per-shape autotune 27B +1.6-5.8% [VT_FP4_AUTOTUNE, default-OFF pending graph-safety].
+**Current fresh A/B vs GRAPHED vLLM: 35B ≈0.97× (near parity), 27B ≈0.84× (≈0.86-0.87× with fp4
+autotune), ours uses ~35% LESS peak memory on both.** Also: measured-refuted fp8-plan-cache +
+launch-bubble-fusion + EVT-on-GB10 (all ~0); relicensed MIT→Apache-2.0; fixed CI runner-OOM
+(bounded -j); README status refreshed. **The 27B's dominant residual is the GDN-chunk CODEGEN
+gap (~1.9× vs vLLM's Triton), portably-unclosable** — the open fork: Triton CUDA fast-path
+(branch perf/triton-fastpath, proven; non-portable) vs accept the floor + pursue the broader MVP
+(GGUF/tools/grammars/server/e2e/more-models). fp4-autotune default-on (verify graph-safety) is a
+cheap pending 27B win.

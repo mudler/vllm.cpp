@@ -6218,3 +6218,27 @@ Every C3R timing/memory observation is **NOT APPLICABLE**, the stopped C3
 partial performance remains **VOID**, and immutable `3f256ab` remains binding
 at **55/124**. Corrected C3 c2/c16 is next. No exact grid or 35B performance
 command ran or is authorized before that component passes.
+
+## 2026-07-09 — Local NixOS Blackwell bring-up branch (RTX 5070 Ti / 16GB)
+
+Created branch `local-blackwell-environment` for the current local machine, separate from the old
+DGX/Spark environment record. Added root `.environment.md` with host facts (NixOS 25.11, Ryzen 9
+7900, RTX 5070 Ti/GB203, 16GB VRAM) and a `flake.nix`/`flake.lock` dev environment. Nix path works:
+`nix develop .#cuda` provides CUDA 12.9 nvcc + GCC 14 and fixes the default-shell `nvidia-smi`
+failure by adding `/run/opengl-driver/lib`; `nvidia-smi` reports driver 580.142 and 16,303 MiB VRAM.
+Docker fallback was NOT added because the Nix flake succeeded.
+
+Verification on this local RTX:
+- CPU shell: `nix develop .#default` configure/build/test passed, 91/91.
+- CUDA shell: configured with explicit `-DCMAKE_CUDA_COMPILER=$CMAKE_CUDA_COMPILER` and
+  `-DCMAKE_CUDA_HOST_COMPILER=$CMAKE_CUDA_HOST_COMPILER`; native RTX build succeeds.
+- Fixed one non-GB10 compile portability issue: `cuda_matmul_nvfp4.cu` now hides the native
+  fp4-MMA-only `GetNib` helper when `__CUDA_ARCH_SPECIFIC__` is absent.
+- Fixed one test portability issue: fp8 CUTLASS tests now skip when `VT_CUTLASS_FP8` is not built
+  (local native RTX build disables CUTLASS/FP8 because it is not sm_12xa).
+- Full CUDA ctest is 89/91. Open local failures: `test_cuda_ops` BF16 cuBLASLt odd-size matmul
+  tolerance on `{17,31,13}`, and `test_op_parity` CUDA `gdn_prefill_f32_realdims` off by
+  ~1.17e-5 vs a ~1.02e-5 tolerance. Do not loosen these without an RTX-specific numeric review.
+
+NEXT local work: evaluate Gemma 4 small models for 16GB VRAM fit and vLLM support, then port/verify
+one small model path in vllm.cpp so local apples-to-apples vLLM benchmarking is meaningful.

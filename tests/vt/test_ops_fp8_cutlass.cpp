@@ -27,13 +27,21 @@ using vt::DType;
 using vt::Queue;
 using vt::Tensor;
 
-bool HasCuda() {
+[[maybe_unused]] bool HasCuda() {
   try {
     vt::GetBackend(DeviceType::kCUDA);
     return true;
   } catch (const std::runtime_error&) {
     return false;
   }
+}
+
+bool HasCudaFp8() {
+#ifdef VT_CUTLASS_FP8
+  return HasCuda();
+#else
+  return false;
+#endif
 }
 
 Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
@@ -186,8 +194,8 @@ void RunCase(int M, int N, int K, uint32_t seed, bool cublaslt = false) {
 }  // namespace
 
 TEST_CASE("fp8 cutlass W8A8 GEMM matches host W8A8 reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA device; skipping fp8 cutlass W8A8 test");
+  if (!HasCudaFp8()) {
+    MESSAGE("CUDA fp8 kernels not built; skipping fp8 cutlass W8A8 test");
     return;
   }
   // Cover both M-dispatch configs (M<=256 pingpong 64-tile; M>256 default
@@ -202,8 +210,8 @@ TEST_CASE("fp8 cutlass W8A8 GEMM matches host W8A8 reference") {
 }
 
 TEST_CASE("fp8 cutlass W8A8 GEMM f32-output path matches bf16") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA device; skipping fp8 cutlass f32-out test");
+  if (!HasCudaFp8()) {
+    MESSAGE("CUDA fp8 kernels not built; skipping fp8 cutlass f32-out test");
     return;
   }
   // f32 out is the bf16 epilogue value cast up; same reference within tol.
@@ -243,8 +251,8 @@ TEST_CASE("fp8 cutlass W8A8 GEMM f32-output path matches bf16") {
 }
 
 TEST_CASE("fp8 cuBLASLt W8A8 GEMM matches host W8A8 reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA device; skipping fp8 cuBLASLt W8A8 test");
+  if (!HasCudaFp8()) {
+    MESSAGE("CUDA fp8 kernels not built; skipping fp8 cuBLASLt W8A8 test");
     return;
   }
   // Same shapes as the cutlass case (small-M decode + prefill), routed through
@@ -266,8 +274,8 @@ TEST_CASE("fp8 cuBLASLt W8A8 GEMM matches host W8A8 reference") {
 // bf16 vLLM model dtype) and the optional bf16 side-output (GDN emits it for
 // in_proj_a/b; full-attn does not). This is the op-level token-exactness gate.
 TEST_CASE("rmsnorm_quant_fp8 fused == RmsNorm(bf16)+QuantFp8Static (bit-for-bit)") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA device; skipping rmsnorm_quant_fp8 fusion test");
+  if (!HasCudaFp8()) {
+    MESSAGE("CUDA fp8 kernels not built; skipping rmsnorm_quant_fp8 fusion test");
     return;
   }
   using vt::RmsNormArgs;
@@ -344,8 +352,8 @@ TEST_CASE("rmsnorm_quant_fp8 fused == RmsNorm(bf16)+QuantFp8Static (bit-for-bit)
 }
 
 TEST_CASE("fp8 cuBLASLt W8A8 GEMM f32-output path matches reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA device; skipping fp8 cuBLASLt f32-out test");
+  if (!HasCudaFp8()) {
+    MESSAGE("CUDA fp8 kernels not built; skipping fp8 cuBLASLt f32-out test");
     return;
   }
   // cuBLASLt writes f32 out directly (no bf16 staging); same reference within tol.

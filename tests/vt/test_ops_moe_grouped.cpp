@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -436,3 +437,191 @@ TEST_CASE("moe_grouped_gemm_nvfp4 validates shapes loudly (CPU dispatch)") {
       vt::MoeGroupedGemmNvfp4(cq, tout, tact, tids, nullptr, tpp, tsp, ts2),
       std::runtime_error);
 }
+
+#ifdef VT_MARLIN_NVFP4
+#include "vt/cuda/marlin_repack.h"
+
+// Fused-w13 Marlin probe (VT_MOE_FUSED_W13 lever): ONE grouped Marlin GEMM over
+// the N-concatenated gate|up (size_n=2N, output [P,2N]) + SiluAndMul on the
+// halves must match TWO grouped GEMMs (size_n=N each) + MoeSiluMul — the split
+// path MoeBlockFusedMarlinCuda runs by default. Mirrors vLLM marlin_moe.py:133-170
+// (one moe_wna16_marlin_gemm with size_n = w13_num_shards*N, then silu_and_mul).
+// The comparison is CheckClose(atol=rtol=0) = BIT-EXACT: it PINS whether the 2N
+// grouped schedule preserves the k-accumulation order. If a future kernel/tile
+// change legitimately reorders accumulation, this case may need a tolerance —
+// the model-level gate is 35B greedy 16/16-vs-oracle either way.
+TEST_CASE("CUDA marlin fused w13 (size_n=2N) is bit-exact vs split gate/up GEMMs") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  void* stream = gq.q.handle;
+  const int dev = gq.q.device.index;
+
+  // 35B-like small shape: K%128==0 and N%64==0 (Marlin tile constraints, the
+  // no-padding case vLLM's pad_w13 reduces to). top_k=2, T=6 → P=12 pairs.
+  const int64_t E = 4, T = 6, top_k = 2, P = T * top_k;
+  const int64_t K = 256, N = 64;
+
+  // Per expert: gate and up nvfp4 weights with EQUAL scale2 (the fused path's
+  // single per-expert global scale — vLLM w13_weight_scale_2[:, 0] after its
+  // allclose check, modelopt.py:1556-1564).
+  std::vector<Nvfp4Weight> gate_w, up_w;
+  for (int64_t e = 0; e < E; ++e) {
+    gate_w.push_back(MakeNvfp4Weight(N, K, 100 + static_cast<uint32_t>(e)));
+    up_w.push_back(MakeNvfp4Weight(N, K, 200 + static_cast<uint32_t>(e)));
+    up_w.back().scale2 = gate_w.back().scale2;
+  }
+  const auto act_f = RandomF32(static_cast<size_t>(T * K), 4242);
+  const auto act_bf16 = ToBf16(act_f);
+
+  // combined_scale_factor jointly over gate+up (vLLM computes it over the
+  // STACKED w13 scales; identical for both paths).
+  std::vector<const uint8_t*> sc_bufs;
+  std::vector<size_t> sc_lens;
+  for (int64_t e = 0; e < E; ++e) {
+    sc_bufs.push_back(gate_w[static_cast<size_t>(e)].scale.data());
+    sc_lens.push_back(gate_w[static_cast<size_t>(e)].scale.size());
+    sc_bufs.push_back(up_w[static_cast<size_t>(e)].scale.data());
+    sc_lens.push_back(up_w[static_cast<size_t>(e)].scale.size());
+  }
+  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(sc_bufs, sc_lens);
+
+  // Repack SPLIT (per-shard, size_n=N) and FUSED (host-concat gate|up rows,
+  // size_n=2N) residents + processed scales + global scales.
+  const size_t wq_i32 = static_cast<size_t>(K / 16) * (N * 2);
+  const size_t sc_b = static_cast<size_t>(K / 16) * N;
+  DeviceTensor wq_gate(gpu, gq.q, DType::kI32, {E, K / 16, N * 2});
+  DeviceTensor wq_up(gpu, gq.q, DType::kI32, {E, K / 16, N * 2});
+  DeviceTensor wq_gu(gpu, gq.q, DType::kI32, {E, K / 16, 2 * N * 2});
+  DeviceTensor sc_gate(gpu, gq.q, DType::kI8, {E, K / 16, N});
+  DeviceTensor sc_up(gpu, gq.q, DType::kI8, {E, K / 16, N});
+  DeviceTensor sc_gu(gpu, gq.q, DType::kI8, {E, K / 16, 2 * N});
+  std::vector<float> g_gate(static_cast<size_t>(E)), g_up(static_cast<size_t>(E)),
+      g_gu(static_cast<size_t>(E));
+  for (int64_t e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    const Nvfp4Weight& g = gate_w[se];
+    const Nvfp4Weight& u = up_w[se];
+    DeviceTensor dpg(gpu, gq.q, DType::kI8, {N, K / 2}, g.packed.data());
+    DeviceTensor dpu(gpu, gq.q, DType::kI8, {N, K / 2}, u.packed.data());
+    DeviceTensor dsg(gpu, gq.q, DType::kI8, {N, K / 16}, g.scale.data());
+    DeviceTensor dsu(gpu, gq.q, DType::kI8, {N, K / 16}, u.scale.data());
+    // Concat = flat row-stack (packed [N,K/2] u8 and scales [N,K/16] fp8 are
+    // row-major over N; gate rows first — the vLLM w13 shard order).
+    std::vector<uint8_t> cat_p(g.packed.size() + u.packed.size());
+    std::memcpy(cat_p.data(), g.packed.data(), g.packed.size());
+    std::memcpy(cat_p.data() + g.packed.size(), u.packed.data(), u.packed.size());
+    std::vector<uint8_t> cat_s(g.scale.size() + u.scale.size());
+    std::memcpy(cat_s.data(), g.scale.data(), g.scale.size());
+    std::memcpy(cat_s.data() + g.scale.size(), u.scale.data(), u.scale.size());
+    DeviceTensor dpc(gpu, gq.q, DType::kI8, {2 * N, K / 2}, cat_p.data());
+    DeviceTensor dsc(gpu, gq.q, DType::kI8, {2 * N, K / 16}, cat_s.data());
+
+    auto* wq_gate_e = static_cast<uint32_t*>(wq_gate.ptr()) + se * wq_i32;
+    auto* wq_up_e = static_cast<uint32_t*>(wq_up.ptr()) + se * wq_i32;
+    auto* wq_gu_e = static_cast<uint32_t*>(wq_gu.ptr()) + se * 2 * wq_i32;
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, wq_gate_e,
+                                       static_cast<const uint8_t*>(dpg.ptr()), K, N);
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, wq_up_e,
+                                       static_cast<const uint8_t*>(dpu.ptr()), K, N);
+    vt::cuda::MarlinRepackExpertWeight(stream, dev, wq_gu_e,
+                                       static_cast<const uint8_t*>(dpc.ptr()), K, 2 * N);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dsg.ptr()),
+                                        static_cast<uint8_t*>(sc_gate.ptr()) + se * sc_b, K, N, sf);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dsu.ptr()),
+                                        static_cast<uint8_t*>(sc_up.ptr()) + se * sc_b, K, N, sf);
+    vt::cuda::MarlinProcessExpertScales(stream, static_cast<const uint8_t*>(dsc.ptr()),
+                                        static_cast<uint8_t*>(sc_gu.ptr()) + se * 2 * sc_b, K,
+                                        2 * N, sf);
+    g_gate[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(g.scale2, sf);
+    g_up[se] = vt::cuda::MarlinNvfp4ProcessGlobalScale(u.scale2, sf);
+    g_gu[se] = g_gate[se];  // equal scale2 → identical processed global
+    gpu.Synchronize(gq.q);  // repack reads the loop-local staging uploads
+  }
+  DeviceTensor dg_gate(gpu, gq.q, DType::kF32, {E}, g_gate.data());
+  DeviceTensor dg_up(gpu, gq.q, DType::kF32, {E}, g_up.data());
+  DeviceTensor dg_gu(gpu, gq.q, DType::kF32, {E}, g_gu.data());
+
+  // moe_align inputs over random top-k ids (same for both paths).
+  std::vector<int32_t> topk_ids(static_cast<size_t>(P));
+  for (int64_t p = 0; p < P; ++p)
+    topk_ids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 5 + 3) % E);
+  std::vector<float> topk_w(static_cast<size_t>(P), 1.0f);
+  const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(T),
+                                                            static_cast<int>(top_k),
+                                                            static_cast<int>(E));
+  int max_tok = 0, max_blk = 0;
+  vt::cuda::MarlinMoeAlignSizes(static_cast<int>(T), static_cast<int>(top_k),
+                                static_cast<int>(E), block, &max_tok, &max_blk);
+  DeviceTensor dtid(gpu, gq.q, DType::kI32, {T, top_k}, topk_ids.data());
+  DeviceTensor dtw(gpu, gq.q, DType::kF32, {T, top_k}, topk_w.data());
+  DeviceTensor sorted_ids(gpu, gq.q, DType::kI32, {max_tok});
+  DeviceTensor expert_ids(gpu, gq.q, DType::kI32, {max_blk});
+  DeviceTensor num_pad(gpu, gq.q, DType::kI32, {1});
+  vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                    static_cast<int>(T), static_cast<int>(top_k),
+                                    static_cast<int>(E), block,
+                                    static_cast<int32_t*>(sorted_ids.ptr()),
+                                    static_cast<int32_t*>(expert_ids.ptr()),
+                                    static_cast<int32_t*>(num_pad.ptr()));
+
+  const int sms = vt::cuda::MarlinDeviceSms(dev);
+  DeviceTensor ws(gpu, gq.q, DType::kI32, {sms * 4});
+  DeviceTensor dact(gpu, gq.q, DType::kBF16, {T, K}, act_bf16.data());
+  const vt::MoeMarlinArgs args_n{block, static_cast<int>(top_k), static_cast<int>(T),
+                                 static_cast<int>(N), static_cast<int>(K), false};
+  const vt::MoeMarlinArgs args_2n{block, static_cast<int>(top_k), static_cast<int>(T),
+                                  static_cast<int>(2 * N), static_cast<int>(K), false};
+
+  // SPLIT: two GEMMs + MoeSiluMul.
+  DeviceTensor dgate(gpu, gq.q, DType::kBF16, {P, N});
+  DeviceTensor dup(gpu, gq.q, DType::kBF16, {P, N});
+  DeviceTensor act_split(gpu, gq.q, DType::kBF16, {P, N});
+  gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(gq.q, dgate.tensor(), dact.tensor(), wq_gate.tensor(),
+                                sc_gate.tensor(), dg_gate.tensor(), ws.tensor(),
+                                sorted_ids.tensor(), expert_ids.tensor(), num_pad.tensor(),
+                                dtw.tensor(), args_n);
+  gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(gq.q, dup.tensor(), dact.tensor(), wq_up.tensor(),
+                                sc_up.tensor(), dg_up.tensor(), ws.tensor(),
+                                sorted_ids.tensor(), expert_ids.tensor(), num_pad.tensor(),
+                                dtw.tensor(), args_n);
+  vt::MoeSiluMul(gq.q, act_split.tensor(), dgate.tensor(), dup.tensor());
+
+  // FUSED: one GEMM (size_n=2N) + SiluAndMul on the halves.
+  DeviceTensor dgu(gpu, gq.q, DType::kBF16, {P, 2 * N});
+  DeviceTensor act_fused(gpu, gq.q, DType::kBF16, {P, N});
+  gpu.Memset(gq.q, ws.ptr(), 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+  vt::MoeGroupedGemmNvfp4Marlin(gq.q, dgu.tensor(), dact.tensor(), wq_gu.tensor(),
+                                sc_gu.tensor(), dg_gu.tensor(), ws.tensor(),
+                                sorted_ids.tensor(), expert_ids.tensor(), num_pad.tensor(),
+                                dtw.tensor(), args_2n);
+  vt::SiluAndMul(gq.q, act_fused.tensor(), dgu.tensor());
+
+  // Compare BITWISE: fused halves vs split GEMM outputs, and the activations.
+  std::vector<uint16_t> h_gate(static_cast<size_t>(P * N)), h_up(static_cast<size_t>(P * N));
+  std::vector<uint16_t> h_gu(static_cast<size_t>(P * 2 * N));
+  std::vector<uint16_t> h_act_s(static_cast<size_t>(P * N)), h_act_f(static_cast<size_t>(P * N));
+  dgate.Download(gq.q, h_gate.data());
+  dup.Download(gq.q, h_up.data());
+  dgu.Download(gq.q, h_gu.data());
+  act_split.Download(gq.q, h_act_s.data());
+  act_fused.Download(gq.q, h_act_f.data());
+  size_t gate_diff = 0, up_diff = 0, act_diff = 0;
+  for (int64_t p = 0; p < P; ++p) {
+    for (int64_t n = 0; n < N; ++n) {
+      const size_t i = static_cast<size_t>(p * N + n);
+      if (h_gate[i] != h_gu[static_cast<size_t>(p * 2 * N + n)]) ++gate_diff;
+      if (h_up[i] != h_gu[static_cast<size_t>(p * 2 * N + N + n)]) ++up_diff;
+      if (h_act_s[i] != h_act_f[i]) ++act_diff;
+    }
+  }
+  CHECK(gate_diff == 0);
+  CHECK(up_diff == 0);
+  CHECK(act_diff == 0);
+}
+#endif  // VT_MARLIN_NVFP4

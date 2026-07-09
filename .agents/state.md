@@ -6285,3 +6285,38 @@ Practical local ceilings from this sweep:
 Important caveat: vllm.cpp does not yet support Gemma 4 full-engine inference, so these are vLLM
 oracle numbers only. Next meaningful local perf work is to add/verify a Gemma 4 E2B path in
 vllm.cpp (or choose another model the project can actually run), then run apples-to-apples.
+
+## 2026-07-09 — vllm.cpp local benchmark attempt against Gemma target
+
+Tried to benchmark the same cached `google/gemma-4-E2B-it` snapshot with
+`build-nix-cuda-gcc14/examples/vllm-bench --model ...`. It is not currently benchmarkable in
+vllm.cpp: loading fails in the tokenizer with `unsupported normalizer "Replace"`. Separately, the
+repo's registered model implementations are Qwen3.5/3.6, not Gemma 4, so fixing tokenizer support
+would not by itself produce a valid Gemma engine benchmark.
+
+Ran the no-model synthetic benchmark harness at the same shapes only as a smoke check:
+- 1024/128, prompts/concurrency 112: 109.15 req/s, 125,784.57 total tok/s, 13,970.97 output tok/s.
+- 2048/128, prompts/concurrency 64: 55.34 req/s, 120,448.56 total tok/s, 7,083.94 output tok/s.
+
+These are NOT comparable to the vLLM Gemma oracle numbers because the no-model path is a tiny
+synthetic CPU engine. Current honest comparison result: vLLM Gemma E2B has local oracle numbers;
+vllm.cpp has no same-model number yet. Next step for a real comparison is either implement Gemma 4
+tokenizer/model support or select a local model already supported by vllm.cpp and rerun both sides.
+
+## 2026-07-09 — local Qwen candidate check
+
+Queried current Hugging Face metadata for smaller Qwen options through the local vLLM environment.
+`Qwen/Qwen3.5-4B` is the best-sized local candidate: config reports
+`model_type=qwen3_5`, `text_config.model_type=qwen3_5_text`,
+`architectures=["Qwen3_5ForConditionalGeneration"]`, 32 layers, hidden 2560, 16 attention heads,
+4 KV heads, head_dim 256, and the same hybrid `layer_types` pattern as the Qwen3.6 gate models.
+`Qwen/Qwen3.5-2B` is the smaller fallback with the same family/config shape; older
+`Qwen/Qwen3-4B-Instruct-2507` is `model_type=qwen3` / `Qwen3ForCausalLM` with no hybrid
+`layer_types`, so it is not the same architecture path.
+
+Important loader caveat: current vllm.cpp dense Qwen support is specialized for the
+`unsloth/Qwen3.6-27B-NVFP4` compressed-tensors checkpoint. Its dense loader expects NVFP4
+`weight_packed`/`weight_scale`/global-scale tensors for attention/MLP/GDN-out projections, while
+`Qwen/Qwen3.5-4B` exposes ordinary `.weight` tensors in the safetensors index. So 4B is a good
+vLLM oracle target and likely the right local Qwen architecture to support next, but vllm.cpp needs
+a BF16/plain-weight dense loader path before apples-to-apples benchmarking can run.

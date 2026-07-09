@@ -448,10 +448,13 @@ void L2NormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& 
 // coupled GDN bf16 path (VT_GDN_BF16) — mirrors FLA keeping the matmul-input
 // activations (q/k/v) in bf16 while g/beta stay f32 (they gate the recurrence,
 // FLA holds them f32). The l2norm reduction math is f32; only the store rounds
-// to Tqkv. g_out/beta_out are always f32.
-template <typename Tqkv>
+// to Tqkv. g_out/beta_out are always f32. Tconv = the conv-output activation
+// dtype: f32 (default) or bf16 under the input-side bf16 GDN path (VT_GDN_IN_BF16),
+// which mirrors FLA carrying the post-conv activations in bf16 (halved conv-read
+// traffic); the reads upcast to f32 via Load() so the norm math is unchanged.
+template <typename Tqkv, typename Tconv>
 __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out,
-                                  float* beta_out, const float* conv, const float* araw,
+                                  float* beta_out, const Tconv* conv, const float* araw,
                                   const float* braw, const float* a_log, const float* dt_bias,
                                   int64_t hk, int64_t dk, int64_t hv, int64_t dv, float eps) {
   const int64_t key_dim = hk * dk, value_dim = hv * dv;
@@ -461,14 +464,14 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
   const int64_t row = tok * conv_dim;
   if (head < hk) {
     __shared__ float partial[kBlock];
-    const float* qin = conv + row + head * dk;
-    const float* kin = conv + row + key_dim + head * dk;
+    const Tconv* qin = conv + row + head * dk;
+    const Tconv* kin = conv + row + key_dim + head * dk;
     Tqkv* qo = q_out + (tok * hk + head) * dk;
     Tqkv* ko = k_out + (tok * hk + head) * dk;
     // ---- q l2norm (plain SUM of squares over Dk, §4) ----
     float acc = 0.0f;
     for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
-      const float v = qin[j];
+      const float v = Load(qin, j);
       acc += v * v;
     }
     partial[threadIdx.x] = acc;
@@ -478,12 +481,12 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
       __syncthreads();
     }
     const float qinv = 1.0f / sqrtf(partial[0] + eps);
-    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(qo, j, qin[j] * qinv);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(qo, j, Load(qin, j) * qinv);
     __syncthreads();
     // ---- k l2norm ----
     acc = 0.0f;
     for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
-      const float v = kin[j];
+      const float v = Load(kin, j);
       acc += v * v;
     }
     partial[threadIdx.x] = acc;
@@ -493,12 +496,12 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
       __syncthreads();
     }
     const float kinv = 1.0f / sqrtf(partial[0] + eps);
-    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(ko, j, kin[j] * kinv);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(ko, j, Load(kin, j) * kinv);
   } else {
     // v copy + §6 g/beta for this token.
-    const float* vin = conv + row + 2 * key_dim;
+    const Tconv* vin = conv + row + 2 * key_dim;
     Tqkv* vo = v_out + tok * value_dim;
-    for (int64_t j = threadIdx.x; j < value_dim; j += kBlock) Store(vo, j, vin[j]);
+    for (int64_t j = threadIdx.x; j < value_dim; j += kBlock) Store(vo, j, Load(vin, j));
     for (int64_t h = threadIdx.x; h < hv; h += kBlock) {
       const int64_t idx = tok * hv + h;
       const float x = araw[idx] + dt_bias[h];
@@ -521,18 +524,30 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
            "cuda gdn_post_conv: q/k/v out dtypes must match");
   VT_CHECK(q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16,
            "cuda gdn_post_conv: q/k/v out must be f32 or bf16");
+  VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
+           "cuda gdn_post_conv: conv must be f32 or bf16");
   dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hk + 1));
   cudaStream_t s = AsStream(q);
-  if (q_out.dtype == DType::kF32) {
-    GdnPostConvKernel<float><<<grid, kBlock, 0, s>>>(
-        q_out.Ptr<float>(), k_out.Ptr<float>(), v_out.Ptr<float>(), g_out.Ptr<float>(),
-        beta_out.Ptr<float>(), conv.Ptr<float>(), araw.Ptr<float>(), braw.Ptr<float>(),
+  // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
+  // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
+  auto launch = [&](auto qkv_tag, auto conv_tag) {
+    using Tqkv = decltype(qkv_tag);
+    using Tconv = decltype(conv_tag);
+    GdnPostConvKernel<Tqkv, Tconv><<<grid, kBlock, 0, s>>>(
+        q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+        beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<float>(), braw.Ptr<float>(),
         a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, args.eps);
+  };
+  const bool qkv_f32 = q_out.dtype == DType::kF32;
+  const bool conv_f32 = conv.dtype == DType::kF32;
+  if (qkv_f32 && conv_f32) {
+    launch(float{}, float{});
+  } else if (qkv_f32) {
+    launch(float{}, __nv_bfloat16{});
+  } else if (conv_f32) {
+    launch(__nv_bfloat16{}, float{});
   } else {
-    GdnPostConvKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
-        q_out.Ptr<__nv_bfloat16>(), k_out.Ptr<__nv_bfloat16>(), v_out.Ptr<__nv_bfloat16>(),
-        g_out.Ptr<float>(), beta_out.Ptr<float>(), conv.Ptr<float>(), araw.Ptr<float>(),
-        braw.Ptr<float>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, args.eps);
+    launch(__nv_bfloat16{}, __nv_bfloat16{});
   }
   Check(cudaGetLastError(), "gdn_post_conv launch");
 }

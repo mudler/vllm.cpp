@@ -1496,3 +1496,47 @@ Investigated the 27B 0.84× gap with vLLM's LLM-API torch profiler (nsys breaks 
 bf16 activations, f32 accum, keep f32 g/beta/state guardrail) + ~2% fp4 autotune + ~1.3% bf16
 in_proj-output = the ~16% 27B gap, GDN-dominated. NEXT: bf16-vs-f32 GDN A/B → full bf16 GDN
 pipeline. This RE-OPENS the GDN front for the 27B. Evidence: dgx /home/mudler/scratch_agent_a562/.
+
+## 2026-07-09 — 27B GDN INPUT-side bf16 (VT_GDN_IN_BF16, DEFAULT-ON): token-exact, +0.7-0.8% e2e. The 2× GDN gap is the CHUNK codegen, NOT input dtype (the "14%" was wrong).
+
+Tested the STEP-1/STEP-2 bf16-GDN-I/O hypothesis. **STEP-1 diagnosis (code +
+nsys scratch_agent_a562/nsys/prefill_kern.csv) REVISED the premise:** the bf16
+CHUNK path was ALREADY ACTIVE by default (VT_GDN_BF16 on) — GdnChunkWUWmmaVec
+<bf16> (5.9%), GdnChunkDeltaHRegRing<bf16> (4.5%), GdnChunkOWmma<bf16,float>
+(4.5%) all bf16. The ONLY remaining f32 INPUT-side stages: in_proj mixed_qkv GEMM
+output (MatmulF32D), causal conv1d (CausalConv1dFwd<float,float> 3.7%), post-conv
+conv-READ (GdnPostConv reads const float* conv, 3.2%). So **"GDN 27%→halve→14%"
+was WRONG** — most of GDN was already bf16; only ~conv+postconv-read were f32.
+
+IMPLEMENTED VT_GDN_IN_BF16 (DEFAULT-ON): mixed_qkv→MatmulBf16D, conv bf16 (bf16
+weight + bf16 dconv; f32 conv_state + f32-accum math unchanged), GdnPostConv/
+GdnConvSplit templated on conv dtype (Load() upcast, ops.cpp guards relaxed).
+g/beta/ssm_state + the a/b GEMMs stay f32 (FLA split). 27B-only by construction
+(bf16-weight in_proj branch); 35B fp8 branch untouched. Commit on perf/gdn-in-bf16.
+
+GATES (all GREEN): test_ops_gdn 423/423 + compute-sanitizer memcheck 0 errors.
+27B greedy paged-engine token-EXACT (default-on AND VT_GDN_IN_BF16=1 AND OFF:
+identical "…Berlin." + tie-free 6/6 + full-16 matches PRODUCTION). 35B 16/16
+(unaffected — fp8 branch). Default-on gate re-confirmed on the flipped build.
+
+A/B (same-binary, OFF vs ON, 27B in1024/out128, 3 interleaved reps):
+  conc16/np96:  OFF 707.2 / ON 712.0 total = +0.68%; prefill 628.7/632.9 = +0.68%;
+                TTFT 2935.9/2892.4 = -1.5%. NON-OVERLAPPING arms (OFF max 708.1 < ON min 711.2).
+  conc32/np192/mnbt8192: OFF 854.0 / ON 861.1 = +0.83%; prefill 759.2/765.5 = +0.83%;
+                TTFT 7181/7062 = -1.6%. Noisier per-rep (0.02/0.51/1.98%), avg positive every axis.
+nsys GDN-kernel A/B (in1024/out8 np48; prefill 1651.9→1664.6 = +0.77%):
+  CausalConv1dFwd 987675→676139 = -31.5% (bf16 I/O halves the read-bound conv, re-reads x K=4×);
+  GdnPostConv 876352→721914 = -17.6% (bf16 conv read); GdnChunkWU/O/DeltaH FLAT
+  (-0.5/-0.01/-1.0%, already bf16); RmsNormGated FLAT (output side not converted).
+  GDN µs/tok ~138→128 = -7.1%; vs vLLM FLA 71.7 → gap 2.07×→~1.9×.
+
+**HONEST VERDICT:** input-side bf16 is token-exact + net-positive on EVERY axis
+(+0.7-0.8% total & prefill, TTFT -1.5%), mechanism-confirmed (conv -31.5%). But it
+recovers only ~7% of OUR GDN kernel time (2.07×→~1.9× vs vLLM), NOT "much of the
+2×." The CHUNK trio (the dominant GDN cost) was ALREADY bf16 and stays FLAT — the
+remaining ~1.9× is the chunk's KERNEL-STRUCTURE/CODEGEN gap vs vLLM's Triton/FLA,
+the established hard frontier (parity-ledger 2026-07-08: hand-matched structure =
+neutral, codegen-quality = a compiler capability). Landed DEFAULT-ON as a faithful
+(vLLM FLA carries bf16 activations) clean down-payment in the same shape as
+delta_h (+0.85%) / WY (+0.54%). The 27B's bigger levers remain elsewhere (fp4
+autotune ~2%; the chunk codegen gap, needing Triton/compiler not hand-C++).

@@ -1158,6 +1158,31 @@ DType GdnActDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
+// GDN INPUT-side bf16 (VT_GDN_IN_BF16, DEFAULT ON — gated). Mirrors vLLM FLA
+// carrying the *pre-chunk* activations in bf16, not just the chunk fragments:
+// when ON, the GDN in_proj mixed_qkv GEMM emits bf16 (MatmulBf16D instead of
+// MatmulF32D), the causal conv1d then runs bf16 in/out (bf16 conv weight,
+// f32-accumulated internally, f32 conv_state unchanged), and the post-conv
+// split/l2norm reads bf16 conv — halving the traffic of the two big [T,conv_dim]
+// activation buffers (mixed write+conv read, conv write+post-conv read) that
+// stayed f32 while the chunk trio was already bf16 (GdnActDType). The
+// l2norm/softplus math is f32-accumulated regardless (Load() upcasts); g/beta,
+// ssm_state, and the a/b GEMMs stay f32 (FLA's split). 27B-only by construction:
+// gated on the bf16-weight in_proj branch (the 27B's in_proj_qkv is a plain bf16
+// weight); the 35B's fp8-cutlass in_proj branch keeps its f32 output untouched.
+// MEASURED (27B, GB10, same-binary A/B): conv kernel -31.5%, post-conv -17.6%
+// (chunk trio FLAT — already bf16); e2e +0.68% (conc16, non-overlapping) / +0.83%
+// (conc32), TTFT -1.5%; token-exact (27B greedy paged-engine + 35B 16/16). The
+// GDN-vs-vLLM gap only 2.07×→~1.9× (the ~1.9× residual is the chunk's codegen
+// gap, not dtype). A/B: VT_GDN_IN_BF16=0 restores the byte-identical f32 path.
+DType GdnInDType() {
+  static const bool bf16 = [] {
+    const char* e = std::getenv("VT_GDN_IN_BF16");
+    return e == nullptr || e[0] != '0';
+  }();
+  return bf16 ? DType::kBF16 : DType::kF32;
+}
+
 // GDN recurrence-OUTPUT + z-gate in bf16 (default OFF; VT_GDN_OUT_BF16=1 enables).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
@@ -1218,10 +1243,14 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
   // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
+  // mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight branch); the
+  // fp8-cutlass branch (35B) keeps f32. See GdnInDType().
+  const DType indt = GdnInDType();
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
                    ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
                             : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
-                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
+               : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
+                                      : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
   DBuf z = !w.in_proj_z_fp8.Empty()
                ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, DType::kF32)
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32))
@@ -1229,15 +1258,19 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
-  // Causal conv1d over the token stream (silu activation), fresh zero state.
-  Tensor dcw = ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
+  // Causal conv1d over the token stream (silu activation), fresh zero state. conv
+  // in/out dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16); f32
+  // conv_state + f32-accumulated math unchanged.
+  const DType convdt = mixed.t().dtype;
+  Tensor dcw = convdt == DType::kBF16 ? ResidentWeight(d, w.conv1d_weight, {conv_dim, Kw})
+                                      : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dstate(d, DType::kF32, {1, conv_dim, Kw - 1});
   dstate.Zero(d);
   const int32_t qsl[2] = {0, static_cast<int32_t>(T)};
   const int32_t his[1] = {0};
   DBuf dqsl(d, DType::kI32, {2}, qsl);
   DBuf dhis(d, DType::kI32, {1}, his);
-  DBuf dconv(d, DType::kF32, {T, conv_dim});
+  DBuf dconv(d, convdt, {T, conv_dim});
   vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dstate.t(),
                       dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
 
@@ -1409,10 +1442,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
   // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
+  // mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight branch, halves
+  // the conv-input traffic); the fp8-cutlass branch (35B) keeps f32. See
+  // GdnInDType().
+  const DType indt = GdnInDType();
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
                    ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
                             : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
-                   : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
+               : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
+                                      : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
   // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
   // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
   // byte-identical f32 path.
@@ -1426,9 +1464,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
   // Causal conv1d over the token stream, PERSISTENT conv_state (gathered by the
-  // per-request state indices, updated in place, scattered back).
-  Tensor dcw = ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
-  DBuf dconv(d, DType::kF32, {T, conv_dim});
+  // per-request state indices, updated in place, scattered back). conv in/out
+  // dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16 → bf16 weight +
+  // bf16 dconv halve the conv read/write); the f32 conv_state and the
+  // f32-accumulated conv math are unchanged. The post-conv split reads dconv's
+  // dtype (GdnPostConv/GdnConvSplit are templated on it).
+  const DType convdt = mixed.t().dtype;
+  Tensor dcw = convdt == DType::kBF16 ? ResidentWeight(d, w.conv1d_weight, {conv_dim, Kw})
+                                      : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
+  DBuf dconv(d, convdt, {T, conv_dim});
   const int64_t conv_row_elems = conv_dim * (Kw - 1);
   if (np > 0) {
     // Any prefill: conv over the WHOLE non-spec stream (decodes lead, each with

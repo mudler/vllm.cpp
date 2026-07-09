@@ -161,10 +161,12 @@ void GdnGBetaKernelCuda(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor&
 // copy is folded in for idx < T*value_dim so both halves ride one launch.
 // Templated on the q/k/v output dtype (Tqkv): f32 by default, or bf16 for the
 // coupled GDN bf16 path (VT_GDN_BF16) so the split activations feed the WMMA
-// chunk-scan as native bf16 (halved traffic + bf16 tensor-core fragments). The
-// conv input stays f32; math rounds to Tqkv on store via the Store overloads.
-template <typename Tqkv>
-__global__ void GdnConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, const float* conv,
+// chunk-scan as native bf16 (halved traffic + bf16 tensor-core fragments). Tconv
+// = the conv-output dtype: f32 (default) or bf16 under the input-side bf16 GDN
+// path (VT_GDN_IN_BF16); the conv read upcasts to f32 via Load(), math rounds to
+// Tqkv on store via the Store overloads.
+template <typename Tqkv, typename Tconv>
+__global__ void GdnConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, const Tconv* conv,
                                    int64_t t, int64_t key_dim, int64_t value_dim) {
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const int64_t nq = t * key_dim, nv = t * value_dim;
@@ -196,15 +198,26 @@ void GdnConvSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_ou
            "cuda gdn_conv_split: q/k/v out dtypes must match");
   VT_CHECK(q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16,
            "cuda gdn_conv_split: q/k/v out must be f32 or bf16");
+  VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
+           "cuda gdn_conv_split: conv must be f32 or bf16");
   cudaStream_t s = AsStream(q);
-  if (q_out.dtype == DType::kF32) {
-    GdnConvSplitKernel<float><<<GridFor(n), kBlock, 0, s>>>(
-        q_out.Ptr<float>(), k_out.Ptr<float>(), v_out.Ptr<float>(), conv.Ptr<float>(), t, key_dim,
+  auto launch = [&](auto qkv_tag, auto conv_tag) {
+    using Tqkv = decltype(qkv_tag);
+    using Tconv = decltype(conv_tag);
+    GdnConvSplitKernel<Tqkv, Tconv><<<GridFor(n), kBlock, 0, s>>>(
+        q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), conv.Ptr<Tconv>(), t, key_dim,
         value_dim);
+  };
+  const bool qkv_f32 = q_out.dtype == DType::kF32;
+  const bool conv_f32 = conv.dtype == DType::kF32;
+  if (qkv_f32 && conv_f32) {
+    launch(float{}, float{});
+  } else if (qkv_f32) {
+    launch(float{}, __nv_bfloat16{});
+  } else if (conv_f32) {
+    launch(__nv_bfloat16{}, float{});
   } else {
-    GdnConvSplitKernel<__nv_bfloat16><<<GridFor(n), kBlock, 0, s>>>(
-        q_out.Ptr<__nv_bfloat16>(), k_out.Ptr<__nv_bfloat16>(), v_out.Ptr<__nv_bfloat16>(),
-        conv.Ptr<float>(), t, key_dim, value_dim);
+    launch(__nv_bfloat16{}, __nv_bfloat16{});
   }
   Check(cudaGetLastError(), "gdn_conv_split launch");
 }

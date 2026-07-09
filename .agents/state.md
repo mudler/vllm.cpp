@@ -1357,3 +1357,56 @@ therefore needs a greedy 16/16-vs-oracle confirmation on 35B+27B (the bar delta_
 not run here. RECOMMEND: default-on after that greedy check; optionally raise the merges to a
 tf32x3/ieee-equivalent to match vLLM's precision exactly. This is a real GPU-work cut and a
 clean down-payment on the "GDN-chunk efficiency (25.6%)" campaign lever.
+
+## 2026-07-09 — GDN ChunkO occupancy fix (VT_GDN_CHUNKO_OPT) — kernel −11.5%, e2e-neutral@gate, default OFF
+
+**DIAGNOSIS (why ChunkO ~2× vLLM's fla chunk_o).** ncu counters are BLOCKED on GB10
+(RmProfilingAdminOnly=1, no sudo → ERR_NVGPUCTRPERM), so diagnosed via static resource
+usage + cudaOccupancy + isolated nsys A/B. Device: 100 KiB smem/SM, 65536 regs/SM, 1536
+threads (48 warps)/SM. Baseline `GdnChunkOWmmaKernel<bf16>` = 60 reg/thread, **73728 B
+dynamic smem** → floor(102400/75264) = **1 block/SM** (regs would allow 2). At 512 threads
+that is 16/48 = **33 % occupancy — shared-memory-limited**. The 32 KiB culprit is `outc`
+[BT,Dv=128] f32 — the whole-Dv b_o accumulator, round-tripped through smem across the
+cross / eg-scale / A@V phases (6 __syncthreads). vLLM's chunk_fwd_kernel_o (chunk_o.py:
+90-137) instead SPLITS V into BV blocks (grid.x=V/BV) and keeps b_o[BT,BV]+b_A[BT,BT] in
+REGISTERS → tiny per-program smem, high occupancy; it even does MORE flops (b_A=Q@K
+recomputed per BV block, chunk_o.py:113) yet is ~2× faster. **So the 2× is occupancy/
+efficiency, NOT compute** — the smem round-trip + barrier serialization is the gap.
+
+**FIX (VT_GDN_CHUNKO_OPT, bf16, default OFF).** New `GdnChunkOWmmaOptKernel`: loops Dv
+over BV=64 v-blocks inside ONE block (Q@Kᵀ + the causal A computed ONCE — no vLLM-style
+redundant Gram) and aliases smem down to **48 KiB** (Qs 16K persistent; R_A = qks[f32]→
+As[bf16] in-place with a register-buffered barrier; R_S = Ks[bf16]→outc_vb[f32]) →
+**2 blocks/SM = 66 % occupancy**. `__launch_bounds__(512,2)` caps it at 64 reg (64×512×2 =
+65536 = exactly 2 blocks by regs too). **BIT-IDENTICAL numerics** (same tf32/f32 WMMA,
+same post-scale outc*=eg, same causal exp(G_i−G_j) mask; only smem layout + Dv iteration
+order change) — so no greedy-oracle risk, and the 423 chunked-vs-sequential tests already
+prove bit-exactness. +12 LOC launcher, +1 kernel (~130 LOC). cuda_gdn.cu.
+
+**Token-exact:** test_ops_gdn **423/423** BOTH toggles + compute-sanitizer memcheck **0
+errors** with OPT=1 (full suite). No numeric deviation → greedy 16/16 guaranteed by
+construction (not run; default stays OFF so shipped behavior == baseline anyway).
+
+**MEASURED (35B NVFP4, GB10, idle box, same binary A/B):**
+- **Kernel (nsys, in1024/out8 conc16 np32, 300 inst):** ChunkO **353.37M→312.83M ns =
+  −11.5 %** (avg 1177.9→1042.8 µs); siblings flat (GdnChunkWU −0.09 %, DeltaHRegRing
+  −0.7 %) ⇒ isolated. ChunkO 5.0→4.4 % GPU busy.
+- **e2e gate (in1024/out128 conc32 np192 mnbt8192, 3+3):** OFF 2619.6 [2617.1,2622.8] /
+  ON 2620.9 [2618.4,2622.6] tok/s = **+0.05 %, fully overlapping → NEUTRAL** (TTFT ~2104
+  both; prefill ~2328 both). out128 is decode-heavy so the prefill-only ChunkO cut washes out.
+- **e2e prefill-heavy (in1024/out8 conc32 np96, 3+3):** OFF 4725.4 [4721.3,4730.5] / ON
+  4733.8 [4725.6,4739.2] = **+0.18 % total**, TTFT 2588.1→2581.4 = **−0.26 %** — small
+  positive at the edge of noise (one ON run dipped into the OFF range).
+
+**HONEST VERDICT.** A real, isolated, token-exact **−11.5 % ChunkO** GPU-work cut, but its
+e2e footprint is small (ChunkO ~5-6 % of PREFILL GPU-busy, prefill a fraction of the gate
+wall-time) → **e2e-neutral at the out128 gate**, ~+0.18 % prefill-heavy. Occupancy doubling
+(33→66 %) bought −11.5 %, NOT the full 2× — the kernel is only PARTLY occupancy-bound; the
+residual is exactly the smem round-trip + 6-barrier phase serialization vLLM removes with
+register-resident FUSED accumulators. **Default OFF** (gate-neutral; bit-identical so zero
+risk to flip if desired). Branch `perf/gdn-chunko-occ`. Shape as the delta_h/WU wins
+(−22 %→+0.85 %, −15.4 %→+0.54 %); a third GDN-chunk down-payment. **NEXT bigger lever for
+the "GDN-chunk efficiency (25.6 %)" campaign:** the register-resident fused ChunkO (b_o in
+WMMA accumulators across cross+A@V, only A materialized to smem, ≤3 barriers) — closes the
+round-trip residual but needs eg handled without post-scale (pre-scale Q by eg≤1, a small
+numeric deviation ⇒ greedy 16/16 gate).

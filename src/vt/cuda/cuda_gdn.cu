@@ -1918,6 +1918,168 @@ __global__ void GdnChunkOWmmaKernel(Tout* out, const TD* q, const TD* k, const T
   }
 }
 
+// ChunkO (WMMA, OCCUPANCY-tuned) — VT_GDN_CHUNKO_OPT, bf16 only.
+//
+// DIAGNOSIS (GB10 sm_121, static + nsys, ncu counters unavailable): the baseline
+// GdnChunkOWmmaKernel is SHARED-MEMORY occupancy-limited to 1 block/SM. Its 72 KiB
+// dynamic smem (Qs 16K + Ks|outc 32K + qks 16K + As 8K) exceeds half the 100 KiB/SM,
+// so only one 512-thread block is resident = 16/48 = 33 % occupancy; its 60 regs/
+// thread would otherwise admit 2 blocks. The 32 KiB term is `outc` [BT,Dv] f32 —
+// the whole-Dv b_o accumulator, round-tripped through smem across the cross / eg /
+// A@V phases. vLLM's chunk_fwd_kernel_o (fla/ops/chunk_o.py:90-137) instead SPLITS
+// V into BV blocks (grid.x = V/BV) and keeps b_o[BT,BV] + b_A[BT,BT] in registers,
+// so its per-program smem is tiny and it runs at high occupancy — it even does MORE
+// flops (b_A = Q@K recomputed per BV block, chunk_o.py:113) yet is ~2× faster, i.e.
+// the gap is occupancy/efficiency, not compute.
+//
+// FIX (this kernel): loop the Dv output over BV=64 v-blocks inside ONE block (so
+// Q@Kᵀ + A are computed ONCE, no vLLM-style redundant Gram) and alias the smem so
+// the resident footprint drops to 48 KiB → 2 blocks/SM = 66 % occupancy:
+//   Qs   [BT,Dk] bf16            = 16 KiB (persistent)
+//   R_A  qks[BT,BT] f32 (phase1) → As[BT,BT] bf16 (phase2+, in the low 8K) = 16 KiB
+//   R_S  Ks[BT,Dk] bf16 (phase1) → outc_vb[BT,BV] f32 (per v-block)        = 16 KiB
+// Numerics are BIT-IDENTICAL to the baseline (same tf32/f32-accumulate WMMA, same
+// post-scale `outc*=eg`, same causal exp(G_i-G_j) mask) — only the smem layout and
+// the Dv loop change. qks→As is compacted in place with a register-buffered barrier
+// (read all qks to regs, sync, write bf16 As) so the f32→bf16 shrink never races the
+// still-pending f32 reads. Launched with a FIXED 512-thread block (4096/512 = 8
+// elems/thread → the buf[8] compaction is exact) and BV | Dv.
+template <typename TD, typename Tout>
+__global__ __launch_bounds__(512, 2) void GdnChunkOWmmaOptKernel(
+    Tout* out, const TD* q, const TD* k, const TD* v_new, const TD* hstate,
+    const float* gcum, const int32_t* tok0a, const int32_t* lena, int64_t hk_n, int64_t dk,
+    int64_t hv_n, int64_t dv, float scale, bool vec) {
+  using Cfg = WmmaCfg<TD>;
+  using V = V128<TD>;
+  constexpr int WK = Cfg::WK;
+  constexpr int BV = 64;  // v-block width (Dv must be a multiple)
+  const int64_t gc = blockIdx.x, hv = blockIdx.y;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t tok0 = tok0a[gc], len = lena[gc];
+  const int64_t sd = dv * dk;
+  const TD* hstart = hstate + (gc * hv_n + hv) * sd;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, nwarps = static_cast<int>(blockDim.x) / 32;
+
+  extern __shared__ char smem_raw[];
+  const size_t qs_bytes = static_cast<size_t>(kChunk * dk) * sizeof(TD);        // Qs
+  const size_t ra_bytes = static_cast<size_t>(kChunk * kChunk) * 4;             // R_A (qks f32)
+  TD* Qs = reinterpret_cast<TD*>(smem_raw);                                     // [BT,Dk]
+  char* pA = smem_raw + qs_bytes;                                              // R_A
+  float* qks = reinterpret_cast<float*>(pA);                                    // [BT,BT] f32
+  TD* As = reinterpret_cast<TD*>(pA);                                           // [BT,BT] bf16 (aliases qks)
+  char* pS = pA + ra_bytes;                                                    // R_S
+  TD* Ks = reinterpret_cast<TD*>(pS);                                           // [BT,Dk] bf16
+  float* outc = reinterpret_cast<float*>(pS);                                   // [BT,BV] f32 (aliases Ks)
+  __shared__ float gs[kChunk], eg[kChunk];
+
+  // Stage Q/K + decay (identical to the baseline).
+  if (vec)
+    for (int64_t g = tid; g < (kChunk * dk) / V::N; g += blockDim.x) {
+      const int64_t base = g * V::N;
+      const int64_t i = base / dk, d = base % dk;
+      if (i < len) {
+        V::Cpy(Qs + base, q + (tok0 + i) * hk_n * dk + hk * dk + d);
+        V::Cpy(Ks + base, k + (tok0 + i) * hk_n * dk + hk * dk + d);
+      } else {
+        V::Sf0(Qs + base);
+        V::Sf0(Ks + base);
+      }
+    }
+  else
+    for (int64_t e = tid; e < kChunk * dk; e += blockDim.x) {
+      const int64_t i = e / dk, d = e % dk;
+      const bool in = i < len;
+      Store(Qs, e, in ? Load(q, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+      Store(Ks, e, in ? Load(k, (tok0 + i) * hk_n * dk + hk * dk + d) : 0.0f);
+    }
+  for (int64_t i = tid; i < len; i += blockDim.x) {
+    gs[i] = gcum[(tok0 + i) * hv_n + hv];
+    eg[i] = expf(gs[i]);
+  }
+  __syncthreads();
+
+  // qk = Q @ Kᵀ  [BT,BT] -> qks (R_A, f32)
+  const int nqk = (kChunk / kWM) * (kChunk / kWM);
+  for (int t = warp; t < nqk; t += nwarps) {
+    const int it = t % (kChunk / kWM), jt = t / (kChunk / kWM);
+    const int i0 = it * kWM, j0 = jt * kWM;
+    typename Cfg::Acc acc;
+    wmma::fill_fragment(acc, 0.0f);
+    for (int64_t kk = 0; kk < dk; kk += WK) {
+      typename Cfg::Arow a;
+      typename Cfg::Bcol b;
+      Cfg::load(a, Qs + i0 * dk + kk, dk);
+      Cfg::load(b, Ks + j0 * dk + kk, dk);
+      wmma::mma_sync(acc, a, b, acc);
+    }
+    wmma::store_matrix_sync(qks + i0 * kChunk + j0, acc, kChunk, wmma::mem_row_major);
+  }
+  __syncthreads();
+  // A[i,j] = exp(G_i - G_j) * qk[i,j] for j<=i (causal), else 0. Compact f32 qks ->
+  // bf16 As IN PLACE (As aliases qks): buffer this thread's masked values in regs,
+  // barrier so every qks f32 read is retired, then write the (half-width) bf16 As —
+  // the write to As[e]@2e can never clobber a qks[e']@4e' still being read.
+  float amask[8];
+  int ac = 0;
+  for (int64_t e = tid; e < kChunk * kChunk; e += blockDim.x) {
+    const int64_t i = e / kChunk, j = e % kChunk;
+    float a = 0.0f;
+    if (i < len && j < len && j <= i) a = expf(gs[i] - gs[j]) * qks[e];
+    amask[ac++] = a;
+  }
+  __syncthreads();
+  ac = 0;
+  for (int64_t e = tid; e < kChunk * kChunk; e += blockDim.x) Store(As, e, amask[ac++]);
+  __syncthreads();
+
+  // Per v-block: outc_vb = eg * (Q @ Hstartᵀ) + A @ V_new ; o = scale * outc_vb
+  const int ncr = (kChunk / kWM) * (BV / kWM);
+  for (int64_t vb = 0; vb < dv; vb += BV) {
+    // cross = Q @ Hstartᵀ  [BT,BV] -> outc (R_S, f32)
+    for (int t = warp; t < ncr; t += nwarps) {
+      const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+      const int i0 = it * kWM, vi0 = vt * kWM;
+      typename Cfg::Acc acc;
+      wmma::fill_fragment(acc, 0.0f);
+      for (int64_t kk = 0; kk < dk; kk += WK) {
+        typename Cfg::Arow a;
+        typename Cfg::Bcol b;
+        Cfg::load(a, Qs + i0 * dk + kk, dk);
+        Cfg::load(b, hstart + (vb + vi0) * dk + kk, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(outc + i0 * BV + vi0, acc, BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int64_t e = tid; e < kChunk * BV; e += blockDim.x) {
+      const int64_t i = e / BV;
+      outc[e] *= i < len ? eg[i] : 0.0f;
+    }
+    __syncthreads();
+    for (int t = warp; t < ncr; t += nwarps) {
+      const int it = t % (kChunk / kWM), vt = t / (kChunk / kWM);
+      const int i0 = it * kWM, vi0 = vt * kWM;
+      typename Cfg::Acc acc;
+      wmma::load_matrix_sync(acc, outc + i0 * BV + vi0, BV, wmma::mem_row_major);
+      for (int jj = 0; jj < kChunk; jj += WK) {
+        typename Cfg::Arow a;
+        typename Cfg::Brow b;
+        Cfg::load(a, As + i0 * kChunk + jj, kChunk);
+        Cfg::load(b, v_new + (tok0 + jj) * hv_n * dv + hv * dv + vb + vi0, hv_n * dv);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(outc + i0 * BV + vi0, acc, BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+    for (int64_t e = tid; e < kChunk * BV; e += blockDim.x) {
+      const int64_t i = e / BV, vi = e % BV;
+      if (i < len) Store(out, (tok0 + i) * hv_n * dv + hv * dv + vb + vi, scale * outc[e]);
+    }
+    __syncthreads();
+  }
+}
+
 // Step B (WMMA) — chunk_scaled_dot_kkt Gram on tensor cores. The scalar
 // GdnChunkWUKernel spends its bulk in the O(BT²·Dk) Gram K@Kᵀ (prefill's last
 // scalar-float GDN chunk kernel, ~22% GPU). This replaces that cooperative
@@ -2592,18 +2754,46 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
     }
 
-    const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
-                          ? static_cast<size_t>(kChunk * dk) * sz
-                          : static_cast<size_t>(kChunk * dv) * 4;
-    const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
-                                static_cast<size_t>(kChunk * kChunk) * 4 +
-                                static_cast<size_t>(kChunk * kChunk) * sz;
-    opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
-           "gdn chunked o(wmma) shared opt-in");
-    GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
-        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
-        hk_n, dk, hv_n, dv, args.scale, dvec);
-    Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
+    // OCCUPANCY-tuned ChunkO (VT_GDN_CHUNKO_OPT, bf16 only, default OFF). The
+    // baseline is shared-limited to 1 block/SM by its 72 KiB dynamic smem (the
+    // 32 KiB full-Dv `outc` term); the opt kernel loops Dv over BV=64 v-blocks and
+    // aliases qks/As + Ks/outc down to 48 KiB → 2 blocks/SM (33 %→66 % occupancy),
+    // bit-identical numerics. Fixed 512-thread block (its in-place qks→As compaction
+    // assumes exactly 4096/512 = 8 elems/thread). Requires dk==128, BV|Dv.
+    const char* qo_env = std::getenv("VT_GDN_CHUNKO_OPT");
+    const bool chunko_opt = (qo_env != nullptr && qo_env[0] != '0') &&
+                            std::is_same<TSc, __nv_bfloat16>::value && dk == 128 && (dv % 64 == 0);
+    if (chunko_opt) {
+      constexpr int BVO = 64;
+      const size_t opt_bytes =
+          static_cast<size_t>(kChunk * dk) * sz + static_cast<size_t>(kChunk * kChunk) * 4 +
+          (static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * BVO) * 4
+               ? static_cast<size_t>(kChunk * dk) * sz
+               : static_cast<size_t>(kChunk * BVO) * 4);
+      // Always opt in: 48 KiB dynamic + the static smem exceeds the 48 KiB default
+      // cap (opt_in's "> 48 KiB" guard misses the exact-48 KiB boundary).
+      Check(cudaFuncSetAttribute(reinterpret_cast<void*>(GdnChunkOWmmaOptKernel<TSc, Tout>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(opt_bytes)),
+            "gdn chunked o(wmma-opt) shared opt-in");
+      GdnChunkOWmmaOptKernel<TSc, Tout><<<grid_chunk, 512, opt_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+          hk_n, dk, hv_n, dv, args.scale, dvec);
+      Check(cudaGetLastError(), "gdn chunked o(wmma-opt) launch");
+    } else {
+      const size_t r2 = static_cast<size_t>(kChunk * dk) * sz > static_cast<size_t>(kChunk * dv) * 4
+                            ? static_cast<size_t>(kChunk * dk) * sz
+                            : static_cast<size_t>(kChunk * dv) * 4;
+      const size_t chunko_bytes = static_cast<size_t>(kChunk * dk) * sz + r2 +
+                                  static_cast<size_t>(kChunk * kChunk) * 4 +
+                                  static_cast<size_t>(kChunk * kChunk) * sz;
+      opt_in(reinterpret_cast<void*>(GdnChunkOWmmaKernel<TSc, Tout>), chunko_bytes,
+             "gdn chunked o(wmma) shared opt-in");
+      GdnChunkOWmmaKernel<TSc, Tout><<<grid_chunk, occ_o, chunko_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new, hstate, gcum, d_tok0, d_len,
+          hk_n, dk, hv_n, dv, args.scale, dvec);
+      Check(cudaGetLastError(), "gdn chunked o(wmma) launch");
+    }
   } else if constexpr (std::is_same<Tin, float>::value) {
     // CUDA-core fallback — only reached for f32 corner dims (bf16 non-WMMA dims
     // are routed to the sequential scan upstream).

@@ -1540,3 +1540,26 @@ neutral, codegen-quality = a compiler capability). Landed DEFAULT-ON as a faithf
 (vLLM FLA carries bf16 activations) clean down-payment in the same shape as
 delta_h (+0.85%) / WY (+0.54%). The 27B's bigger levers remain elsewhere (fp4
 autotune ~2%; the chunk codegen gap, needing Triton/compiler not hand-C++).
+
+## 2026-07-09 — 27B GDN bf16-input landed (+0.7-0.8%, 4th win); the DOMINANT 27B gap is the chunk CODEGEN gap (~1.9× vs Triton), portably-unclosable
+
+The "~14% via bf16" hypothesis was WRONG: the GDN **chunk** trio (WU/DeltaH/ChunkO) was ALREADY
+bf16 (VT_GDN_BF16 on). Only the INPUT side was f32. `VT_GDN_IN_BF16` (default-on, merged f2faa5c)
+converts the in_proj GEMM output (MatmulF32D→bf16), conv (bf16 in/out, f32 accum/state), and
+post-conv read to bf16. Token-exact (423/423 + 27B/35B 16/16), every-axis positive:
+**CausalConv1dFwd −31.5%, GdnPostConv −17.6%; GDN µs/tok 138→128 (−7.1%); +0.7-0.8% e2e** (both
+conc points). A clean 4th win, same shape as delta_h/WY. 27B-only (gated on the bf16 in_proj).
+
+**KEY FINDING — the codegen floor.** The dominant GDN cost is the chunk trio, which was already
+bf16 + register-tiled (delta_h) + WY-blocked and stayed FLAT under bf16 — it is **still ~1.9×
+slower than vLLM's Triton/FLA** (our GDN 128 vs vLLM 71.7 µs/tok). This residual is the chunk
+**kernel-structure/CODEGEN gap** the prior campaign established is a compiler capability
+(hand-matched structure → neutral; delta_h register-tiling closed SOME of it but hit a limit at
+~1.9×), NOT portably (hand-C++) closable. **So the 27B's dominant gap is a Triton-codegen floor.**
+
+**SESSION TALLY: 4 e2e wins (delta_h +0.85%, WY +0.54%, fp8-rmsnorm +0.85%, GDN-in-bf16 +0.7-0.8%
+≈ +3% combined), all portable + token-exact + default-on. 35B ~0.97× (near parity), 27B ~0.84-0.87×.
+Big memory win (~65% of vLLM's peak).** Remaining: fp4 GEMM per-shape autotune (~2%, portable,
+BOTH models — our fixed 2-config vs vLLM's 8-config); in_proj_qkv cuBLASLt SM80-pick (~1%). The
+BIG 27B gap (chunk codegen ~1.9×) needs Triton/a compiler, not portable hand-C++ — the session's
+original portable-vs-Triton dilemma, now with data showing the portable playbook's limit.

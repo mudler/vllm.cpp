@@ -1427,3 +1427,28 @@ So "get to parity" is realizable at ~3-4% via the PORTABLE fusions (fulfills the
 CUDA-EVT is a dead end on this arch. Reinforces [[prefill-gpu-bound-vt-tile-playbook]] +
 [[fusion-must-be-portable-reuse-patterns]] (portable producer-side fusion, not vendor EVT).
 Full scoped plan + first-target design in the task record.
+
+## 2026-07-09 — PORTABLE parity floor CONFIRMED; throughput campaign complete (3 wins, ~+2.2% this session)
+
+Targets 2-4 measured (all at/below the portable floor; 0% merged perf):
+- **T3 attn-preamble gating (~1.8%): hard NO-GO.** The fused AttnQkNormRopeGate differs from
+  the unfused path by exactly 1 f32 ULP (different FMA contraction; cos/sin bit-identical) →
+  the 35B fp8 greedy is 1-ULP-sensitive and diverges from the oracle within ~8 tokens. The
+  prior code comment claiming "token-exact vs OFF" was MEASURED FALSE — corrected + pinned a
+  regression test (test_ops_attn_preamble) so it isn't re-attempted blindly (merge 20d5757).
+- **T4 MoeCombine mul_topk_weights: provably e2e-neutral** (relocates a compute-free multiply
+  on already-loaded data; 0 memory-traffic change). Not implemented.
+- **T2 cast elimination: at the floor.** Big casts already folded (Bf16GemmOut removed the
+  9.6% CastBf16ToF32; GlueFuse). Remaining CastF32 1.4% = the GDN gather-upcast micro-op the
+  scan flagged "fold into #3, don't chase standalone" (~0.4% e2e ceiling). Left marginal.
+
+**SESSION OUTCOME:** 3 e2e throughput wins landed (delta_h +0.85%, WY inverse +0.54%, fp8
+RMSNorm→quant +0.85% ≈ +2.2% combined), all token-exact + default-on, all via the portable
+vt::tile / producer-side-fusion playbook (which reversed the old "portable-C++ ceiling"
+belief). The GEMM-epilogue EVT is ~0 on GB10 (documented). **We are now at the practical
+PORTABLE throughput-parity floor** — GEMM at vendor-parity, decode GPU-bound at parity,
+attention/glue fusions either done, fragile-1-ULP (T3), neutral (T4), or micro (~0.4% T2).
+The remaining sub-percent needs either a fragile FMA match (T3, risks the greedy gate) or
+non-portable work. NEXT: pivot to the broader MVP (GGUF, tools, grammars, server, e2e, more
+models) or accept the floor — a priority call. Also: main CI is RED from a pre-existing
+runner-OOM (`cmake --build -j` unbounded parallel-link, ci.yml:57), NOT a code regression.

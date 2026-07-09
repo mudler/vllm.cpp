@@ -1402,3 +1402,28 @@ GPU-bound at parity, attention/fp8 non-levers. The recommended next lever is the
 vt:: glue-chain fusion (~3% e2e, Med, via include/vt/fused_recipe.h TDR skeleton +
 GlueFuseEnabled in qwen3_5.cpp); the last ~3% beyond that needs XL CUDA-specific EVT (a
 portability tradeoff = a user decision).
+
+## 2026-07-09 — EVT scoping: "full EVT epilogue fusion" is ~0 on GB10; realizable win = PORTABLE producer-side fusion
+
+Scoped the user-chosen "full EVT epilogue fusion" (~6%) and DECISIVELY refuted its premise on
+sm120a/GB10 (grounded in vLLM's csrc dep-chain, agrees with the measured GEMM-at-parity):
+- **Our fp4/fp8/Marlin GEMM epilogues are ALREADY at parity** — scale folded into `alpha`,
+  output cast in-epilogue. **vLLM's OWN sm120a fp4 GEMM emits bf16 via LinearCombination and
+  does NOT fold the next-op fp4 quant** (grep for an SF-generating sm120 output epilogue in
+  vLLM csrc = empty; the fp4-output epilogues are SM100/TRT-LLM paths, not GB10's dense/Marlin).
+- cutlass-3.x EVT is wire-up-able (template-only, no version bump) but yields **~0 on GB10** (no
+  bias, scalar scale, output-SF unused by vLLM here, inter-GEMM silu/norm blocks chaining).
+  Marlin epilogue: only `mul_topk_weights`/`use_atomic_add` flags open (vLLM uses the same +
+  separate sum → structural parity). cuBLASLt epilogue: nothing to fold (no bias, bf16 out).
+- **The realizable ~3-4% is PRODUCER-SIDE vt:: kernel fusion** (mirror vLLM's Inductor passes,
+  not its CUDA epilogues) — canon-compliant, no CUDA lock-in. Ranked targets:
+  **1. fp8 RMSNorm→quant + quantize-once (~3.0%)** — QuantFp8Static runs 3× on the shared q/k/v
+     activation; mirror `rms_quant_fusion.py:124` + MergedQKV quant-once. IN PROGRESS.
+  2. Cast elimination (~2.3%, fold CastF32/CastBf16 into producers).
+  3. Attn-preamble gating (~1.8%, `FuseAttnPreambleEnabled` kernel EXISTS default-OFF → 16/16 gate + flip).
+  4. MoeCombine ×weight → Marlin `mul_topk_weights` flag (trivial).
+
+So "get to parity" is realizable at ~3-4% via the PORTABLE fusions (fulfills the intent); the XL
+CUDA-EVT is a dead end on this arch. Reinforces [[prefill-gpu-bound-vt-tile-playbook]] +
+[[fusion-must-be-portable-reuse-patterns]] (portable producer-side fusion, not vendor EVT).
+Full scoped plan + first-target design in the task record.

@@ -1357,3 +1357,21 @@ therefore needs a greedy 16/16-vs-oracle confirmation on 35B+27B (the bar delta_
 not run here. RECOMMEND: default-on after that greedy check; optionally raise the merges to a
 tf32x3/ieee-equivalent to match vLLM's precision exactly. This is a real GPU-work cut and a
 clean down-payment on the "GDN-chunk efficiency (25.6%)" campaign lever.
+
+## 2026-07-09 — GDN-chunk front is EXHAUSTED for e2e gains (ChunkO −11.5% kernel = e2e-neutral)
+
+ChunkO occupancy fix (`GdnChunkOWmmaOptKernel`, branch `perf/gdn-chunko-occ` a4a8eb8, NOT
+merged): diagnosed smem-occupancy-limited (32KiB whole-Dv f32 accumulator round-tripped
+through smem across 6 barriers → 1 block/SM, 33% occ). Fix: BV-block Dv + smem aliasing →
+2 blocks/SM (66% occ). **−11.5% ChunkO kernel, token-exact 423/423 + memcheck, but e2e
+NEUTRAL** (+0.05% gate / +0.18% prefill-heavy) — ChunkO is only ~5-6% of prefill. Left
+default-OFF (gate-neutral). The residual toward vLLM's 2× is the smem round-trip + barrier
+serialization vLLM removes with register-resident fused accumulators (the delta_h/WY trick),
+but even a full 2× ChunkO is ~+0.3% e2e.
+
+**CONCLUSION: the clean GDN-chunk e2e levers are HARVESTED** (delta_h +0.85%, WY +0.54%
+merged; ChunkO −11.5% kernel = e2e-neutral). Further GDN-kernel work is e2e-neutral at the
+gate (kernels too small a prefill fraction). The meaningful remaining e2e gap is the GLUE/EVT
+front (bigger, but spread across cutlass-3.x/Marlin/cuBLASLt epilogues — XL, CUDA-specific)
+OR a different axis (27B-specific, decode, features). This is a strategic fork for the user's
+steer — the autonomous GDN thread is measurably exhausted for e2e gains.

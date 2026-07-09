@@ -2672,15 +2672,19 @@ bool TryTritonChunkO(cudaStream_t s, float* out, const __nv_bfloat16* q, const _
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
   if (cidx == nullptr) return false;
+  // scale is PINNED to Dk^-0.5 in the kernel (Triton AOT can't take an fp32 scalar
+  // arg — it mis-packs it as a double). The gate model always passes Dk^-0.5; bail
+  // to the hand path if a caller ever uses a different scale, keeping it exact.
+  if (std::fabs(scale - 1.0f / std::sqrt(static_cast<float>(dk))) > 1e-6f) return false;
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);   // overwritten per-seq (IS_VARLEN)
   const int32_t NT = static_cast<int32_t>(nt_tot);  // grid-y carrier (= total chunks)
   const CUresult r =
       hv_n == 48
           ? gdn_chunko_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
-                                   D(cidx), scale, T, NT)
+                                   D(cidx), T, NT)
           : gdn_chunko_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
-                                   D(cidx), scale, T, NT);
+                                   D(cidx), T, NT);
   VT_CHECK(r == CUDA_SUCCESS, "cuda gdn chunk_o(triton): launcher returned non-success");
   return true;
 }

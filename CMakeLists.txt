@@ -298,15 +298,16 @@ if(VLLM_CPP_CUDA)
     # preserved as fallback. Two specs (H=48 27B, H=32 35B); K=V=128, Hg=16, BT=64,
     # BK=BV=64 (grid.x=cdiv(V,BV)=2). USE_G=1, IS_VARLEN=1. o(=out) is f32 (the
     # default GDN recurrence-output dtype). Grid (cdiv(V,BV), NT, H); H=B*H baked
-    # (varlen B=1), NT is the runtime grid-carrier scalar. Args: q k v h g o
-    # cu_seqlens chunk_indices scale T NT | H Hg K V BT BK BV USE_G IS_VARLEN.
+    # (varlen B=1), NT is the runtime grid-carrier scalar. scale is PINNED to
+    # Dk^-0.5 inside the kernel (Triton AOT mis-packs fp32 scalars), NOT a sig arg.
+    # Args: q k v h g o cu_seqlens chunk_indices T NT | H Hg K V BT BK BV USE_G IS_VARLEN.
     set(VT_GDN_CHUNKO_BK    64 CACHE STRING "chunk_o Triton BK")
     set(VT_GDN_CHUNKO_BV    64 CACHE STRING "chunk_o Triton BV")
     set(VT_GDN_CHUNKO_WARPS 4  CACHE STRING "chunk_o Triton num_warps")
     set(VT_GDN_CHUNKO_STAGES 3 CACHE STRING "chunk_o Triton num_stages")
     math(EXPR _CHUNKO_GX "(128 + ${VT_GDN_CHUNKO_BV} - 1) / ${VT_GDN_CHUNKO_BV}")
     set(_CHUNKO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_o.py")
-    set(_CHUNKO_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, fp32, i32, i32")
+    set(_CHUNKO_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
     set(_CHUNKO_SIG_TAIL "16, 128, 128, 64, ${VT_GDN_CHUNKO_BK}, ${VT_GDN_CHUNKO_BV}, 1, 1")
     foreach(_H 48 32)
       set(_sig "${_CHUNKO_SIG_HEAD}, ${_H}, ${_CHUNKO_SIG_TAIL}")

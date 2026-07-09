@@ -26,6 +26,12 @@
 #         packing has B=1 (single packed [T,H,*] tensor + cu_seqlens), so grid-z is
 #         the constexpr H (baked per spec). `NT` is unused by the kernel body (dead
 #         arg → eliminated → the compute codegen is identical to FLA's).
+#     (3) the runtime `scale` arg is REMOVED and pinned to Dk^-0.5 (= K**-0.5, the
+#         GDN q-scale; K=128 pinned). Triton's AOT launcher mis-packs an fp32 scalar
+#         as an 8-byte double (the kernel reads 4 bytes → garbage), so a runtime
+#         float scalar is unusable here; the model always passes scale == Dk^-0.5
+#         (qwen3_5.cpp: scale = 1/sqrt(Dk)) and the dispatch (TryTritonChunkO) guards
+#         that args.scale matches before firing, so pinning it is exact.
 #
 # Pinned flags for the vllm.cpp GDN chunked-prefill call site: USE_G=1,
 # IS_VARLEN=1. Buffer layout is a 1:1 drop-in (verified stride-for-stride against
@@ -52,7 +58,6 @@ def chunk_fwd_kernel_o(
     o,
     cu_seqlens,
     chunk_indices,
-    scale,
     T,
     NT,  # AOT grid-carrier (= total chunks): grid-y extent; unused by the body.
     H: tl.constexpr,
@@ -65,6 +70,9 @@ def chunk_fwd_kernel_o(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    # scale = Dk^-0.5 (GDN q-scale), pinned since Triton AOT can't take an fp32
+    # scalar arg reliably; K == Dk == 128 for the gate shape (see header note 3).
+    scale = K ** -0.5
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 

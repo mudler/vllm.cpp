@@ -381,6 +381,31 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     token-exact rmsnorm). See discipline.md + mission.md; rationale + evidence in
     `.agents/state.md` (2026-07-09 "portable async-pipeline EXHAUSTED").
 
+    **IMPLEMENTED — delta_h (2026-07-09; branch `perf/gdn-deltah-triton-aot`).**
+    The delta_h state recurrence is the first kernel landed on this sanction:
+    `triton_kernels/chunk_delta_h.py` (FLA `chunk_delta_h.py:42-315` VERBATIM —
+    autotune/heuristics stripped so the constexprs are pinned per-shape via the
+    AOT signature; one documented grid-carrier scalar `NH`=N*H since the FLA grid
+    needs the sequence count, not a kernel arg). Toolchain `cmake/TritonAOT.cmake`
+    (merged from `perf/triton-fastpath`) builds two specializations — H=48 (27B),
+    H=32 (35B); both K=V=128, Hg=16, BT=64, BV=64, warps4/stages3 — to embedded
+    cubins; dispatch `TryTritonDeltaH` in `cuda_gdn.cu` behind the runtime toggle
+    `VT_GDN_DELTAH_TRITON` (opt-in until the win is proven), with the hand
+    `GdnChunkDeltaHRegRingKernel` + CPU ref PRESERVED as fallback and the OFF build
+    byte-inert. The GDN buffer layout is a verified 1:1 drop-in (strides checked
+    stride-for-stride against the FLA pointer arithmetic), so the Triton kernel
+    consumes the same device buffers the other chunk kernels produce.
+    GATES (GB10 sm_121a): token-exact — `test_ops_gdn` 450/450 (incl. a new
+    gate-shape Triton-vs-sequential case at H=48 and H=32) + 27B greedy 16/16 AND
+    35B greedy 16/16 single & batched-graph, all through the Triton path.
+    MEASURED 27B e2e (same-binary A/B, VT_GDN_DELTAH_TRITON on vs hand off, GB10):
+    conc16/np96 in1024/out128 hand 712.96 -> Triton 716.10 tok/s = +0.44%
+    (clean, non-overlapping arms). HONEST: a real, token-exact per-kernel win, but
+    delta_h is only ~5-6% of GPU kernel time so the e2e move is small and does NOT
+    reach 27B >=1.0x alone — closing the full GDN ~1.9x codegen gap needs `chunk_o`
+    + `recompute_w_u` ported to the same AOT path (the next kernels on this
+    sanction). Kept default-OFF pending that rollout + the flip-to-default decision.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

@@ -10,6 +10,8 @@
 // wrappers never copy them back (that would force a stream sync). The CPU
 // reference validates qsl bounds/monotonicity host-side; here bad metadata is
 // unchecked (correctness-grade — the M0.9 builder owns metadata integrity).
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -22,6 +24,7 @@
 #include <vector>
 
 #include "vt/cuda/tile/cp_async.cuh"
+#include "vt/cuda/tile/tma_pipeline.cuh"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -44,6 +47,49 @@ void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("vt cuda: ") + what + ": " + cudaGetErrorString(err));
   }
+}
+
+// Rung-2 TMA support (VT_GDN_TMA). Host-side CUtensorMap builder for the delta_h
+// chunk streaming: a 3D tiled descriptor over a [tokens, heads, dk] bf16 tensor
+// (dk innermost/contiguous), box (dk, 1, BT) — one [BT, dk] chunk tile per TMA.
+// cuTensorMapEncodeTiled is a driver symbol; we fetch it once via the runtime's
+// cudaGetDriverEntryPoint so no explicit libcuda link is needed (CUTLASS's own
+// runtime-linked path). Mirrors the CuTe-DSL kernel_h _make_bf16_tma_args
+// (gdn_chunk_cutedsl/kernel_h.py:56-75): 128 K-dim, num_stages ring, bf16 tile.
+using PfnTmaEncode = PFN_cuTensorMapEncodeTiled_v12000;
+inline PfnTmaEncode GdnTmaEncodeFn() {
+  static PfnTmaEncode fn = [] {
+    PfnTmaEncode f = nullptr;
+    cudaDriverEntryPointQueryResult q{};
+    // Versioned entry-point query (non-deprecated; cuTensorMapEncodeTiled_v12000 => 12000).
+    cudaError_t e = cudaGetDriverEntryPointByVersion(
+        "cuTensorMapEncodeTiled", reinterpret_cast<void**>(&f), 12000, cudaEnableDefault, &q);
+    if (e != cudaSuccess || f == nullptr) return static_cast<PfnTmaEncode>(nullptr);
+    return f;
+  }();
+  return fn;
+}
+
+// Build a 3D TMA descriptor for a bf16 [t_dim, h_dim, dk] tensor (row-major, dk
+// contiguous). box (dk,1,BT), swizzle NONE (the WMMA consumer reads plain
+// row-major smem, identical to the cp.async ring — this isolates the copy/
+// pipeline mechanism from the smem-layout lever). OOB fill NONE => TMA zeros the
+// tail beyond t_dim (partial-chunk tail rows are masked downstream regardless).
+inline bool BuildGdnTmaDesc3D(CUtensorMap* desc, const void* base, int64_t t_dim, int64_t h_dim,
+                              int64_t dk, int64_t bt) {
+  PfnTmaEncode encode = GdnTmaEncodeFn();
+  if (!encode) return false;
+  const uint64_t gdim[3] = {static_cast<uint64_t>(dk), static_cast<uint64_t>(h_dim),
+                            static_cast<uint64_t>(t_dim)};
+  const uint64_t gstr[2] = {static_cast<uint64_t>(dk) * 2u,
+                            static_cast<uint64_t>(h_dim) * static_cast<uint64_t>(dk) * 2u};
+  const uint32_t bdim[3] = {static_cast<uint32_t>(dk), 1u, static_cast<uint32_t>(bt)};
+  const uint32_t estr[3] = {1u, 1u, 1u};
+  CUresult r = encode(desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+                      const_cast<void*>(base), gdim, gstr, bdim, estr,
+                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return r == CUDA_SUCCESS;
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
@@ -1807,6 +1853,195 @@ __global__ void GdnChunkDeltaHRegRingKernel(float* state, TD* hstate, TD* v_new,
   }
 }
 
+// DeltaH (REGISTER-tiled + N-stage TMA+mbarrier ring, vt::tile Rung-2). Identical
+// persistent-accumulator FLA blockdim64 compute as GdnChunkDeltaHRegRingKernel; the
+// ONLY change is the W/K chunk streaming: instead of the sm80 cp.async ring
+// (Rung-1), each stage is filled by a TMA bulk-tensor copy (cp.async.bulk.tensor.3d)
+// whose completion is signalled on a per-stage mbarrier (transaction-bytes) — the
+// Blackwell-native async pipeline Triton emits. This is the DECISIVE A/B: same
+// smem layout (plain row-major, swizzle NONE) + same WMMA, so it isolates the
+// COPY/PIPELINE mechanism (cp.async vs TMA+mbarrier) from every other variable.
+// bf16 only. Behind VT_GDN_TMA (default OFF).
+//
+// Ported FROM: fla/ops/chunk_delta_h.py:43-315 (compute, decay-on-b_v FLA form) +
+// gdn_chunk_cutedsl/kernel_h.py:198-270 (the TMA warp's mbarrier producer loop:
+// mbarrier_init(count) / arrive_and_expect_tx(STAGE_SIZE) / simple_tma_copy /
+// mbarrier_wait(parity), num_stages ring) mapped to a unified (non-warp-specialized)
+// pipeline feeding WMMA (sm_121 has no tcgen05/tmem; the DSL's MMA path is sm_100).
+// TMA/mbarrier atoms: vt::cuda::tile::tma_pipeline.cuh (cited to CUTLASS there).
+template <typename TD, int BV, int STAGES>
+__global__ void GdnChunkDeltaHTmaKernel(float* state, TD* hstate, TD* v_new, const TD* k,
+                                        const TD* u, const TD* w, const float* gcum,
+                                        const int32_t* qsl, const int32_t* boh, int64_t hk_n,
+                                        int64_t dk, int64_t hv_n, int64_t dv,
+                                        const __grid_constant__ CUtensorMap descW,
+                                        const __grid_constant__ CUtensorMap descK) {
+  namespace tp = vt::cuda::tile;
+  using Cfg = WmmaCfg<TD>;
+  constexpr int WK = Cfg::WK;
+  constexpr int BT = kChunk;
+  constexpr int NK = 64 / kWM;
+  constexpr int VN = V128<TD>::N;
+  const int64_t i_v = blockIdx.x, i_nh = blockIdx.y;
+  const int64_t n = i_nh / hv_n, hv = i_nh % hv_n;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t begin = qsl[n], seqlen = qsl[n + 1] - begin;
+  const int64_t boh_n = boh[n];
+  const int64_t sd = dv * dk;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32;
+  const int nthreads = static_cast<int>(blockDim.x);
+
+  const int64_t rA = BV * 64 * (int64_t)sizeof(float);  // Hf32(half) == Braw == 16 KiB
+  const int64_t rB = BV * dk * (int64_t)sizeof(TD);     // Hbf full == 16 KiB
+  const int64_t tile = BT * dk * (int64_t)sizeof(TD);   // one W or K tile (16 KiB)
+  extern __shared__ __align__(128) char smem_tma[];     // 128B base for the TMA dst
+  float* Hf32 = reinterpret_cast<float*>(smem_tma);  // [BV,64] f32 (region A)
+  float* Braw = reinterpret_cast<float*>(smem_tma);  // [BT,BV] f32 (aliases A)
+  TD* Hbf = reinterpret_cast<TD*>(smem_tma + rA);    // [BV,dk] TD  (region B)
+  TD* Vbf = reinterpret_cast<TD*>(smem_tma + rA);    // [BT,BV] TD  (aliases B)
+  char* ring = smem_tma + rA + rB;                   // STAGES * (W tile | K tile), 128B-aligned
+  __shared__ float decay[BT];
+  __shared__ uint64_t full_mbar[STAGES];             // one completion barrier per stage
+
+  float* sH = state + (n * hv_n + hv) * sd;
+  const int64_t vrow0 = i_v * BV + warp * kWM;
+  typename Cfg::Acc h1[NK], h2[NK];
+  for (int kt = 0; kt < NK; ++kt) {
+    wmma::load_matrix_sync(h1[kt], sH + vrow0 * dk + kt * kWM, dk, wmma::mem_row_major);
+    wmma::load_matrix_sync(h2[kt], sH + vrow0 * dk + 64 + kt * kWM, dk, wmma::mem_row_major);
+  }
+  const int64_t nt = (seqlen + BT - 1) / BT;
+  const uint32_t txbytes = static_cast<uint32_t>(2 * BT * dk * (int64_t)sizeof(TD));  // W+K
+
+  // arm the per-stage mbarriers (count=1: the single arrive.expect_tx below), then
+  // fence so the init is visible to the async (TMA) proxy before any copy.
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) tp::mbarrier_init(&full_mbar[s], 1);
+    tp::fence_proxy_async_shared();
+  }
+  __syncthreads();
+
+  // Producer: one elected thread arms stage `s`'s barrier with the W+K tx bytes and
+  // issues the two TMA bulk copies (chunk `it`) into it. TMA hardware zero-fills any
+  // OOB tail (partial last chunk) — masked downstream regardless.
+  auto issue = [&](int64_t it, int s) {
+    if (tid != 0 || it >= nt) return;
+    const int64_t tok0 = begin + it * BT;
+    TD* Wd = reinterpret_cast<TD*>(ring + (int64_t)s * 2 * tile);
+    TD* Kd = reinterpret_cast<TD*>(ring + (int64_t)s * 2 * tile + tile);
+    tp::mbarrier_arrive_expect_tx(&full_mbar[s], txbytes);
+    tp::tma_load_3d(&descW, &full_mbar[s], Wd, 0, static_cast<int>(hv), static_cast<int>(tok0));
+    tp::tma_load_3d(&descK, &full_mbar[s], Kd, 0, static_cast<int>(hk), static_cast<int>(tok0));
+  };
+
+  // prologue: prime all STAGES stages
+#pragma unroll
+  for (int s = 0; s < STAGES; ++s) issue(s, s);
+
+  for (int64_t it = 0; it < nt; ++it) {
+    const int stage = static_cast<int>(it % STAGES);
+    const uint32_t phase = static_cast<uint32_t>((it / STAGES) & 1);
+    tp::mbarrier_wait(&full_mbar[stage], phase);  // all threads block until W+K landed
+    __syncthreads();
+    TD* Wcur = reinterpret_cast<TD*>(ring + (int64_t)stage * 2 * tile);
+    TD* Kcur = reinterpret_cast<TD*>(ring + (int64_t)stage * 2 * tile + tile);
+
+    const int64_t gc = boh_n + it;
+    const int64_t tok0 = begin + it * BT;
+    const int64_t rem = seqlen - it * BT;
+    const int64_t len = rem < BT ? rem : BT;
+    const float glast = gcum[(tok0 + len - 1) * hv_n + hv];
+    const float eglast = expf(glast);
+    for (int64_t i = tid; i < len; i += nthreads)
+      decay[i] = expf(glast - gcum[(tok0 + i) * hv_n + hv]);
+
+    // (a) snapshot in HALVES (16 KiB Hf32) -> hstate(bf16) + V1 operand Hbf.
+    TD* hsnap = hstate + (gc * hv_n + hv) * sd;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int coff = half * 64;
+      for (int kt = 0; kt < NK; ++kt)
+        wmma::store_matrix_sync(Hf32 + (warp * kWM) * 64 + kt * kWM, half == 0 ? h1[kt] : h2[kt],
+                                64, wmma::mem_row_major);
+      __syncthreads();
+      for (int64_t e = tid * VN; e < BV * 64; e += (int64_t)nthreads * VN) {
+        float f[VN];
+#pragma unroll
+        for (int j = 0; j < VN; j += 4) {
+          const float4 v = *reinterpret_cast<const float4*>(Hf32 + e + j);
+          f[j] = v.x;
+          f[j + 1] = v.y;
+          f[j + 2] = v.z;
+          f[j + 3] = v.w;
+        }
+        const int64_t r = e / 64, c = e % 64;
+        V128<TD>::Sf(hsnap + (i_v * BV + r) * dk + coff + c, f);
+        V128<TD>::Sf(Hbf + r * dk + coff + c, f);
+      }
+      __syncthreads();
+    }
+
+    // (b) V1: b_v[BT,BV] = W @ b_hᵀ  (W straight from the TMA ring)
+    for (int bvc = 0; bvc < BV / kWM; ++bvc) {
+      typename Cfg::Acc acc;
+      wmma::fill_fragment(acc, 0.0f);
+      for (int64_t kk = 0; kk < dk; kk += WK) {
+        typename Cfg::Arow a;
+        typename Cfg::Bcol b;
+        Cfg::load(a, Wcur + (warp * kWM) * dk + kk, dk);
+        Cfg::load(b, Hbf + bvc * kWM * dk + kk, dk);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(Braw + (warp * kWM) * BV + bvc * kWM, acc, BV, wmma::mem_row_major);
+    }
+    __syncthreads();
+    // subtract u (global): v_new = undecayed b_v; Vbf = decayed b_v (FLA form).
+    for (int64_t e = tid * VN; e < BT * BV; e += (int64_t)nthreads * VN) {
+      const int64_t i = e / BV, cvi = e % BV;
+      if (i < len) {
+        float bf[VN];
+        V128<TD>::Uf(u + (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, bf);
+#pragma unroll
+        for (int j = 0; j < VN; ++j) bf[j] -= Braw[i * BV + cvi + j];
+        V128<TD>::Sf(v_new + (tok0 + i) * hv_n * dv + hv * dv + i_v * BV + cvi, bf);
+        const float d = decay[i];
+#pragma unroll
+        for (int j = 0; j < VN; ++j) bf[j] *= d;
+        V128<TD>::Sf(Vbf + e, bf);
+      } else {
+        V128<TD>::Sf0(Vbf + e);
+      }
+    }
+    for (int kt = 0; kt < NK; ++kt) {
+      for (int x = 0; x < h1[kt].num_elements; ++x) h1[kt].x[x] *= eglast;
+      for (int x = 0; x < h2[kt].num_elements; ++x) h2[kt].x[x] *= eglast;
+    }
+    __syncthreads();
+
+    // (e) V2: b_h += b_vᵀ(decayed) @ K(undecayed, from the TMA ring)
+    for (int64_t tt = 0; tt < BT; tt += WK) {
+      typename Cfg::Acol a;
+      Cfg::load(a, Vbf + warp * kWM + tt * BV, BV);
+      for (int kt = 0; kt < NK; ++kt) {
+        typename Cfg::Brow b1, b2;
+        Cfg::load(b1, Kcur + tt * dk + kt * kWM, dk);
+        wmma::mma_sync(h1[kt], a, b1, h1[kt]);
+        Cfg::load(b2, Kcur + tt * dk + 64 + kt * kWM, dk);
+        wmma::mma_sync(h2[kt], a, b2, h2[kt]);
+      }
+    }
+    __syncthreads();  // WAR: all consumers done reading Wcur/Kcur before the re-issue overwrites
+    // prefetch chunk it+STAGES into the just-consumed stage.
+    issue(it + STAGES, stage);
+  }
+  for (int kt = 0; kt < NK; ++kt) {
+    wmma::store_matrix_sync(sH + vrow0 * dk + kt * kWM, h1[kt], dk, wmma::mem_row_major);
+    wmma::store_matrix_sync(sH + vrow0 * dk + 64 + kt * kWM, h2[kt], dk, wmma::mem_row_major);
+  }
+}
+
 // ChunkO (WMMA). One block per (chunk, v-head). cross = Q@Hstartᵀ; A = Q@Kᵀ
 // (decay-weighted, causal-masked); o = scale*(exp(G)*cross + A@V_new). Buffers
 // alias: Ks (used only for qk) is reused as outc after qk.
@@ -2566,15 +2801,37 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       // netting the 398->345us win. VT_GDN_TILE_PIPE_CPASYNC=0 isolates reg-no-ring.
       const char* ca_env = std::getenv("VT_GDN_TILE_PIPE_CPASYNC");
       const bool use_ring = (ca_env == nullptr || ca_env[0] != '0');
+      // STEP 3 (Rung-2) — TMA + mbarrier ring (VT_GDN_TMA, default OFF). Same
+      // register-tiled WMMA compute + smem layout as the cp.async ring; only the
+      // W/K streaming swaps sm80 cp.async for TMA bulk-tensor copies signalled by
+      // per-stage mbarriers (the Blackwell-native pipeline). A/B isolates the copy
+      // mechanism. bf16 only; falls back to the cp.async ring if TMA desc setup fails.
+      const char* tma_env = std::getenv("VT_GDN_TMA");
+      const bool use_tma = (tma_env != nullptr && tma_env[0] == '1');
       bool launched = false;
       if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {
-        if (use_ring) {
-          constexpr int STAGES = 2;
-          const int64_t rAr = static_cast<int64_t>(BV * 64) * sizeof(float);  // Hf32(half)/Braw f32
-          const int64_t rBr = static_cast<int64_t>(BV * dk) * sz;             // Hbf full (TD)
-          const int64_t tile = static_cast<int64_t>(kChunk * dk) * sz;
-          const size_t ring_bytes =
-              static_cast<size_t>(rAr + rBr + (int64_t)STAGES * 2 * tile);
+        constexpr int STAGES = 2;
+        const int64_t rAr = static_cast<int64_t>(BV * 64) * sizeof(float);  // Hf32(half)/Braw f32
+        const int64_t rBr = static_cast<int64_t>(BV * dk) * sz;             // Hbf full (TD)
+        const int64_t tile = static_cast<int64_t>(kChunk * dk) * sz;
+        const size_t ring_bytes = static_cast<size_t>(rAr + rBr + (int64_t)STAGES * 2 * tile);
+        if (use_tma) {
+          CUtensorMap descW{}, descK{};
+          const bool okW = BuildGdnTmaDesc3D(&descW, w, t_pad, hv_n, dk, kChunk);
+          const bool okK = BuildGdnTmaDesc3D(&descK, k.Ptr<Tin>(), t_tot, hk_n, dk, kChunk);
+          if (okW && okK) {
+            Check(cudaFuncSetAttribute(
+                      reinterpret_cast<void*>(GdnChunkDeltaHTmaKernel<TSc, BV, STAGES>),
+                      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(ring_bytes)),
+                  "gdn chunked delta_h(tma) shared opt-in");
+            GdnChunkDeltaHTmaKernel<TSc, BV, STAGES><<<grid_reg, reg_block, ring_bytes, s>>>(
+                state.Ptr<float>(), hstate, v_new, k.Ptr<Tin>(), u, w, gcum, qsl.Ptr<int32_t>(),
+                d_boh, hk_n, dk, hv_n, dv, descW, descK);
+            Check(cudaGetLastError(), "gdn chunked delta_h(tma) launch");
+            launched = true;
+          }
+        }
+        if (!launched && use_ring) {
           Check(cudaFuncSetAttribute(
                     reinterpret_cast<void*>(GdnChunkDeltaHRegRingKernel<TSc, BV, STAGES>),
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(ring_bytes)),

@@ -62,6 +62,20 @@ expertise ONCE as reusable primitives — which is exactly what CUTLASS/CuTe are
    lags — because Blackwell's real codegen is TMA-based. Higher complexity
    (mbarrier init/phase, transaction bytes, warp specialization). Justified by
    evidence, grounded in the CuTe-DSL `kernel_h.py` which uses exactly this.
+   **→ BUILT + MEASURED (2026-07-09, `include/vt/cuda/tile/tma_pipeline.cuh`,
+   `GdnChunkDeltaHTmaKernel`, VT_GDN_TMA).** sm_121a SUPPORTS the TMA+mbarrier
+   subset (`cp.async.bulk.tensor.3d.shared::cta` + mbarrier init/expect_tx/
+   try_wait.parity; descriptor via `cudaGetDriverEntryPointByVersion`) — verified
+   token-exact by a standalone probe + the real kernel (423/423 + memcheck 0 +
+   27B/35B greedy). **OUTCOME: delta_h −3.8% vs the cp.async ring (real, robust),
+   but NOT a gap-closer.** The no-ring(464 ms)→ring(401)→TMA(386) ladder proves a
+   ~386 ms COMPUTE floor: the ring already hides most copy latency, TMA hides ~15 ms
+   more. So the copy/pipeline mechanism is NOT the GDN 1.9× residual — that is the
+   **WMMA compute codegen** (Triton's tensor-core scheduling), a compiler capability.
+   The portable async-pipeline lever is EXHAUSTED on this kernel. Rung-2 kept as a
+   proven, correct, DEFAULT-OFF primitive (reusable for any future copy-bound kernel);
+   the GDN codegen gap now points to the Triton fast-path (a human canon decision), not
+   more Rung tiers. See parity-ledger 2026-07-09 + state.md 2026-07-09 for the full A/B.
 
 ## First target & success bar
 

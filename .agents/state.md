@@ -1590,3 +1590,53 @@ gap (~1.9× vs vLLM's Triton), portably-unclosable** — the open fork: Triton C
 (branch perf/triton-fastpath, proven; non-portable) vs accept the floor + pursue the broader MVP
 (GGUF/tools/grammars/server/e2e/more-models). fp4-autotune default-on (verify graph-safety) is a
 cheap pending 27B win.
+
+## 2026-07-09 — vt::tile RUNG-2 (TMA+mbarrier) built + VERIFIED on sm_121a; delta_h −3.8% kernel, but DECISIVE: the copy mechanism is NOT the GDN codegen gap (portable TMA does NOT close the 1.9×)
+
+Answered the open Rung-2 question from the 2026-07-08 component design + the 2026-07-09 codegen-floor
+finding: "Triton's Blackwell codegen = TMA+mbarrier (not sm80 cp.async); does a portable TMA pipeline
+close the GDN-chunk 1.9× gap?" Built the Rung-2 primitive and re-ported delta_h to test it decisively.
+
+**Built (branch perf/gdn-tma-pipeline):**
+- `include/vt/cuda/tile/tma_pipeline.cuh` — the Rung-2 tier: mbarrier (init / arrive.expect_tx /
+  try_wait.parity spin) + `cp.async.bulk.tensor.3d.shared::cta` TMA G2S + fence.proxy.async, ported
+  1:1 from CUTLASS (barrier.h:397/593/416, copy_sm90_tma.hpp:159-191 the CUTE_ARCH_TMA_SM120_ENABLED
+  `.shared::cta` variant), cited. Host CUtensorMap builder (3D [tok,head,dk] bf16, box(dk,1,BT), swizzle
+  NONE, OOB-zero) via `cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled",12000)` — no libcuda link.
+- `GdnChunkDeltaHTmaKernel<TD,BV,STAGES>` in cuda_gdn.cu — the RegRing delta_h with ONLY the W/K
+  streaming swapped cp.async→TMA+mbarrier (SAME smem layout + WMMA + STAGES=2). Behind VT_GDN_TMA
+  (default OFF); falls back to the cp.async ring if desc setup fails. Mirrors the CuTe-DSL kernel_h.py
+  TMA-warp mbarrier producer loop (its tcgen05/tmem MMA is sm_100-only, so sm_121 keeps WMMA).
+
+**sm_121a SUPPORTS the TMA+mbarrier subset** — proven first by a standalone probe (bit-exact 3D tile
+load: `cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes` + mbarrier init/expect_tx/
+try_wait all assemble & run), then by the real kernel. Two alignment gotchas: TMA smem dst needs 128B
+alignment (extern `__align__(128)`); descriptor global addr/strides need 16B (cudaMallocAsync-aligned).
+
+**Correctness (all GREEN):** test_ops_gdn 423/423 with VT_GDN_TMA=1 AND default (bit-exact vs ref) +
+compute-sanitizer memcheck 0 errors; 27B paged-engine greedy token-exact vs vLLM + 35B greedy 6×16 SUCCESS.
+
+**MEASURED (27B NVFP4, GB10, same-binary nsys A/B, in1024/out4 np16 conc16, delta_h total over prefill,
+2 reps each):**
+  reg-no-ring (copy EXPOSED)  464.1 ms
+  cp.async ring (Rung-1)      401.5 ms   (402.54 / 400.56)
+  TMA (Rung-2)                386.4 ms   (386.16 / 386.54)   = −3.8% vs ring, −16.7% vs no-ring
+  Control: GdnChunkWU 529→531, ChunkO 414→413 flat ±0.5% between arms ⇒ clean isolation of the copy swap.
+  E2E prefill (np32 conc32, 3 interleaved reps): OFF 1363.6 / ON 1372.2 = +0.6% mean but NOISY
+  (+0.0/+1.6/+0.3%), near the noise floor.
+
+**DECISIVE VERDICT (the point of the task):** the portable TMA pipeline does **NOT** close the GDN-chunk
+codegen gap. TMA is a real but SMALL win (−3.8% on ONE of ~6 GDN kernels ≈ −0.7% of GDN, e2e ≈ noise),
+not the ~44% (128→71.7 µs/tok) the 1.9× needs. The no-ring→ring→TMA ladder is the proof: the delta_h
+kernel has a ~386 ms **COMPUTE floor** — the cp.async ring already hides most copy latency (−63 ms of the
+78 ms exposed), and TMA (the strictly-better copy) hides only ~15 ms more. So the ~1.9× residual is NOT
+the gmem→smem copy/pipeline mechanism (which the earlier campaign correctly identified as codegen); it is
+the **WMMA compute codegen + the sequential-chunk kernel structure** — Triton's tensor-core scheduling, a
+COMPILER capability, exactly the frontier the parity-ledger established (V-split neutral, hand-cp.async
+negative, register-tiling +0.85%, and now TMA −3.8%-but-not-a-closer). The 128B-swizzle + warp-specialized
+variants would tune the SMEM-READ/overlap (compute-side, different lever), not the copy — and STAGES=3
+doesn't fit the 99 KiB opt-in with the full W+K ring. **This EXHAUSTS the portable async-pipeline lever on
+the GDN chunk: closing the codegen gap needs the Triton CUDA fast-path (branch perf/triton-fastpath,
+proven end-to-end) — a human canon decision (Triton-for-CUDA-perf-behind-vt:: vs accept the portable
+floor + pursue the broader MVP).** Kept VT_GDN_TMA DEFAULT OFF (proven-correct, memcheck-clean, available
+lever); did NOT roll out to WU/ChunkO (their copy isn't the bottleneck either — same compute-floor logic).

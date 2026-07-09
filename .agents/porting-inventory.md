@@ -361,6 +361,26 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
     port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
 
+9.N **Triton CUDA fast-path for PROVEN codegen-bound kernels (User-sanctioned
+    2026-07-09; extends the "vendor a proven kernel when we can't match it" clause).**
+    For a kernel where portable C++ is *measured-exhausted* against vLLM's compiler
+    codegen, a CUDA-only Triton kernel may be AOT-compiled to cubin at BUILD time and
+    dispatched behind `vt::`. Scope, strictly bounded: gated `VLLM_CPP_TRITON` (default
+    OFF); the CPU reference + a correct portable hand-C++ CUDA fallback are PRESERVED
+    (Metal/Vulkan/ROCm/XPU still port from `vt::`+CPU-ref; CUDA-without-Triton still
+    works); the RUNTIME stays Python/Triton-free (cubin via the CUDA driver API);
+    token-exact + greedy-16/16-gated. **Trigger case: the GDN linear-attention chunk
+    kernels** (`chunk_gated_delta_rule_fwd_kernel_h_blockdim64` + `chunk_o` +
+    `recompute_w_u`), ~1.9× slower than vLLM's Triton/FLA where the portable path was
+    proven exhausted — register-tiling (delta_h −22%), blocked tensor-core inverse,
+    bf16 I/O, and BOTH async-pipeline tiers (Rung-1 cp.async + Rung-2 TMA+mbarrier,
+    `include/vt/cuda/tile/`) all landed, and the delta_h kernel still sits ~1.9× off
+    vLLM on a compute floor → the residual is Triton's WMMA compute codegen, a compiler
+    capability. See discipline.md "SANCTIONED EXCEPTION" + mission.md. Toolchain proven
+    on branch `perf/triton-fastpath` (cmake/TritonAOT.cmake, `triton.tools.compile/link`,
+    token-exact rmsnorm). See discipline.md + mission.md; rationale + evidence in
+    `.agents/state.md` (2026-07-09 "portable async-pipeline EXHAUSTED").
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

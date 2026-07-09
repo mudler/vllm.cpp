@@ -45,6 +45,30 @@
     realized portably; never the vendor's generated binary. (User, 2026-07-08:
     *"get from triton/cute-dsl the base to build ours ported 1:1"*; *"triton/cute-dsl
     would make it less portable?"*)
+  - **SANCTIONED EXCEPTION (User, 2026-07-09) — a CUDA-only Triton AOT fast-path for
+    PROVEN codegen-bound kernels.** The rule above is the DEFAULT and holds wherever
+    portable C++ can match the vendor. But for a kernel where portable hand-C++ is
+    *measured-exhausted* — i.e. we have BENCHMARKS showing the residual gap is the
+    vendor's *compiler* codegen (register allocation / tensor-core instruction
+    scheduling), not the algorithm/structure/pipeline (which we ported) — a
+    **CUDA-only Triton kernel AOT-compiled to cubin at BUILD time** is allowed,
+    **provided the portable contract is fully preserved**: (1) it lives behind the
+    `vt::` op interface; (2) the CPU reference AND a correct portable hand-C++ CUDA
+    fallback remain, so Metal/Vulkan/ROCm/XPU still port FROM `vt::`+CPU-ref and CUDA
+    without Triton still works; (3) it is a gated build dependency (`VLLM_CPP_TRITON`,
+    default OFF) and the RUNTIME stays Triton/Python-free (cubin via the CUDA driver
+    API); (4) it is token-exact vs the portable path and greedy-16/16-gated. This is a
+    bounded per-backend accelerator, NOT "AOT Triton everywhere." Justification, now
+    EVIDENCE-BACKED: the GDN linear-attention chunk kernels are ~1.9× slower than
+    vLLM's Triton/FLA, and we PROVED the portable path is exhausted — register-tiling
+    (delta_h −22%), blocked tensor-core inverse, bf16 I/O, and BOTH async-pipeline
+    tiers (Rung-1 cp.async + Rung-2 TMA+mbarrier) all landed, and the delta_h kernel
+    still sits on a compute floor ~1.9× off vLLM. The "no compile-target" rule was
+    premised on portable being able to match the codegen; that premise is disproven
+    for these kernels. Mirror-vLLM (the PRIME POLICY — vLLM hits its numbers WITH
+    Triton) + the ≥1.0× MVP gate both require it. Recorded as deviation in
+    porting-inventory.md §9. Toolchain: branch `perf/triton-fastpath`
+    (cmake/TritonAOT.cmake + triton.tools.compile/link), proven token-exact.
 - **Every ported file carries a header comment**: upstream path + upstream
   commit hash it was ported from. When re-syncing with upstream, diff that
   file against its recorded commit.

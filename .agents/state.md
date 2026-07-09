@@ -1266,3 +1266,35 @@ toggle `VT_GDN_TILE_PIPE`) — two levers: keep `v_new` in smem across V1→V2 (
 gmem round-trip FLA avoids) + N-stage cp.async prefetch of the streamed k/u/w tiles.
 Gate: `test_ops_gdn` token-exact + gate A/B vs the hand kernel. Rung-2 (TMA+mbarrier)
 only if Rung-1 lags; retarget to chunk_o if delta_h's sequential structure caps the win.
+
+## 2026-07-09 — delta_h win landed; #1 refuted; prefill is GPU-BOUND (campaign reframe)
+
+**delta_h register-tiled + cp.async ring MERGED (7a7a64b).** The vt::tile component's
+first real target: H moved from 64KiB smem into WMMA accumulator REGISTERS (faithful
+FLA blockdim64), freeing smem for a 2-stage cp.async ring. **−22% delta_h kernel**
+(441→345µs), **+0.85% e2e** (35B 2797→2821 tok/s), token-exact 423/423 + memcheck,
+35B+27B 16/16, 27B neutral. **This REVERSES the prior "hand cp.async is DEFINITIVELY
+negative / 0.82× is the portable-C++ ceiling" conclusion** — the ceiling was an
+artifact of the wrong structure (smem-resident H starving the ring), NOT a real limit.
+Portable-C++ CAN match Triton's codegen when the STRUCTURE is ported faithfully.
+
+**Two scan hypotheses REFUTED by measurement (why we measure):**
+- **#1 fp8 cuBLASLt plan-cache — DEAD.** Pre-written, compiled clean, token-exact
+  (46/46, 35B 16/16), but same-binary A/B = +0.14% (noise). nsys: the ~210µs gap
+  before each fp8 GEMM is the `QuantFp8Static→GEMM` dependency, NOT the heuristic —
+  the per-call heuristic is already cheap/overlapped. Branch `perf/fp8-plan-cache`
+  (7a90380) left unmerged. Only the 35B runs fp8 (7 W8A8 projections: attn qkvo +
+  GDN in/out_proj); 27B is pure W4A4/bf16, no fp8.
+- **#3-as-launch-bubble-fix — DEAD.** Steady-state prefill GPU-idle-between-launches
+  = **3.8%** (<5%); the 24.8% raw idle is ONE one-time ~340ms JIT/graph-capture gap.
+  **The GPU is ~96% busy during prefill — GPU-BOUND, not host/launch-starved.**
+
+**CAMPAIGN REFRAME:** the residual 0.82× prefill is redundant non-GEMM GPU WORK
+(HBM traffic / extra passes) vs vLLM's fused kernels — NOT host-side idle. Levers are
+re-scoped to GPU-WORK reduction: #2 GDN WY blocked triangular inverse (serial
+2016-deep solve @64/256-util → tensor-core blocked inverse; a clear GPU-work cut,
+reuses the validated vt::tile+WMMA infra) and #3-reframed (fuse add+RMSNorm+quant +
+silu chains to cut HBM PASSES, not bubbles). NEXT: GPU-BUSY kernel breakdown of our
+prefill vs vLLM's (memory profile) → measured non-GEMM lever ranking, then pursue the
+top hard lever. Top host-trace busy/gap sites: QuantFp8Static→GEMM, GdnChunkWU (the
+WY solve — #2), CastBf16 (redundant dtype casts), GdnPostConv.

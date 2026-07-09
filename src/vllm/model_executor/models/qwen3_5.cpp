@@ -1007,6 +1007,117 @@ DBuf MatmulNvfp4MarlinD(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_
   vt::CastF32(d.q, out.t(), outbf.t());
   return out;
 }
+
+// --- Fused shared-expert gate_up Marlin resident (VT_MOE_FUSED_W13, the dense
+// sibling of the MoE fused w13). The shared expert's gate/up dense NVFP4
+// projections are TWO separate checkpoint weights here, but in vLLM they are
+// ONE merged parameter (MergedColumnParallelLinear gate_up_proj — w1 rows
+// first, w3 rows second) repacked WHOLE as a single Marlin operand
+// (marlin_utils_fp4.py prepare_fp4_layer_for_marlin). Mirroring that: the pair
+// is N-concatenated (gate rows [0,Is), up rows [Is,2Is)) and repacked ONCE
+// with size_n=2Is + ONE combined_scale_factor over both shards, so the forward
+// runs ONE Marlin GEMM [T,2Is] + SiluAndMul instead of two GEMMs (+2 workspace
+// memsets, +2 CastF32) + MoeSiluMul. Requires gate.scale2 == up.scale2 (single
+// per-GEMM global scale — same rule as the MoE fused w13); the caller guards.
+struct MarlinDensePairResident {
+  void* w = nullptr;   // i32 [K/16, (2N)*2]
+  void* s = nullptr;   // fp8 [K/16, 2N]
+  void* g = nullptr;   // f32 [1]
+  int64_t n = 0, k = 0;  // n = per-shard N (Is); operand size_n = 2n
+  bool ready = false;
+};
+
+MarlinDensePairResident& MarlinDensePairResidentFor(const Nvfp4Weight* gate) {
+  static std::mutex mu;
+  static std::unordered_map<const Nvfp4Weight*, MarlinDensePairResident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[gate];
+}
+
+void BuildMarlinDensePairResident(Dev d, const Nvfp4Weight& gw, const Nvfp4Weight& uw,
+                                  MarlinDensePairResident& mr) {
+  if (mr.ready) return;
+  const int K = static_cast<int>(gw.k);
+  const int N = static_cast<int>(gw.n);
+  void* stream = d.q.handle;
+  const size_t w_i32 = static_cast<size_t>(K / 16) * (static_cast<size_t>(2 * N) * 2);
+  const size_t s_b = static_cast<size_t>(K / 16) * (2 * N);
+  const size_t pk_b = static_cast<size_t>(N) * (K / 2);   // one shard's packed bytes
+  const size_t sc_b = static_cast<size_t>(N) * (K / 16);  // one shard's scale bytes
+  mr.w = d.b.Alloc(w_i32 * 4);
+  mr.s = d.b.Alloc(s_b);
+  mr.g = d.b.Alloc(sizeof(float));
+  mr.n = gw.n;
+  mr.k = gw.k;
+  // combined_scale_factor over BOTH shards (vLLM computes it over the merged
+  // gate_up scale tensor).
+  std::vector<const uint8_t*> bufs{reinterpret_cast<const uint8_t*>(gw.scale.bytes.data()),
+                                   reinterpret_cast<const uint8_t*>(uw.scale.bytes.data())};
+  std::vector<size_t> lens{gw.scale.bytes.size(), uw.scale.bytes.size()};
+  const float sf = vt::cuda::MarlinNvfp4CombinedScaleFactor(bufs, lens);
+  Nvfp4Dev dg = ResidentNvfp4(d, gw);
+  Nvfp4Dev du = ResidentNvfp4(d, uw);
+  // Flat row-stack concat (packed [N,K/2] u8 / scales [N,K/16] fp8 are
+  // row-major over N; gate rows first — the vLLM merged shard order).
+  auto* tmp_w = static_cast<uint8_t*>(d.b.Alloc(2 * pk_b));
+  auto* tmp_s = static_cast<uint8_t*>(d.b.Alloc(2 * sc_b));
+  d.b.Copy(d.q, tmp_w, dg.packed.data, pk_b);
+  d.b.Copy(d.q, tmp_w + pk_b, du.packed.data, pk_b);
+  d.b.Copy(d.q, tmp_s, dg.scale.data, sc_b);
+  d.b.Copy(d.q, tmp_s + sc_b, du.scale.data, sc_b);
+  vt::cuda::MarlinRepackExpertWeight(stream, d.q.device.index, static_cast<uint32_t*>(mr.w),
+                                     tmp_w, K, 2 * N);
+  vt::cuda::MarlinProcessExpertScales(stream, tmp_s, static_cast<uint8_t*>(mr.s), K, 2 * N, sf);
+  // Single global scale for both shards (gate's; equality guarded by caller —
+  // the vLLM merged parameter has exactly one weight_global_scale).
+  const float g = vt::cuda::MarlinNvfp4ProcessGlobalScale(gw.scale2, sf);
+  d.b.Copy(d.q, mr.g, &g, sizeof(float));
+  d.b.Synchronize(d.q);  // repack done -> safe to free staging + fp4 originals
+  d.b.Free(tmp_w);
+  d.b.Free(tmp_s);
+  gw.d_packed.reset();
+  gw.d_scale.reset();
+  uw.d_packed.reset();
+  uw.d_scale.reset();
+  mr.ready = true;
+}
+
+// True when the shared-expert gate/up pair takes the fused Marlin gate_up path
+// (one GEMM [T,2Is] + SiluAndMul). Must be checked IDENTICALLY at load
+// (PrepareMarlinResident) and forward so exactly one resident layout is built.
+bool SharedGateUpFusedEligible(const Nvfp4Weight& gw, const Nvfp4Weight& uw) {
+  return MoeFusedW13Enabled() && !gw.Empty() && !uw.Empty() && !gw.IsTrueW4A4() &&
+         !uw.IsTrueW4A4() && gw.n == uw.n && gw.k == uw.k && gw.scale2 == uw.scale2;
+}
+
+// silu(x@gate.T) * (x@up.T) -> bf16 [M,Is] via ONE fused Marlin gate_up GEMM.
+DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
+                              const Nvfp4Weight& uw) {
+  const int64_t M = x.shape[0], K = x.shape[1], N = gw.n;
+  MarlinDensePairResident& mr = MarlinDensePairResidentFor(&gw);
+  if (!mr.ready) BuildMarlinDensePairResident(d, gw, uw, mr);
+  DenseAlignCache& ac = DenseAlignFor(d, static_cast<int>(M));
+  int sms = 0;
+  void* ws = DenseMarlinWorkspace(d, &sms);
+  d.b.Memset(d.q, ws, 0, static_cast<size_t>(sms) * 4 * sizeof(int32_t));
+
+  DBuf gu(d, DType::kBF16, {M, 2 * N});
+  Tensor wq = MakeTensor(mr.w, DType::kI32, d.q.device, {1, K / 16, 2 * N * 2});
+  Tensor sc = MakeTensor(mr.s, DType::kI8, d.q.device, {1, K / 16, 2 * N});
+  Tensor gg = MakeTensor(mr.g, DType::kF32, d.q.device, {1});
+  Tensor wst = MakeTensor(ws, DType::kI32, d.q.device, {sms * 4});
+  Tensor sorted = MakeTensor(ac.sorted, DType::kI32, d.q.device, {ac.max_tok});
+  Tensor expert = MakeTensor(ac.expert, DType::kI32, d.q.device, {ac.max_blk});
+  Tensor numpad = MakeTensor(ac.numpad, DType::kI32, d.q.device, {1});
+  Tensor topkw = MakeTensor(ac.topkw, DType::kF32, d.q.device, {M});
+  vt::MoeGroupedGemmNvfp4Marlin(
+      d.q, gu.t(), x, wq, sc, gg, wst, sorted, expert, numpad, topkw,
+      vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
+                        static_cast<int>(K), false});
+  DBuf act(d, DType::kBF16, {M, N});
+  vt::SiluAndMul(d.q, act.t(), gu.t());
+  return act;
+}
 #endif  // VT_MARLIN_NVFP4
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
@@ -2030,6 +2141,21 @@ struct SharedExpertParts {
 SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
                                       const Tensor& h, int64_t T, bool fp4) {
   const int64_t Is = cfg.shared_expert_intermediate_size;
+#ifdef VT_MARLIN_NVFP4
+  // Fused gate_up (VT_MOE_FUSED_W13, dense sibling of the MoE fused w13): ONE
+  // Marlin GEMM [T,2Is] + SiluAndMul — vLLM's merged gate_up_proj layout. The
+  // silu input values match the unfused path bit-for-bit given equal GEMM
+  // outputs: unfused MatmulNvfp4F32D is the SAME Marlin bf16 GEMM upcast to f32
+  // (value-preserving), and MoeSiluMul/SiluAndMul share the f32 silu math.
+  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA && MarlinMoeEnabled() &&
+      h.dtype == DType::kBF16 &&
+      SharedGateUpFusedEligible(w.shared_gate_proj_fp4, w.shared_up_proj_fp4)) {
+    DBuf sact = SharedGateUpFusedMarlinD(d, h, w.shared_gate_proj_fp4, w.shared_up_proj_fp4);
+    DBuf sd = MatmulNvfp4F32D(d, sact.t(), w.shared_down_proj_fp4);  // [T,H] f32
+    DBuf gl = MatmulF32D(d, h, w.shared_gate);                       // [T,1] f32
+    return {std::move(sd), std::move(gl)};
+  }
+#endif
   DBuf sg = fp4 ? MatmulNvfp4F32D(d, h, w.shared_gate_proj_fp4)
                 : MatmulF32D(d, h, w.shared_gate_proj);  // [T,Is]
   DBuf su = fp4 ? MatmulNvfp4F32D(d, h, w.shared_up_proj_fp4)
@@ -2962,12 +3088,19 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
     const MoeBlockWeights& moe = layer.moe;
     if (!moe.expert_gate_fp4.empty())
       BuildMoeMarlinResident(d, moe, config, MoeMarlinResidentFor(&moe));
-    if (!moe.shared_gate_proj_fp4.Empty())
-      BuildMarlinDenseResident(d, moe.shared_gate_proj_fp4,
-                               MarlinDenseResidentFor(&moe.shared_gate_proj_fp4));
-    if (!moe.shared_up_proj_fp4.Empty())
-      BuildMarlinDenseResident(d, moe.shared_up_proj_fp4,
-                               MarlinDenseResidentFor(&moe.shared_up_proj_fp4));
+    if (SharedGateUpFusedEligible(moe.shared_gate_proj_fp4, moe.shared_up_proj_fp4)) {
+      // Fused gate_up pair resident INSTEAD of the two singles (same total
+      // bytes; the forward takes the fused path under the identical guard).
+      BuildMarlinDensePairResident(d, moe.shared_gate_proj_fp4, moe.shared_up_proj_fp4,
+                                   MarlinDensePairResidentFor(&moe.shared_gate_proj_fp4));
+    } else {
+      if (!moe.shared_gate_proj_fp4.Empty())
+        BuildMarlinDenseResident(d, moe.shared_gate_proj_fp4,
+                                 MarlinDenseResidentFor(&moe.shared_gate_proj_fp4));
+      if (!moe.shared_up_proj_fp4.Empty())
+        BuildMarlinDenseResident(d, moe.shared_up_proj_fp4,
+                                 MarlinDenseResidentFor(&moe.shared_up_proj_fp4));
+    }
     if (!moe.shared_down_proj_fp4.Empty())
       BuildMarlinDenseResident(d, moe.shared_down_proj_fp4,
                                MarlinDenseResidentFor(&moe.shared_down_proj_fp4));

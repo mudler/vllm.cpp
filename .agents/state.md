@@ -1298,3 +1298,25 @@ silu chains to cut HBM PASSES, not bubbles). NEXT: GPU-BUSY kernel breakdown of 
 prefill vs vLLM's (memory profile) → measured non-GEMM lever ranking, then pursue the
 top hard lever. Top host-trace busy/gap sites: QuantFp8Static→GEMM, GdnChunkWU (the
 WY solve — #2), CastBf16 (redundant dtype casts), GdnPostConv.
+
+## 2026-07-09 — MEASURED GPU-busy breakdown: the gap is UNFUSED GLUE (~27%, HBM-bound)
+
+35B prefill GPU-busy (1495ms steady-state, from nsys cuda_gpu_kern_sum). Buckets (% busy):
+D glue (norm/quant/cast/silu) **30.2%** · C GDN chunk **25.6%** · A fp4/Marlin 22.7% ·
+B fp8 GEMM 10.9% · E attn 8.6%. **NON-GEMM = 65.1%** (GEMM 34.9%).
+**vs vLLM: glue ~2.3× and GDN chunk ~2.4× vLLM's relative share** (GEMMs at parity).
+That excess IS the residual 0.82×. Glue kernels are HBM-BW-BOUND (RmsNormRow 61% peak,
+QuantFp8Static ≥53%, MoeSiluMul ~66%) — each a full HBM round-trip vLLM folds into GEMM
+epilogues / single fused kernels. **OVERTURNS the source-scan's "chunk_o/WU we're ahead"**
+— measurement says our GDN chunk is 2.4× vLLM's share.
+
+Top glue kernels (%busy): GdnPostConv 5.0, RmsNormGatedRow 4.5, MoeCombineGate 4.4,
+RmsNormRow 4.1, QuantFp8Static 3.0, MoeSiluMul 3.0, CastF32 1.9, AttnGateSplit 1.8,
+SigmoidGateBf16 1.0, CastBf16 0.4. GDN chunk: GdnChunkWU 8.7, ChunkO 6.1, DeltaHRegRing
+5.5 (just improved), Conv 5.4.
+
+**NEXT (biggest measured lever): #1 FUSE the glue chain (~27%, HBM-bound, Med).** Collapse
+residual-add+RMSNorm+quant and silu+mul+cvt_fp4 into single passes / GEMM epilogues
+(mirror vLLM Inductor fusions) via the TDR fused-recipe skeleton. Then #2 GDN-chunk
+efficiency (25.6%, High — apply the vt::tile register-tiled method to ChunkO/WU + the
+WY blocked inverse). #3 kill Cast passes (~2.3%, Low — fold f32→bf16 into producers).

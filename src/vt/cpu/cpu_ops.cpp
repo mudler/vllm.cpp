@@ -140,6 +140,46 @@ uint8_t F32ToFp8(float f) {
                               static_cast<uint8_t>(mant));
 }
 
+// Fused fp8 RMSNorm -> static per-tensor quant (mirror vLLM Inductor
+// fused_add_rms_norm_static_fp8_quant, rms_quant_fusion.py:124). Same reduction
+// order as RmsNormKernel; the fp8 is taken from the SAME bf16-rounded normed value
+// the split RmsNorm(bf16)+QuantFp8Static path quantizes (bf16-intermediate form),
+// so the two are bit-identical. out_bf16 (optional) is the normed activation in
+// bf16 (for a coexisting bf16 consumer, e.g. GDN in_proj_a/b). CUDA has the hot
+// path; this CPU kernel keeps the op available on the host backend.
+void RmsNormQuantFp8Kernel(Queue&, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
+                           const Tensor& w, const RmsNormArgs& args, Tensor* residual,
+                           float input_scale) {
+  const int64_t t = x.shape[0], h = x.shape[1];
+  const float inv_scale = 1.0F / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  uint16_t* bp = out_bf16 == nullptr ? nullptr : out_bf16->Ptr<uint16_t>();
+  for (int64_t i = 0; i < t; ++i) {
+    const int64_t rbase = i * h;
+    float sumsq = 0.0F;
+    for (int64_t j = 0; j < h; ++j) {
+      float v = LoadF32(x, rbase + j);
+      if (residual) {
+        v += LoadF32(*residual, rbase + j);   // add in f32
+        StoreF32(*residual, rbase + j, v);     // new residual stream (rounds to its dtype)
+        v = LoadF32(*residual, rbase + j);     // re-read rounded value (bf16-faithful)
+      }
+      sumsq += v * v;
+    }
+    const float inv = 1.0F / std::sqrt(sumsq / static_cast<float>(h) + args.eps);
+    for (int64_t j = 0; j < h; ++j) {
+      float v = residual ? LoadF32(*residual, rbase + j) : LoadF32(x, rbase + j);
+      float wj = LoadF32(w, j);
+      if (args.gemma) wj += 1.0F;
+      // bf16-intermediate: round the normed value to bf16 (as RmsNorm's bf16 store),
+      // then quant from that bf16 (as QuantFp8Static's bf16 load).
+      const uint16_t nb = F32ToBF16(v * inv * wj);
+      if (bp) bp[rbase + j] = nb;
+      op[rbase + j] = F32ToFp8(BF16ToF32(nb) * inv_scale);
+    }
+  }
+}
+
 // f32 -> E2M1 nibble (bit-matches vllm::CastToFp4 + Fp4ToNibble). Input pre-scaled.
 uint8_t F32ToFp4Nibble(float x) {
   const float a = std::fabs(x);
@@ -942,6 +982,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
+    RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,

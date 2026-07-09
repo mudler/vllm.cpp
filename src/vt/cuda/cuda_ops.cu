@@ -3,6 +3,7 @@
 // Correctness-grade (M0.6): plain grid-stride / one-block-per-row kernels, f32
 // accumulation, double-precision RoPE angles matching the CPU reference.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
@@ -130,6 +131,96 @@ void RmsNormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
       LaunchRmsNorm<__nv_bfloat16>(AsStream(q), out, x, w, args, residual);
       break;
     default: VT_CHECK(false, "cuda rmsnorm: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// rmsnorm + static fp8 quant, fused: emit the fp8 activation (and optionally the
+// bf16 normed activation) directly from the RMSNorm's normalize loop, so the
+// standalone QuantFp8Static pass + its bf16 round-trip disappear. Mirror of
+// vLLM's Inductor fused_add_rms_norm_static_fp8_quant
+// (vllm/compilation/passes/fusion/rms_quant_fusion.py:124). Same reduction as
+// RmsNormRowKernel; BIT-IDENTICAL to RmsNorm(bf16)+QuantFp8Static because the
+// fp8 is taken from the SAME bf16-rounded value the split path quantizes
+// (F32ToFp8Dev(__bfloat162float(bf16(n)) * inv_scale)).
+__device__ __forceinline__ uint8_t RmsNormF32ToFp8Dev(float f) {
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
+}
+
+template <typename Tin, typename Tres>
+__global__ void RmsNormQuantFp8RowKernel(uint8_t* out_fp8, __nv_bfloat16* out_bf16, const Tin* x,
+                                         const Tin* w, Tres* residual, int64_t h, float eps,
+                                         bool gemma, float inv_scale) {
+  const int64_t row = blockIdx.x;
+  const Tin* xrow = x + row * h;
+  uint8_t* orow = out_fp8 + row * h;
+  __nv_bfloat16* brow = out_bf16 == nullptr ? nullptr : out_bf16 + row * h;
+  Tres* rrow = residual == nullptr ? nullptr : residual + row * h;
+
+  __shared__ float partial[kBlock];
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+    float v = Load(xrow, j);
+    if (rrow != nullptr) {
+      v = ResRound<Tres>(v + Load(rrow, j));  // new residual stream: f32 add, round to Tres
+      Store(rrow, j, v);                       // updated in place (f32 or bf16)
+    }
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
+  for (int64_t j = threadIdx.x; j < h; j += kBlock) {
+    const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
+    float wj = Load(w, j);
+    if (gemma) wj += 1.0f;
+    // bf16-intermediate (matches RmsNorm's bf16 store then QuantFp8Static's bf16 load).
+    const __nv_bfloat16 nb = __float2bfloat16(v * inv * wj);
+    if (brow != nullptr) brow[j] = nb;
+    orow[j] = RmsNormF32ToFp8Dev(__bfloat162float(nb) * inv_scale);
+  }
+}
+
+template <typename Tin>
+void LaunchRmsNormQuantFp8(cudaStream_t s, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
+                           const Tensor& w, const RmsNormArgs& args, Tensor* residual,
+                           float input_scale) {
+  const int64_t t = x.shape[0], h = x.shape[1];
+  if (t == 0 || h == 0) return;
+  const unsigned rows = static_cast<unsigned>(t);
+  const float inv_scale = 1.0f / input_scale;
+  __nv_bfloat16* bf16 = out_bf16 == nullptr ? nullptr : out_bf16->Ptr<__nv_bfloat16>();
+  if (residual != nullptr && residual->dtype == DType::kBF16) {
+    RmsNormQuantFp8RowKernel<Tin, __nv_bfloat16><<<rows, kBlock, 0, s>>>(
+        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tin>(),
+        residual->Ptr<__nv_bfloat16>(), h, args.eps, args.gemma, inv_scale);
+  } else {
+    float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
+    RmsNormQuantFp8RowKernel<Tin, float><<<rows, kBlock, 0, s>>>(
+        out_fp8.Ptr<uint8_t>(), bf16, x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma,
+        inv_scale);
+  }
+  Check(cudaGetLastError(), "rmsnorm_quant_fp8 launch");
+}
+
+void RmsNormQuantFp8KernelCuda(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
+                               const Tensor& w, const RmsNormArgs& args, Tensor* residual,
+                               float input_scale) {
+  VT_CHECK(w.dtype == x.dtype, "cuda rmsnorm_quant_fp8: weight dtype must match x");
+  switch (x.dtype) {
+    case DType::kF32:
+      LaunchRmsNormQuantFp8<float>(AsStream(q), out_fp8, out_bf16, x, w, args, residual,
+                                   input_scale);
+      break;
+    case DType::kBF16:
+      LaunchRmsNormQuantFp8<__nv_bfloat16>(AsStream(q), out_fp8, out_bf16, x, w, args, residual,
+                                           input_scale);
+      break;
+    default: VT_CHECK(false, "cuda rmsnorm_quant_fp8: unsupported input dtype (f32/bf16 only)");
   }
 }
 
@@ -785,6 +876,9 @@ struct Registrar {
   Registrar() {
     RegisterOp(OpId::kRmsNorm, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernelCuda)));
+    RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8KernelCuda)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,

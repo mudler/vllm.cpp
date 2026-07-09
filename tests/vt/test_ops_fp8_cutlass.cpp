@@ -260,6 +260,89 @@ TEST_CASE("fp8 cuBLASLt W8A8 GEMM matches host W8A8 reference") {
   RunCase(1024, 128, 256, 7, /*cublaslt=*/true);
 }
 
+// The fused fp8 RMSNorm->static-quant op (vt::RmsNormQuantFp8) must be BYTE-for-BYTE
+// identical to the split path it replaces: vt::RmsNorm(bf16 out, residual) then
+// vt::QuantFp8Static of that bf16. Covers both residual dtypes (f32 full-precision /
+// bf16 vLLM model dtype) and the optional bf16 side-output (GDN emits it for
+// in_proj_a/b; full-attn does not). This is the op-level token-exactness gate.
+TEST_CASE("rmsnorm_quant_fp8 fused == RmsNorm(bf16)+QuantFp8Static (bit-for-bit)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping rmsnorm_quant_fp8 fusion test");
+    return;
+  }
+  using vt::RmsNormArgs;
+  const int64_t T = 7, H = 128;  // H multiple of 16
+  const size_t N = static_cast<size_t>(T) * H;
+  const float eps = 1e-6f, input_scale = 0.03f;
+
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<float> ux(-3.0f, 3.0f);
+  std::vector<float> x(N), w(static_cast<size_t>(H)), res(N);
+  for (auto& v : x) v = ux(rng);
+  for (auto& v : w) v = ux(rng) * 0.1f;
+  for (auto& v : res) v = ux(rng);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor dx(b, g.q, DType::kF32, {T, H}, x.data());
+  DeviceTensor dw(b, g.q, DType::kF32, {H}, w.data());
+
+  auto run = [&](bool bf16_residual, bool want_bf16_out) {
+    const DType rdt = bf16_residual ? DType::kBF16 : DType::kF32;
+    // Materialize the initial residual bytes so both paths start identical.
+    std::vector<uint16_t> res_bf16(N);
+    for (size_t i = 0; i < N; ++i) res_bf16[i] = vt::F32ToBF16(res[i]);
+    const void* res_init = bf16_residual ? static_cast<const void*>(res_bf16.data())
+                                         : static_cast<const void*>(res.data());
+
+    // Split path.
+    DeviceTensor dresA(b, g.q, rdt, {T, H}, res_init);
+    DeviceTensor dbf16A(b, g.q, DType::kBF16, {T, H});
+    vt::RmsNorm(g.q, dbf16A.tensor(), dx.tensor(), dw.tensor(), RmsNormArgs{eps, true},
+                &dresA.tensor());
+    DeviceTensor dfp8A(b, g.q, DType::kI8, {T, H});
+    vt::QuantFp8Static(g.q, dfp8A.tensor(), dbf16A.tensor(), input_scale);
+    std::vector<uint8_t> fp8_split(N);
+    dfp8A.Download(g.q, fp8_split.data());
+    std::vector<uint16_t> bf16_split(N);
+    dbf16A.Download(g.q, bf16_split.data());
+
+    // Fused path (separate residual copy).
+    DeviceTensor dresB(b, g.q, rdt, {T, H}, res_init);
+    DeviceTensor dfp8B(b, g.q, DType::kI8, {T, H});
+    DeviceTensor dbf16B(b, g.q, DType::kBF16, {T, H});
+    vt::RmsNormQuantFp8(g.q, dfp8B.tensor(), want_bf16_out ? &dbf16B.tensor() : nullptr,
+                        dx.tensor(), dw.tensor(), RmsNormArgs{eps, true}, &dresB.tensor(),
+                        input_scale);
+    std::vector<uint8_t> fp8_fused(N);
+    dfp8B.Download(g.q, fp8_fused.data());
+
+    CHECK(fp8_fused == fp8_split);  // fp8 activation byte-identical
+    if (want_bf16_out) {
+      std::vector<uint16_t> bf16_fused(N);
+      dbf16B.Download(g.q, bf16_fused.data());
+      CHECK(bf16_fused == bf16_split);  // bf16 side-output byte-identical
+    }
+    // Residual stream updated identically (compare raw bytes for both dtypes).
+    if (bf16_residual) {
+      std::vector<uint16_t> ra(N), rb(N);
+      dresA.Download(g.q, ra.data());
+      dresB.Download(g.q, rb.data());
+      CHECK(ra == rb);
+    } else {
+      std::vector<float> ra(N), rb(N);
+      dresA.Download(g.q, ra.data());
+      dresB.Download(g.q, rb.data());
+      CHECK(ra == rb);
+    }
+  };
+
+  run(/*bf16_residual=*/false, /*want_bf16_out=*/true);
+  run(/*bf16_residual=*/false, /*want_bf16_out=*/false);
+  run(/*bf16_residual=*/true, /*want_bf16_out=*/true);
+  run(/*bf16_residual=*/true, /*want_bf16_out=*/false);
+}
+
 TEST_CASE("fp8 cuBLASLt W8A8 GEMM f32-output path matches reference") {
   if (!HasCuda()) {
     MESSAGE("no CUDA device; skipping fp8 cuBLASLt f32-out test");

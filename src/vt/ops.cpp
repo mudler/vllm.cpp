@@ -202,6 +202,37 @@ void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scal
   reinterpret_cast<QuantFp8StaticFn>(GetOp(OpId::kQuantFp8Static, q.device.type))(q, out_fp8, x,
                                                                                   input_scale);
 }
+void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
+                     const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
+                     float input_scale) {
+  VT_CHECK(x.rank == 2 && out_fp8.rank == 2 && weight.rank == 1,
+           "rmsnorm_quant_fp8: x/out_fp8 rank-2, weight rank-1");
+  VT_CHECK(x.shape[0] == out_fp8.shape[0] && x.shape[1] == out_fp8.shape[1],
+           "rmsnorm_quant_fp8: out_fp8 must match x shape [T,H]");
+  VT_CHECK(weight.shape[0] == x.shape[1], "rmsnorm_quant_fp8: weight size mismatch");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype), "rmsnorm_quant_fp8: float x/weight required");
+  VT_CHECK(out_fp8.dtype == DType::kI8,
+           "rmsnorm_quant_fp8: out_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(x.IsContiguous() && out_fp8.IsContiguous() && weight.IsContiguous(),
+           "rmsnorm_quant_fp8: contiguous tensors required");
+  if (out_bf16 != nullptr) {
+    VT_CHECK(out_bf16->dtype == DType::kBF16 && out_bf16->rank == 2 &&
+                 out_bf16->shape[0] == x.shape[0] && out_bf16->shape[1] == x.shape[1] &&
+                 out_bf16->IsContiguous() && out_bf16->device == x.device,
+             "rmsnorm_quant_fp8: out_bf16 must be bf16 [T,H] contiguous on x's device");
+  }
+  if (residual != nullptr) {
+    VT_CHECK((residual->dtype == DType::kF32 || residual->dtype == DType::kBF16) &&
+                 residual->rank == 2 && residual->shape[0] == x.shape[0] &&
+                 residual->shape[1] == x.shape[1] && residual->IsContiguous() &&
+                 residual->device == x.device,
+             "rmsnorm_quant_fp8: residual must be f32/bf16 [T,H] contiguous on x's device");
+  }
+  VT_CHECK(x.device == out_fp8.device && weight.device == x.device && x.device == q.device,
+           "rmsnorm_quant_fp8: device mismatch (x/out_fp8/weight/queue)");
+  reinterpret_cast<RmsNormQuantFp8Fn>(GetOp(OpId::kRmsNormQuantFp8, q.device.type))(
+      q, out_fp8, out_bf16, x, weight, args, residual, input_scale);
+}
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha) {
   VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,

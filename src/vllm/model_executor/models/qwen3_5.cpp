@@ -615,12 +615,16 @@ DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, D
 // via MatmulFp8CutlassPreQuantD — removing the standalone QuantFp8Static pass + its
 // bf16 round-trip AND the redundant per-projection re-quant of the same [T,H].
 // Bit-identical (bf16-intermediate form); only fires when the shared projections
-// carry ONE input_scale (asserted at the RunLayer site). DEFAULT OFF until gated;
-// VT_FUSE_RMSNORM_FP8QUANT=1 enables.
+// carry ONE input_scale (guarded at the RunLayer site — the real 35B q/k/v and
+// in_proj_qkv/z do). DEFAULT ON: token-exact (op-level byte-identical + 35B greedy
+// 16/16) and a clean same-binary win at the gate shape (in1024/out128 conc32 np192:
+// +0.85% total & prefill tok/s, every ON run > every OFF run; nsys: the input-fed
+// QuantFp8Static instances drop 130->40 per step, folded into RmsNormQuantFp8). The
+// 27B (no fp8 weights) never fires it. VT_FUSE_RMSNORM_FP8QUANT=0 opts out for an A/B.
 bool FuseRmsNormFp8QuantEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_RMSNORM_FP8QUANT");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return on;
 }

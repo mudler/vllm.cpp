@@ -1315,6 +1315,18 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate 
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7220, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7230, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_bf16, 7235, 3e-2f, 3e-2f);
+  // H=32 (35B) multi-sequence — the batched-graph gate config. Several seqs with
+  // partial tails at different offsets, exercising chunk_indices at H=32.
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 32, 128, 128, bf16_bf16, 7236, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 100, 150, 264, 300, 401}, 16, 32, 128, 128, bf16_bf16, 7237,
+                            3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 100, 150, 264, 300, 401}, 16, 48, 128, 128, bf16_bf16, 7238,
+                            3e-2f, 3e-2f);
+  // Very short seqs (T < 16, single partial sub-block) — the batched 35B prompt
+  // shape (~6 concurrent ~10-token prompts). Exercises solve_tril's T<16 corner.
+  RunGdnChunkedVsSequential({0, 10, 22, 31, 40, 52, 61}, 16, 32, 128, 128, bf16_bf16, 7239,
+                            3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 10}, 16, 32, 128, 128, bf16_bf16, 7241, 3e-2f, 3e-2f);
   unsetenv("VT_GDN_WU_TRITON");
   setenv("VT_GDN_CHUNKED", "1", 1);
 }

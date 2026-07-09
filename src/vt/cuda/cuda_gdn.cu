@@ -2713,6 +2713,12 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
   const size_t na = static_cast<size_t>(t_tot) * static_cast<size_t>(hv_n) * BT;
   Check(cudaMallocAsync(&araw, na * sizeof(float), s), "gdn wu(triton) A alloc");
   Check(cudaMallocAsync(&ai, na * sizeof(__nv_bfloat16), s), "gdn wu(triton) Ai alloc");
+  // solve_tril writes ONLY the 10 lower-triangular 16×16 blocks of each [BT,BT]
+  // inverse; the 6 upper blocks stay 0 (FLA: `Ai = torch.zeros_like(A)`).
+  // recompute_w_u then reads the FULL [BT,BT] Ai block and dots it, so the upper
+  // triangle MUST be zeroed — cudaMallocAsync returns dirty pool memory in a busy
+  // engine (clean in the op test / under memcheck, which is why it slipped there).
+  Check(cudaMemsetAsync(ai, 0, na * sizeof(__nv_bfloat16), s), "gdn wu(triton) Ai zero");
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);
   const int32_t NT = static_cast<int32_t>(nt_tot);

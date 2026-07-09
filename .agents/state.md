@@ -1663,3 +1663,35 @@ the portable path: the "no compile-target" rule was premised on portable working
 these kernels); mirror-vLLM (PRIME POLICY) + the ≥1.0× MVP both point to Triton. A HUMAN decision.
 (One untried portable compute-side lever remains — 128B-swizzle + warp-specialization of the WMMA
 — but the evidence assesses it as the same compiler-capability class = likely partial.)
+## 2026-07-09 — DGX gate test harness aligned with native-resident loader state (worktree: codex/parity-dgx-runbook)
+
+Worked in isolated worktree `/home/mudler/_git/vllm.cpp-codex-parity-dgx`; DGX scratch copy:
+`/home/mudler/work/vllm.cpp-agent-20260709-171553`. Initial DGX GPU commands used `/tmp/gpu`
+`flock`; after user override, final CUDA confirmation ran directly on the GPU. The final direct
+run saw `nvidia-smi`: `NVIDIA GB10, 1 %`.
+
+Changes prepared:
+- `scripts/dgx-bringup.sh`: updated the bring-up runbook to the current gate stack (`sm_121a`,
+  CUTLASS via `VLLM_CPP_CUTLASS_DIR` / `~/cutlass_probe`, 35B+27B gate language, bounded default
+  `JOBS=8`).
+- `tests/vllm/test_qwen36_weights.cpp`: updated the real-shard loader contract checks for the
+  current native-resident default: 35B W8A8 projections are raw FP8 resident, NVFP4 experts are raw
+  FP4 resident; helper dequant bit-pattern checks remain the numeric golden.
+- `tests/parity/test_op_parity.cpp`: added scoped env overrides so f32 GDN prefill replays the same
+  sequential oracle path as the committed goldens, full real-model logits remain CUDA-only on CPU
+  builds, and isolated Qwen3.6 layer goldens use the legacy dequant loader (`VT_DENSE_NATIVE=0`).
+  The isolated full-attention layer replay is CPU-only; CUDA full-attention correctness remains
+  covered by the full 35B/27B logits gates. Margin diagnostics now print before a failure when
+  `VLLM_PARITY_PRINT_MARGINS=1`.
+
+Verification:
+- Local CPU build + full suite: `cmake --build build -j2 && ctest --test-dir build --output-on-failure`
+  passed 91/91 after the harness update.
+- DGX CUDA incremental build of `test_op_parity` + `test_qwen36_weights` passed.
+- DGX locked `test_qwen36_weights` passed 66/66 assertions.
+- DGX locked `test_op_parity` with the native default confirmed the full-model gates still pass:
+  35B `greedy_match=16/16`, top-1000 gap `1.8125`; 27B diagnostic `greedy_match=16/16`, top-1000 gap
+  `1.228461`; f32 GDN prefill sequential replay margins were tight. A direct follow-up run after the
+  CUDA full-attention skip passed `./build-cuda-agent/tests/test_op_parity -tc="op parity vs upstream
+  goldens (CUDA)"`: 1/1 test case passed, 12/12 assertions, with the 35B full-attention layer
+  explicitly skipped as CPU-only isolated replay while 35B/27B full-model logits stayed 16/16.

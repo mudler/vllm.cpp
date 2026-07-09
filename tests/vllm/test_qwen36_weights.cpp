@@ -4,10 +4,10 @@
 // laptops) every case skips and passes. On dgx it opens shard 1 (which holds
 // embed_tokens + layers 0-16, so both a GDN layer (0) and a full-attn layer (3)
 // are fully resolvable from one file) and proves the loader RESOLVES real
-// tensors by name, DEQUANTS them (NVFP4 experts + FP8 attn), and TRANSPOSES to
-// Matmul-B layout — against python/torch-computed golden bf16 bit patterns
-// (snapshot 491c2f1e; see .agents/qwen36-forward-notes.md §6). The full-model
-// load is exercised in Task 5.
+// tensors by name, verifies the standalone dequant helpers against python/torch
+// golden bf16 bit patterns, and checks the full-layer loader's current native
+// resident contract (FP8/NVFP4 raw weights by default; snapshot 491c2f1e; see
+// .agents/qwen36-forward-notes.md §6). The full-model load is exercised in Task 5.
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -142,7 +142,7 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(dq[1 * in_dim + 5] == 0x3CE1);
   }
 
-  SUBCASE("transpose + full-layer load: GDN (layer 0) and full-attn (layer 3)") {
+  SUBCASE("full-layer load: GDN (layer 0) and full-attn (layer 3)") {
     // A small expert count keeps the test fast; the loop/shared-expert/router
     // path is what we're proving, not all 256 experts (that is Task 5).
     const int64_t kExperts = 4;
@@ -150,10 +150,18 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     const vllm::Qwen3_5MoeLayerWeights gdn =
         vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, kExperts);
     CHECK(gdn.is_linear_attention);
-    // in_proj_qkv transposed to [H=2048, conv_dim=8192].
-    REQUIRE(gdn.gdn.in_proj_qkv.rank == 2);
-    CHECK(gdn.gdn.in_proj_qkv.shape[0] == 2048);
-    CHECK(gdn.gdn.in_proj_qkv.shape[1] == 8192);
+    // The default CUDA-parity loader keeps 35B W8A8 projections resident in
+    // raw FP8 [N=out,K=in] orientation. VT_DENSE_NATIVE=0 is the legacy
+    // dequant-to-bf16 path; the gate default should exercise the native fields.
+    CHECK(gdn.gdn.in_proj_qkv.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_qkv_fp8.Empty());
+    CHECK(gdn.gdn.in_proj_qkv_fp8.n == 8192);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.k == 2048);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.packed.shape[0] == 8192);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.packed.shape[1] == 2048);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.weight_scale > 0.0F);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.input_scale > 0.0F);
+    CHECK(gdn.gdn.in_proj_qkv_fp8.alpha > 0.0F);
     // conv1d collapsed to [conv_dim, K].
     CHECK(gdn.gdn.conv1d_weight.shape[0] == 8192);
     CHECK(gdn.gdn.conv1d_weight.shape[1] == 4);
@@ -168,30 +176,37 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     // Router gate transpose is value-preserving: gate[0,0] on disk == [0,0]
     // after transpose (corner is invariant). Golden 0x3BB3.
     CHECK(Bf16At(gdn.moe.router_gate, 0) == 0x3BB3);
-    // Expert 0 down_proj transposed to [I=512, H=2048]; dequant[o,i] -> [i,o],
-    // so pre-transpose dq[5,17] lands at [17,5] = 17*out(2048)+5... but this is
-    // the transposed buffer [512,2048]; index = 17*2048 + 5.
-    REQUIRE(gdn.moe.expert_down.size() == static_cast<size_t>(kExperts));
-    CHECK(gdn.moe.expert_down[0].shape[0] == 512);
-    CHECK(gdn.moe.expert_down[0].shape[1] == 2048);
-    CHECK(Bf16At(gdn.moe.expert_down[0], 17 * 2048 + 5) == 0x3BCB);
-    CHECK(Bf16At(gdn.moe.expert_down[0], 0) == 0x3C7E);
+    // NVFP4 expert weights are also resident now: raw packed [N=out,K/2] plus
+    // fp8 group scales [N,K/16]. The helper-level dequant goldens above cover
+    // the numeric bit patterns.
+    CHECK(gdn.moe.expert_down.empty());
+    REQUIRE(gdn.moe.expert_down_fp4.size() == static_cast<size_t>(kExperts));
+    CHECK(gdn.moe.expert_down_fp4[0].n == 2048);
+    CHECK(gdn.moe.expert_down_fp4[0].k == 512);
+    CHECK(gdn.moe.expert_down_fp4[0].packed.shape[0] == 2048);
+    CHECK(gdn.moe.expert_down_fp4[0].packed.shape[1] == 256);
+    CHECK(gdn.moe.expert_down_fp4[0].scale.shape[0] == 2048);
+    CHECK(gdn.moe.expert_down_fp4[0].scale.shape[1] == 32);
+    CHECK(gdn.moe.expert_down_fp4[0].scale2 > 0.0F);
 
     const vllm::Qwen3_5MoeLayerWeights attn =
         vllm::LoadQwen3_5MoeLayer(get, "full_attention", 3, kExperts);
     CHECK_FALSE(attn.is_linear_attention);
-    // q_proj transposed to [H=2048, 2*Hq*Dh=8192].
-    CHECK(attn.attn.q_proj.shape[0] == 2048);
-    CHECK(attn.attn.q_proj.shape[1] == 8192);
-    // q_proj transpose value-preserving at the corner: dq[0,0] golden 0x3C0A.
-    CHECK(Bf16At(attn.attn.q_proj, 0) == 0x3C0A);
-    // dq[1,5] pre-transpose -> transposed[5,1] = 5*out(8192)+1.
-    CHECK(Bf16At(attn.attn.q_proj, 5 * 8192 + 1) == 0x3CE1);
+    CHECK(attn.attn.q_proj.Empty());
+    REQUIRE_FALSE(attn.attn.q_proj_fp8.Empty());
+    CHECK(attn.attn.q_proj_fp8.n == 8192);
+    CHECK(attn.attn.q_proj_fp8.k == 2048);
+    CHECK(attn.attn.q_proj_fp8.packed.shape[0] == 8192);
+    CHECK(attn.attn.q_proj_fp8.packed.shape[1] == 2048);
+    CHECK(attn.attn.q_proj_fp8.weight_scale > 0.0F);
+    CHECK(attn.attn.q_proj_fp8.input_scale > 0.0F);
+    CHECK(attn.attn.q_proj_fp8.alpha > 0.0F);
     // qk-norm over head_dim=256.
     CHECK(attn.attn.q_norm.shape[0] == 256);
     CHECK(attn.attn.k_norm.shape[0] == 256);
-    // o_proj transposed to [Hq*Dh=4096, H=2048].
-    CHECK(attn.attn.o_proj.shape[0] == 4096);
-    CHECK(attn.attn.o_proj.shape[1] == 2048);
+    CHECK(attn.attn.o_proj.Empty());
+    REQUIRE_FALSE(attn.attn.o_proj_fp8.Empty());
+    CHECK(attn.attn.o_proj_fp8.n == 2048);
+    CHECK(attn.attn.o_proj_fp8.k == 4096);
   }
 }

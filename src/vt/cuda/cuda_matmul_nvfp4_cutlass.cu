@@ -338,10 +338,22 @@ const std::vector<Fp4Candidate>& Fp4Candidates() {
   return c;
 }
 
+// DEFAULT ON (opt-out VT_FP4_AUTOTUNE=0 for an A/B). Per-shape tile autotune of
+// the dense-27B W4A4 fp4 GEMM. MEASURED (GB10, Triton-fast branch, same-binary
+// A/B vs graphed vLLM): +1.2% conc16 / +6.4% conc32 e2e, token-exact 16/16 (27B),
+// 35B inert (its dense is fp8 cuBLASLt / Marlin W4A16, never this cutlass GEMM).
+// CUDA-GRAPH SAFE: the autotune's cudaEventSynchronize is illegal mid-capture, but
+// it can only fire on a cache MISS, and a MISS never happens during capture — the
+// decode-graph state machine (Qwen3_5DenseDecodeGraph, cold->warm->captured) runs a
+// cold EAGER step at each padded batch size S that executes the exact same
+// ForwardLayers(S) fp4 GEMMs (M=S) and populates the plan cache BEFORE the warm step
+// captures size S, so every fp4 GEMM in the captured region is a cache HIT (mutex
+// lookup only, no event/sync). Prefill is always eager. Verified: 27B greedy 16/16 +
+// clean graphed conc16/conc32 benches with autotune ON, zero stream-capture errors.
 bool Fp4AutotuneEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FP4_AUTOTUNE");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return on;
 }

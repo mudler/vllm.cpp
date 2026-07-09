@@ -1255,3 +1255,95 @@ TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)
   (void)f32;
   (void)bf16;
 }
+
+// SANCTIONED Triton AOT delta_h fast-path, token-exact at the EXACT gate-model GDN
+// shapes (K=V=128, Hk=16, Hv in {48,32} = Qwen3.6-27B / 35B). The chunked path with
+// VT_GDN_DELTAH_TRITON=1 routes delta_h through the AOT cubin; it is compared vs the
+// sequential scan exactly like the hand path above. In a build WITHOUT VLLM_CPP_TRITON
+// the env is inert (the chunked path stays hand-C++), so this case is valid in both
+// builds — it only exercises Triton in the VLLM_CPP_TRITON build. bf16 tolerance
+// matches the hand chunked-vs-sequential cases (same per-head delta-rule math).
+TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate shape") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_DELTAH_TRITON", "1", 1);  // opt into the Triton path (inert if not built)
+  // Two chunks + partial tail (150 tok) exercises the cross-chunk state recurrence,
+  // which is the delta_h kernel. 27B shape (Hk16/Hv48) then 35B shape (Hk16/Hv32).
+  RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16, 7100, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16, 7110, 3e-2f, 3e-2f);
+  // Multi-sequence varlen at the 27B shape (differing chunk counts + chunk offsets).
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16, 7120, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+  (void)bf16;
+}
+
+// SANCTIONED Triton AOT chunk_o + WU (WY) fast-paths, token-exact at the EXACT
+// gate-model GDN shapes (K=V=128, Hk=16, Hv in {48,32} = Qwen3.6-27B / 35B). The
+// chunked path with VT_GDN_CHUNKO_TRITON=1 / VT_GDN_WU_TRITON=1 routes chunk_o /
+// the WY pipeline through the AOT cubins; both are compared vs the sequential scan
+// exactly like the hand path above. chunk_o Triton pins o=f32, so these cases use
+// bf16-in / f32-out (the DEFAULT GDN recurrence-output dtype). WU Triton is dtype-
+// agnostic on out, so a bf16-in/bf16-out case also exercises it (with the hand
+// chunk_o). In a build WITHOUT VLLM_CPP_TRITON the envs are inert (chunked stays
+// hand-C++), so this case is valid in both builds. Tolerance matches the hand
+// chunked-vs-sequential cases (same per-head WY + delta-rule + output math).
+TEST_CASE("CUDA gdn prefill chunked (Triton chunk_o only) matches sequential at gate shape") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};   // default GDN out dtype
+  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
+  RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_f32, 7200, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7210, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7215, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_CHUNKO_TRITON");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+}
+
+TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate shape") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_WU_TRITON", "1", 1);
+  RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7220, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7230, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_bf16, 7235, 3e-2f, 3e-2f);
+  // H=32 (35B) multi-sequence — the batched-graph gate config. Several seqs with
+  // partial tails at different offsets, exercising chunk_indices at H=32.
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 32, 128, 128, bf16_bf16, 7236, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 100, 150, 264, 300, 401}, 16, 32, 128, 128, bf16_bf16, 7237,
+                            3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 100, 150, 264, 300, 401}, 16, 48, 128, 128, bf16_bf16, 7238,
+                            3e-2f, 3e-2f);
+  // Very short seqs (T < 16, single partial sub-block) — the batched 35B prompt
+  // shape (~6 concurrent ~10-token prompts). Exercises solve_tril's T<16 corner.
+  RunGdnChunkedVsSequential({0, 10, 22, 31, 40, 52, 61}, 16, 32, 128, 128, bf16_bf16, 7239,
+                            3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 10}, 16, 32, 128, 128, bf16_bf16, 7241, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_WU_TRITON");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+}
+
+TEST_CASE("CUDA gdn prefill chunked (Triton WU + delta_h + chunk_o) matches sequential") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};
+  setenv("VT_GDN_WU_TRITON", "1", 1);
+  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
+  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7240, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7250, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  unsetenv("VT_GDN_WU_TRITON");
+  unsetenv("VT_GDN_CHUNKO_TRITON");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+}

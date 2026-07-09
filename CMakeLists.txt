@@ -103,6 +103,11 @@ if(VLLM_CPP_CUDA)
 endif()
 
 include(cmake/CompilerWarnings.cmake)
+# Triton AOT toolchain (build-time kernel->cubin, CUDA-only). Defines the gated
+# option VLLM_CPP_TRITON (default OFF) + add_triton_kernel(); with the option OFF
+# this include is inert (no Python, no generated sources). Wired below under CUDA
+# for the SANCTIONED GDN delta_h fast-path (see .agents/discipline.md).
+include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
 
@@ -251,6 +256,117 @@ if(VLLM_CPP_CUDA)
     set_source_files_properties(${_MARLIN_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;--expt-relaxed-constexpr;-diag-suppress=20280;-isystem;${_MARLIN_ROOT}>")
+  endif()
+
+  # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
+  # Build-time compile of the FLA chunk_delta_h state-recurrence kernel to cubins
+  # embedded in libvllm; runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
+  # cuda_gdn.cu with the hand-C++ GdnChunkDeltaHRegRingKernel preserved as the
+  # default fallback. OFF => none of this runs and the build is byte-identical.
+  # Two specializations, one per gate-model GDN shape (both K=V=128, Hg=16, BT=64;
+  # only H=num_value_heads differs): 27B H=48, 35B H=32. Signature order matches
+  # triton_kernels/chunk_delta_h.py arg list; pinned flags USE_G=1,USE_GK=0,
+  # USE_INITIAL_STATE=1,STORE_FINAL_STATE=1,SAVE_NEW_VALUE=1,IS_VARLEN=1,USE_EXP2=0.
+  if(VLLM_CPP_TRITON)
+    enable_language(C)  # the AOT launchers are plain C (CUDA driver API)
+    # Winning autotune knobs for the gate shape (BV,warps,stages); overridable to
+    # re-sweep without editing this file. gridX = cdiv(V=128, BV) baked per spec.
+    set(VT_GDN_DELTAH_BV     64 CACHE STRING "delta_h Triton BV (32 or 64)")
+    set(VT_GDN_DELTAH_WARPS  4  CACHE STRING "delta_h Triton num_warps")
+    set(VT_GDN_DELTAH_STAGES 3  CACHE STRING "delta_h Triton num_stages")
+    math(EXPR _DELTAH_GX "(128 + ${VT_GDN_DELTAH_BV} - 1) / ${VT_GDN_DELTAH_BV}")
+    set(_DELTAH_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_delta_h.py")
+    set(_DELTAH_KFN chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
+    # Signature (26 args): k v w v_new g gk h h0 ht cu_seqlens chunk_offsets T NH
+    #   H Hg K V BT BV USE_G USE_GK USE_INITIAL_STATE STORE_FINAL_STATE
+    #   SAVE_NEW_VALUE IS_VARLEN USE_EXP2. dtypes: k/v/w/v_new/h bf16, g/h0/ht fp32.
+    set(_DELTAH_SIG_TAIL "*bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, @H@, 16, 128, 128, 64, ${VT_GDN_DELTAH_BV}, 1, 0, 1, 1, 1, 1, 0")
+    set(_DELTAH_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32")
+    foreach(_H 48 32)
+      string(REPLACE "@H@" "${_H}" _sig "${_DELTAH_SIG_HEAD}, ${_DELTAH_SIG_TAIL}")
+      add_triton_kernel(VT_GDN_DELTAH_${_H}_SRCS
+        "${_DELTAH_KPY}" ${_DELTAH_KFN} gdn_deltah_h${_H}
+        "${_sig}" "${_DELTAH_GX},NH,1"
+        ${VT_GDN_DELTAH_WARPS} ${VT_GDN_DELTAH_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_DELTAH_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_DELTAH_${_H}_SRCS_INCLUDE_DIR})
+    endforeach()
+
+    # ── SANCTIONED Triton AOT: GDN chunk_o (the output kernel) ──────────────────
+    # FLA chunk_o.py chunk_fwd_kernel_o -> triton_kernels/chunk_o.py. Dispatch
+    # TryTritonChunkO (VT_GDN_CHUNKO_TRITON) in cuda_gdn.cu; hand GdnChunkOWmmaKernel
+    # preserved as fallback. Two specs (H=48 27B, H=32 35B); K=V=128, Hg=16, BT=64,
+    # BK=BV=64 (grid.x=cdiv(V,BV)=2). USE_G=1, IS_VARLEN=1. o(=out) is f32 (the
+    # default GDN recurrence-output dtype). Grid (cdiv(V,BV), NT, H); H=B*H baked
+    # (varlen B=1), NT is the runtime grid-carrier scalar. scale is PINNED to
+    # Dk^-0.5 inside the kernel (Triton AOT mis-packs fp32 scalars), NOT a sig arg.
+    # Args: q k v h g o cu_seqlens chunk_indices T NT | H Hg K V BT BK BV USE_G IS_VARLEN.
+    set(VT_GDN_CHUNKO_BK    64 CACHE STRING "chunk_o Triton BK")
+    set(VT_GDN_CHUNKO_BV    64 CACHE STRING "chunk_o Triton BV")
+    set(VT_GDN_CHUNKO_WARPS 4  CACHE STRING "chunk_o Triton num_warps")
+    set(VT_GDN_CHUNKO_STAGES 3 CACHE STRING "chunk_o Triton num_stages")
+    math(EXPR _CHUNKO_GX "(128 + ${VT_GDN_CHUNKO_BV} - 1) / ${VT_GDN_CHUNKO_BV}")
+    set(_CHUNKO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_o.py")
+    set(_CHUNKO_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
+    set(_CHUNKO_SIG_TAIL "16, 128, 128, 64, ${VT_GDN_CHUNKO_BK}, ${VT_GDN_CHUNKO_BV}, 1, 1")
+    foreach(_H 48 32)
+      set(_sig "${_CHUNKO_SIG_HEAD}, ${_H}, ${_CHUNKO_SIG_TAIL}")
+      add_triton_kernel(VT_GDN_CHUNKO_${_H}_SRCS
+        "${_CHUNKO_KPY}" chunk_fwd_kernel_o gdn_chunko_h${_H}
+        "${_sig}" "${_CHUNKO_GX},NT,${_H}"
+        ${VT_GDN_CHUNKO_WARPS} ${VT_GDN_CHUNKO_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS_INCLUDE_DIR})
+    endforeach()
+
+    # ── SANCTIONED Triton AOT: GDN WU pipeline (kkt -> solve_tril -> recompute_w_u)
+    # The 3 FLA kernels our single fused GdnChunkWUWmmaVecKernel mirrors; ported so
+    # the WU (biggest ~25% GDN) share runs on Triton codegen. Dispatch TryTritonWU
+    # (VT_GDN_WU_TRITON) in cuda_gdn.cu runs all 3 into scratch A(f32)/Ai(bf16) and
+    # produces w,u; hand fused kernel preserved as fallback. All grid-y = H (varlen
+    # B=1, baked), grid-x = NT (runtime carrier). H=48 (27B) / 32 (35B).
+    set(VT_GDN_WU_WARPS  4 CACHE STRING "WU Triton num_warps")
+    set(VT_GDN_WU_STAGES 3 CACHE STRING "WU Triton num_stages")
+    # (1) chunk_scaled_dot_kkt_fwd_kernel: k beta g A cu_seqlens chunk_indices T NT |
+    #     H Hg K BT BK IS_VARLEN USE_G. BK=64. A out f32.
+    set(_KKT_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_scaled_dot_kkt.py")
+    set(_KKT_HEAD "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
+    set(_KKT_TAIL "16, 128, 64, 64, 1, 1")
+    # (2) merge_16x16_to_64x64_inverse_kernel: A Ai cu_seqlens chunk_indices T NT |
+    #     H BT IS_VARLEN. A in f32, Ai out bf16. USE_TMA/DOT_PRECISION hardcoded.
+    set(_TRIL_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/solve_tril.py")
+    set(_TRIL_HEAD "*fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32")
+    set(_TRIL_TAIL "64, 1")
+    # (3) recompute_w_u_fwd_kernel: k v beta w u A g cu_seqlens chunk_indices T NT |
+    #     H Hg K V BT BK BV IS_VARLEN. BK=BV=64. A in bf16(=Ai); w,u out bf16.
+    set(_WU_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/wy_fast.py")
+    set(_WU_HEAD "*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32")
+    set(_WU_TAIL "16, 128, 128, 64, 64, 64, 1")
+    foreach(_H 48 32)
+      add_triton_kernel(VT_GDN_KKT_${_H}_SRCS
+        "${_KKT_KPY}" chunk_scaled_dot_kkt_fwd_kernel gdn_kkt_h${_H}
+        "${_KKT_HEAD}, ${_H}, ${_KKT_TAIL}" "NT,${_H},1"
+        ${VT_GDN_WU_WARPS} ${VT_GDN_WU_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_KKT_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_KKT_${_H}_SRCS_INCLUDE_DIR})
+
+      add_triton_kernel(VT_GDN_TRIL_${_H}_SRCS
+        "${_TRIL_KPY}" merge_16x16_to_64x64_inverse_kernel gdn_tril_h${_H}
+        "${_TRIL_HEAD}, ${_H}, ${_TRIL_TAIL}" "NT,${_H},1"
+        ${VT_GDN_WU_WARPS} ${VT_GDN_WU_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_TRIL_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_TRIL_${_H}_SRCS_INCLUDE_DIR})
+
+      add_triton_kernel(VT_GDN_WU_${_H}_SRCS
+        "${_WU_KPY}" recompute_w_u_fwd_kernel gdn_wu_h${_H}
+        "${_WU_HEAD}, ${_H}, ${_WU_TAIL}" "NT,${_H},1"
+        ${VT_GDN_WU_WARPS} ${VT_GDN_WU_STAGES})
+      target_sources(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS_INCLUDE_DIR})
+    endforeach()
+
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON=1)
+    target_link_libraries(vllm PUBLIC CUDA::cuda_driver)
   endif()
 endif()
 

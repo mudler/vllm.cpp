@@ -381,6 +381,95 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     token-exact rmsnorm). See discipline.md + mission.md; rationale + evidence in
     `.agents/state.md` (2026-07-09 "portable async-pipeline EXHAUSTED").
 
+    **IMPLEMENTED — delta_h (2026-07-09; branch `perf/gdn-deltah-triton-aot`).**
+    The delta_h state recurrence is the first kernel landed on this sanction:
+    `triton_kernels/chunk_delta_h.py` (FLA `chunk_delta_h.py:42-315` VERBATIM —
+    autotune/heuristics stripped so the constexprs are pinned per-shape via the
+    AOT signature; one documented grid-carrier scalar `NH`=N*H since the FLA grid
+    needs the sequence count, not a kernel arg). Toolchain `cmake/TritonAOT.cmake`
+    (merged from `perf/triton-fastpath`) builds two specializations — H=48 (27B),
+    H=32 (35B); both K=V=128, Hg=16, BT=64, BV=64, warps4/stages3 — to embedded
+    cubins; dispatch `TryTritonDeltaH` in `cuda_gdn.cu` behind the runtime toggle
+    `VT_GDN_DELTAH_TRITON` (opt-in until the win is proven), with the hand
+    `GdnChunkDeltaHRegRingKernel` + CPU ref PRESERVED as fallback and the OFF build
+    byte-inert. The GDN buffer layout is a verified 1:1 drop-in (strides checked
+    stride-for-stride against the FLA pointer arithmetic), so the Triton kernel
+    consumes the same device buffers the other chunk kernels produce.
+    GATES (GB10 sm_121a): token-exact — `test_ops_gdn` 450/450 (incl. a new
+    gate-shape Triton-vs-sequential case at H=48 and H=32) + 27B greedy 16/16 AND
+    35B greedy 16/16 single & batched-graph, all through the Triton path.
+    MEASURED (GB10, idle-flocked box, 27B NVFP4). delta_h KERNEL (same-binary nsys
+    A/B, in1024/out4, 240 launches, control kernels ±1% ⇒ clean isolation): hand
+    `GdnChunkDeltaHRegRingKernel` 1685.4 µs → Triton
+    `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` 1180.7 µs/launch = **−29.9%
+    (1.43×)** — the Triton WMMA codegen substantially beats our best hand kernel,
+    VALIDATING the sanction's premise (the residual WAS compiler codegen). But
+    delta_h is only ~19% of GDN chunk-kernel GPU time (the profile shows WU ~25% and
+    ChunkO ~20% are LARGER), so GDN aggregate −5.7% ⇒ GDN µs/tok gap vs vLLM's FLA
+    (128 vs 71.7 = ~1.79×) closes to ~1.68×. E2E (same-binary A/B, 3 reps,
+    non-overlapping arms) vs FRESH graphed vLLM: conc16/np96 in1024/out128 hand
+    712.96 → Triton 716.10 tok/s (+0.44%), vLLM 766.62 ⇒ **0.930×→0.934×**;
+    conc32/np192 hand 859.21 → Triton 866.59 (+0.86%), vLLM 1043.17 ⇒
+    **0.824×→0.831×**. HONEST VERDICT: delta_h Triton is a real, clean, token-exact
+    per-kernel win that PROVES the Triton fast-path closes the codegen gap on the
+    kernel it targets, but delta_h alone does NOT reach 27B ≥1.0× MVP parity (e2e
+    +0.4–0.9%). Reaching parity needs the SAME AOT treatment on the two LARGER GDN
+    kernels — `chunk_o` (~20%) and `recompute_w_u` (~25%) — the next rollout on this
+    sanction. Kept default-OFF pending that rollout + the flip-to-default decision.
+
+    **IMPLEMENTED — chunk_o + WU/WY pipeline (2026-07-09; branch
+    `perf/gdn-wu-chunko-triton-aot`, stacked on `perf/gdn-deltah-triton-aot`).**
+    The two LARGER GDN chunk kernels join delta_h on the sanction:
+    `triton_kernels/chunk_o.py` (FLA `chunk_o.py` `chunk_fwd_kernel_o` VERBATIM) and
+    the 3 FLA WY kernels our single fused `GdnChunkWUWmmaVecKernel` mirrors —
+    `triton_kernels/{chunk_scaled_dot_kkt,solve_tril,wy_fast}.py`
+    (`chunk_scaled_dot_kkt_fwd_kernel` → `merge_16x16_to_64x64_inverse_kernel` →
+    `recompute_w_u_fwd_kernel`). AOT adaptations: autotune/heuristics stripped +
+    constexprs pinned per-shape; one dead grid-carrier `NT` (B*H==H under our varlen
+    B=1 packing, baked); solve_tril pins USE_TMA=0 (`is_tma_supported` False on GB10)
+    + DOT_PRECISION "ieee". Toolchain builds 8 new specs (4 kernels × H=48/32); dispatch
+    `TryTritonChunkO` (`VT_GDN_CHUNKO_TRITON`) + `TryTritonWU` (`VT_GDN_WU_TRITON`, runs
+    the 3 WY kernels into scratch A f32 / Ai bf16), device-built FLA `chunk_indices`
+    (`GdnBuildChunkIndices`); hand kernels + CPU ref PRESERVED, OFF build byte-inert.
+    Two bugs found+fixed (both would-be silent): (1) chunk_o `scale` — Triton AOT
+    mis-packs an fp32 scalar as C `double` (kernel reads 4 of 8 bytes → garbage), so
+    scale is PINNED to Dk^-0.5 in-kernel and the dispatch guards `args.scale`; (2) the
+    solve_tril `Ai` output — FLA does `zeros_like`, solve_tril writes only the 10
+    lower 16×16 blocks and `recompute_w_u` dots the FULL block, so `Ai` MUST be zeroed
+    (a dirty cudaMallocAsync pool in the busy engine put NaN in the upper triangle →
+    35B batched-graph all-zero tokens; the op test + compute-sanitizer both hand back
+    a CLEAN pool, which is why it slipped there and surfaced only in the 6-request
+    batched gate).
+    GATES (GB10 sm_121a, full Triton WU+delta_h+chunk_o): `test_ops_gdn` 31/31 (new
+    gate-shape cases incl. H=32 multi-seq + tiny-seq T<16 WY) + compute-sanitizer 0
+    errors; 27B greedy gate PASS; 35B greedy single + batched-graph 2/2 (33/33), all
+    through the Triton path.
+    MEASURED (GB10, idle-flocked, 27B NVFP4). Per-kernel (nsys same-binary A/B,
+    in1024/out4 np16, 240 launches/kernel): WU (fused hand `GdnChunkWUWmmaVecKernel`)
+    2204.8 → Triton kkt 286.5 + solve_tril 415.7 + recompute_w_u 722.7 = 1424.9
+    µs/launch = **−35.4%**; chunk_o hand 1729.5 → Triton 1097.7 = **−36.5%**; delta_h
+    hand 1673.9 → Triton 1174.8 = **−29.8%**. **GDN chunk aggregate 5608.2 → 3697.4
+    µs/launch = −34.1% (1.52×)** — the full Triton port (delta_h+chunk_o+WU) cuts a
+    THIRD of GDN chunk-kernel GPU time, taking the ~1.79× GDN-vs-FLA gap down to
+    ~1.18× (the residual is the autotuner's per-shape BK/BV/warps/stages vs our pinned
+    BV=64/w4/s3 — a tuning knob, not structure). E2E (same-binary A/B, 3 reps,
+    non-overlapping arms) vs FRESH graphed vLLM (766.62 conc16 / 1043.17 conc32,
+    same box/config, measured flock-clean by the PR #1 agent minutes earlier — a
+    model+config constant, not code-dependent): conc16/np96 in1024/out128 hand 713.38
+    → Triton 723.82 tok/s (+1.46%), vLLM 766.62 ⇒ **0.930×→0.944×**; conc32/np192
+    hand 856.73 → Triton 876.08 (+2.26%), vLLM 1043.17 ⇒ **0.821×→0.840×**.
+    HONEST VERDICT: the full GDN Triton port (delta_h+chunk_o+WU) is a real, clean,
+    token-exact per-kernel win — −34.1% GDN chunk-kernel GPU time, ~3× the delta_h-
+    alone e2e win — but 27B does **NOT** reach ≥1.0× MVP parity (0.944× conc16 /
+    0.840× conc32). The residual has MOVED OFF GDN: the GDN chunk kernels are now
+    Triton-fast (~1.18× vLLM's autotuned FLA, a BK/BV/warps/stages tuning knob, not
+    structure), so the dominant remaining gap (~5.6% conc16 / ~16% conc32) is the
+    NON-GDN prefill buckets — vLLM's Inductor whole-graph fusion (rmsnorm+quant,
+    silu+quant, run unfused by us; see fusion-architecture + honest-bar notes). GDN
+    Triton was necessary but not sufficient for MVP. Kept default-OFF pending the
+    flip-to-default decision (+ the per-shape AOT-config tune to squeeze the GDN
+    1.18× residual).
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

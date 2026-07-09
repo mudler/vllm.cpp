@@ -2422,13 +2422,17 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     const size_t v1 = static_cast<size_t>(kNB * dk) * sz + static_cast<size_t>(kChunk * kNB) * 4;
     const size_t v2 = static_cast<size_t>(kChunk * dk) * sz;
     const size_t delta_bytes = static_cast<size_t>(dv * dk) * sizeof(float) + (v1 > v2 ? v1 : v2);
-    // REGISTER-tiled delta_h (vt::tile Rung-1): H in accumulator registers, smem
-    // freed for the STEP-2 cp.async ring. Faithful FLA blockdim64 port. Opt-in
-    // VT_GDN_TILE_PIPE=1; requires dk==128 (two K-halves) and dv%BV==0. BV=64
-    // (grid.x=dv/BV, 4 warps/block); the persistent-accumulator restructure is
-    // the real fix for the H-in-smem-starves-the-ring neutral of the prior add-on.
+    // REGISTER-tiled delta_h (vt::tile Rung-1): the running state H lives in WMMA
+    // ACCUMULATOR REGISTERS across the chunk loop (FLA blockdim64's b_h1/b_h2), NOT
+    // in 64 KiB of shared memory — the CUTLASS-style persistent-accumulator GEMM
+    // that frees smem for the cp.async ring below. DEFAULT ON at the gate shape
+    // (dk==128, dv%BV==0, bf16); VT_GDN_TILE_PIPE=0 restores the baseline
+    // GdnChunkDeltaHWmmaKernel for A/B. BV=64 (grid.x=dv/BV, 4 warps/block).
+    // MEASURED (35B NVFP4, in1024/out8, GB10): delta_h 441us baseline ->
+    // 398us reg-no-ring -> 345us reg+ring (0.78x); e2e in1024/out128 conc32 np192
+    // +0.85% total & prefill, TTFT/TPOT lower. Token-exact (test_ops_gdn 423/423).
     const char* tp_env = std::getenv("VT_GDN_TILE_PIPE");
-    const bool tile_pipe = tp_env != nullptr && tp_env[0] == '1' && dk == 128 && (dv % 64 == 0);
+    const bool tile_pipe = (tp_env == nullptr || tp_env[0] != '0') && dk == 128 && (dv % 64 == 0);
     if (tile_pipe) {
       constexpr int BV = 64;
       const int64_t rA0 = static_cast<int64_t>(BV * dk) * sizeof(float);
@@ -2438,23 +2442,18 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       regA = regA > rA2 ? regA : rA2;
       const int64_t rB0 = static_cast<int64_t>(BV * dk) * sz;
       const int64_t rB1 = static_cast<int64_t>(kChunk * BV) * sz;
-      size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
-      // Occupancy-sensitivity probe: pad the smem request to force 1 block/SM
-      // (2->1), the same occupancy a 2-stage cp.async ring would impose. If this
-      // regresses the kernel, the ring is doomed by the occupancy halving.
-      if (const char* pe = std::getenv("VT_GDN_TILE_PIPE_PAD")) {
-        const size_t pad = static_cast<size_t>(std::atoi(pe)) * 1024;
-        if (pad > reg_bytes) reg_bytes = pad;
-      }
+      const size_t reg_bytes = static_cast<size_t>(regA + (rB0 > rB1 ? rB0 : rB1));
       const dim3 grid_reg(static_cast<unsigned>(dv / BV),
                           static_cast<unsigned>(n_seq * hv_n));
       const unsigned reg_block = (BV / kWM) * 32;
       // STEP 2 — cp.async ring (VT_GDN_TILE_PIPE_CPASYNC, default ON for bf16):
       // 2-stage software pipeline over the streamed W/K tiles. bf16 only (the f32
       // ring tiles overflow the 99 KiB opt-in); f32 uses the ring-less reg kernel.
+      // The ring runs at 1 block/SM (its smem halves occupancy vs reg-no-ring's 2
+      // blocks), but the prefetch hides the load-stalls that low occupancy exposes,
+      // netting the 398->345us win. VT_GDN_TILE_PIPE_CPASYNC=0 isolates reg-no-ring.
       const char* ca_env = std::getenv("VT_GDN_TILE_PIPE_CPASYNC");
-      const bool use_ring = (ca_env == nullptr || ca_env[0] != '0') &&
-                            std::getenv("VT_GDN_TILE_PIPE_PAD") == nullptr;
+      const bool use_ring = (ca_env == nullptr || ca_env[0] != '0');
       bool launched = false;
       if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {
         if (use_ring) {

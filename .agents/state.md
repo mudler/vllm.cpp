@@ -1472,3 +1472,27 @@ Same-box, same-workload, graphed (production) vLLM denominator. Total token thro
 fp4 GEMM (flashinfer AutoTuner) while we run a FIXED cutlass config — the exact "don't infer
 at-parity from source" trap. So the 27B's ~16-19% gap MAY be substantially the fp4 GEMM, an
 UNEXAMINED lever. Worth measuring before declaring the 27B at the floor.
+
+## 2026-07-09 — 27B gap MEASURED: it's GDN (~2× slower, f32-vs-bf16), NOT the fp4 GEMM. "Floor" call was 35B-biased.
+
+Investigated the 27B 0.84× gap with vLLM's LLM-API torch profiler (nsys breaks its EngineCore)
++ shape-matched microbenches. DECISIVE:
+- **fp4 GEMM is NOT the lever.** vLLM = flashinfer-AUTOTUNED cutlass (8 tile configs) vs our
+  FIXED 2-way M-dispatch (cuda_matmul_nvfp4_cutlass.cu:243). Shape-matched (M=4096): vLLM only
+  **6.1% faster** aggregate (mlp_down at parity; small-M favors us). fp4 GEMM = 30.6% of 27B
+  prefill → matching it = ~2% prefill e2e. (task #13's "per-shape autotune" is NOT active — a
+  fixed dispatch; overclaim to fix.)
+- **THE 27B LEVER = GDN ~2× slower than vLLM.** OURS 148.5 µs/tok vs vLLM (Triton/FLA) 71.7
+  µs/tok = 2.07× (1.68× core chunk+conv only). GDN ~27% of 27B prefill → **~14% prefill e2e,
+  the biggest lever.** Measured mechanism: **our GDN runs f32 activations (in_proj MatmulF32D
+  output, qwen3_5.cpp:1224; memory-bound chunk kernels) vs vLLM FLA's bf16 → ~2× memory
+  traffic.** Explains why the dense 27B lags but the MoE 35B (GDN smaller share) is at parity.
+- bf16 in_proj: our bf16-OUTPUT matches vLLM (2778/2854µs); the f32-output choice (MatmulF32D)
+  costs ~5-10% (~1.3% prefill). in_proj_qkv N=10240 ~6% slow (cuBLASLt SM80 heuristic pick).
+
+**CORRECTION: the 27B is NOT at the parity floor.** The 2026-07-09 "portable floor" + reassess
+"GDN exhausted" conclusions were 35B-BIASED (GDN is a small share of the MoE 35B). On the dense
+27B, GDN is the dominant lever: **~14% prefill e2e via bf16 GDN I/O** (mirror vLLM's FLA:
+bf16 activations, f32 accum, keep f32 g/beta/state guardrail) + ~2% fp4 autotune + ~1.3% bf16
+in_proj-output = the ~16% 27B gap, GDN-dominated. NEXT: bf16-vs-f32 GDN A/B → full bf16 GDN
+pipeline. This RE-OPENS the GDN front for the 27B. Evidence: dgx /home/mudler/scratch_agent_a562/.

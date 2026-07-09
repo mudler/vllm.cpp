@@ -2459,8 +2459,8 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {
         if (use_ring) {
           constexpr int STAGES = 2;
-          const int64_t rAr = static_cast<int64_t>(BV * 64) * sz;   // halved snapshot / Braw
-          const int64_t rBr = static_cast<int64_t>(BV * dk) * sz;   // Hbf full
+          const int64_t rAr = static_cast<int64_t>(BV * 64) * sizeof(float);  // Hf32(half)/Braw f32
+          const int64_t rBr = static_cast<int64_t>(BV * dk) * sz;             // Hbf full (TD)
           const int64_t tile = static_cast<int64_t>(kChunk * dk) * sz;
           const size_t ring_bytes =
               static_cast<size_t>(rAr + rBr + (int64_t)STAGES * 2 * tile);

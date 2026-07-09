@@ -150,3 +150,10 @@ Development is fully documented under [`.agents/`](.agents/) (canonical index in
 [AGENTS.md](AGENTS.md)): the [gates](.agents/gates.md), the [porting inventory](.agents/porting-inventory.md)
 vs upstream vLLM, the [parity ledger](.agents/parity-ledger.md), the [roadmap](.agents/roadmap.md),
 and the [upstream sync protocol](.agents/upstream-sync.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [`NOTICE`](NOTICE)
+for third-party attributions (this project is a C++ port of the Apache-2.0-licensed
+[vLLM](https://github.com/vllm-project/vllm) and vendors additional components under
+their respective licenses).

@@ -660,10 +660,18 @@ bool FuseSiluQuantEnabled() {
 // k-RMSNorm + partial NeoX RoPE, the last recomputing cos/sin transcendentals in
 // DOUBLE per element/head/layer) collapse into ONE launch that reads a precomputed
 // cos_sin cache — mirror of vLLM's fused_qk_rmsnorm_rope (fla
-// fused_qk_norm_rope.py:95-102, zero in-kernel transcendentals). Default OFF until
-// GPU-gated; VT_FUSE_ATTN_PREAMBLE=1 enables. The fused kernel emits f32 q/k/gate,
-// byte-for-byte the current 4-kernel intermediates (the query stays f32 for
-// PagedAttention), so ON is token-exact vs OFF.
+// fused_qk_norm_rope.py:95-102, zero in-kernel transcendentals). Would save ~4% of
+// prefill (nsys: AttnGateSplit 1.3% + RopeNeox 2.2% + qk-RmsNorm), ~1.8% e2e.
+//
+// DEFAULT OFF — MEASURED NO-GO (GB10, 2026-07-09). The fusion is NOT bit-identical:
+// the gate passthrough is exact, but the RoPE'd q/k differ by ONE f32 ULP because
+// the fused `ni*cs - nih*cs` contracts to a different FMA than the unfused
+// RmsNorm-store + RopeNeox `x*c - y*sn` (pinned by test_ops_attn_preamble). On the
+// 35B (fp8) the deterministic greedy decode is 1-ULP-sensitive and DIVERGES from
+// the shipped (OFF) path within 16 tokens, so ON FAILS the token-exact gate. Do NOT
+// flip the default without making the two paths bit-identical (fragile FMA match)
+// AND re-clearing greedy 16/16-vs-oracle on BOTH models. VT_FUSE_ATTN_PREAMBLE=1
+// enables it for a same-binary A/B only.
 bool FuseAttnPreambleEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_ATTN_PREAMBLE");

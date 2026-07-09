@@ -1695,3 +1695,24 @@ Verification:
   CUDA full-attention skip passed `./build-cuda-agent/tests/test_op_parity -tc="op parity vs upstream
   goldens (CUDA)"`: 1/1 test case passed, 12/12 assertions, with the 35B full-attention layer
   explicitly skipped as CPU-only isolated replay while 35B/27B full-model logits stayed 16/16.
+
+## 2026-07-09 — GDN codegen gap CLOSED via sanctioned Triton AOT (−34%); 27B → 0.944×/0.840×; residual MOVED off GDN
+
+Full GDN chunk trio ported to the sanctioned CUDA-only Triton AOT fast-path (PRs #1+#2, default-OFF,
+byte-inert with VLLM_CPP_TRITON=OFF; token-exact test_ops_gdn 31/31 + 27B/35B greedy 16/16; 2 silent
+bugs caught: chunk_o fp32-scalar-as-double, solve_tril uninit Ai upper-tri). Per-kernel (nsys):
+**WU −35.4%, chunk_o −36.5%, delta_h −29.8%; GDN chunk total −34.1% (1.52×).** The ~1.79× GDN-vs-FLA
+gap → **~1.18×** (GDN essentially at parity with vLLM's autotuned FLA). **This CLOSES the codegen gap
+— the session's central finding — and PROVES the sanction's premise (residual was Triton compiler
+codegen; hand-C++ exhausted).**
+
+**27B e2e vs graphed vLLM (Triton-on): conc16 0.930→0.944×, conc32 0.821→0.840×. NOT yet ≥1.0×.**
+**The residual has MOVED OFF GDN** (GDN now Triton-fast). Dominant remaining: (a) **non-GDN prefill
+fusion** (rmsnorm+quant, silu+quant — vLLM Inductor whole-graph fusion we run unfused); (b) a
+**conc32 concurrency-scaling gap** (0.84× at conc32 vs 0.944× at conc16 — worse scaling, likely
+batching/KV/scheduling, not prefill compute); (c) fp4-GEMM autotune (+5.8% conc32, BUILT,
+VT_FP4_AUTOTUNE, default-OFF pending graph-safety); (d) tune GDN AOT configs (BV/BK/warps/stages) for
+the last ~0.18× of GDN. GDN-Triton was NECESSARY but not SUFFICIENT for MVP parity. NEXT: reassess
+the GDN-Triton-fast 27B to rank the non-GDN residual + diagnose the conc32 scaling gap. PRs kept off
+main while the parallel agent is active. Triton branches: perf/gdn-deltah-triton-aot (#1) +
+perf/gdn-wu-chunko-triton-aot (#2).

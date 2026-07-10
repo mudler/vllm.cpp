@@ -14,9 +14,9 @@ DONE with a one-line outcome + where the full report/branch lives.
 | # | Track | State |
 |---|---|---|
 | A1 | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🔄 agent on dgx |
-| A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | 🔄 agent on dgx |
+| A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
-| A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | 🔄 agent |
+| A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461) — vendored sm_121a artifacts (40 files, byte-deterministic regen), fresh-clone build green with `VLLM_CPP_TRITON_PYTHON=/nonexistent/python`, 27B gate green on vendored cubins |
 | A5 | e2e suites per gates.md (server conformance nightly on dgx etc.) | ☐ next |
 
 ## B. Research tracks (kicked off in parallel, reports due)
@@ -29,6 +29,7 @@ DONE with a one-line outcome + where the full report/branch lives.
 | B4 | llama.cpp CPU | vendor IF proven faster (user criterion) | ✅ research: **our CPU is a single-threaded scalar loop (zero threads!)** — threadpool = 1-wk prerequisite; **compute-in-quant** = the structural fix (~3.3× decode, ~10× prefill on GGUF). 🔄 local Qwen3.5-2B bench = the decision measurement | 
 | B5 | Speculative decoding | MTP + dflash | ✅ **Both gate checkpoints SHIP MTP heads** (bf16, we currently skip `mtp.*` at load!); **DFlash** (block-diffusion drafter, ICML'26) is in-pin WITH published drafts for our exact models + a DGX-Spark community container. Route: MTP k=1 27B → GDN spec path → DFlash. → [spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md) |
 | B6 | Feature parity matrix | the big one-by-one vLLM-feature table (TP/PP/EP, LoRA, multimodal, disagg, pooling, …) — what we have / miss / tier | ✅ **[feature-matrix.md](feature-matrix.md)** — 13 sections, ~80 rows, every row source-verified + carrying its `Spec` delegation link; headline gaps surfaced: `/metrics` (open T0-core debt), async/overlap scheduling (unmet MIRROR obligation, B3), logprobs payload + logit_bias/bad_words API wiring (sampler done, serving not) |
+| B7 | Multimodality + tool calls | image/audio/video route; parallel tool calls | ✅ **the gate checkpoints ARE the VLMs** (full ViT shipped in both — 333 `model.visual.*` tensors we currently DROP at load; no deepstack; interleaved M-RoPE) → vision = a MIRROR obligation. **Our Qwen3 tool parser targets the WRONG format** (Hermes JSON; the shipped template is Qwen3-Coder XML — vLLM serves 27B with `qwen3_coder`) + no reasoning parser + our Jinja engine can't render the shipped template (~10 missing constructs) + tool-result round-trip broken; parallel tool calls otherwise solid (parser/index/grammar/streaming, tested). 6 specs ranked. → [mm-tools-scoping-2026-07-10.md](mm-tools-scoping-2026-07-10.md) |
 
 ## C. T1 queue (from roadmap.md Post-MVP, unchanged priorities)
 

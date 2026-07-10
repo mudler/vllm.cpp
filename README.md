@@ -39,7 +39,11 @@ The full vLLM **V1 engine** runs end-to-end on CPU, ported 1:1 from upstream:
   minja-subset Jinja engine); **tool/function calling** (Hermes/Qwen `<tool_call>`
   parsers, streaming tool-call deltas, `tool_choice` auto/required/named — `auto`
   is *relaxed*: the model may reply in plain text or call a tool, constrained only
-  once it starts a call); **grammars / structured output** (JSON-schema,
+  once it starts a call; ⚠️ the Qwen3.6 gate checkpoints' shipped chat template
+  uses the **Qwen3-Coder XML** tool format and forced `<think>` blocks, which the
+  current Hermes-JSON parsers and template engine do not yet handle — the
+  `qwen3_coder` XML parser + reasoning parser + template-engine extensions are
+  scoped in `.agents/mm-tools-scoping-2026-07-10.md`); **grammars / structured output** (JSON-schema,
   `json_object`, regex, choice, GBNF — a native constrained-decoding engine behind
   vLLM's structured-output seam).
 - **Library packaging** — a stable C ABI (`include/vllm.h`), `libvllm` shared +

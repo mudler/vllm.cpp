@@ -1,0 +1,170 @@
+# Leaf spec: vt CPU threadpool — parallel op dispatch for the CPU backend
+
+**Row:** `QUANT-GGUF-CPU-THREADPOOL` (quantization-matrix.md, leaf of the
+`QUANT-GGUF-COMPUTE` block) · **status:** spike complete, `READY` ·
+**upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
+**parent evidence:** the B4 CPU decision measurement
+([parity-ledger.md L290](../parity-ledger.md#L290)): our CPU path is
+single-threaded scalar loops and trails same-file llama.cpp by 54–75× decode /
+≈1,480× prefill / 2.65× peak RSS on Qwen3.5-2B-UD-Q8_K_XL. The threadpool is
+the PREREQUISITE leaf: ~N_core× on every op before any kernel work, and the
+chunked-GEMM worker loop that `QUANT-GGUF-CIQ-GEMM` reuses.
+
+## Scope
+
+- **In scope:** a `vt::cpu` threadpool (create/park/wake/barrier/atomic chunk
+  counter) ported 1:1 from ggml's CPU threadpool; conversion of the CPU op
+  kernels in `src/vt/cpu/cpu_ops.cpp` to chunked parallel execution, GEMM
+  first (`kMatmul`, `kMatmulBT`), then the row/batch-parallel remainder
+  (norms, activations, attention, GDN, MoE glue); thread-count config
+  (`VLLM_CPP_CPU_THREADS`, default = hardware concurrency) wired through the
+  CPU backend at [cpu_backend.cpp:11](../../src/vt/cpu/cpu_backend.cpp#L11).
+- **Out of scope:** quantized kernels (leaf `QUANT-GGUF-CIQ-GEMM`), loader
+  changes (leaf `QUANT-GGUF-KEEPQ-LOADER`), CUDA paths (untouched), OpenMP
+  (ggml's `GGML_USE_OPENMP` branch is NOT ported — we port the native
+  pthread/atomic pool, one code path), NUMA node distribution (single-node
+  stub; see Risks/decisions).
+- **Dispatch behavior:** every `vt::cpu` kernel keeps its exact per-element
+  math and per-output sequential reduction order; parallelism only partitions
+  OUTPUT elements across threads (each output element is produced by exactly
+  one thread with the same instruction sequence as today), so results are
+  bit-identical to single-thread by construction — same argument as ggml's
+  mul_mat row chunking. `n_threads==1` short-circuits to the current code.
+
+## Upstream chain
+
+All anchors in the pinned local fork `/home/mudler/_git/llama.cpp` @
+`237ad9b96` (the `QUANT-GGUF-COMPUTE` upstream pin; the B4 bench arm ran this
+exact tree with 20 threads).
+
+| Component | Upstream anchor | What it does |
+|---|---|---|
+| Threadpool state | `ggml/src/ggml-cpu/ggml-cpu.c:471-508` | `struct ggml_threadpool` (mutex/cond, atomics `n_graph`, cache-aligned `n_barrier`/`n_barrier_passed`/`current_chunk`, `stop`/`pause`/`abort`, workers, `n_threads`, prio, poll) + per-thread `struct ggml_compute_state` (thread handle, `cpumask`, `ith`) |
+| Spin relax | `ggml-cpu.c:510-530` | `ggml_thread_cpu_relax` (`yield`/`_mm_pause`) per arch |
+| Barrier | `ggml-cpu.c:566-603` | `ggml_barrier`: atomic fetch-add entry, last thread resets and bumps `n_barrier_passed`, spinners relax-wait; seq-cst fences |
+| Chunk counter | `ggml-cpu.c:604-610` | `ggml_threadpool_chunk_set/add` — the shared work-stealing cursor used by mul_mat and flash-attn |
+| Worker loop | `ggml-cpu.c:3024-3101` | `ggml_graph_compute_thread`: per-node loop, `params{ith,nth,wsize,wdata,threadpool}`, barrier per node, abort check |
+| Park/wake | `ggml-cpu.c:3103-3235` | `ggml_graph_compute_thread_ready/_sync`, polling (`poll` rounds then cond-wait), `n_graph` epoch increment as the kick |
+| Pool create/destroy | `ggml-cpu.c:3237-3311`, `:2682-2745` | `ggml_threadpool_new_impl` (workers spawned via `ggml_thread_create` at `:3292`, worker 0 = caller), `ggml_threadpool_free`, pause/resume |
+| Entry point | `ggml-cpu.c:3314-3390` | `ggml_graph_compute`: attach graph/cplan, kick epoch, main thread computes as worker 0, disposable-pool fallback |
+| GEMM chunking policy | `ggml-cpu.c:1245-1443` | `ggml_compute_forward_mul_mat`: `chunk_size` 16 (64 when `nr0==1\|\|nr1==1`), `nchunk0×nchunk1` grid, re-chunk to `nth` when `<nth*4` chunks or NUMA, atomic `current_chunk` work stealing at `:1352-1357` and `:1437-1442` |
+| GEMM chunk worker | `ggml-cpu.c:1155-1243` | `ggml_compute_forward_mul_mat_one_chunk`: 16×16 block tiling inside a chunk, `vec_dot` per output element |
+| Work-size plan | `ggml-cpu.c:2752-2980` | `ggml_graph_plan`: per-op `n_tasks` + `work_size` (+`CACHE_LINE_SIZE*n_threads` padding) — the scratch model our per-call scratch mirrors |
+| Non-GEMM split example | `ggml-cpu/ops.cpp:9070-9126` | flash-attn row chunking: 4×-oversubscribed chunks + `ggml_threadpool_chunk_add` stealing; `:9042-9069` decode KV-split + barrier + partial reduce |
+| NUMA hooks | `ggml-cpu.c:538-560,613-716,2123-2168` | node discovery, `ggml_is_numa()` (disables chunk oversubscription), thread affinity — see Risks/decisions for our stub |
+
+Runtime-trace plan: none needed — CPU dispatch is fully static (no heuristic
+libraries); the B4 `llama-bench` arm already traced the real execution (20
+threads, 99–100% × 20 cores).
+
+## Our baseline
+
+- [src/vt/cpu/cpu_ops.cpp:1](../../src/vt/cpu/cpu_ops.cpp#L1) — **zero
+  threading anywhere**: `MatmulKernel`/`MatmulBTKernel` (`:30-57`) are naive
+  sequential triple loops; all 30 registered CPU kernels (`:999-1066`) are
+  single-thread scalar f32 loops. B4 observed 99–100% of ONE core for the
+  whole run.
+- [src/vt/cpu/cpu_backend.cpp:11](../../src/vt/cpu/cpu_backend.cpp#L11) —
+  `CpuBackend` has no queue state (`CreateQueue` returns a null-handle
+  `Queue`), no thread config, nothing to park/join.
+- [include/vt/ops.h:285](../../include/vt/ops.h#L285) — op registry
+  (`RegisterOp`/`GetOp`) dispatches per `(OpId, DeviceType)`; kernels receive
+  `Queue&` first — the natural place to hang the pool without touching any
+  call site.
+- Tests: [tests/vt/test_ops_matmul.cpp](../../tests/vt/test_ops_matmul.cpp),
+  [tests/parity/test_op_parity.cpp:34](../../tests/parity/test_op_parity.cpp#L34)
+  run all CPU ops single-threaded today; the same binaries are the
+  determinism harness (run at multiple thread counts).
+- Honest gap: measured B4 floor ([parity-ledger.md L290](../parity-ledger.md#L290)) —
+  ours 0.229 t/s prefill / 0.171 t/s decode / 7.43 GiB RSS vs llama.cpp
+  372.65 t/s pp512 / 9.19–12.75 t/s tg / 2.80 GiB on the same file and box.
+
+## Port map
+
+| Upstream (llama.cpp @ 237ad9b96) | Local | Notes / deviations |
+|---|---|---|
+| `ggml-cpu.c:471-530` threadpool + compute_state structs | new `src/vt/cpu/cpu_threadpool.h` | C++ std::atomic re-expression, same fields/alignment annotations; drop `cgraph/cplan` (we dispatch per OP, not per graph — the "graph" is one op call) |
+| `ggml-cpu.c:566-610` barrier + chunk counter | new `src/vt/cpu/cpu_threadpool.cpp` | port 1:1 incl. seq-cst fence discipline and relax-spin |
+| `ggml-cpu.c:3024-3311` worker loop, park/wake epoch, create/free | `cpu_threadpool.cpp` | per-op kick instead of per-graph: `ParallelFor(pool, n_chunks, fn(ith,nth))` wraps {kick epoch, worker 0 = caller, barrier}; polling default `poll` behavior kept |
+| `ggml-cpu.c:1245-1443` mul_mat chunk policy | `cpu_ops.cpp` `MatmulKernel`/`MatmulBTKernel` | same constants: chunk 16 (64 for vector shapes), `nth*4` oversubscription test, atomic stealing; inner 16×16 tiling from `:1155-1243`; per-element K loop byte-identical to today |
+| `ggml-cpu/ops.cpp:9070-9126` row-chunk pattern | `cpu_ops.cpp` non-GEMM kernels | rows = tokens (RmsNorm/SiluAndMul/glue), (head,query) pairs (`AttentionKernel`), sequences (`GdnPrefillKernel`), batch (`GdnDecodeKernel`/conv update), token rows (`MoeRouterTopK`/`MoeCombine`/embedding) |
+| `ggml-cpu.c` `GGML_USE_OPENMP` branches | NOT ported | single native-pthread path; recorded deviation |
+| `ggml-cpu.c:613-716,2123-2168` NUMA | NOT ported (stub `IsNuma()==false`) | GB10 and the x86 bench VM are single-node; revisit with a dual-socket target |
+| n_threads selection (`ggml_threadpool_params_default`, bench `-t 20`) | env `VLLM_CPP_CPU_THREADS`, default `std::thread::hardware_concurrency()` | B4 oracle ran 20/20 threads; default mirrors that operating point |
+
+Pool lifetime: one static pool per process created lazily on first CPU op
+(mirrors ggml's persistent threadpool path, not the disposable per-graph
+fallback), workers parked between ops via the `n_graph` epoch + cond-wait.
+
+## Tests to port
+
+| Upstream test | Local tier / file | Notes |
+|---|---|---|
+| `tests/test-barrier.cpp` (llama.cpp) | T-unit `tests/vt/test_cpu_threadpool.cpp` (new) | barrier stress over repeated parallel ops, mixed chunk counts; port the reach-all-threads assertion shape |
+| `tests/test-thread-safety.cpp` (llama.cpp) | T-unit, same file, reduced | concurrent op submission from one queue is serialized by the pool; full multi-context server case stays with `SERVE-E2E-NIGHTLY` (checked in SKIPPED with reason if not runnable at land time) |
+| (no upstream analogue) determinism A/B | T-unit + T-parity | run the existing op suites ([test_ops_matmul.cpp](../../tests/vt/test_ops_matmul.cpp), [test_op_parity.cpp:34](../../tests/parity/test_op_parity.cpp#L34)) at `VLLM_CPP_CPU_THREADS=1,3,20` — byte-identical outputs required (3 = non-divisor thread count to catch boundary bugs) |
+| existing GGUF engine gates | T-e2e [tests/parity/test_qwen36_gguf_engine.cpp:143](../../tests/parity/test_qwen36_gguf_engine.cpp#L143) | greedy 16/16 must stay token-exact with threads enabled (default on) |
+
+## Gates
+
+1. **Determinism (hard):** all existing CPU ctest suites + op-parity goldens
+   byte-identical at `VLLM_CPP_CPU_THREADS ∈ {1, 3, 20}`; greedy GGUF engine
+   gates 16/16 token-exact vs their existing goldens. Command:
+   `VLLM_CPP_CPU_THREADS=N ctest --test-dir build -L cpu` (and the gguf
+   suite: `ctest -R gguf`).
+2. **Perf floor (B4-anchored, same box/file/recipe as
+   [parity-ledger.md L290](../parity-ledger.md#L290)):** same-binary A/B
+   `VLLM_CPP_CPU_THREADS=1` vs `=20` on the 20-core x86 box, Qwen3.5-2B
+   Q8_K_XL, `vllm-bench --num-prompts 1 --input-len 128 --output-len 32`,
+   ≥2 runs within noise: decode TPOT **≥10×** the single-thread arm
+   (0.171 t/s → ≥1.7 t/s; target ~N_core×), prefill **≥10×**. Record the
+   honest remaining gap vs llama.cpp tg32 12.75 t/s / pp128 339.63 t/s in
+   the ledger (this leaf does NOT close it — compute-in-quant does).
+3. **No-regression:** CUDA gate suites untouched/green (CPU-only change);
+   single-thread mode still available (`=1`) as the debug/fallback path.
+4. **Memory:** peak RSS within +5% of the single-thread arm (pool + per-thread
+   scratch only; no weight-path change in this leaf).
+
+## Dependencies
+
+- None on other leaves (this is the first claimable leaf). `QUANT-GGUF-CIQ-GEMM`
+  depends on THIS row's `ParallelFor`/chunk loop.
+- Hardware: any multi-core box; the gate A/B runs on the same 20-core x86 box
+  as B4 (idle, no GPU lock needed); a GB10 20-Arm-core rerun belongs to
+  `BACKEND-GATE-CPU-LLAMACPP`, not this leaf.
+- Models/data: `Qwen3.5-2B-UD-Q8_K_XL.gguf` (the B4 file) — NOTE: running it
+  from main needs the dense-arch loader path, currently only on the unmerged
+  bench branch; see `QUANT-GGUF-KEEPQ-LOADER` W-row L1 (merge `7c91a42`) or
+  run the A/B from that branch rebased on the leaf, as B4 did.
+- Toolchain: none new (std::thread/atomics; keep `-ffp-contract=off` pinned —
+  bit-identity across compiled loops depends on it, see cpu_ops.cpp:876-881).
+
+## Work breakdown
+
+| W | Row (claim-sized) | Content | Depends |
+|---|---|---|---|
+| W1 | pool core | `cpu_threadpool.{h,cpp}`: struct, barrier, chunk counter, park/wake epoch, create/free, `VLLM_CPP_CPU_THREADS`, `ParallelFor` | - |
+| W2 | GEMM chunking | `MatmulKernel`/`MatmulBTKernel` → mul_mat chunk policy + 16×16 tile worker; determinism A/B on op tests | W1 |
+| W3 | non-GEMM ops | row/batch chunking for RmsNorm family, SiluAndMul/MoeSiluMul, Attention, GdnPrefill/Decode, conv1d, MoE router/combine, embedding, glue/fused-chain | W1 |
+| W4 | gate + ledger | full determinism matrix, B4-recipe A/B, ledger row, matrix/roadmap flip | W2, W3 |
+
+W2 and W3 are parallel-claimable after W1; W4 closes the row.
+
+## Risks/decisions
+
+- **NUMA stub (recorded deviation):** `ggml_is_numa()` gates chunk
+  oversubscription and thread affinity upstream; both dev targets are
+  single-node, so we stub `false` and skip affinity. Revisit only with real
+  dual-socket hardware — not a product call, an environment fact.
+- **No OpenMP path:** one native pool (ggml's non-OpenMP branch) keeps the
+  build dependency-free; upstream keeps both only for platform breadth we
+  don't have yet.
+- **Per-op kick vs per-graph:** ggml amortizes wake-ups across a whole cgraph;
+  we kick per op. Parked-worker wake cost is bounded by the polling window
+  (ggml default polls before cond-wait); if per-op overhead shows up in the
+  gate A/B at small shapes, the recorded fallback is a min-work threshold
+  (`n_chunks==1` → run inline), which preserves determinism.
+- **Determinism is load-bearing** for the whole parity method (goldens,
+  VT_CPU_REF oracle in the sibling leaves): any future kernel change that
+  splits a REDUCTION across threads (not just outputs) must move that op's
+  goldens first — forbidden inside this leaf.

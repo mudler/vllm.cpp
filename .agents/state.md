@@ -2169,3 +2169,33 @@ PASS; `ctest --test-dir build-roadmap-audit --output-on-failure -j 4` PASS
 then execute the SGLang exact-load/corpus preflight without claiming binding
 latency until async streaming lands. In roadmap order, diagnose the online
 gate, spike the nightly, then claim kernel ABI/model factory/GGUF compute leaves.
+
+## 2026-07-10 — `QUANT-GGUF-COMPUTE` split into three READY leaf specs (ROAD-V1-C4 gate)
+
+**What landed (docs-only spike, `CLAIM-QGC-LEAVES`, released):** the umbrella
+`QUANT-GGUF-COMPUTE` row is now a block row over three claim-sized `READY`
+leaves, each with a full spike-gate spec grounded in the pinned llama.cpp
+`237ad9b96` and the B4 decision measurement (parity-ledger.md L290: llama.cpp
+CPU ahead 54–75× decode / ≈1,480× prefill / 2.65× peak RSS on the same GGUF):
+
+- `QUANT-GGUF-CPU-THREADPOOL` — [specs/gguf-cpu-threadpool.md](specs/gguf-cpu-threadpool.md):
+  ggml threadpool/barrier/chunk port into `src/vt/cpu/`, GEMM chunking first;
+  gates = bit-identical determinism at 1/3/20 threads + ≥10× decode on the B4
+  recipe. No dependencies — claim this first.
+- `QUANT-GGUF-CIQ-GEMM` — [specs/gguf-compute-in-quant-gemm.md](specs/gguf-compute-in-quant-gemm.md):
+  tensor-traits compute-in-quant GEMM (activation Q8_0/Q8_K quant + per-type
+  vec_dot) for Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0; portable generic tier → x86/Arm
+  SIMD tiers → repack/interleave tier; final gate = match/beat llama.cpp on
+  decode/prefill/RSS, token-exact vs the same-file oracle.
+- `QUANT-GGUF-KEEPQ-LOADER` — [specs/gguf-keep-quant-loader.md](specs/gguf-keep-quant-loader.md):
+  block-resident weights ([N,K], no transpose), per-tensor routing,
+  `VT_CPU_REF=1` dequant-oracle switch; DECISION recorded: merge bench branch
+  `7c91a42` (B4 loader arm) into main as work row L1.
+
+Matrix: umbrella → `READY` + three new leaf rows (QUANT pin 78→81 in
+check-agent-record.py); roadmap `ROAD-V1-C4` next gate now "claim the
+threadpool leaf". Dequant-to-bf16 stays the parity oracle; compute-in-quant is
+gated against llama.cpp, not against our old path.
+
+**Next:** claim `QUANT-GGUF-CPU-THREADPOOL` (W1 pool core), merge `7c91a42`
+(loader L1), then keep-quant residency + CIQ GEMM tier 0.

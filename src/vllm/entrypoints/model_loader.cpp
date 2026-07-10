@@ -58,34 +58,46 @@ std::vector<vllm::SafetensorsFile> LoadShards(const std::string& model_dir) {
   return shards;
 }
 
+}  // namespace
+
 // Resolve the per-step token budget (max_num_batched_tokens) for chunked
-// prefill. An explicit EngineParams override wins; otherwise use a FIXED bounded
+// prefill. An explicit EngineParams override wins; otherwise a PER-ARCH bounded
 // default that does NOT scale with max_num_seqs, so a long/many-request prefill
 // is split across steps and the per-step GDN chunked-scan activation stays
 // bounded regardless of concurrency (the 27B 8x1024 conc-8 OOM fix — the old
 // max_model_len*max_num_seqs product ran the whole 8192-token prefill in one
-// step). Mirrors vLLM's chunked-prefill relationship: a bounded
-// max_num_batched_tokens (DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048,
-// vllm/config/scheduler.py:42 @ e24d1b24). Invariants mirrored from
-// SchedulerConfig.verify_max_model_len (vllm/config/scheduler.py:87): the budget
-// must be >= max_num_seqs (every running seq needs at least one token/step). For
-// tiny models whose whole workload is smaller than the default we keep the old
+// step).
+//
+//  * DENSE arch (27B W4A4): 2048 FLAT — mirrors vLLM's own scheduler default
+//    (DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048, vllm/config/scheduler.py:42 @
+//    e24d1b24). The dense prefill is expensive per token: at mnbt=8192 one
+//    giant mixed step runs several full prompts' prefill eagerly and every
+//    decode stream stalls behind it (TTFT ~2x, decode starved). MEASURED (27B
+//    NVFP4, GB10, in1024/out128): conc32/np96 mnbt=2048 999.16 tok/s vs 8192
+//    895.90 (+11.5%); the conc16/conc32 default-vs-8192 A/Bs are in
+//    .agents/parity-ledger.md (2026-07-10).
+//  * MoE arch (35B A3B W4A16): keep the GB10-tuned CONCURRENCY-AWARE budget —
+//    8192 at high concurrency (>=32), else 4096. Its cheap A3B expert prefill
+//    wants the bigger chunk: at the 35B gate (conc-64, in1024/out128)
+//    mnbt=8192 is +2.7% over 4096 (itself +8.2% over 2048) — bigger prefill
+//    chunks amortize per-token GEMM/attention work across the many running
+//    seqs. At LOW concurrency 8192 loses pipelining, so those keep 4096.
+//    Memory-safe on GB10's 119GB (35B conc-64 peak 54GB; 16384 OOMs).
+//
+// Invariants mirrored from SchedulerConfig.verify_max_model_len
+// (vllm/config/scheduler.py:87): the budget must be >= max_num_seqs (every
+// running seq needs at least one token/step). For tiny models whose whole
+// workload is smaller than the default we keep the old
 // (max_model_len*max_num_seqs) ceiling so no behavior changes there.
-int ResolveMaxNumBatchedTokens(const EngineParams& params, int max_model_len) {
+int LoadedEngine::ResolveMaxNumBatchedTokens(const EngineParams& params,
+                                             int max_model_len,
+                                             bool is_dense_arch) {
   const int seqs = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
   if (params.max_num_batched_tokens > 0) {
     // Explicit override; still honor the >= max_num_seqs invariant.
     return std::max(params.max_num_batched_tokens, seqs);
   }
-  // GB10-tuned, CONCURRENCY-AWARE default: 8192 at high concurrency (>=32),
-  // else 4096. Measured: at the 35B gate (conc-64, in1024/out128) mnbt=8192 is
-  // +2.7% over 4096 (which is itself +8.2% over 2048) — bigger prefill chunks
-  // amortize per-token GEMM/attention work across the many running seqs. But at
-  // LOW concurrency (27B gate conc-8, np=8) mnbt=8192 is -10% (all 8 prompts
-  // prefill in one step -> no prefill/decode pipelining), so those keep 4096.
-  // Matches vLLM's runtime default (8192) at scale; both are memory-safe on
-  // GB10's 119GB (35B conc-64 peak 54GB, 27B conc-8 peak 56GB; 16384 OOMs).
-  int budget = seqs >= 32 ? 8192 : 4096;
+  int budget = is_dense_arch ? 2048 : (seqs >= 32 ? 8192 : 4096);
   // Never exceed the whole workload's ceiling (tiny-model no-op preservation).
   const long ceiling = static_cast<long>(max_model_len) * seqs;
   if (ceiling > 0 && static_cast<long>(budget) > ceiling) {
@@ -93,8 +105,6 @@ int ResolveMaxNumBatchedTokens(const EngineParams& params, int max_model_len) {
   }
   return std::max(budget, seqs);
 }
-
-}  // namespace
 
 bool LoadedEngine::EnsureNoneHash() {
   // Idempotent: init_none_hash just (re)assigns the NONE_HASH global. Prefix
@@ -159,14 +169,16 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-                     ResolveMaxNumBatchedTokens(params, max_model_len_)),
+                     ResolveMaxNumBatchedTokens(params, max_model_len_,
+                                                IsDenseArch(config_))),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *moe_weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
-              ResolveMaxNumBatchedTokens(params, max_model_len_)),
+              ResolveMaxNumBatchedTokens(params, max_model_len_,
+                                         IsDenseArch(config_))),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
@@ -196,14 +208,16 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-                     ResolveMaxNumBatchedTokens(params, max_model_len_)),
+                     ResolveMaxNumBatchedTokens(params, max_model_len_,
+                                                IsDenseArch(config_))),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *dense_weights_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
-              ResolveMaxNumBatchedTokens(params, max_model_len_)),
+              ResolveMaxNumBatchedTokens(params, max_model_len_,
+                                         IsDenseArch(config_))),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),

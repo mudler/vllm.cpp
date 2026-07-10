@@ -281,3 +281,52 @@ TEST_CASE("loaded_engine: dense 27B arch generates deterministically through the
   CHECK(run1.outputs[0].token_ids == run2.outputs[0].token_ids);
   CHECK(run1.outputs[0].text == run2.outputs[0].text);
 }
+
+TEST_CASE(
+    "loaded_engine: ResolveMaxNumBatchedTokens per-arch default (dense 2048 "
+    "flat, MoE concurrency-aware)") {
+  EngineParams p;
+  const int kBigLen = 262144;  // large max_model_len => the tiny-model ceiling
+                               // (max_model_len*seqs) never binds here.
+
+  // DENSE arch: vLLM's scheduler default 2048, FLAT across concurrency
+  // (DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048, vllm/config/scheduler.py:42 @
+  // e24d1b24).
+  for (int seqs : {8, 16, 32, 64}) {
+    p.max_num_seqs = seqs;
+    CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen,
+                                                   /*is_dense_arch=*/true) ==
+          2048);
+  }
+
+  // MoE arch: GB10-tuned concurrency-aware budget (unchanged behavior).
+  p.max_num_seqs = 8;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, false) == 4096);
+  p.max_num_seqs = 16;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, false) == 4096);
+  p.max_num_seqs = 32;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, false) == 8192);
+  p.max_num_seqs = 64;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, false) == 8192);
+
+  // Explicit override wins for BOTH arches (the CLI --max-num-batched-tokens).
+  p.max_num_seqs = 32;
+  p.max_num_batched_tokens = 8192;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, true) == 8192);
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, false) == 8192);
+  // ... but is still clamped up to the >= max_num_seqs invariant
+  // (SchedulerConfig.verify_max_model_len, vllm/config/scheduler.py:87).
+  p.max_num_seqs = 64;
+  p.max_num_batched_tokens = 4;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, kBigLen, true) == 64);
+
+  // Tiny-model ceiling preservation: whole workload smaller than the default
+  // => budget capped at max_model_len*seqs (no behavior change for the small
+  // synthetic CPU engines).
+  p.max_num_batched_tokens = 0;
+  p.max_num_seqs = 4;
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, /*max_model_len=*/64,
+                                                 true) == 256);
+  CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, /*max_model_len=*/64,
+                                                 false) == 256);
+}

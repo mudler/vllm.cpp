@@ -157,6 +157,8 @@ TEST_CASE("HfConfigFromGguf reads the qwen35moe hparams") {
   const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
 
   CHECK(c.model_type == "qwen35moe");
+  REQUIRE(c.architectures.size() == 1);
+  CHECK(c.architectures[0] == "Qwen3_5MoeForConditionalGeneration");
   CHECK(c.hidden_size == 8);
   CHECK(c.num_hidden_layers == 2);
   CHECK(c.num_attention_heads == 2);

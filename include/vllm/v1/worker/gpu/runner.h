@@ -60,6 +60,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -116,6 +117,13 @@ void apply_grammar_bitmask(
 // The batched paged model runner (upstream GPUModelRunner, T0 slice).
 class GPUModelRunner final : public ModelRunnerBase {
  public:
+  // Generic model-factory path. `model` owns/borrows its concrete weights and
+  // must outlive the runner (LoadedEngine declares it before runner_).
+  GPUModelRunner(const HfConfig& config, LoadedModel& model,
+                 const KVCacheConfig& kv_cache_config, vt::Queue queue,
+                 int max_num_reqs, int max_model_len,
+                 int max_num_batched_tokens);
+
   // Construct the runner over a model (config + weights) and allocate the KV
   // caches from `kv_cache_config` (initialize_kv_cache). `queue` selects the
   // device (CPU at T0; CUDA dgx-pending). The InputBatch is sized from
@@ -163,6 +171,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   int64_t num_blocks() const { return num_blocks_; }
 
  private:
+  // Compatibility path for direct synthetic-weight runner tests. The wrapper
+  // is type-erased but borrows the caller-owned concrete weights.
+  GPUModelRunner(const HfConfig& config,
+                 std::unique_ptr<LoadedModel> owned_model,
+                 const KVCacheConfig& kv_cache_config, vt::Queue queue,
+                 int max_num_reqs, int max_model_len,
+                 int max_num_batched_tokens);
+
   // Allocate the per-full-attn-layer paged KV buffers + the per-GDN-layer
   // persistent mamba ssm/conv buffers from the KVCacheConfig groups.
   void initialize_kv_cache(const KVCacheConfig& kv_cache_config);
@@ -183,11 +199,10 @@ class GPUModelRunner final : public ModelRunnerBase {
                              int num_reqs);
 
   const HfConfig& config_;
-  // Exactly one of {moe_weights_, dense_weights_} is non-null, selecting the MoE
-  // (35B) or dense (27B) forward. Held by pointer (not reference) so the single
-  // runner class carries either arch; both are borrowed (must outlive the runner).
-  const Qwen3_5MoeWeights* moe_weights_ = nullptr;
-  const Qwen3_5DenseWeights* dense_weights_ = nullptr;
+  // Production: model_ borrows LoadedEngine::model_. Direct runner tests use a
+  // small owned adapter that in turn borrows their concrete weights.
+  std::unique_ptr<LoadedModel> owned_model_;
+  LoadedModel* model_ = nullptr;
   vt::Queue queue_;
   InputBatch input_batch_;
   Sampler sampler_;
@@ -224,18 +239,6 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::vector<uint8_t>> conv_buf_;  // per GDN layer (raw bytes)
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
-
-  // Decode CUDA-graph driver (M2.5 Phase 2), created lazily on the first
-  // pure-decode step of an fp4/CUDA model. Captures the decode forward once per
-  // batch shape and replays it per token (mirrors vLLM's decode CUDAGraph
-  // capture). nullptr on CPU / bf16 / when disabled — those keep the eager path.
-  std::unique_ptr<Qwen3_5DecodeGraph> decode_graph_;
-  // 27B DENSE decode CUDA-graph driver, created lazily on the first pure-decode
-  // step of an fp4/CUDA dense model. The dense sibling of decode_graph_; captures
-  // the dense decode forward once per batch shape and replays it per token.
-  // nullptr on CPU / bf16 / when the 27B-specific toggle (VLLM_CPP_DENSE_DECODE_
-  // GRAPH=0) is off — those keep the eager Qwen3_5DenseModel::Forward path.
-  std::unique_ptr<Qwen3_5DenseDecodeGraph> dense_decode_graph_;
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

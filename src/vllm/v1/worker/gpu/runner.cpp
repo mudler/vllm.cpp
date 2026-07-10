@@ -54,22 +54,6 @@ static bool GpuSampleEnabled() {
   return on;
 }
 
-// 27B DENSE decode CUDA-graph toggle (the dense sibling of the 35B MoE decode
-// graph). Default ON: a pure-decode step on the fp4/CUDA dense (27B) model is
-// routed through Qwen3_5DenseDecodeGraph (capture-once/replay-per-token), which
-// removes the per-step host tax (the ~62k synchronous cudaMalloc + serial kernel
-// launches the eager dense decode paid EVERY step). VLLM_CPP_DENSE_DECODE_GRAPH=0
-// restores the eager Qwen3_5DenseModel::ForwardDevice/Forward path (the fallback,
-// and the A/B baseline). Inner capture is additionally gated by VLLM_CPP_CUDAGRAPH
-// (shared with the MoE graph); with it off the driver runs its eager fallback.
-static bool DenseDecodeGraphEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VLLM_CPP_DENSE_DECODE_GRAPH");
-    return e == nullptr || e[0] != '0';
-  }();
-  return on;
-}
-
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
 bool reorder_batch_to_split_decodes_and_prefills(
     InputBatch& input_batch, const SchedulerOutput& scheduler_output,
@@ -266,12 +250,12 @@ std::vector<int> group_block_sizes(const KVCacheConfig& cfg) {
 }  // namespace
 
 GPUModelRunner::GPUModelRunner(const HfConfig& config,
-                               const Qwen3_5MoeWeights& weights,
+                               LoadedModel& model,
                                const KVCacheConfig& kv_cache_config,
                                vt::Queue queue, int max_num_reqs,
                                int max_model_len, int max_num_batched_tokens)
     : config_(config),
-      moe_weights_(&weights),
+      model_(&model),
       queue_(queue),
       input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
                    static_cast<int>(config.vocab_size),
@@ -279,27 +263,44 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
   initialize_kv_cache(kv_cache_config);
-  // Eager Marlin NVFP4 repack (VT_NVFP4_MARLIN=1): repack all experts + dense
-  // shared/lm_head weights at LOAD time so the first request pays no first-touch
-  // repack. No-op on CPU / bf16 / when the gate is off.
-  Qwen3_5Model::PrepareMarlinResident(weights, config, queue_);
+  ModelRegistry::Prepare(*model_, config_, queue_);
 }
+
+GPUModelRunner::GPUModelRunner(const HfConfig& config,
+                               std::unique_ptr<LoadedModel> owned_model,
+                               const KVCacheConfig& kv_cache_config,
+                               vt::Queue queue, int max_num_reqs,
+                               int max_model_len, int max_num_batched_tokens)
+    : config_(config),
+      owned_model_(std::move(owned_model)),
+      model_(owned_model_.get()),
+      queue_(queue),
+      input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
+                   static_cast<int>(config.vocab_size),
+                   group_block_sizes(kv_cache_config),
+                   group_block_sizes(kv_cache_config)) {
+  max_num_reqs_ = max_num_reqs;
+  initialize_kv_cache(kv_cache_config);
+  ModelRegistry::Prepare(*model_, config_, queue_);
+}
+
+GPUModelRunner::GPUModelRunner(const HfConfig& config,
+                               const Qwen3_5MoeWeights& weights,
+                               const KVCacheConfig& kv_cache_config,
+                               vt::Queue queue, int max_num_reqs,
+                               int max_model_len, int max_num_batched_tokens)
+    : GPUModelRunner(config, BorrowQwen3_5MoeLoadedModel(weights),
+                     kv_cache_config, queue, max_num_reqs, max_model_len,
+                     max_num_batched_tokens) {}
 
 GPUModelRunner::GPUModelRunner(const HfConfig& config,
                                const Qwen3_5DenseWeights& weights,
                                const KVCacheConfig& kv_cache_config,
                                vt::Queue queue, int max_num_reqs,
                                int max_model_len, int max_num_batched_tokens)
-    : config_(config),
-      dense_weights_(&weights),
-      queue_(queue),
-      input_batch_(max_num_reqs, max_model_len, max_num_batched_tokens,
-                   static_cast<int>(config.vocab_size),
-                   group_block_sizes(kv_cache_config),
-                   group_block_sizes(kv_cache_config)) {
-  max_num_reqs_ = max_num_reqs;
-  initialize_kv_cache(kv_cache_config);
-}
+    : GPUModelRunner(config, BorrowQwen3_5DenseLoadedModel(weights),
+                     kv_cache_config, queue, max_num_reqs, max_model_len,
+                     max_num_batched_tokens) {}
 
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   num_blocks_ = kv_cache_config.num_blocks;
@@ -515,10 +516,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // path is on (prefill/mixed) or pure-decode, else the full
   // [num_actual_tokens, vocab] (VT_LOGITS_GATHER=0).
   //
-  // DECODE CUDA-GRAPH path (M2.5): a PURE-DECODE step (every request one token,
-  // no prefill) on an fp4/CUDA model is routed through the Qwen3_5DecodeGraph,
-  // which captures the forward once per PADDED batch size and replays it per
-  // step. The graph's real-row output is bit-identical to Forward.
+  // DECODE CUDA-GRAPH path (M2.5): the registered model forward routes a
+  // PURE-DECODE fp4/CUDA step through its model-specific graph, whose state now
+  // lives behind LoadedModel. It captures once per padded batch size and
+  // replays per step; real-row output remains bit-identical to eager Forward.
   //
   // BATCHED (num_reqs>1) — the gate-#1 lever: at conc-64 kernel-launch overhead
   // is ~24% of the decode wall (~1.4k cudaLaunchKernel/step -> 1 cudaGraphLaunch).
@@ -527,22 +528,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // compilation/cuda_graph.py); the padded rows are inert (BuildPaddedDecode).
   // The decode forward is row-independent, so padding cannot perturb the real
   // rows. Beyond 64 (kMaxDecodeGraphBatch) / prefill / mixed / bf16 / CPU stay
-  // eager. The DENSE (27B) fp4 model has its OWN decode graph (dense_decode_
-  // graph_, the sibling of decode_graph_) under the same gate.
+  // eager. The DENSE (27B) registration owns its sibling decode graph under the
+  // same gate.
   const bool pure_decode = attn_meta.num_actual_tokens == num_reqs &&
                            gdn_meta.num_prefill_tokens == 0;
-  const bool fp4_cuda = queue_.device.type == vt::DeviceType::kCUDA &&
-                        moe_weights_ != nullptr &&
-                        !moe_weights_->layers.empty() &&
-                        !moe_weights_->layers.front().moe.expert_gate_fp4.empty();
-  // Dense (27B) fp4/CUDA gate — the sibling of fp4_cuda for the dense decode
-  // graph. True when the dense MLP projections are fp4-resident (the real 27B
-  // CUDA load); the synthetic CPU tests leave them empty and stay eager.
-  const bool fp4_cuda_dense = queue_.device.type == vt::DeviceType::kCUDA &&
-                              dense_weights_ != nullptr &&
-                              !dense_weights_->layers.empty() &&
-                              !dense_weights_->layers.front().mlp.gate_proj_fp4.Empty();
-  constexpr int kMaxDecodeGraphBatch = 64;  // largest captured size
   // Gather-before-lm_head indices (the SAME last-token rows sample_tokens uses).
   // Empty when the toggle is off → old full-logits path. The eager forwards skip
   // the gather when it is a no-op (pure decode: len == num_actual_tokens).
@@ -550,67 +539,26 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   const std::vector<int32_t> kNoGather;
   const std::vector<int32_t>& gather_li = gather ? step.logits_indices : kNoGather;
 
-  // Wrap a full [T,vocab] HOST logits vector (the VT_LOGITS_GATHER=0 opt-out) as a
-  // ForwardLogits::host — sample_tokens re-gathers the per-request rows on host.
-  auto host_logits = [&](std::vector<float>&& h) {
-    ForwardLogits fl;
-    fl.vocab = config_.vocab_size;
-    fl.rows = fl.vocab > 0 ? static_cast<int64_t>(h.size()) / fl.vocab : 0;
-    fl.host = std::move(h);
-    return fl;
-  };
-
   // THE FORWARD. DEFAULT (gather ON): the *Device entry points keep the
   // [num_reqs,vocab] logits ON DEVICE and hand them to the sampler with no
   // full-logits D2H. VT_LOGITS_GATHER=0: the host Forward returns full
   // [T,vocab] logits and sample_tokens re-gathers on host (unchanged path).
-  ForwardLogits logits;
-  if (dense_weights_ != nullptr) {
-    // DENSE arch (27B). A PURE-DECODE fp4/CUDA step is routed through the dense
-    // decode CUDA-graph (capture-once/replay-per-token) under the SAME gate as
-    // the 35B MoE graph — removing the per-step host tax (the ~62k synchronous
-    // cudaMalloc + serial kernel launches the eager dense decode paid EVERY
-    // step). VLLM_CPP_DENSE_DECODE_GRAPH=0 restores the eager path (fallback +
-    // A/B baseline). Prefill / mixed / bf16 / CPU / >64 stay eager.
-    if (DenseDecodeGraphEnabled() && pure_decode && fp4_cuda_dense &&
-        num_reqs <= kMaxDecodeGraphBatch) {
-      if (!dense_decode_graph_) {
-        dense_decode_graph_ = std::make_unique<Qwen3_5DenseDecodeGraph>(
-            *dense_weights_, config_, queue_, gdn_state_slots_);
-      }
-      // Device-resident [num_reqs,vocab] (one row/request in request order); the
-      // gather toggle is a no-op for pure decode (T==num_reqs).
-      logits = dense_decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
-                                         attn_kv_, gdn_state_);
-    } else {
-      // Eager paged dense forward. Same paged KV/GDN-state machinery, dense
-      // SwiGLU MLP in place of the MoE block.
-      logits = gather
-                   ? Qwen3_5DenseModel::ForwardDevice(
-                         token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                         gdn_state_, *dense_weights_, config_, queue_, gather_li)
-                   : host_logits(Qwen3_5DenseModel::Forward(
-                         token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                         gdn_state_, *dense_weights_, config_, queue_, gather_li));
-    }
-  } else if (pure_decode && fp4_cuda && num_reqs <= kMaxDecodeGraphBatch) {
-    if (!decode_graph_) {
-      decode_graph_ = std::make_unique<Qwen3_5DecodeGraph>(
-          *moe_weights_, config_, queue_, gdn_state_slots_);
-    }
-    // Decode graph output is device-resident [num_reqs,vocab] (one row/request in
-    // request order); the gather toggle is a no-op for pure decode (T==num_reqs).
-    logits = decode_graph_->Step(token_ids, positions, attn_meta, gdn_meta,
-                                 attn_kv_, gdn_state_);
-  } else {
-    logits = gather
-                 ? Qwen3_5Model::ForwardDevice(
-                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                       gdn_state_, *moe_weights_, config_, queue_, gather_li)
-                 : host_logits(Qwen3_5Model::Forward(
-                       token_ids, positions, attn_meta, gdn_meta, attn_kv_,
-                       gdn_state_, *moe_weights_, config_, queue_, gather_li));
-  }
+  ModelForwardInput forward_input{
+      .token_ids = token_ids,
+      .positions = positions,
+      .attn_meta = attn_meta,
+      .gdn_meta = gdn_meta,
+      .attn_kv = attn_kv_,
+      .gdn_state = gdn_state_,
+      .config = config_,
+      .queue = queue_,
+      .logits_indices = gather_li,
+      .num_reqs = num_reqs,
+      .gdn_state_slots = gdn_state_slots_,
+      .pure_decode = pure_decode,
+      .gather_logits = gather,
+  };
+  ForwardLogits logits = ModelRegistry::Forward(*model_, forward_input);
 
   // Stash for sample_tokens (upstream ExecuteModelState).
   exec_state_.num_actual_tokens = scheduler_output.total_num_scheduled_tokens;

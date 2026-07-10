@@ -209,7 +209,11 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
 
   HfConfig c;
   c.model_type = arch;
-  c.architectures = {arch};
+  // `general.architecture` is llama.cpp's GGUF family key, not the HuggingFace
+  // model-class ID consumed by vLLM's ModelRegistry. This loader implements the
+  // Qwen3.5 MoE wrapper, so expose its canonical registered architecture while
+  // retaining the GGUF key in model_type for metadata lookup.
+  c.architectures = {"Qwen3_5MoeForConditionalGeneration"};
 
   c.hidden_size = ReqInt(gguf, p + "embedding_length");
   const int64_t block_count = ReqInt(gguf, p + "block_count");

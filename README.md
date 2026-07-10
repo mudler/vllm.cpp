@@ -492,6 +492,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   are absent from both leak inventories and all server lifecycle returns pass.
   This component win does not close the full-grid vLLM throughput/host-memory
   gate.
+- **Local RTX 5070 Ti / sm_120 status:** `Qwen/Qwen3.5-4B` now loads ordinary
+  BF16 weights and runs end-to-end in the Nix CUDA shell. This is **not parity
+  qualified**: only 9/16 greedy sequences match vLLM with Triton AOT (10/16 with
+  hand GDN kernels). On the exact 128-request, concurrency-32, 1024-in/128-out,
+  temperature-1 workload, three-run means are **1,086.92 tok/s vs vLLM 6,679.72
+  (0.163×)**. Nsight attributes **81.7% of project GPU time** to the serial
+  full-vocabulary `RandomSampleKernel`; replacing it with a parallel reduction
+  is the first local performance lever. A project-only greedy diagnostic reaches
+  **5,754.92 tok/s** (5.30× faster), but is still only **0.862×** the recorded
+  vLLM temperature-1 result; this cross-mode ratio is diagnostic, not parity.
+  Persistent KV/GDN caches are now true device allocations on discrete GPUs,
+  eliminating the prior HMM/UVM migration path; sustained runs and both engine
+   traces completed without Xid/UVM faults.
 - **CPU status:** the native threadpool and chunked op dispatch pass the complete
   suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
   speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS

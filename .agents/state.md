@@ -6393,3 +6393,20 @@ Verification: focused CUDA suites passed (`test_qwen27_dense_forward` 5/5,
 `test_ops_gdn` 31/31). The full CPU build succeeds; CTest is 91/92 because the
 existing `test_op_parity` registry has no runner for `qwen36_gguf_greedy`.
 Excluding that unrelated case, 91/91 tests pass.
+
+## 2026-07-10 — local Qwen3.5-4B greedy throughput diagnostic
+
+Repeated the exact local 128-request, concurrency-32, 1024-input/128-output,
+mnbt-2048 workload with vllm.cpp `--temperature 0`, preserving the sm_120
+Triton-AOT build, all three GDN AOT toggles, 1,280 cache blocks, and the 1,024
+MiB device-pool ceiling. Three runs produced 5,753.30 / 5,754.45 / 5,757.01
+total tok/s (mean 5,754.92) and 639.26 / 639.38 / 639.67 output tok/s (mean
+639.44). Pool peak was 954.87 MiB with zero evictions in every run.
+
+Greedy is 5.30x faster than the same project's temperature-1 mean (1,086.92),
+confirming that the serial full-vocabulary `RandomSampleKernel` caused most of
+that collapse. It does not reach the recorded production-vLLM temperature-1
+mean of 6,679.72 total / 742.19 output tok/s: the deliberately cross-mode ratio
+is 0.8616x. This is not an accepted comparison because sampling differs, but it
+shows that bypassing the sampler leaves a reproducible roughly 14% local
+model/runtime throughput gap rather than putting this model at parity.

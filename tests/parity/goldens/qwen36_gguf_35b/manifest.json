@@ -1,0 +1,52 @@
+{
+ "op": "qwen36_gguf_greedy",
+ "oracle": {
+  "engine": "llama.cpp fork (dgx.casa ~/llama-phase93-qwen3next-gqa-bcast, arch qwen35moe, CUDA -ngl 99)",
+  "invocation": "llama-server -m <apex.gguf> -ngl 99; POST /completion {prompt, n_predict:16, temperature:0, top_k:1, cache_prompt:false, return_tokens:true, n_probs:5}; prompt ids via POST /tokenize",
+  "date": "2026-07-10",
+  "note": "Greedy continuations of DECISIVE prompts from the SAME GGUF file. The oracle must load the SAME weights: the APEX GGUFs are k-quant re-quantizations of the 35B base weights, so the safetensors-NVFP4 goldens are NOT the reference (APEX-Balanced legitimately diverges from the NVFP4 continuation at token 7 in the oracle itself). Both APEX files produce IDENTICAL continuations for these two prompts, and the oracle's per-step top-2 logprob margins are healthy (eiffel min 0.15 [Balanced pos 5] / 0.28 [Compact pos 6]; count min 1.91), so greedy agreement is well-defined across engine numerics (ours: dequant->bf16 + bf16 GEMMs, mirroring vLLM's GGUF recipe; oracle: native quantized ggml kernels).",
+  "m0_prompt_tie_disclosure": "The M0-exit prompt ('The capital of France is Paris, and the') is NOT gated for GGUF: the oracle's own top-2 at the first generated token are a near-tie (' capital' -1.8802 vs ' official' -1.9200, margin 0.040), and our engine legitimately takes the other branch. Loader correctness was verified weight-level instead: every GGUF tensor family cross-checked against the safetensors checkpoint ground truth (norm +1 inversions, ssm_a/dt_bias/conv1d V-head reorders EXACT to 0.0; quantized families corr>=0.9927 with the documented reorder/transpose transforms)."
+ },
+ "args": {
+  "prompts": {
+   "eiffel": "The Eiffel Tower is located in the city of",
+   "count": "1, 2, 3, 4, 5, 6, 7, 8,"
+  },
+  "n_greedy": 16,
+  "files": [
+   "Qwen3.6-35B-A3B-APEX-Compact.gguf (F32+Q3_K+Q4_K+Q6_K)",
+   "Qwen3.6-35B-A3B-APEX-Balanced.gguf (F32+Q8_0+Q5_K+Q6_K)"
+  ],
+  "note": "both files share identical oracle continuations for these prompts"
+ },
+ "tensors": {
+  "eiffel_prompt_ids": {
+   "file": "eiffel_prompt_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    10
+   ]
+  },
+  "eiffel_greedy_ids": {
+   "file": "eiffel_greedy_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ]
+  },
+  "count_prompt_ids": {
+   "file": "count_prompt_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    23
+   ]
+  },
+  "count_greedy_ids": {
+   "file": "count_greedy_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    16
+   ]
+  }
+ }
+}

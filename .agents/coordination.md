@@ -86,6 +86,15 @@ implementation supported.
 All agents use the shared protocol at
 `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`.
 
+**When the lock applies (user-directed 2026-07-10):** there is no external GPU
+contention on dgx (the LocalAI worker stays stopped during work) — the flock is
+purely the INTER-AGENT mutex. It is REQUIRED whenever more than one agent or
+queued job may execute GPU work in the same window (any moment coordination.md
+lists 2+ GPU-capable claims, or a queue exists). A sole GPU owner may run
+lock-free after verifying the GPU is idle (`nvidia-smi` shows no compute
+process); benchmark/A-B validity still requires an uncontended GPU either way —
+that invariant is about measurement, not locking.
+
 | Work | Lock rule |
 |---|---|
 | Compile, sync files, inspect source, `ps`/`nvidia-smi` | No GPU lock needed |

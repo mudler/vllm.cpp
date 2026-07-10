@@ -128,5 +128,8 @@ plain text until the spike exists.
 
 - Every perf claim: same-box A/B vs the reference, token-exact gated, fresh
   denominators (benchmark-protocol.md). Vendoring needs a MEASURED win first
-  (B4 criterion). Sub-agents on shared GPUs use the flock mutex at `/tmp/gpu`
-  per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`.
+  (B4 criterion). Sub-agents use the flock mutex at `/tmp/gpu`
+  per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md` only when
+  2+ agents may run GPU work concurrently (no external contention exists; sole
+  owner verified idle via `nvidia-smi` runs lock-free; benchmark series always
+  need an uncontended GPU).

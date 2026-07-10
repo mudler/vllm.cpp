@@ -75,7 +75,10 @@ commit; record gaps honestly as `ANCHOR-BACKFILL` or `PARTIAL`.
 Parallel work is coordinated through `.agents/coordination.md`. A sub-agent
 claims stable row IDs there before editing, uses an isolated worktree/branch,
 and owns only the listed files/rows. GPU execution is serialized with
-`flock /tmp/gpu` per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`;
+`flock /tmp/gpu` per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`
+WHEN multiple agents may run GPU work concurrently — there is no external
+contention on dgx, so a sole GPU owner (verified idle via `nvidia-smi`) may run
+lock-free; benchmark series always need an uncontended GPU regardless;
 an A/B or profile series holds one lock for the whole series. When every row in
 an execution block is `DONE`, move the block plan/report to
 `.agents/completed/` in the closing change. Permanent support matrices retain

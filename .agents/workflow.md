@@ -75,7 +75,7 @@ and false closure commits are rejected.
 ## Practicalities
 
 - Long CUDA builds/benchmarks run on `dgx.casa` over SSH; each claim gets its
-  own `~/work/<claim>/` directory. Gate all GPU execution on `flock /tmp/gpu`
+  own `~/work/<claim>/` directory. Gate GPU execution on `flock /tmp/gpu` whenever 2+ agents may run GPU work in the window (sole owner verified idle via `nvidia-smi` may skip; benchmarks still need an uncontended GPU)
   and hold one lock across a whole A/B/profile sequence, following
   `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
   read-only `nvidia-smi`, and file transfer do not need the lock. Specs/models:

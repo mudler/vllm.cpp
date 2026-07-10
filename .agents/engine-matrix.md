@@ -20,11 +20,11 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
 | Speculative decoding | 6 | 0 | 0 | 0 | 3 | 1 | 0 | 2 |
-| Serving, API, CLI, library | 17 | 3 | 2 | 0 | 1 | 1 | 0 | 10 |
+| Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 2 | 0 | 10 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **90** | **9** | **17** | **0** | **7** | **2** | **2** | **53** |
+| **Total** | **90** | **9** | **17** | **0** | **6** | **3** | **2** | **53** |
 
 ## Engine core and scheduling
 
@@ -131,7 +131,7 @@ claims it.
 | `SERVE-STREAM-USAGE` | Stream options and include-usage payload | T1 | `vllm/entrypoints/openai/chat_completion/protocol.py:214,731-735` | - | - | `planned: specs/stream-options.md` | `INVENTORIED` | - |
 | `SERVE-UTILITY-ENDPOINTS` | Tokenize, detokenize, ready, ping, server info, prefix reset | T1 | `vllm/entrypoints/serve/tokenize/api_router.py:37,63`; `vllm/entrypoints/serve/sagemaker/api_router.py:48`; `vllm/entrypoints/serve/dev/server_info/api_router.py:43`; `vllm/entrypoints/serve/dev/cache/api_router.py:20` | - | - | `planned: specs/utility-endpoints.md` | `INVENTORIED` | - |
 | `SERVE-CHAT-TEMPLATE` | Bounded Qwen3.6 Jinja/minja-style chat templates | T0 | `vllm/renderers/hf.py:673,986`; `vllm/entrypoints/chat_utils.py:1248,1335` | `src/vllm/entrypoints/chat_template.cpp:1133,1173,1186` | `tests/vllm/entrypoints/test_chat_template.cpp:60,79,206,236` | `planned: specs/chat-templating.md` | `ANCHOR-BACKFILL` | - |
-| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API; re-promoted T1→T0 2026-07-10: `SERVE-GATE-ONLINE` found the example server runs the engine synchronously per request with precomputed SSE (`include/vllm/entrypoints/openai/serving_completion.h:9-12`), making TTFT/TPOT/ITL structurally unmeasurable — this row BLOCKS roadmap order 0 (`ROAD-V1-A`) | T0 | `vllm/v1/engine/async_llm.py:70`; `vllm/v1/engine/output_processor.py:45` | - | - | [async-serving.md](specs/async-serving.md) | `READY` | - |
+| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API; re-promoted T1→T0 2026-07-10: `SERVE-GATE-ONLINE` found the example server runs the engine synchronously per request with precomputed SSE (`include/vllm/entrypoints/openai/serving_completion.h:9-12`), making TTFT/TPOT/ITL structurally unmeasurable — this row BLOCKS roadmap order 0 (`ROAD-V1-A`) | T0 | `vllm/v1/engine/async_llm.py:70`; `vllm/v1/engine/output_processor.py:45` | - | - | [async-serving.md](specs/async-serving.md) | `ACTIVE` | `CLAIM-SERVE-ASYNC-W2-1` |
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143-217`; `src/capi/vllm_c.cpp:133-348` | `tests/capi/test_capi.cpp:320,428,505`; `tests/capi/test_dlopen.cpp:60`; C11 header compile | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |

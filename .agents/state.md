@@ -2507,3 +2507,20 @@ Closure therefore requires current-main integration, artifact regeneration and
 drift-contract updates, assertable dispatch/reuse tests, nsys of vLLM and ours,
 and fresh same-workload performance/correctness denominators. No PR3 row moved
 state in this recovery change.
+
+## 2026-07-10 — crash recovery resumed roadmap order 0 through AsyncLLM W2
+
+The canonical record was reconciled after the host crash: recovery commit
+`80975be` preserves both the stopped-stream evidence and remote
+`BACKEND-ABI-VT` W0 claim `39c8b56`; `scripts/check-agent-record.py` plus all
+13 mutation tests are green.
+The dgx serving campaign survived under its original whole-series GPU lock;
+PR3's queued jobs and the C1/C3/C4 implementation worktrees also survived.
+
+`SERVE-ASYNC-LLM` is now `ACTIVE` under `CLAIM-SERVE-ASYNC-W2-1` in isolated
+worktree `/home/mudler/_git/vllm.cpp-async-llm-w2`. Scope is exactly W2 from
+[async-serving.md](specs/async-serving.md): AsyncLLM/output collector, live
+completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
+ported W2 tests. W3 async scheduling/runner work remains outside this claim.
+CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
+GPU handoffs rather than speculative closure.

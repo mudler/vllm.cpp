@@ -2416,3 +2416,19 @@ A/B, fresh same-box vLLM or backend-native floor, throughput/latency/memory,
 speed-sensitive milestone is not stacked until the first checkpoint is
 recorded. Hardware deferral means `GATING` plus a reproducible handoff, never
 an unmeasured `DONE` claim.
+
+## 2026-07-10 — expert-streaming workflow recovered for grounding repair
+
+The expert-streaming map/verify workflow completed its source maps and two
+adversarial verification passes, but its writer hit the session limit before
+landing corrections. Live-source review confirms that the capacity-regime and
+NVMe bandwidth math remain useful, while the accepted draft is not yet an
+implementation contract: the GB10 Marlin kernel indexes one dense contiguous
+expert base by stride rather than following the draft's pointer table; original
+per-expert NVFP4 tensors are repacked once into that dense layout and freed;
+the safetensors reader exposes mmap spans but does not retain public shard/file
+offset metadata for later pread; and router-selected IDs remain device-side,
+making miss discovery, graph capture, and synchronization explicit design
+work. `ENG-EXPERT-STREAM` therefore moved `READY -> SPIKE` under
+`CLAIM-EXPSTREAM-GROUND-1`. No implementation starts until the port map,
+dependencies, tests, gates, and claim-sized WBS match those facts.

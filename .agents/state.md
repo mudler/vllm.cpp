@@ -2483,3 +2483,27 @@ W2 bank/reader/pread (with its own build/startup/RSS checkpoint), W3 phase-1
 decode (token/memory/off-path/performance gates), then W4 chunked prefill and W5
 locality. Any resident/missing overlap is a new W6 spike after W3 evidence.
 `ENG-EXPERT-STREAM` is READY for W0, not implemented or supported.
+
+## 2026-07-10 — stopped serving and PR3 streams recovered from their worktrees
+
+Root took over `CLAIM-SERVE-GATE-1` and `CLAIM-PR3` without discarding their
+existing remote jobs or evidence. On `dgx.casa`, the completed 35B exact-shape
+sanitizer diagnostic survived all three repetitions and reported no sanitizer
+errors. The second online campaign now owns `/tmp/gpu` for one uninterrupted
+27B ours→vLLM series; ours c1/c2 repetitions are complete and c4 is active.
+Fresh 27B vLLM and both 35B arms remain, so this is progress evidence, not a
+gate result. The first campaign remains invalid diagnostic evidence. The
+every-axis online gate still depends on `SERVE-ASYNC-LLM`, because the current
+server cannot expose genuine TTFT/TPOT/ITL.
+
+The PR3 takeover is grounded in local
+`/home/mudler/_git/vllm.cpp-pr3-validate` and DGX
+`~/work/vllm.cpp-noPy`, both at PR head `85dfb48`. Existing `test_ops_gdn`,
+two-model greedy and scratch-pool A/B jobs remain queued behind the serving
+lock, but they are explicitly preliminary. Review found that the branch has no
+vendored BF16 `gdn_chunko_*` artifacts or MANIFEST entries and its tests do not
+assert Triton dispatch or dirty-buffer reuse; it also predates current main.
+Closure therefore requires current-main integration, artifact regeneration and
+drift-contract updates, assertable dispatch/reuse tests, nsys of vLLM and ours,
+and fresh same-workload performance/correctness denominators. No PR3 row moved
+state in this recovery change.

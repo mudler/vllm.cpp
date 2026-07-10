@@ -1854,3 +1854,43 @@ FA2 `flash_fwd_splitkv` (CUDA C++ dep — carries its pipelining; NOT hand-match
 which measured negative on GDN). (2) bf16-out chunk_o AOT variant → re-flip
 gdn-out-bf16 (+ the old +0.8% traffic win). (3) bf16-q preamble→attention
 (vLLM-faithful; attention dispatch already accepts bf16 q; numerics-gated).
+
+## 2026-07-10 — 🎯 27B MVP THROUGHPUT GATE PASSED: FA-2 prefill resurrected (1.0072×/1.0071× vs fresh graphed vLLM) — the last named lever, closed
+
+**THE HEADLINE.** The row-283 remainder ("prefill attention kernel, ours ≈5× FA-2")
+is closed by resurrecting the shelved FA-2 vendored port CORRECTLY. 27B at
+in1024/out128, fresh same-hour graphed denominators (GM0.5, random, range-ratio 0):
+**conc16/np96 764.28 vs 758.84 = 1.0072× (7 reps, 6/7 ≥1.0, worst 0.9960);
+conc32/np192 1051.24 vs 1043.86 = 1.0071× (5/5 reps ≥1.0).** Output tok/s 1.0068×
+both; TTFT 1750/2440 (prior best 1804/2500); TPOT 175.1/255.6 (prior 177.2/255.7).
+35B spot conc64/np200: 3346.8 mean = 1.020× vs pinned 3282 (FA-2 verified inert on
+the 35B). **Both gate models now measure ≥1.0× total throughput at their MVP
+operating points with token-exact gates green.**
+
+**WHY THE OLD FA-2 WAS SHELVED, AND WHAT CHANGED.** Ledger rows 188/190: the
+vendored kernel was 3.4× FASTER per-kernel, but e2e −4.3% because (a) the wiring
+bridged our f32 q/out with f32↔bf16 CAST kernels (+ per-call cudaMallocAsync),
+which erased the win; (b) the launcher did a per-layer D2H+sync for max_seqlen_q/k
+(the exact drain query_start_loc_host later removed for the WMMA path); (c) at the
+time the engine was believed idle/GDN-bound so the lever was deprioritized. The
+resurrection (branch `perf/fa2-prefill-27b`): natively-bf16 end to end — the fused
+preamble emits bf16 q/k (gate stays f32; mixed-dtype AttnQkNormRopeGate, every
+moved rounding = the same RN round CastBf16 did, bit-identity PINNED by tests),
+attention out is bf16 into a templated SigmoidGateBf16, bf16 k feeds the KV-write
+directly; sync-free via query_start_loc_host + new PagedAttentionArgs::max_seq_len;
+softmax_lse pooled; num_splits pinned 1 (vLLM's own FA-2 varlen contract,
+flash_attn_interface.py:309; the combine kernel is batched-addressed and unsound
+for ragged varlen). Kernel A/B: **475.25→129.18 ms per profile window = 3.68×**
+(~1.81→0.49 µs/tok/layer at our T≤2048 chunks; vLLM's 0.25 was at T=4096).
+
+**DEFAULTS.** VLLM_CPP_FLASH_ATTN now default ON (builds when CUTLASS present,
+sm_12xa); VT_FA2_PREFILL default ON when compiled (=0 → WMMA, same-binary A/B).
+Eligibility: prefill segment && head_dim 256 && bf16 q/KV/out only — decode and
+the 35B (f32 q) are untouched by construction. Gates: 27B greedy engine PASS ON
+and OFF (same tie branch), chunked==one-shot holds with FA-2 engaging, FA-2 op
+parity max|err| 5.8e-3, host-metadata vs fallback bit-identical, 35B PASS.
+
+**FLAGGED (pre-existing, NOT this branch):** `test_ops_fused_chain` fails on
+PRISTINE main 08c3825 clean-built with the same flags (CPU Tier-1 vs golden
+RmsNorm, h={7,127,128,512}) — earlier "91/91" runs were on stale incremental
+builds ("incremental build masks" memory). Needs a separate fix on main.

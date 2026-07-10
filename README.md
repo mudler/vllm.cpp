@@ -10,14 +10,13 @@ C API, an example CLI, and an OpenAI-compatible server.
 > full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
 > **token-exact greedy gates passing**, and throughput is measured against vLLM
 > on real hardware. We **beat vLLM run eager** on both models; against vLLM's
-> *production* config (CUDA graphs + torch.compile) the **35B is at ≥1.0×
-> (measured 1.02× total throughput, and better TTFT/TPOT, with the Triton-AOT
-> GDN build; 0.99× in the default pure-C++ build)** and the **27B is ≈0.99–1.00×
-> (0.990× conc16 / 0.997× conc32; best conc32 rep above 1.0×)** — and we use
-> less peak memory on both. We are **actively closing the 27B's last ~1%**
-> (the measured prefill attention-kernel gap; FA-2 port next) via a measured,
-> execution-traced roadmap — see *Status*. The tables track real, tested support
-> and are kept current as work lands (see `.agents/`).
+> *production* config (CUDA graphs + torch.compile) **both gate models measure
+> ≥1.0× total throughput at their large-concurrency operating points**: the
+> **35B at 1.02×** (Triton-AOT GDN build; 0.99× in the default pure-C++ build)
+> and the **27B at 1.007× conc16 / 1.007× conc32** (vendored FA-2 prefill,
+> default-on; per-rep spreads in *Status*) — with better TTFT/TPOT and less
+> peak memory on both. The tables track real, tested support and are kept
+> current as work lands (see `.agents/`).
 
 ## What's implemented (CPU, behaviorally tested)
 
@@ -100,7 +99,7 @@ vLLM actually runs (cited to upstream / its deps — flashinfer, cutlass, cuBLAS
 | Dense **W4A4** GEMM | cutlass fp4×fp4 (sm120a) + fp8 W8A8 — vLLM `cutlass_scaled_mm` | ✅ ref | ✅ |
 | MoE **W4A16** GEMM | Marlin + fp4-resident — vLLM `marlin` / `fused_moe` | ✅ ref | ✅ |
 | FP8 / bf16 projection GEMM | cuBLASLt col-major-TN → `nvjet_sm121` | ✅ ref | ✅ |
-| Prefill attention | flash-style WMMA (FA-2-inspired tiles/staging) — FA-2 `flash_fwd_splitkv` 1:1 port is the named next lever (measured ~5× per-token gap at L=1024) | ✅ ref | ✅ · FA-2 port 🚧 |
+| Prefill attention | **vendored FlashAttention-2** `flash_fwd_splitkv` (vllm-project/flash-attention @ 2c839c33, the exact kernel vLLM runs; default-on for the bf16 head-256 path, 3.7× vs our WMMA) with the flash-style WMMA kernel as the portable fallback | ✅ ref | ✅ |
 | Decode attention (paged) | FlashInfer-style paged, GQA-fused | ✅ ref | ✅ |
 | GDN / linear-attn (chunk) | tensor-core WY solve — FLA `chunk_delta` | ✅ ref | ✅ |
 | RMSNorm(+residual) → fp4 quant | 2 kernels, PARITY with production vLLM (measured: its Inductor `fused_add_rms_norm` triton kernel + extern `scaled_fp4_quant`; no fp4 norm-quant fusion exists in vLLM 0.24) · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ |
@@ -129,24 +128,28 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   paged engine end-to-end with **token-exact greedy gates passing**, and all CUDA
   kernels are validated on real hardware. **Throughput, measured vs vLLM on the same
   workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
-  *production* config (CUDA graphs + torch.compile — the honest bar) the **35B is at
-  ≥1.0×** — measured **1.02× total throughput with better TTFT (−4%) and TPOT (−2%)**
-  in the Triton-AOT GDN build (`-DVLLM_CPP_TRITON=ON`; 0.99× in the default pure-C++
-  build) — and the **27B is ≈0.99–1.00×**, while we use less peak memory on both
-  (27B run: 61.8 vs 76.2 GB at the identical workload/recipe). The GDN chunk-kernel
+  *production* config (CUDA graphs + torch.compile — the honest bar) **both gate
+  models measure ≥1.0×**: the **35B at 1.02× total throughput with better TTFT (−4%)
+  and TPOT (−2%)** in the Triton-AOT GDN build (`-DVLLM_CPP_TRITON=ON`; 0.99× in the
+  default pure-C++ build), and the **27B at 1.007× conc16 / 1.007× conc32** (see
+  below), while we use less peak memory on both (27B run: 61.8 vs 76.2 GB at the
+  identical workload/recipe). The GDN chunk-kernel
   **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed by a sanctioned, bounded
   **build-time Triton AOT fast-path** (FLA kernels verbatim → cubin; runtime stays
   Python/Triton-free; the portable C++ kernels and CPU reference remain the
-  fallback — see the porting inventory §9). The 27B measures **0.990× at conc16
-  and 0.997× at conc32** (758.5 vs 766.5; 1049.0 vs 1052.5 tok/s; 3/5-rep means vs
-  same-hour graphed denominators; the best conc32 rep lands above 1.0×): a
-  production-codegen dump + kernel profile of vLLM settled the residual — the
-  norm→quant sites were already at parity; the real gaps were the **bf16 GEMM
-  layout** (the GDN in_proj now runs the cuBLASLt TN `nvjet TNNN` class vLLM's
-  `F.linear` gets), the **fused attention preamble** (default-on for the 27B,
-  reading a cos/sin cache), and the **tiled causal-conv** (default-on). The
-  remaining ~1.0%/~0.3% is the measured prefill **attention-kernel** gap (ours
-  ≈5× FA-2 per-token at L=1024) — the named next port.
+  fallback — see the porting inventory §9). The 27B measures **1.0072× at conc16
+  and 1.0071× at conc32** (764.3 vs 758.8; 1051.2 vs 1043.9 tok/s; 7/5-rep means vs
+  fresh same-hour graphed denominators; conc32 5/5 reps ≥1.0×, conc16 6/7 with one
+  0.996 rep disclosed): a production-codegen dump + kernel profile of vLLM settled
+  the residual — the norm→quant sites were already at parity; the real gaps were
+  the **bf16 GEMM layout** (the GDN in_proj now runs the cuBLASLt TN `nvjet TNNN`
+  class vLLM's `F.linear` gets), the **fused attention preamble** (default-on for
+  the 27B, reading a cos/sin cache), the **tiled causal-conv** (default-on), and
+  finally the prefill **attention kernel** — closed by the **vendored
+  FlashAttention-2** `flash_fwd_splitkv` port (the exact kernel vLLM runs on GB10),
+  wired natively-bf16 (zero cast kernels) and sync-free, measured **3.7× per-kernel
+  vs our WMMA** and **+1.5%/+0.5% e2e** (default-on; `VT_FA2_PREFILL=0` falls back
+  to the portable WMMA kernel).
 - **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
   total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
   concurrency operating point). We do not stop at "near parity." The gap is being

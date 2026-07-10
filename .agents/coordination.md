@@ -101,7 +101,7 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
-| `CLAIM-PR3` | `KERNEL-GDN-AOT-BF16`, `KERNEL-GDN-SCRATCH` | `complete_pr3` | `/home/mudler/_git/vllm.cpp-codex-triton-aot-analysis`; DGX `~/work/vllm.cpp-pr3` | `codex/triton-aot-analysis` | PR #3 files only | `ACTIVE` | 2026-07-10 |
+| `CLAIM-PR3` | `KERNEL-GDN-AOT-BF16`, `KERNEL-GDN-SCRATCH` | `validate_pr3` (task #52, took over from `complete_pr3`) | DGX `~/work/vllm.cpp-noPy` (reused disposable clone, own build dir) | `merge-pr3-validation` (local merge of `pull/3/head` into main) | PR #3 files; claim/matrix rows `KERNEL-GDN-AOT-BF16`+`KERNEL-GDN-SCRATCH`; ledger/inventory/roadmap rows for PR #3 closure. GPU lock: one flock per test + one for the pool A/B series | `ACTIVE` | 2026-07-10 (validation pass: build TU, test_ops_gdn, both greedy gates, pool A/B, AOT byte-repro) |
 
 ## Handoff queue
 

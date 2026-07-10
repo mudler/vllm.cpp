@@ -1,6 +1,6 @@
 // vllm.cpp original — the DENSE Qwen3.6-27B text gate
 // (unsloth/Qwen3.6-27B-NVFP4, arch Qwen3_5ForConditionalGeneration, text_config
-// model_type "qwen3_5_text"). See .agents/qwen27b-w4a4-notes.md.
+// model_type "qwen3_5_text"). See .agents/specs/qwen27b-w4a4-notes.md.
 //
 // The 27B shares the 35B hybrid backbone WHOLESALE (GDN linear-attention + gated
 // full-attention + Gemma (1+w) RMSNorm + mRoPE->NeoX); it REUSES the 35B's

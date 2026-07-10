@@ -43,7 +43,7 @@ prompt tokens one-at-a-time per layer → 63.8% of prefill) and decode (1-step, 
 PREFILL path with a **chunk-parallel scan** mirroring vLLM's FLA `model_executor/layers/fla/ops/
 chunk.py` (+ chunk_scaled_dot_kkt / solve_tril / wy_fast / chunk_delta_h / chunk_o / cumsum):
 parallelize within-chunk via matmuls, pass the `[Dk×Dv]` state sequentially across chunks. Keep
-the decode 1-step recurrence untouched. Reference: `.agents/gdn-semantics.md`. Correctness:
+the decode 1-step recurrence untouched. Reference: `.agents/specs/gdn-semantics.md`. Correctness:
 chunked == sequential (synthetic, ≥2 chunks + tail) → paged gate 16/16 → measure prefill TTFT.
 
 ### M2.7 — tensor-core NVFP4 MMA GEMM (THE earlier prefill unlock — DONE `bc0a8d7`)
@@ -68,7 +68,7 @@ modelopt W4A16 layout already in `DequantNvfp4ToBf16`) × bf16 activations → b
 dequantizing on-the-fly in the kernel (no host bf16 tensor). Correctness-grade first
 (a straightforward per-tile dequant-then-mma or dequant-into-shared), then tune. Reference:
 mudler's killgate NVFP4 prior art (`~/killgate_series/` on dgx, `.agents/environment.md`
-§ prior art + `.agents/gguf-nvfp4-notes.md` § M2.2 — the UE4M3 LUT ×0.5 trap, QR/QI packing).
+§ prior art + `.agents/specs/gguf-nvfp4-notes.md` § M2.2 — the UE4M3 LUT ×0.5 trap, QR/QI packing).
 Unit-test on GB10 vs the existing bf16 matmul (small synthetic NVFP4 tensor → dequant-GEMM
 == bf16-matmul(dequant(w)) within tolerance). This is the compute primitive.
 

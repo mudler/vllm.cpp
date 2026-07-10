@@ -11,6 +11,11 @@
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
   - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
     parity oracle (golden op dumps via `tools/parity/`).
+- **Apple/Metal box**: `ssh 192.168.68.103` — Mac mini, Apple M4 (10 CPU
+  cores), 16 GB unified memory, arm64, macOS 26.5.2. Use it for the MLX-backed
+  `vt::` backend, Metal op parity, and small-model bring-up. It cannot hold the
+  27B/35B gate models; gate-scale Apple performance needs a larger-memory Mac.
+  Verified 2026-07-10: Xcode is installed; CMake and MLX are not yet installed.
 
 ## Benchmark models on dgx.casa
 
@@ -37,5 +42,6 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- vLLM is now installed on dgx.casa for op-oracle use (`~/venvs/vllm-oracle`,
-  pip 0.24.0); the M2.1 serving baseline still needs to be measured with it.
+- Offline vLLM throughput baselines are complete; the online `vllm serve`
+  TTFT/TPOT A/B remains roadmap closing track A1.
+- Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.

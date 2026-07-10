@@ -3,7 +3,7 @@
 // THE 27B DENSE W4A4 GREEDY ACCEPTANCE GATE — the counterpart to
 // test_qwen36_paged_engine.cpp for the dense 27B gate model
 // (unsloth/Qwen3.6-27B-NVFP4, arch Qwen3_5ForConditionalGeneration,
-// compressed-tensors NVFP4 W4A4). See .agents/qwen27b-w4a4-notes.md.
+// compressed-tensors NVFP4 W4A4). See .agents/specs/qwen27b-w4a4-notes.md.
 //
 // It drives the pinned M0-exit prompt through the FULL PAGED LLMEngine stack
 // (LoadedEngine::FromModelDir -> InputProcessor -> Scheduler -> paged attention

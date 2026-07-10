@@ -1,5 +1,5 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
-// GDN CPU reference op unit tests. Formula reference: .agents/gdn-semantics.md
+// GDN CPU reference op unit tests. Formula reference: .agents/specs/gdn-semantics.md
 // (§2 conv fwd, §3 conv update, §4 l2norm, §5 gated rmsnorm, §7 delta rule).
 // Golden coverage lives in tests/parity/test_op_parity.cpp; these tests pin
 // hand-computed values and the corners the goldens do not cover (conv bias,

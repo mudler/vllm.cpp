@@ -2,8 +2,8 @@
 // the pinned upstream forward (vllm/model_executor/models/qwen3_next.py +
 // qwen3_5.py @ e24d1b24): embed -> N decoder layers (GDN linear_attention OR
 // dense full_attention, each followed by the sparse-MoE block) -> final RMSNorm
-// -> lm_head. Assembly reference: .agents/qwen36-forward-notes.md,
-// .agents/gdn-semantics.md, .agents/moe-semantics.md.
+// -> lm_head. Assembly reference: .agents/specs/qwen36-forward-notes.md,
+// .agents/specs/gdn-semantics.md, .agents/specs/moe-semantics.md.
 //
 // M1.8 Task 3 — THE CENTRAL REFACTOR (dense → paged). The primary `Forward` now
 // consumes the batched paged KV cache (full-attn: vt::ReshapeAndCache +

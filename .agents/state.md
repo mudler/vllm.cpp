@@ -1968,3 +1968,66 @@ porting-inventory):** no 27B GGUF exists anywhere on dgx (and the GGUF loader is
 qwen35moe/qwen3next-only — a dense-27B variant is unwritten); no NVFP4-extension
 -type (id 40) GGUF exists for the gate models (reader traits support it, dequant
 does not); APEX Mini/Quality need IQ2_S/IQ4_XS i-quants (clear error today).
+
+## 2026-07-10 — Canonical record v1: live roadmap, completed MVP archive, centralized specs, Mac host available
+
+Applied the user-directed document lifecycle and made it binding in `AGENTS.md`:
+
+- Renamed the live post-MVP roadmap to `.agents/roadmap_v1.md` and moved the
+  completed M0–M3 record to `.agents/completed/roadmap_mvp_v0.md`.
+- Carried every open TODO from the v0 Post-MVP paragraph into explicit live
+  tracks C1–C9/D1–D4: kernel drop-in alignment; dense/MoE/Qwen3-Next families;
+  MTP; FP8; sliding window/YaRN; priority scheduling; prompt-logprobs and logit
+  controls; tokenize/metrics; sync tooling; backend expansion, TP, spec breadth,
+  LoRA/offload/model breadth.
+- Moved 14 feature-specific scoping, semantics, feasibility, architecture, and
+  design artifacts from `.agents/` into `.agents/specs/`, including the MM/tools
+  and spec-decode scoping reports. Project-wide protocol/status/index documents
+  remain at the top level; completed era records live under `completed/`.
+- Repaired repository references and stale public/current-status lines: A2 GGUF
+  real-file parity and A4 vendored Triton AOT now read complete in the matrix;
+  README architecture/CUDA tables now agree that both throughput gates passed.
+- Verified both remote development hosts: `dgx.casa` is the GB10/sm_121 CUDA
+  box; `192.168.68.103` is an M4 Mac mini with 16 GB unified memory. The Mac is
+  sufficient for MLX/Metal op parity and small-model bring-up, but not 27B/35B
+  gate-model runs. Xcode is present; CMake and MLX still need bootstrapping.
+
+**Kernel-reuse posture:** the codebase has already proven thin-adapter lifts for
+vLLM/dependency CUDA cores (CUTLASS NVFP4, Marlin, FlashAttention-2). Roadmap C1
+standardizes raw pointer/shape/stride/stream adapter signatures so future pure
+C++/CUDA csrc lifts replace only Torch glue. Python orchestration and generated
+Inductor/Triton/CuTe paths still need C++ ports or the bounded vendored-AOT route;
+they are not arbitrary source-file drop-ins today.
+
+**Validation:** local roadmap/spec link audit PASS; `git diff --check` PASS;
+CPU build + ctest PASS, 92/92.
+
+**Next:** finish the independent PR #3 merge-readiness review; do not merge a
+CUDA/performance path without its required GB10 compile, gates, and same-binary
+A/B. Then scope C1 kernel adapter alignment and continue A1/A5 closing tracks.
+
+## 2026-07-10 — PR #3 independent review: DO NOT MERGE yet
+
+An independent sub-agent reviewed PR #3 (`codex/triton-aot-analysis`) against
+current main, the whole-chain rules, and the new roadmap protocol. The synthetic
+merge is conflict-free and clean CPU build/tests pass 90/90, but three high
+severity blockers remain:
+
+1. The new GDN scratch pools are default-on CUDA/performance behavior and have
+   no CUDA/Triton build, reuse/growth test, model gates, `nsys`, pool ON/OFF A/B,
+   or fresh-vLLM comparison.
+2. The advertised bf16 `chunk_o` path is compiled out because its generated
+   `gdn_chunko_bf16_h{32,48}` artifacts and MANIFEST entries are absent. The
+   current sync workflow omits top-level `CMakeLists.txt`, while the drift check
+   validates source hashes but not the expected base/signature set, so CI cannot
+   detect or regenerate the missing artifacts.
+3. The added bf16 tests silently exercise the hand fallback when artifacts are
+   absent, create fresh streams, and run only one chunk call; they prove neither
+   Triton dispatch nor dirty-buffer reuse/pool growth.
+
+**Merge requirements:** regenerate and commit both bf16 launchers + MANIFEST;
+extend workflow paths and drift validation to the expected artifact set; add an
+assertable dispatch/reuse test; run the CUDA/Triton suite and both model gates on
+`dgx.casa`; then run repeated same-binary pool ON/OFF and bf16-output A/B against
+fresh production-vLLM denominators across throughput, latency, and memory. Rebase
+and update roadmap/matrix status under the new protocol before merge.

@@ -6,9 +6,9 @@ and continue. Follow this protocol every session.
 ## Session protocol
 
 1. **Orient**: read `AGENTS.md` (index), then [state.md](state.md) (where we
-   are, what's next), then the [roadmap.md](roadmap.md) unit you'll work on.
+   are, what's next), then the [roadmap_v1.md](roadmap_v1.md) unit you'll work on.
 2. **Scope one unit**: work in roadmap-unit-sized chunks (one focused PR
-   each). If a unit turns out too big, split it in roadmap.md first.
+   each). If a unit turns out too big, split it in roadmap_v1.md first.
 3. **Read upstream first**: before implementing any subsystem, read the
    upstream Python at the paths listed in
    [porting-inventory.md](porting-inventory.md) — port, don't reinvent
@@ -28,7 +28,7 @@ and continue. Follow this protocol every session.
    - [porting-inventory.md](porting-inventory.md) status markers flipped;
    - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,
      upstream refs);
-   - [roadmap.md](roadmap.md) unit status updated;
+   - [roadmap_v1.md](roadmap_v1.md) unit status updated;
    - **`README.md` support tables** (architectures / acceleration /
      quantization) updated whenever a change alters what is supported, its
      status, or its tested formats — a family/backend becomes ✅ only when

@@ -1,7 +1,7 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 //
 // Tiered Declarative Recipe (TDR) — Phase 0 skeleton. See
-// .agents/fusion-architecture-2026-07-08.md.
+// .agents/specs/fusion-architecture-2026-07-08.md.
 //
 // A fusion is declared ONCE, backend-agnostic, as a constexpr `FusedRecipe`
 // POD (an opcode list + operand bindings) that lives ABOVE vt::. It is the

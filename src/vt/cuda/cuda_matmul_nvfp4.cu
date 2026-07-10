@@ -14,7 +14,7 @@
 //     DequantNvfp4ToBf16 stores — so this GEMM and Matmul(act, dequant(w).T)
 //     differ only in K-reduction order, not in the per-element product.
 // These are standard IEEE fp8-e4m3fn scales: the GGUF killgate fork's UE4M3
-// x0.5 LUT trap (.agents/gguf-nvfp4-notes.md) does NOT apply to modelopt NVFP4.
+// x0.5 LUT trap (.agents/specs/gguf-nvfp4-notes.md) does NOT apply to modelopt NVFP4.
 //
 // Layout (M2.4-tile): SHARED-MEMORY TILED GEMM with register accumulation. A
 // thread-block computes a [BM x BN] output tile; per K-tile it cooperatively

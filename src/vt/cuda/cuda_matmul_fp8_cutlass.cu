@@ -20,7 +20,7 @@
 // Isolated TU (heavy cutlass templates) — built only for sm_12{0,1}a. Pairs with
 // QuantFp8Static (below), the static per-tensor activation quant that mirrors
 // vLLM's static_scaled_fp8_quant (is_scale_inverted=False: x/input_scale, clamp,
-// RNE hardware cvt). See .agents/cutlass-dropin-feasibility.md.
+// RNE hardware cvt). See .agents/specs/cutlass-dropin-feasibility.md.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

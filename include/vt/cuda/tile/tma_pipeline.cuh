@@ -20,7 +20,7 @@
 //                                    CUTE_ARCH_TMA_SM120_ENABLED .shared::cta variant)
 //   - cp.async.bulk.commit/wait    : cute/arch/copy_sm90_tma.hpp:1228,1251 (SM90_TMA_STORE / wait)
 // Verified on GB10 sm_121a by a standalone probe (token-exact 3D tile load).
-// Design record: .agents/tile-pipeline-component-2026-07-08.md (Rung-2).
+// Design record: .agents/specs/tile-pipeline-component-2026-07-08.md (Rung-2).
 #ifndef VT_CUDA_TILE_TMA_PIPELINE_CUH
 #define VT_CUDA_TILE_TMA_PIPELINE_CUH
 

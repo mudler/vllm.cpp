@@ -3,7 +3,7 @@
 // The declared fusion catalog (TDR Phase 0). Each `constexpr FusedRecipe` here
 // TRANSCRIBES a vLLM fusion PATTERN as a backend-agnostic opcode list — we lift
 // the WHAT (which primitives, in which order, over which operands), never a CUDA
-// kernel. See .agents/fusion-architecture-2026-07-08.md §1.
+// kernel. See .agents/specs/fusion-architecture-2026-07-08.md §1.
 #pragma once
 
 #include "vt/fused_recipe.h"

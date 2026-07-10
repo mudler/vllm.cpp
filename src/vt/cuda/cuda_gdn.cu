@@ -2,7 +2,7 @@
 // CUDA GDN kernels (M0.7): causal conv1d fwd/update, l2norm, gated rmsnorm,
 // gated-delta-rule scan. Correctness-grade — plain kernels matching the CPU
 // reference math in src/vt/cpu/cpu_ops.cpp element for element; formulas from
-// .agents/gdn-semantics.md (§ cited per kernel). Perf-grade (chunked prefill)
+// .agents/specs/gdn-semantics.md (§ cited per kernel). Perf-grade (chunked prefill)
 // lands M2.3.
 //
 // Metadata contract (M0.7 Task 2 review): query_start_loc / has_initial_state

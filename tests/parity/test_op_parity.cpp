@@ -529,7 +529,7 @@ void RunGdnDecode(Backend& b, Queue& q, const fs::path& dir, const json& m) {
 }
 
 // --- MoE runners (M0.8). Goldens are pinned-oracle dumps (Task 1);
-// .agents/moe-semantics.md is the formula reference.
+// .agents/specs/moe-semantics.md is the formula reference.
 
 // moe_router_topk: logits [T,E] -> weights [T,K] f32 + ids [T,K] i32
 // (moe-semantics.md §3). weights are toleranced, ids are an exact match.
@@ -824,7 +824,7 @@ bool RunQwen36Norm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   std::string snap;
   if (!Qwen36Gate(dir, snap)) return false;
   // The final norm.weight lives in the last shard (layers 37-39 + norm +
-  // lm_head), per .agents/qwen36-forward-notes.md §6.
+  // lm_head), per .agents/specs/qwen36-forward-notes.md §6.
   auto shard3 = OpenShard(snap, 3);
   if (!shard3) {
     MESSAGE("SKIP " << dir.filename().string() << ": shard 3 not found");

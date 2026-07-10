@@ -5,7 +5,7 @@
 //
 // Loads the real 35B checkpoint (nvidia/Qwen3.6-35B-A3B-NVFP4) into owned host
 // bf16 tensors. Quant schemes per weight class (verified against the real ckpt,
-// .agents/qwen36-forward-notes.md §6):
+// .agents/specs/qwen36-forward-notes.md §6):
 //   - MoE experts + shared_expert + lm_head : NVFP4 W4A16 (DequantNvfp4ToBf16)
 //   - attention (q/k/v/o) + GDN (in_proj_qkv/z, out_proj) : per-tensor FP8
 //     (DequantFp8ToBf16) — NOT bf16 as the task first assumed

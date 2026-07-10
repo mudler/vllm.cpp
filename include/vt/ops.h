@@ -73,7 +73,7 @@ struct RopeArgs {
   int rotary_dim = 0;  // <= head_dim; even
 };
 
-// GDN op args (.agents/gdn-semantics.md is the formula reference; sections
+// GDN op args (.agents/specs/gdn-semantics.md is the formula reference; sections
 // cited on each op below).
 struct CausalConv1dArgs {
   // Upstream `activation` is "silu"/"swish" (→ silu) or None (→ identity);
@@ -107,7 +107,7 @@ struct GdnArgs {
   const int32_t* query_start_loc_host = nullptr;
 };
 
-// Dense causal attention args (.agents/qwen36-forward-notes.md §5 is the
+// Dense causal attention args (.agents/specs/qwen36-forward-notes.md §5 is the
 // formula reference — Qwen3NextAttention's core scaled-dot-product).
 struct AttentionArgs {
   // Softmax scale, applied to the qk dot product. Upstream sets it to
@@ -148,7 +148,7 @@ struct PagedAttentionArgs {
   int32_t max_seq_len = 0;
 };
 
-// MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).
+// MoE router top-k args (.agents/specs/moe-semantics.md §3 is the formula reference).
 struct MoeRouterTopKArgs {
   // Number of experts selected per token (top_k = num_experts_per_tok).
   int top_k = 0;
@@ -525,7 +525,7 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
 // --- Fused declarative recipe (TDR Phase 0; see include/vt/recipes.h and
-// .agents/fusion-architecture-2026-07-08.md). Runs `recipe` — a backend-agnostic
+// .agents/specs/fusion-architecture-2026-07-08.md). Runs `recipe` — a backend-agnostic
 // constexpr FusedRecipe — over its operands, producing `out`. The op is realized
 // per backend in tiers selected by VT_FUSED_TIER (default 0 = Tier-0 composite,
 // which walks the recipe through the already-registered primitives; 1 = Tier-1
@@ -606,7 +606,7 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
                         const Tensor& k_norm, const Tensor& cos_sin,
                         const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 
-// --- GDN (Gated DeltaNet) ops. Formula reference: .agents/gdn-semantics.md.
+// --- GDN (Gated DeltaNet) ops. Formula reference: .agents/specs/gdn-semantics.md.
 // All GDN state tensors are caller-allocated f32 and updated IN PLACE
 // (upstream computes states in f32 and rounds to the cache dtype on store —
 // that rounding point is M0.9 layer assembly, gdn-semantics.md §1).
@@ -682,7 +682,7 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
                const Tensor* state_idx = nullptr);
 
 // --- MoE (sparse mixture-of-experts) ops. Formula reference:
-// .agents/moe-semantics.md. The expert MLP itself is NOT an op — it is composed
+// .agents/specs/moe-semantics.md. The expert MLP itself is NOT an op — it is composed
 // in the layer/runner from Matmul + SiluAndMul (§4). These two ops cover the
 // pieces composition cannot express: the router top-k/normalize and the
 // weighted scatter-combine.
@@ -719,7 +719,7 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
                     const Tensor& sd, const Tensor& gl);
 
 // --- Dense causal attention (M0.9). Formula reference:
-// .agents/qwen36-forward-notes.md §5 (pinned Qwen3NextAttention core).
+// .agents/specs/qwen36-forward-notes.md §5 (pinned Qwen3NextAttention core).
 //
 // Causal scaled-dot-product attention with GQA broadcast over a single packed
 // sequence. query [T,Hq,D], key/value [T,Hk,D], out [T,Hq,D]; Hq a multiple of

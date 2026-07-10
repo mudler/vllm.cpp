@@ -10,7 +10,9 @@ The gate campaign already built the assets that make expansion cheap: an sm_80+ 
   - (a) Async/overlap scheduling — engine-level, benefits all backends, a mirror obligation.
   - (b) CPU threadpool → compute-in-quant GEMM — self-contained in `src/vt/cpu/`.
 - **Wave 3 (~4–6 wk):** AMD MI300X (gfx942). The Triton-GDN one-flag lever makes the hardest kernel near-free on AMD.
-- **Wave 4 (hardware-gated):** Apple Metal via MLX. Start the Linux-buildable glue during Waves 1–3; execute the on-Mac milestones once a Mac is procured.
+- **Wave 4 (hardware-enabled):** Apple Metal via MLX. The M4/16 GB Mac mini at
+  `ssh 192.168.68.103` supports op parity and small-model milestones now; a
+  larger-memory Mac is still required for 27B/35B gate-model measurements.
 - **Wave 5 (long poles, workload-driven):** Vulkan (broad cross-vendor bet), then EAGLE/MTP spec decode, Intel SYCL, grammar jump-forward.
 
 ## Ranked expansion map (reach × effort)
@@ -24,7 +26,7 @@ Effort: 🟢 days–2 wk · 🟡 4–6 wk · 🔴 8–16 wk.
 | **2** | **Async/overlap scheduling** (engine, cross-cutting) | All backends / all users (latency) | 🟡 medium | nsys the decode steady-state to size the prize, then port `async_scheduler.cpp` + `step_with_batch_queue` + event-based sampling | Token-exact stop/abort/preemption with in-flight steps; honest win is TPOT/ITL, **not** throughput |
 | **3** | **CPU threadpool + compute-in-quant GEMM** (+ tiled/KV-split CPU FA) | High — CPU-only / edge / no-GPU + GB10's 20 Arm cores | 🟢 1 wk + 🟡 2–4 wk | `src/vt/cpu/cpu_threadpool.{h,cpp}` (port ggml pool 1:1), convert `Matmul(BT)` to chunked parallel-for (bit-identical, measurable) | Compute-in-quant ≠ bit-identical to dequant-to-bf16 → need a new CPU parity oracle (keep dequant path as `VT_CPU_REF`) |
 | **4** | **AMD MI300X** (gfx942 / CDNA3) | High — #2 datacenter accelerator | 🟡 ~4–6 wk | gfx942 bf16 gate via hip-Triton GDN (one `--target hip:gfx942:64` flag) + hipified glue + vendored `csrc/rocm/attention.cu` MFMA | cutlass fp8/fp4 + FA-2-CuTe are NVIDIA-locked; fp8/fp4 peak must come from AITER/hipBLASLt (follow-on ~3–4 wk) |
-| **5** | **Apple Metal via MLX** (M-series dev/consumer) | High — Apple Silicon base | 🔴 ~6–10 wk **+ hardware** | On Linux: vendor MLX, build its CPU backend, stand up `src/vt/metal/mlx_ops.cpp` passing CPU-ref goldens (no Mac). Then M-Metal-0: bf16 dense Qwen3-4B/8B greedy on M-series | **No Apple hardware in the environment (procurement dependency)**; paged KV needs MLX-internal primitives (ported from vllm-metal Apache-2.0); nvfp4 E4M3-vs-UE4M3 scale parity (#2962) |
+| **5** | **Apple Metal via MLX** (M-series dev/consumer) | High — Apple Silicon base | 🟡 ~6–10 wk | Vendor MLX, stand up `src/vt/metal/mlx_ops.cpp` against CPU-ref goldens, then run a small bf16 dense model on the M4/16 GB host | Available host cannot fit the 27B/35B gates; paged KV needs MLX-internal primitives (ported from vllm-metal Apache-2.0); nvfp4 E4M3-vs-UE4M3 scale parity (#2962) |
 | **6** | **Vulkan** (cross-vendor: AMD/Intel/NVIDIA consumer + mobile) | Very high but *shared* | 🔴 ~10–16 wk | bf16 dense decode of one gate model via `VK_KHR_cooperative_matrix` + Vulkan paged-KV + command-buffer replay | Fully hand-written SPIR-V (no Triton/cutlass leverage); longest sustained effort; amortizes across all vendors |
 | **7** | **EAGLE-3 / MTP spec decode** | Medium — latency serving, low concurrency | 🔴 large | New `src/vllm/v1/spec_decode/` mirroring vLLM + rejection sampler; MTP heads exist upstream | Batch-decay (1.38× @ bs64, can go <1× @ bs24); MoE verification activates more experts; GDN linear-state rollback on rejection is hard |
 | **8** | **Intel XPU (SYCL)** (Arc/Battlemage, DC Max) | Medium (Arc growing) | 🔴 ~8–12 wk | Mirror `platforms/xpu` + vendor `vllm-xpu-kernels` SYCL attention/MoE | Highest per-vendor effort; weakest Triton lever; oneDNN dep tension with "we own the code" |
@@ -55,7 +57,11 @@ Effort: 🟢 days–2 wk · 🟡 4–6 wk · 🔴 8–16 wk.
 - **AMD consumer risk:** upstream Triton RDNA3 (gfx1100) fused-MoE codegen bug (sglang#30245) — not in blast radius for CDNA GDN, but gates the RDNA consumer follow-on; lean on hand-C++ MoE fallback.
 - **CPU numerics:** compute-in-quant changes gate goldens — keep dequant-to-bf16 as `VT_CPU_REF` oracle and add the scalar `vec_dot` reference.
 
-**Hard external dependency:** the Metal track is blocked on acquiring an Apple Silicon box (≥32 GB, ideally M4/M5) — not in `.agents/environment.md`. The seam/op-parity work is Linux-buildable (MLX CPU/CUDA backends) and should proceed in parallel, but the on-Mac milestones cannot land without hardware — flag procurement as the critical-path item for that track.
+**Environment update (2026-07-10):** an Apple M4 Mac mini with 16 GB is now
+reachable at `ssh 192.168.68.103` and recorded in `environment.md`. This removes
+the hardware block for MLX compilation, op parity, and small-model milestones.
+It does not satisfy 27B/35B gate-model memory requirements; those measurements
+still need a larger-memory Apple Silicon host.
 
 ---
 *Synthesis of 4 research tracks (Metal/MLX, arches/vendors, SGLang, llama.cpp CPU) — workflow wf_24e95c3b-7a5, 2026-07-10. Full per-track reports in the workflow journal.*

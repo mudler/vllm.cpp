@@ -2,14 +2,14 @@
 
 > **2026-07-10: the MVP throughput gates passed on both models. This M0–M3
 > breakdown is the archived record of the completed MVP. The LIVE roadmap is
-> now [post-mvp.md](post-mvp.md)** (tracks A–E, incl. the feature-level
-> breakdown in [feature-matrix.md](feature-matrix.md)).
+> now [roadmap_v1.md](../roadmap_v1.md)** (tracks A–E, incl. the feature-level
+> breakdown in [feature-matrix.md](../feature-matrix.md)).
 
 Milestones decompose into **workable units** (one unit ≈ one focused PR an
 agent can pick up, implement, test, and ledger in a session or few). Order
 within a milestone is roughly dependency order. Every unit's Definition of
 Done (DoD) includes: mirrored-structure sources with upstream-commit headers,
-tests per [discipline.md](discipline.md), inventory markers flipped, ledger
+tests per [discipline.md](../discipline.md), inventory markers flipped, ledger
 row appended, state log updated.
 
 Status: ☐ open · 🚧 in progress · ✅ done. Keep this current.
@@ -27,7 +27,7 @@ GGUF greedy parity vs safetensors remains dgx-pending (T0).**
   DoD: green CI on empty-ish lib.
 - ✅ **M0.2 vt runtime core** (`8df527e`): Tensor/dtype/device, step arena + persistent
   buffers, op dispatch table, CPU scalar reference ops. Interface MUST meet
-  the portability requirements in [backends.md](backends.md) (open device
+  the portability requirements in [backends.md](../backends.md) (open device
   enum, unified-memory awareness, per-device queue handles, optional
   graph-capture hook). DoD: op unit tests.
 - ✅ **M0.3 Parity harness** (`f063890`): `tools/parity/` dump scripts (upstream vLLM on
@@ -249,23 +249,23 @@ vocabulary is ported.**
 ## Recurring (any time after M0)
 
 - ☐ **P1 Sync tooling** (`tools/sync/`): automate sync-cycle steps 2–4 of
-  [upstream-sync.md](upstream-sync.md) — enumerate `PIN..TARGET` per ported
+  [upstream-sync.md](../upstream-sync.md) — enumerate `PIN..TARGET` per ported
   subtree, map commits to our mirrored files via their headers, draft the
   classification report. DoD: one command emits a ready-to-review
   `.agents/sync/` report.
-- 🔁 **Sync cycle** ([upstream-sync.md](upstream-sync.md)) — run on cadence
+- 🔁 **Sync cycle** ([upstream-sync.md](../upstream-sync.md)) — run on cadence
   (weekly or on demand); each run is a bounded, self-contained task.
 
 ## Post-MVP (T1 queue, reorder as needed)
 
 - ☐ **Kernel drop-in alignment** (user-mandated): reshape vt CUDA/ROCm kernel
   entry points to match upstream csrc signatures so upstream kernels drop in;
-  see [backends.md](backends.md) §drop-in. Start after MVP gates pass.
+  see [backends.md](../backends.md) §drop-in. Start after MVP gates pass.
 
 Dense/MoE model families (Llama/Qwen3/Mixtral…) · MTP spec decode · fp8 ·
 sliding window · priority scheduling · YaRN · prompt_logprobs/logit_bias/
 bad_words · tokenize endpoints · full metrics · Qwen3-Next. Then T2 per
-[porting-inventory.md](porting-inventory.md), including backend expansion
-per [backends.md](backends.md): Apple Metal (explorations E1 MLX vs E2
+[porting-inventory.md](../porting-inventory.md), including backend expansion
+per [backends.md](../backends.md): Apple Metal (explorations E1 MLX vs E2
 native MSL first), Vulkan, Intel XPU (loyal port of upstream
 `platforms/xpu`), ANE for encoder/pooling classes (E3).

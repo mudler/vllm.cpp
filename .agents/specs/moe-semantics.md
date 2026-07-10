@@ -294,7 +294,7 @@ with quant_config=None). gate_proj and up_proj of the same layer share one
 - `input_scale`: registered as a placeholder and DISCARDED for W4A16
   (modelopt.py:1258-1264, process_weights_after_loading) — do not use it.
 
-### Contrast with the GGUF fork convention (.agents/gguf-nvfp4-notes.md)
+### Contrast with the GGUF fork convention (.agents/specs/gguf-nvfp4-notes.md)
 
 - The fork's **×0.5 LUT trap does NOT apply here** (verified): the fork's
   `ggml_ue4m3_to_fp32` halves the decoded scale only to compensate its

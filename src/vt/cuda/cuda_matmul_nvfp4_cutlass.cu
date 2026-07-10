@@ -12,7 +12,7 @@
 // sm_12{0,1}a. Pairs with SwizzleBlockscale (below), the lift of vLLM's
 // swizzle_blockscale (nvfp4_utils.py:13-53) that lays the linear fp8 block
 // scales into the atom layout Sm1xxBlkScaledConfig::tile_atom_to_shape_SF{A,B}
-// reads. See .agents/cutlass-dropin-feasibility.md and qwen27b-w4a4-notes.md §7.
+// reads. See .agents/specs/cutlass-dropin-feasibility.md and qwen27b-w4a4-notes.md §7.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

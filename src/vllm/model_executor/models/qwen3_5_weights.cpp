@@ -1,6 +1,6 @@
 // vllm.cpp original; see qwen3_5_weights.h. Weight naming/quant verified
 // against nvidia/Qwen3.6-35B-A3B-NVFP4 snapshot 491c2f1e
-// (.agents/qwen36-forward-notes.md §6).
+// (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
 #include <cstdlib>

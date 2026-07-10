@@ -7,7 +7,7 @@
 // tensors by name, verifies the standalone dequant helpers against python/torch
 // golden bf16 bit patterns, and checks the full-layer loader's current native
 // resident contract (FP8/NVFP4 raw weights by default; snapshot 491c2f1e; see
-// .agents/qwen36-forward-notes.md §6). The full-model load is exercised in Task 5.
+// .agents/specs/qwen36-forward-notes.md §6). The full-model load is exercised in Task 5.
 #include <doctest/doctest.h>
 
 #include <cstdint>

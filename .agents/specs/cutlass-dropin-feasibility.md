@@ -145,7 +145,7 @@ GB10 disk is at 97% (126 G free) — vendor headers, don't leave full clones.
 whereas the cutlass kernel is **W4A4** (fp4×fp4). To use it we must:
 1. **Activation quant to fp4 + per-group ue4m3 scales at runtime** (per-token
    dynamic quant). We already have the CPU W4A4 activation-quant *reference*
-   (`nvfp4_emulation.h`, unit-tested — see `.agents/qwen27b-w4a4-notes.md §3.4`);
+   (`nvfp4_emulation.h`, unit-tested — see `.agents/specs/qwen27b-w4a4-notes.md §3.4`);
    needs a GPU kernel.
 2. **Scale swizzle**: cutlass wants `A_sf`/`B_sf` in the padded+swizzled atom
    layout (`round_up(M,128) × round_up(K/16,4)`, `Sm1xxBlkScaledConfig`). Our

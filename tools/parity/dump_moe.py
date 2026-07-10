@@ -13,7 +13,7 @@ Loading technique (dump_gdn.py's exec-stub pattern): package skeletons for
 __init__.py files; only leaf infra is stubbed (recorded in STUBBED below and
 in every manifest). All oracle MATH executes from the pinned files.
 
-Oracle callables (see .agents/moe-semantics.md §7 for why these):
+Oracle callables (see .agents/specs/moe-semantics.md §7 for why these):
   moe_router_topk -> tests/kernels/moe/test_fused_topk.py::torch_topk
                      (the pinned torch-native reference the upstream test
                      suite validates the production topk_softmax CUDA kernel

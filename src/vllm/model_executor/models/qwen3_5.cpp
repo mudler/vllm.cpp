@@ -2,9 +2,9 @@
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
 // qwen_gdn_linear_attn.py, qwen3_next.py::Qwen3NextAttention /
 // Qwen3NextSparseMoeBlock @ e24d1b24). References:
-// .agents/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
-// .agents/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
-// .agents/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+// .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
+// .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
+// .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"

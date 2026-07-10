@@ -26,7 +26,7 @@ Dump script: `tools/parity/dump_qwen36.py`. Goldens:
      `model_type qwen3_5_moe` / text `qwen3_5_moe_text` — the **MoE** model
      (256 experts, top-8, `moe_intermediate_size 512`, shared expert 512),
      40 layers, hidden 2048. Quantized **modelopt NVFP4 W4A16** (weight-only,
-     activations bf16) per `.agents/moe-semantics.md` §8.
+     activations bf16) per `.agents/specs/moe-semantics.md` §8.
    - **Implication for the plan:** Task 4's forward dispatches on `model_type`
      and builds the MoE block only for `qwen3_5_moe`. So a full-model parity run
      **on the 27B does NOT exercise the MoE path at all** — it validates GDN +

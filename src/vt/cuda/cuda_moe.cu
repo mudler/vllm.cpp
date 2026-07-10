@@ -2,7 +2,7 @@
 // CUDA MoE ops (M0.8 Task 3): router top-k (softmax + greedy top-k +
 // renormalize) and weighted combine. Correctness-grade — plain kernels
 // matching the CPU reference math in src/vt/cpu/cpu_ops.cpp element for
-// element; formulas from .agents/moe-semantics.md (§3 router, §4/§6 combine).
+// element; formulas from .agents/specs/moe-semantics.md (§3 router, §4/§6 combine).
 //
 // Upstream counterpart: layers/fused_moe/ (fused_topk / moe_align + grouped
 // GEMM Triton/cutlass kernels — M2.2 replaces this correctness-grade path).

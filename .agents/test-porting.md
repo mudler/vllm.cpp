@@ -34,7 +34,7 @@ So test porting is part of the mirror obligation, not an optional extra.
    when a synced vLLM PR touches `tests/`, the port includes the test delta.
    A PR that only changes tests still gets synced — it's a spec change.
 5. **Specs must inventory their tests**: every `.agents/specs/<slug>.md`
-   (post-mvp.md §E convention) includes a **"Tests to port"** section listing
+   (roadmap_v1.md §E convention) includes a **"Tests to port"** section listing
    the upstream test files/cases that cover the feature and the tier each maps
    to. A spec without it is incomplete; the implementing agent's DoD includes
    those tests green.

@@ -358,7 +358,7 @@ TEST_CASE("ggml traits: standard table values") {
 TEST_CASE("ggml traits: killgate fork extension ids (NVFP4, Q1_0, MXFP4)") {
   // Ids/geometry from mudler's killgate llama.cpp fork
   // (ggml/include/ggml.h:429-431, ggml/src/ggml-common.h). See
-  // .agents/gguf-nvfp4-notes.md.
+  // .agents/specs/gguf-nvfp4-notes.md.
   CHECK(vllm::GgmlTraits(39).block_elems == 32);  // MXFP4: 1 E8M0 + 16 qs
   CHECK(vllm::GgmlTraits(39).block_bytes == 17);
   CHECK(vllm::GgmlTraits(39).name == std::string("MXFP4"));

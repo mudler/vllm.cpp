@@ -53,22 +53,22 @@ Extensions (Metal, Vulkan) are recorded as deviations in
 platforms; we add them *through* upstream's own abstraction so a future
 upstream platform PR ports mechanically.
 
-## Explorations (open questions with decision criteria)
+## Backend decisions and remaining questions
 
-- **E1 — MLX as the Apple kernel layer.** MLX is Apple's C++ array framework
+- **E1 — MLX as the Apple kernel layer (SELECTED, B1 2026-07-10).** MLX is Apple's C++ array framework
   (Metal kernels, unified memory, C API via mlx-c). Attractive: mature
   GEMM/attention kernels, custom-MSL-kernel API, active development. Risks:
   **lazy-evaluation graph semantics** vs our eager persistent-batch design
   (same impedance class that disqualified ggml — needs a forced-eval eager
   wrapper and profiling to see what that costs); dependency weight vs the
   "we own the code" posture; MLX does **not** use the ANE (GPU only).
-  Decide by benchmark: MLX-backed vt ops vs hand-written MSL (E2) on paged
-  attention + GDN + MoE decode for a gate-class model. Criteria: decode
-  tokens/s at high concurrency, memory control (paged KV must be raw
-  buffers we manage), build/maintenance cost.
-- **E2 — Hand-written Metal (llama.cpp-style).** Full control, zero deps,
-  proven by llama.cpp on Apple Silicon; higher initial kernel cost. Default
-  if E1's eager-wrapper tax is real.
+  B1 selected MLX after the production Ollama evidence; implementation still
+  benchmarks MLX-backed vt ops and custom MLX Metal kernels on paged attention,
+  GDN, and MoE. The M4/16 GB host in `environment.md` supports op/small-model
+  bring-up; gate-class runs need a larger-memory Mac.
+- **E2 — Hand-written Metal (fallback).** Full control, zero deps, proven by
+  llama.cpp on Apple Silicon; use custom MSL/MLX primitives where MLX lacks the
+  paged operation or its eager-wrapper tax fails measurement.
 - **E3 — ANE.** Reachable only via CoreML compiled models: static shapes,
   no paged KV, no custom ops — a poor fit for autoregressive decode with
   dynamic batching. Realistic roles: encoder/embedding/pooling models (T2

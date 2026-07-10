@@ -1,7 +1,7 @@
 # Feature matrix — the feature-level breakdown of the roadmap
 
 **This document is the feature-level breakdown of the project roadmap
-([post-mvp.md](post-mvp.md) — post-mvp.md IS the roadmap; this matrix is its §E).**
+([roadmap_v1.md](roadmap_v1.md) — this matrix is its §E).**
 One row per vLLM feature, grounded in [porting-inventory.md](porting-inventory.md)
 (the per-subsystem parity record), the B1–B6 research reports, and direct source
 verification (2026-07-10, worktree @ a82d262).
@@ -13,10 +13,10 @@ it to a sub-agent. Most spec files do not exist yet — writing one is how work 
 
 **Status legend:** ✅ merged + gated · 🟡 partial (what's missing is in Notes) ·
 🚧 spec written / agent running · ☐ gap (not started). Tier (T0–T3) per
-porting-inventory; Wave per [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md).
+porting-inventory; Wave per [specs/expansion-map-2026-07-10.md](specs/expansion-map-2026-07-10.md).
 
 **Mirror policy:** vLLM parity is the FLOOR for every row (mirror-vllm-always);
-the surpass track (post-mvp.md "Protocol evolution") builds beyond it, never
+the surpass track (roadmap_v1.md "Protocol evolution") builds beyond it, never
 instead of it.
 
 ---
@@ -90,7 +90,7 @@ multi-process/multi-GPU re-enters through that seam.
 |---|---|---|---|---|
 | NVFP4 modelopt (35B: W4A16 experts via vendored Marlin + fp8/bf16 dense) | `quantization/modelopt.py` | ✅ T0 | Marlin bit-exact vs vLLM's own kernel; gate-passing config | [specs/nvfp4-modelopt.md](specs/nvfp4-modelopt.md) |
 | NVFP4 compressed-tensors W4A4 (27B dense, cutlass sm120a GEMM) | `compressed_tensors/`, `csrc/.../fp4/` | ✅ T0 | vendored `cutlass_scaled_fp4_mm_sm120a` 1:1; per-shape autotune beats flashinfer on several shapes (surpass datum) | [specs/nvfp4-w4a4.md](specs/nvfp4-w4a4.md) |
-| GGUF quants (Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16/F32 + NVFP4 ext types) | `quantization/gguf.py` | 🟡 T0 | dequant byte-exact vs ggml + loader ✅; **real-file GPU greedy parity = closing track A2 (in flight)**; IQ2_S/IQ4_XS deferred | [specs/gguf-quants.md](specs/gguf-quants.md) |
+| GGUF quants (Q3_K/Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16/F32 + NVFP4 ext types) | `quantization/gguf.py` | 🟡 T0 | dequant byte-exact vs ggml + loader ✅; **35B real-file GPU greedy parity PASSED (A2)**; no 27B file, NVFP4 type-40 dequant, and IQ2_S/IQ4_XS remain | [specs/gguf-quants.md](specs/gguf-quants.md) |
 | fp8 W8A8 (e4m3) | `quantization/fp8.py` | ☐ T1 | | [specs/fp8-w8a8.md](specs/fp8-w8a8.md) |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | ☐ T1 | | [specs/mxfp4-mxfp8.md](specs/mxfp4-mxfp8.md) |
 | AWQ / GPTQ (+ int Marlin) | `quantization/{awq,gptq}*.py` | ☐ T2 | Marlin template already vendored (nvfp4 instantiation) — int paths are new instantiations | [specs/awq-gptq.md](specs/awq-gptq.md) |
@@ -126,7 +126,7 @@ multi-process/multi-GPU re-enters through that seam.
 
 ## 8. Speculative decoding
 
-Scoping done → [spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md)
+Scoping done → [specs/spec-decode-scoping-2026-07-10.md](specs/spec-decode-scoping-2026-07-10.md)
 (B5). Route: MTP k=1 on 27B → GDN spec path → DFlash. Both gate checkpoints SHIP
 MTP heads (we currently skip `mtp.*` at load).
 
@@ -179,7 +179,7 @@ MTP heads (we currently skip `mtp.*` at load).
 
 ## 12. Platforms & hardware
 
-Per [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) (B1/B2) and
+Per [specs/expansion-map-2026-07-10.md](specs/expansion-map-2026-07-10.md) (B1/B2) and
 [backends.md](backends.md). Portability confined to vLLM's own seams
 (platforms/ + attention backends + vt:: op tables).
 
@@ -188,18 +188,18 @@ Per [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) (B1/B2) and
 | CUDA GB10 (sm_121) | `platforms/cuda.py` | ✅ T0 | the gate platform | [specs/cuda-gb10.md](specs/cuda-gb10.md) |
 | NVIDIA fan-out: A100/H100/4090 (sm_80+) | same | ☐ Wave 1 | B2: nearly FREE — bf16 path already sm_80+, ~no new kernels; needs per-arch Triton-AOT cubins (A4) + CI matrix | [specs/nvidia-fanout.md](specs/nvidia-fanout.md) |
 | ROCm (gfx942 first) | `platforms/rocm.py` | ☐ Wave 2 | B2: Triton GDN AOT retargets via one flag; rest = HIP port of vt:: | [specs/rocm.md](specs/rocm.md) |
-| Apple Metal via MLX (vendored under vt::) | — (§9.8 extension) | ☐ Wave 2 | B1: MLX wins vs native MSL; **hardware-gated — Mac procurement = critical path** | [specs/metal-mlx.md](specs/metal-mlx.md) |
+| Apple Metal via MLX (vendored under vt::) | — (§9.8 extension) | ☐ Wave 2 | B1: MLX wins vs native MSL; M4 Mac mini/16 GB reachable for op + small-model bring-up, but gate-model memory testing still needs a larger Mac | [specs/metal-mlx.md](specs/metal-mlx.md) |
 | Vulkan | — (§9.8 extension) | ☐ Wave 3 | B2 call: Vulkan before SYCL | [specs/vulkan.md](specs/vulkan.md) |
 | Intel XPU | `platforms/xpu.py` | ☐ Wave 3+ | loyal port (not a deviation) | [specs/intel-xpu.md](specs/intel-xpu.md) |
 | CPU production path (threadpool + compute-in-quant) | `platforms/cpu.py`, `csrc/cpu/` | 🚧 B4 | today: single-threaded scalar reference (correctness-grade, CI parity); B4: threadpool = 1-wk prereq, compute-in-quant ~3.3× decode / ~10× prefill on GGUF; local Qwen3.5-2B bench = decision measurement (in flight) | [specs/cpu-production.md](specs/cpu-production.md) |
-| De-Python the build (vendor Triton-AOT cubins per-arch) | — (build infra) | 🚧 A4 | agent in flight; `VLLM_CPP_TRITON_REGEN` = maintainer-only | [specs/depython-build.md](specs/depython-build.md) |
+| De-Python the build (vendor Triton-AOT cubins per-arch) | — (build infra) | ✅ A4/sm_121a | vendored artifacts + manifest build without Python; `VLLM_CPP_TRITON_REGEN` is maintainer-only; additional arches land with NVIDIA/ROCm fan-out | [specs/depython-build.md](specs/depython-build.md) |
 
 ## 13. Loading, tokenizer, config
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
 | safetensors loader + stacked-params mapping + WeightsMapper | `model_loader/` | ✅ T0 | | [specs/safetensors-loader.md](specs/safetensors-loader.md) |
-| GGUF loader (name mapping, transform inversions, expert split) + embedded vocab | `model_loader/gguf_loader.py` | 🟡 T0 | loader ✅; real-file GPU parity = A2 in flight (same row as §5 GGUF) | [specs/gguf-loader.md](specs/gguf-loader.md) |
+| GGUF loader (name mapping, transform inversions, expert split) + embedded vocab | `model_loader/gguf_loader.py` | 🟡 T0 | loader + 35B real-file GPU parity ✅; dense-27B loader/file and remaining quant breadth are open | [specs/gguf-loader.md](specs/gguf-loader.md) |
 | HF `tokenizer.json` byte-level BPE + incremental detok | `transformers_utils/tokenizer.py` | ✅ T0 | | [specs/hf-tokenizer.md](specs/hf-tokenizer.md) |
 | SentencePiece tokenizer | same | ☐ T1 | needed for Llama-2-era / Gemma checkpoints | [specs/sentencepiece.md](specs/sentencepiece.md) |
 | Config surface: dataclass-for-dataclass structs, `vllm serve`-compatible flags | `vllm/config/` | 🟡 T0/T1 | T0 set ✅; remainder lands with each feature | [specs/config-surface.md](specs/config-surface.md) |
@@ -209,7 +209,7 @@ Per [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) (B1/B2) and
 
 ## Reading the matrix into work
 
-1. Pick the highest-leverage ☐/🟡 row (tier order, then post-mvp.md §C/§D queue).
+1. Pick the highest-leverage ☐/🟡 row (tier order, then roadmap_v1.md §C/§D queue).
 2. Write its spec at the linked `specs/<slug>.md` path: scope, upstream file:line
    to mirror, gates (token-exact / conformance), same-box A/B plan.
 3. Delegate the spec to a sub-agent (worktree isolation; GPU work under the flock
@@ -217,5 +217,6 @@ Per [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) (B1/B2) and
 4. Merge + gate ⇒ ✅ here, marker flip in porting-inventory.md, row in
    parity-ledger.md — same change.
 
-Currently open T0 debt (pre-existing, tracked): `/metrics` core set (§9), GGUF
-real-file parity (A2), serve-latency A/B (A1), e2e suites (A5).
+Currently open T0 debt (pre-existing, tracked): `/metrics` core set (§9),
+serve-latency A/B (A1), and e2e suites (A5). GGUF real-file parity A2 passed;
+its remaining format/model breadth stays tracked in §5/§13.

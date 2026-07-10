@@ -8,13 +8,13 @@ v1 offline engine so the hard plumbing — GDN mamba state, full-attention KV
 cache, attention-metadata build, mrope positions, NVFP4 dequant/GEMM — is done
 by vLLM itself. We attach forward hooks to capture per-layer hidden states and
 compute logits from the model's own bf16 lm_head. See
-.agents/qwen36-forward-notes.md for the full recipe + rationale.
+.agents/specs/qwen36-forward-notes.md for the full recipe + rationale.
 
 Run on dgx (GB10, 119 GiB unified) in the pip oracle venv (`~/venvs/vllm-oracle`,
 pip vLLM 0.24.0 — same release family as pin e24d1b24). The pinned-Python-over-
 pip-kernels overlay was TRIED and BLOCKED (the post-0.24.0-tag pinned Python
 expects a newer vendored/compiled API than the pip 0.24.0 wheel ships — see
-.agents/qwen36-forward-notes.md §3), so pip 0.24.0 is the oracle. Every
+.agents/specs/qwen36-forward-notes.md §3), so pip 0.24.0 is the oracle. Every
 forward-math module in these checkpoints is byte-identical to the pin; only
 weight-loader plumbing + ROCm code differ. The ACTUAL working command (§4):
 
@@ -203,7 +203,7 @@ def main():
     # post-0.24.0-tag and its Python expects newer vendored/compiled APIs
     # (vllm_flash_attn.compile_flash_attn_varlen_func_from_specs) than the pip
     # 0.24.0 wheel ships, so a pinned-Python-over-pip-kernels overlay does not
-    # run (blocker recorded in .agents/qwen36-forward-notes.md). We therefore
+    # run (blocker recorded in .agents/specs/qwen36-forward-notes.md). We therefore
     # use the pip vLLM 0.24.0 engine — the SAME release family as the pin — as
     # the end-to-end oracle; it loads these exact checkpoints and greedy-decodes
     # coherently ("The capital of France is" -> " Paris"). Deviation from the

@@ -187,7 +187,7 @@ GgufValue ReadValue(Cursor& cur, uint32_t type, int depth,
 // GGML_TYPE_NVFP4 = 40 and GGML_TYPE_Q1_0 = 41 after mainline's
 // GGML_TYPE_MXFP4 = 39 (ggml/include/ggml.h:429-431). Block geometry from
 // ggml/src/ggml-common.h and gguf-py/gguf/constants.py GGML_QUANT_SIZES.
-// See .agents/gguf-nvfp4-notes.md for the full layout writeup.
+// See .agents/specs/gguf-nvfp4-notes.md for the full layout writeup.
 const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
   switch (type) {
     case 0: {

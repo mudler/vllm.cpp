@@ -14,6 +14,38 @@ never lag reality: no "pending"/"not yet confirmed" for something that now
 works, and no overclaim for something that doesn't. It is part of the record,
 kept honest and current alongside the ledger.
 
+**Keep the ROADMAP (`.agents/roadmap_v1.md`) and FEATURE MATRIX
+(`.agents/feature-matrix.md`) CURRENT — same-change obligation.** Any change
+that shifts a feature's or track's state — a feature lands, a gap opens, a spec
+gets written (`☐ → 🚧`), an agent starts/finishes implementing (`🚧 → ✅`,
+merged + gated), a research track reports, a queue item is re-ranked — updates
+the matching feature-matrix ROW (status + Spec link + one-line grounded note)
+and the roadmap track line (mark DONE with a one-line outcome + pointer to the
+full report/branch) **in the SAME change**, exactly like the README rule above.
+The matrix is the single feature-level status surface; the roadmap is the
+single track-level one — neither may lag reality, and neither is ever updated
+speculatively (a row flips ✅ only when merged + gated). Applies to every
+sub-agent; reviewers treat a state-shifting diff without its matrix/roadmap
+update as incomplete.
+
+**Doc lifecycle — live context vs completed record (user-directed 2026-07-10).**
+`.agents/` holds documents that are LIVE context for current work; era-closed
+documents move to **`.agents/completed/`** (version/era-stamped name, e.g.
+`completed/roadmap_mvp_v0.md`) in the same change that closes their era, with
+all repo links fixed. The roadmap is VERSIONED: `roadmap_v1.md` is current;
+when superseded, it moves to `completed/` and `roadmap_v2.md` takes its place.
+Nothing under `completed/` may be load-bearing for live decisions — if you need
+to cite it for current work, the relevant content belongs (summarized) in a
+live doc. Rationale: a reader of `.agents/` should see exactly what bears on
+what we are doing NOW, nothing stale mixed in.
+
+**Spec/scoping location.** All feature-specific implementation specs, scoping
+reports, semantics notes, feasibility studies, and design references live under
+`.agents/specs/`, never at the `.agents/` top level. The top level is reserved
+for the live project-wide protocol, roadmap, status, environment, inventory,
+and ledger. Specs that cease to be live context follow the same lifecycle and
+move to `.agents/completed/` with their links repaired.
+
 **Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
 message. This asserts the contributor (human or AI-assisted) has read this
 AGENTS.md and follows the protocol. **CI rejects any commit lacking it**
@@ -201,16 +233,19 @@ submitting AI-assisted code, read
 - [.agents/parity-ledger.md](.agents/parity-ledger.md) — **append-only
   ledger**: one row per change we introduce — what it does vs vLLM, upstream
   PR/commit references, how parity was verified.
-- [.agents/post-mvp.md](.agents/post-mvp.md) — **THE ROADMAP** (post-MVP,
+- [.agents/roadmap_v1.md](.agents/roadmap_v1.md) — **THE ROADMAP** (post-MVP,
   live): closing tracks, research tracks, T1/T2 queue, the feature-level
   breakdown (→ feature-matrix.md, each gap row delegable via its
   `.agents/specs/<slug>.md` spec), and the protocol evolution
   (mirror-as-floor, surpass-by-fusing).
-- [.agents/roadmap.md](.agents/roadmap.md) — ARCHIVED M0–M3 record of the
-  completed MVP (both throughput gates passed 2026-07-10).
+- [.agents/completed/roadmap_mvp_v0.md](.agents/completed/roadmap_mvp_v0.md) —
+  ARCHIVED M0–M3 record of the completed MVP (both throughput gates passed
+  2026-07-10).
 - [.agents/feature-matrix.md](.agents/feature-matrix.md) — **the one-by-one
   vLLM feature parity table** (what vLLM has vs what we have, every feature:
   parallelism, quant, serving, spec decode, multimodal, …). Living doc.
+- [.agents/specs/](.agents/specs/) — live feature implementation specs,
+  scoping reports, semantics notes, feasibility studies, and design references.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
   decisions, next steps. Update this every working session.
 

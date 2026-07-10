@@ -20,7 +20,7 @@
 // input_scale is present in W4A4-shaped checkpoints but UNUSED here (W4A16).
 //
 // NOTE: modelopt scales are standard IEEE fp8-e4m3fn. The GGUF killgate fork's
-// UE4M3 x0.5 LUT trap (.agents/gguf-nvfp4-notes.md) does NOT apply here.
+// UE4M3 x0.5 LUT trap (.agents/specs/gguf-nvfp4-notes.md) does NOT apply here.
 #pragma once
 
 #include <cstdint>

@@ -424,7 +424,7 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
   }
 }
 
-// GDN CPU reference kernels. Formulas: .agents/gdn-semantics.md (§ cited per
+// GDN CPU reference kernels. Formulas: .agents/specs/gdn-semantics.md (§ cited per
 // kernel); scalar f32 math throughout, states f32 in place.
 
 // §2 causal_conv1d_fn. Per sequence s (tokens [qsl[s], qsl[s+1])), channel c,

@@ -11,7 +11,7 @@
 //   - cp.async atom          : include/cute/arch/copy_sm80.hpp:40-193
 //   - cast_smem_ptr_to_uint  : include/cute/arch/util.hpp (__cvta_generic_to_shared)
 //   - PipelineState ring     : include/cutlass/pipeline/sm90_pipeline.hpp:171-250
-// Design record: .agents/tile-pipeline-component-2026-07-08.md
+// Design record: .agents/specs/tile-pipeline-component-2026-07-08.md
 #ifndef VT_CUDA_TILE_CP_ASYNC_CUH
 #define VT_CUDA_TILE_CP_ASYNC_CUH
 

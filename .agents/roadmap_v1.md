@@ -1,6 +1,7 @@
-# Roadmap (post-MVP) — THE project roadmap
-*(user-directed 2026-07-10: this document IS the roadmap now; the old
-[roadmap.md](roadmap.md) M0–M3 is the archived record of the completed MVP.)*
+# Roadmap v1 — post-MVP
+*(user-directed 2026-07-10: this document is the live roadmap; the completed
+M0–M3 record is archived at
+[completed/roadmap_mvp_v0.md](completed/roadmap_mvp_v0.md).)*
 
 **Context:** the MVP throughput gate is PASSED on both gate models (35B 1.02×,
 27B 1.007× vs production vLLM, token-exact, ~25-35% less memory — see
@@ -23,30 +24,41 @@ DONE with a one-line outcome + where the full report/branch lives.
 
 | # | Track | Question | State |
 |---|---|---|---|
-| B1 | Apple Metal / **MLX** | vllm-metal vs wiring MLX's C++ API behind `vt::` vs native MSL | ✅ **MLX wins** (Ollama's production swap ~1.6-2×); vendor MLX under vt:: + port vllm-metal's paged MSL as MLX primitives; **hardware-gated: needs a Mac (procurement = critical path)**. → [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) |
+| B1 | Apple Metal / **MLX** | vllm-metal vs wiring MLX's C++ API behind `vt::` vs native MSL | ✅ **MLX wins** (Ollama's production swap ~1.6-2×); vendor MLX under vt:: + port vllm-metal's paged MSL as MLX primitives. **Hardware now available:** `ssh 192.168.68.103`, M4 Mac mini/16 GB; enough for op parity + small-model bring-up, not the 27B/35B gates. → [specs/expansion-map-2026-07-10.md](specs/expansion-map-2026-07-10.md) |
 | B2 | Arches & vendors | per-arch matrix; Triton→AMD; SYCL vs Vulkan | ✅ **NVIDIA fan-out nearly FREE** (bf16 path already sm_80+; A100/H100/4090 need ~no new kernels — Wave 1); **Triton GDN → AMD gfx942 via one flag**; Vulkan-before-SYCL call. → map |
 | B3 | SGLang steals | measured wins portable to C++ | ✅ **Async/overlap scheduling is vLLM's DEFAULT at our pin — an unmet MIRROR obligation** (we run synchronous); reframed as latency/mirror, not throughput (we already ≥1.0× vs async-vLLM). RadixAttention REJECTED per mirror policy. Kernel steals: no-op. → map |
 | B4 | llama.cpp CPU | vendor IF proven faster (user criterion) | ✅ research: **our CPU is a single-threaded scalar loop (zero threads!)** — threadpool = 1-wk prerequisite; **compute-in-quant** = the structural fix (~3.3× decode, ~10× prefill on GGUF). 🔄 local Qwen3.5-2B bench = the decision measurement | 
-| B5 | Speculative decoding | MTP + dflash | ✅ **Both gate checkpoints SHIP MTP heads** (bf16, we currently skip `mtp.*` at load!); **DFlash** (block-diffusion drafter, ICML'26) is in-pin WITH published drafts for our exact models + a DGX-Spark community container. Route: MTP k=1 27B → GDN spec path → DFlash. → [spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md) — **specs written → [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md), [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md)** (NB: B5's "27B pure attention" was wrong — both gates are GDN hybrids; the GDN spec path is on milestone 1, spec §0) |
+| B5 | Speculative decoding | MTP + dflash | ✅ **Both gate checkpoints SHIP MTP heads** (bf16, we currently skip `mtp.*` at load!); **DFlash** (block-diffusion drafter, ICML'26) is in-pin WITH published drafts for our exact models + a DGX-Spark community container. Route: MTP k=1 27B → GDN spec path → DFlash. → [specs/spec-decode-scoping-2026-07-10.md](specs/spec-decode-scoping-2026-07-10.md) — **specs written → [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md), [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md)** (NB: B5's "27B pure attention" was wrong — both gates are GDN hybrids; the GDN spec path is on milestone 1, spec §0) |
 | B6 | Feature parity matrix | the big one-by-one vLLM-feature table (TP/PP/EP, LoRA, multimodal, disagg, pooling, …) — what we have / miss / tier | ✅ **[feature-matrix.md](feature-matrix.md)** — 13 sections, ~80 rows, every row source-verified + carrying its `Spec` delegation link; headline gaps surfaced: `/metrics` (open T0-core debt), async/overlap scheduling (unmet MIRROR obligation, B3), logprobs payload + logit_bias/bad_words API wiring (sampler done, serving not) |
-| B7 | Multimodality + tool calls | image/audio/video route; parallel tool calls | ✅ **the gate checkpoints ARE the VLMs** (full ViT shipped in both — 333 `model.visual.*` tensors we currently DROP at load; no deepstack; interleaved M-RoPE) → vision = a MIRROR obligation. **Our Qwen3 tool parser targets the WRONG format** (Hermes JSON; the shipped template is Qwen3-Coder XML — vLLM serves 27B with `qwen3_coder`) + no reasoning parser + our Jinja engine can't render the shipped template (~10 missing constructs) + tool-result round-trip broken; parallel tool calls otherwise solid (parser/index/grammar/streaming, tested). 6 specs ranked. → [mm-tools-scoping-2026-07-10.md](mm-tools-scoping-2026-07-10.md) |
+| B7 | Multimodality + tool calls | image/audio/video route; parallel tool calls | ✅ **the gate checkpoints ARE the VLMs** (full ViT shipped in both — 333 `model.visual.*` tensors we currently DROP at load; no deepstack; interleaved M-RoPE) → vision = a MIRROR obligation. **Our Qwen3 tool parser targets the WRONG format** (Hermes JSON; the shipped template is Qwen3-Coder XML — vLLM serves 27B with `qwen3_coder`) + no reasoning parser + our Jinja engine can't render the shipped template (~10 missing constructs) + tool-result round-trip broken; parallel tool calls otherwise solid (parser/index/grammar/streaming, tested). 6 specs ranked. → [specs/mm-tools-scoping-2026-07-10.md](specs/mm-tools-scoping-2026-07-10.md) |
 
-## C. T1 queue (from roadmap.md Post-MVP, unchanged priorities)
+## C. T1 queue (all open v0 items carried forward)
 
-- **Kernel drop-in alignment** (user-mandated, unblocked now the gates passed):
-  reshape vt CUDA/ROCm kernel entry points to match upstream csrc signatures so
-  upstream kernels drop in (backends.md §drop-in). **Next to kick off.**
-- Dense/MoE model families (Llama / Qwen3-dense / Mixtral …) · MTP spec decode
-  (→ B5 scoping first) · fp8 quant · sliding window · priority scheduling ·
-  YaRN · prompt_logprobs / logit_bias / bad_words · tokenize endpoints · full
-  metrics · Qwen3-Next.
-- Recurring: upstream **sync cycle** (upstream-sync.md) + P1 sync tooling.
+This is the complete Post-MVP queue inherited from the
+[completed v0 roadmap](completed/roadmap_mvp_v0.md), expanded into track rows so
+none of its compact TODO list is lost. Feature-level state and delegation specs
+live in [feature-matrix.md](feature-matrix.md).
+
+| # | Track | State |
+|---|---|---|
+| C1 | **Kernel drop-in alignment**: reshape `vt::` CUDA/ROCm adapter entry points around upstream `csrc` raw-pointer/shape/stride/stream signatures so copied kernels bind with only the Torch tensor wrapper replaced ([backends.md §drop-in](backends.md#post-mvp-drop-in-kernel-compatibility-with-upstream)) | ☐ **next to scope**; MVP experience already proves the approach with CUTLASS NVFP4, Marlin, and FlashAttention-2 lifts |
+| C2 | Dense/MoE model families: Llama, Qwen3 dense, Mixtral, then Qwen3-Next | ☐ T1; [feature matrix §4](feature-matrix.md#4-model-families) |
+| C3 | MTP speculative decode, starting k=1 on 27B and including the GDN speculative path | 🚧 specs written: [MTP](specs/mtp-spec-decode.md), then [DFlash](specs/dflash-spec-decode.md) |
+| C4 | FP8 W8A8 quantization breadth | ☐ T1; [feature matrix §5](feature-matrix.md#5-quantization) |
+| C5 | Sliding-window KV/attention and YaRN long-context scaling | ☐ T1; [feature matrix §§2,11](feature-matrix.md#2-kv-cache--memory) |
+| C6 | Priority scheduling | ☐ T1; [feature matrix §1](feature-matrix.md#1-engine-core--scheduling) |
+| C7 | `prompt_logprobs`, `logit_bias`, `allowed_token_ids`, and `bad_words` end-to-end API wiring | 🟡 T1; sampler ops exist, engine/serving payload and protocol wiring remain ([feature matrix §6](feature-matrix.md#6-sampling--generation-controls)) |
+| C8 | `/tokenize`/`/detokenize` utility endpoints and full Prometheus metrics | ☐ T1; `/metrics` core is the oldest open T0 debt ([feature matrix §9](feature-matrix.md#9-serving-surface-openai-api-endpoints-cli-library)) |
+| C9 | Recurring upstream sync cycle and P1 sync tooling | 🔁 recurring; [upstream-sync.md](upstream-sync.md) |
 
 ## D. T2 (after T1, per porting-inventory.md)
 
-Backend expansion per backends.md (Metal/MLX per B1, Vulkan, Intel XPU, ANE),
-multi-GPU/TP (**spec written → [specs/tensor-parallelism.md](specs/tensor-parallelism.md)**; ⚠ needs a 2-GPU box — GB10 is single-GPU),
-spec-decode breadth, LoRA, offload, model zoo breadth.
+| # | Track | State |
+|---|---|---|
+| D1 | Backend expansion: NVIDIA fan-out → ROCm; Apple Metal via MLX (B1 selected E1 over native-MSL-first; M4/16 GB dev host available); Vulkan; loyal Intel XPU port; ANE for encoder/pooling classes | ☐ staged by waves in [feature matrix §12](feature-matrix.md#12-platforms--hardware) and [backends.md](backends.md) |
+| D2 | Multi-GPU / tensor parallelism | 🚧 [spec written](specs/tensor-parallelism.md); needs a 2-GPU box because GB10 is single-GPU |
+| D3 | Spec-decode breadth beyond MTP/DFlash | ☐ ngram and EAGLE3 after the T1 path |
+| D4 | LoRA, KV/offload breadth, and wider model zoo | ☐ T2 |
 
 ## Protocol evolution (user-directed, 2026-07-10) — mirror as the FLOOR, surpass beyond it
 

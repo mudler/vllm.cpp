@@ -1,5 +1,5 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
-// MoE CPU reference op unit tests. Formula reference: .agents/moe-semantics.md
+// MoE CPU reference op unit tests. Formula reference: .agents/specs/moe-semantics.md
 // (§3 router softmax/top-k/renormalize, §4 expert MLP + weighted combine, §5
 // shared-expert sigmoid gate, §6 combine order). Golden coverage lives in
 // tests/parity/test_op_parity.cpp; these tests pin hand-computed values and the

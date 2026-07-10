@@ -2,7 +2,7 @@
 
 Implementation-ready spec for Multi-Token-Prediction speculative decoding on
 both gate checkpoints. Derived from
-[.agents/spec-decode-scoping-2026-07-10.md](../spec-decode-scoping-2026-07-10.md);
+[.agents/specs/spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md);
 every claim re-grounded against the pin (`/home/mudler/_git/vllm` @ `e24d1b24`)
 and the actual checkpoints on `dgx.casa`. Companion spec:
 [dflash-spec-decode.md](dflash-spec-decode.md) (depends on this one).

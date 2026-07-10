@@ -1,6 +1,6 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 // Dense causal attention op unit tests. Formula reference:
-// .agents/qwen36-forward-notes.md §5 (Qwen3NextAttention core: causal GQA
+// .agents/specs/qwen36-forward-notes.md §5 (Qwen3NextAttention core: causal GQA
 // scaled-dot-product). Golden coverage (qk-norm + RoPE + gate composed) lives in
 // tests/parity/test_op_parity.cpp (dense_attention_*); these tests pin
 // hand-computed values and the corners the random goldens do not isolate:

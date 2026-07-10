@@ -2,7 +2,7 @@
 
 Block-diffusion drafting — the headline speculative method after MTP lands.
 Derived from
-[.agents/spec-decode-scoping-2026-07-10.md](../spec-decode-scoping-2026-07-10.md);
+[.agents/specs/spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md);
 re-grounded against the pin (`/home/mudler/_git/vllm` @ `e24d1b24`) and the
 live HF draft checkpoints (re-verified 2026-07-10). **Prerequisite:
 [mtp-spec-decode.md](mtp-spec-decode.md) fully landed** — DFlash reuses its

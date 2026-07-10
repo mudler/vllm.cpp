@@ -27,7 +27,7 @@
 //
 // On-disk tensor names differ too: weight_packed / weight_scale /
 // weight_global_scale / input_global_scale (CT) vs weight / weight_scale /
-// weight_scale_2 / input_scale (modelopt). See .agents/qwen27b-w4a4-notes.md §3.
+// weight_scale_2 / input_scale (modelopt). See .agents/specs/qwen27b-w4a4-notes.md §3.
 #pragma once
 
 #include <cstdint>

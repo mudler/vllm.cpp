@@ -248,6 +248,20 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
       check_bytes(4);
       std::memcpy(y, data, static_cast<size_t>(numel) * sizeof(float));
       break;
+    case 1:  // F16 (ggml fp16 = IEEE half; unquantized tensors in mixed files)
+      check_bytes(2);
+      for (int64_t i = 0; i < numel; ++i) y[i] = ReadF16(data + i * 2);
+      break;
+    case 30: {  // BF16 (upper 16 bits of f32)
+      check_bytes(2);
+      for (int64_t i = 0; i < numel; ++i) {
+        uint16_t b;
+        std::memcpy(&b, data + i * 2, sizeof(b));
+        uint32_t u = static_cast<uint32_t>(b) << 16;
+        std::memcpy(&y[i], &u, sizeof(u));
+      }
+      break;
+    }
     case 2:  // Q4_0
       check_bytes(18);
       DequantQ4_0(data, nb, y);

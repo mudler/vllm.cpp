@@ -2633,8 +2633,7 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
                      const __nv_bfloat16* k, const __nv_bfloat16* u, const __nv_bfloat16* w,
                      const float* gcum, const int32_t* qsl, const int32_t* boh, int64_t hk_n,
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t n_seq, int64_t t_tot) {
-  const char* e = std::getenv("VT_GDN_DELTAH_TRITON");
-  if (e == nullptr || e[0] != '1') return false;  // opt-in until proven; A/B toggle
+  if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) return false;  // default ON (see GdnTritonEnvOn); =0 restores hand path
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
@@ -2652,9 +2651,14 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
   return true;
 }
 
+// DEFAULT-ON (2026-07-10) in the VLLM_CPP_TRITON build: gated by token-exact
+// test_ops_gdn 31/31 + 27B AND 35B greedy 16/16 through the Triton path in BOTH
+// toggle arms, and the measured every-axis win (35B conc64 +2.64% total, TTFT
+// −4.1%, TPOT −2.4%, mem equal → 1.0195× vs graphed vLLM = the MVP gate; 27B
+// +13pts at conc32). `VT_GDN_*_TRITON=0` opts back into the hand-C++ kernels.
 static bool GdnTritonEnvOn(const char* n) {
   const char* e = std::getenv(n);
-  return e != nullptr && e[0] == '1';
+  return e == nullptr || e[0] != '0';
 }
 
 // SANCTIONED Triton AOT fast-path for GDN chunk_o (the output kernel). Fires ONLY

@@ -1736,3 +1736,23 @@ exists; IN FLIGHT: the decisive A/B, does Triton GDN cross 1.0×?). 27B **~0.958
 mnbt 8192→2048 +11.5%, the conc32 gap was largely OUR batch config starving decode).
 Remaining 27B ~4%: GDN AOT config tune (FLA autotuner best_config vs our pinned BV64/w4/s3),
 TTFT axis, non-GDN fusion residual.
+
+## 2026-07-10 — 🎯 35B MVP THROUGHPUT GATE PASSED: 1.0195× vs graphed vLLM (Triton GDN on)
+
+Decisive A/B on consolidated main @1489774 (VLLM_CPP_TRITON=ON build; token-exact both arms:
+test_ops_gdn 31/31 + 35B greedy 16/16 + batched): 35B conc64/np200 in1024/out128 —
+Triton-GDN ON **3345.9** vs OFF 3260.0 (+2.64%, arms non-overlapping, ±0.03% spread).
+**3345.9 / 3282.0 (fresh graphed vLLM) = 1.0195×** (per-rep 1.0192–1.0198; worst-case
+contended bound 1.0073×). Every axis: TTFT −4.1%, TPOT −2.4%, peak mem 52.8 vs vLLM ~80.6GB.
+One OFF rep was discarded for contention (a concurrent agent's gate test) and re-run clean —
+disclosed. **The 35B meets the ≥1.0× MVP bar on every measured axis** (vLLM TTFT/TPOT not
+measurable via its offline bench; ours beat the OFF arm on both).
+
+**Triton runtime toggles flipped DEFAULT-ON** in the VLLM_CPP_TRITON build (GdnTritonEnvOn:
+absent→on, =0 opts out) — gated by both-arm token-exactness on both models + the every-axis
+win. Default (non-Triton) build unchanged (hand-C++, 0.99×).
+
+**27B consolidated checkpoint: 0.970× at conc32** (Triton + fp4-autotune + mnbt2048;
+1011.6/1043.2, ±0.24%, peak 61.8GB vs vLLM ~86.4GB) — from 0.840× at the start of this
+push. Residual ~3%; the finisher agent (mnbt dense default mirroring vLLM's scheduler 2048 +
+FLA-autotuner GDN config re-pin) is in flight. README updated (35B ≥1.0×, 27B ≈0.97×).

@@ -4,7 +4,9 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <exception>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include <httplib/httplib.h>
@@ -17,13 +19,11 @@ namespace vllm::entrypoints::openai {
 // Opaque httplib::Server (pimpl — keeps httplib.h out of api_server.h).
 struct ApiServer::Impl {
   httplib::Server server;
-  // The LLMEngine (+ Scheduler + runner + KV cache) is stateful and NOT
-  // thread-safe, but httplib services requests on a worker-thread pool. Serialize
-  // every engine-touching request so two concurrent clients cannot interleave
-  // add_request/step and corrupt the shared engine state. T0 = one request at a
-  // time (correct, not concurrent-throughput); true in-flight batching of
-  // multiple HTTP requests through one engine loop is a later async redesign.
-  std::mutex engine_mutex;
+  // The legacy LLMEngine serving constructors remain for small synthetic
+  // tests and embedding compatibility. Unlike AsyncLLM, that engine is driven
+  // synchronously by its caller, so retain one shared lock for that seam only.
+  // Production handlers use AsyncLLM and never take this request-level lock.
+  std::mutex legacy_engine_mutex;
 };
 
 namespace {
@@ -83,7 +83,9 @@ ApiServer::DispatchResult ApiServer::handle_completions(
 
   CompletionResult result;
   try {
-    std::lock_guard<std::mutex> engine_lock(impl_->engine_mutex);
+    std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
+                                             std::defer_lock);
+    if (!completion_.uses_async_engine()) legacy_lock.lock();
     result = completion_.create_completion(request);
   } catch (const std::exception& e) {
     return MakeError(500, "InternalServerError", e.what());
@@ -94,6 +96,7 @@ ApiServer::DispatchResult ApiServer::handle_completions(
     out.streaming = true;
     out.content_type = "text/event-stream";
     out.sse_chunks = std::move(result.sse_chunks);
+    out.sse_stream = std::move(result.sse_stream);
   } else {
     out.status = 200;
     out.content_type = "application/json";
@@ -127,7 +130,9 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
 
   ChatCompletionResult result;
   try {
-    std::lock_guard<std::mutex> engine_lock(impl_->engine_mutex);
+    std::unique_lock<std::mutex> legacy_lock(impl_->legacy_engine_mutex,
+                                             std::defer_lock);
+    if (!chat_.uses_async_engine()) legacy_lock.lock();
     result = chat_.create_chat_completion(request);
   } catch (const std::exception& e) {
     return MakeError(500, "InternalServerError", e.what());
@@ -138,6 +143,7 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     out.streaming = true;
     out.content_type = "text/event-stream";
     out.sse_chunks = std::move(result.sse_chunks);
+    out.sse_stream = std::move(result.sse_stream);
   } else {
     out.status = 200;
     out.content_type = "application/json";
@@ -183,13 +189,38 @@ void ApiServer::register_routes() {
   auto write = [](const DispatchResult& result, httplib::Response& res) {
     res.status = result.status;
     if (result.streaming) {
-      // Each `data: {...}\n\n` chunk written via cpp-httplib's chunked content
-      // provider (StreamingResponse). The chunks are precomputed by the Task-2
-      // handler (T0 engine runs synchronously); the provider streams them out.
-      // httplib calls the provider with a cumulative BYTE offset (not a chunk
-      // index) and re-invokes until done() is signalled — so emit every
-      // precomputed chunk as its own sink.write() (one HTTP chunk each) in a
-      // single pass, then done().
+      if (result.sse_stream != nullptr) {
+        // W2 live StreamingResponse: one provider invocation pulls one
+        // per-request collector output. A slow/disconnected client occupies
+        // only its httplib worker; AsyncLLM keeps batching other requests.
+        std::shared_ptr<SseStream> stream = result.sse_stream;
+        res.set_chunked_content_provider(
+            result.content_type,
+            [stream](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+              try {
+                std::string chunk;
+                if (!stream->next(chunk)) {
+                  sink.done();
+                  return true;
+                }
+                if (!sink.write(chunk.data(), chunk.size())) {
+                  stream->abort();
+                  return false;
+                }
+                return true;
+              } catch (...) {
+                stream->abort();
+                return false;
+              }
+            },
+            [stream](bool success) {
+              if (!success) stream->abort();
+            });
+        return;
+      }
+
+      // Legacy synchronous compatibility/test seam: write the precomputed
+      // chunks exactly as before.
       auto chunks = std::make_shared<std::vector<std::string>>(result.sse_chunks);
       res.set_chunked_content_provider(
           result.content_type,

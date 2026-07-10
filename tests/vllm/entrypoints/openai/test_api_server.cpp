@@ -1,6 +1,6 @@
 // Tests for the OpenAI HTTP api_server (M3.1 Task 4). Two layers:
 //   1. HANDLER-DISPATCH (no socket, the primary coverage): drive the ApiServer
-//      handle_* methods with request bodies over a small SYNTHETIC LLMEngine and
+//      handle_* methods with request bodies over a small synthetic AsyncLLM and
 //      assert the OpenAI response shape, SSE framing, error status codes and
 //      that a completion serializes without a 500 from invalid UTF-8.
 //   2. SOCKET SMOKE (real HTTP over an ephemeral port via cpp-httplib's client):
@@ -40,6 +40,7 @@
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/core.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/llm_engine.h"
 #include "vllm/v1/engine/output_processor.h"
@@ -62,6 +63,7 @@ using vllm::entrypoints::openai::OpenAIServingCompletion;
 using vllm::entrypoints::openai::OpenAIServingModels;
 using vllm::tok::Tokenizer;
 using vllm::v1::EngineCore;
+using vllm::v1::AsyncLLM;
 using vllm::v1::Executor;
 using vllm::v1::FullAttentionSpec;
 using vllm::v1::get_request_block_hasher;
@@ -305,13 +307,13 @@ struct ServerHarness {
                   /*enable_caching=*/true),
         runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, kMaxModelLen * 8),
         executor(runner),
-        engine_core(scheduler, executor),
         input_processor(tok, c),
         output_processor(&tok),
-        engine(input_processor, engine_core, output_processor, Hasher()),
+        async_engine(input_processor, scheduler, executor, output_processor,
+                     Hasher()),
         models("test-model"),
-        completion(engine, "test-model"),
-        chat(engine, "test-model", InVocabChatPrompt),
+        completion(async_engine, "test-model"),
+        chat(async_engine, "test-model", InVocabChatPrompt),
         server(completion, chat, models, "9.9.9") {}
 
   static SchedulerConfig MakeSchedulerConfig() {
@@ -335,10 +337,9 @@ struct ServerHarness {
   Scheduler scheduler;
   GPUModelRunner runner;
   Executor executor;
-  EngineCore engine_core;
   InputProcessor input_processor;
   OutputProcessor output_processor;
-  LLMEngine engine;
+  AsyncLLM async_engine;
   OpenAIServingModels models;
   OpenAIServingCompletion completion;
   OpenAIServingChat chat;
@@ -380,15 +381,54 @@ TEST_CASE("api_server: streaming completion dispatch → SSE chunks ending [DONE
   CHECK(r.status == 200);
   CHECK(r.streaming);
   CHECK(r.content_type == "text/event-stream");
-  REQUIRE(r.sse_chunks.size() >= 2);
-  CHECK(r.sse_chunks.back() == "data: [DONE]\n\n");
+  REQUIRE(r.sse_stream != nullptr);
+  std::vector<std::string> chunks;
+  std::string chunk;
+  while (r.sse_stream->next(chunk)) chunks.push_back(chunk);
+  REQUIRE(chunks.size() >= 2);
+  CHECK(chunks.back() == "data: [DONE]\n\n");
   // Each non-terminal chunk is a valid `data: {json}\n\n` frame.
-  for (size_t i = 0; i + 1 < r.sse_chunks.size(); ++i) {
-    REQUIRE(r.sse_chunks[i].rfind("data: ", 0) == 0);
-    REQUIRE(r.sse_chunks[i].substr(r.sse_chunks[i].size() - 2) == "\n\n");
-    json j = json::parse(r.sse_chunks[i].substr(6, r.sse_chunks[i].size() - 8));
+  for (size_t i = 0; i + 1 < chunks.size(); ++i) {
+    REQUIRE(chunks[i].rfind("data: ", 0) == 0);
+    REQUIRE(chunks[i].substr(chunks[i].size() - 2) == "\n\n");
+    json j = json::parse(chunks[i].substr(6, chunks[i].size() - 8));
     CHECK(j.at("object") == "text_completion");
   }
+}
+
+// Ported from tests/entrypoints/openai/completion/test_completion.py:259
+// (test_completion_streaming), with W2's load-bearing arrival assertion: the
+// first content frame is observed before the terminal frame instead of being
+// replayed from a precomputed vector after generation completes.
+TEST_CASE("api_server: live SSE first chunk arrives before generation completes") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body =
+      R"({"prompt":"hello","max_tokens":20,"temperature":0.0,"stream":true})";
+  const auto started = std::chrono::steady_clock::now();
+  ApiServer::DispatchResult result = h.server.handle_completions(body);
+  const auto dispatched = std::chrono::steady_clock::now();
+  REQUIRE(result.sse_stream != nullptr);
+  CHECK(result.sse_chunks.empty());  // no precomputed fake-SSE fallback
+
+  std::string first;
+  REQUIRE(result.sse_stream->next(first));
+  const auto first_arrival = std::chrono::steady_clock::now();
+  REQUIRE(first.rfind("data: ", 0) == 0);
+  const json first_payload =
+      json::parse(first.substr(6, first.size() - 8));
+  CHECK(first_payload.at("choices").at(0).at("finish_reason").is_null());
+
+  size_t chunk_count = 1;
+  std::string chunk;
+  while (result.sse_stream->next(chunk)) ++chunk_count;
+  const auto completed = std::chrono::steady_clock::now();
+  CHECK(chunk_count > 2);  // content frames plus [DONE]
+  CHECK(dispatched < first_arrival);
+  CHECK(first_arrival < completed);
+  CHECK(started < completed);
 }
 
 TEST_CASE("api_server: chat dispatch → assistant message") {
@@ -404,6 +444,58 @@ TEST_CASE("api_server: chat dispatch → assistant message") {
   json j = json::parse(r.body);
   CHECK(j.at("object") == "chat.completion");
   CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
+}
+
+TEST_CASE("api_server: live chat SSE emits role, content, finish, and DONE") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body =
+      R"({"messages":[{"role":"user","content":"hello"}],"max_completion_tokens":8,"temperature":0.0,"stream":true})";
+  ApiServer::DispatchResult result = h.server.handle_chat_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+
+  std::string chunk;
+  REQUIRE(result.sse_stream->next(chunk));
+  json role = json::parse(chunk.substr(6, chunk.size() - 8));
+  CHECK(role.at("choices").at(0).at("delta").at("role") == "assistant");
+  CHECK(role.at("choices").at(0).at("finish_reason").is_null());
+
+  size_t content_frames = 0;
+  bool finish_seen = false;
+  bool done_seen = false;
+  while (result.sse_stream->next(chunk)) {
+    if (chunk == "data: [DONE]\n\n") {
+      done_seen = true;
+      continue;
+    }
+    json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+    const json& choice = frame.at("choices").at(0);
+    if (!choice.at("finish_reason").is_null()) finish_seen = true;
+    if (choice.at("delta").contains("content")) ++content_frames;
+  }
+  CHECK(content_frames > 0);
+  CHECK(finish_seen);
+  CHECK(done_seen);
+}
+
+TEST_CASE("api_server: disconnect aborts a live SSE request") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body =
+      R"({"prompt":"hello","max_tokens":30,"temperature":0.0,"stream":true})";
+  ApiServer::DispatchResult result = h.server.handle_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+  std::string first;
+  REQUIRE(result.sse_stream->next(first));
+  result.sse_stream->abort();
+  for (int i = 0; i < 500 && h.async_engine.has_unfinished_requests(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK_FALSE(h.async_engine.has_unfinished_requests());
 }
 
 TEST_CASE("api_server: malformed JSON → 400 error shape") {
@@ -519,13 +611,10 @@ TEST_CASE("api_server: socket smoke — real HTTP requests over an ephemeral por
   server_thread.join();
 }
 
-// Concurrent clients must not race the stateful (non-thread-safe) LLMEngine:
-// httplib services requests on a worker-thread pool, so the api_server serializes
-// engine-touching requests with a mutex. This fires N concurrent completion
-// requests and asserts every one returns a well-formed 200 (no crash, no
-// corrupted/empty body). Without the mutex this races the shared scheduler/runner
-// /KV state (a TSan/ASan build would flag it; even plain builds can crash/garble).
-TEST_CASE("api_server: concurrent requests are serialized (no engine race)") {
+// W2 port of test_async_llm.test_load at the HTTP boundary: concurrent workers
+// submit into one AsyncLLM queue and complete as one scheduler batch; there is
+// no server-wide engine mutex.
+TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
   ServerHarness h(c, w, Fixture());

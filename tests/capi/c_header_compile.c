@@ -23,6 +23,7 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
   vllm_sampling_params sp = vllm_sampling_params_default();
   vllm_completion out;
   vllm_token_callback cb = &c_header_token_cb;
+  vllm_request* request = NULL;
   vllm_status st = VLLM_OK;
 
   st = vllm_engine_load(&mp, &eng);
@@ -31,6 +32,15 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
     vllm_completion_free(&out);
     vllm_string_free(out.text);
     st = vllm_complete_stream(eng, prompt, &sp, cb, /*user_data=*/NULL);
+    st = vllm_request_submit(eng, prompt, &sp, cb, /*user_data=*/NULL,
+                             &request);
+    if (request != NULL) {
+      (void)vllm_request_done(request);
+      (void)vllm_request_error(request);
+      (void)vllm_request_cancel(request);
+      st = vllm_request_wait(request);
+      vllm_request_free(request);
+    }
     vllm_engine_free(eng);
   }
 

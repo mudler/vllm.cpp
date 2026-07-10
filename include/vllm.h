@@ -72,8 +72,13 @@ typedef enum vllm_status {
 /* ── Opaque handles ───────────────────────────────────────────────────────────
  * The engine handle owns the whole C++ stack (LLMEngine + Scheduler + runner +
  * KV cache + processors + tokenizer). Created by vllm_engine_load, destroyed by
- * vllm_engine_free. Not thread-safe: serialize calls on one handle. */
+ * vllm_engine_free. W2 completion submissions are thread-safe and share one
+ * AsyncLLM scheduler; destruction still requires all request handles freed. */
 typedef struct vllm_engine vllm_engine;
+
+/* A non-blocking request returned by vllm_request_submit. The engine MUST
+ * outlive every request created from it. Free with vllm_request_free. */
+typedef struct vllm_request vllm_request;
 
 /* ── Model / load parameters ──────────────────────────────────────────────────
  * POD. Populate with vllm_model_params_default() then override. All `const char*`
@@ -192,6 +197,39 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
                                           const vllm_sampling_params* params,
                                           vllm_token_callback cb,
                                           void* user_data);
+
+/* ── Non-blocking streaming requests (async-serving W2) ─────────────────────
+ * Submit returns after validation/enqueue. A library-owned delivery thread
+ * invokes `cb` for each RequestOutput delta while the shared AsyncLLM engine
+ * continues batching other requests. `out` receives an owned request handle.
+ * The callback/user_data borrow follows vllm_complete_stream's contract.
+ * The engine must outlive the request handle. */
+VLLM_API vllm_status vllm_request_submit(
+    vllm_engine* engine, const char* prompt,
+    const vllm_sampling_params* params, vllm_token_callback cb,
+    void* user_data, vllm_request** out);
+
+/* Abort an in-flight request. Idempotent; its delivery thread exits after the
+ * terminal abort output is consumed. */
+VLLM_API vllm_status vllm_request_cancel(vllm_request* request);
+
+/* Wait for callback delivery to finish and return its terminal status. On an
+ * error, vllm_last_error() on the WAITING thread receives the request error.
+ * Do not call wait/free from that request's own callback. */
+VLLM_API vllm_status vllm_request_wait(vllm_request* request);
+
+/* Non-blocking completion probe (false for NULL). */
+VLLM_API bool vllm_request_done(const vllm_request* request);
+
+/* Request-owned diagnostic string. Empty while the request is still running;
+ * after vllm_request_done returns true (or wait returns), valid until
+ * vllm_request_free. Never NULL. */
+VLLM_API const char* vllm_request_error(const vllm_request* request);
+
+/* Cancel if needed, join the delivery thread, and destroy the handle. NULL is
+ * a no-op. The parent engine must still be alive. Must not be called from the
+ * request's own callback; use cancel there and free from another thread. */
+VLLM_API void vllm_request_free(vllm_request* request);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

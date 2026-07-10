@@ -4,9 +4,109 @@
 #include "vllm/v1/engine/output_processor.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 namespace vllm::v1 {
+
+// ---------------------------------------------------------------------------
+// RequestOutputCollector
+// ---------------------------------------------------------------------------
+
+RequestOutputCollector::RequestOutputCollector(RequestOutputKind output_kind,
+                                               std::string request_id)
+    : aggregate_(output_kind == RequestOutputKind::kDelta),
+      request_id_(std::move(request_id)) {}
+
+void RequestOutputCollector::put(RequestOutput output) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!output_.has_value()) {
+      output_ = std::move(output);
+    } else {
+      Merge(std::move(output));
+    }
+  }
+  ready_.notify_one();
+}
+
+void RequestOutputCollector::put_error(std::exception_ptr error) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    error_ = std::move(error);
+    output_.reset();
+  }
+  ready_.notify_one();
+}
+
+RequestOutput RequestOutputCollector::get() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  ready_.wait(lock, [&] { return output_.has_value() || error_ != nullptr; });
+  if (error_ != nullptr) {
+    std::exception_ptr error = std::move(error_);
+    error_ = nullptr;
+    lock.unlock();
+    std::rethrow_exception(error);
+  }
+  RequestOutput output = std::move(*output_);
+  output_.reset();
+  return output;
+}
+
+std::optional<RequestOutput> RequestOutputCollector::get_nowait() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (error_ != nullptr) {
+    std::exception_ptr error = std::move(error_);
+    error_ = nullptr;
+    lock.unlock();
+    std::rethrow_exception(error);
+  }
+  if (!output_.has_value()) return std::nullopt;
+  std::optional<RequestOutput> output(std::move(*output_));
+  output_.reset();
+  return output;
+}
+
+bool RequestOutputCollector::has_output() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return output_.has_value() || error_ != nullptr;
+}
+
+void RequestOutputCollector::Merge(RequestOutput next) {
+  // RequestOutput.add(next, aggregate=...) from outputs.py. Keep completions
+  // with distinct indexes independent (parallel sampling is deferred, but the
+  // collector contract is complete and the cumulative n>1 test can exercise
+  // the value merge directly).
+  RequestOutput& current = *output_;
+  for (CompletionOutput& next_completion : next.outputs) {
+    auto it = std::find_if(
+        current.outputs.begin(), current.outputs.end(),
+        [&](const CompletionOutput& completion) {
+          return completion.index == next_completion.index;
+        });
+    if (it == current.outputs.end()) {
+      current.outputs.push_back(std::move(next_completion));
+      continue;
+    }
+    if (!aggregate_) {
+      *it = std::move(next_completion);
+      continue;
+    }
+    it->text += next_completion.text;
+    it->token_ids.insert(it->token_ids.end(), next_completion.token_ids.begin(),
+                         next_completion.token_ids.end());
+    it->cumulative_logprob = next_completion.cumulative_logprob;
+    if (next_completion.logprobs.has_value()) {
+      it->logprobs = next_completion.logprobs;
+    }
+    it->finish_reason = std::move(next_completion.finish_reason);
+    it->stop_reason = std::move(next_completion.stop_reason);
+  }
+  // RequestOutput.add uses logical OR so a terminal state can never be
+  // cleared by a later merge. Prompt logprobs belong to the first output and
+  // are intentionally left untouched.
+  current.finished = current.finished || next.finished;
+}
 
 // ---------------------------------------------------------------------------
 // RequestState
@@ -143,18 +243,21 @@ OutputProcessor::OutputProcessor(const tok::Tokenizer* tokenizer,
 
 void OutputProcessor::add_request(const EngineCoreRequest& request,
                                   std::optional<std::string> prompt,
-                                  int request_index) {
-  // output_processor.py:512-541 (T0: no parent_req / queue; the streaming-input
+                                  int request_index,
+                                  std::shared_ptr<RequestOutputCollector> queue) {
+  // output_processor.py:512-541 (T0: no parent_req; the streaming-input
   // re-entry — a request_id already present — is deferred).
   const std::string& request_id = request.request_id;
   if (request_states_.find(request_id) != request_states_.end()) {
-    // Upstream _update_streaming_request_state; deferred. A request_id appears
-    // once at T0.
-    return;
+    // Upstream routes this case only through the explicitly resumable
+    // streaming-input path. That path is deferred; silently reusing the state
+    // would enqueue a second core Request against the first collector.
+    throw std::invalid_argument("duplicate live request id: " + request_id);
   }
 
   RequestState state = RequestState::FromNewRequest(
       tokenizer_, request, std::move(prompt), request_index, stream_interval_);
+  state.queue = std::move(queue);
   const std::string external_req_id = state.external_req_id;
   request_states_[request_id] =
       std::make_unique<RequestState>(std::move(state));
@@ -210,8 +313,13 @@ OutputProcessorOutput OutputProcessor::process_outputs(
         new_token_ids, finish_reason, stop_reason);
     if (request_output.has_value()) {
       // streaming_input deferred (false) -> no finished=false override.
-      // queue is null on the sync path -> collect into the returned list.
-      result.request_outputs.push_back(std::move(*request_output));
+      if (req_state.queue != nullptr) {
+        // AsyncLLM: hand off to the per-request collector.
+        req_state.queue->put(std::move(*request_output));
+      } else {
+        // LLMEngine: collect into the synchronous return value.
+        result.request_outputs.push_back(std::move(*request_output));
+      }
     }
 
     // Free completed requests (:669-688).
@@ -231,15 +339,43 @@ OutputProcessorOutput OutputProcessor::process_outputs(
   return result;
 }
 
-void OutputProcessor::abort_requests(
-    const std::vector<std::string>& request_ids) {
-  // output_processor.py:534 (T0 subset): remove each request's state so it stops
-  // counting as unfinished. Reuse FinishRequest for the map/external-id cleanup;
-  // unknown ids are a no-op (matching upstream's silent skip).
+std::vector<std::string> OutputProcessor::abort_requests(
+    const std::vector<std::string>& request_ids, bool produce_final_output) {
+  // output_processor.py:450-510 (T0 1:1 id subset): remove each request and,
+  // for AsyncLLM, enqueue its terminal ABORT RequestOutput before cleanup.
+  std::vector<std::string> request_ids_to_abort;
   for (const std::string& req_id : request_ids) {
     auto it = request_states_.find(req_id);
     if (it == request_states_.end()) continue;
-    FinishRequest(*it->second);  // erases the entry (invalidates it).
+    RequestState& req_state = *it->second;
+    request_ids_to_abort.push_back(req_id);
+    if (produce_final_output && req_state.queue != nullptr) {
+      std::optional<RequestOutput> final_output = req_state.make_request_output(
+          /*new_token_ids=*/{}, FinishReason::kAbort, std::nullopt);
+      if (final_output.has_value()) {
+        req_state.queue->put(std::move(*final_output));
+      }
+    }
+    FinishRequest(req_state);  // erases the entry (invalidates it).
+  }
+  return request_ids_to_abort;
+}
+
+std::vector<std::string> OutputProcessor::abort_all_requests(
+    bool produce_final_output) {
+  std::vector<std::string> request_ids;
+  request_ids.reserve(request_states_.size());
+  for (const auto& [request_id, state] : request_states_) {
+    (void)state;
+    request_ids.push_back(request_id);
+  }
+  return abort_requests(request_ids, produce_final_output);
+}
+
+void OutputProcessor::propagate_error(std::exception_ptr error) {
+  for (const auto& [request_id, state] : request_states_) {
+    (void)request_id;
+    if (state->queue != nullptr) state->queue->put_error(error);
   }
 }
 

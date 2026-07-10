@@ -542,7 +542,11 @@ TEST_CASE("capi: seeded sampled streaming is deterministic across two calls") {
   CHECK(a.saw_finished);
   CHECK(b.saw_finished);
   CHECK(a.text == b.text);      // same seed -> identical sampled output.
-  CHECK(a.deltas == b.deltas);
+  // W2 mirrors RequestOutputCollector's single-slot DELTA coalescing: callback
+  // chunk count is scheduling-dependent when the producer outruns the
+  // consumer, while concatenated text/tokens remain deterministic.
+  CHECK(a.deltas > 0);
+  CHECK(b.deltas > 0);
 
   vllm_engine_free(eng);
 }
@@ -563,6 +567,96 @@ TEST_CASE("capi: vllm_complete_stream null arguments return INVALID_ARGUMENT") {
   CHECK(vllm_complete_stream(eng, "hi", &sp, nullptr, &acc) ==
         VLLM_ERR_INVALID_ARGUMENT);
 
+  vllm_engine_free(eng);
+}
+
+// ─── (j) W2 non-blocking submit: independent callbacks share AsyncLLM ───────
+TEST_CASE("capi: non-blocking request_submit runs concurrent callback streams") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+  vllm_sampling_params sp = GreedyParams(8);
+
+  StreamAccumulator first;
+  StreamAccumulator second;
+  vllm_request* first_request = nullptr;
+  vllm_request* second_request = nullptr;
+  REQUIRE(vllm_request_submit(eng, "hello", &sp, &AccumulateCb, &first,
+                              &first_request) == VLLM_OK);
+  REQUIRE(vllm_request_submit(eng, "world", &sp, &AccumulateCb, &second,
+                              &second_request) == VLLM_OK);
+  REQUIRE(first_request != nullptr);
+  REQUIRE(second_request != nullptr);
+
+  CHECK(vllm_request_wait(first_request) == VLLM_OK);
+  CHECK(vllm_request_wait(second_request) == VLLM_OK);
+  CHECK(vllm_request_done(first_request));
+  CHECK(vllm_request_done(second_request));
+  CHECK(std::string(vllm_request_error(first_request)).empty());
+  CHECK(std::string(vllm_request_error(second_request)).empty());
+  CHECK(first.saw_finished);
+  CHECK(second.saw_finished);
+  CHECK(first.deltas > 0);
+  CHECK(second.deltas > 0);
+
+  vllm_request_free(first_request);
+  vllm_request_free(second_request);
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi: non-blocking request cancellation and null contracts") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+  vllm_sampling_params sp = GreedyParams(24);
+  StreamAccumulator acc;
+  vllm_request* request = nullptr;
+  REQUIRE(vllm_request_submit(eng, "hello", &sp, &AccumulateCb, &acc,
+                              &request) == VLLM_OK);
+  REQUIRE(request != nullptr);
+  CHECK(vllm_request_cancel(request) == VLLM_OK);
+  CHECK(vllm_request_cancel(request) == VLLM_OK);  // idempotent
+  CHECK(vllm_request_wait(request) == VLLM_OK);
+  CHECK(vllm_request_done(request));
+  vllm_request_free(request);
+
+  CHECK(vllm_request_submit(nullptr, "hello", &sp, &AccumulateCb, &acc,
+                            &request) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_submit(eng, nullptr, &sp, &AccumulateCb, &acc,
+                            &request) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_submit(eng, "hello", nullptr, &AccumulateCb, &acc,
+                            &request) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_submit(eng, "hello", &sp, nullptr, &acc, &request) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_submit(eng, "hello", &sp, &AccumulateCb, &acc, nullptr) ==
+        VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_cancel(nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_request_wait(nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK_FALSE(vllm_request_done(nullptr));
+  CHECK(std::string(vllm_request_error(nullptr)).empty());
+  vllm_request_free(nullptr);
+
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi: non-blocking callback errors propagate and leave the engine reusable") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+  vllm_sampling_params sp = GreedyParams(10);
+
+  int calls = 0;
+  vllm_request* request = nullptr;
+  REQUIRE(vllm_request_submit(eng, "hello", &sp, &ThrowingCb, &calls,
+                              &request) == VLLM_OK);
+  REQUIRE(request != nullptr);
+  CHECK(vllm_request_wait(request) == VLLM_ERR_RUNTIME);
+  CHECK(vllm_request_done(request));
+  CHECK(std::string(vllm_request_error(request)).find("callback boom") !=
+        std::string::npos);
+  vllm_request_free(request);
+
+  vllm_completion out;
+  CHECK(vllm_complete(eng, "hello", &sp, &out) == VLLM_OK);
+  CHECK(out.text != nullptr);
+  vllm_completion_free(&out);
   vllm_engine_free(eng);
 }
 

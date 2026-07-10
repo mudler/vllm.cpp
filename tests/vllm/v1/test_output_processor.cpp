@@ -27,6 +27,8 @@
 #include "vllm/v1/request.h"
 
 using nlohmann::json;
+using vllm::CompletionOutput;
+using vllm::RequestOutput;
 using vllm::RequestOutputKind;
 using vllm::SamplingParams;
 using vllm::tok::MapBytesToUnicode;
@@ -36,6 +38,7 @@ using vllm::v1::EngineCoreOutputs;
 using vllm::v1::EngineCoreRequest;
 using vllm::v1::FinishReason;
 using vllm::v1::OutputProcessor;
+using vllm::v1::RequestOutputCollector;
 
 namespace {
 
@@ -261,4 +264,110 @@ TEST_CASE("output for an unknown / already-finished request is ignored") {
   auto out = op.process_outputs(MakeStep("ghost", {17}, FinishReason::kStop));
   CHECK(out.request_outputs.empty());
   CHECK(out.reqs_to_abort.empty());
+}
+
+// Ported from tests/v1/engine/test_output_processor.py:1146
+// test_request_output_collector. DELTA puts coalesce in the collector's one
+// slot when the producer gets ahead of the consumer; terminal metadata comes
+// from the newest output.
+TEST_CASE("request_output_collector merges DELTA outputs before get") {
+  RequestOutputCollector collector(RequestOutputKind::kDelta,
+                                   "my-request-id-int");
+  for (int i = 0; i < 3; ++i) {
+    CompletionOutput completion;
+    completion.index = 0;
+    completion.text = "a";
+    completion.token_ids = {i};
+    completion.cumulative_logprob = static_cast<double>(i + 1);
+    if (i == 2) completion.finish_reason = "length";
+
+    RequestOutput output;
+    output.request_id = "my-request-id";
+    output.prompt_token_ids = {1, 2, 3};
+    output.outputs.push_back(std::move(completion));
+    output.finished = i == 2;
+    collector.put(std::move(output));
+  }
+
+  REQUIRE(collector.has_output());
+  RequestOutput output = collector.get();
+  CHECK_FALSE(collector.has_output());
+  CHECK(output.finished);
+  REQUIRE(output.outputs.size() == 1);
+  CHECK(output.outputs[0].text == "aaa");
+  CHECK(output.outputs[0].token_ids == Ids({0, 1, 2}));
+  CHECK(output.outputs[0].cumulative_logprob == 3.0);
+  REQUIRE(output.outputs[0].finish_reason.has_value());
+  CHECK(*output.outputs[0].finish_reason == "length");
+  CHECK_FALSE(collector.get_nowait().has_value());
+}
+
+// Ported from tests/v1/engine/test_output_processor.py:1228
+// test_cumulative_output_collector_n. Parallel sampling fan-out is deferred,
+// but the collector must already preserve/replace distinct completion indexes.
+TEST_CASE("cumulative_output_collector preserves distinct completion indexes") {
+  RequestOutputCollector collector(RequestOutputKind::kCumulative, "request");
+
+  RequestOutput first;
+  first.request_id = "request";
+  CompletionOutput first_0;
+  first_0.index = 0;
+  first_0.text = "a";
+  first_0.token_ids = {0};
+  CompletionOutput first_1;
+  first_1.index = 1;
+  first_1.text = "b";
+  first_1.token_ids = {1};
+  first.outputs = {std::move(first_0), std::move(first_1)};
+  collector.put(std::move(first));
+
+  RequestOutput second;
+  second.request_id = "request";
+  CompletionOutput second_0;
+  second_0.index = 0;
+  second_0.text = "ab";
+  second_0.token_ids = {0, 1};
+  CompletionOutput second_1;
+  second_1.index = 1;
+  second_1.text = "bc";
+  second_1.token_ids = {1, 2};
+  second.outputs = {std::move(second_0), std::move(second_1)};
+  second.finished = true;
+  collector.put(std::move(second));
+
+  RequestOutput output = collector.get();
+  REQUIRE(output.outputs.size() == 2);
+  CHECK(output.outputs[0].index == 0);
+  CHECK(output.outputs[0].text == "ab");
+  CHECK(output.outputs[0].token_ids == Ids({0, 1}));
+  CHECK(output.outputs[1].index == 1);
+  CHECK(output.outputs[1].text == "bc");
+  CHECK(output.finished);
+}
+
+TEST_CASE("OutputProcessor AsyncLLM queue handoff and abort final output") {
+  const Tokenizer& tok = Fixture();
+  const Ids prompt = tok.Encode("hello");
+  OutputProcessor op(&tok);
+  auto collector = std::make_shared<RequestOutputCollector>(
+      RequestOutputKind::kDelta, "r0");
+  op.add_request(MakeRequest("r0", prompt, RequestOutputKind::kDelta),
+                 "hello", 0, collector);
+
+  auto processed = op.process_outputs(MakeStep("r0", {17}));
+  CHECK(processed.request_outputs.empty());
+  RequestOutput delta = collector->get();
+  CHECK_FALSE(delta.finished);
+  REQUIRE(delta.outputs.size() == 1);
+  CHECK(delta.outputs[0].text == " world");
+
+  const std::vector<std::string> aborted =
+      op.abort_requests({"r0"}, /*produce_final_output=*/true);
+  CHECK(aborted == std::vector<std::string>{"r0"});
+  RequestOutput final_output = collector->get();
+  CHECK(final_output.finished);
+  REQUIRE(final_output.outputs.size() == 1);
+  REQUIRE(final_output.outputs[0].finish_reason.has_value());
+  CHECK(*final_output.outputs[0].finish_reason == "abort");
+  CHECK_FALSE(op.has_unfinished_requests());
 }

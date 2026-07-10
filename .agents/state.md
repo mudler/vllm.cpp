@@ -2524,3 +2524,77 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+
+## 2026-07-10 — AsyncLLM W2 implemented and CPU-gated; GB10 gates handed off
+
+`SERVE-ASYNC-LLM` moved `ACTIVE -> GATING` and
+`CLAIM-SERVE-ASYNC-W2-1` was released. The production server now uses a new
+`AsyncLLM` over W1's `InprocClient`: EngineCore runs on its dedicated thread,
+an output-handler thread feeds a thread-safe single-slot collector per request,
+and unrelated callers submit/generate/abort concurrently. DELTA outputs
+coalesce when the producer wins, cumulative outputs replace by completion
+index, fatal errors wake every consumer, and abort emits terminal metadata.
+
+Completion and chat serving now return live pull sources rather than replaying
+precomputed vectors. The httplib provider writes one SSE frame per pull,
+preserves chat role/content/finish/`[DONE]` cadence, and aborts the underlying
+request when the sink/releaser reports disconnect. The production server-wide
+engine mutex is gone; only the retained synchronous `LLMEngine` compatibility
+constructor takes a conditional legacy lock. `LoadedEngine::async_engine()`
+owns the lazy async frontend and `examples/server` selects it.
+
+The stable C ABI is additively extended from 11 to 17 exported symbols:
+`vllm_request_submit`, `cancel`, `wait`, `done`, `error`, and `free`. A
+library-owned delivery thread drains only its request collector and invokes the
+existing delta callback while the shared engine keeps batching; callback
+failures become request status/error and leave the engine reusable. Existing
+`vllm_complete` and `vllm_complete_stream` are unchanged at the source/API
+surface and now share AsyncLLM internally. The engine must outlive its request
+handles, and wait/free are rejected from the request's own callback.
+
+The stress pass found one load-bearing teardown race after the initial green
+suite: shutdown could beat the engine thread before a queued ADD's first busy-
+loop iteration. EngineCore then saw an empty scheduler and exited without
+consuming/rejecting the ADD, leaving its collector blocked forever. Teardown now
+sets the add-rejecting shutdown flag, aborts every OutputProcessor frontend
+state (emitting terminal outputs) before core shutdown, forwards the remaining
+core IDs, then joins. Final inspection closed the complementary admission race:
+the stopped-state recheck, frontend registration and core enqueue are now one
+critical section with shutdown's abort-all sweep, so a submitter that began
+input processing earlier cannot publish a collector after that sweep. A new
+64-way concurrent submit/shutdown regression covers both valid orderings. The
+exact full-process reproducer passed 500/500 after the fixes.
+
+Validation (CPU-only worktree):
+
+- `cmake -S . -B build-w2 -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo`
+  and `cmake --build build-w2 -j2`: clean, zero warnings.
+- `ctest --test-dir build-w2 --output-on-failure -j2`: 94/94 pass.
+- `setarch x86_64 -R ctest --test-dir build-w2-tsan --output-on-failure -R
+  'test_(output_processor|async_llm|openai_api_server|openai_conformance|capi)$'`:
+  5/5 pass under ThreadSanitizer. (`setarch -R` is required on this host to
+  avoid TSan's unrelated unexpected-memory-mapping startup failure.)
+- `ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1
+  ctest --test-dir build-w2-asan --output-on-failure -R
+  'test_(output_processor|async_llm|openai_api_server|openai_conformance|capi)$'`:
+  5/5 pass. A leak-enabled diagnostic reports only the existing process-lifetime
+  Qwen device-buffer pool from `qwen3_5.cpp:119`; collector/AsyncLLM-only tests
+  pass with leak detection enabled. No W2 address/undefined-behavior finding.
+- `ctest --test-dir build-w2 --output-on-failure --repeat until-fail:100 -R
+  'test_(async_llm|openai_api_server|capi)$'`: all three executables pass 100
+  consecutive runs. The shutdown executable additionally passed 500 separate
+  process invocations with a 5-second per-run timeout.
+- C11 header compile, dlopen of all 17 names, and exact `vllm_*` export-set test
+  pass in the 94-test suite. `scripts/check-agent-record.py` and its 13 mutation
+  tests are the final record gate before integration.
+
+Required first-GPU-idle handoff (one uncontended whole-series lock, after the
+current `CLAIM-SERVE-GATE-1` pre-W2 baseline releases dgx): build the W2 commit
+with the release CUDA/Triton settings; run both greedy engine gates (G1); run a
+manual `curl -N` arrival sanity plus the pinned `vllm bench serve` client at
+c=1 and the large-concurrency points for both 27B and 35B (G3); capture fresh
+same-workload vLLM denominators and 2-3 reproductions for every throughput,
+TTFT, TPOT/ITL and request-rate axis (G4/standing online gate); sample peak
+VRAM/RSS (G6). The running `latres2` campaign uses a pre-W2 binary and remains
+baseline evidence only. W3 `ENG-ASYNC-SCHED` scheduler/runner overlap is still
+`READY` and is not claimed by this change.

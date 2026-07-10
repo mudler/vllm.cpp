@@ -14,9 +14,11 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "capi/engine_handle.h"
@@ -25,6 +27,7 @@
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/version.h"
+#include "vllm/v1/engine/async_llm.h"
 
 // The opaque handle: owns the whole C++ engine stack behind LoadedEngine.
 struct vllm_engine {
@@ -38,6 +41,22 @@ struct vllm_engine {
   std::atomic<uint64_t> next_request_id{0};
 };
 
+// One non-blocking callback-delivery request. The AsyncLLM output handler owns
+// EngineCore output processing; this lightweight thread only consumes this
+// request's collector and invokes the C callback.
+struct vllm_request {
+  vllm_engine* parent = nullptr;  // borrowed; parent must outlive this handle.
+  vllm::v1::AsyncRequest async_request;
+  vllm_token_callback callback = nullptr;
+  void* user_data = nullptr;
+  std::thread delivery_thread;
+  std::mutex join_mutex;
+  std::atomic<bool> done{false};
+  std::atomic<bool> cancelled{false};
+  vllm_status status = VLLM_OK;
+  std::string error;
+};
+
 namespace {
 
 // RAII: aborts an in-flight request on scope exit (incl. exception unwind) unless
@@ -46,13 +65,13 @@ namespace {
 // std::terminate during unwind. This guarantees no request is left registered
 // after a throwing callback or a mid-stream runtime error.
 struct RequestGuard {
-  vllm::v1::LLMEngine& engine;
+  vllm::v1::AsyncLLM& engine;
   std::string id;
   bool armed = true;
   ~RequestGuard() {
     if (!armed) return;
     try {
-      engine.abort_request(id);
+      engine.abort(id);
     } catch (...) {  // NOLINT(bugprone-empty-catch) — dtor must not throw
     }
   }
@@ -124,6 +143,52 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
   sp.output_kind = output_kind;
   sp.PostInit();
   return sp;
+}
+
+void JoinRequest(vllm_request* request) {
+  std::lock_guard<std::mutex> lock(request->join_mutex);
+  if (request->delivery_thread.joinable()) request->delivery_thread.join();
+}
+
+void RunRequestDelivery(vllm_request* request) noexcept {
+  try {
+    vllm::v1::AsyncLLM& engine = request->parent->loaded->async_engine();
+    for (;;) {
+      vllm::RequestOutput output =
+          engine.get_output(request->async_request);
+      if (!request->cancelled.load()) {
+        for (const vllm::CompletionOutput& completion : output.outputs) {
+          const std::string delta =
+              vllm::entrypoints::openai::SanitizeUtf8(completion.text);
+          if (!request->callback(delta.c_str(), output.finished,
+                                 request->user_data)) {
+            request->cancelled.store(true);
+            engine.abort(request->async_request.request_id);
+            break;
+          }
+        }
+      }
+      if (output.finished || request->cancelled.load()) break;
+    }
+    request->status = VLLM_OK;
+  } catch (const std::exception& e) {
+    request->status = VLLM_ERR_RUNTIME;
+    request->error = e.what();
+    try {
+      request->parent->loaded->async_engine().abort(
+          request->async_request.request_id);
+    } catch (...) {
+    }
+  } catch (...) {
+    request->status = VLLM_ERR_UNKNOWN;
+    request->error = "unknown asynchronous request error";
+    try {
+      request->parent->loaded->async_engine().abort(
+          request->async_request.request_id);
+    } catch (...) {
+    }
+  }
+  request->done.store(true, std::memory_order_release);
 }
 
 }  // namespace
@@ -217,7 +282,7 @@ VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
   try {
     const vllm::SamplingParams sp =
         ToSamplingParams(*params, vllm::RequestOutputKind::kCumulative);
-    vllm::v1::LLMEngine& e = engine->loaded->engine();
+    vllm::v1::AsyncLLM& e = engine->loaded->async_engine();
     const std::string request_id =
         std::to_string(engine->next_request_id.fetch_add(1));
     // If generate() throws mid-loop the request is torn down by the guard; a
@@ -279,33 +344,30 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
     // directly (like serving_completion) — no new LLMEngine driver needed. The
     // guard tears the request down on EVERY exit path (early-stop, a throwing
     // callback, or a mid-stream step() error) so the engine stays reusable.
-    vllm::v1::LLMEngine& e = engine->loaded->engine();
+    vllm::v1::AsyncLLM& e = engine->loaded->async_engine();
     const std::string request_id =
         std::to_string(engine->next_request_id.fetch_add(1));
     RequestGuard guard{e, request_id};
-    e.add_request(request_id, prompt, sp);
+    vllm::v1::AsyncRequest request = e.add_request(request_id, prompt, sp);
 
     bool stopped_by_callback = false;
-    while (e.has_unfinished_requests()) {
-      for (const vllm::RequestOutput& res : e.step()) {
-        if (res.request_id != request_id) continue;
-        for (const vllm::CompletionOutput& output : res.outputs) {
-          // SanitizeUtf8: the raw-bytes detokenizer can emit invalid/truncated
-          // UTF-8; the callback gets a well-formed, NUL-terminated C string
-          // (embedded NULs cannot survive a C string either). See serving_utils.
-          const std::string delta =
-              vllm::entrypoints::openai::SanitizeUtf8(output.text);
-          const bool finished = res.finished;
-          // Callback owns the borrow only for this call; false => stop early.
-          const bool keep_going = cb(delta.c_str(), finished, user_data);
-          if (!keep_going) {
-            stopped_by_callback = true;
-            break;
-          }
+    for (;;) {
+      const vllm::RequestOutput res = e.get_output(request);
+      for (const vllm::CompletionOutput& output : res.outputs) {
+        // SanitizeUtf8: the raw-bytes detokenizer can emit invalid/truncated
+        // UTF-8; the callback gets a well-formed, NUL-terminated C string
+        // (embedded NULs cannot survive a C string either). See serving_utils.
+        const std::string delta =
+            vllm::entrypoints::openai::SanitizeUtf8(output.text);
+        const bool finished = res.finished;
+        // Callback owns the borrow only for this call; false => stop early.
+        const bool keep_going = cb(delta.c_str(), finished, user_data);
+        if (!keep_going) {
+          stopped_by_callback = true;
+          break;
         }
-        if (stopped_by_callback) break;
       }
-      if (stopped_by_callback) break;
+      if (stopped_by_callback || res.finished) break;
     }
 
     // On early stop the guard aborts the in-flight request. On a natural finish
@@ -323,6 +385,130 @@ VLLM_API vllm_status vllm_complete_stream(vllm_engine* engine,
   } catch (...) {
     SetError("vllm_complete_stream: unknown error");
     return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API vllm_status vllm_request_submit(
+    vllm_engine* engine, const char* prompt,
+    const vllm_sampling_params* params, vllm_token_callback cb,
+    void* user_data, vllm_request** out) {
+  if (out == nullptr) {
+    SetError("vllm_request_submit: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out = nullptr;
+  if (engine == nullptr || prompt == nullptr || params == nullptr ||
+      cb == nullptr) {
+    SetError("vllm_request_submit: engine, prompt, params or cb is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::SamplingParams sp =
+        ToSamplingParams(*params, vllm::RequestOutputKind::kDelta);
+    vllm::v1::AsyncLLM& async = engine->loaded->async_engine();
+    const std::string request_id =
+        std::to_string(engine->next_request_id.fetch_add(1));
+    vllm::v1::AsyncRequest async_request =
+        async.add_request(request_id, prompt, std::move(sp));
+    RequestGuard guard{async, request_id};
+
+    auto request = std::make_unique<vllm_request>();
+    request->parent = engine;
+    request->async_request = std::move(async_request);
+    request->callback = cb;
+    request->user_data = user_data;
+    request->delivery_thread =
+        std::thread(RunRequestDelivery, request.get());
+    *out = request.release();
+    guard.disarm();
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_request_submit: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_request_submit: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API vllm_status vllm_request_cancel(vllm_request* request) {
+  if (request == nullptr) {
+    SetError("vllm_request_cancel: request is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    if (!request->done.load() && !request->cancelled.exchange(true)) {
+      request->parent->loaded->async_engine().abort(
+          request->async_request.request_id);
+    }
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_request_cancel: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_request_cancel: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API vllm_status vllm_request_wait(vllm_request* request) {
+  if (request == nullptr) {
+    SetError("vllm_request_wait: request is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (request->delivery_thread.get_id() == std::this_thread::get_id()) {
+    SetError("vllm_request_wait: cannot wait from the request callback");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    JoinRequest(request);
+    if (request->status != VLLM_OK) {
+      SetError(std::string("vllm_request_wait: ") + request->error);
+    } else {
+      ClearError();
+    }
+    return request->status;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_request_wait: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_request_wait: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API bool vllm_request_done(const vllm_request* request) {
+  return request != nullptr &&
+         request->done.load(std::memory_order_acquire);
+}
+
+VLLM_API const char* vllm_request_error(const vllm_request* request) {
+  static const char* kEmpty = "";
+  if (request == nullptr ||
+      !request->done.load(std::memory_order_acquire)) {
+    return kEmpty;
+  }
+  return request->error.c_str();
+}
+
+VLLM_API void vllm_request_free(vllm_request* request) {
+  if (request == nullptr) return;
+  if (request->delivery_thread.get_id() == std::this_thread::get_id()) {
+    SetError("vllm_request_free: cannot free from the request callback");
+    return;
+  }
+  try {
+    if (!request->done.load()) {
+      (void)vllm_request_cancel(request);
+    }
+    JoinRequest(request);
+    delete request;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_request_free: ") + e.what());
+  } catch (...) {
+    SetError("vllm_request_free: unknown error");
   }
 }
 

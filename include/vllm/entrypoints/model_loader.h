@@ -9,6 +9,7 @@
 #define VLLM_ENTRYPOINTS_MODEL_LOADER_H_
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -20,6 +21,7 @@
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/core.h"
+#include "vllm/v1/engine/async_llm.h"
 #include "vllm/v1/engine/input_processor.h"
 #include "vllm/v1/engine/llm_engine.h"
 #include "vllm/v1/engine/output_processor.h"
@@ -119,6 +121,10 @@ class LoadedEngine {
                                         int max_model_len, bool is_dense_arch);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
+  // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
+  // online/server callers use this frontend rather than the synchronous
+  // LLMEngine over the same scheduler/executor.
+  vllm::v1::AsyncLLM& async_engine();
   const tok::Tokenizer& tokenizer() const { return tokenizer_; }
   const HfConfig& config() const { return config_; }
   int max_model_len() const { return max_model_len_; }
@@ -153,7 +159,10 @@ class LoadedEngine {
   vllm::v1::EngineCore engine_core_;
   vllm::v1::InputProcessor input_processor_;
   vllm::v1::OutputProcessor output_processor_;
+  vllm::v1::BlockHasher block_hasher_;
   vllm::v1::LLMEngine engine_;
+  std::mutex async_engine_mutex_;
+  std::unique_ptr<vllm::v1::AsyncLLM> async_engine_;
 };
 
 }  // namespace vllm::entrypoints

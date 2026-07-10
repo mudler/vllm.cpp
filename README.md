@@ -39,9 +39,13 @@ runs end-to-end on CPU:
   `n`, full random/logprob payload behavior, and request/API wiring for the
   long-tail controls remain open; some paths synchronize results to the host.
 - **OpenAI server** — basic `/v1/completions` and `/v1/chat/completions`
-  transport (SSE streaming + non-streaming), `/v1/models`, `/health`, and
-  `/version`; `/health` currently reports process liveness rather than probing
-  engine health. Chat templates use a bounded minja-subset Jinja engine.
+  transport (non-streaming plus **live incremental SSE** over an `AsyncLLM`
+  engine thread), concurrent requests through one scheduler, and disconnect
+  abort; `/v1/models`, `/health`, and `/version` are present, while `/health`
+  currently reports process liveness rather than probing engine health. The
+  async path passes the full CPU suite and ThreadSanitizer; its post-change
+  GB10 token/latency/throughput/memory gates are still pending. Chat templates
+  use a bounded minja-subset Jinja engine.
   **Tool/function calling** provides Hermes-style `<tool_call>` parsing,
   streaming tool-call deltas, and `tool_choice` auto/required/named — `auto`
   is *relaxed*: the model may reply in plain text or call a tool, constrained only
@@ -54,9 +58,11 @@ runs end-to-end on CPU:
   `json_object`, regex, choice, GBNF — a native constrained-decoding engine with
   an explicitly bounded JSON-schema/structural-tag subset behind vLLM's
   structured-output seam).
-- **Library packaging** — a stable C ABI (`include/vllm.h`), `libvllm` shared +
-  static, an example CLI and OpenAI server, and a `dlopen`/FFI consumption path
-  (for LocalAI-style embedding via cgo/purego).
+- **Library packaging** — a stable 17-symbol C ABI (`include/vllm.h`),
+  `libvllm` shared + static, an example CLI and OpenAI server, and a
+  `dlopen`/FFI consumption path (for LocalAI-style embedding via cgo/purego).
+  Alongside the blocking completion calls, additive request handles provide
+  nonblocking submit/cancel/wait/done/error/free with per-delta callbacks.
 
 Every unit is adversarially reviewed and behaviorally tested; the CPU test suite
 is green (`ctest`). See the [parity ledger](.agents/parity-ledger.md) for the
@@ -85,7 +91,9 @@ cmake -S . -B build -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
 ```
 
 As a library, link `libvllm` (or `dlopen` it) and drive the C API in
-`include/vllm.h` (`vllm_engine_load` / `vllm_complete` / `vllm_complete_stream`).
+`include/vllm.h`: use `vllm_complete` / `vllm_complete_stream` for blocking
+calls, or `vllm_request_submit` plus the request lifecycle functions for
+nonblocking concurrent streams.
 
 ## Supported model architectures
 
@@ -193,8 +201,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 - The CUDA low-concurrency comparison against SGLang is specified and pinned to
   v0.5.13, but **no SGLang performance result is claimed yet**. The unchanged
   27B checkpoint has a plausible native path; exact 35B mixed-quant loading must
-  be proven, and binding TTFT/ITL numbers wait for true incremental async HTTP
-  streaming (`SERVE-ASYNC-LLM`).
+  be proven. True incremental async HTTP streaming now exists, but binding
+  TTFT/ITL numbers wait for the post-W2 GB10 online gate
+  (`SERVE-ASYNC-LLM` remains `GATING`, not `DONE`).
 
 ## Project record
 

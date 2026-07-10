@@ -39,6 +39,15 @@ using fn_complete = vllm_status (*)(vllm_engine*, const char*,
 using fn_complete_stream = vllm_status (*)(vllm_engine*, const char*,
                                            const vllm_sampling_params*,
                                            vllm_token_callback, void*);
+using fn_request_submit = vllm_status (*)(vllm_engine*, const char*,
+                                          const vllm_sampling_params*,
+                                          vllm_token_callback, void*,
+                                          vllm_request**);
+using fn_request_cancel = vllm_status (*)(vllm_request*);
+using fn_request_wait = vllm_status (*)(vllm_request*);
+using fn_request_done = bool (*)(const vllm_request*);
+using fn_request_error = const char* (*)(const vllm_request*);
+using fn_request_free = void (*)(vllm_request*);
 using fn_string_free = void (*)(char*);
 using fn_completion_free = void (*)(vllm_completion*);
 using fn_last_error = const char* (*)(void);
@@ -74,6 +83,12 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   auto p_engine_free = Sym<fn_engine_free>(lib, "vllm_engine_free");
   auto p_complete = Sym<fn_complete>(lib, "vllm_complete");
   auto p_complete_stream = Sym<fn_complete_stream>(lib, "vllm_complete_stream");
+  auto p_request_submit = Sym<fn_request_submit>(lib, "vllm_request_submit");
+  auto p_request_cancel = Sym<fn_request_cancel>(lib, "vllm_request_cancel");
+  auto p_request_wait = Sym<fn_request_wait>(lib, "vllm_request_wait");
+  auto p_request_done = Sym<fn_request_done>(lib, "vllm_request_done");
+  auto p_request_error = Sym<fn_request_error>(lib, "vllm_request_error");
+  auto p_request_free = Sym<fn_request_free>(lib, "vllm_request_free");
   auto p_string_free = Sym<fn_string_free>(lib, "vllm_string_free");
   auto p_completion_free = Sym<fn_completion_free>(lib, "vllm_completion_free");
   auto p_last_error = Sym<fn_last_error>(lib, "vllm_last_error");
@@ -88,6 +103,12 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   CHECK(sp.repetition_penalty > 0.0f);  // a zeroed struct would be invalid.
   (void)p_complete;
   (void)p_complete_stream;
+  (void)p_request_submit;
+  (void)p_request_cancel;
+  (void)p_request_wait;
+  (void)p_request_done;
+  (void)p_request_error;
+  (void)p_request_free;
   (void)p_string_free;
   (void)p_completion_free;
 

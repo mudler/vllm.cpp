@@ -187,10 +187,10 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
-      engine_(input_processor_, engine_core_, output_processor_,
-              vllm::v1::get_request_block_hasher(
-                  params.block_size > 0 ? params.block_size : 32,
-                  vllm::v1::sha256_cbor)) {
+      block_hasher_(vllm::v1::get_request_block_hasher(
+          params.block_size > 0 ? params.block_size : 32,
+          vllm::v1::sha256_cbor)),
+      engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
 }
 
@@ -227,11 +227,21 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
-      engine_(input_processor_, engine_core_, output_processor_,
-              vllm::v1::get_request_block_hasher(
-                  params.block_size > 0 ? params.block_size : 32,
-                  vllm::v1::sha256_cbor)) {
+      block_hasher_(vllm::v1::get_request_block_hasher(
+          params.block_size > 0 ? params.block_size : 32,
+          vllm::v1::sha256_cbor)),
+      engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+}
+
+vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
+  std::lock_guard<std::mutex> lock(async_engine_mutex_);
+  if (async_engine_ == nullptr) {
+    async_engine_ = std::make_unique<vllm::v1::AsyncLLM>(
+        input_processor_, scheduler_, executor_, output_processor_,
+        block_hasher_);
+  }
+  return *async_engine_;
 }
 
 bool LoadedEngine::IsDenseArch(const HfConfig& config) {

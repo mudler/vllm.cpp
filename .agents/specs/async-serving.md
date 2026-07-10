@@ -88,7 +88,13 @@ with `--no-async-scheduling` at c=16 on GB10, per parity-lever-protocol.md
 reproduce (schedule N+1 host work concurrent with step N GPU tail) and to
 freeze the A/B denominators.
 
-## Our baseline
+## Our baseline (captured at spike acceptance)
+
+This table freezes the gaps that justified the work breakdown. Current
+lifecycle truth lives in `engine-matrix.md`: W1, W2 and W4 are now implemented
+and `GATING`; W3 remains `READY`. In particular, the synchronous/fake-SSE
+statements below describe the pre-W2 binary retained for the ongoing baseline
+campaign, not the new production server path.
 
 | Area | Anchor | Honest state |
 |---|---|---|
@@ -123,7 +129,7 @@ Leaf W2 — `SERVE-ASYNC-LLM` (async frontend + real streaming surface):
 | `vllm/entrypoints/openai/completion/serving.py:278-310` + `chat_completion/serving.py:404` (stream generators) | rework `src/vllm/entrypoints/openai/serving_completion.cpp` / `serving_chat.cpp`: `create_completion` returns a pull-based chunk source (callback/generator object) instead of a precomputed `sse_chunks` vector (`serving_completion.h:40-46` union changes shape) | Chunk JSON content is already 1:1; only the delivery becomes incremental. Non-streaming path: same handler awaits final output off the collector |
 | `api_router.py:66,74` (`StreamingResponse`) | `src/vllm/entrypoints/openai/api_server.cpp:183-206` chunked provider pulls from the live chunk source; drop the engine mutex (`:26,86,130`) — concurrency moves into `AsyncLLM` | httplib's `set_chunked_content_provider` callback blocks per chunk on the collector; client disconnect (`sink.write` false / provider abort) triggers `AsyncLLM::abort` mirroring `async_llm.py:590-596` |
 | `vllm/entrypoints/launcher.py` serve wiring | `examples/server/main.cpp:60,121` constructs `AsyncLLM` instead of bare `LLMEngine` | CLI flags unchanged; `--no-async-scheduling`-style flag added in W3 |
-| C ABI (original packaging, no upstream) | `include/vllm.h` + `src/capi/vllm_c.cpp`: add handle-based `vllm_request_submit` / per-delta callback delivery from the engine thread; keep `vllm_complete_stream` (`include/vllm.h:190-194`) as a blocking wrapper over the new path | Decision D1 below; C11 header compile + dlopen tests extended (`tests/capi/test_capi.cpp`, `tests/capi/test_dlopen.cpp`) |
+| C ABI (original packaging, no upstream) | `include/vllm.h` + `src/capi/vllm_c.cpp`: add handle-based `vllm_request_submit`; a library-owned per-request delivery thread drains that collector and invokes the callback while the shared engine/output handler keep batching. Keep `vllm_complete_stream` (`include/vllm.h:190-194`) as a blocking wrapper over the new path | Decision D1 below; C11 header compile + dlopen tests extended (`tests/capi/test_capi.cpp`, `tests/capi/test_dlopen.cpp`) |
 
 Leaf W3 — `ENG-ASYNC-SCHED` (overlap scheduling, mirror default ON):
 
@@ -156,7 +162,7 @@ tracked reason, never dropped.
 | `tests/v1/core/test_async_scheduler.py:34,67,103,139,196,261` | `test_stop_by_max_tokens`, `test_abort`, `test_preempt`, `test_prefix_caching_for_prefill_dedup`, `test_prefix_caching_for_multi_turn`, `test_abort_request_when_structured_output_fsm_cannot_advance` | new `tests/vllm/v1/test_async_scheduler.cpp` | T-unit | W3 |
 | `tests/v1/core/test_scheduler.py:2382-2810,2978` | the 11 `test_priority_scheduling_*` cases + `..._preemption_and_resumption_when_out_of_kv`; SKIP: `:3769` EC-connector variant (no connector) | extend `tests/vllm/v1/test_scheduler.cpp` + `tests/vllm/v1/test_request_queue.cpp` | T-unit | W4 |
 | `tests/v1/core/test_priority_scheduler_random.py` | randomized heap-property/ordering property test | `tests/vllm/v1/test_request_queue.cpp` (seeded) | T-unit | W4 |
-| `tests/entrypoints/openai/completion/test_completion.py:259` (`test_completion_streaming`) and the chat streaming analog | streamed chunks concat to non-stream text AND **chunks arrive incrementally** — new arrival-time assertion: first chunk observed before generation completes, chunk count > 1 spread over the response window (this is the assertion our current `test_conformance.cpp:502` cannot express against precomputed SSE) | `tests/vllm/entrypoints/openai/test_conformance.cpp` (extend) | T-e2e | W2 |
+| `tests/entrypoints/openai/completion/test_completion.py:259` (`test_completion_streaming`) and the chat streaming analog | streamed chunks concat to non-stream text AND **chunks arrive incrementally** — new arrival-time assertion: first chunk observed before generation completes, chunk count > 1 spread over the response window (the pre-W2 conformance case could only inspect precomputed frames) | `tests/vllm/entrypoints/openai/test_api_server.cpp` (AsyncLLM harness: live completion/chat arrival/cadence, disconnect abort and concurrent requests); real-model arrival remains G3 | T-unit + T-e2e gate | W2 |
 | `tests/benchmarks/test_serve_cli.py:1` | `vllm bench serve` smoke against a live server | DGX smoke in the `SERVE-GATE-ONLINE` harness: run upstream's real `vllm bench serve` client against OUR server (mirror-exact measurement client), plus `tests/examples/test_bench.cpp:15,48` kept green | T-e2e | W2 |
 | Token-exactness twins (ours) | existing greedy gates re-run with async ON — async must not change tokens | `tests/parity/test_qwen36_paged_engine.cpp:140`, `tests/parity/test_qwen27_paged_engine.cpp:110` | T-parity | W3 |
 | Combine/post-update kernel goldens | goldens dumped from `vllm/v1/worker/gpu/input_batch.py:304-406,457-543` via the LLM-API torch-profiler recipe | `tests/parity/test_op_parity.cpp` op rows (+`PendingRunnerOps` discipline if goldens land first) | T-parity | W3 |
@@ -213,7 +219,7 @@ W4 anytime after W1 merges (or before, at the queue level).
 
 | # | Item | Type | Resolution |
 |---|---|---|---|
-| D1 | C ABI streaming shape (vLLM defines no C ABI — genuine product call) | decision | Add a handle-based non-blocking surface (`vllm_request_submit` + per-delta callback invoked from the engine-side thread, or poll); KEEP `vllm_complete_stream` as a blocking wrapper so LocalAI consumers don't break. Exact symbol set finalized in W2's PR with the C11-compile test |
+| D1 | C ABI streaming shape (vLLM defines no C ABI — genuine product call) | decision | Add a handle-based non-blocking surface: `vllm_request_submit` plus a library-owned per-request delivery thread that consumes only that request's collector and invokes the existing per-delta callback; `cancel`/`wait`/`done`/`error`/`free` complete the lifecycle. KEEP `vllm_complete_stream` as a blocking wrapper so LocalAI consumers don't break. The additive 17-symbol set is C11/dlopen/export tested; the engine must outlive its request handles |
 | D2 | In-proc thread instead of process split | recorded deviation | Mirrors the EngineCoreProc/MPClient QUEUE semantics without ZMQ; the client API shape is kept so a future multiproc client is additive. Not a behavior change vLLM defines externally |
 | D3 | httplib worker-pool blocking on slow SSE clients | risk | Each streaming response occupies one httplib worker while blocked on the collector; mitigation = pool sizing + disconnect-abort; measure at c=16 in G3 (vLLM has the same backpressure via asyncio, different mechanics) |
 | D4 | Token-exactness under placeholders | risk | Preemption/stale-frame paths (`async_tokens_to_discard`, placeholder-aware `cache_blocks`) are where async can silently corrupt; covered by the ported preempt/abort async-scheduler tests + G1 on both gate models |

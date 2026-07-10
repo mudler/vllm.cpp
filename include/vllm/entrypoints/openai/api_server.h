@@ -45,13 +45,15 @@ class ApiServer {
   ApiServer& operator=(const ApiServer&) = delete;
 
   // The socket-free result of dispatching one request (shared by the HTTP layer
-  // and the unit tests). Exactly one of {body, sse_chunks} is populated.
+  // and unit tests). Streaming uses either the legacy precomputed vector or
+  // W2's live pull source.
   struct DispatchResult {
     int status = 200;
     bool streaming = false;
     std::string content_type = "application/json";
     std::string body;                     // populated when !streaming
     std::vector<std::string> sse_chunks;  // populated when streaming
+    std::shared_ptr<SseStream> sse_stream;  // live AsyncLLM streaming path
   };
 
   // Route dispatch (parse the JSON body → the Task-1 request → the Task-2

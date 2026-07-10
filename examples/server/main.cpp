@@ -158,7 +158,10 @@ int main(int argc, char** argv) {
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                       engine_params);
-    vllm::v1::LLMEngine& engine = loaded->engine();
+    // W2: the production server uses AsyncLLM over EngineCoreProc's dedicated
+    // engine thread. HTTP workers submit independently and stream from their
+    // per-request collectors; no server-wide engine mutex remains.
+    vllm::v1::AsyncLLM& engine = loaded->async_engine();
     const vllm::tok::Tokenizer& tokenizer = loaded->tokenizer();
 
     // ── OpenAI serving handlers. The chat handler is wired with the real chat

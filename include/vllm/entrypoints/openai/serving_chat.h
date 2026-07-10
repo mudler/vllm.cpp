@@ -22,6 +22,7 @@
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_CHAT_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_CHAT_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/serving_completion.h"  // SseStream
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/engine/llm_engine.h"
@@ -45,6 +47,7 @@ struct ChatCompletionResult {
   bool streaming = false;
   std::optional<ChatCompletionResponse> response;   // set when !streaming
   std::vector<std::string> sse_chunks;              // set when streaming
+  std::shared_ptr<SseStream> sse_stream;             // live AsyncLLM path
 };
 
 // The chat-prompt SEAM: messages + add_generation_prompt + tools → the prompt
@@ -143,10 +146,16 @@ class OpenAIServingChat {
   OpenAIServingChat(v1::LLMEngine& engine, std::string served_model_name,
                     ChatPromptFn prompt_fn = DefaultChatPromptFallback,
                     std::string tool_parser_name = "hermes");
+  OpenAIServingChat(v1::AsyncLLM& engine, std::string served_model_name,
+                    ChatPromptFn prompt_fn = DefaultChatPromptFallback,
+                    std::string tool_parser_name = "hermes");
 
   // create_chat_completion (chat_completion/serving.py:229).
   ChatCompletionResult create_chat_completion(
       const ChatCompletionRequest& request);
+
+  // See OpenAIServingCompletion::uses_async_engine().
+  bool uses_async_engine() const { return async_engine_ != nullptr; }
 
  private:
   // Build the per-request tool parser (get_tool_parser) when ToolsEnabled and a
@@ -155,12 +164,13 @@ class OpenAIServingChat {
   std::unique_ptr<ToolParser> MakeToolParser(
       const ChatCompletionRequest& request) const;
 
-  v1::LLMEngine& engine_;
+  v1::LLMEngine* sync_engine_ = nullptr;
+  v1::AsyncLLM* async_engine_ = nullptr;
   std::string served_model_name_;
   ChatPromptFn prompt_fn_;
   std::string tool_parser_name_;
   // request_id is "chatcmpl-<counter>" (upstream f"chatcmpl-{random_uuid()}").
-  int64_t request_counter_ = 0;
+  std::atomic<int64_t> request_counter_{0};
 };
 
 }  // namespace vllm::entrypoints::openai

@@ -3,6 +3,8 @@
 #include "vllm/entrypoints/openai/serving_completion.h"
 
 #include <ctime>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -12,16 +14,111 @@
 
 namespace vllm::entrypoints::openai {
 
+namespace {
+
+// completion_stream_generator (serving.py:278-474) as a blocking pull source.
+// Each next() consumes at most one RequestOutput from this request's collector;
+// other requests are processed independently by AsyncLLM's output handler.
+class CompletionSseStream final : public SseStream {
+ public:
+  CompletionSseStream(v1::AsyncLLM& engine, v1::AsyncRequest request,
+                      std::string response_id, int64_t created,
+                      std::string model)
+      : engine_(engine),
+        request_(std::move(request)),
+        response_id_(std::move(response_id)),
+        created_(created),
+        model_(std::move(model)) {}
+
+  ~CompletionSseStream() override { abort(); }
+
+  bool next(std::string& chunk) override {
+    if (complete_) return false;
+    if (done_pending_) {
+      chunk = "data: [DONE]\n\n";
+      done_pending_ = false;
+      complete_ = true;
+      return true;
+    }
+
+    for (;;) {
+      RequestOutput response = engine_.get_output(request_);
+      if (response.outputs.empty()) {
+        if (response.finished) {
+          engine_finished_ = true;
+          done_pending_ = true;
+        }
+        if (done_pending_) return next(chunk);
+        continue;
+      }
+
+      const CompletionOutput& output = response.outputs.front();
+      const std::string delta_text = SanitizeUtf8(output.text);
+      // completion/serving.py:368-374 chunked-prefill hold-back. Preserve a
+      // terminal empty chunk so clients still observe finish_reason.
+      if (delta_text.empty() && output.token_ids.empty() &&
+          previous_num_tokens_ == 0 && !response.finished) {
+        continue;
+      }
+      previous_num_tokens_ += static_cast<int>(output.token_ids.size());
+
+      CompletionResponseStreamChoice choice;
+      choice.index = output.index;
+      choice.text = delta_text;
+      choice.finish_reason = output.finish_reason;
+
+      CompletionStreamResponse frame;
+      frame.id = response_id_;
+      frame.created = created_;
+      frame.model = model_;
+      frame.choices.push_back(std::move(choice));
+      chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+
+      if (response.finished) {
+        engine_finished_ = true;
+        done_pending_ = true;
+      }
+      return true;
+    }
+  }
+
+  void abort() override {
+    if (complete_ || engine_finished_ || aborted_) return;
+    aborted_ = true;
+    engine_.abort(request_.request_id);
+  }
+
+ private:
+  v1::AsyncLLM& engine_;
+  v1::AsyncRequest request_;
+  std::string response_id_;
+  int64_t created_ = 0;
+  std::string model_;
+  int previous_num_tokens_ = 0;
+  bool done_pending_ = false;
+  bool engine_finished_ = false;
+  bool complete_ = false;
+  bool aborted_ = false;
+};
+
+}  // namespace
+
 OpenAIServingCompletion::OpenAIServingCompletion(v1::LLMEngine& engine,
                                                  std::string served_model_name)
-    : engine_(engine), served_model_name_(std::move(served_model_name)) {}
+    : sync_engine_(&engine),
+      served_model_name_(std::move(served_model_name)) {}
+
+OpenAIServingCompletion::OpenAIServingCompletion(
+    v1::AsyncLLM& engine, std::string served_model_name)
+    : async_engine_(&engine),
+      served_model_name_(std::move(served_model_name)) {}
 
 CompletionResult OpenAIServingCompletion::create_completion(
     const CompletionRequest& request) {
   // request_id = f"cmpl-{...}" (completion/serving.py:143); created_time =
   // int(time.time()) (:144).
   const std::string request_id =
-      "cmpl-" + std::to_string(request_counter_++);
+      "cmpl-" + std::to_string(request_counter_.fetch_add(1));
   const auto created_time = static_cast<int64_t>(std::time(nullptr));
   const std::string model_name =
       request.model.has_value() ? *request.model : served_model_name_;
@@ -35,6 +132,24 @@ CompletionResult OpenAIServingCompletion::create_completion(
   // f"{request_id}-{i}" upstream (:179); here i == 0.
   const std::string engine_request_id = request_id + "-0";
 
+  // W2 production path: enqueue and return immediately with a live pull source.
+  // The HTTP provider blocks on this request's collector one chunk at a time.
+  if (async_engine_ != nullptr && request.stream) {
+    v1::AsyncRequest async_request = async_engine_->add_request(
+        engine_request_id, request.prompt, std::move(sampling_params),
+        request.priority);
+    CompletionResult result;
+    result.streaming = true;
+    try {
+      result.sse_stream = std::make_shared<CompletionSseStream>(
+          *async_engine_, async_request, request_id, created_time, model_name);
+    } catch (...) {
+      async_engine_->abort(async_request.request_id);
+      throw;
+    }
+    return result;
+  }
+
   if (request.stream) {
     // ── Streaming (completion_stream_generator, :278) ─────────────────────
     // Drive the engine over DELTA RequestOutputs; format one
@@ -43,10 +158,13 @@ CompletionResult OpenAIServingCompletion::create_completion(
     result.streaming = true;
 
     int previous_num_tokens = 0;
-    engine_.add_request(engine_request_id, request.prompt,
-                        std::move(sampling_params), request.priority);
-    while (engine_.has_unfinished_requests()) {
-      for (const RequestOutput& res : engine_.step()) {
+    if (sync_engine_ == nullptr) {
+      throw std::runtime_error("completion handler has no engine");
+    }
+    sync_engine_->add_request(engine_request_id, request.prompt,
+                              std::move(sampling_params), request.priority);
+    while (sync_engine_->has_unfinished_requests()) {
+      for (const RequestOutput& res : sync_engine_->step()) {
         if (res.request_id != engine_request_id) continue;
         for (const CompletionOutput& output : res.outputs) {
           const std::string& delta_text = output.text;
@@ -83,9 +201,11 @@ CompletionResult OpenAIServingCompletion::create_completion(
   }
 
   // ── Non-streaming (request_output_to_completion_response, :475) ──────────
-  const RequestOutput final_res = engine_.generate(
-      request.prompt, std::move(sampling_params), engine_request_id,
-      request.priority);
+  const RequestOutput final_res = async_engine_ != nullptr
+      ? async_engine_->generate(request.prompt, std::move(sampling_params),
+                                engine_request_id, request.priority)
+      : sync_engine_->generate(request.prompt, std::move(sampling_params),
+                               engine_request_id, request.priority);
 
   CompletionResponse response;
   response.id = request_id;

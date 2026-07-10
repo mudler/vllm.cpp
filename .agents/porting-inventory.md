@@ -50,8 +50,8 @@ what vLLM has vs what we have:
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
 | Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 ✅ `core_proc.{h,cpp}` + `core_client.{h,cpp}` (W1 `ENG-CORE-BUSY-LOOP`: EngineCoreProc busy loop, shutdown drain/abort, WAKEUP + ENGINE_CORE_DEAD sentinels, InprocClient engine thread; tests `test_engine_core_proc.cpp` ← upstream `tests/v1/engine/test_engine_core_client.py`; GPU G1/G4 gating pending; UTILITY/DP/aborts-queue/batch-queue deferred) |
 | InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
-| OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` (process_outputs: detokenize + string-stop + reqs_to_abort feedback; streaming DELTA/CUMULATIVE/FINAL_ONLY; logprobs/pooling deferred) |
-| AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 |
+| OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` baseline + W2 `GATING`: process_outputs detokenize/string-stop/DELTA-CUMULATIVE-FINAL_ONLY plus thread-safe single-slot `RequestOutputCollector`, per-request queue handoff, abort-final output and error propagation; logprobs/pooling/parallel-sampling remain deferred |
+| AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 🚧 W2 `GATING`: `AsyncLLM` owns the EngineCoreProc/output-handler threads, concurrent add/generate/abort, collector streams and clean shutdown; CPU/TSan gates pass, GB10 G1/G3-G6 pending. Synchronous `LLMEngine` remains for offline/compatibility use |
 | Unified scheduler: token-budget, **no prefill/decode distinction** | `v1/core/sched/scheduler.py` | T0 ✅ `4f12158` (schedule() running-first + chunked prefill + FCFS preemption; update_from_output + check_stop; priority/spec/structured/async deferred behind 1:1 stubs) |
 | Chunked prefill (`enable_chunked_prefill`, on by default) | `config/scheduler.py` | T0 ✅ `4f12158` |
 | Budgets: `max_num_batched_tokens`, `max_num_seqs`, `max_num_scheduled_tokens` | `config/scheduler.py` | T0 ✅ `2f0ea69` |
@@ -59,7 +59,7 @@ what vLLM has vs what we have:
 | FCFS request queue | `v1/core/sched/request_queue.py` | T0 ✅ `2f0ea69` |
 | Priority scheduling (`policy="priority"`) | same | T1 🚧 GATING (W4 `ENG-PRIORITY-SCHED`): `PriorityRequestQueue` (heap by `Request.__lt__`) + priority preemption (victim = max `(priority, arrival_time)`) + `priority` plumbed through `Request`/`EngineCoreRequest`/OpenAI field + `SchedulerPolicyFromString`; default stays FCFS. Tests ported: `tests/vllm/v1/test_scheduler.cpp` (12 `test_priority_scheduling_*` cases ← `tests/v1/core/test_scheduler.py:2382,2978`) + `tests/vllm/v1/test_request_queue.cpp` (priority-queue cases + seeded random property ← `tests/v1/core/test_priority_scheduler_random.py`). CPU 93/93 green; GPU G1 token-exact A/B deferred (GPU held) |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill threshold/limits) | `config/scheduler.py` | T1 |
-| Async scheduling (overlap schedule with execution) | `v1/core/sched/async_scheduler.py` | T1 (perf lever for the gate if needed → may promote to T0) |
+| Async scheduling (overlap schedule with execution) | `v1/core/sched/async_scheduler.py` | T1 `READY` (W3; vLLM default-ON mirror obligation, distinct from W2's asynchronous frontend) |
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | T1 |
 | Cascade attention (shared-prefix batch attention) | `config/model.py::disable_cascade_attn` | T2 |
 | DBO / ubatch overlap | `config/parallel.py::enable_dbo` | T2 |
@@ -221,7 +221,7 @@ sampler + `use_v2_model_runner`-style padded drafting come with it.
 
 | Item | Upstream | Tier |
 |---|---|---|
-| Basic `/v1/completions`, `/v1/chat/completions` SSE transport, `/v1/models`, `/health`, `/version` | `entrypoints/openai/` | T0 **partial** `23d9f2c` (basic protocol+serving+cpp-httplib; `/health` is liveness-only; `/metrics`, complete protocol fields and logprobs payload remain open) |
+| Basic `/v1/completions`, `/v1/chat/completions` SSE transport, `/v1/models`, `/health`, `/version` | `entrypoints/openai/` | T0 **partial** `23d9f2c` + W2 `GATING`: production completion/chat streams now pull live incremental frames from AsyncLLM, concurrent HTTP requests share one scheduler, and disconnect abort is wired; `/health` is liveness-only, `/metrics`, complete protocol fields, logprobs payload and GB10 online gates remain open |
 | Chat templating (bounded Qwen3.6 Jinja subset; engine: minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | T0 **anchor-backfill** `a99a65e` (original minja-subset engine; generic template/parser breadth remains open) |
 | **Tool/function calling** (user-mandated MVP): `tools`/`tool_choice` in chat API, auto-tool-choice, streaming tool-call deltas, Hermes parser first; upstream Qwen3Engine and other parser families remain T1 | `tool_parsers/`, `entrypoints/openai/chat_completion/` | T0 **partial** `18e3efb` (Hermes parser + streaming; local `qwen3` is a Hermes alias, not upstream Qwen3Engine parity; **tool_choice=auto RELAXED via a native LAZY grammar matcher behind vLLM's STRUCTURAL_TAG seam** — free text until `<tool_call>`, then constrain; required/named forced; Coder-XML/Mistral/pythonic parsers deferred) |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | T1 |
@@ -233,14 +233,17 @@ sampler + `use_v2_model_runner`-style padded drafting come with it.
 | Prometheus metric names **1:1** (`vllm:num_requests_running`, `vllm:time_to_first_token_seconds`, `vllm:kv_cache_usage_perc`, …) | `v1/metrics/` | T0 (core set), T1 (full set) |
 | OTLP tracing | `config/observability.py` | T2 |
 
-**Library packaging (llama.cpp-style) — T0 ✅ `0b252ec`:** core built as `libvllm`
-(static + shared; the shared lib's linker version-script exports ONLY the 11
+**Library packaging (llama.cpp-style) — T0 ✅ `0b252ec` baseline + W2 `GATING`:** core built as `libvllm`
+(static + shared; the shared lib's linker version-script exports ONLY the 17
 `vllm_*` C ABI symbols — nm-verified + ctest-enforced) with a stable **C API**
 (`include/vllm.h`: `vllm_engine_load`/`free`, `vllm_complete` [blocking],
 `vllm_complete_stream` + `vllm_token_callback` [streaming/early-stop],
+`vllm_request_submit`/`cancel`/`wait`/`done`/`error`/`free` [additive
+nonblocking callback delivery over the shared AsyncLLM],
 `vllm_string_free`/`vllm_completion_free`, `vllm_last_error`, `vllm_version`;
 opaque handles, no-throw-across-ABI, thread-local error, unique per-call request
-ids — cgo/purego-friendly for LocalAI; ASan-clean + dlopen-smoke-proven). The
+ids — cgo/purego-friendly for LocalAI; W2 CPU/TSan/dlopen gates green, GB10
+G1/G3-G6 pending). The
 richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
 Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
 `examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.

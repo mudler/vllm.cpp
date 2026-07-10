@@ -33,7 +33,7 @@ then expand backends and scale-out.
 | 10 | `ROAD-V1-D1` | NVIDIA target fan-out, ROCm, MLX, Vulkan, XPU, ANE | [backend matrix](backend-matrix.md), [backends strategy](backends.md) | 13 CUDA targets, component rules, platforms and native floors inventoried; `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `READY`, while `BACKEND-GATE-CUDA-SGLANG` is `BLOCKED` | `PARTIAL` | claim the SGLang preflight in parallel; spike the architecture spine, then sm80/sm90 build gates |
 | 11 | `ROAD-V1-D2` | Tensor/multi-GPU parallelism | [engine matrix](engine-matrix.md), [coverage view §3](feature-matrix.md#3-parallelism--scale-out) | TP spec written | `READY` | acquire 2-GPU target and claim Phase 0 mock/ABI |
 | 12 | `ROAD-V1-D3` | Spec-decode breadth: ngram and EAGLE3 | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | unspiked | `INVENTORIED` | after MTP/DFlash gate |
-| 13 | `ROAD-V1-D4` | LoRA, KV/offload, wider model zoo | [engine matrix](engine-matrix.md), [model matrix](model-matrix.md) | expert-streaming draft under adversarial grounding repair (`ENG-EXPERT-STREAM` SPIKE): the capacity regime/NVMe measurements stand, but live Marlin dense-stride addressing, repack residency, safetensors offset ownership, and graph/synchronization constraints must replace invalid pointer-table/direct-offset assumptions; mirror floor `ENG-WEIGHT-OFFLOAD` inventoried; LoRA/KV-offload/model-zoo unspiked | `PARTIAL` | finish the expert-streaming dispatch/storage re-spike before any W1 implementation claim; rest after T1 dependencies close |
+| 13 | `ROAD-V1-D4` | LoRA, KV/offload, wider model zoo | [engine matrix](engine-matrix.md), [model matrix](model-matrix.md) | corrected expert-streaming spike accepted (`ENG-EXPERT-STREAM` READY): bank-only safetensors→Marlin bank, fixed contiguous cache slots matching Marlin dense strides, logical→slot remap after explicit router D2H, chunked C<E prefill, whole-system GB10 memory gate; mirror floor `ENG-WEIGHT-OFFLOAD` inventoried; LoRA/KV-offload/model-zoo unspiked | `PARTIAL` | claim expert-streaming W0 trace/c1 baseline, then W1 cache policy and W2 bank/reader/pread leaves; rest after T1 dependencies close |
 
 An area row cannot enter `READY` without a real spike under `specs/`, and cannot
 enter `DONE` without exact code and test/evidence anchors. Closed execution
@@ -89,7 +89,7 @@ live in [feature-matrix.md](feature-matrix.md).
 | D1 | Backend expansion: NVIDIA fan-out → ROCm; Apple Metal via MLX (B1 selected E1 over native-MSL-first; M4/16 GB dev host available); Vulkan; loyal Intel XPU port; ANE for encoder/pooling classes | ☐ staged by waves in [feature matrix §12](feature-matrix.md#12-platforms--hardware) and [backends.md](backends.md) |
 | D2 | Multi-GPU / tensor parallelism | 🚧 [spec written](specs/tensor-parallelism.md); needs a 2-GPU box because GB10 is single-GPU |
 | D3 | Spec-decode breadth beyond MTP/DFlash | ☐ ngram and EAGLE3 after the T1 path |
-| D4 | LoRA, KV/offload breadth, and wider model zoo | 🚧 T2 — [expert streaming from disk](specs/expert-streaming.md) returned to `SPIKE` for dispatch/storage grounding repair; LoRA/KV-offload/zoo still ☐ |
+| D4 | LoRA, KV/offload breadth, and wider model zoo | 🚧 T2 — corrected [expert streaming from disk](specs/expert-streaming.md) contract READY; W0 trace/c1 baseline first; LoRA/KV-offload/zoo still ☐ |
 
 ## Protocol evolution (user-directed, 2026-07-10) — mirror as the FLOOR, surpass beyond it
 

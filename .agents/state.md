@@ -2462,3 +2462,24 @@ claim changed in this docs-only spike.
 Validation: `python3 scripts/check-agent-record.py` and the 13-case mutation
 suite pass; matrix counts remain ENGINE=90, MODEL=323, QUANT=81, KERNEL=30,
 BACKEND=51. Spike claim released; `BACKEND-ABI-VT` is `READY`.
+
+## 2026-07-10 — corrected expert-streaming contract accepted (`READY`)
+
+The grounding takeover finished the stopped workflow's write phase and released
+`CLAIM-EXPSTREAM-GROUND-1`. The corrected spec preserves ds4's cache policy,
+pread pool, capacity-mode scope and measured NVMe math while adapting them to
+our actual execution chain. Runtime Marlin uses one dense base and
+`expert_id * stride`, so streaming uses fixed contiguous C-slot arrays and
+rewrites logical router IDs to slot IDs before `moe_align`; it does not promise
+pointer-table indirection. The loader builds a versioned pre-repacked bank while
+safetensors shard spans are alive and, in streaming mode, never creates the
+16.88 GiB host expert vectors or the full-E `MoeMarlinResident`. Phase 1 is
+explicitly non-graphed with one router D2H/event wait per MoE layer. Long
+prefill with C<E uses exact chunk filters/scatter accumulation rather than a
+hidden full-layer resident.
+
+The implementation order is W0 nsys/current-c1 baseline, W1 CPU cache policy,
+W2 bank/reader/pread (with its own build/startup/RSS checkpoint), W3 phase-1
+decode (token/memory/off-path/performance gates), then W4 chunked prefill and W5
+locality. Any resident/missing overlap is a new W6 spike after W3 evidence.
+`ENG-EXPERT-STREAM` is READY for W0, not implemented or supported.

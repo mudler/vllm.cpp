@@ -11,11 +11,14 @@ mirror port).
 
 Verdict up front (from the bandwidth math in §3, all inputs measured):
 
-- **Low concurrency (c1-c4): VIABLE as a capacity feature.** At a 50%
+- **Low concurrency (c1-c4): VIABLE as a capacity feature, conditional on the
+  bank-only loader and fixed-slot Marlin design below.** At a 50%
   expert-resident fraction the 35B-A3B needs ≤ 270 MiB of expert reads per
   token worst-case; the dgx NVMe sustains 5.0-5.3 GB/s with a small read
-  pool, an I/O-only bound of ≥ 17.7 tok/s before locality. Frees ~8.4 GiB
-  (f=0.5) to ~12.7 GiB (f=0.25) of the ~22 GiB weight footprint.
+  pool, an I/O-only bound of ≥ 17.7 tok/s before locality. It can free ~8.4 GiB
+  (f=0.5) to ~12.7 GiB (f=0.25) only if streaming mode never materializes the
+  current per-expert host `OwnedTensor` copies or the full device Marlin
+  resident; keeping either would erase the capacity win on unified-memory GB10.
 - **High concurrency (the MVP gate operating point): NOT SERVED.** At
   conc≥32 every step touches ~64-98% of all 256 experts per layer
   (1-(1-8/256)^B), so per-step I/O approaches (1-f) x 16.9 GiB regardless of
@@ -32,11 +35,11 @@ Verdict up front (from the bandwidth math in §3, all inputs measured):
 
 | Field | Content |
 |---|---|
-| Row IDs | `ENG-EXPERT-STREAM` (this spike; work-breakdown leaves W1-W7 below). Mirror-floor context row: `ENG-WEIGHT-OFFLOAD` (INVENTORIED, not claimed here) |
-| In | Routed-MoE expert weights only (gate/up/down per expert per layer) for MoE models, first target Qwen3.6-35B-A3B NVFP4 (safetensors): NVMe-backed expert bank, byte/count-budgeted resident cache in device memory, router-output-keyed miss loads via an async pread pool, hotness-decayed-LFU + LRU-tiebreak eviction with in-flight/selected protection, full-layer sequential streaming for long prefill + decode-cache seeding, optional hotlist preload, `--simulate-used-memory`-style honest measurement mode |
+| Row IDs | `ENG-EXPERT-STREAM` (this spike; work-breakdown leaves W0-W8 below). Mirror-floor context row: `ENG-WEIGHT-OFFLOAD` (INVENTORIED, not claimed here) |
+| In | Routed-MoE expert weights only (gate/up/down per expert per layer) for MoE models, first target Qwen3.6-35B-A3B NVFP4 (safetensors): versioned NVMe Marlin-layout expert bank, bank-only loader, fixed-capacity contiguous Marlin slot arrays, logical-expert→slot remap after router D2H, async O_DIRECT pread/copy pool, hotness-decayed-LFU + LRU-tiebreak eviction with in-flight/selected protection, chunked slot sweeps for long prefill + decode-cache seeding, optional hotlist preload, `--simulate-used-memory`-style honest measurement mode |
 | Out (this row) | Dense weights, shared experts, router, norms, KV cache (all stay resident); GGUF expert streaming (needs per-expert slicing of 3D tensors — follow-up leaf after `QUANT-GGUF-KEEPQ-LOADER`); host-RAM tier for discrete GPUs (W7, after gate); vLLM UVA `cpu_offload_gb` mirror (own row `ENG-WEIGHT-OFFLOAD`); expert-parallel EPLB (`PAR-EP-EPLB`) |
 | Supported modes | `off` (default, unchanged engine); `nvme` (expert bank file + device cache). Budget accepted as expert count or `NGB` (ds4 CLI semantics `--ssd-streaming-cache-experts 32GB`, ds4_ssd.c:46-70); auto budget = fraction of free device memory minus non-streamed needs (ds4_ssd.c:80-106) |
-| Dispatch behavior | Streaming engages only when enabled AND the model is MoE; engine WARNS and refuses (or auto-disables per config) when max concurrency exceeds the regime bound (§3, default warn at conc>4, hard cap configurable); dense models reject the flag |
+| Dispatch behavior | Streaming engages only when enabled AND the model is MoE. It branches before `BuildMoeMarlinResident`, never builds the full `[E,...]` resident, copies router IDs device→host and synchronizes once per MoE layer in phase 1, maps logical IDs to fixed cache slots, then runs the unchanged dense-stride Marlin kernel over slot IDs. Engine WARNS and refuses (or auto-disables per config) when max concurrency exceeds the regime bound (§3, default warn at conc>4, hard cap configurable); dense models reject the flag |
 | Regimes served | c1-c4 capacity/single-user; models larger than device memory. Explicitly NOT the high-concurrency throughput gate |
 
 ## ds4 anatomy (what we are porting from)
@@ -130,10 +133,12 @@ and ROCm SSD streaming").
 
 **Portable to us**: the resident/streamed split (non-routed resident, routed
 experts tiered); byte-or-count budget + auto plan; hotness-decayed-LFU
-eviction with in-flight protection; the pread pool with per-tensor tasks;
-within-layer overlap (resident experts compute while misses load); full-layer
-sequential prefill streaming + last-K decode seed; locality profiler +
-hotlist preload; the simulate-used-memory honesty tool; CLI semantics.
+eviction with in-flight protection; the pread pool; a synchronous phase-1
+router-readback/load boundary; chunked prefill streaming + last-K decode seed;
+locality profiler + hotlist preload; the simulate-used-memory honesty tool;
+CLI semantics. ds4's resident-first/missing-deferred overlap is a later
+candidate, not a mechanical port: our selected GB10 Marlin kernel uses dense
+expert strides and has no address table or pair-mask input.
 **ds4-specific, not portable**: Metal no-copy mmap buffer wrapping +
 `F_RDADVISE`; hash-layer lookahead (DeepSeek `tid2eid`; Qwen3.6 has none);
 top-6 bitmasks (we are top-8); GGUF 3D-tensor slicing arithmetic (our first
@@ -196,38 +201,60 @@ antirez/ds4 @ 80ebbc3 — files/lines inventoried in §ds4-anatomy above. Ports
 from ds4 carry `// Ported from: antirez/ds4 <file>:<line> @80ebbc3` headers
 exactly like vLLM-derived files.
 
+**Runtime trace plan (required because dispatch is dynamic).** Before W1, run
+`nsys profile` on the non-streamed 35B c1 workload and record the actual router,
+`moe_align`, Marlin w13/w2, repack, allocation, and synchronization kernels plus
+their wall time/launch order. W0 also runs an instrumented router-only probe that
+copies `dtid` after `MoeRouterTopK` and proves the device→host event boundary.
+At W3, trace streaming-off and phase-1 streaming-on in one same-binary series:
+the OFF trace must remain structurally identical; the ON trace must show one
+intentional D2H/event wait per MoE layer, bank reads/copies before slot use, and
+no full-resident repack/allocation. At W4, trace each prefill slot sweep and
+verify every routed pair is computed exactly once. Kernel names and steady-state
+times, not source inference, are the acceptance evidence.
+
 ## Our baseline
 
 - **Checkpoint (measured from the real safetensors header, dgx 2026-07-10)**:
   `nvidia/Qwen3.6-35B-A3B-NVFP4`, 40 MoE layers x 256 experts, top-8 + 1
   shared (`config.json`: num_experts=256, num_experts_per_tok=8,
   moe_intermediate_size=512, hidden 2048). Per expert per layer: gate
-  U8[512,1024] 524,288 B + FP8 scales [512,128] 65,536 B; up identical; down
-  U8[2048,256] 524,288 B + scales 65,536 B → **1,769,472 B ≈ 1.688 MiB**.
-  Routed-expert total: 40x256x1.688 MiB = **16.88 GiB of the ~22 GiB
-  checkpoint (~77%)**. Each expert is a separate safetensors tensor
-  (offsets directly available from the header — no GGUF-style slicing math
-  needed).
-- **Our MoE execution path (the seams)**: per-expert NVFP4 tensors are loaded
-  into per-expert device buffers
-  (`src/vllm/model_executor/models/qwen3_5_weights.cpp:277-300`), exposed
-  through per-layer `[E]` device pointer tables
-  (`src/vllm/model_executor/models/qwen3_5.cpp:169-201`), then repacked ONCE
-  at first touch into Marlin interleaved layout — fused w13 `[E, 2N, K/2]`
-  gate+up concatenation — and the originals freed
-  (`qwen3_5.cpp:202-267`); decode runs ONE grouped
+  U8[512,1024] 524,288 B + FP8 scales [512,128] 65,536 B + f32 scale2;
+  up identical; down U8[2048,256] 524,288 B + scales 65,536 B + f32 scale2
+  → **1,769,484 B ≈ 1.688 MiB**. Routed-expert total is **16.88 GiB of the
+  ~22 GiB checkpoint (~77%)**. Each projection is a separate safetensors
+  entry, but our reader exposes only an mmap pointer/length through `StTensor`
+  (`safetensors_reader.h:13-47`); it does not expose the owning shard path, fd,
+  data-section base, or absolute offset for later pread. The bank builder must
+  consume those spans while shards are alive or extend the reader metadata.
+- **Our MoE execution path (the seams)**: `LoadNvfp4Raw` copies every packed
+  weight and scale span into host `OwnedTensor` storage
+  (`qwen3_5_weights.cpp:196-223,276-298`), and the model retains those copies.
+  CUDA then uploads per-expert originals, repacks ALL E experts once into one
+  contiguous Marlin layout — fused w13 `[E, H/16, 4I]`, w2
+  `[E, I/16, 2H]`, contiguous scale arrays and `[E]` global scales —
+  synchronizes, and frees only the temporary DEVICE originals
+  (`qwen3_5.cpp:2392-2549`). Decode runs grouped
   `moe_wna16_marlin_gemm` over `moe_align` outputs
   (router `MoeRouterTopKKernel` `src/vt/cuda/cuda_moe.cu:47-127`;
   `MoeAlignKernel`/`MarlinMoeAlignBlockSize`
-  `src/vt/cuda/cuda_marlin_repack.cu:203-293`).
+  `src/vt/cuda/cuda_marlin_repack.cu:203-293`). The Marlin kernel reads
+  `expert_ids_ptr[block]`, indexes `global_scale[expert_id]`, and computes
+  `B_expert_off = expert_id * prob_n * prob_k / (pack_factor*4)`
+  (`marlin_template.h:543-550`): runtime storage is dense-stride, not a pointer
+  table. Router IDs stay on device (`cuda_moe.cu:54-128`).
 - **Honest gaps**: (1) nothing in the engine can drop or re-load expert
-  weights after load — residency is all-or-nothing; (2) the Marlin repack
-  happens on-device from the fp4 originals, so a naive "stream from
-  safetensors" would pay a repack kernel per miss; (3) memory accounting
+  weights after load — residency is all-or-nothing; (2) retaining the current
+  host `OwnedTensor` expert vectors would consume the bytes streaming is meant
+  to free on GB10 even if the device cache were smaller; (3) a naive checkpoint
+  pread would still require the Marlin repack/scale-processing kernels per miss,
+  including layer-wide combined scale factors; (4) `MoeMarlinResident` is a
+  process-static full-E allocation keyed by `MoeBlockWeights*` and must be
+  bypassed, not partially populated; (5) router IDs require an explicit D2H
+  synchronization before host cache decisions; (6) memory accounting
   (`src/vllm/entrypoints/model_loader.cpp:117-129`) assumes static weights;
-  (4) we have no expert-locality data for Qwen3.6 routing (needed to predict
-  hit rates above the uniform lower bound — ds4's profiler is the tool to
-  port); (5) engine c1 decode tok/s on dgx is not yet recorded in the ledger
+  (7) we have no expert-locality data for Qwen3.6 routing; (8) c1 decode tok/s
+  on dgx is not yet recorded in the ledger
   (the online-serving campaign `SERVE-GATE-ONLINE` is in flight) — the W6
   campaign must measure the non-streamed c1 baseline first.
 
@@ -251,13 +278,13 @@ With hit rate h the bound scales as 1/(1-h):
 | 0.75 (12.7 GiB) | 0.75 | 35.4 | 4.2 GiB |
 | 0.90 (15.2 GiB) | 0.90 | 88.5 | 1.7 GiB |
 
-Uniform routing is the WORST case for h; routing skew + hotness caching +
-consecutive-token locality (ds4's bet; its profiler measures adjacency
-overlap precisely because this is deployment-dependent) push h above f. The
-c1 compute floor adds ~20-35 ms/token (engine TPOT ~147 ms at conc64 per
-state.md:1467 implies c1 well under 50 ms); with within-layer overlap the
-totals support a **≥ 12 tok/s floor at f=0.5** with margin (56.6 ms I/O +
-partially-hidden compute), and ~2x that if measured locality reaches h≈0.7.
+Uniform routing is the conservative cache-hit model; routing skew + hotness
+caching + consecutive-token locality may push h above f, but W0/W5 must measure
+that rather than assume it. The table is an I/O-only upper bound: c64 TPOT does
+not identify c1 compute time, and phase 1 deliberately adds 40 router-readback
+waits per token. The **≥12 tok/s at f=0.5** target remains a gate derived from
+the 17.7 tok/s I/O ceiling, not a predicted result; W0 records the non-streamed
+c1 floor before implementation and no overlap credit is assumed until traced.
 
 High-batch regime (why the gate is out of scope): B independent top-8 draws
 touch ~256x(1-(31/32)^B) experts per layer per step — B=16: ~102 (40%),
@@ -281,12 +308,12 @@ New code goes under our seams; no upstream-mirrored file is restructured.
 | Source (design) | Local target | Notes |
 |---|---|---|
 | ds4_ssd.c:46-106 (budget parse + auto plan), ds4_ssd.c:108-181 (simulate-used-memory) | `src/vllm/model_executor/expert_stream/budget.{h,cpp}`; probe tool `tools/expert_stream/simulate_used_memory.cpp` | count-or-`NGB` parsing, auto plan from free device memory minus non-streamed needs; honesty tool for W6 |
-| ds4_metal.m:370-458, 8678-8776, 9653-9830 (entry table, slabs, hotness decay, victim scan, protection); ds4_cuda.cu:156-198, 1967, 2011-2098 (device slabs, LRU) | `src/vllm/model_executor/expert_stream/expert_cache.{h,cpp}` (+ CUDA slab alloc in `src/vt/cuda/cuda_expert_cache.cu`) | per-(layer,expert) entries over cudaMalloc'ed slabs `[C, 2N, K/2]`+scales; hotness-decayed LFU (decay every 16 decode tokens), LRU tiebreak, in-flight seq + selected protection |
-| ds4_metal.m:7699-7995 (pread task/pool), ds4_cuda.cu:1055-1104 (O_DIRECT staging), 1262 (async upload) | `src/vllm/model_executor/expert_stream/pread_pool.{h,cpp}` | persistent pool (default 9, cap 18 threads), one task per missing expert; O_DIRECT + pinned staging + `cudaMemcpyAsync` on a copy stream (GB10 unified memory: memcpy may collapse to no-op-cost — measure in W2) |
-| ds4_metal.m:10618-10800 (begin_selected_load), 23392-23433 (resident/missing split) | hook in `src/vllm/model_executor/models/qwen3_5.cpp` MoE block (after `MoeRouterTopKKernel`, before `MarlinMoeAlignBlockSize`) | Phase 1: sync-wait (readback topk ids → ensure resident → remap → GEMM). Phase 2: within-layer overlap via moe_align **slot remap** — cache slot ids replace expert ids so `moe_wna16_marlin_gemm` runs unmodified over the slab; resident-first/missing-deferred split only if Phase-1 profile shows the wait dominates |
-| ds4.c:11696-11760 (full-layer streaming prefill + lookahead thread), 13812-13824 + 19657 (decode cache seed from last ≤64 prefill tokens) | same hook, prefill branch | above a token cutoff, stream whole repacked layer banks sequentially (5.4 GB/s measured) instead of expert-wise; then seed decode cache from last-K selections |
+| ds4_metal.m:370-458, 8678-8776, 9653-9830 (entry table, slabs, hotness decay, victim scan, protection); ds4_cuda.cu:156-198, 1967, 2011-2098 (device slabs, LRU) | `src/vllm/model_executor/expert_stream/expert_cache.{h,cpp}` + `src/vt/cuda/cuda_expert_cache.cu` | CPU metadata maps `(layer, logical_expert) -> slot`; CUDA owns fixed contiguous arrays for C Marlin slots (`w13`, `w2`, both processed scales, both global scales), because the kernel addresses `base + slot*stride`. Never allocate unrelated per-entry device pointers. Hotness-decayed LFU (decay every 16 decode tokens), LRU tiebreak, in-flight + selected protection |
+| ds4_metal.m:7699-7995 (pread task/pool), ds4_cuda.cu:1055-1104 (O_DIRECT staging), 1262 (async upload) | `src/vllm/model_executor/expert_stream/pread_pool.{h,cpp}` | persistent pool (default 9, cap 18 threads), one fixed-size bank-entry task per missing expert; O_DIRECT into aligned pinned staging, then explicit copy-stream upload into the chosen contiguous slot. GB10 is unified memory but current cache arrays are `cudaMalloc`; copy cost/overlap is measured, never assumed away |
+| ds4_metal.m:10618-10800 (begin_selected_load), 23392-23433 (resident/missing split) | streaming branch beside `MoeBlockFusedMarlinCuda` in `src/vllm/model_executor/models/qwen3_5.cpp`, before the current full-E `MoeMarlinResidentFor` build | Phase 1: run router; async D2H `dtid` + event synchronize; update hotness/dedupe logical IDs; load/evict until all selected experts are resident; rewrite a device copy of top-k IDs from logical IDs to slot IDs; run `MarlinMoeAlignBlockSize(..., num_experts=C)` and unchanged Marlin GEMMs over C-slot tensors. OFF path is byte- and trace-identical. Resident-first/missing-deferred overlap requires new pair partition/accumulation kernels and is out until phase-1 profiling justifies a separately spiked leaf |
+| ds4.c:11696-11760 (full-layer streaming prefill + lookahead thread), 13812-13824 + 19657 (decode cache seed from last ≤64 prefill tokens) | same streaming branch, prefill mode | full-layer residency is impossible when C<E. Sweep the bank in chunks of at most C logical experts: filter routed pairs for the chunk, load contiguous slots, run aligned Marlin, scatter/accumulate each pair exactly once, then advance; pipeline next chunk reads only after correctness. Seed decode cache from the last-K prompt selections |
 | ds4.c:750-1207 (expert locality profiler + hotlist write), ds4.c:13949-14016 (preload), ds4_streaming_hotlist.inc | `tools/expert_stream/expert_profiler` (+ optional hotlist preload in expert_cache) | measures per-layer histograms, latest-N cache simulation, adjacency; produces hotlist for preload and the h(f) curve for gates |
-| (ours, no ds4 counterpart) | `tools/expert_stream/build_expert_bank.cpp` + loader hook near `src/vllm/model_executor/models/qwen3_5_weights.cpp:277-300` | one-time offline/first-load repack of all experts to a **Marlin-layout expert bank file** on NVMe (per-expert offset table in header) so misses are plain preads of ready-to-use bytes — kills the per-miss repack (baseline gap 2). Bank keyed by checkpoint hash + layout version |
+| (ours, no ds4 counterpart) | `tools/expert_stream/build_expert_bank.cpp`; source-metadata extension in `safetensors_reader.{h,cpp}`; streaming loader branch near `qwen3_5_weights.cpp:196-223,276-298,326-339` | one-time offline/first-load repack of all experts to a **Marlin-layout bank**. Builder consumes mmap spans while each owning shard lives (or explicit path/absolute-offset metadata), computes layer-wide w13/w2 combined scale factors, and writes fixed-size per-expert records plus manifest. Runtime streaming mode loads only manifest/non-expert weights: it must not populate `expert_{gate,up,down}_fp4` host bytes or call `BuildMoeMarlinResident`. Bank key covers checkpoint content, architecture, shapes, fused-vs-split w13 mode, Marlin layout ABI and target arch; derived bank is never redistributed |
 | vLLM config style (`vllm/config/offload.py:15-44` as the shape reference) | `include/vllm/config/expert_stream.h` + plumb through `src/vllm/entrypoints/model_loader.cpp:117-129` memory accounting | our namespace `expert_streaming.*` (see upstream-sync safety); memory accounting learns "streamed expert bytes not resident" |
 
 ## Tests to port
@@ -300,10 +327,11 @@ for its own future spike, not this one.
 | Test | Source / pattern | Local tier / target | Status plan |
 |---|---|---|---|
 | Streaming-vs-resident token exactness (same checkpoint, same seed, 16/16 greedy; f ∈ {0.25, 0.5, 1.0-ε}) | pattern: `tests/parity/test_qwen36_paged_engine.cpp:140` gate | T-parity, new `tests/parity/test_qwen36_expert_stream.cpp` (checkpoint-gated, dgx) | with W3 |
-| Expert cache unit semantics: budget parse (count/`NGB`), auto plan subtraction, hotness decay halving, victim = min-hotness/LRU-tiebreak, in-flight + selected protection, slot reuse | ds4 semantics at ds4_ssd.c:46-106 and ds4_metal.m:8678-8776, 9653-9830 (cited in test header) | T-unit doctest, new `tests/vllm/test_expert_cache.cpp` (CPU-only, mock storage) | with W1 |
+| Expert cache unit semantics: budget parse (count/`NGB`), auto plan subtraction, hotness decay halving, victim = min-hotness/LRU-tiebreak, in-flight + selected protection, logical→slot mapping, slot reuse, C<E bounds | ds4 semantics at ds4_ssd.c:46-106 and ds4_metal.m:8678-8776, 9653-9830 (cited in test header) | T-unit doctest, new `tests/vllm/test_expert_cache.cpp` (CPU-only, mock storage) | with W1 |
 | pread pool: task fan-out, O_DIRECT alignment, failure propagation, shutdown | ds4_metal.m:7776-7995 | T-unit, `tests/vllm/test_expert_pread_pool.cpp` (tmp files, CPU-only CI) | with W2 |
-| Expert bank builder: offsets, per-expert byte identity vs loader-repacked device bytes | ours | T-unit + golden compare, `tests/vllm/test_expert_bank.cpp` | with W3 |
-| Prefill full-layer path + decode seed: cache state after prefill equals last-K selections | ds4.c:11696-11760, 13812 | T-unit with mock router + checkpoint-gated e2e assert | with W4 |
+| Expert bank builder: shard ownership/offset bounds, manifest-key rejection, layer-wide scale factors, and per-expert byte identity vs the existing full-resident Marlin repack | ours, current reference `qwen3_5.cpp:2392-2549` | T-unit + real-checkpoint golden compare, `tests/vllm/test_expert_bank.cpp` | with W2 |
+| Slot-remap kernel: random logical top-k IDs + mappings become valid `[0,C)` IDs; `moe_align` + w13/w2 outputs equal an E-resident reference; unmapped ID hard-fails before GEMM | current Marlin dense-stride contract `marlin_template.h:543-550` | T-unit CPU reference + CUDA op parity | with W3 |
+| Prefill chunk sweeps + decode seed: every routed pair appears exactly once across chunks; accumulated output equals full-resident path; cache state after prefill equals last-K selections | ds4.c:11696-11760, 13812 adapted to dense-slot Marlin | T-unit with mock router + checkpoint-gated e2e assert | with W4 |
 | Regime guard: conc>bound warns/refuses; dense model rejects flag | ours (product rule from §3) | T-unit config + `tests/vllm/entrypoints/openai/test_conformance.cpp` addition | with W3 |
 | `ENG-WEIGHT-OFFLOAD` mirror tests — `tests/basic_correctness/test_cpu_offload.py:11` (UVA/pin-memory matrix), `tests/quantization/test_cpu_offload.py:18,32,48,64` | upstream | NOT this row — inventoried for `specs/weight-offload-uva.md` | recorded only |
 
@@ -315,10 +343,10 @@ idle box, ≥2-3 reps, exact commands into the ledger.
 | Gate | Requirement | Exact command sketch |
 |---|---|---|
 | G1 token exactness (precondition, never traded) | Streaming on (f=0.5 and f=0.25) is 16/16 greedy token-exact vs the SAME build with streaming off, 35B gate corpus; and the streaming-off build stays 16/16 vs the vLLM oracle as today | `flock /tmp/gpu -c './tests/parity/test_qwen36_expert_stream --resident-frac 0.5'` (dgx) |
-| G2 measured memory reduction | At f=0.5: peak device memory ≥ 7.5 GiB below the non-streamed run (target from §3: 8.4 GiB of expert bytes minus cache metadata); measured via `nvidia-smi`/cudaMemGetInfo A/B on identical workload; run under page-cache control (O_DIRECT bank reads AND a `simulate_used_memory` arm) so unified-memory page cache cannot fake it | A/B same-binary, `--expert-streaming off` vs `cache=8.4GB` |
+| G2 measured memory reduction | At f=0.5: peak whole-system used memory AND CUDA allocation high-water are ≥7.5 GiB below non-streamed. Prove the streaming loader retained no routed-expert host `OwnedTensor` bytes and allocated no full-E `MoeMarlinResident`. On GB10, `nvidia-smi` alone is insufficient: record `/proc`/`free`, process RSS/PSS, `cudaMemGetInfo`, and page-cache baseline; use O_DIRECT plus `simulate_used_memory` so file cache cannot fake the win | A/B same binary, fresh process per arm: `--expert-streaming off` vs `cache=8.4GB` |
 | G3 tok/s floor at stated resident fraction | c1 decode (1024-token prefill, 128 decode, greedy) on dgx NVMe at f=0.5: **≥ 12 tok/s**, with the full measured curve published for f ∈ {0.25, 0.5, 0.75, 1.0-ε} incl. hit rates (I/O math §3 supports 17.7 uniform; 12 leaves compute+sync margin — a miss on 12 means the overlap machinery, not the concept, failed) | bench harness c1 arm x3 reps + cache hit-rate counters |
-| G4 prefill regression bound | 8k-token prefill with streaming ≤ 1.5x the non-streamed prefill wall time at f=0.5 (full-layer sequential path; 16.9 GiB @ 5.4 GB/s ≈ 3.1 s I/O amortized over layers with lookahead) | same harness, prefill-heavy arm |
-| G5 regime honesty | conc>4 with streaming enabled emits the documented warning/refusal; gate-model non-streamed throughput paths measurably unchanged (same-binary A/B at conc64 within noise) when the feature is off | conformance test + one conc64 A/B rep |
+| G4 prefill regression bound | 8k-token prefill with streaming ≤1.5x non-streamed at f=0.5. Trace chunked slot sweeps: each routed pair exactly once, no full-layer resident allocation, and next-chunk overlap only if separately measured correct | same harness, prefill-heavy arm + nsys |
+| G5 regime/off-path honesty | conc>4 warns/refuses; streaming mode disables CUDA graphs explicitly in phase 1; with feature off, 35B and 27B large-concurrency throughput/TTFT/TPOT/peak memory and kernel trace are unchanged within reproduced noise against fresh vLLM denominators | conformance + same-binary OFF-vs-parent A/B, both gate models, 3 reps |
 | G6 record closure | Matrix row anchors + ledger row + README capacity-mode note + state.md, per DoD | `python3 scripts/check-agent-record.py` |
 
 ## Dependencies
@@ -326,7 +354,9 @@ idle box, ≥2-3 reps, exact commands into the ledger.
 | Dependency | Why | State |
 |---|---|---|
 | dgx.casa NVMe + 35B NVFP4 checkpoint | the only MoE gate model; bank build needs ~17 GiB free disk (346 GB free, headroom rule OK) | available (measured this spike) |
-| Marlin fused-w13 MoE path (`VT_MOE_FUSED_W13`, qwen3_5.cpp:202-267) | the expert bank stores Marlin-layout bytes; slot remap rides `moe_align` | merged, gated |
+| Marlin fused-w13 MoE path (`VT_MOE_FUSED_W13`, `qwen3_5.cpp:2392-2652`) | bank records and fixed slots must match its fused layout, layer-wide scale factors, dense expert stride and global-scale indexing | merged, gated; exact contract now cited |
+| Safetensors source metadata + bank-only loader representation | current `StTensor` lacks public owning path/fd/absolute offset, and `LoadNvfp4Raw` always copies bytes | W2 owns the narrow metadata/representation change; hard dependency before paging |
+| Router D2H + logical-to-slot op | current `dtid` is device-only and Marlin consumes dense expert IDs | W3; phase 1 intentionally non-graphed |
 | `SERVE-GATE-ONLINE` c1 baseline numbers | G3 needs the honest non-streamed c1 denominator | in flight (`CLAIM-SERVE-GATE-1`); W6 can measure its own baseline if still open |
 | `QUANT-GGUF-KEEPQ-LOADER` (`specs/gguf-keep-quant-loader.md`) | only for the LATER GGUF-streaming leaf (3D-tensor slicing); not needed for safetensors/W1-W6 | READY, unclaimed |
 | No new third-party deps | plain pread/O_DIRECT + pthreads + CUDA runtime; io_uring explicitly NOT required (measured 5 GB/s with 4 threads) | - |
@@ -334,27 +364,32 @@ idle box, ≥2-3 reps, exact commands into the ledger.
 
 ## Work breakdown
 
-Claim-sized, non-overlapping leaves; W1-W3 are the critical path, W1+W2 are
-CPU-testable without the GPU box.
+Claim-sized, non-overlapping leaves. W0 is evidence before implementation;
+W1 is CPU-only; W2 has CPU manifest tests plus one GPU golden; W3-W7 are the
+critical runtime/gating path.
 
 | Leaf | Scope (files above) | Depends on | Gate slice |
 |---|---|---|---|
-| W1 expert-resident memory manager + eviction | `expert_cache.{h,cpp}`, `budget.{h,cpp}`, slab alloc, hotness/LFU/protection, unit tests | - | cache unit tests green (CPU CI) |
-| W2 async prefetch pipeline keyed on router output | `pread_pool.{h,cpp}`, O_DIRECT staging, copy-stream upload, begin/finish API, unit tests | W1 | pool unit tests green; measured pool bw ≥ 4.5 GB/s on dgx |
-| W3 storage format + loader/dispatch changes | expert bank builder + bank reader, loader keep-on-disk mode, config plumbing + memory accounting, MoE hook with sync-wait ensure-resident + moe_align slot remap, regime guard | W1, W2 | G1 + G2 + G5 conformance slice |
-| W4 prefill full-layer streaming + decode cache seed | prefill branch + seed, lookahead pipelining | W3 | G4 |
-| W5 locality profiler + hotlist preload | profiler tool, h(f)/adjacency report for the 35B on the gate corpus, optional preload | W3 (runs alongside W4) | published h(f) curve feeding G3 tuning |
-| W6 per-regime gate campaign + closure | c1 curve (G3), prefill (G4), memory (G2), conc64 no-regression arm (G5), ledger/README/matrix/state closure | W3-W5 | G3 + G6 |
-| W7 (post-gate, optional) pluggable host-RAM tier for discrete-GPU hosts | backing-store interface (bank-file vs pinned-host pool); relates to, but does not implement, vLLM `cpu_offload_gb` (that mirror is `ENG-WEIGHT-OFFLOAD`) | W3 | own mini-gate on non-GB10 hardware when available |
+| W0 trace + c1 baseline | nsys current 35B router/align/Marlin/repack; router D2H boundary probe; fresh non-streamed c1 throughput/latency/memory; bank-layout byte accounting | - | committed evidence; no code state claim |
+| W1 cache policy + budget | CPU `expert_cache` metadata and `budget`: logical→slot mapping, LFU/LRU/protection, no device allocation; unit tests | W0 | CPU tests green |
+| W2 bank format/builder + reader + pread pool | safetensors source metadata, layer-wide scale-factor/full-resident byte golden, versioned bank manifest, bank-only weight representation, O_DIRECT pool and aligned staging. Does not change live dispatch | W0 | CPU tests + real-bank golden; build/startup/RSS checkpoint vs parent |
+| W3 phase-1 decode dispatch | fixed contiguous C-slot CUDA arrays; router D2H/event wait; ensure-resident; logical→slot rewrite; align with C; unchanged Marlin GEMMs; config/memory accounting/regime guard; bypass full-E resident | W1,W2 | G1 + G2 + G5; nsys contract; own performance checkpoint |
+| W4 prefill chunk sweeps + decode seed | routed-pair filter/scatter accumulation over ≤C experts per pass; last-K seed; only then measured next-chunk I/O overlap | W3 | G4 + exact pair coverage |
+| W5 locality profiler + hotlist preload | h(f)/adjacency report for 35B corpus, optional preload | W3 (parallel with W4) | published curve; no gate rebasing |
+| W6 optional resident/missing overlap spike | only if W3 trace shows wait dominance: inventory pair partition/accumulation kernel and graph implications before code | W3 evidence | separate accepted spike required |
+| W7 per-regime campaign + closure | c1 curve, prefill, whole-system memory, OFF-path both-model vLLM A/B, ledger/README/matrix/state | W3-W5 | G3 + G6, all benchmark-protocol axes |
+| W8 post-gate host-RAM tier | bank-file vs pinned-host backing store on discrete GPU; distinct from vLLM `cpu_offload_gb` mirror | W3 | separate hardware mini-gate |
 
 ## Risks/decisions
 
 | Risk / decision | Call |
 |---|---|
 | Product call: is a below-gate-throughput capacity mode in scope? | YES per user direction (this spike was user-directed); it is surpass-track, default-off, and G5 protects the gate paths. Only genuine product call in here — everything behavioral follows ds4's proven design + our math |
-| Per-layer sync (topk readback) adds ~40 sync points/token | Phase-1 accepts it (ds4 ships this way and our math includes margin); Phase-2 slot-remap overlap only if profiling shows need — decision recorded at W3 gating |
-| Uniform-routing h≈f may undershoot the G3 floor if Qwen3.6 routing is anti-local at f=0.5 | W5 measures h(f) BEFORE W6; if h<0.55 at f=0.5, G3's fraction is re-stated (e.g. pass at f=0.65) — the gate is the CURVE plus a floor, never silent re-basing (benchmark-protocol rule) |
+| Per-layer sync adds ~40 waits/token | Phase 1 accepts the structural cost but does not assume margin; W0 measures c1 and W3 has its own checkpoint. Any resident/missing overlap is W6 and requires a fresh spike, not an in-place optimization promise |
+| Uniform-routing h≈f may undershoot G3 | W5 measures h(f), but G3 stays fixed at f=0.5/12 tok/s. A miss is an open gap; changing the fraction is a new recorded gate, never silent rebasing |
 | Expert bank = second copy of expert bytes on disk (~17 GiB) | Accepted: one-time build, keyed+versioned, evictable file; alternative (per-miss repack kernel) taxes every miss forever |
 | GGUF checkpoints (APEX 35B) not covered by W1-W6 | Explicit out-of-scope; follow-up leaf after `QUANT-GGUF-KEEPQ-LOADER` lands (same cache, different slicer) |
 | tmpfs "tier" temptation on GB10 | Rejected with reasons (§Scope verdict): tmpfs is the same unified memory; documented so it is not re-proposed |
-| CUDA graphs vs data-dependent miss handling | Streaming decode runs the non-graphed path first (c1 capacity mode tolerates it); graph-compatible address-table indirection (ds4's addr-table analogue) is a recorded Phase-2 option, not a promise |
+| CUDA graphs vs data-dependent miss handling | Phase 1 explicitly disables graphs. Current Marlin has no address table; graph compatibility would require a separately spiked kernel/dispatch change after W3 profiling |
+| Full-layer prefill with C<E | A single unmodified Marlin launch cannot address experts absent from slots. W4 uses exact chunk filters + scatter accumulation and proves every routed pair once; it may not allocate a hidden E-sized buffer |
+| Host-copy trap on GB10 | Streaming loader must never materialize the 16.88 GiB expert `OwnedTensor` vectors. G2 inspects representation and whole-system memory, not device allocation alone |

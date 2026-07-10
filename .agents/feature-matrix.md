@@ -61,7 +61,7 @@ instead of it.
 | MLAAttentionSpec (latent KV) | `v1/kv_cache_interface.py` | ☐ T2 | with DeepSeek family | `planned: specs/mla-kv-spec.md` |
 | Sizing: `gpu_memory_utilization`, block overrides | `config/cache.py` | `PARTIAL` T0 | watermark/fixed loader inputs exist; public utilization/cache-byte/override policy absent | `planned: specs/kv-sizing.md` |
 | Weight CPU offload (`cpu_offload_gb` UVA per-parameter + layer-group `PrefetchOffloader`) | `config/offload.py`; `model_executor/offloader/` | ☐ T2 | v1-supported at the pin; blanket/name-targeted, NOT router-aware; mirror floor for expert streaming (engine row `ENG-WEIGHT-OFFLOAD`) | `planned: specs/weight-offload-uva.md` |
-| Expert streaming from disk (routed-MoE experts paged NVMe→GPU on router output, budgeted resident cache) | absent in-pin (surpass-track); design ref antirez/ds4 | ☐ T2 | low-concurrency capacity mode only; engine row `ENG-EXPERT-STREAM` returned to SPIKE after verification found the draft assumed pointer-table Marlin addressing and directly reusable file offsets that the live path does not provide | [expert-streaming.md](specs/expert-streaming.md) |
+| Expert streaming from disk (routed-MoE experts paged NVMe→GPU on router output, budgeted resident cache) | absent in-pin (surpass-track); design ref antirez/ds4 | ☐ T2 | corrected engine row `ENG-EXPERT-STREAM` READY: bank-only loader, fixed contiguous Marlin slots, logical→slot remap, explicit router D2H, chunked prefill; W0 trace/baseline first | [expert-streaming.md](specs/expert-streaming.md) |
 
 ## 3. Parallelism & scale-out
 

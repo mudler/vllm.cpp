@@ -10,12 +10,13 @@ C API, an example CLI, and an OpenAI-compatible server.
 > full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
 > **token-exact greedy gates passing**, and throughput is measured against vLLM
 > on real hardware. We **beat vLLM run eager** on both models; against vLLM's
-> *production* config (CUDA graphs + torch.compile) the **35B is near-parity
-> (≈0.97×)** and the **27B is ≈0.84×** on total throughput — and we use **~35%
-> less peak GPU memory** on both (a decisive win on that axis). We are **actively
-> closing the remaining gap** via a measured, execution-traced roadmap — see
-> *Status*. The tables track real, tested support and are kept current as work
-> lands (see `.agents/`).
+> *production* config (CUDA graphs + torch.compile) the **35B is at ≥1.0×
+> (measured 1.02× total throughput, and better TTFT/TPOT, with the Triton-AOT
+> GDN build; 0.99× in the default pure-C++ build)** and the **27B is ≈0.97×** —
+> and we use **~35% less peak GPU memory** on both (a decisive win on that
+> axis). We are **actively closing the 27B's last ~3%** via a measured,
+> execution-traced roadmap — see *Status*. The tables track real, tested support
+> and are kept current as work lands (see `.agents/`).
 
 ## What's implemented (CPU, behaviorally tested)
 
@@ -127,12 +128,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   paged engine end-to-end with **token-exact greedy gates passing**, and all CUDA
   kernels are validated on real hardware. **Throughput, measured vs vLLM on the same
   workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
-  *production* config (CUDA graphs + torch.compile — the honest bar) the **35B is
-  ≈0.97× (near parity)** and the **27B is ≈0.84×** on total throughput, while we use
-  **~35% less peak GPU memory** on both. The 35B is essentially at parity; the 27B's
-  residual is concentrated in the GDN linear-attention **chunk kernels**, which remain
-  ~1.9× slower than vLLM's Triton/FLA — a kernel-**codegen** gap (not a dtype or
-  algorithm gap), the next frontier.
+  *production* config (CUDA graphs + torch.compile — the honest bar) the **35B is at
+  ≥1.0×** — measured **1.02× total throughput with better TTFT (−4%) and TPOT (−2%)**
+  in the Triton-AOT GDN build (`-DVLLM_CPP_TRITON=ON`; 0.99× in the default pure-C++
+  build) — and the **27B is ≈0.97×**, while we use **~35% less peak GPU memory** on
+  both. The GDN chunk-kernel **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed
+  by a sanctioned, bounded **build-time Triton AOT fast-path** (FLA kernels verbatim →
+  cubin; runtime stays Python/Triton-free; the portable C++ kernels and CPU reference
+  remain the fallback — see the porting inventory §9). The 27B's last ~3% is in
+  flight (GDN config tune + batch-budget alignment with vLLM's scheduler default).
 - **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
   total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
   concurrency operating point). We do not stop at "near parity." The gap is being

@@ -14,17 +14,17 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `READY` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|
-| Engine and scheduling | 12 | 3 | 3 | 0 | 0 | 6 |
-| KV cache and memory | 12 | 2 | 2 | 0 | 0 | 8 |
+| Engine and scheduling | 13 | 3 | 3 | 0 | 0 | 7 |
+| KV cache and memory | 14 | 2 | 2 | 0 | 0 | 10 |
 | Parallelism | 5 | 0 | 0 | 1 | 0 | 4 |
-| Sampling and generation | 11 | 0 | 4 | 0 | 0 | 7 |
+| Sampling and generation | 13 | 0 | 4 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 3 |
 | Speculative decoding | 6 | 0 | 0 | 4 | 0 | 2 |
 | Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 11 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 6 | 0 | 0 | 0 | 0 | 6 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 2 |
-| **Total** | **83** | **9** | **17** | **5** | **0** | **51** |
+| **Total** | **88** | **9** | **17** | **5** | **0** | **56** |
 
 ## Engine core and scheduling
 
@@ -39,6 +39,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203` | - | - | `planned: specs/priority-scheduling.md` | `INVENTORIED` | - |
 | `ENG-PARTIAL-PREFILL` | Concurrent partial-prefill and long-prompt limits | T1 | `vllm/config/scheduler.py:70-80` | - | - | `planned: specs/partial-prefill-concurrency.md` | `INVENTORIED` | - |
 | `ENG-BATCH-QUEUE` | Pipelined `step_with_batch_queue` | T1 | `vllm/v1/engine/core.py:519` | - | - | `planned: specs/batch-queue-step.md` | `INVENTORIED` | - |
+| `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); carried from porting-inventory §1 (T0 there) at the v1 fold | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | - | - | `planned: specs/core-busy-loop.md` | `INVENTORIED` | - |
 | `ENG-SCHED-KNOBS` | Reserve-full-ISL, scheduler class seam, stream interval | T1 | `vllm/config/scheduler.py:26,127,140,163` | `include/vllm/config/scheduler.h:71,95`; `src/vllm/config/scheduler.cpp:43,52`; `src/vllm/v1/core/sched/scheduler.cpp:237`; `src/vllm/v1/engine/output_processor.cpp:68` | `tests/vllm/test_scheduler_config.cpp:10,20`; `tests/vllm/v1/test_kv_cache_manager.cpp:425` | `planned: specs/scheduler-knobs.md` | `PARTIAL` | - |
 | `ENG-CASCADE-ATTN` | Cascade attention for shared prefixes | T2 | `vllm/config/model.py:238` | - | - | `planned: specs/cascade-attention.md` | `INVENTORIED` | - |
 | `ENG-DBO-UBATCH` | DBO and ubatch overlap | T2 | `vllm/config/parallel.py:208,524` | - | - | `planned: specs/dbo-ubatch.md` | `INVENTORIED` | - |
@@ -58,7 +59,9 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-CONNECTORS` | Nixl, LMCache, Mooncake, and prefill/decode disaggregation | T2 | `vllm/distributed/kv_transfer/kv_connector/factory.py:27,152-164` | - | - | `planned: specs/kv-connectors-disagg.md` | `INVENTORIED` | - |
 | `KV-EVENTS` | Block create/evict event publication | T2 | `vllm/config/kv_events.py:11-52`; `vllm/v1/core/kv_cache_manager.py:121,149` | - | - | `planned: specs/kv-events.md` | `INVENTORIED` | - |
 | `KV-MLA-SPEC` | Latent MLA KV specification | T2 | `vllm/v1/kv_cache_interface.py:363` | - | - | `planned: specs/mla-kv-spec.md` | `INVENTORIED` | - |
+| `KV-CROSS-ENCODER-SPECS` | `CrossAttentionSpec` and `EncoderOnlyAttentionSpec` KV interface specs (`ATTN-ENCODER-CROSS` covers backends only); carried from porting-inventory §2 (T2) at the v1 fold | T2 | `vllm/v1/kv_cache_interface.py:710,717` | - | - | `planned: specs/encoder-cross-kv-specs.md` | `INVENTORIED` | - |
 | `KV-SIZING` | GPU memory utilization and block-count overrides | T0 | `vllm/config/cache.py:68,87,168`; `tests/v1/core/test_kv_cache_utils.py:2224,2303` | fixed inputs `src/vllm/entrypoints/model_loader.cpp:117,129`; watermark `src/vllm/v1/core/kv_cache_manager.cpp:118` | watermark only `tests/vllm/v1/test_kv_cache_manager.cpp:298` | `planned: specs/kv-sizing.md` | `PARTIAL` | - |
+| `KV-WARMUP-PROFILE` | Dummy runs, warmup, and startup memory profiling that derive the KV budget (`KV-SIZING` covers the sizing knobs only); carried from porting-inventory §3 (T0 there) at the v1 fold | T0 | `vllm/v1/worker/gpu/model_runner.py:504,647`; `vllm/v1/worker/gpu_worker.py:430` | - | - | `planned: specs/warmup-memory-profiling.md` | `INVENTORIED` | - |
 
 ## Parallelism and scale-out
 
@@ -78,6 +81,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `SAMPLE-PHILOX` | Torch-Philox bit-exact stochastic parity | T1 | `vllm/v1/sample/ops/topk_topp_sampler.py:70`; `vllm/v1/sample/sampler.py:243` | - | - | `planned: specs/philox-rng-parity.md` | `INVENTORIED` | - |
 | `SAMPLE-LOGPROBS` | Token logprobs payload end to end | T1 | `vllm/v1/sample/sampler.py:309`; `tests/v1/sample/test_logprobs.py:303`; `tests/v1/sample/test_logprobs_e2e.py:25` | `src/vllm/v1/sample/sampler.cpp:107,215`; `src/vllm/entrypoints/openai/protocol.cpp:202,294,327`; `src/vllm/v1/engine/output_processor.cpp:101,114` | sampler only `tests/vllm/v1/sample/test_sampler.cpp:185,221,253`; protocol parsing only | `planned: specs/logprobs-payload.md` | `PARTIAL` | - |
 | `SAMPLE-PROMPT-LOGPROBS` | Prompt logprobs | T1 | `vllm/v1/sample/sampler.py:309`; `vllm/sampling_params.py:303` | - | - | `planned: specs/prompt-logprobs.md` | `INVENTORIED` | - |
+| `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids` generative scoring and `logprobs_mode` variants beyond raw/processed (`SAMPLE-LOGPROBS` covers the payload only); carried from porting-inventory §6 (T1) at the v1 fold | T1 | `vllm/sampling_params.py:278,727`; `vllm/config/model.py:82,221` | - | - | `planned: specs/logprob-token-ids.md` | `INVENTORIED` | - |
 | `SAMPLE-LOGIT-FILTERS` | Logit bias, allowed-token IDs, bad words | T1 | `vllm/sampling_params.py:318,321,337`; `vllm/v1/sample/sampler.py:396`; `tests/v1/sample/test_sampler.py:367,413`; `tests/v1/sample/test_sampling_params_e2e.py:106,147` | `src/vllm/v1/sample/sampler.cpp:239`; `src/vllm/v1/sample/logits_processor/builtin.cpp:41`; `src/vllm/v1/sample/ops/bad_words.cpp:13,55` | `tests/vllm/v1/sample/test_logits_processors.cpp:121,163,200` | `planned: specs/logit-bias-bad-words.md` | `PARTIAL` | - |
 | `SERVE-COMPLETION-LONGTAIL` | Best-of, echo, suffix, user request fields | T1 | `vllm/entrypoints/openai/completion/protocol.py:56,67,70`; `tests/entrypoints/openai/completion/test_token_in_token_out.py:56` | echo parse only `include/vllm/entrypoints/openai/protocol.h:196`; `src/vllm/entrypoints/openai/protocol.cpp:204,295` | acceptance-only `tests/vllm/entrypoints/openai/test_conformance.cpp:589` | `planned: specs/completions-longtail-fields.md` | `PARTIAL` | - |
 | `SAMPLE-BEAM` | Beam-search wrapper | T1 | `vllm/entrypoints/generate/beam_search/offline.py:55,58,193` | - | - | `planned: specs/beam-search.md` | `INVENTORIED` | - |
@@ -85,6 +89,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `SAMPLE-THINKING-BUDGET` | Thinking budget state and logit combination | T1 | `vllm/v1/sample/sampler.py:381-386` | - | - | `planned: specs/thinking-budget.md` | `INVENTORIED` | - |
 | `SAMPLE-REPETITION` | Repetition detection and penalty state | T1 | `vllm/v1/sample/sampler.py:437` | - | - | `planned: specs/repetition-detection.md` | `INVENTORIED` | - |
 | `SAMPLE-CUSTOM-PROCESSORS` | Custom logits-processor plugin point | T2 | `vllm/v1/sample/logits_processor/__init__.py:49-97` | - | - | `planned: specs/custom-logits-processors.md` | `INVENTORIED` | - |
+| `SAMPLE-ROUTED-EXPERTS` | Routed-experts return (`enable_return_routed_experts` per-token expert-routing output); carried from porting-inventory §6 (T2) at the v1 fold | T2 | `vllm/v1/outputs.py:281`; `vllm/sampling_params.py:328` | - | - | `planned: specs/routed-experts-return.md` | `INVENTORIED` | - |
 
 ## Structured outputs and tool calling
 
@@ -108,6 +113,12 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `SPEC-NGRAM` | N-gram proposer | T2 | `vllm/v1/spec_decode/ngram_proposer.py:12` | - | - | `planned: specs/spec-decode-ngram.md` | `INVENTORIED` | - |
 | `SPEC-EAGLE3` | EAGLE3 proposer and draft model | T2 | `vllm/v1/spec_decode/eagle.py:10`; `vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:1` | - | - | `planned: specs/spec-decode-eagle3.md` | `INVENTORIED` | - |
 
+Note: grammar-bitmask application under speculative decode (the multi-row
+bitmask, one row per draft token) is deferred — see
+[porting-inventory.md §6](porting-inventory.md) — and is in scope for neither
+the `TOOLS-STRUCTURED-CORE` row nor the `SPEC-*` rows above until a spike
+claims it.
+
 ## Serving surface, CLI, and library
 
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
@@ -118,7 +129,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `SERVE-STREAM-USAGE` | Stream options and include-usage payload | T1 | `vllm/entrypoints/openai/chat_completion/protocol.py:214,731-735` | - | - | `planned: specs/stream-options.md` | `INVENTORIED` | - |
 | `SERVE-UTILITY-ENDPOINTS` | Tokenize, detokenize, ready, ping, server info, prefix reset | T1 | `vllm/entrypoints/serve/tokenize/api_router.py:37,63`; `vllm/entrypoints/serve/sagemaker/api_router.py:48`; `vllm/entrypoints/serve/dev/server_info/api_router.py:43`; `vllm/entrypoints/serve/dev/cache/api_router.py:20` | - | - | `planned: specs/utility-endpoints.md` | `INVENTORIED` | - |
 | `SERVE-CHAT-TEMPLATE` | Bounded Qwen3.6 Jinja/minja-style chat templates | T0 | `vllm/renderers/hf.py:673,986`; `vllm/entrypoints/chat_utils.py:1248,1335` | `src/vllm/entrypoints/chat_template.cpp:1133,1173,1186` | `tests/vllm/entrypoints/test_chat_template.cpp:60,79,206,236` | `planned: specs/chat-templating.md` | `ANCHOR-BACKFILL` | - |
-| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API | T1 | `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/async-llm-api.md` | `INVENTORIED` | - |
+| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API (reclassified T0→T1 at the v1 fold; porting-inventory §1 kept its T0 label) | T1 | `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/async-llm-api.md` | `INVENTORIED` | - |
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143-217`; `src/capi/vllm_c.cpp:133-348` | `tests/capi/test_capi.cpp:320,428,505`; `tests/capi/test_dlopen.cpp:60`; C11 header compile | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |

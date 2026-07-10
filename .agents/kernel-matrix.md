@@ -12,6 +12,11 @@ is explicit. `INVENTORIED` is source knowledge only. Runtime-selected kernels
 remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
+Interim convention (binding for every new kernel row until the C1 drop-in ABI
+lands; restated from [backends.md](backends.md) §drop-in): every new vt CUDA
+kernel notes its upstream `csrc` counterpart (if one exists) in a source
+comment, so the later signature alignment is mechanical.
+
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `KERNEL-CUDA-DISPATCH-AOT` | CUDA runtime, streams, graphs, per-arch dispatch, and generated/AOT artifact selection | platform selection `vllm/platforms/cuda.py:205-493`; gencode handling `CMakeLists.txt:201-220`; JIT packages `cmake/external_projects/triton_kernels.cmake:1-28` | [cuda_backend.cu:20](../src/vt/cuda/cuda_backend.cu#L20), [CMakeLists.txt:37](../CMakeLists.txt#L37), [TritonAOT.cmake:57](../cmake/TritonAOT.cmake#L57) | [CUDA backend tests](../tests/vt/test_cuda_backend.cpp#L31); only SM121 AOT artifacts are evidenced | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |

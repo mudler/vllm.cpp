@@ -12,7 +12,7 @@ and the actual checkpoints on `dgx.casa`. Companion spec:
 | Required field | Grounded content |
 |---|---|
 | Row IDs | `SPEC-MTP`, `SPEC-REJECTION`, `SPEC-GDN-SEGMENTS`, `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp`, `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
-| Scope | k=1 Qwen3.5/3.6 MTP first, both gate models and GDN rollback; §0-§3 |
+| Scope | k=1 Qwen3.5/3.6 MTP first, both gate models and GDN rollback; §0-§3. Grammar bitmask under spec decode (multi-row bitmask over draft tokens): OUT of scope — deferred, see porting-inventory §6 |
 | Upstream chain | config, model, speculator, rejection, scheduler and KV/state paths at pin; §2-§3 |
 | Our baseline | exact local GDN, scheduler, runner, model-loader and state touch points; §3.1 and §4 |
 | Port map | upstream component to the local file set; §3.1, §4 and the milestone file lists in §5 |

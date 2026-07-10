@@ -1,0 +1,3 @@
+# Vendored Triton AOT artifacts are generated code (embedded cubins): collapse
+# in diffs/review and exclude from language stats. Regen: scripts/regen-triton-aot.sh
+src/vt/cuda/triton_aot_vendored/** linguist-generated=true

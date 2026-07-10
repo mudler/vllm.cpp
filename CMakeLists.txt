@@ -116,10 +116,13 @@ if(VLLM_CPP_CUDA)
 endif()
 
 include(cmake/CompilerWarnings.cmake)
-# Triton AOT toolchain (build-time kernel->cubin, CUDA-only). Defines the gated
-# option VLLM_CPP_TRITON (default OFF) + add_triton_kernel(); with the option OFF
-# this include is inert (no Python, no generated sources). Wired below under CUDA
-# for the SANCTIONED GDN delta_h fast-path (see .agents/discipline.md).
+# Triton AOT kernels (cubins embedded in C launchers, CUDA-only), VENDORED
+# per-arch under src/vt/cuda/triton_aot_vendored/. Defines the gated option
+# VLLM_CPP_TRITON (default OFF; consumes the vendored artifacts — NO Python) +
+# the maintainer knob VLLM_CPP_TRITON_REGEN (regenerates them with Python+Triton;
+# scripts/regen-triton-aot.sh) + add_triton_kernel()/triton_aot_finalize(); with
+# the option OFF this include is inert (no sources added). Wired below under
+# CUDA for the SANCTIONED GDN fast-path (see .agents/discipline.md).
 include(cmake/TritonAOT.cmake)
 
 configure_file(include/vllm/version.h.in include/vllm/version.h @ONLY)
@@ -272,8 +275,9 @@ if(VLLM_CPP_CUDA)
   endif()
 
   # ── SANCTIONED Triton AOT fast-path: GDN delta_h (VLLM_CPP_TRITON, default OFF)
-  # Build-time compile of the FLA chunk_delta_h state-recurrence kernel to cubins
-  # embedded in libvllm; runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
+  # The FLA chunk_delta_h state-recurrence kernel as an embedded cubin in libvllm
+  # (VENDORED per-arch — the build needs no Python; VLLM_CPP_TRITON_REGEN=ON is
+  # the maintainer regen); runtime dispatch (behind VT_GDN_DELTAH_TRITON) is in
   # cuda_gdn.cu with the hand-C++ GdnChunkDeltaHRegRingKernel preserved as the
   # default fallback. OFF => none of this runs and the build is byte-identical.
   # Two specializations, one per gate-model GDN shape (both K=V=128, Hg=16, BT=64;
@@ -410,6 +414,12 @@ if(VLLM_CPP_CUDA)
       target_sources(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS})
       target_include_directories(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS_INCLUDE_DIR})
     endforeach()
+
+    # Vendored-tree bookkeeping (call ONCE, after the LAST add_triton_kernel):
+    # REGEN writes the MANIFEST (generator versions + triton_kernels/*.py hashes
+    # + per-base generation params); the normal builder path verifies those
+    # hashes against the vendored tree and WARNS loudly on drift.
+    triton_aot_finalize()
 
     target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON=1)
     target_link_libraries(vllm PUBLIC CUDA::cuda_driver)

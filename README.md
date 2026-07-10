@@ -58,6 +58,12 @@ cmake -S . -B build -DVLLM_CPP_SERVER=ON
 cmake --build build -j
 ctest --test-dir build            # the behavioral suite
 
+# Fast-GDN CUDA build (the MVP-parity numbers): adds the Triton-AOT GDN kernels.
+# They are VENDORED as pre-compiled cubins (src/vt/cuda/triton_aot_vendored/) —
+# building needs ONLY a C compiler, no Python/Triton (regenerating the vendored
+# artifacts is a maintainer task: scripts/regen-triton-aot.sh).
+cmake -S . -B build -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+
 # Serve an OpenAI-compatible endpoint (safetensors dir or a .gguf file)
 ./build/examples/server --model /path/to/Qwen3.6-35B-A3B --port 8000
 # then: curl localhost:8000/v1/chat/completions -d '{"model":"...","messages":[...]}'
@@ -135,9 +141,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   below), while we use less peak memory on both (27B run: 61.8 vs 76.2 GB at the
   identical workload/recipe). The GDN chunk-kernel
   **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed by a sanctioned, bounded
-  **build-time Triton AOT fast-path** (FLA kernels verbatim → cubin; runtime stays
-  Python/Triton-free; the portable C++ kernels and CPU reference remain the
-  fallback — see the porting inventory §9). The 27B measures **1.0072× at conc16
+  **Triton AOT fast-path** (FLA kernels verbatim → cubin, **vendored per-arch as
+  generated C** so the build needs no Python/Triton — regen is a maintainer task
+  via `scripts/regen-triton-aot.sh`; the runtime stays Python/Triton-free and the
+  portable C++ kernels and CPU reference remain the fallback — see the porting
+  inventory §9). The 27B measures **1.0072× at conc16
   and 1.0071× at conc32** (764.3 vs 758.8; 1051.2 vs 1043.9 tok/s; 7/5-rep means vs
   fresh same-hour graphed denominators; conc32 5/5 reps ≥1.0×, conc16 6/7 with one
   0.996 rep disclosed): a production-codegen dump + kernel profile of vLLM settled

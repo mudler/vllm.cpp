@@ -1716,3 +1716,23 @@ the last ~0.18× of GDN. GDN-Triton was NECESSARY but not SUFFICIENT for MVP par
 the GDN-Triton-fast 27B to rank the non-GDN residual + diagnose the conc32 scaling gap. PRs kept off
 main while the parallel agent is active. Triton branches: perf/gdn-deltah-triton-aot (#1) +
 perf/gdn-wu-chunko-triton-aot (#2).
+
+## 2026-07-10 — 35B at 0.994× (w13 fusion +3.01%); main CONSOLIDATED (w13 + Triton stack); MVP within reach
+
+**w13 MoE fusion MERGED (3e6736b, default-ON):** one grouped Marlin GEMM [P,2I] + SiluAndMul
+instead of two GEMMs + memsets (mirrors marlin_moe.py:133-170), same fusion for the
+shared-expert gate_up (the headline: +2.5 of the +3.01%). BIT-IDENTICAL halves probe + 35B
+greedy 16/16 both arms; A/B conc64/np200 +3.01%, every axis better (TPOT −3.1%, TTFT −1.4%).
+**35B: 0.965× → 0.994× vs graphed vLLM (3282).** Honest note: the MoE-expert w13 alone was
++0.53% (fixed costs largely overlapped); the shared-expert fusion carried the rest.
+
+**Triton AOT GDN stack MERGED to main (f3bcf60**, PRs #1+#2; byte-inert with
+VLLM_CPP_TRITON=OFF). Main now carries every lever: 4 portable wins + w13 + Triton GDN
+(default-OFF) + fp4-autotune (default-OFF).
+
+**MVP state:** 35B **0.994×** (w13 on, Triton GDN OFF — its 35B e2e never measured, H=32 spec
+exists; IN FLIGHT: the decisive A/B, does Triton GDN cross 1.0×?). 27B **~0.958×** best
+(Triton + fp4-autotune + mnbt2048; agent report pending — measured: autotune conc32 +6.4%,
+mnbt 8192→2048 +11.5%, the conc32 gap was largely OUR batch config starving decode).
+Remaining 27B ~4%: GDN AOT config tune (FLA autotuner best_config vs our pinned BV64/w4/s3),
+TTFT axis, non-GDN fusion residual.

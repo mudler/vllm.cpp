@@ -57,6 +57,6 @@ inner 4096, state 128; context 262144.
 - Offline vLLM throughput baselines are complete. The first online A1 campaign
   ended invalid/incomplete (vLLM startup failures and ours-35B aborts); diagnose
   and rerun the full every-axis series under the GPU mutex.
-- Provision SGLang `v0.5.12.post1` in an isolated environment after the current
+- Provision SGLang `v0.5.13` (`28b095c`) in an isolated environment after the current
   GPU claims; never mutate `~/venvs/vllm-oracle`.
 - Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.

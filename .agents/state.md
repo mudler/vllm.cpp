@@ -2110,3 +2110,12 @@ YAML parses; `git diff --check` passes; clean incremental CPU build succeeds and
 A5 spike; then claim the C1 raw-pointer adapter-ABI spike, C2 generic model
 factory spike, C3 MTP implementation leaf, and C4 GGUF compute-in-quant spike.
 The D1 architecture-spine spike precedes parallel sm80/sm90 and backend lanes.
+
+## 2026-07-10 — SGLang comparison pin corrected to current stable before execution
+
+The initial competitor inventory named `v0.5.12.post1`, but SGLang `v0.5.13`
+(`28b095c`) was released on 2026-06-13 and is the current stable release. It
+also adds faster Qwen3.5 Blackwell GDN kernels, making it the more relevant
+low-concurrency reference for these gate models. Advanced the unexecuted pin to
+`v0.5.13`; no benchmark result or implementation state changed. The isolated
+DGX provisioning/run still waits for the active PR #3 GPU series.

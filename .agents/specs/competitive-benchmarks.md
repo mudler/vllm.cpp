@@ -12,7 +12,7 @@ implementation for that hardware.
 | ID | Target | Reference | Why it is in the matrix | Source/tool |
 |---|---|---|---|---|
 | `BENCH-CUDA-VLLM` | CUDA, all concurrency | pinned production vLLM | compatibility + large-concurrency floor | `vllm bench throughput`, `vllm bench serve` |
-| `BENCH-CUDA-SGLANG` | CUDA, concurrency 1/2/4/8/16 | SGLang `v0.5.12.post1` initially | low-concurrency scheduling/serving leader candidate; Qwen3.6 entered the v0.5.11 line | [releases](https://github.com/sgl-project/sglang/releases/tag/v0.5.12.post1), [official bench serving guide](https://github.com/sgl-project/sglang/blob/main/docs/developer_guide/bench_serving.md) |
+| `BENCH-CUDA-SGLANG` | CUDA, concurrency 1/2/4/8/16 | SGLang `v0.5.13` (`28b095c`) initially | current stable low-concurrency candidate; Qwen3.6 entered v0.5.11 and v0.5.13 adds faster Qwen3.5 Blackwell GDN kernels | [release](https://github.com/sgl-project/sglang/releases/tag/v0.5.13), [official bench serving guide](https://github.com/sgl-project/sglang/blob/main/docs/developer_guide/bench_serving.md) |
 | `BENCH-CPU-LLAMA` | CPU/GGUF | same-file llama.cpp | quantized CPU and GGUF maturity floor | `llama-bench`, server completion benchmark |
 | `BENCH-VK-LLAMA` | Vulkan/GGUF | same-file llama.cpp Vulkan | Vulkan maturity floor | `llama-bench` + server |
 | `BENCH-APPLE-OMLX` | Apple MLX | oMLX `v0.5.0rc1` pinned initially | continuous batching, tiered KV and MLX-native serving | [release](https://github.com/jundot/omlx/releases/tag/v0.5.0rc1), [repo](https://github.com/jundot/omlx) |

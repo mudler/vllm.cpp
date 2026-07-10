@@ -75,6 +75,20 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   return o;
 }
 
+// BF16 [out, in] kept RAW in the on-disk torch Linear orientation (nk=true),
+// consumed via vt::MatmulBT — the cuBLASLt TN fast path (K contiguous in both
+// operands, the layout vLLM's F.linear hits; nvjet TNNN on GB10). Measured
+// 2026-07-10: the transposed [K,N] Matmul-B orientation forces cuBLASLt onto
+// NNNN/sm80-cutlass kernels — 27B GDN in_proj site 2.29 vs vLLM 1.80 us/tok.
+// Also skips the load-time host transpose.
+OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.shape.size() == 2, "qwen3_5 dense: expected 2-D weight for " + name);
+  OwnedTensor o = LoadBf16Direct(get, name);
+  o.nk = true;
+  return o;
+}
+
 // BF16 [n] -> owned f32 [n] (A_log / dt_bias; upcast is lossless).
 OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   const StTensor& t = get(name);
@@ -144,11 +158,12 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
 GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6).
-  g.in_proj_qkv = LoadBf16Transposed(get, la + "in_proj_qkv.weight");
-  g.in_proj_z = LoadBf16Transposed(get, la + "in_proj_z.weight");
-  g.in_proj_b = LoadBf16Transposed(get, la + "in_proj_b.weight");
-  g.in_proj_a = LoadBf16Transposed(get, la + "in_proj_a.weight");
+  // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
+  // (nk=true -> vt::MatmulBT TN fast path; see LoadBf16RawNK).
+  g.in_proj_qkv = LoadBf16RawNK(get, la + "in_proj_qkv.weight");
+  g.in_proj_z = LoadBf16RawNK(get, la + "in_proj_z.weight");
+  g.in_proj_b = LoadBf16RawNK(get, la + "in_proj_b.weight");
+  g.in_proj_a = LoadBf16RawNK(get, la + "in_proj_a.weight");
   // out_proj: W4A4-quantized -> fp4-resident (throughput path, notes §5 step-6a).
   g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].

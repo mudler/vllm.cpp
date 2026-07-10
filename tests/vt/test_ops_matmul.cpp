@@ -63,6 +63,32 @@ TEST_CASE("matmul bf16 output: same golden within bf16 eps") {
   CHECK(vt::BF16ToF32(out[3]) == doctest::Approx(154.0f).epsilon(0.01));
 }
 
+TEST_CASE("matmul_bt f32: b [N,K] row-major matches Matmul on the transposed weight") {
+  // Same golden as the Matmul case: a = [[1,2,3],[4,5,6]] [M=2,K=3],
+  // b_nk = b^T = [[7,9,11],[8,10,12]] [N=2,K=3] -> out = [[58,64],[139,154]].
+  std::vector<float> a = {1, 2, 3, 4, 5, 6};
+  std::vector<float> b_nk = {7, 9, 11, 8, 10, 12};
+  std::vector<float> out(4, -1.0f);
+  Tensor ta = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {2, 3});
+  Tensor tb = Tensor::Contiguous(b_nk.data(), DType::kF32, Cpu(), {2, 3});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {2, 2});
+  Queue q = CpuQueue();
+  vt::MatmulBT(q, to, ta, tb);
+  CHECK(out[0] == 58.0f);
+  CHECK(out[1] == 64.0f);
+  CHECK(out[2] == 139.0f);
+  CHECK(out[3] == 154.0f);
+}
+
+TEST_CASE("matmul_bt validates shapes loudly") {
+  std::vector<float> buf(6, 0.0f);
+  Tensor a = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {2, 3});
+  Tensor b = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {3, 2});  // K mismatch ([N,K] wants K=3)
+  Tensor o = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {2, 3});
+  Queue q = CpuQueue();
+  CHECK_THROWS_AS(vt::MatmulBT(q, o, a, b), std::runtime_error);
+}
+
 TEST_CASE("matmul validates shapes loudly") {
   std::vector<float> buf(6, 0.0f);
   Tensor a = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {2, 3});

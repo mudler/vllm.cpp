@@ -180,6 +180,81 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
           "cublasLtMatmul");
 }
 
+// ---- cuBLASLt bf16/f32 "BT" dense GEMM (b = Linear weight [N,K]) -----------
+// out[M,N] = a[M,K] @ b^T with b [N,K] row-major — K contiguous in BOTH
+// operands, the TN layout vLLM's F.linear hits for its bf16 projections. On
+// GB10 cuBLASLt serves this with the fast `nvjet_sm121_tst_..._TNNN` kernels
+// (measured 27B GDN in_proj: 1.80 us/tok vs 2.29 us/tok for our row-major x
+// row-major kMatmul, which falls to `NNNN` nvjet / sm80-cutlass kernels).
+// Same column-major TN formulation as MatmulFp8CublasLtKernelCuda below (see
+// its derivation comment); only the A/B dtypes differ (bf16/f32, alpha=1).
+void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
+  const bool f32_in = a.dtype == DType::kF32 && b.dtype == DType::kF32;
+  if (!bf16_in && !f32_in) {
+    throw std::runtime_error("vt cuda: matmul_bt: unsupported dtype combo " +
+                             ComboName(a, b, out) +
+                             "; supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16");
+  }
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  if (k == 0) {
+    CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "bt k=0 memset");
+    return;
+  }
+
+  const LtContext ctx = GetContext(q.device.index);
+  const cudaDataType_t ab_type = f32_in ? CUDA_R_32F : CUDA_R_16BF;
+  const cudaDataType_t out_type = out.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF;
+
+  DescGuard desc;
+  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "bt cublasLtMatmulDescCreate");
+  const cublasOperation_t op_t = CUBLAS_OP_T, op_n = CUBLAS_OP_N;
+  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)),
+          "bt set TRANSA=T");
+  CheckLt(cublasLtMatmulDescSetAttribute(desc.v, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)),
+          "bt set TRANSB=N");
+
+  // Column-major TN layouts: A=weight col[K,N] ld=K (TRANSA=T => [N,K] row),
+  // B=act col[K,M] ld=K (= [M,K] row), C=D=out col[N,M] ld=N (= [M,N] row).
+  LayoutGuard la, lb, lc;
+  CheckLt(cublasLtMatrixLayoutCreate(&la.v, ab_type, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(n), k),
+          "bt Adesc (weight)");
+  CheckLt(cublasLtMatrixLayoutCreate(&lb.v, ab_type, static_cast<uint64_t>(k),
+                                     static_cast<uint64_t>(m), k),
+          "bt Bdesc (act)");
+  CheckLt(cublasLtMatrixLayoutCreate(&lc.v, out_type, static_cast<uint64_t>(n),
+                                     static_cast<uint64_t>(m), n),
+          "bt Cdesc (out)");
+
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "bt cublasLtMatmulPreferenceCreate");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "bt set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
+
+  cublasLtMatmulHeuristicResult_t heur{};
+  int returned = 0;
+  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
+                                         /*requestedAlgoCount=*/1, &heur, &returned),
+          "bt cublasLtMatmulAlgoGetHeuristic");
+  if (returned == 0) {
+    throw std::runtime_error("vt cuda: matmul_bt: no cublasLt heuristic for [" +
+                             std::to_string(m) + "," + std::to_string(k) + "]x[" +
+                             std::to_string(n) + "," + std::to_string(k) + "]^T " +
+                             ComboName(a, b, out));
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b.data, la.v, a.data, lb.v, &beta,
+                         out.data, lc.v, out.data, lc.v, &heur.algo, ctx.workspace,
+                         kWorkspaceBytes, s),
+          "bt cublasLtMatmul");
+}
+
 // ---- cuBLASLt FP8 (e4m3) dense GEMM ---------------------------------------
 // The native equivalent of vLLM's cuBLASLt fp8 dense path (the
 // `nvjet_sm121_qqtst_*` / `qq*` kernels torch._scaled_mm / cublasLt select for
@@ -268,6 +343,8 @@ struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernelCuda)));
+    RegisterOp(OpId::kMatmulBT, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTKernelCuda)));
     RegisterOp(OpId::kMatmulFp8CublasLt, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFp8CublasLtFn>(&MatmulFp8CublasLtKernelCuda)));
   }

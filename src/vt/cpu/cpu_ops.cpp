@@ -40,6 +40,22 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   }
 }
 
+// b is the torch Linear weight [N,K] row-major (see vt::MatmulBT); identical
+// accumulation order to MatmulKernel (sequential over K), so on CPU the two
+// orientations are bit-identical for the same logical weight.
+void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < n; ++j) {
+      float acc = 0.0f;
+      for (int64_t p = 0; p < k; ++p) {
+        acc += LoadF32(a, i * k + p) * LoadF32(b, j * k + p);
+      }
+      StoreF32(out, i * n + j, acc);
+    }
+  }
+}
+
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -980,6 +996,8 @@ struct Registrar {
     // registration contract at compile time.
     RegisterOp(OpId::kMatmul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
+    RegisterOp(OpId::kMatmulBT, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,

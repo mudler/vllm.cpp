@@ -59,6 +59,7 @@ enum class OpId : uint8_t {
   kAttnQkNormRopeGate,
   kFusedChain,
   kRmsNormQuantFp8,
+  kMatmulBT,
   kCount
 };
 
@@ -282,6 +283,20 @@ void* GetOp(OpId op, DeviceType device);
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32 or
 // bf16, f32 accumulation, all contiguous, same device.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// out[M,N] = a[M,K] @ b^T with b [N,K] row-major — the torch Linear weight
+// orientation, K contiguous in BOTH operands (the "TN" GEMM). This is the
+// layout vLLM's F.linear hits for its bf16 projections (GDN in_proj_qkvz /
+// in_proj_ba, qwen3_next.py packed_modules_mapping @ e24d1b24): on GB10 it
+// selects the fast `nvjet_sm121_tst_..._TNNN` cuBLASLt kernels (~1.3x the
+// per-token rate of our row-major x row-major kMatmul, which cuBLASLt serves
+// with slower `NNNN`/sm80-cutlass kernels — measured 2026-07-10, 27B prefill:
+// in_proj site ours 2.29 vs vLLM 1.80 us/tok). Same f32 accumulation and
+// dtype contract as Matmul: a/b bf16 (or f32), out f32 or bf16, contiguous,
+// same device. NOT bit-identical to kMatmul on the transposed weight (the
+// cuBLASLt algo — and so the K-reduction split — differs); token-exact gates
+// decide call-site adoption.
+void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
 // out[M,N] = act[M,K] @ dequant(w).T  — the modelopt W4A16_NVFP4 dequant-GEMM
 // (M2.2a). The NVFP4 weight is read DIRECTLY from device memory and dequantized

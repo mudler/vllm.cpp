@@ -424,6 +424,59 @@ TEST_CASE("CUDA matmul (cuBLASLt) matches CPU on odd sizes") {
   }
 }
 
+TEST_CASE("CUDA matmul_bt (cuBLASLt TN) matches CPU on odd sizes") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  // Same tolerance rationale as the CUDA matmul case above: the TN cuBLASLt
+  // algo reduces over K in its own order vs the CPU triple loop.
+  const Combo combos[] = {
+      {DType::kF32, DType::kF32, 1e-4f, 1e-4f},
+      {DType::kBF16, DType::kF32, 2e-3f, 2e-3f},
+      {DType::kBF16, DType::kBF16, 4e-3f, 8e-3f},
+  };
+  struct Dims {
+    int64_t m, k, n;
+  };
+  const Dims dims[] = {{17, 32, 13}, {64, 128, 48}, {1, 256, 1}};
+  uint32_t seed = 7000;
+  for (const Dims& d : dims) {
+    for (const Combo& c : combos) {
+      CAPTURE(d.m);
+      CAPTURE(d.k);
+      CAPTURE(d.n);
+      CAPTURE(static_cast<int>(c.in));
+      CAPTURE(static_cast<int>(c.out));
+      const auto af = RandomF32(static_cast<size_t>(d.m * d.k), seed);
+      const auto bf = RandomF32(static_cast<size_t>(d.n * d.k), seed + 1);  // b [N,K]
+      const auto ab = Pack(af, c.in);
+      const auto bb = Pack(bf, c.in);
+
+      // CPU reference on the same packed inputs (b in [N,K] orientation).
+      std::vector<uint8_t> out_cpu(static_cast<size_t>(d.m * d.n) * vt::SizeOf(c.out));
+      Tensor ta = MakeTensor(const_cast<uint8_t*>(ab.data()), c.in, Cpu(), {d.m, d.k});
+      Tensor tb = MakeTensor(const_cast<uint8_t*>(bb.data()), c.in, Cpu(), {d.n, d.k});
+      Tensor to = MakeTensor(out_cpu.data(), c.out, Cpu(), {d.m, d.n});
+      Queue cq{Cpu(), nullptr};
+      vt::MatmulBT(cq, to, ta, tb);
+
+      // CUDA.
+      QueueGuard gq(gpu);
+      DeviceTensor da(gpu, gq.q, c.in, {d.m, d.k}, ab.data());
+      DeviceTensor db(gpu, gq.q, c.in, {d.n, d.k}, bb.data());
+      DeviceTensor dout(gpu, gq.q, c.out, {d.m, d.n});
+      vt::MatmulBT(gq.q, dout.tensor(), da.tensor(), db.tensor());
+      std::vector<uint8_t> out_gpu(out_cpu.size());
+      dout.Download(gq.q, out_gpu.data());
+
+      CheckClose(Unpack(out_gpu, c.out), Unpack(out_cpu, c.out), c.atol, c.rtol);
+      seed += 10;
+    }
+  }
+}
+
 TEST_CASE("CUDA matmul: unsupported dtype combo (f16 inputs) throws naming it") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");

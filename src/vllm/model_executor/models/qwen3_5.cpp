@@ -409,11 +409,14 @@ Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
 // GEMM's f32 accumulation for the f32 glue that consumes it.
 std::vector<float> MatmulF32(Dev d, const std::vector<uint16_t>& x, int64_t M,
                              int64_t K, const OwnedTensor& w) {
-  const int64_t N = w.shape[1];
+  const int64_t N = w.nk ? w.shape[0] : w.shape[1];
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kF32, {M, N});
-  vt::Matmul(d.q, dout.t(), dx.t(), dw);
+  if (w.nk)
+    vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
+  else
+    vt::Matmul(d.q, dout.t(), dx.t(), dw);
   std::vector<float> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
   return out;
@@ -423,11 +426,14 @@ std::vector<float> MatmulF32(Dev d, const std::vector<uint16_t>& x, int64_t M,
 // hidden states where the result feeds the residual stream / next matmul).
 std::vector<uint16_t> MatmulBf16(Dev d, const std::vector<uint16_t>& x, int64_t M,
                                  int64_t K, const OwnedTensor& w) {
-  const int64_t N = w.shape[1];
+  const int64_t N = w.nk ? w.shape[0] : w.shape[1];
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kBF16, {M, N});
-  vt::Matmul(d.q, dout.t(), dx.t(), dw);
+  if (w.nk)
+    vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
+  else
+    vt::Matmul(d.q, dout.t(), dx.t(), dw);
   std::vector<uint16_t> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
   return out;
@@ -552,19 +558,29 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
 // the whole decode step run async-on-stream (the prerequisite for graph
 // capture). x is [M,K] bf16 (device); the returned DBuf owns the [M,N] output.
 
+// Both helpers route on the weight's orientation flag: nk=true (raw torch
+// Linear [N,K], LoadBf16RawNK) -> vt::MatmulBT, the cuBLASLt TN fast path;
+// nk=false (loader-transposed [K,N]) -> row-major vt::Matmul, unchanged.
+
 DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
-  const int64_t M = x.shape[0], N = w.shape[1];
+  const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kF32, {M, N});
-  vt::Matmul(d.q, dout.t(), x, dw);
+  if (w.nk)
+    vt::MatmulBT(d.q, dout.t(), x, dw);
+  else
+    vt::Matmul(d.q, dout.t(), x, dw);
   return dout;
 }
 
 DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
-  const int64_t M = x.shape[0], N = w.shape[1];
+  const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kBF16, {M, N});
-  vt::Matmul(d.q, dout.t(), x, dw);
+  if (w.nk)
+    vt::MatmulBT(d.q, dout.t(), x, dw);
+  else
+    vt::Matmul(d.q, dout.t(), x, dw);
   return dout;
 }
 

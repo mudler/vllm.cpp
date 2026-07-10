@@ -247,6 +247,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
     HfConfig config = vllm::HfConfigFromGguf(gguf);
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
+    // Same dense-vs-MoE arch split as the safetensors path below: the dense
+    // `qwen35` GGUF (no expert_count kv -> num_experts == 0) routes to the
+    // dense loader + dense engine constructor.
+    if (LoadedEngine::IsDenseArch(config)) {
+      Qwen3_5DenseWeights weights = vllm::LoadQwen3_5DenseFromGguf(gguf, config);
+      return std::make_unique<LoadedEngine>(std::move(config),
+                                            std::move(weights),
+                                            std::move(tokenizer), params);
+    }
     Qwen3_5MoeWeights weights = vllm::LoadQwen3_5MoeFromGguf(gguf, config);
     return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
                                           std::move(tokenizer), params);

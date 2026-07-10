@@ -12,9 +12,10 @@ C API, an example CLI, and an OpenAI-compatible server.
 > on real hardware. We **beat vLLM run eager** on both models; against vLLM's
 > *production* config (CUDA graphs + torch.compile) the **35B is at ≥1.0×
 > (measured 1.02× total throughput, and better TTFT/TPOT, with the Triton-AOT
-> GDN build; 0.99× in the default pure-C++ build)** and the **27B is ≈0.97×** —
-> and we use **~35% less peak GPU memory** on both (a decisive win on that
-> axis). We are **actively closing the 27B's last ~3%** via a measured,
+> GDN build; 0.99× in the default pure-C++ build)** and the **27B is ≈0.99–1.00×
+> (0.990× conc16 / 0.997× conc32; best conc32 rep above 1.0×)** — and we use
+> less peak memory on both. We are **actively closing the 27B's last ~1%**
+> (the measured prefill attention-kernel gap; FA-2 port next) via a measured,
 > execution-traced roadmap — see *Status*. The tables track real, tested support
 > and are kept current as work lands (see `.agents/`).
 
@@ -99,10 +100,10 @@ vLLM actually runs (cited to upstream / its deps — flashinfer, cutlass, cuBLAS
 | Dense **W4A4** GEMM | cutlass fp4×fp4 (sm120a) + fp8 W8A8 — vLLM `cutlass_scaled_mm` | ✅ ref | ✅ |
 | MoE **W4A16** GEMM | Marlin + fp4-resident — vLLM `marlin` / `fused_moe` | ✅ ref | ✅ |
 | FP8 / bf16 projection GEMM | cuBLASLt col-major-TN → `nvjet_sm121` | ✅ ref | ✅ |
-| Prefill attention | flash-style WMMA (vLLM `flash_fwd`); vendored FA-2 🚧 wiring | ✅ ref | ✅ · FA-2 🚧 |
+| Prefill attention | flash-style WMMA (FA-2-inspired tiles/staging) — FA-2 `flash_fwd_splitkv` 1:1 port is the named next lever (measured ~5× per-token gap at L=1024) | ✅ ref | ✅ · FA-2 port 🚧 |
 | Decode attention (paged) | FlashInfer-style paged, GQA-fused | ✅ ref | ✅ |
 | GDN / linear-attn (chunk) | tensor-core WY solve — FLA `chunk_delta` | ✅ ref | ✅ |
-| Fused RMSNorm→fp4 quant | flashinfer `add_rmsnorm_fp4quant` | ✅ ref | ✅ |
+| RMSNorm(+residual) → fp4 quant | 2 kernels, PARITY with production vLLM (measured: its Inductor `fused_add_rms_norm` triton kernel + extern `scaled_fp4_quant`; no fp4 norm-quant fusion exists in vLLM 0.24) · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ |
 | Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
 | CUDA-graph decode | captured decode step (vLLM cudagraph) | — | ✅ (both models) |
 | Sampling (greedy/top-k/top-p/penalties) | vLLM V1 sampler, on-GPU sort-free | ✅ | ✅ |
@@ -131,17 +132,21 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   *production* config (CUDA graphs + torch.compile — the honest bar) the **35B is at
   ≥1.0×** — measured **1.02× total throughput with better TTFT (−4%) and TPOT (−2%)**
   in the Triton-AOT GDN build (`-DVLLM_CPP_TRITON=ON`; 0.99× in the default pure-C++
-  build) — and the **27B is ≈0.97×**, while we use **~35% less peak GPU memory** on
-  both. The GDN chunk-kernel **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed
-  by a sanctioned, bounded **build-time Triton AOT fast-path** (FLA kernels verbatim →
-  cubin; runtime stays Python/Triton-free; the portable C++ kernels and CPU reference
-  remain the fallback — see the porting inventory §9). The 27B measures **0.966× at
-  BOTH operating points** (conc16 740.9 vs 766.6; conc32 1008.0 vs 1043.2 tok/s;
-  3-rep means): the batch budget is now aligned with vLLM's scheduler default
-  (dense mnbt 2048 flat — **+9.5% conc32, TTFT −59%**), and the GDN AOT launch
-  configs are verified against FLA's own autotuner (already optimal on the dominant
-  kernels). The last ~3.4% is the non-GDN prefill **fusion** residual (vLLM's
-  Inductor rmsnorm+quant / silu+quant whole-graph fusion, which we run unfused).
+  build) — and the **27B is ≈0.99–1.00×**, while we use less peak memory on both
+  (27B run: 61.8 vs 76.2 GB at the identical workload/recipe). The GDN chunk-kernel
+  **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed by a sanctioned, bounded
+  **build-time Triton AOT fast-path** (FLA kernels verbatim → cubin; runtime stays
+  Python/Triton-free; the portable C++ kernels and CPU reference remain the
+  fallback — see the porting inventory §9). The 27B measures **0.990× at conc16
+  and 0.997× at conc32** (758.5 vs 766.5; 1049.0 vs 1052.5 tok/s; 3/5-rep means vs
+  same-hour graphed denominators; the best conc32 rep lands above 1.0×): a
+  production-codegen dump + kernel profile of vLLM settled the residual — the
+  norm→quant sites were already at parity; the real gaps were the **bf16 GEMM
+  layout** (the GDN in_proj now runs the cuBLASLt TN `nvjet TNNN` class vLLM's
+  `F.linear` gets), the **fused attention preamble** (default-on for the 27B,
+  reading a cos/sin cache), and the **tiled causal-conv** (default-on). The
+  remaining ~1.0%/~0.3% is the measured prefill **attention-kernel** gap (ours
+  ≈5× FA-2 per-token at L=1024) — the named next port.
 - **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
   total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
   concurrency operating point). We do not stop at "near parity." The gap is being

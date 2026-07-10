@@ -872,6 +872,12 @@ void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor&
 // f32 variance accumulation, gemma (1+w), and residual-add rounding. Operand
 // ROLES resolve to physical tensors: kIn->x, kResidual->residual (in/out),
 // kWeight->weight ([H], per-column), kOut->out. Row tensors are [T,H].
+//
+// Bit-identity across SEPARATELY COMPILED loops (here vs RmsNormKernel) holds
+// because the build pins -ffp-contract=off (top-level CMakeLists): under the
+// GCC/Clang default (fast), `sumsq += v*v` may be fma-contracted in one loop
+// and not the other (observed: RmsNormKernel's residual path contracted, this
+// interpreter not, on FMA-capable ISAs), skewing inv by 1 ulp on ~half the rows.
 
 // Read one operand element (row, column j). kWeight is per-column ([H]); the
 // [T,H] roles index row*h + j.

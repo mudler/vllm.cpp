@@ -7,6 +7,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Host C++ floating point is pinned to IEEE as-written semantics: no FMA
+# contraction. GCC/Clang default to -ffp-contract=fast, which lets the compiler
+# fuse `a*b + c` into a single-rounding fma PER LOOP, PER FUNCTION — so two
+# textually identical reductions (e.g. the vt::RmsNorm golden vs the FusedChain
+# Tier-1 interpreter, both `sumsq += v*v`) can compile one contracted and one
+# not, breaking the bit-identity contracts the vt:: CPU reference kernels and
+# their tests rely on (test_ops_fused_chain, the fused-vs-split fp8 pairs, ...).
+# This bites wherever FMA is baseline ISA (aarch64 always; x86 with -march=*).
+# Pinning contract=off gives every TU (kernels AND tests) the exact numerics of
+# the plain x86-64 Release build on every platform. CUDA device code is NOT
+# affected (nvcc flags are separate; GPU parity tests compare GPU-vs-GPU).
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+
 option(VLLM_CPP_BUILD_TESTS "Build tests" ON)
 option(VLLM_CPP_BUILD_EXAMPLES "Build examples" ON)
 # The OpenAI HTTP server (M3.1 Task 4) is gated so the core build stays lean when

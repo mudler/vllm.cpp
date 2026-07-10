@@ -213,9 +213,19 @@ sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/
 `bad_words` primitives were ported at M1.7 `aac5138`; their SamplingParams and
 OpenAI request/payload wiring remain T1.)
 
-**Spec decode** (`v1/spec_decode/`): all T2, ordered — MTP (Qwen3.6 ships MTP
-weights; biggest single-model win) → ngram → EAGLE3 → dspark/suffix. Rejection
-sampler + `use_v2_model_runner`-style padded drafting come with it.
+**Spec decode** (`v1/worker/gpu/spec_decode/`): T1 starts with Qwen3.5/3.6 MTP
+(the gate checkpoints ship their heads), then DFlash; ngram, EAGLE3 and
+dspark/suffix remain T2. M-mtp-0 is `GATING`: the optional BF16 `mtp.*`
+safetensors loader (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`) and
+standalone dense/MoE head (`src/vllm/model_executor/models/qwen3_5.cpp:3359`)
+mirror `models/qwen3_5_mtp.py:63-165`, share the target embedding/lm-head, and
+have ported loader/direct-hidden tests
+(`tests/vllm/v1/spec_decode/test_mtp_speculator.cpp:201,225,299,331`) plus a
+two-checkpoint oracle dump/runner (`tools/parity/dump_qwen3_5_mtp.py:1`,
+`tests/parity/test_op_parity.cpp:1226`). GPU head parity is still pending; no
+spec-token scheduler, rejection sampler, GDN snapshot rollback, GGUF MTP, or
+user-visible speculative-decoding path is claimed. Those land in M-mtp-1+
+before this becomes supported.
 
 ## 7. Serving surface (`vllm/entrypoints/`)
 

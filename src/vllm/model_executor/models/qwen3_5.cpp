@@ -8,6 +8,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 
 #include <algorithm>
 #include <array>
@@ -3330,6 +3331,158 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
+                                 const Qwen3_5DenseWeights& target,
+                                 const HfConfig& config)
+    : weights_(&weights),
+      config_(&config),
+      embed_tokens_(&target.embed_tokens),
+      lm_head_(&target.lm_head) {
+  VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
+           "qwen3_5 MTP: dense target requires dense MTP weights");
+}
+
+Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
+                                 const Qwen3_5MoeWeights& target,
+                                 const HfConfig& config)
+    : weights_(&weights),
+      config_(&config),
+      embed_tokens_(&target.embed_tokens),
+      lm_head_(&target.lm_head),
+      lm_head_fp4_(&target.lm_head_fp4) {
+  VT_CHECK(weights.kind == Qwen3_5MTPKind::kMoe,
+           "qwen3_5 MTP: MoE target requires MoE MTP weights");
+}
+
+Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
+    const std::vector<int32_t>& input_ids,
+    const std::vector<int32_t>& positions,
+    const vt::Tensor& target_hidden_states, vt::Queue& queue,
+    int64_t spec_step_idx) const {
+  const int64_t tokens = static_cast<int64_t>(input_ids.size());
+  const int64_t hidden_size = config_->hidden_size;
+  const int64_t vocab_size = config_->vocab_size;
+  const int64_t num_layers = weights_->NumLayers();
+  VT_CHECK(tokens > 0, "qwen3_5 MTP forward: empty input_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == tokens,
+           "qwen3_5 MTP forward: positions length must equal token count");
+  VT_CHECK(spec_step_idx >= 0 && num_layers > 0,
+           "qwen3_5 MTP forward: invalid spec step/layer count");
+  VT_CHECK(target_hidden_states.rank == 2 &&
+               target_hidden_states.shape[0] == tokens &&
+               target_hidden_states.shape[1] == hidden_size &&
+               target_hidden_states.dtype == DType::kBF16 &&
+               target_hidden_states.IsContiguous() &&
+               target_hidden_states.device == queue.device,
+           "qwen3_5 MTP forward: target hidden states must be contiguous "
+           "bf16 [T,H] on the queue device");
+  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
+               weights_->fc.shape[0] == hidden_size &&
+               weights_->fc.shape[1] == 2 * hidden_size,
+           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
+
+  Dev device{vt::GetBackend(queue.device.type), queue};
+  const float eps = static_cast<float>(config_->rms_norm_eps);
+
+  // Qwen3_5MultiTokenPredictor.forward: shared embedding, then independent
+  // Gemma RMSNorms over the embedding and target final hidden states.
+  Tensor embedding_table =
+      ResidentWeight(device, *embed_tokens_, {vocab_size, hidden_size});
+  DBuf device_ids(device, DType::kI32, {tokens}, input_ids.data());
+  DBuf embedding(device, DType::kBF16, {tokens, hidden_size});
+  vt::Embedding(device.q, embedding.t(), embedding_table, device_ids.t());
+
+  Tensor embedding_norm_weight = ResidentWeight(
+      device, weights_->pre_fc_norm_embedding, {hidden_size});
+  Tensor hidden_norm_weight =
+      ResidentWeight(device, weights_->pre_fc_norm_hidden, {hidden_size});
+  DBuf embedding_norm(device, DType::kBF16, {tokens, hidden_size});
+  DBuf target_norm(device, DType::kBF16, {tokens, hidden_size});
+  vt::RmsNorm(device.q, embedding_norm.t(), embedding.t(),
+              embedding_norm_weight, vt::RmsNormArgs{eps, true});
+  vt::RmsNorm(device.q, target_norm.t(), target_hidden_states,
+              hidden_norm_weight, vt::RmsNormArgs{eps, true});
+
+  // torch.cat([embedding_norm, target_norm], -1). Backend::Copy is used row by
+  // row so this remains portable and exact without introducing a one-off MTP
+  // kernel; M-mtp-1 may fuse this if profiling makes it material.
+  DBuf concatenated(device, DType::kBF16, {tokens, 2 * hidden_size});
+  const size_t row_bytes =
+      static_cast<size_t>(hidden_size) * vt::SizeOf(DType::kBF16);
+  auto* cat = static_cast<uint8_t*>(concatenated.ptr());
+  const auto* embed =
+      static_cast<const uint8_t*>(embedding_norm.t().data);
+  const auto* target = static_cast<const uint8_t*>(target_norm.t().data);
+  for (int64_t token = 0; token < tokens; ++token) {
+    const size_t source_offset = static_cast<size_t>(token) * row_bytes;
+    const size_t target_offset = static_cast<size_t>(token) * 2 * row_bytes;
+    device.b.Copy(device.q, cat + target_offset, embed + source_offset,
+                  row_bytes);
+    device.b.Copy(device.q, cat + target_offset + row_bytes,
+                  target + source_offset, row_bytes);
+  }
+
+  DBuf hidden = MatmulBf16D(device, concatenated.t(), weights_->fc);
+  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  residual.Zero(device);
+  const size_t layer_index =
+      static_cast<size_t>(spec_step_idx % num_layers);
+  if (weights_->kind == Qwen3_5MTPKind::kDense) {
+    RunDenseLayer(device, weights_->dense_layers[layer_index], *config_, hidden,
+                  residual, positions, tokens);
+  } else {
+    RunLayer(device, weights_->moe_layers[layer_index], *config_, hidden,
+             residual, positions, tokens);
+  }
+
+  Tensor final_norm_weight =
+      ResidentWeight(device, weights_->final_norm, {hidden_size});
+  DBuf normalized(device, DType::kBF16, {tokens, hidden_size});
+  vt::RmsNorm(device.q, normalized.t(), hidden.t(), final_norm_weight,
+              vt::RmsNormArgs{eps, true}, &residual.t());
+
+  Qwen3_5MTPHiddenStates out;
+  out.tensor = normalized.t();
+  const size_t allocation = normalized.alloc_bytes();
+  void* storage = normalized.Release();
+  out.storage = std::shared_ptr<void>(
+      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  return out;
+}
+
+ForwardLogits Qwen3_5MTPModel::ComputeLogits(
+    const vt::Tensor& hidden_states, vt::Queue& queue) const {
+  const int64_t hidden_size = config_->hidden_size;
+  VT_CHECK(hidden_states.rank == 2 &&
+               hidden_states.shape[1] == hidden_size &&
+               hidden_states.dtype == DType::kBF16 &&
+               hidden_states.IsContiguous() &&
+               hidden_states.device == queue.device,
+           "qwen3_5 MTP logits: hidden states must be contiguous bf16 [T,H] "
+           "on the queue device");
+  Dev device{vt::GetBackend(queue.device.type), queue};
+  DBuf logits = (lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
+                    ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
+                    : MatmulF32D(device, hidden_states, *lm_head_);
+  return WrapDeviceLogits(device, std::move(logits), config_->vocab_size);
+}
+
+std::vector<float> Qwen3_5MTPModel::ForwardLogitsHost(
+    const std::vector<int32_t>& input_ids,
+    const std::vector<int32_t>& positions,
+    const vt::Tensor& target_hidden_states, vt::Queue& queue,
+    int64_t spec_step_idx) const {
+  Qwen3_5MTPHiddenStates hidden =
+      Forward(input_ids, positions, target_hidden_states, queue, spec_step_idx);
+  ForwardLogits logits = ComputeLogits(hidden.tensor, queue);
+  std::vector<float> host(static_cast<size_t>(logits.rows) * logits.vocab);
+  Backend& backend = vt::GetBackend(queue.device.type);
+  backend.Copy(queue, host.data(), logits.device_tensor.data,
+               host.size() * sizeof(float));
+  backend.Synchronize(queue);
+  return host;
 }
 
 // Shared shape/count validation for the dense paged forward entry points (the

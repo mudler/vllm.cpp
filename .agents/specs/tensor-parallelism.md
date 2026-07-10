@@ -3,6 +3,25 @@
 *Task #50 · written 2026-07-10 · upstream pin vLLM `e24d1b24` at
 `/home/mudler/_git/vllm` · status: **spec written, not implemented***
 
+## Protocol compliance map
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `PAR-TP` |
+| Scope | single-node TP=2 first, then 4/8; gate models, NVFP4/bf16 and safetensors; §0 |
+| Upstream chain | process groups, executor, NCCL/custom-AR, graph capture and every sharded layer; §1-§3 |
+| Our baseline | current single-device runner, model layers, loader, queue and graph touch points; §5 |
+| Port map | NCCL C API, executor, parallel state, collectives, sharding and graph destinations; §4-§5 |
+| Tests to port | exact distributed modules/cases, local tiers and tracked skips; §7 |
+| Gates | Phase 0 CPU ABI through TP=2 correctness, graphs, custom-AR and same-box vLLM performance; §6 |
+| Dependencies | a 2-GPU target, `KERNEL-COLLECTIVES`, model/quant sharding and graph-safe buffers; §0, §4 and §6 |
+| Work breakdown | Phase 0 mock/ABI, NCCL/executor, sharding, collectives/graphs, then custom-AR; §6 and §8 |
+| Risks/decisions | single-process threads are a recorded deviation; hardware fidelity and graph-capture ordering remain explicit; §0 and §4.2-§4.5 |
+
+Each phase owns only the files listed in §4-§6. Model-layer sharding claims may
+run in parallel after the communicator/parallel-state ABI is fixed; the final
+TP row remains one integration gate.
+
 ## ⚠ OPEN HARDWARE QUESTION (blocks all GPU phases)
 
 **`dgx.casa` (GB10) is a SINGLE-GPU box — no phase of this spec past Phase 0

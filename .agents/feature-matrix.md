@@ -230,5 +230,5 @@ evidence.
    change. Legacy emoji rows are migrated by the anchor-backfill workstream.
 
 Currently open T0 debt (pre-existing, tracked): `/metrics` core set (§9),
-serve-latency A/B (A1), and e2e suites (A5). GGUF real-file parity A2 passed;
+`SERVE-GATE-ONLINE`, and `SERVE-E2E-NIGHTLY`. GGUF real-file parity A2 passed;
 its remaining format/model breadth stays tracked in §5/§13.

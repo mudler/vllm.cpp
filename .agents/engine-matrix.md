@@ -12,19 +12,19 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
-| Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `READY` | `INVENTORIED` |
-|---|---:|---:|---:|---:|---:|
-| Engine and scheduling | 12 | 3 | 3 | 0 | 6 |
-| KV cache and memory | 12 | 2 | 2 | 0 | 8 |
-| Parallelism | 5 | 0 | 0 | 1 | 4 |
-| Sampling and generation | 11 | 0 | 4 | 0 | 7 |
-| Structured output and tools | 6 | 0 | 3 | 0 | 3 |
-| Speculative decoding | 6 | 0 | 0 | 4 | 2 |
-| Serving, API, CLI, library | 15 | 3 | 2 | 0 | 10 |
-| LoRA and adapters | 2 | 0 | 0 | 0 | 2 |
-| Long context and attention | 6 | 0 | 0 | 0 | 6 |
-| Loading, tokenizer, config | 6 | 1 | 3 | 0 | 2 |
-| **Total** | **81** | **9** | **17** | **5** | **50** |
+| Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `READY` | `GATING` | `INVENTORIED` |
+|---|---:|---:|---:|---:|---:|---:|
+| Engine and scheduling | 12 | 3 | 3 | 0 | 0 | 6 |
+| KV cache and memory | 12 | 2 | 2 | 0 | 0 | 8 |
+| Parallelism | 5 | 0 | 0 | 1 | 0 | 4 |
+| Sampling and generation | 11 | 0 | 4 | 0 | 0 | 7 |
+| Structured output and tools | 6 | 0 | 3 | 0 | 0 | 3 |
+| Speculative decoding | 6 | 0 | 0 | 4 | 0 | 2 |
+| Serving, API, CLI, library | 17 | 3 | 2 | 0 | 1 | 11 |
+| LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 2 |
+| Long context and attention | 6 | 0 | 0 | 0 | 0 | 6 |
+| Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 2 |
+| **Total** | **83** | **9** | **17** | **5** | **1** | **51** |
 
 ## Engine core and scheduling
 
@@ -122,6 +122,8 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143-217`; `src/capi/vllm_c.cpp:133-348` | `tests/capi/test_capi.cpp:320,428,505`; `tests/capi/test_dlopen.cpp:60`; C11 header compile | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
+| `SERVE-GATE-ONLINE` | Same-corpus online serving correctness, TTFT/TPOT/ITL, throughput, and peak-memory gate vs vLLM | T0 | `vllm/entrypoints/cli/benchmark/serve.py:1`; `vllm/benchmarks/serve.py:1`; `tests/benchmarks/test_serve_cli.py:1` | `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | harness `tests/examples/test_bench.cpp:15,48`; first DGX campaign invalid/incomplete and retained only as diagnostic evidence | [online serving gate](specs/cuda-online-serving-gate.md) | `GATING` | - |
+| `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |
 | `SERVE-RESPONSES-MESSAGES` | Responses, Anthropic messages, audio | T2 | `vllm/entrypoints/openai/responses/api_router.py:48`; `vllm/entrypoints/anthropic/api_router.py:49`; `vllm/entrypoints/speech_to_text/transcription/api_router.py:1` | - | - | `planned: specs/responses-messages-endpoints.md` | `INVENTORIED` | - |

@@ -64,8 +64,9 @@ ratio. Do not reduce results to one throughput number.
   representative serving gates, not the 27B/35B scale claim.
 - SGLang was not installed at the initial 2026-07-10 audit; provisioning must
   use its own environment and must not mutate `~/venvs/vllm-oracle`.
-- The first CUDA competitor run waits for the current A1 and PR #3 GPU claims;
-  overlapping data is void.
+- The exact SGLang recipe is [spiked](cuda-sglang-low-concurrency.md). Its
+  preflight waits for the current PR #3 GPU claim; binding TTFT/ITL execution
+  also depends on `SERVE-ASYNC-LLM`. Overlapping data is void.
 
 ## Tests and artifacts to retain
 

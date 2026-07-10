@@ -22,8 +22,10 @@ and continue. Follow this protocol every session.
 5. **Tests -> code**: port the upstream tests listed in the spike and use the
    parity harness before filling implementation anchors.
 6. **Close the loop** (Definition of Done for every change):
-   - `python3 scripts/check-agent-record.py` passes (canonical tables, stable
-     IDs, lifecycle states, spec/link integrity, minimum pinned inventory size);
+   - `python3 scripts/check-agent-record.py` and
+     `python3 tests/scripts/test_agent_record.py` pass (canonical tables, stable
+     IDs, semantic row fields, lifecycle/spec/claim/DONE integrity, pinned
+     inventory size, and mutation proof that malformed rows fail);
    - tests green (op-parity / behavioral / e2e as applicable);
    - **committing parity goldens BEFORE their runner? In the SAME commit, add
      the op to `PendingRunnerOps()` in `tests/parity/test_op_parity.cpp`** —
@@ -56,13 +58,19 @@ and continue. Follow this protocol every session.
 | `ACTIVE` | Implementation is in flight | Implementation claim + owned files |
 | `GATING` | Code exists; required parity/perf gates are running | Code anchors + ported tests |
 | `PARTIAL` | Some modes work; missing modes are explicit | Code/test anchors for the working subset |
-| `DONE` | Whole row scope is merged and gated | Code + tests/evidence + spec + ledger anchors |
+| `DONE` | Whole row scope is merged and gated | Code + tests/evidence + spec + ledger anchor + exact closing commit |
 | `BLOCKED` | External dependency prevents progress | Concrete blocker + unblocking condition |
 | `ANCHOR-BACKFILL` | Legacy code exists but the new evidence contract is incomplete | Honest working-scope note; cannot count as `DONE` |
 
 Support inventories retain `DONE` rows permanently. When a roadmap execution
 block has no open rows, archive its plan/report under `completed/` and point the
 portfolio row at that archive; do not erase current support evidence.
+
+All implementation and test/evidence anchors resolve to a permitted local path
+class and an in-range line. `DONE` uses the closing commit in `Owner`, an exact
+parity-ledger line, and a commit present in Git history. The CI mutation suite
+must prove wrong-class links, out-of-range lines, missing claims/spec identity,
+and false closure commits are rejected.
 
 ## Practicalities
 

@@ -457,3 +457,23 @@ dq[0,0]=0x3C7E, dq[5,17]=0x3BCB; FP8 `layers.3.self_attn.q_proj` scale
 buffers (A_log/dt_bias as f32) in Matmul-B layout, so the mmap'd
 `SafetensorsFile`s can be released after load. Full 35B bf16 ≈ 70 GB host — fine
 on GB10 unified for M0.9 single-seq correctness; device placement is M1.
+
+## Protocol completion record
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `QUANT-FP8-MO-STATIC` |
+| Scope | Qwen3.6 35B ModelOpt static per-tensor FP8 W8A8 projections on the named CUDA gate slice |
+| Upstream chain | real checkpoint tensor metadata, ModelOpt FP8 config, activation scales and scaled GEMM dispatch; §§1,1b,6 |
+| Our baseline | captured forward goldens, loader layout and pre-native bf16 materialization; §§2-4,6 |
+| Port map | FP8 resident loader, static activation quant, cuBLASLt/CUTLASS dispatch, model forward and gates |
+| Tests to port | upstream FP8 quant/scaled-mm/modelopt tests plus local FP8 kernels and 35B token gate |
+| Gates | tensor/scale parity, kernel tolerance, 16/16 greedy, every-axis vLLM and peak-memory evidence |
+| Dependencies | sm121 CUDA scaled-mm, Qwen3.5 MoE model loader/forward, graph-safe scratch |
+| Work breakdown | load raw FP8/scales, activation quant, kernel dispatch, e2e correctness, performance |
+| Risks/decisions | static versus dynamic scales, row/column layout, capability selection and fallback fidelity |
+
+The native FP8 path landed through `7b682cc` and the production cuBLASLt route
+in `fd2a575`; the named gate-model slice closed with the MVP in `83010c7`.
+Final gate evidence is linked from the canonical quantization row and parity
+ledger.

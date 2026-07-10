@@ -84,6 +84,7 @@ on every listed target.
 |---|---|---|---|---|---|---|---|
 | `BACKEND-ABI-VT` | Backend registry, device/queue, capture, drop-in adapter ABI | vLLM platform contract `platforms/interface.py:67-229` | [device.h:11](../include/vt/device.h#L11), [backend.h:11](../include/vt/backend.h#L11), [backend.cpp:16](../src/vt/backend.cpp#L16) | [backend tests](../tests/vt/test_backend.cpp#L10) | [kernel inventory](specs/kernel-family-inventory.md) | `PARTIAL` - device enum exists; drop-in ABI not aligned | - |
 | `BACKEND-CPU` | CPU correctness and production path | `platforms/cpu.py:42-125`, CPU ops rooted at `csrc/cpu/torch_bindings.cpp:123-139` | [cpu_backend.cpp:11](../src/vt/cpu/cpu_backend.cpp#L11), [cpu_ops.cpp:1003](../src/vt/cpu/cpu_ops.cpp#L1003) | [backend tests](../tests/vt/test_backend.cpp#L10), [op parity](../tests/parity/test_op_parity.cpp#L34); no llama.cpp speed gate | [CUDA inventory](specs/cuda-architecture-inventory.md) | `PARTIAL` | - |
+| `BACKEND-CPU-ZEN` | AMD Zen CPU with ZenDNN/zentorch dispatch and weight prepack | `platforms/zen_cpu.py:12-32`; detection `platforms/__init__.py:153-192`; `tests/test_zen_cpu_platform_detection.py:8-37` | generic CPU backend only; no Zen-specific dispatch | - | [CUDA inventory](specs/cuda-architecture-inventory.md); leaf spike required | `INVENTORIED` | - |
 | `BACKEND-ROCM` | AMD ROCm/HIP | `platforms/__init__.py:110-128`, `platforms/rocm.py:43-125`, ROCm ops rooted at `csrc/rocm/moe_q_gemm_rdna3.cu:1` | - | - | [CUDA inventory](specs/cuda-architecture-inventory.md) | `INVENTORIED` | - |
 | `BACKEND-XPU` | Intel XPU loyal port | `platforms/__init__.py:131-150`, `platforms/xpu.py:103-125` | enum slot only [device.h:11](../include/vt/device.h#L11) | [unavailable-backend test](../tests/vt/test_backend.cpp#L37) | [CUDA inventory](specs/cuda-architecture-inventory.md) | `INVENTORIED` | - |
 | `BACKEND-TPU` | vLLM TPU parity surface | `platforms/__init__.py:35-56,202-208`, `platforms/tpu.py:9-20` | - | - | [CUDA inventory](specs/cuda-architecture-inventory.md) | `INVENTORIED` | - |
@@ -99,13 +100,15 @@ memory. Floating competitor versions do not count.
 
 | ID | Item | Upstream/reference | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
-| `BACKEND-GATE-CUDA-VLLM` | CUDA correctness and every-axis parity vs pinned vLLM | local vLLM `e24d1b24`; [benchmark protocol](benchmark-protocol.md) | [bench main:1](../examples/bench/main.cpp#L1) | gate throughput and GB10 traces in [parity ledger](parity-ledger.md); online latency closure remains open | [CUDA inventory](specs/cuda-architecture-inventory.md) | `PARTIAL` | - |
-| `BACKEND-GATE-CUDA-SGLANG` | CUDA low-concurrency serving vs SGLang | [SGLang v0.5.13](https://github.com/sgl-project/sglang/releases/tag/v0.5.13) initially; exact commit `28b095c` pinned per run | [bench main:1](../examples/bench/main.cpp#L1), [server main:1](../examples/server/main.cpp#L1) | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
+| `BACKEND-GATE-CUDA-VLLM` | CUDA correctness and every-axis parity vs pinned vLLM | local vLLM `e24d1b24`; [benchmark protocol](benchmark-protocol.md) | [bench main:1](../examples/bench/main.cpp#L1) | gate throughput and GB10 traces in [parity ledger](parity-ledger.md#L284); online latency closure remains open | [CUDA inventory](specs/cuda-architecture-inventory.md) | `PARTIAL` | - |
+| `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | SGLang corpus, harness, image and exact-checkpoint/token-ID preflights | [SGLang v0.5.13](https://github.com/sgl-project/sglang/releases/tag/v0.5.13), commit `28b095c`; digest-pinned CUDA 13 image | - | no harness or exact-checkpoint preflight yet | [SGLang low-concurrency spike](specs/cuda-sglang-low-concurrency.md) | `READY` | - |
+| `BACKEND-GATE-CUDA-SGLANG` | Binding CUDA low-concurrency serving vs SGLang | same pinned SGLang/checkpoints as `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | [bench main:1](../examples/bench/main.cpp#L1), [server main:1](../examples/server/main.cpp#L1) | no binding run; HTTP TTFT/ITL cannot be measured honestly yet | [SGLang low-concurrency spike](specs/cuda-sglang-low-concurrency.md) | `BLOCKED` on `SERVE-ASYNC-LLM` and successful exact-equivalence preflight | - |
 | `BACKEND-GATE-ROCM-VLLM` | ROCm parity vs vLLM | pinned vLLM ROCm backend | - | - | [CUDA inventory](specs/cuda-architecture-inventory.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-ROCM-SGLANG` | ROCm low-concurrency serving vs SGLang | pinned SGLang ROCm build | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-XPU-VLLM` | Intel XPU parity vs vLLM | pinned vLLM XPU backend | - | - | [CUDA inventory](specs/cuda-architecture-inventory.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-CPU-LLAMACPP` | CPU throughput/latency/memory vs llama.cpp | [llama.cpp](https://github.com/ggml-org/llama.cpp), commit pinned per run | [CPU backend:11](../src/vt/cpu/cpu_backend.cpp#L11), [bench main:1](../examples/bench/main.cpp#L1) | [CPU correctness](../tests/parity/test_op_parity.cpp#L34); no speed comparison | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-METAL-OMLX` | MLX/Metal serving vs oMLX | [oMLX v0.5.0rc1](https://github.com/jundot/omlx/releases/tag/v0.5.0rc1), then pinned successor | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
+| `BACKEND-GATE-METAL-MLXLM` | MLX/Metal correctness and generation baseline vs MLX-LM | [MLX-LM](https://github.com/ml-explore/mlx-lm), commit pinned per run | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-METAL-LLAMACPP` | Metal kernel/model parity vs llama.cpp Metal | pinned llama.cpp Metal build | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 | `BACKEND-GATE-VULKAN-LLAMACPP` | Vulkan kernel/model parity vs llama.cpp Vulkan | pinned llama.cpp Vulkan build | - | - | [competitive benchmark spike](specs/competitive-benchmarks.md) | `INVENTORIED` | - |
 
@@ -115,7 +118,8 @@ memory. Floating competitor versions do not count.
   exactly 13 numeric CUDA targets.
 - The CUDA target table has exactly 13 stable rows.
 - The component target table has exactly 18 stable rows.
-- The non-CUDA/platform ABI table has exactly 8 stable rows.
-- The native competitor table has exactly 9 stable rows.
+- The non-CUDA/platform ABI table has exactly 9 stable rows.
+- The native competitor table has exactly 11 stable rows: one independently
+  claimable SGLang preflight and ten binding platform/competitor gates.
 - Adding or removing an upstream target, component family, platform, or
   required competitor changes the corresponding count in the same commit.

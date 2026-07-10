@@ -2119,3 +2119,53 @@ also adds faster Qwen3.5 Blackwell GDN kernels, making it the more relevant
 low-concurrency reference for these gate models. Advanced the unexecuted pin to
 `v0.5.13`; no benchmark result or implementation state changed. The isolated
 DGX provisioning/run still waits for the active PR #3 GPU series.
+
+## 2026-07-10 - Roadmap control plane is lifecycle-enforced, not count-only
+
+An adversarial follow-up audit found that the first tabular checker enforced
+counts, links and state tokens but not the row contract it advertised. Closed
+that gap and archived the completed repair at
+`completed/roadmap_v1_control_plane_hardening_2026-07-10.md`.
+
+**Canonical ownership and claimability:** the 323 `MODEL-*` factory/static/
+dynamic rows now live in `model-matrix.md`; `specs/model-family-inventory.md`
+is only the accepted inventory methodology. Priority-zero work now has stable
+`SERVE-GATE-ONLINE` and `SERVE-E2E-NIGHTLY` rows, and the online gate has a
+complete spike. TP/MTP/DFlash legacy specs bind their exact `PAR-*`, `SPEC-*`
+and `MODEL-*` rows; DFlash now records local gaps, dependencies, file ownership
+and non-overlapping `DF-*` leaves.
+
+**Quant/backend completeness:** added claimable `QUANT-GGUF-COMPUTE` and
+`QUANT-GGUF-PRESETS` umbrellas, labeled the preset display as non-claimable,
+normalized KV/MLX row fields, and grounded the three gate-slice `DONE` rows with
+code/tests, ledger and closing commits. Added the previously omitted
+`BACKEND-CPU-ZEN` and `BACKEND-GATE-METAL-MLXLM` surfaces. Final inventories are
+`ENGINE=83 MODEL=323 QUANT=78 KERNEL=30 BACKEND=51` (353 unique static model
+architecture IDs; 13 CUDA numeric targets and 18 component rules unchanged).
+
+**SGLang leaf:** `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `READY` against
+v0.5.13 `28b095c` and its digest-pinned multi-arch CUDA 13 image. The distinct
+`BACKEND-GATE-CUDA-SGLANG` is `BLOCKED` until that preflight and
+`SERVE-ASYNC-LLM` close. The 27B compressed-tensors NVFP4 path is a viable
+preflight; 35B ModelOpt mixed precision remains conditional because source
+inspection indicates a legacy `w4afp8` route. Correctness uses native engine
+output IDs, never detokenize/re-tokenize. No SGLang result is claimed.
+
+**CI enforcement:** `check-agent-record.py` now parses claimable tables and
+rejects missing semantic fields, wrong-class or out-of-range implementation/
+test anchors, `READY+` specs
+that do not name the row or cover the complete spike contract, uncoordinated
+`SPIKE`/`ACTIVE` owners, incomplete `DONE` ledger/commit closure, unknown
+roadmap/claim IDs, portfolio-order drift, count drift, bad links and malformed
+tables. `tests/scripts/test_agent_record.py` mutation-checks those failure modes
+and runs in the `agent-record` CI job.
+
+**Validation:** checker PASS (`83/323/78/30/51`); 13-test mutation suite PASS;
+`git diff --check` PASS; clean CPU configure/build in `build-roadmap-audit`
+PASS; `ctest --test-dir build-roadmap-audit --output-on-failure -j 4` PASS
+92/92. No runtime feature or benchmark support changed.
+
+**Next:** finish the seven PR #3 review fixes and post-fix GPU/oracle gates;
+then execute the SGLang exact-load/corpus preflight without claiming binding
+latency until async streaming lands. In roadmap order, diagnose the online
+gate, spike the nightly, then claim kernel ABI/model factory/GGUF compute leaves.

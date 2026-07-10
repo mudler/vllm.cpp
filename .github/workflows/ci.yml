@@ -8,8 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Canonical roadmap tables and links are consistent
-        run: python3 scripts/check-agent-record.py
+        run: |
+          python3 scripts/check-agent-record.py
+          python3 tests/scripts/test_agent_record.py
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.

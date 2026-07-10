@@ -190,6 +190,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   only). Original runtime/packaging components (the `vt` op runtime, the minja
   chat-template engine, the native grammar backend, the C API) are documented as
   deviations in the [porting inventory](.agents/porting-inventory.md) §9.
+- The CUDA low-concurrency comparison against SGLang is specified and pinned to
+  v0.5.13, but **no SGLang performance result is claimed yet**. The unchanged
+  27B checkpoint has a plausible native path; exact 35B mixed-quant loading must
+  be proven, and binding TTFT/ITL numbers wait for true incremental async HTTP
+  streaming (`SERVE-ASYNC-LLM`).
 
 ## Project record
 

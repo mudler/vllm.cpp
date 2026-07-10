@@ -69,8 +69,8 @@ chain, dispatch rules, exact files to port, tests to port, hardware needs,
 correctness/performance gates, dependencies, and a row-sized work breakdown.
 No row may enter `READY`/`ACTIVE` without that spike. An implementation already
 present in the tree is not allowed to claim `DONE` in a matrix until the row
-links exact code and test/evidence anchors; record gaps honestly as
-`ANCHOR-BACKFILL` or `PARTIAL`.
+links exact code and test/evidence anchors, its ledger evidence, and the closing
+commit; record gaps honestly as `ANCHOR-BACKFILL` or `PARTIAL`.
 
 Parallel work is coordinated through `.agents/coordination.md`. A sub-agent
 claims stable row IDs there before editing, uses an isolated worktree/branch,
@@ -81,6 +81,11 @@ an execution block is `DONE`, move the block plan/report to
 `.agents/completed/` in the closing change. Permanent support matrices retain
 the completed row and its code/test anchors so current capability remains
 discoverable. Full lifecycle and claim protocol: `.agents/coordination.md`.
+CI runs `scripts/check-agent-record.py` plus its mutation suite. It rejects
+missing semantic columns, ungrounded implemented states, `READY+` specs that do
+not name the row and cover the full spike contract, `SPIKE`/`ACTIVE` owners not
+present in the coordination claim table, and `DONE` rows without ledger/commit
+closure. Do not weaken the checker to make a transition pass; repair the record.
 
 **Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
 message. This asserts the contributor (human or AI-assisted) has read this

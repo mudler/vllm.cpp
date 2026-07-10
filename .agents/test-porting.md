@@ -41,8 +41,8 @@ So test porting is part of the mirror obligation, not an optional extra.
 6. **Can't-pass-yet ≠ delete**: a ported test blocked on an unimplemented
    dependency is checked in SKIPPED with a one-line tracked reason (and shows
    up as debt), never silently dropped or watered down.
-7. **Regression floor**: all ported tests run in CI (CPU tiers) or the nightly
-   dgx suite (GPU/model tiers, gates.md A5). If vLLM asserts a behavior, our
+7. **Regression floor**: all ported tests run in CI (CPU tiers) or the
+   `SERVE-E2E-NIGHTLY` DGX suite (GPU/model tiers). If vLLM asserts a behavior, our
    port is not DONE until an equivalent assertion runs green in our suite —
    the test-side twin of the mirror policy's "match on every axis".
 

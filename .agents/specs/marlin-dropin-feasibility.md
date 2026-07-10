@@ -230,3 +230,23 @@ The kernel lift is numerically proven. The kernel is retired as a risk.
 4. **35B `test_qwen36_paged_engine` 16/16** token-for-token, 27B unaffected.
 5. **A/B**: Marlin MoE-GEMM TFLOPS + 35B total/output/TTFT/TPOT before→after +
    vs `vllm bench throughput` (was 5.18×).
+
+## Protocol completion record
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `QUANT-NVFP4-MO-W4A16` |
+| Scope | ModelOpt NVFP4 W4A16 expert/dense Marlin repack and compute on CUDA; §§1-7 |
+| Upstream chain | vLLM Marlin selection, vendored Marlin sources, repack, scales and grouped execution; §§1-4 |
+| Our baseline | prior fp4-resident loader and grouped fallback, plus the build/run probe; §§2-3 |
+| Port map | vendor kernel, repack, alignment and model-forward wiring; §5 and the ordered list above |
+| Tests to port | upstream Marlin repack/GEMM/MoE shape cases plus local bit-exact grouped and 35B gates |
+| Gates | bit-exact kernel/repack, 35B token gate, same-binary A/B, vLLM every-axis and memory evidence |
+| Dependencies | CUDA target, ModelOpt loader, MoE routing/alignment, `KERNEL-GEMM-MARLIN-W4A16` |
+| Work breakdown | vendor/build, repack, align, forward integration, correctness, then performance |
+| Risks/decisions | capability gating, layout/scales, small-M behavior and grouped scheduling; §§4-7 |
+
+The vendor lift began in `240d4a1`, the wired/default-on sequence completed in
+`38d7efa` and `d6ed102`, and the named gate-model slice was accepted by the
+MVP closure commit `83010c7`. Final gate evidence is linked from the canonical
+quantization row and parity ledger.

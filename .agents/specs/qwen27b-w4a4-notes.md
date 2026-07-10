@@ -734,3 +734,23 @@ note the 35B experts are W4A16 (Marlin), not fp4×fp4, so that grouped fp4 kerne
 does not apply to the 35B either; it would apply to a W4A4 MoE checkpoint. (c) The
 198 gate needs full-stack flashinfer bit-parity (attn+GDN+norm), out of scope for
 the GEMM drop-in.
+
+## Protocol completion record
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `QUANT-NVFP4-CT-W4A4` |
+| Scope | unchanged compressed-tensors NVFP4 W4A4 27B checkpoint, true FP4 activations and weights; §§0-7.8 |
+| Upstream chain | checkpoint metadata through compressed-tensors config, activation quant, scale layout and selected CUTLASS/FlashInfer path; §§3,7 |
+| Our baseline | CPU emulation, loader, a16 fallback, native W4A4 kernels and gate history; §§2,5,7.7-7.8 |
+| Port map | packed weight/scale loader, activation quant, FP4 GEMM, forward dispatch and tests; §§5,7.4,7.6 |
+| Tests to port | upstream NVFP4 quant/scaled-mm/model tests plus local emulation, kernel and 27B token gates |
+| Gates | scale/layout parity, kernel numerics, 16/16 greedy, same-binary every-axis vLLM and memory evidence |
+| Dependencies | sm120a FP4 toolchain, Qwen3.5 dense loader/model, scheduler/KV and CUDA graph paths |
+| Work breakdown | emulation, loader, a16 baseline, true W4A4 quant/GEMM, e2e, performance |
+| Risks/decisions | reciprocal global scales, rounding/near ties, small-M tactics and checkpoint modality; §§0,3,7 |
+
+`4fef786` was only the phase-1 CUTLASS lift. The forward path and greedy gate
+were accepted in `64ad26b`; the named gate-model slice closed with the MVP in
+`83010c7`. Final gate evidence is linked from the canonical quantization row
+and parity ledger.

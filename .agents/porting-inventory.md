@@ -504,9 +504,12 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     configure time: kernel-source hash drift vs MANIFEST → loud WARNING (build
     proceeds on the old cubins); pin/signature drift vs the MANIFEST `base`
     lines → loud WARNING; missing arch dir → clear FATAL with the regen
-    instructions. Regen is byte-deterministic (verified: two independent regens
-    on GB10, triton 3.6.0 ptxas 12.8 → byte-identical tree), so `git diff`
-    after regen IS the change signal. The OFF build stays byte-inert.
+    instructions. Two same-worktree GB10 regens (Triton 3.6.0, ptxas 12.8)
+    produced the same tree, but **cross-worktree byte reproducibility is not
+    established**: generated cubins can embed absolute source paths. Until
+    `CLAIM-PR3` normalizes/strips those paths, source/manifest hashes plus the
+    reviewed artifact diff are the change signal, not a universal byte-identity
+    claim. The OFF build stays byte-inert.
     VALIDATED end-to-end on dgx.casa (2026-07-10, fresh clone, configure pinned
     to `VLLM_CPP_TRITON_PYTHON=/nonexistent/python` so only the vendored
     artifacts could satisfy the build): full `all` builds green with no Python,

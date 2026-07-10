@@ -7,6 +7,25 @@ every claim re-grounded against the pin (`/home/mudler/_git/vllm` @ `e24d1b24`)
 and the actual checkpoints on `dgx.casa`. Companion spec:
 [dflash-spec-decode.md](dflash-spec-decode.md) (depends on this one).
 
+## Protocol compliance map
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `SPEC-MTP`, `SPEC-REJECTION`, `SPEC-GDN-SEGMENTS`, `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp`, `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
+| Scope | k=1 Qwen3.5/3.6 MTP first, both gate models and GDN rollback; §0-§3 |
+| Upstream chain | config, model, speculator, rejection, scheduler and KV/state paths at pin; §2-§3 |
+| Our baseline | exact local GDN, scheduler, runner, model-loader and state touch points; §3.1 and §4 |
+| Port map | upstream component to the local file set; §3.1, §4 and the milestone file lists in §5 |
+| Tests to port | exact upstream modules/cases and local tiers; §6 |
+| Gates | phase correctness, greedy acceptance, memory and same-workload throughput gates; §5 |
+| Dependencies | scheduler/KV/model loader, sampler/rejection, GDN rollback, both gate-model/quant rows; §3-§5 |
+| Work breakdown | non-overlapping `M-mtp-0` through `M-mtp-4` claims; §5 and §7 |
+| Risks/decisions | checkpoint depth resolution, GDN slot rollback, graph/state sizing and acceptance semantics; §0, §3 and §8 |
+
+The three engine rows may be implemented by separate claims after their shared
+metadata ABI is frozen. The two model rows own only their target-specific MTP
+weight/config mapping; they do not implicitly own the rejection or GDN rows.
+
 ## 0. CORRECTION to B5 (changes the route's shape, not its order)
 
 B5 §2/§4 claimed the 27B is "pure attention" with "no GDN problem → port there

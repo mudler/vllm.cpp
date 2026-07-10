@@ -9,6 +9,46 @@ live HF draft checkpoints (re-verified 2026-07-10). **Prerequisite:
 scheduler plumbing, rejection sampler, draft-KV machinery, and (critically)
 the GDN spec path, since BOTH gate targets are GDN hybrids (MTP spec §0).
 
+## Protocol compliance map
+
+| Required field | Grounded content |
+|---|---|
+| Row IDs | `SPEC-DFLASH`, `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` |
+| Scope | Qwen3.6 27B then 35B DFlash, greedy first, production graphs and sampling later; §1-§6 |
+| Upstream chain | drafter model, speculator, prepare-inputs, target taps, draft KV, scheduler and rejection paths; §1-§4 |
+| Our baseline | no DFlash model/speculator exists; reusable scheduler/GDN/rejection pieces are owned by the MTP dependency; exact anchors below |
+| Port map | upstream-to-local files and ownership table below |
+| Tests to port | exact lookahead, acceptance, rejection, GDN metadata, max-length and dynamic-SD cases; §7 |
+| Gates | standalone draft parity, 27B/35B token-exact e2e, acceptance, memory, graphs and same-config vLLM performance; §5-§6 |
+| Dependencies | MTP engine rows, `SPEC-REJECTION`, `SPEC-GDN-SEGMENTS`, both gate model/quant rows and sliding-window attention; table below |
+| Work breakdown | non-overlapping `DF-*` leaves below, integrated by milestones `M-df-0` through `M-df-3` |
+| Risks/decisions | k resolution, GDN state growth, target feature width, mixed-quant MoE cost, remote-code policy; §5 and §8 |
+
+### Our baseline and dependencies
+
+| Surface | Local anchor / gap | Dependency |
+|---|---|---|
+| Scheduler lookahead | `include/vllm/v1/core/sched/scheduler.h:217-218` fixes lookahead to zero; `src/vllm/v1/core/sched/scheduler.cpp:398-408` defers rollback | `SPEC-MTP` |
+| Rejection and draft IDs | `src/vllm/v1/sample/sampler.cpp:152-239` is target sampling only; no rejection sampler/spec token queue | `SPEC-REJECTION` |
+| GDN speculative state | fields are deferred at `include/vllm/v1/attention/backends/gdn_attn.h:74-79`; builder hardwires zero spec decodes at `src/vllm/v1/attention/backends/gdn_attn.cpp:89` | `SPEC-GDN-SEGMENTS` |
+| Target hidden taps | current model surfaces only final gathered logits rows around `src/vllm/model_executor/models/qwen3_5.cpp:3074-3094`; DFlash needs several configured layer taps | MTP hidden-state ABI, then `DF-AUX-TAPS` |
+| Draft model | no local `qwen3_dflash` model, loader, SWA/non-causal block attention, or context-KV implementation | `DF-DRAFT-MODEL`, `ATTN-SLIDING-WINDOW` |
+| Gate checkpoints | target text paths are grounded by `tests/parity/test_qwen27_paged_engine.cpp:110` and `tests/parity/test_qwen36_paged_engine.cpp:78` | corresponding `MODEL-*` and `QUANT-*` rows stay prerequisites |
+
+### Port map and non-overlapping claim leaves
+
+| Claim leaf | Upstream source | Owned local scope | Exit gate |
+|---|---|---|---|
+| `DF-DRAFT-MODEL` | `vllm/model_executor/models/qwen3_dflash.py`, DFlash config/loader utilities | new `include/vllm/model_executor/models/qwen3_dflash.h`, `src/vllm/model_executor/models/qwen3_dflash.cpp`, target-specific weight loader and model unit tests | standalone draft forward parity on captured target features |
+| `DF-AUX-TAPS` | target auxiliary hidden capture in Qwen3.5 runner/model | narrow tap ABI in `qwen3_5*.{h,cpp}` and runner metadata; no scheduler/speculator files | exact configured layer/features and no non-spec regression |
+| `DF-DRAFT-KV-PREP` | `dflash/speculator.py`, `dflash/utils.py`, prepare-input Triton | new `src/vllm/v1/worker/gpu/spec_decode/dflash/`, matching headers, CUDA prep kernel and unit tests | context-KV reuse and block proposal parity |
+| `DF-ENGINE-INTEGRATION` | shared speculator/scheduler/rejection path | integration-only changes after MTP rows are `DONE`; DFlash lookahead/e2e tests | 27B then 35B token-exact and acceptance gates |
+| `DF-GRAPH-SAMPLING` | uniform draft graph and stochastic verify paths | DFlash graph registration and sampler parametrization only | production-graph and seeded-sampling parity/performance |
+
+No leaf may edit another leaf's owned files without an explicit lead claim in
+`coordination.md`. `DF-ENGINE-INTEGRATION` cannot start while the MTP ABI is
+moving.
+
 ## 1. What DFlash is (at our pin — it is fully in-tree)
 
 arXiv 2602.06036 (ICML 2026, Z-Lab): a small (~0.3–0.5B) **block-diffusion

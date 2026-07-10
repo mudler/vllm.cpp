@@ -20,22 +20,29 @@ spikes and evidence. Do not copy detailed status prose upward.
 
 ## Row contract
 
-Every area-table row must contain these columns (additional area-specific
-columns are allowed):
+Every claimable area-table row must expose these semantic fields (additional
+area-specific columns and different ordering are allowed). Generated model and
+quantization tables may combine `Our code` with `Tests/evidence` in one exact
+cell; every other matrix keeps them separate. A table-level upstream pin may
+qualify dense registry rows only when each row also names its upstream
+method/type/target. Summary/roll-up tables must say `non-claimable` and contain
+no stable work IDs.
 
 | Required field | Rule |
 |---|---|
 | `ID` | Stable and never reused; use area prefixes (`ENG`, `MODEL`, `QUANT`, `KERNEL`, `BACKEND`) |
 | `Item` | One independently gateable capability or explicit row block |
 | `Upstream` | Pinned vLLM `file:line`; include dependency source when it owns execution |
-| `Our code` | Exact implementation `file:line`, or `-` when absent |
-| `Tests/evidence` | Exact tests/goldens/ledger evidence, or `-` when absent |
+| `Our code` | Exact implementation `file:line`, or `-` when absent; path and line must resolve inside a source/build/tool path class |
+| `Tests/evidence` | Exact tests/goldens/ledger evidence, or `-` when absent; path and line must resolve inside a test/CI/ledger class, and a combined code/tests cell must contain both classes |
 | `Spike/spec` | Real `.agents/specs/<slug>.md` once state is `READY` or later |
 | `State` | One value from [workflow.md](workflow.md#tabular-lifecycle) |
 | `Owner` | Active claim ID, or `-`; completed rows name the closing commit |
 
 `DONE` with `-`, vague prose, a directory-only pointer, or a dangling spec link
-is invalid. Split a row when supported and unsupported modes would otherwise be
+is invalid. Its evidence cell links an exact parity-ledger line, and its owner
+cell is the hexadecimal closing commit; the checker verifies that commit exists
+in Git history. Split a row when supported and unsupported modes would otherwise be
 hidden behind one status. Quantization rows, for example, distinguish format
 recognition, dequantization, compute-in-quant, backend kernels, and e2e gates.
 
@@ -100,12 +107,14 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 | Priority | Row/block | Dependency | Next handoff | State |
 |---|---|---|---|---|
-| 1 | A1 serve-latency closure | First campaign invalid: vLLM startup failure + ours-35B aborts | diagnose and rerun whole every-axis series under flock | `GATING` |
-| 2 | A5 e2e/nightly closure | A1 evidence where benchmarks overlap | write spike and CI/nightly split | `INVENTORIED` |
+| 1 | `SERVE-GATE-ONLINE` | First campaign invalid: vLLM startup failure + ours-35B aborts | diagnose and rerun whole every-axis series under flock | `GATING` |
+| 2 | `SERVE-E2E-NIGHTLY` | `SERVE-GATE-ONLINE` evidence where benchmarks overlap | write spike and CI/nightly split | `INVENTORIED` |
 | 3 | C1 kernel drop-in alignment | accepted kernel-family inventory | spike adapter ABI, then split kernel-family claims | `SPIKE` |
-| 4 | C2/C4 models + quantizations | accepted comprehensive inventories | spike generic model factory and GGUF compute-in-quant leaves | `SPIKE` |
-| 5 | C3/C5-C8 engine/API work | existing feature rows | complete missing spikes in priority order | `INVENTORIED` |
-| 6 | D1 backend expansion | accepted backend/CUDA inventory + vt seam | spike architecture spine, then NVIDIA fan-out, ROCm, MLX, Vulkan, XPU | `SPIKE` |
+| 4 | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | accepted spike; no dependency on async serving | provision digest-pinned image, build the corpus/harness, then classify each exact checkpoint | `READY` |
+| 5 | `BACKEND-GATE-CUDA-SGLANG` | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT`, then `SERVE-ASYNC-LLM` | run the binding c1-c16 campaign only after both dependencies close | `BLOCKED` |
+| 6 | C2/C4 models + quantizations | accepted comprehensive inventories | spike `MODEL-FACTORY-registry` and split `QUANT-GGUF-COMPUTE` leaves | `SPIKE` |
+| 7 | C3/C5-C8 engine/API work | existing feature rows | complete missing spikes in priority order | `INVENTORIED` |
+| 8 | D1 backend expansion | accepted backend/CUDA inventory + vt seam | spike architecture spine, then NVIDIA fan-out, ROCm, MLX, Vulkan, XPU | `SPIKE` |
 
 ## Closing and archival
 

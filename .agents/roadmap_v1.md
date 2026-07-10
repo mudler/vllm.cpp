@@ -20,17 +20,17 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | MVP operational closure: online latency and e2e/nightlies | [engine matrix](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | A1 first campaign invalid/incomplete (vLLM startup failed; 35B ours arms aborted), rerun required; A5 unspiked | `GATING` | diagnose/rerun A1 under flock with valid denominators, then spike A5 |
+| 0 | `ROAD-V1-A` | MVP operational closure: online latency and e2e/nightlies | [`SERVE-GATE-ONLINE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | online-gate spike accepted; first campaign invalid/incomplete (vLLM startup failed; 35B ours arms aborted); nightly unspiked | `GATING` | diagnose/rerun `SERVE-GATE-ONLINE` under flock, then spike `SERVE-E2E-NIGHTLY` |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory accepted; raw-pointer ABI leaf unspiked | `PARTIAL` | spike the adapter ABI, then split family claims |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | all 353 static architecture IDs inventoried; current Qwen wrappers are partial; factory leaf unspiked | `PARTIAL` | generic architecture-to-factory + reject-unknown spike |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs written | `READY` | claim 27B MTP loader/state leaf |
-| 4 | `ROAD-V1-C4` | Quantization: llama.cpp breadth/speed, NVFP4/FP8/MX, MLX native | [quantization matrix](quantization-matrix.md) | comprehensive coverage spike merged; leaf specs open | `PARTIAL` | spike GGUF compute-in-quant storage/dispatch |
+| 4 | `ROAD-V1-C4` | Quantization: llama.cpp breadth/speed, NVFP4/FP8/MX, MLX native | [quantization matrix](quantization-matrix.md) | comprehensive coverage spike merged; leaf specs open | `PARTIAL` | advance `QUANT-GGUF-COMPUTE` from umbrella spike to claim-sized leaf specs |
 | 5 | `ROAD-V1-C5` | Sliding window, local attention, YaRN/long context | [engine matrix](engine-matrix.md), [coverage view §§2,11](feature-matrix.md#2-kv-cache--memory) | unspiked | `INVENTORIED` | SlidingWindowSpec + attention joint spike |
 | 6 | `ROAD-V1-C6` | Priority and async/overlap scheduling | [engine matrix](engine-matrix.md), [coverage view §1](feature-matrix.md#1-engine-core--scheduling) | async research finding only; leaf specs absent | `INVENTORIED` | async execution trace + scheduler test inventory |
 | 7 | `ROAD-V1-C7` | Sampling/API controls and logprobs payloads | [engine matrix](engine-matrix.md), [coverage view §6](feature-matrix.md#6-sampling--generation-controls) | implementation slices exist; all audited leaf specs absent | `PARTIAL` | split sampler-core evidence from serving wiring |
 | 8 | `ROAD-V1-C8` | Tokenize/detokenize and full metrics | [engine matrix](engine-matrix.md), [coverage view §9](feature-matrix.md#9-serving-surface-openai-api-endpoints-cli-library) | unspiked | `INVENTORIED` | `/metrics` core spike, then utility endpoints |
 | 9 | `ROAD-V1-C9` | Mechanical recurring upstream sync | [upstream sync](upstream-sync.md), [porting inventory](porting-inventory.md) | protocol exists; automation P1 open | `PARTIAL` | run next enumerate/classify cycle at pin advance |
-| 10 | `ROAD-V1-D1` | NVIDIA target fan-out, ROCm, MLX, Vulkan, XPU, ANE | [backend matrix](backend-matrix.md), [backends strategy](backends.md) | 13 CUDA targets, component rules, platforms and native floors inventoried; leaf specs absent | `PARTIAL` | spike the architecture spine, then sm80/sm90 build gates |
+| 10 | `ROAD-V1-D1` | NVIDIA target fan-out, ROCm, MLX, Vulkan, XPU, ANE | [backend matrix](backend-matrix.md), [backends strategy](backends.md) | 13 CUDA targets, component rules, platforms and native floors inventoried; `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `READY`, while `BACKEND-GATE-CUDA-SGLANG` is `BLOCKED` | `PARTIAL` | claim the SGLang preflight in parallel; spike the architecture spine, then sm80/sm90 build gates |
 | 11 | `ROAD-V1-D2` | Tensor/multi-GPU parallelism | [engine matrix](engine-matrix.md), [coverage view §3](feature-matrix.md#3-parallelism--scale-out) | TP spec written | `READY` | acquire 2-GPU target and claim Phase 0 mock/ABI |
 | 12 | `ROAD-V1-D3` | Spec-decode breadth: ngram and EAGLE3 | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | unspiked | `INVENTORIED` | after MTP/DFlash gate |
 | 13 | `ROAD-V1-D4` | LoRA, KV/offload, wider model zoo | [engine matrix](engine-matrix.md), [model matrix](model-matrix.md) | unspiked | `INVENTORIED` | after T1 dependencies close |
@@ -44,11 +44,11 @@ their area matrix.
 
 | # | Track | State |
 |---|---|---|
-| A1 | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | ⚠️ first flock-held campaign ended 2026-07-10 but is **invalid/incomplete**: vLLM 27B/35B servers failed initialization and multiple ours-35B arms aborted; preserve logs in `~/work/vllm.cpp-latency/latres`, diagnose and rerun with fresh denominators |
+| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | ⚠️ first flock-held campaign ended 2026-07-10 but is **invalid/incomplete**: vLLM 27B/35B servers failed initialization and multiple ours-35B arms aborted; preserve logs in `~/work/vllm.cpp-latency/latres`, diagnose and rerun with fresh denominators |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
-| A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461) — vendored sm_121a artifacts (40 files, byte-deterministic regen), fresh-clone build green with `VLLM_CPP_TRITON_PYTHON=/nonexistent/python`, 27B gate green on vendored cubins |
-| A5 | e2e suites per gates.md (server conformance nightly on dgx etc.) | ☐ next |
+| A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461) — vendored sm_121a artifacts (40 files, source/manifest hash-tracked regen), fresh-clone build green with `VLLM_CPP_TRITON_PYTHON=/nonexistent/python`, 27B gate green on vendored cubins; cross-worktree byte reproducibility remains open in `CLAIM-PR3` until generated source paths are normalized |
+| `SERVE-E2E-NIGHTLY` (formerly A5) | e2e suites per gates.md (server conformance nightly on dgx etc.) | ☐ next; leaf spike required |
 
 ## B. Research tracks (complete)
 
@@ -60,6 +60,8 @@ is evidence, not a load-bearing decision source.
 
 The follow-on table/model/quant/kernel/backend coverage-spike block is archived
 at [completed/roadmap_v1_inventory_spikes_2026-07-10.md](completed/roadmap_v1_inventory_spikes_2026-07-10.md).
+The completed control-plane audit and lifecycle-enforcement repair is archived
+at [completed/roadmap_v1_control_plane_hardening_2026-07-10.md](completed/roadmap_v1_control_plane_hardening_2026-07-10.md).
 
 ## C. T1 queue (all open v0 items carried forward)
 

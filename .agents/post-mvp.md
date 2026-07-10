@@ -45,7 +45,8 @@ DONE with a one-line outcome + where the full report/branch lives.
 ## D. T2 (after T1, per porting-inventory.md)
 
 Backend expansion per backends.md (Metal/MLX per B1, Vulkan, Intel XPU, ANE),
-multi-GPU/TP, spec-decode breadth, LoRA, offload, model zoo breadth.
+multi-GPU/TP (**spec written → [specs/tensor-parallelism.md](specs/tensor-parallelism.md)**; ⚠ needs a 2-GPU box — GB10 is single-GPU),
+spec-decode breadth, LoRA, offload, model zoo breadth.
 
 ## Protocol evolution (user-directed, 2026-07-10) — mirror as the FLOOR, surpass beyond it
 

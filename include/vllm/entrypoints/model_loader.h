@@ -38,16 +38,16 @@ struct EngineParams {
   int num_blocks = 256;    // KV blocks to allocate.
   int max_model_len = 0;   // 0 => config.max_position_embeddings.
   int max_num_seqs = 8;    // max concurrent sequences.
-  // Per-step token budget (the chunked-prefill knob). 0 => the bounded default
-  // (see MakeSchedulerConfig / ResolveMaxNumBatchedTokens in model_loader.cpp):
-  // a FIXED budget that does NOT scale with max_num_seqs, so a long/many-request
-  // prefill is split across steps (enable_chunked_prefill is always true) and the
-  // per-step GDN chunked-scan activation stays bounded regardless of concurrency.
-  // This is the fix for the 27B 8x1024 conc-8 OOM: the old
-  // max_model_len*max_num_seqs product let an 8x1024 (8192-token) prefill run in
-  // ONE step, blowing the GDN prefill activation. Mirrors vLLM's chunked-prefill
-  // relationship (a bounded max_num_batched_tokens; DEFAULT_MAX_NUM_BATCHED_TOKENS
-  // = 2048 in vllm/config/scheduler.py @ e24d1b24).
+  // Per-step token budget (the chunked-prefill knob). 0 => the bounded PER-ARCH
+  // default (see LoadedEngine::ResolveMaxNumBatchedTokens): dense arch 2048 flat
+  // (vLLM's DEFAULT_MAX_NUM_BATCHED_TOKENS, vllm/config/scheduler.py:42 @
+  // e24d1b24); MoE arch 8192 at max_num_seqs >= 32 else 4096 (GB10-tuned). The
+  // budget does NOT scale with max_num_seqs, so a long/many-request prefill is
+  // split across steps (enable_chunked_prefill is always true) and the per-step
+  // GDN chunked-scan activation stays bounded regardless of concurrency. This is
+  // the fix for the 27B 8x1024 conc-8 OOM: the old max_model_len*max_num_seqs
+  // product let an 8x1024 (8192-token) prefill run in ONE step, blowing the GDN
+  // prefill activation.
   int max_num_batched_tokens = 0;
 };
 
@@ -95,6 +95,24 @@ class LoadedEngine {
   // the structural discriminator (dense == 0, MoE > 0). Exposed for testing the
   // dispatch without a disk load.
   static bool IsDenseArch(const HfConfig& config);
+
+  // Resolve the per-step token budget (max_num_batched_tokens) for chunked
+  // prefill. An explicit EngineParams override wins; otherwise a PER-ARCH
+  // default (see the definition in model_loader.cpp for the measurements):
+  //  * DENSE arch: 2048 flat — vLLM's own scheduler default
+  //    (DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048, vllm/config/scheduler.py:42 @
+  //    e24d1b24). The dense prefill is expensive per token; a bigger budget
+  //    lets one giant mixed step run several full prompts' prefill and starves
+  //    every decode stream behind it.
+  //  * MoE arch: the GB10-tuned concurrency-aware budget (8192 at
+  //    max_num_seqs >= 32, else 4096) — the cheap A3B expert prefill wants the
+  //    bigger chunk.
+  // Invariants (SchedulerConfig.verify_max_model_len,
+  // vllm/config/scheduler.py:87): result >= max_num_seqs; the tiny-model
+  // (max_model_len * max_num_seqs) ceiling is preserved. Exposed for testing
+  // the default policy without a disk load.
+  static int ResolveMaxNumBatchedTokens(const EngineParams& params,
+                                        int max_model_len, bool is_dense_arch);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
   const tok::Tokenizer& tokenizer() const { return tokenizer_; }

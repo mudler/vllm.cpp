@@ -2619,11 +2619,22 @@ __global__ void GdnChunkVNewSlackZeroKernel(TD* v_new, const int32_t* qsl, int64
 }
 
 #ifdef VLLM_CPP_TRITON
+// DEFAULT-ON (2026-07-10) in the VLLM_CPP_TRITON build: gated by token-exact
+// test_ops_gdn 31/31 + 27B AND 35B greedy 16/16 through the Triton path in BOTH
+// toggle arms, and the measured every-axis win (35B conc64 +2.64% total, TTFT
+// −4.1%, TPOT −2.4%, mem equal → 1.0195× vs graphed vLLM = the MVP gate; 27B
+// +13pts at conc32). `VT_GDN_*_TRITON=0` opts back into the hand-C++ kernels.
+// (Defined BEFORE the first TryTriton* user — main's default-ON commit placed it
+// after TryTritonDeltaH, which fails to compile with VLLM_CPP_TRITON=ON.)
+static bool GdnTritonEnvOn(const char* n) {
+  const char* e = std::getenv(n);
+  return e == nullptr || e[0] != '0';
+}
+
 // SANCTIONED Triton AOT fast-path dispatch for GDN delta_h (the state recurrence).
 // Returns true iff it launched the Triton kernel (caller then skips the hand
-// path). Runtime toggle VT_GDN_DELTAH_TRITON: must be "1" to enable (default OFF
-// even in the VLLM_CPP_TRITON build until the token-exact win is proven — then the
-// default flips to on). Fires ONLY for the exact bf16 gate-model GDN shapes the two
+// path). Runtime toggle VT_GDN_DELTAH_TRITON: default ON (GdnTritonEnvOn above;
+// =0 restores the hand path). Fires ONLY for the exact bf16 gate-model GDN shapes the two
 // AOT specializations were pinned to (K=V=128, Hg=16, H in {48,32}); any other
 // shape/dtype returns false so the preserved hand-C++ GdnChunkDeltaHRegRingKernel
 // (and the CPU reference) still handle it — the portable contract is intact. The
@@ -2649,16 +2660,6 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
                                    D(state), D(qsl), D(boh), T, NH);
   VT_CHECK(r == CUDA_SUCCESS, "cuda gdn delta_h(triton): launcher returned non-success");
   return true;
-}
-
-// DEFAULT-ON (2026-07-10) in the VLLM_CPP_TRITON build: gated by token-exact
-// test_ops_gdn 31/31 + 27B AND 35B greedy 16/16 through the Triton path in BOTH
-// toggle arms, and the measured every-axis win (35B conc64 +2.64% total, TTFT
-// −4.1%, TPOT −2.4%, mem equal → 1.0195× vs graphed vLLM = the MVP gate; 27B
-// +13pts at conc32). `VT_GDN_*_TRITON=0` opts back into the hand-C++ kernels.
-static bool GdnTritonEnvOn(const char* n) {
-  const char* e = std::getenv(n);
-  return e == nullptr || e[0] != '0';
 }
 
 // SANCTIONED Triton AOT fast-path for GDN chunk_o (the output kernel). Fires ONLY

@@ -1894,3 +1894,28 @@ parity max|err| 5.8e-3, host-metadata vs fallback bit-identical, 35B PASS.
 PRISTINE main 08c3825 clean-built with the same flags (CPU Tier-1 vs golden
 RmsNorm, h={7,127,128,512}) — earlier "91/91" runs were on stale incremental
 builds ("incremental build masks" memory). Needs a separate fix on main.
+
+## 2026-07-10 — 🏁 MVP THROUGHPUT GATE PASSED ON BOTH MODELS
+
+**27B: PASSED via FA-2 prefill attention (merged 45a6342, default-ON).** The last named
+lever: vendored `flash_fwd_splitkv<256,64,64,4>` (vllm-project/flash-attention @2c839c33)
+wired natively-bf16 (zero casts — what killed the shelved attempt), sync-free, splits=1
+per vLLM's varlen contract. Kernel 1.81→0.49 µs/tok/layer (3.68×). **Token-exact: 27B
+greedy IDENTICAL tokens FA2 on/off.** vs fresh graphed vLLM: **conc16 1.0072× (6/7 reps
+≥1.0, worst 0.996 disclosed), conc32 1.0071× (5/5 ≥1.0)**; TTFT 1750/2440ms and TPOT
+better than prior best; peak mem ours. 35B inert (f32 q never routes), spot 1.020×.
+
+**SCOREBOARD (Triton-AOT build, fresh same-box graphed-vLLM denominators):**
+- **35B conc64: 1.020-1.023×** total; TTFT −4.1%, TPOT −2.4%; mem 52.8 vs ~80.6GB. ✅
+- **27B conc16: 1.0072× / conc32: 1.0071×**; TTFT/TPOT better; mem ~62 vs ~76GB. ✅
+- Token-exact greedy 16/16 preserved on both, every change gated.
+Session arc: 27B 0.84×→1.007×, 35B 0.96×→1.02×, via: portable vt::tile wins (delta_h,
+WY, fp8-fusion, bf16-in), sanctioned Triton AOT GDN (−34%), w13+shared-expert fusion
+(+3%), fp4-autotune, mnbt=2048 (mirrors vLLM), TN in_proj, preamble/conv flips, FA-2.
+
+**KNOWN ISSUE (not MVP-blocking, needs a fix):** `test_ops_fused_chain` fails on pristine
+main (CPU Tier-1 interpreter vs golden RmsNorm at h={7,127,128,512}) — pre-existing,
+proven not from the FA-2 branch; the Tier-1 interpreter is not on the model hot path
+(Tier-0 composite is default). Fix the CPU interpreter or its golden.
+**REMAINING MVP SCOPE (non-throughput):** TTFT/TPOT vs vLLM SERVE (only offline-bench
+compared so far), GGUF real-file parity on dgx, e2e suites — per gates.md.

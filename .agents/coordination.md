@@ -107,7 +107,7 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 | Priority | Row/block | Dependency | Next handoff | State |
 |---|---|---|---|---|
-| 1 | `SERVE-GATE-ONLINE` | First campaign invalid: vLLM startup failure + ours-35B aborts | claimed by `CLAIM-SERVE-GATE-1`; both failures diagnosed, rerun in progress | `GATING` |
+| 1 | `SERVE-GATE-ONLINE` | First campaign invalid: vLLM startup failure + ours-35B aborts | claimed by `CLAIM-SERVE-GATE-1`; both failures diagnosed, rerun in progress | `ACTIVE` |
 | 2 | `SERVE-E2E-NIGHTLY` | `SERVE-GATE-ONLINE` evidence where benchmarks overlap | write spike and CI/nightly split | `INVENTORIED` |
 | 3 | C1 kernel drop-in alignment | accepted kernel-family inventory | spike adapter ABI, then split kernel-family claims | `SPIKE` |
 | 4 | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | accepted spike; no dependency on async serving | provision digest-pinned image, build the corpus/harness, then classify each exact checkpoint | `READY` |

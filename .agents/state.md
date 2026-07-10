@@ -2403,3 +2403,16 @@ included consistently with the ported registry-property test.
 No runtime/support state changed. `MODEL-FACTORY-registry` is `READY`; the next
 C2 implementation is that row, followed by a separately spiked Llama-dense
 family leaf.
+
+## 2026-07-10 — performance checks are per feature/milestone, before stacking
+
+User reaffirmed that every feature or milestone capable of affecting speed
+must be benchmarked immediately so regressions are caught at their source, not
+only at a later release gate. The existing fresh-denominator and every-axis
+rules already required this; `workflow.md` and `benchmark-protocol.md` now make
+the operational checkpoint explicit: correctness first, same-binary pre/post
+A/B, fresh same-box vLLM or backend-native floor, throughput/latency/memory,
+2–3 uncontended reproductions, and exact ledger recipe. A second
+speed-sensitive milestone is not stacked until the first checkpoint is
+recorded. Hardware deferral means `GATING` plus a reproducible handoff, never
+an unmeasured `DONE` claim.

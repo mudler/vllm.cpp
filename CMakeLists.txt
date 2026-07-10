@@ -203,6 +203,7 @@ add_library(vllm STATIC
   src/vt/arena.cpp
   src/vt/ops.cpp
   src/vt/cpu/cpu_backend.cpp
+  src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_paged_attn.cpp

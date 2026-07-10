@@ -1,4 +1,11 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
+// EXCEPT the parallel dispatch (QUANT-GGUF-CPU-THREADPOOL): the GEMM chunk
+// policy and the row/batch chunking are ported 1:1 from llama.cpp (local fork)
+// ggml/src/ggml-cpu/ggml-cpu.c:1155-1443 and ggml-cpu/ops.cpp:9070-9126 @
+// 237ad9b96 — see cpu_threadpool.h and the per-kernel anchors below. Every
+// kernel keeps its exact per-element math and per-output sequential reduction
+// order; parallelism partitions OUTPUT elements only, so results are
+// bit-identical to single-thread by construction (spec § Dispatch behavior).
 #include "vt/ops.h"
 
 #include <algorithm>
@@ -6,8 +13,16 @@
 #include <limits>
 #include <vector>
 
+#include "cpu_threadpool.h"
+
 namespace vt::cpu {
 namespace {
+
+// Row/batch-chunked dispatch through the process pool (or the test-swapped
+// pool). body(r0, r1) produces output rows [r0, r1) exactly once each.
+inline void ForRows(int64_t nr, const std::function<void(int64_t, int64_t)>& body) {
+  ParallelForRows(CurrentThreadpool(), nr, body);
+}
 
 float LoadF32(const Tensor& t, int64_t elem_offset) {
   switch (t.dtype) {
@@ -27,39 +42,131 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
   }
 }
 
-void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
-  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
-  for (int64_t i = 0; i < m; ++i) {
-    for (int64_t j = 0; j < n; ++j) {
-      float acc = 0.0f;
-      for (int64_t p = 0; p < k; ++p) {
-        acc += LoadF32(a, i * k + p) * LoadF32(b, p * n + j);
+// GEMM chunk worker — 16x16 block tiling inside a chunk, ported from
+// ggml_compute_forward_mul_mat_one_chunk (ggml-cpu.c:1155-1243; empty-chunk
+// yield :1181-1184, blck_0/blck_1 = 16 :1192-1194). ggml's vec_dot per output
+// element is our per-element K loop: byte-identical accumulation (sequential
+// over K, f32, -ffp-contract=off pinned) to the pre-threadpool kernels.
+// ir0 indexes output COLUMNS j (ggml nr0 = src0/weight rows = N), ir1 indexes
+// output ROWS i (ggml nr1 = src1 rows = M). kBT selects the [N,K] row-major
+// weight orientation (MatmulBT) vs [K,N] (Matmul).
+template <bool kBT>
+void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, int64_t n,
+                    int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end) {
+  // threads with no work simply yield
+  if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+    return;
+  }
+
+  // block-tiling attempt
+  const int64_t blck_0 = 16;
+  const int64_t blck_1 = 16;
+
+  for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+    for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+      for (int64_t i = iir1; i < iir1 + blck_1 && i < ir1_end; ++i) {
+        for (int64_t j = iir0; j < iir0 + blck_0 && j < ir0_end; ++j) {
+          float acc = 0.0f;
+          for (int64_t p = 0; p < k; ++p) {
+            acc += LoadF32(a, i * k + p) * LoadF32(b, kBT ? j * k + p : p * n + j);
+          }
+          StoreF32(out, i * n + j, acc);
+        }
       }
-      StoreF32(out, i * n + j, acc);
     }
   }
+}
+
+// GEMM chunking policy + atomic work stealing, ported from
+// ggml_compute_forward_mul_mat (ggml-cpu.c:1245-1443): thread 0 seeds the
+// steal cursor at nth and a barrier publishes it (:1350-1355); chunk_size 16,
+// 64 for vector shapes (:1388-1393); nchunk0 x nchunk1 grid (:1398-1399);
+// re-chunk per-thread when the grid is < nth*4 or NUMA (:1404-1408, IsNuma()
+// stubbed false); each thread starts at chunk ith then steals via the atomic
+// cursor (:1415-1442). num_rows_per_vec_dot is 1 for our scalar dot (no mmla).
+template <bool kBT>
+void MatmulChunked(Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1];
+  const int64_t n = kBT ? b.shape[0] : b.shape[1];
+  // ggml nr0 = ne0 (dst dim0 = weight rows) -> our N; nr1 = ne1*ne2*ne3
+  // (src1 rows) -> our M.
+  const int64_t nr0 = n;
+  const int64_t nr1 = m;
+
+  Threadpool& tp = CurrentThreadpool();
+  tp.Run([&](int ith, int nth) {
+    if (ith == 0) {
+      // Every thread starts at ith, so the first unprocessed chunk is nth.
+      tp.ChunkSet(nth);
+    }
+
+    tp.Barrier();
+
+    // Now select a reasonable chunk size.
+    int chunk_size = 16;
+
+    // We need to step up the size if it's small
+    if (nr0 == 1 || nr1 == 1) {
+      chunk_size = 64;
+    }
+
+    // distribute the work across the inner or outer loop based on which one is larger
+    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+
+    // If the chunking is poor for the number of threads on this setup, scrap
+    // the whole plan. Re-chunk it by thread.
+    if (nchunk0 * nchunk1 < nth * 4 || IsNuma()) {
+      nchunk0 = nr0 > nr1 ? nth : 1;  // parallelize by weight rows (N)
+      nchunk1 = nr0 > nr1 ? 1 : nth;  // parallelize by src1 rows (M)
+    }
+
+    // The number of elements in each chunk
+    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+
+    // The first chunk comes from our thread_id, the rest will get auto-assigned.
+    int64_t current_chunk = ith;
+
+    while (current_chunk < nchunk0 * nchunk1) {
+      const int64_t ith0 = current_chunk % nchunk0;
+      const int64_t ith1 = current_chunk / nchunk0;
+
+      const int64_t ir0_start = dr0 * ith0;
+      const int64_t ir0_end = std::min(ir0_start + dr0, nr0);
+
+      const int64_t ir1_start = dr1 * ith1;
+      const int64_t ir1_end = std::min(ir1_start + dr1, nr1);
+
+      MatmulOneChunk<kBT>(out, a, b, k, n, ir0_start, ir0_end, ir1_start, ir1_end);
+
+      if (nth >= nchunk0 * nchunk1) {
+        break;
+      }
+
+      current_chunk = tp.ChunkAdd(1);
+    }
+  });
+}
+
+void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  MatmulChunked<false>(out, a, b);
 }
 
 // b is the torch Linear weight [N,K] row-major (see vt::MatmulBT); identical
 // accumulation order to MatmulKernel (sequential over K), so on CPU the two
 // orientations are bit-identical for the same logical weight.
 void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
-  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
-  for (int64_t i = 0; i < m; ++i) {
-    for (int64_t j = 0; j < n; ++j) {
-      float acc = 0.0f;
-      for (int64_t p = 0; p < k; ++p) {
-        acc += LoadF32(a, i * k + p) * LoadF32(b, j * k + p);
-      }
-      StoreF32(out, i * n + j, acc);
-    }
-  }
+  MatmulChunked<true>(out, a, b);
 }
 
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
-  for (int64_t i = 0; i < t; ++i) {
+  // Row-chunked over tokens (ops.cpp:9070-9126 pattern); each row's f32
+  // variance reduction stays sequential on one thread — bit-identical.
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const int64_t rbase = i * h;
     float sumsq = 0.0f;
     for (int64_t j = 0; j < h; ++j) {
@@ -79,11 +186,13 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
       StoreF32(out, i * h + j, v * inv * wj);
     }
   }
+  });
 }
 
 void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   const int64_t t = x.shape[0], d = x.shape[1] / 2;
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     for (int64_t j = 0; j < d; ++j) {
       float gate = LoadF32(x, i * 2 * d + j);
       float up = LoadF32(x, i * 2 * d + d + j);
@@ -91,15 +200,19 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
       StoreF32(out, i * d + j, silu * up);
     }
   }
+  });
 }
 
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
-  for (int64_t i = 0; i < n; ++i) {
+  // Elementwise: partition the flat output range.
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const float g = LoadF32(gate, i);
     const float silu = g / (1.0f + std::exp(-g));
     StoreF32(out, i, silu * LoadF32(up, i));
   }
+  });
 }
 
 // --- TRUE W4A4 (fp4xfp4) helpers + kernels (notes §7). Self-contained fp8/fp4
@@ -170,7 +283,8 @@ void RmsNormQuantFp8Kernel(Queue&, Tensor& out_fp8, Tensor* out_bf16, const Tens
   const float inv_scale = 1.0F / input_scale;
   uint8_t* op = out_fp8.Ptr<uint8_t>();
   uint16_t* bp = out_bf16 == nullptr ? nullptr : out_bf16->Ptr<uint16_t>();
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const int64_t rbase = i * h;
     float sumsq = 0.0F;
     for (int64_t j = 0; j < h; ++j) {
@@ -194,6 +308,7 @@ void RmsNormQuantFp8Kernel(Queue&, Tensor& out_fp8, Tensor* out_bf16, const Tens
       op[rbase + j] = F32ToFp8(BF16ToF32(nb) * inv_scale);
     }
   }
+  });
 }
 
 // f32 -> E2M1 nibble (bit-matches vllm::CastToFp4 + Fp4ToNibble). Input pre-scaled.
@@ -225,7 +340,8 @@ void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const T
   const float gs_recip = RecipF(input_global_scale_inv);
   auto* packed = out_packed.Ptr<uint8_t>();
   auto* scale = out_scale.Ptr<uint8_t>();
-  for (int64_t i = 0; i < m; ++i) {
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     for (int64_t g = 0; g < groups; ++g) {
       const int64_t base = g * kBS;
       float vec_max = 0.0F;
@@ -243,6 +359,7 @@ void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const T
       }
     }
   }
+  });
 }
 
 // SiluMulFp4Quant CPU fallback = the exact composite (bf16 intermediate then
@@ -268,8 +385,11 @@ void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Ten
   const auto* as = a_scale.Ptr<uint8_t>();
   const auto* bp = b_packed.Ptr<uint8_t>();
   const auto* bs = b_scale.Ptr<uint8_t>();
+  // Row-chunked over M (each output row + its arow decode owned by one
+  // thread); per-column K-group reduction order unchanged.
+  ForRows(m, [&](int64_t r0, int64_t r1) {
   std::vector<float> arow(static_cast<size_t>(k));
-  for (int64_t i = 0; i < m; ++i) {
+  for (int64_t i = r0; i < r1; ++i) {
     // Decode a_fp4·a_scale_fp8 for this row once (reused across N columns).
     for (int64_t g = 0; g < groups; ++g) {
       const float asf = Fp8ToF32(as[i * groups + g]);
@@ -292,17 +412,20 @@ void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Ten
       StoreF32(out, i * n + col, alpha * acc);
     }
   }
+  });
 }
 
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   const int64_t t = ids.shape[0], h = table.shape[1], v = table.shape[0];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     int64_t id = ids.dtype == DType::kI32 ? ids.Ptr<int32_t>()[i] : ids.Ptr<int64_t>()[i];
     VT_CHECK(id >= 0 && id < v, "embedding: id out of range");
     for (int64_t j = 0; j < h; ++j) {
       StoreF32(out, i * h + j, LoadF32(table, id * h + j));
     }
   }
+  });
 }
 
 // In-place rotation of one head starting at element head_off; f32 math,
@@ -323,7 +446,8 @@ void RopeRotateHead(const Tensor& t, int64_t head_off, int rot, double base, int
 
 void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const RopeArgs& args) {
   const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     int64_t p = pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
     for (int64_t hh = 0; hh < hq; ++hh) {
       RopeRotateHead(qs, (i * hq + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
@@ -332,6 +456,7 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
       RopeRotateHead(ks, (i * hk + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
     }
   }
+  });
 }
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
@@ -345,7 +470,8 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, con
   const int rot = args.rotary_dim;
   const int64_t half = rot / 2;
   const double base = static_cast<double>(args.base);
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const int64_t p =
         positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i] : positions.Ptr<int64_t>()[i];
     for (int64_t pair = 0; pair < half; ++pair) {
@@ -355,6 +481,7 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, con
       StoreF32(cos_sin, i * rot + half + pair, static_cast<float>(std::sin(angle)));
     }
   }
+  });
 }
 
 // gemma-RMSNorm one element: (v*inv)*(gemma ? w+1 : w) — matches RmsNormKernel's
@@ -408,7 +535,8 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
       }
     }
   };
-  for (int64_t tok = 0; tok < t; ++tok) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t tok = r0; tok < r1; ++tok) {
     const float* cs = cos_sin.Ptr<float>() + tok * rot;
     for (int64_t h = 0; h < hq; ++h) {
       const int64_t qrow = tok * (hq * 2 * dh) + h * 2 * dh;
@@ -422,6 +550,7 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
       do_head(kf, tok * (hkv * dh) + h * dh, k_norm, k_out, (tok * hkv + h) * dh, cs);
     }
   }
+  });
 }
 
 // GDN CPU reference kernels. Formulas: .agents/specs/gdn-semantics.md (§ cited per
@@ -441,13 +570,20 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   const int32_t* qslp = qsl.Ptr<int32_t>();
   const int32_t* hisp = his.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == total, "causal_conv1d_fwd: bad query_start_loc bounds");
-  std::vector<float> old_row(static_cast<size_t>(width));
   for (int64_t s = 0; s < n; ++s) {
+    VT_CHECK(qslp[s + 1] >= qslp[s] && qslp[s] >= 0,
+             "causal_conv1d_fwd: query_start_loc not monotonic");
+  }
+  // Row-chunked over (sequence, channel) pairs: each pair owns its out column
+  // slice and its conv_state row — independent outputs (spec W3 "conv1d").
+  ForRows(n * c_dim, [&](int64_t r0, int64_t r1) {
+  std::vector<float> old_row(static_cast<size_t>(width));
+  for (int64_t r = r0; r < r1; ++r) {
+    const int64_t s = r / c_dim, c = r % c_dim;
     const int64_t begin = qslp[s], end = qslp[s + 1], t_len = end - begin;
-    VT_CHECK(t_len >= 0 && begin >= 0, "causal_conv1d_fwd: query_start_loc not monotonic");
     const bool init = hisp[s] != 0;
     float* srow_base = conv_state.Ptr<float>() + s * c_dim * width;
-    for (int64_t c = 0; c < c_dim; ++c) {
+    {
       float* srow = srow_base + c * width;
       for (int64_t j = 0; j < width; ++j) old_row[static_cast<size_t>(j)] = srow[j];
       const float b = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
@@ -477,6 +613,7 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
       }
     }
   }
+  });
 }
 
 // §3 causal_conv1d_update (seqlen==1): read-old-then-roll. conv_state_indices
@@ -489,14 +626,18 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
   const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
   const int32_t* cache_idx =
       conv_state_indices != nullptr ? conv_state_indices->Ptr<int32_t>() : nullptr;
-  for (int64_t bt = 0; bt < batch; ++bt) {
+  // Row-chunked over (batch, channel) pairs: each pair owns its out element and
+  // its conv_state row slice (batch rows map to distinct cache slots).
+  ForRows(batch * c_dim, [&](int64_t r0, int64_t r1) {
+  for (int64_t r = r0; r < r1; ++r) {
+    const int64_t bt = r / c_dim, c = r % c_dim;
     int64_t srow_row = bt;
     if (cache_idx != nullptr) {
       if (cache_idx[bt] < 0) continue;  // NULL block
       srow_row = cache_idx[bt];
     }
     float* srow_base = conv_state.Ptr<float>() + srow_row * c_dim * width;
-    for (int64_t c = 0; c < c_dim; ++c) {
+    {
       float* srow = srow_base + c * width;
       const float xt = LoadF32(x, bt * c_dim + c);
       float acc = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
@@ -507,13 +648,15 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
       if (width > 0) srow[width - 1] = xt;                            // raw x
     }
   }
+  });
 }
 
 // §4 l2norm_fwd: y = x * rsqrt(sum(x^2) + eps) over the last dim (plain SUM).
 void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) {
   const int64_t d = x.shape[x.rank - 1];
   const int64_t rows = x.Numel() / d;
-  for (int64_t r = 0; r < rows; ++r) {
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+  for (int64_t r = r0; r < r1; ++r) {
     float sumsq = 0.0f;
     for (int64_t j = 0; j < d; ++j) {
       const float v = LoadF32(x, r * d + j);
@@ -522,6 +665,7 @@ void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) 
     const float inv = 1.0f / std::sqrt(sumsq + args.eps);
     for (int64_t j = 0; j < d; ++j) StoreF32(out, r * d + j, LoadF32(x, r * d + j) * inv);
   }
+  });
 }
 
 // §5 RMSNormGated (norm_before_gate=True, group_size=None):
@@ -529,7 +673,8 @@ void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) 
 void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
                         const Tensor& w, const RmsNormGatedArgs& args) {
   const int64_t t = x.shape[0], d = x.shape[1];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     float sumsq = 0.0f;
     for (int64_t j = 0; j < d; ++j) {
       const float v = LoadF32(x, i * d + j);
@@ -542,6 +687,7 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
       StoreF32(out, i * d + j, LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
     }
   }
+  });
 }
 
 // §7 gated-delta-rule token step, shared by prefill and decode. state points
@@ -596,14 +742,20 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
   const int32_t* qslp = qsl.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == q_in.shape[0],
            "gdn_prefill: bad query_start_loc bounds");
-  std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
-      vbuf(static_cast<size_t>(dv));
   for (int64_t s = 0; s < n; ++s) {
     VT_CHECK(qslp[s + 1] >= qslp[s], "gdn_prefill: query_start_loc not monotonic");
+  }
+  // Row-chunked over SEQUENCES (spec W3): each sequence owns its state block
+  // and its token range's outputs; the in-sequence recurrence stays sequential.
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
+      vbuf(static_cast<size_t>(dv));
+  for (int64_t s = r0; s < r1; ++s) {
     float* s_state = state.Ptr<float>() + s * hv_n * dv * dk;
     for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
       GdnTokenStep(out, q_in, k, v, g, beta, s_state, t, args.scale, qbuf, kbuf, vbuf);
   }
+  });
 }
 
 void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
@@ -612,9 +764,12 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
   const int64_t batch = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2],
                 dk = state.shape[3];
   const int32_t* sidx = state_idx != nullptr ? state_idx->Ptr<int32_t>() : nullptr;
+  // Row-chunked over the BATCH (spec W3): each token owns its state slot
+  // (distinct cache rows) and its output row.
+  ForRows(batch, [&](int64_t r0, int64_t r1) {
   std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
       vbuf(static_cast<size_t>(dv));
-  for (int64_t bt = 0; bt < batch; ++bt) {
+  for (int64_t bt = r0; bt < r1; ++bt) {
     // state_idx != null => in-place on the FULL cache at slot sidx[bt] (fla
     // ssm_state_indices); sidx[bt]<0 == NULL block → zero out; null => row == bt.
     int64_t srow = bt;
@@ -630,6 +785,7 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
     float* s_state = state.Ptr<float>() + srow * hv_n * dv * dk;
     GdnTokenStep(out, q_in, k, v, g, beta, s_state, bt, args.scale, qbuf, kbuf, vbuf);
   }
+  });
 }
 
 // §3 router: softmax (f32, over all E) -> greedy top-k (lowest-index tie-break)
@@ -638,9 +794,10 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
                          const MoeRouterTopKArgs& args) {
   const int64_t t = logits.shape[0], e = logits.shape[1];
   const int k = args.top_k;
+  ForRows(t, [&](int64_t r0, int64_t r1) {
   std::vector<float> p(static_cast<size_t>(e));
   std::vector<char> chosen(static_cast<size_t>(e));
-  for (int64_t row = 0; row < t; ++row) {
+  for (int64_t row = r0; row < r1; ++row) {
     // softmax(logits.float()) with max-subtraction (topk_softmax_kernels.cu).
     float mx = -INFINITY;
     for (int64_t j = 0; j < e; ++j) mx = std::max(mx, LoadF32(logits, row * e + j));
@@ -678,6 +835,7 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
       for (int j = 0; j < k; ++j) weights.Ptr<float>()[row * k + j] /= denom;
     }
   }
+  });
 }
 
 // §4/§6 weighted scatter-combine: out[t,:] = sum_j w[t,j]*expert_out[t,j,:]
@@ -685,7 +843,8 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
 void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tensor& weights,
                       const Tensor* shared) {
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
-  for (int64_t row = 0; row < t; ++row) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t row = r0; row < r1; ++row) {
     for (int64_t col = 0; col < h; ++col) {
       float acc = 0.0f;
       for (int64_t j = 0; j < k; ++j)
@@ -695,6 +854,7 @@ void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tenso
       StoreF32(out, row * h + col, acc);
     }
   }
+  });
 }
 
 // Dense causal attention (qwen36-forward-notes.md §5). Causal scaled-dot-product
@@ -708,11 +868,16 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
   const int64_t hk = key.shape[1];
   const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
   const float scale = args.scale;
+  // Row-chunked over (head, query) pairs (spec W3) — the flash-attn q-row
+  // split (ops.cpp:9072-9073 nr = neq1*neq2*neq3). Same h-outer/i-inner walk.
+  ForRows(hq * t, [&](int64_t r0, int64_t r1) {
   std::vector<float> probs(static_cast<size_t>(t));
   std::vector<float> acc(static_cast<size_t>(d));
-  for (int64_t h = 0; h < hq; ++h) {
+  for (int64_t r = r0; r < r1; ++r) {
+    const int64_t h = r / t;
     const int64_t g = h / qpk;
-    for (int64_t i = 0; i < t; ++i) {
+    {
+      const int64_t i = r % t;
       const int64_t jmax = args.causal ? i : t - 1;  // causal: keys 0..i
       const int64_t qoff = (i * hq + h) * d;
       // Pass 1: scores + running max.
@@ -743,6 +908,7 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
       for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
     }
   }
+  });
 }
 
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). Elementwise fusions of the
@@ -754,13 +920,16 @@ float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 // out[i] = F32ToBF16(in[i]); out bf16, in f32, same element count.
 void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
   const int64_t n = out.Numel();
-  for (int64_t i = 0; i < n; ++i) StoreF32(out, i, LoadF32(in, i));
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) StoreF32(out, i, LoadF32(in, i));
+  });
 }
 
 // Split fused [T, Hq*2*Dh] q/gate projection into q_out/gate_out [T,Hq,Dh].
 void AttnGateSplitKernel(Queue&, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     for (int64_t h = 0; h < hq; ++h) {
       const int64_t base = i * (hq * 2 * dh) + h * 2 * dh;  // start of (i,h) pair
       const int64_t out_off = (i * hq + h) * dh;
@@ -770,19 +939,24 @@ void AttnGateSplitKernel(Queue&, Tensor& q_out, Tensor& gate_out, const Tensor& 
       }
     }
   }
+  });
 }
 
 // out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])); out bf16, attn/gate f32.
 void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn, const Tensor& gate) {
   const int64_t n = out.Numel();
-  for (int64_t i = 0; i < n; ++i) StoreF32(out, i, LoadF32(attn, i) * Sigmoid(LoadF32(gate, i)));
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i)
+      StoreF32(out, i, LoadF32(attn, i) * Sigmoid(LoadF32(gate, i)));
+  });
 }
 
 // GDN g/beta from raw projections (gdn-semantics.md §6). softplus threshold 20.
 void GdnGBetaKernel(Queue&, Tensor& g_out, Tensor& beta_out, const Tensor& araw,
                     const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias) {
   const int64_t t = g_out.shape[0], hv = g_out.shape[1];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     for (int64_t h = 0; h < hv; ++h) {
       const int64_t idx = i * hv + h;
       const float x = LoadF32(araw, idx) + LoadF32(dt_bias, h);
@@ -791,13 +965,15 @@ void GdnGBetaKernel(Queue&, Tensor& g_out, Tensor& beta_out, const Tensor& araw,
       StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
     }
   }
+  });
 }
 
 // Split GDN conv [T, 2*key_dim+value_dim] into q/k [T,key_dim] and v [T,value_dim].
 void GdnConvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv) {
   const int64_t t = conv.shape[0], key_dim = q_out.Numel() / t, value_dim = v_out.Numel() / t;
   const int64_t conv_dim = 2 * key_dim + value_dim;
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const int64_t row = i * conv_dim;
     for (int64_t j = 0; j < key_dim; ++j) {
       StoreF32(q_out, i * key_dim + j, LoadF32(conv, row + j));
@@ -806,6 +982,7 @@ void GdnConvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, con
     for (int64_t j = 0; j < value_dim; ++j)
       StoreF32(v_out, i * value_dim + j, LoadF32(conv, row + 2 * key_dim + j));
   }
+  });
 }
 
 // Fused GDN post-conv prep: GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta in
@@ -820,7 +997,8 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tens
   const int64_t hv = v_out.shape[1], dv = v_out.shape[2];
   const int64_t key_dim = hk * dk, value_dim = hv * dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const int64_t row = i * conv_dim;
     // q/k: split then l2norm over Dk, per head (plain SUM of squares, §4).
     for (int64_t h = 0; h < hk; ++h) {
@@ -851,15 +1029,18 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tens
       StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
     }
   }
+  });
 }
 
 // out[t,c] = F32ToBF16(sigmoid(gl[t]) * sd[t*H+c]); shared-expert sigmoid gate.
 void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor& gl) {
   const int64_t t = out.shape[0], h = out.shape[1];
-  for (int64_t i = 0; i < t; ++i) {
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
     const float g = Sigmoid(LoadF32(gl, i));
     for (int64_t c = 0; c < h; ++c) StoreF32(out, i * h + c, g * LoadF32(sd, i * h + c));
   }
+  });
 }
 
 // --- Fused declarative recipe (TDR Phase 0). Two realizations of ANY
@@ -908,7 +1089,8 @@ void FusedStore(FOperand o, int64_t row, int64_t j, int64_t h, float v, Tensor* 
 void FusedChainInterpKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
                             Tensor* residual, const FusedRecipe& r, float eps) {
   const int64_t t = x.shape[0], h = x.shape[1];
-  for (int64_t row = 0; row < t; ++row) {
+  ForRows(t, [&](int64_t rr0, int64_t rr1) {
+  for (int64_t row = rr0; row < rr1; ++row) {
     for (int s = 0; s < r.n; ++s) {
       const FStep& st = r.steps[s];
       switch (st.op) {
@@ -939,6 +1121,7 @@ void FusedChainInterpKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& 
       }
     }
   }
+  });
 }
 
 // Tier 0 — composite: walk the steps and realize them through the ALREADY-

@@ -132,10 +132,10 @@ MTP heads (we currently skip `mtp.*` at load).
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/spec_decode/`, `models/*mtp*` | 🚧 scoped | biggest single-model win; scheduler spec hooks stubbed | [specs/spec-decode-mtp.md](specs/spec-decode-mtp.md) |
-| Rejection sampler | `v1/sample/rejection_sampler.py` | ☐ T2 | prerequisite for all spec paths | [specs/rejection-sampler.md](specs/rejection-sampler.md) |
-| GDN spec segments (metadata + align col-gather) | `v1/attention/backends/gdn_attn.py` | ☐ T2 | deferred at GDN backend port | [specs/gdn-spec-segments.md](specs/gdn-spec-segments.md) |
-| DFlash (block-diffusion drafter) | in-pin + published drafts for our models | ☐ T2 | DGX-Spark community container exists | [specs/dflash.md](specs/dflash.md) |
+| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/worker/gpu/spec_decode/`, `models/qwen3_5_mtp.py` | 🚧 **spec written** | biggest single-model win; NB both gates are GDN hybrids so the GDN spec path is on milestone 1 | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) |
+| Rejection sampler | `v1/worker/gpu/spec_decode/rejection_sampler.py` | 🚧 covered by MTP spec | prerequisite for all spec paths | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (2.4) |
+| GDN spec segments (metadata + slot-snapshot rollback) | `v1/attention/backends/gdn_attn.py`, `fla/ops/fused_sigmoid_gating.py` | 🚧 covered by MTP spec | on milestone 1 (both gates hybrid) | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (3) |
+| DFlash (block-diffusion drafter) | in-pin + published drafts for our models | 🚧 **spec written** (after MTP) | DGX-Spark community container exists; GDN slot memory at k=15 flagged | [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md) |
 | ngram | `v1/spec_decode/ngram_proposer.py` | ☐ T2 | | [specs/spec-decode-ngram.md](specs/spec-decode-ngram.md) |
 | EAGLE3 | `v1/spec_decode/eagle.py` | ☐ T2 | | [specs/spec-decode-eagle3.md](specs/spec-decode-eagle3.md) |
 

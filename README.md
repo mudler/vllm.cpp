@@ -18,7 +18,8 @@ OpenAI-compatible server.
 > and the **27B at 1.007× conc16 / 1.007× conc32** (vendored FA-2 prefill,
 > default-on; per-rep spreads in *Status*) — with better TTFT/TPOT and less
 > peak memory on both. The tables track real, tested support and are kept
-> current as work lands (see `.agents/`).
+> current as work lands (see `.agents/`). CPU multithreaded dispatch is now
+> correctness-gated, but its real-file throughput/RSS checkpoint is still open.
 
 ## What's implemented (CPU, behaviorally tested)
 
@@ -34,6 +35,11 @@ runs end-to-end on CPU:
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
   (k-quant→bf16 for the qwen35moe APEX files).
+- **CPU execution** — persistent ggml-derived native threadpool with chunked
+  GEMM and row/batch op dispatch; `VLLM_CPP_CPU_THREADS` selects the worker
+  count. Outputs are byte-identical at 1/3/20 threads and the concurrency suite
+  is ThreadSanitizer-clean. The real-file ≥10x speed/RSS checkpoint still needs
+  an exclusive idle-host rerun, and GGUF compute-in-quant remains open.
 - **Sampler** — greedy (bit-exact vs `torch.argmax`) plus temperature,
   top-k/top-p, penalties, min-p and internal logit-filter/logprob primitives.
   `n`, full random/logprob payload behavior, and request/API wiring for the
@@ -100,7 +106,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Backend | Hardware | Status |
 |---|---|---|
-| CPU | x86-64 reference (correctness/CI grade) | ✅ gate-model text engine + basic serving path end-to-end; production threading/quant speed open |
+| CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
 | CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy gates pass token-exact and meet the production-vLLM throughput gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
@@ -138,7 +144,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 | Format | Status |
 |---|---|
 | NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, cutlass sm120a fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass |
-| GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. There is no direct compute-in-quant path or llama.cpp speed parity yet; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
+| GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
 
@@ -186,6 +192,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   A/B-measured and
   gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
   `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
+- **CPU status:** the native threadpool and chunked op dispatch pass the complete
+  suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
+  speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS
+  series was deferred because the recovered 20-core host was contended by
+  unowned inference services. It remains `GATING` until an exclusive idle-host
+  run reproduces the ≥10x prefill/decode floor and refreshes llama.cpp.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF
   only). Original runtime/packaging components (the `vt` op runtime, the minja
   chat-template engine, the native grammar backend, the C API) are documented as

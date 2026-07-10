@@ -164,11 +164,18 @@ long-context uses it). T2: the rest.
 | Method | Upstream | Tier |
 |---|---|---|
 | **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅** both native CUDA paths and full gate workloads pass on GB10; generic quant-config/backend breadth remains in `quantization-matrix.md` |
-| **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. All weights expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
+| **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. The llama.cpp-derived CPU threadpool/chunked-op prerequisite is implemented and correctness-gated (1/3/20 full suites + TSAN), but its B4 speed/RSS gate is pending. All weights still expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
 | AWQ/GPTQ (+Marlin), compressed-tensors int schemes | various | T2 |
 | bitsandbytes, torchao, quark, INC, … | various | T3 (niche/other-vendor) |
+
+Threadpool test-port mapping (row `QUANT-GGUF-CPU-THREADPOOL`): llama.cpp
+`tests/test-barrier.cpp` → `tests/vt/test_cpu_threadpool.cpp:63` (repeated
+barrier/chunk reach-all-threads), and `tests/test-thread-safety.cpp` → the
+reduced concurrent-submit case at `:133`; the full multi-model/context case is
+checked in at `:173` with a real doctest skip assigned to
+`SERVE-E2E-NIGHTLY`. The local 1/3/20 byte-determinism battery is at `:399`.
 
 **Sampling** (`vllm/sampling_params.py`, `v1/sample/`):
 T0 fields: `n`, `temperature`, `top_p`, `top_k`, `min_p`, `presence/frequency/

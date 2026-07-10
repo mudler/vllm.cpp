@@ -12,6 +12,21 @@
 #include <immintrin.h>
 #endif
 
+// Match ggml's GGML_TSAN_ENABLED fence workaround. GCC and Clang both warn
+// that a standalone atomic_thread_fence is not modeled by ThreadSanitizer;
+// the upstream TSAN build uses a no-op seq-cst RMW on the same synchronization
+// atomic instead (ggml-cpu.c:594-600,3122-3128).
+#if defined(__SANITIZE_THREAD__)
+#define VT_CPU_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define VT_CPU_THREAD_SANITIZER 1
+#endif
+#endif
+#ifndef VT_CPU_THREAD_SANITIZER
+#define VT_CPU_THREAD_SANITIZER 0
+#endif
+
 namespace vt::cpu {
 namespace {
 
@@ -92,8 +107,8 @@ Threadpool::~Threadpool() {
 // bumps n_barrier_passed (seq-cst); spinners relax-wait then issue a full
 // seq-cst fence on exit.
 void Threadpool::Barrier() {
-  const int n_threads =
-      n_graph_.load(std::memory_order_relaxed) & kNThreadsMask;
+  const int n_threads = static_cast<int>(
+      n_graph_.load(std::memory_order_relaxed) & kNThreadsMask);
   if (n_threads == 1) {
     return;
   }
@@ -116,8 +131,13 @@ void Threadpool::Barrier() {
     CpuRelax();
   }
 
-  // exit barrier (full seq-cst fence)
+  // exit barrier (full seq-cst fence). TSAN does not model a standalone
+  // fence, so mirror ggml's dummy seq-cst RMW in sanitizer builds.
+#if VT_CPU_THREAD_SANITIZER
+  n_barrier_passed_.fetch_add(0, std::memory_order_seq_cst);
+#else
   std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
 }
 
 // ggml_graph_compute_thread, ggml-cpu.c:3024-3097, per-op: nth comes from the
@@ -126,7 +146,8 @@ void Threadpool::Barrier() {
 // Deviation: exceptions from the fn are captured (first wins) for rethrow on
 // the Run() caller.
 void Threadpool::ComputeThread(ComputeState& state) {
-  const int nth = n_graph_.load(std::memory_order_relaxed) & kNThreadsMask;
+  const int nth = static_cast<int>(
+      n_graph_.load(std::memory_order_relaxed) & kNThreadsMask);
   const std::function<void(int, int)>* fn = work_;
   if (fn != nullptr && state.ith < nth) {
     ParallelRegionScope scope;
@@ -151,8 +172,8 @@ bool Threadpool::ThreadReady(ComputeState& state) {
   }
 
   // check for new graph/work
-  const int n_graph = n_graph_.load(std::memory_order_relaxed);
-  const int n_threads = n_graph & kNThreadsMask;
+  const uint64_t n_graph = n_graph_.load(std::memory_order_relaxed);
+  const int n_threads = static_cast<int>(n_graph & kNThreadsMask);
   if (n_graph != state.last_graph) {
     state.pending = state.ith < n_threads;
     state.last_graph = n_graph;
@@ -164,7 +185,13 @@ bool Threadpool::ThreadReady(ComputeState& state) {
 
 // ggml_graph_compute_thread_sync, ggml-cpu.c:3121-3129: full seq-cst fence
 // after a polling exit (the relaxed epoch read needs it before touching work).
-void Threadpool::ThreadSync() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+void Threadpool::ThreadSync() {
+#if VT_CPU_THREAD_SANITIZER
+  n_graph_.fetch_add(0, std::memory_order_seq_cst);
+#else
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 
 // ggml_graph_compute_poll_for_work, ggml-cpu.c:3131-3144: 1024*128*poll relax
 // rounds before falling back to the cond-var sleep.
@@ -227,8 +254,9 @@ void Threadpool::SecondaryThread(ComputeState& state) {
 void Threadpool::Kickoff(int n_threads) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  int n_graph = n_graph_.load(std::memory_order_relaxed) >> kNThreadsBits;
-  n_graph = ((n_graph + 1) << kNThreadsBits) | (n_threads & kNThreadsMask);
+  uint64_t n_graph = n_graph_.load(std::memory_order_relaxed) >> kNThreadsBits;
+  n_graph = ((n_graph + 1) << kNThreadsBits) |
+            (static_cast<uint64_t>(n_threads) & kNThreadsMask);
 
   n_graph_.store(n_graph, std::memory_order_seq_cst);
 
@@ -257,8 +285,10 @@ void Threadpool::Run(const std::function<void(int, int)>& fn) {
   if (n_threads_ == 1) {
     // spec § Dispatch behavior: n_threads==1 short-circuits to the current
     // (inline) code path; keep the epoch mask coherent for Barrier().
-    const int epoch = n_graph_.load(std::memory_order_relaxed) >> kNThreadsBits;
-    n_graph_.store(((epoch + 1) << kNThreadsBits) | 1, std::memory_order_relaxed);
+    const uint64_t epoch =
+        n_graph_.load(std::memory_order_relaxed) >> kNThreadsBits;
+    n_graph_.store(((epoch + 1) << kNThreadsBits) | 1u,
+                   std::memory_order_relaxed);
     {
       ParallelRegionScope scope;
       fn(0, 1);

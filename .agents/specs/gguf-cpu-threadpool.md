@@ -1,7 +1,8 @@
 # Leaf spec: vt CPU threadpool — parallel op dispatch for the CPU backend
 
 **Row:** `QUANT-GGUF-CPU-THREADPOOL` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** spike complete, `READY` ·
+`QUANT-GGUF-COMPUTE` block) · **status:** W1-W3 implemented and correctness
+gated; `GATING` on the W4 idle-host performance/RSS reproduction ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** the B4 CPU decision measurement
 ([parity-ledger.md L290](../parity-ledger.md#L290)): our CPU path is
@@ -168,3 +169,55 @@ W2 and W3 are parallel-claimable after W1; W4 closes the row.
   VT_CPU_REF oracle in the sibling leaves): any future kernel change that
   splits a REDUCTION across threads (not just outputs) must move that op's
   goldens first — forbidden inside this leaf.
+
+## Gating handoff (2026-07-10 crash recovery)
+
+W1-W3 are implemented. The full CPU suite passes serially at
+`VLLM_CPP_CPU_THREADS={1,3,20}` (94/94 each); the dedicated upstream-derived
+suite also passes under GCC ThreadSanitizer (8 executed cases / 19,595
+assertions, one explicitly registered `SERVE-E2E-NIGHTLY` skip). The local
+35B/27B checkpoint gates were absent and therefore did not execute model
+assertions.
+
+W4 was deliberately not measured on the recovered host: at 2026-07-10 22:39
+UTC the 20-core x86 box had persistent unowned `llama-cpp-avx512` and
+`depth-anything-cpp` inference processes consuming CPU, with load average
+`7.97/16.15/9.81`. Benchmark protocol makes a contended run void; those
+processes were not killed or perturbed. The row therefore remains `GATING`.
+
+Exact rerun after an exclusive idle-host window is available (hold the host
+lock for the whole series; run each ours arm at least three times, interleaved):
+
+```sh
+export MODEL=/home/mudler/_git/prep-buddy/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+git rev-parse HEAD
+cmake -S . -B build-cpu-gate -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF
+cmake --build build-cpu-gate -j 20 --target vllm-bench
+
+flock /tmp/vllm-cpp-cpu-bench.lock sh -c '
+  uptime
+  ps -eo pid,psr,pcpu,pmem,comm,args --sort=-pcpu | head -20
+  for rep in 1 2 3; do
+    /usr/bin/time -v env VLLM_CPP_CPU_THREADS=1 \
+      ./build-cpu-gate/examples/vllm-bench --model "$MODEL" \
+      --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 \
+      --seed 0 --temperature 0
+    /usr/bin/time -v env VLLM_CPP_CPU_THREADS=20 \
+      ./build-cpu-gate/examples/vllm-bench --model "$MODEL" \
+      --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 \
+      --seed 0 --temperature 0
+  done
+'
+```
+
+Acceptance remains: both prefill and decode throughput at
+20 threads are at least 10x their same-binary 1-thread arms, peak RSS is no
+more than 1.05x, and outputs remain token-exact. In the same idle window,
+rebuild a clean detached llama.cpp worktree at `237ad9b96` (`Release`,
+`GGML_CUDA=OFF`, `GGML_NATIVE=ON`) and refresh the native floor:
+
+```sh
+llama-bench -m "$MODEL" -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
+/usr/bin/time -v llama-bench -m "$MODEL" -p 0 -n 32 -t 20 -r 3 -ngl 0
+```

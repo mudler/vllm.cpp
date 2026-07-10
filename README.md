@@ -135,8 +135,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   both. The GDN chunk-kernel **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed
   by a sanctioned, bounded **build-time Triton AOT fast-path** (FLA kernels verbatim →
   cubin; runtime stays Python/Triton-free; the portable C++ kernels and CPU reference
-  remain the fallback — see the porting inventory §9). The 27B's last ~3% is in
-  flight (GDN config tune + batch-budget alignment with vLLM's scheduler default).
+  remain the fallback — see the porting inventory §9). The 27B measures **0.966× at
+  BOTH operating points** (conc16 740.9 vs 766.6; conc32 1008.0 vs 1043.2 tok/s;
+  3-rep means): the batch budget is now aligned with vLLM's scheduler default
+  (dense mnbt 2048 flat — **+9.5% conc32, TTFT −59%**), and the GDN AOT launch
+  configs are verified against FLA's own autotuner (already optimal on the dominant
+  kernels). The last ~3.4% is the non-GDN prefill **fusion** residual (vLLM's
+  Inductor rmsnorm+quant / silu+quant whole-graph fusion, which we run unfused).
 - **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
   total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
   concurrency operating point). We do not stop at "near parity." The gap is being
@@ -145,7 +150,8 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   token-exact, default-on wins: register-tiled GDN `delta_h` + `cp.async` ring, a
   blocked tensor-core WY triangular inverse, fused fp8 RMSNorm→quant (quantize-once),
   and bf16 GDN input I/O. A per-shape fp4-GEMM autotune (**+5.8%** on the 27B at high
-  concurrency) is available via `VT_FP4_AUTOTUNE=1`. Every step is A/B-measured and
+  concurrency) is **default-on** (`VT_FP4_AUTOTUNE=0` opts out). Every step is
+  A/B-measured and
   gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
   `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF

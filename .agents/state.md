@@ -1756,3 +1756,41 @@ win. Default (non-Triton) build unchanged (hand-C++, 0.99×).
 1011.6/1043.2, ±0.24%, peak 61.8GB vs vLLM ~86.4GB) — from 0.840× at the start of this
 push. Residual ~3%; the finisher agent (mnbt dense default mirroring vLLM's scheduler 2048 +
 FLA-autotuner GDN config re-pin) is in flight. README updated (35B ≥1.0×, 27B ≈0.97×).
+
+## 2026-07-10 — 27B MVP finisher: per-arch mnbt (dense 2048, vLLM's default) +9.5% conc32; GDN AOT pins verified vs FLA autotuner (already optimal); FINAL 27B 0.966×/0.966×
+
+**Task 1 (mnbt, branch perf/27b-mvp-finisher):** `ResolveMaxNumBatchedTokens` is now
+per-arch — dense 27B gets **2048 FLAT** (vLLM's own DEFAULT_MAX_NUM_BATCHED_TOKENS,
+vllm/config/scheduler.py:42 @ e24d1b24); MoE 35B keeps conc-aware 8192/4096
+(unit-pinned, 35B gate 33/33 unchanged). 27B greedy 16/16 passes WITH the new default;
+91/91 CPU. Official A/B (everything-on, 3 interleaved reps, same binary, idle box):
+conc32/np192 2048 = **1012.42** vs 8192 = 924.50 (**+9.5%** total/prefill/decode,
+TTFT −59%, peak −2.2GB; TPOT +0.6% the one marginally-worse axis); conc16/np96
+2048 = **740.51** vs 4096 (old default) = 731.60 (**+1.2%**, non-overlapping; TTFT −33%;
+TPOT +2.7% worse while decode tok/s higher). **conc16 answer: 2048 flat wins there too —
+vLLM's flat default mirrored, no per-conc special case.**
+
+**Task 2 (GDN AOT config tune):** ran FLA's OWN autotuner on the exact engine shapes
+(H=48/32, T=1024..8192 varlen — winners T-stable). **delta_h (BV64/w4/s3) and chunk_o
+(BK/BV64/w4/s3) pins CONFIRMED optimal** (both H) — the "unverified guess" was already
+the FLA winner. Shipped: kkt H=48 BK128/w8/s3 (**−3.3%** kernel, reproduced). FLA's
+tril (w8/s5) and wu (w2/s2) picks measured **SLOWER on our AOT variants** (+6.8%/+1.7%,
+nsys 432 launches) → reverted to w4/s3; H=32 trio candidates recorded, unshipped.
+GDN chunk total FLAT (2084→2082 µs) ⇒ **the "config tune ≈2-3% e2e" hypothesis is
+DISPROVEN**; CMake knobs now per-kernel/per-H for future sweeps. Gates on the
+re-pinned build: test_ops_gdn 31/31 (557), 27B 16/16 + 35B 33/33 through Triton.
+
+**FINAL 27B MVP NUMBERS (everything on: Triton GDN + fp4-autotune default-ON + mnbt
+per-arch default, 3 reps):** conc16/np96 **740.90** (737.96/743.04/741.71) vs vLLM
+766.62 = **0.9665×**; conc32/np192 **1008.04** (997.58/1013.78/1012.76; r1 a cold
+outlier, r2/r3 ≈1013 = 0.971×) vs vLLM 1043.17 = **0.9663×**. **NOT ≥1.0× — honest
+shortfall ≈3.4% at both operating points** (fresh-denominator drift check in the
+ledger). Session lift: conc32 0.896×→0.966× (the mnbt fix), conc16 0.957×→0.966×.
+The residual is the known non-GDN prefill fusion gap (Inductor rmsnorm+quant /
+silu+quant) — GDN and config levers are now exhausted/verified-optimal.
+
+**Op note:** the shared dgx workspace ~/work/vllm.cpp-mvpgate was concurrently used by
+the 35B Triton A/B agent at session start; my rebuild swapped vllm-bench under its
+first OFF rep (semantically inert for its explicit-mnbt 35B runs — my change only
+alters the dense-arch DEFAULT — but rep r1 of its A/B crossed binaries; reps r2-r4 ran
+consistently on the new binary). Flagged for that agent's report review.

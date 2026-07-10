@@ -63,7 +63,7 @@ multi-process/multi-GPU re-enters through that seam.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| Tensor parallel (TP) | `distributed/`, `config/parallel.py` | ☐ T2 | weight-stacking semantics already ported (single-GPU shape) | [specs/tensor-parallel.md](specs/tensor-parallel.md) |
+| Tensor parallel (TP) | `distributed/`, `config/parallel.py` | 🚧 T2 (spec written, task #50) | weight-stacking semantics already ported (single-GPU shape); ⚠ impl needs a 2-GPU box (GB10 is single-GPU) | [specs/tensor-parallelism.md](specs/tensor-parallelism.md) |
 | Pipeline parallel (PP) | same | ☐ T2 | | [specs/pipeline-parallel.md](specs/pipeline-parallel.md) |
 | Expert parallel (EP) + EPLB | `v1/worker/gpu/eplb_utils.py` | ☐ T2 | | [specs/expert-parallel.md](specs/expert-parallel.md) |
 | Data parallel (DP) | `config/parallel.py` | ☐ T2 | | [specs/data-parallel.md](specs/data-parallel.md) |

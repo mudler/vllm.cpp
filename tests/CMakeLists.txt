@@ -163,6 +163,15 @@ target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
 
+# GGUF 35B greedy acceptance gate (checkpoint-gated, dgx-only; skips when the
+# APEX k-quant GGUFs are absent). Loads the REAL .gguf single-file path
+# (metadata + embedded vocab + k-quant dequant) through the paged engine and
+# asserts greedy token-for-token vs the pinned same-file llama.cpp oracle.
+vllm_cpp_add_test(test_qwen36_gguf_engine parity/test_qwen36_gguf_engine.cpp)
+target_compile_definitions(test_qwen36_gguf_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen36_gguf_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
+
 # Dense 27B W4A4 greedy acceptance gate (checkpoint-gated, dgx-only; skips on
 # CPU/CI when the real snapshot is absent). Counterpart to the 35B gate; asserts
 # the paged dense engine reproduces the pip-vLLM oracle greedy continuation

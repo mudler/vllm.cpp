@@ -91,7 +91,10 @@ class EngineCore {
   // (total_num_scheduled_tokens > 0). See the file header for the full order.
   std::pair<std::map<int, EngineCoreOutputs>, bool> step();
 
- private:
+ protected:
+  // Protected (not private) because EngineCoreProc subclasses EngineCore
+  // exactly as upstream (core.py:896 `class EngineCoreProc(EngineCore)`) and
+  // its has_work()/shutdown paths read the scheduler directly.
   Scheduler& scheduler_;
   Executor& executor_;
   // The engine's StructuredOutputManager (null when structured output is not

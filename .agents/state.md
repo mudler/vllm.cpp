@@ -2219,3 +2219,358 @@ non-CUTLASS pieces in worktree `vllm.cpp-codex-triton-aot-analysis`.
    `VT_GDN_OUT_BF16=1` before considering any default flip.
 4. Re-run production-vLLM comparisons only after the CUDA build is green; no
    throughput claim was made in this session.
+
+## 2026-07-10 — `QUANT-GGUF-COMPUTE` split into three READY leaf specs (ROAD-V1-C4 gate)
+
+**What landed (docs-only spike, `CLAIM-QGC-LEAVES`, released):** the umbrella
+`QUANT-GGUF-COMPUTE` row is now a block row over three claim-sized `READY`
+leaves, each with a full spike-gate spec grounded in the pinned llama.cpp
+`237ad9b96` and the B4 decision measurement (parity-ledger.md L290: llama.cpp
+CPU ahead 54–75× decode / ≈1,480× prefill / 2.65× peak RSS on the same GGUF):
+
+- `QUANT-GGUF-CPU-THREADPOOL` — [specs/gguf-cpu-threadpool.md](specs/gguf-cpu-threadpool.md):
+  ggml threadpool/barrier/chunk port into `src/vt/cpu/`, GEMM chunking first;
+  gates = bit-identical determinism at 1/3/20 threads + ≥10× decode on the B4
+  recipe. No dependencies — claim this first.
+- `QUANT-GGUF-CIQ-GEMM` — [specs/gguf-compute-in-quant-gemm.md](specs/gguf-compute-in-quant-gemm.md):
+  tensor-traits compute-in-quant GEMM (activation Q8_0/Q8_K quant + per-type
+  vec_dot) for Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0; portable generic tier → x86/Arm
+  SIMD tiers → repack/interleave tier; final gate = match/beat llama.cpp on
+  decode/prefill/RSS, token-exact vs the same-file oracle.
+- `QUANT-GGUF-KEEPQ-LOADER` — [specs/gguf-keep-quant-loader.md](specs/gguf-keep-quant-loader.md):
+  block-resident weights ([N,K], no transpose), per-tensor routing,
+  `VT_CPU_REF=1` dequant-oracle switch; DECISION recorded: merge bench branch
+  `7c91a42` (B4 loader arm) into main as work row L1.
+
+Matrix: umbrella → `READY` + three new leaf rows (QUANT pin 78→81 in
+check-agent-record.py); roadmap `ROAD-V1-C4` next gate now "claim the
+threadpool leaf". Dequant-to-bf16 stays the parity oracle; compute-in-quant is
+gated against llama.cpp, not against our old path.
+
+**Next:** claim `QUANT-GGUF-CPU-THREADPOOL` (W1 pool core), merge `7c91a42`
+(loader L1), then keep-quant residency + CIQ GEMM tier 0.
+
+## 2026-07-10 — async serving + overlap scheduling spiked (ROAD-V1-C6 READY; blocks order 0)
+
+**What landed (docs-only spike, `CLAIM-ASYNC-SPIKE-1`, released):** joint
+spike [specs/async-serving.md](specs/async-serving.md) covering four engine
+rows, all now `READY`: `SERVE-ASYNC-LLM` (AsyncLLM-equivalent + real SSE +
+C-ABI streaming), `ENG-CORE-BUSY-LOOP` (engine thread + input/output queue
+split), `ENG-ASYNC-SCHED` (AsyncScheduler placeholders + depth-2 batch queue +
+copy-stream D2H + GPU-resident last-sampled combine), `ENG-PRIORITY-SCHED`
+(priority heap + preemption victim). Work breakdown W1→W4, each independently
+gateable; tests-to-port inventoried from `tests/v1/engine/test_async_llm.py`,
+`tests/v1/core/test_async_scheduler.py`, the 11 priority scheduler cases, and
+the OpenAI streaming/bench-serve suites.
+
+**New priority, recorded:** (1) `SERVE-GATE-ONLINE` found our example server
+executes the engine synchronously per request with precomputed SSE
+(`serving_completion.h:9-12`, `api_server.cpp:26,86,130`), so TTFT/TPOT/ITL
+are structurally unmeasurable — `SERVE-ASYNC-LLM` re-promoted T1→T0 and
+recorded as a BLOCKING dependency of roadmap order 0 (`ROAD-V1-A` row +
+engine-matrix row + handoff queue). (2) B3: async/overlap scheduling is
+vLLM's DEFAULT at pin e24d1b24 (`vllm/config/vllm.py:990-1038`) — unmet
+mirror obligation, now leaf W3. Engine-matrix summary gained SPIKE/ACTIVE
+columns so lifecycle tallies sum to the row count.
+
+**Next:** claim W1 (`ENG-CORE-BUSY-LOOP`), then W2 (`SERVE-ASYNC-LLM`) to
+unblock the online gate's latency axes; W3 async-default mirror A/B'd on both
+gate models; W4 priority any time.
+
+## 2026-07-10 — Expert-streaming-from-disk spike (`ENG-EXPERT-STREAM` READY; ds4 scan + measured math)
+
+**User-directed spike (CLAIM-EXPSTREAM-SPIKE-1, released):** scanned
+antirez/ds4 (DwarfStar @ 80ebbc3 — DeepSeek V4 Flash/PRO engine with SSD
+expert streaming on Metal/CUDA/ROCm) and wrote
+[specs/expert-streaming.md](specs/expert-streaming.md). ds4's design: routed
+experts in a per-(layer,expert) mlocked slab cache, misses pread(2) from the
+GGUF by a 9-18-thread pool inside the per-layer router→FFN window,
+hotness-decayed-LFU eviction (halve every 16 tokens, LRU tiebreak, in-flight
+protection), full-layer SEQUENTIAL streaming for long prefill + decode-cache
+seeding from the last ≤64 prefill tokens, shipped hotlist preload, and a
+`--simulate-used-memory` honesty tool. ds4 publishes almost no numbers (only:
+auto ~59GB cache best on M5 Max PRO q2); its profiler measures hit rates per
+deployment.
+
+**Measured this spike (dgx):** 35B-A3B NVFP4 per-expert bytes from the real
+safetensors header = 1,769,472 B x 256 experts x 40 layers = 16.88 GiB
+routed experts (~77% of ~22 GiB weights); NVMe `/dev/nvme0n1` O_DIRECT: 5.4
+GB/s sequential, 2.76 GB/s single-thread random expert-size preads, ~5.0-5.3
+GB/s with 4-16 threads. Worst-case decode traffic 540 MiB/token (top-8 x 40
+layers). Verdict: viable capacity feature at c1-c4 (I/O bound ≥17.7 tok/s at
+50% resident, ~8.4 GiB freed; gates G1-G6 in spec incl. token-exactness,
+≥7.5 GiB measured reduction, ≥12 tok/s floor at f=0.5); NOT the
+high-concurrency gate regime (B=64 touches ~88% of all experts/step → I/O
+~orders below the ~2.8k tok/s gate); tmpfs is a non-tier on GB10 (unified
+memory; dgx /tmp is ext4 on the same NVMe anyway).
+
+**Mirror floor settled at the pin (one line each):** (1) load-time streaming
+PRESENT (`runai_streamer` + loaders, `model_loader/__init__.py:33-66`) — not
+this feature; (2) `cpu_offload_gb` PRESENT, v1-supported, blanket
+per-parameter UVA (`config/offload.py:23`, `offloader/uva.py:64-108`), name-
+targetable but NOT router-aware — inventoried as new row `ENG-WEIGHT-OFFLOAD`;
+(3) inference-time disk/SSD expert paging ABSENT in-pin (searched fused_moe/,
+offloader/, config, loaders; eplb is EP rebalancing) → `ENG-EXPERT-STREAM` is
+surpass-track, additive/default-off/own-config-namespace for sync safety.
+
+**Rows:** engine-matrix +2 (`ENG-EXPERT-STREAM` READY, `ENG-WEIGHT-OFFLOAD`
+INVENTORIED; checker ENGINE_ROWS 88→90), feature-matrix §2 +2, roadmap
+`ROAD-V1-D4` INVENTORIED→PARTIAL, handoff queue #10. **Next:** claim W1
+(expert cache manager, CPU-testable), W2 (pread pool), then W3 (bank +
+engine hook) on dgx.
+
+## 2026-07-10 — ENG-CORE-BUSY-LOOP (W1) implemented: EngineCoreProc busy loop + queue split + InprocClient (GATING)
+
+First leaf of the async-serving block (`ROAD-V1-C6`, spec
+[async-serving.md](specs/async-serving.md) W1) landed by `CLAIM-BUSY-LOOP-1`
+(claim released this change):
+
+- **`EngineCoreProc : EngineCore`** (`include/vllm/v1/engine/core_proc.h`,
+  `src/vllm/v1/engine/core_proc.cpp`) — 1:1 port of the upstream busy loop
+  (`vllm/v1/engine/core.py:915-916,1259-1480` @ e24d1b24): input/output
+  `BlockingQueue`s (queue.Queue semantics), `run_busy_loop` =
+  `_handle_shutdown` → `_process_input_queue` → `_process_engine_step`,
+  abort-mode (timeout 0: finish-all-ABORTED + abort outputs) and drain-mode
+  shutdown, ADD rejected with an abort output during shutdown, WAKEUP and
+  ENGINE_CORE_DEAD sentinels, `EngineCoreRequestType` values preserved.
+  step_fn selection mirrored; `max_concurrent_batches > 1` throws until W3
+  lands `step_with_batch_queue`.
+- **`InprocClient`** (`core_client.{h,cpp}`) — SyncMPClient collapsed to the
+  in-proc queue split (recorded deviation D2): owns the engine `std::thread`
+  under the run_engine_core fatal-error guard, blocking `get_output` that
+  raises `EngineDeadError` on the dead sentinel, `add_request_async` /
+  `abort_requests_async` shapes kept for W2's AsyncLLM and a future
+  multi-proc client.
+- **Sync path untouched**: additive files only; `EngineCore` members flipped
+  private→protected for the upstream subclass shape. `LLMEngine`/server
+  behavior unchanged (W2 rewires serving onto this client).
+- **Tests** (`tests/vllm/v1/test_engine_core_proc.cpp`): upstream
+  `tests/v1/engine/test_engine_core_client.py` sync-cycle assertions
+  (normal/abort/abort-after-finish) ported T-unit over the RunnerStub seam +
+  busy-loop shutdown/dead-sentinel/batch-queue-reject cases. CPU ctest
+  93/93; 25/25 stability reruns; clean full build, zero warnings.
+- **GATING, honestly**: G1 (both greedy gates re-run same binary) and G4
+  (offline no-regression A/B) need the GB10, which `CLAIM-SERVE-GATE-1`
+  holds (flock holder + queued waiter at check time) — per the
+  no-queueing-behind-the-campaign rule they are DEFERRED to the next
+  GPU-idle window and recorded in the engine-matrix row + handoff queue.
+  Row `GATING`, not `DONE`. README untouched: no externally-visible change
+  until W2 rewires serving.
+
+**Next:** claim W2 (`SERVE-ASYNC-LLM`) on the merged queue split (unblocks
+`ROAD-V1-A` latency axes); run W1's G1/G4 when the GPU frees; W3 async
+default mirror; W4 priority separable.
+
+## 2026-07-10 — W4 `ENG-PRIORITY-SCHED` implemented (async-serving block leaf 4), GATING
+
+Ported vLLM priority scheduling 1:1 (pin e24d1b24), fully separable from W1–W3.
+- **PriorityRequestQueue** (`src/vllm/v1/core/sched/request_queue.cpp:101`,
+  header `include/.../request_queue.h:112`): binary heap over `Request*` ordered
+  by `RequestPriorityLess` (`Request.__lt__`: (priority, arrival_time,
+  request_id, identity)) via std::*_heap; `create_request_queue(kPriority)` now
+  returns it instead of throwing.
+- **Priority preemption** (`src/vllm/v1/core/sched/scheduler.cpp:178`): under the
+  priority policy the OOM victim is `max(running, key=(priority, arrival_time))`
+  with the scheduled-this-step undo (restore budget, drop blocks, `req_index -=
+  1`), mirroring `scheduler.py:546-572`. FCFS tail-pop unchanged; **default stays
+  FCFS** (byte-identical).
+- **`priority` plumbing**: `Request.priority` + `RequestPriorityLess`
+  (`request.{h,cpp}`), `EngineCoreRequest.priority`, OpenAI `priority` request
+  field (`protocol.{h,cpp}`) → serving handlers → `LLMEngine::add_request`/
+  `generate` → `InputProcessor::process_inputs` → `EngineCoreRequest` → `Request`.
+- **Policy config surface**: `SchedulerPolicyFromString`/`SchedulerPolicyToString`
+  (`config/scheduler.cpp:21`, reject-unknown mirrors upstream `SchedulingPolicy(value)`
+  ValueError) + `EngineParams.policy` → `MakeSchedulerConfig`.
+- **Tests ported** (test-porting.md, same change): 12 `test_priority_scheduling_*`
+  cases → `tests/vllm/v1/test_scheduler.cpp:674` (from `test_scheduler.py:2382-2856,2978`,
+  incl. the preemption-then-resumption-out-of-KV V2/no-connector case); 14
+  priority-queue cases + the seeded random ordering/heap-property property test →
+  `tests/vllm/v1/test_request_queue.cpp:238,429` (from `test_priority_scheduler_random.py`).
+  DEVIATION recorded: M1.3 KVCacheManager forces caching ON (enable_caching=false
+  deferred), so the ported block-math cases give each request a DISTINCT prompt to
+  make caching-ON behaviorally equal upstream's caching-OFF; EC/KV-connector
+  `test_scheduler.py:3769` variant not ported (no connectors).
+- **G2 green**: clean full CPU build zero warnings; ctest **93/93**
+  (test_scheduler 29 cases/238 asserts, test_request_queue 26 cases/1839 asserts).
+- **GATING, honestly**: G1 (both greedy engine gates re-run priority-vs-fcfs
+  token-exactness) needs the GB10, which `CLAIM-SERVE-GATE-1` holds — DEFERRED to
+  the next GPU-idle window and recorded in the engine-matrix row + handoff queue.
+  Priority is NOT the default, so the greedy gates run FCFS unchanged; the
+  priority-vs-fcfs token-exact A/B runs before the row may claim DONE. Row
+  `GATING`, not `DONE`. Server surface: added `--scheduling-policy fcfs|priority`
+  to `examples/server/main.cpp` (→ `EngineParams.policy`), mirroring vLLM's flag;
+  reject-unknown via `SchedulerPolicyFromString`. README arch/quant/accel tables
+  untouched (priority is a scheduler knob, not a new arch/backend/quant surface;
+  default behavior is unchanged FCFS).
+
+**Next:** claim W2 (`SERVE-ASYNC-LLM`); run W1+W4 GPU G1 when the GPU frees;
+W3 async-overlap default mirror.
+
+## 2026-07-10 — C3 M-mtp-0 stream recovered and claimed (`SPEC-MTP` ACTIVE)
+
+Recovered interrupted task `a3002072f42ec1b7f` from its harness transcript.
+The prior session ended at its model rate limit after protocol/upstream/local
+source inspection and a clean CPU baseline build; it issued no Edit/Write
+operation, created no commit, and left no live process. Its named worktree and
+branch had already disappeared, so they were recreated exactly at
+`.claude/worktrees/agent-a3002072f42ec1b7f` /
+`worktree-agent-a3002072f42ec1b7f` from `origin/main` without touching the
+dirty root worktree.
+
+`CLAIM-MTP-0` now owns only the spike's M-mtp-0 leaf: load the BF16 `mtp.*`
+safetensors tensors for the 27B dense and 35B MoE gate checkpoints, mirror the
+Qwen3.5 MTP head/model forward for standalone captured-hidden-state parity,
+and port the matching upstream loader/propose contract tests. `SPEC-MTP` and
+the two Qwen3.5 MTP model rows are `ACTIVE`; scheduler/rejection/GDN-spec/GGUF
+work remains outside this claim. No GPU work will run while
+`CLAIM-SERVE-GATE-1` owns the GB10; both-checkpoint oracle head parity is queued
+for the first released window.
+
+**Next:** commit/push the claim transition, implement and CPU-test M-mtp-0,
+then hand off the exact DGX oracle commands if the serve campaign still holds
+the GPU.
+
+## 2026-07-10 — C2 model-factory spike recovered, corrected, and READY
+
+Recovered the stopped `aea89f315855d3bfb` stream after it had written an
+uncommitted draft and matrix edit but had not claimed, updated the roadmap, or
+committed. The takeover first established `CLAIM-MODEL-FACTORY-SPIKE-1`, then
+validated the draft against pinned `registry.py`, its tests, and the live C++
+loader/runner path. The accepted
+[model-factory-registry.md](specs/model-factory-registry.md) contract makes
+`MODEL-FACTORY-registry` independently claimable: ordered architecture lookup,
+type-erased factory, exact previous/OOT error branches, subset-registry default
+message parity, capability metadata, both existing Qwen paths re-registered,
+and both gate models required for no-regression closure.
+
+Corrections made during recovery: the pin has 32 previously-supported entries
+(not 36); the full oracle's 353-entry supported list cannot byte-match our
+implemented subset, so that branch is compared against a pinned subset
+`_ModelRegistry`; the registry is a central ordered table (not cross-TU static
+initialization); the public header lives under `include/`; and `score_type` is
+included consistently with the ported registry-property test.
+
+No runtime/support state changed. `MODEL-FACTORY-registry` is `READY`; the next
+C2 implementation is that row, followed by a separately spiked Llama-dense
+family leaf.
+
+## 2026-07-10 — performance checks are per feature/milestone, before stacking
+
+User reaffirmed that every feature or milestone capable of affecting speed
+must be benchmarked immediately so regressions are caught at their source, not
+only at a later release gate. The existing fresh-denominator and every-axis
+rules already required this; `workflow.md` and `benchmark-protocol.md` now make
+the operational checkpoint explicit: correctness first, same-binary pre/post
+A/B, fresh same-box vLLM or backend-native floor, throughput/latency/memory,
+2–3 uncontended reproductions, and exact ledger recipe. A second
+speed-sensitive milestone is not stacked until the first checkpoint is
+recorded. Hardware deferral means `GATING` plus a reproducible handoff, never
+an unmeasured `DONE` claim.
+
+## 2026-07-10 — expert-streaming workflow recovered for grounding repair
+
+The expert-streaming map/verify workflow completed its source maps and two
+adversarial verification passes, but its writer hit the session limit before
+landing corrections. Live-source review confirms that the capacity-regime and
+NVMe bandwidth math remain useful, while the accepted draft is not yet an
+implementation contract: the GB10 Marlin kernel indexes one dense contiguous
+expert base by stride rather than following the draft's pointer table; original
+per-expert NVFP4 tensors are repacked once into that dense layout and freed;
+the safetensors reader exposes mmap spans but does not retain public shard/file
+offset metadata for later pread; and router-selected IDs remain device-side,
+making miss discovery, graph capture, and synchronization explicit design
+work. `ENG-EXPERT-STREAM` therefore moved `READY -> SPIKE` under
+`CLAIM-EXPSTREAM-GROUND-1`. No implementation starts until the port map,
+dependencies, tests, gates, and claim-sized WBS match those facts.
+
+## 2026-07-10 — C1 drop-in kernel ABI spike accepted (`BACKEND-ABI-VT` READY)
+
+Recovered the predecessor's uncommitted C1 draft after its rate limit, then
+re-grounded it against pinned vLLM `e24d1b24`, the dependency launch edges, and
+the shipped CUTLASS NVFP4, Marlin, and FA-2 adapters. The accepted contract is
+[specs/dropin-kernel-abi.md](specs/dropin-kernel-abi.md).
+
+Two adversarial corrections are load-bearing: (1) workspace identity is
+`Device + Queue::id + native handle + OpId + slot`, not the stream handle alone
+(default streams can alias across devices and handles can be recycled); (2)
+packed `DType::kI8` is storage only, so FP4/FP8/UE8M0 semantics travel as an
+explicit upstream-compatible `ScalarTypeId` plus a layout descriptor. The
+M0.6 choices are now fixed: code registries remain per `DeviceType`, resource
+APIs become explicit per `Device`; all backend fn aliases stay in `ops.h`; and
+output dtype sets are per-op with no silent narrowing.
+
+Decision: additive ABI spine first, then **per-family incremental migration**.
+Preparation may use disjoint worktrees, but every speed-sensitive family
+migration completes its own old/new same-binary correctness, nsys, fresh-vLLM
+every-axis, peak-memory, and 2–3-run reproduction checkpoint before another
+stacks. First implementation order: `BACKEND-ABI-VT` spine → proven
+NVFP4/FP8/Marlin adapters → core/EW/KV/attention/MoE/sampling; GDN waits for
+`CLAIM-PR3`; collectives/spec-decode and ROCm wait for their implementation/
+hardware leaves. No code, support status, README, ledger, or porting-inventory
+claim changed in this docs-only spike.
+
+Validation: `python3 scripts/check-agent-record.py` and the 13-case mutation
+suite pass; matrix counts remain ENGINE=90, MODEL=323, QUANT=81, KERNEL=30,
+BACKEND=51. Spike claim released; `BACKEND-ABI-VT` is `READY`.
+
+## 2026-07-10 — corrected expert-streaming contract accepted (`READY`)
+
+The grounding takeover finished the stopped workflow's write phase and released
+`CLAIM-EXPSTREAM-GROUND-1`. The corrected spec preserves ds4's cache policy,
+pread pool, capacity-mode scope and measured NVMe math while adapting them to
+our actual execution chain. Runtime Marlin uses one dense base and
+`expert_id * stride`, so streaming uses fixed contiguous C-slot arrays and
+rewrites logical router IDs to slot IDs before `moe_align`; it does not promise
+pointer-table indirection. The loader builds a versioned pre-repacked bank while
+safetensors shard spans are alive and, in streaming mode, never creates the
+16.88 GiB host expert vectors or the full-E `MoeMarlinResident`. Phase 1 is
+explicitly non-graphed with one router D2H/event wait per MoE layer. Long
+prefill with C<E uses exact chunk filters/scatter accumulation rather than a
+hidden full-layer resident.
+
+The implementation order is W0 nsys/current-c1 baseline, W1 CPU cache policy,
+W2 bank/reader/pread (with its own build/startup/RSS checkpoint), W3 phase-1
+decode (token/memory/off-path/performance gates), then W4 chunked prefill and W5
+locality. Any resident/missing overlap is a new W6 spike after W3 evidence.
+`ENG-EXPERT-STREAM` is READY for W0, not implemented or supported.
+
+## 2026-07-10 — stopped serving and PR3 streams recovered from their worktrees
+
+Root took over `CLAIM-SERVE-GATE-1` and `CLAIM-PR3` without discarding their
+existing remote jobs or evidence. On `dgx.casa`, the completed 35B exact-shape
+sanitizer diagnostic survived all three repetitions and reported no sanitizer
+errors. The second online campaign now owns `/tmp/gpu` for one uninterrupted
+27B ours→vLLM series; ours c1/c2 repetitions are complete and c4 is active.
+Fresh 27B vLLM and both 35B arms remain, so this is progress evidence, not a
+gate result. The first campaign remains invalid diagnostic evidence. The
+every-axis online gate still depends on `SERVE-ASYNC-LLM`, because the current
+server cannot expose genuine TTFT/TPOT/ITL.
+
+The PR3 takeover is grounded in local
+`/home/mudler/_git/vllm.cpp-pr3-validate` and DGX
+`~/work/vllm.cpp-noPy`, both at PR head `85dfb48`. Existing `test_ops_gdn`,
+two-model greedy and scratch-pool A/B jobs remain queued behind the serving
+lock, but they are explicitly preliminary. Review found that the branch has no
+vendored BF16 `gdn_chunko_*` artifacts or MANIFEST entries and its tests do not
+assert Triton dispatch or dirty-buffer reuse; it also predates current main.
+Closure therefore requires current-main integration, artifact regeneration and
+drift-contract updates, assertable dispatch/reuse tests, nsys of vLLM and ours,
+and fresh same-workload performance/correctness denominators. No PR3 row moved
+state in this recovery change.
+
+## 2026-07-10 — crash recovery resumed roadmap order 0 through AsyncLLM W2
+
+The canonical record was reconciled after the host crash: recovery commit
+`80975be` preserves both the stopped-stream evidence and remote
+`BACKEND-ABI-VT` W0 claim `39c8b56`; `scripts/check-agent-record.py` plus all
+13 mutation tests are green.
+The dgx serving campaign survived under its original whole-series GPU lock;
+PR3's queued jobs and the C1/C3/C4 implementation worktrees also survived.
+
+`SERVE-ASYNC-LLM` is now `ACTIVE` under `CLAIM-SERVE-ASYNC-W2-1` in isolated
+worktree `/home/mudler/_git/vllm.cpp-async-llm-w2`. Scope is exactly W2 from
+[async-serving.md](specs/async-serving.md): AsyncLLM/output collector, live
+completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
+ported W2 tests. W3 async scheduling/runner work remains outside this claim.
+CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
+GPU handoffs rather than speculative closure.

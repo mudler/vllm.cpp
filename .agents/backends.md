@@ -35,7 +35,12 @@ lives entirely below them.
 - Quantized-weight layout is backend-negotiated: NVFP4 W4A4 is
   NVIDIA-specific; Metal/Vulkan/XPU lean on GGUF quant kernels (k-quants,
   and their own fp4/int4 paths where hardware supports it).
-- Known M0.6 decisions deferred: backend registry is per-DeviceType (multi-GPU needs per-Device or Alloc(Device,...)); kernel fn-type aliases move to ops.h at second-backend registration; op validation currently pins out=f32 (widen for bf16 CUDA outputs).
+- M0.6 decisions are resolved by the accepted
+  [drop-in ABI spike](specs/dropin-kernel-abi.md): kernel/backend code remains
+  registered per `DeviceType`, while resource APIs become explicit in
+  `Device`; function aliases stay centralized in `ops.h` for every backend;
+  and output dtypes are validated per op (the applicable matmuls already admit
+  f32/bf16) with no silent narrowing.
 
 ## Per-platform status & strategy
 
@@ -104,6 +109,10 @@ kernels can be **dropped in and work** — at least for CUDA and AMD/ROCm:
   without rewriting — the torch::Tensor wrapper is the only part we replace.
 - Applies to future accelerators too where upstream has kernels (ROCm mirrors
   CUDA signatures in csrc; XPU via upstream's SYCL contracts).
-- Design work starts after MVP, informed by the M0.6-M2 kernel experience;
-  until then, new vt CUDA kernels should note their upstream csrc counterpart
-  (if one exists) in a comment to make the later alignment mechanical.
+- The implementation contract is now accepted at
+  [specs/dropin-kernel-abi.md](specs/dropin-kernel-abi.md). It lands an additive
+  device-explicit ABI spine first, then migrates one kernel family at a time;
+  each speed-sensitive migration completes its own same-binary correctness,
+  trace, performance, and memory checkpoint before another stacks. Until the
+  spine lands, new vt CUDA kernels still cite their upstream csrc/dependency
+  counterpart so migration stays mechanical.

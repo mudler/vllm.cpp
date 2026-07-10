@@ -47,6 +47,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 
 namespace vllm {
 
@@ -54,8 +55,17 @@ namespace vllm {
 // form ("fcfs" is the default).
 enum class SchedulerPolicy {
   kFCFS,      // "fcfs": first come first served (arrival order).
-  kPriority,  // "priority": DEFERRED (T1) — priority scheduling not ported.
+  kPriority,  // "priority": handled by (priority, arrival_time) — lower first.
 };
+
+// The wire string for a policy ("fcfs" / "priority").
+const char* SchedulerPolicyToString(SchedulerPolicy policy);
+
+// Parse a policy wire string into the enum. Mirrors upstream's Literal
+// validation + Scheduler.__init__ `SchedulingPolicy(self.scheduler_config.policy)`
+// (scheduler.py:175-178), which raises ValueError on an unknown value; here we
+// throw std::invalid_argument("Unknown scheduling policy: <value>").
+SchedulerPolicy SchedulerPolicyFromString(const std::string& value);
 
 struct SchedulerConfig {
   // ClassVar defaults from upstream.

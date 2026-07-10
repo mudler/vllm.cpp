@@ -27,6 +27,14 @@ and continue. Follow this protocol every session.
      IDs, semantic row fields, lifecycle/spec/claim/DONE integrity, pinned
      inventory size, and mutation proof that malformed rows fail);
    - tests green (op-parity / behavioral / e2e as applicable);
+   - every feature/milestone that can plausibly affect speed, latency,
+     scheduling, memory traffic, loading, or peak memory completes its own
+     [benchmark-protocol](benchmark-protocol.md) checkpoint: same-binary
+     pre/post A/B, fresh same-box applicable floor (vLLM, llama.cpp, or the
+     backend-native oracle), correctness first, every applicable axis, and
+     2–3 uncontended reproducing runs. Do not stack a second speed-sensitive
+     milestone before the first checkpoint is recorded; unavailable hardware
+     leaves the row `GATING` with the exact handoff recipe rather than `DONE`;
    - **committing parity goldens BEFORE their runner? In the SAME commit, add
      the op to `PendingRunnerOps()` in `tests/parity/test_op_parity.cpp`** —
      the harness scans golden dirs eagerly and hard-FAILs an op with no runner
@@ -75,7 +83,7 @@ and false closure commits are rejected.
 ## Practicalities
 
 - Long CUDA builds/benchmarks run on `dgx.casa` over SSH; each claim gets its
-  own `~/work/<claim>/` directory. Gate all GPU execution on `flock /tmp/gpu`
+  own `~/work/<claim>/` directory. Gate GPU execution on `flock /tmp/gpu` whenever 2+ agents may run GPU work in the window (sole owner verified idle via `nvidia-smi` may skip; benchmarks still need an uncontended GPU)
   and hold one lock across a whole A/B/profile sequence, following
   `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
   read-only `nvidia-smi`, and file transfer do not need the lock. Specs/models:

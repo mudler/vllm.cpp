@@ -4,7 +4,7 @@
 
 The gate campaign already built the assets that make expansion cheap: an sm_80+ WMMA/FA-2/Marlin/cuBLASLt kernel set, a Triton-AOT pipeline that retargets by one flag, and a clean `vt::` op-table seam. The winning sequence exploits that, front-loads the near-free reach, runs the two hardware-independent tracks in parallel, and defers the from-scratch backends.
 
-- **Wave 0 (prereq, ~1 wk):** close the two `backends.md:38` structural items — per-`Device` backend registry (currently per-`DeviceType`) and widen the `out=f32` op-validation — plus a CUDA device-capability probe. This unblocks *every* downstream track.
+- **Wave 0 (prereq, ~1 wk):** close the three `backends.md:38` structural items — per-`Device` backend registry (currently per-`DeviceType`), widen the `out=f32` op-validation, and move the kernel fn-type aliases to `ops.h` (deferred M0.6 decision, due at second-backend registration) — plus a CUDA device-capability probe. This unblocks *every* downstream track.
 - **Wave 1 (~2 wk, huge reach, nearly free):** NVIDIA arch fan-out (sm_89/90 first, then sm_80/86). No new kernels; it also *forces the capability-fallback machinery into existence*, which every other GPU vendor reuses.
 - **Wave 2 (parallel, different engineers, no contention):**
   - (a) Async/overlap scheduling — engine-level, benefits all backends, a mirror obligation.

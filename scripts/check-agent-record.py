@@ -15,7 +15,7 @@ AGENTS = ROOT / ".agents"
 
 MATRICES = {
     "MODEL": (AGENTS / "model-matrix.md", 323),
-    "QUANT": (AGENTS / "quantization-matrix.md", 78),
+    "QUANT": (AGENTS / "quantization-matrix.md", 81),
     "KERNEL": (AGENTS / "kernel-matrix.md", 30),
     "BACKEND": (AGENTS / "backend-matrix.md", 51),
 }
@@ -33,7 +33,7 @@ ENGINE_PREFIXES = (
     "ATTN",
     "LOAD",
 )
-ENGINE_ROWS = 83
+ENGINE_ROWS = 90
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

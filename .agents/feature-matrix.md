@@ -36,8 +36,8 @@ instead of it.
 | Prefix caching (APC) | `v1/core/kv_cache_utils.py` | `PARTIAL` T0 | hashing/lookup/reuse subset; align and partial-block primitives remain stubs | `planned: specs/prefix-caching.md` |
 | Preemption (FCFS tail pop, recompute) | `v1/core/sched/scheduler.py` | `ANCHOR-BACKFILL` T0 | FCFS recompute slice | `planned: specs/preemption.md` |
 | CUDA graphs (decode capture/replay, no torch) | `config/compilation.py::cudagraph_mode` | `PARTIAL` T0 | Qwen-specific capture; explicit 35B assertion, generic modes and direct 27B evidence open | `planned: specs/cuda-graphs.md` |
-| **Async/overlap scheduling** | `v1/core/sched/async_scheduler.py` | ☐ T1 (**promoted**) | B3 finding: vLLM's DEFAULT at our pin ⇒ unmet MIRROR obligation (we run synchronous); latency lever | `planned: specs/async-scheduling.md` |
-| Priority scheduling (`policy="priority"`) | `v1/core/sched/request_queue.py` | ☐ T1 | | `planned: specs/priority-scheduling.md` |
+| **Async/overlap scheduling** | `v1/core/sched/async_scheduler.py` | ☐ T1 (**promoted**), spike accepted | B3 finding: vLLM's DEFAULT at our pin ⇒ unmet MIRROR obligation (we run synchronous); latency lever; execution row `ENG-ASYNC-SCHED` is `READY` | [async-serving.md](specs/async-serving.md) |
+| Priority scheduling (`policy="priority"`) | `v1/core/sched/request_queue.py` | ☐ T1, spike accepted | execution row `ENG-PRIORITY-SCHED` is `READY` (W4 leaf, separable) | [async-serving.md](specs/async-serving.md) |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill limits) | `config/scheduler.py` | ☐ T1 | | `planned: specs/partial-prefill-concurrency.md` |
 | `step_with_batch_queue` (pipelined batch queue) | `v1/engine/core.py` | ☐ T1 | | `planned: specs/batch-queue-step.md` |
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | `PARTIAL` T1 | fields/internal handling exist; scheduler registry and public stream-interval wiring are absent | `planned: specs/scheduler-knobs.md` |
@@ -60,6 +60,8 @@ instead of it.
 | KV events (block create/evict publish) | `config/kv_events.py` | ☐ T2 | | `planned: specs/kv-events.md` |
 | MLAAttentionSpec (latent KV) | `v1/kv_cache_interface.py` | ☐ T2 | with DeepSeek family | `planned: specs/mla-kv-spec.md` |
 | Sizing: `gpu_memory_utilization`, block overrides | `config/cache.py` | `PARTIAL` T0 | watermark/fixed loader inputs exist; public utilization/cache-byte/override policy absent | `planned: specs/kv-sizing.md` |
+| Weight CPU offload (`cpu_offload_gb` UVA per-parameter + layer-group `PrefetchOffloader`) | `config/offload.py`; `model_executor/offloader/` | ☐ T2 | v1-supported at the pin; blanket/name-targeted, NOT router-aware; mirror floor for expert streaming (engine row `ENG-WEIGHT-OFFLOAD`) | `planned: specs/weight-offload-uva.md` |
+| Expert streaming from disk (routed-MoE experts paged NVMe→GPU on router output, budgeted resident cache) | absent in-pin (surpass-track); design ref antirez/ds4 | ☐ T2 | corrected engine row `ENG-EXPERT-STREAM` READY: bank-only loader, fixed contiguous Marlin slots, logical→slot remap, explicit router D2H, chunked prefill; W0 trace/baseline first | [expert-streaming.md](specs/expert-streaming.md) |
 
 ## 3. Parallelism & scale-out
 
@@ -84,7 +86,7 @@ Transformers-compatibility path. The complete alias-preserving inventory is
 | ID | Category / mechanism | Pinned upstream | State | Grounded summary | Detailed evidence / spike |
 |---|---|---|---|---|---|
 | `MODEL-GATE-QWEN35` | Qwen3.5/3.6 dense + MoE wrappers | `models/registry.py:556-560` | `PARTIAL` | 27B/35B **text submodels** pass token/perf gates; both upstream IDs are multimodal wrappers and their ViT/merger paths are absent | model matrix + existing Qwen specs |
-| `MODEL-FACTORY` | architecture -> model factory + reject unknown | `models/registry.py:998-1402` | `PARTIAL` | direct registry covers one MoE ID; dense works through `num_experts==0` bypass that can misroute unrelated dense models | first C2 leaf spike |
+| `MODEL-FACTORY` | architecture -> model factory + reject unknown | `models/registry.py:998-1404` | `PARTIAL` | direct registry covers one MoE ID; dense works through `num_experts==0` bypass that can misroute unrelated dense models; execution row `MODEL-FACTORY-registry` is READY | [model-factory-registry.md](specs/model-factory-registry.md) |
 | `MODEL-TEXT` | 130 text-generation IDs | `models/registry.py:71-208` | `INVENTORIED` | 0/130 static text-generation IDs directly supported | model matrix |
 | `MODEL-POOLING` | embedding, late-interaction, reward, token/sequence classification | `models/registry.py:210-329` | `INVENTORIED` | five distinct work fronts; no pooling runtime | model matrix |
 | `MODEL-MM` | 114 multimodal IDs | `models/registry.py:331-580` | `PARTIAL` | 2 wrappers run text-only; encoder/processors/cache absent | model matrix |
@@ -140,7 +142,7 @@ MTP heads (we currently skip `mtp.*` at load).
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/worker/gpu/spec_decode/`, `models/qwen3_5_mtp.py` | 🚧 **spec written** | biggest single-model win; NB both gates are GDN hybrids so the GDN spec path is on milestone 1 | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) |
+| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/worker/gpu/spec_decode/`, `models/qwen3_5_mtp.py` | 🚧 **ACTIVE: M-mtp-0** | safetensors loader + standalone MTP head parity claimed for both gate checkpoints; NB both gates are GDN hybrids so the GDN spec path is on milestone 1 | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) |
 | Rejection sampler | `v1/worker/gpu/spec_decode/rejection_sampler.py` | 🚧 covered by MTP spec | prerequisite for all spec paths | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (2.4) |
 | GDN spec segments (metadata + slot-snapshot rollback) | `v1/attention/backends/gdn_attn.py`, `fla/ops/fused_sigmoid_gating.py` | 🚧 covered by MTP spec | on milestone 1 (both gates hybrid) | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (3) |
 | DFlash (block-diffusion drafter) | in-pin + published drafts for our models | 🚧 **spec written** (after MTP) | DGX-Spark community container exists; GDN slot memory at k=15 flagged | [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md) |
@@ -157,7 +159,7 @@ MTP heads (we currently skip `mtp.*` at load).
 | `stream_options` / `include_usage` | `protocol.py` | ☐ T1 | verified absent | `planned: specs/stream-options.md` |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | ☐ T1 | | `planned: specs/utility-endpoints.md` |
 | Chat templating (Jinja subset, minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | `ANCHOR-BACKFILL` T0 | bounded Qwen3.6 minja/Jinja subset; generic template parity open | `planned: specs/chat-templating.md` |
-| AsyncLLM-equivalent streaming engine API | `v1/engine/async_llm.py` | ☐ T1 | today: sync engine + server-side engine mutex (verified) | `planned: specs/async-llm-api.md` |
+| AsyncLLM-equivalent streaming engine API | `v1/engine/async_llm.py` | ☐ **T0 (re-promoted 2026-07-10)**, spike accepted | today: sync engine + server mutex + precomputed SSE ⇒ TTFT/TPOT/ITL structurally unmeasurable; BLOCKS `SERVE-GATE-ONLINE`/`ROAD-V1-A`; execution rows `SERVE-ASYNC-LLM` + `ENG-CORE-BUSY-LOOP` are `READY` | [async-serving.md](specs/async-serving.md) |
 | C API library (llama.cpp-style, 11-symbol ABI) | — (our packaging) | `ANCHOR-BACKFILL` T0 | dlopen and LocalAI-style FFI proof; not a claim of LocalAI integration | `planned: specs/c-api-library.md` |
 | Rich C++ API (`LLM`/`AsyncLLM` mirror) | `entrypoints/llm.py` | ☐ T1 | | `planned: specs/cpp-api.md` |
 | CLI: `serve` + `bench {latency,throughput,serve}` | `entrypoints/cli/` | `PARTIAL` T0 | separate server/bench binaries and one in-process benchmark; no matching command family | `planned: specs/cli-serve-bench.md` |

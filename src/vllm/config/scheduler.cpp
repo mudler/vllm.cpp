@@ -8,6 +8,27 @@
 
 namespace vllm {
 
+const char* SchedulerPolicyToString(SchedulerPolicy policy) {
+  switch (policy) {
+    case SchedulerPolicy::kFCFS:
+      return "fcfs";
+    case SchedulerPolicy::kPriority:
+      return "priority";
+  }
+  return "fcfs";
+}
+
+SchedulerPolicy SchedulerPolicyFromString(const std::string& value) {
+  if (value == "fcfs") {
+    return SchedulerPolicy::kFCFS;
+  }
+  if (value == "priority") {
+    return SchedulerPolicy::kPriority;
+  }
+  // Mirrors upstream SchedulingPolicy(value) raising ValueError.
+  throw std::invalid_argument("Unknown scheduling policy: " + value);
+}
+
 void SchedulerConfig::PostInit(int max_model_len_in, bool is_encoder_decoder) {
   max_model_len = max_model_len_in;
 

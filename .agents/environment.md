@@ -13,7 +13,7 @@
   - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
     parity oracle (golden op dumps via `tools/parity/`).
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds
-    `flock /tmp/gpu` for the whole job or multi-arm series, following
+    `flock /tmp/gpu` for the whole job or multi-arm series WHEN other agents may run GPU work concurrently (sole owner verified idle via `nvidia-smi` may skip), following
     `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
     source inspection and file transfer do not need the lock. Never kill an
     unowned PID.

@@ -15,8 +15,8 @@
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params,
 //     lora_request, cache_salt (prefix caching salt), events /
-//     kv_transfer_params, spec_token_ids, priority /
-//     client_index / __lt__ (priority scheduling), streaming / resumable
+//     kv_transfer_params, spec_token_ids,
+//     client_index, streaming / resumable
 //     state, prefill_stats, async-scheduling counters
 //     (num_output_placeholders, async_tokens_to_discard,
 //     next_decode_eligible_step, last_sched_seq), num_nans_in_logits,
@@ -109,9 +109,13 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status);
 struct Request {
   // block_hasher mirrors upstream's `block_hasher=None` default: null => prefix
   // caching off (update_block_hashes() is a no-op, block_hashes stays empty).
+  // `priority` mirrors upstream Request(priority=0): the scheduling priority
+  // used by the priority policy (lower value = handled first). It is appended
+  // after block_hasher (rather than kept in upstream's kwargs position) so the
+  // existing positional call sites are unaffected; default 0 keeps FCFS parity.
   Request(std::string request_id, std::vector<int32_t> prompt_token_ids,
           SamplingParams sampling_params, double arrival_time,
-          BlockHasher block_hasher = nullptr);
+          BlockHasher block_hasher = nullptr, int priority = 0);
 
   // from_engine_core_request: build a Request from the frontend->core message.
   // Mirrors upstream Request.from_engine_core_request for the T0 fields
@@ -153,6 +157,10 @@ struct Request {
   // rather than a variant<int, string>.
   std::optional<int> stop_reason;
   double arrival_time = 0.0;
+  // Scheduling priority (upstream Request.priority, request.py:83). Lower value
+  // = handled earlier by the priority policy; ties broken by arrival_time then
+  // request_id (see RequestPriorityLess). Ignored under the default FCFS policy.
+  int priority = 0;
   // Set at construction from prompt_token_ids.size() (upstream:
   // length_from_prompt_token_ids_or_embeds).
   int num_prompt_tokens = 0;
@@ -207,5 +215,17 @@ struct Request {
   bool IsFinished() const;
   std::optional<FinishReason> GetFinishedReason() const;
 };
+
+// Request.__lt__ (request.py:309-320): the total order the priority scheduler
+// uses. A request compares "less" (i.e. is scheduled earlier) when it has a
+// smaller priority; ties break on the earlier arrival_time, then the smaller
+// request_id, then object identity (upstream `id(self) < id(other)`). The
+// request_id + pointer tie-breakers make this a STRICT TOTAL order (distinct
+// requests never compare equal), so heap pop order is deterministic and matches
+// upstream heapq. Returns true iff `a` should be handled before `b`.
+bool RequestPriorityLess(const Request& a, const Request& b);
+inline bool RequestPriorityLess(const Request* a, const Request* b) {
+  return RequestPriorityLess(*a, *b);
+}
 
 }  // namespace vllm::v1

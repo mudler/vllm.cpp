@@ -80,7 +80,8 @@ class LLMEngine {
   // output_processor.add_request BEFORE engine_core.add_request (upstream order,
   // :274-276). Returns the request id.
   std::string add_request(const std::string& request_id,
-                          const std::string& prompt, SamplingParams params);
+                          const std::string& prompt, SamplingParams params,
+                          int priority = 0);
 
   // step (llm_engine.py:296): get the EngineCore outputs -> process_outputs ->
   // abort any reqs the detokenizer stopped -> return the RequestOutputs.
@@ -110,7 +111,7 @@ class LLMEngine {
   // this is only the final delta — drive step() directly to accumulate streaming
   // deltas.
   RequestOutput generate(const std::string& prompt, SamplingParams params,
-                         const std::string& request_id = "0");
+                         const std::string& request_id = "0", int priority = 0);
 
  private:
   InputProcessor& input_processor_;

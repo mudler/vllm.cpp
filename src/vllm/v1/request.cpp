@@ -5,6 +5,7 @@
 #include "vllm/v1/request.h"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -53,13 +54,14 @@ std::optional<FinishReason> GetFinishedReason(RequestStatus status) {
 Request::Request(std::string request_id,
                  std::vector<int32_t> prompt_token_ids,
                  SamplingParams sampling_params, double arrival_time,
-                 BlockHasher block_hasher)
+                 BlockHasher block_hasher, int priority)
     : request_id(std::move(request_id)),
       prompt_token_ids(std::move(prompt_token_ids)),
       sampling_params(std::move(sampling_params)),
       num_computed_tokens(0),
       status(RequestStatus::kWaiting),
       arrival_time(arrival_time),
+      priority(priority),
       num_prompt_tokens(static_cast<int>(this->prompt_token_ids.size())),
       block_hasher_(std::move(block_hasher)) {
   // request.py:87-92: build the per-request structured-output state from the
@@ -79,7 +81,25 @@ Request Request::FromEngineCoreRequest(const EngineCoreRequest& request,
                                        BlockHasher block_hasher) {
   return Request(request.request_id, request.prompt_token_ids,
                  request.sampling_params, request.arrival_time,
-                 std::move(block_hasher));
+                 std::move(block_hasher), request.priority);
+}
+
+// Request.__lt__ (request.py:309-320): priority, then arrival_time, then
+// request_id, then object identity (upstream id(self) < id(other)). std::less
+// gives a portable total order for the pointer tie-break; it is only ever
+// reached when two distinct requests share a request_id, which cannot happen
+// for the engine's unique ids — it exists purely to mirror upstream 1:1.
+bool RequestPriorityLess(const Request& a, const Request& b) {
+  if (a.priority != b.priority) {
+    return a.priority < b.priority;
+  }
+  if (a.arrival_time != b.arrival_time) {
+    return a.arrival_time < b.arrival_time;
+  }
+  if (a.request_id != b.request_id) {
+    return a.request_id < b.request_id;
+  }
+  return std::less<const Request*>{}(&a, &b);
 }
 
 // num_tokens: len(_all_token_ids) == prompt + output.

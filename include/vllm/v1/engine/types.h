@@ -15,7 +15,7 @@
 // without reshaping the structs:
 //   EngineCoreRequest: mm_features (multimodal), pooling_params, lora_request,
 //     cache_salt, data_parallel_rank, prompt_embeds, prompt_is_token_ids,
-//     client_index, current_wave, priority, trace_headers, resumable,
+//     client_index, current_wave, trace_headers, resumable,
 //     external_req_id, reasoning_ended / reasoning_parser_kwargs,
 //     abort_immediately, and the params property. (eos_token_id is NOT a field
 //     upstream either — it rides on sampling_params.eos_token_id.)
@@ -74,6 +74,10 @@ struct EngineCoreRequest {
   // does NOT re-validate. The model's EOS id rides on sampling_params.eos_token_id.
   SamplingParams sampling_params;
   double arrival_time = 0.0;
+  // priority (engine/__init__.py EngineCoreRequest.priority): the scheduling
+  // priority carried from the frontend request (OpenAI `priority` field) into
+  // Request.priority. Default 0 keeps FCFS parity when unset.
+  int priority = 0;
 };
 
 // SamplerOutput (vllm/v1/outputs.py): the raw sampler result for a step.

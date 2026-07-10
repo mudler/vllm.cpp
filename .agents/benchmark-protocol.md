@@ -64,6 +64,16 @@ CUDA-graph config (see above), not `--enforce-eager`.**
 
 ## How to run it (every change that could affect perf, and every gate check)
 
+**Feature/milestone checkpoint — do not stack unbenchmarked speed-sensitive
+changes.** Each feature or milestone that can plausibly change runtime speed,
+latency, launch structure, memory traffic, scheduling, batching, loading, or
+peak memory is its own benchmark checkpoint. Finish and record its isolated
+same-binary A/B plus the fresh applicable floor before layering the next such
+change on top. If two changes are technically inseparable, the committed spike
+must declare the combined checkpoint and explain why they cannot be toggled or
+measured separately. Missing hardware leaves the row in `GATING` with an exact
+handoff recipe; it never converts an unmeasured milestone into `DONE`.
+
 1. **Re-measure the vLLM denominator** on the IDENTICAL workload (`vllm bench
    throughput` / `bench serve`, `~/venvs/vllm-oracle`) — same model, in/out len,
    concurrency, sampling. Its number drifts; a stale baseline is disqualifying.
@@ -104,6 +114,15 @@ rumor; a reproducible run is evidence.
 - **Prefer a scripted, re-runnable harness** over ad-hoc one-offs so any result
   can be regenerated on demand; keep the gate config stable (never silently
   re-base it without re-running vLLM on the new config).
+- **Thermal/power + memory-return disclosure for multi-arm series** (adopted
+  from spark-bench `matrix_driver.sh`; GB10 is a compact unified-memory box):
+  snapshot `nvidia-smi -q -d TEMPERATURE,POWER` before/after each measured leg
+  and record it with the results; between engine legs, verify available memory
+  returns to the recorded baseline (leak check) and drop page caches before the
+  next leg. A leg run on a throttling or memory-leaking box voids the
+  cross-leg comparison, same as contention.
+  See [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md)
+  § "Folded: spark-bench".
 
 If a result cannot be reproduced on demand under these rules, it does not count
 toward the gate.
@@ -112,6 +131,9 @@ toward the gate.
 
 - A change is a WIN only if it moves an axis toward-or-past vLLM **without
   regressing any other axis below vLLM** (or below our own prior best).
+- A speed-sensitive feature or milestone cannot enter `DONE` on aggregate
+  release evidence alone: its own checkpoint must identify its attributable
+  delta, fresh floor, run spread, commands, and all applicable axes.
 - The MVP throughput gate is MET only when, for BOTH models at large concurrency:
   total throughput ≥ vLLM (≥ 1.0×) **AND** TTFT ≤ vLLM **AND** TPOT ≤ vLLM
   **AND** peak memory ≤ vLLM **AND** correctness holds — i.e. **match-or-beat on

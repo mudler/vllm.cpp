@@ -2524,3 +2524,17 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+
+## 2026-07-10 — `MODEL-FACTORY-registry` claimed for CPU implementation
+
+The accepted [model-factory registry spike](specs/model-factory-registry.md) is
+now `ACTIVE` under `CLAIM-MODEL-FACTORY-1` in isolated worktree
+`/home/mudler/_git/vllm.cpp-model-factory-registry` on branch
+`codex/model-factory-registry`. This claim owns only the central ordered
+type-erased registry, exact reject-unknown tables/messages, capability metadata,
+the two existing Qwen3.5 registrations, the live `IsDenseArch` replacement and
+the minimum runner/loader indirection it requires, plus ported registry tests and
+their record surfaces. It adds no model family and performs no GPU work while
+`CLAIM-SERVE-GATE-1` owns dgx. After CPU implementation and full relevant tests,
+the two gate-model token/performance/memory no-regression campaign remains an
+exact `GATING` handoff rather than a speculative closure.

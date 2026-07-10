@@ -69,6 +69,13 @@
     Triton) + the ≥1.0× MVP gate both require it. Recorded as deviation in
     porting-inventory.md §9. Toolchain: branch `perf/triton-fastpath`
     (cmake/TritonAOT.cmake + triton.tools.compile/link), proven token-exact.
+    NARROWED 2026-07-10: the generated artifacts are VENDORED per-arch in-repo
+    (`src/vt/cuda/triton_aot_vendored/<arch>/` + MANIFEST), so condition (3)
+    tightens — `VLLM_CPP_TRITON=ON` builds need ONLY a C compiler (no
+    Python/Triton); Python+Triton is a MAINTAINER-only regen-time dependency
+    (`VLLM_CPP_TRITON_REGEN=ON`, `scripts/regen-triton-aot.sh`), with
+    configure-time staleness warnings when `triton_kernels/*.py` or the pins
+    drift from the MANIFEST.
 - **Every ported file carries a header comment**: upstream path + upstream
   commit hash it was ported from. When re-syncing with upstream, diff that
   file against its recorded commit.

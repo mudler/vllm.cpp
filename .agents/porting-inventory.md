@@ -482,6 +482,26 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     model+config constant, not code-dependent): conc16/np96 in1024/out128 hand 713.38
     → Triton 723.82 tok/s (+1.46%), vLLM 766.62 ⇒ **0.930×→0.944×**; conc32/np192
     hand 856.73 → Triton 876.08 (+2.26%), vLLM 1043.17 ⇒ **0.821×→0.840×**.
+    **VENDORED — build-time Python removed (2026-07-10; branch
+    `build/vendor-triton-aot`).** The generated AOT artifacts (per-spec C
+    launchers with EMBEDDED cubins + the linked stable dispatchers, 10 bases =
+    5 kernels × H=48/32) are now COMMITTED per-arch under
+    `src/vt/cuda/triton_aot_vendored/<arch>/` (today `sm_121a/`; ~6.8 MB total,
+    the Marlin/FA-2 vendoring precedent), each with a provenance header and a
+    `MANIFEST` (triton/ptxas/python/CUDA versions, sha256 of every
+    `triton_kernels/*.py`, per-base generation parameters, date). This NARROWS
+    the sanction: `-DVLLM_CPP_TRITON=ON` now consumes the vendored artifacts
+    with ONLY a C compiler — **no Python/Triton at build time for normal
+    builders**; Python+Triton is a MAINTAINER-only regen dependency
+    (`-DVLLM_CPP_TRITON_REGEN=ON` reruns `triton.tools.compile/link` AND
+    refreshes the vendored tree + MANIFEST; `scripts/regen-triton-aot.sh` wraps
+    it and prints the git diff to review/commit). Staleness is guarded at
+    configure time: kernel-source hash drift vs MANIFEST → loud WARNING (build
+    proceeds on the old cubins); pin/signature drift vs the MANIFEST `base`
+    lines → loud WARNING; missing arch dir → clear FATAL with the regen
+    instructions. Regen is byte-deterministic (verified: two independent regens
+    on GB10, triton 3.6.0 ptxas 12.8 → byte-identical tree), so `git diff`
+    after regen IS the change signal. The OFF build stays byte-inert.
     HONEST VERDICT: the full GDN Triton port (delta_h+chunk_o+WU) is a real, clean,
     token-exact per-kernel win — −34.1% GDN chunk-kernel GPU time, ~3× the delta_h-
     alone e2e win — but 27B does **NOT** reach ≥1.0× MVP parity (0.944× conc16 /

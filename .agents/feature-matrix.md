@@ -142,7 +142,7 @@ MTP heads (we currently skip `mtp.*` at load).
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/worker/gpu/spec_decode/`, `models/qwen3_5_mtp.py` | 🚧 **spec written** | biggest single-model win; NB both gates are GDN hybrids so the GDN spec path is on milestone 1 | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) |
+| MTP (Qwen3.6 MTP heads, k=1 first) | `v1/worker/gpu/spec_decode/`, `models/qwen3_5_mtp.py` | 🚧 **ACTIVE: M-mtp-0** | safetensors loader + standalone MTP head parity claimed for both gate checkpoints; NB both gates are GDN hybrids so the GDN spec path is on milestone 1 | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) |
 | Rejection sampler | `v1/worker/gpu/spec_decode/rejection_sampler.py` | 🚧 covered by MTP spec | prerequisite for all spec paths | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (2.4) |
 | GDN spec segments (metadata + slot-snapshot rollback) | `v1/attention/backends/gdn_attn.py`, `fla/ops/fused_sigmoid_gating.py` | 🚧 covered by MTP spec | on milestone 1 (both gates hybrid) | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (3) |
 | DFlash (block-diffusion drafter) | in-pin + published drafts for our models | 🚧 **spec written** (after MTP) | DGX-Spark community container exists; GDN slot memory at k=15 flagged | [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md) |

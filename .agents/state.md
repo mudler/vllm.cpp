@@ -2355,3 +2355,27 @@ Ported vLLM priority scheduling 1:1 (pin e24d1b24), fully separable from W1–W3
 
 **Next:** claim W2 (`SERVE-ASYNC-LLM`); run W1+W4 GPU G1 when the GPU frees;
 W3 async-overlap default mirror.
+
+## 2026-07-10 — C3 M-mtp-0 stream recovered and claimed (`SPEC-MTP` ACTIVE)
+
+Recovered interrupted task `a3002072f42ec1b7f` from its harness transcript.
+The prior session ended at its model rate limit after protocol/upstream/local
+source inspection and a clean CPU baseline build; it issued no Edit/Write
+operation, created no commit, and left no live process. Its named worktree and
+branch had already disappeared, so they were recreated exactly at
+`.claude/worktrees/agent-a3002072f42ec1b7f` /
+`worktree-agent-a3002072f42ec1b7f` from `origin/main` without touching the
+dirty root worktree.
+
+`CLAIM-MTP-0` now owns only the spike's M-mtp-0 leaf: load the BF16 `mtp.*`
+safetensors tensors for the 27B dense and 35B MoE gate checkpoints, mirror the
+Qwen3.5 MTP head/model forward for standalone captured-hidden-state parity,
+and port the matching upstream loader/propose contract tests. `SPEC-MTP` and
+the two Qwen3.5 MTP model rows are `ACTIVE`; scheduler/rejection/GDN-spec/GGUF
+work remains outside this claim. No GPU work will run while
+`CLAIM-SERVE-GATE-1` owns the GB10; both-checkpoint oracle head parity is queued
+for the first released window.
+
+**Next:** commit/push the claim transition, implement and CPU-test M-mtp-0,
+then hand off the exact DGX oracle commands if the serve campaign still holds
+the GPU.

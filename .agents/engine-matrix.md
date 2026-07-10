@@ -19,12 +19,12 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
-| Speculative decoding | 6 | 0 | 0 | 0 | 4 | 0 | 0 | 2 |
+| Speculative decoding | 6 | 0 | 0 | 0 | 3 | 1 | 0 | 2 |
 | Serving, API, CLI, library | 17 | 3 | 2 | 0 | 1 | 1 | 0 | 10 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **90** | **9** | **17** | **0** | **8** | **1** | **2** | **53** |
+| **Total** | **90** | **9** | **17** | **0** | **7** | **2** | **2** | **53** |
 
 ## Engine core and scheduling
 
@@ -108,7 +108,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|---|
-| `SPEC-MTP` | Qwen3.6 MTP heads, k=1 first | T1 | `vllm/v1/worker/gpu/spec_decode/mtp/speculator.py:12`; `vllm/model_executor/models/qwen3_5_mtp.py:1` | - | - | [mtp-spec-decode.md](specs/mtp-spec-decode.md) | `READY` | - |
+| `SPEC-MTP` | Qwen3.6 MTP heads, k=1 first; M-mtp-0 loader + standalone head-parity leaf in progress for both gate checkpoints | T1 | `vllm/v1/worker/gpu/spec_decode/mtp/speculator.py:12`; `vllm/model_executor/models/qwen3_5_mtp.py:1` | - | - | [mtp-spec-decode.md](specs/mtp-spec-decode.md) | `ACTIVE` | `CLAIM-MTP-0` |
 | `SPEC-REJECTION` | Rejection sampler | T1 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:43` | - | - | [mtp-spec-decode.md §2.4](specs/mtp-spec-decode.md) | `READY` | - |
 | `SPEC-GDN-SEGMENTS` | GDN speculative metadata and slot-snapshot rollback | T1 | `vllm/v1/attention/backends/gdn_attn.py:82,244`; `vllm/v1/spec_decode/metadata.py:10` | - | - | [mtp-spec-decode.md §3](specs/mtp-spec-decode.md) | `READY` | - |
 | `SPEC-DFLASH` | Block-diffusion drafter | T1 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:31` | - | - | [dflash-spec-decode.md](specs/dflash-spec-decode.md) | `READY` | - |

@@ -16,8 +16,8 @@
 # target arch has no vendored artifacts, configuration FAILS with instructions.
 #
 # MAINTAINER (VLLM_CPP_TRITON_REGEN=ON): runs the original Python toolchain
-# (triton.tools.compile / triton.tools.link, needs Python+Triton+ptxas and a
-# visible GPU unless VLLM_CPP_TRITON_TARGET is set) AND refreshes the vendored
+# (triton.tools.compile / triton.tools.link, needs Python+Triton+ptxas) AND
+# refreshes the vendored
 # tree + its MANIFEST, so `scripts/regen-triton-aot.sh` + `git diff` is the
 # whole regen workflow. The build then compiles the refreshed vendored files
 # (exactly what a builder will compile).
@@ -46,8 +46,8 @@
 # Staleness: the vendored MANIFEST records the sha256 of every
 # triton_kernels/*.py plus the exact generation parameters per kernel base.
 # Consuming a vendored tree whose hashes/parameters no longer match the working
-# tree WARNS loudly (the kernels changed but the vendored cubins did not) but
-# does not fail — regen is a maintainer task on a GPU box.
+# tree FAILS configuration. Shipping source and embedded cubins as an atomic
+# unit is the builder contract; regen remains a maintainer task.
 #
 # VLLM_CPP_TRITON=OFF (the default) => this file only DEFINES the options + cache
 # vars + the functions and does nothing else. No Python is invoked, no sources
@@ -58,7 +58,7 @@ option(VLLM_CPP_TRITON
   "Link the vendored Triton AOT kernels (cubins embedded in C) into libvllm (CUDA-only; no Python needed)" OFF)
 
 option(VLLM_CPP_TRITON_REGEN
-  "MAINTAINER: regenerate the vendored Triton AOT artifacts with Python+Triton (needs a visible GPU); see scripts/regen-triton-aot.sh" OFF)
+  "MAINTAINER: regenerate target-pinned vendored Triton AOT artifacts with Python+Triton+ptxas; see scripts/regen-triton-aot.sh" OFF)
 
 # Where the vendored artifacts live, one subdir per arch (sm_121a today;
 # sm_90/sm_80/gfx* slots in later). Each arch dir holds the generated .c/.h for
@@ -79,25 +79,52 @@ set(VLLM_CPP_TRITON_VENDORED_ARCH "" CACHE STRING
 set(VLLM_CPP_TRITON_PYTHON "$ENV{HOME}/venvs/vllm-oracle/bin/python"
   CACHE FILEPATH "Python interpreter with Triton installed (REGEN only)")
 
-# Optional explicit Triton target "<backend>:<arch>:<warp-size>" (e.g. cuda:121:32
-# for GB10 sm_121). Empty => Triton auto-detects the GPU present at configure
-# time (the dgx case; the REGEN step requires a visible GPU + ptxas regardless).
+# Optional explicit Triton target "<backend>:<arch>:<warp-size>" (e.g.
+# cuda:121:32 for GB10 sm_121). Empty => derive it from the single vendored arch
+# directory. An explicit value must match that directory; autodetect is forbidden
+# because it can silently put an sm_90 cubin in sm_121a on a generic GPU runner.
 set(VLLM_CPP_TRITON_TARGET "" CACHE STRING
-  "Triton AOT target '<backend>:<arch>:<warpsize>' (REGEN only; empty = autodetect active GPU)")
+  "Triton AOT target '<backend>:<arch>:<warpsize>' (REGEN only; empty = derive from vendored arch)")
 
-# Fresh manifest accumulator per configure run (REGEN mode appends to it; the
-# property does not persist across cmake runs, this is just belt-and-braces).
-set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_MANIFEST_BASES "")
+# Fresh build-declaration accumulator per configure run. Every
+# add_triton_kernel call appends its exact manifest line in both builder and
+# regen modes; finalize compares it with the canonical contract and MANIFEST.
+set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES "")
 
-# _triton_aot_arch_dir(OUTVAR) -> absolute path of the active vendored arch dir.
-function(_triton_aot_arch_dir OUTVAR)
+# _triton_aot_arch_name(OUTVAR) -> active vendored arch directory name.
+function(_triton_aot_arch_name OUTVAR)
   if(VLLM_CPP_TRITON_VENDORED_ARCH)
     set(_a "${VLLM_CPP_TRITON_VENDORED_ARCH}")
   else()
     string(REPLACE ";" "_" _a "${VLLM_CPP_CUDA_ARCHITECTURES}")
     set(_a "sm_${_a}")
   endif()
+  set(${OUTVAR} "${_a}" PARENT_SCOPE)
+endfunction()
+
+# _triton_aot_arch_dir(OUTVAR) -> absolute path of the active vendored arch dir.
+function(_triton_aot_arch_dir OUTVAR)
+  _triton_aot_arch_name(_a)
   set(${OUTVAR} "${VLLM_CPP_TRITON_VENDORED_DIR}/${_a}" PARENT_SCOPE)
+endfunction()
+
+# Resolve and validate the code-generation target from the vendored destination.
+# The current AOT toolchain is CUDA-only and accepts one target per artifact tree.
+function(_triton_aot_resolved_target OUTVAR)
+  _triton_aot_arch_name(_arch)
+  if(NOT _arch MATCHES "^sm_([0-9]+)a?$")
+    message(FATAL_ERROR
+      "Cannot derive a single CUDA Triton target from vendored arch '${_arch}'. "
+      "Use one sm_<capability> directory per artifact tree.")
+  endif()
+  set(_derived "cuda:${CMAKE_MATCH_1}:32")
+  if(VLLM_CPP_TRITON_TARGET AND NOT VLLM_CPP_TRITON_TARGET STREQUAL _derived)
+    message(FATAL_ERROR
+      "VLLM_CPP_TRITON_TARGET='${VLLM_CPP_TRITON_TARGET}' does not match "
+      "vendored arch '${_arch}' (required '${_derived}'). Refusing to write a "
+      "cubinary into the wrong architecture directory.")
+  endif()
+  set(${OUTVAR} "${_derived}" PARENT_SCOPE)
 endfunction()
 
 # add_triton_kernel(RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE GRID
@@ -139,6 +166,8 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
   # pins/signature changed without a regen -> stale cubins).
   set(_manifest_line
     "base ${OUT_BASE} py=${_py_name} kernel=${KERNEL_NAME} warps=${_num_warps} stages=${_num_stages} grid=${GRID} signature=${SIGNATURE}")
+  set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES
+    "${_manifest_line}")
 
   if(NOT VLLM_CPP_TRITON_REGEN)
     # ── BUILDER path: consume the vendored artifacts. No Python. ─────────────
@@ -151,7 +180,7 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
         "    the always-available fallback), or\n"
         "  * set -DVLLM_CPP_TRITON_VENDORED_ARCH=<dir> if the artifacts exist under\n"
         "    another name, or\n"
-        "  * regenerate for this arch (MAINTAINER task; needs Python+Triton+GPU):\n"
+        "  * regenerate for this arch (MAINTAINER task; needs Python+Triton+ptxas):\n"
         "    scripts/regen-triton-aot.sh  (configure with -DVLLM_CPP_TRITON_REGEN=ON)")
     endif()
     if(NOT EXISTS "${_adir}/${OUT_BASE}.c" OR NOT EXISTS "${_adir}/${OUT_BASE}.h")
@@ -179,13 +208,13 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
       endif()
     endforeach()
     if(NOT _found_line STREQUAL _manifest_line)
-      message(WARNING
+      message(FATAL_ERROR
         "STALE VENDORED TRITON AOT ARTIFACTS: the generation parameters for "
         "'${OUT_BASE}' differ from ${_adir}/MANIFEST.\n"
         "  expected: ${_manifest_line}\n"
         "  vendored: ${_found_line}\n"
-        "The build proceeds with the VENDORED cubins (they are self-consistent), "
-        "but they do not reflect the current CMake pins. Regenerate: "
+        "Refusing to build cubins that do not reflect the declared launch ABI. "
+        "Regenerate: "
         "scripts/regen-triton-aot.sh")
     endif()
     message(STATUS "Triton AOT: ${OUT_BASE} <- vendored ${_adir} (no Python)")
@@ -210,10 +239,8 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
       file(REMOVE ${_stale})
     endif()
 
-    set(_target_args)
-    if(VLLM_CPP_TRITON_TARGET)
-      list(APPEND _target_args --target "${VLLM_CPP_TRITON_TARGET}")
-    endif()
+    _triton_aot_resolved_target(_resolved_target)
+    set(_target_args --target "${_resolved_target}")
 
     # Split SIGNATURE into one-or-more specializations on '|'.
     string(REPLACE "|" ";" _sigs "${SIGNATURE}")
@@ -224,7 +251,9 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
       message(STATUS "Triton AOT: compile ${KERNEL_NAME} [${_sig}] grid(${GRID}) "
                      "warps=${_num_warps} stages=${_num_stages}")
       execute_process(
-        COMMAND "${VLLM_CPP_TRITON_PYTHON}" -m triton.tools.compile
+        COMMAND "${CMAKE_COMMAND}" -E env TRITON_DISABLE_LINE_INFO=1
+                "${VLLM_CPP_TRITON_PYTHON}"
+                "${CMAKE_SOURCE_DIR}/scripts/triton-aot-compile.py"
                 "${KERNEL_PY}"
                 --kernel-name "${KERNEL_NAME}"
                 --out-name "${OUT_BASE}"
@@ -264,8 +293,8 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
 
     # 3) Refresh the vendored tree: drop this base's old files (hash-named files
     #    can change name across regens), copy the fresh ones with a provenance
-    #    header prepended (deterministic — no timestamps; regen with the same
-    #    toolchain must be byte-identical so `git diff` is the staleness signal).
+    #    header prepended. Explicit target selection plus disabled line info
+    #    removes GPU/path sensitivity; exact bytes are pinned in the MANIFEST.
     file(MAKE_DIRECTORY "${_adir}")
     file(GLOB _old_vendored "${_adir}/${OUT_BASE}.*")
     if(_old_vendored)
@@ -275,13 +304,13 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
       "/*\n"
       " * vllm.cpp VENDORED Triton AOT artifact — GENERATED CODE. DO NOT EDIT.\n"
       " *\n"
-      " * Generated by `python -m triton.tools.compile` / `triton.tools.link` from\n"
+      " * Generated by `scripts/triton-aot-compile.py` / `triton.tools.link` from\n"
       " * triton_kernels/${_py_name} (kernel ${KERNEL_NAME}); the embedded byte\n"
       " * array (if any) is the compiled cubin for the arch named by this\n"
       " * directory. Generator versions, kernel-source hashes and the exact\n"
       " * generation parameters are recorded in the MANIFEST next to this file.\n"
       " *\n"
-      " * Regenerate (MAINTAINER task; needs Python + Triton + a visible GPU):\n"
+      " * Regenerate (MAINTAINER task; needs Python + Triton + ptxas):\n"
       " *   scripts/regen-triton-aot.sh\n"
       " *\n"
       " * The generating kernel source (triton_kernels/${_py_name}) is ported\n"
@@ -294,13 +323,17 @@ function(add_triton_kernel RESULT_VAR KERNEL_PY KERNEL_NAME OUT_BASE SIGNATURE G
     foreach(_f IN LISTS _gen_files)
       get_filename_component(_fname "${_f}" NAME)
       file(READ "${_f}" _content)
+      # Triton's linker emits whitespace-only lines in generated headers. Keep
+      # the vendored text canonical so new artifacts pass git diff --check and
+      # repeated regeneration does not require hand-editing generated files.
+      string(REGEX REPLACE "[ \t]+\n" "\n" _content "${_content}")
+      string(REGEX REPLACE "[ \t]+$" "" _content "${_content}")
+      string(REGEX REPLACE "\n+$" "\n" _content "${_content}")
       file(WRITE "${_adir}/${_fname}" "${_hdr}${_content}")
       if(_fname MATCHES "\\.c$")
         list(APPEND _all_sources "${_adir}/${_fname}")
       endif()
     endforeach()
-    set_property(GLOBAL APPEND PROPERTY VLLM_TRITON_AOT_MANIFEST_BASES
-      "${_manifest_line}")
     message(STATUS "Triton AOT: ${OUT_BASE} regenerated -> ${_adir}")
   endif()
 
@@ -324,10 +357,26 @@ endfunction()
 #    bundled ptxas, python, the CUDA toolkit configured here), the sha256 of
 #    every triton_kernels/*.py, the generation date, and one 'base' line per
 #    kernel (accumulated by the add_triton_kernel calls).
-#  * builder: verifies the triton_kernels/*.py hashes against the vendored
-#    MANIFEST and WARNS loudly on any drift (kernels changed, cubins did not).
+#  * builder: verifies target, line-info policy, source hashes, generation
+#    declarations, artifact inventory, and artifact hashes; any drift is fatal.
 function(triton_aot_finalize)
   _triton_aot_arch_dir(_adir)
+  _triton_aot_arch_name(_arch_name)
+  _triton_aot_resolved_target(_resolved_target)
+
+  get_property(_expected_bases GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES)
+  list(SORT _expected_bases)
+  get_property(_contract_bases GLOBAL PROPERTY VLLM_TRITON_AOT_CONTRACT_LINES)
+  list(SORT _contract_bases)
+  if(NOT _expected_bases STREQUAL _contract_bases)
+    list(JOIN _expected_bases "\n  " _expected_text)
+    list(JOIN _contract_bases "\n  " _contract_text)
+    message(FATAL_ERROR
+      "Triton AOT build declarations differ from cmake/TritonAOTKernels.cmake.\n"
+      "Build declarations:\n  ${_expected_text}\n"
+      "Canonical contract:\n  ${_contract_text}\n"
+      "Update the canonical contract and build calls together, then regenerate.")
+  endif()
 
   if(VLLM_CPP_TRITON_REGEN)
     # Generator versions. Triton compiles the cubin with its OWN bundled ptxas
@@ -353,27 +402,25 @@ else:
     list(GET _vlist 1 _python_ver)
     list(GET _vlist 2 _ptxas_ver)
     string(TIMESTAMP _date "%Y-%m-%d" UTC)
-    if(VLLM_CPP_TRITON_TARGET)
-      set(_tgt "${VLLM_CPP_TRITON_TARGET}")
-    else()
-      set(_tgt "autodetect (GPU visible at regen time)")
-    endif()
-
     set(_m "")
     string(APPEND _m
       "# vllm.cpp vendored Triton AOT artifacts — MANIFEST. GENERATED, do not edit.\n"
-      "# Regenerate: scripts/regen-triton-aot.sh (maintainer task; Python+Triton+GPU).\n"
+      "# Regenerate: scripts/regen-triton-aot.sh (maintainer task; Python+Triton+ptxas).\n"
       "# 'source' lines are the sha256 of the generating triton_kernels/*.py at regen\n"
-      "# time (the configure-time staleness check compares against these); 'base'\n"
-      "# lines are the exact generation parameters per kernel dispatcher.\n")
-    get_filename_component(_arch_name "${_adir}" NAME)
+      "# time; 'generator' pins the repository-owned Triton 3.6 target shim;\n"
+      "# 'base' lines are the exact generation parameters per dispatcher;\n"
+      "# 'artifact' lines pin every generated file byte-for-byte.\n")
     string(APPEND _m "arch ${_arch_name}\n")
     string(APPEND _m "generated ${_date}\n")
     string(APPEND _m "triton ${_triton_ver}\n")
     string(APPEND _m "python ${_python_ver}\n")
     string(APPEND _m "ptxas ${_ptxas_ver}\n")
     string(APPEND _m "cuda_toolkit ${CMAKE_CUDA_COMPILER_VERSION}\n")
-    string(APPEND _m "triton_target ${_tgt}\n")
+    string(APPEND _m "triton_target ${_resolved_target}\n")
+    string(APPEND _m "line_info disabled\n")
+    file(SHA256 "${CMAKE_SOURCE_DIR}/scripts/triton-aot-compile.py" _generator_hash)
+    string(APPEND _m
+      "generator scripts/triton-aot-compile.py sha256=${_generator_hash}\n")
     file(GLOB _pys "${CMAKE_SOURCE_DIR}/triton_kernels/*.py")
     list(SORT _pys)
     foreach(_py IN LISTS _pys)
@@ -381,18 +428,85 @@ else:
       file(SHA256 "${_py}" _h)
       string(APPEND _m "source ${_pn} sha256=${_h}\n")
     endforeach()
-    get_property(_bases GLOBAL PROPERTY VLLM_TRITON_AOT_MANIFEST_BASES)
-    list(SORT _bases)
-    foreach(_b IN LISTS _bases)
+    foreach(_b IN LISTS _expected_bases)
       string(APPEND _m "${_b}\n")
+    endforeach()
+    file(GLOB _artifacts "${_adir}/*.c" "${_adir}/*.h")
+    list(SORT _artifacts)
+    foreach(_artifact IN LISTS _artifacts)
+      get_filename_component(_artifact_name "${_artifact}" NAME)
+      file(SHA256 "${_artifact}" _artifact_hash)
+      string(APPEND _m "artifact ${_artifact_name} sha256=${_artifact_hash}\n")
     endforeach()
     file(WRITE "${_adir}/MANIFEST" "${_m}")
     message(STATUS "Triton AOT: MANIFEST written -> ${_adir}/MANIFEST "
                    "(triton ${_triton_ver}, ptxas '${_ptxas_ver}'). "
                    "Review + commit the vendored tree: git diff ${_adir}")
   else()
-    # Source staleness for the vendored tree we just consumed.
+    # Exact dispatcher/signature set for the vendored tree we just consumed.
     file(STRINGS "${_adir}/MANIFEST" _mlines)
+    if(NOT "arch ${_arch_name}" IN_LIST _mlines)
+      message(FATAL_ERROR
+        "Triton AOT MANIFEST arch does not match destination '${_arch_name}'")
+    endif()
+    if(NOT "triton_target ${_resolved_target}" IN_LIST _mlines)
+      message(FATAL_ERROR
+        "Triton AOT MANIFEST target does not match '${_resolved_target}'")
+    endif()
+    if(NOT "line_info disabled" IN_LIST _mlines)
+      message(FATAL_ERROR
+        "Triton AOT MANIFEST lacks the path-independent line-info policy; regenerate")
+    endif()
+    file(SHA256 "${CMAKE_SOURCE_DIR}/scripts/triton-aot-compile.py" _generator_hash)
+    if(NOT
+       "generator scripts/triton-aot-compile.py sha256=${_generator_hash}" IN_LIST _mlines)
+      message(FATAL_ERROR
+        "Triton AOT MANIFEST generator shim differs from scripts/triton-aot-compile.py; "
+        "regenerate")
+    endif()
+    set(_manifest_bases "")
+    foreach(_line IN LISTS _mlines)
+      if(_line MATCHES "^base ")
+        list(APPEND _manifest_bases "${_line}")
+      endif()
+    endforeach()
+    list(SORT _manifest_bases)
+    if(NOT _manifest_bases STREQUAL _expected_bases)
+      list(JOIN _expected_bases "\n  " _expected_text)
+      list(JOIN _manifest_bases "\n  " _manifest_text)
+      message(FATAL_ERROR
+        "STALE VENDORED TRITON AOT ARTIFACT SET (${_adir}).\n"
+        "Expected from the build contract:\n  ${_expected_text}\n"
+        "Vendored MANIFEST contains:\n  ${_manifest_text}\n"
+        "Regenerate: scripts/regen-triton-aot.sh")
+    endif()
+
+    set(_manifest_artifacts "")
+    foreach(_line IN LISTS _mlines)
+      if(_line MATCHES "^artifact ([^ ]+) sha256=([0-9a-f]+)$")
+        set(_artifact_name "${CMAKE_MATCH_1}")
+        set(_artifact_hash "${CMAKE_MATCH_2}")
+        list(APPEND _manifest_artifacts "${_artifact_name}")
+        if(NOT EXISTS "${_adir}/${_artifact_name}")
+          message(FATAL_ERROR
+            "Triton AOT MANIFEST names missing artifact ${_artifact_name}")
+        endif()
+        file(SHA256 "${_adir}/${_artifact_name}" _actual_hash)
+        if(NOT _actual_hash STREQUAL _artifact_hash)
+          message(FATAL_ERROR
+            "Triton AOT artifact hash mismatch: ${_artifact_name}")
+        endif()
+      endif()
+    endforeach()
+    file(GLOB _actual_artifacts RELATIVE "${_adir}" "${_adir}/*.c" "${_adir}/*.h")
+    list(SORT _actual_artifacts)
+    list(SORT _manifest_artifacts)
+    if(NOT _actual_artifacts STREQUAL _manifest_artifacts)
+      message(FATAL_ERROR
+        "Triton AOT MANIFEST artifact set does not match ${_adir}; regenerate")
+    endif()
+
+    # Source staleness for the vendored tree.
     set(_manifest_pys "")
     set(_stale "")
     foreach(_line IN LISTS _mlines)
@@ -420,12 +534,12 @@ else:
     endforeach()
     if(_stale)
       list(JOIN _stale "\n  " _stale_txt)
-      message(WARNING
+      message(FATAL_ERROR
         "STALE VENDORED TRITON AOT ARTIFACTS (${_adir}):\n"
         "  ${_stale_txt}\n"
         "The triton_kernels/*.py sources changed but the vendored cubins were NOT "
-        "regenerated — the build proceeds with the OLD kernels. Regenerate "
-        "(maintainer task; Python+Triton+GPU): scripts/regen-triton-aot.sh")
+        "regenerated. Refusing to build the old kernels. Regenerate "
+        "(maintainer task; Python+Triton+ptxas): scripts/regen-triton-aot.sh")
     else()
       message(STATUS "Triton AOT: vendored tree ${_adir} matches triton_kernels/ "
                      "(MANIFEST hashes OK)")

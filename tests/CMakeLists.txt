@@ -1,6 +1,11 @@
 add_library(vllm_test_main STATIC doctest_main.cpp)
 target_include_directories(vllm_test_main SYSTEM PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
 
+if(UNIX)
+  add_test(NAME test_triton_aot_drift_contract
+    COMMAND bash "${CMAKE_SOURCE_DIR}/tests/scripts/test_triton_aot_drift.sh")
+endif()
+
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
@@ -145,6 +150,14 @@ vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
+target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(VLLM_CPP_TRITON)
+  # A separate process guarantees this race test reaches the generated module
+  # loaders before another gate-shape GDN case can warm them.
+  add_test(NAME test_ops_gdn_aot_concurrent_first_load
+    COMMAND test_ops_gdn
+      "--test-case=CUDA gdn Triton AOT concurrent first load is safe across two queues")
+endif()
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)

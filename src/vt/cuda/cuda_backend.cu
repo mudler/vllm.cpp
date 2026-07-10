@@ -5,6 +5,9 @@
 #include <string>
 
 #include "vt/backend.h"
+#ifdef VLLM_CPP_TRITON
+#include "vt/cuda/cuda_gdn_internal.h"
+#endif
 
 namespace vt::cuda {
 namespace {
@@ -48,6 +51,9 @@ class CudaBackend final : public Backend {
   }
   void DestroyQueue(Queue& q) override {
     if (q.handle == nullptr) return;
+#ifdef VLLM_CPP_TRITON
+    ReleaseGdnTritonScratch(device_, q.handle);
+#endif
     Check(cudaStreamDestroy(AsStream(q)), "cudaStreamDestroy");
     q.handle = nullptr;
   }

@@ -25,7 +25,7 @@
 
 #endif
 
-void unload_gdn_chunko_h48_6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718(void);
-void load_gdn_chunko_h48_6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718(void);
-// tt-linker: gdn_chunko_h48_6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718:CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT:48x16x128x128x64x64x64x1x1_warps4xstages3
-CUresult gdn_chunko_h48_6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
+void unload_gdn_chunko_bf16_h48_c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718(void);
+void load_gdn_chunko_bf16_h48_c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718(void);
+// tt-linker: gdn_chunko_bf16_h48_c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718:CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT:48x16x128x128x64x64x64x1x1_warps4xstages3
+CUresult gdn_chunko_bf16_h48_c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);

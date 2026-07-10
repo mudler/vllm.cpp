@@ -7,9 +7,8 @@
 #     so a kernel change cannot merge while shipping stale cubins.
 #  2. regen-pr (SELF-HOSTED GPU runner, label [self-hosted, gpu]): actually
 #     reruns scripts/regen-triton-aot.sh and opens a sync PR with the refreshed
-#     artifacts. Regen REQUIRES a visible GPU + Python+Triton (see
-#     cmake/TritonAOT.cmake), so GitHub-hosted runners cannot do it — this job
-#     is a no-op until a GPU runner (e.g. dgx.casa) is registered on the repo.
+#     artifacts, then executes them on CUDA. Generation is target-pinned; runtime
+#     validation requires the self-hosted GPU runner (e.g. dgx.casa).
 #     Trigger manually (workflow_dispatch) or via the weekly schedule; it only
 #     opens a PR when the drift check says the tree is stale.
 name: triton-aot-sync
@@ -23,8 +22,12 @@ on:
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
+      - 'cmake/TritonAOTKernels.cmake'
+      - 'cmake/DumpTritonAOTContract.cmake'
       - 'scripts/regen-triton-aot.sh'
       - 'scripts/check-triton-aot-drift.sh'
+      - 'scripts/triton-aot-compile.py'
+      - 'tests/scripts/test_triton_aot_drift.sh'
   pull_request:
     paths:
       - '.github/workflows/triton-aot-sync.yml'
@@ -32,8 +35,12 @@ on:
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
+      - 'cmake/TritonAOTKernels.cmake'
+      - 'cmake/DumpTritonAOTContract.cmake'
       - 'scripts/regen-triton-aot.sh'
       - 'scripts/check-triton-aot-drift.sh'
+      - 'scripts/triton-aot-compile.py'
+      - 'tests/scripts/test_triton_aot_drift.sh'
   schedule:
     - cron: '17 5 * * 1'   # weekly drift audit (Mon 05:17 UTC)
   workflow_dispatch: {}
@@ -69,7 +76,22 @@ jobs:
           fi
       - name: Regenerate vendored artifacts
         if: steps.drift.outputs.stale == 'true'
-        run: bash scripts/regen-triton-aot.sh
+        run: flock -w 7200 /tmp/gpu bash scripts/regen-triton-aot.sh
+      - name: Verify regenerated artifact contract and vendored consumer
+        if: steps.drift.outputs.stale == 'true'
+        run: |
+          bash scripts/check-triton-aot-drift.sh
+          cmake -S . -B build-triton-aot-consumer \
+            -DVLLM_CPP_CUDA=ON \
+            -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+            -DVLLM_CPP_TRITON=ON \
+            -DVLLM_CPP_TRITON_REGEN=OFF \
+            -DVLLM_CPP_BUILD_TESTS=ON \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF
+          cmake --build build-triton-aot-consumer --target vllm test_ops_gdn -j2
+          flock -w 7200 /tmp/gpu \
+            build-triton-aot-consumer/tests/test_ops_gdn
       - name: Open sync PR
         if: steps.drift.outputs.stale == 'true'
         env:
@@ -89,7 +111,7 @@ jobs:
           merge; CI's drift-check gates that the result is coherent.
 
           FOLLOWING_AGENTS_PROTOCOL
-          Assisted-by: triton-aot-sync GitHub workflow
+          Assisted-by: triton-aot-sync:workflow [GitHubActions]
           MSG
           git push origin "$branch"
           gh pr create --base main --head "$branch" \

@@ -304,3 +304,30 @@ FLA chunk metadata (`chunk_indices/offsets`) is precomputed on CPU
   Hk=2/Hv=4 with small dims. States dumped as gathered per-sequence slices,
   f32. Total ≤ 2MB. (1.74 MiB actual data; du reports ~2.3M due to 4K block
   overhead across 121 files — budget assert lives in dump_gdn.py.)
+
+## 10. Tests to port
+
+Pinned executable-spec inventory for the chunked prefill path:
+
+- `tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness`
+  (lines 33-199): **ported in substance** to `tests/vt/test_ops_gdn.cpp`.
+  The suite covers one and multi-sequence varlen batches, bf16 q/k/v + bf16
+  output buffers, output/final-state parity against the sequential recurrence,
+  metadata offsets, and with-buffer reuse. The Triton-AOT-specific case adds
+  strict dispatch counters plus same-stream dirty reuse, growth, and pool
+  ON/OFF coverage because a numerical fallback-only pass is insufficient here.
+- The upstream `num_seqs=257` stress point is **SKIPPED for the gate-shape AOT
+  specialization**: upstream uses Hk=4/Hv=8, while the vendored launch ABI is
+  deliberately specialized to Hk=16/Hv={32,48}. The existing generic metadata
+  builder tests own large sequence-count coverage; adding a non-dispatching H8
+  case here would not test the artifact being ported. Track H8 when Triton AOT
+  expands beyond gate shapes.
+- The upstream `state_dtype=torch.bfloat16` prefill case is **SKIPPED pending
+  the tracked bf16 SSM-cache feature**: this op's current public prefill
+  contract uses f32 persistent state, with bf16 cache rounding handled outside
+  the op. The f32 state case is ported; bf16 decode-cache drift is separately
+  pinned in `test_ops_gdn.cpp`.
+- `tests/kernels/mamba/test_gdn_forward_core_split.py::test_forward_core_split_matches_unified`
+  (lines 151-296): engine-level mixed decode/prefill split parity remains a
+  separate metadata/assembly port; this kernel-only change neither implements
+  nor drops it.

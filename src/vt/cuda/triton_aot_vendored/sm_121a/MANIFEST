@@ -1,20 +1,25 @@
 # vllm.cpp vendored Triton AOT artifacts — MANIFEST. GENERATED, do not edit.
-# Regenerate: scripts/regen-triton-aot.sh (maintainer task; Python+Triton+GPU).
+# Regenerate: scripts/regen-triton-aot.sh (maintainer task; Python+Triton+ptxas).
 # 'source' lines are the sha256 of the generating triton_kernels/*.py at regen
-# time (the configure-time staleness check compares against these); 'base'
-# lines are the exact generation parameters per kernel dispatcher.
+# time; 'generator' pins the repository-owned Triton 3.6 target shim;
+# 'base' lines are the exact generation parameters per dispatcher;
+# 'artifact' lines pin every generated file byte-for-byte.
 arch sm_121a
 generated 2026-07-10
 triton 3.6.0
 python 3.12.3
 ptxas Build cuda_12.8.r12.8/compiler.35583870_0
 cuda_toolkit 13.0.88
-triton_target autodetect (GPU visible at regen time)
+triton_target cuda:121:32
+line_info disabled
+generator scripts/triton-aot-compile.py sha256=eba7b92b36dc898d3dabdca462eac23632a380003dcfd61078a8058750d3b79f
 source chunk_delta_h.py sha256=02a5768deedc92201d4b88098aaaca31b8ea50f09b5f85dbe1279970cd0c641a
-source chunk_o.py sha256=bb5af66c778ae2f03df109b4a12815d6d8047b9a8166b7604e6d31f38d3656fb
+source chunk_o.py sha256=a818ea28c0a375605ebd09b4eeca3fee172a5e6fcbf17475ad79557210a7e6c1
 source chunk_scaled_dot_kkt.py sha256=3969074950cebb99a27d14d0c615bd758439ed06217e580ea79a839ee2f7e8af
 source solve_tril.py sha256=7fcb71fffb5463b57285f77a981ba40e6bcaccce5b57bb9ee798d0ad21cdfd20
 source wy_fast.py sha256=043af9d6fb1c9ab7a2bfb46a52f65b650cdabeb1cae393ac5f8d4adacef0f769
+base gdn_chunko_bf16_h32 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,32 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1, 1
+base gdn_chunko_bf16_h48 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,48 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_chunko_h32 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,32 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_chunko_h48 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,48 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_deltah_h32 py=chunk_delta_h.py kernel=chunk_gated_delta_rule_fwd_kernel_h_blockdim64 warps=4 stages=3 grid=2,NH,1 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 1, 0, 1, 1, 1, 1, 0
@@ -25,3 +30,51 @@ base gdn_tril_h32 py=solve_tril.py kernel=merge_16x16_to_64x64_inverse_kernel wa
 base gdn_tril_h48 py=solve_tril.py kernel=merge_16x16_to_64x64_inverse_kernel warps=4 stages=3 grid=NT,48,1 signature=*fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 48, 64, 1
 base gdn_wu_h32 py=wy_fast.py kernel=recompute_w_u_fwd_kernel warps=4 stages=3 grid=NT,32,1 signature=*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1
 base gdn_wu_h48 py=wy_fast.py kernel=recompute_w_u_fwd_kernel warps=4 stages=3 grid=NT,48,1 signature=*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1
+artifact gdn_chunko_bf16_h32.b8ddc694_0d1d2d3d4d5d6d7d89101112131415161718.c sha256=e12b72b07b5c7fcc1d55834edc1a94bd374da114b05355dff2a160eb408848a5
+artifact gdn_chunko_bf16_h32.b8ddc694_0d1d2d3d4d5d6d7d89101112131415161718.h sha256=391272af349629bfdcbba6a85913a50dd37ff7a421d46caddc36d78ff0848b42
+artifact gdn_chunko_bf16_h32.c sha256=ae419643e3773a4427c5bdd892560262a63a8b61bdf3c5660787b93b8640c41d
+artifact gdn_chunko_bf16_h32.h sha256=d82eb5e3b3b5b252c7ae222e5bb04c1ffc68cd79852c821bd2b02ba4e78f403d
+artifact gdn_chunko_bf16_h48.c sha256=9ee24de6108327e22daf106306ff4790a0d7704380bced8d006ae7d7768e897b
+artifact gdn_chunko_bf16_h48.c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718.c sha256=8abeea3475a3fe52b6839c930e196e7502964a63df955afd533e89f3320e2e01
+artifact gdn_chunko_bf16_h48.c9fe5207_0d1d2d3d4d5d6d7d89101112131415161718.h sha256=e9ec5deae8f3f05b12a542e70bcccd6589f02fd27831d0e3843c910f4c948947
+artifact gdn_chunko_bf16_h48.h sha256=2d4d5e708f617500fbe5c84e485f329911105d6b289a2aac9dbd1c056de0501b
+artifact gdn_chunko_h32.9c004d96_0d1d2d3d4d5d6d7d89101112131415161718.c sha256=35a4b083f3d77bfe96eba7ca11d3d5efedb4765eca85e409df6620fec571464f
+artifact gdn_chunko_h32.9c004d96_0d1d2d3d4d5d6d7d89101112131415161718.h sha256=a92b7ca7c2913fb7ed19ee2cde1eae46985eb705657dd533d26ea12749420c81
+artifact gdn_chunko_h32.c sha256=1259126af5a1fa4f19b603bee74b8cd083bd7325739c5f3d537bdcb8344da820
+artifact gdn_chunko_h32.h sha256=5613829d4b0eadf5574f0b647b2e7e4a69cb5a4135f2e89511ec2e950dc312db
+artifact gdn_chunko_h48.6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718.c sha256=7496e598d2397faba3cecd180932becfcfe4223ef7bda6f57a3107791bcdb8d2
+artifact gdn_chunko_h48.6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718.h sha256=524a83b4dc17b6f1ba5e3e32e18de5c9c90ff1c33947b0321fe344b98df0c10c
+artifact gdn_chunko_h48.c sha256=df5703243e8cd5501c73da32a16d11f3eb9dcabc697217f6f264eb8dc5588bd7
+artifact gdn_chunko_h48.h sha256=fc815ee19d6ffbb5a7bece5de00cba2721ad473288df645339142fa5188a1fa8
+artifact gdn_deltah_h32.950d2abe_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.c sha256=1be9cb066fa47fec4d10555d999a5281865d83413eb560ac4407a66807a85a5b
+artifact gdn_deltah_h32.950d2abe_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.h sha256=7bbd50d4bc435ae752469b2849effc74947a04f89be9a588007988915d4d9e6b
+artifact gdn_deltah_h32.c sha256=f50ae31513638061d592959cbd97d81ce748dabcf5345cfbd0b60e0509d0f898
+artifact gdn_deltah_h32.h sha256=1c9e6fec4fcadf6068cffb8f814e41032f341e53a9c3194a7a8dab9232959246
+artifact gdn_deltah_h48.4841de36_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.c sha256=793e4bef3f9398e54af946fd7e039147e25774d73a8af328a917ceb12a27c993
+artifact gdn_deltah_h48.4841de36_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.h sha256=4ee9dbc394987156993561b8686b5641e857409c2ece14181698fc9de1c8922d
+artifact gdn_deltah_h48.c sha256=a6fc3fe11abc3381448f8b02f60ab52cc44b5645059efa0a4c94500c7d25c600
+artifact gdn_deltah_h48.h sha256=cc966bd88791f64a26d32d0a8c14c8965e25714b5e017f1b29b1268c61ddea79
+artifact gdn_kkt_h32.8538f717_0d1d2d3d4d5d67891011121314.c sha256=f0abbbbfeb1b90b5328230dd8d90f3525e5681cfa467f580649a45bb34a88d71
+artifact gdn_kkt_h32.8538f717_0d1d2d3d4d5d67891011121314.h sha256=d8c8ff99a13a26318d9ff1e1e1088072f8cd8f32305cbabd725a36966ac077f2
+artifact gdn_kkt_h32.c sha256=23c39fc6bf18172afeb0015987a77ca8093a206486b118e77dd146716a9ca2e5
+artifact gdn_kkt_h32.h sha256=1ab22e337f1a7a601a1fdca8dac803abc4c695c24f81117c5742613f71cc6123
+artifact gdn_kkt_h48.6c65858f_0d1d2d3d4d5d67891011121314.c sha256=2a60db32db981e4a9777e54061f673dcbfd5d549b0b8e86ac51db0ca70a55a1c
+artifact gdn_kkt_h48.6c65858f_0d1d2d3d4d5d67891011121314.h sha256=3720617c96a22d10e3350dade322515a0125d658fef272d6426cbdf953eb1d3f
+artifact gdn_kkt_h48.c sha256=5a8403ea780ad8f96197cc9a16bac4601b103140b670c5f948b292069b006cf6
+artifact gdn_kkt_h48.h sha256=02a59ec0b69545a3e9f41f9da5512a0cc5ad9b6c3184d9f1f8dabe44e5e1b2ba
+artifact gdn_tril_h32.31103791_0d1d2d3d45678.c sha256=75bef1c589f18b17515576c211053f77a98b536d78be60300679da7b12dc9d1d
+artifact gdn_tril_h32.31103791_0d1d2d3d45678.h sha256=b1bdd31213b7d42e99bd53bec16a0ee583f89dfcd80f7765c2dd7964efed9df3
+artifact gdn_tril_h32.c sha256=3e68692d64a9cb07644f8a6d0cd1cc4e7637c8038722cda807140344717af0f0
+artifact gdn_tril_h32.h sha256=9586484a8e40235b7c9809393b95229b0a961e4fa5a7b14052d696479c85b036
+artifact gdn_tril_h48.c sha256=b32c44e65216aa97ff31490851c328e2b55d2f08f3b89141b0b11085eb1f24c5
+artifact gdn_tril_h48.db00fe7c_0d1d2d3d45678.c sha256=43856ff54bbac21b940e458284bcf66fe64f4c954d841f694f04f9359e3eff8c
+artifact gdn_tril_h48.db00fe7c_0d1d2d3d45678.h sha256=46d3d047e07fd729733d6a362f9cc3ec11c42063a8ee5f2df04cdc145978bb8c
+artifact gdn_tril_h48.h sha256=e4d3569511d35347ee0e5614ea7de5523dd724b0a145795c881d977b5c9db991
+artifact gdn_wu_h32.85cddad1_0d1d2d3d4d5d6d7d8d9101112131415161718.c sha256=bb3235e9cfa2a0e8b6b228a93384ecf49633594a942091381962aa760b43e905
+artifact gdn_wu_h32.85cddad1_0d1d2d3d4d5d6d7d8d9101112131415161718.h sha256=6588e2ca9231bff0a9db204c222b12ddb01c3bd9008320d2f46dadb33f6b36f0
+artifact gdn_wu_h32.c sha256=d43f232b9f141119664a4f3523d0c8f3c8f9fc5e8acba6b889c1a63a151c17dc
+artifact gdn_wu_h32.h sha256=3cb307f4c907dbbb10f0bf5d60593e2cd04b69e79e1a8cf7cafc6178a762df83
+artifact gdn_wu_h48.c sha256=7cec853cf310f13bf47a253b4f3f5be7fd4e2575e7a3f2273b957605613f3011
+artifact gdn_wu_h48.f1c2dbdd_0d1d2d3d4d5d6d7d8d9101112131415161718.c sha256=0c43408749fc91b445fdeae675b4d519cb505dda146e129cf8679684d557b4a2
+artifact gdn_wu_h48.f1c2dbdd_0d1d2d3d4d5d6d7d8d9101112131415161718.h sha256=00f1476bb3fea34363800603d2b4fc865182bc89014322b82037e5aca4aa0096
+artifact gdn_wu_h48.h sha256=ef5d2e411032c372695c8cf3a9962a7ce49492bef58d1e7e0c0321c06899cce1

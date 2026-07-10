@@ -178,9 +178,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed by a sanctioned, bounded
   **Triton AOT fast-path** (FLA kernels verbatim → cubin, **vendored per-arch as
   generated C** so the build needs no Python/Triton — regen is a maintainer task
-  via `scripts/regen-triton-aot.sh`; the runtime stays Python/Triton-free and the
-  portable C++ kernels and CPU reference remain the fallback — see the porting
-  inventory §9). The 27B measures **1.0072× at conc16
+  via `scripts/regen-triton-aot.sh`; generation is pinned to the destination
+  architecture and byte-reproducible across source paths). The runtime stays
+  Python/Triton-free and the portable C++ kernels and CPU reference remain the
+  fallback. The upstream-faithful bf16 `chunk_o` artifacts are available behind
+  `VT_GDN_OUT_BF16=1`; f32 remains the default pending a fresh current-main
+  two-model A/B. GDN reuses grow-only, queue-owned scratch, with the two
+  `VT_GDN_TRITON_*_POOL=0` toggles retaining same-binary fallbacks (see the
+  porting inventory §9). The 27B measures **1.0072× at conc16
   and 1.0071× at conc32** (764.3 vs 758.8; 1051.2 vs 1043.9 tok/s; 7/5-rep means vs
   fresh same-hour graphed denominators; conc32 5/5 reps ≥1.0×, conc16 6/7 with one
   0.996 rep disclosed): a production-codegen dump + kernel profile of vLLM settled

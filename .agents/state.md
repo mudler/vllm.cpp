@@ -2169,6 +2169,56 @@ PASS; `ctest --test-dir build-roadmap-audit --output-on-failure -j 4` PASS
 then execute the SGLang exact-load/corpus preflight without claiming binding
 latency until async streaming lands. In roadmap order, diagnose the online
 gate, spike the nightly, then claim kernel ABI/model factory/GGUF compute leaves.
+## 2026-07-10 — Triton-AOT follow-up: bf16 chunk_o + scratch pooling (GPU validation pending)
+
+Picked up the post-MVP follow-up from the earlier assessment and implemented the
+non-CUTLASS pieces in worktree `vllm.cpp-codex-triton-aot-analysis`.
+
+**Implemented.**
+- Added bf16-output Triton AOT `chunk_o` specs (`gdn_chunko_bf16_h48/h32`) alongside
+  the existing f32-output specs, gated behind `VLLM_CPP_TRITON_CHUNKO_BF16` until
+  the vendored artifacts are regenerated for the active arch. `TryTritonChunkO<Tout>`
+  now dispatches f32 output and can dispatch bf16 output once that compile define is
+  present.
+- Kept `VT_GDN_OUT_BF16` default OFF. The previous default flip regressed because
+  bf16 output fell off Triton; the source path is now wired, but the default needs
+  regenerated artifacts and a fresh same-binary A/B before changing again.
+- Added per-stream grow-only pools in the Triton-AOT GDN build for chunk scratch
+  (`gcum/u/w/v_new/hstate`) and chunk metadata (`tok0/len/boh/cidx`), plus the WU
+  A/Ai intermediates. A/B escapes: `VT_GDN_TRITON_CHUNK_POOL=0` and
+  `VT_GDN_TRITON_WU_POOL=0`.
+- Integrated with main's vendored Triton AOT artifact workflow:
+  `VLLM_CPP_TRITON_REGEN=ON` is the maintainer path; normal builds consume
+  `src/vt/cuda/triton_aot_vendored/<arch>/` without Python. The bf16 `chunk_o`
+  path stays disabled until those generated files are added.
+- Fixed README status drift: the architecture/backend rows now agree with the
+  header/status section that the MVP throughput gates passed, while preserving the
+  newly closed 35B GGUF real-file parity status from main.
+- Rebased over the GGUF acceptance golden and routed `qwen36_gguf_greedy` out of
+  the generic op-parity runner; `test_qwen36_gguf_engine` owns that full-engine
+  fixture.
+
+**Validation run here.**
+- `git diff --check` PASS.
+- `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF` PASS.
+- `cmake --build build-cpu -j$(nproc)` PASS.
+- `ctest --test-dir build-cpu --output-on-failure` PASS (90/90).
+
+**Pending validation.**
+- This environment did not provide a CUDA-capable build/run path, so I could not
+  regenerate artifacts, build `VLLM_CPP_TRITON=ON`, or run the required vLLM
+  comparison here.
+
+**Next CUDA pass.**
+1. Regenerate and check in the full stable AOT artifact bundle under
+   `src/vt/cuda/triton_aot_vendored/<arch>/` for all current bases, including
+   `gdn_chunko_bf16_h{48,32}`.
+2. Configure/build with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON` and run
+   `test_ops_gdn` through the Triton paths.
+3. Same-binary A/B the new pools (`VT_GDN_TRITON_*_POOL=0`) and
+   `VT_GDN_OUT_BF16=1` before considering any default flip.
+4. Re-run production-vLLM comparisons only after the CUDA build is green; no
+   throughput claim was made in this session.
 
 ## 2026-07-10 — `QUANT-GGUF-COMPUTE` split into three READY leaf specs (ROAD-V1-C4 gate)
 
@@ -2940,3 +2990,90 @@ prefill/decode, peak RSS, output tokens, and spread. Require ≥10x on both spee
 axes and ≤1.05x RSS, then refresh clean llama.cpp `237ad9b96` pp/tg/RSS on the
 same idle window. Only that evidence may advance the row to `DONE`; afterward
 claim `QUANT-GGUF-KEEPQ-LOADER` and `QUANT-GGUF-CIQ-GEMM`.
+
+## 2026-07-10 — recovered PR #3 validation evidence; current-main denominator remains open
+
+Recovered the pre-current-main `CLAIM-PR3` validation branch and its preliminary
+implementation/correctness evidence. The vendored contract now
+derives and validates `cuda:121:32` from `sm_121a`, disables cubin line info,
+pins the repository-owned Triton 3.6 numeric-target shim by hash, treats source
+drift as fatal, and validates the exact base/artifact set. Two regenerations in
+different absolute paths on `dgx.casa` were byte-identical. The no-Python
+consumer configured with `VLLM_CPP_TRITON_PYTHON=/definitely/missing/python` and
+built `vllm`, `test_ops_gdn`, `server`, and `vllm-bench` from vendored C only.
+
+Runtime hardening adds one `std::call_once` per generated module, a concurrent
+two-queue first-load test, allocate-before-retire scratch growth, queue-destroy
+pool cleanup, and exact upstream CuTe-DSL max/mean tolerances (output max/mean
+`<2e-3/<6e-5`; state `<2e-2/<6e-4`). The recovered branch had enabled the bf16
+AOT `chunk_o` and grow-only per-stream pools by default and its previously
+frozen 3x factorial found every-axis wins for both pool and bf16 steps on both
+models. Those pre-current-main measurements are recovery evidence only: the
+bf16 default remains off until the final current-main same-binary A/B is rerun.
+
+Recovered validation on that exact pre-current-main tree: local CPU `91/91`; clean macOS
+AppleClang drift CTest `1/1`; DGX `test_ops_gdn` `33/33`, `786/786`; compute-
+sanitizer `0` errors and `0` leaked bytes; 27B engine gate `9/9`; 35B single plus
+six-request batched graph gate `33/33`. The workflow now regenerates and executes
+the consumer test under `/tmp/gpu`, and its required trailer is corrected.
+
+Still open before `CLAIM-PR3` can close: rebuild and rerun the recovered validation
+on the integrated current-main tree, then one uninterrupted-lock, two-rep final
+ours-vs-production-vLLM comparison for both gate models and a paired `nsys` kernel
+trace; finally perform the same-change permanent matrix/roadmap/README/ledger
+reconciliation, completed-report archive, and claim release. No current-main
+runtime or DONE status is asserted here.
+
+## 2026-07-10 — PR #3 current-main non-GPU recovery complete; final GPU gate handed off
+
+Crash recovery preserved the two pre-existing record edits in stashes
+`f912def` and `be481151`, merged current `origin/main` without flattening the PR
+history (`407cea3`), and recovered the useful pre-crash implementation through
+`1c29dca`. The missing BF16 H32/H48 `chunk_o` launchers are now part of the
+12-base / 48-generated-file SM121 bundle. The AOT contract derives
+`cuda:121:32`, disables line info, pins the repository generator shim, and
+fails on source, declaration, inventory, or artifact-hash drift. Generated
+module loads are `call_once` guarded; scratch grows allocate-before-retire and
+is released with queue destruction.
+
+The upstream-derived CuTe-DSL test now has assertable BF16 `chunk_o` dispatch,
+hand-fallback rejection, concurrent fresh-process module loading, pool
+allocation/growth/reuse counters, and an explicit dirty-buffer proof: all nine
+chunk buffers plus both WU buffers are filled with `0xff` before a same-stream
+rerun. `VT_GDN_OUT_BF16` deliberately remains opt-in/default f32 until fresh
+current-main measurements prove every-axis parity or better.
+
+Local, non-GPU validation on the integrated tree is green:
+
+- `bash scripts/check-triton-aot-drift.sh`;
+- `bash tests/scripts/test_triton_aot_drift.sh` (ten independent stale-surface
+  mutations);
+- clean Release CPU configure/build; and
+- `ctest --test-dir build-pr3-cpu --output-on-failure -j4` = **92/92**.
+
+No GPU command ran because `CLAIM-SERVE-GATE-1` owns the DGX. Existing jobs and
+evidence under `~/work/vllm.cpp-noPy` remain preliminary because they predate
+the integrated tree. The final owner must sync the pushed branch head into a
+fresh isolated DGX directory, hold one uncontended `/tmp/gpu` lock for each
+complete series, and run this order:
+
+1. configure a vendored-only consumer with CUDA `121a`, Triton ON/regen OFF,
+   `VLLM_CPP_TRITON_PYTHON=/definitely/missing/python`, and the pinned CUTLASS;
+   build `vllm`, `test_ops_gdn`, both paged-engine gates, `vllm-bench`, and the
+   server;
+2. run `test_ops_gdn_aot_concurrent_first_load`, full `test_ops_gdn`,
+   `compute-sanitizer --tool memcheck --leak-check full` on the focused dirty-
+   reuse case/full GDN binary, then the 27B and 35B greedy gates including the
+   35B batched graph case;
+3. on the exact 1024-in/128-out workloads, interleave 2–3 reps of f32-pools-off,
+   f32-pools-on, and `VT_GDN_OUT_BF16=1`+pools-on for 27B
+   (`192` prompts, concurrency `32`, max batched tokens `2048`, blocks `2368`)
+   and 35B (`200`, `64`, `8192`, `4736`), recording total/output throughput,
+   requests/s, TTFT, TPOT/ITL/E2EL, and peak process/system memory; and
+4. in the same hardware window, run fresh pinned production-vLLM denominators
+   on the identical token corpus/config and paired warmup-excluded `nsys`
+   captures (`cuda_gpu_kern_sum`) for ours and vLLM.
+
+Only current-head results may move `KERNEL-GDN-AOT-BF16` or
+`KERNEL-GDN-SCRATCH` out of `ACTIVE`; below-vLLM on any axis or any correctness
+drift remains an open gap.

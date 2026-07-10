@@ -1,22 +1,32 @@
-// vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
-// GDN CPU reference op unit tests. Formula reference: .agents/specs/gdn-semantics.md
-// (§2 conv fwd, §3 conv update, §4 l2norm, §5 gated rmsnorm, §7 delta rule).
+// vllm.cpp original vt runtime with GDN cases ported from pinned upstream
+// tests/kernels/mamba/test_gdn_prefill_cutedsl.py @ e24d1b24 (multi-sequence
+// varlen, bf16 output-buffer parity, state parity). Formula reference:
+// .agents/specs/gdn-semantics.md (§2-§7 and Tests to port).
 // Golden coverage lives in tests/parity/test_op_parity.cpp; these tests pin
 // hand-computed values and the corners the goldens do not cover (conv bias,
 // GQA ratio 3, tiny hand tables).
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <random>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#ifdef VLLM_CPP_TRITON
+#include "vt/cuda/cuda_gdn_internal.h"
+#endif
 
 using vt::Backend;
 using vt::CausalConv1dArgs;
@@ -860,9 +870,46 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, 
 // prefill perf kernel (cuda_gdn.cu GdnChunk*); it must reproduce the sequential
 // recurrence within GDN tolerance (fp reassociation only). Covers >=2 chunks +
 // a partial tail and multiple heads / varlen sequences.
-void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
-                               int64_t dk, int64_t dv, const Combo& cb, uint32_t seed,
-                               float atol, float rtol) {
+struct GdnDiffStats {
+  float output_max = 0.0f;
+  double output_mean = 0.0;
+  float state_max = 0.0f;
+  double state_mean = 0.0;
+};
+
+std::pair<float, double> AbsoluteDiffStats(const std::vector<float>& got,
+                                           const std::vector<float>& want) {
+  REQUIRE(got.size() == want.size());
+  float max_error = 0.0f;
+  double sum_error = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const float error = std::fabs(got[i] - want[i]);
+    max_error = std::max(max_error, error);
+    sum_error += static_cast<double>(error);
+  }
+  return {max_error, got.empty() ? 0.0 : sum_error / static_cast<double>(got.size())};
+}
+
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+void CheckUpstreamCutedslTolerances(const GdnDiffStats& stats) {
+  CAPTURE(stats.output_max);
+  CAPTURE(stats.output_mean);
+  CAPTURE(stats.state_max);
+  CAPTURE(stats.state_mean);
+  // Pinned upstream executable contract:
+  // tests/kernels/mamba/test_gdn_prefill_cutedsl.py:163-166 @ e24d1b24.
+  CHECK(stats.output_max < 2e-3f);
+  CHECK(stats.output_mean < 6e-5);
+  CHECK(stats.state_max < 2e-2f);
+  CHECK(stats.state_mean < 6e-4);
+}
+#endif
+
+GdnDiffStats RunGdnChunkedVsSequentialOnQueue(Backend& gpu, Queue& queue,
+                                               const std::vector<int32_t>& qsl, int64_t hk,
+                                               int64_t hv, int64_t dk, int64_t dv,
+                                               const Combo& cb, uint32_t seed, float atol,
+                                               float rtol) {
   const int64_t t = qsl.back();
   const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
   auto qf = RandomF32(static_cast<size_t>(t * hk * dk), seed, -1.0f, 1.0f);
@@ -893,32 +940,44 @@ void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int6
   const auto vb = Pack(vf, cb.in);
   const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
 
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
-  QueueGuard gq(gpu);
   std::vector<uint8_t> out_seq(static_cast<size_t>(t * hv * dv) * vt::SizeOf(cb.out));
   std::vector<uint8_t> out_chunk(out_seq.size());
   std::vector<float> st_seq(stf.size()), st_chunk(stf.size());
 
   auto run = [&](const char* toggle, std::vector<uint8_t>& out_bytes, std::vector<float>& st_out) {
     setenv("VT_GDN_CHUNKED", toggle, 1);
-    DeviceTensor dq(gpu, gq.q, cb.in, {t, hk, dk}, qb.data());
-    DeviceTensor dkt(gpu, gq.q, cb.in, {t, hk, dk}, kb.data());
-    DeviceTensor dvt(gpu, gq.q, cb.in, {t, hv, dv}, vb.data());
-    DeviceTensor dg(gpu, gq.q, DType::kF32, {t, hv}, gf.data());
-    DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, hv}, betaf.data());
-    DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, stf.data());
-    DeviceTensor dout(gpu, gq.q, cb.out, {t, hv, dv});
-    DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
-    vt::GdnPrefill(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
+    DeviceTensor dq(gpu, queue, cb.in, {t, hk, dk}, qb.data());
+    DeviceTensor dkt(gpu, queue, cb.in, {t, hk, dk}, kb.data());
+    DeviceTensor dvt(gpu, queue, cb.in, {t, hv, dv}, vb.data());
+    DeviceTensor dg(gpu, queue, DType::kF32, {t, hv}, gf.data());
+    DeviceTensor dbeta(gpu, queue, DType::kF32, {t, hv}, betaf.data());
+    DeviceTensor dst(gpu, queue, DType::kF32, {n, hv, dv, dk}, stf.data());
+    DeviceTensor dout(gpu, queue, cb.out, {t, hv, dv});
+    DeviceTensor dqsl(gpu, queue, DType::kI32, {n + 1}, qsl.data());
+    vt::GdnPrefill(queue, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
                    dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
-    dout.Download(gq.q, out_bytes.data());
-    dst.Download(gq.q, st_out.data());
+    dout.Download(queue, out_bytes.data());
+    dst.Download(queue, st_out.data());
   };
   run("0", out_seq, st_seq);
   run("1", out_chunk, st_chunk);
 
-  CheckClose(Unpack(out_chunk, cb.out), Unpack(out_seq, cb.out), atol, rtol);
+  const auto out_chunk_f = Unpack(out_chunk, cb.out);
+  const auto out_seq_f = Unpack(out_seq, cb.out);
+  CheckClose(out_chunk_f, out_seq_f, atol, rtol);
   CheckClose(st_chunk, st_seq, atol, rtol);
+  const auto [output_max, output_mean] = AbsoluteDiffStats(out_chunk_f, out_seq_f);
+  const auto [state_max, state_mean] = AbsoluteDiffStats(st_chunk, st_seq);
+  return GdnDiffStats{output_max, output_mean, state_max, state_mean};
+}
+
+void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
+                               int64_t dk, int64_t dv, const Combo& cb, uint32_t seed,
+                               float atol, float rtol) {
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  (void)RunGdnChunkedVsSequentialOnQueue(gpu, gq.q, qsl, hk, hv, dk, dv, cb, seed, atol,
+                                         rtol);
 }
 
 }  // namespace
@@ -1256,6 +1315,64 @@ TEST_CASE("CUDA gdn prefill chunked matches sequential (2+ chunks, partial tail)
   (void)bf16;
 }
 
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+TEST_CASE("CUDA gdn Triton AOT concurrent first load is safe across two queues") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard q0(gpu);
+  QueueGuard q1(gpu);
+  std::atomic<int> ready{0};
+  std::atomic<bool> go{false};
+  std::exception_ptr failures[2];
+  auto warm = [&](size_t index, Queue& queue) {
+    ready.fetch_add(1, std::memory_order_release);
+    while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+    try {
+      vt::cuda::testing::WarmGdnTritonAotModules(queue.device.index);
+    } catch (...) {
+      failures[index] = std::current_exception();
+    }
+  };
+  std::thread first(warm, 0, std::ref(q0.q));
+  std::thread second(warm, 1, std::ref(q1.q));
+  while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+  go.store(true, std::memory_order_release);
+  first.join();
+  second.join();
+  if (failures[0]) std::rethrow_exception(failures[0]);
+  if (failures[1]) std::rethrow_exception(failures[1]);
+
+  setenv("VT_GDN_CHUNKED", "1", 1);
+  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
+  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
+  setenv("VT_GDN_WU_TRITON", "1", 1);
+  setenv("VT_GDN_TRITON_CHUNK_POOL", "1", 1);
+  setenv("VT_GDN_TRITON_WU_POOL", "1", 1);
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  vt::cuda::testing::ResetGdnTritonDebugStats();
+  const auto h48 = RunGdnChunkedVsSequentialOnQueue(
+      gpu, q0.q, {0, 150}, 16, 48, 128, 128, bf16, 7220, 3e-2f, 3e-2f);
+  const auto h32 = RunGdnChunkedVsSequentialOnQueue(
+      gpu, q1.q, {0, 150}, 16, 32, 128, 128, bf16, 7230, 3e-2f, 3e-2f);
+  CheckUpstreamCutedslTolerances(h48);
+  CheckUpstreamCutedslTolerances(h32);
+  const auto stats = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(stats.chunk_o_bf16_launches == 2);
+  CHECK(stats.chunk_o_hand_launches == 0);
+  vt::cuda::testing::DisableGdnTritonDebugStats();
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  unsetenv("VT_GDN_CHUNKO_TRITON");
+  unsetenv("VT_GDN_WU_TRITON");
+  unsetenv("VT_GDN_TRITON_CHUNK_POOL");
+  unsetenv("VT_GDN_TRITON_WU_POOL");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+}
+#endif
+
 // SANCTIONED Triton AOT delta_h fast-path, token-exact at the EXACT gate-model GDN
 // shapes (K=V=128, Hk=16, Hv in {48,32} = Qwen3.6-27B / 35B). The chunked path with
 // VT_GDN_DELTAH_TRITON=1 routes delta_h through the AOT cubin; it is compared vs the
@@ -1270,6 +1387,8 @@ TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate 
   }
   const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
   setenv("VT_GDN_DELTAH_TRITON", "1", 1);  // opt into the Triton path (inert if not built)
+  setenv("VT_GDN_CHUNKO_TRITON", "0", 1);
+  setenv("VT_GDN_WU_TRITON", "0", 1);
   // Two chunks + partial tail (150 tok) exercises the cross-chunk state recurrence,
   // which is the delta_h kernel. 27B shape (Hk16/Hv48) then 35B shape (Hk16/Hv32).
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16, 7100, 3e-2f, 3e-2f);
@@ -1277,6 +1396,8 @@ TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate 
   // Multi-sequence varlen at the 27B shape (differing chunk counts + chunk offsets).
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16, 7120, 3e-2f, 3e-2f);
   unsetenv("VT_GDN_DELTAH_TRITON");
+  unsetenv("VT_GDN_CHUNKO_TRITON");
+  unsetenv("VT_GDN_WU_TRITON");
   setenv("VT_GDN_CHUNKED", "1", 1);
   (void)bf16;
 }
@@ -1285,11 +1406,13 @@ TEST_CASE("CUDA gdn prefill chunked (Triton delta_h) matches sequential at gate 
 // gate-model GDN shapes (K=V=128, Hk=16, Hv in {48,32} = Qwen3.6-27B / 35B). The
 // chunked path with VT_GDN_CHUNKO_TRITON=1 / VT_GDN_WU_TRITON=1 routes chunk_o /
 // the WY pipeline through the AOT cubins; both are compared vs the sequential scan
-// exactly like the hand path above. chunk_o Triton pins o=f32, so these cases use
-// bf16-in / f32-out (the DEFAULT GDN recurrence-output dtype). WU Triton is dtype-
-// agnostic on out, so a bf16-in/bf16-out case also exercises it (with the hand
-// chunk_o). In a build WITHOUT VLLM_CPP_TRITON the envs are inert (chunked stays
-// hand-C++), so this case is valid in both builds. Tolerance matches the hand
+// exactly like the hand path above. chunk_o always has the f32-output AOT spec;
+// the bf16-output AOT spec engages only when the vendored artifacts were regenerated
+// and VLLM_CPP_TRITON_CHUNKO_BF16 is compiled. The bf16-in/bf16-out cases still
+// guard the fallback path and become Triton coverage in that build. WU Triton is
+// dtype-agnostic on out, so a bf16-in/bf16-out case also exercises it. In a build
+// WITHOUT VLLM_CPP_TRITON the envs are inert (chunked stays hand-C++), so this case
+// is valid in both builds. Tolerance matches the hand
 // chunked-vs-sequential cases (same per-head WY + delta-rule + output math).
 TEST_CASE("CUDA gdn prefill chunked (Triton chunk_o only) matches sequential at gate shape") {
   if (!HasCuda()) {
@@ -1297,11 +1420,18 @@ TEST_CASE("CUDA gdn prefill chunked (Triton chunk_o only) matches sequential at 
     return;
   }
   const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};   // default GDN out dtype
+  const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_DELTAH_TRITON", "0", 1);
   setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
+  setenv("VT_GDN_WU_TRITON", "0", 1);
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_f32, 7200, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7210, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7215, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7216, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7217, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_DELTAH_TRITON");
   unsetenv("VT_GDN_CHUNKO_TRITON");
+  unsetenv("VT_GDN_WU_TRITON");
   setenv("VT_GDN_CHUNKED", "1", 1);
 }
 
@@ -1311,6 +1441,8 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate 
     return;
   }
   const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  setenv("VT_GDN_DELTAH_TRITON", "0", 1);
+  setenv("VT_GDN_CHUNKO_TRITON", "0", 1);
   setenv("VT_GDN_WU_TRITON", "1", 1);
   RunGdnChunkedVsSequential({0, 150}, 16, 48, 128, 128, bf16_bf16, 7220, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7230, 3e-2f, 3e-2f);
@@ -1327,6 +1459,8 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU only) matches sequential at gate 
   RunGdnChunkedVsSequential({0, 10, 22, 31, 40, 52, 61}, 16, 32, 128, 128, bf16_bf16, 7239,
                             3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 10}, 16, 32, 128, 128, bf16_bf16, 7241, 3e-2f, 3e-2f);
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  unsetenv("VT_GDN_CHUNKO_TRITON");
   unsetenv("VT_GDN_WU_TRITON");
   setenv("VT_GDN_CHUNKED", "1", 1);
 }
@@ -1337,13 +1471,122 @@ TEST_CASE("CUDA gdn prefill chunked (Triton WU + delta_h + chunk_o) matches sequ
     return;
   }
   const Combo bf16_f32 = {DType::kBF16, DType::kF32, 3e-2f, 3e-2f};
+  const Combo bf16_bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
   setenv("VT_GDN_WU_TRITON", "1", 1);
   setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
   setenv("VT_GDN_DELTAH_TRITON", "1", 1);
   RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_f32, 7240, 3e-2f, 3e-2f);
   RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_f32, 7250, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150, 200}, 16, 48, 128, 128, bf16_bf16, 7251, 3e-2f, 3e-2f);
+  RunGdnChunkedVsSequential({0, 150}, 16, 32, 128, 128, bf16_bf16, 7252, 3e-2f, 3e-2f);
   unsetenv("VT_GDN_DELTAH_TRITON");
   unsetenv("VT_GDN_WU_TRITON");
   unsetenv("VT_GDN_CHUNKO_TRITON");
   setenv("VT_GDN_CHUNKED", "1", 1);
 }
+
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+// Ported coverage from pinned vLLM
+// tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness:
+// bf16 output-buffer parity across varlen batches. The vllm.cpp-specific
+// additions prove the AOT dispatcher and queue-owned allocator behavior rather
+// than allowing a hand-kernel fallback to satisfy the numerical assertion.
+TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dirty scratch") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+
+  setenv("VT_GDN_CHUNKED", "1", 1);
+  setenv("VT_GDN_DELTAH_TRITON", "1", 1);
+  setenv("VT_GDN_CHUNKO_TRITON", "1", 1);
+  setenv("VT_GDN_WU_TRITON", "1", 1);
+  setenv("VT_GDN_TRITON_CHUNK_POOL", "1", 1);
+  setenv("VT_GDN_TRITON_WU_POOL", "1", 1);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  const Combo bf16 = {DType::kBF16, DType::kBF16, 3e-2f, 3e-2f};
+  vt::cuda::testing::ResetGdnTritonDebugStats();
+
+  // First call owns the initial allocations and must dispatch bf16 chunk_o.
+  const auto first_diff = RunGdnChunkedVsSequentialOnQueue(
+      gpu, gq.q, {0, 150}, 16, 48, 128, 128, bf16, 7300, 3e-2f, 3e-2f);
+  CheckUpstreamCutedslTolerances(first_diff);
+  auto first = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(first.chunk_o_bf16_launches == 1);
+  CHECK(first.chunk_o_hand_launches == 0);
+  CHECK(first.chunk_pool_allocations == 9);
+  CHECK(first.chunk_pool_growths == 0);
+  CHECK(first.wu_pool_allocations == 2);
+  CHECK(first.wu_pool_growths == 0);
+
+  // Poison every pooled allocation with 0xff: this is NaN for float/bf16
+  // payloads and invalid for the metadata arrays. A correct repeated launch on
+  // the SAME stream must overwrite/zero every byte it may consume. Fresh-zero
+  // allocation behavior cannot accidentally satisfy this assertion.
+  CHECK(vt::cuda::testing::PoisonGdnTritonScratch(gq.q, 0xff) == 11);
+
+  // Different data at the same shape reuses those explicitly dirty buffers.
+  const auto reused_diff = RunGdnChunkedVsSequentialOnQueue(
+      gpu, gq.q, {0, 150}, 16, 48, 128, 128, bf16, 7310, 3e-2f, 3e-2f);
+  CheckUpstreamCutedslTolerances(reused_diff);
+  auto reused = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(reused.chunk_o_bf16_launches == 2);
+  CHECK(reused.chunk_o_hand_launches == 0);
+  CHECK(reused.chunk_pool_allocations == first.chunk_pool_allocations);
+  CHECK(reused.chunk_pool_reuses >= first.chunk_pool_reuses + 9);
+  CHECK(reused.wu_pool_allocations == first.wu_pool_allocations);
+  CHECK(reused.wu_pool_reuses >= first.wu_pool_reuses + 2);
+
+  // A larger varlen batch grows every high-water buffer once. A following
+  // smaller H=32 call must reuse without shrinking or allocating again.
+  const auto grown_diff = RunGdnChunkedVsSequentialOnQueue(
+      gpu, gq.q, {0, 100, 150, 264, 300, 401}, 16, 48, 128, 128, bf16, 7320, 3e-2f,
+      3e-2f);
+  CheckUpstreamCutedslTolerances(grown_diff);
+  auto grown = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(grown.chunk_o_bf16_launches == 3);
+  CHECK(grown.chunk_o_hand_launches == 0);
+  CHECK(grown.chunk_pool_growths >= 9);
+  CHECK(grown.wu_pool_growths >= 2);
+
+  const auto smaller_diff = RunGdnChunkedVsSequentialOnQueue(
+      gpu, gq.q, {0, 150}, 16, 32, 128, 128, bf16, 7330, 3e-2f, 3e-2f);
+  CheckUpstreamCutedslTolerances(smaller_diff);
+  auto smaller = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(smaller.chunk_o_bf16_launches == 4);
+  CHECK(smaller.chunk_o_hand_launches == 0);
+  CHECK(smaller.chunk_pool_allocations == grown.chunk_pool_allocations);
+  CHECK(smaller.chunk_pool_growths == grown.chunk_pool_growths);
+  CHECK(smaller.chunk_pool_reuses >= grown.chunk_pool_reuses + 9);
+  CHECK(smaller.wu_pool_allocations == grown.wu_pool_allocations);
+  CHECK(smaller.wu_pool_growths == grown.wu_pool_growths);
+  CHECK(smaller.wu_pool_reuses >= grown.wu_pool_reuses + 2);
+
+  // Same binary, pools disabled: numerical parity and Triton dispatch remain,
+  // while the persistent-pool counters stay unchanged.
+  setenv("VT_GDN_TRITON_CHUNK_POOL", "0", 1);
+  setenv("VT_GDN_TRITON_WU_POOL", "0", 1);
+  const auto disabled_diff = RunGdnChunkedVsSequentialOnQueue(
+      gpu, gq.q, {0, 150}, 16, 48, 128, 128, bf16, 7340, 3e-2f, 3e-2f);
+  CheckUpstreamCutedslTolerances(disabled_diff);
+  auto disabled = vt::cuda::testing::GetGdnTritonDebugStats();
+  CHECK(disabled.chunk_o_bf16_launches == 5);
+  CHECK(disabled.chunk_o_hand_launches == 0);
+  CHECK(disabled.chunk_pool_allocations == smaller.chunk_pool_allocations);
+  CHECK(disabled.chunk_pool_growths == smaller.chunk_pool_growths);
+  CHECK(disabled.chunk_pool_reuses == smaller.chunk_pool_reuses);
+  CHECK(disabled.wu_pool_allocations == smaller.wu_pool_allocations);
+  CHECK(disabled.wu_pool_growths == smaller.wu_pool_growths);
+  CHECK(disabled.wu_pool_reuses == smaller.wu_pool_reuses);
+
+  vt::cuda::testing::DisableGdnTritonDebugStats();
+  unsetenv("VT_GDN_DELTAH_TRITON");
+  unsetenv("VT_GDN_CHUNKO_TRITON");
+  unsetenv("VT_GDN_WU_TRITON");
+  unsetenv("VT_GDN_TRITON_CHUNK_POOL");
+  unsetenv("VT_GDN_TRITON_WU_POOL");
+  setenv("VT_GDN_CHUNKED", "1", 1);
+}
+#endif

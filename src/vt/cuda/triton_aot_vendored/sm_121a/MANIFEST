@@ -1,0 +1,27 @@
+# vllm.cpp vendored Triton AOT artifacts — MANIFEST. GENERATED, do not edit.
+# Regenerate: scripts/regen-triton-aot.sh (maintainer task; Python+Triton+GPU).
+# 'source' lines are the sha256 of the generating triton_kernels/*.py at regen
+# time (the configure-time staleness check compares against these); 'base'
+# lines are the exact generation parameters per kernel dispatcher.
+arch sm_121a
+generated 2026-07-10
+triton 3.6.0
+python 3.12.3
+ptxas Build cuda_12.8.r12.8/compiler.35583870_0
+cuda_toolkit 13.0.88
+triton_target autodetect (GPU visible at regen time)
+source chunk_delta_h.py sha256=02a5768deedc92201d4b88098aaaca31b8ea50f09b5f85dbe1279970cd0c641a
+source chunk_o.py sha256=bb5af66c778ae2f03df109b4a12815d6d8047b9a8166b7604e6d31f38d3656fb
+source chunk_scaled_dot_kkt.py sha256=3969074950cebb99a27d14d0c615bd758439ed06217e580ea79a839ee2f7e8af
+source solve_tril.py sha256=7fcb71fffb5463b57285f77a981ba40e6bcaccce5b57bb9ee798d0ad21cdfd20
+source wy_fast.py sha256=043af9d6fb1c9ab7a2bfb46a52f65b650cdabeb1cae393ac5f8d4adacef0f769
+base gdn_chunko_h32 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,32 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1, 1
+base gdn_chunko_h48 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,48 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1, 1
+base gdn_deltah_h32 py=chunk_delta_h.py kernel=chunk_gated_delta_rule_fwd_kernel_h_blockdim64 warps=4 stages=3 grid=2,NH,1 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 1, 0, 1, 1, 1, 1, 0
+base gdn_deltah_h48 py=chunk_delta_h.py kernel=chunk_gated_delta_rule_fwd_kernel_h_blockdim64 warps=4 stages=3 grid=2,NH,1 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 1, 0, 1, 1, 1, 1, 0
+base gdn_kkt_h32 py=chunk_scaled_dot_kkt.py kernel=chunk_scaled_dot_kkt_fwd_kernel warps=4 stages=3 grid=NT,32,1 signature=*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 64, 64, 1, 1
+base gdn_kkt_h48 py=chunk_scaled_dot_kkt.py kernel=chunk_scaled_dot_kkt_fwd_kernel warps=8 stages=3 grid=NT,48,1 signature=*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 64, 128, 1, 1
+base gdn_tril_h32 py=solve_tril.py kernel=merge_16x16_to_64x64_inverse_kernel warps=4 stages=3 grid=NT,32,1 signature=*fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 32, 64, 1
+base gdn_tril_h48 py=solve_tril.py kernel=merge_16x16_to_64x64_inverse_kernel warps=4 stages=3 grid=NT,48,1 signature=*fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 48, 64, 1
+base gdn_wu_h32 py=wy_fast.py kernel=recompute_w_u_fwd_kernel warps=4 stages=3 grid=NT,32,1 signature=*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1
+base gdn_wu_h48 py=wy_fast.py kernel=recompute_w_u_fwd_kernel warps=4 stages=3 grid=NT,48,1 signature=*bf16:16, *bf16:16, *fp32:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1

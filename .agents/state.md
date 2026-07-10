@@ -1794,3 +1794,63 @@ the 35B Triton A/B agent at session start; my rebuild swapped vllm-bench under i
 first OFF rep (semantically inert for its explicit-mnbt 35B runs — my change only
 alters the dense-arch DEFAULT — but rep r1 of its A/B crossed binaries; reps r2-r4 ran
 consistently on the new binary). Flagged for that agent's report review.
+
+## 2026-07-10 — 27B last-mile: ground-truth dump SETTLED the fusion record; TN GEMM + measured toggle stack landed; FINAL 27B 0.990×/0.997× (from 0.966×/0.966×); 35B 1.023×
+
+**STEP 1 (ground truth — the conflicting record is settled).** Dumped vLLM's ACTUAL
+27B production Inductor codegen (`TORCH_LOGS=output_code`, cache disabled;
+~/work/vdump27b.err on dgx) + a PRODUCTION-config graphed torch profile
+(~/work/vprod27b). The earlier trace (~/scratch_agent_a562/vprof27b) was
+`enforce_eager=True` — it could never answer the fusion question and seeded the
+conflict. In production the 27B norm→fp4-quant site is TWO kernels in vLLM TOO
+(triton add+rmsnorm bf16, then extern `_C.scaled_fp4_quant`; the
+"…_scaled_fp4_quant" in Inductor kernel names is origin-node pollution — the body
+writes bf16 only; rms_quant_fusion.py registers FP8-only patterns, no nvfp4).
+Measured PARITY at that site (0.374 vs 0.360 µs/tok). silu+quant: vLLM runs the
+fused `_C.silu_and_mul_nvfp4_quant` custom op — we already ship that fused (≈parity).
+**The finisher's "Inductor rmsnorm+quant / silu+quant residual" theory is DEAD for
+the 27B** (it's real only on the fp8/35B path, where RmsNormQuantFp8 already ships).
+
+**STEP 2 (measured per-site diff, production kernels both sides).** Ours ≈426 vs
+vLLM ≈356 µs/tok prefill GPU (1.20× ≈ the 3.4% e2e gap). Ranked: (1) GDN in_proj
+bf16 GEMMs 2.29 vs 1.80 µs/tok/L — OUR LAYOUT: row-major×row-major kMatmul gets
+nvjet NNNN ~76TF + a slow sm80-cutlass z kernel; vLLM's F.linear TN gets nvjet TNNN
+~123TF (≈24 µs/tok ×48L — the mislabeled "GEMM at-parity" component); (2) prefill
+attention 1.37 vs 0.25 (PagedFlashWmma ~7-13TF vs FA2 ~40-56TF; ≈18 µs/tok);
+(3) attn preamble+rope 1.36 vs 0.27 (4 f32 kernels + in-kernel DOUBLE
+transcendentals vs 4 bf16 Inductor kernels + cos/sin cache; ≈17.5); (4) conv 0.43
+vs 0.18 (≈12); (5) gated-norm 0.37 vs 0.15 (≈8.4). OUR ADVANTAGE: fp4 GEMMs ≈103
+vs ≈127 µs/tok (per-shape autotune beats flashinfer mm_fp4 here). vLLM's merged
+qkvz/ba/qkv/gate_up GEMMs: at TN rates the merge saving is only the extra A-reads
+(~0.1-0.2% e2e) — NOT ported, measured too small.
+
+**STEP 3 (landed on perf/27b-prefill-fusion-mvp; every change gated).**
+(a) `vt::MatmulBT` TN bf16 GEMM (b raw torch-Linear [N,K]; cuBLASLt column-major TN
+copied from our own fp8 path) + `OwnedTensor.nk`/`LoadBf16RawNK` for the 27B
+in_proj_{qkv,z,b,a}. +0.57% e2e. dgx ctest 91/91. lm_head NOT flipped (measured at
+parity). (b) Toggle stack flipped to PER-ARCH defaults after a 3-rep interleaved
+A/B (+1.61% over TN, every axis better): fused attn preamble ON for fp4-attn (27B;
+gates pass — the 35B fp8 1-ULP divergence stands, stays OFF), conv-tiled ON (both
+models gated), and gdn-out-bf16 → **REVERTED after measurement**: the Triton AOT
+chunk_o guards Tout==float, so bf16 core forfeits its −36% kernel (754.71 vs 757.15
+conc16); re-flip needs a bf16-out chunk_o AOT variant (LESSON: re-measure old
+toggle wins after a kernel-path swap). 27B logits diagnostic moved to the OTHER
+vLLM-legitimate branch of the documented tok-6 whitespace tie (16/16→6/16
+informational; the deterministic-span hard gate + engine gates green throughout).
+
+**FINAL NUMBERS (defaults binary, fresh graphed denominators measured same hour):**
+conc16/np96 **758.51** (757.70/756.20/761.62; r1 713.12 cold outlier disclosed) vs
+vLLM 766.49 = **0.990×** (0.987-0.994); conc32/np192 **1049.01** (5 reps
+1044.95-1053.74, best rep 1.0012×) vs 1052.48 = **0.9967×** (0.994-1.001). TTFT
+1804/2500ms, TPOT 177.2/255.7ms (all better than the 0.966× baseline's). Peak mem
+61.8 vs vLLM 76.2GB. **35B spot conc64/np200: 3356.66 = 1.023×** (shared-kernel
+changes safe; TPOT 139.2). **NOT ≥1.0×: honest shortfall ≈1.0% conc16 / ≈0.3%
+conc32** (conc32 straddles 1.0 within rep spread). Session lift: 0.9665→0.990 /
+0.9663→0.997.
+
+**REMAINING (measured, named):** (1) the prefill attention kernel — ours ≈5× FA2
+per token at L=1024 ⇒ ≈1.5-1.8% e2e; the sanctioned 1:1 route is porting vLLM's
+FA2 `flash_fwd_splitkv` (CUDA C++ dep — carries its pipelining; NOT hand-matching,
+which measured negative on GDN). (2) bf16-out chunk_o AOT variant → re-flip
+gdn-out-bf16 (+ the old +0.8% traffic win). (3) bf16-q preamble→attention
+(vLLM-faithful; attention dispatch already accepts bf16 q; numerics-gated).

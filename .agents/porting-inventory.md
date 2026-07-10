@@ -48,7 +48,7 @@ what vLLM has vs what we have:
 | EngineCore I/O types (`EngineCoreRequest`/`EngineCoreOutput(s)`, `ModelRunnerOutput`, `SamplerOutput`) | `v1/engine/__init__.py`, `v1/outputs.py` | T0 ✅ `cd13ec3` (structural port) |
 | `RequestOutput` / `CompletionOutput` (public result carriers; FinishReason→string) | `vllm/outputs.py` | T0 ✅ `4d477eb` (+ prompt_logprobs opaque placeholder at M1.1 close-out; logprobs payloads deferred to sampler unit) |
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
-| Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 |
+| Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 ✅ `core_proc.{h,cpp}` + `core_client.{h,cpp}` (W1 `ENG-CORE-BUSY-LOOP`: EngineCoreProc busy loop, shutdown drain/abort, WAKEUP + ENGINE_CORE_DEAD sentinels, InprocClient engine thread; tests `test_engine_core_proc.cpp` ← upstream `tests/v1/engine/test_engine_core_client.py`; GPU G1/G4 gating pending; UTILITY/DP/aborts-queue/batch-queue deferred) |
 | InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
 | OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` (process_outputs: detokenize + string-stop + reqs_to_abort feedback; streaming DELTA/CUMULATIVE/FINAL_ONLY; logprobs/pooling deferred) |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 |

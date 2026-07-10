@@ -2268,3 +2268,45 @@ INVENTORIED; checker ENGINE_ROWS 88→90), feature-matrix §2 +2, roadmap
 `ROAD-V1-D4` INVENTORIED→PARTIAL, handoff queue #10. **Next:** claim W1
 (expert cache manager, CPU-testable), W2 (pread pool), then W3 (bank +
 engine hook) on dgx.
+
+## 2026-07-10 — ENG-CORE-BUSY-LOOP (W1) implemented: EngineCoreProc busy loop + queue split + InprocClient (GATING)
+
+First leaf of the async-serving block (`ROAD-V1-C6`, spec
+[async-serving.md](specs/async-serving.md) W1) landed by `CLAIM-BUSY-LOOP-1`
+(claim released this change):
+
+- **`EngineCoreProc : EngineCore`** (`include/vllm/v1/engine/core_proc.h`,
+  `src/vllm/v1/engine/core_proc.cpp`) — 1:1 port of the upstream busy loop
+  (`vllm/v1/engine/core.py:915-916,1259-1480` @ e24d1b24): input/output
+  `BlockingQueue`s (queue.Queue semantics), `run_busy_loop` =
+  `_handle_shutdown` → `_process_input_queue` → `_process_engine_step`,
+  abort-mode (timeout 0: finish-all-ABORTED + abort outputs) and drain-mode
+  shutdown, ADD rejected with an abort output during shutdown, WAKEUP and
+  ENGINE_CORE_DEAD sentinels, `EngineCoreRequestType` values preserved.
+  step_fn selection mirrored; `max_concurrent_batches > 1` throws until W3
+  lands `step_with_batch_queue`.
+- **`InprocClient`** (`core_client.{h,cpp}`) — SyncMPClient collapsed to the
+  in-proc queue split (recorded deviation D2): owns the engine `std::thread`
+  under the run_engine_core fatal-error guard, blocking `get_output` that
+  raises `EngineDeadError` on the dead sentinel, `add_request_async` /
+  `abort_requests_async` shapes kept for W2's AsyncLLM and a future
+  multi-proc client.
+- **Sync path untouched**: additive files only; `EngineCore` members flipped
+  private→protected for the upstream subclass shape. `LLMEngine`/server
+  behavior unchanged (W2 rewires serving onto this client).
+- **Tests** (`tests/vllm/v1/test_engine_core_proc.cpp`): upstream
+  `tests/v1/engine/test_engine_core_client.py` sync-cycle assertions
+  (normal/abort/abort-after-finish) ported T-unit over the RunnerStub seam +
+  busy-loop shutdown/dead-sentinel/batch-queue-reject cases. CPU ctest
+  93/93; 25/25 stability reruns; clean full build, zero warnings.
+- **GATING, honestly**: G1 (both greedy gates re-run same binary) and G4
+  (offline no-regression A/B) need the GB10, which `CLAIM-SERVE-GATE-1`
+  holds (flock holder + queued waiter at check time) — per the
+  no-queueing-behind-the-campaign rule they are DEFERRED to the next
+  GPU-idle window and recorded in the engine-matrix row + handoff queue.
+  Row `GATING`, not `DONE`. README untouched: no externally-visible change
+  until W2 rewires serving.
+
+**Next:** claim W2 (`SERVE-ASYNC-LLM`) on the merged queue split (unblocks
+`ROAD-V1-A` latency axes); run W1's G1/G4 when the GPU frees; W3 async
+default mirror; W4 priority separable.

@@ -191,6 +191,14 @@ submitting AI-assisted code, read
   PR/commit references, how parity was verified.
 - [.agents/roadmap.md](.agents/roadmap.md) — engineer's work breakdown:
   milestones M0–M3 as pick-up-able units with DoD; status kept current.
+- [.agents/post-mvp.md](.agents/post-mvp.md) — **the post-MVP program** (started
+  2026-07-10 when both throughput gates passed): in-flight closing tracks,
+  parallel research tracks (Metal/MLX, arches/ROCm, SGLang, llama.cpp CPU,
+  spec decode, feature matrix), the T1/T2 queue, and the coming protocol
+  evolution (mirror-as-floor, surpass-by-fusing).
+- [.agents/feature-matrix.md](.agents/feature-matrix.md) — **the one-by-one
+  vLLM feature parity table** (what vLLM has vs what we have, every feature:
+  parallelism, quant, serving, spec decode, multimodal, …). Living doc.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
   decisions, next steps. Update this every working session.
 

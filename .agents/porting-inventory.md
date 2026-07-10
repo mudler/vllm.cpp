@@ -486,8 +486,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `build/vendor-triton-aot`).** The generated AOT artifacts (per-spec C
     launchers with EMBEDDED cubins + the linked stable dispatchers, 10 bases =
     5 kernels × H=48/32) are now COMMITTED per-arch under
-    `src/vt/cuda/triton_aot_vendored/<arch>/` (today `sm_121a/`; ~6.8 MB total,
-    the Marlin/FA-2 vendoring precedent), each with a provenance header and a
+    `src/vt/cuda/triton_aot_vendored/<arch>/` (today `sm_121a/`; 40 files +
+    MANIFEST, 6.7 MB total — the embedded-cubin C arrays dominate; the
+    Marlin/FA-2 vendoring precedent), each with a provenance header and a
     `MANIFEST` (triton/ptxas/python/CUDA versions, sha256 of every
     `triton_kernels/*.py`, per-base generation parameters, date). This NARROWS
     the sanction: `-DVLLM_CPP_TRITON=ON` now consumes the vendored artifacts
@@ -502,6 +503,11 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     instructions. Regen is byte-deterministic (verified: two independent regens
     on GB10, triton 3.6.0 ptxas 12.8 → byte-identical tree), so `git diff`
     after regen IS the change signal. The OFF build stays byte-inert.
+    VALIDATED end-to-end on dgx.casa (2026-07-10, fresh clone, configure pinned
+    to `VLLM_CPP_TRITON_PYTHON=/nonexistent/python` so only the vendored
+    artifacts could satisfy the build): full `all` builds green with no Python,
+    `test_ops_gdn` 31/31 cases (557 assertions), and the 27B W4A4 paged-engine
+    greedy gate passes on the vendored cubins.
     HONEST VERDICT: the full GDN Triton port (delta_h+chunk_o+WU) is a real, clean,
     token-exact per-kernel win — −34.1% GDN chunk-kernel GPU time, ~3× the delta_h-
     alone e2e win — but 27B does **NOT** reach ≥1.0× MVP parity (0.944× conc16 /

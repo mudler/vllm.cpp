@@ -491,8 +491,15 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
            "attn_qk_norm_rope_gate: cos_sin must be [T, rotary_dim]");
   VT_CHECK(rope_args.rotary_dim > 0 && rope_args.rotary_dim % 2 == 0 && rope_args.rotary_dim <= dh,
            "attn_qk_norm_rope_gate: rotary_dim must be even and <= Dh");
-  VT_CHECK(IsOutFloat(q_out.dtype) && k_out.dtype == q_out.dtype && gate_out.dtype == q_out.dtype,
-           "attn_qk_norm_rope_gate: q/k/gate out f32 or bf16 (same dtype)");
+  // q/k share one out dtype; the gate may additionally stay f32 while q/k are
+  // bf16 (the FA-2 prefill combo: bf16 q feeds FA-2 and bf16 k feeds the bf16
+  // KV-cache write, but sigmoid(gate) must see the un-rounded f32 gate). All
+  // kernel math is f32 either way; a bf16 store is the RN round of the same
+  // value, so mixed out is bit-identical to f32-out + CastBf16 on q/k.
+  VT_CHECK(IsOutFloat(q_out.dtype) && k_out.dtype == q_out.dtype &&
+               (gate_out.dtype == q_out.dtype ||
+                (q_out.dtype == DType::kBF16 && gate_out.dtype == DType::kF32)),
+           "attn_qk_norm_rope_gate: q/k/gate out f32 or bf16 (gate f32 allowed with bf16 q/k)");
   VT_CHECK(IsFloat(qgate.dtype) && kf.dtype == qgate.dtype,
            "attn_qk_norm_rope_gate: qgate/kf float, same dtype");
   VT_CHECK(q_norm.dtype == DType::kF32 && k_norm.dtype == DType::kF32 &&
@@ -1099,8 +1106,13 @@ void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgat
 
 void SigmoidGateBf16(Queue& q, Tensor& out, const Tensor& attn, const Tensor& gate) {
   VT_CHECK(out.dtype == DType::kBF16, "sigmoid_gate_bf16: out must be bf16");
-  VT_CHECK(attn.dtype == DType::kF32 && gate.dtype == DType::kF32,
-           "sigmoid_gate_bf16: attn/gate must be f32");
+  // attn may be bf16 (the FA-2 prefill path outputs bf16 attention); it is
+  // upcast to f32 inside the kernel (exact), so bf16-attn is bit-identical to
+  // f32-attn holding the same bf16-representable values. The gate stays f32
+  // (sigmoid input must not be rounded).
+  VT_CHECK((attn.dtype == DType::kF32 || attn.dtype == DType::kBF16) &&
+               gate.dtype == DType::kF32,
+           "sigmoid_gate_bf16: attn must be f32/bf16, gate f32");
   VT_CHECK(out.Numel() == attn.Numel() && out.Numel() == gate.Numel(),
            "sigmoid_gate_bf16: out/attn/gate must have the same element count");
   VT_CHECK(out.IsContiguous() && attn.IsContiguous() && gate.IsContiguous(),

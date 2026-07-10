@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -757,3 +758,144 @@ TEST_CASE("paged_attention CUDA matches CPU at head_dim 256 (gate config, epl=8)
   for (size_t i = 0; i < ref.size(); ++i)
     CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
 }
+
+// ===========================================================================
+// Vendored FlashAttention-2 prefill (VLLM_CPP_FLASH_ATTN build + VT_FA2_PREFILL
+// runtime): the exact flash_fwd_splitkv kernel vLLM runs on GB10, engaged for
+// the natively-bf16 combo (bf16 query + bf16 KV + bf16 out, head_dim 256,
+// prefill). Validated at the gate config against the f32 composed reference on
+// the SAME bf16-rounded q/K/V (residual = FA-2's bf16 tensor-core matmuls +
+// f32-softmax rounding + the bf16 output round, same tolerance class as the
+// WMMA bf16 test). Also pins the sync-free host-metadata path: passing
+// query_start_loc_host + a max_seq_len UPPER BOUND must be bit-identical to the
+// fallback (D2H+sync) run — the host values size grids only, never geometry.
+// ===========================================================================
+#ifdef VLLM_CPP_FLASH_ATTN
+namespace {
+// Set/restore an env var for the duration of a scope (exception-safe).
+struct EnvGuard {
+  const char* name;
+  explicit EnvGuard(const char* n, const char* value) : name(n) { setenv(name, value, 1); }
+  ~EnvGuard() { unsetenv(name); }
+  EnvGuard(const EnvGuard&) = delete;
+  EnvGuard& operator=(const EnvGuard&) = delete;
+};
+}  // namespace
+
+TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 256") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 prefill parity (dgx-pending)");
+    return;
+  }
+  const int64_t Hq = 16, Hk = 2, D = 256, block_size = 16;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  // Ragged 3-req batch at the gate config: a long prefill, a decode row, and a
+  // short chunked-prefill tail (context 137) — the mixed batch LaunchPaged
+  // treats as one prefill call.
+  std::vector<int32_t> qsl = {0, 100, 101, 104};
+  std::vector<int32_t> seq_lens = {100, 133, 140};
+  const int64_t num_tokens = 104;
+  const int64_t num_reqs = 3;
+  const int64_t num_blocks = 64, page = Hk * D, max_blocks = 9;
+  auto qf = RandF32(static_cast<size_t>(num_tokens * Hq * D), 2024);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 137);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * page), 179);
+  std::vector<int32_t> block_table = {5,  0,  11, 3,  0,  0, 0, 0, 0,
+                                      2,  17, 9,  20, 1,  8, 0, 0, 0,
+                                      30, 4,  22, 15, 6, 19, 7, 12, 0};
+
+  // Round q AND K/V to bf16 (bit-identical to what FA-2 reads) and build the
+  // f32 reference on those same values, so only FA-2's compute rounding + the
+  // bf16 output round remain.
+  std::vector<uint16_t> q_b(qf.size()), kc_b(kc.size()), vc_b(vc.size());
+  std::vector<float> q_r(qf.size()), kc_r(kc.size()), vc_r(vc.size());
+  for (size_t i = 0; i < qf.size(); ++i) {
+    q_b[i] = F32ToBf16Bits(qf[i]);
+    q_r[i] = Bf16BitsToF32(q_b[i]);
+  }
+  for (size_t i = 0; i < kc.size(); ++i) {
+    kc_b[i] = F32ToBf16Bits(kc[i]);
+    kc_r[i] = Bf16BitsToF32(kc_b[i]);
+    vc_b[i] = F32ToBf16Bits(vc[i]);
+    vc_r[i] = Bf16BitsToF32(vc_b[i]);
+  }
+  std::vector<float> ref = ComposedPagedRef(q_r, kc_r, vc_r, block_table, max_blocks, seq_lens,
+                                            qsl, Hq, Hk, D, block_size, scale, true);
+
+  // ENGINE cache layout: one (num_blocks, 2, block_size, Hk, D) bf16 allocation,
+  // K/V = the dim-1 unbind slices (block stride 2*bs*Hk*D) — what the runner
+  // really feeds PagedAttention (KvSlice).
+  const int64_t within = block_size * Hk * D;
+  std::vector<uint16_t> combined(static_cast<size_t>(num_blocks * 2 * within), 0);
+  for (int64_t b = 0; b < num_blocks; ++b)
+    for (int64_t e = 0; e < within; ++e) {
+      combined[static_cast<size_t>((b * 2 + 0) * within + e)] =
+          kc_b[static_cast<size_t>(b * within + e)];
+      combined[static_cast<size_t>((b * 2 + 1) * within + e)] =
+          vc_b[static_cast<size_t>(b * within + e)];
+    }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kBF16, {num_tokens, Hq, D}, q_b.data());
+  DeviceTensor dcache(gpu, g.q, DType::kBF16, {num_blocks * 2 * within}, combined.data());
+  auto SliceView = [&](int which) {
+    Tensor t = dcache.tensor();
+    t.data = static_cast<char*>(t.data) +
+             static_cast<size_t>(which) * static_cast<size_t>(within) * vt::SizeOf(DType::kBF16);
+    t.rank = 4;
+    t.shape[0] = num_blocks;
+    t.shape[1] = block_size;
+    t.shape[2] = Hk;
+    t.shape[3] = D;
+    t.stride[0] = 2 * within;
+    t.stride[1] = Hk * D;
+    t.stride[2] = D;
+    t.stride[3] = 1;
+    return t;
+  };
+  Tensor kview = SliceView(0);
+  Tensor vview = SliceView(1);
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+
+  EnvGuard fa2_on("VT_FA2_PREFILL", "1");
+
+  // Run 1: no host metadata -> the launcher's D2H+sync fallback sizes the grid.
+  DeviceTensor dout1(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+  vt::PagedAttention(g.q, dout1.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                     dsl.tensor(), dqsl.tensor(), PagedAttentionArgs{scale, true});
+  std::vector<uint16_t> got1(static_cast<size_t>(num_tokens * Hq * D), 0);
+  dout1.Download(g.q, got1.data());
+
+  // Run 2: sync-free host metadata, with max_seq_len an UPPER BOUND (160 > 140)
+  // — must be bit-identical to run 1 (host values size grids, not geometry).
+  PagedAttentionArgs host_args{scale, true};
+  host_args.query_start_loc_host = qsl.data();
+  host_args.max_seq_len = 160;
+  DeviceTensor dout2(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+  vt::PagedAttention(g.q, dout2.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                     dsl.tensor(), dqsl.tensor(), host_args);
+  std::vector<uint16_t> got2(static_cast<size_t>(num_tokens * Hq * D), 0);
+  dout2.Download(g.q, got2.data());
+
+  double max_abs = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs,
+                       std::abs(static_cast<double>(Bf16BitsToF32(got1[i])) - ref[i]));
+  }
+  MESSAGE("FA-2 bf16 prefill max_abs_err vs f32 ref = " << max_abs);
+  CHECK(max_abs < 5e-2);
+
+  size_t mism = 0;
+  for (size_t i = 0; i < got1.size(); ++i)
+    if (got1[i] != got2[i]) ++mism;
+  MESSAGE("FA-2 host-metadata vs fallback mismatches = " << mism);
+  CHECK(mism == 0);
+}
+#else
+TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 256") {
+  MESSAGE("built without VLLM_CPP_FLASH_ATTN; FA-2 prefill parity skipped");
+}
+#endif  // VLLM_CPP_FLASH_ATTN

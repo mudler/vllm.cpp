@@ -139,6 +139,13 @@ struct PagedAttentionArgs {
   // / callers without a host qsl). Mirrors GdnArgs::query_start_loc_host and the
   // decode StepDevInputs device-resident metadata pattern.
   const int32_t* query_start_loc_host = nullptr;
+  // OPTIONAL host-known max context length in this batch (max over the device
+  // `seq_lens` values = CommonAttentionMetadata::max_seq_len; an upper bound is
+  // safe — it only sizes grids/rounded dims, per-request geometry stays on the
+  // device values). When > 0 the FA-2 prefill launcher sizes its grid without a
+  // device read (companion to query_start_loc_host). 0 => that launcher falls
+  // back to the D2H+sync.
+  int32_t max_seq_len = 0;
 };
 
 // MoE router top-k args (.agents/moe-semantics.md §3 is the formula reference).
@@ -589,8 +596,11 @@ void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const R
 //   k_out   [T, Hkv, Dh]  f32/bf16 — gemma-RMSNorm'd + RoPE'd k
 //   gate_out[T, Hq, Dh]   f32/bf16 — the raw gate half (passthrough, no norm/rope)
 // norm_args: eps + gemma (must be gemma=true for Qwen). rope_args: rotary_dim (the
-// partial rotation width; base is unused — the cache is precomputed). q_out/k_out/
-// gate_out share one dtype; qgate/kf share one dtype. CPU + CUDA.
+// partial rotation width; base is unused — the cache is precomputed). q_out/k_out
+// share one dtype; gate_out matches it OR stays f32 while q/k are bf16 (the FA-2
+// prefill combo: bf16 q/k feed FA-2 + the bf16 KV-cache write — each store is the
+// RN round of the same f32 value, bit-identical to f32-out + CastBf16 — while
+// sigmoid(gate) keeps the un-rounded f32 gate). qgate/kf share one dtype. CPU + CUDA.
 void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                         const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
                         const Tensor& k_norm, const Tensor& cos_sin,
@@ -912,8 +922,11 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in);
 void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate);
 
 // out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])), sigmoid(x)=1/(1+exp(-x)); out
-// bf16, attn/gate f32, same element count. The sigmoid output-gate applied to
-// the attention result before the o_proj (elementwise on the projection split).
+// bf16, attn f32 OR bf16 (the FA-2 prefill path hands bf16 attention out; the
+// upcast is exact so bf16-attn is bit-identical to f32-attn holding the same
+// values), gate f32 (sigmoid input must not be rounded), same element count.
+// The sigmoid output-gate applied to the attention result before the o_proj
+// (elementwise on the projection split).
 void SigmoidGateBf16(Queue& q, Tensor& out, const Tensor& attn, const Tensor& gate);
 
 // Derives the GDN per-head decay g and gate beta from the raw projections

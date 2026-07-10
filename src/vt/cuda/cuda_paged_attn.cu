@@ -38,6 +38,21 @@
 #include "vt/ops.h"
 
 namespace vt::cuda {
+
+#ifdef VLLM_CPP_FLASH_ATTN
+// Vendored FlashAttention-2 sm_121a prefill launcher (cuda_flash_attn_fa2.cu).
+// Declared at vt::cuda scope (external linkage) — the definition lives in a
+// separate TU. Torch-free drop-in for the full-attn causal + paged-KV + GQA +
+// head_dim-256 + bf16 prefill path (the exact FA-2 flash_fwd_splitkv kernel vLLM
+// runs on GB10). Runtime toggle VT_FA2_PREFILL (see Fa2PrefillEnabled()).
+void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                          const Tensor& k_cache, const Tensor& v_cache,
+                          const Tensor& block_table, const Tensor& seq_lens,
+                          const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                          int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
+                          int64_t block_size);
+#endif  // VLLM_CPP_FLASH_ATTN
+
 namespace {
 
 constexpr int kPagedBlock = 256;
@@ -2268,6 +2283,22 @@ void DispatchPrefillFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& query,
   }
 }
 
+#ifdef VLLM_CPP_FLASH_ATTN
+// FlashAttention-2 prefill toggle (VT_FA2_PREFILL, DEFAULT ON when compiled;
+// =0 restores the WMMA prefill for a same-binary A/B). Only eligible for bf16
+// query + bf16 KV + bf16 out + head_dim 256 (see the LaunchPaged gate) — the
+// natively-bf16 production 27B full-attn prefill. Read fresh each call (not
+// static-cached) so in-process tests can flip it; the check is a getenv on a
+// host path that runs once per full-attn layer per step. MUST match
+// qwen3_5.cpp Fa2PrefillOn(), which selects the bf16 q/out dtypes that make
+// this gate eligible. Measured 2026-07-10 (GB10): kernel 3.68x vs WMMA, 27B
+// e2e +1.2%/+0.5% (conc16/conc32), token-exact gates PASS — see the ledger.
+bool Fa2PrefillEnabled() {
+  const char* e = std::getenv("VT_FA2_PREFILL");
+  return e == nullptr || e[0] != '0';
+}
+#endif  // VLLM_CPP_FLASH_ATTN
+
 // TQ = query dtype, TKV = KV-cache dtype (decoupled: Phase-1 bf16 KV cache keeps
 // an f32 query with a bf16 cache — attention still accumulates in f32, the cache
 // reads convert bf16→f32 via Load()). Tout is dispatched here from out.dtype.
@@ -2298,6 +2329,22 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const bool flash2 = gqa && PrefillWmmaFlash2Enabled();
   const bool flash2vec = flash2 && PrefillFlash2VecEnabled();
   const bool prefill = is_prefill && d <= kMaxEpl * 32 && PrefillFlashEnabled();
+#ifdef VLLM_CPP_FLASH_ATTN
+  // Vendored FA-2 sm_121a prefill: the exact flash_fwd_splitkv kernel vLLM runs
+  // (paged + varlen + GQA + causal), head_dim 256, toggle VT_FA2_PREFILL.
+  // NATIVE bf16 only — bf16 query (TQ) + bf16 KV (TKV) + bf16 out; anything
+  // else (f32 q/out: the 35B fp8 path, the non-preamble 27B fallback, unit
+  // anchors) falls through to the WMMA ladder. The earlier f32 wiring bridged
+  // with cast kernels and measurably erased the win (parity-ledger 2026-07-06
+  // FA-2 split-KV row); the production 27B preamble now emits bf16 q and the
+  // sigmoid gate consumes bf16 attention out, so no casts exist on this path.
+  const bool fa2 = is_prefill && d == 256 && Fa2PrefillEnabled() &&
+                   std::is_same<TQ, __nv_bfloat16>::value &&
+                   std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
+#else
+  const bool fa2 = false;
+  (void)fa2;  // all fa2 uses are #ifdef VLLM_CPP_FLASH_ATTN — silence -Werror=all-warnings
+#endif
   switch (out.dtype) {
     case DType::kF32:
       if (flash2vec) {
@@ -2328,6 +2375,12 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       }
       break;
     case DType::kBF16:
+#ifdef VLLM_CPP_FLASH_ATTN
+      if (fa2) {
+        LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                             query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
+      } else  // NOLINT(readability/braces) — chains into the flash2vec ladder below
+#endif
       if (flash2vec) {
         DispatchPrefillFlash2Vec<TQ, TKV, __nv_bfloat16>(s, out, query, k_cache, v_cache,
                                                          block_table, seq_lens, query_start_loc,

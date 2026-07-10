@@ -361,6 +361,30 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
     port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
 
+11. **Vendored FlashAttention-2 (the full-attn PREFILL kernel — both gate models'
+    head_dim-256 GQA attention)**: `src/vt/cuda/flash_attn/` is a byte-identical,
+    torch-free vendor of vllm-project/flash-attention @ 2c839c33 (the exact
+    source vLLM 0.24.0 builds as `_vllm_fa2_C`; its
+    `flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256,64,64,4,...>>` is what
+    vLLM's own profile shows for prefill on GB10). 3 stub headers replace the
+    ATen/c10 surface (PhiloxCudaState POD + C10_CUDA_CHECK) and
+    `fa2_compat_prelude.h` is force-included; the FA sources stay pristine.
+    `flash_api.cpp` (torch-heavy) is replaced by the torch-free launcher
+    `src/vt/cuda/cuda_flash_attn_fa2.cu` (fills `Flash_fwd_params` from
+    `vt::Tensor` views; paged block_table + varlen cu_seqlens_q/seqused_k;
+    num_splits pinned 1 = vLLM's FA-2 varlen behavior,
+    flash_attn_interface.py:309-310). Engaged by the LaunchPaged dispatch for
+    the natively-bf16 prefill combo only (bf16 q from the fused preamble + bf16
+    KV + bf16 out, head_dim 256); decode + every other combo stay on the
+    hand-written WMMA/decode kernels, and the CPU reference is untouched. CMake
+    `VLLM_CPP_FLASH_ATTN` (default ON with CUTLASS, sm_12xa), runtime
+    `VT_FA2_PREFILL` (default ON when compiled; =0 → WMMA for same-binary A/B).
+    **Verified GB10 sm_121a (2026-07-10): kernel 3.68× vs our WMMA (475.3→129.2
+    ms per profile window), 27B e2e +1.52%/+0.54% (conc16/conc32) → ≥1.0× vs
+    fresh graphed vLLM at BOTH MVP points; token-exact greedy gates PASS ON and
+    OFF; the earlier −4.3% attempt was the f32↔bf16 cast glue + a per-layer
+    D2H sync, both removed (see parity-ledger 2026-07-10).**
+
 9.N **Triton CUDA fast-path for PROVEN codegen-bound kernels (User-sanctioned
     2026-07-09; extends the "vendor a proven kernel when we can't match it" clause).**
     For a kernel where portable C++ is *measured-exhausted* against vLLM's compiler

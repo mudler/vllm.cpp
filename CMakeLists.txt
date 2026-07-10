@@ -408,11 +408,13 @@ if(VLLM_CPP_CUDA)
   # Compiled torch-free against our CUTLASS: 3 stub headers replace the ATen/c10
   # surface (PhiloxCudaState POD + C10_CUDA_CHECK), and fa2_compat_prelude.h is
   # force-included for the std headers ATen pulled in transitively — the upstream
-  # (auto-generated) FA sources stay byte-for-byte pristine. Opt-in at build with
-  # -DVLLM_CPP_FLASH_ATTN=ON (needs CUTLASS); runtime toggle VT_FA2_PREFILL=1
-  # (default OFF) so the proven WMMA prefill stays default until FA-2 is
-  # validated token-for-token AND over the throughput bar on this build.
-  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill kernel (needs CUTLASS)" OFF)
+  # (auto-generated) FA sources stay byte-for-byte pristine. DEFAULT ON (like
+  # Marlin/cutlass) — it only actually builds when CUTLASS is present
+  # (VLLM_CPP_CUTLASS, sm_12xa); -DVLLM_CPP_FLASH_ATTN=OFF opts out. Runtime
+  # toggle VT_FA2_PREFILL (default ON when compiled; =0 restores the WMMA
+  # prefill for a same-binary A/B). Validated token-for-token + over the
+  # throughput bar on GB10 2026-07-10 (see .agents/parity-ledger.md).
+  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill kernel (needs CUTLASS)" ON)
   if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
     set(_FA2_KERNEL_SRCS

@@ -2284,16 +2284,18 @@ void DispatchPrefillFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& query,
 }
 
 #ifdef VLLM_CPP_FLASH_ATTN
-// FlashAttention-2 prefill toggle (VT_FA2_PREFILL, default OFF). Only eligible
-// for bf16 query + bf16 KV + bf16 out + head_dim 256 (see the LaunchPaged
-// gate) — the natively-bf16 production 27B full-attn prefill. Read fresh each
-// call (not static-cached) so in-process tests can flip it; the check is a
-// getenv on a host path that runs once per full-attn layer per step. MUST match
+// FlashAttention-2 prefill toggle (VT_FA2_PREFILL, DEFAULT ON when compiled;
+// =0 restores the WMMA prefill for a same-binary A/B). Only eligible for bf16
+// query + bf16 KV + bf16 out + head_dim 256 (see the LaunchPaged gate) — the
+// natively-bf16 production 27B full-attn prefill. Read fresh each call (not
+// static-cached) so in-process tests can flip it; the check is a getenv on a
+// host path that runs once per full-attn layer per step. MUST match
 // qwen3_5.cpp Fa2PrefillOn(), which selects the bf16 q/out dtypes that make
-// this gate eligible.
+// this gate eligible. Measured 2026-07-10 (GB10): kernel 3.68x vs WMMA, 27B
+// e2e +1.2%/+0.5% (conc16/conc32), token-exact gates PASS — see the ledger.
 bool Fa2PrefillEnabled() {
   const char* e = std::getenv("VT_FA2_PREFILL");
-  return e != nullptr && e[0] == '1';
+  return e == nullptr || e[0] != '0';
 }
 #endif  // VLLM_CPP_FLASH_ATTN
 

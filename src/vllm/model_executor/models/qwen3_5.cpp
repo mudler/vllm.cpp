@@ -741,14 +741,20 @@ bool FuseAttnPreambleOn(bool fp4_attn) {
 // prefill attention 1.37 vs vLLM's FA-2 0.25 us/tok/layer (~18 us/tok e2e).
 // bf16-q/out is NOT bit-identical to the f32-q WMMA path (FA-2 rounds q to bf16
 // and accumulates in its own order) but IS vLLM-faithful (vLLM's whole attn
-// path is bf16) — validated by the token-exact greedy gate. Decode segments
-// keep f32 q/out + the graph-captured decode kernels, byte-identical to today.
-// Toggle VT_FA2_PREFILL (default OFF; =1 enables). Compiled only with
-// VLLM_CPP_FLASH_ATTN — without it the env is ignored and the WMMA path runs.
+// path is bf16) — validated by the token-exact greedy gate (2026-07-10: 27B
+// engine gate PASS ON and OFF, same tie branch; chunked==one-shot holds).
+// MEASURED (2026-07-10, GB10, same binary): kernel 3.68x faster (475.3ms ->
+// 129.2ms per np16xin1024 profile; ~1.81 -> 0.49 us/tok/layer), 27B e2e
+// conc16/np96 752.8 -> 761.6 (+1.2%), conc32/np192 1045.6 -> 1050.4 (+0.5%),
+// TTFT -3.4/-3.6%, putting the 27B at/above fresh graphed-vLLM denominators —
+// hence DEFAULT ON when compiled (VLLM_CPP_FLASH_ATTN); VT_FA2_PREFILL=0
+// restores the WMMA prefill for a same-binary A/B. Decode segments keep f32
+// q/out + the graph-captured decode kernels, byte-identical either way.
+// Without VLLM_CPP_FLASH_ATTN the env is ignored and the WMMA path runs.
 bool Fa2PrefillOn() {
 #ifdef VLLM_CPP_FLASH_ATTN
   const char* e = std::getenv("VT_FA2_PREFILL");
-  return e != nullptr && e[0] == '1';
+  return e == nullptr || e[0] != '0';
 #else
   return false;
 #endif

@@ -62,7 +62,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 
 | ID | Item | Upstream | Our code + tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|
-| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection, capability metadata, task-aware loader/runner construction | `registry.py:998-1164,1192-1296,1396-1403` | current `ModelForwardFn` hardcodes Qwen3.5 MoE weights; no generic factory test | ☐ required before new families | `INVENTORIED` | unassigned |
+| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection, capability metadata, task-aware loader/runner construction | `registry.py:998-1164,1192-1296,1396-1403` | current `ModelForwardFn` hardcodes Qwen3.5 MoE weights; no generic factory test | ☐ spike in progress | `SPIKE` | `CLAIM-MODEL-FACTORY-SPIKE-1` |
 
 ## MODEL-TEXT - Text generation
 

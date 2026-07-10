@@ -1359,16 +1359,20 @@ DType GdnInDType() {
 // split). Distinct from the earlier VT_BF16_GDN (in_proj/conv/z-gate, neutral):
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
 // A/B: VT_GDN_OUT_BF16 unset restores the byte-identical f32 dcore/z path.
-// PER-ARCH default (2026-07-10): ON for the 27B (bf16-weight in_proj branch;
-// `fp8_in_proj`=false) — the +0.8% conc32 win was measured token-exact on
-// 2026-07-08 (ledger) and the bf16 core/z is MORE vLLM-faithful, but the flip
-// was left "pending" and the finisher's everything-on baseline never included
-// it. Today's site measurement: gated-norm 0.37 (f32 core) vs vLLM 0.15
-// us/tok/layer. The 35B (fp8 in_proj — its z GEMM consumes outdt) keeps the
-// measured-shipped f32 default. VT_GDN_OUT_BF16=1/0 force-overrides.
+// DEFAULT OFF (f32) — MEASURED 2026-07-10 on the Triton-AOT build: flipping
+// the 27B default to bf16 core/z REGRESSED conc16 754.71 vs 757.15 (3-rep
+// means, non-overlapping) because the SANCTIONED Triton AOT chunk_o fast-path
+// only fires for f32 output (cuda_gdn.cu TryTritonChunkO guard `Tout==float`)
+// — bf16 out silently forfeits its −36% kernel win and falls back to the hand
+// WMMA chunk_o. The old +0.8% for VT_GDN_OUT_BF16=1 (2026-07-08 ledger)
+// predates the Triton port and no longer holds. RE-FLIP ONLY together with a
+// bf16-out chunk_o AOT variant (vLLM/FLA itself stores o bf16 — that variant
+// is the faithful follow-up). `fp8_in_proj` (the 35B marker) is kept so a
+// future flip stays per-arch; env VT_GDN_OUT_BF16=1/0 force-overrides.
 DType GdnOutDType(bool fp8_in_proj) {
+  (void)fp8_in_proj;  // per-arch hook for the future bf16-out AOT re-flip
   static const char* e = std::getenv("VT_GDN_OUT_BF16");
-  const bool bf16 = (e != nullptr) ? (e[0] == '1') : !fp8_in_proj;
+  const bool bf16 = (e != nullptr) && e[0] == '1';
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 

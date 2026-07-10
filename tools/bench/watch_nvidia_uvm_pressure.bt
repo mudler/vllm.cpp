@@ -1,0 +1,40 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Low-overhead sentinel for the NVIDIA UVM failure seen on this local host.
+ *
+ * The prior crash first corrupted process_lazy_free() state, then trapped
+ * vllm-bench in uvm_pmm_gpu_pma_evict_range(). NVIDIA's open module exposes
+ * both functions as kprobes on kernel 6.18. The kernel's eventual
+ * __list_del_entry_valid_or_report() path is marked notrace, so it cannot be
+ * probed. This program is observational: it cannot make a corrupted driver
+ * list safe or abort PMA eviction.
+ */
+BEGIN
+{
+  printf("watching NVIDIA UVM lazy-free activity and vllm-bench PMA eviction\n");
+}
+
+kprobe:process_lazy_free
+/comm == "vidmem lazy fre"/
+{
+  @lazy_free_calls = count();
+}
+
+kprobe:uvm_pmm_gpu_pma_evict_range
+/comm == "vllm-bench"/
+{
+  time("%H:%M:%S ");
+  printf("WARNING: vllm-bench entered UVM PMA eviction pid=%d tid=%d args=%p,%p,%p,%p\n",
+         pid, tid, arg0, arg1, arg2, arg3);
+  print(kstack);
+  @pma_evictions = count();
+}
+
+interval:s:5
+{
+  print(@lazy_free_calls);
+  print(@pma_evictions);
+  clear(@lazy_free_calls);
+  clear(@pma_evictions);
+}

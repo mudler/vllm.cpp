@@ -130,11 +130,18 @@ struct Registrar {
   Registrar() noexcept {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return;
-    int pageable = 0;  // cudaDevAttrPageableMemoryAccess: host and device share one memory space
+    // PageableMemoryAccess alone means the driver can service ordinary host
+    // pointers through HMM/UVM. Discrete Blackwell reports it too; that does
+    // not make pageable system RAM equivalent to device-local memory. Require
+    // an integrated GPU as well before exposing the zero-copy contract used by
+    // DeviceScratch and the persistent KV/GDN caches.
+    int pageable = 0;
+    int integrated = 0;
     if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) != cudaSuccess) {
       return;
     }
-    static CudaBackend backend(0, pageable != 0);  // device 0 only for now
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) return;
+    static CudaBackend backend(0, pageable != 0 && integrated != 0);  // device 0 only for now
     RegisterBackend(DeviceType::kCUDA, &backend);
   }
 } registrar;

@@ -27,6 +27,10 @@
 #include <string>
 #include <vector>
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/sampling_params.h"
@@ -314,6 +318,45 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(gs.conv_state.shape[1] == conv_dim);
   CHECK(gs.conv_state.shape[2] == c.linear_conv_kernel_dim - 1);
 }
+
+#ifdef VLLM_CPP_CUDA
+// vLLM allocates its raw KV tensors with torch.zeros(..., device=self.device)
+// (vllm/v1/worker/gpu_model_runner.py::_allocate_kv_cache_tensors). A discrete
+// CUDA runner must therefore expose device allocations, never pageable host
+// pointers that happen to be GPU-addressable through HMM/UVM.
+TEST_CASE("runner: discrete CUDA KV and GDN caches are device allocations") {
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+    MESSAGE("no CUDA device; skipping");
+    return;
+  }
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCUDA);
+  if (backend.UnifiedMemory()) {
+    MESSAGE("unified-memory CUDA backend; host-backed caches are valid");
+    return;
+  }
+
+  vt::Queue q = backend.CreateQueue();
+  {
+    const HfConfig c = MakeConfig();
+    const Qwen3_5MoeWeights w = MakeWeights(c);
+    GPUModelRunner runner(c, w, MakeKvConfig(c), q, /*max_num_reqs=*/8,
+                          kMaxModelLen, /*max_num_batched_tokens=*/64);
+    backend.Synchronize(q);
+
+    cudaPointerAttributes attr{};
+    REQUIRE(cudaPointerGetAttributes(&attr, runner.attn_kv()[0].data) == cudaSuccess);
+    CHECK(attr.type == cudaMemoryTypeDevice);
+    REQUIRE(cudaPointerGetAttributes(&attr, runner.gdn_state()[0].ssm_state.data) ==
+            cudaSuccess);
+    CHECK(attr.type == cudaMemoryTypeDevice);
+    REQUIRE(cudaPointerGetAttributes(&attr, runner.gdn_state()[0].conv_state.data) ==
+            cudaSuccess);
+    CHECK(attr.type == cudaMemoryTypeDevice);
+  }
+  backend.DestroyQueue(q);
+}
+#endif
 
 // ─── 2. THE ORDERING IDENTITY GATE (mandatory de-risk) ───────────────────────
 // A batch of {1 decode "D", 1 prefill "P"} admitted PREFILL-FIRST. After the

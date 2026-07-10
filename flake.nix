@@ -40,13 +40,25 @@
             cuda.libcurand
           ];
           cudaRuntimePackages = cudaPackages ++ [
+            pkgs.stdenv.cc.cc.lib
             pkgs.gcc14.cc.lib
+            pkgs.zlib
           ];
           cudaLibPath = pkgs.lib.makeLibraryPath cudaRuntimePackages;
           cudaIncludePath = pkgs.lib.concatStringsSep ":" [
             (pkgs.lib.makeSearchPathOutput "dev" "include" cudaPackages)
             (pkgs.lib.makeSearchPathOutput "include" "include" cudaPackages)
           ];
+          # Nsight's CLI is self-contained. Nixpkgs also adds UCX for optional
+          # network tracing, but that UCX build enables DOCA GDA without
+          # providing its headers on this host. Drop only that optional runtime
+          # dependency so the native profiler remains available; CUDA tracing
+          # does not use UCX.
+          nsightSystemsCli = cuda.nsight_systems.overrideAttrs (old: {
+            buildInputs = builtins.filter
+              (dep: (dep.pname or "") != "ucx")
+              old.buildInputs;
+          });
         in
         {
           default = pkgs.mkShell {
@@ -59,7 +71,12 @@
           };
 
           cuda = pkgs.mkShell {
-            packages = commonPackages ++ [ pkgs.gcc14 ] ++ cudaPackages;
+            packages = commonPackages ++ [
+              pkgs.bpftrace
+              pkgs.gcc14
+              pkgs.gdb
+              nsightSystemsCli
+            ] ++ cudaPackages;
 
             CUDA_PATH = "${cuda.cuda_nvcc}";
             CUDAToolkit_ROOT = "${cuda.cuda_nvcc}";

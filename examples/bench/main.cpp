@@ -9,9 +9,10 @@
 // comparable to a vLLM run on the same box, model and workload. See
 // examples/bench/bench_core.h for the cited metric mapping.
 //
-//   vllm-bench [--model <dir|.gguf>] [--num-prompts N] [--input-len L]
+//   vllm-bench [--model <dir|.gguf>] [--dataset-path <sharegpt.json>]
+//              [--num-prompts N] [--input-len L]
 //              [--output-len O] [--concurrency C] [--seed S]
-//              [--temperature T]
+//              [--temperature T] [--output-token-ids <json>]
 //
 // With NO --model it builds a SYNTHETIC tiny CPU engine so the harness runs on
 // the dev box (toy weights => meaningless numbers; the point is the harness).
@@ -41,8 +42,10 @@ void Usage(const char* argv0, std::FILE* out) {
   std::fprintf(
       out,
       "usage: %s [--model <dir|.gguf>] [--num-prompts N] [--input-len L]\n"
+      "          [--dataset-path <sharegpt.json>]\n"
       "          [--output-len O] [--concurrency C] [--seed S]\n"
       "          [--temperature T] [--max-num-batched-tokens B]\n"
+      "          [--output-token-ids <json>]\n"
       "\n"
       "Throughput/latency benchmark over the vllm.cpp V1 LLMEngine, mirroring\n"
       "`vllm bench serve` metrics. With no --model, a synthetic CPU engine runs\n"
@@ -66,6 +69,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
     const std::string flag = argv[i];
     if (flag == "--model") {
       cfg.model_path = NextArg(argc, argv, i);
+    } else if (flag == "--dataset-path") {
+      cfg.dataset_path = NextArg(argc, argv, i);
     } else if (flag == "--num-prompts") {
       cfg.num_prompts = std::atoi(NextArg(argc, argv, i));
     } else if (flag == "--input-len") {
@@ -78,6 +83,8 @@ bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
       cfg.seed = std::strtoull(NextArg(argc, argv, i), nullptr, 10);
     } else if (flag == "--temperature") {
       cfg.temperature = std::atof(NextArg(argc, argv, i));
+    } else if (flag == "--output-token-ids") {
+      cfg.output_token_ids_path = NextArg(argc, argv, i);
     } else if (flag == "--max-num-batched-tokens") {
       cfg.max_num_batched_tokens = std::atoi(NextArg(argc, argv, i));
     } else if (flag == "--num-blocks") {
@@ -115,15 +122,19 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr,
                "vllm-bench: %s engine | num_prompts=%d input_len=%d "
-               "output_len=%d concurrency=%d seed=%llu temp=%.2f\n",
+               "output_len=%d concurrency=%d seed=%llu temp=%.2f dataset=%s\n",
                cfg.model_path.empty() ? "SYNTHETIC (no --model)"
                                        : cfg.model_path.c_str(),
                cfg.num_prompts, cfg.input_len, cfg.output_len, cfg.concurrency,
-               static_cast<unsigned long long>(cfg.seed), cfg.temperature);
+               static_cast<unsigned long long>(cfg.seed), cfg.temperature,
+               cfg.dataset_path.empty() ? "generated" : cfg.dataset_path.c_str());
 
   try {
     const vllm::bench::BenchResult res = vllm::bench::RunBench(cfg);
     vllm::bench::PrintReport(cfg, res, stdout);
+    if (!cfg.output_token_ids_path.empty()) {
+      vllm::bench::WriteOutputTokenIds(cfg.output_token_ids_path, res);
+    }
     if (res.completed != cfg.num_prompts) {
       std::fprintf(stderr,
                    "vllm-bench: only %d/%d requests completed\n", res.completed,

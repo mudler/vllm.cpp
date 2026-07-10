@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,11 @@ namespace vllm::bench {
 struct BenchConfig {
   // Empty => SYNTHETIC tiny CPU engine (smoke). Otherwise a model dir / .gguf.
   std::string model_path;
+  // Optional ShareGPT JSON file. When set, consume the first conversation turn
+  // from each entry so vLLM and vllm.cpp can run byte-identical prompts.
+  std::string dataset_path;
+  // Optional JSON output path containing generated IDs in submission order.
+  std::string output_token_ids_path;
   int num_prompts = 8;     // N: total requests to submit.
   int input_len = 16;      // L: target prompt tokens per request.
   int output_len = 16;     // O: max_tokens per request (greedy => exactly O).
@@ -89,6 +95,7 @@ struct RequestRecord {
   double last_token_s = 0.0;    // running: previous token arrival (for ITL).
   int prompt_tokens = 0;
   int output_tokens = 0;
+  std::vector<int32_t> output_token_ids;
   std::vector<double> itls;  // inter-token latencies (s), one per chunk>1st.
   bool finished = false;
 };
@@ -99,6 +106,9 @@ struct BenchResult {
   double duration_s = 0.0;
   int64_t total_input = 0;
   int64_t total_output = 0;
+  // Per-request generated IDs in submission order. This makes the benchmark
+  // workload usable as a token-for-token correctness gate before timing it.
+  std::vector<std::vector<int32_t>> output_token_ids;
   double request_throughput = 0.0;       // req/s
   double output_throughput = 0.0;        // tok/s  (decode)
   double input_throughput = 0.0;         // tok/s  (prefill) — our split
@@ -344,6 +354,33 @@ inline std::string BuildPrompt(const tok::Tokenizer& t, int target,
   return p;
 }
 
+inline std::vector<std::string> LoadShareGptPrompts(const std::string& path,
+                                                    int num_prompts) {
+  std::ifstream in(path);
+  if (!in) throw std::runtime_error("cannot open dataset: " + path);
+  nlohmann::json data;
+  in >> data;
+  if (!data.is_array())
+    throw std::runtime_error("ShareGPT dataset must be a JSON array: " + path);
+
+  std::vector<std::string> prompts;
+  prompts.reserve(static_cast<size_t>(num_prompts));
+  for (const auto& entry : data) {
+    if (!entry.contains("conversations") ||
+        !entry["conversations"].is_array() ||
+        entry["conversations"].empty())
+      continue;
+    const auto& turn = entry["conversations"][0];
+    if (!turn.contains("value") || !turn["value"].is_string()) continue;
+    prompts.push_back(turn["value"].get<std::string>());
+    if (static_cast<int>(prompts.size()) == num_prompts) break;
+  }
+  if (static_cast<int>(prompts.size()) != num_prompts) {
+    throw std::runtime_error("dataset has fewer valid prompts than --num-prompts");
+  }
+  return prompts;
+}
+
 }  // namespace detail
 
 // Build a SamplingParams for one bench request (greedy unless temperature>0).
@@ -351,6 +388,9 @@ inline SamplingParams MakeSampling(const BenchConfig& cfg, int req_index) {
   SamplingParams sp;
   sp.temperature = cfg.temperature;  // <= 0 => greedy.
   sp.max_tokens = cfg.output_len;
+  // vllm bench throughput always sets ignore_eos=True so every request emits
+  // exactly the requested output length.
+  sp.ignore_eos = true;
   sp.output_kind = RequestOutputKind::kDelta;  // observe TTFT/ITL like a client.
   if (cfg.temperature > 0.0) {
     sp.seed = static_cast<int64_t>(cfg.seed + static_cast<uint64_t>(req_index));
@@ -369,17 +409,24 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded;
   std::vector<std::string> prompts;
   prompts.reserve(static_cast<size_t>(cfg.num_prompts));
+  if (!cfg.dataset_path.empty()) {
+    prompts = detail::LoadShareGptPrompts(cfg.dataset_path, cfg.num_prompts);
+  }
 
   if (cfg.model_path.empty()) {
     // Synthetic: build tokenizer first (to size the engine + measure prompts),
     // then move it into the LoadedEngine.
     tok::Tokenizer tok = detail::BuildSyntheticTokenizer();
     int max_prompt = 1;
-    for (int i = 0; i < cfg.num_prompts; ++i) {
-      prompts.push_back(detail::BuildPrompt(
-          tok, cfg.input_len, cfg.seed + static_cast<uint64_t>(i)));
-      max_prompt = std::max(
-          max_prompt, static_cast<int>(tok.Encode(prompts.back()).size()));
+    if (prompts.empty()) {
+      for (int i = 0; i < cfg.num_prompts; ++i) {
+        prompts.push_back(detail::BuildPrompt(
+            tok, cfg.input_len, cfg.seed + static_cast<uint64_t>(i)));
+      }
+    }
+    for (const std::string& prompt : prompts) {
+      max_prompt =
+          std::max(max_prompt, static_cast<int>(tok.Encode(prompt).size()));
     }
     const int seq_budget = max_prompt + cfg.output_len + 4;
     vllm::entrypoints::EngineParams params;
@@ -404,9 +451,12 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     // Chunked-prefill per-step budget (0 => engine bounded default).
     params.max_num_batched_tokens = cfg.max_num_batched_tokens;
     loaded = vllm::entrypoints::LoadedEngine::FromModelDir(cfg.model_path, params);
-    for (int i = 0; i < cfg.num_prompts; ++i) {
-      prompts.push_back(detail::BuildPrompt(
-          loaded->tokenizer(), cfg.input_len, cfg.seed + static_cast<uint64_t>(i)));
+    if (prompts.empty()) {
+      for (int i = 0; i < cfg.num_prompts; ++i) {
+        prompts.push_back(detail::BuildPrompt(
+            loaded->tokenizer(), cfg.input_len,
+            cfg.seed + static_cast<uint64_t>(i)));
+      }
     }
   }
 
@@ -452,6 +502,9 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
         }
         rec.last_token_s = t;
         rec.output_tokens += n_new;
+        rec.output_token_ids.insert(rec.output_token_ids.end(),
+                                    out.outputs[0].token_ids.begin(),
+                                    out.outputs[0].token_ids.end());
       }
       if (out.finished && !rec.finished) {
         rec.finished = true;
@@ -488,6 +541,7 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   }
 
   BenchResult res;
+  res.output_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.completed = done;
   res.duration_s = dur_s;
   res.total_input = total_in;
@@ -516,7 +570,21 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   res.mean_e2el_ms = Mean(e2els) * 1000.0;
   res.median_e2el_ms = Percentile(e2els, 50) * 1000.0;
   res.p99_e2el_ms = Percentile(e2els, 99) * 1000.0;
+  for (const auto& kv : records) {
+    const size_t request_index = static_cast<size_t>(std::stoul(kv.first));
+    if (request_index >= res.output_token_ids.size()) {
+      throw std::runtime_error("benchmark request id is out of range");
+    }
+    res.output_token_ids[request_index] = kv.second.output_token_ids;
+  }
   return res;
+}
+
+inline void WriteOutputTokenIds(const std::string& path,
+                                const BenchResult& result) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot write output token IDs: " + path);
+  out << nlohmann::json(result.output_token_ids).dump() << '\n';
 }
 
 // Print the summary table, mirroring serve.py's "Serving Benchmark Result"

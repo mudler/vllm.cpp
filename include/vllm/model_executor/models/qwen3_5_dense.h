@@ -111,8 +111,9 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
                                              const std::string& proj);
 
 // Load one dense decoder layer. `layer_type` is "linear_attention" or
-// "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". Routes
-// each Linear to bf16 vs W4A4-materialized-to-bf16 per IsQwen27QuantizedLinear.
+// "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". The
+// public resolver overload consumes ordinary BF16/F32 Qwen3.5 weights; the
+// full-checkpoint loader also detects compressed-tensors NVFP4 projections.
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
                                                const std::string& layer_type,
                                                int64_t layer_idx);

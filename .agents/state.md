@@ -6320,3 +6320,76 @@ Important loader caveat: current vllm.cpp dense Qwen support is specialized for 
 `Qwen/Qwen3.5-4B` exposes ordinary `.weight` tensors in the safetensors index. So 4B is a good
 vLLM oracle target and likely the right local Qwen architecture to support next, but vllm.cpp needs
 a BF16/plain-weight dense loader path before apples-to-apples benchmarking can run.
+
+## 2026-07-10 — local Blackwell driver upgrade, UVM root cause, and Qwen3.5-4B comparison
+
+Rebased `local-blackwell-environment` onto `origin/main` (`34dbbb3`) and kept all work local to the
+RTX 5070 Ti machine. Current host is Linux 6.18.38 with NVIDIA open driver 595.71.05; the Nix CUDA
+shell reports CUDA compatibility 13.2 and 16,303 MiB VRAM. Added native Nsight Systems 2025.1.3,
+bpftrace, and gdb to the flake. The Nixpkgs Nsight package needed its optional UCX dependency
+removed because that UCX derivation enabled DOCA GDA without the required header; CUDA tracing is
+self-contained and works without UCX.
+
+Root cause of the prior project-triggered kernel failure was identified in the cache ownership
+chain. `CudaBackend::UnifiedMemory()` classified this discrete RTX as unified solely because
+`cudaDevAttrPageableMemoryAccess=1`. The GPU also reports `cudaDevAttrIntegrated=0`: pageable
+access means HMM/UVM can fault ordinary host pages into the GPU, not that host memory is device
+local. `GPUModelRunner::initialize_kv_cache()` allocated attention KV and GDN SSM/conv caches in
+`std::vector<uint8_t>` and labeled those host pointers CUDA tensors. The old Nsight trace showed
+hundreds of thousands of Unified transfers; the prior oops entered `nvidia_uvm process_lazy_free`,
+and the benchmark later blocked in `uvm_pmm_gpu_pma_evict_range`.
+
+Fixes:
+- CUDA unified memory now requires both pageable access and an integrated device.
+- Discrete runners allocate persistent KV/GDN caches through the backend and zero them on the
+  runner queue; a CUDA regression test verifies `cudaMemoryTypeDevice` for all three cache types.
+- `DevicePool` buckets are now keyed by backend as well as size. `VT_POOL_MAX_CACHED_MB` optionally
+  bounds retained scratch, and `VT_POOL_STATS` reports hits/misses/cached peak/evictions.
+- Added a low-overhead NVIDIA UVM bpftrace sentinel. Four module kprobes attach; the kernel's
+  `__list_del_entry_valid_or_report` is `notrace`, so the probe observes precursor activity but
+  cannot prevent a corrupted-list failure.
+
+Progressive validation was clean: CUDA backend/cache tests, 31/31 GDN Triton-toggle cases,
+Qwen dense forward tests, then increasing full-model loads through the old sustained-failure shape
+(224 prompts, concurrency 56, 1024/128) which completed at 5,554.19 total tok/s under launch
+blocking. The fixed project trace has ordinary H2D/D2D/D2H operations and no Unified transfer row.
+The UVM sentinel observed no lazy-free/PMA event. The current boot log has no Xid, oops, lockup, or
+UVM fault; four isolated `refcntRequestReference_IMPL` warnings occurred around profiler/NVML
+startup without affecting execution. The GPU returned to 146-166 MiB idle after each run.
+
+Implemented plain BF16/F32 dense loading for `Qwen/Qwen3.5-4B`: ordinary attention, MLP and GDN
+out-projection weights, F32 A_log/dt_bias/norm support, and tied embedding/lm_head fallback. Added
+ShareGPT dataset support and per-request output-token JSON to `vllm-bench`, plus a vLLM oracle dump
+tool. The benchmark harness now mirrors `vllm bench throughput` by setting `ignore_eos=true`.
+
+Correctness precondition is OPEN. On two deterministic 16-request greedy corpora, Triton AOT
+matches vLLM on 9/16 complete sequences. With all three GDN AOT kernels disabled, one corpus is
+10/16; AOT and hand paths match each other on 13/16. Therefore AOT contributes numerical drift but
+does not explain the whole BF16-model discrepancy. Local performance results below are diagnostic,
+not accepted parity.
+
+Exact throughput workload: model snapshot `851bf6e...`, deterministic ShareGPT file with 128
+exact-1024-token prompts, output 128, concurrency 32, max model len 4096, mnbt 2048, seed 0,
+temperature 1, ignore EOS. Project: sm_120 RelWithDebInfo `VLLM_CPP_TRITON=ON`, all three GDN AOT
+toggles on, `VT_POOL_MAX_CACHED_MB=1024`, `--num-blocks 1280`. vLLM: 0.24.0 production
+torch.compile/CUDA-graph path, BF16, GPU memory utilization 0.88.
+
+- vllm.cpp: 1,087.00 / 1,086.63 / 1,087.12 total tok/s; mean 1,086.92; output mean 120.77.
+  Device pool peak 954.87 MiB, zero evictions in all runs.
+- vLLM: 6,651.76 / 6,692.12 / 6,695.28; mean 6,679.72; output mean 742.19.
+- Ratio: 0.1627x on total and output throughput; vLLM is 6.15x faster.
+
+Matched native Nsight traces settle the immediate performance cause. In vllm.cpp,
+`RandomSampleKernel` consumes 81.7% of GPU time: 109.98 s over 527 calls, 208.7 ms/call. It launches
+one CUDA thread per request and serially scans all ~248K vocabulary entries while generating an
+exponential variate per entry. The preceding softmax is only 0.1%. vLLM's native path generates
+exponential noise and reduces in parallel (and uses FlashInfer when top-k/top-p filtering applies).
+The first local optimization lever is therefore a block/multi-block parallel random sampler; after
+that, re-profile the remaining model-only ~10-15% trace gap. Separately, resolve the 4B greedy gate
+before any local result can satisfy the project acceptance rule.
+
+Verification: focused CUDA suites passed (`test_qwen27_dense_forward` 5/5,
+`test_bench` 4/4, `test_cuda_backend` 5/5, `test_runner` 6/6, and the earlier
+`test_ops_gdn` 31/31). The full CPU build succeeds; CTest is 91/92 because the
+existing `test_op_parity` registry has no runner for `qwen36_gguf_greedy`.
+Excluding that unrelated case, 91/91 tests pass.

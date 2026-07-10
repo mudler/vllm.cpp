@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -154,10 +155,12 @@ class DevicePool {
     const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
-      auto it = free_.find(key);
-      if (it != free_.end() && !it->second.empty()) {
+      auto& buckets = free_[&b];
+      auto it = buckets.find(key);
+      if (it != buckets.end() && !it->second.empty()) {
         void* p = it->second.back();
         it->second.pop_back();
+        cached_bytes_[&b] -= key;
         ++hits_;
         return p;
       }
@@ -165,20 +168,41 @@ class DevicePool {
     }
     return b.Alloc(key);
   }
-  void Put(size_t bytes, void* p) {
+  void Put(Backend& b, size_t bytes, void* p) {
     const size_t key = ClassOf(bytes);
-    std::lock_guard<std::mutex> lk(mu_);
-    free_[key].push_back(p);
+    bool retain = true;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      const size_t limit = MaxCachedBytes();
+      size_t& cached = cached_bytes_[&b];
+      retain = key <= limit - std::min(limit, cached);
+      if (retain) {
+        free_[&b][key].push_back(p);
+        cached += key;
+        peak_cached_bytes_ = std::max(peak_cached_bytes_, cached);
+      } else {
+        ++evictions_;
+      }
+    }
+    // cudaFree may synchronize. Never hold the pool mutex across it.
+    if (!retain) b.Free(p);
   }
 
   ~DevicePool() {
     if (std::getenv("VT_POOL_STATS") != nullptr) {
       const uint64_t h = hits_.load(), m = misses_.load();
       const double rate = (h + m) ? 100.0 * static_cast<double>(h) / static_cast<double>(h + m) : 0.0;
+      size_t classes = 0;
+      size_t cached = 0;
+      for (const auto& entry : free_) classes += entry.second.size();
+      for (const auto& entry : cached_bytes_) cached += entry.second;
       std::fprintf(stderr,
-                   "[DevicePool] hits=%llu misses(cudaMalloc)=%llu hit-rate=%.2f%% distinct-classes=%zu\n",
+                   "[DevicePool] hits=%llu misses(backend-alloc)=%llu hit-rate=%.2f%% "
+                   "distinct-classes=%zu cached=%.2fMiB peak-cached=%.2fMiB evictions=%llu\n",
                    static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
-                   rate, free_.size());
+                   rate, classes, static_cast<double>(cached) / (1024.0 * 1024.0),
+                   static_cast<double>(peak_cached_bytes_) / (1024.0 * 1024.0),
+                   static_cast<unsigned long long>(evictions_.load()));
     }
   }
 
@@ -200,10 +224,29 @@ class DevicePool {
     return (bytes + mask) & ~mask;  // round up to a multiple of 2^shift
   }
 
+  static size_t MaxCachedBytes() {
+    // Unified-memory/CPU operation keeps the historical unbounded cache unless
+    // explicitly overridden. On a discrete GPU the same override provides a
+    // safety valve against continuous-batching size classes consuming all VRAM.
+    static const size_t configured = [] {
+      const char* e = std::getenv("VT_POOL_MAX_CACHED_MB");
+      if (e == nullptr || e[0] == '\0') return std::numeric_limits<size_t>::max();
+      char* end = nullptr;
+      const unsigned long long mb = std::strtoull(e, &end, 10);
+      if (end == e || *end != '\0' || mb > std::numeric_limits<size_t>::max() / (1024 * 1024))
+        return std::numeric_limits<size_t>::max();
+      return static_cast<size_t>(mb) * 1024 * 1024;
+    }();
+    return configured;
+  }
+
   std::mutex mu_;
-  std::unordered_map<size_t, std::vector<void*>> free_;
+  std::unordered_map<Backend*, std::unordered_map<size_t, std::vector<void*>>> free_;
+  std::unordered_map<Backend*, size_t> cached_bytes_;
+  size_t peak_cached_bytes_ = 0;
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
+  std::atomic<uint64_t> evictions_{0};
 };
 
 DevicePool& Pool() {
@@ -341,7 +384,7 @@ class DBuf {
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
   }
-  ~DBuf() { if (p_ != nullptr) Pool().Put(alloc_bytes_, p_); }
+  ~DBuf() { if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_); }
   DBuf(const DBuf&) = delete;
   DBuf& operator=(const DBuf&) = delete;
   // Movable so device-resident block helpers can RETURN a DBuf (the buffer
@@ -352,7 +395,7 @@ class DBuf {
   }
   DBuf& operator=(DBuf&& o) noexcept {
     if (this != &o) {
-      if (p_ != nullptr) Pool().Put(alloc_bytes_, p_);
+      if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_);
       b_ = o.b_;
       p_ = o.p_;
       bytes_ = o.bytes_;
@@ -399,10 +442,16 @@ float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 // activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
 // replay), the bf16 weight must be presented as f32.
 std::vector<float> WeightF32(const OwnedTensor& w) {
-  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
   const int64_t n = w.Numel();
   std::vector<float> out(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  if (w.dtype == DType::kF32) {
+    std::memcpy(out.data(), w.bytes.data(), static_cast<size_t>(n) * sizeof(float));
+    return out;
+  }
+  VT_CHECK(w.dtype == DType::kBF16, "qwen3_5: expected BF16 or F32 weight");
+  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  for (int64_t i = 0; i < n; ++i)
+    out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
   return out;
 }
 
@@ -3729,7 +3778,7 @@ static ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t vocab) {
   const size_t alloc = dlogits.alloc_bytes();
   void* p = dlogits.Release();     // dtor now a no-op; we own the Pool().Put
   fl.device_storage = std::shared_ptr<void>(
-      p, [alloc](void* q) { Pool().Put(alloc, q); });
+      p, [backend = &d.b, alloc](void* q) { Pool().Put(*backend, alloc, q); });
   (void)d;
   return fl;
 }

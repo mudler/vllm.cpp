@@ -151,6 +151,48 @@ Qwen3_5DenseWeights MakeWeights(const HfConfig& c) {
 
 vt::Queue Q() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
 
+struct PlainWeightFixture {
+  std::unordered_map<std::string, std::vector<uint8_t>> storage;
+  std::unordered_map<std::string, StTensor> tensors;
+
+  void AddBf16(const std::string& name, std::vector<int64_t> shape,
+               uint16_t first = 1) {
+    int64_t numel = 1;
+    for (int64_t dim : shape) numel *= dim;
+    std::vector<uint8_t>& bytes = storage[name];
+    bytes.resize(static_cast<size_t>(numel) * sizeof(uint16_t));
+    auto* values = reinterpret_cast<uint16_t*>(bytes.data());
+    for (int64_t i = 0; i < numel; ++i)
+      values[i] = vt::F32ToBF16(static_cast<float>(first + i));
+    tensors[name] = StTensor{"BF16", std::move(shape), bytes.data(), bytes.size()};
+  }
+
+  void AddF32(const std::string& name, std::vector<int64_t> shape,
+              float first = 1.0F) {
+    int64_t numel = 1;
+    for (int64_t dim : shape) numel *= dim;
+    std::vector<uint8_t>& bytes = storage[name];
+    bytes.resize(static_cast<size_t>(numel) * sizeof(float));
+    auto* values = reinterpret_cast<float*>(bytes.data());
+    for (int64_t i = 0; i < numel; ++i) values[i] = first + static_cast<float>(i);
+    tensors[name] = StTensor{"F32", std::move(shape), bytes.data(), bytes.size()};
+  }
+
+  TensorResolver Resolver() {
+    return [this](const std::string& name) -> const StTensor& {
+      return tensors.at(name);
+    };
+  }
+};
+
+void AddPlainLayerCommon(PlainWeightFixture& f, const std::string& base) {
+  f.AddBf16(base + "input_layernorm.weight", {3});
+  f.AddBf16(base + "post_attention_layernorm.weight", {3});
+  f.AddBf16(base + "mlp.gate_proj.weight", {2, 3}, 20);
+  f.AddBf16(base + "mlp.up_proj.weight", {2, 3}, 30);
+  f.AddBf16(base + "mlp.down_proj.weight", {3, 2}, 40);
+}
+
 }  // namespace
 
 TEST_CASE("qwen27 loader routing: IsQwen27QuantizedLinear encodes §3.6") {
@@ -175,6 +217,60 @@ TEST_CASE("qwen27 loader routing: IsQwen27QuantizedLinear encodes §3.6") {
   CHECK_FALSE(IsQwen27QuantizedLinear("lm_head"));
   CHECK_FALSE(IsQwen27QuantizedLinear("mtp.layers.0.mlp.gate_proj"));
   CHECK_FALSE(IsQwen27QuantizedLinear("model.visual.blocks.0.mlp.gate_proj"));
+}
+
+TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weights") {
+  const std::string base = "model.language_model.layers.0.";
+
+  SUBCASE("full attention and MLP use ordinary BF16 weights") {
+    PlainWeightFixture f;
+    AddPlainLayerCommon(f, base);
+    f.AddBf16(base + "self_attn.q_proj.weight", {2, 3}, 1);
+    f.AddBf16(base + "self_attn.k_proj.weight", {2, 3}, 10);
+    f.AddBf16(base + "self_attn.v_proj.weight", {2, 3}, 20);
+    f.AddBf16(base + "self_attn.o_proj.weight", {3, 2}, 30);
+    f.AddBf16(base + "self_attn.q_norm.weight", {2});
+    f.AddBf16(base + "self_attn.k_norm.weight", {2});
+
+    const Qwen3_5DenseLayerWeights layer =
+        vllm::LoadQwen3_5DenseLayer(f.Resolver(), "full_attention", 0);
+    CHECK_FALSE(layer.is_linear_attention);
+    CHECK(layer.attn.q_proj_fp4.Empty());
+    CHECK(layer.attn.q_proj.shape[0] == 3);
+    CHECK(layer.attn.q_proj.shape[1] == 2);
+    const auto* q = reinterpret_cast<const uint16_t*>(layer.attn.q_proj.bytes.data());
+    CHECK(q[0] == vt::F32ToBF16(1.0F));
+    CHECK(q[1] == vt::F32ToBF16(4.0F));
+    CHECK(layer.mlp.gate_proj_fp4.Empty());
+    CHECK_FALSE(layer.mlp.gate_proj.Empty());
+  }
+
+  SUBCASE("linear attention accepts plain out_proj and F32 state parameters") {
+    PlainWeightFixture f;
+    AddPlainLayerCommon(f, base);
+    const std::string la = base + "linear_attn.";
+    f.AddBf16(la + "in_proj_qkv.weight", {4, 3});
+    f.AddBf16(la + "in_proj_z.weight", {4, 3});
+    f.AddBf16(la + "in_proj_b.weight", {2, 3});
+    f.AddBf16(la + "in_proj_a.weight", {2, 3});
+    f.AddBf16(la + "out_proj.weight", {3, 4});
+    f.AddBf16(la + "conv1d.weight", {4, 1, 3});
+    f.AddF32(la + "A_log", {2}, -2.0F);
+    f.AddF32(la + "dt_bias", {2}, 0.25F);
+    f.AddF32(la + "norm.weight", {4}, 0.5F);
+
+    const Qwen3_5DenseLayerWeights layer =
+        vllm::LoadQwen3_5DenseLayer(f.Resolver(), "linear_attention", 0);
+    CHECK(layer.is_linear_attention);
+    CHECK(layer.gdn.out_proj_fp4.Empty());
+    CHECK_FALSE(layer.gdn.out_proj.Empty());
+    CHECK(layer.gdn.a_log.dtype == DType::kF32);
+    CHECK(layer.gdn.dt_bias.dtype == DType::kF32);
+    CHECK(layer.gdn.norm_weight.dtype == DType::kF32);
+    const auto* a_log = reinterpret_cast<const float*>(layer.gdn.a_log.bytes.data());
+    CHECK(a_log[0] == doctest::Approx(-2.0F));
+    CHECK(a_log[1] == doctest::Approx(-1.0F));
+  }
 }
 
 TEST_CASE("qwen27 W4A4 materialize: CT dequant + bf16 + transpose to [in,out]") {

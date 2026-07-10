@@ -15,16 +15,16 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 13 | 3 | 3 | 0 | 1 | 0 | 2 | 4 |
-| KV cache and memory | 16 | 2 | 2 | 0 | 1 | 0 | 0 | 11 |
+| KV cache and memory | 18 | 2 | 2 | 0 | 4 | 0 | 0 | 10 |
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
 | Speculative decoding | 6 | 0 | 0 | 0 | 3 | 1 | 0 | 2 |
 | Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 1 | 1 | 10 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
-| Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
+| Long context and attention | 10 | 0 | 0 | 0 | 7 | 0 | 0 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **90** | **9** | **17** | **0** | **6** | **2** | **3** | **53** |
+| **Total** | **96** | **9** | **17** | **0** | **16** | **2** | **3** | **49** |
 
 ## Engine core and scheduling
 
@@ -52,7 +52,9 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-MANAGER-ALLOC` | Slot allocation, watermark, admission, release | T0 | `vllm/v1/core/kv_cache_manager.py:110,244`; `tests/v1/core/test_single_type_kv_cache_manager.py:380,413` | `src/vllm/v1/core/kv_cache_manager.cpp:88,124,144` | `tests/vllm/v1/test_kv_cache_manager.cpp:119,168,298,349,380,425` | `planned: specs/kv-cache-manager.md` | `ANCHOR-BACKFILL` | - |
 | `KV-HYBRID-COORD` | Full-attention and GDN/Mamba group coordinator | T0 | `vllm/v1/core/kv_cache_coordinator.py:514,630`; `tests/v1/core/test_prefix_caching.py:347,836,987` | `src/vllm/v1/core/kv_cache_coordinator.cpp:294,370,389` | `tests/vllm/v1/test_kv_cache_coordinator.cpp:130,154,169,209,306` | `planned: specs/hybrid-kv-coordinator.md` | `PARTIAL` | - |
 | `KV-MAMBA-ALIGN` | Mamba/GDN prefix retention in align mode | T1 | `vllm/config/cache.py:134-140`; `vllm/v1/core/single_type_kv_cache_manager.py:1032-1072` | - | - | `planned: specs/mamba-align-retention.md` | `INVENTORIED` | - |
-| `KV-SLIDING-LOCAL-SPECS` | Sliding-window and chunked-local KV specs | T1 | `vllm/v1/kv_cache_interface.py:481,518` | - | - | `planned: specs/sliding-window-kv-spec.md` | `INVENTORIED` | - |
+| `KV-SLIDING-LOCAL-SPECS` | Block row (claim the two leaves below, not this row): sliding-window and chunked-local KV specs | T1 | `vllm/v1/kv_cache_interface.py:205-307,480-586`; `tests/v1/test_kv_cache_spec_registry.py:174-306` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `KV-SLIDING-WINDOW-SPEC` | `SlidingWindowSpec` sizing, grouping, admission, allocation, eviction, and prefix-cache policy | T1 | `vllm/v1/kv_cache_interface.py:518-586`; `vllm/v1/core/single_type_kv_cache_manager.py:669-873`; `tests/v1/core/test_single_type_kv_cache_manager.py:127,259,380,413,489`; `tests/v1/core/test_prefix_caching.py:2457-3909` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `KV-CHUNKED-LOCAL-SPEC` | `ChunkedLocalAttentionSpec` sizing, grouping, admission, allocation, and chunk-boundary prefix-cache policy | T1 | `vllm/v1/kv_cache_interface.py:480-514`; `vllm/v1/core/single_type_kv_cache_manager.py:876-1023`; `tests/v1/core/test_single_type_kv_cache_manager.py:54,198,456` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `KV-FP8` | FP8 KV cache and scale handling | T1 | `vllm/model_executor/layers/quantization/kv_cache.py:42,108-191` | - | - | `planned: specs/fp8-kv-cache.md` | `INVENTORIED` | - |
 | `KV-NVFP4-TURBO` | NVFP4, per-token-head, and TurboQuant KV | T2 | `vllm/config/cache.py:14,28-35,272` | - | - | `planned: specs/nvfp4-kv-cache.md` | `INVENTORIED` | - |
 | `KV-OFFLOAD` | CPU tiering with LRU and ARC | T2 | `vllm/v1/kv_offload/cpu/manager.py:36`; `vllm/v1/kv_offload/cpu/policies/lru.py:12`; `vllm/v1/kv_offload/cpu/policies/arc.py:12` | - | - | `planned: specs/kv-offload.md` | `INVENTORIED` | - |
@@ -154,9 +156,13 @@ claims it.
 
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|---|
-| `ATTN-YARN` | YaRN rope scaling | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:243-284` | - | - | `planned: specs/yarn-rope.md` | `INVENTORIED` | - |
-| `ATTN-ROPE-FAMILY` | Llama3, LongRoPE, dynamic-NTK scaling | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155,200,315` | - | - | `planned: specs/rope-scaling-family.md` | `INVENTORIED` | - |
-| `ATTN-SLIDING-WINDOW` | Sliding-window attention backend | T1 | `vllm/v1/attention/backends/flash_attn.py:255,272-300` | - | - | `planned: specs/sliding-window-attention.md` | `INVENTORIED` | - |
+| `ATTN-YARN` | YaRN RoPE scaling, including the `mrope_section` dispatch branch | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:243-284`; `vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py:10-84`; `vllm/model_executor/layers/rotary_embedding/mrope.py:201-340`; `tests/kernels/core/test_mrope.py:47-235`; `tests/models/language/pooling/test_nomic_max_model_len.py:93-113` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-ROPE-FAMILY` | Block row (claim the three leaves below, not this row): Llama 3, LongRoPE, and dynamic-NTK scaling | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155-171,200-230,315-335`; `tests/kernels/core/test_pos_encoding.py:66-193` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-ROPE-LLAMA3` | Llama 3 frequency-banded RoPE scaling | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155-171`; `vllm/model_executor/layers/rotary_embedding/llama3_rope.py:11-54` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-ROPE-LONGROPE` | Phi-3 LongRoPE short/long factor scaling | T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:315-335`; `vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.py:16-159` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-ROPE-DYNAMIC-NTK` | Dynamic-NTK `alpha` and `factor` dispatch modes | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:200-230`; `vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.py:30-73`; `vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.py:9-43`; `tests/test_config.py:543-587` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-SLIDING-WINDOW` | Sliding-window attention semantics and backend dispatch | T1 | `vllm/v1/attention/backends/flash_attn.py:255-300,674-717,840-955`; `tests/v1/attention/test_attention_backends.py:745-867`; `tests/v1/e2e/general/test_correctness_sliding_window.py:19-78` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-CHUNKED-LOCAL` | Chunked-local attention wrapper, virtual-batch metadata, and underlying-backend dispatch | T1 | `vllm/model_executor/layers/attention/chunked_local_attention.py:30-128`; `vllm/v1/attention/backends/utils.py:225-420`; `tests/v1/attention/test_chunked_local_attention.py:28-204` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-MLA` | MLA prefill/decode backends and latent KV | T2 | `vllm/v1/attention/backends/mla/flashinfer_mla.py:1`; `vllm/v1/attention/backends/mla/triton_mla.py:1` | - | - | `planned: specs/mla-backends.md` | `INVENTORIED` | - |
 | `ATTN-MAMBA` | Mamba1/Mamba2, short-conv, linear backends | T2 | `vllm/v1/attention/backends/mamba_attn.py:30,79`; `vllm/model_executor/layers/mamba/short_conv.py:1` | - | - | `planned: specs/mamba-backends.md` | `INVENTORIED` | - |
 | `ATTN-ENCODER-CROSS` | Encoder and cross-attention | T2 | `vllm/model_executor/layers/attention/attention.py:1`; `vllm/v1/attention/backends/utils.py:1` | - | - | `planned: specs/encoder-cross-attention.md` | `INVENTORIED` | - |

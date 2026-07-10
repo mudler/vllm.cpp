@@ -14,7 +14,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Engine and scheduling | 13 | 3 | 3 | 0 | 3 | 0 | 0 | 4 |
+| Engine and scheduling | 13 | 3 | 3 | 0 | 2 | 1 | 0 | 4 |
 | KV cache and memory | 14 | 2 | 2 | 0 | 0 | 0 | 0 | 10 |
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
@@ -24,7 +24,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **88** | **9** | **17** | **0** | **9** | **1** | **0** | **52** |
+| **Total** | **88** | **9** | **17** | **0** | **8** | **2** | **0** | **52** |
 
 ## Engine core and scheduling
 
@@ -39,7 +39,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203`; `vllm/v1/core/sched/scheduler.py:546` | - | - | [async-serving.md](specs/async-serving.md) | `READY` | - |
 | `ENG-PARTIAL-PREFILL` | Concurrent partial-prefill and long-prompt limits | T1 | `vllm/config/scheduler.py:70-80` | - | - | `planned: specs/partial-prefill-concurrency.md` | `INVENTORIED` | - |
 | `ENG-BATCH-QUEUE` | Pipelined `step_with_batch_queue` | T1 | `vllm/v1/engine/core.py:519` | - | - | `planned: specs/batch-queue-step.md` | `INVENTORIED` | - |
-| `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); carried from porting-inventory §1 (T0 there) at the v1 fold; first claimable leaf (W1) of the async-serving block | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | - | - | [async-serving.md](specs/async-serving.md) | `READY` | - |
+| `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); carried from porting-inventory §1 (T0 there) at the v1 fold; first claimable leaf (W1) of the async-serving block | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | - | - | [async-serving.md](specs/async-serving.md) | `ACTIVE` | `CLAIM-BUSY-LOOP-1` |
 | `ENG-SCHED-KNOBS` | Reserve-full-ISL, scheduler class seam, stream interval | T1 | `vllm/config/scheduler.py:26,127,140,163` | `include/vllm/config/scheduler.h:71,95`; `src/vllm/config/scheduler.cpp:43,52`; `src/vllm/v1/core/sched/scheduler.cpp:237`; `src/vllm/v1/engine/output_processor.cpp:68` | `tests/vllm/test_scheduler_config.cpp:10,20`; `tests/vllm/v1/test_kv_cache_manager.cpp:425` | `planned: specs/scheduler-knobs.md` | `PARTIAL` | - |
 | `ENG-CASCADE-ATTN` | Cascade attention for shared prefixes | T2 | `vllm/config/model.py:238` | - | - | `planned: specs/cascade-attention.md` | `INVENTORIED` | - |
 | `ENG-DBO-UBATCH` | DBO and ubatch overlap | T2 | `vllm/config/parallel.py:208,524` | - | - | `planned: specs/dbo-ubatch.md` | `INVENTORIED` | - |

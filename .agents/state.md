@@ -2432,3 +2432,33 @@ making miss discovery, graph capture, and synchronization explicit design
 work. `ENG-EXPERT-STREAM` therefore moved `READY -> SPIKE` under
 `CLAIM-EXPSTREAM-GROUND-1`. No implementation starts until the port map,
 dependencies, tests, gates, and claim-sized WBS match those facts.
+
+## 2026-07-10 — C1 drop-in kernel ABI spike accepted (`BACKEND-ABI-VT` READY)
+
+Recovered the predecessor's uncommitted C1 draft after its rate limit, then
+re-grounded it against pinned vLLM `e24d1b24`, the dependency launch edges, and
+the shipped CUTLASS NVFP4, Marlin, and FA-2 adapters. The accepted contract is
+[specs/dropin-kernel-abi.md](specs/dropin-kernel-abi.md).
+
+Two adversarial corrections are load-bearing: (1) workspace identity is
+`Device + Queue::id + native handle + OpId + slot`, not the stream handle alone
+(default streams can alias across devices and handles can be recycled); (2)
+packed `DType::kI8` is storage only, so FP4/FP8/UE8M0 semantics travel as an
+explicit upstream-compatible `ScalarTypeId` plus a layout descriptor. The
+M0.6 choices are now fixed: code registries remain per `DeviceType`, resource
+APIs become explicit per `Device`; all backend fn aliases stay in `ops.h`; and
+output dtype sets are per-op with no silent narrowing.
+
+Decision: additive ABI spine first, then **per-family incremental migration**.
+Preparation may use disjoint worktrees, but every speed-sensitive family
+migration completes its own old/new same-binary correctness, nsys, fresh-vLLM
+every-axis, peak-memory, and 2–3-run reproduction checkpoint before another
+stacks. First implementation order: `BACKEND-ABI-VT` spine → proven
+NVFP4/FP8/Marlin adapters → core/EW/KV/attention/MoE/sampling; GDN waits for
+`CLAIM-PR3`; collectives/spec-decode and ROCm wait for their implementation/
+hardware leaves. No code, support status, README, ledger, or porting-inventory
+claim changed in this docs-only spike.
+
+Validation: `python3 scripts/check-agent-record.py` and the 13-case mutation
+suite pass; matrix counts remain ENGINE=90, MODEL=323, QUANT=81, KERNEL=30,
+BACKEND=51. Spike claim released; `BACKEND-ABI-VT` is `READY`.

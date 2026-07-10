@@ -12,10 +12,13 @@ is explicit. `INVENTORIED` is source knowledge only. Runtime-selected kernels
 remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
-Interim convention (binding for every new kernel row until the C1 drop-in ABI
-lands; restated from [backends.md](backends.md) §drop-in): every new vt CUDA
-kernel notes its upstream `csrc` counterpart (if one exists) in a source
-comment, so the later signature alignment is mechanical.
+The C1 implementation spike is accepted at
+[dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Until its
+`BACKEND-ABI-VT` spine lands, every new vt CUDA kernel still notes its upstream
+`csrc`/dependency counterpart in a source comment. Afterward, each family
+migrates incrementally to the common raw pointer/shape/stride/scalar/layout/
+workspace/stream adapter and completes its own correctness, trace, every-axis
+performance, and memory checkpoint before the next migration stacks.
 
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|

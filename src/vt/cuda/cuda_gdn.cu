@@ -17,10 +17,13 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "vt/cuda/tile/cp_async.cuh"
@@ -39,11 +42,16 @@
 extern "C" {
 #include "gdn_deltah_h48.h"
 #include "gdn_deltah_h32.h"
-// GDN chunk_o (the output kernel): gdn_chunko_hNN_default(stream, q, k, v_new,
-// hstate, gcum, out, cu_seqlens, chunk_indices, scale, T, NT). See
-// triton_kernels/chunk_o.py. o(=out) is f32 (the default GDN out dtype).
+// GDN chunk_o (the output kernel): gdn_chunko_hNN_default, and optionally
+// gdn_chunko_bf16_hNN_default when the vendored artifacts are present.
+// See triton_kernels/chunk_o.py. o(=out) is f32 for the default GDN out dtype;
+// bf16 mirrors the vLLM-faithful recurrence-output dtype once regenerated.
 #include "gdn_chunko_h48.h"
 #include "gdn_chunko_h32.h"
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+#include "gdn_chunko_bf16_h48.h"
+#include "gdn_chunko_bf16_h32.h"
+#endif
 // GDN WU pipeline (kkt -> solve_tril -> recompute_w_u), 3 stable dispatchers each.
 // See triton_kernels/{chunk_scaled_dot_kkt,solve_tril,wy_fast}.py.
 #include "gdn_kkt_h48.h"
@@ -2637,6 +2645,65 @@ static bool GdnTritonEnvOn(const char* n) {
   return e == nullptr || e[0] != '0';
 }
 
+// Persistent per-stream scratch for the Triton-AOT GDN build. This mirrors the
+// caching allocator vLLM gets through PyTorch: buffers grow to the largest shape
+// seen on a stream and are reused by subsequent GDN layers/steps. Reuse is safe
+// under single-stream forward ordering; VT_GDN_TRITON_CHUNK_POOL=0 and
+// VT_GDN_TRITON_WU_POOL=0 restore per-call cudaMallocAsync/cudaFreeAsync for A/B.
+struct GdnScratchBuf {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+};
+
+struct GdnChunkScratch {
+  GdnScratchBuf gcum;
+  GdnScratchBuf u;
+  GdnScratchBuf w;
+  GdnScratchBuf v_new;
+  GdnScratchBuf hstate;
+  GdnScratchBuf tok0;
+  GdnScratchBuf len;
+  GdnScratchBuf boh;
+  GdnScratchBuf cidx;
+};
+
+struct GdnWuScratch {
+  GdnScratchBuf a;
+  GdnScratchBuf ai;
+};
+
+bool GdnTritonChunkPoolEnabled() { return GdnTritonEnvOn("VT_GDN_TRITON_CHUNK_POOL"); }
+
+bool GdnTritonWuPoolEnabled() { return GdnTritonEnvOn("VT_GDN_TRITON_WU_POOL"); }
+
+void* EnsureGdnScratch(GdnScratchBuf& buf, size_t bytes, cudaStream_t s, const char* what) {
+  if (bytes > buf.bytes) {
+    if (buf.ptr != nullptr) Check(cudaFreeAsync(buf.ptr, s), "gdn scratch grow free");
+    Check(cudaMallocAsync(&buf.ptr, bytes, s), what);
+    buf.bytes = bytes;
+  }
+  return buf.ptr;
+}
+
+template <typename T>
+T* EnsureGdnScratch(GdnScratchBuf& buf, size_t count, cudaStream_t s, const char* what) {
+  return static_cast<T*>(EnsureGdnScratch(buf, count * sizeof(T), s, what));
+}
+
+GdnChunkScratch& GdnChunkScratchFor(cudaStream_t s) {
+  static std::mutex mu;
+  static std::unordered_map<cudaStream_t, GdnChunkScratch> pool;
+  std::lock_guard<std::mutex> lk(mu);
+  return pool[s];
+}
+
+GdnWuScratch& GdnWuScratchFor(cudaStream_t s) {
+  static std::mutex mu;
+  static std::unordered_map<cudaStream_t, GdnWuScratch> pool;
+  std::lock_guard<std::mutex> lk(mu);
+  return pool[s];
+}
+
 // SANCTIONED Triton AOT fast-path dispatch for GDN delta_h (the state recurrence).
 // Returns true iff it launched the Triton kernel (caller then skips the hand
 // path). Runtime toggle VT_GDN_DELTAH_TRITON: default ON (GdnTritonEnvOn above;
@@ -2669,16 +2736,19 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
 }
 
 // SANCTIONED Triton AOT fast-path for GDN chunk_o (the output kernel). Fires ONLY
-// at the exact gate-model shape (K=V=128, Hg=16, H in {48,32}) AND with f32 out
-// (the default GDN recurrence-output dtype; the AOT spec pins o=*fp32). Runtime
-// toggle VT_GDN_CHUNKO_TRITON (opt-in). Consumes the SAME buffers our hand
+// at the exact gate-model shape (K=V=128, Hg=16, H in {48,32}) with f32 out, and
+// with bf16 out when VLLM_CPP_TRITON_CHUNKO_BF16 is compiled. Runtime toggle
+// VT_GDN_CHUNKO_TRITON (default ON). Consumes the SAME buffers our hand
 // GdnChunkOWmmaKernel does (v_new/hstate from delta_h, gcum, q/k, out) — a verified
 // 1:1 drop-in — plus chunk_indices (cidx). Returns true iff it launched (caller
 // then skips the hand kernel). The hand path + CPU ref remain the fallback.
-bool TryTritonChunkO(cudaStream_t s, float* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
+template <typename Tout>
+bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __nv_bfloat16* k,
                      const __nv_bfloat16* v_new, const __nv_bfloat16* hstate, const float* gcum,
                      const int32_t* qsl, const int32_t* cidx, float scale, int64_t hk_n,
                      int64_t dk, int64_t hv_n, int64_t dv, int64_t nt_tot, int64_t t_tot) {
+  static_assert(std::is_same<Tout, float>::value || std::is_same<Tout, __nv_bfloat16>::value,
+                "Triton chunk_o supports f32 or bf16 output");
   if (!GdnTritonEnvOn("VT_GDN_CHUNKO_TRITON")) return false;
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
@@ -2690,12 +2760,23 @@ bool TryTritonChunkO(cudaStream_t s, float* out, const __nv_bfloat16* q, const _
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);   // overwritten per-seq (IS_VARLEN)
   const int32_t NT = static_cast<int32_t>(nt_tot);  // grid-y carrier (= total chunks)
-  const CUresult r =
-      hv_n == 48
-          ? gdn_chunko_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
-                                   D(cidx), T, NT)
-          : gdn_chunko_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
-                                   D(cidx), T, NT);
+  CUresult r;
+  if constexpr (std::is_same<Tout, float>::value) {
+    r = hv_n == 48
+            ? gdn_chunko_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
+                                     D(cidx), T, NT)
+            : gdn_chunko_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
+                                     D(cidx), T, NT);
+  } else {
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+    r = hv_n == 48 ? gdn_chunko_bf16_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
+                                                 D(out), D(qsl), D(cidx), T, NT)
+                   : gdn_chunko_bf16_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
+                                                 D(out), D(qsl), D(cidx), T, NT);
+#else
+    return false;
+#endif
+  }
   VT_CHECK(r == CUDA_SUCCESS, "cuda gdn chunk_o(triton): launcher returned non-success");
   return true;
 }
@@ -2719,11 +2800,18 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
   // WY intermediates [T,H,BT]: A = beta*K*Kᵀ*exp(gΔ) strictly-lower (kkt out, f32);
   // Ai = (I+A)^-1 (solve_tril out, bf16 = k.dtype). Indexed by packed token, so
   // t_tot rows suffice (block-ptr boundary_check clamps the partial-tail slack).
+  const size_t na = static_cast<size_t>(t_tot) * static_cast<size_t>(hv_n) * BT;
   float* araw = nullptr;
   __nv_bfloat16* ai = nullptr;
-  const size_t na = static_cast<size_t>(t_tot) * static_cast<size_t>(hv_n) * BT;
-  Check(cudaMallocAsync(&araw, na * sizeof(float), s), "gdn wu(triton) A alloc");
-  Check(cudaMallocAsync(&ai, na * sizeof(__nv_bfloat16), s), "gdn wu(triton) Ai alloc");
+  const bool pooled = GdnTritonWuPoolEnabled();
+  if (pooled) {
+    GdnWuScratch& sc = GdnWuScratchFor(s);
+    araw = EnsureGdnScratch<float>(sc.a, na, s, "gdn wu(triton) A pool alloc");
+    ai = EnsureGdnScratch<__nv_bfloat16>(sc.ai, na, s, "gdn wu(triton) Ai pool alloc");
+  } else {
+    Check(cudaMallocAsync(&araw, na * sizeof(float), s), "gdn wu(triton) A alloc");
+    Check(cudaMallocAsync(&ai, na * sizeof(__nv_bfloat16), s), "gdn wu(triton) Ai alloc");
+  }
   // solve_tril writes ONLY the 10 lower-triangular 16×16 blocks of each [BT,BT]
   // inverse; the 6 upper blocks stay 0 (FLA: `Ai = torch.zeros_like(A)`).
   // recompute_w_u then reads the FULL [BT,BT] Ai block and dots it, so the upper
@@ -2762,8 +2850,10 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
   Check(cudaMemsetAsync(w + static_cast<size_t>(t_tot) * hv_n * dk, 0,
                         static_cast<size_t>(kChunk) * hv_n * dk * sizeof(__nv_bfloat16), s),
         "gdn wu(triton) w slack zero");
-  Check(cudaFreeAsync(araw, s), "gdn wu(triton) A free");
-  Check(cudaFreeAsync(ai, s), "gdn wu(triton) Ai free");
+  if (!pooled) {
+    Check(cudaFreeAsync(araw, s), "gdn wu(triton) A free");
+    Check(cudaFreeAsync(ai, s), "gdn wu(triton) Ai free");
+  }
   return true;
 }
 #endif  // VLLM_CPP_TRITON
@@ -2792,7 +2882,8 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   // (the extra rows contribute nothing: masked/discarded).
   const int64_t t_pad = t_tot + kChunk;
 
-  // Device scratch (stream-ordered; freed after the kernels on the same stream).
+  // Device scratch (stream-ordered). In Triton-AOT builds this is pooled per stream;
+  // otherwise it is freed after the kernels on the same stream.
   float* gcum = nullptr;
   TSc* u = nullptr;
   TSc* w = nullptr;
@@ -2801,22 +2892,48 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   int32_t* d_tok0 = nullptr;
   int32_t* d_len = nullptr;
   int32_t* d_boh = nullptr;
-  Check(cudaMallocAsync(&gcum, static_cast<size_t>(t_tot * hv_n) * sizeof(float), s),
-        "gdn chunked gcum alloc");
-  Check(cudaMallocAsync(&u, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
-        "gdn chunked u alloc");
-  Check(cudaMallocAsync(&w, static_cast<size_t>(t_pad * hv_n * dk) * sizeof(TSc), s),
-        "gdn chunked w alloc");
-  Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
-        "gdn chunked v_new alloc");
-  Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(TSc), s),
-        "gdn chunked hstate alloc");
-  Check(cudaMallocAsync(&d_tok0, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
-        "gdn chunked tok0 alloc");
-  Check(cudaMallocAsync(&d_len, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
-        "gdn chunked len alloc");
-  Check(cudaMallocAsync(&d_boh, static_cast<size_t>(n_seq) * sizeof(int32_t), s),
-        "gdn chunked boh alloc");
+#ifdef VLLM_CPP_TRITON
+  GdnChunkScratch* chunk_sc = nullptr;
+  const bool chunk_pool = GdnTritonChunkPoolEnabled();
+  if (chunk_pool) {
+    chunk_sc = &GdnChunkScratchFor(s);
+    gcum = EnsureGdnScratch<float>(chunk_sc->gcum, static_cast<size_t>(t_tot * hv_n), s,
+                                   "gdn chunked gcum pool alloc");
+    u = EnsureGdnScratch<TSc>(chunk_sc->u, static_cast<size_t>(t_pad * hv_n * dv), s,
+                              "gdn chunked u pool alloc");
+    w = EnsureGdnScratch<TSc>(chunk_sc->w, static_cast<size_t>(t_pad * hv_n * dk), s,
+                              "gdn chunked w pool alloc");
+    v_new = EnsureGdnScratch<TSc>(chunk_sc->v_new, static_cast<size_t>(t_pad * hv_n * dv), s,
+                                  "gdn chunked v_new pool alloc");
+    hstate = EnsureGdnScratch<TSc>(chunk_sc->hstate,
+                                   static_cast<size_t>(nt_tot * hv_n * dv * dk), s,
+                                   "gdn chunked hstate pool alloc");
+    d_tok0 = EnsureGdnScratch<int32_t>(chunk_sc->tok0, static_cast<size_t>(nt_tot), s,
+                                       "gdn chunked tok0 pool alloc");
+    d_len = EnsureGdnScratch<int32_t>(chunk_sc->len, static_cast<size_t>(nt_tot), s,
+                                      "gdn chunked len pool alloc");
+    d_boh = EnsureGdnScratch<int32_t>(chunk_sc->boh, static_cast<size_t>(n_seq), s,
+                                      "gdn chunked boh pool alloc");
+  } else
+#endif
+  {
+    Check(cudaMallocAsync(&gcum, static_cast<size_t>(t_tot * hv_n) * sizeof(float), s),
+          "gdn chunked gcum alloc");
+    Check(cudaMallocAsync(&u, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
+          "gdn chunked u alloc");
+    Check(cudaMallocAsync(&w, static_cast<size_t>(t_pad * hv_n * dk) * sizeof(TSc), s),
+          "gdn chunked w alloc");
+    Check(cudaMallocAsync(&v_new, static_cast<size_t>(t_pad * hv_n * dv) * sizeof(TSc), s),
+          "gdn chunked v_new alloc");
+    Check(cudaMallocAsync(&hstate, static_cast<size_t>(nt_tot * hv_n * dv * dk) * sizeof(TSc), s),
+          "gdn chunked hstate alloc");
+    Check(cudaMallocAsync(&d_tok0, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
+          "gdn chunked tok0 alloc");
+    Check(cudaMallocAsync(&d_len, static_cast<size_t>(nt_tot) * sizeof(int32_t), s),
+          "gdn chunked len alloc");
+    Check(cudaMallocAsync(&d_boh, static_cast<size_t>(n_seq) * sizeof(int32_t), s),
+          "gdn chunked boh alloc");
+  }
   if (dev_meta) {
     // Device-resident metadata: fill d_tok0/d_len/d_boh on the device from the
     // device qsl (no host-vector H2D, no launch sync — the caller does not sync).
@@ -2849,8 +2966,13 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       (hv_n == 48 || hv_n == 32) &&
       (GdnTritonEnvOn("VT_GDN_CHUNKO_TRITON") || GdnTritonEnvOn("VT_GDN_WU_TRITON"));
   if (want_cidx) {
-    Check(cudaMallocAsync(&d_cidx, static_cast<size_t>(2 * nt_tot) * sizeof(int32_t), s),
-          "gdn chunked cidx alloc");
+    if (chunk_pool) {
+      d_cidx = EnsureGdnScratch<int32_t>(chunk_sc->cidx, static_cast<size_t>(2 * nt_tot), s,
+                                         "gdn chunked cidx pool alloc");
+    } else {
+      Check(cudaMallocAsync(&d_cidx, static_cast<size_t>(2 * nt_tot) * sizeof(int32_t), s),
+            "gdn chunked cidx alloc");
+    }
     const unsigned nb = static_cast<unsigned>((n_seq + 31) / 32);
     GdnBuildChunkIndices<<<nb, 32, 0, s>>>(d_cidx, qsl.Ptr<int32_t>(), d_boh, n_seq);
     Check(cudaGetLastError(), "gdn chunked cidx build launch");
@@ -3109,13 +3231,16 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
       Check(cudaGetLastError(), "gdn chunked delta_h(wmma) launch");
     }
 
-    // SANCTIONED Triton AOT chunk_o fast-path (bf16 gate shape + f32 out only,
-    // opt-in via VT_GDN_CHUNKO_TRITON=1). If it fires it writes `out` directly and
-    // we skip the hand kernel; otherwise the preserved hand path runs unchanged.
+    // SANCTIONED Triton AOT chunk_o fast-path (bf16 gate shape + f32 out, plus
+    // bf16 out when VLLM_CPP_TRITON_CHUNKO_BF16 is compiled). If it fires it writes
+    // `out` directly and we skip the hand kernel; otherwise the preserved hand path
+    // runs unchanged.
     bool triton_chunko = false;
 #ifdef VLLM_CPP_TRITON
-    if constexpr (std::is_same<TSc, __nv_bfloat16>::value && std::is_same<Tout, float>::value) {
-      triton_chunko = TryTritonChunkO(s, out.Ptr<float>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new,
+    if constexpr (std::is_same<TSc, __nv_bfloat16>::value &&
+                  (std::is_same<Tout, float>::value ||
+                   std::is_same<Tout, __nv_bfloat16>::value)) {
+      triton_chunko = TryTritonChunkO(s, out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v_new,
                                       hstate, gcum, qsl.Ptr<int32_t>(), d_cidx, args.scale, hk_n,
                                       dk, hv_n, dv, nt_tot, t_tot);
     }
@@ -3154,16 +3279,21 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     VT_CHECK(false, "cuda gdn_prefill(chunked): bf16 requires WMMA-friendly head dims");
   }
 
-  Check(cudaFreeAsync(gcum, s), "gdn chunked gcum free");
-  Check(cudaFreeAsync(u, s), "gdn chunked u free");
-  Check(cudaFreeAsync(w, s), "gdn chunked w free");
-  Check(cudaFreeAsync(v_new, s), "gdn chunked v_new free");
-  Check(cudaFreeAsync(hstate, s), "gdn chunked hstate free");
-  Check(cudaFreeAsync(d_tok0, s), "gdn chunked tok0 free");
-  Check(cudaFreeAsync(d_len, s), "gdn chunked len free");
-  Check(cudaFreeAsync(d_boh, s), "gdn chunked boh free");
 #ifdef VLLM_CPP_TRITON
-  if (d_cidx != nullptr) Check(cudaFreeAsync(d_cidx, s), "gdn chunked cidx free");
+  if (!chunk_pool)
+#endif
+  {
+    Check(cudaFreeAsync(gcum, s), "gdn chunked gcum free");
+    Check(cudaFreeAsync(u, s), "gdn chunked u free");
+    Check(cudaFreeAsync(w, s), "gdn chunked w free");
+    Check(cudaFreeAsync(v_new, s), "gdn chunked v_new free");
+    Check(cudaFreeAsync(hstate, s), "gdn chunked hstate free");
+    Check(cudaFreeAsync(d_tok0, s), "gdn chunked tok0 free");
+    Check(cudaFreeAsync(d_len, s), "gdn chunked len free");
+    Check(cudaFreeAsync(d_boh, s), "gdn chunked boh free");
+  }
+#ifdef VLLM_CPP_TRITON
+  if (d_cidx != nullptr && !chunk_pool) Check(cudaFreeAsync(d_cidx, s), "gdn chunked cidx free");
 #endif
 }
 

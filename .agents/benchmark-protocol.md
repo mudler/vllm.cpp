@@ -104,6 +104,15 @@ rumor; a reproducible run is evidence.
 - **Prefer a scripted, re-runnable harness** over ad-hoc one-offs so any result
   can be regenerated on demand; keep the gate config stable (never silently
   re-base it without re-running vLLM on the new config).
+- **Thermal/power + memory-return disclosure for multi-arm series** (adopted
+  from spark-bench `matrix_driver.sh`; GB10 is a compact unified-memory box):
+  snapshot `nvidia-smi -q -d TEMPERATURE,POWER` before/after each measured leg
+  and record it with the results; between engine legs, verify available memory
+  returns to the recorded baseline (leak check) and drop page caches before the
+  next leg. A leg run on a throttling or memory-leaking box voids the
+  cross-leg comparison, same as contention.
+  See [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md)
+  § "Folded: spark-bench".
 
 If a result cannot be reproduced on demand under these rules, it does not count
 toward the gate.

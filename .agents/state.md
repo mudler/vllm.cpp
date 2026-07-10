@@ -2538,3 +2538,97 @@ their record surfaces. It adds no model family and performs no GPU work while
 `CLAIM-SERVE-GATE-1` owns dgx. After CPU implementation and full relevant tests,
 the two gate-model token/performance/memory no-regression campaign remains an
 exact `GATING` handoff rather than a speculative closure.
+
+## 2026-07-10 — `MODEL-FACTORY-registry` CPU implementation complete; GPU `GATING`
+
+Implementation commit `c707602` replaces the live `num_experts==0` guess with
+the pinned registry contract. `model_registry.{h,cpp}` now owns the central
+declaration-ordered table, type-erased `LoadedModel`/factory hooks, consumed
+`_ModelInfo` metadata, both existing Qwen registrations, all 32 previous + four
+OOT entries, and the exact empty/inspection-failed/previous/OOT/subset-default
+errors. `LoadedEngine` and `GPUModelRunner` each carry one type-erased model;
+their existing Qwen forwards, Marlin preparation, dense/MoE token-budget policy,
+KV layout, and decode graphs remain intact behind the registration. Live disk
+loading resolves the complete `architectures` list before tokenizer/weight work,
+so an unrelated dense config now rejects deterministically. GGUF exposes the
+canonical MoE registration ID while retaining its container model type.
+
+CPU evidence from the fresh isolated build:
+
+```sh
+cmake -S . -B build-model-factory -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF
+cmake --build build-model-factory -j20
+ctest --test-dir build-model-factory -j20 --output-on-failure
+# 94/94 pass
+./build-model-factory/tests/test_model_registry --success=0
+# 11 active cases, 112/112 assertions; one explicit
+# "MODEL-FACTORY-registry: no second family yet" skip
+python3 scripts/check-agent-record.py
+python3 tests/scripts/test_agent_record.py
+```
+
+The claim is released and the row is `GATING`, not `DONE`: no GPU command ran
+while `CLAIM-SERVE-GATE-1` owns dgx. Exact first-idle-window handoff (the dispatch
+refactor is structurally inseparable, so use adjacent-commit old/new binaries
+under one lock rather than inventing a shipping runtime fallback toggle):
+
+```sh
+BASE_REPO=$HOME/work/vllm.cpp
+OLD=$HOME/work/vllm.cpp-model-factory-old
+NEW=$HOME/work/vllm.cpp-model-factory-new
+export BASE_REPO OLD NEW
+git -C "$BASE_REPO" fetch origin codex/model-factory-registry
+git -C "$BASE_REPO" worktree add --detach "$OLD" c707602^
+git -C "$BASE_REPO" worktree add --detach "$NEW" c707602
+for tree in "$OLD" "$NEW"; do
+  cmake -S "$tree" -B "$tree/build-cuda" -DCMAKE_BUILD_TYPE=Release \
+    -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+    -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_DIR="$HOME/cutlass_probe"
+  cmake --build "$tree/build-cuda" --clean-first -j"$(nproc)"
+done
+
+MODEL27=$(dirname "$(find "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots" -name config.json -print -quit)")
+MODEL35=$(dirname "$(find "$HOME/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots" -name config.json -print -quit)")
+export MODEL27 MODEL35
+
+flock /tmp/gpu bash -lc '
+  set -euo pipefail
+  ctest --test-dir "$NEW/build-cuda" \
+    -R "test_qwen27_paged_engine|test_qwen36_paged_engine" \
+    --output-on-failure
+  for rep in 1 2 3; do
+    for tree in "$OLD" "$NEW"; do
+      /usr/bin/time -v "$tree/build-cuda/examples/vllm-bench" \
+        --model "$MODEL27" --num-prompts 96 --input-len 1024 \
+        --output-len 128 --concurrency 16 --seed 0 --temperature 0 \
+        --num-blocks 2400
+      /usr/bin/time -v "$tree/build-cuda/examples/vllm-bench" \
+        --model "$MODEL27" --num-prompts 192 --input-len 1024 \
+        --output-len 128 --concurrency 32 --seed 0 --temperature 0 \
+        --num-blocks 2400
+      /usr/bin/time -v "$tree/build-cuda/examples/vllm-bench" \
+        --model "$MODEL35" --num-prompts 200 --input-len 1024 \
+        --output-len 128 --concurrency 64 --seed 0 --temperature 0 \
+        --num-blocks 2400
+    done
+    run_oracle() {
+      "$HOME/venvs/vllm-oracle/bin/vllm" bench throughput --model "$1" \
+        --dataset-name random --random-input-len 1024 \
+        --random-output-len 128 --random-range-ratio 0 \
+        --num-prompts "$2" --max-num-seqs "$3" --seed 0
+    }
+    run_oracle "$MODEL27" 96 16
+    run_oracle "$MODEL27" 192 32
+    run_oracle "$MODEL35" 200 64
+  done
+'
+```
+
+Capture temperature/power before/after each leg, verify memory returns before
+the next engine, and record all three repetitions, total/output/request
+throughput, TTFT/TPOT/ITL, peak RSS/unified memory, fresh vLLM denominators and
+ratios. Closure requires both greedy gates unchanged, new-vs-old no regression
+on every axis within reproduced run noise, and the standing ≥1.0× vLLM floors
+retained at 27B c16/c32 and 35B c64. Only then append the closing ledger evidence,
+move `MODEL-FACTORY-registry` `GATING→DONE`, and use the closing commit as owner.

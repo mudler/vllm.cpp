@@ -33,7 +33,12 @@ runs end-to-end on CPU:
 - **Model forward** — Qwen3.6-35B-A3B hybrid (GDN×3 + gated full-attention, 256-
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
-  (k-quant→bf16 for the qwen35moe APEX files).
+  (k-quant→bf16 for the qwen35moe APEX files). Model selection now uses a
+  central ordered, type-erased registry over the full Hugging Face
+  `architectures` list for both implemented Qwen IDs; unsupported,
+  previously-supported, and out-of-tree IDs are rejected explicitly instead of
+  being guessed from `num_experts`. The registry's CPU suite is green; its
+  unchanged two-model GPU path is awaiting the queued no-regression rerun.
 - **Sampler** — greedy (bit-exact vs `torch.argmax`) plus temperature,
   top-k/top-p, penalties, min-p and internal logit-filter/logprob primitives.
   `n`, full random/logprob payload behavior, and request/API wiring for the

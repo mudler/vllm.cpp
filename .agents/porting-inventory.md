@@ -128,11 +128,17 @@ we mirror it.
 
 The pinned registry has **353 unique static architecture IDs** (370 category
 memberships, 307 implementation targets, 258 modules) plus a dynamic
-Transformers-compatible path. The generic architecture-to-factory registry is
-not ported: one MoE ID is directly registered and the dense gate model uses a
-Qwen-specific `num_experts==0` bypass. Its claim-sized implementation contract
-is READY in [model-factory-registry.md](specs/model-factory-registry.md); see
-`model-matrix.md`.
+Transformers-compatible path. The generic ordered architecture-to-type-erased-
+factory contract is now implemented for the two architectures whose text paths
+exist locally: `Qwen3_5ForConditionalGeneration` and
+`Qwen3_5MoeForConditionalGeneration`. Live loading consumes the full
+`config.architectures` list in order and mirrors pinned unknown,
+previously-supported, and out-of-tree rejection; unimplemented IDs remain
+unsupported rather than being misclassified by `num_experts`. The execution row
+is `GATING` on its deferred two-model GPU no-regression campaign; see
+[model-factory-registry.md](specs/model-factory-registry.md) and
+`model-matrix.md`. Dynamic Transformers/terratorch/OOT runtime loading and
+Python lazy-import/subprocess caching remain explicitly deferred.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
@@ -299,23 +305,25 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    `Qwen3_5Model::Forward`, reusing the file-local `GdnBlockPaged`/
    `FullAttnBlockPaged`/paged machinery VERBATIM via `RunDenseLayerPaged` (the
    only delta vs `RunLayerPaged` is `DenseMlpBlock` in place of `MoeBlock`).
-   Runner deviation: `GPUModelRunner` now carries EITHER arch via a
-   `{moe,dense}_weights_` pointer pair (was a single `Qwen3_5MoeWeights&`
-   reference) + a `Qwen3_5DenseWeights` constructor overload; `execute_model`
-   dispatches to the dense forward when `dense_weights_` is set. `initialize_kv_cache`
-   is unchanged (config-driven; same hybrid backbone). Full LoadedEngine dense
-   dispatch is now WIRED (CPU): `LoadedEngine` carries the SAME `{moe,dense}_weights_`
-   pair (`std::optional<Qwen3_5MoeWeights>` / `std::optional<Qwen3_5DenseWeights>`,
-   was a single `Qwen3_5MoeWeights weights_`) + a `Qwen3_5DenseWeights` constructor
-   overload driving the runner's dense overload; `FromModelDir` arch-selects on
-   `LoadedEngine::IsDenseArch` (`num_experts==0` → `LoadQwen3_5Dense`, else
-   `LoadQwen3_5Moe`). Everything between (Executor/EngineCore/processors) was
-   already arch-agnostic (touches the runner only via `ModelRunnerBase`), so NO
-   change was needed there — the MoE-typing was confined to the runner + the
-   loader. CPU-proven by `test_loaded_engine_dense.cpp` (IsDenseArch dispatch +
-   dense stack generates deterministically through the full LLMEngine loop). The
-   remaining 27B steps are all GPU-gated (oracle golden → W4A4 GEMM 6a → flip
-   `kW4A4ForwardReady`, qwen27b-w4a4-notes.md §5 steps 5-7).
+   Registry/type-erasure update (`c707602`): `GPUModelRunner` now carries one
+   `LoadedModel*` and calls the registration's type-erased prepare/forward hooks;
+   model-specific weights and both existing decode-graph objects live behind the
+   concrete `LoadedModel`. Its concrete-weight constructor overloads are only
+   compatibility adapters for synthetic tests. `LoadedEngine` likewise owns one
+   `std::unique_ptr<LoadedModel>` instead of the `{moe,dense}` optional pair and
+   obtains its KV spec plus already-gated dense/MoE scheduler policy through the
+   factory. `FromModelDir` resolves `config.architectures` in declaration order
+   before tokenizer/weight work, then calls the matched safetensors/GGUF loader;
+   unrelated dense configs now receive the pinned reject-unknown error instead
+   of falling through `num_experts==0`. The GGUF Qwen loader publishes the
+   canonical MoE registration ID while retaining `qwen35moe`/`qwen3next` as its
+   container `model_type`. Everything between runner and LLMEngine remains
+   architecture-agnostic. CPU evidence: `test_model_registry.cpp` (112 active
+   assertions + one tracked second-family skip), the live reject case in
+   `test_model_loader_gguf.cpp`, deterministic dense `LoadedEngine`, runner and
+   GGUF tests, and the full 94/94 suite. The implementation is `GATING`, not
+   `DONE`, until both real gate-model greedy and adjacent-commit every-axis
+   no-regression runs complete on dgx.
 8. **Extension platforms** (T2): Apple Metal and Vulkan backends — upstream has
    no equivalent under `vllm/platforms/`; we add them through the mirrored
    Platform/AttentionBackend/vt-op seams so they behave as vLLM platforms

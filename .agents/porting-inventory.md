@@ -490,10 +490,10 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     hand 856.73 → Triton 876.08 (+2.26%), vLLM 1043.17 ⇒ **0.821×→0.840×**.
     **VENDORED — build-time Python removed (2026-07-10; branch
     `build/vendor-triton-aot`).** The generated AOT artifacts (per-spec C
-    launchers with EMBEDDED cubins + the linked stable dispatchers, 10 bases =
-    5 kernels × H=48/32) are now COMMITTED per-arch under
-    `src/vt/cuda/triton_aot_vendored/<arch>/` (today `sm_121a/`; 40 files +
-    MANIFEST, 6.7 MB total — the embedded-cubin C arrays dominate; the
+    launchers with EMBEDDED cubins + the linked stable dispatchers, 12 bases =
+    5 kernels × H=48/32 plus the two bf16-output `chunk_o` dispatchers) are now
+    COMMITTED per-arch under `src/vt/cuda/triton_aot_vendored/<arch>/` (today
+    `sm_121a/`; 48 generated C/H files + MANIFEST — the embedded-cubin C arrays dominate; the
     Marlin/FA-2 vendoring precedent), each with a provenance header and a
     `MANIFEST` (triton/ptxas/python/CUDA versions, sha256 of every
     `triton_kernels/*.py`, per-base generation parameters, date). This NARROWS
@@ -503,15 +503,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (`-DVLLM_CPP_TRITON_REGEN=ON` reruns `triton.tools.compile/link` AND
     refreshes the vendored tree + MANIFEST; `scripts/regen-triton-aot.sh` wraps
     it and prints the git diff to review/commit). Staleness is guarded at
-    configure time: kernel-source hash drift vs MANIFEST → loud WARNING (build
-    proceeds on the old cubins); pin/signature drift vs the MANIFEST `base`
-    lines → loud WARNING; missing arch dir → clear FATAL with the regen
-    instructions. Two same-worktree GB10 regens (Triton 3.6.0, ptxas 12.8)
-    produced the same tree, but **cross-worktree byte reproducibility is not
-    established**: generated cubins can embed absolute source paths. Until
-    `CLAIM-PR3` normalizes/strips those paths, source/manifest hashes plus the
-    reviewed artifact diff are the change signal, not a universal byte-identity
-    claim. The OFF build stays byte-inert.
+    configure time and by a no-Python/GPU CI checker: target, line-info policy,
+    generator shim, kernel-source hashes, exact base/signature set, artifact
+    inventory, and every artifact hash must match the MANIFEST; drift is FATAL.
+    **Cross-worktree byte reproducibility is now resolved (2026-07-10,
+    `CLAIM-PR3`).** The initial measurement found that all cross-path deltas were
+    embedded Triton line-info source paths in the 12 specialization C arrays.
+    Generation now derives the explicit `cuda:121:32` target from `sm_121a`,
+    sets `TRITON_DISABLE_LINE_INFO=1`, and pins the repository-owned Triton 3.6
+    numeric-target shim by hash. Recovered pre-current-main validation records
+    two regenerations from different absolute source roots as byte-identical;
+    the current integrated tree's pure drift checker and ten mutation cases
+    pass over all 49 files. Current-main CUDA execution remains an explicit
+    `KERNEL-GDN-*` gate, not an A4/reproducibility claim. The OFF build stays
+    byte-inert.
     VALIDATED end-to-end on dgx.casa (2026-07-10, fresh clone, configure pinned
     to `VLLM_CPP_TRITON_PYTHON=/nonexistent/python` so only the vendored
     artifacts could satisfy the build): full `all` builds green with no Python,

@@ -18,6 +18,8 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/triton-aot-sync.yml'
+      - 'CMakeLists.txt'
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
@@ -25,9 +27,13 @@ on:
       - 'scripts/check-triton-aot-drift.sh'
   pull_request:
     paths:
+      - '.github/workflows/triton-aot-sync.yml'
+      - 'CMakeLists.txt'
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
+      - 'scripts/regen-triton-aot.sh'
+      - 'scripts/check-triton-aot-drift.sh'
   schedule:
     - cron: '17 5 * * 1'   # weekly drift audit (Mon 05:17 UTC)
   workflow_dispatch: {}
@@ -76,15 +82,15 @@ jobs:
           git checkout -b "$branch"
           git add src/vt/cuda/triton_aot_vendored/
           git commit -F - <<'MSG'
-build: sync vendored Triton AOT artifacts with triton_kernels sources (automated regen)
+          build: sync vendored Triton AOT artifacts with triton_kernels sources (automated regen)
 
-Automated regen via scripts/regen-triton-aot.sh after drift was detected by
-scripts/check-triton-aot-drift.sh. Review the MANIFEST + artifact diff, then
-merge; CI's drift-check gates that the result is coherent.
+          Automated regen via scripts/regen-triton-aot.sh after drift was detected by
+          scripts/check-triton-aot-drift.sh. Review the MANIFEST + artifact diff, then
+          merge; CI's drift-check gates that the result is coherent.
 
-FOLLOWING_AGENTS_PROTOCOL
-Assisted-by: triton-aot-sync GitHub workflow
-MSG
+          FOLLOWING_AGENTS_PROTOCOL
+          Assisted-by: triton-aot-sync GitHub workflow
+          MSG
           git push origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "build: sync vendored Triton AOT artifacts (automated regen)" \

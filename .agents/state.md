@@ -2031,3 +2031,18 @@ assertable dispatch/reuse test; run the CUDA/Triton suite and both model gates o
 `dgx.casa`; then run repeated same-binary pool ON/OFF and bf16-output A/B against
 fresh production-vLLM denominators across throughput, latency, and memory. Rebase
 and update roadmap/matrix status under the new protocol before merge.
+
+## 2026-07-10 — Triton AOT sync workflow parses again; PR #3 artifact-set gap remains
+
+The workflow added at `aae469d` failed at workflow-parse time on every push (zero
+jobs, no logs): its `git commit` heredoc body was not indented inside the YAML
+`run: |` scalar. Indented the body/terminator correctly and added top-level
+`CMakeLists.txt` plus `regen-triton-aot.sh`/`check-triton-aot-drift.sh` to both
+push and PR filters. This ensures changes to the declared AOT base/signature set
+actually trigger the workflow.
+
+Validation: PyYAML parses both jobs; the current sm_121a hash drift check passes;
+`git diff --check` passes. This does **not** clear PR #3: the checker still needs
+an expected-base/signature inventory so a missing generated bf16 specialization
+cannot report in-sync. GitHub workflow execution is the final validation after
+push.

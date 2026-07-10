@@ -79,7 +79,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass**; throughput near-parity vs vLLM | 🚧 load path done (k-quant dequant + qwen35moe loader; real-file parity dgx-pending) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack + both greedy gates on GB10**; 🚧 throughput parity being closed |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass**; throughput near-parity vs vLLM | ✅ 35B from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack + both greedy gates on GB10**; 🚧 throughput parity being closed |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -123,7 +123,7 @@ backends (Metal/Vulkan/ROCm/XPU) are 🗓 post-MVP and will port from the CPU re
 | Format | Status |
 |---|---|
 | NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, cutlass sm120a fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass |
-| GGUF quants (Q4_K/Q5_K/Q6_K/Q3_K, Q8_0, F32) | 🚧 dequant (byte-exact vs ggml) + qwen35moe load path done on CPU; real-file greedy parity dgx-pending; IQ2_S/IQ4_XS i-quants pending |
+| GGUF quants (Q4_K/Q5_K/Q6_K/Q3_K, Q8_0, F32) | ✅ 35B (qwen35moe) loads + serves from a single real `.gguf` on GB10 (dequant byte-exact vs ggml; greedy token-for-token vs a same-file llama.cpp oracle); 27B GGUF + IQ2_S/IQ4_XS i-quants + NVFP4 GGUF extension type pending (no real files exist yet) |
 | fp8, MXFP4 | 🗓 planned (post-MVP T1) |
 
 Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.

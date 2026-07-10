@@ -1919,3 +1919,52 @@ proven not from the FA-2 branch; the Tier-1 interpreter is not on the model hot 
 (Tier-0 composite is default). Fix the CPU interpreter or its golden.
 **REMAINING MVP SCOPE (non-throughput):** TTFT/TPOT vs vLLM SERVE (only offline-bench
 compared so far), GGUF real-file parity on dgx, e2e suites — per gates.md.
+
+## 2026-07-10 — GGUF REAL-FILE GREEDY PARITY ON GB10: PASSED (the last M0.10 dgx-pending item)
+
+**WHAT WAS PENDING.** M0.10 shipped the GGUF loader CPU-green on synthetic files;
+the real APEX end-to-end load + greedy parity on GB10 had never run. This session
+ran it, chose the oracle, and closed it. Branch `gate/gguf-real-file-parity`.
+
+**FIRST RUN + THE ORACLE QUESTION.** The engine loads the real 17.3 GB
+APEX-Compact (arch qwen35moe, F32+Q3_K/Q4_K/Q6_K) end-to-end via
+`FromModelDir(*.gguf)` on GB10 first try — single-file config + GGUF-embedded
+vocab + k-quant dequant→bf16, ~2.7 min load, fluent 16-token greedy output,
+exit 0. THE ORACLE for parity is llama.cpp loading the SAME .gguf (the fork at
+`~/llama-phase93-qwen3next-gqa-bcast` supports qwen35moe; driven via llama-server
+`-ngl 99`, temp 0, `return_tokens`): the APEX files are k-quant re-quantizations
+of the base weights, so the safetensors-NVFP4 goldens are NOT same-weights — the
+oracle itself, on APEX-Balanced, diverges from the NVFP4 M0 continuation at
+token 7. (Compact's M0 continuation happens to coincide with the NVFP4 one.)
+
+**THE M0-PROMPT NEAR-TIE (disclosed, not a bug).** On the M0-exit prompt our
+Compact greedy takes " official…" where the oracle takes " capital…" — the
+oracle's OWN top-2 at that step are −1.8802 vs −1.9200 (margin 0.040), a
+near-tie; our numerics (dequant→bf16 + bf16 GEMMs — the SAME recipe vLLM's GGUF
+loader uses) legitimately land on the other branch. Verified NOT a loader bug
+by WEIGHT-LEVEL cross-check of every GGUF tensor family against the safetensors
+checkpoint ground truth (gguf-py dequant + the loader's documented inversions,
+vs BF16/FP8-scalar/NVFP4-dequant safetensors tensors): norm +1 inversions,
+ssm_a=log(-x), dt_bias, conv1d V-head reorders all EXACT (maxabs 0.0); every
+quantized 2-D/3-D family (embed, qkv/gate/out with V-row+col reorders, q/k/v/o,
+router, shared+routed experts, lm_head) corr ≥ 0.9927 = pure quant noise.
+Config-from-GGUF also diffed clean against config.json (rope 1e7/64, eps 1e-6,
+MoE 256/8/512, GQA 16/2/256, layer pattern interval-4).
+
+**THE GATE (test_qwen36_gguf_engine, checkpoint-gated dgx-only).** Two DECISIVE
+prompts (oracle top-2 margin ≥1.91 every step on "1, 2, …, 8," ; ≥0.15 on the
+Eiffel prompt) × two files covering all supported k-quants on real tensors:
+APEX-Compact (Q3_K/Q4_K/Q6_K) and APEX-Balanced (Q8_0/Q5_K/Q6_K). Asserts the
+GGUF-embedded-vocab prompt tokenization (matches llama.cpp /tokenize exactly)
+AND the 16-token greedy continuation token-for-token vs the pinned same-file
+oracle (goldens/qwen36_gguf_35b/, provenance in manifest.json). **RESULT ON
+GB10: 2/2 test cases, 28/28 assertions — Compact AND Balanced reproduce the
+oracle 16/16 on both prompts, tokenization exact.** Server spot probes also
+matched the oracle text exactly on 3/4 prompts incl. " oxygen. The atomic
+mass…" (the 4th is the disclosed M0 near-tie).
+
+**REMAINING for the full gate-#2 language (blocked on files, recorded in
+porting-inventory):** no 27B GGUF exists anywhere on dgx (and the GGUF loader is
+qwen35moe/qwen3next-only — a dense-27B variant is unwritten); no NVFP4-extension
+-type (id 40) GGUF exists for the gate models (reader traits support it, dequant
+does not); APEX Mini/Quality need IQ2_S/IQ4_XS i-quants (clear error today).

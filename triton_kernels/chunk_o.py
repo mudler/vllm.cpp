@@ -38,8 +38,9 @@
 # the FLA pointer arithmetic and our hand GdnChunkOWmmaKernel):
 #   q=[T,Hg,K] bf16, k=[T,Hg,K] bf16, v(=v_new)=[T,H,V] bf16,
 #   h(=hstate snapshot)=[NT,H,V,K] bf16, g(=gcum within-chunk cumsum)=[T,H] f32,
-#   o(=out)=[T,H,V] f32 (the default GDN recurrence-output dtype; VT_GDN_OUT_BF16
-#   stays OFF for the gate config), cu_seqlens=[N+1] i32,
+#   o(=out)=[T,H,V] f32 or bf16, selected by the AOT signature. The bf16
+#   specialization mirrors FLA's empty_like(v) / output-buffer dtype and is
+#   evaluated before VT_GDN_OUT_BF16 can become a default. cu_seqlens=[N+1] i32,
 #   chunk_indices=[NT,2] i32 (per global chunk: (i_n, i_t_local)).
 import triton
 import triton.language as tl

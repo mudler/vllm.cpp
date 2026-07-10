@@ -288,6 +288,11 @@ if(VLLM_CPP_CUDA)
   # USE_INITIAL_STATE=1,STORE_FINAL_STATE=1,SAVE_NEW_VALUE=1,IS_VARLEN=1,USE_EXP2=0.
   if(VLLM_CPP_TRITON)
     enable_language(C)  # the AOT launchers are plain C (CUDA driver API)
+    include(cmake/TritonAOTKernels.cmake)
+    vllm_triton_aot_declare_all()
+    vllm_triton_aot_expected_lines(_TRITON_AOT_CONTRACT_LINES)
+    set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_CONTRACT_LINES
+      "${_TRITON_AOT_CONTRACT_LINES}")
     # Launch-config pins, PER KERNEL and PER GDN SHAPE (H=48 27B, H=32 35B),
     # set to the winning config of FLA's OWN @triton.autotune run at the exact
     # engine shapes on GB10 (tools: ~/work/finisher_fla_autotune.py; see
@@ -336,16 +341,6 @@ if(VLLM_CPP_CUDA)
     set(_CHUNKO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_o.py")
     set(_CHUNKO_SIG_HEAD_F32 "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
     set(_CHUNKO_SIG_HEAD_BF16 "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32")
-    set(_CHUNKO_BF16_AOT_AVAILABLE ${VLLM_CPP_TRITON_REGEN})
-    if(NOT _CHUNKO_BF16_AOT_AVAILABLE)
-      _triton_aot_arch_dir(_TRITON_AOT_ARCH_DIR)
-      if(EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h48.c" AND
-         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h48.h" AND
-         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h32.c" AND
-         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h32.h")
-        set(_CHUNKO_BF16_AOT_AVAILABLE ON)
-      endif()
-    endif()
     foreach(_H 48 32)
       set(_CHUNKO_SIG_TAIL "16, 128, 128, 64, ${VT_GDN_CHUNKO_BK_${_H}}, ${VT_GDN_CHUNKO_BV_${_H}}, 1, 1")
       math(EXPR _CHUNKO_GX "(128 + ${VT_GDN_CHUNKO_BV_${_H}} - 1) / ${VT_GDN_CHUNKO_BV_${_H}}")
@@ -357,23 +352,15 @@ if(VLLM_CPP_CUDA)
       target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS})
       target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS_INCLUDE_DIR})
 
-      if(_CHUNKO_BF16_AOT_AVAILABLE)
-        set(_sig "${_CHUNKO_SIG_HEAD_BF16}, ${_H}, ${_CHUNKO_SIG_TAIL}")
-        add_triton_kernel(VT_GDN_CHUNKO_BF16_${_H}_SRCS
-          "${_CHUNKO_KPY}" chunk_fwd_kernel_o gdn_chunko_bf16_h${_H}
-          "${_sig}" "${_CHUNKO_GX},NT,${_H}"
-          ${VT_GDN_CHUNKO_WARPS_${_H}} ${VT_GDN_CHUNKO_STAGES_${_H}})
-        target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS})
-        target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS_INCLUDE_DIR})
-      endif()
+      set(_sig "${_CHUNKO_SIG_HEAD_BF16}, ${_H}, ${_CHUNKO_SIG_TAIL}")
+      add_triton_kernel(VT_GDN_CHUNKO_BF16_${_H}_SRCS
+        "${_CHUNKO_KPY}" chunk_fwd_kernel_o gdn_chunko_bf16_h${_H}
+        "${_sig}" "${_CHUNKO_GX},NT,${_H}"
+        ${VT_GDN_CHUNKO_WARPS_${_H}} ${VT_GDN_CHUNKO_STAGES_${_H}})
+      target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS_INCLUDE_DIR})
     endforeach()
-    if(_CHUNKO_BF16_AOT_AVAILABLE)
-      target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON_CHUNKO_BF16=1)
-    else()
-      message(STATUS
-        "Triton AOT bf16 chunk_o artifacts not present for this arch; "
-        "VT_GDN_OUT_BF16 will use the portable chunk_o fallback until regen")
-    endif()
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON_CHUNKO_BF16=1)
 
     # ── SANCTIONED Triton AOT: GDN WU pipeline (kkt -> solve_tril -> recompute_w_u)
     # The 3 FLA kernels our single fused GdnChunkWUWmmaVecKernel mirrors; ported so

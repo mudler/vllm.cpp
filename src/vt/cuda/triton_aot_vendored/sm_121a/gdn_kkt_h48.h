@@ -20,11 +20,10 @@
 CUresult gdn_kkt_h48_48x16x128x64x128x1x1_warps8xstages3(CUstream stream, CUdeviceptr k, CUdeviceptr beta, CUdeviceptr g, CUdeviceptr A, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 void load_gdn_kkt_h48_48x16x128x64x128x1x1_warps8xstages3();
 void unload_gdn_kkt_h48_48x16x128x64x128x1x1_warps8xstages3();
-    
+
 int gdn_kkt_h48_get_num_algos(void);
 
 CUresult gdn_kkt_h48_default(CUstream stream, CUdeviceptr k, CUdeviceptr beta, CUdeviceptr g, CUdeviceptr A, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 CUresult gdn_kkt_h48(CUstream stream, CUdeviceptr k, CUdeviceptr beta, CUdeviceptr g, CUdeviceptr A, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT, int algo_id);
 void load_gdn_kkt_h48();
 void unload_gdn_kkt_h48();
-    

@@ -20,11 +20,10 @@
 CUresult gdn_chunko_h32_32x16x128x128x64x64x64x1x1_warps4xstages3(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 void load_gdn_chunko_h32_32x16x128x128x64x64x64x1x1_warps4xstages3();
 void unload_gdn_chunko_h32_32x16x128x128x64x64x64x1x1_warps4xstages3();
-    
+
 int gdn_chunko_h32_get_num_algos(void);
 
 CUresult gdn_chunko_h32_default(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 CUresult gdn_chunko_h32(CUstream stream, CUdeviceptr q, CUdeviceptr k, CUdeviceptr v, CUdeviceptr h, CUdeviceptr g, CUdeviceptr o, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT, int algo_id);
 void load_gdn_chunko_h32();
 void unload_gdn_chunko_h32();
-    

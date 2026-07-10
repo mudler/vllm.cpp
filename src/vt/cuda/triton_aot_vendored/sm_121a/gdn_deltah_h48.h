@@ -20,11 +20,10 @@
 CUresult gdn_deltah_h48_48x16x128x128x64x64x1x0x1x1x1x1x0_warps4xstages3(CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr w, CUdeviceptr v_new, CUdeviceptr g, CUdeviceptr gk, CUdeviceptr h, CUdeviceptr h0, CUdeviceptr ht, CUdeviceptr cu_seqlens, CUdeviceptr chunk_offsets, int32_t T, int32_t NH);
 void load_gdn_deltah_h48_48x16x128x128x64x64x1x0x1x1x1x1x0_warps4xstages3();
 void unload_gdn_deltah_h48_48x16x128x128x64x64x1x0x1x1x1x1x0_warps4xstages3();
-    
+
 int gdn_deltah_h48_get_num_algos(void);
 
 CUresult gdn_deltah_h48_default(CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr w, CUdeviceptr v_new, CUdeviceptr g, CUdeviceptr gk, CUdeviceptr h, CUdeviceptr h0, CUdeviceptr ht, CUdeviceptr cu_seqlens, CUdeviceptr chunk_offsets, int32_t T, int32_t NH);
 CUresult gdn_deltah_h48(CUstream stream, CUdeviceptr k, CUdeviceptr v, CUdeviceptr w, CUdeviceptr v_new, CUdeviceptr g, CUdeviceptr gk, CUdeviceptr h, CUdeviceptr h0, CUdeviceptr ht, CUdeviceptr cu_seqlens, CUdeviceptr chunk_offsets, int32_t T, int32_t NH, int algo_id);
 void load_gdn_deltah_h48();
 void unload_gdn_deltah_h48();
-    

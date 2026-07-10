@@ -181,8 +181,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   mirror what it runs. Recent measured,
   token-exact, default-on wins: register-tiled GDN `delta_h` + `cp.async` ring, a
   blocked tensor-core WY triangular inverse, fused fp8 RMSNorm→quant (quantize-once),
-  bf16 GDN input I/O, per-shape fp4-GEMM autotune, and FA-2 prefill attention.
-  The full record is in the [parity ledger](.agents/parity-ledger.md).
+  and bf16 GDN input I/O. A per-shape fp4-GEMM autotune (**+5.8%** on the 27B at high
+  concurrency) is **default-on** (`VT_FP4_AUTOTUNE=0` opts out). Every step is
+  A/B-measured and
+  gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
   `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF
   only). Original runtime/packaging components (the `vt` op runtime, the minja

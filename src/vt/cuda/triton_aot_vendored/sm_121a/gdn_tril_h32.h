@@ -20,11 +20,10 @@
 CUresult gdn_tril_h32_32x64x1_warps4xstages3(CUstream stream, CUdeviceptr A, CUdeviceptr Ai, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 void load_gdn_tril_h32_32x64x1_warps4xstages3();
 void unload_gdn_tril_h32_32x64x1_warps4xstages3();
-    
+
 int gdn_tril_h32_get_num_algos(void);
 
 CUresult gdn_tril_h32_default(CUstream stream, CUdeviceptr A, CUdeviceptr Ai, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT);
 CUresult gdn_tril_h32(CUstream stream, CUdeviceptr A, CUdeviceptr Ai, CUdeviceptr cu_seqlens, CUdeviceptr chunk_indices, int32_t T, int32_t NT, int algo_id);
 void load_gdn_tril_h32();
 void unload_gdn_tril_h32();
-    

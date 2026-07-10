@@ -23,8 +23,11 @@ on:
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
+      - 'cmake/TritonAOTKernels.cmake'
+      - 'cmake/DumpTritonAOTContract.cmake'
       - 'scripts/regen-triton-aot.sh'
       - 'scripts/check-triton-aot-drift.sh'
+      - 'tests/scripts/test_triton_aot_drift.sh'
   pull_request:
     paths:
       - '.github/workflows/triton-aot-sync.yml'
@@ -32,8 +35,11 @@ on:
       - 'triton_kernels/**'
       - 'src/vt/cuda/triton_aot_vendored/**'
       - 'cmake/TritonAOT.cmake'
+      - 'cmake/TritonAOTKernels.cmake'
+      - 'cmake/DumpTritonAOTContract.cmake'
       - 'scripts/regen-triton-aot.sh'
       - 'scripts/check-triton-aot-drift.sh'
+      - 'tests/scripts/test_triton_aot_drift.sh'
   schedule:
     - cron: '17 5 * * 1'   # weekly drift audit (Mon 05:17 UTC)
   workflow_dispatch: {}
@@ -70,6 +76,18 @@ jobs:
       - name: Regenerate vendored artifacts
         if: steps.drift.outputs.stale == 'true'
         run: bash scripts/regen-triton-aot.sh
+      - name: Verify regenerated artifact contract and vendored consumer
+        if: steps.drift.outputs.stale == 'true'
+        run: |
+          bash scripts/check-triton-aot-drift.sh
+          cmake -S . -B build-triton-aot-consumer \
+            -DVLLM_CPP_CUDA=ON \
+            -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+            -DVLLM_CPP_TRITON=ON \
+            -DVLLM_CPP_TRITON_REGEN=OFF \
+            -DVLLM_CPP_BUILD_TESTS=OFF \
+            -DVLLM_CPP_BUILD_EXAMPLES=OFF \
+            -DVLLM_CPP_SERVER=OFF
       - name: Open sync PR
         if: steps.drift.outputs.stale == 'true'
         env:

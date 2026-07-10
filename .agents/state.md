@@ -2540,3 +2540,34 @@ No implementation or support state changed. The next step is a pinned
 written as the nine-section
 `specs/sliding-local-yarn-long-context.md`; no GPU work is authorized for this
 spike.
+
+## 2026-07-10 — ROAD-V1-C5 joint spike accepted; eight leaves `READY`
+
+`CLAIM-C5-SPIKE-1` completed its docs-only pinned-source analysis and is
+released. The accepted contract is
+[specs/sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md).
+It covers both full execution chains: config → KV spec/manager/admission/
+recycling → attention metadata/backend → the exact pinned FA2 mask (plus the
+FlashInfer fallback), and config/factory → scaled cos/sin cache → CPU/CUDA RoPE
+apply for YaRN/MRoPE, Llama3, LongRoPE, and both dynamic-NTK modes. The spec
+ports the upstream tests, fills the pin's missing per-formula numerical tests
+with oracle goldens, assigns non-overlapping W1-W8 ownership, and fixes model,
+hardware, correctness, nsys, every-axis performance and memory gates.
+
+Two findings are load-bearing. First, sm_121's default non-MLA path prioritizes
+FlashAttention and resolves FA2 at this pin; the local mask lives in pinned
+`vllm-project/flash-attention` commit
+`2c839c33742309ec41e620bf837495ec9926c56e`, so source and future nsys evidence
+must both agree. Second, the actual 35B and 27B gate configs use
+`rope_type=default` interleaved MRoPE at 262144 positions and have no
+sliding/chunked-local setting — they do **not** exercise YaRN. They remain
+mandatory regressions, while each C5 leaf has a separate feature-positive
+oracle/model gate.
+
+The two umbrellas and eight leaves move `SPIKE -> READY`; none has code/test
+support evidence and README therefore does not change. Engine summary is now
+96 rows: `ANCHOR-BACKFILL=9`, `PARTIAL=17`, `SPIKE=0`, `READY=16`,
+`ACTIVE=3`, `GATING=2`, `INVENTORIED=49`.
+Validation is green: `python3 scripts/check-agent-record.py` reports
+ENGINE=96, MODEL=323, QUANT=81, KERNEL=30, BACKEND=51, and all 13
+`tests.scripts.test_agent_record` mutation cases pass. No GPU command ran.

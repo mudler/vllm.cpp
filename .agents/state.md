@@ -2574,3 +2574,35 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+## 2026-07-10 — recovered PR #3 validation evidence; current-main denominator remains open
+
+Recovered the pre-current-main `CLAIM-PR3` validation branch and its preliminary
+implementation/correctness evidence. The vendored contract now
+derives and validates `cuda:121:32` from `sm_121a`, disables cubin line info,
+pins the repository-owned Triton 3.6 numeric-target shim by hash, treats source
+drift as fatal, and validates the exact base/artifact set. Two regenerations in
+different absolute paths on `dgx.casa` were byte-identical. The no-Python
+consumer configured with `VLLM_CPP_TRITON_PYTHON=/definitely/missing/python` and
+built `vllm`, `test_ops_gdn`, `server`, and `vllm-bench` from vendored C only.
+
+Runtime hardening adds one `std::call_once` per generated module, a concurrent
+two-queue first-load test, allocate-before-retire scratch growth, queue-destroy
+pool cleanup, and exact upstream CuTe-DSL max/mean tolerances (output max/mean
+`<2e-3/<6e-5`; state `<2e-2/<6e-4`). The recovered branch had enabled the bf16
+AOT `chunk_o` and grow-only per-stream pools by default and its previously
+frozen 3x factorial found every-axis wins for both pool and bf16 steps on both
+models. Those pre-current-main measurements are recovery evidence only: the
+bf16 default remains off until the final current-main same-binary A/B is rerun.
+
+Recovered validation on that exact pre-current-main tree: local CPU `91/91`; clean macOS
+AppleClang drift CTest `1/1`; DGX `test_ops_gdn` `33/33`, `786/786`; compute-
+sanitizer `0` errors and `0` leaked bytes; 27B engine gate `9/9`; 35B single plus
+six-request batched graph gate `33/33`. The workflow now regenerates and executes
+the consumer test under `/tmp/gpu`, and its required trailer is corrected.
+
+Still open before `CLAIM-PR3` can close: rebuild and rerun the recovered validation
+on the integrated current-main tree, then one uninterrupted-lock, two-rep final
+ours-vs-production-vLLM comparison for both gate models and a paired `nsys` kernel
+trace; finally perform the same-change permanent matrix/roadmap/README/ledger
+reconciliation, completed-report archive, and claim release. No current-main
+runtime or DONE status is asserted here.

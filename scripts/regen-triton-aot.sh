@@ -5,12 +5,12 @@
 # Normal builds do NOT need this (nor Python/Triton at all): with
 # -DVLLM_CPP_TRITON=ON the build consumes the vendored .c/.h artifacts with only
 # a C compiler. Run this ONLY when the kernels / signatures / launch pins change
-# (the vendored-path configure warns loudly when they drift), or to add a new
+# (the vendored-path configure fails when they drift), or to add a new
 # arch tree; then review + commit the git diff it prints.
 #
-# Requirements (a GPU box, e.g. dgx.casa): CUDA toolkit (nvcc), a Python with
-# Triton installed (Triton compiles the cubins with its OWN bundled ptxas), and
-# a visible GPU unless VLLM_CPP_TRITON_TARGET is passed explicitly.
+# Requirements: CUDA toolkit (nvcc) and a Python with Triton installed (Triton
+# compiles cubins with its OWN bundled ptxas). The target is derived from the
+# vendored arch directory; workflow runtime validation still requires a GPU.
 #
 # Usage:
 #   bash scripts/regen-triton-aot.sh [extra -D cmake args...]
@@ -52,4 +52,5 @@ git status --short -- src/vt/cuda/triton_aot_vendored/ || true
 git --no-pager diff --stat -- src/vt/cuda/triton_aot_vendored/ || true
 echo
 echo "If the diff is empty, the vendored artifacts were already current"
-echo "(byte-identical regen). Untracked files above are NEW artifacts: add them."
+echo "(byte-identical for the pinned target/toolchain; line info is disabled)."
+echo "Untracked files above are NEW artifacts: add them."

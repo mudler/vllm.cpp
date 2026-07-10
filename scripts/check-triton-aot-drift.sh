@@ -22,8 +22,12 @@ KERNELS_DIR=triton_kernels
 VENDORED_DIR=src/vt/cuda/triton_aot_vendored
 status=0
 found_manifest=0
-tmpdir=$(mktemp -d)
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/vllm-triton-aot-check.XXXXXX")
 trap 'rm -rf "${tmpdir}"' EXIT
+
+sha256_file() {
+  cmake -E sha256sum "$1" | awk '{print $1}'
+}
 
 expected_bases="${tmpdir}/expected-bases"
 cmake -DOUTPUT="${expected_bases}" -P cmake/DumpTritonAOTContract.cmake
@@ -36,7 +40,38 @@ for manifest in "${VENDORED_DIR}"/*/MANIFEST; do
   [ -f "${manifest}" ] || continue
   found_manifest=1
   arch_dir=$(dirname "${manifest}")
+  arch=$(basename "${arch_dir}")
   echo "== ${manifest}"
+
+  capability=${arch#sm_}
+  capability=${capability%a}
+  case "${capability}" in
+    ''|*[!0-9]*)
+      echo "DRIFT  ${arch_dir}: cannot derive a CUDA capability from ${arch}"
+      status=1
+      ;;
+    *)
+      expected_target="cuda:${capability}:32"
+      if ! grep -q "^arch ${arch}$" "${manifest}"; then
+        echo "DRIFT  ${arch_dir}: MANIFEST arch does not match ${arch}"
+        status=1
+      fi
+      if ! grep -q "^triton_target ${expected_target}$" "${manifest}"; then
+        echo "DRIFT  ${arch_dir}: MANIFEST target must be ${expected_target}"
+        status=1
+      fi
+      if ! grep -q '^line_info disabled$' "${manifest}"; then
+        echo "DRIFT  ${arch_dir}: MANIFEST must record path-independent line_info disabled"
+        status=1
+      fi
+      generator_hash=$(sha256_file scripts/triton-aot-compile.py)
+      if ! grep -q "^generator scripts/triton-aot-compile.py sha256=${generator_hash}$" \
+        "${manifest}"; then
+        echo "DRIFT  ${arch_dir}: generator shim hash differs"
+        status=1
+      fi
+      ;;
+  esac
 
   actual_bases="${tmpdir}/$(basename "${arch_dir}").actual-bases"
   grep '^base ' "${manifest}" | LC_ALL=C sort >"${actual_bases}" || true
@@ -53,7 +88,7 @@ for manifest in "${VENDORED_DIR}"/*/MANIFEST; do
       status=1
       continue
     fi
-    actual=$(sha256sum "${KERNELS_DIR}/${src}" | awk '{print $1}')
+    actual=$(sha256_file "${KERNELS_DIR}/${src}")
     if [ "${actual}" != "${expected}" ]; then
       echo "DRIFT  ${arch_dir}: ${src} changed since regen (manifest ${expected:0:12}… vs current ${actual:0:12}…)"
       status=1
@@ -132,7 +167,7 @@ for manifest in "${VENDORED_DIR}"/*/MANIFEST; do
       status=1
       continue
     fi
-    actual=$(sha256sum "${arch_dir}/${name}" | awk '{print $1}')
+    actual=$(sha256_file "${arch_dir}/${name}")
     if [ "${actual}" != "${expected}" ]; then
       echo "DRIFT  ${arch_dir}: artifact ${name} hash differs"
       status=1

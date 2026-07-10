@@ -2766,9 +2766,15 @@ void* EnsureGdnScratch(GdnScratchBuf& buf, size_t bytes, cudaStream_t s, const c
                        GdnScratchKind kind) {
   if (bytes > buf.bytes) {
     const bool growth = buf.ptr != nullptr;
-    if (growth) Check(cudaFreeAsync(buf.ptr, s), "gdn scratch grow free");
-    Check(cudaMallocAsync(&buf.ptr, bytes, s), what);
+    void* replacement = nullptr;
+    Check(cudaMallocAsync(&replacement, bytes, s), what);
+    void* old = buf.ptr;
+    buf.ptr = replacement;
     buf.bytes = bytes;
+    // Preserve ownership of the old allocation until replacement succeeds.
+    // The stream-ordered free remains after all earlier users of old, while
+    // subsequent launches consume replacement.
+    if (old != nullptr) Check(cudaFreeAsync(old, s), "gdn scratch grow free");
     RecordGdnScratchEvent(kind, !growth, growth);
   } else {
     RecordGdnScratchEvent(kind, false, false);
@@ -2780,6 +2786,85 @@ template <typename T>
 T* EnsureGdnScratch(GdnScratchBuf& buf, size_t count, cudaStream_t s, const char* what,
                     GdnScratchKind kind) {
   return static_cast<T*>(EnsureGdnScratch(buf, count * sizeof(T), s, what, kind));
+}
+
+// triton.tools.compile emits unsynchronized lazy initialization around process-
+// global CUmodule/CUfunction variables. Guard each stable dispatcher explicitly
+// so concurrent first use from separate queues cannot double-load or race those
+// globals. CUDA primary-context modules are process-wide for the active device.
+struct GdnAotModuleOnce {
+  std::once_flag deltah_h48;
+  std::once_flag deltah_h32;
+  std::once_flag chunko_h48;
+  std::once_flag chunko_h32;
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+  std::once_flag chunko_bf16_h48;
+  std::once_flag chunko_bf16_h32;
+#endif
+  std::once_flag kkt_h48;
+  std::once_flag tril_h48;
+  std::once_flag wu_h48;
+  std::once_flag kkt_h32;
+  std::once_flag tril_h32;
+  std::once_flag wu_h32;
+};
+
+GdnAotModuleOnce& GdnAotModules() {
+  static GdnAotModuleOnce modules;
+  return modules;
+}
+
+void EnsureGdnDeltaHLoaded(int64_t hv_n) {
+  auto& modules = GdnAotModules();
+  if (hv_n == 48) {
+    std::call_once(modules.deltah_h48, load_gdn_deltah_h48);
+  } else {
+    std::call_once(modules.deltah_h32, load_gdn_deltah_h32);
+  }
+}
+
+void EnsureGdnChunkOF32Loaded(int64_t hv_n) {
+  auto& modules = GdnAotModules();
+  if (hv_n == 48) {
+    std::call_once(modules.chunko_h48, load_gdn_chunko_h48);
+  } else {
+    std::call_once(modules.chunko_h32, load_gdn_chunko_h32);
+  }
+}
+
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+void EnsureGdnChunkOBF16Loaded(int64_t hv_n) {
+  auto& modules = GdnAotModules();
+  if (hv_n == 48) {
+    std::call_once(modules.chunko_bf16_h48, load_gdn_chunko_bf16_h48);
+  } else {
+    std::call_once(modules.chunko_bf16_h32, load_gdn_chunko_bf16_h32);
+  }
+}
+#endif
+
+void EnsureGdnWULoaded(int64_t hv_n) {
+  auto& modules = GdnAotModules();
+  if (hv_n == 48) {
+    std::call_once(modules.kkt_h48, load_gdn_kkt_h48);
+    std::call_once(modules.tril_h48, load_gdn_tril_h48);
+    std::call_once(modules.wu_h48, load_gdn_wu_h48);
+  } else {
+    std::call_once(modules.kkt_h32, load_gdn_kkt_h32);
+    std::call_once(modules.tril_h32, load_gdn_tril_h32);
+    std::call_once(modules.wu_h32, load_gdn_wu_h32);
+  }
+}
+
+void EnsureAllGdnAotModulesLoaded() {
+  for (const int64_t hv_n : {48, 32}) {
+    EnsureGdnDeltaHLoaded(hv_n);
+    EnsureGdnChunkOF32Loaded(hv_n);
+#ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+    EnsureGdnChunkOBF16Loaded(hv_n);
+#endif
+    EnsureGdnWULoaded(hv_n);
+  }
 }
 
 // SANCTIONED Triton AOT fast-path dispatch for GDN delta_h (the state recurrence).
@@ -2798,6 +2883,7 @@ bool TryTritonDeltaH(cudaStream_t s, float* state, __nv_bfloat16* hstate, __nv_b
   if (!GdnTritonEnvOn("VT_GDN_DELTAH_TRITON")) return false;  // default ON (see GdnTritonEnvOn); =0 restores hand path
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
+  EnsureGdnDeltaHLoaded(hv_n);
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);      // overwritten per-seq (IS_VARLEN)
   const int32_t NH = static_cast<int32_t>(n_seq * hv_n);  // grid-y = N*H (grid carrier)
@@ -2844,6 +2930,7 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
   // branch would be unreachable code in that instantiation (nvcc #128-D,
   // promoted to error by warnings-as-errors).
   if constexpr (std::is_same<Tout, float>::value) {
+    EnsureGdnChunkOF32Loaded(hv_n);
     const CUresult r =
         hv_n == 48
             ? gdn_chunko_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
@@ -2858,6 +2945,7 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
     return true;
   } else {
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
+    EnsureGdnChunkOBF16Loaded(hv_n);
     const CUresult r =
         hv_n == 48 ? gdn_chunko_bf16_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
                                                  D(out), D(qsl), D(cidx), T, NT)
@@ -2890,6 +2978,7 @@ bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_
   if (dk != 128 || dv != 128 || hk_n != 16) return false;
   if (hv_n != 48 && hv_n != 32) return false;
   if (cidx == nullptr) return false;
+  EnsureGdnWULoaded(hv_n);
   constexpr int BT = kChunk;  // 64
   // WY intermediates [T,H,BT]: A = beta*K*Kᵀ*exp(gΔ) strictly-lower (kkt out, f32);
   // Ai = (I+A)^-1 (solve_tril out, bf16 = k.dtype). Indexed by packed token, so
@@ -3581,6 +3670,11 @@ void ReleaseGdnTritonScratch(int device, void* stream_handle) {
 }
 
 namespace testing {
+void WarmGdnTritonAotModules(int device) {
+  Check(cudaSetDevice(device), "gdn AOT warm set device");
+  EnsureAllGdnAotModulesLoaded();
+}
+
 void ResetGdnTritonDebugStats() {
   GdnDebugCounters& c = GdnCounters();
   c.chunk_o_f32_launches.store(0, std::memory_order_relaxed);

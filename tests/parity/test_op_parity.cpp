@@ -1192,10 +1192,15 @@ bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
 // M0.9: the qwen36 layer/model goldens landed in Task 1 ahead of the runners.
 // Task 4 landed the per-layer runners (qwen36_{embed,gdn_layer,fullattn_layer,
 // norm}); Task 5 landed qwen36_logits (the full-model M0-exit gate). All
-// checkpoint-gated + dgx-only. This set is now EMPTY — every committed golden
-// has a runner (the anti-stale-golden gate is fully closed for M0).
+// checkpoint-gated + dgx-only. Engine-level acceptance goldens can still live
+// under this tree; those are owned by their dedicated engine tests, not this
+// op runner.
 const std::set<std::string>& PendingRunnerOps() {
-  static const std::set<std::string> kPending = {};
+  static const std::set<std::string> kPending = {
+      // Full-engine GGUF greedy acceptance fixture consumed by
+      // test_qwen36_gguf_engine.cpp.
+      "qwen36_gguf_greedy",
+  };
   return kPending;
 }
 

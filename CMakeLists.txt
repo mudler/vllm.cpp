@@ -409,8 +409,9 @@ if(VLLM_CPP_CUDA)
   # surface (PhiloxCudaState POD + C10_CUDA_CHECK), and fa2_compat_prelude.h is
   # force-included for the std headers ATen pulled in transitively — the upstream
   # (auto-generated) FA sources stay byte-for-byte pristine. Opt-in at build with
-  # -DVLLM_CPP_FLASH_ATTN=ON (needs CUTLASS); runtime gate VT_ATTN_FA2=1 (default
-  # OFF) so the proven WMMA prefill stays default until validated token-for-token.
+  # -DVLLM_CPP_FLASH_ATTN=ON (needs CUTLASS); runtime toggle VT_FA2_PREFILL=1
+  # (default OFF) so the proven WMMA prefill stays default until FA-2 is
+  # validated token-for-token AND over the throughput bar on this build.
   option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill kernel (needs CUTLASS)" OFF)
   if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
@@ -426,7 +427,7 @@ if(VLLM_CPP_CUDA)
       ${_FA2_KERNEL_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
-    message(STATUS "FlashAttention-2 sm_121a prefill: ENABLED (opt-in VT_ATTN_FA2=1)")
+    message(STATUS "FlashAttention-2 sm_121a prefill: ENABLED (runtime toggle VT_FA2_PREFILL)")
   endif()
 endif()
 

@@ -44,7 +44,7 @@ namespace vt::cuda {
 // Declared at vt::cuda scope (external linkage) — the definition lives in a
 // separate TU. Torch-free drop-in for the full-attn causal + paged-KV + GQA +
 // head_dim-256 + bf16 prefill path (the exact FA-2 flash_fwd_splitkv kernel vLLM
-// runs on GB10). Runtime opt-in via VT_ATTN_FA2 (see Fa2Enabled()).
+// runs on GB10). Runtime toggle VT_FA2_PREFILL (see Fa2PrefillEnabled()).
 void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                           const Tensor& k_cache, const Tensor& v_cache,
                           const Tensor& block_table, const Tensor& seq_lens,
@@ -2284,15 +2284,16 @@ void DispatchPrefillFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& query,
 }
 
 #ifdef VLLM_CPP_FLASH_ATTN
-// FlashAttention-2 prefill opt-in (VT_ATTN_FA2=1). Default OFF: the proven WMMA
-// prefill stays the default until FA-2 is validated token-for-token on GB10. Only
-// eligible for bf16 query + bf16 KV + head_dim 256 (see LaunchPaged gate).
-bool Fa2Enabled() {
-  static const bool enabled = [] {
-    const char* e = std::getenv("VT_ATTN_FA2");
-    return e != nullptr && e[0] == '1';
-  }();
-  return enabled;
+// FlashAttention-2 prefill toggle (VT_FA2_PREFILL, default OFF). Only eligible
+// for bf16 query + bf16 KV + bf16 out + head_dim 256 (see the LaunchPaged
+// gate) — the natively-bf16 production 27B full-attn prefill. Read fresh each
+// call (not static-cached) so in-process tests can flip it; the check is a
+// getenv on a host path that runs once per full-attn layer per step. MUST match
+// qwen3_5.cpp Fa2PrefillOn(), which selects the bf16 q/out dtypes that make
+// this gate eligible.
+bool Fa2PrefillEnabled() {
+  const char* e = std::getenv("VT_FA2_PREFILL");
+  return e != nullptr && e[0] == '1';
 }
 #endif  // VLLM_CPP_FLASH_ATTN
 
@@ -2328,26 +2329,22 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   const bool prefill = is_prefill && d <= kMaxEpl * 32 && PrefillFlashEnabled();
 #ifdef VLLM_CPP_FLASH_ATTN
   // Vendored FA-2 sm_121a prefill: the exact flash_fwd_splitkv kernel vLLM runs
-  // (paged + varlen + GQA + causal), head_dim 256, opt-in via VT_ATTN_FA2. The
-  // kernel is bf16, so the KV cache must be bf16 (TKV); the launcher casts an f32
-  // query in and an f32 output back (production full-attn prefill hands us f32 q +
-  // bf16 KV + f32 out — see qwen3_5.cpp FullAttnBlockPaged). Both f32- and
-  // bf16-output run FA-2; f32 KV (unit anchors) falls through to WMMA.
-  const bool fa2 = is_prefill && d == 256 && Fa2Enabled() &&
-                   std::is_same<TKV, __nv_bfloat16>::value &&
-                   (out.dtype == DType::kBF16 || out.dtype == DType::kF32);
+  // (paged + varlen + GQA + causal), head_dim 256, toggle VT_FA2_PREFILL.
+  // NATIVE bf16 only — bf16 query (TQ) + bf16 KV (TKV) + bf16 out; anything
+  // else (f32 q/out: the 35B fp8 path, the non-preamble 27B fallback, unit
+  // anchors) falls through to the WMMA ladder. The earlier f32 wiring bridged
+  // with cast kernels and measurably erased the win (parity-ledger 2026-07-06
+  // FA-2 split-KV row); the production 27B preamble now emits bf16 q and the
+  // sigmoid gate consumes bf16 attention out, so no casts exist on this path.
+  const bool fa2 = is_prefill && d == 256 && Fa2PrefillEnabled() &&
+                   std::is_same<TQ, __nv_bfloat16>::value &&
+                   std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
 #else
   const bool fa2 = false;
   (void)fa2;  // all fa2 uses are #ifdef VLLM_CPP_FLASH_ATTN — silence -Werror=all-warnings
 #endif
   switch (out.dtype) {
     case DType::kF32:
-#ifdef VLLM_CPP_FLASH_ATTN
-      if (fa2) {
-        LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
-                             query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
-      } else  // NOLINT(readability/braces) — chains into the flash2vec ladder below
-#endif
       if (flash2vec) {
         DispatchPrefillFlash2Vec<TQ, TKV, float>(s, out, query, k_cache, v_cache, block_table,
                                                  seq_lens, query_start_loc, args, hq, d, num_reqs,

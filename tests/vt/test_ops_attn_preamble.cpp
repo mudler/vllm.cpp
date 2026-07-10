@@ -192,3 +192,86 @@ TEST_CASE("attn preamble fused == unfused (f32, gemma) bit-identity") {
   CHECK(dk <= 3.0e-7f);              // k: within ~1 f32 ULP, but NOT zero
   CHECK(dq > 0.0f);                  // documents the non-bit-identity (the NO-GO cause)
 }
+
+namespace {
+// f32 -> bf16 round-to-nearest-even bits (host mirror of the device
+// __float2bfloat16 store; same helper as test_ops_paged_attn.cpp).
+inline uint16_t F32ToBf16Bits(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  const uint32_t rounding = 0x7fffu + ((x >> 16) & 1u);
+  return static_cast<uint16_t>((x + rounding) >> 16);
+}
+}  // namespace
+
+// The FA-2 prefill combo: bf16 q_out/k_out + f32 gate_out. The kernel math is
+// f32 either way; the bf16 store is the RN round of the exact f32 value — so
+// (bf16 q/k, f32 gate) must be BIT-IDENTICAL to the f32 run followed by a host
+// RN cast of q/k, and the f32 gate must be bit-identical to the f32 run's gate.
+// This pins the claim FullAttnBlockPaged relies on: switching the preamble to
+// bf16 q/k for FA-2 changes NOTHING except where the (identical) rounding step
+// happens (in-kernel store vs the CastBf16 the KV-cache write used to do).
+TEST_CASE("attn preamble bf16 q/k + f32 gate == f32 out + RN cast (bit-identity)") {
+  if (!HasCuda()) return;
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  Queue& q = g.q;
+
+  const int64_t T = 8, Hq = 16, Hkv = 2, Dh = 256;  // the 27B gate head shape
+  const int rot = 64;
+  const float base = 1.0e7f, eps = 1.0e-6f;
+
+  auto qgate_h = RandomF32(static_cast<size_t>(T * Hq * 2 * Dh), 55);
+  auto kf_h = RandomF32(static_cast<size_t>(T * Hkv * Dh), 66);
+  auto qn_h = RandomF32(static_cast<size_t>(Dh), 77, -0.5f, 0.5f);
+  auto kn_h = RandomF32(static_cast<size_t>(Dh), 88, -0.5f, 0.5f);
+  std::vector<int32_t> pos_h(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) pos_h[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+  Dev qgate(b, q, DType::kF32, {T, Hq * 2 * Dh}, qgate_h.data());
+  Dev kf(b, q, DType::kF32, {T, Hkv * Dh}, kf_h.data());
+  Dev qn(b, q, DType::kF32, {Dh}, qn_h.data());
+  Dev kn(b, q, DType::kF32, {Dh}, kn_h.data());
+  Dev pos(b, q, DType::kI32, {T}, pos_h.data());
+  Dev cos_sin(b, q, DType::kF32, {T, rot});
+  vt::RopeCosSinCache(q, cos_sin.t(), pos.t(), RopeArgs{base, rot});
+
+  // ---- reference: all-f32 fused run ----
+  Dev dq_r(b, q, DType::kF32, {T, Hq, Dh});
+  Dev dk_r(b, q, DType::kF32, {T, Hkv, Dh});
+  Dev gate_r(b, q, DType::kF32, {T, Hq, Dh});
+  vt::AttnQkNormRopeGate(q, dq_r.t(), dk_r.t(), gate_r.t(), qgate.t(), kf.t(), qn.t(), kn.t(),
+                         cos_sin.t(), RmsNormArgs{eps, true}, RopeArgs{base, rot});
+  std::vector<float> qr(static_cast<size_t>(T * Hq * Dh));
+  std::vector<float> kr(static_cast<size_t>(T * Hkv * Dh));
+  std::vector<float> gr(static_cast<size_t>(T * Hq * Dh));
+  dq_r.Download(q, qr.data());
+  dk_r.Download(q, kr.data());
+  gate_r.Download(q, gr.data());
+
+  // ---- mixed run: bf16 q/k + f32 gate ----
+  Dev dq_b(b, q, DType::kBF16, {T, Hq, Dh});
+  Dev dk_b(b, q, DType::kBF16, {T, Hkv, Dh});
+  Dev gate_b(b, q, DType::kF32, {T, Hq, Dh});
+  vt::AttnQkNormRopeGate(q, dq_b.t(), dk_b.t(), gate_b.t(), qgate.t(), kf.t(), qn.t(), kn.t(),
+                         cos_sin.t(), RmsNormArgs{eps, true}, RopeArgs{base, rot});
+  std::vector<uint16_t> qb(static_cast<size_t>(T * Hq * Dh));
+  std::vector<uint16_t> kb(static_cast<size_t>(T * Hkv * Dh));
+  std::vector<float> gb(static_cast<size_t>(T * Hq * Dh));
+  dq_b.Download(q, qb.data());
+  dk_b.Download(q, kb.data());
+  gate_b.Download(q, gb.data());
+
+  size_t qmis = 0, kmis = 0;
+  for (size_t i = 0; i < qr.size(); ++i)
+    if (qb[i] != F32ToBf16Bits(qr[i])) ++qmis;
+  for (size_t i = 0; i < kr.size(); ++i)
+    if (kb[i] != F32ToBf16Bits(kr[i])) ++kmis;
+  size_t fg = 0;
+  const float dg = MaxAbsDiff(gr, gb, &fg);
+  MESSAGE("bf16-q/k mismatches: q=", qmis, "/", qr.size(), " k=", kmis, "/", kr.size(),
+          " gate max|diff|=", dg);
+  CHECK(qmis == 0);   // q: bf16 store == RN(f32 value), bit-identical
+  CHECK(kmis == 0);   // k: same
+  CHECK(dg == 0.0f);  // gate: still the exact f32 passthrough
+}

@@ -731,6 +731,29 @@ bool FuseAttnPreambleOn(bool fp4_attn) {
   return fp4_attn;
 }
 
+// FA-2 PREFILL (the last measured 27B prefill gap): route the full-attn PREFILL
+// segment through the vendored FlashAttention-2 flash_fwd_splitkv kernel (the
+// exact kernel vLLM runs on GB10; vllm-project/flash-attention @ 2c839c33) by
+// making the fused preamble emit bf16 q/k and the attention output bf16 — the
+// natively-bf16 combo the FA-2 dispatch gate (cuda_paged_attn.cu) requires, with
+// ZERO cast kernels (the earlier f32-glued wiring measured negative; see
+// cuda_flash_attn_fa2.cu header). Measured 27B site (2026-07-10): our WMMA
+// prefill attention 1.37 vs vLLM's FA-2 0.25 us/tok/layer (~18 us/tok e2e).
+// bf16-q/out is NOT bit-identical to the f32-q WMMA path (FA-2 rounds q to bf16
+// and accumulates in its own order) but IS vLLM-faithful (vLLM's whole attn
+// path is bf16) — validated by the token-exact greedy gate. Decode segments
+// keep f32 q/out + the graph-captured decode kernels, byte-identical to today.
+// Toggle VT_FA2_PREFILL (default OFF; =1 enables). Compiled only with
+// VLLM_CPP_FLASH_ATTN — without it the env is ignored and the WMMA path runs.
+bool Fa2PrefillOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_PREFILL");
+  return e != nullptr && e[0] == '1';
+#else
+  return false;
+#endif
+}
+
 // QUANTIZE-ONCE: q/k/v (and gate/up) share their input activation AND their on-disk
 // input_global_scale (verified: 27B layer-3 q/k/v all 28.75; gate/up 812/476), so we
 // can ScaledFp4Quant the shared activation ONCE and feed each projection's fp4xfp4
@@ -2031,8 +2054,23 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // four-op path (the query stays f32 for PagedAttention), so ON is token-exact.
   // positions/slot_mapping/... are the PERSISTENT per-step device buffers; sdi.*
   // Tensors are const views over the shared DBufs (no per-layer H2D re-upload).
-  DBuf dq3(d, DType::kF32, {T, Hq, Dh});
-  DBuf dk3(d, DType::kF32, {T, Hkv, Dh});
+  //
+  // FA-2 PREFILL (VT_FA2_PREFILL, see Fa2PrefillOn): on an eligible PREFILL step
+  // the preamble instead emits bf16 q/k (gate stays f32) and the attention
+  // output is bf16 — the natively-bf16 combo the FA-2 dispatch gate requires,
+  // with zero cast kernels. bf16 k feeds the bf16 KV-cache write directly
+  // (skipping the CastBf16 below — bit-identical, both are the RN round of the
+  // same f32 value); bf16 attention out feeds SigmoidGateBf16 (exact upcast).
+  // The eligibility MUST mirror cuda_paged_attn.cu's fa2 gate (prefill segment:
+  // T > num_reqs; head_dim 256; bf16 KV; CUDA) so the bf16 query is consumed by
+  // FA-2. Decode steps keep f32 q/out + the graph-captured decode kernels,
+  // byte-identical to today.
+  const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
+                           d.q.device.type == vt::DeviceType::kCUDA &&
+                           kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
+  const DType attn_dt = fa2_prefill ? DType::kBF16 : DType::kF32;
+  DBuf dq3(d, attn_dt, {T, Hq, Dh});
+  DBuf dk3(d, attn_dt, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
   if (FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin) {
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
@@ -2072,8 +2110,15 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
   if (kv.dtype == DType::kBF16) {
-    vt::CastBf16(d.q, kbf.t(), kn3);
-    kw = kbf.t();
+    // K may already be bf16 (the FA-2 prefill preamble emits bf16 k directly —
+    // the RN round of the same f32 value this CastBf16 would produce); only
+    // down-cast when the preamble/fallback produced f32 K.
+    if (kn3.dtype == DType::kBF16) {
+      kw = kn3;
+    } else {
+      vt::CastBf16(d.q, kbf.t(), kn3);
+      kw = kbf.t();
+    }
     // V may already be bf16 (VT_BF16_GEMM_OUT: the fp4 v_proj GEMM emits bf16
     // directly, removing the cutlass CastBf16ToF32 + this CastBf16 round-trip);
     // only down-cast when the GEMM produced f32 V.
@@ -2094,7 +2139,9 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dqsl = sdi.query_start_loc.t();
   vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
 
-  DBuf dattn(d, DType::kF32, {T, Hq, Dh});
+  // bf16 attention out on the FA-2 prefill path (FA-2 writes bf16; the sigmoid
+  // gate upcast is exact) — f32 everywhere else, byte-identical to today.
+  DBuf dattn(d, attn_dt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
   // Hand the prefill flash/WMMA launchers the HOST query_start_loc (already
   // materialized per step by the attention metadata build) so they size the
@@ -2103,8 +2150,10 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // full-attention prefill layer (~10-12 syncs/step; prefill only 43.7%
   // GPU-busy). meta.query_start_loc outlives this call. Device-resident metadata,
   // mirroring the GDN GdnArgs::query_start_loc_host / decode StepDevInputs fix.
+  // max_seq_len is the FA-2 launcher's host grid bound (same pattern).
   vt::PagedAttentionArgs pa_args{scale, meta.causal};
   pa_args.query_start_loc_host = meta.query_start_loc.data();
+  pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
   // Sigmoid output gate then o-project (§5) — device op.

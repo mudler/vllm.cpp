@@ -477,8 +477,13 @@ __device__ inline float GemmaNormElem(float v, float inv, float w, bool gemma) {
   return v * inv * wj;
 }
 
-template <typename Tsrc, typename Tout>
-__global__ void AttnQkNormRopeGateKernel(Tout* q_out, Tout* k_out, Tout* gate_out,
+// Tqk = q_out/k_out store dtype, Tgate = gate_out store dtype. All math stays
+// f32; a bf16 Tqk store is the RN round of the exact f32 value, so (Tqk=bf16,
+// Tgate=f32) is bit-identical to the f32 path followed by CastBf16 on q/k — the
+// FA-2 prefill combo (bf16 q feeds FA-2, bf16 k feeds the bf16 KV-cache write,
+// gate stays f32 because sigmoid(gate) must see the un-rounded f32 value).
+template <typename Tsrc, typename Tqk, typename Tgate>
+__global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
                                          const Tsrc* qgate, const Tsrc* kf, const float* q_norm,
                                          const float* k_norm, const float* cos_sin, int64_t hq,
                                          int64_t hkv, int64_t dh, int rot, int64_t half, float eps,
@@ -489,7 +494,7 @@ __global__ void AttnQkNormRopeGateKernel(Tout* q_out, Tout* k_out, Tout* gate_ou
 
   const Tsrc* src;
   const float* w;
-  Tout* out;
+  Tqk* out;
   int64_t gate_base = 0;  // only meaningful for q heads
   if (is_q) {
     const int64_t qrow = tok * (hq * 2 * dh) + head * 2 * dh;
@@ -540,12 +545,12 @@ __global__ void AttnQkNormRopeGateKernel(Tout* q_out, Tout* k_out, Tout* gate_ou
 
   // ---- gate passthrough (q heads only): the raw gate half, no norm/rope ----
   if (is_q) {
-    Tout* go = gate_out + (tok * hq + head) * dh;
+    Tgate* go = gate_out + (tok * hq + head) * dh;
     for (int64_t j = threadIdx.x; j < dh; j += kBlock) Store(go, j, Load(qgate, gate_base + j));
   }
 }
 
-template <typename Tsrc, typename Tout>
+template <typename Tsrc, typename Tqk, typename Tgate>
 void LaunchAttnPreamble(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                         const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
                         const Tensor& k_norm, const Tensor& cos_sin, const RmsNormArgs& na,
@@ -555,8 +560,8 @@ void LaunchAttnPreamble(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor& ga
   const int64_t half = ra.rotary_dim / 2;
   if (t == 0) return;
   dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq + hkv));
-  AttnQkNormRopeGateKernel<Tsrc, Tout><<<grid, kBlock, 0, s>>>(
-      q_out.Ptr<Tout>(), k_out.Ptr<Tout>(), gate_out.Ptr<Tout>(), qgate.Ptr<Tsrc>(),
+  AttnQkNormRopeGateKernel<Tsrc, Tqk, Tgate><<<grid, kBlock, 0, s>>>(
+      q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
       kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(), hq, hkv, dh,
       ra.rotary_dim, half, na.eps, na.gemma);
   Check(cudaGetLastError(), "attn_qk_norm_rope_gate launch");
@@ -567,14 +572,23 @@ void LaunchAttnPreambleOut(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor&
                            const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
                            const Tensor& k_norm, const Tensor& cos_sin, const RmsNormArgs& na,
                            const RopeArgs& ra) {
+  // (q/k out, gate out) combos: (f32,f32) — the default token-exact path;
+  // (bf16,bf16) — all-bf16; (bf16,f32) — the FA-2 prefill combo (bf16 q/k for
+  // FA-2 + the bf16 KV-cache write, f32 gate for the sigmoid). Validation in
+  // ops.cpp admits exactly these.
   switch (q_out.dtype) {
     case DType::kF32:
-      LaunchAttnPreamble<Tsrc, float>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
-                                      cos_sin, na, ra);
+      LaunchAttnPreamble<Tsrc, float, float>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
+                                             cos_sin, na, ra);
       break;
     case DType::kBF16:
-      LaunchAttnPreamble<Tsrc, __nv_bfloat16>(s, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm,
-                                              cos_sin, na, ra);
+      if (gate_out.dtype == DType::kF32) {
+        LaunchAttnPreamble<Tsrc, __nv_bfloat16, float>(s, q_out, k_out, gate_out, qgate, kf,
+                                                       q_norm, k_norm, cos_sin, na, ra);
+      } else {
+        LaunchAttnPreamble<Tsrc, __nv_bfloat16, __nv_bfloat16>(s, q_out, k_out, gate_out, qgate,
+                                                               kf, q_norm, k_norm, cos_sin, na, ra);
+      }
       break;
     default: VT_CHECK(false, "cuda attn_qk_norm_rope_gate: unsupported out dtype");
   }

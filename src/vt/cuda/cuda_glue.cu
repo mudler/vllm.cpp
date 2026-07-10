@@ -111,8 +111,13 @@ void AttnGateSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& gate_out, const Te
 }
 
 // ---------------------------------------------------------------------------
-// sigmoid_gate_bf16: out[i] = bf16(attn[i] * sigmoid(gate[i])).
-__global__ void SigmoidGateBf16Kernel(__nv_bfloat16* out, const float* attn, const float* gate,
+// sigmoid_gate_bf16: out[i] = bf16(attn[i] * sigmoid(gate[i])). Tattn f32 or
+// bf16 (the FA-2 prefill path hands a bf16 attention out); the bf16 Load upcast
+// is exact, so bf16-attn is bit-identical to f32-attn holding the same
+// bf16-representable values. The gate is always f32 (sigmoid input must not be
+// rounded).
+template <typename Tattn>
+__global__ void SigmoidGateBf16Kernel(__nv_bfloat16* out, const Tattn* attn, const float* gate,
                                       int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
@@ -122,8 +127,13 @@ __global__ void SigmoidGateBf16Kernel(__nv_bfloat16* out, const float* attn, con
 void SigmoidGateBf16KernelCuda(Queue& q, Tensor& out, const Tensor& attn, const Tensor& gate) {
   const int64_t n = out.Numel();
   if (n == 0) return;
-  SigmoidGateBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-      out.Ptr<__nv_bfloat16>(), attn.Ptr<float>(), gate.Ptr<float>(), n);
+  if (attn.dtype == DType::kBF16) {
+    SigmoidGateBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__nv_bfloat16>(), attn.Ptr<__nv_bfloat16>(), gate.Ptr<float>(), n);
+  } else {
+    SigmoidGateBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<__nv_bfloat16>(), attn.Ptr<float>(), gate.Ptr<float>(), n);
+  }
   Check(cudaGetLastError(), "sigmoid_gate_bf16 launch");
 }
 

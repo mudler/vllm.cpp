@@ -89,6 +89,23 @@ TEST_CASE("sigmoid_gate_bf16: attn * sigmoid(gate), rounded to bf16") {
     CHECK(vt::BF16ToF32(out[i]) == doctest::Approx(Bf(attn[i] * Sigmoid(gate[i]))));
 }
 
+// bf16-attn variant (the FA-2 prefill path hands a bf16 attention out): the
+// upcast is exact, so the result must be BIT-IDENTICAL to the f32-attn run over
+// the same (bf16-representable) values. The gate stays f32.
+TEST_CASE("sigmoid_gate_bf16: bf16 attn == f32 attn over the same values") {
+  std::vector<float> attn_f = {2.0f, -1.0f, 4.0f, 0.5f};  // exactly bf16-representable
+  std::vector<float> gate = {0.0f, 1.0f, -2.0f, 3.0f};
+  std::vector<uint16_t> attn_b(attn_f.size(), 0);
+  for (size_t i = 0; i < attn_f.size(); ++i) attn_b[i] = vt::F32ToBF16(attn_f[i]);
+  std::vector<uint16_t> out_f(attn_f.size(), 0), out_b(attn_f.size(), 0);
+  Tensor taf = F32(attn_f, {2, 2}), tab = Bf16(attn_b, {2, 2}), tg = F32(gate, {2, 2});
+  Tensor tof = Bf16(out_f, {2, 2}), tob = Bf16(out_b, {2, 2});
+  Queue q = Q();
+  vt::SigmoidGateBf16(q, tof, taf, tg);
+  vt::SigmoidGateBf16(q, tob, tab, tg);
+  for (size_t i = 0; i < out_f.size(); ++i) CHECK(out_b[i] == out_f[i]);
+}
+
 // ---------------------------------------------------------------------------
 // gdn_g_beta (gdn-semantics.md §6):
 //   x = araw + dt_bias[hv];  sp = softplus(x);

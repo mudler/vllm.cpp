@@ -332,25 +332,33 @@ if(VLLM_CPP_CUDA)
     # (VT_GDN_WU_TRITON) in cuda_gdn.cu runs all 3 into scratch A(f32)/Ai(bf16) and
     # produces w,u; hand fused kernel preserved as fallback. All grid-y = H (varlen
     # B=1, baked), grid-x = NT (runtime carrier). H=48 (27B) / 32 (35B).
-    # FLA autotuner winners (measured on GB10 2026-07-10, T-stable across
-    # T=1024..8192 varlen; ~/work/finisher_autotune.log):
-    #   H=48 (27B): kkt BK=128/w8/s3, tril w8/s5, wu w2/s2
-    #   H=32 (35B): kkt BK=64/w4/s3,  tril w8/s3, wu w4/s2
-    # (delta_h BV=64/w4/s3 and chunk_o BK=BV=64/w4/s3 confirmed already-optimal.)
+    # Pins verified against FLA's OWN autotuner (GB10 2026-07-10, exact engine
+    # shapes, T-stable 1024..8192; ~/work/finisher_autotune.log) AND per-kernel
+    # nsys on OUR AOT variants (.agents/parity-ledger.md 2026-07-10):
+    #  * delta_h BV=64/w4/s3, chunk_o BK=BV=64/w4/s3: FLA winners == old pins
+    #    (CONFIRMED optimal, both H).
+    #  * kkt H=48: FLA winner BK=128/w8/s3 measured −2.7% vs BK=64/w4/s3 → pinned.
+    #  * tril/wu H=48: FLA winners (w8/s5, w2/s2) measured SLOWER on our AOT
+    #    variants (+6.8%, +1.7% — the AOT specialization shifts the optimum) →
+    #    keep the proven w4/s3 pins. Recorded as a measured dead-end.
+    #  * H=32 (35B): kkt FLA winner == old pin; tril w8/s3 + wu w4/s2 are FLA
+    #    winners but UNMEASURED on our AOT (and the H=48 measurement shows FLA
+    #    winners don't transfer blindly) → keep proven w4/s3 pins; candidates
+    #    recorded in the ledger.
     set(VT_GDN_KKT_BK_48      128 CACHE STRING "kkt H=48 Triton BK (32/64/128)")
     set(VT_GDN_KKT_WARPS_48   8   CACHE STRING "kkt H=48 Triton num_warps")
     set(VT_GDN_KKT_STAGES_48  3   CACHE STRING "kkt H=48 Triton num_stages")
     set(VT_GDN_KKT_BK_32      64  CACHE STRING "kkt H=32 Triton BK (32/64/128)")
     set(VT_GDN_KKT_WARPS_32   4   CACHE STRING "kkt H=32 Triton num_warps")
     set(VT_GDN_KKT_STAGES_32  3   CACHE STRING "kkt H=32 Triton num_stages")
-    set(VT_GDN_TRIL_WARPS_48  8   CACHE STRING "solve_tril H=48 Triton num_warps")
-    set(VT_GDN_TRIL_STAGES_48 5   CACHE STRING "solve_tril H=48 Triton num_stages")
-    set(VT_GDN_TRIL_WARPS_32  8   CACHE STRING "solve_tril H=32 Triton num_warps")
+    set(VT_GDN_TRIL_WARPS_48  4   CACHE STRING "solve_tril H=48 Triton num_warps")
+    set(VT_GDN_TRIL_STAGES_48 3   CACHE STRING "solve_tril H=48 Triton num_stages")
+    set(VT_GDN_TRIL_WARPS_32  4   CACHE STRING "solve_tril H=32 Triton num_warps")
     set(VT_GDN_TRIL_STAGES_32 3   CACHE STRING "solve_tril H=32 Triton num_stages")
-    set(VT_GDN_WU_WARPS_48    2   CACHE STRING "recompute_w_u H=48 Triton num_warps")
-    set(VT_GDN_WU_STAGES_48   2   CACHE STRING "recompute_w_u H=48 Triton num_stages")
+    set(VT_GDN_WU_WARPS_48    4   CACHE STRING "recompute_w_u H=48 Triton num_warps")
+    set(VT_GDN_WU_STAGES_48   3   CACHE STRING "recompute_w_u H=48 Triton num_stages")
     set(VT_GDN_WU_WARPS_32    4   CACHE STRING "recompute_w_u H=32 Triton num_warps")
-    set(VT_GDN_WU_STAGES_32   2   CACHE STRING "recompute_w_u H=32 Triton num_stages")
+    set(VT_GDN_WU_STAGES_32   3   CACHE STRING "recompute_w_u H=32 Triton num_stages")
     # (1) chunk_scaled_dot_kkt_fwd_kernel: k beta g A cu_seqlens chunk_indices T NT |
     #     H Hg K BT BK IS_VARLEN USE_G. A out f32.
     set(_KKT_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_scaled_dot_kkt.py")

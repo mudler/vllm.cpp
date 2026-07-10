@@ -143,7 +143,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_5_mtp.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
-  src/vllm/model_executor/models/registry.cpp
+  src/vllm/model_executor/models/model_registry.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
   src/vllm/tokenizer/bpe.cpp

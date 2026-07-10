@@ -10,10 +10,10 @@
 
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -59,12 +59,9 @@ struct EngineParams {
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
 // runner -> Executor -> EngineCore; Input/OutputProcessor -> LLMEngine) for a
-// Qwen3.5-family model — the MoE 35B (Qwen3_5MoeForConditionalGeneration) OR the
-// dense 27B (Qwen3_5ForConditionalGeneration, W4A4 text path). Only the WEIGHTS
-// type and the runner's forward differ by arch; the Scheduler / Executor /
-// EngineCore / processors are arch-agnostic (they touch the runner only through
-// ModelRunnerBase). The engine holds exactly one of {moe,dense}_weights_ — the
-// same {moe,dense} pointer-pair the GPUModelRunner carries, lifted UP the stack.
+// registered model. The concrete weights/forward are held behind LoadedModel;
+// the Scheduler / Executor / EngineCore / processors are arch-agnostic (they
+// touch the runner only through ModelRunnerBase).
 // Members are declared in dependency order so the LLMEngine's by-reference
 // collaborators stay valid for this object's lifetime. NON-COPYABLE /
 // NON-MOVABLE (the internal references would dangle) — always heap-hold behind a
@@ -95,13 +92,6 @@ class LoadedEngine {
   static std::unique_ptr<LoadedEngine> FromModelDir(const std::string& model_dir,
                                                     const EngineParams& params);
 
-  // Arch-select for FromModelDir: true iff `config` is the DENSE 27B
-  // (Qwen3_5ForConditionalGeneration / text_config qwen3_5_text), routed to
-  // LoadQwen3_5Dense; false selects the MoE 35B (LoadQwen3_5Moe). num_experts is
-  // the structural discriminator (dense == 0, MoE > 0). Exposed for testing the
-  // dispatch without a disk load.
-  static bool IsDenseArch(const HfConfig& config);
-
   // Resolve the per-step token budget (max_num_batched_tokens) for chunked
   // prefill. An explicit EngineParams override wins; otherwise a PER-ARCH
   // default (see the definition in model_loader.cpp for the measurements):
@@ -130,11 +120,11 @@ class LoadedEngine {
   int max_model_len() const { return max_model_len_; }
 
  private:
-  // Build the hybrid KV-cache config (one full-attention group + one GDN/mamba
-  // group) sized from the config. The runner keys off the spec KIND, not the
-  // group-id strings, so this generalizes to any Qwen3.5 layer count.
-  static vllm::v1::KVCacheConfig MakeKvConfig(const HfConfig& c, int block_size,
-                                              int num_blocks);
+  // Type-erased constructor used by FromModelDir and the concrete-weight
+  // compatibility overloads above.
+  LoadedEngine(HfConfig config, std::unique_ptr<LoadedModel> model,
+               tok::Tokenizer tokenizer, const EngineParams& params);
+
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
       vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS);
@@ -144,12 +134,9 @@ class LoadedEngine {
 
   bool hash_ready_;  // declared first: forces EnsureNoneHash() ahead of the rest.
   HfConfig config_;
-  // Exactly one is engaged, selected by the constructor overload; the other stays
-  // nullopt. The runner borrows whichever is set (mirrors GPUModelRunner's own
-  // {moe,dense}_weights_ pointer-pair). Declared before runner_ so the borrow is
-  // live when runner_ is constructed.
-  std::optional<Qwen3_5MoeWeights> moe_weights_;
-  std::optional<Qwen3_5DenseWeights> dense_weights_;
+  // Concrete weights and model-specific runtime state behind the central
+  // registry contract. Declared before runner_ so its borrow remains live.
+  std::unique_ptr<LoadedModel> model_;
   tok::Tokenizer tokenizer_;
   int max_model_len_;
   vllm::v1::KVCacheConfig kv_cfg_;

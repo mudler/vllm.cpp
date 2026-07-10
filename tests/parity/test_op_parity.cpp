@@ -17,11 +17,11 @@
 
 #include "npy.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/model_executor/models/registry.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
@@ -925,8 +925,8 @@ int32_t ArgmaxRow(const float* row, int64_t vocab) {
 
 // --- Full-model logits parity + greedy decode — the M0 EXIT GATE (M0.9 Task 5).
 // Loads the WHOLE real 35B MoE checkpoint (all 3 shards, NVFP4/FP8 dequant +
-// transpose), resolves the forward through the model REGISTRY (exercising
-// ResolveModelForward), runs it on the pinned-oracle prompt, and asserts:
+// transpose), resolves the architecture through the central model registry,
+// runs the legacy dense reference forward on the pinned-oracle prompt, and asserts:
 //   (a) per-position logits track the oracle's top-1000 within a loose tol
 //       (measured/reported; the compounded 40-layer bf16-dequant gap);
 //   (b) the last-prefill-position argmax == the oracle's first greedy token;
@@ -952,9 +952,14 @@ bool RunQwen36Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
       vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
   MESSAGE("qwen36_logits: loading full 35B weights (dequant + transpose)...");
   const vllm::Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, cfg);
-  // Registry: architecture string -> forward (closes the Task 4 minor). This is
-  // the path a serving loader would take (config.architectures -> forward fn).
-  const vllm::ModelForwardFn forward = vllm::ResolveModelForward(cfg);
+  // Registry: prove the architecture is the implemented MoE registration. The
+  // live paged runner dispatches through its type-erased forward; this legacy
+  // single-sequence parity case intentionally keeps ForwardDense as its oracle.
+  const vllm::ModelRegistration& registration =
+      vllm::ModelRegistry::Resolve(cfg);
+  REQUIRE(registration.architecture ==
+          "Qwen3_5MoeForConditionalGeneration");
+  const auto forward = &vllm::Qwen3_5Model::ForwardDense;
 
   auto ids_l = LoadTensor(dir, m["tensors"]["token_ids"]);
   const int64_t T0 = ids_l.tensor.shape[0];

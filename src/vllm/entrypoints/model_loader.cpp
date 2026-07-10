@@ -129,100 +129,47 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
   return cfg;
 }
 
-vllm::v1::KVCacheConfig LoadedEngine::MakeKvConfig(const HfConfig& c,
-                                                   int block_size,
-                                                   int num_blocks) {
-  const int Hkv = static_cast<int>(c.num_key_value_heads);
-  const int Dh = static_cast<int>(c.head_dim);
-  const int Hv = static_cast<int>(c.linear_num_value_heads);
-  const int Dv = static_cast<int>(c.linear_value_head_dim);
-  const int Dk = static_cast<int>(c.linear_key_head_dim);
-  const int Kw = static_cast<int>(c.linear_conv_kernel_dim);
-  const int key_dim = static_cast<int>(c.linear_num_key_heads) * Dk;
-  const int value_dim = Hv * Dv;
-  const int conv_dim = 2 * key_dim + value_dim;
-
-  vllm::v1::KVCacheConfig kv;
-  kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"fa"},
-      std::make_shared<vllm::v1::FullAttentionSpec>(block_size, Hkv, Dh,
-                                                    vt::DType::kF32));
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"gdn"},
-      std::make_shared<vllm::v1::MambaSpec>(
-          block_size,
-          std::vector<std::vector<int64_t>>{{Hv, Dv, Dk}, {conv_dim, Kw - 1}},
-          std::vector<vt::DType>{vt::DType::kF32, vt::DType::kF32}));
-  return kv;
-}
-
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
-    : hash_ready_(EnsureNoneHash()),
-      config_(std::move(config)),
-      moe_weights_(std::move(weights)),
-      tokenizer_(std::move(tokenizer)),
-      max_model_len_(params.max_model_len > 0
-                         ? params.max_model_len
-                         : static_cast<int>(config_.max_position_embeddings)),
-      kv_cfg_(MakeKvConfig(config_,
-                           params.block_size > 0 ? params.block_size : 32,
-                           params.num_blocks > 0 ? params.num_blocks : 256)),
-      scheduler_(MakeSchedulerConfig(
-                     max_model_len_,
-                     params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-                     ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                                IsDenseArch(config_)),
-                     params.policy),
-                 kv_cfg_, params.block_size > 0 ? params.block_size : 32,
-                 /*enable_caching=*/true),
-      runner_(config_, *moe_weights_, kv_cfg_, SelectQueue(),
-              /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-              max_model_len_,
-              /*max_num_batched_tokens=*/
-              ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                         IsDenseArch(config_))),
-      executor_(runner_),
-      engine_core_(scheduler_, executor_),
-      input_processor_(tokenizer_, config_),
-      output_processor_(&tokenizer_),
-      block_hasher_(vllm::v1::get_request_block_hasher(
-          params.block_size > 0 ? params.block_size : 32,
-          vllm::v1::sha256_cbor)),
-      engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
-  (void)hash_ready_;
-}
+    : LoadedEngine(std::move(config),
+                   MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                   std::move(tokenizer), params) {}
 
-// DENSE-arch overload (27B). Identical to the MoE constructor except dense_weights_
-// carries the model and runner_ is built through the GPUModelRunner dense overload
-// (Qwen3_5DenseModel::Forward). Every other member is arch-agnostic.
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
+    : LoadedEngine(std::move(config),
+                   MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   std::move(tokenizer), params) {}
+
+LoadedEngine::LoadedEngine(HfConfig config,
+                           std::unique_ptr<LoadedModel> model,
+                           tok::Tokenizer tokenizer,
+                           const EngineParams& params)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
-      dense_weights_(std::move(weights)),
+      model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
       max_model_len_(params.max_model_len > 0
                          ? params.max_model_len
                          : static_cast<int>(config_.max_position_embeddings)),
-      kv_cfg_(MakeKvConfig(config_,
-                           params.block_size > 0 ? params.block_size : 32,
-                           params.num_blocks > 0 ? params.num_blocks : 256)),
+      kv_cfg_(ModelRegistry::MakeKVCache(
+          *model_, config_, params.block_size > 0 ? params.block_size : 32,
+          params.num_blocks > 0 ? params.num_blocks : 256)),
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
                      ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                                IsDenseArch(config_)),
+                                                ModelRegistry::IsDenseModel(
+                                                    *model_)),
                      params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
-      runner_(config_, *dense_weights_, kv_cfg_, SelectQueue(),
+      runner_(config_, *model_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/
               ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                         IsDenseArch(config_))),
+                                         ModelRegistry::IsDenseModel(*model_))),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
@@ -244,14 +191,6 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
   return *async_engine_;
 }
 
-bool LoadedEngine::IsDenseArch(const HfConfig& config) {
-  // The dense 27B (Qwen3_5ForConditionalGeneration, text_config qwen3_5_text)
-  // has no experts; the MoE 35B (Qwen3_5MoeForConditionalGeneration) sets
-  // num_experts > 0. num_experts is the structural discriminator between the two
-  // Qwen3.5 gate arches sharing this hybrid backbone.
-  return config.num_experts == 0;
-}
-
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
   const fs::path dir(model_dir);
@@ -261,10 +200,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
     vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
     HfConfig config = vllm::HfConfigFromGguf(gguf);
+    // Resolve before tokenizer/weight work so unsupported architecture errors
+    // are deterministic and match registry.py rather than being masked by a
+    // later source-specific missing-tensor/tokenizer error.
+    (void)ModelRegistry::Resolve(config);
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
-    Qwen3_5MoeWeights weights = vllm::LoadQwen3_5MoeFromGguf(gguf, config);
-    return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
-                                          std::move(tokenizer), params);
+    std::unique_ptr<LoadedModel> model =
+        ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
+    return std::unique_ptr<LoadedEngine>(new LoadedEngine(
+        std::move(config), std::move(model), std::move(tokenizer), params));
   }
 
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -274,26 +218,19 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
   HfConfig config = vllm::LoadHfConfig(config_path);
+  (void)ModelRegistry::Resolve(config);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
   std::vector<vllm::SafetensorsFile> shards = LoadShards(model_dir);
 
-  // Arch-select: the dense 27B (Qwen3_5ForConditionalGeneration, num_experts==0)
-  // routes to LoadQwen3_5Dense + the dense engine constructor; the MoE 35B stays
-  // on LoadQwen3_5Moe. Both drive the SAME stack below via the {moe,dense}_weights_
-  // pair (the runner already carries either arch).
-  if (LoadedEngine::IsDenseArch(config)) {
-    Qwen3_5DenseWeights weights = vllm::LoadQwen3_5Dense(shards, config);
-    shards.clear();  // the mmap'd shards may be released after the load.
-    return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
-                                          std::move(tokenizer), params);
-  }
-
-  Qwen3_5MoeWeights weights = vllm::LoadQwen3_5Moe(shards, config);
+  // Live architecture dispatch: consume config.architectures in order and let
+  // the matched registration own the weight-name map/loader. Unknown dense
+  // configs now reject instead of falling through num_experts == 0.
+  std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
+      config, ModelSource::FromSafetensors(shards));
   shards.clear();  // the mmap'd shards may be released after the load.
-
-  return std::make_unique<LoadedEngine>(std::move(config), std::move(weights),
-                                        std::move(tokenizer), params);
+  return std::unique_ptr<LoadedEngine>(new LoadedEngine(
+      std::move(config), std::move(model), std::move(tokenizer), params));
 }
 
 }  // namespace vllm::entrypoints

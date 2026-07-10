@@ -8,8 +8,8 @@
 //
 // The 35B analogue for the MoE stack is tests/vllm/v1/test_llm_engine.cpp; this is
 // its dense sibling driven through the packaging LoadedEngine seam. Cases:
-//   1. IsDenseArch dispatch decision: dense config (num_experts==0) -> true, MoE
-//      config (num_experts>0) -> false. This is the FromModelDir arch-select.
+//   1. ModelRegistry dispatch decision: explicit architecture IDs select their
+//      factories; num_experts is no longer used as a model-class key.
 //   2. Dense stack runs end to end: a LoadedEngine built via the DENSE constructor
 //      over synthetic dense weights + a small hybrid dense config generates
 //      exactly N greedy tokens, terminates, and is deterministic across two fresh
@@ -38,6 +38,7 @@
 using nlohmann::json;
 using vllm::DenseMlpWeights;
 using vllm::HfConfig;
+using vllm::ModelRegistry;
 using vllm::OwnedTensor;
 using vllm::Qwen3_5DenseLayerWeights;
 using vllm::Qwen3_5DenseWeights;
@@ -238,15 +239,20 @@ SamplingParams Greedy(int max_tokens) {
 }  // namespace
 
 // ─── 1. Arch-select: the FromModelDir dispatch decision ──────────────────────
-TEST_CASE("loaded_engine: IsDenseArch routes 27B dense vs 35B MoE by num_experts") {
+TEST_CASE("loaded_engine: ModelRegistry routes explicit 27B dense vs 35B MoE IDs") {
   HfConfig dense = MakeDenseConfig();
-  CHECK(LoadedEngine::IsDenseArch(dense));  // num_experts == 0 -> dense (27B)
+  // Deliberately contradict the old structural heuristic: the architecture ID
+  // remains authoritative.
+  dense.num_experts = 4;
+  CHECK(ModelRegistry::Resolve(dense).architecture ==
+        "Qwen3_5ForConditionalGeneration");
 
   HfConfig moe = MakeDenseConfig();
   moe.model_type = "qwen3_5_moe_text";
   moe.architectures = {"Qwen3_5MoeForConditionalGeneration"};
-  moe.num_experts = 4;  // MoE -> NOT dense
-  CHECK_FALSE(LoadedEngine::IsDenseArch(moe));
+  moe.num_experts = 0;
+  CHECK(ModelRegistry::Resolve(moe).architecture ==
+        "Qwen3_5MoeForConditionalGeneration");
 }
 
 // ─── 2. The dense stack drives the full engine loop end to end ───────────────

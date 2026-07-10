@@ -112,8 +112,8 @@ we mirror it.
 | Item | Upstream | Tier |
 |---|---|---|
 | Backend interface: `AttentionBackend/Impl/MetadataBuilder` | `v1/attention/backend.py` | T0 ✅ `bd47ce3` (ABCs + flash NHD get_kv_cache_shape) |
-| `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; CUDA parity dgx-pending) |
-| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 🚧 `c244592` (vt::PagedAttention correctness-grade CPU+CUDA, anchored to M0.9 dense; FlashInfer-class perf + CUDA graphs = M2.4; CUDA parity dgx-pending) |
+| `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; GB10 gates pass; other CUDA targets unvalidated) |
+| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 ✅ on GB10 gate workloads (CPU/CUDA parity + full 27B/35B paged-engine and throughput gates); broader attention/backend/SM coverage lives in `kernel-matrix.md` and remains open |
 | **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 ✅ `370ddaf` (GDNAttentionMetadata decode/prefill split + has_initial_state mask + prefill rebasing; spec segments + align col-gather deferred; GDN-state zeroing = caller obligation, see state.md) |
 | GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` (correctness-grade sequential; chunked perf kernel M2.3) |
 | GDN fused decode recurrence (sigmoid-gating delta rule update) | `layers/fla/ops/{fused_sigmoid_gating,fused_recurrent}.py` | T0 ✅ `ead59d6` (correctness-grade) |
@@ -126,8 +126,11 @@ we mirror it.
 
 ## 5. Model architectures (`vllm/model_executor/models/`)
 
-292 registered upstream. Registry design (`registry.py`: HF `architectures[]` →
-implementation) is ported at T0.
+The pinned registry has **353 unique static architecture IDs** (370 category
+memberships, 307 implementation targets, 258 modules) plus a dynamic
+Transformers-compatible path. The generic architecture-to-factory registry is
+not ported: one MoE ID is directly registered and the dense gate model uses a
+Qwen-specific `num_experts==0` bypass. See `model-matrix.md`.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|
@@ -135,7 +138,7 @@ implementation) is ported at T0.
 | Dense decoders | Llama 3.x, Qwen2/3, Mistral, Gemma 2/3, Phi | GQA + RoPE + SwiGLU + RMSNorm (subset of T0 layer set) | T1 |
 | MoE decoders | Mixtral, Qwen3-MoE (30B-A3B), GLM-4-MoE, OLMoE | FusedMoE 🚧 `65788b3` (correctness-grade eager; grouped-GEMM perf M2.2) | T1 |
 | Qwen3-Next | `Qwen3NextForCausalLM` | same stack, interleaved-GQA weight layout | T1 |
-| Hybrid others | Jamba, Bamba, NemotronH, FalconH1, Zamba2, LFM2, Kimi-Linear | mamba1/2 kernels | T2 |
+| Hybrid others | Jamba, NemotronH, FalconH1, Zamba2, LFM2, Kimi-Linear | mamba1/2 kernels | T2 (`Bamba` is previously-supported, not in the pinned live registry) |
 | MLA family | DeepSeek V3/V3.2/V4, Kimi K2.5 | MLA wrapper, latent KV, sparse indexer | T2 |
 | MTP/EAGLE draft models | `Qwen3_5MTP`, `Qwen3_5MoeMTP`, EAGLE3 | spec decode (§6) | T2 |
 | Embedding/pooling/reranker | BERT-family, GTE, Qwen embed | bidirectional attn, poolers | T2 |
@@ -158,9 +161,9 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 (modelopt_fp4 + compressed-tensors w4a4_nvfp4)** — gate checkpoints; W4A4 MMA on sm_121 for MoE grouped GEMM + dense | `quantization/modelopt.py`, `compressed_tensors/` | **T0** 🚧 `65788b3`/`bc0a8d7` (35B modelopt W4A16: dequant-to-bf16 + tensor-core GEMM). **27B compressed-tensors NVFP4 W4A4** (the dense gate): CPU dequant + activation-quant emulation reference `nvfp4_emulation.h` ✅ (mirrors `nvfp4_emulation_utils.py`; weight-dequant reciprocal-global fix + the per-token activation fp4 quant; `test_ct_nvfp4_emulation` 81 assert green). Forward + W4A4 GPU GEMM pending — see `.agents/specs/qwen27b-w4a4-notes.md` §5 |
-| **GGUF quants** — container + dequant/matmul for types in our benchmark files (Q4_K/Q5_K/Q6_K/Q8_0/F16/F32 + NVFP4 GGUF extension types from the APEX/killgate tooling) | `quantization/gguf.py`, `model_loader/gguf_loader.py` | **T0 (gate)** ✅ `1a4db5c` (dequant F32/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/Q3_K byte-exact vs ggml + the qwen35moe GGUF loader [name mapping, convert-transform inversions, expert split, HfConfig] + model_loader `.gguf` routing; IQ2_S/IQ4_XS i-quants deferred) + **real-APEX greedy parity on GB10** ✅ (test_qwen36_gguf_engine: APEX-Compact [Q3_K/Q4_K/Q6_K] + APEX-Balanced [Q8_0/Q5_K] 16/16 greedy vs the same-file llama.cpp-fork oracle on 2 decisive prompts each; M0-prompt near-tie disclosed [oracle margin 0.040, ours takes the other branch]; weight-level cross-check vs the safetensors checkpoint: norm/ssm_a/dt_bias/conv1d inversions EXACT, quantized families corr≥0.9927. REMAINING for gate-#2 full language: no 27B GGUF file exists anywhere on dgx + no NVFP4-extension-type GGUF exists for the gate models — dequant for type 40 unimplemented, blocked on a real file) |
-| fp8 (W8A8, e4m3) | `quantization/fp8.py` | T1 |
+| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅** both native CUDA paths and full gate workloads pass on GB10; generic quant-config/backend breadth remains in `quantization-matrix.md` |
+| **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. All weights expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
+| fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
 | AWQ/GPTQ (+Marlin), compressed-tensors int schemes | various | T2 |
 | bitsandbytes, torchao, quark, INC, … | various | T3 (niche/other-vendor) |
@@ -205,7 +208,8 @@ T1: `prompt_logprobs`, `logprob_token_ids`, additional backends
 (guidance/outlines), reasoning parsers, beam search wrapper, thinking budget,
 repetition detection, torch-Philox bit-exact random parity. T2: rejection
 sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/
-`bad_words` promoted to T0 — ported at M1.7 `aac5138`.)
+`bad_words` primitives were ported at M1.7 `aac5138`; their SamplingParams and
+OpenAI request/payload wiring remain T1.)
 
 **Spec decode** (`v1/spec_decode/`): all T2, ordered — MTP (Qwen3.6 ships MTP
 weights; biggest single-model win) → ngram → EAGLE3 → dspark/suffix. Rejection
@@ -215,15 +219,15 @@ sampler + `use_v2_model_runner`-style padded drafting come with it.
 
 | Item | Upstream | Tier |
 |---|---|---|
-| `/v1/completions`, `/v1/chat/completions` (SSE streaming), `/v1/models`, `/health`, `/version`, `/metrics` | `entrypoints/openai/` | T0 ✅ `23d9f2c` (protocol+serving+cpp-httplib server+SanitizeUtf8+engine-mutex+examples/server; `/metrics` deferred; logprobs payload M3.x) |
-| Chat templating (Jinja subset needed by Qwen/Llama templates; engine: minja-style) | `entrypoints/chat_utils.py` | T0 ✅ `a99a65e` (original minja-subset Jinja engine, Qwen3.6 byte-identical to jinja2; tool/think branches M3.3/M3.4) |
-| **Tool/function calling** (user-mandated MVP): `tools`/`tool_choice` in chat API, auto-tool-choice, streaming tool-call deltas, tool-call parsers for the gate models (Qwen family + Hermes format first; others T1), grammar-forced JSON for `tool_choice=required`/named | `entrypoints/openai/tool_parsers/`, `chat_completion/` | T0 ✅ `18e3efb` (Hermes/Qwen3 parsers + streaming; **tool_choice=auto RELAXED via a native LAZY grammar matcher behind vLLM's STRUCTURAL_TAG seam** — free text until `<tool_call>`, then constrain [xgrammar TriggeredTag / llama.cpp lazy-grammar equivalent]; required/named forced; `<tool_call>` added-token matchability fixed for the real gate model; Coder-XML/Mistral/pythonic parsers deferred) |
+| Basic `/v1/completions`, `/v1/chat/completions` SSE transport, `/v1/models`, `/health`, `/version` | `entrypoints/openai/` | T0 **partial** `23d9f2c` (basic protocol+serving+cpp-httplib; `/health` is liveness-only; `/metrics`, complete protocol fields and logprobs payload remain open) |
+| Chat templating (bounded Qwen3.6 Jinja subset; engine: minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | T0 **anchor-backfill** `a99a65e` (original minja-subset engine; generic template/parser breadth remains open) |
+| **Tool/function calling** (user-mandated MVP): `tools`/`tool_choice` in chat API, auto-tool-choice, streaming tool-call deltas, Hermes parser first; upstream Qwen3Engine and other parser families remain T1 | `tool_parsers/`, `entrypoints/openai/chat_completion/` | T0 **partial** `18e3efb` (Hermes parser + streaming; local `qwen3` is a Hermes alias, not upstream Qwen3Engine parity; **tool_choice=auto RELAXED via a native LAZY grammar matcher behind vLLM's STRUCTURAL_TAG seam** — free text until `<tool_call>`, then constrain; required/named forced; Coder-XML/Mistral/pythonic parsers deferred) |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | T1 |
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | T2 |
 | `/v1/responses`, `/v1/messages` (Anthropic-style), audio endpoints | responses/messages routers | T2 |
 | Sleep/pause/resume, LoRA load/unload, profiling, RL weight-update endpoints | various | T2–T3 |
-| CLI: `serve`, `bench {latency,throughput,serve}` (bench is how we measure the gate), `chat`, `complete` | `entrypoints/cli/` | T0 (`serve`+`bench`), T1 rest |
-| Offline API: `generate`, `chat`, streaming enqueue; `get_metrics` | `entrypoints/llm.py` | T0 |
+| CLI: `serve`, `bench {latency,throughput,serve}`, `chat`, `complete` | `entrypoints/cli/` | T0 **partial** (separate example server + one in-process bench), T1 matching command families/rest |
+| Offline API: `generate`, `chat`, streaming enqueue; `get_metrics` | `entrypoints/llm.py` | T1 parity surface; bounded synchronous C/C++ entry points exist |
 | Prometheus metric names **1:1** (`vllm:num_requests_running`, `vllm:time_to_first_token_seconds`, `vllm:kv_cache_usage_perc`, …) | `v1/metrics/` | T0 (core set), T1 (full set) |
 | OTLP tracing | `config/observability.py` | T2 |
 

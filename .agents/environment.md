@@ -6,11 +6,23 @@
   capability 12.1 → sm_121. Unified memory: both gate models fit
   in bf16; the machine is memory-bandwidth-bound (~273 GB/s class) — decode
   parity is a bandwidth/launch-overhead game, hence CUDA graphs + fused
-  kernels in T0. Keep build/bench artifacts in `~/work/vllm.cpp/` there.
+  kernels in T0. Give each active claim its own `~/work/<claim>/` directory;
+  never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
   - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
     parity oracle (golden op dumps via `tools/parity/`).
+  - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds
+    `flock /tmp/gpu` for the whole job or multi-arm series, following
+    `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
+    source inspection and file transfer do not need the lock. Never kill an
+    unowned PID.
+  - Disk cleanup 2026-07-10 reclaimed ~368 GB from unrelated cached model sets,
+    April-era autoresearch logits/F16-GGUF cache artifacts, the vLLM compile
+    cache and stale rebuildable CUDA build trees. Active latency/PR workspaces,
+    gate checkpoints, APEX GGUF evidence and sources were preserved; the volume
+    had 359 GB free afterward. Maintain at least 200 GB headroom before adding
+    competitor images.
 - **Apple/Metal box**: `ssh 192.168.68.103` — Mac mini, Apple M4 (10 CPU
   cores), 16 GB unified memory, arm64, macOS 26.5.2. Use it for the MLX-backed
   `vt::` backend, Metal op parity, and small-model bring-up. It cannot hold the
@@ -42,6 +54,9 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- Offline vLLM throughput baselines are complete; the online `vllm serve`
-  TTFT/TPOT A/B remains roadmap closing track A1.
+- Offline vLLM throughput baselines are complete. The first online A1 campaign
+  ended invalid/incomplete (vLLM startup failures and ours-35B aborts); diagnose
+  and rerun the full every-axis series under the GPU mutex.
+- Provision SGLang `v0.5.12.post1` in an isolated environment after the current
+  GPU claims; never mutate `~/venvs/vllm-oracle`.
 - Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.

@@ -1,0 +1,167 @@
+# Engine and serving execution matrix
+
+This is the canonical stable-ID inventory for cross-cutting engine behavior at
+the parity pin `e24d1b24fe96`. Model, quantization, kernel, and platform support
+remain in their own matrices. The inventory audit that established the 26
+code-bearing baselines is recorded in
+[feature-anchor-backfill.md](specs/feature-anchor-backfill.md).
+
+`ANCHOR-BACKFILL` means the named bounded slice has code and tests but still
+lacks its required leaf spike. `PARTIAL` means the implementation is also
+known to omit upstream behavior. Neither state is protocol-complete. A plain
+`planned: specs/...` entry is not an accepted spike and cannot make a row
+`READY`.
+
+| Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `READY` | `INVENTORIED` |
+|---|---:|---:|---:|---:|---:|
+| Engine and scheduling | 12 | 3 | 3 | 0 | 6 |
+| KV cache and memory | 12 | 2 | 2 | 0 | 8 |
+| Parallelism | 5 | 0 | 0 | 1 | 4 |
+| Sampling and generation | 11 | 0 | 4 | 0 | 7 |
+| Structured output and tools | 6 | 0 | 3 | 0 | 3 |
+| Speculative decoding | 6 | 0 | 0 | 4 | 2 |
+| Serving, API, CLI, library | 15 | 3 | 2 | 0 | 10 |
+| LoRA and adapters | 2 | 0 | 0 | 0 | 2 |
+| Long context and attention | 6 | 0 | 0 | 0 | 6 |
+| Loading, tokenizer, config | 6 | 1 | 3 | 0 | 2 |
+| **Total** | **81** | **9** | **17** | **5** | **50** |
+
+## Engine core and scheduling
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `ENG-SCHED-CORE` | Text-generation running-first unified scheduler, FCFS, token budget, output update | T0 | `vllm/v1/core/sched/scheduler.py:396,1501`; `tests/v1/core/test_scheduler.py:86,847` | `src/vllm/v1/core/sched/scheduler.cpp:114,365` | `tests/vllm/v1/test_scheduler.cpp:143,416`; `tests/vllm/v1/test_engine_core.cpp:271` | `planned: specs/unified-scheduler.md` | `ANCHOR-BACKFILL` | - |
+| `ENG-CHUNKED-PREFILL` | Basic token-budget chunked prefill | T0 | `vllm/config/scheduler.py:84`; `vllm/v1/core/sched/scheduler.py:835`; `tests/v1/core/test_scheduler.py:185,503,903` | `src/vllm/v1/core/sched/scheduler.cpp:225,548` | `tests/vllm/v1/test_scheduler.cpp:192`; `tests/vllm/models/test_qwen27_paged_forward.cpp:492` | `planned: specs/chunked-prefill.md` | `ANCHOR-BACKFILL` | - |
+| `KV-PREFIX-CACHE` | APC hashes, lookup, allocation, partial blocks, eviction | T0 | `vllm/v1/core/kv_cache_manager.py:229`; `vllm/v1/core/block_pool.py:226`; `tests/v1/core/test_prefix_caching.py:225,2781`; `tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py:90` | `src/vllm/v1/core/kv_cache_utils.cpp:259,291`; `src/vllm/v1/core/kv_cache_manager.cpp:124`; stubs `src/vllm/v1/core/block_pool.cpp:95,122,131` | `tests/vllm/v1/test_kv_cache_utils.cpp:411,516,536`; `tests/vllm/v1/test_block_pool.cpp:115` | `planned: specs/prefix-caching.md` | `PARTIAL` | - |
+| `ENG-PREEMPT-RECOMPUTE` | FCFS tail preemption with recompute | T0 | `vllm/v1/core/sched/scheduler.py:1142`; `tests/v1/core/test_scheduler.py:930` | `src/vllm/v1/core/sched/scheduler.cpp:102,157`; `src/vllm/v1/core/sched/request_queue.cpp:36` | `tests/vllm/v1/test_scheduler.cpp:247,295`; `tests/vllm/v1/test_request_queue.cpp:91` | `planned: specs/preemption.md` | `ANCHOR-BACKFILL` | - |
+| `ENG-CUDAGRAPH` | Decode graph capture/replay modes | T0 | `vllm/config/compilation.py:53,1319`; `vllm/v1/worker/gpu/cudagraph_utils.py:116`; `tests/compile/test_config.py:122,229` | `src/vt/cuda/cuda_backend.cu:76,97,105`; `src/vllm/model_executor/models/qwen3_5.cpp:3754,3952`; `src/vllm/v1/worker/gpu/runner.cpp:577,597` | `tests/vt/test_cuda_backend.cpp:98`; explicit 35B gate `tests/parity/test_qwen36_paged_engine.cpp:140` | `planned: specs/cuda-graphs.md` | `PARTIAL` | - |
+| `ENG-ASYNC-SCHED` | Async and overlap scheduling | T1 | `vllm/v1/core/sched/async_scheduler.py:12` | - | - | `planned: specs/async-scheduling.md` | `INVENTORIED` | - |
+| `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203` | - | - | `planned: specs/priority-scheduling.md` | `INVENTORIED` | - |
+| `ENG-PARTIAL-PREFILL` | Concurrent partial-prefill and long-prompt limits | T1 | `vllm/config/scheduler.py:70-80` | - | - | `planned: specs/partial-prefill-concurrency.md` | `INVENTORIED` | - |
+| `ENG-BATCH-QUEUE` | Pipelined `step_with_batch_queue` | T1 | `vllm/v1/engine/core.py:519` | - | - | `planned: specs/batch-queue-step.md` | `INVENTORIED` | - |
+| `ENG-SCHED-KNOBS` | Reserve-full-ISL, scheduler class seam, stream interval | T1 | `vllm/config/scheduler.py:26,127,140,163` | `include/vllm/config/scheduler.h:71,95`; `src/vllm/config/scheduler.cpp:43,52`; `src/vllm/v1/core/sched/scheduler.cpp:237`; `src/vllm/v1/engine/output_processor.cpp:68` | `tests/vllm/test_scheduler_config.cpp:10,20`; `tests/vllm/v1/test_kv_cache_manager.cpp:425` | `planned: specs/scheduler-knobs.md` | `PARTIAL` | - |
+| `ENG-CASCADE-ATTN` | Cascade attention for shared prefixes | T2 | `vllm/config/model.py:238` | - | - | `planned: specs/cascade-attention.md` | `INVENTORIED` | - |
+| `ENG-DBO-UBATCH` | DBO and ubatch overlap | T2 | `vllm/config/parallel.py:208,524` | - | - | `planned: specs/dbo-ubatch.md` | `INVENTORIED` | - |
+
+## KV cache and memory
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `KV-BLOCK-POOL` | Free list, refcounts, LRU eviction, core block lifecycle | T0 | `vllm/v1/core/block_pool.py:144,226,542,614`; `tests/v1/core/test_prefix_caching.py:1315,1991` | `src/vllm/v1/core/block_pool.cpp:42,77,206,231,254` | `tests/vllm/v1/test_block_pool.cpp:70,115,202,251,280` | `planned: specs/block-pool.md` | `ANCHOR-BACKFILL` | - |
+| `KV-MANAGER-ALLOC` | Slot allocation, watermark, admission, release | T0 | `vllm/v1/core/kv_cache_manager.py:110,244`; `tests/v1/core/test_single_type_kv_cache_manager.py:380,413` | `src/vllm/v1/core/kv_cache_manager.cpp:88,124,144` | `tests/vllm/v1/test_kv_cache_manager.cpp:119,168,298,349,380,425` | `planned: specs/kv-cache-manager.md` | `ANCHOR-BACKFILL` | - |
+| `KV-HYBRID-COORD` | Full-attention and GDN/Mamba group coordinator | T0 | `vllm/v1/core/kv_cache_coordinator.py:514,630`; `tests/v1/core/test_prefix_caching.py:347,836,987` | `src/vllm/v1/core/kv_cache_coordinator.cpp:294,370,389` | `tests/vllm/v1/test_kv_cache_coordinator.cpp:130,154,169,209,306` | `planned: specs/hybrid-kv-coordinator.md` | `PARTIAL` | - |
+| `KV-MAMBA-ALIGN` | Mamba/GDN prefix retention in align mode | T1 | `vllm/config/cache.py:134-140`; `vllm/v1/core/single_type_kv_cache_manager.py:1032-1072` | - | - | `planned: specs/mamba-align-retention.md` | `INVENTORIED` | - |
+| `KV-SLIDING-LOCAL-SPECS` | Sliding-window and chunked-local KV specs | T1 | `vllm/v1/kv_cache_interface.py:481,518` | - | - | `planned: specs/sliding-window-kv-spec.md` | `INVENTORIED` | - |
+| `KV-FP8` | FP8 KV cache and scale handling | T1 | `vllm/model_executor/layers/quantization/kv_cache.py:42,108-191` | - | - | `planned: specs/fp8-kv-cache.md` | `INVENTORIED` | - |
+| `KV-NVFP4-TURBO` | NVFP4, per-token-head, and TurboQuant KV | T2 | `vllm/config/cache.py:14,28-35,272` | - | - | `planned: specs/nvfp4-kv-cache.md` | `INVENTORIED` | - |
+| `KV-OFFLOAD` | CPU tiering with LRU and ARC | T2 | `vllm/v1/kv_offload/cpu/manager.py:36`; `vllm/v1/kv_offload/cpu/policies/lru.py:12`; `vllm/v1/kv_offload/cpu/policies/arc.py:12` | - | - | `planned: specs/kv-offload.md` | `INVENTORIED` | - |
+| `KV-CONNECTORS` | Nixl, LMCache, Mooncake, and prefill/decode disaggregation | T2 | `vllm/distributed/kv_transfer/kv_connector/factory.py:27,152-164` | - | - | `planned: specs/kv-connectors-disagg.md` | `INVENTORIED` | - |
+| `KV-EVENTS` | Block create/evict event publication | T2 | `vllm/config/kv_events.py:11-52`; `vllm/v1/core/kv_cache_manager.py:121,149` | - | - | `planned: specs/kv-events.md` | `INVENTORIED` | - |
+| `KV-MLA-SPEC` | Latent MLA KV specification | T2 | `vllm/v1/kv_cache_interface.py:363` | - | - | `planned: specs/mla-kv-spec.md` | `INVENTORIED` | - |
+| `KV-SIZING` | GPU memory utilization and block-count overrides | T0 | `vllm/config/cache.py:68,87,168`; `tests/v1/core/test_kv_cache_utils.py:2224,2303` | fixed inputs `src/vllm/entrypoints/model_loader.cpp:117,129`; watermark `src/vllm/v1/core/kv_cache_manager.cpp:118` | watermark only `tests/vllm/v1/test_kv_cache_manager.cpp:298` | `planned: specs/kv-sizing.md` | `PARTIAL` | - |
+
+## Parallelism and scale-out
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `PAR-TP` | Tensor parallelism | T2 | `vllm/distributed/parallel_state.py:1695-1783`; `vllm/config/parallel.py:117` | - | - | [tensor-parallelism.md](specs/tensor-parallelism.md) | `READY` | - |
+| `PAR-PP` | Pipeline parallelism | T2 | `vllm/config/parallel.py:120` | - | - | `planned: specs/pipeline-parallel.md` | `INVENTORIED` | - |
+| `PAR-EP-EPLB` | Expert parallelism and EPLB | T2 | `vllm/config/parallel.py:162,481-487`; `vllm/v1/worker/gpu/eplb_utils.py:1` | - | - | `planned: specs/expert-parallel.md` | `INVENTORIED` | - |
+| `PAR-DP` | Data parallelism | T2 | `vllm/config/parallel.py:126-155` | - | - | `planned: specs/data-parallel.md` | `INVENTORIED` | - |
+| `PAR-MULTINODE` | Multi-node Ray and multiprocessing executor behavior | T3 | `vllm/v1/executor/abstract.py:37`; `vllm/config/parallel.py:245` | - | - | `planned: specs/multi-node.md` | `INVENTORIED` | - |
+
+## Sampling and generation controls
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `SAMPLE-CORE` | Ordered temperature, top-k/p, min-p, penalties, seed, stop, length, output-kind pipeline | T0 | `vllm/v1/sample/sampler.py:20,72,243`; `vllm/sampling_params.py:199`; `tests/v1/sample/test_sampling_params_e2e.py:17,25,40,176` | `src/vllm/sampling_params.cpp:25,35,167`; `src/vllm/v1/sample/sampler.cpp:152,215`; `src/vllm/v1/core/sched/utils.cpp:12` | `tests/vllm/test_sampling_params.cpp:13,64,231`; `tests/vllm/v1/sample/test_sampler.cpp:46,78,118,142,165,253`; `tests/vllm/v1/test_output_processor.cpp:189` | `planned: specs/core-sampler.md` | `PARTIAL` | - |
+| `SAMPLE-PHILOX` | Torch-Philox bit-exact stochastic parity | T1 | `vllm/v1/sample/ops/topk_topp_sampler.py:70`; `vllm/v1/sample/sampler.py:243` | - | - | `planned: specs/philox-rng-parity.md` | `INVENTORIED` | - |
+| `SAMPLE-LOGPROBS` | Token logprobs payload end to end | T1 | `vllm/v1/sample/sampler.py:309`; `tests/v1/sample/test_logprobs.py:303`; `tests/v1/sample/test_logprobs_e2e.py:25` | `src/vllm/v1/sample/sampler.cpp:107,215`; `src/vllm/entrypoints/openai/protocol.cpp:202,294,327`; `src/vllm/v1/engine/output_processor.cpp:101,114` | sampler only `tests/vllm/v1/sample/test_sampler.cpp:185,221,253`; protocol parsing only | `planned: specs/logprobs-payload.md` | `PARTIAL` | - |
+| `SAMPLE-PROMPT-LOGPROBS` | Prompt logprobs | T1 | `vllm/v1/sample/sampler.py:309`; `vllm/sampling_params.py:303` | - | - | `planned: specs/prompt-logprobs.md` | `INVENTORIED` | - |
+| `SAMPLE-LOGIT-FILTERS` | Logit bias, allowed-token IDs, bad words | T1 | `vllm/sampling_params.py:318,321,337`; `vllm/v1/sample/sampler.py:396`; `tests/v1/sample/test_sampler.py:367,413`; `tests/v1/sample/test_sampling_params_e2e.py:106,147` | `src/vllm/v1/sample/sampler.cpp:239`; `src/vllm/v1/sample/logits_processor/builtin.cpp:41`; `src/vllm/v1/sample/ops/bad_words.cpp:13,55` | `tests/vllm/v1/sample/test_logits_processors.cpp:121,163,200` | `planned: specs/logit-bias-bad-words.md` | `PARTIAL` | - |
+| `SERVE-COMPLETION-LONGTAIL` | Best-of, echo, suffix, user request fields | T1 | `vllm/entrypoints/openai/completion/protocol.py:56,67,70`; `tests/entrypoints/openai/completion/test_token_in_token_out.py:56` | echo parse only `include/vllm/entrypoints/openai/protocol.h:196`; `src/vllm/entrypoints/openai/protocol.cpp:204,295` | acceptance-only `tests/vllm/entrypoints/openai/test_conformance.cpp:589` | `planned: specs/completions-longtail-fields.md` | `PARTIAL` | - |
+| `SAMPLE-BEAM` | Beam-search wrapper | T1 | `vllm/entrypoints/generate/beam_search/offline.py:55,58,193` | - | - | `planned: specs/beam-search.md` | `INVENTORIED` | - |
+| `SAMPLE-REASONING` | Reasoning parsers and grammar integration | T1 | `vllm/reasoning/abs_reasoning_parsers.py:26,213` | - | - | `planned: specs/reasoning-parsers.md` | `INVENTORIED` | - |
+| `SAMPLE-THINKING-BUDGET` | Thinking budget state and logit combination | T1 | `vllm/v1/sample/sampler.py:381-386` | - | - | `planned: specs/thinking-budget.md` | `INVENTORIED` | - |
+| `SAMPLE-REPETITION` | Repetition detection and penalty state | T1 | `vllm/v1/sample/sampler.py:437` | - | - | `planned: specs/repetition-detection.md` | `INVENTORIED` | - |
+| `SAMPLE-CUSTOM-PROCESSORS` | Custom logits-processor plugin point | T2 | `vllm/v1/sample/logits_processor/__init__.py:49-97` | - | - | `planned: specs/custom-logits-processors.md` | `INVENTORIED` | - |
+
+## Structured outputs and tool calling
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `TOOLS-STRUCTURED-CORE` | JSON schema/object, regex, choice, grammar, response format | T0 | `vllm/v1/structured_output/request.py:77`; `vllm/v1/structured_output/__init__.py:36,204`; `vllm/v1/structured_output/backend_xgrammar.py:78`; `tests/entrypoints/llm/test_struct_output_generate.py:214` | `src/vllm/v1/structured_output/request.cpp:12,43`; `src/vllm/v1/structured_output/manager.cpp:14,67`; `src/vllm/v1/structured_output/backend_native.cpp:1334` | `tests/vllm/v1/structured_output/test_structured_output.cpp:114,352`; `tests/vllm/v1/structured_output/test_response_format_e2e.cpp:205`; native backend tests | `planned: specs/structured-outputs.md` | `PARTIAL` | - |
+| `TOOLS-XGRAMMAR` | xgrammar C++ backend | T1 | `vllm/v1/structured_output/backend_xgrammar.py:36,78,136` | - | - | `planned: specs/xgrammar-backend.md` | `INVENTORIED` | - |
+| `TOOLS-STRUCTURAL-TAG` | Full structural-tag surface | T1 | `vllm/v1/structured_output/backend_xgrammar.py:108`; `vllm/tool_parsers/structural_tag_registry.py:238`; `tests/entrypoints/llm/test_struct_output_generate.py:990` | `src/vllm/v1/structured_output/json_schema_to_gbnf.cpp:415`; `src/vllm/v1/structured_output/backend_native.cpp:1366`; `src/vllm/entrypoints/openai/serving_chat.cpp:98` | `tests/vllm/v1/structured_output/test_backend_native.cpp:910,939,952,987`; `tests/vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp:180` | `planned: specs/structural-tag.md` | `PARTIAL` | - |
+| `TOOLS-GUIDANCE-OUTLINES` | Guidance, outlines, and LM-format-enforcer backends | T2 | `vllm/v1/structured_output/__init__.py:140-159` | - | - | `planned: specs/guidance-outlines-backends.md` | `INVENTORIED` | - |
+| `TOOLS-CALLING-CORE` | Auto, required, named tool choice; streaming deltas; Hermes and Qwen3 parsers | T0 | `vllm/entrypoints/openai/chat_completion/serving.py:428,688,872`; `vllm/tool_parsers/hermes_tool_parser.py:34`; `vllm/tool_parsers/qwen3_engine_tool_parser.py:7` | `src/vllm/entrypoints/openai/serving_chat.cpp:98,224,239`; `src/vllm/entrypoints/openai/tool_parsers/hermes.cpp:124,180`; `src/vllm/entrypoints/openai/tool_parsers/qwen3.cpp:13` | `tests/vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp:27,121,159`; `tests/vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp:248,260,280`; `tests/vllm/entrypoints/openai/test_serving.cpp:625,741,903` | `planned: specs/tool-calling.md` | `PARTIAL` | - |
+| `TOOLS-PARSER-BREADTH` | Qwen-Coder XML, Mistral, pythonic, and remaining parsers | T1 | `vllm/tool_parsers/__init__.py:16-206` | - | - | `planned: specs/tool-parser-breadth.md` | `INVENTORIED` | - |
+
+## Speculative decoding
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `SPEC-MTP` | Qwen3.6 MTP heads, k=1 first | T1 | `vllm/v1/worker/gpu/spec_decode/mtp/speculator.py:12`; `vllm/model_executor/models/qwen3_5_mtp.py:1` | - | - | [mtp-spec-decode.md](specs/mtp-spec-decode.md) | `READY` | - |
+| `SPEC-REJECTION` | Rejection sampler | T1 | `vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:43` | - | - | [mtp-spec-decode.md §2.4](specs/mtp-spec-decode.md) | `READY` | - |
+| `SPEC-GDN-SEGMENTS` | GDN speculative metadata and slot-snapshot rollback | T1 | `vllm/v1/attention/backends/gdn_attn.py:82,244`; `vllm/v1/spec_decode/metadata.py:10` | - | - | [mtp-spec-decode.md §3](specs/mtp-spec-decode.md) | `READY` | - |
+| `SPEC-DFLASH` | Block-diffusion drafter | T1 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:31` | - | - | [dflash-spec-decode.md](specs/dflash-spec-decode.md) | `READY` | - |
+| `SPEC-NGRAM` | N-gram proposer | T2 | `vllm/v1/spec_decode/ngram_proposer.py:12` | - | - | `planned: specs/spec-decode-ngram.md` | `INVENTORIED` | - |
+| `SPEC-EAGLE3` | EAGLE3 proposer and draft model | T2 | `vllm/v1/spec_decode/eagle.py:10`; `vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:1` | - | - | `planned: specs/spec-decode-eagle3.md` | `INVENTORIED` | - |
+
+## Serving surface, CLI, and library
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `SERVE-OAI-BASIC` | Chat/completions endpoints with SSE transport | T0 | `vllm/entrypoints/openai/completion/api_router.py:34`; `vllm/entrypoints/openai/chat_completion/api_router.py:40`; `tests/entrypoints/openai/completion/test_completion.py:50,259` | `src/vllm/entrypoints/openai/api_server.cpp:60,105,176`; `src/vllm/entrypoints/openai/serving_completion.cpp:19`; `src/vllm/entrypoints/openai/serving_chat.cpp:239` | `tests/vllm/entrypoints/openai/test_api_server.cpp:351,371,394,452`; `tests/vllm/entrypoints/openai/test_conformance.cpp:469,502,614,641` | `planned: specs/chat-completions-endpoints.md` | `ANCHOR-BACKFILL` | - |
+| `SERVE-DISCOVERY-HEALTH` | Models, health, and version endpoints | T0 | `vllm/entrypoints/openai/models/api_router.py:20`; `vllm/entrypoints/serve/instrumentator/health.py:22`; `vllm/entrypoints/serve/instrumentator/basic.py:53`; `tests/entrypoints/openai/models/test_models.py:48` | `src/vllm/entrypoints/openai/api_server.cpp:149,158,167,215`; `src/vllm/entrypoints/openai/serving_models.cpp:22,50` | `tests/vllm/entrypoints/openai/test_api_server.cpp:434`; `tests/vllm/entrypoints/openai/test_conformance.cpp:953,976,990` | `planned: specs/models-health-version.md` | `PARTIAL` | - |
+| `SERVE-METRICS` | Prometheus `/metrics` with vLLM names | T0/T1 | `vllm/entrypoints/serve/instrumentator/metrics.py:52-82`; `vllm/v1/metrics/stats.py:171-243` | - | - | `planned: specs/prometheus-metrics.md` | `INVENTORIED` | - |
+| `SERVE-STREAM-USAGE` | Stream options and include-usage payload | T1 | `vllm/entrypoints/openai/chat_completion/protocol.py:214,731-735` | - | - | `planned: specs/stream-options.md` | `INVENTORIED` | - |
+| `SERVE-UTILITY-ENDPOINTS` | Tokenize, detokenize, ready, ping, server info, prefix reset | T1 | `vllm/entrypoints/serve/tokenize/api_router.py:37,63`; `vllm/entrypoints/serve/sagemaker/api_router.py:48`; `vllm/entrypoints/serve/dev/server_info/api_router.py:43`; `vllm/entrypoints/serve/dev/cache/api_router.py:20` | - | - | `planned: specs/utility-endpoints.md` | `INVENTORIED` | - |
+| `SERVE-CHAT-TEMPLATE` | Bounded Qwen3.6 Jinja/minja-style chat templates | T0 | `vllm/renderers/hf.py:673,986`; `vllm/entrypoints/chat_utils.py:1248,1335` | `src/vllm/entrypoints/chat_template.cpp:1133,1173,1186` | `tests/vllm/entrypoints/test_chat_template.cpp:60,79,206,236` | `planned: specs/chat-templating.md` | `ANCHOR-BACKFILL` | - |
+| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API | T1 | `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/async-llm-api.md` | `INVENTORIED` | - |
+| `SERVE-C-ABI` | Stable LocalAI-style C FFI | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143-217`; `src/capi/vllm_c.cpp:133-348` | `tests/capi/test_capi.cpp:320,428,505`; `tests/capi/test_dlopen.cpp:60`; C11 header compile | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
+| `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
+| `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
+| `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
+| `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |
+| `SERVE-RESPONSES-MESSAGES` | Responses, Anthropic messages, audio | T2 | `vllm/entrypoints/openai/responses/api_router.py:48`; `vllm/entrypoints/anthropic/api_router.py:49`; `vllm/entrypoints/speech_to_text/transcription/api_router.py:1` | - | - | `planned: specs/responses-messages-endpoints.md` | `INVENTORIED` | - |
+| `SERVE-ADMIN` | Sleep, pause/resume, profiling, RL weight updates | T2/T3 | `vllm/entrypoints/serve/dev/sleep/api_router.py:21`; `vllm/entrypoints/serve/dev/rlhf/api_router.py:29,74,136`; `vllm/entrypoints/serve/profile/api_router.py:21` | - | - | `planned: specs/admin-endpoints.md` | `INVENTORIED` | - |
+| `SERVE-OTLP` | OpenTelemetry traces | T2 | `vllm/config/observability.py:18,36,128` | - | - | `planned: specs/otlp-tracing.md` | `INVENTORIED` | - |
+
+## LoRA and adapters
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `LORA-RUNTIME` | Punica-style batched LoRA apply | T2 | `vllm/lora/lora_model.py:60`; `vllm/lora/lora_weights.py:13`; `vllm/lora/punica_wrapper/punica_gpu.py:33`; `vllm/v1/worker/lora_model_runner_mixin.py:30` | - | - | `planned: specs/lora-runtime.md` | `INVENTORIED` | - |
+| `LORA-ENDPOINTS` | Dynamic adapter load and unload | T2 | `vllm/entrypoints/serve/lora/api_router.py:43,60` | - | - | `planned: specs/lora-endpoints.md` | `INVENTORIED` | - |
+
+## Long context and attention breadth
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `ATTN-YARN` | YaRN rope scaling | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:243-284` | - | - | `planned: specs/yarn-rope.md` | `INVENTORIED` | - |
+| `ATTN-ROPE-FAMILY` | Llama3, LongRoPE, dynamic-NTK scaling | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155,200,315` | - | - | `planned: specs/rope-scaling-family.md` | `INVENTORIED` | - |
+| `ATTN-SLIDING-WINDOW` | Sliding-window attention backend | T1 | `vllm/v1/attention/backends/flash_attn.py:255,272-300` | - | - | `planned: specs/sliding-window-attention.md` | `INVENTORIED` | - |
+| `ATTN-MLA` | MLA prefill/decode backends and latent KV | T2 | `vllm/v1/attention/backends/mla/flashinfer_mla.py:1`; `vllm/v1/attention/backends/mla/triton_mla.py:1` | - | - | `planned: specs/mla-backends.md` | `INVENTORIED` | - |
+| `ATTN-MAMBA` | Mamba1/Mamba2, short-conv, linear backends | T2 | `vllm/v1/attention/backends/mamba_attn.py:30,79`; `vllm/model_executor/layers/mamba/short_conv.py:1` | - | - | `planned: specs/mamba-backends.md` | `INVENTORIED` | - |
+| `ATTN-ENCODER-CROSS` | Encoder and cross-attention | T2 | `vllm/model_executor/layers/attention/attention.py:1`; `vllm/v1/attention/backends/utils.py:1` | - | - | `planned: specs/encoder-cross-attention.md` | `INVENTORIED` | - |
+
+## Loading, tokenizer, and config
+
+| ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
+|---|---|---|---|---|---|---|---|---|
+| `LOAD-SAFETENSORS` | General safetensors loading, stacked parameters, weights mapping | T0 | `vllm/model_executor/model_loader/default_loader.py:43,145`; `vllm/model_executor/model_loader/weight_utils.py:820`; `vllm/model_executor/models/utils.py:44`; `tests/model_executor/model_loader/fastsafetensors_loader/test_weight_utils.py:24` | `src/vllm/model_executor/model_loader/safetensors_reader.cpp:43`; model-specific `src/vllm/model_executor/models/qwen3_5_weights.cpp:326`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:284` | `tests/vllm/test_safetensors.cpp:68,319`; `tests/vllm/test_qwen36_weights.cpp:51` | `planned: specs/safetensors-loader.md` | `PARTIAL` | - |
+| `LOAD-GGUF` | GGUF reader, dequantization, Qwen name transforms, embedded vocabulary | T0 | Pinned vLLM has no GGUF loader: `vllm/model_executor/model_loader/__init__.py:31-65`; compatibility reference is llama.cpp | `src/vllm/model_executor/model_loader/gguf_reader.cpp:302`; `src/vllm/model_executor/model_loader/gguf_dequant.cpp:223`; `src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:432`; `src/vllm/entrypoints/model_loader.cpp:240` | `tests/vllm/test_gguf.cpp:53`; `tests/vllm/test_gguf_dequant.cpp:25`; `tests/vllm/test_gguf_qwen36_loader.cpp:153`; real 35B `tests/parity/test_qwen36_gguf_engine.cpp:145` | `planned: specs/gguf-loader.md` | `PARTIAL` | - |
+| `LOAD-HF-BPE` | HF tokenizer.json byte-level BPE and incremental detokenization | T0 | `vllm/tokenizers/registry.py:176`; `vllm/tokenizers/hf.py:163`; `tests/tokenizers_/test_hf.py:18`; `tests/tokenizers_/test_detokenize.py:148` | `src/vllm/tokenizer/tokenizer.cpp:240,484,512`; `src/vllm/v1/engine/detokenizer.cpp:409` | `tests/vllm/test_bpe.cpp:226`; `tests/vllm/test_tokenizer_parity.cpp:66,74,82,90`; `tests/vllm/test_pretokenizer.cpp:130` | `planned: specs/hf-tokenizer.md` | `ANCHOR-BACKFILL` | - |
+| `LOAD-SENTENCEPIECE` | SentencePiece tokenizer family | T1 | `vllm/tokenizers/hf.py:163`; `vllm/tokenizers/mistral.py:235,467` | - | - | `planned: specs/sentencepiece.md` | `INVENTORIED` | - |
+| `LOAD-CONFIG-SURFACE` | Dataclass-for-dataclass config and serve-compatible flags | T0/T1 | `vllm/config/scheduler.py:26`; `vllm/config/cache.py:25`; `vllm/config/compilation.py:378` | `include/vllm/config/scheduler.h:67`; `src/vllm/config/scheduler.cpp:11`; `src/vllm/transformers_utils/hf_config.cpp:83`; limited flags `examples/server/main.cpp:60` | `tests/vllm/test_scheduler_config.cpp:10`; `tests/vllm/test_hf_config.cpp:131,224,265` | `planned: specs/config-surface.md` | `PARTIAL` | - |
+| `LOAD-LONGTAIL` | Sharded-state, tensorizer, RunAI, BitsAndBytes loaders | T3 | `vllm/model_executor/model_loader/__init__.py:33-65` | - | - | `planned: specs/loader-longtail.md` | `INVENTORIED` | - |
+
+## Claim rule
+
+Claims use the stable ID above. An agent first commits the row's leaf spike,
+updates this matrix to `READY`, then claims implementation in
+[coordination.md](coordination.md). The umbrella anchor-backfill inventory does
+not replace any leaf spike. `DONE` additionally requires merged code, ported
+upstream tests, end-to-end oracle evidence where applicable, and same-change
+roadmap/README/ledger/state updates.

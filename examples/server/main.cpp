@@ -1,5 +1,5 @@
 // server: an OpenAI-compatible HTTP server over the vllm.cpp LLMEngine (M3.1
-// Task 4). Loads a model (safetensors weights + tokenizer + a KV-cache config →
+// Task 4). Loads a supported model (safetensors or GGUF weights + tokenizer + a KV-cache config →
 // LLMEngine), constructs the OpenAI serving handlers (chat wired with the real
 // chat template via MakeChatTemplatePromptFn(LoadChatTemplateFromConfig(...)))
 // and serves /v1/completions, /v1/chat/completions, /v1/models, /health,
@@ -10,8 +10,9 @@
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //
-// <dir> holds config.json, tokenizer.json and the *.safetensors shards (T0:
-// safetensors only — GGUF load is M0.10). If --tokenizer-config is omitted it
+// A directory holds config.json, tokenizer.json and supported safetensors
+// shards. A supported GGUF file is also accepted and supplies model metadata
+// plus embedded vocabulary. If --tokenizer-config is omitted for a directory it
 // defaults to <dir>/tokenizer_config.json; when that file has no chat_template
 // the chat endpoint falls back to the simple role-join prompt.
 //

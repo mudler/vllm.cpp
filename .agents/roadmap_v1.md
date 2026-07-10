@@ -6,31 +6,60 @@ M0–M3 record is archived at
 **Context:** the MVP throughput gate is PASSED on both gate models (35B 1.02×,
 27B 1.007× vs production vLLM, token-exact, ~25-35% less memory — see
 state.md 2026-07-10). This document is the canonical index of what runs next:
-the in-flight closing tracks, the research tracks (each is a live sub-agent /
-workflow with a report due), and the T1/T2 queue. Keep it current: mark tracks
-DONE with a one-line outcome + where the full report/branch lives.
+the in-flight closing tracks and the ordered T1/T2 portfolio. Detailed status
+lives in the area matrices; active ownership lives in `coordination.md`; closed
+execution blocks live under `completed/`.
+
+## Top-level portfolio
+
+This is the single ordered roadmap table. Detailed capability/status rows live
+only in the linked area matrix; active agents/worktrees live in
+[coordination.md](coordination.md). The order preserves the post-MVP sequence:
+close the MVP operational gates, establish the kernel porting seam, execute T1,
+then expand backends and scale-out.
+
+| Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
+|---:|---|---|---|---|---|---|
+| 0 | `ROAD-V1-A` | MVP operational closure: online latency and e2e/nightlies | [engine matrix](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | A1 first campaign invalid/incomplete (vLLM startup failed; 35B ours arms aborted), rerun required; A5 unspiked | `GATING` | diagnose/rerun A1 under flock with valid denominators, then spike A5 |
+| 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory accepted; raw-pointer ABI leaf unspiked | `PARTIAL` | spike the adapter ABI, then split family claims |
+| 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | all 353 static architecture IDs inventoried; current Qwen wrappers are partial; factory leaf unspiked | `PARTIAL` | generic architecture-to-factory + reject-unknown spike |
+| 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs written | `READY` | claim 27B MTP loader/state leaf |
+| 4 | `ROAD-V1-C4` | Quantization: llama.cpp breadth/speed, NVFP4/FP8/MX, MLX native | [quantization matrix](quantization-matrix.md) | comprehensive coverage spike merged; leaf specs open | `PARTIAL` | spike GGUF compute-in-quant storage/dispatch |
+| 5 | `ROAD-V1-C5` | Sliding window, local attention, YaRN/long context | [engine matrix](engine-matrix.md), [coverage view §§2,11](feature-matrix.md#2-kv-cache--memory) | unspiked | `INVENTORIED` | SlidingWindowSpec + attention joint spike |
+| 6 | `ROAD-V1-C6` | Priority and async/overlap scheduling | [engine matrix](engine-matrix.md), [coverage view §1](feature-matrix.md#1-engine-core--scheduling) | async research finding only; leaf specs absent | `INVENTORIED` | async execution trace + scheduler test inventory |
+| 7 | `ROAD-V1-C7` | Sampling/API controls and logprobs payloads | [engine matrix](engine-matrix.md), [coverage view §6](feature-matrix.md#6-sampling--generation-controls) | implementation slices exist; all audited leaf specs absent | `PARTIAL` | split sampler-core evidence from serving wiring |
+| 8 | `ROAD-V1-C8` | Tokenize/detokenize and full metrics | [engine matrix](engine-matrix.md), [coverage view §9](feature-matrix.md#9-serving-surface-openai-api-endpoints-cli-library) | unspiked | `INVENTORIED` | `/metrics` core spike, then utility endpoints |
+| 9 | `ROAD-V1-C9` | Mechanical recurring upstream sync | [upstream sync](upstream-sync.md), [porting inventory](porting-inventory.md) | protocol exists; automation P1 open | `PARTIAL` | run next enumerate/classify cycle at pin advance |
+| 10 | `ROAD-V1-D1` | NVIDIA target fan-out, ROCm, MLX, Vulkan, XPU, ANE | [backend matrix](backend-matrix.md), [backends strategy](backends.md) | 13 CUDA targets, component rules, platforms and native floors inventoried; leaf specs absent | `PARTIAL` | spike the architecture spine, then sm80/sm90 build gates |
+| 11 | `ROAD-V1-D2` | Tensor/multi-GPU parallelism | [engine matrix](engine-matrix.md), [coverage view §3](feature-matrix.md#3-parallelism--scale-out) | TP spec written | `READY` | acquire 2-GPU target and claim Phase 0 mock/ABI |
+| 12 | `ROAD-V1-D3` | Spec-decode breadth: ngram and EAGLE3 | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | unspiked | `INVENTORIED` | after MTP/DFlash gate |
+| 13 | `ROAD-V1-D4` | LoRA, KV/offload, wider model zoo | [engine matrix](engine-matrix.md), [model matrix](model-matrix.md) | unspiked | `INVENTORIED` | after T1 dependencies close |
+
+An area row cannot enter `READY` without a real spike under `specs/`, and cannot
+enter `DONE` without exact code and test/evidence anchors. Closed execution
+blocks move to [completed/](completed/) while permanent support rows remain in
+their area matrix.
 
 ## A. MVP closing tracks (in flight)
 
 | # | Track | State |
 |---|---|---|
-| A1 | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🔄 agent on dgx |
+| A1 | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | ⚠️ first flock-held campaign ended 2026-07-10 but is **invalid/incomplete**: vLLM 27B/35B servers failed initialization and multiple ours-35B arms aborted; preserve logs in `~/work/vllm.cpp-latency/latres`, diagnose and rerun with fresh denominators |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
 | A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461) — vendored sm_121a artifacts (40 files, byte-deterministic regen), fresh-clone build green with `VLLM_CPP_TRITON_PYTHON=/nonexistent/python`, 27B gate green on vendored cubins |
 | A5 | e2e suites per gates.md (server conformance nightly on dgx etc.) | ☐ next |
 
-## B. Research tracks (kicked off in parallel, reports due)
+## B. Research tracks (complete)
 
-| # | Track | Question | State |
-|---|---|---|---|
-| B1 | Apple Metal / **MLX** | vllm-metal vs wiring MLX's C++ API behind `vt::` vs native MSL | ✅ **MLX wins** (Ollama's production swap ~1.6-2×); vendor MLX under vt:: + port vllm-metal's paged MSL as MLX primitives. **Hardware now available:** `ssh 192.168.68.103`, M4 Mac mini/16 GB; enough for op parity + small-model bring-up, not the 27B/35B gates. → [specs/expansion-map-2026-07-10.md](specs/expansion-map-2026-07-10.md) |
-| B2 | Arches & vendors | per-arch matrix; Triton→AMD; SYCL vs Vulkan | ✅ **NVIDIA fan-out nearly FREE** (bf16 path already sm_80+; A100/H100/4090 need ~no new kernels — Wave 1); **Triton GDN → AMD gfx942 via one flag**; Vulkan-before-SYCL call. → map |
-| B3 | SGLang steals | measured wins portable to C++ | ✅ **Async/overlap scheduling is vLLM's DEFAULT at our pin — an unmet MIRROR obligation** (we run synchronous); reframed as latency/mirror, not throughput (we already ≥1.0× vs async-vLLM). RadixAttention REJECTED per mirror policy. Kernel steals: no-op. → map |
-| B4 | llama.cpp CPU | vendor IF proven faster (user criterion) | ✅ research: **our CPU is a single-threaded scalar loop (zero threads!)** — threadpool = 1-wk prerequisite; **compute-in-quant** = the structural fix (~3.3× decode, ~10× prefill on GGUF). 🔄 local Qwen3.5-2B bench = the decision measurement | 
-| B5 | Speculative decoding | MTP + dflash | ✅ **Both gate checkpoints SHIP MTP heads** (bf16, we currently skip `mtp.*` at load!); **DFlash** (block-diffusion drafter, ICML'26) is in-pin WITH published drafts for our exact models + a DGX-Spark community container. Route: MTP k=1 27B → GDN spec path → DFlash. → [specs/spec-decode-scoping-2026-07-10.md](specs/spec-decode-scoping-2026-07-10.md) — **specs written → [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md), [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md)** (NB: B5's "27B pure attention" was wrong — both gates are GDN hybrids; the GDN spec path is on milestone 1, spec §0) |
-| B6 | Feature parity matrix | the big one-by-one vLLM-feature table (TP/PP/EP, LoRA, multimodal, disagg, pooling, …) — what we have / miss / tier | ✅ **[feature-matrix.md](feature-matrix.md)** — 13 sections, ~80 rows, every row source-verified + carrying its `Spec` delegation link; headline gaps surfaced: `/metrics` (open T0-core debt), async/overlap scheduling (unmet MIRROR obligation, B3), logprobs payload + logit_bias/bad_words API wiring (sampler done, serving not) |
-| B7 | Multimodality + tool calls | image/audio/video route; parallel tool calls | ✅ **the gate checkpoints ARE the VLMs** (full ViT shipped in both — 333 `model.visual.*` tensors we currently DROP at load; no deepstack; interleaved M-RoPE) → vision = a MIRROR obligation. **Our Qwen3 tool parser targets the WRONG format** (Hermes JSON; the shipped template is Qwen3-Coder XML — vLLM serves 27B with `qwen3_coder`) + no reasoning parser + our Jinja engine can't render the shipped template (~10 missing constructs) + tool-result round-trip broken; parallel tool calls otherwise solid (parser/index/grammar/streaming, tested). 6 specs ranked. → [specs/mm-tools-scoping-2026-07-10.md](specs/mm-tools-scoping-2026-07-10.md) |
+The B1-B7 parallel research block closed on 2026-07-10. Its frozen questions,
+findings and corrections are archived at
+[completed/roadmap_v1_research_spikes_2026-07-10.md](completed/roadmap_v1_research_spikes_2026-07-10.md).
+Live consequences are carried by the portfolio and area matrices; the archive
+is evidence, not a load-bearing decision source.
+
+The follow-on table/model/quant/kernel/backend coverage-spike block is archived
+at [completed/roadmap_v1_inventory_spikes_2026-07-10.md](completed/roadmap_v1_inventory_spikes_2026-07-10.md).
 
 ## C. T1 queue (all open v0 items carried forward)
 
@@ -77,21 +106,25 @@ The updated protocol will define: (a) the mirror floor (unchanged discipline),
 not just match), (c) how surpass-side divergences are recorded so upstream
 sync stays mechanical. Owner: after B1-B6 reports land.
 
-## E. Feature roadmap (the delegable breakdown)
+## E. Delegable area tables
 
-The feature-level roadmap is **[feature-matrix.md](feature-matrix.md)** — one row
-per vLLM feature (parallelism, quant, spec decode, multimodal, serving, …) with
-our status and a **`Spec` column** linking to `.agents/specs/<feature-slug>.md`.
-Convention: a gap row becomes a unit of delegable work by WRITING its spec at the
-linked path (scope, upstream file:line to mirror, gates, A/B plan, **and a
-"Tests to port" inventory of the upstream test files/cases covering the feature
-— see [test-porting.md](test-porting.md)**) and handing
-that spec to a sub-agent. Specs live in `.agents/specs/`; the matrix row flips
-☐ → 🚧 (spec written / agent running) → ✅ (merged + gated).
+The complete breakdown is split by ownership boundary:
+[engine-matrix.md](engine-matrix.md), [feature-matrix.md](feature-matrix.md),
+[model-matrix.md](model-matrix.md),
+[quantization-matrix.md](quantization-matrix.md),
+[kernel-matrix.md](kernel-matrix.md), and
+[backend-matrix.md](backend-matrix.md). Each stable row ID is independently
+claimable through [coordination.md](coordination.md).
+
+An item moves `INVENTORIED -> SPIKE -> READY -> ACTIVE -> GATING -> DONE`.
+`READY` requires a real `.agents/specs/<slug>.md` with upstream/dependency
+anchors, exact tests to port, gates, dependencies and row-sized work. `DONE`
+requires merged code and exact code/test/evidence anchors. A planned path is
+plain text until the spike exists.
 
 ## Decision rules carried forward
 
 - Every perf claim: same-box A/B vs the reference, token-exact gated, fresh
   denominators (benchmark-protocol.md). Vendoring needs a MEASURED win first
-  (B4 criterion). Sub-agents on shared GPUs use the flock mutex
-  (`~/.claude/skills/sharing-a-gpu-with-flock`).
+  (B4 criterion). Sub-agents on shared GPUs use the flock mutex at `/tmp/gpu`
+  per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`.

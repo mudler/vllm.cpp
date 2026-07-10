@@ -5,17 +5,25 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
-1. **Orient**: read `AGENTS.md` (index), then [state.md](state.md) (where we
-   are, what's next), then the [roadmap_v1.md](roadmap_v1.md) unit you'll work on.
-2. **Scope one unit**: work in roadmap-unit-sized chunks (one focused PR
-   each). If a unit turns out too big, split it in roadmap_v1.md first.
-3. **Read upstream first**: before implementing any subsystem, read the
+1. **Orient**: read `AGENTS.md` (index), [state.md](state.md), the top-level
+   [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row, and
+   [coordination.md](coordination.md).
+2. **Claim one stable row ID**: add the sub-agent/worktree/branch and owned files
+   to the coordination table before editing. One focused row or explicitly
+   listed row block per PR; split oversized rows in the area matrix first.
+3. **Spike first**: create `.agents/specs/<slug>.md` and move the row through
+   `INVENTORIED -> SPIKE -> READY`. The spike must cover upstream + dependency
+   dispatch, tests to port, gates, hardware, dependencies, and row-sized work.
+   Implementation must not start from an uncommitted or missing spike.
+4. **Read upstream first**: before implementing any subsystem, read the
    upstream Python at the paths listed in
    [porting-inventory.md](porting-inventory.md) — port, don't reinvent
    ([discipline.md](discipline.md)).
-4. **Design → tests → code**: for non-trivial units, brainstorm/spec first
-   (specs in `docs/superpowers/specs/`); TDD with the parity harness.
-5. **Close the loop** (Definition of Done for every change):
+5. **Tests -> code**: port the upstream tests listed in the spike and use the
+   parity harness before filling implementation anchors.
+6. **Close the loop** (Definition of Done for every change):
+   - `python3 scripts/check-agent-record.py` passes (canonical tables, stable
+     IDs, lifecycle states, spec/link integrity, minimum pinned inventory size);
    - tests green (op-parity / behavioral / e2e as applicable);
    - **committing parity goldens BEFORE their runner? In the SAME commit, add
      the op to `PendingRunnerOps()` in `tests/parity/test_op_parity.cpp`** —
@@ -28,7 +36,9 @@ and continue. Follow this protocol every session.
    - [porting-inventory.md](porting-inventory.md) status markers flipped;
    - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,
      upstream refs);
-   - [roadmap_v1.md](roadmap_v1.md) unit status updated;
+   - owning area-matrix row has exact implementation + test/evidence anchors;
+   - [roadmap_v1.md](roadmap_v1.md) portfolio row and
+     [coordination.md](coordination.md) claim updated;
    - **`README.md` support tables** (architectures / acceleration /
      quantization) updated whenever a change alters what is supported, its
      status, or its tested formats — a family/backend becomes ✅ only when
@@ -36,10 +46,32 @@ and continue. Follow this protocol every session.
    - [state.md](state.md) entry appended (what landed, what's next);
    - commit + push to `main` (user-authorized, for now).
 
+## Tabular lifecycle
+
+| State | Meaning | Required before entering |
+|---|---|---|
+| `INVENTORIED` | Upstream item is listed; spike is not complete | Stable ID + upstream anchor |
+| `SPIKE` | A named agent is investigating and writing the spec | Coordination claim + worktree |
+| `READY` | Spike is merged; implementation can be claimed | Real spec link + tests/gates/dependencies |
+| `ACTIVE` | Implementation is in flight | Implementation claim + owned files |
+| `GATING` | Code exists; required parity/perf gates are running | Code anchors + ported tests |
+| `PARTIAL` | Some modes work; missing modes are explicit | Code/test anchors for the working subset |
+| `DONE` | Whole row scope is merged and gated | Code + tests/evidence + spec + ledger anchors |
+| `BLOCKED` | External dependency prevents progress | Concrete blocker + unblocking condition |
+| `ANCHOR-BACKFILL` | Legacy code exists but the new evidence contract is incomplete | Honest working-scope note; cannot count as `DONE` |
+
+Support inventories retain `DONE` rows permanently. When a roadmap execution
+block has no open rows, archive its plan/report under `completed/` and point the
+portfolio row at that archive; do not erase current support evidence.
+
 ## Practicalities
 
-- Long CUDA builds/benchmarks run on `dgx.casa` over SSH; artifacts in
-  `~/work/vllm.cpp/` there. Specs/models: [environment.md](environment.md).
+- Long CUDA builds/benchmarks run on `dgx.casa` over SSH; each claim gets its
+  own `~/work/<claim>/` directory. Gate all GPU execution on `flock /tmp/gpu`
+  and hold one lock across a whole A/B/profile sequence, following
+  `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
+  read-only `nvidia-smi`, and file transfer do not need the lock. Specs/models:
+  [environment.md](environment.md).
 - Benchmarks are honest: same box, same model files, request-rate sweeps,
   report TTFT/ITL/throughput; no cherry-picking. Numbers go in the ledger.
 - Upstream sync procedure: [upstream-sync.md](upstream-sync.md). When syncing,

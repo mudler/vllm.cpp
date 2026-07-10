@@ -1,10 +1,29 @@
-# Benchmarking protocol — match or beat vLLM on EVERY axis (never below)
+# Benchmarking protocol — match or beat every applicable floor on every axis
 
-**Acceptance rule (non-negotiable):** for any change *and* for the MVP throughput
-gate, vllm.cpp must be **equal to or better than vLLM on EVERY measured axis**.
-Below vLLM on any axis is **NOT accepted** — it is an open gap to close, and the
-MVP is not met until every axis is at parity or above. "Near parity" (0.9×,
-0.98×) does **not** count. Equal-or-above, never below.
+**Acceptance rule (non-negotiable):** vLLM remains the compatibility and CUDA
+performance floor wherever it supports the same workload. Each backend also has
+a native performance floor and a leader comparison below. vllm.cpp must be
+**equal to or better than every applicable floor on EVERY measured axis**.
+Below a floor on any axis is an open gap. "Near parity" (0.9×, 0.98×) does not
+count. A leader that is not yet a binding floor is still measured and tracked;
+it becomes binding once the spike proves the workload/features are equivalent.
+
+## Backend-native floors and leader comparisons
+
+| Backend / operating point | Compatibility oracle | Binding performance floor | Leader comparison |
+|---|---|---|---|
+| NVIDIA CUDA, large concurrency | pinned vLLM | production graphed vLLM | SGLang when it supports the same model/quant |
+| NVIDIA CUDA, low concurrency 1/2/4/8/16 | pinned vLLM | better of production vLLM and equivalent SGLang | both are always reported |
+| CPU + GGUF | pinned vLLM behavior where shared; same-file llama.cpp tokens/logits | same-file llama.cpp | strongest current CPU engine found by the spike |
+| Vulkan | vLLM behavior where shared | same-model/quant llama.cpp Vulkan | other equivalent native Vulkan engine if identified |
+| Apple MLX/Metal | pinned vLLM behavior + MLX primitive/MLX-LM numerics | equivalent oMLX or MLX-LM result, whichever is better per axis | llama.cpp Metal also reported when it accepts the same file |
+| Intel XPU / ROCm | pinned vLLM on that platform | production vLLM platform backend | strongest equivalent native engine identified by the backend spike |
+
+"Equivalent" means the same model weights/quantization, prompt tokens, input and
+output lengths, sampling, cache/prefix state, concurrency and serving features.
+If conversion is necessary, record it and do not turn the converted result into
+a binding floor until correctness/quality equivalence is established. Full
+matrix: [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md).
 
 ## The denominator is vLLM's PRODUCTION config (CUDA graphs ON) — never `--enforce-eager`
 
@@ -54,8 +73,12 @@ CUDA-graph config (see above), not `--enforce-eager`.**
    **large-concurrency operating point** (the gate is *large concurrency*; a
    single-wave `np == concurrency` run hides sustained-load amortization — use
    sustained load, and size `--num-blocks` so the KV cache is not starved).
-4. **Record every axis + the ratio** in [parity-ledger.md](parity-ledger.md).
-   A ledger row that leaves ANY axis below vLLM is an OPEN GAP, not a done change.
+4. **Run the applicable native/leader arms** from the table above. For CUDA
+   serving, include the low-concurrency sweep when latency/scheduling could
+   change. For new backends, the area spike fixes representative models that fit
+   the hardware without pretending a small-model gate proves 27B/35B scale.
+5. **Record every axis + every ratio** in [parity-ledger.md](parity-ledger.md).
+   A ledger row that leaves ANY axis below an applicable floor is an open gap.
 
 ## Reproduction is a GATE
 
@@ -72,10 +95,12 @@ rumor; a reproducible run is evidence.
   ±2–4%; report the spread). A number that doesn't reproduce is void, not a win.
 - **Same-binary A/B** (toggle ON vs OFF) so the delta is attributable to the
   change, not to build/config drift.
-- **Guard against contamination** — the box must be idle for the measurement:
-  no concurrent build/bench/other-process on the GPU (verify `ps` + `free -g`);
-  a contended run inflates latency and is void (we lost a dense-fp8 A/B this way
-  and had to re-run). Kill strays with `pkill -9 -x vllm-bench` before each run.
+- **Guard against contamination with the shared mutex** — wrap the complete
+  server/reference/A/B/profile series in one `flock /tmp/gpu -c '...'`, per
+  `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. A number is void
+  unless the lock was held for its entire run. Inspect `fuser -v /tmp/gpu` on a
+  timeout; never kill a PID you did not start. CPU-only comparisons use an
+  equivalent host lock or an otherwise idle, pinned-core machine.
 - **Prefer a scripted, re-runnable harness** over ad-hoc one-offs so any result
   can be regenerated on demand; keep the gate config stable (never silently
   re-base it without re-running vLLM on the new config).
@@ -90,7 +115,8 @@ toward the gate.
 - The MVP throughput gate is MET only when, for BOTH models at large concurrency:
   total throughput ≥ vLLM (≥ 1.0×) **AND** TTFT ≤ vLLM **AND** TPOT ≤ vLLM
   **AND** peak memory ≤ vLLM **AND** correctness holds — i.e. **match-or-beat on
-  every axis, both models**. Anything below vLLM on any axis keeps the gate open.
+  every axis, both models**. Post-MVP backend rows additionally remain open while
+  below their applicable native floor.
 
 See also: [gates.md](gates.md) (the MVP gates), [parity-lever-protocol.md](parity-lever-protocol.md)
 (how to find the levers to close a below-vLLM axis).

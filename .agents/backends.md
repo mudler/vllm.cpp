@@ -1,4 +1,4 @@
-# Backend portability strategy (NVIDIA · Apple · Vulkan · Intel · CPU)
+# Backend portability strategy (NVIDIA, AMD, Apple, Vulkan, Intel, ANE, CPU)
 
 **Principle:** the engine (scheduler, KV/block management, persistent batch,
 sampler pipeline, serving) is 100% backend-agnostic — in upstream vLLM it
@@ -42,11 +42,12 @@ lives entirely below them.
 | Platform | Upstream equivalent | Strategy | Tier |
 |---|---|---|---|
 | NVIDIA CUDA (GB10 first) | `platforms/cuda.py` | The gate. Native CUDA kernels + cuBLASLt + CUDA graphs | T0 |
-| CPU | `platforms/cpu.py`, `csrc/cpu/` | Correctness-grade reference for CI/parity | T0 (correctness) |
+| CPU | `platforms/cpu.py`, `csrc/cpu/` | Correctness baseline today; production thread/quant path must meet llama.cpp speed/memory | T0 correctness; T1 production |
 | Intel XPU | **`platforms/xpu.py` exists upstream** | Loyal port: SYCL/oneAPI kernels (upstream uses oneDNN/IPEX paths; we write SYCL against the same contracts). Battlemage/Arc + Data Center Max | T2 |
 | Apple Metal | none — vllm.cpp extension | New `platforms/metal` following the mirrored Platform contract; kernel layer per exploration E1/E2 below | T2 |
 | Vulkan | none — vllm.cpp extension | New `platforms/vulkan`; hand-written compute shaders, `VK_KHR_cooperative_matrix` for MMA-class GEMM; llama.cpp's Vulkan backend is the maturity reference | T2 |
-| AMD ROCm | `platforms/rocm.py` | Not scoped yet; falls out of the same seams when wanted | T3 |
+| AMD ROCm | `platforms/rocm.py` | Loyal HIP/platform port after the common architecture spine; vLLM and SGLang are native references | T2 |
+| Apple ANE | none — vllm.cpp extension | CoreML route limited to encoder, pooling, and suitable fixed-shape draft classes | T2 specialized |
 
 Extensions (Metal, Vulkan) are recorded as deviations in
 [porting-inventory.md](porting-inventory.md) §9 — upstream has no such
@@ -86,7 +87,11 @@ upstream platform PR ports mechanically.
   later); backend implementations are post-MVP.
 - A new backend lands like any port: parity harness (same golden dumps —
   they are backend-independent), behavioral suites unchanged, benchmark
-  honesty per [workflow.md](workflow.md).
+  honesty per [benchmark-protocol.md](benchmark-protocol.md). `DONE` additionally
+  requires match-or-beat against the applicable native floor: llama.cpp for
+  CPU/GGUF and Vulkan, oMLX/MLX-LM for Apple MLX, production vLLM for its native
+  platforms, plus the SGLang low-concurrency CUDA sweep. The canonical status
+  and target list lives in [backend-matrix.md](backend-matrix.md).
 
 ## Post-MVP: drop-in kernel compatibility with upstream (user-mandated scope)
 

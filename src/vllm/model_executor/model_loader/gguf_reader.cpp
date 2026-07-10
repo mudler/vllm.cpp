@@ -1,4 +1,5 @@
-// Ported from: vllm/model_executor/model_loader/gguf_loader.py (container semantics) @ e24d1b24
+// vllm.cpp original. GGUF wire semantics follow the llama.cpp format; pinned
+// vLLM e24d1b24 has no GGUF load format.
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 #include <fcntl.h>

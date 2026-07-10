@@ -14,19 +14,16 @@ never lag reality: no "pending"/"not yet confirmed" for something that now
 works, and no overclaim for something that doesn't. It is part of the record,
 kept honest and current alongside the ledger.
 
-**Keep the ROADMAP (`.agents/roadmap_v1.md`) and FEATURE MATRIX
-(`.agents/feature-matrix.md`) CURRENT — same-change obligation.** Any change
-that shifts a feature's or track's state — a feature lands, a gap opens, a spec
-gets written (`☐ → 🚧`), an agent starts/finishes implementing (`🚧 → ✅`,
-merged + gated), a research track reports, a queue item is re-ranked — updates
-the matching feature-matrix ROW (status + Spec link + one-line grounded note)
-and the roadmap track line (mark DONE with a one-line outcome + pointer to the
-full report/branch) **in the SAME change**, exactly like the README rule above.
-The matrix is the single feature-level status surface; the roadmap is the
-single track-level one — neither may lag reality, and neither is ever updated
-speculatively (a row flips ✅ only when merged + gated). Applies to every
-sub-agent; reviewers treat a state-shifting diff without its matrix/roadmap
-update as incomplete.
+**Keep the ROADMAP (`.agents/roadmap_v1.md`) and its AREA MATRICES CURRENT —
+same-change obligation.** The roadmap is the single top-level portfolio table;
+the linked engine/model/quantization/kernel/backend matrices are the detailed
+execution-status surfaces; `feature-matrix.md` remains the broad parity coverage
+view. Any change that shifts a feature's or track's state updates
+the owning matrix row (status, spike/spec, implementation + test evidence) and
+the roadmap portfolio row **in the SAME change**, exactly like the README rule
+above. Neither is ever updated speculatively: `DONE` means merged and gated,
+with non-empty code and test anchors. Applies to every sub-agent; reviewers
+treat a state-shifting diff without its matrix/roadmap update as incomplete.
 
 **Doc lifecycle — live context vs completed record (user-directed 2026-07-10).**
 `.agents/` holds documents that are LIVE context for current work; era-closed
@@ -45,6 +42,45 @@ reports, semantics notes, feasibility studies, and design references live under
 for the live project-wide protocol, roadmap, status, environment, inventory,
 and ledger. Specs that cease to be live context follow the same lifecycle and
 move to `.agents/completed/` with their links repaired.
+
+## STANDING DIRECTIVE — tabular inventory, spike first, then parallel claims
+
+The canonical record is **table-first**. Before implementation begins, enumerate
+the complete upstream surface in the owning area matrix. Every row has a stable
+ID and these fields: upstream source, our implementation anchor, tests/evidence,
+spike/spec, lifecycle state, and owner/claim. The canonical area matrices are:
+
+- `.agents/engine-matrix.md` — stable execution rows for engine, KV, scale-out,
+  sampling, serving, and other cross-cutting behavior;
+- `.agents/feature-matrix.md` — broad one-by-one parity coverage view; it rolls
+  up to the engine matrix and the domain matrices below;
+- `.agents/model-matrix.md` — every model architecture/family registered by the
+  pinned vLLM;
+- `.agents/quantization-matrix.md` — every tracked storage/quantization scheme,
+  separated by loader, dequant/compute path, backend, and end-to-end gate;
+- `.agents/kernel-matrix.md` — vLLM and dependency kernel families plus our
+  dispatch/architecture coverage;
+- `.agents/backend-matrix.md` — platform and CUDA-architecture targets plus the
+  native competitor/performance gate for each backend.
+
+**Every item is spiked before it is implemented.** Its committed
+`.agents/specs/<slug>.md` spike must inventory the whole upstream/dependency
+chain, dispatch rules, exact files to port, tests to port, hardware needs,
+correctness/performance gates, dependencies, and a row-sized work breakdown.
+No row may enter `READY`/`ACTIVE` without that spike. An implementation already
+present in the tree is not allowed to claim `DONE` in a matrix until the row
+links exact code and test/evidence anchors; record gaps honestly as
+`ANCHOR-BACKFILL` or `PARTIAL`.
+
+Parallel work is coordinated through `.agents/coordination.md`. A sub-agent
+claims stable row IDs there before editing, uses an isolated worktree/branch,
+and owns only the listed files/rows. GPU execution is serialized with
+`flock /tmp/gpu` per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`;
+an A/B or profile series holds one lock for the whole series. When every row in
+an execution block is `DONE`, move the block plan/report to
+`.agents/completed/` in the closing change. Permanent support matrices retain
+the completed row and its code/test anchors so current capability remains
+discoverable. Full lifecycle and claim protocol: `.agents/coordination.md`.
 
 **Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
 message. This asserts the contributor (human or AI-assisted) has read this
@@ -221,11 +257,14 @@ submitting AI-assisted code, read
 - [.agents/vllm-v1-v2.md](.agents/vllm-v1-v2.md) — V1 engine vs "Model Runner
   V2" terminology; we port MRV2.
 - [.agents/backends.md](.agents/backends.md) — backend portability strategy
-  (CUDA/CPU now; Metal, Vulkan, Intel XPU later) via vLLM's own Platform +
+  (CUDA/CPU now; ROCm, Metal, Vulkan, Intel XPU and ANE later) via vLLM's own Platform +
   attention-backend seams; MLX/ANE explorations; binding vt:: interface
   requirements for M0.2.
 - [.agents/workflow.md](.agents/workflow.md) — **agent operating manual**:
   session protocol, Definition of Done, practicalities.
+- [.agents/coordination.md](.agents/coordination.md) — **parallel-work control
+  plane**: stable IDs, spike gate, claims/worktrees, dependency and GPU-lock
+  rules, handoff, and completed-block archival.
 - [.agents/porting-inventory.md](.agents/porting-inventory.md) — **living
   parity record**: full vLLM feature/architecture inventory, T0 (gate) / T1 /
   T2 / T3 tiers, upstream paths, inline status markers. Kept up to date with
@@ -234,16 +273,23 @@ submitting AI-assisted code, read
   ledger**: one row per change we introduce — what it does vs vLLM, upstream
   PR/commit references, how parity was verified.
 - [.agents/roadmap_v1.md](.agents/roadmap_v1.md) — **THE ROADMAP** (post-MVP,
-  live): closing tracks, research tracks, T1/T2 queue, the feature-level
-  breakdown (→ feature-matrix.md, each gap row delegable via its
-  `.agents/specs/<slug>.md` spec), and the protocol evolution
-  (mirror-as-floor, surpass-by-fusing).
+  live): one ordered portfolio table over the area matrices and current gates.
 - [.agents/completed/roadmap_mvp_v0.md](.agents/completed/roadmap_mvp_v0.md) —
   ARCHIVED M0–M3 record of the completed MVP (both throughput gates passed
   2026-07-10).
-- [.agents/feature-matrix.md](.agents/feature-matrix.md) — **the one-by-one
-  vLLM feature parity table** (what vLLM has vs what we have, every feature:
-  parallelism, quant, serving, spec decode, multimodal, …). Living doc.
+- [.agents/engine-matrix.md](.agents/engine-matrix.md) — canonical stable-ID
+  execution rows for cross-cutting engine/KV/sampling/serving/loading work,
+  with exact code, tests, spike and owner fields.
+- [.agents/feature-matrix.md](.agents/feature-matrix.md) — broad one-by-one
+  cross-cutting vLLM parity coverage view; execution claims use engine-matrix.
+- [.agents/model-matrix.md](.agents/model-matrix.md) — comprehensive pinned-vLLM
+  model architecture/family inventory and port status.
+- [.agents/quantization-matrix.md](.agents/quantization-matrix.md) — canonical
+  per-scheme quantization inventory, with loader/compute/backend/e2e evidence.
+- [.agents/kernel-matrix.md](.agents/kernel-matrix.md) — kernel-family and
+  dispatch parity inventory across vLLM and its runtime dependency chain.
+- [.agents/backend-matrix.md](.agents/backend-matrix.md) — backend/platform and
+  CUDA target matrix, including native-competitor performance gates.
 - [.agents/specs/](.agents/specs/) — live feature implementation specs,
   scoping reports, semantics notes, feasibility studies, and design references.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,

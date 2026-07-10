@@ -2046,3 +2046,67 @@ Validation: PyYAML parses both jobs; the current sm_121a hash drift check passes
 an expected-base/signature inventory so a missing generated bf16 specialization
 cannot report in-sync. GitHub workflow execution is the final validation after
 push.
+
+## 2026-07-10 — Roadmap v1 is tabular, spike-gated, and ready for parallel claims
+
+Closed the user-directed inventory-groundwork block and moved its frozen report
+to `completed/roadmap_v1_inventory_spikes_2026-07-10.md`. The live record now
+has one ordered portfolio table plus six ownership surfaces: the 81-row engine
+matrix, complete pinned-vLLM model inventory, quantization matrix, kernel-family
+matrix, backend/architecture matrix, and the broad feature coverage view.
+
+**Pinned coverage invariants now enforced by CI:**
+
+- engine/serving: 81 stable rows (`9 ANCHOR-BACKFILL`, `17 PARTIAL`, `5 READY`,
+  `50 INVENTORIED`);
+- models: 370 category memberships, 353 unique static architecture IDs, 321
+  category/implementation rows, 307 unique targets, 258 modules, plus the
+  unbounded dynamic Transformers route;
+- quantization: 76 scheme/encoding rows, separating recognition,
+  materialization/repack, native quant compute, real-model gates, and native
+  performance gates;
+- kernels: 30 practical families grounded through vLLM plus FlashInfer,
+  CUTLASS, cuBLASLt, DeepGEMM, Triton/Inductor and other execution owners; and
+- backends: 13 CUDA targets, 18 component-target rules, 8 platform/ABI rows and
+  9 native-competitor gates (48 total).
+
+Every implementation row now follows `INVENTORIED -> SPIKE -> READY -> ACTIVE
+-> GATING -> DONE`; `PARTIAL` and `ANCHOR-BACKFILL` cannot masquerade as done.
+Claims name stable IDs, agent/worktree/branch/file ownership, dependencies and
+hardware. Completed blocks move under `completed/`, while permanent capability
+rows retain their code/test anchors. `scripts/check-agent-record.py` rejects
+dangling links, missing canonical documents, count drift, duplicate IDs,
+invalid states, malformed tables and misplaced top-level specs.
+
+**Audit corrections:** 26 legacy checkmark/partial feature claims had code but
+no leaf spike. They are now exact engine-matrix rows rather than broad `DONE`
+claims. The record narrows generic CUDA graphs to the evidenced Qwen/35B slice,
+sampler support to the implemented host-synchronized subset, structured output
+and tool calling to the native/Hermes subsets, serving to basic transport with
+liveness-only `/health`, safetensors to model-specific mapping, and GGUF to a
+llama.cpp-compatible vllm.cpp deviation (pinned vLLM has no GGUF loader). Source
+provenance comments and README were corrected with the tables.
+
+**Performance floors:** vLLM remains the mandatory CUDA oracle. SGLang
+`v0.5.12.post1` is the initial low-concurrency CUDA comparison at concurrency
+1/2/4/8/16; llama.cpp is the CPU/GGUF and Vulkan floor; Apple uses oMLX
+`v0.5.0rc1` plus MLX-LM, with same-file llama.cpp Metal where applicable. All
+arms use identical workloads, every-axis results and one resource lock across
+the complete series. The first A1 latency campaign is preserved as
+invalid/incomplete because both vLLM startups failed and ours-35B arms aborted;
+it must be diagnosed and rerun rather than reused as evidence.
+
+**Hardware hygiene:** followed the shared flock skill and preserved the active
+PR #3 lock/workspace, both gate checkpoints, APEX GGUF evidence and sources.
+Deleted only rebuildable/stale caches and build trees, reclaiming about 368 GB;
+DGX free space was 359 GB after cleanup.
+
+**Validation:** canonical-record checker reports `ENGINE=81 MODEL=323 QUANT=76
+KERNEL=30 BACKEND=48`; all local Markdown links and table shapes pass; workflow
+YAML parses; `git diff --check` passes; clean incremental CPU build succeeds and
+`ctest --test-dir build-cifix --output-on-failure -j 4` passes 92/92.
+
+**Next in accepted order:** finish/gate PR #3; diagnose and rerun A1; write the
+A5 spike; then claim the C1 raw-pointer adapter-ABI spike, C2 generic model
+factory spike, C3 MTP implementation leaf, and C4 GGUF compute-in-quant spike.
+The D1 architecture-spine spike precedes parallel sm80/sm90 and backend lanes.

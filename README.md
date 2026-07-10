@@ -1,9 +1,11 @@
 # vllm.cpp
 
 A 1:1 port of [vLLM](https://github.com/vllm-project/vllm) to pure C++ —
-no Python, no PyTorch, no ggml at runtime. Same V1 architecture, same
-algorithms, same serving surface; usable as a library (llama.cpp-style) with a
-C API, an example CLI, and an OpenAI-compatible server.
+no Python, no PyTorch, no ggml at runtime. It mirrors the V1 architecture and
+targets the same algorithms and serving surface; the tables below distinguish
+the implemented subset from the remaining parity work. It is usable as a
+library (llama.cpp-style) with a C API, an example CLI, and an
+OpenAI-compatible server.
 
 > ⚠️ **Pre-release, under heavy development.** Both NVFP4 gate models —
 > **Qwen3.6-35B-A3B** (MoE hybrid) and **Qwen3.6-27B** (dense W4A4) — now run the
@@ -20,7 +22,8 @@ C API, an example CLI, and an OpenAI-compatible server.
 
 ## What's implemented (CPU, behaviorally tested)
 
-The full vLLM **V1 engine** runs end-to-end on CPU, ported 1:1 from upstream:
+The vLLM **V1 engine path needed by the two Qwen gate-model text workloads**
+runs end-to-end on CPU:
 
 - **Engine core** — the unified token-budget `Scheduler` (chunked prefill, FCFS
   preemption), hash-based prefix-caching `KVCacheManager` + hybrid KV coordinator
@@ -31,21 +34,26 @@ The full vLLM **V1 engine** runs end-to-end on CPU, ported 1:1 from upstream:
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
   (k-quant→bf16 for the qwen35moe APEX files).
-- **Sampler** — the exact V1 pipeline: greedy (bit-exact vs `torch.argmax`),
-  temperature, top-k/top-p, penalties, min-p/logit-bias/min-tokens, allowed/
-  bad-words, logprobs.
-- **OpenAI server** — `/v1/completions` and `/v1/chat/completions` (SSE streaming
-  + non-streaming), `/v1/models`, `/health`, `/version`; chat templates (a
-  minja-subset Jinja engine); **tool/function calling** (Hermes/Qwen `<tool_call>`
-  parsers, streaming tool-call deltas, `tool_choice` auto/required/named — `auto`
+- **Sampler** — greedy (bit-exact vs `torch.argmax`) plus temperature,
+  top-k/top-p, penalties, min-p and internal logit-filter/logprob primitives.
+  `n`, full random/logprob payload behavior, and request/API wiring for the
+  long-tail controls remain open; some paths synchronize results to the host.
+- **OpenAI server** — basic `/v1/completions` and `/v1/chat/completions`
+  transport (SSE streaming + non-streaming), `/v1/models`, `/health`, and
+  `/version`; `/health` currently reports process liveness rather than probing
+  engine health. Chat templates use a bounded minja-subset Jinja engine.
+  **Tool/function calling** provides Hermes-style `<tool_call>` parsing,
+  streaming tool-call deltas, and `tool_choice` auto/required/named — `auto`
   is *relaxed*: the model may reply in plain text or call a tool, constrained only
   once it starts a call; ⚠️ the Qwen3.6 gate checkpoints' shipped chat template
   uses the **Qwen3-Coder XML** tool format and forced `<think>` blocks, which the
-  current Hermes-JSON parsers and template engine do not yet handle — the
+  current parser (including the local `qwen3` Hermes alias) and template engine
+  do not yet handle — the
   `qwen3_coder` XML parser + reasoning parser + template-engine extensions are
   scoped in `.agents/specs/mm-tools-scoping-2026-07-10.md`); **grammars / structured output** (JSON-schema,
-  `json_object`, regex, choice, GBNF — a native constrained-decoding engine behind
-  vLLM's structured-output seam).
+  `json_object`, regex, choice, GBNF — a native constrained-decoding engine with
+  an explicitly bounded JSON-schema/structural-tag subset behind vLLM's
+  structured-output seam).
 - **Library packaging** — a stable C ABI (`include/vllm.h`), `libvllm` shared +
   static, an example CLI and OpenAI server, and a `dlopen`/FFI consumption path
   (for LocalAI-style embedding via cgo/purego).
@@ -68,7 +76,7 @@ ctest --test-dir build            # the behavioral suite
 # artifacts is a maintainer task: scripts/regen-triton-aot.sh).
 cmake -S . -B build -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
 
-# Serve an OpenAI-compatible endpoint (safetensors dir or a .gguf file)
+# Serve a supported Qwen text checkpoint (safetensors dir or supported 35B .gguf)
 ./build/examples/server --model /path/to/Qwen3.6-35B-A3B --port 8000
 # then: curl localhost:8000/v1/chat/completions -d '{"model":"...","messages":[...]}'
 
@@ -83,7 +91,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass; ≥1.0× throughput parity passed** | ✅ 35B from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack, greedy gates, and production-vLLM throughput gates on GB10** |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy gates pass; ≥1.0× throughput parity passed. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ paged text engine + basic server/tool/grammar subsets; ✅ greedy and production-vLLM throughput gates on GB10 |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -92,17 +100,19 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Backend | Hardware | Status |
 |---|---|---|
-| CPU | x86-64 reference (correctness/CI grade) | ✅ engine + serving end-to-end |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **full paged stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, CUDA-graph decode); both 27B + 35B greedy gates pass token-exact and meet the production-vLLM throughput gate |
+| CPU | x86-64 reference (correctness/CI grade) | ✅ gate-model text engine + basic serving path end-to-end; production threading/quant speed open |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy gates pass token-exact and meet the production-vLLM throughput gate |
+| Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
 | SYCL / XPU | Intel GPUs | 🗓 planned (post-MVP) |
 
 ### Kernels & target hardware
 
-Every op has a portable **CPU reference** (the correctness oracle + the backbone
-other backends port from) and a **CUDA** implementation that mirrors the kernel
-vLLM actually runs (cited to upstream / its deps — flashinfer, cutlass, cuBLASLt).
+The ops exercised by the two GB10 text gates have portable references and CUDA
+implementations grounded in vLLM or its dependencies. This is not a claim of
+complete vLLM-kernel or cross-architecture coverage: the canonical kernel and
+CUDA-target inventories track unimplemented and untraced families separately.
 
 | Op / kernel | Implementation (upstream it mirrors) | CPU | CUDA · Blackwell (GB10, sm_121a) |
 |---|---|:--:|---|
@@ -112,31 +122,33 @@ vLLM actually runs (cited to upstream / its deps — flashinfer, cutlass, cuBLAS
 | Prefill attention | **vendored FlashAttention-2** `flash_fwd_splitkv` (vllm-project/flash-attention @ 2c839c33, the exact kernel vLLM runs; default-on for the bf16 head-256 path, 3.7× vs our WMMA) with the flash-style WMMA kernel as the portable fallback | ✅ ref | ✅ |
 | Decode attention (paged) | FlashInfer-style paged, GQA-fused | ✅ ref | ✅ |
 | GDN / linear-attn (chunk) | tensor-core WY solve — FLA `chunk_delta` | ✅ ref | ✅ |
-| RMSNorm(+residual) → fp4 quant | 2 kernels, PARITY with production vLLM (measured: its Inductor `fused_add_rms_norm` triton kernel + extern `scaled_fp4_quant`; no fp4 norm-quant fusion exists in vLLM 0.24) · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ |
+| RMSNorm(+residual) → fp4 quant | the **traced gate workload** dispatches Inductor `fused_add_rms_norm` + external `scaled_fp4_quant`; FlashInfer also contains fused Add/RMSNorm+FP4 kernels that remain in the upstream kernel inventory · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ gate path |
 | Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
-| CUDA-graph decode | captured decode step (vLLM cudagraph) | — | ✅ (both models) |
-| Sampling (greedy/top-k/top-p/penalties) | vLLM V1 sampler, on-GPU sort-free | ✅ | ✅ |
+| CUDA-graph decode | Qwen-specific captured decode step (vLLM cudagraph) | — | 🟡 explicit 35B capture gate; 27B evidence backfill open |
+| Sampling (greedy/top-k/top-p/penalties) | vLLM V1 ordering subset; some token/logprob paths synchronize to host | ✅ | 🟡 bounded subset |
 | RMSNorm / RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
 
-Arch fallbacks: cutlass fp4×fp4 needs **sm_120a+**; WMMA paths need **sm_80+**;
-cuBLASLt and the software fp4 ladder are portable across CUDA arches. Non-CUDA
-backends (Metal/Vulkan/ROCm/XPU) are 🗓 post-MVP and will port from the CPU ref.
+Only **GB10/sm_121a is built, traced and gated today**. Source-level fallbacks
+suggest routes for other SMs, but none counts as support until its full build,
+correctness, trace and performance block passes. Non-CUDA backends
+(Metal/Vulkan/ROCm/XPU) are post-MVP and will port from the CPU reference.
 
 ## Quantization
 
 | Format | Status |
 |---|---|
 | NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, cutlass sm120a fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass |
-| GGUF quants (Q4_K/Q5_K/Q6_K/Q3_K, Q8_0, F32) | ✅ 35B (qwen35moe) loads + serves from a single real `.gguf` on GB10 (dequant byte-exact vs ggml; greedy token-for-token vs a same-file llama.cpp oracle); 27B GGUF + IQ2_S/IQ4_XS i-quants + NVFP4 GGUF extension type pending (no real files exist yet) |
-| fp8, MXFP4 | 🗓 planned (post-MVP T1) |
+| GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. There is no direct compute-in-quant path or llama.cpp speed parity yet; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
+| FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
+| MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
 
 Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 
 ## Status & caveats (honest)
 
-- **Where we are (GB10 / DGX Spark, sm_121a):** both NVFP4 gate models run the full
-  paged engine end-to-end with **token-exact greedy gates passing**, and all CUDA
-  kernels are validated on real hardware. **Throughput, measured vs vLLM on the same
+- **Where we are (GB10 / DGX Spark, sm_121a):** both NVFP4 gate-model **text paths** run the full
+  paged engine end-to-end with **token-exact greedy gates passing**, and the CUDA
+  kernel paths exercised by those workloads are validated on real hardware. **Throughput, measured vs vLLM on the same
   workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
   *production* config (CUDA graphs + torch.compile — the honest bar) **both gate
   models measure ≥1.0×**: the **35B at 1.02× total throughput with better TTFT (−4%)
@@ -184,6 +196,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 Development is fully documented under [`.agents/`](.agents/) (canonical index in
 [AGENTS.md](AGENTS.md)): the [gates](.agents/gates.md), the [porting inventory](.agents/porting-inventory.md)
 vs upstream vLLM, the [parity ledger](.agents/parity-ledger.md), the [roadmap](.agents/roadmap_v1.md),
+the [engine](.agents/engine-matrix.md), [model](.agents/model-matrix.md),
+[quantization](.agents/quantization-matrix.md), [kernel](.agents/kernel-matrix.md),
+and [backend](.agents/backend-matrix.md) matrices,
 and the [upstream sync protocol](.agents/upstream-sync.md).
 
 ## License

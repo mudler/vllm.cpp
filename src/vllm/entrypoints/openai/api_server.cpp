@@ -156,7 +156,8 @@ ApiServer::DispatchResult ApiServer::handle_models() const {
 }
 
 ApiServer::DispatchResult ApiServer::handle_health() const {
-  // serve/instrumentator/health.py:22 — empty 200 (T0: always healthy).
+  // Upstream calls engine_client.check_health() before returning an empty 200.
+  // This bounded server currently exposes process liveness only.
   DispatchResult out;
   out.status = 200;
   out.content_type = "text/plain";

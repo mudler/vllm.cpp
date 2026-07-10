@@ -80,8 +80,7 @@ typedef struct vllm_engine vllm_engine;
  * fields are borrowed for the duration of the vllm_engine_load call only — the
  * library copies what it needs; the caller retains ownership. */
 typedef struct vllm_model_params {
-  /* Directory holding config.json, tokenizer.json and the *.safetensors shards
-   * (T0: safetensors only). Required. */
+  /* Supported model directory or GGUF file. Required. */
   const char* model_path;
   /* Optional override for tokenizer_config.json; NULL => <model_path>/
    * tokenizer_config.json (unused at T0 blocking-complete, reserved). */

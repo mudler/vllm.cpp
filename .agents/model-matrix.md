@@ -62,7 +62,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 
 | ID | Item | Upstream | Our code + tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|
-| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection, capability metadata, task-aware loader/runner construction | `registry.py:998-1164,1192-1296,1396-1403` | current `ModelForwardFn` hardcodes Qwen3.5 MoE weights; no generic factory test | ☐ spike in progress | `SPIKE` | `CLAIM-MODEL-FACTORY-SPIKE-1` |
+| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection (including subset-supported-list formatting), capability metadata, task-aware loader/runner construction | `registry.py:998-1082,1166-1190,1244-1296,1396-1404` | live dispatch is the `num_experts` `IsDenseArch` branch (`entrypoints/model_loader.cpp:237-279`) which can mis-load an unrelated dense arch as Qwen3.5; `ModelForwardFn` (`models/registry.h:19-30`) is Qwen3.5-MoE-weights-typed; no generic factory test | ✅ [model-factory-registry.md](specs/model-factory-registry.md) | `READY` | unassigned |
 
 ## MODEL-TEXT - Text generation
 

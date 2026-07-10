@@ -130,7 +130,9 @@ The pinned registry has **353 unique static architecture IDs** (370 category
 memberships, 307 implementation targets, 258 modules) plus a dynamic
 Transformers-compatible path. The generic architecture-to-factory registry is
 not ported: one MoE ID is directly registered and the dense gate model uses a
-Qwen-specific `num_experts==0` bypass. See `model-matrix.md`.
+Qwen-specific `num_experts==0` bypass. Its claim-sized implementation contract
+is READY in [model-factory-registry.md](specs/model-factory-registry.md); see
+`model-matrix.md`.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|

@@ -2379,3 +2379,27 @@ for the first released window.
 **Next:** commit/push the claim transition, implement and CPU-test M-mtp-0,
 then hand off the exact DGX oracle commands if the serve campaign still holds
 the GPU.
+
+## 2026-07-10 — C2 model-factory spike recovered, corrected, and READY
+
+Recovered the stopped `aea89f315855d3bfb` stream after it had written an
+uncommitted draft and matrix edit but had not claimed, updated the roadmap, or
+committed. The takeover first established `CLAIM-MODEL-FACTORY-SPIKE-1`, then
+validated the draft against pinned `registry.py`, its tests, and the live C++
+loader/runner path. The accepted
+[model-factory-registry.md](specs/model-factory-registry.md) contract makes
+`MODEL-FACTORY-registry` independently claimable: ordered architecture lookup,
+type-erased factory, exact previous/OOT error branches, subset-registry default
+message parity, capability metadata, both existing Qwen paths re-registered,
+and both gate models required for no-regression closure.
+
+Corrections made during recovery: the pin has 32 previously-supported entries
+(not 36); the full oracle's 353-entry supported list cannot byte-match our
+implemented subset, so that branch is compared against a pinned subset
+`_ModelRegistry`; the registry is a central ordered table (not cross-TU static
+initialization); the public header lives under `include/`; and `score_type` is
+included consistently with the ported registry-property test.
+
+No runtime/support state changed. `MODEL-FACTORY-registry` is `READY`; the next
+C2 implementation is that row, followed by a separately spiked Llama-dense
+family leaf.

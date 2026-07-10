@@ -111,6 +111,20 @@ TEST_CASE("ParallelForRows visits every row exactly once at mixed sizes") {
   }
 }
 
+TEST_CASE("per-op epoch remains valid beyond the upstream signed 16-bit epoch") {
+  // Upstream advances the packed epoch once per graph. Our adaptation advances
+  // it once per op, so a signed 32-bit (epoch << 16) reaches UB after 32767
+  // dispatches. Exercise that boundary explicitly; poll=0 keeps the stress
+  // test bounded while retaining the real park/wake + barrier path.
+  constexpr int kDispatches = 33000;
+  Threadpool pool(2, 0);
+  std::atomic<int64_t> visits{0};
+  for (int i = 0; i < kDispatches; ++i) {
+    pool.Run([&](int, int) { visits.fetch_add(1, std::memory_order_relaxed); });
+  }
+  CHECK(visits.load(std::memory_order_relaxed) == int64_t{kDispatches} * 2);
+}
+
 // test-thread-safety.cpp REDUCED: several host threads submit ops through the
 // same pool concurrently; the pool serializes dispatch and every result is
 // correct. (The full multi-model/multi-context server case is intentionally
@@ -154,6 +168,15 @@ TEST_CASE("concurrent op submission from multiple host threads is serialized") {
   }
   for (auto& t : submitters) t.join();
   CHECK(mismatches.load() == 0);
+}
+
+TEST_CASE("thread safety full multi-context server case is tracked nightly" *
+          doctest::skip(true) *
+          doctest::description("requires SERVE-E2E-NIGHTLY checkpoint provisioning")) {
+  // Porting debt from llama.cpp tests/test-thread-safety.cpp:16-165. This leaf
+  // ports the shared-pool concurrent-submit semantics above; the upstream
+  // multi-model/multi-context real-server case needs checkpoint provisioning
+  // and remains assigned to SERVE-E2E-NIGHTLY (test-porting.md rule 6).
 }
 
 TEST_CASE("thread count: constructor clamps; global pool respects the env contract") {

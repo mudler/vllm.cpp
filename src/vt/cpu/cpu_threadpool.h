@@ -55,9 +55,14 @@ namespace vt::cpu {
 
 // ggml-cpu.c:60 GGML_CACHE_LINE
 inline constexpr size_t kCacheLine = 64;
-// ggml-cpu.c:202-203: n_graph packs (epoch << 16) | n_threads.
-inline constexpr int kNThreadsMask = 0xffff;   // GGML_THREADPOOL_N_THREADS_MASK
-inline constexpr int kNThreadsBits = 16;       // GGML_THREADPOOL_N_THREADS_BITS
+// ggml-cpu.c:202-203: n_graph packs (epoch << 16) | n_threads. Upstream uses
+// an atomic int because it advances once per graph. Our recorded per-OP
+// adaptation advances far more often, so keep the same packed layout in a
+// uint64_t and avoid signed-shift UB / practical epoch rollover on long runs.
+inline constexpr uint64_t kNThreadsMask =
+    0xffffu;  // GGML_THREADPOOL_N_THREADS_MASK
+inline constexpr int kNThreadsBits =
+    16;  // GGML_THREADPOOL_N_THREADS_BITS
 // ggml.h:GGML_MAX_N_THREADS (512).
 inline constexpr int kMaxThreads = 512;
 // ggml.c:8139 ggml_threadpool_params_init: poll = 50 (hybrid polling enabled).
@@ -74,7 +79,7 @@ class Threadpool;
 // (cpumask dropped: affinity not ported, see header note).
 struct ComputeState {
   std::thread thrd;         // ggml_thread_t thrd
-  int last_graph = 0;       // int last_graph
+  uint64_t last_graph = 0;  // widened epoch for the per-OP adaptation
   bool pending = false;     // bool pending
   Threadpool* threadpool = nullptr;
   int ith = 0;
@@ -145,7 +150,7 @@ class Threadpool {
   const std::function<void(int, int)>* work_ = nullptr;  // cgraph/cplan analogue
 
   // synchronization primitives (ggml-cpu.c:478-487)
-  std::atomic<int> n_graph_{0};  // updated when there is work; holds epoch+n_threads
+  std::atomic<uint64_t> n_graph_{0};  // work epoch + active-thread count
   alignas(kCacheLine) std::atomic<int> n_barrier_{0};
   alignas(kCacheLine) std::atomic<int> n_barrier_passed_{0};
   alignas(kCacheLine) std::atomic<int> current_chunk_{0};

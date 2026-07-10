@@ -103,7 +103,7 @@ and reference-engine performance.
 | ID | Block | State | Grounded summary | Detailed evidence / spike |
 |---|---|---|---|---|
 | `QUANT-CUDA-GATES` | NVFP4 W4A16, NVFP4 W4A4, gate-specific FP8 W8A8 | `DONE` | all three native CUDA slices are token/perf-gated on GB10 | quant matrix §2 + [coverage spike](specs/quantization-coverage.md) |
-| `QUANT-GGUF` | llama.cpp encodings and output presets | `PARTIAL` | F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K materialize; F16 was corrected to reader-only; no direct compute-in-quant or llama.cpp speed parity | quant matrix §1 |
+| `QUANT-GGUF` | llama.cpp encodings and output presets | `PARTIAL` | F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K materialize; F16 was corrected to reader-only; CPU threadpool/chunked dispatch is correctness-gated but its B4 speed/RSS checkpoint is pending; no direct compute-in-quant or llama.cpp speed parity | quant matrix §1 |
 | `QUANT-VLLM-BREADTH` | generic FP8/MX, AWQ/GPTQ, CT integer, vendor methods, KV | `PARTIAL` | gate-specific implementations exist; generic dispatch/modes remain inventoried | quant matrix §§2-3 |
 | `QUANT-MLX` | affine Q2-8, MXFP4/MXFP8/NVFP4, QQ, mixed recipes/imports | `INVENTORIED` | required for Apple backend; no MLX runtime yet | quant matrix §4 |
 
@@ -201,7 +201,7 @@ evidence.
 |---|---|---|---|---|
 | `BACKEND-CUDA-SM121` | GB10/sm121a | `PARTIAL` | gate workload built, traced, token/perf gated; full component-family coverage is open | [backend row](backend-matrix.md#cuda-target-rows) |
 | `BACKEND-CUDA-OTHER` | vLLM sm70/75/80/86/87/89/90/100/101/103/110/120 targets | `INVENTORIED` | our global build defaults to 121a; no other target is validated | [backend matrix](backend-matrix.md), [CUDA inventory](specs/cuda-architecture-inventory.md) |
-| `BACKEND-CPU` | production CPU | `PARTIAL` | single-thread scalar correctness path; threadpool and compute-in-quant open | [backend matrix](backend-matrix.md) |
+| `BACKEND-CPU` | production CPU | `PARTIAL` | persistent threadpool + chunked GEMM/row dispatch is 1/3/20-thread bit-identical and TSAN-clean; idle-host performance/RSS gate and compute-in-quant remain open | [backend matrix](backend-matrix.md) |
 | `BACKEND-ROCM` | ROCm | `INVENTORIED` | source/dispatch spike required; no "one flag" support claim | [backend matrix](backend-matrix.md) |
 | `BACKEND-MLX` | Apple Metal through MLX | `INVENTORIED` | M4/16 GB host available; runtime absent | [backend matrix](backend-matrix.md) |
 | `BACKEND-VULKAN` | Vulkan | `INVENTORIED` | runtime absent | [backend matrix](backend-matrix.md) |

@@ -2894,3 +2894,49 @@ ratios. Closure requires both greedy gates unchanged, new-vs-old no regression
 on every axis within reproduced run noise, and the standing ≥1.0× vLLM floors
 retained at 27B c16/c32 and 35B c64. Only then append the closing ledger evidence,
 move `MODEL-FACTORY-registry` `GATING→DONE`, and use the closing commit as owner.
+
+## 2026-07-10 — crash recovery: CPU threadpool W1-W3 complete, row honestly `GATING`
+
+Recovered `CLAIM-QGCT-1` in its original isolated worktree without discarding
+commits `e75ef42`, `0b85ea1`, or `1b8e8cc`; two named stashes preserve the
+pre-recovery uncommitted diff. `HANDSOFF.md` does not exist anywhere under
+`/home/mudler`, so `AGENTS.md`, the accepted leaf spec, and canonical matrices
+were used as the controlling record. The branch was reconciled with current
+`origin/main` by merge `6aab95a` before final validation.
+
+**W1-W3 present and audited:** `src/vt/cpu/cpu_threadpool.{h,cpp}` ports the
+pinned llama.cpp `237ad9b96` native pool/barrier/chunk/park-wake protocol;
+`cpu_ops.cpp` ports mul-mat's 16x16 chunk policy and partitions every registered
+CPU op family by independent output rows/batches. `VLLM_CPP_CPU_THREADS=1`
+retains the inline path; single-row non-GEMM decode work also stays inline.
+Recovery fixes preserve the per-op adaptation over long runs by widening the
+packed epoch to unsigned 64-bit, mirror ggml's TSAN dummy seq-cst RMW in place
+of unsupported standalone fences, and register the full upstream multi-context
+server case as a genuine skipped test rather than a passing message-only case.
+
+**Non-performance gates:** clean post-main CPU/server configure and build;
+serial full suite 94/94 at each of 1, 3, and 20 threads; dedicated upstream-test
+port/determinism suite byte-identical; GCC TSAN-only focused run under
+`setarch x86_64 -R` passed 8 executed cases / 19,595 assertions with one tracked
+`SERVE-E2E-NIGHTLY` skip and no race report. The local 35B GGUF, 35B
+safetensors, and 27B checkpoint gates emitted their absent-checkpoint messages
+and ran zero model assertions; no e2e model claim is inferred from that.
+
+**Why not DONE:** the required B4 same-binary 1-vs-20 throughput/RSS series
+could not be validly run. At 2026-07-10 22:39 UTC this 20-core host still ran
+unowned persistent `llama-cpp-avx512` and `depth-anything-cpp` inference
+processes (about 2.4% and 5.3% CPU), while load average was 7.97/16.15/9.81.
+Per benchmark protocol, a contended result is void; no process was killed or
+perturbed and no number was recorded. `QUANT-GGUF-CPU-THREADPOOL` therefore
+moves `ACTIVE -> GATING`, the implementation claim is released, and README /
+quantization/backend/feature surfaces describe correctness support without a
+speed claim.
+
+**Next:** obtain an exclusive idle window on the same 20-core x86 host, hold
+`/tmp/vllm-cpp-cpu-bench.lock` for the whole series, and run the exact leaf-spec
+recipe: three interleaved identical-binary arms at threads 1 and 20 on
+`Qwen3.5-2B-UD-Q8_K_XL.gguf` (in128/out32, one request, greedy seed 0), recording
+prefill/decode, peak RSS, output tokens, and spread. Require ≥10x on both speed
+axes and ≤1.05x RSS, then refresh clean llama.cpp `237ad9b96` pp/tg/RSS on the
+same idle window. Only that evidence may advance the row to `DONE`; afterward
+claim `QUANT-GGUF-KEEPQ-LOADER` and `QUANT-GGUF-CIQ-GEMM`.

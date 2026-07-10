@@ -2966,8 +2966,9 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
 // SANCTIONED Triton AOT fast-path for the GDN WU (WY-representation) pipeline — the
 // 3 FLA kernels (chunk_scaled_dot_kkt -> solve_tril -> recompute_w_u) that our
 // single fused hand GdnChunkWUWmmaVecKernel mirrors. Fires ONLY at the gate shape.
-// Runtime toggle VT_GDN_WU_TRITON (opt-in). Allocates the two intermediate WY
-// buffers (A raw f32, Ai bf16) as stream-ordered scratch, runs the 3 kernels, and
+// Runtime toggle VT_GDN_WU_TRITON (default ON; =0 restores the hand path).
+// Allocates the two intermediate WY buffers (A raw f32, Ai bf16) as
+// stream-ordered scratch, runs the 3 kernels, and
 // writes u/w (the SAME buffers the hand path fills, consumed downstream by delta_h)
 // — a verified 1:1 drop-in. Returns true iff it launched (caller skips the hand WU).
 bool TryTritonWU(cudaStream_t s, __nv_bfloat16* u, __nv_bfloat16* w, const __nv_bfloat16* k,
@@ -3215,10 +3216,10 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
   const bool wu_vec = wu_wmma && (vec_env == nullptr || vec_env[0] != '0') &&
                       vec_bytes <= static_cast<size_t>(smem_optin);
-  // SANCTIONED Triton AOT WU fast-path (bf16 gate shape only, opt-in via
-  // VT_GDN_WU_TRITON=1). If it fires it produces u/w via the FLA 3-kernel WY
-  // pipeline into the SAME buffers and we skip the hand WU kernels; otherwise the
-  // preserved hand path below runs unchanged (portable contract intact).
+  // SANCTIONED Triton AOT WU fast-path (bf16 gate shape only, default ON;
+  // VT_GDN_WU_TRITON=0 restores the hand path). If it fires it produces u/w via
+  // the FLA 3-kernel WY pipeline into the SAME buffers and skips the hand WU
+  // kernels; otherwise the preserved hand path runs unchanged.
   bool triton_wu = false;
 #ifdef VLLM_CPP_TRITON
   if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {
@@ -3323,10 +3324,10 @@ void LaunchChunkedPrefill(cudaStream_t s, Tensor& out, const Tensor& q_in, const
     // MEASURED (35B NVFP4, in1024/out8, GB10): delta_h 441us baseline ->
     // 398us reg-no-ring -> 345us reg+ring (0.78x); e2e in1024/out128 conc32 np192
     // +0.85% total & prefill, TTFT/TPOT lower. Token-exact (test_ops_gdn 423/423).
-    // SANCTIONED Triton AOT fast-path (bf16 gate shapes only, opt-in via
-    // VT_GDN_DELTAH_TRITON=1). If it fires it launches delta_h into the SAME
-    // buffers and we skip the hand kernels; otherwise the preserved hand-C++
-    // path below runs unchanged (portable contract intact).
+    // SANCTIONED Triton AOT fast-path (bf16 gate shapes only, default ON;
+    // VT_GDN_DELTAH_TRITON=0 restores the hand path). If it fires it launches
+    // delta_h into the SAME buffers and skips the hand kernels; otherwise the
+    // preserved hand-C++ path runs unchanged.
     bool triton_deltah = false;
 #ifdef VLLM_CPP_TRITON
     if constexpr (std::is_same<TSc, __nv_bfloat16>::value) {

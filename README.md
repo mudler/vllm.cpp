@@ -83,7 +83,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass**; throughput near-parity vs vLLM | ✅ 35B from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack + both greedy gates on GB10**; 🚧 throughput parity being closed |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **both run end-to-end on GB10; token-exact greedy gates pass**; ✅ throughput parity vs production vLLM at the MVP gates | ✅ 35B from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ engine + server + tools + grammars on CPU; ✅ **full paged stack + both greedy gates on GB10**; ✅ throughput gates passed |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -93,7 +93,7 @@ As a library, link `libvllm` (or `dlopen` it) and drive the C API in
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | ✅ engine + serving end-to-end |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **full paged stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, WMMA attention/GDN, CUDA-graph decode); both 27B + 35B greedy gates pass token-exact; throughput measured vs vLLM (near-parity, beats eager) — 🚧 **closing the last few % to full parity** |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **full paged stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, WMMA attention/GDN, Triton-AOT GDN, FA-2 prefill, CUDA-graph decode); both 27B + 35B greedy gates pass token-exact; ✅ throughput gates passed vs production vLLM at the MVP operating points (default pure-C++ 35B remains 0.99×; see Status) |
 | Metal | Apple Silicon (MLX vs native MSL under exploration) | 🗓 planned (post-MVP) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
 | SYCL / XPU | Intel GPUs | 🗓 planned (post-MVP) |
@@ -162,17 +162,16 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   wired natively-bf16 (zero cast kernels) and sync-free, measured **3.7× per-kernel
   vs our WMMA** and **+1.5%/+0.5% e2e** (default-on; `VT_FA2_PREFILL=0` falls back
   to the portable WMMA kernel).
-- **The MVP is FULL throughput parity** (≥1.0× vs *production* vLLM on every axis —
-  total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
-  concurrency operating point). We do not stop at "near parity." The gap is being
-  closed by an **execution-traced roadmap**: we `nsys`- and torch-profile vLLM's
-  *actual* kernels (not just its source) and mirror what it runs. Recent measured,
+- **The MVP throughput gate is passed**, and the rule remains full parity: ≥1.0× vs
+  *production* vLLM on every axis — total/output throughput, TTFT, TPOT, memory —
+  for both gate models at their large-concurrency operating point. We do not stop at
+  "near parity." Future performance work stays on the same **execution-traced
+  roadmap**: `nsys`- and torch-profile vLLM's *actual* kernels (not just its source),
+  mirror what it runs, then A/B-measure and gate-check. Recent measured,
   token-exact, default-on wins: register-tiled GDN `delta_h` + `cp.async` ring, a
   blocked tensor-core WY triangular inverse, fused fp8 RMSNorm→quant (quantize-once),
-  and bf16 GDN input I/O. A per-shape fp4-GEMM autotune (**+5.8%** on the 27B at high
-  concurrency) is **default-on** (`VT_FP4_AUTOTUNE=0` opts out). Every step is
-  A/B-measured and
-  gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
+  bf16 GDN input I/O, per-shape fp4-GEMM autotune, and FA-2 prefill attention.
+  The full record is in the [parity ledger](.agents/parity-ledger.md).
   `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
 - No PyTorch / no ggml at build or runtime (ggml is a *format* reference for GGUF
   only). Original runtime/packaging components (the `vt` op runtime, the minja

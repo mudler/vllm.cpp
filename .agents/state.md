@@ -1968,3 +1968,54 @@ porting-inventory):** no 27B GGUF exists anywhere on dgx (and the GGUF loader is
 qwen35moe/qwen3next-only — a dense-27B variant is unwritten); no NVFP4-extension
 -type (id 40) GGUF exists for the gate models (reader traits support it, dequant
 does not); APEX Mini/Quality need IQ2_S/IQ4_XS i-quants (clear error today).
+
+## 2026-07-10 — Triton-AOT follow-up: bf16 chunk_o + scratch pooling (GPU validation pending)
+
+Picked up the post-MVP follow-up from the earlier assessment and implemented the
+non-CUTLASS pieces in worktree `vllm.cpp-codex-triton-aot-analysis`.
+
+**Implemented.**
+- Added bf16-output Triton AOT `chunk_o` specs (`gdn_chunko_bf16_h48/h32`) alongside
+  the existing f32-output specs, gated behind `VLLM_CPP_TRITON_CHUNKO_BF16` until
+  the vendored artifacts are regenerated for the active arch. `TryTritonChunkO<Tout>`
+  now dispatches f32 output and can dispatch bf16 output once that compile define is
+  present.
+- Kept `VT_GDN_OUT_BF16` default OFF. The previous default flip regressed because
+  bf16 output fell off Triton; the source path is now wired, but the default needs
+  regenerated artifacts and a fresh same-binary A/B before changing again.
+- Added per-stream grow-only pools in the Triton-AOT GDN build for chunk scratch
+  (`gcum/u/w/v_new/hstate`) and chunk metadata (`tok0/len/boh/cidx`), plus the WU
+  A/Ai intermediates. A/B escapes: `VT_GDN_TRITON_CHUNK_POOL=0` and
+  `VT_GDN_TRITON_WU_POOL=0`.
+- Integrated with main's vendored Triton AOT artifact workflow:
+  `VLLM_CPP_TRITON_REGEN=ON` is the maintainer path; normal builds consume
+  `src/vt/cuda/triton_aot_vendored/<arch>/` without Python. The bf16 `chunk_o`
+  path stays disabled until those generated files are added.
+- Fixed README status drift: the architecture/backend rows now agree with the
+  header/status section that the MVP throughput gates passed, while preserving the
+  newly closed 35B GGUF real-file parity status from main.
+- Rebased over the GGUF acceptance golden and routed `qwen36_gguf_greedy` out of
+  the generic op-parity runner; `test_qwen36_gguf_engine` owns that full-engine
+  fixture.
+
+**Validation run here.**
+- `git diff --check` PASS.
+- `cmake -S . -B build-cpu -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=OFF` PASS.
+- `cmake --build build-cpu -j$(nproc)` PASS.
+- `ctest --test-dir build-cpu --output-on-failure` PASS (90/90).
+
+**Pending validation.**
+- This environment did not provide a CUDA-capable build/run path, so I could not
+  regenerate artifacts, build `VLLM_CPP_TRITON=ON`, or run the required vLLM
+  comparison here.
+
+**Next CUDA pass.**
+1. Regenerate and check in the full stable AOT artifact bundle under
+   `src/vt/cuda/triton_aot_vendored/<arch>/` for all current bases, including
+   `gdn_chunko_bf16_h{48,32}`.
+2. Configure/build with `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON` and run
+   `test_ops_gdn` through the Triton paths.
+3. Same-binary A/B the new pools (`VT_GDN_TRITON_*_POOL=0`) and
+   `VT_GDN_OUT_BF16=1` before considering any default flip.
+4. Re-run production-vLLM comparisons only after the CUDA build is green; no
+   throughput claim was made in this session.

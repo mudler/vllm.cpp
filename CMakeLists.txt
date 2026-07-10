@@ -317,11 +317,13 @@ if(VLLM_CPP_CUDA)
     # ── SANCTIONED Triton AOT: GDN chunk_o (the output kernel) ──────────────────
     # FLA chunk_o.py chunk_fwd_kernel_o -> triton_kernels/chunk_o.py. Dispatch
     # TryTritonChunkO (VT_GDN_CHUNKO_TRITON) in cuda_gdn.cu; hand GdnChunkOWmmaKernel
-    # preserved as fallback. Two specs (H=48 27B, H=32 35B); K=V=128, Hg=16, BT=64,
-    # BK=BV=64 (grid.x=cdiv(V,BV)=2). USE_G=1, IS_VARLEN=1. o(=out) is f32 (the
-    # default GDN recurrence-output dtype). Grid (cdiv(V,BV), NT, H); H=B*H baked
-    # (varlen B=1), NT is the runtime grid-carrier scalar. scale is PINNED to
-    # Dk^-0.5 inside the kernel (Triton AOT mis-packs fp32 scalars), NOT a sig arg.
+    # preserved as fallback. Two specs per output dtype (H=48 27B, H=32 35B);
+    # K=V=128, Hg=16, BT=64, BK=BV=64 (grid.x=cdiv(V,BV)=2). USE_G=1,
+    # IS_VARLEN=1. o(=out) is f32 for the default GDN recurrence-output dtype and
+    # bf16 for the vLLM-faithful core/z dtype follow-up. Grid (cdiv(V,BV), NT, H);
+    # H=B*H baked (varlen B=1), NT is the runtime grid-carrier scalar. scale is
+    # PINNED to Dk^-0.5 inside the kernel (Triton AOT mis-packs fp32 scalars), NOT
+    # a sig arg.
     # Args: q k v h g o cu_seqlens chunk_indices T NT | H Hg K V BT BK BV USE_G IS_VARLEN.
     foreach(_H 48 32)
       set(VT_GDN_CHUNKO_BK_${_H}     64 CACHE STRING "chunk_o H=${_H} Triton BK")
@@ -330,18 +332,46 @@ if(VLLM_CPP_CUDA)
       set(VT_GDN_CHUNKO_STAGES_${_H} 3  CACHE STRING "chunk_o H=${_H} Triton num_stages")
     endforeach()
     set(_CHUNKO_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/chunk_o.py")
-    set(_CHUNKO_SIG_HEAD "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
+    set(_CHUNKO_SIG_HEAD_F32 "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")
+    set(_CHUNKO_SIG_HEAD_BF16 "*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32")
+    set(_CHUNKO_BF16_AOT_AVAILABLE ${VLLM_CPP_TRITON_REGEN})
+    if(NOT _CHUNKO_BF16_AOT_AVAILABLE)
+      _triton_aot_arch_dir(_TRITON_AOT_ARCH_DIR)
+      if(EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h48.c" AND
+         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h48.h" AND
+         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h32.c" AND
+         EXISTS "${_TRITON_AOT_ARCH_DIR}/gdn_chunko_bf16_h32.h")
+        set(_CHUNKO_BF16_AOT_AVAILABLE ON)
+      endif()
+    endif()
     foreach(_H 48 32)
       set(_CHUNKO_SIG_TAIL "16, 128, 128, 64, ${VT_GDN_CHUNKO_BK_${_H}}, ${VT_GDN_CHUNKO_BV_${_H}}, 1, 1")
       math(EXPR _CHUNKO_GX "(128 + ${VT_GDN_CHUNKO_BV_${_H}} - 1) / ${VT_GDN_CHUNKO_BV_${_H}}")
-      set(_sig "${_CHUNKO_SIG_HEAD}, ${_H}, ${_CHUNKO_SIG_TAIL}")
+      set(_sig "${_CHUNKO_SIG_HEAD_F32}, ${_H}, ${_CHUNKO_SIG_TAIL}")
       add_triton_kernel(VT_GDN_CHUNKO_${_H}_SRCS
         "${_CHUNKO_KPY}" chunk_fwd_kernel_o gdn_chunko_h${_H}
         "${_sig}" "${_CHUNKO_GX},NT,${_H}"
         ${VT_GDN_CHUNKO_WARPS_${_H}} ${VT_GDN_CHUNKO_STAGES_${_H}})
       target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS})
       target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_${_H}_SRCS_INCLUDE_DIR})
+
+      if(_CHUNKO_BF16_AOT_AVAILABLE)
+        set(_sig "${_CHUNKO_SIG_HEAD_BF16}, ${_H}, ${_CHUNKO_SIG_TAIL}")
+        add_triton_kernel(VT_GDN_CHUNKO_BF16_${_H}_SRCS
+          "${_CHUNKO_KPY}" chunk_fwd_kernel_o gdn_chunko_bf16_h${_H}
+          "${_sig}" "${_CHUNKO_GX},NT,${_H}"
+          ${VT_GDN_CHUNKO_WARPS_${_H}} ${VT_GDN_CHUNKO_STAGES_${_H}})
+        target_sources(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS})
+        target_include_directories(vllm PRIVATE ${VT_GDN_CHUNKO_BF16_${_H}_SRCS_INCLUDE_DIR})
+      endif()
     endforeach()
+    if(_CHUNKO_BF16_AOT_AVAILABLE)
+      target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON_CHUNKO_BF16=1)
+    else()
+      message(STATUS
+        "Triton AOT bf16 chunk_o artifacts not present for this arch; "
+        "VT_GDN_OUT_BF16 will use the portable chunk_o fallback until regen")
+    endif()
 
     # ── SANCTIONED Triton AOT: GDN WU pipeline (kkt -> solve_tril -> recompute_w_u)
     # The 3 FLA kernels our single fused GdnChunkWUWmmaVecKernel mirrors; ported so

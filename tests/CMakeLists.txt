@@ -125,6 +125,11 @@ vllm_cpp_add_test(test_backend vt/test_backend.cpp)
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
+# stress + the n_threads 1/3/20 determinism battery. Reaches the internal
+# header under src/ (the pool is not public API).
+vllm_cpp_add_test(test_cpu_threadpool vt/test_cpu_threadpool.cpp)
+target_include_directories(test_cpu_threadpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_nvfp4_matmul vt/test_ops_nvfp4_matmul.cpp)
 vllm_cpp_add_test(test_ops_nvfp4_fp4 vt/test_ops_nvfp4_fp4.cpp)
 vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)

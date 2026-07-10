@@ -1521,7 +1521,13 @@ TEST_CASE("CUDA gdn Triton bf16 chunk_o dispatch and same-stream pools reuse dir
   CHECK(first.wu_pool_allocations == 2);
   CHECK(first.wu_pool_growths == 0);
 
-  // Different data at the same shape reuses dirty buffers on the SAME stream.
+  // Poison every pooled allocation with 0xff: this is NaN for float/bf16
+  // payloads and invalid for the metadata arrays. A correct repeated launch on
+  // the SAME stream must overwrite/zero every byte it may consume. Fresh-zero
+  // allocation behavior cannot accidentally satisfy this assertion.
+  CHECK(vt::cuda::testing::PoisonGdnTritonScratch(gq.q, 0xff) == 11);
+
+  // Different data at the same shape reuses those explicitly dirty buffers.
   const auto reused_diff = RunGdnChunkedVsSequentialOnQueue(
       gpu, gq.q, {0, 150}, 16, 48, 128, 128, bf16, 7310, 3e-2f, 3e-2f);
   CheckUpstreamCutedslTolerances(reused_diff);

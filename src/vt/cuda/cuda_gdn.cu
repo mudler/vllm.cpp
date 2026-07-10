@@ -3676,6 +3676,41 @@ void WarmGdnTritonAotModules(int device) {
   EnsureAllGdnAotModulesLoaded();
 }
 
+size_t PoisonGdnTritonScratch(Queue& queue, unsigned char value) {
+  VT_CHECK(queue.device.type == DeviceType::kCUDA,
+           "PoisonGdnTritonScratch requires a CUDA queue");
+  Check(cudaSetDevice(queue.device.index), "gdn scratch poison set device");
+  const cudaStream_t stream = static_cast<cudaStream_t>(queue.handle);
+  std::shared_ptr<GdnStreamScratch> scratch;
+  {
+    std::lock_guard<std::mutex> lk(GdnScratchPoolMutex());
+    const auto& pool = GdnScratchPool();
+    const auto it = pool.find(GdnStreamKey{queue.device.index, stream});
+    if (it == pool.end()) return 0;
+    scratch = it->second;
+  }
+
+  std::lock_guard<std::mutex> lk(scratch->submit_mu);
+  size_t poisoned = 0;
+  auto poison = [&](GdnScratchBuf& buf) {
+    if (buf.ptr == nullptr) return;
+    Check(cudaMemsetAsync(buf.ptr, value, buf.bytes, stream), "gdn scratch test poison");
+    ++poisoned;
+  };
+  poison(scratch->chunk.gcum);
+  poison(scratch->chunk.u);
+  poison(scratch->chunk.w);
+  poison(scratch->chunk.v_new);
+  poison(scratch->chunk.hstate);
+  poison(scratch->chunk.tok0);
+  poison(scratch->chunk.len);
+  poison(scratch->chunk.boh);
+  poison(scratch->chunk.cidx);
+  poison(scratch->wu.a);
+  poison(scratch->wu.ai);
+  return poisoned;
+}
+
 void ResetGdnTritonDebugStats() {
   GdnDebugCounters& c = GdnCounters();
   c.chunk_o_f32_launches.store(0, std::memory_order_relaxed);

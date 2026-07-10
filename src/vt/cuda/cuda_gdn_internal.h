@@ -1,7 +1,10 @@
 // Internal CUDA GDN pool lifecycle and test instrumentation. Not installed.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+
+#include "vt/device.h"
 
 namespace vt::cuda {
 
@@ -15,6 +18,12 @@ namespace testing {
 // Loads every generated GDN module under the runtime's per-module call_once
 // guards. Exposed only to exercise concurrent first use from multiple queues.
 void WarmGdnTritonAotModules(int device);
+
+// Enqueues a byte-pattern fill over every allocated queue-owned GDN scratch
+// buffer. The dirty-buffer test uses 0xff (NaNs / invalid metadata) to prove a
+// repeated launch initializes every byte it may consume rather than relying on
+// zero-filled fresh allocations. Returns the number of poisoned buffers.
+size_t PoisonGdnTritonScratch(Queue& queue, unsigned char value);
 
 struct GdnTritonDebugStats {
   uint64_t chunk_o_f32_launches = 0;

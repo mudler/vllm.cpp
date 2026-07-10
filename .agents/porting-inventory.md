@@ -57,7 +57,7 @@ what vLLM has vs what we have:
 | Budgets: `max_num_batched_tokens`, `max_num_seqs`, `max_num_scheduled_tokens` | `config/scheduler.py` | T0 ✅ `2f0ea69` |
 | Preemption (FCFS tail pop, recompute) + `SchedulerOutput` new/cached diff protocol | `v1/core/sched/{scheduler,output}.py` | T0 ✅ `4f12158` (`c65e650` SchedulerOutput/NewRequestData/CachedRequestData in the MRV2 shape — prefill_token_ids + resumed-as-new fold) |
 | FCFS request queue | `v1/core/sched/request_queue.py` | T0 ✅ `2f0ea69` |
-| Priority scheduling (`policy="priority"`) | same | T1 |
+| Priority scheduling (`policy="priority"`) | same | T1 🚧 GATING (W4 `ENG-PRIORITY-SCHED`): `PriorityRequestQueue` (heap by `Request.__lt__`) + priority preemption (victim = max `(priority, arrival_time)`) + `priority` plumbed through `Request`/`EngineCoreRequest`/OpenAI field + `SchedulerPolicyFromString`; default stays FCFS. Tests ported: `tests/vllm/v1/test_scheduler.cpp` (12 `test_priority_scheduling_*` cases ← `tests/v1/core/test_scheduler.py:2382,2978`) + `tests/vllm/v1/test_request_queue.cpp` (priority-queue cases + seeded random property ← `tests/v1/core/test_priority_scheduler_random.py`). CPU 93/93 green; GPU G1 token-exact A/B deferred (GPU held) |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill threshold/limits) | `config/scheduler.py` | T1 |
 | Async scheduling (overlap schedule with execution) | `v1/core/sched/async_scheduler.py` | T1 (perf lever for the gate if needed → may promote to T0) |
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | T1 |

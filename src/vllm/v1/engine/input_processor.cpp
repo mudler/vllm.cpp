@@ -99,7 +99,8 @@ void InputProcessor::UpdateFromTokenizer(SamplingParams& params) const {
 
 EngineCoreRequest InputProcessor::process_inputs(
     const std::string& request_id, const std::string& prompt,
-    SamplingParams params, std::optional<double> arrival_time) const {
+    SamplingParams params, std::optional<double> arrival_time,
+    int priority) const {
   // _validate_params: run PostInit()/Verify() on the (cloned) params.
   ValidateParams(params);
 
@@ -123,6 +124,7 @@ EngineCoreRequest InputProcessor::process_inputs(
   request.prompt_token_ids = std::move(prompt_token_ids);
   request.sampling_params = std::move(params);
   request.arrival_time = t;
+  request.priority = priority;
   return request;
 }
 

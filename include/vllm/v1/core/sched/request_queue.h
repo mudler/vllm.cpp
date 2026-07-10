@@ -23,9 +23,11 @@
 //   prepend_requests-> extendleft         : prepends in REVERSE order of the
 //                                           other queue (deque.extendleft)
 //
-// DEFERRED (T1): PriorityRequestQueue (the heap ordered by (priority,
-// arrival_time)). create_request_queue(kPriority) throws — priority scheduling
-// is not ported in T0.
+// PriorityRequestQueue (W4 / ENG-PRIORITY-SCHED): a heap ordered by
+// Request.__lt__ ((priority, arrival_time, request_id, identity)). Requests
+// with a smaller `priority` are handled first; ties break on the earlier
+// arrival_time. create_request_queue(kPriority) returns it. FCFS stays the
+// default (SchedulingPolicy::kFCFS).
 #pragma once
 
 #include <cstddef>
@@ -40,7 +42,7 @@ struct Request;
 // Enum for scheduling policies (mirrors upstream SchedulingPolicy(Enum)).
 enum class SchedulingPolicy {
   kFCFS,      // "fcfs"
-  kPriority,  // "priority" — DEFERRED (T1).
+  kPriority,  // "priority"
 };
 
 // Abstract base class for request queues.
@@ -94,6 +96,35 @@ class FCFSRequestQueue final : public RequestQueue {
 
  private:
   std::deque<Request*> queue_;
+};
+
+// A priority queue backed by a binary heap over Request* ordered by
+// RequestPriorityLess (Request.__lt__: (priority, arrival_time, request_id,
+// identity)). Mirrors upstream PriorityRequestQueue, which wraps a Python list
+// with heapq push/pop/heapify. The heap array (heap_) is maintained with the
+// std::*_heap algorithms using a comparator that inverts RequestPriorityLess so
+// that heap_.front() is the SMALLEST element per __lt__ (= the highest-priority
+// request, the next to schedule).
+//
+// prepend_request(s) is defined by upstream to be a plain heap insert (a
+// priority heap has no "front" to prepend to — the order is re-derived from
+// (priority, arrival_time)).
+class PriorityRequestQueue final : public RequestQueue {
+ public:
+  void add_request(Request* request) override;
+  Request* pop_request() override;
+  Request* peek_request() const override;
+  void prepend_request(Request* request) override;
+  void prepend_requests(const RequestQueue& requests) override;
+  void remove_request(Request* request) override;
+  void remove_requests(const std::vector<Request*>& requests) override;
+  std::size_t size() const override;
+  bool empty() const override;
+  // __iter__: a snapshot in priority (pop) order — the sorted heap contents.
+  std::vector<Request*> ToList() const override;
+
+ private:
+  std::vector<Request*> heap_;
 };
 
 // Create a request queue based on the scheduling policy.

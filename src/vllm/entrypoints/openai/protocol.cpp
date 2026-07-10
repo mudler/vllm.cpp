@@ -207,6 +207,7 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
+  GetOr(j, "priority", r.priority);
   ParseResponseFormat(j, r.response_format);
 }
 
@@ -261,6 +262,7 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   GetOr(j, "include_stop_str_in_output", r.include_stop_str_in_output);
   GetOr(j, "skip_special_tokens", r.skip_special_tokens);
   GetOr(j, "spaces_between_special_tokens", r.spaces_between_special_tokens);
+  GetOr(j, "priority", r.priority);
   ParseResponseFormat(j, r.response_format);
   // tools / tool_choice (chat_completion/protocol.py:217-224).
   if (auto it = j.find("tools"); it != j.end() && it->is_array()) {

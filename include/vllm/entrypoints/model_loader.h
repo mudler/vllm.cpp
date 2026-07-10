@@ -49,6 +49,10 @@ struct EngineParams {
   // product let an 8x1024 (8192-token) prefill run in ONE step, blowing the GDN
   // prefill activation.
   int max_num_batched_tokens = 0;
+  // Scheduling policy (mirrors SchedulerConfig.policy / the vLLM
+  // --scheduling-policy flag). Default fcfs. Set kPriority to schedule by
+  // (priority, arrival_time); requests then carry a `priority` field.
+  vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS;
 };
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
@@ -125,9 +129,9 @@ class LoadedEngine {
   // group-id strings, so this generalizes to any Qwen3.5 layer count.
   static vllm::v1::KVCacheConfig MakeKvConfig(const HfConfig& c, int block_size,
                                               int num_blocks);
-  static vllm::SchedulerConfig MakeSchedulerConfig(int max_model_len,
-                                                   int max_num_seqs,
-                                                   int max_num_batched_tokens);
+  static vllm::SchedulerConfig MakeSchedulerConfig(
+      int max_model_len, int max_num_seqs, int max_num_batched_tokens,
+      vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();

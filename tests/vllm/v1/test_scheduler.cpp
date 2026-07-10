@@ -26,6 +26,8 @@
 //   - max_num_seqs cap         : only max_num_seqs requests run concurrently.
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,6 +43,7 @@
 
 using vllm::SamplingParams;
 using vllm::SchedulerConfig;
+using vllm::SchedulerPolicy;
 using vllm::v1::EngineCoreOutputs;
 using vllm::v1::FinishReason;
 using vllm::v1::FullAttentionSpec;
@@ -577,4 +580,402 @@ TEST_CASE("Scheduler.update_from_output: batched outputs shape") {
   // "a" and "b" produced a token; "c" (still prefilling) produced none.
   CHECK(eco.outputs.size() == 2);
   CHECK(eco.engine_index == 0);
+}
+
+// ===========================================================================
+// Priority scheduling (W4 / ENG-PRIORITY-SCHED).
+// Ported from tests/v1/core/test_scheduler.py @ e24d1b24: the 11
+// test_priority_scheduling_* cases (:2382-2856) +
+// test_priority_scheduling_preemption_and_resumption_when_out_of_kv (:2978),
+// with the create_scheduler_with_priority / create_requests_with_priority
+// helpers (:2155,:2278).
+//
+// DEVIATION (recorded): our M1.3 KVCacheManager only supports the
+// prefix-caching coordinator (enable_caching == false is deferred), so these
+// run with caching ON — exactly like the FCFS scheduler tests above. Upstream's
+// priority tests run with caching OFF (create_scheduler_with_priority default
+// enable_prefix_caching=False). To keep caching ON behaviorally equivalent to
+// caching OFF for the block-math (preemption/resumption) cases, every request is
+// given a DISTINCT prompt (via a distinct `starting_idx`) so there is no
+// cross-request prefix reuse — the tests exercise priority ORDER / victim
+// selection, not the prefix cache. The EC/KV-connector variant (:3769) is not
+// ported (no connectors); only the V2-model-runner, no-connector path is
+// covered (that is our only output path).
+// ===========================================================================
+
+namespace {
+
+// Mirror of test utils.create_scheduler_with_priority (T0 subset): identical to
+// CreateScheduler but policy = priority.
+std::unique_ptr<Scheduler> CreateSchedulerWithPriority(
+    int max_num_seqs = 16, int max_num_batched_tokens = 8192,
+    int num_blocks = 10000, int block_size = 16, int max_model_len = 8192) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = max_num_seqs;
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = max_model_len;
+  cfg.watermark = 0.0;
+  cfg.policy = SchedulerPolicy::kPriority;  // enable priority scheduling.
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = num_blocks;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(block_size, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+
+  return std::make_unique<Scheduler>(cfg, kv_cfg, block_size,
+                                     /*enable_caching=*/true);
+}
+
+// Mirror of test utils.create_requests_with_priority (T0 subset): each request
+// carries a priority + arrival time; prompt = [i + starting_idx] * num_tokens
+// (distinct per i+starting_idx). Default req ids "{i+starting_idx}".
+std::vector<std::unique_ptr<Request>> CreateRequestsWithPriority(
+    int num_requests, const std::vector<int>& priorities,
+    const std::vector<double>& arrival_times = {}, int num_tokens = 10,
+    int max_tokens = 16, const std::vector<std::string>& req_ids = {},
+    int starting_idx = 0) {
+  static bool none_hash_initialized = false;
+  if (!none_hash_initialized) {
+    init_none_hash(sha256_cbor);
+    none_hash_initialized = true;
+  }
+  const int block_size = 16;
+  auto block_hasher = get_request_block_hasher(block_size, sha256_cbor);
+  SamplingParams params;
+  params.max_tokens = max_tokens;
+
+  std::vector<std::unique_ptr<Request>> requests;
+  for (int i = 0; i < num_requests; ++i) {
+    std::string id =
+        req_ids.empty() ? std::to_string(i + starting_idx) : req_ids[i];
+    const double arrival =
+        arrival_times.empty() ? static_cast<double>(i) : arrival_times[i];
+    std::vector<int32_t> prompt(num_tokens,
+                                static_cast<int32_t>(i + starting_idx));
+    requests.push_back(std::make_unique<Request>(
+        id, prompt, params, arrival, block_hasher, priorities[i]));
+  }
+  return requests;
+}
+
+// Collect the scheduled_new_reqs req ids in schedule order.
+std::vector<std::string> ScheduledNewIds(const vllm::v1::SchedulerOutput& out) {
+  std::vector<std::string> ids;
+  for (const auto& nr : out.scheduled_new_reqs) ids.push_back(nr.req_id);
+  return ids;
+}
+
+}  // namespace
+
+// test_priority_scheduling_basic_ordering: lower priority value first.
+TEST_CASE("Priority scheduling: basic priority ordering") {
+  auto scheduler = CreateSchedulerWithPriority();
+  auto requests = CreateRequestsWithPriority(
+      /*num_requests=*/3, /*priorities=*/{2, 0, 1},
+      /*arrival_times=*/{1.0, 2.0, 3.0});
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+
+  CHECK(out.scheduled_new_reqs.size() == 3);
+  // req_1 (prio 0), req_2 (prio 1), req_0 (prio 2).
+  CHECK(ScheduledNewIds(out) == std::vector<std::string>{"1", "2", "0"});
+}
+
+// test_priority_scheduling_arrival_time_tiebreaker: equal priority -> arrival.
+TEST_CASE("Priority scheduling: arrival time tiebreaker") {
+  auto scheduler = CreateSchedulerWithPriority();
+  auto requests = CreateRequestsWithPriority(
+      /*num_requests=*/3, /*priorities=*/{1, 1, 1},
+      /*arrival_times=*/{3.0, 1.0, 2.0});
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+
+  CHECK(out.scheduled_new_reqs.size() == 3);
+  // req_1 (1.0), req_2 (2.0), req_0 (3.0).
+  CHECK(ScheduledNewIds(out) == std::vector<std::string>{"1", "2", "0"});
+}
+
+// test_priority_scheduling_mixed_priority_and_arrival.
+TEST_CASE("Priority scheduling: mixed priority and arrival") {
+  auto scheduler = CreateSchedulerWithPriority();
+  auto requests = CreateRequestsWithPriority(
+      /*num_requests=*/4, /*priorities=*/{2, 1, 1, 0},
+      /*arrival_times=*/{1.0, 3.0, 2.0, 4.0});
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+
+  CHECK(out.scheduled_new_reqs.size() == 4);
+  // req_3 (prio 0), req_2 (prio 1, arr 2), req_1 (prio 1, arr 3), req_0 (prio 2).
+  CHECK(ScheduledNewIds(out) == std::vector<std::string>{"3", "2", "1", "0"});
+}
+
+// test_priority_scheduling_preemption: under KV pressure the lowest-PRIORITY
+// running request is preempted, not the FCFS tail.
+TEST_CASE("Priority scheduling: preempts the lowest-priority running request") {
+  const int block_size = 16;
+  const int num_blocks = 6;             // 1 null -> 5 usable
+  const int num_tokens = block_size * 2;  // 32 tokens = exactly 2 blocks
+  auto scheduler = CreateSchedulerWithPriority(
+      /*max_num_seqs=*/3, /*max_num_batched_tokens=*/200, num_blocks, block_size);
+
+  // Phase 1: low-priority request starts running (distinct prompt via idx 0).
+  auto lo = CreateRequestsWithPriority(1, {5}, {1.0}, num_tokens, /*max_tokens=*/16,
+                                       {"lo1"}, /*starting_idx=*/0);
+  Request* lo1 = lo[0].get();
+  AddRequest(*scheduler, std::move(lo[0]));
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  scheduler->update_from_output(out, MakeRunnerOutput({{"lo1", {100}}}));
+
+  // Phase 2: high-priority request arrives (distinct prompt via idx 1).
+  auto hi = CreateRequestsWithPriority(1, {0}, {2.0}, num_tokens, /*max_tokens=*/16,
+                                       {"hi1"}, /*starting_idx=*/1);
+  AddRequest(*scheduler, std::move(hi[0]));
+  out = scheduler->schedule();
+  bool hi_admitted = false;
+  for (const auto& nr : out.scheduled_new_reqs)
+    if (nr.req_id == "hi1") hi_admitted = true;
+  CHECK(hi_admitted);
+  CHECK(scheduler->running.size() == 2);
+  scheduler->update_from_output(out,
+                                MakeRunnerOutput({{"lo1", {101}}, {"hi1", {100}}}));
+
+  // Phase 3: hi1 needs a 3rd block, 0 free -> preempt the lowest-priority
+  // running request = lo1 (priority 5 > 0).
+  out = scheduler->schedule();
+  CHECK(lo1->status == RequestStatus::kPreempted);
+  bool hi_running = false;
+  for (Request* r : scheduler->running)
+    if (r->request_id == "hi1") hi_running = true;
+  CHECK(hi_running);
+}
+
+// test_priority_scheduling_no_preemption_when_space_available.
+TEST_CASE("Priority scheduling: no preemption when space is available") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/3,
+                                               /*max_num_batched_tokens=*/200);
+  auto lows = CreateRequestsWithPriority(2, {5, 5}, {1.0, 2.0}, /*num_tokens=*/30,
+                                         /*max_tokens=*/16, {"lo1", "lo2"},
+                                         /*starting_idx=*/0);
+  for (auto& r : lows) AddRequest(*scheduler, std::move(r));
+  auto out = scheduler->schedule();
+  scheduler->update_from_output(
+      out, MakeRunnerOutput({{"lo1", {100}}, {"lo2", {100}}}));
+
+  auto hi = CreateRequestsWithPriority(1, {0}, {3.0}, /*num_tokens=*/30,
+                                       /*max_tokens=*/16, {"hi1"},
+                                       /*starting_idx=*/2);
+  AddRequest(*scheduler, std::move(hi[0]));
+  out = scheduler->schedule();
+
+  CHECK(out.scheduled_new_reqs.size() == 1);  // hi1 admitted, no preemption
+  CHECK(scheduler->running.size() == 3);
+  CHECK(scheduler->waiting->empty());
+}
+
+// test_priority_scheduling_preemption_victim_selection: waiting queue order.
+TEST_CASE("Priority scheduling: victim selection / waiting queue order") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/1);
+  auto requests = CreateRequestsWithPriority(3, {3, 2, 0}, {1.0, 2.0, 3.0},
+                                             /*num_tokens=*/10);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == "2");  // highest priority
+
+  auto waiting = scheduler->waiting->ToList();
+  REQUIRE(waiting.size() == 2);
+  CHECK(waiting[0]->priority == 2);
+  CHECK(waiting[1]->priority == 3);
+  CHECK(waiting[0]->request_id == "1");
+  CHECK(waiting[1]->request_id == "0");
+}
+
+// test_priority_scheduling_equal_priority_preemption: arrival tiebreak in wait.
+TEST_CASE("Priority scheduling: equal priority -> arrival tiebreak in waiting") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/1);
+  auto requests = CreateRequestsWithPriority(3, {2, 2, 2}, {3.0, 1.0, 2.0},
+                                             /*num_tokens=*/10);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == "1");  // earliest arrival (1.0)
+
+  auto waiting = scheduler->waiting->ToList();
+  REQUIRE(waiting.size() == 2);
+  CHECK(waiting[0]->arrival_time == 2.0);
+  CHECK(waiting[1]->arrival_time == 3.0);
+  CHECK(waiting[0]->request_id == "2");
+  CHECK(waiting[1]->request_id == "0");
+}
+
+// test_priority_scheduling_waiting_queue_order.
+TEST_CASE("Priority scheduling: waiting queue maintains priority order") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/1);
+  auto requests = CreateRequestsWithPriority(4, {3, 1, 2, 0},
+                                             {1.0, 2.0, 3.0, 4.0},
+                                             /*num_tokens=*/10);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == "3");  // priority 0
+
+  auto waiting = scheduler->waiting->ToList();
+  REQUIRE(waiting.size() == 3);
+  std::vector<std::string> ids;
+  std::vector<int> prios;
+  for (Request* r : waiting) {
+    ids.push_back(r->request_id);
+    prios.push_back(r->priority);
+  }
+  CHECK(ids == std::vector<std::string>{"1", "2", "0"});
+  CHECK(prios == std::vector<int>{1, 2, 3});
+}
+
+// test_priority_scheduling_fcfs_fallback: equal priority -> FCFS by arrival.
+TEST_CASE("Priority scheduling: FCFS fallback when priorities equal") {
+  auto scheduler = CreateSchedulerWithPriority();
+  auto requests = CreateRequestsWithPriority(4, {1, 1, 1, 1},
+                                             {4.0, 1.0, 3.0, 2.0},
+                                             /*num_tokens=*/10);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 4);
+  // Arrival order: req_1 (1.0), req_3 (2.0), req_2 (3.0), req_0 (4.0).
+  CHECK(ScheduledNewIds(out) == std::vector<std::string>{"1", "3", "2", "0"});
+}
+
+// test_priority_scheduling_with_limited_slots.
+TEST_CASE("Priority scheduling: max_num_seqs limits to highest priorities") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/2,
+                                               /*max_num_batched_tokens=*/1000);
+  auto requests = CreateRequestsWithPriority(4, {3, 1, 2, 0},
+                                             {1.0, 2.0, 3.0, 4.0},
+                                             /*num_tokens=*/10);
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  auto out = scheduler->schedule();
+  REQUIRE(out.scheduled_new_reqs.size() == 2);
+  auto ids = ScheduledNewIds(out);
+  // The 2 highest priorities: req_3 (prio 0), req_1 (prio 1).
+  CHECK(std::find(ids.begin(), ids.end(), "3") != ids.end());
+  CHECK(std::find(ids.begin(), ids.end(), "1") != ids.end());
+
+  auto waiting = scheduler->waiting->ToList();
+  REQUIRE(waiting.size() == 2);
+  CHECK(waiting[0]->priority == 2);
+  CHECK(waiting[1]->priority == 3);
+  CHECK(waiting[0]->request_id == "2");
+  CHECK(waiting[1]->request_id == "0");
+}
+
+// test_priority_scheduling_heap_property: scheduling one at a time (finishing
+// each) drains requests in ascending-priority order.
+TEST_CASE("Priority scheduling: schedules in ascending priority order") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/1);
+  const std::vector<int> priorities = {5, 1, 8, 3, 2, 7, 4, 6};
+  std::vector<double> arrivals;
+  for (std::size_t i = 0; i < priorities.size(); ++i)
+    arrivals.push_back(static_cast<double>(i));
+  auto requests = CreateRequestsWithPriority(
+      static_cast<int>(priorities.size()), priorities, arrivals,
+      /*num_tokens=*/10);
+  // Map req id -> priority for the recording step.
+  std::map<std::string, int> id_to_priority;
+  for (auto& r : requests) id_to_priority[r->request_id] = r->priority;
+  for (auto& r : requests) AddRequest(*scheduler, std::move(r));
+
+  std::vector<int> scheduled_priorities;
+  while (!scheduler->waiting->empty()) {
+    auto out = scheduler->schedule();
+    if (!out.scheduled_new_reqs.empty()) {
+      const std::string& id = out.scheduled_new_reqs[0].req_id;
+      scheduled_priorities.push_back(id_to_priority[id]);
+      scheduler->update_from_output(out, MakeRunnerOutput({{id, {100}}}));
+      scheduler->finish_requests(id, RequestStatus::kFinishedStopped);
+    }
+  }
+
+  std::vector<int> expected = priorities;
+  std::sort(expected.begin(), expected.end());
+  CHECK(scheduled_priorities == expected);
+}
+
+// test_priority_scheduling_preemption_and_resumption_when_out_of_kv (V2 model
+// runner, no connector variant).
+TEST_CASE("Priority scheduling: preemption then resumption when out of KV") {
+  auto scheduler = CreateSchedulerWithPriority(/*max_num_seqs=*/2,
+                                               /*max_num_batched_tokens=*/200,
+                                               /*num_blocks=*/5,
+                                               /*block_size=*/16);
+
+  // request_low: priority 1, 30 tokens (distinct prompt via idx 0).
+  auto lo = CreateRequestsWithPriority(1, {1}, {0.0}, /*num_tokens=*/30,
+                                       /*max_tokens=*/16, {}, /*starting_idx=*/0);
+  const std::string low_id = lo[0]->request_id;
+  Request* low = lo[0].get();
+  AddRequest(*scheduler, std::move(lo[0]));
+
+  // 1st schedule.
+  auto out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  CHECK(scheduler->waiting->empty());
+  CHECK(scheduler->running.size() == 1);
+  // 1st decode.
+  scheduler->update_from_output(out, MakeRunnerOutput({{low_id, {100}}}));
+
+  // request_high: priority 0, 32 tokens (distinct prompt via idx 1).
+  auto hi = CreateRequestsWithPriority(1, {0}, {1.0}, /*num_tokens=*/32,
+                                       /*max_tokens=*/16, {}, /*starting_idx=*/1);
+  const std::string high_id = hi[0]->request_id;
+  AddRequest(*scheduler, std::move(hi[0]));
+
+  // 2nd schedule: KV cache becomes full (0 free blocks).
+  out = scheduler->schedule();
+  CHECK(scheduler->kv_cache_manager->block_pool.get_num_free_blocks() == 0);
+  CHECK(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_cached_reqs.num_reqs() == 1);
+  CHECK(scheduler->waiting->empty());
+  CHECK(scheduler->running.size() == 2);
+  // 2nd decode.
+  scheduler->update_from_output(
+      out, MakeRunnerOutput({{low_id, {100}}, {high_id, {100}}}));
+
+  // 3rd schedule: triggers priority preemption of request_low.
+  out = scheduler->schedule();
+  CHECK(out.scheduled_new_reqs.empty());
+  CHECK(out.scheduled_cached_reqs.num_reqs() == 1);
+  CHECK(out.scheduled_cached_reqs.req_ids[0] == high_id);
+  CHECK(scheduler->requests.at(low_id)->status == RequestStatus::kPreempted);
+  CHECK(scheduler->waiting->size() == 1);
+  CHECK(scheduler->running.size() == 1);
+  // 3rd decode: low produced nothing (preempted), high produced a token.
+  scheduler->update_from_output(
+      out, MakeRunnerOutput({{low_id, {}}, {high_id, {100}}}));
+  // Finish high so the preempted low can resume.
+  scheduler->finish_requests(high_id, RequestStatus::kFinishedStopped);
+
+  // 4th schedule: request_low resumes. V2: folded into scheduled_new_reqs
+  // carrying its full token ids in prefill_token_ids (30 prompt + 2 decoded).
+  out = scheduler->schedule();
+  CHECK(scheduler->waiting->empty());
+  CHECK(scheduler->running.size() == 1);
+  CHECK(out.scheduled_cached_reqs.num_reqs() == 0);
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.scheduled_new_reqs[0].req_id == low_id);
+  const auto& seed = out.scheduled_new_reqs[0].prefill_token_ids;
+  REQUIRE(seed.has_value());
+  CHECK(seed->size() == 32);
+  CHECK((*seed)[31] == 100);
+  (void)low;
 }

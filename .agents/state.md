@@ -2310,3 +2310,48 @@ First leaf of the async-serving block (`ROAD-V1-C6`, spec
 **Next:** claim W2 (`SERVE-ASYNC-LLM`) on the merged queue split (unblocks
 `ROAD-V1-A` latency axes); run W1's G1/G4 when the GPU frees; W3 async
 default mirror; W4 priority separable.
+
+## 2026-07-10 — W4 `ENG-PRIORITY-SCHED` implemented (async-serving block leaf 4), GATING
+
+Ported vLLM priority scheduling 1:1 (pin e24d1b24), fully separable from W1–W3.
+- **PriorityRequestQueue** (`src/vllm/v1/core/sched/request_queue.cpp:101`,
+  header `include/.../request_queue.h:112`): binary heap over `Request*` ordered
+  by `RequestPriorityLess` (`Request.__lt__`: (priority, arrival_time,
+  request_id, identity)) via std::*_heap; `create_request_queue(kPriority)` now
+  returns it instead of throwing.
+- **Priority preemption** (`src/vllm/v1/core/sched/scheduler.cpp:178`): under the
+  priority policy the OOM victim is `max(running, key=(priority, arrival_time))`
+  with the scheduled-this-step undo (restore budget, drop blocks, `req_index -=
+  1`), mirroring `scheduler.py:546-572`. FCFS tail-pop unchanged; **default stays
+  FCFS** (byte-identical).
+- **`priority` plumbing**: `Request.priority` + `RequestPriorityLess`
+  (`request.{h,cpp}`), `EngineCoreRequest.priority`, OpenAI `priority` request
+  field (`protocol.{h,cpp}`) → serving handlers → `LLMEngine::add_request`/
+  `generate` → `InputProcessor::process_inputs` → `EngineCoreRequest` → `Request`.
+- **Policy config surface**: `SchedulerPolicyFromString`/`SchedulerPolicyToString`
+  (`config/scheduler.cpp:21`, reject-unknown mirrors upstream `SchedulingPolicy(value)`
+  ValueError) + `EngineParams.policy` → `MakeSchedulerConfig`.
+- **Tests ported** (test-porting.md, same change): 12 `test_priority_scheduling_*`
+  cases → `tests/vllm/v1/test_scheduler.cpp:674` (from `test_scheduler.py:2382-2856,2978`,
+  incl. the preemption-then-resumption-out-of-KV V2/no-connector case); 14
+  priority-queue cases + the seeded random ordering/heap-property property test →
+  `tests/vllm/v1/test_request_queue.cpp:238,429` (from `test_priority_scheduler_random.py`).
+  DEVIATION recorded: M1.3 KVCacheManager forces caching ON (enable_caching=false
+  deferred), so the ported block-math cases give each request a DISTINCT prompt to
+  make caching-ON behaviorally equal upstream's caching-OFF; EC/KV-connector
+  `test_scheduler.py:3769` variant not ported (no connectors).
+- **G2 green**: clean full CPU build zero warnings; ctest **93/93**
+  (test_scheduler 29 cases/238 asserts, test_request_queue 26 cases/1839 asserts).
+- **GATING, honestly**: G1 (both greedy engine gates re-run priority-vs-fcfs
+  token-exactness) needs the GB10, which `CLAIM-SERVE-GATE-1` holds — DEFERRED to
+  the next GPU-idle window and recorded in the engine-matrix row + handoff queue.
+  Priority is NOT the default, so the greedy gates run FCFS unchanged; the
+  priority-vs-fcfs token-exact A/B runs before the row may claim DONE. Row
+  `GATING`, not `DONE`. Server surface: added `--scheduling-policy fcfs|priority`
+  to `examples/server/main.cpp` (→ `EngineParams.policy`), mirroring vLLM's flag;
+  reject-unknown via `SchedulerPolicyFromString`. README arch/quant/accel tables
+  untouched (priority is a scheduler knob, not a new arch/backend/quant surface;
+  default behavior is unchanged FCFS).
+
+**Next:** claim W2 (`SERVE-ASYNC-LLM`); run W1+W4 GPU G1 when the GPU frees;
+W3 async-overlap default mirror.

@@ -14,7 +14,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Engine and scheduling | 13 | 3 | 3 | 0 | 2 | 0 | 1 | 4 |
+| Engine and scheduling | 13 | 3 | 3 | 0 | 1 | 0 | 2 | 4 |
 | KV cache and memory | 16 | 2 | 2 | 0 | 1 | 0 | 0 | 11 |
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
@@ -24,7 +24,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **90** | **9** | **17** | **0** | **9** | **1** | **1** | **53** |
+| **Total** | **90** | **9** | **17** | **0** | **8** | **1** | **2** | **53** |
 
 ## Engine core and scheduling
 
@@ -36,7 +36,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `ENG-PREEMPT-RECOMPUTE` | FCFS tail preemption with recompute | T0 | `vllm/v1/core/sched/scheduler.py:1142`; `tests/v1/core/test_scheduler.py:930` | `src/vllm/v1/core/sched/scheduler.cpp:102,157`; `src/vllm/v1/core/sched/request_queue.cpp:36` | `tests/vllm/v1/test_scheduler.cpp:247,295`; `tests/vllm/v1/test_request_queue.cpp:91` | `planned: specs/preemption.md` | `ANCHOR-BACKFILL` | - |
 | `ENG-CUDAGRAPH` | Decode graph capture/replay modes | T0 | `vllm/config/compilation.py:53,1319`; `vllm/v1/worker/gpu/cudagraph_utils.py:116`; `tests/compile/test_config.py:122,229` | `src/vt/cuda/cuda_backend.cu:76,97,105`; `src/vllm/model_executor/models/qwen3_5.cpp:3754,3952`; `src/vllm/v1/worker/gpu/runner.cpp:577,597` | `tests/vt/test_cuda_backend.cpp:98`; explicit 35B gate `tests/parity/test_qwen36_paged_engine.cpp:140` | `planned: specs/cuda-graphs.md` | `PARTIAL` | - |
 | `ENG-ASYNC-SCHED` | Async/overlap scheduling (AsyncScheduler placeholders + depth-2 batch-queue step + async D2H on a copy stream); vLLM's DEFAULT at the pin — unmet mirror obligation per B3 | T1 | `vllm/v1/core/sched/async_scheduler.py:12`; `vllm/config/vllm.py:990,1038`; `vllm/v1/engine/core.py:519`; `vllm/v1/worker/gpu/async_utils.py:12` | - | - | [async-serving.md](specs/async-serving.md) | `READY` | - |
-| `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203`; `vllm/v1/core/sched/scheduler.py:546` | - | - | [async-serving.md](specs/async-serving.md) | `READY` | - |
+| `ENG-PRIORITY-SCHED` | Priority request queue + policy + priority preemption + `priority` plumbing (Request/EngineCoreRequest/OpenAI field); W4 of the async-serving block. Default stays FCFS. GATING: full CPU tier green (93/93; 12 ported priority-scheduler cases + 14 priority-queue cases incl. the seeded random property test); GPU G1 (both greedy engine gates, priority-vs-fcfs token-exactness) deferred to the next GPU-idle window — GPU held by the `SERVE-GATE-ONLINE` campaign | T1 | `vllm/v1/core/sched/request_queue.py:131,201`; `vllm/v1/core/sched/scheduler.py:546`; `vllm/config/scheduler.py:109`; `tests/v1/core/test_scheduler.py:2382,2978`; `tests/v1/core/test_priority_scheduler_random.py:1` | `src/vllm/v1/core/sched/request_queue.cpp:101,186`; `src/vllm/v1/core/sched/scheduler.cpp:178`; `src/vllm/v1/request.cpp:92`; `src/vllm/config/scheduler.cpp:21` | `tests/vllm/v1/test_scheduler.cpp:674,916`; `tests/vllm/v1/test_request_queue.cpp:238,429` | [async-serving.md](specs/async-serving.md) | `GATING` | - |
 | `ENG-PARTIAL-PREFILL` | Concurrent partial-prefill and long-prompt limits | T1 | `vllm/config/scheduler.py:70-80` | - | - | `planned: specs/partial-prefill-concurrency.md` | `INVENTORIED` | - |
 | `ENG-BATCH-QUEUE` | Pipelined `step_with_batch_queue` | T1 | `vllm/v1/engine/core.py:519` | - | - | `planned: specs/batch-queue-step.md` | `INVENTORIED` | - |
 | `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); W1 of the async-serving block. Implemented: `EngineCoreProc` (queues, run_busy_loop, shutdown drain/abort, WAKEUP, ENGINE_CORE_DEAD) + `InprocClient` on a dedicated engine thread; sync `LLMEngine` path untouched; UTILITY/DP/aborts-queue/step_with_batch_queue deferred per spec. GATING: CPU suites green; GPU G1 (token-exact twins) + G4 (no-throughput-regression) deferred to the gating handoff — GPU held by the `SERVE-GATE-ONLINE` campaign | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | `include/vllm/v1/engine/core_proc.h:150`; `src/vllm/v1/engine/core_proc.cpp:51`; `src/vllm/v1/engine/core_client.cpp:33` | `tests/vllm/v1/test_engine_core_proc.cpp:188,314,395` (9 cases, 82 asserts; CPU ctest 93/93) | [async-serving.md](specs/async-serving.md) | `GATING` | - |

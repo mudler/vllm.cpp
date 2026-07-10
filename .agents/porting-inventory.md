@@ -394,6 +394,26 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     OFF; the earlier −4.3% attempt was the f32↔bf16 cast glue + a per-layer
     D2H sync, both removed (see parity-ledger 2026-07-10).**
 
+12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common
+    `vt::` surface now carries upstream-compatible semantic scalar IDs separate
+    from storage dtype, layout/shape/element-stride descriptors, typed op
+    registration, monotonic queue identity, named workspace roles and explicit
+    device-resource free functions. CUDA's new `cuda_dropin.{h,cu}` ports the
+    device/current-stream boundary from
+    `csrc/libtorch_stable/torch_utils.h:20-82` and binds a test-only Layer A to
+    a raw pointer/geometry/scalar/workspace/stream Layer B; its workspace pool
+    mirrors `torch::stable::new_empty` caching and FlashInfer's caller-owned
+    first-use-zero contract. Ported tests map
+    `tests/cuda/test_cuda_context.py:54-83` and
+    `tests/v1/cudagraph/test_cudagraph_dispatch.py:271-354` to
+    `tests/vt/test_dropin_abi.cpp`. No production family uses this helper yet.
+    Narrow-scope deviations/debt are explicit: `W0-SCALAR-FORWARDER` keeps the
+    exact `ScalarType::id()` vocabulary in `ops.h` until the first family claim
+    may safely replace the vendored Marlin header with a common forwarder;
+    `W0-BACKEND-SHIM` leaves old `Backend` virtual calls as index-0 shims while
+    new adapters use the device-explicit free functions. CPU 94/94 is green;
+    CUDA cross-build/runtime/capture/model/trace evidence remains `W0-GPU`.
+
 9.N **Triton CUDA fast-path for PROVEN codegen-bound kernels (User-sanctioned
     2026-07-09; extends the "vendor a proven kernel when we can't match it" clause).**
     For a kernel where portable C++ is *measured-exhausted* against vLLM's compiler

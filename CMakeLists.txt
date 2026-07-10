@@ -224,6 +224,7 @@ if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)
   target_sources(vllm PRIVATE
     src/vt/cuda/cuda_backend.cu
+    src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu

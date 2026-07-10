@@ -50,10 +50,35 @@ class Backend {
   virtual void DestroyGraph(void* graph);
 };
 
+// Device-explicit resource vocabulary for new kernel adapters. Existing
+// Backend::{Alloc,Free,CreateQueue,DestroyQueue} methods remain temporary
+// index-0 migration shims for production call sites that predate the drop-in
+// ABI. New adapter code must use these free functions so device index and queue
+// cleanup are never ambient.
+struct DeviceResourceOps {
+  using AllocFn = void* (*)(Device, size_t);
+  using FreeFn = void (*)(Device, void*);
+  using CreateQueueFn = Queue (*)(Device);
+  using DestroyQueueFn = void (*)(Queue&);
+
+  AllocFn alloc = nullptr;
+  FreeFn free = nullptr;
+  CreateQueueFn create_queue = nullptr;
+  DestroyQueueFn destroy_queue = nullptr;
+};
+
+void* Alloc(Device device, size_t bytes);
+void Free(Device device, void* p);
+Queue CreateQueue(Device device);
+void DestroyQueue(Queue& q);
+
 Backend& GetBackend(DeviceType type);
 // Threading contract: all registration must complete before main() runs
 // (backends register via static initializers). After that, GetBackend is
 // lock-free reads only; no synchronization is performed.
 void RegisterBackend(DeviceType type, Backend* backend);
+// Static-initializer contract matches RegisterBackend. A backend-neutral
+// fallback serves index 0 when no device-specific table is registered.
+void RegisterDeviceResourceOps(DeviceType type, const DeviceResourceOps* ops);
 
 }  // namespace vt

@@ -1,10 +1,39 @@
 # Drop-in kernel ABI (`BACKEND-ABI-VT`) — implementation spike
 
-Status: accepted implementation spike once this document and its owning record
-rows merge. Pins: vLLM `e24d1b24fe96`, CUTLASS `v4.4.2`, vLLM
+Status: accepted implementation spike; W0 additive spine is `GATING` on the
+implementation branch. Pins: vLLM `e24d1b24fe96`, CUTLASS `v4.4.2`, vLLM
 FlashAttention `2c839c33`, and the dependency revisions recorded by the pinned
 vLLM build. This is a design and execution plan, not an implementation or a
 claim that another kernel/backend is supported.
+
+### W0 implementation checkpoint (2026-07-10)
+
+The narrow W0 claim has implemented the backend-neutral scalar-ID/layout/
+tensor descriptor, monotonic queue identity, typed op registration, explicit
+device-resource free functions, CUDA device/stream guard, queue-scoped
+workspace roles and initialization policies, device scalars, capture-time
+growth rejection, cleanup, and a raw-signature probe. The matching upstream
+CUDA-context and graph-capture cases are ported in
+`tests/vt/test_dropin_abi.cpp`; the clean CPU build and 94/94 CPU tests pass.
+No production launcher uses the helper yet, so no kernel-family support or
+throughput state changed and README remains unchanged.
+
+The row remains `GATING`, not `DONE`, under these named W0 debts:
+
+- `W0-GPU`: clean CUDA cross-builds for `80`, `90a`, and `121a`, then GB10
+  probe/workspace/capture runtime and both gate-model correctness/trace/memory
+  checks. The shared GB10 is held by `CLAIM-SERVE-GATE-1`; exact handoff below.
+- `W0-SCALAR-FORWARDER`: W0 carries the exact upstream `ScalarType::id()` bit
+  vocabulary in `include/vt/ops.h`, verified against the vendored Marlin
+  header. Promoting that vendored class to one common forwarding header would
+  touch an unclaimed production-kernel include, so it is deliberately deferred
+  to the first family-migration claim; duplicate semantic IDs are forbidden.
+- `W0-BACKEND-SHIM`: new adapters use `vt::{Alloc,Free,CreateQueue,DestroyQueue}`
+  and CUDA registers device-index-aware callbacks in `cuda_dropin.cu`. Existing
+  `Backend` virtual calls remain explicit index-0 migration shims because the
+  production CPU/CUDA backend TUs were outside W0 ownership. Each family claim
+  removes its direct shim use; the ABI row cannot close while adapter resources
+  can bypass queue cleanup.
 
 The objective is to reshape the `vt::` CUDA/ROCm **adapter boundary** around
 the raw pointer, shape, stride, semantic dtype, workspace, device, and stream
@@ -292,6 +321,46 @@ cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
 cmake --build build-cpu --clean-first -j"$(nproc)"
 ctest --test-dir build-cpu --output-on-failure
 ```
+
+Deferred W0 GPU handoff (run only after `CLAIM-SERVE-GATE-1` releases the
+shared machine; compilation itself needs no lock, execution holds one lock for
+the whole series):
+
+```sh
+ssh dgx.casa
+export PATH=/usr/local/cuda/bin:$PATH
+git -C ~/work/vllm.cpp-backend-abi-w0 fetch origin codex/backend-abi-vt-w0
+git -C ~/work/vllm.cpp-backend-abi-w0 checkout --detach FETCH_HEAD
+
+for arch in 80 90a 121a; do
+  cmake -S ~/work/vllm.cpp-backend-abi-w0 \
+    -B ~/work/vllm.cpp-backend-abi-w0/build-cuda-${arch} \
+    -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
+    -DVLLM_CPP_CUDA_ARCHITECTURES=${arch}
+  cmake --build ~/work/vllm.cpp-backend-abi-w0/build-cuda-${arch} \
+    --clean-first -j"$(nproc)"
+done
+
+flock /tmp/gpu -c '
+  set -eu
+  cd ~/work/vllm.cpp-backend-abi-w0
+  ctest --test-dir build-cuda-121a \
+    -R "test_dropin_abi|test_cuda_backend|test_qwen27_paged_engine|test_qwen36_paged_engine" \
+    --output-on-failure
+  compute-sanitizer --tool memcheck --error-exitcode=99 \
+    ./build-cuda-121a/tests/test_dropin_abi
+'
+```
+
+Then resolve and record the exact snapshot directories beneath the two model
+roots in `.agents/environment.md`; compare the parent-main and W0 binaries with
+the same `vllm-bench` commands at 27B `np=96,c=16` and `np=192,c=32`, and 35B
+`np=200,c=64`, with 2–3 interleaved runs. One additional flock-held nsys pair
+must show the production kernel lists/call counts unchanged and no W0 workspace
+allocator calls outside `test_dropin_abi`; record total/output throughput,
+req/s, TTFT, TPOT/ITL, peak memory, temperatures, commands, commits, and ratios.
+Because W0 has no production-family call site, any non-noise model delta is a
+regression, not a claimed ABI gain.
 
 Exact GB10 build/test/profile skeleton (run in a dedicated synced clone; the
 family migration substitutes its test and `VT_DROPIN_<FAMILY>` selector):

@@ -3111,3 +3111,20 @@ the two PR3 kernel rows remain `ACTIVE` under `CLAIM-PR3`. The existing
 baseline evidence only; after it releases the device, the canonical handoff
 queue supplies the post-W2 serving gates followed by the queued ABI, MTP,
 model-registry and PR3 GPU closures.
+
+## 2026-07-10 — C5 W1 sliding-window KV leaf claimed while DGX remains occupied
+
+`CLAIM-C5-SW-KV-1` moves `KV-SLIDING-WINDOW-SPEC` `READY -> ACTIVE` in isolated
+CPU worktree `/home/mudler/_git/vllm.cpp-c5-sw-kv`, branch
+`codex/c5-sw-kv-w1`. The claim is limited to W1 of the accepted
+[joint C5 spike](specs/sliding-local-yarn-long-context.md): concrete
+`SlidingWindowSpec`, spec/manager dispatch, exact page and admission-cap math,
+right-to-left reachable prefix policy, skipped-block recycling, hybrid-disabled
+full-allocation conversion, no-cascade behavior, and the complete applicable
+ported KV tests. Attention kernels/config plumbing, chunked-local KV, RoPE,
+model files and GPU work are out of scope.
+
+The surviving DGX series still owns `/tmp/gpu`: ours 27B c1/c2/c4/c8 and two
+c16 repetitions are complete, with c16 rep3 running at inspection time; vLLM
+and 35B arms remain. It is preserved unchanged. C5 W1 needs only CPU G1/G2, so
+implementation can proceed without contending with that campaign.

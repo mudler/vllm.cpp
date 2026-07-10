@@ -15,7 +15,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 13 | 3 | 3 | 0 | 1 | 0 | 2 | 4 |
-| KV cache and memory | 18 | 2 | 2 | 0 | 4 | 0 | 0 | 10 |
+| KV cache and memory | 18 | 2 | 2 | 0 | 3 | 1 | 0 | 10 |
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
@@ -24,7 +24,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 7 | 0 | 0 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **96** | **9** | **17** | **0** | **16** | **1** | **4** | **49** |
+| **Total** | **96** | **9** | **17** | **0** | **15** | **2** | **4** | **49** |
 
 ## Engine core and scheduling
 
@@ -53,7 +53,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-HYBRID-COORD` | Full-attention and GDN/Mamba group coordinator | T0 | `vllm/v1/core/kv_cache_coordinator.py:514,630`; `tests/v1/core/test_prefix_caching.py:347,836,987` | `src/vllm/v1/core/kv_cache_coordinator.cpp:294,370,389` | `tests/vllm/v1/test_kv_cache_coordinator.cpp:130,154,169,209,306` | `planned: specs/hybrid-kv-coordinator.md` | `PARTIAL` | - |
 | `KV-MAMBA-ALIGN` | Mamba/GDN prefix retention in align mode | T1 | `vllm/config/cache.py:134-140`; `vllm/v1/core/single_type_kv_cache_manager.py:1032-1072` | - | - | `planned: specs/mamba-align-retention.md` | `INVENTORIED` | - |
 | `KV-SLIDING-LOCAL-SPECS` | Block row (claim the two leaves below, not this row): sliding-window and chunked-local KV specs | T1 | `vllm/v1/kv_cache_interface.py:205-307,480-586`; `tests/v1/test_kv_cache_spec_registry.py:174-306` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
-| `KV-SLIDING-WINDOW-SPEC` | `SlidingWindowSpec` sizing, grouping, admission, allocation, eviction, and prefix-cache policy | T1 | `vllm/v1/kv_cache_interface.py:518-586`; `vllm/v1/core/single_type_kv_cache_manager.py:669-873`; `tests/v1/core/test_single_type_kv_cache_manager.py:127,259,380,413,489`; `tests/v1/core/test_prefix_caching.py:2457-3909` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `KV-SLIDING-WINDOW-SPEC` | `SlidingWindowSpec` sizing, grouping, admission, allocation, eviction, and prefix-cache policy | T1 | `vllm/v1/kv_cache_interface.py:518-586`; `vllm/v1/core/single_type_kv_cache_manager.py:669-873`; `tests/v1/core/test_single_type_kv_cache_manager.py:127,259,380,413,489`; `tests/v1/core/test_prefix_caching.py:2457-3909` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `ACTIVE` | `CLAIM-C5-SW-KV-1` |
 | `KV-CHUNKED-LOCAL-SPEC` | `ChunkedLocalAttentionSpec` sizing, grouping, admission, allocation, and chunk-boundary prefix-cache policy | T1 | `vllm/v1/kv_cache_interface.py:480-514`; `vllm/v1/core/single_type_kv_cache_manager.py:876-1023`; `tests/v1/core/test_single_type_kv_cache_manager.py:54,198,456` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `KV-FP8` | FP8 KV cache and scale handling | T1 | `vllm/model_executor/layers/quantization/kv_cache.py:42,108-191` | - | - | `planned: specs/fp8-kv-cache.md` | `INVENTORIED` | - |
 | `KV-NVFP4-TURBO` | NVFP4, per-token-head, and TurboQuant KV | T2 | `vllm/config/cache.py:14,28-35,272` | - | - | `planned: specs/nvfp4-kv-cache.md` | `INVENTORIED` | - |

@@ -75,7 +75,7 @@ what vLLM has vs what we have:
 | ✅ `75caf38` **Hybrid KV coordinator + per-group managers** (full-attn group + GDN/mamba state group — the gate models are hybrid): SingleTypeKVCacheManager (FullAttention left→right multi-block prefix + Mamba right→left single recurrent state), HybridKVCacheCoordinator cross-group MIN-intersection prefix hit. Mamba `align` mode deferred behind a 1:1 stub | `v1/core/kv_cache_coordinator.py`, `single_type_kv_cache_manager.py` | **T0** |
 | ✅ `75caf38` Specs: `FullAttentionSpec`, `MambaSpec` (GDN state), `KVCacheGroupSpec`, `KVCacheConfig` — `page_size_bytes` byte-exact vs upstream. `SlidingWindowSpec`/`ChunkedLocalAttentionSpec`/`MLAAttentionSpec` deferred behind 1:1 stubs | `v1/kv_cache_interface.py` | T0 |
 | Mamba/GDN prefix-cache retention (`mamba_cache_mode` align, PR #45845) | `v1/core/` | T1 |
-| `SlidingWindowSpec`, `ChunkedLocalAttentionSpec` | `v1/kv_cache_interface.py` | T1 |
+| 🚧 `SlidingWindowSpec` W1 claimed; `ChunkedLocalAttentionSpec` remains READY | `v1/kv_cache_interface.py` | T1 |
 | `MLAAttentionSpec` (+ latent KV) | same | T2 (with DeepSeek-family) |
 | `CrossAttentionSpec`, `EncoderOnlyAttentionSpec` | same | T2 |
 | KV quantization: fp8 KV cache (`cache_dtype=fp8*`) | `config/cache.py`, `layers/quantization/kv_cache.py` | T1 |

@@ -325,8 +325,9 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
 
 Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
                                  const HfConfig& config) {
-  // Build a name -> shard index from each shard's own header. mtp.* tensors are
-  // ignored (not requested); the resolver throws on any missing name.
+  // Build a name -> shard index from each shard's own header. The target loader
+  // does not request mtp.*: LoadQwen3_5MTP loads that optional draft head only
+  // when speculative decoding is enabled. The resolver throws on missing names.
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards) {
     for (const std::string& name : shard.Names()) where[name] = &shard;

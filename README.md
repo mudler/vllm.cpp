@@ -195,6 +195,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   27B checkpoint has a plausible native path; exact 35B mixed-quant loading must
   be proven, and binding TTFT/ITL numbers wait for true incremental async HTTP
   streaming (`SERVE-ASYNC-LLM`).
+- **Speculative decoding is not user-visible yet.** The first MTP leaf now has
+  safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
+  but its exact 27B+35B oracle gate is still queued and the scheduler,
+  rejection sampler, GDN state snapshots, and API/config wiring remain open.
+  GGUF files do not currently carry `mtp.*`; normal non-speculative execution
+  is unchanged.
 
 ## Project record
 

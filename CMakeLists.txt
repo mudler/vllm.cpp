@@ -140,6 +140,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
   src/vllm/model_executor/models/qwen3_5_dense_weights.cpp
+  src/vllm/model_executor/models/qwen3_5_mtp.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
   src/vllm/model_executor/models/registry.cpp

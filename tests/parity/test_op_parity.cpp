@@ -19,6 +19,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/registry.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -1181,6 +1182,154 @@ bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
   return true;
 }
 
+// --- Qwen3.5/3.6 MTP standalone head parity (M-mtp-0). ---------------------
+// Ported model behavior: qwen3_5_mtp.py:129-165 @ e24d1b24. The oracle tool
+// captures the exact input ids, positions and TARGET post-final-norm hidden
+// states seen by vLLM's real k=1 speculator. This runner loads mtp.* from the
+// same checkpoint, shares the target embed/lm_head, and requires every captured
+// draft argmax to match. It is CUDA/checkpoint gated because the real heads are
+// multi-GiB (the 35B draft layer contains the full 256-expert BF16 MoE).
+
+std::string FindMtpSnapshot(int tag) {
+  const char* env_name = tag == 27 ? "VLLM_MTP_27B_SNAPSHOT"
+                                   : "VLLM_MTP_35B_SNAPSHOT";
+  if (const char* override_path = std::getenv(env_name)) {
+    const fs::path path(override_path);
+    std::error_code ec;
+    if (fs::exists(path / "config.json", ec)) return path.string();
+    throw std::runtime_error(std::string(env_name) +
+                             " does not name a checkpoint snapshot: " +
+                             override_path);
+  }
+  return tag == 27 ? Find27BSnapshot() : Find35BSnapshot();
+}
+
+std::vector<vllm::SafetensorsFile> OpenMtpShards(const std::string& snapshot,
+                                                  int tag) {
+  std::vector<vllm::SafetensorsFile> shards;
+  if (tag == 27) {
+    const fs::path path = fs::path(snapshot) / "model.safetensors";
+    VT_CHECK(fs::exists(path), "MTP parity: 27B model.safetensors not found");
+    shards.push_back(vllm::SafetensorsFile::Open(path.string()));
+    return shards;
+  }
+  for (int shard_index = 1; shard_index <= 3; ++shard_index) {
+    auto shard = OpenShard(snapshot, shard_index);
+    VT_CHECK(shard.has_value(),
+             "MTP parity: missing 35B safetensors shard " +
+                 std::to_string(shard_index));
+    shards.push_back(std::move(*shard));
+  }
+  return shards;
+}
+
+bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
+                      const json& manifest) {
+  const int tag = GoldenTag(dir);
+  VT_CHECK(tag == 27 || tag == 35,
+           "MTP parity: golden directory must end in _27b or _35b");
+  VT_CHECK(manifest.at("args").at("tag").get<std::string>() ==
+               (tag == 27 ? "27b" : "35b"),
+           "MTP parity: manifest tag disagrees with directory tag");
+  const std::string snapshot = FindMtpSnapshot(tag);
+  if (snapshot.empty()) {
+    MESSAGE("SKIP " << dir.filename().string() << ": " << tag
+                    << "B checkpoint snapshot not present");
+    return false;
+  }
+
+  std::vector<vllm::SafetensorsFile> shards = OpenMtpShards(snapshot, tag);
+  const vllm::HfConfig config =
+      vllm::LoadHfConfig((fs::path(snapshot) / "config.json").string());
+  const vllm::Qwen3_5MTPKind kind =
+      tag == 27 ? vllm::Qwen3_5MTPKind::kDense
+                : vllm::Qwen3_5MTPKind::kMoe;
+  MESSAGE("MTP parity: loading " << tag << "B target sharing weights + mtp.*");
+  const vllm::Qwen3_5MTPWeights mtp =
+      vllm::LoadQwen3_5MTP(shards, config, kind);
+
+  auto input_ids_loaded =
+      LoadTensor(dir, manifest.at("tensors").at("input_ids"));
+  auto positions_loaded =
+      LoadTensor(dir, manifest.at("tensors").at("positions"));
+  auto target_hidden_loaded =
+      LoadTensor(dir, manifest.at("tensors").at("target_hidden"));
+  auto expected_hidden =
+      LoadTensor(dir, manifest.at("tensors").at("mtp_hidden"));
+  auto expected_argmax =
+      LoadTensor(dir, manifest.at("tensors").at("expected_argmax"));
+  VT_CHECK(input_ids_loaded.dtype == DType::kI32 &&
+               positions_loaded.dtype == DType::kI32 &&
+               target_hidden_loaded.dtype == DType::kBF16 &&
+               expected_hidden.dtype == DType::kBF16 &&
+               expected_argmax.dtype == DType::kI32,
+           "MTP parity: unexpected golden dtype");
+  const int64_t tokens = input_ids_loaded.tensor.shape[0];
+  VT_CHECK(tokens >= 16 && positions_loaded.tensor.Numel() == tokens &&
+               target_hidden_loaded.tensor.rank == 2 &&
+               target_hidden_loaded.tensor.shape[0] == tokens &&
+               target_hidden_loaded.tensor.shape[1] == config.hidden_size &&
+               expected_hidden.tensor.rank == 2 &&
+               expected_hidden.tensor.shape[0] == tokens &&
+               expected_hidden.tensor.shape[1] == config.hidden_size &&
+               expected_argmax.tensor.Numel() == tokens,
+           "MTP parity: malformed captured tensor shapes");
+  const int32_t* ids_data = input_ids_loaded.tensor.Ptr<int32_t>();
+  const int32_t* positions_data = positions_loaded.tensor.Ptr<int32_t>();
+  std::vector<int32_t> input_ids(ids_data, ids_data + tokens);
+  std::vector<int32_t> positions(positions_data, positions_data + tokens);
+  DeviceBuf target_hidden(b, q, DType::kBF16, {tokens, config.hidden_size},
+                          target_hidden_loaded.raw.data.data());
+
+  std::vector<uint8_t> hidden_bytes;
+  std::vector<float> logits;
+  auto execute = [&](const vllm::Qwen3_5MTPModel& model) {
+    vllm::Qwen3_5MTPHiddenStates hidden =
+        model.Forward(input_ids, positions, target_hidden.tensor(), q);
+    hidden_bytes.resize(static_cast<size_t>(hidden.tensor.Numel()) *
+                        vt::SizeOf(hidden.tensor.dtype));
+    b.Copy(q, hidden_bytes.data(), hidden.tensor.data, hidden_bytes.size());
+    vllm::ForwardLogits output = model.ComputeLogits(hidden.tensor, q);
+    VT_CHECK(output.on_device() && output.rows == tokens &&
+                 output.vocab == config.vocab_size,
+             "MTP parity: unexpected logits result");
+    logits.resize(static_cast<size_t>(output.rows) * output.vocab);
+    b.Copy(q, logits.data(), output.device_tensor.data,
+           logits.size() * sizeof(float));
+    b.Synchronize(q);
+  };
+
+  if (kind == vllm::Qwen3_5MTPKind::kDense) {
+    const vllm::Qwen3_5DenseWeights target =
+        vllm::LoadQwen3_5Dense(shards, config);
+    execute(vllm::Qwen3_5MTPModel(mtp, target, config));
+  } else {
+    const vllm::Qwen3_5MoeWeights target =
+        vllm::LoadQwen3_5Moe(shards, config);
+    execute(vllm::Qwen3_5MTPModel(mtp, target, config));
+  }
+
+  Tensor actual_hidden = expected_hidden.tensor;
+  actual_hidden.data = hidden_bytes.data();
+  const double hidden_atol = manifest.at("tol").value(
+      "hidden_diagnostic_atol", 0.05);
+  RequireMatch("mtp_hidden", actual_hidden, expected_hidden.tensor,
+               hidden_atol, 0.0);
+
+  const int32_t* want_argmax = expected_argmax.tensor.Ptr<int32_t>();
+  int64_t matches = 0;
+  for (int64_t token = 0; token < tokens; ++token) {
+    const int32_t actual = ArgmaxRow(
+        logits.data() + static_cast<size_t>(token) * config.vocab_size,
+        config.vocab_size);
+    if (actual == want_argmax[token]) ++matches;
+  }
+  MESSAGE("MTP " << tag << "B standalone head: argmax " << matches << "/"
+                 << tokens << " exact; hidden atol=" << hidden_atol);
+  REQUIRE(matches == tokens);
+  return true;
+}
+
 // Ops whose goldens are committed but whose runners are not implemented yet.
 // The parity harness scans every golden directory eagerly, so a milestone that
 // lands goldens before their runners (the standard "dump first, implement next"
@@ -1271,6 +1420,14 @@ int RunGoldenPass(Device dev) {
                            ? RunQwen27Logits(b, q, entry.path(), m)
                            : RunQwen36Logits(b, q, entry.path(), m);
       if (!ran) continue;
+    } else if (op == "qwen3_5_mtp_head") {
+      // Multi-GiB, two-checkpoint gate owned by the focused test case below.
+      // Recognize it here so committed goldens never trip the stale-runner
+      // guard, but do not make every generic op-parity pass reload both models.
+      MESSAGE("SKIP op '" << op << "' case '"
+                          << entry.path().filename().string()
+                          << "': owned by focused Qwen3.5 MTP head parity test");
+      continue;
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");
@@ -1335,6 +1492,52 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
   CHECK(cases >= 31);  // 24 pre-M0.8 + 5 MoE + 2 dense_attention (M0.9 Task 2)
+}
+
+TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend registered; skipping Qwen3.5 MTP head parity");
+    return;
+  }
+
+  const bool require_all =
+      std::getenv("VLLM_MTP_REQUIRE_CHECKPOINTS") != nullptr;
+  Backend& backend = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = backend.CreateQueue();
+  int manifests = 0;
+  int ran = 0;
+  for (const auto& entry : fs::directory_iterator(fs::path(PARITY_GOLDENS_DIR))) {
+    if (!entry.is_directory()) continue;
+    const fs::path manifest_path = entry.path() / "manifest.json";
+    if (!fs::exists(manifest_path)) continue;
+    const json manifest = json::parse(std::ifstream(manifest_path));
+    if (manifest.value("op", "") != "qwen3_5_mtp_head") continue;
+    ++manifests;
+    INFO("case " << entry.path().filename().string());
+    if (RunQwen35MtpHead(backend, queue, entry.path(), manifest)) ++ran;
+  }
+  backend.DestroyQueue(queue);
+
+  if (manifests == 0) {
+    if (require_all) {
+      FAIL("VLLM_MTP_REQUIRE_CHECKPOINTS=1 but no MTP goldens were found");
+    }
+    MESSAGE("Qwen3.5 MTP head goldens absent; skipping checkpoint gate");
+    return;
+  }
+  if (require_all) {
+    REQUIRE(manifests == 2);
+    REQUIRE(ran == 2);
+  } else {
+    MESSAGE("Qwen3.5 MTP head parity: ran " << ran << "/" << manifests
+                                            << " available golden cases");
+  }
 }
 
 // Standalone, fast, CUDA-only 27B dense-logits diagnostic — runs ONLY the dense

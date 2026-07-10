@@ -97,8 +97,10 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
                                                int64_t layer_idx);
 
 // Full dense-model load across the given shards. Uses config.num_hidden_layers
-// and config.layer_types. Text path only — the vision tower (model.visual.*),
-// the MTP head (mtp.*) and the image/video merger are DEFERRED (notes §0.1).
+// and config.layer_types. Text path only — the vision tower (model.visual.*)
+// and image/video merger are DEFERRED (notes §0.1). The checkpoint's MTP
+// head is intentionally loaded on demand by LoadQwen3_5MTP when speculative
+// decoding is enabled; it is not part of the always-resident target weights.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config);
 

@@ -2524,3 +2524,108 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+
+## 2026-07-10 — C3 M-mtp-0 CPU/local implementation complete; two-checkpoint gate queued
+
+Recovered the 1,063-line uncommitted MTP stream in its original isolated
+worktree, checkpointed it before rebasing, and audited it against pinned vLLM
+`e24d1b24` plus the exact upstream tests named by
+[mtp-spec-decode.md](specs/mtp-spec-decode.md). M-mtp-0 now contains:
+
+- an on-demand, safetensors-only BF16 `mtp.*` loader for both gate layouts,
+  including the 27B dense layer and the 35B fused `[E,2I,H]` / `[E,H,I]`
+  256-expert stacks; every norm/projection/expert tensor is shape- and
+  dtype-checked against `H`, head counts/dim, dense/MoE intermediate sizes and
+  shared-expert size;
+- `Qwen3_5MTPModel`, sharing the target embedding and lm-head (FP4 head on the
+  35B), with the pinned `norm(embed)` + `norm(target_hidden)` → concat/fc →
+  one full-attention dense/MoE decoder layer → final norm forward and direct
+  hidden-state return; normal target loading remains unchanged and loads the
+  optional draft only when requested;
+- ported loader/direct-return CPU tests for both architectures, with the
+  unimplemented AutoRegressiveSpeculator tuple/tensor and propose-shape cases
+  retained as explicit M-mtp-1 skips rather than false-green placeholders;
+- a focused DGX oracle dumper and C++ golden consumer that require exact argmax
+  on every captured row (at least 16) for both checkpoints and retain a 0.05
+  hidden-state diagnostic bound.
+
+The crash audit found and repaired one oracle-tool blocker before any GPU time:
+pip-vLLM 0.24 uses an older explicit fused-expert `load_weights` method while
+the pin uses `AutoWeightsLoader`. Their executable MTP class bodies are
+otherwise AST-identical. The tool now strips exactly the two loader-only
+methods plus the pin-only mapper assignment, compares every remaining class
+member, and relies on the final exact-argmax gate to prove equivalent loaded
+weights. Read-only DGX checks confirmed this guard passes the real installed
+source; the pinned file at `/home/mudler/work/vllm-pin` has SHA256
+`9b36e5bfcee4faf8d04319e069032c3c4a01c4aaf49f86108eca788038c0c7fd`, identical
+to the canonical local pin.
+
+**Local evidence:** clean CPU configure/full build; CTest **92/92**; focused
+`test_mtp_speculator` **7/7 runnable cases, 141/141 assertions, 3 tracked
+skips**; focused MTP oracle test cleanly skips without CUDA/goldens; generic CPU
+op-parity remains green; `python3 -m py_compile`, `--help`, installed-vs-pin AST
+guard and 3-row text-position normalization pass; record checker reports
+`ENGINE=90 MODEL=323 QUANT=81 KERNEL=30 BACKEND=51`; all 13 record mutation
+tests and `git diff --check` pass.
+
+No GPU/model command ran: `CLAIM-SERVE-GATE-1` still holds `/tmp/gpu` for its
+live campaign, with PR3 already queued behind it. `SPEC-MTP`, `Qwen3_5MTP` and
+`Qwen3_5MoeMTP` therefore remain honestly `GATING`; `ROAD-V1-C3` remains
+`ACTIVE`, and speculative decoding is still unavailable to users (no
+scheduler, rejection sampler, GDN snapshots, config/API wiring, or GGUF head).
+The implementation claim is released into the handoff queue.
+
+### Exact first-free-GPU handoff (one lock for both oracle arms + C++ gate)
+
+After branch `worktree-agent-a3002072f42ec1b7f` is pushed, prepare the build
+without the GPU lock:
+
+```bash
+REPO=/home/mudler/work/vllm.cpp-mtp0
+test -d "$REPO/.git" || git clone --no-checkout \
+  git@github.com:mudler/vllm.cpp.git "$REPO"
+git -C "$REPO" fetch origin worktree-agent-a3002072f42ec1b7f
+git -C "$REPO" switch --detach origin/worktree-agent-a3002072f42ec1b7f
+cmake -S "$REPO" -B "$REPO/build-cuda" \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+cmake --build "$REPO/build-cuda" -j2 --target test_op_parity
+```
+
+When `CLAIM-SERVE-GATE-1` and the already-queued PR3 jobs release the device,
+run this entire correctness series under one uncontended lock:
+
+```bash
+flock /tmp/gpu bash -lc '
+set -euo pipefail
+REPO=/home/mudler/work/vllm.cpp-mtp0
+PY=/home/mudler/venvs/vllm-oracle/bin/python
+PIN=/home/mudler/work/vllm-pin
+M27=/home/mudler/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a
+M35=/home/mudler/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots/491c2f1ea524c639598bf8fa787a93fed5a6fbce
+
+cd "$REPO"
+VLLM_ENABLE_V1_MULTIPROCESSING=0 "$PY" \
+  tools/parity/dump_qwen3_5_mtp.py \
+  --model "$M27" --tag 27b --pinned-vllm "$PIN" \
+  --out tests/parity/goldens
+VLLM_ENABLE_V1_MULTIPROCESSING=0 "$PY" \
+  tools/parity/dump_qwen3_5_mtp.py \
+  --model "$M35" --tag 35b --pinned-vllm "$PIN" \
+  --out tests/parity/goldens
+
+VLLM_MTP_27B_SNAPSHOT="$M27" \
+VLLM_MTP_35B_SNAPSHOT="$M35" \
+VLLM_MTP_REQUIRE_CHECKPOINTS=1 \
+  ./build-cuda/tests/test_op_parity \
+  -tc="qwen3.5 MTP standalone head parity*"
+'
+```
+
+Required return evidence before closing M-mtp-0: both
+`qwen3_5_mtp_head_{27b,35b}/manifest.json` fixtures; installed-vs-pin forward
+AST verification printed by each oracle arm; C++ runner reports `argmax T/T`
+with `T>=16` for **both** checkpoints and satisfies the 0.05 hidden diagnostic;
+the two golden directories are brought back in the gating commit; the focused
+test is re-run once after that commit. Any mismatch keeps all three rows open
+and is debugged against the captured target hidden/input/positions—never by
+loosening exact argmax.

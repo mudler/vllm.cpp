@@ -3077,3 +3077,37 @@ complete series, and run this order:
 Only current-head results may move `KERNEL-GDN-AOT-BF16` or
 `KERNEL-GDN-SCRATCH` out of `ACTIVE`; below-vLLM on any axis or any correctness
 drift remains an open gap.
+
+## 2026-07-10 — crash-recovered roadmap work integrated on current main
+
+The recovered branches are reconciled on `main` without importing the
+threadpool branch's benchmark-only dense-GGUF loader parent. The integrated
+checkpoints are AsyncLLM W2 (`5063a22`), the C5 long-context spike
+(`851d632`), backend ABI W0 (`5a67f41`), M-mtp-0 (`b8e9598`), the model factory
+registry (`a4a6ef3`), CPU threadpool W1-W3 (`0878fc7`, `f980660`, `adc92b4`),
+and PR3 AOT/scratch hardening (`a767188`). Shared loader lifetime wiring keeps
+the registry's type-erased `LoadedModel` and W2's lazily owned `AsyncLLM`
+together; the clean integrated build validates that combined path.
+
+Final local recovery validation (CUDA disabled; no GPU command ran):
+
+- clean Release build in `build-integration` completed with zero warnings;
+- the pre-PR3 integrated tree passed 98/98 at the threadpool's default worker
+  count; after PR3 integration, `VLLM_CPP_CPU_THREADS=1 ctest --test-dir
+  build-integration --output-on-failure -j2` passed 99/99, including the AOT
+  drift contract;
+- `scripts/check-triton-aot-drift.sh` and all ten mutation cases in
+  `tests/scripts/test_triton_aot_drift.sh` passed;
+- `scripts/check-agent-record.py` reports `ENGINE=96 MODEL=323 QUANT=81
+  KERNEL=30 BACKEND=51`, all 13 record mutation tests pass, `git diff --check`
+  is clean, and every commit introduced since the prior `origin/main` contains
+  `FOLLOWING_AGENTS_PROTOCOL`.
+
+No GPU-dependent row is promoted by this recovery. `SERVE-ASYNC-LLM`,
+`BACKEND-ABI-VT`, `SPEC-MTP`, both Qwen MTP model rows,
+`MODEL-FACTORY-registry`, and `QUANT-GGUF-CPU-THREADPOOL` remain `GATING`;
+the two PR3 kernel rows remain `ACTIVE` under `CLAIM-PR3`. The existing
+`CLAIM-SERVE-GATE-1` series retains GPU ownership. Its pre-W2 measurements are
+baseline evidence only; after it releases the device, the canonical handoff
+queue supplies the post-W2 serving gates followed by the queued ABI, MTP,
+model-registry and PR3 GPU closures.

@@ -21,11 +21,11 @@ DONE with a one-line outcome + where the full report/branch lives.
 
 | # | Track | Question | State |
 |---|---|---|---|
-| B1 | Apple Metal / **MLX** | vllm-metal vs wiring MLX's C++ API behind `vt::` vs native MSL; paged-KV + nvfp4 gaps; pick ONE route + first milestone | 🔄 workflow wf_24e95c3b |
-| B2 | Arches & vendors | per-NVIDIA-arch support matrix (sm_90/80/consumer); **Triton AMD backend for our same 5 GDN kernels → hsaco?**; hipify/hipBLASLt; vendor vLLM ROCm kernels 1:1; Intel SYCL/XPU vs Vulkan | 🔄 workflow wf_24e95c3b |
-| B3 | SGLang steals | measured wins over vLLM V1 portable to C++ (overlap scheduling, RadixAttention vs hash prefix, jump-forward grammar decode) | 🔄 workflow wf_24e95c3b |
-| B4 | llama.cpp CPU | in-quant compute vs our dequant-to-bf16, repacking, threadpool; **vendor ggml-cpu kernels IF proven faster** (user criterion) | 🔄 workflow + **local Qwen3.5-2B CPU bench agent** (the decision measurement) |
-| B5 | Speculative decoding | vLLM V1 spec-decode map; **MTP** (do our gate checkpoints ship heads?); what **dflash** is; ranked route + the high-concurrency caveat | 🔄 agent |
+| B1 | Apple Metal / **MLX** | vllm-metal vs wiring MLX's C++ API behind `vt::` vs native MSL | ✅ **MLX wins** (Ollama's production swap ~1.6-2×); vendor MLX under vt:: + port vllm-metal's paged MSL as MLX primitives; **hardware-gated: needs a Mac (procurement = critical path)**. → [expansion-map-2026-07-10.md](expansion-map-2026-07-10.md) |
+| B2 | Arches & vendors | per-arch matrix; Triton→AMD; SYCL vs Vulkan | ✅ **NVIDIA fan-out nearly FREE** (bf16 path already sm_80+; A100/H100/4090 need ~no new kernels — Wave 1); **Triton GDN → AMD gfx942 via one flag**; Vulkan-before-SYCL call. → map |
+| B3 | SGLang steals | measured wins portable to C++ | ✅ **Async/overlap scheduling is vLLM's DEFAULT at our pin — an unmet MIRROR obligation** (we run synchronous); reframed as latency/mirror, not throughput (we already ≥1.0× vs async-vLLM). RadixAttention REJECTED per mirror policy. Kernel steals: no-op. → map |
+| B4 | llama.cpp CPU | vendor IF proven faster (user criterion) | ✅ research: **our CPU is a single-threaded scalar loop (zero threads!)** — threadpool = 1-wk prerequisite; **compute-in-quant** = the structural fix (~3.3× decode, ~10× prefill on GGUF). 🔄 local Qwen3.5-2B bench = the decision measurement | 
+| B5 | Speculative decoding | MTP + dflash | ✅ **Both gate checkpoints SHIP MTP heads** (bf16, we currently skip `mtp.*` at load!); **DFlash** (block-diffusion drafter, ICML'26) is in-pin WITH published drafts for our exact models + a DGX-Spark community container. Route: MTP k=1 27B → GDN spec path → DFlash. → [spec-decode-scoping-2026-07-10.md](spec-decode-scoping-2026-07-10.md) |
 | B6 | Feature parity matrix | the big one-by-one vLLM-feature table (TP/PP/EP, LoRA, multimodal, disagg, pooling, …) — what we have / miss / tier | 🔄 agent → `.agents/feature-matrix.md` |
 
 ## C. T1 queue (from roadmap.md Post-MVP, unchanged priorities)

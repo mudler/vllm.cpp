@@ -2226,3 +2226,45 @@ columns so lifecycle tallies sum to the row count.
 **Next:** claim W1 (`ENG-CORE-BUSY-LOOP`), then W2 (`SERVE-ASYNC-LLM`) to
 unblock the online gate's latency axes; W3 async-default mirror A/B'd on both
 gate models; W4 priority any time.
+
+## 2026-07-10 — Expert-streaming-from-disk spike (`ENG-EXPERT-STREAM` READY; ds4 scan + measured math)
+
+**User-directed spike (CLAIM-EXPSTREAM-SPIKE-1, released):** scanned
+antirez/ds4 (DwarfStar @ 80ebbc3 — DeepSeek V4 Flash/PRO engine with SSD
+expert streaming on Metal/CUDA/ROCm) and wrote
+[specs/expert-streaming.md](specs/expert-streaming.md). ds4's design: routed
+experts in a per-(layer,expert) mlocked slab cache, misses pread(2) from the
+GGUF by a 9-18-thread pool inside the per-layer router→FFN window,
+hotness-decayed-LFU eviction (halve every 16 tokens, LRU tiebreak, in-flight
+protection), full-layer SEQUENTIAL streaming for long prefill + decode-cache
+seeding from the last ≤64 prefill tokens, shipped hotlist preload, and a
+`--simulate-used-memory` honesty tool. ds4 publishes almost no numbers (only:
+auto ~59GB cache best on M5 Max PRO q2); its profiler measures hit rates per
+deployment.
+
+**Measured this spike (dgx):** 35B-A3B NVFP4 per-expert bytes from the real
+safetensors header = 1,769,472 B x 256 experts x 40 layers = 16.88 GiB
+routed experts (~77% of ~22 GiB weights); NVMe `/dev/nvme0n1` O_DIRECT: 5.4
+GB/s sequential, 2.76 GB/s single-thread random expert-size preads, ~5.0-5.3
+GB/s with 4-16 threads. Worst-case decode traffic 540 MiB/token (top-8 x 40
+layers). Verdict: viable capacity feature at c1-c4 (I/O bound ≥17.7 tok/s at
+50% resident, ~8.4 GiB freed; gates G1-G6 in spec incl. token-exactness,
+≥7.5 GiB measured reduction, ≥12 tok/s floor at f=0.5); NOT the
+high-concurrency gate regime (B=64 touches ~88% of all experts/step → I/O
+~orders below the ~2.8k tok/s gate); tmpfs is a non-tier on GB10 (unified
+memory; dgx /tmp is ext4 on the same NVMe anyway).
+
+**Mirror floor settled at the pin (one line each):** (1) load-time streaming
+PRESENT (`runai_streamer` + loaders, `model_loader/__init__.py:33-66`) — not
+this feature; (2) `cpu_offload_gb` PRESENT, v1-supported, blanket
+per-parameter UVA (`config/offload.py:23`, `offloader/uva.py:64-108`), name-
+targetable but NOT router-aware — inventoried as new row `ENG-WEIGHT-OFFLOAD`;
+(3) inference-time disk/SSD expert paging ABSENT in-pin (searched fused_moe/,
+offloader/, config, loaders; eplb is EP rebalancing) → `ENG-EXPERT-STREAM` is
+surpass-track, additive/default-off/own-config-namespace for sync safety.
+
+**Rows:** engine-matrix +2 (`ENG-EXPERT-STREAM` READY, `ENG-WEIGHT-OFFLOAD`
+INVENTORIED; checker ENGINE_ROWS 88→90), feature-matrix §2 +2, roadmap
+`ROAD-V1-D4` INVENTORIED→PARTIAL, handoff queue #10. **Next:** claim W1
+(expert cache manager, CPU-testable), W2 (pread pool), then W3 (bank +
+engine hook) on dgx.

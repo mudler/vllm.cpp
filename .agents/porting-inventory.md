@@ -205,8 +205,10 @@ pipeline (raw-logprobs snapshot → allowed-ids → bad-words → min-tokens/log
 penalties → greedy/temperature/min-p/top-k/top-p/random → where(temp<eps) merge →
 gather_logprobs+ranks), `SamplingMetadata`/`LogprobsTensors`/`make_sampling_metadata`,
 core ops (ApplyTemperature/GreedyArgmax/ApplyTopKTopP/ComputeProbs/ComputeLogprobs/
-RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA (CUDA
-dgx-pending). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
+RandomSample) + penalties/min-p/logit-bias/token-mask/allowed-ids, CPU+CUDA. The
+CUDA random path mirrors vLLM's parallel exponential-noise + argmax structure
+with a two-pass multi-block reduction (local sm_120 tested; scalar toggle retained
+for same-binary parity). **logit_bias/allowed_token_ids/bad_words landed at T0** (moved up
 from T1 below — the OpenAI-serving MVP needs them). Greedy = bit-exact parity gate;
 random RNG = exponential-noise gumbel-max, distribution-correct, **torch-Philox
 bit-exact parity deferred to T1**. Deferred (marked stubs): logprob_token_ids

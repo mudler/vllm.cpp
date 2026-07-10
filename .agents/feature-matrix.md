@@ -116,7 +116,7 @@ and reference-engine performance.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| Core sampler pipeline (temperature, top-k/p, min-p, penalties, seed, n, stop, min/max_tokens, output_kind) | `v1/sample/sampler.py` | `PARTIAL` T0 | greedy and bounded controls work; `n` is parsed but not executed and random/logprob paths synchronize to host | `planned: specs/core-sampler.md` |
+| Core sampler pipeline (temperature, top-k/p, min-p, penalties, seed, n, stop, min/max_tokens, output_kind) | `v1/sample/sampler.py` | `PARTIAL` T0 | greedy and bounded controls work; random uses an on-GPU multi-block exponential-race reduction, but `n` is parsed and not executed and token/logprob results still synchronize to host | `planned: specs/core-sampler.md` |
 | torch-Philox bit-exact random parity | `v1/sample/ops/` | ☐ T1 | current RNG gumbel-max distribution-correct only | `planned: specs/philox-rng-parity.md` |
 | logprobs payload end-to-end | `v1/sample/`, serving | `PARTIAL` T1 | sampler tensors/protocol fields exist; engine/output/OpenAI payload absent | `planned: specs/logprobs-payload.md` |
 | prompt_logprobs | `v1/sample/` | ☐ T1 | protocol field parsed; no engine path | `planned: specs/prompt-logprobs.md` |

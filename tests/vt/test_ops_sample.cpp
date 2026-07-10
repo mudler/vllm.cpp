@@ -11,8 +11,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -764,4 +766,44 @@ TEST_CASE("CUDA random_sample agrees with CPU on the vast majority of rows") {
     if (id_gpu[i] == id_cpu[i]) ++agree;
   // Allow a small number of ULP-driven argmax flips; require strong agreement.
   CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
+}
+
+TEST_CASE("CUDA random_sample parallel reduction matches scalar kernel at Qwen3.5 vocab") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping (dgx-pending)");
+    return;
+  }
+  const int64_t N = 4, V = 248320;
+  auto probs = RandomLogits(static_cast<size_t>(N * V), 12035);
+  for (float& p : probs) p = std::abs(p) + 0.001F;
+  // Pin the reduction's global lowest-index tie rule across every block.
+  for (int64_t j = 0; j < V; ++j) probs[static_cast<size_t>(2 * V + j)] = 0.0F;
+  std::vector<int64_t> seeds = {11, 29, 47, 71};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dp(gpu, gq.q, DType::kF32, {N, V}, probs.data());
+  DeviceTensor ds(gpu, gq.q, DType::kI64, {N}, seeds.data());
+  DeviceTensor slow_ids(gpu, gq.q, DType::kI64, {N});
+  DeviceTensor fast_ids(gpu, gq.q, DType::kI64, {N});
+
+  const char* previous_env = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  const bool had_previous_env = previous_env != nullptr;
+  const std::string saved_env = had_previous_env ? previous_env : "";
+  setenv("VT_FAST_RANDOM_SAMPLE", "0", 1);
+  vt::RandomSample(gq.q, slow_ids.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> slow(static_cast<size_t>(N));
+  slow_ids.Download(gq.q, slow.data());
+
+  setenv("VT_FAST_RANDOM_SAMPLE", "1", 1);
+  vt::RandomSample(gq.q, fast_ids.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> fast(static_cast<size_t>(N));
+  fast_ids.Download(gq.q, fast.data());
+  if (had_previous_env)
+    setenv("VT_FAST_RANDOM_SAMPLE", saved_env.c_str(), 1);
+  else
+    unsetenv("VT_FAST_RANDOM_SAMPLE");
+
+  CHECK(fast == slow);
+  CHECK(fast[2] == 0);
 }

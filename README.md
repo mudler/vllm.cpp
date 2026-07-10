@@ -177,8 +177,9 @@ runs end-to-end on CPU:
   count. Outputs are byte-identical at 1/3/20 threads and the concurrency suite
   is ThreadSanitizer-clean. The real-file ≥10x speed/RSS checkpoint still needs
   an exclusive idle-host rerun, and GGUF compute-in-quant remains open.
-- **Sampler** — greedy (bit-exact vs `torch.argmax`) plus temperature,
-  top-k/top-p, penalties, min-p and internal logit-filter/logprob primitives.
+- **Sampler** — greedy (bit-exact vs `torch.argmax`) and parallel exponential-
+  race random sampling, plus temperature, top-k/top-p, penalties, min-p and
+  internal logit-filter/logprob primitives.
   `n`, full random/logprob payload behavior, and request/API wiring for the
   long-tail controls remain open; some paths synchronize results to the host.
 - **OpenAI server** — basic `/v1/completions` and `/v1/chat/completions`
@@ -292,7 +293,7 @@ CUDA-target inventories track unimplemented and untraced families separately.
 | RMSNorm(+residual) → fp4 quant | the **traced gate workload** dispatches Inductor `fused_add_rms_norm` + external `scaled_fp4_quant`; FlashInfer also contains fused Add/RMSNorm+FP4 kernels that remain in the upstream kernel inventory · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ gate path |
 | Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
 | CUDA-graph decode | Qwen-specific captured decode step (vLLM cudagraph) | — | 🟡 explicit 35B capture gate; 27B evidence backfill open |
-| Sampling (greedy/top-k/top-p/penalties) | vLLM V1 ordering subset; some token/logprob paths synchronize to host | ✅ | 🟡 bounded subset |
+| Sampling (greedy/random/top-k/top-p/penalties) | vLLM V1 ordering subset; on-GPU multi-block random reduction, while token/logprob results still synchronize to host | ✅ | 🟡 bounded subset |
 | RMSNorm / default RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
 | Scaled RoPE supplied-cache rotation | pinned vLLM typed cache/factory + YaRN/MRoPE/Llama 3/Phi-3 LongRoPE/dynamic-NTK construction and cache lookup/rotation | ✅ ref + fifteen oracle fixtures | 🚧 source present; compile/runtime gate open |
 
@@ -496,12 +497,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   BF16 weights and runs end-to-end in the Nix CUDA shell. This is **not parity
   qualified**: only 9/16 greedy sequences match vLLM with Triton AOT (10/16 with
   hand GDN kernels). On the exact 128-request, concurrency-32, 1024-in/128-out,
-  temperature-1 workload, three-run means are **1,086.92 tok/s vs vLLM 6,679.72
-  (0.163×)**. Nsight attributes **81.7% of project GPU time** to the serial
-  full-vocabulary `RandomSampleKernel`; replacing it with a parallel reduction
-  is the first local performance lever. A project-only greedy diagnostic reaches
-  **5,754.92 tok/s** (5.30× faster), but is still only **0.862×** the recorded
-  vLLM temperature-1 result; this cross-mode ratio is diagnostic, not parity.
+  temperature-1 workload, the multi-block random sampler raises the three-run
+  mean from **1,086.92 to 5,614.25 tok/s (5.16×)** versus a fresh vLLM mean of
+  **6,669.28 tok/s (0.842×)**. Nsight reduces sampling from **81.7%** of project
+  GPU time to about **2.3% including softmax**; the remaining 15.8% throughput
+  gap is in the model/runtime path. The parallel path is bit-identical to the
+  retained scalar CUDA reference for the project's deterministic SplitMix RNG.
   Persistent KV/GDN caches are now true device allocations on discrete GPUs,
   eliminating the prior HMM/UVM migration path; sustained runs and both engine
    traces completed without Xid/UVM faults.

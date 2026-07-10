@@ -6410,3 +6410,41 @@ mean of 6,679.72 total / 742.19 output tok/s: the deliberately cross-mode ratio
 is 0.8616x. This is not an accepted comparison because sampling differs, but it
 shows that bypassing the sampler leaves a reproducible roughly 14% local
 model/runtime throughput gap rather than putting this model at parity.
+
+## 2026-07-10 — parallel CUDA random sampler
+
+Replaced the temperature-1 hot path's one-thread-per-request 248K-vocabulary
+scan with a two-pass multi-block reduction in `cuda_sample.cu`. This mirrors
+vLLM's native execution structure (vectorized exponential-noise generation,
+then device argmax) while preserving the project's documented deterministic
+SplitMix `(seed,row,vocab)` RNG deviation. Pass 1 uses up to 256 blocks per row;
+pass 2 reuses the exact lowest-index `ArgReduce` rule. The scalar implementation
+remains available as `VT_FAST_RANDOM_SAMPLE=0` for same-binary A/B.
+
+Correctness: a new CUDA regression compares scalar and parallel outputs exactly
+at Qwen3.5's 248,320-token vocabulary and includes an all-zero row to force a
+global cross-block tie; 22/22 sampling cases and 279,751 assertions pass. The
+composed CUDA `test_sampler`, `test_apply_grammar_bitmask`, and `test_ops_sample`
+suites pass; CPU `test_ops_sample` passes and the full CPU suite excluding the
+documented `test_op_parity` registry gap is 91/91. `compute-sanitizer` is not
+present in the current flake, so memcheck was not run.
+
+Same-binary temperature-1 A/B on Qwen3.5-4B, exact 128-request conc32 1024/128
+ShareGPT workload: scalar `VT_FAST_RANDOM_SAMPLE=0` = 1,087.09 total / 120.79
+output tok/s; parallel default = 5,617.17 / 5,612.36 / 5,613.22 total tok/s,
+mean 5,614.25, output mean 623.81. This is a 5.164x end-to-end gain and 97.6%
+of the project's greedy throughput. Pool peak remained 954.87 MiB with zero
+evictions.
+
+Fresh production-vLLM runs on the identical workload were 6,639.71 / 6,685.60 /
+6,682.52 total tok/s (mean 6,669.28), output mean 741.03. The new project ratio
+is 0.8418x on both total and output throughput; no parity claim because the 4B
+greedy correctness precondition remains 9/16. An attempted vLLM quiet run with
+`TQDM_DISABLE=1` produced no measurement because vLLM's reporter divided by a
+zero elapsed value; it is excluded.
+
+Matched Nsight trace `/tmp/nsys-out/vllm-cpp-random-parallel.nsys-rep` reports
+`RandomSamplePartialKernel` at 1.5% GPU time (377.82 ms / 527 calls, 0.717
+ms/call), softmax at 0.7%, and final reduction below 0.01%. The former scalar
+kernel was 81.7% (109.98 s). Sampling is no longer the local bottleneck; the
+remaining measured 15.8% gap is in model/runtime kernels.

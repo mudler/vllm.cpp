@@ -3,8 +3,8 @@
 // Correctness-grade CUDA kernels for the V1 sampling ops (M1.7 Task 2), mirroring
 // the CPU reference (src/vt/cpu/cpu_sample.cpp) element for element:
 //   - apply_temperature: grid-stride, per-row temp with the eps greedy guard.
-//   - greedy_argmax / random_sample: ONE BLOCK per row, single-threaded scan so
-//     the lowest-index tie-break matches torch.argmax / the CPU reference exactly.
+//   - greedy_argmax / random_sample: multi-block vocabulary reductions with an
+//     exact lowest-index tie-break matching torch.argmax / the CPU reference.
 //   - compute_probs / compute_logprobs: block-per-row max-subtracted softmax.
 //   - apply_top_k_top_p: SORT-FREE block-cooperative pivot-bracket THRESHOLD
 //     search (one block per row), mirroring flashinfer's TopK/TopPRenormProb
@@ -51,11 +51,16 @@ __device__ inline uint64_t SplitMix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-__device__ inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
-  const uint64_t row_key = SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
+__device__ inline double ExpNoiseFromRowKey(uint64_t row_key, int64_t col) {
   const uint64_t r = SplitMix64(row_key + static_cast<uint64_t>(col));
   const double u = static_cast<double>((r >> 11) + 1ULL) * (1.0 / 9007199254740993.0);
   return -log(u);
+}
+
+__device__ inline double ExpNoise(uint64_t seed, int64_t row, int64_t col) {
+  const uint64_t row_key =
+      SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
+  return ExpNoiseFromRowKey(row_key, col);
 }
 
 // --- apply_temperature ------------------------------------------------------
@@ -266,9 +271,15 @@ void ComputeLogprobsCuda(Queue& q, Tensor& logprobs, const Tensor& logits) {
   Check(cudaGetLastError(), "compute_logprobs launch");
 }
 
-// --- random_sample (single-threaded per row: exact tie-break + same RNG) -----
-__global__ void RandomSampleKernel(int64_t* out, const float* probs, const int64_t* seeds,
-                                   int64_t v) {
+// --- random_sample (two-pass multi-block reduction, same deterministic RNG) --
+// vLLM's native path vectorizes exponential-noise generation and then runs a
+// device argmax. Preserve our documented SplitMix RNG deviation, but mirror
+// that parallel execution structure: pass 1 computes per-block winners across
+// the vocabulary and pass 2 uses ArgmaxFinalKernel to select the row winner.
+// Scores are independent, so reduction order cannot alter them; ArgReduce pins
+// exact ties to the lowest global vocabulary index.
+__global__ void RandomSampleKernelSlow(int64_t* out, const float* probs,
+                                       const int64_t* seeds, int64_t v) {
   const int64_t row = blockIdx.x;
   if (threadIdx.x != 0) return;
   const float* r = probs + row * v;
@@ -286,11 +297,83 @@ __global__ void RandomSampleKernel(int64_t* out, const float* probs, const int64
   out[row] = best;
 }
 
+__global__ void RandomSamplePartialKernel(float* part_val, int64_t* part_idx,
+                                          const float* probs, const int64_t* seeds,
+                                          int64_t v, int blocks_per_row) {
+  const int64_t row = blockIdx.y;
+  const int blk = blockIdx.x;
+  const float* r = probs + row * v;
+  const uint64_t seed = static_cast<uint64_t>(seeds[row]);
+  const uint64_t row_key =
+      SplitMix64(seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(row));
+  __shared__ float sv[kBlock];
+  __shared__ int64_t si[kBlock];
+
+  float best_v = kNegInf;
+  int64_t best = kArgSentinel;
+  const int64_t stride = static_cast<int64_t>(blocks_per_row) * blockDim.x;
+  for (int64_t j = static_cast<int64_t>(blk) * blockDim.x + threadIdx.x; j < v;
+       j += stride) {
+    const float qn = static_cast<float>(ExpNoiseFromRowKey(row_key, j));
+    ArgReduce(best_v, best, r[j] / qn, j);
+  }
+
+  sv[threadIdx.x] = best_v;
+  si[threadIdx.x] = best;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sv[threadIdx.x], si[threadIdx.x], sv[threadIdx.x + s],
+                si[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    part_val[row * blocks_per_row + blk] = sv[0];
+    part_idx[row * blocks_per_row + blk] = si[0];
+  }
+}
+
+float* g_random_sample_val = nullptr;
+int64_t* g_random_sample_idx = nullptr;
+size_t g_random_sample_cap = 0;
+
+void EnsureRandomSampleScratch(size_t elems) {
+  if (elems <= g_random_sample_cap) return;
+  if (g_random_sample_val) cudaFree(g_random_sample_val);
+  if (g_random_sample_idx) cudaFree(g_random_sample_idx);
+  Check(cudaMalloc(&g_random_sample_val, elems * sizeof(float)),
+        "random_sample scratch val");
+  Check(cudaMalloc(&g_random_sample_idx, elems * sizeof(int64_t)),
+        "random_sample scratch idx");
+  g_random_sample_cap = elems;
+}
+
+bool FastRandomSampleEnabled() {
+  const char* e = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  return e == nullptr || e[0] != '0';
+}
+
 void RandomSampleCuda(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds) {
   const int64_t n = probs.shape[0], v = probs.shape[1];
   if (n == 0 || v == 0) return;
-  RandomSampleKernel<<<static_cast<unsigned>(n), 1, 0, AsStream(q)>>>(
-      token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
+  cudaStream_t s = AsStream(q);
+  if (!FastRandomSampleEnabled()) {
+    RandomSampleKernelSlow<<<static_cast<unsigned>(n), 1, 0, s>>>(
+        token_ids.Ptr<int64_t>(), probs.Ptr<float>(), seeds.Ptr<int64_t>(), v);
+    Check(cudaGetLastError(), "random_sample launch (slow)");
+    return;
+  }
+
+  int bpr = static_cast<int>((v + kBlock - 1) / kBlock);
+  if (bpr > kBlock) bpr = kBlock;
+  if (bpr < 1) bpr = 1;
+  EnsureRandomSampleScratch(static_cast<size_t>(n) * bpr);
+  dim3 grid1(static_cast<unsigned>(bpr), static_cast<unsigned>(n));
+  RandomSamplePartialKernel<<<grid1, kBlock, 0, s>>>(
+      g_random_sample_val, g_random_sample_idx, probs.Ptr<float>(), seeds.Ptr<int64_t>(), v,
+      bpr);
+  ArgmaxFinalKernel<<<static_cast<unsigned>(n), kBlock, 0, s>>>(
+      token_ids.Ptr<int64_t>(), g_random_sample_val, g_random_sample_idx, bpr);
   Check(cudaGetLastError(), "random_sample launch");
 }
 

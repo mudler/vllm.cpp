@@ -2524,3 +2524,19 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+## 2026-07-10 — ROAD-V1-C5 joint spike claimed after row split
+
+`CLAIM-C5-SPIKE-1` owns a docs-only analysis of sliding-window KV/attention,
+chunked-local KV/attention, YaRN, and the existing Llama 3/LongRoPE/dynamic-NTK
+long-context block. Before deep analysis, the two oversized stable rows were
+preserved as joint-spike umbrellas and split into six claimable leaves:
+`KV-SLIDING-WINDOW-SPEC`, `KV-CHUNKED-LOCAL-SPEC`, `ATTN-CHUNKED-LOCAL`,
+`ATTN-ROPE-LLAMA3`, `ATTN-ROPE-LONGROPE`, and
+`ATTN-ROPE-DYNAMIC-NTK`. The existing `ATTN-YARN` and
+`ATTN-SLIDING-WINDOW` leaves join that claim.
+
+No implementation or support state changed. The next step is a pinned
+`e24d1b24` vLLM plus dependency/runtime-dispatch and upstream-test inventory,
+written as the nine-section
+`specs/sliding-local-yarn-long-context.md`; no GPU work is authorized for this
+spike.

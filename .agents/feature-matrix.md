@@ -52,7 +52,7 @@ instead of it.
 | KVCacheManager (allocate_slots, watermark, admission) | `v1/core/kv_cache_manager.py` | `ANCHOR-BACKFILL` T0 | named allocation/admission/lookahead slice | `planned: specs/kv-cache-manager.md` |
 | Hybrid KV coordinator (full-attn + GDN/mamba state groups) | `v1/core/kv_cache_coordinator.py` | `PARTIAL` T0 | cross-group MIN-intersection prefix hit; align/retention modes absent | `planned: specs/hybrid-kv-coordinator.md` |
 | Mamba/GDN prefix-cache retention (`mamba_cache_mode=align`, vllm#45845) | `v1/core/` | ☐ T1 | 1:1 stub in place | `planned: specs/mamba-align-retention.md` |
-| SlidingWindowSpec + ChunkedLocalAttentionSpec | `v1/kv_cache_interface.py` | ☐ T1 | stubs in place | `planned: specs/sliding-window-kv-spec.md` |
+| SlidingWindowSpec + ChunkedLocalAttentionSpec | `v1/kv_cache_interface.py` | 🚧 `SPIKE` T1 | joint spike split into independently claimable sliding-window and chunked-local KV leaves | `planned: specs/sliding-local-yarn-long-context.md` |
 | fp8 KV cache (`cache_dtype=fp8*`) | `layers/quantization/kv_cache.py` | ☐ T1 | | `planned: specs/fp8-kv-cache.md` |
 | nvfp4 / per-token-head / turboquant KV | `config/cache.py` | ☐ T2 | | `planned: specs/nvfp4-kv-cache.md` |
 | KV offload (CPU tiering, LRU/ARC) | `v1/kv_offload/` | ☐ T2 | | `planned: specs/kv-offload.md` |
@@ -180,9 +180,10 @@ MTP heads (we currently skip `mtp.*` at load).
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| YaRN rope scaling | `layers/rotary_embedding/` | ☐ T1 | Qwen3.6 long-context uses it — first of the rope family | `planned: specs/yarn-rope.md` |
-| llama3 / longrope / dynamic-NTK scaling | same | ☐ T1–T2 | | `planned: specs/rope-scaling-family.md` |
-| Sliding-window attention backend | `v1/attention/backends/` | ☐ T1 | pairs with §2 KV spec row | `planned: specs/sliding-window-attention.md` |
+| YaRN rope scaling | `layers/rotary_embedding/` | 🚧 `SPIKE` T1 | includes plain YaRN and its `mrope_section` dispatch branch | `planned: specs/sliding-local-yarn-long-context.md` |
+| llama3 / longrope / dynamic-NTK scaling | same | 🚧 `SPIKE` T1–T2 | umbrella split into three independently claimable engine leaves | `planned: specs/sliding-local-yarn-long-context.md` |
+| Sliding-window attention backend | `v1/attention/backends/` | 🚧 `SPIKE` T1 | pairs with the sliding-window KV leaf | `planned: specs/sliding-local-yarn-long-context.md` |
+| Chunked-local attention wrapper/backend | `model_executor/layers/attention/chunked_local_attention.py` | 🚧 `SPIKE` T1 | virtual-batch metadata over the selected underlying backend; pairs with the chunked-local KV leaf | `planned: specs/sliding-local-yarn-long-context.md` |
 | MLA backends (latent KV, MQA decode) | `v1/attention/backends/mla/` | ☐ T2 | | `planned: specs/mla-backends.md` |
 | Mamba1/Mamba2/short-conv/linear backends | `v1/attention/backends/` | ☐ T2 | | `planned: specs/mamba-backends.md` |
 | Encoder / cross-attention | backends | ☐ T2 | | `planned: specs/encoder-cross-attention.md` |

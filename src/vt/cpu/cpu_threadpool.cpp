@@ -305,6 +305,15 @@ void ParallelForRows(Threadpool& tp, int64_t nr,
   if (nr <= 0) {
     return;
   }
+  // Min-work fallback (spec § Risks/decisions: "n_chunks==1 → run inline"):
+  // a single output row has no partitionable work — the 4x-oversubscribed
+  // grid degenerates to one chunk — so run it inline on the caller (the same
+  // body over the same [0,1) range: bit-identical by construction, no kick).
+  // n_threads==1 likewise short-circuits to the current single-thread code.
+  if (nr == 1 || tp.NThreads() == 1) {
+    body(0, nr);
+    return;
+  }
   tp.Run([&tp, nr, &body](int ith, int nth) {
     // 4x chunks per thread
     const int nth_scaled = nth * 4;

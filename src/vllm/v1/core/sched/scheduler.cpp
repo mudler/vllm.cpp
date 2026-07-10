@@ -128,9 +128,16 @@ SchedulerOutput Scheduler::schedule() {
 
   kv_cache_manager->new_step_starts();
 
-  // First, schedule the RUNNING requests.
-  std::size_t req_index = 0;
-  while (req_index < running.size() && token_budget > 0) {
+  // Whether the priority policy is in effect (else FCFS). Chosen once per step
+  // (mirrors scheduler.py reading self.policy inside schedule()).
+  const bool priority_policy =
+      scheduler_config_.policy == SchedulerPolicy::kPriority;
+
+  // First, schedule the RUNNING requests. req_index is a signed int so the
+  // priority-preemption `req_index -= 1` fix-up (upstream scheduler.py:570) is
+  // well-defined.
+  int req_index = 0;
+  while (req_index < static_cast<int>(running.size()) && token_budget > 0) {
     Request* request = running[req_index];
 
     // num_tokens_with_spec == num_tokens at T0 (no spec tokens);
@@ -154,7 +161,7 @@ SchedulerOutput Scheduler::schedule() {
       continue;
     }
 
-    // Schedule the KV blocks, preempting the FCFS tail on OOM until it fits.
+    // Schedule the KV blocks, preempting on OOM until the request fits.
     std::optional<KVCacheBlocks> new_blocks;
     while (true) {
       new_blocks = kv_cache_manager->allocate_slots(
@@ -164,9 +171,41 @@ SchedulerOutput Scheduler::schedule() {
       if (new_blocks.has_value()) {
         break;  // The request can be scheduled.
       }
-      // Preempt the lowest-priority (FCFS tail) request.
-      Request* preempted_req = running.back();
-      running.pop_back();
+
+      // The request cannot be scheduled — preempt one running request.
+      // (scheduler.py:546-572.)
+      Request* preempted_req = nullptr;
+      if (priority_policy) {
+        // Preempt the lowest-priority running request: the max of running by
+        // (priority, arrival_time). std::max_element returns the FIRST maximum,
+        // matching Python max()'s first-encountered tie behavior.
+        auto victim = std::max_element(
+            running.begin(), running.end(), [](Request* a, Request* b) {
+              return std::make_pair(a->priority, a->arrival_time) <
+                     std::make_pair(b->priority, b->arrival_time);
+            });
+        preempted_req = *victim;
+        running.erase(victim);
+        // If the victim was already scheduled earlier this step, undo it:
+        // restore its token budget, drop its block reservation, and step
+        // req_index back one (running shrank in front of the cursor).
+        auto sit = std::find(scheduled_running_reqs.begin(),
+                             scheduled_running_reqs.end(), preempted_req);
+        if (sit != scheduled_running_reqs.end()) {
+          const std::string& preempted_id = preempted_req->request_id;
+          scheduled_running_reqs.erase(sit);
+          token_budget += num_scheduled_tokens[preempted_id];
+          num_scheduled_tokens.erase(preempted_id);
+          req_to_new_blocks.erase(preempted_id);
+          // (spec-decode / encoder budgets are deferred at T0.)
+          req_index -= 1;
+        }
+      } else {
+        // FCFS: preempt the tail (lowest scheduling priority = last arrival).
+        preempted_req = running.back();
+        running.pop_back();
+      }
+
       preempt_request(preempted_req);
       preempted_reqs.push_back(preempted_req);
       if (preempted_req == request) {

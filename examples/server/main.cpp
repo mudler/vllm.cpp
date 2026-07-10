@@ -9,6 +9,7 @@
 //          [--tokenizer-config <tokenizer_config.json>]
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
+//          [--scheduling-policy fcfs|priority]
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
 // shards. A supported GGUF file is also accepted and supplies model metadata
@@ -67,6 +68,9 @@ struct Args {
   int block_size = 32;
   int num_blocks = 256;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
+  // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
+  // --scheduling-policy / SchedulerConfig.policy).
+  std::string scheduling_policy = "fcfs";
 };
 
 [[noreturn]] void Usage(const char* argv0, int code) {
@@ -74,7 +78,8 @@ struct Args {
       << "usage: " << argv0
       << " --model <dir> [--host H] [--port P] [--tokenizer-config F]\n"
          "               [--served-model-name N] [--block-size N] "
-         "[--num-blocks N] [--max-model-len N]\n";
+         "[--num-blocks N] [--max-model-len N]\n"
+         "               [--scheduling-policy fcfs|priority]\n";
   std::exit(code);
 }
 
@@ -103,6 +108,8 @@ Args ParseArgs(int argc, char** argv) {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--scheduling-policy") {
+      a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
     } else {
@@ -146,6 +153,8 @@ int main(int argc, char** argv) {
     engine_params.block_size = args.block_size;
     engine_params.num_blocks = args.num_blocks;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
+    // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
+    engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                       engine_params);

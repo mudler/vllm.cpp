@@ -70,11 +70,13 @@ class InputProcessor {
   // `params` is taken BY VALUE (upstream clones it); PostInit()/eos-wiring
   // mutate the local copy, never the caller's. Throws std::runtime_error via
   // SamplingParams::Verify() on invalid params. arrival_time defaults to the
-  // wall clock (upstream time.time()).
+  // wall clock (upstream time.time()). `priority` (upstream process_inputs
+  // priority arg) is carried onto EngineCoreRequest.priority; default 0.
   EngineCoreRequest process_inputs(
       const std::string& request_id, const std::string& prompt,
       SamplingParams params,
-      std::optional<double> arrival_time = std::nullopt) const;
+      std::optional<double> arrival_time = std::nullopt,
+      int priority = 0) const;
 
  private:
   // _validate_params: runs SamplingParams::PostInit() (normalize + Verify) —

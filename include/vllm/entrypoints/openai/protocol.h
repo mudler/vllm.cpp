@@ -29,7 +29,8 @@
 //     the request-side `logprobs` counts ARE mapped into SamplingParams.
 //   - multimodal message content parts (T0 chat content is a bare string)
 //   - array / token-id `prompt` forms (T0 completion prompt is a bare string)
-//   - beam search, kv_transfer_params, vllm_xargs, priority, cache_salt, etc.
+//   - beam search, kv_transfer_params, vllm_xargs, cache_salt, etc.
+//     (`priority` IS parsed now — it feeds the priority scheduler; see below.)
 #pragma once
 
 #include <cstdint>
@@ -200,6 +201,11 @@ struct CompletionRequest {
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
 
+  // priority (completion/protocol.py): the request's scheduling priority for
+  // the priority policy (lower = handled first). Default 0. Not a sampling
+  // param — the serving layer forwards it to engine add_request/process_inputs.
+  int priority = 0;
+
   // response_format (completion/protocol.py:106): {type: "text"|"json_object"|
   // "json_schema", json_schema?} — normalized into structured_outputs in
   // to_sampling_params (M3.4 Task 5).
@@ -310,6 +316,9 @@ struct ChatCompletionRequest {
   bool include_stop_str_in_output = false;
   bool skip_special_tokens = true;
   bool spaces_between_special_tokens = true;
+
+  // priority (chat_completion/protocol.py). See CompletionRequest.priority.
+  int priority = 0;
 
   // response_format (chat_completion/protocol.py:210). See CompletionRequest.
   std::optional<ResponseFormat> response_format;

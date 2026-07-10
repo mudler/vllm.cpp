@@ -48,7 +48,7 @@ what vLLM has vs what we have:
 | EngineCore I/O types (`EngineCoreRequest`/`EngineCoreOutput(s)`, `ModelRunnerOutput`, `SamplerOutput`) | `v1/engine/__init__.py`, `v1/outputs.py` | T0 ✅ `cd13ec3` (structural port) |
 | `RequestOutput` / `CompletionOutput` (public result carriers; FinishReason→string) | `vllm/outputs.py` | T0 ✅ `4d477eb` (+ prompt_logprobs opaque placeholder at M1.1 close-out; logprobs payloads deferred to sampler unit) |
 | `step_with_batch_queue` (pipelined batch queue, deferred sampling) | `v1/engine/core.py` | T1 |
-| Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 |
+| Busy loop + input/output queue split (in-proc analog of ZMQ boundary) | `v1/engine/core.py`, `core_client.py` | T0 ✅ `core_proc.{h,cpp}` + `core_client.{h,cpp}` (W1 `ENG-CORE-BUSY-LOOP`: EngineCoreProc busy loop, shutdown drain/abort, WAKEUP + ENGINE_CORE_DEAD sentinels, InprocClient engine thread; tests `test_engine_core_proc.cpp` ← upstream `tests/v1/engine/test_engine_core_client.py`; GPU G1/G4 gating pending; UTILITY/DP/aborts-queue/batch-queue deferred) |
 | InputProcessor (validate, tokenize, build EngineCoreRequest) | `v1/engine/input_processor.py` | T0 ✅ `73a9509` (text path; runs PostInit/Verify + max_tokens default + eos/stop wiring; mm/lora/embeds/pooling deferred) |
 | OutputProcessor + RequestState + incremental Detokenizer | `v1/engine/output_processor.py`, `detokenizer.py` | T0 ✅ `c7ba3a5` (process_outputs: detokenize + string-stop + reqs_to_abort feedback; streaming DELTA/CUMULATIVE/FINAL_ONLY; logprobs/pooling deferred) |
 | AsyncLLM-equivalent streaming API + sync LLM API | `v1/engine/async_llm.py`, `llm_engine.py` | T0 |
@@ -57,7 +57,7 @@ what vLLM has vs what we have:
 | Budgets: `max_num_batched_tokens`, `max_num_seqs`, `max_num_scheduled_tokens` | `config/scheduler.py` | T0 ✅ `2f0ea69` |
 | Preemption (FCFS tail pop, recompute) + `SchedulerOutput` new/cached diff protocol | `v1/core/sched/{scheduler,output}.py` | T0 ✅ `4f12158` (`c65e650` SchedulerOutput/NewRequestData/CachedRequestData in the MRV2 shape — prefill_token_ids + resumed-as-new fold) |
 | FCFS request queue | `v1/core/sched/request_queue.py` | T0 ✅ `2f0ea69` |
-| Priority scheduling (`policy="priority"`) | same | T1 |
+| Priority scheduling (`policy="priority"`) | same | T1 🚧 GATING (W4 `ENG-PRIORITY-SCHED`): `PriorityRequestQueue` (heap by `Request.__lt__`) + priority preemption (victim = max `(priority, arrival_time)`) + `priority` plumbed through `Request`/`EngineCoreRequest`/OpenAI field + `SchedulerPolicyFromString`; default stays FCFS. Tests ported: `tests/vllm/v1/test_scheduler.cpp` (12 `test_priority_scheduling_*` cases ← `tests/v1/core/test_scheduler.py:2382,2978`) + `tests/vllm/v1/test_request_queue.cpp` (priority-queue cases + seeded random property ← `tests/v1/core/test_priority_scheduler_random.py`). CPU 93/93 green; GPU G1 token-exact A/B deferred (GPU held) |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill threshold/limits) | `config/scheduler.py` | T1 |
 | Async scheduling (overlap schedule with execution) | `v1/core/sched/async_scheduler.py` | T1 (perf lever for the gate if needed → may promote to T0) |
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | T1 |
@@ -130,7 +130,9 @@ The pinned registry has **353 unique static architecture IDs** (370 category
 memberships, 307 implementation targets, 258 modules) plus a dynamic
 Transformers-compatible path. The generic architecture-to-factory registry is
 not ported: one MoE ID is directly registered and the dense gate model uses a
-Qwen-specific `num_experts==0` bypass. See `model-matrix.md`.
+Qwen-specific `num_experts==0` bypass. Its claim-sized implementation contract
+is READY in [model-factory-registry.md](specs/model-factory-registry.md); see
+`model-matrix.md`.
 
 | Family | Marquee members | Needs | Tier |
 |---|---|---|---|

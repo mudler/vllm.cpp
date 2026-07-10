@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/llm_engine.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "vllm/v1/engine/types.h"
@@ -20,11 +21,12 @@ LLMEngine::LLMEngine(InputProcessor& input_processor, EngineCore& engine_core,
 
 std::string LLMEngine::add_request(const std::string& request_id,
                                    const std::string& prompt,
-                                   SamplingParams params) {
+                                   SamplingParams params, int priority) {
   // llm_engine.py:250 request = self.input_processor.process_inputs(...). The
   // text path: validate (SamplingParams PostInit) + tokenize + build the message.
-  EngineCoreRequest request =
-      input_processor_.process_inputs(request_id, prompt, std::move(params));
+  EngineCoreRequest request = input_processor_.process_inputs(
+      request_id, prompt, std::move(params), /*arrival_time=*/std::nullopt,
+      priority);
   const std::string req_id = request.request_id;
 
   // llm_engine.py:274 self.output_processor.add_request(request, prompt_text,
@@ -80,12 +82,12 @@ void LLMEngine::abort_request(const std::string& request_id) {
 
 RequestOutput LLMEngine::generate(const std::string& prompt,
                                   SamplingParams params,
-                                  const std::string& request_id) {
+                                  const std::string& request_id, int priority) {
   // The LLM.generate / _run_engine driver for one request (offline_utils.py:591):
   //   while self.llm_engine.has_unfinished_requests():
   //       for output in self.llm_engine.step():
   //           if output.finished: outputs.append(output)
-  add_request(request_id, prompt, std::move(params));
+  add_request(request_id, prompt, std::move(params), priority);
   RequestOutput result;
   while (has_unfinished_requests()) {
     std::vector<RequestOutput> step_outputs = step();

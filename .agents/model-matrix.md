@@ -62,7 +62,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 
 | ID | Item | Upstream | Our code + tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|
-| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection, capability metadata, task-aware loader/runner construction | `registry.py:998-1164,1192-1296,1396-1403` | current `ModelForwardFn` hardcodes Qwen3.5 MoE weights; no generic factory test | ☐ required before new families | `INVENTORIED` | unassigned |
+| `MODEL-FACTORY-registry` | Type-erased architecture-to-factory contract, explicit unsupported-architecture rejection (including subset-supported-list formatting), capability metadata, task-aware loader/runner construction | `registry.py:998-1082,1166-1190,1244-1296,1396-1404` | live dispatch is the `num_experts` `IsDenseArch` branch (`entrypoints/model_loader.cpp:237-279`) which can mis-load an unrelated dense arch as Qwen3.5; `ModelForwardFn` (`models/registry.h:19-30`) is Qwen3.5-MoE-weights-typed; no generic factory test | ✅ [model-factory-registry.md](specs/model-factory-registry.md) | `READY` | unassigned |
 
 ## MODEL-TEXT - Text generation
 
@@ -409,8 +409,8 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SPEC-openpangu-mtp-open-pangu-mtp` | `OpenPanguMTPModel` | `registry.py:624`; `vllm/model_executor/models/openpangu_mtp.py::OpenPanguMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-qwen3-next-mtp-qwen3-next-mtp` | `Qwen3NextMTP` | `registry.py:625`; `vllm/model_executor/models/qwen3_next_mtp.py::Qwen3NextMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-step3p5-mtp-step3p5-mtp` | `Step3p5MTP` | `registry.py:626`; `vllm/model_executor/models/step3p5_mtp.py::Step3p5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |
-| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` | `Qwen3_5MTP` | `registry.py:627`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `READY` | none | unassigned |
-| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` | `Qwen3_5MoeMTP` | `registry.py:628`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MoeMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `READY` | none | unassigned |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` | `Qwen3_5MTP` | `registry.py:627`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `ACTIVE` | none | `CLAIM-MTP-0` |
+| `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` | `Qwen3_5MoeMTP` | `registry.py:628`; `vllm/model_executor/models/qwen3_5_mtp.py::Qwen3_5MoeMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ✅ [Qwen3.5 MTP spec](specs/mtp-spec-decode.md) | `ACTIVE` | none | `CLAIM-MTP-0` |
 | `MODEL-SPEC-hy-v3-mtp-hyv3-mtp` | `HYV3MTPModel` | `registry.py:629`; `vllm/model_executor/models/hy_v3_mtp.py::HYV3MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 
 ## MODEL-HFALIAS - Static Transformers aliases

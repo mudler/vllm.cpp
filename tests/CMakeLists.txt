@@ -53,6 +53,7 @@ vllm_cpp_add_test(test_json_schema_to_gbnf vllm/v1/structured_output/test_json_s
 vllm_cpp_add_test(test_response_format_e2e vllm/v1/structured_output/test_response_format_e2e.cpp)
 vllm_cpp_add_test(test_engine_types vllm/test_engine_types.cpp)
 vllm_cpp_add_test(test_engine_core vllm/v1/test_engine_core.cpp)
+vllm_cpp_add_test(test_engine_core_proc vllm/v1/test_engine_core_proc.cpp)
 vllm_cpp_add_test(test_input_processor vllm/v1/test_input_processor.cpp)
 target_compile_definitions(test_input_processor PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

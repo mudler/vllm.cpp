@@ -302,7 +302,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     int previous_num_tokens = 0;
     std::string previous_text;
     bool tools_streamed = false;
-    engine_.add_request(engine_request_id, prompt, std::move(sampling_params));
+    engine_.add_request(engine_request_id, prompt, std::move(sampling_params),
+                        request.priority);
     while (engine_.has_unfinished_requests()) {
       for (const RequestOutput& res : engine_.step()) {
         if (res.request_id != engine_request_id) continue;
@@ -365,8 +366,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   }
 
   // ── Non-streaming (chat_completion_full_generator, :804) ────────────────
-  const RequestOutput final_res =
-      engine_.generate(prompt, std::move(sampling_params), engine_request_id);
+  const RequestOutput final_res = engine_.generate(
+      prompt, std::move(sampling_params), engine_request_id, request.priority);
 
   ChatCompletionResponse response;
   response.id = request_id;

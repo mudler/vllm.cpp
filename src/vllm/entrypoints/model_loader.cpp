@@ -115,7 +115,8 @@ bool LoadedEngine::EnsureNoneHash() {
 }
 
 vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
-    int max_model_len, int max_num_seqs, int max_num_batched_tokens) {
+    int max_model_len, int max_num_seqs, int max_num_batched_tokens,
+    vllm::SchedulerPolicy policy) {
   vllm::SchedulerConfig cfg;
   cfg.max_num_seqs = max_num_seqs;
   // Bounded per-step budget (chunked prefill). See ResolveMaxNumBatchedTokens.
@@ -123,6 +124,8 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
   cfg.enable_chunked_prefill = true;
   cfg.max_model_len = max_model_len;
   cfg.watermark = 0.0;
+  // Scheduling policy (fcfs default; kPriority selects the priority queue).
+  cfg.policy = policy;
   return cfg;
 }
 
@@ -170,7 +173,8 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
                      ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                                IsDenseArch(config_))),
+                                                IsDenseArch(config_)),
+                     params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *moe_weights_, kv_cfg_, SelectQueue(),
@@ -209,7 +213,8 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
                      ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                                IsDenseArch(config_))),
+                                                IsDenseArch(config_)),
+                     params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/true),
       runner_(config_, *dense_weights_, kv_cfg_, SelectQueue(),

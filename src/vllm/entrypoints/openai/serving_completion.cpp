@@ -44,7 +44,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
     int previous_num_tokens = 0;
     engine_.add_request(engine_request_id, request.prompt,
-                        std::move(sampling_params));
+                        std::move(sampling_params), request.priority);
     while (engine_.has_unfinished_requests()) {
       for (const RequestOutput& res : engine_.step()) {
         if (res.request_id != engine_request_id) continue;
@@ -84,7 +84,8 @@ CompletionResult OpenAIServingCompletion::create_completion(
 
   // ── Non-streaming (request_output_to_completion_response, :475) ──────────
   const RequestOutput final_res = engine_.generate(
-      request.prompt, std::move(sampling_params), engine_request_id);
+      request.prompt, std::move(sampling_params), engine_request_id,
+      request.priority);
 
   CompletionResponse response;
   response.id = request_id;

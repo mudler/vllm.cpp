@@ -46,6 +46,20 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
 }
 
+void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul_bt: rank-2 tensors required");
+  VT_CHECK(a.shape[1] == b.shape[1], "matmul_bt: inner dims mismatch (b is [N,K])");
+  VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[0],
+           "matmul_bt: output shape mismatch");
+  VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
+           "matmul_bt: float inputs and f32/bf16 output required");
+  VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
+           "matmul_bt: contiguous tensors required");
+  VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
+           "matmul_bt: device mismatch");
+  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBT, q.device.type))(q, out, a, b);
+}
+
 void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
                  const Tensor& weight_scale, float weight_scale_2) {
   VT_CHECK(act.rank == 2 && weight_packed.rank == 2 && weight_scale.rank == 2 && out.rank == 2,

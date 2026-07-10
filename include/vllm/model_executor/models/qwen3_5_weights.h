@@ -40,6 +40,12 @@ struct OwnedTensor {
   int rank = 0;
   int64_t shape[vt::kMaxRank] = {0, 0, 0, 0};
 
+  // Matmul-weight orientation. false (default): Matmul-B [K=in, N=out] (the
+  // loader transposed the disk tensor; row-major x row-major vt::Matmul).
+  // true: raw torch Linear [N=out, K=in] as on disk (LoadBf16Raw) — consumed
+  // via vt::MatmulBT, the cuBLASLt TN fast path (see ops.h MatmulBT).
+  bool nk = false;
+
   bool Empty() const { return bytes.empty(); }
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).

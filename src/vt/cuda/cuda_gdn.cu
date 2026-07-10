@@ -283,12 +283,18 @@ __global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w
   }
 }
 
-// Toggle: default OFF (byte-identical scalar dispatch). Cached static reader
-// (GdnSlackMemsetEnabled style) — VT_CONV_TILED=1 selects the tiled kernel.
+// Toggle: DEFAULT ON since 2026-07-10 (VT_CONV_TILED=0 restores the scalar
+// kernel for an A/B). Token-exact by construction (same tap order over the
+// same f32 values — see the kernel comment) AND gate-verified: 27B + 35B
+// paged-engine token-exact with the tiled kernel. MEASURED (27B prefill,
+// T≈2040 chunks): scalar 884 us/layer-instance ≈ 96 GB/s effective vs vLLM's
+// causal_conv1d 300 GB/s-class — the scalar kernel rereads x K times and was
+// ~0.25 us/tok/layer of the 27B prefill excess; the tiled kernel stages the
+// x window in shared once with coalesced channel-major access.
 bool ConvTiledEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_CONV_TILED");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';
   }();
   return on;
 }

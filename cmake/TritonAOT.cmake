@@ -432,3 +432,19 @@ else:
     endif()
   endif()
 endfunction()
+
+# Convenience build-system entry point for the maintainer regen task:
+#   cmake --build <build-dir> --target regen-triton-aot
+# (equivalent to running scripts/regen-triton-aot.sh from the source root; the
+# drift twin `check-triton-aot-drift` needs no Python/GPU and is what CI runs.)
+if(NOT TARGET regen-triton-aot)
+  add_custom_target(regen-triton-aot
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/regen-triton-aot.sh"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Regenerating vendored Triton AOT artifacts (maintainer task: Python+Triton+GPU)"
+    USES_TERMINAL)
+  add_custom_target(check-triton-aot-drift
+    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/check-triton-aot-drift.sh"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Checking vendored Triton AOT artifacts vs kernel sources (no Python/GPU)")
+endif()

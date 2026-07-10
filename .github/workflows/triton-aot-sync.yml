@@ -1,0 +1,91 @@
+# Triton AOT vendored-artifact sync.
+#
+# Two jobs:
+#  1. drift-check (GitHub-hosted, no GPU): pure sha256 compare of
+#     triton_kernels/*.py vs every vendored MANIFEST. Runs on any push/PR that
+#     touches the kernels, the vendored tree, or the AOT cmake. FAILS on drift,
+#     so a kernel change cannot merge while shipping stale cubins.
+#  2. regen-pr (SELF-HOSTED GPU runner, label [self-hosted, gpu]): actually
+#     reruns scripts/regen-triton-aot.sh and opens a sync PR with the refreshed
+#     artifacts. Regen REQUIRES a visible GPU + Python+Triton (see
+#     cmake/TritonAOT.cmake), so GitHub-hosted runners cannot do it — this job
+#     is a no-op until a GPU runner (e.g. dgx.casa) is registered on the repo.
+#     Trigger manually (workflow_dispatch) or via the weekly schedule; it only
+#     opens a PR when the drift check says the tree is stale.
+name: triton-aot-sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'triton_kernels/**'
+      - 'src/vt/cuda/triton_aot_vendored/**'
+      - 'cmake/TritonAOT.cmake'
+      - 'scripts/regen-triton-aot.sh'
+      - 'scripts/check-triton-aot-drift.sh'
+  pull_request:
+    paths:
+      - 'triton_kernels/**'
+      - 'src/vt/cuda/triton_aot_vendored/**'
+      - 'cmake/TritonAOT.cmake'
+  schedule:
+    - cron: '17 5 * * 1'   # weekly drift audit (Mon 05:17 UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check vendored Triton AOT artifacts vs kernel sources
+        run: bash scripts/check-triton-aot-drift.sh
+
+  regen-pr:
+    # Only meaningful with a GPU runner registered; scheduled/manual only so
+    # ordinary pushes never queue on a runner that may not exist.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, gpu]
+    needs: []
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skip if already in sync
+        id: drift
+        run: |
+          if bash scripts/check-triton-aot-drift.sh; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Regenerate vendored artifacts
+        if: steps.drift.outputs.stale == 'true'
+        run: bash scripts/regen-triton-aot.sh
+      - name: Open sync PR
+        if: steps.drift.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "triton-aot-sync[bot]"
+          git config user.email "noreply@localai.io"
+          branch="sync/triton-aot-$(date -u +%Y%m%d-%H%M)"
+          git checkout -b "$branch"
+          git add src/vt/cuda/triton_aot_vendored/
+          git commit -F - <<'MSG'
+build: sync vendored Triton AOT artifacts with triton_kernels sources (automated regen)
+
+Automated regen via scripts/regen-triton-aot.sh after drift was detected by
+scripts/check-triton-aot-drift.sh. Review the MANIFEST + artifact diff, then
+merge; CI's drift-check gates that the result is coherent.
+
+FOLLOWING_AGENTS_PROTOCOL
+Assisted-by: triton-aot-sync GitHub workflow
+MSG
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "build: sync vendored Triton AOT artifacts (automated regen)" \
+            --body "Automated regen of \`src/vt/cuda/triton_aot_vendored/\` after \`scripts/check-triton-aot-drift.sh\` detected drift vs \`triton_kernels/*.py\`. Review the MANIFEST diff (triton/ptxas/toolkit pins + per-kernel source hashes) and the artifact churn, then merge. Generated on a self-hosted GPU runner via \`scripts/regen-triton-aot.sh\`."

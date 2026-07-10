@@ -1,4 +1,9 @@
-# Roadmap — engineer's work breakdown
+# Roadmap — engineer's work breakdown [ARCHIVED — MVP COMPLETE]
+
+> **2026-07-10: the MVP throughput gates passed on both models. This M0–M3
+> breakdown is the archived record of the completed MVP. The LIVE roadmap is
+> now [post-mvp.md](post-mvp.md)** (tracks A–E, incl. the feature-level
+> breakdown in [feature-matrix.md](feature-matrix.md)).
 
 Milestones decompose into **workable units** (one unit ≈ one focused PR an
 agent can pick up, implement, test, and ledger in a session or few). Order

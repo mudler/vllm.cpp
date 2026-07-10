@@ -189,13 +189,13 @@ submitting AI-assisted code, read
 - [.agents/parity-ledger.md](.agents/parity-ledger.md) — **append-only
   ledger**: one row per change we introduce — what it does vs vLLM, upstream
   PR/commit references, how parity was verified.
-- [.agents/roadmap.md](.agents/roadmap.md) — engineer's work breakdown:
-  milestones M0–M3 as pick-up-able units with DoD; status kept current.
-- [.agents/post-mvp.md](.agents/post-mvp.md) — **the post-MVP program** (started
-  2026-07-10 when both throughput gates passed): in-flight closing tracks,
-  parallel research tracks (Metal/MLX, arches/ROCm, SGLang, llama.cpp CPU,
-  spec decode, feature matrix), the T1/T2 queue, and the coming protocol
-  evolution (mirror-as-floor, surpass-by-fusing).
+- [.agents/post-mvp.md](.agents/post-mvp.md) — **THE ROADMAP** (post-MVP,
+  live): closing tracks, research tracks, T1/T2 queue, the feature-level
+  breakdown (→ feature-matrix.md, each gap row delegable via its
+  `.agents/specs/<slug>.md` spec), and the protocol evolution
+  (mirror-as-floor, surpass-by-fusing).
+- [.agents/roadmap.md](.agents/roadmap.md) — ARCHIVED M0–M3 record of the
+  completed MVP (both throughput gates passed 2026-07-10).
 - [.agents/feature-matrix.md](.agents/feature-matrix.md) — **the one-by-one
   vLLM feature parity table** (what vLLM has vs what we have, every feature:
   parallelism, quant, serving, spec decode, multimodal, …). Living doc.

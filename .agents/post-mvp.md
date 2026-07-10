@@ -1,4 +1,6 @@
-# Post-MVP program (started 2026-07-10, the day both throughput gates passed)
+# Roadmap (post-MVP) — THE project roadmap
+*(user-directed 2026-07-10: this document IS the roadmap now; the old
+[roadmap.md](roadmap.md) M0–M3 is the archived record of the completed MVP.)*
 
 **Context:** the MVP throughput gate is PASSED on both gate models (35B 1.02×,
 27B 1.007× vs production vLLM, token-exact, ~25-35% less memory — see
@@ -60,6 +62,16 @@ The updated protocol will define: (a) the mirror floor (unchanged discipline),
 (b) the surpass track (fusion-first, measured vs vLLM as the baseline to BEAT,
 not just match), (c) how surpass-side divergences are recorded so upstream
 sync stays mechanical. Owner: after B1-B6 reports land.
+
+## E. Feature roadmap (the delegable breakdown)
+
+The feature-level roadmap is **[feature-matrix.md](feature-matrix.md)** — one row
+per vLLM feature (parallelism, quant, spec decode, multimodal, serving, …) with
+our status and a **`Spec` column** linking to `.agents/specs/<feature-slug>.md`.
+Convention: a gap row becomes a unit of delegable work by WRITING its spec at the
+linked path (scope, upstream file:line to mirror, gates, A/B plan) and handing
+that spec to a sub-agent. Specs live in `.agents/specs/`; the matrix row flips
+☐ → 🚧 (spec written / agent running) → ✅ (merged + gated).
 
 ## Decision rules carried forward
 

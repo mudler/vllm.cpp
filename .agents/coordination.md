@@ -112,19 +112,19 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 |---|---|---|---|---|---|---|---|
 | `CLAIM-PR3` | `KERNEL-GDN-AOT-BF16`, `KERNEL-GDN-SCRATCH` | `validate_pr3` (task #52, took over from `complete_pr3`) | DGX `~/work/vllm.cpp-noPy` (reused disposable clone, own build dir) | `merge-pr3-validation` (local merge of `pull/3/head` into main) | PR #3 files; claim/matrix rows `KERNEL-GDN-AOT-BF16`+`KERNEL-GDN-SCRATCH`; ledger/inventory/roadmap rows for PR #3 closure. GPU lock: one flock per test + one for the pool A/B series | `ACTIVE` | 2026-07-10 (validation pass: build TU, test_ops_gdn, both greedy gates, pool A/B, AOT byte-repro) |
 | `CLAIM-SERVE-GATE-1` | `SERVE-GATE-ONLINE` | `serve-gate-online` (task #42) | local main (docs only); DGX `~/work/vllm.cpp-latency` (harness/build @ 83010c7) + `~/work/vllm.cpp-latency/latres*` | `main` (docs-only edits per push policy) | DGX latency dir + `lat_*.sh` harness; engine-matrix `SERVE-GATE-ONLINE` row; roadmap `ROAD-V1-A` row; ledger appends. Lock plan: short diag window (vLLM ninja/PATH preflight + ours-35B IMA sanitizer repro), then ONE `flock` per model A/B series (27B ours+vLLM single hold; 35B ours+vLLM single hold) | `ACTIVE` | 2026-07-10 (diagnosed: vLLM init = ninja not on PATH for flashinfer JIT; ours-35B = device IMA under c16 online serve, NOT the merged 249a569 pad bug — sanitizer capture next) |
-| `CLAIM-ASYNC-SPIKE-1` | `SERVE-ASYNC-LLM`, `ENG-CORE-BUSY-LOOP`, `ENG-ASYNC-SCHED`, `ENG-PRIORITY-SCHED` | `async-serving-spike` spike agent | local main (docs only; spike is read-only outside spec/matrix/coordination rows) | `main` (docs-only edits per push policy) | New joint spec `.agents/specs/async-serving.md`; the four claimed engine-matrix rows + summary tallies; roadmap `ROAD-V1-C6` row + the `ROAD-V1-A` next-gate dependency note (append-only; that row otherwise stays with `CLAIM-SERVE-GATE-1`); feature-matrix §1 async/priority + §9 AsyncLLM rows; state.md append. No GPU lock needed (docs-only spike) | `ACTIVE` | 2026-07-10 (spiking async serving + overlap scheduling; forcing facts: `SERVE-GATE-ONLINE` fake-SSE finding + B3 async-default mirror obligation) |
 ## Handoff queue
 
 | Priority | Row/block | Dependency | Next handoff | State |
 |---|---|---|---|---|
 | 1 | `SERVE-GATE-ONLINE` | First campaign invalid: vLLM startup failure + ours-35B aborts | claimed by `CLAIM-SERVE-GATE-1`; both failures diagnosed, rerun in progress | `ACTIVE` |
-| 2 | `SERVE-E2E-NIGHTLY` | `SERVE-GATE-ONLINE` evidence where benchmarks overlap | write spike and CI/nightly split | `INVENTORIED` |
-| 3 | C1 kernel drop-in alignment | accepted kernel-family inventory | spike adapter ABI, then split kernel-family claims | `SPIKE` |
-| 4 | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | accepted spike; no dependency on async serving | provision digest-pinned image, build the corpus/harness, then classify each exact checkpoint | `READY` |
-| 5 | `BACKEND-GATE-CUDA-SGLANG` | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT`, then `SERVE-ASYNC-LLM` | run the binding c1-c16 campaign only after both dependencies close | `BLOCKED` |
-| 6 | C2/C4 models + quantizations | accepted comprehensive inventories | spike `MODEL-FACTORY-registry`; `QUANT-GGUF-COMPUTE` leaves split and `READY` (`CLAIM-QGC-LEAVES` released) — claim `QUANT-GGUF-CPU-THREADPOOL` first, then keep-quant loader + CIQ GEMM | `SPIKE` |
-| 7 | C3/C5-C8 engine/API work | existing feature rows | complete missing spikes in priority order | `INVENTORIED` |
-| 8 | D1 backend expansion | accepted backend/CUDA inventory + vt seam | spike architecture spine, then NVIDIA fan-out, ROCm, MLX, Vulkan, XPU | `SPIKE` |
+| 2 | `SERVE-ASYNC-LLM` block (`ENG-CORE-BUSY-LOOP`, `ENG-ASYNC-SCHED`, `ENG-PRIORITY-SCHED`) | joint spike accepted ([async-serving.md](specs/async-serving.md), `CLAIM-ASYNC-SPIKE-1` released); BLOCKS the `SERVE-GATE-ONLINE` latency axes | claim W1 (busy loop), then W2 (AsyncLLM + real SSE) — unblocks order 0; W3 overlap mirrors vLLM's default; W4 priority separable | `READY` |
+| 3 | `SERVE-E2E-NIGHTLY` | `SERVE-GATE-ONLINE` evidence where benchmarks overlap | write spike and CI/nightly split | `INVENTORIED` |
+| 4 | C1 kernel drop-in alignment | accepted kernel-family inventory | spike adapter ABI, then split kernel-family claims | `SPIKE` |
+| 5 | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` | accepted spike; no dependency on async serving | provision digest-pinned image, build the corpus/harness, then classify each exact checkpoint | `READY` |
+| 6 | `BACKEND-GATE-CUDA-SGLANG` | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT`, then `SERVE-ASYNC-LLM` | run the binding c1-c16 campaign only after both dependencies close | `BLOCKED` |
+| 7 | C2/C4 models + quantizations | accepted comprehensive inventories | spike `MODEL-FACTORY-registry`; `QUANT-GGUF-COMPUTE` leaves split and `READY` (`CLAIM-QGC-LEAVES` released) — claim `QUANT-GGUF-CPU-THREADPOOL` first, then keep-quant loader + CIQ GEMM | `SPIKE` |
+| 8 | C3/C5/C7/C8 engine/API work | existing feature rows | complete missing spikes in priority order (C6 spiked via the async-serving block above) | `INVENTORIED` |
+| 9 | D1 backend expansion | accepted backend/CUDA inventory + vt seam | spike architecture spine, then NVIDIA fan-out, ROCm, MLX, Vulkan, XPU | `SPIKE` |
 
 ## Closing and archival
 

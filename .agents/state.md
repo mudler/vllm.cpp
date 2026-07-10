@@ -2199,3 +2199,30 @@ gated against llama.cpp, not against our old path.
 
 **Next:** claim `QUANT-GGUF-CPU-THREADPOOL` (W1 pool core), merge `7c91a42`
 (loader L1), then keep-quant residency + CIQ GEMM tier 0.
+
+## 2026-07-10 — async serving + overlap scheduling spiked (ROAD-V1-C6 READY; blocks order 0)
+
+**What landed (docs-only spike, `CLAIM-ASYNC-SPIKE-1`, released):** joint
+spike [specs/async-serving.md](specs/async-serving.md) covering four engine
+rows, all now `READY`: `SERVE-ASYNC-LLM` (AsyncLLM-equivalent + real SSE +
+C-ABI streaming), `ENG-CORE-BUSY-LOOP` (engine thread + input/output queue
+split), `ENG-ASYNC-SCHED` (AsyncScheduler placeholders + depth-2 batch queue +
+copy-stream D2H + GPU-resident last-sampled combine), `ENG-PRIORITY-SCHED`
+(priority heap + preemption victim). Work breakdown W1→W4, each independently
+gateable; tests-to-port inventoried from `tests/v1/engine/test_async_llm.py`,
+`tests/v1/core/test_async_scheduler.py`, the 11 priority scheduler cases, and
+the OpenAI streaming/bench-serve suites.
+
+**New priority, recorded:** (1) `SERVE-GATE-ONLINE` found our example server
+executes the engine synchronously per request with precomputed SSE
+(`serving_completion.h:9-12`, `api_server.cpp:26,86,130`), so TTFT/TPOT/ITL
+are structurally unmeasurable — `SERVE-ASYNC-LLM` re-promoted T1→T0 and
+recorded as a BLOCKING dependency of roadmap order 0 (`ROAD-V1-A` row +
+engine-matrix row + handoff queue). (2) B3: async/overlap scheduling is
+vLLM's DEFAULT at pin e24d1b24 (`vllm/config/vllm.py:990-1038`) — unmet
+mirror obligation, now leaf W3. Engine-matrix summary gained SPIKE/ACTIVE
+columns so lifecycle tallies sum to the row count.
+
+**Next:** claim W1 (`ENG-CORE-BUSY-LOOP`), then W2 (`SERVE-ASYNC-LLM`) to
+unblock the online gate's latency axes; W3 async-default mirror A/B'd on both
+gate models; W4 priority any time.

@@ -36,8 +36,8 @@ instead of it.
 | Prefix caching (APC) | `v1/core/kv_cache_utils.py` | `PARTIAL` T0 | hashing/lookup/reuse subset; align and partial-block primitives remain stubs | `planned: specs/prefix-caching.md` |
 | Preemption (FCFS tail pop, recompute) | `v1/core/sched/scheduler.py` | `ANCHOR-BACKFILL` T0 | FCFS recompute slice | `planned: specs/preemption.md` |
 | CUDA graphs (decode capture/replay, no torch) | `config/compilation.py::cudagraph_mode` | `PARTIAL` T0 | Qwen-specific capture; explicit 35B assertion, generic modes and direct 27B evidence open | `planned: specs/cuda-graphs.md` |
-| **Async/overlap scheduling** | `v1/core/sched/async_scheduler.py` | ☐ T1 (**promoted**) | B3 finding: vLLM's DEFAULT at our pin ⇒ unmet MIRROR obligation (we run synchronous); latency lever | `planned: specs/async-scheduling.md` |
-| Priority scheduling (`policy="priority"`) | `v1/core/sched/request_queue.py` | ☐ T1 | | `planned: specs/priority-scheduling.md` |
+| **Async/overlap scheduling** | `v1/core/sched/async_scheduler.py` | ☐ T1 (**promoted**), spike accepted | B3 finding: vLLM's DEFAULT at our pin ⇒ unmet MIRROR obligation (we run synchronous); latency lever; execution row `ENG-ASYNC-SCHED` is `READY` | [async-serving.md](specs/async-serving.md) |
+| Priority scheduling (`policy="priority"`) | `v1/core/sched/request_queue.py` | ☐ T1, spike accepted | execution row `ENG-PRIORITY-SCHED` is `READY` (W4 leaf, separable) | [async-serving.md](specs/async-serving.md) |
 | Partial-prefill concurrency (`max_num_partial_prefills`, long-prefill limits) | `config/scheduler.py` | ☐ T1 | | `planned: specs/partial-prefill-concurrency.md` |
 | `step_with_batch_queue` (pipelined batch queue) | `v1/engine/core.py` | ☐ T1 | | `planned: specs/batch-queue-step.md` |
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | `PARTIAL` T1 | fields/internal handling exist; scheduler registry and public stream-interval wiring are absent | `planned: specs/scheduler-knobs.md` |
@@ -157,7 +157,7 @@ MTP heads (we currently skip `mtp.*` at load).
 | `stream_options` / `include_usage` | `protocol.py` | ☐ T1 | verified absent | `planned: specs/stream-options.md` |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | ☐ T1 | | `planned: specs/utility-endpoints.md` |
 | Chat templating (Jinja subset, minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | `ANCHOR-BACKFILL` T0 | bounded Qwen3.6 minja/Jinja subset; generic template parity open | `planned: specs/chat-templating.md` |
-| AsyncLLM-equivalent streaming engine API | `v1/engine/async_llm.py` | ☐ T1 | today: sync engine + server-side engine mutex (verified) | `planned: specs/async-llm-api.md` |
+| AsyncLLM-equivalent streaming engine API | `v1/engine/async_llm.py` | ☐ **T0 (re-promoted 2026-07-10)**, spike accepted | today: sync engine + server mutex + precomputed SSE ⇒ TTFT/TPOT/ITL structurally unmeasurable; BLOCKS `SERVE-GATE-ONLINE`/`ROAD-V1-A`; execution rows `SERVE-ASYNC-LLM` + `ENG-CORE-BUSY-LOOP` are `READY` | [async-serving.md](specs/async-serving.md) |
 | C API library (llama.cpp-style, 11-symbol ABI) | — (our packaging) | `ANCHOR-BACKFILL` T0 | dlopen and LocalAI-style FFI proof; not a claim of LocalAI integration | `planned: specs/c-api-library.md` |
 | Rich C++ API (`LLM`/`AsyncLLM` mirror) | `entrypoints/llm.py` | ☐ T1 | | `planned: specs/cpp-api.md` |
 | CLI: `serve` + `bench {latency,throughput,serve}` | `entrypoints/cli/` | `PARTIAL` T0 | separate server/bench binaries and one in-process benchmark; no matching command family | `planned: specs/cli-serve-bench.md` |

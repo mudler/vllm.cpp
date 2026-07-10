@@ -2760,25 +2760,33 @@ bool TryTritonChunkO(cudaStream_t s, Tout* out, const __nv_bfloat16* q, const __
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t T = static_cast<int32_t>(t_tot);   // overwritten per-seq (IS_VARLEN)
   const int32_t NT = static_cast<int32_t>(nt_tot);  // grid-y carrier (= total chunks)
-  CUresult r;
+  // The check/return tail lives INSIDE each `if constexpr` arm: when the bf16
+  // artifacts are not compiled in (no VLLM_CPP_TRITON_CHUNKO_BF16), the bf16
+  // instantiation's body is just `return false` — a shared tail after the
+  // branch would be unreachable code in that instantiation (nvcc #128-D,
+  // promoted to error by warnings-as-errors).
   if constexpr (std::is_same<Tout, float>::value) {
-    r = hv_n == 48
+    const CUresult r =
+        hv_n == 48
             ? gdn_chunko_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
                                      D(cidx), T, NT)
             : gdn_chunko_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum), D(out), D(qsl),
                                      D(cidx), T, NT);
+    VT_CHECK(r == CUDA_SUCCESS, "cuda gdn chunk_o(triton): launcher returned non-success");
+    return true;
   } else {
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
-    r = hv_n == 48 ? gdn_chunko_bf16_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
+    const CUresult r =
+        hv_n == 48 ? gdn_chunko_bf16_h48_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
                                                  D(out), D(qsl), D(cidx), T, NT)
                    : gdn_chunko_bf16_h32_default(s, D(q), D(k), D(v_new), D(hstate), D(gcum),
                                                  D(out), D(qsl), D(cidx), T, NT);
+    VT_CHECK(r == CUDA_SUCCESS, "cuda gdn chunk_o(triton): launcher returned non-success");
+    return true;
 #else
     return false;
 #endif
   }
-  VT_CHECK(r == CUDA_SUCCESS, "cuda gdn chunk_o(triton): launcher returned non-success");
-  return true;
 }
 
 // SANCTIONED Triton AOT fast-path for the GDN WU (WY-representation) pipeline — the

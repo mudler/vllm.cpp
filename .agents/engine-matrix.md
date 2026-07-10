@@ -12,19 +12,19 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
-| Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `READY` | `GATING` | `INVENTORIED` |
-|---|---:|---:|---:|---:|---:|---:|
-| Engine and scheduling | 13 | 3 | 3 | 0 | 0 | 7 |
-| KV cache and memory | 14 | 2 | 2 | 0 | 0 | 10 |
-| Parallelism | 5 | 0 | 0 | 1 | 0 | 4 |
-| Sampling and generation | 13 | 0 | 4 | 0 | 0 | 9 |
-| Structured output and tools | 6 | 0 | 3 | 0 | 0 | 3 |
-| Speculative decoding | 6 | 0 | 0 | 4 | 0 | 2 |
-| Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 11 |
-| LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 2 |
-| Long context and attention | 6 | 0 | 0 | 0 | 0 | 6 |
-| Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 2 |
-| **Total** | **88** | **9** | **17** | **5** | **0** | **56** |
+| Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Engine and scheduling | 13 | 3 | 3 | 3 | 0 | 0 | 0 | 4 |
+| KV cache and memory | 14 | 2 | 2 | 0 | 0 | 0 | 0 | 10 |
+| Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
+| Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
+| Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
+| Speculative decoding | 6 | 0 | 0 | 0 | 4 | 0 | 0 | 2 |
+| Serving, API, CLI, library | 17 | 3 | 2 | 1 | 0 | 1 | 0 | 10 |
+| LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
+| Long context and attention | 6 | 0 | 0 | 0 | 0 | 0 | 0 | 6 |
+| Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
+| **Total** | **88** | **9** | **17** | **4** | **5** | **1** | **0** | **52** |
 
 ## Engine core and scheduling
 
@@ -35,11 +35,11 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-PREFIX-CACHE` | APC hashes, lookup, allocation, partial blocks, eviction | T0 | `vllm/v1/core/kv_cache_manager.py:229`; `vllm/v1/core/block_pool.py:226`; `tests/v1/core/test_prefix_caching.py:225,2781`; `tests/v1/core/prefix_cache/test_partial_prefix_cache_primitives.py:90` | `src/vllm/v1/core/kv_cache_utils.cpp:259,291`; `src/vllm/v1/core/kv_cache_manager.cpp:124`; stubs `src/vllm/v1/core/block_pool.cpp:95,122,131` | `tests/vllm/v1/test_kv_cache_utils.cpp:411,516,536`; `tests/vllm/v1/test_block_pool.cpp:115` | `planned: specs/prefix-caching.md` | `PARTIAL` | - |
 | `ENG-PREEMPT-RECOMPUTE` | FCFS tail preemption with recompute | T0 | `vllm/v1/core/sched/scheduler.py:1142`; `tests/v1/core/test_scheduler.py:930` | `src/vllm/v1/core/sched/scheduler.cpp:102,157`; `src/vllm/v1/core/sched/request_queue.cpp:36` | `tests/vllm/v1/test_scheduler.cpp:247,295`; `tests/vllm/v1/test_request_queue.cpp:91` | `planned: specs/preemption.md` | `ANCHOR-BACKFILL` | - |
 | `ENG-CUDAGRAPH` | Decode graph capture/replay modes | T0 | `vllm/config/compilation.py:53,1319`; `vllm/v1/worker/gpu/cudagraph_utils.py:116`; `tests/compile/test_config.py:122,229` | `src/vt/cuda/cuda_backend.cu:76,97,105`; `src/vllm/model_executor/models/qwen3_5.cpp:3754,3952`; `src/vllm/v1/worker/gpu/runner.cpp:577,597` | `tests/vt/test_cuda_backend.cpp:98`; explicit 35B gate `tests/parity/test_qwen36_paged_engine.cpp:140` | `planned: specs/cuda-graphs.md` | `PARTIAL` | - |
-| `ENG-ASYNC-SCHED` | Async and overlap scheduling | T1 | `vllm/v1/core/sched/async_scheduler.py:12` | - | - | `planned: specs/async-scheduling.md` | `INVENTORIED` | - |
-| `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203` | - | - | `planned: specs/priority-scheduling.md` | `INVENTORIED` | - |
+| `ENG-ASYNC-SCHED` | Async and overlap scheduling | T1 | `vllm/v1/core/sched/async_scheduler.py:12` | - | - | `planned: specs/async-serving.md` | `SPIKE` | CLAIM-ASYNC-SPIKE-1 |
+| `ENG-PRIORITY-SCHED` | Priority request queue and policy | T1 | `vllm/v1/core/sched/request_queue.py:131,203` | - | - | `planned: specs/async-serving.md` | `SPIKE` | CLAIM-ASYNC-SPIKE-1 |
 | `ENG-PARTIAL-PREFILL` | Concurrent partial-prefill and long-prompt limits | T1 | `vllm/config/scheduler.py:70-80` | - | - | `planned: specs/partial-prefill-concurrency.md` | `INVENTORIED` | - |
 | `ENG-BATCH-QUEUE` | Pipelined `step_with_batch_queue` | T1 | `vllm/v1/engine/core.py:519` | - | - | `planned: specs/batch-queue-step.md` | `INVENTORIED` | - |
-| `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); carried from porting-inventory §1 (T0 there) at the v1 fold | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | - | - | `planned: specs/core-busy-loop.md` | `INVENTORIED` | - |
+| `ENG-CORE-BUSY-LOOP` | Busy loop with input/output queue split (in-proc analog of the ZMQ EngineCoreProc boundary); carried from porting-inventory §1 (T0 there) at the v1 fold | T0 | `vllm/v1/engine/core.py:915,1259`; `vllm/v1/engine/core_client.py:467` | - | - | `planned: specs/async-serving.md` | `SPIKE` | CLAIM-ASYNC-SPIKE-1 |
 | `ENG-SCHED-KNOBS` | Reserve-full-ISL, scheduler class seam, stream interval | T1 | `vllm/config/scheduler.py:26,127,140,163` | `include/vllm/config/scheduler.h:71,95`; `src/vllm/config/scheduler.cpp:43,52`; `src/vllm/v1/core/sched/scheduler.cpp:237`; `src/vllm/v1/engine/output_processor.cpp:68` | `tests/vllm/test_scheduler_config.cpp:10,20`; `tests/vllm/v1/test_kv_cache_manager.cpp:425` | `planned: specs/scheduler-knobs.md` | `PARTIAL` | - |
 | `ENG-CASCADE-ATTN` | Cascade attention for shared prefixes | T2 | `vllm/config/model.py:238` | - | - | `planned: specs/cascade-attention.md` | `INVENTORIED` | - |
 | `ENG-DBO-UBATCH` | DBO and ubatch overlap | T2 | `vllm/config/parallel.py:208,524` | - | - | `planned: specs/dbo-ubatch.md` | `INVENTORIED` | - |
@@ -129,7 +129,7 @@ claims it.
 | `SERVE-STREAM-USAGE` | Stream options and include-usage payload | T1 | `vllm/entrypoints/openai/chat_completion/protocol.py:214,731-735` | - | - | `planned: specs/stream-options.md` | `INVENTORIED` | - |
 | `SERVE-UTILITY-ENDPOINTS` | Tokenize, detokenize, ready, ping, server info, prefix reset | T1 | `vllm/entrypoints/serve/tokenize/api_router.py:37,63`; `vllm/entrypoints/serve/sagemaker/api_router.py:48`; `vllm/entrypoints/serve/dev/server_info/api_router.py:43`; `vllm/entrypoints/serve/dev/cache/api_router.py:20` | - | - | `planned: specs/utility-endpoints.md` | `INVENTORIED` | - |
 | `SERVE-CHAT-TEMPLATE` | Bounded Qwen3.6 Jinja/minja-style chat templates | T0 | `vllm/renderers/hf.py:673,986`; `vllm/entrypoints/chat_utils.py:1248,1335` | `src/vllm/entrypoints/chat_template.cpp:1133,1173,1186` | `tests/vllm/entrypoints/test_chat_template.cpp:60,79,206,236` | `planned: specs/chat-templating.md` | `ANCHOR-BACKFILL` | - |
-| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API (reclassified T0→T1 at the v1 fold; porting-inventory §1 kept its T0 label) | T1 | `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/async-llm-api.md` | `INVENTORIED` | - |
+| `SERVE-ASYNC-LLM` | AsyncLLM-equivalent streaming engine API (reclassified T0→T1 at the v1 fold; porting-inventory §1 kept its T0 label) | T1 | `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/async-serving.md` | `SPIKE` | CLAIM-ASYNC-SPIKE-1 |
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143-217`; `src/capi/vllm_c.cpp:133-348` | `tests/capi/test_capi.cpp:320,428,505`; `tests/capi/test_dlopen.cpp:60`; C11 header compile | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries `examples/server/main.cpp:60,121`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |

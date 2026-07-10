@@ -2524,3 +2524,38 @@ completion/chat SSE, disconnect abort, additive non-blocking C ABI, and the
 ported W2 tests. W3 async scheduling/runner work remains outside this claim.
 CPU work proceeds while `CLAIM-SERVE-GATE-1` owns dgx; G1/G3-G6 stay explicit
 GPU handoffs rather than speculative closure.
+
+## 2026-07-10 — `BACKEND-ABI-VT` W0 additive spine CPU-green, GPU handoff queued
+
+Recovered `CLAIM-BACKEND-ABI-VT-W0-1` after the machine crash, rebased its clean
+worktree onto current `origin/main`, and implemented only the test-first W0
+adapter spine. `Queue` now has a process-unique monotonic ID; new
+device-explicit `vt::{Alloc,Free,CreateQueue,DestroyQueue}` resource functions
+sit beside the legacy index-0 `Backend` shims; `ops.h` carries vLLM-compatible
+semantic scalar IDs, layouts, tensor descriptors, named workspace roles and a
+typed registrar. The new CUDA helper supplies explicit device/stream guards,
+device-index callbacks, stable queue/device/op/slot workspace entries,
+uninitialized/zero-first/zero-each policies, stream-ordered device scalars,
+capture-time growth rejection, deterministic queue cleanup, and a tiny raw
+signature probe. No existing production backend or kernel-family TU changed.
+
+Upstream tests shipped with the code: `test_dropin_abi` names and re-expresses
+the CUDA set-device/context and cudagraph capture/replay cases, plus the
+vt-specific packed-type rejection, default-stream/device/queue-ID isolation,
+workspace growth/roles/init/cleanup, scalar staging, two-device conditional,
+and raw-boundary assertions. Local validation: clean Release CPU build, no
+warnings; 94/94 ctest pass; scalar IDs independently match the vendored Marlin
+`ScalarType::id()` values; record checker/mutation results are recorded after
+the final record pass.
+
+`BACKEND-ABI-VT` moves `ACTIVE -> GATING`, not `DONE`. `W0-GPU` (CUDA
+cross-builds 80/90a/121a, GB10 runtime/capture/memcheck, both greedy gates and
+unchanged production traces/A-B) waits for `CLAIM-SERVE-GATE-1` to release the
+GPU; the exact commands are in the spike. `W0-SCALAR-FORWARDER` and
+`W0-BACKEND-SHIM` remain deliberately named: moving the vendored Marlin scalar
+class or editing production backend TUs was outside this claim, so the first
+family migration must consolidate the header and move its resource use off the
+legacy shims before the ABI row can close. README is unchanged because no
+externally supported backend, quantization, model, or performance state moved.
+The implementation claim is released into coordination's C1 `GATING` handoff;
+the eventual GPU runner must claim that gate window before executing it.

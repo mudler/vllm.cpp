@@ -13,9 +13,11 @@ remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
 The C1 implementation spike is accepted at
-[dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Until its
-`BACKEND-ABI-VT` spine lands, every new vt CUDA kernel still notes its upstream
-`csrc`/dependency counterpart in a source comment. Afterward, each family
+[dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Its additive
+`BACKEND-ABI-VT` W0 spine is CPU-green and `GATING`; no row below is promoted by
+that test-only probe. Until its CUDA/cross-build debts close, every new vt CUDA
+kernel still notes its upstream `csrc`/dependency counterpart in a source
+comment. Afterward, each family
 migrates incrementally to the common raw pointer/shape/stride/scalar/layout/
 workspace/stream adapter and completes its own correctness, trace, every-axis
 performance, and memory checkpoint before the next migration stacks.

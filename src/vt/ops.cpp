@@ -17,6 +17,72 @@ bool IsFloat(DType d) { return d == DType::kF32 || d == DType::kF16 || d == DTyp
 bool IsOutFloat(DType d) { return d == DType::kF32 || d == DType::kBF16; }
 }  // namespace
 
+ScalarTypeId ToScalarType(DType dtype) {
+  switch (dtype) {
+    case DType::kF32: return scalar_type::kF32;
+    case DType::kF16: return scalar_type::kF16;
+    case DType::kBF16: return scalar_type::kBF16;
+    case DType::kI8: return scalar_type::kI8;
+    case DType::kI32: return scalar_type::kI32;
+    case DType::kI64: return scalar_type::kI64;
+  }
+  VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
+  return scalar_type::kF32;
+}
+
+KernelTensorDesc Describe(const Tensor& tensor, ScalarTypeId semantic_type,
+                          KernelLayout layout) {
+  VT_CHECK(tensor.rank >= 1 && tensor.rank <= kMaxRank,
+           "kernel tensor descriptor rank out of range");
+  VT_CHECK(tensor.data != nullptr, "kernel tensor descriptor requires non-null data");
+  for (int d = 0; d < tensor.rank; ++d) {
+    VT_CHECK(tensor.shape[d] > 0, "kernel tensor descriptor requires positive dimensions");
+    VT_CHECK(tensor.stride[d] >= 0, "kernel tensor descriptor rejects negative strides");
+  }
+
+  switch (layout) {
+    case KernelLayout::kStrided:
+      VT_CHECK(semantic_type == ToScalarType(tensor.dtype),
+               "strided layout semantic type must match its storage dtype");
+      break;
+    case KernelLayout::kPackedTwoFp4PerByte:
+      VT_CHECK(tensor.dtype == DType::kI8 && semantic_type == scalar_type::kFE2M1f,
+               "packed-two-fp4 layout requires i8 storage with explicit FE2M1 semantics");
+      break;
+    case KernelLayout::kBlockScaleLinear:
+    case KernelLayout::kBlockScaleSwizzled:
+      VT_CHECK(tensor.dtype == DType::kI8 &&
+                   (semantic_type == scalar_type::kFE4M3fn ||
+                    semantic_type == scalar_type::kFE8M0fnu),
+               "block-scale layout requires i8 storage with explicit FP8 scale semantics");
+      break;
+    case KernelLayout::kMarlinInterleaved:
+      VT_CHECK(tensor.dtype == DType::kI8 &&
+                   (semantic_type == scalar_type::kFE2M1f ||
+                    semantic_type == scalar_type::kI4 || semantic_type == scalar_type::kU4),
+               "Marlin layout requires i8 storage with an explicit 4-bit semantic type");
+      break;
+  }
+
+  KernelTensorDesc desc;
+  desc.data = tensor.data;
+  desc.storage_dtype = tensor.dtype;
+  desc.scalar_type = semantic_type;
+  desc.device = tensor.device;
+  desc.rank = tensor.rank;
+  desc.layout = layout;
+  for (int d = 0; d < kMaxRank; ++d) {
+    desc.shape[d] = tensor.shape[d];
+    desc.stride[d] = tensor.stride[d];
+  }
+  return desc;
+}
+
+WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
+  VT_CHECK(q.id != 0, "workspace key requires a live queue identity");
+  return WorkspaceKey{q.device, q.id, reinterpret_cast<uintptr_t>(q.handle), op, slot};
+}
+
 void RegisterOp(OpId op, DeviceType device, void* fn) {
   VT_CHECK(static_cast<size_t>(op) < static_cast<size_t>(OpId::kCount), "invalid op id");
   VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
@@ -44,6 +110,25 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul: device mismatch");
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
+}
+
+void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
+                 const DropinProbeArgs& args) {
+  VT_CHECK(q.id != 0, "dropin_probe: live queue required");
+  VT_CHECK(in.rank == 2 && out.rank == 2, "dropin_probe: rank-2 tensors required");
+  VT_CHECK(in.shape[0] == out.shape[0] && in.shape[1] == out.shape[1],
+           "dropin_probe: input/output shape mismatch");
+  VT_CHECK(in.device == q.device && out.device == q.device,
+           "dropin_probe: input/output/queue device mismatch");
+  VT_CHECK(args.workspace_slot != args.scalar_slot,
+           "dropin_probe: workspace and scalar slots must not alias");
+  VT_CHECK(args.workspace_bytes >= sizeof(uint32_t),
+           "dropin_probe: workspace must hold the raw-launch marker");
+  (void)Describe(in, args.scalar_type, args.layout);
+  (void)Describe(out, args.scalar_type, args.layout);
+  VT_CHECK(args.scalar_type == scalar_type::kF32 && args.layout == KernelLayout::kStrided,
+           "dropin_probe: W0 raw kernel supports f32 strided tensors only");
+  GetTypedOp<DropinProbeFn>(OpId::kDropinProbe, q.device.type)(q, out, in, args);
 }
 
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {

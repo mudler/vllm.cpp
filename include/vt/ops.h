@@ -1,10 +1,77 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
 #include "vt/fused_recipe.h"
 #include "vt/tensor.h"
 
 namespace vt {
+
+// Upstream-compatible vllm::ScalarType IDs without importing the Marlin-only
+// scalar_type.hpp into the backend-neutral public surface. The bit packing is
+// ported from csrc/core/scalar_type.hpp:80-151 @ e24d1b24. Storage DType and
+// semantic type are deliberately separate: DType::kI8 never guesses whether
+// its bytes contain int8, FP4, FP8, or a block scale.
+using ScalarTypeId = int64_t;
+
+namespace scalar_type {
+
+enum class NanRepr : uint8_t { kNone = 0, kIeee754 = 1, kExtendedRangeMaxMin = 2 };
+
+constexpr ScalarTypeId Make(uint8_t exponent, uint8_t mantissa, bool is_signed,
+                            int32_t bias, bool finite_values_only, NanRepr nan_repr) {
+  const uint64_t bias_bits = static_cast<uint32_t>(bias);
+  return static_cast<ScalarTypeId>(
+      static_cast<uint64_t>(exponent) |
+      (static_cast<uint64_t>(mantissa) << 8) |
+      (static_cast<uint64_t>(is_signed) << 16) |
+      (bias_bits << 17) |
+      (static_cast<uint64_t>(finite_values_only) << 49) |
+      (static_cast<uint64_t>(nan_repr) << 50));
+}
+
+inline constexpr ScalarTypeId kF32 = Make(8, 23, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kF16 = Make(5, 10, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kBF16 = Make(8, 7, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kI8 = Make(0, 7, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kI32 = Make(0, 31, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kI64 = Make(0, 63, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kI4 = Make(0, 3, true, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kU4 = Make(0, 4, false, 0, false, NanRepr::kIeee754);
+inline constexpr ScalarTypeId kFE2M1f = Make(2, 1, true, 0, true, NanRepr::kNone);
+inline constexpr ScalarTypeId kFE4M3fn =
+    Make(4, 3, true, 0, true, NanRepr::kExtendedRangeMaxMin);
+inline constexpr ScalarTypeId kFE8M0fnu =
+    Make(8, 0, false, 0, true, NanRepr::kExtendedRangeMaxMin);
+
+}  // namespace scalar_type
+
+ScalarTypeId ToScalarType(DType dtype);
+
+enum class KernelLayout : uint8_t {
+  kStrided = 0,
+  kPackedTwoFp4PerByte,
+  kBlockScaleLinear,
+  kBlockScaleSwizzled,
+  kMarlinInterleaved,
+};
+
+struct KernelTensorDesc {
+  void* data = nullptr;
+  DType storage_dtype = DType::kF32;
+  ScalarTypeId scalar_type = vt::scalar_type::kF32;
+  Device device;
+  int rank = 0;
+  int64_t shape[kMaxRank] = {0, 0, 0, 0};
+  int64_t stride[kMaxRank] = {0, 0, 0, 0};
+  KernelLayout layout = KernelLayout::kStrided;
+};
+
+KernelTensorDesc Describe(const Tensor& tensor, ScalarTypeId scalar_type,
+                          KernelLayout layout);
 
 enum class OpId : uint8_t {
   kMatmul,
@@ -60,7 +127,51 @@ enum class OpId : uint8_t {
   kFusedChain,
   kRmsNormQuantFp8,
   kMatmulBT,
+  // W0-only raw-signature probe for the shared drop-in adapter boundary. It is
+  // not a production kernel-family migration.
+  kDropinProbe,
   kCount
+};
+
+enum class WorkspaceSlot : uint8_t {
+  kWorkspace = 0,
+  kOutput,
+  kLse,
+  kSemaphore,
+  kDeviceScalar0,
+  kDeviceScalar1,
+};
+
+enum class WorkspaceInit : uint8_t {
+  kUninitialized = 0,
+  kZeroOnFirstUse,
+  kZeroEachUse,
+};
+
+struct WorkspaceKey {
+  Device device;
+  uint64_t queue_id = 0;
+  uintptr_t native_handle = 0;
+  OpId op = OpId::kMatmul;
+  WorkspaceSlot slot = WorkspaceSlot::kWorkspace;
+
+  friend bool operator==(const WorkspaceKey& a, const WorkspaceKey& b) {
+    return a.device == b.device && a.queue_id == b.queue_id &&
+           a.native_handle == b.native_handle && a.op == b.op && a.slot == b.slot;
+  }
+};
+
+WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot);
+
+struct DropinProbeArgs {
+  ScalarTypeId scalar_type = vt::scalar_type::kF32;
+  KernelLayout layout = KernelLayout::kStrided;
+  size_t workspace_bytes = sizeof(uint32_t);
+  size_t workspace_alignment = alignof(uint32_t);
+  WorkspaceInit workspace_init = WorkspaceInit::kZeroEachUse;
+  WorkspaceSlot workspace_slot = WorkspaceSlot::kWorkspace;
+  WorkspaceSlot scalar_slot = WorkspaceSlot::kDeviceScalar0;
+  float scalar = 0.0f;
 };
 
 struct RmsNormArgs {
@@ -281,15 +392,36 @@ using ApplyAllowedTokenIdsFn = void (*)(Queue&, Tensor&, const Tensor&);
 // the backend's Tier-0 composite / Tier-1 interpreter (see FusedChain below).
 using FusedChainFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, Tensor*, const FusedRecipe&, float);
+using DropinProbeFn = void (*)(Queue&, Tensor&, const Tensor&, const DropinProbeArgs&);
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
+
+template <typename Fn>
+void RegisterTypedOp(OpId op, DeviceType device, Fn fn) {
+  static_assert(std::is_pointer_v<Fn> && std::is_function_v<std::remove_pointer_t<Fn>>,
+                "registered op must be a function pointer");
+  RegisterOp(op, device, reinterpret_cast<void*>(fn));
+}
+
+template <typename Fn>
+Fn GetTypedOp(OpId op, DeviceType device) {
+  static_assert(std::is_pointer_v<Fn> && std::is_function_v<std::remove_pointer_t<Fn>>,
+                "looked-up op must be a function pointer");
+  return reinterpret_cast<Fn>(GetOp(op, device));
+}
 
 // Contract: out must not alias any input tensor (RopeNeox is in-place by design).
 
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32 or
 // bf16, f32 accumulation, all contiguous, same device.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// Test-only ABI probe: a tiny adapter binds Queue/Tensor metadata to a raw
+// pointer/shape/stride/semantic-type/workspace/stream launcher. Production
+// families migrate independently after this spine is gated.
+void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
+                 const DropinProbeArgs& args);
 
 // out[M,N] = a[M,K] @ b^T with b [N,K] row-major — the torch Linear weight
 // orientation, K contiguous in BOTH operands (the "TN" GEMM). This is the

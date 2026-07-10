@@ -6,6 +6,11 @@
 
 namespace vt {
 
+// Queue identities are process-unique and monotonic. A native stream handle is
+// not an identity by itself: CUDA's per-device default streams are all null and
+// destroyed streams may later reuse the same handle value.
+uint64_t NextQueueId() noexcept;
+
 // Open device enum (.agents/backends.md): reserved entries for platforms we
 // have not implemented yet keep engine-visible types backend-agnostic.
 enum class DeviceType : uint8_t { kCPU = 0, kCUDA = 1, kMETAL = 2, kVULKAN = 3, kXPU = 4 };
@@ -24,6 +29,7 @@ struct Device {
 struct Queue {
   Device device;
   void* handle = nullptr;
+  uint64_t id = NextQueueId();
 };
 
 }  // namespace vt

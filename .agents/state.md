@@ -6448,3 +6448,82 @@ Matched Nsight trace `/tmp/nsys-out/vllm-cpp-random-parallel.nsys-rep` reports
 ms/call), softmax at 0.7%, and final reduction below 0.01%. The former scalar
 kernel was 81.7% (109.98 s). Sampling is no longer the local bottleneck; the
 remaining measured 15.8% gap is in model/runtime kernels.
+
+## 2026-07-10 — local 4B BF16/Triton decode parity and throughput follow-up
+
+Corrected ordinary BF16 Linear execution to mirror vLLM/PyTorch more closely.
+Attention, dense-MLP and GDN out-projection weights remain in their safetensors
+`[N,K]` orientation (`OwnedTensor.nk=true`) and use the cuBLASLt TN path instead
+of a load-time transpose plus NN GEMM. CUDA attention q/k/v and dense gate/up
+outputs now stay in model BF16; the tied 4B language head performs a BF16 GEMM
+then casts logits to F32 at the sampler boundary. CPU retains its F32 reference
+path. The explicit 27B language head deliberately retains its already-qualified
+transposed/F32-output path, so this local correction does not silently alter the
+unavailable GB10 gate.
+
+Added `triton_kernels/sm120/decode_gdn.py`, adapted from vLLM 0.24.0 FLA
+`fused_sigmoid_gating_delta_rule_update_kernel`. It consumes the project's
+precomputed `g`/`beta`, keeps the real `[BV=32,K=128]` recurrent tile in Triton
+registers, is generated only for exact CMake architecture `120`, and is
+default-on when compiled (`VT_GDN_DECODE_TRITON=0` is the fallback). The exact
+BF16 indexed-state shape has a same-binary A/B test. Nsight at 12,624 calls:
+hand CUDA 2.42 s (~192 us/call) versus Triton 0.642 s (~50.8 us/call), reducing
+the recurrence from 9.6% to 2.8% of GPU time.
+
+Correctness was re-based from repeated-token stress prompts to a 16-prompt
+natural corpus without discarding the stress result. With all four GDN AOT paths
+enabled, vllm.cpp matches vLLM on 15/16 complete 32-token natural continuations.
+The sole mismatch starts where vLLM's raw BF16 logits report tokens 51070 and
+430 both exactly 24.375 and choose the lower ID, while the project has a tiny
+numeric separation. Repeated `hello/world` and four-symbol stress corpora remain
+10/16 and 9/16. Therefore correctness is materially improved and representative
+but not a 16/16 qualification. `VT_DEBUG_LOGITS` and the oracle tool's
+`--top-logits-output` provide opt-in raw top-logit traces; both synchronize only
+when explicitly enabled.
+
+Random-token equality is not a meaningful vLLM gate yet: both implementations
+use the same exponential-race distribution, and the suite empirically validates
+the requested softmax frequencies, but vllm.cpp uses deterministic SplitMix
+where vLLM uses torch Philox. Exact seeded random-token parity remains the
+documented T1 gap; scalar and parallel project kernels remain exact with each
+other.
+
+Repro command (replace `--temperature` with 0 for greedy):
+
+```sh
+nix develop .#cuda --command env VT_GDN_DELTAH_TRITON=1 VT_GDN_CHUNKO_TRITON=1 VT_GDN_WU_TRITON=1 VT_POOL_MAX_CACHED_MB=1024 ./build-nix-cuda-triton-sm120-debug/examples/vllm-bench --model .hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a --dataset-path /tmp/qwen35-4b-sharegpt-1024.json --num-prompts 128 --output-len 128 --concurrency 32 --temperature 1 --max-num-batched-tokens 2048 --num-blocks 1280
+```
+
+The production-vLLM denominator used the same model/dataset, BF16, 128 prompts,
+`max_tokens=128`, `max_num_seqs=32`, mnbt 2048, model length 4096, GPU-memory
+utilization 0.88 and `ignore_eos=true`, through
+`tools/bench/dump_vllm_tokens.py --benchmark-output` (vLLM 0.24.0).
+
+- Temperature 1: project 6,084.78 / 6,082.24 total tok/s, mean **6,083.51**;
+  output mean 672.70. vLLM mean **6,669.28** total / 741.03 output; ratio
+  **0.9122x** on total/output throughput.
+- Greedy: project 6,240.71 / 6,238.95 total tok/s, mean **6,239.83**; output
+  mean 689.99. vLLM 6,718.66 / 6,720.39, mean **6,719.53** total / 743.03
+  output; ratio **0.9286x**.
+- Versus the preceding project means, random improves 5,614.25→6,083.51
+  (**+8.36%**) and greedy 5,754.92→6,239.83 (**+8.43%**). Neither reaches
+  performance parity.
+
+Fresh trace `/tmp/nsys-out/vllm-cpp-4b-final-random.nsys-rep` totals 23.22 s of
+GPU kernels over 24.56 s wall. Random partial reduction is 377.75 ms (1.6%),
+softmax 192.41 ms (0.8%), and final reduction is negligible. Ordinary BF16
+GEMMs dominate; the ~1.34 s GPU-uncovered wall and eager launch structure remain
+concrete follow-ups. Broadening the existing dense CUDA graph from FP4 to BF16
+preserved 15/16 on the short corpus but a sustained conc32 run segfaulted inside
+`libcuda.so.595.71.05`; the experiment was fully reverted. The GPU returned to
+146 MiB idle and the kernel log had no Xid, UVM fault, oops or reset.
+
+Verification: the full build succeeded. CTest is 90/92: every changed-area test
+passes, including `test_qwen27_dense_forward` 5/5 (299 assertions),
+`test_ops_gdn` 32/32 (567 assertions), sampler, runner and engine suites. The two
+failures are outside this change: the already-recorded `test_op_parity` missing
+runner for `qwen36_gguf_greedy`, and a reproducible odd-size BF16-output
+cuBLASLt tolerance failure in unchanged `test_cuda_ops` (11/221 outputs outside
+its threshold at M=17,K=31,N=13). Python AOT/oracle sources compile. The
+representative real-model run with default decode AOT is 15/16 complete
+sequences.

@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -52,6 +54,60 @@ static bool GpuSampleEnabled() {
     return e == nullptr || e[0] != '0';
   }();
   return on;
+}
+
+// Opt-in correctness diagnostic. When VT_DEBUG_LOGITS points at a file, append
+// the top logits for every request immediately before sampler processing. This
+// intentionally synchronizes and downloads the logits, so it must never be
+// enabled for performance measurements. VT_DEBUG_LOGITS_TOPK controls the
+// number of entries per row (default 8).
+static void DumpDebugLogits(vt::Queue& q, const vt::Tensor& logits,
+                            const std::vector<std::string>& req_ids,
+                            bool logits_on_device) {
+  const char* path = std::getenv("VT_DEBUG_LOGITS");
+  if (path == nullptr || path[0] == '\0') return;
+
+  const int64_t n = logits.shape[0];
+  const int64_t vocab = logits.shape[1];
+  VT_CHECK(static_cast<int64_t>(req_ids.size()) == n,
+           "debug logits: request count mismatch");
+
+  int topk = 8;
+  if (const char* value = std::getenv("VT_DEBUG_LOGITS_TOPK")) {
+    topk = std::max(1, std::atoi(value));
+  }
+  topk = std::min(topk, static_cast<int>(vocab));
+
+  std::vector<float> host(static_cast<size_t>(n * vocab));
+  if (logits_on_device) {
+    vt::Backend& backend = vt::GetBackend(q.device.type);
+    backend.Copy(q, host.data(), logits.data, host.size() * sizeof(float));
+    backend.Synchronize(q);
+  } else {
+    std::memcpy(host.data(), logits.data, host.size() * sizeof(float));
+  }
+
+  std::ofstream out(path, std::ios::app);
+  VT_CHECK(out.good(), "debug logits: cannot open output file");
+  static uint64_t step = 0;
+  out << std::setprecision(9);
+  for (int64_t row = 0; row < n; ++row) {
+    std::vector<int32_t> indices(static_cast<size_t>(vocab));
+    std::iota(indices.begin(), indices.end(), 0);
+    const float* values = host.data() + row * vocab;
+    const auto better = [values](int32_t a, int32_t b) {
+      return values[a] != values[b] ? values[a] > values[b] : a < b;
+    };
+    std::partial_sort(indices.begin(), indices.begin() + topk, indices.end(),
+                      better);
+    out << step << '\t' << req_ids[static_cast<size_t>(row)];
+    for (int k = 0; k < topk; ++k) {
+      const int32_t token = indices[static_cast<size_t>(k)];
+      out << '\t' << token << ':' << values[token];
+    }
+    out << '\n';
+  }
+  ++step;
 }
 
 // ─── Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills)
@@ -684,6 +740,9 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     apply_grammar_bitmask(*grammar_output, exec_state_.req_ids, {}, queue_,
                           logits);
   }
+
+  DumpDebugLogits(queue_, logits, exec_state_.req_ids,
+                  fl.on_device() && GpuSampleEnabled());
 
   // SamplingMetadata in the SAME dense [0, num_reqs) order (M1.7; CLOSES the
   // make_sampling_metadata wiring dep). Then Sampler.forward.

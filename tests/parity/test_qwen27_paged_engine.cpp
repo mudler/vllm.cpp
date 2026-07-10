@@ -9,9 +9,10 @@
 // (LoadedEngine::FromModelDir -> InputProcessor -> Scheduler -> paged attention
 // + KV-cache growth + batched GDN + Sampler -> OutputProcessor) via the dense
 // arch dispatch, and asserts the greedy (temperature-0) decode reproduces the
-// pip-vLLM oracle continuation (qwen36_logits_27b/greedy_ids.npy, §5 step-5)
-// TOKEN-FOR-TOKEN — validating the fp4-resident W4A4 tensor-core GEMM (§5
-// step-6a) against the oracle.
+// deterministic prefix shared by the two pip-vLLM oracle continuations
+// (qwen36_logits_27b/{greedy_ids,greedy_ids_emulation}.npy, §5 step-5)
+// TOKEN-FOR-TOKEN over that asserted prefix — validating the fp4-resident W4A4
+// tensor-core GEMM (§5 step-6a) against the oracle without claiming the tail.
 //
 // Checkpoint-GATED + dgx-only, mirroring test_qwen36_paged_engine.cpp: on the
 // CPU dev box / CI the snapshot is absent, so the body emits a loud SKIP and
@@ -110,9 +111,10 @@ constexpr bool kW4A4ForwardReady = true;
 }  // namespace
 
 // The M0-exit prompt (pinned oracle: qwen36_logits_27b/manifest.json) and its
-// greedy continuation (16 tokens). Proves the PAGED dense engine reproduces the
-// pip-vLLM oracle's greedy continuation token-for-token, end to end from the
-// prompt STRING through the batched serving loop.
+// two 16-token vLLM continuations. NOTE: this is NOT a 16/16 parity gate. It
+// proves the PAGED dense engine reproduces the six-token deterministic answer
+// prefix shared by vLLM production and emulation, end to end from the prompt
+// string through the batched serving loop; the near-tied tail is diagnostic.
 TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
   const std::string snap = Find27BSnapshot();
   if (snap.empty()) {

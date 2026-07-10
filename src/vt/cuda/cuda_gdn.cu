@@ -64,6 +64,9 @@ extern "C" {
 #include "gdn_tril_h32.h"
 #include "gdn_wu_h48.h"
 #include "gdn_wu_h32.h"
+#ifdef VT_GDN_DECODE_TRITON_AOT
+#include "gdn_decode_h32.h"
+#endif
 }
 #endif
 
@@ -1067,6 +1070,34 @@ void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, cons
                                            nw);
 }
 
+#ifdef VT_GDN_DECODE_TRITON_AOT
+bool TryTritonDecode(cudaStream_t stream, Tensor& out, const Tensor& q_in,
+                     const Tensor& k, const Tensor& v, const Tensor& g,
+                     const Tensor& beta, Tensor& state,
+                     const int32_t* state_idx, const GdnArgs& args) {
+  const char* env = std::getenv("VT_GDN_DECODE_TRITON");
+  // The sm_120 specialization is generated only when its exact shape is
+  // available. Keep an explicit off switch for same-binary A/B and diagnosis.
+  if (env != nullptr && env[0] == '0') return false;
+  if (q_in.dtype != DType::kBF16 || out.dtype != DType::kF32 ||
+      state.dtype != DType::kBF16 || state_idx == nullptr)
+    return false;
+  const int64_t n = q_in.shape[0];
+  const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
+  const int64_t hv_n = v.shape[1], dv = v.shape[2];
+  if (hk_n != 16 || hv_n != 32 || dk != 128 || dv != 128) return false;
+  if (std::fabs(args.scale - 1.0f / std::sqrt(static_cast<float>(dk))) > 1e-6f)
+    return false;
+  auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
+  const CUresult result = gdn_decode_h32_default(
+      stream, D(q_in.data), D(k.data), D(v.data), D(g.data), D(beta.data),
+      D(out.data), D(state.data), D(state_idx), static_cast<int32_t>(n));
+  VT_CHECK(result == CUDA_SUCCESS,
+           "cuda gdn decode(triton): launcher returned non-success");
+  return true;
+}
+#endif
+
 // Decode dispatch. state_idx == nullptr: compact [n,Hv,Dv,Dk] state (row==i_n).
 // Falls back to the sequential scan for the rare corner dims whose [BV,Dk]
 // shared slice would exceed the 48 KB default budget (the real gate Dk=128 and
@@ -1090,6 +1121,11 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
     GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
     return;
   }
+#ifdef VT_GDN_DECODE_TRITON_AOT
+  if (TryTritonDecode(AsStream(q), out, q_in, k, v, g, beta, state,
+                      state_idx, args))
+    return;
+#endif
   // Warps-per-block for the Dk-split occupancy lever (default 8 — measured best
   // on GB10 sm_121: raises GdnDecodeFused theoretical occupancy 10.4%→66.7% and
   // cuts per-call time ~2.2× at conc-64; A/B via env, read once per call —

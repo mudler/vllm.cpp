@@ -614,6 +614,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     flip-to-default decision (+ the per-shape AOT-config tune to squeeze the GDN
     1.18× residual).
 
+    **LOCAL sm_120 DECODE SPECIALIZATION (2026-07-10).**
+    `triton_kernels/sm120/decode_gdn.py` adapts vLLM 0.24.0
+    `fused_sigmoid_gating_delta_rule_update_kernel`: the project already computes
+    `g` and `beta`, then the AOT kernel keeps each `[BV=32,K=128]` recurrent state
+    tile in registers. CMake generates it only for exact architecture `120`; the
+    sm_121a vendored set and gate-model dispatch are unchanged. Eligibility is
+    exact BF16 input/state, F32 output, indexed state, HK=16, HV=32, K=V=128;
+    `VT_GDN_DECODE_TRITON=0` retains the hand-kernel fallback. It is default-on
+    when compiled and has a real-shape same-binary A/B parity test. Local Nsight:
+    12,624 decode calls fall from 2.42 s (~192 us/call) to 0.64 s (~51 us/call).
+    Representative Qwen3.5-4B greedy parity is 15/16 complete 32-token sequences
+    both before and after the final AOT/BF16-output stack; this is a local
+    diagnostic, not a gate-model parity claim.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

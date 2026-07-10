@@ -1419,6 +1419,73 @@ TEST_CASE("CUDA gdn decode: bf16 state cache drift vs f32 (real dims, chained st
   CHECK(max_st < 5e-2f);
 }
 
+TEST_CASE("CUDA gdn decode Triton AOT matches hand kernel (indexed BF16 cache)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  const int64_t batch = 2, slots = 3, hk = 16, hv = 32, dk = 128, dv = 128;
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+  auto qf = RandomF32(static_cast<size_t>(batch * hk * dk), 7601, -1.0f, 1.0f);
+  auto kf = RandomF32(static_cast<size_t>(batch * hk * dk), 7602, -1.0f, 1.0f);
+  auto normalize = [dk](std::vector<float>& x) {
+    for (size_t row = 0; row < x.size(); row += static_cast<size_t>(dk)) {
+      float sum = 0.0f;
+      for (int64_t col = 0; col < dk; ++col) sum += x[row + col] * x[row + col];
+      const float inv = 1.0f / std::sqrt(sum + 1e-6f);
+      for (int64_t col = 0; col < dk; ++col) x[row + col] *= inv;
+    }
+  };
+  normalize(qf);
+  normalize(kf);
+  const auto vf = RandomF32(static_cast<size_t>(batch * hv * dv), 7603, -1.0f, 1.0f);
+  const auto gf = RandomF32(static_cast<size_t>(batch * hv), 7604, -1.0f, 0.0f);
+  const auto betaf = RandomF32(static_cast<size_t>(batch * hv), 7605, 0.05f, 0.95f);
+  const auto statef = RandomF32(static_cast<size_t>(slots * hv * dv * dk), 7606,
+                                -0.5f, 0.5f);
+  const auto qb = Pack(qf, DType::kBF16);
+  const auto kb = Pack(kf, DType::kBF16);
+  const auto vb = Pack(vf, DType::kBF16);
+  const auto stateb = Pack(statef, DType::kBF16);
+  const std::vector<int32_t> indices = {2, 0};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dq(gpu, gq.q, DType::kBF16, {batch, hk, dk}, qb.data());
+  DeviceTensor dk_(gpu, gq.q, DType::kBF16, {batch, hk, dk}, kb.data());
+  DeviceTensor dv_(gpu, gq.q, DType::kBF16, {batch, hv, dv}, vb.data());
+  DeviceTensor dg(gpu, gq.q, DType::kF32, {batch, hv}, gf.data());
+  DeviceTensor dbeta(gpu, gq.q, DType::kF32, {batch, hv}, betaf.data());
+  DeviceTensor didx(gpu, gq.q, DType::kI32, {batch}, indices.data());
+  DeviceTensor state_hand(gpu, gq.q, DType::kBF16, {slots, hv, dv, dk},
+                          stateb.data());
+  DeviceTensor state_triton(gpu, gq.q, DType::kBF16, {slots, hv, dv, dk},
+                            stateb.data());
+  DeviceTensor out_hand(gpu, gq.q, DType::kF32, {batch, hv, dv});
+  DeviceTensor out_triton(gpu, gq.q, DType::kF32, {batch, hv, dv});
+
+  setenv("VT_GDN_DECODE_TRITON", "0", 1);
+  vt::GdnDecode(gq.q, out_hand.tensor(), dq.tensor(), dk_.tensor(), dv_.tensor(),
+                dg.tensor(), dbeta.tensor(), state_hand.tensor(), args,
+                &didx.tensor());
+  setenv("VT_GDN_DECODE_TRITON", "1", 1);
+  vt::GdnDecode(gq.q, out_triton.tensor(), dq.tensor(), dk_.tensor(), dv_.tensor(),
+                dg.tensor(), dbeta.tensor(), state_triton.tensor(), args,
+                &didx.tensor());
+  unsetenv("VT_GDN_DECODE_TRITON");
+
+  std::vector<float> hand_out(static_cast<size_t>(batch * hv * dv));
+  std::vector<float> triton_out(hand_out.size());
+  std::vector<uint8_t> hand_state(stateb.size()), triton_state(stateb.size());
+  out_hand.Download(gq.q, hand_out.data());
+  out_triton.Download(gq.q, triton_out.data());
+  state_hand.Download(gq.q, hand_state.data());
+  state_triton.Download(gq.q, triton_state.data());
+  CheckClose(triton_out, hand_out, 5e-3f, 5e-3f);
+  CheckClose(Unpack(triton_state, DType::kBF16),
+             Unpack(hand_state, DType::kBF16), 5e-3f, 5e-3f);
+}
+
 // The M2 chunk-parallel prefill scan vs the sequential scan (same binary),
 // real head dims Dk=Dv=128 (the gate model), GQA ratio 2, multiple heads.
 // 150 tokens = 2 full chunks (64) + a partial tail (22) exercises the chunk

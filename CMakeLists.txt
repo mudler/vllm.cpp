@@ -532,6 +532,22 @@ if(VLLM_CPP_CUDA)
       target_include_directories(vllm PRIVATE ${VT_GDN_WU_${_H}_SRCS_INCLUDE_DIR})
     endforeach()
 
+    # Local sm_120 decode specialization. vLLM's FLA decode keeps the
+    # [BV=32,K=128] recurrent state tile in registers; this consumes our
+    # already-computed g/beta and replaces the shared-memory CUDA realization.
+    # It is generated only for native sm_120 development, leaving the GB10
+    # sm_121a vendored artifact set and dispatch unchanged.
+    if(VLLM_CPP_CUDA_ARCHITECTURES STREQUAL "120")
+      set(_DECODE_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/sm120/decode_gdn.py")
+      set(_DECODE_SIG "*bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *fp32:16, *bf16:16, *i32:16, i32, 16, 32, 128, 128, 32")
+      add_triton_kernel(VT_GDN_DECODE_32_SRCS
+        "${_DECODE_KPY}" gdn_decode_kernel gdn_decode_h32
+        "${_DECODE_SIG}" "4,N*32,1" 4 3)
+      target_sources(vllm PRIVATE ${VT_GDN_DECODE_32_SRCS})
+      target_include_directories(vllm PRIVATE ${VT_GDN_DECODE_32_SRCS_INCLUDE_DIR})
+      target_compile_definitions(vllm PRIVATE VT_GDN_DECODE_TRITON_AOT=1)
+    endif()
+
     # Vendored-tree bookkeeping (call ONCE, after the LAST add_triton_kernel):
     # REGEN writes the MANIFEST (generator versions + triton_kernels/*.py hashes
     # + per-base generation params); the normal builder path verifies those

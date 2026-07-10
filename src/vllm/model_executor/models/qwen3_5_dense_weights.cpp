@@ -79,7 +79,8 @@ OwnedTensor LoadBf16OrF32Direct(const TensorResolver& get,
   return o;
 }
 
-// BF16 [out, in] -> owned bf16 [in, out] (Matmul-B layout).
+// Preserve the explicit 27B lm_head layout qualified by its GB10 gate. The
+// tied 4B head follows the raw-NK path below instead.
 OwnedTensor LoadBf16Transposed(const TensorResolver& get,
                                const std::string& name) {
   const StTensor& t = get(name);
@@ -105,17 +106,6 @@ OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
   VT_CHECK(t.shape.size() == 2, "qwen3_5 dense: expected 2-D weight for " + name);
   OwnedTensor o = LoadBf16Direct(get, name);
   o.nk = true;
-  return o;
-}
-
-OwnedTensor TransposeBf16Tensor(const OwnedTensor& src) {
-  VT_CHECK(src.dtype == vt::DType::kBF16 && src.rank == 2,
-           "qwen3_5 dense: expected 2-D BF16 tensor to transpose");
-  const int64_t rows = src.shape[0];
-  const int64_t cols = src.shape[1];
-  OwnedTensor o = MakeOwned(vt::DType::kBF16, {cols, rows});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(src.bytes.data()), rows, cols,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
   return o;
 }
 
@@ -208,7 +198,7 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   if (has(la + "out_proj.weight_packed")) {
     g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
   } else {
-    g.out_proj = LoadBf16Transposed(get, la + "out_proj.weight");
+    g.out_proj = LoadBf16RawNK(get, la + "out_proj.weight");
   }
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
   const StTensor& conv = get(la + "conv1d.weight");
@@ -232,22 +222,22 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
   if (has(sa + "q_proj.weight_packed")) {
     a.q_proj_fp4 = LoadCtNvfp4Raw(get, sa + "q_proj");
   } else {
-    a.q_proj = LoadBf16Transposed(get, sa + "q_proj.weight");
+    a.q_proj = LoadBf16RawNK(get, sa + "q_proj.weight");
   }
   if (has(sa + "k_proj.weight_packed")) {
     a.k_proj_fp4 = LoadCtNvfp4Raw(get, sa + "k_proj");
   } else {
-    a.k_proj = LoadBf16Transposed(get, sa + "k_proj.weight");
+    a.k_proj = LoadBf16RawNK(get, sa + "k_proj.weight");
   }
   if (has(sa + "v_proj.weight_packed")) {
     a.v_proj_fp4 = LoadCtNvfp4Raw(get, sa + "v_proj");
   } else {
-    a.v_proj = LoadBf16Transposed(get, sa + "v_proj.weight");
+    a.v_proj = LoadBf16RawNK(get, sa + "v_proj.weight");
   }
   if (has(sa + "o_proj.weight_packed")) {
     a.o_proj_fp4 = LoadCtNvfp4Raw(get, sa + "o_proj");
   } else {
-    a.o_proj = LoadBf16Transposed(get, sa + "o_proj.weight");
+    a.o_proj = LoadBf16RawNK(get, sa + "o_proj.weight");
   }
   a.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   a.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
@@ -262,17 +252,17 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
   if (has(mlp + "gate_proj.weight_packed")) {
     m.gate_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "gate_proj");
   } else {
-    m.gate_proj = LoadBf16Transposed(get, mlp + "gate_proj.weight");
+    m.gate_proj = LoadBf16RawNK(get, mlp + "gate_proj.weight");
   }
   if (has(mlp + "up_proj.weight_packed")) {
     m.up_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "up_proj");
   } else {
-    m.up_proj = LoadBf16Transposed(get, mlp + "up_proj.weight");
+    m.up_proj = LoadBf16RawNK(get, mlp + "up_proj.weight");
   }
   if (has(mlp + "down_proj.weight_packed")) {
     m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
   } else {
-    m.down_proj = LoadBf16Transposed(get, mlp + "down_proj.weight");
+    m.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
   }
   return m;
 }
@@ -390,9 +380,12 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
   // The 27B has an explicit unquantized lm_head; smaller Qwen3.5 dense
   // checkpoints tie lm_head to embeddings and omit `lm_head.weight`.
-  w.lm_head = has("lm_head.weight")
-                  ? LoadBf16Transposed(get, "lm_head.weight")
-                  : TransposeBf16Tensor(w.embed_tokens);
+  if (has("lm_head.weight")) {
+    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+  } else {
+    w.lm_head = w.embed_tokens;
+    w.lm_head.nk = true;
+  }
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     w.layers.push_back(LoadQwen3_5DenseLayer(

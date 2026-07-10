@@ -1453,7 +1453,7 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                  ? MatmulNvfp4Bf16D(d, h, fp4_weight)
                  : MatmulNvfp4F32D(d, h, fp4_weight);
     }
-    return MatmulF32D(d, h, plain_weight);
+    return MatmulBf16D(d, h, plain_weight);
   };
   out.q_owner.emplace(
       project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));

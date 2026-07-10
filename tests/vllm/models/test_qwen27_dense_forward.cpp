@@ -236,13 +236,15 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
         vllm::LoadQwen3_5DenseLayer(f.Resolver(), "full_attention", 0);
     CHECK_FALSE(layer.is_linear_attention);
     CHECK(layer.attn.q_proj_fp4.Empty());
-    CHECK(layer.attn.q_proj.shape[0] == 3);
-    CHECK(layer.attn.q_proj.shape[1] == 2);
+    CHECK(layer.attn.q_proj.nk);
+    CHECK(layer.attn.q_proj.shape[0] == 2);
+    CHECK(layer.attn.q_proj.shape[1] == 3);
     const auto* q = reinterpret_cast<const uint16_t*>(layer.attn.q_proj.bytes.data());
     CHECK(q[0] == vt::F32ToBF16(1.0F));
-    CHECK(q[1] == vt::F32ToBF16(4.0F));
+    CHECK(q[1] == vt::F32ToBF16(2.0F));
     CHECK(layer.mlp.gate_proj_fp4.Empty());
     CHECK_FALSE(layer.mlp.gate_proj.Empty());
+    CHECK(layer.mlp.gate_proj.nk);
   }
 
   SUBCASE("linear attention accepts plain out_proj and F32 state parameters") {
@@ -264,6 +266,7 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(layer.is_linear_attention);
     CHECK(layer.gdn.out_proj_fp4.Empty());
     CHECK_FALSE(layer.gdn.out_proj.Empty());
+    CHECK(layer.gdn.out_proj.nk);
     CHECK(layer.gdn.a_log.dtype == DType::kF32);
     CHECK(layer.gdn.dt_bias.dtype == DType::kF32);
     CHECK(layer.gdn.norm_weight.dtype == DType::kF32);

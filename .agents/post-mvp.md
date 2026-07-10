@@ -69,7 +69,9 @@ The feature-level roadmap is **[feature-matrix.md](feature-matrix.md)** — one 
 per vLLM feature (parallelism, quant, spec decode, multimodal, serving, …) with
 our status and a **`Spec` column** linking to `.agents/specs/<feature-slug>.md`.
 Convention: a gap row becomes a unit of delegable work by WRITING its spec at the
-linked path (scope, upstream file:line to mirror, gates, A/B plan) and handing
+linked path (scope, upstream file:line to mirror, gates, A/B plan, **and a
+"Tests to port" inventory of the upstream test files/cases covering the feature
+— see [test-porting.md](test-porting.md)**) and handing
 that spec to a sub-agent. Specs live in `.agents/specs/`; the matrix row flips
 ☐ → 🚧 (spec written / agent running) → ✅ (merged + gated).
 

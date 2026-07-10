@@ -86,6 +86,18 @@ check. Full method:
 [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § Verify the
 whole chain.
 
+## STANDING DIRECTIVE — port the TESTS with the code (upstream tests = the spec)
+
+vLLM's `tests/` tree is the executable spec of every feature. **Every port
+carries its matching upstream test module(s) in the same change**, re-expressed
+in our suite (doctest/parity/e2e tiers), named traceably after the upstream
+cases, with the upstream test file cited in the header. Specs
+(`.agents/specs/<slug>.md`) must include a "Tests to port" inventory; a ported
+test that can't pass yet is checked in SKIPPED with a tracked reason, never
+dropped. This ground-rules our work against what vLLM actually guarantees and
+turns the suite into the regression net. Full protocol:
+[.agents/test-porting.md](.agents/test-porting.md).
+
 ## STANDING DIRECTIVE — always compare vs vLLM (the oracle), same workload
 
 Every change that could affect correctness OR performance MUST be compared

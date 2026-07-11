@@ -1,0 +1,310 @@
+# Spike: FlashInfer-parity NVFP4 small-M dispatch and SM12 tactics
+
+**Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
+spike; row is `READY`. **Pins:** vLLM `e24d1b24fe96`, pip-vLLM `0.24.0`,
+installed FlashInfer `0.6.12`, CUTLASS `v4.4.2`, CUDA `13.0.88`, and the
+Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
+
+This spike is the mandatory contract before changing the FP4 plan cache or
+kernel set. It is source- and execution-grounded, but contains no runtime
+change and claims no new performance result.
+
+## Scope
+
+Restore vLLM/FlashInfer-equivalent selection for dense NVFP4 W4A4 GEMMs on
+SM120/SM121, starting with the exact 27B online gap. The row owns:
+
+- hybrid `M` tuning buckets, including distinct 1/2/4/8/16 decode buckets;
+- one tuning result per complete shape/device/dtype/tactic-set key, with
+  single-flight miss handling and capture-safe cache hits;
+- FlashInfer's eight SM12 CTA shapes crossed with `swap_ab` and
+  static-persistent/Stream-K scheduling (32 tactics, in upstream order);
+- workspace high-water sizing, forced-tactic diagnostics, warmup and optional
+  persistent plan-cache compatibility;
+- BF16 gate-model output first, followed by the upstream FP16 output mode
+  before the permanent kernel row can close;
+- exact per-GEMM, real-model, trace, online latency/throughput and memory gates.
+
+The first implementation checkpoint is deliberately narrower: correct the
+bucket identity and single-flight behavior while retaining the current four
+wide candidates. The second checkpoint ports the 32-tactic family. They use
+separate same-binary toggles and separate A/Bs; a result cannot attribute a
+stacked change to one lever.
+
+Out of scope for this spike:
+
+- W4A16 Marlin (`KERNEL-GEMM-MARLIN-W4A16`), FP8, MoE routing, attention,
+  scheduler admission, HTTP transport, prefix caching, or new quant formats;
+- merged QKV/gate-up projection topology and quantization fusion. Those are
+  real source/trace differences but are independently gateable later levers;
+- changing FP4 quantization, block-scale layout, alpha semantics, sampling, or
+  the 27B correctness contract to manufacture a speed win;
+- running 35B performance while any 27B acceptance axis remains below vLLM.
+
+Dispatch follows vLLM. On GB10, `FlashInferCuteDslNvFp4LinearKernel` rejects
+SM12, the FlashInfer CUTLASS kernel wins the linear-kernel priority probe, and
+its autotuner chooses from all valid tactics for a hybrid `M` bucket. A
+missing/unsupported tactic is skipped during warmup; runtime precision never
+falls back silently. The existing torch-free emulation path remains a
+diagnostic/correctness reference, not the production performance arm.
+
+## Trace-grounded problem
+
+The exact pushed-`a531e05` online campaign is the binding before-state. It ran
+cache-off, greedy, closed-loop 1024-input/128-output requests at c1/2/4/8/16/32
+for three interleaved repetitions. All 2,016 requests, six memory returns, the
+model gate and paired traces passed, but no concurrency passed all 20
+performance axes.
+
+Two independent observations localize the FP4 selection defect:
+
+1. Local `NextPow2M` clamps to 16, so actual M=1/2/4/8/16 share one
+   `(mp2,N,K)` cache entry. The ascending ladder tunes that entry at M=1 and
+   reuses its tactic through c16. Three clean servers started directly at c16
+   retuned M=16 and measured mean TPOT **161.747/161.719/161.729 ms**, versus
+   **167.484 ms** in the standard ascending series and **161.698 ms** for vLLM.
+2. The vLLM dependency trace contains the production tactics absent locally.
+   Its dominant W4A4 kernels include CTA **128x32x256** with both
+   `StreamKScheduler` (95,232 calls) and `StaticPersistentScheduler` (118,192
+   calls). Local code exposes only four N>=128 persistent candidates and no
+   `swap_ab` or Stream-K variants. Profiler percentages are not compared across
+   the different trace mechanisms; kernel identity and call presence are the
+   structural evidence.
+
+Evidence root:
+`~/work/vllm.cpp-online-gate/evidence/a531e055f0ef81b1d7296a7cba99d8f09373a265`.
+Campaign/trace-status hashes are `24d78fbc…e9d2a` / `1c702ef9…142a`; ours
+nsys/kernel hashes are `22d5a0f4…f247d1` / `ab7d0131…c0d6a3`; vLLM
+trace/kernel hashes are `83fd0f41…d2a66` / `7056183f…cce417`.
+
+## Upstream chain and execution dependency
+
+### vLLM orchestration
+
+- `vllm/model_executor/kernels/linear/__init__.py:407-420` orders CUDA NVFP4
+  backends: CuTe DSL, FlashInfer CUTLASS, native CUTLASS, Marlin, other
+  dependency paths, then emulation.
+- `vllm/model_executor/kernels/linear/nvfp4/flashinfer.py:97-176` capability
+  gates FlashInfer CUTLASS, swizzles/pads weights once, accepts pre-quantized
+  activation+scale pairs, and invokes `flashinfer_scaled_fp4_mm(...,
+  backend="cutlass")`.
+- `vllm/config/vllm.py:193-275,1192-1200` enables FlashInfer autotuning for
+  optimization levels O1-O3; the production oracle resolves O3 and full/
+  piecewise cudagraphs.
+- `vllm/model_executor/warmup/kernel_warmup.py:133-220` tunes at the maximum
+  token budget before serving, writes a persistent cache on rank zero,
+  broadcasts it, and loads identical tactics on every rank.
+- `vllm/model_executor/warmup/flashinfer_autotune_cache.py:19-41` fingerprints
+  the configuration and chooses `autotune_configs.json` under a versioned
+  FlashInfer workspace.
+
+### FlashInfer 0.6.12 execution owner
+
+The installed dependency under
+`~/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/` is the source of
+truth for what actually ran:
+
+- `gemm/gemm_base.py:5771-5816` gives FP4's dynamic activation-M dimension the
+  hybrid bucket generator and uncapped mapping; scale/output dimensions remain
+  constrained to the real M contract.
+- `fused_moe/utils.py:212-307` defines the exact mapping: powers of two through
+  256, 256-wide steps through 2048, 512-wide steps through 4096, then powers
+  of two. Crucially, 1/2/4/8/16 remain distinct.
+- `autotuner.py:1384-1436` warms and times each tactic with events, optionally
+  inside a CUDA graph; `:1438-1584` generates all bucket profiles and keys
+  cache lookup by runner plus mapped shapes and extras.
+- `gemm/gemm_base.py:1300-1340` exposes every tactic returned by
+  `fp4_gemm_tactic_num()` and passes the selected integer to the compiled
+  runner.
+- `data/include/flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h:47-147`
+  dispatches DP versus Stream-K and `swap_ab`; `:187-220` enumerates eight
+  tiles times two operand orientations times two schedulers.
+- The same dependency's `fp4_gemm_template_sm120.h:99-195` constructs the raw
+  argument/workspace/capture-safe launch; `:216-327` uses an explicit
+  tensor-op/TMA epilogue, block-scaled cooperative mainloop,
+  `StaticPersistentScheduler` or `StreamKScheduler`, and the pointer/dimension
+  swap needed by `swap_ab`.
+- `data/csrc/fp4_gemm_cutlass_sm120.cu:41-75,140-180` binds tactic IDs,
+  high-water workspace and BF16/FP16 output to the raw runner.
+
+The exact upstream tactic order is stable for parity and diagnostics:
+
+1. tiles: 128x32x128, 128x32x256, 128x64x128, 128x64x256,
+   128x128x128, 128x128x256, 256x128x128, 128x256x128;
+2. within each tile: swap-AB DP, ordinary DP, swap-AB Stream-K, ordinary
+   Stream-K.
+
+The current local comment that narrow-N tiles matter only when matrix N is
+small is rejected by the execution trace: tile N is kernel geometry, while
+the Qwen projection N remains large. The oracle selects 128x32 tiles for the
+real gate shapes.
+
+## Our baseline
+
+- `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:108-125` retains the two native
+  vLLM fallback configs; `:127-165` adds two more wide persistent configs.
+- `:217-283` already provides a torch-free raw pointer/shape/scale/alpha/
+  workspace/stream launcher, so no PyTorch or FlashInfer runtime dependency is
+  required.
+- `:329-339` exposes only four candidates. The implementation uses
+  `ElementC=OutType`, a block-scaled epilogue builder and persistent scheduling;
+  it cannot instantiate the four narrow-N configurations.
+- `:369-390,423-459` keys the plan by `(max(16,next_pow2(M)),N,K)`, releases
+  the mutex before profiling, and therefore both aliases five small-M shapes
+  and permits duplicate concurrent tuning.
+- `:394-420` profiles three warmups plus ten iterations on the real output and
+  catches unsupported candidates. `:461-470` guarantees a cache hit before
+  graph capture only by the current model's eager graph-size warmup; no
+  explicit capture-miss rejection or persistent plan cache exists.
+- `:525-571` supports BF16 output and F32 through a BF16 staging/cast
+  deviation. FP16, which FlashInfer supports, is absent.
+- `tests/vt/test_ops_nvfp4_fp4.cpp:319-398` has one M=96/N=256/K=512 CUTLASS
+  correctness case. It does not cover bucket identity, every tactic, M=1/2/3,
+  concurrency, capture misses, workspace growth, forced dispatch, or real
+  projection shapes.
+
+Real 27B W4A4 projection classes to benchmark include:
+
+| Projection | M sweep | N | K |
+|---|---:|---:|---:|
+| full-attention Q | 1,2,4,8,16,32 | 12,288 | 5,120 |
+| full-attention K/V | 1,2,4,8,16,32 | 1,024 | 5,120 |
+| attention/GDN output | 1,2,4,8,16,32 | 5,120 | 6,144 |
+| dense gate/up | 1,2,4,8,16,32 | 17,408 | 5,120 |
+| dense down | 1,2,4,8,16,32 | 5,120 | 17,408 |
+
+## Port map
+
+| Upstream concern | Local disposition |
+|---|---|
+| hybrid bucket generator/mapping (`fused_moe/utils.py:212-307`) | add a pure, unit-testable plan helper; map 1/2/4/8/16 independently, preserve 256/2048/4096 phase boundaries, and key device, architecture, output dtype, N, K, bucket and tactic-set version |
+| profile/cache key (`autotuner.py:1438-1584`) | one per-key state machine (`empty -> tuning -> ready/failed`) with condition-variable/future single-flight; waiters never retune; cache insertion publishes only a complete plan |
+| capture behavior | query `cudaStreamIsCapturing`; a ready lookup is allocation/sync-free, while an uncached capture is a loud pre-launch error rather than an event synchronization inside capture |
+| 32 configs (`fp4_gemm_cutlass_template_sm120.h:47-220`) | port the dependency-owned raw template semantics into split local CUDA TUs: explicit TMA epilogue with `ElementC=void`, block-scaled cooperative mainloop, static persistent + Stream-K, both orientations and exact tactic order |
+| `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
+| workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
+| warmup/persistence (`kernel_warmup.py:133-220`) | tune all configured hybrid buckets before server readiness, version cache entries by source/tactic ABI/device/CUDA/CUTLASS/model shape, load atomically, and keep lazy tuning only as a fail-closed diagnostic path |
+| output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
+| diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
+
+No implementation copies FlashInfer's Python orchestration. The raw C++/CUDA
+dispatcher and templates are Apache-2.0-compatible source ports with upstream
+file/commit comments; local `vt::Tensor` validation replaces only tensor
+wrappers.
+
+## Tests to port
+
+| Upstream executable specification | Local port/evidence |
+|---|---|
+| `tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py:26-168` | extend `tests/vt/test_ops_nvfp4_fp4.cpp` with M=1/2/3 and padded/non-padded shapes, BF16 first and FP16 at its breadth leaf, autotune off/on, scale-layout validation, forced tactics and dequantized-matmul tolerance |
+| `tests/kernels/quantization/test_nvfp4_scaled_mm.py:17-100` | preserve the native fallback reference and all listed M/N/K shapes so full-tactic work cannot regress the existing two-config path |
+| `tests/v1/determinism/test_nvfp4_batch_invariant_scaled_mm.py:31-101` | port as an explicit diagnostic mode in a fresh process; never silently make batch-invariant math the production default if it loses the vLLM performance floor |
+| `tests/v1/determinism/test_nvfp4_batch_invariant.py:22-100` | retain the gate model's deterministic common-prefix contract across c1/2/4/8/16/32 and exact native token counts; record full generated text diagnostically because vLLM's own FP4 backends diverge after near ties |
+| FlashInfer bucket helpers `fused_moe/utils.py:212-307` | table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; assert distinct plan entries at every graph capture size |
+| FlashInfer tactic enumeration `fp4_gemm_cutlass_template_sm120.h:187-220` | assert 32 stable tactic descriptors/order; force every supported tactic over representative small-M and real Qwen shapes; unsupported configs are reported/skipped only during tuning |
+| autotuner cache behavior | multi-thread same-key test proves one profiling pass; different keys progress independently; ready lookup works under CUDA capture; uncached capture fails; stale-version disk entry is rejected; no partial entry survives an exception |
+
+The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
+the longest prefix on which vLLM production and emulation agree; it may not be
+weakened or replaced with a self-golden. Per-GEMM numerical tolerance and
+native token-count correctness are preconditions to all speed claims.
+
+## Gates
+
+1. **Record/build:** source comments cite vLLM and FlashInfer pins; clean CUDA
+   13.0.88 `sm_121a` build, warning-as-error, record checker/mutations and
+   documentation checkpoint pass. Split-TU compile time and binary-size deltas
+   are recorded.
+2. **Unit correctness:** bucket/single-flight/cache tests pass; all 32 tactic
+   descriptors are present; every supported forced tactic matches the
+   dequantized BF16 reference within the upstream tolerance. Existing native
+   fallback and fused quant tests remain green.
+3. **CUDA safety/lifecycle:** compute-sanitizer covers small/padded/real shapes,
+   every scheduler/orientation class, workspace growth/reuse and graph replay
+   with zero errors. No process-exit scratch leak is added; queue/device
+   ownership follows `BACKEND-ABI-VT` or records the existing pool debt.
+4. **Real models:** 27B default and each diagnostic fallback pass the committed
+   greedy common-prefix gate and exact output counts; 35B 16/16 remains
+   unchanged for default/fallback because it does not dispatch this W4A4 GEMM.
+5. **Component A/B:** each implementation checkpoint uses one binary and an
+   interleaved AB/BA/AB series on the real projection shapes and c1-c32 online
+   slices. Default must be reproducibly faster and no individual latency,
+   throughput or memory axis may regress versus its fallback.
+6. **Execution trace:** nsys ours and the vLLM oracle on the identical c16/48
+   workload. The bucket checkpoint must show independent selected plans for
+   M=1/2/4/8/16. The tactic checkpoint must show the oracle-selected
+   narrow/static/Stream-K family where the same shape selects it; kernel lists,
+   calls, workspace and launch behavior are archived.
+7. **Binding 27B gate:** rerun the exact full c1/2/4/8/16/32, three-repetition,
+   cache-off online campaign against fresh production vLLM after each accepted
+   checkpoint. Ours must be no worse on every throughput, TTFT, TPOT/ITL,
+   E2E and memory axis. A component win does not waive a red end-to-end axis.
+8. **35B/final:** only after every 27B axis passes, run the exact 35B campaign
+   and both-model direct-library/online/trace/memory gates. The row remains
+   open for FP16/cross-architecture breadth even if the order-0 GB10 gate
+   passes.
+
+Every GPU series holds one uncontended `/tmp/gpu` lock for all arms and traces.
+The active HTTP campaign completes and releases its immutable build before any
+new FP4 GPU command begins.
+
+## Dependencies
+
+- `SERVE-GATE-ONLINE` owns the exact corpus, commands, validation and fresh
+  vLLM denominator. Prefix caching stays off and max-seqs/token budget/model
+  length/admission/sampling remain unchanged.
+- `SERVE-ASYNC-LLM` HTTP capacity is measured first so transport stalls cannot
+  contaminate the FP4 A/B. The FP4 source does not alter HTTP or scheduling.
+- CUDA 13.0.88, GB10/sm_121a, CUTLASS 4.4.2 and enough build storage for 32
+  heavy instantiations are required. SM120 cross-build/runtime becomes a
+  backend follow-up; other architectures keep their current dispatch.
+- `BACKEND-ABI-VT` defines the future common workspace lifecycle. This repair
+  may use the current raw adapter, but it may not invent a conflicting resource
+  contract or worsen known teardown debt.
+- The Qwen3.6-27B snapshot and exact vLLM/FlashInfer environment are immutable
+  benchmark inputs. FlashInfer source is inspected from the installed package;
+  no runtime Python dependency is introduced.
+
+## Work breakdown
+
+| Work | Deliverable | State / gate |
+|---|---|---|
+| W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
+| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | next; unit/CUDA/model + component AB/BA/AB + full exact 27B campaign |
+| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | after W1 measurement; every-tactic sanitizer, trace, component and exact 27B campaign |
+| W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
+| W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
+
+W1 and W2 are intentionally separate performance iterations. W3 cannot be
+folded into their timed arms because tuning placement changes startup and
+first-request behavior. W4 breadth cannot delay an order-0 BF16 speed repair,
+but its open state remains visible in the kernel matrix.
+
+## Risks and decisions
+
+- **Compile/binary growth:** 32 heavy CUTLASS instantiations can exhaust a
+  monolithic nvcc process. Split by tile/scheduler into bounded TUs and record
+  build time/object size. Do not prune a traced tactic merely to shorten build.
+- **Narrow-N construction:** the current collective builder fails N=32/64
+  scale-factor TMA checks. Port FlashInfer's explicit tensor-op epilogue and
+  cooperative block-scaled mainloop; do not approximate those shapes with the
+  existing builder and then claim tactic parity.
+- **Swap-AB correctness:** pointer/scale/M/N swapping changes internal layout
+  but not the public `[M,N]` contract. Forced-tactic tests must catch transpose
+  or scale-stream mistakes before tuning can select the path.
+- **Stream-K workspace:** query the maximum across every enabled tactic and
+  reserve it before capture. An allocation, event sync, or plan mutation during
+  graph replay is a gate failure.
+- **Autotune races:** the current unlocked profiling window can duplicate work
+  and publish nondeterministically. Single-flight chooses once; failures wake
+  waiters and leave a retryable/explicit failed state, never a partial plan.
+- **Persistent-cache staleness:** include tactic ABI, source revision, device
+  capability, CUDA/CUTLASS versions, output dtype and relevant model geometry in
+  the fingerprint; reject rather than reinterpret old tactic integers.
+- **FP4 near ties:** different valid reduction schedules can change later
+  generated tokens. Correctness uses the oracle-common deterministic prefix,
+  per-GEMM error bounds and exact native counts. Speed may never be purchased
+  by weakening those gates or switching sampling.
+- **Attribution:** nsys/torch-profiler timings are structurally informative but
+  differently perturbed. Unprofiled interleaved A/B owns performance; traces
+  own actual dispatch identity. Re-profile and re-rank after every checkpoint.

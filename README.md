@@ -24,9 +24,13 @@ OpenAI-compatible server.
 > preallocates `max_num_seqs + 4` workers, while
 > `VLLM_CPP_HTTP_FIXED_POOL=0` retains the legacy same-binary A/B arm; the
 > 32-persistent-client regression passes 100 consecutive runs plus
-> ASan+UBSan/TSan. Its exact GB10 c32/full-ladder gate is still pending. Exact
-> FlashInfer FP4 bucket/tactic parity follows. The 35B campaign is held until
-> 27B passes every axis. Historical temperature/token-budget-mismatched ratios
+> ASan+UBSan/TSan. Its exact GB10 c32/full-ladder gate is still pending. The
+> full FlashInfer dependency-chain
+> [FP4 repair spike](.agents/specs/nvfp4-small-m-dispatch.md) is now accepted:
+> exact hybrid buckets/single-flight tuning and the 32-tactic SM12 family are
+> separate measured iterations, with no runtime fix claimed yet. The 35B
+> campaign is held until 27B passes every axis. Historical
+> temperature/token-budget-mismatched ratios
 > remain diagnostics only. The tables track real, tested support and are kept
 > current as work lands (see
 > `.agents/`). CPU multithreaded dispatch is now
@@ -251,8 +255,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   current FP4 implementation is not yet FlashInfer-equivalent: its small-M cache
   bucket aliases five distinct runtime shapes and exposes only four wide
   persistent tactics, while the traced vLLM dependency selects from a wider
-  static-persistent/Stream-K family. Until repaired, isolated per-shape wins do
-  not establish end-to-end tactic parity.
+  static-persistent/Stream-K family. The accepted
+  [implementation spike](.agents/specs/nvfp4-small-m-dispatch.md) inventories
+  the exact hybrid mapping, eight tiles × two operand orientations × two
+  schedulers, upstream tests, workspace/capture rules and separate W1/W2 A/B
+  gates. It is a plan, not an implementation result. Until repaired, isolated
+  per-shape wins do not establish end-to-end tactic parity.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and

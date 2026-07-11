@@ -4750,3 +4750,32 @@ behavior, two-engine reuse, correctness, TTFT, transfer bandwidth, memory,
 failure recovery and metrics. This checkpoint is inventory-only and therefore
 records `NOT APPLICABLE` performance: no local connector or LMCache result is
 claimed.
+
+## 2026-07-11 — exact small-M FP4 dispatch/tactic spike accepted
+
+The reproduced `KERNEL-GEMM-NVFP4-W4A4` gap now has a committed implementation
+contract at `specs/nvfp4-small-m-dispatch.md`. Source inspection covers pinned
+vLLM's NVFP4 backend priority, FlashInfer application and pre-serve warmup, plus
+the installed FlashInfer 0.6.12 hybrid-bucket/autotuner/raw SM12 template chain.
+Execution grounding remains the exact `a531e05` trace: local
+`max(16,next_pow2(M))` aliases M=1/2/4/8/16, while vLLM actually runs
+128x32x256 Stream-K and static-persistent kernels absent from the four local
+wide candidates. Three direct-c16 fresh servers still own the causal
+before-state: 161.747/161.719/161.729-ms mean TPOT versus 167.484 ms after the
+ascending M=1-led ladder and 161.698 ms for standard vLLM.
+
+The accepted sequence is factorial and fail-closed. W1 ports exact hybrid
+buckets plus a complete device/dtype/shape/tactic-version key, per-key
+single-flight and capture-miss rejection, with the aliased cache retained only
+as a same-binary diagnostic arm. W2 separately ports all eight CTA shapes,
+swap-AB and static-persistent/Stream-K scheduling (32 tactics in FlashInfer
+order). W3 moves all-bucket tuning before readiness and versions persistent
+plans. FP16 and SM120 breadth remain W4 rather than being hidden by the GB10
+BF16 speed gate. Each of W1/W2/W3 gets its own unit/CUDA/model/AB-BA-AB/trace
+and full exact 27B oracle checkpoint; 35B performance remains forbidden until
+all 27B axes pass.
+
+This is documentation-only: no runtime source, selected tactic, benchmark
+result or support claim changed. The row moves from `ANCHOR-BACKFILL` to
+`READY`. The immutable `4e1d8ca` HTTP/oracle campaign is not modified and must
+finish and release the DGX before the W1 claim or any new FP4 GPU command.

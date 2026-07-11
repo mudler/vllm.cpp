@@ -1176,13 +1176,19 @@ void RunGdnPostConvCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t d
   const auto conv = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
   const auto araw = RandomF32(static_cast<size_t>(t * hv), seed + 1, -1.0f, 1.0f);
   const auto braw = RandomF32(static_cast<size_t>(t * hv), seed + 2, -1.0f, 1.0f);
+  std::vector<float> ba(static_cast<size_t>(t * 2 * hv));
+  for (int64_t i = 0; i < t; ++i) {
+    std::copy_n(braw.data() + i * hv, hv, ba.data() + i * 2 * hv);
+    std::copy_n(araw.data() + i * hv, hv, ba.data() + i * 2 * hv + hv);
+  }
   const auto alog = RandomF32(static_cast<size_t>(hv), seed + 3, -1.0f, 1.0f);
   const auto dtb = RandomF32(static_cast<size_t>(hv), seed + 4, -1.0f, 1.0f);
   const vt::L2NormArgs args{1e-6f};
   Queue cq = Q();
   Tensor tconv = MakeT(const_cast<float*>(conv.data()), DType::kF32, Cpu(), {t, conv_dim});
-  Tensor taraw = MakeT(const_cast<float*>(araw.data()), DType::kF32, Cpu(), {t, hv});
-  Tensor tbraw = MakeT(const_cast<float*>(braw.data()), DType::kF32, Cpu(), {t, hv});
+  Tensor tba = MakeT(ba.data(), DType::kF32, Cpu(), {t, 2 * hv});
+  Tensor tbraw = tba.Slice(1, 0, hv);
+  Tensor taraw = tba.Slice(1, hv, 2 * hv);
   Tensor talog = MakeT(const_cast<float*>(alog.data()), DType::kF32, Cpu(), {hv});
   Tensor tdtb = MakeT(const_cast<float*>(dtb.data()), DType::kF32, Cpu(), {hv});
 
@@ -1223,8 +1229,9 @@ void RunGdnPostConvCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t d
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
   DeviceTensor dconv(gpu, gq.q, DType::kF32, {t, conv_dim}, conv.data());
-  DeviceTensor daraw(gpu, gq.q, DType::kF32, {t, hv}, araw.data());
-  DeviceTensor dbraw(gpu, gq.q, DType::kF32, {t, hv}, braw.data());
+  DeviceTensor dba(gpu, gq.q, DType::kF32, {t, 2 * hv}, ba.data());
+  Tensor dbraw = dba.tensor().Slice(1, 0, hv);
+  Tensor daraw = dba.tensor().Slice(1, hv, 2 * hv);
   DeviceTensor dalog(gpu, gq.q, DType::kF32, {hv}, alog.data());
   DeviceTensor ddtb(gpu, gq.q, DType::kF32, {hv}, dtb.data());
   DeviceTensor dgq(gpu, gq.q, DType::kF32, {t, hk, dk});
@@ -1233,7 +1240,7 @@ void RunGdnPostConvCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t d
   DeviceTensor dgg(gpu, gq.q, DType::kF32, {t, hv});
   DeviceTensor dgb(gpu, gq.q, DType::kF32, {t, hv});
   vt::GdnPostConv(gq.q, dgq.tensor(), dgk.tensor(), dgv.tensor(), dgg.tensor(), dgb.tensor(),
-                  dconv.tensor(), daraw.tensor(), dbraw.tensor(), dalog.tensor(), ddtb.tensor(),
+                  dconv.tensor(), daraw, dbraw, dalog.tensor(), ddtb.tensor(),
                   args);
   std::vector<float> gq_q(fq.size()), gq_k(fk.size()), gq_v(fv.size()), gq_g(fg.size()),
       gq_b(fb.size());

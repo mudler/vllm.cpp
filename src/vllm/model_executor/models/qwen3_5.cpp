@@ -1068,6 +1068,16 @@ bool Bf16PackedMlpEnabled() {
   return on;
 }
 
+bool Bf16PackedGdnBaEnabled() {
+  static const bool on = [] {
+    const char* master = std::getenv("VT_BF16_PACKED_LINEAR");
+    const char* ba = std::getenv("VT_BF16_PACKED_GDN_BA");
+    return (master == nullptr || master[0] != '0') &&
+           (ba == nullptr || ba[0] != '0');
+  }();
+  return on;
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
 // VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
@@ -2029,8 +2039,18 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
-  DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
-  DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
+  std::optional<DBuf> ba_packed, braw_buf, araw_buf;
+  Tensor braw, araw;
+  if (Bf16PackedGdnBaEnabled() && !w.in_proj_ba.Empty()) {
+    ba_packed.emplace(MatmulF32D(d, h, w.in_proj_ba));  // [T,2*Hv] = [b|a]
+    braw = ba_packed->t().Slice(1, 0, Hv);
+    araw = ba_packed->t().Slice(1, Hv, 2 * Hv);
+  } else {
+    braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
+    araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    braw = braw_buf->t();
+    araw = araw_buf->t();
+  }
 
   // Causal conv1d over the token stream (silu activation), fresh zero state. conv
   // in/out dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16); f32
@@ -2064,8 +2084,8 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dql2(d, actdt, {T, Hk, Dk});
   DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
-    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw.t(),
-                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw,
+                    braw, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
     DBuf qf(d, actdt, {T, Hk, Dk});
     DBuf kf(d, actdt, {T, Hk, Dk});
@@ -2073,7 +2093,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});
     vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-    vt::GdnGBeta(d.q, g.t(), beta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::GdnGBeta(d.q, g.t(), beta.t(), araw, braw, a_log_dev, dt_bias_dev);
     vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
     vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
   }
@@ -2284,8 +2304,18 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
-  DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
-  DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
+  std::optional<DBuf> ba_packed, braw_buf, araw_buf;
+  Tensor braw, araw;
+  if (Bf16PackedGdnBaEnabled() && !w.in_proj_ba.Empty()) {
+    ba_packed.emplace(MatmulF32D(d, h, w.in_proj_ba));  // [T,2*Hv] = [b|a]
+    braw = ba_packed->t().Slice(1, 0, Hv);
+    araw = ba_packed->t().Slice(1, Hv, 2 * Hv);
+  } else {
+    braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
+    araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    braw = braw_buf->t();
+    araw = araw_buf->t();
+  }
 
   // Causal conv1d over the token stream, PERSISTENT conv_state (gathered by the
   // per-request state indices, updated in place, scattered back). conv in/out
@@ -2369,8 +2399,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dql2(d, actdt, {T, Hk, Dk});
   DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
-    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw.t(),
-                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw,
+                    braw, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
     DBuf qf(d, actdt, {T, Hk, Dk});
     DBuf kf(d, actdt, {T, Hk, Dk});
@@ -2378,7 +2408,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});
     vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw, braw, a_log_dev, dt_bias_dev);
     vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
     vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
   }

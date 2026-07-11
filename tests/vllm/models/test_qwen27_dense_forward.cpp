@@ -258,10 +258,10 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     PlainWeightFixture f;
     AddPlainLayerCommon(f, base);
     const std::string la = base + "linear_attn.";
-    f.AddBf16(la + "in_proj_qkv.weight", {4, 3});
-    f.AddBf16(la + "in_proj_z.weight", {4, 3});
-    f.AddBf16(la + "in_proj_b.weight", {2, 3});
-    f.AddBf16(la + "in_proj_a.weight", {2, 3});
+    f.AddBf16(la + "in_proj_qkv.weight", {4, 3}, 1);
+    f.AddBf16(la + "in_proj_z.weight", {4, 3}, 20);
+    f.AddBf16(la + "in_proj_b.weight", {2, 3}, 40);
+    f.AddBf16(la + "in_proj_a.weight", {2, 3}, 50);
     f.AddBf16(la + "out_proj.weight", {3, 4});
     f.AddBf16(la + "conv1d.weight", {4, 1, 3});
     f.AddF32(la + "A_log", {2}, -2.0F);
@@ -274,6 +274,13 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(layer.gdn.out_proj_fp4.Empty());
     CHECK_FALSE(layer.gdn.out_proj.Empty());
     CHECK(layer.gdn.out_proj.nk);
+    CHECK(layer.gdn.in_proj_ba.nk);
+    CHECK(layer.gdn.in_proj_ba.shape[0] == 4);
+    CHECK(layer.gdn.in_proj_ba.shape[1] == 3);
+    const auto* ba = reinterpret_cast<const uint16_t*>(
+        layer.gdn.in_proj_ba.bytes.data());
+    CHECK(ba[0] == vt::F32ToBF16(40.0F));
+    CHECK(ba[6] == vt::F32ToBF16(50.0F));
     CHECK(layer.gdn.a_log.dtype == DType::kF32);
     CHECK(layer.gdn.dt_bias.dtype == DType::kF32);
     CHECK(layer.gdn.norm_weight.dtype == DType::kF32);

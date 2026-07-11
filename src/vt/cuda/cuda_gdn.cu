@@ -649,7 +649,8 @@ template <typename Tqkv, typename Tconv>
 __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out,
                                   float* beta_out, const Tconv* conv, const float* araw,
                                   const float* braw, const float* a_log, const float* dt_bias,
-                                  int64_t hk, int64_t dk, int64_t hv, int64_t dv, float eps) {
+                                  int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+                                  int64_t a_stride, int64_t b_stride, float eps) {
   const int64_t key_dim = hk * dk, value_dim = hv * dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const int64_t tok = blockIdx.x;
@@ -697,10 +698,10 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
     for (int64_t j = threadIdx.x; j < value_dim; j += kBlock) Store(vo, j, Load(vin, j));
     for (int64_t h = threadIdx.x; h < hv; h += kBlock) {
       const int64_t idx = tok * hv + h;
-      const float x = araw[idx] + dt_bias[h];
+      const float x = araw[tok * a_stride + h] + dt_bias[h];
       const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
       g_out[idx] = -expf(a_log[h]) * sp;
-      beta_out[idx] = 1.0f / (1.0f + expf(-braw[idx]));
+      beta_out[idx] = 1.0f / (1.0f + expf(-braw[tok * b_stride + h]));
     }
   }
 }
@@ -729,7 +730,8 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     GdnPostConvKernel<Tqkv, Tconv><<<grid, kBlock, 0, s>>>(
         q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
         beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<float>(), braw.Ptr<float>(),
-        a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, args.eps);
+        a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, araw.stride[0],
+        braw.stride[0], args.eps);
   };
   const bool qkv_f32 = q_out.dtype == DType::kF32;
   const bool conv_f32 = conv.dtype == DType::kF32;

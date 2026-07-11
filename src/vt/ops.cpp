@@ -1434,9 +1434,9 @@ void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, con
                araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
                a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
            "gdn_g_beta: all tensors must be f32");
-  VT_CHECK(g_out.IsContiguous() && beta_out.IsContiguous() && araw.IsContiguous() &&
-               braw.IsContiguous() && a_log.IsContiguous() && dt_bias.IsContiguous(),
-           "gdn_g_beta: contiguous required");
+  VT_CHECK(g_out.IsContiguous() && beta_out.IsContiguous() && araw.stride[1] == 1 &&
+               braw.stride[1] == 1 && a_log.IsContiguous() && dt_bias.IsContiguous(),
+           "gdn_g_beta: outputs/weights contiguous and a/b inner-contiguous required");
   VT_CHECK(g_out.device == q.device && beta_out.device == q.device && araw.device == q.device &&
                braw.device == q.device && a_log.device == q.device && dt_bias.device == q.device,
            "gdn_g_beta: device mismatch (g_out/beta_out/araw/braw/a_log/dt_bias/queue)");
@@ -1514,9 +1514,9 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
            "gdn_post_conv: g/beta/araw/braw/a_log/dt_bias must be f32");
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                g_out.IsContiguous() && beta_out.IsContiguous() && conv.IsContiguous() &&
-               araw.IsContiguous() && braw.IsContiguous() && a_log.IsContiguous() &&
+               araw.stride[1] == 1 && braw.stride[1] == 1 && a_log.IsContiguous() &&
                dt_bias.IsContiguous(),
-           "gdn_post_conv: contiguous required");
+           "gdn_post_conv: outputs/conv/weights contiguous and a/b inner-contiguous required");
   VT_CHECK(q_out.device == q.device && k_out.device == q.device && v_out.device == q.device &&
                g_out.device == q.device && beta_out.device == q.device && conv.device == q.device &&
                araw.device == q.device && braw.device == q.device && a_log.device == q.device &&

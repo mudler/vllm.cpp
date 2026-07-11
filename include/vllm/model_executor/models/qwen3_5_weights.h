@@ -138,6 +138,8 @@ struct GdnLayerWeights {
   OwnedTensor in_proj_z;      // bf16 [H, value_dim] (FP8 dequant + T)
   OwnedTensor in_proj_b;      // bf16 [H, Hv]        (bf16 + T)
   OwnedTensor in_proj_a;      // bf16 [H, Hv]        (bf16 + T)
+  // Plain-BF16 vLLM layout [2*Hv,H], nk=true: b rows then a rows.
+  OwnedTensor in_proj_ba;
   OwnedTensor conv1d_weight;  // bf16 [conv_dim, K]  (bf16, NOT transposed)
   OwnedTensor a_log;          // f32  [Hv]
   OwnedTensor dt_bias;        // f32  [Hv]

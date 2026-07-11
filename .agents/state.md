@@ -6574,3 +6574,49 @@ pass, including `test_qwen27_dense_forward` 5/5 (304 assertions). The two
 failures are unchanged local baseline issues: `test_cuda_ops` has 11 odd-size
 BF16 cuBLASLt outputs outside tolerance at M=17,K=31,N=13, and
 `test_op_parity` has no runner for committed `qwen36_gguf_greedy` goldens.
+
+## 2026-07-11 — completed local BF16 projection-packing sweep
+
+Completed the remaining load-time packing candidates against vLLM 0.24's
+Qwen3.5 stacked mapping (`qwen3_5.py:279-293`). The retained change concatenates
+plain-BF16 GDN `in_proj_b` and `in_proj_a` raw `[N,K]` rows into `[2*Hv,H]` at
+load. One F32-output cuBLASLt GEMM produces `[b|a]`; `GdnPostConv` and the
+unfused `GdnGBeta` fallback read the two inner-contiguous strided views directly,
+so there is no materialization or unpack launch. `VT_BF16_PACKED_GDN_BA=0` (or
+the shared `VT_BF16_PACKED_LINEAR=0`) restores the two-GEMM path from the same
+binary. CPU and CUDA tests exercise the strided views, and the loader test pins
+shape and b-then-a row order.
+
+Correctness remains the same 15/16 complete 32-token natural continuations as
+the MLP-only baseline: request 1 first differs at generated token 6, vLLM token
+430 versus project token 51070. Two fresh interleaved exact-workload greedy
+pairs measured packed 6324.85 / 6315.72 (mean **6320.29**) versus split 6301.99 /
+6297.88 (mean **6299.94**, **+0.32%**). Mean packed TTFT/TPOT are 785.65/39.74
+ms versus split 786.46/39.88 ms. The unchanged vLLM greedy mean is 6719.53, so
+the cumulative project ratio is **0.9406x**. Temperature-1 packed runs are
+6153.43 / 6146.07 (mean **6149.75**) versus split 6132.46 / 6128.82 (mean
+**6130.64**, **+0.31%**); vLLM remains 6669.28, ratio **0.9221x**.
+
+Matched temperature-1 Nsight captures (32 requests, concurrency 16, 1024 input,
+24 output) are `/tmp/nsys-out/vllm-cpp-4b-packed-ba-{on,off}.nsys-rep`.
+Packed is 7001.85 versus split 6970.65 tok/s under tracing (+0.45%); aggregate
+GPU kernel time falls 4.1356→4.1101 s (-0.62%). Packing removes 1,320 logical
+GEMMs (24 GDN layers x 55 forwards), but the wider GEMM's cuBLASLt split-K
+tactic adds 696 reduction launches, so physical kernel instances fall
+31800→31176 (-624). The tactic is still beneficial: the relevant split GEMM
+groups total about 51 ms versus about 28 ms for packed including reductions.
+
+Two broader candidates were disqualified and removed. Attention QKV packing
+improved throughput 6306.79→6327.18 (+0.32%) but changed the combined GEMM tactic
+and reduced natural greedy parity 15/16→14/16. GDN QKV/Z packing was neutral
+(6312.26 split versus 6310.99 packed) and reduced parity 15/16→13/16; sharing an
+F32 output also forfeited the existing BF16 mixed-QKV/conv traffic path. No
+generalized attention, convolution, norm, or cache stride changes from those
+experiments remain. Performance parity is still open.
+
+Verification: full CUDA and CPU builds succeed. CUDA CTest is 90/92; the two
+failures are the unchanged odd-size BF16 cuBLASLt tolerance case in
+`test_cuda_ops` (11 outputs at M=17,K=31,N=13) and the missing
+`qwen36_gguf_greedy` runner in `test_op_parity`. CPU CTest is 91/92 with only
+that same missing parity runner. The changed loader and GDN suites pass on both
+backends, and the real-model natural-corpus run confirms the unchanged 15/16.

@@ -221,6 +221,8 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   g.in_proj_z = LoadBf16RawNK(get, la + "in_proj_z.weight");
   g.in_proj_b = LoadBf16RawNK(get, la + "in_proj_b.weight");
   g.in_proj_a = LoadBf16RawNK(get, la + "in_proj_a.weight");
+  g.in_proj_ba =
+      PackBf16RawNK({&g.in_proj_b, &g.in_proj_a}, la + "in_proj_ba");
   // 27B NVFP4 checkpoints store this as compressed tensors; smaller BF16
   // Qwen3.5 dense checkpoints store an ordinary `.weight`.
   if (has(la + "out_proj.weight_packed")) {

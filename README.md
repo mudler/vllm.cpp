@@ -514,7 +514,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   the project still uses SplitMix while vLLM uses torch Philox. The fresh Nsight
   trace puts random sampling plus softmax at 2.4% of project GPU time. Packed
   gate/up removes one GEMM per MLP invocation; a matched trace removed 1,760
-  launches and 1.92% of GPU kernel time. Ordinary BF16 GEMMs and eager launch
+  launches and 1.92% of GPU kernel time. GDN B/A removes one logical GEMM per
+  GDN invocation; its wider cuBLASLt tactic adds split-K reductions, so the
+  matched trace removes 624 physical launches and 0.62% of GPU kernel time.
+  Attention QKV and GDN QKV/Z merge trials were reverted because they worsened
+  the current 15/16 greedy result. Ordinary BF16 GEMMs and eager launch
   structure still dominate. A trial of the existing dense CUDA graph on BF16
   preserved the 15/16 short-corpus result but segfaulted in `libcuda.so` under
   sustained load, so that routing was reverted.

@@ -1119,10 +1119,10 @@ void GdnGBetaKernel(Queue&, Tensor& g_out, Tensor& beta_out, const Tensor& araw,
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t h = 0; h < hv; ++h) {
       const int64_t idx = i * hv + h;
-      const float x = LoadF32(araw, idx) + LoadF32(dt_bias, h);
+      const float x = LoadF32(araw, i * araw.stride[0] + h) + LoadF32(dt_bias, h);
       const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus
       StoreF32(g_out, idx, -std::exp(LoadF32(a_log, h)) * sp);
-      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
+      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, i * braw.stride[0] + h)));
     }
   }
   });
@@ -1183,10 +1183,10 @@ void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tens
     // g/beta from a/b + A_log/dt_bias (§6).
     for (int64_t h = 0; h < hv; ++h) {
       const int64_t idx = i * hv + h;
-      const float x = LoadF32(araw, idx) + LoadF32(dt_bias, h);
+      const float x = LoadF32(araw, i * araw.stride[0] + h) + LoadF32(dt_bias, h);
       const float sp = x > 20.0f ? x : std::log1p(std::exp(x));  // softplus
       StoreF32(g_out, idx, -std::exp(LoadF32(a_log, h)) * sp);
-      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, idx)));
+      StoreF32(beta_out, idx, Sigmoid(LoadF32(braw, i * braw.stride[0] + h)));
     }
   }
   });

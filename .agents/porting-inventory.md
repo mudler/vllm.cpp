@@ -633,6 +633,17 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     both before and after the final AOT/BF16-output stack; this is a local
     diagnostic, not a gate-model parity claim.
 
+    **LOCAL plain-BF16 MERGED PROJECTIONS (2026-07-11).** The dense loader now
+    mirrors vLLM's stacked mappings for MLP gate/up and GDN B/A by concatenating
+    raw `[N,K]` rows once at load time. The runtime consumes each packed output
+    directly, including strided B/A views in the GDN post-conv kernel; no unpack
+    kernel is introduced. Same-binary split fallbacks are
+    `VT_BF16_PACKED_MLP=0` and `VT_BF16_PACKED_GDN_BA=0` (or the shared
+    `VT_BF16_PACKED_LINEAR=0`). Local 4B natural greedy remains 15/16. The
+    cumulative exact-workload result is 6,320.29 greedy / 6,149.75 temperature-1
+    tok/s, 0.941x / 0.922x of vLLM. Attention QKV (+0.32% but 15/16→14/16) and
+    GDN QKV/Z (neutral, 15/16→13/16) merged-GEMM experiments were removed.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

@@ -51,6 +51,15 @@ repair: deterministic worker capacity for the configured concurrent-stream
 floor, a persistent-client regression, disconnect/teardown checks, and exact
 c32/full-ladder evidence. This repair does not authorize W3 scheduler overlap.
 
+The host implementation is now present: `ApiServer` replaces the default pool
+with exactly `max_concurrent_streams + 4` fixed workers, production passes
+`max_num_seqs`, and `VLLM_CPP_HTTP_FIXED_POOL=0` preserves cpp-httplib's legacy
+dynamic pool for same-binary A/B only. The real-socket regression parks 32
+keep-alive connections and proves a bounded control request remains readable;
+it passes 100 consecutive Release executions plus ASan+UBSan and TSan. The row
+stays `ACTIVE` because exact fixed-vs-legacy c32 and full-ladder GPU evidence is
+still required.
+
 ## Scope
 
 | Aspect | In scope | Out of scope (owning row) |
@@ -238,7 +247,7 @@ W4 anytime after W1 merges (or before, at the queue level).
 |---|---|---|---|
 | D1 | C ABI streaming shape (vLLM defines no C ABI — genuine product call) | decision | Add a handle-based non-blocking surface: `vllm_request_submit` plus a library-owned per-request delivery thread that consumes only that request's collector and invokes the existing per-delta callback; `cancel`/`wait`/`done`/`error`/`free` complete the lifecycle. KEEP `vllm_complete_stream` as a blocking wrapper so LocalAI consumers don't break. The additive 17-symbol set is C11/dlopen/export tested; the engine must outlive its request handles |
 | D2 | In-proc thread instead of process split | recorded deviation | Mirrors the EngineCoreProc/MPClient QUEUE semantics without ZMQ; the client API shape is kept so a future multiproc client is additive. Not a behavior change vLLM defines externally |
-| D3 | httplib worker-pool blocking on slow SSE clients | confirmed defect / bounded W2 repair | Exact `a531e05` c32 repetitions 1/3 strand one accepted unread socket for 205–207 s. Size the HTTP pool from an explicit configured stream-capacity floor plus bounded control-path headroom (not the library's 19-thread hardware heuristic), preserve disconnect-abort and clean join, expose/validate the server setting if needed for reproducibility, and gate above the initial-pool threshold plus exact c32. Do not rely on opportunistic `idle_thread_count_ == 0` growth |
+| D3 | httplib worker-pool blocking on slow SSE clients | implemented; GPU gate open | Exact `a531e05` c32 repetitions 1/3 strand one unread socket for 205–207 s. Production now fixes the pool at `max_num_seqs + 4`, logs the resolved count, and retains `VLLM_CPP_HTTP_FIXED_POOL=0` as a diagnostic same-binary fallback. The 32-client/control-reserve regression and sanitizer lifecycle gates pass. Exact c32/full-ladder A/B must still prove the runtime repair before closure |
 | D4 | Token-exactness under placeholders | risk | Preemption/stale-frame paths (`async_tokens_to_discard`, placeholder-aware `cache_blocks`) are where async can silently corrupt; covered by the ported preempt/abort async-scheduler tests + G1 on both gate models |
 | D5 | CUDA-graph replay vs the new copy stream | risk | The decode graph (`ENG-CUDAGRAPH`, `src/vt/cuda/cuda_backend.cu:76-105`) must not capture the copy stream; AsyncOutput copies run outside capture exactly as upstream keeps them out of graphed regions — verified by G1 with graphs ON |
 | D6 | Overlap win smaller in C++ than in Python | risk (must-measure) | vLLM's async default partly compensates Python/GIL host cost; our host step is already cheap, so G5 may show a smaller delta — the gate is "no regression + mirror behavior", the measured delta is recorded in the ledger either way |

@@ -227,9 +227,24 @@ int main(int argc, char** argv) {
     oai::OpenAIServingChat chat(engine, served_model_name, chat_prompt_fn,
                                 "hermes", args.enable_force_include_usage);
 
-    oai::ApiServer server(completion, chat, models, vllm::Version());
+    // Diagnostic opt-out exists only for same-binary attribution. Production
+    // defaults to the capacity-derived fixed pool.
+    const char* fixed_pool_env = std::getenv("VLLM_CPP_HTTP_FIXED_POOL");
+    const auto worker_pool_mode =
+        fixed_pool_env != nullptr && std::string(fixed_pool_env) == "0"
+            ? oai::ApiServer::HttpWorkerPoolMode::kLegacyDynamic
+            : oai::ApiServer::HttpWorkerPoolMode::kCapacityFixed;
+    oai::ApiServer server(completion, chat, models, vllm::Version(),
+                          static_cast<size_t>(args.max_num_seqs),
+                          worker_pool_mode);
     std::cerr << "server: listening on http://" << args.host << ":" << args.port
-              << " (model '" << served_model_name << "')\n";
+              << " (model '" << served_model_name << "', HTTP worker pool ";
+    if (server.http_worker_count() == 0) {
+      std::cerr << "legacy-dynamic";
+    } else {
+      std::cerr << server.http_worker_count() << " fixed";
+    }
+    std::cerr << ")\n";
     if (!server.listen(args.host, args.port)) {
       std::cerr << "server: failed to bind " << args.host << ":" << args.port
                 << "\n";

@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -303,7 +305,9 @@ std::string InVocabChatPrompt(
 struct ServerHarness {
   ServerHarness(const HfConfig& c, const Qwen3_5MoeWeights& w,
                 const Tokenizer& tok,
-                bool enable_force_include_usage = false)
+                bool enable_force_include_usage = false,
+                size_t max_concurrent_streams =
+                    ApiServer::kDefaultMaxConcurrentStreams)
       : scheduler(MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
                   /*enable_caching=*/true),
         runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, kMaxModelLen * 8),
@@ -316,7 +320,7 @@ struct ServerHarness {
         completion(async_engine, "test-model", enable_force_include_usage),
         chat(async_engine, "test-model", InVocabChatPrompt, "hermes",
              enable_force_include_usage),
-        server(completion, chat, models, "9.9.9") {}
+        server(completion, chat, models, "9.9.9", max_concurrent_streams) {}
 
   static SchedulerConfig MakeSchedulerConfig() {
     SchedulerConfig cfg;
@@ -928,4 +932,70 @@ TEST_CASE("api_server: concurrent requests share AsyncLLM without state races") 
 
   h.server.stop();
   server_thread.join();
+}
+
+TEST_CASE("api_server: configured persistent-stream capacity remains readable") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  constexpr size_t kStreamCapacity = 32;
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/false,
+                  kStreamCapacity);
+
+  CHECK(h.server.http_worker_count() ==
+        kStreamCapacity + ApiServer::kControlWorkerHeadroom);
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  // cpp-httplib keeps a worker inside process_and_close_socket while a
+  // keep-alive connection waits for its next request. Park exactly the
+  // configured stream floor this way, then prove the bounded control reserve
+  // still reads and answers another accepted socket. This is the deterministic
+  // CPU reproduction of the c32 unread-socket failure mode.
+  std::vector<std::unique_ptr<httplib::Client>> parked;
+  parked.reserve(kStreamCapacity);
+  for (size_t i = 0; i < kStreamCapacity; ++i) {
+    auto client = std::make_unique<httplib::Client>("127.0.0.1", port);
+    client->set_keep_alive(true);
+    client->set_connection_timeout(5, 0);
+    client->set_read_timeout(5, 0);
+    auto response = client->Get("/health");
+    REQUIRE(response);
+    CHECK(response->status == 200);
+    parked.push_back(std::move(client));
+  }
+  CHECK(parked.size() == kStreamCapacity);
+
+  httplib::Client control("127.0.0.1", port);
+  control.set_connection_timeout(5, 0);
+  control.set_read_timeout(5, 0);
+  auto response = control.Get("/health");
+  REQUIRE(response);
+  CHECK(response->status == 200);
+
+  parked.clear();
+  h.server.stop();
+  server_thread.join();
+}
+
+TEST_CASE("api_server: stream capacity must be positive") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  CHECK_THROWS_AS(ApiServer(h.completion, h.chat, h.models, "bad", 0),
+                  std::invalid_argument);
+}
+
+TEST_CASE("api_server: legacy worker pool is an explicit diagnostic mode") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  ApiServer legacy(
+      h.completion, h.chat, h.models, "legacy",
+      ApiServer::kDefaultMaxConcurrentStreams,
+      ApiServer::HttpWorkerPoolMode::kLegacyDynamic);
+  CHECK(legacy.http_worker_count() == 0);
 }

@@ -4693,3 +4693,37 @@ Campaign/trace-status SHA-256 are `24d78fbcd9b2…be9d2a` and
 `83fd0f415d03…d2a66` / `7056183f8447…cce417`. The immediate order is HTTP
 capacity → FP4 bucket semantics → FP4 tactics → re-rank remaining trace gaps →
 every-axis 27B closure → exact 35B closure → roadmap v1 feature work.
++
+## 2026-07-11 — fixed HTTP stream-capacity floor is CPU/sanitizer-gated
+
+`CLAIM-SERVE-HTTP-POOL-1` is active in isolated worktree
+`/home/mudler/_git/vllm.cpp-serve-http-pool` on branch
+`codex/serve-http-pool`. The bounded W2 repair does not touch scheduling or
+kernels. `ApiServer` now replaces cpp-httplib's hardware-derived opportunistic
+pool with exactly one worker per configured scheduler-visible stream plus four
+control-path workers. The production example passes `max_num_seqs` and logs
+the resolved count, so the c32 gate starts 36 fixed workers rather than a racy
+19-worker base. `VLLM_CPP_HTTP_FIXED_POOL=0` restores the exact legacy dynamic
+pool in the same executable for attribution; it is diagnostic, not default.
+
+The new real-socket regression parks 32 keep-alive clients, which keep their
+workers inside cpp-httplib's connection loop, and then proves the four-worker
+reserve reads and answers another `/health` request. It also covers invalid
+zero capacity and the explicit legacy mode. Clean Release focused API/help
+tests pass 2/2; `test_openai_api_server` passes 100 consecutive processes.
+Focused ASan+UBSan passes 1/1 with inherited process-lifetime leak reporting
+disabled, and GCC TSan passes 1/1 under this host's required
+`setarch x86_64 -R` workaround.
+
+The clean serial CPU suite is 104/105. Its only failure is the already-recorded
+unrelated C-API early-stop callback-count flake: producer-ahead DELTA merging
+yielded one callback where that old test demands exactly two. The isolated C
+API rerun passes, as do focused API/help reruns. No HTTP-capacity code touches
+the C ABI, collectors or output merging, so the failure is retained rather
+than folded into this performance repair.
+
+This is deliberately a CPU checkpoint, not performance closure. The next step
+is to commit and push the exact source, build that SHA on the idle DGX, and run
+the legacy/fixed c32 arms in AB/BA/AB order under one `/tmp/gpu` lock, followed
+by the fresh exact 27B oracle ladder. README and `docs/BENCHMARKS.md` record
+the GPU result as pending; `SERVE-ASYNC-LLM` remains `ACTIVE`.

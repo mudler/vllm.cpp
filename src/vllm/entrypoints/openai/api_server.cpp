@@ -4,8 +4,10 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -16,9 +18,48 @@
 
 namespace vllm::entrypoints::openai {
 
+namespace {
+
+size_t HttpWorkerCount(size_t max_concurrent_streams) {
+  if (max_concurrent_streams == 0) {
+    throw std::invalid_argument("max_concurrent_streams must be positive");
+  }
+  if (max_concurrent_streams >
+      std::numeric_limits<size_t>::max() -
+          ApiServer::kControlWorkerHeadroom) {
+    throw std::invalid_argument("max_concurrent_streams is too large");
+  }
+  return max_concurrent_streams + ApiServer::kControlWorkerHeadroom;
+}
+
+size_t HttpWorkerCount(size_t max_concurrent_streams,
+                       ApiServer::HttpWorkerPoolMode mode) {
+  const size_t fixed_count = HttpWorkerCount(max_concurrent_streams);
+  return mode == ApiServer::HttpWorkerPoolMode::kCapacityFixed ? fixed_count
+                                                               : 0;
+}
+
+}  // namespace
+
 // Opaque httplib::Server (pimpl — keeps httplib.h out of api_server.h).
 struct ApiServer::Impl {
+  Impl(size_t max_concurrent_streams, HttpWorkerPoolMode mode)
+      : http_worker_count(HttpWorkerCount(max_concurrent_streams, mode)) {
+    // cpp-httplib's default pool starts at hardware_concurrency()-1 and only
+    // grows if idle_thread_count_ is exactly zero at enqueue. A burst can queue
+    // accepted sockets while that counter is stale-positive; long-lived SSE
+    // jobs then prevent the queued sockets from ever being read. A fixed floor
+    // derived from the configured stream capacity removes that race and makes
+    // resource use reproducible.
+    if (http_worker_count != 0) {
+      server.new_task_queue = [workers = http_worker_count]() {
+        return new httplib::ThreadPool(workers);
+      };
+    }
+  }
+
   httplib::Server server;
+  size_t http_worker_count;
   // The legacy LLMEngine serving constructors remain for small synthetic
   // tests and embedding compatibility. Unlike AsyncLLM, that engine is driven
   // synchronously by its caller, so retain one shared lock for that seam only.
@@ -48,12 +89,13 @@ ApiServer::DispatchResult MakeError(int status, const std::string& type,
 
 ApiServer::ApiServer(OpenAIServingCompletion& completion,
                      OpenAIServingChat& chat, OpenAIServingModels& models,
-                     std::string version)
+                     std::string version, size_t max_concurrent_streams,
+                     HttpWorkerPoolMode worker_pool_mode)
     : completion_(completion),
       chat_(chat),
       models_(models),
       version_(std::move(version)),
-      impl_(std::make_unique<Impl>()) {}
+      impl_(std::make_unique<Impl>(max_concurrent_streams, worker_pool_mode)) {}
 
 ApiServer::~ApiServer() = default;
 
@@ -273,5 +315,9 @@ bool ApiServer::serve() { return impl_->server.listen_after_bind(); }
 void ApiServer::stop() { impl_->server.stop(); }
 
 bool ApiServer::is_running() const { return impl_->server.is_running(); }
+
+size_t ApiServer::http_worker_count() const {
+  return impl_->http_worker_count;
+}
 
 }  // namespace vllm::entrypoints::openai

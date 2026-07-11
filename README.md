@@ -20,8 +20,12 @@ OpenAI-compatible server.
 > capacity failure in two of three repetitions; the residual c1-c16 decode gap
 > includes a confirmed FP4 autotune-key defect. A fresh server started directly
 > at c16 removes that defect's TPOT gap (161.72-161.75 ms ours versus 161.70 ms
-> vLLM in the standard series), so HTTP capacity and exact FlashInfer FP4
-> bucket/tactic parity are the priority repairs. The 35B campaign is held until
+> vLLM in the standard series). The HTTP repair is now implemented: production
+> preallocates `max_num_seqs + 4` workers, while
+> `VLLM_CPP_HTTP_FIXED_POOL=0` retains the legacy same-binary A/B arm; the
+> 32-persistent-client regression passes 100 consecutive runs plus
+> ASan+UBSan/TSan. Its exact GB10 c32/full-ladder gate is still pending. Exact
+> FlashInfer FP4 bucket/tactic parity follows. The 35B campaign is held until
 > 27B passes every axis. Historical temperature/token-budget-mismatched ratios
 > remain diagnostics only. The tables track real, tested support and are kept
 > current as work lands (see
@@ -92,12 +96,17 @@ runs end-to-end on CPU:
   native-ID final/continuous usage frames; `--enable-force-include-usage`
   mirrors vLLM's server-wide force mode. This path is CPU/sanitizer-gated and
   awaits its fresh two-model GB10 online checkpoint before the row can close.
+  The HTTP transport now provisions a fixed `max_num_seqs + 4` worker floor so
+  every scheduler-visible SSE stream plus bounded health/discovery traffic has
+  delivery capacity; the legacy dynamic pool is a diagnostic A/B opt-out only.
   `--max-num-seqs` and `--max-num-batched-tokens` expose reproducible scheduler
   operating points. `/v1/models`, `/health`, and `/version` are
   present, while `/health`
   currently reports process liveness rather than probing engine health. The
-  async path passes the full CPU suite and ThreadSanitizer; its post-change
-  GB10 token/latency/throughput/memory gates are still pending. Chat templates
+  async/API path passes focused Release, ASan+UBSan and ThreadSanitizer; the
+  current full serial suite is 104/105 only on the recorded unrelated C-API
+  callback-count flake, which passes in isolation. Post-change GB10
+  token/latency/throughput/memory gates are still pending. Chat templates
   use a bounded minja-subset Jinja engine. `--[no-]enable-prefix-caching`
   exposes the tri-state cache policy; hybrid/attention-free generation models
   default off like pinned vLLM, while ordinary decoder models default on.
@@ -167,7 +176,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact `a531e05` 27B online throughput is 0.934-1.003× vLLM over c1-c32 medians (0.927× at c32 after two HTTP-capacity stalls), but the all-axis gate is still red. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate repeated 27B component A/B evidence. Current repairs target HTTP streaming capacity and FlashInfer-equivalent FP4 buckets/tactics before any 35B performance run. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact `a531e05` 27B online throughput is 0.934-1.003× vLLM over c1-c32 medians (0.927× at c32 after two HTTP-capacity stalls), but the all-axis gate is still red. The capacity-derived fixed HTTP pool is implemented and CPU/sanitizer-gated; its GB10 same-binary/c32 gate remains. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate repeated 27B component A/B evidence. FlashInfer-equivalent FP4 buckets/tactics follow before any 35B performance run. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -217,7 +226,8 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   run the full paged engine end-to-end, and their real-model **token-exact greedy
   correctness gates pass**. The CUDA kernel paths exercised by those gates are
   validated on real hardware.
-- **Production-vLLM performance is below the exact gate.** The historical 35B 1.0195× and
+- **Production-vLLM performance is below the exact gate.** The historical 35B
+  1.0195× and
   27B 1.007× offline ratios were produced with vLLM's
   `bench throughput` default `temperature=1.0`, while vllm.cpp used greedy
   `temperature=0`; the 27B vLLM arm also resolved an 8192-token scheduler budget
@@ -229,8 +239,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   remain above vLLM. Two c32 repetitions stranded one accepted HTTP connection
   for roughly 205-207 seconds; direct c16 trace starts separately prove that
   the current FP4 key aliases M=1/2/4/8/16 and reuses the first M=1 tactic.
-  These are concrete repair targets, not a hardware ceiling. The exact 35B run
-  waits behind 27B closure.
+  The HTTP repair now replaces that racy pool with a fixed
+  `max_num_seqs + 4` floor and keeps a same-binary legacy toggle. Its focused
+  real-socket test passes 100/100 plus ASan+UBSan/TSan; the exact GPU A/B remains
+  open. These are concrete repair targets, not a hardware ceiling. The exact
+  35B run waits behind 27B closure.
 - The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
   cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
   vendored FlashAttention-2 prefill, register-tiled GDN `delta_h`, tensor-core WY,
@@ -290,20 +303,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   a plausible native path; exact 35B mixed-quant loading must be proven, and
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
-  for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
-  `DONE`). Historical `31d053f` and offline ratios are non-binding because the
+  for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` is `ACTIVE`, not
+  `DONE`). Its fixed capacity-derived HTTP pool is CPU/sanitizer-gated and still
+  needs the exact same-binary GPU A/B. Historical `31d053f` and offline ratios
+  are non-binding because the
   audit found cache, sampling, token-budget, admission, and model-length
-  mismatches. Pushed `f065fce` completed the first exact 27B cache-off,
-  closed-loop baseline: 2,016/2,016 timed requests, three repetitions, six
-  memory returns, the real-model gate, and both corrected traces pass their
-  contracts. Mean total-throughput ratios are below the required floor at every
-  point: **0.962/0.926/0.936/0.945/0.978/0.972×** from c1 to c32; only 3–5/20
-  timing axes and 2/4 memory axes pass. Dispersion is low (throughput CV <0.7%),
-  so this is the binding 27B gap baseline, not noise or a parity pass. The
-  corrected nsys trace records 153,394 `cudaMemcpyAsync` calls; persistent GDN
-  state rows alone account for 20.809 GiB H2D plus 20.806 GiB D2H across its
-  three repetitions. That grounds device-resident KV/GDN state as the first
-  repair. W0 is merged at `7d29e0c`; its clean GB10 build, default/fallback
+  mismatches. Pushed `a531e05` is the current exact 27B cache-off, closed-loop
+  checkpoint: 2,016/2,016 timed requests, three repetitions, six memory returns,
+  the real-model gate, and paired traces pass their contracts. Median c1→c32
+  total ratios are **0.968/0.934/0.948/0.955/1.003/0.927×**; only
+  4/2/5/3/10/8 of 20 performance axes and 2/4 memory axes pass. The c32 result
+  includes two reproduced unread-socket stalls; direct-c16 traces separately
+  prove FP4 bucket aliasing. W0 is merged at `7d29e0c`; its clean GB10 build,
+  default/fallback
   35B+27B pointer/token gates, lifecycle, trace, and repeated 27B A/B pass. The
   measured W0 same-binary gain is +2.12% (20/20 timing axes). W1 then wins a
   separate same-binary A/B by +0.6246% (20/20) and collapses the traced copy
@@ -311,9 +323,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   vLLM denominator or may be multiplied into the old grid. Both model paths are
   W0 memory-access clean and the W1 indexed op is memcheck-clean, but the
   required zero-leak result remains open on inherited process-lifetime pools.
-  Fresh exact direct-library/online 27B and 35B every-axis closure remains
-  mandatory before later roadmap work; W2 direct indexed convolution-state
-  update is the next scoped lever if the fresh 27B run remains below floor.
+  Fixed HTTP capacity, exact FP4 bucket/tactic parity, and fresh every-axis 27B
+  closure remain mandatory before 35B and later roadmap work. W2 direct indexed
+  convolution-state update stays scoped until those confirmed causes are
+  removed and the residual trace is re-ranked.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

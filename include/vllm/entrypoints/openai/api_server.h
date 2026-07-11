@@ -23,6 +23,7 @@
 #ifndef VLLM_ENTRYPOINTS_OPENAI_API_SERVER_H_
 #define VLLM_ENTRYPOINTS_OPENAI_API_SERVER_H_
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,8 +38,23 @@ namespace vllm::entrypoints::openai {
 // model registry (constructed + owned by the caller; they outlive it).
 class ApiServer {
  public:
+  enum class HttpWorkerPoolMode {
+    kCapacityFixed,
+    // Diagnostic same-binary fallback for A/B attribution only.
+    kLegacyDynamic,
+  };
+
+  // A live SSE response occupies one cpp-httplib worker while it waits on its
+  // collector. Keep enough fixed workers for every scheduler-visible stream,
+  // plus a small bounded reserve for health/discovery/control requests.
+  static constexpr size_t kDefaultMaxConcurrentStreams = 8;
+  static constexpr size_t kControlWorkerHeadroom = 4;
+
   ApiServer(OpenAIServingCompletion& completion, OpenAIServingChat& chat,
-            OpenAIServingModels& models, std::string version);
+            OpenAIServingModels& models, std::string version,
+            size_t max_concurrent_streams = kDefaultMaxConcurrentStreams,
+            HttpWorkerPoolMode worker_pool_mode =
+                HttpWorkerPoolMode::kCapacityFixed);
   ~ApiServer();
 
   ApiServer(const ApiServer&) = delete;
@@ -82,6 +98,10 @@ class ApiServer {
   // True once the server is accepting connections (poll before issuing
   // requests against a bind_to_any_port + serve() server on another thread).
   bool is_running() const;
+  // Configured fixed worker count. Exposed for startup diagnostics and the
+  // transport-capacity regression; it is max_concurrent_streams + headroom,
+  // or zero when the diagnostic legacy-dynamic mode is selected.
+  size_t http_worker_count() const;
 
  private:
   OpenAIServingCompletion& completion_;

@@ -11,14 +11,18 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** (MoE hybrid) and **Qwen3.6-27B** (dense W4A4) — now run the
 > full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
 > **token-exact greedy correctness gates passing**. Performance parity is
-> currently **GATING**: the first exact cache-off, closed-loop 27B online
-> baseline is reproducibly below pinned vLLM at every c1-c32 throughput point
-> (0.9258-0.9775×). Device-resident cache W0 and indexed-state-I/O W1 each win
-> their separate same-binary component A/Bs (+2.1239% and +0.6246%, both 20/20
-> online axes), and W1 cuts traced async copies from 163,540 to 7,508 versus its
-> fallback. Those component ratios are not multiplied into the old grid: a
-> fresh current-SHA direct-library and online 27B oracle run, followed by 35B,
-> is still mandatory. Historical temperature/token-budget-mismatched ratios
+> currently **GATING**. The exact pushed-`a531e05` cache-off, closed-loop 27B
+> online checkpoint validates all 12 performance groups but remains below the
+> every-axis floor: median total-throughput ratios at c1/2/4/8/16/32 are
+> **0.968/0.934/0.948/0.955/1.003/0.927×**, with only
+> **4/2/5/3/10/8 of 20** throughput+latency axes and **2/4** memory axes
+> passing. The c32 total-throughput outlier includes a confirmed HTTP worker
+> capacity failure in two of three repetitions; the residual c1-c16 decode gap
+> includes a confirmed FP4 autotune-key defect. A fresh server started directly
+> at c16 removes that defect's TPOT gap (161.72-161.75 ms ours versus 161.70 ms
+> vLLM in the standard series), so HTTP capacity and exact FlashInfer FP4
+> bucket/tactic parity are the priority repairs. The 35B campaign is held until
+> 27B passes every axis. Historical temperature/token-budget-mismatched ratios
 > remain diagnostics only. The tables track real, tested support and are kept
 > current as work lands (see
 > `.agents/`). CPU multithreaded dispatch is now
@@ -153,7 +157,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. Production-vLLM performance parity is reopened pending exact matched-config reruns. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact `a531e05` 27B online checkpoint is valid but below the all-axis floor; 35B performance is held behind the 27B repairs. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -163,7 +167,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance remains open. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) pass separate repeated 27B same-binary A/Bs with 20/20 axes; W1 reduces traced async copies 163,540→7,508. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate, and fresh 27B→35B oracle parity remains mandatory |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact `a531e05` 27B online throughput is 0.934-1.003× vLLM over c1-c32 medians (0.927× at c32 after two HTTP-capacity stalls), but the all-axis gate is still red. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate repeated 27B component A/B evidence. Current repairs target HTTP streaming capacity and FlashInfer-equivalent FP4 buckets/tactics before any 35B performance run. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -213,18 +217,29 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   run the full paged engine end-to-end, and their real-model **token-exact greedy
   correctness gates pass**. The CUDA kernel paths exercised by those gates are
   validated on real hardware.
-- **Production-vLLM performance is reopened.** The historical 35B 1.0195× and
+- **Production-vLLM performance is below the exact gate.** The historical 35B 1.0195× and
   27B 1.007× offline ratios were produced with vLLM's
   `bench throughput` default `temperature=1.0`, while vllm.cpp used greedy
   `temperature=0`; the 27B vLLM arm also resolved an 8192-token scheduler budget
   while vllm.cpp used 2048. Those measurements and their memory observations
   remain useful diagnostics, but they are not identical-workload acceptance
-  evidence. Both direct-library and online every-axis gates remain `GATING`
-  until fresh, repeated, same-config runs close them.
+  evidence. The replacement pushed-`a531e05` 27B online series is exact and
+  binding: all 12 groups validate, but only c16 median total throughput exceeds
+  vLLM and no concurrency passes all 20 performance axes. Host PSS/RSS also
+  remain above vLLM. Two c32 repetitions stranded one accepted HTTP connection
+  for roughly 205-207 seconds; direct c16 trace starts separately prove that
+  the current FP4 key aliases M=1/2/4/8/16 and reuses the first M=1 tactic.
+  These are concrete repair targets, not a hardware ceiling. The exact 35B run
+  waits behind 27B closure.
 - The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
   cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
   vendored FlashAttention-2 prefill, register-tiled GDN `delta_h`, tensor-core WY,
-  fused fp8 RMSNorm→quant, bf16 GDN I/O, and default-on fp4 per-shape autotuning.
+  fused fp8 RMSNorm→quant, bf16 GDN I/O, and default-on fp4 autotuning. The
+  current FP4 implementation is not yet FlashInfer-equivalent: its small-M cache
+  bucket aliases five distinct runtime shapes and exposes only four wide
+  persistent tactics, while the traced vLLM dependency selects from a wider
+  static-persistent/Stream-K family. Until repaired, isolated per-shape wins do
+  not establish end-to-end tactic parity.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and

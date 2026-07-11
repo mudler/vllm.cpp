@@ -60,10 +60,11 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- Offline vLLM throughput baselines are complete. The first
-  `SERVE-GATE-ONLINE` campaign
-  ended invalid/incomplete (vLLM startup failures and ours-35B aborts); diagnose
-  and rerun the full every-axis series under the GPU mutex.
+- Historical offline vLLM throughput baselines are non-binding after the
+  sampling/token-budget audit. Exact pushed-`a531e05` 27B online evidence is
+  complete and below the every-axis floor; it reproduces cpp-httplib c32 worker
+  under-capacity and FP4 small-M key/tactic mismatch. Repair and repeat 27B
+  under one whole-series GPU lock before starting the exact 35B campaign.
 - Provision SGLang `v0.5.13` (`28b095c`) with the digest-pinned CUDA 13 image
   from [the leaf spike](specs/cuda-sglang-low-concurrency.md) in an isolated
   environment after current GPU claims; never mutate `~/venvs/vllm-oracle`.

@@ -35,6 +35,22 @@ split), `ENG-ASYNC-SCHED` (async/overlap scheduling), `ENG-PRIORITY-SCHED`
    so every A/B we run compares our sync loop against vLLM's overlapped
    default — a mirror gap on the denominator itself.
 
+### 2026-07-11 execution update: live SSE works; HTTP capacity is now binding
+
+W1/W2/W4 subsequently landed and the exact pushed-`a531e05` online campaign
+proves live/native-count streaming at every standard point. It also turns D3
+from a hypothetical risk into a reproduced defect. On the 20-CPU DGX,
+cpp-httplib starts 19 workers and grows only when `idle_thread_count_ == 0` at
+the enqueue instant (`third_party/httplib/httplib.h:161-169,10359-10377`). A
+streaming socket owns that worker through collector waits and keepalive. At c32,
+repetitions 1 and 3 each left one accepted connection with 2,131 unread request
+bytes and zero response bytes for roughly 205–207 seconds while the other 31
+streams completed normally; the healthy repetition grew enough workers and
+reached 1087.15 tok/s. `CLAIM-SERVE-HTTP-POOL-1` therefore owns a bounded W2
+repair: deterministic worker capacity for the configured concurrent-stream
+floor, a persistent-client regression, disconnect/teardown checks, and exact
+c32/full-ladder evidence. This repair does not authorize W3 scheduler overlap.
+
 ## Scope
 
 | Aspect | In scope | Out of scope (owning row) |
@@ -164,6 +180,7 @@ tracked reason, never dropped.
 | `tests/v1/core/test_priority_scheduler_random.py` | randomized heap-property/ordering property test | `tests/vllm/v1/test_request_queue.cpp` (seeded) | T-unit | W4 |
 | `tests/entrypoints/openai/completion/test_completion.py:259` (`test_completion_streaming`) and the chat streaming analog | streamed chunks concat to non-stream text AND **chunks arrive incrementally** — new arrival-time assertion: first chunk observed before generation completes, chunk count > 1 spread over the response window (the pre-W2 conformance case could only inspect precomputed frames) | `tests/vllm/entrypoints/openai/test_api_server.cpp` (AsyncLLM harness: live completion/chat arrival/cadence, disconnect abort and concurrent requests); real-model arrival remains G3 | T-unit + T-e2e gate | W2 |
 | `tests/benchmarks/test_serve_cli.py:1` | `vllm bench serve` smoke against a live server | DGX smoke in the `SERVE-GATE-ONLINE` harness: run upstream's real `vllm bench serve` client against OUR server (mirror-exact measurement client), plus `tests/examples/test_bench.cpp:15,48` kept green | T-e2e | W2 |
+| Local transport-capacity regression (cpp-httplib-specific adaptation; no upstream equivalent because vLLM serves through asyncio) | More simultaneous persistent SSE clients than the library's hardware-concurrency-derived initial pool; every request must be read and produce its first frame without waiting for another stream to finish | `tests/vllm/entrypoints/openai/test_api_server.cpp`: deterministic configured-capacity case, thread/lifecycle return, disconnect abort retained | T-unit + T-e2e gate | W2 repair |
 | Token-exactness twins (ours) | existing greedy gates re-run with async ON — async must not change tokens | `tests/parity/test_qwen36_paged_engine.cpp:140`, `tests/parity/test_qwen27_paged_engine.cpp:110` | T-parity | W3 |
 | Combine/post-update kernel goldens | goldens dumped from `vllm/v1/worker/gpu/input_batch.py:304-406,457-543` via the LLM-API torch-profiler recipe | `tests/parity/test_op_parity.cpp` op rows (+`PendingRunnerOps` discipline if goldens land first) | T-parity | W3 |
 
@@ -177,7 +194,7 @@ lock.
 |---|---|---|
 | G1 token-exactness (W1-W4) | both greedy engine gates, same binary, async ON vs OFF and priority vs fcfs: `flock /tmp/gpu -c 'ctest -R qwen36_paged_engine'` + same for `qwen27_paged_engine` on DGX | 16/16 token-for-token identical in every mode; a diff = hard fail |
 | G2 unit/property suites (per leaf) | `ctest` CPU tier (CI) for the ported modules above | green, skips only with tracked reasons |
-| G3 streaming reality (W2) | conformance arrival-time case + manual `curl -N` sanity; then `vllm bench serve` (upstream client, `~/venvs/vllm-oracle`) against our server at c∈{1,16} | TTFT << total latency at c=1 (first chunk arrives while decode continues); native usage proves the exact token count and retained ITLs are inter-choice timings. The normal cadence is token count - 1, but pinned vLLM's producer-ahead `RequestOutputCollector` may legally merge DELTA outputs, so fewer intervals are recorded rather than rejected; **this makes `SERVE-GATE-ONLINE` runnable — the every-axis online campaign (benchmark-protocol.md, TTFT/TPOT/ITL/throughput/memory, both gate models) IS the e2e gate**, executed with/handed to `CLAIM-SERVE-GATE-1`'s harness (DGX `~/work/vllm.cpp-online-gate`) |
+| G3 streaming reality + capacity (W2) | conformance arrival-time/persistent-client cases + manual `curl -N`; then upstream `vllm bench serve` against our server at c∈{1,16,32} and the complete standard ladder | TTFT << total latency at c=1; native usage proves exact token count; every one of 32 accepted persistent clients is read and receives a first frame without another request completing; no 19-worker hardware-concurrency cliff or queued socket. Retained ITLs remain inter-choice timings and may be coalesced by the pinned single-slot collector. The binding every-axis campaign is executed with `CLAIM-SERVE-GATE-1` under one whole-series lock |
 | G4 no-throughput-regression (W1/W2) | offline gate workloads re-run vs the pre-change binary (same-binary-set A/B, fresh exact matched-config vLLM denominators per benchmark-protocol.md): both 35B and 27B direct-library mirrors | ≥ 1.00× vs our own sync baseline within run-noise and ≥ fresh vLLM on every required axis. Historical 35B 1.02× / 27B 1.007× values are diagnostics only after the sampling/token-budget audit and are not standing floors |
 | G5 overlap wins (W3) | same A/B with async ON vs OFF on both gate models, plus the nsys trace-plan capture | async ON ≥ async OFF on throughput axes and ≤ on TTFT/TPOT (mirroring vLLM's own default rationale); GPU-idle gap between steps shrinks in the trace |
 | G6 memory | peak RSS/VRAM sampled in the same A/Bs | ≤ sync baseline + bounded queue overhead; the ~25-35%-less-than-vLLM edge not regressed |
@@ -208,7 +225,7 @@ Claim-sized, non-overlapping; each row independently gateable:
 | W | Row ID | Deliverable | Files (primary) | Gate |
 |---|---|---|---|---|
 | W1 | `ENG-CORE-BUSY-LOOP` | `EngineCoreProc` thread + input/output queues + in-proc client; sync `LLMEngine` path untouched | new `core_proc.{h,cpp}`, `core_client.{h,cpp}` | G1, G2, G4 |
-| W2 | `SERVE-ASYNC-LLM` | `AsyncLLM` + `RequestOutputCollector` + output-handler thread; real SSE emission + engine-mutex removal + disconnect-abort; C ABI submit/callback; server wiring | new `async_llm.{h,cpp}`; `output_processor.{h,cpp}`, `serving_completion.*`, `serving_chat.*`, `api_server.cpp`, `include/vllm.h`, `src/capi/vllm_c.cpp`, `examples/server/main.cpp` | G1, G2, G3, G4, G6, G7 |
+| W2 | `SERVE-ASYNC-LLM` | `AsyncLLM` + `RequestOutputCollector` + output-handler thread; real SSE emission + engine-mutex removal + disconnect-abort; deterministic HTTP worker capacity for configured concurrent streams; C ABI submit/callback; server wiring | new `async_llm.{h,cpp}`; `output_processor.{h,cpp}`, `serving_completion.*`, `serving_chat.*`, `api_server.{h,cpp}`, `include/vllm.h`, `src/capi/vllm_c.cpp`, `examples/server/main.cpp`; capacity regression in `test_api_server.cpp` | G1, G2, G3, G4, G6, G7 |
 | W3 | `ENG-ASYNC-SCHED` | `AsyncScheduler` + virtual hooks; `step_with_batch_queue` depth-2; runner `AsyncOutput` copy-stream + GPU-resident `last_sampled_tokens` + combine kernels; default-ON config resolution | new `async_scheduler.{h,cpp}`; `scheduler.{h,cpp}`, `core.cpp`, `runner.cpp`, `input_batch.cpp`, `config/scheduler.*` | G1, G2, G5, G6 + kernel goldens |
 | W4 | `ENG-PRIORITY-SCHED` | `PriorityRequestQueue` + policy config + priority preemption + `priority` request plumbing | `request_queue.{h,cpp}`, `scheduler.cpp`, protocol/serving plumbing | G1, G2 |
 
@@ -221,7 +238,7 @@ W4 anytime after W1 merges (or before, at the queue level).
 |---|---|---|---|
 | D1 | C ABI streaming shape (vLLM defines no C ABI — genuine product call) | decision | Add a handle-based non-blocking surface: `vllm_request_submit` plus a library-owned per-request delivery thread that consumes only that request's collector and invokes the existing per-delta callback; `cancel`/`wait`/`done`/`error`/`free` complete the lifecycle. KEEP `vllm_complete_stream` as a blocking wrapper so LocalAI consumers don't break. The additive 17-symbol set is C11/dlopen/export tested; the engine must outlive its request handles |
 | D2 | In-proc thread instead of process split | recorded deviation | Mirrors the EngineCoreProc/MPClient QUEUE semantics without ZMQ; the client API shape is kept so a future multiproc client is additive. Not a behavior change vLLM defines externally |
-| D3 | httplib worker-pool blocking on slow SSE clients | risk | Each streaming response occupies one httplib worker while blocked on the collector; mitigation = pool sizing + disconnect-abort; measure at c=16 in G3 (vLLM has the same backpressure via asyncio, different mechanics) |
+| D3 | httplib worker-pool blocking on slow SSE clients | confirmed defect / bounded W2 repair | Exact `a531e05` c32 repetitions 1/3 strand one accepted unread socket for 205–207 s. Size the HTTP pool from an explicit configured stream-capacity floor plus bounded control-path headroom (not the library's 19-thread hardware heuristic), preserve disconnect-abort and clean join, expose/validate the server setting if needed for reproducibility, and gate above the initial-pool threshold plus exact c32. Do not rely on opportunistic `idle_thread_count_ == 0` growth |
 | D4 | Token-exactness under placeholders | risk | Preemption/stale-frame paths (`async_tokens_to_discard`, placeholder-aware `cache_blocks`) are where async can silently corrupt; covered by the ported preempt/abort async-scheduler tests + G1 on both gate models |
 | D5 | CUDA-graph replay vs the new copy stream | risk | The decode graph (`ENG-CUDAGRAPH`, `src/vt/cuda/cuda_backend.cu:76-105`) must not capture the copy stream; AsyncOutput copies run outside capture exactly as upstream keeps them out of graphed regions — verified by G1 with graphs ON |
 | D6 | Overlap win smaller in C++ than in Python | risk (must-measure) | vLLM's async default partly compensates Python/GIL host cost; our host step is already cheap, so G5 may show a smaller delta — the gate is "no regression + mirror behavior", the measured delta is recorded in the ledger either way |

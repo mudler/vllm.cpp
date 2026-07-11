@@ -19,7 +19,21 @@ than the production contract. `ed6247d` subsequently captured a complete exact
 vLLM c16/48 trace (kernel summary SHA-256 `8213…df64`), but it has no comparable
 ours arm. The historical offline denominators are also reopened: pinned
 `vllm bench throughput` used temperature 1 while ours used temperature 0, and
-the 27B budgets were 8192 versus 2048. No existing performance ratio is binding.
+the 27B budgets were 8192 versus 2048.
+
+The replacement pushed-`a531e05` series is now binding 27B evidence. All 12
+engine/concurrency groups validate; 2,016/2,016 timed requests, six memory
+returns, the commit-bound model gate and the paired-trace contract pass. Median
+total-throughput ratios c1→c32 are
+0.9679/0.9338/0.9482/0.9547/1.0028/0.9268×, with only
+4/2/5/3/10/8 of 20 performance axes and 2/4 memory axes passing. The evidence
+also reproduces two independent causes: c32 can leave one accepted socket
+unread for 205–207 s when cpp-httplib under-spawns streaming workers, and the
+local FP4 tuner aliases M=1/2/4/8/16. Fresh-server direct-c16 traces retune real
+M=16 and improve TPOT to 161.72–161.75 ms, essentially vLLM's 161.698 ms.
+Campaign/trace status hashes are `24d78fbc…e9d2a` / `1c702ef9…142a`. This is a
+valid failed gate, not a parity claim. The 35B series waits until repaired 27B
+passes every axis.
 
 ## Scope
 

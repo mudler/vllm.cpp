@@ -4636,3 +4636,60 @@ Focused release tests pass 2/2, leak-disabled ASan+UBSan access tests pass 2/2,
 and serial CTest passes 105/105. The canonical record checker reports
 ENGINE=97 / MODEL=323 / QUANT=81 / KERNEL=30 / BACKEND=51; record mutations
 pass 13/13, documentation mutations 5/5, and `git diff --check` is clean.
++
+## 2026-07-11 — exact a531 27B checkpoint is binding below floor; HTTP and FP4 causes reproduced
+
+The priority-zero speed-parity campaign has completed for pushed commit
+`a531e055f0ef81b1d7296a7cba99d8f09373a265`. One uncontended `/tmp/gpu` lock
+covered the exact 27B model gate, three interleaved ours/vLLM repetitions over
+c1/2/4/8/16/32, six process/GPU-memory returns and cache-eviction proofs, then
+paired ours nsys and vLLM torch-profiler captures. The lock and GPU are now
+idle. The exact 35B campaign was intentionally not started: project policy now
+requires closing every 27B axis before spending the next whole-model window.
+
+All twelve 27B engine/concurrency groups are binding-eligible. The campaign
+retains 2,016/2,016 successful timed requests, exact native input/output counts,
+a passing 1/1 commit-bound model gate and a passing trace contract. Median
+total-throughput ratios c1→c32 are
+**0.967904/0.933755/0.948181/0.954688/1.002822/0.926776×**. Only
+**4/2/5/3/10/8 of 20** direction-aware throughput/latency axes pass; memory
+passes **2/4**. Median ours/vLLM PSS is 48,175,251/28,075,085 KiB, RSS
+48,177,656/28,401,904 KiB, reported GPU memory 39,067/72,704 MiB, and
+available-memory drop 66,305,132/80,687,860 KiB. This is a valid failed gate,
+not a harness failure and not a parity claim.
+
+The c32 total-throughput collapse is localized to the HTTP delivery layer.
+cpp-httplib derives an initial 19-worker pool from the DGX's 20 CPUs and grows
+only when `idle_thread_count_ == 0` exactly when a job is enqueued. Each SSE
+response owns its worker through collector waits and keepalive. In repetitions
+1 and 3, a live `ss -tinp` sample caught one accepted connection with 2,131
+unread request bytes, zero bytes sent and roughly 126 seconds already idle;
+the request finally received its first frame at about 205–207 seconds. All
+other 31 streams decoded with normal ITLs. The healthy repetition grew enough
+workers and reached 1087.15 tok/s. This rules out the model, OutputProcessor and
+client as the cause of those two stalls. `CLAIM-SERVE-HTTP-POOL-1` now owns only
+the deterministic worker-capacity/lifecycle repair, API regression and exact
+c32/full-ladder evidence in an isolated worktree.
+
+The residual c1-c16 decode gap has a separate reproduced FP4 dispatch cause.
+`NextPow2M` currently clamps M=1/2/4/8/16 to one M=16 cache key, so the ascending
+standard ladder tunes the key at actual M=1 and reuses that tactic through c16.
+Three fresh server traces started directly at c16 instead tune real M=16 and
+measure mean TPOT 161.747/161.719/161.729 ms, essentially the standard vLLM
+161.698-ms mean, versus 167.484 ms for ours after the ascending ladder. The
+paired runtime trace also proves production vLLM selects FlashInfer
+128×32×256 Stream-K and static-persistent FP4 tactics absent from our four wide
+persistent candidates. The next kernel iteration must first commit a specific
+whole-dependency-chain spike, then separately measure exact hybrid-M
+buckets/single-flight tuning and the full tactic family. Merged projection
+topology remains a real trace/source difference but will be a later factorial
+A/B, not mixed into either confirmed repair.
+
+Evidence root is
+`~/work/vllm.cpp-online-gate/evidence/a531e055f0ef81b1d7296a7cba99d8f09373a265`.
+Campaign/trace-status SHA-256 are `24d78fbcd9b2…be9d2a` and
+`1c702ef957a0…03142a`; ours nsys/kernel summary are
+`22d5a0f401cc…f247d1` / `ab7d01310006…19c0d6a3`; vLLM trace/kernel summary are
+`83fd0f415d03…d2a66` / `7056183f8447…cce417`. The immediate order is HTTP
+capacity → FP4 bucket semantics → FP4 tactics → re-rank remaining trace gaps →
+every-axis 27B closure → exact 35B closure → roadmap v1 feature work.

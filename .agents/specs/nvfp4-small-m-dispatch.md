@@ -1,7 +1,7 @@
 # Spike: FlashInfer-parity NVFP4 small-M dispatch and SM12 tactics
 
 **Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
-spike; row is `READY`. **Pins:** vLLM `e24d1b24fe96`, pip-vLLM `0.24.0`,
+spike; W1 is `ACTIVE` under `CLAIM-NVFP4-SMALL-M-1`. **Pins:** vLLM `e24d1b24fe96`, pip-vLLM `0.24.0`,
 installed FlashInfer `0.6.12`, CUTLASS `v4.4.2`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
 
@@ -76,6 +76,14 @@ Evidence root:
 Campaign/trace-status hashes are `24d78fbc…e9d2a` / `1c702ef9…142a`; ours
 nsys/kernel hashes are `22d5a0f4…f247d1` / `ab7d0131…c0d6a3`; vLLM
 trace/kernel hashes are `83fd0f41…d2a66` / `7056183f…cce417`.
+
+The immutable HTTP-repair campaign at pushed `4e1d8ca` is the clean W1
+before-state. All fixed c32 legs complete without an unread socket and the
+separate fixed/legacy c32 A/B is steady-state-neutral at 0.999764×, while the
+fresh exact total-throughput ratios remain **0.9661/0.9274/0.9378/0.9466/
+0.9808/0.9910×** from c1 through c32. That removes transport starvation from
+the sampled ladder without closing any concurrency's 20-axis gate, so W1 can
+attribute its own exact-bucket/single-flight A/B against a healthy baseline.
 
 ## Upstream chain and execution dependency
 
@@ -245,8 +253,8 @@ native token-count correctness are preconditions to all speed claims.
    passes.
 
 Every GPU series holds one uncontended `/tmp/gpu` lock for all arms and traces.
-The active HTTP campaign completes and releases its immutable build before any
-new FP4 GPU command begins.
+The `4e1d8ca` HTTP campaign has completed and releases its immutable build
+before any new FP4 GPU command begins.
 
 ## Dependencies
 
@@ -270,7 +278,7 @@ new FP4 GPU command begins.
 | Work | Deliverable | State / gate |
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
-| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | next; unit/CUDA/model + component AB/BA/AB + full exact 27B campaign |
+| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | `ACTIVE`; unit/CUDA/model + component AB/BA/AB + full exact 27B campaign |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | after W1 measurement; every-tactic sanitizer, trace, component and exact 27B campaign |
 | W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |

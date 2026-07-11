@@ -21,18 +21,22 @@ ours arm. The historical offline denominators are also reopened: pinned
 `vllm bench throughput` used temperature 1 while ours used temperature 0, and
 the 27B budgets were 8192 versus 2048.
 
-The replacement pushed-`a531e05` series is now binding 27B evidence. All 12
-engine/concurrency groups validate; 2,016/2,016 timed requests, six memory
-returns, the commit-bound model gate and the paired-trace contract pass. Median
-total-throughput ratios c1→c32 are
-0.9679/0.9338/0.9482/0.9547/1.0028/0.9268×, with only
-4/2/5/3/10/8 of 20 performance axes and 2/4 memory axes passing. The evidence
-also reproduces two independent causes: c32 can leave one accepted socket
-unread for 205–207 s when cpp-httplib under-spawns streaming workers, and the
-local FP4 tuner aliases M=1/2/4/8/16. Fresh-server direct-c16 traces retune real
-M=16 and improve TPOT to 161.72–161.75 ms, essentially vLLM's 161.698 ms.
-Campaign/trace status hashes are `24d78fbc…e9d2a` / `1c702ef9…142a`. This is a
-valid failed gate, not a parity claim. The 35B series waits until repaired 27B
+The replacement pushed-`4e1d8ca` series is now the current binding 27B
+evidence. All 12 engine/concurrency groups validate; 2,016/2,016 timed
+requests, six memory returns, the commit-bound model gate and paired traces
+pass. Median total-throughput ratios c1→c32 are
+0.9661/0.9274/0.9378/0.9466/0.9808/0.9910×, with only 0/2/5/3/3/5 of 20
+performance axes and 2/4 memory axes passing. All three fixed-pool c32 legs
+complete without the prior unread-socket tail. Its separate same-binary c32
+fixed/legacy AB/BA/AB is steady-state-neutral at 0.999764×, and neither
+bounded arm samples the rare legacy stall. The superseded `a531e05` trace plus
+fresh-server direct-c16 runs remain causal FP4 evidence: the local tuner aliases
+M=1/2/4/8/16, while real-M=16 retuning improves TPOT to 161.72–161.75 ms,
+essentially the prior vLLM 161.698-ms mean. This is a valid failed gate, not a
+parity claim. Derived summary/trace-status hashes are `880261e4…e1574` /
+`bf2e0ac2…7bc66`; ours nsys/kernel are `b8d5ee28…3c941` /
+`972b94ae…0a60e0`, and vLLM trace/kernel are `b55f20ec…85cccc` /
+`044bc20e…796083`. FP4 W1 is active; the 35B series waits until repaired 27B
 passes every axis.
 
 ## Scope

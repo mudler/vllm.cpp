@@ -4779,3 +4779,46 @@ This is documentation-only: no runtime source, selected tactic, benchmark
 result or support claim changed. The row moves from `ANCHOR-BACKFILL` to
 `READY`. The immutable `4e1d8ca` HTTP/oracle campaign is not modified and must
 finish and release the DGX before the W1 claim or any new FP4 GPU command.
+
+## 2026-07-11 — HTTP capacity GPU-classified; exact 27B gap cleanly handed to FP4 W1
+
+The immutable pushed-`4e1d8ca1ecc929dc24dec365f96eeb3131465b1f` campaign
+completed under one uncontended `/tmp/gpu` lock and exited zero. It retained all
+36 standard raw points (ours/vLLM × c1/2/4/8/16/32 × three repetitions),
+2,016/2,016 successful exact-count requests, six memory returns, the 27B model
+gate and passing paired trace status. GPU compute processes are empty and a
+nonblocking lock reacquisition passes after cleanup.
+
+The fixed transport removes the sampled catastrophic tail but is not a speed
+lever. All three fresh fixed-pool c32 legs finish without a queued/unread socket.
+The separate same-binary c32 AB/BA/AB at
+`~/work/vllm.cpp-http-pool/4e1d8ca1ecc929dc24dec365f96eeb3131465b1f/c32-ab`
+measures **1097.031 fixed versus 1097.290 legacy tok/s = 0.999764×**, with
+0.541%/0.311% CV, 8/20 fixed axes, all 1,152 requests and all six returns. Neither
+bounded arm samples the old rare stall, so the record claims structural capacity
+and healthy lifecycle, not a measured tail-rate or throughput improvement.
+Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`.
+
+The fresh oracle result is still below the acceptance floor. Median total
+ratios c1→c32 are **0.966111/0.927356/0.937767/0.946566/0.980841/
+0.991022×**, with **0/2/5/3/3/5 of 20** performance axes and **2/4** memory
+axes passing. Median ours/vLLM memory is PSS 48,175,090/28,095,948 KiB, RSS
+48,177,492/28,430,956 KiB, GPU 39,254/72,576 MiB and available-memory drop
+66,700,764/80,496,096 KiB. Because the canonical cross-model summarizer
+correctly waits for 35B, the 27-only classification used the same pinned module
+with `MODEL_REVISIONS` narrowed read-only to 27; its canonical compact digest is
+`880261e4…e1574`. Trace-status SHA is `bf2e0ac2…7bc66`; ours nsys/kernel are
+`b8d5ee28…3c941` / `972b94ae…0a60e0`; vLLM trace/kernel are
+`b55f20ec…85cccc` / `044bc20e…796083`. The oracle trace contains 1,944,148
+kernel events and again resolves 128×32×256 static-persistent and Stream-K
+FP4 kernels absent locally.
+
+`CLAIM-SERVE-HTTP-POOL-1` is released and `SERVE-ASYNC-LLM` returns to
+`GATING`; no further HTTP tuning is inferred. `CLAIM-NVFP4-SMALL-M-1` now owns
+only W1 in `/home/mudler/_git/vllm.cpp-nvfp4-small-m`: exact FlashInfer hybrid
+buckets, complete device/architecture/dtype/shape/tactic-version key,
+single-flight tuning and capture-miss rejection, with
+`VT_FP4_EXACT_BUCKETS=0` retaining the aliased baseline. W2's 32-tactic family
+remains separate and unclaimed. The next sequence is CPU/unit proof, a pushed
+CUDA/model checkpoint, component AB/BA/AB plus paired trace, then a full exact
+27B oracle rerun. Exact 35B remains forbidden until every 27B axis passes.

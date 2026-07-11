@@ -527,8 +527,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   split fallback by row slicing instead of retaining source copies. CPU, UMA,
   borrowed and quantized release behavior is unchanged;
   `VT_RELEASE_HOST_WEIGHTS=0` is the release control. Correctness, memory and
-  performance gates are pending; CPU and native-sm_120 builds plus four focused
-  CPU tests pass, but no improved number is claimed yet.
+  performance gates are pending. Releasing on the first timed forward was
+  rejected after a 1.77% throughput regression; ordinary weights are now
+  uploaded and released in model preparation before request timing. CPU and
+  native-sm_120 builds plus four focused CPU tests pass, but the replacement
+  A/B has not run and no improved number is claimed yet.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

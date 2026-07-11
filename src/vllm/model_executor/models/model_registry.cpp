@@ -231,9 +231,17 @@ void PrepareQwen3_5Moe(LoadedModel& model, const HfConfig& config,
 
 void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
                          vt::Queue& queue) {
-  (void)model;
   (void)config;
-  (void)queue;
+  auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  if (HostWeightReleaseEnabled() && qwen.owns_weights() &&
+      queue.device.type == vt::DeviceType::kCUDA &&
+      !backend.UnifiedMemory() && IsPlainBf16Qwen3_5Dense(qwen.weights())) {
+    Qwen3_5DenseModel::PrepareBf16Resident(qwen.weights(), queue);
+    backend.Synchronize(queue);
+    ReleaseResidentQwen3_5DenseHostWeights(qwen.mutable_weights());
+    qwen.mark_host_weights_released();
+  }
 }
 
 ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,

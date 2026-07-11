@@ -3937,6 +3937,56 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 #endif
 }
 
+void Qwen3_5DenseModel::PrepareBf16Resident(
+    const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
+  VT_CHECK(queue.device.type == vt::DeviceType::kCUDA,
+           "PrepareBf16Resident: CUDA queue required");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto raw = [&d](const OwnedTensor& tensor) {
+    if (!tensor.Empty()) (void)ResidentWeight(d, tensor);
+  };
+  const auto f32 = [&d](const OwnedTensor& tensor) {
+    if (!tensor.Empty()) {
+      const std::vector<int64_t> shape(tensor.shape,
+                                       tensor.shape + tensor.rank);
+      (void)ResidentWeightF32(d, tensor, shape);
+    }
+  };
+
+  raw(weights.embed_tokens);
+  raw(weights.final_norm);
+  raw(DenseLmHead(weights));
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    raw(layer.input_layernorm);
+    raw(layer.post_attention_layernorm);
+    if (layer.is_linear_attention) {
+      const GdnLayerWeights& gdn = layer.gdn;
+      raw(gdn.in_proj_qkv);
+      raw(gdn.in_proj_z);
+      raw(gdn.in_proj_ba);
+      raw(gdn.conv1d_weight);
+      f32(gdn.conv1d_weight);
+      raw(gdn.a_log);
+      raw(gdn.dt_bias);
+      raw(gdn.norm_weight);
+      f32(gdn.norm_weight);
+      raw(gdn.out_proj);
+    } else {
+      const FullAttnLayerWeights& attn = layer.attn;
+      raw(attn.q_proj);
+      raw(attn.k_proj);
+      raw(attn.v_proj);
+      raw(attn.o_proj);
+      raw(attn.q_norm);
+      raw(attn.k_norm);
+      f32(attn.q_norm);
+      f32(attn.k_norm);
+    }
+    raw(layer.mlp.gate_up_proj);
+    raw(layer.mlp.down_proj);
+  }
+}
+
 std::vector<float> Qwen3_5Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,

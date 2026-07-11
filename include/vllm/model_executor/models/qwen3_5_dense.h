@@ -149,6 +149,12 @@ size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);
 // logits [T, vocab] f32 (T = token_ids.size()). CPU or CUDA per `queue`.
 class Qwen3_5DenseModel {
  public:
+  // Eagerly populate the ordinary plain-BF16 device representations used by
+  // the dense forward. Called by the registry prepare hook so host staging can
+  // be released before request timing rather than on the first forward.
+  static void PrepareBf16Resident(const Qwen3_5DenseWeights& weights,
+                                  vt::Queue& queue);
+
   // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.
   // Same signature/structure (paged KV cache for the full-attn layers, batched
   // GDN recurrent state for the GDN layers, the f32 residual thread), reusing the

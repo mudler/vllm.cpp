@@ -537,7 +537,14 @@ remains above vLLM after steady-state release, bounded streaming/direct-device
 loading remains an explicit open follow-on. CPU/CUDA correctness, memory and
 unmonitored throughput gates have not yet run for this implementation. CPU and
 native-sm_120 builds plus the focused loader/forward/engine/registry tests pass
-4/4; this is compile/unit evidence only.
+4/4; this is compile/unit evidence only. The first lock-held unmonitored A/B is
+**REJECTED**: post-first-forward release averaged 6,325.25 tok/s versus
+6,439.33 with release disabled (-1.77%). The implementation now performs eager
+upload and synchronized release in model preparation, before request timing;
+its replacement A/B is `PENDING`. The initial combined driver stopped after all
+nine valid memory arms and before any throughput process due to a `set -u`
+shell-local expansion; the throughput-only restart was separately lock-held and
+complete, so no partial timing is retained.
 
 Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
 The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps

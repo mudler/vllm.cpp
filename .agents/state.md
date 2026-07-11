@@ -6935,3 +6935,28 @@ Triton-AOT `build-nix-cuda-triton-sm120-debug` tree. Focused
 CTest passes 4/4. The agent-record checker, all 13 mutation tests, doc-checkpoint
 checker, and `git diff --check` pass. Full CPU and all GPU/e2e measurements
 remain the next gate; no metric is promoted by this evidence.
+
+## 2026-07-11 — W1 memory result, rejected timing, and prepare-time mitigation
+
+At implementation commit `9cf4d9d`, one lock covered three interleaved monitored
+memory reps each for release ON, release OFF, and fresh vLLM. All nine completed.
+The combined driver then stopped before launching throughput because a Bash
+`local` expanded an unset `mode` under `set -u`; GPU state was 166 MiB/0%/43 C.
+A corrected throughput-only phase ran under a new whole-phase lock, so the
+memory and throughput evidence are complete but have distinct lock intervals.
+
+The memory mechanism works: terminal GPU-resident PSS is 0.759 GiB release ON,
+8.585 GiB release OFF, and 4.094 GiB vLLM. W2 reduces launch peak from the old
+19.77 GiB to 15.70 GiB, but release ON cannot alter that pre-residency peak;
+fresh vLLM averages 7.18 GiB peak. These remain provisional until the lifecycle
+mitigation reruns because implementation is changing.
+
+The initial W1 timing is rejected. Unmonitored total throughput was
+6331.18/6318.20/6326.38 (mean 6325.25) release ON versus
+6436.42/6439.48/6442.10 (mean 6439.33) OFF: -1.77%. Fresh vLLM was
+6716.58/6717.40/6717.05 (mean 6717.01). The synchronous first-forward release
+therefore sat inside request timing. W3 now eagerly uploads canonical BF16
+weights and required F32 views in `PrepareQwen3_5Dense`, synchronizes and
+releases there, before requests. Both builds and focused CTest 4/4 pass. Its
+replacement memory/performance A/B is pending; no performance acceptance is
+claimed from the rejected path.

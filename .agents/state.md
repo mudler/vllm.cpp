@@ -3717,3 +3717,19 @@ reported 96% utilization. The later vLLM 27B replicated/sampled points and both
 35B arms remain under the same campaign; PID 1140673 still holds `/tmp/gpu`
 for the 27B same-lock series. This was read-only observation: W8 neither
 enqueued nor disturbed the benchmark.
+
+## 2026-07-11 — SGLang low-concurrency preflight P1 claimed
+
+`CLAIM-BACKEND-SGLANG-PREFLIGHT-1` moves
+`BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` `READY -> ACTIVE` in isolated worktree
+`/home/mudler/_git/vllm.cpp-sglang-preflight`, branch
+`codex/sglang-preflight-p1`. The bounded P1 scope is the CPU-only deterministic
+1024-token corpus/partition contract, pinned-client orchestration and native-ID
+precondition handling, every-axis raw-result summarizer, process-tree memory
+sampler, fail-closed campaign dry run, and their ported unit tests.
+
+The digest-pinned image will not be pulled or decompressed while a benchmark
+series is active. SGLang installation, checkpoint load, exact quantization/
+token-ID classification, nsys, and every GPU/performance action remain P2/P3
+and out of this claim. `CLAIM-SERVE-GATE-1` retains dgx; P1 will use no GPU and
+will only observe that campaign read-only.

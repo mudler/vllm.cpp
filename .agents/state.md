@@ -3923,3 +3923,22 @@ does not reproduce the earlier HTTP-server fault. It does not close
 `BACKEND-ABI-VT`: sm_80/sm_90a cross-builds and unchanged-trace/model
 A/B-memory proof remain, so the row and claim stay `ACTIVE`. README capability
 status is unchanged.
+
+## 2026-07-11 — binding online-gate preparation catches corpus command defect
+
+After `BACKEND-ABI-VT` validation merged, the fresh DGX source advanced cleanly
+to main `0295e72`; the existing exact sm_121a build and both model-runtime tests
+are green. `scripts/dgx-online-serving.sh --dry-run` wrote the SHA-bound
+campaign manifest without acquiring `/tmp/gpu`. Executing its exact recorded
+corpus command then failed immediately in both model partitions:
+`python3 tools/bench/make_serve_low_corpus.py` places `tools/bench`, not the
+repository root, on `sys.path`, so `from tools.bench...` is not importable in a
+clean shell. No corpus file, server, model process or GPU evidence was created.
+
+The bounded preparation repair records the package-safe command
+`python3 -m tools.bench.make_serve_low_corpus`. The existing plan-contract test
+now asserts that exact prefix and executes its `--help` path from the repository
+root; the focused client suite passes 8/8. The old `0295e72` evidence directory
+is not reused because the plan is commit-bound. After this repair merges, make
+a new dry-run manifest and corpora under the new full SHA, then start the 27B
+whole-model lock before the 35B series. README capability state is unchanged.

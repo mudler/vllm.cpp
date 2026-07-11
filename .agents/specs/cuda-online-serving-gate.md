@@ -58,7 +58,7 @@ successful repetitions.
 | async scheduling/stream updates | current engine/server bridge; gaps map to `SERVE-ASYNC-LLM` |
 | scheduler operating point | explicit server `max_num_seqs` and `max_num_batched_tokens` flags; harness fixes identical values on both arms |
 | benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
-| exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus + hash-preserving vLLM CustomDataset view in `online_gate.py` |
+| exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `python3 -m tools.bench.make_serve_low_corpus` clean-shell command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, benchmark modules, dist metadata and RECORD in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; `tools/bench/sample_process_memory.py` |
 | GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via `tools/bench/profile_vllm_online_gate.py`; kernel-event aggregation in `summarize_torch_kernels.py` |
@@ -70,7 +70,9 @@ successful repetitions.
 - The local server's explicit scheduler-capacity CLI is build/run-gated by
   `test_server_help` in `examples/CMakeLists.txt`.
 - `tests/benchmarks/test_custom_dataset_seed.py`: deterministic custom-corpus
-  selection, ported to the same client/corpus suite.
+  selection, ported to the same client/corpus suite; that suite also executes
+  the dry-run-recorded module prefix so an unimportable clean-shell preparation
+  command fails before GPU work.
 - Pinned profiler example/API behavior is covered by
   `tests/tools/test_online_gate_trace.py`; project every-axis/void propagation
   is covered by `tests/tools/test_online_gate_summary.py`.

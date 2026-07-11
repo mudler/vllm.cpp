@@ -446,7 +446,8 @@ def build_plan(
         "planned_commands": {
             "corpus": [
                 "python3",
-                "tools/bench/make_serve_low_corpus.py",
+                "-m",
+                "tools.bench.make_serve_low_corpus",
                 "--tokenizer-json",
                 "<MODEL_SNAPSHOT>/tokenizer.json",
                 "--tokenizer-revision",

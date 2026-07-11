@@ -186,6 +186,20 @@ class OnlineClientContractTests(unittest.TestCase):
             plan["run_contract"]["warmups_per_client_invocation"],
             "equals configured concurrency",
         )
+        corpus_command = plan["planned_commands"]["corpus"]
+        self.assertEqual(
+            corpus_command[:3],
+            ["python3", "-m", "tools.bench.make_serve_low_corpus"],
+        )
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [*corpus_command[:3], "--help"],
+            cwd=repo,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

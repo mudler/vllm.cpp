@@ -1,7 +1,8 @@
 # Drop-in kernel ABI (`BACKEND-ABI-VT`) — implementation spike
 
-Status: accepted implementation spike; W0 additive spine is `GATING` on the
-implementation branch. Pins: vLLM `e24d1b24fe96`, CUTLASS `v4.4.2`, vLLM
+Status: accepted implementation spike; W0 additive spine is `ACTIVE` for the
+claimed `W0-GPU` cross-build/runtime closure. Pins: vLLM `e24d1b24fe96`,
+CUTLASS `v4.4.2`, vLLM
 FlashAttention `2c839c33`, and the dependency revisions recorded by the pinned
 vLLM build. This is a design and execution plan, not an implementation or a
 claim that another kernel/backend is supported.

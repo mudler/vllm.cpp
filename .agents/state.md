@@ -3870,3 +3870,21 @@ pre-W2 local server also used its historical eight-sequence default at c16/c32.
 Next is no longer “wait”: prepare/build clean current main `b0acec2` in fresh
 DGX directories, reproduce the exact 35B path under sanitizer if it still
 fails, then run the committed matched-capacity model-wide gate under new locks.
+
+## 2026-07-11 — `BACKEND-ABI-VT` W0-GPU claimed after fresh-build blocker
+
+The clean current-main DGX build (CUDA 13.0.88, sm_121a, RelWithDebInfo, CUTLASS
+4.4.2, vendored Triton AOT, tests/server enabled) compiled the full CUDA library
+and reached 77% of the all-target build. GCC 13 then rejected the ported test
+expression `CHECK_THROWS_AS(vt::cuda::DeviceGuard(Cpu()), ...)` as
+`-Werror=parentheses`: within the doctest macro expansion it parses like an
+unnecessary-parentheses declaration. This is a deterministic test-source
+cross-build blocker, not a CUDA runtime or implementation failure.
+
+Root claims `CLAIM-BACKEND-ABI-W0-GPU-1` before editing. The bounded first leaf
+owns only the equivalent brace-initialization spelling in
+`tests/vt/test_dropin_abi.cpp`, the exact fresh rebuild/runtime evidence, and
+the owning records. No ABI, dispatch, kernel, dtype, workspace, or production
+behavior may change. After the compile repair, run the focused W0 CUDA runtime
+case under `/tmp/gpu`; the serving claim remains the owner of the later
+model-wide series.

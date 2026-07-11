@@ -1,6 +1,6 @@
 // Ported from:
-//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283,
-//   315-335
+//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,200-230,
+//   243-283,315-335
 //   vllm/model_executor/layers/rotary_embedding/base.py:13-252,298-318
 // @ e24d1b24fe96.
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.h"
+#include "vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
 #include "vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.h"
@@ -237,6 +239,22 @@ std::shared_ptr<RotaryEmbeddingBase> get_rope(
       embedding = std::make_shared<RotaryEmbedding>(
           head_size, rotary_dim, max_position, rope_parameters.rope_theta,
           is_neox_style, dtype);
+    }
+  } else if (rope_parameters.rope_type == "dynamic") {
+    if (rope_parameters.alpha.has_value()) {
+      embedding = std::make_shared<DynamicNTKAlphaRotaryEmbedding>(
+          head_size, rotary_dim, max_position, rope_parameters.rope_theta,
+          is_neox_style, *rope_parameters.alpha, dtype);
+    } else if (rope_parameters.factor.has_value()) {
+      const int64_t max_trained_positions =
+          rope_parameters.max_trained_positions.value_or(max_position);
+      embedding = std::make_shared<DynamicNTKScalingRotaryEmbedding>(
+          head_size, rotary_dim, max_position, max_trained_positions,
+          rope_parameters.rope_theta, is_neox_style,
+          *rope_parameters.factor, dtype);
+    } else {
+      throw std::invalid_argument(
+          "Dynamic rope scaling requires either alpha or factor");
     }
   } else if (rope_parameters.rope_type == "llama3") {
     if (!rope_parameters.factor.has_value() ||

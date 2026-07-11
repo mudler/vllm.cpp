@@ -3663,3 +3663,57 @@ All other RoPE families, Hunyuan model implementation, and GPU execution are
 outside the claim. `CLAIM-SERVE-GATE-1` retains `/tmp/gpu`, so W8 starts with
 CPU, exact-class oracle and sanitizer work and will preserve model/CUDA/G9 as
 an explicit gating handoff.
+
+## 2026-07-11 — C5 W8 dynamic-NTK implemented; all C5 leaves now gating
+
+`CLAIM-C5-DYNAMIC-1` is released and `ATTN-ROPE-DYNAMIC-NTK` moves `ACTIVE ->
+GATING`, never `DONE`. W8 adds typed `alpha` and `max_trained_positions`, exact
+alpha-first factory dispatch, the pinned factor/trained-length and alpha base
+transforms, a singular-dimension guard, and the missing-mode error. Both new
+classes use W6's initialize-after-fields constructor seam and W5's owned dtype
+cache/supplied-cache apply path. No formula branch or transcendental work enters
+the per-token kernel. Factor=1 with default trained length matches the default
+RoPE cache byte-for-byte.
+
+The oracle generator verifies full commit
+`e24d1b24fe96a56ba8b0d653efa076d03eb95d6c` and executes the exact
+`dynamic_ntk_scaling_rope.py` / `dynamic_ntk_alpha_rope.py` files. Three
+fixtures cover f32 NeoX factor=1, bf16 GPT-J factor=4 with trained length 32,
+and f32 NeoX alpha precedence when both alpha and factor are present.
+Regeneration to `/tmp/vllm-cpp-w8-goldens-repro` was byte-identical.
+
+Fresh local evidence, with no DGX command beyond read-only monitoring:
+
+- clean Release/CUDA-OFF build and full ctest pass **103/103**;
+- `test_hf_config` passes **15 / 156**, `test_rotary_embedding` passes **14 /
+  226** with five named model/TP dependency skips, `test_ops_rope_cache` passes
+  **5 / 156**, and `test_op_parity` passes **5 / 123**;
+- those four focused binaries pass Debug ASan+UBSan **4/4** with leak detection;
+- f32 cache/output maximum absolute differences versus the pinned classes are
+  `5.960e-8`/`1.192e-7`; bf16 cache is exact and output maximum absolute
+  difference is `1.562e-2`, within `atol=1e-2, rtol=1.6e-2`; and
+- the generic golden floor rises from 43 to 46.
+
+The first sanitizer build attempt stopped while GCC wrote temporary assembly
+because the root filesystem had only 52 MiB free. Only this session's obsolete
+W6/W7 build trees, the incomplete W8 sanitizer tree, and temporary regenerated
+goldens were removed; unrelated `/tmp` files were untouched. The exact build
+then passed at `-j4` with a build-local `TMPDIR`.
+
+All eight C5 implementation leaves are now `GATING`. Remaining block handoff:
+compile/run the shared scaled-RoPE CUDA path on idle GB10; restore the named
+StarCoder2/Gemma3/Llama4/Nomic/Qwen-VL/Llama-3.1/Phi-3/Hunyuan model consumers;
+then run their oracle/trace/every-axis gates plus unchanged 27B/35B regressions.
+No user-visible scaled-RoPE/local-attention support is claimed before those
+G6-G9 debts close.
+
+## 2026-07-11 — DGX serving-campaign read-only progress after W8
+
+At 03:34 UTC (05:34 on the remote campaign log's local clock), result files
+and the append-only campaign log confirm that matched vLLM 27B greedy c1, c2,
+c4, c8 and c16 completed all three repetitions, c32 repetitions 1-2 completed,
+and c32 repetition 3 started. `VLLM::EngineCore` held 70,356 MiB and the GPU
+reported 96% utilization. The later vLLM 27B replicated/sampled points and both
+35B arms remain under the same campaign; PID 1140673 still holds `/tmp/gpu`
+for the 27B same-lock series. This was read-only observation: W8 neither
+enqueued nor disturbed the benchmark.

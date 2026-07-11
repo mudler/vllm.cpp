@@ -43,18 +43,19 @@ runs end-to-end on CPU:
   shapes plus randomized causal-mask properties are CPU/sanitizer-gated.
   Neither mode is yet user-visible model support: GPU runtime, positive-model
   e2e, oracle, trace, and performance/memory gates remain open.
-- **Long-context RoPE foundation (YaRN/MRoPE/Llama 3/Phi-3 LongRoPE)** — modern
-  and legacy Hugging Face RoPE parameters now normalize into a typed, memoized
-  factory with f32/bf16 caches.
+- **Long-context RoPE foundation (YaRN/MRoPE/Llama 3/Phi-3/dynamic-NTK)** —
+  modern and legacy Hugging Face RoPE parameters now normalize into a typed,
+  memoized factory with f32/bf16 caches.
   Plain YaRN and its `mrope_section` branch apply caller-supplied caches for
   NeoX/GPT-J layouts and 1-D or 3-axis contiguous/interleaved positions; Llama 3
   adds its exact unchanged/smoothed/scaled frequency bands, including equal
   low/high factors. Phi-3 LongRoPE builds its short and long factor-array caches
   and selects one globally from runtime max length, including explicit mscale
-  overrides. Twelve exact pinned-source oracle fixtures, CPU references, and
-  ASan/UBSan pass. The CUDA implementation is source-complete but has not yet
-  been compiled or run on an uncontended GPU, and no feature-positive model
-  path is claimed yet.
+  overrides. Dynamic-NTK mirrors both its factor/trained-length and alpha base
+  transforms with pinned alpha-first dispatch. Fifteen exact pinned-source
+  oracle fixtures, CPU references, and ASan/UBSan pass. The CUDA implementation
+  is source-complete but has not yet been compiled or run on an uncontended
+  GPU, and no feature-positive model path is claimed yet.
 - **Model forward** — Qwen3.6-35B-A3B hybrid (GDN×3 + gated full-attention, 256-
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
@@ -170,7 +171,7 @@ CUDA-target inventories track unimplemented and untraced families separately.
 | CUDA-graph decode | Qwen-specific captured decode step (vLLM cudagraph) | — | 🟡 explicit 35B capture gate; 27B evidence backfill open |
 | Sampling (greedy/top-k/top-p/penalties) | vLLM V1 ordering subset; some token/logprob paths synchronize to host | ✅ | 🟡 bounded subset |
 | RMSNorm / default RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
-| Scaled RoPE supplied-cache rotation | pinned vLLM typed cache/factory + YaRN/MRoPE/Llama 3/Phi-3 LongRoPE construction and cache lookup/rotation | ✅ ref + twelve oracle fixtures | 🚧 source present; compile/runtime gate open |
+| Scaled RoPE supplied-cache rotation | pinned vLLM typed cache/factory + YaRN/MRoPE/Llama 3/Phi-3 LongRoPE/dynamic-NTK construction and cache lookup/rotation | ✅ ref + fifteen oracle fixtures | 🚧 source present; compile/runtime gate open |
 
 Only **GB10/sm_121a is built, traced and gated today**. Source-level fallbacks
 suggest routes for other SMs, but none counts as support until its full build,
@@ -268,12 +269,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   and memory evidence remain open; all four execution rows remain `GATING`, not
   supported.
 - **Scaled long-context RoPE is not user-visible yet.** Typed config, memoized
-  f32/bf16 cache construction, plain/MRoPE YaRN, Llama 3 frequency-band, and
-  Phi-3 LongRoPE short/long formulas, plus the CPU supplied-cache operator,
-  pass twelve exact pinned-source oracle fixtures and sanitizer checks. CUDA
-  compile/runtime, Nomic/Qwen-VL YaRN, Llama-3.1 and Phi-3 consumers, both-
-  engine traces, and correctness/performance/latency/memory closure remain
-  open; `ATTN-YARN`, `ATTN-ROPE-LLAMA3`, and `ATTN-ROPE-LONGROPE` are
+  f32/bf16 cache construction, plain/MRoPE YaRN, Llama 3 frequency-band, Phi-3
+  LongRoPE short/long, and both dynamic-NTK formulas, plus the CPU supplied-
+  cache operator, pass fifteen exact pinned-source oracle fixtures and
+  sanitizer checks. CUDA compile/runtime, Nomic/Qwen-VL YaRN, Llama-3.1,
+  Phi-3, and Hunyuan consumers, both-engine traces, and correctness/performance/
+  latency/memory closure remain open; all four scaled-RoPE execution rows are
   `GATING`, not supported.
 
 ## Project record

@@ -529,6 +529,50 @@ TEST_CASE("LoadHfConfig retains and normalizes Phi-3 LongRoPE parameters") {
   CHECK(*cfg.rope_parameters.original_max_position_embeddings == 32);
 }
 
+TEST_CASE("LoadHfConfig retains both dynamic NTK dispatch forms") {
+  SUBCASE("factor mode retains trained context") {
+    TempJson f(R"({
+      "model_type": "llama",
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "max_position_embeddings": 128,
+      "rope_parameters": {
+        "rope_type": "dynamic",
+        "rope_theta": 10000.0,
+        "rope_dim": 8,
+        "factor": 4.0,
+        "max_trained_positions": 32
+      }
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.rope_parameters.rope_type == "dynamic");
+    REQUIRE(cfg.rope_parameters.factor.has_value());
+    REQUIRE(cfg.rope_parameters.max_trained_positions.has_value());
+    CHECK(*cfg.rope_parameters.factor == doctest::Approx(4.0));
+    CHECK(*cfg.rope_parameters.max_trained_positions == 32);
+  }
+
+  SUBCASE("alpha mode is typed independently") {
+    TempJson f(R"({
+      "model_type": "hunyuan",
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "max_position_embeddings": 128,
+      "rope_parameters": {
+        "rope_type": "dynamic",
+        "rope_dim": 8,
+        "alpha": 2.0
+      }
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    REQUIRE(cfg.rope_parameters.alpha.has_value());
+    CHECK(*cfg.rope_parameters.alpha == doctest::Approx(2.0));
+    CHECK_FALSE(cfg.rope_parameters.factor.has_value());
+  }
+}
+
 TEST_CASE("LoadHfConfig normalizes legacy and default MRoPE dictionaries") {
   SUBCASE("legacy rope_scaling type yarn is standardized") {
     TempJson f(R"({
@@ -578,7 +622,7 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     "num_attention_heads": 4,
     "rope_parameters": )";
   SUBCASE("future formula family remains rejected until its leaf lands") {
-    TempJson f(prefix + R"({"rope_type":"dynamic"}})");
+    TempJson f(prefix + R"({"rope_type":"linear"}})");
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("does not implement yet"),
                          std::runtime_error);
@@ -601,6 +645,12 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
                R"({"rope_type":"longrope","short_factor":[1.0,1.0]}})");
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("longrope requires"),
+                         std::runtime_error);
+  }
+  SUBCASE("dynamic NTK requires alpha or factor") {
+    TempJson f(prefix + R"({"rope_type":"dynamic"}})");
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("requires either alpha or factor"),
                          std::runtime_error);
   }
   SUBCASE("nested per-layer parameters cannot silently become default") {

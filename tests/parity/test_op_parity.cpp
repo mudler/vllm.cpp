@@ -384,6 +384,13 @@ vllm::RopeParameters ParseLongContextRopeParameters(const json& value) {
     params.short_mscale = value["short_mscale"].get<double>();
   if (value.contains("long_mscale") && !value["long_mscale"].is_null())
     params.long_mscale = value["long_mscale"].get<double>();
+  if (value.contains("alpha") && !value["alpha"].is_null())
+    params.alpha = value["alpha"].get<double>();
+  if (value.contains("max_trained_positions") &&
+      !value["max_trained_positions"].is_null()) {
+    params.max_trained_positions =
+        value["max_trained_positions"].get<int64_t>();
+  }
   params.extrapolation_factor = value.value("extrapolation_factor", 1.0);
   params.attn_factor = value.value("attn_factor", 1.0);
   params.beta_fast = value.value("beta_fast", int64_t{32});
@@ -1604,8 +1611,8 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
   // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE +
-  // 3 W6 Llama 3 + 3 W7 LongRoPE.
-  CHECK(cases >= 43);
+  // 3 W6 Llama 3 + 3 W7 LongRoPE + 3 W8 dynamic-NTK.
+  CHECK(cases >= 46);
 }
 
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {

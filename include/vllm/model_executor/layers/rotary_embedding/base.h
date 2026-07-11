@@ -1,6 +1,6 @@
 // Ported from:
-//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283,
-//   315-335
+//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,200-230,
+//   243-283,315-335
 //   vllm/model_executor/layers/rotary_embedding/base.py:13-252,298-318
 // @ e24d1b24fe96.
 #pragma once

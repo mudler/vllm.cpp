@@ -4,10 +4,12 @@
 //   tests/kernels/core/test_apply_rotary_emb.py:43-203
 //   tests/models/language/pooling/test_nomic_max_model_len.py:93-111
 // and pinned class behavior in rotary_embedding/{__init__,base,common,
-// yarn_scaling_rope,mrope,llama3_rope,phi3_long_rope_scaled_rope}.py
+// yarn_scaling_rope,mrope,llama3_rope,phi3_long_rope_scaled_rope,
+// dynamic_ntk_scaling_rope,dynamic_ntk_alpha_rope}.py
 // @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -15,6 +17,8 @@
 
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/model_executor/layers/rotary_embedding/common.h"
+#include "vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.h"
+#include "vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
 #include "vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.h"
@@ -65,6 +69,16 @@ vllm::RopeParameters LongRoPEParameters() {
   params.original_max_position_embeddings = 32;
   params.short_factor = {1.0, 1.1, 1.2, 1.3};
   params.long_factor = {2.0, 2.2, 2.4, 2.6};
+  return params;
+}
+
+vllm::RopeParameters DynamicFactorParameters() {
+  vllm::RopeParameters params;
+  params.rope_type = "dynamic";
+  params.rope_theta = 10000.0;
+  params.rope_dim = 8;
+  params.factor = 4.0;
+  params.max_trained_positions = 32;
   return params;
 }
 
@@ -372,6 +386,78 @@ TEST_CASE("Phi-3 LongRoPE mirrors mscale and validation boundaries") {
                        std::invalid_argument);
 }
 
+TEST_CASE("dynamic NTK factor mode mirrors trained-length base scaling") {
+  const vllm::RopeParameters params = DynamicFactorParameters();
+  auto rope = vllm::get_rope(16, 128, true, params, vt::DType::kF32);
+  auto dynamic = std::dynamic_pointer_cast<
+      vllm::DynamicNTKScalingRotaryEmbedding>(rope);
+  REQUIRE(dynamic != nullptr);
+  CHECK(dynamic->scaling_factor() == doctest::Approx(4.0));
+  CHECK(dynamic->max_trained_positions() == 32);
+  CHECK(rope->cache_rows() == 128);
+
+  const double scale = 4.0 * 128.0 / 32.0 - 3.0;
+  const double scaled_base = 10000.0 * std::pow(scale, 8.0 / 6.0);
+  for (int64_t pair = 0; pair < 4; ++pair) {
+    const float expected =
+        1.0F / std::pow(static_cast<float>(scaled_base),
+                        static_cast<float>(2 * pair) / 8.0F);
+    const float got = std::atan2(CacheValue(*rope, 1, 4 + pair),
+                                 CacheValue(*rope, 1, pair));
+    CHECK(got == doctest::Approx(expected).epsilon(1e-5));
+  }
+}
+
+TEST_CASE("dynamic NTK factor one reduces to default RoPE") {
+  vllm::RopeParameters dynamic_params;
+  dynamic_params.rope_type = "dynamic";
+  dynamic_params.rope_dim = 8;
+  dynamic_params.factor = 1.0;
+  auto dynamic =
+      vllm::get_rope(16, 128, true, dynamic_params, vt::DType::kF32);
+
+  vllm::RopeParameters default_params;
+  default_params.rope_dim = 8;
+  auto ordinary =
+      vllm::get_rope(16, 128, true, default_params, vt::DType::kF32);
+  REQUIRE(dynamic->cache_bytes() == ordinary->cache_bytes());
+  const auto* got = static_cast<const std::byte*>(dynamic->cache_data());
+  const auto* want = static_cast<const std::byte*>(ordinary->cache_data());
+  CHECK(std::equal(got, got + dynamic->cache_bytes(), want));
+}
+
+TEST_CASE("dynamic NTK alpha mode wins dispatch and guards dimensions") {
+  vllm::RopeParameters params = DynamicFactorParameters();
+  params.alpha = 2.0;
+  auto rope = vllm::get_rope(16, 128, false, params, vt::DType::kF32);
+  auto alpha = std::dynamic_pointer_cast<
+      vllm::DynamicNTKAlphaRotaryEmbedding>(rope);
+  REQUIRE(alpha != nullptr);
+  CHECK(alpha->scaling_alpha() == doctest::Approx(2.0));
+  CHECK(rope->is_neox_style() == false);
+
+  const double scaled_base = 10000.0 * std::pow(2.0, 8.0 / 6.0);
+  for (int64_t pair = 0; pair < 4; ++pair) {
+    const float expected =
+        1.0F / std::pow(static_cast<float>(scaled_base),
+                        static_cast<float>(2 * pair) / 8.0F);
+    const float got = std::atan2(CacheValue(*rope, 1, 4 + pair),
+                                 CacheValue(*rope, 1, pair));
+    CHECK(got == doctest::Approx(expected).epsilon(1e-5));
+  }
+
+  params.rope_dim = 2;
+  CHECK_THROWS_WITH_AS(vllm::get_rope(16, 128, true, params),
+                       doctest::Contains("greater than 2"),
+                       std::invalid_argument);
+
+  params = {};
+  params.rope_type = "dynamic";
+  CHECK_THROWS_WITH_AS(vllm::get_rope(16, 128, true, params),
+                       doctest::Contains("either alpha or factor"),
+                       std::invalid_argument);
+}
+
 TEST_CASE("mrope next text positions mirror three equal streams") {
   const auto positions =
       vllm::MRotaryEmbedding::get_next_input_positions(5, 3, 7);
@@ -409,4 +495,12 @@ TEST_CASE("Phi-3 LongRoPE feature-positive e2e remains a model dependency" *
           doctest::description("MODEL-TEXT-phi3-phi3-for-causal-lm")) {
   MESSAGE("SKIP MODEL-TEXT-phi3-phi3-for-causal-lm: the Phi-3 model family "
           "is not ported; W7 closes formula/cache/operator parity only");
+}
+
+TEST_CASE("dynamic NTK feature-positive e2e remains a model dependency" *
+          doctest::skip(true) *
+          doctest::description(
+              "MODEL-TEXT-hunyuan-v1-hun-yuan-dense-v1-for-causal-lm")) {
+  MESSAGE("SKIP MODEL-TEXT-hunyuan-v1-hun-yuan-dense-v1-for-causal-lm: "
+          "the Hunyuan family is not ported; W8 closes formula/cache parity");
 }

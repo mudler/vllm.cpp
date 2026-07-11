@@ -192,6 +192,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
   src/vllm/model_executor/layers/rotary_embedding/base.cpp
   src/vllm/model_executor/layers/rotary_embedding/common.cpp
+  src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp
+  src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp

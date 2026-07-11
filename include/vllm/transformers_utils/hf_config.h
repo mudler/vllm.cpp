@@ -1,7 +1,8 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
 // vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
 // normalization mirrors vllm/transformers_utils/config.py:439-509 and
-// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283,315-335
+// model_executor/layers/rotary_embedding/__init__.py:33-112,200-230,243-283,
+// 315-335
 // @ e24d1b24fe96.
 #pragma once
 
@@ -36,6 +37,10 @@ struct RopeParameters {
   std::vector<double> long_factor;
   std::optional<double> short_mscale = std::nullopt;
   std::optional<double> long_mscale = std::nullopt;
+  // Dynamic-NTK alternatives. Presence of alpha takes precedence over factor;
+  // factor mode optionally names its trained context length.
+  std::optional<double> alpha = std::nullopt;
+  std::optional<int64_t> max_trained_positions = std::nullopt;
   // Remaining YaRN-only controls.
   double extrapolation_factor = 1.0;
   double attn_factor = 1.0;

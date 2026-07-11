@@ -59,9 +59,10 @@ def _direct_source_factory():
     absent. The RoPE files only need CustomOp/platform registration scaffolding
     to execute their PyTorch-native cache and forward methods. This fallback
     stubs that scaffolding, but imports and executes the pinned common.py,
-    base.py, yarn_scaling_rope.py, mrope.py, llama3_rope.py and
-    phi3_long_rope_scaled_rope.py files verbatim. It is therefore a
-    direct-source oracle, not a reimplementation of their formulas.
+    base.py, yarn_scaling_rope.py, mrope.py, llama3_rope.py,
+    phi3_long_rope_scaled_rope.py, dynamic_ntk_scaling_rope.py and
+    dynamic_ntk_alpha_rope.py files verbatim. It is therefore a direct-source
+    oracle, not a reimplementation of their formulas.
     """
     upstream = pathlib.Path(
         os.environ.get("VLLM_UPSTREAM_DIR", "/home/mudler/_git/vllm")
@@ -191,6 +192,14 @@ def _direct_source_factory():
         "vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope",
         rope_dir / "phi3_long_rope_scaled_rope.py",
     )
+    dynamic_factor_module = _load_module(
+        "vllm.model_executor.layers.rotary_embedding.dynamic_ntk_scaling_rope",
+        rope_dir / "dynamic_ntk_scaling_rope.py",
+    )
+    dynamic_alpha_module = _load_module(
+        "vllm.model_executor.layers.rotary_embedding.dynamic_ntk_alpha_rope",
+        rope_dir / "dynamic_ntk_alpha_rope.py",
+    )
 
     def factory(
         head_size,
@@ -247,10 +256,35 @@ def _direct_source_factory():
                 params["long_factor"],
                 **extra,
             )
+        if rope_type == "dynamic":
+            if "alpha" in params:
+                return dynamic_alpha_module.DynamicNTKAlphaRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    params["alpha"],
+                    dtype,
+                )
+            if "factor" in params:
+                return dynamic_factor_module.DynamicNTKScalingRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    params.get("max_trained_positions", max_position),
+                    base,
+                    is_neox_style,
+                    params["factor"],
+                    dtype,
+                )
+            raise ValueError(
+                "Dynamic rope scaling must contain either alpha or factor"
+            )
         if rope_type != "yarn":
             raise ValueError(
                 "direct-source long-context loader only accepts yarn, "
-                "llama3, or longrope"
+                "llama3, longrope, or dynamic"
             )
         factor = params["factor"]
         original = params["original_max_position_embeddings"]
@@ -617,7 +651,59 @@ def dump_longrope(root: pathlib.Path) -> None:
     )
 
 
-DUMPERS = {"yarn": dump_yarn, "llama3": dump_llama3, "longrope": dump_longrope}
+def dump_dynamic(root: pathlib.Path) -> None:
+    max_position = 128
+    positions = torch.tensor([0, 1, 31, 32, 127], dtype=torch.int64)
+    common = {
+        "rope_type": "dynamic",
+        "rope_theta": 10000.0,
+        "rope_dim": 8,
+    }
+    _dump_case(
+        root,
+        "long_rope_dynamic_factor1_neox_f32",
+        head_size=16,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={**common, "factor": 1.0},
+        dtype=torch.float32,
+        positions=positions,
+        seed=401,
+    )
+    _dump_case(
+        root,
+        "long_rope_dynamic_factor_gptj_bf16",
+        head_size=16,
+        max_position=max_position,
+        is_neox_style=False,
+        rope_parameters={
+            **common,
+            "factor": 4.0,
+            "max_trained_positions": 32,
+        },
+        dtype=torch.bfloat16,
+        positions=positions,
+        seed=402,
+    )
+    _dump_case(
+        root,
+        "long_rope_dynamic_alpha_neox_f32",
+        head_size=16,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={**common, "alpha": 2.0, "factor": 9.0},
+        dtype=torch.float32,
+        positions=positions,
+        seed=403,
+    )
+
+
+DUMPERS = {
+    "yarn": dump_yarn,
+    "llama3": dump_llama3,
+    "longrope": dump_longrope,
+    "dynamic": dump_dynamic,
+}
 
 
 if __name__ == "__main__":

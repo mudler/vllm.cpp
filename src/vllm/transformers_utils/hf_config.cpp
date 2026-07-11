@@ -1,7 +1,8 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
 // vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
 // normalization mirrors vllm/transformers_utils/config.py:439-509 and
-// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283,315-335
+// model_executor/layers/rotary_embedding/__init__.py:33-112,200-230,243-283,
+// 315-335
 // @ e24d1b24fe96.
 #include "vllm/transformers_utils/hf_config.h"
 
@@ -197,6 +198,9 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   params.long_factor = GetDoubleArray(*raw, "long_factor");
   params.short_mscale = GetOptionalDouble(*raw, "short_mscale");
   params.long_mscale = GetOptionalDouble(*raw, "long_mscale");
+  params.alpha = GetOptionalDouble(*raw, "alpha");
+  params.max_trained_positions =
+      GetOptionalInt(*raw, "max_trained_positions");
   params.extrapolation_factor =
       GetDouble(*raw, "extrapolation_factor", 1.0);
   params.attn_factor = GetDouble(*raw, "attn_factor", 1.0);
@@ -258,12 +262,23 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
           "positive in " +
           path);
     }
+  } else if (params.rope_type == "dynamic") {
+    if (!params.alpha.has_value() && !params.factor.has_value()) {
+      throw std::runtime_error(
+          "hf_config: dynamic rope requires either alpha or factor in " +
+          path);
+    }
+    if (params.max_trained_positions.has_value() &&
+        *params.max_trained_positions <= 0) {
+      throw std::runtime_error(
+          "hf_config: dynamic max_trained_positions must be positive in " +
+          path);
+    }
   } else if (params.rope_type != "default") {
-    // W8 adds its own typed fields and factory cases before relaxing this.
     throw std::runtime_error(
         "hf_config: checkpoint declares rope type '" + params.rope_type +
         "' which vllm.cpp does not implement yet (supported: default, yarn, "
-        "llama3, longrope) in " + path);
+        "llama3, longrope, dynamic) in " + path);
   }
 
   if (!params.rope_dim.has_value() &&

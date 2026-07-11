@@ -9,16 +9,17 @@ Regenerate:
       tools/parity/dump_ops.py --out tests/parity/goldens'
 then commit the changed goldens. Manifests record the oracle version + pin.
 
-The W5-W7 YaRN/MRoPE/Llama 3/LongRoPE fixtures have their own pinned-source
-dumper:
+The W5-W8 YaRN/MRoPE/Llama 3/LongRoPE/dynamic-NTK fixtures have their own
+pinned-source dumper:
 
     python3 tools/parity/dump_long_context.py \
-      --out tests/parity/goldens --only yarn llama3 longrope
+      --out tests/parity/goldens --only yarn llama3 longrope dynamic
 
 It first tries the installed oracle. If that import is unavailable, it verifies
 the full `/home/mudler/_git/vllm` commit and executes the exact pinned
 `common.py`, `base.py`, `yarn_scaling_rope.py`, `mrope.py`, `llama3_rope.py`,
-and `phi3_long_rope_scaled_rope.py` class code with
+`phi3_long_rope_scaled_rope.py`, and both `dynamic_ntk_*_rope.py` class files
+with
 only unrelated runtime-registration scaffolding stubbed. The manifest records
 which loader produced each fixture; this fallback is not formula reimplementation.
 Long-context tolerances: f32 `atol=rtol=1e-5`; bf16 `atol=1e-2,

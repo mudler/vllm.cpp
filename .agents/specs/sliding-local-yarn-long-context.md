@@ -426,6 +426,28 @@ shared CUDA apply path remains uncompiled/unrun, `MODEL-TEXT-phi3-phi3-for-
 causal-lm` is absent, and G6/G9 feature-positive, two-model correctness/
 performance/latency/memory gates remain open.
 
+W8 checkpoint (2026-07-11): `ATTN-ROPE-DYNAMIC-NTK` now mirrors both pinned
+base transforms and their exact factory ordering. Presence of `alpha` selects
+`DynamicNTKAlphaRotaryEmbedding` even when factor is also present; otherwise
+factor mode uses optional `max_trained_positions`, defaulting to current max
+position. Both classes initialize their fields before the inherited dtype cache,
+reject the singular rotary-dimension-two exponent, and reuse the supplied-cache
+apply path without per-token formula work. The pinned factor=1 case reduces to
+the default cache byte-for-byte.
+
+Three fixtures execute the exact pinned dynamic class files after verifying the
+full upstream commit: f32 NeoX factor=1, bf16 GPT-J nontrivial factor/trained-
+length, and f32 NeoX alpha-first precedence. Regeneration is byte-identical.
+C++ vs oracle f32 caches differ by at most `5.960e-8` and outputs by `1.192e-7`;
+the bf16 cache is exact and outputs remain within `atol=1e-2, rtol=1.6e-2`
+(maximum absolute difference `1.562e-2`). Release/CUDA-OFF ctest passes
+**103/103**; four focused binaries pass **39 active cases / 661 assertions**
+with five named dependency skips, and those four pass ASan+UBSan with leak
+detection. The row moves to `GATING`, not `DONE`: the shared CUDA apply path
+remains uncompiled/unrun, the Hunyuan model consumer is absent, and G6/G9
+feature-positive plus two-model correctness/performance/latency/memory gates
+remain open.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

@@ -48,7 +48,7 @@ def _record(*, faster: bool, repetition: int) -> dict:
         "output_lens": [OUTPUT_LEN] * requests,
         "output_throughput": requests * OUTPUT_LEN / duration,
         "request_throughput": requests / duration,
-        "start_times": [0.0, 1.0],
+        "start_times": [0.0, 2.0],
         "total_input_tokens": requests * INPUT_LEN,
         "total_output_tokens": requests * OUTPUT_LEN,
         "total_token_throughput": requests * (INPUT_LEN + OUTPUT_LEN) / duration,

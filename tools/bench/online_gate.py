@@ -206,6 +206,55 @@ def _require_list(record: Mapping[str, Any], field: str, length: int) -> list[An
     return value
 
 
+def precise_max_concurrent_requests(record: Mapping[str, Any]) -> int:
+    """Compute exact request overlap from detailed half-open time intervals.
+
+    Pinned vLLM's reported ``max_concurrent_requests`` uses inclusive one-second
+    buckets, so sequential requests that straddle a bucket boundary can be
+    reported as overlapping.  Detailed start/TTFT/ITL arrays retain the exact
+    intervals needed for the binding concurrency check.
+    """
+
+    start_times = record.get("start_times")
+    ttfts = record.get("ttfts")
+    itls = record.get("itls")
+    if (
+        not isinstance(start_times, list)
+        or not isinstance(ttfts, list)
+        or not isinstance(itls, list)
+    ):
+        raise HarnessError("precise concurrency requires start_times, ttfts and itls")
+    if not start_times or len(start_times) != len(ttfts) or len(start_times) != len(itls):
+        raise HarnessError("precise concurrency arrays have inconsistent cardinality")
+    events: list[tuple[float, int]] = []
+    for index, (start_value, ttft_value, itl_values) in enumerate(
+        zip(start_times, ttfts, itls)
+    ):
+        start = require_number(start_value, f"start_times[{index}]")
+        ttft = require_number(ttft_value, f"ttfts[{index}]")
+        if not isinstance(itl_values, list):
+            raise HarnessError(f"itls[{index}] is not a list")
+        latency = ttft + sum(
+            require_number(value, f"itls[{index}][{value_index}]")
+            for value_index, value in enumerate(itl_values)
+        )
+        if start < 0.0 or latency < 0.0:
+            raise HarnessError("precise concurrency interval contains a negative value")
+        events.append((start, 1))
+        events.append((start + latency, -1))
+    # End events sort before starts at identical timestamps: [start, end).
+    active = 0
+    peak = 0
+    for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+        active += delta
+        if active < 0:
+            raise HarnessError("precise concurrency event order is invalid")
+        peak = max(peak, active)
+    if active != 0:
+        raise HarnessError("precise concurrency intervals did not close")
+    return peak
+
+
 def validate_raw_result(
     record: Mapping[str, Any],
     *,
@@ -261,14 +310,17 @@ def validate_raw_result(
             if require_number(value, f"itls[{row_index}][{value_index}]") < 0.0:
                 raise HarnessError("itls contains a negative value")
 
-    configured_peak = record.get("max_concurrent_requests")
-    if isinstance(configured_peak, bool) or not isinstance(configured_peak, int):
+    bucketed_peak = record.get("max_concurrent_requests")
+    if isinstance(bucketed_peak, bool) or not isinstance(bucketed_peak, int):
         raise HarnessError("max_concurrent_requests is not an integer")
-    if configured_peak != min(concurrency, expected):
+    precise_peak = precise_max_concurrent_requests(record)
+    expected_peak = min(concurrency, expected)
+    if precise_peak != expected_peak:
         raise HarnessError(
-            f"achieved peak concurrency {configured_peak}; expected "
-            f"{min(concurrency, expected)}"
+            f"precise peak concurrency {precise_peak}; expected {expected_peak}"
         )
+    if bucketed_peak < precise_peak:
+        raise HarnessError("upstream bucketed peak is below precise concurrency")
 
     numeric_fields = (
         "duration",

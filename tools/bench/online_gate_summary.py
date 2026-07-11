@@ -35,6 +35,7 @@ from tools.bench.online_gate import (
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
     VLLM_ORACLE_VERSION,
+    precise_max_concurrent_requests,
     validate_raw_result,
 )
 from tools.bench.serve_low_common import (
@@ -614,8 +615,16 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
                     "generated_texts": record.get("generated_texts"),
                     "metrics": metrics,
                     "model": model,
+                    "precise_max_concurrent_requests": (
+                        precise_max_concurrent_requests(record)
+                        if not reasons
+                        else None
+                    ),
                     "reasons": reasons,
                     "repetition": repetition,
+                    "upstream_bucketed_max_concurrent_requests": record.get(
+                        "max_concurrent_requests"
+                    ),
                 },
             )
         )

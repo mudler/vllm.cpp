@@ -58,7 +58,10 @@ def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
         "output_lens": [OUTPUT_LEN] * requests,
         "output_throughput": requests * OUTPUT_LEN / 12.0,
         "request_throughput": requests / 12.0,
-        "start_times": [float(index) for index in range(requests)],
+        "start_times": [
+            float(index // max(1, concurrency)) * 2.0
+            for index in range(requests)
+        ],
         "total_input_tokens": requests * INPUT_LEN,
         "total_output_tokens": requests * OUTPUT_LEN,
         "total_token_throughput": requests * (INPUT_LEN + OUTPUT_LEN) / 12.0,
@@ -122,6 +125,9 @@ class OnlineClientContractTests(unittest.TestCase):
 
     def test_result_validation_rejects_partial_failed_or_bundled_streams(self) -> None:
         validate_raw_result(valid_record(), concurrency=1)
+        bucketed_boundary = valid_record()
+        bucketed_boundary["max_concurrent_requests"] = 2
+        validate_raw_result(bucketed_boundary, concurrency=1)
 
         partial = valid_record()
         partial["completed"] = 1
@@ -135,8 +141,9 @@ class OnlineClientContractTests(unittest.TestCase):
             validate_raw_result(bundled, concurrency=1)
 
         unsaturated = valid_record(requests=6, concurrency=2)
+        unsaturated["start_times"] = [float(index) * 2.0 for index in range(6)]
         unsaturated["max_concurrent_requests"] = 1
-        with self.assertRaisesRegex(HarnessError, "peak concurrency"):
+        with self.assertRaisesRegex(HarnessError, "precise peak concurrency"):
             validate_raw_result(
                 unsaturated,
                 concurrency=2,

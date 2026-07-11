@@ -4018,3 +4018,30 @@ manifest passes and hashes to
 `30a5382d24e727e2660376dc74bdc8d661aab5103b0514df60b98507bd4ef7e5`.
 CPU tools remain 34/34. Regenerate at the merged SHA; README capability state
 is unchanged.
+
+## 2026-07-11 — vLLM bucketed peak overcounts sequential c1 requests
+
+The clean `4b546a8` retry passed pandas/oracle provenance, the 27B model gate,
+the complete 26.55-GB zero-residency transition and live SSE. Its first c1
+client completed all six 1,024→128 timed requests with zero failures, then the
+local validator voided the arm because pinned vLLM reported
+`max_concurrent_requests=2` for configured c1. Raw result SHA-256 is
+`adbbb4dd1bffe7aa7d5e46cbe3ef9a4af145f846f10859f2ef4016a9a5092592`;
+client-log SHA-256 is
+`aa19d73b0588d47887836690227a211b3cac9468fbe3db5645d621ba274a48ae`.
+The server was cleaned up and `/tmp/gpu` released; this single arm remains
+diagnostic and supplies no ratio.
+
+Pinned `vllm/benchmarks/serve.py:656-706` computes that peak by marking every
+integer-second bucket from `int(start)` through `int(end)` **inclusive**. The
+detailed arrays show the six requests are strictly sequential: each next start
+follows the prior exact `start + ttft + sum(itls)` end by 0.00010–0.00018s.
+Thus the precise peak is 1; only the coarse upstream diagnostic is 2.
+
+The validator now sweeps exact half-open request intervals and sorts end events
+before starts at ties. Exact peak must equal the configured concurrency; the
+upstream bucketed value remains preserved and must not under-report the exact
+peak, but may overcount. The summary emits both values. Unit fixtures now form
+exact concurrency waves, include the upstream c1 false-overlap case, and retain
+an unsaturated precise-peak failure. The preserved real c1 raw result passes the
+new validator. README capability state is unchanged; regenerate after merge.

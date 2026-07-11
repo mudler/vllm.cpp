@@ -28,6 +28,10 @@ capture/JIT work cannot contaminate the reported request set.
 - CLI and benchmark orchestration:
   `/home/mudler/_git/vllm/vllm/entrypoints/cli/benchmark/serve.py:1` and
   `vllm/benchmarks/serve.py:1`.
+- Pinned vLLM computes `max_concurrent_requests` with inclusive integer-second
+  buckets at `vllm/benchmarks/serve.py:656-706`; adjacent sequential requests
+  can therefore both occupy one bucket. Binding saturation uses the retained
+  detailed half-open intervals instead.
 - CLI test contract: `tests/benchmarks/test_serve_cli.py:1`.
 - Production serving path: `vllm/entrypoints/openai/api_server.py` and the V1
   async engine/streaming path reached by that server.
@@ -85,6 +89,9 @@ successful repetitions.
   build or GPU lock. The version comes from pinned vLLM's CUDA test requirement
   (`requirements/test/cuda.txt:742`), while `setup.py:1247` declares pandas as a
   `bench` extra.
+- Client contracts cover vLLM's bucket-boundary false overlap: the upstream
+  bucketed peak is retained, while exact start + TTFT + ITL intervals must reach
+  the configured concurrency and use end-before-start ordering at ties.
 - Applicable `tests/entrypoints/openai/` streaming, disconnect, usage, and error
   cases before relying on HTTP measurements.
 - Local conformance and benchmark tests remain prerequisites. Any upstream case
@@ -101,7 +108,11 @@ at least three valid repetitions and a fresh pinned-vLLM denominator. Generated
 tokens must pass the configured deterministic/logprob correctness gate before
 performance is compared. vllm.cpp must be no worse on every throughput,
 latency, error, and memory axis; a failed start or request voids that arm. The
-committed summary exits nonzero unless every detailed result, exact generated
+configured concurrency must be reached by an exact sweep of each request's
+half-open `[start_time, start_time + ttft + sum(itls))` interval. Pinned vLLM's
+inclusive one-second `max_concurrent_requests` remains hashed diagnostic data
+but is not a saturation oracle because it can overcount sequential boundaries.
+The committed summary exits nonzero unless every detailed result, exact generated
 text pair, stream probe, process/GPU-memory sample, thermal snapshot, cache/
 memory-return record, clean-HEAD build provenance, exact pip-oracle runtime
 inventory, model gate and paired trace is present and hash-valid.

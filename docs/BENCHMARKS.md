@@ -497,6 +497,31 @@ vLLM. The project results differ from the preceding means by -0.06% greedy and
 -0.11% temperature 1, so the rebase produced no material throughput change.
 Performance parity remains open.
 
+The same workload was measured for memory over three interleaved repetitions
+per engine and sampling mode, with one `/tmp/gpu` lock covering the complete
+series. The existing process-tree sampler read aggregate RSS/PSS and
+per-process VRAM every 100 ms from launch through shutdown. VRAM excludes the
+146-166 MiB desktop baseline. Lower is better.
+
+| Memory axis | vllm.cpp | vLLM | vllm.cpp / vLLM |
+|---|---:|---:|---:|
+| Greedy peak process VRAM, mean (range) | 12,911 MiB (12,894-12,924) | 12,924 MiB | **0.9990x** |
+| Temperature-1 peak process VRAM, mean (range) | 12,929 MiB (12,926-12,930) | 12,924 MiB | **1.0004x** |
+| Loaded-GPU plateau peak PSS, all runs | 12.59 GiB | 4.15 GiB | **3.04x** |
+| Launch-to-exit peak PSS, six-run mean (range) | 19.77 GiB (19.61-19.88) | 7.39 GiB (6.51-8.07) | **2.68x** |
+| Launch-to-exit peak RSS, six-run mean | 19.78 GiB | 7.71 GiB | **2.56x** |
+| Whole-system `MemAvailable` drop, six-run mean | 12.41 GiB | 3.96 GiB | **3.14x** |
+
+This memory checkpoint is **diagnostic, not an accepted gate** because local
+greedy correctness remains 15/16. The process VRAM result is reproducible and
+effectively equal. PSS is the preferred host metric; RSS double-counts shared
+pages, and whole-system available-memory movement includes background/cache
+noise. The 10 Hz monitor materially slowed eager vllm.cpp, especially random
+sampling, so throughput from the monitored legs is **VOID**; the unmonitored
+throughput table above remains authoritative. Every process exited, process
+VRAM returned to zero, board memory returned to 146-166 MiB, and no Xid,
+UVM/AER fault, reset, or lockup occurred.
+
 Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
 The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps
 to `NV_ERR_NOT_SUPPORTED` in the matching 595.71.05 open-driver source and is

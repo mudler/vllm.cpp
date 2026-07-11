@@ -6810,3 +6810,69 @@ Current read-only health check: RTX 5070 Ti, driver 595.71.05, P8, 0% GPU,
 warning. No project or system configuration change is required. Treat future
 instances as benign unless accompanied by an Xid, UVM/AER fault, reset, GPU
 loss, application error, or a new status other than `0x56`.
+
+## 2026-07-11 — local Qwen3.5-4B VRAM and system-RAM comparison
+
+Measured process VRAM and host memory for vllm.cpp and production vLLM 0.24.0
+on the current local Qwen3.5-4B workload. One `flock /tmp/gpu` covered the
+complete interleaved series: three repetitions per engine in greedy mode and
+three per engine at temperature 1. Both engines used snapshot `851bf6e`, the
+same 128 ShareGPT prompts, exact 1024-token input and 128-token output,
+concurrency/max-num-seqs 32, BF16, mnbt 2048, model length 4096, seed 0, and
+ignore-EOS. vllm.cpp used 1280 blocks and `VT_POOL_MAX_CACHED_MB=1024`; vLLM
+used GPU-memory utilization 0.88.
+
+The existing `tools/bench/sample_process_memory.py` sampled every 100 ms from
+process launch through shutdown. It recursively aggregated each owned process
+tree's `/proc/<pid>/smaps_rollup` RSS/PSS, retained `MemAvailable`, and summed
+per-process VRAM from `nvidia-smi`. The first evidence directory
+`/tmp/qwen35-memory-20260711-1205` is VOID: direct-file invocation could not
+import the repository `tools` package, so the series was interrupted after its
+first unmonitored leg. The driver was corrected to use
+`python3 -m tools.bench.sample_process_memory`, made sampler failure fatal, and
+all legs restarted in `/tmp/qwen35-memory-20260711-1220`. Sampler unit tests
+pass 3/3; all 12 corrected sample streams terminate with `alive=false` and
+GPU memory zero.
+
+Peak process VRAM is effectively equal and reproducible:
+
+- Greedy vllm.cpp: 12,924 / 12,916 / 12,894 MiB, mean **12,911 MiB**;
+  vLLM: 12,924 / 12,924 / 12,924 MiB. Ratio **0.9990x**.
+- Temperature 1 vllm.cpp: 12,930 / 12,930 / 12,926 MiB, mean **12,929 MiB**;
+  vLLM: 12,924 / 12,924 / 12,924 MiB. Ratio **1.0004x**.
+
+These values exclude the persistent 146-166 MiB desktop allocation. Host RAM
+is substantially worse in vllm.cpp:
+
+- At the loaded-GPU plateau (samples with process VRAM at least 12,000 MiB),
+  maximum PSS across runs is **12.59 GiB** for vllm.cpp versus **4.15 GiB** for
+  vLLM, ratio **3.04x**. Mode-specific per-run-max means are 12.57/12.59 GiB
+  project versus 4.13/4.13 GiB vLLM for greedy/temperature 1.
+- Launch-to-exit peak PSS over all six runs averages **19.77 GiB**
+  (19.61-19.88) for vllm.cpp versus **7.39 GiB** (6.51-8.07) for vLLM,
+  ratio **2.68x**. Peak RSS mean is 19.78 versus 7.71 GiB (2.56x).
+- Mean whole-system `MemAvailable` drop is **12.41 GiB** versus **3.96 GiB**
+  (3.14x). This is secondary because it includes page-cache/background noise;
+  process-tree PSS is the preferred host comparison.
+
+The project PSS maximum occurs during loading before device residency (example
+greedy r1: 19.85 GiB at 7.50 s while process VRAM is zero). Once loaded it
+still retains about 12.6 GiB because `OwnedTensor` keeps host `bytes` after
+populating lazy `d_dev` copies. The plain-BF16 loader additionally copies tied
+embeddings into `lm_head` and retains separate gate/up and GDN B/A buffers
+after constructing `gate_up_proj` and `in_proj_ba`. vLLM's loaded plateau is
+about 4.1 GiB. Releasing inactive source tensors after packing, aliasing tied
+weights, and supporting device-only ownership are concrete next memory levers.
+
+The 10 Hz monitor materially perturbs eager C++ timing: monitored greedy total
+throughput is 5,978.12/5,976.88/5,956.73 and temperature 1 is
+4,961.13/4,918.91/4,950.01, while monitored vLLM remains near its unmonitored
+values. These timing numbers are VOID and do not replace the preceding
+unmonitored throughput checkpoint; reading large `smaps_rollup` mappings and
+polling NVML disproportionately interferes with the eager launch path. Memory
+allocations are persistent long enough to reproduce in every run.
+
+Every process exited and board memory returned to 146-166 MiB. Final state was
+P8, 0% utilization, 166 MiB, 42 C. The kernel log contains no Xid, UVM/AER
+fault, reset, oops, or lockup from the series. Correctness remains the existing
+15/16, so this is a diagnostic memory checkpoint, not a passed gate.

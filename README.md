@@ -513,6 +513,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **6,681.13 tok/s (0.935×)**; two greedy runs average **6,430.56 tok/s**
   versus fresh vLLM **6,715.54 tok/s (0.958×)**. These are open gaps, not
   performance parity.
+  A three-repetition, process-tree memory campaign on the same workload finds
+  **VRAM effectively equal**: vllm.cpp uses 12,894-12,930 MiB and vLLM uses
+  12,924 MiB (excluding the 146-166 MiB desktop baseline). Host RAM is an open
+  gap: at the loaded-GPU plateau peak PSS is **12.59 GiB versus 4.15 GiB
+  (3.04×)**, while launch-to-exit peak PSS averages **19.77 GiB versus 7.39
+  GiB (2.68×)**. The loader retains owned host tensors after device upload,
+  including tied/packed BF16 duplicates; memory parity is not met.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

@@ -3179,3 +3179,22 @@ then pair this leaf with `ATTN-SLIDING-WINDOW` G4/G6-G9 (operator/model-positive
 correctness, nsys trace, every-axis performance and memory). Until that evidence
 exists, README and matrices explicitly say the KV policy is CPU-gated but
 sliding-window model support is not user-visible.
+
+## 2026-07-11 — C5 W2 sliding-window attention claimed alongside the serving campaign
+
+`CLAIM-C5-SW-ATTN-1` moves `ATTN-SLIDING-WINDOW` `READY -> ACTIVE` in isolated
+worktree `/home/mudler/_git/vllm.cpp-c5-sw-attn`, branch
+`codex/c5-sw-attn-w2`. The accepted W2 scope is one backend-neutral semantic
+window propagated through the generic attention/backend seam,
+`vt::PagedAttention`, the CPU and portable-CUDA lower key bound, and the
+vendored FA2 adapter, with the applicable pinned attention-backend and FA2
+tests ported in the same change. Chunked-local attention/KV, RoPE, model-family
+implementation, connectors/offload and DCP/PCP remain out of scope.
+
+The active `CLAIM-SERVE-GATE-1` process still owns `/tmp/gpu`; read-only
+inspection at 2026-07-11 00:21 UTC showed the 27B ours c32 arm running with the
+server using 25,251 MiB. Its vLLM denominator and both 35B arms remain scripted
+afterward. W2 therefore begins with source, CPU tests and compile-only CUDA
+validation and will not launch GPU work until that whole campaign releases the
+lock. Feature-positive model, oracle, nsys and every-axis performance/memory
+gates remain an explicit `GATING` handoff rather than invented evidence.

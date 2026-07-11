@@ -22,9 +22,9 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Speculative decoding | 6 | 0 | 0 | 0 | 3 | 0 | 1 | 2 |
 | Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 1 | 1 | 10 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
-| Long context and attention | 10 | 0 | 0 | 0 | 7 | 0 | 0 | 3 |
+| Long context and attention | 10 | 0 | 0 | 0 | 6 | 1 | 0 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **96** | **9** | **17** | **0** | **15** | **1** | **5** | **49** |
+| **Total** | **96** | **9** | **17** | **0** | **14** | **2** | **5** | **49** |
 
 ## Engine core and scheduling
 
@@ -161,7 +161,7 @@ claims it.
 | `ATTN-ROPE-LLAMA3` | Llama 3 frequency-banded RoPE scaling | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155-171`; `vllm/model_executor/layers/rotary_embedding/llama3_rope.py:11-54` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-ROPE-LONGROPE` | Phi-3 LongRoPE short/long factor scaling | T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:315-335`; `vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.py:16-159` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-ROPE-DYNAMIC-NTK` | Dynamic-NTK `alpha` and `factor` dispatch modes | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:200-230`; `vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.py:30-73`; `vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.py:9-43`; `tests/test_config.py:543-587` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
-| `ATTN-SLIDING-WINDOW` | Sliding-window attention semantics and backend dispatch | T1 | `vllm/v1/attention/backends/flash_attn.py:255-300,674-717,840-955`; `tests/v1/attention/test_attention_backends.py:745-867`; `tests/v1/e2e/general/test_correctness_sliding_window.py:19-78` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-SLIDING-WINDOW` | Sliding-window attention semantics and backend dispatch | T1 | `vllm/v1/attention/backends/flash_attn.py:255-300,674-717,840-955`; `tests/v1/attention/test_attention_backends.py:745-867`; `tests/v1/e2e/general/test_correctness_sliding_window.py:19-78` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `ACTIVE` | `CLAIM-C5-SW-ATTN-1` |
 | `ATTN-CHUNKED-LOCAL` | Chunked-local attention wrapper, virtual-batch metadata, and underlying-backend dispatch | T1 | `vllm/model_executor/layers/attention/chunked_local_attention.py:30-128`; `vllm/v1/attention/backends/utils.py:225-420`; `tests/v1/attention/test_chunked_local_attention.py:28-204` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-MLA` | MLA prefill/decode backends and latent KV | T2 | `vllm/v1/attention/backends/mla/flashinfer_mla.py:1`; `vllm/v1/attention/backends/mla/triton_mla.py:1` | - | - | `planned: specs/mla-backends.md` | `INVENTORIED` | - |
 | `ATTN-MAMBA` | Mamba1/Mamba2, short-conv, linear backends | T2 | `vllm/v1/attention/backends/mamba_attn.py:30,79`; `vllm/model_executor/layers/mamba/short_conv.py:1` | - | - | `planned: specs/mamba-backends.md` | `INVENTORIED` | - |

@@ -3252,3 +3252,22 @@ engines on the identical feature-positive workload, and run G6-G9 correctness,
 throughput, latency and memory comparisons plus the unchanged 27B/35B
 regressions. Until then README and matrices say operator implemented/compile-
 checked, but no user-visible sliding-window model support.
+
+## 2026-07-11 — C5 W3 chunked-local KV leaf claimed
+
+`CLAIM-C5-CHUNKED-KV-1` moves `KV-CHUNKED-LOCAL-SPEC` `READY -> ACTIVE` in
+isolated worktree `/home/mudler/_git/vllm.cpp-c5-chunked-kv`, branch
+`codex/c5-chunked-kv-w3`. W3 is the next dependency-ready leaf in the accepted
+C5 work breakdown after W1 established the shared registry shape. Its bounded
+scope is `ChunkedLocalAttentionSpec`, registry/coordinator dispatch,
+`ChunkedLocalAttentionManager` fixed-chunk prefix/null-block/recycling policy,
+the exact admission cap and hybrid-manager-disabled full-allocation conversion,
+plus the applicable pinned CPU tests and deterministic allocation properties.
+W4 virtual-batch attention metadata/backend, RoPE, models, connectors/offload,
+DCP/PCP and all GPU work remain out of scope.
+
+Read-only DGX inspection at 2026-07-11 01:07 UTC showed
+`CLAIM-SERVE-GATE-1` still holding `/tmp/gpu`, with the 27B vllm.cpp server at
+25,251 MiB and the c32 repetition series active; two PR3 jobs remain queued on
+the mutex. W3 requires only CPU G1/G2, so it will not enqueue or disturb that
+campaign.

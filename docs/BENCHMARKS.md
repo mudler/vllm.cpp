@@ -522,29 +522,42 @@ throughput table above remains authoritative. Every process exited, process
 VRAM returned to zero, board memory returned to 146-166 MiB, and no Xid,
 UVM/AER fault, reset, or lockup occurred.
 
-Host-residency optimization disposition: **PENDING / ACTIVE**. W1 now implements
-post-first-forward synchronized release for device-resident host staging on an
-engine-owned plain-BF16 discrete-CUDA model, with a same-binary opt-out. W2 also
-removes tied embedding/head duplication and uses canonical packed storage for
-both packed and row-sliced split execution. The
-accepted
-[`ENG-HOST-WEIGHT-RESIDENCY`](../.agents/specs/discrete-cuda-host-weight-residency.md)
-work first gates synchronized post-residency host release and duplicate-free
-tied/stacked ownership on this discrete GPU. It does not replace the table
-above, and no improved memory or throughput number is published until the
-same-workload A/B and fresh vLLM series completes. If launch-to-exit peak PSS
-remains above vLLM after steady-state release, bounded streaming/direct-device
-loading remains an explicit open follow-on. CPU/CUDA correctness, memory and
-unmonitored throughput gates have not yet run for this implementation. CPU and
-native-sm_120 builds plus the focused loader/forward/engine/registry tests pass
-4/4; this is compile/unit evidence only. The first lock-held unmonitored A/B is
-**REJECTED**: post-first-forward release averaged 6,325.25 tok/s versus
-6,439.33 with release disabled (-1.77%). The implementation now performs eager
-upload and synchronized release in model preparation, before request timing;
-its replacement A/B is `PENDING`. The initial combined driver stopped after all
-nine valid memory arms and before any throughput process due to a `set -u`
-shell-local expansion; the throughput-only restart was separately lock-held and
-complete, so no partial timing is retained.
+Host-residency optimization disposition: **PARTIAL PASS / ACTIVE** at
+`6c30657`. W1-W3 close steady host residency and lower VRAM; launch peak remains
+open. Three interleaved repetitions per arm used the same workload as the table
+above and one whole-series lock. Stable PSS is the mean of each run's last ten
+live samples with process VRAM above 11,000 MiB; the lower threshold reflects
+the removed tied device allocation.
+
+| Memory axis | Release ON | Release OFF | vLLM | ON / vLLM |
+|---|---:|---:|---:|---:|
+| Stable GPU-resident process PSS, three-run mean | **0.752 GiB** | 8.585 GiB | 4.097 GiB | **0.184x** |
+| Launch-to-exit peak PSS, mean (range) | **15.55 GiB** (15.24-15.71) | 15.57 GiB | 6.69 GiB (6.21-7.02) | **2.32x** |
+| Peak process VRAM, mean | **11,689 MiB** | 11,709 MiB | 12,924 MiB | **0.904x** |
+
+Versus the pre-change vllm.cpp baseline, stable PSS falls 12.59→0.752 GiB and
+launch peak falls 19.77→15.55 GiB (-21.4%). The residual peak is created before
+residency by simultaneous safetensors mappings plus full owned materialization;
+bounded streaming/direct-device loading is explicitly `PENDING` and prevents
+row closure.
+
+The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
+eager upload/synchronized release into model preparation produces
+6551.56/6551.84/6551.42 total tok/s, mean **6551.61**, versus release-OFF mean
+**6439.25** (**+1.74%**). Fresh vLLM mean is **6716.57**, so total throughput is
+**0.9754x**; output is 724.46 vs 742.70 tok/s, also **0.9754x**. This improves
+the prior 0.9576x but remains below the every-axis performance gate.
+
+Release ON/OFF token files are byte-identical on all 128 throughput requests,
+and current natural-corpus output is byte-identical to the prior project 16/16
+file. Fresh vLLM changed request 10 versus its own prior oracle file; current
+cross-engine natural parity is therefore 14/16 rather than the historical
+15/16. Correctness parity remains open and no support claim changes.
+
+Verification: CPU and native-sm_120 builds pass; full CPU CTest is **105/105**
+and focused CUDA-build loader/forward/engine/registry CTest is **4/4**. All
+processes exited, GPU state returned to 146 MiB / 0% / 42 C, and the read-only
+kernel journal contains no benchmark-window entry.
 
 Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
 The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps

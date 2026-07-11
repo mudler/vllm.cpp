@@ -513,25 +513,22 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **6,681.13 tok/s (0.935×)**; two greedy runs average **6,430.56 tok/s**
   versus fresh vLLM **6,715.54 tok/s (0.958×)**. These are open gaps, not
   performance parity.
-  A three-repetition, process-tree memory campaign on the same workload finds
-  **VRAM effectively equal**: vllm.cpp uses 12,894-12,930 MiB and vLLM uses
-  12,924 MiB (excluding the 146-166 MiB desktop baseline). Host RAM is an open
-  gap: at the loaded-GPU plateau peak PSS is **12.59 GiB versus 4.15 GiB
-  (3.04×)**, while launch-to-exit peak PSS averages **19.77 GiB versus 7.39
-  GiB (2.68×)**. The loader retains owned host tensors after device upload,
-  including tied/packed BF16 duplicates; memory parity is not met. A scoped
-  `ENG-HOST-WEIGHT-RESIDENCY` work is now **ACTIVE**: engine-owned plain-BF16
-  models on discrete CUDA release host buffers that have a device-resident copy
-  after the first synchronized full forward. Tied logits now share embedding
-  storage, while canonical packed gate/up and GDN B/A tensors also serve the
-  split fallback by row slicing instead of retaining source copies. CPU, UMA,
-  borrowed and quantized release behavior is unchanged;
-  `VT_RELEASE_HOST_WEIGHTS=0` is the release control. Correctness, memory and
-  performance gates are pending. Releasing on the first timed forward was
-  rejected after a 1.77% throughput regression; ordinary weights are now
-  uploaded and released in model preparation before request timing. CPU and
-  native-sm_120 builds plus four focused CPU tests pass, but the replacement
-  A/B has not run and no improved number is claimed yet.
+  The original memory campaign found equal VRAM but a severe host gap: 12.59 vs
+  4.15 GiB loaded PSS and 19.77 vs 7.39 GiB launch peak. The implemented
+  `ENG-HOST-WEIGHT-RESIDENCY` W1-W3 now mirror vLLM ownership: tied logits share
+  embeddings, gate/up and GDN B/A retain only canonical stacked storage, and an
+  engine-owned plain-BF16 model is uploaded/released during model preparation.
+  `VT_RELEASE_HOST_WEIGHTS=0` retains the W2-only control; CPU, UMA, borrowed and
+  quantized release behavior is unchanged.
+
+  At commit `6c30657`, three interleaved repetitions give steady GPU-resident
+  process PSS **0.752 GiB versus 4.097 GiB vLLM (0.184×; 81.6% lower)** and peak
+  process VRAM **11,689 versus 12,924 MiB (0.904×)**. Launch peak PSS improves
+  to **15.55 GiB (-21.4%)** but remains above vLLM's **6.69 GiB (2.32×)**, so
+  memory parity as a whole remains open pending bounded streaming/direct-device
+  loading. Prepare-time release is **+1.74%** versus OFF and reaches **0.9754×**
+  fresh-vLLM total/output throughput; performance parity also remains open.
+  Full CPU CTest passes 105/105 and focused native-sm_120 CTest passes 4/4.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

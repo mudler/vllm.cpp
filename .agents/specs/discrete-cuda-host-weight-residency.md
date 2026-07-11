@@ -1,7 +1,7 @@
 # Discrete-CUDA host-weight residency
 
 **Row:** `ENG-HOST-WEIGHT-RESIDENCY`  
-**State:** `SPIKE`  
+**State:** `ACTIVE`
 **Claim:** `CLAIM-HOST-WEIGHT-RESIDENCY-1`
 
 ## Scope
@@ -135,6 +135,11 @@ change. The implementation checkpoint records full commands and commit IDs.
    fresh vLLM denominator, trace-name and kernel-log safety checks.
 4. `W4` peak follow-on: if peak PSS remains above vLLM, spike a direct-device or
    bounded-window streaming safetensors loader rather than claiming closure.
+
+Checkpoint `6c30657`: W1-W3 are implemented and measured. Stable GPU-resident
+PSS is 0.752 GiB versus 4.097 GiB vLLM; peak VRAM is 11,689 versus 12,924 MiB;
+prepare-time ON is +1.74% throughput versus OFF. W4 is required because launch
+peak remains 15.55 versus 6.69 GiB. The row therefore remains `ACTIVE`.
 
 ## Risks and decisions
 

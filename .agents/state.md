@@ -6960,3 +6960,52 @@ weights and required F32 views in `PrepareQwen3_5Dense`, synchronizes and
 releases there, before requests. Both builds and focused CTest 4/4 pass. Its
 replacement memory/performance A/B is pending; no performance acceptance is
 claimed from the rejected path.
+
+## 2026-07-11 — host residency W1-W3 accepted; peak streaming remains
+
+The immutable `6c30657` replacement campaign completed under one `/tmp/gpu`
+lock with three interleaved repetitions each of prepare-time release ON,
+release OFF, and fresh production vLLM 0.24.0. Workload: Qwen3.5-4B snapshot
+`851bf6e`, 128 exact ShareGPT 1024-token prompts, 128 output tokens, concurrency
+32, BF16, mnbt 2048, max model length 4096, seed 0, ignore EOS; project 1280
+blocks/1024-MiB pool and vLLM 0.88 GPU utilization. Raw evidence is
+`/tmp/qwen35-host-residency-6c30657`.
+
+Accepted memory results:
+
+- Stable resident PSS (mean of final ten live samples above 11,000 MiB process
+  VRAM): release ON **0.7518 GiB**, OFF **8.5848 GiB**, vLLM **4.0969 GiB**.
+  ON is 0.1835x vLLM, or 81.6% lower; the old project plateau was 12.59 GiB.
+- Launch peak PSS: ON **15.5488 GiB** mean (15.24-15.71), OFF **15.5708 GiB**,
+  vLLM **6.6937 GiB** (6.21-7.02). W2 lowers the old 19.77-GiB peak by 21.4%,
+  but ON remains 2.3229x vLLM. Post-residency release cannot affect it.
+- Peak process VRAM: ON **11,688.7 MiB**, OFF 11,709.3, vLLM 12,924. ON is
+  0.9044x vLLM; tied identity removes the prior duplicate device head.
+
+Accepted unmonitored timing: release ON 6551.56/6551.84/6551.42 total tok/s,
+mean **6551.61**, versus OFF 6438.81/6438.22/6440.71, mean **6439.25**:
+prepare-time residency is +1.7449%. Fresh vLLM 6717.24/6716.22/6716.25, mean
+**6716.57**; ON is **0.9754x** total and output throughput (724.46 vs 742.70).
+This improves the prior 0.9576x but does not pass the every-axis performance
+gate.
+
+Correctness did not regress within the project: release ON/OFF token files are
+byte-identical for all 128 throughput requests, and the current 16-prompt
+natural output is byte-identical to the prior project file. Fresh vLLM changed
+request 10 versus its own prior oracle file, so current cross-engine natural
+parity is 14/16 instead of the historical 15/16 (the established request-1 tie
+plus oracle-run request-10 drift). Correctness remains open; no support claim is
+promoted.
+
+All campaign processes exited, process VRAM returned to zero, board memory to
+146 MiB, final state 0%/42 C, and the kernel journal has no entry during the
+benchmark window. `ENG-HOST-WEIGHT-RESIDENCY` remains `ACTIVE`: W1-W3 close and
+reverse steady host residency without a throughput trade, but W4 must spike and
+implement bounded safetensors streaming/direct-device loading to close the
+15.55-vs-6.69-GiB launch peak. No Spark/GB10 result is inferred.
+
+Final verification is green: full low-concurrency CPU CTest **105/105** and
+lock-held focused native-sm_120 CUDA-build CTest
+`model_registry|qwen27_dense_forward|qwen27_paged_forward|loaded_engine_dense`
+**4/4**. Both build trees compile. The agent-record checker, mutation suite and
+doc-checkpoint checker remain the final repository gates before commit.

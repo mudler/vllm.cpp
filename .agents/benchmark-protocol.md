@@ -120,7 +120,11 @@ rumor; a reproducible run is evidence.
   and record it with the results; between engine legs, verify available memory
   returns to the recorded baseline (leak check) and drop page caches before the
   next leg. A leg run on a throttling or memory-leaking box voids the
-  cross-leg comparison, same as contention.
+  cross-leg comparison, same as contention. On a non-root benchmark host, the
+  complete enumerated set of benchmark-owned checkpoint, corpus, client and
+  server files may instead be evicted with `POSIX_FADV_DONTNEED` only when a
+  retained report hashes that inventory and `mincore(2)` proves **zero resident
+  pages** afterward; an unverified/best-effort advisory call does not qualify.
   See [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md)
   § "Folded: spark-bench".
 

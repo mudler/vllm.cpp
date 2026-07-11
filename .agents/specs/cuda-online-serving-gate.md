@@ -60,7 +60,7 @@ successful repetitions.
 | benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, benchmark modules, dist metadata and RECORD in `online_gate.py` |
-| lifecycle/resources | `scripts/dgx-online-serving.sh`; `tools/bench/sample_process_memory.py` |
+| lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
 | GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via `tools/bench/profile_vllm_online_gate.py`; kernel-event aggregation in `summarize_torch_kernels.py` |
 
 ## Tests to port
@@ -77,6 +77,10 @@ successful repetitions.
 - Pinned profiler example/API behavior is covered by
   `tests/tools/test_online_gate_trace.py`; project every-axis/void propagation
   is covered by `tests/tools/test_online_gate_summary.py`.
+- Rootless eviction inventory, inode deduplication, zero-residency proof,
+  failure reporting and overwrite refusal are covered by
+  `tests/tools/test_drop_file_cache.py`; client/summary suites reject resident
+  or missing cache reports.
 - Applicable `tests/entrypoints/openai/` streaming, disconnect, usage, and error
   cases before relying on HTTP measurements.
 - Local conformance and benchmark tests remain prerequisites. Any upstream case
@@ -97,6 +101,17 @@ committed summary exits nonzero unless every detailed result, exact generated
 text pair, stream probe, process/GPU-memory sample, thermal snapshot, cache/
 memory-return record, clean-HEAD build provenance, exact pip-oracle runtime
 inventory, model gate and paired trace is present and hash-valid.
+
+DGX does not delegate global `/proc/sys/vm/drop_caches` to the benchmark user.
+The gate therefore enumerates every regular checkpoint, corpus, client and
+server file, deduplicates by inode, calls `POSIX_FADV_DONTNEED`, and uses
+`mincore(2)` to require zero resident pages. Before/after reports for every leg
+and before/between/after reports for paired traces retain the inventory hash,
+logical byte count and file-level residency; the summary re-hashes and validates
+each raw report. A successful advisory call without zero-residency proof is
+still fatal. A warmed real 27B probe covered 49 files / 26.55 GB, observed
+1,199,611,904 resident bytes before, and reached zero afterward (report SHA-256
+`21bbcc7594a661d8ce22979f6f7009f2fb8e02b0ad2ee02d297373ee14320069`).
 
 ## Dependencies
 

@@ -3958,3 +3958,31 @@ The plan test asserts `/oracle/bin/python` for its synthetic client and executes
 the module suffix under the test interpreter. Regenerate under the new merged
 SHA; only a successfully generated and converted pair of corpus manifests may
 precede the first 27B GPU lock. README capability state remains unchanged.
+
+## 2026-07-11 — 27B execution preflight exposes root-only cache assumption
+
+At clean main `4e7aa12`, both source corpora generated successfully: each has
+3,457 globally disjoint exact 1,024-token prompts at the pinned tokenizer
+revision, and each hash-preserving vLLM view contains 1,008 timed prompts. The
+27B execute path refreshed and hashed the exact server/oracle/build/snapshot,
+acquired the whole-model lock, and passed `test_qwen27_paged_engine` in 16.36s
+(gate-log SHA-256 `8ed05dea66c0fc2abbad579db2834a24c6cd16060a11834f714b3b9857af67b9`).
+It then stopped before starting either timed server because `sudo -n` cannot
+write global `/proc/sys/vm/drop_caches`. The lock was released, no raw result
+exists, and the entire `4e7aa12` campaign remains non-binding.
+
+The replacement does not waive cache equality. `drop_file_cache.py` inventories
+all regular checkpoint, corpus, client and server files, deduplicates inodes,
+syncs, applies `POSIX_FADV_DONTNEED`, and checks every page with `mincore(2)`;
+one resident page fails the call. Every leg retains hashed before/after reports,
+paired traces retain before/between/after reports, memory-return records bind
+their hashes, and the final summary reopens and verifies the raw proof. The
+benchmark protocol now permits this rootless path only with zero residency.
+
+The warmed real 27B probe passed over 49 files and 26,551,864,449 logical bytes,
+moving from 1,199,611,904 resident bytes to zero; report SHA-256 is
+`21bbcc7594a661d8ce22979f6f7009f2fb8e02b0ad2ee02d297373ee14320069`.
+Online-focused tests pass 18/18, all benchmark tools 34/34, registered CTest
+tools 1/1, record checker + 13 mutations, `py_compile`, `bash -n`, ShellCheck
+and diff checks pass. Regenerate at the merged SHA before the next GPU lock.
+README capability state is unchanged.

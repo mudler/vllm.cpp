@@ -63,6 +63,7 @@ MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192}
 ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
+CACHE_DROP_METHOD = "posix_fadvise-dontneed+mincore"
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -500,11 +501,13 @@ def build_plan(
             "memory/<model>/<engine>/r<rep>.samples.jsonl",
             "memory/<model>/<engine>/r<rep>.summary.json",
             "thermal/<model>/<engine>/r<rep>-{before,after}.txt",
+            "cache-drop/<model>/<engine>/r<rep>-{before,after}.json",
             "memory-return/<model>/<engine>/r<rep>.json",
             "trace/<model>/ours.nsys-rep",
             "trace/<model>/ours-cuda_gpu_kern_sum.txt",
             "trace/<model>/vllm-profile/*.pt.trace.json.gz",
             "trace/<model>/vllm-kernels.json",
+            "trace/<model>/cache-{before-ours,between-engines,after-vllm}.json",
             "trace/<model>/status.json",
             "summary/{all-runs,ratios}.json",
         ],
@@ -548,25 +551,66 @@ def record_memory_return(
     baseline_mem_available_kib: int,
     final_mem_available_kib: int,
     tolerance_kib: int,
-    drop_caches_succeeded: bool,
+    before_cache_drop_report: pathlib.Path,
+    after_cache_drop_report: pathlib.Path,
     gpu_idle: bool,
 ) -> dict[str, Any]:
     if output.exists():
         raise HarnessError(f"refusing to overwrite memory-return evidence: {output}")
     if min(baseline_mem_available_kib, final_mem_available_kib, tolerance_kib) < 0:
         raise HarnessError("memory-return values must be non-negative")
+    cache_drops = {
+        "before": _validated_cache_drop_artifact(before_cache_drop_report),
+        "after": _validated_cache_drop_artifact(after_cache_drop_report),
+    }
     within = final_mem_available_kib + tolerance_kib >= baseline_mem_available_kib
     result = {
         "baseline_mem_available_kib": baseline_mem_available_kib,
-        "drop_caches_succeeded": drop_caches_succeeded,
+        "cache_drops": cache_drops,
+        "drop_caches_succeeded": True,
         "final_mem_available_kib": final_mem_available_kib,
         "gpu_idle": gpu_idle,
         "mem_available_within_tolerance": within,
-        "returned": drop_caches_succeeded and gpu_idle and within,
+        "returned": gpu_idle and within,
         "tolerance_kib": tolerance_kib,
     }
     write_json_atomic(output, result)
     return result
+
+
+def _validated_cache_drop_artifact(path: pathlib.Path) -> dict[str, Any]:
+    report = _load_json_object(path)
+    if report.get("method") != CACHE_DROP_METHOD:
+        raise HarnessError(f"cache-drop method differs in {path}")
+    if report.get("succeeded") is not True:
+        raise HarnessError(f"cache-drop report did not succeed: {path}")
+    if report.get("resident_after_bytes") != 0:
+        raise HarnessError(f"cache-drop report retains resident pages: {path}")
+    file_count = report.get("file_count")
+    logical_bytes = report.get("logical_bytes")
+    inventory_sha = report.get("file_inventory_sha256")
+    roots = report.get("roots")
+    if not isinstance(file_count, int) or file_count <= 0:
+        raise HarnessError(f"cache-drop report has no file inventory: {path}")
+    if not isinstance(logical_bytes, int) or logical_bytes <= 0:
+        raise HarnessError(f"cache-drop report has no logical byte count: {path}")
+    if not isinstance(inventory_sha, str) or re.fullmatch(r"[0-9a-f]{64}", inventory_sha) is None:
+        raise HarnessError(f"cache-drop inventory hash is absent: {path}")
+    if (
+        not isinstance(roots, list)
+        or len(roots) != 4
+        or any(not isinstance(root, str) or not pathlib.Path(root).is_absolute() for root in roots)
+    ):
+        raise HarnessError(f"cache-drop root inventory differs: {path}")
+    return {
+        "file_count": file_count,
+        "file_inventory_sha256": inventory_sha,
+        "logical_bytes": logical_bytes,
+        "method": CACHE_DROP_METHOD,
+        "path": str(path),
+        "roots": roots,
+        "sha256": sha256_file(path),
+    }
 
 
 def record_model_gate(
@@ -612,6 +656,7 @@ def record_trace_status(
     vllm_profile_log: pathlib.Path,
     vllm_metadata: pathlib.Path,
     vllm_corpus: pathlib.Path,
+    cache_drop_reports: Sequence[pathlib.Path],
     vllm_cpp_sha: str,
 ) -> dict[str, Any]:
     """Hash the mandatory paired execution-trace artifacts.
@@ -630,6 +675,12 @@ def record_trace_status(
         or len(ours_client_logs) != TRACE_REPETITIONS
     ):
         raise HarnessError("ours trace must retain exactly three client results and logs")
+    if len(cache_drop_reports) != 3:
+        raise HarnessError("paired trace must retain before/between/after cache-drop reports")
+    cache_drop_artifacts = {
+        f"cache_drop_{index}": _validated_cache_drop_artifact(path)
+        for index, path in enumerate(cache_drop_reports, start=1)
+    }
     generated_texts = []
     for path in ours_client_results:
         record = _load_json_object(path)
@@ -688,8 +739,11 @@ def record_trace_status(
             raise HarnessError(f"trace artifact {name} is absent or empty: {path}")
     result = {
         "artifacts": {
-            name: {"path": str(path), "sha256": sha256_file(path)}
-            for name, path in artifacts.items()
+            **{
+                name: {"path": str(path), "sha256": sha256_file(path)}
+                for name, path in artifacts.items()
+            },
+            **cache_drop_artifacts,
         },
         "model_key": model_key,
         "ours_profiler": "nsys",
@@ -885,6 +939,12 @@ def record_execution_manifest(
             "machine": platform.machine(),
             "node": platform.node(),
         },
+        "cache_drop_roots": [
+            str(snapshot.absolute()),
+            str((output.parent.parent / "corpus" / model_key).absolute()),
+            str((build_dir / "examples" / "server").absolute()),
+            str(client.absolute()),
+        ],
         "model_key": model_key,
         "model_revision": MODEL_REVISIONS[model_key],
         "max_num_batched_tokens": max_num_batched_tokens,
@@ -942,7 +1002,12 @@ def _parser() -> argparse.ArgumentParser:
     memory_return.add_argument("--baseline-kib", type=int, required=True)
     memory_return.add_argument("--final-kib", type=int, required=True)
     memory_return.add_argument("--tolerance-kib", type=int, default=1048576)
-    memory_return.add_argument("--drop-caches-succeeded", action="store_true")
+    memory_return.add_argument(
+        "--before-cache-drop-report", type=pathlib.Path, required=True
+    )
+    memory_return.add_argument(
+        "--after-cache-drop-report", type=pathlib.Path, required=True
+    )
     memory_return.add_argument("--gpu-idle", action="store_true")
 
     model_gate = commands.add_parser("record-model-gate")
@@ -967,6 +1032,9 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument("--vllm-profile-log", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-metadata", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-corpus", type=pathlib.Path, required=True)
+    trace.add_argument(
+        "--cache-drop-report", action="append", type=pathlib.Path, required=True
+    )
     trace.add_argument("--vllm-cpp-sha", required=True)
 
     oracle = commands.add_parser("record-oracle")
@@ -1036,7 +1104,8 @@ def main() -> int:
             baseline_mem_available_kib=args.baseline_kib,
             final_mem_available_kib=args.final_kib,
             tolerance_kib=args.tolerance_kib,
-            drop_caches_succeeded=args.drop_caches_succeeded,
+            before_cache_drop_report=args.before_cache_drop_report,
+            after_cache_drop_report=args.after_cache_drop_report,
             gpu_idle=args.gpu_idle,
         )
     elif args.command == "record-model-gate":
@@ -1063,6 +1132,7 @@ def main() -> int:
             vllm_profile_log=args.vllm_profile_log,
             vllm_metadata=args.vllm_metadata,
             vllm_corpus=args.vllm_corpus,
+            cache_drop_reports=args.cache_drop_report,
             vllm_cpp_sha=args.vllm_cpp_sha,
         )
     elif args.command == "record-oracle":

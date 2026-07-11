@@ -21,6 +21,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from tools.bench.online_gate import (
+    CACHE_DROP_METHOD,
     ENGINES,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
@@ -114,6 +115,15 @@ def _memory_for_leg(
     samples_path = base / f"r{repetition}.samples.jsonl"
     summary_path = base / f"r{repetition}.summary.json"
     reasons: list[str] = []
+    try:
+        execution = _load_json(evidence_root / "execution" / f"{model}.json")
+        expected_cache_roots = execution.get("cache_drop_roots")
+        if not isinstance(expected_cache_roots, list):
+            expected_cache_roots = []
+            reasons.append("execution cache-drop root inventory is absent")
+    except HarnessError as error:
+        expected_cache_roots = []
+        reasons.append(str(error))
     try:
         summary = _load_json(summary_path)
     except HarnessError as error:
@@ -229,6 +239,24 @@ def _memory_for_leg(
         ):
             if returned.get(field) is not True:
                 reasons.append(f"memory-return field {field} is not true")
+        cache_drops = returned.get("cache_drops")
+        if not isinstance(cache_drops, dict):
+            reasons.append("memory-return cache-drop artifact map is absent")
+        else:
+            for phase in ("before", "after"):
+                artifact = cache_drops.get(phase)
+                if not isinstance(artifact, dict):
+                    reasons.append(f"memory-return cache-drop {phase} is absent")
+                    continue
+                try:
+                    _verify_cache_drop_artifact(
+                        artifact,
+                        evidence_root,
+                        f"memory-return cache-drop {phase}",
+                        expected_roots=expected_cache_roots,
+                    )
+                except HarnessError as error:
+                    reasons.append(str(error))
     except HarnessError as error:
         reasons.append(str(error))
     return memory, reasons
@@ -252,12 +280,42 @@ def _verify_hashed_artifact(
         raise HarnessError(f"{field} hash does not match its status record")
 
 
+def _verify_cache_drop_artifact(
+    artifact: Mapping[str, Any],
+    evidence_root: pathlib.Path,
+    field: str,
+    *,
+    expected_roots: Sequence[str],
+) -> None:
+    _verify_hashed_artifact(artifact, evidence_root, field)
+    path = _artifact_path(artifact.get("path"), evidence_root, field)
+    report = _load_json(path)
+    if artifact.get("method") != CACHE_DROP_METHOD:
+        raise HarnessError(f"{field} status method differs")
+    if report.get("method") != CACHE_DROP_METHOD:
+        raise HarnessError(f"{field} report method differs")
+    if report.get("succeeded") is not True or report.get("resident_after_bytes") != 0:
+        raise HarnessError(f"{field} did not prove zero resident pages")
+    if artifact.get("roots") != list(expected_roots):
+        raise HarnessError(f"{field} root inventory differs from execution")
+    if report.get("roots") != list(expected_roots):
+        raise HarnessError(f"{field} raw root inventory differs from execution")
+    for metadata_field in (
+        "file_count",
+        "file_inventory_sha256",
+        "logical_bytes",
+    ):
+        if artifact.get(metadata_field) != report.get(metadata_field):
+            raise HarnessError(f"{field} {metadata_field} differs from its report")
+
+
 def _model_precondition_reasons(
     evidence_root: pathlib.Path,
     model: str,
     vllm_cpp_sha: str | None,
 ) -> list[str]:
     reasons: list[str] = []
+    expected_cache_roots: list[str] = []
     execution_path = evidence_root / "execution" / f"{model}.json"
     try:
         execution = _load_json(execution_path)
@@ -321,6 +379,17 @@ def _model_precondition_reasons(
                     _verify_hashed_artifact(artifact, evidence_root, field)
                 except HarnessError as error:
                     reasons.append(str(error))
+            try:
+                expected_cache_roots = [
+                    str(pathlib.Path(artifacts["model_config"]["path"]).parent),
+                    str((evidence_root / "corpus" / model).absolute()),
+                    str(pathlib.Path(artifacts["server"]["path"])),
+                    str(pathlib.Path(artifacts["client"]["path"])),
+                ]
+            except (KeyError, TypeError) as error:
+                reasons.append(f"execution cache-drop roots cannot be derived: {error}")
+            if execution.get("cache_drop_roots") != expected_cache_roots:
+                reasons.append("execution cache-drop root inventory differs")
     except HarnessError as error:
         reasons.append(str(error))
 
@@ -367,6 +436,9 @@ def _model_precondition_reasons(
             reasons.append("paired trace artifact map is absent")
         else:
             for field in (
+                "cache_drop_1",
+                "cache_drop_2",
+                "cache_drop_3",
                 "ours_command",
                 "ours_profile_log",
                 "ours_nsys_report",
@@ -389,7 +461,15 @@ def _model_precondition_reasons(
                     reasons.append(f"paired trace artifact {field} is absent")
                     continue
                 try:
-                    _verify_hashed_artifact(artifact, evidence_root, field)
+                    if field.startswith("cache_drop_"):
+                        _verify_cache_drop_artifact(
+                            artifact,
+                            evidence_root,
+                            field,
+                            expected_roots=expected_cache_roots,
+                        )
+                    else:
+                        _verify_hashed_artifact(artifact, evidence_root, field)
                 except HarnessError as error:
                     reasons.append(str(error))
     except HarnessError as error:

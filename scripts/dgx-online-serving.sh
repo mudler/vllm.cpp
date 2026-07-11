@@ -205,7 +205,13 @@ gpu_idle() {
 }
 
 drop_caches() {
-  sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+  local output=$1
+  python3 -m tools.bench.drop_file_cache \
+    --root "${snapshot}" \
+    --root "${source_corpus}" \
+    --root "${build_dir}/examples/server" \
+    --root "${client}" \
+    --output "${output}"
 }
 
 wait_ready() {
@@ -272,16 +278,20 @@ start_server() {
 
 run_leg() {
   local engine=$1 repetition=$2
-  local baseline final drop_ok=0 idle_ok=0
+  local baseline final idle_ok=0
   local memory_dir="${evidence}/memory/${model}/${engine}"
   local thermal_dir="${evidence}/thermal/${model}/${engine}"
   local return_dir="${evidence}/memory-return/${model}/${engine}"
+  local cache_dir="${evidence}/cache-drop/${model}/${engine}"
   local preflight_dir="${evidence}/preflight/${model}/${engine}"
-  mkdir -p "${memory_dir}" "${thermal_dir}" "${return_dir}" "${preflight_dir}"
+  local before_cache="${cache_dir}/r${repetition}-before.json"
+  local after_cache="${cache_dir}/r${repetition}-after.json"
+  mkdir -p \
+    "${memory_dir}" "${thermal_dir}" "${return_dir}" "${cache_dir}" "${preflight_dir}"
 
-  drop_caches
-  baseline=$(mem_available_kib)
   gpu_idle || { echo "GPU is not idle before ${model}/${engine}/r${repetition}" >&2; return 1; }
+  drop_caches "${before_cache}"
+  baseline=$(mem_available_kib)
   start_server "${engine}" "${repetition}" "${memory_dir}"
   nvidia-smi -q -d TEMPERATURE,POWER >"${thermal_dir}/r${repetition}-before.txt"
 
@@ -311,9 +321,6 @@ run_leg() {
   nvidia-smi -q -d TEMPERATURE,POWER >"${thermal_dir}/r${repetition}-after.txt"
   cleanup_server
 
-  if drop_caches; then
-    drop_ok=1
-  fi
   for _ in $(seq 1 120); do
     if gpu_idle; then
       idle_ok=1
@@ -321,16 +328,17 @@ run_leg() {
     fi
     sleep 1
   done
+  ((idle_ok == 1)) || { echo "GPU did not return after ${model}/${engine}/r${repetition}" >&2; return 1; }
+  drop_caches "${after_cache}"
   final=$(mem_available_kib)
-  local -a return_flags=()
-  ((drop_ok == 1)) && return_flags+=(--drop-caches-succeeded)
-  ((idle_ok == 1)) && return_flags+=(--gpu-idle)
   python3 "${repo_root}/tools/bench/online_gate.py" record-memory-return \
     --output "${return_dir}/r${repetition}.json" \
     --baseline-kib "${baseline}" \
     --final-kib "${final}" \
     --tolerance-kib 1048576 \
-    "${return_flags[@]}"
+    --before-cache-drop-report "${before_cache}" \
+    --after-cache-drop-report "${after_cache}" \
+    --gpu-idle
 }
 
 run_paired_traces() {
@@ -347,6 +355,9 @@ run_paired_traces() {
   local vllm_log="${trace_dir}/vllm-profile.log"
   local vllm_command="${trace_dir}/vllm-profile-command.txt"
   local status="${trace_dir}/status.json"
+  local cache_before_ours="${trace_dir}/cache-before-ours.json"
+  local cache_between="${trace_dir}/cache-between-engines.json"
+  local cache_after_vllm="${trace_dir}/cache-after-vllm.json"
   mkdir -p "${trace_dir}"
   [[ ! -e ${ours_rep} && ! -e ${vllm_summary} && ! -e ${status} ]] || {
     echo "refusing to overwrite paired trace evidence for ${model}" >&2
@@ -354,8 +365,8 @@ run_paired_traces() {
   }
   command -v nsys >/dev/null || { echo "nsys is required for our trace" >&2; return 1; }
 
-  drop_caches
   gpu_idle || { echo "GPU is not idle before our trace" >&2; return 1; }
+  drop_caches "${cache_before_ours}"
   local -a server_cmd=(
     "${build_dir}/examples/server"
     --model "${snapshot}"
@@ -414,8 +425,8 @@ run_paired_traces() {
     >"${ours_summary}"
   [[ -s ${ours_summary} ]] || { echo "ours kernel summary is empty" >&2; return 1; }
 
-  drop_caches
   gpu_idle || { echo "GPU is not idle before vLLM trace" >&2; return 1; }
+  drop_caches "${cache_between}"
   local -a vllm_profile_cmd=(
     "${vllm_python}" "${repo_root}/tools/bench/profile_vllm_online_gate.py"
     --model "${snapshot}"
@@ -455,6 +466,9 @@ PY
     --vllm-profile-log "${vllm_log}"
     --vllm-metadata "${vllm_metadata}"
     --vllm-corpus "${vllm_corpus}"
+    --cache-drop-report "${cache_before_ours}"
+    --cache-drop-report "${cache_between}"
+    --cache-drop-report "${cache_after_vllm}"
     --vllm-cpp-sha "${vllm_cpp_sha}"
   )
   for trace_rep in 1 2 3; do
@@ -463,10 +477,10 @@ PY
       --ours-client-log "${evidence}/logs/${model}/ours/c16-r1-trace${trace_rep}.log"
     )
   done
+  gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }
+  drop_caches "${cache_after_vllm}"
   python3 "${repo_root}/tools/bench/online_gate.py" record-trace-status \
     "${status_args[@]}"
-  drop_caches
-  gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }
 }
 
 # One lock for every ours/vLLM leg of this model, including the model gate.

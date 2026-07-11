@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from tools.bench.online_gate import (
+    CACHE_DROP_METHOD,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
@@ -56,6 +57,38 @@ def _record(*, faster: bool, repetition: int) -> dict:
         for stat in ("mean", "median", "p90", "p99"):
             record[f"{stat}_{metric}_ms"] = latency
     return record
+
+
+def _fixture_cache_roots(root: pathlib.Path) -> list[str]:
+    return [
+        str(root / "fixture-artifacts"),
+        str(root / "corpus" / "27"),
+        str(root / "fixture-artifacts" / "server"),
+        str(root / "fixture-artifacts" / "client"),
+    ]
+
+
+def _write_cache_drop(path: pathlib.Path, roots: list[str]) -> dict:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "file_count": 1,
+        "file_inventory_sha256": "a" * 64,
+        "logical_bytes": 4096,
+        "method": CACHE_DROP_METHOD,
+        "resident_after_bytes": 0,
+        "roots": roots,
+        "succeeded": True,
+    }
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return {
+        "file_count": report["file_count"],
+        "file_inventory_sha256": report["file_inventory_sha256"],
+        "logical_bytes": report["logical_bytes"],
+        "method": CACHE_DROP_METHOD,
+        "path": str(path),
+        "roots": report["roots"],
+        "sha256": sha256_file(path),
+    }
 
 
 def _write_fixture(root: pathlib.Path) -> None:
@@ -110,6 +143,7 @@ def _write_fixture(root: pathlib.Path) -> None:
         json.dumps(
             {
                 "artifacts": execution_artifacts,
+                "cache_drop_roots": _fixture_cache_roots(root),
                 "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
                 "max_num_seqs": MAX_NUM_SEQS,
                 "model_key": "27",
@@ -163,6 +197,11 @@ def _write_fixture(root: pathlib.Path) -> None:
         path = trace_root / f"{name}.txt"
         path.write_text(f"{name}\n", encoding="utf-8")
         trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+    for index in range(1, 4):
+        trace_files[f"cache_drop_{index}"] = _write_cache_drop(
+            trace_root / f"cache-drop-{index}.json",
+            _fixture_cache_roots(root),
+        )
     (trace_root / "status.json").write_text(
         json.dumps(
             {
@@ -299,9 +338,18 @@ def _write_fixture(root: pathlib.Path) -> None:
 
             returned = root / "memory-return" / "27" / engine
             returned.mkdir(parents=True, exist_ok=True)
+            cache_root = root / "cache-drop" / "27" / engine
+            cache_drops = {
+                phase: _write_cache_drop(
+                    cache_root / f"r{repetition}-{phase}.json",
+                    _fixture_cache_roots(root),
+                )
+                for phase in ("before", "after")
+            }
             (returned / f"r{repetition}.json").write_text(
                 json.dumps(
                     {
+                        "cache_drops": cache_drops,
                         "drop_caches_succeeded": True,
                         "gpu_idle": True,
                         "mem_available_within_tolerance": True,
@@ -353,6 +401,16 @@ class OnlineGateSummaryTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             _write_fixture(root)
             (root / "memory" / "27" / "ours" / "r1.samples.jsonl").unlink()
+            runs, _ = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            returned_path = root / "memory-return" / "27" / "ours" / "r1.json"
+            returned = json.loads(returned_path.read_text(encoding="utf-8"))
+            returned["cache_drops"]["before"]["roots"][0] = "/wrong-snapshot"
+            returned_path.write_text(json.dumps(returned), encoding="utf-8")
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
 

@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 from tools.bench.online_gate import (
+    CACHE_DROP_METHOD,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
@@ -66,6 +67,23 @@ def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
         for stat in ("mean", "median", "p90", "p99"):
             record[f"{stat}_{metric}_ms"] = 10.0
     return record
+
+
+def write_cache_drop_report(path: pathlib.Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "file_count": 1,
+                "file_inventory_sha256": "a" * 64,
+                "logical_bytes": 4096,
+                "method": CACHE_DROP_METHOD,
+                "resident_after_bytes": 0,
+                "roots": ["/snapshot", "/corpus", "/server", "/client"],
+                "succeeded": True,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class OnlineClientContractTests(unittest.TestCase):
@@ -208,23 +226,43 @@ class OnlineClientContractTests(unittest.TestCase):
 
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = pathlib.Path(temporary) / "return.json"
+            root = pathlib.Path(temporary)
+            path = root / "return.json"
+            before = root / "before.json"
+            after = root / "after.json"
+            write_cache_drop_report(before)
+            write_cache_drop_report(after)
             result = record_memory_return(
                 path,
                 baseline_mem_available_kib=10_000,
                 final_mem_available_kib=9_500,
                 tolerance_kib=1_000,
-                drop_caches_succeeded=True,
+                before_cache_drop_report=before,
+                after_cache_drop_report=after,
                 gpu_idle=True,
             )
             self.assertTrue(result["returned"])
+            failed_report = json.loads(after.read_text(encoding="utf-8"))
+            failed_report["resident_after_bytes"] = 4096
+            after.write_text(json.dumps(failed_report), encoding="utf-8")
+            with self.assertRaisesRegex(HarnessError, "resident"):
+                record_memory_return(
+                    root / "failed-return.json",
+                    baseline_mem_available_kib=10_000,
+                    final_mem_available_kib=10_000,
+                    tolerance_kib=0,
+                    before_cache_drop_report=before,
+                    after_cache_drop_report=after,
+                    gpu_idle=True,
+                )
             with self.assertRaisesRegex(HarnessError, "overwrite"):
                 record_memory_return(
                     path,
                     baseline_mem_available_kib=10_000,
                     final_mem_available_kib=10_000,
                     tolerance_kib=0,
-                    drop_caches_succeeded=True,
+                    before_cache_drop_report=before,
+                    after_cache_drop_report=after,
                     gpu_idle=True,
                 )
 
@@ -451,6 +489,11 @@ class OnlineClientContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            cache_drop_reports = []
+            for index in range(3):
+                path = root / f"cache-drop-{index}.json"
+                write_cache_drop_report(path)
+                cache_drop_reports.append(path)
             trace = record_trace_status(
                 root / "trace.json",
                 model_key="27",
@@ -466,6 +509,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 vllm_profile_log=vllm_profile_log,
                 vllm_metadata=vllm_metadata,
                 vllm_corpus=vllm_corpus,
+                cache_drop_reports=cache_drop_reports,
                 vllm_cpp_sha="d" * 40,
             )
             self.assertEqual(trace["ours_profiler"], "nsys")

@@ -32,6 +32,8 @@
 #include "vt/dtype.h"
 
 using vllm::v1::BlockHash;
+using vllm::v1::ChunkedLocalAttentionManager;
+using vllm::v1::ChunkedLocalAttentionSpec;
 using vllm::v1::get_kv_cache_coordinator;
 using vllm::v1::get_request_block_hasher;
 using vllm::v1::HybridKVCacheCoordinator;
@@ -73,6 +75,13 @@ std::shared_ptr<SlidingWindowSpec> MakeSlidingSpec(
       sliding_window);
 }
 
+std::shared_ptr<ChunkedLocalAttentionSpec> MakeChunkedLocalSpec(
+    int attention_chunk_size = 4) {
+  return std::make_shared<ChunkedLocalAttentionSpec>(
+      kBlockSize, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
+      attention_chunk_size);
+}
+
 // The 2-group gate-model config: group 0 = full attention, group 1 = GDN mamba.
 KVCacheConfig MakeHybridConfig(int num_blocks = 100) {
   KVCacheConfig cfg;
@@ -98,6 +107,16 @@ KVCacheConfig MakeSlidingConfig(int num_blocks = 100,
   cfg.num_blocks = num_blocks;
   cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swa0"},
                                    MakeSlidingSpec(sliding_window));
+  return cfg;
+}
+
+KVCacheConfig MakeChunkedLocalConfig(int num_blocks = 100,
+                                     int attention_chunk_size = 4) {
+  KVCacheConfig cfg;
+  cfg.num_blocks = num_blocks;
+  cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"chunked0"},
+      MakeChunkedLocalSpec(attention_chunk_size));
   return cfg;
 }
 
@@ -165,6 +184,31 @@ TEST_CASE("get_kv_cache_coordinator: SlidingWindowSpec uses registry manager and
             /*apply_admission_cap=*/true) == 5);
 }
 
+TEST_CASE(
+    "get_kv_cache_coordinator: ChunkedLocalAttentionSpec uses registry manager and cap") {
+  auto coord = get_kv_cache_coordinator(
+      MakeChunkedLocalConfig(), /*max_model_len=*/100,
+      /*max_num_batched_tokens=*/3, /*use_eagle=*/false,
+      /*enable_caching=*/true, /*enable_kv_cache_events=*/false,
+      /*dcp_world_size=*/1, /*pcp_world_size=*/1,
+      /*scheduler_block_size=*/kBlockSize,
+      /*hash_block_size=*/kBlockSize);
+  REQUIRE(dynamic_cast<UnitaryKVCacheCoordinator*>(coord.get()) != nullptr);
+  REQUIRE(coord->single_type_managers.size() == 1);
+  auto* chunked = dynamic_cast<ChunkedLocalAttentionManager*>(
+      coord->single_type_managers[0].get());
+  REQUIRE(chunked != nullptr);
+  // min(chunk + max_batch, max_model) = 7; cdiv(7, 2) = 4.
+  CHECK(chunked->_max_admission_blocks_per_request == std::optional<int>{4});
+
+  vllm::v1::KVCacheBlocksTuple no_hits(1);
+  CHECK(coord->get_num_blocks_to_allocate(
+            "admit", /*num_tokens=*/100, no_hits,
+            /*num_encoder_tokens=*/0, /*total_computed_tokens=*/0,
+            /*num_tokens_main_model=*/100,
+            /*apply_admission_cap=*/true) == 4);
+}
+
 TEST_CASE("get_kv_cache_coordinator: enable_caching == false is DEFERRED (throws)") {
   CHECK_THROWS(get_kv_cache_coordinator(
       MakeHybridConfig(), 8192, 8192, false, /*enable_caching=*/false, false, 1,
@@ -208,6 +252,26 @@ TEST_CASE("HybridKVCacheCoordinator: equal sliding specs share one SpecGroup") {
         vllm::v1::KVCacheSpecKind::kFullAttention);
   CHECK(hyb->attention_groups[1].spec->kind() ==
         vllm::v1::KVCacheSpecKind::kSlidingWindow);
+  CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
+}
+
+TEST_CASE("HybridKVCacheCoordinator: equal chunked-local specs share one SpecGroup") {
+  KVCacheConfig cfg;
+  cfg.num_blocks = 100;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"chunked0"},
+                                   MakeChunkedLocalSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
+                                   MakeFullSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"chunked1"},
+                                   MakeChunkedLocalSpec());
+  auto coord = MakeCoordinator(std::move(cfg));
+  auto* hyb = dynamic_cast<HybridKVCacheCoordinator*>(coord.get());
+  REQUIRE(hyb != nullptr);
+  REQUIRE(hyb->attention_groups.size() == 2);
+  CHECK(hyb->attention_groups[0].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+  CHECK(hyb->attention_groups[1].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kChunkedLocalAttention);
   CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
 }
 
@@ -308,6 +372,30 @@ TEST_CASE(
   REQUIRE(blocks[0].size() == 3);
   CHECK(blocks[0][0] == coord->block_pool.null_block);
   CHECK(blocks[0][1]->block_id == allocated[0][1]->block_id);
+  CHECK(blocks[0][2]->block_id == allocated[0][2]->block_id);
+  CHECK(hit_length == 3 * kBlockSize);
+}
+
+TEST_CASE(
+    "UnitaryKVCacheCoordinator: chunked-local replay nulls old chunks and reuses current") {
+  init_none_hash(sha256_cbor);
+  auto coord = MakeCoordinator(MakeChunkedLocalConfig());
+
+  Request original = MakeRequest("chunk-a", /*n_tokens=*/6);
+  auto allocated = coord->allocate_new_blocks("chunk-a", 6, 6);
+  REQUIRE(allocated.size() == 1);
+  REQUIRE(allocated[0].size() == 3);
+  coord->cache_blocks(original, /*num_computed_tokens=*/6);
+  coord->free("chunk-a");
+
+  Request replay = MakeRequest("chunk-b", /*n_tokens=*/8);
+  auto [blocks, hit_length] =
+      coord->find_longest_cache_hit(replay.block_hashes,
+                                    /*max_cache_hit_length=*/6);
+  REQUIRE(blocks.size() == 1);
+  REQUIRE(blocks[0].size() == 3);
+  CHECK(blocks[0][0] == coord->block_pool.null_block);
+  CHECK(blocks[0][1] == coord->block_pool.null_block);
   CHECK(blocks[0][2]->block_id == allocated[0][2]->block_id);
   CHECK(hit_length == 3 * kBlockSize);
 }
@@ -431,4 +519,12 @@ TEST_CASE("SWA model-positive replay waits on attention and model rows" *
               "tests/v1/e2e/general/test_correctness_sliding_window.py needs "
               "ATTN-SLIDING-WINDOW and MODEL-TEXT-gemma3-gemma3-for-causal-lm")) {
   MESSAGE("SKIP ATTN-SLIDING-WINDOW + MODEL-TEXT-gemma3-gemma3-for-causal-lm");
+}
+
+TEST_CASE("chunked-local model-positive replay waits on W4 and Llama4" *
+          doctest::skip(true) *
+          doctest::description(
+              "chunked-local e2e needs ATTN-CHUNKED-LOCAL and "
+              "MODEL-TEXT-llama4-llama4-for-causal-lm")) {
+  MESSAGE("SKIP ATTN-CHUNKED-LOCAL + MODEL-TEXT-llama4-llama4-for-causal-lm");
 }

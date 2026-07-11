@@ -76,6 +76,13 @@ int SlidingWindowSpec::max_admission_blocks_per_request(
   return (num_tokens + block_size - 1) / block_size + 1;
 }
 
+int ChunkedLocalAttentionSpec::max_admission_blocks_per_request(
+    int max_num_batched_tokens, int max_model_len) const {
+  const int num_tokens = std::min(
+      attention_chunk_size + max_num_batched_tokens, max_model_len);
+  return (num_tokens + block_size - 1) / block_size;
+}
+
 int64_t MambaSpec::page_size_bytes() const {
   if (shapes.size() != dtypes.size()) {
     throw std::runtime_error(

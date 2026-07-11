@@ -14,6 +14,8 @@
 //   - MambaSpec.page_size_bytes: the `new_mamba_spec()` default state shapes
 //     ((2,512),(3,32,32), float32) from test_kv_cache_utils.py
 //     (page_size_bytes = 16384), plus the page_size_padded override.
+//   - ChunkedLocalAttentionSpec sizing/uniform/registry cases port
+//     test_single_type_kv_cache_manager.py and test_kv_cache_spec_registry.py.
 //   - KVCacheTensor / KVCacheGroupSpec / KVCacheConfig construction mirrors
 //     test_get_kv_cache_configs_multiple_workers (num_blocks=10, per-layer
 //     tensors of page_size_bytes*10, one group over [layer1, layer2]).
@@ -31,6 +33,7 @@
 #include "vllm/v1/kv_cache_spec_registry.h"
 #include "vt/dtype.h"
 
+using vllm::v1::ChunkedLocalAttentionSpec;
 using vllm::v1::FullAttentionSpec;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::KVCacheGroupSpec;
@@ -73,8 +76,19 @@ std::shared_ptr<SlidingWindowSpec> new_sliding_window_spec(
       sliding_window);
 }
 
+std::shared_ptr<ChunkedLocalAttentionSpec> new_chunked_local_spec(
+    int attention_chunk_size = 512, int block_size = 16) {
+  return std::make_shared<ChunkedLocalAttentionSpec>(
+      block_size, /*num_kv_heads=*/2, /*head_size=*/64, DType::kF32,
+      attention_chunk_size);
+}
+
 struct CustomFullSpec : FullAttentionSpec {
   using FullAttentionSpec::FullAttentionSpec;
+};
+
+struct CustomChunkedLocalSpec : ChunkedLocalAttentionSpec {
+  using ChunkedLocalAttentionSpec::ChunkedLocalAttentionSpec;
 };
 
 struct TrulyUnregisteredSpec : KVCacheSpec {
@@ -171,19 +185,40 @@ TEST_CASE("SlidingWindowSpec quantized page-size math is deferred") {
   CHECK_THROWS_AS(spec.real_page_size_bytes(), std::runtime_error);
 }
 
+TEST_CASE("ChunkedLocalAttentionSpec page size and admission cap") {
+  ChunkedLocalAttentionSpec spec(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64, DType::kF32,
+      /*attention_chunk_size=*/512, KVQuantMode::kNone,
+      /*page_size_padded=*/20000);
+  CHECK(spec.kind() == KVCacheSpecKind::kChunkedLocalAttention);
+  // Inherits AttentionSpec's symmetric K+V page formula.
+  CHECK(spec.real_page_size_bytes() == 16384);
+  CHECK(spec.page_size_bytes() == 20000);
+  // min(chunk + max_batch, max_model) = min(512 + 255, 8192) = 767;
+  // cdiv(767, 16) = 48. Unlike SWA, no unaligned-window +1 is needed because
+  // attention_chunk_size is block-aligned by the backend contract.
+  CHECK(spec.max_admission_blocks_per_request(255, 8192) == 48);
+  CHECK(spec.max_admission_blocks_per_request(255, 500) == 32);
+}
+
 TEST_CASE("KVCacheSpecRegistry built-ins and inherited custom specs") {
   auto full = new_kv_cache_spec();
   auto sliding = new_sliding_window_spec();
+  auto chunked = new_chunked_local_spec();
   auto mamba = new_mamba_spec();
 
   CHECK(KVCacheSpecRegistry::get_manager_kind(*full) ==
         KVCacheManagerKind::kFullAttention);
   CHECK(KVCacheSpecRegistry::get_manager_kind(*sliding) ==
         KVCacheManagerKind::kSlidingWindow);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(*chunked) ==
+        KVCacheManagerKind::kChunkedLocalAttention);
   CHECK(KVCacheSpecRegistry::get_manager_kind(*mamba) ==
         KVCacheManagerKind::kMamba);
   CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(*sliding) ==
         std::optional<std::type_index>{typeid(SlidingWindowSpec)});
+  CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(*chunked) ==
+        std::optional<std::type_index>{typeid(ChunkedLocalAttentionSpec)});
 
   // Explicit custom registration is idempotent with inherited built-in
   // behavior, and an unregistered subclass still resolves through its base.
@@ -195,6 +230,17 @@ TEST_CASE("KVCacheSpecRegistry built-ins and inherited custom specs") {
       KVCacheManagerKind::kFullAttention);
   CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(custom) ==
         std::optional<std::type_index>{typeid(FullAttentionSpec)});
+
+  CustomChunkedLocalSpec custom_chunked(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64, DType::kF32,
+      /*attention_chunk_size=*/512);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(custom_chunked) ==
+        KVCacheManagerKind::kChunkedLocalAttention);
+  KVCacheSpecRegistry::register_spec<CustomChunkedLocalSpec,
+                                     ChunkedLocalAttentionSpec>(
+      KVCacheManagerKind::kChunkedLocalAttention);
+  CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(custom_chunked) ==
+        std::optional<std::type_index>{typeid(ChunkedLocalAttentionSpec)});
 }
 
 TEST_CASE("KVCacheSpecRegistry rejects a truly unregistered spec") {
@@ -209,16 +255,23 @@ TEST_CASE("KVCacheSpecRegistry rejects a truly unregistered spec") {
       std::invalid_argument);
 }
 
-TEST_CASE("KVCacheSpecRegistry uniform-type rules include SWA window fields") {
+TEST_CASE("KVCacheSpecRegistry uniform-type rules include local-attention fields") {
   auto sliding_a = new_sliding_window_spec(/*sliding_window=*/1024);
   auto sliding_b = new_sliding_window_spec(/*sliding_window=*/1024);
   auto sliding_other = new_sliding_window_spec(/*sliding_window=*/256);
   auto full = new_kv_cache_spec();
+  auto chunked_a = new_chunked_local_spec(/*attention_chunk_size=*/512);
+  auto chunked_b = new_chunked_local_spec(/*attention_chunk_size=*/512);
+  auto chunked_other = new_chunked_local_spec(/*attention_chunk_size=*/256);
 
   CHECK(are_uniform_kv_cache_specs({sliding_a.get(), sliding_b.get()}));
   CHECK_FALSE(
       are_uniform_kv_cache_specs({sliding_a.get(), sliding_other.get()}));
   CHECK_FALSE(are_uniform_kv_cache_specs({full.get(), sliding_a.get()}));
+  CHECK(are_uniform_kv_cache_specs({chunked_a.get(), chunked_b.get()}));
+  CHECK_FALSE(
+      are_uniform_kv_cache_specs({chunked_a.get(), chunked_other.get()}));
+  CHECK_FALSE(are_uniform_kv_cache_specs({sliding_a.get(), chunked_a.get()}));
 }
 
 TEST_CASE("MambaSpec page_size_bytes: new_mamba_spec defaults") {

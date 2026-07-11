@@ -32,6 +32,8 @@ std::type_index built_in_type_for_kind(KVCacheSpecKind kind) {
       return typeid(FullAttentionSpec);
     case KVCacheSpecKind::kSlidingWindow:
       return typeid(SlidingWindowSpec);
+    case KVCacheSpecKind::kChunkedLocalAttention:
+      return typeid(ChunkedLocalAttentionSpec);
     case KVCacheSpecKind::kMamba:
       return typeid(MambaSpec);
     default:
@@ -66,6 +68,8 @@ void KVCacheSpecRegistry::ensure_registered() {
         KVCacheManagerKind::kFullAttention);
     register_spec<SlidingWindowSpec, SlidingWindowSpec>(
         KVCacheManagerKind::kSlidingWindow);
+    register_spec<ChunkedLocalAttentionSpec, ChunkedLocalAttentionSpec>(
+        KVCacheManagerKind::kChunkedLocalAttention);
     register_spec<MambaSpec, MambaSpec>(KVCacheManagerKind::kMamba);
   });
 }
@@ -155,6 +159,20 @@ bool are_uniform_kv_cache_specs(const std::vector<const KVCacheSpec*>& specs) {
       const auto* sliding = dynamic_cast<const SlidingWindowSpec*>(spec);
       if (sliding == nullptr ||
           sliding->sliding_window != first->sliding_window) {
+        return false;
+      }
+    }
+  } else if (*base == typeid(ChunkedLocalAttentionSpec)) {
+    const auto* first =
+        dynamic_cast<const ChunkedLocalAttentionSpec*>(specs.front());
+    if (first == nullptr) {
+      return false;
+    }
+    for (const KVCacheSpec* spec : specs) {
+      const auto* chunked =
+          dynamic_cast<const ChunkedLocalAttentionSpec*>(spec);
+      if (chunked == nullptr || chunked->attention_chunk_size !=
+                                    first->attention_chunk_size) {
         return false;
       }
     }

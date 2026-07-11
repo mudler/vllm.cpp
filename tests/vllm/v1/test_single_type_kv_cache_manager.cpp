@@ -1,10 +1,13 @@
 // Tests for the per-group KV-cache managers — FullAttentionManager (standard
-// paged K+V), SlidingWindowManager (recycling-aware local K+V), and
-// MambaManager (the GDN single-state manager).
+// paged K+V), SlidingWindowManager / ChunkedLocalAttentionManager
+// (recycling-aware local K+V), and MambaManager (the GDN single-state manager).
 //
 // Ported from vllm/tests/v1/core/test_single_type_kv_cache_manager.py @ e24d1b24:
 //   - test_sliding_window_possible_cached_prefix
 //   - test_sliding_window_remove_skipped_blocks
+//   - test_chunked_local_attention_possible_cached_prefix
+//   - test_chunked_local_attention_remove_skipped_blocks
+//   - test_chunked_local_attention_get_num_blocks_to_allocate
 //   - test_get_num_blocks_to_allocate
 //   - test_evictable_cached_blocks_not_double_allocated -> "evictable cached
 //       blocks are not double allocated"
@@ -34,6 +37,8 @@
 
 using vllm::v1::BlockHash;
 using vllm::v1::BlockPool;
+using vllm::v1::ChunkedLocalAttentionManager;
+using vllm::v1::ChunkedLocalAttentionSpec;
 using vllm::v1::FullAttentionManager;
 using vllm::v1::FullAttentionSpec;
 using vllm::v1::get_request_block_hasher;
@@ -71,6 +76,13 @@ std::shared_ptr<SlidingWindowSpec> MakeSlidingSpec(
   return std::make_shared<SlidingWindowSpec>(
       block_size, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
       sliding_window);
+}
+
+std::shared_ptr<ChunkedLocalAttentionSpec> MakeChunkedLocalSpec(
+    int block_size = 2, int attention_chunk_size = 4) {
+  return std::make_shared<ChunkedLocalAttentionSpec>(
+      block_size, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
+      attention_chunk_size);
 }
 
 // Insert a cached block for `bh` in group 0 (mirrors upstream's direct
@@ -558,6 +570,241 @@ TEST_CASE("SlidingWindowManager: randomized predictor and recycling properties")
 }
 
 // ---------------------------------------------------------------------------
+// ChunkedLocalAttentionManager
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ChunkedLocalAttentionManager: possible cached prefix stays in one chunk") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeChunkedLocalSpec(/*block_size=*/2,
+                                   /*attention_chunk_size=*/4);
+  ChunkedLocalAttentionManager mgr(
+      spec, pool, true, 0, 2,
+      /*max_admission_blocks_per_request=*/1000000000);
+
+  auto run_case = [&](const std::vector<bool>& cached, int tail_token,
+                      int expected_length) {
+    pool.cached_block_hash_to_block.clear();
+    std::vector<BlockHash> hashes;
+    for (size_t i = 0; i < cached.size(); ++i) {
+      hashes.push_back("h" + std::to_string(i));
+      if (cached[i]) {
+        MockCache(pool, hashes.back(), &pool.blocks[i + 10]);
+      }
+    }
+
+    const int max_length = static_cast<int>(hashes.size()) * 2 + tail_token;
+    auto computed = mgr.find_longest_cache_hit(
+        hashes, max_length, {0}, pool, *spec,
+        /*drop_eagle_block=*/false, /*alignment_tokens=*/2)[0];
+    REQUIRE(computed.size() == static_cast<size_t>(expected_length));
+    const int chunk_start_block = max_length / 4 * 4 / 2;
+    for (int i = 0; i < std::min(chunk_start_block, expected_length); ++i) {
+      CHECK(computed[static_cast<size_t>(i)] == pool.null_block);
+    }
+    for (int i = chunk_start_block; i < expected_length; ++i) {
+      REQUIRE(cached[static_cast<size_t>(i)]);
+      CHECK(computed[static_cast<size_t>(i)] == &pool.blocks[i + 10]);
+    }
+  };
+
+  // Exact vectors from upstream
+  // test_chunked_local_attention_possible_cached_prefix.
+  run_case({true}, 0, 1);
+  run_case({true}, 1, 1);
+  run_case({true, false}, 0, 2);
+  run_case({true, false}, 1, 2);
+  run_case({true, true}, 0, 2);
+  run_case({true, true}, 1, 2);
+  run_case({true, true, false}, 0, 2);
+  run_case({true, true, false}, 1, 2);
+  run_case({true, true, true}, 0, 3);
+  run_case({true, true, true}, 1, 3);
+  run_case({true, true, true, false}, 0, 4);
+  run_case({true, true, true, false}, 1, 4);
+  run_case({false, true, false, true, false, true, false, true, true}, 1, 9);
+  run_case({true, false, true, false, true, false, true, false, false}, 1, 8);
+  run_case({false, true, false, true, false, true, false, true, true, true}, 1,
+           10);
+  run_case({true, false, true, false, true, false, true, false, true, false}, 0,
+           10);
+  run_case({true, false, true, false, true, false, true, false, true, false}, 1,
+           10);
+  run_case({false, true, false, true, false, true, false, true, false, true}, 0,
+           10);
+  run_case({false, true, false, true, false, true, false, true, false, true}, 1,
+           10);
+  run_case({true, false, true, false, true, false, true, false, false, false}, 0,
+           10);
+  run_case({true, false, true, false, true, false, true, false, false, false}, 1,
+           10);
+}
+
+TEST_CASE("ChunkedLocalAttentionManager: skipped blocks recycle at chunk boundaries") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeChunkedLocalSpec(/*block_size=*/2,
+                                   /*attention_chunk_size=*/4);
+  ChunkedLocalAttentionManager mgr(spec, pool, true, 0, 2, 100);
+  auto allocated = mgr.allocate_new_blocks("test", /*num_tokens=*/22,
+                                            /*num_tokens_main_model=*/22);
+  REQUIRE(allocated.size() == 11);
+  std::vector<int> original_ids;
+  for (KVCacheBlock* block : allocated) original_ids.push_back(block->block_id);
+
+  auto check_prefix = [&](int null_count) {
+    const auto& blocks = mgr.req_to_blocks["test"];
+    for (int i = 0; i < 11; ++i) {
+      if (i < null_count) {
+        CHECK(blocks[static_cast<size_t>(i)] == pool.null_block);
+      } else {
+        CHECK(blocks[static_cast<size_t>(i)]->block_id ==
+              original_ids[static_cast<size_t>(i)]);
+      }
+    }
+  };
+
+  mgr.remove_skipped_blocks("test", 0);
+  check_prefix(0);
+  mgr.remove_skipped_blocks("test", 4);
+  check_prefix(2);
+  mgr.remove_skipped_blocks("test", 6);
+  check_prefix(2);
+  mgr.remove_skipped_blocks("test", 12);
+  check_prefix(6);
+
+  CHECK(mgr.get_num_skipped_tokens(0) == 0);
+  CHECK(mgr.get_num_skipped_tokens(3) == 0);
+  CHECK(mgr.get_num_skipped_tokens(4) == 4);
+  CHECK(mgr.get_num_skipped_tokens(13) == 12);
+  CHECK(mgr.get_num_common_prefix_blocks("test") == 0);
+}
+
+TEST_CASE("ChunkedLocalAttentionManager: allocation and admission-cap accounting") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeChunkedLocalSpec(/*block_size=*/2,
+                                   /*attention_chunk_size=*/4);
+  ChunkedLocalAttentionManager mgr(
+      spec, pool, true, 0, 2,
+      /*max_admission_blocks_per_request=*/4);
+  BlockStore store;
+  std::vector<KVCacheBlock*> cached_1;
+  for (int i = 0; i < 10; ++i) cached_1.push_back(store.make(i + 1));
+  std::vector<KVCacheBlock*> cached_2(5, pool.null_block);
+  for (int i = 0; i < 5; ++i) cached_2.push_back(store.make(i + 20));
+
+  CHECK(mgr.get_num_blocks_to_allocate("1", 40, cached_1, 0, 40) == 20);
+  CHECK(mgr.get_num_blocks_to_allocate("2", 40, cached_2, 0, 40) == 15);
+  CHECK(mgr.get_num_blocks_to_allocate("admit", 40, {}, 0, 40,
+                                       /*apply_admission_cap=*/true) == 4);
+  CHECK(mgr.get_num_blocks_to_allocate("step", 40, {}, 0, 40,
+                                       /*apply_admission_cap=*/false) == 20);
+}
+
+TEST_CASE("ChunkedLocalAttentionManager: rejects unsupported EAGLE and parallel layouts") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeChunkedLocalSpec();
+  ChunkedLocalAttentionManager mgr(spec, pool, true, 0, 2, 100);
+  std::vector<BlockHash> hashes = {"h0", "h1"};
+
+  CHECK_THROWS_AS(mgr.find_longest_cache_hit(
+                      hashes, 4, {0}, pool, *spec,
+                      /*drop_eagle_block=*/true, 2),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(mgr.find_longest_cache_hit(
+                      hashes, 4, {0}, pool, *spec, false, 2,
+                      /*dcp_world_size=*/2, /*pcp_world_size=*/1),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(mgr.find_longest_cache_hit(
+                      hashes, 4, {0}, pool, *spec, false, 2,
+                      /*dcp_world_size=*/1, /*pcp_world_size=*/2),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(mgr.find_longest_cache_hit(
+                      hashes, 4, {0}, pool, *spec, false,
+                      /*alignment_tokens=*/4),
+                  std::invalid_argument);
+}
+
+TEST_CASE("ChunkedLocalAttentionManager: randomized predictor and recycling properties") {
+  std::mt19937 rng(0xc4a11u);
+  for (int trial = 0; trial < 40; ++trial) {
+    const int block_size = trial % 2 == 0 ? 2 : 4;
+    const int attention_chunk_size = block_size * (2 + trial % 5);
+    const int max_batched_tokens =
+        block_size * (1 + trial % 4) - trial % block_size;
+    const int max_model_len =
+        block_size * (16 + trial % 17) + trial % block_size;
+    auto spec = MakeChunkedLocalSpec(block_size, attention_chunk_size);
+    const int cap = spec->max_admission_blocks_per_request(
+        max_batched_tokens, max_model_len);
+    BlockPool pool(/*num_gpu_blocks=*/512, /*enable_caching=*/false,
+                   /*hash_block_size=*/block_size);
+    ChunkedLocalAttentionManager mgr(spec, pool, false, 0, block_size, cap);
+    const std::string request_id = "r";
+    std::unordered_map<int, std::vector<int>> block_contents;
+
+    CHECK(mgr.get_num_blocks_to_allocate(
+              request_id, max_model_len, {}, 0, max_model_len,
+              /*apply_admission_cap=*/true) <= cap);
+
+    int computed = 0;
+    while (computed < max_model_len) {
+      mgr.remove_skipped_blocks(request_id, computed);
+      const int batch = 1 + static_cast<int>(rng() % max_batched_tokens);
+      const int num_tokens = std::min(computed + batch, max_model_len);
+      const int predicted = mgr.get_num_blocks_to_allocate(
+          request_id, num_tokens, {}, computed, num_tokens);
+      auto newly_allocated =
+          mgr.allocate_new_blocks(request_id, num_tokens, num_tokens);
+      CHECK(predicted == static_cast<int>(newly_allocated.size()));
+      computed = num_tokens;
+
+      int held_blocks = 0;
+      const auto& table = mgr.req_to_blocks[request_id];
+      for (size_t logical_block = 0; logical_block < table.size();
+           ++logical_block) {
+        KVCacheBlock* block = table[logical_block];
+        if (block == pool.null_block) continue;
+        ++held_blocks;
+        CHECK(block->ref_cnt > 0);
+        CHECK(block->prev_free_block == nullptr);
+        CHECK(block->next_free_block == nullptr);
+
+        auto& contents = block_contents[block->block_id];
+        contents.assign(static_cast<size_t>(block_size), -1);
+        for (int offset = 0; offset < block_size; ++offset) {
+          const int token =
+              static_cast<int>(logical_block) * block_size + offset;
+          if (token < computed) {
+            contents[static_cast<size_t>(offset)] = token;
+          }
+        }
+      }
+      CHECK(held_blocks <= cap);
+
+      const int visible_start =
+          computed / attention_chunk_size * attention_chunk_size;
+      for (int token = visible_start; token < computed; ++token) {
+        const size_t logical_block =
+            static_cast<size_t>(token / block_size);
+        REQUIRE(logical_block < table.size());
+        KVCacheBlock* block = table[logical_block];
+        REQUIRE(block != pool.null_block);
+        REQUIRE(block_contents.count(block->block_id) == 1);
+        CHECK(block_contents[block->block_id]
+                            [static_cast<size_t>(token % block_size)] == token);
+      }
+    }
+
+    mgr.free(request_id);
+    CHECK(mgr.req_to_blocks.count(request_id) == 0);
+    CHECK(pool.get_num_free_blocks() == 511);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MambaManager
 // ---------------------------------------------------------------------------
 
@@ -820,4 +1067,25 @@ TEST_CASE("SWA connector cases are tracked by KV-CONNECTORS" *
           doctest::description(
               "tests/v1/kv_connector SWA cases require KV-CONNECTORS")) {
   MESSAGE("SKIP KV-CONNECTORS: external/disaggregated SWA cache is not ported");
+}
+
+TEST_CASE("chunked-local contiguous-KV packing is tracked by KV-PREFIX-CACHE" *
+          doctest::skip(true) *
+          doctest::description(
+              "chunked-local multi-block-size packing requires KV-PREFIX-CACHE")) {
+  MESSAGE("SKIP KV-PREFIX-CACHE: chunked-local contiguous packing is unported");
+}
+
+TEST_CASE("chunked-local KV offload is tracked by KV-OFFLOAD" *
+          doctest::skip(true) *
+          doctest::description(
+              "chunked-local tests/v1/kv_offload cases require KV-OFFLOAD")) {
+  MESSAGE("SKIP KV-OFFLOAD: chunked-local offload is not ported");
+}
+
+TEST_CASE("chunked-local connector cases are tracked by KV-CONNECTORS" *
+          doctest::skip(true) *
+          doctest::description(
+              "chunked-local connector cases require KV-CONNECTORS")) {
+  MESSAGE("SKIP KV-CONNECTORS: chunked-local external cache is not ported");
 }

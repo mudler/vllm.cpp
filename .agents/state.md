@@ -3271,3 +3271,60 @@ Read-only DGX inspection at 2026-07-11 01:07 UTC showed
 25,251 MiB and the c32 repetition series active; two PR3 jobs remain queued on
 the mutex. W3 requires only CPU G1/G2, so it will not enqueue or disturb that
 campaign.
+
+## 2026-07-11 — C5 W3 chunked-local KV implemented and handed to feature gating
+
+`CLAIM-C5-CHUNKED-KV-1` completed its bounded CPU-only scope and is released.
+`KV-CHUNKED-LOCAL-SPEC` moves `ACTIVE -> GATING`, never `DONE`. The port adds:
+
+- `ChunkedLocalAttentionSpec`, including its symmetric K+V page sizing and the
+  exact `cdiv(min(chunk + max_num_batched_tokens, max_model_len), block_size)`
+  per-request admission cap;
+- built-in, inherited-custom and explicitly registered-custom registry paths,
+  registry-backed manager construction, common-chunk uniform-type checks and
+  exact-spec coordinator grouping;
+- `ChunkedLocalAttentionManager` prefix lookup that materializes old chunks as
+  null logical blocks and requires a contiguous cache hit only inside the
+  current fixed chunk, plus whole-chunk skipped-page recycling and no-cascade
+  behavior;
+- the pinned EAGLE/DCP/PCP/alignment rejection rules; and
+- hybrid-manager-disabled chunked-local to full-allocation conversion that
+  preserves `attention_chunk_size` exactly as upstream does.
+
+Ported coverage includes all 21 pinned possible-prefix vectors, skipped-block
+boundaries, allocation/admission accounting, registry/uniform/grouping cases,
+unitary replay, every local-policy fallback arm and a seeded 40-trial
+allocation/recycling/token-slot property. Eight real skips retain contiguous
+KV packing, offload, connectors and the W4/Llama4-class positive-model
+obligations (including the pre-existing W1 dependency skips in the same focused
+binaries).
+
+Fresh local evidence (no DGX command ran):
+
+- clean Release/CUDA-OFF build and
+  `VLLM_CPP_CPU_THREADS=1 ctest --test-dir build-c5-chunked-kv-cpu
+  --output-on-failure` pass **100/100**;
+- the four focused binaries pass **82 active cases / 78,003 assertions** with
+  eight named dependency skips: interface **17 / 69**, manager **26 / 77,632**,
+  utils **23 / 205**, coordinator **16 / 97**;
+- the same four binaries pass Debug ASan+UBSan with
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`;
+- the pinned upstream checkout is exactly
+  `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`; the documented local
+  `/home/mudler/venvs/vllm-oracle` path is absent after the crash, so no fresh
+  executable-oracle result is claimed; and
+- `scripts/check-agent-record.py`, all **13** mutation tests and
+  `git diff --check` pass. This host has no `clang-format` executable; the
+  compiler emitted no new formatting/style diagnostic.
+
+Read-only DGX inspection at 2026-07-11 01:19 UTC still showed
+`CLAIM-SERVE-GATE-1` holding `/tmp/gpu`; its vllm.cpp 27B server used 25,251 MiB
+while the c32/192-prompt repetition 2 client ran. The two PR3 `flock` jobs
+remained queued. W3 neither waited on nor queued behind that campaign.
+
+Remaining handoff: W4 `ATTN-CHUNKED-LOCAL` owns virtual-batch metadata, block
+tables and the underlying attention backend; a supported Llama4-class model,
+restored oracle, runtime trace and every-axis performance/memory evidence then
+own G5-G9. Until those land, README and matrices describe CPU-gated KV
+bookkeeping only, with no user-visible chunked-local model support.

@@ -529,6 +529,103 @@ int SlidingWindowManager::get_num_common_prefix_blocks(
 }
 
 // ---------------------------------------------------------------------------
+// ChunkedLocalAttentionManager
+// ---------------------------------------------------------------------------
+
+ChunkedLocalAttentionManager::ChunkedLocalAttentionManager(
+    std::shared_ptr<KVCacheSpec> kv_cache_spec, BlockPool& block_pool,
+    bool enable_caching, int kv_cache_group_id, int scheduler_block_size,
+    std::optional<int> max_admission_blocks_per_request)
+    : SingleTypeKVCacheManager(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size, max_admission_blocks_per_request) {
+  const auto* chunked =
+      dynamic_cast<const ChunkedLocalAttentionSpec*>(kv_cache_spec.get());
+  if (chunked == nullptr) {
+    throw std::invalid_argument(
+        "ChunkedLocalAttentionManager requires a "
+        "ChunkedLocalAttentionSpec");
+  }
+  attention_chunk_size = chunked->attention_chunk_size;
+}
+
+std::vector<std::vector<KVCacheBlock*>>
+ChunkedLocalAttentionManager::find_longest_cache_hit(
+    const std::vector<BlockHash>& block_hashes, int max_length,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
+    const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+    int alignment_tokens, int dcp_world_size, int pcp_world_size) {
+  const auto* chunked =
+      dynamic_cast<const ChunkedLocalAttentionSpec*>(&kv_cache_spec);
+  if (chunked == nullptr) {
+    throw std::invalid_argument(
+        "ChunkedLocalAttentionManager can only be used for chunked-local "
+        "attention groups");
+  }
+  if (drop_eagle_block) {
+    throw std::invalid_argument(
+        "Hybrid KV cache is not supported for EAGLE + chunked-local "
+        "attention");
+  }
+  if (dcp_world_size != 1) {
+    throw std::invalid_argument(
+        "DCP does not support chunked-local attention");
+  }
+  if (pcp_world_size != 1) {
+    throw std::invalid_argument(
+        "PCP does not support chunked-local attention");
+  }
+  if (kv_cache_group_ids.empty() || alignment_tokens <= 0) {
+    throw std::invalid_argument(
+        "ChunkedLocalAttentionManager requires a group and positive "
+        "alignment");
+  }
+  if (chunked->block_size != alignment_tokens) {
+    throw std::invalid_argument(
+        "KV cache groups with different block sizes are not compatible with "
+        "chunked-local attention");
+  }
+
+  const int max_num_blocks = std::min(
+      max_length / chunked->block_size,
+      static_cast<int>(block_hashes.size()));
+  const int local_attention_start_idx =
+      max_length > 0
+          ? max_length / chunked->attention_chunk_size *
+                chunked->attention_chunk_size
+          : 0;
+  const int local_attention_start_block_idx =
+      local_attention_start_idx / chunked->block_size;
+  std::vector<std::vector<KVCacheBlock*>> computed_blocks(
+      kv_cache_group_ids.size(),
+      std::vector<KVCacheBlock*>(
+          static_cast<size_t>(local_attention_start_block_idx),
+          block_pool.null_block));
+
+  for (int i = local_attention_start_block_idx; i < max_num_blocks; ++i) {
+    auto cached_block = block_pool.get_cached_block(
+        block_hashes[static_cast<size_t>(i)], kv_cache_group_ids);
+    if (!cached_block.has_value()) {
+      break;
+    }
+    for (size_t group = 0; group < computed_blocks.size(); ++group) {
+      computed_blocks[group].push_back((*cached_block)[group]);
+    }
+  }
+  return computed_blocks;
+}
+
+int ChunkedLocalAttentionManager::get_num_skipped_tokens(
+    int num_computed_tokens) {
+  return num_computed_tokens / attention_chunk_size * attention_chunk_size;
+}
+
+int ChunkedLocalAttentionManager::get_num_common_prefix_blocks(
+    const std::string& /*running_request_id*/) {
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // MambaManager
 // ---------------------------------------------------------------------------
 
@@ -830,6 +927,20 @@ std::unique_ptr<SingleTypeKVCacheManager> get_manager_for_kv_cache_spec(
       const int cap = sliding->max_admission_blocks_per_request(
           max_num_batched_tokens, max_model_len);
       return std::make_unique<SlidingWindowManager>(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size, cap);
+    }
+    case KVCacheManagerKind::kChunkedLocalAttention: {
+      const auto* chunked = dynamic_cast<const ChunkedLocalAttentionSpec*>(
+          kv_cache_spec.get());
+      if (chunked == nullptr) {
+        throw std::invalid_argument(
+            "Chunked-local manager registration requires "
+            "ChunkedLocalAttentionSpec");
+      }
+      const int cap = chunked->max_admission_blocks_per_request(
+          max_num_batched_tokens, max_model_len);
+      return std::make_unique<ChunkedLocalAttentionManager>(
           kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
           scheduler_block_size, cap);
     }

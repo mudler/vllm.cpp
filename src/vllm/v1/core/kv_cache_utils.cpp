@@ -33,6 +33,7 @@ void unify_hybrid_kv_cache_specs(
 
   bool has_full_attention = false;
   bool has_sliding_window = false;
+  bool has_chunked_local_attention = false;
   for (const auto& [layer_name, spec] : kv_cache_specs) {
     (void)layer_name;
     has_full_attention =
@@ -41,21 +42,36 @@ void unify_hybrid_kv_cache_specs(
     has_sliding_window =
         has_sliding_window ||
         dynamic_cast<const SlidingWindowSpec*>(spec.get()) != nullptr;
+    has_chunked_local_attention =
+        has_chunked_local_attention ||
+        dynamic_cast<const ChunkedLocalAttentionSpec*>(spec.get()) != nullptr;
   }
 
-  if (has_full_attention && has_sliding_window) {
+  if (has_full_attention &&
+      (has_sliding_window || has_chunked_local_attention)) {
     for (auto& [layer_name, spec] : kv_cache_specs) {
       (void)layer_name;
       const auto* sliding =
           dynamic_cast<const SlidingWindowSpec*>(spec.get());
-      if (sliding == nullptr) {
+      if (sliding != nullptr) {
+        spec = std::make_shared<FullAttentionSpec>(
+            sliding->block_size, sliding->num_kv_heads, sliding->head_size,
+            sliding->dtype, sliding->head_size_v, sliding->kv_quant_mode,
+            sliding->page_size_padded,
+            /*indexes_kv_by_block_stride=*/false, sliding->sliding_window);
         continue;
       }
-      spec = std::make_shared<FullAttentionSpec>(
-          sliding->block_size, sliding->num_kv_heads, sliding->head_size,
-          sliding->dtype, sliding->head_size_v, sliding->kv_quant_mode,
-          sliding->page_size_padded,
-          /*indexes_kv_by_block_stride=*/false, sliding->sliding_window);
+      const auto* chunked =
+          dynamic_cast<const ChunkedLocalAttentionSpec*>(spec.get());
+      if (chunked != nullptr) {
+        spec = std::make_shared<FullAttentionSpec>(
+            chunked->block_size, chunked->num_kv_heads, chunked->head_size,
+            chunked->dtype, /*head_size_v=*/std::nullopt,
+            KVQuantMode::kNone, chunked->page_size_padded,
+            /*indexes_kv_by_block_stride=*/false,
+            /*sliding_window=*/std::nullopt,
+            chunked->attention_chunk_size);
+      }
     }
   }
 

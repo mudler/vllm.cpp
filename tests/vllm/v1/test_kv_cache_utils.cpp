@@ -20,7 +20,8 @@
 // parent chaining changes the hash, group id differentiates, the partial last
 // block is not hashed, and NONE_HASH is used as the first-block parent.
 //
-// C5 W1 additionally ports test_unify_hybrid_kv_cache_specs from
+// C5 W1/W3 additionally port every local-attention arm of
+// test_unify_hybrid_kv_cache_specs from
 // vllm/tests/v1/core/test_kv_cache_utils.py:2420-2487 @ e24d1b24.
 //
 // HASH-FUNCTION FIDELITY: upstream parametrizes these over `sha256` (pickle) and
@@ -57,6 +58,7 @@
 using vllm::v1::BlockHash;
 using vllm::v1::BlockHashWithGroupId;
 using vllm::v1::CborValue;
+using vllm::v1::ChunkedLocalAttentionSpec;
 using vllm::v1::ExtraKey;
 using vllm::v1::ExtraKeys;
 using vllm::v1::FreeKVCacheBlockQueue;
@@ -622,6 +624,77 @@ TEST_CASE("unify_hybrid_kv_cache_specs leaves uniform sliding specs unchanged") 
   unify_hybrid_kv_cache_specs(specs);
   CHECK(specs["layer_1"] == sliding_a);
   CHECK(specs["layer_2"] == sliding_b);
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs converts chunked-local storage to full") {
+  auto full = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64,
+      vt::DType::kF32);
+  auto chunked = std::make_shared<ChunkedLocalAttentionSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64,
+      vt::DType::kF32, /*attention_chunk_size=*/512,
+      vllm::v1::KVQuantMode::kNone, /*page_size_padded=*/32768);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"layer_1", full}, {"layer_2", chunked}};
+
+  unify_hybrid_kv_cache_specs(specs);
+  CHECK(specs["layer_1"] == full);
+  auto converted =
+      std::dynamic_pointer_cast<FullAttentionSpec>(specs["layer_2"]);
+  REQUIRE(converted != nullptr);
+  CHECK(converted->block_size == 16);
+  CHECK(converted->num_kv_heads == 2);
+  CHECK(converted->head_size == 64);
+  CHECK(converted->head_size_v == 64);
+  CHECK(converted->page_size_padded == std::optional<int64_t>{32768});
+  CHECK(converted->sliding_window == std::nullopt);
+  CHECK(converted->attention_chunk_size == std::optional<int>{512});
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs converts both local policies with full") {
+  auto full = std::make_shared<FullAttentionSpec>(16, 2, 64, vt::DType::kF32);
+  auto sliding = std::make_shared<SlidingWindowSpec>(
+      16, 2, 64, vt::DType::kF32, /*sliding_window=*/1024);
+  auto chunked = std::make_shared<ChunkedLocalAttentionSpec>(
+      16, 2, 64, vt::DType::kF32, /*attention_chunk_size=*/512);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"full", full}, {"swa", sliding}, {"chunked", chunked}};
+
+  unify_hybrid_kv_cache_specs(specs);
+  auto converted_sliding =
+      std::dynamic_pointer_cast<FullAttentionSpec>(specs["swa"]);
+  auto converted_chunked =
+      std::dynamic_pointer_cast<FullAttentionSpec>(specs["chunked"]);
+  REQUIRE(converted_sliding != nullptr);
+  REQUIRE(converted_chunked != nullptr);
+  CHECK(converted_sliding->sliding_window == std::optional<int>{1024});
+  CHECK(converted_chunked->attention_chunk_size == std::optional<int>{512});
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs leaves uniform chunked-local specs unchanged") {
+  auto chunked_a = std::make_shared<ChunkedLocalAttentionSpec>(
+      16, 2, 64, vt::DType::kF32, /*attention_chunk_size=*/512);
+  auto chunked_b = std::make_shared<ChunkedLocalAttentionSpec>(
+      16, 4, 32, vt::DType::kF32, /*attention_chunk_size=*/512);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"layer_1", chunked_a}, {"layer_2", chunked_b}};
+  unify_hybrid_kv_cache_specs(specs);
+  CHECK(specs["layer_1"] == chunked_a);
+  CHECK(specs["layer_2"] == chunked_b);
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs rejects local policies without full") {
+  auto sliding = std::make_shared<SlidingWindowSpec>(
+      16, 2, 64, vt::DType::kF32, /*sliding_window=*/1024);
+  auto chunked = std::make_shared<ChunkedLocalAttentionSpec>(
+      16, 2, 64, vt::DType::kF32, /*attention_chunk_size=*/512);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"swa", sliding}, {"chunked", chunked}};
+  CHECK_THROWS_WITH_AS(
+      unify_hybrid_kv_cache_specs(specs),
+      "Hybrid KV cache manager is disabled but failed to convert the KV cache "
+      "specs to one unified type.",
+      std::invalid_argument);
 }
 
 TEST_CASE("unify_hybrid_kv_cache_specs rejects an unconvertible mixed policy") {

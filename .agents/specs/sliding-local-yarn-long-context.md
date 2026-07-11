@@ -316,6 +316,23 @@ units for sm_121a against CUTLASS v4.4.2. No CUDA kernel was executed. The row
 moves to `GATING`, not `DONE`, pending G4 and the model/oracle/trace/every-axis
 G6-G9 handoff after `CLAIM-SERVE-GATE-1` releases dgx.
 
+W3 checkpoint (2026-07-11): `KV-CHUNKED-LOCAL-SPEC` now mirrors the concrete
+`ChunkedLocalAttentionSpec`, its built-in/custom/inherited registry mapping and
+registry-backed manager factory, exact
+`cdiv(min(chunk + max_num_batched_tokens, max_model_len), block_size)` admission
+cap, fixed-chunk prefix lookup, null logical blocks before the current chunk,
+whole-chunk skipped-page recycling, no-cascade result, exact-spec grouping and
+the hybrid-manager-disabled conversion to `FullAttentionSpec` while preserving
+`attention_chunk_size`. The pinned EAGLE, DCP, PCP and alignment restrictions
+are explicit; connector, offload and contiguous-packing dependencies remain
+named skips. Exact upstream prefix vectors plus a deterministic 40-trial
+allocation/recycling/token-slot property pass with the full 100/100 Release CPU
+suite and focused ASan+UBSan leak detection. The documented local
+`~/venvs/vllm-oracle` environment remains absent after the crash, and W4's
+virtual-batch attention wrapper plus Llama4-class model/runtime/oracle/trace/
+performance gates remain open. The row therefore moves to `GATING`, not `DONE`;
+no GPU work or user-visible model-support claim is made.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

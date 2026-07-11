@@ -22,6 +22,7 @@ namespace vllm::v1 {
 enum class KVCacheManagerKind {
   kFullAttention,
   kSlidingWindow,
+  kChunkedLocalAttention,
   kMamba,
 };
 
@@ -62,7 +63,8 @@ class KVCacheSpecRegistry {
 
 // Mirrors UniformTypeKVCacheSpecs.is_uniform_type for the currently ported
 // built-ins: common block size and registry base; SWA additionally requires a
-// common window, while Mamba requires a common speculative-block count.
+// common window, chunked-local a common chunk size, and Mamba a common
+// speculative-block count.
 bool are_uniform_kv_cache_specs(const std::vector<const KVCacheSpec*>& specs);
 
 }  // namespace vllm::v1

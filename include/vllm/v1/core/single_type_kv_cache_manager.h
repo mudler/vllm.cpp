@@ -2,8 +2,9 @@
 //
 // Scope (M1.3 Task 2): the per-group KV-cache managers — the `SingleTypeKV
 // CacheManager` abstract base plus `FullAttentionManager` (standard paged K+V
-// blocks), `SlidingWindowManager` (recycling-aware local K+V blocks), and
-// `MambaManager` (the GDN/mamba single-recurrent-state manager). Each manager
+// blocks), `SlidingWindowManager` and `ChunkedLocalAttentionManager`
+// (recycling-aware local K+V blocks), and `MambaManager` (the GDN/mamba
+// single-recurrent-state manager). Each manager
 // owns the per-request block table (`req_to_blocks`) for ONE kv cache group and
 // calls the M1.2 BlockPool to allocate / cache / free physical blocks.
 // Behavioral only: no CUDA, no model.
@@ -53,8 +54,8 @@
 //
 // DEFERRED (marked; the gate models never exercise these — later tasks add them
 // without reshaping the base):
-//   - RSWAManager / ChunkedLocalAttentionManager / CrossAttentionManager /
-//     SinkFullAttentionManager (T1/T2) — omitted. Their
+//   - RSWAManager / CrossAttentionManager / SinkFullAttentionManager (T1/T2) —
+//     omitted. Their
 //     spec types are already deferred in kv_cache_interface.h.
 //   - Out-of-tree platform registration callbacks are not wired to a platform
 //     object yet. The core registry, built-in registration and inherited-spec
@@ -255,6 +256,33 @@ class SlidingWindowManager : public SingleTypeKVCacheManager {
       const std::string& running_request_id) override;
 
   int sliding_window;
+};
+
+// Fixed-chunk local-attention manager. Prefix blocks before the current chunk
+// are represented by nulls without cache lookup; only the contiguous suffix in
+// the current chunk must hit. Physical blocks from older chunks are recycled,
+// and cascade attention is disabled. (Upstream ChunkedLocalAttentionManager.)
+class ChunkedLocalAttentionManager : public SingleTypeKVCacheManager {
+ public:
+  ChunkedLocalAttentionManager(
+      std::shared_ptr<KVCacheSpec> kv_cache_spec, BlockPool& block_pool,
+      bool enable_caching, int kv_cache_group_id, int scheduler_block_size,
+      std::optional<int> max_admission_blocks_per_request = std::nullopt);
+
+  std::vector<std::vector<KVCacheBlock*>> find_longest_cache_hit(
+      const std::vector<BlockHash>& block_hashes, int max_length,
+      const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
+      const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+      int alignment_tokens, int dcp_world_size = 1,
+      int pcp_world_size = 1) override;
+
+  int get_num_skipped_tokens(int num_computed_tokens) override;
+
+  // Always 0: cascade attention is not supported by chunked-local layers.
+  int get_num_common_prefix_blocks(
+      const std::string& running_request_id) override;
+
+  int attention_chunk_size;
 };
 
 // The GDN/mamba single-recurrent-state manager. (Upstream MambaManager.)

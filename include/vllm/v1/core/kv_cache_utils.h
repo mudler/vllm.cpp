@@ -74,9 +74,9 @@ namespace vllm::v1 {
 
 struct KVCacheSpec;
 
-// Hybrid-manager-disabled fallback: when full and sliding-window specs are
-// mixed, convert SWA storage to full allocation while preserving the compute
-// window on FullAttentionSpec.sliding_window. Mirrors
+// Hybrid-manager-disabled fallback: when full and sliding-window/chunked-local
+// specs are mixed, convert local storage to full allocation while preserving
+// the compute window/chunk on FullAttentionSpec. Mirrors
 // kv_cache_utils.unify_hybrid_kv_cache_specs for the ported spec set.
 void unify_hybrid_kv_cache_specs(
     std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>>&

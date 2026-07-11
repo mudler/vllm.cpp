@@ -44,6 +44,17 @@ bool spec_equal(const KVCacheSpec& a, const KVCacheSpec& b) {
                  sb.indexes_kv_by_block_stride &&
              sa.sliding_window == sb.sliding_window;
     }
+    case KVCacheSpecKind::kChunkedLocalAttention: {
+      const auto& ca = static_cast<const ChunkedLocalAttentionSpec&>(a);
+      const auto& cb = static_cast<const ChunkedLocalAttentionSpec&>(b);
+      return ca.num_kv_heads == cb.num_kv_heads &&
+             ca.head_size == cb.head_size && ca.dtype == cb.dtype &&
+             ca.kv_quant_mode == cb.kv_quant_mode &&
+             ca.page_size_padded == cb.page_size_padded &&
+             ca.indexes_kv_by_block_stride ==
+                 cb.indexes_kv_by_block_stride &&
+             ca.attention_chunk_size == cb.attention_chunk_size;
+    }
     case KVCacheSpecKind::kMamba: {
       const auto& ma = static_cast<const MambaSpec&>(a);
       const auto& mb = static_cast<const MambaSpec&>(b);

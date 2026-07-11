@@ -41,8 +41,8 @@
 // DEVIATIONS, recorded:
 //   - Per-group managers are built through the registry-backed
 //     `get_manager_for_kv_cache_spec`, including the recycling-aware admission
-//     cap for SlidingWindowSpec. Out-of-tree platform callbacks remain deferred
-//     in kv_cache_spec_registry.h.
+//     cap for SlidingWindowSpec and ChunkedLocalAttentionSpec. Out-of-tree
+//     platform callbacks remain deferred in kv_cache_spec_registry.h.
 //   - Task 2 ported `find_longest_cache_hit` as a VIRTUAL INSTANCE method (C++
 //     has no abstract static methods). Upstream's Hybrid calls
 //     `manager_cls.find_longest_cache_hit(...)` (a classmethod). Here each
@@ -200,7 +200,7 @@ class KVCacheCoordinator {
 };
 
 // KV cache coordinator for models with exactly one KV cache group (all layers
-// full attention, or all mamba). (Upstream UnitaryKVCacheCoordinator.)
+// of one registered spec type). (Upstream UnitaryKVCacheCoordinator.)
 class UnitaryKVCacheCoordinator : public KVCacheCoordinator {
  public:
   UnitaryKVCacheCoordinator(KVCacheConfig kv_cache_config, int max_model_len,

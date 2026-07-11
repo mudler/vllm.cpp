@@ -10,6 +10,7 @@
 // HIERARCHY SHAPE: upstream is a frozen-dataclass hierarchy
 //   KVCacheSpec (base) -> AttentionSpec -> FullAttentionSpec
 //                                      -> SlidingWindowSpec
+//                                      -> ChunkedLocalAttentionSpec
 //                      -> MambaSpec
 // mirrored here with a virtual base class + derived structs. `page_size_bytes`
 // is the abstract per-page byte cost; `AttentionSpec` splits it into
@@ -25,6 +26,8 @@
 //        split exists so MLA/asymmetric-V layers can differ — deferred here)
 //   SlidingWindowSpec.real_page_size_bytes = the same asymmetric K+V formula;
 //       its window changes allocation lifetime, not bytes per stored token.
+//   ChunkedLocalAttentionSpec inherits AttentionSpec's symmetric K+V formula;
+//       its fixed chunk changes allocation lifetime, not bytes per token.
 //   MambaSpec.page_size_bytes =
 //       sum_i( prod(shapes[i]) * dtype_size(dtypes[i]) )    (SSM + conv state)
 //   page_size_bytes = page_size_padded if set (>= real), else real.
@@ -38,8 +41,7 @@
 //
 // DEFERRED (marked stubs / omissions; the gate models never exercise these, and
 // later units fill them in without reshaping the base):
-//   - MLAAttentionSpec / SlidingWindowMLASpec / ChunkedLocalAttentionSpec /
-//     SinkFullAttentionSpec / RSWASpec /
+//   - MLAAttentionSpec / SlidingWindowMLASpec / SinkFullAttentionSpec / RSWASpec /
 //     EncoderOnlyAttentionSpec / CrossAttentionSpec / UniformTypeKVCacheSpecs /
 //     TQFullAttentionSpec / HiddenStateCacheSpec (T1/T2) — omitted. The base
 //     stays extensible (virtual page_size_bytes/kind/storage_block_size).
@@ -208,6 +210,32 @@ struct SlidingWindowSpec : AttentionSpec {
 
   KVCacheSpecKind kind() const override {
     return KVCacheSpecKind::kSlidingWindow;
+  }
+};
+
+// Fixed-chunk local-attention paged K+V cache. Tokens before the current
+// attention chunk are represented by null logical blocks and their physical
+// pages are recycled. (Upstream ChunkedLocalAttentionSpec.)
+struct ChunkedLocalAttentionSpec : AttentionSpec {
+  ChunkedLocalAttentionSpec(
+      int block_size, int num_kv_heads, int head_size, vt::DType dtype,
+      int attention_chunk_size,
+      KVQuantMode kv_quant_mode = KVQuantMode::kNone,
+      std::optional<int64_t> page_size_padded = std::nullopt,
+      bool indexes_kv_by_block_stride = false)
+      : AttentionSpec(block_size, num_kv_heads, head_size, dtype, kv_quant_mode,
+                      page_size_padded, indexes_kv_by_block_stride),
+        attention_chunk_size(attention_chunk_size) {}
+
+  int attention_chunk_size;
+
+  // During chunked prefill, physical KV holds at most the current fixed chunk
+  // plus the newly scheduled batch, clamped by max_model_len.
+  int max_admission_blocks_per_request(int max_num_batched_tokens,
+                                       int max_model_len) const;
+
+  KVCacheSpecKind kind() const override {
+    return KVCacheSpecKind::kChunkedLocalAttention;
   }
 };
 

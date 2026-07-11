@@ -243,8 +243,8 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(q[0] == vt::F32ToBF16(1.0F));
     CHECK(q[1] == vt::F32ToBF16(2.0F));
     CHECK(layer.mlp.gate_proj_fp4.Empty());
-    CHECK_FALSE(layer.mlp.gate_proj.Empty());
-    CHECK(layer.mlp.gate_proj.nk);
+    CHECK(layer.mlp.gate_proj.Empty());
+    CHECK(layer.mlp.up_proj.Empty());
     CHECK(layer.mlp.gate_up_proj.nk);
     CHECK(layer.mlp.gate_up_proj.shape[0] == 4);
     CHECK(layer.mlp.gate_up_proj.shape[1] == 3);
@@ -275,6 +275,8 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK_FALSE(layer.gdn.out_proj.Empty());
     CHECK(layer.gdn.out_proj.nk);
     CHECK(layer.gdn.in_proj_ba.nk);
+    CHECK(layer.gdn.in_proj_b.Empty());
+    CHECK(layer.gdn.in_proj_a.Empty());
     CHECK(layer.gdn.in_proj_ba.shape[0] == 4);
     CHECK(layer.gdn.in_proj_ba.shape[1] == 3);
     const auto* ba = reinterpret_cast<const uint16_t*>(
@@ -288,6 +290,52 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(a_log[0] == doctest::Approx(-2.0F));
     CHECK(a_log[1] == doctest::Approx(-1.0F));
   }
+}
+
+TEST_CASE("OwnedTensor host release preserves presence and rejects host views") {
+  vllm::OwnedTensor tensor;
+  tensor.dtype = DType::kBF16;
+  tensor.rank = 1;
+  tensor.shape[0] = 4;
+  tensor.bytes.resize(8, 0x5a);
+
+  CHECK_FALSE(tensor.Empty());
+  CHECK(tensor.HasHostBytes());
+  CHECK(tensor.ReleaseHost() == 8);
+  CHECK_FALSE(tensor.Empty());
+  CHECK_FALSE(tensor.HasHostBytes());
+  CHECK_THROWS_WITH(
+      tensor.View(),
+      doctest::Contains(
+          "OwnedTensor::View: host bytes were released after device upload"));
+}
+
+TEST_CASE("dense host release drops only device-resident plain weights") {
+  Qwen3_5DenseWeights weights;
+  weights.embed_tokens.dtype = DType::kBF16;
+  weights.embed_tokens.rank = 1;
+  weights.embed_tokens.shape[0] = 4;
+  weights.embed_tokens.bytes.resize(8);
+  weights.final_norm.dtype = DType::kBF16;
+  weights.final_norm.rank = 1;
+  weights.final_norm.shape[0] = 2;
+  weights.final_norm.bytes.resize(4);
+
+  int resident_marker = 0;
+  weights.embed_tokens.d_dev =
+      std::shared_ptr<void>(&resident_marker, [](void*) {});
+  REQUIRE(vllm::IsPlainBf16Qwen3_5Dense(weights));
+  CHECK(vllm::ReleaseResidentQwen3_5DenseHostWeights(weights) == 8);
+  CHECK_FALSE(weights.embed_tokens.Empty());
+  CHECK_FALSE(weights.embed_tokens.HasHostBytes());
+  CHECK(weights.final_norm.HasHostBytes());
+
+  weights.layers.emplace_back();
+  auto& quant = weights.layers.back().mlp.gate_proj_fp4;
+  quant.packed.rank = 1;
+  quant.packed.shape[0] = 1;
+  quant.packed.bytes.resize(1);
+  CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(weights));
 }
 
 TEST_CASE("qwen27 W4A4 materialize: CT dequant + bf16 + transpose to [in,out]") {

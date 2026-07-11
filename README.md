@@ -520,11 +520,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   (3.04×)**, while launch-to-exit peak PSS averages **19.77 GiB versus 7.39
   GiB (2.68×)**. The loader retains owned host tensors after device upload,
   including tied/packed BF16 duplicates; memory parity is not met. A scoped
-  `ENG-HOST-WEIGHT-RESIDENCY` spike is now **ACTIVE at the design/claim
-  checkpoint**: first release discrete-CUDA staging after synchronized full
-  residency, then remove tied/packed duplicates, and leave true streaming as an
-  explicit follow-on if launch peak remains above vLLM. No improved number is
-  claimed yet.
+  `ENG-HOST-WEIGHT-RESIDENCY` work is now **ACTIVE**: engine-owned plain-BF16
+  models on discrete CUDA release host buffers that have a device-resident copy
+  after the first synchronized full forward. Tied logits now share embedding
+  storage, while canonical packed gate/up and GDN B/A tensors also serve the
+  split fallback by row slicing instead of retaining source copies. CPU, UMA,
+  borrowed and quantized release behavior is unchanged;
+  `VT_RELEASE_HOST_WEIGHTS=0` is the release control. Correctness, memory and
+  performance gates are pending; CPU and native-sm_120 builds plus four focused
+  CPU tests pass, but no improved number is claimed yet.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

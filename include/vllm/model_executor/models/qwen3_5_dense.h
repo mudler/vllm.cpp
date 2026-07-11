@@ -46,8 +46,9 @@ struct DenseMlpWeights {
 
   // Plain-BF16 packed vLLM layout: checkpoint gate/up rows concatenated into
   // one raw torch-Linear [2I,H] tensor (nk=true). The forward computes one
-  // [T,2I] GEMM and feeds vt::SiluAndMul directly. Separate tensors remain as
-  // the same-binary fallback; FP4 checkpoints use their native fields below.
+  // [T,2I] GEMM and feeds vt::SiluAndMul directly. The split same-binary
+  // fallback reads row slices from this canonical tensor, avoiding retained
+  // source copies; FP4 checkpoints use their native fields below.
   OwnedTensor gate_up_proj;
 
   // W4A4 fp4-resident variants (compressed-tensors NVFP4, notes §5 step-6a). On
@@ -95,6 +96,9 @@ struct Qwen3_5DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab]  (unquantized -> Matmul-B layout)
+  // Mirrors config.tie_word_embeddings: logits use embed_tokens as raw [V,H]
+  // torch-Linear storage, avoiding a second host/device owner.
+  bool tied_lm_head = false;
   std::vector<Qwen3_5DenseLayerWeights> layers;
 };
 
@@ -131,6 +135,13 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
 // decoding is enabled; it is not part of the always-resident target weights.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config);
+
+// Host-lifetime helpers for ordinary dense CUDA models. The release function
+// drops only tensors with an existing raw or F32 device representation; unused
+// fallback tensors remain host-resident. The caller must synchronize the upload
+// queue first.
+bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights);
+size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);
 
 // Dense single-sequence reference forward (text path). Mirrors
 // Qwen3_5Model::ForwardDense but runs the dense SwiGLU MLP in place of the MoE

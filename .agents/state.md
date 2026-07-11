@@ -6897,3 +6897,41 @@ materialization still leaves peak above vLLM. This checkpoint changes no
 runtime code and retains the 12.59/19.77 GiB project versus 4.15/7.39 GiB vLLM
 baseline. Next: implement W1, remove safe tied/packed duplicates in W2, then run
 one lock-held memory A/B series plus separate unmonitored throughput runs.
+
+## 2026-07-11 — host-weight residency W1 implementation
+
+`ENG-HOST-WEIGHT-RESIDENCY` is now `ACTIVE`. `OwnedTensor` distinguishes logical
+presence from host staging, rejects host views after release, and can return its
+released byte count. After an engine-owned plain-BF16 dense model completes its
+first non-decode forward on discrete CUDA, the registry synchronizes that queue
+and traverses the model, releasing only tensors that already hold a raw or F32
+device representation. CPU, UMA/GB10, borrowed, quantized and inactive fallback
+tensors retain their current ownership; `VT_RELEASE_HOST_WEIGHTS=0` disables W1.
+
+This checkpoint contains no memory or throughput claim. Focused/full CPU tests,
+local repeat-forward correctness, lock-held release ON/OFF process-memory A/B,
+and separate unmonitored throughput against fresh vLLM remain pending. Tied and
+packed-source duplicate removal is W2 after W1 demonstrates its actual residual.
+
+## 2026-07-11 — host-weight residency W2 implementation
+
+W2 now mirrors two additional upstream ownership properties before measurement.
+Tied plain-BF16 checkpoints set explicit tied-head metadata and logits/MTP reuse
+the embedding tensor instead of copying its host bytes and later uploading a
+second device buffer. Gate/up and GDN B/A are packed once, then their separate
+source vectors are discarded. The existing packed-off controls remain valid:
+their split GEMMs consume row slices of the same canonical raw-NK tensor.
+
+No new metric is attached to this checkpoint. The initial W1 CPU build passed;
+its focused test initially failed only because `VT_CHECK` prefixes source
+context, and the corrected substring assertion passes with the registry test
+2/2. An unrelated parallel full-suite conformance server timeout passed 1/1
+when isolated. The post-W2 CPU/CUDA builds and all memory/performance gates are
+still pending.
+
+Post-W2 compilation is now green in both `build-nix-cpu` and the native-sm_120
+Triton-AOT `build-nix-cuda-triton-sm120-debug` tree. Focused
+`model_registry|qwen27_dense_forward|qwen27_paged_forward|loaded_engine_dense`
+CTest passes 4/4. The agent-record checker, all 13 mutation tests, doc-checkpoint
+checker, and `git diff --check` pass. Full CPU and all GPU/e2e measurements
+remain the next gate; no metric is promoted by this evidence.

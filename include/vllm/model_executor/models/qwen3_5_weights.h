@@ -48,10 +48,19 @@ struct OwnedTensor {
   // via vt::MatmulBT, the cuBLASLt TN fast path (see ops.h MatmulBT).
   bool nk = false;
 
-  bool Empty() const { return bytes.empty(); }
+  // Device-only tensors remain logically present after their host staging
+  // bytes are released. Empty() is dispatch metadata throughout the model, so
+  // host reclamation must not make a populated weight look absent.
+  bool host_released = false;
+
+  bool Empty() const { return bytes.empty() && !host_released; }
+  bool HasHostBytes() const { return !bytes.empty(); }
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
+  // Drop host staging after a synchronized device upload while preserving
+  // logical presence and shape/dtype metadata. Returns bytes released.
+  size_t ReleaseHost();
 
   // Lazily-populated device-resident copies (CUDA forward only; null on host or
   // before first use). Uploaded ONCE and reused across every forward step so the

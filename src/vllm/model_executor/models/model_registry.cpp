@@ -21,6 +21,7 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -121,6 +122,14 @@ bool DenseDecodeGraphEnabled() {
   return enabled;
 }
 
+bool HostWeightReleaseEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("VT_RELEASE_HOST_WEIGHTS");
+    return value == nullptr || value[0] != '0';
+  }();
+  return enabled;
+}
+
 struct BorrowedWeightsTag {};
 
 class Qwen3_5MoeLoadedModel final : public LoadedModel {
@@ -160,6 +169,10 @@ class Qwen3_5DenseLoadedModel final : public LoadedModel {
     return !weights_->layers.empty() &&
            weights_->layers.front().mlp.gate_proj_fp4.IsTrueW4A4();
   }
+  bool owns_weights() const { return owned_weights_.has_value(); }
+  Qwen3_5DenseWeights& mutable_weights() { return *owned_weights_; }
+  bool host_weights_released() const { return host_weights_released_; }
+  void mark_host_weights_released() { host_weights_released_ = true; }
   std::unique_ptr<Qwen3_5DenseDecodeGraph>& decode_graph() {
     return decode_graph_;
   }
@@ -168,6 +181,7 @@ class Qwen3_5DenseLoadedModel final : public LoadedModel {
   std::optional<Qwen3_5DenseWeights> owned_weights_;
   const Qwen3_5DenseWeights* weights_ = nullptr;
   std::unique_ptr<Qwen3_5DenseDecodeGraph> decode_graph_;
+  bool host_weights_released_ = false;
 };
 
 void ParseQwen3_5Config(const HfConfig& config) {
@@ -278,18 +292,31 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
         input.attn_kv, input.gdn_state);
   }
 
+  ForwardLogits output;
   if (input.gather_logits) {
-    return Qwen3_5DenseModel::ForwardDevice(
+    output = Qwen3_5DenseModel::ForwardDevice(
         input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
         input.attn_kv, input.gdn_state, weights, input.config, input.queue,
         input.logits_indices);
+  } else {
+    output = HostLogits(
+        Qwen3_5DenseModel::Forward(
+            input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
+            input.attn_kv, input.gdn_state, weights, input.config, input.queue,
+            input.logits_indices),
+        input.config.vocab_size);
   }
-  return HostLogits(
-      Qwen3_5DenseModel::Forward(
-          input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-          input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-          input.logits_indices),
-      input.config.vocab_size);
+
+  vt::Backend& backend = vt::GetBackend(input.queue.device.type);
+  if (!input.pure_decode && HostWeightReleaseEnabled() && qwen.owns_weights() &&
+      !qwen.host_weights_released() &&
+      input.queue.device.type == vt::DeviceType::kCUDA &&
+      !backend.UnifiedMemory() && IsPlainBf16Qwen3_5Dense(weights)) {
+    backend.Synchronize(input.queue);
+    ReleaseResidentQwen3_5DenseHostWeights(qwen.mutable_weights());
+    qwen.mark_host_weights_released();
+  }
+  return output;
 }
 
 v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,

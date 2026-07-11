@@ -840,6 +840,9 @@ DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
 }
 
 DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
+  // The CPU backend is the f32 correctness reference and has no bf16-output
+  // matmul registration. CUDA mirrors torch Linear's model-dtype output.
+  if (d.q.device.type != vt::DeviceType::kCUDA) return MatmulF32D(d, x, w);
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
   DBuf dout(d, DType::kBF16, {M, N});
@@ -848,6 +851,29 @@ DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   else
     vt::Matmul(d.q, dout.t(), x, dw);
   return dout;
+}
+
+DBuf MatmulBf16LogitsF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
+  if (d.q.device.type != vt::DeviceType::kCUDA) return MatmulF32D(d, x, w);
+  DBuf bf16 = MatmulBf16D(d, x, w);
+  DBuf f32(d, DType::kF32, {bf16.t().shape[0], bf16.t().shape[1]});
+  vt::CastF32(d.q, f32.t(), bf16.t());
+  return f32;
+}
+
+DBuf MatmulRawNkRowsD(Dev d, const Tensor& x, const OwnedTensor& packed,
+                      int64_t row_begin, int64_t row_end, DType out_dtype) {
+  VT_CHECK(packed.nk && packed.rank == 2 && row_begin >= 0 &&
+               row_end > row_begin && row_end <= packed.shape[0],
+           "MatmulRawNkRowsD: invalid packed-weight row slice");
+  Tensor rows = ResidentWeight(d, packed).Slice(0, row_begin, row_end);
+  DBuf out(d, out_dtype, {x.shape[0], row_end - row_begin});
+  vt::MatmulBT(d.q, out.t(), x, rows);
+  return out;
+}
+
+const OwnedTensor& DenseLmHead(const Qwen3_5DenseWeights& weights) {
+  return weights.tied_lm_head ? weights.embed_tokens : weights.lm_head;
 }
 
 // Device-resident view over an Fp8Weight's raw fp8 [N,K] bytes, uploaded ONCE
@@ -2046,8 +2072,15 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     braw = ba_packed->t().Slice(1, 0, Hv);
     araw = ba_packed->t().Slice(1, Hv, 2 * Hv);
   } else {
-    braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
-    araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    if (!w.in_proj_b.Empty()) {
+      braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
+      araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    } else {
+      braw_buf.emplace(
+          MatmulRawNkRowsD(d, h, w.in_proj_ba, 0, Hv, DType::kF32));
+      araw_buf.emplace(MatmulRawNkRowsD(d, h, w.in_proj_ba, Hv, 2 * Hv,
+                                       DType::kF32));
+    }
     braw = braw_buf->t();
     araw = araw_buf->t();
   }
@@ -2312,8 +2345,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     braw = ba_packed->t().Slice(1, 0, Hv);
     araw = ba_packed->t().Slice(1, Hv, 2 * Hv);
   } else {
-    braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
-    araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    if (!w.in_proj_b.Empty()) {
+      braw_buf.emplace(MatmulF32D(d, h, w.in_proj_b));
+      araw_buf.emplace(MatmulF32D(d, h, w.in_proj_a));
+    } else {
+      braw_buf.emplace(
+          MatmulRawNkRowsD(d, h, w.in_proj_ba, 0, Hv, DType::kF32));
+      araw_buf.emplace(MatmulRawNkRowsD(d, h, w.in_proj_ba, Hv, 2 * Hv,
+                                       DType::kF32));
+    }
     braw = braw_buf->t();
     araw = araw_buf->t();
   }
@@ -3530,16 +3570,27 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // halves the GEMM write + MoeSiluMul read; else f32 (current). MoeSiluMul is
   // templated on the input dtype so both work.
   const DType gu_out = Bf16GemmOutEnabled() ? DType::kBF16 : DType::kF32;
+  const bool canonical_bf16 = !fp4 && w.gate_proj.Empty();
   DBuf gate = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.gate_proj_fp4, gu_out,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
                                             : MatmulNvfp4F32D(d, dh, w.gate_proj_fp4))
-                    : MatmulF32D(d, dh, w.gate_proj);  // [T,I]
+                    : canonical_bf16
+                          ? MatmulRawNkRowsD(d, dh, w.gate_up_proj, 0, I,
+                                           d.q.device.type == vt::DeviceType::kCUDA
+                                               ? DType::kBF16
+                                               : DType::kF32)
+                          : MatmulBf16D(d, dh, w.gate_proj);  // [T,I]
   DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, gu_out,
                                             gu_sf_sw_p)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.up_proj_fp4)
                                           : MatmulNvfp4F32D(d, dh, w.up_proj_fp4))
-                  : MatmulF32D(d, dh, w.up_proj);      // [T,I]
+                  : canonical_bf16
+                        ? MatmulRawNkRowsD(d, dh, w.gate_up_proj, I, 2 * I,
+                                         d.q.device.type == vt::DeviceType::kCUDA
+                                             ? DType::kBF16
+                                             : DType::kF32)
+                        : MatmulBf16D(d, dh, w.up_proj);      // [T,I]
   // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
   // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.
@@ -4004,7 +4055,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
-  DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
+  DBuf dlogits = MatmulF32D(d, dnorm.t(), DenseLmHead(weights));
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
@@ -4016,7 +4067,7 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
     : weights_(&weights),
       config_(&config),
       embed_tokens_(&target.embed_tokens),
-      lm_head_(&target.lm_head) {
+      lm_head_(&DenseLmHead(target)) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -4286,9 +4337,13 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    return MatmulF32D(d, dgather.t(), weights.lm_head);
+    const OwnedTensor& lm_head = DenseLmHead(weights);
+    return lm_head.nk ? MatmulBf16LogitsF32D(d, dgather.t(), lm_head)
+                      : MatmulF32D(d, dgather.t(), lm_head);
   }
-  return MatmulF32D(d, dnorm.t(), weights.lm_head);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  return lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
+                    : MatmulF32D(d, dnorm.t(), lm_head);
 }
 
 // Full eager dense paged forward body: embed (host token_ids) then the capturable

@@ -223,6 +223,8 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   g.in_proj_a = LoadBf16RawNK(get, la + "in_proj_a.weight");
   g.in_proj_ba =
       PackBf16RawNK({&g.in_proj_b, &g.in_proj_a}, la + "in_proj_ba");
+  g.in_proj_b = {};
+  g.in_proj_a = {};
   // 27B NVFP4 checkpoints store this as compressed tensors; smaller BF16
   // Qwen3.5 dense checkpoints store an ordinary `.weight`.
   if (has(la + "out_proj.weight_packed")) {
@@ -297,6 +299,8 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
   if (!m.gate_proj.Empty() && !m.up_proj.Empty()) {
     m.gate_up_proj =
         PackBf16RawNK({&m.gate_proj, &m.up_proj}, mlp + "gate_up_proj");
+    m.gate_proj = {};
+    m.up_proj = {};
   }
   return m;
 }
@@ -417,14 +421,85 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   if (has("lm_head.weight")) {
     w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
   } else {
-    w.lm_head = w.embed_tokens;
-    w.lm_head.nk = true;
+    w.tied_lm_head = true;
+    w.embed_tokens.nk = true;
   }
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
     w.layers.push_back(LoadQwen3_5DenseLayer(
         get, has, config.layer_types[static_cast<size_t>(l)], l));
   return w;
+}
+
+bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
+        !layer.mlp.down_proj_fp4.Empty())
+      return false;
+    if (layer.is_linear_attention) {
+      if (!layer.gdn.out_proj_fp4.Empty() ||
+          !layer.gdn.in_proj_qkv_fp8.Empty() ||
+          !layer.gdn.in_proj_z_fp8.Empty() ||
+          !layer.gdn.out_proj_fp8.Empty())
+        return false;
+    } else if (!layer.attn.q_proj_fp4.Empty() ||
+               !layer.attn.k_proj_fp4.Empty() ||
+               !layer.attn.v_proj_fp4.Empty() ||
+               !layer.attn.o_proj_fp4.Empty() ||
+               !layer.attn.q_proj_fp8.Empty() ||
+               !layer.attn.k_proj_fp8.Empty() ||
+               !layer.attn.v_proj_fp8.Empty() ||
+               !layer.attn.o_proj_fp8.Empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t ReleaseResidentQwen3_5DenseHostWeights(
+    Qwen3_5DenseWeights& weights) {
+  size_t released = 0;
+  const auto release = [&released](OwnedTensor& tensor) {
+    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32))
+      released += tensor.ReleaseHost();
+  };
+  const auto release_gdn = [&release](GdnLayerWeights& gdn) {
+    release(gdn.in_proj_qkv);
+    release(gdn.in_proj_z);
+    release(gdn.in_proj_b);
+    release(gdn.in_proj_a);
+    release(gdn.in_proj_ba);
+    release(gdn.conv1d_weight);
+    release(gdn.a_log);
+    release(gdn.dt_bias);
+    release(gdn.norm_weight);
+    release(gdn.out_proj);
+  };
+  const auto release_attn = [&release](FullAttnLayerWeights& attn) {
+    release(attn.q_proj);
+    release(attn.k_proj);
+    release(attn.v_proj);
+    release(attn.o_proj);
+    release(attn.q_norm);
+    release(attn.k_norm);
+  };
+
+  release(weights.embed_tokens);
+  release(weights.final_norm);
+  release(weights.lm_head);
+  for (Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    release(layer.input_layernorm);
+    release(layer.post_attention_layernorm);
+    if (layer.is_linear_attention)
+      release_gdn(layer.gdn);
+    else
+      release_attn(layer.attn);
+    release(layer.mlp.gate_proj);
+    release(layer.mlp.up_proj);
+    release(layer.mlp.gate_up_proj);
+    release(layer.mlp.down_proj);
+  }
+  return released;
 }
 
 }  // namespace vllm

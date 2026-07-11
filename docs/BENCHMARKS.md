@@ -522,14 +522,22 @@ throughput table above remains authoritative. Every process exited, process
 VRAM returned to zero, board memory returned to 146-166 MiB, and no Xid,
 UVM/AER fault, reset, or lockup occurred.
 
-Host-residency optimization disposition: **PENDING / SPIKE**. The accepted
+Host-residency optimization disposition: **PENDING / ACTIVE**. W1 now implements
+post-first-forward synchronized release for device-resident host staging on an
+engine-owned plain-BF16 discrete-CUDA model, with a same-binary opt-out. W2 also
+removes tied embedding/head duplication and uses canonical packed storage for
+both packed and row-sliced split execution. The
+accepted
 [`ENG-HOST-WEIGHT-RESIDENCY`](../.agents/specs/discrete-cuda-host-weight-residency.md)
 work first gates synchronized post-residency host release and duplicate-free
 tied/stacked ownership on this discrete GPU. It does not replace the table
 above, and no improved memory or throughput number is published until the
 same-workload A/B and fresh vLLM series completes. If launch-to-exit peak PSS
 remains above vLLM after steady-state release, bounded streaming/direct-device
-loading remains an explicit open follow-on.
+loading remains an explicit open follow-on. CPU/CUDA correctness, memory and
+unmonitored throughput gates have not yet run for this implementation. CPU and
+native-sm_120 builds plus the focused loader/forward/engine/registry tests pass
+4/4; this is compile/unit evidence only.
 
 Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
 The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps

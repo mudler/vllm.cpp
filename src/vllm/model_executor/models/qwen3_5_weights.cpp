@@ -22,6 +22,8 @@ int64_t OwnedTensor::Numel() const {
 }
 
 vt::Tensor OwnedTensor::View() const {
+  VT_CHECK(!host_released,
+           "OwnedTensor::View: host bytes were released after device upload");
   vt::Tensor t;
   t.data = const_cast<uint8_t*>(bytes.data());
   t.dtype = dtype;
@@ -34,6 +36,13 @@ vt::Tensor OwnedTensor::View() const {
     stride *= shape[i];
   }
   return t;
+}
+
+size_t OwnedTensor::ReleaseHost() {
+  const size_t released = bytes.size();
+  std::vector<uint8_t>().swap(bytes);
+  host_released = true;
+  return released;
 }
 
 namespace {

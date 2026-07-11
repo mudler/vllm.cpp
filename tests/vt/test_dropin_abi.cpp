@@ -242,7 +242,7 @@ TEST_CASE("dropin ABI CUDA explicit queues isolate default handles and queue cle
     return current;
   });
   CHECK(set_device.get() == target_device);
-  CHECK_THROWS_AS(vt::cuda::DeviceGuard(Cpu()), std::runtime_error);
+  CHECK_THROWS_AS(vt::cuda::DeviceGuard{Cpu()}, std::runtime_error);
 #endif
 }
 

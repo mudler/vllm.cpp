@@ -3888,3 +3888,15 @@ the owning records. No ABI, dispatch, kernel, dtype, workspace, or production
 behavior may change. After the compile repair, run the focused W0 CUDA runtime
 case under `/tmp/gpu`; the serving claim remains the owner of the later
 model-wide series.
+
+## 2026-07-11 — W0-GPU GCC13/doctest syntax leaf implemented
+
+The bounded repair changes only the ported negative test expression from
+`DeviceGuard(Cpu())` to `DeviceGuard{Cpu()}`. Both forms construct the same
+temporary and must throw `std::runtime_error` for a CPU device; brace
+initialization prevents GCC13 from treating the macro-expanded expression as a
+parenthesized declaration. No library, adapter, kernel, dispatch, workspace or
+runtime source changed. `git diff --check` and the canonical record gates pass;
+the clean CPU focused build/CTest passes 1/1. This checkpoint deliberately
+claims no CUDA build/runtime result until the pushed branch is rebuilt in the
+exact clean DGX tree.

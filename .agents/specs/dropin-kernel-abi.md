@@ -19,7 +19,7 @@ CUDA-context and graph-capture cases are ported in
 No production launcher uses the helper yet, so no kernel-family support or
 throughput state changed and README remains unchanged.
 
-The row remains `GATING`, not `DONE`, under these named W0 debts:
+The row remains `ACTIVE`, not `DONE`, under these named W0 debts:
 
 - `W0-GPU`: clean CUDA cross-builds for `80`, `90a`, and `121a`, then GB10
   probe/workspace/capture runtime and both gate-model correctness/trace/memory
@@ -35,6 +35,13 @@ The row remains `GATING`, not `DONE`, under these named W0 debts:
   production CPU/CUDA backend TUs were outside W0 ownership. Each family claim
   removes its direct shim use; the ABI row cannot close while adapter resources
   can bypass queue cleanup.
+
+The 2026-07-11 fresh GCC13/CUDA build exposed a test-only parsing blocker before
+runtime: doctest's throw macro interpreted `DeviceGuard(Cpu())` as an
+unnecessary-parentheses declaration under `-Werror`. W0-GPU spells the same
+temporary construction with braces (`DeviceGuard{Cpu()}`); the constructor,
+exception type and assertion are unchanged. Exact sm_121a rebuild/runtime is
+still required before the leaf returns to `GATING`.
 
 The objective is to reshape the `vt::` CUDA/ROCm **adapter boundary** around
 the raw pointer, shape, stride, semantic dtype, workspace, device, and stream

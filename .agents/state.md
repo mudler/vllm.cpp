@@ -3347,3 +3347,68 @@ Read-only DGX inspection at 2026-07-11 01:33 UTC showed
 jobs remained queued on the mutex. W4 begins with source, CPU/reference tests
 and compile-only validation; it will not queue behind or contaminate that
 campaign.
+
+## 2026-07-11 — C5 W4 chunked-local attention implemented and handed to feature gating
+
+`CLAIM-C5-CHUNKED-ATTN-1` completed its bounded CPU/reference scope and is
+released. `ATTN-CHUNKED-LOCAL` moves `ACTIVE -> GATING`, never `DONE`. The port
+adds:
+
+- the exact fixed-chunk virtual-batch transform over common attention metadata,
+  including partial first/last chunks, preserved query-token order and slot
+  mapping, local computed-token lengths and causal forcing;
+- the clipped block-table gather indices as a reusable update plan (the host-
+  vector equivalent of upstream's eagerly uploaded torch index tensors);
+- a typed C++ builder adapter that transforms common metadata before delegating
+  to the ordinary builder, transforms replacement block tables before the
+  underlying update, and always reports `AttentionCGSupport::kNever`;
+- a thread-safe backend wrapper cache keyed by ordinary backend type + chunk
+  size, with KV shape and implementation construction delegated unchanged; and
+- a generic `ChunkedLocalAttention` layer seam that emits the W3
+  `ChunkedLocalAttentionSpec` without model-specific logic.
+
+All six pinned upstream Q/K/block-table vectors are ported exactly: clipped
+last pages, partial first/last chunks, chunk larger than the sequence,
+block==chunk and decode entering a second chunk. A seeded 100-trial property
+adds 18,000+ checks across varied block/chunk/batch/query/context shapes:
+queries are preserved in order, every virtual Q/K is bounded by the chunk,
+gathers select the exact source page, and an ordinary causal virtual batch
+equals the dense fixed-chunk mask. Tests also execute a delegated underlying
+implementation, verify cache identity, update ordering, cudagraph rejection
+and every emitted spec field. The Llama4-class positive model remains a named
+skip against `MODEL-TEXT-llama4-llama4-for-causal-lm`.
+
+Fresh local evidence (no DGX command ran):
+
+- clean Release/CUDA-OFF build and
+  `VLLM_CPP_CPU_THREADS=1 ctest --test-dir build-c5-chunked-attn-cpu
+  --output-on-failure` pass **101/101**;
+- `test_chunked_local_attention` passes **5 active cases / 18,849 assertions**
+  with one named model skip; the common-metadata regression passes **5 / 23**
+  and GDN metadata regression passes **8 / 71**;
+- the three focused binaries pass Debug ASan+UBSan with
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`;
+- the first sanitizer compile stopped while writing a temporary assembly file
+  because `/` had only 648 KiB free. Only the disposable, already-committed W3
+  Release/sanitizer build directories were removed; the identical W4 build and
+  all three sanitizer runs then passed. This was an environment-capacity stop,
+  not a test or sanitizer failure; and
+- the pinned source remains `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`.
+  `/home/mudler/venvs/vllm-oracle` remains absent, so no executable-oracle result
+  is claimed; and
+- `scripts/check-agent-record.py`, all **13** record mutation tests and
+  `git diff --check` pass. This host still has no `clang-format` executable; the
+  clean compiler build is the available style diagnostic.
+
+Read-only DGX inspection at 2026-07-11 01:50 UTC still showed the unchanged
+vllm.cpp 27B server at 25,251 MiB and ours c32/192-prompt repetition 3 under
+`CLAIM-SERVE-GATE-1`; both PR3 jobs remained queued. W4 neither waited on nor
+queued behind that lock.
+
+Remaining handoff: land a supported Llama4-class consumer, restore the pinned
+oracle, run the real ordinary CUDA backend, nsys both engines and complete
+G6-G9 correctness/performance/latency/memory comparisons. W5 `ATTN-YARN` is now
+the next dependency-ready C5 implementation leaf. Until the model/runtime gates
+land, README and matrices claim CPU-gated metadata/wrapper support only, not a
+user-visible chunked-local model.

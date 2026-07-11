@@ -43,8 +43,12 @@ CommonAttentionMetadata MakeCommonAttentionMetadata(
   // max_query_len = longest query = max over per-request query lengths
   // (derivable from the step inputs; equals max num_scheduled_tokens).
   cam.max_query_len = 0;
-  for (const int32_t len : cam.naive_query_lens()) {
+  const std::vector<int32_t> query_lens = cam.naive_query_lens();
+  cam.num_computed_tokens_cpu.reserve(query_lens.size());
+  for (size_t i = 0; i < query_lens.size(); ++i) {
+    const int32_t len = query_lens[i];
     cam.max_query_len = std::max(cam.max_query_len, len);
+    cam.num_computed_tokens_cpu.push_back(cam.seq_lens_cpu[i] - len);
   }
   // max_seq_len = longest context length in the batch.
   cam.max_seq_len =

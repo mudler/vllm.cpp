@@ -37,10 +37,12 @@ runs end-to-end on CPU:
   fallbacks, all CPU/property/sanitizer-gated. The generic sliding window also
   propagates through config, the CPU reference, separately specialized
   portable-CUDA kernels, and vendored FA2 local dispatch; the sm_121a
-  translation units compile cleanly. Chunked-local virtual-batch attention is
-  still the next leaf. Neither mode is yet user-visible model support: GPU
-  runtime, positive-model e2e, oracle, trace, and performance/memory gates
-  remain open.
+  translation units compile cleanly. Chunked-local attention now has its cached
+  ordinary-backend wrapper, exact virtual Q/K batches, reusable block-table
+  gather/update plan, cudagraph rejection and generic spec seam; all six pinned
+  shapes plus randomized causal-mask properties are CPU/sanitizer-gated.
+  Neither mode is yet user-visible model support: GPU runtime, positive-model
+  e2e, oracle, trace, and performance/memory gates remain open.
 - **Model forward** — Qwen3.6-35B-A3B hybrid (GDN×3 + gated full-attention, 256-
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
@@ -245,12 +247,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 - **Local attention is not user-visible yet.** Sliding-window KV bookkeeping
   and backend-neutral CPU/portable-CUDA/FA2 compute-window leaves are
   implemented; chunked-local KV sizing, registry/grouping, fixed-chunk prefix
-  reuse/recycling, admission and fallback allocation are also implemented.
-  Their CPU/property/sanitizer gates pass, and the sliding-window sm_121a
-  translation units compile. The chunked-local virtual-batch wrapper remains
-  open, as do GPU runtime, supported StarCoder2/Gemma3/Llama4-class model paths,
-  oracle, trace, throughput, latency and memory evidence; all three rows remain
-  `GATING`, not supported.
+  reuse/recycling, admission and fallback allocation are also implemented, as
+  is the virtual-batch wrapper that delegates each fixed chunk to an ordinary
+  causal backend. Their CPU/property/sanitizer gates pass, and the
+  sliding-window sm_121a translation units compile. GPU runtime, supported
+  StarCoder2/Gemma3/Llama4-class model paths, oracle, trace, throughput, latency
+  and memory evidence remain open; all four execution rows remain `GATING`, not
+  supported.
 
 ## Project record
 

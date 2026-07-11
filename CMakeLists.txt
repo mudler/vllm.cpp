@@ -171,6 +171,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/runner.cpp
   src/vllm/v1/attention/backend.cpp
+  src/vllm/v1/attention/backends/utils.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
@@ -188,6 +189,7 @@ add_library(vllm STATIC
   src/vllm/v1/engine/llm_engine.cpp
   src/vllm/v1/executor/executor.cpp
   src/vllm/model_executor/layers/attention/attention.cpp
+  src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
   src/vllm/entrypoints/chat_template.cpp
   src/vllm/entrypoints/model_loader.cpp
   src/capi/vllm_c.cpp

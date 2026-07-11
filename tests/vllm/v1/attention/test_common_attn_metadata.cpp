@@ -52,6 +52,7 @@ TEST_CASE("MakeCommonAttentionMetadata: prefill + decode step") {
   CHECK(cam.query_start_loc_cpu == std::vector<int32_t>{0, 4, 5});
   CHECK(cam.seq_lens == std::vector<int32_t>{4, 6});
   CHECK(cam.seq_lens_cpu == std::vector<int32_t>{4, 6});
+  CHECK(cam.num_computed_tokens_cpu == std::vector<int32_t>{0, 5});
   CHECK(cam.num_reqs == 2);
   CHECK(cam.num_actual_tokens == 5);
   CHECK(cam.max_query_len == 4);

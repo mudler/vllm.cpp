@@ -20,14 +20,16 @@
 //   * Decode context parallelism (dcp): dcp_local_seq_lens(_cpu).
 //   * DeepSeek V4 sparse: positions, mm_req_doc_ranges, is_prefilling,
 //     seq_lens_cpu_upper_bound, rswa_prefix_lens.
-//   * The deprecated _seq_lens_cpu / _num_computed_tokens_cpu accessors and the
-//     unpadded()/replace() spec-decode helpers.
+//   * The deprecated lazy _seq_lens_cpu accessor and the unpadded()/replace()
+//     spec-decode helpers. The host-equivalent num_computed_tokens_cpu array is
+//     ported because chunked-local virtual batching consumes and rewrites it.
 //   * AttentionBackend: the whole supports_*/validate_configuration capability
 //     surface, get_kv_cache_stride_order / get_kv_cache_block_dim, cudagraph
-//     support (AttentionCGSupport / build_for_cudagraph_capture / drafting),
-//     MLA / sparse-MLA impls. Ported here: the T0 core (CommonAttentionMetadata,
-//     the AttentionBackend/AttentionImpl/AttentionMetadataBuilder ABCs,
-//     get_name + get_kv_cache_shape, the forward signature).
+//     capture/drafting hooks, MLA / sparse-MLA impls. AttentionCGSupport itself
+//     is ported for the chunked-local wrapper. Ported here: the T0 core
+//     (CommonAttentionMetadata, the AttentionBackend/AttentionImpl/
+//     AttentionMetadataBuilder ABCs, get_name + get_kv_cache_shape, the forward
+//     signature).
 #ifndef VLLM_V1_ATTENTION_BACKEND_H_
 #define VLLM_V1_ATTENTION_BACKEND_H_
 
@@ -49,6 +51,15 @@ enum class AttentionType {
   kEncoder,        // "encoder"
   kEncoderOnly,    // "encoder_only"
   kEncoderDecoder  // "encoder_decoder"
+};
+
+// Cudagraph support level advertised by an attention metadata builder.
+// Values preserve upstream ordering; chunked-local explicitly returns kNever.
+enum class AttentionCGSupport {
+  kNever = 0,
+  kUniformSingleTokenDecode = 1,
+  kUniformBatch = 2,
+  kAlways = 3,
 };
 
 // Marker base for per-backend attention metadata (upstream `class
@@ -76,6 +87,11 @@ struct CommonAttentionMetadata {
   // property; we name it plainly per the M1.6 brief.)
   std::vector<int32_t> seq_lens;
   std::vector<int32_t> seq_lens_cpu;
+
+  // (num_reqs,) number of tokens computed before this step. Upstream exposes
+  // this as the deprecated lazy num_computed_tokens_cpu property; the local
+  // host-array representation stores the derived value eagerly.
+  std::vector<int32_t> num_computed_tokens_cpu;
 
   // Number of requests.
   int num_reqs = 0;

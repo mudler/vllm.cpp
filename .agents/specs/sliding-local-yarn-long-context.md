@@ -139,6 +139,10 @@ what sm_121 actually ran.
 
 ## Our baseline
 
+This table freezes the tree audited when the spike was accepted at `723d325`.
+It is not the current support surface; the leaf checkpoints later in this
+document and the engine matrix supersede it as each implementation lands.
+
 | Area | Local anchor | Honest state |
 |---|---|---|
 | KV types | `include/vllm/v1/kv_cache_interface.h:36-52,70-176`; `src/vllm/v1/kv_cache_interface.cpp:1-61` | Kinds are enumerated and `FullAttentionSpec` already preserves fallback `sliding_window` / `attention_chunk_size`, but both concrete local specs, their sizing/grouping, and quant-aware page math are explicitly deferred |
@@ -152,9 +156,9 @@ what sm_121 actually ran.
 | RoPE apply/cache | `src/vt/cpu/cpu_ops.cpp:308-357`; `src/vt/cuda/cuda_ops.cu:359-460`; fused consumer `cuda_ops.cu:463-590` | Plain NeoX computes default frequencies from `base` in each apply/cache kernel. The fused QK preamble can consume a cache, but cache generation has no scaled-frequency abstraction |
 | RoPE tests | `tests/vt/test_ops_rope.cpp`; `tests/vt/test_cuda_ops.cpp:506`; `tests/parity/test_op_parity.cpp` cases `rope_f32_pos_short` / `rope_f32_pos_131k` | Default one-dimensional RoPE only; no config-dispatch or scaling-formula oracle cases |
 
-No present code anchor may be upgraded to support evidence by this spike. In
-particular, 262K default MRoPE on Qwen3.6 does not demonstrate any of the four
-scaled families.
+These pre-implementation anchors are not current support evidence. In
+particular, 262K default MRoPE on Qwen3.6 still does not demonstrate any of the
+four scaled families.
 
 ## Port map
 
@@ -332,6 +336,27 @@ suite and focused ASan+UBSan leak detection. The documented local
 virtual-batch attention wrapper plus Llama4-class model/runtime/oracle/trace/
 performance gates remain open. The row therefore moves to `GATING`, not `DONE`;
 no GPU work or user-visible model-support claim is made.
+
+W4 checkpoint (2026-07-11): `ATTN-CHUNKED-LOCAL` now mirrors the cached
+underlying-backend wrapper, forces `AttentionCGSupport::kNever`, derives the
+exact chunk-aligned virtual Q/K sequences, records a reusable clipped
+block-table gather/update plan, preserves slot mappings, delegates metadata and
+implementation calls to the ordinary backend, and emits the W3
+`ChunkedLocalAttentionSpec`. Upstream uploads its NumPy gather indices to torch
+device tensors; the existing project-wide metadata deviation represents both
+copies as host vectors, so the reusable plan is the C++ equivalent. A typed
+template adapter replaces Python's dynamic metadata-builder subclass while
+preserving build and update ordering. All six pinned Q/K/table vectors pass,
+including clipped last pages, partial first/last chunks, chunk>sequence,
+block==chunk and second-chunk decode. A deterministic 100-trial property proves
+query preservation, bounded virtual lengths, exact page gathers and equality
+between the fixed-chunk dense mask and ordinary causal virtual batches; cached
+backend identity/shape/implementation delegation and spec fields are also
+gated. Full Release CPU ctest passes 101/101 and the changed metadata suites are
+ASan+UBSan clean with leak detection. The row moves to `GATING`, not `DONE`:
+the local oracle environment remains absent and a supported Llama4-class model,
+real GPU backend run, trace and G6-G9 every-axis evidence remain open. No DGX
+command or user-visible model-support claim is made.
 
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE

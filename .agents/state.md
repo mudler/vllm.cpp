@@ -3328,3 +3328,22 @@ tables and the underlying attention backend; a supported Llama4-class model,
 restored oracle, runtime trace and every-axis performance/memory evidence then
 own G5-G9. Until those land, README and matrices describe CPU-gated KV
 bookkeeping only, with no user-visible chunked-local model support.
+
+## 2026-07-11 — C5 W4 chunked-local attention leaf claimed
+
+`CLAIM-C5-CHUNKED-ATTN-1` moves `ATTN-CHUNKED-LOCAL` `READY -> ACTIVE` in
+isolated worktree `/home/mudler/_git/vllm.cpp-c5-chunked-attn`, branch
+`codex/c5-chunked-attn-w4`. W3 has merged the concrete KV spec/manager
+dependency, so W4 is the next dependency-ready C5 leaf. Its bounded scope is
+the pinned chunked-local wrapper, virtual-batch Q/K lengths, slot/block-table
+transforms, cudagraph rejection, `ChunkedLocalAttentionSpec` emission,
+ordinary-backend dispatch and the exact upstream-derived CPU/reference tests.
+Llama4/model-family support, W3 KV edits, RoPE, connectors/offload, DCP/PCP,
+kernel optimization and all GPU work remain out of scope.
+
+Read-only DGX inspection at 2026-07-11 01:33 UTC showed
+`CLAIM-SERVE-GATE-1` still holding `/tmp/gpu`; its 27B vllm.cpp server used
+25,251 MiB while the ours c32/192-prompt repetition 3 client ran. The two PR3
+jobs remained queued on the mutex. W4 begins with source, CPU/reference tests
+and compile-only validation; it will not queue behind or contaminate that
+campaign.

@@ -4226,3 +4226,54 @@ nsys trace, and implement the highest-value concrete parity lever. Do not spend
 a 35B series or rerun the full 27B gate unchanged; the next binding campaign
 must use the optimized commit and start from a new whole-model lock/evidence
 tree.
+
+## 2026-07-11 — FP4 output equality is diagnostic, not the online correctness gate
+
+After `d4ddeb1e7012e22429c2fde4ac6de338b6a535ed` reached `origin/main`, its
+real oracle preflight hashed executable venv Ninja as
+`abf714870db6db3de512100023d26db0b2750d6afffe96cdde5513564e3d910b`.
+The first standalone diagnostic command omitted the driver-exported repository
+`PYTHONPATH` and failed before model import/load; that command defect retained
+no measurement and released the lock immediately. The production-equivalent
+retry then held `/tmp/gpu`, passed the former Ninja/JIT failure point, loaded
+the 27B checkpoint, and profiled one warmup plus three exact c16/48 generations.
+Torch profiler stopped successfully and wrote a 143-MiB worker trace, but the
+helper exited after capture because at least one measured output digest differed
+from its warmup digest. Cleanup released the lock and the GPU is idle.
+
+The completed-but-rejected trace is retained only as diagnosis under
+`~/work/vllm.cpp-online-gate/diagnostic/d4ddeb1-vllm27-c16-trace-r2`.
+Trace, kernel-summary and profile-log SHA-256 values are respectively
+`08d9bb3c39343cadac18b4f5ab9486bf79447601a60abb0a55304030d3049b35`,
+`d826edfb390d01de5f7c71cbf0272837e538a08c04f12be2681fa3ba8f0db8cc`,
+and `95977ccdd0558e9ad509976e7f20db5e4fc84fef96c91b5bd716a1809a1647ef`.
+It contains 1,933,965 kernel events and 272.215 s of profiler-inflated kernel
+time. Names are useful for diagnosis; percentages are not a binding steady-state
+comparison, and the missing metadata/status makes it ineligible for the gate.
+
+The same defect was latent in the final timed summarizer. Direct inspection of
+all 36 retained `31d053f` pairs found only **4 exact generated-text matches out
+of 2,016 requests**. This does not contradict its passing commit-bound 27B model
+gate or the 2,016/2,016 exact native prompt/output counts: the frozen synthetic
+continuations are sensitive to production FP4 accumulation order, and the
+existing 27B correctness gate already uses the longest prefix on which vLLM's
+own production and emulation kernels agree before their whitespace near-tie.
+Requiring whole synthetic strings—or requiring vLLM profiler repetitions to
+select the same near-tie branch—was an over-strong and unsatisfiable performance
+precondition.
+
+The repair keeps correctness fail-closed at the separate commit-bound model
+gate plus exact native counts, errors and completeness. It retains every
+cross-engine exact-text count as a structured diagnostic, and the profiler now
+records the warmup plus all measured output digests and an honest equality flag
+without rejecting a valid kernel trace. Missing pairs, failed model gates,
+partial/errors, token-count drift, malformed timing, hash drift, memory/trace
+gaps and every below-floor axis remain fatal. The nondeterministic-digest fixture
+and text-difference fixture exercise both paths. Client **9/9**, summary **5/5**,
+all benchmark tools **35/35**, record mutations **13/13**, documentation
+mutations **5/5**, canonical record (ENGINE=96 / MODEL=323 / QUANT=81 /
+KERNEL=30 / BACKEND=51), shell syntax, Python compilation and diff checks pass.
+
+Next: merge this contract repair and recapture the lock-held diagnostic trace at
+the new SHA. Only that complete status may drive the ranked parity-lever scan;
+the full 27B gate remains deferred until a concrete optimization is implemented.

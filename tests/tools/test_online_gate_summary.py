@@ -389,7 +389,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
             self.assertTrue(all(item["binding_eligible"] for item in ratios["ratios"]))
             self.assertTrue(all(item["pass"] for item in ratios["ratios"]))
 
-    def test_text_mismatch_voids_paired_performance(self) -> None:
+    def test_text_difference_is_diagnostic_after_model_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
@@ -398,10 +398,15 @@ class OnlineGateSummaryTests(unittest.TestCase):
             record["generated_texts"][0] = "different"
             path.write_text(json.dumps(record), encoding="utf-8")
             runs, ratios = self._summarize(root)
-            self.assertFalse(runs["gate_pass"])
-            self.assertTrue(
-                any(not item["binding_eligible"] for item in ratios["ratios"])
+            self.assertTrue(runs["gate_pass"])
+            self.assertTrue(all(item["binding_eligible"] for item in ratios["ratios"]))
+            diagnostic = next(
+                item
+                for item in runs["output_text_diagnostics"]
+                if item["repetition"] == 2
             )
+            self.assertFalse(diagnostic["all_equal"])
+            self.assertEqual(diagnostic["exact_matches"], 1)
 
     def test_missing_memory_or_partial_request_set_cannot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

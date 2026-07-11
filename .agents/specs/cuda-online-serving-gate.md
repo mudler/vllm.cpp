@@ -80,8 +80,9 @@ successful repetitions.
   an ambient or unimportable clean-shell preparation command fails before GPU
   work.
 - Pinned profiler example/API behavior is covered by
-  `tests/tools/test_online_gate_trace.py`; project every-axis/void propagation
-  is covered by `tests/tools/test_online_gate_summary.py`.
+  `tests/tools/test_online_gate_trace.py`; output-repeatability metadata and
+  project every-axis/void propagation are covered by
+  `tests/tools/test_online_gate_{client,summary}.py`.
 - Rootless eviction inventory, inode deduplication, zero-residency proof,
   failure reporting and overwrite refusal are covered by
   `tests/tools/test_drop_file_cache.py`; client/summary suites reject resident
@@ -115,9 +116,14 @@ warmup, all interleaved repetitions, shutdown, memory sampling, and paired
 traces. The c32 client point is backed by an explicit 32-sequence scheduler on
 both arms rather than the local server's historical default of eight. Each
 model/point has
-at least three valid repetitions and a fresh pinned-vLLM denominator. Generated
-tokens must pass the configured deterministic/logprob correctness gate before
-performance is compared. vllm.cpp must be no worse on every throughput,
+at least three valid repetitions and a fresh pinned-vLLM denominator. The
+commit-bound model gate is the correctness precondition before performance is
+compared; every timed request separately requires exact native prompt/output
+counts. Generated texts and profiler output digests are retained as diagnostics,
+not an equality gate: production FP4 accumulation variants can choose different
+greedy near-ties, including between vLLM warmup and measured repetitions. A
+text mismatch may not hide a failed model gate, partial request, error, or count
+drift. vllm.cpp must be no worse on every throughput,
 latency, error, and memory axis; a failed start or request voids that arm. The
 configured concurrency must be reached by an exact sweep of each request's
 observed half-open `[start_time, start_time + ttft + sum(itls))` interval.
@@ -181,6 +187,11 @@ owns the DGX campaign and its result directory.
 - A profiler dependency that is importable but not executable through the
   spawned EngineCore `PATH` is a failed preflight, not a reason to omit the
   paired trace or reuse a lock-released series.
+- Cross-engine generated-text equality is not a substitute for the model gate.
+  The frozen synthetic continuations are performance load, and direct evidence
+  showed FP4 variants select different valid branches; retain exact-match counts
+  and all profiler digests so repeatability remains visible without voiding an
+  otherwise exact-count, correctness-preconditioned performance arm.
 - The pre-W2 server's `cudaFree` error is an asynchronous surfacing point, not
   a proven faulting kernel; reproduce current main under sanitizer before any
   fix or root-cause claim.

@@ -4,8 +4,10 @@
 Metric values are read from the detailed output produced by pinned vLLM
 ``bench serve`` (``vllm/benchmarks/serve.py:563-748,1188-1284`` at
 ``e24d1b24``).  The upstream client owns timing; this module validates the
-complete grid, checks deterministic outputs across engines, aggregates repeated
-runs, and applies the repository's direction-aware every-axis rule.
+complete grid, retains cross-engine output differences as diagnostics,
+aggregates repeated runs, and applies the repository's direction-aware
+every-axis rule. Correctness is a separate commit-bound model gate because
+production FP4 accumulation variants may select different greedy near-ties.
 """
 
 from __future__ import annotations
@@ -678,9 +680,12 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
         for repetition in REPETITIONS
     }
 
-    # Compare deterministic generated text for the identical partition before
-    # aggregating any performance value. A mismatch voids both paired arms.
+    # A paired result must exist, but generated text is diagnostic rather than
+    # a performance precondition. Production FP4 accumulation variants can
+    # select different greedy near-ties (including across vLLM repetitions),
+    # while the commit-bound model gate plus exact native counts own correctness.
     pair_reasons: dict[tuple[str, int, int], list[str]] = defaultdict(list)
+    output_text_diagnostics: list[dict[str, Any]] = []
     for model in MODEL_REVISIONS:
         for concurrency, _ in POINTS:
             per_engine = {
@@ -694,10 +699,23 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
                     pair_reasons[(model, concurrency, repetition)].append(
                         "paired engine result is absent"
                     )
-                elif ours["generated_texts"] != vllm["generated_texts"]:
-                    pair_reasons[(model, concurrency, repetition)].append(
-                        "deterministic generated texts differ between ours and vLLM"
-                    )
+                    continue
+                ours_texts = ours["generated_texts"]
+                vllm_texts = vllm["generated_texts"]
+                exact_matches = sum(
+                    ours_text == vllm_text
+                    for ours_text, vllm_text in zip(ours_texts, vllm_texts)
+                )
+                output_text_diagnostics.append(
+                    {
+                        "all_equal": ours_texts == vllm_texts,
+                        "concurrency": concurrency,
+                        "exact_matches": exact_matches,
+                        "model": model,
+                        "repetition": repetition,
+                        "requests": len(ours_texts),
+                    }
+                )
 
     leg_memory: dict[tuple[str, str, int], dict[str, float | None]] = {}
     leg_reasons: dict[tuple[str, str, int], list[str]] = {}
@@ -857,6 +875,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
         "campaign_reasons": campaign_reasons,
         "gate_pass": gate_pass,
         "memory_aggregates": memory_aggregates,
+        "output_text_diagnostics": output_text_diagnostics,
         "raw_runs": raw_runs,
     }
     ratios_document = {"gate_pass": gate_pass, "ratios": ratios}

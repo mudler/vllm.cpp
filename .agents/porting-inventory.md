@@ -607,13 +607,16 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    runs c1/2/4/8/16/32 with three interleaved ours/vLLM repetitions under one
    model-wide lock and an identical 32-sequence/per-model-token-budget
    scheduler configuration, retains detailed TTFT/TPOT/ITL/E2EL arrays, compares
-   deterministic outputs, samples process-tree/GPU memory and thermal/power,
+   output exact-match counts diagnostically behind a separate commit-bound model
+   correctness gate, samples process-tree/GPU memory and thermal/power,
    verifies memory return, refreshes targets from a clean exact HEAD, hashes the
    executable pip-oracle runtime, and records an ours-nsys/vLLM-torch-profiler
    trace pair. The oracle manifest hashes the venv's `ninja` executable and the
    profiler prepends that venv to `PATH`, because FlashInfer can JIT inside a
    spawned EngineCore. Pinned-vLLM producer-ahead DELTA merges remain valid
-   inter-chunk timing evidence when native output counts are exact; any missing, failed,
+   inter-chunk timing evidence when native output counts are exact. Profiler
+   warmup/measured output digests and their equality flag are retained without
+   treating FP4 greedy near-tie branches as a performance failure; any missing, failed,
    native-count-inexact, over-fragmented, hash-drifted, or below-vLLM artifact
    is non-binding. CPU harness contracts are green; the current-main DGX
    campaigns remain open under `SERVE-GATE-ONLINE`.

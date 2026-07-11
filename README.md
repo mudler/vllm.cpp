@@ -276,13 +276,16 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   and -0.63% at c32, while vLLM's online denominator was +4.92%/+4.65% under
   the changed corpus/frontend recipe. Direct-library parity remains accepted;
   the still-unlocalized online gap may be scheduling, configuration, arrival,
-  frontend, or model-execution behavior. Our nsys trace completed, but the required
-  vLLM torch-profiler fallback then failed closed because FlashInfer JIT could
-  not find the oracle venv's `ninja`; the whole-model lock was released and 35B
-  was not started, so no online ratio is binding. The harness now hashes and
-  preflights that executable and prepends the pinned venv for the profiler.
-  Next is a diagnostic paired-trace recapture, concrete hot-path optimization,
-  then a fresh commit-bound gate rerun.
+  frontend, or model-execution behavior. Our nsys trace completed. After the
+  Ninja/PATH repair, `d4ddeb1` captured the full 143-MiB vLLM torch trace, but
+  its postcondition rejected differing warmup/measured FP4 output digests. The
+  timed grid confirms exact synthetic text is not a valid performance gate:
+  only 4/2,016 paired continuations matched, although the commit-bound model
+  correctness gate passed and every request retained exact native counts. The
+  repaired contract records all digests and exact-match counts diagnostically;
+  it does not let them replace or bypass the model/count gates. The trace must
+  be recaptured after merge, then the concrete hot-path difference optimized
+  before a fresh 27B→35B campaign. No online ratio is binding.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

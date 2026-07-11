@@ -583,6 +583,13 @@ class OnlineClientContractTests(unittest.TestCase):
                         "max_num_seqs": TRACE_CONCURRENCY,
                         "num_prompts": TRACE_PROMPTS,
                         "output_digest": "a" * 64,
+                        "output_digests": [
+                            "a" * 64,
+                            "b" * 64,
+                            "c" * 64,
+                            "d" * 64,
+                        ],
+                        "output_digests_equal": False,
                         "output_len": OUTPUT_LEN,
                         "profiled_warmup_prompts": TRACE_PROMPTS,
                         "repetitions": TRACE_REPETITIONS,
@@ -615,6 +622,7 @@ class OnlineClientContractTests(unittest.TestCase):
             )
             self.assertEqual(trace["ours_profiler"], "nsys")
             self.assertEqual(trace["vllm_profiler"], "torch-profiler")
+            self.assertFalse(trace["output_repeatability"]["vllm"]["all_equal"])
 
 
 if __name__ == "__main__":

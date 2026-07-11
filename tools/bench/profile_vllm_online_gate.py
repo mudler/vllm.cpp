@@ -128,8 +128,7 @@ def main() -> int:
             measured_digests.append(_output_digest(outputs))
     finally:
         llm.stop_profile()
-    if any(value != warmup_digest for value in measured_digests):
-        raise HarnessError("profile repetitions are not deterministic")
+    output_digests = [warmup_digest, *measured_digests]
 
     # EngineCore may write the worker trace asynchronously after stop_profile.
     deadline = time.monotonic() + 30.0
@@ -145,6 +144,8 @@ def main() -> int:
         "input_len": INPUT_LEN,
         "model": str(args.model),
         "output_digest": warmup_digest,
+        "output_digests": output_digests,
+        "output_digests_equal": len(set(output_digests)) == 1,
         "output_len": OUTPUT_LEN,
         "profile_dir": str(args.profile_dir.resolve()),
         "num_prompts": args.num_prompts,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -756,8 +757,10 @@ def record_trace_status(
             expected_requests=TRACE_PROMPTS,
         )
         generated_texts.append(record.get("generated_texts"))
-    if any(value != generated_texts[0] for value in generated_texts[1:]):
-        raise HarnessError("ours trace client repetitions are not deterministic")
+    ours_output_digests = [
+        hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+        for value in generated_texts
+    ]
     metadata = _load_json_object(vllm_metadata)
     expected_metadata = {
         "input_len": INPUT_LEN,
@@ -777,9 +780,22 @@ def record_trace_status(
         raise HarnessError("vLLM trace metadata corpus hash differs")
     if pathlib.Path(str(metadata.get("corpus"))).resolve() != vllm_corpus.resolve():
         raise HarnessError("vLLM trace metadata corpus path differs")
-    output_digest = metadata.get("output_digest")
-    if not isinstance(output_digest, str) or re.fullmatch(r"[0-9a-f]{64}", output_digest) is None:
-        raise HarnessError("vLLM trace metadata output digest is absent")
+    output_digests = metadata.get("output_digests")
+    if (
+        not isinstance(output_digests, list)
+        or len(output_digests) != TRACE_REPETITIONS + 1
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in output_digests
+        )
+    ):
+        raise HarnessError("vLLM trace metadata output digests are absent")
+    if metadata.get("output_digest") != output_digests[0]:
+        raise HarnessError("vLLM trace warmup output digest differs")
+    output_digests_equal = len(set(output_digests)) == 1
+    if metadata.get("output_digests_equal") is not output_digests_equal:
+        raise HarnessError("vLLM trace output-repeatability flag differs")
     artifacts = {
         "ours_command": ours_command,
         "ours_profile_log": ours_profile_log,
@@ -813,6 +829,16 @@ def record_trace_status(
         },
         "model_key": model_key,
         "ours_profiler": "nsys",
+        "output_repeatability": {
+            "ours": {
+                "all_equal": len(set(ours_output_digests)) == 1,
+                "digests": ours_output_digests,
+            },
+            "vllm": {
+                "all_equal": output_digests_equal,
+                "digests": output_digests,
+            },
+        },
         "passed": True,
         "trace_contract": {
             "concurrency": TRACE_CONCURRENCY,

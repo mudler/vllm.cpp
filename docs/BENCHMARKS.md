@@ -6,14 +6,14 @@ Detailed commands, per-repetition values, hashes, and parity rationale remain
 in the [append-only parity ledger](../.agents/parity-ledger.md) and the linked
 feature specs.
 
-Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` 27B trace-preflight checkpoint).
+Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` FP4 output-contract checkpoint).
 
 ## Current checkpoint
 
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **VOID / BELOW-FLOOR DIAGNOSTIC — no binding ratio** | `31d053f` completed all three interleaved 27B ours/vLLM c1–c32 ladders, six memory-return checks, and ours nsys. Mean total-throughput ratios were 0.959/0.926/0.934/0.937/0.961/0.956×; only 1–4 of 19 timing axes passed per point. This does **not** show a library/kernel regression: against the accepted offline checkpoint, ours was +0.14% at c16 and -0.63% at c32, while the online vLLM denominator was +4.92%/+4.65% under the changed corpus/frontend recipe. The vLLM torch-profiler fallback then failed during FlashInfer JIT because the pinned venv's `ninja` was not on `PATH`; no status/final summary exists, the lock was released, and 35B did not start. [Diagnostic record](../.agents/state.md). | Hash/preflight `ninja`, recapture the paired diagnostic trace, distinguish scheduling/config/frontend effects from model execution, mirror the highest-value differences, then rerun the full 27B gate before 35B. None of the `31d053f` values is binding. |
+| `SERVE-GATE-ONLINE` | **VOID / BELOW-FLOOR DIAGNOSTIC — no binding ratio** | `31d053f` completed all three interleaved 27B ours/vLLM c1–c32 ladders, six memory-return checks, and ours nsys. Mean total-throughput ratios were 0.959/0.926/0.934/0.937/0.961/0.956×; only 1–4 of 19 timing axes passed per point. This does **not** show a library/kernel regression: against the accepted offline checkpoint, ours was +0.14% at c16 and -0.63% at c32, while the online vLLM denominator was +4.92%/+4.65% under the changed corpus/frontend recipe. `d4ddeb1` then captured the 143-MiB vLLM trace after the Ninja fix, but the profiler rejected it because measured FP4 output digests differed from warmup. The timed grid independently shows why exact text is the wrong performance precondition: only 4/2,016 paired synthetic continuations matched, while the model gate passed and every request retained exact native counts. Trace/output-equality repair is CPU-green; all evidence remains void. [Diagnostic record](../.agents/state.md). | Record all output digests/exact-match counts diagnostically behind the commit-bound model gate, recapture the trace at the merged SHA, distinguish scheduling/config/frontend effects from model execution, then optimize and rerun the full 27B gate before 35B. |
 
 The stream-usage path changes host-side JSON/SSE serialization, not model
 kernels. Its performance disposition is nevertheless `PENDING` because the
@@ -28,6 +28,10 @@ The accepted direct-library throughput rows below therefore remain valid. The
 online diagnostic is a different serving/corpus recipe and cannot localize its
 gap to JSON/SSE alone; scheduler batching, arrival cadence, server configuration
 and model execution all remain candidates until the paired trace is complete.
+Its synthetic generated strings are retained as diagnostics. Correctness comes
+from the commit-bound real-model gate plus exact native counts, because production
+FP4 accumulation variants—including vLLM across profiler repetitions—can choose
+different greedy branches at numerical near-ties.
 
 ## Accepted CUDA engine throughput
 

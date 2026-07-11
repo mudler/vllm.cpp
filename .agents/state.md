@@ -3128,3 +3128,54 @@ The surviving DGX series still owns `/tmp/gpu`: ours 27B c1/c2/c4/c8 and two
 c16 repetitions are complete, with c16 rep3 running at inspection time; vLLM
 and 35B arms remain. It is preserved unchanged. C5 W1 needs only CPU G1/G2, so
 implementation can proceed without contending with that campaign.
+
+## 2026-07-11 — C5 W1 sliding-window KV implemented and handed to feature gating
+
+`CLAIM-C5-SW-KV-1` completed its bounded CPU-only implementation scope and is
+released. `KV-SLIDING-WINDOW-SPEC` moves `ACTIVE -> GATING`, never `DONE`.
+The port adds:
+
+- `SlidingWindowSpec` with asymmetric V-head sizing and the pinned
+  `min(W-1+max_num_batched_tokens,max_model_len)` admission formula;
+- `KVCacheSpecRegistry` metadata and inherited built-in lookup, plus
+  registry-backed coordinator dispatch that supplies the exact SWA cap;
+- `SlidingWindowManager` right-to-left contiguous-hit lookup, alignment/EAGLE
+  lookahead/drop/re-alignment, reachable sparse-retention and replay tails,
+  skipped whole-page recycling, and cascade disablement;
+- exact SWA grouping fields and the hybrid-disabled conversion to
+  `FullAttentionSpec(sliding_window=...)` so storage falls back to full while
+  compute semantics remain local; and
+- the applicable pinned spec/registry/manager/prefix/utility tests, with real
+  named skips for `KV-PREFIX-CACHE` contiguous packing, `KV-OFFLOAD`,
+  `KV-CONNECTORS`, and the `ATTN-SLIDING-WINDOW` + Gemma3 model-positive gate.
+
+Local evidence (no GPU command ran):
+
+- `cmake -S . -B build-c5-cpu -DCMAKE_BUILD_TYPE=Release
+  -DVLLM_CPP_CUDA=OFF && cmake --build build-c5-cpu -j20` passed;
+- `VLLM_CPP_CPU_THREADS=1 ctest --test-dir build-c5-cpu
+  --output-on-failure` passed **99/99**;
+- the four focused binaries report **69 passing cases / 49,763 assertions**,
+  with four explicit dependency skips;
+- the deterministic 40-trial property spans non-block-aligned window, batch,
+  block and model boundaries; it proves predictor=allocator, physical-held
+  pages≤cap, no live/free alias, visible-token-slot equality with the
+  full-allocation oracle, and clean free/reallocate;
+- a Debug CUDA-OFF build with `-fsanitize=address,undefined
+  -fno-omit-frame-pointer` passed all four focused suites under
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1`; and
+- `git diff --check` passed. No formatter binary is installed on the recovered
+  host, so formatting was reviewed against the surrounding project style.
+
+The fresh pinned-vLLM test run is explicitly unavailable after the crash:
+`~/venvs/vllm-oracle/bin/python` does not exist. The fallback exact command
+`python3 -m pytest -q
+tests/v1/core/test_single_type_kv_cache_manager.py::test_sliding_window_possible_cached_prefix`
+reached the pinned tree but failed while loading `tests/conftest.py` because
+system Python lacks `tblib`. No package was installed and no oracle result is
+invented. Restore the documented oracle environment, rerun the exact C5 modules,
+then pair this leaf with `ATTN-SLIDING-WINDOW` G4/G6-G9 (operator/model-positive
+correctness, nsys trace, every-axis performance and memory). Until that evidence
+exists, README and matrices explicitly say the KV policy is CPU-gated but
+sliding-window model support is not user-visible.

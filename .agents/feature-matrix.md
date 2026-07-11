@@ -52,7 +52,7 @@ instead of it.
 | KVCacheManager (allocate_slots, watermark, admission) | `v1/core/kv_cache_manager.py` | `ANCHOR-BACKFILL` T0 | named allocation/admission/lookahead slice | `planned: specs/kv-cache-manager.md` |
 | Hybrid KV coordinator (full-attn + GDN/mamba state groups) | `v1/core/kv_cache_coordinator.py` | `PARTIAL` T0 | cross-group MIN-intersection prefix hit; align/retention modes absent | `planned: specs/hybrid-kv-coordinator.md` |
 | Mamba/GDN prefix-cache retention (`mamba_cache_mode=align`, vllm#45845) | `v1/core/` | ☐ T1 | 1:1 stub in place | `planned: specs/mamba-align-retention.md` |
-| SlidingWindowSpec + ChunkedLocalAttentionSpec | `v1/kv_cache_interface.py` | `ACTIVE` T1 | `KV-SLIDING-WINDOW-SPEC` W1 claimed; `KV-CHUNKED-LOCAL-SPEC` remains separately `READY` | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) |
+| SlidingWindowSpec + ChunkedLocalAttentionSpec | `v1/kv_cache_interface.py` | `PARTIAL` T1 | `KV-SLIDING-WINDOW-SPEC` W1 is implemented and CPU/property/sanitizer-green but remains `GATING` on feature-positive attention/model/oracle/performance evidence; `KV-CHUNKED-LOCAL-SPEC` remains separately `READY` | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) |
 | fp8 KV cache (`cache_dtype=fp8*`) | `layers/quantization/kv_cache.py` | ☐ T1 | | `planned: specs/fp8-kv-cache.md` |
 | nvfp4 / per-token-head / turboquant KV | `config/cache.py` | ☐ T2 | | `planned: specs/nvfp4-kv-cache.md` |
 | KV offload (CPU tiering, LRU/ARC) | `v1/kv_offload/` | ☐ T2 | | `planned: specs/kv-offload.md` |

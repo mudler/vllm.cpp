@@ -13,6 +13,8 @@
 //     KVCacheManager / Scheduler are not landed yet), constructing the per-group
 //     cache-hit state directly against the owned BlockPool — the same
 //     mock-the-block-pool pattern used by the Task 2 manager tests.
+//   - test_eagle_with_sliding_window and pure-SWA retention/replay cases at
+//     tests/v1/core/test_prefix_caching.py:2520-2584,3811-3909.
 //
 // Object-identity comparisons (`block is ...`) are ported as pointer equality.
 #include <doctest/doctest.h>
@@ -44,6 +46,8 @@ using vllm::v1::make_block_hash_with_group_id;
 using vllm::v1::MambaSpec;
 using vllm::v1::Request;
 using vllm::v1::sha256_cbor;
+using vllm::v1::SlidingWindowManager;
+using vllm::v1::SlidingWindowSpec;
 using vllm::v1::UnitaryKVCacheCoordinator;
 using vt::DType;
 
@@ -62,6 +66,13 @@ std::shared_ptr<MambaSpec> MakeMambaSpec() {
       std::vector<DType>{DType::kF32});
 }
 
+std::shared_ptr<SlidingWindowSpec> MakeSlidingSpec(
+    int sliding_window = 4) {
+  return std::make_shared<SlidingWindowSpec>(
+      kBlockSize, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
+      sliding_window);
+}
+
 // The 2-group gate-model config: group 0 = full attention, group 1 = GDN mamba.
 KVCacheConfig MakeHybridConfig(int num_blocks = 100) {
   KVCacheConfig cfg;
@@ -78,6 +89,15 @@ KVCacheConfig MakeUnitaryConfig(int num_blocks = 100) {
   cfg.num_blocks = num_blocks;
   cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
                                    MakeFullSpec());
+  return cfg;
+}
+
+KVCacheConfig MakeSlidingConfig(int num_blocks = 100,
+                                int sliding_window = 4) {
+  KVCacheConfig cfg;
+  cfg.num_blocks = num_blocks;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swa0"},
+                                   MakeSlidingSpec(sliding_window));
   return cfg;
 }
 
@@ -121,6 +141,30 @@ TEST_CASE("get_kv_cache_coordinator: 1 group -> Unitary, 2 groups -> Hybrid") {
   CHECK(hyb->single_type_managers.size() == 2);
 }
 
+TEST_CASE("get_kv_cache_coordinator: SlidingWindowSpec uses registry manager and cap") {
+  auto coord = get_kv_cache_coordinator(
+      MakeSlidingConfig(), /*max_model_len=*/100,
+      /*max_num_batched_tokens=*/4, /*use_eagle=*/false,
+      /*enable_caching=*/true, /*enable_kv_cache_events=*/false,
+      /*dcp_world_size=*/1, /*pcp_world_size=*/1,
+      /*scheduler_block_size=*/kBlockSize,
+      /*hash_block_size=*/kBlockSize);
+  REQUIRE(dynamic_cast<UnitaryKVCacheCoordinator*>(coord.get()) != nullptr);
+  REQUIRE(coord->single_type_managers.size() == 1);
+  auto* sliding = dynamic_cast<SlidingWindowManager*>(
+      coord->single_type_managers[0].get());
+  REQUIRE(sliding != nullptr);
+  // min(W-1 + max_batch, max_model) = 7; cdiv(7, 2) + 1 = 5.
+  CHECK(sliding->_max_admission_blocks_per_request == std::optional<int>{5});
+
+  vllm::v1::KVCacheBlocksTuple no_hits(1);
+  CHECK(coord->get_num_blocks_to_allocate(
+            "admit", /*num_tokens=*/100, no_hits,
+            /*num_encoder_tokens=*/0, /*total_computed_tokens=*/0,
+            /*num_tokens_main_model=*/100,
+            /*apply_admission_cap=*/true) == 5);
+}
+
 TEST_CASE("get_kv_cache_coordinator: enable_caching == false is DEFERRED (throws)") {
   CHECK_THROWS(get_kv_cache_coordinator(
       MakeHybridConfig(), 8192, 8192, false, /*enable_caching=*/false, false, 1,
@@ -145,6 +189,26 @@ TEST_CASE("HybridKVCacheCoordinator: attention_groups puts full attention first"
   // The mamba group keeps its config-order id (1 here / 0 in this config).
   CHECK(hyb->attention_groups[0].group_ids == std::vector<int>{1});
   CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0});
+}
+
+TEST_CASE("HybridKVCacheCoordinator: equal sliding specs share one SpecGroup") {
+  KVCacheConfig cfg;
+  cfg.num_blocks = 100;
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swa0"},
+                                   MakeSlidingSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"full0"},
+                                   MakeFullSpec());
+  cfg.kv_cache_groups.emplace_back(std::vector<std::string>{"swa1"},
+                                   MakeSlidingSpec());
+  auto coord = MakeCoordinator(std::move(cfg));
+  auto* hyb = dynamic_cast<HybridKVCacheCoordinator*>(coord.get());
+  REQUIRE(hyb != nullptr);
+  REQUIRE(hyb->attention_groups.size() == 2);
+  CHECK(hyb->attention_groups[0].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+  CHECK(hyb->attention_groups[1].spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kSlidingWindow);
+  CHECK(hyb->attention_groups[1].group_ids == std::vector<int>{0, 2});
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +287,29 @@ TEST_CASE(
   CHECK(blocks[0][0] == &pool.blocks[10]);
   CHECK(blocks[0][1] == &pool.blocks[11]);
   CHECK(hit_length == 2 * kBlockSize);  // 2 blocks * block_size
+}
+
+TEST_CASE(
+    "UnitaryKVCacheCoordinator: sliding-window cache replay keeps the live tail") {
+  init_none_hash(sha256_cbor);
+  auto coord = MakeCoordinator(MakeSlidingConfig());
+
+  Request original = MakeRequest("swa-a", /*n_tokens=*/6);
+  auto allocated = coord->allocate_new_blocks("swa-a", 6, 6);
+  REQUIRE(allocated.size() == 1);
+  REQUIRE(allocated[0].size() == 3);
+  coord->cache_blocks(original, /*num_computed_tokens=*/6);
+  coord->free("swa-a");
+
+  Request replay = MakeRequest("swa-b", /*n_tokens=*/8);
+  auto [blocks, hit_length] =
+      coord->find_longest_cache_hit(replay.block_hashes, 8);
+  REQUIRE(blocks.size() == 1);
+  REQUIRE(blocks[0].size() == 3);
+  CHECK(blocks[0][0] == coord->block_pool.null_block);
+  CHECK(blocks[0][1]->block_id == allocated[0][1]->block_id);
+  CHECK(blocks[0][2]->block_id == allocated[0][2]->block_id);
+  CHECK(hit_length == 3 * kBlockSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,4 +423,12 @@ TEST_CASE(
   CHECK(blocks[1][0] == coord->block_pool.null_block);
   CHECK(blocks[1][1] == coord->block_pool.null_block);
   CHECK(blocks[1][2]->block_id == allocatedA[1][2]->block_id);
+}
+
+TEST_CASE("SWA model-positive replay waits on attention and model rows" *
+          doctest::skip(true) *
+          doctest::description(
+              "tests/v1/e2e/general/test_correctness_sliding_window.py needs "
+              "ATTN-SLIDING-WINDOW and MODEL-TEXT-gemma3-gemma3-for-causal-lm")) {
+  MESSAGE("SKIP ATTN-SLIDING-WINDOW + MODEL-TEXT-gemma3-gemma3-for-causal-lm");
 }

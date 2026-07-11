@@ -31,6 +31,13 @@ runs end-to-end on CPU:
   (full-attn + GDN/mamba-state groups), the persistent `InputBatch` + step-input
   build, `EngineCore.step()` loop, and the `LLMEngine` (`add_request`/`step`/
   `generate`).
+- **Sliding-window KV policy** — `SlidingWindowSpec`, registry-backed manager
+  dispatch, recycling-aware admission, right-to-left prefix reuse (including
+  alignment/EAGLE and sparse-retention masks), whole-page eviction, and the
+  hybrid-disabled full-allocation fallback are CPU/property/sanitizer-gated.
+  This is not yet user-visible sliding-window model support: the attention
+  backend, positive model e2e, runtime oracle, trace, and performance/memory
+  gates remain open.
 - **Model forward** — Qwen3.6-35B-A3B hybrid (GDN×3 + gated full-attention, 256-
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
@@ -232,6 +239,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   rejection sampler, GDN state snapshots, and API/config wiring remain open.
   GGUF files do not currently carry `mtp.*`; normal non-speculative execution
   is unchanged.
+- **Sliding-window attention is not user-visible yet.** Its KV bookkeeping leaf
+  is implemented and CPU-gated, but compute-window plumbing and a supported
+  StarCoder2/Gemma3-class model path are still required; the row remains
+  `GATING`, not supported.
 
 ## Project record
 

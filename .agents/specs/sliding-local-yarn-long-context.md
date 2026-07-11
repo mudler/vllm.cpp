@@ -290,6 +290,16 @@ Claim the leaves, not the two umbrellas:
 | W7 | `ATTN-ROPE-LONGROPE` | Global short/long cache selection, validation and goldens | `phi3_long_rope_scaled_rope.*` and leaf tests only | G1, G3, G6, G9 |
 | W8 | `ATTN-ROPE-DYNAMIC-NTK` | Alpha/factor builders, dispatch/error cases and goldens | two dynamic files and leaf tests only | G1, G3, G6, G9 |
 
+W1 checkpoint (2026-07-11): `KV-SLIDING-WINDOW-SPEC` is implemented with its
+registry dispatch, hybrid-disabled conversion, ported manager/prefix cases and
+deterministic allocation/token-slot properties. CPU G1 and KV G2 pass, including
+focused ASan/UBSan. The row remains `GATING`, not `DONE`: the recovered machine
+no longer has the documented `~/venvs/vllm-oracle` environment, and positive
+attention/model, trace and performance/memory gates remain coupled to W2 and its
+model prerequisites. The exact failed oracle command and remaining handoff are
+recorded in the ledger/state; blocked connector/offload/contiguous-packing/model
+tests are checked in as named skips against their owning rows.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

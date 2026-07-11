@@ -9,6 +9,7 @@
 //
 // HIERARCHY SHAPE: upstream is a frozen-dataclass hierarchy
 //   KVCacheSpec (base) -> AttentionSpec -> FullAttentionSpec
+//                                      -> SlidingWindowSpec
 //                      -> MambaSpec
 // mirrored here with a virtual base class + derived structs. `page_size_bytes`
 // is the abstract per-page byte cost; `AttentionSpec` splits it into
@@ -22,6 +23,8 @@
 //       block_size * num_kv_heads * (head_size + head_size_v) * dtype_size
 //       (identical to the base when head_size_v == head_size, the default; the
 //        split exists so MLA/asymmetric-V layers can differ — deferred here)
+//   SlidingWindowSpec.real_page_size_bytes = the same asymmetric K+V formula;
+//       its window changes allocation lifetime, not bytes per stored token.
 //   MambaSpec.page_size_bytes =
 //       sum_i( prod(shapes[i]) * dtype_size(dtypes[i]) )    (SSM + conv state)
 //   page_size_bytes = page_size_padded if set (>= real), else real.
@@ -35,8 +38,8 @@
 //
 // DEFERRED (marked stubs / omissions; the gate models never exercise these, and
 // later units fill them in without reshaping the base):
-//   - SlidingWindowSpec / MLAAttentionSpec / SlidingWindowMLASpec /
-//     ChunkedLocalAttentionSpec / SinkFullAttentionSpec / RSWASpec /
+//   - MLAAttentionSpec / SlidingWindowMLASpec / ChunkedLocalAttentionSpec /
+//     SinkFullAttentionSpec / RSWASpec /
 //     EncoderOnlyAttentionSpec / CrossAttentionSpec / UniformTypeKVCacheSpecs /
 //     TQFullAttentionSpec / HiddenStateCacheSpec (T1/T2) — omitted. The base
 //     stays extensible (virtual page_size_bytes/kind/storage_block_size).
@@ -68,7 +71,8 @@
 namespace vllm::v1 {
 
 // Upstream KVCacheSpecKind (str Enum). Ported as a plain enum; the T1/T2 kinds
-// are listed for fidelity but only kFullAttention / kMamba are produced here.
+// are listed for fidelity; kFullAttention / kSlidingWindow / kMamba are
+// currently produced here.
 enum class KVCacheSpecKind {
   kFullAttention,
   kMlaAttention,
@@ -172,6 +176,38 @@ struct FullAttentionSpec : AttentionSpec {
   int64_t real_page_size_bytes() const override;
   KVCacheSpecKind kind() const override {
     return KVCacheSpecKind::kFullAttention;
+  }
+};
+
+// Sliding-window paged K+V cache. The compute path still applies the local
+// attention mask; this spec controls the recycling-aware cache allocation and
+// prefix policy. (Upstream SlidingWindowSpec.)
+struct SlidingWindowSpec : AttentionSpec {
+  // head_size_v defaults to head_size (upstream __post_init__).
+  SlidingWindowSpec(int block_size, int num_kv_heads, int head_size,
+                    vt::DType dtype, int sliding_window,
+                    std::optional<int> head_size_v = std::nullopt,
+                    KVQuantMode kv_quant_mode = KVQuantMode::kNone,
+                    std::optional<int64_t> page_size_padded = std::nullopt,
+                    bool indexes_kv_by_block_stride = false)
+      : AttentionSpec(block_size, num_kv_heads, head_size, dtype, kv_quant_mode,
+                      page_size_padded, indexes_kv_by_block_stride),
+        sliding_window(sliding_window),
+        head_size_v(head_size_v.value_or(head_size)) {}
+
+  int sliding_window;
+  int head_size_v;
+
+  int64_t real_page_size_bytes() const override;
+
+  // Per-request startup-admission bound used by both pool sizing and the
+  // runtime full-sequence fit check. The +1 covers a window that starts in the
+  // middle of a block.
+  int max_admission_blocks_per_request(int max_num_batched_tokens,
+                                       int max_model_len) const;
+
+  KVCacheSpecKind kind() const override {
+    return KVCacheSpecKind::kSlidingWindow;
   }
 };
 

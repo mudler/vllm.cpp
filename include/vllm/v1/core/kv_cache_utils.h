@@ -62,13 +62,25 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace vllm::v1 {
+
+struct KVCacheSpec;
+
+// Hybrid-manager-disabled fallback: when full and sliding-window specs are
+// mixed, convert SWA storage to full allocation while preserving the compute
+// window on FullAttentionSpec.sliding_window. Mirrors
+// kv_cache_utils.unify_hybrid_kv_cache_specs for the ported spec set.
+void unify_hybrid_kv_cache_specs(
+    std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>>&
+        kv_cache_specs);
 
 // BlockHash represents the hash of a single KV-cache block used for prefix
 // caching. Upstream: `NewType("BlockHash", bytes)`. Held as raw bytes.

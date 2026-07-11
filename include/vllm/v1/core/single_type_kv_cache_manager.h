@@ -1,8 +1,8 @@
 // Ported from: vllm/v1/core/single_type_kv_cache_manager.py @ e24d1b24
 //
 // Scope (M1.3 Task 2): the per-group KV-cache managers — the `SingleTypeKV
-// CacheManager` abstract base plus the two T0 concrete managers the hybrid gate
-// models need: `FullAttentionManager` (standard paged K+V blocks) and
+// CacheManager` abstract base plus `FullAttentionManager` (standard paged K+V
+// blocks), `SlidingWindowManager` (recycling-aware local K+V blocks), and
 // `MambaManager` (the GDN/mamba single-recurrent-state manager). Each manager
 // owns the per-request block table (`req_to_blocks`) for ONE kv cache group and
 // calls the M1.2 BlockPool to allocate / cache / free physical blocks.
@@ -53,13 +53,12 @@
 //
 // DEFERRED (marked; the gate models never exercise these — later tasks add them
 // without reshaping the base):
-//   - SlidingWindowManager / RSWAManager / ChunkedLocalAttentionManager /
-//     CrossAttentionManager / SinkFullAttentionManager (T1/T2) — omitted. Their
+//   - RSWAManager / ChunkedLocalAttentionManager / CrossAttentionManager /
+//     SinkFullAttentionManager (T1/T2) — omitted. Their
 //     spec types are already deferred in kv_cache_interface.h.
-//   - get_manager_for_kv_cache_spec / register_all_kvcache_specs /
-//     KVCacheSpecRegistry: the spec->manager registry. Task 3's coordinator
-//     constructs FullAttentionManager / MambaManager directly (as upstream's own
-//     tests do), so the registry indirection is not needed yet.
+//   - Out-of-tree platform registration callbacks are not wired to a platform
+//     object yet. The core registry, built-in registration and inherited-spec
+//     lookup are ported in kv_cache_spec_registry.*.
 //   - dcp_world_size / pcp_world_size (decode/prefill context parallelism): the
 //     find_longest_cache_hit params are carried for signature fidelity and
 //     asserted == 1 (mamba) / honored in the block-size scaling (full attn), but
@@ -91,7 +90,9 @@ class SingleTypeKVCacheManager {
  public:
   SingleTypeKVCacheManager(std::shared_ptr<KVCacheSpec> kv_cache_spec,
                            BlockPool& block_pool, bool enable_caching,
-                           int kv_cache_group_id, int scheduler_block_size);
+                           int kv_cache_group_id, int scheduler_block_size,
+                           std::optional<int> max_admission_blocks_per_request =
+                               std::nullopt);
   virtual ~SingleTypeKVCacheManager() = default;
 
   // Non-copyable (holds a BlockPool reference).
@@ -187,6 +188,9 @@ class SingleTypeKVCacheManager {
   std::shared_ptr<KVCacheSpec> kv_cache_spec;
   BlockPool& block_pool;
   bool enable_caching;
+  // Recycling-aware reservation cap. nullopt for managers that retain their
+  // full history (full attention and mamba).
+  std::optional<int> _max_admission_blocks_per_request;
   std::vector<int> new_block_ids;
 
   // request_id -> the blocks allocated for that request (its block table).
@@ -217,6 +221,40 @@ class FullAttentionManager : public SingleTypeKVCacheManager {
   // Count leading blocks whose ref_cnt == #requests (cascade attention).
   int get_num_common_prefix_blocks(
       const std::string& running_request_id) override;
+};
+
+// Sliding-window manager. It retains only the live window's physical blocks,
+// finds reusable cache tails right-to-left, and never participates in cascade
+// attention. (Upstream SlidingWindowManager.)
+class SlidingWindowManager : public SingleTypeKVCacheManager {
+ public:
+  SlidingWindowManager(
+      std::shared_ptr<KVCacheSpec> kv_cache_spec, BlockPool& block_pool,
+      bool enable_caching, int kv_cache_group_id, int scheduler_block_size,
+      std::optional<int> max_admission_blocks_per_request = std::nullopt);
+
+  static int _contiguous_blocks_for_hit(int window_size, int block_size,
+                                        bool use_eagle);
+
+  std::vector<std::vector<KVCacheBlock*>> find_longest_cache_hit(
+      const std::vector<BlockHash>& block_hashes, int max_length,
+      const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
+      const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+      int alignment_tokens, int dcp_world_size = 1,
+      int pcp_world_size = 1) override;
+
+  std::optional<std::vector<bool>> reachable_block_mask(
+      int start_block, int end_block, std::optional<int> alignment_tokens,
+      std::optional<int> retention_interval = std::nullopt,
+      std::optional<int> num_prompt_tokens = std::nullopt) override;
+
+  int get_num_skipped_tokens(int num_computed_tokens) override;
+
+  // Always 0: cascade attention is not supported by sliding-window layers.
+  int get_num_common_prefix_blocks(
+      const std::string& running_request_id) override;
+
+  int sliding_window;
 };
 
 // The GDN/mamba single-recurrent-state manager. (Upstream MambaManager.)
@@ -277,6 +315,12 @@ class MambaManager : public SingleTypeKVCacheManager {
   std::unordered_map<std::string, int> last_state_block_idx;
   std::unordered_set<std::string> _allocated_block_reqs;
 };
+
+// Registry-backed manager construction (upstream get_manager_for_kv_cache_spec).
+std::unique_ptr<SingleTypeKVCacheManager> get_manager_for_kv_cache_spec(
+    const std::shared_ptr<KVCacheSpec>& kv_cache_spec,
+    int max_num_batched_tokens, int max_model_len, BlockPool& block_pool,
+    bool enable_caching, int kv_cache_group_id, int scheduler_block_size);
 
 }  // namespace vllm::v1
 

@@ -20,6 +20,9 @@
 // parent chaining changes the hash, group id differentiates, the partial last
 // block is not hashed, and NONE_HASH is used as the first-block parent.
 //
+// C5 W1 additionally ports test_unify_hybrid_kv_cache_specs from
+// vllm/tests/v1/core/test_kv_cache_utils.py:2420-2487 @ e24d1b24.
+//
 // HASH-FUNCTION FIDELITY: upstream parametrizes these over `sha256` (pickle) and
 // `sha256_cbor` (cbor2 canonical). We port `sha256_cbor` BYTE-FOR-BYTE (see the
 // header) and pin absolute goldens against it; `sha256` (pickle) is out of scope
@@ -38,14 +41,18 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
+#include "vt/dtype.h"
 
 using vllm::v1::BlockHash;
 using vllm::v1::BlockHashWithGroupId;
@@ -57,8 +64,13 @@ using vllm::v1::hash_block_tokens;
 using vllm::v1::hash_request_tokens;
 using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheBlock;
+using vllm::v1::KVCacheSpec;
+using vllm::v1::FullAttentionSpec;
 using vllm::v1::make_block_hash_with_group_id;
+using vllm::v1::MambaSpec;
 using vllm::v1::sha256_cbor;
+using vllm::v1::SlidingWindowSpec;
+using vllm::v1::unify_hybrid_kv_cache_specs;
 
 namespace {
 
@@ -573,4 +585,55 @@ TEST_CASE("get_request_block_hasher matches hash_request_tokens (byte-exact)") {
   CHECK(no_hash.block_hashes.empty());
   no_hash.AppendOutputToken(std::vector<int32_t>{14, 15});
   CHECK(no_hash.block_hashes.empty());
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs converts sliding storage to full") {
+  auto full = std::make_shared<FullAttentionSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64,
+      vt::DType::kF32);
+  auto sliding = std::make_shared<SlidingWindowSpec>(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64,
+      vt::DType::kF32, /*sliding_window=*/1024,
+      /*head_size_v=*/32, vllm::v1::KVQuantMode::kNone,
+      /*page_size_padded=*/32768);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"layer_1", full}, {"layer_2", sliding}};
+
+  unify_hybrid_kv_cache_specs(specs);
+  CHECK(specs["layer_1"] == full);
+  auto converted =
+      std::dynamic_pointer_cast<FullAttentionSpec>(specs["layer_2"]);
+  REQUIRE(converted != nullptr);
+  CHECK(converted->block_size == 16);
+  CHECK(converted->num_kv_heads == 2);
+  CHECK(converted->head_size == 64);
+  CHECK(converted->head_size_v == 32);
+  CHECK(converted->page_size_padded == std::optional<int64_t>{32768});
+  CHECK(converted->sliding_window == std::optional<int>{1024});
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs leaves uniform sliding specs unchanged") {
+  auto sliding_a = std::make_shared<SlidingWindowSpec>(
+      16, 2, 64, vt::DType::kF32, /*sliding_window=*/1024);
+  auto sliding_b = std::make_shared<SlidingWindowSpec>(
+      16, 4, 32, vt::DType::kF32, /*sliding_window=*/1024);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"layer_1", sliding_a}, {"layer_2", sliding_b}};
+  unify_hybrid_kv_cache_specs(specs);
+  CHECK(specs["layer_1"] == sliding_a);
+  CHECK(specs["layer_2"] == sliding_b);
+}
+
+TEST_CASE("unify_hybrid_kv_cache_specs rejects an unconvertible mixed policy") {
+  auto sliding_a = std::make_shared<SlidingWindowSpec>(
+      16, 2, 64, vt::DType::kF32, /*sliding_window=*/1024);
+  auto sliding_b = std::make_shared<SlidingWindowSpec>(
+      16, 2, 64, vt::DType::kF32, /*sliding_window=*/256);
+  std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>> specs{
+      {"layer_1", sliding_a}, {"layer_2", sliding_b}};
+  CHECK_THROWS_WITH_AS(
+      unify_hybrid_kv_cache_specs(specs),
+      "Hybrid KV cache manager is disabled but failed to convert the KV cache "
+      "specs to one unified type.",
+      std::invalid_argument);
 }

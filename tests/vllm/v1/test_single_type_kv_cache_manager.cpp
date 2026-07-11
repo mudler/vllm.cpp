@@ -1,16 +1,16 @@
-// Tests for the per-group KV-cache managers (M1.3 Task 2) — FullAttentionManager
-// (standard paged K+V) and MambaManager (the GDN single-state manager).
+// Tests for the per-group KV-cache managers — FullAttentionManager (standard
+// paged K+V), SlidingWindowManager (recycling-aware local K+V), and
+// MambaManager (the GDN single-state manager).
 //
 // Ported from vllm/tests/v1/core/test_single_type_kv_cache_manager.py @ e24d1b24:
-//   - test_get_num_blocks_to_allocate            -> "get_num_blocks_to_allocate
-//       accounting" (adapted to FullAttentionManager: SlidingWindow is DEFERRED,
-//       but full attention shares the base accounting and its
-//       get_num_skipped_tokens is 0, so the 20 / 15 oracles carry over verbatim).
+//   - test_sliding_window_possible_cached_prefix
+//   - test_sliding_window_remove_skipped_blocks
+//   - test_get_num_blocks_to_allocate
 //   - test_evictable_cached_blocks_not_double_allocated -> "evictable cached
-//       blocks are not double allocated" (same adaptation; base-class path).
-// The upstream file only exercises the DEFERRED SWA/Chunked/RSWA managers for
-// find_longest_cache_hit / remove_skipped_blocks; the FullAttention and Mamba
-// find_longest_cache_hit / lifecycle behaviors below follow the upstream
+//       blocks are not double allocated"
+//   - test_predictor_matches_allocator_blocks_calculation_with_admission_cap
+// The FullAttention and Mamba find_longest_cache_hit / lifecycle behaviors
+// below follow the upstream
 // mock-the-block-pool pattern (block_pool.cached_block_hash_to_block insertion)
 // applied to the T0 managers, asserting the upstream method semantics.
 //
@@ -19,7 +19,9 @@
 
 #include <deque>
 #include <memory>
+#include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vllm/sampling_params.h"
@@ -43,6 +45,8 @@ using vllm::v1::MambaManager;
 using vllm::v1::MambaSpec;
 using vllm::v1::Request;
 using vllm::v1::sha256_cbor;
+using vllm::v1::SlidingWindowManager;
+using vllm::v1::SlidingWindowSpec;
 using vt::DType;
 
 namespace {
@@ -60,6 +64,13 @@ std::shared_ptr<MambaSpec> MakeMambaSpec(int block_size = 2,
       block_size, std::vector<std::vector<int64_t>>{{2, 4}},
       std::vector<DType>{DType::kF32}, /*page_size_padded=*/std::nullopt, mode,
       num_speculative_blocks);
+}
+
+std::shared_ptr<SlidingWindowSpec> MakeSlidingSpec(
+    int block_size = 2, int sliding_window = 4) {
+  return std::make_shared<SlidingWindowSpec>(
+      block_size, /*num_kv_heads=*/1, /*head_size=*/1, DType::kF32,
+      sliding_window);
 }
 
 // Insert a cached block for `bh` in group 0 (mirrors upstream's direct
@@ -251,6 +262,299 @@ TEST_CASE("FullAttentionManager: get_num_common_prefix_blocks") {
   // ref_cnt 1 != 2.
   mgr.allocate_new_blocks("r2", 4, 4);
   CHECK(mgr.get_num_common_prefix_blocks("r1") == 0);
+}
+
+// ---------------------------------------------------------------------------
+// SlidingWindowManager
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SlidingWindowManager: possible cached prefix searches right-to-left") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeSlidingSpec(/*block_size=*/2, /*sliding_window=*/4);
+  SlidingWindowManager mgr(spec, pool, true, 0, 2,
+                           /*max_admission_blocks_per_request=*/1000000000);
+
+  auto run_case = [&](const std::vector<bool>& cached, int expected_length) {
+    pool.cached_block_hash_to_block.clear();
+    std::vector<BlockHash> hashes;
+    for (size_t i = 0; i < cached.size(); ++i) {
+      hashes.push_back("h" + std::to_string(i));
+      if (cached[i]) {
+        MockCache(pool, hashes.back(), &pool.blocks[i + 10]);
+      }
+    }
+
+    auto computed = mgr.find_longest_cache_hit(
+        hashes, static_cast<int>(hashes.size()) * 2, {0}, pool, *spec,
+        /*drop_eagle_block=*/false, /*alignment_tokens=*/2)[0];
+    REQUIRE(computed.size() == static_cast<size_t>(expected_length));
+    for (int i = 0; i < expected_length - 2; ++i) {
+      CHECK(computed[static_cast<size_t>(i)] == pool.null_block);
+    }
+    for (int offset = 0; offset < 2 && offset < expected_length; ++offset) {
+      const int index = expected_length - offset - 1;
+      CHECK(computed[static_cast<size_t>(index)]->block_id == index + 10);
+    }
+  };
+
+  run_case(std::vector<bool>(10, false), 0);
+  run_case({true}, 1);
+  run_case({true, false}, 1);
+  run_case({true, true}, 2);
+  run_case({true, true, false}, 2);
+  run_case({true, true, true}, 3);
+  run_case({true, true, true, false}, 3);
+  run_case({true, true, false, true, false, false, true, true, false, true,
+            true, true},
+           12);
+  run_case({true, true, false, true, false, false, true, true, false, false,
+            false},
+           8);
+  run_case({true, true, false, true, false, false, true, true, false, false,
+            false, true},
+           8);
+}
+
+TEST_CASE("SlidingWindowManager: alignment and EAGLE require the lookahead block") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/8);
+  auto spec = MakeSlidingSpec(/*block_size=*/8, /*sliding_window=*/8);
+  SlidingWindowManager mgr(spec, pool, true, 0,
+                           /*scheduler_block_size=*/32,
+                           /*max_admission_blocks_per_request=*/100);
+  std::vector<BlockHash> hashes = {"h0", "h1", "h2", "h3", "h4"};
+
+  SUBCASE("non-EAGLE hit lands on the aligned boundary") {
+    MockCache(pool, "h3", &pool.blocks[13]);
+    auto hit = mgr.find_longest_cache_hit(hashes, 40, {0}, pool, *spec,
+                                          /*drop_eagle_block=*/false,
+                                          /*alignment_tokens=*/32)[0];
+    REQUIRE(hit.size() == 4);
+    CHECK(hit[3] == &pool.blocks[13]);
+  }
+
+  SUBCASE("EAGLE caches one block past the boundary and drops it") {
+    MockCache(pool, "h3", &pool.blocks[13]);
+    MockCache(pool, "h4", &pool.blocks[14]);
+    auto hit = mgr.find_longest_cache_hit(hashes, 40, {0}, pool, *spec,
+                                          /*drop_eagle_block=*/true,
+                                          /*alignment_tokens=*/32)[0];
+    REQUIRE(hit.size() == 4);
+    CHECK(hit[3] == &pool.blocks[13]);
+  }
+
+  SUBCASE("EAGLE rejects a tail without its post-boundary lookahead") {
+    MockCache(pool, "h3", &pool.blocks[13]);
+    auto hit = mgr.find_longest_cache_hit(hashes, 40, {0}, pool, *spec,
+                                          /*drop_eagle_block=*/true,
+                                          /*alignment_tokens=*/32)[0];
+    CHECK(hit.empty());
+  }
+}
+
+TEST_CASE("SlidingWindowManager: reachable mask mirrors dense and sparse tails") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/16);
+  auto spec = MakeSlidingSpec(/*block_size=*/16, /*sliding_window=*/16);
+  SlidingWindowManager mgr(spec, pool, true, 0, 16, 100);
+
+  // Dense default: every 16-token boundary is reachable.
+  CHECK_FALSE(mgr.reachable_block_mask(0, 16, 16).has_value());
+
+  // retention=64: segment tails 3/7/11/15 plus the exact-prompt replay tail 14.
+  auto sparse = mgr.reachable_block_mask(
+      0, 16, 16, /*retention_interval=*/64,
+      /*num_prompt_tokens=*/256);
+  REQUIRE(sparse.has_value());
+  std::vector<int> set_indices;
+  for (int i = 0; i < 16; ++i) {
+    if ((*sparse)[static_cast<size_t>(i)]) set_indices.push_back(i);
+  }
+  CHECK(set_indices == std::vector<int>{3, 7, 11, 14, 15});
+
+  // retention=0 keeps only the latest replay tail.
+  auto latest_only = mgr.reachable_block_mask(0, 16, 16, 0, 256);
+  REQUIRE(latest_only.has_value());
+  set_indices.clear();
+  for (int i = 0; i < 16; ++i) {
+    if ((*latest_only)[static_cast<size_t>(i)]) set_indices.push_back(i);
+  }
+  CHECK(set_indices == std::vector<int>{14});
+
+  // EAGLE shifts each tail across the boundary and requires two contiguous
+  // blocks for a one-block window (tail + lookahead).
+  auto eagle_spec = MakeSlidingSpec(/*block_size=*/8, /*sliding_window=*/8);
+  SlidingWindowManager eagle(eagle_spec, pool, true, 0, 32, 100);
+  eagle.use_eagle = true;
+  auto eagle_mask = eagle.reachable_block_mask(0, 9, 32);
+  REQUIRE(eagle_mask.has_value());
+  set_indices.clear();
+  for (int i = 0; i < 9; ++i) {
+    if ((*eagle_mask)[static_cast<size_t>(i)]) set_indices.push_back(i);
+  }
+  CHECK(set_indices == std::vector<int>{3, 4, 7, 8});
+}
+
+TEST_CASE("SlidingWindowManager: skipped blocks recycle whole pages only") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeSlidingSpec(/*block_size=*/2, /*sliding_window=*/4);
+  SlidingWindowManager mgr(spec, pool, true, 0, 2, 100);
+  auto allocated = mgr.allocate_new_blocks("test", /*num_tokens=*/22,
+                                            /*num_tokens_main_model=*/22);
+  REQUIRE(allocated.size() == 11);
+  std::vector<int> original_ids;
+  for (KVCacheBlock* block : allocated) original_ids.push_back(block->block_id);
+
+  auto check_prefix = [&](int null_count) {
+    const auto& blocks = mgr.req_to_blocks["test"];
+    for (int i = 0; i < 11; ++i) {
+      if (i < null_count) {
+        CHECK(blocks[static_cast<size_t>(i)] == pool.null_block);
+      } else {
+        CHECK(blocks[static_cast<size_t>(i)]->block_id ==
+              original_ids[static_cast<size_t>(i)]);
+      }
+    }
+  };
+
+  mgr.remove_skipped_blocks("test", 0);
+  check_prefix(0);
+  mgr.remove_skipped_blocks("test", 4);
+  check_prefix(0);  // one skipped token is not a whole page.
+  mgr.remove_skipped_blocks("test", 5);
+  check_prefix(1);
+  mgr.remove_skipped_blocks("test", 6);
+  check_prefix(1);
+  mgr.remove_skipped_blocks("test", 7);
+  check_prefix(2);
+  mgr.remove_skipped_blocks("test", 11);
+  check_prefix(4);
+
+  CHECK(mgr.get_num_skipped_tokens(0) == 0);
+  CHECK(mgr.get_num_skipped_tokens(4) == 1);
+  CHECK(mgr.get_num_skipped_tokens(7) == 4);
+  CHECK(mgr.get_num_common_prefix_blocks("test") == 0);
+}
+
+TEST_CASE("SlidingWindowManager: allocation and admission-cap accounting") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeSlidingSpec(/*block_size=*/2, /*sliding_window=*/4);
+  SlidingWindowManager mgr(spec, pool, true, 0, 2,
+                           /*max_admission_blocks_per_request=*/4);
+  BlockStore store;
+  std::vector<KVCacheBlock*> cached_1;
+  for (int i = 0; i < 10; ++i) cached_1.push_back(store.make(i + 1));
+  std::vector<KVCacheBlock*> cached_2(5, pool.null_block);
+  for (int i = 0; i < 5; ++i) cached_2.push_back(store.make(i + 20));
+
+  CHECK(mgr.get_num_blocks_to_allocate("1", 40, cached_1, 0, 40) == 20);
+  CHECK(mgr.get_num_blocks_to_allocate("2", 40, cached_2, 0, 40) == 15);
+
+  // The startup full-sequence admission check is capped, while the per-step
+  // predictor remains uncapped to match allocate_new_blocks.
+  CHECK(mgr.get_num_blocks_to_allocate("admit", 40, {}, 0, 40,
+                                       /*apply_admission_cap=*/true) == 4);
+  CHECK(mgr.get_num_blocks_to_allocate("step", 40, {}, 0, 40,
+                                       /*apply_admission_cap=*/false) == 20);
+}
+
+TEST_CASE("SlidingWindowManager: randomized predictor and recycling properties") {
+  std::mt19937 rng(0x5a17u);
+  for (int trial = 0; trial < 40; ++trial) {
+    const int block_size = trial % 2 == 0 ? 2 : 4;
+    const int sliding_window = block_size * (2 + trial % 5);
+    const int max_batched_tokens =
+        block_size * (1 + trial % 4) - trial % block_size;
+    const int max_model_len =
+        block_size * (16 + trial % 17) + trial % block_size;
+    auto spec = MakeSlidingSpec(block_size, sliding_window);
+    const int cap = spec->max_admission_blocks_per_request(
+        max_batched_tokens, max_model_len);
+    BlockPool pool(/*num_gpu_blocks=*/256, /*enable_caching=*/false,
+                   /*hash_block_size=*/block_size);
+    SlidingWindowManager mgr(spec, pool, false, 0, block_size, cap);
+    const std::string request_id = "r";
+    std::unordered_map<int, std::vector<int>> block_contents;
+
+    CHECK(mgr.get_num_blocks_to_allocate(
+              request_id, max_model_len, {}, 0, max_model_len,
+              /*apply_admission_cap=*/true) <= cap);
+
+    int computed = 0;
+    while (computed < max_model_len) {
+      mgr.remove_skipped_blocks(request_id, computed);
+      const int chunk =
+          1 + static_cast<int>(rng() % max_batched_tokens);
+      const int num_tokens = std::min(computed + chunk, max_model_len);
+      const int predicted = mgr.get_num_blocks_to_allocate(
+          request_id, num_tokens, {}, computed, num_tokens);
+      auto allocated =
+          mgr.allocate_new_blocks(request_id, num_tokens, num_tokens);
+      CHECK(predicted == static_cast<int>(allocated.size()));
+      computed = num_tokens;
+
+      int held_blocks = 0;
+      const auto& table = mgr.req_to_blocks[request_id];
+      for (size_t logical_block = 0; logical_block < table.size();
+           ++logical_block) {
+        KVCacheBlock* block = table[logical_block];
+        if (block == pool.null_block) continue;
+        ++held_blocks;
+        CHECK(block->ref_cnt > 0);
+        CHECK(block->prev_free_block == nullptr);
+        CHECK(block->next_free_block == nullptr);
+
+        // Model the KV writes for this logical page. A recycled physical block
+        // overwrites its old contents, just as the worker kernels do.
+        auto& contents = block_contents[block->block_id];
+        contents.assign(static_cast<size_t>(block_size), -1);
+        for (int offset = 0; offset < block_size; ++offset) {
+          const int token =
+              static_cast<int>(logical_block) * block_size + offset;
+          if (token < computed) {
+            contents[static_cast<size_t>(offset)] = token;
+          }
+        }
+      }
+      CHECK(held_blocks <= cap);
+
+      // Compare every token visible to the next attention step with the
+      // full-allocation oracle. This checks that recycling changes storage,
+      // never the logical token suffix presented to attention.
+      const int visible_start =
+          std::max(0, computed - sliding_window + 1);
+      for (int token = visible_start; token < computed; ++token) {
+        const size_t logical_block =
+            static_cast<size_t>(token / block_size);
+        REQUIRE(logical_block < table.size());
+        KVCacheBlock* block = table[logical_block];
+        REQUIRE(block != pool.null_block);
+        REQUIRE(block_contents.count(block->block_id) == 1);
+        CHECK(block_contents[block->block_id]
+                            [static_cast<size_t>(token % block_size)] == token);
+      }
+    }
+
+    // Free/preempt the request, then prove those physical pages can be
+    // reallocated cleanly to a fresh request without a live page remaining in
+    // the free queue.
+    mgr.free(request_id);
+    CHECK(mgr.req_to_blocks.count(request_id) == 0);
+    CHECK(pool.get_num_free_blocks() == 255);
+    auto fresh = mgr.allocate_new_blocks("fresh", max_batched_tokens,
+                                         max_batched_tokens);
+    CHECK_FALSE(fresh.empty());
+    for (KVCacheBlock* block : fresh) {
+      CHECK(block->ref_cnt > 0);
+      CHECK(block->prev_free_block == nullptr);
+      CHECK(block->next_free_block == nullptr);
+    }
+    mgr.free("fresh");
+    CHECK(pool.get_num_free_blocks() == 255);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,4 +798,26 @@ TEST_CASE(
 
   mgr.new_step_starts();
   CHECK(mgr.cached_blocks_this_step.empty());
+}
+
+TEST_CASE("SWA contiguous-KV packing cases are tracked by KV-PREFIX-CACHE" *
+          doctest::skip(true) *
+          doctest::description(
+              "tests/v1/core/test_contiguous_kv_packing.py requires the "
+              "KV-PREFIX-CACHE multi-block-size packing path")) {
+  MESSAGE("SKIP KV-PREFIX-CACHE: contiguous KV packing is not ported");
+}
+
+TEST_CASE("SWA KV offload cases are tracked by KV-OFFLOAD" *
+          doctest::skip(true) *
+          doctest::description(
+              "tests/v1/kv_offload SWA cases require the KV-OFFLOAD row")) {
+  MESSAGE("SKIP KV-OFFLOAD: CPU-tiered SWA cache is not ported");
+}
+
+TEST_CASE("SWA connector cases are tracked by KV-CONNECTORS" *
+          doctest::skip(true) *
+          doctest::description(
+              "tests/v1/kv_connector SWA cases require KV-CONNECTORS")) {
+  MESSAGE("SKIP KV-CONNECTORS: external/disaggregated SWA cache is not ported");
 }

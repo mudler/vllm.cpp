@@ -1,10 +1,11 @@
 // Ported from: vllm/v1/kv_cache_interface.py @ e24d1b24
 //
-// The page_size_bytes / real_page_size_bytes math for the T0 specs
-// (FullAttentionSpec, MambaSpec). See kv_cache_interface.h for the formulas and
-// the deferred-spec notes.
+// The page_size_bytes / real_page_size_bytes math for FullAttentionSpec,
+// SlidingWindowSpec and MambaSpec. See kv_cache_interface.h for the formulas
+// and deferred-spec notes.
 #include "vllm/v1/kv_cache_interface.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -54,6 +55,25 @@ int64_t FullAttentionSpec::real_page_size_bytes() const {
       static_cast<int64_t>(head_size) + static_cast<int64_t>(head_size_v);
   return static_cast<int64_t>(block_size) * num_kv_heads * last_dim *
          static_cast<int64_t>(vt::SizeOf(dtype));
+}
+
+int64_t SlidingWindowSpec::real_page_size_bytes() const {
+  if (needs_deferred_quant_math(kv_quant_mode)) {
+    throw std::runtime_error(
+        "SlidingWindowSpec: kv_quant_mode != NONE page-size math is deferred "
+        "(T1)");
+  }
+  const int64_t last_dim =
+      static_cast<int64_t>(head_size) + static_cast<int64_t>(head_size_v);
+  return static_cast<int64_t>(block_size) * num_kv_heads * last_dim *
+         static_cast<int64_t>(vt::SizeOf(dtype));
+}
+
+int SlidingWindowSpec::max_admission_blocks_per_request(
+    int max_num_batched_tokens, int max_model_len) const {
+  const int num_tokens = std::min(
+      sliding_window - 1 + max_num_batched_tokens, max_model_len);
+  return (num_tokens + block_size - 1) / block_size + 1;
 }
 
 int64_t MambaSpec::page_size_bytes() const {

@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <stdexcept>
 #include <utility>
 
+#include "vllm/v1/kv_cache_spec_registry.h"
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
@@ -24,12 +26,14 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 SingleTypeKVCacheManager::SingleTypeKVCacheManager(
     std::shared_ptr<KVCacheSpec> kv_cache_spec, BlockPool& block_pool,
-    bool enable_caching, int kv_cache_group_id, int scheduler_block_size)
+    bool enable_caching, int kv_cache_group_id, int scheduler_block_size,
+    std::optional<int> max_admission_blocks_per_request)
     : scheduler_block_size(scheduler_block_size),
       block_size(kv_cache_spec->block_size),
       kv_cache_spec(std::move(kv_cache_spec)),
       block_pool(block_pool),
       enable_caching(enable_caching),
+      _max_admission_blocks_per_request(max_admission_blocks_per_request),
       kv_cache_group_id(kv_cache_group_id),
       _null_block(block_pool.null_block) {}
 
@@ -48,10 +52,14 @@ int SingleTypeKVCacheManager::get_num_blocks_to_allocate(
     const std::string& request_id, int num_tokens,
     const std::vector<KVCacheBlock*>& new_computed_blocks,
     int total_computed_tokens, int /*num_tokens_main_model*/,
-    bool /*apply_admission_cap*/) {
+    bool apply_admission_cap) {
   int num_required_blocks = cdiv(num_tokens, block_size);
-  // apply_admission_cap only matters for recycling-aware specs (SWA / chunked
-  // local), which are DEFERRED; _max_admission_blocks_per_request is None here.
+  if (apply_admission_cap &&
+      _max_admission_blocks_per_request.has_value()) {
+    num_required_blocks =
+        std::min(num_required_blocks,
+                 *_max_admission_blocks_per_request);
+  }
   auto it = req_to_blocks.find(request_id);
   int num_req_blocks =
       it != req_to_blocks.end() ? static_cast<int>(it->second.size()) : 0;
@@ -336,6 +344,191 @@ int FullAttentionManager::get_num_common_prefix_blocks(
 }
 
 // ---------------------------------------------------------------------------
+// SlidingWindowManager
+// ---------------------------------------------------------------------------
+
+SlidingWindowManager::SlidingWindowManager(
+    std::shared_ptr<KVCacheSpec> kv_cache_spec, BlockPool& block_pool,
+    bool enable_caching, int kv_cache_group_id, int scheduler_block_size,
+    std::optional<int> max_admission_blocks_per_request)
+    : SingleTypeKVCacheManager(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size, max_admission_blocks_per_request) {
+  const auto* sliding =
+      dynamic_cast<const SlidingWindowSpec*>(kv_cache_spec.get());
+  if (sliding == nullptr) {
+    throw std::invalid_argument(
+        "SlidingWindowManager requires a SlidingWindowSpec");
+  }
+  sliding_window = sliding->sliding_window;
+}
+
+int SlidingWindowManager::_contiguous_blocks_for_hit(int window_size,
+                                                     int block_size,
+                                                     bool use_eagle) {
+  int blocks = cdiv(window_size - 1, block_size);
+  if (use_eagle) {
+    ++blocks;
+  }
+  return blocks;
+}
+
+std::vector<std::vector<KVCacheBlock*>>
+SlidingWindowManager::find_longest_cache_hit(
+    const std::vector<BlockHash>& block_hashes, int max_length,
+    const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
+    const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
+    int alignment_tokens, int dcp_world_size, int pcp_world_size) {
+  const auto* sliding = dynamic_cast<const SlidingWindowSpec*>(&kv_cache_spec);
+  if (sliding == nullptr) {
+    throw std::invalid_argument(
+        "SlidingWindowManager can only be used for sliding window groups");
+  }
+  if (dcp_world_size != 1) {
+    throw std::invalid_argument(
+        "DCP not support sliding window attn now.");
+  }
+  if (pcp_world_size != 1) {
+    throw std::invalid_argument(
+        "PCP not support sliding window attn now.");
+  }
+  if (kv_cache_group_ids.empty() || alignment_tokens <= 0) {
+    throw std::invalid_argument(
+        "SlidingWindowManager requires a group and positive alignment");
+  }
+
+  const int contiguous_blocks = _contiguous_blocks_for_hit(
+      sliding->sliding_window, sliding->block_size, drop_eagle_block);
+  const int block_size = sliding->block_size;
+  const int max_num_blocks = std::min(
+      max_length / block_size, static_cast<int>(block_hashes.size()));
+  std::vector<std::vector<KVCacheBlock*>> computed_blocks(
+      kv_cache_group_ids.size(),
+      std::vector<KVCacheBlock*>(static_cast<size_t>(max_num_blocks),
+                                 block_pool.null_block));
+
+  int num_contiguous_blocks = 0;
+  bool match_found = false;
+  for (int i = max_num_blocks - 1; i >= 0; --i) {
+    auto cached_block = block_pool.get_cached_block(
+        block_hashes[static_cast<size_t>(i)], kv_cache_group_ids);
+    if (cached_block.has_value()) {
+      if (num_contiguous_blocks == 0 && block_size != alignment_tokens) {
+        const int post_pop_blocks = drop_eagle_block ? i : i + 1;
+        if (post_pop_blocks * block_size % alignment_tokens != 0) {
+          continue;
+        }
+      }
+      for (size_t group = 0; group < computed_blocks.size(); ++group) {
+        computed_blocks[group][static_cast<size_t>(i)] =
+            (*cached_block)[group];
+      }
+      ++num_contiguous_blocks;
+      if (num_contiguous_blocks >= contiguous_blocks) {
+        for (auto& computed : computed_blocks) {
+          computed.resize(static_cast<size_t>(i + num_contiguous_blocks));
+        }
+        match_found = true;
+        break;
+      }
+    } else {
+      num_contiguous_blocks = 0;
+    }
+  }
+
+  if (!match_found) {
+    for (auto& computed : computed_blocks) {
+      computed.resize(static_cast<size_t>(num_contiguous_blocks));
+    }
+    while (block_size != alignment_tokens &&
+           static_cast<int>(computed_blocks.front().size()) * block_size %
+                   alignment_tokens !=
+               0) {
+      for (auto& computed : computed_blocks) {
+        computed.pop_back();
+      }
+    }
+  }
+
+  if (drop_eagle_block && !computed_blocks.front().empty()) {
+    for (auto& computed : computed_blocks) {
+      computed.pop_back();
+    }
+    while (block_size != alignment_tokens &&
+           static_cast<int>(computed_blocks.front().size()) * block_size %
+                   alignment_tokens !=
+               0) {
+      for (auto& computed : computed_blocks) {
+        computed.pop_back();
+      }
+    }
+  }
+  return computed_blocks;
+}
+
+std::optional<std::vector<bool>>
+SlidingWindowManager::reachable_block_mask(
+    int start_block, int end_block, std::optional<int> alignment_tokens,
+    std::optional<int> retention_interval,
+    std::optional<int> num_prompt_tokens) {
+  const auto* sliding =
+      dynamic_cast<const SlidingWindowSpec*>(kv_cache_spec.get());
+  assert(sliding != nullptr);
+  if (!alignment_tokens.has_value()) {
+    return std::nullopt;
+  }
+  assert(*alignment_tokens % sliding->block_size == 0);
+
+  const int block_size = sliding->block_size;
+  const int need = _contiguous_blocks_for_hit(
+      sliding->sliding_window, block_size, use_eagle);
+  const int shift = use_eagle ? 1 : 0;
+  std::vector<bool> mask(static_cast<size_t>(end_block - start_block), false);
+
+  std::optional<int> segment_tokens;
+  if (!retention_interval.has_value()) {
+    segment_tokens = *alignment_tokens;
+  } else if (*retention_interval != 0) {
+    segment_tokens = *retention_interval;
+  }
+
+  if (segment_tokens.has_value()) {
+    const int per_segment = *segment_tokens / block_size;
+    if (need >= per_segment) {
+      return std::nullopt;
+    }
+    for (int i = start_block; i < end_block; ++i) {
+      if (i >= shift &&
+          (i - shift) % per_segment >= per_segment - need) {
+        mask[static_cast<size_t>(i - start_block)] = true;
+      }
+    }
+  }
+
+  if (retention_interval.has_value() && num_prompt_tokens.has_value() &&
+      *num_prompt_tokens > 0) {
+    const int latest =
+        (*num_prompt_tokens - 1) / *alignment_tokens * *alignment_tokens;
+    const int prompt_end_block = latest / block_size + shift;
+    for (int i = std::max(start_block, prompt_end_block - need);
+         i < std::min(end_block, prompt_end_block); ++i) {
+      mask[static_cast<size_t>(i - start_block)] = true;
+    }
+  }
+  return mask;
+}
+
+int SlidingWindowManager::get_num_skipped_tokens(
+    int num_computed_tokens) {
+  return std::max(0, num_computed_tokens - sliding_window + 1);
+}
+
+int SlidingWindowManager::get_num_common_prefix_blocks(
+    const std::string& /*running_request_id*/) {
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // MambaManager
 // ---------------------------------------------------------------------------
 
@@ -608,5 +801,44 @@ void MambaManager::cache_blocks(const Request& request, int num_tokens,
 }
 
 void MambaManager::new_step_starts() { cached_blocks_this_step.clear(); }
+
+std::unique_ptr<SingleTypeKVCacheManager> get_manager_for_kv_cache_spec(
+    const std::shared_ptr<KVCacheSpec>& kv_cache_spec,
+    int max_num_batched_tokens, int max_model_len, BlockPool& block_pool,
+    bool enable_caching, int kv_cache_group_id, int scheduler_block_size) {
+  if (kv_cache_spec == nullptr) {
+    throw std::invalid_argument("KV cache spec must not be null");
+  }
+  auto manager_kind =
+      KVCacheSpecRegistry::get_manager_kind(*kv_cache_spec);
+  if (!manager_kind.has_value()) {
+    throw std::invalid_argument("No manager registered for KVCacheSpec");
+  }
+
+  switch (*manager_kind) {
+    case KVCacheManagerKind::kFullAttention:
+      return std::make_unique<FullAttentionManager>(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size);
+    case KVCacheManagerKind::kSlidingWindow: {
+      const auto* sliding =
+          dynamic_cast<const SlidingWindowSpec*>(kv_cache_spec.get());
+      if (sliding == nullptr) {
+        throw std::invalid_argument(
+            "Sliding-window manager registration requires SlidingWindowSpec");
+      }
+      const int cap = sliding->max_admission_blocks_per_request(
+          max_num_batched_tokens, max_model_len);
+      return std::make_unique<SlidingWindowManager>(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size, cap);
+    }
+    case KVCacheManagerKind::kMamba:
+      return std::make_unique<MambaManager>(
+          kv_cache_spec, block_pool, enable_caching, kv_cache_group_id,
+          scheduler_block_size);
+  }
+  throw std::invalid_argument("Unsupported KV cache manager registration");
+}
 
 }  // namespace vllm::v1

@@ -12,9 +12,65 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/kv_cache_spec_registry.h"
 #include "vllm/v1/request.h"
 
 namespace vllm::v1 {
+
+void unify_hybrid_kv_cache_specs(
+    std::unordered_map<std::string, std::shared_ptr<KVCacheSpec>>&
+        kv_cache_specs) {
+  std::vector<const KVCacheSpec*> specs;
+  specs.reserve(kv_cache_specs.size());
+  for (const auto& [layer_name, spec] : kv_cache_specs) {
+    (void)layer_name;
+    specs.push_back(spec.get());
+  }
+  if (are_uniform_kv_cache_specs(specs)) {
+    return;
+  }
+
+  bool has_full_attention = false;
+  bool has_sliding_window = false;
+  for (const auto& [layer_name, spec] : kv_cache_specs) {
+    (void)layer_name;
+    has_full_attention =
+        has_full_attention ||
+        dynamic_cast<const FullAttentionSpec*>(spec.get()) != nullptr;
+    has_sliding_window =
+        has_sliding_window ||
+        dynamic_cast<const SlidingWindowSpec*>(spec.get()) != nullptr;
+  }
+
+  if (has_full_attention && has_sliding_window) {
+    for (auto& [layer_name, spec] : kv_cache_specs) {
+      (void)layer_name;
+      const auto* sliding =
+          dynamic_cast<const SlidingWindowSpec*>(spec.get());
+      if (sliding == nullptr) {
+        continue;
+      }
+      spec = std::make_shared<FullAttentionSpec>(
+          sliding->block_size, sliding->num_kv_heads, sliding->head_size,
+          sliding->dtype, sliding->head_size_v, sliding->kv_quant_mode,
+          sliding->page_size_padded,
+          /*indexes_kv_by_block_stride=*/false, sliding->sliding_window);
+    }
+  }
+
+  specs.clear();
+  for (const auto& [layer_name, spec] : kv_cache_specs) {
+    (void)layer_name;
+    specs.push_back(spec.get());
+  }
+  if (!are_uniform_kv_cache_specs(specs)) {
+    throw std::invalid_argument(
+        "Hybrid KV cache manager is disabled but failed to convert the KV "
+        "cache specs to one unified type.");
+  }
+}
+
 namespace {
 
 // --- SHA-256 -----------------------------------------------------------------

@@ -13,29 +13,8 @@ namespace vllm::v1 {
 
 namespace {
 
-// Build the SingleTypeKVCacheManager for one group's spec (upstream
-// get_manager_for_kv_cache_spec, specialized to the T0 spec set).
-std::unique_ptr<SingleTypeKVCacheManager> make_manager_for_spec(
-    const std::shared_ptr<KVCacheSpec>& spec, BlockPool& block_pool,
-    bool enable_caching, int kv_cache_group_id, int scheduler_block_size) {
-  switch (spec->kind()) {
-    case KVCacheSpecKind::kFullAttention:
-      return std::make_unique<FullAttentionManager>(
-          spec, block_pool, enable_caching, kv_cache_group_id,
-          scheduler_block_size);
-    case KVCacheSpecKind::kMamba:
-      return std::make_unique<MambaManager>(spec, block_pool, enable_caching,
-                                            kv_cache_group_id,
-                                            scheduler_block_size);
-    default:
-      throw std::runtime_error(
-          "KVCacheCoordinator: unsupported (deferred) KV cache spec kind; only "
-          "FullAttentionSpec and MambaSpec are ported (M1.3 Task 3).");
-  }
-}
-
 // Value equality of two specs (upstream frozen-dataclass __eq__), restricted to
-// the T0 spec kinds. Used to batch groups that share a spec.
+// the ported spec kinds. Used to batch groups that share a spec.
 bool spec_equal(const KVCacheSpec& a, const KVCacheSpec& b) {
   if (a.kind() != b.kind() || a.block_size != b.block_size) {
     return false;
@@ -46,13 +25,30 @@ bool spec_equal(const KVCacheSpec& a, const KVCacheSpec& b) {
       const auto& fb = static_cast<const FullAttentionSpec&>(b);
       return fa.num_kv_heads == fb.num_kv_heads &&
              fa.head_size == fb.head_size && fa.head_size_v == fb.head_size_v &&
-             fa.dtype == fb.dtype && fa.sliding_window == fb.sliding_window &&
-             fa.attention_chunk_size == fb.attention_chunk_size;
+             fa.dtype == fb.dtype && fa.kv_quant_mode == fb.kv_quant_mode &&
+             fa.page_size_padded == fb.page_size_padded &&
+             fa.indexes_kv_by_block_stride ==
+                 fb.indexes_kv_by_block_stride &&
+             fa.sliding_window == fb.sliding_window &&
+             fa.attention_chunk_size == fb.attention_chunk_size &&
+             fa.non_causal == fb.non_causal;
+    }
+    case KVCacheSpecKind::kSlidingWindow: {
+      const auto& sa = static_cast<const SlidingWindowSpec&>(a);
+      const auto& sb = static_cast<const SlidingWindowSpec&>(b);
+      return sa.num_kv_heads == sb.num_kv_heads &&
+             sa.head_size == sb.head_size && sa.head_size_v == sb.head_size_v &&
+             sa.dtype == sb.dtype && sa.kv_quant_mode == sb.kv_quant_mode &&
+             sa.page_size_padded == sb.page_size_padded &&
+             sa.indexes_kv_by_block_stride ==
+                 sb.indexes_kv_by_block_stride &&
+             sa.sliding_window == sb.sliding_window;
     }
     case KVCacheSpecKind::kMamba: {
       const auto& ma = static_cast<const MambaSpec&>(a);
       const auto& mb = static_cast<const MambaSpec&>(b);
       return ma.shapes == mb.shapes && ma.dtypes == mb.dtypes &&
+             ma.page_size_padded == mb.page_size_padded &&
              ma.mamba_cache_mode == mb.mamba_cache_mode &&
              ma.num_speculative_blocks == mb.num_speculative_blocks;
     }
@@ -109,9 +105,10 @@ KVCacheCoordinator::KVCacheCoordinator(KVCacheConfig kv_cache_config,
 
   for (std::size_t i = 0; i < this->kv_cache_config.kv_cache_groups.size();
        ++i) {
-    single_type_managers.push_back(make_manager_for_spec(
-        this->kv_cache_config.kv_cache_groups[i].kv_cache_spec, block_pool,
-        enable_caching, static_cast<int>(i), scheduler_block_size));
+    single_type_managers.push_back(get_manager_for_kv_cache_spec(
+        this->kv_cache_config.kv_cache_groups[i].kv_cache_spec,
+        max_num_batched_tokens_, max_model_len, block_pool, enable_caching,
+        static_cast<int>(i), scheduler_block_size));
   }
 
   // retention_interval stays nullopt (dense caching); env read deferred.

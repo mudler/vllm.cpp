@@ -1,5 +1,6 @@
 // Tests for the KV-cache SPEC hierarchy + config wrappers (M1.3 Task 1),
-// ported from vllm/tests/v1/core/test_kv_cache_utils.py and
+// ported from vllm/tests/v1/core/test_kv_cache_utils.py,
+// vllm/tests/v1/test_kv_cache_spec_registry.py, and
 // vllm/tests/v1/worker/test_attn_utils.py @ e24d1b24.
 //
 // Ported oracles:
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/kv_cache_spec_registry.h"
 #include "vt/dtype.h"
 
 using vllm::v1::FullAttentionSpec;
@@ -34,9 +36,13 @@ using vllm::v1::KVCacheConfig;
 using vllm::v1::KVCacheGroupSpec;
 using vllm::v1::KVCacheSpec;
 using vllm::v1::KVCacheSpecKind;
+using vllm::v1::KVCacheManagerKind;
+using vllm::v1::KVCacheSpecRegistry;
 using vllm::v1::KVCacheTensor;
 using vllm::v1::KVQuantMode;
 using vllm::v1::MambaSpec;
+using vllm::v1::SlidingWindowSpec;
+using vllm::v1::are_uniform_kv_cache_specs;
 using vt::DType;
 
 namespace {
@@ -59,6 +65,23 @@ std::shared_ptr<MambaSpec> new_mamba_spec() {
       /*page_size_padded=*/std::nullopt, /*mamba_cache_mode=*/"none",
       /*num_speculative_blocks=*/2);
 }
+
+std::shared_ptr<SlidingWindowSpec> new_sliding_window_spec(
+    int sliding_window = 1024, int block_size = 16) {
+  return std::make_shared<SlidingWindowSpec>(
+      block_size, /*num_kv_heads=*/2, /*head_size=*/64, DType::kF32,
+      sliding_window);
+}
+
+struct CustomFullSpec : FullAttentionSpec {
+  using FullAttentionSpec::FullAttentionSpec;
+};
+
+struct TrulyUnregisteredSpec : KVCacheSpec {
+  TrulyUnregisteredSpec() : KVCacheSpec(/*block_size=*/16) {}
+  int64_t page_size_bytes() const override { return 0; }
+  KVCacheSpecKind kind() const override { return KVCacheSpecKind::kUnknown; }
+};
 
 }  // namespace
 
@@ -115,6 +138,87 @@ TEST_CASE("FullAttentionSpec quantized page-size math is deferred") {
                          DType::kI8, /*head_size_v=*/std::nullopt,
                          KVQuantMode::kInt8PerTokenHead);
   CHECK_THROWS_AS(spec.real_page_size_bytes(), std::runtime_error);
+}
+
+TEST_CASE("SlidingWindowSpec page size, head_size_v, and admission cap") {
+  SlidingWindowSpec spec(/*block_size=*/16, /*num_kv_heads=*/2,
+                         /*head_size=*/64, DType::kF32,
+                         /*sliding_window=*/1024);
+  CHECK(spec.head_size_v == 64);
+  CHECK(spec.real_page_size_bytes() == 16384);
+  CHECK(spec.page_size_bytes() == 16384);
+  CHECK(spec.kind() == KVCacheSpecKind::kSlidingWindow);
+
+  // min(1024 - 1 + 256, 8192) = 1279; cdiv(1279, 16) + 1 = 81.
+  CHECK(spec.max_admission_blocks_per_request(
+            /*max_num_batched_tokens=*/256, /*max_model_len=*/8192) == 81);
+  // The model-length clamp is part of the same upstream formula.
+  CHECK(spec.max_admission_blocks_per_request(256, 1000) == 64);
+
+  SlidingWindowSpec asymmetric(
+      /*block_size=*/16, /*num_kv_heads=*/2, /*head_size=*/64, DType::kF32,
+      /*sliding_window=*/1024, /*head_size_v=*/32,
+      KVQuantMode::kNone, /*page_size_padded=*/16000);
+  CHECK(asymmetric.real_page_size_bytes() == 12288);
+  CHECK(asymmetric.page_size_bytes() == 16000);
+}
+
+TEST_CASE("SlidingWindowSpec quantized page-size math is deferred") {
+  SlidingWindowSpec spec(/*block_size=*/16, /*num_kv_heads=*/1,
+                         /*head_size=*/4, DType::kI8,
+                         /*sliding_window=*/32, std::nullopt,
+                         KVQuantMode::kInt8PerTokenHead);
+  CHECK_THROWS_AS(spec.real_page_size_bytes(), std::runtime_error);
+}
+
+TEST_CASE("KVCacheSpecRegistry built-ins and inherited custom specs") {
+  auto full = new_kv_cache_spec();
+  auto sliding = new_sliding_window_spec();
+  auto mamba = new_mamba_spec();
+
+  CHECK(KVCacheSpecRegistry::get_manager_kind(*full) ==
+        KVCacheManagerKind::kFullAttention);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(*sliding) ==
+        KVCacheManagerKind::kSlidingWindow);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(*mamba) ==
+        KVCacheManagerKind::kMamba);
+  CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(*sliding) ==
+        std::optional<std::type_index>{typeid(SlidingWindowSpec)});
+
+  // Explicit custom registration is idempotent with inherited built-in
+  // behavior, and an unregistered subclass still resolves through its base.
+  CustomFullSpec custom(/*block_size=*/16, /*num_kv_heads=*/2,
+                        /*head_size=*/64, DType::kF32);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(custom) ==
+        KVCacheManagerKind::kFullAttention);
+  KVCacheSpecRegistry::register_spec<CustomFullSpec, FullAttentionSpec>(
+      KVCacheManagerKind::kFullAttention);
+  CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(custom) ==
+        std::optional<std::type_index>{typeid(FullAttentionSpec)});
+}
+
+TEST_CASE("KVCacheSpecRegistry rejects a truly unregistered spec") {
+  TrulyUnregisteredSpec unknown;
+  CHECK_FALSE(KVCacheSpecRegistry::get_manager_kind(unknown).has_value());
+  CHECK_FALSE(
+      KVCacheSpecRegistry::get_uniform_type_base_spec(unknown).has_value());
+  CHECK_THROWS_WITH_AS(
+      KVCacheSpecRegistry::check_kv_cache_spec_registry(
+          {{"layer_0", &unknown}}),
+      "Unsupported KV cache spec type for layer layer_0",
+      std::invalid_argument);
+}
+
+TEST_CASE("KVCacheSpecRegistry uniform-type rules include SWA window fields") {
+  auto sliding_a = new_sliding_window_spec(/*sliding_window=*/1024);
+  auto sliding_b = new_sliding_window_spec(/*sliding_window=*/1024);
+  auto sliding_other = new_sliding_window_spec(/*sliding_window=*/256);
+  auto full = new_kv_cache_spec();
+
+  CHECK(are_uniform_kv_cache_specs({sliding_a.get(), sliding_b.get()}));
+  CHECK_FALSE(
+      are_uniform_kv_cache_specs({sliding_a.get(), sliding_other.get()}));
+  CHECK_FALSE(are_uniform_kv_cache_specs({full.get(), sliding_a.get()}));
 }
 
 TEST_CASE("MambaSpec page_size_bytes: new_mamba_spec defaults") {

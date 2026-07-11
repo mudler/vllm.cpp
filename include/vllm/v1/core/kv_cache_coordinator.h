@@ -39,12 +39,10 @@
 //   requests).
 //
 // DEVIATIONS, recorded:
-//   - Upstream builds the per-group managers via `get_manager_for_kv_cache_spec`
-//     (the deferred spec->manager registry, see Task 2). Here the base
-//     constructor dispatches on `spec->kind()` directly:
-//     FullAttentionSpec -> FullAttentionManager, MambaSpec -> MambaManager; any
-//     other (deferred) spec kind throws. This is the exact set the gate models
-//     need and mirrors upstream's own tests, which construct managers directly.
+//   - Per-group managers are built through the registry-backed
+//     `get_manager_for_kv_cache_spec`, including the recycling-aware admission
+//     cap for SlidingWindowSpec. Out-of-tree platform callbacks remain deferred
+//     in kv_cache_spec_registry.h.
 //   - Task 2 ported `find_longest_cache_hit` as a VIRTUAL INSTANCE method (C++
 //     has no abstract static methods). Upstream's Hybrid calls
 //     `manager_cls.find_longest_cache_hit(...)` (a classmethod). Here each

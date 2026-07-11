@@ -3765,3 +3765,33 @@ GPU/performance result was produced. Read-only campaign observation showed the
 27B pre-W2 same-lock series close with both arms `rc=0`; the queued PR3 focused
 GDN test then passed and its pool A/B acquired `/tmp/gpu`, while the scripted
 35B series waits on that lock.
+
+## 2026-07-11 — second pre-W2 35B online arm is void; committed harness claimed
+
+The queued preliminary PR3 work released `/tmp/gpu` after its focused GDN,
+27B, and 35B tests returned zero and its older-branch scratch-pool A/B completed.
+Those runs remain preliminary exactly as recorded: the build is `85dfb48`, not
+current main, and no fresh vLLM/BF16/trace closure is inferred.
+
+The scripted second pre-W2 35B serving series then acquired its model-wide lock.
+Its local server at `83010c7` became ready, but the first c1/6-prompt result
+completed only **1/6** requests; the other five failed, and before repetition 2
+the server aborted. Its log surfaces `vt cuda: cudaFree: an illegal memory
+access was encountered`. That asynchronous error site does not identify the
+faulting kernel, and the earlier exact-shape sanitizer diagnostic remains clean,
+so no root cause or current-main behavior is claimed. The local arm and complete
+35B A/B series are void. The already-started production-vLLM arm remains under
+the same lock only to preserve diagnostic evidence; it cannot repair the missing
+local repetitions.
+
+`CLAIM-SERVE-GATE-1` now also owns isolated worktree
+`/home/mudler/_git/vllm.cpp-serve-gate`, branch
+`codex/serve-gate-harness`, and committed `tools/bench/online_gate_*`,
+`scripts/dgx-online-serving.sh`, and focused tests. The harness checkpoint will
+freeze exact tokenized corpora, reject any failed/short request set, record
+process-tree RSS/PSS/GPU memory plus thermal/power and memory return, preserve
+raw timing arrays, and plan one uninterrupted lock around each complete
+current-main ours/vLLM A/B series. This is orchestration hardening, not a server
+fix or performance result. Current W2 still requires a fresh CUDA build,
+reproduction of the 35B fault under sanitizer if it persists, and both-model
+G1/G3-G6 evidence.

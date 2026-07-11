@@ -4880,3 +4880,25 @@ preliminary because the test was not yet in pushed `1a802ac` when run.
 Next: push this test/record checkpoint, rerun both capture arms from that exact
 SHA, then run focused compute-sanitizer and 27B default/fallback model gates.
 Do not run 35B or any performance series until the 27B W1 axes justify it.
+
+## 2026-07-11 — NVFP4 W1 immutable capture, memcheck and 27B model gates pass
+
+The capture-test checkpoint is pushed as
+`c8807b05cc4e3672641aad9a6c247337870141a2`. A fresh detached source and build
+under `~/work/vllm.cpp-nvfp4-small-m/c8807b05cc4e3672641aad9a6c247337870141a2/w1`
+use CUDA 13.0.88, `121a`, CUTLASS NVFP4, Marlin, Triton AOT and FA2. The source
+is clean at the exact SHA and the focused/test-model binaries are hashed.
+
+One uncontended `/tmp/gpu` series passes every permitted W1 safety/correctness
+leg. Exact and `VT_FP4_EXACT_BUCKETS=0` legacy capture suites each pass **10/10
+cases / 18,333/18,333 assertions**. Focused compute-sanitizer memcheck passes
+**1/1 / 16,389/16,389 with 0 errors**. Exact and legacy 27B paged-engine gates
+each pass **1/1 / 234/234**, produce 16/16 tokens, and preserve the required
+6-token tie-free prefix against vLLM. The GPU and lock return idle. Evidence
+manifest SHA-256 is `ed245cf67a5708267e177e422a9906547036241bb45b0b1152fa1ef57f107fab`;
+binary hashes are `8d1dbec2…7300` (focused) and `6f63a5fa…09ab` (27B).
+
+No throughput, latency, memory or vLLM ratio is inferred from these gates. Next
+is W1 exact-vs-legacy component AB/BA/AB, paired traces and the full exact 27B
+oracle campaign. Per the fail-closed order, do not run 35B while any 27B axis
+remains below the floor, and do not stack W2 before W1 is classified.

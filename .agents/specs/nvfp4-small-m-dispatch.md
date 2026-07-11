@@ -7,9 +7,10 @@ spike; W1 is `ACTIVE` under `CLAIM-NVFP4-SMALL-M-1`. **Pins:** vLLM
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
 
 This accepted spike is the mandatory contract for FP4 plan-cache and kernel
-changes. W1 now has a CPU-gated implementation checkpoint, but no CUDA/model/
-capture/performance result is claimed; the exact `4e1d8ca` campaign remains its
-binding before-state.
+changes. W1 has a CPU/TSan implementation checkpoint and pushed `1a802ac`
+passes the focused sm_121a op in default and legacy modes. The expanded real
+capture case is staging-green but not yet immutable evidence; model, memcheck
+and performance remain open, and exact `4e1d8ca` remains the binding before-state.
 
 ## Scope
 
@@ -169,11 +170,15 @@ real gate shapes.
   Three warmups plus ten real-operand timing iterations remain unchanged.
 - `:525-571` supports BF16 output and F32 through a BF16 staging/cast
   deviation. FP16, which FlashInfer supports, is absent.
-- `tests/vt/test_ops_nvfp4_fp4.cpp:56-277` now covers every hybrid boundary,
+- `tests/vt/test_ops_nvfp4_fp4.cpp:56-277` covers every hybrid boundary,
   legacy fallback, all key fields, 16-thread single-flight, independent keys,
-  failure wake/retry and capture miss/hit behavior. Focused Release passes
-  100/100 and TSan passes 9 cases/615 assertions. The existing
-  M=96/N=256/K=512 CUDA reference remains; real capture, every tactic,
+  failure wake/retry and the pure capture predicate contract. The
+  M=96/N=256/K=512 CUDA reference now also captures/replays a ready plan,
+  rejects an uncached M=64 plan without invalidating capture, and proves an
+  eager retry can tune without partial state. Release passes 100/100 and TSan
+  passes 9 cases/615 assertions. Pushed `1a802ac` (before the expanded test)
+  passes default/legacy CUDA 10/10 and 1,945/1,945; the expanded test passes
+  both staging arms at 10/10 and 18,333/18,333. Immutable capture, every tactic,
   workspace growth, forced dispatch and real projection shapes are still open.
 
 Real 27B W4A4 projection classes to benchmark include:
@@ -213,9 +218,9 @@ wrappers.
 | `tests/kernels/quantization/test_nvfp4_scaled_mm.py:17-100` | preserve the native fallback reference and all listed M/N/K shapes so full-tactic work cannot regress the existing two-config path |
 | `tests/v1/determinism/test_nvfp4_batch_invariant_scaled_mm.py:31-101` | port as an explicit diagnostic mode in a fresh process; never silently make batch-invariant math the production default if it loses the vLLM performance floor |
 | `tests/v1/determinism/test_nvfp4_batch_invariant.py:22-100` | retain the gate model's deterministic common-prefix contract across c1/2/4/8/16/32 and exact native token counts; record full generated text diagnostically because vLLM's own FP4 backends diverge after near ties |
-| FlashInfer bucket helpers `fused_moe/utils.py:212-307` | **W1 ported:** table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; real graph-size capture entries remain a CUDA gate |
+| FlashInfer bucket helpers `fused_moe/utils.py:212-307` | **W1 ported:** table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; a real ready-hit/miss/retry capture case is implemented and staging-green, with its immutable run still required |
 | FlashInfer tactic enumeration `fp4_gemm_cutlass_template_sm120.h:187-220` | assert 32 stable tactic descriptors/order; force every supported tactic over representative small-M and real Qwen shapes; unsupported configs are reported/skipped only during tuning |
-| autotuner cache behavior | **W1 CPU portion ported:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass. Real capture/replay remains G3; stale disk-version rejection belongs to W3 |
+| autotuner cache behavior | **W1 ported:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; real CUDA capture/replay/miss/teardown/retry is added and staging-green. Immutable G3 evidence remains; stale disk-version rejection belongs to W3 |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -283,7 +288,7 @@ before any new FP4 GPU command begins.
 | Work | Deliverable | State / gate |
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
-| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | implementation + CPU/TSan checkpoint complete; `ACTIVE` on clean CUDA/model/capture/memcheck, component AB/BA/AB, trace and full exact 27B campaign |
+| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | implementation + CPU/TSan and first pushed focused CUDA op checkpoint complete; real capture case is staging-green; `ACTIVE` on immutable capture/memcheck/model, component AB/BA/AB, trace and full exact 27B campaign |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | after W1 measurement; every-tactic sanitizer, trace, component and exact 27B campaign |
 | W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |

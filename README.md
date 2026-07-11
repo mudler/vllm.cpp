@@ -28,8 +28,11 @@ OpenAI-compatible server.
 > exact hybrid buckets/single-flight tuning from the 32-tactic SM12 family;
 > W1 is now implemented behind `VT_FP4_EXACT_BUCKETS=0` and passes its focused
 > Release test 100 consecutive times plus ThreadSanitizer (9 cases / 615
-> assertions). This is a CPU checkpoint only: CUDA/model/capture/A-B/oracle
-> evidence and every speed ratio remain pending. The 35B
+> assertions). Exact pushed `1a802ac` also clean-builds for sm_121a and its
+> default/legacy focused CUDA runs each pass 10/10 cases and 1,945/1,945
+> assertions. A new real warmed-hit/capture-miss/retry test passes both arms in
+> preliminary staging (10/10, 18,333/18,333), but its pushed-SHA rerun plus
+> memcheck/model/A-B/oracle evidence and every speed ratio remain pending. The 35B
 > campaign is held until 27B passes every axis. Historical
 > temperature/token-budget-mismatched ratios
 > remain diagnostics only. The tables track real, tested support and are kept
@@ -171,7 +174,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact `4e1d8ca` 27B online checkpoint is valid but below the all-axis floor; FP4 W1 is implemented/CPU-green and awaits GB10 gates, while 35B performance is held behind 27B closure. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact `4e1d8ca` 27B online checkpoint is valid but below the all-axis floor; FP4 W1 is implemented and its focused sm_121a op gate passes, while final capture/memcheck/model/performance evidence and 35B performance remain held behind 27B closure. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -181,7 +184,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact `4e1d8ca` 27B online throughput is 0.927-0.991× vLLM over c1-c32 medians and the all-axis gate remains red. The fixed HTTP pool is CPU/sanitizer-green, steady-state-neutral at 0.999764× versus its legacy arm, and completed every fresh c32 leg without an unread socket; its bounded legacy A/B did not reproduce the rare failure. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate repeated 27B component A/B evidence. FlashInfer-equivalent FP4 W1 exact buckets/complete key/single-flight/capture-miss handling are implemented and CPU/TSan-green, but CUDA and performance gates remain; the separate full-tactic iteration follows before any 35B performance run. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact `4e1d8ca` 27B online throughput is 0.927-0.991× vLLM over c1-c32 medians and the all-axis gate remains red. The fixed HTTP pool is CPU/sanitizer-green, steady-state-neutral at 0.999764× versus its legacy arm, and completed every fresh c32 leg without an unread socket; its bounded legacy A/B did not reproduce the rare failure. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate repeated 27B component A/B evidence. FP4 W1 exact buckets/key/single-flight now clean-build on sm_121a; pushed `1a802ac` focused default/legacy CUDA runs pass 10/10 and 1,945/1,945 each. Its real capture test is only preliminary until the next pushed-SHA rerun; memcheck, models and performance remain open, followed separately by W2 full tactics before any 35B performance run. Both models are W0 compute-sanitizer access-clean and the W1 indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -265,8 +268,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   [implementation spike](.agents/specs/nvfp4-small-m-dispatch.md) inventories
   the exact hybrid mapping, eight tiles × two operand orientations × two
   schedulers, upstream tests, workspace/capture rules and separate W1/W2 A/B
-  gates. W1 passes focused Release stress and ThreadSanitizer, but has no CUDA,
-  model, capture or performance result yet. Until gated, isolated per-shape wins
+  gates. W1 passes focused Release stress, ThreadSanitizer and pushed-`1a802ac`
+  default/legacy CUDA op runs. The new real capture test is preliminary only;
+  its immutable rerun plus model, memcheck and performance results remain. Until gated, isolated per-shape wins
   do not establish end-to-end tactic parity.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
@@ -331,8 +335,8 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   total ratios are **0.966/0.927/0.938/0.947/0.981/0.991×**; only
   0/2/5/3/3/5 of 20 performance axes and 2/4 memory axes pass. All fixed c32
   legs are healthy; direct-c16 traces separately prove FP4 bucket aliasing, and
-  exact-bucket/single-flight W1 is implemented/CPU-green but awaits its GB10
-  gates. W0 is merged at `7d29e0c`; its clean GB10 build,
+  exact-bucket/single-flight W1 is implemented and its first focused GB10 op
+  gate passes, while capture/memcheck/model/performance closure remains. W0 is merged at `7d29e0c`; its clean GB10 build,
   default/fallback
   35B+27B pointer/token gates, lifecycle, trace, and repeated 27B A/B pass. The
   measured W0 same-binary gain is +2.12% (20/20 timing axes). W1 then wins a

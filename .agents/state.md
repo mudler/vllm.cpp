@@ -4856,3 +4856,27 @@ the pushed `4e1d8ca` series remains the exact before-state. After this checkpoin
 is pushed, use a clean CUDA 13.0.88/sm_121a build for focused op/default+legacy
 capture, compute-sanitizer and both-model default/fallback gates. Only then run
 the uncontended W1 AB/BA/AB, paired trace and full exact 27B oracle campaign.
+
+## 2026-07-11 — NVFP4 W1 focused sm_121a gate passes; real capture test added
+
+Pushed `1a802ac3428f324d9433baf9bb0a1189cdb32a62` was checked out as a clean
+detached DGX worktree under
+`~/work/vllm.cpp-nvfp4-small-m/1a802ac3428f324d9433baf9bb0a1189cdb32a62/w1`.
+CUDA 13.0.88 configured for `121a` with CUTLASS NVFP4, Marlin, Triton AOT and
+FA2 enabled; the focused op plus both gate-model executables built. Under one
+uncontended `/tmp/gpu` lock, the focused op passes in default exact-bucket and
+`VT_FP4_EXACT_BUCKETS=0` legacy modes: **10/10 cases and 1,945/1,945 assertions
+per arm**. The GPU is empty after the series. No model or speed result is
+inferred from this narrow gate.
+
+The focused CUDA reference now exercises the missing real graph contract. It
+warms M=96, captures and replays the ready plan with byte-identical BF16 output,
+then presents uncached M=64 during capture, requires the explicit miss error,
+ends a valid graph, and proves a subsequent eager call tunes and matches the
+reference. In the separate precommit staging build, both exact and legacy arms
+pass **10/10 cases and 18,333/18,333 assertions**. This is deliberately marked
+preliminary because the test was not yet in pushed `1a802ac` when run.
+
+Next: push this test/record checkpoint, rerun both capture arms from that exact
+SHA, then run focused compute-sanitizer and 27B default/fallback model gates.
+Do not run 35B or any performance series until the 27B W1 axes justify it.

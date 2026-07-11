@@ -624,6 +624,50 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   MESSAGE("cutlass max_abs=" << max_abs << " ref_absmax=" << ref_absmax);
   CHECK(max_abs <= 0.03 * ref_absmax + 1e-3);
 
+  // A warmed plan must be a pure cache hit during CUDA graph capture. Replay
+  // the same fixed-pointer GEMM and require byte-identical bf16 output.
+  b.Memset(gq, dout, 0, g_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  b.BeginCapture(gq);
+  vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
+  void* ready_graph = b.EndCaptureGraph(gq);
+  REQUIRE(ready_graph != nullptr);
+  b.ReplayGraph(gq, ready_graph);
+  b.Synchronize(gq);
+  std::vector<uint16_t> replay_out(g_out.size());
+  b.Copy(gq, replay_out.data(), dout, replay_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  CHECK(replay_out == g_out);
+  b.DestroyGraph(ready_graph);
+
+  // M=64 has a different plan key from the warmed M=96 (bucket 64 vs 128).
+  // The call records its already-warmed scalar write, then rejects the missing
+  // plan before creating tuner events or launching a GEMM. Ending the capture
+  // must still produce a valid graph, proving the rejection itself did not
+  // invalidate the stream. An eager retry must tune normally (no partial plan).
+  Tensor tap_miss = tap;
+  tap_miss.shape[0] = 64;
+  Tensor to_miss = to;
+  to_miss.shape[0] = 64;
+  b.Memset(gq, dout, 0, g_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  b.BeginCapture(gq);
+  CHECK_THROWS_WITH_AS(
+      vt::MatmulNvfp4Cutlass(gq, to_miss, tap_miss, tasw, tbp, tbsw, alpha),
+      "NVFP4 plan cache miss while tuning is disallowed", std::runtime_error);
+  void* miss_graph = b.EndCaptureGraph(gq);
+  REQUIRE(miss_graph != nullptr);
+  b.DestroyGraph(miss_graph);
+
+  vt::MatmulNvfp4Cutlass(gq, to_miss, tap_miss, tasw, tbp, tbsw, alpha);
+  std::vector<uint16_t> retry_out(static_cast<size_t>(64 * N));
+  b.Copy(gq, retry_out.data(), dout, retry_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  for (size_t i = 0; i < retry_out.size(); ++i) {
+    const float got = Bf16ToFloat(retry_out[i]);
+    CHECK(got == doctest::Approx(cpu_out[i]).epsilon(0.03).scale(1.0));
+  }
+
   for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
   b.DestroyQueue(gq);
 }

@@ -476,6 +476,35 @@ cd "$W3/source"
 /tmp/w3b-trace-repro.sh
 ```
 
+## Local RTX diagnostic throughput
+
+This local checkpoint is diagnostic because Qwen3.5-4B greedy correctness is
+still 15/16 on the representative corpus, not fully qualified. It compares the
+rebased `81c9383` native-sm_120 Triton-AOT build against fresh production vLLM
+0.24.0 processes on the RTX 5070 Ti. Both use the same 128 ShareGPT prompts,
+exact 1024-token inputs, 128 generated tokens, concurrency/max-num-seqs 32,
+BF16, max model length 4096, scheduler token budget 2048, seed 0, and ignored
+EOS. Each value is a two-run mean.
+
+| Sampling | vllm.cpp total / output tok/s | vLLM total / output tok/s | Ratio |
+|---|---:|---:|---:|
+| Greedy | 6430.56 / 711.08 | 6715.54 / 742.59 | **0.9576x** |
+| Temperature 1 | 6246.86 / 690.76 | 6681.13 / 738.78 | **0.9350x** |
+
+The corresponding total-throughput repetitions were 6431.15/6429.96 and
+6246.72/6247.00 for vllm.cpp, and 6713.51/6717.57 and 6680.91/6681.35 for
+vLLM. The project results differ from the preceding means by -0.06% greedy and
+-0.11% temperature 1, so the rebase produced no material throughput change.
+Performance parity remains open.
+
+Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
+The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps
+to `NV_ERR_NOT_SUPPORTED` in the matching 595.71.05 open-driver source and is
+consistent with a profiler requesting an unsupported Blackwell GR timestamp
+tick-frequency change. It did not coincide with an Xid, UVM/AER fault, reset,
+application failure, or throughput anomaly, so no recorded run is voided by
+this notice alone.
+
 ## Reproduce the current online checkpoint
 
 The existing immutable evidence can be re-aggregated without GPU work by using

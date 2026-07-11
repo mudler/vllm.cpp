@@ -6781,3 +6781,32 @@ The project means moved only -0.06% greedy and -0.11% temperature 1 from the
 preceding checkpoint, so the rebase caused no material throughput regression.
 The established representative-corpus correctness remains 15/16 and was not
 requalified by this throughput-only run; performance parity remains open.
+
+## 2026-07-11 — NVIDIA refcount warning identified as unsupported GR-tick request
+
+Investigated the recurring kernel message
+`refcntRequestReference_IMPL: Failed to enter state 1 (current state: 0,
+status: 0x00000056)` against the exact installed open-driver version 595.71.05.
+This boot contains isolated instances from July 10 onward, including pairs at
+05:44, 06:50, 07:31, and 07:54-07:55 on July 11. The reported 07:55 instance
+has no adjacent or subsequent Xid, UVM fault, AER/PCIe error, oops, lockup,
+reset, or application failure. New nix-daemon clients immediately precede the
+07:54 and 07:55 warnings, consistent with short-lived CUDA/profiler startup.
+
+NVIDIA's `nvstatuscodes.h` maps `0x56` to `NV_ERR_NOT_SUPPORTED` ("Call not
+supported"). In `src/nvidia/src/lib/ref_count.c`, a zero-count reference object
+invokes its state-change callback before bookkeeping; on callback failure it
+logs this message and exits without incrementing the count or changing state.
+The 595.71.05 generated timer HAL maps post-Ada chips, including Blackwell, to
+`tmrGrTickFreqChange_395e98`, which returns `NV_ERR_NOT_SUPPORTED`; older
+TU/GA/AD chips use the GM107 implementation. This strongly identifies the
+message as a profiling client requesting maximum GR timestamp tick frequency,
+not a rejected userspace pointer and not memory corruption. The HWPM PMA
+refcount path is less consistent because its callback emits an additional
+PMA-allocation error that is absent from the journal.
+
+Current read-only health check: RTX 5070 Ti, driver 595.71.05, P8, 0% GPU,
+146 MiB / 16,303 MiB, 42 C. The health query itself emitted no new kernel
+warning. No project or system configuration change is required. Treat future
+instances as benign unless accompanied by an Xid, UVM/AER fault, reset, GPU
+loss, application error, or a new status other than `0x56`.

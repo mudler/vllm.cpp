@@ -513,6 +513,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **6,681.13 tok/s (0.935×)**; two greedy runs average **6,430.56 tok/s**
   versus fresh vLLM **6,715.54 tok/s (0.958×)**. These are open gaps, not
   performance parity.
+  The recurring NVIDIA
+  `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
+  source-identified as an unsupported profiler request to change Blackwell's
+  GR timestamp tick frequency. It is not an invalid-pointer or GPU-reset
+  status; no adjacent Xid/UVM/AER fault or benchmark failure was observed.
   Random sampling uses the same exponential-race distribution as vLLM and has
   an empirical distribution test, but deterministic token streams differ because
   the project still uses SplitMix while vLLM uses torch Philox. The fresh Nsight

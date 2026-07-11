@@ -946,6 +946,10 @@ void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_
   VT_CHECK(hq >= 1 && num_kv_heads >= 1 && hq % num_kv_heads == 0,
            "paged_attention: num_q_heads must be a positive multiple of num_kv_heads (GQA)");
   VT_CHECK(args.scale > 0.0f, "paged_attention: scale must be set (> 0), e.g. head_size^-0.5");
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0 && args.window_size->right >= 0,
+             "paged_attention: window_size left/right must both be >= 0");
+  }
   VT_CHECK(IsFloat(query.dtype) && IsOutFloat(out.dtype),
            "paged_attention: float query, f32/bf16 out");
   // The KV cache may be a DIFFERENT float dtype than the query (Phase-1 bf16 KV

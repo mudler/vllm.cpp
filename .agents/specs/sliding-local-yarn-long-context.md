@@ -300,6 +300,22 @@ model prerequisites. The exact failed oracle command and remaining handoff are
 recorded in the ledger/state; blocked connector/offload/contiguous-packing/model
 tests are checked in as named skips against their owning rows.
 
+W2 checkpoint (2026-07-11): `ATTN-SLIDING-WINDOW` now carries one optional
+bottom-right-aligned `(left,right)` value from typed text config and the generic
+attention layer through `vt::PagedAttention`. The CPU reference and every
+portable CUDA decode/prefill specialization enforce the exact lower/upper key
+bounds; compile-time full/local variants preserve the no-window hot path. The
+vendored FA2 adapter mirrors the pinned API normalization by selecting its
+non-causal local specialization for finite decoder `(W-1,0)` and symmetric
+encoder `(W-1,W-1)` windows. Upstream-derived decoder, encoder, mixed,
+page-boundary, GQA and FA2 tests are present, with explicit dependency skips for
+TP, FlashInfer and the two feature-positive model rows. CPU G1 passes 100/100;
+the focused suites pass under ASan+UBSan with leak detection; NVIDIA 13.0.88
+compiles the portable, adapter, causal and non-causal/local FA2 translation
+units for sm_121a against CUTLASS v4.4.2. No CUDA kernel was executed. The row
+moves to `GATING`, not `DONE`, pending G4 and the model/oracle/trace/every-axis
+G6-G9 handoff after `CLAIM-SERVE-GATE-1` releases dgx.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

@@ -1,3 +1,5 @@
+// Sliding-window cases port ModelConfig normalization from
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
 #include <cstdio>
@@ -334,6 +336,50 @@ TEST_CASE("LoadHfConfig applies upstream rotary and head_dim defaults") {
     vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
     CHECK(cfg.head_dim == 128);   // hidden_size / num_attention_heads
     CHECK(cfg.rotary_dim == 128);
+  }
+}
+
+TEST_CASE("LoadHfConfig mirrors sliding_window normalization from the text config") {
+  SUBCASE("positive top-level window is retained") {
+    TempJson f(R"({
+      "model_type": "starcoder2",
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "sliding_window": 4096
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    REQUIRE(cfg.sliding_window.has_value());
+    CHECK(*cfg.sliding_window == 4096);
+  }
+
+  SUBCASE("zero and null mean disabled") {
+    for (const char* value : {"0", "null"}) {
+      TempJson f(std::string(R"({
+        "model_type": "local",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "sliding_window": )") + value + "}");
+      CHECK_FALSE(vllm::LoadHfConfig(f.path()).sliding_window.has_value());
+    }
+  }
+
+  SUBCASE("nested text_config is the source") {
+    TempJson f(R"({
+      "model_type": "wrapper",
+      "architectures": ["WrapperForCausalLM"],
+      "sliding_window": 999,
+      "text_config": {
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "sliding_window": 128
+      }
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    REQUIRE(cfg.sliding_window.has_value());
+    CHECK(*cfg.sliding_window == 128);
   }
 }
 

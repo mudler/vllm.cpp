@@ -1,7 +1,9 @@
-// vllm.cpp original (container reader); no upstream mirror.
+// vllm.cpp original container reader. Sliding-window normalization mirrors
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,9 @@ struct HfConfig {
   int64_t num_attention_heads = 0;
   int64_t num_key_value_heads = 0;  // absent -> num_attention_heads
   int64_t head_dim = 0;             // absent -> hidden_size / num_attention_heads
+  // Model-level local-attention width. Absent/null/0 => full attention, matching
+  // ModelConfig's pinned normalization before backend construction.
+  std::optional<int64_t> sliding_window = std::nullopt;
   // Hybrid models: "linear_attention"/"full_attention" per layer; empty = all
   // full attention.
   std::vector<std::string> layer_types;

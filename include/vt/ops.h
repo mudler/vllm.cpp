@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 
 #include "vt/fused_recipe.h"
@@ -229,6 +230,17 @@ struct AttentionArgs {
   bool causal = true;
 };
 
+// Backend-neutral local-attention window, matching FlashAttention's
+// `window_size=(left, right)` convention. The bounds are inclusive distances
+// from the bottom-right-aligned absolute query position: (W-1, 0) is a causal
+// decoder window of W tokens and (W-1, W-1) is the symmetric encoder form.
+// Full attention is represented by std::nullopt on PagedAttentionArgs, never by
+// a backend-specific sentinel pair.
+struct AttentionWindow {
+  int32_t left = 0;
+  int32_t right = 0;
+};
+
 // Paged attention args (M1.6). Same softmax convention as AttentionArgs — the
 // paged op generalizes the dense M0.9 attention to the varlen/batched/paged
 // case and MUST agree with it on the single-sequence contiguous read.
@@ -240,6 +252,12 @@ struct PagedAttentionArgs {
   // positions j <= p. True for the decoder path; non-causal carried for
   // fidelity (matches AttentionArgs.causal).
   bool causal = true;
+  // OPTIONAL local-attention bounds. For an absolute query position p, visible
+  // keys are intersected with [p-left, p+right] after the causal/full bound is
+  // applied. Query positions use FlashAttention's bottom-right alignment:
+  // p = seq_len - query_len + local_query_index. std::nullopt preserves the
+  // existing full causal/non-causal behavior exactly.
+  std::optional<AttentionWindow> window_size = std::nullopt;
   // OPTIONAL host-resident query_start_loc[num_reqs+1] (same values as the
   // device `query_start_loc` tensor). When set, the CUDA prefill flash/WMMA
   // launchers size the per-request query-tile grid from these host values and
@@ -901,7 +919,9 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // p = (seq_lens[r] - query_len_r) + (t - query_start_loc[r]) (query_len_r =
 // query_start_loc[r+1] - query_start_loc[r]; seq_lens[r] is the total context
 // INCLUDING this chunk), and q-head h (kv-head g = h / (Hq/Hk)):
-//   for key position j in 0..p (causal) — block = block_table[r, j / block_size],
+//   for key position j in 0..p (causal), intersected with
+//   [p-window.left,p+window.right] when args.window_size is present —
+//   block = block_table[r, j / block_size],
 //   offset = j % block_size, K = k_cache[block, offset, g, :], V likewise —
 //   s[j] = scale * (query[t,h] · K);  out[t,h,:] = Σ_j softmax(s)_j * V.
 // Softmax/accumulation in f32 (max-subtracted). The current step's K/V must

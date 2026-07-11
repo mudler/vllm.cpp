@@ -187,6 +187,7 @@ add_library(vllm STATIC
   src/vllm/v1/engine/output_processor.cpp
   src/vllm/v1/engine/llm_engine.cpp
   src/vllm/v1/executor/executor.cpp
+  src/vllm/model_executor/layers/attention/attention.cpp
   src/vllm/entrypoints/chat_template.cpp
   src/vllm/entrypoints/model_loader.cpp
   src/capi/vllm_c.cpp

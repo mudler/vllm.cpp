@@ -225,9 +225,17 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.scale_softmax_rp_dropout = args.scale;
   p.philox_args = at::PhiloxCudaState(0, 0);
 
-  p.is_causal = args.causal;
-  p.window_size_left = -1;
-  p.window_size_right = args.causal ? 0 : -1;
+  // The pinned FA-2 API normalizes a finite window to the LOCAL specialization,
+  // even for decoder attention: local (W-1,0) already contains the causal right
+  // bound, while the compile-time Is_causal specialization deliberately ignores
+  // window_size_left (flash_fwd_launch_template.h LOCAL_SWITCH). Because this
+  // torch-free adapter bypasses flash_api.cpp, reproduce that normalization
+  // here before selecting the explicit template instantiation.
+  const bool is_local = args.window_size.has_value();
+  p.is_causal = args.causal && !is_local;
+  p.window_size_left = is_local ? args.window_size->left : -1;
+  p.window_size_right =
+      is_local ? args.window_size->right : (args.causal ? 0 : -1);
   p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
   p.is_rotary_interleaved = false;
   p.rotary_dim = 0;
@@ -246,10 +254,12 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.o_batch_stride = static_cast<int64_t>(max_seqlen_q) * p.o_row_stride;
 
   // head_dim 256 is gated by the caller. Causal is per-layer (qwen3.5 mixes full-
-  // attn causal / GDN); dispatch both instantiations (compiled for sm_121a).
+  // attn causal / GDN); a finite decoder or encoder window dispatches the
+  // non-causal template so its runtime LOCAL_SWITCH selects the exact local
+  // mask. Both instantiations are compiled for sm_121a.
   // With num_splits==1 run_mha_fwd_splitkv_dispatch runs the Split=false kernel
   // only — no combine pass, exactly vLLM's varlen prefill.
-  if (args.causal) {
+  if (args.causal && !is_local) {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
   } else {
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);

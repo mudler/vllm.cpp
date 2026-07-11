@@ -1,4 +1,5 @@
-// vllm.cpp original (container reader); no upstream mirror.
+// vllm.cpp original container reader. Sliding-window normalization mirrors
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
 #include "vllm/transformers_utils/hf_config.h"
 
 #include <fstream>
@@ -31,6 +32,15 @@ std::vector<std::string> GetStringArray(const nlohmann::json& doc,
   auto it = doc.find(key);
   if (it == doc.end() || it->is_null()) return {};
   return it->get<std::vector<std::string>>();
+}
+
+std::optional<int64_t> GetSlidingWindow(const nlohmann::json& doc) {
+  auto it = doc.find("sliding_window");
+  if (it == doc.end() || it->is_null()) return std::nullopt;
+  const int64_t window = it->get<int64_t>();
+  // Pinned ModelConfig normalizes checkpoint sliding_window=0 to None before
+  // max-length verification and backend construction (config/model.py:654-660).
+  return window == 0 ? std::nullopt : std::optional<int64_t>(window);
 }
 
 void RequireKey(const nlohmann::json& doc, const char* key,
@@ -126,6 +136,7 @@ HfConfig LoadHfConfig(const std::string& path) {
     // back to hidden_size / num_attention_heads.
     cfg.head_dim = GetInt(text, "head_dim", 0);
     if (cfg.head_dim <= 0) cfg.head_dim = derived_head_dim;
+    cfg.sliding_window = GetSlidingWindow(text);
     cfg.layer_types = GetStringArray(text, "layer_types");
     cfg.intermediate_size = GetInt(text, "intermediate_size", 0);
 

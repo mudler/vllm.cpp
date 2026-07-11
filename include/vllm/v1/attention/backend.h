@@ -33,11 +33,12 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
-#include "vt/tensor.h"
+#include "vt/ops.h"
 
 namespace vllm::v1 {
 
@@ -127,6 +128,9 @@ struct AttentionLayer {
   float q_scale = 1.0f;  // upstream _q_scale_float
   float k_scale = 1.0f;  // upstream _k_scale_float
   float v_scale = 1.0f;  // upstream _v_scale_float
+  // Per-layer backend-neutral window resolved by the generic attention layer.
+  // nullopt is full attention; model-specific code must not reinterpret it.
+  std::optional<vt::AttentionWindow> window_size = std::nullopt;
 };
 
 // Base class for attention implementations (upstream AttentionImpl, flattened

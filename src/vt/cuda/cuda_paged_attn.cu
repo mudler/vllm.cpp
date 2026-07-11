@@ -1,8 +1,10 @@
 // Ported from: vllm/v1/attention/backends/flash_attn.py @ e24d1b24
 //   (FlashAttentionImpl.forward SEMANTICS: causal GQA softmax over the paged K/V,
 //    softmax_scale = self.scale, cu_seqlens_q = query_start_loc, seqused_k =
-//    seq_lens, block_table = block_table_tensor, window_size = None for the
-//    qwen35 full-attn layers → plain causal). Cache READ is the NHD layout
+//    seq_lens, block_table = block_table_tensor, optional bottom-right-aligned
+//    window_size; the Qwen3.5 gate layers keep window_size=None → plain causal).
+//    Sliding-window masks are ported with tests/v1/attention/
+//    test_attention_backends.py:745-867. Cache READ is the NHD layout
 //    FlashAttentionBackend::get_kv_cache_shape allocates, indexed by TENSOR
 //    STRIDES (the two dim-1 unbind slices; block stride 2*bs*H*D) — NOT cpu_attn's
 //    HND arithmetic (M1.6 Task-3 layout trap).
@@ -77,20 +79,48 @@ __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloa
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __float2bfloat16(v); }
 
+// FlashAttention local-mask bounds for one bottom-right-aligned absolute query
+// position p. Negative window values mean the corresponding full bound. Public
+// PagedAttentionArgs uses nullopt for full attention; launchers unwrap it to -1.
+__device__ __forceinline__ int64_t WindowKeyMin(int64_t p, int window_left) {
+  if (window_left < 0) return 0;
+  const int64_t lower = p - static_cast<int64_t>(window_left);
+  return lower > 0 ? lower : 0;
+}
+
+__device__ __forceinline__ int64_t WindowKeyMax(int64_t p, int64_t seqlen,
+                                                bool causal, int window_right) {
+  int64_t upper = causal ? p : seqlen - 1;
+  if (window_right >= 0) {
+    const int64_t local_upper = p + static_cast<int64_t>(window_right);
+    if (local_upper < upper) upper = local_upper;
+  }
+  return upper < seqlen ? upper : seqlen - 1;
+}
+
+int WindowLeft(const PagedAttentionArgs& args) {
+  return args.window_size.has_value() ? args.window_size->left : -1;
+}
+
+int WindowRight(const PagedAttentionArgs& args) {
+  return args.window_size.has_value() ? args.window_size->right : -1;
+}
+
 // ===========================================================================
 // DECODE path (M1.6, unchanged): one block per (query token, q-head). The block
 // scans query_start_loc to find token t's request r, derives the absolute
 // position p, and streams keys 0..p (causal) from the paged cache with a
 // block-cooperative online (flash) softmax. Fully device-side / graph-safe.
 // ===========================================================================
-template <typename TQ, typename TKV, typename Tout>
+template <typename TQ, typename TKV, typename Tout, bool HasWindow>
 __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                      const TKV* v_cache, const int32_t* block_table,
                                      const int32_t* seq_lens, const int32_t* query_start_loc,
                                      int64_t num_reqs, int64_t hq, int64_t num_kv_heads, int64_t d,
                                      int64_t block_size, int64_t bt_row, int64_t bt_col,
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal) {
+                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                     int window_left, int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index
   const int64_t h = blockIdx.y;  // q-head
   // Find request r with query_start_loc[r] <= t < query_start_loc[r+1].
@@ -110,7 +140,9 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
   const int64_t seqlen = seq_lens[r];
   const int64_t context = seqlen - query_len;
   const int64_t p = context + (t - q0);
-  const int64_t jmax = causal ? p : seqlen - 1;
+  const int64_t jmin = HasWindow ? WindowKeyMin(p, window_left) : 0;
+  const int64_t jmax = HasWindow ? WindowKeyMax(p, seqlen, causal, window_right)
+                                 : (causal ? p : seqlen - 1);
   const int64_t g = h / (hq / num_kv_heads);
   const int64_t qoff = (t * hq + h) * d;
 
@@ -125,7 +157,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
   }
   __syncthreads();
 
-  for (int64_t j = 0; j <= jmax; ++j) {
+  for (int64_t j = jmin; j <= jmax; ++j) {
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
@@ -198,7 +230,7 @@ __device__ inline void LoadRow8(const float* p, int64_t base, int lane, float r[
   }
 }
 
-template <typename TQ, typename TKV, typename Tout>
+template <typename TQ, typename TKV, typename Tout, bool HasWindow>
 __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                               const TKV* v_cache, const int32_t* block_table,
                                               const int32_t* seq_lens,
@@ -207,7 +239,8 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
                                               int64_t block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal) {
+                                              float scale, bool causal, int window_left,
+                                              int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
   const int64_t h = blockIdx.y;  // q-head
   const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -230,7 +263,9 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
   const int64_t seqlen = seq_lens[r];
   const int64_t context = seqlen - query_len;
   const int64_t p = context + (t - q0);
-  const int64_t jmax = causal ? p : seqlen - 1;
+  const int64_t jmin = HasWindow ? WindowKeyMin(p, window_left) : 0;
+  const int64_t jmax = HasWindow ? WindowKeyMax(p, seqlen, causal, window_right)
+                                 : (causal ? p : seqlen - 1);
   const int64_t g = h / (hq / num_kv_heads);
   const int64_t qoff = (t * hq + h) * d;
 
@@ -243,7 +278,7 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
   for (int i = 0; i < kDecEpl; ++i) o_reg[i] = 0.0f;
 
   // Warp-strided scan over keys: warp-shuffle q.k, register online softmax.
-  for (int64_t j = warp; j <= jmax; j += kDecWarps) {
+  for (int64_t j = jmin + warp; j <= jmax; j += kDecWarps) {
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     float k_reg[kDecEpl];
@@ -323,7 +358,7 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
 //   grid = (num_tokens, num_kv_heads); block = kDecWarps * 32.
 //   Shared: o_sh[kDecWarps*QG*d] | m_sh[kDecWarps*QG] | l_sh[kDecWarps*QG] (f32).
 // ===========================================================================
-template <typename TQ, typename TKV, typename Tout, int QG>
+template <typename TQ, typename TKV, typename Tout, int QG, bool HasWindow>
 __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                               const TKV* v_cache, const int32_t* block_table,
                                               const int32_t* seq_lens,
@@ -332,7 +367,8 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
                                               int64_t block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal) {
+                                              float scale, bool causal, int window_left,
+                                              int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
   const int64_t g = blockIdx.y;  // KV head (shared by QG q-heads)
   const int warp = static_cast<int>(threadIdx.x) >> 5;
@@ -355,7 +391,9 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
   const int64_t seqlen = seq_lens[r];
   const int64_t context = seqlen - query_len;
   const int64_t p = context + (t - q0);
-  const int64_t jmax = causal ? p : seqlen - 1;
+  const int64_t jmin = HasWindow ? WindowKeyMin(p, window_left) : 0;
+  const int64_t jmax = HasWindow ? WindowKeyMax(p, seqlen, causal, window_right)
+                                 : (causal ? p : seqlen - 1);
   const int64_t h0 = g * QG;  // first q-head sharing this KV head (QG == qpk)
 
   // This lane's query slice for ALL QG heads, loaded once (128-bit coalesced/head).
@@ -376,7 +414,7 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
 
   // Warp-strided scan over keys: the KV row is loaded ONCE per key and reused
   // across all QG q-heads (the 8x KV-traffic reduction vs the opt kernel).
-  for (int64_t j = warp; j <= jmax; j += kDecWarps) {
+  for (int64_t j = jmin + warp; j <= jmax; j += kDecWarps) {
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     float k_reg[kDecEpl];
@@ -457,14 +495,15 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
 // reused across the rows → bandwidth amortization). Per key: warp-shuffle dot,
 // online-softmax rescale of the register accumulator. No per-key block sync.
 // ===========================================================================
-template <typename TQ, typename TKV, typename Tout>
+template <typename TQ, typename TKV, typename Tout, bool HasWindow>
 __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                  const TKV* v_cache, const int32_t* block_table,
                                  const int32_t* seq_lens, const int32_t* query_start_loc,
                                  const int2* tiles, int num_tiles, int hq, int num_kv_heads, int d,
                                  int block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk,
                                  int64_t kc_pg, int64_t kc_hd, int64_t vc_blk, int64_t vc_pg,
-                                 int64_t vc_hd, float scale, bool causal, int bn) {
+                                 int64_t vc_hd, float scale, bool causal, int window_left,
+                                 int window_right, int bn) {
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
   if (tile_idx >= num_tiles) return;
@@ -486,7 +525,10 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
   const int t = q0 + local_row;          // global query token
   const bool active = local_row < qlen;  // valid query row?
   const int p = context + local_row;     // absolute position (if active)
-  const int my_jmax = causal ? p : (seqlen - 1);
+  const int my_jmin = HasWindow ? static_cast<int>(WindowKeyMin(p, window_left)) : 0;
+  const int my_jmax = HasWindow
+                          ? static_cast<int>(WindowKeyMax(p, seqlen, causal, window_right))
+                          : (causal ? p : seqlen - 1);
 
   const int epl = (d + 31) / 32;  // elems per lane (<= kMaxEpl)
   float q_reg[kMaxEpl];
@@ -509,7 +551,12 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
   // in each shared-memory load barrier (rows with smaller jmax process a prefix).
   // local0 < qlen is guaranteed by the host tile builder.
   const int last_row = min(local0 + bm, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
 
   extern __shared__ float smem[];
   float* ksm = smem;           // [bn * d]
@@ -517,7 +564,7 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
   const int nthreads = bm * 32;
   const int tid = warp * 32 + lane;
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += bn) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += bn) {
     const int tile_keys = min(bn, block_jmax - j0 + 1);
     // Cooperative K/V tile load: [tile_keys, d] → shared memory (as f32).
     for (int idx = tid; idx < tile_keys * d; idx += nthreads) {
@@ -535,8 +582,9 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
     __syncthreads();
 
     if (active) {
+      const int kmin = HasWindow ? max(j0, my_jmin) : j0;
       const int kmax = min(j0 + tile_keys - 1, my_jmax);
-      for (int j = j0; j <= kmax; ++j) {
+      for (int j = kmin; j <= kmax; ++j) {
         const int koff = (j - j0) * d;
         float dot = 0.0f;
         for (int i = 0; i < epl; ++i) {
@@ -600,14 +648,15 @@ using BcolFrag =
 using BrowFrag =
     attn_wmma::fragment<attn_wmma::matrix_b, kWmmaM, kWmmaM, kWmmaM, __nv_bfloat16, attn_wmma::row_major>;
 
-template <typename TQ, typename TKV, typename Tout>
+template <typename TQ, typename TKV, typename Tout, bool HasWindow>
 __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                      const TKV* v_cache, const int32_t* block_table,
                                      const int32_t* seq_lens, const int32_t* query_start_loc,
                                      const int2* tiles, int num_tiles, int hq, int num_kv_heads,
                                      int d, int block_size, int64_t bt_row, int64_t bt_col,
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal) {
+                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                     int window_left, int window_right) {
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
   if (tile_idx >= num_tiles) return;
@@ -657,12 +706,17 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
   __syncthreads();
 
   const int last_row = min(local0 + kWmmaM, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
   const int nqk = d / kWmmaM;         // QKᵀ k-steps (also = # of Q k-tiles)
   const int nqk_n = kWmmaBN / kWmmaM; // QKᵀ n-tiles (key sub-tiles)
   const int npv_n = d / kWmmaM;       // P·V n-tiles (over head_dim)
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += kWmmaBN) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += kWmmaBN) {
     const int tile_keys = min(kWmmaBN, block_jmax - j0 + 1);
     // Stage the full [BN, d] K/V tile → bf16 shared. Rows [tile_keys, BN) are
     // ZEROED (not left stale): P·V multiplies masked probs (Pb=0) by these rows,
@@ -709,11 +763,18 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
       const int i = tid;
       const int local_row = local0 + i;
       const bool active = local_row < qlen;
-      const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+      const int p_i = context + local_row;
+      const int jmin_i =
+          !active || !HasWindow ? 0 : static_cast<int>(WindowKeyMin(p_i, window_left));
+      const int jmax_i = !active
+                             ? -1
+                             : (HasWindow ? static_cast<int>(WindowKeyMax(
+                                                p_i, seqlen, causal, window_right))
+                                          : (causal ? p_i : seqlen - 1));
       float row_max = -CUDART_INF_F;
       for (int jj = 0; jj < tile_keys; ++jj) {
         const int j = j0 + jj;
-        if (j <= jmax_i) {
+        if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
           const float s = Ssm[i * kWmmaBN + jj] * scale;
           Ssm[i * kWmmaBN + jj] = s;  // store scaled for the exp pass
           row_max = fmaxf(row_max, s);
@@ -726,7 +787,7 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
       for (int jj = 0; jj < kWmmaBN; ++jj) {
         const int j = j0 + jj;
         float p = 0.0f;
-        if (jj < tile_keys && j <= jmax_i) {
+        if (jj < tile_keys && (!HasWindow || j >= jmin_i) && j <= jmax_i) {
           p = __expf(Ssm[i * kWmmaBN + jj] - m_new);
           row_sum += p;
         }
@@ -804,14 +865,15 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
 constexpr int kGqaBN = 32;  // keys per K/V tile (multiple of 16; smaller than
                             // the per-head BN=64 so the QG O buffers fit shared)
 
-template <typename TQ, typename TKV, typename Tout, int QG>
+template <typename TQ, typename TKV, typename Tout, int QG, bool HasWindow>
 __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                         const TKV* v_cache, const int32_t* block_table,
                                         const int32_t* seq_lens, const int32_t* query_start_loc,
                                         const int2* tiles, int num_tiles, int hq, int num_kv_heads,
                                         int d, int block_size, int64_t bt_row, int64_t bt_col,
                                         int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                        int64_t vc_pg, int64_t vc_hd, float scale, bool causal) {
+                                        int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                        int window_left, int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;  // group over hq/QG groups of QG consecutive q-heads
   if (tile_idx >= num_tiles) return;
@@ -866,12 +928,17 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
   __syncthreads();
 
   const int last_row = min(local0 + kWmmaM, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
   const int nqk = d / kWmmaM;          // QKᵀ k-steps
   const int nqk_n = kGqaBN / kWmmaM;   // QKᵀ n-tiles (key sub-tiles)
   const int npv_n = d / kWmmaM;        // P·V n-tiles (over head_dim)
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += kGqaBN) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += kGqaBN) {
     const int tile_keys = min(kGqaBN, block_jmax - j0 + 1);
     // Stage the [BN,d] K/V tile ONCE → bf16 shared, shared by all QG heads. Rows
     // [tile_keys, BN) are ZEROED (not left stale): P·V multiplies masked probs
@@ -921,11 +988,18 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
         const int i = tid;
         const int local_row = local0 + i;
         const bool active = local_row < qlen;
-        const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+        const int p_i = context + local_row;
+        const int jmin_i =
+            !active || !HasWindow ? 0 : static_cast<int>(WindowKeyMin(p_i, window_left));
+        const int jmax_i = !active
+                               ? -1
+                               : (HasWindow ? static_cast<int>(WindowKeyMax(
+                                                  p_i, seqlen, causal, window_right))
+                                            : (causal ? p_i : seqlen - 1));
         float row_max = -CUDART_INF_F;
         for (int jj = 0; jj < tile_keys; ++jj) {
           const int j = j0 + jj;
-          if (j <= jmax_i) {
+          if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
             const float s = Ssm[i * kGqaBN + jj] * scale;
             Ssm[i * kGqaBN + jj] = s;  // store scaled for the exp pass
             row_max = fmaxf(row_max, s);
@@ -938,7 +1012,7 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
         for (int jj = 0; jj < kGqaBN; ++jj) {
           const int j = j0 + jj;
           float p = 0.0f;
-          if (jj < tile_keys && j <= jmax_i) {
+          if (jj < tile_keys && (!HasWindow || j >= jmin_i) && j <= jmax_i) {
             p = __expf(Ssm[i * kGqaBN + jj] - m_new);
             row_sum += p;
           }
@@ -1024,7 +1098,7 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
 // ===========================================================================
 constexpr int kF2BN = 32;  // keys per K/V tile (K and V share KVb, two-phase).
 
-template <typename TQ, typename TKV, typename Tout, int QG>
+template <typename TQ, typename TKV, typename Tout, int QG, bool HasWindow>
 __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const TKV* k_cache,
                                               const TKV* v_cache, const int32_t* block_table,
                                               const int32_t* seq_lens,
@@ -1033,7 +1107,8 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
                                               int block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal) {
+                                              float scale, bool causal, int window_left,
+                                              int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
   if (tile_idx >= num_tiles) return;
@@ -1096,9 +1171,14 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
   __syncthreads();
 
   const int last_row = min(local0 + kWmmaM, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += kF2BN) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += kF2BN) {
     const int tile_keys = min(kF2BN, block_jmax - j0 + 1);
 
     // ---- K-phase: stage K into KVb.
@@ -1141,11 +1221,18 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
         const int i = tid;
         const int local_row = local0 + i;
         const bool active = local_row < qlen;
-        const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+        const int p_i = context + local_row;
+        const int jmin_i =
+            !active || !HasWindow ? 0 : static_cast<int>(WindowKeyMin(p_i, window_left));
+        const int jmax_i = !active
+                               ? -1
+                               : (HasWindow ? static_cast<int>(WindowKeyMax(
+                                                  p_i, seqlen, causal, window_right))
+                                            : (causal ? p_i : seqlen - 1));
         float row_max = -CUDART_INF_F;
         for (int jj = 0; jj < tile_keys; ++jj) {
           const int j = j0 + jj;
-          if (j <= jmax_i) {
+          if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
             const float s = Ssm[i * kF2BN + jj] * scale;
             Ssm[i * kF2BN + jj] = s;
             row_max = fmaxf(row_max, s);
@@ -1158,7 +1245,7 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
         for (int jj = 0; jj < kF2BN; ++jj) {
           const int j = j0 + jj;
           float p = 0.0f;
-          if (jj < tile_keys && j <= jmax_i) {
+          if (jj < tile_keys && (!HasWindow || j >= jmin_i) && j <= jmax_i) {
             p = __expf(Ssm[i * kF2BN + jj] - m_new);
             row_sum += p;
           }
@@ -1282,7 +1369,7 @@ __device__ __forceinline__ void StageKeyBf16(__nv_bfloat16* dst, const TKV* base
   }
 }
 
-template <typename TQ, typename TKV, typename Tout, int QG>
+template <typename TQ, typename TKV, typename Tout, int QG, bool HasWindow>
 __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                                  const TKV* v_cache, const int32_t* block_table,
                                                  const int32_t* seq_lens,
@@ -1291,7 +1378,8 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
                                                  int block_size, int64_t bt_row, int64_t bt_col,
                                                  int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                  int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                                 float scale, bool causal) {
+                                                 float scale, bool causal, int window_left,
+                                                 int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
   if (tile_idx >= num_tiles) return;
@@ -1352,9 +1440,14 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
   __syncthreads();
 
   const int last_row = min(local0 + kWmmaM, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += kF2BN) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += kF2BN) {
     const int tile_keys = min(kF2BN, block_jmax - j0 + 1);
 
     // ---- K-phase: per-KEY address + vectorized bf16 copy.
@@ -1402,10 +1495,18 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
       float* cbuf = corrbuf + hh * kWmmaM * kWmmaM;
       const int local_row = local0 + i;
       const bool active = local_row < qlen;
-      const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+      const int p_i = context + local_row;
+      const int jmin_i =
+          !active || !HasWindow ? 0 : static_cast<int>(WindowKeyMin(p_i, window_left));
+      const int jmax_i = !active
+                             ? -1
+                             : (HasWindow ? static_cast<int>(WindowKeyMax(
+                                                p_i, seqlen, causal, window_right))
+                                          : (causal ? p_i : seqlen - 1));
       float sval = -CUDART_INF_F;
       bool valid = false;
-      if (lane < tile_keys && (j0 + lane) <= jmax_i) {
+      if (lane < tile_keys && (!HasWindow || (j0 + lane) >= jmin_i) &&
+          (j0 + lane) <= jmax_i) {
         sval = Sh[i * kF2BN + lane] * scale;
         valid = true;
       }
@@ -1508,7 +1609,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
 // 1 block/SM (vs 2 blocks at BM=16 / 40 KiB) — the occupancy-vs-traffic call the
 // microbench decides. QKᵀ also parallelizes better: the QG·MT·(BN/16) score
 // tiles now fill more of the 8 warps (BM=16 leaves 6/8 idle in QKᵀ).
-template <typename TQ, typename TKV, typename Tout, int QG, int MT>
+template <typename TQ, typename TKV, typename Tout, int QG, int MT, bool HasWindow>
 __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                                    const TKV* v_cache, const int32_t* block_table,
                                                    const int32_t* seq_lens,
@@ -1517,7 +1618,8 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
                                                    int block_size, int64_t bt_row, int64_t bt_col,
                                                    int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                                   float scale, bool causal) {
+                                                   float scale, bool causal, int window_left,
+                                                   int window_right) {
   constexpr int BM = MT * kWmmaM;  // query rows per block (MT WMMA M-tiles)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
@@ -1581,9 +1683,14 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
   __syncthreads();
 
   const int last_row = min(local0 + BM, qlen) - 1;
-  const int block_jmax = causal ? (context + last_row) : (seqlen - 1);
+  const int block_jmin =
+      HasWindow ? static_cast<int>(WindowKeyMin(context + local0, window_left)) : 0;
+  const int block_jmax = HasWindow
+                             ? static_cast<int>(WindowKeyMax(
+                                   context + last_row, seqlen, causal, window_right))
+                             : (causal ? context + last_row : seqlen - 1);
 
-  for (int j0 = 0; j0 <= block_jmax; j0 += kF2BN) {
+  for (int j0 = block_jmin; j0 <= block_jmax; j0 += kF2BN) {
     const int tile_keys = min(kF2BN, block_jmax - j0 + 1);
 
     // ---- K-phase: per-KEY address + vectorized bf16 copy.
@@ -1633,10 +1740,18 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
       float* cbuf = corrbuf + hh * BM * kWmmaM;
       const int local_row = local0 + i;
       const bool active = local_row < qlen;
-      const int jmax_i = !active ? -1 : (causal ? (context + local_row) : (seqlen - 1));
+      const int p_i = context + local_row;
+      const int jmin_i =
+          !active || !HasWindow ? 0 : static_cast<int>(WindowKeyMin(p_i, window_left));
+      const int jmax_i = !active
+                             ? -1
+                             : (HasWindow ? static_cast<int>(WindowKeyMax(
+                                                p_i, seqlen, causal, window_right))
+                                          : (causal ? p_i : seqlen - 1));
       float sval = -CUDART_INF_F;
       bool valid = false;
-      if (lane < tile_keys && (j0 + lane) <= jmax_i) {
+      if (lane < tile_keys && (!HasWindow || (j0 + lane) >= jmin_i) &&
+          (j0 + lane) <= jmax_i) {
         sval = Sh[i * kF2BN + lane] * scale;
         valid = true;
       }
@@ -1774,7 +1889,9 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
       const int gblock = kDecWarps * 32;
       const size_t gshmem =
           (static_cast<size_t>(kDecWarps) * QG * d + 2ull * kDecWarps * QG) * sizeof(float);
-      auto* gkernel = PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG>;
+      auto* gkernel = args.window_size.has_value()
+                          ? PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG, true>
+                          : PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG, false>;
       if (gshmem > 48u * 1024u) {
         Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(gkernel),
                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1788,7 +1905,8 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
           block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
           num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
           k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
-          v_cache.stride[1], v_cache.stride[2], args.scale, args.causal);
+          v_cache.stride[1], v_cache.stride[2], args.scale, args.causal,
+          WindowLeft(args), WindowRight(args));
       Check(cudaGetLastError(), "paged_attention decode-gqa launch");
       return;
     }
@@ -1797,22 +1915,30 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
     const int block = kDecWarps * 32;
     const size_t shmem =
         (static_cast<size_t>(kDecWarps) * d + 2 * kDecWarps) * sizeof(float);
-    PagedAttentionDecodeOptKernel<TQ, TKV, Tout><<<grid, block, shmem, s>>>(
+    auto* opt_kernel = args.window_size.has_value()
+                           ? PagedAttentionDecodeOptKernel<TQ, TKV, Tout, true>
+                           : PagedAttentionDecodeOptKernel<TQ, TKV, Tout, false>;
+    opt_kernel<<<grid, block, shmem, s>>>(
         out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
         block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
         num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
         k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
-        v_cache.stride[1], v_cache.stride[2], args.scale, args.causal);
+        v_cache.stride[1], v_cache.stride[2], args.scale, args.causal,
+        WindowLeft(args), WindowRight(args));
     Check(cudaGetLastError(), "paged_attention decode-opt launch");
     return;
   }
   const size_t shmem = (static_cast<size_t>(d) + kPagedBlock) * sizeof(float);
-  PagedAttentionKernel<TQ, TKV, Tout><<<grid, kPagedBlock, shmem, s>>>(
+  auto* kernel = args.window_size.has_value()
+                     ? PagedAttentionKernel<TQ, TKV, Tout, true>
+                     : PagedAttentionKernel<TQ, TKV, Tout, false>;
+  kernel<<<grid, kPagedBlock, shmem, s>>>(
       out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
       block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), num_reqs,
       hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
       k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1],
-      v_cache.stride[2], args.scale, args.causal);
+      v_cache.stride[2], args.scale, args.causal, WindowLeft(args),
+      WindowRight(args));
   Check(cudaGetLastError(), "paged_attention decode launch");
 }
 
@@ -1922,7 +2048,9 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
 
   const int bn = kBN;
   const size_t shmem = static_cast<size_t>(2) * bn * d * sizeof(float);
-  auto* kernel = PagedFlashKernel<TQ, TKV, Tout>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashKernel<TQ, TKV, Tout, true>
+                     : PagedFlashKernel<TQ, TKV, Tout, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1937,7 +2065,7 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, bn);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args), bn);
   Check(cudaGetLastError(), "paged_attention prefill flash launch");
   Check(cudaFreeAsync(d_tiles, s), "paged flash tiles free");
 }
@@ -1960,7 +2088,9 @@ void LaunchPrefillWmma(cudaStream_t s, Tensor& out, const Tensor& query, const T
   const size_t f32_bytes =
       (static_cast<size_t>(kWmmaM) * d + static_cast<size_t>(kWmmaM) * kWmmaBN) * sizeof(float);
   const size_t shmem = bf16_bytes + f32_bytes;
-  auto* kernel = PagedFlashWmmaKernel<TQ, TKV, Tout>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashWmmaKernel<TQ, TKV, Tout, true>
+                     : PagedFlashWmmaKernel<TQ, TKV, Tout, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1975,7 +2105,7 @@ void LaunchPrefillWmma(cudaStream_t s, Tensor& out, const Tensor& query, const T
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma tiles free");
 }
@@ -2001,7 +2131,9 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
   const size_t f32_bytes =
       (static_cast<size_t>(QG) * kWmmaM * d + static_cast<size_t>(kWmmaM) * kGqaBN) * sizeof(float);
   const size_t shmem = bf16_bytes + f32_bytes;
-  auto* kernel = PagedFlashWmmaGqaKernel<TQ, TKV, Tout, QG>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashWmmaGqaKernel<TQ, TKV, Tout, QG, true>
+                     : PagedFlashWmmaGqaKernel<TQ, TKV, Tout, QG, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2017,7 +2149,7 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-gqa launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-gqa tiles free");
 }
@@ -2046,7 +2178,9 @@ void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query
       (static_cast<size_t>(kWmmaM) * kF2BN + static_cast<size_t>(QG) * kWmmaM * kWmmaM) *
       sizeof(float);
   const size_t shmem = bf16_bytes + f32_bytes;
-  auto* kernel = PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG, true>
+                     : PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2062,7 +2196,7 @@ void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2 launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2 tiles free");
 }
@@ -2089,7 +2223,9 @@ void LaunchPrefillWmmaGqaFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& qu
       (static_cast<size_t>(QG) * kWmmaM * kF2BN + static_cast<size_t>(QG) * kWmmaM * kWmmaM) *
       sizeof(float);
   const size_t shmem = bf16_bytes + f32_bytes;
-  auto* kernel = PagedFlashWmmaGqaFlash2VecKernel<TQ, TKV, Tout, QG>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashWmmaGqaFlash2VecKernel<TQ, TKV, Tout, QG, true>
+                     : PagedFlashWmmaGqaFlash2VecKernel<TQ, TKV, Tout, QG, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2105,7 +2241,7 @@ void LaunchPrefillWmmaGqaFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& qu
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec tiles free");
 }
@@ -2133,7 +2269,9 @@ void LaunchPrefillWmmaGqaFlash2VecBM(cudaStream_t s, Tensor& out, const Tensor& 
   const size_t f32_bytes =
       (static_cast<size_t>(QG) * BM * kF2BN + static_cast<size_t>(QG) * BM * kWmmaM) * sizeof(float);
   const size_t shmem = bf16_bytes + f32_bytes;
-  auto* kernel = PagedFlashWmmaGqaFlash2VecBMKernel<TQ, TKV, Tout, QG, MT>;
+  auto* kernel = args.window_size.has_value()
+                     ? PagedFlashWmmaGqaFlash2VecBMKernel<TQ, TKV, Tout, QG, MT, true>
+                     : PagedFlashWmmaGqaFlash2VecBMKernel<TQ, TKV, Tout, QG, MT, false>;
   if (shmem > 48u * 1024u) {
     Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2149,7 +2287,7 @@ void LaunchPrefillWmmaGqaFlash2VecBM(cudaStream_t s, Tensor& out, const Tensor& 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal);
+      args.scale, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec-bm launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec-bm tiles free");
 }

@@ -1,7 +1,11 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 // Paged attention op unit tests. Semantics ported from
 // vllm/v1/attention/backends/flash_attn.py::FlashAttentionImpl.forward @ e24d1b24
-// (causal GQA softmax over the paged K/V; scale = self.scale). The cache is the
+// and tests/v1/attention/test_attention_backends.py:745-867 (causal decoder and
+// symmetric encoder sliding-window masks over paged K/V; scale = self.scale).
+// Kernel vectors additionally carry tests/kernels/attention/test_flash_attn.py:
+// 95-217 (paged varlen, GQA and window boundaries).
+// The cache is the
 // NHD FlashAttention layout — the two dim-1 unbind slices of get_kv_cache_shape's
 // (num_blocks, 2, block_size, num_kv_heads, head_size).
 //
@@ -23,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -31,6 +36,7 @@
 #include "vt/ops.h"
 
 using vt::AttentionArgs;
+using vt::AttentionWindow;
 using vt::Backend;
 using vt::Device;
 using vt::DeviceType;
@@ -94,7 +100,7 @@ std::vector<float> RandF32(size_t n, uint32_t seed) {
   return v;
 }
 
-// Host composed reference: per-token causal GQA softmax over K/V gathered from a
+// Host composed reference: per-token causal/non-causal GQA softmax over K/V gathered from a
 // contiguous NHD cache (block b, offset o at flat index ((b*bs+o)*H+g)*D+e). This
 // is the M0.9-style reference, independent of the op's stride arithmetic.
 std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vector<float>& kc,
@@ -102,7 +108,8 @@ std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vect
                                     const std::vector<int32_t>& block_table, int64_t max_blocks,
                                     const std::vector<int32_t>& seq_lens,
                                     const std::vector<int32_t>& qsl, int64_t hq, int64_t hk,
-                                    int64_t d, int64_t block_size, float scale, bool causal) {
+                                    int64_t d, int64_t block_size, float scale, bool causal,
+                                    std::optional<AttentionWindow> window = std::nullopt) {
   const int64_t num_reqs = static_cast<int64_t>(seq_lens.size());
   const int64_t num_tokens = qsl.back();
   const int64_t qpk = hq / hk;
@@ -115,13 +122,17 @@ std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vect
     for (int64_t local = 0; local < qlen; ++local) {
       const int64_t t = q0 + local;
       const int64_t p = context + local;
-      const int64_t jmax = causal ? p : seqlen - 1;
+      const int64_t jmin =
+          window.has_value() ? std::max<int64_t>(0, p - window->left) : 0;
+      int64_t jmax = causal ? p : seqlen - 1;
+      if (window.has_value()) jmax = std::min(jmax, p + window->right);
+      jmax = std::min(jmax, seqlen - 1);
       for (int64_t h = 0; h < hq; ++h) {
         const int64_t g = h / qpk;
         const int64_t qoff = (t * hq + h) * d;
-        std::vector<float> sc(static_cast<size_t>(jmax + 1));
+        std::vector<float> sc(static_cast<size_t>(jmax - jmin + 1));
         float m = -std::numeric_limits<float>::infinity();
-        for (int64_t j = 0; j <= jmax; ++j) {
+        for (int64_t j = jmin; j <= jmax; ++j) {
           const int64_t blk = block_table[static_cast<size_t>(r * max_blocks + j / block_size)];
           const int64_t off = j % block_size;
           const int64_t kbase = ((blk * block_size + off) * hk + g) * d;
@@ -129,23 +140,23 @@ std::vector<float> ComposedPagedRef(const std::vector<float>& q, const std::vect
           for (int64_t e = 0; e < d; ++e)
             dot += q[static_cast<size_t>(qoff + e)] * kc[static_cast<size_t>(kbase + e)];
           dot *= scale;
-          sc[static_cast<size_t>(j)] = dot;
+          sc[static_cast<size_t>(j - jmin)] = dot;
           if (dot > m) m = dot;
         }
         float denom = 0.0f;
-        for (int64_t j = 0; j <= jmax; ++j) {
-          const float e = std::exp(sc[static_cast<size_t>(j)] - m);
-          sc[static_cast<size_t>(j)] = e;
+        for (int64_t j = jmin; j <= jmax; ++j) {
+          const float e = std::exp(sc[static_cast<size_t>(j - jmin)] - m);
+          sc[static_cast<size_t>(j - jmin)] = e;
           denom += e;
         }
         const float inv = 1.0f / denom;
         for (int64_t e = 0; e < d; ++e) {
           float a = 0.0f;
-          for (int64_t j = 0; j <= jmax; ++j) {
+          for (int64_t j = jmin; j <= jmax; ++j) {
             const int64_t blk = block_table[static_cast<size_t>(r * max_blocks + j / block_size)];
             const int64_t off = j % block_size;
             const int64_t vbase = ((blk * block_size + off) * hk + g) * d;
-            a += sc[static_cast<size_t>(j)] * inv * vc[static_cast<size_t>(vbase + e)];
+            a += sc[static_cast<size_t>(j - jmin)] * inv * vc[static_cast<size_t>(vbase + e)];
           }
           out[static_cast<size_t>(qoff + e)] = a;
         }
@@ -437,6 +448,113 @@ TEST_CASE("paged_attention block-spanning decode reads across multiple blocks") 
   for (size_t i = 0; i < ref.size(); ++i) CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
 }
 
+// Port of tests/v1/attention/test_attention_backends.py::
+// test_sliding_window_backend_correctness. One ragged batch combines prefill,
+// decode and context-bearing chunked prefill; W straddles page boundaries.
+TEST_CASE("paged_attention sliding-window decoder matches bottom-right causal mask") {
+  const int64_t Hq = 4, Hk = 2, D = 8, block_size = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  std::vector<int32_t> qsl = {0, 5, 6, 9};
+  std::vector<int32_t> seq_lens = {5, 9, 11};
+  const int64_t num_tokens = qsl.back();
+  const int64_t num_blocks = 12, max_blocks = 3;
+  std::vector<int32_t> block_table = {
+      2, 3, 0,   // five-token prefill
+      4, 7, 8,   // decode at absolute position 8
+      1, 9, 10,  // three-token chunk at positions 8..10
+  };
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 3101);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3102);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3103);
+
+  Queue qq = Q();
+  Tensor tq = F32(q, {num_tokens, Hq, D});
+  Tensor tkc = Contig(kc.data(), DType::kF32, Cpu(),
+                      {num_blocks, block_size, Hk, D});
+  Tensor tvc = Contig(vc.data(), DType::kF32, Cpu(),
+                      {num_blocks, block_size, Hk, D});
+  Tensor tbt = I32(block_table, {3, max_blocks});
+  Tensor tsl = I32(seq_lens, {3});
+  Tensor tqsl = I32(qsl, {4});
+
+  for (const int32_t width : {1, 3, 4, 5}) {
+    CAPTURE(width);
+    const AttentionWindow window{width - 1, 0};
+    const std::vector<float> ref = ComposedPagedRef(
+        q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D,
+        block_size, scale, /*causal=*/true, window);
+    std::vector<float> got(ref.size(), 0.0f);
+    Tensor tout = F32(got, {num_tokens, Hq, D});
+    PagedAttentionArgs args{scale, true};
+    args.window_size = window;
+    vt::PagedAttention(qq, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    for (size_t i = 0; i < ref.size(); ++i) {
+      CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
+    }
+  }
+}
+
+// Port of test_sliding_window_encoder_backend_correctness. Non-causal encoder
+// windows are symmetric, and the absolute query positions are bottom-right
+// aligned when Q is shorter than K (context = seqlen-query_len).
+TEST_CASE("paged_attention sliding-window encoder is symmetric and bottom-right aligned") {
+  const int64_t Hq = 2, Hk = 1, D = 4, block_size = 4;
+  const int64_t query_len = 5, seqlen = 7;
+  const int64_t num_blocks = 4, max_blocks = 2;
+  const float scale = 0.5f;
+  std::vector<int32_t> qsl = {0, static_cast<int32_t>(query_len)};
+  std::vector<int32_t> seq_lens = {static_cast<int32_t>(seqlen)};
+  std::vector<int32_t> block_table = {3, 1};
+  auto q = RandF32(static_cast<size_t>(query_len * Hq * D), 3201);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3202);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 3203);
+  const AttentionWindow window{/*left=*/1, /*right=*/1};  // W=2
+  const std::vector<float> ref = ComposedPagedRef(
+      q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D,
+      block_size, scale, /*causal=*/false, window);
+
+  Queue qq = Q();
+  Tensor tq = F32(q, {query_len, Hq, D});
+  Tensor tkc = Contig(kc.data(), DType::kF32, Cpu(),
+                      {num_blocks, block_size, Hk, D});
+  Tensor tvc = Contig(vc.data(), DType::kF32, Cpu(),
+                      {num_blocks, block_size, Hk, D});
+  Tensor tbt = I32(block_table, {1, max_blocks});
+  Tensor tsl = I32(seq_lens, {1});
+  Tensor tqsl = I32(qsl, {2});
+  std::vector<float> got(ref.size(), 0.0f);
+  Tensor tout = F32(got, {query_len, Hq, D});
+  PagedAttentionArgs args{scale, false};
+  args.window_size = window;
+  vt::PagedAttention(qq, tout, tq, tkc, tvc, tbt, tsl, tqsl, args);
+
+  for (size_t i = 0; i < ref.size(); ++i) {
+    CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-5));
+  }
+
+  // The first query is at absolute p=2 and may see keys 1..3 only. Poison key
+  // 0 and keys 4..6; its output must stay bit-identical while later rows may use
+  // some of those keys. This directly proves both local bounds are enforced.
+  std::vector<float> poisoned_v = vc;
+  for (const int64_t key : {0, 4, 5, 6}) {
+    const int64_t blk = block_table[static_cast<size_t>(key / block_size)];
+    const int64_t off = key % block_size;
+    const int64_t base = (blk * block_size + off) * Hk * D;
+    for (int64_t e = 0; e < Hk * D; ++e) {
+      poisoned_v[static_cast<size_t>(base + e)] = 100000.0f + static_cast<float>(e);
+    }
+  }
+  Tensor poisoned_tvc = Contig(poisoned_v.data(), DType::kF32, Cpu(),
+                               {num_blocks, block_size, Hk, D});
+  std::vector<float> poisoned_out(got.size(), 0.0f);
+  Tensor poisoned_tout = F32(poisoned_out, {query_len, Hq, D});
+  vt::PagedAttention(qq, poisoned_tout, tq, tkc, poisoned_tvc, tbt, tsl,
+                     tqsl, args);
+  for (int64_t i = 0; i < Hq * D; ++i) {
+    CHECK(poisoned_out[static_cast<size_t>(i)] == got[static_cast<size_t>(i)]);
+  }
+}
+
 TEST_CASE("paged_attention validates shapes/args") {
   const int64_t block_size = 2, Hk = 1, D = 2;
   std::vector<float> kc(static_cast<size_t>(1 * block_size * Hk * D), 0.0f);
@@ -482,6 +600,16 @@ TEST_CASE("paged_attention validates shapes/args") {
     Tensor tsl_bad = Contig(sl64.data(), DType::kI64, Cpu(), {1});
     CHECK_THROWS_AS(
         vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl_bad, tqsl, PagedAttentionArgs{1.0f, true}),
+        std::runtime_error);
+  }
+  // A present window is an actual local window, so both inclusive distances
+  // must be non-negative (full attention is represented by nullopt).
+  {
+    Tensor tq = F32(q, {1, 2, D}), tp = F32(out, {1, 2, D});
+    PagedAttentionArgs bad{1.0f, true};
+    bad.window_size = AttentionWindow{-1, 0};
+    CHECK_THROWS_AS(
+        vt::PagedAttention(qq, tp, tq, tkc, tvc, tbt, tsl, tqsl, bad),
         std::runtime_error);
   }
 }
@@ -556,6 +684,54 @@ class DeviceTensor {
   Tensor t_;
 };
 
+void CheckCudaWindowCase(const std::vector<int32_t>& qsl,
+                         const std::vector<int32_t>& seq_lens, bool causal,
+                         AttentionWindow window, uint32_t seed) {
+  const int64_t Hq = 4, Hk = 2, D = 32, block_size = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  const int64_t num_reqs = static_cast<int64_t>(seq_lens.size());
+  const int64_t num_tokens = qsl.back();
+  const int32_t max_seq = *std::max_element(seq_lens.begin(), seq_lens.end());
+  const int64_t max_blocks = (max_seq + block_size - 1) / block_size;
+  const int64_t num_blocks = num_reqs * max_blocks;
+  std::vector<int32_t> block_table(static_cast<size_t>(num_blocks));
+  for (int64_t r = 0; r < num_reqs; ++r) {
+    for (int64_t b = 0; b < max_blocks; ++b) {
+      block_table[static_cast<size_t>(r * max_blocks + b)] =
+          static_cast<int32_t>(r * max_blocks + b);
+    }
+  }
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), seed);
+  auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), seed + 1);
+  auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), seed + 2);
+  const std::vector<float> ref = ComposedPagedRef(
+      q, kc, vc, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D,
+      block_size, scale, causal, window);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {num_tokens, Hq, D}, q.data());
+  DeviceTensor dkc(gpu, g.q, DType::kF32,
+                   {num_blocks, block_size, Hk, D}, kc.data());
+  DeviceTensor dvc(gpu, g.q, DType::kF32,
+                   {num_blocks, block_size, Hk, D}, vc.data());
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks},
+                   block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {num_tokens, Hq, D});
+  PagedAttentionArgs args{scale, causal};
+  args.window_size = window;
+  vt::PagedAttention(g.q, dout.tensor(), dq.tensor(), dkc.tensor(),
+                     dvc.tensor(), dbt.tensor(), dsl.tensor(), dqsl.tensor(),
+                     args);
+  std::vector<float> got(ref.size(), 0.0f);
+  dout.Download(g.q, got.data());
+  for (size_t i = 0; i < ref.size(); ++i) {
+    CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
+  }
+}
+
 }  // namespace
 
 TEST_CASE("paged_attention CUDA matches CPU (batched varlen, GQA, block-spanning)") {
@@ -598,6 +774,29 @@ TEST_CASE("paged_attention CUDA matches CPU (batched varlen, GQA, block-spanning
 
   for (size_t i = 0; i < ref.size(); ++i)
     CHECK(got[i] == doctest::Approx(ref[i]).epsilon(1e-4));
+}
+
+TEST_CASE("paged_attention CUDA sliding-window masks match upstream decoder and encoder vectors") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping sliding-window CUDA parity (dgx-pending)");
+    return;
+  }
+
+  // Mixed prefill/decode/chunked-prefill takes the portable tiled prefill path.
+  for (const int32_t width : {1, 3, 4, 5}) {
+    CAPTURE(width);
+    CheckCudaWindowCase({0, 5, 6, 9}, {5, 9, 11}, /*causal=*/true,
+                        AttentionWindow{width - 1, 0},
+                        5000u + static_cast<uint32_t>(width));
+  }
+  CheckCudaWindowCase({0, 129}, {129}, /*causal=*/true,
+                      AttentionWindow{4095, 0}, 5050);
+  // All query lengths are one, so this exercises the graph-safe decode path.
+  CheckCudaWindowCase({0, 1, 2}, {9, 11}, /*causal=*/true,
+                      AttentionWindow{4, 0}, 5100);
+  // Q<K bottom-right alignment with the symmetric encoder window.
+  CheckCudaWindowCase({0, 5}, {7}, /*causal=*/false,
+                      AttentionWindow{2, 2}, 5200);
 }
 
 // ===========================================================================
@@ -706,6 +905,28 @@ TEST_CASE("paged_attention CUDA WMMA (bf16 cache) matches f32 ref at head_dim 25
     max_abs = std::max(max_abs, std::abs(static_cast<double>(got[i]) - ref[i]));
   MESSAGE("WMMA bf16 prefill max_abs_err vs f32 ref = " << max_abs);
   CHECK(max_abs < 5e-2);
+
+  // The same optimized WMMA ladder must honor the local lower bound; FA-2 is
+  // ineligible here because query/out are f32.
+  const AttentionWindow local_window{31, 0};
+  const std::vector<float> local_ref = ComposedPagedRef(
+      q, kc_r, vc_r, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D,
+      block_size, scale, /*causal=*/true, local_window);
+  DeviceTensor local_out(gpu, g.q, DType::kF32, {num_tokens, Hq, D});
+  PagedAttentionArgs local_args{scale, true};
+  local_args.window_size = local_window;
+  vt::PagedAttention(g.q, local_out.tensor(), dq.tensor(), kview, vview,
+                     dbt.tensor(), dsl.tensor(), dqsl.tensor(), local_args);
+  std::vector<float> local_got(local_ref.size(), 0.0f);
+  local_out.Download(g.q, local_got.data());
+  double local_max_abs = 0.0;
+  for (size_t i = 0; i < local_ref.size(); ++i) {
+    local_max_abs = std::max(
+        local_max_abs,
+        std::abs(static_cast<double>(local_got[i]) - local_ref[i]));
+  }
+  MESSAGE("WMMA sliding-window max_abs_err vs f32 ref = " << local_max_abs);
+  CHECK(local_max_abs < 5e-2);
 }
 
 // ===========================================================================
@@ -893,6 +1114,37 @@ TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at 
     if (got1[i] != got2[i]) ++mism;
   MESSAGE("FA-2 host-metadata vs fallback mismatches = " << mism);
   CHECK(mism == 0);
+
+  // Finite windows must dispatch FA-2's LOCAL specialization. In particular,
+  // the decoder keeps causal semantics via right=0 while is_causal is normalized
+  // false for the local template; leaving the causal template selected would
+  // silently ignore the lower bound in the pinned dependency.
+  auto check_local = [&](bool causal, AttentionWindow window,
+                         const char* label) {
+    const std::vector<float> local_ref = ComposedPagedRef(
+        q_r, kc_r, vc_r, block_table, max_blocks, seq_lens, qsl, Hq, Hk, D,
+        block_size, scale, causal, window);
+    PagedAttentionArgs local_args{scale, causal};
+    local_args.window_size = window;
+    DeviceTensor local_out(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+    vt::PagedAttention(g.q, local_out.tensor(), dq.tensor(), kview, vview,
+                       dbt.tensor(), dsl.tensor(), dqsl.tensor(), local_args);
+    std::vector<uint16_t> local_got(local_ref.size(), 0);
+    local_out.Download(g.q, local_got.data());
+    double local_max_abs = 0.0;
+    for (size_t i = 0; i < local_ref.size(); ++i) {
+      local_max_abs = std::max(
+          local_max_abs,
+          std::abs(static_cast<double>(Bf16BitsToF32(local_got[i])) -
+                   local_ref[i]));
+    }
+    INFO(label);
+    CHECK(local_max_abs < 5e-2);
+  };
+  check_local(/*causal=*/true, AttentionWindow{31, 0},
+              "FA-2 causal decoder local window");
+  check_local(/*causal=*/false, AttentionWindow{31, 31},
+              "FA-2 symmetric encoder local window");
 }
 #else
 TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 256") {

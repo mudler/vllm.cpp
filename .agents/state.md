@@ -3198,3 +3198,57 @@ afterward. W2 therefore begins with source, CPU tests and compile-only CUDA
 validation and will not launch GPU work until that whole campaign releases the
 lock. Feature-positive model, oracle, nsys and every-axis performance/memory
 gates remain an explicit `GATING` handoff rather than invented evidence.
+
+## 2026-07-11 — C5 W2 sliding-window attention implemented and handed to feature gating
+
+`CLAIM-C5-SW-ATTN-1` completed its bounded implementation scope and is
+released. `ATTN-SLIDING-WINDOW` moves `ACTIVE -> GATING`, never `DONE`. The
+port adds:
+
+- typed top-level/effective-text-config `sliding_window` normalization;
+- generic per-layer-over-model precedence and the exact decoder `(W-1,0)` /
+  encoder `(W-1,W-1)` mapping;
+- one optional backend-neutral `vt::AttentionWindow` propagated into
+  `PagedAttentionArgs` and `AttentionLayer`;
+- bottom-right-aligned CPU lower/upper bounds;
+- compile-time full/local variants for every portable CUDA decode, tiled
+  prefill, WMMA, GQA, Flash2 and vectorized/BM specialization, avoiding a
+  per-key window branch on the existing full-attention path; and
+- pinned FA2 API normalization: a finite decoder window dispatches the
+  non-causal LOCAL specialization because `(W-1,0)` already carries the causal
+  right bound and the pinned causal template otherwise ignores `window_left`.
+
+Ported/upstream-derived tests cover mixed prefill/decode/chunked prefill,
+widths `{1,3,4,5}`, page boundaries, GQA, unequal Q/K bottom-right alignment,
+symmetric encoder poisoning, the q=129/W=4096 boundary, WMMA and FA2 local
+arms. Four real skips retain TP, FlashInfer, StarCoder2 and Gemma3 obligations.
+
+Fresh local evidence (no DGX command ran):
+
+- `cmake --build build-c5-attn-cpu -j8` passed with no new warning;
+- `VLLM_CPP_CPU_THREADS=1 ctest --test-dir build-c5-attn-cpu
+  --output-on-failure -j2` passed **100/100**;
+- `test_ops_paged_attn` passed **14/14 cases, 1,643 assertions**;
+  `test_attention_window` passed **3/3 cases, 22 assertions, four named skips**;
+  `test_hf_config` passed **9/9 cases, 98 assertions**; and the unchanged
+  common metadata regression passed **5/5 cases, 22 assertions**;
+- the three changed focused binaries pass a Debug ASan+UBSan ctest run with
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1`;
+- a temporary, non-repository NVIDIA CUDA 13.0.88 toolchain compiled
+  `cuda_paged_attn.cu` for `121a` with the optional accelerators disabled;
+  against the project-pinned CUTLASS v4.4.2 commit `da5e086`, it also compiled
+  `cuda_flash_attn_fa2.cu` and both causal and non-causal/local hdim256 bf16
+  FA2 instantiation units. Object symbols close both dispatch arms. This is
+  compile-only evidence; no runtime correctness/performance is inferred; and
+- `scripts/check-agent-record.py`, all **13** record mutation tests, and
+  `git diff --check` pass.
+
+The surviving `CLAIM-SERVE-GATE-1` campaign retains `/tmp/gpu`; W2 did not
+enqueue behind it or contaminate its benchmark. Remaining handoff: restore the
+pinned oracle environment, run G4 portable/FA2/FlashInfer-when-available vectors
+under one lock, land a supported StarCoder2/Gemma3-class consumer, nsys both
+engines on the identical feature-positive workload, and run G6-G9 correctness,
+throughput, latency and memory comparisons plus the unchanged 27B/35B
+regressions. Until then README and matrices say operator implemented/compile-
+checked, but no user-visible sliding-window model support.

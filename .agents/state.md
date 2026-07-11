@@ -3643,3 +3643,23 @@ unbroken `/tmp/gpu` hold: c1 greedy completed and c2 greedy repetition 2 is
 active. `VLLM::EngineCore` holds 70,350 MiB. Both 35B arms remain after the
 rest of the vLLM 27B greedy/sampled sweep. This inspection was read-only and
 did not alter or enqueue behind the campaign.
+
+## 2026-07-11 — C5 W8 dynamic-NTK claimed after pinned-chain audit
+
+`CLAIM-C5-DYNAMIC-1` moves `ATTN-ROPE-DYNAMIC-NTK` `READY -> ACTIVE` in
+isolated worktree `/home/mudler/_git/vllm.cpp-c5-dynamic`, branch
+`codex/c5-dynamic-w8`. Pinned review covered factory dispatch at
+`rotary_embedding/__init__.py:200-230`, both complete dynamic classes, the
+factor=1 upstream operator case, and config override/max-length behavior.
+
+The bounded scope is typed `alpha` and optional `max_trained_positions`, exact
+alpha-first dispatch, the factor/trained-length and alpha base transforms,
+rotary-dimension guard, missing-mode error, leaf tests, and pinned-source f32/
+bf16 NeoX/GPT-J goldens. Factor mode defaults trained length to max position as
+pinned; when both keys are present alpha wins. It reuses W5's owned dtype cache
+and supplied-cache apply seam without adding formula branches to the hot path.
+
+All other RoPE families, Hunyuan model implementation, and GPU execution are
+outside the claim. `CLAIM-SERVE-GATE-1` retains `/tmp/gpu`, so W8 starts with
+CPU, exact-class oracle and sanitizer work and will preserve model/CUDA/G9 as
+an explicit gating handoff.

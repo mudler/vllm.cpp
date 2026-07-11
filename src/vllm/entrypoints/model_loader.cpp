@@ -106,6 +106,18 @@ int LoadedEngine::ResolveMaxNumBatchedTokens(const EngineParams& params,
   return std::max(budget, seqs);
 }
 
+bool LoadedEngine::ResolveEnablePrefixCaching(const EngineParams& params,
+                                               const ModelInfo& model_info) {
+  if (params.enable_prefix_caching.has_value()) {
+    return *params.enable_prefix_caching;
+  }
+  // ModelConfig.is_prefix_caching_supported at the parity pin: generative
+  // hybrid and attention-free models default OFF while ordinary decoder-only
+  // models default ON. ModelInfo.has_inner_state covers the attention-free
+  // family in the native registry; is_hybrid covers Qwen3.5/3.6 GDN.
+  return !model_info.is_hybrid && !model_info.has_inner_state;
+}
+
 bool LoadedEngine::EnsureNoneHash() {
   // Idempotent: init_none_hash just (re)assigns the NONE_HASH global. Prefix
   // caching stays inert for prompts shorter than a block, so the (unseeded)
@@ -152,6 +164,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(params.max_model_len > 0
                          ? params.max_model_len
                          : static_cast<int>(config_.max_position_embeddings)),
+      prefix_caching_enabled_(ResolveEnablePrefixCaching(
+          params, model_->registration().info)),
       kv_cfg_(ModelRegistry::MakeKVCache(
           *model_, config_, params.block_size > 0 ? params.block_size : 32,
           params.num_blocks > 0 ? params.num_blocks : 256)),
@@ -163,7 +177,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
                                                     *model_)),
                      params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
-                 /*enable_caching=*/true),
+                 /*enable_caching=*/prefix_caching_enabled_),
       runner_(config_, *model_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
@@ -174,9 +188,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
-      block_hasher_(vllm::v1::get_request_block_hasher(
-          params.block_size > 0 ? params.block_size : 32,
-          vllm::v1::sha256_cbor)),
+      block_hasher_(prefix_caching_enabled_
+                        ? vllm::v1::get_request_block_hasher(
+                              params.block_size > 0 ? params.block_size : 32,
+                              vllm::v1::sha256_cbor)
+                        : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
 }

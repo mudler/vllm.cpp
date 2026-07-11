@@ -250,6 +250,7 @@ start_server() {
       --num-blocks "${num_blocks}"
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
+      --no-enable-prefix-caching
       --served-model-name gate
     )
   else
@@ -260,6 +261,7 @@ start_server() {
       --gpu-memory-utilization 0.6
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
+      --no-enable-prefix-caching
       --port "${port}"
     )
   fi
@@ -374,6 +376,7 @@ run_paired_traces() {
     --num-blocks "${num_blocks}"
     --max-num-seqs "${max_num_seqs}"
     --max-num-batched-tokens "${max_num_batched_tokens}"
+    --no-enable-prefix-caching
     --served-model-name gate
   )
   local -a profile_cmd=(
@@ -435,7 +438,8 @@ run_paired_traces() {
     --profile-dir "${vllm_profile_dir}"
     --metadata "${vllm_metadata}"
     --num-prompts 48
-    --max-num-seqs 16
+    --max-concurrency 16
+    --max-num-seqs "${max_num_seqs}"
     --max-num-batched-tokens "${max_num_batched_tokens}"
     --repetitions 3
   )

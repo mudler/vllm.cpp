@@ -6,14 +6,15 @@ Detailed commands, per-repetition values, hashes, and parity rationale remain
 in the [append-only parity ledger](../.agents/parity-ledger.md) and the linked
 feature specs.
 
-Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` FP4 output-contract checkpoint).
+Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` configuration-audit and
+cache-policy checkpoint).
 
 ## Current checkpoint
 
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **VOID / BELOW-FLOOR DIAGNOSTIC — no binding ratio** | `31d053f` completed all three interleaved 27B ours/vLLM c1–c32 ladders, six memory-return checks, and ours nsys. Mean total-throughput ratios were 0.959/0.926/0.934/0.937/0.961/0.956×; only 1–4 of 19 timing axes passed per point. This does **not** show a library/kernel regression: against the accepted offline checkpoint, ours was +0.14% at c16 and -0.63% at c32, while the online vLLM denominator was +4.92%/+4.65% under the changed corpus/frontend recipe. `d4ddeb1` then captured the 143-MiB vLLM trace after the Ninja fix, but the profiler rejected it because measured FP4 output digests differed from warmup. The timed grid independently shows why exact text is the wrong performance precondition: only 4/2,016 paired synthetic continuations matched, while the model gate passed and every request retained exact native counts. Trace/output-equality repair is CPU-green; all evidence remains void. [Diagnostic record](../.agents/state.md). | Record all output digests/exact-match counts diagnostically behind the commit-bound model gate, recapture the trace at the merged SHA, distinguish scheduling/config/frontend effects from model execution, then optimize and rerun the full 27B gate before 35B. |
+| `SERVE-GATE-ONLINE` | **VOID / BELOW-FLOOR DIAGNOSTIC — no binding ratio** | `31d053f` completed all three interleaved 27B ours/vLLM c1–c32 ladders, six memory-return checks, and ours nsys. Mean total-throughput ratios were 0.959/0.926/0.934/0.937/0.961/0.956×; only 1–4 of 19 timing axes passed per point. `ed6247d` captured the exact 48-prompt vLLM trace, but the old pair was not comparable: vllm.cpp's repeated prompts became prefix-cache hits while vLLM caching was off, and admission, max-sequence, and model-length settings differed. A separate audit also invalidated the historical offline denominators below. The repaired contract uses closed-loop c16 admission, max-seqs 32, production model length, explicit cache-off on both arms, three stable repetitions, and diagnostic output digests behind the real-model/count gates. The strongest old-trace lever is now the accepted `KV-DEVICE-RESIDENCY` spike: ours moved about 255.4 MiB of GDN state per direction at the representative mixed step. [Diagnostic record](../.agents/state.md). | Merge the repaired contract, recapture both trace arms, implement and A/B device-resident KV/GDN state, then rerun exact matched-config direct-library and online 27B gates before 35B. |
 
 The stream-usage path changes host-side JSON/SSE serialization, not model
 kernels. Its performance disposition is nevertheless `PENDING` because the
@@ -24,32 +25,31 @@ when the producer gets ahead, while native usage remains the exact token-count
 oracle. The gate accepts fewer than 127 ITLs for that case but still rejects
 extra intervals, partial requests, count drift, errors, or unsaturated load.
 
-The accepted direct-library throughput rows below therefore remain valid. The
-online diagnostic is a different serving/corpus recipe and cannot localize its
-gap to JSON/SSE alone; scheduler batching, arrival cadence, server configuration
-and model execution all remain candidates until the paired trace is complete.
-Its synthetic generated strings are retained as diagnostics. Correctness comes
-from the commit-bound real-model gate plus exact native counts, because production
-FP4 accumulation variants—including vLLM across profiler repetitions—can choose
-different greedy branches at numerical near-ties.
+The audit found that the historical direct-library comparisons were not exact
+same-workload runs. Pinned `vllm bench throughput` hard-codes
+`temperature=1.0`, while the vllm.cpp arms used greedy `temperature=0`; the 27B
+vLLM run also resolved `max_num_batched_tokens=8192`, versus 2048 for vllm.cpp.
+They remain useful historical diagnostics, but the strict performance gate is
+reopened for both models. Correctness remains established separately by the
+commit-bound real-model greedy gates and exact native request counts.
 
-## Accepted CUDA engine throughput
+## Historical CUDA engine checkpoints — reopened, non-binding
 
-These are the accepted offline engine checkpoints against fresh, production
-(CUDA graphs + `torch.compile`) vLLM on the same GB10. They do **not** replace
-the still-open HTTP online TTFT/TPOT/ITL gate above.
+These values are preserved so the optimization history remains reproducible.
+They cannot establish production-vLLM parity under the current protocol because
+their oracle sampling differed; the 27B scheduler budget differed as well.
 
-| Model / point | Build and workload | vllm.cpp | vLLM | Ratio | Other accepted evidence |
+| Model / point | Historical build and workload | vllm.cpp | vLLM | Diagnostic ratio | Disposition |
 |---|---|---:|---:|---:|---|
-| Qwen3.6-35B-A3B NVFP4, c64 / 200 prompts | Triton-AOT GDN; input 1024, output 128, greedy | 3345.9 tok/s | 3282.0 tok/s | **1.0195×** | 16/16 token-exact; repetition ratio 1.0192–1.0198; peak memory 52.8 vs ~80.6 GB. [Record](../.agents/state.md#L1740). |
-| Qwen3.6-27B NVFP4, c16 / 96 prompts | Triton-AOT + default FA-2 prefill; input 1024, output 128, seed 0, greedy | 764.28 tok/s total; 84.89 output | 758.84 tok/s total; 84.32 output | **1.0072× total; 1.0068× output** | 16/16 token-exact; 7 local reps, 6/7 ≥1.0×, worst 0.996 disclosed. [Ledger](../.agents/parity-ledger.md#L284). |
-| Qwen3.6-27B NVFP4, c32 / 192 prompts | Same build/workload | 1051.24 tok/s total; 116.77 output | 1043.86 tok/s total; 115.98 output | **1.0071× total; 1.0068× output** | 16/16 token-exact; 5/5 local reps ≥1.0×; peak memory 61.8 vs 76.2 GB. [Ledger](../.agents/parity-ledger.md#L284). |
+| Qwen3.6-35B-A3B NVFP4, c64 / 200 prompts | Triton-AOT GDN; input 1024, output 128 | 3345.9 tok/s | 3282.0 tok/s | 1.0195× | Non-binding: ours temperature 0, vLLM temperature 1. Correctness remains 16/16 token-exact in its separate greedy gate. [Record](../.agents/state.md#L1740). |
+| Qwen3.6-27B NVFP4, c16 / 96 prompts | Triton-AOT + default FA-2 prefill; input 1024, output 128, seed 0 | 764.28 tok/s total; 84.89 output | 758.84 tok/s total; 84.32 output | 1.0072× total; 1.0068× output | Non-binding: temperature 0/1 and token budget 2048/8192. Historical repetition spread retained in the [ledger](../.agents/parity-ledger.md#L284). |
+| Qwen3.6-27B NVFP4, c32 / 192 prompts | Same historical build | 1051.24 tok/s total; 116.77 output | 1043.86 tok/s total; 115.98 output | 1.0071× total; 1.0068× output | Non-binding for the same two configuration mismatches; historical peak memory was 61.8 vs 76.2 GB. |
 
-The 35B ratio requires `-DVLLM_CPP_TRITON=ON`; the default pure-C++ build was
-0.99× at that checkpoint. The accepted 27B path also requires the default-on
-vendored FA-2 prefill route. Reported TTFT/TPOT improvements in those offline
-runs are implementation A/B evidence; binding server-to-server latency ratios
-remain intentionally absent until `SERVE-GATE-ONLINE` closes.
+The historical 35B result requires `-DVLLM_CPP_TRITON=ON`; its default pure-C++
+build measured 0.99× in the same old campaign. The 27B values require the
+default-on vendored FA-2 prefill route. Same-binary component A/Bs still support
+the individual kernel choices, but fresh exact oracle runs are required for an
+end-to-end acceptance claim, and binding server-to-server latency remains open.
 
 ## Reproduce the current online checkpoint
 

@@ -3,7 +3,7 @@
 // Scope (M1.3 Task 3): the KV-cache COORDINATOR — the layer that fans the
 // per-group SingleTypeKVCacheManagers (M1.3 Task 2) out across a model's KV
 // cache groups and, crucially, coordinates the CROSS-GROUP prefix-cache hit the
-// hybrid gate models depend on. Three concrete coordinators are ported:
+// hybrid gate models depend on. Four concrete coordinators are ported:
 //   * KVCacheCoordinator (abstract base): owns the BlockPool + one
 //     SingleTypeKVCacheManager per kv cache group (built by a small
 //     spec->manager factory), and the group-fanout shared methods
@@ -12,6 +12,8 @@
 //     remove_skipped_blocks, get_blocks, new_step_starts).
 //   * UnitaryKVCacheCoordinator (exactly ONE group — pure full-attn OR pure
 //     mamba): find_longest_cache_hit delegates to the single manager.
+//   * KVCacheCoordinatorNoPrefixCache (any group count): returns no hits and no
+//     common-prefix blocks while retaining the ordinary allocation/free fanout.
 //   * HybridKVCacheCoordinator (>1 group — the gate models: a full-attn block
 //     group + a GDN/mamba-state group): the CROSS-GROUP find_longest_cache_hit
 //     — the highest-risk correctness code in M1.3.
@@ -69,11 +71,7 @@
 //   - `metrics_collector` (KVCacheMetricsCollector) is omitted (not part of the
 //     allocation correctness core).
 //
-// DEFERRED (marked; the gate models never exercise these — later tasks add them
-// without reshaping the base):
-//   - KVCacheCoordinatorNoPrefixCache (enable_caching == false path): omitted;
-//     get_kv_cache_coordinator throws for enable_caching == false (T1). The gate
-//     models run with prefix caching enabled.
+// DEFERRED (marked; later tasks add these without reshaping the base):
 //   - CrossAttentionManager special-casing in get_num_blocks_to_allocate /
 //     allocate_new_blocks (num_encoder_tokens): cross-attention is a deferred
 //     manager type (Task 2), so the encoder branches are omitted.
@@ -199,6 +197,28 @@ class KVCacheCoordinator {
   int hash_block_size_;
 };
 
+// Coordinator used when prefix caching is disabled or unsupported. It accepts
+// arbitrary group counts and deliberately exposes no cache hits, while all
+// allocation, block-table and free behavior stays in the common base.
+class KVCacheCoordinatorNoPrefixCache : public KVCacheCoordinator {
+ public:
+  KVCacheCoordinatorNoPrefixCache(
+      KVCacheConfig kv_cache_config, int max_model_len,
+      int max_num_batched_tokens, bool use_eagle,
+      bool enable_kv_cache_events, int dcp_world_size, int pcp_world_size,
+      int scheduler_block_size, int hash_block_size);
+
+  std::vector<int> get_num_common_prefix_blocks(
+      const std::string& running_request_id) override;
+
+  std::pair<KVCacheBlocksTuple, int> find_longest_cache_hit(
+      const std::vector<BlockHash>& block_hashes,
+      int max_cache_hit_length) override;
+
+ private:
+  std::size_t num_single_type_managers_;
+};
+
 // KV cache coordinator for models with exactly one KV cache group (all layers
 // of one registered spec type). (Upstream UnitaryKVCacheCoordinator.)
 class UnitaryKVCacheCoordinator : public KVCacheCoordinator {
@@ -264,8 +284,8 @@ class HybridKVCacheCoordinator : public KVCacheCoordinator {
 };
 
 // Select + construct the coordinator for a config. (Upstream
-// get_kv_cache_coordinator.) 1 group -> Unitary; >1 group -> Hybrid.
-// enable_caching == false (KVCacheCoordinatorNoPrefixCache) is DEFERRED (throws).
+// get_kv_cache_coordinator.) Caching off -> NoPrefixCache; otherwise 1 group ->
+// Unitary and >1 groups -> Hybrid.
 std::unique_ptr<KVCacheCoordinator> get_kv_cache_coordinator(
     KVCacheConfig kv_cache_config, int max_model_len,
     int max_num_batched_tokens, bool use_eagle, bool enable_caching,

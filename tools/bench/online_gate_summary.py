@@ -27,6 +27,7 @@ from tools.bench.online_gate import (
     ENGINES,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
+    MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
     OUTPUT_LEN,
@@ -212,6 +213,8 @@ def _memory_for_leg(
                 reasons.append(f"server command omits {flag}")
             elif command[command.index(flag) + 1] != expected:
                 reasons.append(f"server command {flag} differs from the gate")
+        if "--no-enable-prefix-caching" not in command:
+            reasons.append("server command does not disable prefix caching")
     except (OSError, ValueError, HarnessError) as error:
         reasons.append(str(error))
 
@@ -434,8 +437,12 @@ def _model_precondition_reasons(
         if status.get("vllm_profiler") != "torch-profiler":
             reasons.append("vLLM trace is not the required torch-profiler fallback")
         if status.get("trace_contract") != {
+            "admission_mode": "closed-loop",
             "concurrency": TRACE_CONCURRENCY,
+            "enable_prefix_caching": False,
             "input_len": INPUT_LEN,
+            "max_model_len": MAX_MODEL_LEN[model],
+            "max_num_seqs": MAX_NUM_SEQS,
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
             "repetitions": TRACE_REPETITIONS,

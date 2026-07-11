@@ -336,3 +336,22 @@ TEST_CASE(
   CHECK(LoadedEngine::ResolveMaxNumBatchedTokens(p, /*max_model_len=*/64,
                                                  false) == 256);
 }
+
+TEST_CASE("loaded_engine: prefix caching mirrors model-capability defaults") {
+  EngineParams params;
+  vllm::ModelInfo decoder;
+  CHECK(LoadedEngine::ResolveEnablePrefixCaching(params, decoder));
+
+  vllm::ModelInfo hybrid;
+  hybrid.is_hybrid = true;
+  CHECK_FALSE(LoadedEngine::ResolveEnablePrefixCaching(params, hybrid));
+
+  vllm::ModelInfo attention_free;
+  attention_free.has_inner_state = true;
+  CHECK_FALSE(LoadedEngine::ResolveEnablePrefixCaching(params, attention_free));
+
+  params.enable_prefix_caching = true;
+  CHECK(LoadedEngine::ResolveEnablePrefixCaching(params, hybrid));
+  params.enable_prefix_caching = false;
+  CHECK_FALSE(LoadedEngine::ResolveEnablePrefixCaching(params, decoder));
+}

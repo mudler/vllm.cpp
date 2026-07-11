@@ -4277,3 +4277,92 @@ KERNEL=30 / BACKEND=51), shell syntax, Python compilation and diff checks pass.
 Next: merge this contract repair and recapture the lock-held diagnostic trace at
 the new SHA. Only that complete status may drive the ranked parity-lever scan;
 the full 27B gate remains deferred until a concrete optimization is implemented.
+
+## 2026-07-11 — performance closure reopened; cache-off trace contract repaired
+
+This entry explicitly corrects the earlier same-date interpretation that the
+complete 27B online diagnostic showed no direct-library regression and that the
+historical offline rows remained accepted. The raw measurements remain valid
+diagnostics; the acceptance conclusion does not.
+
+The exact historical denominator commands were audited end to end. DGX
+`/home/mudler/work/fa2_denom.sh` invoked pinned `vllm bench throughput` without
+a sampling override or `--max-num-batched-tokens`. At vLLM `e24d1b24`,
+`benchmarks/throughput.py:122-130` constructs `SamplingParams` with
+`temperature=1.0`, while every vllm.cpp arm used greedy temperature 0. The
+vLLM LLM-class default also resolved 8192 batched tokens; the 27B vllm.cpp arm
+used its dense-model default of 2048. The 35B token budget matched at 8192, but
+its sampling still did not. Therefore the historical 35B 1.0195× and 27B
+1.007× values, latency observations, and comparative memory values are
+non-binding. Both gate models retain their separate 16/16 token-exact greedy
+correctness evidence; exact production-vLLM performance closure is reopened for
+both direct-library and online axes.
+
+At pushed `ed6247d`, a sole-owner `/tmp/gpu` run captured one warmup plus three
+complete 27B c16/48 vLLM generations under
+`~/work/vllm.cpp-online-gate/diagnostic/ed6247d-vllm27-c16-trace`. All four
+output digests equal
+`f6e06aae3c059f7baf2c188bafdaa7826010d8f255d818bd4d58f2a9fc91935e`.
+The trace contains 1,933,320 kernel events; metadata, kernel summary, profile
+log, worker trace, and `SHA256SUMS` hashes are respectively
+`1b6748911aa018e73d33389bb91e0c4e74c7247e426b0ae28dbedbec3f7cf08b`,
+`8213fdcb27bd13aa5dd52bccc9203adbf823d6460209eb1bc1d24a43be6ddf64`,
+`0a3010c651af0143114003c024f1b0566705d2725f2b33e5d2607779363bd5b8`,
+`e4525680fe72422d7404a95f33f3d6910b67c754fa6576d85f5c145be331dde3`,
+and `e6ff15dee7a79b8968eacd3f0ca4ffcebe191a4e0c7cf31dc4a753b444b3aed3`.
+The lock released and a fresh compute-process query is empty.
+
+That vLLM trace is complete but its old ours pair is not comparable. Ours
+hard-enabled prefix caching and repeated the same 48 prompts on one process:
+the first repetition performed prefill, while repetitions two and three became
+cache-hit/pure-decode runs (71.763 s then 50.187/50.181 s). Pinned vLLM's
+hybrid-model default was cache-off. The old profiler also preloaded all 48
+requests at max-seqs 16 and forced max model length 1152, while production uses
+closed-loop c16 admission, max-seqs 32, and model length 262144. Standard-grid
+prompts are disjoint below one 32-token block, so cache hits do not explain the
+whole grid gap; the asymmetric warmup/trace policy still voids strict parity.
+
+W0 now mirrors the pinned cache policy. `EngineParams` carries an optional
+override; hybrid and attention-free generation models default off, ordinary
+decoders default on, and the server exposes mutually exclusive
+`--[no-]enable-prefix-caching` flags plus the resolved-policy log. The new
+`KVCacheCoordinatorNoPrefixCache` supports arbitrary cache-group counts,
+returns no hits/common prefix, and preserves ordinary allocate/free fanout;
+the request hasher is absent when caching is off. Both production server arms
+and both trace arms explicitly disable caching. The vLLM profiler now admits
+replacements closed-loop at c16 while retaining max-seqs 32 and production
+model length. Trace status rejects policy/config drift and more than 20%
+duration spread. Output digests remain diagnostic behind real-model and exact
+native-count correctness gates. The accepted
+`specs/prefix-caching.md` keeps broader APC work `PARTIAL`.
+
+The execution scan found a larger, trace-exact next lever and registered it as
+`KV-DEVICE-RESIDENCY` with accepted
+`specs/device-resident-kv-gdn-state.md`. At the representative mixed
+T=2048 + d11 context, ours/vLLM wall values were 952.960/900.398 ms, summed
+kernels 918.092/885.602 ms, and non-kernel remainder 34.868/14.797 ms. Ours
+owns full-attention KV plus convolution/recurrent caches in host
+`std::vector<uint8_t>` buffers wrapped as CUDA tensors. For 11 decode + 3
+prefill sequences, the state formula predicts exactly 267,780,096 bytes =
+255.375 MiB across 816 row copies per direction. nsys observes 817 D2H calls /
+255.375015 MiB and 966 H2D calls / 255.842133 MiB, approximately 1,799
+`cudaMemcpyAsync` calls per context. Pure b16 decode is effectively tied
+(129.353 vs 128.838 ms), so device allocation and indexed mixed-state I/O
+precede generic async overlap. These old-trace values rank the lever; a corrected
+pair remains mandatory acceptance evidence.
+
+Validation for this CPU checkpoint: clean Makefiles build reaches 100%; normal
+serial CTest passes **105/105**. An exploratory `-j2` run passed 104/105 while
+two CPU-saturating OpenAI binaries ran together; the conformance test timed out,
+then passed **1/1** alone in 81.13 s and in the canonical serial suite in
+86.76 s. Online client/summary/trace contracts pass **18/18**, agent-record
+mutations **13/13**, documentation mutations **5/5**, and the canonical checker
+reports ENGINE=97 / MODEL=323 / QUANT=81 / KERNEL=30 / BACKEND=51. Python
+compilation, shell syntax, and diff checks pass. No GPU model or performance run
+was made by the unmerged W0 code, so `KV-PREFIX-CACHE` remains `PARTIAL`,
+`SERVE-GATE-ONLINE` remains `ACTIVE`, and no performance ratio is claimed.
+
+Next: merge/push this record checkpoint, claim `KV-DEVICE-RESIDENCY`, capture a
+corrected cache-off/closed-loop 27B baseline pair, then implement device-backed
+cache ownership followed by indexed BF16↔F32 state I/O as separate same-binary
+A/Bs. Fresh exact direct-library and online 27B gates precede the 35B series.

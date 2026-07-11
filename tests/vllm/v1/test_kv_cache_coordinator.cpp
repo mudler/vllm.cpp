@@ -41,6 +41,7 @@ using vllm::v1::init_none_hash;
 using vllm::v1::KVCacheBlock;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::KVCacheCoordinator;
+using vllm::v1::KVCacheCoordinatorNoPrefixCache;
 using vllm::v1::KVCacheGroupSpec;
 using vllm::v1::KVCacheSpec;
 using vllm::v1::FullAttentionSpec;
@@ -209,10 +210,29 @@ TEST_CASE(
             /*apply_admission_cap=*/true) == 4);
 }
 
-TEST_CASE("get_kv_cache_coordinator: enable_caching == false is DEFERRED (throws)") {
-  CHECK_THROWS(get_kv_cache_coordinator(
+TEST_CASE("KVCacheCoordinatorNoPrefixCache returns no hits for hybrid groups") {
+  auto coord = get_kv_cache_coordinator(
       MakeHybridConfig(), 8192, 8192, false, /*enable_caching=*/false, false, 1,
-      1, kBlockSize, kBlockSize));
+      1, kBlockSize, kBlockSize);
+  REQUIRE(dynamic_cast<KVCacheCoordinatorNoPrefixCache*>(coord.get()) !=
+          nullptr);
+  CHECK_FALSE(coord->enable_caching);
+
+  std::vector<BlockHash> hashes = {"h0", "h1"};
+  auto [hits, hit_length] =
+      coord->find_longest_cache_hit(hashes, /*max_cache_hit_length=*/4);
+  CHECK(hit_length == 0);
+  REQUIRE(hits.size() == 2);
+  CHECK(hits[0].empty());
+  CHECK(hits[1].empty());
+  CHECK(coord->get_num_common_prefix_blocks("running") ==
+        std::vector<int>{0, 0});
+
+  auto allocated = coord->allocate_new_blocks("running", 4, 4);
+  REQUIRE(allocated.size() == 2);
+  CHECK_FALSE(allocated[0].empty());
+  CHECK_FALSE(allocated[1].empty());
+  coord->free("running");
 }
 
 TEST_CASE("HybridKVCacheCoordinator: attention_groups puts full attention first") {

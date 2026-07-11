@@ -113,7 +113,7 @@ we mirror it.
 |---|---|---|
 | Backend interface: `AttentionBackend/Impl/MetadataBuilder` | `v1/attention/backend.py` | T0 ✅ `bd47ce3` (ABCs + flash NHD get_kv_cache_shape) |
 | `reshape_and_cache` (write K/V into paged NHD cache at slot_mapping) | `csrc/.../cache_kernels.cu::reshape_and_cache_flash` | T0 ✅ `e231196`→`7de4f0c` (vt::ReshapeAndCache, stride-based NHD write CPU+CUDA; GB10 gates pass; other CUDA targets unvalidated) |
-| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 ✅ on GB10 gate workloads (CPU/CUDA parity + full 27B/35B paged-engine and throughput gates); broader attention/backend/SM coverage lives in `kernel-matrix.md` and remains open |
+| Paged attention for full-attn layers on sm_121 (bf16, GQA 16/2, partial RoPE) — FlashInfer-class performance is the bar; strategy in §9 | ref: `v1/attention/backends/{flashinfer,triton_attn,flash_attn}.py` | T0 🚧 on GB10 gate workloads (CPU/CUDA parity + full 27B/35B paged-engine greedy correctness gates pass; historical production-vLLM throughput closure was reopened after a sampling/token-budget audit, and `KV-DEVICE-RESIDENCY` owns the traced host-backed-cache gap); broader attention/backend/SM coverage lives in `kernel-matrix.md` and remains open |
 | **GDN backend**: metadata segmentation (prefill/decode/spec) | `v1/attention/backends/gdn_attn.py` | T0 ✅ `370ddaf` (GDNAttentionMetadata decode/prefill split + has_initial_state mask + prefill rebasing; spec segments + align col-gather deferred; GDN-state zeroing = caller obligation, see state.md) |
 | GDN chunked-scan prefill kernel (chunk gated delta rule) | `layers/fla/ops/chunk.py` (Triton ref), `flashinfer.gdn_prefill` (Blackwell) | T0 🚧 `ead59d6` (correctness-grade sequential; chunked perf kernel M2.3) |
 | GDN fused decode recurrence (sigmoid-gating delta rule update) | `layers/fla/ops/{fused_sigmoid_gating,fused_recurrent}.py` | T0 ✅ `ead59d6` (correctness-grade) |
@@ -417,10 +417,12 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `VLLM_CPP_FLASH_ATTN` (default ON with CUTLASS, sm_12xa), runtime
     `VT_FA2_PREFILL` (default ON when compiled; =0 → WMMA for same-binary A/B).
     **Verified GB10 sm_121a (2026-07-10): kernel 3.68× vs our WMMA (475.3→129.2
-    ms per profile window), 27B e2e +1.52%/+0.54% (conc16/conc32) → ≥1.0× vs
-    fresh graphed vLLM at BOTH MVP points; token-exact greedy gates PASS ON and
-    OFF; the earlier −4.3% attempt was the f32↔bf16 cast glue + a per-layer
-    D2H sync, both removed (see parity-ledger 2026-07-10).**
+    ms per profile window), with same-binary 27B e2e +1.52%/+0.54%
+    (conc16/conc32); token-exact greedy gates PASS ON and OFF. The historical
+    claim that this reached ≥1.0× vs vLLM is non-binding after the 2026-07-11
+    sampling/token-budget audit; the component A/B remains valid. The earlier
+    −4.3% attempt was the f32↔bf16 cast glue + a per-layer D2H sync, both removed
+    (see parity-ledger 2026-07-10).**
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common
     `vt::` surface now carries upstream-compatible semantic scalar IDs separate
@@ -611,12 +613,18 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    correctness gate, samples process-tree/GPU memory and thermal/power,
    verifies memory return, refreshes targets from a clean exact HEAD, hashes the
    executable pip-oracle runtime, and records an ours-nsys/vLLM-torch-profiler
-   trace pair. The oracle manifest hashes the venv's `ninja` executable and the
+   trace pair. Both arms now explicitly disable prefix caching for the hybrid
+   gate comparison; the profiler uses closed-loop c16 admission with production
+   max-seqs/model length, and the server exposes the pinned model-default plus
+   explicit cache override. The oracle manifest hashes the venv's `ninja` executable and the
    profiler prepends that venv to `PATH`, because FlashInfer can JIT inside a
    spawned EngineCore. Pinned-vLLM producer-ahead DELTA merges remain valid
    inter-chunk timing evidence when native output counts are exact. Profiler
    warmup/measured output digests and their equality flag are retained without
    treating FP4 greedy near-tie branches as a performance failure; any missing, failed,
    native-count-inexact, over-fragmented, hash-drifted, or below-vLLM artifact
-   is non-binding. CPU harness contracts are green; the current-main DGX
-   campaigns remain open under `SERVE-GATE-ONLINE`.
+   is non-binding. The historical direct-library denominators are also
+   non-binding: vLLM used temperature 1 while ours used temperature 0, and the
+   27B token budgets differed. CPU harness contracts are green; corrected
+   direct-library and online DGX campaigns remain open under
+   `BACKEND-GATE-CUDA-VLLM` / `SERVE-GATE-ONLINE`.

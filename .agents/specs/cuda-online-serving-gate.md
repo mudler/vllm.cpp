@@ -11,17 +11,31 @@ open sockets and no log progress. The owned campaign was snapshotted/hashed at
 DGX `latres2/diagnostic-vllm35-hang-20260711T0734CEST`, terminated, and released
 the GPU lock. Neither pre-W2 campaign is gate evidence.
 
+The post-W2 `31d053f` 27B grid completed 2,016 exact-count requests and all
+memory-return checks, but its 0.926–0.961× ratios remain void. The repeated ours
+trace became a prefix-cache hit while vLLM caching was off; the profiler also
+preloaded all prompts, used max-seqs 16, and forced max model length 1152 rather
+than the production contract. `ed6247d` subsequently captured a complete exact
+vLLM c16/48 trace (kernel summary SHA-256 `8213…df64`), but it has no comparable
+ours arm. The historical offline denominators are also reopened: pinned
+`vllm bench throughput` used temperature 1 while ours used temperature 0, and
+the 27B budgets were 8192 versus 2048. No existing performance ratio is binding.
+
 ## Scope
 
 Compare the production HTTP server with pinned vLLM on both gate checkpoints at
 concurrency 1, 2, 4, 8, 16 and 32 (the large-concurrency gate point). Both
 servers run with `max_num_seqs=32` and identical per-model token budgets
-(27B=2048, 35B=8192). Record request
+(27B=2048, 35B=8192), production model length 262144, and explicit prefix
+caching off. Record request
 rate, input/output/total throughput, TTFT, TPOT, ITL, end-to-end latency, errors,
 and peak host/GPU memory. The same prompts, tokenizer output, arrival policy,
 sampling parameters, warmup, and request count are mandatory.
 Each timed invocation first issues one full-concurrency warmup wave so lazy
 capture/JIT work cannot contaminate the reported request set.
+The paired profiler keeps only 16 requests resident and admits one replacement
+per completion, matching the online closed-loop client instead of preloading all
+48 prompts.
 
 ## Upstream chain
 
@@ -52,7 +66,9 @@ vLLM's producer-ahead DELTA aggregation;
 `online_gate_summary.py` makes any missing/mismatched
 model, stream, memory-return, trace or every-axis artifact non-binding. The
 failed pre-W2 campaigns remain diagnostics; partial rows are never reused as
-successful repetitions.
+successful repetitions. W0 of `KV-PREFIX-CACHE` now supplies the pinned hybrid
+default-off policy and an explicit server override. The trace contract rejects
+cache-policy, admission, max-sequence, model-length, or repeated-duration drift.
 
 ## Port map
 
@@ -61,12 +77,12 @@ successful repetitions.
 | server startup/readiness | `examples/server/main.cpp` plus `/health` probe |
 | OpenAI request/SSE stream | `src/vllm/entrypoints/openai/` |
 | async scheduling/stream updates | current engine/server bridge; gaps map to `SERVE-ASYNC-LLM` |
-| scheduler operating point | explicit server `max_num_seqs` and `max_num_batched_tokens` flags; harness fixes identical values on both arms |
+| scheduler/cache operating point | explicit server `max_num_seqs`, `max_num_batched_tokens`, and `--[no-]enable-prefix-caching` flags; harness fixes identical values on both arms and records the resolved policy |
 | benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
-| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via `tools/bench/profile_vllm_online_gate.py`; kernel-event aggregation in `summarize_torch_kernels.py` |
+| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py` |
 
 ## Tests to port
 
@@ -83,6 +99,11 @@ successful repetitions.
   `tests/tools/test_online_gate_trace.py`; output-repeatability metadata and
   project every-axis/void propagation are covered by
   `tests/tools/test_online_gate_{client,summary}.py`.
+- The profiler test drives a fake engine through closed-loop replacement
+  admission and proves the resident request count never exceeds c16. Client and
+  summary cases reject missing cache-off flags or drifted cache/admission/
+  max-sequence/model-length metadata; loaded-engine/coordinator tests cover the
+  underlying model-default no-prefix path.
 - Rootless eviction inventory, inode deduplication, zero-residency proof,
   failure reporting and overwrite refusal are covered by
   `tests/tools/test_drop_file_cache.py`; client/summary suites reject resident
@@ -114,7 +135,10 @@ successful repetitions.
 One `flock /tmp/gpu` per model holds its model gate, server start, readiness,
 warmup, all interleaved repetitions, shutdown, memory sampling, and paired
 traces. The c32 client point is backed by an explicit 32-sequence scheduler on
-both arms rather than the local server's historical default of eight. Each
+both arms rather than the local server's historical default of eight. Both
+servers explicitly disable prefix caching, and the paired trace uses closed-loop
+c16 admission, max-seqs 32, production max model length, and three cache-off
+repetitions whose durations differ by no more than 20%. Each
 model/point has
 at least three valid repetitions and a fresh pinned-vLLM denominator. The
 commit-bound model gate is the correctness precondition before performance is
@@ -130,8 +154,8 @@ observed half-open `[start_time, start_time + ttft + sum(itls))` interval.
 Pinned vLLM's
 inclusive one-second `max_concurrent_requests` remains hashed diagnostic data
 but is not a saturation oracle because it can overcount sequential boundaries.
-The committed summary exits nonzero unless every detailed result, exact generated
-text pair, stream probe, process/GPU-memory sample, thermal snapshot, cache/
+The committed summary exits nonzero unless every detailed result, generated-text
+diagnostic pair/count, stream probe, process/GPU-memory sample, thermal snapshot, cache/
 memory-return record, clean-HEAD build provenance, exact pip-oracle runtime
 inventory, model gate and paired trace is present and hash-valid.
 
@@ -168,17 +192,24 @@ file-hashed by the gate, and the profiler receives the venv-prefixed `PATH`.
    (**implemented and CPU-gated**).
 3. Add readiness/failure guards that abort the whole locked series on bad arms
    (**implemented and CPU-gated**).
-4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points.
+4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points with
+   explicit cache-off, identical sampling, scheduler settings, and model length.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape).
-6. Append commands, raw artifact hashes, results, and ratios to the ledger.
+6. Drive the top traced lever through its owning row. Current priority is
+   `KV-DEVICE-RESIDENCY`: the old d11 slice attributed exactly 255.375 MiB of
+   state traffic per direction to host-backed caches; corrected traces must
+   confirm the lever on equivalent inputs.
+7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim
 owns the DGX campaign and its result directory.
 
 ## Risks and decisions
 
-- Offline and online throughput are different gates.
+- Offline and online throughput are different gates, but both require identical
+  sampling and scheduler/cache configuration within their own comparison. The
+  historical direct-library values fail that rule and are non-binding.
 - A server that never becomes model-ready is not a zero-throughput result; the
   comparison is invalid and must be rerun.
 - Provisioning, compilation, downloads, and cache warmup stay outside the
@@ -192,6 +223,9 @@ owns the DGX campaign and its result directory.
   showed FP4 variants select different valid branches; retain exact-match counts
   and all profiler digests so repeatability remains visible without voiding an
   otherwise exact-count, correctness-preconditioned performance arm.
+- Logical input-token counts do not expose prefix hits. Explicit cache policy
+  and stable repeated duration are mandatory evidence; a cache-hit ours trace
+  cannot be compared with cache-off vLLM.
 - The pre-W2 server's `cudaFree` error is an asynchronous surfacing point, not
   a proven faulting kernel; reproduce current main under sanitizer before any
   fix or root-cause claim.

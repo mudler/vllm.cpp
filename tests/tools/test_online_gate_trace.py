@@ -11,14 +11,53 @@ import json
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from tools.bench.online_gate import INPUT_LEN
-from tools.bench.profile_vllm_online_gate import load_prompts
+from tools.bench.profile_vllm_online_gate import load_prompts, run_closed_loop
 from tools.bench.serve_low_common import HarnessError
 from tools.bench.summarize_torch_kernels import summarize
 
 
 class OnlineGateTraceTests(unittest.TestCase):
+    def test_closed_loop_never_preloads_beyond_concurrency(self) -> None:
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.active = []
+                self.max_active = 0
+
+            def add_request(self, request_id, prompt, params) -> None:
+                self.active.append((request_id, prompt, params))
+                self.max_active = max(self.max_active, len(self.active))
+
+            def has_unfinished_requests(self) -> bool:
+                return bool(self.active)
+
+            def step(self):
+                request_id, prompt, _ = self.active.pop(0)
+                return [
+                    SimpleNamespace(
+                        request_id=request_id,
+                        finished=True,
+                        outputs=[SimpleNamespace(token_ids=[prompt])],
+                    )
+                ]
+
+        engine = FakeEngine()
+        llm = SimpleNamespace(llm_engine=engine)
+        outputs = run_closed_loop(
+            llm,
+            list(range(9)),
+            SimpleNamespace(output_kind=None),
+            max_concurrency=3,
+            request_id_base=100,
+            final_output_kind="final",
+        )
+        self.assertEqual(engine.max_active, 3)
+        self.assertEqual(
+            [item.outputs[0].token_ids[0] for item in outputs], list(range(9))
+        )
+
     def test_exact_token_prompts_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "corpus.jsonl"

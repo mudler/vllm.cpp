@@ -10,15 +10,15 @@ OpenAI-compatible server.
 > ⚠️ **Pre-release, under heavy development.** Both NVFP4 gate models —
 > **Qwen3.6-35B-A3B** (MoE hybrid) and **Qwen3.6-27B** (dense W4A4) — now run the
 > full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
-> **token-exact greedy gates passing**, and throughput is measured against vLLM
-> on real hardware. We **beat vLLM run eager** on both models; against vLLM's
-> *production* config (CUDA graphs + torch.compile) **both gate models measure
-> ≥1.0× total throughput at their large-concurrency operating points**: the
-> **35B at 1.02×** (Triton-AOT GDN build; 0.99× in the default pure-C++ build)
-> and the **27B at 1.007× conc16 / 1.007× conc32** (vendored FA-2 prefill,
-> default-on; per-rep spreads in *Status*) — with better TTFT/TPOT and less
-> peak memory on both. The tables track real, tested support and are kept
-> current as work lands (see `.agents/`). CPU multithreaded dispatch is now
+> **token-exact greedy correctness gates passing**. Performance parity is
+> currently **GATING**: an audit found that the historical vLLM throughput
+> denominators used temperature 1 while vllm.cpp used greedy temperature 0;
+> the 27B comparison also used different token budgets (8192 vs 2048). The old
+> 1.02×/1.007× ratios are retained only as diagnostics, and no production-vLLM
+> performance pass is claimed until both models are rerun with identical
+> sampling, scheduler, cache, admission, and model-length settings. The tables
+> track real, tested support and are kept current as work lands (see
+> `.agents/`). CPU multithreaded dispatch is now
 > correctness-gated, but its real-file throughput/RSS checkpoint is still open.
 > The current serving checkpoint implements native-ID final/continuous stream
 > usage for completion and chat and is CPU/ASan/UBSan/TSan-green; the fresh
@@ -91,7 +91,9 @@ runs end-to-end on CPU:
   currently reports process liveness rather than probing engine health. The
   async path passes the full CPU suite and ThreadSanitizer; its post-change
   GB10 token/latency/throughput/memory gates are still pending. Chat templates
-  use a bounded minja-subset Jinja engine.
+  use a bounded minja-subset Jinja engine. `--[no-]enable-prefix-caching`
+  exposes the tri-state cache policy; hybrid/attention-free generation models
+  default off like pinned vLLM, while ordinary decoder models default on.
   **Tool/function calling** provides Hermes-style `<tool_call>` parsing,
   streaming tool-call deltas, and `tool_choice` auto/required/named — `auto`
   is *relaxed*: the model may reply in plain text or call a tool, constrained only
@@ -148,7 +150,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy gates pass; ≥1.0× throughput parity passed. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | ✅ paged text engine + basic server/tool/grammar subsets; ✅ greedy and production-vLLM throughput gates on GB10 |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. Production-vLLM performance parity is reopened pending exact matched-config reruns. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -158,7 +160,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | ✅ **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy gates pass token-exact and meet the production-vLLM throughput gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance gates are reopened |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -204,51 +206,26 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
 
 ## Status & caveats (honest)
 
-- **Where we are (GB10 / DGX Spark, sm_121a):** both NVFP4 gate-model **text paths** run the full
-  paged engine end-to-end with **token-exact greedy gates passing**, and the CUDA
-  kernel paths exercised by those workloads are validated on real hardware. **Throughput, measured vs vLLM on the same
-  workload:** we **beat vLLM run `--enforce-eager`** on both models; against vLLM's
-  *production* config (CUDA graphs + torch.compile — the honest bar) **both gate
-  models measure ≥1.0×**: the **35B at 1.02× total throughput with better TTFT (−4%)
-  and TPOT (−2%)** in the Triton-AOT GDN build (`-DVLLM_CPP_TRITON=ON`; 0.99× in the
-  default pure-C++ build), and the **27B at 1.007× conc16 / 1.007× conc32** (see
-  below), while we use less peak memory on both (27B run: 61.8 vs 76.2 GB at the
-  identical workload/recipe). The GDN chunk-kernel
-  **codegen** gap (~1.9× vs vLLM's Triton/FLA) was closed by a sanctioned, bounded
-  **Triton AOT fast-path** (FLA kernels verbatim → cubin, **vendored per-arch as
-  generated C** so the build needs no Python/Triton — regen is a maintainer task
-  via `scripts/regen-triton-aot.sh`; generation is pinned to the destination
-  architecture and byte-reproducible across source paths). The runtime stays
-  Python/Triton-free and the portable C++ kernels and CPU reference remain the
-  fallback. The upstream-faithful bf16 `chunk_o` artifacts are available behind
-  `VT_GDN_OUT_BF16=1`; f32 remains the default pending a fresh current-main
-  two-model A/B. GDN reuses grow-only, queue-owned scratch, with the two
-  `VT_GDN_TRITON_*_POOL=0` toggles retaining same-binary fallbacks (see the
-  porting inventory §9). The 27B measures **1.0072× at conc16
-  and 1.0071× at conc32** (764.3 vs 758.8; 1051.2 vs 1043.9 tok/s; 7/5-rep means vs
-  fresh same-hour graphed denominators; conc32 5/5 reps ≥1.0×, conc16 6/7 with one
-  0.996 rep disclosed): a production-codegen dump + kernel profile of vLLM settled
-  the residual — the norm→quant sites were already at parity; the real gaps were
-  the **bf16 GEMM layout** (the GDN in_proj now runs the cuBLASLt TN `nvjet TNNN`
-  class vLLM's `F.linear` gets), the **fused attention preamble** (default-on for
-  the 27B, reading a cos/sin cache), the **tiled causal-conv** (default-on), and
-  finally the prefill **attention kernel** — closed by the **vendored
-  FlashAttention-2** `flash_fwd_splitkv` port (the exact kernel vLLM runs on GB10),
-  wired natively-bf16 (zero cast kernels) and sync-free, measured **3.7× per-kernel
-  vs our WMMA** and **+1.5%/+0.5% e2e** (default-on; `VT_FA2_PREFILL=0` falls back
-  to the portable WMMA kernel).
-- **The MVP throughput gate is PASSED** (≥1.0× vs *production* vLLM on every axis —
-  total/output throughput, TTFT, TPOT, memory — both gate models, at their large-
-  concurrency operating point). Post-MVP optimization remains execution-traced:
-  we `nsys`- and torch-profile vLLM's *actual* kernels (not just its source) and
-  mirror what it runs. Recent measured,
-  token-exact, default-on wins: register-tiled GDN `delta_h` + `cp.async` ring, a
-  blocked tensor-core WY triangular inverse, fused fp8 RMSNorm→quant (quantize-once),
-  and bf16 GDN input I/O. A per-shape fp4-GEMM autotune (**+5.8%** on the 27B at high
-  concurrency) is **default-on** (`VT_FP4_AUTOTUNE=0` opts out). Every step is
-  A/B-measured and
-  gate-checked; the full record is in the [parity ledger](.agents/parity-ledger.md).
-  `scripts/dgx-bringup.sh` runs the CUDA suite + the gates on dgx.casa.
+- **Where we are (GB10 / DGX Spark, sm_121a):** both NVFP4 gate-model text paths
+  run the full paged engine end-to-end, and their real-model **token-exact greedy
+  correctness gates pass**. The CUDA kernel paths exercised by those gates are
+  validated on real hardware.
+- **Production-vLLM performance is reopened.** The historical 35B 1.0195× and
+  27B 1.007× offline ratios were produced with vLLM's
+  `bench throughput` default `temperature=1.0`, while vllm.cpp used greedy
+  `temperature=0`; the 27B vLLM arm also resolved an 8192-token scheduler budget
+  while vllm.cpp used 2048. Those measurements and their memory observations
+  remain useful diagnostics, but they are not identical-workload acceptance
+  evidence. Both direct-library and online every-axis gates remain `GATING`
+  until fresh, repeated, same-config runs close them.
+- The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
+  cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
+  vendored FlashAttention-2 prefill, register-tiled GDN `delta_h`, tensor-core WY,
+  fused fp8 RMSNorm→quant, bf16 GDN I/O, and default-on fp4 per-shape autotuning.
+  Historical same-binary component A/Bs remain evidence for those individual
+  levers; they do not substitute for the reopened end-to-end oracle gate. The
+  full record is in the [parity ledger](.agents/parity-ledger.md), and
+  `scripts/dgx-bringup.sh` runs the CUDA suite and gates on dgx.casa.
 - **CPU status:** the native threadpool and chunked op dispatch pass the complete
   suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
   speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS
@@ -271,21 +248,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   2,016/2,016 successful, exact-native-count requests and full lifecycle/memory
   return. The reproducible diagnostic throughput ratios are below the required
   floor at every point: 0.959/0.926/0.934/0.937/0.961/0.956× from c1 to c32,
-  with most latency axes also slower. This is not evidence of a library/kernel
-  regression: against the accepted offline checkpoint, ours was +0.14% at c16
-  and -0.63% at c32, while vLLM's online denominator was +4.92%/+4.65% under
-  the changed corpus/frontend recipe. Direct-library parity remains accepted;
-  the still-unlocalized online gap may be scheduling, configuration, arrival,
-  frontend, or model-execution behavior. Our nsys trace completed. After the
-  Ninja/PATH repair, `d4ddeb1` captured the full 143-MiB vLLM torch trace, but
-  its postcondition rejected differing warmup/measured FP4 output digests. The
-  timed grid confirms exact synthetic text is not a valid performance gate:
-  only 4/2,016 paired continuations matched, although the commit-bound model
-  correctness gate passed and every request retained exact native counts. The
-  repaired contract records all digests and exact-match counts diagnostically;
-  it does not let them replace or bypass the model/count gates. The trace must
-  be recaptured after merge, then the concrete hot-path difference optimized
-  before a fresh 27B→35B campaign. No online ratio is binding.
+  with most latency axes also slower. The old comparison to an “accepted
+  offline” checkpoint was itself invalidated by the sampling/token-budget audit,
+  so it neither proves nor rules out a direct-library regression. The HTTP
+  frontend was measured and cannot explain the gap; pure b16 decode is nearly
+  tied, while mixed prefill/decode and host-backed KV/GDN state traffic are the
+  leading execution candidates. After the Ninja/PATH repair, `ed6247d` captured
+  the exact 48-prompt vLLM trace, but the old paired trace was still non-binding:
+  vllm.cpp reused cached prompts while vLLM had prefix caching off, and admission,
+  max-sequence, and model-length settings differed. The current harness fixes
+  those contracts explicitly and records output digests diagnostically behind
+  the commit-bound model/count gates. A fresh corrected trace, then matched
+  direct-library and online 27B→35B campaigns, is required. No existing
+  performance ratio is binding.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

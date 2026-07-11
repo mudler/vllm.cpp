@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <stdexcept>
 
 #include "vllm/v1/request.h"
 
@@ -252,6 +251,35 @@ void KVCacheCoordinator::new_step_starts() {
   for (const auto& manager : single_type_managers) {
     manager->new_step_starts();
   }
+}
+
+// ---------------------------------------------------------------------------
+// KVCacheCoordinatorNoPrefixCache
+// ---------------------------------------------------------------------------
+
+KVCacheCoordinatorNoPrefixCache::KVCacheCoordinatorNoPrefixCache(
+    KVCacheConfig kv_cache_config, int max_model_len,
+    int max_num_batched_tokens, bool use_eagle,
+    bool enable_kv_cache_events, int dcp_world_size, int pcp_world_size,
+    int scheduler_block_size, int hash_block_size)
+    : KVCacheCoordinator(std::move(kv_cache_config), max_model_len,
+                         max_num_batched_tokens, use_eagle,
+                         /*enable_caching=*/false, enable_kv_cache_events,
+                         dcp_world_size, pcp_world_size, scheduler_block_size,
+                         hash_block_size),
+      num_single_type_managers_(single_type_managers.size()) {}
+
+std::vector<int>
+KVCacheCoordinatorNoPrefixCache::get_num_common_prefix_blocks(
+    const std::string& /*running_request_id*/) {
+  return std::vector<int>(num_single_type_managers_, 0);
+}
+
+std::pair<KVCacheBlocksTuple, int>
+KVCacheCoordinatorNoPrefixCache::find_longest_cache_hit(
+    const std::vector<BlockHash>& /*block_hashes*/,
+    int /*max_cache_hit_length*/) {
+  return {KVCacheBlocksTuple(num_single_type_managers_), 0};
 }
 
 // ---------------------------------------------------------------------------
@@ -515,10 +543,10 @@ std::unique_ptr<KVCacheCoordinator> get_kv_cache_coordinator(
     bool enable_kv_cache_events, int dcp_world_size, int pcp_world_size,
     int scheduler_block_size, int hash_block_size) {
   if (!enable_caching) {
-    // KVCacheCoordinatorNoPrefixCache is DEFERRED (see header).
-    throw std::runtime_error(
-        "get_kv_cache_coordinator: enable_caching == false "
-        "(KVCacheCoordinatorNoPrefixCache) is DEFERRED (M1.3 Task 3).");
+    return std::make_unique<KVCacheCoordinatorNoPrefixCache>(
+        std::move(kv_cache_config), max_model_len, max_num_batched_tokens,
+        use_eagle, enable_kv_cache_events, dcp_world_size, pcp_world_size,
+        scheduler_block_size, hash_block_size);
   }
   std::size_t num_groups = kv_cache_config.kv_cache_groups.size();
   if (num_groups == 1) {

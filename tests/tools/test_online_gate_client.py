@@ -21,6 +21,7 @@ from tools.bench.online_gate import (
     CACHE_DROP_METHOD,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
+    MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     OUTPUT_LEN,
     PANDAS_VERSION,
@@ -564,8 +565,12 @@ class OnlineClientContractTests(unittest.TestCase):
             vllm_command = root / "vllm-command.txt"
             vllm_profile_log = root / "vllm-profile.log"
             vllm_corpus = root / "vllm-corpus.jsonl"
+            ours_command.write_text(
+                "nsys server --max-num-seqs 32 --max-num-batched-tokens 2048 "
+                "--no-enable-prefix-caching\n",
+                encoding="utf-8",
+            )
             for path in (
-                ours_command,
                 ours_profile_log,
                 vllm_command,
                 vllm_profile_log,
@@ -576,11 +581,15 @@ class OnlineClientContractTests(unittest.TestCase):
             vllm_metadata.write_text(
                 json.dumps(
                     {
+                        "admission_mode": "closed-loop",
                         "corpus": str(vllm_corpus),
                         "corpus_sha256": sha256_file(vllm_corpus),
+                        "enable_prefix_caching": False,
                         "input_len": INPUT_LEN,
+                        "max_concurrency": TRACE_CONCURRENCY,
                         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
-                        "max_num_seqs": TRACE_CONCURRENCY,
+                        "max_model_len": MAX_MODEL_LEN["27"],
+                        "max_num_seqs": MAX_NUM_SEQS,
                         "num_prompts": TRACE_PROMPTS,
                         "output_digest": "a" * 64,
                         "output_digests": [
@@ -602,24 +611,53 @@ class OnlineClientContractTests(unittest.TestCase):
                 path = root / f"cache-drop-{index}.json"
                 write_cache_drop_report(path)
                 cache_drop_reports.append(path)
-            trace = record_trace_status(
-                root / "trace.json",
-                model_key="27",
-                ours_nsys_report=trace_paths[0],
-                ours_kernel_summary=trace_paths[1],
-                ours_command=ours_command,
-                ours_profile_log=ours_profile_log,
-                ours_client_results=ours_client_results,
-                ours_client_logs=ours_client_logs,
-                vllm_torch_trace=trace_paths[2],
-                vllm_kernel_summary=trace_paths[3],
-                vllm_command=vllm_command,
-                vllm_profile_log=vllm_profile_log,
-                vllm_metadata=vllm_metadata,
-                vllm_corpus=vllm_corpus,
-                cache_drop_reports=cache_drop_reports,
-                vllm_cpp_sha="d" * 40,
+            def record_trace():
+                return record_trace_status(
+                    root / "trace.json",
+                    model_key="27",
+                    ours_nsys_report=trace_paths[0],
+                    ours_kernel_summary=trace_paths[1],
+                    ours_command=ours_command,
+                    ours_profile_log=ours_profile_log,
+                    ours_client_results=ours_client_results,
+                    ours_client_logs=ours_client_logs,
+                    vllm_torch_trace=trace_paths[2],
+                    vllm_kernel_summary=trace_paths[3],
+                    vllm_command=vllm_command,
+                    vllm_profile_log=vllm_profile_log,
+                    vllm_metadata=vllm_metadata,
+                    vllm_corpus=vllm_corpus,
+                    cache_drop_reports=cache_drop_reports,
+                    vllm_cpp_sha="d" * 40,
+                )
+
+            ours_command.write_text("nsys server\n", encoding="utf-8")
+            with self.assertRaisesRegex(HarnessError, "disable prefix caching"):
+                record_trace()
+            ours_command.write_text(
+                "nsys server --max-num-seqs 32 --max-num-batched-tokens 2048 "
+                "--no-enable-prefix-caching\n",
+                encoding="utf-8",
             )
+            slow = valid_record(
+                requests=TRACE_PROMPTS,
+                concurrency=TRACE_CONCURRENCY,
+            )
+            slow["duration"] = 15.0
+            ours_client_results[-1].write_text(json.dumps(slow), encoding="utf-8")
+            with self.assertRaisesRegex(HarnessError, "duration by more than 20%"):
+                record_trace()
+            ours_client_results[-1].write_text(
+                json.dumps(
+                    valid_record(
+                        requests=TRACE_PROMPTS,
+                        concurrency=TRACE_CONCURRENCY,
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            trace = record_trace()
             self.assertEqual(trace["ours_profiler"], "nsys")
             self.assertEqual(trace["vllm_profiler"], "torch-profiler")
             self.assertFalse(trace["output_repeatability"]["vllm"]["all_equal"])

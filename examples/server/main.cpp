@@ -11,6 +11,7 @@
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--enable-force-include-usage]
+//          [--[no-]enable-prefix-caching]
 //          [--scheduling-policy fcfs|priority]
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
@@ -28,6 +29,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "vllm/config/scheduler.h"
@@ -72,6 +74,7 @@ struct Args {
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
+  std::optional<bool> enable_prefix_caching = std::nullopt;
   bool enable_force_include_usage = false;
   // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy).
@@ -87,6 +90,7 @@ struct Args {
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--enable-force-include-usage]\n"
+         "               [--[no-]enable-prefix-caching]\n"
          "               [--scheduling-policy fcfs|priority]\n";
   std::exit(code);
 }
@@ -122,6 +126,13 @@ Args ParseArgs(int argc, char** argv) {
       a.max_num_batched_tokens = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--enable-force-include-usage") {
       a.enable_force_include_usage = true;
+    } else if (flag == "--enable-prefix-caching" ||
+               flag == "--no-enable-prefix-caching") {
+      if (a.enable_prefix_caching.has_value()) {
+        std::cerr << "server: prefix-caching flag specified more than once\n";
+        Usage(argv[0], 2);
+      }
+      a.enable_prefix_caching = flag == "--enable-prefix-caching";
     } else if (flag == "--scheduling-policy") {
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
@@ -174,11 +185,15 @@ int main(int argc, char** argv) {
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
+    engine_params.enable_prefix_caching = args.enable_prefix_caching;
     // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
     engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
                                                       engine_params);
+    std::cerr << "server: prefix caching "
+              << (loaded->prefix_caching_enabled() ? "enabled" : "disabled")
+              << "\n";
     // W2: the production server uses AsyncLLM over EngineCoreProc's dedicated
     // engine thread. HTTP workers submit independently and stream from their
     // per-request collectors; no server-wide engine mutex remains.

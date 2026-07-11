@@ -62,6 +62,7 @@ MODEL_REPOSITORIES = {
 }
 MAX_NUM_SEQS = 32
 MAX_NUM_BATCHED_TOKENS = {"27": 2048, "35": 8192}
+MAX_MODEL_LEN = {"27": 262144, "35": 262144}
 ENGINES = ("ours", "vllm")
 PERCENTILE_METRICS = ("ttft", "tpot", "itl", "e2el")
 PERCENTILES = (50, 90, 99)
@@ -749,6 +750,7 @@ def record_trace_status(
         for index, path in enumerate(cache_drop_reports, start=1)
     }
     generated_texts = []
+    ours_durations = []
     for path in ours_client_results:
         record = _load_json_object(path)
         validate_raw_result(
@@ -757,15 +759,42 @@ def record_trace_status(
             expected_requests=TRACE_PROMPTS,
         )
         generated_texts.append(record.get("generated_texts"))
+        ours_durations.append(require_number(record.get("duration"), "duration"))
+    ours_command_tokens = shlex.split(ours_command.read_text(encoding="utf-8"))
+    if "--no-enable-prefix-caching" not in ours_command_tokens:
+        raise HarnessError("ours trace must explicitly disable prefix caching")
+    for flag, expected in (
+        ("--max-num-seqs", MAX_NUM_SEQS),
+        ("--max-num-batched-tokens", MAX_NUM_BATCHED_TOKENS[model_key]),
+    ):
+        if flag not in ours_command_tokens:
+            raise HarnessError(f"ours trace command omits {flag}")
+        value_index = ours_command_tokens.index(flag) + 1
+        if value_index >= len(ours_command_tokens):
+            raise HarnessError(f"ours trace command omits the value for {flag}")
+        if ours_command_tokens[value_index] != str(expected):
+            raise HarnessError(f"ours trace command {flag} differs from the gate")
+    if "--max-model-len" in ours_command_tokens:
+        value_index = ours_command_tokens.index("--max-model-len") + 1
+        if value_index >= len(ours_command_tokens):
+            raise HarnessError("ours trace command omits the value for --max-model-len")
+        if ours_command_tokens[value_index] != str(MAX_MODEL_LEN[model_key]):
+            raise HarnessError("ours trace command --max-model-len differs from the gate")
+    if max(ours_durations) > min(ours_durations) * 1.20:
+        raise HarnessError("ours trace repetitions differ in duration by more than 20%")
     ours_output_digests = [
         hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
         for value in generated_texts
     ]
     metadata = _load_json_object(vllm_metadata)
     expected_metadata = {
+        "admission_mode": "closed-loop",
+        "enable_prefix_caching": False,
         "input_len": INPUT_LEN,
+        "max_concurrency": TRACE_CONCURRENCY,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS[model_key],
-        "max_num_seqs": TRACE_CONCURRENCY,
+        "max_num_seqs": MAX_NUM_SEQS,
+        "max_model_len": MAX_MODEL_LEN[model_key],
         "num_prompts": TRACE_PROMPTS,
         "output_len": OUTPUT_LEN,
         "profiled_warmup_prompts": TRACE_PROMPTS,
@@ -841,8 +870,12 @@ def record_trace_status(
         },
         "passed": True,
         "trace_contract": {
+            "admission_mode": "closed-loop",
             "concurrency": TRACE_CONCURRENCY,
+            "enable_prefix_caching": False,
             "input_len": INPUT_LEN,
+            "max_model_len": MAX_MODEL_LEN[model_key],
+            "max_num_seqs": MAX_NUM_SEQS,
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
             "repetitions": TRACE_REPETITIONS,

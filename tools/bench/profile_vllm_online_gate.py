@@ -11,6 +11,7 @@ guard is intentional because vLLM uses multiprocessing spawn.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import pathlib
 import time
@@ -42,7 +43,10 @@ def load_prompts(corpus: pathlib.Path, batch_size: int):
         token_ids = row.get("prompt_token_ids")
         if not isinstance(token_ids, list) or len(token_ids) != INPUT_LEN:
             raise HarnessError(f"{corpus}:{index + 1}: prompt token IDs are not exact")
-        if any(isinstance(token, bool) or not isinstance(token, int) for token in token_ids):
+        if any(
+            isinstance(token, bool) or not isinstance(token, int)
+            for token in token_ids
+        ):
             raise HarnessError(f"{corpus}:{index + 1}: prompt token ID is not an integer")
         prompts.append(token_ids)
     return prompts
@@ -61,6 +65,57 @@ def _output_digest(outputs) -> str:
     return digest.hexdigest()
 
 
+def run_closed_loop(
+    llm,
+    prompts,
+    sampling,
+    max_concurrency: int,
+    request_id_base: int,
+    final_output_kind=None,
+):
+    """Run the offline engine with the online client's closed-loop admission.
+
+    Only ``max_concurrency`` requests are resident. Each finished request admits
+    one replacement, matching ``vllm bench serve --max-concurrency`` instead of
+    preloading all prompts into the scheduler's waiting queue.
+    """
+
+    if max_concurrency <= 0 or max_concurrency > len(prompts):
+        raise HarnessError("max-concurrency must be in [1, num-prompts]")
+    engine = llm.llm_engine
+    next_index = 0
+    completed = {}
+
+    def submit(index: int) -> None:
+        params = copy.copy(sampling)
+        if final_output_kind is not None:
+            params.output_kind = final_output_kind
+        engine.add_request(str(request_id_base + index), prompts[index], params)
+
+    while next_index < min(max_concurrency, len(prompts)):
+        submit(next_index)
+        next_index += 1
+
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            if not output.finished:
+                continue
+            index = int(output.request_id) - request_id_base
+            if index in completed or index < 0 or index >= len(prompts):
+                raise HarnessError("closed-loop profiler returned an invalid request id")
+            completed[index] = output
+            if next_index < len(prompts):
+                submit(next_index)
+                next_index += 1
+
+    if len(completed) != len(prompts):
+        raise HarnessError(
+            f"closed-loop profiler completed {len(completed)} prompts; "
+            f"expected {len(prompts)}"
+        )
+    return [completed[index] for index in range(len(prompts))]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
@@ -68,7 +123,8 @@ def main() -> int:
     parser.add_argument("--profile-dir", type=pathlib.Path, required=True)
     parser.add_argument("--metadata", type=pathlib.Path, required=True)
     parser.add_argument("--num-prompts", type=int, default=TRACE_PROMPTS)
-    parser.add_argument("--max-num-seqs", type=int, default=TRACE_CONCURRENCY)
+    parser.add_argument("--max-concurrency", type=int, default=TRACE_CONCURRENCY)
+    parser.add_argument("--max-num-seqs", type=int, required=True)
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
     parser.add_argument("--repetitions", type=int, default=TRACE_REPETITIONS)
     args = parser.parse_args()
@@ -85,9 +141,12 @@ def main() -> int:
     # Delayed imports keep CPU contract tests independent of vLLM/PyTorch.
     from vllm import LLM, SamplingParams, TokensPrompt
     from vllm.config import ProfilerConfig
+    from vllm.sampling_params import RequestOutputKind
 
-    if args.max_num_seqs <= 0 or args.max_num_seqs > args.num_prompts:
-        raise HarnessError("max-num-seqs must be in [1, num-prompts]")
+    if args.max_num_seqs <= 0:
+        raise HarnessError("max-num-seqs must be positive")
+    if args.max_concurrency <= 0 or args.max_concurrency > args.max_num_seqs:
+        raise HarnessError("max-concurrency must be in [1, max-num-seqs]")
     if args.max_num_batched_tokens < args.max_num_seqs:
         raise HarnessError("max-num-batched-tokens must cover max-num-seqs")
     token_rows = load_prompts(args.corpus, args.num_prompts)
@@ -103,9 +162,9 @@ def main() -> int:
         model=str(args.model),
         tokenizer=str(args.model),
         seed=0,
-        max_model_len=INPUT_LEN + OUTPUT_LEN,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        enable_prefix_caching=False,
         gpu_memory_utilization=0.6,
         profiler_config=ProfilerConfig(
             profiler="torch",
@@ -121,10 +180,24 @@ def main() -> int:
         # each include a full c16 warmup wave. Profile the equivalent 48-prompt
         # (three-wave) warmup here so both traces contain 192 prompt executions
         # before comparing runtime-resolved kernel families.
-        warmup = llm.generate(prompts, sampling, use_tqdm=False)
+        warmup = run_closed_loop(
+            llm,
+            prompts,
+            sampling,
+            args.max_concurrency,
+            request_id_base=0,
+            final_output_kind=RequestOutputKind.FINAL_ONLY,
+        )
         warmup_digest = _output_digest(warmup)
-        for _ in range(args.repetitions):
-            outputs = llm.generate(prompts, sampling, use_tqdm=False)
+        for repetition in range(args.repetitions):
+            outputs = run_closed_loop(
+                llm,
+                prompts,
+                sampling,
+                args.max_concurrency,
+                request_id_base=(repetition + 1) * 100_000,
+                final_output_kind=RequestOutputKind.FINAL_ONLY,
+            )
             measured_digests.append(_output_digest(outputs))
     finally:
         llm.stop_profile()
@@ -137,8 +210,12 @@ def main() -> int:
             break
         time.sleep(1.0)
     result = {
+        "admission_mode": "closed-loop",
+        "enable_prefix_caching": False,
+        "max_concurrency": args.max_concurrency,
         "max_num_seqs": args.max_num_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_model_len": llm.llm_engine.model_config.max_model_len,
         "corpus": str(args.corpus),
         "corpus_sha256": sha256_file(args.corpus),
         "input_len": INPUT_LEN,

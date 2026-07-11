@@ -18,6 +18,7 @@ from tools.bench.online_gate import (
     CACHE_DROP_METHOD,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
+    MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     OUTPUT_LEN,
     PANDAS_VERSION,
@@ -217,8 +218,12 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "ours_profiler": "nsys",
                 "passed": True,
                 "trace_contract": {
+                    "admission_mode": "closed-loop",
                     "concurrency": TRACE_CONCURRENCY,
+                    "enable_prefix_caching": False,
                     "input_len": INPUT_LEN,
+                    "max_model_len": MAX_MODEL_LEN["27"],
+                    "max_num_seqs": MAX_NUM_SEQS,
                     "num_prompts": TRACE_PROMPTS,
                     "output_len": OUTPUT_LEN,
                     "repetitions": TRACE_REPETITIONS,
@@ -278,7 +283,8 @@ def _write_fixture(root: pathlib.Path) -> None:
             client_log.write_text("timed client passed\n", encoding="utf-8")
             (client_log.parent / f"r{repetition}-server-command.txt").write_text(
                 "server --model /fixture --max-num-seqs 32 "
-                "--max-num-batched-tokens 2048 --served-model-name gate\n",
+                "--max-num-batched-tokens 2048 --no-enable-prefix-caching "
+                "--served-model-name gate\n",
                 encoding="utf-8",
             )
             (client_log.parent / f"r{repetition}-server.log").write_text(

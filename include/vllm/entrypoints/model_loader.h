@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "vllm/config/scheduler.h"
@@ -51,6 +52,11 @@ struct EngineParams {
   // product let an 8x1024 (8192-token) prefill run in ONE step, blowing the GDN
   // prefill activation.
   int max_num_batched_tokens = 0;
+  // Mirrors vLLM's tri-state --[no-]enable-prefix-caching resolution. Hybrid
+  // and attention-free generation models default OFF at the parity pin;
+  // decoder-only models default ON. An explicit value overrides the model
+  // capability default.
+  std::optional<bool> enable_prefix_caching = std::nullopt;
   // Scheduling policy (mirrors SchedulerConfig.policy / the vLLM
   // --scheduling-policy flag). Default fcfs. Set kPriority to schedule by
   // (priority, arrival_time); requests then carry a `priority` field.
@@ -109,6 +115,8 @@ class LoadedEngine {
   // the default policy without a disk load.
   static int ResolveMaxNumBatchedTokens(const EngineParams& params,
                                         int max_model_len, bool is_dense_arch);
+  static bool ResolveEnablePrefixCaching(const EngineParams& params,
+                                         const ModelInfo& model_info);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
@@ -118,6 +126,7 @@ class LoadedEngine {
   const tok::Tokenizer& tokenizer() const { return tokenizer_; }
   const HfConfig& config() const { return config_; }
   int max_model_len() const { return max_model_len_; }
+  bool prefix_caching_enabled() const { return prefix_caching_enabled_; }
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight
@@ -139,6 +148,7 @@ class LoadedEngine {
   std::unique_ptr<LoadedModel> model_;
   tok::Tokenizer tokenizer_;
   int max_model_len_;
+  bool prefix_caching_enabled_;
   vllm::v1::KVCacheConfig kv_cfg_;
   vllm::v1::Scheduler scheduler_;
   vllm::v1::GPUModelRunner runner_;

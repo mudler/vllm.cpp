@@ -24,7 +24,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 0 | 6 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **97** | **9** | **17** | **0** | **8** | **3** | **12** | **48** |
+| **Total** | **98** | **9** | **17** | **0** | **8** | **3** | **12** | **49** |
 
 ## Engine core and scheduling
 
@@ -59,7 +59,8 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-FP8` | FP8 KV cache and scale handling | T1 | `vllm/model_executor/layers/quantization/kv_cache.py:42,108-191` | - | - | `planned: specs/fp8-kv-cache.md` | `INVENTORIED` | - |
 | `KV-NVFP4-TURBO` | NVFP4, per-token-head, and TurboQuant KV | T2 | `vllm/config/cache.py:14,28-35,272` | - | - | `planned: specs/nvfp4-kv-cache.md` | `INVENTORIED` | - |
 | `KV-OFFLOAD` | CPU tiering with LRU and ARC | T2 | `vllm/v1/kv_offload/cpu/manager.py:36`; `vllm/v1/kv_offload/cpu/policies/lru.py:12`; `vllm/v1/kv_offload/cpu/policies/arc.py:12` | - | - | `planned: specs/kv-offload.md` | `INVENTORIED` | - |
-| `KV-CONNECTORS` | Nixl, LMCache, Mooncake, and prefill/decode disaggregation | T2 | `vllm/distributed/kv_transfer/kv_connector/factory.py:27,152-164` | - | - | `planned: specs/kv-connectors-disagg.md` | `INVENTORIED` | - |
+| `KV-EXTERNAL-CACHE` | External KV-cache provider ABI plus LMCache interoperability: vLLM-compatible producer/consumer/both roles, scheduler/worker metadata split, cache registration, block-hash lookup, asynchronous layer load/store and completion/free ownership; built-in `LMCacheConnectorV1`, recommended standalone-service `LMCacheMPConnector`, and an external connector-module seam | T2 | config/roles/failure policy `vllm/config/kv_transfer.py:23-72,92-121`; connector factory, external-module override and HMA guard `vllm/distributed/kv_transfer/kv_connector/factory.py:45-75,95-145,164-174`; abstract scheduler/worker lifecycle `vllm/distributed/kv_transfer/kv_connector/v1/base.py:7-40,171-355`; MP block/chunk state `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py:69-83,176-320`; tests `tests/v1/kv_connector/unit/test_lmcache_connector.py:74,200,394,562`, `tests/v1/kv_connector/unit/test_lmcache_integration.py:60-223`, `tests/distributed/test_kvlayout.py:19-77`; [LMCache quickstart](https://docs.lmcache.ai/getting_started/quickstart.html) | - | - | `planned: specs/external-kv-cache-lmcache.md` | `INVENTORIED` | - |
+| `KV-CONNECTORS` | Remaining connector breadth (NIXL, Mooncake, MultiConnector, remote stores) and prefill/decode disaggregation over the `KV-EXTERNAL-CACHE` base seam | T2 | `vllm/distributed/kv_transfer/kv_connector/factory.py:176-230`; `tests/v1/kv_connector/unit/test_{nixl_connector,mooncake_connector,multi_connector,remote_prefill_lifecycle,remote_decode_lifecycle}.py` | - | - | `planned: specs/kv-connectors-disagg.md` | `INVENTORIED` | - |
 | `KV-EVENTS` | Block create/evict event publication | T2 | `vllm/config/kv_events.py:11-52`; `vllm/v1/core/kv_cache_manager.py:121,149` | - | - | `planned: specs/kv-events.md` | `INVENTORIED` | - |
 | `KV-MLA-SPEC` | Latent MLA KV specification | T2 | `vllm/v1/kv_cache_interface.py:363` | - | - | `planned: specs/mla-kv-spec.md` | `INVENTORIED` | - |
 | `KV-CROSS-ENCODER-SPECS` | `CrossAttentionSpec` and `EncoderOnlyAttentionSpec` KV interface specs (`ATTN-ENCODER-CROSS` covers backends only); carried from porting-inventory §2 (T2) at the v1 fold | T2 | `vllm/v1/kv_cache_interface.py:710,717` | - | - | `planned: specs/encoder-cross-kv-specs.md` | `INVENTORIED` | - |

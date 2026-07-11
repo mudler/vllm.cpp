@@ -327,6 +327,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   closure remain mandatory before 35B and later roadmap work. W2 direct indexed
   convolution-state update stays scoped until those confirmed causes are
   removed and the residual trace is re-ranked.
+- **External KV-cache providers are roadmap-only, not supported yet.** Roadmap
+  v1 now has a dedicated `KV-EXTERNAL-CACHE` outcome: mirror vLLM's
+  producer/consumer/both connector ABI, scheduler/worker load-store lifecycle,
+  dynamic external-provider seam and failure policy, then make the official
+  [LMCache MP and in-process workflows](https://docs.lmcache.ai/getting_started/quickstart.html)
+  work end-to-end. The first binding gates will cover shared-prefix
+  store/retrieve, two-engine reuse, Qwen3.6 hybrid-cache behavior, correctness,
+  TTFT, transfer throughput, memory, failure recovery and observability. No
+  local connector implementation or LMCache benchmark is claimed today.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

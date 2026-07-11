@@ -81,7 +81,8 @@ what vLLM has vs what we have:
 | KV quantization: fp8 KV cache (`cache_dtype=fp8*`) | `config/cache.py`, `layers/quantization/kv_cache.py` | T1 |
 | KV quantization: nvfp4 / per-token-head / turboquant modes | `config/cache.py` | T2 |
 | KV offload (CPU tiering, LRU/ARC policies) | `v1/kv_offload/` | T2 |
-| KV connectors (Nixl/LMCache/Mooncake/PD-disaggregation) | `distributed/kv_transfer/` | T2 |
+| External KV-cache provider ABI + LMCache MP/in-process interoperability | `config/kv_transfer.py`; `distributed/kv_transfer/kv_connector/v1/{base,lmcache_connector,lmcache_mp_connector}.py` | T2 |
+| KV connector breadth (NIXL/Mooncake/MultiConnector/PD-disaggregation) | `distributed/kv_transfer/` | T2 |
 | KV events (ZMQ publish of block create/evict) | `config/kv_events.py` | T2 |
 | Sizing: `gpu_memory_utilization`, `num_gpu_blocks_override`, `kv_cache_memory_bytes` | `config/cache.py` | T0 |
 

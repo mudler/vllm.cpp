@@ -33,7 +33,7 @@ ENGINE_PREFIXES = (
     "ATTN",
     "LOAD",
 )
-ENGINE_ROWS = 97
+ENGINE_ROWS = 98
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
@@ -683,6 +683,7 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
         "ROAD-V1-D2",
         "ROAD-V1-D3",
         "ROAD-V1-D4",
+        "ROAD-V1-D5",
     ]
     seen: list[tuple[int, str]] = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):

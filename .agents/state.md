@@ -4727,3 +4727,26 @@ is to commit and push the exact source, build that SHA on the idle DGX, and run
 the legacy/fixed c32 arms in AB/BA/AB order under one `/tmp/gpu` lock, followed
 by the fresh exact 27B oracle ladder. README and `docs/BENCHMARKS.md` record
 the GPU result as pending; `SERVE-ASYNC-LLM` remains `ACTIVE`.
+
+## 2026-07-11 — external KV-cache / LMCache is an explicit roadmap outcome
+
+User direction adds externally managed KV caches as a first-class roadmap-v1
+outcome, with LMCache as the initial interoperability target. The prior record
+mentioned LMCache only inside the broad T2 `KV-CONNECTORS` inventory. The new
+stable `KV-EXTERNAL-CACHE` row separates the provider ABI and LMCache gate from
+NIXL/Mooncake/PD-disaggregation breadth, and `ROAD-V1-D4` now names the outcome
+directly; the old mixed LoRA/offload/zoo block moves to `ROAD-V1-D5`.
+
+Pinned vLLM exposes `KVTransferConfig` roles (`kv_producer`, `kv_consumer`,
+`kv_both`), extra config and external module override, a factory-enforced
+scheduler/worker split, cache registration, block-hash lookup, asynchronous
+per-layer load/store, completion/free ownership and recompute/fail policy. It
+registers both `LMCacheConnectorV1` and `LMCacheMPConnector`. The official
+LMCache quickstart recommends the standalone MP server, ZMQ connector config
+and two-request shared-prefix store/retrieve flow; in-process mode remains a
+second supported mode. The eventual spike must cover that full dependency
+chain, a deterministic fake-provider conformance layer, Qwen3.6 hybrid-cache
+behavior, two-engine reuse, correctness, TTFT, transfer bandwidth, memory,
+failure recovery and metrics. This checkpoint is inventory-only and therefore
+records `NOT APPLICABLE` performance: no local connector or LMCache result is
+claimed.

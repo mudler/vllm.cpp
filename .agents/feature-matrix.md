@@ -57,7 +57,8 @@ instead of it.
 | fp8 KV cache (`cache_dtype=fp8*`) | `layers/quantization/kv_cache.py` | ☐ T1 | | `planned: specs/fp8-kv-cache.md` |
 | nvfp4 / per-token-head / turboquant KV | `config/cache.py` | ☐ T2 | | `planned: specs/nvfp4-kv-cache.md` |
 | KV offload (CPU tiering, LRU/ARC) | `v1/kv_offload/` | ☐ T2 | | `planned: specs/kv-offload.md` |
-| KV connectors (Nixl/LMCache/Mooncake, **PD disaggregation**) | `distributed/kv_transfer/` | ☐ T2 | | `planned: specs/kv-connectors-disagg.md` |
+| External KV-cache provider ABI + LMCache (MP service and in-process connectors) | `config/kv_transfer.py`, `distributed/kv_transfer/kv_connector/v1/{base,lmcache_connector,lmcache_mp_connector}.py` | ☐ T2 | explicit roadmap outcome `KV-EXTERNAL-CACHE`: mirror `kv_producer`/`kv_consumer`/`kv_both`, scheduler/worker metadata, async layer load/store, dynamic external connector modules, failure policy, metrics and cache-lifecycle ownership; gate the official LMCache shared-prefix quickstart plus Qwen3.6 hybrid behavior | `planned: specs/external-kv-cache-lmcache.md` |
+| KV connector breadth (NIXL/Mooncake/MultiConnector, **PD disaggregation**) | `distributed/kv_transfer/` | ☐ T2 | builds on the external-provider base seam; remains a separate breadth/scale-out leaf | `planned: specs/kv-connectors-disagg.md` |
 | KV events (block create/evict publish) | `config/kv_events.py` | ☐ T2 | | `planned: specs/kv-events.md` |
 | MLAAttentionSpec (latent KV) | `v1/kv_cache_interface.py` | ☐ T2 | with DeepSeek family | `planned: specs/mla-kv-spec.md` |
 | Sizing: `gpu_memory_utilization`, block overrides | `config/cache.py` | `PARTIAL` T0 | watermark/fixed loader inputs exist; public utilization/cache-byte/override policy absent | `planned: specs/kv-sizing.md` |

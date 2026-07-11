@@ -6620,3 +6620,69 @@ failures are the unchanged odd-size BF16 cuBLASLt tolerance case in
 `qwen36_gguf_greedy` runner in `test_op_parity`. CPU CTest is 91/92 with only
 that same missing parity runner. The changed loader and GDN suites pass on both
 backends, and the real-model natural-corpus run confirms the unchanged 15/16.
+
+## 2026-07-11 — matched post-packing C++ versus vLLM execution trace
+
+Re-profiled both engines sequentially on the identical local Qwen3.5-4B
+temperature-1 workload: 32 ShareGPT requests, concurrency/max-num-seqs 16,
+exact 1024 input / 24 output tokens, mnbt 2048, BF16, seed 0. C++ trace:
+`/tmp/nsys-out/vllm-cpp-4b-packed-ba-on.nsys-rep`; production vLLM 0.24 trace:
+`/tmp/nsys-out/vllm-qwen35-4b-packed-ba-match.nsys-rep`. vLLM's whole-process
+capture includes compile/warmup/graph capture, so its kernel summary was filtered
+to the inference interval beginning at the post-warmup sampling cluster
+(33.0-37.081 s). The first request still JIT-compiled three previously uncovered
+Triton shapes; that latency is included in vLLM's wall time, not mistaken for a
+steady-state kernel.
+
+| GPU bucket | vllm.cpp | vLLM | C++ excess |
+|---|---:|---:|---:|
+| GEMM | 3067.68 ms | 2594.58 ms | **473.10 ms** |
+| Remaining glue/norm/cache | 305.54 ms | 120.42 ms | **185.12 ms** |
+| Attention | 227.23 ms | 61.21 ms | **166.01 ms** |
+| GDN conv + post-conv | 184.53 ms | 55.06 ms | **129.47 ms** |
+| Sampling | 32.63 ms | 4.25 ms | 28.38 ms |
+| MLP activation | 80.49 ms | 55.22 ms | 25.27 ms |
+| GDN recurrence | 212.04 ms | 188.12 ms | 23.92 ms |
+| **Total GPU kernels** | **4110.13 ms** | **3078.86 ms** | **1031.28 ms** |
+
+Traced throughput is 7001.85 versus 8891.79 tok/s (0.7875x); wall time is
+4.8140 versus 3.7908 s. Crucially, GPU-uncovered wall time is effectively equal:
+0.7039 s C++ versus 0.7119 s vLLM. The 1.0232 s wall gap is therefore fully
+explained by the 1.0313 s aggregate GPU-kernel gap, within trace accounting.
+This refutes host scheduling/launch starvation as the current primary cause.
+
+The largest absolute bucket is BF16 GEMM. C++ launches 11,407 physical GEMM
+kernels versus vLLM's 3,426, spends 18.2% more GPU time, and currently asks
+cuBLASLt for only one heuristic (`cuda_matmul.cu:241-243`). vLLM also executes
+merged full-attention QKV and GDN QKV/Z projections (`qwen3_5.py:283-284`), while
+our direct merged-GEMM experiments were removed because they worsened token
+parity. The next defensible GEMM lever is a cached per-shape cuBLASLt tactic
+autotune (including split-K/non-split-K), followed by reworking merged projection
+dtypes/numerics to mirror vLLM end-to-end rather than merely concatenating the
+current mixed paths.
+
+The clearest non-GEMM lever is attention: C++ runs `PagedFlashWmma`/decode
+kernels for 227.23 ms while vLLM's actual FA2 `flash_fwd_splitkv<256,64,64,4>`
+runs for 61.21 ms (3.71x). Although `VLLM_CPP_FLASH_ATTN=ON` appears in the local
+CMake cache, no `VLLM_CPP_FLASH_ATTN` compile definition exists because CMake
+currently couples FA2 to `VLLM_CPP_CUTLASS`/sm_12xa (`CMakeLists.txt:451-465`).
+The vendored sources themselves are sm80 BF16 kernels and vLLM runs that same
+family on sm_120. Decoupling local FA2 from the fp4-CUTLASS capability gate is
+the highest-confidence next change, with about 166 ms / 3.45% of C++ wall time
+available in this trace.
+
+GDN recurrence is already close (only 23.92 ms excess) and should not be the
+next target. The adjacent glue remains expensive: C++ causal-conv plus
+post-conv is 184.53 ms versus vLLM's Triton `_causal_conv1d_fwd_kernel` plus
+`_fused_post_conv_kernel` at 55.06 ms (3.35x, 129.47 ms gap). Porting those two
+resolved kernels through the existing Triton AOT mechanism is the next concrete
+GDN task. Sampling remains 7.7x slower per aggregate than vLLM but its entire
+remaining opportunity is only 28.38 ms (~0.6% wall), so it is now lower priority.
+
+Machine integrity: the first sandboxed oracle attempt failed before GPU access
+because Triton could not find NixOS `/sbin/ldconfig`; the documented
+`TRITON_LIBCUDA_PATH=/run/opengl-driver/lib` fixed it. The apparent missing
+`/dev/nvidia*` was sandbox device isolation: host `nvidia-smi` remained healthy.
+After the successful profile the GPU returned to 146 MiB / P8. The kernel log
+has two recurring `refcntRequestReference_IMPL ... status 0x56` notices during
+vLLM initialization, but no Xid, UVM fault, oops, reset, or lockup.

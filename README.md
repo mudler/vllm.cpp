@@ -519,9 +519,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   matched trace removes 624 physical launches and 0.62% of GPU kernel time.
   Attention QKV and GDN QKV/Z merge trials were reverted because they worsened
   the current 15/16 greedy result. Ordinary BF16 GEMMs and eager launch
-  structure still dominate. A trial of the existing dense CUDA graph on BF16
-  preserved the 15/16 short-corpus result but segfaulted in `libcuda.so` under
-  sustained load, so that routing was reverted.
+  structure still dominate. A matched post-packing short Nsight run attributes
+  the 1.03 s GPU-time gap versus vLLM roughly half to GEMMs (0.47 s) and half
+  to non-GEMM kernels (0.56 s); host/GPU-uncovered time is already equal. The
+  largest concrete non-GEMM gaps are local attention (the sm_120 build does not
+  compile the vendored FA2 path) and GDN conv/post-conv kernels. A trial of the
+  existing dense CUDA graph on BF16 preserved the 15/16 short-corpus result but
+  segfaulted in `libcuda.so` under sustained load, so that routing was reverted.
   Persistent KV/GDN caches are now true device allocations on discrete GPUs,
   eliminating the prior HMM/UVM migration path; sustained runs and both engine
    traces completed without Xid/UVM faults.

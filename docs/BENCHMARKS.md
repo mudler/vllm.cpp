@@ -522,6 +522,15 @@ throughput table above remains authoritative. Every process exited, process
 VRAM returned to zero, board memory returned to 146-166 MiB, and no Xid,
 UVM/AER fault, reset, or lockup occurred.
 
+Host-residency optimization disposition: **PENDING / SPIKE**. The accepted
+[`ENG-HOST-WEIGHT-RESIDENCY`](../.agents/specs/discrete-cuda-host-weight-residency.md)
+work first gates synchronized post-residency host release and duplicate-free
+tied/stacked ownership on this discrete GPU. It does not replace the table
+above, and no improved memory or throughput number is published until the
+same-workload A/B and fresh vLLM series completes. If launch-to-exit peak PSS
+remains above vLLM after steady-state release, bounded streaming/direct-device
+loading remains an explicit open follow-on.
+
 Environment diagnostic disposition: **NOT APPLICABLE to benchmark validity**.
 The recurring NVIDIA `refcntRequestReference_IMPL ... 0x00000056` notice maps
 to `NV_ERR_NOT_SUPPORTED` in the matching 595.71.05 open-driver source and is

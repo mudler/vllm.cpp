@@ -519,7 +519,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   gap: at the loaded-GPU plateau peak PSS is **12.59 GiB versus 4.15 GiB
   (3.04×)**, while launch-to-exit peak PSS averages **19.77 GiB versus 7.39
   GiB (2.68×)**. The loader retains owned host tensors after device upload,
-  including tied/packed BF16 duplicates; memory parity is not met.
+  including tied/packed BF16 duplicates; memory parity is not met. A scoped
+  `ENG-HOST-WEIGHT-RESIDENCY` spike is now **ACTIVE at the design/claim
+  checkpoint**: first release discrete-CUDA staging after synchronized full
+  residency, then remove tied/packed duplicates, and leave true streaming as an
+  explicit follow-on if launch peak remains above vLLM. No improved number is
+  claimed yet.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

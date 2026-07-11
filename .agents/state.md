@@ -6876,3 +6876,24 @@ Every process exited and board memory returned to 146-166 MiB. Final state was
 P8, 0% utilization, 166 MiB, 42 C. The kernel log contains no Xid, UVM/AER
 fault, reset, oops, or lockup from the series. Correctness remains the existing
 15/16, so this is a diagnostic memory checkpoint, not a passed gate.
+
+## 2026-07-11 — discrete-CUDA host-weight residency spike
+
+The local Qwen3.5-4B memory evidence is now owned by stable row
+`ENG-HOST-WEIGHT-RESIDENCY` and claim `CLAIM-HOST-WEIGHT-RESIDENCY-1`. Source
+inspection explains the architecture-specific Spark/local contrast: vLLM
+constructs and loads ordinary parameters on the target CUDA device, aliases a
+tied LM head to the embedding object, and loads gate/up plus GDN B/A directly
+as shards of canonical stacked parameters. vllm.cpp instead keeps
+`OwnedTensor::bytes` beside lazy device copies, copies tied embeddings, and
+retains both source and packed vectors.
+
+The accepted spike scopes W1 to engine-owned plain-BF16 Qwen3.5 on discrete
+CUDA after one successful synchronized full forward. CPU, UMA/GB10, borrowed
+test weights, and quantized models retain their current ownership until
+separately gated. Steady-state PSS and launch-to-exit peak PSS are independent:
+post-residency release may close the former but cannot close the row if full
+materialization still leaves peak above vLLM. This checkpoint changes no
+runtime code and retains the 12.59/19.77 GiB project versus 4.15/7.39 GiB vLLM
+baseline. Next: implement W1, remove safe tied/packed duplicates in W2, then run
+one lock-held memory A/B series plus separate unmonitored throughput runs.

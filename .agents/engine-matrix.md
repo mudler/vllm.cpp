@@ -16,7 +16,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 14 | 3 | 3 | 0 | 1 | 0 | 2 | 5 |
-| KV cache and memory | 19 | 2 | 2 | 0 | 2 | 1 | 2 | 10 |
+| KV cache and memory | 20 | 2 | 2 | 1 | 2 | 1 | 2 | 10 |
 | Parallelism | 6 | 0 | 0 | 0 | 1 | 0 | 0 | 5 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 7 | 0 | 3 | 0 | 0 | 0 | 0 | 4 |
@@ -25,7 +25,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 0 | 6 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **104** | **9** | **17** | **0** | **8** | **2** | **13** | **55** |
+| **Total** | **105** | **9** | **17** | **1** | **8** | **2** | **13** | **55** |
 
 ## Engine core and scheduling
 
@@ -68,6 +68,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | `KV-CROSS-ENCODER-SPECS` | `CrossAttentionSpec` and `EncoderOnlyAttentionSpec` KV interface specs (`ATTN-ENCODER-CROSS` covers backends only); carried from porting-inventory §2 (T2) at the v1 fold | T2 | `vllm/v1/kv_cache_interface.py:710,717` | - | - | `planned: specs/encoder-cross-kv-specs.md` | `INVENTORIED` | - |
 | `KV-SIZING` | GPU memory utilization and block-count overrides | T0 | `vllm/config/cache.py:68,87,168`; `tests/v1/core/test_kv_cache_utils.py:2224,2303` | fixed inputs `src/vllm/entrypoints/model_loader.cpp:117,129`; watermark `src/vllm/v1/core/kv_cache_manager.cpp:118` | watermark only `tests/vllm/v1/test_kv_cache_manager.cpp:298` | `planned: specs/kv-sizing.md` | `PARTIAL` | - |
 | `KV-WARMUP-PROFILE` | Dummy runs, warmup, and startup memory profiling that derive the KV budget (`KV-SIZING` covers the sizing knobs only); carried from porting-inventory §3 (T0 there) at the v1 fold | T0 | `vllm/v1/worker/gpu/model_runner.py:504,647`; `vllm/v1/worker/gpu_worker.py:430` | - | - | `planned: specs/warmup-memory-profiling.md` | `INVENTORIED` | - |
+| `ENG-HOST-WEIGHT-RESIDENCY` | Ordinary loaded-weight host lifetime on discrete CUDA: release staging copies after residency, preserve tied identity and avoid retained packed-source duplicates; steady-state and load-peak memory are separately gated | T0 | `vllm/model_executor/model_loader/base_loader.py:43-82`; `vllm/model_executor/models/qwen3_5.py:279-294,483-492`; `vllm/model_executor/model_loader/weight_utils.py:820` | baseline `include/vllm/model_executor/models/qwen3_5_weights.h:34`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:217,283,411`; `src/vllm/model_executor/models/qwen3_5.cpp:421` | baseline `.agents/parity-ledger.md` 2026-07-11 local process-memory row | [discrete-cuda-host-weight-residency.md](specs/discrete-cuda-host-weight-residency.md) | `SPIKE` | `CLAIM-HOST-WEIGHT-RESIDENCY-1` |
 | `ENG-EXPERT-STREAM` | Expert streaming from disk: bank-only routed-MoE weights paged into fixed contiguous Marlin slots after logical-expert→slot remap (low-concurrency capacity mode; surpass-track — inference-time disk expert paging is ABSENT in pinned vLLM) | T2 | absent in-pin: `vllm/model_executor/offloader/uva.py:21` (CPU-blanket UVA only), `vllm/model_executor/offloader/prefetch.py:557-560` (cpu-only); design reference antirez/ds4 (`ds4_metal.m`, `ds4_cuda.cu`, `ds4_ssd.c`); local dense-stride constraint `src/vt/cuda/marlin/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h:543-550` | - | - | [expert-streaming.md](specs/expert-streaming.md) | `READY` | - |
 | `ENG-WEIGHT-OFFLOAD` | Inference-time CPU weight offload mirror floor: UVA `cpu_offload_gb` per-parameter offload with pinned+zero-copy views and opt-in name-segment targeting (`cpu_offload_params`), plus layer-group `PrefetchOffloader`; v1-supported at the pin | T2 | `vllm/config/offload.py:23,34-44,47-76`; `vllm/model_executor/offloader/uva.py:64,80-108`; `vllm/model_executor/offloader/base.py:126-162`; `vllm/v1/worker/gpu_model_runner.py:445,913`; tests `tests/basic_correctness/test_cpu_offload.py:11`, `tests/quantization/test_cpu_offload.py:18-64` | - | - | `planned: specs/weight-offload-uva.md` | `INVENTORIED` | - |
 

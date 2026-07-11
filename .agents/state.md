@@ -3838,3 +3838,35 @@ has no proven faulting kernel, and the diagnostic vLLM arm still owns the DGX.
 After it releases, sync/build the pushed current head in a fresh remote
 directory, reproduce the exact 35B workload under sanitizer if the fault
 persists, then run both model-wide W2 G1/G3-G6 series and paired traces.
+
+## 2026-07-11 — pre-W2 35B diagnostic closed as a dual failure; GPU released
+
+The preserved vLLM arm did not finish. It completed every greedy-temperature
+point (c1/c2/c4/c8/c16/c32, three repetitions) and two default-sampling c1
+repetitions, then entered default-sampling c16/np96 rep1 at 06:32:43 CEST. The
+server last logged nonzero token progress at 06:33:38 and zero throughput at
+06:33:48. More than 60 minutes later the client still had 16 established
+connections, no result JSON or newer server log existed, the API process was in
+`ep_poll`, and `VLLM::EngineCore` remained runnable with the accelerator busy.
+This is a terminal hang, not a slow or binding performance result.
+
+Before stopping anything, root captured the complete owned PGID/SID process
+tree, sockets, per-process status/wchan/syscall/stack attempts, full nvidia-smi,
+source log sizes/timestamps, and pre/post-termination log hashes under
+`~/work/vllm.cpp-latency/latres2/diagnostic-vllm35-hang-20260711T0734CEST`.
+`MANIFEST.sha256` has SHA-256
+`caf173160915389586961f43c53077c2a6d6c41ca25a1e0052d2d9cc97a50a2d`;
+the final server/client log hashes are
+`eacec77ddac66a7d6e8e384a25595b01d59780d9b0d21e57907c0259f22f2cc0`
+and `4c542450a186b1fb5a2bdecebbfe9469ae8212137466677a591ce71f4a35ac03`.
+Only the claim-owned process group 1140669 was terminated. It shut down cleanly
+enough to append the API lifecycle messages, `/tmp/gpu` has no holder, no CUDA
+compute process remains, and system `MemAvailable` returned to 115 GiB.
+
+The whole second 35B series is therefore void twice over: our pre-W2 server
+aborted after 1/6 c1 requests with a surfaced CUDA illegal-access error, and the
+oracle later hung. Its completed greedy JSONs remain diagnostics only; the
+pre-W2 local server also used its historical eight-sequence default at c16/c32.
+Next is no longer “wait”: prepare/build clean current main `b0acec2` in fresh
+DGX directories, reproduce the exact 35B path under sanitizer if it still
+fails, then run the committed matched-capacity model-wide gate under new locks.

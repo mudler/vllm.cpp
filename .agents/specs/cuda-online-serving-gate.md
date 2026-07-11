@@ -5,7 +5,11 @@ The first campaign under `~/work/vllm.cpp-latency/latres` is diagnostic only:
 both vLLM model starts failed and several 35B local arms aborted, so it supplies
 no denominator or release number. The second pre-W2 campaign supplies a complete
 27B diagnostic, but its 35B local arm completed only 1/6 c1 requests before a
-CUDA illegal-memory-access abort; neither pre-W2 campaign is gate evidence.
+CUDA illegal-memory-access abort. Its vLLM arm completed the greedy ladder and
+default c1, then hung for more than 60 minutes in default c16/np96 rep1 with 16
+open sockets and no log progress. The owned campaign was snapshotted/hashed at
+DGX `latres2/diagnostic-vllm35-hang-20260711T0734CEST`, terminated, and released
+the GPU lock. Neither pre-W2 campaign is gate evidence.
 
 ## Scope
 

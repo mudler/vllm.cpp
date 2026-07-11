@@ -4045,3 +4045,31 @@ peak, but may overcount. The summary emits both values. Unit fixtures now form
 exact concurrency waves, include the upstream c1 false-overlap case, and retain
 an unsaturated precise-peak failure. The preserved real c1 raw result passes the
 new validator. README capability state is unchanged; regenerate after merge.
+
+## 2026-07-11 — 27B c32 exposes missing requested native usage frame
+
+The regenerated clean-main `8289cbd` 27B campaign passed oracle/build
+provenance, the model gate, the complete zero-residency cache proof, live SSE,
+and ours rep1 c1/c2/c4/c8/c16. At c32 the local server completed all 192 timed
+requests with zero errors. One request (index 158) retained 127 ITLs plus its
+first token, proving 128 choice frames, but concatenated decoded text
+re-tokenized to 126 IDs. The aggregate was therefore 24,574 instead of the
+required 24,576, and the exact-output validator stopped before the vLLM arm.
+Raw SHA-256 is
+`af4fc15fd5af8db625c4a83b6c6213c139054854bfe18957ad549253f8fc53a9`;
+client-log SHA-256 is
+`52e142e04ed66d718ddb2022bd79ce9409b03dc305b51a6631ad86679652fde1`.
+The owned server exited, no compute process remains, and `/tmp/gpu` is free.
+No latency, throughput, memory or ratio from this partial arm is binding.
+
+The pinned benchmark client already sends
+`stream_options={"include_usage": true}` and prefers the server's native
+`completion_tokens`; only when that frame is absent does pinned vLLM fall back
+to its documented decoded-text tokenization estimate. Our request parser
+currently drops `stream_options`, although the response structs already admit
+usage. This is a real feature gap, not a reason to weaken the validator.
+`CLAIM-SERVE-STREAM-USAGE-1` now owns the full completion/chat final,
+continuous, validation and force-mode spike in
+`.agents/specs/stream-options.md`. Commit the spike before implementation;
+after CPU/sanitizer closure, merge and regenerate both SHA-bound campaigns.
+README capability status is unchanged.

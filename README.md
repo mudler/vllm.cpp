@@ -160,7 +160,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance gates are reopened |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance is reopened. Device-resident cache W0 is source/CPU-gated but still awaits its CUDA gates |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -226,6 +226,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and
   `scripts/dgx-bringup.sh` runs the CUDA suite and gates on dgx.casa.
+- **Device-resident cache work is active.** W0 now gives CUDA full-attention KV
+  and GDN convolution/recurrent state stable `vt::Alloc` ownership and
+  stream-ordered zeroing; CPU retains host storage, and
+  `VT_DEVICE_KV_CACHE=0` restores the former CUDA host-vector path for an exact
+  same-binary A/B. The focused CPU build/tests pass. CUDA pointer-residency,
+  real-model, lifecycle, trace, memory, and performance gates are still open,
+  so this is not yet a speed or support-state claim.
 - **CPU status:** the native threadpool and chunked op dispatch pass the complete
   suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
   speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS
@@ -252,8 +259,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   offline” checkpoint was itself invalidated by the sampling/token-budget audit,
   so it neither proves nor rules out a direct-library regression. The HTTP
   frontend was measured and cannot explain the gap; pure b16 decode is nearly
-  tied, while mixed prefill/decode and host-backed KV/GDN state traffic are the
-  leading execution candidates. After the Ninja/PATH repair, `ed6247d` captured
+  tied, while mixed prefill/decode and the old host-backed KV/GDN state traffic
+  are the leading execution candidates; the device-resident W0 above is the
+  active, not-yet-GPU-gated repair. After the Ninja/PATH repair, `ed6247d` captured
   the exact 48-prompt vLLM trace, but the old paired trace was still non-binding:
   vllm.cpp reused cached prompts while vLLM had prefix caching off, and admission,
   max-sequence, and model-length settings differed. The current harness fixes

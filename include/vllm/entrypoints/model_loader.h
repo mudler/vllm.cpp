@@ -127,6 +127,7 @@ class LoadedEngine {
   const HfConfig& config() const { return config_; }
   int max_model_len() const { return max_model_len_; }
   bool prefix_caching_enabled() const { return prefix_caching_enabled_; }
+  const vllm::v1::GPUModelRunner& runner() const { return runner_; }
 
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight

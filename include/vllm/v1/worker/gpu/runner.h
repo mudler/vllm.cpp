@@ -52,6 +52,7 @@
 #ifndef VLLM_V1_WORKER_GPU_RUNNER_H_
 #define VLLM_V1_WORKER_GPU_RUNNER_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -169,8 +170,33 @@ class GPUModelRunner final : public ModelRunnerBase {
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
+  bool kv_cache_backend_resident() const {
+    return kv_cache_backend_resident_;
+  }
 
  private:
+  // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
+  // device storage; CPU and VT_DEVICE_KV_CACHE=0 retain the host-vector
+  // diagnostic fallback. Tensor/PagedKvCache views never own this memory.
+  class CacheBuffer {
+   public:
+    CacheBuffer(vt::Device device, vt::Queue& queue, size_t bytes,
+                bool backend_resident);
+    ~CacheBuffer();
+    CacheBuffer(const CacheBuffer&) = delete;
+    CacheBuffer& operator=(const CacheBuffer&) = delete;
+
+    void* data() {
+      return backend_resident_ ? backend_data_ : host_data_.data();
+    }
+
+   private:
+    vt::Device device_;
+    bool backend_resident_ = false;
+    void* backend_data_ = nullptr;
+    std::vector<uint8_t> host_data_;
+  };
+
   // Compatibility path for direct synthetic-weight runner tests. The wrapper
   // is type-erased but borrows the caller-owned concrete weights.
   GPUModelRunner(const HfConfig& config,
@@ -221,22 +247,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::unordered_map<int32_t, int32_t> gdn_slot_of_block_;
   std::vector<int32_t> gdn_free_slots_;
 
-  // Owned KV-cache backing storage (host at T0) + the views the forward reads.
-  // full_attn_buf_ is a raw byte buffer sized by the KV-cache dtype: bf16 by
-  // default (mirrors vLLM's bf16 flash_attn KV store, halves KV memory), or f32
-  // when VT_KV_CACHE_F32 is set (same-binary A/B).
-  std::vector<std::vector<uint8_t>> full_attn_buf_;  // per full-attn layer (bytes)
+  // Owned persistent cache storage plus the non-owning views used by forward.
+  // CUDA uses backend allocations by default (VT_DEVICE_KV_CACHE=0 restores the
+  // former host-vector storage for same-binary attribution); CPU stays host.
+  // Full-attention KV is bf16 by default, or f32 under VT_KV_CACHE_F32.
+  bool kv_cache_backend_resident_ = false;
+  std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
   // GDN recurrent + conv state caches. On CUDA they are bf16 (gdn_cache_dtype_),
   // mirroring vLLM's default mamba_cache_dtype/mamba_ssm_cache_dtype="auto" →
   // model dtype (bf16 for Qwen3-Next): fla fused_recurrent reads bf16 → f32
   // registers → writes bf16, which the CUDA GDN decode/conv kernels replicate.
   // This halves the decode recurrent-state read/write traffic and the resident
   // state-cache footprint. On CPU (the unit tests) they stay f32 — the CPU GDN
-  // ops are f32-only and the exact-value tests assume f32. Backing storage is
-  // raw bytes sized by gdn_cache_dtype_ (0 bytes == +0.0f in both f32 and bf16).
+  // ops are f32-only and the exact-value tests assume f32. Storage is raw bytes
+  // sized by gdn_cache_dtype_ (0 bytes == +0.0f in both f32 and bf16).
   vt::DType gdn_cache_dtype_ = vt::DType::kF32;
-  std::vector<std::vector<uint8_t>> ssm_buf_;   // per GDN layer (raw bytes)
-  std::vector<std::vector<uint8_t>> conv_buf_;  // per GDN layer (raw bytes)
+  std::vector<std::unique_ptr<CacheBuffer>> ssm_buf_;
+  std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
 

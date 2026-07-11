@@ -24,6 +24,10 @@
 #include <system_error>
 #include <vector>
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/sampling_params.h"
@@ -31,6 +35,32 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+void CheckDeviceCacheResidency(
+    const vllm::entrypoints::LoadedEngine& loaded) {
+#ifdef VLLM_CPP_CUDA
+  const char* fallback = std::getenv("VT_DEVICE_KV_CACHE");
+  if (fallback != nullptr && fallback[0] == '0') {
+    CHECK_FALSE(loaded.runner().kv_cache_backend_resident());
+    return;
+  }
+  REQUIRE(loaded.runner().kv_cache_backend_resident());
+  const auto check_device_pointer = [](const void* pointer) {
+    cudaPointerAttributes attributes{};
+    REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
+    CHECK(attributes.type == cudaMemoryTypeDevice);
+  };
+  for (const vllm::PagedKvCache& cache : loaded.runner().attn_kv()) {
+    check_device_pointer(cache.data);
+  }
+  for (const vllm::GdnStateCache& cache : loaded.runner().gdn_state()) {
+    check_device_pointer(cache.ssm_state.data);
+    check_device_pointer(cache.conv_state.data);
+  }
+#else
+  CHECK_FALSE(loaded.runner().kv_cache_backend_resident());
+#endif
+}
 
 // Snapshot dir of the pinned 35B checkpoint (contains config.json), or "".
 // IDENTICAL resolution to test_op_parity.cpp's Find35BSnapshot — the HF cache
@@ -101,6 +131,7 @@ TEST_CASE("qwen36 paged-engine greedy acceptance gate (dgx-only, 35B)") {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
+  CheckDeviceCacheResidency(*loaded);
 
   MESSAGE("qwen36_paged_engine: greedy-decoding "
           << kMaxTokens << " tokens through the PAGED engine...");
@@ -157,6 +188,7 @@ TEST_CASE("qwen36 paged-engine batched-graph greedy gate (dgx-only, 35B)") {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
+  CheckDeviceCacheResidency(*loaded);
 
   MESSAGE("qwen36_paged_engine(batched): greedy-decoding " << kN
           << " concurrent requests x " << kMaxTokens << " tokens...");

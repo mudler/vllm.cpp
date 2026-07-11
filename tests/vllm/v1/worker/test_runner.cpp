@@ -287,6 +287,7 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(runner.full_attn_group_id() == 0);
   CHECK(runner.gdn_group_id() == 1);
   CHECK(runner.num_blocks() == kNumBlocks);
+  CHECK_FALSE(runner.kv_cache_backend_resident());
 
   // One PagedKvCache per full-attn layer (config has exactly 1).
   REQUIRE(runner.attn_kv().size() == 1);

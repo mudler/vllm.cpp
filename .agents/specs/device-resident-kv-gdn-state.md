@@ -1,7 +1,7 @@
 # Spike: device-resident KV and indexed GDN state I/O
 
 **Row:** `KV-DEVICE-RESIDENCY` · **state:** accepted; implementation is
-`READY`.
+`ACTIVE` under `CLAIM-KV-DEVICE-1`.
 
 ## Scope
 
@@ -109,7 +109,7 @@ alternate supported defaults.
 
 | Work | Deliverable | State |
 |---|---|---|
-| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | ready |
+| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | implemented and CPU-gated; CUDA/model/A-B gates open |
 | W1 | persistent full non-spec/prefill index upload plus fused indexed BF16↔F32 GDN state gather/scatter; `VT_GDN_INDEXED_STATE_IO=0` A/B | depends on W0 |
 | W2 | convolution prefill consumes indexed persistent state directly; preserve initial-state/reset semantics | depends on W1 |
 | W3 | corrected trace, both real-model gates, direct-library and online every-axis comparison | depends on W0-W2 |

@@ -302,6 +302,33 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                      kv_cache_config, queue, max_num_reqs, max_model_len,
                      max_num_batched_tokens) {}
 
+GPUModelRunner::CacheBuffer::CacheBuffer(vt::Device device, vt::Queue& queue,
+                                         size_t bytes,
+                                         bool backend_resident)
+    : device_(device), backend_resident_(backend_resident) {
+  if (!backend_resident_) {
+    host_data_.assign(bytes, uint8_t{0});
+    return;
+  }
+
+  backend_data_ = vt::Alloc(device_, std::max<size_t>(bytes, 1));
+  try {
+    if (bytes != 0) {
+      vt::GetBackend(device_.type).Memset(queue, backend_data_, 0, bytes);
+    }
+  } catch (...) {
+    vt::Free(device_, backend_data_);
+    backend_data_ = nullptr;
+    throw;
+  }
+}
+
+GPUModelRunner::CacheBuffer::~CacheBuffer() {
+  if (backend_data_ != nullptr) {
+    vt::Free(device_, backend_data_);
+  }
+}
+
 void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   num_blocks_ = kv_cache_config.num_blocks;
   // GDN mamba-state slots = max concurrent sequences (one recurrent state per
@@ -358,6 +385,13 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   }
 
   const vt::Device dev = queue_.device;
+  const char* device_cache_env = std::getenv("VT_DEVICE_KV_CACHE");
+  kv_cache_backend_resident_ =
+      dev.type == vt::DeviceType::kCUDA &&
+      (device_cache_env == nullptr || device_cache_env[0] != '0');
+  full_attn_buf_.clear();
+  ssm_buf_.clear();
+  conv_buf_.clear();
   // bf16 GDN state caches on CUDA (vLLM default mamba_cache_dtype auto → model
   // dtype), f32 on CPU (the CPU GDN ops are f32-only; the exact-value CPU tests
   // assume f32). The CUDA GDN decode/conv kernels read bf16 → f32 → write bf16.
@@ -375,17 +409,22 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       // State caches: bf16 on CUDA (vLLM default), f32 on CPU (f32-only CPU ops).
       // Raw bytes sized by gdn_cache_dtype_; 0 bytes == +0.0f in both dtypes.
       const size_t es = vt::SizeOf(gdn_cache_dtype_);
-      ssm_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk) * es, uint8_t{0});
-      conv_buf_.emplace_back(
-          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)) * es, uint8_t{0});
+      ssm_buf_.push_back(std::make_unique<CacheBuffer>(
+          dev, queue_,
+          static_cast<size_t>(gdn_state_slots_ * Hv * Dv * Dk) * es,
+          kv_cache_backend_resident_));
+      conv_buf_.push_back(std::make_unique<CacheBuffer>(
+          dev, queue_,
+          static_cast<size_t>(gdn_state_slots_ * conv_dim * (Kw - 1)) * es,
+          kv_cache_backend_resident_));
     } else {
       // KV cache stored in kv_dtype (bf16 default; f32 if VT_KV_CACHE_F32). 0
       // bytes == 0.0 in both bf16 and f32. bf16 halves KV memory vs f32.
-      full_attn_buf_.emplace_back(
+      full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
+          dev, queue_,
           static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh) *
               static_cast<size_t>(vt::SizeOf(kv_dtype)),
-          static_cast<uint8_t>(0));
+          kv_cache_backend_resident_));
     }
   }
 
@@ -393,7 +432,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   attn_kv_.clear();
   for (auto& b : full_attn_buf_) {
     PagedKvCache kv;
-    kv.data = b.data();
+    kv.data = b->data();
     kv.dtype = kv_dtype;
     kv.num_blocks = num_blocks_;
     kv.block_size = fa_block_size;
@@ -404,9 +443,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   gdn_state_.clear();
   for (size_t g = 0; g < ssm_buf_.size(); ++g) {
     GdnStateCache gs;
-    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g].data(), gdn_cache_dtype_,
+    gs.ssm_state = vt::Tensor::Contiguous(ssm_buf_[g]->data(), gdn_cache_dtype_,
                                           dev, {gdn_state_slots_, Hv, Dv, Dk});
-    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g].data(), gdn_cache_dtype_,
+    gs.conv_state = vt::Tensor::Contiguous(conv_buf_[g]->data(), gdn_cache_dtype_,
                                            dev,
                                            {gdn_state_slots_, conv_dim, Kw - 1});
     gdn_state_.push_back(gs);

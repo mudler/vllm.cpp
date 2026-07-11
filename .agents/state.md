@@ -4366,3 +4366,45 @@ Next: merge/push this record checkpoint, claim `KV-DEVICE-RESIDENCY`, capture a
 corrected cache-off/closed-loop 27B baseline pair, then implement device-backed
 cache ownership followed by indexed BF16↔F32 state I/O as separate same-binary
 A/Bs. Fresh exact direct-library and online 27B gates precede the 35B series.
+
+## 2026-07-11 — device-resident KV/GDN cache W0 CPU checkpoint
+
+`KV-DEVICE-RESIDENCY` is now claimed `ACTIVE` under
+`CLAIM-KV-DEVICE-1`. W0 replaces CUDA's persistent host-vector owners for every
+full-attention KV cache and every GDN convolution/recurrent-state cache with
+stable `vt::Alloc` allocations. A `unique_ptr`-owned `CacheBuffer` keeps each
+allocation alive behind fixed addresses suitable for CUDA graph capture; initialization
+zeroes it on the runner queue before model preparation. CPU retains the prior
+zeroed host vectors, and `VT_DEVICE_KV_CACHE=0` restores that same CUDA host path
+for a same-binary attribution run. The cache views remain non-owning and their
+dtypes, shapes, block strides, compact GDN-slot mapping, and scheduling semantics
+are unchanged.
+
+Both real-model parity binaries now inspect the loaded runner. A default CUDA
+load requires the backend-residency bit and `cudaPointerGetAttributes` device
+type for every full-attention, SSM, and convolution pointer; the fallback load
+requires the bit to be false. The existing greedy token gates remain the
+correctness check after those assertions. The CPU runner gate explicitly proves
+that CPU storage is not reported backend-resident.
+
+The clean CPU all-target build reached 100%. Focused runner/dense/27B/35B tests
+pass **4/4**; the canonical serial suite passes **105/105** in 409.67 seconds.
+The canonical record checker reports ENGINE=97 / MODEL=323 / QUANT=81 /
+KERNEL=30 / BACKEND=51; its mutation suite passes **13/13**, the documentation
+mutation suite **5/5**, and the online client/summary/trace contracts **18/18**.
+Diff checks pass.
+No CUDA binary or runtime result from this W0 source exists yet, so this entry
+makes no residency, correctness, memory, trace, or performance claim for GB10.
+
+In parallel, pushed parent `f065fce` is executing the first corrected exact 27B
+cache-off/closed-loop baseline under one uninterrupted DGX `/tmp/gpu` lock. Its
+commit-bound real-model gate passed in 16.32 seconds (log SHA-256
+`7f33e8624960bafb3d719cefbe761e521b338caf3e0625d6732c0fcf83922678`),
+and the timed interleaved ladder is active. That campaign deliberately uses the
+pre-W0 binary and cannot validate or measure this change.
+
+Next: merge and push this explicitly GPU-open W0 checkpoint. After the f065
+series releases the GPU, build the merged SHA on sm_121a and hold one new lock
+for default/fallback pointer, both-model greedy, lifecycle, sanitizer, memory,
+nsys, and repeated same-binary A/B gates. Only then advance W0; W1 replaces the
+remaining row-wise mixed-prefill GDN copies with indexed device I/O.

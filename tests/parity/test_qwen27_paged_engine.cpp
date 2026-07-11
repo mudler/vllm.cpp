@@ -26,6 +26,10 @@
 #include <system_error>
 #include <vector>
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/sampling_params.h"
@@ -33,6 +37,32 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+void CheckDeviceCacheResidency(
+    const vllm::entrypoints::LoadedEngine& loaded) {
+#ifdef VLLM_CPP_CUDA
+  const char* fallback = std::getenv("VT_DEVICE_KV_CACHE");
+  if (fallback != nullptr && fallback[0] == '0') {
+    CHECK_FALSE(loaded.runner().kv_cache_backend_resident());
+    return;
+  }
+  REQUIRE(loaded.runner().kv_cache_backend_resident());
+  const auto check_device_pointer = [](const void* pointer) {
+    cudaPointerAttributes attributes{};
+    REQUIRE(cudaPointerGetAttributes(&attributes, pointer) == cudaSuccess);
+    CHECK(attributes.type == cudaMemoryTypeDevice);
+  };
+  for (const vllm::PagedKvCache& cache : loaded.runner().attn_kv()) {
+    check_device_pointer(cache.data);
+  }
+  for (const vllm::GdnStateCache& cache : loaded.runner().gdn_state()) {
+    check_device_pointer(cache.ssm_state.data);
+    check_device_pointer(cache.conv_state.data);
+  }
+#else
+  CHECK_FALSE(loaded.runner().kv_cache_backend_resident());
+#endif
+}
 
 // Snapshot dir of the 27B checkpoint (contains config.json), or "". Same HF
 // cache layout as Find35BSnapshot, for models--unsloth--Qwen3.6-27B-NVFP4.
@@ -153,6 +183,7 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
+  CheckDeviceCacheResidency(*loaded);
 
   MESSAGE("qwen27_paged_engine: greedy-decoding "
           << kMaxTokens << " tokens through the PAGED dense engine...");

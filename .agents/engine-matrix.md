@@ -15,7 +15,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 13 | 3 | 3 | 0 | 1 | 0 | 2 | 4 |
-| KV cache and memory | 19 | 2 | 2 | 0 | 3 | 0 | 2 | 10 |
+| KV cache and memory | 19 | 2 | 2 | 0 | 2 | 1 | 2 | 10 |
 | Parallelism | 5 | 0 | 0 | 0 | 1 | 0 | 0 | 4 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 9 |
 | Structured output and tools | 6 | 0 | 3 | 0 | 0 | 0 | 0 | 3 |
@@ -24,7 +24,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 0 | 6 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **97** | **9** | **17** | **0** | **9** | **1** | **13** | **48** |
+| **Total** | **97** | **9** | **17** | **0** | **8** | **2** | **13** | **48** |
 
 ## Engine core and scheduling
 
@@ -50,7 +50,7 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 |---|---|---|---|---|---|---|---|---|
 | `KV-BLOCK-POOL` | Free list, refcounts, LRU eviction, core block lifecycle | T0 | `vllm/v1/core/block_pool.py:144,226,542,614`; `tests/v1/core/test_prefix_caching.py:1315,1991` | `src/vllm/v1/core/block_pool.cpp:42,77,206,231,254` | `tests/vllm/v1/test_block_pool.cpp:70,115,202,251,280` | `planned: specs/block-pool.md` | `ANCHOR-BACKFILL` | - |
 | `KV-MANAGER-ALLOC` | Slot allocation, watermark, admission, release | T0 | `vllm/v1/core/kv_cache_manager.py:110,244`; `tests/v1/core/test_single_type_kv_cache_manager.py:380,413` | `src/vllm/v1/core/kv_cache_manager.cpp:88,124,144` | `tests/vllm/v1/test_kv_cache_manager.cpp:119,168,298,349,380,425` | `planned: specs/kv-cache-manager.md` | `ANCHOR-BACKFILL` | - |
-| `KV-DEVICE-RESIDENCY` | Persistent full-attention KV plus GDN convolution/recurrent state must be backend-resident; indexed mixed-prefill state I/O replaces row-wise host round trips | T0 | allocation/views `vllm/v1/worker/gpu/attn_utils.py:166-182,327-346`; runner ownership `vllm/v1/worker/gpu/model_runner.py:478-488`; indexed conv/SSM `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1309-1375,1503-1532`; tests `tests/v1/worker/test_gpu_model_runner.py:968,1265`; `tests/v1/worker/test_mamba_utils.py:342-358` | current host-backed baseline `include/vllm/v1/worker/gpu/runner.h:224-241`; `src/vllm/v1/worker/gpu/runner.cpp:360-412`; row-wise gather/scatter `src/vllm/model_executor/models/qwen3_5.cpp:1286-1316,1673-1691,1767-1797` | diagnostic d11 trace: 255.375 MiB state traffic per direction and ~1,799 async copies/context; implementation tests/gates enumerated in the spike | [device-resident-kv-gdn-state.md](specs/device-resident-kv-gdn-state.md) | `READY` | - |
+| `KV-DEVICE-RESIDENCY` | Persistent full-attention KV plus GDN convolution/recurrent state must be backend-resident; indexed mixed-prefill state I/O replaces row-wise host round trips. W0 backend ownership is implemented/CPU-gated; CUDA build, pointer, lifecycle, model and A/B gates remain | T0 | allocation/views `vllm/v1/worker/gpu/attn_utils.py:166-182,327-346`; runner ownership `vllm/v1/worker/gpu/model_runner.py:478-488`; indexed conv/SSM `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1309-1375,1503-1532`; tests `tests/v1/worker/test_gpu_model_runner.py:968,1265`; `tests/v1/worker/test_mamba_utils.py:342-358` | move-only backend/host fallback owner `include/vllm/v1/worker/gpu/runner.h:173-200,249-266`; device-default allocation/zero/view wiring `src/vllm/v1/worker/gpu/runner.cpp:305-330,388-450`; `VT_DEVICE_KV_CACHE=0` fallback; W1 row-wise baseline remains `src/vllm/model_executor/models/qwen3_5.cpp:1286-1316,1673-1691,1767-1797` | CPU ownership/shape `tests/vllm/v1/worker/test_runner.cpp:281-313`; default/fallback CUDA pointer-attribute gates `tests/parity/test_qwen27_paged_engine.cpp:41-65,186`; `tests/parity/test_qwen36_paged_engine.cpp:39-63,134,191`; focused CPU build + 4/4 pass. Diagnostic d11 baseline remains 255.375 MiB state traffic/direction; no W0 CUDA/performance result yet | [device-resident-kv-gdn-state.md](specs/device-resident-kv-gdn-state.md) | `ACTIVE` | CLAIM-KV-DEVICE-1 |
 | `KV-HYBRID-COORD` | Full-attention and GDN/Mamba group coordinator | T0 | `vllm/v1/core/kv_cache_coordinator.py:514,630`; `tests/v1/core/test_prefix_caching.py:347,836,987` | `src/vllm/v1/core/kv_cache_coordinator.cpp:294,370,389` | `tests/vllm/v1/test_kv_cache_coordinator.cpp:130,154,169,209,306` | `planned: specs/hybrid-kv-coordinator.md` | `PARTIAL` | - |
 | `KV-MAMBA-ALIGN` | Mamba/GDN prefix retention in align mode | T1 | `vllm/config/cache.py:134-140`; `vllm/v1/core/single_type_kv_cache_manager.py:1032-1072` | - | - | `planned: specs/mamba-align-retention.md` | `INVENTORIED` | - |
 | `KV-SLIDING-LOCAL-SPECS` | Block row (claim the two leaves below, not this row): sliding-window and chunked-local KV specs | T1 | `vllm/v1/kv_cache_interface.py:205-307,480-586`; `tests/v1/test_kv_cache_spec_registry.py:174-306` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |

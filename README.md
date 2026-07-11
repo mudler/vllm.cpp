@@ -160,7 +160,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance is reopened. Device-resident cache W0 now passes clean default/fallback pointer and both-model CUDA gates; sanitizer, trace, memory, and speed A/Bs remain open |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance is reopened. Device-resident cache W0 passes default/fallback pointer/model gates and a repeated +2.12% 27B same-binary A/B. Both models are compute-sanitizer access-clean; the zero-leak gate exposes older process-lifetime pools and remains open alongside indexed state I/O and full oracle parity |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -232,9 +232,18 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   `VT_DEVICE_KV_CACHE=0` restores the former CUDA host-vector path for an exact
   same-binary A/B. The focused CPU suite and a clean CUDA 13.0.88/sm_121a build
   pass. Both 35B/27B tests pass in default device-resident mode and in fallback
-  mode; the default tests assert every cache pointer is CUDA device memory.
-  Sanitizer, lifecycle/memory, corrected trace, and repeated performance A/B
-  gates are still open, so this is not yet a speed-parity claim.
+  mode; the default tests assert every cache pointer is CUDA device memory. On
+  the exact cache-off c16/48 workload, three interleaved repetitions average
+  **785.49 vs 769.15 tok/s (+2.12%)**, with 20/20 throughput+latency axes better
+  and 0.27%/0.20% CV. All six server lifecycles return memory. Paired traces
+  reproduce +2.22% and move the state-sized rows from H2D/D2H to D2D; roughly
+  160k async-copy calls remain, which is the W1 indexed-I/O target. Separate
+  27B/35B compute-sanitizer runs pass 234/234 and 315/315 assertions with zero
+  memory-access errors. Full leak checking remains red on pre-existing bounded
+  caches (47.29 MB dense; 36.82 GB MoE/Marlin); W0's multi-GiB cache allocations
+  are absent from both leak inventories and all server lifecycle returns pass.
+  This component win does not close the full-grid vLLM throughput/host-memory
+  gate.
 - **CPU status:** the native threadpool and chunked op dispatch pass the complete
   suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
   speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS
@@ -265,10 +274,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   corrected nsys trace records 153,394 `cudaMemcpyAsync` calls; persistent GDN
   state rows alone account for 20.809 GiB H2D plus 20.806 GiB D2H across its
   three repetitions. That grounds device-resident KV/GDN state as the first
-  repair. W0 is merged at `7d29e0c`; its clean GB10 build and default/fallback
-  35B+27B pointer/token gates pass. No W0 sanitizer, trace, memory, or speed
-  result exists yet. Exact direct-library, optimized 27B, and then 35B
-  every-axis closure remain mandatory before later roadmap work.
+  repair. W0 is merged at `7d29e0c`; its clean GB10 build, default/fallback
+  35B+27B pointer/token gates, lifecycle, trace, and repeated 27B A/B pass. The
+  measured same-binary gain is +2.12% (20/20 timing axes), but it is not a fresh
+  vLLM denominator and cannot be multiplied into the old grid as an acceptance
+  result. Both model paths are memory-access clean, but the required zero-leak
+  result remains open on inherited process-lifetime pools. W1 must collapse the
+  residual D2D row loop, then exact direct-library/online 27B and 35B every-axis
+  closure remain mandatory before later roadmap work.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

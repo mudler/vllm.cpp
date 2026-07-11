@@ -4487,3 +4487,66 @@ documentation mutations 5/5, and online benchmark contracts 18/18. `git diff
 --check` is clean. No local CPU CTest was rerun for this record-only follow-up;
 the unchanged `7d29e0c` code already passed its clean CPU serial 105/105 suite
 and the CUDA gates above execute that exact pushed commit.
+
+## 2026-07-11 — W0 device residency wins repeated 27B A/B; W1 copy loop grounded
+
+Pushed `7d29e0c` was measured under one uncontended lock at
+`~/work/vllm.cpp-kv-device/7d29e0cd69709f6f96ebbf86a320f8885d7362d1/w0-ab-27`.
+The exact cache-off closed-loop c16 workload uses 48 requests of 1024 prompt +
+128 generated tokens. Three same-binary device/fallback repetitions ran in
+AB/BA/AB order, with a cold file-cache proof, process-tree memory sampling and
+return-to-idle check around every server. All 288 timed requests completed with
+exact native counts and all six memory returns passed.
+
+Device throughput was 788.531/784.031/783.910 tok/s versus fallback
+767.014/770.283/770.166 tok/s. The means are **785.491 vs 769.154 tok/s =
+1.021239×**, with CV 0.274%/0.197%. Device residency wins all four throughput
+and all sixteen latency axes. Mean TTFT is 2498.13 vs 2558.69 ms; mean
+TPOT/ITL is 163.65 vs 166.98 ms; mean E2E is 23282.29 vs 23765.67 ms.
+This is a reproducible W0 component win, not a new vLLM denominator; it is not
+multiplied into the f065 oracle grid.
+
+All six server lifecycles returned. Mean device/fallback PSS is
+48,149,794/48,175,182 KiB; reported GPU peak is 38,381.7/26,215.3 MiB. The
+device arm remains well below the exact f065 vLLM GPU baseline of 72,725 MiB,
+but vllm.cpp's host PSS remains well above vLLM's 28,133,901 KiB, so the
+every-axis memory gate is still open.
+
+Paired nsys traces run the same client three times per arm and reproduce
+795.349 vs 778.085 tok/s = **1.022188×**, with CV below 0.10% on both. The
+fallback trace moves state-sized rows as 22,760,398,848 bytes H2D plus
+22,759,538,688 bytes D2H. Device mode moves those rows D2D and reduces total
+D2H to 203,336 bytes. It still records 160,232 `cudaMemcpyAsync` calls and
+46,175,944,704 bytes in state-sized D2D rows. W0 therefore removes host/GPU
+round trips exactly as intended; W1 is still required to collapse the row loop
+into indexed gather/scatter kernels.
+
+Validated status/summary/trace-summary hashes are `ebd35dc8…2ce1`,
+`1e35695b…ceab`, and `d965b821…aac8`; device/fallback nsys hashes are
+`191f5410…35e8f` / `1900e895…a40d`. The measurement driver completed all 12
+raw results and 16 cache-drop reports, released the GPU, then its embedded
+summary failed because `input_throughput` is derived rather than present in raw
+JSON. Corrected postprocessor `9d7ce547…22b5` derives input tokens/duration;
+final status records the correction and passes. No timed result was rerun or
+altered by that post-lock repair.
+
+The final sanitizer split is complete. With leak reporting disabled so memory
+access is isolated, 27B passes 234/234 and 35B passes 315/315; both report zero
+compute-sanitizer errors. Their log SHA-256 values are `bf4cbe8f…054` and
+`fda9b01b…9a5`. Full leak-check does not pass: the 27B process reports
+47,290,056 bytes in 101 allocations (`04c34941…75c`), broken down as 33,554,432
+bytes of cuBLASLt workspace, 9,300,112 bytes of the Qwen scratch pool, 4,431,572
+bytes of GDN stream scratch, and 3,940 bytes of sampler/FA temporaries. The 35B
+process reports 36,822,413,188 bytes in 1,236 allocations (`55564503…991`), led
+by 36,239,011,840 bytes of model-wide MoE Marlin residents, 333,250,884 bytes
+of dense Marlin residents, 94,372,160 bytes of fused dense-pair residents,
+58,498,400 bytes of Qwen pool blocks, and the older Marlin/cuBLASLt/GDN pools.
+The new W0 multi-GiB full-attention/GDN cache allocations appear in neither
+inventory, consistent with all six server memory returns. This is an inherited
+process-lifetime teardown failure, not a W0 memory-access failure, but the
+zero-leak acceptance gate remains open and no closure is claimed.
+
+Per the priority-zero performance directive, begin W1 from the accepted spike
+while retaining that teardown debt on this ACTIVE row. Do not promote the full
+serving/oracle rows until W1 has its own A/B, pool teardown is repaired, and
+fresh exact 27B→35B parity campaigns pass every axis.

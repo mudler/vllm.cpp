@@ -69,8 +69,10 @@ Across the three c16 trace repetitions, nsys records 153,394
 and 66,094 D2H transfers: 20.809 GiB H2D plus 20.806 GiB D2H. This is the
 binding before-state that every implementation slice must reproduce against.
 Current W0 source at `7d29e0c` replaces the owners. Its clean CUDA
-13.0.88/sm_121a build and default/fallback 35B+27B pointer/token gates pass;
-sanitizer, lifecycle/memory, corrected trace, and performance remain open.
+13.0.88/sm_121a build, default/fallback 35B+27B pointer/token gates, lifecycle,
+trace, repeated A/B, and both-model memory-access checks pass. Full leak-check
+remains open on inherited process-lifetime pools; W0's cache owners are absent
+from both leak inventories.
 
 ## Port map
 
@@ -105,9 +107,10 @@ alternate supported defaults.
    parity covers all cases above; compute-sanitizer reports zero errors/leaks.
 3. Real models: both 27B and 35B 16/16 greedy token gates pass for default and
    each fallback A/B.
-4. Trace: on the exact corrected d11-equivalent mixed context, state-scale
-   H2D/D2H traffic disappears and the ~1,799 copies collapse to metadata-only
-   traffic. Pure-decode graph time may not regress.
+4. Trace: on the exact corrected mixed context, W0 makes state-scale H2D/D2H
+   disappear and changes the row traffic to D2D. W1 then collapses the row-copy
+   calls to indexed-kernel/metadata traffic. Pure-decode graph time may not
+   regress.
 5. Performance: same-binary W0 and W1 A/Bs each reproduce at least three times;
    then fresh exact matched-config vLLM direct-library and online gates run per
    `benchmark-protocol.md`. No historical mismatched denominator counts.
@@ -120,8 +123,8 @@ alternate supported defaults.
 
 | Work | Deliverable | State |
 |---|---|---|
-| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | implemented; CPU/CI and clean sm_121a default/fallback pointer/model gates pass; sanitizer/lifecycle/memory/trace/A-B open |
-| W1 | persistent full non-spec/prefill index upload plus fused indexed BF16↔F32 GDN state gather/scatter; `VT_GDN_INDEXED_STATE_IO=0` A/B | depends on W0 |
+| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | implemented; CPU/CI, clean sm_121a pointer/model, lifecycle, trace and repeated A/B pass at 1.021239×/20-of-20 axes; both models are access-clean. Zero-leak fails inherited pools (47.29 MB/36.82 GB), with W0 cache allocations absent; teardown closure remains required |
+| W1 | persistent full non-spec/prefill index upload plus fused indexed BF16↔F32 GDN state gather/scatter; `VT_GDN_INDEXED_STATE_IO=0` A/B | next performance slice; W0 storage/access prerequisites pass while its inherited teardown debt remains open |
 | W2 | convolution prefill consumes indexed persistent state directly; preserve initial-state/reset semantics | depends on W1 |
 | W3 | corrected trace, both real-model gates, direct-library and online every-axis comparison | depends on W0-W2 |
 | W4 | only if FA remains slow after residency: A/B the oracle's sm80 virtual FA binary target; otherwise rank gated RMSNorm, post-conv prep, causal conv, then `chunk_o` as separate kernel rows/specs | conditional |

@@ -3503,6 +3503,14 @@ pinned-source boundary goldens through the generic long-context runner. W7/W8
 LongRoPE/dynamic formulas, model-family/MM preprocessing, local attention and
 all GPU execution remain out of scope.
 
+Pinned-source review before implementation found that
+`Llama3RotaryEmbedding` subclasses `RotaryEmbedding` and depends on its public
+`init_cache=False` path so Llama 3 fields are initialized before virtual cache
+construction. The claim therefore also owns the minimal matching optional
+constructor parameter in `base.h/base.cpp`; its default stays `true`, so W5 and
+existing default-RoPE call sites remain unchanged. This is an implementation
+prerequisite inside W6, not a YaRN/MRoPE semantic expansion.
+
 Read-only DGX inspection at 02:35 UTC showed `CLAIM-SERVE-GATE-1` still holding
 `/tmp/gpu`; our 27B server used 25,253 MiB while sampled/default-temperature
 c16/16-prompt repetition 1 remained active. Both PR3 jobs were still queued.

@@ -6527,3 +6527,50 @@ cuBLASLt tolerance failure in unchanged `test_cuda_ops` (11/221 outputs outside
 its threshold at M=17,K=31,N=13). Python AOT/oracle sources compile. The
 representative real-model run with default decode AOT is 15/16 complete
 sequences.
+
+## 2026-07-11 — local BF16 dense-MLP load-time packing
+
+Mirrored vLLM 0.24's dense SwiGLU representation: its `Qwen2MoeMLP` declares one
+`MergedColumnParallelLinear(hidden_size, [intermediate_size] * 2)` and executes
+`gate_up_proj` followed by `SiluAndMul`
+(`.venv-vllm/.../models/qwen2_moe.py:90-117`), while Qwen3.5 maps checkpoint
+`gate_proj`/`up_proj` shards into that parameter
+(`.venv-vllm/.../models/qwen3_5.py:279-293`). The plain-BF16 dense loader now
+concatenates the two raw torch-Linear `[N,K]` row blocks into one `[2I,H]`
+`gate_up_proj` at load time. `DenseMlpBlock` performs one BF16 `[T,2I]` GEMM and
+passes the result directly to the existing `vt::SiluAndMul`; FP4 paths are
+unchanged. `VT_BF16_PACKED_MLP=0` or `VT_BF16_PACKED_LINEAR=0` restores the
+split path from the same binary. The separate tensors remain host-side for that
+diagnostic fallback; device weight bytes are unchanged because only the selected
+representation is uploaded lazily.
+
+Correctness is unchanged: the loader test verifies shape and shard order (5/5,
+304 assertions), and the real natural corpus remains 15/16 complete 32-token
+sequences versus vLLM, with the same request diverging at token 6. On the exact
+128-request, concurrency-32, 1024-in/128-out workload, greedy packed runs are
+6310.93 / 6306.07 total tok/s (mean **6308.50**) versus same-binary split
+6253.06 (**+0.89%**); the unchanged vLLM mean is 6719.53, so the project moves
+0.9286x→**0.9388x**. Temperature-1 packed runs are 6138.83 / 6139.29 (mean
+**6139.06**) versus same-binary split 6087.40 (**+0.85%**); vLLM remains
+6669.28, moving 0.9122x→**0.9205x**. Mean greedy TTFT/TPOT improve
+799.39/40.12 ms→786.37/39.82 ms; random improves
+802.35/41.36 ms→789.14/41.07 ms.
+
+Matched temperature-1 Nsight captures use 32 requests, concurrency 16, 1024
+input and 24 output tokens. Packed is 6970.47 versus split 6849.72 total tok/s
+(+1.76% under tracing). GPU kernel instances fall exactly 33560→31800: 1760
+fewer launches, one gate/up GEMM for every MLP invocation. Aggregate kernel time
+falls 4.2166→4.1358 s (−1.92%). Reports:
+`/tmp/nsys-out/vllm-cpp-4b-packed-mlp-{on,off}.nsys-rep`.
+
+A full-attention QKV packing trial was reverted. It replaced three GEMMs with one
+but required a standalone packed-output split before q/k/v consumers; combined
+MLP+QKV measured 6292.53 versus MLP-only 6306.07 (−0.21%). The experiment and
+the generalized split kernel were removed. GDN qkvz/ba packing remains a future
+lever only if its consumers are changed to avoid equivalent unpack traffic.
+
+Verification: full CUDA build succeeds; CTest is 90/92. All changed-area tests
+pass, including `test_qwen27_dense_forward` 5/5 (304 assertions). The two
+failures are unchanged local baseline issues: `test_cuda_ops` has 11 odd-size
+BF16 cuBLASLt outputs outside tolerance at M=17,K=31,N=13, and
+`test_op_parity` has no runner for committed `qwen36_gguf_greedy` goldens.

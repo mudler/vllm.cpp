@@ -245,6 +245,13 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(layer.mlp.gate_proj_fp4.Empty());
     CHECK_FALSE(layer.mlp.gate_proj.Empty());
     CHECK(layer.mlp.gate_proj.nk);
+    CHECK(layer.mlp.gate_up_proj.nk);
+    CHECK(layer.mlp.gate_up_proj.shape[0] == 4);
+    CHECK(layer.mlp.gate_up_proj.shape[1] == 3);
+    const auto* gate_up = reinterpret_cast<const uint16_t*>(
+        layer.mlp.gate_up_proj.bytes.data());
+    CHECK(gate_up[0] == vt::F32ToBF16(20.0F));
+    CHECK(gate_up[6] == vt::F32ToBF16(30.0F));
   }
 
   SUBCASE("linear attention accepts plain out_proj and F32 state parameters") {

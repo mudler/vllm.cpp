@@ -494,15 +494,30 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   This component win does not close the full-grid vLLM throughput/host-memory
   gate.
 - **Local RTX 5070 Ti / sm_120 status:** `Qwen/Qwen3.5-4B` now loads ordinary
-  BF16 weights and runs end-to-end in the Nix CUDA shell. This is **not parity
-  qualified**: only 9/16 greedy sequences match vLLM with Triton AOT (10/16 with
-  hand GDN kernels). On the exact 128-request, concurrency-32, 1024-in/128-out,
-  temperature-1 workload, the multi-block random sampler raises the three-run
-  mean from **1,086.92 to 5,614.25 tok/s (5.16×)** versus a fresh vLLM mean of
-  **6,669.28 tok/s (0.842×)**. Nsight reduces sampling from **81.7%** of project
-  GPU time to about **2.3% including softmax**; the remaining 15.8% throughput
-  gap is in the model/runtime path. The parallel path is bit-identical to the
-  retained scalar CUDA reference for the project's deterministic SplitMix RNG.
+  BF16 weights and runs end-to-end in the Nix CUDA shell. With all Triton AOT
+  paths enabled it matches vLLM on **15/16 complete 32-token sequences** from a
+  representative natural-prompt corpus. The one mismatch begins at a BF16
+  top-logit tie that vLLM reports as exactly equal; adversarial repeated-token
+  corpora remain 9/16 and 10/16, so this is **not full parity qualification**.
+  Ordinary BF16 linears now retain torch's raw `[N,K]` layout and BF16 outputs,
+  and a default-on sm_120 Triton AOT decode recurrence cuts that kernel from
+  2.42 s to 0.64 s per trace window (about 192 to 51 us/call).
+
+  On the exact 128-request, concurrency-32, 1024-in/128-out workload, ordinary
+  BF16 MLP gate/up weights are now stacked at load and executed as one GEMM,
+  mirroring vLLM's `MergedColumnParallelLinear`. Two reproduced temperature-1
+  runs average **6,139.06 tok/s** versus vLLM **6,669.28 tok/s (0.921×)**; two
+  greedy runs average **6,308.50 tok/s** versus vLLM **6,719.53 tok/s
+  (0.939×)**. These are open gaps, not performance parity.
+  Random sampling uses the same exponential-race distribution as vLLM and has
+  an empirical distribution test, but deterministic token streams differ because
+  the project still uses SplitMix while vLLM uses torch Philox. The fresh Nsight
+  trace puts random sampling plus softmax at 2.4% of project GPU time. Packed
+  gate/up removes one GEMM per MLP invocation; a matched trace removed 1,760
+  launches and 1.92% of GPU kernel time. Ordinary BF16 GEMMs and eager launch
+  structure still dominate. A trial of the existing dense CUDA graph on BF16
+  preserved the 15/16 short-corpus result but segfaulted in `libcuda.so` under
+  sustained load, so that routing was reverted.
   Persistent KV/GDN caches are now true device allocations on discrete GPUs,
   eliminating the prior HMM/UVM migration path; sustained runs and both engine
    traces completed without Xid/UVM faults.

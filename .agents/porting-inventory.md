@@ -341,6 +341,11 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    `Qwen3_5Model::Forward`, reusing the file-local `GdnBlockPaged`/
    `FullAttnBlockPaged`/paged machinery VERBATIM via `RunDenseLayerPaged` (the
    only delta vs `RunLayerPaged` is `DenseMlpBlock` in place of `MoeBlock`).
+   Ordinary BF16 dense MLPs mirror vLLM 0.24's `Qwen2MoeMLP` and Qwen3.5
+   stacked mapping (`qwen2_moe.py:90-117`, `qwen3_5.py:279-293`): gate/up raw
+   `[N,K]` rows are concatenated once at load into `gate_up_proj`, then one
+   `[T,2I]` GEMM feeds `SiluAndMul`. `VT_BF16_PACKED_MLP=0` (or the master
+   `VT_BF16_PACKED_LINEAR=0`) retains the split same-binary reference.
    Registry/type-erasure update (`c707602`): `GPUModelRunner` now carries one
    `LoadedModel*` and calls the registration's type-erased prepare/forward hooks;
    model-specific weights and both existing decode-graph objects live behind the

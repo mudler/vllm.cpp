@@ -109,6 +109,34 @@ OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
   return o;
 }
 
+OwnedTensor PackBf16RawNK(const std::vector<const OwnedTensor*>& parts,
+                          const std::string& label) {
+  VT_CHECK(!parts.empty(), "qwen3_5 dense: no tensors to pack for " + label);
+  const OwnedTensor* first = parts.front();
+  VT_CHECK(first != nullptr && first->dtype == vt::DType::kBF16 &&
+               first->rank == 2 && first->nk,
+           "qwen3_5 dense: invalid first tensor in " + label);
+  const int64_t k = first->shape[1];
+  int64_t n = 0;
+  for (const OwnedTensor* part : parts) {
+    VT_CHECK(part != nullptr && part->dtype == vt::DType::kBF16 &&
+                 part->rank == 2 && part->nk && part->shape[1] == k,
+             "qwen3_5 dense: incompatible raw-NK tensor in " + label);
+    n += part->shape[0];
+  }
+  OwnedTensor packed = MakeOwned(vt::DType::kBF16, {n, k});
+  packed.nk = true;
+  size_t offset = 0;
+  for (const OwnedTensor* part : parts) {
+    std::memcpy(packed.bytes.data() + offset, part->bytes.data(),
+                part->bytes.size());
+    offset += part->bytes.size();
+  }
+  VT_CHECK(offset == packed.bytes.size(),
+           "qwen3_5 dense: packed byte-size mismatch for " + label);
+  return packed;
+}
+
 // BF16/F32 [n] -> owned f32 [n] (A_log / dt_bias; bf16 upcast is lossless).
 OwnedTensor LoadToF32(const TensorResolver& get, const std::string& name) {
   const StTensor& t = get(name);
@@ -263,6 +291,10 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
     m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
   } else {
     m.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
+  }
+  if (!m.gate_proj.Empty() && !m.up_proj.Empty()) {
+    m.gate_up_proj =
+        PackBf16RawNK({&m.gate_proj, &m.up_proj}, mlp + "gate_up_proj");
   }
   return m;
 }

@@ -44,6 +44,12 @@ struct DenseMlpWeights {
   OwnedTensor up_proj;    // bf16 [H, I]
   OwnedTensor down_proj;  // bf16 [I, H]
 
+  // Plain-BF16 packed vLLM layout: checkpoint gate/up rows concatenated into
+  // one raw torch-Linear [2I,H] tensor (nk=true). The forward computes one
+  // [T,2I] GEMM and feeds vt::SiluAndMul directly. Separate tensors remain as
+  // the same-binary fallback; FP4 checkpoints use their native fields below.
+  OwnedTensor gate_up_proj;
+
   // W4A4 fp4-resident variants (compressed-tensors NVFP4, notes §5 step-6a). On
   // the real 27B CUDA load these are populated (kept in the on-disk [N=out,K=in]
   // orientation vt::MatmulNvfp4 reads) and the bf16 fields above are left EMPTY;

@@ -1058,6 +1058,16 @@ bool Bf16GemmOutEnabled() {
   return on;
 }
 
+bool Bf16PackedMlpEnabled() {
+  static const bool on = [] {
+    const char* master = std::getenv("VT_BF16_PACKED_LINEAR");
+    const char* mlp = std::getenv("VT_BF16_PACKED_MLP");
+    return (master == nullptr || master[0] != '0') &&
+           (mlp == nullptr || mlp[0] != '0');
+  }();
+  return on;
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // cutlass sm120a fp4xfp4 GEMM path toggle (DEFAULT ON when compiled with
 // VT_CUTLASS_NVFP4 — mirrors how the validated 35B fp8/Marlin defaults were
@@ -3439,6 +3449,12 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
 #endif
+  if (!fp4 && Bf16PackedMlpEnabled() && !w.gate_up_proj.Empty()) {
+    DBuf gate_up = MatmulBf16D(d, dh, w.gate_up_proj);  // [T,2I]
+    DBuf act(d, DType::kBF16, {T, I});
+    vt::SiluAndMul(d.q, act.t(), gate_up.t());
+    return MatmulBf16D(d, act.t(), w.down_proj);  // [T,H]
+  }
   // QUANTIZE-ONCE for gate/up: shared activation dh + shared input_global_scale ->
   // one ScaledFp4Quant feeding both fp4 GEMMs (removes 1 redundant [T,H] quant).
   const bool fuse_gu =

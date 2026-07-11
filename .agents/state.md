@@ -3490,3 +3490,21 @@ W6 `ATTN-ROPE-LLAMA3` is now the next dependency-ready C5 leaf; W7/W8 can follow
 on the shared factory/cache API. Until those gates land, README and matrices
 claim an implemented CPU/oracle foundation only, not user-visible YaRN/MRoPE
 model support.
+
+## 2026-07-11 — C5 W6 Llama 3 RoPE leaf claimed
+
+`CLAIM-C5-LLAMA3-1` moves `ATTN-ROPE-LLAMA3` `READY -> ACTIVE` in isolated
+worktree `/home/mudler/_git/vllm.cpp-c5-llama3`, branch
+`codex/c5-llama3-w6`. W5 merged and pushed as `d07dd1c`, so W6 can use its typed
+cache/factory/apply foundation without reopening YaRN/MRoPE semantics. The
+bounded scope is the Llama 3 `low_freq_factor`/`high_freq_factor` typed fields,
+the exact low/mid/high frequency formula, one factory case, direct tests, and
+pinned-source boundary goldens through the generic long-context runner. W7/W8
+LongRoPE/dynamic formulas, model-family/MM preprocessing, local attention and
+all GPU execution remain out of scope.
+
+Read-only DGX inspection at 02:35 UTC showed `CLAIM-SERVE-GATE-1` still holding
+`/tmp/gpu`; our 27B server used 25,253 MiB while sampled/default-temperature
+c16/16-prompt repetition 1 remained active. Both PR3 jobs were still queued.
+W6 begins with pinned source, CPU/oracle tests and the existing supplied-cache
+seam; it will not enqueue behind or contaminate that campaign.

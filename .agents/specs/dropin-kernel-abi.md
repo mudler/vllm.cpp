@@ -40,8 +40,15 @@ The 2026-07-11 fresh GCC13/CUDA build exposed a test-only parsing blocker before
 runtime: doctest's throw macro interpreted `DeviceGuard(Cpu())` as an
 unnecessary-parentheses declaration under `-Werror`. W0-GPU spells the same
 temporary construction with braces (`DeviceGuard{Cpu()}`); the constructor,
-exception type and assertion are unchanged. Exact sm_121a rebuild/runtime is
-still required before the leaf returns to `GATING`.
+exception type and assertion are unchanged. At branch commit `1141b79`, the
+exact CUDA 13.0.88/sm_121a all-target rebuild reached 100%; the lock-held
+focused CUDA/ABI CTest passed 2/2, compute-sanitizer passed all 9 cases and
+196 assertions with zero errors/leaks, and the 35B/27B model gates passed 2/2.
+The hashed evidence lives at
+`~/work/vllm.cpp-online-build/w0-gpu-1141b79` (manifest SHA-256
+`4adbe9527ade165a7a2357cb233055ced82de492d7dd7e42b38a31dde3830601`).
+W0 remains `ACTIVE`: clean sm_80/sm_90a cross-builds plus unchanged-kernel-list
+traces and same-binary model A/B-memory proof are still required.
 
 The objective is to reshape the `vt::` CUDA/ROCm **adapter boundary** around
 the raw pointer, shape, stride, semantic dtype, workspace, device, and stream

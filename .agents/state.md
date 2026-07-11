@@ -3900,3 +3900,26 @@ runtime source changed. `git diff --check` and the canonical record gates pass;
 the clean CPU focused build/CTest passes 1/1. This checkpoint deliberately
 claims no CUDA build/runtime result until the pushed branch is rebuilt in the
 exact clean DGX tree.
+
+## 2026-07-11 — W0-GPU sm_121a runtime and both model gates pass
+
+The clean DGX source was detached at pushed branch commit `1141b79` and built
+with CUDA 13.0.88, `sm_121a`, RelWithDebInfo, CUTLASS 4.4.2 and vendored Triton
+AOT. The resumed all-target build reached 100%; its log SHA-256 is
+`8dd2bee51ffe9abf7adc764118f7ec913e2b68f125900482205390af59d0d1ee`.
+Under one `/tmp/gpu` lock, `test_cuda_backend` and `test_dropin_abi` passed 2/2.
+An absolute-path compute-sanitizer rerun of `test_dropin_abi` passed 9/9 cases
+and 196/196 assertions with zero reported errors and zero leaked bytes (the
+named two-device check remains tracked because GB10 exposes one device).
+
+A second whole-run lock covered both gate models: `test_qwen36_paged_engine`
+passed in 86.65 seconds and `test_qwen27_paged_engine` passed in 32.81 seconds,
+2/2 total. Both post-run compute-process lists are empty and the GPU lock is
+released. Evidence is under
+`~/work/vllm.cpp-online-build/w0-gpu-1141b79`; `SHA256SUMS` itself hashes to
+`4adbe9527ade165a7a2357cb233055ced82de492d7dd7e42b38a31dde3830601`.
+This validates the syntax-only fix on GB10 and shows the current 35B model test
+does not reproduce the earlier HTTP-server fault. It does not close
+`BACKEND-ABI-VT`: sm_80/sm_90a cross-builds and unchanged-trace/model
+A/B-memory proof remain, so the row and claim stay `ACTIVE`. README capability
+status is unchanged.

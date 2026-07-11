@@ -20,7 +20,10 @@
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_UTILS_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_UTILS_H_
 
+#include <optional>
 #include <string>
+
+#include "vllm/entrypoints/openai/protocol.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -28,6 +31,17 @@ namespace vllm::entrypoints::openai {
 // single U+FFFD. Valid UTF-8 (and literal U+FFFD) passes through unchanged. The
 // result is always well-formed UTF-8 and therefore safe for nlohmann json dump.
 std::string SanitizeUtf8(const std::string& s);
+
+// Ported from: vllm/entrypoints/serve/utils/api_utils.py:276-289
+// (should_include_usage). Force mode enables final and continuous usage;
+// request-level continuous stats never take effect without include_usage.
+struct StreamUsageSelection {
+  bool include_usage = false;
+  bool include_continuous_usage = false;
+};
+StreamUsageSelection ShouldIncludeUsage(
+    const std::optional<StreamOptions>& stream_options,
+    bool enable_force_include_usage);
 
 }  // namespace vllm::entrypoints::openai
 

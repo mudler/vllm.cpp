@@ -23,17 +23,31 @@ class CompletionSseStream final : public SseStream {
  public:
   CompletionSseStream(v1::AsyncLLM& engine, v1::AsyncRequest request,
                       std::string response_id, int64_t created,
-                      std::string model)
+                      std::string model, StreamUsageSelection usage)
       : engine_(engine),
         request_(std::move(request)),
         response_id_(std::move(response_id)),
         created_(created),
-        model_(std::move(model)) {}
+        model_(std::move(model)),
+        usage_(usage) {}
 
   ~CompletionSseStream() override { abort(); }
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
+    if (usage_pending_) {
+      CompletionStreamResponse frame;
+      frame.id = response_id_;
+      frame.created = created_;
+      frame.model = model_;
+      frame.usage = UsageInfo{prompt_tokens_,
+                              prompt_tokens_ + previous_num_tokens_,
+                              previous_num_tokens_};
+      chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+      usage_pending_ = false;
+      done_pending_ = true;
+      return true;
+    }
     if (done_pending_) {
       chunk = "data: [DONE]\n\n";
       done_pending_ = false;
@@ -43,12 +57,17 @@ class CompletionSseStream final : public SseStream {
 
     for (;;) {
       RequestOutput response = engine_.get_output(request_);
+      prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
         if (response.finished) {
           engine_finished_ = true;
-          done_pending_ = true;
+          if (usage_.include_usage) {
+            usage_pending_ = true;
+          } else {
+            done_pending_ = true;
+          }
         }
-        if (done_pending_) return next(chunk);
+        if (usage_pending_ || done_pending_) return next(chunk);
         continue;
       }
 
@@ -72,11 +91,20 @@ class CompletionSseStream final : public SseStream {
       frame.created = created_;
       frame.model = model_;
       frame.choices.push_back(std::move(choice));
+      if (usage_.include_continuous_usage) {
+        frame.usage = UsageInfo{prompt_tokens_,
+                                prompt_tokens_ + previous_num_tokens_,
+                                previous_num_tokens_};
+      }
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
 
       if (response.finished) {
         engine_finished_ = true;
-        done_pending_ = true;
+        if (usage_.include_usage) {
+          usage_pending_ = true;
+        } else {
+          done_pending_ = true;
+        }
       }
       return true;
     }
@@ -94,7 +122,10 @@ class CompletionSseStream final : public SseStream {
   std::string response_id_;
   int64_t created_ = 0;
   std::string model_;
+  StreamUsageSelection usage_;
+  int prompt_tokens_ = 0;
   int previous_num_tokens_ = 0;
+  bool usage_pending_ = false;
   bool done_pending_ = false;
   bool engine_finished_ = false;
   bool complete_ = false;
@@ -104,14 +135,18 @@ class CompletionSseStream final : public SseStream {
 }  // namespace
 
 OpenAIServingCompletion::OpenAIServingCompletion(v1::LLMEngine& engine,
-                                                 std::string served_model_name)
+                                                 std::string served_model_name,
+                                                 bool enable_force_include_usage)
     : sync_engine_(&engine),
-      served_model_name_(std::move(served_model_name)) {}
+      served_model_name_(std::move(served_model_name)),
+      enable_force_include_usage_(enable_force_include_usage) {}
 
 OpenAIServingCompletion::OpenAIServingCompletion(
-    v1::AsyncLLM& engine, std::string served_model_name)
+    v1::AsyncLLM& engine, std::string served_model_name,
+    bool enable_force_include_usage)
     : async_engine_(&engine),
-      served_model_name_(std::move(served_model_name)) {}
+      served_model_name_(std::move(served_model_name)),
+      enable_force_include_usage_(enable_force_include_usage) {}
 
 CompletionResult OpenAIServingCompletion::create_completion(
     const CompletionRequest& request) {
@@ -122,6 +157,8 @@ CompletionResult OpenAIServingCompletion::create_completion(
   const auto created_time = static_cast<int64_t>(std::time(nullptr));
   const std::string model_name =
       request.model.has_value() ? *request.model : served_model_name_;
+  const StreamUsageSelection usage = ShouldIncludeUsage(
+      request.stream_options, enable_force_include_usage_);
 
   // request → SamplingParams. to_sampling_params sets output_kind to kDelta
   // when stream, kFinalOnly otherwise (protocol.cpp) — matching upstream's
@@ -142,7 +179,8 @@ CompletionResult OpenAIServingCompletion::create_completion(
     result.streaming = true;
     try {
       result.sse_stream = std::make_shared<CompletionSseStream>(
-          *async_engine_, async_request, request_id, created_time, model_name);
+          *async_engine_, async_request, request_id, created_time, model_name,
+          usage);
     } catch (...) {
       async_engine_->abort(async_request.request_id);
       throw;
@@ -158,6 +196,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
     result.streaming = true;
 
     int previous_num_tokens = 0;
+    int num_prompt_tokens = 0;
     if (sync_engine_ == nullptr) {
       throw std::runtime_error("completion handler has no engine");
     }
@@ -166,6 +205,7 @@ CompletionResult OpenAIServingCompletion::create_completion(
     while (sync_engine_->has_unfinished_requests()) {
       for (const RequestOutput& res : sync_engine_->step()) {
         if (res.request_id != engine_request_id) continue;
+        num_prompt_tokens = static_cast<int>(res.prompt_token_ids.size());
         for (const CompletionOutput& output : res.outputs) {
           const std::string& delta_text = output.text;
           // :368-374 chunked-prefill: skip empty chunks (no text, no tokens,
@@ -190,11 +230,28 @@ CompletionResult OpenAIServingCompletion::create_completion(
           chunk.created = created_time;
           chunk.model = model_name;
           chunk.choices.push_back(std::move(choice));
+          if (usage.include_continuous_usage) {
+            chunk.usage = UsageInfo{num_prompt_tokens,
+                                    num_prompt_tokens + previous_num_tokens,
+                                    previous_num_tokens};
+          }
 
           result.sse_chunks.push_back(
               "data: " + nlohmann::json(chunk).dump() + "\n\n");
         }
       }
+    }
+    if (usage.include_usage) {
+      CompletionStreamResponse usage_chunk;
+      usage_chunk.id = request_id;
+      usage_chunk.created = created_time;
+      usage_chunk.model = model_name;
+      usage_chunk.usage =
+          UsageInfo{num_prompt_tokens,
+                    num_prompt_tokens + previous_num_tokens,
+                    previous_num_tokens};
+      result.sse_chunks.push_back(
+          "data: " + nlohmann::json(usage_chunk).dump() + "\n\n");
     }
     result.sse_chunks.push_back("data: [DONE]\n\n");
     return result;

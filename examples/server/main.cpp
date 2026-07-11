@@ -10,6 +10,7 @@
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
 //          [--max-num-seqs N] [--max-num-batched-tokens N]
+//          [--enable-force-include-usage]
 //          [--scheduling-policy fcfs|priority]
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
@@ -71,6 +72,7 @@ struct Args {
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
+  bool enable_force_include_usage = false;
   // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy).
   std::string scheduling_policy = "fcfs";
@@ -84,6 +86,7 @@ struct Args {
          "[--num-blocks N] [--max-model-len N]\n"
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
+         "               [--enable-force-include-usage]\n"
          "               [--scheduling-policy fcfs|priority]\n";
   std::exit(code);
 }
@@ -117,6 +120,8 @@ Args ParseArgs(int argc, char** argv) {
       a.max_num_seqs = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-num-batched-tokens") {
       a.max_num_batched_tokens = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--enable-force-include-usage") {
+      a.enable_force_include_usage = true;
     } else if (flag == "--scheduling-policy") {
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
@@ -185,7 +190,8 @@ int main(int argc, char** argv) {
     // keeps the default role-join fallback. ────────────────────────────────
     namespace oai = vllm::entrypoints::openai;
     oai::OpenAIServingModels models(served_model_name);
-    oai::OpenAIServingCompletion completion(engine, served_model_name);
+    oai::OpenAIServingCompletion completion(
+        engine, served_model_name, args.enable_force_include_usage);
 
     oai::ChatPromptFn chat_prompt_fn = oai::DefaultChatPromptFallback;
     try {
@@ -203,7 +209,8 @@ int main(int argc, char** argv) {
       std::cerr << "server: no chat template (" << e.what()
                 << "); falling back to the simple role-join prompt\n";
     }
-    oai::OpenAIServingChat chat(engine, served_model_name, chat_prompt_fn);
+    oai::OpenAIServingChat chat(engine, served_model_name, chat_prompt_fn,
+                                "hermes", args.enable_force_include_usage);
 
     oai::ApiServer server(completion, chat, models, vllm::Version());
     std::cerr << "server: listening on http://" << args.host << ":" << args.port

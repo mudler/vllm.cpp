@@ -38,6 +38,8 @@ ENGINE_ROWS = 96
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
     ROOT / "AGENTS.md",
+    ROOT / "README.md",
+    ROOT / "docs/BENCHMARKS.md",
     AGENTS / "roadmap_v1.md",
     AGENTS / "coordination.md",
     AGENTS / "feature-matrix.md",
@@ -138,7 +140,12 @@ class ClaimRow:
 
 
 def markdown_files() -> list[Path]:
-    return [ROOT / "AGENTS.md", ROOT / "README.md", *sorted(AGENTS.rglob("*.md"))]
+    return [
+        ROOT / "AGENTS.md",
+        ROOT / "README.md",
+        ROOT / "docs/BENCHMARKS.md",
+        *sorted(AGENTS.rglob("*.md")),
+    ]
 
 
 def split_cells(line: str) -> list[str]:

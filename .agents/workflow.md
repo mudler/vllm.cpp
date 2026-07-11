@@ -26,6 +26,10 @@ and continue. Follow this protocol every session.
      `python3 tests/scripts/test_agent_record.py` pass (canonical tables, stable
      IDs, semantic row fields, lifecycle/spec/claim/DONE integrity, pinned
      inventory size, and mutation proof that malformed rows fail);
+   - `python3 scripts/check-doc-checkpoint.py --staged` and
+     `python3 tests/scripts/test_doc_checkpoint.py` pass: every feature or
+     iteration checkpoint updates both `README.md` and `docs/BENCHMARKS.md` in
+     the same change, even when the honest result is pending, failed, or void;
    - tests green (op-parity / behavioral / e2e as applicable);
    - every feature/milestone that can plausibly affect speed, latency,
      scheduling, memory traffic, loading, or peak memory completes its own
@@ -49,10 +53,14 @@ and continue. Follow this protocol every session.
    - owning area-matrix row has exact implementation + test/evidence anchors;
    - [roadmap_v1.md](roadmap_v1.md) portfolio row and
      [coordination.md](coordination.md) claim updated;
-   - **`README.md` support tables** (architectures / acceleration /
-     quantization) updated whenever a change alters what is supported, its
-     status, or its tested formats — a family/backend becomes ✅ only when
-     parity-tested per [discipline.md](discipline.md);
+   - **`README.md` current-stage status and support tables** (architectures /
+     acceleration / quantization) updated at every feature/iteration
+     checkpoint — not only at feature closure; a family/backend becomes ✅ only
+     when parity-tested per [discipline.md](discipline.md);
+   - **`docs/BENCHMARKS.md` benchmark disposition** updated at that same
+     checkpoint with accepted comparable numbers or an explicit
+     `PENDING`/`NOT APPLICABLE`/`FAILED`/`VOID` result and next reproduction
+     recipe; partial evidence never becomes a public ratio;
    - [state.md](state.md) entry appended (what landed, what's next);
    - commit + push to `main` (user-authorized, for now).
 

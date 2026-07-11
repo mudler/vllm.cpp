@@ -14,8 +14,6 @@
 //   - tools / tool_choice / grammars (M3.3 / M3.4)
 //   - logprobs *payload* (CompletionLogProbs); echo; best_of; suffix
 //   - n > 1 (multiple choices) — T0 emits a single choice (index 0)
-//   - stream_options / include_usage trailing usage chunk (default: no usage
-//     chunk in the stream — only the deltas + [DONE])
 //   - beam search, LoRA, data-parallel rank, trace headers, kv_transfer
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_COMPLETION_H_
@@ -63,9 +61,11 @@ class OpenAIServingCompletion {
  public:
   // `served_model_name` is the name echoed back in the response `model` field
   // (upstream: self.models.model_name(lora_request); T0 has one served model).
-  OpenAIServingCompletion(v1::LLMEngine& engine, std::string served_model_name);
+  OpenAIServingCompletion(v1::LLMEngine& engine, std::string served_model_name,
+                          bool enable_force_include_usage = false);
   OpenAIServingCompletion(v1::AsyncLLM& engine,
-                          std::string served_model_name);
+                          std::string served_model_name,
+                          bool enable_force_include_usage = false);
 
   // create_completion (completion/serving.py:109). request → SamplingParams →
   // engine → CompletionResponse (non-stream) or SSE chunk vector (stream).
@@ -80,6 +80,7 @@ class OpenAIServingCompletion {
   v1::LLMEngine* sync_engine_ = nullptr;
   v1::AsyncLLM* async_engine_ = nullptr;
   std::string served_model_name_;
+  bool enable_force_include_usage_ = false;
   // Monotonic request counter — the request_id is "cmpl-<counter>". Upstream
   // uses random_uuid() (serving/engine/serving.py:_base_request_id); no
   // random/uuid is wired at T0, so a counter stands in (id uniqueness only).

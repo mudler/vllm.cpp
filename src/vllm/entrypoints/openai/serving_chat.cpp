@@ -226,14 +226,16 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
 namespace {
 
 // chat_completion_stream_generator (serving.py:404-802) as W2's live,
-// pull-based SSE source. The role frame is immediately available; subsequent
+// pull-based SSE source. Continuous usage waits for and buffers the first
+// result so the role frame carries a native prompt-token count; subsequent
 // calls block only on this request's collector.
 class ChatSseStream final : public SseStream {
  public:
   ChatSseStream(v1::AsyncLLM& engine, v1::AsyncRequest async_request,
                 std::string response_id, int64_t created, std::string model,
                 ChatCompletionRequest request,
-                std::unique_ptr<ToolParser> parser, bool named_tool_choice)
+                std::unique_ptr<ToolParser> parser, bool named_tool_choice,
+                StreamUsageSelection usage)
       : engine_(engine),
         async_request_(std::move(async_request)),
         response_id_(std::move(response_id)),
@@ -241,13 +243,28 @@ class ChatSseStream final : public SseStream {
         model_(std::move(model)),
         request_(std::move(request)),
         parser_(std::move(parser)),
-        named_tool_choice_(named_tool_choice) {}
+        named_tool_choice_(named_tool_choice),
+        usage_(usage) {}
 
   ~ChatSseStream() override { abort(); }
 
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (role_pending_) {
+      // Upstream emits the role frame on the first engine result. We only need
+      // to buffer that result when continuous usage requires its native prompt
+      // count; the default path retains its immediately available role frame.
+      if (usage_.include_continuous_usage) {
+        for (;;) {
+          RequestOutput response = engine_.get_output(async_request_);
+          prompt_tokens_ =
+              static_cast<int>(response.prompt_token_ids.size());
+          if (!response.outputs.empty() || response.finished) {
+            buffered_response_ = std::move(response);
+            break;
+          }
+        }
+      }
       role_pending_ = false;
       ChatCompletionResponseStreamChoice choice;
       choice.index = 0;
@@ -259,7 +276,23 @@ class ChatSseStream final : public SseStream {
       frame.created = created_;
       frame.model = model_;
       frame.choices.push_back(std::move(choice));
+      if (usage_.include_continuous_usage) {
+        frame.usage = UsageInfo{prompt_tokens_, prompt_tokens_, 0};
+      }
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+      return true;
+    }
+    if (usage_pending_) {
+      ChatCompletionStreamResponse frame;
+      frame.id = response_id_;
+      frame.created = created_;
+      frame.model = model_;
+      frame.usage = UsageInfo{prompt_tokens_,
+                              prompt_tokens_ + previous_num_tokens_,
+                              previous_num_tokens_};
+      chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
+      usage_pending_ = false;
+      done_pending_ = true;
       return true;
     }
     if (done_pending_) {
@@ -270,11 +303,22 @@ class ChatSseStream final : public SseStream {
     }
 
     for (;;) {
-      RequestOutput response = engine_.get_output(async_request_);
+      RequestOutput response;
+      if (buffered_response_.has_value()) {
+        response = std::move(*buffered_response_);
+        buffered_response_.reset();
+      } else {
+        response = engine_.get_output(async_request_);
+      }
+      prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
         if (response.finished) {
           engine_finished_ = true;
-          done_pending_ = true;
+          if (usage_.include_usage) {
+            usage_pending_ = true;
+          } else {
+            done_pending_ = true;
+          }
           return next(chunk);
         }
         continue;
@@ -317,10 +361,19 @@ class ChatSseStream final : public SseStream {
       frame.created = created_;
       frame.model = model_;
       frame.choices.push_back(std::move(choice));
+      if (usage_.include_continuous_usage) {
+        frame.usage = UsageInfo{prompt_tokens_,
+                                prompt_tokens_ + previous_num_tokens_,
+                                previous_num_tokens_};
+      }
       chunk = "data: " + nlohmann::json(frame).dump() + "\n\n";
       if (response.finished) {
         engine_finished_ = true;
-        done_pending_ = true;
+        if (usage_.include_usage) {
+          usage_pending_ = true;
+        } else {
+          done_pending_ = true;
+        }
       }
       return true;
     }
@@ -341,7 +394,11 @@ class ChatSseStream final : public SseStream {
   ChatCompletionRequest request_;
   std::unique_ptr<ToolParser> parser_;
   bool named_tool_choice_ = false;
+  StreamUsageSelection usage_;
+  std::optional<RequestOutput> buffered_response_;
+  int prompt_tokens_ = 0;
   bool role_pending_ = true;
+  bool usage_pending_ = false;
   bool done_pending_ = false;
   bool engine_finished_ = false;
   bool complete_ = false;
@@ -362,20 +419,24 @@ std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
 OpenAIServingChat::OpenAIServingChat(v1::LLMEngine& engine,
                                      std::string served_model_name,
                                      ChatPromptFn prompt_fn,
-                                     std::string tool_parser_name)
+                                     std::string tool_parser_name,
+                                     bool enable_force_include_usage)
     : sync_engine_(&engine),
       served_model_name_(std::move(served_model_name)),
       prompt_fn_(std::move(prompt_fn)),
-      tool_parser_name_(std::move(tool_parser_name)) {}
+      tool_parser_name_(std::move(tool_parser_name)),
+      enable_force_include_usage_(enable_force_include_usage) {}
 
 OpenAIServingChat::OpenAIServingChat(v1::AsyncLLM& engine,
                                      std::string served_model_name,
                                      ChatPromptFn prompt_fn,
-                                     std::string tool_parser_name)
+                                     std::string tool_parser_name,
+                                     bool enable_force_include_usage)
     : async_engine_(&engine),
       served_model_name_(std::move(served_model_name)),
       prompt_fn_(std::move(prompt_fn)),
-      tool_parser_name_(std::move(tool_parser_name)) {}
+      tool_parser_name_(std::move(tool_parser_name)),
+      enable_force_include_usage_(enable_force_include_usage) {}
 
 ChatCompletionResult OpenAIServingChat::create_chat_completion(
     const ChatCompletionRequest& request) {
@@ -386,6 +447,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   const auto created_time = static_cast<int64_t>(std::time(nullptr));
   const std::string model_name =
       request.model.has_value() ? *request.model : served_model_name_;
+  const StreamUsageSelection usage = ShouldIncludeUsage(
+      request.stream_options, enable_force_include_usage_);
 
   // Build the prompt from messages via the seam (add_generation_prompt is the
   // upstream default True). The tools are passed through so the chat template's
@@ -425,7 +488,7 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       try {
         result.sse_stream = std::make_shared<ChatSseStream>(
             *async_engine_, async_request, request_id, created_time, model_name,
-            request, std::move(parser), named_tool_choice);
+            request, std::move(parser), named_tool_choice, usage);
       } catch (...) {
         async_engine_->abort(async_request.request_id);
         throw;
@@ -437,29 +500,14 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     ChatCompletionResult result;
     result.streaming = true;
 
-    // First chunk: the role delta ({role:"assistant", content:""}) — :485-520.
-    {
-      ChatCompletionResponseStreamChoice choice;
-      choice.index = 0;
-      choice.delta.role = kAssistantRole;
-      choice.delta.content = "";
-      choice.finish_reason = std::nullopt;
-
-      ChatCompletionStreamResponse chunk;
-      chunk.id = request_id;
-      chunk.created = created_time;
-      chunk.model = model_name;
-      chunk.choices.push_back(std::move(choice));
-      result.sse_chunks.push_back(
-          "data: " + nlohmann::json(chunk).dump() + "\n\n");
-    }
-
     // Content / tool-call deltas, then the finish chunk (:559-716). The tool
     // parser (when present) drives per-delta shaping; `previous_text` is the
     // accumulated output the streaming parser re-parses each step (:615).
     int previous_num_tokens = 0;
+    int num_prompt_tokens = 0;
     std::string previous_text;
     bool tools_streamed = false;
+    bool role_emitted = false;
     if (sync_engine_ == nullptr) {
       throw std::runtime_error("chat handler has no engine");
     }
@@ -468,6 +516,26 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     while (sync_engine_->has_unfinished_requests()) {
       for (const RequestOutput& res : sync_engine_->step()) {
         if (res.request_id != engine_request_id) continue;
+        num_prompt_tokens = static_cast<int>(res.prompt_token_ids.size());
+        if (!role_emitted) {
+          role_emitted = true;
+          ChatCompletionResponseStreamChoice role_choice;
+          role_choice.index = 0;
+          role_choice.delta.role = kAssistantRole;
+          role_choice.delta.content = "";
+          role_choice.finish_reason = std::nullopt;
+          ChatCompletionStreamResponse role_chunk;
+          role_chunk.id = request_id;
+          role_chunk.created = created_time;
+          role_chunk.model = model_name;
+          role_chunk.choices.push_back(std::move(role_choice));
+          if (usage.include_continuous_usage) {
+            role_chunk.usage = UsageInfo{num_prompt_tokens,
+                                         num_prompt_tokens, 0};
+          }
+          result.sse_chunks.push_back(
+              "data: " + nlohmann::json(role_chunk).dump() + "\n\n");
+        }
         for (const CompletionOutput& output : res.outputs) {
           // SanitizeUtf8 (see serving_utils.h): raw-byte deltas may carry an
           // invalid/split multibyte run that would make dump() below throw.
@@ -517,10 +585,27 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
           chunk.created = created_time;
           chunk.model = model_name;
           chunk.choices.push_back(std::move(choice));
+          if (usage.include_continuous_usage) {
+            chunk.usage = UsageInfo{num_prompt_tokens,
+                                    num_prompt_tokens + previous_num_tokens,
+                                    previous_num_tokens};
+          }
           result.sse_chunks.push_back(
               "data: " + nlohmann::json(chunk).dump() + "\n\n");
         }
       }
+    }
+    if (usage.include_usage) {
+      ChatCompletionStreamResponse usage_chunk;
+      usage_chunk.id = request_id;
+      usage_chunk.created = created_time;
+      usage_chunk.model = model_name;
+      usage_chunk.usage =
+          UsageInfo{num_prompt_tokens,
+                    num_prompt_tokens + previous_num_tokens,
+                    previous_num_tokens};
+      result.sse_chunks.push_back(
+          "data: " + nlohmann::json(usage_chunk).dump() + "\n\n");
     }
     result.sse_chunks.push_back("data: [DONE]\n\n");
     return result;

@@ -56,6 +56,14 @@ struct UsageInfo {
   int completion_tokens = 0;
 };
 
+// Ported from: vllm/entrypoints/openai/engine/protocol.py:241
+// (StreamOptions). Explicit null values resolve to the upstream defaults
+// during request parsing, so the serving path consumes plain booleans.
+struct StreamOptions {
+  bool include_usage = false;
+  bool continuous_usage_stats = false;
+};
+
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:60 (ErrorInfo).
 struct ErrorInfo {
   std::string message;
@@ -192,6 +200,7 @@ struct CompletionRequest {
   std::vector<std::string> stop;           // normalized list-form
   std::vector<int32_t> stop_token_ids;
   bool stream = false;
+  std::optional<StreamOptions> stream_options;
   std::optional<int> logprobs;
   std::optional<int> prompt_logprobs;
   bool echo = false;                       // parsed; behavior deferred
@@ -306,6 +315,7 @@ struct ChatCompletionRequest {
   std::vector<std::string> stop;           // normalized list-form
   std::vector<int32_t> stop_token_ids;
   bool stream = false;
+  std::optional<StreamOptions> stream_options;
   // Upstream chat `logprobs` is a BOOL flag; `top_logprobs` is the count.
   bool logprobs = false;
   int top_logprobs = 0;

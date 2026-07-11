@@ -96,6 +96,27 @@ void ParseResponseFormat(const nlohmann::json& j,
   out = std::move(r);
 }
 
+// engine/protocol.py:241-243 (StreamOptions) plus completion/protocol.py:
+// 471-478 / chat_completion/protocol.py:731-737 (validate_stream_options).
+// The upstream before-validator rejects a non-empty options object unless the
+// request is streaming. Null booleans use the StreamOptions defaults.
+void ParseStreamOptions(const nlohmann::json& j, bool stream,
+                        std::optional<StreamOptions>& out) {
+  auto it = j.find("stream_options");
+  if (it == j.end() || it->is_null()) return;
+  if (!it->is_object()) {
+    throw std::runtime_error("stream_options must be an object");
+  }
+  if (!stream && !it->empty()) {
+    throw std::runtime_error(
+        "Stream options can only be defined when `stream=True`.");
+  }
+  StreamOptions options;
+  GetOr(*it, "include_usage", options.include_usage);
+  GetOr(*it, "continuous_usage_stats", options.continuous_usage_stats);
+  out = options;
+}
+
 // Normalize a parsed response_format into SamplingParams.structured_outputs
 // (completion/protocol.py:309-338 / chat_completion/protocol.py:629-658):
 //   json_object -> structured_outputs.json_object = true
@@ -199,6 +220,7 @@ void from_json(const nlohmann::json& j, CompletionRequest& r) {
   r.stop = ParseStop(j);
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
+  ParseStreamOptions(j, r.stream, r.stream_options);
   GetOpt(j, "logprobs", r.logprobs);
   GetOpt(j, "prompt_logprobs", r.prompt_logprobs);
   GetOr(j, "echo", r.echo);
@@ -253,6 +275,7 @@ void from_json(const nlohmann::json& j, ChatCompletionRequest& r) {
   r.stop = ParseStop(j);
   GetOr(j, "stop_token_ids", r.stop_token_ids);
   GetOr(j, "stream", r.stream);
+  ParseStreamOptions(j, r.stream, r.stream_options);
   GetOr(j, "logprobs", r.logprobs);
   GetOr(j, "top_logprobs", r.top_logprobs);
   GetOr(j, "echo", r.echo);

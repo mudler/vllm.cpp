@@ -20,6 +20,10 @@ OpenAI-compatible server.
 > peak memory on both. The tables track real, tested support and are kept
 > current as work lands (see `.agents/`). CPU multithreaded dispatch is now
 > correctness-gated, but its real-file throughput/RSS checkpoint is still open.
+> The current serving checkpoint implements native-ID final/continuous stream
+> usage for completion and chat and is CPU/ASan/UBSan/TSan-green; the fresh
+> two-model online latency rerun remains `GATING`. The prior `8289cbd`
+> partial 27B arm is **void** and contributes no public ratio.
 
 ## What's implemented (CPU, behaviorally tested)
 
@@ -77,8 +81,12 @@ runs end-to-end on CPU:
 - **OpenAI server** — basic `/v1/completions` and `/v1/chat/completions`
   transport (non-streaming plus **live incremental SSE** over an `AsyncLLM`
   engine thread), concurrent requests through one scheduler, and disconnect
-  abort; `--max-num-seqs` and `--max-num-batched-tokens` expose reproducible
-  scheduler operating points. `/v1/models`, `/health`, and `/version` are
+  abort. Streaming completion and chat requests accept `stream_options` with
+  native-ID final/continuous usage frames; `--enable-force-include-usage`
+  mirrors vLLM's server-wide force mode. This path is CPU/sanitizer-gated and
+  awaits its fresh two-model GB10 online checkpoint before the row can close.
+  `--max-num-seqs` and `--max-num-batched-tokens` expose reproducible scheduler
+  operating points. `/v1/models`, `/health`, and `/version` are
   present, while `/health`
   currently reports process liveness rather than probing engine health. The
   async path passes the full CPU suite and ThreadSanitizer; its post-change
@@ -124,6 +132,8 @@ cmake -S . -B build -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
 ./build/examples/server --model /path/to/Qwen3.6-35B-A3B --port 8000 \
   --max-num-seqs 32 --max-num-batched-tokens 8192
 # then: curl localhost:8000/v1/chat/completions -d '{"model":"...","messages":[...]}'
+# add --enable-force-include-usage to attach native cumulative usage to every
+# streamed choice and an empty-choice final usage frame before [DONE].
 
 # Or a one-shot completion via the CLI (drives the C ABI end-to-end)
 ./build/examples/vllm-cli --model /path/to/model --prompt "The capital of France is"
@@ -257,7 +267,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
   for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
-  `DONE`).
+  `DONE`). The clean `8289cbd` 27B attempt then failed closed at c32 because the
+  requested final usage frame was missing: 192/192 requests completed, but one
+  128-frame response re-tokenized to 126. Native-ID final/continuous usage,
+  non-stream validation, and force mode are now implemented and
+  CPU/ASan/UBSan/TSan-green; a fresh merged-SHA 27B→35B rerun remains. No metric
+  or ratio from the partial arm is binding.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,
@@ -291,7 +306,9 @@ vs upstream vLLM, the [parity ledger](.agents/parity-ledger.md), the [roadmap](.
 the [engine](.agents/engine-matrix.md), [model](.agents/model-matrix.md),
 [quantization](.agents/quantization-matrix.md), [kernel](.agents/kernel-matrix.md),
 and [backend](.agents/backend-matrix.md) matrices,
-and the [upstream sync protocol](.agents/upstream-sync.md).
+and the [upstream sync protocol](.agents/upstream-sync.md). The concise public
+accepted/pending/failed/void benchmark checkpoint is in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## License
 

@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/sampling_params.h"
 
 using nlohmann::json;
@@ -121,6 +122,88 @@ TEST_CASE("ChatCompletionRequest parse messages + to_sampling_params") {
   CHECK(sp.max_tokens.value() == 32);
   // stream=false => FINAL_ONLY.
   CHECK(sp.output_kind == RequestOutputKind::kFinalOnly);
+}
+
+// Ported from tests/entrypoints/openai/completion/test_completion.py:
+// test_completion_stream_options and chat_completion/test_chat.py:
+// test_chat_completion_stream_options @ e24d1b24.
+TEST_CASE("CompletionRequest stream_options parse defaults and validate stream") {
+  SUBCASE("both usage modes parse on a streaming request") {
+    auto req = json::parse(R"({
+      "prompt":"hi", "stream":true,
+      "stream_options":{"include_usage":true,
+                        "continuous_usage_stats":true}
+    })").get<CompletionRequest>();
+    REQUIRE(req.stream_options.has_value());
+    CHECK(req.stream_options->include_usage);
+    CHECK(req.stream_options->continuous_usage_stats);
+  }
+  SUBCASE("null booleans resolve to false") {
+    auto req = json::parse(R"({
+      "prompt":"hi", "stream":true,
+      "stream_options":{"include_usage":null,
+                        "continuous_usage_stats":null}
+    })").get<CompletionRequest>();
+    REQUIRE(req.stream_options.has_value());
+    CHECK_FALSE(req.stream_options->include_usage);
+    CHECK_FALSE(req.stream_options->continuous_usage_stats);
+  }
+  SUBCASE("empty options remain allowed on a non-stream request") {
+    auto req = json::parse(R"({"prompt":"hi","stream_options":{}})")
+                   .get<CompletionRequest>();
+    REQUIRE(req.stream_options.has_value());
+    CHECK_FALSE(req.stream_options->include_usage);
+  }
+  SUBCASE("non-empty options reject a non-stream request") {
+    CHECK_THROWS_WITH_AS(
+        json::parse(R"({"prompt":"hi","stream":false,
+                         "stream_options":{"include_usage":true}})")
+            .get<CompletionRequest>(),
+        doctest::Contains("Stream options can only be defined"),
+        std::exception);
+    CHECK_THROWS(json::parse(R"({"prompt":"hi","stream":false,
+                                 "stream_options":{"include_usage":null}})")
+                     .get<CompletionRequest>());
+    CHECK_THROWS(json::parse(R"({"prompt":"hi","stream":false,
+                                 "stream_options":{"continuous_usage_stats":true}})")
+                     .get<CompletionRequest>());
+  }
+}
+
+TEST_CASE("ChatCompletionRequest stream_options mirror completion validation") {
+  auto req = json::parse(R"({
+    "messages":[{"role":"user","content":"hi"}], "stream":true,
+    "stream_options":{"include_usage":true,
+                      "continuous_usage_stats":false}
+  })").get<ChatCompletionRequest>();
+  REQUIRE(req.stream_options.has_value());
+  CHECK(req.stream_options->include_usage);
+  CHECK_FALSE(req.stream_options->continuous_usage_stats);
+
+  CHECK_THROWS(json::parse(R"({
+    "messages":[], "stream":false,
+    "stream_options":{"include_usage":true}
+  })").get<ChatCompletionRequest>());
+}
+
+TEST_CASE("should_include_usage mirrors request and force selection") {
+  CHECK_FALSE(ShouldIncludeUsage(std::nullopt, false).include_usage);
+
+  StreamOptions continuous_only;
+  continuous_only.continuous_usage_stats = true;
+  const auto ignored = ShouldIncludeUsage(continuous_only, false);
+  CHECK_FALSE(ignored.include_usage);
+  CHECK_FALSE(ignored.include_continuous_usage);
+
+  StreamOptions final_only;
+  final_only.include_usage = true;
+  const auto final = ShouldIncludeUsage(final_only, false);
+  CHECK(final.include_usage);
+  CHECK_FALSE(final.include_continuous_usage);
+
+  const auto forced = ShouldIncludeUsage(std::nullopt, true);
+  CHECK(forced.include_usage);
+  CHECK(forced.include_continuous_usage);
 }
 
 // (c) CompletionResponse + CompletionStreamResponse serialize to exact shape.

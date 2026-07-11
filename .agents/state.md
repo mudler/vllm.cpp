@@ -4073,3 +4073,38 @@ continuous, validation and force-mode spike in
 `.agents/specs/stream-options.md`. Commit the spike before implementation;
 after CPU/sanitizer closure, merge and regenerate both SHA-bound campaigns.
 README capability status is unchanged.
+
+## 2026-07-11 — native stream usage is CPU/sanitizer-gated; public README + BENCHMARKS checkpoints are now enforceable
+
+`SERVE-STREAM-USAGE` now mirrors pinned vLLM across both text endpoints:
+completion and chat parse nullable `stream_options`, reject non-empty options
+for non-stream requests, attach cumulative native-ID usage only when requested,
+emit the final `choices=[]` usage frame before `[DONE]`, and support
+`--enable-force-include-usage`. Chat buffers only its first result when
+continuous usage needs the real prompt count. The default wire shape remains
+choice frames plus `[DONE]`. The finish-choice/pending-usage disconnect boundary
+is explicitly tested and leaves no live AsyncLLM request.
+
+Local gates on the recovered worktree are green: clean Release/CUDA-OFF CTest
+**105/105**; focused protocol/serving/API **63 cases / 658 assertions**; API
+server `--repeat until-fail:100` **100/100**; focused ASan+UBSan **3/3** with
+the existing process-lifetime pool excluded from leak reporting; rebuilt TSan
+API server **1/1**. The public-document checker passes **5/5** unit cases,
+`py_compile`, and the updated CI YAML parses. No GPU was used and no online
+metric is accepted. The old `8289cbd` arm stays void.
+
+Per the user's new standing directive, `README.md` and
+`docs/BENCHMARKS.md` are now same-change checkpoints after every feature or
+iteration, including `ACTIVE`/`GATING`, pending, failed, and void outcomes.
+`scripts/check-doc-checkpoint.py` checks each new commit that touches
+code/tests/benchmark tooling/spikes/lifecycle records; CI and five mutations
+enforce that both public documents move together. The agent workflow,
+benchmark protocol, coordination protocol, canonical index, and record checker
+all name the obligation.
+
+Next: advance the clean DGX checkout to this checkpoint's new full SHA,
+regenerate its manifest/corpora/evidence, then run the 27B model
+series followed by 35B under separate whole-model locks. Binding closure still
+requires every request to report 128 native output IDs, full repetitions,
+fresh vLLM denominators, final/continuous serialization A/B, all latency /
+throughput/memory axes, memory return, and paired traces.

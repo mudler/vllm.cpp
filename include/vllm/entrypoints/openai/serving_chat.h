@@ -17,8 +17,8 @@
 //     (chat_completion/serving.py:485-520, :663-738, :802).
 //
 // DEFERRED (marked; matches upstream): tools / tool_choice / grammars
-// (M3.3/M3.4); reasoning parser; logprobs payload; echo; n > 1; stream_options
-// / include_usage trailing usage chunk; beam search; LoRA; multimodal.
+// (M3.3/M3.4); reasoning parser; logprobs payload; echo; n > 1; beam search;
+// LoRA; multimodal.
 #ifndef VLLM_ENTRYPOINTS_OPENAI_SERVING_CHAT_H_
 #define VLLM_ENTRYPOINTS_OPENAI_SERVING_CHAT_H_
 
@@ -145,10 +145,12 @@ class OpenAIServingChat {
   // shares it, see qwen3.h). Empty disables tool parsing.
   OpenAIServingChat(v1::LLMEngine& engine, std::string served_model_name,
                     ChatPromptFn prompt_fn = DefaultChatPromptFallback,
-                    std::string tool_parser_name = "hermes");
+                    std::string tool_parser_name = "hermes",
+                    bool enable_force_include_usage = false);
   OpenAIServingChat(v1::AsyncLLM& engine, std::string served_model_name,
                     ChatPromptFn prompt_fn = DefaultChatPromptFallback,
-                    std::string tool_parser_name = "hermes");
+                    std::string tool_parser_name = "hermes",
+                    bool enable_force_include_usage = false);
 
   // create_chat_completion (chat_completion/serving.py:229).
   ChatCompletionResult create_chat_completion(
@@ -169,6 +171,7 @@ class OpenAIServingChat {
   std::string served_model_name_;
   ChatPromptFn prompt_fn_;
   std::string tool_parser_name_;
+  bool enable_force_include_usage_ = false;
   // request_id is "chatcmpl-<counter>" (upstream f"chatcmpl-{random_uuid()}").
   std::atomic<int64_t> request_counter_{0};
 };

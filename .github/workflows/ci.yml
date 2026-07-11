@@ -14,6 +14,32 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
+          python3 tests/scripts/test_doc_checkpoint.py
+  documentation-checkpoint:
+    # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
+    # user-facing status surfaces in that same commit, including void attempts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Every feature checkpoint updates README and BENCHMARKS
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
+          python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.

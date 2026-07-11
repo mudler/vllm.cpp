@@ -5,6 +5,16 @@
 
 namespace vllm::entrypoints::openai {
 
+StreamUsageSelection ShouldIncludeUsage(
+    const std::optional<StreamOptions>& stream_options,
+    bool enable_force_include_usage) {
+  if (enable_force_include_usage) return {true, true};
+  if (!stream_options.has_value()) return {};
+  const bool include_usage = stream_options->include_usage;
+  return {include_usage,
+          include_usage && stream_options->continuous_usage_stats};
+}
+
 std::string SanitizeUtf8(const std::string& s) {
   // Mirrors detokenizer.cpp::LossyStep: consume one valid UTF-8 character or one
   // maximal invalid subpart per step. Valid characters (and a literal U+FFFD)

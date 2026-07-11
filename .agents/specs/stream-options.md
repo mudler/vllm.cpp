@@ -1,7 +1,7 @@
 # Spike: OpenAI stream options and usage frames
 
-**Row:** `SERVE-STREAM-USAGE` · **claim:**
-`CLAIM-SERVE-STREAM-USAGE-1` · **state:** `SPIKE`.
+**Row:** `SERVE-STREAM-USAGE` · **implementation claim:**
+`CLAIM-SERVE-STREAM-USAGE-1` (released at `GATING`) · **state:** `GATING`.
 
 ## Scope
 

@@ -302,7 +302,8 @@ std::string InVocabChatPrompt(
 // A fully-wired serving stack + ApiServer over the synthetic engine.
 struct ServerHarness {
   ServerHarness(const HfConfig& c, const Qwen3_5MoeWeights& w,
-                const Tokenizer& tok)
+                const Tokenizer& tok,
+                bool enable_force_include_usage = false)
       : scheduler(MakeSchedulerConfig(), MakeKvConfig(c), kBlockSize,
                   /*enable_caching=*/true),
         runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, kMaxModelLen * 8),
@@ -312,8 +313,9 @@ struct ServerHarness {
         async_engine(input_processor, scheduler, executor, output_processor,
                      Hasher()),
         models("test-model"),
-        completion(async_engine, "test-model"),
-        chat(async_engine, "test-model", InVocabChatPrompt),
+        completion(async_engine, "test-model", enable_force_include_usage),
+        chat(async_engine, "test-model", InVocabChatPrompt, "hermes",
+             enable_force_include_usage),
         server(completion, chat, models, "9.9.9") {}
 
   static SchedulerConfig MakeSchedulerConfig() {
@@ -394,6 +396,125 @@ TEST_CASE("api_server: streaming completion dispatch → SSE chunks ending [DONE
     json j = json::parse(chunks[i].substr(6, chunks[i].size() - 8));
     CHECK(j.at("object") == "text_completion");
   }
+}
+
+// Ported from tests/entrypoints/openai/completion/test_completion.py:
+// test_completion_stream_options @ e24d1b24.
+TEST_CASE("api_server: completion include_usage emits a final native-ID frame") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body = R"({
+    "prompt":"hello", "max_tokens":5, "temperature":0.0, "stream":true,
+    "stream_options":{"include_usage":true,
+                      "continuous_usage_stats":false}
+  })";
+  ApiServer::DispatchResult result = h.server.handle_completions(body);
+  REQUIRE(result.status == 200);
+  REQUIRE(result.sse_stream != nullptr);
+
+  std::vector<json> frames;
+  bool done_seen = false;
+  std::string chunk;
+  while (result.sse_stream->next(chunk)) {
+    if (chunk == "data: [DONE]\n\n") {
+      done_seen = true;
+      continue;
+    }
+    frames.push_back(json::parse(chunk.substr(6, chunk.size() - 8)));
+  }
+  REQUIRE(done_seen);
+  REQUIRE(frames.size() >= 2);
+  const json& usage_frame = frames.back();
+  CHECK(usage_frame.at("choices").empty());
+  REQUIRE(usage_frame.contains("usage"));
+  CHECK(usage_frame.at("usage").at("prompt_tokens").get<int>() > 0);
+  CHECK(usage_frame.at("usage").at("completion_tokens") == 5);
+  CHECK(usage_frame.at("usage").at("total_tokens").get<int>() ==
+        usage_frame.at("usage").at("prompt_tokens").get<int>() + 5);
+  for (size_t i = 0; i + 1 < frames.size(); ++i) {
+    CHECK_FALSE(frames[i].at("choices").empty());
+    CHECK_FALSE(frames[i].contains("usage"));
+  }
+}
+
+TEST_CASE("api_server: completion continuous usage is cumulative and conditional") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  SUBCASE("include_usage gates continuous usage and the final frame") {
+    ServerHarness h(c, w, Fixture());
+    const std::string body = R"({
+      "prompt":"hello", "max_tokens":5, "temperature":0.0, "stream":true,
+      "stream_options":{"include_usage":true,
+                        "continuous_usage_stats":true}
+    })";
+    ApiServer::DispatchResult result = h.server.handle_completions(body);
+    REQUIRE(result.sse_stream != nullptr);
+    int previous_completion_tokens = 0;
+    bool final_usage_seen = false;
+    std::string chunk;
+    while (result.sse_stream->next(chunk)) {
+      if (chunk == "data: [DONE]\n\n") continue;
+      const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+      REQUIRE(frame.contains("usage"));
+      const json& usage = frame.at("usage");
+      const int completion_tokens = usage.at("completion_tokens");
+      CHECK(completion_tokens >= previous_completion_tokens);
+      CHECK(usage.at("total_tokens").get<int>() ==
+            usage.at("prompt_tokens").get<int>() + completion_tokens);
+      if (frame.at("choices").empty()) {
+        final_usage_seen = true;
+        CHECK(completion_tokens == 5);
+      } else {
+        CHECK(completion_tokens > previous_completion_tokens);
+      }
+      previous_completion_tokens = completion_tokens;
+    }
+    CHECK(final_usage_seen);
+    CHECK(previous_completion_tokens == 5);
+  }
+
+  SUBCASE("continuous=true is ignored when include_usage=false") {
+    ServerHarness h(c, w, Fixture());
+    const std::string body = R"({
+      "prompt":"hello", "max_tokens":3, "temperature":0.0, "stream":true,
+      "stream_options":{"include_usage":false,
+                        "continuous_usage_stats":true}
+    })";
+    ApiServer::DispatchResult result = h.server.handle_completions(body);
+    REQUIRE(result.sse_stream != nullptr);
+    std::string chunk;
+    while (result.sse_stream->next(chunk)) {
+      if (chunk == "data: [DONE]\n\n") continue;
+      const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+      CHECK_FALSE(frame.contains("usage"));
+      CHECK_FALSE(frame.at("choices").empty());
+    }
+  }
+}
+
+TEST_CASE("api_server: stream_options reject non-stream completion and chat") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  ApiServer::DispatchResult completion = h.server.handle_completions(R"({
+    "prompt":"hello", "stream":false,
+    "stream_options":{"include_usage":true}
+  })");
+  CHECK(completion.status == 400);
+  CHECK(json::parse(completion.body).at("error").at("type") ==
+        "BadRequestError");
+
+  ApiServer::DispatchResult chat = h.server.handle_chat_completions(R"({
+    "messages":[{"role":"user","content":"hello"}], "stream":false,
+    "stream_options":{"continuous_usage_stats":true}
+  })");
+  CHECK(chat.status == 400);
+  CHECK(json::parse(chat.body).at("error").at("type") ==
+        "BadRequestError");
 }
 
 // Ported from tests/entrypoints/openai/completion/test_completion.py:259
@@ -478,6 +599,150 @@ TEST_CASE("api_server: live chat SSE emits role, content, finish, and DONE") {
   CHECK(content_frames > 0);
   CHECK(finish_seen);
   CHECK(done_seen);
+}
+
+// Ported from tests/entrypoints/openai/chat_completion/test_chat.py:
+// test_chat_completion_stream_options and
+// test_enable_force_include_usage.py:test_chat_with_enable_force_include_usage.
+TEST_CASE("api_server: chat continuous usage covers role content and final frame") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body = R"({
+    "messages":[{"role":"user","content":"hello"}],
+    "max_completion_tokens":5, "temperature":0.0, "stream":true,
+    "stream_options":{"include_usage":true,
+                      "continuous_usage_stats":true}
+  })";
+  ApiServer::DispatchResult result = h.server.handle_chat_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+
+  int previous_completion_tokens = 0;
+  bool role_seen = false;
+  bool final_usage_seen = false;
+  std::string chunk;
+  while (result.sse_stream->next(chunk)) {
+    if (chunk == "data: [DONE]\n\n") continue;
+    const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+    REQUIRE(frame.contains("usage"));
+    const int completion_tokens =
+        frame.at("usage").at("completion_tokens");
+    CHECK(completion_tokens >= previous_completion_tokens);
+    CHECK(frame.at("usage").at("total_tokens").get<int>() ==
+          frame.at("usage").at("prompt_tokens").get<int>() +
+              completion_tokens);
+    if (frame.at("choices").empty()) {
+      final_usage_seen = true;
+      CHECK(completion_tokens == 5);
+    } else {
+      const json& delta = frame.at("choices").at(0).at("delta");
+      if (delta.contains("role")) {
+        role_seen = true;
+        CHECK(completion_tokens == 0);
+      }
+    }
+    previous_completion_tokens = completion_tokens;
+  }
+  CHECK(role_seen);
+  CHECK(final_usage_seen);
+  CHECK(previous_completion_tokens == 5);
+}
+
+TEST_CASE("api_server: chat final-only usage follows the finish choice") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body = R"({
+    "messages":[{"role":"user","content":"hello"}],
+    "max_completion_tokens":4, "temperature":0.0, "stream":true,
+    "stream_options":{"include_usage":true,
+                      "continuous_usage_stats":false}
+  })";
+  ApiServer::DispatchResult result = h.server.handle_chat_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+  bool finish_seen = false;
+  bool usage_seen_after_finish = false;
+  std::string chunk;
+  while (result.sse_stream->next(chunk)) {
+    if (chunk == "data: [DONE]\n\n") continue;
+    const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+    if (frame.at("choices").empty()) {
+      CHECK(finish_seen);
+      REQUIRE(frame.contains("usage"));
+      CHECK(frame.at("usage").at("completion_tokens") == 4);
+      usage_seen_after_finish = true;
+      continue;
+    }
+    CHECK_FALSE(frame.contains("usage"));
+    if (!frame.at("choices").at(0).at("finish_reason").is_null()) {
+      finish_seen = true;
+    }
+  }
+  CHECK(finish_seen);
+  CHECK(usage_seen_after_finish);
+}
+
+TEST_CASE("api_server: force include usage applies without request options") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture(), /*enable_force_include_usage=*/true);
+
+  const std::string body = R"({
+    "messages":[{"role":"user","content":"hello"}],
+    "max_completion_tokens":4, "temperature":0.0, "stream":true
+  })";
+  ApiServer::DispatchResult result = h.server.handle_chat_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+  int final_completion_tokens = -1;
+  std::string chunk;
+  while (result.sse_stream->next(chunk)) {
+    if (chunk == "data: [DONE]\n\n") continue;
+    const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+    REQUIRE(frame.contains("usage"));
+    if (frame.at("choices").empty()) {
+      final_completion_tokens =
+          frame.at("usage").at("completion_tokens").get<int>();
+    }
+  }
+  CHECK(final_completion_tokens == 4);
+}
+
+TEST_CASE("api_server: disconnect before pending usage leaves no live request") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const std::string body = R"({
+    "prompt":"hello", "max_tokens":4, "temperature":0.0, "stream":true,
+    "stream_options":{"include_usage":true}
+  })";
+  ApiServer::DispatchResult result = h.server.handle_completions(body);
+  REQUIRE(result.sse_stream != nullptr);
+
+  bool finish_seen = false;
+  std::string chunk;
+  while (!finish_seen && result.sse_stream->next(chunk)) {
+    REQUIRE(chunk != "data: [DONE]\n\n");
+    const json frame = json::parse(chunk.substr(6, chunk.size() - 8));
+    REQUIRE_FALSE(frame.at("choices").empty());
+    finish_seen =
+        !frame.at("choices").at(0).at("finish_reason").is_null();
+  }
+  REQUIRE(finish_seen);
+
+  // The engine has already retired the terminal output, while the pull stream
+  // still owns the unconsumed empty-choice usage frame. A client disconnect
+  // at this exact boundary must be idempotent and leave no engine request.
+  result.sse_stream->abort();
+  result.sse_stream->abort();
+  for (int i = 0; i < 500 && h.async_engine.has_unfinished_requests(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK_FALSE(h.async_engine.has_unfinished_requests());
+  result.sse_stream.reset();
+  CHECK_FALSE(h.async_engine.has_unfinished_requests());
 }
 
 TEST_CASE("api_server: disconnect aborts a live SSE request") {

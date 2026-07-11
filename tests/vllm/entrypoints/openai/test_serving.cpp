@@ -69,6 +69,7 @@ using vllm::entrypoints::openai::ShapeChatDelta;
 using vllm::entrypoints::openai::ShapeChatMessage;
 using vllm::entrypoints::openai::ShapedChatMessage;
 using vllm::entrypoints::openai::ApplyToolChoiceStructuredOutput;
+using vllm::entrypoints::openai::StreamOptions;
 using vllm::entrypoints::openai::ToolChoice;
 using vllm::entrypoints::openai::ToolChoiceStructuralTagSpec;
 using vllm::entrypoints::openai::ToolParser;
@@ -477,6 +478,46 @@ TEST_CASE("serving_completion: a stop string yields finish_reason 'stop'") {
   CHECK(res.response->choices[0].text.find(stop) == std::string::npos);
 }
 
+// Ported from tests/entrypoints/openai/completion/test_completion.py:
+// test_completion_stream_options @ e24d1b24. This exercises the retained
+// synchronous serving seam; production AsyncLLM is covered by test_api_server.
+TEST_CASE("serving_completion: continuous and final usage use native token IDs") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const int kN = 6;
+  Harness h(c, w, Fixture());
+  OpenAIServingCompletion serving(h.engine, "test-model");
+
+  CompletionRequest req =
+      MakeCompletionRequest("hello", kN, /*stream=*/true);
+  req.stream_options = StreamOptions{/*include_usage=*/true,
+                                     /*continuous_usage_stats=*/true};
+  CompletionResult res = serving.create_completion(req);
+  REQUIRE(res.streaming);
+  REQUIRE(res.sse_chunks.size() >= 3);
+  CHECK(res.sse_chunks.back() == "data: [DONE]\n\n");
+
+  int previous_completion_tokens = 0;
+  for (size_t i = 0; i + 1 < res.sse_chunks.size(); ++i) {
+    const json frame = json::parse(SsePayload(res.sse_chunks[i]));
+    REQUIRE(frame.contains("usage"));
+    const int completion_tokens =
+        frame.at("usage").at("completion_tokens");
+    CHECK(completion_tokens >= previous_completion_tokens);
+    CHECK(frame.at("usage").at("total_tokens").get<int>() ==
+          frame.at("usage").at("prompt_tokens").get<int>() +
+              completion_tokens);
+    if (frame.at("choices").empty()) {
+      CHECK(i + 2 == res.sse_chunks.size());
+      CHECK(completion_tokens == kN);
+    } else {
+      CHECK(completion_tokens > previous_completion_tokens);
+    }
+    previous_completion_tokens = completion_tokens;
+  }
+  CHECK(previous_completion_tokens == kN);
+}
+
 // ─── DefaultChatPromptFallback (the Task-3 seam) ─────────────────────────────
 TEST_CASE("serving_chat: default fallback joins role: content + generation prompt") {
   std::vector<ChatMessage> msgs;
@@ -599,6 +640,44 @@ TEST_CASE("serving_chat: stream cadence is role delta, content deltas, finish, D
   CHECK(streamed == full_content);
   REQUIRE(last_finish.has_value());
   CHECK(*last_finish == "length");
+}
+
+// Ported from tests/entrypoints/openai/chat_completion/test_chat.py:
+// test_chat_completion_stream_options @ e24d1b24.
+TEST_CASE("serving_chat: continuous usage starts at role and ends empty-choice") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const int kN = 5;
+  Harness h(c, w, Fixture());
+  OpenAIServingChat serving(h.engine, "test-model", InVocabChatPrompt);
+
+  ChatCompletionRequest req = MakeChatRequest(
+      {ChatMessage{"user", std::string("hello")}}, kN, /*stream=*/true);
+  req.stream_options = StreamOptions{/*include_usage=*/true,
+                                     /*continuous_usage_stats=*/true};
+  ChatCompletionResult res = serving.create_chat_completion(req);
+  REQUIRE(res.sse_chunks.size() >= 4);
+  CHECK(res.sse_chunks.back() == "data: [DONE]\n\n");
+
+  const json role = json::parse(SsePayload(res.sse_chunks.front()));
+  CHECK(role.at("choices").at(0).at("delta").at("role") == "assistant");
+  CHECK(role.at("usage").at("prompt_tokens").get<int>() > 0);
+  CHECK(role.at("usage").at("completion_tokens") == 0);
+
+  int previous_completion_tokens = 0;
+  for (size_t i = 1; i + 1 < res.sse_chunks.size(); ++i) {
+    const json frame = json::parse(SsePayload(res.sse_chunks[i]));
+    REQUIRE(frame.contains("usage"));
+    const int completion_tokens =
+        frame.at("usage").at("completion_tokens");
+    CHECK(completion_tokens >= previous_completion_tokens);
+    if (frame.at("choices").empty()) {
+      CHECK(i + 2 == res.sse_chunks.size());
+      CHECK(completion_tokens == kN);
+    }
+    previous_completion_tokens = completion_tokens;
+  }
+  CHECK(previous_completion_tokens == kN);
 }
 
 // ─── M3.3 Task 3: tool-call serving wiring ───────────────────────────────────

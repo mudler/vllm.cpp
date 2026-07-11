@@ -74,6 +74,17 @@ must declare the combined checkpoint and explain why they cannot be toggled or
 measured separately. Missing hardware leaves the row in `GATING` with an exact
 handoff recipe; it never converts an unmeasured milestone into `DONE`.
 
+Every feature/iteration checkpoint also updates the public
+[`README.md`](../README.md) stage and
+[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) disposition **in the same
+change**. This includes an attempted benchmark that fails closed: record it as
+`FAILED` or `VOID`, name why no ratio is binding, and retain the exact next
+reproduction command. A CPU-only/non-performance feature records
+`NOT APPLICABLE` plus its correctness gates; unavailable hardware records
+`PENDING`. The append-only ledger remains the detailed evidence source, while
+`docs/BENCHMARKS.md` is the concise user-facing scoreboard and current
+checkpoint.
+
 1. **Re-measure the vLLM denominator** on the IDENTICAL workload (`vllm bench
    throughput` / `bench serve`, `~/venvs/vllm-oracle`) — same model, in/out len,
    concurrency, sampling. Its number drifts; a stale baseline is disqualifying.
@@ -87,8 +98,11 @@ handoff recipe; it never converts an unmeasured milestone into `DONE`.
    serving, include the low-concurrency sweep when latency/scheduling could
    change. For new backends, the area spike fixes representative models that fit
    the hardware without pretending a small-model gate proves 27B/35B scale.
-5. **Record every axis + every ratio** in [parity-ledger.md](parity-ledger.md).
-   A ledger row that leaves ANY axis below an applicable floor is an open gap.
+5. **Record every axis + every ratio** in [parity-ledger.md](parity-ledger.md),
+   then refresh the concise accepted/pending/failed/void summary in
+   [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) and the current stage in
+   [`README.md`](../README.md). A ledger row that leaves ANY axis below an
+   applicable floor is an open gap.
 
 ## Reproduction is a GATE
 

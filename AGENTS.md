@@ -5,14 +5,23 @@ read this first, follow the links that matter for your task, and keep the
 record updated (append to the state log) — commit it with your changes.
 Push directly to `main`.
 
-**Keep `README.md` (the user-facing status) CURRENT.** Whenever the *externally
-visible* status changes — a gate passes, a model/quant/backend moves state, a
-throughput number materially shifts, a feature lands — update the matching
-README section/table row in the SAME change (its ⚠️ header, the architecture /
-acceleration / quantization tables, and "Status & caveats"). The README must
-never lag reality: no "pending"/"not yet confirmed" for something that now
-works, and no overclaim for something that doesn't. It is part of the record,
-kept honest and current alongside the ledger.
+**Keep `README.md` (the user-facing status) CURRENT at EVERY feature/iteration
+checkpoint.** In the SAME change that advances a spike, implementation, test,
+gate, benchmark attempt, or lifecycle state, update the matching README
+section/table row with the exact current stage — including `ACTIVE`/`GATING`,
+failed or void runs, and explicit pending hardware work. Do not wait for a
+feature to land or a gate to pass. Keep its ⚠️ header, architecture /
+acceleration / quantization tables, and "Status & caveats" mutually consistent.
+The README must never lag reality and must not turn progress into support.
+
+**Keep [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) CURRENT at the SAME
+checkpoint.** Every feature/iteration records its benchmark disposition there
+in the same change: accepted numbers with exact workload/reference/evidence,
+or an explicit `PENDING`, `NOT APPLICABLE`, `FAILED`, or `VOID` reason and the
+next reproduction command. Never publish a partial/contended/stale-denominator
+number as binding. `scripts/check-doc-checkpoint.py` and its CI job enforce that
+every code/test/benchmark/spike/lifecycle commit updates both public checkpoint
+surfaces; do not weaken the checker to bypass the obligation.
 
 **Keep the ROADMAP (`.agents/roadmap_v1.md`) and its AREA MATRICES CURRENT —
 same-change obligation.** The roadmap is the single top-level portfolio table;
@@ -302,6 +311,8 @@ submitting AI-assisted code, read
   scoping reports, semantics notes, feasibility studies, and design references.
 - [.agents/state.md](.agents/state.md) — **append-only state log**: progress,
   decisions, next steps. Update this every working session.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — user-facing accepted benchmark
+  scoreboard plus the current pending/failed/void checkpoint and repro status.
 
 ## Canonical documents (outside .agents/)
 

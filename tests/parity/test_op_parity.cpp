@@ -376,6 +376,14 @@ vllm::RopeParameters ParseLongContextRopeParameters(const json& value) {
       !value["high_freq_factor"].is_null()) {
     params.high_freq_factor = value["high_freq_factor"].get<double>();
   }
+  params.short_factor =
+      value.value("short_factor", std::vector<double>{});
+  params.long_factor =
+      value.value("long_factor", std::vector<double>{});
+  if (value.contains("short_mscale") && !value["short_mscale"].is_null())
+    params.short_mscale = value["short_mscale"].get<double>();
+  if (value.contains("long_mscale") && !value["long_mscale"].is_null())
+    params.long_mscale = value["long_mscale"].get<double>();
   params.extrapolation_factor = value.value("extrapolation_factor", 1.0);
   params.attn_factor = value.value("attn_factor", 1.0);
   params.beta_fast = value.value("beta_fast", int64_t{32});
@@ -401,8 +409,14 @@ void RunLongContextRope(Backend& b, Queue& q, const fs::path& dir,
   const int64_t max_position = args["max_position"].get<int64_t>();
   const bool is_neox_style = args["is_neox_style"].get<bool>();
   const DType dtype = DtypeFromName(args["dtype"].get<std::string>());
-  auto rope = vllm::get_rope(head_size, max_position, is_neox_style, params,
-                             dtype);
+  std::shared_ptr<vllm::RotaryEmbeddingBase> rope;
+  if (args.contains("max_model_len")) {
+    rope = vllm::get_rope(head_size, max_position, is_neox_style, params,
+                          dtype, args["max_model_len"].get<int64_t>());
+  } else {
+    rope = vllm::get_rope(head_size, max_position, is_neox_style, params,
+                          dtype);
+  }
   REQUIRE(rope->type_name() == args["class_name"].get<std::string>());
 
   auto cache_want = LoadTensor(dir, m["tensors"]["cos_sin_cache"]);
@@ -411,7 +425,9 @@ void RunLongContextRope(Backend& b, Queue& q, const fs::path& dir,
   REQUIRE(ShapeOf(cache_host) == ShapeOf(cache_want.tensor));
   const double atol = m["tol"]["atol"].get<double>();
   const double rtol = m["tol"]["rtol"].get<double>();
-  RequireMatch("cos_sin_cache", cache_host, cache_want.tensor, atol, rtol);
+  const std::string case_name = dir.filename().string();
+  RequireMatch(case_name + "/cos_sin_cache", cache_host, cache_want.tensor,
+               atol, rtol);
 
   auto q_in = LoadTensor(dir, m["tensors"]["q_in"]);
   auto k_in = LoadTensor(dir, m["tensors"]["k_in"]);
@@ -436,8 +452,10 @@ void RunLongContextRope(Backend& b, Queue& q, const fs::path& dir,
 
   std::vector<uint8_t> q_host;
   std::vector<uint8_t> k_host;
-  RequireMatch("q_out", dq.Download(q, q_host), q_want.tensor, atol, rtol);
-  RequireMatch("k_out", dk.Download(q, k_host), k_want.tensor, atol, rtol);
+  RequireMatch(case_name + "/q_out", dq.Download(q, q_host), q_want.tensor,
+               atol, rtol);
+  RequireMatch(case_name + "/k_out", dk.Download(q, k_host), k_want.tensor,
+               atol, rtol);
 }
 
 // --- GDN runners (M0.7). Goldens are pinned-oracle dumps (Task 1); shapes
@@ -1585,8 +1603,9 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE + 3 W6 Llama 3.
-  CHECK(cases >= 40);
+  // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE +
+  // 3 W6 Llama 3 + 3 W7 LongRoPE.
+  CHECK(cases >= 43);
 }
 
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {

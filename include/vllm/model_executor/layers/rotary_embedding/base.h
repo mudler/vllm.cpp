@@ -1,5 +1,6 @@
 // Ported from:
-//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283
+//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283,
+//   315-335
 //   vllm/model_executor/layers/rotary_embedding/base.py:13-252,298-318
 // @ e24d1b24fe96.
 #pragma once
@@ -94,5 +95,14 @@ std::shared_ptr<RotaryEmbeddingBase> get_rope(
     int64_t head_size, int64_t max_position, bool is_neox_style,
     const RopeParameters& rope_parameters,
     vt::DType dtype = vt::DType::kF32);
+
+// Additive equivalent of pinned LongRoPE's get_current_vllm_config() lookup.
+// The original overload keeps vLLM's default short-cache choice; callers with
+// an explicit runtime max length use this overload, and the value joins the
+// memoization key so short and long configurations cannot alias.
+std::shared_ptr<RotaryEmbeddingBase> get_rope(
+    int64_t head_size, int64_t max_position, bool is_neox_style,
+    const RopeParameters& rope_parameters, vt::DType dtype,
+    int64_t max_model_len);
 
 }  // namespace vllm

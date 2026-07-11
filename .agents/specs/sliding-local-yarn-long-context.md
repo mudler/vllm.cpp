@@ -401,6 +401,31 @@ and the same four pass ASan+UBSan with leak detection. The row moves to
 `MODEL-TEXT-llama-llama-for-causal-lm` is absent, and G6/G9 feature-positive,
 two-model correctness/performance/latency/memory gates remain open.
 
+W7 checkpoint (2026-07-11): `ATTN-ROPE-LONGROPE` now mirrors the typed
+`short_factor`/`long_factor` arrays, optional per-cache magnitude overrides,
+NeoX-only restriction, exact factor-array length, default magnitude derivation,
+concatenated original/max caches and the single process-global choice between
+them. Python reads `max_model_len` from global `VllmConfig`; C++ exposes an
+additive explicit-runtime-length factory overload, preserves the original
+factory symbol, and defaults that original overload to the short cache exactly
+as pinned `ModelConfig` does when no user override is supplied. Runtime length
+joins the C++ memoization key so explicit short and long configurations cannot
+alias. The apply operator receives one selected contiguous cache view; no per-
+token threshold branch enters the hot path.
+
+Three fixtures execute the exact pinned `phi3_long_rope_scaled_rope.py` class:
+f32 short selection, bf16 long selection crossing the original boundary, and
+f32 long selection with explicit short/long mscale overrides. Regeneration is
+byte-identical. C++ vs oracle f32 caches differ by at most `1.192e-7` and
+outputs by `2.384e-7`; the bf16 cache is exact and outputs remain within
+`atol=1e-2, rtol=1.6e-2` (maximum absolute difference `1.562e-2`). Release/
+CUDA-OFF ctest passes **103/103**; four focused binaries pass **35 active cases
+/ 612 assertions** with four named dependency skips, and those four pass
+ASan+UBSan with leak detection. The row moves to `GATING`, not `DONE`: the
+shared CUDA apply path remains uncompiled/unrun, `MODEL-TEXT-phi3-phi3-for-
+causal-lm` is absent, and G6/G9 feature-positive, two-model correctness/
+performance/latency/memory gates remain open.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

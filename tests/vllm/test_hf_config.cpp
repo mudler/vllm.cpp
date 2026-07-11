@@ -495,6 +495,40 @@ TEST_CASE("LoadHfConfig retains the complete typed Llama 3 parameter slice") {
   CHECK(*cfg.rope_parameters.original_max_position_embeddings == 32);
 }
 
+TEST_CASE("LoadHfConfig retains and normalizes Phi-3 LongRoPE parameters") {
+  TempJson f(R"({
+    "model_type": "phi3",
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "max_position_embeddings": 128,
+    "rope_scaling": {
+      "type": "su",
+      "rope_theta": 10000.0,
+      "rope_dim": 8,
+      "original_max_position_embeddings": 32,
+      "short_factor": [1.0, 1.1, 1.2, 1.3],
+      "long_factor": [2.0, 2.2, 2.4, 2.6],
+      "short_mscale": 0.75,
+      "long_mscale": 1.25
+    }
+  })");
+  const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  REQUIRE(cfg.has_rope_parameters);
+  CHECK(cfg.rope_parameters.rope_type == "longrope");
+  CHECK(cfg.rotary_dim == 8);
+  CHECK(cfg.rope_parameters.short_factor ==
+        std::vector<double>{1.0, 1.1, 1.2, 1.3});
+  CHECK(cfg.rope_parameters.long_factor ==
+        std::vector<double>{2.0, 2.2, 2.4, 2.6});
+  REQUIRE(cfg.rope_parameters.short_mscale.has_value());
+  REQUIRE(cfg.rope_parameters.long_mscale.has_value());
+  CHECK(*cfg.rope_parameters.short_mscale == doctest::Approx(0.75));
+  CHECK(*cfg.rope_parameters.long_mscale == doctest::Approx(1.25));
+  REQUIRE(cfg.rope_parameters.original_max_position_embeddings.has_value());
+  CHECK(*cfg.rope_parameters.original_max_position_embeddings == 32);
+}
+
 TEST_CASE("LoadHfConfig normalizes legacy and default MRoPE dictionaries") {
   SUBCASE("legacy rope_scaling type yarn is standardized") {
     TempJson f(R"({
@@ -544,7 +578,7 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     "num_attention_heads": 4,
     "rope_parameters": )";
   SUBCASE("future formula family remains rejected until its leaf lands") {
-    TempJson f(prefix + R"({"rope_type":"longrope"}})");
+    TempJson f(prefix + R"({"rope_type":"dynamic"}})");
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("does not implement yet"),
                          std::runtime_error);
@@ -560,6 +594,13 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
                R"({"rope_type":"llama3","factor":4.0,"low_freq_factor":1.0}})");
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("llama3 rope requires"),
+                         std::runtime_error);
+  }
+  SUBCASE("LongRoPE requires both factor arrays and original context") {
+    TempJson f(prefix +
+               R"({"rope_type":"longrope","short_factor":[1.0,1.0]}})");
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("longrope requires"),
                          std::runtime_error);
   }
   SUBCASE("nested per-layer parameters cannot silently become default") {

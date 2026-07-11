@@ -9,20 +9,22 @@ Regenerate:
       tools/parity/dump_ops.py --out tests/parity/goldens'
 then commit the changed goldens. Manifests record the oracle version + pin.
 
-The W5/W6 YaRN/MRoPE/Llama 3 fixtures have their own pinned-source dumper:
+The W5-W7 YaRN/MRoPE/Llama 3/LongRoPE fixtures have their own pinned-source
+dumper:
 
     python3 tools/parity/dump_long_context.py \
-      --out tests/parity/goldens --only yarn llama3
+      --out tests/parity/goldens --only yarn llama3 longrope
 
 It first tries the installed oracle. If that import is unavailable, it verifies
 the full `/home/mudler/_git/vllm` commit and executes the exact pinned
-`common.py`, `base.py`, `yarn_scaling_rope.py`, `mrope.py`, and
-`llama3_rope.py` class code with
+`common.py`, `base.py`, `yarn_scaling_rope.py`, `mrope.py`, `llama3_rope.py`,
+and `phi3_long_rope_scaled_rope.py` class code with
 only unrelated runtime-registration scaffolding stubbed. The manifest records
 which loader produced each fixture; this fallback is not formula reimplementation.
-Tolerances: f32 tight (1e-5); bf16 cases 8e-3 (we compute in f32, upstream
-rounds to dtype mid-pipeline); RoPE pos>=32k cases 2e-2 (upstream f32 cache
-drift — see .agents/state.md 2026-07-03 note).
+Long-context tolerances: f32 `atol=rtol=1e-5`; bf16 `atol=1e-2,
+rtol=1.6e-2` (upstream rounds the cache to dtype before applying it).
+Other RoPE pos>=32k cases retain 2e-2 for the recorded upstream f32 cache drift
+(see .agents/state.md 2026-07-03 note).
 
 ## Oracle version vs upstream pin
 

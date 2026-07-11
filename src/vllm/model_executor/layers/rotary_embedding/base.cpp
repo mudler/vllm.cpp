@@ -1,5 +1,6 @@
 // Ported from:
-//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283
+//   vllm/model_executor/layers/rotary_embedding/__init__.py:30-112,243-283,
+//   315-335
 //   vllm/model_executor/layers/rotary_embedding/base.py:13-252,298-318
 // @ e24d1b24fe96.
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
@@ -14,6 +15,7 @@
 
 #include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
+#include "vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -164,6 +166,7 @@ struct RopeCacheKey {
   int64_t head_size;
   int64_t rotary_dim;
   int64_t max_position;
+  int64_t max_model_len;
   bool is_neox_style;
   RopeParameters rope_parameters;
   vt::DType dtype;
@@ -190,10 +193,28 @@ int64_t EffectiveRotaryDim(int64_t head_size,
 std::shared_ptr<RotaryEmbeddingBase> get_rope(
     int64_t head_size, int64_t max_position, bool is_neox_style,
     const RopeParameters& rope_parameters, vt::DType dtype) {
+  int64_t max_model_len = max_position;
+  if (rope_parameters.rope_type == "longrope" &&
+      rope_parameters.original_max_position_embeddings.has_value()) {
+    // Pinned ModelConfig defaults LongRoPE to its original context length to
+    // avoid degrading short prompts (config/model.py:2197-2208).
+    max_model_len = *rope_parameters.original_max_position_embeddings;
+  }
+  return get_rope(head_size, max_position, is_neox_style, rope_parameters,
+                  dtype, max_model_len);
+}
+
+std::shared_ptr<RotaryEmbeddingBase> get_rope(
+    int64_t head_size, int64_t max_position, bool is_neox_style,
+    const RopeParameters& rope_parameters, vt::DType dtype,
+    int64_t max_model_len) {
+  if (max_model_len <= 0) {
+    throw std::invalid_argument("max_model_len must be positive");
+  }
   const int64_t rotary_dim =
       EffectiveRotaryDim(head_size, rope_parameters);
-  const RopeCacheKey key{head_size, rotary_dim, max_position, is_neox_style,
-                         rope_parameters, dtype};
+  const RopeCacheKey key{head_size, rotary_dim, max_position, max_model_len,
+                         is_neox_style, rope_parameters, dtype};
 
   static std::mutex cache_mutex;
   static std::vector<
@@ -232,6 +253,21 @@ std::shared_ptr<RotaryEmbeddingBase> get_rope(
         *rope_parameters.low_freq_factor,
         *rope_parameters.high_freq_factor,
         *rope_parameters.original_max_position_embeddings);
+  } else if (rope_parameters.rope_type == "longrope") {
+    if (!rope_parameters.original_max_position_embeddings.has_value() ||
+        rope_parameters.short_factor.empty() ||
+        rope_parameters.long_factor.empty()) {
+      throw std::invalid_argument(
+          "LongRoPE requires short_factor, long_factor, and "
+          "original_max_position_embeddings");
+    }
+    embedding = std::make_shared<Phi3LongRoPEScaledRotaryEmbedding>(
+        head_size, rotary_dim, max_position,
+        *rope_parameters.original_max_position_embeddings,
+        rope_parameters.rope_theta, is_neox_style, dtype,
+        rope_parameters.short_factor, rope_parameters.long_factor,
+        rope_parameters.short_mscale, rope_parameters.long_mscale,
+        max_model_len);
   } else if (rope_parameters.rope_type == "yarn") {
     if (!rope_parameters.factor.has_value() ||
         !rope_parameters.original_max_position_embeddings.has_value()) {

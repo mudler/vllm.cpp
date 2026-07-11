@@ -1,7 +1,7 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
 // vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
 // normalization mirrors vllm/transformers_utils/config.py:439-509 and
-// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283
+// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283,315-335
 // @ e24d1b24fe96.
 #include "vllm/transformers_utils/hf_config.h"
 
@@ -49,6 +49,13 @@ std::vector<int64_t> GetIntArray(const nlohmann::json& doc, const char* key) {
   auto it = doc.find(key);
   if (it == doc.end() || it->is_null()) return {};
   return it->get<std::vector<int64_t>>();
+}
+
+std::vector<double> GetDoubleArray(const nlohmann::json& doc,
+                                   const char* key) {
+  auto it = doc.find(key);
+  if (it == doc.end() || it->is_null()) return {};
+  return it->get<std::vector<double>>();
 }
 
 std::optional<double> GetOptionalDouble(const nlohmann::json& doc,
@@ -186,6 +193,10 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
       GetOptionalInt(*raw, "original_max_position_embeddings");
   params.low_freq_factor = GetOptionalDouble(*raw, "low_freq_factor");
   params.high_freq_factor = GetOptionalDouble(*raw, "high_freq_factor");
+  params.short_factor = GetDoubleArray(*raw, "short_factor");
+  params.long_factor = GetDoubleArray(*raw, "long_factor");
+  params.short_mscale = GetOptionalDouble(*raw, "short_mscale");
+  params.long_mscale = GetOptionalDouble(*raw, "long_mscale");
   params.extrapolation_factor =
       GetDouble(*raw, "extrapolation_factor", 1.0);
   params.attn_factor = GetDouble(*raw, "attn_factor", 1.0);
@@ -233,12 +244,26 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
           "original_max_position_embeddings must be finite and positive in " +
           path);
     }
+  } else if (params.rope_type == "longrope") {
+    if (!params.original_max_position_embeddings.has_value() ||
+        params.short_factor.empty() || params.long_factor.empty()) {
+      throw std::runtime_error(
+          "hf_config: longrope requires short_factor, long_factor, and "
+          "original_max_position_embeddings in " +
+          path);
+    }
+    if (*params.original_max_position_embeddings <= 0) {
+      throw std::runtime_error(
+          "hf_config: longrope original_max_position_embeddings must be "
+          "positive in " +
+          path);
+    }
   } else if (params.rope_type != "default") {
-    // W7-W8 add their own typed fields and factory cases before relaxing this.
+    // W8 adds its own typed fields and factory cases before relaxing this.
     throw std::runtime_error(
         "hf_config: checkpoint declares rope type '" + params.rope_type +
         "' which vllm.cpp does not implement yet (supported: default, yarn, "
-        "llama3) in " + path);
+        "llama3, longrope) in " + path);
   }
 
   if (!params.rope_dim.has_value() &&

@@ -4,7 +4,8 @@
 //   tests/kernels/core/test_apply_rotary_emb.py:43-203
 //   tests/models/language/pooling/test_nomic_max_model_len.py:93-111
 // and pinned class behavior in rotary_embedding/{__init__,base,common,
-// yarn_scaling_rope,mrope,llama3_rope}.py @ e24d1b24fe96.
+// yarn_scaling_rope,mrope,llama3_rope,phi3_long_rope_scaled_rope}.py
+// @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -16,6 +17,7 @@
 #include "vllm/model_executor/layers/rotary_embedding/common.h"
 #include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
+#include "vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.h"
 #include "vt/dtype.h"
 
@@ -52,6 +54,17 @@ vllm::RopeParameters Llama3Parameters() {
   params.low_freq_factor = 1.0;
   params.high_freq_factor = 4.0;
   params.original_max_position_embeddings = 32;
+  return params;
+}
+
+vllm::RopeParameters LongRoPEParameters() {
+  vllm::RopeParameters params;
+  params.rope_type = "longrope";
+  params.rope_theta = 10000.0;
+  params.rope_dim = 8;
+  params.original_max_position_embeddings = 32;
+  params.short_factor = {1.0, 1.1, 1.2, 1.3};
+  params.long_factor = {2.0, 2.2, 2.4, 2.6};
   return params;
 }
 
@@ -266,6 +279,99 @@ TEST_CASE("Llama 3 equal frequency factors avoid a singular smoothing path") {
                        std::invalid_argument);
 }
 
+TEST_CASE("Phi-3 LongRoPE builds both caches and selects one globally") {
+  const vllm::RopeParameters params = LongRoPEParameters();
+  auto short_rope =
+      vllm::get_rope(16, 128, true, params, vt::DType::kF32);
+  auto short_again = vllm::get_rope(16, 128, true, params,
+                                    vt::DType::kF32, 32);
+  auto long_rope = vllm::get_rope(16, 128, true, params,
+                                  vt::DType::kF32, 33);
+  REQUIRE(short_rope == short_again);
+  REQUIRE(short_rope != long_rope);
+  REQUIRE(short_rope->type_name() ==
+          "Phi3LongRoPEScaledRotaryEmbedding");
+  CHECK(short_rope->cache_rows() == 160);
+  CHECK(long_rope->cache_rows() == 160);
+
+  auto short_phi = std::dynamic_pointer_cast<
+      vllm::Phi3LongRoPEScaledRotaryEmbedding>(short_rope);
+  auto long_phi = std::dynamic_pointer_cast<
+      vllm::Phi3LongRoPEScaledRotaryEmbedding>(long_rope);
+  REQUIRE(short_phi != nullptr);
+  REQUIRE(long_phi != nullptr);
+  CHECK_FALSE(short_phi->use_long_rope());
+  CHECK(long_phi->use_long_rope());
+  CHECK(short_phi->max_model_len() == 32);
+  CHECK(long_phi->max_model_len() == 33);
+
+  const double default_mscale =
+      std::sqrt(1.0 + std::log(4.0) / std::log(32.0));
+  CHECK(short_phi->short_mscale() == doctest::Approx(default_mscale));
+  CHECK(short_phi->long_mscale() == doctest::Approx(default_mscale));
+  CHECK(CacheValue(*short_rope, 0, 0) ==
+        doctest::Approx(default_mscale));
+  CHECK(CacheValue(*short_rope, 32, 0) ==
+        doctest::Approx(default_mscale));
+
+  for (int64_t pair = 0; pair < 4; ++pair) {
+    const float exponent = static_cast<float>(2 * pair) / 8.0F;
+    const float base_inv = 1.0F / std::pow(10000.0F, exponent);
+    const float short_angle =
+        std::atan2(CacheValue(*short_rope, 1, 4 + pair),
+                   CacheValue(*short_rope, 1, pair));
+    const float long_angle =
+        std::atan2(CacheValue(*short_rope, 33, 4 + pair),
+                   CacheValue(*short_rope, 33, pair));
+    CHECK(short_angle == doctest::Approx(
+                             base_inv / params.short_factor[pair])
+                             .epsilon(1e-5));
+    CHECK(long_angle == doctest::Approx(base_inv / params.long_factor[pair])
+                            .epsilon(1e-5));
+  }
+}
+
+TEST_CASE("Phi-3 LongRoPE mirrors mscale and validation boundaries") {
+  vllm::RopeParameters params = LongRoPEParameters();
+  params.short_mscale = 0.75;
+  params.long_mscale = 1.25;
+  auto rope = vllm::get_rope(16, 128, true, params, vt::DType::kF32, 128);
+  auto phi = std::dynamic_pointer_cast<
+      vllm::Phi3LongRoPEScaledRotaryEmbedding>(rope);
+  REQUIRE(phi != nullptr);
+  CHECK(phi->use_long_rope());
+  CHECK(phi->short_mscale() == doctest::Approx(0.75));
+  CHECK(phi->long_mscale() == doctest::Approx(1.25));
+  CHECK(CacheValue(*rope, 0, 0) == doctest::Approx(0.75));
+  CHECK(CacheValue(*rope, 32, 0) == doctest::Approx(1.25));
+
+  std::vector<int64_t> positions = {0};
+  std::vector<float> query(16, 1.0F);
+  vt::Tensor tp = vt::Tensor::Contiguous(positions.data(), vt::DType::kI64,
+                                         Cpu(), {1});
+  vt::Tensor tq = vt::Tensor::Contiguous(query.data(), vt::DType::kF32,
+                                         Cpu(), {1, 1, 16});
+  vt::Queue queue{Cpu(), nullptr};
+  CHECK_THROWS_WITH_AS(rope->forward_native(queue, tp, tq, nullptr),
+                       doctest::Contains("requires a key tensor"),
+                       std::invalid_argument);
+
+  CHECK_THROWS_WITH_AS(
+      vllm::get_rope(16, 128, false, params, vt::DType::kF32, 128),
+      doctest::Contains("only supports neox_style"), std::invalid_argument);
+
+  params.short_factor.pop_back();
+  CHECK_THROWS_WITH_AS(
+      vllm::get_rope(16, 128, true, params, vt::DType::kF32, 128),
+      doctest::Contains("rotary_dim/2"), std::invalid_argument);
+
+  params = LongRoPEParameters();
+  params.long_factor.clear();
+  CHECK_THROWS_WITH_AS(vllm::get_rope(16, 128, true, params),
+                       doctest::Contains("requires short_factor"),
+                       std::invalid_argument);
+}
+
 TEST_CASE("mrope next text positions mirror three equal streams") {
   const auto positions =
       vllm::MRotaryEmbedding::get_next_input_positions(5, 3, 7);
@@ -296,4 +402,11 @@ TEST_CASE("Llama 3 feature-positive e2e remains a model dependency" *
           doctest::description("MODEL-TEXT-llama-llama-for-causal-lm")) {
   MESSAGE("SKIP MODEL-TEXT-llama-llama-for-causal-lm: the Llama model family "
           "is not ported; W6 closes formula/cache/operator parity only");
+}
+
+TEST_CASE("Phi-3 LongRoPE feature-positive e2e remains a model dependency" *
+          doctest::skip(true) *
+          doctest::description("MODEL-TEXT-phi3-phi3-for-causal-lm")) {
+  MESSAGE("SKIP MODEL-TEXT-phi3-phi3-for-causal-lm: the Phi-3 model family "
+          "is not ported; W7 closes formula/cache/operator parity only");
 }

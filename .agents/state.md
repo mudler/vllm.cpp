@@ -3595,3 +3595,51 @@ W8 dynamic-NTK, changes to W5/W6 formula semantics, a Phi-3 model port, and GPU
 work are outside this claim. `CLAIM-SERVE-GATE-1` continues to own `/tmp/gpu`,
 so W7 begins with CPU, exact-class oracle and sanitizer work only and will leave
 CUDA/model/G9 evidence as an explicit gating handoff.
+
+## 2026-07-11 — C5 W7 Phi-3 LongRoPE implemented and handed to gating
+
+`CLAIM-C5-LONGROPE-1` is released and `ATTN-ROPE-LONGROPE` moves `ACTIVE ->
+GATING`, never `DONE`. W7 adds typed short/long factor arrays and optional
+mscales, the exact pinned two-cache formula, strict NeoX layout and factor-array
+length checks, and a once-per-engine short/long selection from runtime
+`max_model_len`. The original `get_rope` symbol remains present and defaults
+LongRoPE to its original context/short cache like pinned `ModelConfig`; an
+additive overload accepts the explicit runtime length, and the value joins the
+cache key. The selected cache is a contiguous view into the concatenated owned
+cache, leaving W5's supplied-cache CPU/CUDA hot path unchanged.
+
+The direct-source oracle verifies full commit
+`e24d1b24fe96a56ba8b0d653efa076d03eb95d6c` and executes the exact
+`phi3_long_rope_scaled_rope.py`. Three fixtures cover f32 short selection, bf16
+long selection across the original-context boundary, and f32 explicit mscale
+overrides. Regeneration to `/tmp/vllm-cpp-w7-goldens-repro` is byte-identical.
+
+Fresh local evidence, with no DGX command beyond read-only monitoring:
+
+- clean Release/CUDA-OFF build and full ctest pass **103/103**;
+- `test_hf_config` passes **14 / 147**, `test_rotary_embedding` passes **11 /
+  207** with four named model/TP dependency skips, `test_ops_rope_cache` passes
+  **5 / 156**, and `test_op_parity` passes **5 / 102**;
+- those four focused binaries pass Debug ASan+UBSan **4/4** with leak detection;
+- f32 cache/output maximum absolute differences versus the pinned class are
+  `1.192e-7`/`2.384e-7`; bf16 cache is exact and output maximum absolute
+  difference is `1.562e-2`, within `atol=1e-2, rtol=1.6e-2`;
+- the generic golden floor rises from 40 to 43; and
+- `nm -C` confirms both the original five-argument-effective factory symbol
+  and the additive runtime-length overload.
+
+At 05:07 UTC the serving campaign completed our full 27B arm and transitioned
+to matched vLLM 27B load/warmup (`VLLM::EngineCore`, 69,074 MiB, 77% GPU); both
+35B arms remained queued inside the same lock. W7 did not enqueue or contaminate
+that series. Remaining handoff: compile/run the shared CUDA apply path on an
+idle GB10, land `MODEL-TEXT-phi3-phi3-for-causal-lm`, run a beyond-original-
+context token-exact comparison, and close G6/G9 correctness/performance/
+latency/memory. W8 `ATTN-ROPE-DYNAMIC-NTK` is the next dependency-ready C5 leaf.
+
+## 2026-07-11 — DGX serving-campaign read-only progress check (05:13 UTC)
+
+The matched vLLM 27B arm is now running measurement points under the same
+unbroken `/tmp/gpu` hold: c1 greedy completed and c2 greedy repetition 2 is
+active. `VLLM::EngineCore` holds 70,350 MiB. Both 35B arms remain after the
+rest of the vLLM 27B greedy/sampled sweep. This inspection was read-only and
+did not alter or enqueue behind the campaign.

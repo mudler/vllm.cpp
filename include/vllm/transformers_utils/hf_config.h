@@ -1,7 +1,7 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
 // vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
 // normalization mirrors vllm/transformers_utils/config.py:439-509 and
-// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283
+// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283,315-335
 // @ e24d1b24fe96.
 #pragma once
 
@@ -31,6 +31,11 @@ struct RopeParameters {
   // Llama 3 frequency-band boundaries. Required only for rope_type=llama3.
   std::optional<double> low_freq_factor = std::nullopt;
   std::optional<double> high_freq_factor = std::nullopt;
+  // Phi-3 LongRoPE frequency divisors and optional per-cache magnitudes.
+  std::vector<double> short_factor;
+  std::vector<double> long_factor;
+  std::optional<double> short_mscale = std::nullopt;
+  std::optional<double> long_mscale = std::nullopt;
   // Remaining YaRN-only controls.
   double extrapolation_factor = 1.0;
   double attn_factor = 1.0;

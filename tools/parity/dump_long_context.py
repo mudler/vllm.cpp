@@ -7,9 +7,10 @@ sys.path, for example:
   ~/venvs/vllm-oracle/bin/python tools/parity/dump_long_context.py \
       --out tests/parity/goldens --only yarn
 
-The W5 matrix deliberately uses small original context lengths while sampling
-the same boundary set {0, 1, original-1, original, scaled-max-1}. Full cache
-tensors are therefore committed without multi-megabyte fixtures.
+The W5-W7 matrix deliberately uses small original context lengths while
+sampling the relevant boundary set {0, 1, original-1, original,
+scaled-max-1}. Full cache tensors are therefore committed without multi-
+megabyte fixtures.
 """
 
 import argparse
@@ -29,6 +30,7 @@ BF16_TOL = {"atol": 1e-2, "rtol": 1.6e-2}
 
 UPSTREAM_PIN = "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c"
 _ROPE_FACTORY = None
+_DIRECT_SOURCE_ROPE_FACTORY = None
 _ORACLE_LOADER = "installed-vllm"
 
 
@@ -57,9 +59,9 @@ def _direct_source_factory():
     absent. The RoPE files only need CustomOp/platform registration scaffolding
     to execute their PyTorch-native cache and forward methods. This fallback
     stubs that scaffolding, but imports and executes the pinned common.py,
-    base.py, yarn_scaling_rope.py, mrope.py and llama3_rope.py files verbatim.
-    It is therefore a direct-source oracle, not a reimplementation of their
-    formulas.
+    base.py, yarn_scaling_rope.py, mrope.py, llama3_rope.py and
+    phi3_long_rope_scaled_rope.py files verbatim. It is therefore a
+    direct-source oracle, not a reimplementation of their formulas.
     """
     upstream = pathlib.Path(
         os.environ.get("VLLM_UPSTREAM_DIR", "/home/mudler/_git/vllm")
@@ -104,9 +106,26 @@ def _direct_source_factory():
     custom_op.CustomOp = CustomOp
     sys.modules[custom_op.__name__] = custom_op
 
+    class LoggerAdapter:
+        def __init__(self, name):
+            self._logger = __import__("logging").getLogger(name)
+
+        def __getattr__(self, name):
+            return getattr(self._logger, name)
+
+        def warning_once(self, message, *args, **kwargs):
+            self._logger.warning(message, *args, **kwargs)
+
     logger = types.ModuleType("vllm.logger")
-    logger.init_logger = lambda name: __import__("logging").getLogger(name)
+    logger.init_logger = LoggerAdapter
     sys.modules[logger.__name__] = logger
+
+    runtime_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(max_model_len=0)
+    )
+    config = types.ModuleType("vllm.config")
+    config.get_current_vllm_config = lambda: runtime_config
+    sys.modules[config.__name__] = config
 
     class Platform:
         @staticmethod
@@ -168,6 +187,10 @@ def _direct_source_factory():
         "vllm.model_executor.layers.rotary_embedding.llama3_rope",
         rope_dir / "llama3_rope.py",
     )
+    longrope_module = _load_module(
+        "vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope",
+        rope_dir / "phi3_long_rope_scaled_rope.py",
+    )
 
     def factory(
         head_size,
@@ -175,6 +198,7 @@ def _direct_source_factory():
         is_neox_style=True,
         rope_parameters=None,
         dtype=None,
+        max_model_len=None,
     ):
         if dtype is None:
             dtype = torch.get_default_dtype()
@@ -202,9 +226,31 @@ def _direct_source_factory():
                 params["high_freq_factor"],
                 params["original_max_position_embeddings"],
             )
+        if rope_type == "longrope":
+            if max_model_len is None:
+                raise ValueError("direct-source LongRoPE requires max_model_len")
+            runtime_config.model_config.max_model_len = max_model_len
+            extra = {
+                key: params[key]
+                for key in ("short_mscale", "long_mscale")
+                if key in params
+            }
+            return longrope_module.Phi3LongRoPEScaledRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                params["original_max_position_embeddings"],
+                base,
+                is_neox_style,
+                dtype,
+                params["short_factor"],
+                params["long_factor"],
+                **extra,
+            )
         if rope_type != "yarn":
             raise ValueError(
-                "direct-source long-context loader only accepts yarn or llama3"
+                "direct-source long-context loader only accepts yarn, "
+                "llama3, or longrope"
             )
         factor = params["factor"]
         original = params["original_max_position_embeddings"]
@@ -249,6 +295,14 @@ def _direct_source_factory():
     return factory
 
 
+def _get_direct_source_rope_factory():
+    global _DIRECT_SOURCE_ROPE_FACTORY, _ORACLE_LOADER
+    if _DIRECT_SOURCE_ROPE_FACTORY is None:
+        _DIRECT_SOURCE_ROPE_FACTORY = _direct_source_factory()
+    _ORACLE_LOADER = "verified-pinned-direct-source"
+    return _DIRECT_SOURCE_ROPE_FACTORY
+
+
 def _get_rope_factory():
     global _ROPE_FACTORY, _ORACLE_LOADER
     if _ROPE_FACTORY is not None:
@@ -262,8 +316,7 @@ def _get_rope_factory():
             f"full vLLM import unavailable ({error}); using verified pinned "
             "direct-source class loader"
         )
-        _ROPE_FACTORY = _direct_source_factory()
-        _ORACLE_LOADER = "verified-pinned-direct-source"
+        _ROPE_FACTORY = _get_direct_source_rope_factory()
     return _ROPE_FACTORY
 
 
@@ -278,24 +331,39 @@ def _dump_case(
     dtype: torch.dtype,
     positions: torch.Tensor,
     seed: int,
+    max_model_len: int | None = None,
     num_q_heads: int = 2,
     num_kv_heads: int = 1,
 ) -> None:
     torch.manual_seed(seed)
-    get_rope = _get_rope_factory()
-    rope = get_rope(
+    get_rope = (
+        _get_direct_source_rope_factory()
+        if max_model_len is not None
+        else _get_rope_factory()
+    )
+    factory_args = dict(
         head_size=head_size,
         max_position=max_position,
         is_neox_style=is_neox_style,
         rope_parameters=rope_parameters,
         dtype=dtype,
     )
+    if max_model_len is not None:
+        factory_args["max_model_len"] = max_model_len
+    rope = get_rope(**factory_args)
     tokens = positions.shape[-1]
     query = torch.randn(tokens, num_q_heads * head_size, dtype=dtype)
     key = torch.randn(tokens, num_kv_heads * head_size, dtype=dtype)
-    query_out, key_out = rope.forward_native(
-        positions, query.clone(), key.clone()
-    )
+    if hasattr(rope, "forward_native"):
+        query_out, key_out = rope.forward_native(
+            positions, query.clone(), key.clone()
+        )
+        cache = rope.cos_sin_cache
+    else:
+        query_out, key_out = rope.forward(
+            positions, query.clone(), key.clone()
+        )
+        cache = rope.long_short_cos_sin_cache
     args = {
         "head_size": head_size,
         "max_position": max_position,
@@ -308,12 +376,14 @@ def _dump_case(
         "seed": seed,
         "oracle_loader": _ORACLE_LOADER,
     }
+    if max_model_len is not None:
+        args["max_model_len"] = max_model_len
     save_case(
         root,
         name,
         "long_context_rope",
         {
-            "cos_sin_cache": rope.cos_sin_cache,
+            "cos_sin_cache": cache,
             "positions": positions,
             "q_in": query,
             "k_in": key,
@@ -488,7 +558,66 @@ def dump_llama3(root: pathlib.Path) -> None:
     )
 
 
-DUMPERS = {"yarn": dump_yarn, "llama3": dump_llama3}
+def dump_longrope(root: pathlib.Path) -> None:
+    original = 32
+    max_position = 128
+    short_positions = torch.tensor(
+        [0, 1, original - 1], dtype=torch.int64
+    )
+    long_positions = torch.tensor(
+        [0, 1, original - 1, original, max_position - 1], dtype=torch.int64
+    )
+    base = {
+        "rope_type": "longrope",
+        "rope_theta": 10000.0,
+        "rope_dim": 8,
+        "original_max_position_embeddings": original,
+        "short_factor": [1.0, 1.1, 1.2, 1.3],
+        "long_factor": [2.0, 2.2, 2.4, 2.6],
+    }
+    _dump_case(
+        root,
+        "long_rope_phi3_neox_f32_short",
+        head_size=16,
+        max_position=max_position,
+        max_model_len=original,
+        is_neox_style=True,
+        rope_parameters=base,
+        dtype=torch.float32,
+        positions=short_positions,
+        seed=301,
+    )
+    _dump_case(
+        root,
+        "long_rope_phi3_neox_bf16_long",
+        head_size=16,
+        max_position=max_position,
+        max_model_len=max_position,
+        is_neox_style=True,
+        rope_parameters=base,
+        dtype=torch.bfloat16,
+        positions=long_positions,
+        seed=302,
+    )
+    _dump_case(
+        root,
+        "long_rope_phi3_neox_f32_mscale_override",
+        head_size=16,
+        max_position=max_position,
+        max_model_len=max_position,
+        is_neox_style=True,
+        rope_parameters={
+            **base,
+            "short_mscale": 0.75,
+            "long_mscale": 1.25,
+        },
+        dtype=torch.float32,
+        positions=long_positions,
+        seed=303,
+    )
+
+
+DUMPERS = {"yarn": dump_yarn, "llama3": dump_llama3, "longrope": dump_longrope}
 
 
 if __name__ == "__main__":

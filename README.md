@@ -77,7 +77,9 @@ runs end-to-end on CPU:
 - **OpenAI server** — basic `/v1/completions` and `/v1/chat/completions`
   transport (non-streaming plus **live incremental SSE** over an `AsyncLLM`
   engine thread), concurrent requests through one scheduler, and disconnect
-  abort; `/v1/models`, `/health`, and `/version` are present, while `/health`
+  abort; `--max-num-seqs` and `--max-num-batched-tokens` expose reproducible
+  scheduler operating points. `/v1/models`, `/health`, and `/version` are
+  present, while `/health`
   currently reports process liveness rather than probing engine health. The
   async path passes the full CPU suite and ThreadSanitizer; its post-change
   GB10 token/latency/throughput/memory gates are still pending. Chat templates
@@ -119,7 +121,8 @@ ctest --test-dir build            # the behavioral suite
 cmake -S . -B build -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
 
 # Serve a supported Qwen text checkpoint (safetensors dir or supported 35B .gguf)
-./build/examples/server --model /path/to/Qwen3.6-35B-A3B --port 8000
+./build/examples/server --model /path/to/Qwen3.6-35B-A3B --port 8000 \
+  --max-num-seqs 32 --max-num-batched-tokens 8192
 # then: curl localhost:8000/v1/chat/completions -d '{"model":"...","messages":[...]}'
 
 # Or a one-shot completion via the CLI (drives the C ABI end-to-end)

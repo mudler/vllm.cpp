@@ -9,6 +9,7 @@
 //          [--tokenizer-config <tokenizer_config.json>]
 //          [--served-model-name <name>]
 //          [--block-size N] [--num-blocks N] [--max-model-len N]
+//          [--max-num-seqs N] [--max-num-batched-tokens N]
 //          [--scheduling-policy fcfs|priority]
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
@@ -68,6 +69,8 @@ struct Args {
   int block_size = 32;
   int num_blocks = 256;
   int max_model_len = 0;  // 0 => config.max_position_embeddings
+  int max_num_seqs = 8;
+  int max_num_batched_tokens = 0;  // 0 => per-architecture default.
   // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
   // --scheduling-policy / SchedulerConfig.policy).
   std::string scheduling_policy = "fcfs";
@@ -79,6 +82,8 @@ struct Args {
       << " --model <dir> [--host H] [--port P] [--tokenizer-config F]\n"
          "               [--served-model-name N] [--block-size N] "
          "[--num-blocks N] [--max-model-len N]\n"
+         "               [--max-num-seqs N] "
+         "[--max-num-batched-tokens N]\n"
          "               [--scheduling-policy fcfs|priority]\n";
   std::exit(code);
 }
@@ -108,6 +113,10 @@ Args ParseArgs(int argc, char** argv) {
       a.num_blocks = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--max-model-len") {
       a.max_model_len = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--max-num-seqs") {
+      a.max_num_seqs = std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--max-num-batched-tokens") {
+      a.max_num_batched_tokens = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--scheduling-policy") {
       a.scheduling_policy = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "-h" || flag == "--help") {
@@ -119,6 +128,11 @@ Args ParseArgs(int argc, char** argv) {
   }
   if (a.model_dir.empty()) {
     std::cerr << "server: --model <dir> is required\n";
+    Usage(argv[0], 2);
+  }
+  if (a.max_num_seqs <= 0 || a.max_num_batched_tokens < 0) {
+    std::cerr << "server: scheduler capacities must be positive "
+                 "(--max-num-batched-tokens may be 0 for auto)\n";
     Usage(argv[0], 2);
   }
   return a;
@@ -153,6 +167,8 @@ int main(int argc, char** argv) {
     engine_params.block_size = args.block_size;
     engine_params.num_blocks = args.num_blocks;
     engine_params.max_model_len = args.max_model_len;  // 0 => from config.
+    engine_params.max_num_seqs = args.max_num_seqs;
+    engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
     // Reject an unknown policy string (mirrors upstream SchedulingPolicy(value)).
     engine_params.policy = vllm::SchedulerPolicyFromString(args.scheduling_policy);
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =

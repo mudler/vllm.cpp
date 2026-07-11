@@ -598,6 +598,17 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
 4. **Server e2e**: OpenAI-endpoint conformance (streaming chunks, stop handling,
    usage accounting, error shapes), health/metrics; runs in CI with the 0.6B
    model on CPU ref backend, nightly on dgx.casa with gate models.
-5. **The gate benchmark**: `bench serve`-equivalent (request-rate sweeps,
-   concurrency ladders; prefill-heavy, decode-heavy, mixed) vs vLLM on the same
-   GB10 — TTFT, ITL, prompt+gen tokens/s. Regression-tracked per commit.
+5. **The gate benchmark**: the unmodified pip-vLLM 0.24.0 `bench serve` oracle
+   (contract-audited against `e24d1b24`) is now wrapped by the committed
+   `tools/bench/online_gate*.py` and `scripts/dgx-online-serving.sh` harness
+   (ported command/schema contracts in
+   `tests/tools/test_online_gate_*.py`). It freezes exact 1024-token partitions,
+   runs c1/2/4/8/16/32 with three interleaved ours/vLLM repetitions under one
+   model-wide lock and an identical 32-sequence/per-model-token-budget
+   scheduler configuration, retains detailed TTFT/TPOT/ITL/E2EL arrays, compares
+   deterministic outputs, samples process-tree/GPU memory and thermal/power,
+   verifies memory return, refreshes targets from a clean exact HEAD, hashes the
+   executable pip-oracle runtime, and records an ours-nsys/vLLM-torch-profiler
+   trace pair. Any missing/failed/short/hash-drifted artifact or below-vLLM axis is
+   non-binding. CPU harness contracts are green; the current-main DGX campaigns
+   remain open under `SERVE-GATE-ONLINE`.

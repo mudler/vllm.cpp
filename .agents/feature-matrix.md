@@ -164,7 +164,7 @@ is configured, exactly as upstream loads its draft model on demand.
 | AsyncLLM-equivalent streaming engine API | `v1/engine/async_llm.py` | 🚧 **T0 `GATING`** | W2 implements per-request coalescing collectors, output handler, concurrent generate/abort, live completion/chat SSE and disconnect abort; full CPU 94/94 + focused TSan 5/5 pass. GB10 token-exactness, streaming-reality, throughput and memory gates remain before `DONE` | [async-serving.md](specs/async-serving.md) |
 | C API library (llama.cpp-style, 17-symbol ABI) | — (our packaging) | `ANCHOR-BACKFILL` T0 | dlopen/FFI proof now includes six additive nonblocking request submit/cancel/wait/done/error/free symbols over AsyncLLM; CPU/TSan green, not a claim of LocalAI integration | `planned: specs/c-api-library.md` |
 | Rich C++ API (`LLM`/`AsyncLLM` mirror) | `entrypoints/llm.py` | ☐ T1 | | `planned: specs/cpp-api.md` |
-| CLI: `serve` + `bench {latency,throughput,serve}` | `entrypoints/cli/` | `PARTIAL` T0 | separate server/bench binaries and one in-process benchmark; no matching command family | `planned: specs/cli-serve-bench.md` |
+| CLI: `serve` + `bench {latency,throughput,serve}` | `entrypoints/cli/` | `PARTIAL` T0 | separate server/bench binaries and one in-process benchmark; server now exposes `max_num_seqs`/`max_num_batched_tokens` for reproducible operating points, but no matching command family | `planned: specs/cli-serve-bench.md` |
 | CLI: `chat`, `complete` | `entrypoints/cli/` | ☐ T1 | examples/cli covers basic complete | `planned: specs/cli-chat-complete.md` |
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | ☐ T2 | with pooling models (§4) | `planned: specs/pooling-endpoints.md` |
 | `/v1/responses`, `/v1/messages` (Anthropic-style), audio | responses/messages routers | ☐ T2 | | `planned: specs/responses-messages-endpoints.md` |
@@ -216,7 +216,7 @@ evidence.
 | GGUF reader + Qwen MoE transform mapping + embedded BPE | no pinned-vLLM implementation; llama.cpp-compatible deviation | `PARTIAL` T0 | 35B real-file parity works; dense and format/compute breadth remain open | `planned: specs/gguf-loader.md` |
 | HF `tokenizer.json` byte-level BPE + incremental detok | `tokenizers/registry.py`, `tokenizers/hf.py` | `ANCHOR-BACKFILL` T0 | bounded Qwen byte-BPE slice; deviations need leaf accounting | `planned: specs/hf-tokenizer.md` |
 | SentencePiece tokenizer | same | ☐ T1 | needed for Llama-2-era / Gemma checkpoints | `planned: specs/sentencepiece.md` |
-| Config surface: dataclass-for-dataclass structs, `vllm serve`-compatible flags | `vllm/config/` | `PARTIAL` T0/T1 | gate-model structs and a small CLI subset only | `planned: specs/config-surface.md` |
+| Config surface: dataclass-for-dataclass structs, `vllm serve`-compatible flags | `vllm/config/` | `PARTIAL` T0/T1 | gate-model structs and a small CLI subset incl. explicit scheduler sequence/token budgets only | `planned: specs/config-surface.md` |
 | Sharded-state / tensorizer / runai / BnB loaders | `model_loader/` | ☐ T3 | | `planned: specs/loader-longtail.md` |
 
 ---

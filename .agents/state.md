@@ -3795,3 +3795,46 @@ current-main ours/vLLM A/B series. This is orchestration hardening, not a server
 fix or performance result. Current W2 still requires a fresh CUDA build,
 reproduction of the 35B fault under sanitizer if it persists, and both-model
 G1/G3-G6 evidence.
+
+## 2026-07-11 — online-gate harness is committed-quality and fail-closed
+
+`CLAIM-SERVE-GATE-1` now has a repository-owned execution path instead of the
+ad-hoc pre-W2 remote scripts. `tools/bench/online_gate.py` preserves the
+unmodified pinned vLLM client as the timing implementation, builds exact custom
+dataset commands over disjoint 1024-token/128-output partitions, records exact
+commands and hashes, and rejects partial requests, errors, length drift, missing
+detailed arrays, bundled token chunks, or failure to reach the requested burst
+concurrency. The paired summarizer compares generated text before performance,
+aggregates all throughput and mean/median/P90/P99 latency axes, and normalizes
+each axis in its pass direction.
+
+`scripts/dgx-online-serving.sh` plans one uninterrupted lock per model. Inside
+it, repetitions are interleaved `ours -> vLLM`; each server leg includes model
+load and timed runtime in descendant/PSS/RSS/GPU-memory sampling, live-SSE
+preflight, thermal/power snapshots, cache drop and memory-return proof. Exact
+server commands now fix `max_num_seqs=32` on both arms plus the same
+model-specific token budget (27B=2048, 35B=8192). This closes a recovery-audit
+gap: the pre-W2 scripts left our server at its internal eight-sequence default,
+so those already-diagnostic c16/c32 measurements could not establish the
+intended large-concurrency operating point. Every timed point first runs a
+full-concurrency warmup wave, keeping lazy capture/JIT work outside the result.
+Exact clean-HEAD build commands/logs and server/checkpoint artifacts are
+hashed; the
+pip-vLLM 0.24.0 launcher, Python, package benchmark modules, distribution
+metadata and RECORD are pinned and re-hashed per model. Each model ends with
+three matched c16/48-prompt trace workloads: ours under nsys and production
+vLLM under the
+LLM-API torch-profiler fallback mandated because nsys breaks V1 EngineCore on
+GB10. The Chrome-trace parser selects the worker trace by positive kernel time
+and groups runtime-resolved kernel names. A missing/model-mismatched/hash-drifted
+gate, stream, resource or trace artifact makes the summary non-binding.
+
+Fresh local evidence (no GPU command): focused online-gate tests **16/16**;
+all benchmark-tool tests **32/32**; relevant registered CTest **2/2** after a
+clean CPU configure/build; `py_compile`, `bash -n`, ShellCheck, dry-run manifest,
+`git diff --check`, the canonical-record checker and its mutation suite pass.
+The row stays `ACTIVE`: no current-main GPU number exists, the pre-W2 35B abort
+has no proven faulting kernel, and the diagnostic vLLM arm still owns the DGX.
+After it releases, sync/build the pushed current head in a fresh remote
+directory, reproduce the exact 35B workload under sanitizer if the fault
+persists, then run both model-wide W2 G1/G3-G6 series and paired traces.

@@ -45,6 +45,7 @@ from tools.bench.serve_low_common import (
 INPUT_LEN = 1024
 OUTPUT_LEN = 128
 VLLM_ORACLE_VERSION = "0.24.0"
+PANDAS_VERSION = "2.2.3"
 TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
@@ -521,6 +522,7 @@ def build_plan(
             "warmups_per_client_invocation": "equals configured concurrency",
         },
         "series_order": "one whole-model flock; rep1 ours/vllm, rep2 ours/vllm, rep3 ours/vllm",
+        "vllm_oracle_bench_dependencies": {"pandas": PANDAS_VERSION},
         "vllm_oracle_version": VLLM_ORACLE_VERSION,
         "vllm_cpp_sha": vllm_cpp_sha,
     }
@@ -535,6 +537,8 @@ def validate_plan(path: pathlib.Path, *, vllm_cpp_sha: str) -> dict[str, Any]:
         raise HarnessError("campaign plan client source differs from the parity pin")
     if value.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
         raise HarnessError("campaign plan oracle version differs from the pinned pip oracle")
+    if value.get("vllm_oracle_bench_dependencies") != {"pandas": PANDAS_VERSION}:
+        raise HarnessError("campaign plan benchmark dependencies differ from the pin")
     if value.get("gpu_lock_acquisitions_planned") != 2:
         raise HarnessError("campaign plan must contain one GPU lock per model")
     if value.get("dry_run") is not True:
@@ -796,6 +800,23 @@ def record_oracle_manifest(
             f"metadata={metadata_version!r}, runtime={runtime_version!r}, "
             f"expected={VLLM_ORACLE_VERSION!r}"
         )
+    try:
+        import pandas  # Delayed so CPU contract tests can provide a stub.
+        pandas_distribution = importlib.metadata.distribution("pandas")
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise HarnessError(
+            f"pinned pandas {PANDAS_VERSION} is required for vllm bench serve"
+        ) from error
+    pandas_runtime_version = getattr(pandas, "__version__", None)
+    if (
+        pandas_distribution.version != PANDAS_VERSION
+        or pandas_runtime_version != PANDAS_VERSION
+    ):
+        raise HarnessError(
+            "pandas benchmark dependency drift: "
+            f"metadata={pandas_distribution.version!r}, "
+            f"runtime={pandas_runtime_version!r}, expected={PANDAS_VERSION!r}"
+        )
     package_init_value = getattr(vllm, "__file__", None)
     if not isinstance(package_init_value, str):
         raise HarnessError("vLLM oracle package has no filesystem source")
@@ -809,6 +830,12 @@ def record_oracle_manifest(
     if dist_info_value is None:
         raise HarnessError("vLLM distribution metadata path is unavailable")
     dist_info = pathlib.Path(dist_info_value).absolute()
+    pandas_init_value = getattr(pandas, "__file__", None)
+    pandas_dist_info_value = getattr(pandas_distribution, "_path", None)
+    if not isinstance(pandas_init_value, str) or pandas_dist_info_value is None:
+        raise HarnessError("pandas benchmark dependency has no filesystem metadata")
+    pandas_init = pathlib.Path(pandas_init_value).absolute()
+    pandas_dist_info = pathlib.Path(pandas_dist_info_value).absolute()
     artifacts = {
         "bench_datasets": package_root / "benchmarks" / "datasets" / "datasets.py",
         "bench_serve": package_root / "benchmarks" / "serve.py",
@@ -818,6 +845,9 @@ def record_oracle_manifest(
         "distribution_record": dist_info / "RECORD",
         "package_init": package_init,
         "python": python,
+        "pandas_distribution_metadata": pandas_dist_info / "METADATA",
+        "pandas_distribution_record": pandas_dist_info / "RECORD",
+        "pandas_package_init": pandas_init,
     }
     for name, path in artifacts.items():
         if not path.is_file() or path.stat().st_size == 0:
@@ -827,6 +857,7 @@ def record_oracle_manifest(
             name: {"path": str(path), "sha256": sha256_file(path)}
             for name, path in artifacts.items()
         },
+        "bench_dependencies": {"pandas": PANDAS_VERSION},
         "client_contract_source_commit": VLLM_COMMIT,
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "oracle_version": metadata_version,
@@ -894,6 +925,8 @@ def record_execution_manifest(
         raise HarnessError("oracle runtime version differs from the pinned pip oracle")
     if oracle.get("client_contract_source_commit") != VLLM_COMMIT:
         raise HarnessError("oracle client contract source differs from the parity pin")
+    if oracle.get("bench_dependencies") != {"pandas": PANDAS_VERSION}:
+        raise HarnessError("oracle benchmark dependency inventory differs from the pin")
     oracle_artifacts = oracle.get("artifacts")
     required_oracle_artifacts = {
         "bench_datasets",
@@ -904,6 +937,9 @@ def record_execution_manifest(
         "distribution_record",
         "package_init",
         "python",
+        "pandas_distribution_metadata",
+        "pandas_distribution_record",
+        "pandas_package_init",
     }
     if not isinstance(oracle_artifacts, dict) or set(oracle_artifacts) != required_oracle_artifacts:
         raise HarnessError("oracle artifact inventory is incomplete or unexpected")
@@ -945,6 +981,7 @@ def record_execution_manifest(
             str((build_dir / "examples" / "server").absolute()),
             str(client.absolute()),
         ],
+        "bench_dependencies": {"pandas": PANDAS_VERSION},
         "model_key": model_key,
         "model_revision": MODEL_REVISIONS[model_key],
         "max_num_batched_tokens": max_num_batched_tokens,

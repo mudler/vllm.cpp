@@ -3986,3 +3986,35 @@ Online-focused tests pass 18/18, all benchmark tools 34/34, registered CTest
 tools 1/1, record checker + 13 mutations, `py_compile`, `bash -n`, ShellCheck
 and diff checks pass. Regenerate at the merged SHA before the next GPU lock.
 README capability state is unchanged.
+
+## 2026-07-11 — 27B live-SSE passes; oracle bench extra was incomplete
+
+The clean `54cba52` campaign reproduced both corpus hashes, refreshed and
+hashed the server/oracle/build, acquired the whole-model lock, and passed the
+27B model gate in 16.18 seconds (log SHA-256
+`38d4d571d9fe868100d8dd95fb6978b335d254fab4a6ef4c23bac86a1738571b`).
+The first rootless report proved the complete 26.55-GB inventory moved from
+26.55 GB resident to zero (SHA-256
+`c7c2052334a767d59af4e53dc6de32b3dc2aef1bca87983cf2fcefe2ac7ba73f`).
+The production server then passed its live-SSE preflight with 128 incremental
+chunks, first chunk at 6.343s and completion at 20.990s (artifact SHA-256
+`0dc88a452d8885ff004314df8ae6ea1c908e6bb96f6597eb7c22c93bcb45cd19`).
+
+The first pinned `vllm bench serve` client exited before sending a timed request:
+pip-vLLM's `CustomDataset` imports pandas, but the oracle venv had not installed
+the `bench` extra. Client log SHA-256 is
+`b27812bceb6de18849fffcc1a1d668bea041c1202852029a27f0680d2bbfa869`.
+The harness terminated its owned server, released `/tmp/gpu`, and wrote no raw
+result. Thus no partial latency or throughput number is retained.
+
+Pinned vLLM's CUDA test lock specifies pandas 2.2.3. The isolated oracle venv now
+contains pandas 2.2.3, python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2;
+`pandas.read_json(..., lines=True)` reads the six-row c1 corpus successfully.
+The oracle preflight now requires pandas 2.2.3 before build/GPU acquisition and
+hashes its package `__init__.py`, distribution `METADATA`, and `RECORD` (current
+SHA-256 `108be8ca…2b7b`, `f0542313…70f`, `d909f7e6…6d9`). Plan, execution and
+summary manifests all bind the dependency version. The real oracle-preflight
+manifest passes and hashes to
+`30a5382d24e727e2660376dc74bdc8d661aab5103b0514df60b98507bd4ef7e5`.
+CPU tools remain 34/34. Regenerate at the merged SHA; README capability state
+is unchanged.

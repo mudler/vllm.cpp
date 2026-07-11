@@ -11,7 +11,10 @@
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
   - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
-    parity oracle (golden op dumps via `tools/parity/`).
+    parity oracle (golden op dumps via `tools/parity/`). Its serving-benchmark
+    subset is completed with the pinned CUDA-test dependency set pandas 2.2.3,
+    python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2; online-gate
+    manifests hash pandas package/distribution files and reject version drift.
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds
     `flock /tmp/gpu` for the whole job or multi-arm series WHEN other agents may run GPU work concurrently (sole owner verified idle via `nvidia-smi` may skip), following
     `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,

@@ -20,6 +20,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
     OUTPUT_LEN,
+    PANDAS_VERSION,
     TRACE_CONCURRENCY,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
@@ -98,6 +99,7 @@ def _write_fixture(root: pathlib.Path) -> None:
             {
                 "client_contract_source_commit": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
                 "gpu_lock_acquisitions_planned": 2,
+                "vllm_oracle_bench_dependencies": {"pandas": PANDAS_VERSION},
                 "vllm_oracle_version": VLLM_ORACLE_VERSION,
                 "vllm_cpp_sha": sha,
             }
@@ -122,6 +124,9 @@ def _write_fixture(root: pathlib.Path) -> None:
         "oracle:distribution_record",
         "oracle:package_init",
         "oracle:python",
+        "oracle:pandas_distribution_metadata",
+        "oracle:pandas_distribution_record",
+        "oracle:pandas_package_init",
         "server",
         "tokenizer",
     ):
@@ -143,6 +148,7 @@ def _write_fixture(root: pathlib.Path) -> None:
         json.dumps(
             {
                 "artifacts": execution_artifacts,
+                "bench_dependencies": {"pandas": PANDAS_VERSION},
                 "cache_drop_roots": _fixture_cache_roots(root),
                 "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
                 "max_num_seqs": MAX_NUM_SEQS,

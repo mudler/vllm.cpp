@@ -23,6 +23,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
     OUTPUT_LEN,
+    PANDAS_VERSION,
     TRACE_CONCURRENCY,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
@@ -205,6 +206,10 @@ class OnlineClientContractTests(unittest.TestCase):
             plan["run_contract"]["warmups_per_client_invocation"],
             "equals configured concurrency",
         )
+        self.assertEqual(
+            plan["vllm_oracle_bench_dependencies"],
+            {"pandas": PANDAS_VERSION},
+        )
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
@@ -307,11 +312,17 @@ class OnlineClientContractTests(unittest.TestCase):
             bin_dir = root / "venv" / "bin"
             package = root / "venv" / "site-packages" / "vllm"
             dist_info = root / "venv" / "site-packages" / "vllm-0.24.0.dist-info"
+            pandas_package = root / "venv" / "site-packages" / "pandas"
+            pandas_dist_info = (
+                root / "venv" / "site-packages" / f"pandas-{PANDAS_VERSION}.dist-info"
+            )
             for directory in (
                 bin_dir,
                 package / "benchmarks" / "datasets",
                 package / "entrypoints" / "cli" / "benchmark",
                 dist_info,
+                pandas_package,
+                pandas_dist_info,
             ):
                 directory.mkdir(parents=True, exist_ok=True)
             client = bin_dir / "vllm"
@@ -326,33 +337,65 @@ class OnlineClientContractTests(unittest.TestCase):
                 package / "entrypoints" / "cli" / "benchmark" / "serve.py",
                 dist_info / "METADATA",
                 dist_info / "RECORD",
+                pandas_package / "__init__.py",
+                pandas_dist_info / "METADATA",
+                pandas_dist_info / "RECORD",
             ):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
             distribution = types.SimpleNamespace(
                 version=VLLM_ORACLE_VERSION,
                 _path=dist_info,
             )
+            pandas_distribution = types.SimpleNamespace(
+                version=PANDAS_VERSION,
+                _path=pandas_dist_info,
+            )
             module = types.SimpleNamespace(
                 __version__=VLLM_ORACLE_VERSION,
                 __file__=str(package_init),
             )
+            pandas_module = types.SimpleNamespace(
+                __version__=PANDAS_VERSION,
+                __file__=str(pandas_package / "__init__.py"),
+            )
+            distributions = {
+                "pandas": pandas_distribution,
+                "vllm": distribution,
+            }
             output = root / "oracle.json"
             with (
-                mock.patch.dict("sys.modules", {"vllm": module}),
+                mock.patch.dict(
+                    "sys.modules",
+                    {"pandas": pandas_module, "vllm": module},
+                ),
                 mock.patch(
                     "tools.bench.online_gate.importlib.metadata.distribution",
-                    return_value=distribution,
+                    side_effect=distributions.__getitem__,
                 ),
                 mock.patch("tools.bench.online_gate.sys.executable", str(python)),
             ):
                 result = record_oracle_manifest(output, client=client)
             self.assertEqual(result["oracle_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(result["runtime_version"], VLLM_ORACLE_VERSION)
-            self.assertEqual(len(result["artifacts"]), 8)
+            self.assertEqual(result["bench_dependencies"], {"pandas": PANDAS_VERSION})
+            self.assertEqual(len(result["artifacts"]), 11)
             self.assertEqual(
                 result["artifacts"]["bench_serve"]["sha256"],
                 sha256_file(package / "benchmarks" / "serve.py"),
             )
+            with (
+                mock.patch.dict(
+                    "sys.modules",
+                    {"pandas": None, "vllm": module},
+                ),
+                mock.patch(
+                    "tools.bench.online_gate.importlib.metadata.distribution",
+                    return_value=distribution,
+                ),
+                mock.patch("tools.bench.online_gate.sys.executable", str(python)),
+                self.assertRaisesRegex(HarnessError, "pinned pandas"),
+            ):
+                record_oracle_manifest(root / "missing-pandas.json", client=client)
 
     def test_execution_model_and_trace_records_hash_their_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,6 +430,9 @@ class OnlineClientContractTests(unittest.TestCase):
                 "distribution_record",
                 "package_init",
                 "python",
+                "pandas_distribution_metadata",
+                "pandas_distribution_record",
+                "pandas_package_init",
             ):
                 path = client if name == "client" else root / "oracle-files" / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +444,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 json.dumps(
                     {
                         "artifacts": oracle_files,
+                        "bench_dependencies": {"pandas": PANDAS_VERSION},
                         "client_contract_source_commit": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
                         "oracle_version": VLLM_ORACLE_VERSION,
                         "runtime_version": VLLM_ORACLE_VERSION,
@@ -422,6 +469,7 @@ class OnlineClientContractTests(unittest.TestCase):
             )
             self.assertEqual(execution["model_key"], "27")
             self.assertEqual(execution["vllm_oracle_version"], VLLM_ORACLE_VERSION)
+            self.assertEqual(execution["bench_dependencies"], {"pandas": PANDAS_VERSION})
             self.assertIn("oracle:bench_serve", execution["artifacts"])
             self.assertIn("build_command", execution["artifacts"])
 

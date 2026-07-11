@@ -28,6 +28,7 @@ from tools.bench.online_gate import (
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
     OUTPUT_LEN,
+    PANDAS_VERSION,
     POINTS,
     REPETITIONS,
     TRACE_CONCURRENCY,
@@ -327,6 +328,8 @@ def _model_precondition_reasons(
             reasons.append("execution manifest vLLM source SHA differs from the pin")
         if execution.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
             reasons.append("execution manifest pip-vLLM oracle version differs")
+        if execution.get("bench_dependencies") != {"pandas": PANDAS_VERSION}:
+            reasons.append("execution benchmark dependency inventory differs")
         if execution.get("max_num_seqs") != MAX_NUM_SEQS:
             reasons.append("execution manifest max-num-seqs differs from the gate")
         if execution.get("max_num_batched_tokens") != MAX_NUM_BATCHED_TOKENS[model]:
@@ -350,6 +353,9 @@ def _model_precondition_reasons(
                 "oracle:distribution_record",
                 "oracle:package_init",
                 "oracle:python",
+                "oracle:pandas_distribution_metadata",
+                "oracle:pandas_distribution_record",
+                "oracle:pandas_package_init",
                 "server",
                 "tokenizer",
             }
@@ -627,6 +633,8 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
             campaign_reasons.append("campaign manifest client source commit differs from the pin")
         if manifest.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
             campaign_reasons.append("campaign manifest pip-vLLM oracle version differs")
+        if manifest.get("vllm_oracle_bench_dependencies") != {"pandas": PANDAS_VERSION}:
+            campaign_reasons.append("campaign manifest benchmark dependencies differ")
         if manifest.get("gpu_lock_acquisitions_planned") != 2:
             campaign_reasons.append("campaign manifest does not plan one lock per model")
     except HarnessError as error:

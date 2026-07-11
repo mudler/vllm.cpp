@@ -59,7 +59,7 @@ successful repetitions.
 | scheduler operating point | explicit server `max_num_seqs` and `max_num_batched_tokens` flags; harness fixes identical values on both arms |
 | benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
-| build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, benchmark modules, dist metadata and RECORD in `online_gate.py` |
+| build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
 | GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via `tools/bench/profile_vllm_online_gate.py`; kernel-event aggregation in `summarize_torch_kernels.py` |
 
@@ -81,6 +81,10 @@ successful repetitions.
   failure reporting and overwrite refusal are covered by
   `tests/tools/test_drop_file_cache.py`; client/summary suites reject resident
   or missing cache reports.
+- The oracle-manifest contract rejects missing or drifted pandas before any
+  build or GPU lock. The version comes from pinned vLLM's CUDA test requirement
+  (`requirements/test/cuda.txt:742`), while `setup.py:1247` declares pandas as a
+  `bench` extra.
 - Applicable `tests/entrypoints/openai/` streaming, disconnect, usage, and error
   cases before relying on HTTP measurements.
 - Local conformance and benchmark tests remain prerequisites. Any upstream case
@@ -119,6 +123,12 @@ still fatal. A warmed real 27B probe covered 49 files / 26.55 GB, observed
 gates, and the benchmark protocol are prerequisites. `SERVE-ASYNC-LLM` is an
 explicit dependency wherever the synchronous bridge prevents equivalent
 low-concurrency overlap or streaming behavior.
+
+The executable oracle environment must include pandas 2.2.3. On 2026-07-11 the
+isolated `~/venvs/vllm-oracle` was completed with pandas 2.2.3,
+python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2; these match the
+pinned CUDA test lock. Only pandas participates directly in the CustomDataset
+path and is independently version/file-hashed by the gate.
 
 ## Work breakdown
 

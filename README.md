@@ -267,15 +267,22 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
   for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
-  `DONE`). A fresh `a40a9e3` 27B campaign proved the native-usage repair on all
-  1,488 retained requests: every response reported exactly 128 native output
-  IDs. It completed two full interleaved ours/vLLM ladders and ours rep3 through
-  c16, then the harness falsely rejected 12/96 c16 responses with 126 rather
-  than 127 ITLs. Pinned vLLM explicitly permits its producer-ahead
-  `RequestOutputCollector` to merge adjacent DELTA outputs, so those are valid
-  inter-chunk timings, not lost tokens. The validator now mirrors that contract
-  and is regression-tested; the interrupted evidence is still void, and a new
-  commit-bound 27B→35B run is required. No online metric or ratio is binding.
+  `DONE`). At `31d053f`, all three 27B ours/vLLM c1–c32 ladders completed with
+  2,016/2,016 successful, exact-native-count requests and full lifecycle/memory
+  return. The reproducible diagnostic throughput ratios are below the required
+  floor at every point: 0.959/0.926/0.934/0.937/0.961/0.956× from c1 to c32,
+  with most latency axes also slower. This is not evidence of a library/kernel
+  regression: against the accepted offline checkpoint, ours was +0.14% at c16
+  and -0.63% at c32, while vLLM's online denominator was +4.92%/+4.65% under
+  the changed corpus/frontend recipe. Direct-library parity remains accepted;
+  the still-unlocalized online gap may be scheduling, configuration, arrival,
+  frontend, or model-execution behavior. Our nsys trace completed, but the required
+  vLLM torch-profiler fallback then failed closed because FlashInfer JIT could
+  not find the oracle venv's `ninja`; the whole-model lock was released and 35B
+  was not started, so no online ratio is binding. The harness now hashes and
+  preflights that executable and prepends the pinned venv for the profiler.
+  Next is a diagnostic paired-trace recapture, concrete hot-path optimization,
+  then a fresh commit-bound gate rerun.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

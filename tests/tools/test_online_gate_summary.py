@@ -122,6 +122,7 @@ def _write_fixture(root: pathlib.Path) -> None:
         "oracle:client",
         "oracle:distribution_metadata",
         "oracle:distribution_record",
+        "oracle:ninja",
         "oracle:package_init",
         "oracle:python",
         "oracle:pandas_distribution_metadata",

@@ -888,6 +888,12 @@ def record_oracle_manifest(
     client = client.absolute()
     if python.parent != client.parent:
         raise HarnessError("oracle client and Python are not from the same environment")
+    ninja = python.parent / "ninja"
+    if not ninja.is_file() or not os.access(ninja, os.X_OK):
+        raise HarnessError(
+            "oracle ninja executable is absent from the pinned environment: "
+            f"{ninja}"
+        )
     dist_info_value = getattr(distribution, "_path", None)
     if dist_info_value is None:
         raise HarnessError("vLLM distribution metadata path is unavailable")
@@ -905,6 +911,7 @@ def record_oracle_manifest(
         "client": client,
         "distribution_metadata": dist_info / "METADATA",
         "distribution_record": dist_info / "RECORD",
+        "ninja": ninja,
         "package_init": package_init,
         "python": python,
         "pandas_distribution_metadata": pandas_dist_info / "METADATA",
@@ -997,6 +1004,7 @@ def record_execution_manifest(
         "client",
         "distribution_metadata",
         "distribution_record",
+        "ninja",
         "package_init",
         "python",
         "pandas_distribution_metadata",

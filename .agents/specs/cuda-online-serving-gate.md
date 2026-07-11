@@ -64,7 +64,7 @@ successful repetitions.
 | scheduler operating point | explicit server `max_num_seqs` and `max_num_batched_tokens` flags; harness fixes identical values on both arms |
 | benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
-| build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
+| build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
 | GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via `tools/bench/profile_vllm_online_gate.py`; kernel-event aggregation in `summarize_torch_kernels.py` |
 
@@ -90,6 +90,10 @@ successful repetitions.
   build or GPU lock. The version comes from pinned vLLM's CUDA test requirement
   (`requirements/test/cuda.txt:742`), while `setup.py:1247` declares pandas as a
   `bench` extra.
+- The same manifest hashes and requires executable `${oracle_venv}/bin/ninja`
+  before any GPU lock. The vLLM profiler prepends that venv to `PATH` because
+  FlashInfer may JIT an uncached FP4 module in a spawned EngineCore process; an
+  importable Python package alone does not make its executable visible.
 - Client contracts cover vLLM's bucket-boundary false overlap: the upstream
   bucketed peak is retained, while exact start + TTFT + ITL intervals must reach
   the configured concurrency and use end-before-start ordering at ties.
@@ -143,11 +147,13 @@ gates, and the benchmark protocol are prerequisites. `SERVE-ASYNC-LLM` is an
 explicit dependency wherever the synchronous bridge prevents equivalent
 low-concurrency overlap or streaming behavior.
 
-The executable oracle environment must include pandas 2.2.3. On 2026-07-11 the
+The executable oracle environment must include pandas 2.2.3 and an executable
+`ninja` in the same venv `bin` directory. On 2026-07-11 the
 isolated `~/venvs/vllm-oracle` was completed with pandas 2.2.3,
 python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2; these match the
 pinned CUDA test lock. Only pandas participates directly in the CustomDataset
-path and is independently version/file-hashed by the gate.
+path. Both pandas and the profiler's Ninja executable are independently
+file-hashed by the gate, and the profiler receives the venv-prefixed `PATH`.
 
 ## Work breakdown
 
@@ -172,6 +178,9 @@ owns the DGX campaign and its result directory.
 - Provisioning, compilation, downloads, and cache warmup stay outside the
   measurement lock window.
 - The exact same checkpoint is required; converted weights are non-binding.
+- A profiler dependency that is importable but not executable through the
+  spawned EngineCore `PATH` is a failed preflight, not a reason to omit the
+  paired trace or reuse a lock-released series.
 - The pre-W2 server's `cudaFree` error is an asynchronous surfacing point, not
   a proven faulting kernel; reproduce current main under sanitizer before any
   fix or root-cause claim.

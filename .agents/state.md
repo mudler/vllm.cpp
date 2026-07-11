@@ -4158,3 +4158,71 @@ build/test. Next: merge this fail-closed harness repair with its required
 README/BENCHMARKS/roadmap/matrix checkpoint, regenerate all SHA-bound evidence,
 then rerun 27B from the beginning before starting 35B. No result from the
 interrupted `a40a9e3` directory is reusable as a successful repetition.
+
+## 2026-07-11 — repeated 27B online gap measured; profiler Ninja preflight failed
+
+The clean `31d053f770e35be4c09f93b637c13617f41ed672` campaign held one
+uncontended `/tmp/gpu` lock across the complete 27B model gate, three
+interleaved ours/vLLM c1/c2/c4/c8/c16/c32 ladders, all six memory-return checks,
+and our nsys arm. All 36 standard raw points completed: 2,016/2,016 requests,
+zero errors, exact 1,024 input / 128 native output tokens, exact configured
+concurrency, and 127 ITLs per request in this run. The model gate passed in
+15.78 seconds (log SHA-256
+`fa3191d60b103ea13d1285899b967d149d89d2c16e4da962b845aaee01cbb0c4`).
+
+The repeated timing result is a clear diagnostic gap, not a binding ratio.
+Mean ours/vLLM total-throughput ratios from c1 through c32 are respectively
+**0.9589 / 0.9261 / 0.9337 / 0.9372 / 0.9613 / 0.9562×**. Ours repetition
+spreads were 1.11/1.50/1.13/1.20/1.08/0.87%; vLLM spreads were
+0.28/0.49/1.01/0.92/1.05/0.50%. Only 1–4 of the 19 throughput plus
+mean/median/P90/P99 TTFT/TPOT/ITL/E2EL axes met the direction-aware floor at
+each point. Mean peak GPU memory strongly favored ours (27,609 vs 72,779 MiB);
+mean process RSS favored vLLM (48,184,873 vs 28,414,676 KiB), while mean
+system-wide available-memory drop favored ours (66,650,904 vs 80,709,265 KiB).
+The committed final summarizer never ran, so these values remain diagnosis only.
+
+This is not evidence of a direct-library/kernel regression. Cross-checking the
+same 1,024/128 concurrency points against the accepted offline checkpoint, ours
+is **765.355 vs 764.28 tok/s at c16 (+0.14%)** and **1,044.646 vs 1,051.24 at
+c32 (-0.63%)**. The corresponding vLLM online means are **796.182 vs 758.84
+(+4.92%)** and **1,092.448 vs 1,043.86 (+4.65%)**. Because the online corpus,
+arrival and frontend recipe differs, that cross-check is diagnostic rather than
+an A/B; it keeps direct-library parity accepted and points the open investigation
+at the full online scheduling/config/frontend/execution chain, not JSON/SSE alone.
+
+Our trace arm completed three exact 48-request c16 repetitions and produced
+`ours.nsys-rep` plus its kernel summary (SHA-256
+`1aac12aae05448773c67ea4331acf7c9b58ce280296c392db440c28d54bac212` /
+`b354f0dd3da2e0c865c37dad1657f3e18dab26a5f5b0e755ea5fdb58e8f170d4`).
+The required vLLM torch-profiler fallback then failed during EngineCore startup:
+FlashInfer attempted to JIT its SM120 FP4 CUTLASS module and
+`flashinfer/jit/cpp_ext.py:368` raised `FileNotFoundError: ninja`. The executable
+exists at `~/venvs/vllm-oracle/bin/ninja`, but the profiler command inherited a
+system-only `PATH`; unlike the ordinary vLLM server launch, it did not prepend
+the oracle venv. Failed profiler-log and complete driver-log SHA-256 values are
+`a1fd2bbbbb95fef7e852550f9c46268fbecf8fb73e1449fef5ab6ee25b181dfb` and
+`d01133eec96704548b2b82a57b3ab53104714f5b6ec312f9413210275a6da6bb`.
+No trace status or final summary was written, 35B never started, cleanup passed,
+the lock released, and the GPU is idle. The whole `31d053f` model series is
+therefore **VOID** and cannot supply a successful repetition or denominator.
+
+The fail-before-lock repair makes Ninja part of the exact oracle inventory:
+`record_oracle_manifest` now requires an executable beside the pinned Python,
+hashes it, execution/final-summary validation requires `oracle:ninja`, and the
+vLLM profiler command records `env PATH=<oracle-bin>:$PATH`. Unit fixtures cover
+both the hash and missing-executable failure, while a driver regression asserts
+the profiler's venv-prefixed `PATH`. Client **9/9**, summary **5/5**, the
+complete benchmark-tool suite **35/35**, agent-record mutations **13/13**,
+documentation mutations **5/5**, canonical record (ENGINE=96 / MODEL=323 /
+QUANT=81 / KERNEL=30 / BACKEND=51), shell syntax, Python compilation and diff
+checks all pass.
+README, `docs/BENCHMARKS.md`, the roadmap, engine matrix, coordination record,
+environment, inventory, accepted spike and ledger all record the void result in
+this same iteration.
+
+Next: merge this preflight repair, capture a separate lock-held **diagnostic**
+vLLM profile on the identical c16/48 shape, diff it against the preserved ours
+nsys trace, and implement the highest-value concrete parity lever. Do not spend
+a 35B series or rerun the full 27B gate unchanged; the next binding campaign
+must use the optimized commit and start from a new whole-model lock/evidence
+tree.

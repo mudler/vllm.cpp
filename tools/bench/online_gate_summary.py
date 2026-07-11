@@ -352,6 +352,7 @@ def _model_precondition_reasons(
                 "oracle:client",
                 "oracle:distribution_metadata",
                 "oracle:distribution_record",
+                "oracle:ninja",
                 "oracle:package_init",
                 "oracle:python",
                 "oracle:pandas_distribution_metadata",

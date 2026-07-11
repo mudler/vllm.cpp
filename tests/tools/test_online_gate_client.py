@@ -250,6 +250,16 @@ class OnlineClientContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_vllm_profiler_exports_the_oracle_venv_path(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        block = script.split("local -a vllm_profile_cmd=(", 1)[1].split(
+            "\n  )", 1
+        )[0]
+        self.assertIn('env "PATH=$(dirname "${client}"):${PATH}"', block)
+
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -348,10 +358,12 @@ class OnlineClientContractTests(unittest.TestCase):
                 directory.mkdir(parents=True, exist_ok=True)
             client = bin_dir / "vllm"
             python = bin_dir / "python"
+            ninja = bin_dir / "ninja"
             package_init = package / "__init__.py"
             for path in (
                 client,
                 python,
+                ninja,
                 package_init,
                 package / "benchmarks" / "serve.py",
                 package / "benchmarks" / "datasets" / "datasets.py",
@@ -363,6 +375,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 pandas_dist_info / "RECORD",
             ):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
+            ninja.chmod(0o755)
             distribution = types.SimpleNamespace(
                 version=VLLM_ORACLE_VERSION,
                 _path=dist_info,
@@ -399,11 +412,29 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertEqual(result["oracle_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(result["runtime_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(result["bench_dependencies"], {"pandas": PANDAS_VERSION})
-            self.assertEqual(len(result["artifacts"]), 11)
+            self.assertEqual(len(result["artifacts"]), 12)
             self.assertEqual(
                 result["artifacts"]["bench_serve"]["sha256"],
                 sha256_file(package / "benchmarks" / "serve.py"),
             )
+            self.assertEqual(
+                result["artifacts"]["ninja"]["sha256"],
+                sha256_file(ninja),
+            )
+            ninja.unlink()
+            with (
+                mock.patch.dict(
+                    "sys.modules",
+                    {"pandas": pandas_module, "vllm": module},
+                ),
+                mock.patch(
+                    "tools.bench.online_gate.importlib.metadata.distribution",
+                    side_effect=distributions.__getitem__,
+                ),
+                mock.patch("tools.bench.online_gate.sys.executable", str(python)),
+                self.assertRaisesRegex(HarnessError, "ninja executable"),
+            ):
+                record_oracle_manifest(root / "missing-ninja.json", client=client)
             with (
                 mock.patch.dict(
                     "sys.modules",
@@ -449,6 +480,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 "client",
                 "distribution_metadata",
                 "distribution_record",
+                "ninja",
                 "package_init",
                 "python",
                 "pandas_distribution_metadata",

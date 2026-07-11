@@ -6,14 +6,14 @@ Detailed commands, per-repetition values, hashes, and parity rationale remain
 in the [append-only parity ledger](../.agents/parity-ledger.md) and the linked
 feature specs.
 
-Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` merged-DELTA validator checkpoint).
+Last updated: **2026-07-11** (`SERVE-GATE-ONLINE` 27B trace-preflight checkpoint).
 
 ## Current checkpoint
 
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
-| `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU, TSan, and ASan+UBSan gates pass. The interrupted `a40a9e3` 27B campaign retained 1,488/1,488 successful requests with exact native 128-token counts, closing the missing-usage symptom; it is not a performance result. | Complete fresh 27B and 35B online campaigns plus the planned same-binary serialization A/B. |
-| `SERVE-GATE-ONLINE` | **VOID — no binding ratio** | `a40a9e3` completed two full interleaved 27B ours/vLLM ladders and ours rep3 through c16. At c16-r3, 96/96 requests completed with exact native counts; 12 legally merged two adjacent DELTA outputs and retained 126 rather than 127 ITLs. The old validator rejected this pinned-vLLM behavior, so c32-r3, vLLM rep3, traces, and finalization never ran. Cleanup and lock release passed. [Diagnostic record](../.agents/state.md). | Merge the corrected inter-chunk validator, regenerate SHA-bound evidence, and rerun 27B then 35B. No latency, throughput, memory, or ratio from `a40a9e3` may be reused. |
+| `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
+| `SERVE-GATE-ONLINE` | **VOID / BELOW-FLOOR DIAGNOSTIC — no binding ratio** | `31d053f` completed all three interleaved 27B ours/vLLM c1–c32 ladders, six memory-return checks, and ours nsys. Mean total-throughput ratios were 0.959/0.926/0.934/0.937/0.961/0.956×; only 1–4 of 19 timing axes passed per point. This does **not** show a library/kernel regression: against the accepted offline checkpoint, ours was +0.14% at c16 and -0.63% at c32, while the online vLLM denominator was +4.92%/+4.65% under the changed corpus/frontend recipe. The vLLM torch-profiler fallback then failed during FlashInfer JIT because the pinned venv's `ninja` was not on `PATH`; no status/final summary exists, the lock was released, and 35B did not start. [Diagnostic record](../.agents/state.md). | Hash/preflight `ninja`, recapture the paired diagnostic trace, distinguish scheduling/config/frontend effects from model execution, mirror the highest-value differences, then rerun the full 27B gate before 35B. None of the `31d053f` values is binding. |
 
 The stream-usage path changes host-side JSON/SSE serialization, not model
 kernels. Its performance disposition is nevertheless `PENDING` because the
@@ -23,6 +23,11 @@ timings: pinned vLLM's single-slot collector deliberately merges DELTA outputs
 when the producer gets ahead, while native usage remains the exact token-count
 oracle. The gate accepts fewer than 127 ITLs for that case but still rejects
 extra intervals, partial requests, count drift, errors, or unsaturated load.
+
+The accepted direct-library throughput rows below therefore remain valid. The
+online diagnostic is a different serving/corpus recipe and cannot localize its
+gap to JSON/SSE alone; scheduler batching, arrival cadence, server configuration
+and model execution all remain candidates until the paired trace is complete.
 
 ## Accepted CUDA engine throughput
 

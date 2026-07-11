@@ -428,6 +428,7 @@ run_paired_traces() {
   gpu_idle || { echo "GPU is not idle before vLLM trace" >&2; return 1; }
   drop_caches "${cache_between}"
   local -a vllm_profile_cmd=(
+    env "PATH=$(dirname "${client}"):${PATH}"
     "${vllm_python}" "${repo_root}/tools/bench/profile_vllm_online_gate.py"
     --model "${snapshot}"
     --corpus "${vllm_corpus}"

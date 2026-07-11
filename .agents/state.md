@@ -6686,3 +6686,59 @@ because Triton could not find NixOS `/sbin/ldconfig`; the documented
 After the successful profile the GPU returned to 146 MiB / P8. The kernel log
 has two recurring `refcntRequestReference_IMPL ... status 0x56` notices during
 vLLM initialization, but no Xid, UVM fault, oops, reset, or lockup.
+
+## 2026-07-11 — ranked-lever sweep; plain-BF16 attention preamble retained
+
+Executed the five follow-up groups from the matched trace and reverted every
+candidate that lost performance or correctness. A blanket cuBLASLt no-split-K
+preference measured 6907.96 versus 7054.16 tok/s (-2.07%) and was removed. FA2
+was compiled successfully from flashinfer's CUTLASS source for native sm_120,
+but its eligible fused-preamble path reduced the natural greedy result from
+15/16 to 14/16 (new request-10 divergence), so the temporary CMake decoupling
+was removed. The exact vLLM 0.24 `_fused_post_conv_kernel`, specialized through
+the existing Triton AOT mechanism, improved the short workload 7148.06 versus
+7042.15 (+1.50%) but reduced parity to 13/16 (new requests 8 and 10); it was
+also removed. Four arithmetic-preserving CUDA causal-conv tile shapes were
+neutral: the best candidate repeated at 7041.49 versus 7045.55 (-0.06%), so the
+original 16x32 tile remains.
+
+The retained change enables the existing fused attention preamble by default
+for plain-BF16 attention as well as FP4, while keeping FP8 default-off and CPU
+on the portable path. It combines q/gate split, q/k RMSNorm and RoPE, and reuses
+one once-per-step cos/sin cache. `VT_FUSE_ATTN_PREAMBLE=0` remains the exact
+same-binary fallback. Two interleaved short-workload pairs measured fused
+7189.29/7202.24 (mean 7195.77) versus split 7089.57/7085.99 (mean 7087.78),
+**+1.52%**. Natural greedy remains the established **15/16**, with only request
+1 first differing at generated token 6. `test_ops_attn_preamble` passes and
+pins the known one-ULP q/k relationship.
+
+The remaining group-5 sweeps produced no retained changes. FLA's own H=32
+autotune candidates (`solve_tril` w8/s3, `recompute_w_u` w4/s2) measured
+7197.04/7188.57 (mean 7192.81), 0.04% below the current reference, so the proven
+w4/s3 pins were restored. Exact-RNG random-sampler block counts 32/64/128/256
+measured 7202.59/7194.32/7200.44/7203.38; this is noise-level and the existing
+256-block default was marginally best, so the tuning hook was removed. The CUDA
+sampler suite passes 22/22 with 279,751 assertions.
+
+Final exact workload after rebasing onto upstream `dc5aa1b` (Qwen3.5-4B snapshot
+`851bf6e`, ShareGPT exact 1024 input, 128 output, 128 requests, concurrency 32,
+mnbt 2048, seed 0): greedy 6438.32/6430.66, mean **6434.49 tok/s**, versus the
+prior 6320.29 (+1.81%) and unchanged vLLM 6719.53 (**0.9576x**);
+temperature-1 6255.41/6252.21, mean **6253.81**, versus prior 6149.75 (+1.69%)
+and vLLM 6669.28 (**0.9377x**). Performance parity remains open.
+
+The rebase introduced two mechanical integration requirements. Upstream's MTP
+forward path now returns pooled storage, so its deleter was updated to pass the
+owning backend into the backend-keyed local pool API. Upstream also made Triton
+AOT artifact declarations fail closed; the local exact-sm_120 `gdn_decode_h32`
+specialization is now conditionally declared in the canonical CMake inventory,
+while the sm_121a vendored contract remains unchanged.
+
+Verification on the rebased tree: the full CPU build and CTest pass **105/105**.
+The full native-sm_120 Triton AOT regeneration and CUDA build succeed, and CUDA
+CTest passes **105/106**; the sole failure is the unchanged odd-size BF16
+cuBLASLt tolerance case in `test_cuda_ops` (11 outputs at M=17,K=31,N=13).
+The upstream registry additions resolved the former missing
+`qwen36_gguf_greedy` runner. Natural greedy remains 15/16 with the established
+request-1 token-6 divergence. No source from the rejected FA2, post-conv,
+convolution, recurrence, sampler, or cuBLASLt experiments remains.

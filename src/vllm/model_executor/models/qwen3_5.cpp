@@ -986,15 +986,15 @@ bool FuseSiluQuantEnabled() {
 // fused `ni*cs - nih*cs` contracts to a different FMA than the unfused
 // RmsNorm-store + RopeNeox `x*c - y*sn` (pinned by test_ops_attn_preamble). On
 // the 35B (fp8 attn) the deterministic greedy decode is 1-ULP-sensitive and
-// DIVERGED within 16 tokens (measured 2026-07-09) => fp8/bf16-attn default
-// stays OFF. On the 27B (fp4 attn) the token-exact gates PASS with it ON
-// (test_qwen27_paged_engine + the dense-logits deterministic span) => fp4-attn
-// default ON. Unset env => default ON iff fp4_attn; VT_FUSE_ATTN_PREAMBLE=1/0
-// force-overrides either way (same-binary A/B).
-bool FuseAttnPreambleOn(bool fp4_attn) {
+// DIVERGED within 16 tokens (measured 2026-07-09), so fp8 stays OFF. On the 27B
+// (fp4 attn) the token-exact gates pass. The local plain-BF16 Qwen3.5-4B path
+// also preserves its established 15/16 natural-corpus parity and measures
+// faster with the fusion, so plain BF16 defaults ON as well. Unset env => ON
+// for fp4 or plain BF16, OFF for fp8; VT_FUSE_ATTN_PREAMBLE=1/0 force-overrides.
+bool FuseAttnPreambleOn(bool fp4_attn, bool fp8_attn) {
   static const char* e = std::getenv("VT_FUSE_ATTN_PREAMBLE");
   if (e != nullptr) return e[0] == '1';
-  return fp4_attn;
+  return fp4_attn || !fp8_attn;
 }
 
 // FA-2 PREFILL (the last measured 27B prefill gap): route the full-attn PREFILL
@@ -2243,8 +2243,9 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
 // PERSISTENT sdi.positions device buffer (same source the RopeNeox path reads) so
 // the fill is a single device kernel — eager and graph-replay identical.
 void MaybeBuildAttnCosSin(Dev d, StepDevInputs& sdi, const HfConfig& cfg, int64_t T,
-                          bool fp4_attn = false) {
-  if (!FuseAttnPreambleOn(fp4_attn)) return;
+                          bool fp4_attn, bool fp8_attn) {
+  if (!FuseAttnPreambleOn(fp4_attn, fp8_attn)) return;
+  if (d.q.device.type != vt::DeviceType::kCUDA) return;
   const int rot = static_cast<int>(cfg.rotary_dim);
   if (rot <= 0) return;
   sdi.attn_cos_sin = DBuf(d, DType::kF32, {T, rot});
@@ -2553,7 +2554,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   DBuf dq3(d, DType::kF32, {T, Hq, Dh});
   DBuf dk3(d, DType::kF32, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
-  if (FuseAttnPreambleOn(fp4) && rot > 0 && d.q.device.type == vt::DeviceType::kCUDA) {
+  if (FuseAttnPreambleOn(fp4, fp8) && rot > 0 && d.q.device.type == vt::DeviceType::kCUDA) {
     DBuf dpos(d, DType::kI32, {T}, positions.data());
     DBuf cos_sin(d, DType::kF32, {T, rot});
     vt::RopeCosSinCache(d.q, cos_sin.t(), dpos.t(), vt::RopeArgs{base, rot});
@@ -2646,7 +2647,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor vf = qkv_out.value;
 
   // Split q|gate + per-head gemma-RMSNorm(q,k) + partial NeoX RoPE + gate
-  // passthrough. VT_FUSE_ATTN_PREAMBLE (default OFF) collapses the four ops into
+  // passthrough. VT_FUSE_ATTN_PREAMBLE collapses the four ops into
   // ONE launch reading the per-step cos_sin cache (sdi.attn_cos_sin, built once by
   // MaybeBuildAttnCosSin and reused by all 11 full-attn layers) — mirror of vLLM's
   // fused_qk_rmsnorm_rope (fla fused_qk_norm_rope.py:95-102, zero in-kernel
@@ -2665,14 +2666,15 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // T > num_reqs; head_dim 256; bf16 KV; CUDA) so the bf16 query is consumed by
   // FA-2. Decode steps keep f32 q/out + the graph-captured decode kernels,
   // byte-identical to today.
-  const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
+  const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4, fp8) &&
+                           sdi.has_attn_cos_sin &&
                            d.q.device.type == vt::DeviceType::kCUDA &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
   const DType attn_dt = fa2_prefill ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});
   DBuf dk3(d, attn_dt, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
-  if (FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin) {
+  if (FuseAttnPreambleOn(fp4, fp8) && sdi.has_attn_cos_sin) {
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
     vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate,
@@ -3719,14 +3721,17 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // state indices) into persistent device buffers all layers read — replaces the
   // per-layer H2D re-uploads (the decode host-stall root; see StepDevInputs).
   StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
-  // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
-  // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
-  const bool fp4_attn = [&] {
-    for (const auto& l : weights.layers)
-      if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
-    return false;
-  }();
-  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  // Build the fused-preamble cos|sin cache ONCE. The weight type keys the
+  // per-path default: fp4/plain-BF16 ON, fp8 OFF.
+  bool fp4_attn = false, fp8_attn = false;
+  for (const auto& l : weights.layers) {
+    if (!l.is_linear_attention) {
+      fp4_attn = !l.attn.q_proj_fp4.Empty();
+      fp8_attn = !l.attn.q_proj_fp8.Empty();
+      break;
+    }
+  }
+  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn, fp8_attn);
 
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
@@ -4120,7 +4125,9 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
   const size_t allocation = normalized.alloc_bytes();
   void* storage = normalized.Release();
   out.storage = std::shared_ptr<void>(
-      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+      storage, [backend = &device.b, allocation](void* ptr) {
+        Pool().Put(*backend, allocation, ptr);
+      });
   return out;
 }
 
@@ -4239,14 +4246,17 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
   StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
-  // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
-  // default (the real 27B W4A4 => ON; bf16/GGUF dense => OFF; env overrides).
-  const bool fp4_attn = [&] {
-    for (const auto& l : weights.layers)
-      if (!l.is_linear_attention) return !l.attn.q_proj_fp4.Empty();
-    return false;
-  }();
-  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
+  // Build the fused-preamble cos|sin cache ONCE. The weight type keys the
+  // per-path default: fp4/plain-BF16 ON, fp8 OFF.
+  bool fp4_attn = false, fp8_attn = false;
+  for (const auto& l : weights.layers) {
+    if (!l.is_linear_attention) {
+      fp4_attn = !l.attn.q_proj_fp4.Empty();
+      fp8_attn = !l.attn.q_proj_fp8.Empty();
+      break;
+    }
+  }
+  MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn, fp8_attn);
 
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the

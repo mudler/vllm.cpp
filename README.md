@@ -501,14 +501,17 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   corpora remain 9/16 and 10/16, so this is **not full parity qualification**.
   Ordinary BF16 linears now retain torch's raw `[N,K]` layout and BF16 outputs,
   and a default-on sm_120 Triton AOT decode recurrence cuts that kernel from
-  2.42 s to 0.64 s per trace window (about 192 to 51 us/call).
+  2.42 s to 0.64 s per trace window (about 192 to 51 us/call). The fused
+  attention preamble now also defaults on for plain BF16 (FP8 remains off),
+  replacing split + q/k norm + RoPE with one kernel and one shared cos/sin cache;
+  `VT_FUSE_ATTN_PREAMBLE=0` restores the prior path.
 
   On the exact 128-request, concurrency-32, 1024-in/128-out workload, ordinary
-  BF16 MLP gate/up weights are now stacked at load and executed as one GEMM,
-  mirroring vLLM's `MergedColumnParallelLinear`. Two reproduced temperature-1
-  runs average **6,139.06 tok/s** versus vLLM **6,669.28 tok/s (0.921×)**; two
-  greedy runs average **6,308.50 tok/s** versus vLLM **6,719.53 tok/s
-  (0.939×)**. These are open gaps, not performance parity.
+  BF16 MLP gate/up and GDN B/A weights are now stacked at load and each pair is
+  executed as one GEMM, mirroring vLLM's merged parameters. Two reproduced
+  temperature-1 runs average **6,253.81 tok/s** versus vLLM **6,669.28 tok/s
+  (0.938×)**; two greedy runs average **6,434.49 tok/s** versus vLLM
+  **6,719.53 tok/s (0.958×)**. These are open gaps, not performance parity.
   Random sampling uses the same exponential-race distribution as vLLM and has
   an empirical distribution test, but deterministic token streams differ because
   the project still uses SplitMix while vLLM uses torch Philox. The fresh Nsight

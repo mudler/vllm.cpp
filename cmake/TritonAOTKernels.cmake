@@ -95,6 +95,17 @@ function(vllm_triton_aot_declare_all)
       "NT,${_H},1"
       "${_wu_head}, ${_H}, 16, 128, 128, 64, 64, 64, 1")
   endforeach()
+
+  # Local RTX sm_120 decode specialization. This is regenerated into the local
+  # maintainer artifact directory and is deliberately absent from the sm_121a
+  # vendored gate contract.
+  if(DEFINED VLLM_CPP_CUDA_ARCHITECTURES AND
+     VLLM_CPP_CUDA_ARCHITECTURES STREQUAL "120")
+    _vllm_triton_aot_declare(
+      gdn_decode_h32 decode_gdn.py gdn_decode_kernel
+      4 3 "4,N*32,1"
+      "*bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *fp32:16, *bf16:16, *i32:16, i32, 16, 32, 128, 128, 32")
+  endif()
 endfunction()
 
 function(vllm_triton_aot_expected_lines OUT_VAR)

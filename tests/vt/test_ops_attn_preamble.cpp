@@ -222,9 +222,10 @@ TEST_CASE("attn preamble fused == unfused (f32, gemma) bit-identity") {
   // `ni*cs - nih*cs` contracts to a DIFFERENT FMA than the unfused RmsNorm-store +
   // RopeNeox `x*c - y*sn`, so the fusion is NOT bit-identical. On the 35B (fp8) the
   // deterministic greedy decode is 1-ULP-sensitive and DIVERGES within 16 tokens, so
-  // VT_FUSE_ATTN_PREAMBLE stays DEFAULT-OFF (it fails the token-exact gate). This
-  // test PINS that relationship (gate exact; q/k within 1 ULP) so a future agent
-  // does not flip the default on the (false) assumption of bit-identity.
+  // The fp8 path stays DEFAULT-OFF because it fails the 35B token-exact gate.
+  // FP4 and plain BF16 have separate passing gates and may default ON. This test
+  // pins the underlying relationship (gate exact; q/k within 1 ULP) so defaults
+  // are not changed on the false assumption of bit-identity.
   CHECK(dg == 0.0f);                 // gate: bit-identical
   CHECK(dq <= 3.0e-7f);              // q: within ~1 f32 ULP, but NOT zero
   CHECK(dk <= 3.0e-7f);              // k: within ~1 f32 ULP, but NOT zero

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -189,11 +190,15 @@ class OnlineClientContractTests(unittest.TestCase):
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
-            ["python3", "-m", "tools.bench.make_serve_low_corpus"],
+            [
+                "/oracle/bin/python",
+                "-m",
+                "tools.bench.make_serve_low_corpus",
+            ],
         )
         repo = pathlib.Path(__file__).resolve().parents[2]
         result = subprocess.run(
-            [*corpus_command[:3], "--help"],
+            [sys.executable, *corpus_command[1:3], "--help"],
             cwd=repo,
             capture_output=True,
             check=False,

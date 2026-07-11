@@ -3942,3 +3942,19 @@ root; the focused client suite passes 8/8. The old `0295e72` evidence directory
 is not reused because the plan is commit-bound. After this repair merges, make
 a new dry-run manifest and corpora under the new full SHA, then start the 27B
 whole-model lock before the 35B series. README capability state is unchanged.
+
+## 2026-07-11 — corpus preparation pins the oracle Python environment
+
+The next clean no-GPU dry-run at `176dea5` recorded the corrected module form,
+but executing it exposed a second independent provenance defect: host
+`python3` has no `tokenizers` package, while the pinned vLLM 0.24.0 environment
+provides `tokenizers` 0.22.2. Again, no corpus row, model process, GPU lock or
+benchmark result was created.
+
+Because `build_plan` already receives the absolute pinned vLLM client, it now
+derives the corpus interpreter from the same environment as
+`<client-parent>/python` and retains `-m tools.bench.make_serve_low_corpus`.
+The plan test asserts `/oracle/bin/python` for its synthetic client and executes
+the module suffix under the test interpreter. Regenerate under the new merged
+SHA; only a successfully generated and converted pair of corpus manifests may
+precede the first 27B GPU lock. README capability state remains unchanged.

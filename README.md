@@ -267,12 +267,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
   for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
-  `DONE`). The clean `8289cbd` 27B attempt then failed closed at c32 because the
-  requested final usage frame was missing: 192/192 requests completed, but one
-  128-frame response re-tokenized to 126. Native-ID final/continuous usage,
-  non-stream validation, and force mode are now implemented and
-  CPU/ASan/UBSan/TSan-green; a fresh merged-SHA 27B→35B rerun remains. No metric
-  or ratio from the partial arm is binding.
+  `DONE`). A fresh `a40a9e3` 27B campaign proved the native-usage repair on all
+  1,488 retained requests: every response reported exactly 128 native output
+  IDs. It completed two full interleaved ours/vLLM ladders and ours rep3 through
+  c16, then the harness falsely rejected 12/96 c16 responses with 126 rather
+  than 127 ITLs. Pinned vLLM explicitly permits its producer-ahead
+  `RequestOutputCollector` to merge adjacent DELTA outputs, so those are valid
+  inter-chunk timings, not lost tokens. The validator now mirrors that contract
+  and is regression-tested; the interrupted evidence is still void, and a new
+  commit-bound 27B→35B run is required. No online metric or ratio is binding.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

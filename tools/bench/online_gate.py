@@ -299,8 +299,18 @@ def validate_raw_result(
         raise HarnessError("raw result contains request errors")
     if any(not isinstance(value, str) for value in generated):
         raise HarnessError("raw result did not retain every generated text")
-    if any(not isinstance(row, list) or len(row) != OUTPUT_LEN - 1 for row in itls):
-        raise HarnessError("each request must retain output_len-1 ITL samples")
+    # RequestOutputCollector deliberately merges DELTA outputs when the
+    # producer gets ahead of the consumer (matching pinned vLLM). The pinned
+    # benchmark client consequently treats ITLs as inter-*chunk* timings and
+    # uses native usage for the exact token count; one chunk may carry more
+    # than one token. Reject impossible extra timing events, but do not reject
+    # an upstream-legal merged delta merely because it retained fewer than
+    # OUTPUT_LEN - 1 intervals.
+    if any(
+        not isinstance(row, list) or len(row) > OUTPUT_LEN - 1
+        for row in itls
+    ):
+        raise HarnessError("request ITL samples exceed output_len-1 chunk intervals")
     for name, values in (("ttfts", ttfts), ("start_times", start_times)):
         for index, value in enumerate(values):
             if require_number(value, f"{name}[{index}]") < 0.0:

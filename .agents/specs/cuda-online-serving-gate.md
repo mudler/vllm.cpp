@@ -47,7 +47,8 @@ coverage at `tests/examples/test_bench.cpp:15-48`. Offline throughput gates
 exist, but they do not prove online queueing, streaming, connection handling,
 or TTFT/ITL parity. `tools/bench/online_gate.py` now constructs the unmodified
 pip-vLLM 0.24.0 oracle command audited against the source pin, freezes
-exact-token corpus views and rejects partial or bundled-stream results;
+exact-token corpus views and rejects partial results while accepting pinned-
+vLLM's producer-ahead DELTA aggregation;
 `online_gate_summary.py` makes any missing/mismatched
 model, stream, memory-return, trace or every-axis artifact non-binding. The
 failed pre-W2 campaigns remain diagnostics; partial rows are never reused as
@@ -92,6 +93,12 @@ successful repetitions.
 - Client contracts cover vLLM's bucket-boundary false overlap: the upstream
   bucketed peak is retained, while exact start + TTFT + ITL intervals must reach
   the configured concurrency and use end-before-start ordering at ties.
+- Client contracts also cover producer-ahead DELTA aggregation. Pinned vLLM's
+  `RequestOutputCollector` merges queued DELTA outputs, and its benchmark client
+  explicitly counts output tokens from native usage because one streamed choice
+  may contain multiple tokens. Exact native output counts remain mandatory;
+  retained ITLs are inter-chunk timings and may therefore number fewer than
+  `output_len - 1`. More timing events than that bound remain invalid.
 - Applicable `tests/entrypoints/openai/` streaming, disconnect, usage, and error
   cases before relying on HTTP measurements.
 - Local conformance and benchmark tests remain prerequisites. Any upstream case
@@ -109,7 +116,8 @@ tokens must pass the configured deterministic/logprob correctness gate before
 performance is compared. vllm.cpp must be no worse on every throughput,
 latency, error, and memory axis; a failed start or request voids that arm. The
 configured concurrency must be reached by an exact sweep of each request's
-half-open `[start_time, start_time + ttft + sum(itls))` interval. Pinned vLLM's
+observed half-open `[start_time, start_time + ttft + sum(itls))` interval.
+Pinned vLLM's
 inclusive one-second `max_concurrent_requests` remains hashed diagnostic data
 but is not a saturation oracle because it can overcount sequential boundaries.
 The committed summary exits nonzero unless every detailed result, exact generated

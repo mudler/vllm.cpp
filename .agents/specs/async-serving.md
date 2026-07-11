@@ -93,8 +93,8 @@ freeze the A/B denominators.
 This table freezes the gaps that justified the work breakdown. Current
 lifecycle truth lives in `engine-matrix.md`: W1, W2 and W4 are now implemented
 and `GATING`; W3 remains `READY`. In particular, the synchronous/fake-SSE
-statements below describe the pre-W2 binary retained for the ongoing baseline
-campaign, not the new production server path.
+statements below describe the archived pre-W2 diagnostic binary, not the new
+production server path or the current online campaign.
 
 | Area | Anchor | Honest state |
 |---|---|---|
@@ -108,7 +108,7 @@ campaign, not the new production server path.
 | Scheduler seam | `include/vllm/v1/core/sched/scheduler.h:83` (non-virtual class), `:201-205` (`update_after_schedule` private) | No subclass seam for `AsyncScheduler`'s two overrides; needs protected-virtual hooks (W3) |
 | Request queue | `include/vllm/v1/core/sched/request_queue.h:26-27,41-44,99-100` | FCFS complete; `create_request_queue(kPriority)` deliberately throws — priority is a marked T1 hole (W4) |
 | Runner | `src/vllm/v1/worker/gpu/runner.cpp:645-730`; `include/vllm/v1/worker/gpu/runner.h:141-144` | `execute_model`/`sample_tokens` split already mirrored (MRV2); sampled ids D2H synchronously + host write-back into `token_ids_cpu` each step (`runner.cpp:706-730`); no GPU-resident `last_sampled_tokens`, no copy stream/event |
-| Bench harness | `examples/bench/bench_core.h:96,468`; `examples/server/main.cpp:60,121` | Offline throughput modes exist; the online serve A/B harness lives with `CLAIM-SERVE-GATE-1` (DGX `~/work/vllm.cpp-latency`) and consumes this work |
+| Bench harness | `examples/bench/bench_core.h:96,468`; `examples/server/main.cpp:60,121` | Offline throughput modes exist; the online serve A/B harness lives with `CLAIM-SERVE-GATE-1` (DGX evidence root `~/work/vllm.cpp-online-gate`) and consumes this work |
 
 ## Port map
 
@@ -177,7 +177,7 @@ lock.
 |---|---|---|
 | G1 token-exactness (W1-W4) | both greedy engine gates, same binary, async ON vs OFF and priority vs fcfs: `flock /tmp/gpu -c 'ctest -R qwen36_paged_engine'` + same for `qwen27_paged_engine` on DGX | 16/16 token-for-token identical in every mode; a diff = hard fail |
 | G2 unit/property suites (per leaf) | `ctest` CPU tier (CI) for the ported modules above | green, skips only with tracked reasons |
-| G3 streaming reality (W2) | conformance arrival-time case + manual `curl -N` sanity; then `vllm bench serve` (upstream client, `~/venvs/vllm-oracle`) against our server at c∈{1,16} | TTFT << total latency at c=1 (first chunk arrives while decode continues); ITL count = token count - 1; **this makes `SERVE-GATE-ONLINE` runnable — the every-axis online campaign (benchmark-protocol.md, TTFT/TPOT/ITL/throughput/memory, both gate models) IS the e2e gate**, executed with/handed to `CLAIM-SERVE-GATE-1`'s harness (DGX `~/work/vllm.cpp-latency`) |
+| G3 streaming reality (W2) | conformance arrival-time case + manual `curl -N` sanity; then `vllm bench serve` (upstream client, `~/venvs/vllm-oracle`) against our server at c∈{1,16} | TTFT << total latency at c=1 (first chunk arrives while decode continues); native usage proves the exact token count and retained ITLs are inter-choice timings. The normal cadence is token count - 1, but pinned vLLM's producer-ahead `RequestOutputCollector` may legally merge DELTA outputs, so fewer intervals are recorded rather than rejected; **this makes `SERVE-GATE-ONLINE` runnable — the every-axis online campaign (benchmark-protocol.md, TTFT/TPOT/ITL/throughput/memory, both gate models) IS the e2e gate**, executed with/handed to `CLAIM-SERVE-GATE-1`'s harness (DGX `~/work/vllm.cpp-online-gate`) |
 | G4 no-throughput-regression (W1/W2) | offline gate workloads re-run vs the pre-change binary (same-binary-set A/B, fresh vLLM denominators per benchmark-protocol.md): 35B and 27B `vllm bench throughput` mirrors | ≥ 1.00× vs our own sync baseline within run-noise; the standing ≥ vLLM floors (35B 1.02×, 27B 1.007×, state.md 2026-07-10) not lost |
 | G5 overlap wins (W3) | same A/B with async ON vs OFF on both gate models, plus the nsys trace-plan capture | async ON ≥ async OFF on throughput axes and ≤ on TTFT/TPOT (mirroring vLLM's own default rationale); GPU-idle gap between steps shrinks in the trace |
 | G6 memory | peak RSS/VRAM sampled in the same A/Bs | ≤ sync baseline + bounded queue overhead; the ~25-35%-less-than-vLLM edge not regressed |

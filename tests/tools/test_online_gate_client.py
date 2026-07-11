@@ -123,7 +123,9 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertIn("--ignore-eos", command)
             self.assertEqual(command[command.index("--temperature") + 1], "0")
 
-    def test_result_validation_rejects_partial_failed_or_bundled_streams(self) -> None:
+    def test_result_validation_accepts_merged_deltas_and_rejects_invalid_cadence(
+        self,
+    ) -> None:
         validate_raw_result(valid_record(), concurrency=1)
         bucketed_boundary = valid_record()
         bucketed_boundary["max_concurrent_requests"] = 2
@@ -135,10 +137,22 @@ class OnlineClientContractTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "partial"):
             validate_raw_result(partial, concurrency=1)
 
-        bundled = valid_record()
-        bundled["itls"][0].pop()
-        with self.assertRaisesRegex(HarnessError, "output_len-1"):
-            validate_raw_result(bundled, concurrency=1)
+        # RequestOutputCollector mirrors pinned vLLM's legal producer-ahead
+        # merge. The native usage count remains exact while one SSE choice can
+        # carry two token deltas, leaving 126 rather than 127 ITLs.
+        merged = valid_record()
+        merged["itls"][0].pop()
+        validate_raw_result(merged, concurrency=1)
+
+        over_fragmented = valid_record()
+        over_fragmented["itls"][0].append(0.01)
+        with self.assertRaisesRegex(HarnessError, "exceed output_len-1"):
+            validate_raw_result(over_fragmented, concurrency=1)
+
+        malformed = valid_record()
+        malformed["itls"][0] = "not-a-list"
+        with self.assertRaisesRegex(HarnessError, "exceed output_len-1"):
+            validate_raw_result(malformed, concurrency=1)
 
         unsaturated = valid_record(requests=6, concurrency=2)
         unsaturated["start_times"] = [float(index) * 2.0 for index in range(6)]

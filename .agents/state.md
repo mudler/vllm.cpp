@@ -4108,3 +4108,53 @@ series followed by 35B under separate whole-model locks. Binding closure still
 requires every request to report 128 native output IDs, full repetitions,
 fresh vLLM denominators, final/continuous serialization A/B, all latency /
 throughput/memory axes, memory return, and paired traces.
+
+## 2026-07-11 — 27B native usage passes; merged-DELTA validator failure is void
+
+The fresh exact-main `a40a9e3bb9b4de52f75d02b0b387dda26cb0f97b`
+27B online campaign held its whole-model `/tmp/gpu` lock and passed oracle/build
+provenance, the model gate, the enumerated 26.55-GB zero-residency transition,
+and the 128-chunk live-SSE probe. It completed two full interleaved ours/vLLM
+c1/c2/c4/c8/c16/c32 ladders, then ours repetition 3 through c16: 29 raw points,
+1,488 completed requests, zero request errors, and exact native prompt/output
+counts in every retained result. The native `stream_options.include_usage`
+repair therefore closes the old decoded-text fallback symptom on this partial
+27B execution.
+
+The driver stopped after `ours/c16-r3.json` because 12 of its 96 successful
+128-token requests retained 126 rather than 127 ITLs; the other 84 retained
+127. Raw, client-log, and driver-log SHA-256 values are respectively
+`d06a9afef9e4db119588be625f71b86b97cbd2e18839caaca3afe962a086b428`,
+`d63182fccda8cbee40bc7a506ba960fcc334cf6b8c20759b0b32743e05ddcb63`,
+and `b0167be1fa4ecc8fcf1da99a1738596cd4e5a24b3a7a558bf9acd7110199ce07`.
+The model-gate log SHA is
+`be69c435d9c624559697016bbfafec38773aa09d2eef204065e49dae7364cae8`.
+The server/process tree exited, `/tmp/gpu` has no holder, and the GB10 is idle.
+Ours c32-r3, vLLM repetition 3, paired traces, final memory return and the 35B
+series never ran, so every partial timing/memory value and ratio remains void.
+
+This was a validator defect, not a missing token or streaming regression.
+Pinned vLLM documents and implements producer-ahead DELTA aggregation in
+`vllm/v1/engine/output_processor.py:45-82`; its own benchmark warns at
+`vllm/benchmarks/serve.py:589-604` that multiple output tokens can be bundled
+and prefers native usage for the exact token count. Our collector mirrors the
+same single-slot merge at `src/vllm/v1/engine/output_processor.cpp:16-28,75-103`.
+The corrected validator at `tools/bench/online_gate.py:286-320` therefore keeps
+exact native 128-token counts mandatory, treats retained ITLs as observed
+inter-choice timings, accepts fewer than 127 when deltas merge, and still
+rejects non-lists, more than 127 intervals, errors, count drift, or unsaturated
+concurrency. The regression at
+`tests/tools/test_online_gate_client.py:126-160` covers the observed 126-ITL
+case plus over-fragmented and malformed failures. The preserved real c16-r3
+artifact passes the corrected validator. Focused client tests pass **8/8**;
+the complete benchmark-tool suite passes **34/34**, agent-record mutations
+**13/13**, documentation-checkpoint mutations **5/5**, the canonical record
+checker reports ENGINE=96 / MODEL=323 / QUANT=81 / KERNEL=30 / BACKEND=51,
+and Python compilation plus `git diff --check` pass.
+
+The previously pushed `a40a9e3` CI run is independently green across commit
+protocol, agent record, the new documentation checkpoint, and full CPU
+build/test. Next: merge this fail-closed harness repair with its required
+README/BENCHMARKS/roadmap/matrix checkpoint, regenerate all SHA-bound evidence,
+then rerun 27B from the beginning before starting 35B. No result from the
+interrupted `a40a9e3` directory is reusable as a successful repetition.

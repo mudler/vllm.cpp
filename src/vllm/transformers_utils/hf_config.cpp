@@ -1,8 +1,12 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
-// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
+// normalization mirrors vllm/transformers_utils/config.py:439-509 and
+// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283
+// @ e24d1b24fe96.
 #include "vllm/transformers_utils/hf_config.h"
 
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace vllm {
@@ -32,6 +36,32 @@ std::vector<std::string> GetStringArray(const nlohmann::json& doc,
   auto it = doc.find(key);
   if (it == doc.end() || it->is_null()) return {};
   return it->get<std::vector<std::string>>();
+}
+
+bool GetBool(const nlohmann::json& doc, const char* key, bool fallback) {
+  auto it = doc.find(key);
+  if (it == doc.end() || it->is_null()) return fallback;
+  return it->get<bool>();
+}
+
+std::vector<int64_t> GetIntArray(const nlohmann::json& doc, const char* key) {
+  auto it = doc.find(key);
+  if (it == doc.end() || it->is_null()) return {};
+  return it->get<std::vector<int64_t>>();
+}
+
+std::optional<double> GetOptionalDouble(const nlohmann::json& doc,
+                                        const char* key) {
+  auto it = doc.find(key);
+  if (it == doc.end() || it->is_null()) return std::nullopt;
+  return it->get<double>();
+}
+
+std::optional<int64_t> GetOptionalInt(const nlohmann::json& doc,
+                                      const char* key) {
+  auto it = doc.find(key);
+  if (it == doc.end() || it->is_null()) return std::nullopt;
+  return it->get<int64_t>();
 }
 
 std::optional<int64_t> GetSlidingWindow(const nlohmann::json& doc) {
@@ -86,6 +116,115 @@ bool IsQwen35Family(const std::string& model_type) {
   return model_type == "qwen3_next" || model_type == "qwen3_5" ||
          model_type == "qwen3_5_moe" || model_type == "qwen3_5_text" ||
          model_type == "qwen3_5_moe_text";
+}
+
+bool LooksLikeNestedRopeParameters(const nlohmann::json& params) {
+  if (params.empty()) return false;
+  for (const auto& item : params.items()) {
+    if (!item.value().is_object()) return false;
+  }
+  return true;
+}
+
+RopeParameters ParseRopeParameters(const nlohmann::json& text,
+                                   double default_partial_rotary_factor,
+                                   const std::string& path,
+                                   bool* has_parameters) {
+  RopeParameters params;
+  params.rope_theta = GetDouble(text, "rope_theta", 10000.0);
+  params.partial_rotary_factor = GetDouble(
+      text, "partial_rotary_factor", default_partial_rotary_factor);
+
+  // Transformers v5 exposes rope_parameters. Older checkpoints use
+  // rope_scaling; pinned patch_rope_parameters standardizes either dictionary
+  // before get_rope sees it. Prefer the modern spelling when both are present.
+  const nlohmann::json* raw = FindObject(text, "rope_parameters");
+  if (raw == nullptr) raw = FindObject(text, "rope_scaling");
+  *has_parameters = raw != nullptr;
+  if (raw == nullptr) return params;
+
+  if (LooksLikeNestedRopeParameters(*raw)) {
+    throw std::runtime_error(
+        "hf_config: nested per-layer rope parameters are not implemented in " +
+        path);
+  }
+
+  std::string modern_type = GetString(*raw, "rope_type");
+  const std::string legacy_type = GetString(*raw, "type");
+  if (!modern_type.empty() && !legacy_type.empty() &&
+      modern_type != legacy_type &&
+      !(legacy_type == "su" && modern_type == "longrope") &&
+      !(legacy_type == "mrope" && modern_type == "default")) {
+    throw std::runtime_error(
+        "hf_config: conflicting rope_type '" + modern_type + "' and type '" +
+        legacy_type + "' in " + path);
+  }
+  if (modern_type.empty()) modern_type = legacy_type;
+  if (modern_type.empty()) modern_type = "default";
+  if (modern_type == "su") modern_type = "longrope";
+  if (modern_type == "mrope") {
+    if (raw->find("mrope_section") == raw->end()) {
+      throw std::runtime_error(
+          "hf_config: legacy rope type 'mrope' requires mrope_section in " +
+          path);
+    }
+    modern_type = "default";
+  }
+  params.rope_type = modern_type;
+
+  params.rope_theta = GetDouble(*raw, "rope_theta", params.rope_theta);
+  params.partial_rotary_factor = GetDouble(
+      *raw, "partial_rotary_factor", params.partial_rotary_factor);
+  params.rope_dim = GetOptionalInt(*raw, "rope_dim");
+  if (params.rope_dim.has_value() && *params.rope_dim == 0) {
+    // Python's `if rotary_dim := ...` treats zero as absent.
+    params.rope_dim.reset();
+  }
+  params.factor = GetOptionalDouble(*raw, "factor");
+  params.original_max_position_embeddings =
+      GetOptionalInt(*raw, "original_max_position_embeddings");
+  params.extrapolation_factor =
+      GetDouble(*raw, "extrapolation_factor", 1.0);
+  params.attn_factor = GetDouble(*raw, "attn_factor", 1.0);
+  params.beta_fast = GetInt(*raw, "beta_fast", 32);
+  params.beta_slow = GetInt(*raw, "beta_slow", 1);
+  params.apply_yarn_scaling =
+      GetBool(*raw, "apply_yarn_scaling", true);
+  params.truncate = GetBool(*raw, "truncate", true);
+  params.mrope_section = GetIntArray(*raw, "mrope_section");
+  params.mrope_interleaved = GetBool(*raw, "mrope_interleaved", false);
+
+  if (params.rope_type == "yarn") {
+    if (!params.factor.has_value() ||
+        !params.original_max_position_embeddings.has_value()) {
+      throw std::runtime_error(
+          "hf_config: yarn rope requires factor and "
+          "original_max_position_embeddings in " +
+          path);
+    }
+    if (!(*params.factor > 0.0) ||
+        *params.original_max_position_embeddings <= 0) {
+      throw std::runtime_error(
+          "hf_config: yarn factor and original_max_position_embeddings must "
+          "be positive in " +
+          path);
+    }
+  } else if (params.rope_type != "default") {
+    // W5 deliberately relaxes the old completeness guard only for YaRN.
+    // W6-W8 add their own typed fields and factory cases before relaxing this.
+    throw std::runtime_error(
+        "hf_config: checkpoint declares rope type '" + params.rope_type +
+        "' which vllm.cpp does not implement yet (supported: default, yarn) in " +
+        path);
+  }
+
+  if (!params.rope_dim.has_value() &&
+      (!(params.partial_rotary_factor > 0.0) ||
+       params.partial_rotary_factor > 1.0)) {
+    throw std::runtime_error(
+        "hf_config: partial_rotary_factor must be in (0, 1] in " + path);
+  }
+  return params;
 }
 
 }  // namespace
@@ -152,7 +291,6 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.linear_value_head_dim = GetInt(text, "linear_value_head_dim", 0);
     cfg.linear_conv_kernel_dim = GetInt(text, "linear_conv_kernel_dim", 0);
 
-    cfg.rope_theta = GetDouble(text, "rope_theta", 10000.0);
     // Partial rotary factor. When the key is absent, upstream Qwen-family
     // config classes default it to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92);
     // all other models default to full rotary (1.0). The wrapper carries the
@@ -163,52 +301,16 @@ HfConfig LoadHfConfig(const std::string& path) {
         IsQwen35Family(GetString(text, "model_type"))) {
       default_partial_rotary_factor = 0.25;
     }
-    const double partial_rotary_factor = GetDouble(
-        text, "partial_rotary_factor", default_partial_rotary_factor);
-    // Upstream truncates: int(head_dim * partial_rotary_factor)
-    // (rotary_embedding/__init__.py:72).
-    cfg.rotary_dim = static_cast<int64_t>(partial_rotary_factor *
-                                          static_cast<double>(cfg.head_dim));
-
-    // RoPE completeness guard (dep-audit 2026-07-07): we implement ONLY plain
-    // (unscaled) NeoX RoPE (RopeNeox, cuda_ops.cu). vLLM's get_rope bakes
-    // yarn/linear/llama3/longrope/mrope/dynamic scaling into a cos_sin_cache
-    // (rotary_embedding/__init__.py). A checkpoint declaring any such variant would
-    // otherwise be SILENTLY given unscaled embeddings — wrong output, no error signal.
-    // HARD-FAIL at load instead; relax per-variant as each is implemented.
-    // NOTE: `rope_type: "default"` with an `mrope_section` (the Qwen3.6 gate models)
-    // is TEXT-SAFE: for text-only input all mrope position dims equal the text
-    // position, so interleaved mrope collapses to plain NeoX — our text path is
-    // correct. (mrope only diverges for multimodal image/video positions, which we
-    // do not serve yet; guard that when the ViT path lands.) Only a genuine SCALING
-    // rope_type (yarn/linear/llama3/longrope/dynamic) would silently miscompute here.
-    for (const char* rope_key : {"rope_scaling", "rope_parameters"}) {
-      const nlohmann::json* rs = FindObject(text, rope_key);
-      if (rs == nullptr) continue;  // absent or null => plain NeoX, fine
-      std::string rtype = GetString(*rs, "rope_type");
-      if (rtype.empty()) rtype = GetString(*rs, "type");
-      const bool is_plain = rtype.empty() || rtype == "default";
-      if (!is_plain) {
-        throw std::runtime_error(
-            "hf_config: checkpoint declares rope " + std::string(rope_key) +
-            " type '" + rtype +
-            "' which vllm.cpp does not implement yet (only plain unscaled NeoX RoPE). "
-            "Refusing to load rather than silently emit unscaled embeddings; implement "
-            "the variant (cos_sin_cache in RopeNeox) before using this checkpoint.");
-      }
-    }
-    // rope_theta / partial_rotary_factor may live under the newer nested
-    // `rope_parameters` (Qwen3.6) rather than at the text_config top level. Prefer
-    // the nested values when present so we don't silently fall back to the 10000
-    // default when the checkpoint sets e.g. rope_theta=1e7. (dep-audit 2026-07-07)
-    if (const nlohmann::json* rp = FindObject(text, "rope_parameters")) {
-      const double rp_theta = GetDouble(*rp, "rope_theta", cfg.rope_theta);
-      if (rp_theta != cfg.rope_theta) cfg.rope_theta = rp_theta;
-      const double rp_prf = GetDouble(*rp, "partial_rotary_factor", partial_rotary_factor);
-      if (rp_prf != partial_rotary_factor) {
-        cfg.rotary_dim = static_cast<int64_t>(rp_prf * static_cast<double>(cfg.head_dim));
-      }
-    }
+    cfg.rope_parameters = ParseRopeParameters(
+        text, default_partial_rotary_factor, path, &cfg.has_rope_parameters);
+    cfg.rope_theta = cfg.rope_parameters.rope_theta;
+    // Upstream get_rope gives a truthy explicit rope_dim precedence; otherwise
+    // it truncates int(head_dim * partial_rotary_factor).
+    cfg.rotary_dim = cfg.rope_parameters.rope_dim.has_value()
+                         ? *cfg.rope_parameters.rope_dim
+                         : static_cast<int64_t>(
+                               cfg.rope_parameters.partial_rotary_factor *
+                               static_cast<double>(cfg.head_dim));
 
     cfg.rms_norm_eps = GetDouble(text, "rms_norm_eps", 0.0);
     cfg.max_position_embeddings = GetInt(text, "max_position_embeddings", 0);

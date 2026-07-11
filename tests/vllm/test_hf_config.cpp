@@ -1,5 +1,7 @@
 // Sliding-window cases port ModelConfig normalization from
-// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234. RoPE cases port
+// vllm/transformers_utils/config.py:439-509 and rotary_embedding/__init__.py:
+// 33-112,243-283 @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
 #include <cstdio>
@@ -416,5 +418,117 @@ TEST_CASE("LoadHfConfig error paths mention the file path") {
     } catch (const std::runtime_error& e) {
       CHECK(std::string(e.what()).find(f.path()) != std::string::npos);
     }
+  }
+}
+
+TEST_CASE("LoadHfConfig retains the complete typed YaRN parameter slice") {
+  TempJson f(R"({
+    "model_type": "nomic_bert",
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "max_position_embeddings": 8192,
+    "rope_parameters": {
+      "rope_type": "yarn",
+      "rope_theta": 1000.0,
+      "rope_dim": 12,
+      "factor": 4.0,
+      "original_max_position_embeddings": 2048,
+      "extrapolation_factor": 1.25,
+      "attn_factor": 0.75,
+      "beta_fast": 24,
+      "beta_slow": 2,
+      "apply_yarn_scaling": false,
+      "truncate": false,
+      "mrope_section": [2, 2, 2],
+      "mrope_interleaved": true
+    }
+  })");
+  const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+  REQUIRE(cfg.has_rope_parameters);
+  CHECK(cfg.rope_theta == doctest::Approx(1000.0));
+  CHECK(cfg.rotary_dim == 12);
+  CHECK(cfg.rope_parameters.rope_type == "yarn");
+  REQUIRE(cfg.rope_parameters.factor.has_value());
+  CHECK(*cfg.rope_parameters.factor == doctest::Approx(4.0));
+  REQUIRE(cfg.rope_parameters.original_max_position_embeddings.has_value());
+  CHECK(*cfg.rope_parameters.original_max_position_embeddings == 2048);
+  CHECK(cfg.rope_parameters.extrapolation_factor == doctest::Approx(1.25));
+  CHECK(cfg.rope_parameters.attn_factor == doctest::Approx(0.75));
+  CHECK(cfg.rope_parameters.beta_fast == 24);
+  CHECK(cfg.rope_parameters.beta_slow == 2);
+  CHECK_FALSE(cfg.rope_parameters.apply_yarn_scaling);
+  CHECK_FALSE(cfg.rope_parameters.truncate);
+  CHECK(cfg.rope_parameters.mrope_section ==
+        std::vector<int64_t>{2, 2, 2});
+  CHECK(cfg.rope_parameters.mrope_interleaved);
+}
+
+TEST_CASE("LoadHfConfig normalizes legacy and default MRoPE dictionaries") {
+  SUBCASE("legacy rope_scaling type yarn is standardized") {
+    TempJson f(R"({
+      "model_type": "legacy",
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "rope_theta": 5000.0,
+      "rope_scaling": {
+        "type": "yarn",
+        "factor": 2.0,
+        "original_max_position_embeddings": 32
+      }
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.rope_parameters.rope_type == "yarn");
+    CHECK(cfg.rope_parameters.rope_theta == doctest::Approx(5000.0));
+    CHECK(*cfg.rope_parameters.factor == doctest::Approx(2.0));
+  }
+
+  SUBCASE("legacy mrope type becomes default and retains sections") {
+    TempJson f(R"({
+      "model_type": "qwen_vl",
+      "hidden_size": 64,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 4,
+      "rope_parameters": {
+        "type": "mrope",
+        "rope_theta": 1000000.0,
+        "mrope_section": [2, 3, 3],
+        "mrope_interleaved": true
+      }
+    })");
+    const vllm::HfConfig cfg = vllm::LoadHfConfig(f.path());
+    CHECK(cfg.rope_parameters.rope_type == "default");
+    CHECK(cfg.rope_parameters.mrope_section ==
+          std::vector<int64_t>{2, 3, 3});
+    CHECK(cfg.rope_parameters.mrope_interleaved);
+  }
+}
+
+TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
+  const std::string prefix = R"({
+    "model_type": "rope_test",
+    "hidden_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "rope_parameters": )";
+  SUBCASE("future formula family remains rejected until its leaf lands") {
+    TempJson f(prefix + R"({"rope_type":"llama3"}})");
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("does not implement yet"),
+                         std::runtime_error);
+  }
+  SUBCASE("YaRN requires both dispatch fields") {
+    TempJson f(prefix + R"({"rope_type":"yarn","factor":4.0}})");
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("requires factor"),
+                         std::runtime_error);
+  }
+  SUBCASE("nested per-layer parameters cannot silently become default") {
+    TempJson f(prefix +
+               R"({"full_attention":{"rope_type":"default"},"sliding_attention":{"rope_type":"yarn"}}})");
+    CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
+                         doctest::Contains("nested per-layer"),
+                         std::runtime_error);
   }
 }

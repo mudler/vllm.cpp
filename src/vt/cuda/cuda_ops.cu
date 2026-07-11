@@ -420,6 +420,116 @@ void RopeNeoxKernelCuda(Queue& q, Tensor& qs, Tensor& ks, const Tensor& pos,
 }
 
 // ---------------------------------------------------------------------------
+// Supplied-cache RoPE. Ported from pinned vLLM base.py:160-252,
+// csrc/libtorch_stable/pos_encoding_kernels.cu:8-200, and the 3-axis selection
+// in mrope.py:14-187,263-375 @ e24d1b24fe96. This hot kernel performs only
+// cache lookup + rotation; YaRN formula construction happens once on the host.
+
+__device__ inline int MropeAxisForPair(int64_t pair, int section_t,
+                                       int section_h, int section_w,
+                                       bool interleaved) {
+  if (interleaved) {
+    if (pair % 3 == 1 && pair <= 3LL * section_h) return 1;
+    if (pair % 3 == 2 && pair <= 3LL * section_w) return 2;
+    return 0;
+  }
+  if (pair < section_t) return 0;
+  if (pair < static_cast<int64_t>(section_t) + section_h) return 1;
+  return 2;
+}
+
+template <typename T, typename Tid>
+__global__ void RopeFromCacheKernel(
+    T* qs, T* ks, const Tid* positions, const T* cache, int64_t cache_rows,
+    int64_t tokens, int64_t hq, int64_t hk, int64_t head_dim, int rotary_dim,
+    int64_t half, bool is_neox_style, bool is_mrope, int section_t,
+    int section_h, int section_w, bool mrope_interleaved, int64_t n) {
+  const int64_t heads = hq + hk;
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                         threadIdx.x;
+       idx < n; idx += step) {
+    const int64_t pair = idx % half;
+    const int64_t head = (idx / half) % heads;
+    const int64_t token = idx / (half * heads);
+    const int axis =
+        is_mrope ? MropeAxisForPair(pair, section_t, section_h, section_w,
+                                   mrope_interleaved)
+                 : 0;
+    const int64_t position_offset =
+        is_mrope ? static_cast<int64_t>(axis) * tokens + token : token;
+    const int64_t position = static_cast<int64_t>(positions[position_offset]);
+    // The public contract, like upstream's custom op, requires positions to be
+    // valid cache rows. Avoid an out-of-bounds read if a broken caller violates
+    // it; CPU validation reports the exact error in reference tests.
+    if (position < 0 || position >= cache_rows) continue;
+    const int64_t cache_offset = position * rotary_dim;
+    const float c = Load(cache, cache_offset + pair);
+    const float sn = Load(cache, cache_offset + half + pair);
+
+    T* states = head < hq ? qs : ks;
+    const int64_t local_head = head < hq ? head : head - hq;
+    const int64_t local_heads = head < hq ? hq : hk;
+    const int64_t row = (token * local_heads + local_head) * head_dim;
+    const int64_t first = is_neox_style ? pair : pair * 2;
+    const int64_t second = is_neox_style ? pair + half : pair * 2 + 1;
+    const float x = Load(states, row + first);
+    const float y = Load(states, row + second);
+    Store(states, row + first, x * c - y * sn);
+    Store(states, row + second, x * sn + y * c);
+  }
+}
+
+template <typename T, typename Tid>
+void LaunchRopeFromCacheTyped(cudaStream_t stream, Tensor& qs, Tensor* ks,
+                              const Tensor& positions, const Tensor& cache,
+                              const RopeArgs& args) {
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
+  const int64_t half = args.rotary_dim / 2;
+  const int64_t n = tokens * (hq + hk) * half;
+  if (n == 0) return;
+  RopeFromCacheKernel<T, Tid><<<GridFor(n), kBlock, 0, stream>>>(
+      qs.Ptr<T>(), ks == nullptr ? nullptr : ks->Ptr<T>(),
+      positions.Ptr<Tid>(), cache.Ptr<T>(), cache.shape[0], tokens, hq, hk,
+      qs.shape[2], args.rotary_dim, half, args.is_neox_style,
+      positions.rank == 2, args.mrope_section[0], args.mrope_section[1],
+      args.mrope_section[2], args.mrope_interleaved, n);
+}
+
+template <typename T>
+void LaunchRopeFromCache(cudaStream_t stream, Tensor& qs, Tensor* ks,
+                         const Tensor& positions, const Tensor& cache,
+                         const RopeArgs& args) {
+  if (positions.dtype == DType::kI32) {
+    LaunchRopeFromCacheTyped<T, int32_t>(stream, qs, ks, positions, cache,
+                                         args);
+  } else {
+    LaunchRopeFromCacheTyped<T, int64_t>(stream, qs, ks, positions, cache,
+                                         args);
+  }
+  Check(cudaGetLastError(), "rope_from_cache launch");
+}
+
+void RopeFromCacheKernelCuda(Queue& q, Tensor& qs, Tensor* ks,
+                             const Tensor& positions, const Tensor& cache,
+                             const RopeArgs& args) {
+  switch (qs.dtype) {
+    case DType::kF32:
+      LaunchRopeFromCache<float>(AsStream(q), qs, ks, positions, cache, args);
+      break;
+    case DType::kBF16:
+      LaunchRopeFromCache<__nv_bfloat16>(AsStream(q), qs, ks, positions,
+                                         cache, args);
+      break;
+    default:
+      VT_CHECK(false,
+               "cuda rope_from_cache: unsupported dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // rope_cos_sin_cache: precompute the batch's cos|sin ONCE per step (grid-stride
 // over (token, pair)) so the fused preamble below does zero in-kernel
 // transcendentals. Angle math in DOUBLE + f32 cast — bit-for-bit RopeNeoxKernel's
@@ -899,6 +1009,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
+    RegisterOp(
+        OpId::kRopeFromCache, DeviceType::kCUDA,
+        reinterpret_cast<void*>(
+            static_cast<RopeFromCacheFn>(&RopeFromCacheKernelCuda)));
     RegisterOp(
         OpId::kRopeCosSinCache, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernelCuda)));

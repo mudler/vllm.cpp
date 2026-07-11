@@ -1,5 +1,8 @@
 // vllm.cpp original container reader. Sliding-window normalization mirrors
-// vllm/config/model.py:542-559,654-660,723-726,1232-1234 @ e24d1b24fe96.
+// vllm/config/model.py:542-559,654-660,723-726,1232-1234; typed RoPE
+// normalization mirrors vllm/transformers_utils/config.py:439-509 and
+// model_executor/layers/rotary_embedding/__init__.py:33-112,243-283
+// @ e24d1b24fe96.
 #pragma once
 
 #include <cstdint>
@@ -10,6 +13,35 @@
 #include <nlohmann/json.hpp>
 
 namespace vllm {
+
+// Typed effective view of the scalar YaRN/MRoPE portion of HuggingFace's
+// rope_parameters (or legacy rope_scaling) dictionary. Defaults are the ones
+// consumed by pinned get_rope(). Formula families that follow W5 add their
+// fields here without making model code parse JSON again.
+struct RopeParameters {
+  std::string rope_type = "default";
+  double rope_theta = 10000.0;
+  std::optional<int64_t> rope_dim = std::nullopt;
+  double partial_rotary_factor = 1.0;
+
+  // YaRN fields. factor and original_max_position_embeddings are required
+  // when rope_type == "yarn"; they remain optional so default RoPE has one
+  // unambiguous representation.
+  std::optional<double> factor = std::nullopt;
+  std::optional<int64_t> original_max_position_embeddings = std::nullopt;
+  double extrapolation_factor = 1.0;
+  double attn_factor = 1.0;
+  int64_t beta_fast = 32;
+  int64_t beta_slow = 1;
+  bool apply_yarn_scaling = true;
+  bool truncate = true;
+
+  // MRoPE T/H/W frequency sections. Empty means one-dimensional RoPE.
+  std::vector<int64_t> mrope_section;
+  bool mrope_interleaved = false;
+
+  friend bool operator==(const RopeParameters&, const RopeParameters&) = default;
+};
 
 // Typed view over a HuggingFace config.json. Key names and defaults follow
 // the pinned upstream config classes (vllm/transformers_utils/configs/
@@ -51,6 +83,10 @@ struct HfConfig {
   // RoPE:
   double rope_theta = 10000.0;
   int64_t rotary_dim = 0;  // partial_rotary_factor * head_dim, rounded
+  RopeParameters rope_parameters;
+  // Distinguishes a checkpoint dictionary from effective defaults synthesized
+  // from top-level rope_theta/partial_rotary_factor.
+  bool has_rope_parameters = false;
   double rms_norm_eps = 0.0;
   int64_t max_position_embeddings = 0;
   std::string torch_dtype;

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "npy.h"
+#include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -349,6 +350,84 @@ void RunRope(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   vt::RopeNeox(q, dq.tensor(), dk.tensor(), dpos.tensor(), args);
   double atol = m["tol"]["atol"].get<double>(), rtol = m["tol"]["rtol"].get<double>();
   std::vector<uint8_t> q_host, k_host;
+  RequireMatch("q_out", dq.Download(q, q_host), q_want.tensor, atol, rtol);
+  RequireMatch("k_out", dk.Download(q, k_host), k_want.tensor, atol, rtol);
+}
+
+vllm::RopeParameters ParseLongContextRopeParameters(const json& value) {
+  vllm::RopeParameters params;
+  params.rope_type = value.value("rope_type", std::string("default"));
+  params.rope_theta = value.value("rope_theta", 10000.0);
+  if (value.contains("rope_dim") && !value["rope_dim"].is_null())
+    params.rope_dim = value["rope_dim"].get<int64_t>();
+  params.partial_rotary_factor = value.value("partial_rotary_factor", 1.0);
+  if (value.contains("factor") && !value["factor"].is_null())
+    params.factor = value["factor"].get<double>();
+  if (value.contains("original_max_position_embeddings") &&
+      !value["original_max_position_embeddings"].is_null()) {
+    params.original_max_position_embeddings =
+        value["original_max_position_embeddings"].get<int64_t>();
+  }
+  params.extrapolation_factor = value.value("extrapolation_factor", 1.0);
+  params.attn_factor = value.value("attn_factor", 1.0);
+  params.beta_fast = value.value("beta_fast", int64_t{32});
+  params.beta_slow = value.value("beta_slow", int64_t{1});
+  params.apply_yarn_scaling = value.value("apply_yarn_scaling", true);
+  params.truncate = value.value("truncate", true);
+  params.mrope_section =
+      value.value("mrope_section", std::vector<int64_t>{});
+  params.mrope_interleaved = value.value("mrope_interleaved", false);
+  return params;
+}
+
+// W5 long-context runner: first compares the C++-built dtype cache to the
+// pinned class cache, then uploads that C++ cache and exercises the same
+// supplied-cache apply seam on CPU/CUDA. Thus neither a correct formula with a
+// broken kernel nor a correct kernel replaying the oracle cache can hide.
+void RunLongContextRope(Backend& b, Queue& q, const fs::path& dir,
+                        const json& m) {
+  const json& args = m["args"];
+  const vllm::RopeParameters params =
+      ParseLongContextRopeParameters(args["rope_parameters"]);
+  const int64_t head_size = args["head_size"].get<int64_t>();
+  const int64_t max_position = args["max_position"].get<int64_t>();
+  const bool is_neox_style = args["is_neox_style"].get<bool>();
+  const DType dtype = DtypeFromName(args["dtype"].get<std::string>());
+  auto rope = vllm::get_rope(head_size, max_position, is_neox_style, params,
+                             dtype);
+  REQUIRE(rope->type_name() == args["class_name"].get<std::string>());
+
+  auto cache_want = LoadTensor(dir, m["tensors"]["cos_sin_cache"]);
+  const Tensor cache_host = rope->cos_sin_cache();
+  REQUIRE(cache_host.dtype == cache_want.dtype);
+  REQUIRE(ShapeOf(cache_host) == ShapeOf(cache_want.tensor));
+  const double atol = m["tol"]["atol"].get<double>();
+  const double rtol = m["tol"]["rtol"].get<double>();
+  RequireMatch("cos_sin_cache", cache_host, cache_want.tensor, atol, rtol);
+
+  auto q_in = LoadTensor(dir, m["tensors"]["q_in"]);
+  auto k_in = LoadTensor(dir, m["tensors"]["k_in"]);
+  auto positions = LoadTensor(dir, m["tensors"]["positions"]);
+  auto q_want = LoadTensor(dir, m["tensors"]["q_out"]);
+  auto k_want = LoadTensor(dir, m["tensors"]["k_out"]);
+  const int64_t tokens = q_in.tensor.shape[0];
+  const int64_t hq = args["num_q_heads"].get<int64_t>();
+  const int64_t hk = args["num_kv_heads"].get<int64_t>();
+  REQUIRE(q_in.dtype == dtype);
+  REQUIRE(k_in.dtype == dtype);
+  REQUIRE(q_in.tensor.Numel() == tokens * hq * head_size);
+  REQUIRE(k_in.tensor.Numel() == tokens * hk * head_size);
+
+  DeviceBuf dq(b, q, dtype, {tokens, hq, head_size}, q_in.raw.data.data());
+  DeviceBuf dk(b, q, dtype, {tokens, hk, head_size}, k_in.raw.data.data());
+  DeviceBuf dpositions(b, q, positions.dtype, ShapeOf(positions.tensor),
+                       positions.raw.data.data());
+  DeviceBuf dcache(b, q, dtype, ShapeOf(cache_host), rope->cache_data());
+  rope->forward(q, dpositions.tensor(), dq.tensor(), &dk.tensor(),
+                dcache.tensor());
+
+  std::vector<uint8_t> q_host;
+  std::vector<uint8_t> k_host;
   RequireMatch("q_out", dq.Download(q, q_host), q_want.tensor, atol, rtol);
   RequireMatch("k_out", dk.Download(q, k_host), k_want.tensor, atol, rtol);
 }
@@ -1390,6 +1469,8 @@ int RunGoldenPass(Device dev) {
       RunEmbedding(b, q, entry.path(), m);
     } else if (op == "rope") {
       RunRope(b, q, entry.path(), m);
+    } else if (op == "long_context_rope") {
+      RunLongContextRope(b, q, entry.path(), m);
     } else if (op == "causal_conv1d_fwd") {
       RunCausalConv1dFwd(b, q, entry.path(), m);
     } else if (op == "causal_conv1d_update") {
@@ -1496,7 +1577,8 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  CHECK(cases >= 31);  // 24 pre-M0.8 + 5 MoE + 2 dense_attention (M0.9 Task 2)
+  // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE.
+  CHECK(cases >= 37);
 }
 
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {

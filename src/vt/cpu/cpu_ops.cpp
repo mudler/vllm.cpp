@@ -459,6 +459,77 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   });
 }
 
+// Ported from vLLM's supplied-cache rotary path:
+//   base.py:160-252; common.py:145-185; mrope.py:14-187,263-375
+// @ e24d1b24fe96. Formula construction stays outside this hot apply loop.
+int MropeAxisForPair(int64_t pair, const RopeArgs& args) {
+  if (args.mrope_interleaved) {
+    if (pair % 3 == 1 &&
+        pair <= 3LL * static_cast<int64_t>(args.mrope_section[1])) {
+      return 1;
+    }
+    if (pair % 3 == 2 &&
+        pair <= 3LL * static_cast<int64_t>(args.mrope_section[2])) {
+      return 2;
+    }
+    return 0;
+  }
+  if (pair < args.mrope_section[0]) return 0;
+  if (pair < static_cast<int64_t>(args.mrope_section[0]) +
+                 args.mrope_section[1]) {
+    return 1;
+  }
+  return 2;
+}
+
+void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks,
+                         const Tensor& positions, const Tensor& cache,
+                         const RopeArgs& args) {
+  const int64_t tokens = qs.shape[0];
+  const int64_t hq = qs.shape[1];
+  const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
+  const int64_t head_dim = qs.shape[2];
+  const int64_t half = args.rotary_dim / 2;
+  const bool is_mrope = positions.rank == 2;
+  ForRows(tokens, [&](int64_t row_start, int64_t row_end) {
+    for (int64_t token = row_start; token < row_end; ++token) {
+      for (int64_t pair = 0; pair < half; ++pair) {
+        const int axis = is_mrope ? MropeAxisForPair(pair, args) : 0;
+        const int64_t pos_offset =
+            is_mrope ? static_cast<int64_t>(axis) * tokens + token : token;
+        const int64_t position =
+            positions.dtype == DType::kI32
+                ? static_cast<int64_t>(positions.Ptr<int32_t>()[pos_offset])
+                : positions.Ptr<int64_t>()[pos_offset];
+        VT_CHECK(position >= 0 && position < cache.shape[0],
+                 "rope_from_cache: position outside cache");
+        const int64_t cache_off = position * args.rotary_dim;
+        const float c = LoadF32(cache, cache_off + pair);
+        const float s = LoadF32(cache, cache_off + half + pair);
+        const int64_t first = args.is_neox_style ? pair : pair * 2;
+        const int64_t second =
+            args.is_neox_style ? pair + half : pair * 2 + 1;
+        for (int64_t head = 0; head < hq; ++head) {
+          const int64_t off = (token * hq + head) * head_dim;
+          const float x = LoadF32(qs, off + first);
+          const float y = LoadF32(qs, off + second);
+          StoreF32(qs, off + first, x * c - y * s);
+          StoreF32(qs, off + second, x * s + y * c);
+        }
+        if (ks != nullptr) {
+          for (int64_t head = 0; head < hk; ++head) {
+            const int64_t off = (token * hk + head) * head_dim;
+            const float x = LoadF32(*ks, off + first);
+            const float y = LoadF32(*ks, off + second);
+            StoreF32(*ks, off + first, x * c - y * s);
+            StoreF32(*ks, off + second, x * s + y * c);
+          }
+        }
+      }
+    }
+  });
+}
+
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
 // Per-step RoPE cos|sin cache fill (fused-attn-preamble prep). cos_sin[T,rot] f32:
@@ -1205,6 +1276,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
+    RegisterOp(
+        OpId::kRopeFromCache, DeviceType::kCPU,
+        reinterpret_cast<void*>(
+            static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
     RegisterOp(OpId::kCausalConv1dFwd, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CausalConv1dFwdFn>(&CausalConv1dFwdKernel)));
     RegisterOp(

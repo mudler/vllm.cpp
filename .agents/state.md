@@ -3432,3 +3432,61 @@ used 25,251 MiB while ours c32/192-prompt repetition 3 remained active. Both PR3
 jobs were still queued. W5 begins with pinned source/oracle construction, CPU
 tests and compile-only CUDA validation and will not enqueue behind that
 campaign.
+
+## 2026-07-11 — C5 W5 YaRN typed RoPE foundation implemented and handed to feature gating
+
+`CLAIM-C5-YARN-1` completed its bounded implementation/oracle scope and is
+released. `ATTN-YARN` moves `ACTIVE -> GATING`, never `DONE`. The port adds a
+typed effective view over modern `rope_parameters` and legacy `rope_scaling`,
+including explicit rejection of nested per-layer and unimplemented formula
+families; a mutex-protected cache key/factory over effective dimensions, layout,
+dtype and every W5 field; exact plain/MRoPE YaRN correction-ramp, magnitude and
+truncate behavior; owned f32/bf16 caches; and a backend-neutral supplied-cache
+apply seam. CPU and CUDA implementations cover NeoX/GPT-J, optional base-path
+key, 1-D text positions, and contiguous/interleaved T/H/W MRoPE without formula
+work in the hot loop. Existing default `RopeNeox` behavior is unchanged.
+
+The new oracle tool first tries the installed vLLM package. This recovered host
+has no importable full vLLM environment, so it verifies the upstream checkout's
+full commit as `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`, imports and executes the
+exact pinned `common.py`, `base.py`, `yarn_scaling_rope.py`, and `mrope.py`
+files, and stubs only CustomOp/platform/Triton registration scaffolding. It does
+not reimplement formula or forward behavior. Six fixture directories cover
+f32/bf16, NeoX/GPT-J, truncated/untruncated, magnitude on/off, ordinary YaRN,
+contiguous/interleaved MRoPE, and its 1-D text branch. A clean regeneration to
+`/tmp/vllm-cpp-w5-goldens-repro` is byte-identical to every committed directory.
+
+Fresh local evidence (no DGX command ran):
+
+- clean Release/CUDA-OFF build and full ctest pass **103/103**;
+- `test_hf_config` passes **12 / 123**, `test_rotary_embedding` passes **7 / 137**
+  with two named model/TP dependency skips, `test_ops_rope_cache` passes
+  **5 / 156**, and `test_op_parity` passes **5 / 60**;
+- the same four focused binaries pass Debug ASan+UBSan **4/4** with
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+  `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`;
+- f32 cache/output maximum absolute differences versus the exact pinned source
+  are `1.192e-7`/`2.384e-7`; bf16 caches match exactly and outputs stay within
+  the upstream-derived `atol=1e-2, rtol=1.6e-2` envelope, with maximum absolute
+  difference `1.562e-2`; and
+- the generic op-parity case floor rises from 31 to 37, independently checking
+  the C++-built cache before uploading that cache to exercise the apply kernel;
+  and
+- `scripts/check-agent-record.py`, all **13** record mutation tests, and
+  `git diff --check` pass. This host still has no `clang-format` executable; the
+  warning-clean compiler build is the available style diagnostic.
+
+Read-only DGX inspection at 02:27 UTC showed `CLAIM-SERVE-GATE-1` still holding
+`/tmp/gpu`: our 27B server used 25,253 MiB while the sampled/default-temperature
+c16/16-prompt repetition 1 ran. The full greedy ours arm and sampled c1 were
+complete; sampled c32, the matching vLLM 27B arm, and both 35B arms remained.
+Both PR3 jobs were queued behind the holder. W5 did not enqueue or contaminate
+the campaign, so its CUDA translation unit remains source-only evidence.
+
+Remaining handoff: compile and run the supplied-cache CUDA path on an idle GB10,
+run default-RoPE regression plus a feature-positive Nomic or Qwen-VL consumer,
+trace both engines, and close G6-G9 correctness/throughput/latency/memory gates.
+W6 `ATTN-ROPE-LLAMA3` is now the next dependency-ready C5 leaf; W7/W8 can follow
+on the shared factory/cache API. Until those gates land, README and matrices
+claim an implemented CPU/oracle foundation only, not user-visible YaRN/MRoPE
+model support.

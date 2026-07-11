@@ -538,6 +538,62 @@ void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positi
                                                                   positions, args);
 }
 
+void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
+                   const Tensor& positions, const Tensor& cos_sin_cache,
+                   const RopeArgs& args) {
+  VT_CHECK(q_states.rank == 3, "rope_from_cache: q must be rank-3 [T,H,D]");
+  const int64_t tokens = q_states.shape[0];
+  const int64_t head_dim = q_states.shape[2];
+  if (k_states != nullptr) {
+    VT_CHECK(k_states->rank == 3 && k_states->shape[0] == tokens &&
+                 k_states->shape[2] == head_dim,
+             "rope_from_cache: k must be [T,Hk,D] matching q");
+    VT_CHECK(k_states->dtype == q_states.dtype,
+             "rope_from_cache: q/k dtype mismatch");
+    VT_CHECK(k_states->IsContiguous(),
+             "rope_from_cache: contiguous k required");
+    VT_CHECK(k_states->device == q.device,
+             "rope_from_cache: k/queue device mismatch");
+  }
+  VT_CHECK(positions.rank == 1 || positions.rank == 2,
+           "rope_from_cache: positions must be [T] or [3,T]");
+  if (positions.rank == 1) {
+    VT_CHECK(positions.shape[0] == tokens,
+             "rope_from_cache: positions[T] mismatch");
+  } else {
+    VT_CHECK(positions.shape[0] == 3 && positions.shape[1] == tokens,
+             "rope_from_cache: MRoPE positions must be [3,T]");
+    int64_t section_sum = 0;
+    for (int32_t section : args.mrope_section) {
+      VT_CHECK(section >= 0,
+               "rope_from_cache: negative mrope_section entry");
+      section_sum += section;
+    }
+    VT_CHECK(section_sum == args.rotary_dim / 2,
+             "rope_from_cache: mrope_section must sum to rotary_dim/2");
+  }
+  VT_CHECK(positions.dtype == DType::kI32 || positions.dtype == DType::kI64,
+           "rope_from_cache: positions must be i32/i64");
+  VT_CHECK(cos_sin_cache.rank == 2 && cos_sin_cache.shape[0] > 0 &&
+               cos_sin_cache.shape[1] == args.rotary_dim,
+           "rope_from_cache: cache must be [P,rotary_dim]");
+  VT_CHECK(IsOutFloat(q_states.dtype) &&
+               cos_sin_cache.dtype == q_states.dtype,
+           "rope_from_cache: q/k/cache must share f32 or bf16 dtype");
+  VT_CHECK(args.rotary_dim > 0 && args.rotary_dim % 2 == 0 &&
+               args.rotary_dim <= head_dim,
+           "rope_from_cache: rotary_dim must be even and <= head_dim");
+  VT_CHECK(q_states.IsContiguous() && positions.IsContiguous() &&
+               cos_sin_cache.IsContiguous(),
+           "rope_from_cache: contiguous tensors required");
+  VT_CHECK(q_states.device == q.device && positions.device == q.device &&
+               cos_sin_cache.device == q.device,
+           "rope_from_cache: q/positions/cache/queue device mismatch");
+  reinterpret_cast<RopeFromCacheFn>(
+      GetOp(OpId::kRopeFromCache, q.device.type))(
+      q, q_states, k_states, positions, cos_sin_cache, args);
+}
+
 void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const RopeArgs& args) {
   VT_CHECK(cos_sin.rank == 2, "rope_cos_sin_cache: cos_sin rank-2 [T, rotary_dim]");
   VT_CHECK(cos_sin.dtype == DType::kF32, "rope_cos_sin_cache: cos_sin must be f32");

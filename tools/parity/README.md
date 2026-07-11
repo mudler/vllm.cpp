@@ -8,6 +8,17 @@ Regenerate:
     ssh dgx.casa 'cd ~/work/vllm.cpp && ~/venvs/vllm-oracle/bin/python \
       tools/parity/dump_ops.py --out tests/parity/goldens'
 then commit the changed goldens. Manifests record the oracle version + pin.
+
+The W5 YaRN/MRoPE fixtures have their own pinned-source dumper:
+
+    python3 tools/parity/dump_long_context.py \
+      --out tests/parity/goldens --only yarn
+
+It first tries the installed oracle. If that import is unavailable, it verifies
+the full `/home/mudler/_git/vllm` commit and executes the exact pinned
+`common.py`, `base.py`, `yarn_scaling_rope.py`, and `mrope.py` class code with
+only unrelated runtime-registration scaffolding stubbed. The manifest records
+which loader produced each fixture; this fallback is not formula reimplementation.
 Tolerances: f32 tight (1e-5); bf16 cases 8e-3 (we compute in f32, upstream
 rounds to dtype mid-pipeline); RoPE pos>=32k cases 2e-2 (upstream f32 cache
 drift — see .agents/state.md 2026-07-03 note).

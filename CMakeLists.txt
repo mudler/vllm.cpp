@@ -190,6 +190,10 @@ add_library(vllm STATIC
   src/vllm/v1/executor/executor.cpp
   src/vllm/model_executor/layers/attention/attention.cpp
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
+  src/vllm/model_executor/layers/rotary_embedding/base.cpp
+  src/vllm/model_executor/layers/rotary_embedding/common.cpp
+  src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp
+  src/vllm/model_executor/layers/rotary_embedding/mrope.cpp
   src/vllm/entrypoints/chat_template.cpp
   src/vllm/entrypoints/model_loader.cpp
   src/capi/vllm_c.cpp

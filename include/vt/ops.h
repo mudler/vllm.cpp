@@ -1,6 +1,7 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -131,6 +132,8 @@ enum class OpId : uint8_t {
   // W0-only raw-signature probe for the shared drop-in adapter boundary. It is
   // not a production kernel-family migration.
   kDropinProbe,
+  // In-place base/MRoPE rotation from a supplied dtype-specific global cache.
+  kRopeFromCache,
   kCount
 };
 
@@ -183,6 +186,11 @@ struct RmsNormArgs {
 struct RopeArgs {
   float base = 10000.0f;
   int rotary_dim = 0;  // <= head_dim; even
+  bool is_neox_style = true;
+  // Empty (all zero) for 1-D RoPE. For positions[3,T], the entries are the
+  // temporal/height/width counts in the half-rotary frequency dimension.
+  std::array<int32_t, 3> mrope_section = {0, 0, 0};
+  bool mrope_interleaved = false;
 };
 
 // GDN op args (.agents/specs/gdn-semantics.md is the formula reference; sections
@@ -362,6 +370,8 @@ using RmsNormFn =
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
+using RopeFromCacheFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&,
+                                 const Tensor&, const RopeArgs&);
 using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*,
                                    Tensor&, const Tensor&, const Tensor&,
                                    const CausalConv1dArgs&);
@@ -709,6 +719,20 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids);
 // rounded back on store for bf16.
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
               const RopeArgs& args);
+
+// In-place partial RoPE from a supplied global cos|sin cache. Mirrors pinned
+// vLLM's rotary_embedding custom op (base.py:160-252; _custom_ops.py:200-225)
+// and MRotaryEmbedding's 3-axis selection (mrope.py:14-187,263-375).
+//
+// q [T,Hq,D], optional k [T,Hk,D], and cache [P,rotary_dim] share f32 or bf16.
+// positions is [T] for ordinary/text RoPE or [3,T] for MRoPE. For the latter,
+// args.mrope_section must sum to rotary_dim/2; contiguous and interleaved T/H/W
+// layouts use the exact pinned selection rules. args.is_neox_style selects
+// half-split NeoX or adjacent-pair GPT-J rotation. Formula construction is not
+// part of this op: the hot path only gathers cache values and rotates.
+void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
+                   const Tensor& positions, const Tensor& cos_sin_cache,
+                   const RopeArgs& args);
 
 // --- Fused full-attention preamble (default-OFF prefill lever; mirror of vLLM's
 // fused_qk_rmsnorm_rope / fla fused_qk_norm_rope.py:95-102, which reads a

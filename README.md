@@ -43,6 +43,13 @@ runs end-to-end on CPU:
   shapes plus randomized causal-mask properties are CPU/sanitizer-gated.
   Neither mode is yet user-visible model support: GPU runtime, positive-model
   e2e, oracle, trace, and performance/memory gates remain open.
+- **YaRN/MRoPE long-context foundation** — modern and legacy Hugging Face RoPE
+  parameters now normalize into a typed, memoized factory with f32/bf16 caches.
+  Plain YaRN and its `mrope_section` branch apply caller-supplied caches for
+  NeoX/GPT-J layouts and 1-D or 3-axis contiguous/interleaved positions. Six
+  exact pinned-source oracle fixtures, CPU references, and ASan/UBSan pass. The
+  CUDA implementation is source-complete but has not yet been compiled or run
+  on an uncontended GPU, and no feature-positive model path is claimed yet.
 - **Model forward** — Qwen3.6-35B-A3B hybrid (GDN×3 + gated full-attention, 256-
   expert MoE + shared expert), with **paged attention** (block-paged KV cache) +
   batched GDN. Loads from **safetensors** (NVFP4/FP8→bf16) and **GGUF**
@@ -157,7 +164,8 @@ CUDA-target inventories track unimplemented and untraced families separately.
 | Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
 | CUDA-graph decode | Qwen-specific captured decode step (vLLM cudagraph) | — | 🟡 explicit 35B capture gate; 27B evidence backfill open |
 | Sampling (greedy/top-k/top-p/penalties) | vLLM V1 ordering subset; some token/logprob paths synchronize to host | ✅ | 🟡 bounded subset |
-| RMSNorm / RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
+| RMSNorm / default RoPE / SwiGLU | fused elementwise | ✅ | ✅ |
+| YaRN/MRoPE supplied-cache rotation | pinned vLLM typed cache/factory + base/MRoPE cache lookup/rotation | ✅ ref + six oracle fixtures | 🚧 source present; compile/runtime gate open |
 
 Only **GB10/sm_121a is built, traced and gated today**. Source-level fallbacks
 suggest routes for other SMs, but none counts as support until its full build,
@@ -254,6 +262,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   StarCoder2/Gemma3/Llama4-class model paths, oracle, trace, throughput, latency
   and memory evidence remain open; all four execution rows remain `GATING`, not
   supported.
+- **YaRN/MRoPE long-context support is not user-visible yet.** Typed config,
+  memoized f32/bf16 cache construction, plain/MRoPE YaRN formulas, and the CPU
+  supplied-cache operator pass six exact pinned-source oracle fixtures and
+  sanitizer checks. CUDA compile/runtime, a Nomic or Qwen-VL feature-positive
+  model, both-engine traces, and correctness/performance/latency/memory closure
+  remain open; `ATTN-YARN` is `GATING`, not supported.
 
 ## Project record
 

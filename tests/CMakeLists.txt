@@ -54,6 +54,8 @@ vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_m
 vllm_cpp_add_test(test_attention_window vllm/model_executor/layers/attention/test_attention.cpp)
 vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
+vllm_cpp_add_test(test_rotary_embedding
+  vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
 vllm_cpp_add_test(test_gdn_metadata_builder vllm/v1/attention/test_gdn_metadata_builder.cpp)
 vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cpp)
 vllm_cpp_add_test(test_structured_output vllm/v1/structured_output/test_structured_output.cpp)
@@ -152,6 +154,7 @@ vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
+vllm_cpp_add_test(test_ops_rope_cache vt/test_ops_rope_cache.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_TRITON)

@@ -358,6 +358,28 @@ the local oracle environment remains absent and a supported Llama4-class model,
 real GPU backend run, trace and G6-G9 every-axis evidence remain open. No DGX
 command or user-visible model-support claim is made.
 
+W5 checkpoint (2026-07-11): `ATTN-YARN` now mirrors the typed modern/legacy
+RoPE parameter slice, memoized dtype-aware factory/cache, YaRN correction ramp,
+magnitude scaling and truncate controls, plus the `mrope_section` dispatch
+branch. The shared supplied-cache operator covers f32/bf16, optional key for the
+base path, NeoX/GPT-J rotation, 1-D text positions, and contiguous/interleaved
+3-axis MRoPE. Formula construction remains outside the hot apply kernel.
+
+Six f32/bf16 fixtures execute the exact pinned `common.py`, `base.py`,
+`yarn_scaling_rope.py`, and `mrope.py` source after verifying the full upstream
+commit `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`; only unrelated CustomOp,
+platform, and Triton registration scaffolding is stubbed because the recovered
+host has no importable full vLLM environment. Regeneration is byte-identical.
+The C++ cache differs by at most `1.192e-7` in f32 and is exact in bf16; f32
+outputs differ by at most `2.384e-7`, while bf16 outputs remain within upstream's
+`atol=1e-2, rtol=1.6e-2` envelope (maximum absolute difference `1.562e-2`).
+Release/CUDA-OFF ctest passes **103/103**; the four focused binaries pass
+**29 active cases / 476 assertions** with two named model/TP skips, and the same
+four pass ASan+UBSan with leak detection. The row moves to `GATING`, not `DONE`:
+the CUDA source could not be compiled or run while the serving campaign owned
+the only GPU, and Nomic/Qwen-VL positive-model e2e, both-engine traces, default-
+RoPE regression, and G6-G9 performance/latency/memory evidence remain open.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

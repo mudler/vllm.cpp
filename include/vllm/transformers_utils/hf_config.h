@@ -14,7 +14,7 @@
 
 namespace vllm {
 
-// Typed effective view of the scalar YaRN/MRoPE portion of HuggingFace's
+// Typed effective view of the scalar scaled-RoPE portion of HuggingFace's
 // rope_parameters (or legacy rope_scaling) dictionary. Defaults are the ones
 // consumed by pinned get_rope(). Formula families that follow W5 add their
 // fields here without making model code parse JSON again.
@@ -24,11 +24,14 @@ struct RopeParameters {
   std::optional<int64_t> rope_dim = std::nullopt;
   double partial_rotary_factor = 1.0;
 
-  // YaRN fields. factor and original_max_position_embeddings are required
-  // when rope_type == "yarn"; they remain optional so default RoPE has one
-  // unambiguous representation.
+  // Common scaling dispatch fields. YaRN and Llama 3 require both; they remain
+  // optional so default RoPE has one unambiguous representation.
   std::optional<double> factor = std::nullopt;
   std::optional<int64_t> original_max_position_embeddings = std::nullopt;
+  // Llama 3 frequency-band boundaries. Required only for rope_type=llama3.
+  std::optional<double> low_freq_factor = std::nullopt;
+  std::optional<double> high_freq_factor = std::nullopt;
+  // Remaining YaRN-only controls.
   double extrapolation_factor = 1.0;
   double attn_factor = 1.0;
   int64_t beta_fast = 32;

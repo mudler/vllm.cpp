@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
 #include "vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.h"
 #include "vt/device.h"
@@ -147,8 +148,15 @@ void RotaryEmbeddingBase::forward_native(vt::Queue& queue,
 RotaryEmbedding::RotaryEmbedding(int64_t head_size, int64_t rotary_dim,
                                  int64_t max_position_embeddings, double base,
                                  bool is_neox_style, vt::DType dtype)
+    : RotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base,
+                      is_neox_style, dtype, true) {}
+
+RotaryEmbedding::RotaryEmbedding(int64_t head_size, int64_t rotary_dim,
+                                 int64_t max_position_embeddings, double base,
+                                 bool is_neox_style, vt::DType dtype,
+                                 bool init_cache)
     : RotaryEmbeddingBase(head_size, rotary_dim, max_position_embeddings, base,
-                          is_neox_style, dtype) {}
+                          is_neox_style, dtype, init_cache) {}
 
 namespace {
 
@@ -209,6 +217,21 @@ std::shared_ptr<RotaryEmbeddingBase> get_rope(
           head_size, rotary_dim, max_position, rope_parameters.rope_theta,
           is_neox_style, dtype);
     }
+  } else if (rope_parameters.rope_type == "llama3") {
+    if (!rope_parameters.factor.has_value() ||
+        !rope_parameters.low_freq_factor.has_value() ||
+        !rope_parameters.high_freq_factor.has_value() ||
+        !rope_parameters.original_max_position_embeddings.has_value()) {
+      throw std::invalid_argument(
+          "Llama 3 RoPE requires factor, low_freq_factor, high_freq_factor, "
+          "and original_max_position_embeddings");
+    }
+    embedding = std::make_shared<Llama3RotaryEmbedding>(
+        head_size, rotary_dim, max_position, rope_parameters.rope_theta,
+        is_neox_style, dtype, *rope_parameters.factor,
+        *rope_parameters.low_freq_factor,
+        *rope_parameters.high_freq_factor,
+        *rope_parameters.original_max_position_embeddings);
   } else if (rope_parameters.rope_type == "yarn") {
     if (!rope_parameters.factor.has_value() ||
         !rope_parameters.original_max_position_embeddings.has_value()) {

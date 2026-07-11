@@ -380,6 +380,27 @@ the CUDA source could not be compiled or run while the serving campaign owned
 the only GPU, and Nomic/Qwen-VL positive-model e2e, both-engine traces, default-
 RoPE regression, and G6-G9 performance/latency/memory evidence remain open.
 
+W6 checkpoint (2026-07-11): `ATTN-ROPE-LLAMA3` now mirrors the required typed
+`factor`, `low_freq_factor`, `high_freq_factor`, and original-context fields,
+the pinned factory branch, and `Llama3RotaryEmbedding`'s unchanged high-
+frequency, smoothed middle-frequency, and scaled low-frequency choices. The
+equal low/high factor branch uses pinned vLLM's explicit zero smoothing value,
+so it remains finite instead of dividing by zero. `RotaryEmbedding` retains its
+existing constructor symbol and adds the upstream `init_cache=false` overload
+needed to initialize subclass fields before cache construction.
+
+Three fixtures execute the exact pinned `llama3_rope.py` class after verifying
+the full upstream commit: f32 NeoX low/mid/high bands, bf16 GPT-J bands, and f32
+NeoX equal factors. Regeneration is byte-identical. C++ vs oracle f32 caches
+differ by at most `5.960e-8` and outputs by `2.384e-7`; the bf16 cache is exact
+and outputs remain within `atol=1e-2, rtol=1.6e-2` (maximum absolute difference
+`1.562e-2`). Release/CUDA-OFF ctest passes **103/103**; the four focused binaries
+pass **32 active cases / 546 assertions** with three named dependency skips,
+and the same four pass ASan+UBSan with leak detection. The row moves to
+`GATING`, not `DONE`: the shared CUDA cache/apply path remains uncompiled/unrun,
+`MODEL-TEXT-llama-llama-for-causal-lm` is absent, and G6/G9 feature-positive,
+two-model correctness/performance/latency/memory gates remain open.
+
 Order: W1 and W3 may start separately with a coordination-designated shared
 registry lead; W2 follows W1 for e2e; W4 follows W3 for e2e. W5 lands the RoPE
 foundation, then W6-W8 can run in parallel. Model-dependent G6/G8 closures are

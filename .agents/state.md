@@ -3516,3 +3516,59 @@ Read-only DGX inspection at 02:35 UTC showed `CLAIM-SERVE-GATE-1` still holding
 c16/16-prompt repetition 1 remained active. Both PR3 jobs were still queued.
 W6 begins with pinned source, CPU/oracle tests and the existing supplied-cache
 seam; it will not enqueue behind or contaminate that campaign.
+
+## 2026-07-11 — C5 W6 Llama 3 RoPE leaf implemented and handed to feature gating
+
+`CLAIM-C5-LLAMA3-1` completed its bounded formula/factory/oracle scope and is
+released. `ATTN-ROPE-LLAMA3` moves `ACTIVE -> GATING`, never `DONE`. The port
+adds typed Llama 3 frequency factors and required-field validation, the exact
+pinned factory branch, and `Llama3RotaryEmbedding` over W5's owned dtype cache
+and supplied-cache apply seam. The class mirrors the three nested `torch.where`
+regions exactly: unchanged high frequencies, scaled low frequencies and linear
+smoothing between them. Equal low/high factors select pinned vLLM's explicit
+`smooth=0` path. The upstream `RotaryEmbedding(init_cache=False)` constructor
+shape is added as an overload while the original constructor symbol and default
+cache behavior remain intact.
+
+The direct-source oracle now loads the exact pinned `llama3_rope.py` after
+verifying full commit `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`. Three
+fixtures cover f32 NeoX standard bands, bf16 GPT-J standard bands, and f32 NeoX
+equal factors at positions `{0,1,original-1,original,max-1}`. A clean
+regeneration to `/tmp/vllm-cpp-w6-goldens-repro` is byte-identical.
+
+Fresh local evidence (no DGX command ran):
+
+- clean Release/CUDA-OFF build and full ctest pass **103/103**;
+- `test_hf_config` passes **13 / 135**, `test_rotary_embedding` passes **9 / 174**
+  with three named model/TP dependency skips, `test_ops_rope_cache` passes
+  **5 / 156**, and `test_op_parity` passes **5 / 81**;
+- the same four focused binaries pass Debug ASan+UBSan **4/4** with leak
+  detection enabled;
+- f32 cache/output maximum absolute differences versus the exact pinned class
+  are `5.960e-8`/`2.384e-7`; the bf16 cache matches exactly and output maximum
+  absolute difference is `1.562e-2`, within `atol=1e-2, rtol=1.6e-2`; and
+- the generic op-parity case floor rises from 37 to 40, independently checking
+  C++ cache construction before the shared apply operator.
+
+Read-only DGX inspection at 02:47 UTC still showed `CLAIM-SERVE-GATE-1` holding
+`/tmp/gpu`: our 27B server used 25,253 MiB while the sampled/default-temperature
+c32/32-prompt run was active; both PR3 jobs remained queued. W6 neither queued
+nor contaminated the campaign, so no CUDA or performance result is claimed.
+
+Remaining handoff: compile/run the shared supplied-cache CUDA path on an idle
+GB10, land a Llama-3.1-compatible model consumer, run a beyond-original-context
+token-exact comparison, and complete the existing G6/G9 correctness/performance/
+latency/memory regressions. W7 `ATTN-ROPE-LONGROPE` is now the next dependency-
+ready C5 leaf, followed by W8 dynamic-NTK. README and matrices therefore claim
+only the implemented CPU/oracle formula foundation, not user-visible Llama 3
+model support.
+
+## 2026-07-11 — DGX serving-campaign read-only progress check (04:51 UTC)
+
+`CLAIM-SERVE-GATE-1` still owns the single `/tmp/gpu` lock without contention.
+The second same-lock campaign has completed our 27B greedy c1/c2/c4/c8/c16/c32
+series and sampled c1/c16 points. Its last local-engine point, sampled/default-
+temperature c32 with 32 prompts, is active: the server holds 25,253 MiB and the
+GPU reported 96% utilization. The matched vLLM 27B arm follows, then both 35B
+arms because `BLOCK35` is absent. Two PR3 flock jobs remain queued behind the
+campaign. This inspection was read-only; W6 did not enqueue GPU work.

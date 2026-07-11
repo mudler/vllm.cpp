@@ -57,8 +57,9 @@ def _direct_source_factory():
     absent. The RoPE files only need CustomOp/platform registration scaffolding
     to execute their PyTorch-native cache and forward methods. This fallback
     stubs that scaffolding, but imports and executes the pinned common.py,
-    base.py, yarn_scaling_rope.py and mrope.py files verbatim. It is therefore a
-    direct-source oracle, not a reimplementation of their formulas.
+    base.py, yarn_scaling_rope.py, mrope.py and llama3_rope.py files verbatim.
+    It is therefore a direct-source oracle, not a reimplementation of their
+    formulas.
     """
     upstream = pathlib.Path(
         os.environ.get("VLLM_UPSTREAM_DIR", "/home/mudler/_git/vllm")
@@ -163,6 +164,10 @@ def _direct_source_factory():
         "vllm.model_executor.layers.rotary_embedding.mrope",
         rope_dir / "mrope.py",
     )
+    llama3_module = _load_module(
+        "vllm.model_executor.layers.rotary_embedding.llama3_rope",
+        rope_dir / "llama3_rope.py",
+    )
 
     def factory(
         head_size,
@@ -171,7 +176,6 @@ def _direct_source_factory():
         rope_parameters=None,
         dtype=None,
     ):
-        del max_position
         if dtype is None:
             dtype = torch.get_default_dtype()
         params = rope_parameters or {}
@@ -184,8 +188,24 @@ def _direct_source_factory():
                     f"partial_rotary_factor={partial} must be between 0.0 and 1.0"
                 )
             rotary_dim = int(head_size * partial)
-        if params.get("rope_type", "default") != "yarn":
-            raise ValueError("direct-source W5 loader only accepts yarn")
+        rope_type = params.get("rope_type", "default")
+        if rope_type == "llama3":
+            return llama3_module.Llama3RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                params["factor"],
+                params["low_freq_factor"],
+                params["high_freq_factor"],
+                params["original_max_position_embeddings"],
+            )
+        if rope_type != "yarn":
+            raise ValueError(
+                "direct-source long-context loader only accepts yarn or llama3"
+            )
         factor = params["factor"]
         original = params["original_max_position_embeddings"]
         extra = {
@@ -413,7 +433,62 @@ def dump_yarn(root: pathlib.Path) -> None:
     )
 
 
-DUMPERS = {"yarn": dump_yarn}
+def dump_llama3(root: pathlib.Path) -> None:
+    original = 32
+    factor = 4.0
+    max_position = int(original * factor)
+    positions = torch.tensor(
+        [0, 1, original - 1, original, max_position - 1], dtype=torch.int64
+    )
+    base = {
+        "rope_type": "llama3",
+        "rope_theta": 10000.0,
+        "rope_dim": 16,
+        "factor": factor,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": original,
+    }
+    _dump_case(
+        root,
+        "long_rope_llama3_neox_f32_bands",
+        head_size=24,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters=base,
+        dtype=torch.float32,
+        positions=positions,
+        seed=201,
+    )
+    _dump_case(
+        root,
+        "long_rope_llama3_gptj_bf16_bands",
+        head_size=24,
+        max_position=max_position,
+        is_neox_style=False,
+        rope_parameters=base,
+        dtype=torch.bfloat16,
+        positions=positions,
+        seed=202,
+    )
+    _dump_case(
+        root,
+        "long_rope_llama3_neox_f32_equal_factors",
+        head_size=24,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={
+            **base,
+            "low_freq_factor": 2.0,
+            "high_freq_factor": 2.0,
+        },
+        dtype=torch.float32,
+        positions=positions,
+        seed=203,
+    )
+
+
+DUMPERS = {"yarn": dump_yarn, "llama3": dump_llama3}
 
 
 if __name__ == "__main__":

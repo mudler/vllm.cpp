@@ -1,0 +1,91 @@
+{
+ "op": "long_context_rope",
+ "args": {
+  "head_size": 24,
+  "max_position": 128,
+  "is_neox_style": true,
+  "rope_parameters": {
+   "rope_type": "llama3",
+   "rope_theta": 10000.0,
+   "rope_dim": 16,
+   "factor": 4.0,
+   "low_freq_factor": 2.0,
+   "high_freq_factor": 2.0,
+   "original_max_position_embeddings": 32
+  },
+  "dtype": "f32",
+  "num_q_heads": 2,
+  "num_kv_heads": 1,
+  "class_name": "Llama3RotaryEmbedding",
+  "seed": 203,
+  "oracle_loader": "verified-pinned-direct-source"
+ },
+ "tensors": {
+  "cos_sin_cache": {
+   "file": "cos_sin_cache.npy",
+   "dtype": "f32",
+   "shape": [
+    128,
+    16
+   ]
+  },
+  "positions": {
+   "file": "positions.npy",
+   "dtype": "i64",
+   "shape": [
+    5
+   ]
+  },
+  "q_in": {
+   "file": "q_in.npy",
+   "dtype": "f32",
+   "shape": [
+    5,
+    48
+   ]
+  },
+  "k_in": {
+   "file": "k_in.npy",
+   "dtype": "f32",
+   "shape": [
+    5,
+    24
+   ]
+  },
+  "q_out": {
+   "file": "q_out.npy",
+   "dtype": "f32",
+   "shape": [
+    5,
+    48
+   ]
+  },
+  "k_out": {
+   "file": "k_out.npy",
+   "dtype": "f32",
+   "shape": [
+    5,
+    24
+   ]
+  }
+ },
+ "inputs": [
+  "positions",
+  "q_in",
+  "k_in"
+ ],
+ "outputs": [
+  "cos_sin_cache",
+  "q_out",
+  "k_out"
+ ],
+ "tol": {
+  "atol": 1e-05,
+  "rtol": 1e-05
+ },
+ "oracle": {
+  "vllm_version": "0.24.0+direct-source-e24d1b24",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

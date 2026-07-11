@@ -5,6 +5,7 @@
 // @ e24d1b24fe96.
 #include "vllm/transformers_utils/hf_config.h"
 
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -183,6 +184,8 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   params.factor = GetOptionalDouble(*raw, "factor");
   params.original_max_position_embeddings =
       GetOptionalInt(*raw, "original_max_position_embeddings");
+  params.low_freq_factor = GetOptionalDouble(*raw, "low_freq_factor");
+  params.high_freq_factor = GetOptionalDouble(*raw, "high_freq_factor");
   params.extrapolation_factor =
       GetDouble(*raw, "extrapolation_factor", 1.0);
   params.attn_factor = GetDouble(*raw, "attn_factor", 1.0);
@@ -209,13 +212,33 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
           "be positive in " +
           path);
     }
+  } else if (params.rope_type == "llama3") {
+    if (!params.factor.has_value() ||
+        !params.original_max_position_embeddings.has_value() ||
+        !params.low_freq_factor.has_value() ||
+        !params.high_freq_factor.has_value()) {
+      throw std::runtime_error(
+          "hf_config: llama3 rope requires factor, low_freq_factor, "
+          "high_freq_factor, and original_max_position_embeddings in " +
+          path);
+    }
+    if (!std::isfinite(*params.factor) || !(*params.factor > 0.0) ||
+        !std::isfinite(*params.low_freq_factor) ||
+        !(*params.low_freq_factor > 0.0) ||
+        !std::isfinite(*params.high_freq_factor) ||
+        !(*params.high_freq_factor > 0.0) ||
+        *params.original_max_position_embeddings <= 0) {
+      throw std::runtime_error(
+          "hf_config: llama3 scaling and frequency factors plus "
+          "original_max_position_embeddings must be finite and positive in " +
+          path);
+    }
   } else if (params.rope_type != "default") {
-    // W5 deliberately relaxes the old completeness guard only for YaRN.
-    // W6-W8 add their own typed fields and factory cases before relaxing this.
+    // W7-W8 add their own typed fields and factory cases before relaxing this.
     throw std::runtime_error(
         "hf_config: checkpoint declares rope type '" + params.rope_type +
-        "' which vllm.cpp does not implement yet (supported: default, yarn) in " +
-        path);
+        "' which vllm.cpp does not implement yet (supported: default, yarn, "
+        "llama3) in " + path);
   }
 
   if (!params.rope_dim.has_value() &&

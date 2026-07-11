@@ -368,6 +368,14 @@ vllm::RopeParameters ParseLongContextRopeParameters(const json& value) {
     params.original_max_position_embeddings =
         value["original_max_position_embeddings"].get<int64_t>();
   }
+  if (value.contains("low_freq_factor") &&
+      !value["low_freq_factor"].is_null()) {
+    params.low_freq_factor = value["low_freq_factor"].get<double>();
+  }
+  if (value.contains("high_freq_factor") &&
+      !value["high_freq_factor"].is_null()) {
+    params.high_freq_factor = value["high_freq_factor"].get<double>();
+  }
   params.extrapolation_factor = value.value("extrapolation_factor", 1.0);
   params.attn_factor = value.value("attn_factor", 1.0);
   params.beta_fast = value.value("beta_fast", int64_t{32});
@@ -1577,8 +1585,8 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {
   int cases = RunGoldenPass(Cpu());
-  // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE.
-  CHECK(cases >= 37);
+  // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE + 3 W6 Llama 3.
+  CHECK(cases >= 40);
 }
 
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {

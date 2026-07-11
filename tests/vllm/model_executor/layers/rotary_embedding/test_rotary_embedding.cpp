@@ -4,7 +4,7 @@
 //   tests/kernels/core/test_apply_rotary_emb.py:43-203
 //   tests/models/language/pooling/test_nomic_max_model_len.py:93-111
 // and pinned class behavior in rotary_embedding/{__init__,base,common,
-// yarn_scaling_rope,mrope}.py @ e24d1b24fe96.
+// yarn_scaling_rope,mrope,llama3_rope}.py @ e24d1b24fe96.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -14,6 +14,7 @@
 
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
 #include "vllm/model_executor/layers/rotary_embedding/common.h"
+#include "vllm/model_executor/layers/rotary_embedding/llama3_rope.h"
 #include "vllm/model_executor/layers/rotary_embedding/mrope.h"
 #include "vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.h"
 #include "vt/dtype.h"
@@ -38,6 +39,18 @@ vllm::RopeParameters YarnParameters() {
   params.rope_theta = 10.0;
   params.rope_dim = 8;
   params.factor = 4.0;
+  params.original_max_position_embeddings = 32;
+  return params;
+}
+
+vllm::RopeParameters Llama3Parameters() {
+  vllm::RopeParameters params;
+  params.rope_type = "llama3";
+  params.rope_theta = 10000.0;
+  params.rope_dim = 16;
+  params.factor = 4.0;
+  params.low_freq_factor = 1.0;
+  params.high_freq_factor = 4.0;
   params.original_max_position_embeddings = 32;
   return params;
 }
@@ -186,6 +199,73 @@ TEST_CASE("get_rope mirrors partial dimension and validation errors") {
                        std::invalid_argument);
 }
 
+TEST_CASE("Llama 3 cache covers unchanged smoothed and scaled bands") {
+  const vllm::RopeParameters params = Llama3Parameters();
+  auto rope = vllm::get_rope(24, 128, true, params, vt::DType::kF32);
+  auto again = vllm::get_rope(24, 128, true, params, vt::DType::kF32);
+  REQUIRE(rope == again);
+  CHECK(rope->type_name() == "Llama3RotaryEmbedding");
+  CHECK(rope->cache_rows() == 128);
+  auto llama3 = std::dynamic_pointer_cast<vllm::Llama3RotaryEmbedding>(rope);
+  REQUIRE(llama3 != nullptr);
+  CHECK(llama3->scaling_factor() == doctest::Approx(4.0));
+  CHECK(llama3->low_freq_factor() == doctest::Approx(1.0));
+  CHECK(llama3->high_freq_factor() == doctest::Approx(4.0));
+  CHECK(llama3->orig_max_position() == 32);
+
+  int unchanged = 0;
+  int smoothed = 0;
+  int scaled = 0;
+  constexpr int64_t kHalf = 8;
+  for (int64_t pair = 0; pair < kHalf; ++pair) {
+    const float exponent = static_cast<float>(2 * pair) / 16.0F;
+    const float base_inv = 1.0F / std::pow(10000.0F, exponent);
+    const float wave_len =
+        static_cast<float>(2.0 * std::acos(-1.0)) / base_inv;
+    const float got = std::atan2(CacheValue(*rope, 1, kHalf + pair),
+                                 CacheValue(*rope, 1, pair));
+    if (wave_len < 8.0F) {
+      ++unchanged;
+      CHECK(got == doctest::Approx(base_inv).epsilon(1e-5));
+    } else if (wave_len > 32.0F) {
+      ++scaled;
+      CHECK(got == doctest::Approx(base_inv / 4.0F).epsilon(1e-5));
+    } else {
+      ++smoothed;
+      CHECK(got > base_inv / 4.0F);
+      CHECK(got < base_inv);
+    }
+  }
+  CHECK(unchanged > 0);
+  CHECK(smoothed > 0);
+  CHECK(scaled > 0);
+}
+
+TEST_CASE("Llama 3 equal frequency factors avoid a singular smoothing path") {
+  vllm::RopeParameters params = Llama3Parameters();
+  params.low_freq_factor = 2.0;
+  params.high_freq_factor = 2.0;
+  auto rope = vllm::get_rope(24, 128, true, params, vt::DType::kF32);
+  constexpr int64_t kHalf = 8;
+  for (int64_t pair = 0; pair < kHalf; ++pair) {
+    const float exponent = static_cast<float>(2 * pair) / 16.0F;
+    const float base_inv = 1.0F / std::pow(10000.0F, exponent);
+    const float wave_len =
+        static_cast<float>(2.0 * std::acos(-1.0)) / base_inv;
+    const float got = std::atan2(CacheValue(*rope, 1, kHalf + pair),
+                                 CacheValue(*rope, 1, pair));
+    REQUIRE(std::isfinite(got));
+    const float expected = wave_len < 16.0F ? base_inv : base_inv / 4.0F;
+    CHECK(got == doctest::Approx(expected).epsilon(1e-5));
+  }
+
+  vllm::RopeParameters missing = params;
+  missing.low_freq_factor.reset();
+  CHECK_THROWS_WITH_AS(vllm::get_rope(24, 128, true, missing),
+                       doctest::Contains("requires factor"),
+                       std::invalid_argument);
+}
+
 TEST_CASE("mrope next text positions mirror three equal streams") {
   const auto positions =
       vllm::MRotaryEmbedding::get_next_input_positions(5, 3, 7);
@@ -209,4 +289,11 @@ TEST_CASE("nomic YaRN feature-positive e2e remains a model dependency" *
               "MODEL-EMBED-bert-with-rope-nomic-bert-model")) {
   MESSAGE("SKIP MODEL-EMBED-bert-with-rope-nomic-bert-model: Nomic pooling "
           "model family is not ported; typed config and operator parity land in W5");
+}
+
+TEST_CASE("Llama 3 feature-positive e2e remains a model dependency" *
+          doctest::skip(true) *
+          doctest::description("MODEL-TEXT-llama-llama-for-causal-lm")) {
+  MESSAGE("SKIP MODEL-TEXT-llama-llama-for-causal-lm: the Llama model family "
+          "is not ported; W6 closes formula/cache/operator parity only");
 }

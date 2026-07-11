@@ -77,15 +77,18 @@ class RotaryEmbeddingBase {
   std::vector<std::byte> cos_sin_cache_;
 };
 
-class RotaryEmbedding final : public RotaryEmbeddingBase {
+class RotaryEmbedding : public RotaryEmbeddingBase {
  public:
   RotaryEmbedding(int64_t head_size, int64_t rotary_dim,
                   int64_t max_position_embeddings, double base,
                   bool is_neox_style, vt::DType dtype);
+  RotaryEmbedding(int64_t head_size, int64_t rotary_dim,
+                  int64_t max_position_embeddings, double base,
+                  bool is_neox_style, vt::DType dtype, bool init_cache);
   std::string type_name() const override { return "RotaryEmbedding"; }
 };
 
-// Memoized typed factory. The effective key covers every W5 parameter plus
+// Memoized typed factory. The effective key covers every typed RoPE parameter plus
 // head/rotary/max/layout/dtype, mirroring pinned get_rope's module cache.
 std::shared_ptr<RotaryEmbeddingBase> get_rope(
     int64_t head_size, int64_t max_position, bool is_neox_style,

@@ -192,6 +192,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
   src/vllm/model_executor/layers/rotary_embedding/base.cpp
   src/vllm/model_executor/layers/rotary_embedding/common.cpp
+  src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/mrope.cpp
   src/vllm/entrypoints/chat_template.cpp

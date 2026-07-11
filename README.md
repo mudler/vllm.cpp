@@ -160,7 +160,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance is reopened. Device-resident cache W0 is source/CPU-gated but still awaits its CUDA gates |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (cutlass NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass, while exact matched-config production-vLLM performance is reopened. Device-resident cache W0 now passes clean default/fallback pointer and both-model CUDA gates; sanitizer, trace, memory, and speed A/Bs remain open |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -230,9 +230,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   and GDN convolution/recurrent state stable `vt::Alloc` ownership and
   stream-ordered zeroing; CPU retains host storage, and
   `VT_DEVICE_KV_CACHE=0` restores the former CUDA host-vector path for an exact
-  same-binary A/B. The focused CPU build/tests pass. CUDA pointer-residency,
-  real-model, lifecycle, trace, memory, and performance gates are still open,
-  so this is not yet a speed or support-state claim.
+  same-binary A/B. The focused CPU suite and a clean CUDA 13.0.88/sm_121a build
+  pass. Both 35B/27B tests pass in default device-resident mode and in fallback
+  mode; the default tests assert every cache pointer is CUDA device memory.
+  Sanitizer, lifecycle/memory, corrected trace, and repeated performance A/B
+  gates are still open, so this is not yet a speed-parity claim.
 - **CPU status:** the native threadpool and chunked op dispatch pass the complete
   suite at 1/3/20 workers and a focused ThreadSanitizer run. This is not yet a
   speed claim: the required same-binary 1-vs-20 Qwen3.5-2B GGUF throughput/RSS
@@ -251,24 +253,22 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
   for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
-  `DONE`). At `31d053f`, all three 27B ours/vLLM c1–c32 ladders completed with
-  2,016/2,016 successful, exact-native-count requests and full lifecycle/memory
-  return. The reproducible diagnostic throughput ratios are below the required
-  floor at every point: 0.959/0.926/0.934/0.937/0.961/0.956× from c1 to c32,
-  with most latency axes also slower. The old comparison to an “accepted
-  offline” checkpoint was itself invalidated by the sampling/token-budget audit,
-  so it neither proves nor rules out a direct-library regression. The HTTP
-  frontend was measured and cannot explain the gap; pure b16 decode is nearly
-  tied, while mixed prefill/decode and the old host-backed KV/GDN state traffic
-  are the leading execution candidates; the device-resident W0 above is the
-  active, not-yet-GPU-gated repair. After the Ninja/PATH repair, `ed6247d` captured
-  the exact 48-prompt vLLM trace, but the old paired trace was still non-binding:
-  vllm.cpp reused cached prompts while vLLM had prefix caching off, and admission,
-  max-sequence, and model-length settings differed. The current harness fixes
-  those contracts explicitly and records output digests diagnostically behind
-  the commit-bound model/count gates. A fresh corrected trace, then matched
-  direct-library and online 27B→35B campaigns, is required. No existing
-  performance ratio is binding.
+  `DONE`). Historical `31d053f` and offline ratios are non-binding because the
+  audit found cache, sampling, token-budget, admission, and model-length
+  mismatches. Pushed `f065fce` completed the first exact 27B cache-off,
+  closed-loop baseline: 2,016/2,016 timed requests, three repetitions, six
+  memory returns, the real-model gate, and both corrected traces pass their
+  contracts. Mean total-throughput ratios are below the required floor at every
+  point: **0.962/0.926/0.936/0.945/0.978/0.972×** from c1 to c32; only 3–5/20
+  timing axes and 2/4 memory axes pass. Dispersion is low (throughput CV <0.7%),
+  so this is the binding 27B gap baseline, not noise or a parity pass. The
+  corrected nsys trace records 153,394 `cudaMemcpyAsync` calls; persistent GDN
+  state rows alone account for 20.809 GiB H2D plus 20.806 GiB D2H across its
+  three repetitions. That grounds device-resident KV/GDN state as the first
+  repair. W0 is merged at `7d29e0c`; its clean GB10 build and default/fallback
+  35B+27B pointer/token gates pass. No W0 sanitizer, trace, memory, or speed
+  result exists yet. Exact direct-library, optimized 27B, and then 35B
+  every-axis closure remain mandatory before later roadmap work.
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

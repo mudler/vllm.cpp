@@ -4408,3 +4408,82 @@ series releases the GPU, build the merged SHA on sm_121a and hold one new lock
 for default/fallback pointer, both-model greedy, lifecycle, sanitizer, memory,
 nsys, and repeated same-binary A/B gates. Only then advance W0; W1 replaces the
 remaining row-wise mixed-prefill GDN copies with indexed device I/O.
+
+## 2026-07-11 — exact f065 27B online before-state complete; below floor
+
+The first corrected production-serving baseline is complete under
+`~/work/vllm.cpp-online-gate/evidence/f065fce18027b52a178b246f490b091b9d9e07a3`.
+One uninterrupted `/tmp/gpu` lock covered the commit-bound real-model gate,
+three interleaved ours/vLLM c1–c32 repetitions, six process/memory-return and
+verified file-cache-eviction cycles, and the paired c16 traces. The model gate
+passed in 16.32 seconds; its log SHA-256 is
+`7f33e8624960bafb3d719cefbe761e521b338caf3e0625d6732c0fcf83922678`.
+All 2,016 timed requests completed with exact native input/output counts. The
+trace contract reports `passed=true` with cache off, closed-loop c16 admission,
+max-seqs 32, max batched tokens 2048, model length 262144, and three stable
+repetitions.
+
+This is a valid **gap baseline**, not a parity pass. Ratios below are the ratio
+of the three-run mean total-token throughputs; the last column counts all four
+higher-is-better throughput axes plus sixteen lower-is-better latency axes:
+
+| Concurrency | ours tok/s | vLLM tok/s | ratio | axes passed |
+|---:|---:|---:|---:|---:|
+| 1 | 79.250 | 82.412 | 0.961624× | 4/20 |
+| 2 | 146.910 | 158.678 | 0.925842× | 4/20 |
+| 4 | 271.065 | 289.481 | 0.936384× | 5/20 |
+| 8 | 478.196 | 506.002 | 0.945047× | 3/20 |
+| 16 | 773.021 | 790.803 | 0.977514× | 3/20 |
+| 32 | 1054.226 | 1084.396 | 0.972179× | 3/20 |
+
+The per-repetition throughput CV is below 0.7% for both engines at every point.
+Memory passes two of four axes. Mean peak PSS/RSS are 48,201,396/48,203,797 KiB
+for vllm.cpp versus 28,133,901/28,471,343 KiB for vLLM; mean reported GPU
+memory is 27,509 versus 72,725 MiB, and mean available-memory drop is
+66,363,179 versus 80,972,653 KiB. Every repetition returns memory within the
+1-GiB tolerance and leaves no compute process.
+
+The corrected local nsys trace contains 153,394 `cudaMemcpyAsync` API calls.
+Two state-row sizes dominate: 54,000 H2D + 54,000 D2H convolution rows of
+61,440 bytes, and 12,096 H2D + 12,094 D2H recurrent rows of 1,572,864 bytes.
+Together they move exactly 22,343,122,944 bytes = 20.809 GiB H2D and
+22,339,977,216 bytes = 20.806 GiB D2H across the three measured trace
+repetitions. This directly confirms the old representative-step attribution
+under the repaired workload and makes W0 device residency the first parity
+lever; W1 then collapses the residual device-to-device row loop.
+
+Evidence hashes: campaign manifest
+`325897a6c82a52b2eacb39b17b3173dd312c63908df10e7c3c0ea0a5d0a5c264`,
+driver log `6348ba1c1eae5cb387649cd0c386ae1ac7a531dedc67d29cd643b1aa0917af1d`,
+trace status `f8de5789e098aa61a29a534fce54505f141a635cce0f92126a6f4128ee1c7e2a`,
+ours nsys/kernel summary `cc13313e…c4f58` / `c64f5c4c…962a7`, and vLLM
+trace/kernel summary `a20b5841…10b8f` / `652cd0ba…bb393`. Output-text digests
+remain diagnostic: the real-model gate and exact native counts own correctness,
+as required by the repaired contract.
+
+This evidence does not show that a vllm.cpp code change regressed speed: the
+historical workloads were mismatched and no old-vs-new same-config binary A/B
+exists. It establishes that current pre-W0 f065 is below production vLLM on the
+exact online workload. Per the user-directed priority, restoring every-axis
+27B and then 35B parity blocks promotion of every later roadmap track.
+
+At baseline release, the durable validator advanced cleanly to pushed
+`7d29e0c`, verified a clean detached source, and completed a fresh CUDA 13.0.88 /
+sm_121a / RelWithDebInfo / CUTLASS 4.4.2 / vendored-Triton build under
+`~/work/vllm.cpp-kv-device/7d29e0cd69709f6f96ebbf86a320f8885d7362d1`.
+The build reached 100%. Under one new uncontended lock, the 35B and 27B
+real-model gates passed 2/2 in default device-resident mode (79.91s/31.04s) and
+2/2 with `VT_DEVICE_KV_CACHE=0` (66.23s/16.50s). The default cases assert CUDA
+device-pointer attributes for every cache family; the fallback cases assert the
+opposite path while preserving token correctness. Driver-log SHA-256 is
+`051a83cbd1382c86201b92e61ce4f4915dd0856f7179b2fbb376c6b5a9792f66`.
+The GPU is process-free and `/tmp/gpu` is released. Sequential cold/warm test
+durations are not a performance A/B. W0 sanitizer, lifecycle/memory, corrected
+trace, and repeated interleaved same-binary A/B gates remain open.
+
+Checkpoint validation passes: canonical record checker reports ENGINE=97 /
+MODEL=323 / QUANT=81 / KERNEL=30 / BACKEND=51; record mutations pass 13/13,
+documentation mutations 5/5, and online benchmark contracts 18/18. `git diff
+--check` is clean. No local CPU CTest was rerun for this record-only follow-up;
+the unchanged `7d29e0c` code already passed its clean CPU serial 105/105 suite
+and the CUDA gates above execute that exact pushed commit.

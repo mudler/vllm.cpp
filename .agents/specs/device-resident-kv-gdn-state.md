@@ -55,11 +55,22 @@ state path precedes generic scheduler-overlap tuning.
 
 ## Our baseline
 
-CUDA cache storage is currently owned by host `std::vector<uint8_t>` objects
-whose addresses are wrapped in tensors tagged with the CUDA device. Decode GDN
-already consumes persistent state indices in-place, but mixed-prefill paths
-gather and scatter host-backed rows. The trace attribution above is the baseline
-that every implementation slice must reproduce before it can claim a win.
+**Binding pre-W0 evidence.**
+
+Pushed `f065fce` completed the corrected 27B cache-off/closed-loop series. Its
+pre-W0 CUDA cache storage is owned by host `std::vector<uint8_t>` objects whose
+addresses are wrapped in CUDA-tagged tensors. Mean c1→c32 throughput ratios are
+0.9616/0.9258/0.9364/0.9450/0.9775/0.9722×; only 3–5/20 timing and 2/4 memory
+axes pass, with throughput CV below 0.7%. The model, lifecycle and corrected
+trace contracts pass (trace-status SHA-256 `f8de5789…1c7e2a`).
+
+Across the three c16 trace repetitions, nsys records 153,394
+`cudaMemcpyAsync` calls. The two state-row sizes alone account for 66,096 H2D
+and 66,094 D2H transfers: 20.809 GiB H2D plus 20.806 GiB D2H. This is the
+binding before-state that every implementation slice must reproduce against.
+Current W0 source at `7d29e0c` replaces the owners. Its clean CUDA
+13.0.88/sm_121a build and default/fallback 35B+27B pointer/token gates pass;
+sanitizer, lifecycle/memory, corrected trace, and performance remain open.
 
 ## Port map
 
@@ -109,7 +120,7 @@ alternate supported defaults.
 
 | Work | Deliverable | State |
 |---|---|---|
-| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | implemented and CPU-gated; CUDA/model/A-B gates open |
+| W0 | move-only persistent backend allocation owner; device KV/GDN caches; queue zero; pointer/lifecycle tests; `VT_DEVICE_KV_CACHE=0` A/B | implemented; CPU/CI and clean sm_121a default/fallback pointer/model gates pass; sanitizer/lifecycle/memory/trace/A-B open |
 | W1 | persistent full non-spec/prefill index upload plus fused indexed BF16↔F32 GDN state gather/scatter; `VT_GDN_INDEXED_STATE_IO=0` A/B | depends on W0 |
 | W2 | convolution prefill consumes indexed persistent state directly; preserve initial-state/reset semantics | depends on W1 |
 | W3 | corrected trace, both real-model gates, direct-library and online every-axis comparison | depends on W0-W2 |

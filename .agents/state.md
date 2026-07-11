@@ -3572,3 +3572,26 @@ temperature c32 with 32 prompts, is active: the server holds 25,253 MiB and the
 GPU reported 96% utilization. The matched vLLM 27B arm follows, then both 35B
 arms because `BLOCK35` is absent. Two PR3 flock jobs remain queued behind the
 campaign. This inspection was read-only; W6 did not enqueue GPU work.
+
+## 2026-07-11 — C5 W7 LongRoPE claimed after pinned-chain audit
+
+`CLAIM-C5-LONGROPE-1` moves `ATTN-ROPE-LONGROPE` `READY -> ACTIVE` in isolated
+worktree `/home/mudler/_git/vllm.cpp-c5-longrope`, branch
+`codex/c5-longrope-w7`. Pinned source review covered factory dispatch at
+`rotary_embedding/__init__.py:315-335`, the complete
+`phi3_long_rope_scaled_rope.py:16-159` class, vLLM max-model-length derivation,
+and Transformers' Phi-3 factor-array validation.
+
+The bounded W7 scope is the typed short/long factor arrays and optional mscale
+overrides, exact NeoX-only two-cache construction, one global short/long choice
+from configured runtime `max_model_len`, a factory case, leaf tests, and pinned-
+source f32/bf16 short/long/override goldens. Python obtains runtime length from
+global `VllmConfig`; the C++ mirror will expose it through an additive factory
+overload while preserving the existing symbol and using pinned vLLM's default
+short-cache selection when no override is supplied. The runtime length joins
+the local memoization key so two explicit test configurations cannot alias.
+
+W8 dynamic-NTK, changes to W5/W6 formula semantics, a Phi-3 model port, and GPU
+work are outside this claim. `CLAIM-SERVE-GATE-1` continues to own `/tmp/gpu`,
+so W7 begins with CPU, exact-class oracle and sanitizer work only and will leave
+CUDA/model/G9 evidence as an explicit gating handoff.

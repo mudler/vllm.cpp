@@ -3733,3 +3733,35 @@ series is active. SGLang installation, checkpoint load, exact quantization/
 token-ID classification, nsys, and every GPU/performance action remain P2/P3
 and out of this claim. `CLAIM-SERVE-GATE-1` retains dgx; P1 will use no GPU and
 will only observe that campaign read-only.
+
+## 2026-07-11 — SGLang preflight P1 CPU harness implemented and gated
+
+`CLAIM-BACKEND-SGLANG-PREFLIGHT-1` is released and
+`BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` moves `ACTIVE -> GATING`, never `DONE`.
+P1 adds the exact-length deterministic custom corpus, pinned client command,
+native-ID/usage/stream preflights, raw-result/concurrency validator,
+direction-aware repetition/floor summarizer, descendant-plus-owned-cgroup
+RSS/PSS sampler and no-GPU dry-run driver. Artifact writers are atomic or
+streaming as appropriate;
+existing raw results and mixed corpus roots are rejected rather than appended.
+
+The source-grounded audit found that SGLang 28b095c `--output-details` retains
+raw TTFT/ITL but not per-request E2E latency, while its aggregate schema omits
+P90 TPOT. The summarizer makes that limitation explicit and non-binding; it
+does not derive response completion from last-token time. P2 must close this
+evidence gap without changing the timed request or metric semantics.
+
+Local CPU evidence:
+
+- standard-library unittest discovery passes **16/16**;
+- the same suite passes through CMake/CTest **1/1**;
+- Python compilation, `git diff --check`, `bash -n`, ShellCheck, and an actual
+  dry-run manifest pass; and
+- the dry-run records exactly one future whole-campaign lock and refuses every
+  non-dry-run invocation in P1.
+
+No image was pulled, no SGLang package installed, no checkpoint touched, and no
+GPU/performance result was produced. Read-only campaign observation showed the
+27B pre-W2 same-lock series close with both arms `rc=0`; the queued PR3 focused
+GDN test then passed and its pool A/B acquired `/tmp/gpu`, while the scripted
+35B series waits on that lock.

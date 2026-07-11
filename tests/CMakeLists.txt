@@ -6,6 +6,15 @@ if(UNIX)
     COMMAND bash "${CMAKE_SOURCE_DIR}/tests/scripts/test_triton_aot_drift.sh")
 endif()
 
+# CPU-only benchmark-harness contract. The tools deliberately use only the
+# Python standard library; image/model/GPU preflights remain dgx-only.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME test_serve_low_tools
+  COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s "${CMAKE_SOURCE_DIR}/tests/tools" -p "test_*.py")
+set_tests_properties(test_serve_low_tools PROPERTIES
+  ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}")
+
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)

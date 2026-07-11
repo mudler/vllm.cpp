@@ -247,11 +247,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   chat-template engine, the native grammar backend, the C API) are documented as
   deviations in the [porting inventory](.agents/porting-inventory.md) §9.
 - The CUDA low-concurrency comparison against SGLang is specified and pinned to
-  v0.5.13, but **no SGLang performance result is claimed yet**. The unchanged
-  27B checkpoint has a plausible native path; exact 35B mixed-quant loading must
-  be proven. True incremental async HTTP streaming now exists, but binding
-  TTFT/ITL numbers wait for the post-W2 GB10 online gate
-  (`SERVE-ASYNC-LLM` remains `GATING`, not `DONE`).
+  v0.5.13. Its CPU-only P1 corpus/client/summary/process-memory/dry-run harness
+  is implemented and contract-tested, but **no image, model compatibility, or
+  SGLang performance result is claimed yet**. The unchanged 27B checkpoint has
+  a plausible native path; exact 35B mixed-quant loading must be proven, and
+  pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
+  incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
+  for the post-W2 GB10 online gate (`SERVE-ASYNC-LLM` remains `GATING`, not
+  `DONE`).
 - **Speculative decoding is not user-visible yet.** The first MTP leaf now has
   safetensors loaders and a standalone dense/MoE Qwen3.5 head with CPU tests,
   but its exact 27B+35B oracle gate is still queued and the scheduler,

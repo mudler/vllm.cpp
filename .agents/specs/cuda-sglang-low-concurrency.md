@@ -471,6 +471,41 @@ P1/P2 preflight work and `SERVE-ASYNC-LLM` can run concurrently in separate
 worktrees. P3 claims the distinct binding-gate row only after both dependencies
 close; an image load alone cannot release it.
 
+## P1 CPU checkpoint (2026-07-11)
+
+`BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` P1 is implemented and handed to
+`GATING`, not `DONE`. The deterministic generator writes the exact SGLang
+two-turn custom-dataset shape plus stored token IDs/hashes, refuses non-empty
+artifact roots, validates the complete corpus before exposing partitions, and
+enforces global prompt disjointness plus the 32-token common-prefix ceiling.
+The client wrapper constructs only the digest-pinned `--pull=never` command,
+runs native `output_ids`, non-streaming usage, and incremental SSE preconditions,
+validates all raw detail arrays and achieved concurrency, and refuses an
+existing output file. The summary recomputes TTFT/ITL percentiles, repetition
+spread/CV and direction-aware floor ratios while propagating checkpoint,
+quantization, tokenizer, native-ID, usage and streaming precondition failures.
+The 100 ms sampler unions ordinary descendants with every PID in an explicitly
+owned cgroup tree, then aggregates RSS/PSS and host `MemAvailable`; numeric GPU
+memory is retained and `N/A` stays JSON `null`.
+
+Source inspection corrected one assumption in the accepted spike: pinned
+SGLang `--output-details` emits `input_lens`, `output_lens`, `ttfts`, nested
+`itls`, texts and errors, but **not per-request E2E latencies**. It reports only
+aggregate E2E/TPOT fields and has no P90 TPOT field. P1 therefore retains those
+aggregates, emits raw P90 TPOT as unavailable, and makes the group non-binding;
+it does not approximate end-of-response time from last-token time. P2 must
+capture the missing raw values without modifying timed request/metric semantics
+before a binding every-percentile result can be promoted.
+
+CPU evidence: direct unittest discovery passes **16/16**; the same suite passes
+through the new CMake/CTest registration **1/1**; `py_compile`, `bash -n`,
+ShellCheck and the real shell dry-run pass. The dry run records one planned
+whole-campaign lock, `--pull=never` timed clients, provisioning outside that
+lock, and every pending evidence precondition. No image was pulled, no SGLang
+package installed, no checkpoint loaded or mutated, and no GPU/performance
+command ran. P2 exact 27B/35B load/quant/token classification and P3 binding
+campaign remain open.
+
 ## Risks and fixed decisions
 
 | Risk | Fixed handling |

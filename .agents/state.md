@@ -4822,3 +4822,37 @@ single-flight tuning and capture-miss rejection, with
 remains separate and unclaimed. The next sequence is CPU/unit proof, a pushed
 CUDA/model checkpoint, component AB/BA/AB plus paired trace, then a full exact
 27B oracle rerun. Exact 35B remains forbidden until every 27B axis passes.
+
+## 2026-07-11 — NVFP4 W1 implementation is CPU/TSan-green; GPU gates pending
+
+W1 now implements the first isolated FP4 repair without touching the candidate
+set. `src/vt/cuda/nvfp4_plan_cache.h` ports FlashInfer 0.6.12's uncapped hybrid
+mapping: powers of two through 256, steps of 256 through 2048, steps of 512
+through 4096, then powers of two. M=1/2/4/8/16 therefore receive independent
+default plans. `VT_FP4_EXACT_BUCKETS=0` preserves the old `max(16,pow2(M))`
+identity for the eventual same-binary process-level A/B.
+
+The plan key now includes M bucket, N, K, CUDA device ordinal, actual SM,
+output dtype and tactic-set ABI. A per-key state machine makes the first caller
+the only tuner, publishes only a complete plan, blocks same-key waiters without
+holding the global map mutex, and lets other keys tune independently. Failure
+wakes every waiter, erases the failed entry and permits a later retry. Ready
+hits do not call CUDA; only a miss queries `cudaStreamIsCapturing`, and an
+active/invalidated capture fails before event creation. The four existing wide
+persistent candidates, real-operand timing loop and 1% hysteresis are unchanged,
+so W2's full tactic family remains independently attributable and unclaimed.
+
+The focused CPU target builds warning-clean in Release and passes once, then
+passes **100/100** repeat-until-fail executions. The new tests cover every
+FlashInfer bucket boundary plus a bounded maximum, legacy mapping, every key
+field, 16-thread same-key single-flight, different-key progress, concurrent
+failure wake/no-partial-state/retry, uncached-capture rejection and ready-hit
+bypass. A separate GCC ThreadSanitizer build, executed with
+`setarch x86_64 -R`, passes **9 cases / 615 assertions** with no report.
+
+This is deliberately a CPU checkpoint. It claims no CUDA compile, real capture
+or replay, memcheck, gate-model result, component ratio or vLLM improvement;
+the pushed `4e1d8ca` series remains the exact before-state. After this checkpoint
+is pushed, use a clean CUDA 13.0.88/sm_121a build for focused op/default+legacy
+capture, compute-sanitizer and both-model default/fallback gates. Only then run
+the uncontended W1 AB/BA/AB, paired trace and full exact 27B oracle campaign.

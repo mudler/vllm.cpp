@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +38,7 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/ops.h"
 
 using namespace cute;
@@ -136,23 +139,12 @@ struct sm120_fp4_config_default {
 //   128x32x128  128x32x256  128x64x128  128x64x256
 //   128x128x128 128x128x256 256x128x128 128x256x128
 //
-// We instantiate the four N>=128 tiles — {128x128x128, 128x128x256,
-// 256x128x128, 128x256x128}. The four narrow-N tiles (N in {32,64}) do NOT
-// compile through our block-scaled CollectiveBuilder: the scale-factor TMA needs
-// the CTA tile N to equal the SF atom N (= max(128, TileN)), so N<128 trips
-// "TMA requires CTA_Tile and SLayout top-level size equivalence" (cute
-// copy_traits_sm90_tma.hpp). flashinfer supports them via a different epilogue
-// (arch::OpClassTensorOp + explicit TmaWarpSpecialized, ElementC=void) which we
-// intentionally do NOT adopt here — it would rework the proven fixed-dispatch
-// configs. The N>=128 subset is exactly where the measured 6.1%/M=4096 prefill
-// headroom lives (large-M dense projections); narrow-N tiles only help tiny
-// M/N where the M<=256 config already ties/beats vLLM. Two of the four
-// (128x128x128, 256x128x128) are the fixed-dispatch configs above; the template
-// realizes 128x128x256 and 128x256x128 (schedules stay Auto as the two proven
-// configs — the builder resolves KernelTmaWarpSpecializedCooperativeBlockScaled
-// -Sm120 per tile, matching flashinfer's KernelTmaWarpSpecializedCooperative).
-// flashinfer also tunes StreamK + swap_ab variants; we take the DP-persistent
-// subset (large-M prefill favors the DP scheduler) to bound nvcc time + binary.
+// W1 retains the existing four N>=128 persistent candidates while repairing M
+// identity and cache concurrency. This is intentionally NOT the complete
+// FlashInfer surface: its explicit ElementC=void epilogue supports N={32,64}
+// tiles, swap-AB and Stream-K, and the exact 27B trace selects those families.
+// The accepted W2 in .agents/specs/nvfp4-small-m-dispatch.md ports all 32
+// tactics separately so this checkpoint's gain remains attributable.
 template <int TileM, int TileN, int TileK,
           typename Sched = cutlass::gemm::PersistentScheduler>
 struct sm120_fp4_tile {
@@ -342,14 +334,11 @@ const std::vector<Fp4Candidate>& Fp4Candidates() {
 // the dense-27B W4A4 fp4 GEMM. MEASURED (GB10, Triton-fast branch, same-binary
 // A/B vs graphed vLLM): +1.2% conc16 / +6.4% conc32 e2e, token-exact 16/16 (27B),
 // 35B inert (its dense is fp8 cuBLASLt / Marlin W4A16, never this cutlass GEMM).
-// CUDA-GRAPH SAFE: the autotune's cudaEventSynchronize is illegal mid-capture, but
-// it can only fire on a cache MISS, and a MISS never happens during capture — the
-// decode-graph state machine (Qwen3_5DenseDecodeGraph, cold->warm->captured) runs a
-// cold EAGER step at each padded batch size S that executes the exact same
-// ForwardLayers(S) fp4 GEMMs (M=S) and populates the plan cache BEFORE the warm step
-// captures size S, so every fp4 GEMM in the captured region is a cache HIT (mutex
-// lookup only, no event/sync). Prefill is always eager. Verified: 27B greedy 16/16 +
-// clean graphed conc16/conc32 benches with autotune ON, zero stream-capture errors.
+// CUDA-GRAPH SAFE: a ready hit performs no CUDA query/allocation/sync. On a miss
+// the adapter queries cudaStreamIsCapturing and fails loudly before creating
+// events when capture is active. The dense graph warmup should still populate
+// every exact M bucket eagerly; the explicit rejection makes that invariant
+// executable instead of relying on a comment.
 bool Fp4AutotuneEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FP4_AUTOTUNE");
@@ -366,28 +355,36 @@ bool Fp4AutotuneVerbose() {
   return on;
 }
 
-uint32_t NextPow2M(int m) {
-  auto next_pow_2 = [](uint32_t v) {
-    if (v <= 1) return 1u;
-    v--;
-    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-    return v + 1;
-  };
-  return std::max<uint32_t>(16u, next_pow_2(static_cast<uint32_t>(m)));
+bool Fp4ExactBucketsEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_EXACT_BUCKETS");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
 }
 
-struct Fp4ShapeKey {
-  uint32_t mp2;
-  int n;
-  int k;
-  bool operator==(const Fp4ShapeKey& o) const { return mp2 == o.mp2 && n == o.n && k == o.k; }
-};
-struct Fp4ShapeKeyHash {
-  size_t operator()(const Fp4ShapeKey& x) const {
-    return (std::hash<uint32_t>{}(x.mp2) * 1000003u) ^ (std::hash<int>{}(x.n) * 9176u) ^
-           std::hash<int>{}(x.k);
+int Fp4DeviceArchitecture(int device_ordinal) {
+  constexpr size_t kCachedDevices = 64;
+  static std::array<std::atomic<int>, kCachedDevices> cached{};
+  if (device_ordinal >= 0 && static_cast<size_t>(device_ordinal) < cached.size()) {
+    const int value = cached[static_cast<size_t>(device_ordinal)].load(std::memory_order_acquire);
+    if (value != 0) return value;
   }
-};
+
+  int major = 0;
+  int minor = 0;
+  Check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_ordinal),
+        "query device compute-capability major");
+  Check(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_ordinal),
+        "query device compute-capability minor");
+  const int architecture = major * 10 + minor;
+  if (device_ordinal >= 0 && static_cast<size_t>(device_ordinal) < cached.size()) {
+    int empty = 0;
+    cached[static_cast<size_t>(device_ordinal)].compare_exchange_strong(
+        empty, architecture, std::memory_order_release, std::memory_order_relaxed);
+  }
+  return architecture;
+}
 
 constexpr float kFp4Inf = 3.4e38f;
 
@@ -422,50 +419,67 @@ float Fp4TimeCandidate(const Fp4Candidate& cand, void* D, const void* A, const v
 
 // Pick + cache the best tile candidate index for a (Mbucket,N,K) shape.
 int Fp4SelectPlan(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                  const float* alpha, int m, int n, int k, cudaStream_t s) {
-  const uint32_t mp2 = NextPow2M(m);
-  const Fp4ShapeKey key{mp2, n, k};
-  static std::mutex mu;
-  static std::unordered_map<Fp4ShapeKey, int, Fp4ShapeKeyHash> plans;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = plans.find(key);
-    if (it != plans.end()) return it->second;
-  }
-  const auto& cands = Fp4Candidates();
-  const int baseline = (mp2 <= 256) ? 0 : 1;
-  std::vector<float> t(cands.size(), kFp4Inf);
-  for (size_t i = 0; i < cands.size(); ++i)
-    t[i] = Fp4TimeCandidate(cands[i], D, A, B, A_sf, B_sf, alpha, m, n, k, s);
-  int best = baseline;
-  for (size_t i = 0; i < cands.size(); ++i)
-    if (t[i] < t[best]) best = static_cast<int>(i);
-  // Hysteresis: only leave the proven baseline when the winner is clearly faster
-  // (>1%). Rejects measurement noise and keeps token output stable run-to-run
-  // (the 16/16 token-exact gate); the measured headroom is ~6.1%, so a real
-  // winner clears 1% easily.
-  const int chosen = (t[best] < t[baseline] * 0.99f) ? best : baseline;
-  if (Fp4AutotuneVerbose()) {
-    fprintf(stderr,
-            "[VT_FP4_AUTOTUNE] M=%d(mp2=%u) N=%d K=%d -> %s (%.1f us); baseline %s (%.1f us)\n", m,
-            mp2, n, k, cands[static_cast<size_t>(chosen)].name, t[static_cast<size_t>(chosen)] * 1000.0f,
-            cands[static_cast<size_t>(baseline)].name, t[static_cast<size_t>(baseline)] * 1000.0f);
-  }
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    plans.emplace(key, chosen);
-  }
-  return chosen;
+                  const float* alpha, int m, int n, int k, int device_ordinal,
+                  cudaStream_t s) {
+  const uint32_t m_bucket = Fp4ExactBucketsEnabled()
+                                ? nvfp4::HybridMBucket(static_cast<uint32_t>(m))
+                                : nvfp4::LegacyMBucket(static_cast<uint32_t>(m));
+  const nvfp4::PlanKey key{m_bucket,
+                           n,
+                           k,
+                           device_ordinal,
+                           Fp4DeviceArchitecture(device_ordinal),
+                           static_cast<uint8_t>(DType::kBF16),
+                           nvfp4::kTacticSetVersion};
+  static nvfp4::SingleFlightPlanCache<int> plans;
+
+  auto can_tune = [s] {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(s, &status), "query stream capture state");
+    return status == cudaStreamCaptureStatusNone;
+  };
+  auto tune = [&] {
+    const auto& cands = Fp4Candidates();
+    const int baseline = (m_bucket <= 256) ? 0 : 1;
+    std::vector<float> timings(cands.size(), kFp4Inf);
+    for (size_t i = 0; i < cands.size(); ++i) {
+      timings[i] =
+          Fp4TimeCandidate(cands[i], D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+    }
+    int best = baseline;
+    for (size_t i = 0; i < cands.size(); ++i) {
+      if (timings[i] < timings[static_cast<size_t>(best)]) best = static_cast<int>(i);
+    }
+    // Only leave the proven baseline for a >1% win. This rejects timing noise
+    // without changing the exact bucket or single-flight contract.
+    const int chosen = timings[static_cast<size_t>(best)] <
+                               timings[static_cast<size_t>(baseline)] * 0.99f
+                           ? best
+                           : baseline;
+    if (Fp4AutotuneVerbose()) {
+      fprintf(stderr,
+              "[VT_FP4_AUTOTUNE] M=%d(bucket=%u) N=%d K=%d device=%d sm=%d -> %s "
+              "(%.1f us); baseline %s (%.1f us)\n",
+              m, m_bucket, n, k, device_ordinal, key.architecture,
+              cands[static_cast<size_t>(chosen)].name,
+              timings[static_cast<size_t>(chosen)] * 1000.0f,
+              cands[static_cast<size_t>(baseline)].name,
+              timings[static_cast<size_t>(baseline)] * 1000.0f);
+    }
+    return chosen;
+  };
+  return nvfp4::ResolvePlan(plans, key, can_tune, tune);
 }
 
 // bf16-out fp4 GEMM entry: fixed dispatch (default) or per-shape autotuned tile.
 void Fp4GemmRunBf16(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                    const float* alpha, int m, int n, int k, cudaStream_t s) {
+                    const float* alpha, int m, int n, int k, int device_ordinal,
+                    cudaStream_t s) {
   if (!Fp4AutotuneEnabled()) {
     Fp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
     return;
   }
-  const int idx = Fp4SelectPlan(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+  const int idx = Fp4SelectPlan(D, A, B, A_sf, B_sf, alpha, m, n, k, device_ordinal, s);
   Fp4Candidates()[static_cast<size_t>(idx)].run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
 }
 
@@ -557,7 +571,7 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
   }
 
   Fp4GemmRunBf16(d_out, a_packed.data, b_packed.data, a_sf_sw.data, b_sf_sw.data, d_alpha, m, n, k,
-                 s);
+                 q.device.index, s);
 
   if (out_f32) {
     const int64_t total = static_cast<int64_t>(m) * n;

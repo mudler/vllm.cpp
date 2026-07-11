@@ -10,15 +10,23 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <random>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
 #include "vt/backend.h"
+#include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -44,6 +52,229 @@ float DecodeActElem(const uint8_t* packed, const uint8_t* scale, int64_t k, int6
   return mag * sf / input_global_scale;  // block_scale = sf/global
 }
 }  // namespace
+
+TEST_CASE("FlashInfer NVFP4 hybrid M buckets preserve small decode shapes") {
+  using vt::cuda::nvfp4::HybridMBucket;
+  const std::vector<std::pair<uint32_t, uint32_t>> cases = {
+      {0, 1},       {1, 1},       {2, 2},       {3, 4},       {4, 4},
+      {8, 8},       {16, 16},     {255, 256},   {256, 256},   {257, 512},
+      {2048, 2048}, {2049, 2560}, {4096, 4096}, {4097, 8192}, {32768, 32768},
+  };
+  for (const auto& [value, expected] : cases) {
+    CAPTURE(value);
+    CHECK(HybridMBucket(value) == expected);
+  }
+
+  using vt::cuda::nvfp4::LegacyMBucket;
+  CHECK(LegacyMBucket(0) == 16);
+  CHECK(LegacyMBucket(1) == 16);
+  CHECK(LegacyMBucket(2) == 16);
+  CHECK(LegacyMBucket(8) == 16);
+  CHECK(LegacyMBucket(16) == 16);
+  CHECK(LegacyMBucket(17) == 32);
+  CHECK_THROWS_AS(vt::cuda::nvfp4::NextPositivePowerOfTwo(0x80000001U),
+                  std::overflow_error);
+}
+
+TEST_CASE("NVFP4 plan key covers device architecture dtype shape and tactic ABI") {
+  using vt::cuda::nvfp4::PlanKey;
+  using vt::cuda::nvfp4::PlanKeyHash;
+  const PlanKey base{16, 5120, 17408, 0, 121, 2, 1};
+  std::unordered_set<PlanKey, PlanKeyHash> keys;
+  keys.insert(base);
+  auto key = base;
+  key.m_bucket = 8;
+  keys.insert(key);
+  key = base;
+  key.n = 1024;
+  keys.insert(key);
+  key = base;
+  key.k = 5120;
+  keys.insert(key);
+  key = base;
+  key.device_ordinal = 1;
+  keys.insert(key);
+  key = base;
+  key.architecture = 120;
+  keys.insert(key);
+  key = base;
+  key.output_dtype = 1;
+  keys.insert(key);
+  key = base;
+  key.tactic_set_version = 2;
+  keys.insert(key);
+  CHECK(keys.size() == 8);
+  CHECK(keys.contains(base));
+}
+
+TEST_CASE("NVFP4 plan tuning is single-flight per key and independent across keys") {
+  using vt::cuda::nvfp4::PlanKey;
+  using vt::cuda::nvfp4::ResolvePlan;
+  using vt::cuda::nvfp4::SingleFlightPlanCache;
+  SingleFlightPlanCache<int> cache;
+  const PlanKey key{16, 5120, 17408, 0, 121, 2, 1};
+
+  std::promise<void> owner_started;
+  auto owner_started_future = owner_started.get_future();
+  std::promise<void> release_owner;
+  const auto release_future = release_owner.get_future().share();
+  std::atomic<int> tune_count{0};
+  std::vector<int> results(16, -1);
+  std::vector<std::exception_ptr> errors(16);
+
+  std::thread owner([&] {
+    try {
+      results[0] = ResolvePlan(
+          cache, key, [] { return true; }, [&] {
+            ++tune_count;
+            owner_started.set_value();
+            release_future.wait();
+            return 7;
+          });
+    } catch (...) {
+      errors[0] = std::current_exception();
+    }
+  });
+  owner_started_future.wait();
+
+  std::vector<std::thread> waiters;
+  for (size_t i = 1; i < results.size(); ++i) {
+    waiters.emplace_back([&, i] {
+      try {
+        results[i] = ResolvePlan(cache, key, [] { return true; }, [&] {
+          ++tune_count;
+          return 99;
+        });
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+  while (cache.WaiterCountForTesting(key) != 15) std::this_thread::yield();
+  release_owner.set_value();
+  owner.join();
+  for (auto& waiter : waiters) waiter.join();
+
+  CHECK(tune_count.load() == 1);
+  CHECK(cache.SizeForTesting() == 1);
+  for (size_t i = 0; i < results.size(); ++i) {
+    CAPTURE(i);
+    CHECK(errors[i] == nullptr);
+    CHECK(results[i] == 7);
+  }
+
+  // A tuner blocked on one shape never owns the global map mutex.
+  const PlanKey blocked_key{8, 5120, 5120, 0, 121, 2, 1};
+  const PlanKey independent_key{8, 1024, 5120, 0, 121, 2, 1};
+  std::promise<void> blocked_started;
+  auto blocked_started_future = blocked_started.get_future();
+  std::promise<void> release_blocked;
+  const auto blocked_release_future = release_blocked.get_future().share();
+  int blocked_result = -1;
+  std::thread blocked([&] {
+    blocked_result = ResolvePlan(
+        cache, blocked_key, [] { return true; }, [&] {
+          blocked_started.set_value();
+          blocked_release_future.wait();
+          return 11;
+        });
+  });
+  blocked_started_future.wait();
+  CHECK(ResolvePlan(cache, independent_key, [] { return true; }, [] { return 13; }) == 13);
+  release_blocked.set_value();
+  blocked.join();
+  CHECK(blocked_result == 11);
+}
+
+TEST_CASE("NVFP4 plan cache rejects capture misses and retries failed tuning") {
+  using vt::cuda::nvfp4::PlanKey;
+  using vt::cuda::nvfp4::ResolvePlan;
+  using vt::cuda::nvfp4::SingleFlightPlanCache;
+  SingleFlightPlanCache<int> cache;
+  const PlanKey key{4, 5120, 17408, 0, 121, 2, 1};
+  int capture_queries = 0;
+  std::atomic<int> tune_count{0};
+
+  CHECK_THROWS_WITH_AS(
+      ResolvePlan(
+          cache, key,
+          [&] {
+            ++capture_queries;
+            return false;
+          },
+          [&] {
+            ++tune_count;
+            return 1;
+          }),
+      "NVFP4 plan cache miss while tuning is disallowed", std::runtime_error);
+  CHECK(capture_queries == 1);
+  CHECK(tune_count.load() == 0);
+  CHECK(cache.SizeForTesting() == 0);
+
+  std::promise<void> failed_owner_started;
+  auto failed_owner_started_future = failed_owner_started.get_future();
+  std::promise<void> release_failed_owner;
+  const auto failed_release_future = release_failed_owner.get_future().share();
+  std::vector<std::exception_ptr> failures(8);
+  std::thread failed_owner([&] {
+    try {
+      static_cast<void>(ResolvePlan(cache, key, [] { return true; }, [&]() -> int {
+        ++tune_count;
+        failed_owner_started.set_value();
+        failed_release_future.wait();
+        throw std::runtime_error("tune failed");
+      }));
+    } catch (...) {
+      failures[0] = std::current_exception();
+    }
+  });
+  failed_owner_started_future.wait();
+  std::vector<std::thread> failed_waiters;
+  for (size_t i = 1; i < failures.size(); ++i) {
+    failed_waiters.emplace_back([&, i] {
+      try {
+        static_cast<void>(ResolvePlan(cache, key, [] { return true; }, [&] {
+          ++tune_count;
+          return 99;
+        }));
+      } catch (...) {
+        failures[i] = std::current_exception();
+      }
+    });
+  }
+  while (cache.WaiterCountForTesting(key) != 7) std::this_thread::yield();
+  release_failed_owner.set_value();
+  failed_owner.join();
+  for (auto& waiter : failed_waiters) waiter.join();
+
+  CHECK(tune_count.load() == 1);
+  for (size_t i = 0; i < failures.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE(failures[i] != nullptr);
+    try {
+      std::rethrow_exception(failures[i]);
+    } catch (const std::runtime_error& error) {
+      CHECK(std::string(error.what()) == "tune failed");
+    }
+  }
+  CHECK(cache.SizeForTesting() == 0);
+  CHECK(ResolvePlan(cache, key, [] { return true; }, [&] {
+          ++tune_count;
+          return 17;
+        }) == 17);
+  CHECK(tune_count.load() == 2);
+
+  // A ready graph-capture lookup never evaluates the capture predicate.
+  capture_queries = 0;
+  CHECK(ResolvePlan(
+            cache, key,
+            [&] {
+              ++capture_queries;
+              return false;
+            },
+            [] { return 23; }) == 17);
+  CHECK(capture_queries == 0);
+}
 
 TEST_CASE("scaled_fp4_quant CPU == vllm::RefScaledFp4Quant (byte-exact) + decode") {
   const int64_t M = 5, K = 64;

@@ -509,9 +509,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   On the exact 128-request, concurrency-32, 1024-in/128-out workload, ordinary
   BF16 MLP gate/up and GDN B/A weights are now stacked at load and each pair is
   executed as one GEMM, mirroring vLLM's merged parameters. Two reproduced
-  temperature-1 runs average **6,253.81 tok/s** versus vLLM **6,669.28 tok/s
-  (0.938×)**; two greedy runs average **6,434.49 tok/s** versus vLLM
-  **6,719.53 tok/s (0.958×)**. These are open gaps, not performance parity.
+  post-rebase temperature-1 runs average **6,246.86 tok/s** versus fresh vLLM
+  **6,681.13 tok/s (0.935×)**; two greedy runs average **6,430.56 tok/s**
+  versus fresh vLLM **6,715.54 tok/s (0.958×)**. These are open gaps, not
+  performance parity.
   Random sampling uses the same exponential-race distribution as vLLM and has
   an empirical distribution test, but deterministic token streams differ because
   the project still uses SplitMix while vLLM uses torch Philox. The fresh Nsight

@@ -6742,3 +6742,42 @@ The upstream registry additions resolved the former missing
 `qwen36_gguf_greedy` runner. Natural greedy remains 15/16 with the established
 request-1 token-6 divergence. No source from the rejected FA2, post-conv,
 convolution, recurrence, sampler, or cuBLASLt experiments remains.
+
+## 2026-07-11 — local branch rebased onto current main and benchmarks refreshed
+
+Replayed all 11 `local-blackwell-environment` commits onto upstream/main
+`a40a9e3`. Two rebase stops required manual resolution. The first was a pure
+append collision in `.agents/state.md`; upstream's July 11 native-stream-usage
+record remains first and the local July 9 NixOS entry follows it. The second
+retained both upstream's serving warning and the local RTX warning in README,
+and retained upstream's serving ledger row before the three local benchmark
+rows in `.agents/parity-ledger.md`. The other eight replayed commits applied
+cleanly. A repository-wide marker scan and `git diff --check main...HEAD` pass.
+
+Validation on the rebased tree: clean incremental CPU rebuild plus CTest passes
+**105/105**. The first CUDA configure attempt stopped before compilation because
+Triton tried NixOS's absent `/sbin/ldconfig`; retrying with the documented
+`TRITON_LIBCUDA_PATH=/run/opengl-driver/lib` regenerated every native-sm_120
+AOT artifact and completed the CUDA build. CUDA CTest passes **105/106**. The
+sole failure is unchanged: `test_cuda_ops` reports 11 BF16 cuBLASLt values over
+tolerance at M=17, K=31, N=13. GDN, concurrent AOT first-load, attention
+preamble, sampler, op parity, and model gate tests all pass.
+
+Refreshed the local comparison sequentially, never overlapping vllm.cpp and
+vLLM. Benchmark binary is `81c9383`; model snapshot is `851bf6e`. Both engines
+used the same 128 ShareGPT prompts, exact 1024-token inputs, 128 generated
+tokens, concurrency/max-num-seqs 32, BF16, model length 4096, mnbt 2048, seed
+0, and ignored EOS. vllm.cpp also used 1280 cache blocks and a 1024 MiB pool
+ceiling; vLLM used GPU-memory utilization 0.88.
+
+- Greedy vllm.cpp: 6431.15/6429.96 total tok/s, mean **6430.56**; output mean
+  711.08. Fresh vLLM: 6713.51/6717.57, mean **6715.54**; output mean 742.59.
+  Ratio: **0.9576x**.
+- Temperature 1 vllm.cpp: 6246.72/6247.00, mean **6246.86**; output mean
+  690.76. Fresh vLLM: 6680.91/6681.35, mean **6681.13**; output mean 738.78.
+  Ratio: **0.9350x**.
+
+The project means moved only -0.06% greedy and -0.11% temperature 1 from the
+preceding checkpoint, so the rebase caused no material throughput regression.
+The established representative-corpus correctness remains 15/16 and was not
+requalified by this throughput-only run; performance parity remains open.

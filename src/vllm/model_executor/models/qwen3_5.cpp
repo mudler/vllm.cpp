@@ -1316,6 +1316,21 @@ void ScatterStateF32(Dev d, const Tensor& cache, DBuf& f32buf,
   }
 }
 
+// W1 indexed state-I/O dispatch. CUDA + device-resident W0 storage defaults to
+// the fused indexed gather/scatter operators. Either diagnostic opt-out restores
+// the exact row-copy + cast baseline on the same binary. CPU keeps that baseline
+// as its reference implementation.
+bool IndexedGdnStateIoEnabled(Device device) {
+  const char* indexed = std::getenv("VT_GDN_INDEXED_STATE_IO");
+  // CPU keeps the row-copy reference by default. An explicit =1 is a test hook
+  // that drives the whole model integration through the CPU reference kernels.
+  if (device.type != vt::DeviceType::kCUDA)
+    return indexed != nullptr && indexed[0] == '1';
+  const char* cache = std::getenv("VT_DEVICE_KV_CACHE");
+  if (cache != nullptr && cache[0] == '0') return false;
+  return indexed == nullptr || indexed[0] != '0';
+}
+
 // Prefill launch-gap fusion (perf/glue-fuse): fold the GDN post-conv glue chain
 // GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta (4 launches) into ONE
 // vt::GdnPostConv launch, and the gated-RMSNorm + CastBf16 pair (2 launches)
@@ -1535,7 +1550,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
 
 // PERSISTENT per-step input device buffers (decode host-tax #2): the flattened
 // positions + the full-attn metadata (slot_mapping/block_table/seq_lens/
-// query_start_loc) + the GDN decode state indices, uploaded to the device ONCE
+// query_start_loc) + all GDN non-spec/prefill state metadata, uploaded ONCE
 // per step and read by EVERY layer — mirrors vLLM's persistent input buffers in
 // gpu_model_runner.py (self.input_batch.{positions,slot_mapping,block_table,
 // seq_lens,query_start_loc} device tensors, refreshed once per step). Collapses
@@ -1553,8 +1568,15 @@ struct StepDevInputs {
   DBuf block_table;      // i32 [num_reqs, cols]
   DBuf seq_lens;         // i32 [num_reqs]
   DBuf query_start_loc;  // i32 [num_reqs+1]
-  DBuf gdn_state_idx;    // i32 [num_decodes] (decode path; else a 1-elem stub)
+  DBuf gdn_state_idx;    // i32 [num_reqs] full non-spec state slots
   bool has_gdn_idx = false;
+  DBuf gdn_non_spec_qsl;       // i32 [num_reqs+1]
+  DBuf gdn_has_initial;        // i8 [num_reqs], upstream bool mask
+  DBuf gdn_prefill_state_idx;  // i32 [num_prefills]
+  DBuf gdn_prefill_qsl;        // i32 [num_prefills+1]
+  DBuf gdn_prefill_has_initial;  // i8 [num_prefills]
+  bool has_gdn_prefill_meta = false;
+  bool indexed_gdn_state_io = false;
   // f32 [T, rotary_dim] cos|sin cache for the fused full-attn preamble, built ONCE
   // per step (VT_FUSE_ATTN_PREAMBLE) and reused by every full-attn layer; a 1-elem
   // stub when the toggle is off (has_attn_cos_sin=false).
@@ -1566,6 +1588,7 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
                                  const CommonAttentionMetadata& am,
                                  const GDNAttentionMetadata& gm) {
   const int64_t T = static_cast<int64_t>(positions.size());
+  const bool indexed_state_io = IndexedGdnStateIoEnabled(d.q.device);
   StepDevInputs s{
       DBuf(d, DType::kI32, {T}, positions.data()),
       DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
@@ -1573,19 +1596,59 @@ StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
            am.block_table_tensor.data()),
       DBuf(d, DType::kI32, {am.num_reqs}, am.seq_lens.data()),
       DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
-      DBuf(d, DType::kI32, {1}),  // gdn stub (replaced below on a decode step)
+      DBuf(d, DType::kI32, {1}),  // non-spec index stub
       false,
+      DBuf(d, DType::kI32, {1}),  // non-spec qsl stub
+      DBuf(d, DType::kI8, {1}),   // full has-initial stub
+      DBuf(d, DType::kI32, {1}),  // prefill index stub
+      DBuf(d, DType::kI32, {1}),  // prefill qsl stub
+      DBuf(d, DType::kI8, {1}),   // prefill has-initial stub
+      false,
+      indexed_state_io,
       DBuf(d, DType::kF32, {1}),  // attn cos|sin stub (filled by MaybeBuildAttnCosSin)
       false,
   };
-  // GDN decode state indices: the leading num_decodes entries of the non-spec
-  // state-index vector, SHARED by causal_conv1d_update + the fused decode
-  // recurrence across ALL 30 GDN layers (was re-uploaded 60×/step). Present only
-  // when the step contains decodes.
-  if (gm.num_decodes > 0 && gm.non_spec_state_indices_tensor.has_value()) {
-    s.gdn_state_idx = DBuf(d, DType::kI32, {gm.num_decodes},
+  // Full non-spec state indices are shared by decode and mixed-prefill paths.
+  // Decode consumes their leading num_decodes rows; indexed W1 gather/scatter
+  // consumes the whole vector. One upload replaces every per-layer row copy.
+  if (gm.non_spec_state_indices_tensor.has_value() &&
+      (indexed_state_io || gm.num_decodes > 0)) {
+    const int64_t index_count =
+        indexed_state_io
+            ? static_cast<int64_t>(gm.non_spec_state_indices_tensor->size())
+            : static_cast<int64_t>(gm.num_decodes);
+    s.gdn_state_idx = DBuf(d, DType::kI32,
+                           {index_count},
                            gm.non_spec_state_indices_tensor->data());
     s.has_gdn_idx = true;
+  }
+  if (indexed_state_io && gm.num_prefills > 0 &&
+      gm.non_spec_query_start_loc.has_value() &&
+      gm.has_initial_state.has_value() &&
+      gm.prefill_state_indices.has_value() &&
+      gm.prefill_query_start_loc.has_value() &&
+      gm.prefill_has_initial_state.has_value()) {
+    s.gdn_non_spec_qsl = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.non_spec_query_start_loc->size())},
+        gm.non_spec_query_start_loc->data());
+    s.gdn_has_initial = DBuf(
+        d, DType::kI8,
+        {static_cast<int64_t>(gm.has_initial_state->size())},
+        gm.has_initial_state->data());
+    s.gdn_prefill_state_idx = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.prefill_state_indices->size())},
+        gm.prefill_state_indices->data());
+    s.gdn_prefill_qsl = DBuf(
+        d, DType::kI32,
+        {static_cast<int64_t>(gm.prefill_query_start_loc->size())},
+        gm.prefill_query_start_loc->data());
+    s.gdn_prefill_has_initial = DBuf(
+        d, DType::kI8,
+        {static_cast<int64_t>(gm.prefill_has_initial_state->size())},
+        gm.prefill_has_initial_state->data());
+    s.has_gdn_prefill_meta = true;
   }
   return s;
 }
@@ -1671,24 +1734,43 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                                       : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dconv(d, convdt, {T, conv_dim});
   const int64_t conv_row_elems = conv_dim * (Kw - 1);
+  const bool indexed_state_io = sdi.indexed_gdn_state_io;
   if (np > 0) {
     // Any prefill: conv over the WHOLE non-spec stream (decodes lead, each with
     // has_initial_state=1). qwen_gdn_linear_attn.py:1360-1375.
     const auto& sidx = *meta.non_spec_state_indices_tensor;
-    const auto& qsl_full = *meta.non_spec_query_start_loc;
-    const auto& his_u8 = *meta.has_initial_state;
     const int64_t nreq = static_cast<int64_t>(sidx.size());
     // Gather the persistent conv_state rows into an f32 working buffer (bf16
     // cache on CUDA → upcast; f32 cache on CPU → direct), run the f32
     // CausalConv1dFwd, then downcast + scatter back to the cache.
     const std::vector<int64_t> cs_shape = {nreq, conv_dim, Kw - 1};
-    DBuf dcs = GatherStateF32(d, state.conv_state, sidx, conv_row_elems, cs_shape);
-    std::vector<int32_t> his(his_u8.begin(), his_u8.end());
-    DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
-    DBuf dhis(d, DType::kI32, {nreq}, his.data());
-    vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dcs.t(),
-                        dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
-    ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems, cs_shape);
+    if (indexed_state_io) {
+      VT_CHECK(sdi.has_gdn_idx && sdi.has_gdn_prefill_meta,
+               "indexed GDN conv requires persistent non-spec metadata");
+      DBuf dcs(d, DType::kF32, cs_shape);
+      vt::GdnStateGather(d.q, dcs.t(), state.conv_state,
+                         sdi.gdn_state_idx.t());
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+                          dcs.t(), sdi.gdn_non_spec_qsl.t(),
+                          sdi.gdn_has_initial.t(),
+                          vt::CausalConv1dArgs{true});
+      Tensor conv_cache = state.conv_state;
+      vt::GdnStateScatter(d.q, conv_cache, dcs.t(),
+                          sdi.gdn_state_idx.t());
+    } else {
+      const auto& qsl_full = *meta.non_spec_query_start_loc;
+      const auto& his_u8 = *meta.has_initial_state;
+      DBuf dcs =
+          GatherStateF32(d, state.conv_state, sidx, conv_row_elems, cs_shape);
+      std::vector<int32_t> his(his_u8.begin(), his_u8.end());
+      DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
+      DBuf dhis(d, DType::kI32, {nreq}, his.data());
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+                          dcs.t(), dqsl.t(), dhis.t(),
+                          vt::CausalConv1dArgs{true});
+      ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems,
+                      cs_shape);
+    }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
     // conv_state at each sequence's slot (mirrors mamba causal_conv1d_update
@@ -1702,7 +1784,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // re-read this H2D copy from a fixed host address across replays.
     // State slot indices from the PERSISTENT per-step buffer (uploaded once,
     // shared by conv-update + the ssm recurrence across all GDN layers).
-    Tensor gidx = sdi.gdn_state_idx.t();
+    Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
     Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
     vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr, conv_cache,
                            vt::CausalConv1dArgs{true}, &gidx);
@@ -1749,7 +1831,10 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // slot (mirrors fla fused_recurrent ssm_state_indices) — no per-request
     // gather+scatter (the other two host<->device copies per sequence per layer).
     // Persistent metadata source (see the conv branch) for graph-replay safety.
-    Tensor gidx = sdi.gdn_state_idx.t();
+    // The persistent W1 buffer covers every non-spec request. A turnover step
+    // may have a leading decode subset followed by prefills, so both decode
+    // consumers must narrow the view to exactly `nd` state slots.
+    Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
     Tensor ssm_cache = state.ssm_state;  // mutable view over the shared buffer
     Tensor q_dec = SubView(dql2.t(), 0, nd_tok);
     Tensor k_dec = SubView(dkl2.t(), 0, nd_tok);
@@ -1762,23 +1847,29 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   if (np > 0) {
     const auto& pidx = *meta.prefill_state_indices;
-    const auto& p_his = *meta.prefill_has_initial_state;
     const auto& p_qsl = *meta.prefill_query_start_loc;
     // Gather the persistent ssm_state rows into an f32 working buffer (bf16 cache
     // on CUDA → upcast; f32 cache on CPU → direct), run the f32 chunked GdnPrefill
     // (fla reads the initial_state in f32, writes the final_state), then downcast +
     // scatter back to the cache.
     const std::vector<int64_t> ss_shape = {np, Hv, Dv, Dk};
-    DBuf dss = GatherStateF32(d, state.ssm_state, pidx, ssm_row_elems, ss_shape);
-    // ⚠ GDN-STATE ZEROING (M1.6 caller obligation, qwen_gdn_linear_attn.py:1514):
-    // vt::GdnPrefill reads `state` unconditionally, so zero the gathered rows
-    // for fresh requests (prefill_has_initial_state==0) — else a fresh request
-    // reads a stale mamba block. Zero the f32 working rows.
-    const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
-    for (size_t s = 0; s < p_his.size(); ++s)
-      if (p_his[s] == 0)
-        d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
-    DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
+    DBuf dss(d, DType::kF32, ss_shape);
+    if (indexed_state_io) {
+      VT_CHECK(sdi.has_gdn_prefill_meta,
+               "indexed GDN prefill requires persistent prefill metadata");
+      // Fuses indexing, BF16->F32, and the fresh-request zeroing obligation.
+      vt::GdnStateGather(d.q, dss.t(), state.ssm_state,
+                         sdi.gdn_prefill_state_idx.t(),
+                         &sdi.gdn_prefill_has_initial.t());
+    } else {
+      dss = GatherStateF32(d, state.ssm_state, pidx, ssm_row_elems,
+                           ss_shape);
+      const auto& p_his = *meta.prefill_has_initial_state;
+      const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
+      for (size_t s = 0; s < p_his.size(); ++s)
+        if (p_his[s] == 0)
+          d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
+    }
     Tensor q_pre = SubView(dql2.t(), nd_tok, np_tok);
     Tensor k_pre = SubView(dkl2.t(), nd_tok, np_tok);
     Tensor v_pre = SubView(vf.t(), nd_tok, np_tok);
@@ -1792,9 +1883,19 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // this call. Device-resident metadata, mirroring the decode StepDevInputs fix.
     vt::GdnArgs gdn_args{scale};
     gdn_args.query_start_loc_host = p_qsl.data();
-    vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                   dpqsl.t(), gdn_args);
-    ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems, ss_shape);
+    if (indexed_state_io) {
+      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
+                     sdi.gdn_prefill_qsl.t(), gdn_args);
+      Tensor ssm_cache = state.ssm_state;
+      vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
+                          sdi.gdn_prefill_state_idx.t());
+    } else {
+      DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
+      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
+                     dpqsl.t(), gdn_args);
+      ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems,
+                      ss_shape);
+    }
   }
 
   // Gated RMSNorm over Dv with the z gate, cast bf16, flatten heads, out-project.

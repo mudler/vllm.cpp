@@ -741,6 +741,15 @@ void CheckI32Meta(const Queue& q, const Tensor& t, int64_t expect_len, const cha
            std::string(name) + ": " + what + " must be i32 [" + std::to_string(expect_len) +
                "] contiguous on the queue device");
 }
+
+void CheckBoolMeta(const Queue& q, const Tensor& t, int64_t expect_len,
+                   const char* name, const char* what) {
+  VT_CHECK(t.rank == 1 && t.shape[0] == expect_len &&
+               (t.dtype == DType::kI8 || t.dtype == DType::kI32) &&
+               t.IsContiguous() && t.device == q.device,
+           std::string(name) + ": " + what + " must be i8/i32 [" +
+               std::to_string(expect_len) + "] contiguous on the queue device");
+}
 }  // namespace
 
 void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
@@ -749,7 +758,7 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
   CheckConvCommon(q, out, x, weight, bias, conv_state, "causal_conv1d_fwd");
   const int64_t n = conv_state.shape[0];
   CheckI32Meta(q, query_start_loc, n + 1, "causal_conv1d_fwd", "query_start_loc");
-  CheckI32Meta(q, has_initial_state, n, "causal_conv1d_fwd", "has_initial_state");
+  CheckBoolMeta(q, has_initial_state, n, "causal_conv1d_fwd", "has_initial_state");
   reinterpret_cast<CausalConv1dFwdFn>(GetOp(OpId::kCausalConv1dFwd, q.device.type))(
       q, out, x, weight, bias, conv_state, query_start_loc, has_initial_state, args);
 }
@@ -829,6 +838,61 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
   }
   reinterpret_cast<GdnDecodeFn>(GetOp(OpId::kGdnDecode, q.device.type))(
       q, out, q_in, k, v, g, beta, state, state_idx, args);
+}
+
+namespace {
+void CheckGdnStateIo(const Queue& q, const Tensor& working,
+                     const Tensor& cache, const Tensor& state_idx,
+                     const char* name) {
+  VT_CHECK(cache.rank >= 2 && cache.rank <= kMaxRank,
+           std::string(name) + ": cache rank must be in [2,4]");
+  VT_CHECK(working.rank == cache.rank,
+           std::string(name) + ": working/cache ranks must match");
+  VT_CHECK(state_idx.rank == 1 && state_idx.dtype == DType::kI32 &&
+               state_idx.IsContiguous(),
+           std::string(name) + ": state_idx must be contiguous i32 [N]");
+  VT_CHECK(working.shape[0] == state_idx.shape[0],
+           std::string(name) + ": working rows must match state_idx");
+  for (int d = 1; d < cache.rank; ++d) {
+    VT_CHECK(working.shape[d] == cache.shape[d],
+             std::string(name) + ": working/cache row shapes must match");
+  }
+  VT_CHECK(working.dtype == DType::kF32,
+           std::string(name) + ": working state must be f32");
+  VT_CHECK(cache.dtype == DType::kF32 || cache.dtype == DType::kBF16,
+           std::string(name) + ": cache must be f32 or bf16");
+  VT_CHECK(working.IsContiguous() && cache.IsContiguous(),
+           std::string(name) + ": working/cache must be contiguous");
+  VT_CHECK(working.device == q.device && cache.device == q.device &&
+               state_idx.device == q.device,
+           std::string(name) + ": device mismatch");
+}
+}  // namespace
+
+void GdnStateGather(Queue& q, Tensor& working, const Tensor& cache,
+                    const Tensor& state_idx,
+                    const Tensor* has_initial_state) {
+  CheckGdnStateIo(q, working, cache, state_idx, "gdn_state_gather");
+  if (has_initial_state != nullptr) {
+    VT_CHECK(has_initial_state->rank == 1 &&
+                 has_initial_state->shape[0] == state_idx.shape[0] &&
+                 (has_initial_state->dtype == DType::kI8 ||
+                  has_initial_state->dtype == DType::kI32) &&
+                 has_initial_state->IsContiguous() &&
+                 has_initial_state->device == q.device,
+             "gdn_state_gather: has_initial_state must be contiguous i8/i32 [N] on device");
+  }
+  reinterpret_cast<GdnStateGatherFn>(
+      GetOp(OpId::kGdnStateGather, q.device.type))(
+      q, working, cache, state_idx, has_initial_state);
+}
+
+void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
+                     const Tensor& state_idx) {
+  CheckGdnStateIo(q, working, cache, state_idx, "gdn_state_scatter");
+  reinterpret_cast<GdnStateScatterFn>(
+      GetOp(OpId::kGdnStateScatter, q.device.type))(
+      q, cache, working, state_idx);
 }
 
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,

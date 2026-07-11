@@ -134,6 +134,10 @@ enum class OpId : uint8_t {
   kDropinProbe,
   // In-place base/MRoPE rotation from a supplied dtype-specific global cache.
   kRopeFromCache,
+  // Indexed persistent GDN cache boundary: one launch replaces the former
+  // per-row copies plus a separate BF16<->F32 cast.
+  kGdnStateGather,
+  kGdnStateScatter,
   kCount
 };
 
@@ -387,6 +391,10 @@ using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, con
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const Tensor&, const Tensor&, Tensor&, const Tensor*,
                              const GdnArgs&);
+using GdnStateGatherFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
+using GdnStateScatterFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MoeRouterTopKFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
 using MoeCombineFn =
@@ -790,7 +798,7 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
 // (nullptr = no bias; Qwen GDN conv has bias=False), conv_state[N,C,K-1] f32
 // in/out (per-sequence slices, gathered — cache_indices/NULL-block handling is
 // M0.9), query_start_loc[N+1] i32 cumulative token offsets (seq s spans
-// [qsl[s], qsl[s+1])), has_initial_state[N] i32 (0/1).
+// [qsl[s], qsl[s+1])), has_initial_state[N] i8/i32 (0/1; upstream bool).
 //   out[c,t] = act(bias[c] + sum_j w[c,j] * window[j]), window[j] = x token
 //   t-(K-1-j), falling back to conv_state (if has_initial_state) or 0 for
 //   tokens before the sequence start. w[:,K-1] multiplies the current token.
@@ -854,6 +862,19 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx = nullptr);
+
+// Indexed persistent-state cache boundary used by GDN mixed prefill. `cache`
+// is [num_slots,...] f32 or bf16, `state_idx` is i32 [N], and `working` is the
+// compact f32 [N,...] state consumed by CausalConv1dFwd/GdnPrefill. Gather
+// fuses cache indexing + BF16->F32 conversion in one launch; optional
+// has_initial_state (i8 or i32 [N]) zeros fresh rows while gathering. Scatter
+// performs the inverse indexed F32->cache-dtype store in one launch. Cache rows
+// not named by state_idx are untouched.
+void GdnStateGather(Queue& q, Tensor& working, const Tensor& cache,
+                    const Tensor& state_idx,
+                    const Tensor* has_initial_state = nullptr);
+void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
+                     const Tensor& state_idx);
 
 // --- MoE (sparse mixture-of-experts) ops. Formula reference:
 // .agents/specs/moe-semantics.md. The expert MLP itself is NOT an op — it is composed

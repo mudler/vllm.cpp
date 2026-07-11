@@ -276,6 +276,14 @@ TEST_CASE("causal_conv1d_fwd: bias + initial state, hand-computed") {
     CHECK(out[0] == doctest::Approx(4.25f));
     CHECK(out[1] == doctest::Approx(4.0f));
   }
+  SUBCASE("upstream bool mask stored as i8") {
+    std::vector<int8_t> his_i8 = {1};
+    Tensor mask = Tensor::Contiguous(his_i8.data(), DType::kI8, Cpu(), {1});
+    vt::CausalConv1dFwd(q, to, tx, tw, &tb, ts, tqsl, mask,
+                        CausalConv1dArgs{false});
+    CHECK(out[0] == doctest::Approx(4.25f));
+    CHECK(out[1] == doctest::Approx(4.0f));
+  }
   CHECK(state[0] == doctest::Approx(1.0f));  // raw x, pre-activation
   CHECK(state[1] == doctest::Approx(2.0f));
 }
@@ -651,7 +659,7 @@ constexpr Combo kCudaCombos[] = {
 // causal_conv1d_fwd CPU-vs-CUDA on one varlen batch.
 void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,
                         int64_t c, int64_t k, bool with_bias, bool silu, const Combo& cb,
-                        uint32_t seed) {
+                        uint32_t seed, bool i8_mask = false) {
   const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
   const int64_t t = qsl.back();
   const auto xf = RandomF32(static_cast<size_t>(t * c), seed);
@@ -667,12 +675,14 @@ void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32
   std::vector<uint8_t> out_cpu(static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
   std::vector<float> st_cpu = stf;
   std::vector<int32_t> qsl_cpu = qsl, his_cpu = his;
+  std::vector<int8_t> his_i8(his.begin(), his.end());
   Tensor tx = MakeT(const_cast<uint8_t*>(xb.data()), cb.in, Cpu(), {t, c});
   Tensor tw = MakeT(const_cast<uint8_t*>(wb.data()), cb.in, Cpu(), {c, k});
   Tensor tb = MakeT(const_cast<uint8_t*>(bb.data()), cb.in, Cpu(), {c});
   Tensor ts = MakeT(st_cpu.data(), DType::kF32, Cpu(), {n, c, k - 1});
   Tensor tqsl = MakeT(qsl_cpu.data(), DType::kI32, Cpu(), {n + 1});
-  Tensor this_ = MakeT(his_cpu.data(), DType::kI32, Cpu(), {n});
+  Tensor this_ = i8_mask ? MakeT(his_i8.data(), DType::kI8, Cpu(), {n})
+                         : MakeT(his_cpu.data(), DType::kI32, Cpu(), {n});
   Tensor to = MakeT(out_cpu.data(), cb.out, Cpu(), {t, c});
   Queue cq = Q();
   vt::CausalConv1dFwd(cq, to, tx, tw, with_bias ? &tb : nullptr, ts, tqsl, this_, args);
@@ -686,7 +696,9 @@ void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32
   DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
   DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stf.data());
   DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
-  DeviceTensor dhis(gpu, gq.q, DType::kI32, {n}, his.data());
+  DeviceTensor dhis(gpu, gq.q, i8_mask ? DType::kI8 : DType::kI32, {n},
+                    i8_mask ? static_cast<const void*>(his_i8.data())
+                            : static_cast<const void*>(his.data()));
   DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
   vt::CausalConv1dFwd(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
                       with_bias ? &db.tensor() : nullptr, dst.tensor(), dqsl.tensor(),
@@ -982,6 +994,124 @@ void RunGdnChunkedVsSequential(const std::vector<int32_t>& qsl, int64_t hk, int6
 
 }  // namespace
 
+// Ported behavior from tests/v1/worker/test_mamba_utils.py:342-358: gather
+// non-contiguous persistent cache rows, zero fresh requests, then scatter only
+// the selected rows back. Both cache dtypes exercise the exact cache boundary;
+// i8 and i32 masks cover upstream bool metadata and standalone callers.
+TEST_CASE("gdn indexed state I/O: dtype conversion, fresh zero, untouched slots") {
+  constexpr int64_t kSlots = 5, kRows = 3, kRowElems = 6;
+  const std::vector<int32_t> idx = {3, 1, 4};
+  const std::vector<int8_t> has_i8 = {1, 0, 1};
+  const std::vector<int32_t> has_i32 = {1, 0, 1};
+  std::vector<float> master(static_cast<size_t>(kSlots * kRowElems));
+  for (int64_t i = 0; i < static_cast<int64_t>(master.size()); ++i)
+    master[static_cast<size_t>(i)] = static_cast<float>(i) * 0.125f - 2.0f;
+
+  for (DType cache_dtype : {DType::kF32, DType::kBF16}) {
+    CAPTURE(static_cast<int>(cache_dtype));
+    std::vector<uint8_t> cache_bytes = Pack(master, cache_dtype);
+    const std::vector<float> cache_initial = Unpack(cache_bytes, cache_dtype);
+    std::vector<float> working(static_cast<size_t>(kRows * kRowElems), -99.0f);
+    std::vector<int32_t> idx_copy = idx;
+    std::vector<int8_t> has8 = has_i8;
+    std::vector<int32_t> has32 = has_i32;
+    Tensor cache = MakeT(cache_bytes.data(), cache_dtype, Cpu(),
+                         {kSlots, 2, 3});
+    Tensor work = MakeT(working.data(), DType::kF32, Cpu(), {kRows, 2, 3});
+    Tensor tidx = MakeT(idx_copy.data(), DType::kI32, Cpu(), {kRows});
+    Tensor mask = cache_dtype == DType::kBF16
+                      ? MakeT(has8.data(), DType::kI8, Cpu(), {kRows})
+                      : MakeT(has32.data(), DType::kI32, Cpu(), {kRows});
+    Queue q = Q();
+    vt::GdnStateGather(q, work, cache, tidx, &mask);
+
+    std::vector<float> want_work(working.size(), 0.0f);
+    for (int64_t r = 0; r < kRows; ++r) {
+      if (has_i8[static_cast<size_t>(r)] == 0) continue;
+      for (int64_t e = 0; e < kRowElems; ++e) {
+        want_work[static_cast<size_t>(r * kRowElems + e)] =
+            cache_initial[static_cast<size_t>(idx[static_cast<size_t>(r)] *
+                                              kRowElems + e)];
+      }
+    }
+    CHECK(working == want_work);
+
+    for (int64_t i = 0; i < static_cast<int64_t>(working.size()); ++i)
+      working[static_cast<size_t>(i)] = 10.0f + static_cast<float>(i) * 0.25f;
+    vt::GdnStateScatter(q, cache, work, tidx);
+    std::vector<float> want_cache = cache_initial;
+    const std::vector<float> stored = Unpack(Pack(working, cache_dtype), cache_dtype);
+    for (int64_t r = 0; r < kRows; ++r) {
+      for (int64_t e = 0; e < kRowElems; ++e) {
+        want_cache[static_cast<size_t>(idx[static_cast<size_t>(r)] *
+                                       kRowElems + e)] =
+            stored[static_cast<size_t>(r * kRowElems + e)];
+      }
+    }
+    CHECK(Unpack(cache_bytes, cache_dtype) == want_cache);
+  }
+
+  std::vector<float> cache(12, 0.0f), working(2, 0.0f);
+  std::vector<int32_t> bad_idx = {6};
+  Tensor tc = MakeT(cache.data(), DType::kF32, Cpu(), {6, 2});
+  Tensor tw = MakeT(working.data(), DType::kF32, Cpu(), {1, 2});
+  Tensor ti = MakeT(bad_idx.data(), DType::kI32, Cpu(), {1});
+  Queue q = Q();
+  CHECK_THROWS_AS(vt::GdnStateGather(q, tw, tc, ti), std::runtime_error);
+  CHECK_THROWS_AS(vt::GdnStateScatter(q, tc, tw, ti), std::runtime_error);
+}
+
+TEST_CASE("CUDA gdn indexed state I/O matches CPU") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr int64_t kSlots = 7, kRows = 3, kRowElems = 24;
+  const std::vector<int32_t> idx = {5, 1, 6};
+  const std::vector<int8_t> has = {1, 0, 1};
+  const std::vector<float> master =
+      RandomF32(static_cast<size_t>(kSlots * kRowElems), 8120);
+  const std::vector<uint8_t> packed = Pack(master, DType::kBF16);
+  const std::vector<float> initial = Unpack(packed, DType::kBF16);
+  std::vector<float> want_work(static_cast<size_t>(kRows * kRowElems), 0.0f);
+  for (int64_t r = 0; r < kRows; ++r) {
+    if (has[static_cast<size_t>(r)] == 0) continue;
+    for (int64_t e = 0; e < kRowElems; ++e)
+      want_work[static_cast<size_t>(r * kRowElems + e)] =
+          initial[static_cast<size_t>(idx[static_cast<size_t>(r)] * kRowElems + e)];
+  }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dcache(gpu, gq.q, DType::kBF16, {kSlots, 2, 3, 4},
+                      packed.data());
+  DeviceTensor didx(gpu, gq.q, DType::kI32, {kRows}, idx.data());
+  DeviceTensor dhas(gpu, gq.q, DType::kI8, {kRows}, has.data());
+  DeviceTensor dwork(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4});
+  vt::GdnStateGather(gq.q, dwork.tensor(), dcache.tensor(), didx.tensor(),
+                     &dhas.tensor());
+  std::vector<float> got_work(want_work.size());
+  dwork.Download(gq.q, got_work.data());
+  CHECK(got_work == want_work);
+
+  const std::vector<float> replacement = RandomF32(want_work.size(), 8130);
+  DeviceTensor dreplacement(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4},
+                            replacement.data());
+  vt::GdnStateScatter(gq.q, dcache.tensor(), dreplacement.tensor(),
+                      didx.tensor());
+  std::vector<uint8_t> got_cache(packed.size());
+  dcache.Download(gq.q, got_cache.data());
+  std::vector<float> want_cache = initial;
+  const std::vector<float> stored =
+      Unpack(Pack(replacement, DType::kBF16), DType::kBF16);
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t e = 0; e < kRowElems; ++e)
+      want_cache[static_cast<size_t>(idx[static_cast<size_t>(r)] * kRowElems + e)] =
+          stored[static_cast<size_t>(r * kRowElems + e)];
+  }
+  CHECK(Unpack(got_cache, DType::kBF16) == want_cache);
+}
+
 TEST_CASE("CUDA causal_conv1d_fwd matches CPU (varlen, bias, dtypes)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
@@ -1001,6 +1131,10 @@ TEST_CASE("CUDA causal_conv1d_fwd matches CPU (varlen, bias, dtypes)") {
   // Real conv dim (512 channels spans multiple thread blocks per sequence).
   RunConvFwdCudaCase({0, 9, 16}, {1, 1}, 512, 4, /*with_bias=*/false, /*silu=*/true,
                      kCudaCombos[0], seed + 10);
+  // W1 persistent metadata uploads the upstream bool mask as i8.
+  RunConvFwdCudaCase({0, 5, 9}, {1, 0}, 16, 4, /*with_bias=*/false,
+                     /*silu=*/true, kCudaCombos[0], seed + 20,
+                     /*i8_mask=*/true);
 }
 
 TEST_CASE("CUDA causal_conv1d_update matches CPU") {

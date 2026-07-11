@@ -4550,3 +4550,89 @@ Per the priority-zero performance directive, begin W1 from the accepted spike
 while retaining that teardown debt on this ACTIVE row. Do not promote the full
 serving/oracle rows until W1 has its own A/B, pool teardown is repaired, and
 fresh exact 27B→35B parity campaigns pass every axis.
+
+## 2026-07-11 — W1 indexed GDN state I/O wins its component A/B and collapses the copy loop
+
+`KV-DEVICE-RESIDENCY` W1 is implemented in the main worktree under the existing
+`CLAIM-KV-DEVICE-1`. New registered CPU/CUDA `GdnStateGather` and
+`GdnStateScatter` operations index BF16/F32 persistent cache rows into compact
+F32 working state and back; gather also consumes the upstream-style i8/i32
+initial-state mask so fresh recurrent rows are zeroed in the same launch.
+`StepDevInputs` now uploads the complete non-spec and prefill state indices,
+query boundaries and i8 masks once per step. Mixed convolution and recurrent
+prefill use those persistent buffers; pure decode retains direct in-place cache
+updates. `VT_GDN_INDEXED_STATE_IO=0` restores the exact row-copy path, while
+`VT_DEVICE_KV_CACHE=0` forces the storage+I/O fallback.
+
+The first exact GPU timing attempt failed closed before recording any result:
+a one-decode/one-prefill turnover step passed the full two-row non-spec index
+vector into `GdnDecode`, which requires the one-row leading decode subset. All
+48 requests returned the same `gdn_decode: state_idx must be i32 [2]` error.
+Both pure-decode consumers now use `SubView(..., 0, num_decodes)`. A CPU model
+regression ports pinned `tests/v1/worker/test_mamba_utils.py:342-358` and compares
+indexed versus fallback logits, convolution state and recurrence state on that
+mixed turnover. The failed attempt remains preserved under
+`~/work/vllm.cpp-kv-device/w1-precommit-8767b308608d/w1-ab-27`; it contributes
+no metric.
+
+The corrected code-only fingerprint is `bec1ff5fd5f3`; exact rebuilt evidence is
+`~/work/vllm.cpp-kv-device/w1-precommit-bec1ff5fd5f3`. Source manifest and
+CUDA 13.0.88/sm_121a build-log SHA-256 are `2013507a…ffc` and
+`2d9af7a2…471`. CUDA `test_ops_gdn` passes, the focused indexed-state
+compute-sanitizer run passes **7/7 with zero errors**, indexed and fallback
+27B+35B model tests pass, and a 16-concurrent turnover smoke returns 16/16 HTTP
+200 responses with exact 1024/128 native counts. Focused CPU and ASan+UBSan
+suites pass in leak-disabled access mode, including the mixed-turnover test;
+runtime-manifest SHA is `736842d6…41f`. A stricter local LSan rerun keeps the
+indexed op green but reports 58,624 bytes in 153 model scratch-pool
+allocations, including pooled step buffers; this is retained as part of the
+open process-lifetime teardown debt rather than treated as an access failure.
+
+The canonical plain CPU suite was attempted twice and reached **104/105** both
+times. The only failure is the unrelated, pre-existing timing-sensitive C API
+early-stop callback-count assertion: an isolated run passes, and
+`--repeat until-fail:20` first fails on iteration five because producer-ahead
+DELTA merging can produce one callback instead of two. W1 does not touch C API
+or async code. The current local serial rerun passes **105/105**. The earlier
+failure remains disclosed as an intermittent flake rather than being repaired
+inside the performance slice.
+
+Under one uncontended `/tmp/gpu` lock, the exact cache-off closed-loop c16/48
+1024→128 workload ran indexed/fallback in AB/BA/AB order, three repetitions per
+arm, with cache eviction and process/GPU memory return on every leg. Indexed
+throughput is 772.568/787.722/785.107 tok/s; fallback is
+771.583/777.660/781.597. Means are **781.799 vs 776.946 tok/s = 1.006246×**,
+CV 0.846%/0.530%. Indexed wins all four throughput and all sixteen latency
+axes; mean TTFT is 2464.46 vs 2500.06 ms and mean TPOT/ITL is 164.75 vs
+165.60 ms. All six memory returns pass; mean reported GPU peaks are
+38,080.7/38,399.7 MiB. The output-text pairs differ because FP4 near ties and
+scheduling are diagnostic; all requests and exact native token counts pass the
+accepted correctness precondition. Evidence manifest/summary SHA-256 are
+`34285a91…a5b` / `4c68b1dc…033`.
+
+The paired traces supply the structural result: indexed/fallback
+`cudaMemcpyAsync` calls are **7,508/163,540**, D2D calls **1,231/142,717**, and
+D2D volume **1,855.918/49,088.289 MB**. The new gather and scatter each execute
+9,394 times; their combined GPU time is 0.551107 seconds over three traced
+repetitions. nsys perturbs the arms unequally and inverts their measured
+throughput (768.249/794.593 tok/s), contrary to every paired unprofiled
+repetition, so that ratio is explicitly non-binding; kernel names/copy counts
+remain the trace ground truth. Trace report hashes are `f36a9648…c58c` /
+`fc5c941a…7109` for copy summaries and `38856bbe…b8f4` /
+`c13fe64a…fe00` for kernel summaries.
+
+W1 therefore closes the scoped row-copy lever but does not close
+`SERVE-GATE-ONLINE`: this is a same-binary component A/B, not a fresh vLLM
+denominator. Run the fresh exact current-SHA direct-library and online 27B
+oracle gates next. If any axis stays below floor, implement W2 direct indexed
+convolution-state update and repeat; only after 27B closes may 35B run. The W0
+inherited 47.29 MB/36.82 GB pool-teardown debt remains open before the row can
+leave `ACTIVE`, and later roadmap tracks remain blocked by this priority-zero
+closure.
+
+Final local pre-commit validation preserves the exact remotely tested
+seven-file code patch SHA-256 `bec1ff5fd5f35922cd74939376e0ccb370364f5fcc8299c480489865d6416ca3`.
+Focused release tests pass 2/2, leak-disabled ASan+UBSan access tests pass 2/2,
+and serial CTest passes 105/105. The canonical record checker reports
+ENGINE=97 / MODEL=323 / QUANT=81 / KERNEL=30 / BACKEND=51; record mutations
+pass 13/13, documentation mutations 5/5, and `git diff --check` is clean.

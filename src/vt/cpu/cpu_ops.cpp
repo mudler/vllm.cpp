@@ -639,7 +639,6 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t total = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
   const int64_t n = conv_state.shape[0];
   const int32_t* qslp = qsl.Ptr<int32_t>();
-  const int32_t* hisp = his.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == total, "causal_conv1d_fwd: bad query_start_loc bounds");
   for (int64_t s = 0; s < n; ++s) {
     VT_CHECK(qslp[s + 1] >= qslp[s] && qslp[s] >= 0,
@@ -652,7 +651,8 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   for (int64_t r = r0; r < r1; ++r) {
     const int64_t s = r / c_dim, c = r % c_dim;
     const int64_t begin = qslp[s], end = qslp[s + 1], t_len = end - begin;
-    const bool init = hisp[s] != 0;
+    const bool init = his.dtype == DType::kI8 ? his.Ptr<int8_t>()[s] != 0
+                                               : his.Ptr<int32_t>()[s] != 0;
     float* srow_base = conv_state.Ptr<float>() + s * c_dim * width;
     {
       float* srow = srow_base + c * width;
@@ -856,6 +856,58 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
     float* s_state = state.Ptr<float>() + srow * hv_n * dv * dk;
     GdnTokenStep(out, q_in, k, v, g, beta, s_state, bt, args.scale, qbuf, kbuf, vbuf);
   }
+  });
+}
+
+// Indexed cache boundary for mixed GDN prefill. This is the CPU executable
+// reference for the fused CUDA gather/scatter kernels: cache rows may be f32 or
+// bf16, while the compact recurrence/conv working state is always f32.
+void GdnStateGatherKernel(Queue&, Tensor& working, const Tensor& cache,
+                          const Tensor& state_idx,
+                          const Tensor* has_initial_state) {
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t row_elems = working.Numel() / rows;
+  const int32_t* idx = state_idx.Ptr<int32_t>();
+  for (int64_t r = 0; r < rows; ++r) {
+    VT_CHECK(idx[r] >= 0 && idx[r] < cache.shape[0],
+             "gdn_state_gather: state_idx out of range");
+  }
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      bool keep = true;
+      if (has_initial_state != nullptr) {
+        keep = has_initial_state->dtype == DType::kI8
+                   ? has_initial_state->Ptr<int8_t>()[r] != 0
+                   : has_initial_state->Ptr<int32_t>()[r] != 0;
+      }
+      const int64_t src = static_cast<int64_t>(idx[r]) * row_elems;
+      const int64_t dst = r * row_elems;
+      for (int64_t e = 0; e < row_elems; ++e) {
+        StoreF32(working, dst + e, keep ? LoadF32(cache, src + e) : 0.0f);
+      }
+    }
+  });
+}
+
+void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
+                           const Tensor& state_idx) {
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t row_elems = working.Numel() / rows;
+  const int32_t* idx = state_idx.Ptr<int32_t>();
+  for (int64_t r = 0; r < rows; ++r) {
+    VT_CHECK(idx[r] >= 0 && idx[r] < cache.shape[0],
+             "gdn_state_scatter: state_idx out of range");
+  }
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t src = r * row_elems;
+      const int64_t dst = static_cast<int64_t>(idx[r]) * row_elems;
+      for (int64_t e = 0; e < row_elems; ++e) {
+        StoreF32(cache, dst + e, LoadF32(working, src + e));
+      }
+    }
   });
 }
 
@@ -1293,6 +1345,14 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    RegisterOp(
+        OpId::kGdnStateGather, DeviceType::kCPU,
+        reinterpret_cast<void*>(
+            static_cast<GdnStateGatherFn>(&GdnStateGatherKernel)));
+    RegisterOp(
+        OpId::kGdnStateScatter, DeviceType::kCPU,
+        reinterpret_cast<void*>(
+            static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernel)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCPU,

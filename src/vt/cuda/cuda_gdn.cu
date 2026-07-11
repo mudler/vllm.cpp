@@ -149,6 +149,90 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
 
 __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
 
+// Indexed persistent GDN cache boundary. One elementwise launch replaces N
+// cudaMemcpyAsync row copies plus a separate cast launch. The optional fresh
+// mask is i8 (metadata's upstream-bool mirror) or i32 (standalone op callers).
+template <typename TCache>
+__global__ void GdnStateGatherKernel(float* working, const TCache* cache,
+                                     const int32_t* state_idx,
+                                     const int8_t* has_i8,
+                                     const int32_t* has_i32,
+                                     int64_t row_elems, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += step) {
+    const int64_t row = i / row_elems;
+    const int64_t col = i - row * row_elems;
+    const bool keep = has_i8 != nullptr ? has_i8[row] != 0
+                      : has_i32 != nullptr ? has_i32[row] != 0
+                                           : true;
+    working[i] = keep ? Load(cache, static_cast<int64_t>(state_idx[row]) * row_elems + col)
+                      : 0.0f;
+  }
+}
+
+template <typename TCache>
+__global__ void GdnStateScatterKernel(TCache* cache, const float* working,
+                                      const int32_t* state_idx,
+                                      int64_t row_elems, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += step) {
+    const int64_t row = i / row_elems;
+    const int64_t col = i - row * row_elems;
+    Store(cache, static_cast<int64_t>(state_idx[row]) * row_elems + col,
+          working[i]);
+  }
+}
+
+void GdnStateGatherKernelCuda(Queue& q, Tensor& working, const Tensor& cache,
+                              const Tensor& state_idx,
+                              const Tensor* has_initial_state) {
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t n = working.Numel();
+  const int64_t row_elems = n / rows;
+  const int8_t* has_i8 =
+      has_initial_state != nullptr && has_initial_state->dtype == DType::kI8
+          ? has_initial_state->Ptr<int8_t>()
+          : nullptr;
+  const int32_t* has_i32 =
+      has_initial_state != nullptr && has_initial_state->dtype == DType::kI32
+          ? has_initial_state->Ptr<int32_t>()
+          : nullptr;
+  cudaStream_t s = AsStream(q);
+  if (cache.dtype == DType::kBF16) {
+    GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
+        working.Ptr<float>(), cache.Ptr<__nv_bfloat16>(), state_idx.Ptr<int32_t>(),
+        has_i8, has_i32, row_elems, n);
+  } else {
+    GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
+        working.Ptr<float>(), cache.Ptr<float>(), state_idx.Ptr<int32_t>(),
+        has_i8, has_i32, row_elems, n);
+  }
+  Check(cudaGetLastError(), "gdn state indexed gather launch");
+}
+
+void GdnStateScatterKernelCuda(Queue& q, Tensor& cache,
+                               const Tensor& working,
+                               const Tensor& state_idx) {
+  const int64_t rows = state_idx.shape[0];
+  if (rows == 0) return;
+  const int64_t n = working.Numel();
+  const int64_t row_elems = n / rows;
+  cudaStream_t s = AsStream(q);
+  if (cache.dtype == DType::kBF16) {
+    GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
+        cache.Ptr<__nv_bfloat16>(), working.Ptr<float>(),
+        state_idx.Ptr<int32_t>(), row_elems, n);
+  } else {
+    GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
+        cache.Ptr<float>(), working.Ptr<float>(), state_idx.Ptr<int32_t>(),
+        row_elems, n);
+  }
+  Check(cudaGetLastError(), "gdn state indexed scatter launch");
+}
+
 // ---------------------------------------------------------------------------
 // causal_conv1d_fwd (gdn-semantics.md §2): one thread per (sequence, channel),
 // sequential over the sequence's tokens. Each thread owns its conv_state row
@@ -160,10 +244,10 @@ __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
 // Upstream counterpart: layers/mamba/ops/causal_conv1d.py (causal_conv1d_fn
 // Triton kernel) — align post-MVP.
 
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tout, typename THas>
 __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, const Tin* bias,
                                       float* conv_state, const int32_t* qsl,
-                                      const int32_t* his, int64_t c_dim, int64_t k,
+                                      const THas* his, int64_t c_dim, int64_t k,
                                       bool silu) {
   const int64_t s = blockIdx.y;
   const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -227,10 +311,10 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
 constexpr int kConvTileM = 16;  // token tile (rows per block)
 constexpr int kConvTileN = 32;  // channel tile (a warp — coalesced x loads/stores)
 
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tout, typename THas>
 __global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w,
                                            const Tin* bias, float* conv_state,
-                                           const int32_t* qsl, const int32_t* his, int64_t c_dim,
+                                           const int32_t* qsl, const THas* his, int64_t c_dim,
                                            int64_t k, bool silu) {
   const int64_t width = k - 1;
   const int64_t s = blockIdx.y;  // sequence
@@ -317,10 +401,17 @@ void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
                    const Tensor& his, const CausalConv1dArgs& args) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
   const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock), static_cast<unsigned>(n));
-  CausalConv1dFwdKernel<Tin, Tout><<<grid, kBlock, 0, s>>>(
-      out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k,
-      args.silu_activation);
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdKernel<Tin, Tout, int8_t><<<grid, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, k, args.silu_activation);
+  } else {
+    CausalConv1dFwdKernel<Tin, Tout, int32_t><<<grid, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k, args.silu_activation);
+  }
   Check(cudaGetLastError(), "causal_conv1d_fwd launch");
 }
 
@@ -338,10 +429,17 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
                   static_cast<unsigned>(n));
   const dim3 block(kConvTileN, kConvTileM);
   const size_t shmem = static_cast<size_t>(kConvTileM + width) * kConvTileN * sizeof(float);
-  CausalConv1dFwdTiledKernel<Tin, Tout><<<grid, block, shmem, s>>>(
-      out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<float>(), qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k,
-      args.silu_activation);
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdTiledKernel<Tin, Tout, int8_t><<<grid, block, shmem, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, k, args.silu_activation);
+  } else {
+    CausalConv1dFwdTiledKernel<Tin, Tout, int32_t><<<grid, block, shmem, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k, args.silu_activation);
+  }
   Check(cudaGetLastError(), "causal_conv1d_fwd(tiled) launch");
 }
 
@@ -3632,6 +3730,14 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelCuda)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kGdnStateGather, DeviceType::kCUDA,
+        reinterpret_cast<void*>(
+            static_cast<GdnStateGatherFn>(&GdnStateGatherKernelCuda)));
+    RegisterOp(
+        OpId::kGdnStateScatter, DeviceType::kCUDA,
+        reinterpret_cast<void*>(
+            static_cast<GdnStateScatterFn>(&GdnStateScatterKernelCuda)));
   }
 } registrar;
 

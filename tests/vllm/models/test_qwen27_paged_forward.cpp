@@ -18,7 +18,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -43,6 +45,31 @@ using vllm::v1::GDNAttentionMetadata;
 using vt::DType;
 
 namespace {
+
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    if (old != nullptr) {
+      had_old_ = true;
+      old_ = old;
+    }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_)
+      setenv(name_.c_str(), old_.c_str(), 1);
+    else
+      unsetenv(name_.c_str());
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
 
 // splitmix64-based small deterministic weight values in [-0.08, 0.08).
 uint64_t Mix(uint64_t x) {
@@ -414,6 +441,90 @@ TEST_CASE("qwen27 dense paged: decode via KV cache equals dense over full sequen
   const double d = MaxAbsDiff(decode_logits, dense_last, decode_logits.size());
   MESSAGE("dense paged decode-via-cache vs dense max|diff| = " << d);
   CHECK(d < 2e-2);
+}
+
+// Ports the mixed decode+prefill turnover shape from pinned-vLLM
+// tests/v1/worker/test_mamba_utils.py:342-358. W1 uploads the complete
+// non-spec state-index vector once, while GdnDecode consumes only its leading
+// decode rows. This catches passing the full [decode+prefill] view to the
+// decode recurrence when a completed request is replaced by a fresh prefill.
+TEST_CASE("qwen27 dense paged: indexed GDN mixed turnover matches row-copy fallback") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5DenseWeights w = MakeWeights(c);
+  vt::Queue q = Q();
+  const int64_t vocab = c.vocab_size;
+  CachePool fallback_pool(c, 8, 8);
+  CachePool indexed_pool(c, 8, 8);
+
+  const std::vector<int32_t> seed_ids = {7, 1, 22};
+  const std::vector<int32_t> seed_pos = {0, 1, 2};
+  auto seed = [&](CachePool& pool, const char* toggle) {
+    ScopedEnv env("VT_GDN_INDEXED_STATE_IO", toggle);
+    const CommonAttentionMetadata am = PrefillAttnMeta(3, {0, 1}, 8, 0);
+    const GDNAttentionMetadata gm = PrefillGdnMeta(3, 0);
+    (void)Qwen3_5DenseModel::Forward(seed_ids, seed_pos, am, gm, pool.attn_kv,
+                                     pool.gdn_state, w, c, q);
+  };
+  seed(fallback_pool, "0");
+  seed(indexed_pool, "1");
+
+  // Request 0 decodes one token from state slot 0; request 1 starts a two-token
+  // prefill in state slot 1. Decodes lead the flattened token stream.
+  CommonAttentionMetadata am;
+  am.num_reqs = 2;
+  am.num_actual_tokens = 3;
+  am.query_start_loc = {0, 1, 3};
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens = {4, 2};
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = 2;
+  am.max_seq_len = 4;
+  am.block_table_num_cols = 2;
+  am.block_table_tensor = {0, 1, 2, 3};
+  am.slot_mapping = {3, 16, 17};
+  am.causal = true;
+
+  GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = 2;
+  gm.num_decodes = 1;
+  gm.num_decode_tokens = 1;
+  gm.num_actual_tokens = 3;
+  gm.has_initial_state = std::vector<uint8_t>{1, 0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 1};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1, 3};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, 2};
+  gm.prefill_state_indices = std::vector<int32_t>{1};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+
+  const std::vector<int32_t> ids = {4, 11, 0};
+  const std::vector<int32_t> pos = {3, 0, 1};
+  std::vector<float> fallback;
+  {
+    ScopedEnv env("VT_GDN_INDEXED_STATE_IO", "0");
+    fallback = Qwen3_5DenseModel::Forward(ids, pos, am, gm, fallback_pool.attn_kv,
+                                          fallback_pool.gdn_state, w, c, q);
+  }
+  std::vector<float> indexed;
+  {
+    ScopedEnv env("VT_GDN_INDEXED_STATE_IO", "1");
+    indexed = Qwen3_5DenseModel::Forward(ids, pos, am, gm, indexed_pool.attn_kv,
+                                         indexed_pool.gdn_state, w, c, q);
+  }
+
+  REQUIRE(indexed.size() == static_cast<size_t>(3 * vocab));
+  REQUIRE(fallback.size() == indexed.size());
+  const double logits_diff = MaxAbsDiff(indexed, fallback, indexed.size());
+  MESSAGE("indexed mixed-turnover logits vs fallback max|diff| = " << logits_diff);
+  CHECK(logits_diff < 1e-4);
+  for (size_t layer = 0; layer < indexed_pool.gdn_ssm_buf.size(); ++layer) {
+    CHECK(MaxAbsDiff(indexed_pool.gdn_ssm_buf[layer],
+                     fallback_pool.gdn_ssm_buf[layer],
+                     indexed_pool.gdn_ssm_buf[layer].size()) < 1e-4);
+    CHECK(MaxAbsDiff(indexed_pool.gdn_conv_buf[layer],
+                     fallback_pool.gdn_conv_buf[layer],
+                     indexed_pool.gdn_conv_buf[layer].size()) < 1e-4);
+  }
 }
 
 TEST_CASE("qwen27 dense paged: GDN state zeroing protects a fresh req in a mixed batch") {

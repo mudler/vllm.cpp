@@ -22,9 +22,9 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 | Speculative decoding | 6 | 0 | 0 | 0 | 3 | 0 | 1 | 2 |
 | Serving, API, CLI, library | 17 | 3 | 2 | 0 | 0 | 1 | 1 | 10 |
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
-| Long context and attention | 10 | 0 | 0 | 0 | 5 | 0 | 2 | 3 |
+| Long context and attention | 10 | 0 | 0 | 0 | 4 | 1 | 2 | 3 |
 | Loading, tokenizer, config | 6 | 1 | 3 | 0 | 0 | 0 | 0 | 2 |
-| **Total** | **96** | **9** | **17** | **0** | **12** | **1** | **8** | **49** |
+| **Total** | **96** | **9** | **17** | **0** | **11** | **2** | **8** | **49** |
 
 ## Engine core and scheduling
 
@@ -156,7 +156,7 @@ claims it.
 
 | ID | Item | Tier | Upstream code/tests | Our code | Our tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|---|
-| `ATTN-YARN` | YaRN RoPE scaling, including the `mrope_section` dispatch branch | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:243-284`; `vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py:10-84`; `vllm/model_executor/layers/rotary_embedding/mrope.py:201-340`; `tests/kernels/core/test_mrope.py:47-235`; `tests/models/language/pooling/test_nomic_max_model_len.py:93-113` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
+| `ATTN-YARN` | YaRN RoPE scaling, including the `mrope_section` dispatch branch | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:243-284`; `vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py:10-84`; `vllm/model_executor/layers/rotary_embedding/mrope.py:201-340`; `tests/kernels/core/test_mrope.py:47-235`; `tests/models/language/pooling/test_nomic_max_model_len.py:93-113` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `ACTIVE` | `CLAIM-C5-YARN-1` |
 | `ATTN-ROPE-FAMILY` | Block row (claim the three leaves below, not this row): Llama 3, LongRoPE, and dynamic-NTK scaling | T1/T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155-171,200-230,315-335`; `tests/kernels/core/test_pos_encoding.py:66-193` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-ROPE-LLAMA3` | Llama 3 frequency-banded RoPE scaling | T1 | `vllm/model_executor/layers/rotary_embedding/__init__.py:155-171`; `vllm/model_executor/layers/rotary_embedding/llama3_rope.py:11-54` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |
 | `ATTN-ROPE-LONGROPE` | Phi-3 LongRoPE short/long factor scaling | T2 | `vllm/model_executor/layers/rotary_embedding/__init__.py:315-335`; `vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.py:16-159` | - | - | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) | `READY` | - |

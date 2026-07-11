@@ -3412,3 +3412,23 @@ G6-G9 correctness/performance/latency/memory comparisons. W5 `ATTN-YARN` is now
 the next dependency-ready C5 implementation leaf. Until the model/runtime gates
 land, README and matrices claim CPU-gated metadata/wrapper support only, not a
 user-visible chunked-local model.
+
+## 2026-07-11 — C5 W5 YaRN typed RoPE foundation claimed
+
+`CLAIM-C5-YARN-1` moves `ATTN-YARN` `READY -> ACTIVE` in isolated worktree
+`/home/mudler/_git/vllm.cpp-c5-yarn`, branch `codex/c5-yarn-w5`. W5 is the
+foundation predecessor for all remaining C5 RoPE leaves. Its bounded scope is
+typed YaRN parameter parsing/selection, the common factory/cache key and
+supplied-cache apply seam, plain one-dimensional YaRN, the pinned
+`mrope_section` branch, the direct upstream tests and a pinned-oracle dump tool
+plus goldens. The implementation may extend the shared CPU/CUDA RoPE consumers
+only to accept that precomputed cache. W6-W8 Llama3/LongRoPE/dynamic formulas,
+model-family and multimodal preprocessing, local-attention code and all GPU
+execution remain out of scope.
+
+Read-only DGX inspection at 2026-07-11 01:54 UTC showed
+`CLAIM-SERVE-GATE-1` still holding `/tmp/gpu`; the unchanged 27B vllm.cpp server
+used 25,251 MiB while ours c32/192-prompt repetition 3 remained active. Both PR3
+jobs were still queued. W5 begins with pinned source/oracle construction, CPU
+tests and compile-only CUDA validation and will not enqueue behind that
+campaign.

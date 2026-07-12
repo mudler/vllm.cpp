@@ -615,6 +615,16 @@ Full CPU CTest passes 105/105; native-sm_120 default passes 5/5 and direct OFF
 passes 3/3. Every process exited, final GPU state is 166 MiB / 0% / 42 C, and
 the campaign kernel-journal capture says `-- No entries --`.
 
+Post-rebase W4.4 reproduction: **PENDING**. Rebasing onto upstream `e10786e`
+preserves the direct-load/prefix-cache composition. The first Triton-AOT rebuild
+failed before compilation because Triton 3.6 tried absent NixOS path
+`/sbin/ldconfig`; the flake now supplies the supported
+`TRITON_LIBCUDA_PATH=/run/opengl-driver/lib` override. CPU and native-sm_120
+Triton-AOT rebuilds pass; focused CPU is 4/4 and CUDA default/direct-OFF is
+5/5 + 3/3. No post-rebase number is claimed at this checkpoint. Rerun the exact
+three-arm W4.4 driver from the immutable environment-fix commit and record peak
+and stable PSS, VRAM, total/output throughput, and mean TTFT.
+
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces
 6551.56/6551.84/6551.42 total tok/s, mean **6551.61**, versus release-OFF mean

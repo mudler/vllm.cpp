@@ -83,6 +83,7 @@
             CMAKE_CUDA_COMPILER = "${cuda.cuda_nvcc}/bin/nvcc";
             CMAKE_CUDA_HOST_COMPILER = "${pkgs.gcc14}/bin/g++";
             CUDAHOSTCXX = "${pkgs.gcc14}/bin/g++";
+            TRITON_LIBCUDA_PATH = "/run/opengl-driver/lib";
 
             # On NixOS the proprietary driver libraries come from the host driver
             # profile, not the CUDA toolkit package. Keep that path in the shell
@@ -101,6 +102,7 @@
               export CPLUS_INCLUDE_PATH="${cudaIncludePath}''${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
               export CMAKE_CUDA_COMPILER="${cuda.cuda_nvcc}/bin/nvcc"
               export CMAKE_CUDA_HOST_COMPILER="${pkgs.gcc14}/bin/g++"
+              export TRITON_LIBCUDA_PATH="/run/opengl-driver/lib"
               echo "vllm.cpp CUDA dev shell"
               echo "  nvidia-smi"
               echo "  cmake -S . -B build-nix-cuda -G Ninja -DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_COMPILER=$CMAKE_CUDA_COMPILER -DCMAKE_CUDA_HOST_COMPILER=$CMAKE_CUDA_HOST_COMPILER -DVLLM_CPP_CUDA_ARCHITECTURES=native -DCMAKE_BUILD_TYPE=RelWithDebInfo"

@@ -553,6 +553,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   (**6,717.48**). The row therefore stays **ACTIVE** for correctness and
   performance parity, not launch memory. Full CPU CTest passes 105/105;
   native-sm_120 default/control tests pass 5/5 and 3/3.
+  After rebasing onto upstream `e10786e`, Triton 3.6 AOT initially failed on
+  NixOS because its NVIDIA helper hardcodes `/sbin/ldconfig`. The CUDA flake now
+  exports `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`; CPU and Triton-AOT CUDA
+  rebuilds plus focused CPU 4/4 and CUDA default/control 5/5 + 3/3 pass. The
+  post-rebase memory/throughput/TTFT reproduction is **PENDING** from the next
+  immutable commit; the pre-rebase numbers above remain the accepted baseline.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

@@ -148,6 +148,13 @@ the path is neutral versus OFF but remains 0.9761x vLLM. ON/OFF output is exact
 The W4.4 launch-memory work is accepted, while the owning row remains `ACTIVE`
 for cross-engine correctness and performance parity.
 
+Post-rebase checkpoint: upstream `e10786e` composes its current prefix-caching
+resolution with the preselected direct-load queue. The Nix CUDA shell now sets
+Triton's supported `TRITON_LIBCUDA_PATH` override, avoiding its non-NixOS
+`/sbin/ldconfig` fallback. CPU and Triton-AOT CUDA rebuilds pass, as do focused
+CPU 4/4 and CUDA default/direct-OFF 5/5 + 3/3. The exact post-rebase memory,
+throughput and TTFT campaign is `PENDING`; no old denominator is relabeled.
+
 ## Risks and mitigations
 
 - Early asynchronous free is a use-after-free. Every layer checkpoint

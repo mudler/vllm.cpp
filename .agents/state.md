@@ -7189,3 +7189,19 @@ entries. W4.4 launch-memory work is accepted, but
 `ENG-HOST-WEIGHT-RESIDENCY` remains `ACTIVE` because throughput is below vLLM
 and correctness debt remains. No Spark/GB10 result or system configuration
 change is involved.
+
+## 2026-07-12 — local branch rebased; Nix Triton AOT override added
+
+Rebased all 26 local commits onto upstream `e10786e`. Conflict resolution keeps
+upstream's newer `CacheBuffer`, indexed GDN state I/O, prefix-caching policy and
+99-row merged engine inventory, while retaining the local direct-load queue and
+all append-only evidence. The composed loader passes the existing focused CPU
+and CUDA tests.
+
+The first post-rebase Triton-AOT rebuild failed during configure, before a
+kernel compiled: Triton 3.6's NVIDIA helper called hardcoded `/sbin/ldconfig`,
+which is absent on NixOS. Its supported `TRITON_LIBCUDA_PATH` knob is now set to
+`/run/opengl-driver/lib` by the CUDA flake. No system configuration changed.
+The rebased CPU and native-sm_120 Triton-AOT CUDA builds pass; focused CPU is
+4/4, CUDA default is 5/5 and direct-OFF is 3/3. The exact three-arm W4.4
+memory/throughput/TTFT rerun remains `PENDING` from the next immutable commit.

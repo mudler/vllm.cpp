@@ -148,12 +148,19 @@ the path is neutral versus OFF but remains 0.9761x vLLM. ON/OFF output is exact
 The W4.4 launch-memory work is accepted, while the owning row remains `ACTIVE`
 for cross-engine correctness and performance parity.
 
-Post-rebase checkpoint: upstream `e10786e` composes its current prefix-caching
-resolution with the preselected direct-load queue. The Nix CUDA shell now sets
-Triton's supported `TRITON_LIBCUDA_PATH` override, avoiding its non-NixOS
-`/sbin/ldconfig` fallback. CPU and Triton-AOT CUDA rebuilds pass, as do focused
-CPU 4/4 and CUDA default/direct-OFF 5/5 + 3/3. The exact post-rebase memory,
-throughput and TTFT campaign is `PENDING`; no old denominator is relabeled.
+Post-rebase `80f370f` checkpoint: upstream `e10786e` composes its current
+prefix-caching resolution with the preselected direct-load queue. The exact
+three-arm campaign reproduces low peak PSS (1.847 GiB ON, 8.168 OFF, 6.883
+vLLM) and reaches 6607.68/6605.42/6717.32 tok/s. Closed-loop mean TTFT is
+658.12/658.65/904.32 ms, while P99 is 3537.55/3538.98/3101.13 ms.
+
+Disposition is **FAILED correctness / diagnostic metrics**. ON/OFF exactness is
+123/128, 122/128 and 121/128; ON-ON and OFF-OFF repetitions vary similarly,
+while vLLM is stable 128/128. This refutes a direct-load-specific corruption
+inference but fails the same-binary precondition. The pre-rebase accepted result
+is not relabeled onto rebased code. Raw evidence is
+`/tmp/qwen35-direct-postrebase-80f370f`; driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
 
 ## Risks and mitigations
 

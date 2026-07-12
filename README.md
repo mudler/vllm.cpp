@@ -553,12 +553,21 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   (**6,717.48**). The row therefore stays **ACTIVE** for correctness and
   performance parity, not launch memory. Full CPU CTest passes 105/105;
   native-sm_120 default/control tests pass 5/5 and 3/3.
-  After rebasing onto upstream `e10786e`, Triton 3.6 AOT initially failed on
-  NixOS because its NVIDIA helper hardcodes `/sbin/ldconfig`. The CUDA flake now
-  exports `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`; CPU and Triton-AOT CUDA
-  rebuilds plus focused CPU 4/4 and CUDA default/control 5/5 + 3/3 pass. The
-  post-rebase memory/throughput/TTFT reproduction is **PENDING** from the next
-  immutable commit; the pre-rebase numbers above remain the accepted baseline.
+  After rebasing onto upstream `e10786e`, the immutable `80f370f` reproduction
+  remains **diagnostic, not binding**: direct ON peak/stable PSS is
+  **1.847/0.758 GiB** versus **8.168/0.752** OFF and **6.883/4.111** fresh vLLM;
+  VRAM is **11,711/11,686/12,924 MiB**. Total throughput improves to
+  **6,607.68 tok/s** ON versus **6,605.42** OFF and **6,717.32** vLLM
+  (**0.9837x**). Closed-loop mean/median/P99 TTFT is
+  **658/220/3,538 ms** ON versus **904/674/3,101 ms** vLLM: mean and median are
+  better, P99 is 14.1% worse. The correctness precondition fails: ON/OFF exact
+  output is only 123/128, 122/128 and 121/128, and ON-ON/OFF-OFF repetitions
+  vary similarly while vLLM is 128/128 stable. This points to broader rebased
+  tie-sensitive nondeterminism, not a direct-load-specific mismatch, but blocks
+  promotion. Triton-AOT Nix discovery is fixed through
+  `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`; builds and focused CUDA gates
+  pass. Full parallel CPU CTest is 104/105 on the known async drain-count timing
+  case, which passes 3/3 isolated.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

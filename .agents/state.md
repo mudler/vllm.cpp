@@ -7205,3 +7205,34 @@ which is absent on NixOS. Its supported `TRITON_LIBCUDA_PATH` knob is now set to
 The rebased CPU and native-sm_120 Triton-AOT CUDA builds pass; focused CPU is
 4/4, CUDA default is 5/5 and direct-OFF is 3/3. The exact three-arm W4.4
 memory/throughput/TTFT rerun remains `PENDING` from the next immutable commit.
+
+## 2026-07-12 — rebased W4.4 campaign fails correctness precondition
+
+The immutable `80f370f` series completed three interleaved direct-ON,
+fresh-vLLM and same-binary direct-OFF monitored repetitions followed by three
+unmonitored repetitions under one `/tmp/gpu` lock. Raw evidence is
+`/tmp/qwen35-direct-postrebase-80f370f`; driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
+
+- Peak PSS is **1.847/8.168/6.883 GiB** ON/OFF/vLLM; stable PSS is
+  **0.758/0.752/4.111 GiB**, process VRAM **11,711/11,686/12,924 MiB**, and
+  whole-system peak available-memory loss **1.363/7.939/3.918 GiB**.
+- Unmonitored total throughput is **6607.68/6605.42/6717.32 tok/s**. ON is
+  +0.034% versus OFF and **0.9837x vLLM**, improving the pre-rebase ratio.
+- Closed-loop mean/median/P99 TTFT is **658.12/220.24/3537.55 ms** ON,
+  **658.65/220.32/3538.98 ms** OFF and **904.32/674.10/3101.13 ms** vLLM.
+  The initial all-at-once vLLM metrics run is VOID because it queues 128 rather
+  than admitting 32; retained TTFT uses `run_closed_loop` and request stats.
+
+Correctness prevents acceptance. ON/OFF exact request counts are **123/128,
+122/128 and 121/128**. ON-ON and OFF-OFF cross-repetition comparisons are also
+122-123/128, while vLLM remains 128/128, so the evidence does not isolate the
+problem to direct loading. Example divergences alternate tie-sensitive token
+IDs 16/17 after repeated token 220. The memory and timing values remain
+diagnostic until project repeated-output stability and ON/OFF 128/128 return.
+
+CPU and native-sm_120 Triton-AOT builds pass. Focused CPU is 4/4; CUDA default
+and direct OFF are 5/5 + 3/3. Parallel CPU CTest is 104/105 because the known
+timing-sensitive `test_async_llm` drain assertion observed seven rather than
+three iterations; it passes 3/3 isolated. Every GPU process exited, final state
+is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.

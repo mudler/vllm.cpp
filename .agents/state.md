@@ -7286,3 +7286,24 @@ is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
   122-124/128; vLLM is 128/128. All numbers remain diagnostic. Evidence is
   `/tmp/qwen35-direct-main-829883d`; final GPU is 146 MiB/0%/42 C and the
   benchmark-window kernel journal is empty.
+
+## 2026-07-12 — local P99 TTFT request-level diagnosis
+
+- Temporarily serialized the project benchmark's existing per-request timing
+  records after the timed region, ran three direct-ON repetitions, then removed
+  the instrumentation and restored a clean source tree. Ran three fresh vLLM
+  controls each for async off, eager, and async-off plus eager.
+- Project P99 is deterministic initial-fill head-of-line time: requests 30/31
+  are always worst, the 16 two-prompt fill steps average 215.35 ms, and post-
+  fill TTFT mean/P99/max is 220.42/222.00/222.09 ms. Default vLLM's initial
+  steps average 186.55 ms while post-fill is 613/1138/1530 ms.
+- vLLM default/async-off/eager/sync-eager P99 is 3099/3127/3414/3409 ms.
+  Async overlap shifts P99 only 0.91% but improves control throughput 3.94%.
+  Eager mode raises P99 314.53 ms and explains about 71% of vLLM's default
+  441.67-ms advantage over the binding project result.
+- Source/runtime evidence agrees: vLLM captures mixed prefill/decode PIECEWISE
+  graphs and FULL decode graphs, while the project graph path is pure-decode
+  only and mixed steps remain eager. Prioritize that compiled/graph execution
+  gap after correctness; this is not a loader or sporadic robustness tail.
+- Raw analysis is `/tmp/qwen35-direct-main-829883d/ttft-analysis.json`. All GPU
+  controls were serialized; final GPU is 166 MiB/0%/42 C.

@@ -669,6 +669,38 @@ CPU and native-sm_120 Triton-AOT builds pass; focused CPU/CUDA pass 6/6 and
 direct OFF passes 3/3. Final GPU state is 146 MiB / 0% / 42 C, and the
 benchmark-window kernel journal is empty.
 
+P99 TTFT follow-up is **DIAGNOSTIC / CAUSE LOCALIZED**. Three opt-in raw-timing
+project runs serialize the same request timestamps already used by the report;
+the instrumentation runs after timing and was removed afterward. The worst
+requests are always initial admissions 30/31. At MNB 2048 the initial
+32-request burst advances in two-prompt steps: project mean step time is
+215.35 ms versus 186.55 ms for default vLLM. Project post-fill TTFT is tightly
+bounded at 220.42 ms mean, 222.00 ms P99 and 222.09 ms max; default vLLM's
+post-fill figures are 613.30/1138.07/1529.75 ms. The global project P99 is
+therefore deterministic initial-fill head-of-line time, not a sporadic
+steady-state stall.
+
+| vLLM latency control, three-run mean | Total tok/s | Mean TTFT | Median TTFT | P99 TTFT | Mean TPOT |
+|---|---:|---:|---:|---:|---:|
+| default async + compiled/graphs | 6742.72 | 902.46 ms | 674.87 ms | **3099.21 ms** | 33.49 ms |
+| synchronous + compiled/graphs | 6487.25 | 795.72 ms | 578.30 ms | 3127.47 ms | 35.88 ms |
+| async + `enforce_eager` | 6603.06 | 1010.83 ms | 775.56 ms | 3413.73 ms | 35.93 ms |
+| synchronous + `enforce_eager` | 6337.43 | 854.24 ms | 624.77 ms | 3409.02 ms | 38.89 ms |
+
+Async scheduling improves control throughput by 3.94% but only shifts P99 by
+28.27 ms (0.91%). Eager execution removes CUDA-graph/compiled execution
+together and raises P99 by 314.53 ms, explaining about 71% of vLLM's 441.67-ms
+default advantage over the binding project P99. The synchronous-eager vLLM
+control is only 3.87% below the project on P99 while the project is 4.25% higher
+on diagnostic total throughput. This broad control does not separate
+`torch.compile` kernels from PIECEWISE CUDA graphs, but source and runtime logs
+show the actionable structural mismatch: vLLM captures 11 mixed
+prefill/decode PIECEWISE sizes plus 7 FULL decode sizes; the project graph path
+explicitly accepts pure decode and leaves prefill/mixed eager. Trace and port
+mixed-prefill graph/compiled-kernel behavior before attributing the remaining
+initial-step gap to scheduling robustness. Raw analysis:
+`/tmp/qwen35-direct-main-829883d/ttft-analysis.json`.
+
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces
 6551.56/6551.84/6551.42 total tok/s, mean **6551.61**, versus release-OFF mean

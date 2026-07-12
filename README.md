@@ -594,6 +594,16 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   121-125/128 and ON/OFF spans 122-124/128, while vLLM remains 128/128. Focused
   CPU/CUDA suites pass 6/6 and direct OFF passes 3/3; final GPU state is
   146 MiB/0%/42 C and the benchmark-window kernel journal is empty.
+  Request-level follow-up shows the P99 gap is not random scheduler fragility.
+  The worst project requests are always initial admissions 30/31, and the
+  32-request fill advances by **215.3 ms per two-prompt step** versus
+  **186.6 ms** for default vLLM. After the initial fill, project TTFT P99/max is
+  only **222/222 ms**, versus **1,138/1,530 ms** for vLLM. Disabling vLLM async
+  scheduling changes P99 only **3,099→3,127 ms**; forcing eager execution moves
+  it to **3,414 ms**, closing about **71%** of the default P99 advantage. This
+  points first to vLLM's compiled/piecewise mixed-prefill graph path, not
+  admission robustness; the project currently graphs pure decode while keeping
+  mixed prefill/decode eager.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

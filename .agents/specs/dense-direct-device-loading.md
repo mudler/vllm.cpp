@@ -190,6 +190,16 @@ while vLLM remains 128/128. Raw evidence is
 `/tmp/qwen35-direct-main-829883d`; driver SHA-256 is
 `7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
 
+The request-level P99 follow-up refutes a direct-loader or random robustness
+tail. All three project traces put requests 30/31 at the top of the initial
+32-request fill; post-fill TTFT P99/max is 222.00/222.09 ms. Default vLLM is
+1138.07/1529.75 ms after fill but completes the initial two-prompt steps in
+186.55 ms versus project 215.35 ms. vLLM async-off changes global P99 by only
+0.91%; `enforce_eager` raises it from 3099.21 to 3413.73 ms and explains about
+71% of the default P99 advantage. The remaining work belongs to compiled/
+piecewise mixed-prefill execution and then async overlap, not W4.4 loading.
+Raw analysis is `/tmp/qwen35-direct-main-829883d/ttft-analysis.json`.
+
 ## Risks and mitigations
 
 - Early asynchronous free is a use-after-free. Every layer checkpoint

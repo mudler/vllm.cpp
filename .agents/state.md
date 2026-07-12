@@ -5055,3 +5055,60 @@ for the strengthened **9/9 prefill + 16/16 greedy** acceptance stream, not
 because this component passed the strict every-axis speed gate. The GDN row
 remains `ACTIVE` on paired trace/pool classification and the same clean
 pushed-SHA exact vLLM campaign that closes FP4 W2.
+
+## 2026-07-12 — clean pushed W2 27B campaign improves the grid but fails exact parity; W3 claimed
+
+Immutable pushed `b5c6e4fd65cdacea8f378e18ae101ebf521e8f01` was checked out
+detached and clean on `dgx.casa`, configured with CUDA 13.0.88, sm_121a,
+CUTLASS 4.5, FA2/Marlin/vendored Triton and the exact Qwen3.6-27B snapshot. The
+clean server and `test_qwen27_paged_engine` built 153/153; the commit-bound
+model gate passed 1/1 with the full 16/16 native stream. One uninterrupted
+`/tmp/gpu` lock then covered three interleaved ours/vLLM c1/2/4/8/16/32
+repetitions, all six cache-eviction/memory-return cycles and paired c16 traces.
+Every process returned; post-run GPU process inventory is empty and a
+nonblocking lock reacquisition passes.
+
+The canonical 27-only validator reports 12/12 binding groups and 2,016/2,016
+successful exact-count requests. Median total-throughput ratios c1→c32 are
+**0.993275/0.951994/0.965716/0.976001/1.021341/1.021801×**. Performance
+axis counts are **4/4/5/4/17/14 of 20**; normalized mean-TPOT ratios are
+**0.991472/0.941745/0.947586/0.940429/0.982670/0.983680×**. W2 therefore
+improves every old binding total ratio and closes total throughput at c16/c32,
+but it does not restore exact parity: c2 is 4.80% low, c4 3.43%, c8 2.40%, and
+mean TPOT/ITL is 1.76%/1.66% slower at c16/c32. Memory remains **2/4**:
+ours/vLLM median PSS is 48,272,873/28,096,858 KiB, RSS
+48,275,264/28,424,060 KiB, GPU 38,746/72,608 MiB and whole-system
+available-memory drop 66,089,528/80,435,540 KiB.
+
+The paired trace status passes the exact cache-off, closed-loop c16/48,
+max-seqs-32, model-length-262144 contract. Ours produces three complete nsys
+runs; vLLM profiles one equivalent warmup plus three measured generations.
+All 32 local FP4 tactics execute, but local kernel time is dominated by
+128x128x128 static-persistent (16.33%) and 256x128x128 static-persistent
+(7.43%). vLLM instead resolves the 128x32x256 Stream-K/static-persistent pair
+for about 25.12% of captured kernel time. Percentages are not compared as
+cross-profiler wall time; the different dominant kernel identity is the
+ground-truth selection mismatch. vLLM's four output digests are stable while
+the three local HTTP trace digests differ; this is retained diagnostically,
+while the separate commit-bound 16/16 model gate owns correctness.
+
+Canonical runs/ratios/report SHA-256 are
+`0056bf62eb87b6bc8f4e0fbf0ae344e4b74f758e1741f0fc17a55212b88c5c59`,
+`632e087b63bfdf38ef6d3ae953f2844670756247ec2ff40753f79f4d1472192c`
+and `96673601e660269e082751a6325902ffac4bd25bbc597915634b6e030c4e894b`.
+Trace status is `0190a7e18d9fba506f648f43d504d44062d1c2b5f2572ae80e7b590e6bdaad3e`;
+ours nsys/kernel are `f059953314a119c2309f7ae5d2656d7919338b1b5dd57723697cfe55e5db9e57`
+/ `d2367ab4df254f62c02f9ea657f002473a7770b57644d90c6329fcd5949d392e`;
+vLLM trace/kernel are `db996f39351890290dfe48edd78b42c5a6872ec297f4beee965acefcfaf2cb41`
+/ `caf8ac9f35efe8f3568b4b4155870b8c5c058c86ea87924b29941f8e9ed258b8`.
+Evidence root is
+`~/work/vllm.cpp-online-gate/evidence/b5c6e4fd65cdacea8f378e18ae101ebf521e8f01`.
+
+`CLAIM-NVFP4-SMALL-M-2` is released after W2's measured acceptance failure.
+The already accepted spike makes W3 the non-speculative next leaf:
+`CLAIM-NVFP4-SMALL-M-3` now owns FlashInfer-equivalent pre-serve all-bucket
+event/graph timing and selection, versioned atomic persistent-cache load/save,
+stale rejection, selected-plan evidence and lazy diagnostic fallback. No new
+tactic, HTTP, scheduler, GDN or device-residency change is in scope. Gate W3
+same-binary, re-profile both engines, then repeat exact 27B; 35B remains
+prohibited until every 27B performance and memory axis passes.

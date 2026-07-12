@@ -1,8 +1,8 @@
 # Spike: FlashInfer-parity NVFP4 small-M dispatch and SM12 tactics
 
 **Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
-spike; W1 is measured and W2 is `ACTIVE` under
-`CLAIM-NVFP4-SMALL-M-2`. **Pins:** vLLM
+spike; W1/W2 are measured and W3 is `ACTIVE` under
+`CLAIM-NVFP4-SMALL-M-3`. **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.5.0`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
@@ -15,8 +15,12 @@ materially improves the 27B grid, but does not pass the strict component or
 every-axis gates. The fresh runtime trace promoted the separate 32-tactic W2
 family; W2 now implements and correctness-gates that family, merged CT gate/up
 semantics and the traced one-input activation/quant producer. Its component is
-positive but below the strict timing/memory floor, and the clean pushed-SHA
-oracle campaign remains. Exact `4e1d8ca` remains W1's immutable before-state.
+positive but below the strict timing/memory floor. Clean pushed `b5c6e4f`
+completes W2's binding classification: it improves every concurrency and wins
+c16/c32 total throughput, but c1-c8, TPOT/ITL and host-memory axes remain red.
+The paired trace promotes W3 because local runtime selection is dominated by
+wide tactics while vLLM resolves the 128x32x256 Stream-K/static pair. Exact
+`4e1d8ca` remains W1's immutable before-state.
 
 ## Scope
 
@@ -175,6 +179,36 @@ the upstream one-input fusion with a dedicated
 `VT_FP4_MERGED_SILU_QUANT=0` same-binary fallback. It must preserve the BF16
 rounding boundary byte-for-byte and is gated independently before the full W2
 component campaign.
+
+### W2 binding classification (2026-07-12)
+
+Clean pushed `b5c6e4fd65cdacea8f378e18ae101ebf521e8f01` completes the W2
+campaign under one uncontended model-wide lock. All 12 engine/concurrency
+groups, 2,016/2,016 timed requests, six memory returns, the commit-bound 16/16
+model gate and paired trace status validate. Median total-throughput ratios
+c1→c32 are **0.993275/0.951994/0.965716/0.976001/1.021341/1.021801×**;
+performance-axis counts are **4/4/5/4/17/14 of 20**, and memory passes **2/4**.
+Median normalized mean-TPOT ratios are
+**0.991472/0.941745/0.947586/0.940429/0.982670/0.983680×**. W2 therefore
+materially improves the old binding grid and closes total throughput at c16
+and c32, but fails the strict every-axis gate.
+
+The new execution trace proves this is a selection gap, not a missing tactic.
+All 32 local candidates execute, yet the local profile is dominated by
+128x128x128 static-persistent (16.33% of local kernel time) and
+256x128x128 static-persistent (7.43%). The exact 128x32x256 family appears only
+as a minor selected/tuning slice. vLLM instead spends **25.12%** of captured
+kernel time in its 128x32x256 Stream-K/static-persistent pair. Cross-profiler
+percentages are not directly compared as wall time; kernel identity and the
+different dominant selection are the structural evidence.
+
+Canonical runs/ratios/trace-status SHA-256 are `0056bf62…c5c59`,
+`632e087b…192c` and `0190a7e1…ad3e`. Ours nsys/kernel hashes are
+`f0599533…9e57` / `d2367ab4…392e`; vLLM trace/kernel hashes are
+`db996f39…b41` / `caf8ac9f…258b`. The trace-run output digest is stable for
+vLLM and differs across local HTTP repetitions; this remains diagnostic while
+the separate commit-bound 16/16 model gate owns correctness. GPU processes are
+empty and `/tmp/gpu` is reacquirable after exit. 35B was correctly not run.
 
 ## Upstream chain and execution dependency
 
@@ -410,8 +444,8 @@ before any new FP4 GPU command begins.
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
-| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; implementation, raw tactics, merged topology/scalars, one-input byte-exact/sanitizer gates and native 16/16 tokens are green. The fusion's unprofiled c16 A/B is +1.521% but only 17/20 timing and 0/4 sampled-memory axes pass; paired trace is +2.084%/20-of-20 and structurally removes the boundary. Clean pushed-SHA exact 27B closure remains |
-| W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
+| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
+| W3 | pre-serve all-bucket warmup, FlashInfer-equivalent event/graph timing and selection, versioned persistent plan cache, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`; retain lazy tuning only as a fail-closed diagnostic path, expose stable selected-plan evidence, run same-binary selection A/B + paired trace, then repeat exact 27B because runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -475,11 +509,11 @@ tactics and generated suffixes; correctness remains the exact op and committed
 native model gates, never generated-text equality between independent tuning
 sessions.
 
-This is an honest active checkpoint, not W2 closure: the component no-regression
-rule is still red and no fresh vLLM denominator exists for this uncommitted
-binary. Commit and push the gated implementation, rebuild it cleanly, then run
-the exact c1/2/4/8/16/32 three-repetition 27B oracle campaign. Keep 35B held
-until all 27B throughput, latency and memory axes pass.
+That component checkpoint did not close W2. The subsequent clean `b5c6e4f`
+campaign above is now the binding denominator and confirms a strict acceptance
+failure with a trace-grounded selection mismatch. W3 owns the next same-binary
+selection A/B and exact c1/2/4/8/16/32 three-repetition 27B oracle campaign.
+Keep 35B held until all 27B throughput, latency and memory axes pass.
 
 ## Risks and decisions
 

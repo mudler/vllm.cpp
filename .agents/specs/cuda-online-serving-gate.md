@@ -21,23 +21,22 @@ ours arm. The historical offline denominators are also reopened: pinned
 `vllm bench throughput` used temperature 1 while ours used temperature 0, and
 the 27B budgets were 8192 versus 2048.
 
-The replacement pushed-`bce2627` series is now the current binding 27B
+The replacement clean pushed-`b5c6e4f` series is now the current binding 27B
 evidence. All 12 engine/concurrency groups validate; 2,016/2,016 timed
 requests, six memory returns, the commit-bound model gate and paired traces
 pass. Median total-throughput ratios c1→c32 are
-0.9680/0.9317/0.9403/0.9516/0.9944/1.0073×, with only 4/4/5/4/4/12 of 20
-performance axes and 2/4 memory axes passing. All three fixed-pool c32 legs
-complete without the prior unread-socket tail. Its separate same-binary c32
-fixed/legacy AB/BA/AB is steady-state-neutral at 0.999764×, and neither
-bounded arm samples the rare legacy stall. FP4 W1 now gives M=1/2/4/8/16
-independent plans; its component evidence is positive at c8/c32 but fails
-strict c16/memory no-regression. The fresh oracle trace executes the absent
-128x32x256 Stream-K/static pair for 25.1% of profiled kernel time, grounding W2
-as the next repair. This is a valid failed gate, not a parity claim. Derived
-runs/ratios/trace-status hashes are `06a4bd7a…e41d` / `1e9643e9…c4b9` /
-`ef9ce611…3a14`; ours nsys/kernel are `94048795…afde` /
-`8ce71db7…3f03`, and vLLM trace/kernel are `c8931f0a…d3ba` /
-`2afd6a57…16086`. FP4 W2 is active; the 35B series waits until repaired 27B
+0.9933/0.9520/0.9657/0.9760/1.0213/1.0218×, with 4/4/5/4/17/14 of 20
+performance axes and 2/4 memory axes passing. W2 materially improves every
+point and wins total throughput at c16/c32, but c1-c8 throughput and
+high-concurrency mean TPOT/ITL remain below vLLM. The exact paired trace shows
+all 32 tactics are present locally, yet our planner is dominated by
+128x128x128/256x128x128 while vLLM resolves the 128x32x256 Stream-K/static pair
+for about 25.1% of captured kernel time. This is a valid failed gate and
+trace-grounded W3 selection input, not a parity claim. Derived
+runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` /
+`0190a7e1…ad3e`; ours nsys/kernel are `f0599533…9e57` /
+`d2367ab4…392e`, and vLLM trace/kernel are `db996f39…b41` /
+`caf8ac9f…258b`. FP4 W3 is active; the 35B series waits until repaired 27B
 passes every axis.
 
 ## Scope

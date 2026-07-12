@@ -39,8 +39,9 @@ runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` /
 `caf8ac9f…258b`. Runtime grounding confirms pip-vLLM pre-tunes all buckets in
 memory with a stream sync and 1-ms GPU delay before ten eager event repeats;
 its file cache is disabled. FP4 W3-A's exact delayed timing mirror is staged
-behind `VT_FP4_AUTOTUNE_DELAY=0`, but its clean GB10 gate and A/B are pending;
-W3-B pre-serve all-bucket warmup follows. The 35B series waits until repaired
+behind `VT_FP4_AUTOTUNE_DELAY=0`. Immutable `71f1e89` focused/model/memcheck
+gates pass and delayed real plans contain the traced ID 6/4 narrow family; its
+timed c16 A/B remains pending. W3-B pre-serve all-bucket warmup follows. The 35B series waits until repaired
 27B passes every axis.
 
 ## Scope

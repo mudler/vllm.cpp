@@ -5152,3 +5152,38 @@ AB/BA/AB under one lock. Only an uncontended real-model performance result can
 accept W3-A. Then implement W3-B pre-serve buckets. `b5c6e4f` remains the exact
 binding denominator, and 35B remains prohibited until every 27B performance
 and memory axis passes.
+
+## 2026-07-12 — immutable W3-A correctness/safety green; real-model timing A/B next
+
+Pushed `71f1e894d0c5e496607d08cfe9089a9944128271` is checked out detached and
+clean at `~/work/vllm.cpp-nvfp4-small-m/71f1e894…/w3/source`. A fresh CUDA
+13.0.88/sm_121a build uses FlashInfer's CUTLASS 4.5 tree plus vendored Triton
+AOT and links the focused FP4 test, native 27B gate and server. Focused/model/
+server SHA-256 are `42c37b3a…43ffa`, `7059f7cd…e8ea` and
+`5d19fbf7…c334`; configure/build logs are `6a042987…80ff` /
+`9831c6af…5b7`.
+
+One uncontended `/tmp/gpu` lock covers the complete immutable gate. Fresh
+delayed and `VT_FP4_AUTOTUNE_DELAY=0` focused processes each pass **14/14 cases
+and 18,619/18,619 assertions**. Fresh delayed and off native 27B processes each
+pass **235/235 assertions**, produce exactly **16/16** tokens and match the full
+vLLM production stream. Delayed compute-sanitizer passes **1/1,
+16,389/16,389, zero errors**. Delayed/off model log SHA are
+`8065b47e…7a61d` / `3b3fcb6a…7a61d`; memcheck is `60d704a9…75c81`.
+Before/after GPU inventories are empty and the lock is free.
+
+The real-shape plan evidence now contains the exact traced narrow family.
+With delayed timing, M=9 selects ID 6 128x32x256 swap/Stream-K for output
+`N=5120,K=6144` and merged gate/up `N=34816,K=5120`, and ID 4
+128x32x256 swap/static for Q `N=12288,K=5120`. M=1 selects ID 6 on output and
+ID 4 on merged gate/up. Other shapes and the off arm choose different valid
+near-tied tactics, so this single process proves availability/selection but
+not stability or performance.
+
+W3-A is therefore immutable build/correctness/access-safety green and remains
+`ACTIVE` on performance. Next run the exact same server binary as delayed vs
+off at c16/96 in AB/BA/AB order, with cache eviction, all 20 timing + four
+memory axes, selected-plan logs and one lock. If delayed timing is accepted,
+move to W3-B pre-serve all-bucket in-memory tuning; otherwise use the repeated
+plan evidence to repair selection stability first. `b5c6e4f` remains the only
+binding production-vLLM denominator, and 35B stays prohibited.

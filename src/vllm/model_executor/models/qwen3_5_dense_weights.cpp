@@ -134,6 +134,7 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   Nvfp4Weight r;
   r.n = out_dim;
   r.k = in_dim;
+  r.weight_global_scale_inv = wgs_disk;  // retain exact divisor for fused linears
   r.scale2 = 1.0F / wgs_disk;  // CT stores 1/scale (divisor) -> reciprocate
   // TRUE W4A4 (notes §7): the on-disk activation divisor drives vt::ScaledFp4Quant
   // (used DIRECTLY), and alpha folds both reciprocated globals for the fp4xfp4

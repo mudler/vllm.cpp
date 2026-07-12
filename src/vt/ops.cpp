@@ -216,6 +216,35 @@ void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tens
       q, out_packed, out_scale, gate, up, input_global_scale_inv);
 }
 
+void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                        const Tensor& gate_up, float input_global_scale_inv) {
+  VT_CHECK(gate_up.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
+           "silu_and_mul_fp4_quant: gate_up/out_packed/out_scale must be rank-2");
+  const int64_t m = gate_up.shape[0];
+  VT_CHECK(gate_up.shape[1] % 2 == 0,
+           "silu_and_mul_fp4_quant: gate_up inner dim must be even");
+  const int64_t i = gate_up.shape[1] / 2;
+  VT_CHECK(i % 16 == 0,
+           "silu_and_mul_fp4_quant: I (half inner dim) must be a multiple of 16");
+  VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == i / 2,
+           "silu_and_mul_fp4_quant: out_packed must be [M, I/2]");
+  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
+           "silu_and_mul_fp4_quant: out_scale must be [M, I/16]");
+  VT_CHECK(gate_up.dtype == DType::kF32 || gate_up.dtype == DType::kBF16,
+           "silu_and_mul_fp4_quant: gate_up must be f32 or bf16");
+  VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
+           "silu_and_mul_fp4_quant: outputs must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(gate_up.IsContiguous() && out_packed.IsContiguous() &&
+               out_scale.IsContiguous(),
+           "silu_and_mul_fp4_quant: contiguous tensors required");
+  VT_CHECK(gate_up.device == q.device && out_packed.device == q.device &&
+               out_scale.device == q.device,
+           "silu_and_mul_fp4_quant: device mismatch");
+  reinterpret_cast<SiluAndMulFp4QuantFn>(
+      GetOp(OpId::kSiluAndMulFp4Quant, q.device.type))(
+      q, out_packed, out_scale, gate_up, input_global_scale_inv);
+}
+
 void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
                     const Tensor& b_packed, const Tensor& b_scale, float alpha) {
   VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_scale.rank == 2 && b_packed.rank == 2 &&

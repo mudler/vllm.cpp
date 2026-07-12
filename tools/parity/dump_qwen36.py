@@ -90,7 +90,9 @@ def _stream(hidden, residual):
     return (hidden.detach().float() + residual.detach().float()).cpu()
 
 
-def register_hooks(model, gdn_idx, full_idx):
+def register_hooks(
+    model, gdn_idx, full_idx, capture_all_layers=False, capture_mlp_layer=None
+):
     lm = model.language_model            # Qwen3_5(Moe)ForCausalLM
     mdl = lm.model                       # Qwen3_5Model
     layers = mdl.layers
@@ -121,6 +123,47 @@ def register_hooks(model, gdn_idx, full_idx):
         L = layers[idx]
         L.register_forward_pre_hook(mk_pre(name), with_kwargs=True)
         L.register_forward_hook(mk_post(name), with_kwargs=True)
+
+    if capture_all_layers:
+        for idx, layer in enumerate(layers):
+            name = f"layer_{idx:02d}"
+            layer.register_forward_pre_hook(mk_pre(name), with_kwargs=True)
+            layer.register_forward_hook(mk_post(name), with_kwargs=True)
+
+    if capture_mlp_layer is not None:
+        layer = layers[capture_mlp_layer]
+        mlp = layer.mlp
+
+        def input_norm_hook(_m, _inputs, output):
+            value = output[0] if isinstance(output, tuple) else output
+            if _is_prefill(value) and "layer_input_norm" not in CAPT:
+                CAPT["layer_input_norm"] = value.detach().cpu()
+
+        def post_norm_pre_hook(_m, inputs):
+            attention, residual = inputs
+            if _is_prefill(attention) and "layer_attention" not in CAPT:
+                CAPT["layer_attention"] = attention.detach().cpu()
+                CAPT["layer_residual_before_post"] = residual.detach().cpu()
+
+        def gate_up_pre_hook(_m, inputs):
+            value = inputs[0]
+            if _is_prefill(value) and "mlp_input" not in CAPT:
+                CAPT["mlp_input"] = value.detach().cpu()
+
+        def gate_up_hook(_m, _inp, output):
+            value = output[0] if isinstance(output, tuple) else output
+            if _is_prefill(value) and "mlp_gate_up" not in CAPT:
+                CAPT["mlp_gate_up"] = value.detach().cpu()
+
+        def act_hook(_m, _inp, output):
+            if _is_prefill(output) and "mlp_act" not in CAPT:
+                CAPT["mlp_act"] = output.detach().cpu()
+
+        layer.input_layernorm.register_forward_hook(input_norm_hook)
+        layer.post_attention_layernorm.register_forward_pre_hook(post_norm_pre_hook)
+        mlp.gate_up_proj.register_forward_pre_hook(gate_up_pre_hook)
+        mlp.gate_up_proj.register_forward_hook(gate_up_hook)
+        mlp.act_fn.register_forward_hook(act_hook)
 
     # Final RMSNorm is called positionally: norm(hidden_states, residual).
     def norm_pre(_m, args):
@@ -170,6 +213,15 @@ def main():
     ap.add_argument("--prompt",
                     default="The capital of France is Paris, and the")
     ap.add_argument("--gpu-mem", type=float, default=0.5)
+    ap.add_argument(
+        "--layer-trace",
+        help="optional directory for every prefill layer's f32 residual-stream in/out",
+    )
+    ap.add_argument(
+        "--mlp-trace",
+        help="optional directory for one prefill layer's BF16 gate_up/activation",
+    )
+    ap.add_argument("--mlp-layer", type=int, default=1)
     args = ap.parse_args()
 
     import os
@@ -236,12 +288,65 @@ def main():
 
     # register hooks in-process, then run greedy generate (prefill captured;
     # decode steps skipped by the prompt-length guard).
-    llm.apply_model(lambda m: register_hooks(m, gdn_idx, full_idx))
+    llm.apply_model(
+        lambda m: register_hooks(
+            m,
+            gdn_idx,
+            full_idx,
+            capture_all_layers=args.layer_trace is not None,
+            capture_mlp_layer=args.mlp_layer if args.mlp_trace is not None else None,
+        )
+    )
     sp = SamplingParams(temperature=0.0, max_tokens=N_GREEDY)
     out = llm.generate({"prompt_token_ids": ids}, sp)
     greedy_ids = list(out[0].outputs[0].token_ids)
     print("GREEDY_TOKEN_IDS", greedy_ids)
     print("GREEDY_TEXT", repr(out[0].outputs[0].text))
+
+    if args.layer_trace is not None:
+        trace_root = pathlib.Path(args.layer_trace)
+        trace_root.mkdir(parents=True, exist_ok=True)
+        for idx in range(int(hf.num_hidden_layers)):
+            for suffix in ("in", "out"):
+                key = f"layer_{idx:02d}_{suffix}"
+                assert key in CAPT, f"missing capture {key}; CAPT={list(CAPT)}"
+                np.save(trace_root / f"{key}.npy", CAPT[key].numpy())
+        print(f"wrote {hf.num_hidden_layers}-layer trace to {trace_root}")
+
+    if args.mlp_trace is not None:
+        trace_root = pathlib.Path(args.mlp_trace)
+        trace_root.mkdir(parents=True, exist_ok=True)
+        for key in (
+            "layer_input_norm",
+            "layer_attention",
+            "layer_residual_before_post",
+            "mlp_input",
+            "mlp_gate_up",
+            "mlp_act",
+        ):
+            assert key in CAPT, f"missing capture {key}; CAPT={list(CAPT)}"
+            value = CAPT[key]
+            np.save(trace_root / f"layer_{args.mlp_layer:02d}_{key}.npy",
+                    value.view(torch.uint16).numpy())
+
+        def save_mlp_parameters(model):
+            linear = model.language_model.model.layers[
+                args.mlp_layer
+            ].mlp.gate_up_proj
+            data = {
+                "weight_shape": list(linear.weight.shape),
+                "weight_scale_shape": list(linear.weight_scale.shape),
+                "weight_global_scale": linear.weight_global_scale.float().cpu().tolist(),
+                "input_global_scale_inv": linear.input_global_scale_inv.float().cpu().tolist(),
+                "alpha": linear.alpha.float().cpu().tolist(),
+            }
+            return data
+
+        params = llm.apply_model(save_mlp_parameters)[0]
+        (trace_root / f"layer_{args.mlp_layer:02d}_params.json").write_text(
+            json.dumps(params, indent=1) + "\n"
+        )
+        print(f"wrote layer-{args.mlp_layer} MLP trace to {trace_root}")
 
     for k in ("embed", "gdn_in", "gdn_out", "full_in", "full_out",
               "norm_in", "norm_out"):

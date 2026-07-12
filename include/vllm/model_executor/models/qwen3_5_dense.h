@@ -51,7 +51,28 @@ struct DenseMlpWeights {
   Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
   Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
   Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
+
+  // CUDA resident for vLLM's MergedColumnParallelLinear gate_up_proj. The
+  // checkpoint stores gate/up separately; production concatenates their packed
+  // rows and linear block scales once, then keeps only the combined packed
+  // operand and combined swizzled scale resident. Mutable matches Nvfp4Weight's
+  // lazy device-resident handles. The split weights remain host-resident for
+  // VT_FP4_MERGED_GATE_UP=0 and VT_FP4_FULL_TACTICS=0 diagnostics.
+  mutable std::shared_ptr<void> d_gate_up_packed;
+  mutable std::shared_ptr<void> d_gate_up_scale_sw;
 };
+
+// Exact scalar processing for a two-shard CT NVFP4 MergedColumnParallelLinear.
+// Mirrors compressed_tensors_w4a4_nvfp4.py:95-138: max each logical-shard
+// divisor first, reciprocate once, then multiply the two reciprocals into alpha.
+struct DenseGateUpGlobals {
+  float input_global_scale_inv = 0.0F;  // max on-disk input divisor
+  float weight_global_scale = 0.0F;     // reciprocal of max on-disk weight divisor
+  float alpha = 0.0F;
+};
+
+DenseGateUpGlobals MergeDenseGateUpGlobals(const Nvfp4Weight& gate,
+                                           const Nvfp4Weight& up);
 
 // One dense decoder layer: input/post norms + one attention variant + dense MLP.
 struct Qwen3_5DenseLayerWeights {
@@ -153,6 +174,14 @@ class Qwen3_5DenseModel {
                                          const HfConfig& config,
                                          vt::Queue& queue);
 };
+
+// Replay one dense decoder layer from a captured combined residual stream.
+// This is the dense sibling of Qwen3_5ReplayLayer and is the focused parity
+// seam for the real 27B resident W4A4 layer goldens.
+std::vector<float> Qwen3_5ReplayDenseLayer(
+    const Qwen3_5DenseLayerWeights& layer, const HfConfig& config,
+    const std::vector<float>& hidden_in, const std::vector<int32_t>& positions,
+    int64_t seqlen, vt::Queue& queue);
 
 // 27B DENSE decode CUDA-graph driver — the dense sibling of Qwen3_5DecodeGraph
 // (qwen3_5.h). Captures the PURE-DECODE dense forward once per PADDED batch size

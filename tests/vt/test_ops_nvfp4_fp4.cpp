@@ -10,23 +10,29 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <future>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
 #include "vt/backend.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
+#include "vt/cuda/nvfp4_tactic_ids.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -39,6 +45,13 @@ using vt::Tensor;
 namespace {
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Queue CpuQueue() { return Queue{Cpu(), nullptr}; }
+
+uint16_t FloatToBf16(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<uint16_t>(bits >> 16U);
+}
 
 // Decode a fp4 activation row-trip from the ScaledFp4Quant outputs, mirroring the
 // GEMM's a-operand: a_fp4 * f8(a_scale) / input_global_scale (== x_dq).
@@ -74,6 +87,40 @@ TEST_CASE("FlashInfer NVFP4 hybrid M buckets preserve small decode shapes") {
   CHECK(LegacyMBucket(17) == 32);
   CHECK_THROWS_AS(vt::cuda::nvfp4::NextPositivePowerOfTwo(0x80000001U),
                   std::overflow_error);
+}
+
+TEST_CASE("FlashInfer SM12 NVFP4 tactics retain exact stable descriptor order") {
+  using vt::cuda::nvfp4::TacticDescriptorForId;
+  using vt::cuda::nvfp4::kFullTacticDescriptors;
+  using vt::cuda::nvfp4::kFullTacticSetVersion;
+  using vt::cuda::nvfp4::kW1TacticIds;
+  using vt::cuda::nvfp4::kW1TacticSetVersion;
+
+  constexpr std::array<std::array<int, 3>, 8> tiles{{
+      {128, 32, 128},   {128, 32, 256},  {128, 64, 128},  {128, 64, 256},
+      {128, 128, 128},  {128, 128, 256}, {256, 128, 128}, {128, 256, 128},
+  }};
+  REQUIRE(kFullTacticDescriptors.size() == tiles.size() * 4);
+  for (size_t tile = 0; tile < tiles.size(); ++tile) {
+    for (size_t variant = 0; variant < 4; ++variant) {
+      const size_t id = tile * 4 + variant;
+      const auto& descriptor = kFullTacticDescriptors[id];
+      CAPTURE(id);
+      CHECK(descriptor.id == static_cast<int>(id));
+      CHECK(descriptor.tile_m == tiles[tile][0]);
+      CHECK(descriptor.tile_n == tiles[tile][1]);
+      CHECK(descriptor.tile_k == tiles[tile][2]);
+      CHECK(descriptor.swap_ab == (variant == 0 || variant == 2));
+      CHECK(descriptor.stream_k == (variant >= 2));
+      CHECK(std::string(descriptor.name).empty() == false);
+      CHECK(TacticDescriptorForId(static_cast<int>(id)) == &descriptor);
+    }
+  }
+  CHECK(TacticDescriptorForId(-1) == nullptr);
+  CHECK(TacticDescriptorForId(32) == nullptr);
+  CHECK((kW1TacticIds == std::array<int, 4>{17, 25, 21, 29}));
+  CHECK(kW1TacticSetVersion == 1);
+  CHECK(kFullTacticSetVersion == 2);
 }
 
 TEST_CASE("NVFP4 plan key covers device architecture dtype shape and tactic ABI") {
@@ -519,6 +566,159 @@ TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)")
   b.DestroyQueue(gq);
 }
 
+// Port of vllm@e24d1b24
+// tests/kernels/quantization/test_silu_mul_nvfp4_quant.py::
+// test_silu_mul_nvfp4_quant. The local gate is intentionally stronger than the
+// upstream dequantized tolerance: the fused producer must preserve the eager
+// BF16 SiluAndMul -> ScaledFp4Quant boundary byte-for-byte.
+TEST_CASE("silu_and_mul_nvfp4_quant one-input CPU is BYTE-EXACT") {
+  Queue queue = CpuQueue();
+  constexpr float kInputGlobalScale = 6.7F;
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    for (const auto& [m, i] :
+         {std::pair<int64_t, int64_t>{1, 64}, {37, 128}}) {
+      CAPTURE(m);
+      CAPTURE(i);
+      CAPTURE(static_cast<int>(dtype));
+      std::mt19937 rng(static_cast<unsigned>(401 + m * 131 + i));
+      std::normal_distribution<float> normal(0.0F, 2.0F);
+      std::vector<float> input_f32(static_cast<size_t>(m * 2 * i));
+      for (float& value : input_f32) value = normal(rng);
+      std::vector<uint16_t> input_bf16;
+      void* input_data = input_f32.data();
+      if (dtype == DType::kBF16) {
+        input_bf16.resize(input_f32.size());
+        std::transform(input_f32.begin(), input_f32.end(), input_bf16.begin(),
+                       FloatToBf16);
+        input_data = input_bf16.data();
+      }
+
+      std::vector<uint16_t> activation(static_cast<size_t>(m * i));
+      std::vector<uint8_t> reference_packed(static_cast<size_t>(m * i / 2));
+      std::vector<uint8_t> reference_scale(static_cast<size_t>(m * i / 16));
+      std::vector<uint8_t> fused_packed(reference_packed.size());
+      std::vector<uint8_t> fused_scale(reference_scale.size());
+      Tensor input = Tensor::Contiguous(input_data, dtype, Cpu(), {m, 2 * i});
+      Tensor act = Tensor::Contiguous(activation.data(), DType::kBF16, Cpu(),
+                                      {m, i});
+      Tensor ref_packed = Tensor::Contiguous(
+          reference_packed.data(), DType::kI8, Cpu(), {m, i / 2});
+      Tensor ref_scale = Tensor::Contiguous(
+          reference_scale.data(), DType::kI8, Cpu(), {m, i / 16});
+      Tensor got_packed = Tensor::Contiguous(
+          fused_packed.data(), DType::kI8, Cpu(), {m, i / 2});
+      Tensor got_scale = Tensor::Contiguous(
+          fused_scale.data(), DType::kI8, Cpu(), {m, i / 16});
+
+      vt::SiluAndMul(queue, act, input);
+      vt::ScaledFp4Quant(queue, ref_packed, ref_scale, act,
+                         kInputGlobalScale);
+      vt::SiluAndMulFp4Quant(queue, got_packed, got_scale, input,
+                             kInputGlobalScale);
+      CHECK(fused_packed == reference_packed);
+      CHECK(fused_scale == reference_scale);
+    }
+  }
+}
+
+TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 6.7F;
+
+  auto run_check = [&](int64_t m, int64_t i, DType dtype) {
+    CAPTURE(m);
+    CAPTURE(i);
+    CAPTURE(static_cast<int>(dtype));
+    std::mt19937 rng(static_cast<unsigned>(211 + m * 131 + i));
+    std::normal_distribution<float> nd(0.0F, 2.0F);
+    std::vector<float> input_f32(static_cast<size_t>(m * 2 * i));
+    for (auto& value : input_f32) value = nd(rng);
+    std::vector<uint16_t> input_bf16;
+    const void* input_host = input_f32.data();
+    size_t input_bytes = input_f32.size() * sizeof(float);
+    if (dtype == DType::kBF16) {
+      input_bf16.resize(input_f32.size());
+      std::transform(input_f32.begin(), input_f32.end(), input_bf16.begin(),
+                     FloatToBf16);
+      input_host = input_bf16.data();
+      input_bytes = input_bf16.size() * sizeof(uint16_t);
+    }
+
+    auto upload = [&](const void* host, size_t bytes) {
+      void* device = b.Alloc(bytes);
+      b.Copy(gq, device, host, bytes);
+      return device;
+    };
+    void* dinput = upload(input_host, input_bytes);
+    Tensor input = GpuTensor({m, 2 * i});
+    input.data = dinput;
+    input.dtype = dtype;
+    input.device = Gpu();
+
+    void* dact = b.Alloc(static_cast<size_t>(m * i) * sizeof(uint16_t));
+    void* dref_packed = b.Alloc(static_cast<size_t>(m * i / 2));
+    void* dref_scale = b.Alloc(static_cast<size_t>(m * i / 16));
+    Tensor act = GpuTensor({m, i});
+    act.data = dact;
+    act.dtype = DType::kBF16;
+    act.device = Gpu();
+    Tensor ref_packed = GpuTensor({m, i / 2});
+    ref_packed.data = dref_packed;
+    ref_packed.dtype = DType::kI8;
+    ref_packed.device = Gpu();
+    Tensor ref_scale = GpuTensor({m, i / 16});
+    ref_scale.data = dref_scale;
+    ref_scale.dtype = DType::kI8;
+    ref_scale.device = Gpu();
+    vt::SiluAndMul(gq, act, input);
+    vt::ScaledFp4Quant(gq, ref_packed, ref_scale, act,
+                       input_global_scale);
+
+    void* dfused_packed = b.Alloc(static_cast<size_t>(m * i / 2));
+    void* dfused_scale = b.Alloc(static_cast<size_t>(m * i / 16));
+    Tensor fused_packed = GpuTensor({m, i / 2});
+    fused_packed.data = dfused_packed;
+    fused_packed.dtype = DType::kI8;
+    fused_packed.device = Gpu();
+    Tensor fused_scale = GpuTensor({m, i / 16});
+    fused_scale.data = dfused_scale;
+    fused_scale.dtype = DType::kI8;
+    fused_scale.device = Gpu();
+    vt::SiluAndMulFp4Quant(gq, fused_packed, fused_scale, input,
+                           input_global_scale);
+
+    std::vector<uint8_t> reference_packed(static_cast<size_t>(m * i / 2));
+    std::vector<uint8_t> reference_scale(static_cast<size_t>(m * i / 16));
+    std::vector<uint8_t> fused_packed_host(reference_packed.size());
+    std::vector<uint8_t> fused_scale_host(reference_scale.size());
+    b.Copy(gq, reference_packed.data(), dref_packed,
+           reference_packed.size());
+    b.Copy(gq, reference_scale.data(), dref_scale, reference_scale.size());
+    b.Copy(gq, fused_packed_host.data(), dfused_packed,
+           fused_packed_host.size());
+    b.Copy(gq, fused_scale_host.data(), dfused_scale,
+           fused_scale_host.size());
+    b.Synchronize(gq);
+
+    CHECK(fused_packed_host == reference_packed);
+    CHECK(fused_scale_host == reference_scale);
+    for (void* pointer : {dinput, dact, dref_packed, dref_scale,
+                          dfused_packed, dfused_scale}) {
+      b.Free(pointer);
+    }
+  };
+
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    run_check(1, 64, dtype);       // decode
+    run_check(128, 128, dtype);    // upstream shape
+    run_check(37, 2048, dtype);    // padded-M prefill
+    run_check(9, 17408, dtype);    // exact 27B intermediate class
+  }
+  b.DestroyQueue(gq);
+}
+
 TEST_CASE("matmul_nvfp4_fp4 validates shapes loudly") {
   std::vector<uint8_t> buf(64, 0);
   std::vector<float> ob(16, 0);
@@ -670,5 +870,206 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
 
   for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
   b.DestroyQueue(gq);
+}
+
+// Port of the forced-tactic coverage in
+// vLLM `tests/kernels/quantization/test_flashinfer_nvfp4_scaled_mm.py:26-168`
+// plus FlashInfer's 32-entry getConfigs contract. CMake launches this case in
+// 32 fresh processes so the process-stable VT_FP4_FORCE_TACTIC selects every ID.
+TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and captures") {
+  const char* forced_text = std::getenv("VT_FP4_FORCE_TACTIC");
+  if (forced_text == nullptr || !HasCuda()) return;
+  const int tactic = std::stoi(forced_text);
+  REQUIRE(tactic >= 0);
+  REQUIRE(tactic < 32);
+
+  auto& backend = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = backend.CreateQueue();
+  const auto dimension = [](const char* name, int64_t fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) return fallback;
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    REQUIRE(end != text);
+    REQUIRE(*end == '\0');
+    REQUIRE(value > 0);
+    return static_cast<int64_t>(value);
+  };
+  const bool real_projection = std::getenv("VT_FP4_TEST_REAL_SHAPE") != nullptr;
+  const int64_t m = dimension("VT_FP4_TEST_M", 1 + tactic % 3);
+  const int64_t n = dimension("VT_FP4_TEST_N", real_projection ? 1024 : 256);
+  const int64_t k = dimension("VT_FP4_TEST_K", real_projection ? 5120 : 512);
+  const unsigned seed = static_cast<unsigned>(
+      dimension("VT_FP4_TEST_SEED", static_cast<int64_t>(9202 + tactic)));
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> normal(0.0F, 2.0F);
+  std::uniform_int_distribution<int> packed_value(0, 255);
+  std::uniform_real_distribution<float> scale_value(0.05F, 4.0F);
+
+  std::vector<float> x(static_cast<size_t>(m * k));
+  for (float& value : x) value = normal(rng);
+  const bool bf16_input = std::getenv("VT_FP4_TEST_BF16_INPUT") != nullptr;
+  std::vector<uint16_t> x_bf16;
+  if (bf16_input) {
+    x_bf16.resize(x.size());
+    for (size_t index = 0; index < x.size(); ++index) {
+      x_bf16[index] = vt::F32ToBF16(x[index]);
+    }
+  }
+  std::vector<uint8_t> w_packed(static_cast<size_t>(n * k / 2));
+  for (uint8_t& value : w_packed) value = static_cast<uint8_t>(packed_value(rng));
+  std::vector<uint8_t> w_scale(static_cast<size_t>(n * k / 16));
+  for (uint8_t& value : w_scale) value = vllm::F32ToF8E4M3(scale_value(rng));
+  constexpr float kInputGlobalScale = 8.2F;
+  constexpr float kWeightGlobalScale = 5.5F;
+  constexpr float kAlpha = (1.0F / kInputGlobalScale) * (1.0F / kWeightGlobalScale);
+
+  std::vector<uint8_t> cpu_a_packed(static_cast<size_t>(m * k / 2), 0);
+  std::vector<uint8_t> cpu_a_scale(static_cast<size_t>(m * k / 16), 0);
+  std::vector<float> reference(static_cast<size_t>(m * n), 0.0F);
+  {
+    Queue cpu_queue = CpuQueue();
+    Tensor tx = bf16_input
+                    ? Tensor::Contiguous(x_bf16.data(), DType::kBF16, Cpu(), {m, k})
+                    : Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {m, k});
+    Tensor ta = Tensor::Contiguous(cpu_a_packed.data(), DType::kI8, Cpu(), {m, k / 2});
+    Tensor tas = Tensor::Contiguous(cpu_a_scale.data(), DType::kI8, Cpu(), {m, k / 16});
+    Tensor tw = Tensor::Contiguous(w_packed.data(), DType::kI8, Cpu(), {n, k / 2});
+    Tensor tws = Tensor::Contiguous(w_scale.data(), DType::kI8, Cpu(), {n, k / 16});
+    Tensor tout = Tensor::Contiguous(reference.data(), DType::kF32, Cpu(), {m, n});
+    vt::ScaledFp4Quant(cpu_queue, ta, tas, tx, kInputGlobalScale);
+    vt::MatmulNvfp4Fp4(cpu_queue, tout, ta, tas, tw, tws, kAlpha);
+  }
+
+  const int64_t mp = RoundUp(m, 128);
+  const int64_t np = RoundUp(n, 128);
+  const int64_t kp = RoundUp(k / 16, 4);
+  const auto upload = [&](const void* host, size_t bytes) {
+    void* device = backend.Alloc(bytes);
+    backend.Copy(queue, device, host, bytes);
+    return device;
+  };
+  void* dx = bf16_input ? upload(x_bf16.data(), x_bf16.size() * sizeof(uint16_t))
+                        : upload(x.data(), x.size() * sizeof(float));
+  void* dw = upload(w_packed.data(), w_packed.size());
+  void* dws = upload(w_scale.data(), w_scale.size());
+  void* da = backend.Alloc(static_cast<size_t>(m * k / 2));
+  void* das = backend.Alloc(static_cast<size_t>(m * k / 16));
+  void* dasw = backend.Alloc(static_cast<size_t>(mp * kp));
+  void* dwsw = backend.Alloc(static_cast<size_t>(np * kp));
+  void* dout = backend.Alloc(static_cast<size_t>(m * n) * sizeof(uint16_t));
+  backend.Memset(queue, dasw, 0, static_cast<size_t>(mp * kp));
+  backend.Memset(queue, dwsw, 0, static_cast<size_t>(np * kp));
+
+  Tensor tx = GpuTensor({m, k});
+  tx.data = dx;
+  tx.dtype = bf16_input ? DType::kBF16 : DType::kF32;
+  tx.device = Gpu();
+  Tensor ta = GpuTensor({m, k / 2});
+  ta.data = da;
+  ta.dtype = DType::kI8;
+  ta.device = Gpu();
+  Tensor tas = GpuTensor({m, k / 16});
+  tas.data = das;
+  tas.dtype = DType::kI8;
+  tas.device = Gpu();
+  Tensor tasw = GpuTensor({mp, kp});
+  tasw.data = dasw;
+  tasw.dtype = DType::kI8;
+  tasw.device = Gpu();
+  Tensor tw = GpuTensor({n, k / 2});
+  tw.data = dw;
+  tw.dtype = DType::kI8;
+  tw.device = Gpu();
+  Tensor tws = GpuTensor({n, k / 16});
+  tws.data = dws;
+  tws.dtype = DType::kI8;
+  tws.device = Gpu();
+  Tensor twsw = GpuTensor({np, kp});
+  twsw.data = dwsw;
+  twsw.dtype = DType::kI8;
+  twsw.device = Gpu();
+  Tensor tout = GpuTensor({m, n});
+  tout.data = dout;
+  tout.dtype = DType::kBF16;
+  tout.device = Gpu();
+
+  vt::ScaledFp4Quant(queue, ta, tas, tx, kInputGlobalScale);
+  vt::SwizzleBlockscale(queue, tasw, tas);
+  vt::SwizzleBlockscale(queue, twsw, tws);
+  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, kAlpha);
+  std::vector<uint16_t> first(static_cast<size_t>(m * n));
+  backend.Copy(queue, first.data(), dout, first.size() * sizeof(uint16_t));
+  backend.Synchronize(queue);
+
+  double max_abs = 0.0;
+  double ref_absmax = 0.0;
+  for (size_t i = 0; i < first.size(); ++i) {
+    const double got = Bf16ToFloat(first[i]);
+    max_abs = std::max(max_abs, std::abs(got - reference[i]));
+    ref_absmax = std::max(ref_absmax, std::abs(static_cast<double>(reference[i])));
+  }
+  CAPTURE(tactic);
+  CAPTURE(m);
+  CAPTURE(max_abs);
+  CAPTURE(ref_absmax);
+  if (std::getenv("VT_FP4_TEST_VERBOSE") != nullptr) {
+    std::fprintf(stderr,
+                 "NVFP4 forced tactic=%d M=%lld N=%lld K=%lld max_abs=%.9g "
+                 "ref_absmax=%.9g relative=%.9g\n",
+                 tactic, static_cast<long long>(m), static_cast<long long>(n),
+                 static_cast<long long>(k), max_abs, ref_absmax,
+                 ref_absmax == 0.0 ? 0.0 : max_abs / ref_absmax);
+  }
+  CHECK(max_abs <= 0.03 * ref_absmax + 1e-3);
+
+  backend.Memset(queue, dout, 0, first.size() * sizeof(uint16_t));
+  backend.Synchronize(queue);
+  backend.BeginCapture(queue);
+  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, kAlpha);
+  void* graph = backend.EndCaptureGraph(queue);
+  REQUIRE(graph != nullptr);
+  backend.ReplayGraph(queue, graph);
+  backend.Synchronize(queue);
+  std::vector<uint16_t> replay(first.size());
+  backend.Copy(queue, replay.data(), dout, replay.size() * sizeof(uint16_t));
+  backend.Synchronize(queue);
+  CHECK(replay == first);
+  backend.DestroyGraph(graph);
+
+  if (const char* dump_dir = std::getenv("VT_FP4_TEST_DUMP_DIR"); dump_dir != nullptr) {
+    std::vector<uint8_t> gpu_a_packed(static_cast<size_t>(m * k / 2));
+    std::vector<uint8_t> gpu_a_sf(static_cast<size_t>(mp * kp));
+    std::vector<uint8_t> gpu_b_sf(static_cast<size_t>(np * kp));
+    backend.Copy(queue, gpu_a_packed.data(), da, gpu_a_packed.size());
+    backend.Copy(queue, gpu_a_sf.data(), dasw, gpu_a_sf.size());
+    backend.Copy(queue, gpu_b_sf.data(), dwsw, gpu_b_sf.size());
+    backend.Synchronize(queue);
+    const auto write = [dump_dir](const char* name, const void* data, size_t bytes) {
+      std::ofstream stream(std::string(dump_dir) + "/" + name,
+                           std::ios::binary | std::ios::trunc);
+      REQUIRE(stream.good());
+      stream.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+      REQUIRE(stream.good());
+    };
+    write("a_packed.bin", gpu_a_packed.data(), gpu_a_packed.size());
+    write("a_sf_sw.bin", gpu_a_sf.data(), gpu_a_sf.size());
+    write("b_packed.bin", w_packed.data(), w_packed.size());
+    write("b_sf_sw.bin", gpu_b_sf.data(), gpu_b_sf.size());
+    write("alpha.bin", &kAlpha, sizeof(kAlpha));
+    write("input_global_scale.bin", &kInputGlobalScale,
+          sizeof(kInputGlobalScale));
+    if (bf16_input) {
+      write("input_bf16.bin", x_bf16.data(), x_bf16.size() * sizeof(uint16_t));
+    }
+    write("out_bf16.bin", first.data(), first.size() * sizeof(uint16_t));
+    std::ofstream metadata(std::string(dump_dir) + "/shape.txt", std::ios::trunc);
+    REQUIRE(metadata.good());
+    metadata << m << ' ' << n << ' ' << k << ' ' << mp << ' ' << np << ' ' << kp << '\n';
+    REQUIRE(metadata.good());
+  }
+
+  for (void* pointer : {dx, dw, dws, da, das, dasw, dwsw, dout}) backend.Free(pointer);
+  backend.DestroyQueue(queue);
 }
 #endif  // VT_CUTLASS_NVFP4

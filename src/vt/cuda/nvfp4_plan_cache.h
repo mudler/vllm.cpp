@@ -53,9 +53,11 @@ inline uint32_t LegacyMBucket(uint32_t value) {
   return bucket < 16 ? 16 : bucket;
 }
 
-// Increment whenever the candidate ID/order or launch ABI changes. It is part
-// of the key now and becomes the persistent-cache compatibility version in W3.
-inline constexpr uint32_t kTacticSetVersion = 1;
+// W1 and W2 are deliberately distinct same-binary tactic ABIs. These values are
+// part of the key now and become persistent-cache compatibility versions in W3.
+inline constexpr uint32_t kW1TacticSetVersion = 1;
+inline constexpr uint32_t kFullTacticSetVersion = 2;
+inline constexpr uint32_t kTacticSetVersion = kFullTacticSetVersion;
 
 struct PlanKey {
   uint32_t m_bucket = 0;

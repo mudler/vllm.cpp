@@ -68,29 +68,55 @@ if(VLLM_CPP_CUDA)
   if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a")
     add_compile_definitions(VT_FP4_MMA_SM120A=1)
   endif()
-  # CUTLASS (header-only, v4.4.2) for the sm120a NVFP4 block-scaled fp4xfp4 GEMM
+  # CUTLASS (header-only, >=v4.5.0) for the sm120a NVFP4 block-scaled fp4xfp4 GEMM
   # drop-in (cuda_matmul_nvfp4_cutlass.cu). Vendored slice under third_party/cutlass
   # by default; override with -DVLLM_CPP_CUTLASS_DIR=<cutlass root> (must contain
   # include/ + tools/util/include/). The TU is enabled only when the dir exists and
   # the arch is sm_12xa (the block-scaled fp4 collective is Blackwell-only).
   set(VLLM_CPP_CUTLASS_DIR "${CMAKE_SOURCE_DIR}/third_party/cutlass"
       CACHE PATH "CUTLASS source root (include/ + tools/util/include/)")
-  # Opt-in FetchContent fallback (mirrors vLLM's own CUTLASS_REVISION v4.4.2): if
+  # Opt-in FetchContent fallback. FlashInfer 0.6.12's installed runtime bundles
+  # CUTLASS 4.5.0; its SM12 scale-factor TMA changes are required for the traced
+  # 128x32/128x64 tactics (4.4.2 rejects them at compile time).
   # no vendored/pointed cutlass tree is present, -DVLLM_CPP_CUTLASS_FETCH=ON pulls
-  # v4.4.2 (header-only). Default OFF so a tight-disk box (dgx) builds against an
+  # v4.5.0 (header-only). Default OFF so a tight-disk box (dgx) builds against an
   # existing clone via -DVLLM_CPP_CUTLASS_DIR instead of a 200MB download.
-  option(VLLM_CPP_CUTLASS_FETCH "FetchContent CUTLASS v4.4.2 if not found locally" OFF)
+  option(VLLM_CPP_CUTLASS_FETCH "FetchContent CUTLASS v4.5.0 if not found locally" OFF)
   if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
     FetchContent_Declare(cutlass GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-      GIT_TAG v4.4.2 GIT_SHALLOW ON)
+      GIT_TAG v4.5.0 GIT_SHALLOW ON)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
   if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
      AND EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    file(STRINGS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/version.h"
+      _CUTLASS_VERSION_LINES
+      REGEX "^#define CUTLASS_(MAJOR|MINOR|PATCH) [0-9]+")
+    foreach(_CUTLASS_VERSION_LINE IN LISTS _CUTLASS_VERSION_LINES)
+      if(_CUTLASS_VERSION_LINE MATCHES "^#define CUTLASS_MAJOR ([0-9]+)")
+        set(_CUTLASS_MAJOR "${CMAKE_MATCH_1}")
+      elseif(_CUTLASS_VERSION_LINE MATCHES "^#define CUTLASS_MINOR ([0-9]+)")
+        set(_CUTLASS_MINOR "${CMAKE_MATCH_1}")
+      elseif(_CUTLASS_VERSION_LINE MATCHES "^#define CUTLASS_PATCH ([0-9]+)")
+        set(_CUTLASS_PATCH "${CMAKE_MATCH_1}")
+      endif()
+    endforeach()
+    if(NOT DEFINED _CUTLASS_MAJOR OR NOT DEFINED _CUTLASS_MINOR OR
+       NOT DEFINED _CUTLASS_PATCH)
+      message(FATAL_ERROR "Could not read CUTLASS version from ${VLLM_CPP_CUTLASS_DIR}")
+    endif()
+    math(EXPR _CUTLASS_VERSION_NUMBER
+      "${_CUTLASS_MAJOR} * 10000 + ${_CUTLASS_MINOR} * 100 + ${_CUTLASS_PATCH}")
+    if(_CUTLASS_VERSION_NUMBER LESS 40500)
+      message(FATAL_ERROR
+        "CUTLASS >=4.5.0 is required for SM12 narrow-N NVFP4 tactics; found "
+        "${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH} at "
+        "${VLLM_CPP_CUTLASS_DIR}")
+    endif()
     set(VLLM_CPP_CUTLASS ON)
     message(STATUS "CUTLASS found at ${VLLM_CPP_CUTLASS_DIR}; enabling sm120a NVFP4 cutlass GEMM")
   else()
@@ -255,20 +281,52 @@ if(VLLM_CPP_CUDA)
   # tree + relaxed-constexpr/extended-lambda, so it never touches the general
   # build. Gated by VT_CUTLASS_NVFP4 so the host op path no-ops if not compiled.
   if(VLLM_CPP_CUTLASS)
-    # Both cutlass GEMM TUs share the same isolated heavy-include discipline.
-    # NVFP4 W4A4 (VT_CUTLASS_NVFP4) + per-tensor W8A8 fp8 (VT_CUTLASS_FP8).
-    target_sources(vllm PRIVATE
+    # The 32 NVFP4 tactics are split four instantiations per tile TU. A single
+    # monolithic nvcc process for all swap/scheduler variants exceeds practical
+    # compiler memory on GB10; the dispatcher and immutable W1 fallback remain
+    # separate so VT_FP4_FULL_TACTICS=0 is an exact same-binary comparison.
+    set(_NVFP4_FLASHINFER_TACTIC_SOURCES
+      src/vt/cuda/cuda_nvfp4_tactics_128x32x128.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x32x256.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x64x128.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x64x256.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x128x128.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x128x256.cu
+      src/vt/cuda/cuda_nvfp4_tactics_256x128x128.cu
+      src/vt/cuda/cuda_nvfp4_tactics_128x256x128.cu)
+    set(_NVFP4_CUTLASS_SOURCES
       src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu
+      src/vt/cuda/cuda_nvfp4_tactics_w1.cu
+      ${_NVFP4_FLASHINFER_TACTIC_SOURCES})
+    target_sources(vllm PRIVATE
+      ${_NVFP4_CUTLASS_SOURCES}
       src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
     target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1 VT_CUTLASS_FP8=1)
     # cutlass headers reach via -isystem so their internal deprecation warnings
     # are exempt from the global -Werror=all-warnings (the general build stays
     # strict). --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.
     set_source_files_properties(
-      src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu
+      ${_NVFP4_CUTLASS_SOURCES}
       src/vt/cuda/cuda_matmul_fp8_cutlass.cu PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
+    # Keep the split 32-tactic family on FlashInfer's semantic CUDA compile
+    # envelope. These definitions are source-scoped: the general CUDA backend,
+    # immutable W1 fallback and FP8 adapter retain the project defaults.
+    set_property(SOURCE ${_NVFP4_FLASHINFER_TACTIC_SOURCES} APPEND PROPERTY
+      COMPILE_DEFINITIONS
+        CUTLASS_ENABLE_GDC_FOR_SM100=1
+        FLASHINFER_ENABLE_FP8_E8M0
+        FLASHINFER_ENABLE_FP4_E2M1
+        FLASHINFER_ENABLE_F16
+        FLASHINFER_ENABLE_BF16
+        FLASHINFER_ENABLE_FP8_E4M3
+        FLASHINFER_ENABLE_FP8_E5M2
+        ENABLE_BF16
+        ENABLE_FP4)
+    set_property(SOURCE ${_NVFP4_FLASHINFER_TACTIC_SOURCES} APPEND PROPERTY
+      COMPILE_OPTIONS
+        "$<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false;-use_fast_math>")
   endif()
   # Marlin NVFP4 MoE: two vendored TUs (the marlin_mm dispatcher + the generated
   # bf16 NVFP4 kernel instantiations) + the vt::Tensor launcher. All three need

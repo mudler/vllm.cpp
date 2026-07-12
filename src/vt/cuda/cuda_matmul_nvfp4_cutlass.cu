@@ -1,18 +1,12 @@
-// vllm.cpp — cutlass sm120a NVFP4 block-scaled fp4xfp4 GEMM drop-in.
+// vllm.cpp — SM120/SM121 NVFP4 block-scaled FP4xFP4 GEMM adapter.
 //
-// This is a 1:1 lift of vLLM's `cutlass_scaled_fp4_mm_sm120a`
-// (csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu @
-// e24d1b24) — the near-peak Blackwell/GeForce block-scaled fp4 GEMM (cutlass
-// example 79b), the kernel vLLM selects on GB10/sm_121 for W4A4 NVFP4. The only
-// change is the host surface: torch::stable::Tensor -> vt::Tensor (data_ptr ->
-// .data, torch::stable::empty(workspace)/DeviceGuard -> cudaMallocAsync + our
-// stream). The GEMM math and the CollectiveBuilder config are verbatim.
-//
-// Isolated TU (heavy cutlass templates, ~34s compile) — built only for
-// sm_12{0,1}a. Pairs with SwizzleBlockscale (below), the lift of vLLM's
-// swizzle_blockscale (nvfp4_utils.py:13-53) that lays the linear fp8 block
-// scales into the atom layout Sm1xxBlkScaledConfig::tile_atom_to_shape_SF{A,B}
-// reads. See .agents/specs/cutlass-dropin-feasibility.md and qwen27b-w4a4-notes.md §7.
+// The raw kernels are split across cuda_nvfp4_tactics_*.cu. The full default
+// surface mirrors installed FlashInfer 0.6.12
+// `fp4_gemm_cutlass_template_sm120.h:47-220`: 8 CTA tiles x swap-AB x
+// StaticPersistent/Stream-K in exact upstream order. The immutable W1 four-
+// candidate implementation is retained separately for VT_FP4_FULL_TACTICS=0.
+// This TU owns vt::Tensor validation/registration, exact hybrid-bucket tuning,
+// high-water workspace reuse, forced-tactic diagnostics and scale swizzling.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -23,25 +17,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "cutlass/cutlass.h"
-
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
-#include "cutlass/gemm/kernel/gemm_universal.hpp"
-
-#include "cutlass/util/packed_stride.hpp"
-
+#include "vt/cuda/nvfp4_cutlass_tactics.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/ops.h"
-
-using namespace cute;
 
 namespace vt::cuda {
 namespace {
@@ -55,12 +40,9 @@ void Check(cudaError_t err, const char* what) {
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
 
-// Persistent per-stream GEMM scratch (alpha scalar + grown-on-demand cutlass
-// workspace + bf16 output staging). Replaces the per-call cudaMallocAsync /
-// cudaFreeAsync churn (up to 3 async allocs + frees PER GEMM). Reuse is safe
-// under the forward's single-stream ordering: a buffer handed to one GEMM is
-// fully consumed before the next GEMM on the SAME stream is issued. Buffers grow
-// monotonically and leak at process exit. VT_CUTLASS_NOPOOL=1 restores per-call.
+// Queue-scoped grow-only scratch. The unique_ptr keeps returned references
+// stable if a later queue insertion rehashes the map. W3 replaces process-exit
+// retention with the common backend resource lifecycle.
 struct StreamScratch {
   float* alpha = nullptr;
   void* workspace = nullptr;
@@ -71,296 +53,139 @@ struct StreamScratch {
 
 bool CutlassPoolEnabled() {
   static const bool on = [] {
-    const char* e = std::getenv("VT_CUTLASS_NOPOOL");
-    return !(e != nullptr && e[0] == '1');
+    const char* value = std::getenv("VT_CUTLASS_NOPOOL");
+    return !(value != nullptr && value[0] == '1');
   }();
   return on;
 }
 
-StreamScratch& ScratchFor(cudaStream_t s) {
-  static std::mutex mu;
-  static std::unordered_map<cudaStream_t, StreamScratch> m;
-  std::lock_guard<std::mutex> lk(mu);
-  return m[s];
+StreamScratch& ScratchFor(cudaStream_t stream) {
+  static std::mutex mutex;
+  static std::unordered_map<cudaStream_t, std::unique_ptr<StreamScratch>> scratch_by_stream;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto& scratch = scratch_by_stream[stream];
+  if (!scratch) scratch = std::make_unique<StreamScratch>();
+  return *scratch;
 }
 
-void* EnsureScratch(void** buf, size_t* have, size_t need, cudaStream_t s, const char* what) {
-  if (need > *have) {
-    if (*buf != nullptr) Check(cudaFreeAsync(*buf, s), "cudaFreeAsync scratch grow");
-    Check(cudaMallocAsync(buf, need, s), what);
-    *have = need;
+void* EnsureScratch(void** buffer, size_t* capacity, size_t required, cudaStream_t stream,
+                    const char* what) {
+  if (required > *capacity) {
+    if (*buffer != nullptr) Check(cudaFreeAsync(*buffer, stream), "cudaFreeAsync scratch grow");
+    Check(cudaMallocAsync(buffer, required, stream), what);
+    *capacity = required;
   }
-  return *buf;
+  return *buffer;
 }
 
-float* PersistentAlpha(cudaStream_t s) {
-  StreamScratch& sc = ScratchFor(s);
-  if (sc.alpha == nullptr) Check(cudaMallocAsync(&sc.alpha, sizeof(float), s), "cudaMallocAsync alpha");
-  return sc.alpha;
+float* PersistentAlpha(cudaStream_t stream) {
+  StreamScratch& scratch = ScratchFor(stream);
+  if (scratch.alpha == nullptr) {
+    Check(cudaMallocAsync(&scratch.alpha, sizeof(float), stream), "cudaMallocAsync alpha");
+  }
+  return scratch.alpha;
 }
 
-#define VT_CUTLASS_CHECK(status)                                                    \
-  do {                                                                              \
-    cutlass::Status s_ = (status);                                                  \
-    if (s_ != cutlass::Status::kSuccess) {                                          \
-      throw std::runtime_error(std::string("vt cuda: matmul_nvfp4_cutlass: cutlass ") + \
-                               cutlassGetStatusString(s_));                         \
-    }                                                                               \
-  } while (0)
-
-// ---- vLLM Fp4GemmSm120 collective config (verbatim, :53-127) ---------------
-struct sm120_fp4_config_M256 {
-  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileScheduler = void;
-  using ClusterShape = Shape<_1, _1, _1>;
-  using MmaTileShape = Shape<_128, _128, _128>;
-  using PerSmTileShape_MNK = Shape<_128, _128, _128>;
-};
-
-struct sm120_fp4_config_default {
-  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileScheduler = cutlass::gemm::PersistentScheduler;
-  using ClusterShape = Shape<_1, _1, _1>;
-  using MmaTileShape = Shape<_256, _128, _128>;
-  using PerSmTileShape_MNK = Shape<_256, _128, _128>;
-};
-
-// ---- Autotunable tile set (mirrors flashinfer's sm120/121 fp4 cutlass configs)
-// The flashinfer FlashInferCutlassNvFp4LinearKernel autotuner (the WHAT vLLM
-// selects among with enable_flashinfer_autotune=True on GB10) tunes over 8 CTA
-// tile shapes, all with 1x1x1 cluster on this target. Source (flashinfer 0.5.x):
-//   - jit/gemm/core.py::gen_gemm_sm120_module_cutlass_fp4 cta_m_n_k_list, and
-//   - include/flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h
-//     CutlassFp4GemmRunner::getConfigs() (CutlassTileConfigSM120 enum).
-// The 8 (CTA_M, CTA_N, CTA_K) tiles (K already the true cutlass tile-K, i.e. the
-// enum's "…64B"/"…128B" doubled to 128/256):
-//   128x32x128  128x32x256  128x64x128  128x64x256
-//   128x128x128 128x128x256 256x128x128 128x256x128
-//
-// W1 retains the existing four N>=128 persistent candidates while repairing M
-// identity and cache concurrency. This is intentionally NOT the complete
-// FlashInfer surface: its explicit ElementC=void epilogue supports N={32,64}
-// tiles, swap-AB and Stream-K, and the exact 27B trace selects those families.
-// The accepted W2 in .agents/specs/nvfp4-small-m-dispatch.md ports all 32
-// tactics separately so this checkpoint's gain remains attributable.
-template <int TileM, int TileN, int TileK,
-          typename Sched = cutlass::gemm::PersistentScheduler>
-struct sm120_fp4_tile {
-  using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileScheduler = Sched;
-  using ClusterShape = Shape<_1, _1, _1>;
-  using MmaTileShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
-  using PerSmTileShape_MNK = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
-};
-
-template <typename Config, typename OutType>
-struct Fp4GemmSm120 {
-  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
-  using LayoutATag = cutlass::layout::RowMajor;
-  static constexpr int AlignmentA = 32;
-
-  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
-  using LayoutBTag = cutlass::layout::ColumnMajor;
-  static constexpr int AlignmentB = 32;
-
-  using ElementD = OutType;
-  using ElementC = OutType;
-  using LayoutCTag = cutlass::layout::RowMajor;
-  using LayoutDTag = cutlass::layout::RowMajor;
-  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
-
-  using ElementAccumulator = float;
-  using ArchTag = cutlass::arch::Sm120;
-  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
-
-  using MmaTileShape = typename Config::MmaTileShape;
-  using ClusterShape = typename Config::ClusterShape;
-  using PerSmTileShape_MNK = typename Config::PerSmTileShape_MNK;
-
-  using CollectiveEpilogue =
-      typename cutlass::epilogue::collective::CollectiveBuilder<
-          ArchTag, OperatorClass, PerSmTileShape_MNK, ClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
-          ElementAccumulator, ElementC, LayoutCTag, AlignmentC, ElementD,
-          LayoutDTag, AlignmentD,
-          typename Config::EpilogueSchedule>::CollectiveOp;
-
-  using CollectiveMainloop =
-      typename cutlass::gemm::collective::CollectiveBuilder<
-          ArchTag, OperatorClass, ElementA, LayoutATag, AlignmentA, ElementB,
-          LayoutBTag, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          typename Config::KernelSchedule>::CollectiveOp;
-
-  using TileScheduler = typename Config::TileScheduler;
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
-                                           CollectiveMainloop, CollectiveEpilogue,
-                                           TileScheduler>;
-
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-};
-
-// ---- args_from_options (vLLM :129-175), raw-pointer surface ----------------
-template <typename Gemm>
-typename Gemm::Arguments ArgsFromRawPtrs(void* D, const void* A, const void* B, const void* A_sf,
-                                         const void* B_sf, const float* alpha, int M, int N,
-                                         int K) {
-  using ElementA = typename Gemm::ElementA;
-  using ElementB = typename Gemm::ElementB;
-  using ElementD = typename Gemm::ElementD;
-  using ElementSFA = cutlass::float_ue4m3_t;
-  using ElementSFB = cutlass::float_ue4m3_t;
-  using ElementCompute = float;
-
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
-
-  using Sm1xxBlkScaledConfig =
-      typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
-
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-
-  auto layout_SFA =
-      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
-  auto layout_SFB =
-      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {M, N, K, 1},
-      {static_cast<ElementA const*>(A), stride_A, static_cast<ElementB const*>(B), stride_B,
-       static_cast<ElementSFA const*>(A_sf), layout_SFA,
-       static_cast<ElementSFB const*>(B_sf), layout_SFB},
-      {{},
-       static_cast<ElementD const*>(D),
-       stride_D,
-       static_cast<ElementD*>(D),
-       stride_D}};
-  auto& fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha);
-  return arguments;
-}
-
-template <typename Gemm>
-void RunGemm(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-             const float* alpha, int M, int N, int K, cudaStream_t stream) {
-  Gemm gemm;
-  auto arguments = ArgsFromRawPtrs<Gemm>(D, A, B, A_sf, B_sf, alpha, M, N, K);
-
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  void* workspace = nullptr;
-  const bool pool = CutlassPoolEnabled();
-  if (workspace_size > 0) {
-    if (pool) {
-      StreamScratch& sc = ScratchFor(stream);
-      workspace = EnsureScratch(&sc.workspace, &sc.workspace_bytes, workspace_size, stream,
-                                "cudaMallocAsync workspace");
-    } else {
-      Check(cudaMallocAsync(&workspace, workspace_size, stream), "cudaMallocAsync workspace");
+const std::vector<nvfp4::Candidate>& FullCandidates() {
+  static const std::vector<nvfp4::Candidate> candidates = [] {
+    std::vector<nvfp4::Candidate> result;
+    result.reserve(nvfp4::kFullTacticDescriptors.size());
+    const auto append = [&](const nvfp4::CandidateGroup& group) {
+      result.insert(result.end(), group.begin(), group.end());
+    };
+    append(nvfp4::FullTactics128x32x128());
+    append(nvfp4::FullTactics128x32x256());
+    append(nvfp4::FullTactics128x64x128());
+    append(nvfp4::FullTactics128x64x256());
+    append(nvfp4::FullTactics128x128x128());
+    append(nvfp4::FullTactics128x128x256());
+    append(nvfp4::FullTactics256x128x128());
+    append(nvfp4::FullTactics128x256x128());
+    if (result.size() != nvfp4::kFullTacticDescriptors.size()) {
+      throw std::runtime_error("NVFP4 full tactic table has the wrong size");
     }
-  }
-  VT_CUTLASS_CHECK(gemm.can_implement(arguments));
-  VT_CUTLASS_CHECK(gemm.initialize(arguments, workspace, stream));
-  VT_CUTLASS_CHECK(gemm.run(arguments, workspace, stream));
-  if (workspace && !pool) Check(cudaFreeAsync(workspace, stream), "cudaFreeAsync workspace");
+    for (size_t i = 0; i < result.size(); ++i) {
+      if (result[i].descriptor.id != static_cast<int>(i)) {
+        throw std::runtime_error("NVFP4 full tactic table violates stable upstream order");
+      }
+    }
+    return result;
+  }();
+  return candidates;
 }
 
-// Dispatch by M (vLLM cutlass_fp4_gemm_dispatch, :202-231). OutType = bf16.
-template <typename OutType>
-void Fp4GemmDispatch(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                     const float* alpha, int m, int n, int k, cudaStream_t stream) {
-  auto next_pow_2 = [](uint32_t v) {
-    if (v <= 1) return 1u;
-    v--;
-    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-    return v + 1;
-  };
-  uint32_t const mp2 = std::max<uint32_t>(16u, next_pow_2(static_cast<uint32_t>(m)));
-  if (mp2 <= 256) {
-    RunGemm<typename Fp4GemmSm120<sm120_fp4_config_M256, OutType>::Gemm>(
-        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  } else {
-    RunGemm<typename Fp4GemmSm120<sm120_fp4_config_default, OutType>::Gemm>(
-        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  }
+const std::vector<nvfp4::Candidate>& LegacyCandidates() {
+  static const std::vector<nvfp4::Candidate> candidates = [] {
+    const auto& group = nvfp4::W1Tactics();
+    return std::vector<nvfp4::Candidate>(group.begin(), group.end());
+  }();
+  return candidates;
 }
 
-// ---- Per-shape tile autotune (VT_FP4_AUTOTUNE, default OFF) -----------------
-// Mirrors vLLM's FlashInferCutlassNvFp4LinearKernel autotune (choose_one over
-// the tile candidates): on first sight of a (Mbucket,N,K) shape, micro-bench the
-// instantiated tiles on the REAL operands and cache the winner keyed by the
-// shape. The projection shapes repeat every layer/step, so the one-time tune
-// amortizes to ~0. Default OFF; the fixed 2-way M-dispatch above is the
-// baseline/fallback (and candidate 0/1 are byte-identical to it). OutType is
-// always bf16 here (the epilogue only emits bf16; f32-out projections go through
-// a bf16 scratch upstream), so the candidate table is bf16-only.
-using Fp4RunFn = void (*)(void*, const void*, const void*, const void*, const void*,
-                          const float*, int, int, int, cudaStream_t);
-
-template <typename Config>
-void RunTileBf16(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                 const float* alpha, int m, int n, int k, cudaStream_t s) {
-  RunGemm<typename Fp4GemmSm120<Config, cutlass::bfloat16_t>::Gemm>(D, A, B, A_sf, B_sf, alpha, m,
-                                                                    n, k, s);
-}
-
-struct Fp4Candidate {
-  const char* name;
-  Fp4RunFn run;
-};
-
-// The candidate set = flashinfer's four N>=128 sm120 tiles. Index 0/1 are the
-// fixed-dispatch baselines (identical to the OFF path); 2/3 are the extra tiles.
-const std::vector<Fp4Candidate>& Fp4Candidates() {
-  static const std::vector<Fp4Candidate> c = {
-      {"128x128x128", &RunTileBf16<sm120_fp4_config_M256>},     // baseline for M<=256
-      {"256x128x128", &RunTileBf16<sm120_fp4_config_default>},  // baseline for M>256
-      {"128x128x256", &RunTileBf16<sm120_fp4_tile<128, 128, 256>>},
-      {"128x256x128", &RunTileBf16<sm120_fp4_tile<128, 256, 128>>},
-  };
-  return c;
-}
-
-// DEFAULT ON (opt-out VT_FP4_AUTOTUNE=0 for an A/B). Per-shape tile autotune of
-// the dense-27B W4A4 fp4 GEMM. MEASURED (GB10, Triton-fast branch, same-binary
-// A/B vs graphed vLLM): +1.2% conc16 / +6.4% conc32 e2e, token-exact 16/16 (27B),
-// 35B inert (its dense is fp8 cuBLASLt / Marlin W4A16, never this cutlass GEMM).
-// CUDA-GRAPH SAFE: a ready hit performs no CUDA query/allocation/sync. On a miss
-// the adapter queries cudaStreamIsCapturing and fails loudly before creating
-// events when capture is active. The dense graph warmup should still populate
-// every exact M bucket eagerly; the explicit rejection makes that invariant
-// executable instead of relying on a comment.
 bool Fp4AutotuneEnabled() {
   static const bool on = [] {
-    const char* e = std::getenv("VT_FP4_AUTOTUNE");
-    return e == nullptr || e[0] != '0';
+    const char* value = std::getenv("VT_FP4_AUTOTUNE");
+    return value == nullptr || value[0] != '0';
   }();
   return on;
 }
 
 bool Fp4AutotuneVerbose() {
   static const bool on = [] {
-    const char* e = std::getenv("VT_FP4_AUTOTUNE_VERBOSE");
-    return e != nullptr && e[0] == '1';
+    const char* value = std::getenv("VT_FP4_AUTOTUNE_VERBOSE");
+    return value != nullptr && value[0] == '1';
   }();
   return on;
 }
 
 bool Fp4ExactBucketsEnabled() {
   static const bool on = [] {
-    const char* e = std::getenv("VT_FP4_EXACT_BUCKETS");
-    return e == nullptr || e[0] != '0';
+    const char* value = std::getenv("VT_FP4_EXACT_BUCKETS");
+    return value == nullptr || value[0] != '0';
   }();
   return on;
+}
+
+bool Fp4FullTacticsEnabled() {
+  static const bool on = [] {
+    const char* value = std::getenv("VT_FP4_FULL_TACTICS");
+    return value == nullptr || value[0] != '0';
+  }();
+  return on;
+}
+
+bool Fp4PlanCacheEnabled() {
+  static const bool on = [] {
+    const char* value = std::getenv("VT_FP4_PLAN_CACHE");
+    return value == nullptr || value[0] != '0';
+  }();
+  return on;
+}
+
+int Fp4ForcedTactic() {
+  static const int tactic = [] {
+    const char* value = std::getenv("VT_FP4_FORCE_TACTIC");
+    if (value == nullptr || value[0] == '\0') return -1;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 ||
+        parsed >= static_cast<long>(nvfp4::kFullTacticDescriptors.size())) {
+      throw std::runtime_error("VT_FP4_FORCE_TACTIC must be an integer in [0,31]");
+    }
+    return static_cast<int>(parsed);
+  }();
+  return tactic;
+}
+
+const std::vector<nvfp4::Candidate>& ActiveCandidates() {
+  return Fp4FullTacticsEnabled() ? FullCandidates() : LegacyCandidates();
+}
+
+int CandidateIndexForId(const std::vector<nvfp4::Candidate>& candidates, int tactic_id) {
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (candidates[i].descriptor.id == tactic_id) return static_cast<int>(i);
+  }
+  return -1;
 }
 
 int Fp4DeviceArchitecture(int device_ordinal) {
@@ -386,209 +211,323 @@ int Fp4DeviceArchitecture(int device_ordinal) {
   return architecture;
 }
 
-constexpr float kFp4Inf = 3.4e38f;
+struct WorkspaceLease {
+  void* data = nullptr;
+  bool ephemeral = false;
+};
 
-// Time one candidate on the real operands (warmup + iters); kFp4Inf on failure
-// (unsupported tile / cutlass error) so the selector skips it. Runs write D
-// (garbage between candidates); the caller re-runs the winner for the real out.
-float Fp4TimeCandidate(const Fp4Candidate& cand, void* D, const void* A, const void* B,
-                       const void* A_sf, const void* B_sf, const float* alpha, int m, int n, int k,
-                       cudaStream_t s) {
-  constexpr int kWarm = 3, kIter = 10;
-  cudaEvent_t e0 = nullptr, e1 = nullptr;
+WorkspaceLease AcquireWorkspace(size_t required, cudaStream_t stream) {
+  if (required == 0) return {};
+  if (!CutlassPoolEnabled()) {
+    void* workspace = nullptr;
+    Check(cudaMallocAsync(&workspace, required, stream), "cudaMallocAsync workspace");
+    return WorkspaceLease{workspace, true};
+  }
+
+  StreamScratch& scratch = ScratchFor(stream);
+  if (required > scratch.workspace_bytes) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(stream, &status), "query stream capture before workspace growth");
+    if (status != cudaStreamCaptureStatusNone) {
+      throw std::runtime_error("NVFP4 workspace high-water miss during CUDA graph capture");
+    }
+    EnsureScratch(&scratch.workspace, &scratch.workspace_bytes, required, stream,
+                  "cudaMallocAsync workspace high-water");
+  }
+  return WorkspaceLease{scratch.workspace, false};
+}
+
+void ReleaseWorkspace(WorkspaceLease lease, cudaStream_t stream) {
+  if (lease.ephemeral && lease.data != nullptr) {
+    Check(cudaFreeAsync(lease.data, stream), "cudaFreeAsync workspace");
+  }
+}
+
+size_t WorkspaceHighWater(const std::vector<nvfp4::Candidate>& candidates,
+                          const nvfp4::LaunchParams& params) {
+  size_t high_water = 0;
+  size_t query_count = 0;
+  for (const auto& candidate : candidates) {
+    try {
+      high_water = std::max(high_water, candidate.workspace_size(params));
+      ++query_count;
+    } catch (const std::exception&) {
+      // Same as FlashInfer getWorkspaceSizeImpl: configurations rejected by
+      // CUTLASS during the query do not suppress the remaining tactic family.
+    }
+  }
+  if (query_count == 0) throw std::runtime_error("no NVFP4 tactic workspace query succeeded");
+  return high_water;
+}
+
+void RunCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams params,
+                  WorkspaceLease workspace, size_t workspace_bytes) {
+  params.workspace = workspace.data;
+  params.workspace_bytes = workspace_bytes;
+  candidate.run(params);
+}
+
+constexpr float kFp4Inf = 3.4e38F;
+
+float TimeCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams params,
+                    WorkspaceLease workspace, size_t workspace_bytes) {
+  constexpr int kWarmupIterations = 3;
+  constexpr int kTimingIterations = 10;
+  cudaEvent_t begin = nullptr;
+  cudaEvent_t end = nullptr;
   try {
-    for (int i = 0; i < kWarm; ++i) cand.run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
-    Check(cudaEventCreate(&e0), "autotune event create e0");
-    Check(cudaEventCreate(&e1), "autotune event create e1");
-    Check(cudaEventRecord(e0, s), "autotune record e0");
-    for (int i = 0; i < kIter; ++i) cand.run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
-    Check(cudaEventRecord(e1, s), "autotune record e1");
-    Check(cudaEventSynchronize(e1), "autotune sync");
-    float ms = 0.0f;
-    Check(cudaEventElapsedTime(&ms, e0, e1), "autotune elapsed");
-    cudaEventDestroy(e0);
-    cudaEventDestroy(e1);
-    return ms / kIter;
+    for (int i = 0; i < kWarmupIterations; ++i) {
+      RunCandidate(candidate, params, workspace, workspace_bytes);
+    }
+    Check(cudaEventCreate(&begin), "autotune event create begin");
+    Check(cudaEventCreate(&end), "autotune event create end");
+    Check(cudaEventRecord(begin, params.stream), "autotune event record begin");
+    for (int i = 0; i < kTimingIterations; ++i) {
+      RunCandidate(candidate, params, workspace, workspace_bytes);
+    }
+    Check(cudaEventRecord(end, params.stream), "autotune event record end");
+    Check(cudaEventSynchronize(end), "autotune event synchronize");
+    float elapsed_ms = 0.0F;
+    Check(cudaEventElapsedTime(&elapsed_ms, begin, end), "autotune event elapsed");
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    return elapsed_ms / kTimingIterations;
   } catch (const std::exception&) {
-    if (e0 != nullptr) cudaEventDestroy(e0);
-    if (e1 != nullptr) cudaEventDestroy(e1);
-    cudaGetLastError();  // clear any sticky launch error from the failed candidate
+    if (begin != nullptr) cudaEventDestroy(begin);
+    if (end != nullptr) cudaEventDestroy(end);
+    cudaGetLastError();
     return kFp4Inf;
   }
 }
 
-// Pick + cache the best tile candidate index for a (Mbucket,N,K) shape.
-int Fp4SelectPlan(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                  const float* alpha, int m, int n, int k, int device_ordinal,
-                  cudaStream_t s) {
+struct SelectedPlan {
+  int candidate_index = -1;
+  int tactic_id = -1;
+  size_t workspace_bytes = 0;
+};
+
+SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
+  const auto& candidates = ActiveCandidates();
+  const bool full_tactics = Fp4FullTacticsEnabled();
   const uint32_t m_bucket = Fp4ExactBucketsEnabled()
-                                ? nvfp4::HybridMBucket(static_cast<uint32_t>(m))
-                                : nvfp4::LegacyMBucket(static_cast<uint32_t>(m));
+                                ? nvfp4::HybridMBucket(static_cast<uint32_t>(params.m))
+                                : nvfp4::LegacyMBucket(static_cast<uint32_t>(params.m));
   const nvfp4::PlanKey key{m_bucket,
-                           n,
-                           k,
+                           params.n,
+                           params.k,
                            device_ordinal,
                            Fp4DeviceArchitecture(device_ordinal),
                            static_cast<uint8_t>(DType::kBF16),
-                           nvfp4::kTacticSetVersion};
-  static nvfp4::SingleFlightPlanCache<int> plans;
+                           full_tactics ? nvfp4::kFullTacticSetVersion
+                                        : nvfp4::kW1TacticSetVersion};
+  static nvfp4::SingleFlightPlanCache<SelectedPlan> plans;
 
-  auto can_tune = [s] {
+  const auto can_tune = [stream = params.stream] {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    Check(cudaStreamIsCapturing(s, &status), "query stream capture state");
+    Check(cudaStreamIsCapturing(stream, &status), "query stream capture state");
     return status == cudaStreamCaptureStatusNone;
   };
-  auto tune = [&] {
-    const auto& cands = Fp4Candidates();
-    const int baseline = (m_bucket <= 256) ? 0 : 1;
-    std::vector<float> timings(cands.size(), kFp4Inf);
-    for (size_t i = 0; i < cands.size(); ++i) {
-      timings[i] =
-          Fp4TimeCandidate(cands[i], D, A, B, A_sf, B_sf, alpha, m, n, k, s);
+  const auto tune = [&] {
+    const size_t high_water = WorkspaceHighWater(candidates, params);
+    WorkspaceLease workspace = AcquireWorkspace(high_water, params.stream);
+    try {
+      const int forced = Fp4ForcedTactic();
+      if (forced >= 0) {
+        const int index = CandidateIndexForId(candidates, forced);
+        if (index < 0) {
+          throw std::runtime_error("forced NVFP4 tactic is not present in the active tactic set");
+        }
+        ReleaseWorkspace(workspace, params.stream);
+        return SelectedPlan{index, forced, high_water};
+      }
+
+      std::vector<float> timings(candidates.size(), kFp4Inf);
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        timings[i] = TimeCandidate(candidates[i], params, workspace, high_water);
+      }
+      int best = -1;
+      for (size_t i = 0; i < timings.size(); ++i) {
+        if (timings[i] < kFp4Inf &&
+            (best < 0 || timings[i] < timings[static_cast<size_t>(best)])) {
+          best = static_cast<int>(i);
+        }
+      }
+      if (best < 0) throw std::runtime_error("all NVFP4 tactics rejected the requested shape");
+
+      // W1 used a >1% threshold relative to its fixed M baseline. Preserve that
+      // only in the fallback arm. FlashInfer's full autotuner chooses the
+      // minimum valid event time directly.
+      int chosen = best;
+      int baseline = (m_bucket <= 256) ? 0 : 1;
+      if (!full_tactics && timings[static_cast<size_t>(baseline)] < kFp4Inf &&
+          !(timings[static_cast<size_t>(best)] <
+            timings[static_cast<size_t>(baseline)] * 0.99F)) {
+        chosen = baseline;
+      }
+      if (Fp4AutotuneVerbose()) {
+        std::fprintf(stderr,
+                     "[VT_FP4_AUTOTUNE] set=%s M=%d(bucket=%u) N=%d K=%d device=%d sm=%d "
+                     "-> id=%d %s (%.1f us), workspace=%zu\n",
+                     full_tactics ? "full" : "w1", params.m, m_bucket, params.n, params.k,
+                     device_ordinal, key.architecture, candidates[static_cast<size_t>(chosen)].descriptor.id,
+                     candidates[static_cast<size_t>(chosen)].descriptor.name,
+                     timings[static_cast<size_t>(chosen)] * 1000.0F, high_water);
+      }
+      ReleaseWorkspace(workspace, params.stream);
+      return SelectedPlan{chosen, candidates[static_cast<size_t>(chosen)].descriptor.id, high_water};
+    } catch (...) {
+      ReleaseWorkspace(workspace, params.stream);
+      throw;
     }
-    int best = baseline;
-    for (size_t i = 0; i < cands.size(); ++i) {
-      if (timings[i] < timings[static_cast<size_t>(best)]) best = static_cast<int>(i);
-    }
-    // Only leave the proven baseline for a >1% win. This rejects timing noise
-    // without changing the exact bucket or single-flight contract.
-    const int chosen = timings[static_cast<size_t>(best)] <
-                               timings[static_cast<size_t>(baseline)] * 0.99f
-                           ? best
-                           : baseline;
-    if (Fp4AutotuneVerbose()) {
-      fprintf(stderr,
-              "[VT_FP4_AUTOTUNE] M=%d(bucket=%u) N=%d K=%d device=%d sm=%d -> %s "
-              "(%.1f us); baseline %s (%.1f us)\n",
-              m, m_bucket, n, k, device_ordinal, key.architecture,
-              cands[static_cast<size_t>(chosen)].name,
-              timings[static_cast<size_t>(chosen)] * 1000.0f,
-              cands[static_cast<size_t>(baseline)].name,
-              timings[static_cast<size_t>(baseline)] * 1000.0f);
-    }
-    return chosen;
   };
+  if (!Fp4PlanCacheEnabled()) {
+    if (!can_tune()) {
+      throw std::runtime_error(
+          "NVFP4 plan-cache bypass cannot select a tactic during CUDA graph capture");
+    }
+    return tune();
+  }
   return nvfp4::ResolvePlan(plans, key, can_tune, tune);
 }
 
-// bf16-out fp4 GEMM entry: fixed dispatch (default) or per-shape autotuned tile.
-void Fp4GemmRunBf16(void* D, const void* A, const void* B, const void* A_sf, const void* B_sf,
-                    const float* alpha, int m, int n, int k, int device_ordinal,
-                    cudaStream_t s) {
-  if (!Fp4AutotuneEnabled()) {
-    Fp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
-    return;
+void RunFixedW1(nvfp4::LaunchParams params) {
+  const auto& candidates = LegacyCandidates();
+  const size_t index = params.m <= 256 ? 0 : 1;
+  const size_t workspace_bytes = candidates[index].workspace_size(params);
+  WorkspaceLease workspace = AcquireWorkspace(workspace_bytes, params.stream);
+  try {
+    RunCandidate(candidates[index], params, workspace, workspace_bytes);
+    ReleaseWorkspace(workspace, params.stream);
+  } catch (...) {
+    ReleaseWorkspace(workspace, params.stream);
+    throw;
   }
-  const int idx = Fp4SelectPlan(D, A, B, A_sf, B_sf, alpha, m, n, k, device_ordinal, s);
-  Fp4Candidates()[static_cast<size_t>(idx)].run(D, A, B, A_sf, B_sf, alpha, m, n, k, s);
 }
 
-// ---- SwizzleBlockscale kernel (lift of vllm swizzle_blockscale) ------------
+void Fp4GemmRunBf16(void* d, const void* a, const void* b, const void* a_sf, const void* b_sf,
+                    const float* alpha, int m, int n, int k, int device_ordinal,
+                    cudaStream_t stream) {
+  nvfp4::LaunchParams params{d, a, b, a_sf, b_sf, alpha, m, n, k, nullptr, 0, stream};
+  if (!Fp4AutotuneEnabled() && Fp4ForcedTactic() < 0) {
+    RunFixedW1(params);
+    return;
+  }
+
+  const SelectedPlan plan = SelectPlan(params, device_ordinal);
+  const auto& candidates = ActiveCandidates();
+  if (plan.candidate_index < 0 ||
+      static_cast<size_t>(plan.candidate_index) >= candidates.size() ||
+      candidates[static_cast<size_t>(plan.candidate_index)].descriptor.id != plan.tactic_id) {
+    throw std::runtime_error("NVFP4 selected plan does not match the active tactic ABI");
+  }
+  WorkspaceLease workspace = AcquireWorkspace(plan.workspace_bytes, stream);
+  try {
+    RunCandidate(candidates[static_cast<size_t>(plan.candidate_index)], params, workspace,
+                 plan.workspace_bytes);
+    ReleaseWorkspace(workspace, stream);
+  } catch (...) {
+    ReleaseWorkspace(workspace, stream);
+    throw;
+  }
+}
+
 // Linear fp8 block scale [rows, cols] -> swizzled [Mp=round_up(rows,128),
-// Kp=round_up(cols,4)] in the cutlass atom layout. Mapping (vLLM reshape
-// [Mp/128,4,32,Kp/4,4] then permute(0,1,4,3,2,5)):
-//   dst = ((((m/128)*(Kp/4) + k/4)*32 + m%32')*4 + (m%128)/32)*4 + k%4
-// with m%32' = (m%128)%32. One thread per swizzled (dst) slot; padding = 0.
-__global__ void SwizzleBlockscaleKernel(uint8_t* dst, const uint8_t* src, int rows, int cols,
-                                        int Mp, int Kp) {
-  const int total = Mp * Kp;
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total) return;
-  const int mo = idx / Kp;           // padded row
-  const int ko = idx % Kp;           // padded col (group)
-  uint8_t val = 0;
-  if (mo < rows && ko < cols) val = src[mo * cols + ko];
-  const int a0 = mo / 128;
-  const int a1 = (mo % 128) / 32;    // in [0,4)
-  const int a2 = (mo % 128) % 32;    // in [0,32)
-  const int a3 = ko / 4;             // in [0, Kp/4)
-  const int a4 = ko % 4;             // in [0,4)
-  const int dst_idx = ((((a0 * (Kp / 4) + a3) * 32 + a2) * 4 + a1) * 4 + a4);
-  dst[dst_idx] = val;
+// Kp=round_up(cols,4)] in Sm1xxBlkScaledConfig's scale-factor atom layout.
+__global__ void SwizzleBlockscaleKernel(uint8_t* dst, const uint8_t* src, int rows, int cols, int mp,
+                                        int kp) {
+  const int total = mp * kp;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= total) return;
+  const int row = index / kp;
+  const int col = index % kp;
+  uint8_t value = 0;
+  if (row < rows && col < cols) value = src[row * cols + col];
+  const int a0 = row / 128;
+  const int a1 = (row % 128) / 32;
+  const int a2 = (row % 128) % 32;
+  const int a3 = col / 4;
+  const int a4 = col % 4;
+  const int destination = ((((a0 * (kp / 4) + a3) * 32 + a2) * 4 + a1) * 4 + a4);
+  dst[destination] = value;
 }
 
 void SwizzleBlockscaleKernelCuda(Queue& q, Tensor& out_swizzled, const Tensor& in_linear) {
   const int rows = static_cast<int>(in_linear.shape[0]);
   const int cols = static_cast<int>(in_linear.shape[1]);
-  const int Mp = static_cast<int>(out_swizzled.shape[0]);
-  const int Kp = static_cast<int>(out_swizzled.shape[1]);
-  cudaStream_t s = AsStream(q);
-  const int total = Mp * Kp;
+  const int mp = static_cast<int>(out_swizzled.shape[0]);
+  const int kp = static_cast<int>(out_swizzled.shape[1]);
+  cudaStream_t stream = AsStream(q);
+  const int total = mp * kp;
   if (total == 0) return;
   constexpr int kBlock = 256;
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
-  SwizzleBlockscaleKernel<<<grid, kBlock, 0, s>>>(out_swizzled.Ptr<uint8_t>(),
-                                                  in_linear.Ptr<uint8_t>(), rows, cols, Mp, Kp);
+  SwizzleBlockscaleKernel<<<grid, kBlock, 0, stream>>>(out_swizzled.Ptr<uint8_t>(),
+                                                       in_linear.Ptr<uint8_t>(), rows, cols, mp, kp);
   Check(cudaGetLastError(), "swizzle_blockscale kernel launch");
 }
 
-// Write a scalar to device WITHOUT a synchronous pageable H2D memcpy (a 4-byte
-// H2D copy of `alpha` would serialize every small/decode GEMM). Fully stream-
-// ordered, async.
-__global__ void SetScalar(float* p, float v) { *p = v; }
+__global__ void SetScalar(float* value, float scalar) { *value = scalar; }
 
-// bf16 -> f32 for the f32-output projections (q/k/v/gate/up sinks): the cutlass
-// epilogue only emits bf16/half, so an f32 out is produced by casting a bf16
-// scratch. Same value the bf16 epilogue rounds to.
-__global__ void CastBf16ToF32Kernel(float* out, const __nv_bfloat16* in, int64_t n) {
+__global__ void CastBf16ToF32Kernel(float* out, const __nv_bfloat16* in, int64_t size) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < size;
+       i += step) {
     out[i] = __bfloat162float(in[i]);
+  }
 }
 
-// ---- MatmulNvfp4Cutlass registered op --------------------------------------
 void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
                                   const Tensor& a_sf_sw, const Tensor& b_packed,
                                   const Tensor& b_sf_sw, float alpha) {
   const int m = static_cast<int>(a_packed.shape[0]);
   const int k = static_cast<int>(a_packed.shape[1] * 2);
   const int n = static_cast<int>(b_packed.shape[0]);
-  cudaStream_t s = AsStream(q);
+  cudaStream_t stream = AsStream(q);
 
-  // alpha lives on device (cutlass epilogue reads alpha_ptr). Pool-backed async
-  // alloc + a 1-thread write kernel; no host<->device sync on the hot path.
   const bool pool = CutlassPoolEnabled();
-  float* d_alpha = nullptr;
+  float* device_alpha = nullptr;
   if (pool) {
-    d_alpha = PersistentAlpha(s);
+    device_alpha = PersistentAlpha(stream);
   } else {
-    Check(cudaMallocAsync(&d_alpha, sizeof(float), s), "cudaMallocAsync alpha");
+    Check(cudaMallocAsync(&device_alpha, sizeof(float), stream), "cudaMallocAsync alpha");
   }
-  SetScalar<<<1, 1, 0, s>>>(d_alpha, alpha);
+  SetScalar<<<1, 1, 0, stream>>>(device_alpha, alpha);
 
-  const bool out_f32 = (out.dtype == DType::kF32);
-  void* d_out = out.data;
+  const bool out_f32 = out.dtype == DType::kF32;
+  void* device_out = out.data;
   void* bf16_scratch = nullptr;
   if (out_f32) {
-    const size_t need = static_cast<size_t>(m) * n * sizeof(__nv_bfloat16);
+    const size_t required = static_cast<size_t>(m) * n * sizeof(__nv_bfloat16);
     if (pool) {
-      StreamScratch& sc = ScratchFor(s);
-      bf16_scratch = EnsureScratch(&sc.bf16, &sc.bf16_bytes, need, s, "cudaMallocAsync bf16 scratch");
+      StreamScratch& scratch = ScratchFor(stream);
+      bf16_scratch = EnsureScratch(&scratch.bf16, &scratch.bf16_bytes, required, stream,
+                                   "cudaMallocAsync bf16 scratch");
     } else {
-      Check(cudaMallocAsync(&bf16_scratch, need, s), "cudaMallocAsync bf16 scratch");
+      Check(cudaMallocAsync(&bf16_scratch, required, stream), "cudaMallocAsync bf16 scratch");
     }
-    d_out = bf16_scratch;
+    device_out = bf16_scratch;
   }
 
-  Fp4GemmRunBf16(d_out, a_packed.data, b_packed.data, a_sf_sw.data, b_sf_sw.data, d_alpha, m, n, k,
-                 q.device.index, s);
+  Fp4GemmRunBf16(device_out, a_packed.data, b_packed.data, a_sf_sw.data, b_sf_sw.data,
+                 device_alpha, m, n, k, q.device.index, stream);
 
   if (out_f32) {
     const int64_t total = static_cast<int64_t>(m) * n;
     const int blocks = static_cast<int>((total + 255) / 256);
-    CastBf16ToF32Kernel<<<blocks, 256, 0, s>>>(
+    CastBf16ToF32Kernel<<<blocks, 256, 0, stream>>>(
         static_cast<float*>(out.data), static_cast<const __nv_bfloat16*>(bf16_scratch), total);
-    if (!pool) Check(cudaFreeAsync(bf16_scratch, s), "cudaFreeAsync bf16 scratch");
+    if (!pool) Check(cudaFreeAsync(bf16_scratch, stream), "cudaFreeAsync bf16 scratch");
   }
 
-  if (!pool) Check(cudaFreeAsync(d_alpha, s), "cudaFreeAsync alpha");
+  if (!pool) Check(cudaFreeAsync(device_alpha, stream), "cudaFreeAsync alpha");
   Check(cudaGetLastError(), "matmul_nvfp4_cutlass launch");
 }
 
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kSwizzleBlockscale, DeviceType::kCUDA,
-               reinterpret_cast<void*>(static_cast<SwizzleBlockscaleFn>(&SwizzleBlockscaleKernelCuda)));
+               reinterpret_cast<void*>(
+                   static_cast<SwizzleBlockscaleFn>(&SwizzleBlockscaleKernelCuda)));
     RegisterOp(OpId::kMatmulNvfp4Cutlass, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<MatmulNvfp4CutlassFn>(&MatmulNvfp4CutlassKernelCuda)));

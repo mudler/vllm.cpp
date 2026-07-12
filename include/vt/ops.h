@@ -106,6 +106,7 @@ enum class OpId : uint8_t {
   kMatmulNvfp4,
   kScaledFp4Quant,
   kSiluMulFp4Quant,
+  kSiluAndMulFp4Quant,
   kMatmulNvfp4Fp4,
   kMatmulNvfp4Cutlass,
   kMatmulFp8Cutlass,
@@ -314,6 +315,8 @@ using ScaledFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
 using SiluMulFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, float);
+using SiluAndMulFp4QuantFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
@@ -527,6 +530,14 @@ void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tenso
 // (CPU fallback = the composite sequence).
 void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
                      const Tensor& up, float input_global_scale_inv);
+
+// SiluAndMulFp4Quant is the exact one-input vLLM custom-op form. `gate_up` is
+// contiguous [M,2I], with gate then up along the inner dimension. It fuses the
+// BF16 SiluAndMul rounding boundary with ScaledFp4Quant and emits the same
+// packed/scale streams as SiluMulFp4Quant, without materializing [M,I]. CPU +
+// CUDA; FP16 is tracked as the separate NVFP4 W4 breadth leaf.
+void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                        const Tensor& gate_up, float input_global_scale_inv);
 
 // MatmulNvfp4Fp4 (mirror vllm cutlass_scaled_fp4_mm / ..._sm120a; notes §7.3):
 //   out[m,n] = alpha * Σ_k ( a_fp4[m,k]·a_scale_fp8[m,k/16] )

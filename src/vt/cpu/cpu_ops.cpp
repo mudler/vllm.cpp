@@ -374,6 +374,20 @@ void SiluMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale, cons
   ScaledFp4QuantKernel(q, out_packed, out_scale, act, input_global_scale_inv);
 }
 
+// CPU definition of vLLM's one-input silu_and_mul_nvfp4_quant custom op. Keep
+// this visibly composite: it is the correctness oracle for the CUDA single-pass
+// producer and preserves the BF16 store/load boundary exactly.
+void SiluAndMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                              const Tensor& gate_up,
+                              float input_global_scale_inv) {
+  const int64_t m = gate_up.shape[0], i = gate_up.shape[1] / 2;
+  std::vector<uint16_t> tmp(static_cast<size_t>(m) * static_cast<size_t>(i));
+  Tensor act = Tensor::Contiguous(tmp.data(), DType::kBF16, gate_up.device, {m, i});
+  SiluAndMulKernel(q, act, gate_up);
+  ScaledFp4QuantKernel(q, out_packed, out_scale, act,
+                       input_global_scale_inv);
+}
+
 // MatmulNvfp4Fp4 CPU kernel: out[m,n] = alpha * Σ_k (a_fp4·f8(a_scale))·(b_fp4·
 // f8(b_scale)). Equals vllm::RunNvfp4Emulation up to K-reduction order.
 void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
@@ -1322,6 +1336,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
     RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluMulFp4QuantFn>(&SiluMulFp4QuantKernel)));
+    RegisterOp(
+        OpId::kSiluAndMulFp4Quant, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<SiluAndMulFp4QuantFn>(
+            &SiluAndMulFp4QuantKernel)));
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4Kernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCPU,

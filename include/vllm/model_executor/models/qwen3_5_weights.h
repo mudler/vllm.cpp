@@ -84,6 +84,10 @@ struct Nvfp4Weight {
   //     passed DIRECTLY to vt::ScaledFp4Quant.
   //   alpha = (1/input_divisor)·(1/weight_divisor) = scale2/input_global_scale_inv,
   //     the single scalar vt::MatmulNvfp4Fp4 multiplies the fp4xfp4 accumulator by.
+  // Keep the original on-disk weight divisor as well as its reciprocal. Fused
+  // logical linears (qkv/gate_up) take max(divisors) BEFORE reciprocating in
+  // vLLM; reconstructing the divisor from scale2 can lose one float ULP.
+  float weight_global_scale_inv = 0.0F;
   float input_global_scale_inv = 0.0F;
   float alpha = 0.0F;
   // True when the activation-quant globals were loaded (27B true-W4A4 path).

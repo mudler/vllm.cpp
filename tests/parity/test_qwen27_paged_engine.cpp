@@ -99,36 +99,12 @@ vllm::SamplingParams Greedy(int max_tokens) {
   return sp;
 }
 
-// The 27B fp4-resident W4A4 GEMM path (§5 step-6a) + the dense forward are wired.
-// This gate RUNS on dgx (DEFAULT production config — cutlass sm120a fp4, no force)
-// and closes token-for-token against vLLM over the DETERMINISTIC region of this
-// prompt's greedy continuation.
-//
-// The prompt "The capital of France is Paris, and the" hits a razor WHITESPACE
-// NEAR-TIE at tok6 (198 "\n" vs 271 "\n\n"). vLLM's OWN two fp4 kernels split on it:
-//   - PRODUCTION (greedy_ids.npy, native flashinfer-cutlass): "...Berlin.\nThe
-//     capital of France is Paris, and the"          (tok6=198)
-//   - EMULATION  (greedy_ids_emulation.npy, EmulationNvFp4LinearKernel): "...Berlin.
-//     \n\n<think>\n\n</think>\n\nThat is correct.\n\n" (tok6=271; the 248068/248069
-//     at tok7/9 are the <think>/</think> special tokens, NOT garbage)
-// BOTH continuations are fully COHERENT and SHARE the meaningful answer (toks 0-5,
-// " capital of Germany is Berlin.", bit-identical). They differ only in which side
-// of the whitespace tie greedy takes — determined by sub-0.2% fp4 accumulation
-// order (flashinfer-cutlass EXACT accumulation is a build-specific edge eager-C++
-// can't 1:1 replicate, per .agents/parity-lever-protocol.md). That is NOT a
-// correctness defect: the answer is identical; only downstream whitespace filler
-// forks.
-//
-// So the GATE asserts token-exact parity ONLY over the span where vLLM is itself
-// deterministic — the longest prefix where PRODUCTION == EMULATION (== 6 tokens,
-// the full answer). It runs the shipping DEFAULT kernel (no VT_NVFP4_CUTLASS force)
-// and does NOT pin the tie tail: which branch our ~0.1-0.2%-off cutlass takes past
-// tok6 is build/accumulation-sensitive (MEASURED 2026-07-07: default cutlass lands
-// on the EMULATION branch; the forced hand-emulation kernel lands on a THIRD
-// branch) and pinning it would make the gate FLAKY under routine fp4-kernel tuning.
-// The full-16 branch is logged informationally. The cutlass path's GEMM correctness
-// is covered by test_ops_nvfp4_fp4 and its end-to-end throughput win by the A/B
-// (division of labour, not a cutlass regression).
+// W2 mirrors the native production chain completely: merged gate_up projection,
+// FlashInfer's full SM12 tactic family with stream-safe eager launches, and BF16
+// GDN recurrence/z output. The latter is correctness-significant at the tok6
+// whitespace near-tie: the former f32 GDN diagnostic takes vLLM's coherent
+// emulation branch, while the shipping BF16 path reproduces the native production
+// continuation for all 16 tokens. The gate therefore requires full equality.
 constexpr bool kW4A4ForwardReady = true;
 
 }  // namespace
@@ -150,33 +126,17 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
     return;
   }
 
-  // Run the DEFAULT (production) config — the cutlass sm120a fp4 stack that ships;
-  // no VT_NVFP4_CUTLASS force. We gate token-exact over the span where vLLM is
-  // itself deterministic (see kW4A4ForwardReady note): both committed vLLM greedy
-  // references for this prompt agree up to a whitespace near-tie at tok6, then
-  // branch. That agreement span is the meaningful answer.
+  // Run the DEFAULT production config with no tactic/kernel/dtype force.
   const std::string kPrompt = "The capital of France is Paris, and the";
   const fs::path golden = fs::path(PARITY_GOLDENS_DIR) / "qwen36_logits_27b";
   const std::vector<int32_t> want_prompt_ids =
       LoadI32Npy(golden / "token_ids.npy");
-  // Two committed vLLM greedy references (pip-vLLM oracle, manifest.json): the
-  // PRODUCTION stream (greedy_ids.npy, native flashinfer-cutlass, tok6=198 "\n")
-  // and the EMULATION stream (greedy_ids_emulation.npy, EmulationNvFp4LinearKernel,
-  // tok6=271 "\n\n"). vLLM's OWN two kernels agree up to the tok6 whitespace tie,
-  // then diverge into two different-but-coherent continuations.
+  // The production stream is the acceptance reference. The emulation stream is
+  // retained as a negative-control fixture for the known tok6 near-tie.
   const std::vector<int32_t> want_prod = LoadI32Npy(golden / "greedy_ids.npy");
   const std::vector<int32_t> want_emu = LoadI32Npy(golden / "greedy_ids_emulation.npy");
   const int kMaxTokens = static_cast<int>(want_prod.size());  // 16
-  // The deterministic, tie-free region = the longest prefix where vLLM's PRODUCTION
-  // and EMULATION kernels agree (== 6 here: " capital of Germany is Berlin.").
-  // Beyond it, sub-0.2% fp4 accumulation order (ours vs flashinfer-cutlass) picks
-  // the whitespace branch — a build-specific edge, not a correctness defect.
-  size_t kAgreeLen = 0;
-  while (kAgreeLen < want_prod.size() && kAgreeLen < want_emu.size() &&
-         want_prod[kAgreeLen] == want_emu[kAgreeLen]) {
-    ++kAgreeLen;
-  }
-  REQUIRE(kAgreeLen >= 6);  // the full "...Berlin." answer must be a stable prefix
+  REQUIRE(want_emu != want_prod);
 
   MESSAGE("qwen27_paged_engine: loading full 27B via FromModelDir("
           << snap << ") — dense W4A4 fp4-resident loader + engine stack...");
@@ -203,24 +163,10 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
           << kMaxTokens << " tokens; continuation=\""
           << out.outputs[0].text << "\"");
 
-  // THE 27B M0 EXIT BAR (paged engine): the batched serving loop reproduces vLLM's
-  // greedy continuation token-for-token over the tie-free region (the meaningful
-  // answer " capital of Germany is Berlin."), validating the fp4-resident W4A4
-  // cutlass GEMM (default-on) end-to-end through prefill + decode + KV growth +
-  // sampler. The tok6 whitespace tie tail is NOT gated (vLLM's own kernels diverge
-  // there); its GEMM correctness is covered by test_ops_nvfp4_fp4 and its e2e win
-  // by the throughput A/B.
+  // THE 27B acceptance bar: native-vLLM production equality through prefill,
+  // decode, paged KV/GDN state growth and sampling.
   REQUIRE(static_cast<int>(got.size()) == kMaxTokens);
-  const std::vector<int32_t> got_prefix(got.begin(), got.begin() + kAgreeLen);
-  const std::vector<int32_t> want_prefix(want_prod.begin(),
-                                         want_prod.begin() + kAgreeLen);
-  CHECK(got_prefix == want_prefix);
-  // Informational: which vLLM branch (if any) our default kernel took past the tie.
-  const bool full_prod = (got == want_prod);
-  const bool full_emu = (got == want_emu);
-  MESSAGE("qwen27_paged_engine: tie-free prefix "
-          << kAgreeLen << "/" << kMaxTokens << " token-exact vs vLLM; full-16 branch: "
-          << (full_prod ? "matches PRODUCTION"
-                        : full_emu ? "matches EMULATION" : "own tie-branch")
-          << " (whitespace tie at tok" << kAgreeLen << ", not gated)");
+  CHECK(got == want_prod);
+  CHECK(got != want_emu);
+  MESSAGE("qwen27_paged_engine: full production stream 16/16 token-exact vs vLLM");
 }

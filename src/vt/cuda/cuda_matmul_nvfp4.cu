@@ -931,6 +931,17 @@ __device__ __forceinline__ uint8_t CastToFp4NibbleDev(float x) {
   return static_cast<uint8_t>((x < 0.0f ? 0x8u : 0x0u) | idx);
 }
 
+// Exact fast-reciprocal primitive used by vLLM's pinned NVFP4 quantizer
+// (`csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh:207-211`).  Keep the
+// two-stage expression below intact: `rcp(sf * rcp(global))` is observably not
+// identical to the algebraically simplified `global * rcp(sf)` at FP4 bucket
+// boundaries.
+__device__ __forceinline__ float ReciprocalApproximateFtz(float value) {
+  float reciprocal;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(reciprocal) : "f"(value));
+  return reciprocal;
+}
+
 // Opt-in switch for the NATIVE block-scaled fp4xfp4 MMA + its matching
 // fast-reciprocal activation quant (mirror of vllm's flashinfer-cutlass sm120a
 // path). DEFAULT OFF: the default forward keeps the bf16-dequant WMMA GEMM +
@@ -960,7 +971,9 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   float vmax = 0.0f;
 #pragma unroll
   for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(Load(x, base + j)));
-  float sc = input_global_scale * (vmax * (1.0f / 6.0f));
+  const float inverse_six =
+      approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+  float sc = input_global_scale * (vmax * inverse_six);
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
   scale[row * groups + g] = sc8;  // LINEAR store; a separate SwizzleBlockscaleKernel reorders.
@@ -988,9 +1001,8 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   float out_scale = 0.0f;
   if (sfv != 0.0f) {
     if (approx_recip) {
-      float rcp;
-      asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(sfv));
-      out_scale = input_global_scale * rcp;
+      out_scale = ReciprocalApproximateFtz(
+          sfv * ReciprocalApproximateFtz(input_global_scale));
     } else {
       out_scale = input_global_scale / sfv;
     }
@@ -1060,7 +1072,9 @@ __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin
   float vmax = 0.0f;
 #pragma unroll
   for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(v[j]));
-  float sc = input_global_scale * (vmax * (1.0f / 6.0f));
+  const float inverse_six =
+      approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+  float sc = input_global_scale * (vmax * inverse_six);
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
   scale[row * groups + g] = sc8;
@@ -1068,9 +1082,8 @@ __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin
   float out_scale = 0.0f;
   if (sfv != 0.0f) {
     if (approx_recip) {
-      float rcp;
-      asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(sfv));
-      out_scale = input_global_scale * rcp;
+      out_scale = ReciprocalApproximateFtz(
+          sfv * ReciprocalApproximateFtz(input_global_scale));
     } else {
       out_scale = input_global_scale / sfv;
     }
@@ -1109,6 +1122,99 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
     default: VT_CHECK(false, "cuda silu_mul_fp4_quant: unsupported dtype (f32/bf16 only)");
   }
   Check(cudaGetLastError(), "silu_mul_fp4_quant kernel launch");
+}
+
+// Exact one-input custom-op form used by vLLM's ActivationQuantFusionPass.
+// Upstream: vllm@e24d1b24
+//   csrc/libtorch_stable/quantization/fp4/
+//     activation_nvfp4_quant_fusion_kernels.cu:27-116,120-163
+// Input is the MergedColumnParallelLinear result [M,2I], with gate then up in
+// each row. The BF16 round below is intentional: it equals SiluAndMul's BF16
+// output boundary before ScaledFp4Quant while avoiding the intermediate write
+// and read. The quant epilogue is kept identical to the existing two-input
+// fused producer above.
+template <typename Tin>
+__global__ void SiluAndMulFp4QuantKernel(
+    uint8_t* packed, uint8_t* scale, const Tin* gate_up,
+    float input_global_scale, int64_t m_rows, int64_t i_dim,
+    bool approx_recip) {
+  const int64_t groups = i_dim / 16;
+  const int64_t gid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (gid >= m_rows * groups) return;
+  const int64_t row = gid / groups;
+  const int64_t g = gid % groups;
+  const int64_t output_base = row * i_dim + g * 16;
+  const int64_t input_row_base = row * (2 * i_dim);
+  const int64_t gate_base = input_row_base + g * 16;
+  const int64_t up_base = input_row_base + i_dim + g * 16;
+
+  float v[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const float gate = Load(gate_up, gate_base + j);
+    const float up = Load(gate_up, up_base + j);
+    const float silu_mul = (gate / (1.0f + expf(-gate))) * up;
+    v[j] = __bfloat162float(__float2bfloat16(silu_mul));
+  }
+
+  float vmax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(v[j]));
+  const float inverse_six =
+      approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+  float sc = input_global_scale * (vmax * inverse_six);
+  sc = fminf(fmaxf(sc, -448.0f), 448.0f);
+  const uint8_t sc8 = F32ToFp8Dev(sc);
+  scale[row * groups + g] = sc8;
+  const float sfv = F8E4M3ToF32Dev(sc8);
+  float out_scale = 0.0f;
+  if (sfv != 0.0f) {
+    if (approx_recip) {
+      out_scale = ReciprocalApproximateFtz(
+          sfv * ReciprocalApproximateFtz(input_global_scale));
+    } else {
+      out_scale = input_global_scale / sfv;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 16; j += 2) {
+    const float lo =
+        fminf(fmaxf(v[j] * out_scale, -6.0f), 6.0f);
+    const float hi =
+        fminf(fmaxf(v[j + 1] * out_scale, -6.0f), 6.0f);
+    packed[(output_base + j) / 2] = static_cast<uint8_t>(
+        CastToFp4NibbleDev(lo) | (CastToFp4NibbleDev(hi) << 4));
+  }
+}
+
+void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
+                                  Tensor& out_scale, const Tensor& gate_up,
+                                  float input_global_scale_inv) {
+  const int64_t m = gate_up.shape[0], i = gate_up.shape[1] / 2;
+  if (m == 0 || i == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int64_t total = m * (i / 16);
+  constexpr int kBlock = 256;
+  const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
+  auto* pk = out_packed.Ptr<uint8_t>();
+  auto* sc = out_scale.Ptr<uint8_t>();
+  const bool approx = NativeFp4MmaEnabled();
+  switch (gate_up.dtype) {
+    case DType::kF32:
+      SiluAndMulFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(
+          pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i, approx);
+      break;
+    case DType::kBF16:
+      SiluAndMulFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+          pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+          approx);
+      break;
+    default:
+      VT_CHECK(false,
+               "cuda silu_and_mul_fp4_quant: unsupported dtype (f32/bf16 only)");
+  }
+  Check(cudaGetLastError(), "silu_and_mul_fp4_quant kernel launch");
 }
 
 // Naive fp4xfp4 GEMM (small-M / decode). out[m,n] = alpha * sum_k
@@ -1391,6 +1497,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernelCuda)));
     RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<SiluMulFp4QuantFn>(&SiluMulFp4QuantKernelCuda)));
+    RegisterOp(
+        OpId::kSiluAndMulFp4Quant, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<SiluAndMulFp4QuantFn>(
+            &SiluAndMulFp4QuantKernelCuda)));
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4KernelCuda)));
     RegisterOp(OpId::kMoeGroupedGemmNvfp4, DeviceType::kCUDA,

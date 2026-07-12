@@ -36,6 +36,28 @@
 #endif
 
 namespace vllm {
+
+DenseGateUpGlobals MergeDenseGateUpGlobals(const Nvfp4Weight& gate,
+                                           const Nvfp4Weight& up) {
+  VT_CHECK(gate.weight_global_scale_inv > 0.0F &&
+               up.weight_global_scale_inv > 0.0F,
+           "qwen3_5 dense merged gate_up: missing CT weight divisor");
+  VT_CHECK(gate.input_global_scale_inv > 0.0F &&
+               up.input_global_scale_inv > 0.0F,
+           "qwen3_5 dense merged gate_up: missing CT input divisor");
+  DenseGateUpGlobals globals;
+  globals.input_global_scale_inv =
+      std::max(gate.input_global_scale_inv, up.input_global_scale_inv);
+  const float weight_global_scale_inv =
+      std::max(gate.weight_global_scale_inv, up.weight_global_scale_inv);
+  // Preserve vLLM/PyTorch's operation order: reciprocal each selected maximum,
+  // then multiply. Do not derive the maximum divisor back from scale2.
+  const float input_global_scale = 1.0F / globals.input_global_scale_inv;
+  globals.weight_global_scale = 1.0F / weight_global_scale_inv;
+  globals.alpha = input_global_scale * globals.weight_global_scale;
+  return globals;
+}
+
 namespace {
 
 using vt::Backend;
@@ -492,6 +514,80 @@ Tensor ResidentNvfp4ScaleSwizzled(Dev d, const Nvfp4Weight& w) {
   }
   return MakeTensor(w.d_scale_sw.get(), DType::kI8, d.q.device, {Np, Kp});
 }
+
+// Device-resident packed operand for the dense CT gate_up_proj. Pinned vLLM
+// represents gate/up as one MergedColumnParallelLinear (`qwen2_moe.py:75-115`)
+// and loads both checkpoint shards into one N-concatenated parameter
+// (`linear.py:580-695`). We retain the split host weights for the diagnostic
+// arm, but production uploads one [2I,H/2] packed buffer and swizzles the one
+// concatenated [2I,H/16] block-scale buffer exactly once.
+struct Nvfp4GateUpDev {
+  Tensor packed;
+  Tensor scale_sw;
+  DenseGateUpGlobals globals;
+};
+
+Nvfp4GateUpDev ResidentNvfp4GateUp(Dev d, const DenseMlpWeights& w) {
+  const Nvfp4Weight& gate = w.gate_proj_fp4;
+  const Nvfp4Weight& up = w.up_proj_fp4;
+  VT_CHECK(!gate.Empty() && !up.Empty(),
+           "qwen3_5 dense merged gate_up: empty logical shard");
+  VT_CHECK(gate.n == up.n && gate.k == up.k,
+           "qwen3_5 dense merged gate_up: logical shard shape mismatch");
+  const int64_t n = gate.n;
+  const int64_t k = gate.k;
+  const size_t packed_shard_bytes = gate.packed.bytes.size();
+  const size_t scale_shard_bytes = gate.scale.bytes.size();
+  VT_CHECK(up.packed.bytes.size() == packed_shard_bytes &&
+               up.scale.bytes.size() == scale_shard_bytes,
+           "qwen3_5 dense merged gate_up: logical shard byte mismatch");
+
+  if (!w.d_gate_up_packed || !w.d_gate_up_scale_sw) {
+    VT_CHECK(!w.d_gate_up_packed && !w.d_gate_up_scale_sw,
+             "qwen3_5 dense merged gate_up: partial resident state");
+    Backend* backend = &d.b;
+    void* packed_data = d.b.Alloc(2 * packed_shard_bytes);
+    std::shared_ptr<void> packed_owner(
+        packed_data, [backend](void* pointer) { backend->Free(pointer); });
+    auto* packed_bytes = static_cast<uint8_t*>(packed_data);
+    d.b.Copy(d.q, packed_bytes, gate.packed.bytes.data(), packed_shard_bytes);
+    d.b.Copy(d.q, packed_bytes + packed_shard_bytes, up.packed.bytes.data(),
+             packed_shard_bytes);
+
+    // Linear scale staging is pool-backed and can return immediately after the
+    // swizzle launch: all reuse is on this queue and therefore stream-ordered.
+    DBuf scale_linear(d, DType::kI8, {2 * n, k / 16});
+    auto* scale_bytes = static_cast<uint8_t*>(scale_linear.ptr());
+    d.b.Copy(d.q, scale_bytes, gate.scale.bytes.data(), scale_shard_bytes);
+    d.b.Copy(d.q, scale_bytes + scale_shard_bytes, up.scale.bytes.data(),
+             scale_shard_bytes);
+
+    const auto round_up = [](int64_t value, int64_t multiple) {
+      return (value + multiple - 1) / multiple * multiple;
+    };
+    const int64_t np = round_up(2 * n, 128);
+    const int64_t kp = round_up(k / 16, 4);
+    void* scale_sw_data = d.b.Alloc(static_cast<size_t>(np * kp));
+    std::shared_ptr<void> scale_sw_owner(
+        scale_sw_data, [backend](void* pointer) { backend->Free(pointer); });
+    Tensor scale_sw =
+        MakeTensor(scale_sw_data, DType::kI8, d.q.device, {np, kp});
+    vt::SwizzleBlockscale(d.q, scale_sw, scale_linear.t());
+
+    w.d_gate_up_packed = std::move(packed_owner);
+    w.d_gate_up_scale_sw = std::move(scale_sw_owner);
+  }
+
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  return Nvfp4GateUpDev{
+      MakeTensor(w.d_gate_up_packed.get(), DType::kI8, d.q.device,
+                 {2 * n, k / 2}),
+      MakeTensor(w.d_gate_up_scale_sw.get(), DType::kI8, d.q.device,
+                 {round_up(2 * n, 128), round_up(k / 16, 4)}),
+      MergeDenseGateUpGlobals(gate, up)};
+}
 #endif  // VT_CUTLASS_NVFP4
 
 // Host reference dequant of an fp4 weight to bf16 [K=in, N=out] (Matmul-B
@@ -847,6 +943,72 @@ bool SwizzleInQuantEnabled() {
     return e != nullptr && e[0] == '1';
   }();
   return on;
+}
+
+// Dense gate/up topology mirror. The full-tactic fallback must remain the
+// immutable W1 arm, so VT_FP4_FULL_TACTICS=0 also disables this W2 model-side
+// adaptation. VT_FP4_MERGED_GATE_UP=0 isolates the split W2 arm while retaining
+// the same 32 raw tactics.
+bool MergedGateUpEnabled() {
+  static const bool on = [] {
+    const char* full_tactics = std::getenv("VT_FP4_FULL_TACTICS");
+    if (full_tactics != nullptr && full_tactics[0] == '0') return false;
+    const char* merged = std::getenv("VT_FP4_MERGED_GATE_UP");
+    return merged == nullptr || merged[0] != '0';
+  }();
+  return on;
+}
+
+// vLLM's ActivationQuantFusionPass consumes the merged BF16 [M,2I] gate_up
+// result directly and emits the down-projection NVFP4 operands in one kernel.
+// Keep a dedicated same-binary fallback so this W2 sub-iteration can be timed
+// independently from the already-gated merged topology and tactic family.
+bool MergedSiluQuantEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_MERGED_SILU_QUANT");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+bool MergedGateUpEligible(const DenseMlpWeights& w, Dev d) {
+  const Nvfp4Weight& gate = w.gate_proj_fp4;
+  const Nvfp4Weight& up = w.up_proj_fp4;
+  return MergedGateUpEnabled() && NvfpCutlassEnabled() &&
+         Bf16GemmOutEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+         !gate.Empty() && !up.Empty() && gate.IsTrueW4A4() &&
+         up.IsTrueW4A4() && TrueW4A4Enabled() && gate.n == up.n &&
+         gate.k == up.k && gate.weight_global_scale_inv > 0.0F &&
+         up.weight_global_scale_inv > 0.0F;
+}
+
+// One CT-W4A4 gate_up projection, matching Qwen2MoeMLP.forward and the fused
+// scale processing in CompressedTensorsW4A4Fp4. This is deliberately a BF16
+// result: vLLM's model dtype is BF16 and SiluAndMul consumes that one [M,2I]
+// buffer. The split diagnostic remains in DenseMlpBlock below.
+DBuf MergedGateUpCutlassD(Dev d, const Tensor& x, const DenseMlpWeights& w) {
+  const int64_t m = x.shape[0];
+  const int64_t k = x.shape[1];
+  const int64_t n = w.gate_proj_fp4.n;
+  Nvfp4GateUpDev gate_up = ResidentNvfp4GateUp(d, w);
+
+  DBuf a_packed(d, DType::kI8, {m, k / 2});
+  DBuf a_scale(d, DType::kI8, {m, k / 16});
+  vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x,
+                     gate_up.globals.input_global_scale_inv);
+
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  DBuf a_scale_sw(d, DType::kI8,
+                  {round_up(m, 128), round_up(k / 16, 4)});
+  vt::SwizzleBlockscale(d.q, a_scale_sw.t(), a_scale.t());
+
+  DBuf out(d, DType::kBF16, {m, 2 * n});
+  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), a_scale_sw.t(),
+                         gate_up.packed, gate_up.scale_sw,
+                         gate_up.globals.alpha);
+  return out;
 }
 #endif
 
@@ -1390,7 +1552,8 @@ DType GdnInDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (default OFF; VT_GDN_OUT_BF16=1 enables).
+// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
+// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -1403,16 +1566,18 @@ DType GdnInDType() {
 // the core/z I/O dtype changes. ssm_state, g (+cumsum), and beta stay f32 (FLA's
 // split). Distinct from the earlier VT_BF16_GDN (in_proj/conv/z-gate, neutral):
 // this lever is the f32 `dcore` recurrence output that attempt left untouched.
-// DEFAULT OFF (f32). Dedicated bf16 AOT chunk_o artifacts are vendored, but the
-// recovered pre-current-main factorial is preliminary evidence rather than a
-// valid denominator for this integrated tree. Keep VT_GDN_OUT_BF16=1 as the
-// same-binary opt-in until a fresh current-main A/B on both gate models proves
-// every-axis parity or better. `fp8_in_proj` remains a future per-architecture
-// hook.
-DType GdnOutDType(bool fp8_in_proj) {
-  (void)fp8_in_proj;  // per-arch hook for the future bf16-out AOT re-flip
-  static const char* e = std::getenv("VT_GDN_OUT_BF16");
-  const bool bf16 = (e != nullptr) && e[0] == '1';
+// This is correctness-significant for the 27B: with the repaired full NVFP4
+// tactic stack, f32 core/z takes the alternate whitespace near-tie branch while
+// bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
+// GGUF, on its prior f32 default; the explicit env override remains available
+// for its later independently gated campaign.
+DType GdnOutDType(bool dense_model) {
+  static const int override = [] {
+    const char* e = std::getenv("VT_GDN_OUT_BF16");
+    if (e == nullptr) return -1;
+    return e[0] == '0' ? 0 : 1;
+  }();
+  const bool bf16 = override >= 0 ? override != 0 : dense_model;
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
@@ -1462,10 +1627,12 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                             : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
                : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
                                       : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
+  const DType outdt = GdnOutDType(cfg.num_experts == 0);
   DBuf z = !w.in_proj_z_fp8.Empty()
-               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, DType::kF32)
-                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, DType::kF32))
-               : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
+                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
+           : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
+                                   : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
   DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
   DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
 
@@ -1517,14 +1684,15 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // scale = Dk^-0.5, applied to q only inside the gated-delta-rule recurrence.
   DBuf dssm(d, DType::kF32, {1, Hv, Dv, Dk});
   dssm.Zero(d);
-  DBuf dcore(d, DType::kF32, {T, Hv, Dv});
+  DBuf dcore(d, outdt, {T, Hv, Dv});
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   vt::GdnPrefill(d.q, dcore.t(), dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(),
                  dssm.t(), dqsl.t(), vt::GdnArgs{scale});
 
   // Gated RMSNorm over Dv with the z gate (gdn-semantics.md §5), viewing the
   // core output and z as [T*Hv, Dv]; cast to bf16, flatten heads, out-project.
-  Tensor dnw = ResidentWeightF32(d, w.norm_weight, {Dv});
+  Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
+                                     : ResidentWeightF32(d, w.norm_weight, {Dv});
   Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
@@ -1714,7 +1882,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
   // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
   // byte-identical f32 path.
-  const DType outdt = GdnOutDType(!w.in_proj_z_fp8.Empty());
+  const DType outdt = GdnOutDType(cfg.num_experts == 0);
   DBuf z = !w.in_proj_z_fp8.Empty()
                ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
@@ -1820,7 +1988,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // scale = Dk^-0.5 (q only, inside the recurrence). dcore (recurrence output /
   // core_attn_out) is bf16 under VT_GDN_OUT_BF16 — GdnDecode/GdnPrefill store the
-  // Tout=bf16 path directly (mirror FLA chunk_o.py o bf16); else the f32 default.
+  // Tout=bf16 path directly (mirror FLA chunk_o.py o bf16); else the f32 arm.
   DBuf dcore(d, outdt, {T, Hv, Dv});
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
   const int64_t ssm_row_elems = Hv * Dv * Dk;
@@ -2936,6 +3104,36 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();
+#ifdef VT_CUTLASS_NVFP4
+  // vLLM's production topology is one MergedColumnParallelLinear gate_up_proj,
+  // not two independently-scaled linears. Its CT loader takes max(input
+  // divisor) and max(weight divisor) across the logical shards, computes one
+  // alpha, quantizes once and launches one [T,H]x[2I,H] GEMM. This branch is W2
+  // default; VT_FP4_MERGED_GATE_UP=0 restores the split W2 diagnostic and
+  // VT_FP4_FULL_TACTICS=0 restores W1 including its split model topology.
+  if (fp4 && MergedGateUpEligible(w, d)) {
+    DBuf gate_up = MergedGateUpCutlassD(d, dh, w);  // bf16 [T,2I]
+    if (FuseSiluQuantEnabled() &&
+        w.down_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
+      DBuf ap(d, DType::kI8, {T, I / 2});
+      DBuf as(d, DType::kI8, {T, I / 16});
+      if (MergedSiluQuantEnabled()) {
+        vt::SiluAndMulFp4Quant(d.q, ap.t(), as.t(), gate_up.t(),
+                               w.down_proj_fp4.input_global_scale_inv);
+      } else {
+        DBuf act(d, DType::kBF16, {T, I});
+        vt::SiluAndMul(d.q, act.t(), gate_up.t());
+        vt::ScaledFp4Quant(d.q, ap.t(), as.t(), act.t(),
+                           w.down_proj_fp4.input_global_scale_inv);
+      }
+      return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.down_proj_fp4,
+                                   DType::kBF16);
+    }
+    DBuf act(d, DType::kBF16, {T, I});
+    vt::SiluAndMul(d.q, act.t(), gate_up.t());
+    return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
+  }
+#endif
   // QUANTIZE-ONCE for gate/up: shared activation dh + shared input_global_scale ->
   // one ScaledFp4Quant feeding both fp4 GEMMs (removes 1 redundant [T,H] quant).
   const bool fuse_gu =
@@ -3787,6 +3985,35 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   std::vector<float> out(static_cast<size_t>(T) * H);
   for (size_t i = 0; i < out.size(); ++i)
     out[i] = res_host[i] + vt::BF16ToF32(hidden_host[i]);
+  return out;
+}
+
+std::vector<float> Qwen3_5ReplayDenseLayer(
+    const Qwen3_5DenseLayerWeights& layer, const HfConfig& config,
+    const std::vector<float>& hidden_in, const std::vector<int32_t>& positions,
+    int64_t seqlen, vt::Queue& queue) {
+  const int64_t T = seqlen;
+  const int64_t H = config.hidden_size;
+  VT_CHECK(static_cast<int64_t>(hidden_in.size()) == T * H,
+           "qwen3_5 dense replay: hidden_in must be [T*H]");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+
+  // Match Qwen3_5ReplayLayer's fused residual contract: the captured layer
+  // input is the combined stream, so seed it as `res` and start the bf16 delta
+  // at zero before running the real dense attention + SwiGLU layer.
+  DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
+  DBuf hidden(d, DType::kBF16, {T, H});
+  hidden.Zero(d);
+  RunDenseLayer(d, layer, config, hidden, res, positions, T);
+
+  std::vector<float> res_host(static_cast<size_t>(T) * H);
+  res.Download(d, res_host.data());
+  std::vector<uint16_t> hidden_host(static_cast<size_t>(T) * H);
+  hidden.Download(d, hidden_host.data());
+  std::vector<float> out(static_cast<size_t>(T) * H);
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = res_host[i] + vt::BF16ToF32(hidden_host[i]);
+  }
   return out;
 }
 

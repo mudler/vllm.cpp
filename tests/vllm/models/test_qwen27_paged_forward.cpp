@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,8 @@
 using vllm::DenseMlpWeights;
 using vllm::GdnStateCache;
 using vllm::HfConfig;
+using vllm::MergeDenseGateUpGlobals;
+using vllm::Nvfp4Weight;
 using vllm::OwnedTensor;
 using vllm::PagedKvCache;
 using vllm::Qwen3_5DenseLayerWeights;
@@ -342,6 +345,35 @@ GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) 
 }
 
 }  // namespace
+
+// Port of the fused logical-scale processing contract in pinned vLLM
+// compressed_tensors_w4a4_nvfp4.py:95-138. Gate/up checkpoint scalars are
+// loaded into arrays by MergedColumnParallelLinear; each maximum is selected
+// before its single reciprocal and the shared alpha multiplication.
+TEST_CASE("qwen27 dense merged gate-up uses maximum CT logical-shard divisors") {
+  Nvfp4Weight gate;
+  gate.weight_global_scale_inv = 224.0F;
+  gate.input_global_scale_inv = 80.0F;
+  gate.scale2 = 1.0F / gate.weight_global_scale_inv;
+  gate.alpha = gate.scale2 * (1.0F / gate.input_global_scale_inv);
+
+  Nvfp4Weight up;
+  up.weight_global_scale_inv = 448.0F;
+  up.input_global_scale_inv = 96.0F;
+  up.scale2 = 1.0F / up.weight_global_scale_inv;
+  up.alpha = up.scale2 * (1.0F / up.input_global_scale_inv);
+
+  const vllm::DenseGateUpGlobals globals =
+      MergeDenseGateUpGlobals(gate, up);
+  CHECK(globals.input_global_scale_inv == 96.0F);
+  CHECK(globals.weight_global_scale == 1.0F / 448.0F);
+  CHECK(globals.alpha == (1.0F / 96.0F) * (1.0F / 448.0F));
+
+  up.weight_global_scale_inv = 0.0F;
+  CHECK_THROWS_WITH_AS(MergeDenseGateUpGlobals(gate, up),
+                       doctest::Contains("missing CT weight divisor"),
+                       std::runtime_error);
+}
 
 TEST_CASE("qwen27 dense paged: full-prefill batch-of-1 equals dense forward") {
   const HfConfig c = MakeConfig();

@@ -910,16 +910,34 @@ bool Qwen36Gate(const fs::path& dir, std::string& snap) {
   return true;
 }
 
+std::string Find27BSnapshot();
+
 bool RunQwen36Embed(Backend& b, Queue& q, const fs::path& dir, const json& m) {
   std::string snap;
-  if (!Qwen36Gate(dir, snap)) return false;
-  auto shard1 = OpenShard(snap, 1);
-  if (!shard1) {
-    MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
-    return false;
+  std::optional<vllm::SafetensorsFile> shard;
+  if (GoldenTag(dir) == 27) {
+    snap = Find27BSnapshot();
+    if (snap.empty()) {
+      MESSAGE("SKIP " << dir.filename().string()
+                      << ": unsloth/Qwen3.6-27B-NVFP4 snapshot not present");
+      return false;
+    }
+    const fs::path model = fs::path(snap) / "model.safetensors";
+    if (!fs::exists(model)) {
+      MESSAGE("SKIP " << dir.filename().string() << ": model.safetensors absent");
+      return false;
+    }
+    shard.emplace(vllm::SafetensorsFile::Open(model.string()));
+  } else {
+    if (!Qwen36Gate(dir, snap)) return false;
+    shard = OpenShard(snap, 1);
+    if (!shard) {
+      MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
+      return false;
+    }
   }
   const vllm::StTensor& tab =
-      shard1->Get("model.language_model.embed_tokens.weight");
+      shard->Get("model.language_model.embed_tokens.weight");
   auto ids = LoadTensor(dir, m["tensors"]["token_ids"]);
   auto want = LoadTensor(dir, m["tensors"]["embed"]);
   const int64_t vocab = tab.shape[0], H = tab.shape[1], T = ids.tensor.shape[0];
@@ -971,36 +989,44 @@ bool RunQwen36Norm(Backend& b, Queue& q, const fs::path& dir, const json& m) {
 // The layer replay drives its own device memory through Qwen3_5ReplayLayer
 // (which resolves the backend from the queue), so the pass Backend is unused.
 bool RunQwen36Layer(Backend& /*b*/, Queue& q, const fs::path& dir, const json& m) {
+  const int tag = GoldenTag(dir);
   std::string snap;
-  if (!Qwen36Gate(dir, snap)) return false;
-  auto shard1 = OpenShard(snap, 1);
-  if (!shard1) {
-    MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
-    return false;
+  std::optional<vllm::SafetensorsFile> shard;
+  if (tag == 27) {
+    snap = Find27BSnapshot();
+    if (snap.empty()) {
+      MESSAGE("SKIP " << dir.filename().string()
+                      << ": unsloth/Qwen3.6-27B-NVFP4 snapshot not present");
+      return false;
+    }
+    const fs::path model = fs::path(snap) / "model.safetensors";
+    if (!fs::exists(model)) {
+      MESSAGE("SKIP " << dir.filename().string() << ": model.safetensors absent");
+      return false;
+    }
+    shard.emplace(vllm::SafetensorsFile::Open(model.string()));
+  } else {
+    if (!Qwen36Gate(dir, snap)) return false;
+    shard = OpenShard(snap, 1);
+    if (!shard) {
+      MESSAGE("SKIP " << dir.filename().string() << ": shard 1 not found");
+      return false;
+    }
   }
-  const vllm::SafetensorsFile& shard = *shard1;
-  const vllm::TensorResolver get =
-      [&shard](const std::string& n) -> const vllm::StTensor& {
-    return shard.Get(n);
-  };
+  const vllm::TensorResolver get = [&shard](const std::string& n)
+      -> const vllm::StTensor& { return shard->Get(n); };
   const vllm::HfConfig cfg =
       vllm::LoadHfConfig((fs::path(snap) / "config.json").string());
   const int64_t layer_idx = m["args"]["layer_idx"].get<int64_t>();
   const std::string layer_type = m["args"]["layer_type"].get<std::string>();
-  if (q.device.type == DeviceType::kCUDA && layer_type == "full_attention") {
+  if (q.device.type == DeviceType::kCUDA && layer_type == "full_attention" &&
+      tag != 27) {
     MESSAGE("SKIP " << dir.filename().string()
                     << ": isolated full-attention layer replay is CPU-only; "
                        "CUDA full-attention correctness is covered by the "
                        "full-model logits gate");
     return false;
   }
-  // The isolated layer goldens are bf16-dequant oracle replays. Keep them on
-  // the legacy loader for both CPU and CUDA; the native resident FP8/NVFP4 path
-  // is covered by the full-model greedy gates below.
-  ScopedEnv legacy_dense("VT_DENSE_NATIVE", "0");
-  const vllm::Qwen3_5MoeLayerWeights layer =
-      vllm::LoadQwen3_5MoeLayer(get, layer_type, layer_idx, cfg.num_experts);
-
   auto x = LoadTensor(dir, m["tensors"]["hidden_in"]);
   auto pos = LoadTensor(dir, m["tensors"]["positions"]);
   auto want = LoadTensor(dir, m["tensors"]["out"]);
@@ -1014,8 +1040,19 @@ bool RunQwen36Layer(Backend& /*b*/, Queue& q, const fs::path& dir, const json& m
   for (int64_t t = 0; t < T; ++t)
     positions[static_cast<size_t>(t)] = static_cast<int32_t>(p[t]);
 
-  std::vector<float> out =
-      vllm::Qwen3_5ReplayLayer(layer, cfg, hidden_in, positions, T, q);
+  std::vector<float> out;
+  if (tag == 27) {
+    const vllm::Qwen3_5DenseLayerWeights layer =
+        vllm::LoadQwen3_5DenseLayer(get, layer_type, layer_idx);
+    out = vllm::Qwen3_5ReplayDenseLayer(layer, cfg, hidden_in, positions, T, q);
+  } else {
+    // The 35B isolated goldens intentionally retain their bf16-dequant replay;
+    // its native resident FP8/NVFP4 path is covered by the full-model gate.
+    ScopedEnv legacy_dense("VT_DENSE_NATIVE", "0");
+    const vllm::Qwen3_5MoeLayerWeights layer =
+        vllm::LoadQwen3_5MoeLayer(get, layer_type, layer_idx, cfg.num_experts);
+    out = vllm::Qwen3_5ReplayLayer(layer, cfg, hidden_in, positions, T, q);
+  }
   Tensor got = MakeTensor(out.data(), DType::kF32, Cpu(), {T, H});
   RequireMatch("out", got, want.tensor, m["tol"]["atol"].get<double>(),
                m["tol"]["rtol"].get<double>());
@@ -1191,16 +1228,14 @@ std::string Find27BSnapshot() {
   return "";
 }
 
-// --- 27B DENSE full-model logits DIAGNOSTIC (the step-6a fast-path characterizer).
+// --- 27B DENSE full-model logits acceptance gate.
 // Loads the real dense 27B (single model.safetensors, W4A4 fp4-resident) and runs
-// Qwen3_5DenseModel::ForwardDense on the pinned-oracle prompt, then REPORTS (not
-// gates): per-position prefill argmax match vs the oracle, the top-1000 logit gap,
-// and greedy-decode token-for-token match + the divergence point. Unlike the 35B
-// RunQwen36Logits, greedy-exact is NOT REQUIREd here: the step-6a fast path keeps
-// bf16 activations (W4A16-style) while the pip-vLLM oracle runs TRUE W4A4 (fp4
-// activations), so a near-tie greedy divergence is expected-by-construction and is
-// characterized, not asserted. Checkpoint-gated + dgx-only (tag-27; SKIPs without
-// the snapshot). The paged engine's exact-greedy gate is test_qwen27_paged_engine.
+// Qwen3_5DenseModel::ForwardDense on the pinned-oracle prompt. It requires every
+// prefill-position argmax and every greedy token to match native vLLM. The
+// top-1000 logit gap remains diagnostic because NVFP4 accumulation need not be
+// elementwise identical away from the decision boundary. Checkpoint-gated +
+// dgx-only (tag-27; SKIPs without the snapshot). The paged-engine counterpart is
+// test_qwen27_paged_engine.
 bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
                      const json& m) {
   if (GoldenTag(dir) != 27) return false;  // 35B handled by RunQwen36Logits
@@ -1261,20 +1296,18 @@ bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
     if (ArgmaxRow(&logits[static_cast<size_t>(t) * vocab], vocab) == amp[t])
       ++argmax_match;
 
-  // (c) greedy decode via ForwardDense; record token-for-token match + divergence.
+  // (c) greedy decode via ForwardDense; require token-for-token equality.
   auto gid = LoadTensor(dir, m["tensors"]["greedy_ids"]);
   const int64_t n_greedy = gid.tensor.shape[0];
   const int32_t* gp = gid.tensor.Ptr<int32_t>();
   std::vector<int32_t> ids = token_ids;
   std::vector<int32_t> pos = positions;
-  std::vector<int32_t> produced;
   int greedy_match = 0;
   std::vector<float> cur = logits;
   for (int64_t s = 0; s < n_greedy; ++s) {
     const int64_t T = static_cast<int64_t>(ids.size());
     const int32_t next =
         ArgmaxRow(&cur[static_cast<size_t>(T - 1) * vocab], vocab);
-    produced.push_back(next);
     if (next != gp[s]) break;
     ++greedy_match;
     ids.push_back(next);
@@ -1283,18 +1316,13 @@ bool RunQwen27Logits(Backend& /*b*/, Queue& q, const fs::path& dir,
       cur = vllm::Qwen3_5DenseModel::ForwardDense(ids, pos, weights, cfg, q);
   }
 
-  MESSAGE("qwen27_logits DIAG (step-6a fast path vs TRUE-W4A4 oracle): "
+  MESSAGE("qwen27_logits acceptance (native W4A4 vs vLLM oracle): "
           "greedy_match=" << greedy_match << "/" << n_greedy
           << "; per-pos prefill argmax_match=" << argmax_match << "/" << T0
-          << "; max top-1000 logit gap=" << max_gap
-          << (greedy_match < n_greedy
-                  ? " (near-tie divergence expected: bf16 acts vs oracle fp4 acts)"
-                  : " (EXACT — fast path matches oracle)"));
+          << "; max top-1000 logit gap=" << max_gap);
 
-  // Guardrail only: the prefill forward must be finite and broadly on-target
-  // (argmax mostly matching), catching a gross dequant/scale bug. Greedy-exact
-  // is intentionally NOT gated here (see the header); the paged engine gate
-  // (test_qwen27_paged_engine) owns the exact-oracle bar.
+  REQUIRE(argmax_match == T0);
+  REQUIRE(greedy_match == n_greedy);
   REQUIRE(std::isfinite(max_gap));
   return true;
 }
@@ -1661,11 +1689,9 @@ TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {
   }
 }
 
-// Standalone, fast, CUDA-only 27B dense-logits diagnostic — runs ONLY the dense
-// 27B ForwardDense characterizer (not the whole golden pass, which includes the
-// ~2600s 35B logits case). Filter with `-tc="qwen27 dense logits*"`. Reports
-// prefill argmax match + top-1000 logit gap + greedy divergence vs the oracle
-// (step-6a fast path vs true-W4A4). Checkpoint-gated + dgx-only.
+// Standalone, fast, CUDA-only 27B dense-logits gate — runs only the dense 27B
+// ForwardDense acceptance case (not the whole golden pass, which includes the
+// long 35B logits case). Filter with `-tc="qwen27 dense logits*"`.
 TEST_CASE("qwen27 dense logits diagnostic (dgx-only, CUDA)") {
   bool has_cuda = true;
   try {
@@ -1686,6 +1712,80 @@ TEST_CASE("qwen27 dense logits diagnostic (dgx-only, CUDA)") {
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   Queue q = b.CreateQueue();
   RunQwen27Logits(b, q, dir, m);
+  b.DestroyQueue(q);
+}
+
+TEST_CASE("qwen27 dense layer-0 parity (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend; skipping 27B dense layer parity");
+    return;
+  }
+  const char* trace_case = std::getenv("VLLM_QWEN27_LAYER_CASE");
+  const fs::path dir =
+      trace_case != nullptr
+          ? fs::path(trace_case)
+          : fs::path(PARITY_GOLDENS_DIR) / "qwen36_gdn_layer_27b";
+  if (!fs::exists(dir / "manifest.json")) {
+    MESSAGE("27B GDN layer golden absent; skipping");
+    return;
+  }
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  RunQwen36Layer(b, q, dir, m);
+  b.DestroyQueue(q);
+}
+
+TEST_CASE("qwen27 embedding parity (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend; skipping 27B embedding parity");
+    return;
+  }
+  const fs::path dir = fs::path(PARITY_GOLDENS_DIR) / "qwen36_embed_27b";
+  if (!fs::exists(dir / "manifest.json")) {
+    MESSAGE("27B embedding golden absent; skipping");
+    return;
+  }
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  RunQwen36Embed(b, q, dir, m);
+  b.DestroyQueue(q);
+}
+
+TEST_CASE("qwen27 dense layer-3 parity (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend; skipping 27B dense layer parity");
+    return;
+  }
+  const fs::path dir =
+      fs::path(PARITY_GOLDENS_DIR) / "qwen36_fullattn_layer_27b";
+  if (!fs::exists(dir / "manifest.json")) {
+    MESSAGE("27B full-attention layer golden absent; skipping");
+    return;
+  }
+  json m = json::parse(std::ifstream(dir / "manifest.json"));
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  RunQwen36Layer(b, q, dir, m);
   b.DestroyQueue(q);
 }
 

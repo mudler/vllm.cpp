@@ -158,6 +158,16 @@ target_include_directories(test_cpu_threadpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_nvfp4_matmul vt/test_ops_nvfp4_matmul.cpp)
 vllm_cpp_add_test(test_ops_nvfp4_fp4 vt/test_ops_nvfp4_fp4.cpp)
 target_include_directories(test_ops_nvfp4_fp4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(VLLM_CPP_CUTLASS)
+  foreach(_NVFP4_TACTIC RANGE 0 31)
+    add_test(NAME test_ops_nvfp4_fp4_tactic_${_NVFP4_TACTIC}
+      COMMAND test_ops_nvfp4_fp4
+        "--test-case=matmul_nvfp4_cutlass every forced SM12 tactic matches reference and captures")
+    set_tests_properties(test_ops_nvfp4_fp4_tactic_${_NVFP4_TACTIC} PROPERTIES
+      ENVIRONMENT
+        "VT_FP4_FORCE_TACTIC=${_NVFP4_TACTIC};VT_FP4_FULL_TACTICS=1;VT_FP4_AUTOTUNE=1")
+  endforeach()
+endif()
 vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)

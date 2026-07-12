@@ -12,8 +12,11 @@ changes. W1 retains its CPU/TSan, exact/legacy sm_121a capture, focused
 memcheck and both-27B-model proof. Pushed `bce2627` completes its component,
 trace and exact oracle classification: it is structurally effective and
 materially improves the 27B grid, but does not pass the strict component or
-every-axis gates. The fresh runtime trace promotes the separate 32-tactic W2
-family; exact `4e1d8ca` remains W1's immutable before-state.
+every-axis gates. The fresh runtime trace promoted the separate 32-tactic W2
+family; W2 now implements and correctness-gates that family, merged CT gate/up
+semantics and the traced one-input activation/quant producer. Its component is
+positive but below the strict timing/memory floor, and the clean pushed-SHA
+oracle campaign remains. Exact `4e1d8ca` remains W1's immutable before-state.
 
 ## Scope
 
@@ -160,6 +163,19 @@ semantics, with `VT_FP4_MERGED_GATE_UP=0` preserving the split W2 arm and
 iteration unless the post-gate trace identifies it as the next correctness or
 performance blocker.
 
+The post-repair paired trace exposes one more execution-chain component inside
+W2 rather than a new speculative lever. vLLM's production graph replaces the
+`SiluAndMul([M,2I] -> [M,I])` plus dynamic NVFP4 quant pair with
+`silu_and_mul_nvfp4_quant`; the exact 27B oracle trace contains
+`vllm::silu_mul_cvt_fp16_to_fp4<__nv_bfloat16,false>`. Our merged branch still
+materializes the BF16 `[M,I]` activation and then runs `ScaledFp4Quant`, even
+though the older local fusion only accepts two separately contiguous `[M,I]`
+operands and therefore cannot consume the merged `[M,2I]` buffer. W2 includes
+the upstream one-input fusion with a dedicated
+`VT_FP4_MERGED_SILU_QUANT=0` same-binary fallback. It must preserve the BF16
+rounding boundary byte-for-byte and is gated independently before the full W2
+component campaign.
+
 ## Upstream chain and execution dependency
 
 ### vLLM orchestration
@@ -180,6 +196,18 @@ performance blocker.
 - `compressed_tensors_w4a4_nvfp4.py:95-138` retains the fused scalar arrays
   through load, then uses the maximum weight divisor and maximum input divisor,
   reciprocates them and computes the one runtime alpha.
+- `vllm/compilation/passes/fusion/act_quant_fusion.py:31-40,128-164` registers
+  the NVFP4 activation-quant replacement and rewrites a one-input
+  `SiluAndMul` followed by `scaled_fp4_quant` to the fused custom op when the
+  CUDA symbol is present; `fix_functionalization.py:140-158` preserves its two
+  mutated outputs through graph lowering.
+- `csrc/libtorch_stable/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu:27-116,120-163`
+  loads the two contiguous halves of `[M,2I]`, computes SiLU and multiply in
+  float, rounds through the input half type, and emits packed E2M1 plus the
+  swizzled FP8 scale stream in one launch. The exact 27B oracle profile enables
+  `fuse_act_quant=True` and executes
+  `silu_mul_cvt_fp16_to_fp4<__nv_bfloat16,false>`; this runtime trace, not only
+  the available source, makes the fusion part of the production comparison.
 - `vllm/config/vllm.py:193-275,1192-1200` enables FlashInfer autotuning for
   optimization levels O1-O3; the production oracle resolves O3 and full/
   piecewise cudagraphs.
@@ -285,6 +313,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
 | merged dense gate/up (`qwen3_5.py`, `qwen2_moe.py`, `linear.py`) | concatenate packed gate/up rows and linear FP8 block scales on device, swizzle the combined scale once, emit BF16 `[M,2I]`, apply `SiluAndMul`, and preserve a split diagnostic arm |
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
+| merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
 | warmup/persistence (`kernel_warmup.py:133-220`) | tune all configured hybrid buckets before server readiness, version cache entries by source/tactic ABI/device/CUDA/CUTLASS/model shape, load atomically, and keep lazy tuning only as a fail-closed diagnostic path |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
@@ -306,6 +335,8 @@ wrappers.
 | FlashInfer bucket helpers `fused_moe/utils.py:212-307` | **W1 ported/gated:** table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; pushed `c8807b0` gates the real ready-hit/miss/retry capture in both exact and legacy modes |
 | FlashInfer tactic enumeration `fp4_gemm_cutlass_template_sm120.h:187-220` | assert 32 stable tactic descriptors/order; force every supported tactic over representative small-M and real Qwen shapes; unsupported configs are reported/skipped only during tuning |
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
+| `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
+| `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
 | autotuner cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. Stale disk-version rejection belongs to W3 |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
@@ -324,7 +355,9 @@ native token-count correctness are preconditions to all speed claims.
    dequantized BF16 reference within the upstream tolerance. Merged gate/up
    uses one max-derived input divisor, weight multiplier and alpha and matches
    an explicit upstream-semantics reference with unequal logical-shard scales.
-   Existing native fallback and fused quant tests remain green.
+   The one-input fused producer is byte-exact to BF16 `SiluAndMul` followed by
+   `ScaledFp4Quant` for decode, padded and real-I shapes. Existing native
+   fallback and two-input fused quant tests remain green.
 3. **CUDA safety/lifecycle:** compute-sanitizer covers small/padded/real shapes,
    every scheduler/orientation class, workspace growth/reuse and graph replay
    with zero errors. No process-exit scratch leak is added; queue/device
@@ -377,7 +410,7 @@ before any new FP4 GPU command begins.
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
-| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; raw tactic gates pass locally on DGX, but merged topology/scale semantics, model correctness, sanitizer, component, trace and exact 27B campaign remain required |
+| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; implementation, raw tactics, merged topology/scalars, one-input byte-exact/sanitizer gates and native 16/16 tokens are green. The fusion's unprofiled c16 A/B is +1.521% but only 17/20 timing and 0/4 sampled-memory axes pass; paired trace is +2.084%/20-of-20 and structurally removes the boundary. Clean pushed-SHA exact 27B closure remains |
 | W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
@@ -385,6 +418,68 @@ W1 and W2 are intentionally separate performance iterations. W3 cannot be
 folded into their timed arms because tuning placement changes startup and
 first-request behavior. W4 breadth cannot delay an order-0 BF16 speed repair,
 but its open state remains visible in the kernel matrix.
+
+## W2 implementation and component classification (2026-07-12)
+
+The W2 staging build uses CUDA 13.0.88, `sm_121a` and CUTLASS 4.5. The full
+32-tactic surface is split across bounded translation units and addressed by
+stable IDs. Dense gate/up weights and scale streams remain resident in their
+merged form, use the maximum logical-shard input/weight divisors and one alpha,
+and feed a backend-neutral `SiluAndMulFp4Quant` op. Its CPU implementation is
+the composed oracle; CUDA consumes contiguous `[M,2I]` and writes packed FP4
+plus the swizzled scale stream in one pass. The three environment fallbacks in
+the W2 row isolate the fusion, merged topology and full tactic family without a
+second binary.
+
+Focused CPU tests pass **12/12 cases and 885/885 assertions**. The final staged
+CUDA NVFP4 slice passes **14/14 and 18,619/18,619**; a focused
+compute-sanitizer run passes **1/1 and 16/16** with zero errors and zero leaks.
+The one-input producer is byte-exact to BF16 `SiluAndMul` followed by
+`ScaledFp4Quant` over F32/BF16 decode, padded and real `I=17408` shapes. The
+real dense gate passes **9/9 prefill argmax positions and 16/16 greedy tokens**.
+The paged shipping and `VT_FP4_MERGED_SILU_QUANT=0` arms each pass **235/235**
+and **16/16 tokens**. Final staged ops/op-parity/paged binary SHA are
+`36779505…e9786` / `338a059b…dbc4` / `dc90e5fa…3546`; ops/sanitizer/dense/paged
+log SHA are `738d15a5…fcbe` / `61b23535…911b` / `3d2b984f…6595` /
+`04a3c872…d29c1`, and GPU process snapshots are empty. Evidence lives at
+`~/work/vllm.cpp-nvfp4-small-m/debug/{merged-silu-quant,final-staging}-20260712`.
+
+The full native stream also depends on the separately owned
+`KERNEL-GDN-AOT-BF16` correction: vLLM stores GDN core/z at the BF16 model
+dtype, while the former local f32 default takes the known near-tie branch once
+W2 tactics are active. The existing vendored BF16 path is now default only for
+the dense 27B; all fusion A/B arms hold it constant. Its own
+`VT_GDN_OUT_BF16=0` component evidence and open gates remain in the kernel
+matrix/ledger rather than being attributed to FP4.
+
+The unprofiled cache-off c16/96-request AB/BA/AB series runs the shipping fused
+arm at 815.625/812.912/800.256 tok/s and the fallback at
+792.337/798.232/801.833 tok/s: means **809.597/797.467 = 1.015211×** with
+0.827%/0.491% CV. It passes **17/20** timing axes and **0/4** sampled memory
+axes, although all six processes return memory. The three misses are p90 E2E,
+p90 TPOT and p99 TPOT; the memory means are sensitive to one 354-MiB-low
+fallback GPU sample, so they remain failures rather than being normalized away.
+Summary/driver SHA-256 are `cb5e5204…b0ab89` and `3cda0d4c…d7bb0` under
+`debug/merged-silu-quant-c16-ab-20260712`.
+
+The bounded paired trace records fused/fallback means
+**817.020/800.338 = 1.020843×** and 20/20 timing axes. The fused producer runs
+8,557 times for 4.802 s; fallback materializes SiLU 8,390 times for 7.054 s and
+adds 8,013 quant calls accounting for 2.643 s of the fallback-only quant time.
+That is roughly 4.9 s less boundary-kernel time and about 8,000 fewer launches
+in the full capture. Summary SHA-256 is `9933724b…a1318`; fused/fallback nsys
+hashes are `094615a1…be22c` and `5efe621c…0a080` under
+`debug/merged-silu-quant-trace-20260712`. These trace timings own structural
+attribution only. Fresh server autotuning can select different near-tied valid
+tactics and generated suffixes; correctness remains the exact op and committed
+native model gates, never generated-text equality between independent tuning
+sessions.
+
+This is an honest active checkpoint, not W2 closure: the component no-regression
+rule is still red and no fresh vLLM denominator exists for this uncommitted
+binary. Commit and push the gated implementation, rebuild it cleanly, then run
+the exact c1/2/4/8/16/32 three-repetition 27B oracle campaign. Keep 35B held
+until all 27B throughput, latency and memory axes pass.
 
 ## Risks and decisions
 

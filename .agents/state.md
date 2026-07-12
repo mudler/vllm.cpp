@@ -4968,3 +4968,90 @@ exact max-divisor/one-alpha semantics and a split diagnostic toggle. The raw
 tactics carry no performance claim yet. Implement this contract, require full
 16/16 model parity, rerun safety/component/trace/exact-27B, and continue to hold
 35B until every 27B axis passes.
+
+## 2026-07-12 — NVFP4 W2 implementation and fused activation-quant checkpoint
+
+W2 now mirrors the execution chain identified by the oracle trace. CUTLASS 4.5
+builds the eight tiles × two orientations × static/Stream-K schedulers as 32
+stable tactics split across bounded CUDA translation units. Eager launches keep
+PDL disabled because this adapter does not own vLLM/FlashInfer's complete PDL
+chain. The dense path retains merged gate/up weights and scale streams, applies
+the maximum logical-shard CT input/weight divisors and one alpha, and exposes
+`VT_FP4_MERGED_GATE_UP=0` plus `VT_FP4_FULL_TACTICS=0` for independent W2/W1
+attribution.
+
+The exact `bce2627` oracle trace and pinned sources prove production vLLM also
+replaces `SiluAndMul([M,2I])` plus `scaled_fp4_quant` with
+`silu_mul_cvt_fp16_to_fp4<__nv_bfloat16,false>`. A new backend-neutral
+`SiluAndMulFp4Quant` op now mirrors that boundary: CPU composes the reference,
+CUDA consumes the merged buffer and emits packed FP4 plus swizzled FP8 scales
+in one pass, and `VT_FP4_MERGED_SILU_QUANT=0` restores materialized BF16
+activation plus quantization. The upstream-derived local test is byte-exact for
+F32/BF16 decode, padded and real `I=17408` shapes.
+
+Staging validation is green: CPU focused **12/12 / 885/885**; CUDA NVFP4
+**14/14 / 18,619/18,619**; focused compute-sanitizer **1/1 / 16/16**, zero
+errors and zero leaks; dense 27B **9/9 prefill argmax + 16/16 greedy**; paged
+shipping and fusion-fallback arms each **235/235 + 16/16**. Evidence is
+`~/work/vllm.cpp-nvfp4-small-m/debug/{merged-silu-quant,final-staging}-20260712`.
+Final staged ops/op-parity/paged binaries hash `36779505…e9786` /
+`338a059b…dbc4` / `dc90e5fa…3546`; ops/sanitizer/dense/paged logs hash
+`738d15a5…fcbe` / `61b23535…911b` / `3d2b984f…6595` / `04a3c872…d29c1`.
+All before/after GPU process snapshots are empty. An initial dense command whose
+exact filter selected zero tests was overwritten by the verified wildcard run
+and contributes no gate evidence.
+
+The unprofiled cache-off c16/96 AB/BA/AB series records fused
+815.625/812.912/800.256 and fallback 792.337/798.232/801.833 tok/s. Means are
+**809.597/797.467 = 1.015211×**, CV 0.827%/0.491%; **17/20** timing axes and
+**0/4** sampled memory axes pass, although all six processes return memory.
+The misses are p90 E2E, p90 TPOT and p99 TPOT, all driven by the slow fused r3.
+The memory comparison is noisy—one fallback GPU sample is 354 MiB below its
+other two—but remains a failure under the every-axis rule. Summary/driver SHA
+are `cb5e5204…b0ab89` / `3cda0d4c…d7bb0` in
+`debug/merged-silu-quant-c16-ab-20260712`.
+
+The bounded paired trace is stable at fused 818.120/816.419/816.522 versus
+fallback 800.336/800.507/800.172 tok/s: means
+**817.020/800.338 = 1.020843×** and 20/20 timing axes. The fused producer runs
+8,557 times / 4.802 s; fallback SiLU runs 8,390 / 7.054 s and retains 8,013
+additional quant calls / 2.643 s. The boundary therefore removes about 8,000
+launches and roughly 4.9 s in the full capture. Summary SHA is
+`9933724b…a1318`; fused/fallback nsys are `094615a1…be22c` /
+`5efe621c…0a080`. The earlier full-warmup trace attempt was interrupted before
+completion and archived as `merged-silu-quant-trace-VOID-full-warmup-20260712`;
+it owns no result. Trace timing is structural evidence only.
+
+Fresh autotune sessions can select different near-tied valid tactics and later
+generated suffixes; cross-startup generated-text equality is diagnostic, while
+the exact op/model gates own correctness. The DGX has no compute process and
+the GPU lock is free. W2 remains `ACTIVE`: update/check the canonical record,
+commit and push this checkpoint, rebuild from that immutable SHA, then run the
+binding exact c1/2/4/8/16/32 27B campaign under one lock. Do not run 35B until
+every 27B throughput, latency and memory axis passes.
+
+## 2026-07-12 — dense-27B BF16 GDN output default is correctness-required, component open
+
+The W2 correctness localization also resolved the active
+`KERNEL-GDN-AOT-BF16` row. With the full tactic stack, the former f32 GDN
+core/z boundary takes the known alternate whitespace near-tie branch; vLLM and
+FLA store the recurrence output at the BF16 model dtype. The already-vendored
+BF16 `chunk_o` and typed norm path now become the default only for
+`config.num_experts==0`, i.e. the dense 27B. Recurrence accumulation/state stay
+f32. `VT_GDN_OUT_BF16=0` restores f32 and `=1` can explicitly exercise BF16.
+Every 35B path, including GGUF, remains on its prior f32 default, so no held
+35B result is inferred.
+
+Under one uncontended lock, cache-off c16/96 AB/BA/AB gives BF16
+789.183/790.691/787.963 and f32 780.660/782.203/786.207 tok/s. Means are
+**789.279/783.023 = 1.007989×**, CV 0.141%/0.299%. BF16 passes **16/20** timing
+and **2/4** memory axes; all six processes return memory. The misses are median
+ITL, median TPOT, p90 ITL and p99 TTFT. Summary SHA-256 is
+`ee6d25c2b8b1b4cd80abc3dd6a89b4c6055ca426abb7bf2eb8720aaf2ffc930b` at
+`~/work/vllm.cpp-nvfp4-small-m/debug/gdn-out-bf16-c16-ab-20260712`.
+
+BF16 stays the dense-27B default because it mirrors the oracle and is required
+for the strengthened **9/9 prefill + 16/16 greedy** acceptance stream, not
+because this component passed the strict every-axis speed gate. The GDN row
+remains `ACTIVE` on paired trace/pool classification and the same clean
+pushed-SHA exact vLLM campaign that closes FP4 W2.

@@ -64,9 +64,9 @@ inner 4096, state 128; context 262144.
   sampling/token-budget audit. Exact pushed-`b5c6e4f` 27B online evidence is
   complete and below the every-axis floor. The fixed HTTP series has no unread
   c32 socket and is steady-state-neutral against its legacy arm; the bounded
-  legacy series does not reproduce the historical rare tail. FP4 W3-B now has
-  a staging-green shared-loader all-bucket implementation; clean immutable
-  safety/selection/component/trace gates are next. Repeat exact 27B under one
+  legacy series does not reproduce the historical rare tail. FP4 W3-B at clean
+  `d7cdf66` is immutable build/correctness/safety-green; repeated
+  selection/component/trace gates are next. Repeat exact 27B under one
   whole-series GPU lock after that classification before starting exact 35B.
 - Provision SGLang `v0.5.13` (`28b095c`) with the digest-pinned CUDA 13 image
   from [the leaf spike](specs/cuda-sglang-low-concurrency.md) in an isolated

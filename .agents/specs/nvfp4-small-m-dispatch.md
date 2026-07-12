@@ -4,8 +4,8 @@
 spike; W1/W2 are measured and W3 is `ACTIVE` under
 `CLAIM-NVFP4-SMALL-M-3`; W3-A delayed event timing is immutable
 correctness/safety-green, performance-classified and strict-acceptance-failed;
-W3-B pre-serve all-bucket implementation is staging-green and awaits its clean
-pushed-SHA safety/selection/performance gates.
+W3-B at clean `d7cdf66` is immutable build/correctness/access-safety-green and
+awaits repeated selection/component/trace/oracle performance gates.
 **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.5.0`, CUDA `13.0.88`, and the
@@ -305,11 +305,37 @@ misses. A separate HTTP process answers `/health` and `/v1/models`; completion
 is line 3 and listening is line 6, again with zero misses. Model/server/models
 log hashes are `96afc6ed…de401`, `2264a306…7e9e` and `80e10055…8315`.
 
-This is deliberately a non-immutable implementation checkpoint. It grants no
-performance credit and does not replace clean `b5c6e4f`. Next: clean-build the
-pushed SHA, repeat exact/legacy focused plus memcheck/model/server gates, then
-measure fresh-process plan stability and the same c16 component, paired trace
-and exact 27B oracle ladder. The 35B run remains prohibited.
+This was deliberately a non-immutable implementation checkpoint. It granted no
+performance credit and did not replace clean `b5c6e4f`; the immutable result
+below supersedes its pending safety disposition.
+
+### W3-B immutable correctness/safety checkpoint (2026-07-12)
+
+Clean pushed `d7cdf66db0cfcc53d68d49613623ec6cd3807641` (tree
+`24abb109…c488`) builds from a detached, clean source with CUDA 13.0.88,
+sm_121a, CUTLASS 4.5 and vendored Triton AOT. Configure/build SHA-256 are
+`50047004…e09e3` / `cac56085…fa248`. Registry and dense-loader contracts pass
+**12/12 cases, 114/114 assertions** (one existing skip) and **4/4, 29/29**.
+Fresh exact and legacy FP4 processes each pass **14/14 cases and
+26,819/26,819 assertions**.
+
+The fresh native 27B process passes **235/235 + 16/16**, materializes exactly
+**80/80** profiles into 80 entries and reports zero lazy misses. Focused
+compute-sanitizer memcheck passes **1/1, 24,586/24,586, zero errors**. A fresh
+server answers `/health` and `/v1/models`; warmup completion is log line 3,
+listening is line 6, and no lazy miss occurs. Model/memcheck/server log hashes
+are `5ea053fe…b6475`, `2ef8f758…b124`, and `04d04fce…6951`;
+manifest/provenance are `6f372fbe…89b1` / `1e8db7b7…e936` under
+`~/work/vllm.cpp-nvfp4-small-m/d7cdf66…/w3b`. GPU inventories are empty and
+the lock is free after the series.
+
+The one-process profile list contains the oracle's narrow 128x32x256 family,
+but several choices differ from the disposable process, which reinforces that
+one startup cannot prove cross-process stability. This checkpoint therefore
+closes immutable build/correctness/access-safety and placement only. It grants
+no speed credit and leaves repeated plan stability, the same c16 component,
+paired trace and exact 27B oracle ladder pending. `b5c6e4f` remains binding and
+the 35B run remains prohibited.
 
 ## Upstream chain and execution dependency
 
@@ -459,7 +485,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
-| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A classified; W3-B implemented/staging-green:** A retains three warmups + stream sync + 1,000-us GPU delay + ten eager repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch and diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`), plus actual-W4A4 shared-loader readiness ordering (`model_loader.cpp:211-260`). `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Disposable 27B/server evidence is 80/80 profiles, zero lazy misses and 16/16 correctness; immutable safety/selection/performance remains pending. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
+| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A classified; W3-B immutable correctness/safety-green at `d7cdf66`:** A retains three warmups + stream sync + 1,000-us GPU delay + ten eager repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch and diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`), plus actual-W4A4 shared-loader readiness ordering (`model_loader.cpp:211-260`). `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Clean exact/legacy/model/memcheck/server evidence passes at 80/80 profiles, zero lazy misses, 16/16 correctness and zero sanitizer errors; repeated selection/performance remains pending. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
 | diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
 
@@ -481,7 +507,7 @@ wrappers.
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass. **W3-A classified. W3-B port staged:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; exact/legacy disposable CUDA processes each pass 14/14 + 26,819/26,819, and the real model/server prove 80/80 profiles before readiness with zero misses. Immutable memcheck and repeated stability/performance remain pending; stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass. **W3-A classified. W3-B immutable safety-gated:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. Repeated stability/performance remains pending; stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -555,7 +581,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A is classified and not independently accepted. W3-B implementation is complete enough for staging: shared loader, true-W4A4 capability gate, max-token request, full hybrid enumeration, observed-work completion guard, capture-ready reuse, counters/diagnostics and fallback. CPU and disposable CUDA/model/server gates pass at 80/80 profiles and zero misses. It remains `ACTIVE`, not accepted, until a clean pushed-SHA build, memcheck, repeated selection/component, paired trace and exact 27B oracle campaign. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison |
+| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A is classified and not independently accepted. W3-B implementation is immutable build/correctness/access-safety-green at clean `d7cdf66`: shared loader, true-W4A4 capability gate, max-token request, full hybrid enumeration, observed-work completion guard, capture-ready reuse, counters/diagnostics and fallback; exact/legacy/model/memcheck/server gates pass at 80/80 profiles and zero misses. It remains `ACTIVE`, not accepted, until repeated selection/component, paired trace and the exact 27B oracle campaign. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be

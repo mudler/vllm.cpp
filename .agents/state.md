@@ -5257,3 +5257,36 @@ processes to classify tactic-ID stability and the same c16 component, then run
 paired nsys and the exact 27B production-vLLM ladder. `b5c6e4f` remains the
 only binding denominator, W3-C persistence remains optional, and 35B stays
 prohibited until every 27B axis passes.
+
+## 2026-07-12 — W3-B immutable correctness/safety green; stability/performance next
+
+Pushed `d7cdf66db0cfcc53d68d49613623ec6cd3807641` was cloned into a
+fresh detached, clean source tree (`24abb109…c488`) under
+`~/work/vllm.cpp-nvfp4-small-m/d7cdf66…/w3b`. CUDA 13.0.88, sm_121a,
+FlashInfer CUTLASS 4.5 and vendored Triton AOT build the registry, loader,
+focused FP4, native 27B and server targets. Configure/build SHA-256 are
+`50047004…e09e3` / `cac56085…fa248`.
+
+One uncontended lock covered the whole immutable runtime series. Registry and
+dense-loader contracts pass 12/12 cases + 114/114 assertions (one existing
+skip) and 4/4 + 29/29. Fresh exact and `VT_FP4_EXACT_BUCKETS=0` processes each
+pass 14/14 cases and 26,819/26,819 assertions. The native 27B process passes
+235/235 + 16/16, tunes exactly 80/80 profiles (16 buckets × five N/K shapes)
+into 80 ready entries and reports zero post-warmup lazy misses. Focused
+compute-sanitizer memcheck passes 1/1, 24,586/24,586 assertions and zero errors.
+
+A separate fresh server answers `/health` and `/v1/models`; pre-serve
+completion is log line 3 and listening is line 6, with 80/80 profiles and no
+lazy miss. Model/memcheck/server hashes are `5ea053fe…b6475`,
+`2ef8f758…b124`, and `04d04fce…6951`. Evidence manifest/provenance are
+`6f372fbe…89b1` / `1e8db7b7…e936`. GPU before/after inventories are empty
+and `/tmp/gpu` is free.
+
+The immutable one-process plan list contains the oracle's narrow
+128x32x256 family, but some IDs differ from the earlier disposable process.
+That is evidence that placement and coverage alone do not establish
+cross-process stability. This checkpoint closes build, correctness,
+access-safety and readiness ordering only; it grants no speed credit. Next run
+fresh W3-B versus `VT_FP4_PRE_SERVE_WARMUP=0` selection/component AB/BA/AB,
+then paired nsys and the exact 27B oracle campaign. `b5c6e4f` remains binding,
+W3-C persistence remains optional, and 35B remains prohibited.

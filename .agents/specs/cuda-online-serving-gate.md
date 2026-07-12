@@ -43,10 +43,11 @@ behind `VT_FP4_AUTOTUNE_DELAY=0`. Immutable `71f1e89` focused/model/memcheck
 gates pass and delayed real plans contain the traced ID 6/4 narrow family. Its
 c16 delayed/off means are 809.932/803.379 tok/s = 1.008156x, but strict
 acceptance fails at 13/20 timing and 2/4 memory with only 5/35 delayed keys
-stable. W3-B's shared-loader pre-serve implementation is staging-green at
-80/80 profiles, completion before HTTP listening, zero lazy misses and 16/16
-correctness. Its clean pushed-SHA sanitizer, repeated selection/component,
-trace and exact-oracle gates remain pending, so `b5c6e4f` is still binding. The
+stable. W3-B's shared-loader pre-serve implementation is immutable
+build/correctness/safety-green at clean `d7cdf66`: 80/80 profiles, completion
+before HTTP listening, zero lazy misses, 16/16 correctness and 24,586/24,586
+zero-error memcheck assertions. Repeated selection/component, trace and
+exact-oracle performance remain pending, so `b5c6e4f` is still binding. The
 35B series waits until repaired 27B passes every axis.
 
 ## Scope

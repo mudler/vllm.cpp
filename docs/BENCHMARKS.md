@@ -358,7 +358,7 @@ Detailed release classification:
 
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
-| `ENG-HOST-WEIGHT-RESIDENCY` local post-rebase | **PENDING AFTER FIX; PRIOR METRICS DIAGNOSTIC** | At `80f370f`, direct ON/OFF/fresh-vLLM peak PSS is **1.847/8.168/6.883 GiB**, total throughput **6607.68/6605.42/6717.32 tok/s**, and closed-loop mean TTFT **658/659/904 ms**, but project output is unstable. After rebasing onto `b5c6e4f`, the first attempted arm failed before timing because the upstream 27B BF16 GDN default incorrectly selected the ordinary-BF16 4B. The local merge now gates that default on a native-NVFP4 projection; default and explicit-f32 real-model smoke runs pass. | Commit the fix, rerun ON/OFF/fresh-vLLM from that immutable SHA, and require repeated ON/ON, OFF/OFF and ON/OFF stability before promoting metrics. |
+| `ENG-HOST-WEIGHT-RESIDENCY` local post-W3 rebase | **FAILED CORRECTNESS / METRICS DIAGNOSTIC** | At immutable `829883d`, all 18 direct ON/OFF/fresh-vLLM arms complete. Peak PSS is **1.768/8.168/6.773 GiB**, stable PSS **0.757/0.754/4.096 GiB**, VRAM **11,692/11,701/12,924 MiB**, total throughput **6607.04/6603.28/6716.47 tok/s**, and closed-loop mean TTFT **659/660/902 ms**. vLLM is 128/128 stable, but project same-mode and ON/OFF comparisons are only 121-125/128. | Localize project greedy nondeterminism and restore repeated 128/128 same-mode and ON/OFF output before promoting any memory, throughput, or TTFT metric. |
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
 | `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124** | Immutable `3f256ab` remains **55/124**. W3-E strict-fails **32/40 timing + 6/8 memory**. W3-C at `d211b8f` passes six fresh native-only processes with byte-identical 64/64 maps, zero tuning/misses and **235/235 + 16/16** each. C3R proves direct/fallback **6/6 x 128-token equality** under identical sequential batch shape; each local arm and production-default vLLM are **0/6** equal between sequential and c2. The stopped partial rates/memory remain `VOID`; no exact grid or 35B performance command ran. | Repeat the corrected frozen-plan c2/c16 40-timing + 8-memory gate with exact counts, fixed model gates and the controlled 6/6 proof before any exact grid. Cross-leg hashes are diagnostic. 35B performance remains held. |
 | `ENG-BATCH-INVARIANT` | **ROADMAP INVENTORY — NOT IMPLEMENTED / NOT APPLICABLE TO PRODUCTION SPEED FLOOR** | vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` off; its opt-in determinism suite changes NVFP4, matmul, norm, attention and collective dispatch. C3R executes only the default-off contrast and records 0/6 sequential-vs-c2 equality for both engines. vllm.cpp exposes no matching opt-in mode, so no support or performance result is claimed. | After production parity, write `specs/batch-invariant-execution.md`, port the upstream operator/e2e determinism cases and gate correctness separately from the default production performance path. |
@@ -635,6 +635,39 @@ BF16 recurrence output only when the layer carries a native-NVFP4 output
 projection. Both an explicit `VT_GDN_OUT_BF16=0` smoke run and the repaired
 default complete on the real 4B checkpoint; the immutable-SHA full campaign is
 `PENDING`.
+
+The post-W3-rebase immutable `829883d` campaign is also **FAILED CORRECTNESS /
+METRICS DIAGNOSTIC**. It repeats the same 18-arm interleaved series after
+rebasing onto upstream `3cc490c`; the upstream true-W4A4 pre-serve autotune path
+is inactive for this plain-BF16 checkpoint.
+
+| `829883d` axis, three-run mean | Direct ON | Same-binary OFF | Fresh vLLM | ON / vLLM |
+|---|---:|---:|---:|---:|
+| Launch-to-exit peak PSS | **1.768 GiB** | 8.168 GiB | 6.773 GiB | **0.2610x** |
+| Stable GPU-resident PSS | **0.757 GiB** | 0.754 GiB | 4.096 GiB | **0.1849x** |
+| Peak process VRAM | **11,692 MiB** | 11,701 MiB | 12,924 MiB | **0.9047x** |
+| Whole-system peak `MemAvailable` drop | **1.375 GiB** | 7.958 GiB | 3.893 GiB | **0.3531x** |
+| Full monitored process wall | **28.601 s** | 28.818 s | 56.959 s | 0.5021x |
+| Total throughput | **6607.04 tok/s** | 6603.28 tok/s | 6716.47 tok/s | **0.9837x** |
+| Output throughput | **730.59 tok/s** | 730.17 tok/s | 742.69 tok/s | **0.9837x** |
+| Mean TTFT, closed-loop 32 | **658.92 ms** | 659.66 ms | 902.46 ms | **0.7301x** |
+| Median TTFT, closed-loop 32 | **220.29 ms** | 220.39 ms | 674.87 ms | **0.3264x** |
+| P99 TTFT, closed-loop 32 | **3540.88 ms** | 3544.06 ms | 3099.21 ms | **1.1425x** |
+
+The fresh vLLM latency supplement observes DELTA outputs at the same client
+boundary as `vllm-bench`; client and internal mean TTFT differ by only 0.36 ms.
+Production throughput remains from the stats-disabled arms. Project same-mode
+comparisons span 121-125/128 and matched ON/OFF comparisons span 122-124/128;
+vLLM remains 128/128 and project/vLLM is 75-76/128. No result is promoted.
+
+Raw evidence: `/tmp/qwen35-direct-main-829883d`; exact commit
+`829883d08824deb43b95d58d98595e340b356f3a`; driver SHA-256
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`;
+latency harness SHA-256
+`41eacf1d3e3d41599648b8e94f3c1d4db06cb46747725888374f6ce1cede6457`.
+CPU and native-sm_120 Triton-AOT builds pass; focused CPU/CUDA pass 6/6 and
+direct OFF passes 3/3. Final GPU state is 146 MiB / 0% / 42 C, and the
+benchmark-window kernel journal is empty.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

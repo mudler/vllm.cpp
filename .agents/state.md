@@ -7267,3 +7267,22 @@ is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
   104/105 on the known parallel async drain-count timing case; isolated async
   passes 3/3. Final GPU is 146 MiB/0%/42 C and the one-hour kernel journal is
   empty.
+
+## 2026-07-12 — post-W3 rebase and immutable local benchmark
+
+- Rebased all 30 local commits onto upstream `3cc490c`, composing upstream
+  true-W4A4 capability dispatch with local dense host-weight ownership. CPU and
+  native-sm_120 Triton-AOT builds pass; focused CPU/CUDA are 6/6 and direct OFF
+  is 3/3. Pushed rewritten branch tip `829883d` with an explicit lease.
+- Ran three monitored and three unmonitored direct ON/fresh-vLLM/direct OFF
+  repetitions under one `/tmp/gpu` lock on Qwen3.5-4B BF16, 128x1024->128,
+  concurrency 32, mnbt 2048 and greedy sampling. Added three fresh client-
+  observed DELTA-output vLLM latency runs.
+- ON/OFF/vLLM peak PSS is 1.768/8.168/6.773 GiB, stable PSS
+  0.757/0.754/4.096 GiB, VRAM 11,692/11,701/12,924 MiB, and total throughput
+  6607.04/6603.28/6716.47 tok/s. Mean/median/P99 TTFT is 659/220/3541,
+  660/220/3544 and 902/675/3099 ms.
+- Correctness still fails: project same-mode spans 121-125/128 and ON/OFF spans
+  122-124/128; vLLM is 128/128. All numbers remain diagnostic. Evidence is
+  `/tmp/qwen35-direct-main-829883d`; final GPU is 146 MiB/0%/42 C and the
+  benchmark-window kernel journal is empty.

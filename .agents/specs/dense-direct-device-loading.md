@@ -179,6 +179,17 @@ again refutes direct-loading-specific corruption, but no metric can be promoted.
 Raw evidence is `/tmp/qwen35-direct-main-54401bf`; driver SHA-256 is
 `7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
 
+Post-W3-rebase checkpoint: immutable `829883d` repeats all 18 direct
+ON/OFF/fresh-vLLM arms after upstream `3cc490c`. Peak PSS is
+1.768/8.168/6.773 GiB, stable PSS 0.757/0.754/4.096 GiB, VRAM
+11,692/11,701/12,924 MiB, and total throughput 6607.04/6603.28/6716.47 tok/s.
+Mean/median/P99 TTFT is 659/220/3541 ms ON, 660/220/3544 OFF and
+902/675/3099 ms vLLM. Disposition remains **FAILED correctness / diagnostic
+metrics** because project same-mode and ON/OFF files match only 121-125/128
+while vLLM remains 128/128. Raw evidence is
+`/tmp/qwen35-direct-main-829883d`; driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
+
 ## Risks and mitigations
 
 - Early asynchronous free is a use-after-free. Every layer checkpoint

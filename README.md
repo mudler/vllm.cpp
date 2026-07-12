@@ -583,6 +583,17 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   while project same-mode and ON/OFF comparisons vary at 121-124/128. Full CPU
   CTest is 104/105 on the known async timing case, which passes 3/3 isolated;
   GPU is idle and the kernel journal is empty.
+  After rebasing the complete local series onto upstream `3cc490c`, immutable
+  `829883d` again completes all 18 arms under one lock. Direct ON/OFF/vLLM
+  launch PSS is **1.768/8.168/6.773 GiB**, stable PSS is
+  **0.757/0.754/4.096 GiB**, and VRAM is **11,692/11,701/12,924 MiB**. Total
+  throughput is **6,607.04/6,603.28/6,716.47 tok/s**, making ON **0.9837x**
+  vLLM. Client-observed closed-loop mean/median/P99 TTFT is
+  **659/220/3,541 ms** ON versus **902/675/3,099 ms** vLLM. This remains
+  **FAILED correctness / diagnostic only**: project same-mode comparisons span
+  121-125/128 and ON/OFF spans 122-124/128, while vLLM remains 128/128. Focused
+  CPU/CUDA suites pass 6/6 and direct OFF passes 3/3; final GPU state is
+  146 MiB/0%/42 C and the benchmark-window kernel journal is empty.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

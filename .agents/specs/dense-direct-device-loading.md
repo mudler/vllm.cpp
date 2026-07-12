@@ -162,6 +162,16 @@ is not relabeled onto rebased code. Raw evidence is
 `/tmp/qwen35-direct-postrebase-80f370f`; driver SHA-256 is
 `7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
 
+Post-`b5c6e4f` integration checkpoint: the first direct-ON arm was not timed
+because its first forward hit the CUDA gated-RMSNorm dtype check. Upstream's
+27B-only BF16 GDN intent had been encoded as `num_experts == 0`, which also
+matches the local ordinary-BF16 4B. The local merge keys the default to an
+actually present native-NVFP4 GDN output projection, preserving the 27B path and
+restoring all other checkpoints to f32 unless explicitly overridden. Real-model
+4B smoke runs pass with both explicit f32 and the corrected default. The complete
+immutable-SHA memory/throughput/TTFT campaign is `PENDING`; partial launch
+samples are not evidence.
+
 ## Risks and mitigations
 
 - Early asynchronous free is a use-after-free. Every layer checkpoint

@@ -1984,8 +1984,9 @@ DType GdnInDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
-// GDN recurrence-OUTPUT + z-gate in bf16 (27B default ON; 35B keeps its former
-// f32 default; VT_GDN_OUT_BF16=0/1 overrides both for diagnostics).
+// GDN recurrence-OUTPUT + z-gate in bf16 (native-NVFP4 27B default ON; other
+// checkpoints keep their former f32 default; VT_GDN_OUT_BF16=0/1 overrides
+// both for diagnostics).
 // vLLM keeps core_attn_out and the z gate bf16 (the gated-RMSNorm consumes them):
 // FLA chunk_o.py stores o bf16, and Qwen3NextGatedRMSNorm reads bf16 core/gate,
 // upcasting to f32 only for the variance reduction (layernorm_guard.py). Our
@@ -2003,13 +2004,13 @@ DType GdnInDType() {
 // bf16 reproduces native vLLM 16/16. Keep every unmeasured 35B arm, including
 // GGUF, on its prior f32 default; the explicit env override remains available
 // for its later independently gated campaign.
-DType GdnOutDType(bool dense_model) {
+DType GdnOutDType(bool native_nvfp4) {
   static const int override = [] {
     const char* e = std::getenv("VT_GDN_OUT_BF16");
     if (e == nullptr) return -1;
     return e[0] == '0' ? 0 : 1;
   }();
-  const bool bf16 = override >= 0 ? override != 0 : dense_model;
+  const bool bf16 = override >= 0 ? override != 0 : native_nvfp4;
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
@@ -2059,7 +2060,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                             : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
                : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
                                       : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType(!w.out_proj_fp4.Empty());
   DBuf z = !w.in_proj_z_fp8.Empty()
                ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
@@ -2332,7 +2333,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
   // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
   // byte-identical f32 path.
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const DType outdt = GdnOutDType(!w.out_proj_fp4.Empty());
   DBuf z = !w.in_proj_z_fp8.Empty()
                ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))

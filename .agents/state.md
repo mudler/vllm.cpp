@@ -7236,3 +7236,17 @@ and direct OFF are 5/5 + 3/3. Parallel CPU CTest is 104/105 because the known
 timing-sensitive `test_async_llm` drain assertion observed seven rather than
 three iterations; it passes 3/3 isolated. Every GPU process exited, final state
 is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
+
+## 2026-07-12 — post-W2 rebase local integration fix
+
+- Rebased the local RTX series onto upstream `b5c6e4f`. CPU/native-sm_120
+  Triton-AOT builds and focused CPU/CUDA tests were green after conflict
+  resolution.
+- The first full benchmark arm then failed before timing at CUDA
+  `RmsNormGated`: upstream's 27B BF16 GDN-output default used
+  `num_experts == 0`, which also selected the ordinary-BF16 Qwen3.5-4B and
+  mismatched its F32 norm weight.
+- Narrowed both GDN paths to default BF16 only when a native-NVFP4 output
+  projection is present. Explicit-f32 and corrected-default real-model smoke
+  runs complete; GPU returned idle. The immutable-SHA full campaign is pending
+  and the aborted arm contributes no benchmark metric.

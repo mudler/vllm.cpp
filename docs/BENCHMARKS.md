@@ -358,6 +358,7 @@ Detailed release classification:
 
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
+| `ENG-HOST-WEIGHT-RESIDENCY` local post-rebase | **PENDING AFTER FIX; PRIOR METRICS DIAGNOSTIC** | At `80f370f`, direct ON/OFF/fresh-vLLM peak PSS is **1.847/8.168/6.883 GiB**, total throughput **6607.68/6605.42/6717.32 tok/s**, and closed-loop mean TTFT **658/659/904 ms**, but project output is unstable. After rebasing onto `b5c6e4f`, the first attempted arm failed before timing because the upstream 27B BF16 GDN default incorrectly selected the ordinary-BF16 4B. The local merge now gates that default on a native-NVFP4 projection; default and explicit-f32 real-model smoke runs pass. | Commit the fix, rerun ON/OFF/fresh-vLLM from that immutable SHA, and require repeated ON/ON, OFF/OFF and ON/OFF stability before promoting metrics. |
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
 | `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124** | Immutable `3f256ab` remains **55/124**. W3-E strict-fails **32/40 timing + 6/8 memory**. W3-C at `d211b8f` passes six fresh native-only processes with byte-identical 64/64 maps, zero tuning/misses and **235/235 + 16/16** each. C3R proves direct/fallback **6/6 x 128-token equality** under identical sequential batch shape; each local arm and production-default vLLM are **0/6** equal between sequential and c2. The stopped partial rates/memory remain `VOID`; no exact grid or 35B performance command ran. | Repeat the corrected frozen-plan c2/c16 40-timing + 8-memory gate with exact counts, fixed model gates and the controlled 6/6 proof before any exact grid. Cross-leg hashes are diagnostic. 35B performance remains held. |
 | `ENG-BATCH-INVARIANT` | **ROADMAP INVENTORY — NOT IMPLEMENTED / NOT APPLICABLE TO PRODUCTION SPEED FLOOR** | vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` off; its opt-in determinism suite changes NVFP4, matmul, norm, attention and collective dispatch. C3R executes only the default-off contrast and records 0/6 sequential-vs-c2 equality for both engines. vllm.cpp exposes no matching opt-in mode, so no support or performance result is claimed. | After production parity, write `specs/batch-invariant-execution.md`, port the upstream operator/e2e determinism cases and gate correctness separately from the default production performance path. |
@@ -624,6 +625,16 @@ Triton-AOT rebuilds pass; focused CPU is 4/4 and CUDA default/direct-OFF is
 5/5 + 3/3. No post-rebase number is claimed at this checkpoint. Rerun the exact
 three-arm W4.4 driver from the immutable environment-fix commit and record peak
 and stable PSS, VRAM, total/output throughput, and mean TTFT.
+
+The first post-`b5c6e4f` campaign attempt is **FAILED / NOT TIMED**. Direct ON
+stopped on its first model forward with `cuda rmsnorm_gated: gate/weight dtype
+must match x`; no OFF or vLLM arm ran, so the partial memory samples are not a
+benchmark. The cause was the rebased 27B BF16 GDN default using
+`num_experts == 0`, which also identifies Qwen3.5-4B. The repaired merge selects
+BF16 recurrence output only when the layer carries a native-NVFP4 output
+projection. Both an explicit `VT_GDN_OUT_BF16=0` smoke run and the repaired
+default complete on the real 4B checkpoint; the immutable-SHA full campaign is
+`PENDING`.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

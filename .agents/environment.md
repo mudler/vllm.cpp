@@ -65,9 +65,12 @@ inner 4096, state 128; context 262144.
   complete and below the every-axis floor. The fixed HTTP series has no unread
   c32 socket and is steady-state-neutral against its legacy arm; the bounded
   legacy series does not reproduce the historical rare tail. FP4 W3-B at clean
-  `d7cdf66` is immutable build/correctness/safety-green; repeated
-  selection/component/trace gates are next. Repeat exact 27B under one
-  whole-series GPU lock after that classification before starting exact 35B.
+  `d7cdf66` is immutable build/correctness/safety-green. Its repeated
+  prewarm/lazy component is steady-state neutral at **1.000293×**, strict-fails
+  **15/20 timing + 2/4 memory**, and retains only **20/80** stable prewarmed
+  tactic IDs; first-use latency improves, so shipping prewarm stays without
+  speed credit. Run paired trace next, then repeat exact 27B under one
+  whole-series GPU lock after the trace-grounded repair before starting 35B.
 - Provision SGLang `v0.5.13` (`28b095c`) with the digest-pinned CUDA 13 image
   from [the leaf spike](specs/cuda-sglang-low-concurrency.md) in an isolated
   environment after current GPU claims; never mutate `~/venvs/vllm-oracle`.

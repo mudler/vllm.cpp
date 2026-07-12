@@ -46,8 +46,12 @@ acceptance fails at 13/20 timing and 2/4 memory with only 5/35 delayed keys
 stable. W3-B's shared-loader pre-serve implementation is immutable
 build/correctness/safety-green at clean `d7cdf66`: 80/80 profiles, completion
 before HTTP listening, zero lazy misses, 16/16 correctness and 24,586/24,586
-zero-error memcheck assertions. Repeated selection/component, trace and
-exact-oracle performance remain pending, so `b5c6e4f` is still binding. The
+zero-error memcheck assertions. Its repeated c16 prewarm/lazy component is
+**808.457/808.220 tok/s = 1.000293×**, strict-fails **15/20 timing + 2/4
+memory**, and retains only **20/80** stable prewarmed tactic IDs. First-use
+first chunk improves **5.662→0.779 s**, so shipping prewarm stays without
+steady-state speed credit. Paired trace and exact-oracle performance remain,
+so `b5c6e4f` is still binding. The
 35B series waits until repaired 27B passes every axis.
 
 ## Scope

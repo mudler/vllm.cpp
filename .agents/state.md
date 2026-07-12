@@ -5290,3 +5290,37 @@ access-safety and readiness ordering only; it grants no speed credit. Next run
 fresh W3-B versus `VT_FP4_PRE_SERVE_WARMUP=0` selection/component AB/BA/AB,
 then paired nsys and the exact 27B oracle campaign. `b5c6e4f` remains binding,
 W3-C persistence remains optional, and 35B remains prohibited.
+
+## 2026-07-12 — W3-B first-use win, steady-state and stability strict-fail
+
+The exact immutable `d7cdf66` server binary completed shipping prewarm versus
+`VT_FP4_PRE_SERVE_WARMUP=0` lazy W3-A at c16/96, input 1,024→output 128 in
+AB/BA/AB order under one uncontended `/tmp/gpu` lock. Every arm used fresh
+server state plus verified model/corpus/binary cache eviction. All 576/576
+timed requests, six memory returns and six cache drops pass; GPU process
+inventory is empty and the lock is reacquirable after exit.
+
+Prewarm runs are 806.723/806.094/812.555 tok/s and lazy runs are
+809.209/807.292/808.160. Means are **808.457/808.220 = 1.000293×**, CV
+**0.360%/0.097%**. The strict result is only **15/20 timing** and **2/4
+memory**: prewarm is red on mean ITL, mean TPOT, median TPOT, p90 E2E and p99
+TPOT; PSS/RSS improve slightly, while mean GPU peak is **38,048/37,615 MiB**
+and available-memory drop **65,615,217/64,893,877 KiB**.
+
+Prewarm materializes 80/80/80 plan keys, but just **20/80** keep the same
+tactic ID in all three fresh processes. Lazy traffic touches 35/40/40 keys and
+keeps **9/30** common IDs stable; paired equal IDs are 13/35, 18/40 and 17/40.
+All-bucket placement therefore does not repair near-tie tactic instability.
+The separate untimed first request does reproduce its intended benefit:
+prewarm/lazy mean first chunk is **0.779/5.662 s** and full request
+**14.929/20.249 s**. Keep shipping prewarm because it mirrors production and
+moves first-use tuning before readiness, but grant no steady-state speed credit
+and do not replace binding `b5c6e4f`.
+
+Evidence root is
+`~/work/vllm.cpp-nvfp4-small-m/d7cdf66db0cfcc53d68d49613623ec6cd3807641/w3b/component-ab`.
+Summary/selection/driver/provenance/tree SHA-256 are `c371848a…cd11`,
+`fec3bf11…99c8`, `e996e6dd…662`, `1df8bdbe…23cb` and
+`85910147…7b6`. Next: paired prewarm/lazy nsys under one lock, compare actual
+kernel/tactic mix, then drive the highest-ranked execution-grounded repair and
+repeat exact 27B. W3-C remains optional and 35B remains prohibited.

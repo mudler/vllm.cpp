@@ -5324,3 +5324,25 @@ Summary/selection/driver/provenance/tree SHA-256 are `c371848a…cd11`,
 `85910147…7b6`. Next: paired prewarm/lazy nsys under one lock, compare actual
 kernel/tactic mix, then drive the highest-ranked execution-grounded repair and
 repeat exact 27B. W3-C remains optional and 35B remains prohibited.
+
+## 2026-07-12 — W3-B trace attempt 1 void on cache-inventory drift
+
+The first prewarm/lazy/vLLM nsys harness held one uncontended lock and launched
+clean `d7cdf66` shipping prewarm with startup/autotune excluded from a trailing
+steady-state capture. Its separate warmup and three retained c16/48 runs all
+completed: **144/144** timed requests at
+810.245/810.860/808.760 tok/s, and a 104,727,615-byte report was flushed.
+
+The lifecycle gate then rejected the leg before lazy or vLLM could run. The
+driver had placed mutable client result/log files under a root passed to
+`drop_file_cache`; the before/after inventories therefore changed from
+**50 to 58 files** (`f9be15f7…106f`→`7e43c029…5947`). That makes the entire
+three-arm attempt **VOID**. The prewarm timing and report are partial artifacts,
+not benchmark or kernel evidence, and no speed denominator changes.
+
+Evidence is `~/work/vllm.cpp-nvfp4-small-m/d7cdf66…/w3b/trace-ab-oracle`;
+driver/report/tree SHA are `c1162d8f…2743`, `eb8a0996…1cc5c` and
+`69a16a4d…b62f`. GPU inventory is empty, Nsight has no live session, and
+`/tmp/gpu` is free. Rerun into a new root with client artifacts excluded from
+cache-drop inventory and a symlink to the immutable shared corpus; preserve
+this failed evidence unchanged. 35B remains prohibited.

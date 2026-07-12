@@ -51,7 +51,11 @@ zero-error memcheck assertions. Its repeated c16 prewarm/lazy component is
 memory**, and retains only **20/80** stable prewarmed tactic IDs. First-use
 first chunk improves **5.662→0.779 s**, so shipping prewarm stays without
 steady-state speed credit. Paired trace and exact-oracle performance remain,
-so `b5c6e4f` is still binding. The
+but trace attempt 1 is **VOID**: prewarm completed 144/144, then the lifecycle
+checker found cache-inventory drift from 50 to 58 files because mutable client
+results sat under an eviction root; lazy/vLLM did not run and no kernel result
+is inferred. The corrected trace uses an immutable corpus-only root. Thus
+`b5c6e4f` is still binding. The
 35B series waits until repaired 27B passes every axis.
 
 ## Scope

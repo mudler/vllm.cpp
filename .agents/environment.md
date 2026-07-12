@@ -69,8 +69,10 @@ inner 4096, state 128; context 262144.
   prewarm/lazy component is steady-state neutral at **1.000293×**, strict-fails
   **15/20 timing + 2/4 memory**, and retains only **20/80** stable prewarmed
   tactic IDs; first-use latency improves, so shipping prewarm stays without
-  speed credit. Run paired trace next, then repeat exact 27B under one
-  whole-series GPU lock after the trace-grounded repair before starting 35B.
+  speed credit. Trace attempt 1 is VOID after prewarm-only 144/144 because
+  mutable client results changed cache inventory 50→58 before lazy/vLLM.
+  Rerun with an immutable corpus-only eviction root, then repeat exact 27B under
+  one whole-series GPU lock after the trace-grounded repair before starting 35B.
 - Provision SGLang `v0.5.13` (`28b095c`) with the digest-pinned CUDA 13 image
   from [the leaf spike](specs/cuda-sglang-low-concurrency.md) in an isolated
   environment after current GPU claims; never mutate `~/venvs/vllm-oracle`.

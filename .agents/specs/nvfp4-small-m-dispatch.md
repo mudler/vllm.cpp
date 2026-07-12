@@ -378,6 +378,18 @@ prewarm/lazy nsys capture to compare actual kernel/tactic mix, then select the
 next trace-grounded lever before another exact 27B oracle ladder. W3-C remains
 optional and 35B remains prohibited.
 
+The first three-arm trace attempt under `w3b/trace-ab-oracle` is **VOID**. The
+prewarm server completed its separate warmup plus three retained c16/48 windows
+(**144/144**, 810.245/810.860/808.760 tok/s), and wrote an nsys report, but the
+post-exit lifecycle validator correctly stopped the series: newly created
+client logs/results were nested under the cache-drop root, changing its stable
+inventory from **50 to 58 files**. Lazy and vLLM never ran, so neither the
+partial throughput nor the capture may be interpreted as a paired result.
+Driver/report/tree SHA are `c1162d8f…2743`, `eb8a0996…1cc5c` and
+`69a16a4d…b62f`; GPU returned idle and the lock is free. The next reproduction
+moves mutable artifacts outside the corpus-only eviction root and writes a new
+evidence directory rather than modifying this failed record.
+
 ## Upstream chain and execution dependency
 
 ### vLLM orchestration

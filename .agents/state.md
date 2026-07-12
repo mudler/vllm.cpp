@@ -7119,3 +7119,22 @@ and opt-out remain **5/5** and **2/2**. Every process exited, GPU returned to
 `ENG-HOST-WEIGHT-RESIDENCY` remains `ACTIVE`: W4.3 is accepted, while W4.4 must
 spike layer-bounded direct-device materialization to remove the remaining owned
 host model before any peak-memory parity claim.
+
+## 2026-07-12 — W4.4 layer-bounded direct-device spike accepted
+
+Traced the remaining 8.168-GiB peak through the construction seam. The queue is
+currently selected only when `LoadedEngine` constructs its runner, after
+`ModelRegistry::Load` has returned the complete owned host model. The existing
+dense prepare hook then uploads everything at once. vLLM constructs on the
+target device and streams tensors into parameters, so the remaining concrete
+lifetime difference is the full-model host accumulation.
+
+W4.4 will preselect exactly the queue later copied into the dense runner, carry
+a non-owning pointer through `ModelSource`, and after layer 0 plus each later
+layer reuse the existing `PrepareBf16Resident` / synchronize /
+`ReleaseResidentQwen3_5DenseHostWeights` sequence. Eligibility requires owned
+safetensors, no top-level or nested quantization config, CUDA, non-UMA and host
+release enabled. Existing resident tensors make prior-layer walks no-ops. CPU,
+UMA, GGUF, quantized 27B, MoE, borrowed and release-OFF paths are explicit
+exclusions. Load exceptions must destroy a preselected queue before ownership
+transfer. No code or improved number is part of this spike checkpoint.

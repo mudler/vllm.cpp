@@ -129,6 +129,10 @@ throughput is 6553.57 ON, 6552.29 OFF and 6717.94 vLLM: ON is neutral versus
 OFF and 0.9755x vLLM. Full CPU CTest is 105/105; focused native-sm_120 is 5/5
 default and 2/2 opt-out. Raw evidence is `/tmp/qwen35-peak-w4-a077d72`.
 
+The required W4.4 follow-on is now separately specified in
+[dense-direct-device-loading.md](dense-direct-device-loading.md). No W4.4 code
+or improved number is part of that spike checkpoint.
+
 ## Risks and mitigations
 
 - Advice can increase file refaults and load time. Checkpoints are layer-sized,

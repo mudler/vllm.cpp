@@ -540,7 +540,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   loader regressions: they were launched outside `nix develop .#cuda` and GDB
   showed every worker in the CPU matmul fallback. The accepted campaign wraps
   the process and lock in the CUDA flake. Correctness and performance parity
-  remain open.
+  remain open. The W4.4 layer-bounded direct-device spike is accepted and
+  **PENDING implementation**; it carries the eventual dense-runner queue into
+  loading and releases each synchronized plain-BF16 layer instead of retaining
+  the full owned host model.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

@@ -173,6 +173,7 @@ class GPUModelRunner final : public ModelRunnerBase {
   bool kv_cache_backend_resident() const {
     return kv_cache_backend_resident_;
   }
+  vt::Device device() const { return queue_.device; }
 
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed

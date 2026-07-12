@@ -5,7 +5,9 @@
 #include "vllm/entrypoints/model_loader.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -16,6 +18,9 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
+#if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
+#include "vt/cuda/nvfp4_autotune.h"
+#endif
 
 namespace vllm::entrypoints {
 
@@ -57,6 +62,13 @@ std::vector<vllm::SafetensorsFile> LoadShards(const std::string& model_dir) {
   }
   return shards;
 }
+
+#if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
+bool EnvironmentEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr || value[0] != '0';
+}
+#endif
 
 }  // namespace
 
@@ -164,6 +176,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
       max_model_len_(params.max_model_len > 0
                          ? params.max_model_len
                          : static_cast<int>(config_.max_position_embeddings)),
+      max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
+          params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
           params, model_->registration().info)),
       kv_cfg_(ModelRegistry::MakeKVCache(
@@ -172,18 +186,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       scheduler_(MakeSchedulerConfig(
                      max_model_len_,
                      params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-                     ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                                ModelRegistry::IsDenseModel(
-                                                    *model_)),
+                     max_num_batched_tokens_,
                      params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/prefix_caching_enabled_),
       runner_(config_, *model_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
-              /*max_num_batched_tokens=*/
-              ResolveMaxNumBatchedTokens(params, max_model_len_,
-                                         ModelRegistry::IsDenseModel(*model_))),
+              /*max_num_batched_tokens=*/max_num_batched_tokens_),
       executor_(runner_),
       engine_core_(scheduler_, executor_),
       input_processor_(tokenizer_, config_),
@@ -195,6 +205,59 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  WarmupKernels();
+}
+
+void LoadedEngine::WarmupKernels() {
+#if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
+  if (!model_->uses_nvfp4_w4a4() ||
+      runner_.device().type != vt::DeviceType::kCUDA ||
+      !EnvironmentEnabled("VT_FP4_PRE_SERVE_WARMUP") ||
+      !EnvironmentEnabled("VT_FP4_AUTOTUNE") ||
+      !EnvironmentEnabled("VT_FP4_PLAN_CACHE")) {
+    return;
+  }
+
+  int32_t dummy_token = -1;
+  for (int32_t token = 0; token < tokenizer_.VocabSize(); ++token) {
+    if (tokenizer_.HasToken(token) && !tokenizer_.IsSpecial(token)) {
+      dummy_token = token;
+      break;
+    }
+  }
+  if (dummy_token < 0) {
+    throw std::runtime_error(
+        "NVFP4 pre-serve warmup could not find a non-special tokenizer token");
+  }
+
+  SamplingParams sampling;
+  sampling.max_tokens = 1;
+  sampling.temperature = 0.0;
+  sampling.ignore_eos = true;
+  sampling.PostInit();
+  std::vector<int32_t> prompt(
+      static_cast<size_t>(max_num_batched_tokens_), dummy_token);
+
+  std::cerr << "vllm.cpp: warming FlashInfer-parity NVFP4 profiles at "
+            << max_num_batched_tokens_ << " tokens before serving\n";
+  vt::cuda::Nvfp4AutotuneWarmupScope warmup(
+      static_cast<uint32_t>(max_num_batched_tokens_));
+  engine_core_.add_request(std::make_unique<vllm::v1::Request>(
+      "_vllm_cpp_nvfp4_warmup", std::move(prompt), std::move(sampling),
+      /*arrival_time=*/0.0, /*block_hasher=*/nullptr));
+  while (scheduler_.get_num_unfinished_requests() > 0) {
+    (void)engine_core_.step();
+  }
+  if (scheduler_.has_finished_requests()) {
+    (void)engine_core_.step();
+  }
+  if (scheduler_.get_num_unfinished_requests() != 0 ||
+      scheduler_.has_finished_requests()) {
+    throw std::runtime_error(
+        "NVFP4 pre-serve warmup left scheduler state behind");
+  }
+  warmup.Complete();
+#endif
 }
 
 vllm::v1::AsyncLLM& LoadedEngine::async_engine() {

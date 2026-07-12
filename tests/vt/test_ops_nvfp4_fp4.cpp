@@ -31,6 +31,7 @@
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
 #include "vt/backend.h"
+#include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/cuda/nvfp4_tactic_ids.h"
 #include "vt/dtype.h"
@@ -87,6 +88,16 @@ TEST_CASE("FlashInfer NVFP4 hybrid M buckets preserve small decode shapes") {
   CHECK(LegacyMBucket(17) == 32);
   CHECK_THROWS_AS(vt::cuda::nvfp4::NextPositivePowerOfTwo(0x80000001U),
                   std::overflow_error);
+
+  using vt::cuda::nvfp4::HybridMTuningBuckets;
+  CHECK(HybridMTuningBuckets(2048) ==
+        std::vector<uint32_t>{1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+                              768, 1024, 1280, 1536, 1792, 2048});
+  CHECK(HybridMTuningBuckets(4096) ==
+        std::vector<uint32_t>{1,    2,    4,    8,    16,   32,   64,
+                              128,  256,  512,  768,  1024, 1280, 1536,
+                              1792, 2048, 2560, 3072, 3584, 4096});
+  CHECK(HybridMTuningBuckets(5000).back() == 5000);
 }
 
 TEST_CASE("FlashInfer SM12 NVFP4 tactics retain exact stable descriptor order") {
@@ -867,6 +878,48 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
     const float got = Bf16ToFloat(retry_out[i]);
     CHECK(got == doctest::Approx(cpu_out[i]).epsilon(0.03).scale(1.0));
   }
+
+  // Port of kernel_warmup.py::flashinfer_autotune plus FlashInfer's
+  // get_hybrid_num_tokens_buckets profile generation. One maximum-M call under
+  // the pre-serve scope materializes every missing bucket for this N/K. M=32
+  // must therefore become a capture-safe ready hit before any real request.
+  const vt::cuda::Nvfp4AutotuneWarmupStats stats_before =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  {
+    vt::cuda::Nvfp4AutotuneWarmupScope warmup(static_cast<uint32_t>(M));
+    vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
+    warmup.Complete();
+  }
+  const vt::cuda::Nvfp4AutotuneWarmupStats stats_after =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  CHECK(stats_after.scopes_started == stats_before.scopes_started + 1);
+  CHECK(stats_after.scopes_completed == stats_before.scopes_completed + 1);
+  CHECK(stats_after.profiles_requested > stats_before.profiles_requested);
+  CHECK(stats_after.profiles_tuned - stats_before.profiles_tuned ==
+        stats_after.profiles_requested - stats_before.profiles_requested);
+
+  Tensor tap_prewarmed = tap;
+  tap_prewarmed.shape[0] = 32;
+  Tensor to_prewarmed = to;
+  to_prewarmed.shape[0] = 32;
+  b.Memset(gq, dout, 0, g_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  b.BeginCapture(gq);
+  vt::MatmulNvfp4Cutlass(gq, to_prewarmed, tap_prewarmed, tasw, tbp, tbsw,
+                         alpha);
+  void* prewarmed_graph = b.EndCaptureGraph(gq);
+  REQUIRE(prewarmed_graph != nullptr);
+  b.ReplayGraph(gq, prewarmed_graph);
+  b.Synchronize(gq);
+  std::vector<uint16_t> prewarmed_out(static_cast<size_t>(32 * N));
+  b.Copy(gq, prewarmed_out.data(), dout,
+         prewarmed_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  for (size_t i = 0; i < prewarmed_out.size(); ++i) {
+    const float got = Bf16ToFloat(prewarmed_out[i]);
+    CHECK(got == doctest::Approx(cpu_out[i]).epsilon(0.03).scale(1.0));
+  }
+  b.DestroyGraph(prewarmed_graph);
 
   for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
   b.DestroyQueue(gq);

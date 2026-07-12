@@ -141,6 +141,10 @@ class LoadedEngine {
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
+  // Mirrors kernel_warmup.py::flashinfer_autotune: before any async/server
+  // frontend starts, one maximum-token synthetic request runs under the NVFP4
+  // all-bucket autotune scope. CUDA dense W4A4 only; CPU/other models are no-op.
+  void WarmupKernels();
 
   bool hash_ready_;  // declared first: forces EnsureNoneHash() ahead of the rest.
   HfConfig config_;
@@ -149,6 +153,7 @@ class LoadedEngine {
   std::unique_ptr<LoadedModel> model_;
   tok::Tokenizer tokenizer_;
   int max_model_len_;
+  int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
   vllm::v1::KVCacheConfig kv_cfg_;
   vllm::v1::Scheduler scheduler_;

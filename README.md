@@ -38,8 +38,16 @@ OpenAI-compatible server.
 > acceptance at **13/20 timing** and **2/4 memory** axes; only **5/35** common
 > delayed plan keys keep one tactic ID across all three fresh processes. No
 > accepted speed credit or vLLM denominator changes. The faithful delayed
-> default stays inside active W3 while W3-B pre-serve all-bucket warmup now owns
-> selection stabilization; optional versioned
+> default stays inside active W3. W3-B now implements the shared-library
+> pre-serve repair: a true-W4A4 `LoadedEngine` runs one 2,048-token synthetic
+> request before `AsyncLLM` or HTTP readiness, and each live FP4 projection
+> materializes all 16 FlashInfer hybrid buckets in memory. A disposable
+> CUDA-13/sm_121a stage passes exact and legacy focused tests (**14/14,
+> 26,819/26,819** each), the native 27B gate (**235/235 + 16/16**), and server
+> readiness with **80/80** profiles cached before the listening line and zero
+> post-warmup lazy misses. This is implementation/staging evidence, not an
+> immutable performance result: clean pushed-SHA sanitizer, selection-stability,
+> component, trace and exact-oracle gates remain pending. Optional versioned
 > persistence is separately gated in W3-C and is not the oracle denominator.
 > The 27B-only BF16 GDN output default remains correctness-required;
 > every 35B path retains f32. No production-parity claim is made, and the 35B
@@ -184,7 +192,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact clean `b5c6e4f` 27B online checkpoint is valid but below the all-axis floor: c1→c32 total ratios are 0.993/0.952/0.966/0.976/1.021/1.022×, with 4/4/5/4/17/14 of 20 performance axes and 2/4 memory axes. FP4 W2 is correctness-green; its trace shows runtime tactic selection, not tactic availability, is the next mismatch. 35B performance is held behind 27B closure. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact clean `b5c6e4f` 27B online checkpoint is valid but below the all-axis floor: c1→c32 total ratios are 0.993/0.952/0.966/0.976/1.021/1.022×, with 4/4/5/4/17/14 of 20 performance axes and 2/4 memory axes. FP4 W3-B now pre-tunes all live buckets before frontend readiness and is staging correctness-green at 80/80 profiles/zero misses; immutable speed evidence is pending. 35B performance is held behind 27B closure. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -194,7 +202,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (CUTLASS NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact clean `b5c6e4f` 27B online total throughput is 0.952-1.022× vLLM over c2-c32 medians (c1 0.993×), but the all-axis gate remains red at 4/4/5/4/17/14 of 20 axes and 2/4 memory axes. The fixed HTTP pool remains healthy/neutral. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate component evidence. FP4 W2 includes the full 32-tactic SM12 family, merged CT gate/up semantics and fused one-input SiLU→NVFP4 quantization; focused CUDA/sanitizer/model gates pass. Its clean trace shows our planner selects wide 128×128×128/256×128×128 tactics where vLLM resolves the 128×32×256 Stream-K/static pair. W3-A's exact 1-ms GPU-delayed eager timing mirror is immutable sm_121a correctness/safety-green at `71f1e89`; its c16 component is +0.816% mean total throughput but fails strict 13/20 timing and 2/4 memory acceptance, with only 5/35 delayed keys selection-stable. W3-B pre-serve in-memory all-bucket tuning is active. The vendored BF16 GDN output path remains the 27B-only default, while 35B stays on f32. Both models are W0 compute-sanitizer access-clean and the indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (CUTLASS NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact clean `b5c6e4f` 27B online total throughput is 0.952-1.022× vLLM over c2-c32 medians (c1 0.993×), but the all-axis gate remains red at 4/4/5/4/17/14 of 20 axes and 2/4 memory axes. The fixed HTTP pool remains healthy/neutral. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate component evidence. FP4 W2 includes the full 32-tactic SM12 family, merged CT gate/up semantics and fused one-input SiLU→NVFP4 quantization; focused CUDA/sanitizer/model gates pass. Its clean trace shows our planner selects wide 128×128×128/256×128×128 tactics where vLLM resolves the 128×32×256 Stream-K/static pair. W3-A's exact 1-ms GPU-delayed eager timing mirror is immutable sm_121a correctness/safety-green at `71f1e89`; its c16 component is +0.816% mean total throughput but fails strict 13/20 timing and 2/4 memory acceptance, with only 5/35 delayed keys selection-stable. W3-B's shared-loader max-token warmup is implemented and staging-green: 80/80 profiles cover 16 buckets across five real 27B shapes before HTTP readiness, with zero lazy misses and the 16/16 stream intact. Its immutable safety/component/trace/oracle gates are pending, so `b5c6e4f` remains binding. The vendored BF16 GDN output path remains the 27B-only default, while 35B stays on f32. Both models are W0 compute-sanitizer access-clean and the indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -231,7 +239,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, CUTLASS 4.5 SM12 fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass. The 27B path includes the 32-tactic FlashInfer dispatch surface, merged gate/up CT scaling and fused SiLU→NVFP4 quantization, while exact production-vLLM performance remains `GATING` |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, CUTLASS 4.5 SM12 fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass. The 27B path includes the 32-tactic FlashInfer surface, merged gate/up CT scaling, fused SiLU→NVFP4 quantization, and W3-B shared-loader all-bucket pre-tuning. W3-B's disposable stage is 80/80 profiles, zero lazy misses and 16/16 token-green; immutable performance remains `GATING` |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -279,17 +287,23 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   shapes. The completed c16/96 AB/BA/AB averages **809.932/803.379 tok/s =
   1.008156×**, but fails strict no-regression at 13/20 timing and 2/4 memory;
   delayed tactic IDs are stable for only 5/35 common keys. W3-A therefore gets
-  no standalone speed acceptance. W3-B pre-serve all-bucket tuning is now the
-  active selection-stability repair, while W3-C's
+  no standalone speed acceptance. W3-B now moves tuning into the common loader:
+  one maximum-token synthetic request expands each observed W4A4 N/K shape over
+  FlashInfer's full hybrid bucket list before any frontend becomes ready;
+  `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. The disposable GB10 stage
+  materializes **80/80** profiles (16 buckets × five shapes), reports zero lazy
+  misses, preserves **16/16** token parity, and logs completion before server
+  listening. Clean immutable safety and repeated selection/performance evidence
+  are still pending, while W3-C's
   collision-complete persistence is optional and separately gated. The existing BF16
   GDN output path is also now default only for the dense 27B because it mirrors
   vLLM and restores the full native token stream; its +0.799% c16 component
   passes 16/20 timing and 2/4 memory axes, so `VT_GDN_OUT_BF16=0` remains the
   required f32 diagnostic and the GDN row stays `ACTIVE`. Every 35B path keeps
   its prior f32 default. This is a concrete
-  runtime repair, not a hardware ceiling. Implement and component-gate W3-B,
-  then repeat the exact 27B c1-c32 campaign; the 35B run waits behind complete
-  27B closure.
+  runtime repair, not a hardware ceiling. Freeze W3-B at a pushed SHA, run its
+  sanitizer and repeated component/selection gates, then repeat the exact 27B
+  c1-c32 campaign; the 35B run waits behind complete 27B closure.
 - The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
   cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
   vendored FlashAttention-2 prefill, register-tiled GDN `delta_h`, tensor-core WY,
@@ -320,8 +334,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   18,619/18,619, both 27B arms pass 235/235 + 16/16, and delayed memcheck is
   16,389/16,389 with zero errors. Its timed c16 component is +0.816% in mean
   total throughput but fails strict acceptance at 13/20 timing and 2/4 memory;
-  only 5/35 common delayed keys retain one ID across three processes. W3-B owns
-  the remaining pre-serve selection-stability gap.
+  only 5/35 common delayed keys retain one ID across three processes. W3-B now
+  implements the pre-serve scope, exact 2,048-bucket enumeration and
+  diagnostic-only later misses in the shared library loader. CPU tests and a
+  disposable sm_121a build/focused/native-27B/server-readiness stage pass, but
+  immutable sanitizer, repeated selection, component, trace and oracle gates
+  remain open.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and
@@ -392,8 +410,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   Stream-K/static pair while our planner predominantly selects wide tactics.
   W3-A delayed-event timing is immutable correctness/safety-green but its
   +0.816% component fails strict 13/20 timing and 2/4 memory acceptance, with
-  only 5/35 delayed keys stable; W3-B owns pre-serve bucket coverage and the
-  oracle-disabled file cache is not a speed denominator.
+  only 5/35 delayed keys stable. W3-B's loader/bucket implementation is staging-
+  green at 80/80 profiles and zero later misses, but is not yet an immutable
+  speed result; the oracle-disabled file cache is not a speed denominator.
   W0 is
   merged at `7d29e0c`; its clean GB10 build,
   default/fallback

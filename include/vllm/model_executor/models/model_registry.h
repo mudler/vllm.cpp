@@ -75,6 +75,9 @@ class LoadedModel {
   LoadedModel& operator=(LoadedModel&&) = delete;
 
   const ModelRegistration& registration() const { return registration_; }
+  // Runtime capability rather than architecture metadata: GGUF/synthetic
+  // instances of a W4A4-capable family may contain only BF16 weights.
+  virtual bool uses_nvfp4_w4a4() const { return false; }
 
  protected:
   explicit LoadedModel(const ModelRegistration& registration)

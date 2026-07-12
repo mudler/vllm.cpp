@@ -22,17 +22,29 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_cutlass_tactics.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
 namespace {
+
+thread_local uint32_t g_fp4_warmup_max_tokens = 0;
+thread_local bool g_fp4_warmup_observed = false;
+std::atomic<int> g_fp4_warmup_active_scopes{0};
+std::atomic<bool> g_fp4_warmup_complete{false};
+std::atomic<uint64_t> g_fp4_warmup_scopes_started{0};
+std::atomic<uint64_t> g_fp4_warmup_scopes_completed{0};
+std::atomic<uint64_t> g_fp4_warmup_profiles_requested{0};
+std::atomic<uint64_t> g_fp4_warmup_profiles_tuned{0};
+std::atomic<uint64_t> g_fp4_lazy_misses{0};
 
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -339,21 +351,53 @@ struct SelectedPlan {
   size_t workspace_bytes = 0;
 };
 
-SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
+using SelectedPlanCache = nvfp4::SingleFlightPlanCache<SelectedPlan>;
+
+SelectedPlanCache& PlanCache() {
+  static SelectedPlanCache plans;
+  return plans;
+}
+
+uint32_t PlanMBucket(const nvfp4::LaunchParams& params) {
+  return Fp4ExactBucketsEnabled()
+             ? nvfp4::HybridMBucket(static_cast<uint32_t>(params.m))
+             : nvfp4::LegacyMBucket(static_cast<uint32_t>(params.m));
+}
+
+nvfp4::PlanKey MakePlanKey(const nvfp4::LaunchParams& params,
+                           int device_ordinal, bool full_tactics) {
+  return nvfp4::PlanKey{PlanMBucket(params),
+                        params.n,
+                        params.k,
+                        device_ordinal,
+                        Fp4DeviceArchitecture(device_ordinal),
+                        static_cast<uint8_t>(DType::kBF16),
+                        full_tactics ? nvfp4::kFullTacticSetVersion
+                                     : nvfp4::kW1TacticSetVersion};
+}
+
+SelectedPlan ResolveSelectedPlan(nvfp4::LaunchParams params,
+                                 int device_ordinal,
+                                 bool report_lazy_miss) {
   const auto& candidates = ActiveCandidates();
   const bool full_tactics = Fp4FullTacticsEnabled();
-  const uint32_t m_bucket = Fp4ExactBucketsEnabled()
-                                ? nvfp4::HybridMBucket(static_cast<uint32_t>(params.m))
-                                : nvfp4::LegacyMBucket(static_cast<uint32_t>(params.m));
-  const nvfp4::PlanKey key{m_bucket,
-                           params.n,
-                           params.k,
-                           device_ordinal,
-                           Fp4DeviceArchitecture(device_ordinal),
-                           static_cast<uint8_t>(DType::kBF16),
-                           full_tactics ? nvfp4::kFullTacticSetVersion
-                                        : nvfp4::kW1TacticSetVersion};
-  static nvfp4::SingleFlightPlanCache<SelectedPlan> plans;
+  const nvfp4::PlanKey key = MakePlanKey(params, device_ordinal, full_tactics);
+  SelectedPlanCache& plans = PlanCache();
+
+  if (const std::optional<SelectedPlan> ready = plans.FindReady(key);
+      ready.has_value()) {
+    return *ready;
+  }
+  if (report_lazy_miss &&
+      g_fp4_warmup_active_scopes.load(std::memory_order_acquire) == 0 &&
+      g_fp4_warmup_complete.load(std::memory_order_acquire)) {
+    g_fp4_lazy_misses.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[VT_FP4_AUTOTUNE] lazy-miss after pre-serve warmup "
+                 "M=%d(bucket=%u) N=%d K=%d device=%d sm=%d; tuning eagerly\n",
+                 params.m, key.m_bucket, params.n, params.k, device_ordinal,
+                 key.architecture);
+  }
 
   const auto can_tune = [stream = params.stream] {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
@@ -391,7 +435,7 @@ SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
       // only in the fallback arm. FlashInfer's full autotuner chooses the
       // minimum valid event time directly.
       int chosen = best;
-      int baseline = (m_bucket <= 256) ? 0 : 1;
+      int baseline = (key.m_bucket <= 256) ? 0 : 1;
       if (!full_tactics && timings[static_cast<size_t>(baseline)] < kFp4Inf &&
           !(timings[static_cast<size_t>(best)] <
             timings[static_cast<size_t>(baseline)] * 0.99F)) {
@@ -401,7 +445,7 @@ SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
         std::fprintf(stderr,
                      "[VT_FP4_AUTOTUNE] set=%s M=%d(bucket=%u) N=%d K=%d device=%d sm=%d "
                      "delay=%s -> id=%d %s (%.1f us), workspace=%zu\n",
-                     full_tactics ? "full" : "w1", params.m, m_bucket, params.n, params.k,
+                     full_tactics ? "full" : "w1", params.m, key.m_bucket, params.n, params.k,
                      device_ordinal, key.architecture,
                      Fp4AutotuneDelayEnabled() ? "1000us" : "off",
                      candidates[static_cast<size_t>(chosen)].descriptor.id,
@@ -423,6 +467,45 @@ SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
     return tune();
   }
   return nvfp4::ResolvePlan(plans, key, can_tune, tune);
+}
+
+SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
+  // FlashInfer's autotune context expands one maximum-token invocation into
+  // every hybrid optimization profile. The input/output buffers were allocated
+  // for the maximum M; each profile safely operates on their row prefix, and
+  // the final real-M launch overwrites the full output.
+  if (Fp4PlanCacheEnabled() && g_fp4_warmup_max_tokens != 0 &&
+      params.m == static_cast<int>(g_fp4_warmup_max_tokens)) {
+    g_fp4_warmup_observed = true;
+    const bool full_tactics = Fp4FullTacticsEnabled();
+    const nvfp4::PlanKey current_key =
+        MakePlanKey(params, device_ordinal, full_tactics);
+    SelectedPlan current_plan;
+    for (const uint32_t bucket :
+         nvfp4::HybridMTuningBuckets(g_fp4_warmup_max_tokens)) {
+      nvfp4::LaunchParams profile = params;
+      profile.m = static_cast<int>(bucket);
+      const nvfp4::PlanKey profile_key =
+          MakePlanKey(profile, device_ordinal, full_tactics);
+      std::optional<SelectedPlan> plan = PlanCache().FindReady(profile_key);
+      if (!plan.has_value()) {
+        g_fp4_warmup_profiles_requested.fetch_add(1,
+                                                  std::memory_order_relaxed);
+        plan = ResolveSelectedPlan(profile, device_ordinal,
+                                   /*report_lazy_miss=*/false);
+        g_fp4_warmup_profiles_tuned.fetch_add(1,
+                                              std::memory_order_relaxed);
+      }
+      if (profile_key == current_key) current_plan = *plan;
+    }
+    if (current_plan.candidate_index < 0) {
+      current_plan = ResolveSelectedPlan(params, device_ordinal,
+                                         /*report_lazy_miss=*/false);
+    }
+    return current_plan;
+  }
+  return ResolveSelectedPlan(params, device_ordinal,
+                             /*report_lazy_miss=*/true);
 }
 
 void RunFixedW1(nvfp4::LaunchParams params) {
@@ -571,4 +654,70 @@ struct Registrar {
 Registrar g_registrar;
 
 }  // namespace
+
+Nvfp4AutotuneWarmupScope::Nvfp4AutotuneWarmupScope(
+    uint32_t max_num_tokens)
+    : max_num_tokens_(max_num_tokens) {
+  if (max_num_tokens == 0) {
+    throw std::invalid_argument(
+        "NVFP4 pre-serve warmup requires a positive maximum token count");
+  }
+  if (g_fp4_warmup_max_tokens != 0) {
+    throw std::logic_error("nested NVFP4 pre-serve warmup scopes are unsupported");
+  }
+  requested_before_ =
+      g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed);
+  tuned_before_ = g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed);
+  g_fp4_warmup_complete.store(false, std::memory_order_release);
+  g_fp4_warmup_active_scopes.fetch_add(1, std::memory_order_acq_rel);
+  g_fp4_warmup_scopes_started.fetch_add(1, std::memory_order_relaxed);
+  g_fp4_warmup_max_tokens = max_num_tokens;
+  g_fp4_warmup_observed = false;
+  active_ = true;
+}
+
+Nvfp4AutotuneWarmupScope::~Nvfp4AutotuneWarmupScope() {
+  if (!active_) return;
+  g_fp4_warmup_max_tokens = 0;
+  g_fp4_warmup_observed = false;
+  g_fp4_warmup_active_scopes.fetch_sub(1, std::memory_order_acq_rel);
+  if (!completed_) {
+    g_fp4_warmup_complete.store(false, std::memory_order_release);
+  }
+}
+
+void Nvfp4AutotuneWarmupScope::Complete() {
+  if (!active_ || completed_) {
+    throw std::logic_error("NVFP4 pre-serve warmup scope completed out of order");
+  }
+  if (!g_fp4_warmup_observed) {
+    throw std::runtime_error(
+        "NVFP4 pre-serve warmup completed without observing a maximum-token "
+        "W4A4 GEMM");
+  }
+  const uint64_t requested =
+      g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed) -
+      requested_before_;
+  const uint64_t tuned =
+      g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed) - tuned_before_;
+  completed_ = true;
+  g_fp4_warmup_scopes_completed.fetch_add(1, std::memory_order_relaxed);
+  g_fp4_warmup_complete.store(true, std::memory_order_release);
+  std::fprintf(stderr,
+               "[VT_FP4_AUTOTUNE] pre-serve warmup complete max_tokens=%u "
+               "profiles_requested=%llu profiles_tuned=%llu cached_plans=%zu\n",
+               max_num_tokens_, static_cast<unsigned long long>(requested),
+               static_cast<unsigned long long>(tuned),
+               PlanCache().SizeForTesting());
+}
+
+Nvfp4AutotuneWarmupStats GetNvfp4AutotuneWarmupStats() {
+  return Nvfp4AutotuneWarmupStats{
+      g_fp4_warmup_scopes_started.load(std::memory_order_relaxed),
+      g_fp4_warmup_scopes_completed.load(std::memory_order_relaxed),
+      g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed),
+      g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed),
+      g_fp4_lazy_misses.load(std::memory_order_relaxed)};
+}
+
 }  // namespace vt::cuda

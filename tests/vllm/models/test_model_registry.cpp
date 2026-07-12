@@ -5,10 +5,12 @@
 // Negative cases additionally pin registry.py:_raise_for_unsupported:1051-1082,
 // which has no direct upstream test at this commit.
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 
 #include <doctest/doctest.h>
 
 #include <array>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -65,6 +67,20 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK(registration.info.supports_multimodal);
     CHECK(registration.info.score_type == "bi-encoder");
   }
+}
+
+TEST_CASE("runtime quant capability distinguishes true W4A4 from dense BF16") {
+  vllm::Qwen3_5DenseWeights bf16;
+  std::unique_ptr<vllm::LoadedModel> bf16_model =
+      vllm::MakeQwen3_5DenseLoadedModel(std::move(bf16));
+  CHECK_FALSE(bf16_model->uses_nvfp4_w4a4());
+
+  vllm::Qwen3_5DenseWeights w4a4;
+  w4a4.layers.resize(1);
+  w4a4.layers.front().mlp.gate_proj_fp4.alpha = 1.0F;
+  std::unique_ptr<vllm::LoadedModel> w4a4_model =
+      vllm::MakeQwen3_5DenseLoadedModel(std::move(w4a4));
+  CHECK(w4a4_model->uses_nvfp4_w4a4());
 }
 
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {

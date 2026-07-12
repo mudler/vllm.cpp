@@ -156,6 +156,10 @@ class Qwen3_5DenseLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(&weights) {}
 
   const Qwen3_5DenseWeights& weights() const { return *weights_; }
+  bool uses_nvfp4_w4a4() const override {
+    return !weights_->layers.empty() &&
+           weights_->layers.front().mlp.gate_proj_fp4.IsTrueW4A4();
+  }
   std::unique_ptr<Qwen3_5DenseDecodeGraph>& decode_graph() {
     return decode_graph_;
   }

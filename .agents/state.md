@@ -5218,3 +5218,42 @@ component plus selection-stability evidence, then paired trace and the exact
 27B production-vLLM ladder. W3-C persistence remains optional and separately
 gated because production pip-vLLM disables its file cache. `b5c6e4f` remains
 binding and 35B remains prohibited.
+
+## 2026-07-12 — W3-B pre-serve implementation staging-green; immutable gates next
+
+W3-B now mirrors the production placement in the common library loader. A
+loaded model reports whether its actual tensors use true W4A4, avoiding false
+warmups for BF16/synthetic/GGUF instances of the same dense architecture. On
+CUDA with autotune and the in-memory plan cache enabled, `LoadedEngine` runs one
+synthetic prompt at the resolved maximum batched-token budget before any
+`AsyncLLM` thread or HTTP readiness. The request uses a non-special tokenizer
+token, greedy one-token generation, and is completely flushed from scheduler
+state. `VT_FP4_PRE_SERVE_WARMUP=0` restores W3-A's lazy behavior.
+
+The dispatcher expands every maximum-M W4A4 projection over FlashInfer's exact
+hybrid profile sequence. For the default 2,048 budget that is
+1/2/4/8/16/32/64/128/256/512/768/1024/1280/1536/1792/2048. Already-ready keys
+are pure capture-safe lookups; a later unknown key is still tuned eagerly but
+is counted and logged. Scope completion fails unless a maximum-token W4A4 GEMM
+was actually seen.
+
+Local CPU focused tests pass 3/3, including the W4A4/BF16 capability split. The
+disposable CUDA stage at
+`~/work/vllm.cpp-nvfp4-small-m/precommit-w3b-195b475` cleanly builds the
+library, server and focused/model tests. Exact and legacy focused processes each
+pass **14/14 cases and 26,819/26,819 assertions**. The full native 27B process
+passes **235/235 assertions + 16/16 oracle tokens**, tunes **80/80** profiles
+(16 buckets × five real N/K shapes), leaves 80 ready plans and records zero
+lazy misses. The separate HTTP process answers `/health` and `/v1/models`;
+warmup completion is line 3 and server listening line 6. Model/server/models
+SHA-256 are `96afc6ed…de401`, `2264a306…7e9e`, and `80e10055…8315`.
+Post-run GPU inventory is empty and `/tmp/gpu` is free.
+
+This is an implementation checkpoint over disposable staged source, not an
+immutable or performance result. Commit/push it with the synchronized public
+and canonical record, then clean-build that SHA and run exact/legacy focused,
+memcheck, native 27B and server-ordering gates. After safety, repeat fresh
+processes to classify tactic-ID stability and the same c16 component, then run
+paired nsys and the exact 27B production-vLLM ladder. `b5c6e4f` remains the
+only binding denominator, W3-C persistence remains optional, and 35B stays
+prohibited until every 27B axis passes.

@@ -8,11 +8,13 @@
 // CUDA adapter is responsible for rejecting a cache miss during stream capture.
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -20,6 +22,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace vt::cuda::nvfp4 {
 
@@ -45,6 +48,42 @@ inline uint32_t HybridMBucket(uint32_t value) {
   if (value <= 2048) return ((value + 255) / 256) * 256;
   if (value <= 4096) return ((value + 511) / 512) * 512;
   return NextPositivePowerOfTwo(value);
+}
+
+// FlashInfer get_hybrid_num_tokens_buckets(): enumerate every optimization
+// profile materialized by a max-token autotune dummy run. The final concrete
+// maximum is retained even when it is not a phase boundary. This is deliberately
+// separate from HybridMBucket(), which mirrors the uncapped lookup mapper.
+inline std::vector<uint32_t> HybridMTuningBuckets(uint32_t max_num_tokens,
+                                                  uint32_t min_num_tokens = 1) {
+  std::vector<uint32_t> buckets;
+  const uint32_t minimum = std::max(min_num_tokens, uint32_t{1});
+
+  for (uint32_t value = minimum;
+       value <= std::min(max_num_tokens, uint32_t{256});) {
+    buckets.push_back(value);
+    if (value > std::numeric_limits<uint32_t>::max() / 2) break;
+    value *= 2;
+  }
+  for (uint32_t value = 512;
+       value <= std::min(max_num_tokens, uint32_t{2048}); value += 256) {
+    buckets.push_back(value);
+  }
+  for (uint32_t value = 2560;
+       value <= std::min(max_num_tokens, uint32_t{4096}); value += 512) {
+    buckets.push_back(value);
+  }
+  for (uint32_t value = 8192; value <= max_num_tokens;) {
+    buckets.push_back(value);
+    if (value > std::numeric_limits<uint32_t>::max() / 2) break;
+    value *= 2;
+  }
+  if (buckets.empty() || buckets.back() != max_num_tokens) {
+    buckets.push_back(max_num_tokens);
+  }
+  std::sort(buckets.begin(), buckets.end());
+  buckets.erase(std::unique(buckets.begin(), buckets.end()), buckets.end());
+  return buckets;
 }
 
 // Exact same-binary fallback for VT_FP4_EXACT_BUCKETS=0.

@@ -11,6 +11,7 @@
 // cuBLASLt FP8 (e4m3) dense GEMM — the native equivalent of vLLM's cuBLASLt fp8
 // path (nvjet_sm121_qqtst_* kernels) — reusing this same handle + workspace.
 #include <cublasLt.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -120,6 +121,25 @@ void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) 
           "set CUBLASLT_MATRIX_LAYOUT_ORDER");
 }
 
+__global__ void MatmulBf16TailKernel(__nv_bfloat16* out,
+                                     const __nv_bfloat16* a,
+                                     const __nv_bfloat16* b, int64_t m,
+                                     int64_t n, int64_t k) {
+  const int64_t total = m * n;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t row = idx / n;
+    const int64_t col = idx - row * n;
+    float value = 0.0F;
+    for (int64_t inner = 0; inner < k; ++inner) {
+      const float product = __fmul_rn(__bfloat162float(a[row * k + inner]),
+                                      __bfloat162float(b[inner * n + col]));
+      value = __fadd_rn(value, product);
+    }
+    out[idx] = __float2bfloat16(value);
+  }
+}
+
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);
 }
@@ -139,6 +159,19 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   cudaStream_t s = static_cast<cudaStream_t>(q.handle);
   if (k == 0) {  // empty reduction: out = 0 (f32 and bf16 zero are all-zero bytes)
     CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "k=0 memset");
+    return;
+  }
+  // CUDA 12.9 on sm_120 can select an extreme split-K tactic for irregular K
+  // tails even when the preference forbids reductions/workspace. Use an exact
+  // fallback for those shapes; aligned model dimensions remain on cuBLASLt.
+  if (bf16_in && out.dtype == DType::kBF16 && k % 16 != 0) {
+    constexpr unsigned block = 256;
+    const int64_t blocks = (m * n + block - 1) / block;
+    const unsigned grid = static_cast<unsigned>(blocks > 65535 ? 65535 : blocks);
+    MatmulBf16TailKernel<<<grid, block, 0, s>>>(
+        out.Ptr<__nv_bfloat16>(), a.Ptr<__nv_bfloat16>(),
+        b.Ptr<__nv_bfloat16>(), m, n, k);
+    CheckCuda(cudaGetLastError(), "bf16 tail launch");
     return;
   }
 

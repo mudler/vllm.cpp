@@ -594,6 +594,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   121-125/128 and ON/OFF spans 122-124/128, while vLLM remains 128/128. Focused
   CPU/CUDA suites pass 6/6 and direct OFF passes 3/3; final GPU state is
   146 MiB/0%/42 C and the benchmark-window kernel journal is empty.
+  The first correctness-repair checkpoint removes the longstanding CUDA
+  odd-tail BF16 matmul failure: the M17/K31/N13 case now uses a deterministic
+  separately-rounded fallback and the focused CUDA suite passes 76/76. Plain
+  Qwen3.5 F32 checkpoint norm weights are also cast to the BF16 model dtype,
+  matching vLLM model construction. The full CUDA CTest suite passes 106/106.
+  This does **not** close model parity: the established natural corpus is
+  stable in 6/6 fresh runs but remains 15/16
+  versus the current vLLM file, and the 1024-token stress reproducer still
+  varies across processes. The 128-request metrics above remain diagnostic.
   Request-level follow-up shows the P99 gap is not random scheduler fragility.
   The worst project requests are always initial admissions 30/31, and the
   32-request fill advances by **215.3 ms per two-prompt step** versus

@@ -112,7 +112,7 @@ OwnedTensor LoadBf16Direct(const TensorResolver& get, const std::string& name,
   return o;
 }
 
-OwnedTensor LoadBf16OrF32Direct(const TensorResolver& get,
+OwnedTensor LoadModelBf16Direct(const TensorResolver& get,
                                 const std::string& name,
                                 const std::vector<int64_t>& shape_override = {}) {
   const StTensor& t = get(name);
@@ -121,10 +121,22 @@ OwnedTensor LoadBf16OrF32Direct(const TensorResolver& get,
   VT_CHECK(is_bf16 || is_f32,
            "qwen3_5 dense: expected BF16 or F32 for " + name);
   std::vector<int64_t> shape = shape_override.empty() ? t.shape : shape_override;
-  OwnedTensor o = MakeOwned(is_bf16 ? vt::DType::kBF16 : vt::DType::kF32, shape);
-  VT_CHECK(t.nbytes == o.bytes.size(),
-           "qwen3_5 dense: byte-size mismatch for " + name);
-  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
+  if (is_bf16) {
+    VT_CHECK(t.nbytes == o.bytes.size(),
+             "qwen3_5 dense: byte-size mismatch for " + name);
+    std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  } else {
+    VT_CHECK(t.nbytes == static_cast<size_t>(o.Numel()) * sizeof(float),
+             "qwen3_5 dense: byte-size mismatch for " + name);
+    const auto* src = static_cast<const uint8_t*>(t.data);
+    auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+    for (int64_t i = 0; i < o.Numel(); ++i) {
+      float value;
+      std::memcpy(&value, src + i * sizeof(value), sizeof(value));
+      dst[i] = vt::F32ToBF16(value);
+    }
+  }
   return o;
 }
 
@@ -289,7 +301,7 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
       LoadBf16Direct(get, la + "conv1d.weight", {conv.shape[0], conv.shape[2]});
   g.a_log = LoadToF32(get, la + "A_log");
   g.dt_bias = LoadToF32(get, la + "dt_bias");
-  g.norm_weight = LoadBf16OrF32Direct(get, la + "norm.weight");
+  g.norm_weight = LoadModelBf16Direct(get, la + "norm.weight");
   return g;
 }
 

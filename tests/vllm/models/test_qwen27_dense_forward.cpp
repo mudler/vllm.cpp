@@ -219,7 +219,7 @@ TEST_CASE("qwen27 loader routing: IsQwen27QuantizedLinear encodes §3.6") {
   CHECK_FALSE(IsQwen27QuantizedLinear("model.visual.blocks.0.mlp.gate_proj"));
 }
 
-TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weights") {
+TEST_CASE("qwen35 plain dense loader normalizes checkpoint parameter dtypes") {
   const std::string base = "model.language_model.layers.0.";
 
   SUBCASE("full attention and MLP use ordinary BF16 weights") {
@@ -254,7 +254,7 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(gate_up[6] == vt::F32ToBF16(30.0F));
   }
 
-  SUBCASE("linear attention accepts plain out_proj and F32 state parameters") {
+  SUBCASE("linear attention casts F32 checkpoint norm to BF16 model dtype") {
     PlainWeightFixture f;
     AddPlainLayerCommon(f, base);
     const std::string la = base + "linear_attn.";
@@ -285,7 +285,11 @@ TEST_CASE("qwen35 plain dense loader accepts BF16 projections and F32 GDN weight
     CHECK(ba[6] == vt::F32ToBF16(50.0F));
     CHECK(layer.gdn.a_log.dtype == DType::kF32);
     CHECK(layer.gdn.dt_bias.dtype == DType::kF32);
-    CHECK(layer.gdn.norm_weight.dtype == DType::kF32);
+    CHECK(layer.gdn.norm_weight.dtype == DType::kBF16);
+    const auto* norm = reinterpret_cast<const uint16_t*>(
+        layer.gdn.norm_weight.bytes.data());
+    CHECK(norm[0] == vt::F32ToBF16(0.5F));
+    CHECK(norm[3] == vt::F32ToBF16(3.5F));
     const auto* a_log = reinterpret_cast<const float*>(layer.gdn.a_log.bytes.data());
     CHECK(a_log[0] == doctest::Approx(-2.0F));
     CHECK(a_log[1] == doctest::Approx(-1.0F));

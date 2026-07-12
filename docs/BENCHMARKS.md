@@ -818,3 +818,21 @@ cache proof, warmup, repetitions, every-axis validation, memory return, and
 paired traces, is in the
 [online serving gate spec](../.agents/specs/cuda-online-serving-gate.md) and
 [benchmark protocol](../.agents/benchmark-protocol.md).
+
+## 2026-07-12 local correctness-repair checkpoint
+
+**PARTIAL / PERFORMANCE NUMBERS NOT PROMOTED.** CUDA 12.9 on sm_120 selected an
+extreme split-K tactic for BF16 M17/K31/N13 and failed the existing CPU-parity
+test in 11 elements. The irregular BF16-output K-tail now uses a deterministic
+separately-rounded CUDA fallback; `test_cuda_ops --test-case='CUDA matmul*'`
+passes 76/76. The plain dense loader also casts an F32 checkpoint GDN norm to
+the BF16 model dtype used by vLLM; the dense-forward suite passes 325/325 and
+the complete CUDA CTest suite passes 106/106 in 35.94 seconds.
+
+Model correctness is still open. On `/tmp/qwen35-4b-parity-natural.json`, both
+GDN f32-output and explicit BF16-output arms produced one identical token file
+in all three fresh runs per arm; that file matches the current vLLM reference
+15/16. The exact-1024 repeated-token stress workload still produced five
+different hashes in five fresh candidate runs. No throughput, TTFT, or memory
+number is binding; rerun the 128-request gate only after the GDN recurrence
+discrepancy is repaired.

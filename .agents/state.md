@@ -7307,3 +7307,27 @@ is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
   gap after correctness; this is not a loader or sporadic robustness tail.
 - Raw analysis is `/tmp/qwen35-direct-main-829883d/ttft-analysis.json`. All GPU
   controls were serialized; final GPU is 166 MiB/0%/42 C.
+
+## 2026-07-12 — local correctness repair: CUDA tail fixed, model parity still open
+
+- Layer/stage hashing localized the first cross-process difference on the
+  exact-1024 stress workload to GDN prefill recurrence output with identical
+  normalized q/k/v, g, beta and input state. Graph-off, launch-blocking,
+  no-reduction cuBLASLt, sequential GDN, serialized heads, direct q/k loads,
+  exact/disabled device pooling and BF16 GDN output did not restore stable
+  stress tokens. All diagnostic hooks were removed.
+- Independently reproduced the longstanding CUDA suite failure: CUDA 12.9
+  chose split-K 70 for BF16-output M17/K31/N13 and exceeded tolerance in 11
+  elements. Reduction/workspace preferences were ignored. A narrow irregular
+  BF16 K-tail fallback with explicit round-to-nearest multiply/add now passes
+  the focused CUDA matmul suite 76/76; aligned model GEMMs remain cuBLASLt.
+- Corrected plain-dense loading to cast F32 checkpoint GDN norm weights to the
+  BF16 model dtype, matching vLLM's `set_default_torch_dtype(model_config.dtype)`
+  construction. Dense-forward tests pass 325/325; the complete CUDA CTest
+  suite passes 106/106 in 35.94 seconds.
+- Six fresh natural-corpus runs (three f32-output, three BF16-output) are
+  byte-identical across project arms and match the current vLLM token file
+  15/16. Five fresh exact-1024 stress runs still produce five hashes. Therefore
+  only the CUDA unit failure is closed; repeated 128/128 model correctness and
+  all prior performance/memory/TTFT metrics remain open/diagnostic. Evidence:
+  `/tmp/qwen35-correctness-8a021a3`.

@@ -4,6 +4,7 @@
 // by name (notes §3.6) and swaps the MoE block for the dense SwiGLU MLP.
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -18,6 +19,20 @@ namespace vllm {
 namespace {
 
 using TensorExists = std::function<bool(const std::string&)>;
+
+bool DiscardSafetensorsPagesEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("VT_SAFETENSORS_DISCARD_PAGES");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+void DiscardSafetensorsPages(const std::vector<SafetensorsFile>& shards) {
+  if (!DiscardSafetensorsPagesEnabled()) return;
+  for (const SafetensorsFile& shard : shards)
+    (void)shard.DiscardResidentPages();
+}
 
 OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
   OwnedTensor o;
@@ -424,10 +439,13 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
     w.tied_lm_head = true;
     w.embed_tokens.nk = true;
   }
+  DiscardSafetensorsPages(shards);
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
         get, has, config.layer_types[static_cast<size_t>(l)], l));
+    DiscardSafetensorsPages(shards);
+  }
   return w;
 }
 

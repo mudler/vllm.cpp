@@ -104,10 +104,26 @@ TEST_CASE("safetensors: Get on absent tensor throws with name") {
                        std::runtime_error);
 }
 
+TEST_CASE("safetensors: discarded resident pages fault back exactly") {
+  TempFile f(MakeSafetensors(kValidHeader, ValidData()));
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+
+  float before[4];
+  std::memcpy(before, st.Get("a").data, sizeof(before));
+  REQUIRE(st.DiscardResidentPages());
+
+  float after[4];
+  std::memcpy(after, st.Get("a").data, sizeof(after));
+  CHECK(std::memcmp(before, after, sizeof(before)) == 0);
+  CHECK(after[0] == 1.0f);
+  CHECK(after[3] == 4.0f);
+}
+
 TEST_CASE("safetensors: move semantics keep the mapping alive") {
   TempFile f(MakeSafetensors(kValidHeader, ValidData()));
   vllm::SafetensorsFile a = vllm::SafetensorsFile::Open(f.path());
   vllm::SafetensorsFile b = std::move(a);
+  CHECK(a.DiscardResidentPages());
   CHECK(b.Get("a").nbytes == 16);
   vllm::SafetensorsFile c = vllm::SafetensorsFile::Open(f.path());
   c = std::move(b);

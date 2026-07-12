@@ -1,7 +1,7 @@
 # W4 spike: bounded safetensors source-page residency
 
 **Row:** `ENG-HOST-WEIGHT-RESIDENCY`  
-**Lifecycle:** `SPIKE`  
+**Lifecycle:** `ACTIVE`
 **Owner:** `CLAIM-HOST-WEIGHT-RESIDENCY-1`  
 **Baseline:** project `6c30657`, evidence
 `/tmp/qwen35-host-residency-6c30657`
@@ -105,6 +105,11 @@ preserves pointer validity while approximating its bounded shard lifetime.
    fresh vLLM denominator.
 4. `W4.4`: if W4.3 remains above vLLM, spike and implement layer-bounded
    direct-device materialization; do not describe W4.1-W4.3 as peak parity.
+
+Implementation checkpoint: W4.1-W4.2 are complete. CPU CTest passes 105/105;
+native-sm_120 focused tests pass 5/5 with discard enabled and 2/2 with
+`VT_SAFETENSORS_DISCARD_PAGES=0`. W4.3 memory/load-time/throughput measurement
+is `PENDING`, so no improved number or peak-parity claim is accepted.
 
 ## Risks and mitigations
 

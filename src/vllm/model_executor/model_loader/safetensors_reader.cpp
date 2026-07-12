@@ -198,6 +198,15 @@ const StTensor& SafetensorsFile::Get(const std::string& name) const {
   return it->second;
 }
 
+bool SafetensorsFile::DiscardResidentPages() const noexcept {
+  if (map_ == nullptr || map_size_ == 0) return true;
+#ifdef MADV_DONTNEED
+  return ::madvise(map_, map_size_, MADV_DONTNEED) == 0;
+#else
+  return false;
+#endif
+}
+
 void SafetensorsFile::Release() noexcept {
   if (map_ != nullptr) {
     ::munmap(map_, map_size_);

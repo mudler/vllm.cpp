@@ -540,10 +540,12 @@ launch peak falls 19.77→15.55 GiB (-21.4%). The residual peak is created befor
 residency by simultaneous safetensors mappings plus full owned materialization;
 the W4 source-chain spike confirms that vLLM scopes `safe_open` one shard at a
 time while this project retains every mapping. Default-on, fail-open
-source-page discard after globals/each layer is now `PENDING` implementation
-and measurement. Direct-device loading remains the required follow-on if the
-owned-model floor stays above vLLM; no improved number is claimed and the row
-cannot close.
+source-page discard after globals/each layer is now `ACTIVE` and implemented;
+`VT_SAFETENSORS_DISCARD_PAGES=0` is the same-binary control. CPU CTest passes
+105/105, focused native-sm_120 default tests pass 5/5, and opt-out tests pass
+2/2. Peak PSS, load time and throughput remain `PENDING`; direct-device loading
+is still required if the owned-model floor stays above vLLM. No improved number
+is claimed and the row cannot close.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

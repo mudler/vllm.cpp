@@ -7029,3 +7029,22 @@ remaining owned-model floor is above vLLM, direct-to-device/bounded
 materialization must be separately recorded and implemented; page advice alone
 cannot close the row by assertion. No runtime code or improved number is part
 of this spike checkpoint.
+
+## 2026-07-12 — launch-peak W4.1-W4.2 implemented, measurement pending
+
+Added `SafetensorsFile::DiscardResidentPages()` as a fail-open Linux
+`MADV_DONTNEED` hint over the unchanged read-only private mapping. The dense
+loader now applies it after global weights and every completed layer; virtual
+addresses and `StTensor` pointers remain valid, and
+`VT_SAFETENSORS_DISCARD_PAGES=0` is the same-binary fallback. A focused reader
+test touches data, discards pages and verifies exact refaulted bytes, including
+safe no-op behavior on a moved-from file.
+
+Both CPU and native-sm_120 Triton-AOT builds are warning-clean. Full CPU CTest
+passes **105/105**. Under `/tmp/gpu`, focused native-sm_120 tests pass **5/5**
+with the default and **2/2** with the opt-out. The first CUDA build invocation
+used the default CPU flake shell and failed because `cuda_runtime.h` was absent;
+rerunning unchanged source in `nix develop .#cuda` passed, confirming an
+environment invocation error rather than a code defect. W4.3 peak PSS, stable
+PSS, VRAM, load time, output A/B and throughput remain pending from an immutable
+commit; no improved number is claimed here.

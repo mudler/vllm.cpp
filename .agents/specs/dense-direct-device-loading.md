@@ -1,7 +1,7 @@
 # W4.4 spike: layer-bounded direct-device dense loading
 
 **Row:** `ENG-HOST-WEIGHT-RESIDENCY`  
-**Lifecycle:** `SPIKE`  
+**Lifecycle:** `ACTIVE`
 **Owner:** `CLAIM-HOST-WEIGHT-RESIDENCY-1`  
 **Dependency:** W4.3 consumed-range checkpoint `a077d72`
 
@@ -127,6 +127,13 @@ non-owning queue propagation and exclusions. No upstream test is dropped.
 3. `W4.4c`: build/test both enabled and release-OFF modes.
 4. `W4.4d`: run the exact W4.3 memory/performance campaign and either close the
    peak axis or identify the next concrete lifetime.
+
+Implementation checkpoint: W4.4a-W4.4c are complete. `ModelSource` carries the
+non-owning queue, dense `FromModelDir` preselects and reuses one queue only when
+direct loading is requested, and the loader stages/synchronizes/releases after
+each eligible layer. `VT_DIRECT_DEVICE_LOAD=0` restores W4.3 from the same
+binary. CPU focused tests pass 4/4; native-sm_120 default passes 5/5 and direct
+OFF passes 3/3. W4.4d and every improved number remain `PENDING`.
 
 ## Risks and mitigations
 

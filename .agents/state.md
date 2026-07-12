@@ -7138,3 +7138,22 @@ release enabled. Existing resident tensors make prior-layer walks no-ops. CPU,
 UMA, GGUF, quantized 27B, MoE, borrowed and release-OFF paths are explicit
 exclusions. Load exceptions must destroy a preselected queue before ownership
 transfer. No code or improved number is part of this spike checkpoint.
+
+## 2026-07-12 — W4.4a-W4.4c direct-device loading implemented
+
+`ModelSource` now optionally carries a non-owning load queue. Dense
+`FromModelDir` preselects a queue only when host release and direct loading are
+enabled, passes it into model construction, and copies that same queue into the
+runner; exceptions destroy it before rethrow. The dense loader excludes
+top-level/nested quantization configs, CPU and UMA, then after each completed
+plain-BF16 layer reuses `PrepareBf16Resident`, synchronizes, and releases all
+currently resident host tensors. Earlier layers short-circuit through their
+existing device owners. `VT_DIRECT_DEVICE_LOAD=0` restores W4.3 from the same
+binary; `VT_RELEASE_HOST_WEIGHTS=0` remains the broader no-release exclusion.
+
+Both CPU and native-sm_120 Triton-AOT builds pass. Focused CPU loader/registry/
+dense/engine tests pass **4/4**. Under `/tmp/gpu`, native-sm_120 default tests
+pass **5/5** and direct-OFF tests pass **3/3**. The new registry case pins
+non-owning queue propagation and ordinary null behavior. W4.4d real-model
+memory, output and timing remain pending from an immutable commit; no improved
+number is claimed here.

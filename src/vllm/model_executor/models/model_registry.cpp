@@ -220,7 +220,8 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
     throw std::runtime_error("safetensors model source is empty");
   }
   return std::make_unique<Qwen3_5DenseLoadedModel>(
-      registration, LoadQwen3_5Dense(*source.safetensors, config));
+      registration,
+      LoadQwen3_5Dense(*source.safetensors, config, source.load_queue));
 }
 
 void PrepareQwen3_5Moe(LoadedModel& model, const HfConfig& config,
@@ -415,10 +416,11 @@ const ModelRegistration& RegistrationFor(std::string_view architecture) {
 LoadedModel::~LoadedModel() = default;
 
 ModelSource ModelSource::FromSafetensors(
-    const std::vector<SafetensorsFile>& shards) {
+    const std::vector<SafetensorsFile>& shards, vt::Queue* load_queue) {
   ModelSource source;
   source.kind = Kind::kSafetensors;
   source.safetensors = &shards;
+  source.load_queue = load_queue;
   return source;
 }
 

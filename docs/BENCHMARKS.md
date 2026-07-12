@@ -580,12 +580,14 @@ Full CPU CTest passes 105/105; focused native-sm_120 default passes 5/5 and
 opt-out 2/2. Every process exited, final GPU state is 146 MiB / 0% / 42 C, and
 the benchmark-window kernel journal says `-- No entries --`.
 
-W4.4 direct-device disposition: **SPIKE / PENDING implementation**. The accepted
+W4.4 direct-device disposition: **ACTIVE / PENDING measurement**. The accepted
 contract preselects one dense runner queue, stages and synchronizes each
 completed unquantized plain-BF16 layer, then releases its host bytes. CPU, UMA,
-GGUF, quantized, MoE, borrowed and release-OFF paths are excluded. No W4.4
-number is claimed. After implementation, rerun the exact driver command above;
-the acceptance target is peak PSS no higher than a fresh vLLM denominator.
+GGUF, quantized, MoE, borrowed and release-OFF paths are excluded.
+`VT_DIRECT_DEVICE_LOAD=0` is the same-binary W4.3 control. CPU focused tests
+pass 4/4; native-sm_120 default passes 5/5 and direct OFF passes 3/3. No W4.4
+number is claimed. Rerun the exact driver workload with direct ON/OFF; the
+acceptance target is peak PSS no higher than a fresh vLLM denominator.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

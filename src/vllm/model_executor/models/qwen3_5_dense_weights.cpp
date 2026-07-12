@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -36,6 +37,35 @@ void DiscardSafetensorsPages(std::vector<ConsumedTensor>* consumed) {
       (void)shard->DiscardResidentPages(*tensor);
   }
   consumed->clear();
+}
+
+bool HasQuantizationConfig(const HfConfig& config) {
+  const auto has_quant = [](const nlohmann::json& value) {
+    const auto it = value.find("quantization_config");
+    return it != value.end() && !it->is_null();
+  };
+  if (!config.raw.is_object()) return false;
+  if (has_quant(config.raw)) return true;
+  const auto text = config.raw.find("text_config");
+  return text != config.raw.end() && text->is_object() && has_quant(*text);
+}
+
+bool DirectDeviceLoadEligible(const HfConfig& config, vt::Queue* queue) {
+  if (queue == nullptr || queue->device.type != vt::DeviceType::kCUDA ||
+      HasQuantizationConfig(config))
+    return false;
+  const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");
+  if (release != nullptr && release[0] == '0') return false;
+  const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
+  if (direct != nullptr && direct[0] == '0') return false;
+  return !vt::GetBackend(queue->device.type).UnifiedMemory();
+}
+
+void StageAndReleaseLoadedDense(Qwen3_5DenseWeights* weights,
+                                vt::Queue* queue) {
+  Qwen3_5DenseModel::PrepareBf16Resident(*weights, *queue);
+  vt::GetBackend(queue->device.type).Synchronize(*queue);
+  (void)ReleaseResidentQwen3_5DenseHostWeights(*weights);
 }
 
 OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
@@ -412,7 +442,8 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
 }
 
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                     const HfConfig& config) {
+                                     const HfConfig& config,
+                                     vt::Queue* load_queue) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -448,10 +479,15 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   }
   DiscardSafetensorsPages(&consumed);
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+  bool direct_device = DirectDeviceLoadEligible(config, load_queue);
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
         get, has, config.layer_types[static_cast<size_t>(l)], l));
     DiscardSafetensorsPages(&consumed);
+    if (direct_device) {
+      direct_device = IsPlainBf16Qwen3_5Dense(w);
+      if (direct_device) StageAndReleaseLoadedDense(&w, load_queue);
+    }
   }
   return w;
 }

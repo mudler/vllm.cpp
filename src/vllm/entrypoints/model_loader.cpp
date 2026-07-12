@@ -44,6 +44,13 @@ vt::Queue SelectQueue() {
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
+bool DirectDeviceLoadRequested() {
+  const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");
+  if (release != nullptr && release[0] == '0') return false;
+  const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
+  return direct == nullptr || direct[0] != '0';
+}
+
 std::vector<vllm::SafetensorsFile> LoadShards(const std::string& model_dir) {
   std::vector<std::string> paths;
   for (const auto& e : fs::directory_iterator(model_dir)) {
@@ -168,7 +175,8 @@ LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
 LoadedEngine::LoadedEngine(HfConfig config,
                            std::unique_ptr<LoadedModel> model,
                            tok::Tokenizer tokenizer,
-                           const EngineParams& params)
+                           const EngineParams& params,
+                           vt::Queue* preselected_queue)
     : hash_ready_(EnsureNoneHash()),
       config_(std::move(config)),
       model_(std::move(model)),
@@ -190,7 +198,8 @@ LoadedEngine::LoadedEngine(HfConfig config,
                      params.policy),
                  kv_cfg_, params.block_size > 0 ? params.block_size : 32,
                  /*enable_caching=*/prefix_caching_enabled_),
-      runner_(config_, *model_, kv_cfg_, SelectQueue(),
+      runner_(config_, *model_, kv_cfg_,
+              preselected_queue != nullptr ? *preselected_queue : SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_),
@@ -297,7 +306,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
   HfConfig config = vllm::LoadHfConfig(config_path);
-  (void)ModelRegistry::Resolve(config);
+  const ModelRegistration& registration = ModelRegistry::Resolve(config);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
   std::vector<vllm::SafetensorsFile> shards = LoadShards(model_dir);
@@ -305,11 +314,26 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // Live architecture dispatch: consume config.architectures in order and let
   // the matched registration own the weight-name map/loader. Unknown dense
   // configs now reject instead of falling through num_experts == 0.
-  std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-      config, ModelSource::FromSafetensors(shards));
-  shards.clear();  // the mmap'd shards may be released after the load.
-  return std::unique_ptr<LoadedEngine>(new LoadedEngine(
-      std::move(config), std::move(model), std::move(tokenizer), params));
+  if (!registration.factory->is_dense_model || !DirectDeviceLoadRequested()) {
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
+        config, ModelSource::FromSafetensors(shards));
+    shards.clear();  // the mmap'd shards may be released after the load.
+    return std::unique_ptr<LoadedEngine>(new LoadedEngine(
+        std::move(config), std::move(model), std::move(tokenizer), params));
+  }
+
+  vt::Queue load_queue = SelectQueue();
+  try {
+    std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
+        config, ModelSource::FromSafetensors(shards, &load_queue));
+    shards.clear();
+    return std::unique_ptr<LoadedEngine>(new LoadedEngine(
+        std::move(config), std::move(model), std::move(tokenizer), params,
+        &load_queue));
+  } catch (...) {
+    vt::DestroyQueue(load_queue);
+    throw;
+  }
 }
 
 }  // namespace vllm::entrypoints

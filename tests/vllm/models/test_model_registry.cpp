@@ -7,6 +7,8 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+
 #include <doctest/doctest.h>
 
 #include <array>
@@ -21,6 +23,8 @@
 using vllm::HfConfig;
 using vllm::ModelRegistration;
 using vllm::ModelRegistry;
+using vllm::ModelSource;
+using vllm::SafetensorsFile;
 using vllm::UnsupportedModelInfo;
 
 namespace {
@@ -53,6 +57,18 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
     const HfConfig config = Config({std::string(registration.architecture)});
     CHECK(&ModelRegistry::Resolve(config) == &registration);
   }
+}
+
+TEST_CASE("model source carries a non-owning direct-load queue") {
+  std::vector<SafetensorsFile> shards;
+  vt::Queue queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
+  const ModelSource source = ModelSource::FromSafetensors(shards, &queue);
+  CHECK(source.kind == ModelSource::Kind::kSafetensors);
+  CHECK(source.safetensors == &shards);
+  CHECK(source.load_queue == &queue);
+
+  const ModelSource ordinary = ModelSource::FromSafetensors(shards);
+  CHECK(ordinary.load_queue == nullptr);
 }
 
 TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo") {

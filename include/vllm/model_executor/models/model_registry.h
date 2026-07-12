@@ -52,12 +52,16 @@ struct ModelSource {
   enum class Kind { kSafetensors, kGguf };
 
   static ModelSource FromSafetensors(
-      const std::vector<SafetensorsFile>& shards);
+      const std::vector<SafetensorsFile>& shards,
+      vt::Queue* load_queue = nullptr);
   static ModelSource FromGguf(const GgufFile& gguf);
 
   Kind kind = Kind::kSafetensors;
   const std::vector<SafetensorsFile>* safetensors = nullptr;
   const GgufFile* gguf = nullptr;
+  // Non-owning queue selected by the entrypoint for bounded target-device
+  // loading. Null preserves the ordinary host-only construction path.
+  vt::Queue* load_queue = nullptr;
 };
 
 struct ModelFactory;

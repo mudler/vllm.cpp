@@ -541,9 +541,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   showed every worker in the CPU matmul fallback. The accepted campaign wraps
   the process and lock in the CUDA flake. Correctness and performance parity
   remain open. The W4.4 layer-bounded direct-device spike is accepted and
-  **PENDING implementation**; it carries the eventual dense-runner queue into
+  now **implemented / GATING**; it carries the eventual dense-runner queue into
   loading and releases each synchronized plain-BF16 layer instead of retaining
-  the full owned host model.
+  the full owned host model. `VT_DIRECT_DEVICE_LOAD=0` restores W4.3 from the
+  same binary. CPU focused tests pass 4/4; native-sm_120 default/control tests
+  pass 5/5 and 3/3. Peak and timing numbers remain pending.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

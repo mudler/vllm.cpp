@@ -134,7 +134,8 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
 // head is intentionally loaded on demand by LoadQwen3_5MTP when speculative
 // decoding is enabled; it is not part of the always-resident target weights.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                     const HfConfig& config);
+                                     const HfConfig& config,
+                                     vt::Queue* load_queue = nullptr);
 
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors with an existing raw or F32 device representation; unused

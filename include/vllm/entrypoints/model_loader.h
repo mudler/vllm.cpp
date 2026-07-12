@@ -133,7 +133,8 @@ class LoadedEngine {
   // Type-erased constructor used by FromModelDir and the concrete-weight
   // compatibility overloads above.
   LoadedEngine(HfConfig config, std::unique_ptr<LoadedModel> model,
-               tok::Tokenizer tokenizer, const EngineParams& params);
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               vt::Queue* preselected_queue = nullptr);
 
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,

@@ -7250,3 +7250,20 @@ is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
   projection is present. Explicit-f32 and corrected-default real-model smoke
   runs complete; GPU returned idle. The immutable-SHA full campaign is pending
   and the aborted arm contributes no benchmark metric.
+
+## 2026-07-12 — immutable local benchmark after W2 rebase
+
+- Ran exact `54401bf` direct ON, same-binary OFF and fresh production vLLM,
+  three monitored plus three unmonitored repetitions per arm, under one
+  `/tmp/gpu` lock. Added a fresh three-run vLLM closed-loop TTFT supplement.
+- ON/OFF/vLLM peak PSS is 1.849/8.168/7.616 GiB, stable PSS
+  0.757/0.754/4.109 GiB, VRAM 11,692/11,691/12,924 MiB, and total throughput
+  6605.55/6601.40/6717.87 tok/s. Closed-loop mean/median/P99 TTFT is
+  659/220/3545, 661/220/3552 and 908/674/3092 ms.
+- Correctness fails the benchmark precondition: project same-mode and ON/OFF
+  request files match only 121-124/128, while vLLM is stable 128/128. All
+  metrics remain diagnostic; direct loading is again not isolated as the cause.
+- CPU/CUDA focused suites pass 6/6 and direct OFF passes 3/3. Full CPU CTest is
+  104/105 on the known parallel async drain-count timing case; isolated async
+  passes 3/3. Final GPU is 146 MiB/0%/42 C and the one-hour kernel journal is
+  empty.

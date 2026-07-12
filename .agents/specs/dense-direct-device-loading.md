@@ -169,8 +169,15 @@ matches the local ordinary-BF16 4B. The local merge keys the default to an
 actually present native-NVFP4 GDN output projection, preserving the 27B path and
 restoring all other checkpoints to f32 unless explicitly overridden. Real-model
 4B smoke runs pass with both explicit f32 and the corrected default. The complete
-immutable-SHA memory/throughput/TTFT campaign is `PENDING`; partial launch
-samples are not evidence.
+immutable-SHA memory/throughput/TTFT campaign then completed at `54401bf`.
+Direct ON/OFF/vLLM peak PSS is 1.849/8.168/7.616 GiB, stable PSS
+0.757/0.754/4.109 GiB, VRAM 11,692/11,691/12,924 MiB, total throughput
+6605.55/6601.40/6717.87 tok/s and closed-loop mean TTFT 659/661/908 ms.
+Disposition is **FAILED correctness / diagnostic metrics**: project same-mode
+and ON/OFF token files vary at 121-124/128 while vLLM is stable 128/128. This
+again refutes direct-loading-specific corruption, but no metric can be promoted.
+Raw evidence is `/tmp/qwen35-direct-main-54401bf`; driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
 
 ## Risks and mitigations
 

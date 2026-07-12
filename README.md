@@ -568,6 +568,21 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   `TRITON_LIBCUDA_PATH=/run/opengl-driver/lib`; builds and focused CUDA gates
   pass. Full parallel CPU CTest is 104/105 on the known async drain-count timing
   case, which passes 3/3 isolated.
+  Rebasing onto upstream `b5c6e4f` exposed an integration bug before the new
+  campaign: upstream's 27B BF16 GDN default used `num_experts == 0`, which also
+  selected the ordinary-BF16 4B and failed its first forward at the gated-norm
+  dtype contract. The local merge now keys that default to an actually present
+  native-NVFP4 GDN output projection; an explicit f32 control and the corrected
+  default both complete a real 4B smoke run. The immutable `54401bf` campaign
+  then completed all 18 arms: direct ON/OFF/fresh-vLLM peak PSS is
+  **1.849/8.168/7.616 GiB**, stable PSS **0.757/0.754/4.109 GiB**, and VRAM
+  **11,692/11,691/12,924 MiB**. Total throughput is
+  **6,605.55/6,601.40/6,717.87 tok/s**, so ON is **0.9833x** vLLM and 0.063%
+  above OFF. Closed-loop mean/median/P99 TTFT is **659/220/3,545 ms** ON versus
+  **908/674/3,092 ms** vLLM. These remain diagnostic: vLLM is stable 128/128,
+  while project same-mode and ON/OFF comparisons vary at 121-124/128. Full CPU
+  CTest is 104/105 on the known async timing case, which passes 3/3 isolated;
+  GPU is idle and the kernel journal is empty.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

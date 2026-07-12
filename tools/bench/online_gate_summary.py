@@ -30,6 +30,7 @@ from tools.bench.online_gate import (
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
+    NSYS_CUDA_GRAPH_TRACE,
     OUTPUT_LEN,
     PANDAS_VERSION,
     POINTS,
@@ -436,7 +437,8 @@ def _model_precondition_reasons(
             reasons.append("ours trace is not an nsys capture")
         if status.get("vllm_profiler") != "torch-profiler":
             reasons.append("vLLM trace is not the required torch-profiler fallback")
-        if status.get("trace_contract") != {
+        trace_contract = status.get("trace_contract")
+        expected_trace_contract = {
             "admission_mode": "closed-loop",
             "concurrency": TRACE_CONCURRENCY,
             "enable_prefix_caching": False,
@@ -446,8 +448,17 @@ def _model_precondition_reasons(
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
             "repetitions": TRACE_REPETITIONS,
-        }:
+        }
+        if not isinstance(trace_contract, dict) or any(
+            trace_contract.get(field) != expected
+            for field, expected in expected_trace_contract.items()
+        ):
             reasons.append("paired trace token/concurrency contract differs")
+        elif trace_contract.get("cuda_graph_trace") not in (
+            None,
+            NSYS_CUDA_GRAPH_TRACE,
+        ):
+            reasons.append("paired trace CUDA-graph granularity differs")
         artifacts = status.get("artifacts")
         if not isinstance(artifacts, dict):
             reasons.append("paired trace artifact map is absent")

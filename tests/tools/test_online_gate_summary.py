@@ -221,6 +221,7 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "trace_contract": {
                     "admission_mode": "closed-loop",
                     "concurrency": TRACE_CONCURRENCY,
+                    "cuda_graph_trace": "node",
                     "enable_prefix_caching": False,
                     "input_len": INPUT_LEN,
                     "max_model_len": MAX_MODEL_LEN["27"],
@@ -415,6 +416,28 @@ class OnlineGateSummaryTests(unittest.TestCase):
             self.assertFalse(
                 any("35" in reason for reason in runs["campaign_reasons"])
             )
+
+    def test_legacy_graph_level_trace_keeps_completed_timing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            path = root / "trace" / "27" / "status.json"
+            status = json.loads(path.read_text(encoding="utf-8"))
+            status["trace_contract"].pop("cuda_graph_trace")
+            path.write_text(json.dumps(status), encoding="utf-8")
+            runs, _ = self._summarize_model(root)
+            self.assertTrue(runs["gate_pass"])
+
+    def test_explicit_whole_graph_trace_cannot_pass_new_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            path = root / "trace" / "27" / "status.json"
+            status = json.loads(path.read_text(encoding="utf-8"))
+            status["trace_contract"]["cuda_graph_trace"] = "graph"
+            path.write_text(json.dumps(status), encoding="utf-8")
+            runs, _ = self._summarize_model(root)
+            self.assertFalse(runs["gate_pass"])
 
     def test_model_selection_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

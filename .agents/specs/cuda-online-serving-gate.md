@@ -51,7 +51,7 @@ failed before output because direct script invocation omitted the repository
 module path. Its corrected `python -m tools.bench.online_gate` invocation,
 plan validation, exact-source check, corpus conversion and fresh sm_121a build
 pass. One uncontended model-wide lock then covered the passing model gate, all
-36 cache-off groups/2,016 requests, six memory returns and paired traces. All
+36 cache-off groups/2,016 requests, six memory returns and the first paired trace. All
 12 performance groups, both memory groups and all 124 axes are binding-eligible;
 **54 pass and 70 fail**. Median total ratios c1→c32 are
 **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**; host PSS/RSS normalize to
@@ -67,6 +67,15 @@ Trace status / ours kernel summary / vLLM kernel summary are
 `f38b149d…d17`, `8bba1bb1…8f4` and `80999085…d2`. Generated-text and ours
 trace-output repeatability remain explicit diagnostics behind the passing
 commit-bound 16/16 gate and exact native 128-token request counts.
+
+That first trace passed the original token/lifecycle contract but is not valid
+for kernel attribution. Its Nsight command omitted `--cuda-graph-trace=node`;
+CUDA 13 therefore defaulted to whole-graph mode. The exported SQLite contains
+246,786 ordinary kernel rows / 101.832 s plus 1,226 graph activities / 154.978 s,
+but zero graph-node kernel rows, while vLLM's torch profiler expands nodes.
+Command/report SHA are `f1d4cde3…2f49` / `35fc9c4e…ad5`. The timing/memory
+grid remains accepted; actual kernel ranking is `PENDING` a fresh node-level
+paired recapture.
 
 ## Scope
 
@@ -118,7 +127,12 @@ missing-35B voids; the no-argument `summary/` remains the final two-model gate. 
 failed pre-W2 campaigns remain diagnostics; partial rows are never reused as
 successful repetitions. W0 of `KV-PREFIX-CACHE` now supplies the pinned hybrid
 default-off policy and an explicit server override. The trace contract rejects
-cache-policy, admission, max-sequence, model-length, or repeated-duration drift.
+cache-policy, admission, max-sequence, model-length, repeated-duration drift,
+and any newly recorded ours trace without explicit node-level CUDA-graph
+activity. `--trace-only` performs the model gate plus both profilers under one
+lock without creating or rerunning the performance grid. Legacy graph-level
+absence remains accepted only so the already-complete timing/memory evidence
+can be re-aggregated; it cannot satisfy attribution.
 
 ## Port map
 
@@ -188,7 +202,9 @@ traces. The c32 client point is backed by an explicit 32-sequence scheduler on
 both arms rather than the local server's historical default of eight. Both
 servers explicitly disable prefix caching, and the paired trace uses closed-loop
 c16 admission, max-seqs 32, production max model length, and three cache-off
-repetitions whose durations differ by no more than 20%. Each
+repetitions whose durations differ by no more than 20%. Ours must run Nsight
+with `--cuda-graph-trace=node`; whole-graph activities without child kernels
+fail attribution. Each
 model/point has
 at least three valid repetitions and a fresh pinned-vLLM denominator. The
 commit-bound model gate is the correctness precondition before performance is
@@ -254,9 +270,10 @@ reported as a clean dependency check.
    complete; 54/124 axes pass. Hold 35B.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
-   old-oracle W3-B trace is lifecycle-clean and diagnostic; the binding
-   `9cc7191` v0.25 trace is complete and hash-valid. 35B remains gated.
-6. Diff the completed ours/vLLM kernel lists, rank executed differences by
+   old-oracle W3-B trace is lifecycle-clean and diagnostic. The `9cc7191`
+   v0.25 trace is hash-valid but captured ours at whole-graph granularity;
+   execute the new node-level paired `--trace-only` checkpoint. 35B remains gated.
+6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a
    new lever from source or aggregate category time while exact TPOT/ITL and

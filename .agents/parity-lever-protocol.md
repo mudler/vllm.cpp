@@ -129,8 +129,12 @@ backend selection, and runtime-linked deps (TRT-LLM) the source never names.
 
 THE METHOD — do this BEFORE and DURING any parity/throughput work:
 1. **nsys BOTH** the vLLM oracle (`~/venvs/vllm-oracle`, graphed = production) AND our
-   engine on the IDENTICAL workload: `nsys profile -t cuda -o OUT --stats=false <cmd>`
+   engine on the IDENTICAL workload. For our graphed engine the command is
+   `nsys profile -t cuda --cuda-graph-trace=node -o OUT --stats=false <cmd>`
    then `nsys stats --force-export=true --report cuda_gpu_kern_sum OUT.nsys-rep`.
+   CUDA-driver ≥11.7 otherwise defaults to whole-graph activity and omits child
+   kernels. Query the export and require graph-node kernel rows whenever graph
+   launches exist; graph-level timing alone is not an actual kernel list.
 2. **Diff the actual GPU-kernel lists.** For each of OUR hot kernels, find what vLLM runs
    for the same op (by kernel name + count + time). The DIFFERENCES (vLLM runs kernel X,
    we run kernel Y; vLLM has N launches, we have 3N; vLLM's op is a fused Triton, ours is

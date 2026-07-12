@@ -5605,3 +5605,38 @@ Next: diff the actual steady-state ours/vLLM kernel names, calls and time from
 the completed trace; rank concrete differences by gain÷effort; implement the
 top 27B lever behind a same-binary A/B; rerun correctness and the exact grid.
 Do not run 35B or resume later roadmap rows until all 124 27B axes pass.
+
+## 2026-07-12 — ours trace attribution gap found; node-level recapture prepared
+
+The first post-gate trace audit found that the `9cc7191` ours Nsight command
+(SHA-256 `f1d4cde354d4faaa641e08166f95856fe6058ac7474cb623d43f4099a53f2f49`)
+did not set CUDA-graph granularity. Nsight Systems 2025.3.2 on CUDA 13 defaults
+to `graph`, which explicitly omits node activities. Exported SQLite from nsys
+report `35fc9c4e5523cc6756b0fa4af276e3ed89825b977f84c1c14ad6ccf494c34ad5`
+confirms **246,786** ordinary kernel events totaling **101,831,568,543 ns**,
+**1,226** whole-graph activities totaling **154,978,361,184 ns**, and **zero**
+kernel rows with a graph-node ID. vLLM's torch profile expands its CUDA-graph
+children. The two current kernel summaries are therefore not structurally
+comparable and cannot select a speed lever.
+
+This does not invalidate the repeated HTTP timing or memory samples: all
+124 axes remain binding and 54 pass. It downgrades only trace attribution from
+the old contract's `passed:true` to **FAILED / PENDING node recapture**. No
+source-level guess, FP4 topology change, GDN rewrite or deletion is authorized
+from the incomplete list.
+
+The harness now adds `NSYS_CUDA_GRAPH_TRACE=node`, emits
+`--cuda-graph-trace=node`, requires that exact flag before writing a new trace
+status, and records `cuda_graph_trace: node` in the trace contract. Summary
+validation requires `node` whenever the field exists but intentionally accepts
+the legacy absent field so the already-complete timing/memory evidence remains
+re-aggregatable. A regression case proves that compatibility. The campaign
+driver adds `--trace-only`: from a fresh SHA-bound evidence root it builds and
+hashes the exact source, runs the model gate, then captures ours and vLLM under
+one uninterrupted lock without creating/rerunning the 36-point grid. Focused
+client/summary/trace tests pass **23/23**; Python compile and shell syntax pass.
+
+Next: commit/push this trace-contract checkpoint, create a fresh immutable 27B
+trace-only root/build/corpus, run it under one lock, and diff node-level kernel
+names/calls/time. Only then select the first same-binary repair. 35B remains
+prohibited.

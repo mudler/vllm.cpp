@@ -4,7 +4,8 @@
 # The accepted contract is .agents/specs/cuda-online-serving-gate.md. Timed
 # requests are issued only by pinned vLLM `bench serve`; this script owns server
 # lifecycle, interleaving, the one-model/one-lock boundary, memory return, and
-# artifact capture.  --dry-run and --prepare-corpus never acquire /tmp/gpu.
+# artifact capture.  --dry-run and --prepare-corpus never acquire /tmp/gpu;
+# --trace-only performs the model gate plus the paired trace without the grid.
 set -euo pipefail
 
 usage() {
@@ -12,6 +13,8 @@ usage() {
 usage:
   dgx-online-serving.sh --dry-run [--claim-root DIR] [--client PATH] [--vllm-cpp-sha SHA]
   dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
+  dgx-online-serving.sh --trace-only --model 27|35 --snapshot DIR --source-corpus DIR \
+    --evidence DIR --build-dir DIR [--client PATH] [--port N]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR [--client PATH] [--port N]
 EOF
@@ -33,7 +36,7 @@ max_num_batched_tokens=""
 
 while (($#)); do
   case "$1" in
-    --dry-run|--prepare-corpus|--execute)
+    --dry-run|--prepare-corpus|--trace-only|--execute)
       [[ -z ${mode} ]] || { echo "choose exactly one mode" >&2; exit 2; }
       mode=${1#--}
       shift
@@ -102,7 +105,7 @@ if [[ ${mode} == prepare-corpus ]]; then
   exit 0
 fi
 
-[[ ${mode} == execute ]] || { usage; exit 2; }
+[[ ${mode} == execute || ${mode} == trace-only ]] || { usage; exit 2; }
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
 [[ -n ${build_dir} && -x ${build_dir}/examples/server ]] || {
   echo "--build-dir must contain examples/server" >&2
@@ -382,6 +385,7 @@ run_paired_traces() {
   local -a profile_cmd=(
     nsys profile
     --trace=cuda
+    --cuda-graph-trace=node
     --sample=none
     --stats=false
     --force-overwrite=true
@@ -513,6 +517,12 @@ python3 "${repo_root}/tools/bench/online_gate.py" record-model-gate \
   --model-key "${model}" \
   --test-name "${test_name}" \
   --vllm-cpp-sha "${vllm_cpp_sha}"
+
+if [[ ${mode} == trace-only ]]; then
+  run_paired_traces
+  echo "model ${model} node-level paired trace complete" >&2
+  exit 0
+fi
 
 for repetition in 1 2 3; do
   run_leg ours "${repetition}"

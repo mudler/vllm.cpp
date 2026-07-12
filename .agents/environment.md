@@ -84,10 +84,12 @@ inner 4096, state 128; context 262144.
   token-budget and dependency drift audits. `b5c6e4f` is historical vLLM
   0.24.0/FlashInfer 0.6.12 evidence; `3cc490c` is VOID at 28/36 groups,
   1,602/2,016 requests, four returns and no trace. Binding immutable `9cc7191`
-  v0.25.0 evidence now completes the exact 27B cache-off grid and paired traces
-  under one lock: 54/124 axes pass. Diff its actual kernel lists, modernize only
-  trace-proven paths, and close all 70 failed throughput/latency/memory axes
-  before any 35B run.
+  v0.25.0 evidence now completes the exact 27B cache-off grid under one lock:
+  54/124 axes pass. Its first ours Nsight trace used the CUDA-13 default whole-
+  graph granularity (1,226 graph activities, zero child-node kernels), so run
+  the new one-lock `--trace-only` node-level paired recapture before ranking an
+  implementation. Then modernize only trace-proven paths and close all 70
+  failed axes before any 35B run.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

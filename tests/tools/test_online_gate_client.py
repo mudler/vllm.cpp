@@ -23,6 +23,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    NSYS_CUDA_GRAPH_TRACE,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
@@ -236,6 +237,10 @@ class OnlineClientContractTests(unittest.TestCase):
             "summary-<model>/{all-runs,ratios}.json",
             plan["required_artifacts"],
         )
+        self.assertEqual(
+            plan["planned_commands"]["trace_model"][1],
+            "--trace-only",
+        )
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
@@ -274,6 +279,8 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("model_summary_status", script)
         self.assertIn("summary-27/ratios.json", script)
         self.assertIn("summary-35/ratios.json", script)
+        self.assertIn("--cuda-graph-trace=node", script)
+        self.assertIn("--trace-only", script)
 
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -585,7 +592,8 @@ class OnlineClientContractTests(unittest.TestCase):
             vllm_profile_log = root / "vllm-profile.log"
             vllm_corpus = root / "vllm-corpus.jsonl"
             ours_command.write_text(
-                "nsys server --max-num-seqs 32 --max-num-batched-tokens 2048 "
+                "nsys --cuda-graph-trace=node server --max-num-seqs 32 "
+                "--max-num-batched-tokens 2048 "
                 "--no-enable-prefix-caching\n",
                 encoding="utf-8",
             )
@@ -658,6 +666,13 @@ class OnlineClientContractTests(unittest.TestCase):
                 "--no-enable-prefix-caching\n",
                 encoding="utf-8",
             )
+            with self.assertRaisesRegex(HarnessError, "node-level CUDA graph"):
+                record_trace()
+            ours_command.write_text(
+                "nsys --cuda-graph-trace=node server --max-num-seqs 32 "
+                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n",
+                encoding="utf-8",
+            )
             slow = valid_record(
                 requests=TRACE_PROMPTS,
                 concurrency=TRACE_CONCURRENCY,
@@ -679,6 +694,10 @@ class OnlineClientContractTests(unittest.TestCase):
             trace = record_trace()
             self.assertEqual(trace["ours_profiler"], "nsys")
             self.assertEqual(trace["vllm_profiler"], "torch-profiler")
+            self.assertEqual(
+                trace["trace_contract"]["cuda_graph_trace"],
+                NSYS_CUDA_GRAPH_TRACE,
+            )
             self.assertFalse(trace["output_repeatability"]["vllm"]["all_equal"])
 
 

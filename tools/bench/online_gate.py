@@ -50,6 +50,7 @@ PANDAS_VERSION = "2.2.3"
 TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
+NSYS_CUDA_GRAPH_TRACE = "node"
 REPETITIONS = (1, 2, 3)
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
 MODEL_REVISIONS = {
@@ -553,6 +554,24 @@ def build_plan(
                 "--vllm-cpp-sha",
                 vllm_cpp_sha,
             ],
+            "trace_model": [
+                "scripts/dgx-online-serving.sh",
+                "--trace-only",
+                "--model",
+                "<27|35>",
+                "--snapshot",
+                "<MODEL_SNAPSHOT>",
+                "--source-corpus",
+                "<EVIDENCE>/corpus/<27|35>",
+                "--evidence",
+                "<EVIDENCE>",
+                "--build-dir",
+                "<CURRENT_MAIN_BUILD>",
+                "--client",
+                str(client),
+                "--vllm-cpp-sha",
+                vllm_cpp_sha,
+            ],
         },
         "required_artifacts": [
             "manifest.json",
@@ -764,6 +783,9 @@ def record_trace_status(
     ours_command_tokens = shlex.split(ours_command.read_text(encoding="utf-8"))
     if "--no-enable-prefix-caching" not in ours_command_tokens:
         raise HarnessError("ours trace must explicitly disable prefix caching")
+    graph_trace_flag = f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}"
+    if graph_trace_flag not in ours_command_tokens:
+        raise HarnessError("ours trace must capture node-level CUDA graph activity")
     for flag, expected in (
         ("--max-num-seqs", MAX_NUM_SEQS),
         ("--max-num-batched-tokens", MAX_NUM_BATCHED_TOKENS[model_key]),
@@ -873,6 +895,7 @@ def record_trace_status(
         "trace_contract": {
             "admission_mode": "closed-loop",
             "concurrency": TRACE_CONCURRENCY,
+            "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
             "enable_prefix_caching": False,
             "input_len": INPUT_LEN,
             "max_model_len": MAX_MODEL_LEN[model_key],

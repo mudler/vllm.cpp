@@ -166,7 +166,11 @@ stack really resolved to on this GPU — drive which kernels you then read in so
 mirror. Code-comparison alone is necessary but NOT sufficient; the execution trace is
 the ground truth for "what vLLM is faster at". (Caveat: a graphed-vLLM nsys is
 warmup/JIT/capture-contaminated — the kernel NAMES are reliable, the %s need a
-steady-state/warmup-excluded capture.) This applies to every subagent and every parity
+steady-state/warmup-excluded capture.) **For any graphed local engine, nsys MUST use
+`--cuda-graph-trace=node`; CUDA-driver ≥11.7 defaults to whole-graph mode, which omits
+child kernels. Verify the export has graph-node kernel rows whenever graph launches
+occur; a whole-graph-only report is attribution-incomplete and cannot select a lever.**
+This applies to every subagent and every parity
 check. Full method:
 [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) § Verify the
 whole chain.

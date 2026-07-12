@@ -5346,3 +5346,39 @@ driver/report/tree SHA are `c1162d8f…2743`, `eb8a0996…1cc5c` and
 `/tmp/gpu` is free. Rerun into a new root with client artifacts excluded from
 cache-drop inventory and a symlink to the immutable shared corpus; preserve
 this failed evidence unchanged. 35B remains prohibited.
+
+## 2026-07-12 — corrected W3-B trace closes FP4 structural gap; exact grid next
+
+The corrected three-arm driver moved all mutable clients outside the immutable
+corpus-only cache roots and ran shipping prewarm, `VT_FP4_PRE_SERVE_WARMUP=0`
+lazy W3-A, and pinned vLLM under one uncontended `/tmp/gpu` lock. Each arm used
+a clean process, one separate warmup and three retained c16/48
+input-1,024→output-128 interactive Nsight node ranges. All **432/432** retained
+requests complete. Every before/after cache inventory remains exactly **49
+files** with digest `b1789458…7523`; all three memory returns pass. GPU process
+inventory is empty, the lock is reacquirable and no Nsight session remains.
+
+SQLite aggregation records prewarm/lazy/vLLM FP4 GEMM sums of
+**110.623/114.229/109.932 s**. Prewarm is **3.157%** lower than lazy and only
+**0.629%** above vLLM. The 128x32x256 narrow pair is prewarm
+**70.333 s / 218,434 calls** versus vLLM **70.986 s / 220,465 calls**; its
+Stream-K/static split still differs (**65.800+4.533** versus
+**43.259+27.728 s**). Lazy executes **480 / 0.492 s** retained delay kernels
+and sampled alternatives; prewarm executes none. W3-B therefore closes the
+original wide-tactic dominance and retained lazy-autotune contamination, but
+does not establish identical tactic IDs or scheduler mix.
+
+Node-traced prewarm/lazy/vLLM means are
+**804.860/810.250/798.324 tok/s**. Prewarm total is **1.008187x** and its TTFT
+is better, while normalized mean TPOT/ITL is only **0.967291x**. These profiled
+rates are diagnostic because CUDA-graph node tracing perturbs execution; the
+decode gap remains concrete. Evidence root is
+`~/work/vllm.cpp-nvfp4-small-m/d7cdf66…/w3b/trace-ab-oracle-r2`;
+tree/driver/provenance SHA are `2aab1197…a137`, `af29681e…22fbf`, and
+`dff465b3…bbe3`; prewarm/lazy/vLLM report SHA are `a73d6032…1194a`,
+`9d74b6c8…37ea2`, and `f89ffd4a…2d1b8`.
+
+Next clean-build the pushed checkpoint and run the exact W3-B 27B c1-c32
+oracle campaign. If any decode axis remains red, rank the remaining executed
+dependent launch/traffic gaps and amend the owning spike before implementation.
+`b5c6e4f` remains binding, W3-C remains optional, and 35B stays prohibited.

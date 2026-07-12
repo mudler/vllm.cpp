@@ -5,8 +5,9 @@ spike; W1/W2 are measured and W3 is `ACTIVE` under
 `CLAIM-NVFP4-SMALL-M-3`; W3-A delayed event timing is immutable
 correctness/safety-green, performance-classified and strict-acceptance-failed;
 W3-B at clean `d7cdf66` is immutable build/correctness/access-safety-green;
-its repeated component is performance-classified and strict-acceptance-failed,
-while paired trace and exact-oracle performance remain open.
+its repeated component is performance-classified and strict-acceptance-failed;
+the corrected paired trace is lifecycle-clean and structurally FP4-equivalent,
+while exact-oracle performance remains open.
 **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.5.0`, CUDA `13.0.88`, and the
@@ -560,7 +561,7 @@ wrappers.
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three, so the stability objective fails; paired trace/performance remain, while stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected trace then puts FP4 kernel time within 0.63% of vLLM and matches the narrow-pair aggregate while profiled TPOT stays red. Exact c1-c32 performance remains; stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -701,10 +702,51 @@ sessions.
 That component checkpoint did not close W2. The subsequent clean `b5c6e4f`
 campaign above is now the binding denominator and confirms a strict acceptance
 failure with a trace-grounded selection mismatch. W3-A and W3-B same-binary
-selection A/Bs are now classified and strict-failed. W3 owns the paired
-prewarm/lazy trace and the next c1/2/4/8/16/32 three-repetition 27B oracle
-campaign after its execution-grounded repair.
+selection A/Bs are now classified and strict-failed. W3's corrected paired
+trace is now clean and structurally classified. W3 owns the next
+c1/2/4/8/16/32 three-repetition 27B oracle campaign before another
+execution-grounded repair.
 Keep 35B held until all 27B throughput, latency and memory axes pass.
+
+### W3-B corrected paired-trace classification (2026-07-12)
+
+Corrected attempt 2 uses a new immutable corpus-only cache root and writes all
+mutable clients outside it. One uncontended `/tmp/gpu` lock spans shipping
+prewarm, `VT_FP4_PRE_SERVE_WARMUP=0` lazy W3-A, and pinned vLLM. Each arm starts
+clean, runs a separate warmup, then keeps only three steady-state c16/48
+input-1,024→output-128 ranges with interactive Nsight start/stop. All
+**432/432** retained requests pass. All six before/after inventories remain
+exactly **49 files** with digest `b1789458…7523`; all three memory returns pass,
+the GPU exits empty, and no Nsight session remains.
+
+The SQLite kernel records close the structural W3 question. Prewarm/lazy/vLLM
+FP4 GEMM sums are **110.623/114.229/109.932 s**. Prewarm is **3.157%** lower
+than lazy and only **0.629%** above vLLM. The 128x32x256 pair is prewarm
+**70.333 s / 218,434 calls** versus vLLM **70.986 s / 220,465 calls**. The
+remaining scheduler split differs: prewarm spends **65.800 s** in Stream-K and
+**4.533 s** in static-persistent, versus vLLM **43.259/27.728 s**. Lazy still
+executes all sampled alternative signatures plus **480 / 0.492 s** delay
+kernels inside the retained range; prewarm executes no retained delay kernel.
+W3-B therefore fixes the original wide-tactic dominance and first-use tuning
+contamination, but not cross-process ID stability or exact scheduler mix.
+
+The node-traced client rates are deliberately diagnostic. Prewarm/lazy/vLLM
+means are **804.860/810.250/798.324 tok/s** with total-throughput CV
+**0.187/0.150/0.012%**. Prewarm is 1.0082x on total throughput and 1.3646x on
+normalized TTFT, but only **0.9673x** on normalized mean TPOT/ITL. CUDA-graph
+node tracing perturbs scheduling, so none of these rates replaces the clean
+full-grid denominator. Evidence is
+`~/work/vllm.cpp-nvfp4-small-m/d7cdf66…/w3b/trace-ab-oracle-r2`; tree/driver/
+provenance SHA are `2aab1197…a137` / `af29681e…22fbf` /
+`dff465b3…bbe3`, and prewarm/lazy/vLLM report SHA are
+`a73d6032…1194a` / `9d74b6c8…37ea2` / `f89ffd4a…2d1b8`.
+
+Next, clean-build the pushed documentation checkpoint and run the exact W3-B
+c1-c32 27B oracle campaign. If any decode axis remains below floor, rank the
+remaining dependent launch/traffic differences from this corrected trace and
+amend the spike before changing FP4 quantization, block-scale layout,
+normalization fusion, or alpha residency. `b5c6e4f` stays binding, W3-C remains
+optional, and 35B remains prohibited.
 
 ## Risks and decisions
 

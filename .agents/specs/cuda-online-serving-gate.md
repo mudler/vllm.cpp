@@ -50,12 +50,20 @@ zero-error memcheck assertions. Its repeated c16 prewarm/lazy component is
 **808.457/808.220 tok/s = 1.000293×**, strict-fails **15/20 timing + 2/4
 memory**, and retains only **20/80** stable prewarmed tactic IDs. First-use
 first chunk improves **5.662→0.779 s**, so shipping prewarm stays without
-steady-state speed credit. Paired trace and exact-oracle performance remain,
-but trace attempt 1 is **VOID**: prewarm completed 144/144, then the lifecycle
-checker found cache-inventory drift from 50 to 58 files because mutable client
-results sat under an eviction root; lazy/vLLM did not run and no kernel result
-is inferred. The corrected trace uses an immutable corpus-only root. Thus
-`b5c6e4f` is still binding. The
+steady-state speed credit. Trace attempt 1 remains **VOID**, but corrected
+attempt 2 now completes prewarm, lazy and pinned vLLM at **144/144 retained
+requests each** under one whole-series lock. Startup/autotune is excluded by
+separate warmups and interactive Nsight stop ranges; all six cache inventories
+remain 49 files with digest `b1789458…7523`, all three memory returns pass, and
+no process/session remains. Prewarm/lazy/vLLM FP4 kernel sums are
+**110.623/114.229/109.932 s**. Prewarm removes 480 retained lazy delay launches,
+lands within **0.63%** of vLLM, and matches the 128x32x256 pair at
+**70.333/70.986 s** and **218,434/220,465 calls**, though the scheduler split
+differs. Diagnostic profiled means are **804.860/810.250/798.324 tok/s**;
+prewarm total is 1.0082x but normalized mean TPOT is only **0.9673x**. The
+node-traced rates are non-binding, while the kernel mix closes the original
+wide-tactic mismatch. Thus `b5c6e4f` is still binding until the fresh exact
+W3-B c1-c32 grid completes. The
 35B series waits until repaired 27B passes every axis.
 
 ## Scope
@@ -231,12 +239,14 @@ file-hashed by the gate, and the profiler receives the venv-prefixed `PATH`.
    (**implemented and CPU-gated**).
 4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points with
    explicit cache-off, identical sampling, scheduler settings, and model length.
+   The W2 27B grid is binding; the clean W3-B 27B rerun is next. Hold 35B.
 5. Capture one representative paired execution trace per model (`nsys` ours,
-   torch-profiler vLLM on the identical 48-prompt/c16 token shape).
-6. Drive the top traced lever through its owning row. Current priority is
-   `KV-DEVICE-RESIDENCY`: the old d11 slice attributed exactly 255.375 MiB of
-   state traffic per direction to host-backed caches; corrected traces must
-   confirm the lever on equivalent inputs.
+   torch-profiler vLLM on the identical 48-prompt/c16 token shape). The corrected
+   W3-B 27B trace is complete and lifecycle-clean; 35B remains gated.
+6. Drive the top traced lever through its owning row. W3-B closes the original
+   wide FP4 tactic-family mismatch. Re-rank only after the exact W3-B grid shows
+   which decode/latency axes remain below floor; do not infer a lever from the
+   profiled total-throughput win while normalized TPOT is still 0.9673x.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

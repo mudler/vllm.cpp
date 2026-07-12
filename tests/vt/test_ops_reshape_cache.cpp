@@ -359,6 +359,51 @@ TEST_CASE("reshape_and_cache strided slices: K and V do not clobber each other")
   }
 }
 
+// Ported input-stride behavior from reshape_and_cache_flash: QKVParallelLinear
+// splits K/V as inner-contiguous token pages whose stride(0) still spans the
+// packed Q+K+V row. No materialized split is required.
+TEST_CASE("reshape_and_cache accepts packed-QKV row-strided K/V inputs") {
+  const int64_t nb = 3, bs = 2, H = 2, D = 3, nt = 4;
+  const int64_t page = H * D;
+  const int64_t q_width = 17;
+  const int64_t packed_width = q_width + 2 * page;
+  std::vector<float> packed(static_cast<size_t>(nt * packed_width), -9.0F);
+  for (int64_t tok = 0; tok < nt; ++tok) {
+    for (int64_t e = 0; e < page; ++e) {
+      packed[static_cast<size_t>(tok * packed_width + q_width + e)] =
+          static_cast<float>(100 * tok + e) + 0.25F;
+      packed[static_cast<size_t>(tok * packed_width + q_width + page + e)] =
+          static_cast<float>(1000 + 100 * tok + e) + 0.5F;
+    }
+  }
+  Tensor tk = StridedView(packed.data(), DType::kF32, Cpu(), q_width,
+                          {nt, H, D}, {packed_width, D, 1});
+  Tensor tv = StridedView(packed.data(), DType::kF32, Cpu(), q_width + page,
+                          {nt, H, D}, {packed_width, D, 1});
+  std::vector<float> kc(static_cast<size_t>(nb * bs * page), -1.0F);
+  std::vector<float> vc(static_cast<size_t>(nb * bs * page), -1.0F);
+  Tensor tkc = Contig(kc.data(), DType::kF32, Cpu(), {nb, bs, H, D});
+  Tensor tvc = Contig(vc.data(), DType::kF32, Cpu(), {nb, bs, H, D});
+  std::vector<int64_t> slots = {0, 5, 2, 3};
+  Tensor ts = Contig(slots.data(), DType::kI64, Cpu(), {nt});
+  Queue qq = Q();
+  vt::ReshapeAndCache(qq, tk, tv, tkc, tvc, ts);
+
+  for (int64_t tok = 0; tok < nt; ++tok) {
+    for (int64_t head = 0; head < H; ++head) {
+      for (int64_t e = 0; e < D; ++e) {
+        const int64_t inner = head * D + e;
+        const int64_t cache = CacheIdx(slots[static_cast<size_t>(tok)], bs,
+                                       H, D, head, e);
+        CHECK(kc[static_cast<size_t>(cache)] ==
+              packed[static_cast<size_t>(tok * packed_width + q_width + inner)]);
+        CHECK(vc[static_cast<size_t>(cache)] ==
+              packed[static_cast<size_t>(tok * packed_width + q_width + page + inner)]);
+      }
+    }
+  }
+}
+
 // ===========================================================================
 // CUDA parity: the CUDA kernel must produce a byte-identical cache to the CPU
 // reference on the same inputs (incl. block-spanning slots + a -1 skip).
@@ -522,4 +567,58 @@ TEST_CASE("reshape_and_cache CUDA matches CPU on the real strided unbind slices"
   for (size_t i = 0; i < buf_n; ++i) {
     CHECK(buf_got[i] == doctest::Approx(buf_cpu[i]));
   }
+}
+
+TEST_CASE("reshape_and_cache CUDA accepts packed-QKV row-strided inputs") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping packed-QKV input-stride parity");
+    return;
+  }
+  const int64_t nb = 4, bs = 4, H = 2, D = 8, nt = 8;
+  const int64_t page = H * D;
+  const int64_t q_width = 37;
+  const int64_t packed_width = q_width + 2 * page;
+  std::vector<float> packed(static_cast<size_t>(nt * packed_width), -3.0F);
+  for (int64_t tok = 0; tok < nt; ++tok) {
+    for (int64_t e = 0; e < page; ++e) {
+      packed[static_cast<size_t>(tok * packed_width + q_width + e)] =
+          static_cast<float>(100 * tok + e) + 0.25F;
+      packed[static_cast<size_t>(tok * packed_width + q_width + page + e)] =
+          static_cast<float>(1000 + 100 * tok + e) + 0.5F;
+    }
+  }
+  std::vector<int64_t> slots = {0, 5, 10, -1, 3, 12, 7, 14};
+  const size_t cache_n = static_cast<size_t>(nb * bs * page);
+  std::vector<float> kc_cpu(cache_n, -7.0F), vc_cpu(cache_n, -7.0F);
+  Tensor tk = StridedView(packed.data(), DType::kF32, Cpu(), q_width,
+                          {nt, H, D}, {packed_width, D, 1});
+  Tensor tv = StridedView(packed.data(), DType::kF32, Cpu(), q_width + page,
+                          {nt, H, D}, {packed_width, D, 1});
+  Tensor tkc = Contig(kc_cpu.data(), DType::kF32, Cpu(), {nb, bs, H, D});
+  Tensor tvc = Contig(vc_cpu.data(), DType::kF32, Cpu(), {nb, bs, H, D});
+  Tensor ts = Contig(slots.data(), DType::kI64, Cpu(), {nt});
+  Queue cpuq = Q();
+  vt::ReshapeAndCache(cpuq, tk, tv, tkc, tvc, ts);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dpacked(gpu, g.q, DType::kF32, {nt, packed_width},
+                       packed.data());
+  auto* packed_dev = static_cast<float*>(dpacked.tensor().data);
+  Tensor dkey = StridedView(packed_dev, DType::kF32, Gpu(), q_width,
+                            {nt, H, D}, {packed_width, D, 1});
+  Tensor dvalue = StridedView(packed_dev, DType::kF32, Gpu(), q_width + page,
+                              {nt, H, D}, {packed_width, D, 1});
+  std::vector<float> cache_init(cache_n, -7.0F);
+  DeviceTensor dkc(gpu, g.q, DType::kF32, {nb, bs, H, D}, cache_init.data());
+  DeviceTensor dvc(gpu, g.q, DType::kF32, {nb, bs, H, D}, cache_init.data());
+  DeviceTensor ds(gpu, g.q, DType::kI64, {nt}, slots.data());
+  vt::ReshapeAndCache(g.q, dkey, dvalue, dkc.tensor(), dvc.tensor(),
+                      ds.tensor());
+
+  std::vector<float> kc_got(cache_n), vc_got(cache_n);
+  dkc.Download(g.q, kc_got.data());
+  dvc.Download(g.q, vc_got.data());
+  CHECK(kc_got == kc_cpu);
+  CHECK(vc_got == vc_cpu);
 }

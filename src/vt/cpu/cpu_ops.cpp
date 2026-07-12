@@ -624,7 +624,7 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
   for (int64_t tok = r0; tok < r1; ++tok) {
     const float* cs = cos_sin.Ptr<float>() + tok * rot;
     for (int64_t h = 0; h < hq; ++h) {
-      const int64_t qrow = tok * (hq * 2 * dh) + h * 2 * dh;
+      const int64_t qrow = tok * qgate.stride[0] + h * 2 * dh;
       do_head(qgate, qrow, q_norm, q_out, (tok * hq + h) * dh, cs);
       // gate passthrough: the second Dh of each (t,h) q|gate pair (no norm/rope).
       const int64_t gbase = qrow + dh;
@@ -632,7 +632,8 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& gate
       for (int64_t j = 0; j < dh; ++j) StoreF32(gate_out, gout + j, LoadF32(qgate, gbase + j));
     }
     for (int64_t h = 0; h < hkv; ++h) {
-      do_head(kf, tok * (hkv * dh) + h * dh, k_norm, k_out, (tok * hkv + h) * dh, cs);
+      do_head(kf, tok * kf.stride[0] + h * dh, k_norm, k_out,
+              (tok * hkv + h) * dh, cs);
     }
   }
   });

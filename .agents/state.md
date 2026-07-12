@@ -5675,3 +5675,37 @@ default/fallback 27B token gates and a 240→208 trace assertion before the
 unprofiled same-binary A/B. Direct-swizzle/alpha/GDN work stays unstacked and
 will be re-ranked afterward. This trace accepts no throughput number;
 `9cc7191` remains binding at **54/124** axes, and 35B remains prohibited.
+
+## 2026-07-12 — W3-D packed QKV implemented; staging correctness/safety green
+
+The `def5f75` trace-selected topology is now implemented without stacking
+another lever. `FullAttnLayerWeights` retains the logical host Q/K/V shards and
+adds two combined device owners. The CUDA resident concatenates packed FP4 rows
+and linear scales at N=`12,288+1,024+1,024=14,336`, swizzles the scale once,
+and applies `max(q,k,v)` to the on-disk CT input and weight divisors before one
+reciprocal and alpha. The forward quantizes the shared hidden state once and
+launches one BF16 GEMM. Q/K/V are zero-copy logical views whose token stride is
+the parent width; the fused attention preamble, BF16→F32 dense value cast and
+KV cache writer now consume that explicit stride. `VT_FP4_MERGED_QKV=0` and an
+explicit fused-preamble opt-out preserve the contiguous three-GEMM reference.
+35B and non-W4A4 paths are unchanged.
+
+CPU focused build/tests pass. Fresh CUDA 13.0.88/sm_121a staging at
+`~/work/vllm.cpp-packed-qkv-staging` builds the server and focused/model
+targets. The packed CUTLASS output equals all three logical BF16 outputs with
+max absolute difference **0**. CUDA preamble is **2/2 cases, 14/14 assertions**;
+reshape/cache is **12/12, 4,290/4,290**. Packed-GEMM, preamble and packed-cache
+compute-sanitizer processes each report **zero errors**. The real 27B default
+and `VT_FP4_MERGED_QKV=0` processes each pass **235/235 assertions and 16/16
+oracle tokens**. Default prewarm now tunes **64/64** profiles; split retains
+**80/80**, reflecting the one packed N=14,336 shape replacing Q N=12,288 and
+K/V N=1,024. Model log SHA-256 are `f2215483…dc8d` / `594c3bf7…11fb`;
+server/model-test binaries are `203994df…4c1c` / `319e6c38…e541`. GPU and
+`/tmp/gpu` exit idle.
+
+This is deliberately mutable pre-commit staging and accepts no performance,
+memory or launch-count claim. `9cc7191` remains binding at **54/124 axes**.
+Next: commit/push this implementation checkpoint, clean-build the immutable
+SHA, run a single lock-held packed/split same-binary 27B A/B, then node re-trace
+to prove 240→208 and re-rank the residual. Do not stack direct-swizzle, alpha,
+GDN or other work; do not run 35B.

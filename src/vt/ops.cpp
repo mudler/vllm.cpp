@@ -675,10 +675,16 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
   VT_CHECK(q_norm.dtype == DType::kF32 && k_norm.dtype == DType::kF32 &&
                cos_sin.dtype == DType::kF32,
            "attn_qk_norm_rope_gate: q_norm/k_norm/cos_sin must be f32");
-  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && gate_out.IsContiguous() &&
-               qgate.IsContiguous() && kf.IsContiguous() && q_norm.IsContiguous() &&
+  // QKVParallelLinear returns torch.split-style logical views: every Q/K row
+  // is inner-contiguous, but stride(0) remains Q+K+V. Consume that layout
+  // directly instead of adding split-copy kernels.
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() &&
+               gate_out.IsContiguous() && qgate.stride[1] == 1 &&
+               qgate.stride[0] >= qgate.shape[1] && kf.stride[1] == 1 &&
+               kf.stride[0] >= kf.shape[1] && q_norm.IsContiguous() &&
                k_norm.IsContiguous() && cos_sin.IsContiguous(),
-           "attn_qk_norm_rope_gate: contiguous required");
+           "attn_qk_norm_rope_gate: outputs/weights/cache must be contiguous; "
+           "qgate/kf rows must be inner-contiguous");
   VT_CHECK(q_out.device == q.device && k_out.device == q.device && gate_out.device == q.device &&
                qgate.device == q.device && kf.device == q.device && q_norm.device == q.device &&
                k_norm.device == q.device && cos_sin.device == q.device,
@@ -1059,11 +1065,17 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
   // head strides from key_cache.stride(0/1/2)). We only require what the copy
   // actually needs: the innermost element access is well-defined (elem stride 1)
   // and the per-token page is dense (head stride == head_size, i.e. dim-2/3
-  // packed), which holds for the NHD unbind slice. The input k/v rows and
-  // slot_mapping must be contiguous (upstream reads k/v inner packed, applying
-  // only key.stride(0) for the token, and indexes slot_mapping directly).
-  VT_CHECK(k.IsContiguous() && v.IsContiguous() && slot_mapping.IsContiguous(),
-           "reshape_and_cache: k/v inputs and slot_mapping must be contiguous");
+  // packed), which holds for the NHD unbind slice. Input K/V may likewise be
+  // torch.split-style QKVParallelLinear views: each [H,D] token page is packed,
+  // while stride(0) still spans Q+K+V. The kernels already consume the explicit
+  // token strides, matching upstream reshape_and_cache_flash.
+  VT_CHECK(k.stride[2] == 1 && v.stride[2] == 1 &&
+               k.stride[1] == head_size && v.stride[1] == head_size &&
+               k.stride[0] >= num_kv_heads * head_size &&
+               v.stride[0] >= num_kv_heads * head_size &&
+               slot_mapping.IsContiguous(),
+           "reshape_and_cache: k/v token pages must be inner-contiguous and "
+           "slot_mapping contiguous");
   VT_CHECK(k_cache.stride[3] == 1 && v_cache.stride[3] == 1,
            "reshape_and_cache: k_cache/v_cache innermost (head_size) stride must be 1");
   VT_CHECK(k_cache.stride[2] == head_size && v_cache.stride[2] == head_size,
@@ -1316,7 +1328,16 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.dtype == DType::kF32, "cast_f32: out must be f32");
   VT_CHECK(in.dtype == DType::kBF16, "cast_f32: in must be bf16");
   VT_CHECK(out.Numel() == in.Numel(), "cast_f32: out/in must have the same element count");
-  VT_CHECK(out.IsContiguous() && in.IsContiguous(), "cast_f32: contiguous required");
+  int64_t inner = 1;
+  bool inner_contiguous = true;
+  for (int dim = in.rank - 1; dim >= 1; --dim) {
+    inner_contiguous = inner_contiguous && in.stride[dim] == inner;
+    inner *= in.shape[dim];
+  }
+  inner_contiguous = inner_contiguous && in.rank >= 1 &&
+                     in.stride[0] >= inner;
+  VT_CHECK(out.IsContiguous() && inner_contiguous,
+           "cast_f32: out must be contiguous and input rows inner-contiguous");
   VT_CHECK(out.device == q.device && in.device == q.device,
            "cast_f32: device mismatch (out/in/queue)");
   reinterpret_cast<CastF32Fn>(GetOp(OpId::kCastF32, q.device.type))(q, out, in);

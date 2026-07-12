@@ -1,4 +1,7 @@
-// vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
+// vllm.cpp runtime tests. Core W4A4 references mirror the pinned quant kernels;
+// the W3-D packed-QKV case also ports QKVParallelLinear's loader topology from
+// tests/model_executor/model_loader/test_reload.py:150 and the logical shard
+// mapping exercised by tests/models/test_adapters.py:44-60.
 // TRUE W4A4 (fp4 activations x fp4 weights) ops — the 27B path (notes §7). These
 // validate the CPU kernels vt::ScaledFp4Quant + vt::MatmulNvfp4Fp4 against the
 // pinned vLLM CPU truth:
@@ -30,6 +33,7 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
+#include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vt/backend.h"
 #include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
@@ -433,6 +437,7 @@ Device Gpu() { return Device{DeviceType::kCUDA, 0}; }
 
 Tensor GpuTensor(const std::vector<int64_t>& shape) {
   Tensor t;
+  t.device = Gpu();
   t.rank = static_cast<int>(shape.size());
   int64_t stride = 1;
   for (int i = t.rank - 1; i >= 0; --i) {
@@ -923,6 +928,150 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
 
   for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
   b.DestroyQueue(gq);
+}
+
+// Ported from QKVParallelLinear's one-physical-weight contract
+// (`linear.py:942-1050`) and the CT max-logical-shard scalar rule. Concatenating
+// Q/K/V packed rows and scales, quantizing once and launching one GEMM must
+// reproduce the same logical BF16 outputs as three views using the one merged
+// alpha. The packed output is split with its real Q+K+V row stride.
+TEST_CASE("matmul_nvfp4_cutlass packed QKV matches logical shard views CUDA") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue q = b.CreateQueue();
+  const int64_t M = 16, K = 512;
+  const std::array<int64_t, 3> ns = {256, 128, 128};
+  const int64_t total_n = ns[0] + ns[1] + ns[2];
+  const int64_t mp = RoundUp(M, 128), kp = RoundUp(K / 16, 4);
+
+  std::mt19937 rng(12025);
+  std::normal_distribution<float> activation(0.0F, 2.0F);
+  std::uniform_int_distribution<int> packed_byte(0, 255);
+  std::uniform_real_distribution<float> block_scale(0.05F, 4.0F);
+  std::vector<float> x(static_cast<size_t>(M * K));
+  for (float& value : x) value = activation(rng);
+  std::vector<uint8_t> weights(static_cast<size_t>(total_n * K / 2));
+  for (uint8_t& value : weights)
+    value = static_cast<uint8_t>(packed_byte(rng));
+  std::vector<uint8_t> scales(static_cast<size_t>(total_n * K / 16));
+  for (uint8_t& value : scales)
+    value = vllm::F32ToF8E4M3(block_scale(rng));
+
+  vllm::Nvfp4Weight qw, kw, vw;
+  qw.input_global_scale_inv = 72.0F;
+  kw.input_global_scale_inv = 80.0F;
+  vw.input_global_scale_inv = 96.0F;
+  qw.weight_global_scale_inv = 256.0F;
+  kw.weight_global_scale_inv = 512.0F;
+  vw.weight_global_scale_inv = 384.0F;
+  const vllm::FullAttnQkvGlobals globals =
+      vllm::MergeFullAttnQkvGlobals(qw, kw, vw);
+
+  const auto upload = [&](const void* host, size_t bytes) {
+    void* device = b.Alloc(bytes);
+    b.Copy(q, device, host, bytes);
+    return device;
+  };
+  void* dx = upload(x.data(), x.size() * sizeof(float));
+  void* dw = upload(weights.data(), weights.size());
+  void* ds = upload(scales.data(), scales.size());
+  void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
+  void* das = b.Alloc(static_cast<size_t>(M * K / 16));
+  void* dasw = b.Alloc(static_cast<size_t>(mp * kp));
+  void* dsw = b.Alloc(static_cast<size_t>(RoundUp(total_n, 128) * kp));
+  void* dout = b.Alloc(static_cast<size_t>(M * total_n) * sizeof(uint16_t));
+
+  Tensor tx = GpuTensor({M, K});
+  tx.data = dx;
+  tx.dtype = DType::kF32;
+  Tensor tap = GpuTensor({M, K / 2});
+  tap.data = dap;
+  tap.dtype = DType::kI8;
+  Tensor tas = GpuTensor({M, K / 16});
+  tas.data = das;
+  tas.dtype = DType::kI8;
+  Tensor tasw = GpuTensor({mp, kp});
+  tasw.data = dasw;
+  tasw.dtype = DType::kI8;
+  Tensor tw = GpuTensor({total_n, K / 2});
+  tw.data = dw;
+  tw.dtype = DType::kI8;
+  Tensor ts = GpuTensor({total_n, K / 16});
+  ts.data = ds;
+  ts.dtype = DType::kI8;
+  Tensor tsw = GpuTensor({RoundUp(total_n, 128), kp});
+  tsw.data = dsw;
+  tsw.dtype = DType::kI8;
+  Tensor tout = GpuTensor({M, total_n});
+  tout.data = dout;
+  tout.dtype = DType::kBF16;
+  vt::ScaledFp4Quant(q, tap, tas, tx, globals.input_global_scale_inv);
+  vt::SwizzleBlockscale(q, tasw, tas);
+  vt::SwizzleBlockscale(q, tsw, ts);
+  vt::MatmulNvfp4Cutlass(q, tout, tap, tasw, tw, tsw, globals.alpha);
+
+  std::array<void*, 3> shard_scale_sw{};
+  std::array<void*, 3> shard_out{};
+  int64_t n_offset = 0;
+  for (size_t shard = 0; shard < ns.size(); ++shard) {
+    const int64_t n = ns[shard];
+    shard_scale_sw[shard] =
+        b.Alloc(static_cast<size_t>(RoundUp(n, 128) * kp));
+    shard_out[shard] =
+        b.Alloc(static_cast<size_t>(M * n) * sizeof(uint16_t));
+    Tensor shard_w = GpuTensor({n, K / 2});
+    shard_w.data = static_cast<uint8_t*>(dw) + n_offset * K / 2;
+    shard_w.dtype = DType::kI8;
+    Tensor shard_s = GpuTensor({n, K / 16});
+    shard_s.data = static_cast<uint8_t*>(ds) + n_offset * K / 16;
+    shard_s.dtype = DType::kI8;
+    Tensor shard_sw = GpuTensor({RoundUp(n, 128), kp});
+    shard_sw.data = shard_scale_sw[shard];
+    shard_sw.dtype = DType::kI8;
+    Tensor shard_o = GpuTensor({M, n});
+    shard_o.data = shard_out[shard];
+    shard_o.dtype = DType::kBF16;
+    vt::SwizzleBlockscale(q, shard_sw, shard_s);
+    vt::MatmulNvfp4Cutlass(q, shard_o, tap, tasw, shard_w, shard_sw,
+                           globals.alpha);
+    n_offset += n;
+  }
+
+  std::vector<uint16_t> packed_out(static_cast<size_t>(M * total_n));
+  b.Copy(q, packed_out.data(), dout, packed_out.size() * sizeof(uint16_t));
+  std::array<std::vector<uint16_t>, 3> shard_outputs;
+  for (size_t shard = 0; shard < ns.size(); ++shard) {
+    shard_outputs[shard].resize(static_cast<size_t>(M * ns[shard]));
+    b.Copy(q, shard_outputs[shard].data(), shard_out[shard],
+           shard_outputs[shard].size() * sizeof(uint16_t));
+  }
+  b.Synchronize(q);
+
+  n_offset = 0;
+  double max_abs = 0.0;
+  double ref_absmax = 0.0;
+  for (size_t shard = 0; shard < ns.size(); ++shard) {
+    const int64_t n = ns[shard];
+    for (int64_t row = 0; row < M; ++row) {
+      for (int64_t col = 0; col < n; ++col) {
+        const float got = Bf16ToFloat(
+            packed_out[static_cast<size_t>(row * total_n + n_offset + col)]);
+        const float ref = Bf16ToFloat(
+            shard_outputs[shard][static_cast<size_t>(row * n + col)]);
+        max_abs = std::max(max_abs,
+                           std::abs(static_cast<double>(got) - ref));
+        ref_absmax = std::max(ref_absmax, std::abs(static_cast<double>(ref)));
+      }
+    }
+    n_offset += n;
+  }
+  MESSAGE("packed-QKV max_abs=" << max_abs << " ref_absmax=" << ref_absmax);
+  CHECK(max_abs <= 0.03 * ref_absmax + 1e-3);
+
+  for (void* pointer : {dx, dw, ds, dap, das, dasw, dsw, dout}) b.Free(pointer);
+  for (void* pointer : shard_scale_sw) b.Free(pointer);
+  for (void* pointer : shard_out) b.Free(pointer);
+  b.DestroyQueue(q);
 }
 
 // Port of the forced-tactic coverage in

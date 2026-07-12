@@ -56,18 +56,27 @@ void CastBf16KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   Check(cudaGetLastError(), "cast_bf16 launch");
 }
 
-// cast_f32: out[i] = f32(in[i]). bf16 -> f32 upcast, thread per element.
-__global__ void CastF32Kernel(float* out, const __nv_bfloat16* in, int64_t n) {
+// cast_f32: bf16 -> f32 upcast. Input may be a torch.split-style packed view:
+// each logical row is dense, while row_stride spans the parent Q+K+V tensor.
+__global__ void CastF32Kernel(float* out, const __nv_bfloat16* in, int64_t n,
+                              int64_t row_size, int64_t row_stride) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
-    out[i] = __bfloat162float(in[i]);
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += step) {
+    const int64_t row = i / row_size;
+    const int64_t col = i - row * row_size;
+    out[i] = __bfloat162float(in[row * row_stride + col]);
+  }
 }
 
 void CastF32KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   const int64_t n = out.Numel();
   if (n == 0) return;
+  const int64_t rows = in.shape[0];
+  const int64_t row_size = n / rows;
   CastF32Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<float>(),
-                                                        in.Ptr<__nv_bfloat16>(), n);
+                                                        in.Ptr<__nv_bfloat16>(), n,
+                                                        row_size, in.stride[0]);
   Check(cudaGetLastError(), "cast_f32 launch");
 }
 

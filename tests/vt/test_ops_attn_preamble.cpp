@@ -172,6 +172,44 @@ TEST_CASE("attn preamble fused == unfused (f32, gemma) bit-identity") {
   dk_f.Download(q, kout_f.data());
   gate_f.Download(q, gate_fo.data());
 
+  // Port of QKVParallelLinear's torch.split-style output contract: Q and K
+  // rows are inner-contiguous views whose token stride remains Q+K+V. The
+  // fused preamble must consume those views without split-copy kernels.
+  const int64_t q_width = Hq * 2 * Dh;
+  const int64_t k_width = Hkv * Dh;
+  const int64_t v_width = Hkv * Dh;
+  const int64_t packed_width = q_width + k_width + v_width;
+  std::vector<float> packed_h(static_cast<size_t>(T * packed_width), -777.0F);
+  for (int64_t tok = 0; tok < T; ++tok) {
+    std::memcpy(packed_h.data() + tok * packed_width,
+                qgate_h.data() + tok * q_width,
+                static_cast<size_t>(q_width) * sizeof(float));
+    std::memcpy(packed_h.data() + tok * packed_width + q_width,
+                kf_h.data() + tok * k_width,
+                static_cast<size_t>(k_width) * sizeof(float));
+  }
+  Dev packed(b, q, DType::kF32, {T, packed_width}, packed_h.data());
+  Tensor packed_q = MakeT(packed.t().data, DType::kF32, Gpu(), {T, q_width});
+  packed_q.stride[0] = packed_width;
+  auto* packed_k_data = static_cast<float*>(packed.t().data) + q_width;
+  Tensor packed_k = MakeT(packed_k_data, DType::kF32, Gpu(), {T, k_width});
+  packed_k.stride[0] = packed_width;
+  Dev dq_s(b, q, DType::kF32, {T, Hq, Dh});
+  Dev dk_s(b, q, DType::kF32, {T, Hkv, Dh});
+  Dev gate_s(b, q, DType::kF32, {T, Hq, Dh});
+  vt::AttnQkNormRopeGate(q, dq_s.t(), dk_s.t(), gate_s.t(), packed_q,
+                         packed_k, qn.t(), kn.t(), cos_sin.t(),
+                         RmsNormArgs{eps, true}, RopeArgs{base, rot});
+  std::vector<float> qout_s(qout_f.size());
+  std::vector<float> kout_s(kout_f.size());
+  std::vector<float> gate_so(gate_fo.size());
+  dq_s.Download(q, qout_s.data());
+  dk_s.Download(q, kout_s.data());
+  gate_s.Download(q, gate_so.data());
+  CHECK(qout_s == qout_f);
+  CHECK(kout_s == kout_f);
+  CHECK(gate_so == gate_fo);
+
   size_t fq = 0, fk = 0, fg = 0;
   const float dq = MaxAbsDiff(qout_u, qout_f, &fq);
   const float dk = MaxAbsDiff(kout_u, kout_f, &fk);

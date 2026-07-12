@@ -37,6 +37,7 @@ using vllm::DenseMlpWeights;
 using vllm::GdnStateCache;
 using vllm::HfConfig;
 using vllm::MergeDenseGateUpGlobals;
+using vllm::MergeFullAttnQkvGlobals;
 using vllm::Nvfp4Weight;
 using vllm::OwnedTensor;
 using vllm::PagedKvCache;
@@ -372,6 +373,34 @@ TEST_CASE("qwen27 dense merged gate-up uses maximum CT logical-shard divisors") 
   up.weight_global_scale_inv = 0.0F;
   CHECK_THROWS_WITH_AS(MergeDenseGateUpGlobals(gate, up),
                        doctest::Contains("missing CT weight divisor"),
+                       std::runtime_error);
+}
+
+// Ported from tests/model_executor/model_loader/test_reload.py:150's
+// QKVParallelLinear construction, tests/models/test_adapters.py:44-60's
+// physical shard placement, and
+// compressed_tensors_w4a4_nvfp4.py:95-138. Q/K/V may carry unequal checkpoint
+// scalars; the packed physical linear selects each maximum before reciprocal.
+TEST_CASE("qwen27 packed QKV uses maximum CT logical-shard divisors") {
+  Nvfp4Weight q;
+  q.weight_global_scale_inv = 256.0F;
+  q.input_global_scale_inv = 72.0F;
+  Nvfp4Weight k;
+  k.weight_global_scale_inv = 512.0F;
+  k.input_global_scale_inv = 80.0F;
+  Nvfp4Weight v;
+  v.weight_global_scale_inv = 384.0F;
+  v.input_global_scale_inv = 96.0F;
+
+  const vllm::FullAttnQkvGlobals globals =
+      MergeFullAttnQkvGlobals(q, k, v);
+  CHECK(globals.input_global_scale_inv == 96.0F);
+  CHECK(globals.weight_global_scale == 1.0F / 512.0F);
+  CHECK(globals.alpha == (1.0F / 96.0F) * (1.0F / 512.0F));
+
+  v.input_global_scale_inv = 0.0F;
+  CHECK_THROWS_WITH_AS(MergeFullAttnQkvGlobals(q, k, v),
+                       doctest::Contains("missing CT input divisor"),
                        std::runtime_error);
 }
 

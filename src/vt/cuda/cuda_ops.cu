@@ -596,8 +596,10 @@ template <typename Tsrc, typename Tqk, typename Tgate>
 __global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
                                          const Tsrc* qgate, const Tsrc* kf, const float* q_norm,
                                          const float* k_norm, const float* cos_sin, int64_t hq,
-                                         int64_t hkv, int64_t dh, int rot, int64_t half, float eps,
-                                         bool gemma) {
+                                         int64_t hkv, int64_t dh,
+                                         int64_t qgate_row_stride,
+                                         int64_t kf_row_stride, int rot,
+                                         int64_t half, float eps, bool gemma) {
   const int64_t tok = blockIdx.x;
   const int64_t head = blockIdx.y;  // [0, hq+hkv)
   const bool is_q = head < hq;
@@ -607,14 +609,14 @@ __global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out
   Tqk* out;
   int64_t gate_base = 0;  // only meaningful for q heads
   if (is_q) {
-    const int64_t qrow = tok * (hq * 2 * dh) + head * 2 * dh;
+    const int64_t qrow = tok * qgate_row_stride + head * 2 * dh;
     src = qgate + qrow;       // q half [0,dh)
     gate_base = qrow + dh;    // gate half [dh,2dh)
     w = q_norm;
     out = q_out + (tok * hq + head) * dh;
   } else {
     const int64_t hk = head - hq;
-    src = kf + tok * (hkv * dh) + hk * dh;
+    src = kf + tok * kf_row_stride + hk * dh;
     w = k_norm;
     out = k_out + (tok * hkv + hk) * dh;
   }
@@ -673,7 +675,7 @@ void LaunchAttnPreamble(cudaStream_t s, Tensor& q_out, Tensor& k_out, Tensor& ga
   AttnQkNormRopeGateKernel<Tsrc, Tqk, Tgate><<<grid, kBlock, 0, s>>>(
       q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
       kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(), hq, hkv, dh,
-      ra.rotary_dim, half, na.eps, na.gemma);
+      qgate.stride[0], kf.stride[0], ra.rotary_dim, half, na.eps, na.gemma);
   Check(cudaGetLastError(), "attn_qk_norm_rope_gate launch");
 }
 

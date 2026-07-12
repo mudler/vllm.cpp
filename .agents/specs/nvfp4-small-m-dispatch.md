@@ -7,9 +7,10 @@ correctness/safety-green, performance-classified and strict-acceptance-failed;
 W3-B at clean `d7cdf66` is immutable build/correctness/access-safety-green;
 its repeated component is performance-classified and strict-acceptance-failed;
 the corrected paired trace is lifecycle-clean and structurally FP4-equivalent,
-and the replacement v0.25 node trace is accepted. It promotes W3-D packed QKV
-as the next trace-grounded implementation; exact-oracle performance remains
-open.
+and the replacement v0.25 node trace is accepted. It promoted W3-D packed QKV,
+which is now implementation/
+correctness/access-safety green in mutable staging; exact-oracle performance
+and immutable evidence remain open.
 **Historical implementation pins:** vLLM `e24d1b24fe96`, pip-vLLM `0.24.0`,
 installed FlashInfer `0.6.12`, CUTLASS `v4.5.0`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
@@ -545,7 +546,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | 32 configs (`fp4_gemm_cutlass_template_sm120.h:47-220`) | port the dependency-owned raw template semantics into split local CUDA TUs: explicit TMA epilogue with `ElementC=void`, block-scaled cooperative mainloop, static persistent + Stream-K, both orientations and exact tactic order |
 | `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
 | merged dense gate/up (`qwen3_5.py`, `qwen2_moe.py`, `linear.py`) | concatenate packed gate/up rows and linear FP8 block scales on device, swizzle the combined scale once, emit BF16 `[M,2I]`, apply `SiluAndMul`, and preserve a split diagnostic arm |
-| full-attention packed QKV (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D trace-promoted:** build one resident packed FP4 Q/K/V operand and one concatenated linear-scale stream, apply the same compressed-tensors logical-shard maximum rule, quantize the shared input once, launch one N=14,336 GEMM and expose Q/K/V BF16 subviews without copies; `VT_FP4_MERGED_QKV=0` restores three GEMMs |
+| full-attention packed QKV (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D implemented/staging-gated:** one resident packed FP4 Q/K/V operand and concatenated linear-scale stream, compressed-tensors logical-shard maxima, one quantization, one N=14,336 GEMM and row-strided Q/K/V BF16 views consumed without copies; `VT_FP4_MERGED_QKV=0` restores three GEMMs. Mutable staging correctness/safety passes; clean performance remains pending |
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
@@ -569,7 +570,7 @@ wrappers.
 | FlashInfer bucket helpers `fused_moe/utils.py:212-307` | **W1 ported/gated:** table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; pushed `c8807b0` gates the real ready-hit/miss/retry capture in both exact and legacy modes |
 | FlashInfer tactic enumeration `fp4_gemm_cutlass_template_sm120.h:187-220` | assert 32 stable tactic descriptors/order; force every supported tactic over representative small-M and real Qwen shapes; unsupported configs are reported/skipped only during tuning |
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
-| `QKVParallelLinear` loader/forward (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | add an unequal-shard pack/split unit test; a CUDA packed-one-GEMM versus explicit three-GEMM/dequantized reference at Q/K/V=`12288/1024/1024`; exact default and `VT_FP4_MERGED_QKV=0` 27B token gates; and an nsys assertion that the default removes exactly 32 FP4 GEMMs per decode step across 16 full-attention layers |
+| `QKVParallelLinear` loader/forward (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D staging-gated:** unequal-shard scalar unit; packed-one-GEMM versus three logical CUDA outputs (max diff 0); row-strided preamble/cache tests; default and `VT_FP4_MERGED_QKV=0` real 27B gates (**235/235 + 16/16 each**); focused sanitizer zero errors. The clean nsys 240→208 launch assertion and immutable A/B remain pending |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
 | autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected old-oracle trace puts FP4 kernel time within 0.63% of vLLM. The binding `9cc7191` v0.25 c1-c32 grid completes with **54/124** axes passing; accepted `def5f75` node tracing selects packed QKV, and stale disk-version/collision rejection belongs to W3-C |
@@ -646,7 +647,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. A/B classifications and `9cc7191`'s exact v0.25 grid are complete; only 54/124 axes pass. Accepted `def5f75` node evidence proves local full-attention topology adds exactly 32 FP4 launches per steady decode step (240 instead of vLLM's 208) and promotes D as the next same-binary 27B repair A/B. C remains optional and cannot own the oracle speed comparison |
+| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. A/B classifications and `9cc7191`'s exact grid are complete; only 54/124 axes pass. D is implemented and staging correctness/access-safety green: packed/logical max diff 0, row-strided CUDA suites pass, focused sanitizer zero errors, default/split 235/235 +16/16 each, and prewarm shapes reduce 80→64. Clean pushed-SHA A/B and 240→208 re-trace are next; C stays optional |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -812,6 +813,38 @@ current three-GEMM reference. Unit, CUDA/reference, exact default/fallback 27B,
 access-safety and trace-launch-count gates precede an unprofiled same-binary
 A/B. The trace earns no speed claim; the binding timing/memory result remains
 `9cc7191` at 54/124 axes until that A/B and a fresh full grid say otherwise.
+
+### W3-D implementation/correctness staging checkpoint (2026-07-12)
+
+W3-D now mirrors the whole selected upstream chain. `FullAttnLayerWeights`
+retains logical host Q/K/V and two combined device owners. First CUDA use
+concatenates packed rows and linear block scales at N=14,336, swizzles the
+combined scale once, and computes one input divisor, weight reciprocal and
+alpha from the three logical maxima. The forward quantizes once and launches
+one BF16 CUTLASS GEMM. Its Q/K/V slices preserve the parent row stride, so
+`AttnQkNormRopeGate`, `CastF32` and `ReshapeAndCache` now admit packed inner-
+contiguous rows and use the explicit token stride. No split-copy kernel is
+introduced. The path requires the already-default fused preamble; an explicit
+preamble opt-out or `VT_FP4_MERGED_QKV=0` retains the fully contiguous split
+reference. Non-W4A4 and 35B paths are unchanged.
+
+Local CPU build and focused suites pass. Fresh sm_121a CUDA staging at
+`~/work/vllm.cpp-packed-qkv-staging` builds the server plus all focused/model
+targets. The packed GEMM equals all three logical BF16 outputs with max
+absolute difference **0**. CUDA preamble passes **2/2 cases, 14/14 assertions**;
+reshape/cache passes **12/12, 4,290/4,290**. Focused packed-GEMM, preamble and
+packed-cache compute-sanitizer processes report **zero errors**. The real 27B
+default and `VT_FP4_MERGED_QKV=0` processes each pass **235/235 assertions and
+16/16 oracle tokens**; default/split prewarm materializes **64/80** profiles.
+Default/fallback model-log SHA-256 are `f2215483…dc8d` / `594c3bf7…11fb`;
+server and model-test binary hashes are `203994df…4c1c` / `319e6c38…e541`.
+
+This evidence is deliberately non-binding mutable staging. It closes
+implementation, component correctness, model correctness and focused access
+safety only. It publishes no speed, memory or launch-count result. Commit and
+push this checkpoint, clean-build that immutable SHA, then run one lock-held
+packed/split same-binary A/B and a node re-trace before updating the binding
+54/124 disposition or selecting another lever. 35B stays prohibited.
 
 ## Risks and decisions
 

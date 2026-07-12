@@ -13,9 +13,11 @@
 //     in_proj_a/b) : bf16 (A_log/dt_bias upcast to f32)
 //
 // All 2-D projection weights are stored TRANSPOSED to vt::Matmul's B layout
-// [in, out] (on-disk torch layout is [out, in]). The four GDN input projections
-// and q/k/v/gate/up projections are kept SEPARATE (no qkvz/ba/qkv/gate_up
-// fusion) — see §6; fusion is a TP-sharding naming convenience, a no-op at TP=1.
+// [in, out] (on-disk torch layout is [out, in]). Host checkpoint ownership stays
+// per logical projection. On CUDA the production 27B path additionally builds
+// resident packed gate_up and full-attention QKV operands, mirroring vLLM's
+// MergedColumnParallelLinear/QKVParallelLinear topology at TP=1; diagnostic
+// toggles retain the split residents.
 #pragma once
 
 #include <cstdint>
@@ -178,6 +180,14 @@ struct FullAttnLayerWeights {
   Nvfp4Weight v_proj_fp4;  // [N=Hkv*Dh,  K=H]
   Nvfp4Weight o_proj_fp4;  // [N=H,       K=Hq*Dh]
 
+  // CUDA resident for vLLM's QKVParallelLinear. The checkpoint owns logical
+  // Q/K/V shards separately; production concatenates their packed rows and
+  // linear block scales once, then keeps the combined packed operand and
+  // combined swizzled scale resident. The split weights remain available for
+  // VT_FP4_MERGED_QKV=0 and non-CUTLASS diagnostics.
+  mutable std::shared_ptr<void> d_qkv_packed;
+  mutable std::shared_ptr<void> d_qkv_scale_sw;
+
   // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
   // real 35B CUDA+cutlass load (VT_DENSE_NATIVE); the bf16 q/k/v/o_proj above are
   // then left EMPTY and the forward calls the native fp8 GEMM (cuBLASLt fp8 by
@@ -189,6 +199,19 @@ struct FullAttnLayerWeights {
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight o_proj_fp8;  // [N=H,       K=Hq*Dh]
 };
+
+// Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.
+// Mirrors compressed_tensors_w4a4_nvfp4.py:95-138 and QKVParallelLinear's
+// logical-shard loader: take each maximum divisor before reciprocating once.
+struct FullAttnQkvGlobals {
+  float input_global_scale_inv = 0.0F;  // max on-disk input divisor
+  float weight_global_scale = 0.0F;     // reciprocal of max weight divisor
+  float alpha = 0.0F;
+};
+
+FullAttnQkvGlobals MergeFullAttnQkvGlobals(const Nvfp4Weight& q,
+                                           const Nvfp4Weight& k,
+                                           const Nvfp4Weight& v);
 
 // Sparse-MoE block (router + per-expert MLP + shared expert). Per-expert and
 // shared projections are NVFP4-dequant'd and stored separately (gate/up/down),

@@ -58,6 +58,30 @@ DenseGateUpGlobals MergeDenseGateUpGlobals(const Nvfp4Weight& gate,
   return globals;
 }
 
+FullAttnQkvGlobals MergeFullAttnQkvGlobals(const Nvfp4Weight& q,
+                                           const Nvfp4Weight& k,
+                                           const Nvfp4Weight& v) {
+  VT_CHECK(q.weight_global_scale_inv > 0.0F &&
+               k.weight_global_scale_inv > 0.0F &&
+               v.weight_global_scale_inv > 0.0F,
+           "qwen3_5 packed QKV: missing CT weight divisor");
+  VT_CHECK(q.input_global_scale_inv > 0.0F &&
+               k.input_global_scale_inv > 0.0F &&
+               v.input_global_scale_inv > 0.0F,
+           "qwen3_5 packed QKV: missing CT input divisor");
+  FullAttnQkvGlobals globals;
+  globals.input_global_scale_inv =
+      std::max({q.input_global_scale_inv, k.input_global_scale_inv,
+                v.input_global_scale_inv});
+  const float weight_global_scale_inv =
+      std::max({q.weight_global_scale_inv, k.weight_global_scale_inv,
+                v.weight_global_scale_inv});
+  const float input_global_scale = 1.0F / globals.input_global_scale_inv;
+  globals.weight_global_scale = 1.0F / weight_global_scale_inv;
+  globals.alpha = input_global_scale * globals.weight_global_scale;
+  return globals;
+}
+
 namespace {
 
 using vt::Backend;
@@ -588,6 +612,95 @@ Nvfp4GateUpDev ResidentNvfp4GateUp(Dev d, const DenseMlpWeights& w) {
                  {round_up(2 * n, 128), round_up(k / 16, 4)}),
       MergeDenseGateUpGlobals(gate, up)};
 }
+
+// Device-resident packed operand for Qwen3NextAttention's QKVParallelLinear.
+// vLLM loads the three logical checkpoint shards into one N-concatenated
+// parameter (`qwen3_5.py:279-288`, `qwen3_next.py:252-270`,
+// `linear.py:942-1050`) and performs one GEMM before splitting the output.
+struct Nvfp4QkvDev {
+  Tensor packed;
+  Tensor scale_sw;
+  FullAttnQkvGlobals globals;
+  int64_t qn = 0;
+  int64_t kn = 0;
+  int64_t vn = 0;
+};
+
+Nvfp4QkvDev ResidentNvfp4Qkv(Dev d, const FullAttnLayerWeights& w) {
+  const Nvfp4Weight& q = w.q_proj_fp4;
+  const Nvfp4Weight& k = w.k_proj_fp4;
+  const Nvfp4Weight& v = w.v_proj_fp4;
+  VT_CHECK(!q.Empty() && !k.Empty() && !v.Empty(),
+           "qwen3_5 packed QKV: empty logical shard");
+  VT_CHECK(q.k == k.k && q.k == v.k,
+           "qwen3_5 packed QKV: logical shard K mismatch");
+  const int64_t total_n = q.n + k.n + v.n;
+  const int64_t inner_k = q.k;
+  const size_t q_packed_bytes = q.packed.bytes.size();
+  const size_t k_packed_bytes = k.packed.bytes.size();
+  const size_t v_packed_bytes = v.packed.bytes.size();
+  const size_t q_scale_bytes = q.scale.bytes.size();
+  const size_t k_scale_bytes = k.scale.bytes.size();
+  const size_t v_scale_bytes = v.scale.bytes.size();
+  VT_CHECK(q_packed_bytes == static_cast<size_t>(q.n * inner_k / 2) &&
+               k_packed_bytes == static_cast<size_t>(k.n * inner_k / 2) &&
+               v_packed_bytes == static_cast<size_t>(v.n * inner_k / 2),
+           "qwen3_5 packed QKV: packed shard byte mismatch");
+  VT_CHECK(q_scale_bytes == static_cast<size_t>(q.n * inner_k / 16) &&
+               k_scale_bytes == static_cast<size_t>(k.n * inner_k / 16) &&
+               v_scale_bytes == static_cast<size_t>(v.n * inner_k / 16),
+           "qwen3_5 packed QKV: scale shard byte mismatch");
+
+  if (!w.d_qkv_packed || !w.d_qkv_scale_sw) {
+    VT_CHECK(!w.d_qkv_packed && !w.d_qkv_scale_sw,
+             "qwen3_5 packed QKV: partial resident state");
+    Backend* backend = &d.b;
+    const size_t packed_bytes =
+        q_packed_bytes + k_packed_bytes + v_packed_bytes;
+    void* packed_data = d.b.Alloc(packed_bytes);
+    std::shared_ptr<void> packed_owner(
+        packed_data, [backend](void* pointer) { backend->Free(pointer); });
+    auto* packed_dst = static_cast<uint8_t*>(packed_data);
+    d.b.Copy(d.q, packed_dst, q.packed.bytes.data(), q_packed_bytes);
+    d.b.Copy(d.q, packed_dst + q_packed_bytes, k.packed.bytes.data(),
+             k_packed_bytes);
+    d.b.Copy(d.q, packed_dst + q_packed_bytes + k_packed_bytes,
+             v.packed.bytes.data(), v_packed_bytes);
+
+    DBuf scale_linear(d, DType::kI8, {total_n, inner_k / 16});
+    auto* scale_dst = static_cast<uint8_t*>(scale_linear.ptr());
+    d.b.Copy(d.q, scale_dst, q.scale.bytes.data(), q_scale_bytes);
+    d.b.Copy(d.q, scale_dst + q_scale_bytes, k.scale.bytes.data(),
+             k_scale_bytes);
+    d.b.Copy(d.q, scale_dst + q_scale_bytes + k_scale_bytes,
+             v.scale.bytes.data(), v_scale_bytes);
+
+    const auto round_up = [](int64_t value, int64_t multiple) {
+      return (value + multiple - 1) / multiple * multiple;
+    };
+    const int64_t np = round_up(total_n, 128);
+    const int64_t kp = round_up(inner_k / 16, 4);
+    void* scale_sw_data = d.b.Alloc(static_cast<size_t>(np * kp));
+    std::shared_ptr<void> scale_sw_owner(
+        scale_sw_data, [backend](void* pointer) { backend->Free(pointer); });
+    Tensor scale_sw =
+        MakeTensor(scale_sw_data, DType::kI8, d.q.device, {np, kp});
+    vt::SwizzleBlockscale(d.q, scale_sw, scale_linear.t());
+
+    w.d_qkv_packed = std::move(packed_owner);
+    w.d_qkv_scale_sw = std::move(scale_sw_owner);
+  }
+
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  return Nvfp4QkvDev{
+      MakeTensor(w.d_qkv_packed.get(), DType::kI8, d.q.device,
+                 {total_n, inner_k / 2}),
+      MakeTensor(w.d_qkv_scale_sw.get(), DType::kI8, d.q.device,
+                 {round_up(total_n, 128), round_up(inner_k / 16, 4)}),
+      MergeFullAttnQkvGlobals(q, k, v), q.n, k.n, v.n};
+}
 #endif  // VT_CUTLASS_NVFP4
 
 // Host reference dequant of an fp4 weight to bf16 [K=in, N=out] (Matmul-B
@@ -959,6 +1072,18 @@ bool MergedGateUpEnabled() {
   return on;
 }
 
+// vLLM's QKVParallelLinear is one physical projection even at TP=1. Keep the
+// W1 tactic fallback independent and expose a dedicated same-binary W3-D arm.
+bool MergedQkvEnabled() {
+  static const bool on = [] {
+    const char* full_tactics = std::getenv("VT_FP4_FULL_TACTICS");
+    if (full_tactics != nullptr && full_tactics[0] == '0') return false;
+    const char* merged = std::getenv("VT_FP4_MERGED_QKV");
+    return merged == nullptr || merged[0] != '0';
+  }();
+  return on;
+}
+
 // vLLM's ActivationQuantFusionPass consumes the merged BF16 [M,2I] gate_up
 // result directly and emits the down-projection NVFP4 operands in one kernel.
 // Keep a dedicated same-binary fallback so this W2 sub-iteration can be timed
@@ -980,6 +1105,25 @@ bool MergedGateUpEligible(const DenseMlpWeights& w, Dev d) {
          up.IsTrueW4A4() && TrueW4A4Enabled() && gate.n == up.n &&
          gate.k == up.k && gate.weight_global_scale_inv > 0.0F &&
          up.weight_global_scale_inv > 0.0F;
+}
+
+bool MergedQkvEligible(const FullAttnLayerWeights& w, Dev d,
+                       bool packed_consumers) {
+  const Nvfp4Weight& q = w.q_proj_fp4;
+  const Nvfp4Weight& k = w.k_proj_fp4;
+  const Nvfp4Weight& v = w.v_proj_fp4;
+  // Packed output views are row-strided. The fused preamble consumes Q/K with
+  // their real row strides, while Attention/ReshapeAndCache consume the V view.
+  // If the preamble is explicitly disabled, retain the fully contiguous split
+  // reference rather than materializing split-copy kernels.
+  return packed_consumers && MergedQkvEnabled() &&
+         NvfpCutlassEnabled() && Bf16GemmOutEnabled() &&
+         d.q.device.type == vt::DeviceType::kCUDA && !q.Empty() && !k.Empty() &&
+         !v.Empty() && q.IsTrueW4A4() && k.IsTrueW4A4() &&
+         v.IsTrueW4A4() && TrueW4A4Enabled() && q.k == k.k && q.k == v.k &&
+         q.weight_global_scale_inv > 0.0F &&
+         k.weight_global_scale_inv > 0.0F &&
+         v.weight_global_scale_inv > 0.0F;
 }
 
 // One CT-W4A4 gate_up projection, matching Qwen2MoeMLP.forward and the fused
@@ -1008,6 +1152,34 @@ DBuf MergedGateUpCutlassD(Dev d, const Tensor& x, const DenseMlpWeights& w) {
   vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), a_scale_sw.t(),
                          gate_up.packed, gate_up.scale_sw,
                          gate_up.globals.alpha);
+  return out;
+}
+
+// One CT-W4A4 QKVParallelLinear. The result is the standard row-major
+// [M,Q+K+V] tensor; consumers use row-strided, inner-contiguous logical views
+// exactly like torch.split on vLLM's packed result.
+DBuf MergedQkvCutlassD(Dev d, const Tensor& x,
+                       const FullAttnLayerWeights& w) {
+  const int64_t m = x.shape[0];
+  const int64_t inner_k = x.shape[1];
+  Nvfp4QkvDev qkv = ResidentNvfp4Qkv(d, w);
+  const int64_t total_n = qkv.qn + qkv.kn + qkv.vn;
+
+  DBuf a_packed(d, DType::kI8, {m, inner_k / 2});
+  DBuf a_scale(d, DType::kI8, {m, inner_k / 16});
+  vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x,
+                     qkv.globals.input_global_scale_inv);
+
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  DBuf a_scale_sw(d, DType::kI8,
+                  {round_up(m, 128), round_up(inner_k / 16, 4)});
+  vt::SwizzleBlockscale(d.q, a_scale_sw.t(), a_scale.t());
+
+  DBuf out(d, DType::kBF16, {m, total_n});
+  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), a_scale_sw.t(),
+                         qkv.packed, qkv.scale_sw, qkv.globals.alpha);
   return out;
 }
 #endif
@@ -1079,6 +1251,112 @@ DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dty
   DBuf a_scale(d, DType::kI8, {M, K / 16});
   vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
   return MatmulNvfp4Fp4DirectD(d, a_packed.t(), a_scale.t(), w, out_dtype);
+}
+
+// Defined after the W4A16 Marlin selection helpers below; the split QKV
+// diagnostic still uses their normal model-side dispatch.
+DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w);
+DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w);
+
+// Owners plus logical views for full-attention Q/K/V. The packed path owns one
+// [T,Q+K+V] allocation and exposes row-strided inner-contiguous views; the
+// diagnostic/non-FP4 paths own three ordinary contiguous allocations.
+struct FullAttnQkvOutput {
+  bool fp4 = false;
+  std::optional<DBuf> packed_owner;
+  std::optional<DBuf> q_owner;
+  std::optional<DBuf> k_owner;
+  std::optional<DBuf> v_owner;
+  Tensor qgate;
+  Tensor key;
+  Tensor value;
+};
+
+FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
+                                     const Tensor& h, int64_t t,
+                                     const Tensor* h_fp8,
+                                     [[maybe_unused]] bool packed_consumers) {
+  FullAttnQkvOutput out;
+  out.fp4 = !w.q_proj_fp4.Empty();
+  const bool fp8 = !w.q_proj_fp8.Empty();
+#ifdef VT_CUTLASS_NVFP4
+  if (out.fp4 && MergedQkvEligible(w, d, packed_consumers)) {
+    out.packed_owner.emplace(MergedQkvCutlassD(d, h, w));
+    Tensor all = out.packed_owner->t();
+    const int64_t qn = w.q_proj_fp4.n;
+    const int64_t kn = w.k_proj_fp4.n;
+    const int64_t vn = w.v_proj_fp4.n;
+    VT_CHECK(all.shape[1] == qn + kn + vn,
+             "qwen3_5 packed QKV: output shape mismatch");
+    out.qgate = all.Slice(1, 0, qn);
+    out.key = all.Slice(1, qn, qn + kn);
+    Tensor value2 = all.Slice(1, qn + kn, qn + kn + vn);
+    out.value = value2;
+    return out;
+  }
+#endif
+
+  // Split reference: quantize the shared activation once when the three input
+  // divisors are equal, then retain one independently-scaled GEMM per shard.
+  const bool fuse_qkv =
+      out.fp4 && FuseQuantOnceEnabled() &&
+      d.q.device.type == vt::DeviceType::kCUDA &&
+      w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
+      w.q_proj_fp4.input_global_scale_inv ==
+          w.k_proj_fp4.input_global_scale_inv &&
+      w.q_proj_fp4.input_global_scale_inv ==
+          w.v_proj_fp4.input_global_scale_inv;
+  std::optional<DBuf> qkv_ap;
+  std::optional<DBuf> qkv_as;
+  if (fuse_qkv) {
+    const int64_t hidden = h.shape[1];
+    qkv_ap.emplace(d, DType::kI8,
+                   std::vector<int64_t>{t, hidden / 2});
+    qkv_as.emplace(d, DType::kI8,
+                   std::vector<int64_t>{t, hidden / 16});
+    vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h,
+                       w.q_proj_fp4.input_global_scale_inv);
+  }
+  const Tensor* qkv_sf_sw_p = nullptr;
+#ifdef VT_CUTLASS_NVFP4
+  std::optional<DBuf> qkv_sf_sw;
+  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+    qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
+    qkv_sf_sw_p = &qkv_sf_sw->t();
+  }
+#endif
+  const DType q_out_dt =
+      (Bf16GemmOutEnabled() && out.fp4) ? DType::kBF16 : DType::kF32;
+  const auto project = [&](const Nvfp4Weight& fp4_weight,
+                           const Fp8Weight& fp8_weight,
+                           const OwnedTensor& plain_weight) -> DBuf {
+    if (fuse_qkv) {
+      return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
+                                    fp4_weight, q_out_dt, qkv_sf_sw_p);
+    }
+    if (fp8) {
+      return h_fp8 != nullptr
+                 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, fp8_weight,
+                                              DType::kF32)
+                 : MatmulFp8CutlassD(d, h, fp8_weight, DType::kF32);
+    }
+    if (out.fp4) {
+      return Bf16GemmOutEnabled()
+                 ? MatmulNvfp4Bf16D(d, h, fp4_weight)
+                 : MatmulNvfp4F32D(d, h, fp4_weight);
+    }
+    return MatmulF32D(d, h, plain_weight);
+  };
+  out.q_owner.emplace(
+      project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
+  out.k_owner.emplace(
+      project(w.k_proj_fp4, w.k_proj_fp8, w.k_proj));
+  out.v_owner.emplace(
+      project(w.v_proj_fp4, w.v_proj_fp8, w.v_proj));
+  out.qgate = out.q_owner->t();
+  out.key = out.k_owner->t();
+  out.value = out.v_owner->t();
+  return out;
 }
 
 #ifdef VT_MARLIN_NVFP4
@@ -2107,68 +2385,16 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   const float base = static_cast<float>(cfg.rope_theta);
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
-  // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
-  const bool fp4 = !w.q_proj_fp4.Empty();
-  const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
-  // QUANTIZE-ONCE for q/k/v: shared activation h + shared input_global_scale -> one
-  // ScaledFp4Quant feeding all three fp4 GEMMs (removes 2 redundant [T,H] quants).
-  const bool fuse_qkv =
-      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
-      w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
-      w.q_proj_fp4.input_global_scale_inv == w.k_proj_fp4.input_global_scale_inv &&
-      w.q_proj_fp4.input_global_scale_inv == w.v_proj_fp4.input_global_scale_inv;
-  std::optional<DBuf> qkv_ap, qkv_as;
-  if (fuse_qkv) {
-    const int64_t H = h.shape[1];
-    qkv_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
-    qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
-    vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
-  }
-  // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared qkv activation SF ONCE
-  // and feed the already-swizzled SF to all three q/k/v GEMMs (skipping each one's
-  // internal SwizzleBlockscale). nullptr (OFF / non-cutlass) = per-projection
-  // swizzle, byte-identical to the current path.
-  const Tensor* qkv_sf_sw_p = nullptr;
-#ifdef VT_CUTLASS_NVFP4
-  std::optional<DBuf> qkv_sf_sw;
-  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
-    qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
-    qkv_sf_sw_p = &qkv_sf_sw->t();
-  }
-#endif
-  // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
-  // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
-  // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
-  // Mirrors vLLM's bf16 model dtype (nvfp4 output_dtype = x.dtype = bf16). The
-  // templated AttnGateSplit upcasts qgate to f32 qf/gatef; k-norm takes a bf16
-  // k_norm weight (see dkw); V is consumed bf16 (cache/attention handle it below).
-  // fp8 (35B) + bf16-weight fallback stay f32.
-  const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
-  DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
-                                           qkv_sf_sw_p)
-               : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.q_proj_fp8, DType::kF32)
-                            : MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32))
-               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
-                                             : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
-                     : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
-                                        qkv_sf_sw_p)
-            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.k_proj_fp8, DType::kF32)
-                         : MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32))
-            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
-                                          : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
-                  : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
-                                        qkv_sf_sw_p)
-            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.v_proj_fp8, DType::kF32)
-                         : MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32))
-            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
-                                          : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
-                  : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  const bool fp4_attn = !w.q_proj_fp4.Empty();
+  const bool packed_consumers =
+      FuseAttnPreambleOn(fp4_attn) && rot > 0 &&
+      d.q.device.type == vt::DeviceType::kCUDA;
+  FullAttnQkvOutput qkv =
+      ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
+  const bool fp4 = qkv.fp4;
+  Tensor qgate = qkv.qgate;  // [T,2*Hq*Dh], possibly row-strided packed view
+  Tensor kf = qkv.key;       // [T,Hkv*Dh], possibly row-strided packed view
+  Tensor vf = qkv.value;     // [T,Hkv*Dh], possibly row-strided packed view
 
   // Split q|gate + per-head gemma-RMSNorm(q,k) + partial NeoX RoPE + gate
   // passthrough, producing q[T,Hq,Dh]/k[T,Hkv,Dh] (normed+RoPE'd) and the raw
@@ -2185,22 +2411,23 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     vt::RopeCosSinCache(d.q, cos_sin.t(), dpos.t(), vt::RopeArgs{base, rot});
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
-    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate.t(),
-                           Reshape(kf.t(), {T, Hkv * Dh}), dqw, dkw, cos_sin.t(),
+    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate,
+                           kf, dqw, dkw, cos_sin.t(),
                            vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
   } else {
     DBuf qf(d, DType::kF32, {T, Hq, Dh});
-    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
+    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate);
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
     // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
     // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
     // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
-    Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
-                                                : ResidentWeightF32(d, w.k_norm, {Dh});
+    Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                           : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
-    vt::RmsNorm(d.q, dkn2d, Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
+    vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
+                vt::RmsNormArgs{eps, true});
     DBuf dpos(d, DType::kI32, {T}, positions.data());
     vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
   }
@@ -2208,7 +2435,13 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   Tensor kn3 = dk3.t();
 
   // Causal GQA scaled-dot-product attention, scale = Dh^-0.5.
-  Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
+  Tensor v3 = vf;
+  v3.rank = 3;
+  v3.shape[0] = T;
+  v3.shape[1] = Hkv;
+  v3.shape[2] = Dh;
+  v3.stride[1] = Dh;
+  v3.stride[2] = 1;
   // vt::Attention requires q/k/v the same float dtype; qn3/kn3 are f32 after
   // norm+rope, so upcast a bf16 V (VT_BF16_GEMM_OUT fp4 path) back to f32. This is
   // the reference (non-paged) path — not perf-critical, so the small cast is fine.
@@ -2253,68 +2486,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "full-attn paged: KV cache head dims mismatch config");
 
-  // fp4-resident W4A4 q/k/v/o (real 27B, notes §3.6) when populated; else bf16
-  // (35B FP8-dequant path / synthetic). Exactly one representation is filled.
-  const bool fp4 = !w.q_proj_fp4.Empty();
-  const bool fp8 = !w.q_proj_fp8.Empty();  // 35B W8A8 cutlass (mutually exclusive)
-  // QUANTIZE-ONCE for q/k/v: shared activation h + shared input_global_scale -> one
-  // ScaledFp4Quant feeding all three fp4 GEMMs (removes 2 redundant [T,H] quants).
-  const bool fuse_qkv =
-      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
-      w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
-      w.q_proj_fp4.input_global_scale_inv == w.k_proj_fp4.input_global_scale_inv &&
-      w.q_proj_fp4.input_global_scale_inv == w.v_proj_fp4.input_global_scale_inv;
-  std::optional<DBuf> qkv_ap, qkv_as;
-  if (fuse_qkv) {
-    const int64_t H = h.shape[1];
-    qkv_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
-    qkv_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
-    vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h, w.q_proj_fp4.input_global_scale_inv);
-  }
-  // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared qkv activation SF ONCE
-  // and feed the already-swizzled SF to all three q/k/v GEMMs (skipping each one's
-  // internal SwizzleBlockscale). nullptr (OFF / non-cutlass) = per-projection
-  // swizzle, byte-identical to the current path.
-  const Tensor* qkv_sf_sw_p = nullptr;
-#ifdef VT_CUTLASS_NVFP4
-  std::optional<DBuf> qkv_sf_sw;
-  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
-    qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
-    qkv_sf_sw_p = &qkv_sf_sw->t();
-  }
-#endif
-  // q/k/v_proj outputs bf16 (VT_BF16_GEMM_OUT): the fp4 cutlass wrapper computes
-  // bf16 then casts to f32 when out.dtype==kF32 — emitting bf16 removes that
-  // CastBf16ToF32 (nsys ~9.6% of prefill) and halves the q/k/v GEMM writes.
-  // Mirrors vLLM's bf16 model dtype (nvfp4 output_dtype = x.dtype = bf16). The
-  // templated AttnGateSplit upcasts qgate to f32 qf/gatef; k-norm takes a bf16
-  // k_norm weight (see dkw); V is consumed bf16 (cache/attention handle it below).
-  // fp8 (35B) + bf16-weight fallback stay f32.
-  const DType q_out_dt = (Bf16GemmOutEnabled() && fp4) ? DType::kBF16 : DType::kF32;
-  DBuf qgate = fuse_qkv
-                   ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.q_proj_fp4, q_out_dt,
-                                           qkv_sf_sw_p)
-               : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.q_proj_fp8, DType::kF32)
-                            : MatmulFp8CutlassD(d, h, w.q_proj_fp8, DType::kF32))
-               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.q_proj_fp4)
-                                             : MatmulNvfp4F32D(d, h, w.q_proj_fp4))
-                     : MatmulF32D(d, h, w.q_proj);  // [T, 2*Hq*Dh]
-  DBuf kf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.k_proj_fp4, q_out_dt,
-                                        qkv_sf_sw_p)
-            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.k_proj_fp8, DType::kF32)
-                         : MatmulFp8CutlassD(d, h, w.k_proj_fp8, DType::kF32))
-            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.k_proj_fp4)
-                                          : MatmulNvfp4F32D(d, h, w.k_proj_fp4))
-                  : MatmulF32D(d, h, w.k_proj);     // [T, Hkv*Dh]
-  DBuf vf = fuse_qkv
-                ? MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(), w.v_proj_fp4, q_out_dt,
-                                        qkv_sf_sw_p)
-            : fp8 ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.v_proj_fp8, DType::kF32)
-                         : MatmulFp8CutlassD(d, h, w.v_proj_fp8, DType::kF32))
-            : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, h, w.v_proj_fp4)
-                                          : MatmulNvfp4F32D(d, h, w.v_proj_fp4))
-                  : MatmulF32D(d, h, w.v_proj);     // [T, Hkv*Dh]
+  const bool fp4_attn = !w.q_proj_fp4.Empty();
+  const bool packed_consumers =
+      FuseAttnPreambleOn(fp4_attn) && sdi.has_attn_cos_sin &&
+      d.q.device.type == vt::DeviceType::kCUDA;
+  FullAttnQkvOutput qkv_out =
+      ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
+  const bool fp4 = qkv_out.fp4;
+  Tensor qgate = qkv_out.qgate;
+  Tensor kf = qkv_out.key;
+  Tensor vf = qkv_out.value;
 
   // Split q|gate + per-head gemma-RMSNorm(q,k) + partial NeoX RoPE + gate
   // passthrough. VT_FUSE_ATTN_PREAMBLE (default OFF) collapses the four ops into
@@ -2346,28 +2527,35 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   if (FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin) {
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
-    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate.t(),
-                           Reshape(kf.t(), {T, Hkv * Dh}), dqw, dkw, sdi.attn_cos_sin.t(),
+    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate,
+                           kf, dqw, dkw, sdi.attn_cos_sin.t(),
                            vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
   } else {
     DBuf qf(d, DType::kF32, {T, Hq, Dh});
-    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate.t());
+    vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate);
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
     // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
     // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
     // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
-    Tensor dkw = (kf.t().dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
-                                                : ResidentWeightF32(d, w.k_norm, {Dh});
+    Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
+                                           : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
-    vt::RmsNorm(d.q, dkn2d, Reshape(kf.t(), {T * Hkv, Dh}), dkw, vt::RmsNormArgs{eps, true});
+    vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
+                vt::RmsNormArgs{eps, true});
     vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
   }
   Tensor qn3 = dq3.t();
   Tensor kn3 = dk3.t();
 
-  Tensor v3 = Reshape(vf.t(), {T, Hkv, Dh});
+  Tensor v3 = vf;
+  v3.rank = 3;
+  v3.shape[0] = T;
+  v3.shape[1] = Hkv;
+  v3.shape[2] = Dh;
+  v3.stride[1] = Dh;
+  v3.stride[2] = 1;
 
   // KV-cache dtype: the production runner allocates a bf16 cache (mirrors vLLM's
   // bf16 flash_attn KV store, halves KV memory); the paged==dense unit anchors

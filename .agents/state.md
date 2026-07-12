@@ -7157,3 +7157,35 @@ pass **5/5** and direct-OFF tests pass **3/3**. The new registry case pins
 non-owning queue propagation and ordinary null behavior. W4.4d real-model
 memory, output and timing remain pending from an immutable commit; no improved
 number is claimed here.
+
+## 2026-07-12 — W4.4d launch peak PSS accepted
+
+The immutable `5508f71` campaign ran entirely inside `nix develop .#cuda`
+under one `/tmp/gpu` lock. It completed three interleaved direct-ON, fresh-vLLM
+and same-binary direct-OFF memory repetitions, followed by three unmonitored
+timing repetitions per arm. Raw evidence is
+`/tmp/qwen35-direct-w4-5508f71`; captured driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
+
+- Launch peak PSS: ON **1.855 GiB** mean (1.577-2.411), OFF **8.168 GiB**,
+  fresh vLLM **7.640 GiB** (7.048-8.058). ON is 77.3% below OFF and 0.2428x
+  vLLM; its worst repetition is below vLLM's best, closing the local axis.
+- Stable PSS: ON **0.757**, OFF 0.754, vLLM 4.109 GiB. Peak process VRAM:
+  ON **11,688**, OFF 11,682, vLLM 12,929 MiB. Whole-system peak
+  `MemAvailable` loss is 1.407/7.905/3.937 GiB.
+- Full monitored process wall is 28.671/28.787/56.704 s. The startup proxy is
+  6.074 ON versus 6.171 s OFF, a 97-ms improvement.
+- Unmonitored throughput: ON 6560.58/6549.44/6560.56, mean **6556.86**;
+  OFF mean **6556.90** (-0.0007% ON); vLLM mean **6717.48**. ON is
+  **0.9761x** vLLM total and output throughput.
+- ON/OFF token output is exact 128/128 in every repetition. The existing
+  tie-sensitive project/vLLM corpus comparison remains 79/128, so correctness
+  does not receive a parity promotion.
+
+The full uncontended CPU suite passes **105/105**; native-sm_120 default and
+direct-OFF focused gates remain **5/5** and **3/3**. Every process exited; the
+GPU is 166 MiB / 0% / 42 C and the campaign kernel-journal capture has no
+entries. W4.4 launch-memory work is accepted, but
+`ENG-HOST-WEIGHT-RESIDENCY` remains `ACTIVE` because throughput is below vLLM
+and correctness debt remains. No Spark/GB10 result or system configuration
+change is involved.

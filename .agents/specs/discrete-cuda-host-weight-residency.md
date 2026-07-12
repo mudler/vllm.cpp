@@ -149,8 +149,10 @@ iterator scopes one `safe_open` per shard while this project retains every
 mapping through full owned materialization. W4.1-W4.2 are implemented and
 CPU/native-sm_120 correctness-gated. The apparent >173.75-s whole-map regression
 was a zero-VRAM CPU fallback caused by omitting the CUDA flake and is `VOID`.
-Valid W4.3 range-advice evidence cuts peak PSS to 8.168 GiB but remains 1.0615x
-fresh vLLM, so W4.4 direct-device materialization is the next required spike.
+Valid W4.3 range-advice evidence cuts peak PSS to 8.168 GiB. Accepted W4.4
+layer-bounded direct-device materialization then reaches 1.855 GiB versus
+7.640 GiB fresh vLLM, closing the local launch-PSS axis. The row remains
+`ACTIVE` because throughput is 0.9761x vLLM and correctness debt remains.
 
 ## Risks and decisions
 

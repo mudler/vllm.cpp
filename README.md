@@ -525,8 +525,8 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   and discards only those page-aligned source ranges. Three interleaved runs give
   launch peak PSS **8.168 GiB**, down **47.5%** from same-binary OFF
   (**15.562 GiB**), versus fresh vLLM **7.695 GiB**. The remaining **1.061×**
-  peak gap keeps memory parity open and requires W4.4 bounded direct-device
-  materialization. Stable PSS is **0.754 versus 4.099 GiB vLLM**, and peak
+  peak gap required W4.4 bounded direct-device materialization. Stable PSS is
+  **0.754 versus 4.099 GiB vLLM**, and peak
   process VRAM is **11,682 versus 12,924 MiB**.
 
   W4 is timing-neutral: unmonitored throughput is **6,553.57 tok/s** ON versus
@@ -540,12 +540,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   loader regressions: they were launched outside `nix develop .#cuda` and GDB
   showed every worker in the CPU matmul fallback. The accepted campaign wraps
   the process and lock in the CUDA flake. Correctness and performance parity
-  remain open. The W4.4 layer-bounded direct-device spike is accepted and
-  now **implemented / GATING**; it carries the eventual dense-runner queue into
+  remain open. The accepted W4.4 layer-bounded direct-device path carries the
+  eventual dense-runner queue into
   loading and releases each synchronized plain-BF16 layer instead of retaining
   the full owned host model. `VT_DIRECT_DEVICE_LOAD=0` restores W4.3 from the
-  same binary. CPU focused tests pass 4/4; native-sm_120 default/control tests
-  pass 5/5 and 3/3. Peak and timing numbers remain pending.
+  same binary. Three interleaved runs at commit `5508f71` reduce launch peak PSS
+  to **1.855 GiB** from **8.168 GiB** OFF and **7.640 GiB** fresh vLLM: the
+  local launch-memory axis is closed at **0.243x vLLM**. Stable PSS is
+  **0.757 GiB**, peak process VRAM is **11,688 MiB**, and startup proxy improves
+  97 ms versus OFF. Unmonitored throughput is neutral at **6,556.86 tok/s** ON
+  versus **6,556.90** OFF, but remains only **0.9761x** fresh vLLM
+  (**6,717.48**). The row therefore stays **ACTIVE** for correctness and
+  performance parity, not launch memory. Full CPU CTest passes 105/105;
+  native-sm_120 default/control tests pass 5/5 and 3/3.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

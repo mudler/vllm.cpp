@@ -129,9 +129,10 @@ throughput is 6553.57 ON, 6552.29 OFF and 6717.94 vLLM: ON is neutral versus
 OFF and 0.9755x vLLM. Full CPU CTest is 105/105; focused native-sm_120 is 5/5
 default and 2/2 opt-out. Raw evidence is `/tmp/qwen35-peak-w4-a077d72`.
 
-The required W4.4 follow-on is now separately specified in
-[dense-direct-device-loading.md](dense-direct-device-loading.md). No W4.4 code
-or improved number is part of that spike checkpoint.
+The W4.4 follow-on in [dense-direct-device-loading.md](dense-direct-device-loading.md)
+is implemented and accepted at `5508f71`: layer-bounded staging reduces peak
+PSS to 1.855 GiB versus 8.168 GiB OFF and 7.640 GiB fresh vLLM. W4.1-W4.3
+remain the independently controlled source-page component of that result.
 
 ## Risks and mitigations
 

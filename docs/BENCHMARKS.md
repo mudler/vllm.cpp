@@ -580,14 +580,40 @@ Full CPU CTest passes 105/105; focused native-sm_120 default passes 5/5 and
 opt-out 2/2. Every process exited, final GPU state is 146 MiB / 0% / 42 C, and
 the benchmark-window kernel journal says `-- No entries --`.
 
-W4.4 direct-device disposition: **ACTIVE / PENDING measurement**. The accepted
-contract preselects one dense runner queue, stages and synchronizes each
-completed unquantized plain-BF16 layer, then releases its host bytes. CPU, UMA,
-GGUF, quantized, MoE, borrowed and release-OFF paths are excluded.
-`VT_DIRECT_DEVICE_LOAD=0` is the same-binary W4.3 control. CPU focused tests
-pass 4/4; native-sm_120 default passes 5/5 and direct OFF passes 3/3. No W4.4
-number is claimed. Rerun the exact driver workload with direct ON/OFF; the
-acceptance target is peak PSS no higher than a fresh vLLM denominator.
+W4.4 direct-device disposition: **LAUNCH PSS PASS / ROW ACTIVE** at `5508f71`.
+The accepted path preselects one dense runner queue, stages and synchronizes
+each completed unquantized plain-BF16 layer, then releases its host bytes.
+`VT_DIRECT_DEVICE_LOAD=0` is the same-binary W4.3 control. CPU, UMA, GGUF,
+quantized, MoE, borrowed and release-OFF paths remain excluded.
+
+| W4.4 axis, three-run mean | Direct ON | Same-binary OFF | Fresh vLLM | ON / vLLM |
+|---|---:|---:|---:|---:|
+| Launch-to-exit peak PSS (range) | **1.855 GiB** (1.577-2.411) | 8.168 GiB | 7.640 GiB (7.048-8.058) | **0.2428x** |
+| Stable GPU-resident PSS | **0.757 GiB** | 0.754 GiB | 4.109 GiB | **0.1841x** |
+| Peak process VRAM | **11,688 MiB** | 11,682 MiB | 12,929 MiB | **0.9040x** |
+| Whole-system peak `MemAvailable` drop | **1.407 GiB** | 7.905 GiB | 3.937 GiB | **0.3574x** |
+| Full monitored process wall | **28.671 s** | 28.787 s | 56.704 s | 0.506x |
+| Pre-benchmark startup proxy | **6.074 s** | 6.171 s | not comparable | n/a |
+
+The worst ON peak (2.411 GiB) is below the best fresh-vLLM peak (7.048 GiB),
+so the local launch-PSS gate closes decisively. Unmonitored total throughput is
+6560.58/6549.44/6560.56, mean **6556.86 tok/s**, versus OFF mean **6556.90**
+(-0.0007%) and fresh vLLM mean **6717.48**; ON is **0.9761x** vLLM total and
+output throughput. ON/OFF outputs are exact 128/128 in every repetition. The
+project/vLLM throughput corpus remains 79/128 from the existing tie-sensitive
+correctness debt, so the engine row remains `ACTIVE` and no global parity
+promotion is made.
+
+```bash
+nix develop .#cuda -c env OUT=/tmp/qwen35-direct-w4-5508f71 \
+  flock /tmp/gpu bash /tmp/qwen35-direct-w4-5508f71/driver.sh
+```
+
+Raw evidence: `/tmp/qwen35-direct-w4-5508f71`; captured driver SHA-256
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
+Full CPU CTest passes 105/105; native-sm_120 default passes 5/5 and direct OFF
+passes 3/3. Every process exited, final GPU state is 166 MiB / 0% / 42 C, and
+the campaign kernel-journal capture says `-- No entries --`.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

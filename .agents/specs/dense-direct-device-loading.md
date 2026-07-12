@@ -128,12 +128,25 @@ non-owning queue propagation and exclusions. No upstream test is dropped.
 4. `W4.4d`: run the exact W4.3 memory/performance campaign and either close the
    peak axis or identify the next concrete lifetime.
 
-Implementation checkpoint: W4.4a-W4.4c are complete. `ModelSource` carries the
+W4.4a-W4.4d are complete. `ModelSource` carries the
 non-owning queue, dense `FromModelDir` preselects and reuses one queue only when
 direct loading is requested, and the loader stages/synchronizes/releases after
 each eligible layer. `VT_DIRECT_DEVICE_LOAD=0` restores W4.3 from the same
 binary. CPU focused tests pass 4/4; native-sm_120 default passes 5/5 and direct
-OFF passes 3/3. W4.4d and every improved number remain `PENDING`.
+OFF passes 3/3; full CPU CTest passes 105/105.
+
+The immutable `5508f71` campaign closes the local launch-PSS axis. Three-run
+mean peak PSS is **1.855 GiB** ON (1.577-2.411), **8.168 GiB** OFF and
+**7.640 GiB** fresh vLLM (7.048-8.058), so ON is 0.2428x vLLM and its worst run
+is below vLLM's best. Stable PSS is 0.757/0.754/4.109 GiB and peak process VRAM
+is 11,688/11,682/12,929 MiB. The startup proxy improves 6.171 to 6.074 s.
+Unmonitored throughput is **6556.86** ON, **6556.90** OFF and **6717.48** vLLM:
+the path is neutral versus OFF but remains 0.9761x vLLM. ON/OFF output is exact
+128/128 in all repetitions; existing project/vLLM corpus exactness remains
+79/128. Raw evidence is `/tmp/qwen35-direct-w4-5508f71`; driver SHA-256 is
+`7d90bfb16804bff3db38097f29cd2e971dc0b7e0e7ad14eb0e2c22eeb9fbf800`.
+The W4.4 launch-memory work is accepted, while the owning row remains `ACTIVE`
+for cross-engine correctness and performance parity.
 
 ## Risks and mitigations
 

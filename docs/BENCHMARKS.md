@@ -15,13 +15,18 @@ every point and wins c16/c32 total throughput, but c1-c8 and mean TPOT/ITL stay
 below the strict floor. The trace shows vLLM's dominant 128x32x256
 Stream-K/static-persistent FP4 pair while our live planner predominantly
 selects 128x128x128/256x128x128, promoting W3 pre-serve warmup/selection/cache
-parity. Runtime inspection now proves pip-vLLM uses pre-serve in-memory tuning
-with a stream sync and 1-ms GPU delay before ten eager event repeats; its file
-cache is disabled for key collisions. W3-A's exact delayed timing mirror is
-implementation-staged with `VT_FP4_AUTOTUNE_DELAY=0` restoring W2. Immutable
+parity. Runtime inspection proves pip-vLLM uses pre-serve in-memory tuning with
+a stream sync and 1-ms GPU delay before ten eager event repeats; its file cache
+is disabled for key collisions. W3-A's exact delayed timing mirror uses
+`VT_FP4_AUTOTUNE_DELAY=0` to restore W2. Immutable
 `71f1e89` focused delayed/off, both 27B correctness arms and delayed memcheck
 pass; delayed real-model selection includes the oracle's ID 6/4 narrow pair.
-The timed performance A/B is **PENDING**, so no new number is published. The
+Its c16/96 delayed/off AB/BA/AB averages **809.932/803.379 tok/s =
+1.008156×**, but standalone acceptance **FAILED** at **13/20 timing** and
+**2/4 memory** axes; only **5/35** common delayed plan keys keep one ID across
+all three fresh processes. This component changes no production-vLLM
+denominator. W3-B pre-serve all-bucket tuning is now the active stabilization
+gate. The
 27B-only BF16 GDN output default remains correctness-required; 35B
 retains f32 and still waits for complete 27B closure. External KV-cache/LMCache interoperability
 remains explicit roadmap inventory and has no benchmark yet).
@@ -31,10 +36,10 @@ remains explicit roadmap inventory and has no benchmark yet).
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **BELOW FLOOR — VALID CLEAN `b5c6e4f` 27B CHECKPOINT** | Exact greedy/cache-off/closed-loop input-1024→output-128 c1-c32 evidence has **2,016/2,016** successful timed requests, three interleaved repetitions, six verified memory returns, model gate **1/1**, and passing paired-trace status. Median total-throughput ratios are **0.9933/0.9520/0.9657/0.9760/1.0213/1.0218×**; **4/4/5/4/17/14 of 20** throughput+latency axes pass. Median mean-TPOT normalized ratios are **0.9915/0.9417/0.9476/0.9404/0.9827/0.9837×**. Memory passes **2/4**: ours/vLLM median PSS **48,272,873/28,096,858 KiB**, RSS **48,275,264/28,424,060 KiB**, GPU **38,746/72,608 MiB**, and available-memory drop **66,089,528/80,435,540 KiB**. The canonical 27-only runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` / `0190a7e1…ad3e`; ours nsys/kernel are `f0599533…9e57` / `d2367ab4…392e`; vLLM trace/kernel are `db996f39…b41` / `caf8ac9f…258b`. Trace-run output digests differ locally and are stable in vLLM; the separate 16/16 commit-bound model gate owns correctness. W3-A has commit-bound correctness/safety but no timed performance result, so `b5c6e4f` remains the denominator and 35B was not run. | Run the W3-A delayed/off c16 component A/B, add W3-B pre-serve in-memory all-bucket warmup if needed, and prove stable oracle-selected 128x32x256 plans. Gate optional W3-C persistence separately because pip-vLLM disables its file cache. Then rerun this exact 27B campaign until every axis passes. Only then run 35B. Pool teardown remains separately required. |
+| `SERVE-GATE-ONLINE` | **BELOW FLOOR — VALID CLEAN `b5c6e4f` 27B CHECKPOINT** | Exact greedy/cache-off/closed-loop input-1024→output-128 c1-c32 evidence has **2,016/2,016** successful timed requests, three interleaved repetitions, six verified memory returns, model gate **1/1**, and passing paired-trace status. Median total-throughput ratios are **0.9933/0.9520/0.9657/0.9760/1.0213/1.0218×**; **4/4/5/4/17/14 of 20** throughput+latency axes pass. Median mean-TPOT normalized ratios are **0.9915/0.9417/0.9476/0.9404/0.9827/0.9837×**. Memory passes **2/4**: ours/vLLM median PSS **48,272,873/28,096,858 KiB**, RSS **48,275,264/28,424,060 KiB**, GPU **38,746/72,608 MiB**, and available-memory drop **66,089,528/80,435,540 KiB**. The canonical 27-only runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` / `0190a7e1…ad3e`; ours nsys/kernel are `f0599533…9e57` / `d2367ab4…392e`; vLLM trace/kernel are `db996f39…b41` / `caf8ac9f…258b`. Trace-run output digests differ locally and are stable in vLLM; the separate 16/16 commit-bound model gate owns correctness. W3-A's timed component is +0.816% but strict-failed 13/20 timing and 2/4 memory, so `b5c6e4f` remains the denominator and 35B was not run. | Implement and same-binary gate W3-B pre-serve in-memory all-bucket warmup, proving stable oracle-selected 128x32x256 plans. Gate optional W3-C persistence separately because pip-vLLM disables its file cache. Then rerun this exact 27B campaign until every axis passes. Only then run 35B. Pool teardown remains separately required. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **W3-A IMMUTABLE CORRECTNESS/SAFETY GREEN / PERFORMANCE A/B PENDING; W2 BINDING BELOW FLOOR** | W1's exact-bucket classification and W2's 32 tactics, merged gate/up scaling, one-input fusion and prior gates remain green. Clean `b5c6e4f` remains the binding performance result: totals **0.9933/0.9520/0.9657/0.9760/1.0213/1.0218×**, axes **4/4/5/4/17/14**, memory **2/4**. Immutable `71f1e89` clean-builds on CUDA 13.0.88/sm_121a/CUTLASS 4.5. Fresh delayed/off focused processes each pass **14/14 / 18,619/18,619**; delayed/off native 27B each pass **235/235** and the full **16/16** vLLM stream; delayed memcheck passes **1/1 / 16,389/16,389 / 0 errors**. Delayed M=9 selects ID 6 Stream-K for output and merged gate/up and ID 4 static for Q; M=1 selects ID 6/4 on output/gate-up. Both arms are numerically green, while plan differences remain timing-sensitive. Model delayed/off log SHA are `8065b47e…7a61d` / `3b3fcb6a…7a61d`; memcheck SHA is `60d704a9…75c81`; GPU/lock return idle. No throughput or memory comparison is inferred. | Run the real-27B delayed/off c16/96 AB/BA/AB with selected-plan logs and all 20+4 axes. Then implement W3-B pre-serve in-memory all-bucket warmup if W3-A alone does not close selection stability. W3-C persistence stays optional because pip-vLLM disables its file cache. Repeat exact 27B only after the component is accepted; do not run 35B. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **W3-A CLASSIFIED — +0.816% MEAN, STRICT ACCEPTANCE FAILED; W3-B ACTIVE; W2 BINDING BELOW FLOOR** | W1's exact-bucket classification and W2's 32 tactics, merged gate/up scaling, one-input fusion and prior gates remain green. Immutable `71f1e89` clean-builds on CUDA 13.0.88/sm_121a/CUTLASS 4.5; focused delayed/off each pass **14/14 / 18,619/18,619**, native 27B each pass **235/235 + 16/16**, and delayed memcheck passes **16,389/16,389 / 0 errors**. The exact c16/96 delayed/off AB/BA/AB completes **576/576** requests and six lifecycle/cache returns. Delayed runs **810.084/811.018/808.693**, off **798.974/797.584/813.580 tok/s**; means **809.932/803.379 = 1.008156×**, CV **0.118%/0.901%**. Strict axes are only **13/20 timing** and **2/4 memory**; delayed/off GPU peaks are **38,069/38,091 MiB**, while delayed PSS/RSS are slightly higher. Only **5/35** common delayed keys are ID-stable across all processes (off 8/35); paired ID equality is 14/35, 6/35, 11/35. Summary/driver/provenance/tree hashes are `044bcf6e…e87fc` / `425f8521…e9ae` / `f5caa065…9915` / `cf4c33c7…360c`. Clean `b5c6e4f` therefore remains binding. | Keep the faithful W3-A timing window but grant it no standalone speed credit. Implement W3-B max-token pre-serve all-bucket in-memory tuning in the shared library loader, leave lazy misses diagnostic, and rerun the same component with plan-stability evidence. W3-C persistence stays optional; do not run 35B. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Clean `b5c6e4f` now classifies the exact oracle: c16 total throughput passes at **1.021341×**, but normalized mean TPOT/ITL is **0.982670×**; c1-c8 remain decode-shaped gaps. The paired trace contains vLLM's fused recurrent decode and the local GDN kernels, while FP4 tactic selection is the higher-priority traced mismatch. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; re-rank its residual after W3 FP4 selection parity, then address GDN decode/pool evidence if still red. Do not infer any 35B result. |
 | `KV-DEVICE-RESIDENCY` | **ACTIVE — W0+W1 A/B/TRACE/CORRECTNESS PASS; ZERO-LEAK FAIL** | W0's clean build, default/fallback pointer/model gates, +2.1239% A/B, trace and both-model access checks remain valid. W1 indexed BF16↔F32 state I/O averages **+0.6246%**, improves **20/20** axes and sharply reduces D2D traffic. CUDA/model/turnover/sanitizer gates pass; inherited pools still fail strict teardown (27B **47,290,056 B/101**, 35B **36,822,413,188 B/1,236**). Clean `b5c6e4f` re-ranks the residual: W2 FP4 availability/topology materially improves the grid, but the trace still shows FP4 tactic-selection mismatch and the end-to-end host-memory axes remain red. | Keep device-residency W2 scoped while FP4 W3 repairs selection parity; separately repair model/pool/queue teardown. |
 
@@ -73,13 +78,15 @@ default-on vendored FA-2 prefill route. Same-binary component A/Bs still support
 the individual kernel choices, but fresh exact oracle runs are required for an
 end-to-end acceptance claim, and binding server-to-server latency remains open.
 
-### Reproduce the W3-A correctness checkpoint
+### Reproduce the W3-A correctness and component checkpoints
 
 Use immutable `71f1e894d0c5e496607d08cfe9089a9944128271` in one clean detached
 checkout on `dgx.casa`. The two test arms use the same binary and one uncontended GPU lock;
 the default delayed arm must report `delay=1000us`, while the fallback must
-report `delay=off`. This is a correctness/selection preflight, not a benchmark
-result.
+report `delay=off`. The test command is the correctness/selection preflight.
+The archived component driver below then runs the exact c16/96 AB/BA/AB; copy
+it to a fresh path and change only its `ev=` destination because it refuses to
+overwrite evidence.
 
 ```sh
 BUILD="$HOME/work/vllm.cpp-nvfp4-small-m/w3-a-build"
@@ -96,6 +103,13 @@ flock /tmp/gpu sh -c '
     ctest --test-dir "'"$BUILD"'" \
     -R "^(test_ops_nvfp4_fp4|test_qwen27_paged_engine)$" --output-on-failure
 '
+
+# Exact measured component driver (SHA-256 425f8521...e9ae).
+W3="$HOME/work/vllm.cpp-nvfp4-small-m/71f1e894d0c5e496607d08cfe9089a9944128271/w3"
+cp "$W3/component-ab/driver.sh" /tmp/w3a-component-repro.sh
+sed -i "s|^ev=.*|ev=$W3/component-ab-repro|" /tmp/w3a-component-repro.sh
+cd "$W3/source"
+/tmp/w3a-component-repro.sh
 ```
 
 ## Reproduce the current online checkpoint

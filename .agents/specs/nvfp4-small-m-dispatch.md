@@ -3,7 +3,8 @@
 **Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
 spike; W1/W2 are measured and W3 is `ACTIVE` under
 `CLAIM-NVFP4-SMALL-M-3`; W3-A delayed event timing is immutable
-correctness/safety-green and performance-pending.
+correctness/safety-green, performance-classified and strict-acceptance-failed;
+W3-B pre-serve all-bucket stabilization is active.
 **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.5.0`, CUDA `13.0.88`, and the
@@ -243,9 +244,30 @@ native 27B arms pass 235/235 plus the full 16/16 oracle stream; delayed
 memcheck passes 16,389/16,389 with zero errors. Delayed M=9 selects ID 6
 128x32x256 Stream-K for output and merged gate/up and ID 4 static for Q; M=1
 keeps the ID 6/4 family on output/gate-up. This closes W3-A correctness/safety
-and proves the oracle family is selectable on real shapes, but not performance:
-the real-model AB/BA/AB and selection stability remain `PENDING`. Pre-serve all-bucket in-memory
-warmup is W3-B. Versioned atomic persistence remains W3-C as an optional local
+and proves the oracle family is selectable on real shapes.
+
+### W3-A component classification (2026-07-12)
+
+The exact immutable server binary then ran delayed versus
+`VT_FP4_AUTOTUNE_DELAY=0` at c16, 96 requests, input 1,024 and output 128 in
+delayed/off, off/delayed, delayed/off order under one lock. All 576 requests,
+six memory returns and six verified cache evictions pass. Delayed runs are
+810.084/811.018/808.693 total tok/s; off runs are
+798.974/797.584/813.580. Means are **809.932/803.379 = 1.008156x**, with
+0.118%/0.901% CV, but only **13/20 timing** and **2/4 memory** axes satisfy
+strict no-regression. Delayed/off mean GPU peaks are 38,069/38,091 MiB and
+available-memory drop improves, while delayed PSS/RSS are slightly higher.
+
+The selection evidence is decisive: all processes share 35 plan keys, but only
+**5/35** delayed keys retain one tactic ID across all three fresh processes
+(off: 8/35). Paired delayed/off ID equality is 14/35, 6/35 and 11/35. The
+narrow oracle family appears, but not stably. W3-A therefore receives no
+standalone performance acceptance; its faithful timing default remains inside
+the active W3 stack. Summary/driver/provenance/tree hashes are
+`044bcf6e...e87fc`, `425f8521...e9ae`, `f5caa065...9915` and
+`cf4c33c7...360c` under immutable `w3/component-ab`. Clean `b5c6e4f` remains
+the binding vLLM denominator. Pre-serve all-bucket in-memory warmup is now the
+active W3-B selection-stability repair. Versioned atomic persistence remains W3-C as an optional local
 capability with collision-complete keys and stale rejection; it is not allowed
 to stand in for, or silently become the default against, the production oracle
 whose file cache is disabled.
@@ -398,7 +420,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
-| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A immutable correctness/safety green; performance pending:** three warmups + pre-window stream sync + exact 1,000-us GPU delay + ten eager event repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2 and verbose output records the selected stable ID. `71f1e89` passes focused/model/memcheck gates and resolves the traced ID 6/4 narrow family on real hot shapes. W3-B tunes every configured hybrid bucket before server readiness and leaves lazy misses diagnostic-only. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
+| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A immutable correctness/safety green; component strict-acceptance failed:** three warmups + pre-window stream sync + exact 1,000-us GPU delay + ten eager event repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2 and verbose output records the selected stable ID. `71f1e89` passes focused/model/memcheck gates. Its c16 component is 1.008156x mean total throughput but only 13/20 timing and 2/4 memory, with 5/35 delayed keys stable. W3-B tunes every configured hybrid bucket before server readiness and leaves lazy misses diagnostic-only. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
 | diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
 
@@ -420,7 +442,7 @@ wrappers.
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. **W3-A immutable correctness/safety green:** fresh delayed/off focused and 27B processes preserve the output/capture contract; delayed memcheck is clean and verbose evidence records real-shape plans. Performance/selection-stability A/B remains pending. Pre-serve bucket coverage belongs to W3-B; stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. **W3-A classified:** fresh delayed/off focused and 27B processes preserve the output/capture contract; delayed memcheck is clean. The timed component is +0.816% mean total but strict-fails 13/20 timing and 2/4 memory, and only 5/35 delayed keys are selection-stable. Pre-serve bucket coverage/stability belongs to active W3-B; stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -494,7 +516,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A at immutable `71f1e89` is clean-build, focused/model correctness and memcheck green; delayed real-model plans include the traced ID 6/4 narrow family. Same-binary real-model performance/selection-stability A/B remains `PENDING`, so A is not accepted yet. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison. After A/B/C, run the paired trace and exact 27B because runtime selection changes |
+| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A at immutable `71f1e89` is clean-build, focused/model correctness and memcheck green; its c16 component averages +0.816% total throughput but strict-fails 13/20 timing and 2/4 memory, with only 5/35 delayed keys stable. A is classified and not independently accepted. W3-B is now active to move all bucket selection before readiness and prove stability. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison. After B/C, run the paired trace and exact 27B because runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be

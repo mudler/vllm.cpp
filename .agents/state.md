@@ -5187,3 +5187,34 @@ memory axes, selected-plan logs and one lock. If delayed timing is accepted,
 move to W3-B pre-serve all-bucket in-memory tuning; otherwise use the repeated
 plan evidence to repair selection stability first. `b5c6e4f` remains the only
 binding production-vLLM denominator, and 35B stays prohibited.
+
+## 2026-07-12 — W3-A component mean-positive but strict-failed; W3-B active
+
+Immutable `71f1e89` completed the exact delayed versus
+`VT_FP4_AUTOTUNE_DELAY=0` c16/96 input-1024→output-128 AB/BA/AB under one
+uncontended lock. All 576 requests, six cache evictions and six memory/GPU
+returns pass. Delayed total-throughput runs are
+810.084/811.018/808.693 tok/s; off runs are
+798.974/797.584/813.580. Means are **809.932/803.379 = 1.008156x**, with
+0.118%/0.901% CV.
+
+The checkpoint is not accepted: delayed wins only **13/20 timing** and **2/4
+memory** axes. It lowers mean GPU peak (38,069 vs 38,091 MiB) and
+available-memory drop, but slightly raises PSS/RSS. More decisively, only
+**5/35** common delayed plan keys retain one tactic ID across all three fresh
+processes (off: 8/35); paired delayed/off ID equality is 14/35, 6/35 and 11/35.
+The production narrow family is available but not selected stably. Summary,
+driver, provenance and evidence-tree SHA are `044bcf6e…e87fc`,
+`425f8521…e9ae`, `f5caa065…9915` and `cf4c33c7…360c` under
+`~/work/vllm.cpp-nvfp4-small-m/71f1e894…/w3/component-ab`. GPU inventory is
+empty and `/tmp/gpu` is free after completion.
+
+Retain W3-A's faithful timing default inside active W3, grant it no standalone
+speed credit, and implement W3-B next: a maximum-token synthetic run in the
+shared library loader before `AsyncLLM`/server readiness, with the FP4 tuner
+materializing every hybrid bucket and leaving any later miss diagnostic-only.
+Gate that behavior with ported warmup tests, fresh correctness/safety, the same
+component plus selection-stability evidence, then paired trace and the exact
+27B production-vLLM ladder. W3-C persistence remains optional and separately
+gated because production pip-vLLM disables its file cache. `b5c6e4f` remains
+binding and 35B remains prohibited.

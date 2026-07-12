@@ -5509,3 +5509,43 @@ highest-ranked executed difference; repeat until every 27B throughput, latency
 and memory axis closes. Then execute the shared-prefix PX1 and Mamba-align leaf,
 close 27B cache-on, and only then spend 35B. DSpark, TLI, LMCache/external KV
 and the rest of roadmap_v1 remain queued behind speed closure.
+
+## 2026-07-12 — immutable `9cc7191` v0.25 27B campaign preflight complete
+
+The replacement cache-off online campaign is now prepared from pushed clean
+`9cc71918dbdc10f014c02feb9bab1d00963a16fe`, not from a moving checkout.
+Detached source/build live under
+`~/work/vllm.cpp-online-gate/checkpoints/9cc71918dbdc10f014c02feb9bab1d00963a16fe`;
+evidence lives under the matching `evidence/` path. The fail-closed manifest
+pins vLLM 0.25.0 / source target `702f481`, FlashInfer 0.6.13, 27B
+`max_num_batched_tokens=2048`, cache off, temperature zero, input 1,024,
+output 128, c1/2/4/8/16/32, three interleaved repetitions and the exact
+`9cc7191` code SHA.
+
+The deterministic source corpus contains 3,457 disjoint prompts with 192
+requests per partition; its vLLM views contain the exact 1,008 timed prompts
+required by the six points and three repetitions. Plan/oracle/build-log/source-
+corpus/vLLM-corpus manifest SHA-256 are
+`5a04cdcf6f83a3e6da6e3bf929a68a084bca5781579beb2878cbee91178cb8b2`,
+`6d39cb903e4580229b9af2a3d178b606a58072fafa561bcaf7a08bdd6032a10c`,
+`10786029ac05f5c6dfb7b0a069298de3d5bdffe8b6674dbb4ed5226856661f6a`,
+`41bd634a97a09c7ad5adc87237cbc30f7d96c8f7de6d3c1e32fa5c27d910fd7a`
+and `b048d789f85914aa8c9334eca2c62a2af0f3bbf78eab0eb200cabfcd7a90e5dc`.
+Fresh RelWithDebInfo CUDA 13/sm_121a server and model-gate binaries build
+successfully with SHA-256 `ffddab5f…bd` and `a24fc776…37`; the build log is
+the hash above.
+
+One first metadata-only `record-oracle` command was **FAILED /
+PREFLIGHT-COMMAND-INVALID**: direct script invocation lacked the repository on
+`PYTHONPATH`, raised `ModuleNotFoundError: tools`, wrote no oracle artifact and
+performed no GPU work. The corrected module invocation wrote the atomic oracle
+manifest and plan validation passed. At handoff the source was clean, 274 GB
+were free, no compute process owned the GPU, port 8001 was unused and a
+nonblocking `/tmp/gpu` acquisition succeeded.
+
+No model-gate process or timed request has run, so no throughput, latency or
+memory number exists. Next, commit/push this same-stage checkpoint and execute
+the driver from the immutable source. It will acquire one lock around the
+27B correctness gate, all 36 timed groups, six memory returns and both traces.
+Stop on any fail-closed contract violation; never publish partial values. Hold
+35B and every later roadmap track until all applicable 27B axes close.

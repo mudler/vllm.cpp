@@ -39,10 +39,20 @@ load succeeds, while the wheel's internal `manylinux2014_sbsa` tag makes
 `pip check` report unsupported. A lock-held real 27B production-graph offline
 smoke loads the 24.57-GiB checkpoint, compiles, autotunes FlashInfer, captures
 graphs and completes exact 16-input/1-output counts; its cold rate is not a
-benchmark. The clean server smoke and atomic oracle-path activation are the
-remaining promotion checks at this checkpoint. Only after promotion does the
-full 27B c1-c32 grid plus paired traces restart. Every throughput, latency and
-memory axis must pass before any 35B performance run.
+benchmark. Clean server smoke and atomic oracle-path activation also pass.
+
+The replacement campaign is immutable clean `9cc7191`, with source/build at
+`~/work/vllm.cpp-online-gate/checkpoints/9cc71918dbdc10f014c02feb9bab1d00963a16fe`
+and evidence at the matching `evidence/` path. Plan/oracle/build-log/source-
+corpus/vLLM-corpus SHA-256 are `5a04cdcf…b2`, `6d39cb90…10c`,
+`10786029…6a`, `41bd634a…7a` and `b048d789…5dc`; server/model-gate binaries
+are `ffddab5f…bd` / `a24fc776…37`. The first no-GPU metadata recorder command
+failed before output because direct script invocation omitted the repository
+module path. Its corrected `python -m tools.bench.online_gate` invocation,
+plan validation, exact-source check, corpus conversion and fresh sm_121a build
+pass. No model gate or timed request has run. The full 27B c1-c32 grid plus
+paired traces is `ACTIVE` and will own one lock for the entire series. Every
+throughput, latency and memory axis must pass before any 35B performance run.
 
 ## Scope
 
@@ -221,10 +231,12 @@ reported as a clean dependency check.
    (**implemented and CPU-gated**).
 4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points with
    explicit cache-off, identical sampling, scheduler settings, and model length.
-   The W2 27B grid is binding; the clean W3-B 27B rerun is next. Hold 35B.
+   The immutable `9cc7191` W3-B 27B source/build/corpus preflight is complete;
+   execute its model gate, 36 timed groups and six returns next. Hold 35B.
 5. Capture one representative paired execution trace per model (`nsys` ours,
-   torch-profiler vLLM on the identical 48-prompt/c16 token shape). The corrected
-   W3-B 27B trace is complete and lifecycle-clean; 35B remains gated.
+   torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
+   old-oracle W3-B trace is lifecycle-clean and diagnostic; the binding
+   `9cc7191` v0.25 trace remains part of the active series. 35B remains gated.
 6. Drive the top traced lever through its owning row. W3-B closes the original
    wide FP4 tactic-family mismatch. Re-rank only after the exact W3-B grid shows
    which decode/latency axes remain below floor; do not infer a lever from the

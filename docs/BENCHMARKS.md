@@ -6,7 +6,8 @@ Detailed commands, per-repetition values, hashes, and parity rationale remain
 in the [append-only parity ledger](../.agents/parity-ledger.md) and the linked
 feature specs.
 
-Last updated: **2026-07-12** (vLLM v0.25.0 oracle-rebase checkpoint).
+Last updated: **2026-07-12** (immutable `9cc7191` vLLM v0.25.0 27B
+campaign-preflight checkpoint).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -47,8 +48,25 @@ rates. `pip check` has one disclosed NVIDIA metadata exception: the installed
 cuSPARSELt library is a loadable AArch64 ELF from the aarch64 wheel, whose
 internal `manylinux2014_sbsa` tag is rejected by packaging.
 
-The exact c1/2/4/8/16/32 grid and paired nsys traces now restart under one
-uncontended lock.
+The replacement campaign is now prepared from immutable clean
+`9cc71918dbdc10f014c02feb9bab1d00963a16fe`. Its fresh evidence root is
+`~/work/vllm.cpp-online-gate/evidence/9cc71918dbdc10f014c02feb9bab1d00963a16fe`.
+The fail-closed plan, v0.25 oracle fingerprint, sm_121a build log, exact source
+corpus and 1,008-request vLLM corpus-view manifests have SHA-256
+`5a04cdcf…b2`, `6d39cb90…10c`, `10786029…6a`, `41bd634a…7a` and
+`b048d789…5dc`; server/model-gate binaries are `ffddab5f…bd` /
+`a24fc776…37`. One first metadata-only `record-oracle` invocation is
+**FAILED / PREFLIGHT-COMMAND-INVALID** because the script form omitted the
+repository module path and raised `ModuleNotFoundError: tools`; it wrote no
+oracle artifact and performed no GPU work. The corrected module invocation
+passed, as did plan validation, exact-SHA/source-clean checks, corpus conversion
+and compilation. The GPU, port 8001 and `/tmp/gpu` lock were idle at handoff.
+The model correctness gate, six interleaved serving legs and paired traces have
+not run; therefore this checkpoint is **ACTIVE / PENDING**, with no partial
+throughput, latency or memory value accepted.
+
+The exact c1/2/4/8/16/32 grid and paired traces will execute under one
+uncontended whole-series lock.
 Trace-proven v0.25 improvements—such as blocking CUDA events—will be mirrored
 only when relevant locally. Every 27B throughput, latency and memory axis must
 pass before 35B; broader roadmap work, including DSpark, remains queued behind
@@ -60,7 +78,7 @@ speed parity. Detailed release classification:
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **PENDING — v0.25.0 ORACLE ACTIVE; FRESH 27B GRID/TRACE NEXT** | The last complete old-oracle grid (`b5c6e4f`) is historical because it used vLLM 0.24.0 + FlashInfer 0.6.12. `3cc490c` stopped cleanly at 28/36 groups, 1,602/2,016 requests, four returns and no trace. No current rate binds. The canonical v0.25.0/FlashInfer 0.6.13 oracle has passed exact package/import/CLI, real 27B production-graph generation and server health/completion smoke; v0.24.0 remains rollback-safe. | Commit the migrated oracle contract, generate a new SHA-bound evidence tree, then run the full 27B cache-off grid and paired traces. Repair every red 27B throughput/latency/memory axis before 35B. |
+| `SERVE-GATE-ONLINE` | **ACTIVE — `9cc7191` v0.25.0 27B SERIES PREFLIGHT-COMPLETE; NO RATE YET** | The last complete old-oracle grid (`b5c6e4f`) is historical because it used vLLM 0.24.0 + FlashInfer 0.6.12. `3cc490c` stopped cleanly at 28/36 groups, 1,602/2,016 requests, four returns and no trace. The canonical v0.25.0/FlashInfer 0.6.13 oracle and rollback-safe promotion pass. Immutable `9cc7191` now has clean exact source, a fresh sm_121a build, hashed oracle fingerprint and exact source/vLLM corpus views at the evidence root above. The first metadata-only recorder invocation failed before output due to a missing module path; its corrected invocation passed. No GPU model gate or timed request has run and no current rate binds. | Execute the model gate, all 36 cache-off timed groups, six memory returns and paired traces under the single model-wide lock. Repair every red 27B throughput/latency/memory axis before 35B. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |

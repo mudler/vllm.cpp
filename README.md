@@ -27,8 +27,13 @@ OpenAI-compatible server.
 > a live backend-neutral paged-KV contract with current FA2/fallback kernels.
 > It also confirms the next FP4 candidates remain current: v0.25 still consumes
 > directly swizzled scale factors with zeroed unread padding and a model-owned
-> device `alpha` pointer. The exact v0.25 oracle is now validated and active;
-> we will modernize or delete paths only when the fresh paired trace proves
+> device `alpha` pointer. The exact v0.25 oracle is now validated and active. A
+> fresh immutable `9cc7191` 27B campaign has its exact source/build, oracle
+> fingerprint and deterministic c1-c32 corpus prepared under
+> `~/work/vllm.cpp-online-gate/evidence/9cc71918…`; its model gate, six
+> interleaved serving legs and paired traces are **ACTIVE / not yet executed**
+> under one whole-series GPU lock. No preflight artifact is a performance
+> result. We will modernize or delete paths only when that paired trace proves
 > they are obsolete. Every 27B speed, latency and memory axis must pass before
 > 35B runs; broader roadmap work—including newly explicit **DSpark** support—
 > waits behind parity.
@@ -169,7 +174,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. Historical vLLM 0.24.0/FlashInfer 0.6.12 rates are diagnostic only; the v0.25.0 oracle has passed real 27B production-graph generation and server smoke, while a fresh binding c1-c32 grid/trace remains pending. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 production performance `GATING` |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. Historical vLLM 0.24.0/FlashInfer 0.6.12 rates are diagnostic only; the v0.25.0 oracle has passed real 27B production-graph generation and server smoke. The fresh immutable `9cc7191` c1-c32 corpus/build/oracle preflight is complete and locked execution is active; no new rate exists yet. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 production performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -179,7 +184,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. End-to-end rates against vLLM 0.24.0 + FlashInfer 0.6.12 are now historical diagnostics; `3cc490c` is VOID at 28/36 groups after the dependency drift was found. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved; the exact fresh 27B grid and paired traces will re-rank modernization/removal and FP4 topology work. No 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. End-to-end rates against vLLM 0.24.0 + FlashInfer 0.6.12 are now historical diagnostics; `3cc490c` is VOID at 28/36 groups after the dependency drift was found. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved. Fresh `9cc7191` sm_121a binaries and exact c1-c32 corpora are prepared and hashed; the whole-lock 27B model gate/grid/trace is `ACTIVE` but has not emitted a rate. No 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -236,7 +241,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **VOID** at 28/36 groups, 1,602/2,016 timed requests, four returns and no
   paired trace. The canonical v0.25.0 oracle now passes package/import/CLI,
   lock-held real-model production-graph and clean server health/completion
-  smoke checks; a fresh c1-c32 grid is still required for any binding ratio.
+  smoke checks. The fresh `9cc7191` source, sm_121a build, oracle manifest and
+  exact 1,008-request vLLM corpus view are now prepared and hashed; the
+  model-gate/grid/trace series is `ACTIVE` but has not started, so no binding
+  ratio exists.
 - **Modernization and removal are trace-gated.** The v0.25.0 audit found no
   copied legacy `paged_attention_v1/v2` source and no MRV1 execution path to
   delete. The live `vt::PagedAttention` name denotes a backend-neutral paged-KV
@@ -301,8 +309,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   Corrected paired tracing now closes the original FP4 structural gap at
   **110.623/109.932 s** prewarm/vLLM and leaves diagnostic normalized TPOT at
   **0.9673x**. The old-oracle `3cc490c` grid is VOID; the next exact c1-c32
-  campaign is now unblocked by the validated v0.25.0 oracle and starts from a
-  new SHA-bound evidence tree.
+  campaign is now prepared from immutable `9cc7191`: manifest/oracle/build-log/
+  source-corpus/vLLM-corpus SHA-256 are `5a04cdcf…b2`, `6d39cb90…10c`,
+  `10786029…6a`, `41bd634a…7a`, and `b048d789…5dc`. One metadata-only
+  invocation first failed before writing output because it omitted the repo
+  module path; the corrected module invocation passed. The GPU model gate,
+  full c1-c32 grid and traces have not run, and no partial rate is published.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and
@@ -395,9 +407,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   vLLM denominator or may be multiplied into the old grid. Both model paths are
   W0 memory-access clean and the W1 indexed op is memcheck-clean, but the
   required zero-leak result remains open on inherited process-lifetime pools.
-  Exact v0.25.0 oracle activation is complete; paired traces, fixed HTTP
-  capacity and fresh every-axis 27B closure remain mandatory before 35B and
-  later roadmap work.
+  Exact v0.25.0 oracle activation and the immutable `9cc7191` build/corpus
+  preflight are complete; paired traces, fixed HTTP capacity and fresh
+  every-axis 27B closure remain mandatory before 35B and later roadmap work.
   W2 direct indexed
   convolution-state update stays scoped until those confirmed causes are
   removed and the residual trace is re-ranked.

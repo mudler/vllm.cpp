@@ -756,6 +756,16 @@ rank the executed launch/traffic differences before changing FP4
 quantization, block-scale layout, normalization fusion or alpha residency.
 W3-C stays optional and 35B remains prohibited until every 27B axis passes.
 
+The replacement exact campaign is now **ACTIVE** from immutable clean
+`9cc71918dbdc10f014c02feb9bab1d00963a16fe`. Its detached source, fresh sm_121a
+server/model-gate build, vLLM 0.25.0 oracle fingerprint and exact c1-c32
+source/vLLM corpus views are prepared and hashed under
+`~/work/vllm.cpp-online-gate/evidence/9cc71918dbdc10f014c02feb9bab1d00963a16fe`.
+One no-GPU recorder command failed before output because it omitted the repo
+module path; the corrected module invocation passes. The locked model gate,
+36 timed groups, six returns and paired traces remain unexecuted, so there is no
+new rate or topology decision.
+
 ## Risks and decisions
 
 - **Compile/binary growth:** 32 heavy CUTLASS instantiations can exhaust a

@@ -132,8 +132,8 @@ by 128×32×256 and 128×32×128, while vLLM also uses 128×64×256 materially.
 Packed QKV with one max-derived CT scale/alpha and a split fallback is the
 selected W3-D contract. No profiler rate or speedup is accepted from this trace.
 
-W3-D is now implemented in a pre-commit staging build, with **no performance
-number accepted**. The 27B CUDA path concatenates resident Q/K/V FP4 weights
+W3-D is now implemented and measured from clean pushed `3f256ab`. The 27B CUDA
+path concatenates resident Q/K/V FP4 weights
 and linear scales at N=`12,288+1,024+1,024=14,336`, applies one maximum-derived
 CT input/weight divisor and alpha, quantizes once, launches one GEMM, and feeds
 row-strided Q/K/V views directly to the fused preamble, dense value cast and
@@ -143,11 +143,18 @@ split arm's **80/80**, because packed N=14,336 replaces N=12,288 and N=1,024.
 The low-level packed result equals all three logical BF16 outputs exactly
 (max absolute difference **0**); row-strided preamble/cache suites pass; both
 default and fallback real-model runs pass **235/235 assertions and 16/16
-tokens**. Focused compute-sanitizer runs report **zero errors**. Staging
-evidence is `~/work/vllm.cpp-packed-qkv-staging`; default/fallback model-log
-SHA-256 are `f2215483…dc8d` / `594c3bf7…1fb`. This is correctness/safety
-evidence only: it is mutable and cannot bind speed. The next checkpoint must
-clean-build the pushed SHA and run the unprofiled same-binary A/B.
+tokens**. Focused compute-sanitizer runs report **zero errors**. Immutable
+evidence is
+`~/work/vllm.cpp-packed-qkv/3f256abdbb558e162bf8a2196284deb119648560/w3d/component-ab`.
+The c16/96 input-1,024/output-128 AB/BA/AB packed runs are
+**815.886/810.759/810.047**, split runs **811.294/805.779/807.377 tok/s**;
+means are **812.231/808.150 = 1.005049×**, with CV **0.320%/0.287%**. Strict
+component acceptance is **FAILED: 14/20 timing + 2/4 memory axes**. Packed
+improves sampled GPU peak **38,059→37,765 MiB** and available-memory drop, but
+PSS/RSS are about 60 MiB higher and six tail/TTFT axes miss. All **576/576**
+requests and six memory returns pass; both immutable correctness arms pass
+**235/235 + 16/16**. Summary/selection/tree SHA are `c13ee24e…6976` /
+`7eebec5b…bece` / `ff8e7fea…3041`.
 
 Generated texts differ across most FP4 engine pairs and ours' three trace
 digests are not all equal; this remains a diagnostic, not an ignored
@@ -158,9 +165,8 @@ correctness preconditions. vLLM also logged a missing optional
 path resolved FlashInfer NVFP4, FLA/Triton GDN and FA2, so the warning is
 recorded as non-path evidence and the frozen oracle was not mutated.
 
-Next: clean-build the pushed W3-D SHA and run the packed-QKV same-binary 27B
-A/B selected by the node trace, then repeat the exact grid and re-rank the
-residual. Every
+Next: node re-trace `3f256ab` to prove the expected ~240→208 FP4 launch
+collapse, then repeat the exact grid and re-rank the residual. Every
 27B throughput, latency and memory axis must pass before 35B; broader roadmap
 work, including DSpark, remains queued behind speed parity. Detailed release classification:
 [2026-07-12-702f481.md](../.agents/sync/2026-07-12-702f481.md).
@@ -170,11 +176,11 @@ work, including DSpark, remains queued behind speed parity. Detailed release cla
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `9cc7191` v0.25.0 27B: 54/124 AXES PASS; W3-D A/B PENDING** | Immutable `9cc7191` completed the correctness gate, all 36 cache-off groups, 2,016 requests and six returns under one uncontended lock. All 124 axes bind; 70 fail. Total-throughput ratios c1→c32 are **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**. Replacement `def5f75` selected packed QKV; W3-D staging passes focused CUDA/sanitizer and both 16/16 model arms, but supplies no binding timing/memory result. Evidence and hashes are above; 35B did not run. | Clean-build the pushed W3-D SHA and run its same-binary 27B A/B, then repeat the exact grid and re-rank until every axis passes; only then run 35B. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `9cc7191` v0.25.0 27B: 54/124 AXES PASS; W3-D COMPONENT STRICT-FAIL** | Immutable `9cc7191` completed the correctness gate, all 36 cache-off groups, 2,016 requests and six returns under one uncontended lock. All 124 axes bind; 70 fail. Total-throughput ratios c1→c32 are **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**. Replacement `def5f75` selected packed QKV. Clean `3f256ab` packed/split correctness passes 16/16; c16 means are **812.231/808.150 = 1.005049×**, but only **14/20 timing + 2/4 memory** axes pass. This component result does not replace the vLLM grid; 35B did not run. | Re-trace to prove 240→208 launches, then repeat the exact grid and re-rank until every axis passes; only then run 35B. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — W3-D IMPLEMENTED / CORRECTNESS-GREEN; PERFORMANCE PENDING** | W3-D mirrors vLLM's packed QKV resident and max-shard CT scalar semantics, consumes row-strided split views without copy kernels, and retains `VT_FP4_MERGED_QKV=0`. Staging low-level packed output is exact, strided CUDA suites and sanitizer pass, and both real-model arms are 16/16. The binding grid still fails 70/124 axes; no staging speed result is accepted. | Clean-build the pushed SHA and run the packed/split same-binary 27B A/B. Re-trace to prove 240→208 launches and re-rank after the result; keep 35B held. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — W3-D COMPONENT MEAN-POSITIVE / STRICT-FAIL** | W3-D mirrors vLLM's packed QKV resident and max-shard CT scalar semantics, consumes row-strided split views without copy kernels, and retains `VT_FP4_MERGED_QKV=0`. Low-level packed output is exact, strided CUDA suites and sanitizer pass, and immutable real-model arms are 16/16. Clean c16 packed/split means are **812.231/808.150 tok/s**, CV **0.320%/0.287%**, with **14/20 timing + 2/4 memory** axes. The binding grid still fails 70/124 axes. | Re-trace to prove 240→208 launches, then rerun the exact 27B grid and re-rank; keep 35B held. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `9cc7191` has c16 total throughput **1.028782×** but normalized mean TPOT/ITL **0.988851×**. The node trace sees the executed GDN family but ranks the exact 32-launch packed-QKV gap first. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; finish packed QKV, then re-trace/re-rank GDN. Do not infer any 35B result. |
 | `KV-DEVICE-RESIDENCY` | **ACTIVE — W0+W1 A/B/TRACE/CORRECTNESS PASS; ZERO-LEAK FAIL** | W0/W1 same-binary gains, copy reduction and correctness/safety evidence remain valid. Inherited pools still fail strict teardown (27B **47,290,056 B/101**, 35B **36,822,413,188 B/1,236**); old-oracle host-memory ratios are historical. | Keep W2 scoped until the v0.25.0 grid re-ranks the residual; separately repair model/pool/queue teardown. |
 

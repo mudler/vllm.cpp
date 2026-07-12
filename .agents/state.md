@@ -5709,3 +5709,40 @@ Next: commit/push this implementation checkpoint, clean-build the immutable
 SHA, run a single lock-held packed/split same-binary 27B A/B, then node re-trace
 to prove 240→208 and re-rank the residual. Do not stack direct-swizzle, alpha,
 GDN or other work; do not run 35B.
+
+### 2026-07-12 — W3-D immutable packed/split component classification
+
+Clean pushed `3f256abdbb558e162bf8a2196284deb119648560` was detached, configured
+with CUDA 13.0.88/sm_121a, FlashInfer CUTLASS, Triton AOT and FA2, and built on
+`dgx.casa`. One uncontended `/tmp/gpu` lock covered both correctness gates and
+the full c16/96 input-1,024/output-128 packed/split AB/BA/AB series. Packed and
+`VT_FP4_MERGED_QKV=0` each pass **235/235 assertions + 16/16 vLLM tokens**.
+Every leg passes fixed-pool readiness, 128-chunk preflight, 96/96 requests,
+cache eviction and memory return; GPU, port and lock exit idle.
+
+Packed runs are **815.886/810.759/810.047**, split runs
+**811.294/805.779/807.377 tok/s**. Means are **812.231/808.150 = 1.005049×**,
+CV **0.320%/0.287%**. Packed passes **14/20 timing + 2/4 memory** axes. It
+improves all throughput axes, central E2E/TPOT/ITL and sampled GPU peak
+**38,059→37,765 MiB**, but loses mean/median/p99 TTFT, p90 TPOT, p99 E2E/ITL
+and PSS/RSS by about 60 MiB. Thus strict standalone component acceptance
+**fails**. Retain packed because it is the trace-selected upstream topology,
+is correctness-exact, removes 16 profiles, and is mean-positive with lower GPU
+memory; do not claim parity. The binding `9cc7191` result remains **54/124**.
+
+Evidence:
+`~/work/vllm.cpp-packed-qkv/3f256abdbb558e162bf8a2196284deb119648560/w3d/component-ab`.
+Summary/selection/driver/provenance/tree SHA are `c13ee24e…6976` /
+`7eebec5b…bece` / `d6aee607…ee8` / `6021469c…ecc` / `ff8e7fea…3041`.
+All packed logs contain 64/64 profiles, split 80/80 and zero lazy misses;
+cross-process tactic-ID stability stays diagnostic. Next: commit this exact
+checkpoint, run a clean node-level `3f256ab` trace to prove ~240→208 FP4
+launches, then repeat the exact vLLM grid and re-rank. Do not stack another
+lever or run 35B.
+
+Checkpoint validation: `check-agent-record.py` passes at ENGINE=103,
+MODEL=326, QUANT=81, KERNEL=30, BACKEND=52; `check-doc-checkpoint.py` passes;
+`git diff --check` passes. One first mutation command is **COMMAND-INVALID**
+because `tests/agents` is not an importable repository directory. The corrected
+`python3 -m unittest tests.scripts.test_agent_record
+tests.scripts.test_doc_checkpoint` passes **18/18**.

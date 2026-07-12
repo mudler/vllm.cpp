@@ -36,8 +36,12 @@ trace-grounded W3 selection input, not a parity claim. Derived
 runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` /
 `0190a7e1…ad3e`; ours nsys/kernel are `f0599533…9e57` /
 `d2367ab4…392e`, and vLLM trace/kernel are `db996f39…b41` /
-`caf8ac9f…258b`. FP4 W3 is active; the 35B series waits until repaired 27B
-passes every axis.
+`caf8ac9f…258b`. Runtime grounding confirms pip-vLLM pre-tunes all buckets in
+memory with a stream sync and 1-ms GPU delay before ten eager event repeats;
+its file cache is disabled. FP4 W3-A's exact delayed timing mirror is staged
+behind `VT_FP4_AUTOTUNE_DELAY=0`, but its clean GB10 gate and A/B are pending;
+W3-B pre-serve all-bucket warmup follows. The 35B series waits until repaired
+27B passes every axis.
 
 ## Scope
 

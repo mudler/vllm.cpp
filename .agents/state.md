@@ -5112,3 +5112,43 @@ stale rejection, selected-plan evidence and lazy diagnostic fallback. No new
 tactic, HTTP, scheduler, GDN or device-residency change is in scope. Gate W3
 same-binary, re-profile both engines, then repeat exact 27B; 35B remains
 prohibited until every 27B performance and memory axis passes.
+
+## 2026-07-12 — W3-A mirrors production FlashInfer's delayed event window; immutable gate pending
+
+The W2 trace promoted FP4 tactic selection, and the full installed execution
+chain now identifies a concrete measurement mismatch. Production pip-vLLM
+0.24.0 does **not** use its persistent FlashInfer file cache:
+`kernel_warmup.py` sets `_FLASHINFER_USE_PERSISTENT_CACHE = False` because the
+file key can collide (including 8x4-vs-128x4 scale layout). It tunes one
+maximum-token dummy forward in memory before CUDA-graph capture; the clean W2
+oracle log records 16 FP4 profiles per projection. Installed FlashInfer's FP4
+configuration uses eager rather than graph timing: three warmups, stream sync,
+TensorRT-LLM `delayStreamKernel(1000us)`, then ten event-timed repeats.
+
+W3-A stages that exact sequence in
+`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`. The delay kernel is the same
+one-thread loop of 1,000-ns `__nanosleep` calls; the start event follows it on
+the same stream. `VT_FP4_AUTOTUNE_DELAY=0` restores W2 timing, while
+`VT_FP4_AUTOTUNE_VERBOSE=1` records `delay=1000us|off` plus the stable tactic
+ID. No pre-serve warmup or persistence is stacked into this checkpoint. W3-B
+owns all-bucket in-memory warmup; W3-C owns optional collision-complete
+versioned persistence and may not stand in for an oracle whose file cache is
+disabled.
+
+Local CPU rebuild plus the focused plan/cache test pass 1/1. A disposable
+precommit sync to `dgx.casa` configures with CUDA 13.0.88, sm_121a, vendored
+Triton and FlashInfer's CUTLASS 4.5 tree; the changed CUDA TU and focused binary
+link. Under one uncontended `/tmp/gpu` lock, delayed and off fresh processes
+each pass **14/14 cases and 18,619/18,619 assertions**. On the synthetic
+M96/M64 reference, delayed timing selects IDs **1/0**, while W2 timing selects
+IDs **20/7**. Thus the missing timing boundary causally changes selection, but
+these are not the real Qwen projection IDs and no speed result is inferred.
+The post-run GPU process list is empty and the lock is free.
+
+Next: pass all record/doc gates, commit and push this implementation checkpoint,
+then clean-build the immutable SHA. Run commit-bound delayed/off focused tests,
+sanitizer and native 27B correctness, followed by a real-shape selected-plan
+AB/BA/AB under one lock. Only an uncontended real-model performance result can
+accept W3-A. Then implement W3-B pre-serve buckets. `b5c6e4f` remains the exact
+binding denominator, and 35B remains prohibited until every 27B performance
+and memory axis passes.

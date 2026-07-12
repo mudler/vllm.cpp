@@ -7,6 +7,9 @@
 // candidate implementation is retained separately for VT_FP4_FULL_TACTICS=0.
 // This TU owns vt::Tensor validation/registration, exact hybrid-bucket tuning,
 // high-water workspace reuse, forced-tactic diagnostics and scale swizzling.
+// W3 mirrors FlashInfer's eager autotune timing window: after three warmups,
+// synchronize the stream and enqueue a one-thread 1 ms GPU delay before the
+// start event so host dispatch latency cannot bias near-tied tactic choices.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -134,6 +137,14 @@ bool Fp4AutotuneVerbose() {
   static const bool on = [] {
     const char* value = std::getenv("VT_FP4_AUTOTUNE_VERBOSE");
     return value != nullptr && value[0] == '1';
+  }();
+  return on;
+}
+
+bool Fp4AutotuneDelayEnabled() {
+  static const bool on = [] {
+    const char* value = std::getenv("VT_FP4_AUTOTUNE_DELAY");
+    return value == nullptr || value[0] != '0';
   }();
   return on;
 }
@@ -269,6 +280,18 @@ void RunCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams params,
 
 constexpr float kFp4Inf = 3.4e38F;
 
+// Exact source mirror of installed FlashInfer 0.6.12
+// `data/csrc/nv_internal/tensorrt_llm/kernels/delayStream.cu:24-34`, used by
+// `autotuner.py:1398-1424`. `__nanosleep` accepts at most one millisecond, so
+// the upstream kernel loops in microsecond-sized 1000 ns increments. The
+// single thread deliberately occupies negligible SM capacity while putting a
+// fixed GPU-side gap between host setup and the measured event window.
+__global__ void Fp4AutotuneDelayStreamKernel(long long delay_microseconds) {
+  for (long long i = 0; i < delay_microseconds; ++i) __nanosleep(1000);
+}
+
+constexpr long long kFp4AutotuneDelayMicroseconds = 1000;
+
 float TimeCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams params,
                     WorkspaceLease workspace, size_t workspace_bytes) {
   constexpr int kWarmupIterations = 3;
@@ -281,6 +304,16 @@ float TimeCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams param
     }
     Check(cudaEventCreate(&begin), "autotune event create begin");
     Check(cudaEventCreate(&end), "autotune event create end");
+    if (Fp4AutotuneDelayEnabled()) {
+      // FlashInfer synchronizes before its delay launch. Without this boundary,
+      // rapid host enqueue can systematically favor a different near-tied
+      // tactic family even though CUDA events exclude the warmup kernels.
+      Check(cudaStreamSynchronize(params.stream),
+            "autotune pre-profile stream synchronize");
+      Fp4AutotuneDelayStreamKernel<<<1, 1, 0, params.stream>>>(
+          kFp4AutotuneDelayMicroseconds);
+      Check(cudaGetLastError(), "autotune delay kernel launch");
+    }
     Check(cudaEventRecord(begin, params.stream), "autotune event record begin");
     for (int i = 0; i < kTimingIterations; ++i) {
       RunCandidate(candidate, params, workspace, workspace_bytes);
@@ -367,9 +400,11 @@ SelectedPlan SelectPlan(nvfp4::LaunchParams params, int device_ordinal) {
       if (Fp4AutotuneVerbose()) {
         std::fprintf(stderr,
                      "[VT_FP4_AUTOTUNE] set=%s M=%d(bucket=%u) N=%d K=%d device=%d sm=%d "
-                     "-> id=%d %s (%.1f us), workspace=%zu\n",
+                     "delay=%s -> id=%d %s (%.1f us), workspace=%zu\n",
                      full_tactics ? "full" : "w1", params.m, m_bucket, params.n, params.k,
-                     device_ordinal, key.architecture, candidates[static_cast<size_t>(chosen)].descriptor.id,
+                     device_ordinal, key.architecture,
+                     Fp4AutotuneDelayEnabled() ? "1000us" : "off",
+                     candidates[static_cast<size_t>(chosen)].descriptor.id,
                      candidates[static_cast<size_t>(chosen)].descriptor.name,
                      timings[static_cast<size_t>(chosen)] * 1000.0F, high_water);
       }

@@ -24,9 +24,15 @@ OpenAI-compatible server.
 > gives a concrete next lever: vLLM spends about **25.1%** of captured kernel
 > time in its 128×32×256 Stream-K/static-persistent FP4 pair, while our runtime
 > planner predominantly selects 128×128×128 and 256×128×128 tactics despite
-> the full 32-tactic family being present. W3 now owns pre-serve all-bucket
-> warmup, FlashInfer-equivalent timing/selection and a versioned persistent plan
-> cache. The 27B-only BF16 GDN output default remains correctness-required;
+> the full 32-tactic family being present. Inspection of the actual pip-vLLM
+> runtime confirms it pre-tunes every FP4 bucket in memory using three warmups,
+> a stream sync, a **1-ms GPU delay**, and ten eager event repeats; its file
+> cache is disabled because of key collisions. W3-A now stages that exact
+> delayed timing window with `VT_FP4_AUTOTUNE_DELAY=0` restoring W2, but its
+> clean GB10 build, selected-plan A/B and performance result are still
+> **PENDING**. W3-B pre-serve all-bucket warmup follows; optional versioned
+> persistence is separately gated in W3-C and is not the oracle denominator.
+> The 27B-only BF16 GDN output default remains correctness-required;
 > every 35B path retains f32. No production-parity claim is made, and the 35B
 > campaign remains held until 27B passes every axis. Historical
 > temperature/token-budget-mismatched ratios
@@ -179,7 +185,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (CUTLASS NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact clean `b5c6e4f` 27B online total throughput is 0.952-1.022× vLLM over c2-c32 medians (c1 0.993×), but the all-axis gate remains red at 4/4/5/4/17/14 of 20 axes and 2/4 memory axes. The fixed HTTP pool remains healthy/neutral. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate component evidence. FP4 W2 includes the full 32-tactic SM12 family, merged CT gate/up semantics and fused one-input SiLU→NVFP4 quantization; focused CUDA/sanitizer/model gates pass. Its clean trace shows our planner selects wide 128×128×128/256×128×128 tactics where vLLM resolves the 128×32×256 Stream-K/static pair, so W3 warmup/selection/cache parity is next. The vendored BF16 GDN output path remains the 27B-only default, while 35B stays on f32. Both models are W0 compute-sanitizer access-clean and the indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (CUTLASS NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact clean `b5c6e4f` 27B online total throughput is 0.952-1.022× vLLM over c2-c32 medians (c1 0.993×), but the all-axis gate remains red at 4/4/5/4/17/14 of 20 axes and 2/4 memory axes. The fixed HTTP pool remains healthy/neutral. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate component evidence. FP4 W2 includes the full 32-tactic SM12 family, merged CT gate/up semantics and fused one-input SiLU→NVFP4 quantization; focused CUDA/sanitizer/model gates pass. Its clean trace shows our planner selects wide 128×128×128/256×128×128 tactics where vLLM resolves the 128×32×256 Stream-K/static pair. W3-A's exact 1-ms GPU-delayed eager timing mirror is staged with a W2 fallback, but clean sm_121a and selected-plan/performance evidence are pending; W3-B pre-serve in-memory bucket tuning follows. The vendored BF16 GDN output path remains the 27B-only default, while 35B stays on f32. Both models are W0 compute-sanitizer access-clean and the indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -254,9 +260,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   1.76%/1.66% slower at c16/c32. The fresh traces show why availability alone
   did not close it: vLLM spends about 25.1% of captured kernel time in the
   128x32x256 Stream-K/static-persistent pair, while our live planner is
-  dominated by 128x128x128 and 256x128x128 tactics. W3 therefore mirrors
-  vLLM's pre-serve all-bucket warmup, selection timing and versioned persistent
-  cache before another exact campaign. The existing BF16
+  dominated by 128x128x128 and 256x128x128 tactics. The actual pip runtime
+  pre-tunes in memory and inserts a 1-ms GPU delay before its eager event
+  window; its persistent file cache is explicitly disabled. W3-A's exact
+  delayed timing mirror is now staged behind
+  `VT_FP4_AUTOTUNE_DELAY=0`, with clean GB10 correctness/selection/performance
+  evidence pending. W3-B pre-serve all-bucket tuning follows, while W3-C's
+  collision-complete persistence is optional and separately gated. The existing BF16
   GDN output path is also now default only for the dense 27B because it mirrors
   vLLM and restores the full native token stream; its +0.799% c16 component
   passes 16/20 timing and 2/4 memory axes, so `VT_GDN_OUT_BF16=0` remains the
@@ -288,7 +298,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   17/20 timing and 0/4 sampled-memory result is not closure; the paired trace's
   +2.084%/20-of-20 result and launch reduction remain component diagnostics.
   The binding W2 campaign is below the all-axis floor and its trace promotes
-  W3 planner/warmup parity rather than another tactic implementation.
+  W3 planner/warmup parity rather than another tactic implementation. W3-A now
+  stages FlashInfer's pre-event stream sync plus one-thread 1-ms nanosleep and
+  reports the timing arm with each selected stable ID. A disposable precommit
+  sm_121a smoke passes 14/14 and 18,619/18,619 in both delayed/off processes and
+  proves selection changes on synthetic shapes, but it is non-binding; no
+  real-model ID or speed result is claimed until the clean same-binary gate completes.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and
@@ -357,6 +372,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   gate/up scaling and fused SiLU→NVFP4 quantization. Its binding trace now
   identifies selection parity as W3: vLLM resolves the narrow 128x32x256
   Stream-K/static pair while our planner predominantly selects wide tactics.
+  W3-A delayed-event timing is implementation-staged/GPU-pending; W3-B owns
+  pre-serve bucket coverage and the oracle-disabled file cache is not a speed
+  denominator.
   W0 is
   merged at `7d29e0c`; its clean GB10 build,
   default/fallback

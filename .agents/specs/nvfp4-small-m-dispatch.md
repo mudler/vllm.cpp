@@ -2,7 +2,8 @@
 
 **Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
 spike; W1/W2 are measured and W3 is `ACTIVE` under
-`CLAIM-NVFP4-SMALL-M-3`. **Pins:** vLLM
+`CLAIM-NVFP4-SMALL-M-3`; W3-A delayed event timing is staged and GPU-pending.
+**Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.5.0`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
@@ -210,6 +211,42 @@ vLLM and differs across local HTTP repetitions; this remains diagnostic while
 the separate commit-bound 16/16 model gate owns correctness. GPU processes are
 empty and `/tmp/gpu` is reacquirable after exit. 35B was correctly not run.
 
+### W3 runtime grounding and W3-A staging (2026-07-12)
+
+The production oracle differs from the newer source-only persistent-cache path
+in one important way. The installed pip-vLLM 0.24.0 runtime at
+`~/venvs/vllm-oracle/lib/python3.12/site-packages/vllm/model_executor/warmup/kernel_warmup.py`
+sets `_FLASHINFER_USE_PERSISTENT_CACHE = False`, with an explicit collision
+warning for incomplete keys such as `use_8x4_sf_layout`. It therefore enters
+`fi_utils.autotune()` in memory, runs one maximum-token dummy forward before
+CUDA-graph capture, and lets FlashInfer generate every hybrid bucket up to
+2,048. The clean W2 oracle log proves that exact path ran: FlashInfer tuned 16
+profiles per real FP4 projection before server readiness. No
+`autotune_configs.json` file is part of the production denominator.
+
+Installed FlashInfer's FP4 `TuningConfig` leaves `use_cuda_graph` at its
+default `false`. For every tactic it performs three warmups, synchronizes the
+stream, launches TensorRT-LLM's one-thread `delayStreamKernel(1000us)`, then
+records ten eager executions between CUDA events. Our W2 planner already used
+three warmups and ten eager event repeats but omitted the pre-window
+synchronize/delay. That is a concrete timing-method mismatch capable of
+inverting near-tied tactic choices.
+
+W3-A now stages the exact one-thread nanosleep loop and stream boundary in
+`cuda_matmul_nvfp4_cutlass.cu`; `VT_FP4_AUTOTUNE_DELAY=0` restores the W2 timing
+method in the same binary, and `VT_FP4_AUTOTUNE_VERBOSE=1` reports the timing
+protocol with each selected stable tactic ID. A disposable uncommitted
+sm_121a/CUTLASS-4.5 build links, and fresh delayed/off processes each pass
+14/14 cases and 18,619/18,619 assertions under one lock. Delayed M96/M64 selects
+IDs 1/0 while W2 timing selects 20/7 on that synthetic shape, proving the
+protocol is causally active. This is non-binding precommit evidence, not the
+real-model tactic pair or a speed result: clean commit-bound build,
+correctness/safety and selected-plan A/B remain `PENDING`. Pre-serve all-bucket in-memory
+warmup is W3-B. Versioned atomic persistence remains W3-C as an optional local
+capability with collision-complete keys and stale rejection; it is not allowed
+to stand in for, or silently become the default against, the production oracle
+whose file cache is disabled.
+
 ## Upstream chain and execution dependency
 
 ### vLLM orchestration
@@ -245,12 +282,18 @@ empty and `/tmp/gpu` is reacquirable after exit. 35B was correctly not run.
 - `vllm/config/vllm.py:193-275,1192-1200` enables FlashInfer autotuning for
   optimization levels O1-O3; the production oracle resolves O3 and full/
   piecewise cudagraphs.
-- `vllm/model_executor/warmup/kernel_warmup.py:133-220` tunes at the maximum
-  token budget before serving, writes a persistent cache on rank zero,
-  broadcasts it, and loads identical tactics on every rank.
-- `vllm/model_executor/warmup/flashinfer_autotune_cache.py:19-41` fingerprints
-  the configuration and chooses `autotune_configs.json` under a versioned
-  FlashInfer workspace.
+- The installed pip-vLLM 0.24.0
+  `model_executor/warmup/kernel_warmup.py:123-154` sets
+  `_FLASHINFER_USE_PERSISTENT_CACHE = False` because the file-cache key can
+  collide, then tunes one maximum-token dummy forward in memory before CUDA
+  graph capture. The clean oracle log records 16 generated FP4 profiles per
+  projection. This installed file, not a newer source branch, owns the runtime
+  denominator.
+- The same file retains a disabled persistent branch, while
+  `flashinfer_autotune_cache.py:19-41` fingerprints the configuration and
+  chooses `autotune_configs.json`. That branch is design reference only until
+  its collision warning is removed and the production oracle actually enables
+  it.
 
 ### FlashInfer 0.6.12 execution owner
 
@@ -264,9 +307,12 @@ truth for what actually ran:
 - `fused_moe/utils.py:212-307` defines the exact mapping: powers of two through
   256, 256-wide steps through 2048, 512-wide steps through 4096, then powers
   of two. Crucially, 1/2/4/8/16 remain distinct.
-- `autotuner.py:1384-1436` warms and times each tactic with events, optionally
-  inside a CUDA graph; `:1438-1584` generates all bucket profiles and keys
-  cache lookup by runner plus mapped shapes and extras.
+- `autotuner.py:1343-1426` performs three warmups, synchronizes the current
+  stream, launches `delay_kernel(1000)` and measures ten eager iterations with
+  events for FP4 (`TuningConfig.use_cuda_graph == false`); `:1428-1584`
+  generates all bucket profiles and keys lookup by runner, mapped shapes and
+  extras. `data/csrc/nv_internal/tensorrt_llm/kernels/delayStream.cu:24-34`
+  owns the one-thread nanosleep loop that removes host timing bias.
 - `gemm/gemm_base.py:1300-1340` exposes every tactic returned by
   `fp4_gemm_tactic_num()` and passes the selected integer to the compiled
   runner.
@@ -349,7 +395,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
-| warmup/persistence (`kernel_warmup.py:133-220`) | tune all configured hybrid buckets before server readiness, version cache entries by source/tactic ABI/device/CUDA/CUTLASS/model shape, load atomically, and keep lazy tuning only as a fail-closed diagnostic path |
+| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A staged/GPU-pending:** three warmups + pre-window stream sync + exact 1,000-us GPU delay + ten eager event repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2 and verbose output records the selected stable ID. W3-B tunes every configured hybrid bucket before server readiness and leaves lazy misses diagnostic-only. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
 | diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
 
@@ -371,7 +417,7 @@ wrappers.
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. Stale disk-version rejection belongs to W3 |
+| autotuner timing/cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. **W3-A staged/GPU-pending:** default delayed and `VT_FP4_AUTOTUNE_DELAY=0` timing arms must select/report plans in fresh processes and preserve the same output/capture contract. Pre-serve bucket coverage belongs to W3-B; stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -445,7 +491,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | pre-serve all-bucket warmup, FlashInfer-equivalent event/graph timing and selection, versioned persistent plan cache, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`; retain lazy tuning only as a fail-closed diagnostic path, expose stable selected-plan evidence, run same-binary selection A/B + paired trace, then repeat exact 27B because runtime selection changes |
+| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A is implemented/staged with `VT_FP4_AUTOTUNE_DELAY=0` restoring W2. A disposable precommit sm_121a build and both 14/14 focused processes pass and prove selection changes, but clean commit-bound correctness/safety and real-model selection/performance A/B are `PENDING`. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison. After A/B/C, run the paired trace and exact 27B because runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be

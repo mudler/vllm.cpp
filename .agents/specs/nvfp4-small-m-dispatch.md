@@ -1,16 +1,19 @@
 # Spike: FlashInfer-parity NVFP4 small-M dispatch and SM12 tactics
 
 **Row:** `KERNEL-GEMM-NVFP4-W4A4` · **state:** accepted implementation
-spike; W1 is `ACTIVE` under `CLAIM-NVFP4-SMALL-M-1`. **Pins:** vLLM
+spike; W1 is measured and W2 is `ACTIVE` under
+`CLAIM-NVFP4-SMALL-M-2`. **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
 `v4.4.2`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
 
 This accepted spike is the mandatory contract for FP4 plan-cache and kernel
-changes. W1 has a CPU/TSan implementation checkpoint and pushed `c8807b0`
-passes exact/legacy sm_121a capture, focused memcheck and both 27B model arms.
-Component, trace and oracle performance remain open, and exact `4e1d8ca`
-remains the binding before-state.
+changes. W1 retains its CPU/TSan, exact/legacy sm_121a capture, focused
+memcheck and both-27B-model proof. Pushed `bce2627` completes its component,
+trace and exact oracle classification: it is structurally effective and
+materially improves the 27B grid, but does not pass the strict component or
+every-axis gates. The fresh runtime trace promotes the separate 32-tactic W2
+family; exact `4e1d8ca` remains W1's immutable before-state.
 
 ## Scope
 
@@ -87,6 +90,34 @@ fresh exact total-throughput ratios remain **0.9661/0.9274/0.9378/0.9466/
 0.9808/0.9910×** from c1 through c32. That removes transport starvation from
 the sampled ladder without closing any concurrency's 20-axis gate, so W1 can
 attribute its own exact-bucket/single-flight A/B against a healthy baseline.
+
+### W1 measured classification
+
+Pushed `bce2627` closes the W1 measurement loop without closing the row. The
+same-binary exact/legacy c1/2/4/8/16/32 AB/BA/AB series completes 2,016 timed
+requests and all six server lifecycles. Exact/legacy total-throughput ratios
+are **1.000229/1.001222/1.000618/1.009320/0.999645/1.007172×**, with
+**10/16/18/18/5/19 of 20** throughput+latency axes and **1/4** memory axes
+passing. C8 and c32 are real wins, while c16 and memory make the iteration a
+strict gate failure. Summary/artifact SHA-256 are `de20915a…6239` and
+`b0f4b432…dceb`.
+
+The paired exact/legacy nsys capture proves exact plans for M=1/2/4/8/16,
+where legacy records only M=1→bucket16 for the small-M family. Across the whole
+captured sequence, exact reduces FP4 kernel time **34,754.7→34,391.0 ms
+(-1.05%)** and aggregate GPU-kernel time **107,121.5→105,159.8 ms (-1.83%)**.
+Profiler throughput is 0.987334× and remains structural-only. Trace
+summary/artifact SHA-256 are `d83826db…9c44` and `d7591e84…4811`.
+
+The binding exact 27B campaign validates 12/12 groups, 2,016 requests, six
+memory returns, the model gate and paired trace. Median total-throughput ratios
+become **0.967983/0.931667/0.940305/0.951590/0.994440/1.007330×**, but only
+**4/4/5/4/4/12 of 20** performance axes and **2/4** memory axes pass. Runs,
+ratios and trace-status SHA-256 are `06a4bd7a…e41d`, `1e9643e9…c4b9` and
+`ef9ce611…3a14`. The fresh oracle trace spends **25.1%** of profiled kernel
+time in the missing 128x32x256 Stream-K/static-persistent pair (94,144 and
+119,280 calls); ours remains dominated by 256x128x128 persistent. W2 is the
+trace-grounded next iteration. 35B stays prohibited.
 
 ## Upstream chain and execution dependency
 
@@ -198,7 +229,7 @@ Real 27B W4A4 projection classes to benchmark include:
 |---|---|
 | hybrid bucket generator/mapping (`fused_moe/utils.py:212-307`) | **W1 implemented:** pure helper maps 1/2/4/8/16 independently, preserves 256/2048/4096 phase boundaries, and keys device, architecture, output dtype, N, K, bucket and tactic-set version |
 | profile/cache key (`autotuner.py:1438-1584`) | **W1 implemented:** one per-key state machine with condition-variable single-flight; waiters never retune, failures wake/erase/retry, and only complete plans publish |
-| capture behavior | **W1 CPU contract implemented:** a ready lookup is allocation/sync-free; an uncached capture is rejected before tuning. Real CUDA capture/replay is still a required gate |
+| capture behavior | **W1 implemented/gated:** a ready lookup is allocation/sync-free; an uncached capture is rejected before tuning; pushed exact/legacy real CUDA capture/replay, invalid-miss teardown and eager-retry suites pass |
 | 32 configs (`fp4_gemm_cutlass_template_sm120.h:47-220`) | port the dependency-owned raw template semantics into split local CUDA TUs: explicit TMA epilogue with `ElementC=void`, block-scaled cooperative mainloop, static persistent + Stream-K, both orientations and exact tactic order |
 | `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
@@ -289,8 +320,8 @@ before any new FP4 GPU command begins.
 | Work | Deliverable | State / gate |
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
-| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | implementation, CPU/TSan, pushed exact/legacy capture, focused memcheck and both 27B model arms complete; `ACTIVE` on component AB/BA/AB, trace and full exact 27B campaign |
-| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | after W1 measurement; every-tactic sanitizer, trace, component and exact 27B campaign |
+| W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
+| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; every-tactic correctness/sanitizer, capture/workspace, component, trace and exact 27B campaign required |
 | W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 

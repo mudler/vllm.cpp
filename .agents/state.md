@@ -4902,3 +4902,42 @@ No throughput, latency, memory or vLLM ratio is inferred from these gates. Next
 is W1 exact-vs-legacy component AB/BA/AB, paired traces and the full exact 27B
 oracle campaign. Per the fail-closed order, do not run 35B while any 27B axis
 remains below the floor, and do not stack W2 before W1 is classified.
+
+## 2026-07-12 — NVFP4 W1 is measured: real gains, strict gate fail; W2 claimed
+
+Pushed `bce262729726ce56991e5af9f98143227d94f9f4` closes the complete W1
+measurement loop from one clean CUDA 13.0.88/sm_121a build. The same binary
+runs exact buckets and `VT_FP4_EXACT_BUCKETS=0` under one uncontended lock in
+AB/BA/AB order over c1/2/4/8/16/32. All 2,016 timed requests, six memory
+returns, both model preflights and evidence hashes pass. Exact/legacy total
+ratios are **1.000229/1.001222/1.000618/1.009320/0.999645/1.007172×**;
+performance axes pass **10/16/18/18/5/19 of 20**, memory **1/4**. C8 and c32
+are real gains, but c16 and memory make W1 a strict component-gate failure.
+Component summary/artifact SHA-256 are `de20915a…6239` / `b0f4b432…dceb`.
+
+The paired component trace proves independent exact M=1/2/4/8/16 plans, while
+legacy records only M=1→bucket16 for the small-M family. Exact reduces
+aggregate FP4 kernel time **34,754.7→34,391.0 ms (-1.05%)** and all GPU-kernel
+time **107,121.5→105,159.8 ms (-1.83%)**. Nsys perturbs wall throughput in the
+opposite direction (0.987334×), so only the unprofiled series owns speed.
+Trace summary/artifact hashes are `d83826db…9c44` / `d7591e84…4811`.
+
+The binding exact 27B campaign then completes 12/12 groups, 2,016 requests,
+six returns, the commit-bound model gate, ours nsys and vLLM torch-profiler
+trace under one model-wide lock. Median total ratios c1→c32 are
+**0.967983/0.931667/0.940305/0.951590/0.994440/1.007330×**; only
+**4/4/5/4/4/12 of 20** performance axes and **2/4** memory axes pass. C32
+throughput closes but its TPOT/ITL tails do not; c1-c16 throughput remains
+below floor. Runs/ratios/trace hashes are `06a4bd7a…e41d` /
+`1e9643e9…c4b9` / `ef9ce611…3a14`. GPU compute processes are empty and a
+nonblocking `/tmp/gpu` reacquisition passes. Per protocol, 35B was not run.
+
+The fresh execution chain makes the next lever unambiguous. vLLM actually
+runs 128x32x256 Stream-K and static-persistent FP4 kernels for 94,144 and
+119,280 calls, totaling **25.1%** of profiled kernel time; ours remains
+dominated by the wide 256x128x128 persistent candidate. W1 is therefore
+classified—not declared parity—and `CLAIM-NVFP4-SMALL-M-2` now owns W2's
+exact eight-tile × two-orientation × two-scheduler family, high-water
+workspace, forced IDs and separately repeated gates. README,
+`docs/BENCHMARKS.md`, roadmap, matrices and specs move together in this
+checkpoint.

@@ -21,22 +21,23 @@ ours arm. The historical offline denominators are also reopened: pinned
 `vllm bench throughput` used temperature 1 while ours used temperature 0, and
 the 27B budgets were 8192 versus 2048.
 
-The replacement pushed-`4e1d8ca` series is now the current binding 27B
+The replacement pushed-`bce2627` series is now the current binding 27B
 evidence. All 12 engine/concurrency groups validate; 2,016/2,016 timed
 requests, six memory returns, the commit-bound model gate and paired traces
 pass. Median total-throughput ratios c1→c32 are
-0.9661/0.9274/0.9378/0.9466/0.9808/0.9910×, with only 0/2/5/3/3/5 of 20
+0.9680/0.9317/0.9403/0.9516/0.9944/1.0073×, with only 4/4/5/4/4/12 of 20
 performance axes and 2/4 memory axes passing. All three fixed-pool c32 legs
 complete without the prior unread-socket tail. Its separate same-binary c32
 fixed/legacy AB/BA/AB is steady-state-neutral at 0.999764×, and neither
-bounded arm samples the rare legacy stall. The superseded `a531e05` trace plus
-fresh-server direct-c16 runs remain causal FP4 evidence: the local tuner aliases
-M=1/2/4/8/16, while real-M=16 retuning improves TPOT to 161.72–161.75 ms,
-essentially the prior vLLM 161.698-ms mean. This is a valid failed gate, not a
-parity claim. Derived summary/trace-status hashes are `880261e4…e1574` /
-`bf2e0ac2…7bc66`; ours nsys/kernel are `b8d5ee28…3c941` /
-`972b94ae…0a60e0`, and vLLM trace/kernel are `b55f20ec…85cccc` /
-`044bc20e…796083`. FP4 W1 is active; the 35B series waits until repaired 27B
+bounded arm samples the rare legacy stall. FP4 W1 now gives M=1/2/4/8/16
+independent plans; its component evidence is positive at c8/c32 but fails
+strict c16/memory no-regression. The fresh oracle trace executes the absent
+128x32x256 Stream-K/static pair for 25.1% of profiled kernel time, grounding W2
+as the next repair. This is a valid failed gate, not a parity claim. Derived
+runs/ratios/trace-status hashes are `06a4bd7a…e41d` / `1e9643e9…c4b9` /
+`ef9ce611…3a14`; ours nsys/kernel are `94048795…afde` /
+`8ce71db7…3f03`, and vLLM trace/kernel are `c8931f0a…d3ba` /
+`2afd6a57…16086`. FP4 W2 is active; the 35B series waits until repaired 27B
 passes every axis.
 
 ## Scope

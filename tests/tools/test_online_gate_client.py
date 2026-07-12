@@ -41,7 +41,7 @@ from tools.bench.online_gate import (
     validate_plan,
     validate_raw_result,
 )
-from tools.bench.serve_low_common import HarnessError, sha256_file
+from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
 
 
 def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
@@ -343,7 +343,12 @@ class OnlineClientContractTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             bin_dir = root / "venv" / "bin"
             package = root / "venv" / "site-packages" / "vllm"
-            dist_info = root / "venv" / "site-packages" / "vllm-0.24.0.dist-info"
+            dist_info = (
+                root
+                / "venv"
+                / "site-packages"
+                / f"vllm-{VLLM_ORACLE_VERSION}.dist-info"
+            )
             pandas_package = root / "venv" / "site-packages" / "pandas"
             pandas_dist_info = (
                 root / "venv" / "site-packages" / f"pandas-{PANDAS_VERSION}.dist-info"
@@ -499,7 +504,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     {
                         "artifacts": oracle_files,
                         "bench_dependencies": {"pandas": PANDAS_VERSION},
-                        "client_contract_source_commit": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
+                        "client_contract_source_commit": VLLM_COMMIT,
                         "oracle_version": VLLM_ORACLE_VERSION,
                         "runtime_version": VLLM_ORACLE_VERSION,
                     }

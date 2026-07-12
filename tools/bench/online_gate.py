@@ -8,7 +8,7 @@ This wrapper mirrors its CLI and result schema from:
 * ``vllm/benchmarks/datasets/datasets.py:2482-2610``
 * ``tests/benchmarks/test_serve_cli.py:58-132``
 
-at vLLM commit ``e24d1b24fe96a56ba8b0d653efa076d03eb95d6c``.  It
+at executable-oracle commit ``702f4814fe54fabff350d43cb753ae3e47c0c276``. It
 does not reimplement request timing.  It constructs the exact upstream client
 command, validates every detailed artifact, and makes partial request sets
 fatal instead of allowing their aggregate metrics to look successful.
@@ -45,7 +45,7 @@ from tools.bench.serve_low_common import (
 
 INPUT_LEN = 1024
 OUTPUT_LEN = 128
-VLLM_ORACLE_VERSION = "0.24.0"
+VLLM_ORACLE_VERSION = "0.25.0"
 PANDAS_VERSION = "2.2.3"
 TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
@@ -895,9 +895,9 @@ def record_oracle_manifest(
     """Record the exact immutable files behind the pip-vLLM oracle command.
 
     This command is intentionally run with the oracle venv's Python.  The
-    repository parity pin defines the audited client contract, while pip vLLM
-    0.24.0 is the executable correctness/performance oracle mandated by the
-    project environment record.
+    audited v0.25.0 target defines the client contract while the older porting
+    parity pin remains explicit in the upstream-sync record until target
+    goldens and behavior gates close.
     """
 
     if output.exists():

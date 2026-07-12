@@ -10,14 +10,34 @@
   never share a build tree between agents.
   - Non-interactive SSH does not put nvcc on PATH — prepend
     `export PATH=/usr/local/cuda/bin:$PATH` in remote build commands.
-  - Oracle venv: `~/venvs/vllm-oracle` — pip vLLM 0.24.0, used as the
-    parity oracle (golden op dumps via `tools/parity/`). Its serving-benchmark
-    subset is completed with the pinned CUDA-test dependency set pandas 2.2.3,
-    python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2; its venv also
-    provides executable `bin/ninja` for FlashInfer JIT. Online-gate manifests
-    hash pandas package/distribution files plus Ninja and reject missing/drifted
-    dependencies before the GPU lock; profiler launches prepend the venv `bin`
-    to spawned EngineCore `PATH`.
+  - Oracle venv: `~/venvs/vllm-oracle` is now a canonical symlink to the
+    validated `~/venvs/vllm-oracle-v0.25.0-stage`; the immediately restorable
+    v0.24.0 directory is preserved at
+    `~/venvs/vllm-oracle-v0.24.0-retired`. The active stack is pip vLLM 0.25.0,
+    FlashInfer Python/cubin 0.6.13, Torch 2.11.0+cu130, CUTLASS DSL 4.5.2,
+    Humming kernels 0.1.10, Transformers 5.13.1 and Ninja 1.13.0. Its serving
+    dependencies are pandas 2.2.3, python-dateutil 2.9.0.post0, pytz 2024.2 and
+    tzdata 2024.2. Install/serving report SHA-256 values are
+    `ab786eee…c297` / `536385d8…f506`; executable vLLM/Ninja hashes are
+    `ec6d76ff…96c` / `abf71487…10b`, and the sorted freeze hash is
+    `cf1636cc…fa5f`.
+  - The only dependency-check exception is NVIDIA's
+    `nvidia-cusparselt-cu13==0.8.0` wheel: PyPI served the aarch64 wheel
+    (`sha256:400c6ed1…77c`), its library is an AArch64 ELF and direct
+    `ctypes.CDLL`/Torch imports pass, but its internal WHEEL tag is
+    `manylinux2014_sbsa`, so `pip check` reports it unsupported. This is a
+    recorded vendor-tag defect, not silently treated as a green `pip check`.
+  - Lock-held production-graph validation on the exact 27B snapshot passed both
+    offline generation (16 input IDs, one output ID) and the actual text-only
+    server: `/health` 200 plus `/v1/completions` 200 with exact 1+1 usage and
+    `finish_reason=length`. Server log/response SHA-256 are
+    `f56be69a…3787` / `82307db4…8e1` under
+    `~/work/vllm-oracle-v0.25.0-stage-validation/2026-07-12-server-smoke`.
+    The smoke rate is non-binding. Its first offline inference emitted one
+    causal-conv Triton JIT warning, which remains a warmup/trace audit item.
+    Online-gate manifests hash pandas package/distribution files plus Ninja and
+    reject missing/drifted dependencies before the GPU lock; profiler launches
+    prepend the venv `bin` to spawned EngineCore `PATH`.
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds
     `flock /tmp/gpu` for the whole job or multi-arm series WHEN other agents may run GPU work concurrently (sole owner verified idle via `nvidia-smi` may skip), following
     `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
@@ -60,22 +80,17 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- Historical offline vLLM throughput baselines are non-binding after the
-  sampling/token-budget audit. Exact pushed-`b5c6e4f` 27B online evidence is
-  complete and below the every-axis floor. The fixed HTTP series has no unread
-  c32 socket and is steady-state-neutral against its legacy arm; the bounded
-  legacy series does not reproduce the historical rare tail. FP4 W3-B at clean
-  `d7cdf66` is immutable build/correctness/safety-green. Its repeated
-  prewarm/lazy component is steady-state neutral at **1.000293×**, strict-fails
-  **15/20 timing + 2/4 memory**, and retains only **20/80** stable prewarmed
-  tactic IDs; first-use latency improves, so shipping prewarm stays without
-  speed credit. Trace attempt 1 is VOID after prewarm-only 144/144 because
-  mutable client results changed cache inventory 50→58 before lazy/vLLM.
-  Rerun with an immutable corpus-only eviction root, then repeat exact 27B under
-  one whole-series GPU lock after the trace-grounded repair before starting 35B.
-- Provision SGLang `v0.5.13` (`28b095c`) with the digest-pinned CUDA 13 image
-  from [the leaf spike](specs/cuda-sglang-low-concurrency.md) in an isolated
-  environment after current GPU claims; never mutate `~/venvs/vllm-oracle`.
-  Exact-checkpoint load/corpus work can proceed before `SERVE-ASYNC-LLM`, but
-  binding TTFT/ITL execution cannot.
+- All old-oracle throughput baselines are non-binding after sampling,
+  token-budget and dependency drift audits. `b5c6e4f` is historical vLLM
+  0.24.0/FlashInfer 0.6.12 evidence; `3cc490c` is VOID at 28/36 groups,
+  1,602/2,016 requests, four returns and no trace. With the canonical v0.25.0
+  oracle now validated/active, run a new exact 27B cache-off grid and paired
+  traces under one whole-series lock, modernize only trace-proven paths, and
+  close every 27B throughput/latency/memory axis before any 35B run.
+- Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
+  shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
+  deterministic 64k/256k harness/counter work is ready after the priority
+  cache-off closure. Write the dedicated `KV-MAMBA-ALIGN` spike before PX2,
+  then require matched BF16/no-spec capacity, native hit/no-eviction evidence,
+  full axes and traces. Never mutate the vLLM oracle while provisioning SGLang.
 - Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.

@@ -12,7 +12,7 @@ it becomes binding once the spike proves the workload/features are equivalent.
 
 | Backend / operating point | Compatibility oracle | Binding performance floor | Leader comparison |
 |---|---|---|---|
-| NVIDIA CUDA, large concurrency | pinned vLLM | production graphed vLLM | SGLang when it supports the same model/quant |
+| NVIDIA CUDA, large concurrency | pinned vLLM | better of production graphed vLLM and equivalent SGLang | both are always reported |
 | NVIDIA CUDA, low concurrency 1/2/4/8/16 | pinned vLLM | better of production vLLM and equivalent SGLang | both are always reported |
 | CPU + GGUF | pinned vLLM behavior where shared; same-file llama.cpp tokens/logits | same-file llama.cpp | strongest current CPU engine found by the spike |
 | Vulkan | vLLM behavior where shared | same-model/quant llama.cpp Vulkan | other equivalent native Vulkan engine if identified |
@@ -24,6 +24,14 @@ output lengths, sampling, cache/prefix state, concurrency and serving features.
 If conversion is necessary, record it and do not turn the converted result into
 a binding floor until correctness/quality equivalence is established. Full
 matrix: [specs/competitive-benchmarks.md](specs/competitive-benchmarks.md).
+
+**Cache policy is part of the workload, never an incidental default.** CUDA
+serving has at least two independent gates: a cache-neutral/cache-off workload
+and a deterministic shared-prefix cache-on workload. Every arm receives equal
+cache capacity, warmup, request order and a measured hit/reuse proof. Hybrid
+Qwen comparisons explicitly enable vLLM prefix caching with
+`mamba_cache_mode=align`; comparing SGLang's default radix cache against vLLM's
+default-off hybrid policy is a configuration comparison and cannot bind.
 
 ## The denominator is vLLM's PRODUCTION config (CUDA graphs ON) — never `--enforce-eager`
 

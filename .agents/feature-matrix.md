@@ -52,7 +52,7 @@ instead of it.
 | KVCacheManager (allocate_slots, watermark, admission) | `v1/core/kv_cache_manager.py` | `ANCHOR-BACKFILL` T0 | named allocation/admission/lookahead slice | `planned: specs/kv-cache-manager.md` |
 | Device-resident attention KV + indexed GDN state I/O | `v1/worker/gpu/attn_utils.py`, `model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | `ACTIVE` T0 | W0 stable allocations/fallback and W1 indexed BF16↔F32 gather/scatter remain correctness/safety green with separate 1.021239×/1.006246× component A/Bs and structural copy reduction. Clean `b5c6e4f` re-ranks the exact residual: W2 FP4 improves every concurrency and wins c16/c32 throughput, but FP4 tactic-selection parity, c1-c8, TPOT/ITL and host-memory axes remain ahead of device-residency W2. Inherited pools still fail zero-leak | [device-resident-kv-gdn-state.md](specs/device-resident-kv-gdn-state.md) |
 | Hybrid KV coordinator (full-attn + GDN/mamba state groups) | `v1/core/kv_cache_coordinator.py` | `PARTIAL` T0 | cross-group MIN-intersection prefix hit; align/retention modes absent | `planned: specs/hybrid-kv-coordinator.md` |
-| Mamba/GDN prefix-cache retention (`mamba_cache_mode=align`, vllm#45845) | `v1/core/` | ☐ T1 | 1:1 stub in place | `planned: specs/mamba-align-retention.md` |
+| Mamba/GDN prefix-cache retention (`mamba_cache_mode=align`, vllm#45845) | `v1/core/` | ☐ T1 (**promoted into competitor gate**) | vLLM hybrid defaults off but explicit cache-on selects align for Qwen3.5/3.6; local 1:1 stub exists, full retention/runtime path is required for matched vLLM/SGLang shared-prefix gating | `planned: specs/mamba-align-retention.md` |
 | SlidingWindowSpec + ChunkedLocalAttentionSpec | `v1/kv_cache_interface.py` | `PARTIAL` T1 | Both execution leaves are implemented and `GATING`: W1 sliding-window and W3 chunked-local sizing, registry/grouping, manager prefix/recycling policy, admission and hybrid-disabled conversion pass their ported CPU/property/sanitizer gates; attention/model/oracle/runtime closure remains | [sliding-local-yarn-long-context.md](specs/sliding-local-yarn-long-context.md) |
 | fp8 KV cache (`cache_dtype=fp8*`) | `layers/quantization/kv_cache.py` | ☐ T1 | | `planned: specs/fp8-kv-cache.md` |
 | nvfp4 / per-token-head / turboquant KV | `config/cache.py` | ☐ T2 | | `planned: specs/nvfp4-kv-cache.md` |
@@ -77,11 +77,13 @@ multi-process/multi-GPU re-enters through that seam.
 | Pipeline parallel (PP) | same | ☐ T2 | | `planned: specs/pipeline-parallel.md` |
 | Expert parallel (EP) + EPLB | `v1/worker/gpu/eplb_utils.py` | ☐ T2 | | `planned: specs/expert-parallel.md` |
 | Data parallel (DP) | `config/parallel.py` | ☐ T2 | | `planned: specs/data-parallel.md` |
+| MoE sequence parallelism without DP | `config/parallel.py::use_sequence_parallel_moe`, `distributed/parallel_state.py` | ☐ T2 | v0.25.0 adds the non-DP path and reports 1.9–5.0% E2E throughput; inventory row `PAR-SEQUENCE-MOE` | `planned: specs/sequence-parallel-moe.md` |
 | Multi-node (Ray / multiproc executor) | `v1/executor/` | ☐ T3 | re-enters via §9.2 seam; not as-is | `planned: specs/multi-node.md` |
 
 ## 4. Model families
 
-The pinned registry contains 353 unique static architecture IDs and a dynamic
+The current pin contains 353 unique static architecture IDs; the audited
+v0.25.0 target adds three, for 356 after pin advancement, plus a dynamic
 Transformers-compatibility path. The complete alias-preserving inventory is
 [model-matrix.md](model-matrix.md); this summary is only the roadmap roll-up.
 
@@ -91,8 +93,8 @@ Transformers-compatibility path. The complete alias-preserving inventory is
 | `MODEL-FACTORY` | architecture -> model factory + reject unknown | `models/registry.py:998-1404` | `PARTIAL` | central ordered type-erased registry now covers both implemented Qwen IDs; live loading resolves the full `architectures` list and rejects unknown/previous/OOT IDs with pinned messages instead of using `num_experts`; execution row `MODEL-FACTORY-registry` is `GATING` on the two-model GPU no-regression campaign | [model-factory-registry.md](specs/model-factory-registry.md) |
 | `MODEL-TEXT` | 130 text-generation IDs | `models/registry.py:71-208` | `INVENTORIED` | 0/130 static text-generation IDs directly supported | model matrix |
 | `MODEL-POOLING` | embedding, late-interaction, reward, token/sequence classification | `models/registry.py:210-329` | `INVENTORIED` | five distinct work fronts; no pooling runtime | model matrix |
-| `MODEL-MM` | 114 multimodal IDs | `models/registry.py:331-580` | `PARTIAL` | 2 wrappers run text-only; encoder/processors/cache absent | model matrix |
-| `MODEL-SPEC` | 44 speculative-draft IDs | `models/registry.py:582-633` | `READY` | MTP/DFlash specs exist; no draft model runs | model matrix + [spec-decode specs](specs/mtp-spec-decode.md) |
+| `MODEL-MM` | 115 v0.25.0-target multimodal IDs | `models/registry.py:331-583` | `PARTIAL` | 2 wrappers run text-only; encoder/processors/cache absent; MOSS-Transcribe-Diarize is target-pending | model matrix |
+| `MODEL-SPEC` | 46 v0.25.0-target speculative-draft IDs | `models/registry.py:585-638` | `READY` | MTP/DFlash specs exist; Laguna DFlash and Bailing hybrid MTP are target-pending; no draft model runs | model matrix + [spec-decode specs](specs/mtp-spec-decode.md) |
 | `MODEL-TRANSFORMERS` | 14 static aliases + dynamic compatible classes | `models/registry.py:635-680,1096-1164` | `INVENTORIED` | C++ policy/factory not spiked | model matrix |
 
 ## 5. Quantization
@@ -104,7 +106,7 @@ and reference-engine performance.
 
 | ID | Block | State | Grounded summary | Detailed evidence / spike |
 |---|---|---|---|---|
-| `QUANT-CUDA-GATES` | NVFP4 W4A16, NVFP4 W4A4, gate-specific FP8 W8A8 | `DONE` | all three native CUDA slices retain support/correctness closure on GB10; performance remains separately `ACTIVE`. W2/W3 focused/native gates and the corrected structural trace remain green. Clean `b5c6e4f` is still the below-floor denominator. The clean pushed-`3cc490c` exact W3-B campaign is now active under one model-wide lock; its model/corpus/cache preconditions, ours repetition 1 c1-c32 and memory return pass, while vLLM repetition 1 runs. No partial rate binds and 35B remains held ([small-M spike](specs/nvfp4-small-m-dispatch.md)) | quant matrix §2 + [coverage spike](specs/quantization-coverage.md) |
+| `QUANT-CUDA-GATES` | NVFP4 W4A16, NVFP4 W4A4, gate-specific FP8 W8A8 | `DONE` | all three native CUDA slices retain support/correctness closure on GB10; performance remains separately `ACTIVE`. W2/W3 focused/native gates and the corrected old-oracle structural trace remain green. `b5c6e4f` is historical vLLM 0.24.0/FlashInfer 0.6.12 evidence; replacement `3cc490c` is VOID at 28/36 groups with no trace. The canonical vLLM 0.25.0/FlashInfer 0.6.13 oracle is validated/active after real 27B generation/server smoke, but no current ratio binds. Run the new exact 27B grid/trace before any further topology repair; 35B remains held ([small-M spike](specs/nvfp4-small-m-dispatch.md)) | quant matrix §2 + [coverage spike](specs/quantization-coverage.md) |
 | `QUANT-GGUF` | llama.cpp encodings and output presets | `PARTIAL` | F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K materialize; F16 was corrected to reader-only; CPU threadpool/chunked dispatch is correctness-gated but its B4 speed/RSS checkpoint is pending; no direct compute-in-quant or llama.cpp speed parity | quant matrix §1 |
 | `QUANT-VLLM-BREADTH` | generic FP8/MX, AWQ/GPTQ, CT integer, vendor methods, KV | `PARTIAL` | gate-specific implementations exist; generic dispatch/modes remain inventoried | quant matrix §§2-3 |
 | `QUANT-MLX` | affine Q2-8, MXFP4/MXFP8/NVFP4, QQ, mixed recipes/imports | `INVENTORIED` | required for Apple backend; no MLX runtime yet | quant matrix §4 |
@@ -134,12 +136,14 @@ and reference-engine performance.
 | STRUCTURAL_TAG (full) | `structured_output/`, `tool_parsers/structural_tag_registry.py` | `PARTIAL` T1 | tool-choice subset works; full response-format/tag surface absent | `planned: specs/structural-tag.md` |
 | guidance / outlines backends | `structured_output/` | ☐ T2 | | `planned: specs/guidance-outlines-backends.md` |
 | Tool calling: `tools`/`tool_choice` auto+required+named, streaming deltas, Hermes + Qwen3 parsers | `tool_parsers/`, `entrypoints/openai/chat_completion/` | `PARTIAL` T0 | Hermes core works; local Qwen3 parser is a Hermes alias, not upstream Qwen3Engine parity | `planned: specs/tool-calling.md` |
+| Unified Streaming Parser Engine | `parser/engine/` | ☐ T1 | one reasoning/tool-call streaming event engine, adapters, token-ID scanning and replay; inventory row `TOOLS-STREAMING-PARSER` | `planned: specs/streaming-parser-engine.md` |
 | Tool parser breadth (Qwen-Coder XML, Mistral, pythonic, …) | `tool_parsers/` | ☐ T1 | abstract parser seam in place | `planned: specs/tool-parser-breadth.md` |
 
 ## 8. Speculative decoding
 
 Scoping done → [specs/spec-decode-scoping-2026-07-10.md](specs/spec-decode-scoping-2026-07-10.md)
-(B5). Route: MTP k=1 on 27B → GDN spec path → DFlash. Both gate checkpoints SHIP
+(B5). Route after speed parity: MTP k=1 on 27B → GDN spec path → DFlash →
+DSpark. Both gate checkpoints SHIP
 MTP heads. The optional safetensors head loader/standalone forward now exists;
 normal target loading still leaves `mtp.*` unloaded until speculative decoding
 is configured, exactly as upstream loads its draft model on demand.
@@ -150,6 +154,8 @@ is configured, exactly as upstream loads its draft model on demand.
 | Rejection sampler | `v1/worker/gpu/spec_decode/rejection_sampler.py` | 🚧 covered by MTP spec | prerequisite for all spec paths | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (2.4) |
 | GDN spec segments (metadata + slot-snapshot rollback) | `v1/attention/backends/gdn_attn.py`, `fla/ops/fused_sigmoid_gating.py` | 🚧 covered by MTP spec | on milestone 1 (both gates hybrid) | [specs/mtp-spec-decode.md](specs/mtp-spec-decode.md) (3) |
 | DFlash (block-diffusion drafter) | in-pin + published drafts for our models | 🚧 **spec written** (after MTP) | DGX-Spark community container exists; GDN slot memory at k=15 flagged | [specs/dflash-spec-decode.md](specs/dflash-spec-decode.md) |
+| DSpark (semi-autoregressive block drafter) | `v1/worker/gpu/spec_decode/dspark/`, `models/{qwen3_dspark,deepseek_v4/nvidia/dspark}.py` | ☐ T1 (**user-promoted**) | DeepSeek-V4 and Qwen3 draft layouts, reduced-vocab mapping, Markov sampling and full-CUDA-graph behavior inventoried as `SPEC-DSPARK`; dedicated spike follows parity/MTP | `planned: specs/dspark-spec-decode.md` |
+| TLI heterogeneous-vocabulary spec decode | `v1/spec_decode/vocab_mapping.py`, `config/speculative.py` | ☐ T1 | target↔draft ID mapping and shared-token constrained logits; current upstream validation is greedy draft only; inventory row `SPEC-TLI` | `planned: specs/tli-spec-decode.md` |
 | ngram | `v1/spec_decode/ngram_proposer.py` | ☐ T2 | | `planned: specs/spec-decode-ngram.md` |
 | EAGLE3 | `v1/spec_decode/eagle.py` | ☐ T2 | | `planned: specs/spec-decode-eagle3.md` |
 
@@ -160,6 +166,7 @@ is configured, exactly as upstream loads its draft model on demand.
 | `/v1/chat/completions` + `/v1/completions` (SSE streaming) | `entrypoints/openai/` | `ANCHOR-BACKFILL` T0 | basic transport/framing plus W2 live incremental AsyncLLM delivery and disconnect abort are CPU/TSan-proven; full protocol and GB10 online gates remain in leaf rows | `planned: specs/chat-completions-endpoints.md` |
 | `/v1/models`, `/health`, `/version` | same | `PARTIAL` T0 | routes work; `/health` always returns 200 instead of checking engine health | `planned: specs/models-health-version.md` |
 | **`/metrics` Prometheus, names 1:1** (`vllm:*`) | `v1/metrics/` | ☐ T0-core | verified ABSENT in-tree; core set was T0, deferred at server land — **oldest open T0 debt**; full set T1 | `planned: specs/prometheus-metrics.md` |
+| Per-request timing metrics in chat/completion response bodies | `entrypoints/generate/base/serving.py`, OpenAI protocols/serving | ☐ T1 | v0.25.0 opt-in surface for TTFT/prefill/decode timing, streaming/non-streaming and invalid multi-output suppression; inventory row `SERVE-RESPONSE-METRICS` | `planned: specs/per-request-response-metrics.md` |
 | `stream_options` / `include_usage` | `engine/protocol.py`, completion/chat `protocol.py` + `serving.py`, `serve/utils/api_utils.py` | 🚧 **GATING** T1 | native-ID final/continuous completion+chat frames, non-stream validation and force mode are implemented; CPU 105/105, focused ASan+UBSan 3/3 and TSan 1/1 pass. Fresh merged-SHA 27B→35B online evidence remains before `DONE` | [stream-options.md](specs/stream-options.md) |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | ☐ T1 | | `planned: specs/utility-endpoints.md` |
 | Chat templating (Jinja subset, minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | `ANCHOR-BACKFILL` T0 | bounded Qwen3.6 minja/Jinja subset; generic template parity open | `planned: specs/chat-templating.md` |

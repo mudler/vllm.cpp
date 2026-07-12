@@ -205,6 +205,16 @@ same-binary A/B, and run only on an idle box (contended runs are void). A number
 that doesn't reproduce does not count. Full protocol:
 [.agents/benchmark-protocol.md](.agents/benchmark-protocol.md).
 
+**Additional competitor floor — equivalent SGLang binds wherever it is
+faster.** vLLM remains mandatory on every workload, but an exact SGLang arm is
+also a floor once model/quantization, tokens, sampling, concurrency, cache
+capacity/policy and serving features are proven equivalent. Cache-neutral/off
+and shared-prefix cache-on are separate gates. Never compare incidental
+defaults: for Qwen hybrid cache-on, explicitly enable vLLM's
+`mamba_cache_mode=align`, prove cache hits/reuse in every arm, and match or beat
+the faster applicable reference on every axis. Full rules remain in the
+benchmark protocol above.
+
 ## STANDING DIRECTIVE — when stuck, SCAN vLLM vs ours (never accept a "ceiling")
 
 **Same architecture, same model, same GPU → if vLLM hits a number, we CAN too.**

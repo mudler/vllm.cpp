@@ -63,6 +63,7 @@ what vLLM has vs what we have:
 | `scheduler_reserve_full_isl`, pluggable `scheduler_cls`, `stream_interval` | `config/scheduler.py` | T1 |
 | Cascade attention (shared-prefix batch attention) | `config/model.py::disable_cascade_attn` | T2 |
 | DBO / ubatch overlap | `config/parallel.py::enable_dbo` | T2 |
+| MoE sequence parallelism without requiring DP (v0.25.0, 1.9–5.0% reported E2E gain) | `config/parallel.py::use_sequence_parallel_moe`, `distributed/parallel_state.py` | T2 |
 | Spec-decode scheduling hooks (`spec_token_ids`, lookahead slots) | `v1/core/sched/scheduler.py` | T2 (with §6) |
 
 ## 2. KV cache management (`vllm/v1/core/`)
@@ -90,9 +91,11 @@ what vLLM has vs what we have:
 
 We port the **Model Runner V2** (`v1/worker/gpu/` package — `model_runner.py`,
 `input_batch.py`, `block_table.py`, `attn_utils.py`, `states.py`), not the legacy
-`gpu_model_runner.py`: upstream defaults new architectures to V2 and new features
-(e.g. DSpark) are V2-only. This is where upstream is going; PR-portability demands
-we mirror it.
+`gpu_model_runner.py`: MRV2 is already the default for all dense models at the
+current pin, and features such as DSpark are V2-only. v0.25.0 deletes the legacy
+libtorch PagedAttention v1/v2 CUDA kernels; our live `vt::PagedAttention` is the
+backend-neutral paged-KV contract backed by current FA2/fallback kernels, not a
+port of those deleted kernels, so there is no corresponding local code to retire.
 
 | Item | Upstream | Tier |
 |---|---|---|
@@ -129,9 +132,11 @@ we mirror it.
 
 ## 5. Model architectures (`vllm/model_executor/models/`)
 
-The pinned registry has **353 unique static architecture IDs** (370 category
-memberships, 307 implementation targets, 258 modules) plus a dynamic
-Transformers-compatible path. The generic ordered architecture-to-type-erased-
+The current pin has **353 unique static architecture IDs**. The audited v0.25.0
+target adds MOSS-Transcribe-Diarize, Laguna DFlash and Bailing MoE v2.5 MTP,
+bringing the target inventory to **356 IDs** (373 category memberships, 310
+implementation targets, 261 modules) plus a dynamic Transformers-compatible
+path. The generic ordered architecture-to-type-erased-
 factory contract is now implemented for the two architectures whose text paths
 exist locally: `Qwen3_5ForConditionalGeneration` and
 `Qwen3_5MoeForConditionalGeneration`. Live loading consumes the full
@@ -172,7 +177,7 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — both native CUDA paths and full gate workloads pass on GB10. W2 includes distinct hybrid buckets, complete key/single-flight/capture handling, all 32 SM12 tactics, merged gate/up CT semantics, and fused one-input SiLU→NVFP4. Clean `b5c6e4f` remains binding at 0.9933/0.9520/0.9657/0.9760/1.0213/1.0218× with 4/4/5/4/17/14 timing and 2/4 memory axes. W3-A's delayed-timing component strict-fails. W3-B implements the shared-loader maximum-token request, exact all-bucket enumeration, capture-safe ready reuse and diagnostic lazy misses. Clean `d7cdf66` passes CPU/registry/loader, exact/legacy CUDA 14/14 each, native 27B 235/235 + 16/16, 24,586/24,586 zero-error memcheck and server ordering with 80/80 profiles and zero misses. Its repeated prewarm/lazy component is **1.000293×**, strict-fails **15/20 timing + 2/4 memory**, and keeps only **20/80** prewarmed tactic IDs stable; first-use improves, but there is no speed credit. Trace attempt 1 is VOID after prewarm-only 144/144 because cache inventory changed 50→58; lazy/vLLM did not run and no kernel result is inferred. Corrected paired trace and exact-oracle performance remain open. W3-C remains optional collision-complete persistence. The accepted [small-M dispatch spike](specs/nvfp4-small-m-dispatch.md) keeps iterations independent; generic quant-config/backend breadth remains in `quantization-matrix.md` |
+| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — both native CUDA paths and full gate workloads pass on GB10. W2 includes distinct hybrid buckets, complete key/single-flight/capture handling, all 32 SM12 tactics, merged gate/up CT semantics, and fused one-input SiLU→NVFP4. W3-A delayed timing and W3-B pre-serve all-bucket warmup are correctness/safety-gated; W3-B's repeated component is **1.000293×** but strict-fails **15/20 timing + 2/4 memory**, keeps only **20/80** tactic IDs stable and therefore earns no speed credit. Its corrected old-oracle trace closes the original wide-tactic structural mismatch, but all `b5c6e4f` ratios are now historical because they used vLLM 0.24.0 + FlashInfer 0.6.12. Replacement `3cc490c` is VOID at 28/36 groups and no trace. The validated/active vLLM 0.25.0 + FlashInfer 0.6.13 oracle now requires a fresh 27B grid/trace before any topology repair; W3-C remains optional. The accepted [small-M dispatch spike](specs/nvfp4-small-m-dispatch.md) keeps iterations independent; generic quant-config/backend breadth remains in `quantization-matrix.md` |
 | **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. The llama.cpp-derived CPU threadpool/chunked-op prerequisite is implemented and correctness-gated (1/3/20 full suites + TSAN), but its B4 speed/RSS gate is pending. All weights still expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
@@ -229,9 +234,11 @@ sampler (spec decode), routed-experts return. (`logit_bias`/`allowed_token_ids`/
 `bad_words` primitives were ported at M1.7 `aac5138`; their SamplingParams and
 OpenAI request/payload wiring remain T1.)
 
-**Spec decode** (`v1/worker/gpu/spec_decode/`): T1 starts with Qwen3.5/3.6 MTP
-(the gate checkpoints ship their heads), then DFlash; ngram, EAGLE3 and
-dspark/suffix remain T2. M-mtp-0 is `GATING`: the optional BF16 `mtp.*`
+**Spec decode** (`v1/worker/gpu/spec_decode/`): after speed parity, T1 starts
+with Qwen3.5/3.6 MTP (the gate checkpoints ship their heads), then DFlash and
+the user-promoted DSpark path. Tokenizer-agnostic TLI heterogeneous-vocabulary
+mapping is a distinct T1 row; ngram, EAGLE3 and suffix remain T2. M-mtp-0 is
+`GATING`: the optional BF16 `mtp.*`
 safetensors loader (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:271`) and
 standalone dense/MoE head (`src/vllm/model_executor/models/qwen3_5.cpp:3359`)
 mirror `models/qwen3_5_mtp.py:63-165`, share the target embedding/lm-head, and
@@ -251,6 +258,8 @@ before this becomes supported.
 | Completion/chat `stream_options` final + continuous usage and force mode | `entrypoints/openai/{engine,completion,chat_completion}/`, `entrypoints/serve/utils/api_utils.py` | T1 **GATING**: native prompt/output-ID counts, empty-choice terminal usage before `[DONE]`, continuous choice/role usage, non-stream validation and `--enable-force-include-usage` are CPU/ASan/UBSan/TSan-gated; fresh 27B+35B online closure remains |
 | Chat templating (bounded Qwen3.6 Jinja subset; engine: minja-style) | `renderers/hf.py`, `entrypoints/chat_utils.py` | T0 **anchor-backfill** `a99a65e` (original minja-subset engine; generic template/parser breadth remains open) |
 | **Tool/function calling** (user-mandated MVP): `tools`/`tool_choice` in chat API, auto-tool-choice, streaming tool-call deltas, Hermes parser first; upstream Qwen3Engine and other parser families remain T1 | `tool_parsers/`, `entrypoints/openai/chat_completion/` | T0 **partial** `18e3efb` (Hermes parser + streaming; local `qwen3` is a Hermes alias, not upstream Qwen3Engine parity; **tool_choice=auto RELAXED via a native LAZY grammar matcher behind vLLM's STRUCTURAL_TAG seam** — free text until `<tool_call>`, then constrain; required/named forced; Coder-XML/Mistral/pythonic parsers deferred) |
+| Unified Streaming Parser Engine for tool calls + reasoning | `parser/engine/` | T1 (v0.25.0 inventory; token-ID scanner, event stream, serving adapters and replay tests) |
+| Opt-in per-request timing metrics in chat/completion responses | `entrypoints/generate/base/serving.py`, OpenAI protocol/serving | T1 (v0.25.0 inventory; streaming/non-streaming and multi-output suppression) |
 | `/tokenize`, `/detokenize`, `/ready`, `/ping`, `/server_info`, `/reset_prefix_cache` | various routers | T1 |
 | `/v1/embeddings`, `/pooling`, `/score`, `/rerank` | pooling routers | T2 |
 | `/v1/responses`, `/v1/messages` (Anthropic-style), audio endpoints | responses/messages routers | T2 |
@@ -606,8 +615,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
 4. **Server e2e**: OpenAI-endpoint conformance (streaming chunks, stop handling,
    usage accounting, error shapes), health/metrics; runs in CI with the 0.6B
    model on CPU ref backend, nightly on dgx.casa with gate models.
-5. **The gate benchmark**: the unmodified pip-vLLM 0.24.0 `bench serve` oracle
-   (contract-audited against `e24d1b24`) is now wrapped by the committed
+5. **The gate benchmark**: the unmodified pip-vLLM 0.25.0 `bench serve` oracle
+   (contract-audited against target `702f481`; porting pin still `e24d1b24`) is
+   validated/active on DGX and wrapped by the committed
    `tools/bench/online_gate*.py` and `scripts/dgx-online-serving.sh` harness
    (ported command/schema contracts in
    `tests/tools/test_online_gate_*.py`). It freezes exact 1024-token partitions,

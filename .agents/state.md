@@ -5399,3 +5399,113 @@ or partial pair is binding, the exact result requires all 36 timed groups, six
 memory returns and the paired trace, and `b5c6e4f` remains the denominator.
 35B is not running and remains prohibited until every 27B performance and
 memory axis closes.
+## 2026-07-12 — vLLM v0.25 oracle active; SGLang prefix claim audited and split into its own gate
+
+Crash recovery and the exact release audit close the prior in-progress record.
+The clean pushed `3cc490cfa6314e81a69451c5f175b071e7970506` 27B campaign was
+stopped after proving its executable oracle still carried vLLM 0.24.0 and
+FlashInfer 0.6.12. It is **VOID** at 28/36 groups, 1,602/2,016 timed requests,
+four memory returns and no paired trace. Its owned process group was terminated;
+GPU processes, benchmark ports and `/tmp/gpu` returned free. No partial timing,
+memory value or ratio is reusable. Clean `b5c6e4f` remains historical
+diagnosis only for the same dependency reason.
+
+The official vLLM v0.25.0 tag is
+`702f4814fe54fabff350d43cb753ae3e47c0c276`. Relative to the live porting pin
+`e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`, 145 non-merge commits are in
+scope: 94 inventory and 51 ignore for the currently implemented Qwen T0 slice,
+with no trace-independent PORT-NOW runtime change. MRV2-by-default, legacy
+`paged_attention_v1/v2` deletion, DSpark, the Streaming Parser Engine and
+FlashInfer 0.6.13 were already in the pin. No copied local legacy PagedAttention
+implementation exists to delete: local `vt::PagedAttention` is the live
+backend-neutral paged-KV operation. v0.25 still consumes directly swizzled FP4
+scales, zeroes producer padding and supplies a device alpha, so those candidate
+repairs remain current but trace-gated. The exact audit is
+`.agents/sync/2026-07-12-702f481.md`.
+
+The isolated DGX environment
+`~/venvs/vllm-oracle-v0.25.0-stage` installs vLLM 0.25.0, FlashInfer
+Python/cubin 0.6.13, Torch 2.11.0+cu130, NVIDIA CUTLASS DSL 4.5.2, Humming
+0.1.10, Transformers 5.13.1, Ninja 1.13.0, pandas 2.2.3,
+python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2. Install/serving
+report SHA-256 are `ab786eeeb395075f61e75ef0855f3a052d2283689af4e7173e6ee2698502c297`
+and `536385d8a314554c5df5f045413de1859da9d2e0585cb7617404229d2082f506`;
+vLLM/Ninja executables are `ec6d76ff…96c` / `abf71487…10b`, and the sorted
+freeze hash is `cf1636cc…fa5f`. Imports, `vllm --version`, both benchmark help
+paths and direct cuSPARSELt library load pass.
+
+`pip check` intentionally remains red on one precisely classified NVIDIA
+metadata defect: PyPI supplied
+`nvidia_cusparselt_cu13-0.8.0-py3-none-manylinux2014_aarch64.whl`
+(`sha256:400c6ed1…77c`), and its `libcusparseLt.so.0` is a loadable AArch64 ELF,
+but its internal WHEEL tag says `manylinux2014_sbsa`, which packaging does not
+recognize as supported. This is recorded as a vendor-tag exception, not called
+a clean dependency check and not repaired by mutating installed metadata.
+
+All GPU validation held `/tmp/gpu`. The first offline command used legacy
+`--input-len/--output-len`; v0.25 warned that its random-dataset defaults won,
+prepared 1024/128 against a 64-token smoke context, and was stopped. SSH
+interruption did not kill its remote child, so only the owned PGID 2650205 was
+terminated; process/GPU/lock cleanup was then verified. That command is
+VOID/invalid and produced no result. The corrected production-graph command
+uses `--random-input-len 16 --random-output-len 1 --random-range-ratio 0`,
+loads the exact 24.57-GiB 27B checkpoint, compiles, FlashInfer-autotunes,
+captures mixed/full graphs and completes exactly 16 input + 1 output token.
+Its cold 0.06 req/s is non-binding. One first-inference
+`_causal_conv1d_fwd_kernel` JIT warning remains a warmup/trace audit item.
+
+A separate text-only `vllm serve` smoke on port 8001 loaded the same snapshot,
+returned `/health` 200, then returned `/v1/completions` 200 for `Hello` with
+exact prompt/completion usage 1/1 and `finish_reason=length`. Evidence is
+`~/work/vllm-oracle-v0.25.0-stage-validation/2026-07-12-server-smoke`;
+server log/response SHA-256 are
+`f56be69a4325bb7c165aba08ea25abe9e2c43d4dd49e060034c14dc65da23787`
+and `82307db4b8fca30adb77c9518520d979249287caad2a7037612d7d42cb7d78e1`.
+Cleanup returned port/GPU/lock idle. The previous canonical directory was moved
+unchanged to `~/venvs/vllm-oracle-v0.24.0-retired`; canonical
+`~/venvs/vllm-oracle` is now a symlink to the validated v0.25 stage, preserving
+the stage venv's absolute shebangs. Canonical imports report
+`0.25.0 / 0.6.13 / 2.11.0+cu130 / 5.13.1 / 2.2.3`.
+
+The benchmark code now requires executable oracle vLLM 0.25.0 and client source
+commit `702f481` in manifests while `.agents/upstream-sync.md` separately keeps
+the porting pin at `e24d1b24` until target goldens/behavior/model gates and the
+fresh denominator close. Focused client/summarizer tests pass 14/14; Python
+compilation, shell syntax and diff checks pass. This checkpoint changes no
+local inference algorithm and accepts no performance number.
+
+The user-provided SGLang report was audited from
+`Weschera/qwen-sglang-dgx-spark` commit
+`03253ef98c01de59a21c85b9a5cc6a27a871c383`, `spark-bench` `dac4e108`, and
+SGLang tag v0.5.15 commit `f63458b5beaceabbd9d749b9fc956370e1b649e6`.
+The repository itself withdraws its original 10–40x comparison: tier2 sent an
+identical prompt to every stream, SGLang radix caching was on and the checked-in
+vLLM command explicitly disabled prefix caching. Cache-off data slightly favors
+vLLM. The remaining cache-on claim is plausible but unproven: all numbers are
+35B, SGLang 0.5.15 is compared to vLLM 0.23.1, vLLM 0.25 cache-on is absent,
+the arms mismatch FP8 versus likely BF16 KV and 0.7/0.75 memory, both enable MTP,
+cells have only one or two runs, and the harness omits full axes, native token
+correctness, cache-hit/no-eviction proof, memory and paired traces.
+
+Source establishes that vLLM v0.25 hybrid models default prefix caching off,
+but explicit enable resolves Qwen3.5/3.6 to `mamba_cache_mode=align`; Qwen
+rejects `all`. SGLang v0.5.15 instead selects `MambaRadixCache` with separate
+full/Mamba state, so a residual implementation advantage could be real. It
+must be measured. A new stable backend row
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` now separates deterministic shared-prefix
+cache-on from the existing cache-neutral gate. Its accepted extension pins
+SGLang v0.5.15/image digest `d0a667e`, exact BF16/no-spec 64k and 256k
+reset→seed→timed-branch corpora, equal byte capacity, native hits/no eviction,
+three repetitions, every throughput/latency/memory axis, correctness and paired
+traces. PX1 harness/counters is READY; PX2 begins by writing the dedicated
+`KV-MAMBA-ALIGN` spike. The faster equivalent SGLang/vLLM result binds per axis,
+27B before 35B. No SGLang image was pulled, no SGLang model/GPU command ran and
+no external scalar is accepted. Backend inventory is now 52 rows.
+
+Next exact order: commit/push this oracle/audit checkpoint; create a fresh
+SHA-bound evidence tree; run the complete v0.25 27B cache-off c1-c32 grid and
+paired traces under one uninterrupted lock; modernize or delete only the
+highest-ranked executed difference; repeat until every 27B throughput, latency
+and memory axis closes. Then execute the shared-prefix PX1 and Mamba-align leaf,
+close 27B cache-on, and only then spend 35B. DSpark, TLI, LMCache/external KV
+and the rest of roadmap_v1 remain queued behind speed closure.

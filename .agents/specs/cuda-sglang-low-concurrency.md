@@ -2,9 +2,14 @@
 
 **Owning rows:** `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` for the independently
 claimable harness/checkpoint work; `BACKEND-GATE-CUDA-SGLANG` for the binding
-campaign after async serving closes.
-**Recommendation:** the preflight row is `READY`; the binding gate is
-`BLOCKED` until `SERVE-ASYNC-LLM` provides real incremental HTTP streaming.
+cache-neutral campaign after async serving closes; and
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` for the distinct deterministic shared-prefix
+cache-on gate.
+**Recommendation:** the implemented preflight row remains `GATING`; the
+cache-neutral binding gate is `BLOCKED` until `SERVE-ASYNC-LLM` provides real
+incremental HTTP streaming. The fully scoped shared-prefix row is `READY` for
+harness/instrumentation work, while its binding run is dependency-blocked on
+exact SGLang v0.5.15 equivalence, `KV-MAMBA-ALIGN`, and async serving.
 
 This is the leaf spike required by the
 [competitive benchmark matrix](competitive-benchmarks.md) and the
@@ -16,7 +21,7 @@ packages before anyone installs SGLang or consumes the shared GPU.
 
 | In scope | Out of scope |
 |---|---|
-| NVIDIA CUDA on `dgx.casa` (GB10, sm121, aarch64) | Large-concurrency throughput gates, which remain owned by vLLM parity |
+| NVIDIA CUDA on `dgx.casa` (GB10, sm121, aarch64) | Generic large-concurrency throughput gates, which remain owned by vLLM parity; the dedicated shared-prefix extension intentionally includes c32 |
 | Qwen3.6 27B dense and 35B-A3B MoE text-only serving | Vision/audio inputs and multimodal encoder performance |
 | Concurrency `1,2,4,8,16`, production graphs, streaming completions | SGLang tuning that changes model semantics or disables production features |
 | Exact shared checkpoint/quantization first; vLLM and vllm.cpp arms always present | Ratios between different checkpoints, architectures, or converted weights |
@@ -36,6 +41,8 @@ against one tokenizer snapshot.
 | vLLM oracle | local pin `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`, `~/venvs/vllm-oracle` | Production CUDA graphs remain enabled; never use `--enforce-eager` |
 | vllm.cpp | commit under test, recorded per run | [server CLI](../../examples/server/main.cpp), [OpenAI transport](../../src/vllm/entrypoints/openai/api_server.cpp) |
 | Load client | SGLang `bench_serving` from the same pinned image | It maps both `sglang-oai` and `vllm` to the same OpenAI completions request function ([lines 874-887](https://github.com/sgl-project/sglang/blob/28b095c01005d4a3a2a5b637b7d028b07fba31b2/python/sglang/bench_serving.py#L874-L887)) |
+| Shared-prefix candidate | SGLang tag `v0.5.15`, commit `f63458b5beaceabbd9d749b9fc956370e1b649e6`; image `lmsysorg/sglang:v0.5.15-cu130@sha256:d0a667eca4e6fff64f7758c5fb1720e16faa806f90ea767e018bb8fa1b09dd44` | This newer pin applies only to `BACKEND-GATE-CUDA-SGLANG-PREFIX` until the existing P1 harness is deliberately repinned and re-gated; it is never substituted silently into old v0.5.13 evidence. |
+| Referenced DGX recipe | `Weschera/qwen-sglang-dgx-spark` commit `03253ef98c01de59a21c85b9a5cc6a27a871c383`; `spark-bench` commit `dac4e108` | The repository withdraws its original 10--40x claim as a cache-on/cache-off mismatch ([README lines 7-12](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/README.md#L7-L12)); its remaining cache-on figures are inputs to reproduce, not accepted evidence. |
 
 The official image is a verified production/runtime artifact, not a floating
 `latest` tag. Provisioning must additionally record the resolved
@@ -471,6 +478,140 @@ P1/P2 preflight work and `SERVE-ASYNC-LLM` can run concurrently in separate
 worktrees. P3 claims the distinct binding-gate row only after both dependencies
 close; an image load alone cannot release it.
 
+## Shared-prefix extension (2026-07-12)
+
+This section is the accepted implementation spike for
+`BACKEND-GATE-CUDA-SGLANG-PREFIX`. It does not reinterpret the existing
+cache-neutral P1 artifacts and it does not accept the external repository's
+numbers. It adds a separately reproducible feature gate because cache-neutral
+serving and cache-hit serving exercise different engine paths.
+
+### Source/config audit of the reported win
+
+| Finding | Evidence | Disposition |
+|---|---|---|
+| The original 10--40x claim was a configuration mismatch. | The recipe itself says every concurrent stream received an identical prompt while SGLang radix caching was on and vLLM prefix caching was explicitly off ([README lines 7-12](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/README.md#L7-L12)); its checked-in vLLM launch still carries `--no-enable-prefix-caching` ([serve-vllm lines 19-24](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/serve-vllm.sh#L19-L24)). | Definitely not an engine-throughput comparison. Reproduce cache-off and cache-on as different gates. |
+| The corrected cache-off data slightly favors vLLM. | At 64k/c2,c8,c32 the CSV reports SGLang 25.7/28.6/29.8 output tok/s versus vLLM 0.23.1 26.8/30.0/31.3; its only vLLM 0.25.0 point is cache-off c32 at 30.6 ([results](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/results/results.csv)). | Consistent with a configuration issue, but not project-grade evidence: old/mixed vLLM versions, one scalar throughput field, and incomplete repetitions/requests. |
+| A residual cache-on SGLang lead is plausible but unproven. | The CSV reports 35B-only SGLang/vLLM 0.23.1 values of 324.4/261.6 at 64k/c32, 85.3/63.8 at 256k/c2, and 133.8/92.6 at 256k/c8; the README says these cells have only one or two runs ([README lines 61-72](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/README.md#L61-L72)). | Candidate to reproduce, never a denominator. There is no vLLM 0.25 cache-on result in the repository. |
+| The launch policies are not equivalent. | The checked-in vLLM arm forces FP8 KV cache and memory fraction 0.7 while the SGLang arm leaves KV dtype at `auto` and uses 0.75 ([vLLM lines 19-24](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/serve-vllm.sh#L19-L24), [SGLang lines 18-24](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/serve-sglang.sh#L18-L24)). SGLang `auto` means model dtype at `server_args.py:558-570` in `f63458b`; this checkpoint has no FP8 KV declaration. Both arms also enable three-token MTP using different frontends. | First isolate cache implementation with BF16 KV and speculative decoding off. Equal byte capacity replaces unequal memory fractions. Add a later composed MTP gate; never mix it into the cache attribution run. |
+| vLLM does support Qwen hybrid prefix caching, but not by default. | vLLM v0.25.0 `vllm/config/model.py:1845-1900` returns unsupported for a hybrid model's default policy. An explicit enable resolves `mamba_cache_mode=align`, block-aligned state retention, and required chunked prefill at `vllm/model_executor/models/config.py:558-602`; Qwen3.5 rejects `all` and names `align` at `vllm/model_executor/models/qwen3_5.py:294-301`. | The matched vLLM arm must say `--enable-prefix-caching --mamba-cache-mode align`; relying on a generic dataclass default is invalid. |
+| SGLang has a structurally different hybrid-cache path. | SGLang v0.5.15 chooses `MambaRadixCache` for hybrid SSM models at `python/sglang/srt/mem_cache/registry.py:78-131`; its cache owns separate full/Mamba LRU state and prefix matching at `mamba_radix_cache.py:424-523`. | This is a credible source-level reason a residual gap could be real. Only matched hit proof, timing, memory, and paired traces decide whether it is faster on GB10. |
+| The external harness is insufficient for this project's gate. | `spark-bench` tier2 sends the same prompt to each stream; the published CSV exposes aggregate output throughput, one TTFT percentile, completion count, and notes. It does not prove token-ID correctness, cache-hit length, full TTFT/TPOT/ITL/E2E percentiles, request/s, peak memory, no eviction, three clean repetitions, or paired kernel traces. | Retain it as a reproduction lead only. The project harness must emit the complete evidence contract below. |
+
+### Two workload classes, never one blended score
+
+| Class | Cache policy | Corpus | Purpose |
+|---|---|---|---|
+| Cache-neutral | Explicitly off on all three arms: SGLang `--disable-radix-cache`; vLLM/vllm.cpp `--no-enable-prefix-caching` | Existing exact 1024/128 disjoint corpus; pairwise common prefix no more than 32 tokens | Scheduler/kernel/frontend comparison without cache hits. Remains owned by `BACKEND-GATE-CUDA-SGLANG`. |
+| Shared-prefix | Explicitly on: SGLang Mamba radix; vLLM `align`; vllm.cpp `KV-MAMBA-ALIGN` | Exact common prefix followed by disjoint per-request suffix; separate 64k and 256k shapes | Cache lookup, GDN/Mamba-state retention, shared physical blocks, branch admission, and hit-path latency. Owned only by `BACKEND-GATE-CUDA-SGLANG-PREFIX`. |
+
+Every report presents both classes side by side. A cache-on result never closes
+cache-neutral parity, and cache-neutral parity never claims cache-on support.
+The faster equivalent reference is selected independently for every metric and
+workload point.
+
+### Canonical shared-prefix corpus
+
+| Shape | Exact common prefix | Exact unique suffix | Exact input/output | Concurrency | Repetitions |
+|---|---:|---:|---:|---|---:|
+| 64k | 63,488 IDs | 1,024 IDs | 64,512 / 128 | 2, 8, 32 | 3 independent reset/seed/run repetitions |
+| 256k | 260,096 IDs | 1,920 IDs | 262,016 / 128 | 2, 8 | 3 independent reset/seed/run repetitions |
+
+The project tokenizer generates and verifies the common segment and every
+suffix; all three engine tokenizers must reproduce the stored IDs exactly. The
+suffixes are pairwise disjoint from one another and from warmup. Output is
+greedy, `ignore_eos=true`, exactly 128 native IDs, and speculative decoding is
+off. Each repetition performs this sequence under one server lifetime and one
+GPU lock:
+
+1. reset the engine cache and counters and prove zero starting hits;
+2. issue one untimed seed request containing the exact common prefix, wait for
+   its insertion, and record cold-fill latency and memory separately;
+3. snapshot cache counters/capacity, then issue exactly one simultaneous timed
+   wave of the stored unique branches at the target concurrency;
+4. prove every request hit the expected engine-specific aligned common length,
+   no block/state was evicted, and only each suffix plus the mandatory final
+   common-prefix token was computed;
+5. retain native output IDs, raw streaming events, cache-counter deltas, memory
+   samples, server logs, and thermal state; then reset before the next point.
+
+The 256k shape is mandatory after 64k closes, not a substitute for it. It may be
+marked `PENDING hardware capacity` only with the measured capacity calculation
+and next command; an OOM, timeout, or eviction is a failed/void run, never a
+smaller silently substituted context.
+
+### Matched server policy
+
+- All arms use BF16 KV/SSM storage for the first binding cache gate. SGLang must
+  receive `--kv-cache-dtype bf16`; vLLM receives `--kv-cache-dtype auto` only
+  after startup proves BF16, otherwise use its explicit BF16 spelling. Ours
+  records the exact native dtype. A later FP8-KV matrix row may add a separate
+  equal-FP8 gate.
+- Speculative decoding, tool/reasoning parsing, LoRA, multimodal work, and
+  external KV connectors are disabled. After the isolated cache gate closes,
+  repeat a composed MTP-on production gate under the speculative-decoding row.
+- Chunked prefill is enabled and maximum batched tokens is exactly 8192 on all
+  arms. The reported recipe warns that 65,536 hung the GB10; no campaign may
+  probe that value ([README lines 99-101](https://github.com/Weschera/qwen-sglang-dgx-spark/blob/03253ef98c01de59a21c85b9a5cc6a27a871c383/README.md#L99-L101)).
+- Usable cache capacity is matched in bytes and usable token/state slots, not
+  by nominal memory-fraction flags. Record page/chunk sizes, full-attention KV
+  bytes, GDN state/checkpoint bytes, reserved graph/workspace bytes, and the
+  maximum no-eviction branch count before timing.
+- Production CUDA graphs remain enabled. The same immutable checkpoint,
+  language-only path, quantization semantics, tokenizer, seed, output length,
+  request order, and host client drive every arm.
+
+### Hit proof, metrics, and traces
+
+vLLM evidence includes the deltas of `vllm:prefix_cache_queries` and
+`vllm:prefix_cache_hits` (`vllm/v1/metrics/loggers.py:547-564,1088-1092` at
+`702f481`) plus per-request cached-token counts and the resolved `align` startup
+log. SGLang evidence includes the selected `MambaRadixCache`, per-request matched
+prefix length from scheduler/cache instrumentation, full/Mamba protected and
+evictable sizes before/after, and an explicit zero-eviction assertion. vllm.cpp
+must expose equivalent native counters under `KV-MAMBA-ALIGN`; log inference or
+faster TTFT alone is not hit proof.
+
+For every point, retain request/s; input, output, and total tok/s; mean and
+P50/P90/P99 E2E, TTFT, TPOT and ITL plus P95/max ITL; cold-fill time; exact hit
+length/rate; completed/errors/concurrency; process-tree PSS/RSS; host
+`MemAvailable` delta; numeric accelerator memory when available; and three-run
+spread/CV. Correctness remains 16/16 engine-native output IDs against the fresh
+vLLM oracle before SGLang can bind. A cache hit is never allowed to trade away
+token equality.
+
+Capture warmup-excluded system-wide CUDA traces for all three engines at
+64k/c32 and 256k/c8, with the seed/fill outside the timed NVTX range. Diff
+kernel names, launches, GPU time, computed-token counts, cache/state copies,
+and host gaps. Trace names are ground truth for the actual selected runtime
+path; source similarity is not.
+
+### Tests to port/add for the prefix row
+
+| Source | Local requirement |
+|---|---|
+| vLLM `tests/v1/e2e/general/test_mamba_prefix_cache.py` at `702f481`, including repeated/shared-prefix hit checks around lines 755-757, 991-993 and 1042-1047 | Port exact Qwen hybrid align hit/miss, block-boundary, branching, no-eviction, output-equivalence, reset, and counter tests into KV-manager and gate-model tiers. Unsupported tests land skipped with a tracked row reason. |
+| SGLang v0.5.15 `MambaRadixCache.match_prefix`, insertion, finished-request caching, split/eviction and Mamba/full LRU tests | Re-express the behavioral cases against `KV-MAMBA-ALIGN`; do not copy the Python data structure as a new incompatible cache abstraction. |
+| `Weschera/spark-bench` identical-prefix tier2 behavior | Corpus contract test proves byte-stable common IDs, suffix divergence, exact lengths, simultaneous admission, reset/seed order, and that cache-off reports zero hits while cache-on reports the expected aligned hit. |
+| Project benchmark protocol | Synthetic raw artifacts exercise every metric, faster-per-axis floor selection, missing-hit/eviction/dtype/spec mismatch voiding, three-repetition enforcement, and 64k/256k separation. |
+
+### Prefix-row work breakdown and gate
+
+| Order | Deliverable | Exit condition |
+|---|---|---|
+| PX1, CPU/read-only | Repin the competitor wrapper to SGLang v0.5.15 `f63458b`, add deterministic long-prefix corpus/manifests, cache counters, equivalence validation, and synthetic tests | No GPU; exact image/source/model/client hashes and all fail-closed contracts pass. |
+| PX2, engine | Write `specs/mamba-align-retention.md`, then implement `KV-MAMBA-ALIGN` plus native hit/eviction/capacity counters and ported tests | Unit/integration tests prove aligned Qwen GDN/full-attention retention, branching, reset, no eviction, and output identity. |
+| PX3, GPU preflight | Exact 27B load/token/dtype/capacity/hit proof for all three arms; SGLang v0.5.15 image platform digest verified | Three equivalent arms or an explicit non-equivalence/blocker; no performance claim. |
+| PX4, 27B gate | Three repetitions of all 64k then 256k points and paired traces under one uninterrupted series lock | Ours meets or beats the faster equivalent vLLM/SGLang result on every throughput, latency, and memory axis; exact outputs/hits/no-eviction are preconditions. |
+| PX5, 35B gate | Run only after every applicable 27B cache-off and cache-on axis passes and exact 35B SGLang quant equivalence is proven | Same every-axis rule for 35B; otherwise the row remains open with the exact failed axis. |
+| PX6, composed production | MTP enabled equivalently after the isolated cache and speculative-decoding rows close | Separate report attributes composition; it cannot retroactively replace PX4/PX5. |
+
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` closes only when both models' applicable
+64k/256k points satisfy correctness, hit/no-eviction, every-axis performance,
+memory, trace, and reproduction gates. Until then its state may advance through
+implementation/gating, but no external scalar is published as an accepted
+project result.
+
 ## P1 CPU checkpoint (2026-07-11)
 
 `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` P1 is implemented and handed to
@@ -522,7 +663,10 @@ campaign remain open.
 | HTTP/client implementation differs | Same pinned SGLang OpenAI completions function drives every endpoint; backend name only selects URL semantics. |
 | A faster result uses different output or checkpoint | Correctness, length, corpus, model, and quantization checks are preconditions. The result is otherwise void. |
 
-There is no remaining product choice in this spike. The preflight row
-`BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `READY`; the binding row
-`BACKEND-GATE-CUDA-SGLANG` is `BLOCKED` until its two dependencies close. The
+There is no remaining product choice in this spike. The implemented preflight
+row `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `GATING`; the cache-neutral row
+`BACKEND-GATE-CUDA-SGLANG` remains `BLOCKED` until its two dependencies close.
+The new `BACKEND-GATE-CUDA-SGLANG-PREFIX` row is `READY` for PX1 work; PX2
+starts by writing the dedicated `KV-MAMBA-ALIGN` leaf spike. Its binding
+performance run remains dependency-blocked as specified above. The
 35B SGLang floor remains conditional on exact-artifact compatibility evidence.

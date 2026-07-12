@@ -8,85 +8,36 @@ library (llama.cpp-style) with a C API, an example CLI, and an
 OpenAI-compatible server.
 
 > ⚠️ **Pre-release, under heavy development.** Both NVFP4 gate models —
-> **Qwen3.6-35B-A3B** (MoE hybrid) and **Qwen3.6-27B** (dense W4A4) — now run the
-> full paged engine end-to-end on **NVIDIA GB10** (DGX Spark, sm_121a) with
-> **token-exact greedy correctness gates passing**. Performance parity is
-> currently **GATING**. The exact clean pushed-`b5c6e4f` cache-off,
-> closed-loop 27B campaign validates all 12 performance groups, **2,016/2,016**
-> timed requests, six memory returns, the commit-bound model gate and paired
-> traces, but remains below the every-axis floor. Median total-throughput ratios
-> at c1/2/4/8/16/32 are **0.993/0.952/0.966/0.976/1.021/1.022×**, with
-> **4/4/5/4/17/14 of 20** throughput+latency axes and **2/4** memory axes
-> passing. W2 materially improves the prior checkpoint and wins total throughput
-> at c16/c32, but mean TPOT/ITL remains **1.76%/1.66% slower** there; c2 is still
-> **4.80%** below vLLM. Host PSS/RSS also remain above the oracle even though
-> GPU and whole-system available-memory-drop axes pass. The execution trace
-> gives a concrete next lever: vLLM spends about **25.1%** of captured kernel
-> time in its 128×32×256 Stream-K/static-persistent FP4 pair, while our runtime
-> planner predominantly selects 128×128×128 and 256×128×128 tactics despite
-> the full 32-tactic family being present. Inspection of the actual pip-vLLM
-> runtime confirms it pre-tunes every FP4 bucket in memory using three warmups,
-> a stream sync, a **1-ms GPU delay**, and ten eager event repeats; its file
-> cache is disabled because of key collisions. W3-A stages that exact delayed
-> timing window with `VT_FP4_AUTOTUNE_DELAY=0` restoring W2. Clean
-> immutable `71f1e89` delayed/off focused tests each pass **14/14**, both native
-> 27B arms pass **235/235** with the full **16/16** oracle stream, and delayed
-> memcheck passes **16,389/16,389 with zero errors**. Its real-model plans now
-> include the oracle's ID 6 Stream-K and ID 4 static 128×32×256 tactics on hot
-> shapes. The completed c16/96 delayed/off AB/BA/AB is positive in mean total
-> throughput (**809.932/803.379 tok/s = 1.008156×**) but fails strict standalone
-> acceptance at **13/20 timing** and **2/4 memory** axes; only **5/35** common
-> delayed plan keys keep one tactic ID across all three fresh processes. No
-> accepted speed credit or vLLM denominator changes. The faithful delayed
-> default stays inside active W3. W3-B now implements the shared-library
-> pre-serve repair: a true-W4A4 `LoadedEngine` runs one 2,048-token synthetic
-> request before `AsyncLLM` or HTTP readiness, and each live FP4 projection
-> materializes all 16 FlashInfer hybrid buckets in memory. Clean pushed
-> `d7cdf66` now passes registry/loader contracts, exact and legacy focused tests
-> (**14/14, 26,819/26,819** each), native 27B (**235/235 + 16/16**), memcheck
-> (**24,586/24,586, zero errors**) and HTTP readiness. Both model and server
-> cache **80/80** profiles before real work/listening and report zero lazy
-> misses. The repeated c16/96 shipping-prewarm/lazy AB/BA/AB then completes all
-> **576/576** timed requests and six memory returns. Means are
-> **808.457/808.220 tok/s = 1.000293×** (CV **0.360%/0.097%**), but strict
-> acceptance **FAILS** at **15/20 timing** and **2/4 memory** axes. Prewarm
-> materializes the same 80 keys in every process, yet only **20/80** retain one
-> tactic ID (lazy: **9/30**); it therefore does not repair selection stability.
-> It does reproducibly move first-use work before readiness: the untimed
-> preflight's mean first chunk falls from **5.662 s to 0.779 s** and its full
-> request from **20.249 s to 14.929 s**. The production-faithful default stays,
-> but receives no steady-state speed credit and changes no vLLM denominator.
-> The first three-arm trace attempt remains **VOID**, but its corrected
-> immutable-root replacement now succeeds under one whole-series lock:
-> prewarm, lazy, and pinned vLLM each complete **144/144** retained requests,
-> all six cache inventories remain exactly **49 files** with the same digest,
-> and all three memory returns pass. Node-traced FP4 kernel sums are
-> **110.623/114.229/109.932 s**; prewarm removes the lazy arm's **480** retained
-> delay launches and lands within **0.63%** of vLLM. The 128x32x256 narrow pair
-> is also structurally aligned at **70.333/70.986 s** and
-> **218,434/220,465** calls, although its Stream-K/static split differs.
-> Profiled rates are diagnostic only: prewarm/vLLM total throughput is
-> **1.0082x**, while normalized mean TPOT is still **0.9673x**. Thus the trace
-> closes W3's original tactic-family mismatch but does not replace the binding
-> clean grid. The clean pushed-`3cc490c` exact W3-B c1-c32 campaign is now
-> **ACTIVE** under one model-wide DGX lock. Its commit-bound 27B gate passed,
-> the deterministic corpus/cache inventory validated, and ours repetition 1
-> completed all six points plus memory return; vLLM repetition 1 is in progress.
-> These partial arms publish no ratio and do not replace `b5c6e4f`; classification
-> waits for all 36 timed groups, six returns, and the paired trace. Optional versioned
-> persistence is separately gated in W3-C and is not the oracle denominator.
-> The 27B-only BF16 GDN output default remains correctness-required;
-> every 35B path retains f32. No production-parity claim is made, and the 35B
-> campaign remains held until 27B passes every axis. Historical
-> temperature/token-budget-mismatched ratios
-> remain diagnostics only. The tables track real, tested support and are kept
-> current as work lands (see
-> `.agents/`). CPU multithreaded dispatch is now
-> correctness-gated, but its real-file throughput/RSS checkpoint is still open.
-> The current serving checkpoint implements native-ID final/continuous stream
-> usage for completion and chat and is CPU/ASan/UBSan/TSan-green; the fresh
-> two-model online latency rerun remains `GATING`. The prior `8289cbd`
-> partial 27B arm is **void** and contributes no public ratio.
+> **Qwen3.6-35B-A3B** and **Qwen3.6-27B** — run the full paged-KV engine on
+> **NVIDIA GB10** with token-exact greedy correctness gates passing. Performance
+> parity is **GATING**, and no current end-to-end ratio is binding while the
+> production oracle moves to [vLLM v0.25.0](https://github.com/vllm-project/vllm/releases/tag/v0.25.0)
+> at `702f481`.
+>
+> The previous exact 27B floor (`b5c6e4f`) used vLLM 0.24.0 with FlashInfer
+> 0.6.12. It remains useful historical evidence—totals
+> **0.993/0.952/0.966/0.976/1.021/1.022×** at c1/2/4/8/16/32—but it is
+> superseded because even the source pin required FlashInfer 0.6.13. The
+> replacement `3cc490c` attempt is **VOID**: it was stopped after **28/36**
+> groups, **1,602/2,016** timed requests and four memory returns, before its
+> paired trace, once the oracle drift was proven. No partial rate is published.
+>
+> The v0.25 audit found no obsolete local legacy PagedAttention source to
+> remove: upstream deleted only `paged_attention_v1/v2`, while this project uses
+> a live backend-neutral paged-KV contract with current FA2/fallback kernels.
+> It also confirms the next FP4 candidates remain current: v0.25 still consumes
+> directly swizzled scale factors with zeroed unread padding and a model-owned
+> device `alpha` pointer. The exact v0.25 oracle is now validated and active;
+> we will modernize or delete paths only when the fresh paired trace proves
+> they are obsolete. Every 27B speed, latency and memory axis must pass before
+> 35B runs; broader roadmap work—including newly explicit **DSpark** support—
+> waits behind parity.
+>
+> The exact post-pin audit classifies **145** commits as **94 inventory / 51
+> ignore / 0 immediate runtime ports** for the currently implemented Qwen T0
+> slice. Dedicated live rows now cover DSpark, heterogeneous-vocabulary TLI,
+> the unified Streaming Parser Engine, non-DP MoE sequence parallelism,
+> per-request response timings, and the three new v0.25.0 registry targets.
 
 ## What's implemented (CPU, behaviorally tested)
 
@@ -218,7 +169,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10; token-exact greedy correctness gates pass. The exact clean `b5c6e4f` 27B online checkpoint is valid but below the all-axis floor: c1→c32 total ratios are 0.993/0.952/0.966/0.976/1.021/1.022×, with 4/4/5/4/17/14 of 20 performance axes and 2/4 memory axes. FP4 W3-B pre-tunes all live buckets before frontend readiness and is immutable build/correctness/safety-green at `d7cdf66` with 80/80 profiles, zero misses, 16/16 tokens and zero memcheck errors. Its repeated prewarm/lazy component is steady-state neutral at **1.000293×** and strict-fails **15/20 timing, 2/4 memory**; the first request improves. The corrected three-arm trace is lifecycle-clean and puts prewarm FP4 kernel time within **0.63%** of vLLM, but profiled normalized mean TPOT remains **0.9673x**, so no denominator changes. 35B performance is held behind the fresh W3-B 27B grid and complete 27B closure. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged text engine + basic server/tool/grammar subsets; correctness gated, production-vLLM performance `GATING` |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. Historical vLLM 0.24.0/FlashInfer 0.6.12 rates are diagnostic only; the v0.25.0 oracle has passed real 27B production-graph generation and server smoke, while a fresh binding c1-c32 grid/trace remains pending. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 production performance `GATING` |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -228,7 +179,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged text stack running on GB10**: vendored torch-free kernels (CUTLASS NVFP4/FP8, cuBLASLt, FA-2, Triton-AOT GDN, Qwen-specific CUDA-graph decode); both 27B + 35B greedy correctness gates pass. Exact clean `b5c6e4f` 27B online total throughput is 0.952-1.022× vLLM over c2-c32 medians (c1 0.993×), but the all-axis gate remains red at 4/4/5/4/17/14 of 20 axes and 2/4 memory axes. The fixed HTTP pool remains healthy/neutral. Device-resident cache W0 (+2.1239%) and indexed GDN state-I/O W1 (+0.6246%) retain their separate component evidence. FP4 W2 includes the full 32-tactic SM12 family, merged CT gate/up semantics and fused one-input SiLU→NVFP4 quantization; focused CUDA/sanitizer/model gates pass. W3-A's exact 1-ms GPU-delayed eager timing mirror is immutable sm_121a correctness/safety-green at `71f1e89`; its c16 component is +0.816% mean total throughput but fails strict 13/20 timing and 2/4 memory acceptance. W3-B's shared-loader max-token warmup is immutable build/correctness/safety-green at `d7cdf66`: 80/80 profiles cover 16 buckets across five real 27B shapes before HTTP readiness, with zero lazy misses, 16/16 tokens and 24,586/24,586 memcheck assertions. Its repeated component is neutral at **808.457/808.220 tok/s = 1.000293×**, strict-fails **15/20 timing and 2/4 memory**, and first-use latency improves. Trace attempt 1 remains **VOID**, while corrected attempt 2 completes all three **144/144** arms with identical 49-file cache inventories and three memory returns. Prewarm/lazy/vLLM FP4 kernel sums are **110.623/114.229/109.932 s**; prewarm removes 480 lazy delay launches and matches the oracle aggregate within **0.63%**. The narrow pair is **70.333/70.986 s** and **218,434/220,465** calls, so the original wide-tactic structural gap is closed. Profiled normalized mean TPOT is nevertheless **0.9673x** and is diagnostic only; the fresh exact W3-B c1-c32 gate remains open, so `b5c6e4f` stays binding. The vendored BF16 GDN output path remains the 27B-only default, while 35B stays on f32. Both models are W0 compute-sanitizer access-clean and the indexed op is memcheck-clean; inherited process-lifetime pools still fail the zero-leak gate |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. End-to-end rates against vLLM 0.24.0 + FlashInfer 0.6.12 are now historical diagnostics; `3cc490c` is VOID at 28/36 groups after the dependency drift was found. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved; the exact fresh 27B grid and paired traces will re-rank modernization/removal and FP4 topology work. No 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -265,7 +216,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10**: W4A16 MoE (35B, Marlin + fp4-resident) and W4A4 dense (27B, CUTLASS 4.5 SM12 fp4×fp4 + fp8-W8A8 attn/GDN); token-exact greedy gates pass. The 27B path includes the 32-tactic FlashInfer surface, merged gate/up CT scaling, fused SiLU→NVFP4 quantization, and W3-B shared-loader all-bucket pre-tuning. Clean `d7cdf66` is 80/80 profiles, zero lazy misses, 16/16 token-green and memcheck-zero. Its repeated component is **1.000293×**, but strict-fails **15/20 timing and 2/4 memory** with only **20/80** prewarmed tactic IDs stable. The corrected trace puts aggregate FP4 kernel time within **0.63%** of vLLM while leaving profiled decode TPOT red; performance remains `GATING` |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged gate/up CT semantics, fused SiLU→NVFP4 quantization and pre-serve bucket tuning. v0.25.0 still requires directly swizzled scales with zeroed unread padding and a resident device `alpha`, so those trace-grounded candidates remain current; performance is `GATING` on the new-oracle trace and exact grid. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -278,67 +229,38 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   run the full paged engine end-to-end, and their real-model **token-exact greedy
   correctness gates pass**. The CUDA kernel paths exercised by those gates are
   validated on real hardware.
-- **Production-vLLM performance is below the exact gate.** The historical 35B
-  1.0195× and
-  27B 1.007× offline ratios were produced with vLLM's
-  `bench throughput` default `temperature=1.0`, while vllm.cpp used greedy
-  `temperature=0`; the 27B vLLM arm also resolved an 8192-token scheduler budget
-  while vllm.cpp used 2048. Those measurements and their memory observations
-  remain useful diagnostics, but they are not identical-workload acceptance
-  evidence. The replacement clean pushed-`b5c6e4f` 27B online series is exact
-  and binding: all 12 groups validate, but no concurrency passes all 20
-  performance axes. Median total throughput is
-  0.993/0.952/0.966/0.976/1.021/1.022× vLLM from c1 through c32;
-  performance-axis counts are 4/4/5/4/17/14 of 20, and host PSS/RSS remain
-  above vLLM. All three fixed
-  c32 repetitions complete without the former unread-socket tail. The separate
-  same-binary c32 fixed/legacy series is neutral within noise (0.999764× total
-  throughput, 0.541%/0.311% CV) and its bounded legacy arms stay healthy, so it
-  establishes capacity/lifecycle behavior rather than a steady-state speed win.
-  W2 now ports the complete 32-tactic family, merged gate/up/max-divisor
-  contract and fused one-input SiLU→NVFP4 producer. All focused correctness and
-  access-safety gates pass, and the new binding checkpoint improves every
-  concurrency versus `bce2627`; c16/c32 total throughput now pass. The residual
-  is decode-shaped: c1-c8 throughput remains below vLLM and mean TPOT/ITL is
-  1.76%/1.66% slower at c16/c32. The fresh traces show why availability alone
-  did not close it: vLLM spends about 25.1% of captured kernel time in the
-  128x32x256 Stream-K/static-persistent pair, while our live planner is
-  dominated by 128x128x128 and 256x128x128 tactics. The actual pip runtime
-  pre-tunes in memory and inserts a 1-ms GPU delay before its eager event
-  window; its persistent file cache is explicitly disabled. W3-A's exact
-  delayed timing mirror is now staged behind
-  `VT_FP4_AUTOTUNE_DELAY=0`. Immutable `71f1e89` passes focused delayed/off,
-  delayed memcheck and both 27B correctness arms; delayed selection resolves
-  the oracle's 128x32x256 Stream-K/static IDs on the hot output/gate-up/Q
-  shapes. The completed c16/96 AB/BA/AB averages **809.932/803.379 tok/s =
-  1.008156×**, but fails strict no-regression at 13/20 timing and 2/4 memory;
-  delayed tactic IDs are stable for only 5/35 common keys. W3-A therefore gets
-  no standalone speed acceptance. W3-B now moves tuning into the common loader:
-  one maximum-token synthetic request expands each observed W4A4 N/K shape over
-  FlashInfer's full hybrid bucket list before any frontend becomes ready;
-  `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Clean immutable `d7cdf66`
-  materializes **80/80** profiles (16 buckets × five shapes), reports zero lazy
-  misses, preserves **16/16** token parity, passes focused memcheck with zero
-  errors, and logs completion before server listening. Its repeated component
-  averages **808.457/808.220 tok/s = 1.000293×** versus lazy W3-A and fails
-  strict acceptance at **15/20 timing** and **2/4 memory**; only **20/80**
-  prewarmed keys keep one tactic ID across three fresh processes. The untimed
-  first request is materially faster (**0.779/5.662 s** mean first chunk), so
-  the production-faithful default stays without steady-state speed credit.
-  Corrected paired tracing now completes all three 144-request arms under one
-  lock and proves W3-B's FP4 aggregate is within 0.63% of vLLM, but its profiled
-  mean TPOT remains 3.38% slower; those node-traced rates are diagnostic. The
-  fresh exact W3-B c1-c32 oracle gate remains open, while W3-C's collision-complete
-  persistence is optional and separately gated. The existing BF16
-  GDN output path is also now default only for the dense 27B because it mirrors
-  vLLM and restores the full native token stream; its +0.799% c16 component
-  passes 16/20 timing and 2/4 memory axes, so `VT_GDN_OUT_BF16=0` remains the
-  required f32 diagnostic and the GDN row stays `ACTIVE`. Every 35B path keeps
-  its prior f32 default. This is a concrete
-  runtime repair, not a hardware ceiling. Run the fresh exact W3-B 27B c1-c32
-  campaign next, then use its remaining red axes together with the corrected
-  kernel trace to drive the next repair; the 35B run waits behind complete 27B
-  closure.
+- **Production-vLLM performance is being re-baselined at v0.25.0.** The
+  completed `b5c6e4f` grid remains reproducible history, but its vLLM 0.24.0
+  environment carried FlashInfer 0.6.12 while the source pin already required
+  0.6.13. The follow-up `3cc490c` run was intentionally stopped and is
+  **VOID** at 28/36 groups, 1,602/2,016 timed requests, four returns and no
+  paired trace. The canonical v0.25.0 oracle now passes package/import/CLI,
+  lock-held real-model production-graph and clean server health/completion
+  smoke checks; a fresh c1-c32 grid is still required for any binding ratio.
+- **Modernization and removal are trace-gated.** The v0.25.0 audit found no
+  copied legacy `paged_attention_v1/v2` source and no MRV1 execution path to
+  delete. The live `vt::PagedAttention` name denotes a backend-neutral paged-KV
+  operation and remains required. v0.25.0 also preserves direct swizzled FP4
+  scales, zeroed unread padding and a device-resident `alpha` pointer, so the
+  proposed FP4 topology repair is not obsolete. Blocking CUDA events
+  (vllm#47081) and any other new optimization will be mirrored only when paired
+  v0.25.0 traces show an equivalent local cost. Every 27B throughput, latency
+  and memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
+  queued behind speed parity.
+- **The competitor floor is workload-specific.** Source-auditing the referenced
+  DGX Spark recipe confirmed its withdrawn 10--40x claim compared SGLang with
+  radix caching on against vLLM with prefix caching explicitly off. Its
+  remaining reported 25--45% cache-on lead is not yet project evidence: it is
+  35B-only, uses vLLM 0.23.1 for the cache-on cells, mismatches BF16/FP8 KV and
+  memory policies, enables MTP, has one or two repetitions, and omits several
+  required axes, hit/eviction proof, memory, correctness and paired traces.
+  Cache-neutral serving and deterministic 64k/256k shared-prefix serving now
+  have distinct canonical gates. Ours, explicit vLLM v0.25.0 Qwen hybrid
+  `mamba_cache_mode=align`, and SGLang v0.5.15 will receive identical
+  checkpoints, BF16 cache dtype, capacity, no-spec policy, token corpus,
+  reset/seed order and native hit proof; the faster equivalent reference binds
+  each throughput, latency and memory axis. **No SGLang prefix-cache number or
+  local Mamba-align support is claimed yet.**
 - The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
   cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
   vendored FlashAttention-2 prefill, register-tiled GDN `delta_h`, tensor-core WY,
@@ -355,13 +277,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   schedulers, upstream tests, workspace/capture rules and separate W1/W2 A/B
   gates. W1 passes focused Release stress, ThreadSanitizer and pushed-`c8807b0`
   exact/legacy CUDA capture, memcheck and 27B model gates. Its `bce2627`
-  classification remains the W1 history, while clean `b5c6e4f` is the binding
-  W2 oracle checkpoint. W2 is focused-CUDA,
+  classification and clean `b5c6e4f` remain W1/W2 historical diagnostics from
+  the superseded vLLM 0.24.0 oracle. W2 is focused-CUDA,
   compute-sanitizer and native-27B correctness green in its shipping and fused
   fallback arms. The one-input fusion's c16 component is +1.521%, but its strict
   17/20 timing and 0/4 sampled-memory result is not closure; the paired trace's
   +2.084%/20-of-20 result and launch reduction remain component diagnostics.
-  The binding W2 campaign is below the all-axis floor and its trace promotes
+  The W2 campaign was below the all-axis floor and its trace promoted
   W3 planner/warmup parity rather than another tactic implementation. W3-A
   implements FlashInfer's pre-event stream sync plus one-thread 1-ms nanosleep and
   reports the timing arm with each selected stable ID. Clean immutable
@@ -378,7 +300,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   prewarmed keys are tactic-stable, although first-use latency improves.
   Corrected paired tracing now closes the original FP4 structural gap at
   **110.623/109.932 s** prewarm/vLLM and leaves diagnostic normalized TPOT at
-  **0.9673x**. The exact W3-B c1-c32 oracle campaign remains open.
+  **0.9673x**. The old-oracle `3cc490c` grid is VOID; the next exact c1-c32
+  campaign is now unblocked by the validated v0.25.0 oracle and starts from a
+  new SHA-bound evidence tree.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The
   full record is in the [parity ledger](.agents/parity-ledger.md), and
@@ -422,10 +346,13 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   only). Original runtime/packaging components (the `vt` op runtime, the minja
   chat-template engine, the native grammar backend, the C API) are documented as
   deviations in the [porting inventory](.agents/porting-inventory.md) §9.
-- The CUDA low-concurrency comparison against SGLang is specified and pinned to
-  v0.5.13. Its CPU-only P1 corpus/client/summary/process-memory/dry-run harness
-  is implemented and contract-tested, but **no image, model compatibility, or
-  SGLang performance result is claimed yet**. The unchanged 27B checkpoint has
+- The CUDA low-concurrency comparison against SGLang remains pinned to v0.5.13
+  for its already implemented P1 corpus/client/summary/process-memory/dry-run
+  evidence. A distinct shared-prefix gate pins SGLang v0.5.15 (`f63458b`) and
+  the cited DGX recipe at `03253ef`; it is fully spiked and `READY` for its PX1
+  harness/counter work plus `KV-MAMBA-ALIGN`, not implemented support. **No
+  image, model compatibility, accepted SGLang performance result, or local
+  hybrid cache-hit result is claimed yet.** The unchanged 27B checkpoint has
   a plausible native path; exact 35B mixed-quant loading must be proven, and
   pinned-client raw E2E/TPOT detail remains a loud preflight gap. True
   incremental async HTTP streaming exists, but binding TTFT/ITL numbers wait
@@ -436,15 +363,15 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   Historical `31d053f` and offline ratios
   are non-binding because the
   audit found cache, sampling, token-budget, admission, and model-length
-  mismatches. Pushed `b5c6e4f` is the current exact 27B cache-off, closed-loop
-  checkpoint: 2,016/2,016 timed requests, three repetitions, six memory returns,
+  mismatches. Pushed `b5c6e4f` is the last complete 27B cache-off, closed-loop
+  historical checkpoint: 2,016/2,016 timed requests, three repetitions, six memory returns,
   the real-model gate, and paired traces pass their contracts. Median c1→c32
   total ratios are **0.993/0.952/0.966/0.976/1.021/1.022×**; only
   4/4/5/4/17/14 of 20 performance axes and 2/4 memory axes pass. All fixed c32
   legs are healthy. Exact-bucket/single-flight W1 is fully classified: its
   component series improves c8/c32 but fails strict c16/memory no-regression.
   W2 ports and correctness-gates the 32-tactic family together with merged CT
-  gate/up scaling and fused SiLU→NVFP4 quantization. Its binding trace now
+  gate/up scaling and fused SiLU→NVFP4 quantization. Its historical trace
   identifies selection parity as W3: vLLM resolves the narrow 128x32x256
   Stream-K/static pair while our planner predominantly selects wide tactics.
   W3-A delayed-event timing is immutable correctness/safety-green but its
@@ -457,7 +384,7 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   selection mismatch: FP4 kernel time is **110.623 s** versus vLLM's
   **109.932 s**, with the narrow pair at **70.333/70.986 s**. The same trace's
   normalized mean TPOT is still **0.9673x**, so a clean full-grid rerun is
-  mandatory. The oracle-disabled file cache is not a speed denominator.
+  mandatory against v0.25.0. The oracle-disabled file cache is not a speed denominator.
   W0 is
   merged at `7d29e0c`; its clean GB10 build,
   default/fallback
@@ -468,8 +395,10 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   vLLM denominator or may be multiplied into the old grid. Both model paths are
   W0 memory-access clean and the W1 indexed op is memcheck-clean, but the
   required zero-leak result remains open on inherited process-lifetime pools.
-  Fixed HTTP capacity, exact FP4 bucket/tactic parity, and fresh every-axis 27B
-  closure remain mandatory before 35B and later roadmap work. W2 direct indexed
+  Exact v0.25.0 oracle activation is complete; paired traces, fixed HTTP
+  capacity and fresh every-axis 27B closure remain mandatory before 35B and
+  later roadmap work.
+  W2 direct indexed
   convolution-state update stays scoped until those confirmed causes are
   removed and the residual trace is re-ranked.
 - **External KV-cache providers are roadmap-only, not supported yet.** Roadmap

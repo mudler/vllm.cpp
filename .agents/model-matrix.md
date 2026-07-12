@@ -2,6 +2,8 @@
 
 **Status:** canonical exhaustive model-family table for parallel claims.
 **Pinned oracle:** `/home/mudler/_git/vllm` at `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`.
+**Audited sync target:** v0.25.0 `702f4814fe54`; the three explicitly marked
+target-pending rows below are inventoried now but do not advance the parity pin.
 **Inventory spike:** [specs/model-family-inventory.md](specs/model-family-inventory.md).
 
 This document, rather than its spike, owns the exhaustive static model-registry
@@ -40,14 +42,14 @@ a practical unit that one agent can spike without silently dropping aliases.
 | `MODEL-REWARD` | Reward | 3 | 3 | `vllm/model_executor/models/registry.py:280-284` |
 | `MODEL-TOKCLS` | Token classification | 4 | 4 | `vllm/model_executor/models/registry.py:286-300` |
 | `MODEL-SEQCLS` | Sequence classification | 10 | 9 | `vllm/model_executor/models/registry.py:302-329` |
-| `MODEL-MM` | Multimodal | 114 | 106 | `vllm/model_executor/models/registry.py:331-580` |
-| `MODEL-SPEC` | Speculative decoding models | 44 | 36 | `vllm/model_executor/models/registry.py:582-633` |
+| `MODEL-MM` | Multimodal | 115 | 107 | `vllm/model_executor/models/registry.py:331-583` @ `702f481` |
+| `MODEL-SPEC` | Speculative decoding models | 46 | 38 | `vllm/model_executor/models/registry.py:586-638` @ `702f481` |
 | `MODEL-HFALIAS` | Static Transformers aliases | 4 | 2 | `vllm/model_executor/models/registry.py:635-645` |
 | `MODEL-HFBACKEND` | Generic Transformers backend | 10 | 10 | `vllm/model_executor/models/registry.py:647-680` |
 
-The tables assert **370 category memberships**, **353 unique static architecture
-IDs**, **321 category/target rows**, **307 unique `(module, class)` targets**,
-**258 implementation modules**, and **17 architecture IDs present in more than
+The tables assert **373 category memberships**, **356 unique static architecture
+IDs**, **324 category/target rows**, **310 unique `(module, class)` targets**,
+**261 implementation modules**, and **17 architecture IDs present in more than
 one task category**. The embedding dictionary comprehension at `registry.py:225-230`
 is expanded exactly as upstream does. Later dictionaries overwrite duplicate IDs
 with identical targets when `_VLLM_MODELS` is assembled at `registry.py:682-693`.
@@ -314,6 +316,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-MM-kimi-vl-kimi-vlfor-conditional-generation` | `KimiVLForConditionalGeneration` | `registry.py:447`; `vllm/model_executor/models/kimi_vl.py::KimiVLForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-kimi-k25-kimi-k25-for-conditional-generation` | `KimiK25ForConditionalGeneration` | `registry.py:448`; `vllm/model_executor/models/kimi_k25.py::KimiK25ForConditionalGeneration` | conditional generation / video+image | MM processor; encoder/merge; vision encoder; video path | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-kimi-audio-kimi-audio-for-conditional-generation` | `MoonshotKimiaForCausalLM` | `registry.py:449`; `vllm/model_executor/models/kimi_audio.py::KimiAudioForConditionalGeneration` | conditional generation / audio+image | MM processor; encoder/merge; audio/ASR frontend; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-MM-moss-transcribe-diarize-moss-transcribe-diarize-for-conditional-generation` | `MossTranscribeDiarizeForConditionalGeneration` (v0.25.0 target-pending) | v0.25.0 target `registry.py:450-453`; `vllm/model_executor/models/moss_transcribe_diarize.py::MossTranscribeDiarizeForConditionalGeneration` @ `702f481` | conditional generation / audio | MM processor; Whisper encoder; VQ adaptor; Qwen3 decoder; speech-to-text/diarization frontend | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-lightonocr-light-on-ocrfor-conditional-generation` | `LightOnOCRForConditionalGeneration` | `registry.py:450-453`; `vllm/model_executor/models/lightonocr.py::LightOnOCRForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-lfm2-vl-lfm2-vlfor-conditional-generation` | `Lfm2VlForConditionalGeneration` | `registry.py:454`; `vllm/model_executor/models/lfm2_vl.py::Lfm2VLForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; Mamba/SSM state; vision encoder; video path | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-MM-mllama4-llama4-for-conditional-generation` | `Llama4ForConditionalGeneration` | `registry.py:455`; `vllm/model_executor/models/mllama4.py::Llama4ForConditionalGeneration` | conditional generation / image | MM processor; encoder/merge; FusedMoE/grouped GEMM; vision encoder | ☐ required | `INVENTORIED` | none | unassigned |
@@ -387,6 +390,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` | `DFlashDraftModel` | `registry.py:591`; `vllm/model_executor/models/qwen3_dflash.py::DFlashQwen3ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; sliding-window attention; DFlash | ✅ [DFlash spec](specs/dflash-spec-decode.md) | `READY` | none | unassigned |
 | `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm` | `DSparkDraftModel` | `registry.py:592`; `vllm/models/deepseek_v4/__init__.py::DSparkDeepseekV4ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MLA/latent KV; sliding-window attention; DSpark | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-qwen3-dspark-qwen3-dspark-for-causal-lm` | `Qwen3DSparkModel` | `registry.py:593`; `vllm/model_executor/models/qwen3_dspark.py::Qwen3DSparkForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; DSpark | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-laguna-dflash-dflash-laguna-for-causal-lm` | `DFlashLagunaForCausalLM` (v0.25.0 target-pending) | v0.25.0 target `registry.py:598`; `vllm/model_executor/models/laguna_dflash.py::DFlashLagunaForCausalLM` @ `702f481` | speculative draft / Laguna targets | draft runner; acceptance/sampling; full/sliding attention; DFlash | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-llama-eagle3-eagle3-llama-for-causal-lm` | `PEagleDraftModel`, `PeagleLlamaForCausalLM`, `Eagle3LlamaForCausalLM`, `Eagle3MiniMaxM2ForCausalLM`, `LlamaForCausalLMEagle3`, `Eagle3Qwen2_5vlForCausalLM`, `Eagle3Qwen3vlForCausalLM` | `registry.py:594-600`; `vllm/model_executor/models/llama_eagle3.py::Eagle3LlamaForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-qwen3-eagle3-eagle3-qwen3-for-causal-lm` | `Eagle3Qwen3ForCausalLM`, `PeagleQwen3ForCausalLM` | `registry.py:601-602`; `vllm/model_executor/models/qwen3_eagle3.py::Eagle3Qwen3ForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-mistral-eagle-eagle-mistral-for-causal-lm` | `EagleMistralForCausalLM` | `registry.py:603`; `vllm/model_executor/models/mistral_eagle.py::EagleMistralForCausalLM` | speculative draft / target-dependent | draft runner; acceptance/sampling; EAGLE/EAGLE3 | ☐ required | `INVENTORIED` | none | unassigned |
@@ -396,6 +400,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SPEC-deepseek-mtp-deep-seek-mtp` | `DeepSeekMTPModel` | `registry.py:611`; `vllm/model_executor/models/deepseek_mtp.py::DeepSeekMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-deepseek-v4-deep-seek-v4-mtp` | `DeepSeekV4MTPModel` | `registry.py:612`; `vllm/models/deepseek_v4/__init__.py::DeepSeekV4MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MLA/latent KV; sliding-window attention; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-minimax-m3-mini-max-m3-mtp` | `MiniMaxM3MTP` | `registry.py:613`; `vllm/models/minimax_m3/__init__.py::MiniMaxM3MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MLA/latent KV; MTP | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-SPEC-bailing-moe-mtp-bailing-moe-v25-mtp-model` | `BailingMoeV25MTPModel` (v0.25.0 target-pending) | v0.25.0 target `registry.py:619`; `vllm/model_executor/models/bailing_moe_mtp.py::BailingMoeV25MTPModel` @ `702f481` | speculative draft / Bailing MoE v2.5 | draft runner; acceptance/sampling; FusedMoE/grouped GEMM; MLA/latent KV; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-gemma4-mtp-gemma4-mtp` | `Gemma4MTPModel` | `registry.py:614`; `vllm/model_executor/models/gemma4_mtp.py::Gemma4MTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; sliding-window attention; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-ernie-mtp-ernie-mtp` | `ErnieMTPModel` | `registry.py:615`; `vllm/model_executor/models/ernie_mtp.py::ErnieMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SPEC-exaone-moe-mtp-exaone-moe-mtp` | `ExaoneMoeMTP` | `registry.py:616`; `vllm/model_executor/models/exaone_moe_mtp.py::ExaoneMoeMTP` | speculative draft / target-dependent | draft runner; acceptance/sampling; MTP | ☐ required | `INVENTORIED` | none | unassigned |

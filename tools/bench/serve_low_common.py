@@ -22,7 +22,10 @@ SGLANG_IMAGE = (
     "docker.io/lmsysorg/sglang:v0.5.13-cu130-runtime@"
     "sha256:9631280f57d95503ed64cf3892de72190aafbfe6e58e90718a019fa775113bfb"
 )
-VLLM_COMMIT = "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c"
+# Exact source commit corresponding to the executable vLLM 0.25.0 benchmark
+# oracle. The porting parity pin remains recorded separately in
+# .agents/upstream-sync.md until target goldens and behavior gates close.
+VLLM_COMMIT = "702f4814fe54fabff350d43cb753ae3e47c0c276"
 
 
 class HarnessError(RuntimeError):

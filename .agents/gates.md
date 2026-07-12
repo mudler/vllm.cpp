@@ -9,7 +9,8 @@
 > features / architectures / accelerators we lack** to decide follow-up. Do NOT
 > start post-MVP work until both models hit parity.
 
-1. **Throughput parity vs vLLM** on `dgx.casa` (DGX Spark, GB10): serve
+1. **Throughput parity vs vLLM and every equivalent faster floor** on
+   `dgx.casa` (DGX Spark, GB10): serve
    **Qwen3.6-35B-A3B (NVFP4)** and **Qwen3.6-27B (NVFP4)** with prefill AND
    decode throughput matching vLLM at large concurrency (request-rate sweeps,
    measured with our `bench serve` equivalent, same box, same models).
@@ -17,7 +18,11 @@
    **MoE** (`Qwen3_5MoeForConditionalGeneration`, modelopt **W4A16**), **27B**
    is **dense** (`Qwen3_5ForConditionalGeneration`, compressed-tensors
    **W4A4**). Both remain throughput-parity targets, but they exercise
-   different architectures and NVFP4 quant schemes.
+   different architectures and NVFP4 quant schemes. vLLM remains mandatory on
+   every workload; when equivalent SGLang is faster, it is an additional
+   binding floor. Cache-neutral/cache-off and shared-prefix cache-on are
+   separate workloads with identical explicit policies and cache-hit proofs;
+   a default-policy mismatch never counts.
 2. **GGUF reading**: the same models load and serve from GGUF files (including
    NVFP4 GGUF extension types from the APEX/killgate tooling), not just
    safetensors.

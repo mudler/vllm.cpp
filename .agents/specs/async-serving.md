@@ -232,6 +232,7 @@ move.
 | `ENG-PRIORITY-SCHED` ← none | row | fully separable; only merge-order coupling in `scheduler.cpp` |
 | `SERVE-GATE-ONLINE` (`CLAIM-SERVE-GATE-1`) | consumer | order-0 gate blocked on W2 for its latency axes; coordinate harness reuse, do not double-own the row |
 | `BACKEND-GATE-CUDA-SGLANG` | consumer | already recorded as blocked on `SERVE-ASYNC-LLM` (coordination handoff) |
+| `BACKEND-GATE-CUDA-SGLANG-PREFIX` | consumer | the distinct shared-prefix cache-on gate also needs honest incremental TTFT/ITL after its PX1/PX2 cache work; do not blend it with the cache-neutral row |
 | `ENG-BATCH-QUEUE` | sibling | W3 ports the depth-2 async subset of `step_with_batch_queue`; the PP-general row stays `INVENTORIED` and inherits W3's code |
 | `SPEC-MTP`/`SPEC-GDN-SEGMENTS` | forward-compat | upstream allows async sched only for EAGLE/MTP-family methods (`vllm/config/vllm.py:969-1021`); W3 must land the method gate so C3 composes |
 | Hardware | env | GB10 (dgx.casa) for G1/G3-G6; CPU CI for G2/G7. No new models/data/licenses; no new toolchain deps (std::thread only) |

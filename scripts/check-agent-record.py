@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / ".agents"
 
 MATRICES = {
-    "MODEL": (AGENTS / "model-matrix.md", 323),
+    "MODEL": (AGENTS / "model-matrix.md", 326),
     "QUANT": (AGENTS / "quantization-matrix.md", 81),
     "KERNEL": (AGENTS / "kernel-matrix.md", 30),
-    "BACKEND": (AGENTS / "backend-matrix.md", 51),
+    "BACKEND": (AGENTS / "backend-matrix.md", 52),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
@@ -33,7 +33,7 @@ ENGINE_PREFIXES = (
     "ATTN",
     "LOAD",
 )
-ENGINE_ROWS = 98
+ENGINE_ROWS = 103
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
@@ -632,11 +632,11 @@ def check_model_invariants(errors: list[str]) -> None:
         "modules": len({target.split("::", 1)[0] for _, target in rows}),
     }
     expected = {
-        "rows": 321,
-        "memberships": 370,
-        "architectures": 353,
-        "targets": 307,
-        "modules": 258,
+        "rows": 324,
+        "memberships": 373,
+        "architectures": 356,
+        "targets": 310,
+        "modules": 261,
     }
     if actual != expected:
         errors.append(f"{path.relative_to(ROOT)}: model inventory {actual}, expected {expected}")

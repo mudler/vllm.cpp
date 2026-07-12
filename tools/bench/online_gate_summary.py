@@ -3,7 +3,7 @@
 
 Metric values are read from the detailed output produced by pinned vLLM
 ``bench serve`` (``vllm/benchmarks/serve.py:563-748,1188-1284`` at
-``e24d1b24``).  The upstream client owns timing; this module validates the
+``702f481``). The upstream client owns timing; this module validates the
 complete grid, retains cross-engine output differences as diagnostics,
 aggregates repeated runs, and applies the repository's direction-aware
 every-axis rule. Correctness is a separate commit-bound model gate because

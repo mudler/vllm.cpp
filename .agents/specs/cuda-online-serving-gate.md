@@ -21,50 +21,28 @@ ours arm. The historical offline denominators are also reopened: pinned
 `vllm bench throughput` used temperature 1 while ours used temperature 0, and
 the 27B budgets were 8192 versus 2048.
 
-The replacement clean pushed-`b5c6e4f` series is now the current binding 27B
-evidence. All 12 engine/concurrency groups validate; 2,016/2,016 timed
-requests, six memory returns, the commit-bound model gate and paired traces
-pass. Median total-throughput ratios c1→c32 are
-0.9933/0.9520/0.9657/0.9760/1.0213/1.0218×, with 4/4/5/4/17/14 of 20
-performance axes and 2/4 memory axes passing. W2 materially improves every
-point and wins total throughput at c16/c32, but c1-c8 throughput and
-high-concurrency mean TPOT/ITL remain below vLLM. The exact paired trace shows
-all 32 tactics are present locally, yet our planner is dominated by
-128x128x128/256x128x128 while vLLM resolves the 128x32x256 Stream-K/static pair
-for about 25.1% of captured kernel time. This is a valid failed gate and
-trace-grounded W3 selection input, not a parity claim. Derived
-runs/ratios/trace-status hashes are `0056bf62…c5c59` / `632e087b…192c` /
-`0190a7e1…ad3e`; ours nsys/kernel are `f0599533…9e57` /
-`d2367ab4…392e`, and vLLM trace/kernel are `db996f39…b41` /
-`caf8ac9f…258b`. Runtime grounding confirms pip-vLLM pre-tunes all buckets in
-memory with a stream sync and 1-ms GPU delay before ten eager event repeats;
-its file cache is disabled. FP4 W3-A's exact delayed timing mirror is implemented
-behind `VT_FP4_AUTOTUNE_DELAY=0`. Immutable `71f1e89` focused/model/memcheck
-gates pass and delayed real plans contain the traced ID 6/4 narrow family. Its
-c16 delayed/off means are 809.932/803.379 tok/s = 1.008156x, but strict
-acceptance fails at 13/20 timing and 2/4 memory with only 5/35 delayed keys
-stable. W3-B's shared-loader pre-serve implementation is immutable
-build/correctness/safety-green at clean `d7cdf66`: 80/80 profiles, completion
-before HTTP listening, zero lazy misses, 16/16 correctness and 24,586/24,586
-zero-error memcheck assertions. Its repeated c16 prewarm/lazy component is
-**808.457/808.220 tok/s = 1.000293×**, strict-fails **15/20 timing + 2/4
-memory**, and retains only **20/80** stable prewarmed tactic IDs. First-use
-first chunk improves **5.662→0.779 s**, so shipping prewarm stays without
-steady-state speed credit. Trace attempt 1 remains **VOID**, but corrected
-attempt 2 now completes prewarm, lazy and pinned vLLM at **144/144 retained
-requests each** under one whole-series lock. Startup/autotune is excluded by
-separate warmups and interactive Nsight stop ranges; all six cache inventories
-remain 49 files with digest `b1789458…7523`, all three memory returns pass, and
-no process/session remains. Prewarm/lazy/vLLM FP4 kernel sums are
-**110.623/114.229/109.932 s**. Prewarm removes 480 retained lazy delay launches,
-lands within **0.63%** of vLLM, and matches the 128x32x256 pair at
-**70.333/70.986 s** and **218,434/220,465 calls**, though the scheduler split
-differs. Diagnostic profiled means are **804.860/810.250/798.324 tok/s**;
-prewarm total is 1.0082x but normalized mean TPOT is only **0.9673x**. The
-node-traced rates are non-binding, while the kernel mix closes the original
-wide-tactic mismatch. Thus `b5c6e4f` is still binding until the fresh exact
-W3-B c1-c32 grid completes. The
-35B series waits until repaired 27B passes every axis.
+The 2026-07-12 vLLM release audit invalidates every old-oracle denominator.
+Clean `b5c6e4f` remains useful historical W1/W2/W3 diagnosis, but it executed
+vLLM 0.24.0 with FlashInfer 0.6.12 while the source pin and v0.25.0 target use
+0.6.13. Its c1→c32 totals
+0.9933/0.9520/0.9657/0.9760/1.0213/1.0218× and all latency/memory ratios are
+non-binding. The replacement clean `3cc490c` campaign was deliberately stopped
+and is **VOID** at 28/36 groups, 1,602/2,016 requests, four memory returns and
+no paired trace; no partial rate is reusable. Its owned process group exited
+and the GPU/ports/lock returned idle.
+
+The executable benchmark contract now pins pip vLLM 0.25.0 at tag commit
+`702f481`, with FlashInfer 0.6.13. The isolated staging environment has passed
+package/version/import/CLI checks except for a documented NVIDIA
+cuSPARSELt-wheel tag defect: PyPI supplied the correct aarch64 binary and direct
+load succeeds, while the wheel's internal `manylinux2014_sbsa` tag makes
+`pip check` report unsupported. A lock-held real 27B production-graph offline
+smoke loads the 24.57-GiB checkpoint, compiles, autotunes FlashInfer, captures
+graphs and completes exact 16-input/1-output counts; its cold rate is not a
+benchmark. The clean server smoke and atomic oracle-path activation are the
+remaining promotion checks at this checkpoint. Only after promotion does the
+full 27B c1-c32 grid plus paired traces restart. Every throughput, latency and
+memory axis must pass before any 35B performance run.
 
 ## Scope
 
@@ -105,7 +83,7 @@ metrics implementation is `examples/bench/bench_core.h:96-468` with unit
 coverage at `tests/examples/test_bench.cpp:15-48`. Offline throughput gates
 exist, but they do not prove online queueing, streaming, connection handling,
 or TTFT/ITL parity. `tools/bench/online_gate.py` now constructs the unmodified
-pip-vLLM 0.24.0 oracle command audited against the source pin, freezes
+vLLM v0.25.0 oracle command audited against target `702f481`, freezes
 exact-token corpus views and rejects partial results while accepting pinned-
 vLLM's producer-ahead DELTA aggregation;
 `online_gate_summary.py` makes any missing/mismatched
@@ -123,7 +101,7 @@ cache-policy, admission, max-sequence, model-length, or repeated-duration drift.
 | OpenAI request/SSE stream | `src/vllm/entrypoints/openai/` |
 | async scheduling/stream updates | current engine/server bridge; gaps map to `SERVE-ASYNC-LLM` |
 | scheduler/cache operating point | explicit server `max_num_seqs`, `max_num_batched_tokens`, and `--[no-]enable-prefix-caching` flags; harness fixes identical values on both arms and records the resolved policy |
-| benchmark request builder and metrics | pip-vLLM 0.24.0 `vllm bench serve` command audited against `e24d1b24` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py` |
+| benchmark request builder and metrics | staged vLLM 0.25.0 + FlashInfer 0.6.13 `vllm bench serve` command audited against target `702f481` + schema validation in `tools/bench/online_gate.py`; aggregation only in `tools/bench/online_gate_summary.py`; the canonical oracle path changes only after fingerprint/model/server validation |
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
@@ -223,12 +201,16 @@ explicit dependency wherever the synchronous bridge prevents equivalent
 low-concurrency overlap or streaming behavior.
 
 The executable oracle environment must include pandas 2.2.3 and an executable
-`ninja` in the same venv `bin` directory. On 2026-07-11 the
-isolated `~/venvs/vllm-oracle` was completed with pandas 2.2.3,
-python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2; these match the
-pinned CUDA test lock. Only pandas participates directly in the CustomDataset
-path. Both pandas and the profiler's Ninja executable are independently
-file-hashed by the gate, and the profiler receives the venv-prefixed `PATH`.
+`ninja` in the same venv `bin` directory. On 2026-07-12 the canonical
+`~/venvs/vllm-oracle` was promoted to validated vLLM 0.25.0/FlashInfer 0.6.13
+with pandas 2.2.3, python-dateutil 2.9.0.post0, pytz 2024.2 and tzdata 2024.2;
+v0.24.0 is preserved under its retired rollback path. Only pandas participates
+directly in the CustomDataset path. Both pandas and the profiler's Ninja
+executable are independently file-hashed by the gate, and the profiler receives
+the venv-prefixed `PATH`. The sole `pip check` warning is a disclosed NVIDIA
+cuSPARSELt internal `sbsa` wheel-tag defect; the installed wheel URL is aarch64,
+the ELF is AArch64, direct library load succeeds, and this exception is never
+reported as a clean dependency check.
 
 ## Work breakdown
 

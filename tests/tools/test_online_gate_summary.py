@@ -28,7 +28,7 @@ from tools.bench.online_gate import (
     VLLM_ORACLE_VERSION,
 )
 from tools.bench.online_gate_summary import summarize_evidence
-from tools.bench.serve_low_common import sha256_file
+from tools.bench.serve_low_common import VLLM_COMMIT, sha256_file
 
 
 def _record(*, faster: bool, repetition: int) -> dict:
@@ -98,7 +98,7 @@ def _write_fixture(root: pathlib.Path) -> None:
     (root / "manifest.json").write_text(
         json.dumps(
             {
-                "client_contract_source_commit": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
+                "client_contract_source_commit": VLLM_COMMIT,
                 "gpu_lock_acquisitions_planned": 2,
                 "vllm_oracle_bench_dependencies": {"pandas": PANDAS_VERSION},
                 "vllm_oracle_version": VLLM_ORACLE_VERSION,
@@ -157,7 +157,7 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "model_key": "27",
                 "vllm_oracle_version": VLLM_ORACLE_VERSION,
                 "vllm_cpp_sha": sha,
-                "vllm_source_sha": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
+                "vllm_source_sha": VLLM_COMMIT,
                 "snapshot_files": [],
                 "weight_files": [weight_name],
             }
@@ -264,7 +264,7 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "model_key": "27",
                 "source_manifest_sha256": sha256_file(source_manifest),
                 "tokenizer_revision": "revision",
-                "vllm_commit": "e24d1b24fe96a56ba8b0d653efa076d03eb95d6c",
+                "vllm_commit": VLLM_COMMIT,
             }
         ),
         encoding="utf-8",

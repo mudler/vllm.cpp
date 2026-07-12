@@ -2,13 +2,19 @@
 
 There is no "V2 engine". vLLM V0 was removed in 2025; everything lives under
 `vllm/v1/`. "V2" refers only to the **Model Runner V2** (`vllm/v1/worker/gpu/`
-package, "MRV2" in commit messages), an in-progress rewrite of the model
-runner *inside* the V1 engine, gated by `VLLM_USE_V2_MODEL_RUNNER` /
-`VllmConfig.use_v2_model_runner` (default: on for an allowlist of
-architectures, required for DSpark/diffusion).
+package, "MRV2" in commit messages), the current runner inside the V1 engine.
+At our `e24d1b24` parity pin it is already the default for every dense model,
+and it is required for DSpark/diffusion paths.
 
 **We port MRV2**, not the legacy `gpu_model_runner.py` — upstream development
 is converging on it.
+
+v0.25.0's “PagedAttention removed” headline means the old libtorch
+`paged_attention_v1.cu`/`paged_attention_v2.cu` implementation was deleted. It
+does not remove paged KV-cache semantics or the backend attention interface.
+Our `vt::PagedAttention` is that live backend-neutral contract and is backed by
+current FA2/fallback kernels; the audit found no local copy of the deleted
+libtorch kernels to retire.
 
 ## Two orthogonal axes: contract (T0) vs storage (M2)
 

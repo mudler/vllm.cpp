@@ -635,7 +635,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A is classified and not independently accepted. W3-B is immutable build/correctness/access-safety-green at clean `d7cdf66`, but its repeated component also fails independent acceptance: **1.000293×**, **15/20 timing + 2/4 memory**, **20/80** stable prewarm IDs. It remains the shipping production-faithful default because its first-use effect is real, not because it earns steady-state speed credit. Paired trace and the exact 27B oracle campaign remain. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison |
+| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A/W3-B component and corrected structural trace classifications are complete. Clean pushed `3cc490c` is now running W3-B's binding exact c1-c32 campaign under one lock; model/corpus/cache preconditions, ours repetition 1 plus return pass, and vLLM repetition 1 is active. No partial rate binds. Production pip-vLLM disables its file cache, so W3-C is separately gated and cannot own the oracle speed comparison |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -741,8 +741,12 @@ provenance SHA are `2aab1197…a137` / `af29681e…22fbf` /
 `dff465b3…bbe3`, and prewarm/lazy/vLLM report SHA are
 `a73d6032…1194a` / `9d74b6c8…37ea2` / `f89ffd4a…2d1b8`.
 
-Next, clean-build the pushed documentation checkpoint and run the exact W3-B
-c1-c32 27B oracle campaign. If any decode axis remains below floor, rank the
+The clean pushed-`3cc490c` exact W3-B c1-c32 27B oracle campaign is now
+**ACTIVE** under one uncontended model-wide lock. Its commit-bound model gate,
+deterministic corpus/cache inventory, ours repetition 1 and first memory return
+pass; vLLM repetition 1 is in progress. No partial result is binding. When the
+full 36 groups, six returns and paired trace finish, if any decode axis remains
+below floor, rank the
 remaining dependent launch/traffic differences from this corrected trace and
 amend the spike before changing FP4 quantization, block-scale layout,
 normalization fusion, or alpha residency. `b5c6e4f` stays binding, W3-C remains

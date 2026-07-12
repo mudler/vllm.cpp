@@ -68,7 +68,12 @@ OpenAI-compatible server.
 > Profiled rates are diagnostic only: prewarm/vLLM total throughput is
 > **1.0082x**, while normalized mean TPOT is still **0.9673x**. Thus the trace
 > closes W3's original tactic-family mismatch but does not replace the binding
-> clean grid; a fresh exact W3-B c1-c32 oracle campaign is next. Optional versioned
+> clean grid. The clean pushed-`3cc490c` exact W3-B c1-c32 campaign is now
+> **ACTIVE** under one model-wide DGX lock. Its commit-bound 27B gate passed,
+> the deterministic corpus/cache inventory validated, and ours repetition 1
+> completed all six points plus memory return; vLLM repetition 1 is in progress.
+> These partial arms publish no ratio and do not replace `b5c6e4f`; classification
+> waits for all 36 timed groups, six returns, and the paired trace. Optional versioned
 > persistence is separately gated in W3-C and is not the oracle denominator.
 > The 27B-only BF16 GDN output default remains correctness-required;
 > every 35B path retains f32. No production-parity claim is made, and the 35B

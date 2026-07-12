@@ -5382,3 +5382,20 @@ Next clean-build the pushed checkpoint and run the exact W3-B 27B c1-c32
 oracle campaign. If any decode axis remains red, rank the remaining executed
 dependent launch/traffic gaps and amend the owning spike before implementation.
 `b5c6e4f` remains binding, W3-C remains optional, and 35B stays prohibited.
+
+## 2026-07-12 — clean pushed `3cc490c` exact W3-B 27B campaign active
+
+The replacement exact W3-B campaign is now running from clean pushed
+`3cc490cfa6314e81a69451c5f175b071e7970506` under one uncontended model-wide
+`/tmp/gpu` lock. The detached CUDA 13.0/sm_121a build and deterministic corpus
+manifests validate; the commit-bound `test_qwen27_paged_engine` gate passes
+1/1 in 43.56 s (log SHA `a0c4fd8c…709c`). The first cache eviction proves zero
+resident pages across 49 files with inventory digest `61a4d3d4…967b`.
+
+Ours repetition 1 has retained every c1/2/4/8/16/32 point with exact native
+counts and its memory/cache return is true. Pinned vLLM repetition 1 is now
+cold-loading/running. This is an **ACTIVE/PENDING** checkpoint: no single arm
+or partial pair is binding, the exact result requires all 36 timed groups, six
+memory returns and the paired trace, and `b5c6e4f` remains the denominator.
+35B is not running and remains prohibited until every 27B performance and
+memory axis closes.

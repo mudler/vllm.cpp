@@ -7,7 +7,8 @@ in the [append-only parity ledger](../.agents/parity-ledger.md) and the linked
 feature specs.
 
 Last updated: **2026-07-12** (immutable `9cc7191` vLLM v0.25.0 27B
-cache-off every-axis result; node-level trace recapture `PENDING`).
+cache-off every-axis result plus accepted `def5f75` node-level paired trace;
+packed-QKV A/B `PENDING`).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -18,9 +19,8 @@ legacy `paged_attention_v1/v2` removal, DSpark, the Streaming Parser Engine
 and Blackwell NVFP4 swizzled-scale zero-init were already in our pin. The audit
 found no copied legacy PagedAttention component to retire; our paged-KV
 operation remains live. v0.25.0 also retains direct swizzled scales, zeroed
-unwritten padding and a device-resident CUTLASS alpha pointer. The first fresh
-trace omitted our CUDA-graph child nodes; those candidates receive work only
-after the node-level recapture ranks them.
+unwritten padding and a device-resident CUTLASS alpha pointer. The accepted
+node trace ranks packed QKV ahead of those lower-confidence candidates.
 
 The current binding result is the immutable clean
 `9cc71918dbdc10f014c02feb9bab1d00963a16fe` 27B campaign against executable
@@ -103,7 +103,34 @@ ATTRIBUTION** and cannot select a lever. Ours command/report SHA-256 are
 `f1d4cde3…2f49` / `35fc9c4e…ad5`. The harness now requires
 `--cuda-graph-trace=node`, records that granularity, and provides `--trace-only`
 to recapture both profilers plus the model gate under one lock without rerunning
-the grid. No node-level GPU result exists at this checkpoint.
+the grid.
+
+That replacement checkpoint is complete from immutable clean
+`def5f752896036d9b35841a278578fd812f75a0d`, with evidence at
+`~/work/vllm.cpp-online-trace-node/evidence/def5f752896036d9b35841a278578fd812f75a0d`.
+The commit-bound 27B gate passes in **44.79 s**; both profilers execute the same
+closed-loop c16 workload with 48 warmup prompts plus three 48-prompt windows,
+input 1,024→output 128, cache off. `status.json` is `passed:true` and records
+`cuda_graph_trace: node`; all three 49-file cache-drop/lifecycle proofs pass,
+and GPU, port and lock exit clean. Status / ours Nsight / ours kernel summary /
+vLLM kernel summary / vLLM trace SHA-256 are `c5a07125…11f4`,
+`71af83c5…1a36`, `42916a72…36e3`, `e4b2d8fe…6a90` and
+`8c4a267e…4291`.
+
+The local SQLite export (`7c8aadd2…eae5`) contains **2,587,766** CUDA-kernel
+rows: **2,315,412** graph-child rows (**181.922 s**) and **272,354** eager rows
+(**110.387 s**), over 7,711 distinct graph-node IDs. This closes the old
+attribution gap. Cross-profiler durations remain diagnostic, but identical-work
+launch counts expose the first structural repair. vLLM executes exactly
+**330,304 / 1,588 = 208 FP4 GEMMs per forward step**. Our graph executes
+**343,461 / 1,430 = 240.18** (240 expected plus 261 capture/warmup launches).
+The model has 64 layers—48 linear-attention and 16 full-attention—and source
+inspection explains the exact 32-launch delta: vLLM's `QKVParallelLinear`
+packs q/k/v into one `qkv_proj`, while ours runs three FP4 GEMMs in each of the
+16 full-attention layers. The local decode tactic mix is consequently dominated
+by 128×32×256 and 128×32×128, while vLLM also uses 128×64×256 materially.
+Packed QKV with one max-derived CT scale/alpha and a split fallback is the next
+same-binary A/B. No profiler rate or speedup is accepted from this trace.
 
 Generated texts differ across most FP4 engine pairs and ours' three trace
 digests are not all equal; this remains a diagnostic, not an ignored
@@ -114,9 +141,8 @@ correctness preconditions. vLLM also logged a missing optional
 path resolved FlashInfer NVFP4, FLA/Triton GDN and FA2, so the warning is
 recorded as non-path evidence and the frozen oracle was not mutated.
 
-Next: run the node-level paired `--trace-only` checkpoint, then diff the
-steady-state kernel lists, rank concrete executed differences, and run a
-same-binary 27B A/B for the highest-gain lever. Every
+Next: implement and run the packed-QKV same-binary 27B A/B selected by the
+node trace, then repeat the exact grid and re-rank the residual. Every
 27B throughput, latency and memory axis must pass before 35B; broader roadmap
 work, including DSpark, remains queued behind speed parity. Detailed release classification:
 [2026-07-12-702f481.md](../.agents/sync/2026-07-12-702f481.md).
@@ -126,12 +152,12 @@ work, including DSpark, remains queued behind speed parity. Detailed release cla
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `9cc7191` v0.25.0 27B: 54/124 AXES PASS; NODE TRACE PENDING** | Immutable `9cc7191` completed the correctness gate, all 36 cache-off groups, 2,016 requests and six returns under one uncontended lock. All 124 axes bind; 70 fail. Total-throughput ratios c1→c32 are **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**. c16/c32 aggregate throughput wins do not close mean TPOT/ITL through c16 or host PSS/RSS (**0.5855/0.5934×**). Its first paired trace is valid only at whole-graph granularity and cannot attribute child kernels. Evidence and hashes are above; 35B did not run. | Run the new model-gate + node-level paired `--trace-only` checkpoint under one lock. Then diff actual kernel lists and run the highest-ranked same-binary 27B repair A/B; repeat the exact grid until every axis passes, then 35B. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `9cc7191` v0.25.0 27B: 54/124 AXES PASS; NODE TRACE PASSED** | Immutable `9cc7191` completed the correctness gate, all 36 cache-off groups, 2,016 requests and six returns under one uncontended lock. All 124 axes bind; 70 fail. Total-throughput ratios c1→c32 are **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**. c16/c32 aggregate throughput wins do not close mean TPOT/ITL through c16 or host PSS/RSS (**0.5855/0.5934×**). Replacement `def5f75` passes the one-lock node trace and selects packed QKV from the observed **~240 vs 208 FP4 GEMMs/step** gap; it does not change the failed timing/memory disposition. Evidence and hashes are above; 35B did not run. | Run the trace-selected packed-QKV same-binary 27B A/B, then repeat the exact grid and re-rank until every axis passes; only then run 35B. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — NODE-LEVEL v0.25.0 TRACE PENDING** | W1/W2/W3 correctness and safety remain valid. The exact v0.25 grid binds and fails 70/124 axes. The paired trace token/workload contract passed, but ours captured whole graph activities and omitted child nodes, so direct swizzled scales, scalar alpha, blocking events and other candidates remain unranked. | Recapture both profilers with required Nsight node granularity. Diff executed kernels/call counts and rank gain÷effort; run a same-binary checkpoint only for a trace-proven hot-path divergence, and keep 35B held. |
-| `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `9cc7191` has c16 total throughput **1.028782×** but normalized mean TPOT/ITL **0.988851×**. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; use the node-level v0.25.0 paired recapture to re-rank GDN against remaining executed gaps. Do not infer any 35B result. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — NODE TRACE PASSED; PACKED QKV PROMOTED** | W1/W2/W3 correctness and safety remain valid. The exact v0.25 grid binds and fails 70/124 axes. `def5f75` exposes 2,315,412 graph-child rows and proves our separate q/k/v topology costs 32 additional FP4 GEMMs per step across 16 full-attention layers; vLLM packs them. Direct swizzle, scalar alpha and blocking-event candidates remain lower-ranked. | Add packed QKV with one max-derived CT scale/alpha plus `VT_FP4_MERGED_QKV=0`; gate correctness and run a same-binary 27B A/B. Re-trace/re-rank after the result; keep 35B held. |
+| `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `9cc7191` has c16 total throughput **1.028782×** but normalized mean TPOT/ITL **0.988851×**. The node trace sees the executed GDN family but ranks the exact 32-launch packed-QKV gap first. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; finish packed QKV, then re-trace/re-rank GDN. Do not infer any 35B result. |
 | `KV-DEVICE-RESIDENCY` | **ACTIVE — W0+W1 A/B/TRACE/CORRECTNESS PASS; ZERO-LEAK FAIL** | W0/W1 same-binary gains, copy reduction and correctness/safety evidence remain valid. Inherited pools still fail strict teardown (27B **47,290,056 B/101**, 35B **36,822,413,188 B/1,236**); old-oracle host-memory ratios are historical. | Keep W2 scoped until the v0.25.0 grid re-ranks the residual; separately repair model/pool/queue teardown. |
 
 The stream-usage path changes host-side JSON/SSE serialization, not model
@@ -261,29 +287,37 @@ test "$rc" -eq 1
 sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ```
 
-The immediate next checkpoint uses a new clean SHA/evidence root for the
-node-level paired trace only:
+The accepted node-level paired trace is reproducible from immutable
+`def5f752896036d9b35841a278578fd812f75a0d` with a fresh evidence root:
 
 ```sh
-SHA=$(git rev-parse HEAD)
+SHA=def5f752896036d9b35841a278578fd812f75a0d
 TRACE_ROOT="$HOME/work/vllm.cpp-online-trace-node"
-TRACE_EVIDENCE="$TRACE_ROOT/evidence/$SHA"
-TRACE_BUILD="$TRACE_ROOT/build/$SHA"
+REPRO_ROOT="$HOME/work/vllm.cpp-online-trace-node-repro"
+TRACE_EVIDENCE="$REPRO_ROOT/evidence/$SHA"
+TRACE_SOURCE="$TRACE_ROOT/checkpoints/$SHA/source"
+TRACE_BUILD="$REPRO_ROOT/checkpoints/$SHA/build"
+CORPUS="$TRACE_ROOT/evidence/$SHA/corpus/27"
 CLIENT="$HOME/venvs/vllm-oracle/bin/vllm"
 M27=$(dirname "$(find "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots" -name config.json -print -quit)")
 
+cd "$TRACE_SOURCE"
 scripts/dgx-online-serving.sh --dry-run \
-  --claim-root "$TRACE_ROOT" --client "$CLIENT" --vllm-cpp-sha "$SHA"
-# Execute the exact 27B corpus command recorded in $TRACE_EVIDENCE/manifest.json.
+  --claim-root "$REPRO_ROOT" --client "$CLIENT" --vllm-cpp-sha "$SHA"
+# Execute the exact immutable 27B source corpus from the accepted checkpoint.
 cmake -S . -B "$TRACE_BUILD" -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=121a \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build "$TRACE_BUILD" --target server test_qwen27_paged_engine \
   --parallel "$(nproc)"
 scripts/dgx-online-serving.sh --trace-only --model 27 --snapshot "$M27" \
-  --source-corpus "$TRACE_EVIDENCE/corpus/27" --evidence "$TRACE_EVIDENCE" \
+  --source-corpus "$CORPUS" --evidence "$TRACE_EVIDENCE" \
   --build-dir "$TRACE_BUILD" --client "$CLIENT" --vllm-cpp-sha "$SHA"
+sha256sum "$TRACE_EVIDENCE"/trace/status.json \
+  "$TRACE_EVIDENCE"/trace/ours/report.nsys-rep \
+  "$TRACE_EVIDENCE"/trace/ours/kernel-summary.json
 ```
 
 After the trace selects and an A/B accepts a repair, the next full checkpoint

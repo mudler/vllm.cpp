@@ -5640,3 +5640,38 @@ Next: commit/push this trace-contract checkpoint, create a fresh immutable 27B
 trace-only root/build/corpus, run it under one lock, and diff node-level kernel
 names/calls/time. Only then select the first same-binary repair. 35B remains
 prohibited.
+
+## 2026-07-12 — accepted v0.25 node trace selects packed full-attention QKV
+
+Immutable clean `def5f752896036d9b35841a278578fd812f75a0d` completed the
+replacement 27B trace-only campaign under one uninterrupted `/tmp/gpu` lock.
+The exact model gate passed in **44.79 seconds**, then ours and vLLM each ran
+the c16/48x3 input-1,024/output-128 profiler contract. All cache inventories,
+memory-return and trace-status checks pass; GPU processes, port 8001 and the
+lock are idle after exit. Evidence is
+`~/work/vllm.cpp-online-trace-node/evidence/def5f752896036d9b35841a278578fd812f75a0d`.
+Status/ours-nsys/ours-kernel-summary/ours-SQLite SHA are
+`c5a07125…11f4` / `71af83c5…1a36` / `42916a72…36e3` /
+`7c8aadd2…eae5`; vLLM trace/kernel/metadata are `8c4a267e…4291` /
+`e4b2d8fe…6a90` / `7c12f5b8…5ca`.
+
+The corrected database contains **2,315,412** CUDA-graph child rows,
+**272,354** eager rows and 7,711 distinct graph node IDs. Ours executes
+343,461 graph FP4 GEMMs across 1,430 graph `lm_head` markers, or **~240 per
+forward** after capture/warmup excess. vLLM executes 330,304 FP4 GEMMs across
+1,588 `ArgMax` markers, exactly **208 per forward**. Source and model topology
+close the attribution: vLLM's 64 merged gate-up/down pairs contribute 128,
+16 packed full-attention QKV/output pairs contribute 32, and 48 GDN outputs
+contribute 48. Our separate Q/K/V calls add exactly two launches across each
+of 16 full-attention layers.
+
+Decision: W3-D is the first repair. Mirror `QKVParallelLinear` by packing the
+resident Q/K/V FP4 weights and scale rows at N=`12,288+1,024+1,024=14,336`,
+derive one compressed-tensors max-shard input/weight divisor and alpha,
+quantize once, launch one GEMM, then split non-copying BF16 views.
+`VT_FP4_MERGED_QKV=0` preserves the current three-GEMM reference. Port an
+unequal-shard pack/split unit, CUDA packed/reference comparison, exact
+default/fallback 27B token gates and a 240→208 trace assertion before the
+unprofiled same-binary A/B. Direct-swizzle/alpha/GDN work stays unstacked and
+will be re-ranked afterward. This trace accepts no throughput number;
+`9cc7191` remains binding at **54/124** axes, and 35B remains prohibited.

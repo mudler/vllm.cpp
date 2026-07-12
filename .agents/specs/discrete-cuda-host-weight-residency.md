@@ -149,7 +149,8 @@ iterator scopes one `safe_open` per shard while this project retains every
 mapping through full owned materialization. W4.1-W4.2 are implemented and
 CPU/native-sm_120 correctness-gated, but whole-mapping advice is rejected after
 one >173.75-s pre-GPU leg. W4.2b narrows advice to consumed tensor ranges before
-W4.3; no improved number is accepted.
+W4.3; that replacement is implemented and correctness-gated, but no improved
+number is accepted before its immutable load-time killgate.
 
 ## Risks and decisions
 

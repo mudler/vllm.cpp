@@ -546,8 +546,13 @@ project legs took about 25 s. The partial 11.41-GiB peak is `VOID` because the
 process had not completed loading and could still rise. GPU state returned to
 146 MiB / 0% / 40 C. CPU 105/105 and focused native-sm_120 default 5/5 plus
 opt-out 2/2 were green, but cannot accept the load-time regression. A
-tensor-range-only replacement is `PENDING`; no improved memory or throughput
-number is claimed and the row cannot close.
+tensor-range-only replacement is now implemented and `PENDING` an immutable
+load-time/memory killgate. It records only tensors returned by the current
+global/layer resolver and advises their page-aligned ranges once. Focused
+native-sm_120 default 5/5 and opt-out 2/2 pass. A full CPU run concurrent with
+those CUDA tests passed 104/105; `test_async_llm` observed one extra drain
+iteration, then passed 3/3 in isolation. No improved memory or throughput number
+is claimed and the row cannot close.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

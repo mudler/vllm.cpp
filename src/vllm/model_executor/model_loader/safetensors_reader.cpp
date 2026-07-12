@@ -198,11 +198,31 @@ const StTensor& SafetensorsFile::Get(const std::string& name) const {
   return it->second;
 }
 
-bool SafetensorsFile::DiscardResidentPages() const noexcept {
+bool SafetensorsFile::DiscardResidentPages(const StTensor& tensor) const
+    noexcept {
   if (map_ == nullptr || map_size_ == 0) return true;
 #ifdef MADV_DONTNEED
-  return ::madvise(map_, map_size_, MADV_DONTNEED) == 0;
+  if (tensor.nbytes == 0) return true;
+  const uintptr_t map_begin = reinterpret_cast<uintptr_t>(map_);
+  const uintptr_t data_begin = reinterpret_cast<uintptr_t>(tensor.data);
+  if (data_begin < map_begin || data_begin - map_begin > map_size_ ||
+      tensor.nbytes > map_size_ - (data_begin - map_begin))
+    return false;
+
+  static const long page_size_long = ::sysconf(_SC_PAGESIZE);
+  if (page_size_long <= 0) return false;
+  const uintptr_t page_size = static_cast<uintptr_t>(page_size_long);
+  const uintptr_t advise_begin = data_begin - data_begin % page_size;
+  if (tensor.nbytes > UINTPTR_MAX - data_begin) return false;
+  const uintptr_t data_end = data_begin + tensor.nbytes;
+  if (data_end > UINTPTR_MAX - (page_size - 1)) return false;
+  const uintptr_t advise_end =
+      data_end + (page_size - data_end % page_size) % page_size;
+  return ::madvise(reinterpret_cast<void*>(advise_begin),
+                   static_cast<size_t>(advise_end - advise_begin),
+                   MADV_DONTNEED) == 0;
 #else
+  (void)tensor;
   return false;
 #endif
 }

@@ -7066,3 +7066,20 @@ the global/layer boundary. This avoids repeatedly walking multi-GiB mappings and
 preserves future tensor pages. After interruption, the process exited and the
 GPU was read-only verified at 146 MiB, 0%, 40 C. No system configuration or
 kernel execution was involved.
+
+## 2026-07-12 — W4.2b consumed-tensor-range replacement implemented
+
+Changed the reader advice API to accept one `StTensor`, validate that its span
+belongs to the owning mapping, and page-align only that byte range. The dense
+resolver records `(SafetensorsFile*, StTensor*)` for tensors actually returned
+during global or layer materialization; each boundary advises those ranges once
+and clears the list. The opt-out also clears the list. This removes the rejected
+multi-GiB whole-map walk while preserving pointer validity and exact refaults.
+
+CPU and native-sm_120 Triton-AOT builds pass. Focused lock-held CUDA-build tests
+pass **5/5** default and **2/2** opt-out. A full CPU run executed concurrently
+with the CUDA tests passed **104/105**; `test_async_llm` expected three drain
+iterations and observed four under contention, then passed **3/3** in isolation.
+No loader code reaches that subsystem, but the non-green concurrent full result
+is retained rather than hidden. The range replacement now needs an uncontended
+immutable load-time killgate before the full W4 memory/performance series.

@@ -110,20 +110,25 @@ TEST_CASE("safetensors: discarded resident pages fault back exactly") {
 
   float before[4];
   std::memcpy(before, st.Get("a").data, sizeof(before));
-  REQUIRE(st.DiscardResidentPages());
+  REQUIRE(st.DiscardResidentPages(st.Get("a")));
 
   float after[4];
   std::memcpy(after, st.Get("a").data, sizeof(after));
   CHECK(std::memcmp(before, after, sizeof(before)) == 0);
   CHECK(after[0] == 1.0f);
   CHECK(after[3] == 4.0f);
+
+  uint8_t foreign_byte = 0;
+  vllm::StTensor foreign = st.Get("a");
+  foreign.data = &foreign_byte;
+  CHECK_FALSE(st.DiscardResidentPages(foreign));
 }
 
 TEST_CASE("safetensors: move semantics keep the mapping alive") {
   TempFile f(MakeSafetensors(kValidHeader, ValidData()));
   vllm::SafetensorsFile a = vllm::SafetensorsFile::Open(f.path());
   vllm::SafetensorsFile b = std::move(a);
-  CHECK(a.DiscardResidentPages());
+  CHECK(a.DiscardResidentPages(b.Get("a")));
   CHECK(b.Get("a").nbytes == 16);
   vllm::SafetensorsFile c = vllm::SafetensorsFile::Open(f.path());
   c = std::move(b);

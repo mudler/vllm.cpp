@@ -113,6 +113,14 @@ prior complete monitored run, so it was interrupted and rejected. Its partial
 11.41-GiB peak is `VOID`. W4.2b must track tensors returned by the resolver and
 advise only their page-aligned byte ranges at each boundary before W4.3 restarts.
 
+W4.2b implementation checkpoint: the resolver now records each owning shard and
+returned tensor, the reader validates ownership and advises only that tensor's
+page-aligned range, and each global/layer boundary clears the consumed list in
+both enabled and opt-out modes. Native-sm_120 focused tests pass 5/5 default and
+2/2 opt-out. A full CPU run concurrent with CUDA tests passed 104/105; its
+unrelated async timing case passed 3/3 in isolation. The immutable load-time
+killgate and all improved numbers remain `PENDING`.
+
 ## Risks and mitigations
 
 - Advice can increase file refaults and load time. Checkpoints are layer-sized,

@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
@@ -19,6 +20,7 @@ namespace vllm {
 namespace {
 
 using TensorExists = std::function<bool(const std::string&)>;
+using ConsumedTensor = std::pair<const SafetensorsFile*, const StTensor*>;
 
 bool DiscardSafetensorsPagesEnabled() {
   static const bool enabled = [] {
@@ -28,10 +30,12 @@ bool DiscardSafetensorsPagesEnabled() {
   return enabled;
 }
 
-void DiscardSafetensorsPages(const std::vector<SafetensorsFile>& shards) {
-  if (!DiscardSafetensorsPagesEnabled()) return;
-  for (const SafetensorsFile& shard : shards)
-    (void)shard.DiscardResidentPages();
+void DiscardSafetensorsPages(std::vector<ConsumedTensor>* consumed) {
+  if (DiscardSafetensorsPagesEnabled()) {
+    for (const auto& [shard, tensor] : *consumed)
+      (void)shard->DiscardResidentPages(*tensor);
+  }
+  consumed->clear();
 }
 
 OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
@@ -412,11 +416,14 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
+  std::vector<ConsumedTensor> consumed;
   const TensorResolver get =
-      [&where](const std::string& name) -> const StTensor& {
+      [&where, &consumed](const std::string& name) -> const StTensor& {
     auto it = where.find(name);
     VT_CHECK(it != where.end(), "qwen3_5 dense: tensor not found: " + name);
-    return it->second->Get(name);
+    const StTensor& tensor = it->second->Get(name);
+    consumed.emplace_back(it->second, &tensor);
+    return tensor;
   };
   const TensorExists has = [&where](const std::string& name) -> bool {
     return where.find(name) != where.end();
@@ -439,12 +446,12 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
     w.tied_lm_head = true;
     w.embed_tokens.nk = true;
   }
-  DiscardSafetensorsPages(shards);
+  DiscardSafetensorsPages(&consumed);
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
         get, has, config.layer_types[static_cast<size_t>(l)], l));
-    DiscardSafetensorsPages(shards);
+    DiscardSafetensorsPages(&consumed);
   }
   return w;
 }

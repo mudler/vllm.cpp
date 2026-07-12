@@ -530,15 +530,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   whole-mapping advice placement is **REJECTED**: its initial monitored leg was
   interrupted still pre-GPU at 173.75 s versus about 25 s for the prior complete
   run. Its 11.41-GiB partial peak is `VOID`, not an accepted improvement.
-  Tensor-range-only advice is now pending; `VT_SAFETENSORS_DISCARD_PAGES=0`
-  remains the same-binary control. Direct-device loading remains
+  The replacement now records tensors actually copied in each phase and advises
+  only their page-aligned ranges once; its immutable load-time/memory killgate
+  is **PENDING**. `VT_SAFETENSORS_DISCARD_PAGES=0` remains the same-binary
+  control. Direct-device loading remains
   required if the owned-model floor still exceeds vLLM. Prepare-time release
   is **+1.74%** versus OFF and reaches **0.9754×**
   fresh-vLLM total/output throughput; performance parity also remains open.
   Full CPU CTest passes 105/105 and focused native-sm_120 CTest passes 4/4.
   W4's rejected implementation passed focused native-sm_120 default 5/5 and
   opt-out 2/2 tests, but load-time regression overrides that correctness gate.
-  No improved memory or throughput number is claimed.
+  The range replacement also passes those 5/5 + 2/2 gates. A concurrent full
+  CPU run passed 104/105; its unrelated async timing case then passed 3/3 in
+  isolation. No improved memory or throughput number is claimed.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

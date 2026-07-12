@@ -42,9 +42,9 @@ class SafetensorsFile {
   const std::map<std::string, std::string>& Metadata() const {
     return metadata_;
   }
-  // Drop resident pages without invalidating the mapping or tensor pointers.
-  // Returns false when the platform/advice call cannot honor the hint.
-  bool DiscardResidentPages() const noexcept;
+  // Drop pages covering one tensor without invalidating its mapping/pointer.
+  // Returns false for a foreign span or when the platform cannot honor it.
+  bool DiscardResidentPages(const StTensor& tensor) const noexcept;
 
  private:
   SafetensorsFile() = default;

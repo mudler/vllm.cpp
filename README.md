@@ -36,7 +36,13 @@ OpenAI-compatible server.
 > fail. The trace proves independent exact plans and reduces aggregate FP4
 > kernel time by 1.05%; the fresh oracle trace still attributes 25.1% of
 > profiled kernel time to vLLM's absent 128x32x256 Stream-K/static pair. W2's
-> full 32-tactic family is therefore active. The 35B
+> 32 raw tactics now compile and pass forced/reference/sanitizer probes. Its
+> first model run exposed a second execution-chain mismatch: vLLM runs those
+> swap tactics on one merged gate/up projection with maximum-of-shards CT
+> divisors and one alpha, while vllm.cpp still launches two independently
+> scaled projections. The accepted spike now makes that merged path W2's
+> correctness prerequisite; filtering to an ordinary tactic is explicitly not
+> parity. The 35B
 > campaign is held until 27B passes every axis. Historical
 > temperature/token-budget-mismatched ratios
 > remain diagnostics only. The tables track real, tested support and are kept
@@ -258,8 +264,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   improves c8/c32 total throughput by 0.93%/0.72%, but c16 is 0.9996× and only
   1/4 memory axes pass, so its strict component gate fails. The fresh vLLM
   execution trace attributes 25.1% of profiled kernel time to the absent
-  128x32x256 Stream-K/static-persistent pair. Full-tactic W2 is now the active
-  repair. This is a concrete runtime target, not a hardware ceiling. The exact
+  128x32x256 Stream-K/static-persistent pair. W2's forced-tactic sweep and nsys
+  signature match prove vLLM uses swap IDs 4/6; ordinary IDs can recover the
+  current tokens only by compensating for our split gate/up scale semantics.
+  Mirroring vLLM's merged gate/up operand, maximum logical-shard divisors and
+  single alpha is now the active repair. This is a concrete runtime target,
+  not a hardware ceiling. The exact
   35B run waits behind complete 27B closure.
 - The optimized paths themselves remain implemented: vendored Triton-AOT GDN,
   cuBLASLt TN projection layouts, fused attention preamble, tiled causal-conv,
@@ -277,7 +287,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   gates. W1 passes focused Release stress, ThreadSanitizer and pushed-`c8807b0`
   exact/legacy CUDA capture, memcheck and 27B model gates. Its complete
   `bce2627` component/trace/oracle classification is positive but below the
-  no-regression and every-axis floors; W2 owns the remaining 32-tactic port.
+  no-regression and every-axis floors. W2's raw 32-tactic port is locally
+  correctness/sanitizer-green; model closure now owns the trace-required merged
+  gate/up topology and max-divisor semantics before performance measurement.
   Until gated, isolated per-shape wins do not establish end-to-end tactic parity.
   Historical same-binary component A/Bs remain evidence for those individual
   levers; they do not substitute for the reopened end-to-end oracle gate. The

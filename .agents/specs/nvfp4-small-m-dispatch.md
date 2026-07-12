@@ -4,7 +4,7 @@
 spike; W1 is measured and W2 is `ACTIVE` under
 `CLAIM-NVFP4-SMALL-M-2`. **Pins:** vLLM
 `e24d1b24fe96`, pip-vLLM `0.24.0`, installed FlashInfer `0.6.12`, CUTLASS
-`v4.4.2`, CUDA `13.0.88`, and the
+`v4.5.0`, CUDA `13.0.88`, and the
 Qwen3.6-27B-NVFP4 gate snapshot recorded in `environment.md`.
 
 This accepted spike is the mandatory contract for FP4 plan-cache and kernel
@@ -25,6 +25,9 @@ SM120/SM121, starting with the exact 27B online gap. The row owns:
   single-flight miss handling and capture-safe cache hits;
 - FlashInfer's eight SM12 CTA shapes crossed with `swap_ab` and
   static-persistent/Stream-K scheduling (32 tactics, in upstream order);
+- the exact dense `gate_up_proj` execution topology those tactics serve in the
+  oracle: one N-concatenated gate/up operand and output, one activation quant,
+  and vLLM's maximum-of-logical-shards input/weight divisor semantics;
 - workspace high-water sizing, forced-tactic diagnostics, warmup and optional
   persistent plan-cache compatibility;
 - BF16 gate-model output first, followed by the upstream FP16 output mode
@@ -41,8 +44,10 @@ Out of scope for this spike:
 
 - W4A16 Marlin (`KERNEL-GEMM-MARLIN-W4A16`), FP8, MoE routing, attention,
   scheduler admission, HTTP transport, prefix caching, or new quant formats;
-- merged QKV/gate-up projection topology and quantization fusion. Those are
-  real source/trace differences but are independently gateable later levers;
+- merged QKV topology. It remains an independently gateable later lever; the
+  merged dense gate/up topology is now in W2 because the forced-tactic
+  correctness investigation proved it is part of the oracle's actual FP4
+  dispatch contract, not an optional fusion;
 - changing FP4 quantization, block-scale layout, alpha semantics, sampling, or
   the 27B correctness contract to manufacture a speed win;
 - running 35B performance while any 27B acceptance axis remains below vLLM.
@@ -119,6 +124,42 @@ time in the missing 128x32x256 Stream-K/static-persistent pair (94,144 and
 119,280 calls); ours remains dominated by 256x128x128 persistent. W2 is the
 trace-grounded next iteration. 35B stays prohibited.
 
+### W2 correctness localization (2026-07-12)
+
+The complete 32-tactic CUDA build passes all forced raw-GEMM references, graph
+replays, sanitizer shapes and a byte-for-byte raw comparison against
+FlashInfer. Its first 27B default run nevertheless diverges at layer 1. A
+full-layer replay and internal trace localize the first material error to the
+dense MLP: attention, residual and post-attention norm agree; the gate/up MLP
+output does not. Forced IDs 0/2/4/6 (swap-AB narrow tactics) fail the layer-1
+replay, while IDs 1/3/5/7 (ordinary narrow tactics) pass its tolerance.
+
+The end-to-end forced sweep makes the distinction stronger. IDs 1, 3 and 7
+produce **16/16** oracle greedy tokens and **9/9** prefill argmax positions;
+forced ID 5 preserves the required 6-token prefix but only 8/9 prefill
+positions. Wider ordinary IDs are not a correctness substitute. Nsys then
+matches the oracle's two dominant 128x32x256 signatures exactly to local IDs 4
+and 6: vLLM really runs the swap-AB static/Stream-K kernels. Therefore selecting
+an ordinary tactic would be a compensating numerical workaround, not parity.
+
+The missing execution-chain link is the operand topology and global-scale
+processing. vLLM constructs one `MergedColumnParallelLinear` for gate/up,
+concatenates the two logical weights along N, and processes their scalar CT
+divisors as arrays. It warns when the logical shards differ but deliberately
+takes `max(weight_global_scale)` and `max(input_global_scale)`, reciprocates
+those maxima, computes one alpha, quantizes the activation once and launches
+one `[M,K] x [2I,K]` GEMM. Our current dense path launches two `[M,K] x [I,K]`
+GEMMs with independent per-checkpoint divisors/alphas. The 27B checkpoint does
+contain differing gate/up scalars, so the two programs are not numerically
+equivalent even though the raw kernel port is exact.
+
+W2 therefore includes the merged dense gate/up resident and exact maximum-scale
+semantics, with `VT_FP4_MERGED_GATE_UP=0` preserving the split W2 arm and
+`VT_FP4_FULL_TACTICS=0` preserving W1. The model test must prove default
+16/16-vs-oracle before any performance claim. Merged QKV remains outside this
+iteration unless the post-gate trace identifies it as the next correctness or
+performance blocker.
+
 ## Upstream chain and execution dependency
 
 ### vLLM orchestration
@@ -130,6 +171,15 @@ trace-grounded next iteration. 35B stays prohibited.
   gates FlashInfer CUTLASS, swizzles/pads weights once, accepts pre-quantized
   activation+scale pairs, and invokes `flashinfer_scaled_fp4_mm(...,
   backend="cutlass")`.
+- `vllm/model_executor/models/qwen3_5.py:278-288` maps checkpoint
+  `gate_proj`/`up_proj` into one `gate_up_proj`; `qwen2_moe.py:75-115` builds a
+  `MergedColumnParallelLinear`, launches it once and applies `SiluAndMul`.
+- `vllm/model_executor/layers/linear.py:580-636,665-695` concatenates logical
+  projection shards along the output dimension and loads scalar scales into
+  the fused array.
+- `compressed_tensors_w4a4_nvfp4.py:95-138` retains the fused scalar arrays
+  through load, then uses the maximum weight divisor and maximum input divisor,
+  reciprocates them and computes the one runtime alpha.
 - `vllm/config/vllm.py:193-275,1192-1200` enables FlashInfer autotuning for
   optimization levels O1-O3; the production oracle resolves O3 and full/
   piecewise cudagraphs.
@@ -210,8 +260,8 @@ real gate shapes.
   passes 9 cases/615 assertions. Pushed `c8807b0` exact/legacy CUDA capture
   suites pass 10/10 and 18,333/18,333 each; focused memcheck passes 1/1 and
   16,389/16,389 with 0 errors; both 27B model arms pass 1/1 and 234/234.
-  Every tactic, workspace growth, forced dispatch and broader real projection
-  shapes remain open.
+  Every tactic, workspace growth, forced dispatch, merged gate/up scale
+  semantics and broader real projection shapes remain open.
 
 Real 27B W4A4 projection classes to benchmark include:
 
@@ -220,7 +270,8 @@ Real 27B W4A4 projection classes to benchmark include:
 | full-attention Q | 1,2,4,8,16,32 | 12,288 | 5,120 |
 | full-attention K/V | 1,2,4,8,16,32 | 1,024 | 5,120 |
 | attention/GDN output | 1,2,4,8,16,32 | 5,120 | 6,144 |
-| dense gate/up | 1,2,4,8,16,32 | 17,408 | 5,120 |
+| dense gate/up split diagnostic | 1,2,4,8,16,32 | 17,408 | 5,120 |
+| dense merged gate_up production | 1,2,4,8,16,32 | 34,816 | 5,120 |
 | dense down | 1,2,4,8,16,32 | 5,120 | 17,408 |
 
 ## Port map
@@ -232,6 +283,8 @@ Real 27B W4A4 projection classes to benchmark include:
 | capture behavior | **W1 implemented/gated:** a ready lookup is allocation/sync-free; an uncached capture is rejected before tuning; pushed exact/legacy real CUDA capture/replay, invalid-miss teardown and eager-retry suites pass |
 | 32 configs (`fp4_gemm_cutlass_template_sm120.h:47-220`) | port the dependency-owned raw template semantics into split local CUDA TUs: explicit TMA epilogue with `ElementC=void`, block-scaled cooperative mainloop, static persistent + Stream-K, both orientations and exact tactic order |
 | `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
+| merged dense gate/up (`qwen3_5.py`, `qwen2_moe.py`, `linear.py`) | concatenate packed gate/up rows and linear FP8 block scales on device, swizzle the combined scale once, emit BF16 `[M,2I]`, apply `SiluAndMul`, and preserve a split diagnostic arm |
+| fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
 | warmup/persistence (`kernel_warmup.py:133-220`) | tune all configured hybrid buckets before server readiness, version cache entries by source/tactic ABI/device/CUDA/CUTLASS/model shape, load atomically, and keep lazy tuning only as a fail-closed diagnostic path |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
@@ -252,6 +305,7 @@ wrappers.
 | `tests/v1/determinism/test_nvfp4_batch_invariant.py:22-100` | retain the gate model's deterministic common-prefix contract across c1/2/4/8/16/32 and exact native token counts; record full generated text diagnostically because vLLM's own FP4 backends diverge after near ties |
 | FlashInfer bucket helpers `fused_moe/utils.py:212-307` | **W1 ported/gated:** table tests for 0,1,2,3,4,8,16,255,256,257,2048,2049,4096,4097 and a bounded max; pushed `c8807b0` gates the real ready-hit/miss/retry capture in both exact and legacy modes |
 | FlashInfer tactic enumeration `fp4_gemm_cutlass_template_sm120.h:187-220` | assert 32 stable tactic descriptors/order; force every supported tactic over representative small-M and real Qwen shapes; unsupported configs are reported/skipped only during tuning |
+| `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | autotuner cache behavior | **W1 ported/gated:** 16-thread same-key one-pass, different-key progress, failure wake/retry/no-partial-state, uncached-capture rejection and ready-hit bypass; pushed real CUDA capture/replay/miss/teardown/retry plus focused memcheck pass. Stale disk-version rejection belongs to W3 |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
@@ -267,8 +321,10 @@ native token-count correctness are preconditions to all speed claims.
    are recorded.
 2. **Unit correctness:** bucket/single-flight/cache tests pass; all 32 tactic
    descriptors are present; every supported forced tactic matches the
-   dequantized BF16 reference within the upstream tolerance. Existing native
-   fallback and fused quant tests remain green.
+   dequantized BF16 reference within the upstream tolerance. Merged gate/up
+   uses one max-derived input divisor, weight multiplier and alpha and matches
+   an explicit upstream-semantics reference with unequal logical-shard scales.
+   Existing native fallback and fused quant tests remain green.
 3. **CUDA safety/lifecycle:** compute-sanitizer covers small/padded/real shapes,
    every scheduler/orientation class, workspace growth/reuse and graph replay
    with zero errors. No process-exit scratch leak is added; queue/device
@@ -305,7 +361,7 @@ before any new FP4 GPU command begins.
   length/admission/sampling remain unchanged.
 - `SERVE-ASYNC-LLM` HTTP capacity is measured first so transport stalls cannot
   contaminate the FP4 A/B. The FP4 source does not alter HTTP or scheduling.
-- CUDA 13.0.88, GB10/sm_121a, CUTLASS 4.4.2 and enough build storage for 32
+- CUDA 13.0.88, GB10/sm_121a, CUTLASS 4.5.0 and enough build storage for 32
   heavy instantiations are required. SM120 cross-build/runtime becomes a
   backend follow-up; other architectures keep their current dispatch.
 - `BACKEND-ABI-VT` defines the future common workspace lifecycle. This repair
@@ -321,7 +377,7 @@ before any new FP4 GPU command begins.
 |---|---|---|
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
-| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; every-tactic correctness/sanitizer, capture/workspace, component, trace and exact 27B campaign required |
+| W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-2`; raw tactic gates pass locally on DGX, but merged topology/scale semantics, model correctness, sanitizer, component, trace and exact 27B campaign remain required |
 | W3 | pre-serve all-bucket warmup, versioned persistent plan cache, atomic load/save and startup/memory evidence | after W2; retain lazy mode only for diagnostics; repeat exact 27B if runtime selection changes |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
@@ -342,6 +398,11 @@ but its open state remains visible in the kernel matrix.
 - **Swap-AB correctness:** pointer/scale/M/N swapping changes internal layout
   but not the public `[M,N]` contract. Forced-tactic tests must catch transpose
   or scale-stream mistakes before tuning can select the path.
+- **Compensating-tactic trap:** ordinary narrow tactics happen to recover the
+  current 27B tokens, but the production trace proves vLLM runs swap IDs 4/6.
+  Do not filter swap tactics to hide the split-projection scale mismatch; port
+  the merged topology and maximum-divisor semantics and keep the oracle's
+  runtime selection.
 - **Stream-K workspace:** query the maximum across every enabled tactic and
   reserve it before capture. An allocation, event sync, or plan mutation during
   graph replay is a gate failure.

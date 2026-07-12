@@ -4941,3 +4941,30 @@ exact eight-tile × two-orientation × two-scheduler family, high-water
 workspace, forced IDs and separately repeated gates. README,
 `docs/BENCHMARKS.md`, roadmap, matrices and specs move together in this
 checkpoint.
+
+## 2026-07-12 — NVFP4 W2 raw tactics pass; merged gate/up semantics identified
+
+The staged CUTLASS 4.5/sm_121a W2 build compiles all 32 FlashInfer tactics and
+passes 32/32 forced references, capture probes, real-shape sanitizer coverage,
+the complete focused suites, and byte-for-byte raw-GEMM comparisons with
+FlashInfer. The first full 27B default run nevertheless diverges at layer 1.
+Embedding is exact; isolated layer 0/3 and ordinary-tactic layer 1 pass; an
+internal layer-1 trace localizes the swap-tactic error to the dense MLP after
+identical attention, residual and post-attention norm.
+
+The forced end-to-end sweep is causal but cannot be used as a workaround. IDs
+1, 3 and 7 recover 16/16 oracle tokens and 9/9 prefill argmax positions, while
+forced ID 5 retains only the required 6-token prefix. Nsys maps vLLM's dominant
+128x32x256 static/Stream-K signatures exactly to local swap IDs 4/6, so vLLM
+does not obtain its output by selecting the ordinary arm. Source inspection
+finds the missing execution-chain contract: vLLM's `MergedColumnParallelLinear`
+concatenates gate/up, then its CT NVFP4 loader takes the maximum logical-shard
+weight divisor and input divisor, reciprocates them and computes one alpha for
+one activation quant + one GEMM. Our dense path still runs independently scaled
+gate and up GEMMs; the checkpoint contains differing scalars.
+
+The accepted W2 spike and claim now include the merged dense gate/up resident,
+exact max-divisor/one-alpha semantics and a split diagnostic toggle. The raw
+tactics carry no performance claim yet. Implement this contract, require full
+16/16 model parity, rerun safety/component/trace/exact-27B, and continue to hold
+35B until every 27B axis passes.

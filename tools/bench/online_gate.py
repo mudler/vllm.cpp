@@ -574,6 +574,7 @@ def build_plan(
             "trace/<model>/vllm-kernels.json",
             "trace/<model>/cache-{before-ours,between-engines,after-vllm}.json",
             "trace/<model>/status.json",
+            "summary-<model>/{all-runs,ratios}.json",
             "summary/{all-runs,ratios}.json",
         ],
         "run_contract": {

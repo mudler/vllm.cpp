@@ -50,9 +50,23 @@ are `ffddab5f…bd` / `a24fc776…37`. The first no-GPU metadata recorder comman
 failed before output because direct script invocation omitted the repository
 module path. Its corrected `python -m tools.bench.online_gate` invocation,
 plan validation, exact-source check, corpus conversion and fresh sm_121a build
-pass. No model gate or timed request has run. The full 27B c1-c32 grid plus
-paired traces is `ACTIVE` and will own one lock for the entire series. Every
-throughput, latency and memory axis must pass before any 35B performance run.
+pass. One uncontended model-wide lock then covered the passing model gate, all
+36 cache-off groups/2,016 requests, six memory returns and paired traces. All
+12 performance groups, both memory groups and all 124 axes are binding-eligible;
+**54 pass and 70 fail**. Median total ratios c1→c32 are
+**0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**; host PSS/RSS normalize to
+**0.5855/0.5934×**. The exact 27B gate therefore remains `ACTIVE` with a
+**FAILED/open** performance disposition. Every throughput, latency and memory
+axis must pass before any 35B performance run.
+
+The model-scoped all-runs / ratios / report SHA-256 are
+`c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
+`231ec9fd72226036f224563b1731c2c048056e9b73330b420e6ba98358167591`
+and `445e2d9be160733df6bca9b132a0c8002e229176300af8b1e9610acc3e685692`.
+Trace status / ours kernel summary / vLLM kernel summary are
+`f38b149d…d17`, `8bba1bb1…8f4` and `80999085…d2`. Generated-text and ours
+trace-output repeatability remain explicit diagnostics behind the passing
+commit-bound 16/16 gate and exact native 128-token request counts.
 
 ## Scope
 
@@ -96,8 +110,11 @@ or TTFT/ITL parity. `tools/bench/online_gate.py` now constructs the unmodified
 vLLM v0.25.0 oracle command audited against target `702f481`, freezes
 exact-token corpus views and rejects partial results while accepting pinned-
 vLLM's producer-ahead DELTA aggregation;
-`online_gate_summary.py` makes any missing/mismatched
-model, stream, memory-return, trace or every-axis artifact non-binding. The
+`online_gate_summary.py` makes any missing/mismatched model, stream,
+memory-return, trace or every-axis artifact non-binding. It now accepts an
+explicit single-model scope and writes immutable `summary-<model>/` evidence,
+so a completed failed 27B gate can bind and block 35B without manufacturing
+missing-35B voids; the no-argument `summary/` remains the final two-model gate. The
 failed pre-W2 campaigns remain diagnostics; partial rows are never reused as
 successful repetitions. W0 of `KV-PREFIX-CACHE` now supplies the pinned hybrid
 default-off policy and an explicit server override. The trace contract rejects
@@ -187,10 +204,12 @@ observed half-open `[start_time, start_time + ttft + sum(itls))` interval.
 Pinned vLLM's
 inclusive one-second `max_concurrent_requests` remains hashed diagnostic data
 but is not a saturation oracle because it can overcount sequential boundaries.
-The committed summary exits nonzero unless every detailed result, generated-text
-diagnostic pair/count, stream probe, process/GPU-memory sample, thermal snapshot, cache/
-memory-return record, clean-HEAD build provenance, exact pip-oracle runtime
-inventory, model gate and paired trace is present and hash-valid.
+The committed summary exits zero only when every detailed result,
+generated-text diagnostic pair/count, stream probe, process/GPU-memory sample,
+thermal snapshot, cache/memory-return record, clean-HEAD build provenance,
+exact pip-oracle runtime inventory, model gate and paired trace is present,
+hash-valid, and every axis passes. Exit 1 means complete evidence with an
+every-axis failure; exit 2 means invalid/incomplete evidence or harness misuse.
 
 DGX does not delegate global `/proc/sys/vm/drop_caches` to the benchmark user.
 The gate therefore enumerates every regular checkpoint, corpus, client and
@@ -231,16 +250,17 @@ reported as a clean dependency check.
    (**implemented and CPU-gated**).
 4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points with
    explicit cache-off, identical sampling, scheduler settings, and model length.
-   The immutable `9cc7191` W3-B 27B source/build/corpus preflight is complete;
-   execute its model gate, 36 timed groups and six returns next. Hold 35B.
+   The immutable `9cc7191` 27B model gate, 36 timed groups and six returns are
+   complete; 54/124 axes pass. Hold 35B.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic; the binding
-   `9cc7191` v0.25 trace remains part of the active series. 35B remains gated.
-6. Drive the top traced lever through its owning row. W3-B closes the original
-   wide FP4 tactic-family mismatch. Re-rank only after the exact W3-B grid shows
-   which decode/latency axes remain below floor; do not infer a lever from the
-   profiled total-throughput win while normalized TPOT is still 0.9673x.
+   `9cc7191` v0.25 trace is complete and hash-valid. 35B remains gated.
+6. Diff the completed ours/vLLM kernel lists, rank executed differences by
+   gain÷effort, and drive the top traced lever through its owning row. W3-B
+   already closes the original wide FP4 tactic-family mismatch; do not infer a
+   new lever from source or aggregate category time while exact TPOT/ITL and
+   host-memory axes remain red.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

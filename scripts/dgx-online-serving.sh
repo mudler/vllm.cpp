@@ -520,8 +520,24 @@ for repetition in 1 2 3; do
 done
 run_paired_traces
 
-if [[ -d ${evidence}/raw/27/ours && -d ${evidence}/raw/35/ours ]]; then
-  python3 "${repo_root}/tools/bench/online_gate_summary.py" --evidence "${evidence}"
+model_summary_status=0
+python3 "${repo_root}/tools/bench/online_gate_summary.py" \
+  --evidence "${evidence}" \
+  --model "${model}" || model_summary_status=$?
+if ((model_summary_status > 1)); then
+  exit "${model_summary_status}"
+fi
+
+full_summary_status=0
+if [[ -f ${evidence}/summary-27/ratios.json && -f ${evidence}/summary-35/ratios.json ]]; then
+  python3 "${repo_root}/tools/bench/online_gate_summary.py" \
+    --evidence "${evidence}" || full_summary_status=$?
+  if ((full_summary_status > 1)); then
+    exit "${full_summary_status}"
+  fi
 else
-  echo "model ${model} series complete; cross-model summary waits for the other model" >&2
+  echo "model ${model} summary complete; cross-model summary waits for the other model" >&2
+fi
+if ((model_summary_status != 0 || full_summary_status != 0)); then
+  exit 1
 fi

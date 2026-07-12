@@ -5549,3 +5549,59 @@ the driver from the immutable source. It will acquire one lock around the
 27B correctness gate, all 36 timed groups, six memory returns and both traces.
 Stop on any fail-closed contract violation; never publish partial values. Hold
 35B and every later roadmap track until all applicable 27B axes close.
+
+## 2026-07-12 — immutable `9cc7191` v0.25 27B exact gate complete; parity failed
+
+The cache-off campaign completed under its single uninterrupted `/tmp/gpu`
+lock from immutable source/build
+`9cc71918dbdc10f014c02feb9bab1d00963a16fe`. The commit-bound 27B model gate
+passed in 44.18 seconds. All 36 timed groups completed: c1/2/4/8/16/32 × ours/
+vLLM × three interleaved repetitions, for 2,016 total timed requests (1,008 per
+engine). All six memory returns passed. Every cache inventory remained 49 files
+with digest `da4c229c02948e5d41c7def4f7f9c498031f377b68af518dafdd45ccd1c09344`.
+Owned processes, port 8001, GPU compute inventory and `/tmp/gpu` all returned
+idle after the driver exited.
+
+The paired trace also passed its contract. Ours retained three c16/48 Nsight
+windows (144 requests); vLLM retained a warmup plus three c16/48 torch-profiler
+windows (192 prompts). Trace-status / ours-kernel-summary /
+vLLM-kernel-summary SHA-256 are
+`f38b149d503f3f5beec6b0157d456809a321d6d361fb25aa8d9314ad5d933d17`,
+`8bba1bb18f5c960df8de77437f9bb0020d1193738f93a26137cfc5257fb388f4`
+and `809990853779effbc75ab0618543037c5d8986b4a654c175e7628352a7177ad2`.
+Ours' three generated-text digests are not all equal, while the vLLM warmup and
+three measured digests are equal. Cross-engine generated texts also almost
+never match. This stays diagnostic under the declared FP4 contract: the
+commit-bound 16/16 model gate plus exact 128-token native counts own
+correctness. vLLM logged a missing optional `triton_kernels.matmul_ogs` import
+used by GPT-OSS/MXFP4; executed dense-27B dispatch resolved FlashInfer NVFP4,
+FLA/Triton GDN and FA2, so the frozen environment was not changed.
+
+The current summarizer originally required both models and would have labeled
+the prohibited, unrun 35B half missing. It now accepts an explicit model scope,
+validates only that model, writes `summary-27/`, records the selected model in
+both JSON documents, and preserves `summary/` for the eventual two-model gate.
+The driver always writes the completed model summary, distinguishes exit 1
+(valid evidence, gate failed) from exit 2 (harness/evidence error), and runs the
+cross-model summary only when both raw trees exist. The first file-transfer
+wrapper command was malformed and stopped before the summarizer ran. The
+corrected summarizer wrote the result successfully; a local zsh wrapper then
+used its reserved `status` variable after output creation. Direct JSON/hash
+validation proved the evidence complete, so it was not rerun or overwritten.
+Focused Python and shell-contract tests pass 17/17.
+
+The binding result is **FAILED/open**: 12/12 performance groups, 2/2 memory
+groups and 124/124 axes are eligible, but only 54/124 pass. Median total ratios
+c1→c32 are 0.990137/0.949141/0.963349/0.977035/1.028782/1.046666×, with
+4/4/5/4/17/18 of 20 performance axes passing. Peak PSS/RSS normalize to
+0.585532/0.593423× and fail; peak GPU memory and `MemAvailable` drop normalize
+to 1.812018/1.220983× and pass. All total-throughput CVs are below 0.51%, so
+the shape reproduces. Summary all-runs / ratios / report SHA-256 are
+`c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
+`231ec9fd72226036f224563b1731c2c048056e9b73330b420e6ba98358167591`
+and `445e2d9be160733df6bca9b132a0c8002e229176300af8b1e9610acc3e685692`.
+
+Next: diff the actual steady-state ours/vLLM kernel names, calls and time from
+the completed trace; rank concrete differences by gain÷effort; implement the
+top 27B lever behind a same-binary A/B; rerun correctness and the exact grid.
+Do not run 35B or resume later roadmap rows until all 124 27B axes pass.

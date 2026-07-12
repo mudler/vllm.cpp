@@ -20,6 +20,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    MODEL_REVISIONS,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
@@ -28,7 +29,7 @@ from tools.bench.online_gate import (
     VLLM_ORACLE_VERSION,
 )
 from tools.bench.online_gate_summary import summarize_evidence
-from tools.bench.serve_low_common import VLLM_COMMIT, sha256_file
+from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
 
 
 def _record(*, faster: bool, repetition: int) -> dict:
@@ -263,7 +264,7 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "files": corpus_files,
                 "model_key": "27",
                 "source_manifest_sha256": sha256_file(source_manifest),
-                "tokenizer_revision": "revision",
+                "tokenizer_revision": MODEL_REVISIONS["27"],
                 "vllm_commit": VLLM_COMMIT,
             }
         ),
@@ -379,11 +380,19 @@ class OnlineGateSummaryTests(unittest.TestCase):
             mock.patch("tools.bench.online_gate.POINTS", ((1, 2),)),
             mock.patch("tools.bench.online_gate_summary.POINTS", ((1, 2),)),
             mock.patch(
-                "tools.bench.online_gate_summary.MODEL_REVISIONS", {"27": "revision"}
+                "tools.bench.online_gate_summary.MODEL_REVISIONS",
+                {"27": MODEL_REVISIONS["27"]},
             ),
         )
         with patches[0], patches[1], patches[2]:
             return summarize_evidence(root)
+
+    def _summarize_model(self, root: pathlib.Path):
+        with (
+            mock.patch("tools.bench.online_gate.POINTS", ((1, 2),)),
+            mock.patch("tools.bench.online_gate_summary.POINTS", ((1, 2),)),
+        ):
+            return summarize_evidence(root, models=("27",))
 
     def test_complete_exact_outputs_and_better_axes_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -394,6 +403,28 @@ class OnlineGateSummaryTests(unittest.TestCase):
             self.assertTrue(ratios["gate_pass"])
             self.assertTrue(all(item["binding_eligible"] for item in ratios["ratios"]))
             self.assertTrue(all(item["pass"] for item in ratios["ratios"]))
+
+    def test_model_summary_does_not_require_the_other_gate_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            runs, ratios = self._summarize_model(root)
+            self.assertEqual(runs["models"], ["27"])
+            self.assertEqual(ratios["models"], ["27"])
+            self.assertTrue(runs["gate_pass"])
+            self.assertFalse(
+                any("35" in reason for reason in runs["campaign_reasons"])
+            )
+
+    def test_model_selection_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(HarnessError, "empty"):
+                summarize_evidence(root, models=())
+            with self.assertRaisesRegex(HarnessError, "duplicates"):
+                summarize_evidence(root, models=("27", "27"))
+            with self.assertRaisesRegex(HarnessError, "unknown"):
+                summarize_evidence(root, models=("not-a-model",))
 
     def test_text_difference_is_diagnostic_after_model_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

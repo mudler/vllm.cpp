@@ -5,9 +5,10 @@ v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
 pin delta is classified (94 `INVENTORY`, 51 `IGNORE`, no trace-independent
 `PORT-NOW` change in the implemented Qwen T0 slice). The pin remains unchanged
-until target goldens/model behavior gates are re-run and the new performance
-denominator is established. The executable v0.25.0/FlashInfer 0.6.13 oracle is
-already validated and active with a preserved v0.24.0 rollback.
+until target goldens/model behavior gates are re-run and exact 27B→35B
+performance closes. The executable v0.25.0/FlashInfer 0.6.13 oracle is already
+validated and active with a preserved v0.24.0 rollback; immutable `9cc7191`
+establishes the new 27B denominator but fails parity at 54/124 axes.
 
 - **Reference checkout:** `/home/mudler/_git/vllm`, branch `main`
   (https://github.com/vllm-project/vllm).

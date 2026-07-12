@@ -542,7 +542,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
-| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A and W3-B classified; W3 remains active:** A retains three warmups + stream sync + 1,000-us GPU delay + ten eager repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch and diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`), plus actual-W4A4 shared-loader readiness ordering (`model_loader.cpp:211-260`). `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Clean exact/legacy/model/memcheck/server evidence passes at 80/80 profiles, zero lazy misses, 16/16 correctness and zero sanitizer errors. Repeated prewarm/lazy component means are **808.457/808.220 tok/s = 1.000293×** with strict **15/20 timing + 2/4 memory** and only **20/80** stable prewarm IDs; first-use improves **5.662→0.779 s**, so production-faithful prewarm stays without speed credit. Paired trace and oracle performance remain. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
+| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A and W3-B classified; W3 remains active:** A retains three warmups + stream sync + 1,000-us GPU delay + ten eager repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch and diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`), plus actual-W4A4 shared-loader readiness ordering (`model_loader.cpp:211-260`). `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Clean exact/legacy/model/memcheck/server evidence passes at 80/80 profiles, zero lazy misses, 16/16 correctness and zero sanitizer errors. Repeated prewarm/lazy component means are **808.457/808.220 tok/s = 1.000293×** with strict **15/20 timing + 2/4 memory** and only **20/80** stable prewarm IDs; first-use improves **5.662→0.779 s**, so production-faithful prewarm stays without speed credit. Immutable `9cc7191` now closes the paired v0.25 trace and exact oracle checkpoint but strict-fails at **54/124** axes. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
 | diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
 
@@ -564,7 +564,7 @@ wrappers.
 | `Qwen2MoeMLP` + `MergedColumnParallelLinear` (`qwen2_moe.py:75-115`, `linear.py:580-695`) | add a fused-vs-split CUDA gate/up probe over concatenated packed weights/scales, including unequal CT global divisors; pin the exact max-divisor/one-alpha contract and fused BF16 activation |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected trace then puts FP4 kernel time within 0.63% of vLLM and matches the narrow-pair aggregate while profiled TPOT stays red. Exact c1-c32 performance remains; stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected old-oracle trace puts FP4 kernel time within 0.63% of vLLM. The binding `9cc7191` v0.25 c1-c32 grid/trace now completes with **54/124** axes passing; stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -638,7 +638,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A/W3-B component and corrected old-oracle structural trace classifications are complete. `3cc490c` is VOID at 28/36 groups after the 0.24.0/0.25.0 dependency drift was proven. Canonical v0.25.0 validation/activation and real 27B generation/server smoke now pass; re-run the full exact 27B grid/trace before selecting another topology repair. W3-C remains separately gated and cannot own the oracle speed comparison |
+| W3 | A: production-FlashInfer eager timing (3 warmups, sync, 1-ms GPU delay, 10 repeats) and selected-plan evidence; B: pre-serve all-bucket in-memory warmup with lazy diagnostic fallback; C: optional versioned persistent plan cache with collision-complete key, atomic load/save/stale rejection and startup/memory evidence | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. W3-A/W3-B component and corrected old-oracle structural trace classifications are complete. `3cc490c` is VOID. Immutable `9cc7191` completes the canonical v0.25.0 exact 27B grid/trace with all 124 axes valid but only 54 passing. Diff its actual kernel lists and select the highest-ranked executed repair; W3-C remains separately optional and cannot own the oracle speed comparison |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -702,13 +702,12 @@ tactics and generated suffixes; correctness remains the exact op and committed
 native model gates, never generated-text equality between independent tuning
 sessions.
 
-That component checkpoint did not close W2. The subsequent clean `b5c6e4f`
-campaign above is now the binding denominator and confirms a strict acceptance
-failure with a trace-grounded selection mismatch. W3-A and W3-B same-binary
-selection A/Bs are now classified and strict-failed. W3's corrected paired
-trace is now clean and structurally classified. W3 owns the next
-c1/2/4/8/16/32 three-repetition 27B oracle campaign before another
-execution-grounded repair.
+That component checkpoint did not close W2. The clean `b5c6e4f` campaign is now
+historical after the oracle upgrade. W3-A and W3-B same-binary selection A/Bs
+are classified and strict-failed, and W3's corrected old-oracle paired trace is
+clean and structurally classified. Immutable `9cc7191` now owns the binding
+c1/2/4/8/16/32 three-repetition v0.25 27B oracle result: **54/124** axes pass.
+The next work is an execution-grounded repair selected from its paired trace.
 Keep 35B held until all 27B throughput, latency and memory axes pass.
 
 ### W3-B corrected paired-trace classification (2026-07-12)
@@ -749,22 +748,27 @@ at 28/36 groups, 1,602/2,016 timed requests, four memory returns and no paired
 trace after proving that the DGX oracle was vLLM 0.24.0 + FlashInfer 0.6.12,
 while the audited v0.25.0 target requires FlashInfer 0.6.13. The owned remote
 process group was terminated and GPU/ports/lock were verified idle; no partial
-rate binds. The isolated v0.25.0 oracle is now validated and atomically active
-with rollback preserved; run the full exact 27B grid plus paired trace. If any
-axis remains below floor,
-rank the executed launch/traffic differences before changing FP4
+rate binds. The isolated v0.25.0 oracle is validated and atomically active with
+rollback preserved. Immutable `9cc7191` has now run the full exact 27B grid plus
+paired trace, and 70/124 axes remain below floor. Rank the executed
+launch/traffic differences before changing FP4
 quantization, block-scale layout, normalization fusion or alpha residency.
 W3-C stays optional and 35B remains prohibited until every 27B axis passes.
 
-The replacement exact campaign is now **ACTIVE** from immutable clean
+The replacement exact campaign is **complete but failed/open** from immutable clean
 `9cc71918dbdc10f014c02feb9bab1d00963a16fe`. Its detached source, fresh sm_121a
 server/model-gate build, vLLM 0.25.0 oracle fingerprint and exact c1-c32
 source/vLLM corpus views are prepared and hashed under
 `~/work/vllm.cpp-online-gate/evidence/9cc71918dbdc10f014c02feb9bab1d00963a16fe`.
 One no-GPU recorder command failed before output because it omitted the repo
 module path; the corrected module invocation passes. The locked model gate,
-36 timed groups, six returns and paired traces remain unexecuted, so there is no
-new rate or topology decision.
+36/36 timed groups, 2,016/2,016 requests, six returns and paired traces all pass
+their evidence contracts. All 124 axes bind; **54 pass and 70 fail**. Total
+ratios c1→c32 are **0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×** and host
+PSS/RSS normalize to **0.5855/0.5934×**. Summary hashes are `c46595b8…a894` /
+`231ec9fd…7591`; trace status and kernel-summary hashes are
+`f38b149d…d17`, `8bba1bb1…8f4` and `80999085…d2`. This selects trace diffing,
+not a speculative topology decision, as the next step.
 
 ## Risks and decisions
 

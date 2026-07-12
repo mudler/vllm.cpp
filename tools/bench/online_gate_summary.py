@@ -581,7 +581,24 @@ def _corpus_reasons(evidence_root: pathlib.Path, model: str) -> list[str]:
     return reasons
 
 
-def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _select_models(models: Sequence[str] | None) -> tuple[str, ...]:
+    selected = tuple(MODEL_REVISIONS) if models is None else tuple(models)
+    if not selected:
+        raise HarnessError("model selection is empty")
+    if len(set(selected)) != len(selected):
+        raise HarnessError("model selection contains duplicates")
+    unknown = sorted(set(selected) - set(MODEL_REVISIONS))
+    if unknown:
+        raise HarnessError(f"unknown model selection: {unknown}")
+    return selected
+
+
+def summarize_evidence(
+    evidence_root: pathlib.Path,
+    *,
+    models: Sequence[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    selected_models = _select_models(models)
     grouped: dict[tuple[str, str, int], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     raw_root = evidence_root / "raw"
     if not raw_root.is_dir():
@@ -593,7 +610,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
             continue
         relative = path.relative_to(raw_root)
         model, engine = relative.parts[:2]
-        if model not in MODEL_REVISIONS or engine not in ENGINES:
+        if model not in selected_models or engine not in ENGINES:
             continue
         concurrency = int(match.group("concurrency"))
         repetition = int(match.group("repetition"))
@@ -661,7 +678,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
 
     expected_groups = {
         (model, engine, concurrency)
-        for model in MODEL_REVISIONS
+        for model in selected_models
         for engine in ENGINES
         for concurrency, _ in POINTS
     }
@@ -676,13 +693,13 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
             _corpus_reasons(evidence_root, model)
             + _model_precondition_reasons(evidence_root, model, vllm_cpp_sha)
         )
-        for model in MODEL_REVISIONS
+        for model in selected_models
     }
     stream_reasons = {
         (model, engine, repetition): _stream_preflight_reasons(
             evidence_root, model, engine, repetition
         )
-        for model in MODEL_REVISIONS
+        for model in selected_models
         for engine in ENGINES
         for repetition in REPETITIONS
     }
@@ -693,7 +710,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
     # while the commit-bound model gate plus exact native counts own correctness.
     pair_reasons: dict[tuple[str, int, int], list[str]] = defaultdict(list)
     output_text_diagnostics: list[dict[str, Any]] = []
-    for model in MODEL_REVISIONS:
+    for model in selected_models:
         for concurrency, _ in POINTS:
             per_engine = {
                 engine: {rep: run for rep, run in grouped.get((model, engine, concurrency), [])}
@@ -726,7 +743,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
 
     leg_memory: dict[tuple[str, str, int], dict[str, float | None]] = {}
     leg_reasons: dict[tuple[str, str, int], list[str]] = {}
-    for model in MODEL_REVISIONS:
+    for model in selected_models:
         for engine in ENGINES:
             for repetition in REPETITIONS:
                 key = (model, engine, repetition)
@@ -780,7 +797,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
 
     memory_aggregates: list[dict[str, Any]] = []
     memory_index: dict[tuple[str, str], dict[str, Any]] = {}
-    for model in MODEL_REVISIONS:
+    for model in selected_models:
         for engine in ENGINES:
             reasons = [
                 reason
@@ -809,7 +826,7 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
             memory_index[(model, engine)] = aggregate
 
     ratios: list[dict[str, Any]] = []
-    for model in MODEL_REVISIONS:
+    for model in selected_models:
         for concurrency, _ in POINTS:
             ours = aggregate_index[(model, "ours", concurrency)]
             floor = aggregate_index[(model, "vllm", concurrency)]
@@ -882,15 +899,22 @@ def summarize_evidence(evidence_root: pathlib.Path) -> tuple[dict[str, Any], dic
         "campaign_reasons": campaign_reasons,
         "gate_pass": gate_pass,
         "memory_aggregates": memory_aggregates,
+        "models": list(selected_models),
         "output_text_diagnostics": output_text_diagnostics,
         "raw_runs": raw_runs,
     }
-    ratios_document = {"gate_pass": gate_pass, "ratios": ratios}
+    ratios_document = {
+        "gate_pass": gate_pass,
+        "models": list(selected_models),
+        "ratios": ratios,
+    }
     return runs_document, ratios_document
 
 
 def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
     lines = ["# CUDA online serving gate summary", ""]
+    lines.append(f"Models: {', '.join(runs['models'])}.")
+    lines.append("")
     lines.append(f"Gate pass: **{'YES' if runs['gate_pass'] else 'NO'}**.")
     lines.append("")
     eligible = sum(item["binding_eligible"] for item in runs["aggregates"])
@@ -913,9 +937,11 @@ def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence", type=pathlib.Path, required=True)
+    parser.add_argument("--model", choices=tuple(MODEL_REVISIONS))
     args = parser.parse_args()
-    runs, ratios = summarize_evidence(args.evidence)
-    output = args.evidence / "summary"
+    models = (args.model,) if args.model is not None else None
+    runs, ratios = summarize_evidence(args.evidence, models=models)
+    output = args.evidence / (f"summary-{args.model}" if args.model else "summary")
     if output.exists() and any(output.iterdir()):
         raise HarnessError(f"refusing to overwrite summary evidence in {output}")
     write_json_atomic(output / "all-runs.json", runs)

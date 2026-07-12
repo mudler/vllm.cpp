@@ -232,6 +232,10 @@ class OnlineClientContractTests(unittest.TestCase):
             plan["vllm_oracle_bench_dependencies"],
             {"pandas": PANDAS_VERSION},
         )
+        self.assertIn(
+            "summary-<model>/{all-runs,ratios}.json",
+            plan["required_artifacts"],
+        )
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
@@ -260,6 +264,16 @@ class OnlineClientContractTests(unittest.TestCase):
             "\n  )", 1
         )[0]
         self.assertIn('env "PATH=$(dirname "${client}"):${PATH}"', block)
+
+    def test_campaign_writes_a_model_summary_before_cross_model_summary(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('--model "${model}"', script)
+        self.assertIn("model_summary_status", script)
+        self.assertIn("summary-27/ratios.json", script)
+        self.assertIn("summary-35/ratios.json", script)
 
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

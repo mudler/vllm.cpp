@@ -106,15 +106,19 @@ preserves pointer validity while approximating its bounded shard lifetime.
 4. `W4.4`: if W4.3 remains above vLLM, spike and implement layer-bounded
    direct-device materialization; do not describe W4.1-W4.3 as peak parity.
 
-Implementation checkpoint: W4.1-W4.2 are complete. CPU CTest passes 105/105;
-native-sm_120 focused tests pass 5/5 with discard enabled and 2/2 with
-`VT_SAFETENSORS_DISCARD_PAGES=0`. W4.3 memory/load-time/throughput measurement
-is `PENDING`, so no improved number or peak-parity claim is accepted.
+Rejected checkpoint `394a933`: W4.1's reader primitive and all correctness
+tests pass, but W4.2 advised each complete multi-GiB mapping after every layer.
+The first monitored leg remained pre-GPU at 173.75 s versus about 25 s for a
+prior complete monitored run, so it was interrupted and rejected. Its partial
+11.41-GiB peak is `VOID`. W4.2b must track tensors returned by the resolver and
+advise only their page-aligned byte ranges at each boundary before W4.3 restarts.
 
 ## Risks and mitigations
 
 - Advice can increase file refaults and load time. Checkpoints are layer-sized,
   not tensor-sized, and load time is measured explicitly.
+- Advising each whole multi-GiB mapping per layer is empirically rejected at
+  `394a933`; only consumed tensor byte ranges may be advised in W4.2b.
 - Kernel readahead may keep nearby pages resident. PSS measurement decides the
   result; no reduction is inferred from the API call alone.
 - Advice failure or a platform without `MADV_DONTNEED` preserves prior

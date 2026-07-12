@@ -147,8 +147,9 @@ peak remains 15.55 versus 6.69 GiB. The row therefore remains `ACTIVE`.
 W4 spike checkpoint: source-chain inspection confirms that vLLM's ordinary
 iterator scopes one `safe_open` per shard while this project retains every
 mapping through full owned materialization. W4.1-W4.2 are implemented and
-CPU/native-sm_120 gated; improved numbers remain `PENDING` until W4.3 measures
-the immutable binary.
+CPU/native-sm_120 correctness-gated, but whole-mapping advice is rejected after
+one >173.75-s pre-GPU leg. W4.2b narrows advice to consumed tensor ranges before
+W4.3; no improved number is accepted.
 
 ## Risks and decisions
 

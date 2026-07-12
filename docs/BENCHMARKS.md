@@ -539,13 +539,15 @@ Versus the pre-change vllm.cpp baseline, stable PSS falls 12.59→0.752 GiB and
 launch peak falls 19.77→15.55 GiB (-21.4%). The residual peak is created before
 residency by simultaneous safetensors mappings plus full owned materialization;
 the W4 source-chain spike confirms that vLLM scopes `safe_open` one shard at a
-time while this project retains every mapping. Default-on, fail-open
-source-page discard after globals/each layer is now `ACTIVE` and implemented;
-`VT_SAFETENSORS_DISCARD_PAGES=0` is the same-binary control. CPU CTest passes
-105/105, focused native-sm_120 default tests pass 5/5, and opt-out tests pass
-2/2. Peak PSS, load time and throughput remain `PENDING`; direct-device loading
-is still required if the owned-model floor stays above vLLM. No improved number
-is claimed and the row cannot close.
+time while this project retains every mapping. The first default-on whole-map
+advice implementation is **FAILED / REJECTED**: commit `394a933` remained
+pre-GPU after 173.75 s and was interrupted, whereas the prior complete monitored
+project legs took about 25 s. The partial 11.41-GiB peak is `VOID` because the
+process had not completed loading and could still rise. GPU state returned to
+146 MiB / 0% / 40 C. CPU 105/105 and focused native-sm_120 default 5/5 plus
+opt-out 2/2 were green, but cannot accept the load-time regression. A
+tensor-range-only replacement is `PENDING`; no improved memory or throughput
+number is claimed and the row cannot close.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

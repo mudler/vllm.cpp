@@ -7048,3 +7048,21 @@ rerunning unchanged source in `nix develop .#cuda` passed, confirming an
 environment invocation error rather than a code defect. W4.3 peak PSS, stable
 PSS, VRAM, load time, output A/B and throughput remain pending from an immutable
 commit; no improved number is claimed here.
+
+## 2026-07-12 — W4.2 whole-map advice rejected before GPU initialization
+
+Started the immutable `394a933` three-arm campaign under one `/tmp/gpu` lock.
+The first default-on process remained in host loading with zero process VRAM at
+173.75 s, versus about 25 s for each prior complete monitored project leg. It
+was interrupted rather than spending the full series on a decisive regression.
+Peak-so-far was 11,960,935 KiB (**11.41 GiB**), but that number is `VOID`: the
+process had not completed loading and could still increase. No vLLM, OFF,
+throughput or output-comparison leg ran.
+
+The rejected implementation advised every complete shard mapping after every
+layer. W4.2b will retain the tested fail-open reader primitive but record each
+tensor returned by the resolver and advise only its page-aligned byte range at
+the global/layer boundary. This avoids repeatedly walking multi-GiB mappings and
+preserves future tensor pages. After interruption, the process exited and the
+GPU was read-only verified at 146 MiB, 0%, 40 C. No system configuration or
+kernel execution was involved.

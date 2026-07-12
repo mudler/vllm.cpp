@@ -526,17 +526,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   process VRAM **11,689 versus 12,924 MiB (0.904×)**. Launch peak PSS improves
   to **15.55 GiB (-21.4%)** but remains above vLLM's **6.69 GiB (2.32×)**, so
   memory parity as a whole remains open. The W4 spike identifies cumulative
-  resident pages from all-shard mappings as the first target. Default-on,
-  fail-open page-discard checkpoints at globals/layer boundaries are now
-  **implemented and GATING on measurement**; `VT_SAFETENSORS_DISCARD_PAGES=0`
-  is the same-binary control. Direct-device loading remains
+  resident pages from all-shard mappings as the first target. The first
+  whole-mapping advice placement is **REJECTED**: its initial monitored leg was
+  interrupted still pre-GPU at 173.75 s versus about 25 s for the prior complete
+  run. Its 11.41-GiB partial peak is `VOID`, not an accepted improvement.
+  Tensor-range-only advice is now pending; `VT_SAFETENSORS_DISCARD_PAGES=0`
+  remains the same-binary control. Direct-device loading remains
   required if the owned-model floor still exceeds vLLM. Prepare-time release
   is **+1.74%** versus OFF and reaches **0.9754×**
   fresh-vLLM total/output throughput; performance parity also remains open.
   Full CPU CTest passes 105/105 and focused native-sm_120 CTest passes 4/4.
-  W4 additionally passes its focused native-sm_120 default 5/5 and opt-out 2/2
-  tests; no improved memory or throughput number is claimed before the locked
-  campaign.
+  W4's rejected implementation passed focused native-sm_120 default 5/5 and
+  opt-out 2/2 tests, but load-time regression overrides that correctness gate.
+  No improved memory or throughput number is claimed.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

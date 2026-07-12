@@ -7009,3 +7009,23 @@ lock-held focused native-sm_120 CUDA-build CTest
 `model_registry|qwen27_dense_forward|qwen27_paged_forward|loaded_engine_dense`
 **4/4**. Both build trees compile. The agent-record checker, mutation suite and
 doc-checkpoint checker remain the final repository gates before commit.
+
+## 2026-07-12 — launch-peak W4 source-page spike accepted
+
+Traced the complete load lifetime before changing code. Production vLLM 0.24's
+ordinary path selects `safetensors_weights_iterator`, scopes one `safe_open`
+per sorted shard and streams its tensors into `model.load_weights`. This
+project's `LoadShards` instead mmaps every shard up front; the dense loader then
+copies globals and all layers while every touched source page remains resident,
+and only clears mappings after the complete model returns. That explains the
+15.55-GiB peak as the 8.585-GiB owned host model plus most source pages.
+
+The committed W4 contract first preserves pointer validity while issuing
+fail-open `MADV_DONTNEED` advice after globals and each complete dense layer.
+It is default on with `VT_SAFETENSORS_DISCARD_PAGES=0` as a same-binary control.
+W4 gates exact reread and model-output behavior, three lock-held peak/load-time
+repetitions versus OFF and fresh vLLM, and unmonitored throughput. If the
+remaining owned-model floor is above vLLM, direct-to-device/bounded
+materialization must be separately recorded and implemented; page advice alone
+cannot close the row by assertion. No runtime code or improved number is part
+of this spike checkpoint.

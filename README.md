@@ -525,8 +525,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   process PSS **0.752 GiB versus 4.097 GiB vLLM (0.184×; 81.6% lower)** and peak
   process VRAM **11,689 versus 12,924 MiB (0.904×)**. Launch peak PSS improves
   to **15.55 GiB (-21.4%)** but remains above vLLM's **6.69 GiB (2.32×)**, so
-  memory parity as a whole remains open pending bounded streaming/direct-device
-  loading. Prepare-time release is **+1.74%** versus OFF and reaches **0.9754×**
+  memory parity as a whole remains open. The W4 spike identifies cumulative
+  resident pages from all-shard mappings as the first target: default-on,
+  fail-open page-discard checkpoints at globals/layer boundaries are
+  **PENDING implementation and measurement**; direct-device loading remains
+  required if the owned-model floor still exceeds vLLM. Prepare-time release
+  is **+1.74%** versus OFF and reaches **0.9754×**
   fresh-vLLM total/output throughput; performance parity also remains open.
   Full CPU CTest passes 105/105 and focused native-sm_120 CTest passes 4/4.
   The recurring NVIDIA

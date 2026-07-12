@@ -133,13 +133,21 @@ change. The implementation checkpoint records full commands and commit IDs.
    canonical packed B/A and gate/up storage while preserving fallback output.
 3. `W3` gates: CPU/CUDA correctness, repeat-forward, memory and throughput A/B,
    fresh vLLM denominator, trace-name and kernel-log safety checks.
-4. `W4` peak follow-on: if peak PSS remains above vLLM, spike a direct-device or
-   bounded-window streaming safetensors loader rather than claiming closure.
+4. `W4` peak follow-on: the accepted
+   [bounded source-page residency spike](safetensors-bounded-page-residency.md)
+   first drops consumed file-backed pages at global/layer boundaries, measures
+   the remaining owned-model floor, and requires a separately recorded
+   direct-device phase if peak PSS still exceeds vLLM.
 
 Checkpoint `6c30657`: W1-W3 are implemented and measured. Stable GPU-resident
 PSS is 0.752 GiB versus 4.097 GiB vLLM; peak VRAM is 11,689 versus 12,924 MiB;
 prepare-time ON is +1.74% throughput versus OFF. W4 is required because launch
 peak remains 15.55 versus 6.69 GiB. The row therefore remains `ACTIVE`.
+
+W4 spike checkpoint: source-chain inspection confirms that vLLM's ordinary
+iterator scopes one `safe_open` per shard while this project retains every
+mapping through full owned materialization. Implementation and improved numbers
+remain `PENDING` until W4.1-W4.3 are built, tested, and measured.
 
 ## Risks and decisions
 

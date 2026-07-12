@@ -538,8 +538,12 @@ the removed tied device allocation.
 Versus the pre-change vllm.cpp baseline, stable PSS falls 12.59→0.752 GiB and
 launch peak falls 19.77→15.55 GiB (-21.4%). The residual peak is created before
 residency by simultaneous safetensors mappings plus full owned materialization;
-bounded streaming/direct-device loading is explicitly `PENDING` and prevents
-row closure.
+the W4 source-chain spike confirms that vLLM scopes `safe_open` one shard at a
+time while this project retains every mapping. Default-on, fail-open
+source-page discard after globals/each layer is now `PENDING` implementation
+and measurement. Direct-device loading remains the required follow-on if the
+owned-model floor stays above vLLM; no improved number is claimed and the row
+cannot close.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

@@ -5746,3 +5746,29 @@ MODEL=326, QUANT=81, KERNEL=30, BACKEND=52; `check-doc-checkpoint.py` passes;
 because `tests/agents` is not an importable repository directory. The corrected
 `python3 -m unittest tests.scripts.test_agent_record
 tests.scripts.test_doc_checkpoint` passes **18/18**.
+
+### 2026-07-12 — W3-D post-pack node trace closes 240→208 topology
+
+Fresh immutable evidence at
+`~/work/vllm.cpp-online-trace-node/evidence/3f256abdbb558e162bf8a2196284deb119648560`
+repeats the accepted c16/48×3 input-1,024/output-128 node-trace contract against
+the unchanged vLLM 0.25.0/FlashInfer 0.6.13 oracle. One `/tmp/gpu` lock covers
+the 27B model gate, ours Nsight `--cuda-graph-trace=node`, vLLM Torch profiler
+and all three 49-file cache inventories. The model gate passes in 42.62 s;
+`status.json` is `passed:true`; GPU, port and lock exit idle.
+
+Ours now contains **2,170,753 graph-child / 248,529 eager** CUDA-kernel rows
+and 7,231 graph-node IDs. The same block-scaled CUTLASS filter as the accepted
+before-trace yields **296,674 graph FP4 launches**. The large BF16 lm-head
+marker occurs **1,425** times, giving **208.192 FP4 GEMMs/forward**: exactly the
+208 steady-state topology plus 274 capture/warmup launches. vLLM remains
+**330,304/1,588 = 208**. This closes the selected exact 32-launch gap; profiled
+rates and cross-profiler durations remain diagnostic.
+
+Status / ours Nsight / SQLite / ours kernel summary / vLLM kernel summary SHA
+are `90350b03…9908` / `6e7e3c6c…b5f9` / `607877d2…65cd` /
+`43ae3507…44ac` / `7988b5ea…08ee`; model-gate log SHA is
+`77dbb034…60b2`. W3-D remains `ACTIVE`: its component strict-failed at 14/20
+timing +2/4 memory and `9cc7191` remains the binding 54/124 result. Next:
+commit/push this checkpoint, then run the fresh exact 27B grid before selecting
+another residual lever. Do not run 35B.

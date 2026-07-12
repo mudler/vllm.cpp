@@ -5772,3 +5772,25 @@ are `90350b03…9908` / `6e7e3c6c…b5f9` / `607877d2…65cd` /
 timing +2/4 memory and `9cc7191` remains the binding 54/124 result. Next:
 commit/push this checkpoint, then run the fresh exact 27B grid before selecting
 another residual lever. Do not run 35B.
+
+### 2026-07-12 — W3-D fresh exact 27B grid prepared (`ACTIVE/PENDING`)
+
+Created immutable evidence root
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560`
+from the same clean pushed runtime binary used by the component and post-pack
+trace. The vLLM 0.25 plan validates; the exact source and transformed vLLM
+corpora are copied from binding `9cc7191`. Plan/source/vLLM-corpus SHA are
+`0e309d8b…9999` / `41bd634a…fd7a` / `b048d789…e5dc`.
+
+No GPU execution occurred in this setup checkpoint: **0/36 timed groups,
+0/2,016 requests, 0/6 memory returns, no model gate and no paired trace**.
+GPU and `/tmp/gpu` remain idle. `9cc7191` continues to bind at 54/124; no
+partial value is accepted. Next: commit/push this `ACTIVE` checkpoint, then
+run `scripts/dgx-online-serving.sh --execute --model 27` under its single
+whole-series lock. Do not run 35B.
+
+ACTIVE-checkpoint validation: the first canonical-record/mutation run
+**FAILED** because a shortened `BACKEND-GATE-CUDA-VLLM` evidence cell had
+dropped its exact 27B/35B test anchors. Restoring those links fixes the record;
+the corrected record checker, doc checker, diff check and **18/18** mutation
+tests pass.

@@ -649,7 +649,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. A/B classifications and `9cc7191`'s exact grid are complete; only 54/124 axes pass. D correctness/A-B/trace are complete: default/split 235/235 +16/16, 64/80 profiles, c16 1.005049×, strict 14/20 timing +2/4 memory, and post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward. Structural target passes; exact grid is next, C stays optional |
+| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. D correctness/A-B/trace are complete: c16 1.005049×, strict 14/20 timing +2/4 memory, and post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward. Fresh exact `3f256ab` evidence is ACTIVE/PENDING with validated plan/corpus and 0/36 groups; `9cc7191` still binds at 54/124. C stays optional |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -903,6 +903,18 @@ SHA-256 are `90350b03…9908` / `6e7e3c6c…b5f9` / `607877d2…65cd` /
 `43ae3507…44ac` / `7988b5ea…08ee`. W3-D remains `ACTIVE`, not `DONE`: its
 component strict-failed and the binding grid remains 54/124. Repeat the exact
 27B grid before selecting the next residual lever; do not run 35B.
+
+### W3-D fresh exact-grid setup checkpoint (2026-07-12)
+
+Evidence
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560`
+is **ACTIVE/PENDING**. The vLLM 0.25 plan validates against the clean pushed
+runtime SHA and its exact source/vLLM corpora were copied from binding
+`9cc7191`; plan/source/vLLM-corpus SHA are `0e309d8b…9999` /
+`41bd634a…fd7a` / `b048d789…e5dc`. At this checkpoint the root contains
+**0/36 timed groups, 0/2,016 requests, 0/6 memory returns and no paired trace**.
+No partial performance value exists. GPU and `/tmp/gpu` are idle. Execute the
+entire 27B series under one lock; do not run 35B.
 
 ## Risks and decisions
 

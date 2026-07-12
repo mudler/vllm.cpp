@@ -7083,3 +7083,39 @@ iterations and observed four under contention, then passed **3/3** in isolation.
 No loader code reaches that subsystem, but the non-green concurrent full result
 is retained rather than hidden. The range replacement now needs an uncontended
 immutable load-time killgate before the full W4 memory/performance series.
+
+## 2026-07-12 — W4.3 consumed-range PSS accepted; direct-device remains
+
+Corrected an environment mistake before accepting evidence. The initial
+whole-map and first range killgates invoked the CUDA-built binary outside
+`nix develop .#cuda`; both showed zero process VRAM. A read-only GDB capture of
+the OFF control showed all 24 threads inside `vt::cpu::MatmulOneChunk`, proving
+runtime CPU fallback. Their 173.75/115.53-s partial runtimes and partial peaks
+are `VOID`; the earlier whole-map `FAILED` label is superseded, not evidence.
+
+The corrected immutable `a077d72` campaign wrapped both the lock and process in
+the CUDA flake and completed three interleaved ON/vLLM/OFF memory repetitions
+plus three unmonitored timing repetitions. Raw evidence:
+`/tmp/qwen35-peak-w4-a077d72`; captured driver SHA-256
+`e49f05162bf2e3d06ac25f7224189b87b2684aa7405d203f6027ecd80852c2cd`.
+
+- Launch peak PSS: ON **8.1682 GiB** (range 8.16819-8.16824), OFF
+  **15.5622 GiB** (15.012-15.838), fresh vLLM **7.6949 GiB** (6.971-8.074).
+  ON is 47.5% below OFF but **1.0615x vLLM**, so W4.4 remains required.
+- Stable PSS: ON **0.7537**, OFF 0.7536, vLLM 4.0991 GiB. Peak process VRAM:
+  ON **11,682**, OFF 11,686, vLLM 12,924 MiB.
+- Full monitored process wall: ON **28.945**, OFF 29.539, vLLM 57.217 s.
+  The pre-benchmark wall-minus-duration proxy is 6.325 ON vs 6.922 s OFF.
+- Unmonitored throughput: ON 6550.86/6554.02/6555.84, mean **6553.57**;
+  OFF mean **6552.29** (+0.0196% ON); fresh vLLM mean **6717.94**. ON is
+  **0.9755x** vLLM total and output throughput.
+- ON/OFF token files are byte-identical in all three runs; current project
+  output matches the prior project file 128/128. Cross-engine exactness on this
+  tie-sensitive throughput corpus is 79/128, so correctness remains open.
+
+Final uncontended CPU CTest passes **105/105**; native-sm_120 focused default
+and opt-out remain **5/5** and **2/2**. Every process exited, GPU returned to
+146 MiB / 0% / 42 C, and the benchmark-window kernel journal has no entries.
+`ENG-HOST-WEIGHT-RESIDENCY` remains `ACTIVE`: W4.3 is accepted, while W4.4 must
+spike layer-bounded direct-device materialization to remove the remaining owned
+host model before any peak-memory parity claim.

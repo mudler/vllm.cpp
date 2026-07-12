@@ -521,28 +521,26 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   `VT_RELEASE_HOST_WEIGHTS=0` retains the W2-only control; CPU, UMA, borrowed and
   quantized release behavior is unchanged.
 
-  At commit `6c30657`, three interleaved repetitions give steady GPU-resident
-  process PSS **0.752 GiB versus 4.097 GiB vLLM (0.184×; 81.6% lower)** and peak
-  process VRAM **11,689 versus 12,924 MiB (0.904×)**. Launch peak PSS improves
-  to **15.55 GiB (-21.4%)** but remains above vLLM's **6.69 GiB (2.32×)**, so
-  memory parity as a whole remains open. The W4 spike identifies cumulative
-  resident pages from all-shard mappings as the first target. The first
-  whole-mapping advice placement is **REJECTED**: its initial monitored leg was
-  interrupted still pre-GPU at 173.75 s versus about 25 s for the prior complete
-  run. Its 11.41-GiB partial peak is `VOID`, not an accepted improvement.
-  The replacement now records tensors actually copied in each phase and advises
-  only their page-aligned ranges once; its immutable load-time/memory killgate
-  is **PENDING**. `VT_SAFETENSORS_DISCARD_PAGES=0` remains the same-binary
-  control. Direct-device loading remains
-  required if the owned-model floor still exceeds vLLM. Prepare-time release
-  is **+1.74%** versus OFF and reaches **0.9754×**
-  fresh-vLLM total/output throughput; performance parity also remains open.
-  Full CPU CTest passes 105/105 and focused native-sm_120 CTest passes 4/4.
-  W4's rejected implementation passed focused native-sm_120 default 5/5 and
-  opt-out 2/2 tests, but load-time regression overrides that correctness gate.
-  The range replacement also passes those 5/5 + 2/2 gates. A concurrent full
-  CPU run passed 104/105; its unrelated async timing case then passed 3/3 in
-  isolation. No improved memory or throughput number is claimed.
+  At commit `a077d72`, W4 records tensors copied during each global/layer phase
+  and discards only those page-aligned source ranges. Three interleaved runs give
+  launch peak PSS **8.168 GiB**, down **47.5%** from same-binary OFF
+  (**15.562 GiB**), versus fresh vLLM **7.695 GiB**. The remaining **1.061×**
+  peak gap keeps memory parity open and requires W4.4 bounded direct-device
+  materialization. Stable PSS is **0.754 versus 4.099 GiB vLLM**, and peak
+  process VRAM is **11,682 versus 12,924 MiB**.
+
+  W4 is timing-neutral: unmonitored throughput is **6,553.57 tok/s** ON versus
+  **6,552.29** OFF (+0.02%) and **6,717.94** fresh vLLM (**0.9755×** total and
+  output). Full monitored process wall time is 28.945 s ON versus 29.539 s OFF.
+  ON/OFF outputs are byte-identical for all 128 requests and current project
+  output matches the prior project file 128/128. CPU CTest passes 105/105;
+  native-sm_120 focused default/opt-out tests pass 5/5 and 2/2.
+
+  Two earlier slow, zero-VRAM attempts are **VOID environment errors**, not
+  loader regressions: they were launched outside `nix develop .#cuda` and GDB
+  showed every worker in the CPU matmul fallback. The accepted campaign wraps
+  the process and lock in the CUDA flake. Correctness and performance parity
+  remain open.
   The recurring NVIDIA
   `refcntRequestReference_IMPL ... status 0x00000056` kernel notice is now
   source-identified as an unsupported profiler request to change Blackwell's

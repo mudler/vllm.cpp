@@ -539,20 +539,46 @@ Versus the pre-change vllm.cpp baseline, stable PSS falls 12.59→0.752 GiB and
 launch peak falls 19.77→15.55 GiB (-21.4%). The residual peak is created before
 residency by simultaneous safetensors mappings plus full owned materialization;
 the W4 source-chain spike confirms that vLLM scopes `safe_open` one shard at a
-time while this project retains every mapping. The first default-on whole-map
-advice implementation is **FAILED / REJECTED**: commit `394a933` remained
-pre-GPU after 173.75 s and was interrupted, whereas the prior complete monitored
-project legs took about 25 s. The partial 11.41-GiB peak is `VOID` because the
-process had not completed loading and could still rise. GPU state returned to
-146 MiB / 0% / 40 C. CPU 105/105 and focused native-sm_120 default 5/5 plus
-opt-out 2/2 were green, but cannot accept the load-time regression. A
-tensor-range-only replacement is now implemented and `PENDING` an immutable
-load-time/memory killgate. It records only tensors returned by the current
-global/layer resolver and advises their page-aligned ranges once. Focused
-native-sm_120 default 5/5 and opt-out 2/2 pass. A full CPU run concurrent with
-those CUDA tests passed 104/105; `test_async_llm` observed one extra drain
-iteration, then passed 3/3 in isolation. No improved memory or throughput number
-is claimed and the row cannot close.
+time while this project retains every mapping. W4 at `a077d72` records only
+tensors returned by the current global/layer resolver and advises their
+page-aligned ranges once. Disposition: **PARTIAL PASS / ACTIVE**; source-page
+residency is bounded without a timing regression, but the remaining owned host
+model keeps peak PSS 6.15% above fresh vLLM and requires W4.4 direct-device
+materialization.
+
+| W4 memory axis, three-run mean | Range discard ON | Same-binary OFF | Fresh vLLM | ON / vLLM |
+|---|---:|---:|---:|---:|
+| Launch-to-exit peak PSS (range) | **8.168 GiB** (8.16819-8.16824) | 15.562 GiB (15.012-15.838) | 7.695 GiB (6.971-8.074) | **1.0615x** |
+| Stable GPU-resident PSS | **0.754 GiB** | 0.754 GiB | 4.099 GiB | **0.1839x** |
+| Peak process VRAM | **11,682 MiB** | 11,686 MiB | 12,924 MiB | **0.9039x** |
+| Full monitored process wall | **28.945 s** | 29.539 s | 57.217 s | 0.506x |
+| Pre-benchmark startup proxy (wall minus benchmark duration) | **6.325 s** | 6.922 s | not comparable | n/a |
+
+Unmonitored ON throughput is 6550.86/6554.02/6555.84, mean **6553.57**
+tok/s, versus OFF 6550.60/6552.16/6554.11, mean **6552.29** (+0.0196%). Fresh
+vLLM is 6717.30/6717.99/6718.54, mean **6717.94**; ON is **0.9755x** total and
+output throughput (724.68 vs 742.85 tok/s). ON/OFF token files are byte-identical
+for all three 128-request runs, and the current project monitored output matches
+the prior project file 128/128. Current project/vLLM throughput-corpus exactness
+is 79/128, consistent with the open tie-sensitive correctness debt; no parity
+promotion is made.
+
+Two pre-campaign killgates are **VOID**, correcting the earlier provisional
+classification: they launched the CUDA build outside `nix develop .#cuda`, had
+zero process VRAM, and a read-only GDB capture placed all 24 workers in
+`vt::cpu::MatmulOneChunk`. They do not measure either page-advice placement.
+The valid command was:
+
+```bash
+nix develop .#cuda -c env OUT=/tmp/qwen35-peak-w4-a077d72 \
+  flock /tmp/gpu bash /tmp/qwen35-peak-w4-a077d72/driver.sh
+```
+
+Raw evidence: `/tmp/qwen35-peak-w4-a077d72`; driver SHA-256
+`e49f05162bf2e3d06ac25f7224189b87b2684aa7405d203f6027ecd80852c2cd`.
+Full CPU CTest passes 105/105; focused native-sm_120 default passes 5/5 and
+opt-out 2/2. Every process exited, final GPU state is 146 MiB / 0% / 42 C, and
+the benchmark-window kernel journal says `-- No entries --`.
 
 The first-forward release placement is **REJECTED** at -1.77% throughput. Moving
 eager upload/synchronized release into model preparation produces

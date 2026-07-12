@@ -106,12 +106,12 @@ preserves pointer validity while approximating its bounded shard lifetime.
 4. `W4.4`: if W4.3 remains above vLLM, spike and implement layer-bounded
    direct-device materialization; do not describe W4.1-W4.3 as peak parity.
 
-Rejected checkpoint `394a933`: W4.1's reader primitive and all correctness
-tests pass, but W4.2 advised each complete multi-GiB mapping after every layer.
-The first monitored leg remained pre-GPU at 173.75 s versus about 25 s for a
-prior complete monitored run, so it was interrupted and rejected. Its partial
-11.41-GiB peak is `VOID`. W4.2b must track tensors returned by the resolver and
-advise only their page-aligned byte ranges at each boundary before W4.3 restarts.
+Void checkpoint `394a933`: W4.1's reader primitive and all correctness tests
+pass, but the attempted runtime was launched outside `nix develop .#cuda`.
+It had zero process VRAM and a later GDB capture of the same invocation placed
+all 24 workers in `vt::cpu::MatmulOneChunk`. Its interrupted 173.75-s runtime
+and 11.41-GiB peak-so-far are environment-invalid and say nothing about
+whole-map advice. W4.2b still selected the narrower consumed-range contract.
 
 W4.2b implementation checkpoint: the resolver now records each owning shard and
 returned tensor, the reader validates ownership and advises only that tensor's
@@ -121,12 +121,21 @@ both enabled and opt-out modes. Native-sm_120 focused tests pass 5/5 default and
 unrelated async timing case passed 3/3 in isolation. The immutable load-time
 killgate and all improved numbers remain `PENDING`.
 
+W4.3 accepted checkpoint `a077d72`: three valid CUDA-flake repetitions under one
+lock give peak PSS 8.168 GiB ON, 15.562 OFF and 7.695 fresh vLLM; stable PSS
+0.754/0.754/4.099 GiB and VRAM 11,682/11,686/12,924 MiB. ON is 47.5% below OFF
+but 1.0615x vLLM, so the row remains `ACTIVE` and W4.4 is required. Unmonitored
+throughput is 6553.57 ON, 6552.29 OFF and 6717.94 vLLM: ON is neutral versus
+OFF and 0.9755x vLLM. Full CPU CTest is 105/105; focused native-sm_120 is 5/5
+default and 2/2 opt-out. Raw evidence is `/tmp/qwen35-peak-w4-a077d72`.
+
 ## Risks and mitigations
 
 - Advice can increase file refaults and load time. Checkpoints are layer-sized,
   not tensor-sized, and load time is measured explicitly.
-- Advising each whole multi-GiB mapping per layer is empirically rejected at
-  `394a933`; only consumed tensor byte ranges may be advised in W4.2b.
+- The `394a933` whole-map runtime was CPU fallback and is void, not an empirical
+  page-advice rejection. W4.2b nevertheless uses consumed tensor byte ranges,
+  which are sufficient to produce stable bounded PSS.
 - Kernel readahead may keep nearby pages resident. PSS measurement decides the
   result; no reduction is inferred from the API call alone.
 - Advice failure or a platform without `MADV_DONTNEED` preserves prior

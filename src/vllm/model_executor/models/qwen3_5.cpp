@@ -965,12 +965,26 @@ bool FuseAttnPreambleOn(bool fp4_attn) {
 // conc16/np96 752.8 -> 761.6 (+1.2%), conc32/np192 1045.6 -> 1050.4 (+0.5%),
 // TTFT -3.4/-3.6%, putting the 27B at/above fresh graphed-vLLM denominators —
 // hence DEFAULT ON when compiled (VLLM_CPP_FLASH_ATTN); VT_FA2_PREFILL=0
-// restores the WMMA prefill for a same-binary A/B. Decode segments keep f32
-// q/out + the graph-captured decode kernels, byte-identical either way.
+// restores the WMMA prefill for a same-binary A/B. Decode has its own bounded
+// FA2 selection below and remains independent of this toggle.
 // Without VLLM_CPP_FLASH_ATTN the env is ignored and the WMMA path runs.
 bool Fa2PrefillOn() {
 #ifdef VLLM_CPP_FLASH_ATTN
   const char* e = std::getenv("VT_FA2_PREFILL");
+  return e == nullptr || e[0] != '0';
+#else
+  return false;
+#endif
+}
+
+// FA2 PURE DECODE (W3-G): vLLM v0.25 and its pinned FA2 dependency reinterpret
+// GQA groups as query rows and run the paged split-KV main+combine path. The
+// first default-on slice is exactly the Qwen3.6-27B Hq/Hkv=24/4 BF16/D256
+// topology. VT_FA2_DECODE=0 restores the existing F32 paged kernel in the same
+// binary. Read fresh because component/tests flip the arm in-process.
+bool Fa2DecodeOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_DECODE");
   return e == nullptr || e[0] != '0';
 #else
   return false;
@@ -2663,20 +2677,26 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // positions/slot_mapping/... are the PERSISTENT per-step device buffers; sdi.*
   // Tensors are const views over the shared DBufs (no per-layer H2D re-upload).
   //
-  // FA-2 PREFILL (VT_FA2_PREFILL, see Fa2PrefillOn): on an eligible PREFILL step
-  // the preamble instead emits bf16 q/k (gate stays f32) and the attention
-  // output is bf16 — the natively-bf16 combo the FA-2 dispatch gate requires,
-  // with zero cast kernels. bf16 k feeds the bf16 KV-cache write directly
+  // FA-2 (VT_FA2_PREFILL / VT_FA2_DECODE): on an eligible prefill or bounded
+  // ratio-6 pure-decode step the preamble emits bf16 q/k (gate stays f32) and
+  // the attention output is bf16 — the natively-bf16 combo the FA2 dispatch
+  // gate requires, with zero cast kernels. bf16 k feeds the cache directly
   // (skipping the CastBf16 below — bit-identical, both are the RN round of the
   // same f32 value); bf16 attention out feeds SigmoidGateBf16 (exact upcast).
-  // The eligibility MUST mirror cuda_paged_attn.cu's fa2 gate (prefill segment:
-  // T > num_reqs; head_dim 256; bf16 KV; CUDA) so the bf16 query is consumed by
-  // FA-2. Decode steps keep f32 q/out + the graph-captured decode kernels,
-  // byte-identical to today.
+  // Eligibility MUST mirror cuda_paged_attn.cu so every bf16 query is consumed
+  // by FA2. Ratio-8 (35B), windows, non-causal calls and all other shapes stay
+  // f32 and use the existing graph-captured fallback.
   const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
                            d.q.device.type == vt::DeviceType::kCUDA &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
-  const DType attn_dt = fa2_prefill ? DType::kBF16 : DType::kF32;
+  const bool fa2_decode = Fa2DecodeOn() && FuseAttnPreambleOn(fp4) &&
+                          sdi.has_attn_cos_sin &&
+                          d.q.device.type == vt::DeviceType::kCUDA &&
+                          kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
+                          Dh == 256 && Hq == 24 && Hkv == 4 &&
+                          T == meta.num_reqs && meta.causal;
+  const bool fa2_attention = fa2_prefill || fa2_decode;
+  const DType attn_dt = fa2_attention ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});
   DBuf dk3(d, attn_dt, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
@@ -2725,7 +2745,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
   DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
   if (kv.dtype == DType::kBF16) {
-    // K may already be bf16 (the FA-2 prefill preamble emits bf16 k directly —
+    // K may already be bf16 (an FA2 preamble emits bf16 k directly —
     // the RN round of the same f32 value this CastBf16 would produce); only
     // down-cast when the preamble/fallback produced f32 K.
     if (kn3.dtype == DType::kBF16) {
@@ -2754,7 +2774,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   Tensor dqsl = sdi.query_start_loc.t();
   vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, dslot);
 
-  // bf16 attention out on the FA-2 prefill path (FA-2 writes bf16; the sigmoid
+  // bf16 attention out on an FA2 path (FA2 writes bf16; the sigmoid
   // gate upcast is exact) — f32 everywhere else, byte-identical to today.
   DBuf dattn(d, attn_dt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));

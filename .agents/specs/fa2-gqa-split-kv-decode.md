@@ -1,8 +1,10 @@
 # W3-G — FlashAttention-2 GQA split-KV decode
 
-Status: **READY** on 2026-07-13. This is a spike and execution contract, not an
-implementation or performance claim. The binding 27B result remains immutable
-`3f256ab` at **55/124 pass, 69 fail**.
+Status: **ACTIVE** on 2026-07-13. W3-G1--G3 source and ported operator tests are
+implemented; the warning-as-error CUDA-off build and focused CTest pass. Clean
+sm_121a compile, CUDA/sanitizer/model/trace and every performance gate remain
+pending, so this is not a CUDA correctness or speed claim. The binding 27B
+result remains immutable `3f256ab` at **55/124 pass, 69 fail**.
 
 ## Scope
 
@@ -255,9 +257,9 @@ this checkpoint.
 | Work ID | Files/ownership | Result and handoff |
 |---|---|---|
 | W3-G0 | this spec; kernel/engine/backend/feature/quant matrices; roadmap, coordination, inventory, README, BENCHMARKS, ledger, state | Accept the full spike, rank FA2 first/FP4 producer second, claim `KERNEL-ATTN-FA2`, publish no rate. |
-| W3-G1 | `cuda_flash_attn_fa2.cu`, optional FA2 internal lifecycle header, `cuda_backend.cu` | Exact swapped-stride params, split heuristic, stable scratch and queue cleanup. No model default change yet. |
-| W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | Exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path; prefill and ratio-8 remain unchanged. |
-| W3-G3 | `tests/vt/test_ops_paged_attn.cpp`, focused build registration only if needed | Port upstream paged pure-decode vectors, ratio-6, heuristic, fallback, capture, lifecycle and invalid-eligibility tests. |
+| W3-G1 | `cuda_flash_attn_fa2.cu`, FA2 internal lifecycle header, `cuda_backend.cu` | **IMPLEMENTED / CUDA RUNTIME PENDING:** exact swapped strides, upstream split heuristic, fixed per-shape scratch and queue cleanup. |
+| W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | **IMPLEMENTED / MODEL GATE PENDING:** exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path; prefill and ratio-8 unchanged. |
+| W3-G3 | `tests/vt/test_ops_paged_attn.cpp` | **PORTED / CUDA EXECUTION PENDING:** upstream 523/37/2011 fallback, ratio-6 B ladder, heuristic, toggle/window/ratio-8 fallback, capture/replay/capacity and two-queue lifecycle. CUDA-off focused CTest passes but compiles these cases out. |
 | W3-G4 | immutable DGX evidence only; same-change public/canonical status updates | G0-G3 build/operator/sanitizer/model/inertness/trace closure. Fail closed before timing. |
 | W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | Strict 40+8-axis component; either authorize G6 or record failure and rescan. |
 | W3-G6 | existing exact online gate/evidence; same-change public/canonical status updates | Conditional 27B c1-c32 vLLM grid. Only 124/124 permits 35B performance. |

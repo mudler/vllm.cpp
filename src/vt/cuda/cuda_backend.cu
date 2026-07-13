@@ -5,6 +5,9 @@
 #include <string>
 
 #include "vt/backend.h"
+#ifdef VLLM_CPP_FLASH_ATTN
+#include "vt/cuda/cuda_flash_attn_fa2_internal.h"
+#endif
 #ifdef VLLM_CPP_TRITON
 #include "vt/cuda/cuda_gdn_internal.h"
 #endif
@@ -51,6 +54,9 @@ class CudaBackend final : public Backend {
   }
   void DestroyQueue(Queue& q) override {
     if (q.handle == nullptr) return;
+#ifdef VLLM_CPP_FLASH_ATTN
+    ReleaseFa2Scratch(device_, q.handle);
+#endif
 #ifdef VLLM_CPP_TRITON
     ReleaseGdnTritonScratch(device_, q.handle);
 #endif

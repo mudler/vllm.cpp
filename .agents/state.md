@@ -6437,3 +6437,37 @@ The normal BF16→FP4 producer is ranked second (vLLM vector loads/stores versus
 our scalar path, about 0.50 ms/forward diagnostic gap) and is not stacked into
 W3-G. Host weight release remains the separate leading PSS/RSS repair. GPU,
 port and `/tmp/gpu` are idle at this documentation checkpoint.
+
+## 2026-07-13 — W3-G ratio-6 FA2 decode implementation checkpoint
+
+W3-G1--G3 are now implemented in source. The torch-free FA2 adapter ports the
+dependency's exact split-count heuristic and presents the upstream logical
+`[B,Hkv,G,D] -> [B,G,Hkv,D]` group swap through the kernel ABI's independent
+Q/O strides, avoiding pack/unpack copies. It allocates F32 final/partial LSE
+and output accumulation per device, stream, padded batch and block-table
+capacity; every shape pointer remains fixed through graph capture/replay and is
+released only when `CudaBackend::DestroyQueue` tears down the stream. A scratch
+miss during capture fails closed.
+
+The operator and model gates are default-on only for the exact Qwen3.6-27B
+slice: CUDA BF16 Q/KV/O, Hq/Hkv 24/4, D256, block size divisible by 16, pure
+global causal decode. `VT_FA2_DECODE=0` restores the same-binary fallback.
+Prefill is independent and unchanged; ratio-8/35B, windows, other dtypes/dims
+and mixed calls remain on the current path.
+
+`tests/vt/test_ops_paged_attn.cpp` now ports the relevant upstream
+`test_varlen_with_paged_kv` semantics: the exact 523/37/2011 paged vector as an
+honest out-of-scope fallback, ratio-6 B1/2/4/8/16, split arithmetic,
+toggle/window/ratio-8 fallback, cold eager -> capture -> two replays while
+`seqused_k` grows inside fixed capacity, capacity rollover preserving the old
+shape, and two-queue cleanup. The warning-as-error Release CUDA-off build of
+`test_ops_paged_attn` passes and focused CTest is **1/1**. Those FA2-only cases
+are compiled out without CUDA, so this is not GPU correctness evidence.
+
+Disposition: `KERNEL-ATTN-FA2` and `SERVE-GATE-ONLINE` remain `ACTIVE`. Freeze
+and push this checkpoint, then clean-build sm_121a from its immutable commit.
+CUDA operator/capture/lifecycle, strict sanitizer, both 27B **235/235 + 16/16**
+arms, correctness-only 35B inertness, paired node trace and the all-40-timing +
+all-8-memory component remain `PENDING`. No new throughput, latency, memory or
+ratio is accepted; immutable `3f256ab` remains **55/124**, the exact grid stays
+blocked, and no 35B performance command is authorized.

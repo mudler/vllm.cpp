@@ -42,7 +42,8 @@
 namespace vt::cuda {
 
 #ifdef VLLM_CPP_FLASH_ATTN
-// Vendored FlashAttention-2 sm_121a prefill launcher (cuda_flash_attn_fa2.cu).
+// Vendored FlashAttention-2 sm_121a prefill/decode launchers
+// (cuda_flash_attn_fa2.cu).
 // Declared at vt::cuda scope (external linkage) — the definition lives in a
 // separate TU. Torch-free drop-in for the full-attn causal + paged-KV + GQA +
 // head_dim-256 + bf16 prefill path (the exact FA-2 flash_fwd_splitkv kernel vLLM
@@ -53,6 +54,12 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                           const Tensor& query_start_loc, const PagedAttentionArgs& args,
                           int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
                           int64_t block_size);
+void LaunchDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                         const Tensor& k_cache, const Tensor& v_cache,
+                         const Tensor& block_table, const Tensor& seq_lens,
+                         const PagedAttentionArgs& args, int64_t hq, int64_t d,
+                         int64_t num_reqs, int64_t num_kv_heads,
+                         int64_t block_size);
 #endif  // VLLM_CPP_FLASH_ATTN
 
 namespace {
@@ -2435,6 +2442,14 @@ bool Fa2PrefillEnabled() {
   const char* e = std::getenv("VT_FA2_PREFILL");
   return e == nullptr || e[0] != '0';
 }
+
+// vLLM v0.25's pure-decode group swap + split-KV route. Read fresh so one
+// process can run the exact same-binary fallback arm. The first slice is
+// deliberately ratio-6-only; other ratios retain LaunchDecode.
+bool Fa2DecodeEnabled() {
+  const char* e = std::getenv("VT_FA2_DECODE");
+  return e == nullptr || e[0] != '0';
+}
 #endif  // VLLM_CPP_FLASH_ATTN
 
 // TQ = query dtype, TKV = KV-cache dtype (decoupled: Phase-1 bf16 KV cache keeps
@@ -2476,12 +2491,26 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // with cast kernels and measurably erased the win (parity-ledger 2026-07-06
   // FA-2 split-KV row); the production 27B preamble now emits bf16 q and the
   // sigmoid gate consumes bf16 attention out, so no casts exist on this path.
-  const bool fa2 = is_prefill && d == 256 && Fa2PrefillEnabled() &&
-                   std::is_same<TQ, __nv_bfloat16>::value &&
-                   std::is_same<TKV, __nv_bfloat16>::value && out.dtype == DType::kBF16;
+  const bool fa2_prefill = is_prefill && d == 256 && Fa2PrefillEnabled() &&
+                           std::is_same<TQ, __nv_bfloat16>::value &&
+                           std::is_same<TKV, __nv_bfloat16>::value &&
+                           out.dtype == DType::kBF16;
+  // Exact W3-G scope: pure decode, Hq/Hkv=24/4, D256, paged BF16, global
+  // causal attention and FA2-compatible page/block-table layout. q/out are
+  // selected BF16 by the matching model-side gate, so no cast kernel appears.
+  const bool fa2_decode = !is_prefill && num_tokens == num_reqs && hq == 24 &&
+                          num_kv_heads == 4 && qpk == 6 && d == 256 &&
+                          block_size % 16 == 0 && args.causal &&
+                          !args.window_size.has_value() &&
+                          block_table.stride[1] == 1 && Fa2DecodeEnabled() &&
+                          std::is_same<TQ, __nv_bfloat16>::value &&
+                          std::is_same<TKV, __nv_bfloat16>::value &&
+                          out.dtype == DType::kBF16;
 #else
-  const bool fa2 = false;
-  (void)fa2;  // all fa2 uses are #ifdef VLLM_CPP_FLASH_ATTN — silence -Werror=all-warnings
+  const bool fa2_prefill = false;
+  const bool fa2_decode = false;
+  (void)fa2_prefill;
+  (void)fa2_decode;
 #endif
   switch (out.dtype) {
     case DType::kF32:
@@ -2514,9 +2543,12 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       break;
     case DType::kBF16:
 #ifdef VLLM_CPP_FLASH_ATTN
-      if (fa2) {
+      if (fa2_prefill) {
         LaunchPrefillFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                              query_start_loc, args, hq, d, num_reqs, num_kv_heads, block_size);
+      } else if (fa2_decode) {
+        LaunchDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                            args, hq, d, num_reqs, num_kv_heads, block_size);
       } else  // NOLINT(readability/braces) — chains into the flash2vec ladder below
 #endif
       if (flash2vec) {

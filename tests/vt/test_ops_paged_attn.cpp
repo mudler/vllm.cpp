@@ -29,11 +29,27 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+
+#ifdef VLLM_CPP_FLASH_ATTN
+namespace vt::cuda::testing {
+int Fa2DecodeNumSplitsForTesting(int batch_nheads_mblocks, int num_sms,
+                                 int num_n_blocks, int max_splits);
+void ResetFa2DecodeDebugCounters();
+void DisableFa2DecodeDebugCounters();
+uint64_t Fa2DecodeLaunchesForTesting();
+uint64_t Fa2DecodeSplitLaunchesForTesting();
+uint64_t Fa2DecodeNoSplitLaunchesForTesting();
+uint64_t Fa2DecodeScratchAllocationsForTesting();
+uint64_t Fa2DecodeScratchReusesForTesting();
+size_t Fa2DecodeScratchShapeCountForTesting(int device, void* stream);
+}  // namespace vt::cuda::testing
+#endif
 
 using vt::AttentionArgs;
 using vt::AttentionWindow;
@@ -996,8 +1012,18 @@ namespace {
 // Set/restore an env var for the duration of a scope (exception-safe).
 struct EnvGuard {
   const char* name;
-  explicit EnvGuard(const char* n, const char* value) : name(n) { setenv(name, value, 1); }
-  ~EnvGuard() { unsetenv(name); }
+  std::optional<std::string> previous;
+  explicit EnvGuard(const char* n, const char* value) : name(n) {
+    if (const char* old = std::getenv(name); old != nullptr) previous = old;
+    setenv(name, value, 1);
+  }
+  ~EnvGuard() {
+    if (previous.has_value()) {
+      setenv(name, previous->c_str(), 1);
+    } else {
+      unsetenv(name);
+    }
+  }
   EnvGuard(const EnvGuard&) = delete;
   EnvGuard& operator=(const EnvGuard&) = delete;
 };
@@ -1145,6 +1171,378 @@ TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at 
               "FA-2 causal decoder local window");
   check_local(/*causal=*/false, AttentionWindow{31, 31},
               "FA-2 symmetric encoder local window");
+}
+
+namespace {
+
+// Host/device fixture for the pure-decode vectors ported from
+// tests/kernels/attention/test_flash_attn.py::test_varlen_with_paged_kv
+// (vLLM 702f481, lines 95-217). Every request has qlen=1. Block-table rows use
+// shared, permuted physical blocks so long 2k-token vectors stay compact while
+// retaining nontrivial paged addressing and head-specific data.
+struct Fa2DecodeCase {
+  int64_t hq;
+  int64_t hk;
+  int64_t d = 256;
+  int64_t block_size = 16;
+  int64_t batch;
+  int64_t max_blocks;
+  int64_t num_blocks;
+  float scale = std::pow(256.0F, -0.5F);
+  std::vector<int32_t> seq_lens;
+  std::vector<int32_t> qsl;
+  std::vector<int32_t> block_table;
+  std::vector<uint16_t> query_bf16;
+  std::vector<uint16_t> combined_cache;
+  std::vector<float> query_rounded;
+  std::vector<float> key_rounded;
+  std::vector<float> value_rounded;
+
+  Fa2DecodeCase(int64_t query_heads, int64_t kv_heads,
+                std::vector<int32_t> lengths, uint32_t seed,
+                int64_t capacity_blocks = 0)
+      : hq(query_heads),
+        hk(kv_heads),
+        batch(static_cast<int64_t>(lengths.size())),
+        seq_lens(std::move(lengths)) {
+    const int32_t max_seq = *std::max_element(seq_lens.begin(), seq_lens.end());
+    max_blocks = std::max<int64_t>(capacity_blocks,
+                                   (max_seq + block_size - 1) / block_size);
+    num_blocks = max_blocks + 17;
+    qsl.resize(static_cast<size_t>(batch + 1));
+    for (int64_t i = 0; i <= batch; ++i)
+      qsl[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+
+    block_table.resize(static_cast<size_t>(batch * max_blocks));
+    for (int64_t r = 0; r < batch; ++r) {
+      for (int64_t b = 0; b < max_blocks; ++b) {
+        block_table[static_cast<size_t>(r * max_blocks + b)] =
+            static_cast<int32_t>((r * 13 + b * 7) % num_blocks);
+      }
+    }
+
+    const auto qf = RandF32(static_cast<size_t>(batch * hq * d), seed);
+    const auto kf = RandF32(
+        static_cast<size_t>(num_blocks * block_size * hk * d), seed + 1);
+    const auto vf = RandF32(kf.size(), seed + 2);
+    query_bf16.resize(qf.size());
+    query_rounded.resize(qf.size());
+    std::vector<uint16_t> key_bf16(kf.size()), value_bf16(vf.size());
+    key_rounded.resize(kf.size());
+    value_rounded.resize(vf.size());
+    for (size_t i = 0; i < qf.size(); ++i) {
+      query_bf16[i] = F32ToBf16Bits(qf[i]);
+      query_rounded[i] = Bf16BitsToF32(query_bf16[i]);
+    }
+    for (size_t i = 0; i < kf.size(); ++i) {
+      key_bf16[i] = F32ToBf16Bits(kf[i]);
+      value_bf16[i] = F32ToBf16Bits(vf[i]);
+      key_rounded[i] = Bf16BitsToF32(key_bf16[i]);
+      value_rounded[i] = Bf16BitsToF32(value_bf16[i]);
+    }
+
+    const int64_t within = block_size * hk * d;
+    combined_cache.assign(static_cast<size_t>(num_blocks * 2 * within), 0);
+    for (int64_t block = 0; block < num_blocks; ++block) {
+      for (int64_t e = 0; e < within; ++e) {
+        const size_t source = static_cast<size_t>(block * within + e);
+        combined_cache[static_cast<size_t>((block * 2) * within + e)] =
+            key_bf16[source];
+        combined_cache[static_cast<size_t>((block * 2 + 1) * within + e)] =
+            value_bf16[source];
+      }
+    }
+  }
+
+  Tensor CacheView(DeviceTensor& cache, int which) const {
+    const int64_t within = block_size * hk * d;
+    Tensor view = cache.tensor();
+    view.data = static_cast<char*>(view.data) +
+                static_cast<size_t>(which * within) * vt::SizeOf(DType::kBF16);
+    view.rank = 4;
+    view.shape[0] = num_blocks;
+    view.shape[1] = block_size;
+    view.shape[2] = hk;
+    view.shape[3] = d;
+    view.stride[0] = 2 * within;
+    view.stride[1] = hk * d;
+    view.stride[2] = d;
+    view.stride[3] = 1;
+    return view;
+  }
+
+  std::vector<float> Reference(
+      const std::vector<int32_t>& lengths,
+      std::optional<AttentionWindow> window = std::nullopt) const {
+    return ComposedPagedRef(query_rounded, key_rounded, value_rounded,
+                            block_table, max_blocks, lengths, qsl, hq, hk, d,
+                            block_size, scale, /*causal=*/true, window);
+  }
+};
+
+void CheckBf16AgainstReference(const std::vector<uint16_t>& got,
+                               const std::vector<float>& reference,
+                               const char* label) {
+  REQUIRE(got.size() == reference.size());
+  size_t violations = 0;
+  double max_abs = 0.0;
+  for (size_t i = 0; i < reference.size(); ++i) {
+    const double actual = Bf16BitsToF32(got[i]);
+    const double error = std::abs(actual - static_cast<double>(reference[i]));
+    max_abs = std::max(max_abs, error);
+    if (error > 1.5e-2 + 1.0e-2 * std::abs(static_cast<double>(reference[i]))) {
+      ++violations;
+    }
+  }
+  INFO(label);
+  INFO(max_abs);
+  CHECK(violations == 0);
+}
+
+struct Fa2DecodeRunStats {
+  uint64_t launches = 0;
+  uint64_t split_launches = 0;
+  uint64_t no_split_launches = 0;
+};
+
+Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
+                                   bool expect_fa2,
+                                   std::optional<AttentionWindow> window = std::nullopt) {
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d},
+                     c.query_bf16.data());
+  DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                     {static_cast<int64_t>(c.combined_cache.size())},
+                     c.combined_cache.data());
+  Tensor key = c.CacheView(cache, 0);
+  Tensor value = c.CacheView(cache, 1);
+  DeviceTensor block_table(gpu, guard.q, DType::kI32,
+                           {c.batch, c.max_blocks}, c.block_table.data());
+  DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c.batch},
+                        c.seq_lens.data());
+  DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
+  DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
+
+  EnvGuard decode_toggle("VT_FA2_DECODE", toggle);
+  vt::cuda::testing::ResetFa2DecodeDebugCounters();
+  PagedAttentionArgs args{c.scale, true};
+  args.window_size = window;
+  args.query_start_loc_host = c.qsl.data();
+  args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                     block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+  std::vector<uint16_t> got(c.query_bf16.size(), 0);
+  out.Download(guard.q, got.data());
+
+  const Fa2DecodeRunStats stats{
+      vt::cuda::testing::Fa2DecodeLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting()};
+  vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  CheckBf16AgainstReference(got, c.Reference(c.seq_lens, window),
+                            expect_fa2 ? "FA2 decode" : "paged fallback");
+  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+  CHECK(stats.split_launches + stats.no_split_launches == stats.launches);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(
+            guard.q.device.index, guard.q.handle) == (expect_fa2 ? 1U : 0U));
+  return stats;
+}
+
+}  // namespace
+
+TEST_CASE("paged_attention CUDA FA-2 split heuristic mirrors upstream") {
+  using vt::cuda::testing::Fa2DecodeNumSplitsForTesting;
+  CHECK(Fa2DecodeNumSplitsForTesting(32, 40, 18, 128) == 1);
+  CHECK(Fa2DecodeNumSplitsForTesting(4, 40, 18, 128) == 9);
+  CHECK(Fa2DecodeNumSplitsForTesting(8, 40, 32, 128) == 5);
+  CHECK(Fa2DecodeNumSplitsForTesting(4, 40, 18, 2) == 2);
+  CHECK(Fa2DecodeNumSplitsForTesting(1, 40, 1, 128) == 1);
+}
+
+TEST_CASE("paged_attention CUDA pure-decode upstream paged vector retains fallback correctness") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping upstream FA-2 pure-decode vector (dgx-pending)");
+    return;
+  }
+  // Exact upstream sequence-length vector. Hq/Hkv=8/2 is outside W3-G's first
+  // ratio-6 slice, so it proves honest fallback rather than broadened support.
+  Fa2DecodeCase c(/*Hq=*/8, /*Hkv=*/2, {523, 37, 2011}, 6120);
+  RunFa2DecodeCase(c, "1", /*expect_fa2=*/false);
+}
+
+TEST_CASE("paged_attention CUDA FA-2 ratio-6 pure decode matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 ratio-6 decode parity (dgx-pending)");
+    return;
+  }
+  for (const int batch : {1, 2, 4, 8, 16}) {
+    CAPTURE(batch);
+    std::vector<int32_t> lengths(static_cast<size_t>(batch));
+    for (int i = 0; i < batch; ++i) lengths[static_cast<size_t>(i)] = 1024 + i * 7;
+    Fa2DecodeCase c(/*Hq=*/24, /*Hkv=*/4, std::move(lengths),
+                    6200U + static_cast<uint32_t>(batch));
+    RunFa2DecodeCase(c, "1", /*expect_fa2=*/true);
+  }
+}
+
+TEST_CASE("paged_attention CUDA FA-2 decode toggle and invalid eligibility use fallback") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 decode fallback vectors (dgx-pending)");
+    return;
+  }
+  Fa2DecodeCase ratio6(/*Hq=*/24, /*Hkv=*/4, {1024, 1057}, 6300);
+  RunFa2DecodeCase(ratio6, "0", /*expect_fa2=*/false);
+  RunFa2DecodeCase(ratio6, "1", /*expect_fa2=*/false,
+                   AttentionWindow{127, 0});
+
+  // The Qwen3.6-35B ratio-8 topology is deliberately inert in this slice.
+  Fa2DecodeCase ratio8(/*Hq=*/16, /*Hkv=*/2, {1024, 1057}, 6310);
+  RunFa2DecodeCase(ratio8, "1", /*expect_fa2=*/false);
+}
+
+TEST_CASE("paged_attention CUDA FA-2 decode scratch is capture-stable across replay") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 capture/replay vector (dgx-pending)");
+    return;
+  }
+  Fa2DecodeCase c(/*Hq=*/24, /*Hkv=*/4, {257, 389}, 6400,
+                  /*capacity_blocks=*/72);
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d},
+                     c.query_bf16.data());
+  DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                     {static_cast<int64_t>(c.combined_cache.size())},
+                     c.combined_cache.data());
+  Tensor key = c.CacheView(cache, 0);
+  Tensor value = c.CacheView(cache, 1);
+  DeviceTensor block_table(gpu, guard.q, DType::kI32,
+                           {c.batch, c.max_blocks}, c.block_table.data());
+  DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c.batch},
+                        c.seq_lens.data());
+  DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
+  DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
+  PagedAttentionArgs args{c.scale, true};
+  args.query_start_loc_host = c.qsl.data();
+  args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+
+  EnvGuard decode_on("VT_FA2_DECODE", "1");
+  vt::cuda::testing::ResetFa2DecodeDebugCounters();
+
+  // Cold eager: materialize the one capture-stable shape entry.
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                     block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+  std::vector<uint16_t> warm(c.query_bf16.size(), 0);
+  out.Download(guard.q, warm.data());
+  CheckBf16AgainstReference(warm, c.Reference(c.seq_lens), "FA2 cold eager");
+  CHECK(vt::cuda::testing::Fa2DecodeScratchAllocationsForTesting() == 1);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchReusesForTesting() == 0);
+
+  // Capture must be a pure pool hit: no pointer changes or allocator calls.
+  gpu.BeginCapture(guard.q);
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                     block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+  void* graph = gpu.EndCaptureGraph(guard.q);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchAllocationsForTesting() == 1);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchReusesForTesting() == 1);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(
+            guard.q.device.index, guard.q.handle) == 1);
+
+  // Grow actual sequence lengths inside the fixed block-table capacity. The
+  // captured geometry and scratch addresses stay fixed; seqused_k changes.
+  const std::vector<int32_t> grown_lens = {511, 887};
+  gpu.Copy(guard.q, seq_lens.tensor().data, grown_lens.data(),
+           grown_lens.size() * sizeof(int32_t));
+  gpu.ReplayGraph(guard.q, graph);
+  std::vector<uint16_t> replay1(c.query_bf16.size(), 0);
+  out.Download(guard.q, replay1.data());
+  CheckBf16AgainstReference(replay1, c.Reference(grown_lens), "FA2 replay 1");
+  gpu.ReplayGraph(guard.q, graph);
+  std::vector<uint16_t> replay2(c.query_bf16.size(), 0);
+  out.Download(guard.q, replay2.data());
+  CHECK(replay1 == replay2);
+  gpu.DestroyGraph(graph);
+  vt::cuda::testing::DisableFa2DecodeDebugCounters();
+
+  // A new block-table column capacity gets a second stable entry; the first is
+  // retained rather than grown/freed because an independently owned graph may
+  // still reference it in production.
+  Fa2DecodeCase wider(/*Hq=*/24, /*Hkv=*/4, {511, 887}, 6410,
+                      /*capacity_blocks=*/80);
+  DeviceTensor query2(gpu, guard.q, DType::kBF16,
+                      {wider.batch, wider.hq, wider.d},
+                      wider.query_bf16.data());
+  DeviceTensor cache2(gpu, guard.q, DType::kBF16,
+                      {static_cast<int64_t>(wider.combined_cache.size())},
+                      wider.combined_cache.data());
+  Tensor key2 = wider.CacheView(cache2, 0);
+  Tensor value2 = wider.CacheView(cache2, 1);
+  DeviceTensor block_table2(gpu, guard.q, DType::kI32,
+                            {wider.batch, wider.max_blocks},
+                            wider.block_table.data());
+  DeviceTensor seq_lens2(gpu, guard.q, DType::kI32, {wider.batch},
+                         wider.seq_lens.data());
+  DeviceTensor qsl2(gpu, guard.q, DType::kI32, {wider.batch + 1},
+                    wider.qsl.data());
+  DeviceTensor out2(gpu, guard.q, DType::kBF16,
+                    {wider.batch, wider.hq, wider.d});
+  PagedAttentionArgs args2{wider.scale, true};
+  args2.query_start_loc_host = wider.qsl.data();
+  args2.max_seq_len = static_cast<int>(wider.max_blocks * wider.block_size);
+  vt::PagedAttention(guard.q, out2.tensor(), query2.tensor(), key2, value2,
+                     block_table2.tensor(), seq_lens2.tensor(), qsl2.tensor(),
+                     args2);
+  gpu.Synchronize(guard.q);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(
+            guard.q.device.index, guard.q.handle) == 2);
+}
+
+TEST_CASE("paged_attention CUDA FA-2 decode scratch is queue-owned and released") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 queue lifecycle vector (dgx-pending)");
+    return;
+  }
+  Fa2DecodeCase c(/*Hq=*/24, /*Hkv=*/4, {1024}, 6500);
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard first(gpu);
+  QueueGuard second(gpu);
+  const auto launch = [&](Queue& queue) {
+    DeviceTensor query(gpu, queue, DType::kBF16, {c.batch, c.hq, c.d},
+                       c.query_bf16.data());
+    DeviceTensor cache(gpu, queue, DType::kBF16,
+                       {static_cast<int64_t>(c.combined_cache.size())},
+                       c.combined_cache.data());
+    Tensor key = c.CacheView(cache, 0);
+    Tensor value = c.CacheView(cache, 1);
+    DeviceTensor block_table(gpu, queue, DType::kI32,
+                             {c.batch, c.max_blocks}, c.block_table.data());
+    DeviceTensor seq_lens(gpu, queue, DType::kI32, {c.batch},
+                          c.seq_lens.data());
+    DeviceTensor qsl(gpu, queue, DType::kI32, {c.batch + 1}, c.qsl.data());
+    DeviceTensor out(gpu, queue, DType::kBF16, {c.batch, c.hq, c.d});
+    PagedAttentionArgs args{c.scale, true};
+    args.query_start_loc_host = c.qsl.data();
+    args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+    vt::PagedAttention(queue, out.tensor(), query.tensor(), key, value,
+                       block_table.tensor(), seq_lens.tensor(), qsl.tensor(),
+                       args);
+    gpu.Synchronize(queue);
+  };
+
+  EnvGuard decode_on("VT_FA2_DECODE", "1");
+  launch(first.q);
+  launch(second.q);
+  void* first_handle = first.q.handle;
+  void* second_handle = second.q.handle;
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, first_handle) == 1);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, second_handle) == 1);
+
+  gpu.DestroyQueue(first.q);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, first_handle) == 0);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, second_handle) == 1);
+  gpu.DestroyQueue(second.q);
+  CHECK(vt::cuda::testing::Fa2DecodeScratchShapeCountForTesting(0, second_handle) == 0);
 }
 #else
 TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 256") {

@@ -428,8 +428,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     exact FA2 dependency pinned by vLLM v0.25.0 `702f481`. Three stub headers
     replace the ATen/c10 surface (PhiloxCudaState POD + C10_CUDA_CHECK) and
     `fa2_compat_prelude.h` is force-included; tuned FA sources stay pristine.
-    The current torch-free `src/vt/cuda/cuda_flash_attn_fa2.cu` fills
-    `Flash_fwd_params` from `vt::Tensor` views for paged varlen prefill. Its
+    The torch-free `src/vt/cuda/cuda_flash_attn_fa2.cu` fills
+    `Flash_fwd_params` from `vt::Tensor` views for paged varlen prefill and the
+    bounded pure-decode route. Its
     `num_splits=1` statement is correct for ordinary ragged paged varlen, but
     was incorrectly generalized to pure decode: upstream `flash_api.cpp`
     separately performs `seqlenq_ngroups_swapped`, then applies the split-count
@@ -444,15 +445,21 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     Those component values remain valid but are not the current v0.25 binding
     grid.
 
-    W3-G now owns the missing Qwen3.6-27B pure-decode specialization: BF16,
-    Hq/Hkv 24/4, D256, paged KV, capture-safe exact split heuristic and
-    `VT_FA2_DECODE=0` fallback. Qwen3.6-35B-A3B is ratio 8 and deliberately
-    inert. Binding diagnostics are local ratio-6 decode **22,893 calls /
+    W3-G implements the missing Qwen3.6-27B pure-decode specialization: BF16,
+    Hq/Hkv 24/4, D256, paged KV, direct logical swap through supported Q/O
+    strides, the exact split heuristic, fixed per-device/stream/shape F32
+    scratch released at queue teardown, cast-free model dispatch and
+    `VT_FA2_DECODE=0` fallback. Ported `test_flash_attn.py:95-217` semantics
+    cover the 523/37/2011 fallback vector, ratio-6 B1--16, invalid ratio/window,
+    split arithmetic, capture/replay/capacity and two-queue lifecycle in
+    `tests/vt/test_ops_paged_attn.cpp:1354-1555`. Qwen3.6-35B-A3B is ratio 8
+    and deliberately inert. Binding diagnostics are local ratio-6 decode **22,893 calls /
     8,793.238 ms** versus vLLM FA2 main **23,616 / 7,061.921 ms** plus combine
     **23,488 / 123.245 ms**; unequal windows make this attribution, not a speed
-    ratio. Implementation, ported upstream paged-decode/capture tests and the
-    every-axis A/B are `PENDING` under the
-    [W3-G spike](specs/fa2-gqa-split-kv-decode.md).
+    ratio. The CUDA-off warning-as-error build/focused CTest pass, but FA2-only
+    cases compile out there. Clean sm_121a compile, CUDA/sanitizer/model/trace
+    and the every-axis A/B are `PENDING` under the [W3-G
+    spike](specs/fa2-gqa-split-kv-decode.md).
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common
     `vt::` surface now carries upstream-compatible semantic scalar IDs separate

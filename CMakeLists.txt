@@ -542,7 +542,8 @@ if(VLLM_CPP_CUDA)
     target_link_libraries(vllm PUBLIC CUDA::cuda_driver)
   endif()
 
-  # Vendored FlashAttention-2 sm_121a prefill. The exact FA-2 source vLLM builds
+  # Vendored FlashAttention-2 sm_121a prefill + pure-decode split-KV. The exact
+  # FA-2 source vLLM builds
   # as _vllm_fa2_C (vllm-project/flash-attention @ 2c839c33) — its
   # flash_fwd_splitkv kernel is what vLLM's nsys trace shows for prefill on GB10.
   # Compiled torch-free against our CUTLASS: 3 stub headers replace the ATen/c10
@@ -551,10 +552,10 @@ if(VLLM_CPP_CUDA)
   # (auto-generated) FA sources stay byte-for-byte pristine. DEFAULT ON (like
   # Marlin/cutlass) — it only actually builds when CUTLASS is present
   # (VLLM_CPP_CUTLASS, sm_12xa); -DVLLM_CPP_FLASH_ATTN=OFF opts out. Runtime
-  # toggle VT_FA2_PREFILL (default ON when compiled; =0 restores the WMMA
-  # prefill for a same-binary A/B). Validated token-for-token + over the
-  # throughput bar on GB10 2026-07-10 (see .agents/parity-ledger.md).
-  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill kernel (needs CUTLASS)" ON)
+  # toggles VT_FA2_PREFILL and VT_FA2_DECODE (each default ON when compiled;
+  # =0 restores its same-binary fallback). Prefill was validated token-for-token
+  # + over the throughput bar on GB10 2026-07-10; ratio-6 decode remains GATING.
+  option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill/decode kernels (needs CUTLASS)" ON)
   if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
     set(_FA2_KERNEL_SRCS
@@ -569,7 +570,7 @@ if(VLLM_CPP_CUDA)
       ${_FA2_KERNEL_SRCS} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-DFLASH_NAMESPACE=flash;-include;${_FA2_ROOT}/fa2_compat_prelude.h;-isystem;${_FA2_ROOT}/src;-isystem;${_FA2_ROOT}/stubs;-isystem;${VLLM_CPP_CUTLASS_DIR}/include>")
-    message(STATUS "FlashAttention-2 sm_121a prefill: ENABLED (runtime toggle VT_FA2_PREFILL)")
+    message(STATUS "FlashAttention-2 sm_121a prefill/decode: ENABLED (runtime toggles VT_FA2_PREFILL, VT_FA2_DECODE)")
   endif()
 endif()
 

@@ -427,12 +427,14 @@ run_paired_traces() {
     local ours_log="${trace_dir}/ours-r${trace_rep}-profile.log"
     local ours_command="${trace_dir}/ours-r${trace_rep}-profile-command.txt"
     local ours_control="${trace_dir}/ours-r${trace_rep}-profile-control.json"
+    local shutdown_fifo="${ours_prefix}-shutdown.fifo"
     [[ ! -e ${ours_rep} && ! -e ${ours_sqlite} && ! -e ${ours_validation} &&
        ! -e ${ours_summary} && ! -e ${ours_log} && ! -e ${ours_command} &&
-       ! -e ${ours_control} ]] || {
+       ! -e ${ours_control} && ! -e ${shutdown_fifo} ]] || {
       echo "refusing to overwrite ours trace repetition ${trace_rep}" >&2
       return 1
     }
+    mkfifo --mode=600 "${shutdown_fifo}"
     local -a server_cmd=(
       "${build_dir}/examples/server"
       --model "${snapshot}"
@@ -443,6 +445,7 @@ run_paired_traces() {
       --max-model-len 262144
       --no-enable-prefix-caching
       --cuda-profile-graph-replays 4
+      --benchmark-shutdown-fifo "${shutdown_fifo}"
       --served-model-name gate
     )
     local -a profile_cmd=(
@@ -490,7 +493,7 @@ run_paired_traces() {
     }
     local shutdown_ready_pid=""
     for _ in $(seq 1 60); do
-      shutdown_ready_pid=$(sed -n 's/^\[VT_BENCH_SHUTDOWN\] ready pid=\([0-9][0-9]*\) signal=SIGUSR1$/\1/p' "${ours_log}")
+      shutdown_ready_pid=$(sed -n 's/^\[VT_BENCH_SHUTDOWN\] ready pid=\([0-9][0-9]*\) control=fifo$/\1/p' "${ours_log}")
       [[ $(wc -w <<<"${shutdown_ready_pid}") -eq 1 ]] && break
       sleep 1
     done
@@ -556,7 +559,7 @@ run_paired_traces() {
       echo "profiled server did not close the exact four-replay window" >&2
       return 1
     }
-    kill -USR1 "${server_pid}"
+    printf 'Q' >"${shutdown_fifo}"
     local nsys_status=0
     local nsys_exited=0
     for _ in $(seq 1 60); do
@@ -576,12 +579,17 @@ run_paired_traces() {
       echo "nsys exited ${nsys_status} for trace repetition ${trace_rep}" >&2
       return 1
     fi
-    grep -q '^\[VT_BENCH_SHUTDOWN\] requested signal=SIGUSR1$' "${ours_log}" || {
+    grep -q '^\[VT_BENCH_SHUTDOWN\] requested control=fifo$' "${ours_log}" || {
       echo "profiled server did not record its graceful-shutdown request" >&2
       return 1
     }
-    grep -q '^\[VT_BENCH_SHUTDOWN\] completed signal=SIGUSR1$' "${ours_log}" || {
+    grep -q '^\[VT_BENCH_SHUTDOWN\] completed control=fifo$' "${ours_log}" || {
       echo "profiled server did not complete graceful shutdown" >&2
+      return 1
+    }
+    rm -- "${shutdown_fifo}"
+    [[ ! -e ${shutdown_fifo} ]] || {
+      echo "profile shutdown FIFO still exists after target exit" >&2
       return 1
     }
     spid=""
@@ -602,7 +610,8 @@ run_paired_traces() {
       --server-pid "${server_pid}" \
       --server-ppid "${server_ppid}" \
       --server-pgid "${server_pgid}" \
-      --server-sid "${server_sid}"
+      --server-sid "${server_sid}" \
+      --shutdown-fifo "${shutdown_fifo}"
     [[ -s ${ours_rep} ]] || {
       echo "nsys did not write ${ours_rep}" >&2
       return 1

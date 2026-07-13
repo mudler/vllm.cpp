@@ -35,9 +35,9 @@
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include <atomic>
 #include <cerrno>
-#include <csignal>
-#include <pthread.h>
-#include <system_error>
+#include <chrono>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #endif
@@ -88,6 +88,7 @@ struct Args {
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
+  std::string benchmark_shutdown_fifo;  // paired trace-only control path.
   std::optional<bool> enable_prefix_caching = std::nullopt;
   bool enable_force_include_usage = false;
   // Scheduling policy: "fcfs" (default) or "priority" (mirrors vLLM's
@@ -104,6 +105,7 @@ struct Args {
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--cuda-profile-graph-replays N]\n"
+         "               [--benchmark-shutdown-fifo F]\n"
          "               [--enable-force-include-usage]\n"
          "               [--[no-]enable-prefix-caching]\n"
          "               [--scheduling-policy fcfs|priority]\n";
@@ -142,6 +144,8 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--cuda-profile-graph-replays") {
       a.cuda_profile_graph_replays =
           std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--benchmark-shutdown-fifo") {
+      a.benchmark_shutdown_fifo = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--enable-force-include-usage") {
       a.enable_force_include_usage = true;
     } else if (flag == "--enable-prefix-caching" ||
@@ -170,6 +174,12 @@ Args ParseArgs(int argc, char** argv) {
                  "(--max-num-batched-tokens may be 0 for auto)\n";
     Usage(argv[0], 2);
   }
+  if ((a.cuda_profile_graph_replays > 0) !=
+      !a.benchmark_shutdown_fifo.empty()) {
+    std::cerr << "server: --cuda-profile-graph-replays and "
+                 "--benchmark-shutdown-fifo must be specified together\n";
+    Usage(argv[0], 2);
+  }
   return a;
 }
 
@@ -178,30 +188,6 @@ Args ParseArgs(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
-
-#ifdef VT_BENCH_PROFILE_CONTROL
-    // H1d runs the server as an Nsight target. A terminating signal makes
-    // Nsight propagate 128+signal instead of the target's successful exit,
-    // so reserve SIGUSR1 as a synchronous, diagnostic-build-only graceful
-    // shutdown request. Block it before the engine creates worker threads;
-    // every descendant thread then inherits the mask and the dedicated
-    // sigwait thread below is the only consumer.
-    sigset_t benchmark_shutdown_signals{};
-    sigset_t previous_signal_mask{};
-    if (args.cuda_profile_graph_replays > 0) {
-      if (sigemptyset(&benchmark_shutdown_signals) != 0 ||
-          sigaddset(&benchmark_shutdown_signals, SIGUSR1) != 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "configure benchmark shutdown signal");
-      }
-      const int mask_status = pthread_sigmask(
-          SIG_BLOCK, &benchmark_shutdown_signals, &previous_signal_mask);
-      if (mask_status != 0) {
-        throw std::system_error(mask_status, std::generic_category(),
-                                "block benchmark shutdown signal");
-      }
-    }
-#endif
 
     const fs::path dir(args.model_dir);
     const std::string config_path = (dir / "config.json").string();
@@ -306,27 +292,79 @@ int main(int argc, char** argv) {
 #ifdef VT_BENCH_PROFILE_CONTROL
     std::atomic<bool> benchmark_shutdown_waiter_ready{false};
     std::atomic<bool> benchmark_shutdown_received{false};
+    std::atomic<bool> benchmark_shutdown_failed{false};
+    std::atomic<bool> benchmark_shutdown_cancelled{false};
     std::thread benchmark_shutdown_thread;
     if (args.cuda_profile_graph_replays > 0) {
       benchmark_shutdown_thread = std::thread([&]() {
-        benchmark_shutdown_waiter_ready.store(true, std::memory_order_release);
-        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << getpid()
-                  << " signal=SIGUSR1\n";
-        int received_signal = 0;
-        const int wait_status =
-            sigwait(&benchmark_shutdown_signals, &received_signal);
-        if (wait_status != 0) {
-          std::cerr << "[VT_BENCH_SHUTDOWN] failed status=" << wait_status
-                    << "\n";
-          server.stop();
+        const int shutdown_fd =
+            open(args.benchmark_shutdown_fifo.c_str(),
+                 O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (shutdown_fd < 0) {
+          const int status = errno;
+          std::cerr << "[VT_BENCH_SHUTDOWN] failed operation=open status="
+                    << status << "\n";
+          benchmark_shutdown_failed.store(true, std::memory_order_release);
           return;
         }
-        benchmark_shutdown_received.store(true, std::memory_order_release);
-        std::cerr << "[VT_BENCH_SHUTDOWN] requested signal=SIGUSR1\n";
-        server.stop();
+        struct stat shutdown_stat {};
+        const int stat_status = fstat(shutdown_fd, &shutdown_stat);
+        if (stat_status != 0 || !S_ISFIFO(shutdown_stat.st_mode)) {
+          const int status = stat_status != 0 ? errno : EINVAL;
+          std::cerr << "[VT_BENCH_SHUTDOWN] failed operation=fstat status="
+                    << status << "\n";
+          close(shutdown_fd);
+          benchmark_shutdown_failed.store(true, std::memory_order_release);
+          return;
+        }
+        benchmark_shutdown_waiter_ready.store(true, std::memory_order_release);
+        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << getpid()
+                  << " control=fifo\n";
+        while (!benchmark_shutdown_cancelled.load(std::memory_order_acquire)) {
+          char command = '\0';
+          const ssize_t bytes = read(shutdown_fd, &command, 1);
+          if (bytes == 1) {
+            if (command == 'Q') {
+              benchmark_shutdown_received.store(true,
+                                                 std::memory_order_release);
+              std::cerr
+                  << "[VT_BENCH_SHUTDOWN] requested control=fifo\n";
+              close(shutdown_fd);
+              server.stop();
+              return;
+            }
+            std::cerr
+                << "[VT_BENCH_SHUTDOWN] failed operation=command status="
+                << static_cast<unsigned int>(
+                       static_cast<unsigned char>(command))
+                << "\n";
+            close(shutdown_fd);
+            benchmark_shutdown_failed.store(true, std::memory_order_release);
+            server.stop();
+            return;
+          }
+          if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+              errno != EINTR) {
+            const int status = errno;
+            std::cerr << "[VT_BENCH_SHUTDOWN] failed operation=read status="
+                      << status << "\n";
+            close(shutdown_fd);
+            benchmark_shutdown_failed.store(true, std::memory_order_release);
+            server.stop();
+            return;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        close(shutdown_fd);
       });
-      while (!benchmark_shutdown_waiter_ready.load(std::memory_order_acquire)) {
+      while (!benchmark_shutdown_waiter_ready.load(std::memory_order_acquire) &&
+             !benchmark_shutdown_failed.load(std::memory_order_acquire)) {
         std::this_thread::yield();
+      }
+      if (benchmark_shutdown_failed.load(std::memory_order_acquire)) {
+        benchmark_shutdown_cancelled.store(true, std::memory_order_release);
+        benchmark_shutdown_thread.join();
+        return 1;
       }
     }
 #endif
@@ -335,21 +373,18 @@ int main(int argc, char** argv) {
 
 #ifdef VT_BENCH_PROFILE_CONTROL
     if (benchmark_shutdown_thread.joinable()) {
-      if (!benchmark_shutdown_received.load(std::memory_order_acquire)) {
-        const int wake_status =
-            pthread_kill(benchmark_shutdown_thread.native_handle(), SIGUSR1);
-        if (wake_status != 0 && wake_status != ESRCH) {
-          std::cerr << "[VT_BENCH_SHUTDOWN] wake failed status=" << wake_status
-                    << "\n";
-        }
-      }
+      benchmark_shutdown_cancelled.store(true, std::memory_order_release);
       benchmark_shutdown_thread.join();
-      std::cerr << "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1\n";
-      const int restore_status =
-          pthread_sigmask(SIG_SETMASK, &previous_signal_mask, nullptr);
-      if (restore_status != 0) {
-        throw std::system_error(restore_status, std::generic_category(),
-                                "restore benchmark shutdown signal mask");
+      if (benchmark_shutdown_received.load(std::memory_order_acquire)) {
+        std::cerr << "[VT_BENCH_SHUTDOWN] completed control=fifo\n";
+      } else {
+        if (!benchmark_shutdown_failed.load(std::memory_order_acquire)) {
+          std::cerr
+              << "[VT_BENCH_SHUTDOWN] failed operation=cancelled status=0\n";
+        }
+        if (listen_ok) {
+          return 1;
+        }
       }
     }
 #endif

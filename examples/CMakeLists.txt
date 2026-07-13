@@ -33,6 +33,6 @@ if(VLLM_CPP_SERVER)
   if(VLLM_CPP_BUILD_TESTS)
     add_test(NAME test_server_help COMMAND $<TARGET_FILE:server> --help)
     set_tests_properties(test_server_help PROPERTIES
-      PASS_REGULAR_EXPRESSION "--max-num-seqs N.*--max-num-batched-tokens N.*--cuda-profile-graph-replays N.*--enable-force-include-usage.*--\\[no-\\]enable-prefix-caching")
+      PASS_REGULAR_EXPRESSION "--max-num-seqs N.*--max-num-batched-tokens N.*--cuda-profile-graph-replays N.*--benchmark-shutdown-fifo F.*--enable-force-include-usage.*--\\[no-\\]enable-prefix-caching")
   endif()
 endif()

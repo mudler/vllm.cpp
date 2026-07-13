@@ -166,13 +166,13 @@ _CUDA_PROFILE_STOPPED_RE = re.compile(
     r"graph=(0x[0-9a-f]+)$"
 )
 _BENCH_SHUTDOWN_READY_RE = re.compile(
-    r"^\[VT_BENCH_SHUTDOWN\] ready pid=(\d+) signal=SIGUSR1$"
+    r"^\[VT_BENCH_SHUTDOWN\] ready pid=(\d+) control=fifo$"
 )
 _BENCH_SHUTDOWN_REQUESTED_RE = re.compile(
-    r"^\[VT_BENCH_SHUTDOWN\] requested signal=SIGUSR1$"
+    r"^\[VT_BENCH_SHUTDOWN\] requested control=fifo$"
 )
 _BENCH_SHUTDOWN_COMPLETED_RE = re.compile(
-    r"^\[VT_BENCH_SHUTDOWN\] completed signal=SIGUSR1$"
+    r"^\[VT_BENCH_SHUTDOWN\] completed control=fifo$"
 )
 
 
@@ -1615,9 +1615,9 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
         "ready_pid": int(ready_pid),
         "real_batch": TRACE_CONCURRENCY,
         "shutdown_completed": True,
+        "shutdown_control": "fifo",
         "shutdown_ready_pid": int(shutdown_ready_pid),
         "shutdown_requested": True,
-        "shutdown_signal": "SIGUSR1",
         "target_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
     }
 
@@ -1639,6 +1639,7 @@ def record_profile_control(
     server_ppid: int,
     server_pgid: int,
     server_sid: int,
+    shutdown_fifo: pathlib.Path,
 ) -> dict[str, Any]:
     if output.exists():
         raise HarnessError(f"refusing to overwrite profile control evidence: {output}")
@@ -1675,9 +1676,11 @@ def record_profile_control(
         raise HarnessError("profiled server is not a direct nsys-launcher child")
     if server_pgid != server_pid or server_sid != server_pid:
         raise HarnessError("profiled server is not the Nsight target-session leader")
+    if not shutdown_fifo.is_absolute() or shutdown_fifo.exists():
+        raise HarnessError("profile shutdown FIFO is not an absent absolute path")
     markers = _parse_profile_markers(profile_log)
     if markers["ready_pid"] != server_pid:
-        raise HarnessError("profile ready marker PID differs from the signaled server")
+        raise HarnessError("profile ready marker PID differs from the controlled server")
     result = {
         **markers,
         "launcher_comm": launcher_comm,
@@ -1695,6 +1698,7 @@ def record_profile_control(
         "server_pid": server_pid,
         "server_ppid": server_ppid,
         "server_sid": server_sid,
+        "shutdown_fifo": str(shutdown_fifo),
         "signal": "SIGUSR2",
         "plan_validation": _parse_fp4_plan_log(profile_log),
     }
@@ -2113,6 +2117,7 @@ def record_trace_status(
         )
 
     command_environments = []
+    command_shutdown_fifos = []
     for command_path, report_path in zip(
         ours_commands, ours_nsys_reports, strict=True
     ):
@@ -2164,6 +2169,8 @@ def record_trace_status(
             f"{output_prefix}.nsys-rep"
         ).resolve() != report_path.resolve():
             raise HarnessError("ours trace command output prefix differs from its report")
+        shutdown_fifo = pathlib.Path(f"{output_prefix}-shutdown.fifo").resolve()
+        command_shutdown_fifos.append(shutdown_fifo)
         expected_tail = [
             "nsys",
             "profile",
@@ -2197,6 +2204,8 @@ def record_trace_status(
             "--no-enable-prefix-caching",
             "--cuda-profile-graph-replays",
             str(TRACE_CAPTURE_GRAPH_REPLAYS),
+            "--benchmark-shutdown-fifo",
+            str(shutdown_fifo),
             "--served-model-name",
             "gate",
         ]
@@ -2230,8 +2239,14 @@ def record_trace_status(
 
     plan_validations = []
     profile_controls = []
-    for index, (log_path, control_path, environment) in enumerate(
-        zip(ours_profile_logs, ours_profile_controls, command_environments, strict=True),
+    for index, (log_path, control_path, environment, shutdown_fifo) in enumerate(
+        zip(
+            ours_profile_logs,
+            ours_profile_controls,
+            command_environments,
+            command_shutdown_fifos,
+            strict=True,
+        ),
         start=1,
     ):
         plan = _parse_fp4_plan_log(log_path)
@@ -2274,6 +2289,11 @@ def record_trace_status(
         if control.get("launcher_comm") != "nsys-launcher":
             raise HarnessError(f"capture {index} parent is not nsys-launcher")
         if (
+            control.get("shutdown_fifo") != str(shutdown_fifo)
+            or shutdown_fifo.exists()
+        ):
+            raise HarnessError(f"capture {index} shutdown FIFO lifecycle differs")
+        if (
             control["nsys_pgid"] != control["nsys_pid"]
             or control["nsys_sid"] != control["nsys_pid"]
             or control["launcher_ppid"] != control["nsys_pid"]
@@ -2285,7 +2305,7 @@ def record_trace_status(
         ):
             raise HarnessError(f"capture {index} does not have the recorded Nsight ancestry")
         if control["server_pid"] != markers["ready_pid"]:
-            raise HarnessError(f"capture {index} signaled server PID differs")
+            raise HarnessError(f"capture {index} controlled server PID differs")
         profile_controls.append(control)
 
     metadata = _load_json_object(vllm_metadata)
@@ -3092,6 +3112,7 @@ def _parser() -> argparse.ArgumentParser:
     profile_control.add_argument("--server-ppid", type=int, required=True)
     profile_control.add_argument("--server-pgid", type=int, required=True)
     profile_control.add_argument("--server-sid", type=int, required=True)
+    profile_control.add_argument("--shutdown-fifo", type=pathlib.Path, required=True)
 
     trace = commands.add_parser("record-trace-status")
     trace.add_argument("--output", type=pathlib.Path, required=True)
@@ -3242,6 +3263,7 @@ def main() -> int:
             server_ppid=args.server_ppid,
             server_pgid=args.server_pgid,
             server_sid=args.server_sid,
+            shutdown_fifo=args.shutdown_fifo,
         )
     elif args.command == "record-trace-status":
         result = record_trace_status(

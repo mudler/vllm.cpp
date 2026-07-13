@@ -357,12 +357,12 @@ def write_profile_log(
         "[VT_FP4_AUTOTUNE] pre-serve warmup complete max_tokens=2048 "
         "profiles_requested=0 profiles_tuned=0 cached_plans=64",
         f"[VT_CUDA_PROFILE] ready pid={server_pid} signal=SIGUSR2 target_replays=4",
-        f"[VT_BENCH_SHUTDOWN] ready pid={server_pid} signal=SIGUSR1",
+        f"[VT_BENCH_SHUTDOWN] ready pid={server_pid} control=fifo",
         "[VT_CUDA_PROFILE] started target_replays=4 graph=0x1234 "
         "real_batch=16 padded_batch=16 prior_replays=128",
         "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234",
-        "[VT_BENCH_SHUTDOWN] requested signal=SIGUSR1",
-        "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1",
+        "[VT_BENCH_SHUTDOWN] requested control=fifo",
+        "[VT_BENCH_SHUTDOWN] completed control=fifo",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -676,7 +676,9 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("${server_ppid} == \"${launcher_pid}\"", script)
         self.assertIn("${server_pgid} == \"${server_pid}\"", script)
         self.assertIn("${server_sid} == \"${server_pid}\"", script)
-        self.assertIn('kill -USR1 "${server_pid}"', script)
+        self.assertIn("mkfifo --mode=600", script)
+        self.assertIn("printf 'Q' >\"${shutdown_fifo}\"", script)
+        self.assertNotIn('kill -USR1 "${server_pid}"', script)
         self.assertIn('kill -TERM -- "-${profiled_pgid}"', script)
         self.assertNotIn("server_pgid} == \"${nsys_pid}", script)
 
@@ -698,7 +700,7 @@ class OnlineClientContractTests(unittest.TestCase):
             )
             profile_log.write_text(
                 profile_log.read_text(encoding="utf-8").replace(
-                    "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1\n", ""
+                    "[VT_BENCH_SHUTDOWN] completed control=fifo\n", ""
                 ),
                 encoding="utf-8",
             )
@@ -721,6 +723,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     server_ppid=5500,
                     server_pgid=6000,
                     server_sid=6000,
+                    shutdown_fifo=root / "shutdown.fifo",
                 )
 
     def test_profile_control_rejects_a_flattened_nsys_process_group(self) -> None:
@@ -758,6 +761,47 @@ class OnlineClientContractTests(unittest.TestCase):
                     server_ppid=5500,
                     server_pgid=5000,
                     server_sid=5000,
+                    shutdown_fifo=root / "shutdown.fifo",
+                )
+
+    def test_profile_control_requires_removed_shutdown_fifo(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            shutdown_fifo = root / "shutdown.fifo"
+            os.mkfifo(shutdown_fifo)
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            with self.assertRaisesRegex(
+                HarnessError, "shutdown FIFO is not an absent absolute path"
+            ):
+                record_profile_control(
+                    root / "control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=6000,
+                    server_sid=6000,
+                    shutdown_fifo=shutdown_fifo,
                 )
 
     def test_campaign_writes_a_model_summary_before_cross_model_summary(self) -> None:
@@ -1322,6 +1366,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
                 }
                 prefix = root / f"ours-{index}"
+                shutdown_fifo = pathlib.Path(f"{prefix}-shutdown.fifo")
                 profile_command = [
                     "env",
                     *[f"{name}={value}" for name, value in command_environment.items()],
@@ -1357,6 +1402,8 @@ class OnlineClientContractTests(unittest.TestCase):
                     "--no-enable-prefix-caching",
                     "--cuda-profile-graph-replays",
                     str(TRACE_CAPTURE_GRAPH_REPLAYS),
+                    "--benchmark-shutdown-fifo",
+                    str(shutdown_fifo),
                     "--served-model-name",
                     "gate",
                 ]
@@ -1378,6 +1425,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     server_ppid=launcher_pid,
                     server_pgid=server_pid,
                     server_sid=server_pid,
+                    shutdown_fifo=shutdown_fifo,
                 )
                 ours_nsys_reports.append(report)
                 ours_nsys_sqlites.append(sqlite_path)

@@ -7051,3 +7051,43 @@ CUDA-off suite passes **106/106**. Immutable `3f256ab`
 continues to bind at **55/124 pass, 69 fail**. Next: commit/push, create a new
 SHA-owned root and require all three zero-exit, lossless, exact-plan captures
 before any W3-H2 implementation, exact grid or 35B performance command.
+
+## 2026-07-13 — eighth H1d attempt hit signal exit 138; FIFO zero-exit repair implemented
+
+Clean pushed `3c1d7b79243ac173e2828e1fb3a74de4e72fbd35` used immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/3c1d7b79243ac173e2828e1fb3a74de4e72fbd35`.
+Plan-first setup, frozen corpus and exact `RelWithDebInfo`
+Triton-AOT/FA2/external-CUTLASS/sm_121a configuration passed. The recorded
+build completed **154/154** and the 27B gate passed **1/1 in 16.83 s**.
+Plan/configure/build/gate/server SHA-256 are `dc6b2cb6…4a2` /
+`3eaf30e3…a4` / `01fa623d…02e` / `5faef2e6…a99` /
+`82cff362…86e`.
+
+Capture 1 validated the real Nsight ancestry, loaded the exact read-only
+64-plan map, completed the ordinary **48/48** c16 workload in 66.803863 s and
+the **16/16** probe in 23.780080 s, then logged `prior_replays=483` and
+`captured_replays=4`. Nsight wrote a 448,789-byte report, SHA
+`4cc9deef…0c1`. Process-directed SIGUSR1 terminated the target before any
+requested/completed shutdown marker; Nsight propagated exit **138** and the
+fail-closed driver stopped before SQLite, captures 2/3 or vLLM.
+Driver/profile/command/client/probe SHA-256 are `3e936aa8…030` /
+`62c773f5…bc9` / `b9f0c465…c3f` / `4f37de0a…184` /
+`7d94fd6b…78f`. The root is **FAILED / VOID**, every client rate is
+diagnostic only, and it is never reused. GPU, lock and port returned idle.
+
+The repair removes terminating signals from accepted shutdown. The driver now
+creates one mode-0600 FIFO per capture and passes its absolute path to the
+diagnostic target. The target opens it read-only with `O_NOFOLLOW`, verifies
+`S_ISFIFO`, records readiness and calls thread-safe `ApiServer::stop()` only
+after reading one `Q` written after the exact four-replay close marker. The
+record requires one ready/requested/completed FIFO lifecycle, FIFO removal and
+Nsight exit zero. Production builds compile this path out; SIGTERM/KILL remain
+failure cleanup.
+
+Python/shell and diagnostic-macro syntax, the CUDA-off server build and focused
+harness tests **31/31** pass. Two full CUDA-off runs pass **105/106** but the
+unrelated timing-sensitive C API early-stop case fails; it passes in isolation.
+Immutable `3f256ab` continues to bind at **55/124 pass, 69 fail**. Next:
+commit/push, create a new SHA-owned root and require all three FIFO-controlled,
+zero-exit, lossless, exact-plan captures before W3-H2, an exact grid or 35B
+performance.

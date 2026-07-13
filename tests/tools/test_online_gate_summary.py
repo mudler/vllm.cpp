@@ -318,6 +318,7 @@ def _write_fixture(root: pathlib.Path) -> None:
             server_ppid=5500 + index,
             server_pgid=6000 + index,
             server_sid=6000 + index,
+            shutdown_fifo=trace_root / f"ours-r{index}-shutdown.fifo",
         )
         for name, path in (
             (f"ours_nsys_sqlite{suffix}", sqlite_path),

@@ -7540,3 +7540,52 @@ zero-lifecycle aggregation, normal H2, exact grid and 35B performance remain
 prohibited. No production code, GPU run, benchmark ratio, or speed credit
 changed; binding `3f256ab` remains **55/124**. Live status surfaces replace the
 former “spike pending” checkpoint instead of accumulating another narrative.
+
+## 2026-07-13 — W3-I1 packed fused producer implemented; dirty preflight passes
+
+W3-I1 now exists behind cached, default-off `VT_FP4_FUSED_VEC=1`. The exact
+eligible slice is sm_120a/121a BF16, direct CUTLASS-swizzled scales and aligned
+input/output. It ports the upstream two 256-bit cache-global gate/up loads,
+packed BF16 SiLU/multiply rounding and maximum, E4M3 scale, hardware packed
+E2M1 conversion, 64-bit output store, block-512 2-D row/group launch and row
+loop. The operation records an explicit `cudaMemsetAsync` before the body so
+dirty pooled padding remains safe under graph replay. Unsupported dtype/layout,
+misalignment, other architectures and a disabled toggle retain the scalar
+producer. Public comments now assign padding ownership to the whole operation.
+
+The first candidate compiled to the intended load/store shape but failed the
+byte-exact CUDA test **21/22 cases, 26,904/26,916 assertions** (log SHA
+`a66ae640…418b`). All 12 mismatches were signed zero: Blackwell packed E2M1
+preserves the sign of values rounded to zero, while vt exact mode canonicalizes
+both zeros. A branch-free per-nibble magnitude mask now clears only zero sign
+bits; the packed hardware path remains intact. Candidate OFF and ON then each
+pass **22/22 + 26,916/26,916**, with byte-identical log SHA `1681b723…90e7`.
+The cases cover M=1/2/4/8/9/16/32/37/48/128, I=64/128/2,048/17,408,
+candidate/fallback, poisoned padded scales, cold eager then capture/two replays,
+and deliberate two-byte input misalignment.
+
+CUDA-off build plus the complete suite pass **106/106**. Focused producer
+memcheck passes **1/1 + 64/64**, zero errors/leaks (SHA `8855fe30…5684`). The
+first full-binary memcheck without the established `VT_CUTLASS_NOPOOL=1`
+strict-test control is **FAILED / NON-CANDIDATE POOL RETENTION**: one unrelated
+four-byte async alpha allocation at `cuda_matmul_nvfp4_cutlass.cu:941` remains
+live (SHA `570860f5…2464`). The correct strict full command with no-pool passes
+**22/22 + 26,916/26,916, zero errors and zero leaked bytes** (SHA
+`cca0b0d8…173c`).
+
+Both frozen-plan 27B processes load the identical 64/64 map, tune zero, and
+pass **235/235 assertions + 16/16 vLLM tokens** with candidate off/on; their
+logs are byte-identical at SHA `468ea71b…7346`. Candidate-on 35B
+correctness-only inertness passes **2/2 + 315/315** (SHA `953eb932…d7ba`); its
+zero-dispatch proof remains part of the immutable trace gate. Final candidate
+object SHA `7a620f4e…206` emits **816 instructions, 36 registers, zero
+stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte
+store and eight packed E2M1 conversions**. SASS text SHA is `b5f07fbc…225a`.
+
+All GPU series ran uncontended under `/tmp/gpu`; GPU and lock are idle. This
+root (`~/work/vllm.cpp-w3i-preflight/29a30eb-dirty`) is deliberately dirty
+development evidence, not immutable trace or benchmark credit. Publish this
+checkpoint, clean-build its exact SHA, then require paired candidate/fallback
+graph traces before the complete c2/c16 **40 timing + 8 memory** component.
+Binding `3f256ab` remains **55/124 pass, 69 fail**; no rate, exact-grid
+authorization or 35B performance result exists, and W3-I2+ remains prohibited.

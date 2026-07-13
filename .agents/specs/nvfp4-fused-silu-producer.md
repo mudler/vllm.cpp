@@ -1,7 +1,8 @@
 # NVFP4 fused SiLU→FP4 producer (W3-I)
 
-Status: **READY — W3-I0 whole-chain spike complete; W3-I1 implementation may
-begin behind an opt-in rollback toggle**
+Status: **ACTIVE — W3-I1 implemented behind a default-off rollback toggle;
+dirty-root correctness/safety/model/SASS preflight passes, immutable trace and
+performance remain pending**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -108,11 +109,11 @@ That dump explains why padding work is absent from the vLLM custom-kernel SASS.
 |---|---|---|
 | Public op contract | `include/vt/ops.h:518-557`; `src/vt/ops.cpp:206-282` | retain layout/shape validation and CPU-neutral API; clarify that the full operation, not necessarily the custom body, zeroes padding |
 | CPU reference | `src/vt/cpu/cpu_ops.cpp:384-410` | retain composite `SiluAndMul` → `ScaledFp4Quant` behavior |
-| CUDA fused body | `src/vt/cuda/cuda_matmul_nvfp4.cu:1191-1307` | currently scalar-loads 32 BF16 values, uses scalar max/nibble stores, and linearizes the full padded allocation; add packed specialization and retain scalar fallback |
+| CUDA fused body | `src/vt/cuda/cuda_matmul_nvfp4.cu:1207-1362,1471-1500` | default-off packed BF16/direct-swizzled specialization uses two 256-bit loads, BF16x2 max, hardware E2M1 packing, signed-zero canonicalization, one 64-bit store and explicit async pre-zero; scalar path remains the fallback |
 | Shared scale address/math | `src/vt/cuda/cuda_matmul_nvfp4.cu:913-981` | reuse exact E4M3 and swizzle contract; add packed helpers only where needed |
 | Model dispatch | `src/vllm/model_executor/models/qwen3_5.cpp:1071-1082,1210-1219,3468-3506,3566-3587` | production executes one-input BF16/swizzled form; add a cached opt-in eligibility check without changing other paths |
 | Buffer lifecycle | `src/vllm/model_executor/models/qwen3_5.cpp:334-395` | pooled `DBuf` memory is dirty, so a packed kernel may not omit padding initialization; W3-I1 must explicitly pre-zero it |
-| Existing tests | `tests/vt/test_ops_nvfp4_fp4.cpp:731-817,820-957,959-1085` | two-input, CPU one-input, direct/padded scale, and CUDA one-input tests already exist; extend them with candidate/fallback, tail, poison, graph, and production shapes |
+| Existing tests | `tests/vt/test_ops_nvfp4_fp4.cpp:731-817,820-957,959-1127` | two-input, CPU one-input, direct/padded scale, and CUDA one-input tests now cover candidate/fallback, production M classes, poisoned padding, capture/replay and misaligned fallback |
 
 The accepted 27B route has `VT_W4A4_TRUE`, fused SiLU quant, direct scales, and
 merged SiLU quant default-on. It calls `SiluAndMulFp4Quant` at
@@ -144,7 +145,7 @@ in the accepted production trace and do not block the first specialization.
 | Leaf | Deliverable | State |
 |---|---|---|
 | W3-I0 | source, generated-code, SASS, executed-trace, dispatch, test, dependency and gate inventory | **COMPLETE in this spike** |
-| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **READY** |
+| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **IMPLEMENTED / PREFLIGHT PASS; IMMUTABLE TRACE + COMPONENT PENDING** |
 | W3-I2 | if a post-I1 trace shows per-call zeroing is material, aggregate/fuse scale initialization at the model/graph lifecycle seam to mirror the generated vLLM zero kernel | **INVENTORIED; prohibited before I1 classification** |
 | W3-I3 | upstream approximate-reciprocal numeric mode plus FP16 packed input, independently correctness/performance-gated | **INVENTORIED** |
 | W3-I4 | two-input and expert-offset packed breadth, each with the matching upstream tests | **INVENTORIED** |
@@ -154,6 +155,30 @@ The W3-I1 pre-zero is a safe local equivalent, not a claim that one memset per
 producer matches Inductor's multi-buffer fusion. The trace must count those
 nodes explicitly. W3-I2 exists only if that measured topology is the next
 largest local residual.
+
+## W3-I1 preflight checkpoint
+
+This is dirty-root development evidence at
+`~/work/vllm.cpp-w3i-preflight/29a30eb-dirty`, not immutable benchmark credit.
+It permits publication and a clean commit-bound rerun only.
+
+| Gate | Result |
+|---|---|
+| CUDA-off build and suite | **PASS — 106/106 CTest** |
+| CUDA candidate OFF / ON | **PASS — 22/22 cases and 26,916/26,916 assertions per arm**; logs are byte-identical, SHA `1681b723…90e7` |
+| Capture, poisoned padding, production M classes, alignment fallback | **PASS** in the focused operator suite |
+| Strict memcheck | **PASS — 22/22, 26,916/26,916, zero errors, zero leaks** with `VT_CUTLASS_NOPOOL=1`; log SHA `cca0b0d8…173c` |
+| 27B candidate / fallback | **PASS — 235/235 + 16/16 each**, one frozen 64/64 plan map; identical log SHA `468ea71b…7346` |
+| 35B candidate-on correctness-only inertness | **PASS — 2/2 + 315/315**; log SHA `953eb932…d7ba`; dispatch-zero proof remains a trace obligation |
+| Packed compiled body | object SHA `7a620f4e…206`: **816 instructions, 36 registers, zero stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte store, eight packed E2M1 conversions** |
+| Paired graph trace / c2+c16 component | **PENDING — no rate or lifecycle credit** |
+
+The first candidate run exposed the one intentional local semantic delta from
+raw Blackwell conversion: hardware E2M1 preserves negative zero while the
+established exact-mode reference canonicalizes it. I1 retains packed hardware
+conversion and clears only sign bits on zero-magnitude nibbles branch-free;
+candidate and fallback bytes then match exactly. The failed pre-fix run is
+diagnostic only and contributes no correctness or speed evidence.
 
 ## Tests to port and extend
 

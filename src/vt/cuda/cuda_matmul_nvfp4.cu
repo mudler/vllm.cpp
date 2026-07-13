@@ -45,8 +45,10 @@
 #include <math_constants.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -83,6 +85,23 @@ bool Fp4VecEnabled() {
     return e == nullptr || (e[0] != '0');
   }();
   return on;
+}
+
+// W3-I1 packed one-input SiLU->NVFP4 producer (A/B; default OFF). The
+// specialization mirrors vLLM's executed sm1xxa body only for the production
+// BF16 + direct-swizzled route. All other dtypes/layouts/alignment cases retain
+// the scalar producer below. Cache the environment decision: this launcher is
+// reached 64 times per dense forward and must never call getenv per kernel.
+bool FusedFp4VectorEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_FUSED_VEC");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+bool PointerAligned(const void* pointer, uintptr_t alignment) {
+  return (reinterpret_cast<uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
 
 // Decode-specialized MoE grouped GEMM path toggle (M2.9; A/B, default ON). Set
@@ -1188,6 +1207,182 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
   Check(cudaGetLastError(), "silu_mul_fp4_quant kernel launch");
 }
 
+// W3-I1 specialization of vLLM@e24d1b24
+//   csrc/libtorch_stable/quantization/fp4/
+//     activation_nvfp4_quant_fusion_kernels.cu:30-116,120-163
+//   csrc/libtorch_stable/quantization/fp4/nvfp4_utils.cuh:118-329
+//   csrc/libtorch_stable/cuda_vec_utils.cuh:123-175,264-288
+//
+// The upstream compiled body consumes 16 BF16 values per thread with two
+// 256-bit gate/up loads, computes/rounds packed BF16 pairs, emits one E4M3 scale
+// byte and one 64-bit E2M1 payload, and launches over actual rows/groups. vLLM's
+// generated graph pre-zeroes padded scale storage outside the custom body. Our
+// pooled DBuf storage is dirty, so the launcher below records an explicit
+// cudaMemsetAsync before this kernel. That lifecycle is intentionally visible
+// to graph tracing and remains a separately measurable W3-I2 opportunity.
+#if defined(VT_FP4_MMA_SM120A)
+struct alignas(32) PackedBf16x16 {
+  uint32_t words[8];
+};
+
+struct PackedFp4x16 {
+  uint32_t lo;
+  uint32_t hi;
+};
+
+__device__ __forceinline__ uint32_t CanonicalizeFp4NegativeZero(
+    uint32_t packed) {
+  // Blackwell's packed E2M1 conversion preserves the sign of values that
+  // round to zero. The established vt exact-mode reference deliberately
+  // canonicalizes both signed zeros to nibble 0x0. Detect a non-zero
+  // magnitude independently in every nibble, then retain its sign bit only
+  // when at least one of the three magnitude bits is set.
+  constexpr uint32_t kMagnitude = 0x77777777u;
+  constexpr uint32_t kSign = 0x88888888u;
+  const uint32_t magnitude = packed & kMagnitude;
+  const uint32_t nonzero_sign =
+      ((magnitude << 1) | (magnitude << 2) | (magnitude << 3)) & kSign;
+  return packed & (kMagnitude | nonzero_sign);
+}
+
+__device__ __forceinline__ void LoadBf16x16Cg(PackedBf16x16& value,
+                                               const __nv_bfloat16* pointer) {
+  asm volatile(
+      "ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
+      : "=r"(value.words[0]), "=r"(value.words[1]), "=r"(value.words[2]),
+        "=r"(value.words[3]), "=r"(value.words[4]), "=r"(value.words[5]),
+        "=r"(value.words[6]), "=r"(value.words[7])
+      : "l"(pointer));
+}
+
+__device__ __forceinline__ __nv_bfloat162& Bf16Pair(PackedBf16x16& value,
+                                                     int index) {
+  return reinterpret_cast<__nv_bfloat162*>(value.words)[index];
+}
+
+__device__ __forceinline__ PackedFp4x16 PackFp4x16(float2 (&values)[8]) {
+  PackedFp4x16 packed;
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0;\n"
+      ".reg .b8 b1;\n"
+      ".reg .b8 b2;\n"
+      ".reg .b8 b3;\n"
+      ".reg .b8 b4;\n"
+      ".reg .b8 b5;\n"
+      ".reg .b8 b6;\n"
+      ".reg .b8 b7;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b0,  %3,  %2;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b1,  %5,  %4;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b2,  %7,  %6;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b3,  %9,  %8;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b4, %11, %10;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b5, %13, %12;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b6, %15, %14;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 b7, %17, %16;\n"
+      "mov.b32 %0, {b0, b1, b2, b3};\n"
+      "mov.b32 %1, {b4, b5, b6, b7};\n"
+      "}\n"
+      : "=r"(packed.lo), "=r"(packed.hi)
+      : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x),
+        "f"(values[1].y), "f"(values[2].x), "f"(values[2].y),
+        "f"(values[3].x), "f"(values[3].y), "f"(values[4].x),
+        "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
+        "f"(values[6].x), "f"(values[6].y), "f"(values[7].x),
+        "f"(values[7].y));
+  packed.lo = CanonicalizeFp4NegativeZero(packed.lo);
+  packed.hi = CanonicalizeFp4NegativeZero(packed.hi);
+  return packed;
+}
+
+__global__ __launch_bounds__(512) void SiluAndMulFp4QuantPackedBf16Kernel(
+    uint8_t* __restrict__ packed, uint8_t* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ gate_up, float input_global_scale,
+    int32_t m_rows, int32_t i_dim, int32_t scale_cols, bool approx_recip) {
+  const int32_t groups = i_dim / 16;
+  const int32_t group =
+      static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
+  if (group >= groups) return;
+
+  for (int32_t row = static_cast<int32_t>(blockIdx.x); row < m_rows;
+       row += static_cast<int32_t>(gridDim.x)) {
+    const int64_t input_row_base = static_cast<int64_t>(row) * 2 * i_dim;
+    const int64_t group_base = static_cast<int64_t>(group) * 16;
+    PackedBf16x16 gate;
+    PackedBf16x16 up;
+    LoadBf16x16Cg(gate, gate_up + input_row_base + group_base);
+    LoadBf16x16Cg(up, gate_up + input_row_base + i_dim + group_base);
+
+    PackedBf16x16 activation;
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+      const float2 gate_pair = __bfloat1622float2(Bf16Pair(gate, pair));
+      const float2 up_pair = __bfloat1622float2(Bf16Pair(up, pair));
+      const float lo =
+          (gate_pair.x / (1.0f + expf(-gate_pair.x))) * up_pair.x;
+      const float hi =
+          (gate_pair.y / (1.0f + expf(-gate_pair.y))) * up_pair.y;
+      Bf16Pair(activation, pair) = __floats2bfloat162_rn(lo, hi);
+    }
+
+    __nv_bfloat162 local_max = __habs2(Bf16Pair(activation, 0));
+#pragma unroll
+    for (int pair = 1; pair < 8; ++pair) {
+      local_max = __hmax2(local_max, __habs2(Bf16Pair(activation, pair)));
+    }
+    const float2 max_pair = __bfloat1622float2(local_max);
+    const float vmax = fmaxf(max_pair.x, max_pair.y);
+    const float inverse_six =
+        approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+    float sf = input_global_scale * (vmax * inverse_six);
+    sf = fminf(fmaxf(sf, -448.0f), 448.0f);
+    const uint8_t sf8 = F32ToFp8Dev(sf);
+    scale[CutlassScaleOffset(row, group, scale_cols)] = sf8;
+
+    const float sf_value = F8E4M3ToF32Dev(sf8);
+    float output_scale = 0.0f;
+    if (sf_value != 0.0f) {
+      output_scale =
+          approx_recip
+              ? ReciprocalApproximateFtz(
+                    sf_value * ReciprocalApproximateFtz(input_global_scale))
+              : input_global_scale / sf_value;
+    }
+    float2 values[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+      values[pair] = __bfloat1622float2(Bf16Pair(activation, pair));
+      values[pair].x *= output_scale;
+      values[pair].y *= output_scale;
+    }
+    const PackedFp4x16 fp4 = PackFp4x16(values);
+    const uint64_t packed64 =
+        (static_cast<uint64_t>(fp4.hi) << 32) | fp4.lo;
+    const int64_t output_byte =
+        (static_cast<int64_t>(row) * i_dim + group_base) / 2;
+    *reinterpret_cast<uint64_t*>(packed + output_byte) = packed64;
+  }
+}
+
+int PackedFusedFp4ResidentBlocks() {
+  static const int blocks = [] {
+    int device = 0;
+    int multiprocessors = 0;
+    int blocks_per_multiprocessor = 0;
+    Check(cudaGetDevice(&device), "packed fused quant get device");
+    Check(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
+                                 device),
+          "packed fused quant multiprocessor count");
+    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks_per_multiprocessor,
+              SiluAndMulFp4QuantPackedBf16Kernel, 512, 0),
+          "packed fused quant occupancy");
+    return std::max(1, multiprocessors * blocks_per_multiprocessor);
+  }();
+  return blocks;
+}
+#endif
+
 // Exact one-input custom-op form used by vLLM's ActivationQuantFusionPass.
 // Upstream: vllm@e24d1b24
 //   csrc/libtorch_stable/quantization/fp4/
@@ -1276,6 +1471,30 @@ void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
   auto* pk = out_packed.Ptr<uint8_t>();
   auto* sc = out_scale.Ptr<uint8_t>();
   const bool approx = NativeFp4MmaEnabled();
+#if defined(VT_FP4_MMA_SM120A)
+  const bool packed_eligible =
+      FusedFp4VectorEnabled() && swizzled && gate_up.dtype == DType::kBF16 &&
+      m <= std::numeric_limits<int32_t>::max() &&
+      i <= std::numeric_limits<int32_t>::max() &&
+      scale_cols <= std::numeric_limits<int32_t>::max() &&
+      PointerAligned(gate_up.data, 32) && PointerAligned(pk, 8);
+  if (packed_eligible) {
+    Check(cudaMemsetAsync(sc, 0, static_cast<size_t>(out_scale.Numel()), s),
+          "packed fused quant zero scale");
+    const int groups = static_cast<int>(i / 16);
+    const int block = std::min(groups, 512);
+    const int grid_y = (groups + block - 1) / block;
+    const int grid_x = std::min(
+        static_cast<int>(m),
+        std::max(1, PackedFusedFp4ResidentBlocks() / grid_y));
+    SiluAndMulFp4QuantPackedBf16Kernel<<<dim3(grid_x, grid_y), block, 0, s>>>(
+        pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv,
+        static_cast<int32_t>(m), static_cast<int32_t>(i),
+        static_cast<int32_t>(scale_cols), approx);
+    Check(cudaGetLastError(), "packed silu_and_mul_fp4_quant kernel launch");
+    return;
+  }
+#endif
   switch (gate_up.dtype) {
     case DType::kF32:
       if (swizzled) {

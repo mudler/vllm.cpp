@@ -16,10 +16,13 @@ OpenAI-compatible server.
 > mandatory token gate. Cross-profiler attribution ranks the fused SiLU→FP4
 > producer above the normal producer in all 12 reports, so normal-producer
 > W3-H2 is displaced. The dedicated [W3-I spike](.agents/specs/nvfp4-fused-silu-producer.md)
-> is now complete: it grounds the executed scale-zero lifecycle, 544-block
-> scalar launch, and 1,480-vs-384-instruction SASS gap, and authorizes only an
-> opt-in packed candidate. No candidate or speed credit exists yet: the binding
-> result remains **55/124**, and no 35B performance result is claimed. See
+> now has a default-off `VT_FP4_FUSED_VEC=1` implementation. Dirty-root
+> preflight passes the full CPU suite, candidate/fallback CUDA operator and
+> model gates, strict memcheck, and the 35B correctness-only inertness gate;
+> the packed body is 816 instructions with two 256-bit loads and one 64-bit
+> store. Commit-bound trace and the 48-axis component are still pending, so no
+> speed credit exists: the binding result remains **55/124**, and no 35B
+> performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -27,10 +30,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Implement and strictly gate opt-in W3-I1; only a passing component can authorize all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Trace and benchmark immutable W3-I1; only a passing component can authorize all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-I fused SiLU→FP4 producer | 🟦 `READY` / I0 complete | Whole-chain source, generated-code, trace and SASS spike accepted; no runtime code or ratio changed | Implement opt-in BF16/swizzled packed candidate, then run correctness, SASS, trace and 48-axis component gates |
+| W3-I fused SiLU→FP4 producer | 🚧 `ACTIVE` / I1 preflight green | Default-off packed BF16/swizzled candidate passes 106/106 CPU tests, 22/22 CUDA cases, strict memcheck, both 27B 16/16 arms, and 35B correctness; no accepted ratio | Publish the exact commit, prove paired graph dispatch/lifecycle, then run the complete c2/c16 48-axis component |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -60,7 +63,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
 | Vectorized normal BF16→FP4 I/O | Not implemented. Accepted H1d attribution ranks its diagnostic residual at **+0.313930 ms/window**, below the fused producer in 12/12 reports; W3-H2 is displaced |
-| Fused SiLU→FP4 producer | W3-I0 spike complete; implementation not started. The executed gap is concrete: local scalar/padded-sweep grid `(544,1,1)` and 1,480 SASS instructions versus vLLM's pre-zeroed 2-D packed body and 384 instructions. W3-I1 is an opt-in candidate with strict rollback gates |
+| Fused SiLU→FP4 producer | W3-I1 is implemented behind default-off `VT_FP4_FUSED_VEC=1`: explicit capture-safe scale pre-zero, 2-D packed BF16 body, scalar/misalignment fallback, and negative-zero canonicalization. Dirty-root correctness/safety preflight passes; immutable trace and all 48 component axes remain pending |
 
 ## What is implemented
 
@@ -130,7 +133,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; accepted trace/SASS evidence selects W3-I and its opt-in packed candidate is `READY`, not implemented |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the default-off W3-I packed candidate is implemented and preflight-green, with immutable trace/performance still pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |

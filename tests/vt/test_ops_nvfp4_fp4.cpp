@@ -962,10 +962,12 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
   Queue gq = b.CreateQueue();
   const float input_global_scale = 6.7F;
 
-  auto run_check = [&](int64_t m, int64_t i, DType dtype) {
+  auto run_check = [&](int64_t m, int64_t i, DType dtype,
+                       bool misaligned_input = false) {
     CAPTURE(m);
     CAPTURE(i);
     CAPTURE(static_cast<int>(dtype));
+    CAPTURE(misaligned_input);
     std::mt19937 rng(static_cast<unsigned>(211 + m * 131 + i));
     std::normal_distribution<float> nd(0.0F, 2.0F);
     std::vector<float> input_f32(static_cast<size_t>(m * 2 * i));
@@ -981,12 +983,14 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
       input_bytes = input_bf16.size() * sizeof(uint16_t);
     }
 
-    auto upload = [&](const void* host, size_t bytes) {
-      void* device = b.Alloc(bytes);
-      b.Copy(gq, device, host, bytes);
-      return device;
-    };
-    void* dinput = upload(input_host, input_bytes);
+    void* dinput_allocation =
+        b.Alloc(input_bytes + (misaligned_input ? size_t{2} : size_t{0}));
+    void* dinput =
+        misaligned_input
+            ? static_cast<void*>(
+                  static_cast<uint8_t*>(dinput_allocation) + 2)
+            : dinput_allocation;
+    b.Copy(gq, dinput, input_host, input_bytes);
     Tensor input = GpuTensor({m, 2 * i});
     input.data = dinput;
     input.dtype = dtype;
@@ -1068,7 +1072,38 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
     CHECK(direct_packed_host == fused_packed_host);
     CHECK(direct_scale_host ==
           SwizzleScaleReference(fused_scale_host, m, i / 16));
-    for (void* pointer : {dinput, dact, dref_packed, dref_scale,
+
+    // Port the upstream functionalized two-output contract through our CUDA
+    // graph API. The first eager call above also initializes the packed
+    // candidate's cached occupancy before capture. Poisoning before each replay
+    // proves that the captured operation owns every padded scale byte rather
+    // than relying on allocator contents or one-time initialization.
+    if (dtype == DType::kBF16 && m == 1 && i == 64 && !misaligned_input) {
+      b.Memset(gq, ddirect_scale, 0xA5,
+               static_cast<size_t>(padded_rows * padded_cols));
+      b.Synchronize(gq);
+      b.BeginCapture(gq);
+      vt::SiluAndMulFp4Quant(gq, direct_packed, direct_scale, input,
+                             input_global_scale,
+                             vt::Fp4ScaleLayout::kCutlassSwizzled);
+      void* graph = b.EndCaptureGraph(gq);
+      for (int replay = 0; replay < 2; ++replay) {
+        b.Memset(gq, ddirect_scale, 0xA5,
+                 static_cast<size_t>(padded_rows * padded_cols));
+        b.ReplayGraph(gq, graph);
+        b.Copy(gq, direct_packed_host.data(), ddirect_packed,
+               direct_packed_host.size());
+        b.Copy(gq, direct_scale_host.data(), ddirect_scale,
+               direct_scale_host.size());
+        b.Synchronize(gq);
+        CHECK(direct_packed_host == fused_packed_host);
+        CHECK(direct_scale_host ==
+              SwizzleScaleReference(fused_scale_host, m, i / 16));
+      }
+      b.DestroyGraph(graph);
+    }
+
+    for (void* pointer : {dinput_allocation, dact, dref_packed, dref_scale,
                           dfused_packed, dfused_scale, ddirect_packed,
                           ddirect_scale}) {
       b.Free(pointer);
@@ -1081,6 +1116,10 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
     run_check(37, 2048, dtype);    // padded-M prefill
     run_check(9, 17408, dtype);    // exact 27B intermediate class
   }
+  for (int64_t m : {2, 4, 8, 16, 32, 48}) {
+    run_check(m, 128, DType::kBF16);  // exact decode-graph row classes
+  }
+  run_check(1, 64, DType::kBF16, true);  // packed path must fall back safely
   b.DestroyQueue(gq);
 }
 

@@ -525,7 +525,9 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
 //   out_scale  linear [M,K/16], or CUTLASS-swizzled
 //              [round_up(M,128),round_up(K/16,4)] i8 fp8-e4m3fn block scales
 //              (a_scale_fp8, RAW — the GEMM folds 1/input_global_scale into
-//              `alpha`). The swizzled producer zeroes every padded byte.
+//              `alpha`). The swizzled operation initializes every padded byte
+//              to zero; backends may do that in the producer body or as a
+//              capture-safe pre-zero immediately before it.
 // `input_global_scale_inv` is the ON-DISK activation divisor (2688/amax_act) used
 // DIRECTLY. K a multiple of 16. Math = vllm cvt_warp_fp16_to_fp4 (notes §7.2) /
 // the CPU vllm::RefScaledFp4Quant. CPU + CUDA.

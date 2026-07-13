@@ -14,10 +14,10 @@ three independent 48/48 + 16/16 local sessions, all 12 lossless reports, and
 the paired vLLM trace. Final status SHA is `84d15970…6e66` with `passed=true`;
 local output non-repeatability remains explicit and non-fatal after the model
 gate. The fused SiLU→FP4 producer is the largest positive mapped residual, so
-normal-producer W3-H2 is displaced. Its dedicated W3-I whole-chain spike is
-now `READY`: generated-code and SASS evidence identify a padded-scale lifecycle
-and packed-kernel gap, but no candidate has run and no binding speed number
-changed.
+normal-producer W3-H2 is displaced. W3-I1 is now implemented behind default-off
+`VT_FP4_FUSED_VEC=1`. Dirty-root operator, sanitizer and both-model correctness
+preflight passes, but commit-bound trace and the c2/c16 component have not run;
+no binding speed number changed.
 
 ## Binding 27B online gate
 
@@ -66,7 +66,7 @@ authorized until all 124 27B axes pass.
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
 | W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
-| W3-I fused SiLU→FP4 producer | **PENDING / READY; NOT IMPLEMENTED** | [Whole-chain spike](../.agents/specs/nvfp4-fused-silu-producer.md) inventories the executed route, generated zero-buffer fusion and compiled bodies: local grid `(544,1,1)` / 1,480 SASS instructions versus vLLM's 2-D packed body / 384. No same-binary number exists | Implement opt-in `VT_FP4_FUSED_VEC=1`; pass operator, model, sanitizer, SASS and trace gates, then run the c2/c16 40-timing + 8-memory component |
+| W3-I fused SiLU→FP4 producer | **ACTIVE / PREFLIGHT PASS; TRACE + PERFORMANCE PENDING** | Default-off [W3-I1](../.agents/specs/nvfp4-fused-silu-producer.md) ports the BF16/direct-swizzled packed body with explicit scale pre-zero and scalar fallback. Dirty-root preflight: CPU **106/106**; candidate OFF/ON CUDA **22/22 + 26,916/26,916** each; strict no-pool memcheck **0 errors / 0 leaks**; both 27B arms **235/235 + 16/16** with identical 64/64 plans; 35B correctness **2/2 + 315/315**. Candidate SASS is **816 instructions / 36 registers / two 256-bit loads / one 64-bit store**. No same-binary rate exists | Publish and rebuild the immutable commit; paired graph trace must prove 64 eligible packed calls, explicit zero nodes, no scalar fallback/capture lifecycle regression, then run all c2/c16 **40 timing + 8 memory** axes |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
@@ -108,9 +108,10 @@ SHA-256 `7c323248…2456`.
 | All GPU kernels | 124.574592 | 128.153486 | −3.578894 |
 
 The fused-producer delta exceeds the normal-producer delta in every one of the
-12 reports, so the W3-H contract displaced normal W3-H2. W3-I0 now completes
-the required source/generated-code/SASS/test inventory and leaves W3-I1
-`READY`; it still contributes no benchmark ratio. The negative whole-window
+12 reports, so the W3-H contract displaced normal W3-H2. W3-I0 completed the
+required source/generated-code/SASS/test inventory and W3-I1 now has a
+preflight-green default-off implementation; it still contributes no benchmark
+ratio. The negative whole-window
 delta is consistent with c16 total throughput already passing; it does not
 explain or close the binding low-concurrency and host-memory failures.
 

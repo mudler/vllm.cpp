@@ -33,13 +33,18 @@ immutable `ae9e8ff` passes its clean sm_121a/operator/memcheck/model/paired-trac
 gates; its completed c2/c16 component reaches **1.017668×/1.006548×** mean
 total throughput but strict-fails at **35/40 timing + 5/8 memory**, so it earns
 no speed credit and authorizes neither the exact vLLM grid nor 35B performance;
-immutable `3f256ab` therefore remains binding at **55/124**; W3-H now accepts
-the complete trace-first normal BF16→FP4 vectorized-I/O spike. Existing clean
-decode slices are **0.627934 ms/forward locally versus 0.343538 ms/forward in
-vLLM**, a **0.284396-ms/forward** cross-profiler diagnostic delta only. A prior
-combined vector/hardware-conversion experiment was neutral. W3-H1 fresh exact-
-workload paired tracing is `PENDING`; no implementation, benchmark ratio,
-exact grid or 35B performance is accepted by this checkpoint).
+immutable `3f256ab` therefore remains binding at **55/124**; W3-H accepts the
+complete trace-first normal BF16→FP4 vectorized-I/O spike, but H1a and H1b are
+now both **VOID**. H1a loaded a writable native plan cache and differed from the
+accepted fixture at 37/64 tactics. H1b correctly froze all 64 FlashInfer plans
+and completed both profiler arms, yet its Nsight SQLite reports lost CUDA
+events and splits the primary graph's 1,107 nodes between 1,372 and 1,373
+replays. Retained per-node means diagnose normal production at **0.638331 vs
+0.342777 ms/decode forward**, not a binding ratio. The harness now adds the
+documented 10-second CUDA flush, a final drain, SQLite hashing and fail-closed
+diagnostic/replay validation. Immutable lossless H1c is `PENDING`; no
+implementation, benchmark ratio, exact grid or 35B performance is accepted by
+this checkpoint).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -622,20 +627,61 @@ Read-only reproduction:
 ssh dgx.casa 'ROOT=~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45; jq . "$ROOT/summary.json"; jq "{gate_pass,all_process_plan_maps_equal,all_process_metadata_equal,paired}" "$ROOT/selection-summary.json"; sha256sum "$ROOT/summary.json" "$ROOT/selection-summary.json" "$ROOT/driver.sh" "$ROOT/driver.log" "$ROOT/provenance.txt"'
 ```
 
-Next: preserve W3-G's correctness/structural implementation without speed
-credit and execute W3-H1 from the accepted
-[normal-producer spike](../.agents/specs/nvfp4-bf16-producer-vectorization.md).
-The exact next reproduction is `scripts/dgx-online-serving.sh --trace-only
---model 27` from a clean immutable pushed SHA, with the Qwen3.6-27B snapshot,
-that SHA's freshly hashed `evidence/corpus/27`, `evidence/manifest.json`, clean
-sm_121a build directory and `~/venvs/vllm-oracle/bin/vllm`, all under the
-script's one uninterrupted `/tmp/gpu` lock. The report must separate normal
-and fused producers, prefill/capture/decode windows, FP4 GEMMs, GDN, FA2 and
-the frozen plan map. This benchmark disposition is **PENDING**; no partial or
-cross-profiler number binds. Only a confirmed ranking permits W3-H2, and only
-a later 48/48 same-binary component permits the exact grid. Every 27B axis
-must pass before 35B performance; broader roadmap work, including DSpark,
-remains queued behind speed parity.
+W3-H1 has two completed but **VOID** paired traces from immutable `5d8af792`.
+H1a (`~/work/vllm.cpp-executed-path-refresh/5d8af792…/evidence/5d8af792…`)
+ran in read-write mode, loaded 64 native plans and saved 64; **37/64** selected
+tactics differ from the checked-in v0.25 fixture, including M=16,
+N=34,816/K=5,120 tactic 4 instead of accepted tactic 14. Its Nsight report SHA
+is `471e30d6…7fb`, and a later SQLite audit also finds the CUDA-event-loss
+warning. H1a's producer measurements are diagnostic only. A manual plan
+validation first omitted `PYTHONPATH` and failed before evidence validation;
+the corrected command passed. A separate dry-run pointed at a precreated
+evidence directory and correctly refused to mix artifacts before lock/GPU/model
+execution. Both setup invocations are **VOID / NOT A BENCHMARK**.
+
+H1b (`~/work/vllm.cpp-executed-path-refresh-frozen-h1b/5d8af792…/
+evidence/5d8af792…`) fixed the plan confound. Read-only mode loaded
+**64 FlashInfer / 0 native**, with zero tuned/rejected/saved/lazy entries; the
+64 selected lines reproduce `f2d9be7f…1fa4`, fixture SHA `e81e9181…7edd`, and
+the forbidden native target stayed absent. The model gate passed; each of the
+three local legs completed **48/48 requests, 49,152 input and 6,144 output
+tokens** in 67.3389/67.4408/67.4441 seconds; vLLM's Torch trace, all three
+cache drops and all 19 status artifacts completed and hashed. Status SHA is
+`69769fef…148c`, ours Nsight report `a76a6ed3…fd11`, vLLM Torch trace
+`3e4050f2…5361`, and kernel summary `d1ed35f5…a3c8`.
+
+H1b is nevertheless **VOID**. SQLite `b6dcd5d6…5165` contains severity-2
+`Not all CUDA events might have been collected.` The dominant 1,107-node CUDA
+graph has **930 nodes replayed 1,372 times and 177 replayed 1,373 times**:
+at least 930 of 1,536,087 expected graph-node events are absent (about 0.0605%).
+The old trace status did not hash/inspect SQLite, so its `passed:true` is only a
+historical harness false positive. Exact counts, duration sums and cross-engine
+rankings do not bind. A per-node diagnostic still places normal production at
+**0.638331 vs 0.342777 ms/decode forward** (gap 0.295554), fused production at
+about **0.543321 vs 0.257276 ms**, and the frozen FP4 GEMM set at about
+**54.676 vs 54.792 ms**. Thus no verified larger eligible residual displaces
+W3-H, but none of those cross-profiler values authorizes H2.
+
+The harness now runs the three local repetitions as **three independent Nsight
+captures under the same uninterrupted lock**, each with
+`--cuda-flush-interval=10000`, `--cpuctxsw=none`, an 11-second final drain and
+mandatory SQLite export/validation. It hashes all three reports, SQLite files,
+validation reports, commands, logs and kernel summaries, and rejects any
+non-whitelisted severity>=2 diagnostic or uneven dominant-graph replay count
+**before** spending time on the vLLM arm. Each capture must also reproduce the
+exact 1,107 primary nodes and the 208 FP4 GEMM, 144 normal producer, 64 fused
+producer, 48 GDN-recurrence and 16+16 FA2 node cardinalities. Focused contract
+tests cover clean, lost-event, uneven-replay, family-drift and missing
+indexed-artifact reports. This hardening has not run on GPU yet, so its
+disposition is **PENDING** rather than passed.
+
+Next: preserve W3-G without speed credit and rerun H1c from this change's clean
+immutable pushed SHA using `scripts/dgx-online-serving.sh --trace-only --model
+27`, the exact Qwen3.6-27B snapshot, freshly hashed corpus/manifest, clean
+sm_121a build and `~/venvs/vllm-oracle/bin/vllm` under one uninterrupted lock.
+H1c must be lossless, frozen-map exact and window-separable before W3-H2. Only
+a later 48/48 same-binary component permits the exact grid; every 27B axis must
+pass before 35B performance or broader roadmap work including DSpark.
 Detailed release classification:
 [2026-07-12-702f481.md](../.agents/sync/2026-07-12-702f481.md).
 
@@ -644,12 +690,12 @@ Detailed release classification:
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; W3-H TRACE PENDING** | Immutable `3f256ab` remains **55/124**. W3-C passes frozen-map control; W3-E, W3-F and W3-G strict-fail and earn no speed credit. W3-G's completed 12-leg/612-request component reaches **1.017668×/1.006548×** c2/c16 mean total throughput but only **35/40 timing + 5/8 memory** axes; model, lifecycle, cache-drop and frozen-plan integrity pass. W3-H is a spike-only checkpoint: no GPU command, new implementation, accepted ratio, exact grid or 35B performance ran. | Run W3-H1's immutable exact-workload ours/vLLM paired trace and re-rank the executed residuals. Only a later 48/48 component authorizes the exact vLLM grid; 35B performance remains held. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; W3-H1c PENDING** | Immutable `3f256ab` remains **55/124**. W3-C passes frozen-map control; W3-E, W3-F and W3-G strict-fail and earn no speed credit. W3-G's completed 12-leg/612-request component reaches **1.017668×/1.006548×** c2/c16 mean total throughput but only **35/40 timing + 5/8 memory** axes; model, lifecycle, cache-drop and frozen-plan integrity pass. W3-H1a/H1b both completed but are `VOID`: the first changed 37/64 tactics, while the frozen second lost at least 930 dominant-graph events. The three-capture lossless harness is CPU-tested but has not run on GPU. No new implementation, accepted ratio, exact grid or 35B performance exists. | Run immutable frozen-map H1c; require all three independently hashed Nsight SQLite validators to pass before residual ranking. Only a later 48/48 component authorizes the exact vLLM grid; 35B performance remains held. |
 | `ENG-BATCH-INVARIANT` | **ROADMAP INVENTORY — NOT IMPLEMENTED / NOT APPLICABLE TO PRODUCTION SPEED FLOOR** | vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` off; its opt-in determinism suite changes NVFP4, matmul, norm, attention and collective dispatch. C3R executes only the default-off contrast and records 0/6 sequential-vs-c2 equality for both engines. vllm.cpp exposes no matching opt-in mode, so no support or performance result is claimed. | After production parity, write `specs/batch-invariant-execution.md`, port the upstream operator/e2e determinism cases and gate correctness separately from the default production performance path. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **READY / GATING — W3-H TRACE-FIRST SPIKE ACCEPTED** | W3-C reproduction control is complete; W3-E and W3-F remain strict failures. W3-G also strict-fails. W3-H inventories the whole normal BF16/direct-swizzled producer chain, prior neutral `f787cf8` constraint, ported tests and fail-closed gates. Clean existing slices show **0.627934 vs 0.343538 ms/decode forward**, but profiler/window mismatch makes the **0.284396-ms** delta diagnostic only. No W3-H code or accepted performance result exists. | Run the fresh exact-workload paired trace first. Implement only byte-identical, process-cached 256-bit-load/64-bit-store I/O if both the trace and residual ranking confirm it; exact grid/35B performance remain held. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE / GATING — W3-H1c LOSSLESS TRACE PENDING** | W3-C reproduction control is complete; W3-E and W3-F remain strict failures. W3-G also strict-fails. W3-H inventories the whole normal BF16/direct-swizzled producer chain and prior neutral `f787cf8` constraint. H1a/H1b are `VOID` from tactic drift and event loss; retained **0.638331 vs 0.342777 ms/decode forward** normal-producer values are diagnostic only. The harness now isolates and validates all three captures. No W3-H runtime code or accepted performance result exists. | Run H1c first. Implement only byte-identical, process-cached 256-bit-load/64-bit-store I/O if all three captures are lossless and the residual ranking confirms it; exact grid/35B performance remain held. |
 | `KERNEL-ATTN-FA2` ratio-6 split-KV decode | **GATING — CORRECTNESS/STRUCTURE PASS; PERFORMANCE FAILED** | Immutable `ae9e8ff` passes **20/20 + 454,323** CUDA assertions, zero-error/zero-leak memcheck, both 27B arms and 35B correctness. Default/fallback traces switch exactly between **240 main+combine / 0 old** and **0 combine / 240 old**, while FP4 topology/plans are identical. The completed frozen c2/c16 component reaches **1.017668×/1.006548×** mean total throughput but strict-fails **35/40 timing + 5/8 memory**. All 12 legs, 612 requests, memory returns, cache drops and frozen plans pass; no exact grid follows. | Preserve the correctness-faithful route and fallback without speed credit; return to the executed-path scan. |
 | `KERNEL-EW-NORM-QUANT` | **PARTIAL — FALSE TRACE-NAME LEVER REFUTED** | vLLM's 127,040 long-named kernels stop after residual-add + RMSNorm to BF16; a separate `scaled_fp4_quant.out`/`cvt_fp16_to_fp4` follows, matching our two-kernel topology. `fuse_norm_quant` is false. Existing FP8 fusion remains gated and historical byte-exact/neutral `76e9047` stays shelved. | No spike/implementation is promoted from this trace. Revisit only if a future body/dispatch difference or surpass-track measurement justifies it independently. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `3f256ab` has c16 total throughput **1.027889×** but normalized mean TPOT/ITL **0.987450×**. Cross-profiler GDN totals remain diagnostic only; no new GDN lever is selected yet. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; revisit only after body-level residual ranking. Do not infer any 35B result. |

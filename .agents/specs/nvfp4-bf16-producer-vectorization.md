@@ -1,7 +1,7 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **READY — spike accepted; fresh exact-workload trace, implementation
-and every performance gate are pending**
+Status: **ACTIVE — H1a/H1b are VOID; hardened lossless frozen-map H1c is
+pending and implementation remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -14,6 +14,13 @@ authorize an exact grid or authorize any 35B performance command. W3-H is only
 the **normal** BF16 activation-to-NVFP4 producer used by the 27B direct-swizzled
 CUTLASS W4A4 path. The separate fused SiLU producer, FP4 GEMMs, GDN, attention,
 scheduler and host-weight lifetime are excluded.
+
+H1 has now completed two paired attempts from immutable `5d8af792`, but neither
+is binding. H1a used a writable native tactic cache and changed 37/64 selected
+plans. H1b restored the exact read-only 64-plan fixture and completed every
+workload/lifecycle arm, but Nsight reported dropped CUDA events and the dominant
+graph had uneven node replay counts. The harness is now hardened for H1c; no
+runtime implementation or speed credit follows from either void trace.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -59,6 +66,53 @@ modes are unnecessary. Feature-parity policy still requires them to be
 inventoried and spiked separately.
 
 ## Why W3-H is selected
+
+### H1 attempts and lossless-trace contract
+
+H1a at
+`~/work/vllm.cpp-executed-path-refresh/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b/evidence/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b`
+is **VOID**. It ran the tactic cache read-write, loaded/saved 64 native plans and
+selected 37/64 tactics differently from the accepted v0.25 fixture, including
+M=16/N=34,816/K=5,120 tactic 4 instead of tactic 14. Its Nsight report SHA is
+`471e30d620236789cfafa6d5ca52a98272e0e93161c3aafe29262ec4f7deb7fb`;
+a later SQLite audit also finds the CUDA-event-loss warning. The corrected
+manual plan validator passes; an earlier invocation without the required
+`PYTHONPATH` and a separate fail-closed precreated-evidence dry-run are setup
+diagnostics, not benchmarks.
+
+H1b at
+`~/work/vllm.cpp-executed-path-refresh-frozen-h1b/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b/evidence/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b`
+is also **VOID**. It loaded 64 FlashInfer and zero native plans in read-only
+mode, tuned/rejected/saved zero, reproduced selected-plan SHA
+`f2d9be7fc4a89de1cfa994ab9be08a423e0c4f6981fe46cb808cef485f4c1fa4`,
+and left the forbidden native-cache target absent. The model gate, three local
+48/48-request legs, vLLM Torch trace and all cache drops completed. Ours Nsight
+report/SQLite SHA are `a76a6ed30239eab52587700f73267ab9be70788ae2f012761c5637228c7bfd11`
+and `b6dcd5d69900010d953d817db612083ffc92d94b17177b9348f8d99fc0485165`.
+The SQLite contains severity-2 `Not all CUDA events might have been collected.`
+Its dominant 1,107-node graph has 930 nodes replayed 1,372 times and 177 nodes
+replayed 1,373 times, proving at least 930 missing graph-node events. The old
+status `passed:true` did not inspect SQLite and is a historical harness false
+positive.
+
+Retained H1b events diagnose normal production at 0.638331 versus 0.342777
+ms/decode forward, fused production at about 0.543321 versus 0.257276 ms, and
+the frozen FP4 GEMM set at about 54.676 versus 54.792 ms. These cross-profiler
+values cannot bind or authorize H2; they only leave W3-H as the leading
+eligible candidate because no verified larger residual displaced it.
+
+H1c replaces the single long local profile with three independent Nsight
+reports, one 48-request repetition each, while retaining one uninterrupted GPU
+lock for the series. Each capture uses node-level CUDA-graph tracing, a
+10,000-ms CUDA flush interval, no CPU context-switch sampling and an 11-second
+final idle drain. Before the next capture or vLLM arm, the harness exports and
+hashes SQLite, rejects every non-whitelisted severity>=2 diagnostic, requires
+graph-node rows and requires uniform replay counts across the dominant graph.
+All three reports, SQLite files, validation reports, commands, logs and kernel
+summaries are separately hashed. Every capture must contain exactly 1,107
+dominant-graph nodes, including 208 FP4 GEMMs, 144 normal producers, 64 fused
+producers, 48 GDN recurrence nodes and 16 FA2 main plus 16 combine nodes. H1c
+remains **PENDING** until that contract runs from a clean pushed immutable SHA.
 
 ### Executed topology and clean diagnostic slice
 
@@ -246,16 +300,27 @@ bytes and every padded scale byte must match exactly.
 Before implementation, run current pushed source and the validated vLLM
 v0.25.0 oracle under one `/tmp/gpu` lock using the exact 27B cache-off c16,
 input-1,024/output-128, 48-prompt x three-repetition contract in
-`scripts/dgx-online-serving.sh --trace-only`. Ours uses Nsight Systems with
-`--cuda-graph-trace=node`; vLLM uses the mandated Torch profiler because nsys
-breaks its EngineCore on this host. Geometry/window slicing must exclude
-prefill, eager and graph-capture contamination.
+`scripts/dgx-online-serving.sh --trace-only`. Ours uses **three independent**
+Nsight Systems captures, one repetition each, with
+`--cuda-graph-trace=node --cuda-flush-interval=10000 --sample=none
+--cpuctxsw=none`; each target idles for one final 11-second flush interval.
+Export and validate every SQLite before starting the next capture and before
+the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
+rows, uneven dominant-graph replay count, missing indexed artifact or hash
+drift voids the attempt. The exact 27B c16 graph contract is 1,107 primary
+nodes with 208 FP4 GEMM, 144 normal-producer, 64 fused-producer, 48 recurrence
+and 16+16 FA2 nodes; any family drift also voids the attempt. vLLM uses the
+mandated Torch profiler because nsys breaks its EngineCore on this host.
+Geometry/window slicing must exclude prefill, eager and graph-capture
+contamination.
 
 The report must inventory current normal/fused producers, FP4 GEMMs, GDN
 post-convolution/recurrence, FA2, graph-node counts, the frozen 64-plan map,
-output digests, cache eviction and lifecycle. If a larger verified current
-residual displaces normal production, leave W3-H READY and spike that row
-instead. Cross-profiler time is diagnostic only.
+output digests, cache eviction and lifecycle. The plan cache must be read-only,
+load all 64 accepted FlashInfer plans, load/save/tune/reject zero native plans
+and reproduce selected-plan SHA `f2d9be7f…1fa4`. If a larger verified current
+residual displaces normal production, leave W3-H ACTIVE without implementation
+and spike that row instead. Cross-profiler time is diagnostic only.
 
 ### G1 — build, operator bytes and capture
 
@@ -348,7 +413,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **pending; first execution gate** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b complete but VOID; lossless three-capture H1c pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

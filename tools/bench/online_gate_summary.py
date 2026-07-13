@@ -30,6 +30,7 @@ from tools.bench.online_gate import (
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
+    NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
     OUTPUT_LEN,
     PANDAS_VERSION,
@@ -40,6 +41,7 @@ from tools.bench.online_gate import (
     TRACE_REPETITIONS,
     VLLM_ORACLE_VERSION,
     precise_max_concurrent_requests,
+    validate_nsys_trace,
     validate_raw_result,
 )
 from tools.bench.serve_low_common import (
@@ -459,6 +461,17 @@ def _model_precondition_reasons(
             NSYS_CUDA_GRAPH_TRACE,
         ):
             reasons.append("paired trace CUDA-graph granularity differs")
+        nsys_captures = (
+            trace_contract.get("nsys_captures")
+            if isinstance(trace_contract, dict)
+            else None
+        )
+        if nsys_captures is not None and nsys_captures != TRACE_REPETITIONS:
+            reasons.append("paired trace independent Nsight capture count differs")
+        if nsys_captures == TRACE_REPETITIONS and trace_contract.get(
+            "cuda_flush_interval_ms"
+        ) != NSYS_CUDA_FLUSH_INTERVAL_MS:
+            reasons.append("paired trace CUDA flush interval differs")
         artifacts = status.get("artifacts")
         if not isinstance(artifacts, dict):
             reasons.append("paired trace artifact map is absent")
@@ -500,6 +513,67 @@ def _model_precondition_reasons(
                         _verify_hashed_artifact(artifact, evidence_root, field)
                 except HarnessError as error:
                     reasons.append(str(error))
+            if nsys_captures == TRACE_REPETITIONS:
+                for field in (
+                    "ours_nsys_sqlite",
+                    "ours_nsys_validation",
+                    "ours_command_2",
+                    "ours_command_3",
+                    "ours_profile_log_2",
+                    "ours_profile_log_3",
+                    "ours_nsys_report_2",
+                    "ours_nsys_report_3",
+                    "ours_nsys_sqlite_2",
+                    "ours_nsys_sqlite_3",
+                    "ours_nsys_validation_2",
+                    "ours_nsys_validation_3",
+                    "ours_kernel_summary_2",
+                    "ours_kernel_summary_3",
+                ):
+                    artifact = artifacts.get(field)
+                    if not isinstance(artifact, dict):
+                        reasons.append(f"paired trace artifact {field} is absent")
+                        continue
+                    try:
+                        _verify_hashed_artifact(artifact, evidence_root, field)
+                    except HarnessError as error:
+                        reasons.append(str(error))
+                validations = status.get("nsys_validations")
+                if (
+                    not isinstance(validations, list)
+                    or len(validations) != TRACE_REPETITIONS
+                ):
+                    reasons.append("paired trace lossless Nsight validations differ")
+                else:
+                    for index, validation in enumerate(validations, start=1):
+                        suffix = "" if index == 1 else f"_{index}"
+                        try:
+                            sqlite_artifact = artifacts[f"ours_nsys_sqlite{suffix}"]
+                            validation_artifact = artifacts[
+                                f"ours_nsys_validation{suffix}"
+                            ]
+                            sqlite_path = _artifact_path(
+                                sqlite_artifact.get("path"),
+                                evidence_root,
+                                f"ours_nsys_sqlite{suffix}",
+                            )
+                            validation_path = _artifact_path(
+                                validation_artifact.get("path"),
+                                evidence_root,
+                                f"ours_nsys_validation{suffix}",
+                            )
+                            actual = validate_nsys_trace(
+                                sqlite_path, model_key=model
+                            )
+                            if validation != actual or _load_json(
+                                validation_path
+                            ) != actual:
+                                raise HarnessError(
+                                    "paired trace Nsight validation differs from "
+                                    f"capture {index}"
+                                )
+                        except (HarnessError, KeyError, TypeError) as error:
+                            reasons.append(str(error))
     except HarnessError as error:
         reasons.append(str(error))
     return reasons

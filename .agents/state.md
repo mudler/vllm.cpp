@@ -6624,3 +6624,58 @@ DGX source/build/evidence root, then run
 cache-off input-1,024/output-128 corpus under one uninterrupted `/tmp/gpu`
 lock. The fresh report must re-rank normal/fused producers, FP4 GEMMs, GDN,
 FA2 and all lifecycle/plan invariants before H2 may begin.
+
+## 2026-07-13 — W3-H1a/H1b are VOID; lossless three-capture H1c is pending
+
+Two immutable `5d8af792a0010434fa9681a9cf46b6a5cdbfc77b` paired trace attempts
+completed, but neither changes the binding performance result. H1a used a
+writable plan cache, loaded/saved 64 native tactics and selected 37/64 plans
+differently from the accepted v0.25 fixture, including tactic 4 instead of 14
+for M=16/N=34,816/K=5,120. It is **VOID**. Its Nsight report SHA is
+`471e30d6...7fb`; later SQLite inspection also finds the CUDA-event-loss
+warning. One manual plan-validation command without repository `PYTHONPATH`
+and one fail-closed precreated-evidence dry-run are setup diagnostics only.
+
+H1b restored the exact read-only fixture: 64 FlashInfer plans, zero native,
+zero tuned/rejected/saved, selected-plan SHA `f2d9be7f...1fa4`, and no native
+cache file. The model gate passed. Each local leg completed **48/48 requests,
+49,152 input tokens and 6,144 output tokens** in
+67.3389/67.4408/67.4441 seconds; the vLLM Torch trace and all cache drops also
+completed. Report/SQLite/status SHA are `a76a6ed3...fd11`,
+`b6dcd5d6...5165` and `69769fef...148c`.
+
+H1b is nevertheless **VOID**. Its SQLite contains severity-2
+`Not all CUDA events might have been collected.` The dominant 1,107-node graph
+has 930 nodes at 1,372 replays and 177 at 1,373, proving at least 930 missing
+node events. The historical status `passed:true` did not inspect SQLite. No
+kernel duration/count or cross-engine ranking binds. Retained samples diagnose
+normal production at **0.638331 versus 0.342777 ms/decode forward**, fused
+production near **0.543321 versus 0.257276 ms**, and frozen FP4 GEMMs at
+**54.676 versus 54.792 ms**; these values only leave W3-H as the leading
+eligible candidate and do not authorize H2.
+
+The H1c harness is now fail-closed around collection loss. It runs the three
+local repetitions as three independent Nsight reports under one uninterrupted
+GPU lock; each uses node-level graph tracing, 10,000-ms CUDA flushes, no CPU
+context-switch tracing and an 11-second final drain. Each SQLite export is
+hashed and checked for required tables, non-whitelisted severity>=2 diagnostics,
+graph-node presence and uniform dominant-graph replay before the next capture
+or vLLM arm. The status/summary requires every indexed report, SQLite,
+validation, command, log and kernel summary. It also fail-closes the exact 27B
+graph inventory at **1,107 primary nodes** with **208 FP4 GEMM, 144 normal
+producer, 64 fused producer, 48 recurrence and 16+16 FA2 nodes**. A read-only
+query of H1b returns `1107|144|64|208|48|16|16`, confirming those family
+cardinalities while its uneven replay/loss still voids duration and count
+totals. Focused Python/shell validation is green at **21/21 tests**; GPU
+execution has not run, so H1c is **PENDING**.
+
+The accepted 27B vLLM v0.25.0 result is unchanged: immutable `3f256ab` passes
+**55/124 axes** and fails 69. Total-throughput ratios c1/c2/c4/c8/c16/c32 are
+**0.993504/0.954464/0.966438/0.980678/1.027889/1.039417×**. High-concurrency
+aggregate throughput wins do not close low/mid-concurrency timing or the host
+PSS/RSS gaps. Exact grid and all 35B performance remain prohibited.
+
+Next: commit/push this checkpoint, create a clean immutable H1c source/build/
+evidence root, run the exact frozen-map three-capture trace under one lock, and
+accept a residual ranking only if all three SQLite validators pass. Only then
+may W3-H2 or a newly displaced higher-ranked spike begin.

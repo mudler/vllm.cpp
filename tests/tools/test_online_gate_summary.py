@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -21,12 +22,15 @@ from tools.bench.online_gate import (
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
+    NSYS_CUDA_FLUSH_INTERVAL_MS,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
+    TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
     VLLM_ORACLE_VERSION,
+    validate_nsys_trace,
 )
 from tools.bench.online_gate_summary import summarize_evidence
 from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
@@ -92,6 +96,51 @@ def _write_cache_drop(path: pathlib.Path, roots: list[str]) -> dict:
         "roots": report["roots"],
         "sha256": sha256_file(path),
     }
+
+
+def _write_model_nsys_sqlite(path: pathlib.Path) -> None:
+    contract = TRACE_PRIMARY_GRAPH_CONTRACTS["27"]
+    node_names = []
+    for pattern, count in contract["families"].values():
+        node_names.extend([pattern] * count)
+    node_names.extend(
+        ["unclassified-kernel"] * (contract["node_count"] - len(node_names))
+    )
+    string_ids = {
+        name: index for index, name in enumerate(sorted(set(node_names)), start=1)
+    }
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE DIAGNOSTIC_EVENT "
+            "(timestamp INTEGER, severity INTEGER, text TEXT)"
+        )
+        connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+            "(graphNodeId INTEGER, demangledName INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
+            (
+                1,
+                3,
+                "CUDA device 0: Unified Memory trace is not supported by the "
+                "current driver version or configuration.",
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [(identifier, name) for name, identifier in string_ids.items()],
+        )
+        for node_id, name in enumerate(node_names, start=1):
+            connection.executemany(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?)",
+                [(node_id, string_ids[name])] * 3,
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _write_fixture(root: pathlib.Path) -> None:
@@ -532,6 +581,62 @@ class OnlineGateSummaryTests(unittest.TestCase):
             (root / "trace" / "27" / "ours_kernel_summary.txt").write_text(
                 "tampered\n", encoding="utf-8"
             )
+            runs, _ = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+
+    def test_three_capture_trace_requires_every_hashed_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            status_path = root / "trace" / "27" / "status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            trace_root = status_path.parent
+            for field in (
+                "ours_command_2",
+                "ours_command_3",
+                "ours_profile_log_2",
+                "ours_profile_log_3",
+                "ours_nsys_report_2",
+                "ours_nsys_report_3",
+                "ours_kernel_summary_2",
+                "ours_kernel_summary_3",
+            ):
+                path = trace_root / f"{field}.txt"
+                path.write_text(f"{field}\n", encoding="utf-8")
+                status["artifacts"][field] = {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                }
+            validations = []
+            for index in range(1, TRACE_REPETITIONS + 1):
+                suffix = "" if index == 1 else f"_{index}"
+                sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
+                _write_model_nsys_sqlite(sqlite_path)
+                validation = validate_nsys_trace(sqlite_path, model_key="27")
+                validation_path = (
+                    trace_root / f"ours_nsys_validation{suffix}.json"
+                )
+                validation_path.write_text(json.dumps(validation), encoding="utf-8")
+                status["artifacts"][f"ours_nsys_sqlite{suffix}"] = {
+                    "path": str(sqlite_path),
+                    "sha256": sha256_file(sqlite_path),
+                }
+                status["artifacts"][f"ours_nsys_validation{suffix}"] = {
+                    "path": str(validation_path),
+                    "sha256": sha256_file(validation_path),
+                }
+                validations.append(validation)
+            status["trace_contract"]["nsys_captures"] = TRACE_REPETITIONS
+            status["trace_contract"][
+                "cuda_flush_interval_ms"
+            ] = NSYS_CUDA_FLUSH_INTERVAL_MS
+            status["nsys_validations"] = validations
+            status_path.write_text(json.dumps(status), encoding="utf-8")
+            runs, _ = self._summarize(root)
+            self.assertTrue(runs["gate_pass"])
+
+            status["artifacts"].pop("ours_nsys_sqlite_2")
+            status_path.write_text(json.dumps(status), encoding="utf-8")
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
 

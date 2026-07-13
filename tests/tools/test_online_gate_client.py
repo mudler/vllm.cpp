@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,10 +24,12 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
+    TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
     VLLM_ORACLE_VERSION,
@@ -39,6 +42,7 @@ from tools.bench.online_gate import (
     record_model_gate,
     record_oracle_manifest,
     record_trace_status,
+    validate_nsys_trace,
     validate_plan,
     validate_raw_result,
 )
@@ -73,6 +77,73 @@ def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
         for stat in ("mean", "median", "p90", "p99"):
             record[f"{stat}_{metric}_ms"] = 10.0
     return record
+
+
+def write_nsys_sqlite(
+    path: pathlib.Path,
+    *,
+    family_drift: bool = False,
+    lost_events: bool = False,
+    model_contract: bool = False,
+    uneven_replays: bool = False,
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE DIAGNOSTIC_EVENT "
+            "(timestamp INTEGER, severity INTEGER, text TEXT)"
+        )
+        connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
+            "(graphNodeId INTEGER, demangledName INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
+            (
+                1,
+                3,
+                "CUDA device 0: Unified Memory trace is not supported by the "
+                "current driver version or configuration.",
+            ),
+        )
+        if lost_events:
+            connection.execute(
+                "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
+                (2, 2, "Not all CUDA events might have been collected."),
+            )
+        if model_contract:
+            contract = TRACE_PRIMARY_GRAPH_CONTRACTS["27"]
+            node_names = []
+            for family, (pattern, count) in contract["families"].items():
+                if family_drift and family == "normal_fp4_producer":
+                    count -= 1
+                node_names.extend([pattern] * count)
+            node_names.extend(
+                ["unclassified-kernel"]
+                * (contract["node_count"] - len(node_names))
+            )
+            replay_counts = [3] * len(node_names)
+        else:
+            node_names = ["kernel-a", "kernel-b"]
+            replay_counts = [3, 2 if uneven_replays else 3]
+        string_ids = {
+            name: index for index, name in enumerate(sorted(set(node_names)), start=1)
+        }
+        connection.executemany(
+            "INSERT INTO StringIds VALUES (?, ?)",
+            [(identifier, name) for name, identifier in string_ids.items()],
+        )
+        for graph_node_id, (name, replay_count) in enumerate(
+            zip(node_names, replay_counts, strict=True), start=1
+        ):
+            connection.executemany(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?)",
+                [(graph_node_id, string_ids[name])] * replay_count,
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def write_cache_drop_report(path: pathlib.Path) -> None:
@@ -280,7 +351,48 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("summary-27/ratios.json", script)
         self.assertIn("summary-35/ratios.json", script)
         self.assertIn("--cuda-graph-trace=node", script)
+        self.assertIn(
+            f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}", script
+        )
+        self.assertIn("--cpuctxsw=none", script)
+        self.assertIn("validate-nsys-trace", script)
+        self.assertIn('--model-key "${model}"', script)
         self.assertIn("--trace-only", script)
+
+    def test_nsys_trace_validation_rejects_loss_and_uneven_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            clean = root / "clean.sqlite"
+            write_nsys_sqlite(clean)
+            result = validate_nsys_trace(clean)
+            self.assertTrue(result["lossless"])
+            self.assertEqual(result["primary_graph_node_count"], 2)
+            self.assertEqual(result["primary_graph_replay_count"], 3)
+
+            lost = root / "lost.sqlite"
+            write_nsys_sqlite(lost, lost_events=True)
+            with self.assertRaisesRegex(HarnessError, "not lossless"):
+                validate_nsys_trace(lost)
+
+            uneven = root / "uneven.sqlite"
+            write_nsys_sqlite(uneven, uneven_replays=True)
+            with self.assertRaisesRegex(HarnessError, "uneven replay counts"):
+                validate_nsys_trace(uneven)
+
+            model_contract = root / "model-contract.sqlite"
+            write_nsys_sqlite(model_contract, model_contract=True)
+            result = validate_nsys_trace(model_contract, model_key="27")
+            self.assertEqual(result["primary_graph_node_count"], 1_107)
+            self.assertEqual(
+                result["primary_graph_family_node_counts"]["fp4_gemm"], 208
+            )
+
+            family_drift = root / "family-drift.sqlite"
+            write_nsys_sqlite(
+                family_drift, family_drift=True, model_contract=True
+            )
+            with self.assertRaisesRegex(HarnessError, "normal_fp4_producer"):
+                validate_nsys_trace(family_drift, model_key="27")
 
     def test_memory_return_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -564,11 +676,37 @@ class OnlineClientContractTests(unittest.TestCase):
             )
             self.assertTrue(gate["passed"])
 
-            trace_paths = []
-            for index in range(4):
-                path = root / f"trace-{index}"
-                path.write_text("trace\n", encoding="utf-8")
-                trace_paths.append(path)
+            ours_nsys_reports = []
+            ours_nsys_sqlites = []
+            ours_nsys_validations = []
+            ours_kernel_summaries = []
+            ours_commands = []
+            ours_profile_logs = []
+            for index in range(TRACE_REPETITIONS):
+                report = root / f"ours-{index}.nsys-rep"
+                report.write_text("trace\n", encoding="utf-8")
+                sqlite_path = root / f"ours-{index}.sqlite"
+                validation = root / f"ours-{index}-validation.json"
+                write_nsys_sqlite(sqlite_path, model_contract=True)
+                validation.write_text(
+                    json.dumps(validate_nsys_trace(sqlite_path, model_key="27")),
+                    encoding="utf-8",
+                )
+                summary = root / f"ours-{index}-summary.txt"
+                summary.write_text("summary\n", encoding="utf-8")
+                command = root / f"ours-{index}-command.txt"
+                profile_log = root / f"ours-{index}-profile.log"
+                profile_log.write_text("profile\n", encoding="utf-8")
+                ours_nsys_reports.append(report)
+                ours_nsys_sqlites.append(sqlite_path)
+                ours_nsys_validations.append(validation)
+                ours_kernel_summaries.append(summary)
+                ours_commands.append(command)
+                ours_profile_logs.append(profile_log)
+            vllm_torch_trace = root / "vllm-trace.json.gz"
+            vllm_kernel_summary = root / "vllm-kernels.json"
+            vllm_torch_trace.write_text("trace\n", encoding="utf-8")
+            vllm_kernel_summary.write_text("summary\n", encoding="utf-8")
             ours_client_results = []
             ours_client_logs = []
             for index in range(TRACE_REPETITIONS):
@@ -586,23 +724,10 @@ class OnlineClientContractTests(unittest.TestCase):
                 log_path.write_text("client passed\n", encoding="utf-8")
                 ours_client_results.append(result_path)
                 ours_client_logs.append(log_path)
-            ours_command = root / "ours-command.txt"
-            ours_profile_log = root / "ours-profile.log"
             vllm_command = root / "vllm-command.txt"
             vllm_profile_log = root / "vllm-profile.log"
             vllm_corpus = root / "vllm-corpus.jsonl"
-            ours_command.write_text(
-                "nsys --cuda-graph-trace=node server --max-num-seqs 32 "
-                "--max-num-batched-tokens 2048 "
-                "--no-enable-prefix-caching\n",
-                encoding="utf-8",
-            )
-            for path in (
-                ours_profile_log,
-                vllm_command,
-                vllm_profile_log,
-                vllm_corpus,
-            ):
+            for path in (vllm_command, vllm_profile_log, vllm_corpus):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
             vllm_metadata = root / "vllm-metadata.json"
             vllm_metadata.write_text(
@@ -638,18 +763,25 @@ class OnlineClientContractTests(unittest.TestCase):
                 path = root / f"cache-drop-{index}.json"
                 write_cache_drop_report(path)
                 cache_drop_reports.append(path)
+
+            def write_ours_commands(value: str) -> None:
+                for path in ours_commands:
+                    path.write_text(value, encoding="utf-8")
+
             def record_trace():
                 return record_trace_status(
                     root / "trace.json",
                     model_key="27",
-                    ours_nsys_report=trace_paths[0],
-                    ours_kernel_summary=trace_paths[1],
-                    ours_command=ours_command,
-                    ours_profile_log=ours_profile_log,
+                    ours_nsys_reports=ours_nsys_reports,
+                    ours_nsys_sqlites=ours_nsys_sqlites,
+                    ours_nsys_validations=ours_nsys_validations,
+                    ours_kernel_summaries=ours_kernel_summaries,
+                    ours_commands=ours_commands,
+                    ours_profile_logs=ours_profile_logs,
                     ours_client_results=ours_client_results,
                     ours_client_logs=ours_client_logs,
-                    vllm_torch_trace=trace_paths[2],
-                    vllm_kernel_summary=trace_paths[3],
+                    vllm_torch_trace=vllm_torch_trace,
+                    vllm_kernel_summary=vllm_kernel_summary,
                     vllm_command=vllm_command,
                     vllm_profile_log=vllm_profile_log,
                     vllm_metadata=vllm_metadata,
@@ -658,20 +790,32 @@ class OnlineClientContractTests(unittest.TestCase):
                     vllm_cpp_sha="d" * 40,
                 )
 
-            ours_command.write_text("nsys server\n", encoding="utf-8")
+            write_ours_commands("nsys server\n")
             with self.assertRaisesRegex(HarnessError, "disable prefix caching"):
                 record_trace()
-            ours_command.write_text(
+            write_ours_commands(
                 "nsys server --max-num-seqs 32 --max-num-batched-tokens 2048 "
-                "--no-enable-prefix-caching\n",
-                encoding="utf-8",
+                "--no-enable-prefix-caching\n"
             )
             with self.assertRaisesRegex(HarnessError, "node-level CUDA graph"):
                 record_trace()
-            ours_command.write_text(
+            write_ours_commands(
                 "nsys --cuda-graph-trace=node server --max-num-seqs 32 "
-                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n",
-                encoding="utf-8",
+                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n"
+            )
+            with self.assertRaisesRegex(HarnessError, "periodically flush"):
+                record_trace()
+            write_ours_commands(
+                "nsys --cuda-graph-trace=node --cuda-flush-interval=10000 "
+                "server --max-num-seqs 32 --max-num-batched-tokens 2048 "
+                "--no-enable-prefix-caching\n"
+            )
+            with self.assertRaisesRegex(HarnessError, "context-switch"):
+                record_trace()
+            write_ours_commands(
+                "nsys --cuda-graph-trace=node --cuda-flush-interval=10000 "
+                "--cpuctxsw=none server --max-num-seqs 32 "
+                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n"
             )
             slow = valid_record(
                 requests=TRACE_PROMPTS,
@@ -697,6 +841,14 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertEqual(
                 trace["trace_contract"]["cuda_graph_trace"],
                 NSYS_CUDA_GRAPH_TRACE,
+            )
+            self.assertEqual(trace["trace_contract"]["nsys_captures"], 3)
+            self.assertEqual(len(trace["nsys_validations"]), 3)
+            self.assertEqual(
+                trace["nsys_validations"][0]["primary_graph_family_node_counts"][
+                    "normal_fp4_producer"
+                ],
+                144,
             )
             self.assertFalse(trace["output_repeatability"]["vllm"]["all_equal"])
 

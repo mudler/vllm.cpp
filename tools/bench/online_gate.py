@@ -27,6 +27,7 @@ import pathlib
 import platform
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -51,6 +52,23 @@ TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
 NSYS_CUDA_GRAPH_TRACE = "node"
+NSYS_CUDA_FLUSH_INTERVAL_MS = 10_000
+TRACE_PRIMARY_GRAPH_CONTRACTS = {
+    "27": {
+        "node_count": 1_107,
+        "families": {
+            "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
+            "fa2_main": ("flash_fwd_splitkv_kernel", 16),
+            "fp4_gemm": (
+                "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal",
+                208,
+            ),
+            "fused_fp4_producer": ("SiluAndMulFp4QuantKernel", 64),
+            "gdn_recurrence": ("GdnDecodeFusedKernel", 48),
+            "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
+        },
+    }
+}
 REPETITIONS = (1, 2, 3)
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
 MODEL_REVISIONS = {
@@ -70,6 +88,10 @@ PERCENTILES = (50, 90, 99)
 CACHE_DROP_METHOD = "posix_fadvise-dontneed+mincore"
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
+_NSYS_ALLOWED_DIAGNOSTIC = re.compile(
+    r"CUDA device \d+: Unified Memory trace is not supported by the current "
+    r"driver version or configuration\."
+)
 
 
 def prompts_for(concurrency: int) -> int:
@@ -587,8 +609,10 @@ def build_plan(
             "thermal/<model>/<engine>/r<rep>-{before,after}.txt",
             "cache-drop/<model>/<engine>/r<rep>-{before,after}.json",
             "memory-return/<model>/<engine>/r<rep>.json",
-            "trace/<model>/ours.nsys-rep",
-            "trace/<model>/ours-cuda_gpu_kern_sum.txt",
+            "trace/<model>/ours-r{1,2,3}.nsys-rep",
+            "trace/<model>/ours-r{1,2,3}.sqlite",
+            "trace/<model>/ours-r{1,2,3}-cuda_gpu_kern_sum.txt",
+            "trace/<model>/ours-r{1,2,3}-nsys-validation.json",
             "trace/<model>/vllm-profile/*.pt.trace.json.gz",
             "trace/<model>/vllm-kernels.json",
             "trace/<model>/cache-{before-ours,between-engines,after-vllm}.json",
@@ -728,14 +752,136 @@ def record_model_gate(
     return result
 
 
+def validate_nsys_trace(
+    sqlite_path: pathlib.Path, *, model_key: str | None = None
+) -> dict[str, Any]:
+    """Reject incomplete node-level CUDA traces before using their attribution.
+
+    Nsight can still exit successfully after dropping CUDA activity.  Its SQLite
+    diagnostics and the replay multiplicity of nodes in the dominant graph are
+    the authoritative completeness checks.
+    """
+
+    if not sqlite_path.is_file() or sqlite_path.stat().st_size == 0:
+        raise HarnessError(f"Nsight SQLite artifact is absent or empty: {sqlite_path}")
+    connection = sqlite3.connect(str(sqlite_path))
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        required_tables = {"CUPTI_ACTIVITY_KIND_KERNEL", "DIAGNOSTIC_EVENT"}
+        if model_key is not None:
+            required_tables.add("StringIds")
+        missing_tables = sorted(required_tables - tables)
+        if missing_tables:
+            raise HarnessError(
+                "Nsight SQLite omits required tables: " + ", ".join(missing_tables)
+            )
+
+        diagnostics = [
+            {"severity": int(severity), "text": str(text)}
+            for severity, text in connection.execute(
+                "SELECT severity, text FROM DIAGNOSTIC_EVENT "
+                "WHERE severity >= 2 ORDER BY timestamp"
+            )
+        ]
+        rejected_diagnostics = [
+            diagnostic
+            for diagnostic in diagnostics
+            if _NSYS_ALLOWED_DIAGNOSTIC.fullmatch(diagnostic["text"]) is None
+        ]
+        if rejected_diagnostics:
+            first = rejected_diagnostics[0]
+            raise HarnessError(
+                "Nsight CUDA collection is not lossless: "
+                f"severity={first['severity']} text={first['text']}"
+            )
+
+        node_replays = [
+            (int(graph_node_id), int(replays))
+            for graph_node_id, replays in connection.execute(
+                "SELECT graphNodeId, COUNT(*) "
+                "FROM CUPTI_ACTIVITY_KIND_KERNEL "
+                "WHERE graphNodeId IS NOT NULL "
+                "GROUP BY graphNodeId"
+            )
+        ]
+        if not node_replays:
+            raise HarnessError("Nsight SQLite has no CUDA graph-node kernel rows")
+        max_replays = max(replays for _, replays in node_replays)
+        primary_floor = max(1, (max_replays * 9) // 10)
+        primary_replays = [
+            replays for _, replays in node_replays if replays >= primary_floor
+        ]
+        primary_replay_counts = sorted(set(primary_replays))
+        if len(primary_replay_counts) != 1:
+            raise HarnessError(
+                "Nsight primary graph has uneven replay counts: "
+                + ", ".join(str(value) for value in primary_replay_counts)
+            )
+
+        primary_family_counts: dict[str, int] = {}
+        contract = TRACE_PRIMARY_GRAPH_CONTRACTS.get(model_key) if model_key else None
+        if contract is not None:
+            expected_node_count = int(contract["node_count"])
+            if len(primary_replays) != expected_node_count:
+                raise HarnessError(
+                    "Nsight primary graph node count differs from the model contract: "
+                    f"got {len(primary_replays)}, expected {expected_node_count}"
+                )
+            primary_node_names = [
+                str(name)
+                for (name,) in connection.execute(
+                    "SELECT strings.value "
+                    "FROM ("
+                    "  SELECT graphNodeId, MIN(demangledName) AS demangledName, "
+                    "         COUNT(*) AS replays "
+                    "  FROM CUPTI_ACTIVITY_KIND_KERNEL "
+                    "  WHERE graphNodeId IS NOT NULL "
+                    "  GROUP BY graphNodeId"
+                    ") AS nodes "
+                    "JOIN StringIds AS strings ON strings.id = nodes.demangledName "
+                    "WHERE nodes.replays >= ?",
+                    (primary_floor,),
+                )
+            ]
+            for family, (pattern, expected_count) in contract["families"].items():
+                actual_count = sum(pattern in name for name in primary_node_names)
+                primary_family_counts[family] = actual_count
+                if actual_count != expected_count:
+                    raise HarnessError(
+                        f"Nsight primary graph {family} node count differs: "
+                        f"got {actual_count}, expected {expected_count}"
+                    )
+    finally:
+        connection.close()
+
+    return {
+        "allowed_diagnostics": diagnostics,
+        "graph_node_count": len(node_replays),
+        "lossless": True,
+        "primary_graph_node_count": len(primary_replays),
+        "primary_graph_family_node_counts": primary_family_counts,
+        "primary_graph_replay_count": primary_replay_counts[0],
+        "sqlite_path": str(sqlite_path),
+        "sqlite_sha256": sha256_file(sqlite_path),
+    }
+
+
 def record_trace_status(
     output: pathlib.Path,
     *,
     model_key: str,
-    ours_nsys_report: pathlib.Path,
-    ours_kernel_summary: pathlib.Path,
-    ours_command: pathlib.Path,
-    ours_profile_log: pathlib.Path,
+    ours_nsys_reports: Sequence[pathlib.Path],
+    ours_nsys_sqlites: Sequence[pathlib.Path],
+    ours_nsys_validations: Sequence[pathlib.Path],
+    ours_kernel_summaries: Sequence[pathlib.Path],
+    ours_commands: Sequence[pathlib.Path],
+    ours_profile_logs: Sequence[pathlib.Path],
     ours_client_results: Sequence[pathlib.Path],
     ours_client_logs: Sequence[pathlib.Path],
     vllm_torch_trace: pathlib.Path,
@@ -763,6 +909,19 @@ def record_trace_status(
         or len(ours_client_logs) != TRACE_REPETITIONS
     ):
         raise HarnessError("ours trace must retain exactly three client results and logs")
+    ours_trace_sequences = {
+        "Nsight reports": ours_nsys_reports,
+        "Nsight SQLite exports": ours_nsys_sqlites,
+        "Nsight validations": ours_nsys_validations,
+        "kernel summaries": ours_kernel_summaries,
+        "profile commands": ours_commands,
+        "profile logs": ours_profile_logs,
+    }
+    for label, paths in ours_trace_sequences.items():
+        if len(paths) != TRACE_REPETITIONS:
+            raise HarnessError(
+                f"ours trace must retain exactly three independent {label}"
+            )
     if len(cache_drop_reports) != 3:
         raise HarnessError("paired trace must retain before/between/after cache-drop reports")
     cache_drop_artifacts = {
@@ -780,29 +939,41 @@ def record_trace_status(
         )
         generated_texts.append(record.get("generated_texts"))
         ours_durations.append(require_number(record.get("duration"), "duration"))
-    ours_command_tokens = shlex.split(ours_command.read_text(encoding="utf-8"))
-    if "--no-enable-prefix-caching" not in ours_command_tokens:
-        raise HarnessError("ours trace must explicitly disable prefix caching")
-    graph_trace_flag = f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}"
-    if graph_trace_flag not in ours_command_tokens:
-        raise HarnessError("ours trace must capture node-level CUDA graph activity")
-    for flag, expected in (
-        ("--max-num-seqs", MAX_NUM_SEQS),
-        ("--max-num-batched-tokens", MAX_NUM_BATCHED_TOKENS[model_key]),
-    ):
-        if flag not in ours_command_tokens:
-            raise HarnessError(f"ours trace command omits {flag}")
-        value_index = ours_command_tokens.index(flag) + 1
-        if value_index >= len(ours_command_tokens):
-            raise HarnessError(f"ours trace command omits the value for {flag}")
-        if ours_command_tokens[value_index] != str(expected):
-            raise HarnessError(f"ours trace command {flag} differs from the gate")
-    if "--max-model-len" in ours_command_tokens:
-        value_index = ours_command_tokens.index("--max-model-len") + 1
-        if value_index >= len(ours_command_tokens):
-            raise HarnessError("ours trace command omits the value for --max-model-len")
-        if ours_command_tokens[value_index] != str(MAX_MODEL_LEN[model_key]):
-            raise HarnessError("ours trace command --max-model-len differs from the gate")
+    for command_path in ours_commands:
+        command_tokens = shlex.split(command_path.read_text(encoding="utf-8"))
+        if "--no-enable-prefix-caching" not in command_tokens:
+            raise HarnessError("ours trace must explicitly disable prefix caching")
+        graph_trace_flag = f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}"
+        if graph_trace_flag not in command_tokens:
+            raise HarnessError("ours trace must capture node-level CUDA graph activity")
+        flush_flag = f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}"
+        if flush_flag not in command_tokens:
+            raise HarnessError("ours trace must periodically flush buffered CUDA activity")
+        if "--cpuctxsw=none" not in command_tokens:
+            raise HarnessError(
+                "ours trace must disable unrelated CPU context-switch tracing"
+            )
+        for flag, expected in (
+            ("--max-num-seqs", MAX_NUM_SEQS),
+            ("--max-num-batched-tokens", MAX_NUM_BATCHED_TOKENS[model_key]),
+        ):
+            if flag not in command_tokens:
+                raise HarnessError(f"ours trace command omits {flag}")
+            value_index = command_tokens.index(flag) + 1
+            if value_index >= len(command_tokens):
+                raise HarnessError(f"ours trace command omits the value for {flag}")
+            if command_tokens[value_index] != str(expected):
+                raise HarnessError(f"ours trace command {flag} differs from the gate")
+        if "--max-model-len" in command_tokens:
+            value_index = command_tokens.index("--max-model-len") + 1
+            if value_index >= len(command_tokens):
+                raise HarnessError(
+                    "ours trace command omits the value for --max-model-len"
+                )
+            if command_tokens[value_index] != str(MAX_MODEL_LEN[model_key]):
+                raise HarnessError(
+                    "ours trace command --max-model-len differs from the gate"
+                )
     if max(ours_durations) > min(ours_durations) * 1.20:
         raise HarnessError("ours trace repetitions differ in duration by more than 20%")
     ours_output_digests = [
@@ -848,11 +1019,31 @@ def record_trace_status(
     output_digests_equal = len(set(output_digests)) == 1
     if metadata.get("output_digests_equal") is not output_digests_equal:
         raise HarnessError("vLLM trace output-repeatability flag differs")
+    nsys_validations = []
+    for sqlite_path, validation_path in zip(
+        ours_nsys_sqlites, ours_nsys_validations, strict=True
+    ):
+        validation = validate_nsys_trace(sqlite_path, model_key=model_key)
+        if _load_json_object(validation_path) != validation:
+            raise HarnessError(
+                "recorded Nsight validation differs from the SQLite report"
+            )
+        nsys_validations.append(validation)
+    indexed_trace_artifacts: dict[str, pathlib.Path] = {}
+    for name, paths in (
+        ("ours_command", ours_commands),
+        ("ours_profile_log", ours_profile_logs),
+        ("ours_nsys_report", ours_nsys_reports),
+        ("ours_nsys_sqlite", ours_nsys_sqlites),
+        ("ours_nsys_validation", ours_nsys_validations),
+        ("ours_kernel_summary", ours_kernel_summaries),
+    ):
+        indexed_trace_artifacts[name] = paths[0]
+        indexed_trace_artifacts.update(
+            {f"{name}_{index}": path for index, path in enumerate(paths[1:], start=2)}
+        )
     artifacts = {
-        "ours_command": ours_command,
-        "ours_profile_log": ours_profile_log,
-        "ours_nsys_report": ours_nsys_report,
-        "ours_kernel_summary": ours_kernel_summary,
+        **indexed_trace_artifacts,
         **{
             f"ours_client_result_{index}": path
             for index, path in enumerate(ours_client_results, start=1)
@@ -895,15 +1086,18 @@ def record_trace_status(
         "trace_contract": {
             "admission_mode": "closed-loop",
             "concurrency": TRACE_CONCURRENCY,
+            "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
             "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
             "enable_prefix_caching": False,
             "input_len": INPUT_LEN,
             "max_model_len": MAX_MODEL_LEN[model_key],
             "max_num_seqs": MAX_NUM_SEQS,
+            "nsys_captures": TRACE_REPETITIONS,
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
             "repetitions": TRACE_REPETITIONS,
         },
+        "nsys_validations": nsys_validations,
         "vllm_cpp_sha": vllm_cpp_sha,
         "vllm_profiler": "torch-profiler",
     }
@@ -1207,13 +1401,34 @@ def _parser() -> argparse.ArgumentParser:
     model_gate.add_argument("--test-name", required=True)
     model_gate.add_argument("--vllm-cpp-sha", required=True)
 
+    validate_nsys = commands.add_parser("validate-nsys-trace")
+    validate_nsys.add_argument("--sqlite", type=pathlib.Path, required=True)
+    validate_nsys.add_argument(
+        "--model-key", choices=tuple(MODEL_REVISIONS), required=True
+    )
+    validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
+
     trace = commands.add_parser("record-trace-status")
     trace.add_argument("--output", type=pathlib.Path, required=True)
     trace.add_argument("--model-key", choices=tuple(MODEL_REVISIONS), required=True)
-    trace.add_argument("--ours-nsys-report", type=pathlib.Path, required=True)
-    trace.add_argument("--ours-kernel-summary", type=pathlib.Path, required=True)
-    trace.add_argument("--ours-command", type=pathlib.Path, required=True)
-    trace.add_argument("--ours-profile-log", type=pathlib.Path, required=True)
+    trace.add_argument(
+        "--ours-nsys-report", action="append", type=pathlib.Path, required=True
+    )
+    trace.add_argument(
+        "--ours-nsys-sqlite", action="append", type=pathlib.Path, required=True
+    )
+    trace.add_argument(
+        "--ours-nsys-validation", action="append", type=pathlib.Path, required=True
+    )
+    trace.add_argument(
+        "--ours-kernel-summary", action="append", type=pathlib.Path, required=True
+    )
+    trace.add_argument(
+        "--ours-command", action="append", type=pathlib.Path, required=True
+    )
+    trace.add_argument(
+        "--ours-profile-log", action="append", type=pathlib.Path, required=True
+    )
     trace.add_argument("--ours-client-result", action="append", type=pathlib.Path, required=True)
     trace.add_argument("--ours-client-log", action="append", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-torch-trace", type=pathlib.Path, required=True)
@@ -1306,14 +1521,21 @@ def main() -> int:
             test_name=args.test_name,
             vllm_cpp_sha=args.vllm_cpp_sha,
         )
+    elif args.command == "validate-nsys-trace":
+        if args.output.exists():
+            raise HarnessError(f"refusing to overwrite Nsight validation: {args.output}")
+        result = validate_nsys_trace(args.sqlite, model_key=args.model_key)
+        write_json_atomic(args.output, result)
     elif args.command == "record-trace-status":
         result = record_trace_status(
             args.output,
             model_key=args.model_key,
-            ours_nsys_report=args.ours_nsys_report,
-            ours_kernel_summary=args.ours_kernel_summary,
-            ours_command=args.ours_command,
-            ours_profile_log=args.ours_profile_log,
+            ours_nsys_reports=args.ours_nsys_report,
+            ours_nsys_sqlites=args.ours_nsys_sqlite,
+            ours_nsys_validations=args.ours_nsys_validation,
+            ours_kernel_summaries=args.ours_kernel_summary,
+            ours_commands=args.ours_command,
+            ours_profile_logs=args.ours_profile_log,
             ours_client_results=args.ours_client_result,
             ours_client_logs=args.ours_client_log,
             vllm_torch_trace=args.vllm_torch_trace,

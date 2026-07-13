@@ -348,11 +348,6 @@ run_leg() {
 
 run_paired_traces() {
   local trace_dir="${evidence}/trace/${model}"
-  local ours_prefix="${trace_dir}/ours"
-  local ours_rep="${ours_prefix}.nsys-rep"
-  local ours_summary="${trace_dir}/ours-cuda_gpu_kern_sum.txt"
-  local ours_log="${trace_dir}/ours-profile.log"
-  local ours_command="${trace_dir}/ours-profile-command.txt"
   local vllm_profile_dir="${trace_dir}/vllm-profile"
   local vllm_metadata="${trace_dir}/vllm-profile-metadata.json"
   local vllm_corpus="${evidence}/corpus/${model}/vllm/c16-r1.jsonl"
@@ -363,8 +358,14 @@ run_paired_traces() {
   local cache_before_ours="${trace_dir}/cache-before-ours.json"
   local cache_between="${trace_dir}/cache-between-engines.json"
   local cache_after_vllm="${trace_dir}/cache-after-vllm.json"
+  local -a ours_reps=()
+  local -a ours_sqlites=()
+  local -a ours_summaries=()
+  local -a ours_validations=()
+  local -a ours_logs=()
+  local -a ours_commands=()
   mkdir -p "${trace_dir}"
-  [[ ! -e ${ours_rep} && ! -e ${vllm_summary} && ! -e ${status} ]] || {
+  [[ ! -e ${vllm_summary} && ! -e ${status} ]] || {
     echo "refusing to overwrite paired trace evidence for ${model}" >&2
     return 1
   }
@@ -372,33 +373,47 @@ run_paired_traces() {
 
   gpu_idle || { echo "GPU is not idle before our trace" >&2; return 1; }
   drop_caches "${cache_before_ours}"
-  local -a server_cmd=(
-    "${build_dir}/examples/server"
-    --model "${snapshot}"
-    --port "${port}"
-    --num-blocks "${num_blocks}"
-    --max-num-seqs "${max_num_seqs}"
-    --max-num-batched-tokens "${max_num_batched_tokens}"
-    --no-enable-prefix-caching
-    --served-model-name gate
-  )
-  local -a profile_cmd=(
-    nsys profile
-    --trace=cuda
-    --cuda-graph-trace=node
-    --sample=none
-    --stats=false
-    --force-overwrite=true
-    --output "${ours_prefix}"
-    "${server_cmd[@]}"
-  )
-  printf '%q ' "${profile_cmd[@]}" >"${ours_command}"
-  printf '\n' >>"${ours_command}"
-  setsid "${profile_cmd[@]}" >"${ours_log}" 2>&1 &
-  spid=$!
-  wait_ready "${ours_log}"
   local trace_rep
   for trace_rep in 1 2 3; do
+    local ours_prefix="${trace_dir}/ours-r${trace_rep}"
+    local ours_rep="${ours_prefix}.nsys-rep"
+    local ours_sqlite="${ours_prefix}.sqlite"
+    local ours_summary="${trace_dir}/ours-r${trace_rep}-cuda_gpu_kern_sum.txt"
+    local ours_validation="${trace_dir}/ours-r${trace_rep}-nsys-validation.json"
+    local ours_log="${trace_dir}/ours-r${trace_rep}-profile.log"
+    local ours_command="${trace_dir}/ours-r${trace_rep}-profile-command.txt"
+    [[ ! -e ${ours_rep} && ! -e ${ours_sqlite} && ! -e ${ours_validation} &&
+       ! -e ${ours_summary} && ! -e ${ours_log} && ! -e ${ours_command} ]] || {
+      echo "refusing to overwrite ours trace repetition ${trace_rep}" >&2
+      return 1
+    }
+    local -a server_cmd=(
+      "${build_dir}/examples/server"
+      --model "${snapshot}"
+      --port "${port}"
+      --num-blocks "${num_blocks}"
+      --max-num-seqs "${max_num_seqs}"
+      --max-num-batched-tokens "${max_num_batched_tokens}"
+      --no-enable-prefix-caching
+      --served-model-name gate
+    )
+    local -a profile_cmd=(
+      nsys profile
+      --trace=cuda
+      --cuda-graph-trace=node
+      --cuda-flush-interval=10000
+      --sample=none
+      --cpuctxsw=none
+      --stats=false
+      --force-overwrite=true
+      --output "${ours_prefix}"
+      "${server_cmd[@]}"
+    )
+    printf '%q ' "${profile_cmd[@]}" >"${ours_command}"
+    printf '\n' >>"${ours_command}"
+    setsid "${profile_cmd[@]}" >"${ours_log}" 2>&1 &
+    spid=$!
+    wait_ready "${ours_log}"
     python3 "${repo_root}/tools/bench/online_gate.py" bench \
       --client "${client}" \
       --tokenizer "${snapshot}" \
@@ -410,27 +425,50 @@ run_paired_traces() {
       --repetition 1 \
       --num-prompts 48 \
       --artifact-tag "trace${trace_rep}"
+    # Nsight 2025.3 recommends a 10-second periodic flush for collections over
+    # 30 seconds. Leave one complete idle interval before target shutdown.
+    sleep 11
+    if ! pkill -TERM -P "${spid}" 2>/dev/null; then
+      kill -INT "${spid}" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 120); do
+      kill -0 "${spid}" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "${spid}" 2>/dev/null; then
+      kill -INT "${spid}" 2>/dev/null || true
+    fi
+    wait "${spid}" 2>/dev/null || true
+    spid=""
+    [[ -s ${ours_rep} ]] || {
+      echo "nsys did not write ${ours_rep}" >&2
+      return 1
+    }
+    nsys stats --force-export=true --report cuda_gpu_kern_sum "${ours_rep}" \
+      >"${ours_summary}"
+    [[ -s ${ours_summary} ]] || {
+      echo "ours kernel summary is empty" >&2
+      return 1
+    }
+    [[ -s ${ours_sqlite} ]] || {
+      echo "ours Nsight SQLite export is empty" >&2
+      return 1
+    }
+    python3 "${repo_root}/tools/bench/online_gate.py" validate-nsys-trace \
+      --sqlite "${ours_sqlite}" \
+      --model-key "${model}" \
+      --output "${ours_validation}"
+    ours_reps+=("${ours_rep}")
+    ours_sqlites+=("${ours_sqlite}")
+    ours_summaries+=("${ours_summary}")
+    ours_validations+=("${ours_validation}")
+    ours_logs+=("${ours_log}")
+    ours_commands+=("${ours_command}")
+    gpu_idle || {
+      echo "GPU is not idle after ours trace repetition ${trace_rep}" >&2
+      return 1
+    }
   done
-  # Stop only the profiled target first so nsys can flush its report.
-  if ! pkill -TERM -P "${spid}" 2>/dev/null; then
-    kill -INT "${spid}" 2>/dev/null || true
-  fi
-  for _ in $(seq 1 120); do
-    kill -0 "${spid}" 2>/dev/null || break
-    sleep 1
-  done
-  if kill -0 "${spid}" 2>/dev/null; then
-    kill -INT "${spid}" 2>/dev/null || true
-  fi
-  wait "${spid}" 2>/dev/null || true
-  spid=""
-  [[ -s ${ours_rep} ]] || {
-    echo "nsys did not write ${ours_rep}" >&2
-    return 1
-  }
-  nsys stats --force-export=true --report cuda_gpu_kern_sum "${ours_rep}" \
-    >"${ours_summary}"
-  [[ -s ${ours_summary} ]] || { echo "ours kernel summary is empty" >&2; return 1; }
 
   gpu_idle || { echo "GPU is not idle before vLLM trace" >&2; return 1; }
   drop_caches "${cache_between}"
@@ -465,10 +503,6 @@ PY
   local -a status_args=(
     --output "${status}"
     --model-key "${model}"
-    --ours-nsys-report "${ours_rep}"
-    --ours-kernel-summary "${ours_summary}"
-    --ours-command "${ours_command}"
-    --ours-profile-log "${ours_log}"
     --vllm-torch-trace "${vllm_trace}"
     --vllm-kernel-summary "${vllm_summary}"
     --vllm-command "${vllm_command}"
@@ -480,8 +514,16 @@ PY
     --cache-drop-report "${cache_after_vllm}"
     --vllm-cpp-sha "${vllm_cpp_sha}"
   )
-  for trace_rep in 1 2 3; do
+  local trace_index
+  for trace_index in 0 1 2; do
+    trace_rep=$((trace_index + 1))
     status_args+=(
+      --ours-nsys-report "${ours_reps[trace_index]}"
+      --ours-nsys-sqlite "${ours_sqlites[trace_index]}"
+      --ours-nsys-validation "${ours_validations[trace_index]}"
+      --ours-kernel-summary "${ours_summaries[trace_index]}"
+      --ours-command "${ours_commands[trace_index]}"
+      --ours-profile-log "${ours_logs[trace_index]}"
       --ours-client-result "${evidence}/raw/${model}/ours/c16-r1-trace${trace_rep}.json"
       --ours-client-log "${evidence}/logs/${model}/ours/c16-r1-trace${trace_rep}.log"
     )

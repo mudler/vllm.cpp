@@ -242,6 +242,15 @@ CUDA-graph capture, and lets FlashInfer generate every hybrid bucket up to
 profiles per real FP4 projection before server readiness. No
 `autotune_configs.json` file is part of the production denominator.
 
+**Superseded for the current denominator (2026-07-13):** the paragraph above
+is exact historical v0.24 evidence only. The binding v0.25.0 log at
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/trace/27/vllm-profile.log`
+loads 64 entries from a persistent FlashInfer 0.6.13 cache and reports an
+`fp4_gemm` config-file hit. Installed 0.6.13 also uses a 5,000-us eager delay,
+not the v0.24 1,000-us value. W3-C is therefore mandatory parity/reproduction
+work under the accepted [persistent-cache spike](nvfp4-persistent-plan-cache.md),
+not an optional local capability.
+
 Installed FlashInfer's FP4 `TuningConfig` leaves `use_cuda_graph` at its
 default `false`. For every tactic it performs three warmups, synchronizes the
 stream, launches TensorRT-LLM's one-thread `delayStreamKernel(1000us)`, then
@@ -269,7 +278,7 @@ The exact immutable server binary then ran delayed versus
 delayed/off, off/delayed, delayed/off order under one lock. All 576 requests,
 six memory returns and six verified cache evictions pass. Delayed runs are
 810.084/811.018/808.693 total tok/s; off runs are
-798.974/797.584/813.580. Means are **809.932/803.379 = 1.008156x**, with
+798.974/797.584/813.580. Means are **809.932/803.379 = 1.008156×**, with
 0.118%/0.901% CV, but only **13/20 timing** and **2/4 memory** axes satisfy
 strict no-regression. Delayed/off mean GPU peaks are 38,069/38,091 MiB and
 available-memory drop improves, while delayed PSS/RSS are slightly higher.
@@ -284,10 +293,10 @@ the active W3 stack. Summary/driver/provenance/tree hashes are
 `cf4c33c7...360c` under immutable `w3/component-ab`. Clean `b5c6e4f` remains
 the binding vLLM denominator. The W3-B implementation below now owns the
 pre-serve selection-stability repair and remains active on immutable evidence.
-Versioned atomic persistence remains W3-C as an optional local
-capability with collision-complete keys and stale rejection; it is not allowed
-to stand in for, or silently become the default against, the production oracle
-whose file cache is disabled.
+That v0.24 component did not authorize persistence as a speed credit. The
+binding v0.25 oracle later changed the denominator: W3-C now owns mandatory
+versioned atomic persistence, exact cache import and stale rejection, while
+still requiring a same-plan component before any speed attribution.
 
 ### W3-B implementation checkpoint (2026-07-12)
 
@@ -389,8 +398,9 @@ Summary/selection/driver/provenance/tree SHA-256 are
 `c371848a…cd11`, `fec3bf11…99c8`, `e996e6dd…662`,
 `1df8bdbe…23cb` and `85910147…7b6`. The next binding step is a paired
 prewarm/lazy nsys capture to compare actual kernel/tactic mix, then select the
-next trace-grounded lever before another exact 27B oracle ladder. W3-C remains
-optional and 35B remains prohibited.
+next trace-grounded lever before another exact 27B oracle ladder. The later
+v0.25 executed-cache audit promotes W3-C to `READY` as the next bounded
+reproduction-control implementation; 35B remains prohibited.
 
 The first three-arm trace attempt under `w3b/trace-ab-oracle` is **VOID**. The
 prewarm server completed its separate warmup plus three retained c16/48 windows
@@ -554,7 +564,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
-| timing/warmup/persistence (`kernel_warmup.py:123-220`, `autotuner.py:1343-1426`) | **W3-A and W3-B classified; W3 remains active:** A retains three warmups + stream sync + 1,000-us GPU delay + ten eager repeats; `VT_FP4_AUTOTUNE_DELAY=0` restores W2. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch and diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`), plus actual-W4A4 shared-loader readiness ordering (`model_loader.cpp:211-260`). `VT_FP4_PRE_SERVE_WARMUP=0` restores lazy W3-A. Clean exact/legacy/model/memcheck/server evidence passes at 80/80 profiles, zero lazy misses, 16/16 correctness and zero sanitizer errors. Repeated prewarm/lazy component means are **808.457/808.220 tok/s = 1.000293×** with strict **15/20 timing + 2/4 memory** and only **20/80** stable prewarm IDs; first-use improves **5.662→0.779 s**, so production-faithful prewarm stays without speed credit. `9cc7191` first closed v0.25 at 54/124; replacement `def5f75` promoted W3-D packed QKV from the exact **~240 versus 208 FP4 GEMMs/step** topology gap, and binding `3f256ab` closes the post-pack grid at 55/124. W3-C adds collision-complete source/tactic/device/CUDA/CUTLASS/model keys plus atomic load/save/stale rejection as an optional capability; production pip-vLLM disables its file cache, so persistence is not the speed denominator |
+| timing/warmup/persistence (`kernel_warmup.py:133-213`, `flashinfer_autotune_cache.py:19-55`, installed `autotuner.py:799-818,978-1013,1745-1900`) | **W3-A/W3-B classified; W3-C READY:** A's 1,000-us method and B's process-local all-bucket warmup were faithful to the old v0.24 denominator. B adds exact profile enumeration (`nvfp4_plan_cache.h:53-87`), process scope/stats (`nvfp4_autotune.h:14-42`), all-bucket dispatch/diagnostic misses (`cuda_matmul_nvfp4_cutlass.cu:354-508`) and actual-W4A4 readiness ordering (`model_loader.cpp:211-260`). Its repeated component is **1.000293×**, strict **15/20 timing + 2/4 memory**, with only **20/80** stable IDs. Binding v0.25 `3f256ab` instead proves a 64-entry persistent cache hit; W3-E fresh processes match only 18--33/64 paired IDs. W3-C now mirrors versioned JSON load/save, exact FlashInfer import, collision/stale rejection, loaded-plan priority and current 5,000-us miss timing. It is mandatory reproduction control, not automatic steady-state speed credit; see [W3-C spike](nvfp4-persistent-plan-cache.md) |
 | output modes | keep BF16/F32 gate behavior unchanged; add the upstream FP16 epilogue and tests as a separately gated breadth leaf before row closure |
 | diagnostics | retain fixed-dispatch/autotune opt-out, add exact-bucket and full-tactic same-binary toggles, forced tactic ID and stable selected-plan reporting; invalid IDs/configs fail loudly |
 
@@ -577,7 +587,7 @@ wrappers.
 | `QKVParallelLinear` loader/forward (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D immutable component/trace/exact-grid-gated:** unequal-shard scalar unit; packed-one-GEMM versus three logical CUDA outputs (max diff 0); row-strided preamble/cache tests; clean default and `VT_FP4_MERGED_QKV=0` real 27B gates (**235/235 + 16/16 each**); focused sanitizer zero errors. The c16 A/B is 1.005049× mean-positive but strict-fails at 14/20 timing + 2/4 memory. Clean nsys proves **296,674/1,425 = 208.192** graph FP4 GEMMs/forward versus vLLM 208; exact grid completes at 55/124 and remains failed |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected old-oracle trace puts FP4 kernel time within 0.63% of vLLM. `9cc7191` first completed v0.25 at 54/124 and `def5f75` selected packed QKV; post-pack `3f256ab` now binds at **55/124**. Its apparent norm+FP4 follow-on is refuted by the generated body and separate custom-op call. Stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified; W3-C READY:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove all profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B demonstrates process-local selection instability. Binding v0.25 `3f256ab` logs a persistent 64-entry hit; W3-C ports exact JSON import/native round-trip, stale/collision rejection, atomic publication and frozen-map fresh-process gates under [its dedicated spike](nvfp4-persistent-plan-cache.md) |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -651,7 +661,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0`; E: direct swizzled activation-scale emission with `VT_FP4_DIRECT_SF=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. D correctness/A-B/trace/exact grid are complete: c16 1.005049×, strict 14/20 timing +2/4 memory, post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward, and binding `3f256ab` at 55/124. E removes 624 activation swizzles and gains 1.002108×/1.006222× c2/c16 mean total throughput, but strict-fails 32/40 timing +6/8 memory; no conditional exact grid ran. C stays optional; re-scan before another unstacked lever |
+| W3 | A: historical v0.24 eager timing; B: pre-serve all-bucket in-memory warmup; C: v0.25 persistent/frozen plan cache and 5,000-us miss timing; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0`; E: direct swizzled activation-scale emission with `VT_FP4_DIRECT_SF=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. D correctness/A-B/trace/exact grid are complete: c16 1.005049×, strict 14/20 timing +2/4 memory, post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward, and binding `3f256ab` at 55/124. E removes 624 activation swizzles and gains 1.002108×/1.006222× c2/c16 mean total throughput, but strict-fails 32/40 timing +6/8 memory. The dynamic re-scan proves v0.25 loaded a 64-entry persistent cache while our fresh processes remain unstable; C is now `READY` under [its dedicated spike](nvfp4-persistent-plan-cache.md), with no speed credit or exact grid yet |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -767,8 +777,9 @@ process group was terminated and GPU/ports/lock were verified idle; no partial
 rate binds. The isolated v0.25.0 oracle is validated and atomically active with
 rollback preserved. Immutable `9cc7191` has now run the full exact 27B grid and
 70/124 axes remain below floor. Its ours trace omitted CUDA-graph child nodes;
-the replacement trace below closes that attribution gap. W3-C stays optional
-and 35B remains prohibited until every 27B axis passes.
+the replacement trace below closes that attribution gap. This was the pre-audit
+classification; the binding v0.25 log later promotes W3-C to mandatory
+reproduction control. 35B remains prohibited until every 27B axis passes.
 
 The replacement exact campaign is **complete but failed/open** from immutable clean
 `9cc71918dbdc10f014c02feb9bab1d00963a16fe`. Its detached source, fresh sm_121a

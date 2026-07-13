@@ -5978,3 +5978,55 @@ credit. Its conditional exact vLLM grid did not run, immutable `3f256ab`
 remains binding at 55/124, and no 35B performance command ran. Next execute the
 AGENTS dynamic hot-path re-scan and spike only the next verified, unstacked
 lever; do not stack another change into W3-E's failed component.
+
+## 2026-07-13 — v0.25 persistent FP4 cache correction and W3-C spike
+
+The required post-W3-E dynamic scan is complete. Three read-only lenses covered
+the FP4 tactic/dependency chain, exact node traces, and scheduler/KV/GDN/
+attention/host residuals; no agent edited files or ran the GPU. One engine-lens
+report initially repeated the live spec's stale v0.24 “file cache disabled”
+classification. Actual execution refutes it: binding log
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/trace/27/vllm-profile.log`
+(SHA `367af18d...2da`) names vLLM's persistent FlashInfer cache, loads 64
+configs, reports a `CutlassFp4GemmRunner` `fp4_gemm` file hit, and reloads the
+same map after warmup.
+
+The exact 11,947-byte file under
+`~/.cache/vllm/flashinfer_autotune_cache/0.6.13/121a/cbd38fe31b19a593fd4ac474a8a138a545227805f23c425119de8429f384d163/`
+has SHA `b41a8ecc...677`. Its metadata binds FlashInfer 0.6.13, CUDA 13.0,
+cuBLAS 13.1.0, cuDNN 91900, cuDNN frontend 1.26.0 and NVIDIA GB10; 64 entries
+cover four post-pack projection shapes across 16 M buckets. vLLM v0.25 tag
+`702f481` enables the path at `kernel_warmup.py:88-95,133-213`, hashes/places
+and atomically replaces it at `flashinfer_autotune_cache.py:19-55`, and O1+
+enables autotune at `config/vllm.py:193-275`. Installed FlashInfer source SHA
+is `adaaabe4...692`; it prioritizes loaded files at `autotuner.py:978-1013`,
+rejects stale metadata at `:1813-1900`, and now profiles misses with three
+warmups, a **5,000-us** eager delay and ten repeats at `:799-818,1407-1493`.
+Our historical 1,000-us W3-A behavior was faithful only to v0.24.
+
+This matters before another small A/B. W3-E tuned 64/64 plans in every fresh
+process with zero lazy misses, yet paired direct/fallback processes share only
+18--33 IDs; only 9--17 c16 and 12--15 c2 keys per arm remain stable across
+three repetitions, and five of six paired 128-token hashes differ. Fixed-tactic
+operator gates already prove direct/composed bytes and GEMM output equal, so
+different CUTLASS reductions remain an uncontrolled variable even though they
+are not assigned as the cause of the failed performance axes.
+
+Accepted `.agents/specs/nvfp4-persistent-plan-cache.md` promotes W3-C to
+`READY`: pure-C++ native JSON round-trip, exact read-only FlashInfer import,
+collision/environment/tactic metadata, same-directory atomic publication,
+loaded-plan priority, frozen benchmark mode, current 5,000-us miss timing,
+ready-map import/snapshot and full source-contract tests. Its gate requires six
+fresh processes to load identical 64/64 plans with zero tuning/misses, both 27B
+arms to retain 235/235 + 16/16, 6/6 paired long-output hashes, then c2/c16
+AB/BA/AB with all 40 timing + 8 memory axes. Only acceptance permits another
+exact 27B grid; every 35B performance command remains prohibited.
+
+W3-C is benchmark-validity infrastructure, not automatic speed credit. The
+parallel scan ranks subsequent unstacked speed candidates as persistent
+per-weight alpha (removes 208 `SetScalar` launches/forward), vectorized BF16
+activation quantization, and packed pure-decode GDN post-conv/recurrence fusion.
+Releasing host checkpoint copies after CUDA residency separately targets the
+binding 0.584689/0.592269 PSS/RSS failures. No implementation, model run, GPU
+command or new performance result occurred in this spike checkpoint; immutable
+`3f256ab` remains binding at 55/124 and GPU/lock remain idle.

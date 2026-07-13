@@ -6866,3 +6866,30 @@ matching the controller and driver preflight. Focused harness tests remain
 policies pass. Next hardware action: create a new clean pushed-SHA root, prove
 the CUDA/CUTLASS build, then let one lock own the model gate and complete H1d
 trace series.
+
+## 2026-07-13 — second immutable H1d setup failed before build/GPU; CUDA compiler pinned
+
+The pinned-Ninja replacement ran from clean pushed
+`2d16c681f3fe64130a7ab9b6fc55ad7e21c0808e` in a new SHA-owned root. Its
+detached source, corpus and corrected 27B-only dry-run plan passed; manifest
+SHA-256 is `9559a2d50f2a7adb8402e68be0aa22bcb03852889abe4b2d6c3a5c93b9f58096`.
+CMake found the pinned Ninja and identified GNU 13.3.0, then stopped because it
+could not find a CUDA compiler: the non-interactive DGX login environment also
+omits `nvcc` from `PATH`. Configure SHA-256 is
+`378fdd7a2e59af3c2510ba9006e717c24e70ab8efe457583279b6fec40464c3c`.
+
+This second root is likewise **FAILED / VOID before build or GPU**. No CUDA or
+C++ translation unit compiled, no model loaded, no GPU lock was acquired and
+no profiler command ran. The GPU/lock/ports remained idle. The root is retained
+and never reused; it contributes no correctness, trace, ratio or speed credit.
+Immutable `3f256ab` remains binding at **55/124 pass, 69 fail**.
+
+Read-only environment inspection locates the installed compiler at
+`/usr/local/cuda-13.0/bin/nvcc`: CUDA 13.0.88, 24,513,032 bytes, SHA-256
+`fbb111f057786ddd10ba723d993cc7dd43abf978b6baa32fedd3c9d806dc79e1`.
+The execution manifest now requires that exact `CMAKE_CUDA_COMPILER`, its
+configure identification banner and its content hash, in addition to the
+already pinned oracle Ninja. Focused harness tests pass **25/25** and record/
+checkpoint checks remain green. The next hardware action after this fully
+explicit toolchain checkpoint is a third fresh immutable root; continue only
+if CUDA/CUTLASS build provenance passes before the GPU lock.

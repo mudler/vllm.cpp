@@ -232,6 +232,12 @@ OpenAI-compatible server.
 > no compile, model load, GPU lock or profiler command ran. The corrected exact
 > recipe now names `~/venvs/vllm-oracle/bin/ninja` explicitly and requires a
 > fresh pushed SHA/evidence root.
+> The replacement clean `2d16c68` root is likewise **FAILED / VOID before
+> build or GPU**: Ninja was found, but CUDA compiler discovery failed because
+> `nvcc` is also absent from login `PATH` (configure SHA `378fdd7a…4c3c`). The
+> next recipe pins `/usr/local/cuda-13.0/bin/nvcc` (CUDA 13.0.88, SHA-256
+> `fbb111f0…79e1`) and records it as an execution artifact. Neither setup
+> changes the binding speed result.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.

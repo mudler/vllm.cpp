@@ -2,9 +2,9 @@
 
 Status: **ACTIVE — H1a/H1b/H1c are VOID; the H1d trace-only controller,
 target-build preflight and schema-v2 validators are implemented and CPU-gated;
-immutable `7bae38a` failed before build/GPU because Ninja was not on the DGX
-login `PATH`; the pinned-Ninja replacement execution is pending and W3-H2
-remains prohibited**
+immutable `7bae38a`/`2d16c68` failed before build/GPU because Ninja and then
+`nvcc` were not on the DGX login `PATH`; the fully pinned-toolchain replacement
+execution is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -38,6 +38,12 @@ or GPU: CMake could not locate Ninja in the DGX login environment. Configure
 log SHA-256 is `ac9e4854…f616`; no model, lock or profiler ran. Its root remains
 immutable/void. The replacement recipe names the oracle environment's pinned
 `ninja` by absolute path and requires a new clean pushed SHA.
+
+Clean replacement `2d16c68` found pinned Ninja but then stopped at CUDA
+compiler discovery because login `PATH` also omits `nvcc`. Configure SHA-256 is
+`378fdd7a…4c3c`; it too ran no build/model/lock/GPU/profiler and remains void.
+The next manifest/recipe pins `/usr/local/cuda-13.0/bin/nvcc` at CUDA 13.0.88
+and hashes the 24,513,032-byte compiler (`fbb111f0…79e1`) before GPU work.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -461,6 +467,7 @@ SHA=$(git rev-parse HEAD)
 ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
   -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
   -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \

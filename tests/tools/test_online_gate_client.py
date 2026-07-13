@@ -990,6 +990,8 @@ class OnlineClientContractTests(unittest.TestCase):
             build_command = root / "build-command.txt"
             build_log = root / "build.log"
             configure_log = root / "configure.log"
+            cuda_compiler = root / "cuda" / "bin" / "nvcc"
+            cuda_compiler.parent.mkdir(parents=True)
             for path in (
                 build_command,
                 build_log,
@@ -998,9 +1000,11 @@ class OnlineClientContractTests(unittest.TestCase):
                 snapshot / "tokenizer.json",
                 snapshot / "model-00001-of-00001.safetensors",
                 client,
+                cuda_compiler,
             ):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
             configure_log.write_text(
+                "-- The CUDA compiler identification is NVIDIA 13.0.88\n"
                 f"-- CUTLASS found at {cutlass}; enabling sm120a NVFP4 cutlass GEMM\n",
                 encoding="utf-8",
             )
@@ -1008,6 +1012,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 "\n".join(
                     (
                         "CMAKE_BUILD_TYPE:STRING=Release",
+                        f"CMAKE_CUDA_COMPILER:FILEPATH={cuda_compiler}",
                         "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
                         f"CMAKE_MAKE_PROGRAM:FILEPATH={root / 'oracle-files/ninja'}",
                         f"CMAKE_HOME_DIRECTORY:INTERNAL={source}",
@@ -1091,7 +1096,12 @@ class OnlineClientContractTests(unittest.TestCase):
                 "VT_FP4_AUTOTUNE_CACHE_PATH": str(native_target),
                 "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
             }
-            with mock.patch.dict(os.environ, trace_environment, clear=False):
+            with (
+                mock.patch.dict(os.environ, trace_environment, clear=False),
+                mock.patch(
+                    "tools.bench.online_gate.DGX_CUDA_COMPILER", cuda_compiler
+                ),
+            ):
                 execution = record_execution_manifest(
                     root / "execution.json",
                     model_key="27",

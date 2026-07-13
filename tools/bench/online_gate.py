@@ -61,6 +61,8 @@ NSYS_CAPTURE_RANGE = "cudaProfilerApi"
 NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
 NSYS_PRODUCT_VERSION = "2025.3.2.474"
+DGX_CUDA_COMPILER = pathlib.Path("/usr/local/cuda-13.0/bin/nvcc")
+DGX_CUDA_COMPILER_VERSION = "13.0.88"
 NVFP4_PLAN_FIXTURE_SHA256 = (
     "e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd"
 )
@@ -2704,6 +2706,7 @@ def record_execution_manifest(
             cache_values[match.group(1)] = match.group(2)
     expected_cache_values = {
         "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_COMPILER": str(DGX_CUDA_COMPILER),
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_MAKE_PROGRAM": str(oracle_ninja),
         "VLLM_CPP_BENCH_PROFILE_CONTROL": "ON" if profile_control else "OFF",
@@ -2726,11 +2729,17 @@ def record_execution_manifest(
 
     configure_text = configure_log.read_text(encoding="utf-8")
     if (
-        "CUTLASS found at " not in configure_text
+        f"CUDA compiler identification is NVIDIA {DGX_CUDA_COMPILER_VERSION}"
+        not in configure_text
+        or "CUTLASS found at " not in configure_text
         or "enabling sm120a NVFP4 cutlass GEMM" not in configure_text
         or "cutlass NVFP4 GEMM disabled" in configure_text
     ):
-        raise HarnessError("configure log does not prove CUTLASS NVFP4 enablement")
+        raise HarnessError(
+            "configure log does not prove the pinned CUDA/CUTLASS NVFP4 toolchain"
+        )
+
+    artifacts["cuda_compiler"] = DGX_CUDA_COMPILER
 
     try:
         compile_entries = json.loads(
@@ -2828,6 +2837,9 @@ def record_execution_manifest(
         "bench_dependencies": expected_bench_dependencies,
         "build_contract": {
             "compile_command_sha256": _sha256_canonical(compile_tokens),
+            "cuda_compiler": str(DGX_CUDA_COMPILER),
+            "cuda_compiler_sha256": sha256_file(DGX_CUDA_COMPILER),
+            "cuda_compiler_version": DGX_CUDA_COMPILER_VERSION,
             "cutlass_source_tree": cutlass_source_tree,
             "native_plan_target": str(native_target),
             "native_plan_target_absent": True,

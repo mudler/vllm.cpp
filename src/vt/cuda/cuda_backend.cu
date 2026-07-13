@@ -151,20 +151,24 @@ class CudaBackend final : public Backend {
         throw std::runtime_error(
             "vt cuda: invalid or duplicate graph replay profiler arm");
       }
-      Check(cudaProfilerStart(), "cudaProfilerStart");
       g_cuda_profile_remaining_replays = g_cuda_profile_target_replays;
       g_cuda_profile_graph = graph;
       g_cuda_profile_active = true;
-      std::fprintf(stderr,
-                   "[VT_CUDA_PROFILE] started target_replays=%u graph=%p "
-                   "real_batch=16 padded_batch=16 prior_replays=%llu\n",
-                   g_cuda_profile_target_replays, graph,
-                   static_cast<unsigned long long>(g_cuda_profile_prior_replays));
     }
     if (g_cuda_profile_active &&
         (!eligible || graph != g_cuda_profile_graph)) {
       throw std::runtime_error(
           "vt cuda: graph replay profiler encountered an ineligible graph");
+    }
+    if (g_cuda_profile_active) {
+      Check(cudaProfilerStart(), "cudaProfilerStart");
+      if (g_cuda_profile_remaining_replays == g_cuda_profile_target_replays) {
+        std::fprintf(stderr,
+                     "[VT_CUDA_PROFILE] started target_replays=%u graph=%p "
+                     "real_batch=16 padded_batch=16 prior_replays=%llu\n",
+                     g_cuda_profile_target_replays, graph,
+                     static_cast<unsigned long long>(g_cuda_profile_prior_replays));
+      }
     }
 #endif
     Check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph), AsStream(q)),
@@ -175,11 +179,11 @@ class CudaBackend final : public Backend {
         throw std::runtime_error(
             "vt cuda: graph replay profiler counter underflow");
       }
+      Check(cudaStreamSynchronize(AsStream(q)),
+            "cudaStreamSynchronize profiler replay");
+      Check(cudaProfilerStop(), "cudaProfilerStop");
       --g_cuda_profile_remaining_replays;
       if (g_cuda_profile_remaining_replays == 0) {
-        Check(cudaStreamSynchronize(AsStream(q)),
-              "cudaStreamSynchronize profiler tail");
-        Check(cudaProfilerStop(), "cudaProfilerStop");
         g_cuda_profile_active = false;
         g_cuda_profile_completed = true;
         std::fprintf(stderr,

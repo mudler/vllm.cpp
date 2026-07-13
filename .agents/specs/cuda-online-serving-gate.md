@@ -65,7 +65,7 @@ but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
 **0.993504/0.954464/0.966438/0.980678/1.027889/1.039417×**; host PSS/RSS
 remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
 earns speed credit. The current W3-H trace-first refresh requires three
-lossless exact-plan captures before implementation. H1a/H1b/H1c and clean
+lossless exact-plan captures before the W3-H2 kernel. H1a/H1b/H1c and clean
 H1d attempts through `219f4f2` are void. The latest completed the exact
 **154/154** build, passed the 27B gate **1/1 in 17.22 s**, completed 48/48 plus
 16/16 clients, closed four replays and proved FIFO graceful stop/removal with
@@ -73,8 +73,10 @@ target and Nsight exit zero. Its SQLite still fails closed: one continuous
 range contains three eager sampler/input gaps (9 kernels, 9 memcpys, 3 memsets)
 and Nsight emits severity-2 possible event loss. The revised contract keeps
 those checks strict and isolates every synchronized graph replay with
-`--capture-range-end=repeat:4`. Implementation and fresh evidence are pending;
-no exact rerun or 35B performance command is authorized.
+`--capture-range-end=repeat:4`. The diagnostic controller, schema-v3
+four-`cuProfilerStart` proof and focused CPU contracts are implemented; fresh
+immutable evidence is pending, and no exact rerun or 35B performance command
+is authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,

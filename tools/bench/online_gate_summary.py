@@ -32,6 +32,7 @@ from tools.bench.online_gate import (
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
     NSYS_CAPTURE_RANGE,
+    NSYS_CAPTURE_RANGE_END,
     NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
     NSYS_PRODUCT_VERSION,
@@ -509,13 +510,16 @@ def _model_precondition_reasons(
         if status.get("vllm_profiler") != "torch-profiler":
             reasons.append("vLLM trace is not the required torch-profiler fallback")
         if status.get("schema_version") != TRACE_STATUS_SCHEMA_VERSION:
-            reasons.append("paired trace schema is not binding H1d schema v2")
+            reasons.append(
+                f"paired trace schema is not binding H1d schema "
+                f"v{TRACE_STATUS_SCHEMA_VERSION}"
+            )
         trace_contract = status.get("trace_contract")
         expected_trace_contract = {
             "admission_mode": "closed-loop",
             "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
             "capture_range": NSYS_CAPTURE_RANGE,
-            "capture_range_end": "stop",
+            "capture_range_end": NSYS_CAPTURE_RANGE_END,
             "concurrency": TRACE_CONCURRENCY,
             "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
             "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,

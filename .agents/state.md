@@ -7132,3 +7132,28 @@ and input construction between ranges. Every SQLite still rejects severity
 and amended spike, then implement/CPU-gate the repeated-range controller before
 a new pushed SHA/root. Immutable `3f256ab` remains **55/124 pass, 69 fail**;
 W3-H2, exact-grid and 35B performance remain prohibited.
+
+## 2026-07-13 — H1d repeated single-replay ranges implemented and CPU-gated
+
+The failed/void `219f4f2` checkpoint was committed separately as `bc03594`.
+The diagnostic-only replay controller now opens and closes one CUDA-profiler
+range around each of the next four eligible dense graph launches: start, one
+launch, stream synchronize, stop. Sampler, token readback and next-input
+construction therefore run between profiler ranges instead of inside one
+continuous range. Nsight is invoked with
+`--capture-range-end=repeat:4`, whose installed 2025.3.2 help defines `:4` as
+four total honored ranges.
+
+The trace status contract advances from schema v2 to v3. SQLite validation
+requires exactly four unique, zero-return `cuProfilerStart` runtime rows, each
+ending before its corresponding `cudaGraphLaunch*` and beginning after the
+prior launch. The existing severity>=2 rejection, direct child correlation,
+uniform replay/resource checks and zero ungraphed kernel/memcpy/memset rules
+remain unchanged. A regression fixture with only three range starts fails
+closed. Production builds still compile the controller out.
+
+Focused client/summary/trace contracts pass **31/31**. Python compile, shell
+syntax, ShellCheck and the CUDA-off server build pass. This checkpoint contains
+no GPU trace or performance run: fresh immutable three-capture DGX evidence is
+next. Immutable `3f256ab` remains **55/124 pass, 69 fail**; W3-H2, the exact
+grid and 35B performance remain prohibited until H1d passes.

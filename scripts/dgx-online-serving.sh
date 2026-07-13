@@ -462,7 +462,7 @@ run_paired_traces() {
       nsys profile
       --trace=cuda
       --capture-range=cudaProfilerApi
-      --capture-range-end=stop
+      --capture-range-end=repeat:4
       --flush-on-cudaprofilerstop=true
       --cuda-flush-interval=0
       --cuda-graph-trace=node:host-only

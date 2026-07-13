@@ -91,8 +91,9 @@ inner 4096, state 128; context 262144.
   pass, 48/48 + 16/16 clients complete, the FIFO is removed and target/Nsight
   exit zero. Its continuous range still captures three eager sampler/input gaps
   and emits severity-2 possible loss despite exact intended graph-child counts.
-  The revised driver/controller must use four isolated `repeat:4` ranges and
-  still enforces
+  The revised driver/controller now implements four isolated `repeat:4` ranges
+  and schema-v3 four-start validation. Focused contracts pass 31/31; fresh DGX
+  evidence is pending. It still enforces
   plan-first evidence, exact
   Triton-AOT/FA2/CUTLASS/toolchain configuration, its own recorded target build
   and actual `nsys -> nsys-launcher -> target-session` ancestry plus a

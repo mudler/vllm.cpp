@@ -56,9 +56,10 @@ TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
 TRACE_CAPTURE_GRAPH_REPLAYS = 4
-TRACE_STATUS_SCHEMA_VERSION = 2
+TRACE_STATUS_SCHEMA_VERSION = 3
 BUILD_CONTRACT_SCHEMA_VERSION = 2
 NSYS_CAPTURE_RANGE = "cudaProfilerApi"
+NSYS_CAPTURE_RANGE_END = f"repeat:{TRACE_CAPTURE_GRAPH_REPLAYS}"
 NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
 NSYS_PRODUCT_VERSION = "2025.3.2.474"
@@ -1109,10 +1110,31 @@ def validate_nsys_trace(
                 f"severity={first['severity']} text={first['text']}"
             )
 
+        profiler_start_rows = [
+            (int(start), int(end), int(correlation_id), int(return_value))
+            for start, end, correlation_id, return_value in connection.execute(
+                "SELECT runtime.start, runtime.end, runtime.correlationId, "
+                "runtime.returnValue FROM CUPTI_ACTIVITY_KIND_RUNTIME AS runtime "
+                "JOIN StringIds AS strings ON strings.id = runtime.nameId "
+                "WHERE strings.value = 'cuProfilerStart' ORDER BY runtime.start"
+            )
+        ]
+        if len(profiler_start_rows) != TRACE_CAPTURE_GRAPH_REPLAYS:
+            raise HarnessError(
+                "Nsight capture has "
+                f"{len(profiler_start_rows)} cuProfilerStart rows; expected "
+                f"{TRACE_CAPTURE_GRAPH_REPLAYS} isolated ranges"
+            )
+        if len({row[2] for row in profiler_start_rows}) != TRACE_CAPTURE_GRAPH_REPLAYS:
+            raise HarnessError("Nsight cuProfilerStart correlation IDs are not unique")
+        if any(row[3] != 0 for row in profiler_start_rows):
+            raise HarnessError("Nsight cuProfilerStart returned a CUDA error")
+
         launch_rows = [
-            (int(correlation_id), str(name), int(return_value))
-            for correlation_id, name, return_value in connection.execute(
-                "SELECT runtime.correlationId, strings.value, runtime.returnValue "
+            (int(start), int(end), int(correlation_id), str(name), int(return_value))
+            for start, end, correlation_id, name, return_value in connection.execute(
+                "SELECT runtime.start, runtime.end, runtime.correlationId, "
+                "strings.value, runtime.returnValue "
                 "FROM CUPTI_ACTIVITY_KIND_RUNTIME AS runtime "
                 "JOIN StringIds AS strings ON strings.id = runtime.nameId "
                 "WHERE strings.value GLOB 'cudaGraphLaunch*' "
@@ -1125,11 +1147,22 @@ def validate_nsys_trace(
                 f"{len(launch_rows)} cudaGraphLaunch rows; expected "
                 f"{TRACE_CAPTURE_GRAPH_REPLAYS}"
             )
-        launch_ids = [row[0] for row in launch_rows]
+        launch_ids = [row[2] for row in launch_rows]
         if len(set(launch_ids)) != TRACE_CAPTURE_GRAPH_REPLAYS:
             raise HarnessError("Nsight cudaGraphLaunch correlation IDs are not unique")
-        if any(return_value != 0 for _, _, return_value in launch_rows):
+        if any(row[4] != 0 for row in launch_rows):
             raise HarnessError("Nsight cudaGraphLaunch returned a CUDA error")
+        for index, (range_start, launch) in enumerate(
+            zip(profiler_start_rows, launch_rows, strict=True)
+        ):
+            if range_start[1] > launch[0]:
+                raise HarnessError(
+                    "Nsight cuProfilerStart does not precede its graph launch"
+                )
+            if index > 0 and range_start[0] <= launch_rows[index - 1][1]:
+                raise HarnessError(
+                    "Nsight graph launches do not occupy isolated profiler ranges"
+                )
         launch_id_set = set(launch_ids)
 
         kernel_fields = (
@@ -1353,7 +1386,7 @@ def validate_nsys_trace(
             kind: len(rows) for kind, rows in child_rows.items()
         },
         "graph_launch_count": len(launch_rows),
-        "graph_launch_names": [row[1] for row in launch_rows],
+        "graph_launch_names": [row[3] for row in launch_rows],
         "graph_node_count": len({row[1] for row in kernel_rows}),
         "kernel_summary": {
             "kernel_count": len(kernel_rows),
@@ -1369,6 +1402,7 @@ def validate_nsys_trace(
         "primary_graph_node_count": len({row[1] for row in kernel_rows}),
         "primary_graph_family_node_counts": primary_family_counts,
         "primary_graph_replay_count": TRACE_CAPTURE_GRAPH_REPLAYS,
+        "profiler_range_start_count": len(profiler_start_rows),
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": sha256_file(sqlite_path),
     }
@@ -1583,7 +1617,7 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
         if (match := _BENCH_SHUTDOWN_COMPLETED_RE.fullmatch(line))
     ]
     if len(ready) != 1 or len(started) != 1 or len(stopped) != 1:
-        raise HarnessError("profile log does not contain one complete CUDA profile window")
+        raise HarnessError("profile log does not contain one complete CUDA profile sequence")
     if (
         len(shutdown_ready) != 1
         or len(shutdown_requested) != 1
@@ -2176,7 +2210,7 @@ def record_trace_status(
             "profile",
             "--trace=cuda",
             f"--capture-range={NSYS_CAPTURE_RANGE}",
-            "--capture-range-end=stop",
+            f"--capture-range-end={NSYS_CAPTURE_RANGE_END}",
             "--flush-on-cudaprofilerstop=true",
             f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}",
             f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}",
@@ -2539,7 +2573,7 @@ def record_trace_status(
             "admission_mode": "closed-loop",
             "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
             "capture_range": NSYS_CAPTURE_RANGE,
-            "capture_range_end": "stop",
+            "capture_range_end": NSYS_CAPTURE_RANGE_END,
             "concurrency": TRACE_CONCURRENCY,
             "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
             "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,

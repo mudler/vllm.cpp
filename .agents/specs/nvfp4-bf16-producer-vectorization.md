@@ -4,7 +4,8 @@ Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID;
 the latest proves FIFO shutdown/zero exit and contains every intended graph
 child, but one continuous four-replay range also captures three eager sampler
 gaps and Nsight emits severity-2 possible event loss; four isolated repeat
-ranges are specified, implementation is pending and W3-H2 remains prohibited**
+ranges are implemented and CPU-gated, fresh DGX evidence is pending and W3-H2
+remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -139,6 +140,15 @@ between-replay sample/input-build gaps: **9 eager kernels, 9 eager memcpys and
 revised to four synchronized single-replay CUDA-profiler ranges under Nsight
 `--capture-range-end=repeat:4`; sampler/input work must execute between ranges
 and remain absent from SQLite. The severity and zero-eager checks stay strict.
+
+The repeated-range repair is implemented in the diagnostic-only backend and
+driver. Every eligible replay now executes `cudaProfilerStart` → one
+`cudaGraphLaunch` → stream synchronize → `cudaProfilerStop`; Nsight honors
+exactly four ranges through `repeat:4`. Trace schema v3 additionally requires
+four unique successful `cuProfilerStart` runtime rows in launch order. The
+ported client/summary/trace contracts pass **31/31**; Python and shell syntax,
+ShellCheck and the CUDA-off server build pass. This is local structural
+evidence only: a new pushed SHA/root and all three DGX captures remain pending.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -621,7 +631,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID. The latest exact build/gate, clients, four graph launches and FIFO/zero-exit lifecycle pass, but one continuous range captures three eager sampler gaps and emits severity-2 possible loss. Four isolated `repeat:4` single-replay ranges must retain the strict diagnostic/zero-eager contract before fresh immutable three-capture execution** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID. The latest exact build/gate, clients, four graph launches and FIFO/zero-exit lifecycle pass, but one continuous range captures three eager sampler gaps and emits severity-2 possible loss. Four isolated `repeat:4` single-replay ranges and schema-v3 four-start validation are implemented/CPU-gated; fresh immutable three-capture execution is next** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

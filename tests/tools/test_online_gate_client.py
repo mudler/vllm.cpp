@@ -31,6 +31,7 @@ from tools.bench.online_gate import (
     MAX_NUM_SEQS,
     FLASHINFER_VERSION,
     NSYS_CAPTURE_RANGE,
+    NSYS_CAPTURE_RANGE_END,
     NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
     NSYS_PRODUCT_VERSION,
@@ -103,6 +104,7 @@ def write_nsys_sqlite(
     lost_events: bool = False,
     model_contract: bool = False,
     orphan_child: bool = False,
+    profiler_start_count: int = TRACE_CAPTURE_GRAPH_REPLAYS,
     signature_drift: bool = False,
     uneven_replays: bool = False,
 ) -> None:
@@ -204,10 +206,11 @@ def write_nsys_sqlite(
             node_names = ["kernel-a", "kernel-b"]
             memcpy_nodes = 1
         launch_name = "cudaGraphLaunch_v10000"
+        profiler_start_name = "cuProfilerStart"
         string_ids = {
             name: index
             for index, name in enumerate(
-                sorted(set(node_names + [launch_name])), start=1
+                sorted(set(node_names + [launch_name, profiler_start_name])), start=1
             )
         }
         connection.executemany(
@@ -216,10 +219,25 @@ def write_nsys_sqlite(
         )
         launch_ids = [1001, 1002, 1003, 1004]
         for launch_index, correlation_id in enumerate(launch_ids):
+            if launch_index < profiler_start_count:
+                connection.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        launch_index * 100_000,
+                        launch_index * 100_000 + 10,
+                        0,
+                        1,
+                        2001 + launch_index,
+                        string_ids[profiler_start_name],
+                        0,
+                        None,
+                    ),
+                )
             connection.execute(
                 "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    launch_index * 100_000,
+                    launch_index * 100_000 + 20,
                     launch_index * 100_000 + 100,
                     0,
                     1,
@@ -818,6 +836,7 @@ class OnlineClientContractTests(unittest.TestCase):
             f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}", script
         )
         self.assertIn("--cpuctxsw=none", script)
+        self.assertIn(f"--capture-range-end={NSYS_CAPTURE_RANGE_END}", script)
         self.assertIn("validate-nsys-trace", script)
         self.assertIn('--model-key "${model}"', script)
         self.assertIn("--trace-only", script)
@@ -833,6 +852,9 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertEqual(
                 result["primary_graph_replay_count"], TRACE_CAPTURE_GRAPH_REPLAYS
             )
+            self.assertEqual(
+                result["profiler_range_start_count"], TRACE_CAPTURE_GRAPH_REPLAYS
+            )
 
             lost = root / "lost.sqlite"
             write_nsys_sqlite(lost, lost_events=True)
@@ -843,6 +865,11 @@ class OnlineClientContractTests(unittest.TestCase):
             write_nsys_sqlite(uneven, uneven_replays=True)
             with self.assertRaisesRegex(HarnessError, "uneven replay counts"):
                 validate_nsys_trace(uneven)
+
+            missing_range = root / "missing-range.sqlite"
+            write_nsys_sqlite(missing_range, profiler_start_count=3)
+            with self.assertRaisesRegex(HarnessError, "cuProfilerStart rows"):
+                validate_nsys_trace(missing_range)
 
             orphan = root / "orphan.sqlite"
             write_nsys_sqlite(orphan, orphan_child=True)
@@ -1374,7 +1401,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     "profile",
                     "--trace=cuda",
                     f"--capture-range={NSYS_CAPTURE_RANGE}",
-                    "--capture-range-end=stop",
+                    f"--capture-range-end={NSYS_CAPTURE_RANGE_END}",
                     "--flush-on-cudaprofilerstop=true",
                     f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}",
                     f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}",

@@ -12,6 +12,11 @@ is explicit. `INVENTORIED` is source knowledge only. Runtime-selected kernels
 remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
+Current `KERNEL-GEMM-NVFP4-W4A4` H1d substage: the trace-only design is frozen
+at four post-workload c16 graph replays per process, exact KERNEL/MEMCPY/MEMSET
+correlation and full node-resource multiset equality. The default production
+build has no profiler observer; implementation and GPU evidence are pending.
+
 The C1 implementation spike is accepted at
 [dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Its additive
 `BACKEND-ABI-VT` W0 spine is CPU-green and `GATING`; no row below is promoted by

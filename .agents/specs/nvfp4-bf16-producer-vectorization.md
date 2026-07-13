@@ -1,7 +1,8 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d target-build, collector and
-semantic-evidence hardening is pending and implementation remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d target-build and bounded
+four-replay design is frozen, harness implementation is pending and W3-H2
+remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -326,6 +327,28 @@ accepted trace must then contain the target CUTLASS FP4 device-kernel family
 and zero naive/WMMA FP4 GEMMs for production shapes. A passing fallback model
 gate cannot substitute for this preflight or runtime-dispatch proof.
 
+H1d uses a trace-only CUDA build seam that is absent from production builds.
+`VLLM_CPP_BENCH_PROFILE_CONTROL=ON` compiles an explicitly enabled server flag
+`--cuda-profile-graph-replays 4`; default builds retain no replay hot-path
+observer. The server installs a SIGUSR2 controller whose signal handler only
+sets `sig_atomic_t`. After the exact c16 client has completed its ordinary 16
+warmups and 48 measured requests with collection dormant, the driver verifies
+the owned server PID/process group, sends SIGUSR2 and runs a separate warmed
+c16 diagnostic probe. `ReplayGraph` calls `cudaProfilerStart()` immediately
+before probe replay 1, launches exactly four graphs, synchronizes the stream
+after replay 4, then calls `cudaProfilerStop()`. The synchronization and probe
+are structural diagnostics: no probe duration, latency or throughput may be
+reported as performance.
+
+The exact Nsight command is `--trace=cuda --capture-range=cudaProfilerApi
+--capture-range-end=stop --flush-on-cudaprofilerstop=true
+--cuda-flush-interval=0 --cuda-graph-trace=node:host-only
+--cuda-event-trace=false --sample=none --cpuctxsw=none --stats=false
+--kill=none`. Startup, model loading, graph construction, ordinary client
+warmups/measured work and shutdown remain outside collection. Four c16 replay
+windows yield only 4,428 primary kernel rows instead of H1c's hundreds of
+thousands.
+
 Export and validate every SQLite before starting the next capture and before
 the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
 rows, uneven dominant-graph replay count, missing indexed artifact or hash
@@ -334,10 +357,18 @@ runtime graph launches and the exact 16-warmup/48-measured workload; require
 distinct capture IDs and path/command/report/SQLite linkage; canonicalize and
 hash the full primary-node name/geometry/resource multiset; require identical
 structure across all three captures; and recompute every retained kernel
-summary from the indexed raw artifact. The exact 27B c16 graph contract is
-1,107 primary nodes with 208 FP4 GEMM, 144 normal-producer, 64 fused-producer,
-48 recurrence and 16+16 FA2 nodes; any family drift also voids the attempt.
-The remaining 611 primary nodes may not stay unconstrained. vLLM uses the
+summary from the indexed raw artifact. The SQLite must contain exactly four
+successful `cudaGraphLaunch*` runtime rows. Every graph-child KERNEL, MEMCPY
+and MEMSET row must map to one of those rows by exact `correlationId`;
+timestamp/nearest-event fallback is forbidden. Each launch must own the same
+node multiset and every node must replay four times. The exact 27B c16 kernel
+contract is 1,107 nodes / 4,428 rows with 208 FP4 GEMM, 144 normal-producer,
+64 fused-producer, 48 recurrence and 16+16 FA2 nodes per launch; any family
+drift voids the attempt. The remaining 611 kernel nodes plus graph memcpy and
+memset nodes are bound by the full canonical name/geometry/resource multiset
+hash and must match across all captures. Do not require
+`CUPTI_ACTIVITY_KIND_GRAPH_TRACE`: Nsight node mode intentionally omits
+whole-graph activity. vLLM uses the
 mandated Torch profiler because nsys breaks its EngineCore on this host; its
 raw trace, selected hash, exact command/corpus/workload and clean decode-window
 family counts must be independently recomputed rather than trusted from the
@@ -422,6 +453,7 @@ ROOT="$HOME/work/vllm.cpp-executed-path-refresh/$SHA"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 scripts/dgx-online-serving.sh --trace-only --model 27 \
@@ -452,7 +484,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d exact target-build/dispatch preflight, lossless collector + exact plan/workload/graph/vLLM validation pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d exact target-build/dispatch preflight plus dormant-workload/bounded-four-replay design frozen; harness/schema implementation pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

@@ -120,6 +120,12 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 | `CLAIM-KV-DEVICE-1` | `KV-DEVICE-RESIDENCY` | root | main worktree `/home/mudler/_git/vllm.cpp`; W0/W1 evidence under `~/work/vllm.cpp-kv-device`; current oracle evidence `~/work/vllm.cpp-online-gate/evidence/b5c6e4fd65cdacea8f378e18ae101ebf521e8f01` | `main` | W0/W1 ownership/indexed-state implementation and open teardown; W2 direct convolution update remains scoped but unclaimed until post-FP4 evidence re-ranks it | `ACTIVE` | 2026-07-12 (W0/W1 component A/Bs remain 1.021239×/1.006246× and access/correctness green; inherited pools fail zero-leak. Clean `b5c6e4f` confirms FP4 selection W3 first; no device-residency W2 implementation is inferred yet) |
 | `CLAIM-BACKEND-ABI-W0-GPU-1` | `BACKEND-ABI-VT` (`W0-GPU`) | root, surfaced by fresh serving-gate CUDA build | local `/home/mudler/_git/vllm.cpp-backend-abi-gpu-fix`; DGX `~/work/vllm.cpp-online-{src,build}` | `codex/backend-abi-w0-gpu` | exact GCC13/CUDA build blocker in `tests/vt/test_dropin_abi.cpp`; CUDA cross-build/runtime/capture evidence for additive W0; owning matrix/roadmap/ledger/state. No ABI or production-kernel redesign | `ACTIVE` | 2026-07-11 (branch `1141b79`: exact clean CUDA 13.0.88/sm_121a all-target rebuild reached 100%; lock-held focused CUDA/ABI CTest 2/2, compute-sanitizer 9/9 cases + 196/196 assertions with 0 errors/leaks, and 35B/27B model gates 2/2 pass. Evidence `~/work/vllm.cpp-online-build/w0-gpu-1141b79`, manifest SHA-256 `4adbe952…601`. Remaining W0: sm_80/sm_90a cross-builds and unchanged-trace/model A/B-memory proof; no runtime source changed) |
 
+`CLAIM-SERVE-GATE-1` H1d design is now frozen before implementation: exact
+workload dormant, then four trace-only warmed graph replays with exact runtime
+child correlation. The claim continues to own only the diagnostic controller,
+harness/schema and resulting paired traces; no W3-H2 kernel code or GPU run is
+authorized by this design checkpoint.
+
 ## Handoff queue
 
 | Priority | Row/block | Dependency | Next handoff | State |

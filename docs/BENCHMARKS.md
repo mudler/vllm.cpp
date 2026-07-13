@@ -720,7 +720,13 @@ closed on plan semantics, graph-launch/workload reconciliation, complete
 primary-node identity/geometry, distinct capture linkage and recomputed
 vLLM-trace structure.
 
-Next: harden the collector/validator and run immutable H1d. It must be lossless,
+Next: implement the frozen H1d collector/validator and run it immutably. Each
+server completes the exact c16 16-warmup/48-measured workload with collection
+dormant, then captures exactly four subsequent warmed graph replays through
+`cudaProfilerApi`. Every KERNEL/MEMCPY/MEMSET graph child must correlate by
+exact ID to one of four runtime `cudaGraphLaunch*` rows; the 4,428 primary
+kernel rows and full node-resource multiset must agree across all three
+captures. Probe timing is structural-only and cannot bind. H1d must be lossless,
 frozen-map exact, launch/workload-reconciled and window-separable before W3-H2.
 Only a later 48/48 same-binary component permits the exact grid; every 27B axis
 must pass before 35B performance or broader roadmap work including DSpark.
@@ -734,6 +740,7 @@ ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 export VT_FP4_PERSISTENT_CACHE=1

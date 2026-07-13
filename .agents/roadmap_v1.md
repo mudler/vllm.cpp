@@ -15,6 +15,13 @@ operational and T1/T2 portfolio. Detailed status lives in the area matrices;
 active ownership lives in `coordination.md`; closed execution blocks live under
 `completed/`.
 
+**Current order-0 substage (2026-07-13):** H1d's design is frozen before code:
+pre-GPU target-build provenance, the exact c16 workload with collection
+dormant, then exactly four warmed diagnostic graph replays per process under
+`cudaProfilerApi`, with exact runtime-child correlation and schema-v2 evidence.
+Harness implementation and all GPU execution remain pending; `3f256ab` still
+binds at 55/124 and no speed credit follows.
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live

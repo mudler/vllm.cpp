@@ -214,8 +214,10 @@ OpenAI-compatible server.
 > trace ran naive/WMMA fallback kernels instead of the frozen 64-plan path.
 > That explains why the retained process log contains no plan lifecycle or
 > selection records. H1d must fail before GPU work unless the exact CUTLASS
-> compile/runtime path is proven, then repair trace collection and semantic
-> plan/workload validation. No speed credit, exact grid or 35B performance is
+> compile/runtime path is proven. Its frozen design then keeps the exact
+> 16-warmup/48-measured workload outside collection and captures only four
+> subsequent warmed graph replays with exact runtime-child correlation; the
+> controller/harness is not implemented yet. No speed credit, exact grid or 35B performance is
 > accepted.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
@@ -524,8 +526,8 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   CMake had also disabled CUTLASS, so the trace used naive/WMMA FP4 GEMMs and
   its process log necessarily had no frozen-plan lifecycle. Implementation
   remains prohibited and no speed credit is claimed. H1d must hard-gate the
-  target build path, make collection lossless and enforce plan/workload
-  semantics before residual ranking.
+  target build path; its dormant-workload/four-replay design is frozen and its
+  controller plus schema-v2 semantic validator remain pending implementation.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.

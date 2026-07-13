@@ -6762,3 +6762,37 @@ pre-GPU build contract: hash the exact external CUTLASS tree; require sm_121a,
 then require target CUTLASS FP4 kernels and zero naive/WMMA production fallback
 in every accepted trace. Only after that preflight may lossless trace and exact
 plan/workload/graph/capture/vLLM semantic validation consume GPU time.
+
+## 2026-07-13 — H1d bounded four-replay design frozen before implementation
+
+The lossless replacement is now specified. Each of three independent local
+server processes starts under dormant Nsight `cudaProfilerApi` collection,
+proves the target CUTLASS build and exact read-only 64-plan lifecycle, then
+completes the ordinary c16 **16 warmups + 48 measured requests** outside the
+capture range. Only afterward an explicitly enabled trace-only controller arms
+a separate warmed c16 probe and captures exactly four `ReplayGraph` calls.
+The controller starts immediately before replay 1, synchronizes after replay
+4, then stops the profiler. Probe synchronization/timing is structural-only
+and can never bind performance.
+
+The frozen command uses `--capture-range=cudaProfilerApi`,
+`--capture-range-end=stop`, stop-time flushing, zero periodic flush interval,
+`--cuda-graph-trace=node:host-only`, disabled CUDA-event tracing, no CPU
+sampling/context switches and `--kill=none`. The target is **4 x 1,107 =
+4,428** primary kernel rows per process instead of H1c's 575,473 graph-node
+rows. Every graph-child KERNEL, MEMCPY and MEMSET row must correlate by exact
+`correlationId` to one of exactly four successful runtime
+`cudaGraphLaunch*` rows; no whole-graph table or timestamp fallback is allowed.
+All 1,107 kernel nodes, the remaining memcpy/memset nodes and their complete
+name/geometry/resource multiset must replay four times and hash identically
+across all three captures.
+
+The control seam is diagnostic-build-only:
+`VLLM_CPP_BENCH_PROFILE_CONTROL=ON`, server
+`--cuda-profile-graph-replays 4`, and SIGUSR2 whose handler only sets
+`sig_atomic_t`; default production builds retain no replay observer. H1d also
+requires schema version 2, parsed prepared/complete/warmup and exact 64-line
+selected-plan SHA `f2d9be7f…1fa4`, distinct report/SQLite identities and command
+linkage, and independent vLLM raw-trace validation. This checkpoint freezes
+design only: no code, GPU command, accepted trace, ratio or speed credit exists;
+`3f256ab` remains **55/124 pass, 69 fail**.

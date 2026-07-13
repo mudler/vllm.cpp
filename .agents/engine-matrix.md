@@ -13,6 +13,11 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
+Current `SERVE-GATE-ONLINE` H1d substage: the owning W3-H spike now freezes a
+pre-GPU CUTLASS build contract plus a dormant exact workload followed by four
+structural-only graph replays with exact `cudaGraphLaunch` child correlation.
+The controller/schema is not implemented and no gate state or ratio changes.
+
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Engine and scheduling | 14 | 3 | 3 | 0 | 1 | 0 | 2 | 5 |

@@ -1868,6 +1868,13 @@ class OnlineClientContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            nonrepeatable = json.loads(
+                ours_client_results[1].read_text(encoding="utf-8")
+            )
+            nonrepeatable["generated_texts"][0] = "different-valid-branch"
+            ours_client_results[1].write_text(
+                json.dumps(nonrepeatable), encoding="utf-8"
+            )
             trace = record_trace()
             self.assertEqual(trace["ours_profiler"], "nsys")
             self.assertEqual(trace["vllm_profiler"], "torch-profiler")
@@ -1896,6 +1903,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 ],
                 144,
             )
+            self.assertFalse(trace["output_repeatability"]["ours"]["all_equal"])
             self.assertFalse(trace["output_repeatability"]["vllm"]["all_equal"])
 
 

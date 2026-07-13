@@ -8,11 +8,13 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-13**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The latest schema-v5 DGX run at clean `a7f67c7` is **FAILED / VOID**. All four
-session-1 reports pass export, exact reconciliation, and kernel summary.
-Session 2 emits four reports and the exact stop marker, but the driver checks
-before Nsight forwards that marker to its log. The bounded-wait repair is
-CPU-gated; a fresh immutable 12-report DGX run is pending. No speed number
+The latest schema-v5 DGX run at clean `c498a413` is **FAILED / VOID pending
+status revalidation**. Exact build and 27B correctness pass; three independent
+local sessions complete 48/48 + 16/16 requests and all 12 lossless reports;
+the paired vLLM trace also completes. Final status creation then rejects
+unequal local output digests, contradicting the owning contract that records
+production-default batch invariance diagnostically after the mandatory model
+gate. The corrected validator and regression are CPU-green. No speed number
 changed.
 
 ## Binding 27B online gate
@@ -60,7 +62,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
-| W3-H1d complete trace | **ACTIVE — CPU PASS / DGX PENDING** | Clean `a7f67c7` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, both session-1 clients, and all 4/4 report exports/validations/summaries. Session 2 completes 48/48 + 16/16 and emits 4 raw reports plus the exact stop marker, but the immediate check races asynchronous log forwarding; the bounded, server-liveness-aware wait and regression contract are green | Run all 12 reports plus the paired vLLM trace from a new pushed SHA/root; any counter, topology, diagnostic, identity, summary, or lifecycle drift still fails closed before W3-H2 |
+| W3-H1d complete trace | **ACTIVE — ARTIFACTS COMPLETE / STATUS PENDING** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, all three 48/48 + 16/16 local sessions, all 12 lossless report exports/validations/summaries, and the paired vLLM trace. The final status file is absent because diagnostic output-repeatability was incorrectly fatal; the corrected contract is CPU-green | Revalidate the immutable artifacts with the pushed corrected validator. Any counter, topology, diagnostic, identity, summary, or lifecycle drift still fails closed before W3-H2 |
 | W3-H2 vectorized BF16→FP4 I/O | **PENDING / NOT IMPLEMENTED** | The scalar implementation remains active; retained traces are diagnostic only | Implement only if W3-H1d produces complete lossless evidence and still selects this residual |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
@@ -69,14 +71,15 @@ authorized until all 124 27B axes pass.
 | Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
 
 The current failed trace root is
-`~/work/vllm.cpp-executed-path-refresh-h1d/a7f67c75fa76f89e5da993f77c5d118bcb3bd55b`.
-Session 1 is complete and accepted as one diagnostic group. Session 2 completes
-both clients and generates four raw reports; its exact stop marker appears in
-the final log, but after the one-shot check fails. The root is incomplete and
-therefore VOID. The repair polls that unchanged marker for at most 60 seconds
-while requiring the server to remain live. Superseded attempt roots and hashes
-remain only in the [parity ledger](../.agents/parity-ledger.md) and
-[state log](../.agents/state.md).
+`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
+It contains three distinct Nsight sessions and 12/12 lossless single-replay
+reports, each with the exact 1,107-node graph and zero eager work, plus the
+paired vLLM trace. The three local semantic output-array digests differ; the
+model gate still passes and the gate spec explicitly keeps batch-invariance
+digests diagnostic. Until the corrected validator creates and validates final
+status, the root remains VOID and no retained kernel time is accepted.
+Superseded attempts and detailed hashes remain only in the
+[parity ledger](../.agents/parity-ledger.md) and [state log](../.agents/state.md).
 
 The exact calibration evidence is
 `~/work/vllm.cpp-nsys-calibration/0d56a238b8bec12435666cb77f32d8d6001425b20a97dfc5bc242bd75742739b`;
@@ -125,10 +128,12 @@ test "$rc" -eq 1
 sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ```
 
-## Reproduce the pending schema-v5 W3-H1d gate
+## Reproduce the pending schema-v5 W3-H1d status
 
-Use a clean pushed schema-v5 SHA and a new SHA-owned root. Never append to the
-failed `a7f67c7` root.
+Immediate work revalidates the complete `c498a413` artifacts without rerunning
+or changing the engine. If any artifact cannot satisfy the corrected status
+contract, use a clean pushed SHA and a new SHA-owned root with the full command
+below; never append a new execution to `c498a413`.
 
 ```sh
 set -euo pipefail

@@ -1,9 +1,9 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — schema-v5 `a7f67c7` is FAILED / VOID on a repaired
-stop-marker log-forwarding race after one complete four-report group; the
-bounded liveness-aware wait is CPU-green, fresh immutable 12-report DGX
-evidence is next, and W3-H2 remains prohibited**
+Status: **ACTIVE — schema-v5 `c498a413` has complete exact-build,
+correctness, 12-report local, and paired-vLLM artifacts but remains VOID until
+final-status revalidation under the corrected diagnostic-repeatability
+contract; W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -26,16 +26,25 @@ target/profiler exit, and four isolated graph-replay ranges. Superseded attempt
 roots, hashes, and forensics live only in `.agents/state.md` and
 `.agents/parity-ledger.md`.
 
-Clean pushed `a7f67c75fa76f89e5da993f77c5d118bcb3bd55b` passes exact
-**154/154** build, 27B **1/1** correctness, frozen plans with zero
-tuning/misses, and session 1's ordinary **48/48** plus probe **16/16** clients.
-All four session-1 reports export, validate, and summarize under schema v5.
-Session 2 completes ordinary **48/48** and probe **16/16**, and emits four raw
-reports plus the exact `stopped captured_replays=4` marker. The one-shot driver
-check runs before Nsight forwards that marker to its log, so the run stops
-before session-2 export, session 3, or vLLM. The immutable root is
-`~/work/vllm.cpp-executed-path-refresh-h1d/a7f67c75fa76f89e5da993f77c5d118bcb3bd55b`;
-it is **VOID**, changes no ratio, and is never reused.
+Clean pushed `c498a4131af7e6cf0ac678841212af80f4f12d53` passes exact
+**154/154** build, 27B **1/1** correctness, and frozen plans with zero
+tuning/misses. Three independent sessions each complete ordinary **48/48** and
+probe **16/16** clients. All **12/12** reports export, validate, and summarize
+losslessly: each contains one 1,107-node graph replay and zero eager work. The
+paired vLLM trace also completes with 1,588 clean decode windows. The immutable
+root is
+`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
+
+Final status creation rejected unequal generated-text-array digests across the
+three local scheduling shapes. That check contradicted this gate's existing
+contract: after the mandatory token-exact model gate passes, production-default
+batch invariance remains visible as a diagnostic and does not void otherwise
+complete exact-count evidence. The validator now records the exact digests and
+`all_equal` state without making them fatal; all artifact, identity, topology,
+counter, zero-eager, plan, profile, and lifecycle checks still fail closed.
+Focused client/summary/trace contracts pass **31/31**. Until the immutable
+artifacts create and pass corrected final status, the root remains **VOID**, no
+kernel timing or residual ranking is accepted, and no performance ratio changes.
 
 Schema v5 remains version-bound and fail-closed. The committed
 [calibration probe](../../tools/bench/nsys_cuda_profiler_probe.cu) establishes
@@ -43,9 +52,8 @@ that pinned Nsight 2025.3.2.474 can emit the exact capture-boundary diagnostic
 despite complete bounded activity, while a full-process trace is clean. The
 validator accepts it only with exact runtime, synchronization, completion,
 event-counter, graph-family/topology, zero-eager, and cross-report
-reconciliation. The repair polls the unchanged exact stop marker for at most
-60 seconds while requiring the server to remain live; focused
-client/summary/trace contracts pass **31/31**.
+reconciliation. The driver also polls the unchanged exact stop marker for at
+most 60 seconds while requiring the server to remain live.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -503,7 +511,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v5 `a7f67c7` closes one complete four-report group but is VOID on a repaired stop-marker log-forwarding race in session 2. Focused contracts pass 31/31. Execute a fresh immutable 3-session × 4-report gate plus paired vLLM trace; W3-H2 remains prohibited** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v5 `c498a413` completes exact build/correctness, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. It remains VOID pending final-status revalidation under the corrected diagnostic-repeatability contract. No GPU rerun, timing acceptance, residual ranking, or W3-H2 is authorized yet** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

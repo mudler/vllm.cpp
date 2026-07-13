@@ -61,6 +61,12 @@ and continue. Follow this protocol every session.
      checkpoint with accepted comparable numbers or an explicit
      `PENDING`/`NOT APPLICABLE`/`FAILED`/`VOID` result and next reproduction
      recipe; partial evidence never becomes a public ratio;
+   - all live status surfaces remain **current-state snapshots**: replace the
+     prior checkpoint instead of appending chronology, and compact any
+     accumulated superseded narratives to the binding result, exact present
+     evidence/caveat, and next action. Detailed attempt history belongs only in
+     append-only `state.md` / `parity-ledger.md`, Git, or an era-closed
+     `completed/` document; never rewrite old append-only entries;
    - [state.md](state.md) entry appended (what landed, what's next);
    - commit + push to `main` (user-authorized, for now).
 

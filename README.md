@@ -9,12 +9,15 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The latest W3-H DGX trace (`a7f67c7`) is **VOID**: all four session-1
-> reports pass schema-v5 export, validation, and summary, but session 2 races
-> the asynchronously forwarded exact stop marker before export. A bounded,
-> liveness-aware wait is repaired and CPU-green; a fresh immutable 12-report
-> DGX gate is pending. No W3-H speed credit or 35B performance result is
-> claimed. See
+> The latest W3-H DGX trace (`c498a413`) is **VOID pending status
+> revalidation**: exact build and 27B correctness pass, all three local
+> sessions complete 48/48 + 16/16 requests and all 12 schema-v5 reports, and
+> the paired vLLM trace completes. Final status creation then rejects unequal
+> local output digests even though the owning gate contract classifies
+> production-default batch invariance as diagnostic. That validator mismatch
+> is repaired and CPU-green; the complete immutable artifacts must be
+> revalidated before residual ranking. No W3-H speed credit or 35B
+> performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -22,10 +25,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the repaired W3-H trace, gate the selected repair, then rerun all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Revalidate and rank the completed W3-H trace, gate the selected repair, then rerun all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | `a7f67c7` passes build, 27B correctness, and all four session-1 report exports/validations/summaries. Session 2 emits its four reports and exact stop marker, but the immediate driver check races log forwarding. The bounded-wait repair is CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
+| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | `c498a413` passes exact build, 27B correctness, three 48/48 + 16/16 local sessions, all 12 lossless report validations, and the paired vLLM trace. Final status is absent because a validator incorrectly made diagnostic batch invariance fatal; the corrected contract is CPU-green | Revalidate the complete immutable artifacts under the pushed corrected validator; W3-H2 stays prohibited until status and residual ranking pass |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -54,7 +57,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Direct swizzled activation scales | Correctness and trace pass; component **FAILED** at 39/40 timing + 1/8 memory axes, so no independent speed credit |
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
-| Vectorized normal BF16→FP4 I/O | Not implemented. A complete repaired W3-H1d trace is the active prerequisite |
+| Vectorized normal BF16→FP4 I/O | Not implemented. Valid status and residual ranking from the complete `c498a413` W3-H1d artifacts are the active prerequisite |
 
 ## What is implemented
 
@@ -124,7 +127,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the schema-v5 stop-marker wait repair is CPU-green and a fresh DGX trace is pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; `c498a413` completed the paired schema-v5 trace artifacts but final status revalidation is pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -151,7 +154,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; `a7f67c7` is void on a repaired trace stop-marker race and no speed credit is claimed |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; `c498a413` completed all paired trace artifacts but is void pending corrected final-status revalidation, so no speed credit is claimed |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -174,7 +177,7 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: repaired, complete W3-H trace → selected component
+The next execution order is fixed: revalidate and rank the complete W3-H trace → selected component
 gate → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.

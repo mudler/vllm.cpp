@@ -7413,3 +7413,52 @@ checkpoint; detailed attempt evidence remains here and in the parity ledger.
 Immutable `3f256ab` remains **55/124 pass, 69 fail**. A fresh pushed SHA and
 immutable 12-report root are required before W3-H2, the exact grid, or 35B
 performance.
+
+## 2026-07-13 — complete schema-v5 H1d artifacts expose a repeatability-policy contradiction
+
+Clean pushed `c498a4131af7e6cf0ac678841212af80f4f12d53` executed from
+immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
+Plan-first setup passed with manifest SHA
+`562feeac7de997e96a78bbce5954906926108bba6df7bd264a0b7f04b00f8fcf`.
+The exact GCC 13.3 / CUDA 13.0.88 / sm_121a / external-CUTLASS / FA2 /
+vendored-Triton-AOT / RelWithDebInfo build completed **154/154** with build-log
+SHA `9784747fde6fcedb0b61d63547d1cade0d683a74721ad99fdd60e0755f59f198`.
+The mandatory 27B token gate passed **1/1 in 17.34 s** with gate-log SHA
+`a89bef6d…e595`; frozen plans loaded with zero tuning or misses.
+
+All three independent local sessions completed. Ordinary clients were
+**48/48 in 66.1656 / 66.1146 / 65.8461 s**; diagnostic probes were **16/16
+in 26.1565 / 26.1870 / 25.9942 s**. Session 2 reproduced the bounded
+stop-marker repair. All **12/12** reports exported, validated, and summarized
+losslessly. Each has one 1,107-node graph replay, 1,107 kernels + 7 memcpys +
+1 memset, and zero eager work. The reports / SQLite / validations / summaries /
+profile-log aggregate digests are `75b25ae3…3de8` / `a97d9d22…886e` /
+`4a5ada88…981c` / `1c351e7f…5728` / `d783eef1…455c`; all three capture UUIDs
+are distinct. The paired vLLM 0.25.0 trace completed **1,588** clean decode
+windows. Its torch-trace / metadata / kernel-summary SHA are
+`6a312b08…018f` / `13f43fe2…4767` / `3f4ef158…6bc`.
+
+Final `record-trace-status` returned 2 before writing status because the three
+local generated-text-array digests differ:
+`3113a6cc…a1c3`, `51ec2936…a74`, and `d447cb17…7fa`. This exposed a policy
+contradiction in the harness, not an engine speed result. The owning online-gate
+spec already says exact repeatability counts and digests remain diagnostic
+after the mandatory correctness precondition; vLLM repeatability was likewise
+recorded but non-fatal. The validator now retains the exact local digests and
+`all_equal` flag without rejecting them. All artifact, plan, identity,
+topology, counter, zero-eager, profile, and lifecycle checks remain strict.
+A regression mutates one otherwise valid local generated-text array and proves
+status records `all_equal=false`.
+
+Focused client/summary/trace contracts pass **31/31**. The CUDA-off build
+passes; the known timing-sensitive C API early-stop case failed twice only in
+full-suite order, passed three isolated repetitions, and the final
+`--repeat until-pass:3` full run closed **106/106**. The immutable DGX root
+remains **VOID** until the corrected pushed validator revalidates it and writes
+final status. No GPU rerun, accepted kernel timing, residual ranking, speed
+credit, exact grid, or 35B command follows yet. GPU, lock, and ports are idle;
+binding `3f256ab` remains **55/124 pass, 69 fail**. Live README, BENCHMARKS,
+roadmap, matrices, coordination, environment, inventory, and feature specs now
+show only this current snapshot; older attempt narratives remain here and in
+the append-only ledger.

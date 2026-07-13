@@ -6545,3 +6545,43 @@ or memory observations are non-binding until the driver emits a complete
 summary and selection summary. Only **40/40 timing + 8/8 memory** authorizes
 W3-G6. Until then immutable `3f256ab` remains **55/124 pass, 69 fail**, and no
 exact vLLM grid or 35B performance command is authorized.
+
+## 2026-07-13 — W3-G frozen component completes; strict gate fails, scan resumes
+
+The immutable `ae9e8ff0576badabdda7289beeacaa1041c55d21` FA2-default versus
+`VT_FA2_DECODE=0` component completed under its one uninterrupted lock. Both
+model arms first passed **235/235 assertions + 16/16 token-exact**. All
+**12/12** timing legs, **612/612** requests, **626,688** input tokens,
+**78,336** output tokens, **12/12** memory returns and **24/24** cache drops
+pass. All processes load the same 64/64 plan map with zero tuning, and every
+paired repetition retains 64/64 tactic IDs.
+
+At c2, FA2/fallback total throughput is
+**154.631341055994/151.946734064979 = 1.017668079591×**, with **18/20 timing +
+3/4 memory**. Mean TTFT (**775.754/729.211 ms**, 0.940004×), median TTFT
+(**802.446/754.901 ms**, 0.940749×), and available-memory drop
+(**64,804,016/64,690,109 KiB**, 0.998242×) fail. At c16, throughput is
+**818.565304954761/813.240309545080 = 1.006547874407×**, with **17/20 timing +
+2/4 memory**. Median TTFT (0.997531×), p90 TTFT (0.998237×), p99 ITL
+(0.998198×), available-memory drop (0.996254×), and sampled GPU memory
+(**37,890/37,650.333 MiB**, 0.993675×) fail. Total-throughput CVs are
+0.2630%/0.0758% at c2 and 0.1169%/0.2890% at c16.
+
+Combined acceptance is **FAILED at 35/40 timing + 5/8 memory**. W3-G earns no
+speed credit. W3-G6, the exact vLLM grid, did not run and is prohibited; 35B
+performance remains prohibited. Immutable `3f256ab` stays binding at
+**55/124 pass, 69 fail**. GPU, `/tmp/gpu` and serving ports exit idle.
+
+Evidence root:
+`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/component-ab-c2-c16-fa2-vs-fallback`.
+Summary/selection/driver/driver-log/provenance SHA-256 values are
+`e53bb60f...5a0` / `627c30ec...cff` / `04cc3d63...66c` /
+`77f3271f...f8` / `e2532677...3f1`; the 190-file aggregate tree is
+`d045d4d3...8a8`.
+
+Next: preserve the correctness-faithful W3-G route and fallback without speed
+credit, then resume the required matched ours/vLLM executed-path scan.
+Vectorized normal BF16→FP4 production is the leading unstacked candidate from
+the prior source audit, but it must be reverified in fresh traces and receive a
+complete spike before any implementation. No candidate may be stacked onto the
+failed component.

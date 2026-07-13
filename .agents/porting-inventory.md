@@ -178,7 +178,7 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124** and W3-E strict-fails. W3-C installs exact plans before warmup and completes frozen-plan reproduction control. W3-F implements and gates device alpha plus the zero-versus-3,536-stage trace, but its strict c2/c16 component fails **27/40 timing + 3/8 memory** and earns no credit. The completed multi-lens scan selects the separate W3-G FA2 ratio-6 decode repair and ranks vectorized normal BF16→FP4 production second; neither has a new benchmark result. No exact grid/35B performance is authorized. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md), [W3-F spike](specs/nvfp4-device-alpha.md) and [W3-G spike](specs/fa2-gqa-split-kv-decode.md) |
+| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124**. W3-C installs exact plans before warmup and completes frozen-plan reproduction control. W3-E and W3-F strict-fail. Separate W3-G FA2 ratio-6 decode passes correctness/structure and reaches **1.017668×/1.006548×** c2/c16 mean total throughput, but strict-fails **35/40 timing + 5/8 memory** and earns no credit. Vectorized normal BF16→FP4 production is now the leading unstacked candidate pending fresh executed-path verification and a complete spike. No exact grid/35B performance is authorized. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md), [W3-F spike](specs/nvfp4-device-alpha.md) and [W3-G spike](specs/fa2-gqa-split-kv-decode.md) |
 | **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. The llama.cpp-derived CPU threadpool/chunked-op prerequisite is implemented and correctness-gated (1/3/20 full suites + TSAN), but its B4 speed/RSS gate is pending. All weights still expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
@@ -462,9 +462,10 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     between **240 main+combine / 0 old** and **0 decode combine / 240 old**;
     both preserve 3,536 FP4 GEMMs/producers and all 64 plans. The short prompt
     is performance-negative (**3.246400/1.395488 ms**) and non-binding. The
-    c2/c16 every-axis A/B is `ACTIVE` under one uninterrupted lock from
-    immutable `ae9e8ff`; both model arms passed before timing and every partial
-    leg remains non-binding under the [W3-G
+    completed frozen c2/c16 component covers all 12 legs and 612 requests,
+    reaches **1.017668×/1.006548×** mean total throughput, and strict-fails
+    **35/40 timing + 5/8 memory**. W3-G earns no speed credit and no exact grid
+    or 35B performance run follows under the [W3-G
     spike](specs/fa2-gqa-split-kv-decode.md).
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common

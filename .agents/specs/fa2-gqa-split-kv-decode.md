@@ -1,15 +1,15 @@
 # W3-G — FlashAttention-2 GQA split-KV decode
 
-Status: **ACTIVE/GATING** on 2026-07-13. W3-G1--G4 are complete at immutable
-`ae9e8ff`: clean sm_121a build, CUDA operator/capture/lifecycle, strict
-zero-error/zero-leak memcheck, both frozen-plan 27B arms, correctness-only 35B
-and paired node-trace gates pass. The short-prompt trace is performance-negative
-and non-binding. W3-G5's input-1,024 c2/c16 **40 timing + 8 memory** component
-started at `2026-07-13T10:44:49Z` under driver SHA `04cc3d63…66c` and one
-uninterrupted `/tmp/gpu` lock. Both model arms passed **235/235 + 16/16** before
-timing; partial legs remain non-binding, so there is no speed credit yet. The
-binding 27B result remains
-immutable `3f256ab` at **55/124 pass, 69 fail**.
+Status: **ACTIVE/GATING; PERFORMANCE FAILED** on 2026-07-13. W3-G1--G4 are
+complete at immutable `ae9e8ff`: clean sm_121a build, CUDA
+operator/capture/lifecycle, strict zero-error/zero-leak memcheck, both
+frozen-plan 27B arms, correctness-only 35B and paired node-trace gates pass.
+W3-G5's completed input-1,024 c2/c16 component reaches
+**1.017668×/1.006548×** mean total throughput but strict-fails at
+**35/40 timing + 5/8 memory**. All 12 legs, 612 requests, memory returns, cache
+drops and frozen-plan checks pass. W3-G earns no speed credit; W3-G6 was not run
+and is prohibited. The binding 27B result remains immutable `3f256ab` at
+**55/124 pass, 69 fail**.
 
 ## Scope
 
@@ -123,7 +123,7 @@ fork or rewrite the tuned kernel.
 | Tensor transpose/temporary output | same adapter | Prefer the dependency's supported independent Q/O strides to present the exact logical `[B,G,Hkv,D]` view directly over `[B,Hkv,G,D]`. This removes two layout copies but preserves the same indexing. Tests must compare it against an explicit host transpose/scatter reference; if any vendored kernel path assumes contiguity despite the ABI, use explicit capture-safe pack/unpack buffers instead. |
 | F32 final/partial LSE and output accumulators | same adapter plus `src/vt/cuda/cuda_flash_attn_fa2_internal.h` and `src/vt/cuda/cuda_backend.cu` if a lifecycle hook is required | Key stable storage by device, stream, padded batch and block-table columns. Cold eager execution allocates; capture/replay only reuses. DestroyQueue releases every allocation after synchronization. Never free/regrow storage referenced by another live graph. |
 | `run_mha_fwd_splitkv_dispatch<bf16,256,false>` | existing vendored instantiations and adapter | Reuse the exact compiled FA2 main/combine implementation. Pure decode is non-causal after the swap, as upstream specifies; all logical queries still represent one time position. |
-| vLLM toggle/config behavior | model + CUDA dispatch | `VT_FA2_DECODE=0` is a diagnostic same-binary fallback. Default-on behavior is allowed only after correctness, trace and every-axis gates pass; until then the implementation checkpoint remains `ACTIVE/GATING`. |
+| vLLM toggle/config behavior | model + CUDA dispatch | `VT_FA2_DECODE=0` is the exact same-binary fallback. The correctness-faithful default route remains implemented, but a failed every-axis component earns no speed credit, does not remove the fallback and cannot authorize the exact grid. |
 
 The adapter must not use one grow-and-free global buffer: another captured graph
 size could retain its old pointer. It also must not derive capture geometry from
@@ -276,6 +276,19 @@ Its prompt is only eight tokens, unlike G4's input-1,024 workload. G4 remains
 authorized because G3 is structural, but it must fail closed on any of the 48
 component axes.
 
+G4 completed under one uninterrupted lock with driver SHA-256
+`04cc3d63...66c`. All **12/12** legs, **612/612** requests, **626,688** input
+tokens, **78,336** output tokens, **12/12** memory returns and **24/24** cache
+drops pass; all processes retain the same 64-plan map. FA2/fallback mean total
+throughput is **154.631341/151.946734 = 1.017668×** at c2 and
+**818.565305/813.240310 = 1.006548×** at c16. c2 passes **18/20 timing + 3/4
+memory**, failing mean/median TTFT and available-memory drop. c16 passes
+**17/20 + 2/4**, failing median/p90 TTFT, p99 ITL, available-memory drop and
+sampled GPU memory. Combined **35/40 + 5/8** fails strict acceptance. Summary
+and selection SHA-256 values are `e53bb60f...5a0` / `627c30ec...cff`; the
+190-file evidence tree hashes to `d045d4d3...8a8`. G5 receives no speed credit,
+so G6 is not authorized.
+
 Evidence root:
 `~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence`.
 Operator/memcheck/default-27/fallback-27/35B log SHA-256 values are
@@ -309,8 +322,8 @@ this checkpoint.
 | W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | **COMPLETE:** exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path pass both 27B arms; prefill and ratio-8 remain unchanged. |
 | W3-G3 | `tests/vt/test_ops_paged_attn.cpp` | **COMPLETE:** upstream fallback, ratio-6 B ladder, heuristic, toggle/window/ratio-8 fallback, capture/replay/capacity and two-queue lifecycle pass 20/20 + 454,323 and strict memcheck. |
 | W3-G4 | immutable DGX evidence only; same-change public/canonical status updates | **COMPLETE at `ae9e8ff`:** G0-G3 build/operator/sanitizer/model/inertness/trace closure passes; short trace performance is negative/non-binding. |
-| W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | **ACTIVE:** strict 40+8-axis component started from `ae9e8ff` under one lock after both model arms passed; partial legs remain non-binding. Either authorize G6 on 48/48 or record failure and rescan. |
-| W3-G6 | existing exact online gate/evidence; same-change public/canonical status updates | Conditional 27B c1-c32 vLLM grid. Only 124/124 permits 35B performance. |
+| W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | **COMPLETE / FAILED:** **1.017668×/1.006548×** c2/c16 mean total throughput, but only **35/40 timing + 5/8 memory** axes pass. Integrity gates pass; no speed credit. |
+| W3-G6 | existing exact online gate/evidence; same-change public/canonical status updates | **NOT RUN / PROHIBITED:** G5 did not pass 48/48. Immutable `3f256ab` remains binding; only a future accepted component may authorize another exact 27B grid, and only 124/124 permits 35B performance. |
 
 The work is intentionally serial because W3-G2 consumes W3-G1's ABI and W3-G4
 must freeze exactly one implementation. The vector FP4 producer and host-memory

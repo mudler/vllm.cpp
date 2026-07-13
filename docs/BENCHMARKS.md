@@ -29,10 +29,12 @@ frozen-plan c2/c16 component reaches 1.001967×/1.000144× total throughput but
 strict-fails at 27/40 timing + 3/8 memory, so no speed credit/exact grid follows
 and the completed multi-lens scan selects W3-G FA2 ratio-6 split-KV decode;
 the full cast-free BF16/capture/fallback/test/every-axis spike is accepted and
-immutable `ae9e8ff` now passes its clean sm_121a/operator/memcheck/model/paired-
-trace gates; its strict c2/c16 component is now `ACTIVE` under one whole-series
-lock after both model arms passed, while every new accepted performance number
-remains explicitly `PENDING` until the complete summary exists).
+immutable `ae9e8ff` passes its clean sm_121a/operator/memcheck/model/paired-trace
+gates; its completed c2/c16 component reaches **1.017668×/1.006548×** mean
+total throughput but strict-fails at **35/40 timing + 5/8 memory**, so it earns
+no speed credit and authorizes neither the exact vLLM grid nor 35B performance;
+immutable `3f256ab` therefore remains binding at **55/124** while a fresh
+executed-path scan revalidates the next candidate).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -212,8 +214,7 @@ ssh dgx.casa 'ROOT=~/work/vllm.cpp-nvfp4-device-alpha/7517af4f983fe322ac88ce2d98
 ```
 
 The current bounded checkpoint is **W3-G / GATING — IMMUTABLE CUDA,
-CORRECTNESS, SAFETY AND STRUCTURAL TRACE PASS; COMPONENT ACTIVE / RESULT
-PENDING**.
+CORRECTNESS, SAFETY AND STRUCTURAL TRACE PASS; COMPONENT PERFORMANCE FAILED**.
 Qwen3.6-27B uses Hq/Hkv
 24/4, ratio 6. Our optimized fused GQA decode is hard-coded to ratio 8, so the
 binding trace falls through to
@@ -268,21 +269,48 @@ the fixed FA2 LSE/partial-output scratch.
 The trace's tiny correctness prompt is deliberately not accepted as a speed
 number: FA2 main+combine totals **3.246400 ms** versus **1.395488 ms** for the
 fallback over 240 calls (**0.429857x** direction-normalized). Its sequence is
-far shorter than the binding input-1,024 workload, so it is a warning for the
-component, not a performance conclusion. The component
-must pass all **40/40 timing + 8/8 memory** axes before an exact vLLM grid may
-run. Evidence is under
-`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence`;
-operator/memcheck/default-27/fallback-27/35B logs hash to
-`15843743...e2b` / `de65e263...f802` / `dd30376b...e4e4` /
-`dd30376b...e4e4` / `4b18329b...eec8`, and the structural summary hashes to
-`c6e4c701...9649`. The first configure attempt remains **FAILED /
-ENVIRONMENT-INVALID** because noninteractive SSH omitted `/usr/local/cuda/bin`;
-the compiler-pinned fresh build above is binding. Read-only trace reproduction
-and the post-implementation handoff:
+far shorter than the binding input-1,024 workload, so it remains structural
+evidence rather than the component conclusion.
+
+The frozen cache-off input-1,024/output-128 AB/BA/AB component is complete from
+the same immutable binary under one uninterrupted lock. All **12/12** legs,
+**612/612** requests, **626,688** input tokens, **78,336** output tokens,
+**12/12** memory returns and **24/24** cache drops pass. Both model arms passed
+**235/235 + 16/16** first; every process loaded the same **64/64** tactic map
+with zero tuning, and every paired repetition retained 64/64 tactic IDs.
+
+- c2 FA2/fallback mean total throughput is
+  **154.631341/151.946734 = 1.017668×**, with **18/20 timing + 3/4 memory**.
+  FA2/fallback CV is **0.2630%/0.0758%**. Mean and median TTFT fail at
+  **0.940004×/0.940749×** direction-normalized; available-memory drop fails at
+  **0.998242×**. PSS, RSS and sampled GPU memory pass.
+- c16 FA2/fallback mean total throughput is
+  **818.565305/813.240310 = 1.006548×**, with **17/20 timing + 2/4 memory**.
+  FA2/fallback CV is **0.1169%/0.2890%**. Median TTFT, p90 TTFT and p99 ITL
+  fail at **0.997531×/0.998237×/0.998198×**; available-memory drop and sampled
+  GPU memory fail at **0.996254×/0.993675×**. PSS and RSS pass.
+
+Combined strict acceptance is therefore **FAILED: 35/40 timing + 5/8 memory**.
+The paired output-shape diagnostic remains **0/6**, but is not a correctness
+failure: every timed request produced the exact declared 128 native tokens and
+both commit-bound token-exact model gates passed. W3-G earns no speed credit;
+the exact vLLM grid and 35B performance were not run and remain prohibited.
+Immutable `3f256ab` remains the binding **55/124** result.
+
+Component evidence is under
+`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/component-ab-c2-c16-fa2-vs-fallback`.
+The summary/selection/driver/driver-log/provenance SHA-256 values are
+`e53bb60f...5a0` / `627c30ec...cff` / `04cc3d63...66c` /
+`77f3271f...f8` / `e2532677...3f1`; all 190 evidence files aggregate to tree
+hash `d045d4d3...8a8`. The wider evidence root retains operator/memcheck/model
+and structural evidence; the first configure attempt remains **FAILED /
+ENVIRONMENT-INVALID** because noninteractive SSH omitted `/usr/local/cuda/bin`,
+while the compiler-pinned fresh build above is binding. Read-only result/trace
+reproduction and the post-implementation handoff:
 
 ```sh
 ssh dgx.casa 'ROOT=~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/trace/27; sqlite3 -header -column "$ROOT/ours.sqlite" "SELECT s.value,COUNT(*),ROUND(SUM(k.end-k.start)/1e6,3),ROUND(AVG(k.end-k.start)/1e3,3) FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON s.id=k.demangledName WHERE instr(s.value,'\''PagedAttentionDecode'\'')>0 GROUP BY s.value;"; jq ".kernels[] | select((.name // \"\")|test(\"flash_fwd_splitkv\"))" "$ROOT/vllm-kernels.json"'
+ssh dgx.casa 'ROOT=~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/component-ab-c2-c16-fa2-vs-fallback; jq . "$ROOT/summary.json"; jq "{gate_pass,all_process_plan_maps_equal,all_process_metadata_equal,paired}" "$ROOT/selection-summary.json"; sha256sum "$ROOT/summary.json" "$ROOT/selection-summary.json" "$ROOT/driver.sh" "$ROOT/driver.log" "$ROOT/provenance.txt"'
 
 SHA=$(git rev-parse HEAD)
 BUILD="$HOME/work/vllm.cpp-fa2-decode/$SHA/build"
@@ -589,15 +617,14 @@ Read-only reproduction:
 ssh dgx.casa 'ROOT=~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45; jq . "$ROOT/summary.json"; jq "{gate_pass,all_process_plan_maps_equal,all_process_metadata_equal,paired}" "$ROOT/selection-summary.json"; sha256sum "$ROOT/summary.json" "$ROOT/selection-summary.json" "$ROOT/driver.sh" "$ROOT/driver.log" "$ROOT/provenance.txt"'
 ```
 
-Next: preserve W3-F without speed credit and freeze W3-G immutable `ae9e8ff`.
-Its operator/sanitizer/model/inertness/trace gates pass; the strict c2/c16
-same-binary **40 timing + 8 memory** component started at
-`2026-07-13T10:44:49Z` under driver SHA `04cc3d63…66c` and one uninterrupted
-`/tmp/gpu` lock. Both model arms passed **235/235 + 16/16** before timing.
-Partial legs are non-binding. The conditional exact
-grid remains blocked until every component axis passes. Every 27B throughput,
-latency and memory axis must pass before 35B performance; broader roadmap work,
-including DSpark, remains queued behind speed parity.
+Next: preserve W3-G's correctness/structural implementation without speed
+credit and resume the required executed-path scan. Vectorized normal BF16→FP4
+production is the leading unstacked candidate from the prior read-only audit,
+but must be reverified against fresh ours/vLLM traces and receive a complete
+committed spike before implementation. The conditional exact grid remains
+blocked. Every 27B throughput, latency and memory axis must pass before 35B
+performance; broader roadmap work, including DSpark, remains queued behind
+speed parity.
 Detailed release classification:
 [2026-07-12-702f481.md](../.agents/sync/2026-07-12-702f481.md).
 
@@ -606,13 +633,13 @@ Detailed release classification:
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; W3-G COMPONENT ACTIVE** | Immutable `3f256ab` remains **55/124**. W3-C passes frozen-map control; W3-E and W3-F strict-fail and earn no speed credit. W3-G immutable `ae9e8ff` passes clean sm_121a/operator/zero-error-zero-leak sanitizer, both 27B arms, correctness-only 35B and paired structural trace gates. The short trace is performance-negative and non-binding. Its input-1,024 c2/c16 **40 timing + 8 memory** run is active under one lock after both model arms passed; all partial legs remain `PENDING`/non-binding. No exact grid or 35B performance command ran. | Finish and classify the active component. Only 48/48 passing axes authorize the exact vLLM grid; 35B performance remains held. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; W3-G STRICT-FAILED** | Immutable `3f256ab` remains **55/124**. W3-C passes frozen-map control; W3-E, W3-F and W3-G strict-fail and earn no speed credit. W3-G's completed 12-leg/612-request component reaches **1.017668×/1.006548×** c2/c16 mean total throughput but only **35/40 timing + 5/8 memory** axes; model, lifecycle, cache-drop and frozen-plan integrity pass. No exact grid or 35B performance command ran. | Resume fresh executed-path scanning and spike the highest verified lever. Only a 48/48 component authorizes the exact vLLM grid; 35B performance remains held. |
 | `ENG-BATCH-INVARIANT` | **ROADMAP INVENTORY — NOT IMPLEMENTED / NOT APPLICABLE TO PRODUCTION SPEED FLOOR** | vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` off; its opt-in determinism suite changes NVFP4, matmul, norm, attention and collective dispatch. C3R executes only the default-off contrast and records 0/6 sequential-vs-c2 equality for both engines. vllm.cpp exposes no matching opt-in mode, so no support or performance result is claimed. | After production parity, write `specs/batch-invariant-execution.md`, port the upstream operator/e2e determinism cases and gate correctness separately from the default production performance path. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE / GATING — W3-F STRUCTURAL PASS; PERFORMANCE FAILED** | W3-C reproduction control is complete and W3-E remains failed at **39/40 timing + 1/8 memory**. W3-F supplies resident alpha and passes local/CUDA/memcheck/model/trace gates, but its component strict-fails **27/40 timing + 3/8 memory**; `3f256ab` remains 55/124. The closed scan ranks vectorized normal BF16→FP4 production second, behind W3-G, and no quant change is added now. | Keep the FP4 producer unstacked until W3-G is classified. Exact grid/35B performance remain held. |
-| `KERNEL-ATTN-FA2` ratio-6 split-KV decode | **GATING — CUDA/SAFETY/MODEL/STRUCTURAL PASS; PERFORMANCE RUN ACTIVE** | Immutable `ae9e8ff` passes **20/20 + 454,323** CUDA assertions, zero-error/zero-leak memcheck, both 27B arms and 35B correctness. Default/fallback traces switch exactly between **240 main+combine / 0 old** and **0 combine / 240 old**, while FP4 topology/plans are identical. The short trace is performance-negative (**3.246400/1.395488 ms**) and earns no credit. The frozen input-1,024 c2/c16 40+8 component is active under one whole-series lock after both model arms passed; partial legs are non-binding. Binding remains **22,893 / 8,793.238 ms** local versus unequal-window vLLM split main **23,616 / 7,061.921 ms** + combine **23,488 / 123.245 ms**. | Finish/classify all 48 axes; fail closed before the exact grid. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE / GATING — NEXT EXECUTED-PATH SCAN OPEN** | W3-C reproduction control is complete; W3-E and W3-F remain strict failures. W3-G also strict-fails, returning vectorized normal BF16→FP4 production to the top of the unstacked candidate list. Prior source inspection finds scalar 16-element group load/pack/store locally versus v0.25's 256-bit load, BF16x2 max, hardware packed E2M1 conversion and packed 64-bit store, but this is not yet fresh executed-path evidence or an accepted spike. | Reverify the producer in matched ours/vLLM nsys traces, inventory its whole dependency/test chain, then commit the spike before implementation. Exact grid/35B performance remain held. |
+| `KERNEL-ATTN-FA2` ratio-6 split-KV decode | **GATING — CORRECTNESS/STRUCTURE PASS; PERFORMANCE FAILED** | Immutable `ae9e8ff` passes **20/20 + 454,323** CUDA assertions, zero-error/zero-leak memcheck, both 27B arms and 35B correctness. Default/fallback traces switch exactly between **240 main+combine / 0 old** and **0 combine / 240 old**, while FP4 topology/plans are identical. The completed frozen c2/c16 component reaches **1.017668×/1.006548×** mean total throughput but strict-fails **35/40 timing + 5/8 memory**. All 12 legs, 612 requests, memory returns, cache drops and frozen plans pass; no exact grid follows. | Preserve the correctness-faithful route and fallback without speed credit; return to the executed-path scan. |
 | `KERNEL-EW-NORM-QUANT` | **PARTIAL — FALSE TRACE-NAME LEVER REFUTED** | vLLM's 127,040 long-named kernels stop after residual-add + RMSNorm to BF16; a separate `scaled_fp4_quant.out`/`cvt_fp16_to_fp4` follows, matching our two-kernel topology. `fuse_norm_quant` is false. Existing FP8 fusion remains gated and historical byte-exact/neutral `76e9047` stays shelved. | No spike/implementation is promoted from this trace. Revisit only if a future body/dispatch difference or surpass-track measurement justifies it independently. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `3f256ab` has c16 total throughput **1.027889×** but normalized mean TPOT/ITL **0.987450×**. Cross-profiler GDN totals remain diagnostic only; no new GDN lever is selected yet. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; revisit only after body-level residual ranking. Do not infer any 35B result. |
 | `KV-DEVICE-RESIDENCY` | **ACTIVE — W0+W1 A/B/TRACE/CORRECTNESS PASS; ZERO-LEAK FAIL** | W0/W1 same-binary gains, copy reduction and correctness/safety evidence remain valid. Inherited pools still fail strict teardown (27B **47,290,056 B/101**, 35B **36,822,413,188 B/1,236**); old-oracle host-memory ratios are historical. | Keep W2 scoped until the v0.25.0 grid re-ranks the residual; separately repair model/pool/queue teardown. |

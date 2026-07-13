@@ -3,8 +3,9 @@
 Status: **ACTIVE — H1a/H1b/H1c are VOID; clean `7bae38a`/`2d16c68` failed
 before build/GPU on missing login-PATH tools; clean `5f8fab1` built but is VOID
 because its H1d recipe omitted the binding Triton-AOT GDN path, used the wrong
-build type and failed correctness before capture; the repaired exact-path
-execution is pending and W3-H2 remains prohibited**
+build type and failed correctness before capture; clean `d063f20` is also VOID
+before plan because corpus preceded dry-run; the repaired exact-path execution
+is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -55,6 +56,14 @@ path. It omitted `VLLM_CPP_TRITON=ON` and used `Release`, whereas accepted
 `RelWithDebInfo`. H1d now preflights those settings plus FA2, CUTLASS and exact
 toolchain artifacts before acquiring `/tmp/gpu`. No trace or performance
 evidence follows from `5f8fab1`.
+
+Clean `d063f20` then failed even earlier: the frozen corpus was copied into the
+SHA evidence directory before `--dry-run`, whose anti-mixing guard rejected
+the non-empty directory with exit 2. No manifest, configure, build, model,
+lock or GPU command ran. Failure-log SHA is `b16476f0…de87`. That root is
+retained/void. The reproduction order is now part of G0: generate the dry-run
+plan in an empty evidence root first, then copy the frozen corpus, then
+configure/build/execute.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -477,6 +486,12 @@ stdout/stderr as the build-provenance input required by the driver:
 ```sh
 SHA=$(git rev-parse HEAD)
 ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
+BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
+"$ROOT/source/scripts/dgx-online-serving.sh" --dry-run \
+  --claim-root "$ROOT" --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA"
+mkdir -p "$ROOT/evidence/$SHA/corpus"
+cp -a "$BINDING/corpus/27" "$ROOT/evidence/$SHA/corpus/27"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
@@ -488,7 +503,7 @@ cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
-scripts/dgx-online-serving.sh --trace-only --model 27 \
+"$ROOT/source/scripts/dgx-online-serving.sh" --trace-only --model 27 \
   --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(readlink "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")" \
   --source-corpus "$ROOT/evidence/$SHA/corpus/27" \
   --evidence "$ROOT/evidence/$SHA" --build-dir "$ROOT/build-cuda" \
@@ -517,7 +532,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c are VOID; H1d `7bae38a`/`2d16c68` failed pre-build and `5f8fab1` failed correctness on a non-binding no-Triton/wrong-build-type configuration before capture. The repaired exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS three-capture execution is pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c are VOID; H1d `7bae38a`/`2d16c68` failed pre-build, `5f8fab1` failed correctness on a non-binding build path, and `d063f20` failed pre-plan on corpus/plan ordering. The repaired plan-first exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS three-capture execution is pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

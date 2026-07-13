@@ -6927,3 +6927,27 @@ scoreboard record the failed checkpoint and fresh-root requirement. Python
 compilation and focused harness tests pass **26/26**. Next: commit/push this
 checkpoint, create a fresh immutable root and require the 27B gate plus three
 lossless exact-path captures before W3-H2.
+
+## 2026-07-13 — fourth H1d setup rejected before plan; plan-first ordering frozen
+
+Clean pushed `d063f20f340cdfeab79c95a61c6fc08c82c1f4a9` was checked out in a
+new SHA-owned root, but setup copied the frozen binding corpus into the evidence
+directory before invoking `--dry-run`. The harness correctly refused to mix a
+new plan with pre-existing artifacts and exited 2. The reproduced dry-run
+failure log has SHA-256
+`b16476f0293af2af645b7847f9e599084a9e9ea1dae8ce8fabe50ae012f5de87`;
+the copied corpus manifest has SHA-256
+`41bd634a97a09c7ad5adc87237cbc30f7d96c8f7de6d3c1e32fa5c27d910fd7a`.
+
+This root is **FAILED / VOID before plan, configure, build or GPU**. No plan
+manifest was emitted, no compiler or model ran, no GPU lock was acquired and no
+profiler command executed. It is retained at
+`~/work/vllm.cpp-executed-path-refresh-h1d/d063f20f340cdfeab79c95a61c6fc08c82c1f4a9`
+and cannot be reused. It contributes no correctness, trace, ratio or speed
+credit; immutable `3f256ab` remains binding at **55/124 pass, 69 fail**.
+
+The public checkpoint and reproduction recipe now make initialization order
+part of the fail-closed contract: create a fresh empty SHA evidence root,
+generate its dry-run plan first, copy the frozen corpus second, then configure
+and execute the exact `RelWithDebInfo` Triton-AOT/FA2/CUTLASS build. The next
+hardware action requires another pushed SHA and new immutable root.

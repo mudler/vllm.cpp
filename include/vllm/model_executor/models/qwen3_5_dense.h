@@ -60,6 +60,10 @@ struct DenseMlpWeights {
   // VT_FP4_MERGED_GATE_UP=0 and VT_FP4_FULL_TACTICS=0 diagnostics.
   mutable std::shared_ptr<void> d_gate_up_packed;
   mutable std::shared_ptr<void> d_gate_up_scale_sw;
+  // One physical merged projection owns one device alpha. Keep the exact merged
+  // host scalar in model-lifetime storage because Backend::Copy is asynchronous.
+  mutable float gate_up_alpha = 0.0F;
+  mutable std::shared_ptr<void> d_gate_up_alpha;
 };
 
 // Exact scalar processing for a two-shard CT NVFP4 MergedColumnParallelLinear.

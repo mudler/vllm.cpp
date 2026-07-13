@@ -1096,6 +1096,71 @@ TEST_CASE("matmul_nvfp4_fp4 validates shapes loudly") {
   CHECK_THROWS_AS(vt::MatmulNvfp4Fp4(q, o, ap, as, bp, bs, 1.0F), std::runtime_error);
 }
 
+// Port of vLLM's stable NVFP4 op input contract and
+// tests/kernels/quantization/test_nvfp4_scaled_mm.py device-alpha fixture. The
+// scalar is validated before backend dispatch, so these malformed cases remain
+// CPU-runnable even though the CUTLASS operation itself is CUDA-only.
+TEST_CASE("matmul_nvfp4_cutlass validates device alpha loudly") {
+  std::vector<uint8_t> packed(32 * 16, 0);
+  std::vector<uint8_t> scale(128 * 4, 0);
+  std::vector<uint16_t> output(32, 0);
+  std::array<float, 2> alpha_values = {0.125F, 0.25F};
+  Queue queue = CpuQueue();
+  Tensor a = Tensor::Contiguous(packed.data(), DType::kI8, Cpu(), {1, 16});
+  Tensor b = Tensor::Contiguous(packed.data(), DType::kI8, Cpu(), {32, 16});
+  Tensor a_scale =
+      Tensor::Contiguous(scale.data(), DType::kI8, Cpu(), {128, 4});
+  Tensor b_scale =
+      Tensor::Contiguous(scale.data(), DType::kI8, Cpu(), {128, 4});
+  Tensor out =
+      Tensor::Contiguous(output.data(), DType::kBF16, Cpu(), {1, 32});
+  Tensor alpha = Tensor::Contiguous(alpha_values.data(), DType::kF32, Cpu(), {1});
+  const auto check_alpha_error = [&](const Tensor& candidate,
+                                     const char* expected) {
+    try {
+      vt::MatmulNvfp4Cutlass(queue, out, a, a_scale, b, b_scale,
+                             candidate);
+      FAIL_CHECK("invalid alpha reached backend dispatch");
+    } catch (const std::runtime_error& error) {
+      CHECK(std::string(error.what()).find(expected) != std::string::npos);
+    }
+  };
+
+  Tensor wrong_rank = alpha;
+  wrong_rank.rank = 2;
+  wrong_rank.shape[0] = 1;
+  wrong_rank.shape[1] = 1;
+  wrong_rank.stride[0] = 1;
+  wrong_rank.stride[1] = 1;
+  check_alpha_error(
+      wrong_rank,
+      "matmul_nvfp4_cutlass: alpha must be a rank-0 or rank-1 scalar tensor");
+
+  Tensor multiple =
+      Tensor::Contiguous(alpha_values.data(), DType::kF32, Cpu(), {2});
+  check_alpha_error(multiple,
+                    "matmul_nvfp4_cutlass: alpha must contain exactly one element");
+
+  Tensor wrong_dtype = alpha;
+  wrong_dtype.dtype = DType::kBF16;
+  check_alpha_error(wrong_dtype, "matmul_nvfp4_cutlass: alpha must be f32");
+
+  Tensor null_alpha = alpha;
+  null_alpha.data = nullptr;
+  check_alpha_error(null_alpha,
+                    "matmul_nvfp4_cutlass: alpha must have non-null storage");
+
+  Tensor noncontiguous = alpha;
+  noncontiguous.stride[0] = 2;
+  check_alpha_error(noncontiguous,
+                    "matmul_nvfp4_cutlass: alpha must be contiguous");
+
+  Tensor cross_device = alpha;
+  cross_device.device = Device{DeviceType::kCUDA, 0};
+  check_alpha_error(cross_device,
+                    "matmul_nvfp4_cutlass: alpha device mismatch");
+}
+
 #ifdef VT_CUTLASS_NVFP4
 namespace {
 float Bf16ToFloat(uint16_t b) {
@@ -1152,6 +1217,7 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   void* dx = up(x.data(), x.size() * sizeof(float));
   void* dbp = up(w_packed.data(), w_packed.size());
   void* dbs = up(w_scale.data(), w_scale.size());
+  void* dalpha = up(&alpha, sizeof(alpha));
   void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
   void* dap_direct = b.Alloc(static_cast<size_t>(M * K / 2));
   void* das = b.Alloc(static_cast<size_t>(M * K / 16));
@@ -1160,6 +1226,10 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   void* dbsw = b.Alloc(static_cast<size_t>(Np * Kp));
   void* dout = b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));  // bf16
   void* dout_direct =
+      b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));
+  void* dout_device_alpha =
+      b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));
+  void* dout_scalar_alpha =
       b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));
   b.Memset(gq, dasw, 0, static_cast<size_t>(Mp * Kp));
   b.Memset(gq, dbsw, 0, static_cast<size_t>(Np * Kp));
@@ -1175,6 +1245,11 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   Tensor tbsw = GpuTensor({Np, Kp}); tbsw.data = dbsw; tbsw.dtype = DType::kI8; tbsw.device = Gpu();
   Tensor to = GpuTensor({M, N}); to.data = dout; to.dtype = DType::kBF16; to.device = Gpu();
   Tensor to_direct = GpuTensor({M, N}); to_direct.data = dout_direct; to_direct.dtype = DType::kBF16; to_direct.device = Gpu();
+  Tensor to_device_alpha = GpuTensor({M, N}); to_device_alpha.data = dout_device_alpha; to_device_alpha.dtype = DType::kBF16; to_device_alpha.device = Gpu();
+  Tensor to_scalar_alpha = GpuTensor({M, N}); to_scalar_alpha.data = dout_scalar_alpha; to_scalar_alpha.dtype = DType::kBF16; to_scalar_alpha.device = Gpu();
+  Tensor talpha = GpuTensor({1}); talpha.data = dalpha; talpha.dtype = DType::kF32; talpha.device = Gpu();
+  Tensor talpha_scalar = talpha;
+  talpha_scalar.rank = 0;
 
   vt::ScaledFp4Quant(gq, tap, tas, tx, input_global_scale);
   vt::ScaledFp4Quant(gq, tap_direct, tas_direct, tx, input_global_scale,
@@ -1184,9 +1259,15 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
   vt::MatmulNvfp4Cutlass(gq, to_direct, tap_direct, tas_direct, tbp, tbsw,
                          alpha);
+  vt::MatmulNvfp4Cutlass(gq, to_device_alpha, tap, tasw, tbp, tbsw,
+                         talpha);
+  vt::MatmulNvfp4Cutlass(gq, to_scalar_alpha, tap, tasw, tbp, tbsw,
+                         talpha_scalar);
 
   std::vector<uint16_t> g_out(static_cast<size_t>(M * N));
   std::vector<uint16_t> direct_out(g_out.size());
+  std::vector<uint16_t> device_alpha_out(g_out.size());
+  std::vector<uint16_t> scalar_alpha_out(g_out.size());
   std::vector<uint8_t> composed_packed(static_cast<size_t>(M * K / 2));
   std::vector<uint8_t> direct_packed(composed_packed.size());
   std::vector<uint8_t> composed_scale(static_cast<size_t>(Mp * Kp));
@@ -1194,6 +1275,10 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   b.Copy(gq, g_out.data(), dout, g_out.size() * sizeof(uint16_t));
   b.Copy(gq, direct_out.data(), dout_direct,
          direct_out.size() * sizeof(uint16_t));
+  b.Copy(gq, device_alpha_out.data(), dout_device_alpha,
+         device_alpha_out.size() * sizeof(uint16_t));
+  b.Copy(gq, scalar_alpha_out.data(), dout_scalar_alpha,
+         scalar_alpha_out.size() * sizeof(uint16_t));
   b.Copy(gq, composed_packed.data(), dap, composed_packed.size());
   b.Copy(gq, direct_packed.data(), dap_direct, direct_packed.size());
   b.Copy(gq, composed_scale.data(), dasw, composed_scale.size());
@@ -1202,6 +1287,8 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   CHECK(direct_packed == composed_packed);
   CHECK(direct_scale == composed_scale);
   CHECK(direct_out == g_out);
+  CHECK(device_alpha_out == g_out);
+  CHECK(scalar_alpha_out == g_out);
 
   double max_abs = 0.0, ref_absmax = 0.0;
   for (size_t i = 0; i < g_out.size(); ++i) {
@@ -1229,6 +1316,25 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   b.Synchronize(gq);
   CHECK(replay_out == g_out);
   b.DestroyGraph(ready_graph);
+
+  // The upstream-shaped resident alpha pointer also remains fixed and valid
+  // across capture/replay, without a scalar-staging kernel in the graph.
+  b.Memset(gq, dout_device_alpha, 0,
+           device_alpha_out.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  b.BeginCapture(gq);
+  vt::MatmulNvfp4Cutlass(gq, to_device_alpha, tap, tasw, tbp, tbsw,
+                         talpha);
+  void* device_alpha_graph = b.EndCaptureGraph(gq);
+  REQUIRE(device_alpha_graph != nullptr);
+  b.ReplayGraph(gq, device_alpha_graph);
+  b.Synchronize(gq);
+  std::vector<uint16_t> device_alpha_replay(g_out.size());
+  b.Copy(gq, device_alpha_replay.data(), dout_device_alpha,
+         device_alpha_replay.size() * sizeof(uint16_t));
+  b.Synchronize(gq);
+  CHECK(device_alpha_replay == g_out);
+  b.DestroyGraph(device_alpha_graph);
 
   // M=64 has a different plan key from the warmed M=96 (bucket 64 vs 128).
   // The call records its already-warmed scalar write, then rejects the missing
@@ -1266,7 +1372,7 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
       vt::cuda::GetNvfp4AutotuneWarmupStats();
   {
     vt::cuda::Nvfp4AutotuneWarmupScope warmup(static_cast<uint32_t>(M));
-    vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
+    vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, talpha);
     warmup.Complete();
   }
   const vt::cuda::Nvfp4AutotuneWarmupStats stats_after =
@@ -1285,7 +1391,7 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   b.Synchronize(gq);
   b.BeginCapture(gq);
   vt::MatmulNvfp4Cutlass(gq, to_prewarmed, tap_prewarmed, tasw, tbp, tbsw,
-                         alpha);
+                         talpha);
   void* prewarmed_graph = b.EndCaptureGraph(gq);
   REQUIRE(prewarmed_graph != nullptr);
   b.ReplayGraph(gq, prewarmed_graph);
@@ -1300,8 +1406,9 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   }
   b.DestroyGraph(prewarmed_graph);
 
-  for (void* p : {dx, dbp, dbs, dap, dap_direct, das, dasw, das_direct,
-                  dbsw, dout, dout_direct}) {
+  for (void* p : {dx, dbp, dbs, dalpha, dap, dap_direct, das, dasw,
+                  das_direct, dbsw, dout, dout_direct, dout_device_alpha,
+                  dout_scalar_alpha}) {
     b.Free(p);
   }
   b.DestroyQueue(gq);
@@ -1352,6 +1459,7 @@ TEST_CASE("matmul_nvfp4_cutlass packed QKV matches logical shard views CUDA") {
   void* dx = upload(x.data(), x.size() * sizeof(float));
   void* dw = upload(weights.data(), weights.size());
   void* ds = upload(scales.data(), scales.size());
+  void* dalpha = upload(&globals.alpha, sizeof(globals.alpha));
   void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
   void* das = b.Alloc(static_cast<size_t>(M * K / 16));
   void* dasw = b.Alloc(static_cast<size_t>(mp * kp));
@@ -1382,10 +1490,13 @@ TEST_CASE("matmul_nvfp4_cutlass packed QKV matches logical shard views CUDA") {
   Tensor tout = GpuTensor({M, total_n});
   tout.data = dout;
   tout.dtype = DType::kBF16;
+  Tensor talpha = GpuTensor({1});
+  talpha.data = dalpha;
+  talpha.dtype = DType::kF32;
   vt::ScaledFp4Quant(q, tap, tas, tx, globals.input_global_scale_inv);
   vt::SwizzleBlockscale(q, tasw, tas);
   vt::SwizzleBlockscale(q, tsw, ts);
-  vt::MatmulNvfp4Cutlass(q, tout, tap, tasw, tw, tsw, globals.alpha);
+  vt::MatmulNvfp4Cutlass(q, tout, tap, tasw, tw, tsw, talpha);
 
   std::array<void*, 3> shard_scale_sw{};
   std::array<void*, 3> shard_out{};
@@ -1410,7 +1521,7 @@ TEST_CASE("matmul_nvfp4_cutlass packed QKV matches logical shard views CUDA") {
     shard_o.dtype = DType::kBF16;
     vt::SwizzleBlockscale(q, shard_sw, shard_s);
     vt::MatmulNvfp4Cutlass(q, shard_o, tap, tasw, shard_w, shard_sw,
-                           globals.alpha);
+                           talpha);
     n_offset += n;
   }
 
@@ -1445,7 +1556,10 @@ TEST_CASE("matmul_nvfp4_cutlass packed QKV matches logical shard views CUDA") {
   MESSAGE("packed-QKV max_abs=" << max_abs << " ref_absmax=" << ref_absmax);
   CHECK(max_abs <= 0.03 * ref_absmax + 1e-3);
 
-  for (void* pointer : {dx, dw, ds, dap, das, dasw, dsw, dout}) b.Free(pointer);
+  for (void* pointer : {dx, dw, ds, dalpha, dap, das, dasw, dsw,
+                        dout}) {
+    b.Free(pointer);
+  }
   for (void* pointer : shard_scale_sw) b.Free(pointer);
   for (void* pointer : shard_out) b.Free(pointer);
   b.DestroyQueue(q);
@@ -1534,6 +1648,7 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
                         : upload(x.data(), x.size() * sizeof(float));
   void* dw = upload(w_packed.data(), w_packed.size());
   void* dws = upload(w_scale.data(), w_scale.size());
+  void* dalpha = upload(&kAlpha, sizeof(kAlpha));
   void* da = backend.Alloc(static_cast<size_t>(m * k / 2));
   void* das = backend.Alloc(static_cast<size_t>(m * k / 16));
   void* dasw = backend.Alloc(static_cast<size_t>(mp * kp));
@@ -1574,6 +1689,10 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
   tout.data = dout;
   tout.dtype = DType::kBF16;
   tout.device = Gpu();
+  Tensor talpha = GpuTensor({1});
+  talpha.data = dalpha;
+  talpha.dtype = DType::kF32;
+  talpha.device = Gpu();
 
   if (direct_scale) {
     vt::ScaledFp4Quant(queue, ta, tasw, tx, kInputGlobalScale,
@@ -1583,7 +1702,7 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
     vt::SwizzleBlockscale(queue, tasw, tas);
   }
   vt::SwizzleBlockscale(queue, twsw, tws);
-  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, kAlpha);
+  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, talpha);
   std::vector<uint16_t> first(static_cast<size_t>(m * n));
   backend.Copy(queue, first.data(), dout, first.size() * sizeof(uint16_t));
   backend.Synchronize(queue);
@@ -1612,7 +1731,7 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
   backend.Memset(queue, dout, 0, first.size() * sizeof(uint16_t));
   backend.Synchronize(queue);
   backend.BeginCapture(queue);
-  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, kAlpha);
+  vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, talpha);
   void* graph = backend.EndCaptureGraph(queue);
   REQUIRE(graph != nullptr);
   backend.ReplayGraph(queue, graph);
@@ -1655,7 +1774,10 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
     REQUIRE(metadata.good());
   }
 
-  for (void* pointer : {dx, dw, dws, da, das, dasw, dwsw, dout}) backend.Free(pointer);
+  for (void* pointer : {dx, dw, dws, dalpha, da, das, dasw, dwsw,
+                        dout}) {
+    backend.Free(pointer);
+  }
   backend.DestroyQueue(queue);
 }
 

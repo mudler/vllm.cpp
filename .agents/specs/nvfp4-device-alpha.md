@@ -1,6 +1,7 @@
 # NVFP4 model-owned device alpha (W3-F)
 
-Status: **READY — spike accepted; implementation and all new gates PENDING**
+Status: **ACTIVE — implementation and local CPU/sanitizer gates complete; all
+CUDA/runtime/performance gates PENDING**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -66,17 +67,17 @@ FlashInfer source SHA-256 values are `d9b3fd63…3c43` (runner),
 The trace proves this chain executes on the 27B gate. Source availability alone
 is not used as execution evidence.
 
-## Current local chain and exact files to adapt
+## Local implementation chain
 
-| Local concern | Current anchor | W3-F adaptation |
+| Local concern | Implementation anchor | W3-F disposition |
 |---|---|---|
-| model ownership | `include/vllm/model_executor/models/qwen3_5_weights.h:74-106,165-210`; `qwen3_5_dense.h:42-75` | add model-lifetime device-alpha ownership for individual, packed-QKV and merged-gate/up true-W4A4 linears; retain the exact host alpha values |
-| resident construction | `src/vllm/model_executor/models/qwen3_5.cpp:492-709` | upload each immutable F32 scalar once on the model queue before first GEMM/capture and return a one-element device tensor alongside each resident operand |
-| model dispatch | `src/vllm/model_executor/models/qwen3_5.cpp:1154-1264` | default CUTLASS W4A4 calls pass the resident alpha tensor; `VT_FP4_DEVICE_ALPHA=0` calls the old host-float overload |
-| typed operation | `include/vt/ops.h:332-333,578-585`; `src/vt/ops.cpp:332-357` | add the upstream-shaped device-tensor overload, validate F32/one element/contiguous/same device, and retain an explicit host-scalar overload for the diagnostic arm |
-| CUDA adapter | `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:76-120,914-968` | use the supplied tensor pointer directly; only the host fallback obtains stream scratch and launches `SetScalar` |
+| model ownership | `include/vllm/model_executor/models/qwen3_5_weights.h:94-109,187-198`; `qwen3_5_dense.h:55-66` | individual, packed-QKV and merged-gate/up true-W4A4 linears own model-lifetime scalar storage; merged async-copy sources persist in their owning weights |
+| resident construction | `src/vllm/model_executor/models/qwen3_5.cpp:1067-1131` | upload each immutable F32 scalar once on the model queue, reject incomplete resident tuples and return a one-element tensor view |
+| model dispatch | `src/vllm/model_executor/models/qwen3_5.cpp:1133-1147,1240-1357` | default CUTLASS W4A4 passes the resident tensor; `VT_FP4_DEVICE_ALPHA=0` selects the former float overload |
+| typed operation | `include/vt/ops.h:332-334,579-592`; `src/vt/ops.cpp:332-400` | tensor overload validates rank 0/1, one F32 element, non-null contiguous storage and queue device; float overload remains explicit |
+| CUDA adapter | `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:924-979` | tensor arm forwards its pointer directly; only the host fallback obtains stream scratch, launches `SetScalar` and conditionally frees staging |
 | CUTLASS tactics | `src/vt/cuda/nvfp4_cutlass_tactics.h:13-25`; `nvfp4_cutlass_tactic_impl.cuh:84-154` | unchanged: the existing `const float* alpha` ABI already matches upstream and accepts the model-owned pointer |
-| tests | `tests/vt/test_ops_nvfp4_fp4.cpp:1140-1305,1340-1445,1540-1635` | port device-alpha shape/value/reference cases, compare device/host arms, cover graph replay and invalid tensor contracts, then retain forced-plan and packed-QKV coverage |
+| tests | `tests/vt/test_ops_nvfp4_fp4.cpp:1099-1162,1175-1415,1417-1785` | malformed contracts, rank-0/rank-1 and host/device equality, graph replay, all 32 forced tactics and packed-QKV tensor-alpha coverage are ported; CUDA execution remains pending |
 
 No quantization producer, tactic, on-disk layout, scheduler, KV cache,
 attention, GDN, server API, W4A16 path, CPU kernel, or non-CUDA backend changes.
@@ -187,13 +188,29 @@ Expected local rows are `eager|23514|23.263872` and
 `graph|296575|207.124383`; the vLLM expression prints `False`. No GPU command is
 required for this spike checkpoint.
 
+## Local implementation checkpoint
+
+The tensor ABI, CUDA pointer/fallback split, model-owned individual/merged
+residency and all named test ports are implemented in one change. CPU Release
+builds warning-as-error and its complete suite passes **103/103**. The focused
+NVFP4 suite passes **17/17 cases + 911/911 assertions** in Release,
+ASan+UBSan (`detect_leaks=1`, halt-on-error) and TSan (`setarch ... -R`,
+halt-on-error). The first focused run failed only because the new test expected
+an exact `VT_CHECK` string without its standard source prefix; validation
+behavior was correct, the assertion now checks the stable diagnostic substring,
+and all three clean reruns pass.
+
+This is not CUDA evidence. No DGX build, operator execution, sanitizer, model
+gate, allocation count, node trace, component ratio, exact grid or 35B
+performance command ran at this checkpoint. Those remain W3-F3 onward.
+
 ## Work breakdown
 
 | Work | Deliverable | State |
 |---|---|---|
 | W3-F0 | whole-chain execution/source/dependency audit, tests, dispatch and gates | **complete in this spike** |
-| W3-F1 | tensor alpha operation/validation plus model-owned individual/merged residency and same-binary fallback | `READY` |
-| W3-F2 | ported device-alpha/reference/capture/invalid-input tests and local build gates | `PENDING` |
+| W3-F1 | tensor alpha operation/validation plus model-owned individual/merged residency and same-binary fallback | **complete locally; CUDA execution pending W3-F3** |
+| W3-F2 | ported device-alpha/reference/capture/invalid-input tests and local build gates | **complete: CPU 103/103; focused Release/ASan+UBSan/TSan 17/17 + 911/911** |
 | W3-F3 | immutable CUDA safety, 27B/35B correctness and paired node trace | `PENDING` |
 | W3-F4 | frozen-plan c2/c16 AB/BA/AB every-axis component | `PENDING` |
 | W3-F5 | exact v0.25 27B grid/trace, conditional on F4 passing every axis | `BLOCKED on F4` |

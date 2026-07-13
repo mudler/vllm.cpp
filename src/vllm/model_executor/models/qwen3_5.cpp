@@ -1064,6 +1064,87 @@ bool DirectFp4ScaleEligible(Dev d) {
          d.q.device.type == vt::DeviceType::kCUDA;
 }
 
+// vLLM's CompressedTensorsW4A4Nvfp4 retains alpha as a non-trainable device
+// parameter and FlashInfer passes that pointer directly into CUTLASS. Default to
+// the same ownership; the opt-out is the exact former per-GEMM host-scalar
+// staging path for same-binary component measurement and rollback.
+bool DeviceFp4AlphaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_DEVICE_ALPHA");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+#ifdef VT_CUTLASS_NVFP4
+Tensor ResidentDeviceAlpha(Dev d, const float* host_alpha,
+                           std::shared_ptr<void>& owner,
+                           const char* context) {
+  VT_CHECK(host_alpha != nullptr && *host_alpha > 0.0F, context);
+  if (!owner) {
+    Backend* backend = &d.b;
+    void* data = d.b.Alloc(sizeof(float));
+    std::shared_ptr<void> candidate(
+        data, [backend](void* pointer) { backend->Free(pointer); });
+    d.b.Copy(d.q, data, host_alpha, sizeof(float));
+    owner = std::move(candidate);
+  }
+  return MakeTensor(owner.get(), DType::kF32, d.q.device, {1});
+}
+
+Tensor ResidentNvfp4Alpha(Dev d, const Nvfp4Weight& w) {
+  VT_CHECK(w.IsTrueW4A4(), "qwen3_5 NVFP4 device alpha: true-W4A4 required");
+  VT_CHECK(w.d_packed && w.d_scale && w.d_scale_sw,
+           "qwen3_5 NVFP4 device alpha: incomplete weight resident state");
+  return ResidentDeviceAlpha(d, &w.alpha, w.d_alpha,
+                             "qwen3_5 NVFP4 device alpha: invalid scalar");
+}
+
+Tensor ResidentNvfp4GateUpAlpha(Dev d, const DenseMlpWeights& w,
+                                float alpha) {
+  VT_CHECK(w.d_gate_up_packed && w.d_gate_up_scale_sw,
+           "qwen3_5 dense merged gate_up alpha: incomplete resident state");
+  if (!w.d_gate_up_alpha) {
+    w.gate_up_alpha = alpha;
+  } else {
+    VT_CHECK(w.gate_up_alpha == alpha,
+             "qwen3_5 dense merged gate_up alpha changed after upload");
+  }
+  return ResidentDeviceAlpha(
+      d, &w.gate_up_alpha, w.d_gate_up_alpha,
+      "qwen3_5 dense merged gate_up alpha: invalid scalar");
+}
+
+Tensor ResidentNvfp4QkvAlpha(Dev d, const FullAttnLayerWeights& w,
+                             float alpha) {
+  VT_CHECK(w.d_qkv_packed && w.d_qkv_scale_sw,
+           "qwen3_5 packed QKV alpha: incomplete resident state");
+  if (!w.d_qkv_alpha) {
+    w.qkv_alpha = alpha;
+  } else {
+    VT_CHECK(w.qkv_alpha == alpha,
+             "qwen3_5 packed QKV alpha changed after upload");
+  }
+  return ResidentDeviceAlpha(d, &w.qkv_alpha, w.d_qkv_alpha,
+                             "qwen3_5 packed QKV alpha: invalid scalar");
+}
+
+void MatmulNvfp4CutlassModel(Dev d, Tensor& out,
+                             const Tensor& a_packed,
+                             const Tensor& a_sf_sw,
+                             const Tensor& b_packed,
+                             const Tensor& b_sf_sw, float alpha_host,
+                             const Tensor& alpha_device) {
+  if (alpha_device.data != nullptr) {
+    vt::MatmulNvfp4Cutlass(d.q, out, a_packed, a_sf_sw, b_packed,
+                           b_sf_sw, alpha_device);
+  } else {
+    vt::MatmulNvfp4Cutlass(d.q, out, a_packed, a_sf_sw, b_packed,
+                           b_sf_sw, alpha_host);
+  }
+}
+#endif
+
 // SWIZZLE-ONCE dedup (prefill-gap-scan quant-hw-swizzle lever). The fused qkv/
 // gate-up projections share ONE ScaledFp4Quant activation + its LINEAR fp8 block
 // scale, but each MatmulNvfp4Fp4DirectD re-runs the identical internal
@@ -1179,9 +1260,14 @@ DBuf MergedGateUpCutlassD(Dev d, const Tensor& x, const DenseMlpWeights& w) {
   }
 
   DBuf out(d, DType::kBF16, {m, 2 * n});
-  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), *scale_for_gemm,
-                         gate_up.packed, gate_up.scale_sw,
-                         gate_up.globals.alpha);
+  Tensor alpha_device;
+  if (DeviceFp4AlphaEnabled()) {
+    alpha_device =
+        ResidentNvfp4GateUpAlpha(d, w, gate_up.globals.alpha);
+  }
+  MatmulNvfp4CutlassModel(d, out.t(), a_packed.t(), *scale_for_gemm,
+                          gate_up.packed, gate_up.scale_sw,
+                          gate_up.globals.alpha, alpha_device);
   return out;
 }
 
@@ -1214,8 +1300,13 @@ DBuf MergedQkvCutlassD(Dev d, const Tensor& x,
   }
 
   DBuf out(d, DType::kBF16, {m, total_n});
-  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), *scale_for_gemm,
-                         qkv.packed, qkv.scale_sw, qkv.globals.alpha);
+  Tensor alpha_device;
+  if (DeviceFp4AlphaEnabled()) {
+    alpha_device = ResidentNvfp4QkvAlpha(d, w, qkv.globals.alpha);
+  }
+  MatmulNvfp4CutlassModel(d, out.t(), a_packed.t(), *scale_for_gemm,
+                          qkv.packed, qkv.scale_sw, qkv.globals.alpha,
+                          alpha_device);
   return out;
 }
 #endif
@@ -1247,16 +1338,22 @@ DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
     auto round_up = [](int64_t v, int64_t y) { return (v + y - 1) / y * y; };
     const int64_t Mp = round_up(M, 128), Kp = round_up(K / 16, 4);
     Tensor b_sf_sw = ResidentNvfp4ScaleSwizzled(d, w);
+    Tensor alpha_device;
+    if (DeviceFp4AlphaEnabled()) {
+      alpha_device = ResidentNvfp4Alpha(d, w);
+    }
     // SWIZZLE-ONCE dedup: the shared activation SF was already swizzled ONCE by the
     // fused caller — reuse it (bit-identical to re-swizzling here) and skip our
     // internal SwizzleBlockscale for this projection.
     if (a_sf_sw_pre != nullptr) {
-      vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed, *a_sf_sw_pre, dw.packed, b_sf_sw, w.alpha);
+      MatmulNvfp4CutlassModel(d, dout.t(), a_packed, *a_sf_sw_pre,
+                              dw.packed, b_sf_sw, w.alpha, alpha_device);
       return dout;
     }
     DBuf a_sf_sw(d, DType::kI8, {Mp, Kp});  // SwizzleBlockscale zero-fills padding
     vt::SwizzleBlockscale(d.q, a_sf_sw.t(), a_scale);
-    vt::MatmulNvfp4Cutlass(d.q, dout.t(), a_packed, a_sf_sw.t(), dw.packed, b_sf_sw, w.alpha);
+    MatmulNvfp4CutlassModel(d, dout.t(), a_packed, a_sf_sw.t(),
+                            dw.packed, b_sf_sw, w.alpha, alpha_device);
     return dout;
   }
 #endif

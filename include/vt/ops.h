@@ -330,7 +330,8 @@ using SiluAndMulFp4QuantFn =
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+             const Tensor*, float);
 using MatmulFp8CutlassFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, float);
 using MatmulFp8CublasLtFn =
@@ -580,7 +581,13 @@ void SwizzleBlockscale(Queue& q, Tensor& out_swizzled, const Tensor& in_linear);
 // but the two fp8 block-scale streams MUST be pre-swizzled (SwizzleBlockscale):
 //   a_sf_sw [round_up(M,128), round_up(K/16,4)], b_sf_sw [round_up(N,128), ...].
 // a_packed [M,K/2], b_packed [N,K/2] raw fp4 (e2m1x2). alpha = (1/input_divisor)
-// ·(1/weight_divisor). out [M,N] bf16. CUDA-only (sm120a). K,N % 32 == 0.
+// ·(1/weight_divisor). The tensor overload mirrors vLLM/FlashInfer: alpha is a
+// resident contiguous CUDA f32 scalar and its pointer passes straight into the
+// CUTLASS epilogue. The float overload retains host-scalar staging as an exact
+// compatibility/diagnostic path. out [M,N] bf16. CUDA-only (sm120a). K,N % 32 == 0.
+void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed,
+                        const Tensor& a_sf_sw, const Tensor& b_packed,
+                        const Tensor& b_sf_sw, const Tensor& alpha);
 void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_sf_sw,
                         const Tensor& b_packed, const Tensor& b_sf_sw, float alpha);
 

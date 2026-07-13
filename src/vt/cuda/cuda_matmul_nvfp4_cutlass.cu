@@ -923,20 +923,29 @@ __global__ void CastBf16ToF32Kernel(float* out, const __nv_bfloat16* in, int64_t
 
 void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
                                   const Tensor& a_sf_sw, const Tensor& b_packed,
-                                  const Tensor& b_sf_sw, float alpha) {
+                                  const Tensor& b_sf_sw,
+                                  const Tensor* alpha_device,
+                                  float alpha_host) {
   const int m = static_cast<int>(a_packed.shape[0]);
   const int k = static_cast<int>(a_packed.shape[1] * 2);
   const int n = static_cast<int>(b_packed.shape[0]);
   cudaStream_t stream = AsStream(q);
 
   const bool pool = CutlassPoolEnabled();
-  float* device_alpha = nullptr;
-  if (pool) {
-    device_alpha = PersistentAlpha(stream);
+  const float* device_alpha = nullptr;
+  float* staged_alpha = nullptr;
+  if (alpha_device != nullptr) {
+    device_alpha = alpha_device->Ptr<float>();
   } else {
-    Check(cudaMallocAsync(&device_alpha, sizeof(float), stream), "cudaMallocAsync alpha");
+    if (pool) {
+      staged_alpha = PersistentAlpha(stream);
+    } else {
+      Check(cudaMallocAsync(&staged_alpha, sizeof(float), stream),
+            "cudaMallocAsync alpha");
+    }
+    SetScalar<<<1, 1, 0, stream>>>(staged_alpha, alpha_host);
+    device_alpha = staged_alpha;
   }
-  SetScalar<<<1, 1, 0, stream>>>(device_alpha, alpha);
 
   const bool out_f32 = out.dtype == DType::kF32;
   void* device_out = out.data;
@@ -964,7 +973,9 @@ void MatmulNvfp4CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_packed,
     if (!pool) Check(cudaFreeAsync(bf16_scratch, stream), "cudaFreeAsync bf16 scratch");
   }
 
-  if (!pool) Check(cudaFreeAsync(device_alpha, stream), "cudaFreeAsync alpha");
+  if (!pool && staged_alpha != nullptr) {
+    Check(cudaFreeAsync(staged_alpha, stream), "cudaFreeAsync alpha");
+  }
   Check(cudaGetLastError(), "matmul_nvfp4_cutlass launch");
 }
 

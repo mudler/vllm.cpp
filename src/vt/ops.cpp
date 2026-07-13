@@ -329,8 +329,12 @@ void SwizzleBlockscale(Queue& q, Tensor& out_swizzled, const Tensor& in_linear) 
       q, out_swizzled, in_linear);
 }
 
-void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_sf_sw,
-                        const Tensor& b_packed, const Tensor& b_sf_sw, float alpha) {
+namespace {
+void ValidateMatmulNvfp4Cutlass(Queue& q, Tensor& out,
+                                const Tensor& a_packed,
+                                const Tensor& a_sf_sw,
+                                const Tensor& b_packed,
+                                const Tensor& b_sf_sw) {
   VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_sf_sw.rank == 2 && b_packed.rank == 2 &&
                b_sf_sw.rank == 2,
            "matmul_nvfp4_cutlass: all tensors must be rank-2");
@@ -352,8 +356,47 @@ void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed, const Ten
   VT_CHECK(out.device == q.device && a_packed.device == q.device && a_sf_sw.device == q.device &&
                b_packed.device == q.device && b_sf_sw.device == q.device,
            "matmul_nvfp4_cutlass: device mismatch");
+}
+
+void DispatchMatmulNvfp4Cutlass(Queue& q, Tensor& out,
+                                const Tensor& a_packed,
+                                const Tensor& a_sf_sw,
+                                const Tensor& b_packed,
+                                const Tensor& b_sf_sw,
+                                const Tensor* alpha_device,
+                                float alpha_host) {
   reinterpret_cast<MatmulNvfp4CutlassFn>(GetOp(OpId::kMatmulNvfp4Cutlass, q.device.type))(
-      q, out, a_packed, a_sf_sw, b_packed, b_sf_sw, alpha);
+      q, out, a_packed, a_sf_sw, b_packed, b_sf_sw, alpha_device,
+      alpha_host);
+}
+}  // namespace
+
+void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed,
+                        const Tensor& a_sf_sw, const Tensor& b_packed,
+                        const Tensor& b_sf_sw, const Tensor& alpha) {
+  ValidateMatmulNvfp4Cutlass(q, out, a_packed, a_sf_sw, b_packed, b_sf_sw);
+  VT_CHECK(alpha.rank == 0 || alpha.rank == 1,
+           "matmul_nvfp4_cutlass: alpha must be a rank-0 or rank-1 scalar tensor");
+  VT_CHECK(alpha.Numel() == 1,
+           "matmul_nvfp4_cutlass: alpha must contain exactly one element");
+  VT_CHECK(alpha.dtype == DType::kF32,
+           "matmul_nvfp4_cutlass: alpha must be f32");
+  VT_CHECK(alpha.data != nullptr,
+           "matmul_nvfp4_cutlass: alpha must have non-null storage");
+  VT_CHECK(alpha.IsContiguous(),
+           "matmul_nvfp4_cutlass: alpha must be contiguous");
+  VT_CHECK(alpha.device == q.device,
+           "matmul_nvfp4_cutlass: alpha device mismatch");
+  DispatchMatmulNvfp4Cutlass(q, out, a_packed, a_sf_sw, b_packed,
+                             b_sf_sw, &alpha, 0.0F);
+}
+
+void MatmulNvfp4Cutlass(Queue& q, Tensor& out, const Tensor& a_packed,
+                        const Tensor& a_sf_sw, const Tensor& b_packed,
+                        const Tensor& b_sf_sw, float alpha) {
+  ValidateMatmulNvfp4Cutlass(q, out, a_packed, a_sf_sw, b_packed, b_sf_sw);
+  DispatchMatmulNvfp4Cutlass(q, out, a_packed, a_sf_sw, b_packed,
+                             b_sf_sw, nullptr, alpha);
 }
 void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale) {
   VT_CHECK(x.rank == 2 && out_fp8.rank == 2, "quant_fp8_static: x/out must be rank-2");

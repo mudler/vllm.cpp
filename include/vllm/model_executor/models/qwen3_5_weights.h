@@ -103,6 +103,10 @@ struct Nvfp4Weight {
   // path (VT_NVFP4_CUTLASS): [round_up(n,128), round_up(k/16,4)] in the cutlass
   // atom layout, computed once from d_scale via vt::SwizzleBlockscale.
   mutable std::shared_ptr<void> d_scale_sw;
+  // vLLM/FlashInfer-compatible model-owned f32 alpha for the true-W4A4 CUTLASS
+  // path. Uploaded once from the persistent `alpha` member; the diagnostic host
+  // scalar path leaves this null.
+  mutable std::shared_ptr<void> d_alpha;
 };
 
 // Device-resident per-tensor FP8 (W8A8) weight — the 35B attn q/k/v/o + GDN
@@ -187,6 +191,11 @@ struct FullAttnLayerWeights {
   // VT_FP4_MERGED_QKV=0 and non-CUTLASS diagnostics.
   mutable std::shared_ptr<void> d_qkv_packed;
   mutable std::shared_ptr<void> d_qkv_scale_sw;
+  // Merged QKV owns the max-before-reciprocal alpha as one physical device
+  // scalar, matching its one physical projection. The host member is persistent
+  // storage for the asynchronous H2D copy.
+  mutable float qkv_alpha = 0.0F;
+  mutable std::shared_ptr<void> d_qkv_alpha;
 
   // 35B fp8-resident W8A8 variants (per-tensor FP8). Populated BY DEFAULT on the
   // real 35B CUDA+cutlass load (VT_DENSE_NATIVE); the bf16 q/k/v/o_proj above are

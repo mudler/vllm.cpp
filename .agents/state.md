@@ -6289,3 +6289,41 @@ then executes frozen-plan c2/c16 AB/BA/AB under one lock. The exact vLLM grid
 remains conditional on every timing and memory component axis passing.
 Immutable `3f256ab` therefore remains binding at **55/124 pass, 69 fail**; no
 GPU command or new performance ratio was produced at this checkpoint.
+
+## 2026-07-13 — W3-F implemented locally; immutable GPU handoff pending
+
+The bounded device-alpha implementation is complete in the local tree. The
+typed `MatmulNvfp4Cutlass` operation now has a device-tensor overload that
+accepts rank-zero or rank-one one-element contiguous F32 storage on the queue
+device, while the prior float overload remains explicit. The CUDA adapter
+passes the tensor pointer straight to the existing CUTLASS `const float*`
+launch ABI; only the float arm obtains the stream scalar and launches
+`SetScalar`. This preserves `VT_FP4_DEVICE_ALPHA=0` as the exact same-binary
+fallback.
+
+True-W4A4 individual weights now own one persistent device alpha sourced from
+their existing model-lifetime host scalar. Merged gate/up and packed QKV each
+own one physical scalar plus a persistent merged host value, preserving the
+max-before-reciprocal operation order and avoiding a stack-backed asynchronous
+copy. Default CUDA CUTLASS model calls use these tensor views. The 35B W4A16,
+CPU/emulation, quantization producers, tactics, scheduler, KV, attention and GDN
+paths are unchanged.
+
+The ported executable contract covers malformed rank, numel, dtype, null,
+contiguity and cross-device inputs; non-unit host versus rank-one/rank-zero
+device alpha byte equality; device and host capture/replay; all 32 forced SM12
+tactics; and packed-QKV logical views. The warning-as-error CPU Release build
+passes its complete **103/103** suite. Focused Release, ASan+UBSan with leak
+detection and TSan under ASLR-disabled `setarch` each pass **17/17 cases +
+911/911 assertions**. The first focused run reported six failures because the
+new tests expected exact error text without `VT_CHECK`'s standard file/line
+prefix; all six operations had thrown the intended validation errors. The test
+now matches stable substrings and all three clean configurations pass.
+
+Disposition: this is an `ACTIVE` local implementation checkpoint, not hardware
+evidence or speed credit. No DGX build, CUDA operator, compute-sanitizer, model
+gate, allocation-count trace, node trace, component benchmark, exact grid or
+35B performance command ran. After publishing this checkpoint, W3-F3 must run
+the immutable CUDA/operator/safety/default+fallback 27B/35B-inertness and paired
+node-trace gates, followed by the frozen-plan c2/c16 component only if those
+pass. Immutable `3f256ab` stays binding at **55/124 pass, 69 fail**.

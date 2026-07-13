@@ -6363,3 +6363,34 @@ component is now `ACTIVE` under one uninterrupted `/tmp/gpu` lock. Partial legs
 remain non-binding. No W3-F speed credit, exact-grid authorization or 35B
 performance result exists yet, so immutable `3f256ab` remains binding at
 **55/124 pass, 69 fail**.
+
+## 2026-07-13 — W3-F component strict-fails; fresh executed-path scan active
+
+The immutable `7517af4` device-alpha versus `VT_FP4_DEVICE_ALPHA=0` component
+completed its full c2/c16 AB/BA/AB order under the original uninterrupted GPU
+lock. Both fixed model gates pass **235/235 + 16/16**. All **12/12** legs,
+**612/612** requests, **626,688** input tokens, **78,336** output tokens,
+**12/12** memory returns and **24/24** cache drops pass. All 12 processes load
+one identical **64/64 native plan map** with zero tuning, rejection, save or
+lazy miss; every paired repetition has 64/64 equal tactic IDs.
+
+The structural change is stable but performance-neutral. At c2, device/host
+mean total throughput is **152.871951898/152.571813445 = 1.0019671946x** with
+**16/20 timing + 3/4 memory** axes. At c16 it is
+**817.229771058/817.111876605 = 1.0001442819x** with **11/20 timing + 0/4
+memory** axes. Combined strict acceptance therefore **FAILS at 27/40 timing +
+3/8 memory**. All total-throughput CVs are below 0.088%; temperature is 51--65
+C and GPU/lock/port exit idle.
+
+Evidence is
+`~/work/vllm.cpp-nvfp4-device-alpha/7517af4f983fe322ac88ce2d9869e1441b7be3fd/evidence/component-ab-c2-c16-device-vs-host-alpha`.
+Summary/selection/driver/driver-log/provenance SHA are `676612c3...bf08` /
+`6006d999...cbd2` / `49d486ad...44db` / `b927ac4f...6871` /
+`f76174c5...776e`.
+
+Disposition: W3-F gets no speed credit. Its upstream-shaped implementation and
+correctness/structural evidence remain, but W3-F4 closes failed, W3-F5 did not
+run, and its dedicated claim is released. Immutable `3f256ab` stays binding at
+**55/124 pass, 69 fail**; every 35B performance command remains prohibited.
+The mandated multi-lens trace/source/dependency scan is active under
+`CLAIM-SERVE-GATE-1` to select one new bounded lever before any implementation.

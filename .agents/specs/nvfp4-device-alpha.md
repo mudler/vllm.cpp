@@ -1,7 +1,7 @@
 # NVFP4 model-owned device alpha (W3-F)
 
-Status: **GATING — G1-G4 complete on immutable `7517af4`; G5 frozen-plan
-component ACTIVE; G6 exact grid BLOCKED on G5**
+Status: **GATING — G1-G4 pass on immutable `7517af4`; G5 strict component
+FAILED at 27/40 timing + 3/8 memory; G6 exact grid BLOCKED**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -246,11 +246,37 @@ the corrected 33-test command passes. The first model attempt is
 commit-owned document from the immutable fixture produces the passing cache.
 None contributes a rate or correctness observation.
 
-G1-G4 and W3-F3 are complete. The unprofiled cache-off
-input-1,024/output-128 c2/c16 AB/BA/AB component is now **ACTIVE under one
-uninterrupted `/tmp/gpu` lock**. Partial legs do not bind. Therefore no W3-F
-ratio, exact-grid authorization, speed credit or 35B performance result exists
-at this checkpoint.
+G1-G4 and W3-F3 are complete.
+
+## Immutable strict component result
+
+The unprofiled cache-off input-1,024/output-128 c2/c16 AB/BA/AB component
+completed under one uninterrupted `/tmp/gpu` lock. Both model gates pass
+**235/235 + 16/16**. All **12/12** legs, **612/612** requests, **626,688** input
+tokens, **78,336** output tokens, **12/12** memory returns and **24/24** cache
+drops pass. Every process loads the identical **64/64 native plan map** with
+zero tuning, rejection, save or lazy miss; every paired repetition has 64/64
+equal tactic IDs. Temperature is 51--65 C and GPU/lock/port exit idle.
+
+At c2, device/host mean total throughput is
+**152.871951898/152.571813445 = 1.0019671946x**, with **16/20 timing + 3/4
+memory** axes. At c16 it is **817.229771058/817.111876605 =
+1.0001442819x**, with **11/20 timing + 0/4 memory** axes. Combined G5 therefore
+**FAILS at 27/40 timing + 3/8 memory**. Total-throughput CV is below 0.088% in
+all four arms, so this is a stable near-neutral result. Independent online text
+hashes are diagnostic under the already-corrected production-default
+batch-shape contract; fixed model gates and W3-C3R's immutable 6/6 x 128-token
+same-shape proof remain the correctness boundary.
+
+Evidence is under the same immutable root at
+`evidence/component-ab-c2-c16-device-vs-host-alpha`. Summary/selection/driver/
+driver-log/provenance SHA-256 values are `676612c3...bf08` /
+`6006d999...cbd2` / `49d486ad...44db` / `b927ac4f...6871` /
+`f76174c5...776e`.
+
+G5/W3-F4 is complete and strict-failed. W3-F receives no speed credit; G6 and
+all 35B performance remain blocked. The next action is a fresh multi-lens
+executed-path scan, not stacking another unmeasured change into W3-F.
 
 ## Work breakdown
 
@@ -260,8 +286,8 @@ at this checkpoint.
 | W3-F1 | tensor alpha operation/validation plus model-owned individual/merged residency and same-binary fallback | **complete on CPU and immutable CUDA build** |
 | W3-F2 | ported device-alpha/reference/capture/invalid-input tests and local build gates | **complete: CPU 103/103; focused Release/ASan+UBSan/TSan 17/17 + 911/911** |
 | W3-F3 | immutable CUDA safety, 27B/35B correctness and paired node trace | **complete: 33/33; strict memcheck 22/22 + 26,884/26,884; both 27B arms and 35B inertness pass; zero-versus-3,536 trace closes** |
-| W3-F4 | frozen-plan c2/c16 AB/BA/AB every-axis component | `ACTIVE under one uninterrupted GPU lock; partial legs non-binding` |
-| W3-F5 | exact v0.25 27B grid/trace, conditional on F4 passing every axis | `BLOCKED on F4` |
+| W3-F4 | frozen-plan c2/c16 AB/BA/AB every-axis component | **complete / FAILED: c2 1.001967x, 16/20 timing + 3/4 memory; c16 1.000144x, 11/20 timing + 0/4 memory; combined 27/40 + 3/8** |
+| W3-F5 | exact v0.25 27B grid/trace, conditional on F4 passing every axis | `BLOCKED: F4 failed; command did not run` |
 
 Any neutral or negative result is recorded honestly. A failed W3-F component
 returns the parity loop to a fresh executed-path scan; it does not authorize

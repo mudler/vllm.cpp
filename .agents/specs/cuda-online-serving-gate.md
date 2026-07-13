@@ -66,13 +66,14 @@ but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
 remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
 earns speed credit. The current W3-H trace-first refresh requires three
 lossless exact-plan captures before implementation. H1a/H1b/H1c and clean
-attempts through `e1acb75` are void. The latest completed the exact **154/154**
-build and passed the 27B gate **1/1 in 17.42 s**, then stopped before trace
-workload/report because the target was incorrectly required to share the
-`nsys` process group. The driver now records and validates the actual
-`nsys -> nsys-launcher -> separate target session` ancestry and owns cleanup
-of both sessions. Fresh evidence is pending; no exact rerun or 35B performance
-command is authorized.
+H1d attempts through `a96e899` are void. The latest completed the exact
+**154/154** build, passed the 27B gate **1/1 in 16.85 s**, completed 48/48 plus
+16/16 clients and closed exactly four replays, but target SIGTERM propagated
+Nsight exit 143 before validation. The driver now records the actual Nsight
+ancestry and uses a diagnostic-only synchronous SIGUSR1 waiter to call graceful
+`stop()`; the evidence contract requires its exact lifecycle plus profiler exit
+zero. Fresh evidence is pending; no exact rerun or 35B performance command is
+authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,

@@ -56,6 +56,13 @@ s**, but stopped before trace workload/report because the harness assumed the
 target shared `nsys`'s process group. The repair now validates the observed
 `nsys -> nsys-launcher -> separate target session` ancestry and owns both
 sessions. That run is also `VOID`; no newer speed number exists).
+Clean `a96e899` then repeated the exact build/gate, completed 48/48 ordinary
+requests plus a 16/16 probe and closed the exact four-replay window, but the
+owned SIGTERM made Nsight return 143 before SQLite validation. It is `VOID`,
+not a performance run. The diagnostic-only repair now consumes SIGUSR1 in a
+dedicated waiter, calls the server's graceful `stop()`, and requires the full
+shutdown lifecycle plus a zero-exit profiler; fresh immutable evidence is
+pending.
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -841,12 +848,45 @@ client/summary/trace tests pass **29/29**. A new pushed SHA/root must reproduce
 the valid build and correctness gate before it can supply three accepted
 captures.
 
+Clean pushed `a96e89929e76b8965d2c9328e4de91690e3ff984` used a new immutable
+root at
+`~/work/vllm.cpp-executed-path-refresh-h1d/a96e89929e76b8965d2c9328e4de91690e3ff984`.
+Plan-first setup, frozen corpus, exact `RelWithDebInfo` Triton-AOT/FA2/external-
+CUTLASS/sm_121a configuration and the recorded **154/154** build passed. The
+27B gate passed **1/1 in 16.85 s**. Plan/configure/build/model/server SHA-256
+are `79585698…f539` / `74e354df…4e4` / `4aff18c2…ad0c` /
+`d6385a2b…e37` / `b23a2925…e842`.
+
+Capture 1 then validated the repaired `nsys -> nsys-launcher -> separate
+target session` ancestry, loaded the exact read-only 64-plan map, completed the
+ordinary **48/48** c16 workload in 67.11 s and the **16/16** probe in 23.86 s,
+and logged `prior_replays=484` plus `captured_replays=4` for one graph. Those
+client rates are diagnostic and are not accepted as performance. Nsight wrote
+a 394,304-byte raw report (SHA `0f8c5c24…503`), but the driver then terminated
+the target session with SIGTERM. Nsight propagated target exit **143**; the
+zero-exit contract failed before export/SQLite, validation, captures 2/3 or the
+vLLM trace. Driver/profile/command/client/probe SHA-256 are
+`04cd5d5f…930` / `08fefb5a…360` / `516466ba…022` /
+`aee63930…f69` / `48ee33f8…4a4`. The root is **FAILED / VOID** and is never
+reused. GPU, `/tmp/gpu` and port 8001 returned idle.
+
+The repair does not accept 143. `VLLM_CPP_BENCH_PROFILE_CONTROL=ON` now blocks
+SIGUSR1 before engine workers start; a dedicated `sigwait` thread consumes the
+signal, records ready/requested/completed markers and calls the HTTP server's
+thread-safe `stop()`, allowing the target and Nsight to return zero. The driver
+uses SIGUSR1 only after the exact four-replay close marker, retains SIGTERM/KILL
+only as failure cleanup, and the profile record requires exactly one complete
+graceful-shutdown lifecycle with the same target PID. Production builds compile
+out this path. Python compilation, shell syntax, ShellCheck, diagnostic-macro
+C++ syntax and the CUDA-off server build pass; focused client/summary/trace tests pass
+**30/30** and the full CUDA-off CTest suite passes **106/106**. A fresh pushed
+SHA/root must still complete all three zero-exit
+captures before H1d supplies evidence.
+
 Current H1d disposition is **FAILED / NOT A PERFORMANCE RUN**: Python compile,
-shell syntax, focused harness tests **29/29** and a full CUDA-off Release build
-pass. The initially oversubscribed full CPU CTest pass completed **104/106**;
-both failures (`test_engine_core_proc` and `test_openai_conformance`) passed
-immediately when rerun serially (**2/2**), so the contended first outcomes are
-retained rather than represented as a clean 106/106 run. No accepted H1d
+shell syntax, focused harness tests **30/30**, diagnostic-macro syntax, a
+CUDA-off Release server build and the full CUDA-off suite **106/106** pass. The
+earlier oversubscribed **104/106** outcome remains historical only. No accepted H1d
 SQLite/status, throughput, latency, memory ratio or speed credit exists yet.
 The repaired manifest now rejects a wrong build type, missing vendored
 Triton-AOT/FA2 path, or enabled regeneration before acquiring the GPU lock.
@@ -904,12 +944,12 @@ Detailed release classification:
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; H1d REPAIR PENDING** | Immutable `3f256ab` remains **55/124**. W3-E/W3-F/W3-G strict-fail; H1a/H1b/H1c are `VOID`. Clean setup/execution attempts through `e1acb75` are also void. The latest exact build completed **154/154** and its 27B gate passed **1/1 in 17.42 s**, but profiling stopped before workload/report because the harness expected the target in the `nsys` process group; Nsight actually places it behind `nsys-launcher` in a separate target session. No accepted trace, ratio, exact grid or 35B performance exists. | Execute a fresh immutable `RelWithDebInfo` root with the repaired ancestry/cleanup contract; require exact build, correctness plus three uniquely linked, zero-exit, lossless, exact-plan captures. Only a later 48/48 component authorizes the exact grid; 35B performance remains held. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124; H1d REPAIR PENDING** | Immutable `3f256ab` remains **55/124**. W3-E/W3-F/W3-G strict-fail; H1a/H1b/H1c and H1d attempts through `a96e899` are `VOID`. `a96e899` repeats the exact **154/154** build, passes the 27B gate **1/1 in 16.85 s**, completes 48/48 + 16/16 clients and closes four replays, but SIGTERM makes Nsight exit 143 before validation. The repaired diagnostic path synchronously consumes SIGUSR1, calls graceful `stop()` and requires its exact lifecycle plus zero profiler exit. No accepted trace, ratio, exact grid or 35B performance exists. | Execute a fresh immutable `RelWithDebInfo` root with the repaired graceful-shutdown contract; require exact build, correctness plus three uniquely linked, zero-exit, lossless, exact-plan captures. Only a later 48/48 component authorizes the exact grid; 35B performance remains held. |
 | `ENG-BATCH-INVARIANT` | **ROADMAP INVENTORY — NOT IMPLEMENTED / NOT APPLICABLE TO PRODUCTION SPEED FLOOR** | vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` off; its opt-in determinism suite changes NVFP4, matmul, norm, attention and collective dispatch. C3R executes only the default-off contrast and records 0/6 sequential-vs-c2 equality for both engines. vllm.cpp exposes no matching opt-in mode, so no support or performance result is claimed. | After production parity, write `specs/batch-invariant-execution.md`, port the upstream operator/e2e determinism cases and gate correctness separately from the default production performance path. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE / GATING — H1d REPAIR PENDING** | W3-C control is complete; W3-E/W3-F/W3-G fail. H1a/H1b/H1c and clean attempts through `e1acb75` are `VOID`; the latest proves the exact build and correctness but yields no report because of the repaired Nsight target-session ownership invariant. The recipe now also records/validates `nsys -> nsys-launcher -> target` ancestry and owns both sessions. Retained-vLLM reaggregation finds **1,476** clean windows and normal production at **0.342627 ms/window**, diagnostic only. No W3-H2 vector kernel or accepted performance result exists. | Run a fresh immutable H1d. Implement only byte-identical, process-cached 256-bit-load/64-bit-store I/O if correctness and all three captures are lossless, exact-plan and launch/workload gates pass; exact grid/35B performance remain held. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE / GATING — H1d REPAIR PENDING** | W3-C control is complete; W3-E/W3-F/W3-G fail. H1a/H1b/H1c and H1d attempts through `a96e899` are `VOID`; the latest reaches the exact four-replay report but fails the mandatory zero-exit profiler contract at 143. The diagnostic-only repair adds synchronous SIGUSR1 graceful stop and lifecycle validation without changing inference. Retained-vLLM reaggregation finds **1,476** clean windows and normal production at **0.342627 ms/window**, diagnostic only. No W3-H2 vector kernel or accepted performance result exists. | Run a fresh immutable H1d. Implement only byte-identical, process-cached 256-bit-load/64-bit-store I/O if correctness and all three captures are lossless, exact-plan and launch/workload gates pass; exact grid/35B performance remain held. |
 | `KERNEL-ATTN-FA2` ratio-6 split-KV decode | **GATING — CORRECTNESS/STRUCTURE PASS; PERFORMANCE FAILED** | Immutable `ae9e8ff` passes **20/20 + 454,323** CUDA assertions, zero-error/zero-leak memcheck, both 27B arms and 35B correctness. Default/fallback traces switch exactly between **240 main+combine / 0 old** and **0 combine / 240 old**, while FP4 topology/plans are identical. The completed frozen c2/c16 component reaches **1.017668×/1.006548×** mean total throughput but strict-fails **35/40 timing + 5/8 memory**. All 12 legs, 612 requests, memory returns, cache drops and frozen plans pass; no exact grid follows. | Preserve the correctness-faithful route and fallback without speed credit; return to the executed-path scan. |
 | `KERNEL-EW-NORM-QUANT` | **PARTIAL — FALSE TRACE-NAME LEVER REFUTED** | vLLM's 127,040 long-named kernels stop after residual-add + RMSNorm to BF16; a separate `scaled_fp4_quant.out`/`cvt_fp16_to_fp4` follows, matching our two-kernel topology. `fuse_norm_quant` is false. Existing FP8 fusion remains gated and historical byte-exact/neutral `76e9047` stays shelved. | No spike/implementation is promoted from this trace. Revisit only if a future body/dispatch difference or surpass-track measurement justifies it independently. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `3f256ab` has c16 total throughput **1.027889×** but normalized mean TPOT/ITL **0.987450×**. Cross-profiler GDN totals remain diagnostic only; no new GDN lever is selected yet. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; revisit only after body-level residual ranking. Do not infer any 35B result. |

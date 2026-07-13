@@ -36,7 +36,7 @@ endif()
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
-  "Compile trace-only SIGUSR2/cudaProfiler graph replay control (never for production timing builds)"
+  "Compile trace-only SIGUSR2/cudaProfiler replay control plus SIGUSR1 graceful shutdown (never for production timing builds)"
   OFF)
 
 # Resolve the tri-state VLLM_CPP_CUDA into a plain ON/OFF. The normal variable

@@ -1,9 +1,10 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c and clean attempts through `e1acb75` are VOID;
-the latest completed the exact build and passed the 27B gate but stopped before
-trace workload/report on a repaired Nsight target-session ownership check; the
-repaired exact-path execution is pending and W3-H2 remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `a96e899` are VOID;
+the latest completed the exact build/gate and four-replay report but target
+SIGTERM propagated Nsight exit 143 before validation; the diagnostic-only
+graceful-stop repair is implemented, fresh exact-path execution is pending and
+W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -86,6 +87,22 @@ or vLLM trace exists; the root is void. Driver/profile-log SHA are
 `27f39c95…b053` / `84c68501…3fc`. H1d now validates and records the complete
 PID/PPID/PGID/SID ancestry, requires `nsys-launcher`, and separately owns
 target-session and profiler-session cleanup. The focused suite passes **29/29**.
+
+Clean `a96e899` then repeated the exact **154/154** build and passed the 27B
+gate **1/1 in 16.85 s**. Capture 1 validated that ancestry, completed 48/48
+ordinary requests plus a 16/16 probe and logged one exact four-replay window
+after 484 prior replays. Nsight wrote a 394,304-byte report, SHA
+`0f8c5c24…503`, but the driver terminated the target session with SIGTERM and
+Nsight propagated exit 143. No SQLite, accepted validation, captures 2/3 or
+vLLM trace exists. Driver/profile-log/command SHA are `04cd5d5f…930` /
+`08fefb5a…360` / `516466ba…022`; every client rate is diagnostic only. The
+root is void and never reused. H1d now blocks SIGUSR1 before engine workers
+start, consumes it synchronously in a diagnostic-only `sigwait` thread, calls
+the server's thread-safe `stop()` and requires ready/requested/completed
+markers with the same target PID plus profiler exit zero. SIGTERM/KILL remain
+failure cleanup only. Focused harness tests pass **30/30**; shell syntax,
+ShellCheck, diagnostic-macro syntax, the CUDA-off server build and full
+CUDA-off CTest suite **106/106** pass.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -393,6 +410,15 @@ after replay 4, then calls `cudaProfilerStop()`. The synchronization and probe
 are structural diagnostics: no probe duration, latency or throughput may be
 reported as performance.
 
+After the exact stop marker, the driver sends SIGUSR1 to the target PID. The
+diagnostic build blocks that signal before constructing the engine so all
+worker threads inherit the mask; one dedicated `sigwait` thread consumes it
+and invokes `ApiServer::stop()`. The target must log exactly one ready,
+requested and completed shutdown marker with the profiled PID, return zero and
+allow Nsight itself to return zero. Signal exits such as 143 remain failures;
+the contract is not relaxed. Default production builds contain neither the
+replay observer nor this shutdown waiter.
+
 The exact Nsight command is `--trace=cuda --capture-range=cudaProfilerApi
 --capture-range-end=stop --flush-on-cudaprofilerstop=true
 --cuda-flush-interval=0 --cuda-graph-trace=node:host-only
@@ -556,7 +582,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and clean attempts through `e1acb75` are VOID. The latest exact build/gate passed before a repaired Nsight ancestry check stopped without a report. The plan-first exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS driver-owned build, explicit launcher/target-session ownership and three-capture execution is pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `a96e899` are VOID. The latest exact build/gate and four-replay report pass but SIGTERM yields profiler exit 143 before validation. The plan-first exact build, explicit Nsight ancestry, synchronous diagnostic SIGUSR1 graceful stop, zero-exit contract and three-capture execution are pending fresh immutable evidence** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

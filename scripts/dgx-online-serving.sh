@@ -488,6 +488,16 @@ run_paired_traces() {
       echo "profiled server did not emit one exact ready marker" >&2
       return 1
     }
+    local shutdown_ready_pid=""
+    for _ in $(seq 1 60); do
+      shutdown_ready_pid=$(sed -n 's/^\[VT_BENCH_SHUTDOWN\] ready pid=\([0-9][0-9]*\) signal=SIGUSR1$/\1/p' "${ours_log}")
+      [[ $(wc -w <<<"${shutdown_ready_pid}") -eq 1 ]] && break
+      sleep 1
+    done
+    [[ ${shutdown_ready_pid} == "${server_pid}" ]] || {
+      echo "profiled server did not arm one exact graceful-shutdown waiter" >&2
+      return 1
+    }
     profiled_pid=${server_pid}
     kill -0 "${server_pid}" 2>/dev/null || {
       echo "profiled server PID is not live" >&2
@@ -546,7 +556,7 @@ run_paired_traces() {
       echo "profiled server did not close the exact four-replay window" >&2
       return 1
     }
-    kill -TERM -- "-${server_pgid}" 2>/dev/null || true
+    kill -USR1 "${server_pid}"
     local nsys_status=0
     local nsys_exited=0
     for _ in $(seq 1 60); do
@@ -557,7 +567,7 @@ run_paired_traces() {
       sleep 1
     done
     if ((nsys_exited == 0)); then
-      echo "nsys did not exit within 60 seconds after owned target shutdown" >&2
+      echo "nsys did not exit within 60 seconds after graceful target shutdown" >&2
       kill -INT -- "-${nsys_pid}" 2>/dev/null || true
       return 1
     fi
@@ -566,6 +576,14 @@ run_paired_traces() {
       echo "nsys exited ${nsys_status} for trace repetition ${trace_rep}" >&2
       return 1
     fi
+    grep -q '^\[VT_BENCH_SHUTDOWN\] requested signal=SIGUSR1$' "${ours_log}" || {
+      echo "profiled server did not record its graceful-shutdown request" >&2
+      return 1
+    }
+    grep -q '^\[VT_BENCH_SHUTDOWN\] completed signal=SIGUSR1$' "${ours_log}" || {
+      echo "profiled server did not complete graceful shutdown" >&2
+      return 1
+    }
     spid=""
     profiled_pid=""
     profiled_pgid=""

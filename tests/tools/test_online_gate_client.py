@@ -357,9 +357,12 @@ def write_profile_log(
         "[VT_FP4_AUTOTUNE] pre-serve warmup complete max_tokens=2048 "
         "profiles_requested=0 profiles_tuned=0 cached_plans=64",
         f"[VT_CUDA_PROFILE] ready pid={server_pid} signal=SIGUSR2 target_replays=4",
+        f"[VT_BENCH_SHUTDOWN] ready pid={server_pid} signal=SIGUSR1",
         "[VT_CUDA_PROFILE] started target_replays=4 graph=0x1234 "
         "real_batch=16 padded_batch=16 prior_replays=128",
         "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234",
+        "[VT_BENCH_SHUTDOWN] requested signal=SIGUSR1",
+        "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -673,8 +676,52 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("${server_ppid} == \"${launcher_pid}\"", script)
         self.assertIn("${server_pgid} == \"${server_pid}\"", script)
         self.assertIn("${server_sid} == \"${server_pid}\"", script)
-        self.assertIn('kill -TERM -- "-${server_pgid}"', script)
+        self.assertIn('kill -USR1 "${server_pid}"', script)
+        self.assertIn('kill -TERM -- "-${profiled_pgid}"', script)
         self.assertNotIn("server_pgid} == \"${nsys_pid}", script)
+
+    def test_profile_control_requires_graceful_shutdown_lifecycle(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            profile_log.write_text(
+                profile_log.read_text(encoding="utf-8").replace(
+                    "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1\n", ""
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                HarnessError, "complete graceful-shutdown lifecycle"
+            ):
+                record_profile_control(
+                    root / "control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=6000,
+                    server_sid=6000,
+                )
 
     def test_profile_control_rejects_a_flattened_nsys_process_group(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
@@ -1121,7 +1168,7 @@ class OnlineClientContractTests(unittest.TestCase):
             )
             (build / "examples/server").write_bytes(
                 b"MatmulNvfp4Cutlass\0[VT_FP4_CACHE] prepared\0"
-                b"[VT_CUDA_PROFILE] started\0"
+                b"[VT_CUDA_PROFILE] started\0[VT_BENCH_SHUTDOWN] ready\0"
             )
             oracle_files = {}
             for name in (

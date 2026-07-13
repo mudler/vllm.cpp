@@ -165,6 +165,15 @@ _CUDA_PROFILE_STOPPED_RE = re.compile(
     r"^\[VT_CUDA_PROFILE\] stopped captured_replays=(\d+) "
     r"graph=(0x[0-9a-f]+)$"
 )
+_BENCH_SHUTDOWN_READY_RE = re.compile(
+    r"^\[VT_BENCH_SHUTDOWN\] ready pid=(\d+) signal=SIGUSR1$"
+)
+_BENCH_SHUTDOWN_REQUESTED_RE = re.compile(
+    r"^\[VT_BENCH_SHUTDOWN\] requested signal=SIGUSR1$"
+)
+_BENCH_SHUTDOWN_COMPLETED_RE = re.compile(
+    r"^\[VT_BENCH_SHUTDOWN\] completed signal=SIGUSR1$"
+)
 
 
 def prompts_for(concurrency: int) -> int:
@@ -1560,9 +1569,31 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
     ready = [match for line in lines if (match := _CUDA_PROFILE_READY_RE.fullmatch(line))]
     started = [match for line in lines if (match := _CUDA_PROFILE_STARTED_RE.fullmatch(line))]
     stopped = [match for line in lines if (match := _CUDA_PROFILE_STOPPED_RE.fullmatch(line))]
+    shutdown_ready = [
+        match for line in lines if (match := _BENCH_SHUTDOWN_READY_RE.fullmatch(line))
+    ]
+    shutdown_requested = [
+        match
+        for line in lines
+        if (match := _BENCH_SHUTDOWN_REQUESTED_RE.fullmatch(line))
+    ]
+    shutdown_completed = [
+        match
+        for line in lines
+        if (match := _BENCH_SHUTDOWN_COMPLETED_RE.fullmatch(line))
+    ]
     if len(ready) != 1 or len(started) != 1 or len(stopped) != 1:
         raise HarnessError("profile log does not contain one complete CUDA profile window")
+    if (
+        len(shutdown_ready) != 1
+        or len(shutdown_requested) != 1
+        or len(shutdown_completed) != 1
+    ):
+        raise HarnessError(
+            "profile log does not contain one complete graceful-shutdown lifecycle"
+        )
     ready_pid, ready_target = ready[0].groups()
+    (shutdown_ready_pid,) = shutdown_ready[0].groups()
     start_target, start_graph, real_batch, padded_batch, prior_replays = started[0].groups()
     stopped_replays, stopped_graph = stopped[0].groups()
     if (
@@ -1573,6 +1604,7 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
         or int(padded_batch) != TRACE_CONCURRENCY
         or int(prior_replays) <= 0
         or stopped_graph != start_graph
+        or shutdown_ready_pid != ready_pid
     ):
         raise HarnessError("CUDA profile markers differ from the eligible four-replay contract")
     return {
@@ -1582,6 +1614,10 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
         "prior_replays": int(prior_replays),
         "ready_pid": int(ready_pid),
         "real_batch": TRACE_CONCURRENCY,
+        "shutdown_completed": True,
+        "shutdown_ready_pid": int(shutdown_ready_pid),
+        "shutdown_requested": True,
+        "shutdown_signal": "SIGUSR1",
         "target_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
     }
 
@@ -2876,9 +2912,15 @@ def record_execution_manifest(
     for marker in (b"MatmulNvfp4Cutlass", b"[VT_FP4_CACHE] prepared"):
         if not _file_contains(server_path, marker):
             raise HarnessError(f"server binary omits target marker {marker!r}")
-    has_profile_marker = _file_contains(server_path, b"[VT_CUDA_PROFILE] started")
-    if has_profile_marker is not profile_control:
-        raise HarnessError("server binary profile-control marker differs from its build")
+    for marker in (
+        b"[VT_CUDA_PROFILE] started",
+        b"[VT_BENCH_SHUTDOWN] ready",
+    ):
+        has_profile_marker = _file_contains(server_path, marker)
+        if has_profile_marker is not profile_control:
+            raise HarnessError(
+                f"server binary profile-control marker {marker!r} differs from its build"
+            )
 
     fixture_path = source_root / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
     if (

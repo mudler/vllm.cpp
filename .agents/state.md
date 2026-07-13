@@ -7014,3 +7014,40 @@ same checks. Shell syntax, Python compilation and the focused
 client/summary/trace suite pass **29/29**. Immutable `3f256ab` therefore still
 binds at **55/124 pass, 69 fail**. A fresh pushed SHA/root must repeat the exact
 build and correctness gate and complete three valid traces before W3-H2.
+
+## 2026-07-13 — seventh H1d attempt closed four replays; graceful zero-exit repair implemented
+
+Clean pushed `a96e89929e76b8965d2c9328e4de91690e3ff984` used the fresh immutable
+DGX root
+`~/work/vllm.cpp-executed-path-refresh-h1d/a96e89929e76b8965d2c9328e4de91690e3ff984`.
+Plan-first setup, frozen corpus, exact `RelWithDebInfo` Triton-AOT/FA2/external-
+CUTLASS/sm_121a configuration and the recorded **154/154** build passed. The
+mandatory 27B gate passed **1/1 in 16.85 s**. Plan/configure/build/model/server
+SHA-256 are `79585698…f539` / `74e354df…4e4` / `4aff18c2…ad0c` /
+`d6385a2b…e37` / `b23a2925…e842`.
+
+Capture 1 validated the repaired `nsys -> nsys-launcher -> separate target
+session` ancestry, loaded the exact read-only 64-plan map, completed the
+ordinary **48/48** c16 workload in 67.11 s and the **16/16** probe in 23.86 s,
+then logged `prior_replays=484` and `captured_replays=4`. Nsight wrote a
+394,304-byte report, SHA `0f8c5c24…503`. The driver then terminated the target
+session with SIGTERM; Nsight propagated exit **143**, and the fail-closed run
+stopped before SQLite export/validation, captures 2/3 or vLLM. Driver/profile/
+command/client/probe SHA-256 are `04cd5d5f…930` / `08fefb5a…360` /
+`516466ba…022` / `aee63930…f69` / `48ee33f8…4a4`. The root is **FAILED /
+VOID**, every client rate is diagnostic only, and it is never reused. GPU,
+`/tmp/gpu` and port 8001 returned idle.
+
+The repair keeps the zero-exit rule. Profile-control builds now block SIGUSR1
+before engine workers start; a dedicated `sigwait` thread consumes it, records
+ready/requested/completed markers and calls the HTTP server's thread-safe
+`stop()`. The driver sends SIGUSR1 only after the exact four-replay stop marker,
+retains SIGTERM/KILL only for failure cleanup and the evidence parser requires
+one complete graceful lifecycle with the same target PID plus profiler exit
+zero. Production builds compile out both diagnostic controls. Python compile,
+shell syntax, ShellCheck, diagnostic-macro C++ syntax and the CUDA-off server
+build pass; focused client/summary/trace tests pass **30/30** and the full
+CUDA-off suite passes **106/106**. Immutable `3f256ab`
+continues to bind at **55/124 pass, 69 fail**. Next: commit/push, create a new
+SHA-owned root and require all three zero-exit, lossless, exact-plan captures
+before any W3-H2 implementation, exact grid or 35B performance command.

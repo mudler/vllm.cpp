@@ -33,6 +33,12 @@
 #include <stdexcept>
 #include <string>
 #ifdef VT_BENCH_PROFILE_CONTROL
+#include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <pthread.h>
+#include <system_error>
+#include <thread>
 #include <unistd.h>
 #endif
 
@@ -173,6 +179,30 @@ int main(int argc, char** argv) {
   try {
     const Args args = ParseArgs(argc, argv);
 
+#ifdef VT_BENCH_PROFILE_CONTROL
+    // H1d runs the server as an Nsight target. A terminating signal makes
+    // Nsight propagate 128+signal instead of the target's successful exit,
+    // so reserve SIGUSR1 as a synchronous, diagnostic-build-only graceful
+    // shutdown request. Block it before the engine creates worker threads;
+    // every descendant thread then inherits the mask and the dedicated
+    // sigwait thread below is the only consumer.
+    sigset_t benchmark_shutdown_signals{};
+    sigset_t previous_signal_mask{};
+    if (args.cuda_profile_graph_replays > 0) {
+      if (sigemptyset(&benchmark_shutdown_signals) != 0 ||
+          sigaddset(&benchmark_shutdown_signals, SIGUSR1) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "configure benchmark shutdown signal");
+      }
+      const int mask_status = pthread_sigmask(
+          SIG_BLOCK, &benchmark_shutdown_signals, &previous_signal_mask);
+      if (mask_status != 0) {
+        throw std::system_error(mask_status, std::generic_category(),
+                                "block benchmark shutdown signal");
+      }
+    }
+#endif
+
     const fs::path dir(args.model_dir);
     const std::string config_path = (dir / "config.json").string();
     const std::string tokenizer_path = (dir / "tokenizer.json").string();
@@ -272,7 +302,59 @@ int main(int argc, char** argv) {
       std::cerr << server.http_worker_count() << " fixed";
     }
     std::cerr << ")\n";
-    if (!server.listen(args.host, args.port)) {
+
+#ifdef VT_BENCH_PROFILE_CONTROL
+    std::atomic<bool> benchmark_shutdown_waiter_ready{false};
+    std::atomic<bool> benchmark_shutdown_received{false};
+    std::thread benchmark_shutdown_thread;
+    if (args.cuda_profile_graph_replays > 0) {
+      benchmark_shutdown_thread = std::thread([&]() {
+        benchmark_shutdown_waiter_ready.store(true, std::memory_order_release);
+        std::cerr << "[VT_BENCH_SHUTDOWN] ready pid=" << getpid()
+                  << " signal=SIGUSR1\n";
+        int received_signal = 0;
+        const int wait_status =
+            sigwait(&benchmark_shutdown_signals, &received_signal);
+        if (wait_status != 0) {
+          std::cerr << "[VT_BENCH_SHUTDOWN] failed status=" << wait_status
+                    << "\n";
+          server.stop();
+          return;
+        }
+        benchmark_shutdown_received.store(true, std::memory_order_release);
+        std::cerr << "[VT_BENCH_SHUTDOWN] requested signal=SIGUSR1\n";
+        server.stop();
+      });
+      while (!benchmark_shutdown_waiter_ready.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+#endif
+
+    const bool listen_ok = server.listen(args.host, args.port);
+
+#ifdef VT_BENCH_PROFILE_CONTROL
+    if (benchmark_shutdown_thread.joinable()) {
+      if (!benchmark_shutdown_received.load(std::memory_order_acquire)) {
+        const int wake_status =
+            pthread_kill(benchmark_shutdown_thread.native_handle(), SIGUSR1);
+        if (wake_status != 0 && wake_status != ESRCH) {
+          std::cerr << "[VT_BENCH_SHUTDOWN] wake failed status=" << wake_status
+                    << "\n";
+        }
+      }
+      benchmark_shutdown_thread.join();
+      std::cerr << "[VT_BENCH_SHUTDOWN] completed signal=SIGUSR1\n";
+      const int restore_status =
+          pthread_sigmask(SIG_SETMASK, &previous_signal_mask, nullptr);
+      if (restore_status != 0) {
+        throw std::system_error(restore_status, std::generic_category(),
+                                "restore benchmark shutdown signal mask");
+      }
+    }
+#endif
+
+    if (!listen_ok) {
       std::cerr << "server: failed to bind " << args.host << ":" << args.port
                 << "\n";
       return 1;

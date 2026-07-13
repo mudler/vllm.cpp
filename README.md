@@ -274,6 +274,21 @@ OpenAI-compatible server.
 > no speed result. The repair now records and validates that full ancestry and
 > explicitly owns cleanup of both sessions; focused harness tests pass
 > **29/29**. A new pushed SHA/root is still required.
+> Clean `a96e899` then repeated the exact **154/154** build and passed the 27B
+> gate **1/1 in 16.85 s**. Capture 1 completed the ordinary **48/48** workload,
+> the **16/16** probe and the exact four-replay window (`prior_replays=484`,
+> `captured_replays=4`), producing a 394,304-byte report. It is nevertheless
+> **FAILED / VOID**: the driver terminated the target session with SIGTERM, so
+> Nsight propagated exit **143** and stopped before SQLite validation, captures
+> 2/3 or vLLM. No diagnostic client rate is accepted as performance. H1d now
+> reserves SIGUSR1 only in the diagnostic build, consumes it synchronously in
+> a dedicated waiter, calls the server's thread-safe `stop()` and requires one
+> complete graceful-shutdown lifecycle plus profiler exit zero. Production
+> builds retain neither control path. Focused harness tests pass **30/30**;
+> shell syntax/ShellCheck, diagnostic-macro syntax, the CUDA-off server build
+> and the full CUDA-off CTest suite **106/106** pass. The `a96e899` root is
+> never reused; fresh immutable evidence remains
+> pending.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.
@@ -415,7 +430,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes frozen-map control; W3-E and W3-F are mean-positive but strict-fail at **39/40 timing + 1/8 memory** and **27/40 + 3/8**, so neither earns speed credit. W3-G implements and correctness-gates the bounded FA2 BF16 ratio-6 split-KV adapter, but its completed c2/c16 component improves mean total throughput **1.017668×/1.006548×** while strict-failing at **35/40 timing + 5/8 memory**; it also earns no speed credit. Immutable `3f256ab` therefore still binds at **55/124**. W3-H is **ACTIVE / trace-first**: H1a/H1b/H1c are void. H1d's controller and schema are implemented, but setup/execution attempts through clean `e1acb75` are also void. The latest is the first to prove the exact build and pass the 27B gate, then stops before trace workload/report because the harness assumed a flat Nsight process group instead of the observed `nsys -> nsys-launcher -> separate target session`. The manifest now requires plan-first ordering, `RelWithDebInfo`, vendored Triton-AOT, FA2, CUTLASS and pinned tools; the driver builds before executable validation and records the real profiler ancestry with owned cleanup. A fresh immutable run remains pending before W3-H2. No speed credit, exact grid or 35B performance is authorized. The 35B ratio-8 path is explicitly inert. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; W3-H H1d immutable trace pending; 35B performance held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes frozen-map control; W3-E and W3-F are mean-positive but strict-fail at **39/40 timing + 1/8 memory** and **27/40 + 3/8**, so neither earns speed credit. W3-G implements and correctness-gates the bounded FA2 BF16 ratio-6 split-KV adapter, but its completed c2/c16 component improves mean total throughput **1.017668×/1.006548×** while strict-failing at **35/40 timing + 5/8 memory**; it also earns no speed credit. Immutable `3f256ab` therefore still binds at **55/124**. W3-H is **ACTIVE / trace-first**: H1a/H1b/H1c and H1d attempts through clean `a96e899` are void. `a96e899` proves the exact build/gate and reaches a four-replay report, but SIGTERM makes Nsight exit 143 before validation. The diagnostic-only repair now uses synchronous SIGUSR1 to call the server's graceful `stop()` and hard-gates its lifecycle plus zero-exit Nsight. A fresh immutable run remains pending before W3-H2. No speed credit, exact grid or 35B performance is authorized. The 35B ratio-8 path is explicitly inert. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; W3-H H1d immutable trace pending; 35B performance held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -425,7 +440,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing on the accepted configuration. Immutable `3f256ab` binds at **55/124**. W3-C frozen-map control passes; W3-E/W3-F/W3-G strict-fail their components and earn no speed credit. W3-H is **ACTIVE / trace-first**. H1a/H1b/H1c and clean setup/execution attempts through `e1acb75` are void. The latest exact build completed **154/154** and its 27B gate passed, but profiling stopped before workload/report on an incorrect process-group invariant. Exact H1d preflight now binds plan-first ordering, Triton-AOT, FA2, CUTLASS, build type, toolchain, driver-owned build and the observed `nsys -> nsys-launcher -> target-session` ancestry with owned cleanup; fresh captures remain pending. Exact grid and 35B performance remain blocked. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing on the accepted configuration. Immutable `3f256ab` binds at **55/124**. W3-C frozen-map control passes; W3-E/W3-F/W3-G strict-fail their components and earn no speed credit. W3-H is **ACTIVE / trace-first**. H1a/H1b/H1c and H1d attempts through `a96e899` are void. The latest exact build/gate and four-replay window pass, but SIGTERM yields profiler exit 143 before validation. H1d now binds plan/build/ancestry plus a diagnostic-only synchronous SIGUSR1 graceful stop and zero profiler exit; fresh captures remain pending. Exact grid and 35B performance remain blocked. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -462,7 +477,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing on the accepted configuration. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-C closes frozen-plan control; W3-E, W3-F and the separate W3-G attention repair preserve correctness/structure but strict-fail their components. `3f256ab` still fails **69/124** axes. The complete W3-H spike scopes only byte-identical, process-cached 256-bit-load/64-bit-store normal BF16→FP4 I/O behind an exact scalar fallback. H1a/H1b/H1c and clean attempts through `e1acb75` are `VOID`; the latest exact build/gate passed before a wrong flat-process-group assertion stopped profiling without a report. The repaired harness rejects configuration/order drift, builds before executable validation, validates the real Nsight ancestry and owns both sessions; fresh H1d evidence remains pending. No W3-H2 kernel, speed credit or support expansion is claimed. |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing on the accepted configuration. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-C closes frozen-plan control; W3-E, W3-F and the separate W3-G attention repair preserve correctness/structure but strict-fail their components. `3f256ab` still fails **69/124** axes. The complete W3-H spike scopes only byte-identical, process-cached 256-bit-load/64-bit-store normal BF16→FP4 I/O behind an exact scalar fallback. H1a/H1b/H1c and H1d attempts through `a96e899` are `VOID`; the latest exact build/gate and four replays pass, but SIGTERM makes Nsight exit 143. The repaired diagnostic harness uses a synchronous SIGUSR1 graceful stop and requires its exact lifecycle plus zero profiler exit; fresh H1d evidence remains pending. No W3-H2 kernel, speed credit or support expansion is claimed. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -581,10 +596,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   CMake had also disabled CUTLASS, so the trace used naive/WMMA FP4 GEMMs and
   its process log necessarily had no frozen-plan lifecycle. W3-H2 implementation
   remains prohibited and no speed credit is claimed. H1d now has its
-  diagnostic-build-only SIGUSR2/four-replay controller, exact CUTLASS
+  diagnostic-build-only SIGUSR2/four-replay controller, synchronous SIGUSR1
+  graceful shutdown, exact CUTLASS
   build/dispatch manifest, lossless SQLite/session validator, parsed plan and
   client contracts, and clean vLLM decode-window reaggregation implemented and
-  CPU-gated. Its three immutable DGX captures remain pending.
+  CPU-gated. Clean `a96e899` reaches its exact four-replay window but is
+  **VOID** because SIGTERM propagated Nsight exit 143 before validation. The
+  zero-exit graceful-stop repair is implemented; three fresh immutable DGX
+  captures remain pending.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.

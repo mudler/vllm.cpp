@@ -6585,3 +6585,42 @@ Vectorized normal BF16→FP4 production is the leading unstacked candidate from
 the prior source audit, but it must be reverified in fresh traces and receive a
 complete spike before any implementation. No candidate may be stacked onto the
 failed component.
+
+## 2026-07-13 — W3-H trace-first normal BF16→FP4 producer spike accepted
+
+The post-W3-G multi-lens scan and adversarial follow-up now close W3-H0 with a
+complete spike for `KERNEL-GEMM-NVFP4-W4A4` under
+`CLAIM-SERVE-GATE-1`. Current local normal BF16/direct-swizzled production is
+the scalar `ScaledFp4QuantKernel<__nv_bfloat16,true>`: each valid 16-value
+group reloads all BF16 inputs for packing and issues eight byte stores. vLLM
+v0.25.0's executed stable producer uses a predicated 256-bit input load and a
+packed 64-bit store. Both execute exactly 80 K=5,120 plus 64 K=6,144 normal
+producers per decode forward and launch equal total threads.
+
+Clean graph-node local slices total **0.627934 ms/decode forward**; geometry-
+separated vLLM decode slices total **0.343538 ms/forward**. The resulting
+**0.284396-ms/forward** opportunity is diagnostic only because local nsys and
+vLLM Torch-profiler windows differ. It cannot close the binding gaps alone.
+The local/vLLM SQLite/trace SHA values remain `6b9a0ddb...66dc` and
+`0c6f859f...0e2`; local/vLLM executable SASS confirms 32 scalar U16 loads and
+eight byte stores versus one 256-bit load and one 64-bit store.
+
+Adversarial history materially constrains the implementation. Shelved
+`f787cf8` combined vector I/O, hardware conversion, approximate reciprocal,
+normal and fused producers on the old linear-scale topology and measured
+1,584/1,573 versus 1,585/1,576 tok/s, with 2,468/37,888 packed-byte mismatches.
+W3-H therefore permits only byte-identical normal BF16/direct-swizzled I/O,
+process-cached toggle/capability dispatch and the exact scalar fallback. It
+excludes the old hot-path `getenv`, approximate reciprocal, hardware
+conversion, fused producer and geometry changes.
+
+Disposition: W3-H is **READY / trace-first**; H1 fresh exact current-source
+ours/vLLM tracing is **PENDING** and precedes implementation. No GPU command,
+new runtime code, accepted performance ratio, speed credit, exact grid or 35B
+performance exists at this checkpoint. Immutable `3f256ab` remains **55/124
+pass, 69 fail**. Next, freeze and push this record, create a clean immutable
+DGX source/build/evidence root, then run
+`scripts/dgx-online-serving.sh --trace-only --model 27` with the exact
+cache-off input-1,024/output-128 corpus under one uninterrupted `/tmp/gpu`
+lock. The fresh report must re-rank normal/fused producers, FP4 GEMMs, GDN,
+FA2 and all lifecycle/plan invariants before H2 may begin.

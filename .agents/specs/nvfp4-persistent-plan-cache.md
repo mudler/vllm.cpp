@@ -1,7 +1,8 @@
 # NVFP4 persistent FlashInfer-compatible plan cache (W3-C)
 
-Status: **ACTIVE; W3-C2 and six-process stability pass, W3-C3 same-plan
-long-output gate failed; fixed-plan localization ready**
+Status: **ACTIVE; W3-C2 and six-process stability pass; W3-C3R proves the
+cross-run long-output predicate invalid and the corrected same-plan component
+is ready**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -174,7 +175,7 @@ C2 changes no accepted performance ratio: immutable `3f256ab` remains 55/124.
 W3-C3 ran from pushed `d211b8f`; its result is recorded below. No 35B
 performance run is authorized.
 
-## W3-C3 immutable stability and failed same-plan checkpoint (2026-07-13)
+## W3-C3 immutable stability and invalid-predicate checkpoint (2026-07-13)
 
 Clean detached `d211b8f80fff831a712f0bfafa4f65f1abe1892d` was configured on
 GB10 with CUDA 13.0.88, sm_121a, CUTLASS 4.5 from the vLLM 0.25 FlashInfer
@@ -198,23 +199,66 @@ for only **2/6** requests; zero-based request indices 0--3 differ. Direct and
 fallback raw SHA are `42047046...842f` / `5bb0e70a...7296`, while compact
 generated-text SHA are `900f6134...ec7` / `b34a17e8...437`.
 
-That is a decisive G2/G4 correctness failure, not a timing result. The driver
-was intentionally stopped, its active process group cleaned up, and GPU, lock
-and port 8001 verified idle/free. All partial or unpaired timing/memory values
-are **VOID**; c16, G3 tracing, G5 exact vLLM grid and every 35B performance
+The then-current G2/G4 predicate treated that as a correctness failure, so the
+driver correctly stopped, cleaned its active process group, and verified GPU,
+lock and port 8001 idle/free. All partial or unpaired timing/memory values
+remain **VOID**; c16, G3 tracing, G5 exact vLLM grid and every 35B performance
 command did not run. Evidence is
 `~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence`;
 failure-summary/driver/driver-log SHA are `01c9faf6...bd74`,
 `fd76dd8b...b886` and `67307adc...b5b`.
 
-The cache implementation is stable; the open failure is the direct versus
-composed scale path under one fixed executable plan map. Before rerunning C3,
-localize the first divergent request/token and then the first divergent
-layer/GEMM or producer byte under the loaded tactic. Repair the implementation
-if the direct path is not byte-equivalent, or reclassify W3-E if concurrent
-long-output equality is not a valid equivalence property only after grounding
-that conclusion against vLLM's determinism tests. The acceptance rule itself
-is not weakened speculatively.
+The cache implementation is stable. W3-C3R below resolves whether the stopped
+pair exposed a direct/composed numerical defect or an invalid production-mode
+equivalence boundary. The failed predicate remains part of the historical
+record; none of its partial performance evidence is rehabilitated.
+
+## W3-C3R batch-shape localization and gate correction (2026-07-13)
+
+Two lock-held diagnostics from the same immutable `d211b8f` build hold the
+input corpus, frozen 64-plan map, sampling, token counts and model constant
+while varying only scheduler batch shape:
+
+1. Six requests sent strictly sequentially through direct and
+   `VT_FP4_DIRECT_SF=0` servers are **6/6 equal for all 128 output tokens**.
+   Each server loads the same 64 native plans, tunes/misses 0/0 and retains the
+   fixed model-gate preconditions. Comparison SHA is `42d74898...cf41`.
+2. Each arm's earlier c2 output is **0/6 equal** to its own sequential output.
+   Therefore the independent A/B text mismatch is batch-shape dependent, not
+   a direct-scale producer-byte boundary.
+3. The exact vLLM v0.25.0 production server, with prefix caching off and
+   `VLLM_BATCH_INVARIANT` explicitly unset, is likewise **0/6 equal** for the
+   same requests run sequentially versus at c2; the first divergence occurs at
+   output token 0--7. Comparison SHA is `cb717bb2...c597`.
+
+This executed result matches upstream's explicit contract. `vllm/envs.py:89,
+576-578` defaults `VLLM_BATCH_INVARIANT` off. The determinism fixture enables
+it only for that suite (`tests/v1/determinism/conftest.py:9-12`); the NVFP4
+operator test requires a fresh opt-in process and compares full-M rows with
+M=1 (`test_nvfp4_batch_invariant_scaled_mm.py`), while the e2e test compares a
+prompt alone with the same prompt inside a batch only under that fixture
+(`test_nvfp4_batch_invariant.py`). On SM12 the opt-in path also selects a
+dedicated persistent-scheduler GEMM configuration
+(`nvfp4_scaled_mm_sm120_kernels.cu:212-220`). It is a distinct execution mode,
+not a property of the production performance denominator.
+
+Accordingly the old **6/6 exact texts across two independently scheduled
+production runs** predicate is reclassified as invalid and removed. This does
+not relax model correctness: G2/G4 retain byte-exact direct/composed producer
+and fixed-tactic GEMM tests; both 235/235 + fixed vLLM 16/16 model gates; the
+new controlled **6/6 x 128-token same-shape sequential** direct/fallback proof;
+exact request/input/output counts; frozen 64/64 identical plans; zero tuning /
+misses; lifecycle; and every timing/memory axis. Per-leg online output hashes
+remain diagnostic, because changing implementation latency can legitimately
+change production scheduler batch composition on both vLLM and vllm.cpp.
+
+The combined evidence summary is
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/c3r-reclassification-summary.json`
+(SHA `a1c500b3...41de`). This checkpoint is correctness-only: all timings and
+memory observations are **NOT APPLICABLE**, immutable `3f256ab` remains
+55/124, and no 35B performance command ran. vLLM's opt-in batch-invariant mode
+is inventoried separately as unsupported parity breadth; it is not enabled for
+the production speed gate.
 
 ## Cache schema, identity and lifecycle
 
@@ -355,9 +399,11 @@ checked in as an explicit skipped/future distributed-row case.
   captures/replays without a miss;
 - default and `VT_FP4_DIRECT_SF=0` 27B gates each pass 235/235 plus the fixed
   16/16 oracle token stream with one identical frozen map;
-- all paired 128-token output hashes must be 6/6 equal before W3-E is
-  reclassified. The 35B correctness-only inertness gate may run; no 35B
-  performance run is authorized.
+- direct and fallback must be 6/6 equal for all 128 output tokens in the
+  controlled same-shape sequential diagnostic. Exact text equality across
+  independently scheduled production runs is diagnostic only, matching
+  vLLM's default-off batch-invariance contract. The 35B correctness-only
+  inertness gate may run; no 35B performance run is authorized.
 
 ### G3 — exact executed-oracle plan parity
 
@@ -372,11 +418,15 @@ checked in as an explicit skipped/future distributed-row case.
 
 Under one uncontended `/tmp/gpu` lock, rerun direct versus
 `VT_FP4_DIRECT_SF=0` at c2/c16 in AB/BA/AB order with the same immutable
-read-only oracle-derived map. Require exact request/output counts, 6/6 paired
-long-output hashes, all lifecycle/memory returns, 64/64 identical selected IDs,
-zero tuning/misses, and no regression on all 40 timing + 8 memory axes. Report
-W3-C separately from W3-E: cache correctness can pass even if direct scales
-still fail the component.
+read-only oracle-derived map. Before the timed series, retain the controlled
+same-shape 6/6 x 128-token sequential direct/fallback proof plus both fixed
+235/235 + vLLM 16/16 model gates. Timed legs require exact request/input/output
+counts, all lifecycle/memory returns, 64/64 identical selected IDs, zero
+tuning/misses, and no regression on all 40 timing + 8 memory axes. Cross-leg
+generated-text hashes are retained as diagnostics, not compared as an exact
+predicate, because neither production-default vLLM nor vllm.cpp is
+batch-invariant. Report W3-C separately from W3-E: cache correctness can pass
+even if direct scales still fail the component.
 
 ### G5 — binding vLLM v0.25 grid
 
@@ -424,8 +474,8 @@ and 11,947 bytes.
 | W3-C0 | whole-chain v0.25/dependency/runtime audit, exact cache fixture contract, files/tests/gates | **complete in this spike** |
 | W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | **complete: Release/ASan+UBSan/TSan 6/6 + 174/174; full CPU 103/103** |
 | W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | **complete: CPU/sanitizers + CUDA runtime/save/memcheck + both frozen 27B arms pass** |
-| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | **FAILED:** six-process stability passes; first same-plan c2 pair has only 2/6 equal long outputs, so the series stops and performance is void |
-| W3-C3R | fixed-plan direct/fallback localization at request/token, layer/GEMM and producer-byte boundaries; repair or evidence-backed reclassification, then complete G4 rerun | `READY` under this spike; no acceptance relaxation |
+| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | **PARTIAL:** six-process stability passes; first component was stopped by the now-invalid cross-run exact-text predicate and all partial performance remains void |
+| W3-C3R | fixed-plan direct/fallback localization at request/token and batch-shape boundaries; repair or evidence-backed reclassification, then complete G4 rerun | **complete:** sequential arms are 6/6 x 128 equal; each batched arm is 0/6 equal to itself sequentially; production-default vLLM is also 0/6, so cross-run equality is reclassified and the corrected G4 is ready |
 | W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | blocked on C3 acceptance |
 
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and

@@ -6172,3 +6172,49 @@ byte-equivalence contract, or reclassify W3-E only with grounded vLLM
 determinism evidence; do not weaken 6/6 equality speculatively. Rerun the full
 C3 gate from a new immutable evidence root before any exact grid or 35B
 performance.
+
+## 2026-07-13 — W3-C3R proves batch-shape dependence and corrects the component gate
+
+The required fixed-plan localization is complete without an inference-code
+change. Under one lock, immutable `d211b8f` starts direct then
+`VT_FP4_DIRECT_SF=0` servers from the same frozen native cache and sends the
+same six c2-r1 prompts strictly sequentially. Both arms load 64/64 native
+plans, tune/miss 0/0 and return **6/6 identical 128-token outputs**. Comparison
+SHA is `42d74898dd6cad9787cde2b4df9b8acd23a2d358cebeefb97cb95222d2f0cf41`.
+Comparing either arm with its own earlier c2 result yields **0/6** equality, so
+the stopped direct/fallback mismatch depends on scheduler batch shape rather
+than the direct scale producer boundary.
+
+The conclusion is grounded in source, tests and executed oracle behavior.
+vLLM v0.25.0 defaults `VLLM_BATCH_INVARIANT` false at `vllm/envs.py:89,
+576-578`; its determinism fixture opts in at
+`tests/v1/determinism/conftest.py:9-12`. The NVFP4 operator test requires a
+fresh opt-in process and compares a full M GEMM row with M=1, while the e2e
+test compares a prompt alone with the same prompt inside a batch only under
+that fixture. SM12 opt-in dispatch selects a dedicated persistent-scheduler
+configuration at
+`csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu:212-220`.
+
+A second one-lock run starts the exact production vLLM v0.25.0 server with
+prefix caching off and `VLLM_BATCH_INVARIANT` explicitly unset, then sends the
+same corpus sequentially and at c2. The result is also **0/6** equality, with
+first divergences at output token 0--7. Comparison/server/driver SHA are
+`cb717bb2...c597`, `725461a8...b4e3` and `0a73c978...40ca`. GPU, lock and port
+exit idle/free after both diagnostics.
+
+Disposition: exact text equality across two independently scheduled
+production A/B runs is an invalid opt-in batch-invariance predicate and is
+removed from W3-C G2/G4. This is not a general correctness relaxation. The
+corrected gate retains byte-exact direct/composed producer and fixed-tactic
+tests, both **235/235 + vLLM 16/16** model gates, the controlled **6/6 x
+128-token** same-shape proof, exact counts, identical frozen 64/64 plans, zero
+tuning/misses, lifecycle and all 40 timing + 8 memory axes. Per-leg online
+hashes remain diagnostic. vLLM's opt-in mode is now separately inventoried as
+`ENG-BATCH-INVARIANT`; no local support is claimed.
+
+Combined evidence summary SHA is
+`a1c500b34baf197fce1876083b3e3f868c734f3b966670d73e6fde9a988f41de`.
+Every C3R timing/memory observation is **NOT APPLICABLE**, the stopped C3
+partial performance remains **VOID**, and immutable `3f256ab` remains binding
+at **55/124**. Corrected C3 c2/c16 is next. No exact grid or 35B performance
+command ran or is authorized before that component passes.

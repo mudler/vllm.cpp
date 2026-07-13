@@ -173,6 +173,16 @@ match and only 9--17 keys per arm retain one ID across all three c16 runs, so
 plan selection is recorded as a confounder rather than assigned as the cause.
 Summary/selection SHA-256 are `cfff5711...50e9` / `ceaa5296...47b4`.
 
+W3-C3R later resolves the text-hash observation without changing this failed
+performance disposition. With one frozen 64-plan map, direct and fallback are
+**6/6 x 128-token equal** when requests are sent sequentially with identical
+batch shape, while each arm is **0/6** equal to its own earlier c2 output.
+Production-default vLLM v0.25.0, with `VLLM_BATCH_INVARIANT` unset, is likewise
+**0/6** equal between sequential and c2 execution. Cross-run online text hashes
+are therefore diagnostic, not a correctness predicate; the component still
+fails independently at **32/40 timing + 6/8 memory** and receives no speed
+credit. Reclassification summary SHA is `a1c500b3...41de`.
+
 ### G5 — oracle grid
 
 If G1-G4 pass, run the full immutable vLLM v0.25.0 27B c1/2/4/8/16/32

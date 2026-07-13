@@ -7505,3 +7505,38 @@ ports stay idle. Agent-record/doc mutation contracts pass **18/18** and the
 diff check is clean; no production code changed. Live README, BENCHMARKS,
 roadmap, matrices, coordination, environment, inventory, and specs now contain
 only this accepted current checkpoint.
+
+## 2026-07-13 — W3-I fused-producer whole-chain spike accepted
+
+The selected fused SiLU→FP4 route was traced through vLLM `702f481` model and
+fusion dispatch, stable custom op, vector/quant helpers, FlashInfer CUTLASS
+consumer, generated Inductor code, local dispatch, tests, and both compiled
+binaries. The vLLM fused sources and tests are unchanged from parity pin
+`e24d1b24`; the only listed-file target delta is an unrelated CPU MoE fake in
+`_custom_ops.py`.
+
+The accepted local reports execute 64 BF16/swizzled fused producers per decode
+window. Each local call launches grid `(544,1,1)` / block 256 and sweeps the
+entire padded scale allocation inside the custom kernel. The vLLM executable
+graph instead allocates three padded scale buffers and zeroes them together in
+generated `triton_poi_fused_0`, then launches a block-512 2-D custom kernel over
+actual rows/groups. Generated file
+`.../inductor_cache/5w/c5witfuvalucva6yzxyahzqeuejurui2tvihcy3m424u5lj57hdl.py`
+has SHA-256 `6e2ee70d…a5ba`; its lines 1263-1272 perform the combined zero and
+1329-1338 call fused quant plus the downstream FP4 GEMM.
+
+Disassembly grounds the body gap. Local object SHA `7f06f46d…e965e` emits
+1,480 instructions, 32 scalar BF16 loads and eight byte stores; vLLM stable-op
+binary SHA `56c647dd…df4` emits 384 instructions, two 256-bit loads, one 64-bit
+packed store and hardware packed E2M1 conversion. Registers are 38/40, so the
+structural instruction/memory topology—not a resource-count guess—owns W3-I.
+
+The new [W3-I spike](specs/nvfp4-fused-silu-producer.md) marks I0 complete and
+I1 `READY`. I1 is limited to an opt-in BF16/direct-swizzled packed candidate
+with explicit safe scale pre-zero and scalar rollback. It must pass operator,
+poison-padding, graph, sanitizer, SASS, 27B/35B model and paired-structure
+gates before the c2/c16 40-timing + 8-memory same-binary component. I2+
+zero-lifecycle aggregation, normal H2, exact grid and 35B performance remain
+prohibited. No production code, GPU run, benchmark ratio, or speed credit
+changed; binding `3f256ab` remains **55/124**. Live status surfaces replace the
+former “spike pending” checkpoint instead of accumulating another narrative.

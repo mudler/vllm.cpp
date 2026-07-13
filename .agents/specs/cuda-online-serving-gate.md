@@ -25,8 +25,11 @@ graph-family/topology, zero-eager, cross-report, plan, profile, identity, and
 lifecycle validation. Passing status SHA is `84d15970…6e66`. Cross-profiler
 attribution ranks fused SiLU→FP4 at +0.357354 ms/window, normal BF16→FP4 at
 +0.313930, and FA2 main at +0.130975; fused exceeds normal in all 12 reports.
-Normal W3-H2 is displaced pending a dedicated fused-producer spike. No ratio,
-speed credit, exact grid, or 35B performance is authorized meanwhile.
+Normal W3-H2 is displaced. The dedicated
+[W3-I spike](nvfp4-fused-silu-producer.md) is now accepted: generated compiler
+zeroing, executed launch geometry and local/vLLM 1,480/384-instruction SASS
+bodies are grounded, and only an opt-in I1 implementation is authorized. No
+ratio, speed credit, exact grid, or 35B performance is authorized meanwhile.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -231,11 +234,11 @@ reported as a clean dependency check.
    its immutable root. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. H1d
-   selects fused SiLU→FP4 ahead of normal production in 12/12 reports; write
-   its whole-chain spike before implementation. W3-B already closes the
-   original wide FP4 tactic-family mismatch; do not infer speed credit from
-   cross-profiler attribution while exact TPOT/ITL and host-memory axes remain
-   red.
+   selects fused SiLU→FP4 ahead of normal production in 12/12 reports. W3-I0
+   completes its whole-chain spike; implement and gate only opt-in I1 next.
+   W3-B already closes the original wide FP4 tactic-family mismatch; do not
+   infer speed credit from cross-profiler attribution while exact TPOT/ITL and
+   host-memory axes remain red.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

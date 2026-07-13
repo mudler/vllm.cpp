@@ -10,11 +10,12 @@ Claim: `CLAIM-SERVE-GATE-1`
 
 This spike scoped one bounded CUDA execution difference after W3-G's
 correctness-faithful FA2 path strict-failed its c2/c16 component. H1's accepted
-fresh trace now displaces that implementation leaf with the larger fused
-SiLU→FP4 residual. W3-H therefore remains the complete normal-producer design
-and evidence record but authorizes no H2 code. It does not claim an end-to-end
-win, change binding `3f256ab` at 55/124 axes, authorize an exact grid, or
-authorize any 35B performance command.
+fresh trace displaces that implementation leaf with the larger fused
+SiLU→FP4 residual. W3-H remains the complete normal-producer design and
+authorizes no H2 code; the selected work is now owned by the accepted
+[W3-I fused-producer spike](nvfp4-fused-silu-producer.md). Neither spec claims
+an end-to-end win, changes binding `3f256ab` at 55/124 axes, authorizes an exact
+grid, or authorizes any 35B performance command.
 
 ## Current H1 trace checkpoint
 
@@ -500,7 +501,7 @@ throughput binds.
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
 | W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **COMPLETE: schema-v5 `c498a413` passes status `84d15970…6e66`; fused production ranks above normal in 12/12 reports** |
-| W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **DEFERRED / NOT IMPLEMENTED: displaced by the larger fused-producer residual** |
+| W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **DEFERRED / NOT IMPLEMENTED: displaced by W3-I fused production** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **deferred with H2** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **deferred with H2** |
 | W3-H5 | conditional default flip, exact v0.25 27B 124-axis grid and lifecycle classification | **deferred with H2; exact grid remains blocked** |

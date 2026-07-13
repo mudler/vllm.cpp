@@ -15,9 +15,11 @@ OpenAI-compatible server.
 > production-default output non-repeatability diagnostically after the
 > mandatory token gate. Cross-profiler attribution ranks the fused SiLU→FP4
 > producer above the normal producer in all 12 reports, so normal-producer
-> W3-H2 is displaced and a dedicated fused-producer spike is next. This is not
-> speed credit: the binding result remains **55/124**, and no 35B performance
-> result is claimed. See
+> W3-H2 is displaced. The dedicated [W3-I spike](.agents/specs/nvfp4-fused-silu-producer.md)
+> is now complete: it grounds the executed scale-zero lifecycle, 544-block
+> scalar launch, and 1,480-vs-384-instruction SASS gap, and authorizes only an
+> opt-in packed candidate. No candidate or speed credit exists yet: the binding
+> result remains **55/124**, and no 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -25,10 +27,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Revalidate and rank the completed W3-H trace, gate the selected repair, then rerun all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Implement and strictly gate opt-in W3-I1; only a passing component can authorize all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / H1 complete | `c498a413` passes final schema-v5 status under validator `7112864`; fused-producer residual is larger than the normal-producer residual in 12/12 reports | Keep W3-H2 unimplemented; spike and gate the fused producer first |
+| W3-I fused SiLU→FP4 producer | 🟦 `READY` / I0 complete | Whole-chain source, generated-code, trace and SASS spike accepted; no runtime code or ratio changed | Implement opt-in BF16/swizzled packed candidate, then run correctness, SASS, trace and 48-axis component gates |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -58,7 +60,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
 | Vectorized normal BF16→FP4 I/O | Not implemented. Accepted H1d attribution ranks its diagnostic residual at **+0.313930 ms/window**, below the fused producer in 12/12 reports; W3-H2 is displaced |
-| Fused SiLU→FP4 producer | Not implemented. Largest positive mapped H1d residual at **+0.357354 ms/window**; a dedicated whole-chain spike is the next implementation prerequisite |
+| Fused SiLU→FP4 producer | W3-I0 spike complete; implementation not started. The executed gap is concrete: local scalar/padded-sweep grid `(544,1,1)` and 1,480 SASS instructions versus vLLM's pre-zeroed 2-D packed body and 384 instructions. W3-I1 is an opt-in candidate with strict rollback gates |
 
 ## What is implemented
 
@@ -128,7 +130,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; `c498a413` is accepted diagnostic trace evidence and selects the fused producer for the next spike |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; accepted trace/SASS evidence selects W3-I and its opt-in packed candidate is `READY`, not implemented |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -155,7 +157,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; accepted `c498a413` trace attribution selects the fused producer, but no speed credit is claimed |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; W3-I0 fully scopes the selected fused producer, but its packed candidate and speed gate remain pending |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -178,8 +180,9 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: fused SiLU→FP4 producer spike → selected
-component gate → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the
+The next execution order is fixed: opt-in W3-I fused-producer implementation →
+correctness/SASS/trace and 48-axis component gate → all-axis 27B parity → 35B
+parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.
 

@@ -6679,3 +6679,53 @@ Next: commit/push this checkpoint, create a clean immutable H1c source/build/
 evidence root, run the exact frozen-map three-capture trace under one lock, and
 accept a residual ranking only if all three SQLite validators pass. Only then
 may W3-H2 or a newly displaced higher-ranked spike begin.
+
+## 2026-07-13 — immutable W3-H1c failed closed on capture 1; H1d pending
+
+Immutable H1c executed from clean pushed
+`d1f8e332277da1f55effb756d6119bbb7f55b439` at
+`~/work/vllm.cpp-executed-path-refresh-h1c/d1f8e332277da1f55effb756d6119bbb7f55b439`
+under one exclusive `/tmp/gpu` lock. The exact Qwen3.6-27B snapshot revision
+was `890bdef7a42feba6d83b6e17a03315c694112f2a`; server SHA was
+`ef129b27d46b45fb6c74ca0f3260898f380fe712ee5cfe9457cfe3325d05d588`;
+the read-only fixture SHA remained
+`e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd`;
+and retained environment SHA was
+`854c2813ad871b030b8815af35fce03ce45f548ff56ed2d3575c76a93478b56e`.
+The 27B model gate passed in **19.20 seconds** with log SHA
+`3f0f15be3c155ac9b03fcfd0d6a28eca1d650b149df74fe64cec1d55e227a91f`.
+Cache eviction covered 49 files / 26.5 GB and left zero resident pages.
+
+Capture 1 completed all **48/48** measured requests with 49,152 input and
+6,144 output tokens, but its exported SQLite contains a severity-2 diagnostic:
+`Not all CUDA events might have been collected.` Nsight reported **818,537**
+collected CUDA events; the SQLite has **637,532** kernel rows. The fail-closed
+driver stopped immediately, before capture 2, capture 3, any accepted SQLite
+validation/status, or the vLLM profiler. Retained SHA-256 values are:
+
+- driver log `3705142a8e68ed128f8ae2874542d040af332e1abf5795a233f68865509af630`;
+- capture report `1ade2dbd8fc1d6a543246c3142e8ca6a403591bdb6ab3514992914f2c38c5ad5`;
+- SQLite `0fadc3f96f2ff950837b98872415c23291d2a75ce8cc244d4d131f0b6915229f`;
+- kernel summary `2a46b6c09e6605b6d085d5ac55e34d78cfea117c5143634c1e9bfa379efddef6`;
+- profile log `5ad5a8a35336140deb0e046271d66b64c5ed560d2004eb53ca23f38ca8cbbaa2`;
+- capture command `83825d4322f146126bb6a88c703eef74696410a1c19add2b4a848549707f0a6a`;
+- client result `cecf18eea41f7c0aa124ab730df515c16693bc9b81ec195693405050119ac1dd`.
+
+The adversarial harness audit found additional evidence gaps. The new path
+does reject H1b's known loss pattern, but it does not parse the frozen-plan
+lifecycle, reconcile graph nodes to graph launches and the exact workload,
+constrain the full primary-node identity/geometry, prove distinct capture
+linkage/comparability, or independently recompute the vLLM raw-trace workload.
+Legacy summary input can also omit the new capture schema. The H1c profile log
+contains **zero** plan lifecycle/selection records, so the exact
+FlashInfer-64/native-0, zero-tune/reject/save/lazy and selected-map SHA contract
+cannot be recovered post-hoc. H1c is therefore **FAILED / VOID**, not partial
+benchmark evidence.
+
+Disposition: immutable `3f256ab` remains the binding vLLM v0.25.0 result at
+**55/124 pass, 69 fail**. No performance number, ratio, speed credit, exact
+grid, W3-H2 implementation or 35B performance command follows. `/tmp/gpu`, the
+GPU and serving ports are idle. Next: harden lossless collection plus exact
+plan/workload/graph/capture/vLLM semantic validation, commit and push it as the
+H1d checkpoint, then execute three independent immutable captures before any
+residual ranking.

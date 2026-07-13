@@ -1,7 +1,7 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b are VOID; hardened lossless frozen-map H1c is
-pending and implementation remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d collector and semantic-evidence
+hardening is pending and implementation remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -19,8 +19,14 @@ H1 has now completed two paired attempts from immutable `5d8af792`, but neither
 is binding. H1a used a writable native tactic cache and changed 37/64 selected
 plans. H1b restored the exact read-only 64-plan fixture and completed every
 workload/lifecycle arm, but Nsight reported dropped CUDA events and the dominant
-graph had uneven node replay counts. The harness is now hardened for H1c; no
-runtime implementation or speed credit follows from either void trace.
+graph had uneven node replay counts. Immutable H1c at `d1f8e33` then passed
+the 27B model gate in 19.20 seconds and completed 48/48 capture-1 requests, but
+Nsight emitted severity-2 `Not all CUDA events might have been collected`
+after reporting 818,537 collected CUDA events. The fail-closed driver stopped
+before captures 2/3 and vLLM. Its retained process log has zero plan
+lifecycle/selection records, so the exact frozen-map contract is not
+recoverable post-hoc. No runtime implementation or speed credit follows from
+any of the three void traces.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -301,26 +307,42 @@ Before implementation, run current pushed source and the validated vLLM
 v0.25.0 oracle under one `/tmp/gpu` lock using the exact 27B cache-off c16,
 input-1,024/output-128, 48-prompt x three-repetition contract in
 `scripts/dgx-online-serving.sh --trace-only`. Ours uses **three independent**
-Nsight Systems captures, one repetition each, with
+Nsight Systems captures, one repetition each. H1c used
 `--cuda-graph-trace=node --cuda-flush-interval=10000 --sample=none
---cpuctxsw=none`; each target idles for one final 11-second flush interval.
+--cpuctxsw=none` plus a final 11-second drain and still lost events, so those
+flags are now a failed constraint rather than an H1d recipe. H1d must retain
+lossless node-level attribution while bounding the capture range and/or trace
+buffers enough to avoid loss, and must record the exact profiler version,
+flags, exit status and capture-range markers.
 Export and validate every SQLite before starting the next capture and before
 the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
 rows, uneven dominant-graph replay count, missing indexed artifact or hash
-drift voids the attempt. The exact 27B c16 graph contract is 1,107 primary
-nodes with 208 FP4 GEMM, 144 normal-producer, 64 fused-producer, 48 recurrence
-and 16+16 FA2 nodes; any family drift also voids the attempt. vLLM uses the
-mandated Torch profiler because nsys breaks its EngineCore on this host.
-Geometry/window slicing must exclude prefill, eager and graph-capture
-contamination.
+drift voids the attempt. H1d must also reconcile graph-node events against
+runtime graph launches and the exact 16-warmup/48-measured workload; require
+distinct capture IDs and path/command/report/SQLite linkage; canonicalize and
+hash the full primary-node name/geometry/resource multiset; require identical
+structure across all three captures; and recompute every retained kernel
+summary from the indexed raw artifact. The exact 27B c16 graph contract is
+1,107 primary nodes with 208 FP4 GEMM, 144 normal-producer, 64 fused-producer,
+48 recurrence and 16+16 FA2 nodes; any family drift also voids the attempt.
+The remaining 611 primary nodes may not stay unconstrained. vLLM uses the
+mandated Torch profiler because nsys breaks its EngineCore on this host; its
+raw trace, selected hash, exact command/corpus/workload and clean decode-window
+family counts must be independently recomputed rather than trusted from the
+aggregate summary. Geometry/window slicing must exclude prefill, eager and
+graph-capture contamination.
 
 The report must inventory current normal/fused producers, FP4 GEMMs, GDN
 post-convolution/recurrence, FA2, graph-node counts, the frozen 64-plan map,
 output digests, cache eviction and lifecycle. The plan cache must be read-only,
 load all 64 accepted FlashInfer plans, load/save/tune/reject zero native plans
-and reproduce selected-plan SHA `f2d9be7f…1fa4`. If a larger verified current
-residual displaces normal production, leave W3-H ACTIVE without implementation
-and spike that row instead. Cross-profiler time is diagnostic only.
+and reproduce selected-plan SHA `f2d9be7f…1fa4` independently in every server
+process. This is a parsed semantic gate, not a log-presence/hash check; missing
+records void the attempt. The forbidden native-cache target must remain absent.
+Legacy status without the complete H1d schema remains visible but cannot bind.
+If a larger verified current residual displaces normal production, leave W3-H
+ACTIVE without implementation and spike that row instead. Cross-profiler time
+is diagnostic only.
 
 ### G1 — build, operator bytes and capture
 
@@ -413,7 +435,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b complete but VOID; lossless three-capture H1c pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d lossless collector + exact plan/workload/graph/vLLM validation pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

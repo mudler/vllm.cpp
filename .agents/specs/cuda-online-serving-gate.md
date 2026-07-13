@@ -14,25 +14,22 @@ PSS/RSS remain red. W3-E/W3-F/W3-G strict-failed their same-binary components
 and earn no speed credit. This result remains the only binding performance
 number, and no 35B performance command is authorized.
 
-The active W3-H trace-first refresh is diagnostic only. Clean schema-v4
-`b9beccdab23d103bcdcb950bae89e78bfeceff15` passed exact **154/154** build,
-27B **1/1** correctness, the frozen 64-plan control, 48/48 ordinary requests,
-16/16 probe, FIFO cleanup, and target/Nsight zero exit. Its first session wrote
-four reports, each with one launch, **1,107 graph kernels + 7 memcpys + 1
-memset**, and zero eager CUDA rows. The strict validator rejected Nsight's
-severity-2 possible-loss diagnostic and stopped before sessions 2/3 or vLLM,
-so the root is **FAILED / VOID** and changes no ratio. Collected-event counters
-exactly reconcile to the visible runtime and graph activities.
+The active W3-H trace-first refresh is diagnostic only. Clean schema-v5
+`b8c8086eea9a4f392774cb97a130a06a75ec920c` passes exact **154/154** build,
+27B **1/1** correctness, frozen **64/64** plans, ordinary **48/48** and probe
+**16/16** clients, FIFO lifecycle, and target/Nsight zero exit. Report 1
+reconciles **1,118 collected / 1,130 produced** events to the exact **1,107
+kernels + 7 memcpys + 1 memset** graph with zero eager work. The immediately
+following kernel-summary command omitted the model key and failed closed before
+the remaining reports, sessions 2/3, or vLLM, so the root is **FAILED / VOID**
+and changes no ratio.
 
-The committed one-kernel calibration probe reproduces the exact warning for
-every profiler-API stop/repeat/synchronous/reset variant on pinned Nsight
-2025.3.2.474 while all bounded activities remain present; an identical
-full-process trace is clean. Schema v5 therefore records this exact
-capture-boundary diagnostic only after version, runtime inventory, device
-completion, synchronization rows, collected/produced counters, complete model
-graph/family counts, zero eager work, and cross-report identity reconcile. Any
-other diagnostic or mismatch still fails closed. Fresh 12-report DGX evidence
-is pending; `b9beccd` is not reclassified.
+Schema v5 still requires the pinned Nsight version and exact runtime,
+synchronization, completion, event-counter, graph-family/topology, zero-eager,
+and cross-report reconciliation. The repair forwards the model key through the
+helper, CLI, driver, trace-status reconstruction, public summarizer, and
+fixtures; focused contracts pass **31/31**. Fresh immutable 12-report DGX
+evidence is pending.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -232,10 +229,9 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H schema-v4 `b9beccd` remains void. The
-   pinned-tool calibration and schema-v5 exact reconciliation are implemented
-   and CPU-gated; execute a fresh 12-report `--trace-only` checkpoint plus the
-   paired vLLM trace. 35B remains gated.
+   attribution is complete. W3-H schema-v5 `b8c8086` is void on a repaired
+   model-key omission in the secondary summary path. Execute a fresh 12-report
+   `--trace-only` checkpoint plus the paired vLLM trace. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a

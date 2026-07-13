@@ -951,6 +951,12 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn(f"--capture-range-end={NSYS_CAPTURE_RANGE_END}", script)
         self.assertIn("validate-nsys-trace", script)
         self.assertIn('--model-key "${model}"', script)
+        self.assertIn(
+            'summarize-nsys-kernels \\\n'
+            '        --sqlite "${ours_sqlite}" \\\n'
+            '        --model-key "${model}"',
+            script,
+        )
         self.assertIn("--trace-only", script)
 
     def test_nsys_range_validation_rejects_loss_replays_and_start_drift(self) -> None:
@@ -980,6 +986,12 @@ class OnlineClientContractTests(unittest.TestCase):
                 result["capture_boundary_diagnostic"]["collected_cuda_events"],
                 1_118,
             )
+            summary = summarize_nsys_kernels(
+                reconciled,
+                model_key="27",
+                range_index=1,
+            )
+            self.assertEqual(summary["kernel_count"], 1_107)
 
             unreconciled = root / "unreconciled.sqlite"
             write_nsys_sqlite(
@@ -1614,7 +1626,9 @@ class OnlineClientContractTests(unittest.TestCase):
                     summary.write_text(
                         json.dumps(
                             summarize_nsys_kernels(
-                                sqlite_path, range_index=range_index
+                                sqlite_path,
+                                model_key="27",
+                                range_index=range_index,
                             )
                         ),
                         encoding="utf-8",
@@ -1807,7 +1821,9 @@ class OnlineClientContractTests(unittest.TestCase):
             ours_kernel_summaries[1].write_text(
                 json.dumps(
                     summarize_nsys_kernels(
-                        ours_nsys_sqlites[1], range_index=2
+                        ours_nsys_sqlites[1],
+                        model_key="27",
+                        range_index=2,
                     )
                 ),
                 encoding="utf-8",
@@ -1835,7 +1851,9 @@ class OnlineClientContractTests(unittest.TestCase):
             ours_kernel_summaries[1].write_text(
                 json.dumps(
                     summarize_nsys_kernels(
-                        ours_nsys_sqlites[1], range_index=2
+                        ours_nsys_sqlites[1],
+                        model_key="27",
+                        range_index=2,
                     )
                 ),
                 encoding="utf-8",

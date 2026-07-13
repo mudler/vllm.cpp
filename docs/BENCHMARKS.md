@@ -8,9 +8,11 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-13**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The first schema-v4 DGX run at clean `b9beccd` remains **FAILED / VOID**. A
-minimal graph calibration now classifies its Nsight warning, and schema v5 is
-CPU-gated; a fresh immutable 12-report DGX run is pending. No speed number changed.
+The first schema-v5 DGX run at clean `b8c8086` is **FAILED / VOID**. Its first
+model report passes exact reconciliation, but the secondary kernel summarizer
+did not receive the model contract and failed closed before sessions 2/3 or
+vLLM. The argument-flow repair is CPU-gated; a fresh immutable 12-report DGX
+run is pending. No speed number changed.
 
 ## Binding 27B online gate
 
@@ -57,7 +59,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
-| W3-H1d complete trace | **ACTIVE — CPU PASS / DGX PENDING** | Clean `b9beccd` remains void. The committed one-kernel probe shows pinned Nsight 2025.3.2.474 emits the same warning for `stop`, `repeat:4`, and `repeat:4:sync`, with or without `cudaDeviceReset`, while every kernel/runtime/synchronization row is present; full-process tracing is clean. Schema v5 accepts exactly that source/severity/text only when the pinned version, runtime inventory, two synchronization rows, completion ordering, exact 1,107+7+1 graph, collected-event counter, positive CUPTI surplus, zero eager work, family counts, and cross-report identity all pass | Run all 12 reports plus the paired vLLM trace from a new pushed SHA/root; any counter, topology, diagnostic, or identity drift still fails closed before W3-H2 |
+| W3-H1d complete trace | **ACTIVE — CPU PASS / DGX PENDING** | Clean `b8c8086` passes exact 154/154 build, 27B 1/1 correctness, frozen 64-plan load, 48/48 + 16/16 clients, FIFO/zero-exit, and report-1 schema-v5 reconciliation at 1,118 collected / 1,130 produced events with exact 1,107+7+1 graph topology. It is VOID because the immediately following kernel-summary command omitted `--model-key`; the repaired CLI/helper/driver/summary path and regression fixture are green | Run all 12 reports plus the paired vLLM trace from a new pushed SHA/root; any counter, topology, diagnostic, identity, or summary drift still fails closed before W3-H2 |
 | W3-H2 vectorized BF16→FP4 I/O | **PENDING / NOT IMPLEMENTED** | The scalar implementation remains active; retained traces are diagnostic only | Implement only if W3-H1d produces complete lossless evidence and still selects this residual |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
@@ -66,17 +68,12 @@ authorized until all 124 27B axes pass.
 | Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
 
 The current failed trace root is
-`~/work/vllm.cpp-executed-path-refresh-h1d/b9beccdab23d103bcdcb950bae89e78bfeceff15`.
-Report 1 reconciles **1,118 collected events** to 1 profiler start + 1 graph
-launch + 1 device synchronization + 1,115 graph children; reports 2–4 each
-reconcile **1,117** after the first-range-only profiler-start row is removed.
-That establishes structural completeness. The model-free calibration explains
-why schema v4 failed: this Nsight version reports **4 collected / 13 produced**
-for a one-kernel bounded range even though the SQLite contains the exact one
-kernel, 3/2 runtime rows, and two synchronization rows. The same source run as
-a full-process trace has no possible-loss diagnostic. Schema v5 therefore
-records the warning and its counters rather than ignoring it, and rejects it
-unless the complete model contract reconciles. Superseded attempt roots and
+`~/work/vllm.cpp-executed-path-refresh-h1d/b8c8086eea9a4f392774cb97a130a06a75ec920c`.
+Session 1 completed both clients and wrote four raw reports, but only report 1
+was exported before the summary-path failure. Its validation is lossless under
+the exact model contract; the run is still incomplete and therefore VOID. The
+repair forwards the required model key through the CLI, helper, trace-status
+reconstruction, public summarizer, and fixtures. Superseded attempt roots and
 hashes remain only in the [parity ledger](../.agents/parity-ledger.md) and
 [state log](../.agents/state.md).
 
@@ -130,7 +127,7 @@ sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ## Reproduce the pending schema-v5 W3-H1d gate
 
 Use a clean pushed schema-v5 SHA and a new SHA-owned root. Never append to the
-failed `b9beccd` root.
+failed `b8c8086` root.
 
 ```sh
 set -euo pipefail

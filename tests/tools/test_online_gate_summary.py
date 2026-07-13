@@ -370,7 +370,9 @@ def _write_fixture(root: pathlib.Path) -> None:
             validation_path = trace_root / f"ours_nsys_validation{suffix}.json"
             validation_path.write_text(json.dumps(validation), encoding="utf-8")
             summary = summarize_nsys_kernels(
-                sqlite_path, range_index=range_index
+                sqlite_path,
+                model_key="27",
+                range_index=range_index,
             )
             summary_path = trace_root / f"ours_kernel_summary{suffix}.json"
             summary_path.write_text(json.dumps(summary), encoding="utf-8")

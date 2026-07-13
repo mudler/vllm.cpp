@@ -7327,3 +7327,46 @@ append-only history.
 No performance number changes: `3f256ab` remains **55/124**, and a fresh
 immutable 12-report schema-v5 DGX run plus paired vLLM trace is next before
 W3-H2, the exact grid, or 35B performance.
+
+## 2026-07-13 — first schema-v5 execution exposes missing summary model contract
+
+Clean pushed `b8c8086eea9a4f392774cb97a130a06a75ec920c` executed from
+immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/b8c8086eea9a4f392774cb97a130a06a75ec920c`.
+Plan-first setup passed with manifest SHA `608914cd…ece`; the exact GCC 13.3 /
+CUDA 13.0.88 / sm_121a / external-CUTLASS / FA2 / vendored-Triton-AOT /
+RelWithDebInfo configuration and **154/154** build passed. Configure,
+CMakeCache, compile-commands and build-log SHA are `74ff9507…05f0`,
+`8fda28e7…40e`, `306b8896…da2` and `b31b6e2a…a9dd`. The mandatory 27B
+correctness gate passed **1/1 in 17.48 s**; gate/server SHA are
+`aa06ea87…c1d9` / `1d97bb35…e949`.
+
+Session 1 loaded frozen plans **64/64** with zero tuning/misses, completed the
+ordinary client **48/48 in 66.788512 s** and probe **16/16 in 26.396335 s**,
+recorded `prior_replays=483` / `captured_replays=4`, and passed FIFO lifecycle,
+removal, target exit and Nsight exit. Four reports were written with SHA
+`295a94ae…cf3`, `1d36c22a…5c53`, `e39f93bf…cdf` and `3a835eb1…1637`.
+Report 1 exported to SQLite SHA `282dcd7f…a2b7` and passed schema-v5 exact
+reconciliation: **1,118 collected / 1,130 produced** events, **1,107 kernels +
+7 memcpys + 1 memset**, zero eager work, session UUID
+`f7f8f7cf-2c20-4267-9317-862967b9757d`; validation SHA is
+`062144cf…4667`.
+
+The immediately following `summarize-nsys-kernels` invocation omitted the
+model key. Its revalidation therefore lacked the exact graph contract and
+correctly rejected the capture-boundary diagnostic before reports 2–4 were
+exported, before sessions 2/3, and before vLLM. The root is **FAILED / VOID**,
+never reused, and changes no performance number. GPU, lock and port returned
+idle.
+
+The repair makes the summarizer's `model_key` argument mandatory and forwards
+it through the CLI, driver, trace-status reconstruction and public summary.
+The retained report-1 SQLite re-summarizes successfully at 1,107 kernels.
+Python/shell syntax passes; focused client/summary/trace contracts pass
+**31/31**, full CUDA-off CTest passes **106/106**, agent-record/doc contracts
+pass **18/18**, and `git diff --check` is clean. Live README, BENCHMARKS,
+roadmap, matrices, coordination and specs are compacted to this one current
+checkpoint; detailed run history remains here and in the parity ledger.
+Immutable `3f256ab` remains **55/124 pass, 69 fail**. A fresh pushed SHA and
+immutable 12-report root are required before W3-H2, the exact grid, or 35B
+performance.

@@ -1562,9 +1562,16 @@ def validate_nsys_trace(
 
 
 def summarize_nsys_kernels(
-    sqlite_path: pathlib.Path, *, range_index: int = 1
+    sqlite_path: pathlib.Path,
+    *,
+    model_key: str,
+    range_index: int = 1,
 ) -> dict[str, Any]:
-    validation = validate_nsys_trace(sqlite_path, range_index=range_index)
+    validation = validate_nsys_trace(
+        sqlite_path,
+        model_key=model_key,
+        range_index=range_index,
+    )
     return {
         **validation["kernel_summary"],
         "range_index": range_index,
@@ -2657,7 +2664,9 @@ def record_trace_status(
             )
         nsys_validations.append(validation)
         summary = summarize_nsys_kernels(
-            sqlite_path, range_index=range_index
+            sqlite_path,
+            model_key=model_key,
+            range_index=range_index,
         )
         if _load_json_object(summary_path) != summary:
             raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
@@ -3334,6 +3343,9 @@ def _parser() -> argparse.ArgumentParser:
     summarize_nsys = commands.add_parser("summarize-nsys-kernels")
     summarize_nsys.add_argument("--sqlite", type=pathlib.Path, required=True)
     summarize_nsys.add_argument(
+        "--model-key", choices=sorted(MODEL_REVISIONS), required=True
+    )
+    summarize_nsys.add_argument(
         "--range-index",
         type=int,
         choices=range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1),
@@ -3494,7 +3506,9 @@ def main() -> int:
         if args.output.exists():
             raise HarnessError(f"refusing to overwrite Nsight summary: {args.output}")
         result = summarize_nsys_kernels(
-            args.sqlite, range_index=args.range_index
+            args.sqlite,
+            model_key=args.model_key,
+            range_index=args.range_index,
         )
         write_json_atomic(args.output, result)
     elif args.command == "record-profile-control":

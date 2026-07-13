@@ -706,7 +706,9 @@ def _model_precondition_reasons(
                                     f"range report {index}"
                                 )
                             actual_summary = summarize_nsys_kernels(
-                                sqlite_path, range_index=range_index
+                                sqlite_path,
+                                model_key=model,
+                                range_index=range_index,
                             )
                             if summaries[index - 1] != actual_summary or _load_json(
                                 summary_path

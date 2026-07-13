@@ -9,11 +9,12 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The latest W3-H DGX trace is **VOID**, but a minimal graph calibration now
-> isolates its warning to pinned Nsight's `cudaProfilerStop` capture boundary.
-> Schema v5 accepts that one diagnostic only after exact event, completion, and
-> model-topology reconciliation; the fresh 12-report DGX gate is pending. No
-> W3-H speed credit or 35B performance result is claimed. See
+> The latest W3-H DGX trace (`b8c8086`) is **VOID**: its first model report
+> passes schema-v5 exact reconciliation, but the secondary kernel-summary path
+> omitted the model contract and failed closed before sessions 2/3 or vLLM.
+> That integration bug is repaired and CPU-green; a fresh immutable 12-report
+> DGX gate is pending. No W3-H speed credit or 35B performance result is
+> claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -21,10 +22,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the lossless W3-H trace, gate the selected repair, then rerun all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the repaired W3-H trace, gate the selected repair, then rerun all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | Minimal one-kernel probes reproduce the warning in every `cudaProfilerApi` capture-range mode while all events are present; full-process traces are clean. Schema v5 adds pinned-version exact reconciliation and is CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
+| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | `b8c8086` passes build, 27B correctness, plans, clients, shutdown, and report-1 schema-v5 reconciliation, then fails in the secondary summary because its model key was not forwarded. The repair and regression contracts are CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -53,7 +54,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Direct swizzled activation scales | Correctness and trace pass; component **FAILED** at 39/40 timing + 1/8 memory axes, so no independent speed credit |
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
-| Vectorized normal BF16→FP4 I/O | Not implemented. W3-H1d lossless trace evidence is the active prerequisite |
+| Vectorized normal BF16→FP4 I/O | Not implemented. A complete repaired W3-H1d trace is the active prerequisite |
 
 ## What is implemented
 
@@ -123,7 +124,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; schema-v5 W3-H trace validation is CPU-green and DGX-pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the schema-v5 summary integration repair is CPU-green and a fresh DGX trace is pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -150,7 +151,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; the latest W3-H trace is void and no new speed credit is claimed |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; `b8c8086` is void on a repaired trace-summary integration bug and no speed credit is claimed |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -173,7 +174,7 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: calibrated, complete W3-H trace → selected component
+The next execution order is fixed: repaired, complete W3-H trace → selected component
 gate → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.

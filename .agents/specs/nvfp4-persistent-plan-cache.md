@@ -1,6 +1,7 @@
 # NVFP4 persistent FlashInfer-compatible plan cache (W3-C)
 
-Status: **READY / SPIKED; implementation not started**
+Status: **ACTIVE; W3-C1 implemented and CPU/sanitizer-gated, W3-C2 runtime
+integration pending**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -89,6 +90,43 @@ Exact tag-source SHA-256 values for the four vLLM control files are:
 No Python or PyTorch enters the runtime. `third_party/nlohmann/json.hpp` is
 already a project dependency and is the implementation surface for the cache
 document.
+
+## W3-C1 implementation checkpoint (2026-07-13)
+
+The CUDA-free document layer is now implemented at
+`src/vt/cuda/nvfp4_persistent_cache.{h,cpp}`. It provides the complete native
+metadata/plan schema, deterministic tactic-descriptor digest, environment/path
+resolution, strict native parse/round-trip, current-wins compatible merge,
+same-directory `mkstemp` + fsync + atomic rename, and a bounded parser for the
+exact FlashInfer 0.6.13 Python-tuple key. It validates M/N/K relationships,
+hybrid buckets, runner/tactic IDs, layout/dtype/device/tactic ABI and every
+FlashInfer metadata field; wildcard metadata follows upstream import semantics.
+`VT_FP4_PERSISTENT_CACHE`, `VT_FP4_AUTOTUNE_CACHE_PATH`,
+`VT_FP4_FLASHINFER_CACHE_PATH`, `VT_FP4_AUTOTUNE_CACHE_READONLY` and
+`VT_FP4_AUTOTUNE_DELAY_US` are parsed now, but no engine/CUDA caller consumes
+the document until C2.
+
+The immutable 64-plan oracle document and provenance manifest live under
+`tests/fixtures/nvfp4_flashinfer_v025_gb10/`. The DGX source file is 11,947
+bytes/SHA `b41a8ecc...677`; the repository text copy adds only the required
+final LF and is 11,948 bytes/SHA `e81e9181...7edd`. The test asserts all 64
+recorded `(M,N,K)->tactic` values, not only count/shape samples.
+
+Focused Release, ASan+UBSan and TSan each pass **6/6 cases, 174/174
+assertions**. The first raw TSan invocation failed before tests with its known
+`unexpected memory mapping`; the exact rerun under
+`setarch $(uname -m) -R` passes, so no race finding exists. A first full CPU
+suite attempt reported **101/103** because the cache fixture was incorrectly
+placed under `tests/parity/goldens`, whose generic scanner treated its manifest
+as an op manifest; after moving it to `tests/fixtures`, reconfiguring and
+rebuilding, both failed tests pass **2/2** and a fresh full suite passes
+**103/103**. This was a fixture-discovery failure, not a cache-parser failure,
+and is retained as failed-attempt evidence.
+
+C1 has no runtime behavior, plan-cache publication, model load, GPU command or
+performance result. C2 must still import ready plans into the single-flight
+map, switch miss timing to the resolved 5,000-us default, add lifecycle/stats,
+load before warmup and save only after `Complete()`.
 
 ## Cache schema, identity and lifecycle
 
@@ -182,7 +220,7 @@ the executed behavior and leaves future rank broadcast to the distributed row.
 | engine startup | `src/vllm/entrypoints/model_loader.cpp` | resolve/load before the dummy request and publish only after `Complete()` |
 | build | `CMakeLists.txt`, `tests/CMakeLists.txt` | compile the CUDA-free cache helper into CUDA builds and focused CPU/CUDA tests |
 | operator/cache tests | `tests/vt/test_ops_nvfp4_fp4.cpp` and, if size requires, new `tests/vt/test_nvfp4_persistent_cache.cpp` | port every source contract listed below |
-| oracle fixture | new `tests/parity/goldens/nvfp4_flashinfer_v025_gb10/` | immutable metadata/64-plan fixture plus manifest with source/cache SHA |
+| oracle fixture | new `tests/fixtures/nvfp4_flashinfer_v025_gb10/` | immutable metadata/64-plan fixture plus manifest with source/cache SHA; kept outside parity-golden discovery because it is a cache document, not an op manifest |
 | DGX harness | `scripts/dgx-online-serving.sh`, `tools/bench/online_gate_summary.py` only if needed | require frozen 64/64 map and compare selected IDs/hashes before accepting an A/B |
 
 No scheduler, KV cache, attention, GDN, HTTP, model-loader format, 35B W4A16
@@ -296,8 +334,8 @@ and 11,947 bytes.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-C0 | whole-chain v0.25/dependency/runtime audit, exact cache fixture contract, files/tests/gates | **complete in this spike** |
-| W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | `READY` |
-| W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | blocked on C1 |
+| W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | **complete: Release/ASan+UBSan/TSan 6/6 + 174/174; full CPU 103/103** |
+| W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | `READY` |
 | W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | blocked on C2 |
 | W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | blocked on C3 acceptance |
 

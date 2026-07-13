@@ -1,0 +1,14 @@
+{
+  "source": "dgx.casa:~/.cache/vllm/flashinfer_autotune_cache/0.6.13/121a/cbd38fe31b19a593fd4ac474a8a138a545227805f23c425119de8429f384d163/autotune_configs.json",
+  "source_sha256": "b41a8ecc18d69174b20263ee85be097d2dd5cf717efd65a03eb466c0c99cf677",
+  "source_bytes": 11947,
+  "checked_in_sha256": "e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd",
+  "checked_in_bytes": 11948,
+  "normalization": "one final LF added by the repository text-file contract; JSON values are unchanged",
+  "vllm_version": "0.25.0",
+  "vllm_tag": "702f4814fe54fabff350d43cb753ae3e47c0c276",
+  "flashinfer_version": "0.6.13",
+  "gpu": "NVIDIA GB10",
+  "architecture": "sm_121a",
+  "fp4_entries": 64
+}

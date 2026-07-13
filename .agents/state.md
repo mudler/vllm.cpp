@@ -6030,3 +6030,45 @@ Releasing host checkpoint copies after CUDA residency separately targets the
 binding 0.584689/0.592269 PSS/RSS failures. No implementation, model run, GPU
 command or new performance result occurred in this spike checkpoint; immutable
 `3f256ab` remains binding at 55/124 and GPU/lock remain idle.
+
+## 2026-07-13 — W3-C1 cache document/import implementation
+
+W3-C1 is implemented without changing runtime dispatch. New
+`src/vt/cuda/nvfp4_persistent_cache.{h,cpp}` is compiled into the core library
+even in CPU builds and remains CUDA-free. It defines the native v1 JSON schema,
+complete metadata and plan keys, a stable digest over all 32 local tactic
+descriptors, environment/default/frozen path resolution, strict parse and
+stale/collision rejection, deterministic current-wins merging, same-directory
+temporary publication with fsync + atomic rename, and exact FlashInfer 0.6.13
+tuple-key import. Invalid/missing metadata, inconsistent shapes, non-hybrid M,
+wrong runner/layout/dtype/device/tactic ABI, duplicate keys, malformed JSON and
+non-regular paths all fail closed. Disabled persistence ignores unrelated
+delay configuration; read-only mode without a cache source fails configuration.
+
+The binding oracle file is checked in at
+`tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json`. Its manifest
+records the exact DGX source path, vLLM/FlashInfer/GPU identity, source
+11,947-byte SHA `b41a8ecc...677`, and the repository's final-LF-normalized
+11,948-byte SHA `e81e9181...7edd`; values are unchanged. The test asserts every
+one of the 64 `(M,N,K)->tactic` mappings, plus wildcard/exact metadata, foreign
+op ignore, malformed FP4 rejection and semantic duplicate rejection.
+
+Focused Release, ASan+UBSan and TSan each pass **6/6 cases and 174/174
+assertions**. The first TSan process failed before doctest with
+`unexpected memory mapping`; rerunning the same binary with ASLR disabled via
+`setarch $(uname -m) -R` passes, so it is an environment startup issue and not
+a race report. The first full CPU suite reported **101/103**: the fixture was
+initially under `tests/parity/goldens`, causing `test_op_parity` to treat its
+manifest as an op golden, and after moving it the pre-reconfigure focused
+binary still named the old path. Relocating it to `tests/fixtures`, updating
+the compile definition and rebuilding makes both failed tests pass 2/2; a
+fresh full run then passes **103/103**. The failed attempt remains recorded.
+
+No CUDA plan-cache import, warmup lifecycle, model/server run, GPU command or
+performance result occurred. C1 is complete. C2 is now `READY`: add checked
+ready-map insertion/snapshot, construct real CUDA/CUTLASS/device metadata,
+load imported/native plans before the maximum-token dummy run, tune only
+misses with the resolved 5,000-us default, publish a native file only after
+successful `Complete()`, extend counters/diagnostics and fail a frozen miss
+before readiness. Immutable `3f256ab` remains binding at 55/124; no exact grid
+or 35B performance is authorized.

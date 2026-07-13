@@ -240,6 +240,7 @@ add_library(vllm STATIC
   src/vt/tensor.cpp
   src/vt/arena.cpp
   src/vt/ops.cpp
+  src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp

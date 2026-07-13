@@ -158,6 +158,10 @@ target_include_directories(test_cpu_threadpool PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_nvfp4_matmul vt/test_ops_nvfp4_matmul.cpp)
 vllm_cpp_add_test(test_ops_nvfp4_fp4 vt/test_ops_nvfp4_fp4.cpp)
 target_include_directories(test_ops_nvfp4_fp4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_nvfp4_persistent_cache vt/test_nvfp4_persistent_cache.cpp)
+target_include_directories(test_nvfp4_persistent_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_nvfp4_persistent_cache PRIVATE
+  TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 if(VLLM_CPP_CUTLASS)
   foreach(_NVFP4_TACTIC RANGE 0 31)
     add_test(NAME test_ops_nvfp4_fp4_tactic_${_NVFP4_TACTIC}

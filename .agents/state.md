@@ -6259,3 +6259,33 @@ component failed. Immutable `3f256ab` remains the binding vLLM v0.25 result at
 remain blocked. Next, attribute the direct-scale peak-memory/c16 p99-TPOT
 misses and resume the trace-grounded vLLM-vs-ours residual scan before another
 bounded component.
+
+## 2026-07-13 — W3-F device-alpha spike accepted; implementation ready
+
+The resumed whole-execution-chain scan selected one bounded mismatch for the
+next component: our CUTLASS true-W4A4 adapter stages a host alpha through a
+`SetScalar` kernel before every FP4 GEMM, while vLLM v0.25 constructs a
+non-trainable model-owned device alpha and FlashInfer passes its pointer into
+CUTLASS. The immutable binding local node trace contains **296,575 graph
+`SetScalar` launches across 1,425 forwards = 208.123/forward**, totaling
+207.124383 ms or 0.145350 ms/forward. The later W3-E trace confirms exactly
+**624/3 = 208 launches/forward**. Binding vLLM kernel and Torch traces contain
+zero occurrences. These observations identify topology; they do not establish
+an end-to-end gain.
+
+The accepted [W3-F spike](specs/nvfp4-device-alpha.md) inventories vLLM's
+compressed-tensors alpha ownership, executed FlashInfer backend and wrapper,
+stable CUTLASS ABI, installed FlashInfer 0.6.13 binding/runner/template, and the
+matching upstream tests. `CLAIM-NVFP4-SMALL-M-4` owns only model-lifetime F32
+alpha residency, tensor validation/ABI, and the exact old host-staging path as
+a same-binary `VT_FP4_DEVICE_ALPHA=0` fallback. Quant producers, tactics,
+scheduler, KV, attention, GDN, W4A16 and non-CUDA behavior are excluded.
+
+All implementation and runtime evidence remains **PENDING**. The planned gate
+ports upstream device-alpha/reference/invalid/capture cases, runs local and CUDA
+safety plus both 27B arms and a correctness-only inert 35B check, proves zero
+default versus approximately 208 fallback `SetScalar` launches per forward,
+then executes frozen-plan c2/c16 AB/BA/AB under one lock. The exact vLLM grid
+remains conditional on every timing and memory component axis passing.
+Immutable `3f256ab` therefore remains binding at **55/124 pass, 69 fail**; no
+GPU command or new performance ratio was produced at this checkpoint.

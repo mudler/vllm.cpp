@@ -1,7 +1,7 @@
 # NVFP4 model-owned device alpha (W3-F)
 
-Status: **ACTIVE — implementation and local CPU/sanitizer gates complete; all
-CUDA/runtime/performance gates PENDING**
+Status: **GATING — G1-G4 complete on immutable `7517af4`; G5 frozen-plan
+component ACTIVE; G6 exact grid BLOCKED on G5**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -200,19 +200,67 @@ an exact `VT_CHECK` string without its standard source prefix; validation
 behavior was correct, the assertion now checks the stable diagnostic substring,
 and all three clean reruns pass.
 
-This is not CUDA evidence. No DGX build, operator execution, sanitizer, model
-gate, allocation count, node trace, component ratio, exact grid or 35B
-performance command ran at this checkpoint. Those remain W3-F3 onward.
+That published checkpoint was not CUDA evidence. The immutable GPU checkpoint
+below supersedes only its pending-hardware disposition; the local evidence and
+the binding `3f256ab` denominator remain unchanged.
+
+## Immutable GPU/trace checkpoint
+
+Clean detached source
+`7517af4f983fe322ac88ce2d9869e1441b7be3fd` builds on GB10 with GCC 13.3,
+CUDA 13.0.88, sm_121a, FlashInfer's CUTLASS 4.5 tree, vendored Triton AOT,
+Marlin and FA2. Focused CUDA CTest passes **33/33** registrations, including
+all 32 forced tactics. Strict `VT_CUTLASS_NOPOOL=1` compute-sanitizer covers
+initialization, eager execution and capture/replay and passes **22/22 cases +
+26,884/26,884 assertions**, with **0 errors and 0 bytes leaked**.
+
+The commit-owned native cache imports the checked-in vLLM v0.25/FlashInfer
+fixture with **64 loaded, 0 tuned, 0 rejected and 64 saved**. Read-only default
+and `VT_FP4_DEVICE_ALPHA=0` 27B arms each load **64/64 native plans**, record
+zero tune/miss, and pass **235/235 + 16/16**. The correctness-only 35B W4A16
+gate passes **2/2 cases + 315/315 assertions**, proving this dispatch is inert;
+it is not a 35B performance result.
+
+Paired `nsys --cuda-graph-trace=node` profiles close G4. Device alpha contains
+**zero** `SetScalar`; the fallback contains **624 eager + 2,912 graph = 3,536**,
+or exactly **208 for each of 17 forwards**, totaling 3.082880 ms. Both arms
+execute identical **3,536 FP4 GEMMs**, **3,536 FP4 producers**, eight CUTLASS
+kernel identities and frozen 64-plan SHA `f2d9be7f...1fa4`. The device arm adds
+exactly **208** model-lifetime allocation/copy/free triplets relative to the
+fallback, matching **208 x 4-byte scalars = 832 bytes**, all freed at teardown.
+Retained vLLM kernel evidence remains free of `SetScalar`.
+
+Evidence is under
+`~/work/vllm.cpp-nvfp4-device-alpha/7517af4f983fe322ac88ce2d9869e1441b7be3fd/evidence`.
+Build/focused-CUDA/memcheck/default-27B/host-27B/35B/trace-summary SHA-256 values
+are `56203868...13db` / `8318b668...6900` / `9296bd10...824` /
+`77f20b30...05d9` / `77f20b30...05d9` / `575a7faf...b1f` /
+`8e6436ef...1455`.
+
+Three setup failures remain explicit. The first configure is **FAILED /
+ENVIRONMENT-INVALID** because non-interactive SSH omitted nvcc; the
+compiler-pinned retry passes. The first CTest wrapper is **VOID /
+COMMAND-INVALID** because nested quoting inspected `$HOME` and found no tests;
+the corrected 33-test command passes. The first model attempt is
+**FAILED-CLOSED / STALE-CACHE** on `build_id` before inference; reseeding the
+commit-owned document from the immutable fixture produces the passing cache.
+None contributes a rate or correctness observation.
+
+G1-G4 and W3-F3 are complete. The unprofiled cache-off
+input-1,024/output-128 c2/c16 AB/BA/AB component is now **ACTIVE under one
+uninterrupted `/tmp/gpu` lock**. Partial legs do not bind. Therefore no W3-F
+ratio, exact-grid authorization, speed credit or 35B performance result exists
+at this checkpoint.
 
 ## Work breakdown
 
 | Work | Deliverable | State |
 |---|---|---|
 | W3-F0 | whole-chain execution/source/dependency audit, tests, dispatch and gates | **complete in this spike** |
-| W3-F1 | tensor alpha operation/validation plus model-owned individual/merged residency and same-binary fallback | **complete locally; CUDA execution pending W3-F3** |
+| W3-F1 | tensor alpha operation/validation plus model-owned individual/merged residency and same-binary fallback | **complete on CPU and immutable CUDA build** |
 | W3-F2 | ported device-alpha/reference/capture/invalid-input tests and local build gates | **complete: CPU 103/103; focused Release/ASan+UBSan/TSan 17/17 + 911/911** |
-| W3-F3 | immutable CUDA safety, 27B/35B correctness and paired node trace | `PENDING` |
-| W3-F4 | frozen-plan c2/c16 AB/BA/AB every-axis component | `PENDING` |
+| W3-F3 | immutable CUDA safety, 27B/35B correctness and paired node trace | **complete: 33/33; strict memcheck 22/22 + 26,884/26,884; both 27B arms and 35B inertness pass; zero-versus-3,536 trace closes** |
+| W3-F4 | frozen-plan c2/c16 AB/BA/AB every-axis component | `ACTIVE under one uninterrupted GPU lock; partial legs non-binding` |
 | W3-F5 | exact v0.25 27B grid/trace, conditional on F4 passing every axis | `BLOCKED on F4` |
 
 Any neutral or negative result is recorded honestly. A failed W3-F component

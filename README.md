@@ -125,18 +125,30 @@ OpenAI-compatible server.
 > W3-E remains strict-failed and receives no speed credit. No exact grid or 35B
 > performance run follows. Opt-in batch-invariant execution remains separately
 > inventoried and unsupported locally today.
-> The resumed executed-path scan now selects
+> The resumed executed-path scan selects
 > [W3-F model-owned device alpha](.agents/specs/nvfp4-device-alpha.md): our
-> steady graph launches **208.123 `SetScalar` kernels/forward** before CUTLASS,
-> while vLLM retains `layer.alpha` as a device parameter and its trace contains
-> zero such kernels. W3-F is now **implemented / ACTIVE**: the typed operation
-> accepts and validates a resident F32 scalar tensor, the CUDA adapter passes
-> its pointer directly into CUTLASS, and individual, merged gate/up and packed
-> QKV projections own model-lifetime scalars. `VT_FP4_DEVICE_ALPHA=0` preserves
-> the exact host-staging path. CPU Release passes **103/103**; the focused
-> Release, ASan+UBSan and TSan runs each pass **17/17 + 911/911**. The CUDA build,
-> hardware correctness/safety, node trace and frozen-plan A/B remain
-> **PENDING**, so no component result, exact-grid rerun or speed credit exists.
+> prior steady graph launched **208.123 `SetScalar` kernels/forward** before
+> CUTLASS, while vLLM retains `layer.alpha` as a device parameter and its trace
+> contains zero. W3-F is **implemented / GATING**: the typed operation validates
+> a resident F32 scalar tensor, the CUDA adapter passes its pointer directly into
+> CUTLASS, and individual, merged gate/up and packed-QKV projections own
+> model-lifetime scalars. `VT_FP4_DEVICE_ALPHA=0` preserves the exact
+> host-staging path. CPU Release passes **103/103** and focused local
+> Release/ASan+UBSan/TSan each pass **17/17 + 911/911**. Clean immutable
+> `7517af4` CUDA 13.0.88/sm_121a then passes **33/33** focused CTest
+> registrations; strict no-pool compute-sanitizer passes **22/22 cases +
+> 26,884/26,884 assertions with 0 errors and 0 leaked bytes**. Device and host
+> 27B arms each pass **235/235 + 16/16**, and the correctness-only 35B W4A16
+> inertness gate passes **315/315**. Paired node traces now prove the structural
+> target: device alpha has **zero `SetScalar`**, while the fallback has exactly
+> **624 eager + 2,912 graph = 3,536**, or **208 for each of 17 forwards**.
+> Both arms execute identical **3,536 FP4 GEMMs**, **3,536 FP4 producers**, eight
+> CUTLASS kernel identities and the same frozen 64-plan map. The trace also
+> records exactly 208 additional model-owned allocation/copy/free triplets,
+> matching **208 x 4-byte scalars = 832 bytes**, all freed at teardown. The
+> unprofiled frozen-plan c2/c16 AB/BA/AB component is currently running under
+> one uninterrupted GPU lock; partial observations do not bind. Thus no
+> component result, exact-grid rerun or speed credit exists yet.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.
@@ -278,7 +290,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes six-process frozen-map stability (**6/6**, identical 64/64 plans, zero tuning); C3R proves direct/composed **6/6 x 128-token equality** under identical sequential batch shape and reclassifies the earlier independent-run 2/6 check against vLLM's default-off batch-invariance contract. The corrected frozen-plan component completes all 12 legs: W3-E's direct scales improve c2/c16 mean throughput by **1.004483×/1.005044×**, but strict-fail at **39/40 timing + 1/8 memory**, so no exact rerun or speed credit follows. W3-F device alpha is implemented/`ACTIVE` with typed validation, model-owned individual/merged residency, a direct CUTLASS pointer and the exact `VT_FP4_DEVICE_ALPHA=0` fallback; CPU and sanitizer gates pass, but CUDA/model/trace/A-B evidence and every performance number remain pending. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes six-process frozen-map stability (**6/6**, identical 64/64 plans, zero tuning); C3R proves direct/composed **6/6 x 128-token equality** under identical sequential batch shape and reclassifies the earlier independent-run 2/6 check against vLLM's default-off batch-invariance contract. The corrected frozen-plan component completes all 12 legs: W3-E's direct scales improve c2/c16 mean throughput by **1.004483×/1.005044×**, but strict-fail at **39/40 timing + 1/8 memory**, so no exact rerun or speed credit follows. W3-F device alpha is implemented/`GATING`: immutable CUDA/operator/memcheck, both 27B arms and the correctness-only 35B gate pass; paired node traces remove all 3,536 scalar-stage launches without changing the 3,536 FP4 GEMMs/producers or frozen plans. Its c2/c16 component is active, so no W3-F performance value binds yet. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -288,7 +300,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. Packed QKV closes at **208.192 vs vLLM 208 FP4 GEMMs/forward**. W3-C now completes persistent-cache reproduction control: six fresh processes and the corrected 12-leg component all use identical frozen 64/64 plans with zero tuning/misses. C3R proves the direct/composed path equal at 6/6 x 128 tokens with identical sequential batch shape and reproduces default-mode batch-shape dependence in vLLM. W3-E removes 624 swizzles and gains **1.004483×/1.005044×** c2/c16 mean throughput, but strict-fails at **39/40 timing + 1/8 memory**, so no speed credit or exact rerun follows. W3-F device alpha is implemented/`ACTIVE`: local Release, ASan+UBSan and TSan gates pass, but the CUDA build, real-model correctness/safety, zero-`SetScalar` trace and component benchmark are pending. No runtime or benchmark result exists yet, and no 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. Packed QKV closes at **208.192 vs vLLM 208 FP4 GEMMs/forward**. W3-C now completes persistent-cache reproduction control: six fresh processes and the corrected 12-leg component all use identical frozen 64/64 plans with zero tuning/misses. C3R proves the direct/composed path equal at 6/6 x 128 tokens with identical sequential batch shape and reproduces default-mode batch-shape dependence in vLLM. W3-E removes 624 swizzles and gains **1.004483×/1.005044×** c2/c16 mean throughput, but strict-fails at **39/40 timing + 1/8 memory**, so no speed credit or exact rerun follows. W3-F device alpha is now CUDA-gated: focused **33/33**, strict memcheck **0 errors/0 leaks**, both 27B arms **235/235 + 16/16**, 35B inertness **315/315**, and paired node traces show **0 versus 3,536 `SetScalar`** with identical FP4 topology. The unprofiled c2/c16 component is active and has no binding partial value. No 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -325,7 +337,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-C wires the pure-C++ native/FlashInfer cache into CUDA startup: exact 64-plan import is a zero-tune capture-safe hit, frozen misses fail, completed warmups publish atomically, and six fresh processes plus the corrected 12-leg component use one identical map. C3R proves direct/composed **6/6 x 128-token equality** when batch shape is held fixed; the earlier independent c2 texts exercised an opt-in batch-invariance property absent from the production vLLM denominator. W3-E removes 624 activation swizzles and is mean-positive under frozen plans, but its corrected strict component fails at **39/40 timing + 1/8 memory**. W3-F model-owned device alpha is implemented/`ACTIVE`: the tensor ABI, model-owned individual/merged scalars, exact host fallback and upstream-shaped tests are present and CPU/sanitizer-green; all DGX evidence remains pending. The `3f256ab` grid still fails **69/124** axes; no speed or support expansion is claimed. |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-C wires the pure-C++ native/FlashInfer cache into CUDA startup: exact 64-plan import is a zero-tune capture-safe hit, frozen misses fail, completed warmups publish atomically, and six fresh processes plus the corrected 12-leg component use one identical map. C3R proves direct/composed **6/6 x 128-token equality** when batch shape is held fixed; the earlier independent c2 texts exercised an opt-in batch-invariance property absent from the production vLLM denominator. W3-E removes 624 activation swizzles and is mean-positive under frozen plans, but its corrected strict component fails at **39/40 timing + 1/8 memory**. W3-F model-owned device alpha is implemented/`GATING`: CPU and CUDA/operator/sanitizer/model gates pass, the W4A16 35B path is inert, and node traces close the zero-stage target while preserving all FP4 GEMM/producer/tactic identities. The c2/c16 component is in progress; `3f256ab` still fails **69/124** axes and no speed or support expansion is claimed. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -408,8 +420,12 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   `VT_FP4_DEVICE_ALPHA=0` as the same-binary old path. Typed invalid-input,
   host/device equality, capture, forced-tactic and packed-QKV tests are ported;
   full CPU **103/103** and focused Release/ASan+UBSan/TSan **17/17 + 911/911**
-  pass. CUDA compilation and every hardware gate are still pending, so no W3-F
-  number exists yet.
+  pass. Immutable `7517af4` adds a clean sm_121a build, focused **33/33** CUDA
+  registrations, strict no-pool memcheck **22/22 + 26,884/26,884** with zero
+  errors/leaks, both 27B **235/235 + 16/16** arms and 35B inertness **315/315**.
+  Its node traces show device/fallback `SetScalar` counts of **0/3,536** while
+  FP4 GEMM, producer and tactic maps remain identical. The unprofiled c2/c16
+  component is active under one lock; no partial W3-F number exists yet.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.

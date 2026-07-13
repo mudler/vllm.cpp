@@ -6327,3 +6327,39 @@ gate, allocation-count trace, node trace, component benchmark, exact grid or
 the immutable CUDA/operator/safety/default+fallback 27B/35B-inertness and paired
 node-trace gates, followed by the frozen-plan c2/c16 component only if those
 pass. Immutable `3f256ab` stays binding at **55/124 pass, 69 fail**.
+
+## 2026-07-13 — W3-F immutable CUDA/model/trace gates pass; component active
+
+Clean detached `7517af4f983fe322ac88ce2d9869e1441b7be3fd` now closes W3-F
+G1-G4 on the idle GB10. The compiler-pinned CUDA 13.0.88/sm_121a build passes;
+the focused operator suite passes **33/33** registrations including all 32
+forced tactics. Strict `VT_CUTLASS_NOPOOL=1` compute-sanitizer passes **22/22
+cases + 26,884/26,884 assertions**, with **0 errors and 0 bytes leaked**.
+
+A commit-owned cache seeded from the checked-in vLLM v0.25/FlashInfer fixture
+publishes and reloads **64/64 native plans** with zero tuning/misses. Default
+device alpha and `VT_FP4_DEVICE_ALPHA=0` 27B arms independently pass
+**235/235 + 16/16**. The correctness-only 35B W4A16 inertness gate passes
+**2/2 + 315/315**; it is explicitly not a performance result.
+
+Paired node traces prove the intended structural closure. Device alpha has
+zero `SetScalar`; fallback has **624 eager + 2,912 graph = 3,536**, exactly
+**208 for each of 17 forwards**, totaling 3.082880 ms. Both arms retain
+**3,536 FP4 GEMMs**, **3,536 FP4 producers**, eight CUTLASS kernel identities
+and the identical frozen 64-plan map. The device arm creates exactly 208
+model-owned four-byte scalar allocation/copy/free triplets, totaling **832
+bytes**, all returned at teardown. Retained vLLM evidence remains free of
+`SetScalar`.
+
+Evidence lives at
+`~/work/vllm.cpp-nvfp4-device-alpha/7517af4f983fe322ac88ce2d9869e1441b7be3fd/evidence`.
+The no-nvcc configure is `FAILED / ENVIRONMENT-INVALID`, the nested-quote
+zero-test wrapper is `VOID / COMMAND-INVALID`, and the old-cache attempt is
+`FAILED-CLOSED / STALE-CACHE`; each is retained and none contributes a rate or
+correctness result.
+
+Disposition: W3-F3 is complete and the unprofiled cache-off c2/c16 AB/BA/AB
+component is now `ACTIVE` under one uninterrupted `/tmp/gpu` lock. Partial legs
+remain non-binding. No W3-F speed credit, exact-grid authorization or 35B
+performance result exists yet, so immutable `3f256ab` remains binding at
+**55/124 pass, 69 fail**.

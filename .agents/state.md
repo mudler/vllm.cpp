@@ -7091,3 +7091,44 @@ Immutable `3f256ab` continues to bind at **55/124 pass, 69 fail**. Next:
 commit/push, create a new SHA-owned root and require all three FIFO-controlled,
 zero-exit, lossless, exact-plan captures before W3-H2, an exact grid or 35B
 performance.
+
+## 2026-07-13 — ninth H1d attempt proves FIFO/zero-exit but continuous range is void
+
+Clean pushed `219f4f2449aaf6afe7a9a8a41a0dabb58c85e0f3` used immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/219f4f2449aaf6afe7a9a8a41a0dabb58c85e0f3`.
+Plan-first setup, frozen corpus and exact `RelWithDebInfo`
+Triton-AOT/FA2/external-CUTLASS/sm_121a configuration passed. The recorded
+build completed **154/154** and the 27B gate passed **1/1 in 17.22 s**.
+Plan/configure/build/execution/gate/server SHA-256 are `808ad8f8…e6c` /
+`6c0560ed…533` / `4d2b682a…a5f` / `b004d1ca…c54` /
+`6fc8279c…a3b` / `0d4e6916…e63`.
+
+Capture 1 loaded the read-only 64-plan map, completed the ordinary **48/48**
+c16 workload in 66.910178 s and the **16/16** diagnostic probe in 23.824916 s,
+then logged `prior_replays=484` and `captured_replays=4`. The per-capture FIFO
+recorded exactly one ready/requested/completed lifecycle, was removed, and both
+the target and Nsight exited zero. Raw client/probe/profile/command/control SHA
+are `3c066c08…6e1` / `d9658bd1…c7b` / `c14f68d6…59f` /
+`f29369db…4c5` / `9c36ca83…6d7`.
+
+The 395,367-byte report and 2,068,480-byte SQLite have SHA
+`6b8667c7…161` / `da637485…0c`. Validation failed closed on severity-2
+`Not all CUDA events might have been collected.` Read-only SQL proves the
+intended graph inventory is complete—four graph launches, 1,107 kernel + 7
+memcpy + 1 memset nodes each, every node replayed four times, and exact
+208/144/64/48/16/16 tracked family counts—but also finds three inter-replay
+sampler/input gaps inside the continuous range: **9 eager kernels, 9 eager
+memcpys and 3 eager memsets**. They are argmax, token readback/upload and the
+next-step embedding. The strict validator would reject these even without the
+diagnostic. The driver stopped before capture 2/3, vLLM or status. The root is
+**FAILED / VOID**, never reused, and every client rate is diagnostic only.
+GPU, `/tmp/gpu` and port 8001 returned idle.
+
+The accepted H1d spike is revised without weakening a gate. Nsight must use
+`--capture-range-end=repeat:4`; the diagnostic controller must perform four
+start → one graph launch → stream synchronize → stop ranges, leaving sampler
+and input construction between ranges. Every SQLite still rejects severity
+>=2 and any eager kernel/memcpy/memset row. Next: commit this failed checkpoint
+and amended spike, then implement/CPU-gate the repeated-range controller before
+a new pushed SHA/root. Immutable `3f256ab` remains **55/124 pass, 69 fail**;
+W3-H2, exact-grid and 35B performance remain prohibited.

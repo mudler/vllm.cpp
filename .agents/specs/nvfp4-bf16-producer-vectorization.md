@@ -1,10 +1,10 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `3c1d7b7` are VOID;
-the latest completed the exact build/gate and four-replay report but SIGUSR1
-terminated the target and propagated Nsight exit 138 before validation; the
-diagnostic-only FIFO graceful-stop repair is implemented, fresh exact-path
-execution is pending and W3-H2 remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID;
+the latest proves FIFO shutdown/zero exit and contains every intended graph
+child, but one continuous four-replay range also captures three eager sampler
+gaps and Nsight emits severity-2 possible event loss; four isolated repeat
+ranges are specified, implementation is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -119,6 +119,26 @@ profiler exit zero. SIGTERM/KILL remain failure cleanup only. Focused harness
 tests pass **31/31**; Python/shell and diagnostic-macro syntax plus the
 CUDA-off server build pass. Two full CUDA-off runs are **105/106** only because
 the unrelated timing-sensitive C API early-stop test fails; it passes alone.
+
+Clean `219f4f2` exercised that FIFO repair from a new immutable root. The exact
+**154/154** build and 27B gate **1/1 in 17.22 s** passed. Capture 1 completed
+the ordinary **48/48** client in 66.910178 s and the **16/16** probe in
+23.824916 s after 484 prior replays. The FIFO ready/requested/completed
+lifecycle, removal, target exit zero and Nsight exit zero all passed. The
+395,367-byte report and 2,068,480-byte SQLite have SHA `6b8667c7…161` and
+`da637485…0c`; the validator still rejected severity-2 `Not all CUDA events
+might have been collected.` and stopped before captures 2/3 or vLLM.
+
+Read-only SQL localizes the contract error without relaxing it. All intended
+children exist exactly: four `cudaGraphLaunch` rows, **1,107 kernel + 7 memcpy
++ 1 memset nodes x4**, uniform replay counts, and exact 208/144/64/48/16/16
+tracked family cardinalities. The continuous range also contains the three
+between-replay sample/input-build gaps: **9 eager kernels, 9 eager memcpys and
+3 eager memsets** (`ArgmaxPartial`, `ArgmaxFinal`, token D2H/input H2D and
+`EmbeddingKernel`). The root is void and never reused. H1d is therefore
+revised to four synchronized single-replay CUDA-profiler ranges under Nsight
+`--capture-range-end=repeat:4`; sampler/input work must execute between ranges
+and remain absent from SQLite. The severity and zero-eager checks stay strict.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -420,11 +440,13 @@ observer. The server installs a SIGUSR2 controller whose signal handler only
 sets `sig_atomic_t`. After the exact c16 client has completed its ordinary 16
 warmups and 48 measured requests with collection dormant, the driver verifies
 the owned server PID/process group, sends SIGUSR2 and runs a separate warmed
-c16 diagnostic probe. `ReplayGraph` calls `cudaProfilerStart()` immediately
-before probe replay 1, launches exactly four graphs, synchronizes the stream
-after replay 4, then calls `cudaProfilerStop()`. The synchronization and probe
-are structural diagnostics: no probe duration, latency or throughput may be
-reported as performance.
+c16 diagnostic probe. For each of the next four eligible `ReplayGraph` calls,
+the diagnostic controller calls `cudaProfilerStart()` immediately before the
+launch, launches one graph, synchronizes its stream, and calls
+`cudaProfilerStop()` immediately afterward. Thus sampling and input building
+between decode steps occur outside all four ranges. The synchronization and
+probe are structural diagnostics: no probe duration, latency or throughput may
+be reported as performance.
 
 Before launch, the driver creates one mode-0600 named FIFO for the capture and
 passes its absolute path through `--benchmark-shutdown-fifo`. The diagnostic
@@ -437,13 +459,13 @@ nonzero profiler exit remains a failure; the contract is not relaxed. Default
 production builds contain neither the replay observer nor this FIFO waiter.
 
 The exact Nsight command is `--trace=cuda --capture-range=cudaProfilerApi
---capture-range-end=stop --flush-on-cudaprofilerstop=true
+--capture-range-end=repeat:4 --flush-on-cudaprofilerstop=true
 --cuda-flush-interval=0 --cuda-graph-trace=node:host-only
 --cuda-event-trace=false --sample=none --cpuctxsw=none --stats=false
 --kill=none`. Startup, model loading, graph construction, ordinary client
-warmups/measured work and shutdown remain outside collection. Four c16 replay
-windows yield only 4,428 primary kernel rows instead of H1c's hundreds of
-thousands.
+warmups/measured work, the three inter-replay sampler/input gaps and shutdown
+remain outside collection. Four c16 single-replay ranges yield only 4,428
+primary kernel rows instead of H1c's hundreds of thousands.
 
 Export and validate every SQLite before starting the next capture and before
 the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
@@ -599,7 +621,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `3c1d7b7` are VOID. The latest exact build/gate and four-replay report pass but SIGUSR1 terminates the target and yields profiler exit 138 before validation. The plan-first exact build, explicit Nsight ancestry, diagnostic FIFO graceful stop/removal, zero-exit contract and three-capture execution are pending fresh immutable evidence** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID. The latest exact build/gate, clients, four graph launches and FIFO/zero-exit lifecycle pass, but one continuous range captures three eager sampler gaps and emits severity-2 possible loss. Four isolated `repeat:4` single-replay ranges must retain the strict diagnostic/zero-eager contract before fresh immutable three-capture execution** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

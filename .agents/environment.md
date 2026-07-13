@@ -87,15 +87,17 @@ inner 4096, state 128; context 262144.
   v0.25.0 evidence completes the exact 27B cache-off grid under one lock:
   **55/124 axes pass, 69 fail**. W3-E/W3-F/W3-G strict-fail their components.
   W3-H's exact-target H1d refresh is next: H1a/H1b/H1c and H1d attempts
-  through `3c1d7b7` are void. The latest exact 154-target build and 27B gate
-  pass, 48/48 + 16/16 clients complete and four replays close, but SIGUSR1
-  terminates the target and propagates profiler exit 138 before validation.
-  The driver now enforces
+  through `219f4f2` are void. The latest exact 154-target build and 27B gate
+  pass, 48/48 + 16/16 clients complete, the FIFO is removed and target/Nsight
+  exit zero. Its continuous range still captures three eager sampler/input gaps
+  and emits severity-2 possible loss despite exact intended graph-child counts.
+  The revised driver/controller must use four isolated `repeat:4` ranges and
+  still enforces
   plan-first evidence, exact
   Triton-AOT/FA2/CUTLASS/toolchain configuration, its own recorded target build
   and actual `nsys -> nsys-launcher -> target-session` ancestry plus a
-  diagnostic-only FIFO graceful stop, FIFO removal and zero exit. Require
-  three lossless exact-plan captures before implementing the
+  diagnostic-only FIFO graceful stop, FIFO removal, zero exit and zero eager
+  rows. Require three lossless exact-plan captures before implementing the
   next lever, then close all 69 failed axes before any 35B performance run.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1

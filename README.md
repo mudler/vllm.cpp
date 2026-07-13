@@ -12,8 +12,8 @@ OpenAI-compatible server.
 > **NVIDIA GB10** with token-exact greedy correctness gates passing. Performance
 > parity is **GATING** against
 > [vLLM v0.25.0](https://github.com/vllm-project/vllm/releases/tag/v0.25.0)
-> at `702f481`. The immutable `9cc7191` 27B cache-off gate is complete and
-> binding: all **124/124** axes are valid, but only **54/124** pass. Therefore
+> at `702f481`. The immutable `3f256ab` 27B cache-off gate is complete and
+> binding: all **124/124** axes are valid, but only **55/124** pass. Therefore
 > 27B parity is **FAILED/open**, and 35B performance remains prohibited.
 >
 > The previous exact 27B floor (`b5c6e4f`) used vLLM 0.24.0 with FlashInfer
@@ -30,13 +30,13 @@ OpenAI-compatible server.
 > It also confirms the next FP4 candidates remain current: v0.25 still consumes
 > directly swizzled scale factors with zeroed unread padding and a model-owned
 > device `alpha` pointer. The exact v0.25 oracle is now validated and active. A
-> fresh immutable `9cc7191` campaign completed the 27B model gate, all **36/36**
+> fresh immutable `3f256ab` campaign completed the 27B model gate, all **36/36**
 > timed groups (**2,016** requests), six memory returns and a paired execution
 > trace under one uncontended whole-series lock. Median total-throughput ratios
-> at c1/2/4/8/16/32 are **0.990/0.949/0.963/0.977/1.029/1.047×**; the per-point
-> performance-axis pass counts are **4/4/5/4/17/18 of 20**. Host PSS/RSS fail
-> at **0.586/0.593×** normalized, while GPU memory and available-memory drop
-> pass at **1.812/1.221×**. We will modernize or delete paths only when the
+> at c1/2/4/8/16/32 are **0.994/0.954/0.966/0.981/1.028/1.039×**; the per-point
+> performance-axis pass counts are **5/4/5/4/17/18 of 20**. Host PSS/RSS fail
+> at **0.585/0.592×** normalized, while GPU memory and available-memory drop
+> pass at **1.829/1.228×**. We will modernize or delete paths only when the
 > trace proves them obsolete. The first trace's CUDA-13 default whole-graph
 > capture was attribution-incomplete, but immutable `def5f75` has now completed
 > the replacement one-lock node-level trace: **2,315,412** graph-child kernels
@@ -54,10 +54,13 @@ OpenAI-compatible server.
 > while the trace-grounded/upstream-mirrored packed default is retained. The
 > clean post-pack node trace passes and closes the structural target: ours is
 > **296,674 / 1,425 = 208.192 FP4 GEMMs/forward** (208 plus 274 capture/warmup
-> calls), while vLLM remains exactly **330,304 / 1,588 = 208**. The binding
-> grid remains 54/124 until the fresh exact rerun. That new `3f256ab` exact
-> grid is now **ACTIVE/PENDING** from an immutable plan and corpus; no model,
-> timing, memory or trace group has run yet. Every 27B speed,
+> calls), while vLLM remains exactly **330,304 / 1,588 = 208**. The fresh exact
+> grid improves the binding disposition by one axis, from 54/124 to **55/124**,
+> but strict parity still fails. Its paired trace exposes the next structural
+> mismatch: vLLM executes **127,040 fused Add+RMSNorm+FP4-quant launches = 80
+> per 1,588 forwards**, while our corresponding sites remain separate norm and
+> quant launches. `KERNEL-EW-NORM-QUANT` is therefore the next trace-grounded
+> spike/repair; no speed credit is claimed before a same-binary A/B. Every 27B speed,
 > latency and memory axis must
 > pass before 35B runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.
@@ -198,7 +201,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `9cc7191` 27B cache-off gate completed all 36 groups but failed strict parity at **54/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Immutable `3f256ab` packed/split correctness is 16/16; its c16 component is **1.005049×** but strict-fails at **14/20 timing + 2/4 memory**. The post-pack trace confirms **208.192 vs 208 FP4 GEMMs/forward**. Its fresh exact grid is **ACTIVE/PENDING** from a validated plan/corpus with no partial result. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Immutable `3f256ab` packed/split correctness is 16/16; its c16 component is **1.005049×** but strict-fails at **14/20 timing + 2/4 memory**. The post-pack trace confirms **208.192 vs 208 FP4 GEMMs/forward**; the exact paired trace next selects the vLLM fused Add+RMSNorm+FP4-quant topology for a spike/A-B. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -208,7 +211,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved. Immutable `9cc7191` completed the exact 27B c1-c32 grid and lifecycle proofs; all **124/124** axes bind, **54 pass / 70 fail**. Clean `3f256ab` c16 is **1.005049×**, with **14/20 timing + 2/4 memory**, and its post-pack trace confirms **208.192 vs vLLM 208 FP4 GEMMs/forward**. The fresh exact grid is **ACTIVE/PENDING** with validated immutable plan/corpus and no partial sample; no 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved. Immutable `3f256ab` completed the exact 27B c1-c32 grid and lifecycle proofs; all **124/124** axes bind, **55 pass / 69 fail**. Its c16 packed/split component is **1.005049×**, with **14/20 timing + 2/4 memory**, and its post-pack trace confirms **208.192 vs vLLM 208 FP4 GEMMs/forward**. The exact trace selects fused Add+RMSNorm+FP4 quant as the next unimplemented executed topology; no 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -245,7 +248,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged gate/up CT semantics, fused SiLU→NVFP4 quantization, pre-serve bucket tuning and W3-D packed QKV. Packed QKV concatenates resident Q/K/V weights/scales, applies max logical-shard CT divisors and one alpha, launches one GEMM, then consumes row-strided views without split copies; `VT_FP4_MERGED_QKV=0` restores the prior path. CUDA/reference, sanitizer and immutable default/fallback 16/16 model gates pass. Packed/split c16 means are **812.231/808.150 tok/s** with **14/20 timing + 2/4 memory**; post-pack tracing closes launch topology. The binding v0.25.0 grid still fails **70/124** axes and its fresh rerun is `ACTIVE/PENDING`; 35B is held. |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged gate/up CT semantics, fused SiLU→NVFP4 quantization, pre-serve bucket tuning and W3-D packed QKV. Packed QKV concatenates resident Q/K/V weights/scales, applies max logical-shard CT divisors and one alpha, launches one GEMM, then consumes row-strided views without split copies; `VT_FP4_MERGED_QKV=0` restores the prior path. CUDA/reference, sanitizer and immutable default/fallback 16/16 model gates pass. Packed/split c16 means are **812.231/808.150 tok/s** with **14/20 timing + 2/4 memory**; post-pack tracing closes launch topology. The binding v0.25.0 `3f256ab` grid still fails **69/124** axes; fused Add+RMSNorm+FP4 quant is the next trace-selected gap and 35B is held. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -266,11 +269,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **VOID** at 28/36 groups, 1,602/2,016 timed requests, four returns and no
   paired trace. The canonical v0.25.0 oracle now passes package/import/CLI,
   lock-held real-model production-graph and clean server health/completion
-  smoke checks. Immutable `9cc7191` then completed its model gate, all 36 timed
-  groups, 2,016 requests, six memory returns and the first paired trace. Every one of
-  the 124 axes is binding-eligible; **54 pass and 70 fail**. Median total ratios
-  are **0.990/0.949/0.963/0.977/1.029/1.047×** from c1 through c32. The run is
-  stable (all total-throughput CVs below 0.51%), so the low-concurrency and host
+  smoke checks. Immutable `3f256ab` then completed its model gate, all 36 timed
+  groups, 2,016 requests, six memory returns and the paired trace. Every one of
+  the 124 axes is binding-eligible; **55 pass and 69 fail**. Median total ratios
+  are **0.994/0.954/0.966/0.981/1.028/1.039×** from c1 through c32. The run is
+  stable (maximum total-throughput CV **0.189%**), so the low-concurrency and host
   memory gaps are reproduced rather than dismissed as noise. The original
   whole-graph trace was insufficient, but replacement `def5f75` passes the
   node-level contract with **2,315,412** graph-child and **272,354** eager rows.
@@ -281,15 +284,19 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   c16/96 component improves mean total throughput **0.5049%** and sampled GPU
   memory, but only **14/20 timing + 2/4 memory** axes pass. The post-pack trace
   then confirms **296,674/1,425 = 208.192** FP4 GEMMs/forward versus vLLM's
-  exact 208. The grid remains failed/open pending the exact vLLM rerun.
+  exact 208. The completed exact rerun gains one axis versus `9cc7191` but remains
+  failed/open. Its paired trace shows vLLM executing **127,040** fused
+  Add+RMSNorm+FP4-quant launches—exactly **80 per forward**—where ours still
+  runs separate producer/quant kernels, selecting `KERNEL-EW-NORM-QUANT` next.
 - **Modernization and removal are trace-gated.** The v0.25.0 audit found no
   copied legacy `paged_attention_v1/v2` source and no MRV1 execution path to
   delete. The live `vt::PagedAttention` name denotes a backend-neutral paged-KV
   operation and remains required. v0.25.0 also preserves direct swizzled FP4
   scales, zeroed unread padding and a device-resident `alpha` pointer, so the
-  proposed FP4 topology repair is not obsolete. The node trace ranks packed
-  QKV ahead of direct swizzle, padding, resident `alpha`, blocking CUDA events
-  (vllm#47081), or another unmeasured change. Every 27B throughput, latency and
+  packed FP4 topology repair was not obsolete. The fresh trace now ranks
+  executed fused Add+RMSNorm+FP4 quant ahead of direct swizzle, padding,
+  resident `alpha`, blocking CUDA events (vllm#47081), or another unmeasured
+  change. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.
 - **The competitor floor is workload-specific.** Source-auditing the referenced
@@ -345,15 +352,16 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   prewarmed keys are tactic-stable, although first-use latency improves.
   Corrected paired tracing now closes the original FP4 structural gap at
   **110.623/109.932 s** prewarm/vLLM and leaves diagnostic normalized TPOT at
-  **0.9673x**. The old-oracle `3cc490c` grid is VOID; its replacement exact
-  c1-c32 campaign is complete from immutable `9cc7191`: manifest/oracle/build-log/
-  source-corpus/vLLM-corpus SHA-256 are `5a04cdcf…b2`, `6d39cb90…10c`,
-  `10786029…6a`, `41bd634a…7a`, and `b048d789…5dc`. One metadata-only
+  **0.9673x**. The old-oracle `3cc490c` grid is VOID. Its first v0.25
+  replacement `9cc7191` remains historical at 54/124; the current binding
+  c1-c32 campaign is complete from immutable `3f256ab`. Plan/source/
+  vLLM-corpus SHA-256 are `0e309d8b…9999`, `41bd634a…fd7a`, and
+  `b048d789…e5dc`. One metadata-only
   invocation first failed before writing output because it omitted the repo
   module path; the corrected module invocation passed. The model gate, all
   **36/36** groups, **2,016/2,016** requests and six lifecycle/cache returns
   pass their evidence contracts. The scoped summary accepts all
-  **124/124** axes but only **54/124** pass; therefore no parity claim is made.
+  **124/124** axes but only **55/124** pass; therefore no parity claim is made.
   Generated-text equality is diagnostic for FP4 near-ties: the commit-bound
   16/16 token gate and exact native 128-token counts remain the correctness
   precondition. The recorded trace status passed the original graph-level
@@ -361,7 +369,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **1,226** graph launches and **0** child-node kernel rows. The replacement
   `def5f75` `--trace-only` checkpoint passes its model gate and paired-profiler
   contract under one lock, retains **2,315,412** graph-child rows, and selects
-  packed QKV from the observed **~240 versus 208 FP4 GEMMs/step** topology. vLLM logged an unavailable optional
+  packed QKV from the observed **~240 versus 208 FP4 GEMMs/step** topology. The
+  completed `3f256ab` trace validates the repaired 208 topology and selects the
+  separate-vs-fused norm/FP4 producer chain next. vLLM logged an unavailable optional
   `triton_kernels.matmul_ogs` import for GPT-OSS/MXFP4; the executed dense-27B
   dispatch used FlashInfer NVFP4, FLA/Triton GDN and FA2, so the warning is
   recorded as non-path evidence rather than an environment mutation.
@@ -457,11 +467,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   vLLM denominator or may be multiplied into the old grid. Both model paths are
   W0 memory-access clean and the W1 indexed op is memcheck-clean, but the
   required zero-leak result remains open on inherited process-lifetime pools.
-  Exact v0.25.0 oracle activation, the immutable `9cc7191` 27B grid and the
+  Exact v0.25.0 oracle activation, the immutable `3f256ab` 27B grid and the
   `def5f75` node-level paired trace and W3-D immutable correctness/A-B are
   complete; the A/B is mean-positive but strict-fails at 14/20 timing + 2/4
   memory. The post-pack trace closes 240→208 structurally; exact-grid and trace-driven
-  repair of all 70 failed axes, fixed HTTP capacity and fresh every-axis 27B
+  repair of all 69 failed axes, fixed HTTP capacity and fresh every-axis 27B
   closure remain mandatory before 35B and later roadmap work.
   W2 direct indexed
   convolution-state update stays scoped until those confirmed causes are

@@ -5794,3 +5794,34 @@ ACTIVE-checkpoint validation: the first canonical-record/mutation run
 dropped its exact 27B/35B test anchors. Restoring those links fixes the record;
 the corrected record checker, doc checker, diff check and **18/18** mutation
 tests pass.
+
+### 2026-07-13 — W3-D exact 27B grid completes at 55/124; norm+FP4 fusion selected
+
+Immutable `3f256ab` completed the complete cache-off vLLM v0.25.0 27B
+campaign under one uninterrupted `/tmp/gpu` lock: model gate, **36/36** timed
+groups, **2,016/2,016** requests, six memory/cache returns and paired traces.
+All 12 performance groups, two memory groups and 124 axes are binding-eligible;
+strict parity **fails at 55 pass / 69 fail**. Total-throughput ratios c1→c32
+are **0.993504/0.954464/0.966438/0.980678/1.027889/1.039417×**. PSS/RSS
+remain open at **0.584689/0.592269×**; GPU/drop pass at
+**1.829076/1.227760×**. Max total-throughput CV is **0.189%**. Versus prior
+binding `9cc7191`, c1-c8 improve by 0.309–0.532 percentage points, c16/c32
+move -0.089/-0.725 points, and only c1 p90 ITL flips to pass. Thus W3-D earns
+one net axis but not closure. Summary hashes are `83b3f500…9f8` /
+`66d7f50e…b4bd` / `df3d0539…e4d7`; model-gate log `36191579…6e69`.
+
+The paired trace passes with status/Nsight/SQLite/ours-kernel/vLLM-kernel SHA
+`9762c1e6…1d0c6` / `e397289d…8476` / `99cbd04d…93f8` /
+`55a1631a…d2be` / `e4e916d1…565`. It reconfirms packed-QKV structural parity
+and re-ranks the residual: vLLM has three generated fused
+Add+RMSNorm+FP4-quant families totaling **127,040 launches = 80 per 1,588
+forwards**, while ours retains separate norm and quant kernels. Local
+`GdnDecodeFusedKernel` totals 19.101 s/73,578 calls versus vLLM fused recurrent
+28.659 s/70,848 calls. Those cross-profiler durations are diagnostic, not a
+speed ratio, but expose no missing local GDN family; the exact missing fused
+norm topology therefore ranks first. The next work is a
+dedicated `KERNEL-EW-NORM-QUANT` full dependency-chain spike before claim or
+implementation, then upstream tests, a same-binary 27B A/B and another exact
+grid. The old byte-exact but neutral `76e9047` shared-staging experiment is
+historical evidence, not a veto on adapting the now-executed v0.25
+FlashInfer/Inductor topology. GPU, ports and lock exit idle; 35B remains held.

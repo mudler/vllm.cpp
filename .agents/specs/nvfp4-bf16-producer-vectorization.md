@@ -1,9 +1,9 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c are VOID; the H1d trace-only controller,
-target-build preflight and schema-v2 validators are implemented and CPU-gated;
-immutable `7bae38a`/`2d16c68` failed before build/GPU because Ninja and then
-`nvcc` were not on the DGX login `PATH`; the fully pinned-toolchain replacement
+Status: **ACTIVE — H1a/H1b/H1c are VOID; clean `7bae38a`/`2d16c68` failed
+before build/GPU on missing login-PATH tools; clean `5f8fab1` built but is VOID
+because its H1d recipe omitted the binding Triton-AOT GDN path, used the wrong
+build type and failed correctness before capture; the repaired exact-path
 execution is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
@@ -44,6 +44,17 @@ compiler discovery because login `PATH` also omits `nvcc`. Configure SHA-256 is
 `378fdd7a…4c3c`; it too ran no build/model/lock/GPU/profiler and remains void.
 The next manifest/recipe pins `/usr/local/cuda-13.0/bin/nvcc` at CUDA 13.0.88
 and hashes the 24,513,032-byte compiler (`fbb111f0…79e1`) before GPU work.
+
+Clean `5f8fab1` then configured and built the CUTLASS target, but its mandatory
+27B gate failed deterministically before capture: profile control ON failed
+3/3 and a same-source profile-control-OFF build failed 2/2 with the same token
+8 divergence. A retained `ae9e8ff` binary still passes the gate. The observer
+is therefore exonerated; the attempted build was not the binding execution
+path. It omitted `VLLM_CPP_TRITON=ON` and used `Release`, whereas accepted
+`3f256ab`/`ae9e8ff` use vendored Triton-AOT with regeneration disabled and
+`RelWithDebInfo`. H1d now preflights those settings plus FA2, CUTLASS and exact
+toolchain artifacts before acquiring `/tmp/gpu`. No trace or performance
+evidence follows from `5f8fab1`.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -330,7 +341,8 @@ flags, exit status and capture-range markers.
 
 Before the GPU lock or any model load, H1d must fail closed unless the detached
 build records the exact external CUTLASS source tree, sm_121a architecture,
-`VT_CUTLASS_NVFP4=1`, compilation of
+`RelWithDebInfo`, vendored `VLLM_CPP_TRITON=ON` with regeneration disabled,
+FA2, `VT_CUTLASS_NVFP4=1`, compilation of
 `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`, and target symbols in the server
 binary. The execution manifest hashes that dependency/build contract. Each
 accepted trace must then contain the target CUTLASS FP4 device-kernel family
@@ -468,8 +480,11 @@ ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
-  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_SERVER=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_FLASH_ATTN=ON \
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=OFF \
   -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
@@ -502,7 +517,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d controller, exact build/dispatch preflight, bounded collector and schema-v2 ours/vLLM validators are implemented and CPU-gated; immutable three-capture DGX execution pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c are VOID; H1d `7bae38a`/`2d16c68` failed pre-build and `5f8fab1` failed correctness on a non-binding no-Triton/wrong-build-type configuration before capture. The repaired exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS three-capture execution is pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

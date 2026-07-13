@@ -204,13 +204,21 @@ def _write_fixture(root: pathlib.Path) -> None:
             "pandas": PANDAS_VERSION,
         },
         "build_contract": {
+            "schema_version": 2,
+            "build_type": "RelWithDebInfo",
             "compile_command_sha256": "a" * 64,
             "cutlass_source_tree": _fingerprint_tree(cutlass),
             "native_plan_target": str(native_target),
             "native_plan_target_absent": True,
             "profile_control": False,
             "sm_architecture": "121a",
-            "target_compile_definitions": ["VT_CUTLASS_NVFP4=1"],
+            "triton_aot": True,
+            "target_compile_definitions": [
+                "VLLM_CPP_FLASH_ATTN",
+                "VLLM_CPP_TRITON=1",
+                "VLLM_CPP_TRITON_CHUNKO_BF16=1",
+                "VT_CUTLASS_NVFP4=1",
+            ],
         },
         "cache_drop_roots": _fixture_cache_roots(root),
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
@@ -231,6 +239,9 @@ def _write_fixture(root: pathlib.Path) -> None:
     trace_execution = json.loads(json.dumps(production_execution))
     trace_execution["build_contract"]["profile_control"] = True
     trace_execution["build_contract"]["target_compile_definitions"] = [
+        "VLLM_CPP_FLASH_ATTN",
+        "VLLM_CPP_TRITON=1",
+        "VLLM_CPP_TRITON_CHUNKO_BF16=1",
         "VT_BENCH_PROFILE_CONTROL=1",
         "VT_CUTLASS_NVFP4=1",
     ]
@@ -585,6 +596,22 @@ class OnlineGateSummaryTests(unittest.TestCase):
             self.assertTrue(ratios["gate_pass"])
             self.assertTrue(all(item["binding_eligible"] for item in ratios["ratios"]))
             self.assertTrue(all(item["pass"] for item in ratios["ratios"]))
+
+    def test_pre_h1d_production_build_contract_stays_reaggregatable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            path = root / "execution" / "27.json"
+            execution = json.loads(path.read_text(encoding="utf-8"))
+            build = execution["build_contract"]
+            build.pop("schema_version")
+            build.pop("build_type")
+            build.pop("triton_aot")
+            build["target_compile_definitions"] = ["VT_CUTLASS_NVFP4=1"]
+            path.write_text(json.dumps(execution), encoding="utf-8")
+            runs, ratios = self._summarize(root)
+            self.assertTrue(runs["gate_pass"])
+            self.assertTrue(ratios["gate_pass"])
 
     def test_model_summary_does_not_require_the_other_gate_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

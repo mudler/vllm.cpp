@@ -6893,3 +6893,37 @@ already pinned oracle Ninja. Focused harness tests pass **25/25** and record/
 checkpoint checks remain green. The next hardware action after this fully
 explicit toolchain checkpoint is a third fresh immutable root; continue only
 if CUDA/CUTLASS build provenance passes before the GPU lock.
+
+## 2026-07-13 — third H1d attempt void on non-binding build path; exact Triton-AOT contract restored
+
+Clean pushed `5f8fab17042ce2939115a3f6ac64b1b9418136c8` configured with pinned
+oracle Ninja, CUDA 13.0.88 `nvcc`, external FlashInfer CUTLASS and sm_121a, and
+built the requested server/model-gate targets **130/130**. The H1d driver then
+acquired `/tmp/gpu` and stopped at the mandatory 27B correctness gate before
+any Nsight or vLLM capture. The original run and two same-binary reproductions
+failed identically at 234/235 assertions: all emitted
+`{6511,314,9564,369,19241,13,271,248068,198,8160,579,264,7047,1817,25,271}`
+instead of the production golden from token 8 onward. Original gate/driver
+SHA-256 are `0d9176cf5a73ebf1f8c2c81fd1c75800b76c4826f9999a8840432353b73fd8ed` /
+`245633e0e5209f1934d8c3a8971ce5f07b436ff41ef27fdef67bc9defc19767b`.
+
+A same-source `VLLM_CPP_BENCH_PROFILE_CONTROL=OFF` Release build failed twice
+with the identical stream (log SHA `49130c62…fc5` / `a899521e…dc7e`), so the
+diagnostic observer is not causal. The retained `ae9e8ff` binary passed the
+same gate under the same read-only plan environment (log SHA `ddb0120b…61f`).
+Build-command comparison found the invalid contract: H1d used `Release` and
+omitted `VLLM_CPP_TRITON=ON`, whereas binding `3f256ab`/`ae9e8ff` use
+`RelWithDebInfo`, vendored Triton-AOT with regeneration off, FA2 and CUTLASS.
+No profiler report, SQLite, vLLM raw trace or performance metric exists from
+`5f8fab1`; `3f256ab` remains binding at **55/124 pass, 69 fail**.
+
+The execution manifest and status validator now emit build-contract schema 2
+and fail closed on exact `RelWithDebInfo`, `VLLM_CPP_TRITON=ON`, regeneration
+OFF, FA2, CUTLASS, sm_121a, tests/server targets, oracle Ninja and CUDA 13.0.88.
+Historical schema-less accepted timing evidence remains reaggregatable, while
+all new manifests use the strict schema. Reproduction docs, README, roadmap,
+engine/kernel/feature matrices, porting inventory, coordination and benchmark
+scoreboard record the failed checkpoint and fresh-root requirement. Python
+compilation and focused harness tests pass **26/26**. Next: commit/push this
+checkpoint, create a fresh immutable root and require the 27B gate plus three
+lossless exact-path captures before W3-H2.

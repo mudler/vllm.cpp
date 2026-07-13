@@ -433,10 +433,29 @@ def _model_precondition_reasons(
                     reasons.append("binding timing build contains trace profile control")
                 if build_contract.get("sm_architecture") != "121a":
                     reasons.append("execution CUDA architecture differs from H1d")
-                if build_contract.get("target_compile_definitions") != [
-                    "VT_CUTLASS_NVFP4=1"
-                ]:
-                    reasons.append("production target compile definitions differ")
+                build_schema = build_contract.get("schema_version")
+                if build_schema is None:
+                    # Accepted pre-H1d production evidence predates the exact
+                    # path fields. Its hashed CMake cache/compile commands stay
+                    # reaggregatable; every new manifest is emitted as schema 2.
+                    if build_contract.get("target_compile_definitions") != [
+                        "VT_CUTLASS_NVFP4=1"
+                    ]:
+                        reasons.append("legacy production compile definitions differ")
+                elif build_schema == 2:
+                    if build_contract.get("build_type") != "RelWithDebInfo":
+                        reasons.append("production build type differs")
+                    if build_contract.get("triton_aot") is not True:
+                        reasons.append("production Triton-AOT path is absent")
+                    if build_contract.get("target_compile_definitions") != [
+                        "VLLM_CPP_FLASH_ATTN",
+                        "VLLM_CPP_TRITON=1",
+                        "VLLM_CPP_TRITON_CHUNKO_BF16=1",
+                        "VT_CUTLASS_NVFP4=1",
+                    ]:
+                        reasons.append("production target compile definitions differ")
+                else:
+                    reasons.append("production build-contract schema differs")
                 native_target = build_contract.get("native_plan_target")
                 if (
                     build_contract.get("native_plan_target_absent") is not True

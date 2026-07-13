@@ -57,6 +57,7 @@ TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
 TRACE_CAPTURE_GRAPH_REPLAYS = 4
 TRACE_STATUS_SCHEMA_VERSION = 2
+BUILD_CONTRACT_SCHEMA_VERSION = 2
 NSYS_CAPTURE_RANGE = "cudaProfilerApi"
 NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
@@ -1860,10 +1861,19 @@ def _validated_trace_execution(
     build_contract = execution.get("build_contract")
     if (
         not isinstance(build_contract, dict)
+        or build_contract.get("schema_version") != BUILD_CONTRACT_SCHEMA_VERSION
+        or build_contract.get("build_type") != "RelWithDebInfo"
         or build_contract.get("profile_control") is not True
         or build_contract.get("sm_architecture") != "121a"
+        or build_contract.get("triton_aot") is not True
         or build_contract.get("target_compile_definitions")
-        != ["VT_BENCH_PROFILE_CONTROL=1", "VT_CUTLASS_NVFP4=1"]
+        != [
+            "VLLM_CPP_FLASH_ATTN",
+            "VLLM_CPP_TRITON=1",
+            "VLLM_CPP_TRITON_CHUNKO_BF16=1",
+            "VT_BENCH_PROFILE_CONTROL=1",
+            "VT_CUTLASS_NVFP4=1",
+        ]
     ):
         raise HarnessError("trace execution manifest is not the exact H1d build")
     artifacts = execution.get("artifacts")
@@ -2705,13 +2715,18 @@ def record_execution_manifest(
         if match:
             cache_values[match.group(1)] = match.group(2)
     expected_cache_values = {
-        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CUDA_COMPILER": str(DGX_CUDA_COMPILER),
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_MAKE_PROGRAM": str(oracle_ninja),
         "VLLM_CPP_BENCH_PROFILE_CONTROL": "ON" if profile_control else "OFF",
+        "VLLM_CPP_BUILD_TESTS": "ON",
         "VLLM_CPP_CUDA": "ON",
         "VLLM_CPP_CUDA_ARCHITECTURES": "121a",
+        "VLLM_CPP_FLASH_ATTN": "ON",
+        "VLLM_CPP_SERVER": "ON",
+        "VLLM_CPP_TRITON": "ON",
+        "VLLM_CPP_TRITON_REGEN": "OFF",
     }
     for name, expected in expected_cache_values.items():
         if cache_values.get(name) != expected:
@@ -2772,6 +2787,9 @@ def record_execution_manifest(
         raise HarnessError("CUTLASS NVFP4 compile command has no token stream")
     compile_text = " ".join(compile_tokens)
     for required in (
+        "-DVLLM_CPP_FLASH_ATTN",
+        "-DVLLM_CPP_TRITON=1",
+        "-DVLLM_CPP_TRITON_CHUNKO_BF16=1",
         "-DVT_CUTLASS_NVFP4=1",
         "arch=compute_121a",
         "sm_121a",
@@ -2836,6 +2854,8 @@ def record_execution_manifest(
         ],
         "bench_dependencies": expected_bench_dependencies,
         "build_contract": {
+            "schema_version": BUILD_CONTRACT_SCHEMA_VERSION,
+            "build_type": "RelWithDebInfo",
             "compile_command_sha256": _sha256_canonical(compile_tokens),
             "cuda_compiler": str(DGX_CUDA_COMPILER),
             "cuda_compiler_sha256": sha256_file(DGX_CUDA_COMPILER),
@@ -2845,10 +2865,22 @@ def record_execution_manifest(
             "native_plan_target_absent": True,
             "profile_control": profile_control,
             "sm_architecture": "121a",
+            "triton_aot": True,
             "target_compile_definitions": (
-                ["VT_BENCH_PROFILE_CONTROL=1", "VT_CUTLASS_NVFP4=1"]
+                [
+                    "VLLM_CPP_FLASH_ATTN",
+                    "VLLM_CPP_TRITON=1",
+                    "VLLM_CPP_TRITON_CHUNKO_BF16=1",
+                    "VT_BENCH_PROFILE_CONTROL=1",
+                    "VT_CUTLASS_NVFP4=1",
+                ]
                 if profile_control
-                else ["VT_CUTLASS_NVFP4=1"]
+                else [
+                    "VLLM_CPP_FLASH_ATTN",
+                    "VLLM_CPP_TRITON=1",
+                    "VLLM_CPP_TRITON_CHUNKO_BF16=1",
+                    "VT_CUTLASS_NVFP4=1",
+                ]
             ),
         },
         "model_key": model_key,

@@ -1008,25 +1008,33 @@ class OnlineClientContractTests(unittest.TestCase):
                 f"-- CUTLASS found at {cutlass}; enabling sm120a NVFP4 cutlass GEMM\n",
                 encoding="utf-8",
             )
-            (build / "CMakeCache.txt").write_text(
+            cmake_cache = build / "CMakeCache.txt"
+            cmake_cache.write_text(
                 "\n".join(
                     (
-                        "CMAKE_BUILD_TYPE:STRING=Release",
+                        "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
                         f"CMAKE_CUDA_COMPILER:FILEPATH={cuda_compiler}",
                         "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
                         f"CMAKE_MAKE_PROGRAM:FILEPATH={root / 'oracle-files/ninja'}",
                         f"CMAKE_HOME_DIRECTORY:INTERNAL={source}",
                         "VLLM_CPP_BENCH_PROFILE_CONTROL:BOOL=ON",
+                        "VLLM_CPP_BUILD_TESTS:BOOL=ON",
                         "VLLM_CPP_CUDA:STRING=ON",
                         "VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a",
                         f"VLLM_CPP_CUTLASS_DIR:PATH={cutlass}",
+                        "VLLM_CPP_FLASH_ATTN:BOOL=ON",
+                        "VLLM_CPP_SERVER:BOOL=ON",
+                        "VLLM_CPP_TRITON:BOOL=ON",
+                        "VLLM_CPP_TRITON_REGEN:BOOL=OFF",
                     )
                 )
                 + "\n",
                 encoding="utf-8",
             )
             compile_command = (
-                "nvcc -DVT_CUTLASS_NVFP4=1 -DVT_BENCH_PROFILE_CONTROL=1 "
+                "nvcc -DVLLM_CPP_FLASH_ATTN -DVLLM_CPP_TRITON=1 "
+                "-DVLLM_CPP_TRITON_CHUNKO_BF16=1 "
+                "-DVT_CUTLASS_NVFP4=1 -DVT_BENCH_PROFILE_CONTROL=1 "
                 '"--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]" '
                 f"-isystem {cutlass / 'include'} "
                 f"-isystem {cutlass / 'tools/util/include'} -c "
@@ -1102,23 +1110,45 @@ class OnlineClientContractTests(unittest.TestCase):
                     "tools.bench.online_gate.DGX_CUDA_COMPILER", cuda_compiler
                 ),
             ):
-                execution = record_execution_manifest(
-                    root / "execution.json",
-                    model_key="27",
-                    vllm_cpp_sha="d" * 40,
-                    build_dir=build,
-                    client=client,
-                    snapshot=snapshot,
-                    configure_log=configure_log,
-                    build_command=build_command,
-                    build_log=build_log,
-                    oracle_manifest=oracle_manifest,
-                    port=8001,
-                    num_blocks=4736,
-                    max_num_seqs=MAX_NUM_SEQS,
-                    max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS["27"],
-                    profile_control=True,
+                def record(path: pathlib.Path) -> dict:
+                    return record_execution_manifest(
+                        path,
+                        model_key="27",
+                        vllm_cpp_sha="d" * 40,
+                        build_dir=build,
+                        client=client,
+                        snapshot=snapshot,
+                        configure_log=configure_log,
+                        build_command=build_command,
+                        build_log=build_log,
+                        oracle_manifest=oracle_manifest,
+                        port=8001,
+                        num_blocks=4736,
+                        max_num_seqs=MAX_NUM_SEQS,
+                        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS["27"],
+                        profile_control=True,
+                    )
+
+                exact_cache = cmake_cache.read_text(encoding="utf-8")
+                cmake_cache.write_text(
+                    exact_cache.replace(
+                        "VLLM_CPP_TRITON:BOOL=ON", "VLLM_CPP_TRITON:BOOL=OFF"
+                    ),
+                    encoding="utf-8",
                 )
+                with self.assertRaisesRegex(HarnessError, "VLLM_CPP_TRITON"):
+                    record(root / "wrong-triton-execution.json")
+                cmake_cache.write_text(
+                    exact_cache.replace(
+                        "CMAKE_BUILD_TYPE:STRING=RelWithDebInfo",
+                        "CMAKE_BUILD_TYPE:STRING=Release",
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(HarnessError, "CMAKE_BUILD_TYPE"):
+                    record(root / "wrong-build-type-execution.json")
+                cmake_cache.write_text(exact_cache, encoding="utf-8")
+                execution = record(root / "execution.json")
             self.assertEqual(execution["model_key"], "27")
             self.assertEqual(execution["vllm_oracle_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(execution["bench_dependencies"], {

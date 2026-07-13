@@ -5925,3 +5925,56 @@ remains binding at **55/124**. Next: commit/push, rebuild the clean SHA, then ru
 the specified c2/c16 AB/BA/AB same-binary component under one lock. Only an
 every-axis accepted component permits the exact v0.25 27B grid; 35B performance
 remains held.
+
+## 2026-07-13 — W3-E immutable component completes: mean-positive, strict gate FAILED
+
+Resumed the clean detached `53ab1492983282a9858cc301d4f7e9aad4784c48`
+DGX build after the host recovery. CUDA 13.0.88/sm_121a/CUTLASS 4.5 completed
+the server, 27B model gate and focused NVFP4 test targets. Server/model/focused
+binary SHA-256 are `9e59b93d...f05d` / `0c5e6907...64e3` /
+`5d361b71...e36d`; source and worktree were clean and detached at the pushed
+commit before GPU execution.
+
+Under one uninterrupted `/tmp/gpu` lock, the W3-E direct arm and exact
+`VT_FP4_DIRECT_SF=0` fallback completed AB/BA/AB at c2 and c16 on the frozen
+input-1,024/output-128 corpus. Both pre-series model gates pass 235/235; all 12
+timed legs complete **612/612 requests with zero failures**, all 12 cache/memory
+returns pass, all processes prewarm 64/64 profiles, and no post-readiness lazy
+plan-cache miss occurs. Evidence is
+`~/work/vllm.cpp-direct-sf/53ab1492983282a9858cc301d4f7e9aad4784c48/component-ab-c2-c16`.
+
+The result is mean-positive but strict-negative:
+
+- c2 direct/fallback total throughput is
+  **150.116922/149.801191 = 1.002107665x**; **16/20 timing + 4/4 memory**
+  pass. Failed normalized axes are median TPOT 0.998753, p90 TPOT 0.998498,
+  p90 TTFT 0.975935 and p99 TTFT 0.993449.
+- c16 direct/fallback total throughput is
+  **796.834440/791.907102 = 1.006222116x**; **16/20 timing + 2/4 memory**
+  pass. Failed normalized axes are mean TTFT 0.995423, p90 TPOT 0.994162,
+  p99 E2EL 0.997763, p99 TTFT 0.966681, PSS 0.999435 and RSS 0.999435.
+- Combined component acceptance is therefore **FAILED at 32/40 timing + 6/8
+  memory**. Direct total-throughput CV is 0.315% at c2 and 0.111% at c16;
+  fallback is 0.041%/0.263%.
+
+Five of six paired 128-token generated-text hashes differ (only c2 r2 is
+equal), while both fixed 16-token oracle gates remain exact. This is recorded,
+not waived. Tactic selection is also highly unstable: c2 paired processes
+match only 27/23/33 of 64 tactic IDs and c16 only 22/18/29; just 9--17 c16 keys
+per arm retain one tactic across all three repetitions. That is a confounder,
+not a proven cause of the long-output differences.
+
+The original temporary driver SHA `7d81edb2...0640` executed the committed
+online-gate contract correctly (c2=6, c16=96) but its local summarizer
+incorrectly asserted 96 at c2 and failed closed only after preserving all raw
+evidence. Corrected summary-only driver `828ec34e...a63d` performs no inference
+and produces summary/selection SHA
+`cfff57117dc262f270c5c1053539ef9bf8f90758d445bbe45604a95ff61850e9` /
+`ceaa5296f5d368bc0de1f736aaf1291ca50ff25b10e77891efb7fa281d7f47b4`.
+GPU and lock exit idle.
+
+**Disposition:** W3-E remains implemented/`GATING` with no accepted speed
+credit. Its conditional exact vLLM grid did not run, immutable `3f256ab`
+remains binding at 55/124, and no 35B performance command ran. Next execute the
+AGENTS dynamic hot-path re-scan and spike only the next verified, unstacked
+lever; do not stack another change into W3-E's failed component.

@@ -386,7 +386,11 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    true-W4A4 model dispatch defaults direct. `VT_FP4_DIRECT_SF=0` preserves the
    linear producer plus this standalone swizzle. CPU/CUDA bytes, focused
    sanitizer, 27B direct/fallback and 35B inertness gates pass; paired tracing
-   removes 624 activation swizzles. Its c2/c16 performance gate is pending.
+   removes 624 activation swizzles. Immutable `53ab149` completes all 12
+   c2/c16 component legs: direct gains 1.002108x/1.006222x mean total
+   throughput, but strict acceptance fails at 32/40 timing + 6/8 memory. No
+   conditional exact grid or 35B performance run followed; the performance row
+   remains `ACTIVE` without speed credit.
 
 10. **Vendored Marlin (NVFP4 W4A16 grouped-MoE GEMM — the 35B experts)**:
     `src/vt/cuda/marlin/` is a torch-free 1:1 vendor of vLLM's

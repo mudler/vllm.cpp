@@ -74,8 +74,11 @@ OpenAI-compatible server.
 > zero-error memchecks, both 27B model arms (**235/235 + 16/16**) and the 35B
 > correctness-only gate (**315/315**) pass. Paired real-model tracing removes
 > **624** activation swizzles (**832→208**; the remaining 208 are one-time
-> weight-layout work) without changing producer/GEMM topology. The required
-> c2/c16 same-binary A/B is still `PENDING`, so no speed credit is claimed.
+> weight-layout work) without changing producer/GEMM topology. Immutable
+> `53ab149` completes the required c2/c16 same-binary A/B: direct gains
+> **1.002108× / 1.006222×** mean total throughput, but only **32/40 timing +
+> 6/8 memory** axes pass. The component therefore fails and no speed credit is
+> claimed; no conditional exact grid or 35B performance run follows.
 > Every 27B speed, latency and memory axis must
 > pass before 35B runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.
@@ -216,7 +219,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Immutable `3f256ab` packed/split correctness is 16/16; its c16 component is **1.005049×** but strict-fails at **14/20 timing + 2/4 memory**. The post-pack trace confirms **208.192 vs 208 FP4 GEMMs/forward**. Generated-code inspection refutes a further norm+FP4 fusion gap. W3-E direct swizzled activation scales is implemented/correctness-green: default/fallback 27B pass 235/235 + 16/16, 35B remains inert at 315/315, and the paired trace removes 624 hot activation swizzles. Its c2/c16 A/B is pending, so support/performance status does not advance. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Immutable `3f256ab` packed/split correctness is 16/16; its c16 component is **1.005049×** but strict-fails at **14/20 timing + 2/4 memory**. The post-pack trace confirms **208.192 vs 208 FP4 GEMMs/forward**. Generated-code inspection refutes a further norm+FP4 fusion gap. W3-E direct swizzled activation scales is implemented/correctness-green: default/fallback 27B pass 235/235 + 16/16, 35B remains inert at 315/315, and the paired trace removes 624 hot activation swizzles. Its completed c2/c16 component gains **1.002108× / 1.006222×** mean total throughput but strict-fails **32/40 timing + 6/8 memory**, so support/performance status does not advance. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -226,7 +229,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved. Immutable `3f256ab` completed the exact 27B c1-c32 grid and lifecycle proofs; all **124/124** axes bind, **55 pass / 69 fail**. Its c16 packed/split component is **1.005049×**, with **14/20 timing + 2/4 memory**, and its post-pack trace confirms **208.192 vs vLLM 208 FP4 GEMMs/forward**. The apparent norm+FP4 trace gap is refuted. W3-E direct activation-scale emission now passes CPU/CUDA byte parity, sanitizer and both model gates; tracing reduces standalone swizzles 832→208 by removing 624 activation-scale launches. Its unprofiled c2/c16 every-axis A/B is pending, so the binding parity result is unchanged. No 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. W1/W2/W3 component correctness/safety evidence remains valid, and corrected tracing closed the old FP4 tactic-family mismatch. The canonical v0.25.0/FlashInfer 0.6.13 oracle is validated/active with rollback preserved. Immutable `3f256ab` completed the exact 27B c1-c32 grid and lifecycle proofs; all **124/124** axes bind, **55 pass / 69 fail**. Its c16 packed/split component is **1.005049×**, with **14/20 timing + 2/4 memory**, and its post-pack trace confirms **208.192 vs vLLM 208 FP4 GEMMs/forward**. The apparent norm+FP4 trace gap is refuted. W3-E direct activation-scale emission passes CPU/CUDA byte parity, sanitizer and both model gates; tracing reduces standalone swizzles 832→208 by removing 624 activation-scale launches. Its completed c2/c16 component is mean-positive at **1.002108× / 1.006222×** but strict-fails **32/40 timing + 6/8 memory**, so the binding parity result is unchanged and the conditional exact grid did not run. No 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -263,7 +266,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged gate/up CT semantics, fused SiLU→NVFP4 quantization, pre-serve bucket tuning and W3-D packed QKV. W3-E adds explicit linear/direct scale layouts to normal and fused producers; CUDA true-W4A4 defaults to direct padded CUTLASS layout, while `VT_FP4_DIRECT_SF=0` restores linear+swizzle. Direct packed bytes/scales/GEMM output match the composed path; focused memcheck is zero-error/leak-free in no-pool teardown mode; real 27B direct/fallback pass 235/235 + 16/16 and 35B is inert at 315/315. Paired tracing removes 624 activation swizzles (832→208 one-time weight swizzles). The binding v0.25.0 `3f256ab` grid still fails **69/124** axes and W3-E's c2/c16 A/B is pending, so no speed or support expansion is claimed. |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged gate/up CT semantics, fused SiLU→NVFP4 quantization, pre-serve bucket tuning and W3-D packed QKV. W3-E adds explicit linear/direct scale layouts to normal and fused producers; CUDA true-W4A4 defaults to direct padded CUTLASS layout, while `VT_FP4_DIRECT_SF=0` restores linear+swizzle. Direct packed bytes/scales/GEMM output match the composed path; focused memcheck is zero-error/leak-free in no-pool teardown mode; real 27B direct/fallback pass 235/235 + 16/16 and 35B is inert at 315/315. Paired tracing removes 624 activation swizzles (832→208 one-time weight swizzles). The binding v0.25.0 `3f256ab` grid still fails **69/124** axes; W3-E's completed component gains **1.002108× / 1.006222×** c2/c16 mean total throughput but strict-fails **32/40 timing + 6/8 memory**, so no speed or support expansion is claimed. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -316,8 +319,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   swizzled address inside quant. W3-E now implements that direct address for
   normal/two-input/one-input producers and preserves the composed fallback.
   Byte parity, sanitizer, both 27B arms and the 35B inertness gate pass; a paired
-  trace removes 624 activation swizzles. Its c2/c16 A/B is still pending, so it
-  is not measured support or speed.
+  trace removes 624 activation swizzles. Immutable `53ab149` then completes all
+  12 c2/c16 AB/BA/AB legs, 612 requests and 12 memory returns. Direct improves
+  mean total throughput by **0.211% at c2** and **0.622% at c16**, but strict
+  acceptance **fails at 32/40 timing + 6/8 memory axes**. Five of six paired
+  128-token text hashes differ amid highly unstable per-process tactic choices;
+  both model gates retain 235/235 assertions and the fixed 16/16 oracle stream.
+  W3-E stays `GATING`, receives no accepted speed credit, and does not trigger
+  an exact-grid or 35B performance run.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.
@@ -396,8 +405,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   norm+FP4 fusion is refuted by the generated body and separate custom-op call.
   The remaining trace then selects W3-E direct scale emission from the local-only
   standalone swizzle family. Implementation/correctness/sanitizer/trace now
-  pass, with 624 activation swizzles removed; the unprofiled c2/c16 A/B remains
-  pending. vLLM logged an unavailable optional
+  pass, with 624 activation swizzles removed. The completed c2/c16 component is
+  mean-positive but strict-fails at 32/40 timing + 6/8 memory; its conditional
+  exact grid did not run. vLLM logged an unavailable optional
   `triton_kernels.matmul_ogs` import for GPT-OSS/MXFP4; the executed dense-27B
   dispatch used FlashInfer NVFP4, FLA/Triton GDN and FA2, so the warning is
   recorded as non-path evidence rather than an environment mutation.

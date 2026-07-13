@@ -1,6 +1,7 @@
 # NVFP4 direct swizzled activation-scale emission (W3-E)
 
-Status: **IMPLEMENTED / GATING; component benchmark PENDING**
+Status: **IMPLEMENTED / GATING; component strict gate FAILED (32/40 timing,
+6/8 memory)**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -8,8 +9,10 @@ Claim: `CLAIM-NVFP4-SMALL-M-3`
 
 This spike selects one bounded, executed difference after the immutable
 `3f256ab` vLLM 0.25.0 27B grid failed strict parity at 55/124 axes. It does not
-claim a speedup, parity closure, 35B performance, or any broader quantization
-support. W3-E changes only how the CUDA CUTLASS W4A4 path materializes dynamic
+claim parity closure, 35B performance, or any broader quantization support.
+The completed component shows small mean-throughput gains but fails the
+every-axis gate, so it supplies no accepted speed credit. W3-E changes only how
+the CUDA CUTLASS W4A4 path materializes dynamic
 activation block scales: write the tensor-core swizzled layout directly in the
 quant producer and retain the current linear-scale producer as the explicit
 fallback.
@@ -153,12 +156,32 @@ native output counts, memory return and the standard 20 timing + 4 memory
 component axes. Acceptance requires reproducible non-regression on every axis;
 mean-only or trace-only improvement is insufficient.
 
+**Result at immutable pushed `53ab1492983282a9858cc301d4f7e9aad4784c48`:**
+the one-lock AB/BA/AB series completed all 12 legs, 612/612 requests, 12/12
+memory returns and both 235/235 model gates with zero lazy plan-cache misses.
+At c2, direct/fallback mean total throughput is
+**150.116922/149.801191 = 1.002107665x**, with **16/20 timing + 4/4 memory**
+axes. At c16 it is **796.834440/791.907102 = 1.006222116x**, with **16/20
+timing + 2/4 memory** axes. The combined disposition is therefore **32/40
+timing + 6/8 memory: FAILED**. c2 misses median TPOT, p90 TPOT, p90 TTFT and
+p99 TTFT at 0.998753/0.998498/0.975935/0.993449x. c16 misses mean TTFT, p90
+TPOT, p99 E2EL and p99 TTFT at
+0.995423/0.994162/0.997763/0.966681x; PSS/RSS also miss at
+0.999435/0.999435x. Five of six paired 128-token generated-text hashes differ,
+while the fixed oracle gates remain exact. Only 18--33 of 64 paired tactic IDs
+match and only 9--17 keys per arm retain one ID across all three c16 runs, so
+plan selection is recorded as a confounder rather than assigned as the cause.
+Summary/selection SHA-256 are `cfff5711...50e9` / `ceaa5296...47b4`.
+
 ### G5 — oracle grid
 
 If G1-G4 pass, run the full immutable vLLM v0.25.0 27B c1/2/4/8/16/32
 three-repetition grid and paired trace. The project gate remains every one of
 124 axes at or above/below the oracle as appropriate. W3-E cannot close the row
 by itself while any axis fails. Do not run the 35B performance grid first.
+
+G4 failed, so **G5 was not run**. Immutable `3f256ab` remains the binding
+vLLM result at 55/124; no 35B performance command was authorized.
 
 ## Exact reproduction checkpoint
 
@@ -169,9 +192,17 @@ ssh dgx.casa 'DB=~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a21962
 ```
 
 Expected baseline rows are `eager|23524|506.032544|21.511` and
-`graph|296575|732.84851|2.471`. The next benchmark command is **PENDING** until
-the same-binary toggle is implemented; use the existing online component
-driver contract rather than inventing a new workload.
+`graph|296575|732.84851|2.471`. The completed component evidence is
+`~/work/vllm.cpp-direct-sf/53ab1492983282a9858cc301d4f7e9aad4784c48/component-ab-c2-c16`.
+The original retained driver SHA is `7d81edb2...0640`; it executed the correct
+committed online-gate request counts but its temporary summarizer incorrectly
+asserted 96 requests at c2 and failed closed after all legs. The corrected
+summary-only driver SHA `828ec34e...a63d` uses the committed c2=6/c16=96
+contract and performs no GPU/model execution. Reproduce only the summary with:
+
+```sh
+SUMMARY_ONLY=1 ~/work/vllm.cpp-direct-sf/53ab1492983282a9858cc301d4f7e9aad4784c48/summary-driver-corrected.sh
+```
 
 ## Work breakdown
 
@@ -180,8 +211,8 @@ driver contract rather than inventing a new workload.
 | W3-E0 | whole-chain source/body audit, upstream tests, dispatch, files and gates | **complete in this spike** |
 | W3-E1 | explicit layout API + CPU/direct CUDA normal quant + ported padded/layout tests | **complete** |
 | W3-E2 | fused producer layouts + true-W4A4 model dispatch + fallback + model tests | **complete** |
-| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | correctness/sanitizer/trace complete; A/B pending |
-| W3-E4 | exact v0.25 27B grid/trace and lifecycle classification | only if E3 accepts |
+| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | **complete; strict A/B failed at 32/40 timing + 6/8 memory** |
+| W3-E4 | exact v0.25 27B grid/trace and lifecycle classification | **not run because E3 failed** |
 
 Any negative or neutral result is recorded honestly. A failed W3-E component
 does not permit stacking another unmeasured lever into the same A/B.

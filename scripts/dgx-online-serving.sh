@@ -560,7 +560,16 @@ run_paired_traces() {
       --num-prompts 16 \
       --num-warmups 0 \
       --artifact-tag "trace${trace_rep}-probe"
-    grep -q '^\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}" || {
+    local capture_closed=0
+    for _ in $(seq 1 60); do
+      if grep -q '^\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}"; then
+        capture_closed=1
+        break
+      fi
+      kill -0 "${server_pid}" 2>/dev/null || break
+      sleep 1
+    done
+    ((capture_closed == 1)) || {
       echo "profiled server did not close the exact four-replay window" >&2
       return 1
     }

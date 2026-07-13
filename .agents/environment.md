@@ -82,10 +82,10 @@ inner 4096, state 128; context 262144.
 
 - Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
   27B cache-off grid at **55/124 axes pass, 69 fail**; W3-E/W3-F/W3-G
-  strict-fail and earn no speed credit. W3-H schema-v5 `b8c8086` passes exact
-  build/correctness/client/shutdown and report-1 reconciliation, then fails
-  closed because the secondary summary omitted the model key; the root is
-  VOID. Its argument-flow repair is CPU-green. Execute a fresh immutable
+  strict-fail and earn no speed credit. W3-H schema-v5 `a7f67c7` passes exact
+  build/correctness and one complete four-report group, then session 2 races
+  the asynchronously forwarded exact stop marker before export; the root is
+  VOID. Its bounded liveness-aware wait is CPU-green. Execute a fresh immutable
   12-report DGX run and close all 69 failed axes before 35B performance.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1

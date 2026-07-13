@@ -1,9 +1,9 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — schema-v5 `b8c8086` is FAILED / VOID on a repaired model-key
-omission in the secondary summary path; report 1 reconciles exactly, the repair
-is CPU-green, fresh immutable 12-report DGX evidence is next, and W3-H2 remains
-prohibited**
+Status: **ACTIVE — schema-v5 `a7f67c7` is FAILED / VOID on a repaired
+stop-marker log-forwarding race after one complete four-report group; the
+bounded liveness-aware wait is CPU-green, fresh immutable 12-report DGX
+evidence is next, and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -26,15 +26,15 @@ target/profiler exit, and four isolated graph-replay ranges. Superseded attempt
 roots, hashes, and forensics live only in `.agents/state.md` and
 `.agents/parity-ledger.md`.
 
-Clean pushed `b8c8086eea9a4f392774cb97a130a06a75ec920c` passes exact
-**154/154** build, 27B **1/1** correctness, frozen **64/64** plans with zero
-tuning/misses, ordinary **48/48** and probe **16/16** clients, FIFO lifecycle,
-and target/Nsight zero exit. Report 1 reconciles **1,118 collected / 1,130
-produced** events to the exact **1,107 kernels + 7 memcpys + 1 memset** graph
-with zero eager work. The run then fails closed because the immediately
-following kernel-summary command did not receive the model key, before the
-remaining reports, sessions 2/3, or vLLM. The immutable root is
-`~/work/vllm.cpp-executed-path-refresh-h1d/b8c8086eea9a4f392774cb97a130a06a75ec920c`;
+Clean pushed `a7f67c75fa76f89e5da993f77c5d118bcb3bd55b` passes exact
+**154/154** build, 27B **1/1** correctness, frozen plans with zero
+tuning/misses, and session 1's ordinary **48/48** plus probe **16/16** clients.
+All four session-1 reports export, validate, and summarize under schema v5.
+Session 2 completes ordinary **48/48** and probe **16/16**, and emits four raw
+reports plus the exact `stopped captured_replays=4` marker. The one-shot driver
+check runs before Nsight forwards that marker to its log, so the run stops
+before session-2 export, session 3, or vLLM. The immutable root is
+`~/work/vllm.cpp-executed-path-refresh-h1d/a7f67c75fa76f89e5da993f77c5d118bcb3bd55b`;
 it is **VOID**, changes no ratio, and is never reused.
 
 Schema v5 remains version-bound and fail-closed. The committed
@@ -43,8 +43,8 @@ that pinned Nsight 2025.3.2.474 can emit the exact capture-boundary diagnostic
 despite complete bounded activity, while a full-process trace is clean. The
 validator accepts it only with exact runtime, synchronization, completion,
 event-counter, graph-family/topology, zero-eager, and cross-report
-reconciliation. The repair now forwards the model key through the helper, CLI,
-driver, trace-status reconstruction, public summarizer, and fixtures; focused
+reconciliation. The repair polls the unchanged exact stop marker for at most
+60 seconds while requiring the server to remain live; focused
 client/summary/trace contracts pass **31/31**.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
@@ -503,7 +503,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v5 `b8c8086` passes report-1 exact reconciliation but is VOID on a repaired model-key omission in the secondary summary path. Focused contracts pass 31/31. Execute a fresh immutable 3-session × 4-report gate plus paired vLLM trace; W3-H2 remains prohibited** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v5 `a7f67c7` closes one complete four-report group but is VOID on a repaired stop-marker log-forwarding race in session 2. Focused contracts pass 31/31. Execute a fresh immutable 3-session × 4-report gate plus paired vLLM trace; W3-H2 remains prohibited** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

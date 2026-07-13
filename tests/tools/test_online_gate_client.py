@@ -957,6 +957,15 @@ class OnlineClientContractTests(unittest.TestCase):
             '        --model-key "${model}"',
             script,
         )
+        self.assertIn("local capture_closed=0", script)
+        self.assertIn("for _ in $(seq 1 60); do", script)
+        self.assertIn("((capture_closed == 1))", script)
+        self.assertIn('kill -0 "${server_pid}" 2>/dev/null || break', script)
+        probe_index = script.index('--artifact-tag "trace${trace_rep}-probe"')
+        wait_index = script.index("local capture_closed=0", probe_index)
+        shutdown_index = script.index("printf 'Q'", wait_index)
+        self.assertLess(probe_index, wait_index)
+        self.assertLess(wait_index, shutdown_index)
         self.assertIn("--trace-only", script)
 
     def test_nsys_range_validation_rejects_loss_replays_and_start_drift(self) -> None:

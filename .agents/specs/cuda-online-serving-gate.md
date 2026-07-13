@@ -15,21 +15,20 @@ and earn no speed credit. This result remains the only binding performance
 number, and no 35B performance command is authorized.
 
 The active W3-H trace-first refresh is diagnostic only. Clean schema-v5
-`b8c8086eea9a4f392774cb97a130a06a75ec920c` passes exact **154/154** build,
-27B **1/1** correctness, frozen **64/64** plans, ordinary **48/48** and probe
-**16/16** clients, FIFO lifecycle, and target/Nsight zero exit. Report 1
-reconciles **1,118 collected / 1,130 produced** events to the exact **1,107
-kernels + 7 memcpys + 1 memset** graph with zero eager work. The immediately
-following kernel-summary command omitted the model key and failed closed before
-the remaining reports, sessions 2/3, or vLLM, so the root is **FAILED / VOID**
+`a7f67c75fa76f89e5da993f77c5d118bcb3bd55b` passes exact **154/154** build,
+27B **1/1** correctness, frozen plans, and both session-1 clients. All four
+session-1 reports export, validate, and summarize. Session 2 completes ordinary
+**48/48** and probe **16/16**, then emits four raw reports and the exact stop
+marker. The immediate driver check races asynchronous Nsight log forwarding
+before session-2 export, session 3, or vLLM, so the root is **FAILED / VOID**
 and changes no ratio.
 
 Schema v5 still requires the pinned Nsight version and exact runtime,
 synchronization, completion, event-counter, graph-family/topology, zero-eager,
-and cross-report reconciliation. The repair forwards the model key through the
-helper, CLI, driver, trace-status reconstruction, public summarizer, and
-fixtures; focused contracts pass **31/31**. Fresh immutable 12-report DGX
-evidence is pending.
+and cross-report reconciliation. The repair polls the unchanged exact stop
+marker for at most 60 seconds while requiring the server to remain live;
+focused contracts pass **31/31**. Fresh immutable 12-report DGX evidence is
+pending.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -229,8 +228,8 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H schema-v5 `b8c8086` is void on a repaired
-   model-key omission in the secondary summary path. Execute a fresh 12-report
+   attribution is complete. W3-H schema-v5 `a7f67c7` is void on a repaired
+   stop-marker log-forwarding race in session 2. Execute a fresh 12-report
    `--trace-only` checkpoint plus the paired vLLM trace. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B

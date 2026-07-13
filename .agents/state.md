@@ -7370,3 +7370,46 @@ checkpoint; detailed run history remains here and in the parity ledger.
 Immutable `3f256ab` remains **55/124 pass, 69 fail**. A fresh pushed SHA and
 immutable 12-report root are required before W3-H2, the exact grid, or 35B
 performance.
+
+## 2026-07-13 — schema-v5 session two exposes asynchronous stop-marker race
+
+Clean pushed `a7f67c75fa76f89e5da993f77c5d118bcb3bd55b` executed from
+immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/a7f67c75fa76f89e5da993f77c5d118bcb3bd55b`.
+The plan-first manifest SHA is `c259dd9e…b972`. Exact GCC 13.3 / CUDA 13.0.88 /
+sm_121a / external-CUTLASS / FA2 / vendored-Triton-AOT / RelWithDebInfo
+configuration passed, the target build completed **154/154**, and the mandatory
+27B gate passed **1/1 in 21.20 s**. Configure/build/gate/server SHA are
+`71d45f65…e481`, `258159ff…1450`, `455b12e3…26fd` and
+`bda7e3eb…e0e1`.
+
+Session 1 loaded the exact frozen **64/64** plan map with zero tuning/misses,
+completed ordinary **48/48 in 66.334552 s** and probe **16/16 in 26.141326 s**,
+and passed FIFO lifecycle, removal and target/Nsight zero exit. All four reports
+exported, validated and summarized. Report SHA are `4ed1974e…3255`,
+`fc5c66a5…8ede`, `3c474e7f…5d97` and `a2ac0a6d…9334`; SQLite SHA are
+`1d70704f…0a7a`, `3205925a…0e4`, `e3c786e9…6137` and `d89ce63f…e54d`.
+Every report is lossless with exactly **1,107 graph kernels** and zero eager
+work. Range 1 reconciles **1,118 collected / 1,129 produced** events; ranges
+2–4 reconcile **1,117 / 1,125**. Validation SHA are `fc1778b8…d925`,
+`eb19ff8d…dad2`, `cfb73629…2b2c` and `a1430499…2715`; profile-control SHA is
+`7e6acfe3…0796`.
+
+Session 2 completed ordinary **48/48 in 66.027100 s** and probe **16/16 in
+26.111752 s**. It emitted four raw reports with SHA `44f985e6…e7e1`,
+`a7ca3334…37e8`, `74c74b69…35a1` and `4465ff18…84a`. The exact
+`[VT_CUDA_PROFILE] stopped captured_replays=4` marker is present in final
+profile log SHA `46eceef7…d53b`, but the driver checked the asynchronously
+forwarded log immediately after the probe returned and failed before
+session-2 export, session 3, or vLLM. The root is **FAILED / VOID**, never
+reused, and changes no ratio. GPU, lock and port returned idle.
+
+The repair retains the exact marker and fail-closed behavior but waits for it
+for at most 60 seconds, aborting early if the profiled server dies. Python and
+shell syntax pass; focused client/summary/trace contracts pass **31/31**, full
+CUDA-off CTest passes **106/106**, agent-record/doc contracts pass **18/18**,
+and `git diff --check` is clean. Live surfaces are compacted to this current
+checkpoint; detailed attempt evidence remains here and in the parity ledger.
+Immutable `3f256ab` remains **55/124 pass, 69 fail**. A fresh pushed SHA and
+immutable 12-report root are required before W3-H2, the exact grid, or 35B
+performance.

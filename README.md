@@ -9,10 +9,10 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The latest W3-H DGX trace (`b8c8086`) is **VOID**: its first model report
-> passes schema-v5 exact reconciliation, but the secondary kernel-summary path
-> omitted the model contract and failed closed before sessions 2/3 or vLLM.
-> That integration bug is repaired and CPU-green; a fresh immutable 12-report
+> The latest W3-H DGX trace (`a7f67c7`) is **VOID**: all four session-1
+> reports pass schema-v5 export, validation, and summary, but session 2 races
+> the asynchronously forwarded exact stop marker before export. A bounded,
+> liveness-aware wait is repaired and CPU-green; a fresh immutable 12-report
 > DGX gate is pending. No W3-H speed credit or 35B performance result is
 > claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
@@ -25,7 +25,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the repaired W3-H trace, gate the selected repair, then rerun all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | `b8c8086` passes build, 27B correctness, plans, clients, shutdown, and report-1 schema-v5 reconciliation, then fails in the secondary summary because its model key was not forwarded. The repair and regression contracts are CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
+| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | `a7f67c7` passes build, 27B correctness, and all four session-1 report exports/validations/summaries. Session 2 emits its four reports and exact stop marker, but the immediate driver check races log forwarding. The bounded-wait repair is CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -124,7 +124,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the schema-v5 summary integration repair is CPU-green and a fresh DGX trace is pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the schema-v5 stop-marker wait repair is CPU-green and a fresh DGX trace is pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -151,7 +151,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; `b8c8086` is void on a repaired trace-summary integration bug and no speed credit is claimed |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; `a7f67c7` is void on a repaired trace stop-marker race and no speed credit is claimed |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |

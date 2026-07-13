@@ -7157,3 +7157,50 @@ syntax, ShellCheck and the CUDA-off server build pass. This checkpoint contains
 no GPU trace or performance run: fresh immutable three-capture DGX evidence is
 next. Immutable `3f256ab` remains **55/124 pass, 69 fail**; W3-H2, the exact
 grid and 35B performance remain prohibited until H1d passes.
+
+## 2026-07-13 — tenth H1d attempt proves isolated ranges but exposes four-report/loss contract
+
+Clean pushed `b2c940cef40ac3d0852352d81ac5ca4448a213e5` used immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/b2c940cef40ac3d0852352d81ac5ca4448a213e5`.
+Plan-first setup, frozen corpus and exact `RelWithDebInfo`
+Triton-AOT/FA2/external-CUTLASS/sm_121a configuration passed. The recorded
+build completed **154/154** and the 27B gate passed **1/1 in 17.30 s**.
+Plan/configure/build/execution/gate/server SHA-256 are `09cff092…d58c` /
+`dffb0c24…49ae` / `d072b0cd…562b` / `60c666f3…4b02` /
+`9f30aeef…46b1` / `f687f2a1…f489`.
+
+Capture 1 loaded the exact read-only 64-plan map, completed the ordinary
+**48/48** c16 workload in 67.123513 s and the **16/16** diagnostic probe in
+26.511322 s, then logged `prior_replays=483` and `captured_replays=4`. The
+per-capture FIFO recorded ready/requested/completed, was removed, and both the
+target and Nsight exited zero. Profile/command/control/client/probe SHA are
+`4ab7a090…bd02` / `95ece4c1…d9fb` / `0a96f212…d97e` /
+`0daf8e0e…0909` / `083f08e9…b6d7`.
+
+Nsight's actual `repeat:4` behavior is one indexed report per range. It wrote
+`ours-r1.1` through `.4.nsys-rep` at **345,857 / 335,910 / 335,538 / 335,785
+bytes**; schema v3 instead required the absent unsuffixed `ours-r1.nsys-rep`,
+so the driver failed closed before captures 2/3 or vLLM. Report SHA-256 are
+`a8ab3557…ef04` / `0903c17e…20c2` / `fdf107aa…8a0c` /
+`7eda1475…95f1`.
+
+Read-only diagnostic exports prove the range boundary itself works. Every
+report has exactly one `cudaGraphLaunch`, **1,107 graph kernels, 7 graph
+memcpys, 1 graph memset and zero eager CUDA rows**. The four reports share
+profiling-session UUID `1caab979-7988-47b3-96c1-df45b50042de`. Report 1
+contains the one visible `cuProfilerStart`; reports 2--4 contain none because
+their starts occur before those reports begin. All four still emit severity-2
+`Not all CUDA events might have been collected.` Report 1 records 1,118
+collected / 1,130 produced events; reports 2--4 record 1,117 / 1,125.
+Diagnostic SQLite SHA are `6817d9a5…936c` / `4938ba18…d62c` /
+`fdcf2afe…60f5` / `23087df2…7256`.
+
+The root is **FAILED / VOID**, never reused, and no client rate or partial
+trace is accepted. GPU, `/tmp/gpu` and port 8001 returned idle. H1d is re-scoped
+without weakening any gate: schema v4 must bind three independent sessions x
+four reports (**12** reports/SQLite/validations/summaries), require one complete
+zero-eager/lossless launch per report, one shared UUID within each group of
+four and three distinct session UUIDs. The next implementation also uses
+`repeat:4:sync` and performs diagnostic-only device synchronization before
+every profiler stop. Immutable `3f256ab` remains **55/124 pass, 69 fail**;
+W3-H2, exact-grid and 35B performance remain prohibited.

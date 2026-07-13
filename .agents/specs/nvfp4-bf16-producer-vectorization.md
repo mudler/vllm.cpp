@@ -1,11 +1,11 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID;
-the latest proves FIFO shutdown/zero exit and contains every intended graph
-child, but one continuous four-replay range also captures three eager sampler
-gaps and Nsight emits severity-2 possible event loss; four isolated repeat
-ranges are implemented and CPU-gated, fresh DGX evidence is pending and W3-H2
-remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID;
+the latest proves four isolated reports each contain exactly one complete
+1,107-kernel graph replay and zero eager CUDA work, but every report emits
+severity-2 possible event loss and the schema-v3 harness incorrectly expects
+one combined report; the 3-session x 4-report contract and synchronous flush
+repair are accepted but not implemented, and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -149,6 +149,40 @@ four unique successful `cuProfilerStart` runtime rows in launch order. The
 ported client/summary/trace contracts pass **31/31**; Python and shell syntax,
 ShellCheck and the CUDA-off server build pass. This is local structural
 evidence only: a new pushed SHA/root and all three DGX captures remain pending.
+
+Clean pushed `b2c940cef40ac3d0852352d81ac5ca4448a213e5` exercised that
+repair from immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/b2c940cef40ac3d0852352d81ac5ca4448a213e5`.
+The exact **154/154** build and 27B gate **1/1 in 17.30 s** passed. Capture 1
+completed the ordinary **48/48** workload in 67.123513 s and the **16/16**
+probe in 26.511322 s, then recorded `prior_replays=483` and
+`captured_replays=4`. The frozen plan, FIFO lifecycle/removal and target/Nsight
+zero exits all passed.
+
+Nsight's actual `repeat:4` contract is four reports from one profiling session,
+not the single `ours-r1.nsys-rep` assumed by schema v3. It wrote
+`ours-r1.{1,2,3,4}.nsys-rep` at **345,857 / 335,910 / 335,538 / 335,785
+bytes**. The fail-closed driver rejected the absent unsuffixed report before
+export, captures 2/3 or vLLM. Read-only exports retained as diagnostics show
+that every report has exactly **one** `cudaGraphLaunch`, **1,107 graph kernels,
+7 graph memcpys, 1 graph memset and zero eager CUDA rows**. All four share
+profiling-session UUID `1caab979-7988-47b3-96c1-df45b50042de`; only report 1
+contains the `cuProfilerStart` runtime row because subsequent range starts sit
+outside their own report. Every report still contains severity-2 `Not all CUDA
+events might have been collected.` Report 1 records 1,118 collected / 1,130
+produced CUDA/CUPTI events; reports 2--4 record 1,117 / 1,125. The root is
+**FAILED / VOID**, never reused, and changes no accepted speed result.
+
+H1d is therefore re-scoped around the profiler's real artifact boundary:
+three independent Nsight sessions, four indexed range reports per session,
+**12 reports/SQLite/validation/summary artifacts total**. Each range report
+must independently contain one launch, the complete per-launch node/resource
+multiset, zero eager CUDA rows and no severity>=2 diagnostic. Four reports in
+one session must share one profiler UUID; the three session UUIDs must be
+distinct. The next repair advances the status schema to v4, uses the supported
+`repeat:4:sync` generation mode so result generation blocks between ranges,
+and performs a diagnostic-only device synchronization before every profiler
+stop. No severity is whitelisted and no partial range can bind.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -452,7 +486,8 @@ warmups and 48 measured requests with collection dormant, the driver verifies
 the owned server PID/process group, sends SIGUSR2 and runs a separate warmed
 c16 diagnostic probe. For each of the next four eligible `ReplayGraph` calls,
 the diagnostic controller calls `cudaProfilerStart()` immediately before the
-launch, launches one graph, synchronizes its stream, and calls
+launch, launches one graph, performs a diagnostic-only device synchronization,
+and calls
 `cudaProfilerStop()` immediately afterward. Thus sampling and input building
 between decode steps occur outside all four ranges. The synchronization and
 probe are structural diagnostics: no probe duration, latency or throughput may
@@ -469,32 +504,38 @@ nonzero profiler exit remains a failure; the contract is not relaxed. Default
 production builds contain neither the replay observer nor this FIFO waiter.
 
 The exact Nsight command is `--trace=cuda --capture-range=cudaProfilerApi
---capture-range-end=repeat:4 --flush-on-cudaprofilerstop=true
+--capture-range-end=repeat:4:sync --flush-on-cudaprofilerstop=true
 --cuda-flush-interval=0 --cuda-graph-trace=node:host-only
 --cuda-event-trace=false --sample=none --cpuctxsw=none --stats=false
 --kill=none`. Startup, model loading, graph construction, ordinary client
 warmups/measured work, the three inter-replay sampler/input gaps and shutdown
-remain outside collection. Four c16 single-replay ranges yield only 4,428
-primary kernel rows instead of H1c's hundreds of thousands.
+remain outside collection. Each c16 single-replay range produces its own
+indexed report with 1,107 primary kernel rows instead of H1c's hundreds of
+thousands. One Nsight session therefore yields four reports; the three required
+independent sessions yield 12.
 
-Export and validate every SQLite before starting the next capture and before
-the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
-rows, uneven dominant-graph replay count, missing indexed artifact or hash
-drift voids the attempt. H1d must also reconcile graph-node events against
-runtime graph launches and the exact 16-warmup/48-measured workload; require
-distinct capture IDs and path/command/report/SQLite linkage; canonicalize and
-hash the full primary-node name/geometry/resource multiset; require identical
-structure across all three captures; and recompute every retained kernel
-summary from the indexed raw artifact. The SQLite must contain exactly four
-successful `cudaGraphLaunch*` runtime rows. Every graph-child KERNEL, MEMCPY
-and MEMSET row must map to one of those rows by exact `correlationId`;
-timestamp/nearest-event fallback is forbidden. Each launch must own the same
-node multiset and every node must replay four times. The exact 27B c16 kernel
-contract is 1,107 nodes / 4,428 rows with 208 FP4 GEMM, 144 normal-producer,
-64 fused-producer, 48 recurrence and 16+16 FA2 nodes per launch; any family
-drift voids the attempt. The remaining 611 kernel nodes plus graph memcpy and
-memset nodes are bound by the full canonical name/geometry/resource multiset
-hash and must match across all captures. Do not require
+Export and validate every one of the 12 SQLite files before starting the vLLM
+arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node row,
+missing indexed artifact or hash drift voids the attempt. H1d must also
+reconcile graph-node events against the exact one runtime graph launch in each
+report and the exact 16-warmup/48-measured workload; require distinct capture
+IDs and path/command/report/SQLite linkage; canonicalize and hash the full
+primary-node name/geometry/resource multiset; require identical structure
+across all 12 ranges; and recompute every retained kernel summary from the
+indexed raw artifact. Every SQLite must contain exactly one successful
+`cudaGraphLaunch*` runtime row. Report 1 of each session contains exactly one
+successful `cuProfilerStart`; reports 2--4 contain none because their start
+calls occur before those reports begin. Every graph-child KERNEL, MEMCPY and
+MEMSET row must map to that launch by exact `correlationId`;
+timestamp/nearest-event fallback is forbidden. The exact per-range 27B c16
+contract is 1,107 kernel nodes / 1,107 rows with 208 FP4 GEMM, 144
+normal-producer, 64 fused-producer, 48 recurrence and 16+16 FA2 nodes; any
+family drift voids the attempt. Each report also carries the identical seven
+graph memcpy and one graph memset signatures. The remaining 611 kernel nodes
+plus graph memcpy/memset nodes are bound by the full canonical
+name/geometry/resource multiset hash and must match across all 12 reports.
+The four reports in one capture share one non-empty profiling-session UUID;
+the three capture UUIDs are pairwise distinct. Do not require
 `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`: Nsight node mode intentionally omits
 whole-graph activity. vLLM uses the
 mandated Torch profiler because nsys breaks its EngineCore on this host; its
@@ -631,7 +672,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `219f4f2` are VOID. The latest exact build/gate, clients, four graph launches and FIFO/zero-exit lifecycle pass, but one continuous range captures three eager sampler gaps and emits severity-2 possible loss. Four isolated `repeat:4` single-replay ranges and schema-v3 four-start validation are implemented/CPU-gated; fresh immutable three-capture execution is next** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID. The latest exact build/gate, clients and FIFO/zero-exit lifecycle pass; four generated reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all four emit severity-2 possible loss. Schema v3 also expects one combined report. The accepted repair is schema v4 over 3 sessions x 4 reports, `repeat:4:sync` and device synchronization; implementation and fresh immutable execution are next** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

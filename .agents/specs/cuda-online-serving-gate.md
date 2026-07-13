@@ -66,17 +66,18 @@ but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
 remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
 earns speed credit. The current W3-H trace-first refresh requires three
 lossless exact-plan captures before the W3-H2 kernel. H1a/H1b/H1c and clean
-H1d attempts through `219f4f2` are void. The latest completed the exact
-**154/154** build, passed the 27B gate **1/1 in 17.22 s**, completed 48/48 plus
-16/16 clients, closed four replays and proved FIFO graceful stop/removal with
-target and Nsight exit zero. Its SQLite still fails closed: one continuous
-range contains three eager sampler/input gaps (9 kernels, 9 memcpys, 3 memsets)
-and Nsight emits severity-2 possible event loss. The revised contract keeps
-those checks strict and isolates every synchronized graph replay with
-`--capture-range-end=repeat:4`. The diagnostic controller, schema-v3
-four-`cuProfilerStart` proof and focused CPU contracts are implemented; fresh
-immutable evidence is pending, and no exact rerun or 35B performance command
-is authorized.
+H1d attempts through `b2c940c` are void. `b2c940c` completed the exact
+**154/154** build, passed the 27B gate **1/1 in 17.30 s**, completed 48/48 plus
+16/16 clients and proved FIFO graceful stop/removal with target and Nsight exit
+zero. Nsight emitted four indexed reports rather than schema v3's one combined
+report, so the driver stopped before captures 2/3 or vLLM. Read-only exports
+show each report contains exactly one launch, 1,107 graph kernels, seven graph
+memcpys, one graph memset and zero eager CUDA rows. All four nevertheless emit
+severity-2 possible event loss. The revised contract keeps that rejection
+strict and binds three sessions x four reports under schema v4, with
+`repeat:4:sync` plus a device synchronization before every stop. That repair
+is pending implementation; no exact rerun or 35B performance command is
+authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
@@ -290,8 +291,9 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete; execute W3-H's fresh exact-target three-capture
-   `--trace-only` checkpoint after the repaired driver-owned target build. 35B
+   attribution is complete. W3-H's repeated-range attempt at `b2c940c` is void;
+   implement its schema-v4 three-session x four-report contract and synchronous
+   flush, then execute a fresh exact-target `--trace-only` checkpoint. 35B
    remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B

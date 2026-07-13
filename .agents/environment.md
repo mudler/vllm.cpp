@@ -87,13 +87,13 @@ inner 4096, state 128; context 262144.
   v0.25.0 evidence completes the exact 27B cache-off grid under one lock:
   **55/124 axes pass, 69 fail**. W3-E/W3-F/W3-G strict-fail their components.
   W3-H's exact-target H1d refresh is next: H1a/H1b/H1c and H1d attempts
-  through `219f4f2` are void. The latest exact 154-target build and 27B gate
-  pass, 48/48 + 16/16 clients complete, the FIFO is removed and target/Nsight
-  exit zero. Its continuous range still captures three eager sampler/input gaps
-  and emits severity-2 possible loss despite exact intended graph-child counts.
-  The revised driver/controller now implements four isolated `repeat:4` ranges
-  and schema-v3 four-start validation. Focused contracts pass 31/31; fresh DGX
-  evidence is pending. It still enforces
+  through `b2c940c` are void. The latest exact 154-target build and 27B gate
+  pass, 48/48 + 16/16 clients complete, the frozen plans/FIFO are exact and
+  target/Nsight exit zero. Four indexed reports each contain one complete
+  1,107-kernel replay and zero eager CUDA rows, but all emit severity-2 possible
+  loss and schema v3 expects one combined report. The accepted repair is schema
+  v4 over three sessions x four reports plus synchronous generation/device
+  flush; implementation and focused CPU gates are next. It still enforces
   plan-first evidence, exact
   Triton-AOT/FA2/CUTLASS/toolchain configuration, its own recorded target build
   and actual `nsys -> nsys-launcher -> target-session` ancestry plus a

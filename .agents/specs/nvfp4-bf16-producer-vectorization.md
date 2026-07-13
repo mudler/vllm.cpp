@@ -1,7 +1,7 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d collector and semantic-evidence
-hardening is pending and implementation remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d target-build, collector and
+semantic-evidence hardening is pending and implementation remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -23,10 +23,12 @@ graph had uneven node replay counts. Immutable H1c at `d1f8e33` then passed
 the 27B model gate in 19.20 seconds and completed 48/48 capture-1 requests, but
 Nsight emitted severity-2 `Not all CUDA events might have been collected`
 after reporting 818,537 collected CUDA events. The fail-closed driver stopped
-before captures 2/3 and vLLM. Its retained process log has zero plan
-lifecycle/selection records, so the exact frozen-map contract is not
-recoverable post-hoc. No runtime implementation or speed credit follows from
-any of the three void traces.
+before captures 2/3 and vLLM. A build-provenance audit found an independent
+fatal confound: the detached source lacked CUTLASS, CMake disabled
+`VT_CUTLASS_NVFP4`, and the trace executed 146,661 naive plus 10,944 WMMA FP4
+GEMMs instead of the target path. Its retained process log therefore has zero
+plan lifecycle/selection records. No runtime implementation or speed credit
+follows from any of the three void traces.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -107,18 +109,18 @@ the frozen FP4 GEMM set at about 54.676 versus 54.792 ms. These cross-profiler
 values cannot bind or authorize H2; they only leave W3-H as the leading
 eligible candidate because no verified larger residual displaced it.
 
-H1c replaces the single long local profile with three independent Nsight
-reports, one 48-request repetition each, while retaining one uninterrupted GPU
-lock for the series. Each capture uses node-level CUDA-graph tracing, a
-10,000-ms CUDA flush interval, no CPU context-switch sampling and an 11-second
-final idle drain. Before the next capture or vLLM arm, the harness exports and
-hashes SQLite, rejects every non-whitelisted severity>=2 diagnostic, requires
-graph-node rows and requires uniform replay counts across the dominant graph.
-All three reports, SQLite files, validation reports, commands, logs and kernel
-summaries are separately hashed. Every capture must contain exactly 1,107
-dominant-graph nodes, including 208 FP4 GEMMs, 144 normal producers, 64 fused
-producers, 48 GDN recurrence nodes and 16 FA2 main plus 16 combine nodes. H1c
-remains **PENDING** until that contract runs from a clean pushed immutable SHA.
+H1c attempted three independent Nsight reports, one 48-request repetition
+each, while retaining one uninterrupted GPU lock. Capture 1 failed closed on
+possible event loss, so r2/r3/vLLM did not run. Configure log SHA
+`7d510aa43faee799f07fb2e5797be697ec8508904c8571917d59233326cbed5d`
+also states `CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM
+disabled`; CMakeCache and compile-commands SHA are
+`6a34a146d33e07f1289009ddbfbf982d46f5f74e075280c8bf7bacf566ee80de`
+and `a834cfc65253f1129139306e6e486c17f3916973e1fcc1f364797efc7f51a855`.
+The kernel summary's 146,661 naive and 10,944 WMMA FP4 calls, with no CUTLASS
+device kernel, prove fallback runtime dispatch. The model gate proves only
+that fallback build's correctness. H1c is **VOID** for both event loss and
+invalid build provenance.
 
 ### Executed topology and clean diagnostic slice
 
@@ -314,6 +316,16 @@ flags are now a failed constraint rather than an H1d recipe. H1d must retain
 lossless node-level attribution while bounding the capture range and/or trace
 buffers enough to avoid loss, and must record the exact profiler version,
 flags, exit status and capture-range markers.
+
+Before the GPU lock or any model load, H1d must fail closed unless the detached
+build records the exact external CUTLASS source tree, sm_121a architecture,
+`VT_CUTLASS_NVFP4=1`, compilation of
+`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`, and target symbols in the server
+binary. The execution manifest hashes that dependency/build contract. Each
+accepted trace must then contain the target CUTLASS FP4 device-kernel family
+and zero naive/WMMA FP4 GEMMs for production shapes. A passing fallback model
+gate cannot substitute for this preflight or runtime-dispatch proof.
+
 Export and validate every SQLite before starting the next capture and before
 the vLLM arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node
 rows, uneven dominant-graph replay count, missing indexed artifact or hash
@@ -407,6 +419,11 @@ Fresh G0 uses a new immutable pushed SHA and evidence root:
 ```sh
 SHA=$(git rev-parse HEAD)
 ROOT="$HOME/work/vllm.cpp-executed-path-refresh/$SHA"
+cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 scripts/dgx-online-serving.sh --trace-only --model 27 \
   --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(readlink "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")" \
   --source-corpus "$ROOT/evidence/corpus/27" \
@@ -419,8 +436,8 @@ before the lock is acquired. No partial trace duration or throughput binds.
 
 ## Dependencies
 
-- vLLM v0.25.0 target `702f481`, validated oracle environment and FlashInfer
-  0.6.13/CUTLASS source used by the binding gate.
+- vLLM v0.25.0 target `702f481`, validated oracle environment and the exact
+  hashed FlashInfer 0.6.13 external CUTLASS source used by the binding gate.
 - CUDA 13.0.88, GCC 13.3, sm_121a/GB10, Nsight Systems, Nsight Compute and
   `cuobjdump`.
 - Qwen3.6-27B NVFP4 snapshot, exact online-gate token corpus, frozen 64-plan
@@ -435,7 +452,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d lossless collector + exact plan/workload/graph/vLLM validation pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d exact target-build/dispatch preflight, lossless collector + exact plan/workload/graph/vLLM validation pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

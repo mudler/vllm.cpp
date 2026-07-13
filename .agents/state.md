@@ -6729,3 +6729,36 @@ GPU and serving ports are idle. Next: harden lossless collection plus exact
 plan/workload/graph/capture/vLLM semantic validation, commit and push it as the
 H1d checkpoint, then execute three independent immutable captures before any
 residual ranking.
+
+## 2026-07-13 — H1c build provenance proves CUTLASS-disabled fallback; H1d preflight expanded
+
+A second independent audit invalidates immutable H1c before its trace contents
+can be interpreted. The detached `d1f8e33` source did not contain
+`third_party/cutlass/include/cutlass/cutlass.h`; its configured
+`VLLM_CPP_CUTLASS_DIR` pointed at that absent tree. Configure log SHA
+`7d510aa43faee799f07fb2e5797be697ec8508904c8571917d59233326cbed5d`
+explicitly records `CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM
+disabled`. CMakeCache SHA is
+`6a34a146d33e07f1289009ddbfbf982d46f5f74e075280c8bf7bacf566ee80de`;
+compile-commands SHA is
+`a834cfc65253f1129139306e6e486c17f3916973e1fcc1f364797efc7f51a855`.
+The target CUTLASS translation unit/definition was consequently absent from
+the linked execution path.
+
+The retained kernel summary independently proves runtime fallback: it contains
+**146,661 `MatmulNvfp4Fp4Naive`** and **10,944 `MatmulNvfp4Fp4Wmma`** calls,
+with no CUTLASS device-kernel family. The normal producer also records the
+fallback `(bool)0` specialization instead of the target direct-swizzled
+`(bool)1` route. This fully explains the missing 64-plan lifecycle/selection
+records. The 19.20-second, 235/235 + 16/16 model gate therefore demonstrates
+only fallback correctness, not parity-path correctness or performance.
+
+Disposition: H1c is doubly **FAILED / VOID** from possible CUDA-event loss and
+invalid build provenance. It yields no duration, ratio, residual ranking or
+speed credit. Immutable `3f256ab` still binds at **55/124 pass, 69 fail**; no
+exact grid, W3-H2 code or 35B performance follows. H1d now has a mandatory
+pre-GPU build contract: hash the exact external CUTLASS tree; require sm_121a,
+`VT_CUTLASS_NVFP4=1`, the CUTLASS translation unit and linked target symbol;
+then require target CUTLASS FP4 kernels and zero naive/WMMA production fallback
+in every accepted trace. Only after that preflight may lossless trace and exact
+plan/workload/graph/capture/vLLM semantic validation consume GPU time.

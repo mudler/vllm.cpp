@@ -41,6 +41,7 @@ from tools.bench.online_gate import (
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
+    TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
     TRACE_REQUIRED_ENV,
     VLLM_DECODE_FAMILY_CONTRACTS,
@@ -99,19 +100,27 @@ def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
 def write_nsys_sqlite(
     path: pathlib.Path,
     *,
+    capture_uuid: str | None = None,
     report_path: pathlib.Path | None = None,
     family_drift: bool = False,
     lost_events: bool = False,
     model_contract: bool = False,
     orphan_child: bool = False,
-    profiler_start_count: int = TRACE_CAPTURE_GRAPH_REPLAYS,
+    profiler_start_count: int | None = None,
+    range_index: int = 1,
     signature_drift: bool = False,
     uneven_replays: bool = False,
 ) -> None:
+    if not 1 <= range_index <= TRACE_CAPTURE_GRAPH_REPLAYS:
+        raise ValueError("synthetic Nsight range index is invalid")
+    if profiler_start_count is None:
+        profiler_start_count = 1 if range_index == 1 else 0
+    if profiler_start_count not in (0, 1):
+        raise ValueError("synthetic Nsight profiler start count is invalid")
     report_path = report_path or path.with_suffix(".nsys-rep")
     if not report_path.exists():
         report_path.write_text("synthetic Nsight report\n", encoding="utf-8")
-    capture_uuid = str(uuid.uuid4())
+    capture_uuid = capture_uuid or str(uuid.uuid4())
     connection = sqlite3.connect(path)
     try:
         connection.execute(
@@ -217,7 +226,7 @@ def write_nsys_sqlite(
             "INSERT INTO StringIds VALUES (?, ?)",
             [(identifier, name) for name, identifier in string_ids.items()],
         )
-        launch_ids = [1001, 1002, 1003, 1004]
+        launch_ids = [1000 + range_index]
         for launch_index, correlation_id in enumerate(launch_ids):
             if launch_index < profiler_start_count:
                 connection.execute(
@@ -248,45 +257,51 @@ def write_nsys_sqlite(
                 ),
             )
             for graph_node_id, name in enumerate(node_names, start=1):
-                if uneven_replays and graph_node_id == len(node_names) and launch_index == 3:
-                    continue
                 row_correlation = 9999 if orphan_child and graph_node_id == 1 else correlation_id
-                grid_x = 2 if signature_drift and graph_node_id == 1 and launch_index == 3 else 1
+                grid_x = 2 if signature_drift and graph_node_id == 1 else 1
+                kernel_row = (
+                    launch_index * 100_000 + graph_node_id * 10,
+                    launch_index * 100_000 + graph_node_id * 10 + 5,
+                    0,
+                    1,
+                    None,
+                    7,
+                    row_correlation,
+                    1,
+                    string_ids[name],
+                    string_ids[name],
+                    None,
+                    0,
+                    0,
+                    32,
+                    grid_x,
+                    1,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    graph_node_id,
+                    None,
+                    graph_node_id,
+                    None,
+                )
                 connection.execute(
                     "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ("
                     + ",".join("?" for _ in range(28))
                     + ")",
-                    (
-                        launch_index * 100_000 + graph_node_id * 10,
-                        launch_index * 100_000 + graph_node_id * 10 + 5,
-                        0,
-                        1,
-                        None,
-                        7,
-                        row_correlation,
-                        1,
-                        string_ids[name],
-                        string_ids[name],
-                        None,
-                        0,
-                        0,
-                        32,
-                        grid_x,
-                        1,
-                        1,
-                        256,
-                        1,
-                        1,
-                        0,
-                        0,
-                        0,
-                        0,
-                        graph_node_id,
-                        None,
-                        graph_node_id,
-                        None,
-                    ),
+                    kernel_row,
                 )
+                if uneven_replays and graph_node_id == len(node_names):
+                    connection.execute(
+                        "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ("
+                        + ",".join("?" for _ in range(28))
+                        + ")",
+                        kernel_row,
+                    )
             for node_index in range(memcpy_nodes):
                 connection.execute(
                     "INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES ("
@@ -841,7 +856,7 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn('--model-key "${model}"', script)
         self.assertIn("--trace-only", script)
 
-    def test_nsys_trace_validation_rejects_loss_and_uneven_replays(self) -> None:
+    def test_nsys_range_validation_rejects_loss_replays_and_start_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             clean = root / "clean.sqlite"
@@ -849,12 +864,9 @@ class OnlineClientContractTests(unittest.TestCase):
             result = validate_nsys_trace(clean)
             self.assertTrue(result["lossless"])
             self.assertEqual(result["primary_graph_node_count"], 2)
-            self.assertEqual(
-                result["primary_graph_replay_count"], TRACE_CAPTURE_GRAPH_REPLAYS
-            )
-            self.assertEqual(
-                result["profiler_range_start_count"], TRACE_CAPTURE_GRAPH_REPLAYS
-            )
+            self.assertEqual(result["primary_graph_replay_count"], 1)
+            self.assertEqual(result["profiler_range_start_count"], 1)
+            self.assertEqual(result["range_index"], 1)
 
             lost = root / "lost.sqlite"
             write_nsys_sqlite(lost, lost_events=True)
@@ -867,19 +879,27 @@ class OnlineClientContractTests(unittest.TestCase):
                 validate_nsys_trace(uneven)
 
             missing_range = root / "missing-range.sqlite"
-            write_nsys_sqlite(missing_range, profiler_start_count=3)
+            write_nsys_sqlite(missing_range, profiler_start_count=0)
             with self.assertRaisesRegex(HarnessError, "cuProfilerStart rows"):
                 validate_nsys_trace(missing_range)
+
+            later_range = root / "later-range.sqlite"
+            write_nsys_sqlite(later_range, range_index=2)
+            result = validate_nsys_trace(later_range, range_index=2)
+            self.assertEqual(result["profiler_range_start_count"], 0)
+            self.assertEqual(result["range_index"], 2)
+
+            unexpected_start = root / "unexpected-start.sqlite"
+            write_nsys_sqlite(
+                unexpected_start, range_index=2, profiler_start_count=1
+            )
+            with self.assertRaisesRegex(HarnessError, "cuProfilerStart rows"):
+                validate_nsys_trace(unexpected_start, range_index=2)
 
             orphan = root / "orphan.sqlite"
             write_nsys_sqlite(orphan, orphan_child=True)
             with self.assertRaisesRegex(HarnessError, "direct cudaGraphLaunch"):
                 validate_nsys_trace(orphan)
-
-            signature_drift = root / "signature-drift.sqlite"
-            write_nsys_sqlite(signature_drift, signature_drift=True)
-            with self.assertRaisesRegex(HarnessError, "signature differs"):
-                validate_nsys_trace(signature_drift)
 
             model_contract = root / "model-contract.sqlite"
             write_nsys_sqlite(model_contract, model_contract=True)
@@ -1359,28 +1379,16 @@ class OnlineClientContractTests(unittest.TestCase):
             ours_commands = []
             ours_profile_logs = []
             ours_profile_controls = []
+            session_uuids = []
             vllm_corpus = root / "vllm-corpus.jsonl"
             vllm_corpus.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
-            for index in range(TRACE_REPETITIONS):
-                report = root / f"ours-{index}.nsys-rep"
-                report.write_text("trace\n", encoding="utf-8")
-                sqlite_path = root / f"ours-{index}.sqlite"
-                validation = root / f"ours-{index}-validation.json"
-                write_nsys_sqlite(sqlite_path, model_contract=True)
-                validation.write_text(
-                    json.dumps(validate_nsys_trace(sqlite_path, model_key="27")),
-                    encoding="utf-8",
-                )
-                summary = root / f"ours-{index}-summary.txt"
-                summary.write_text(
-                    json.dumps(summarize_nsys_kernels(sqlite_path)), encoding="utf-8"
-                )
-                command = root / f"ours-{index}-command.txt"
-                profile_log = root / f"ours-{index}-profile.log"
-                native = root / f"native-{index}-must-not-exist.json"
-                server_pid = 6000 + index
-                nsys_pid = 5000 + index
-                launcher_pid = 5500 + index
+            for session_index in range(TRACE_REPETITIONS):
+                command = root / f"ours-{session_index}-command.txt"
+                profile_log = root / f"ours-{session_index}-profile.log"
+                native = root / f"native-{session_index}-must-not-exist.json"
+                server_pid = 6000 + session_index
+                nsys_pid = 5000 + session_index
+                launcher_pid = 5500 + session_index
                 write_profile_log(
                     profile_log,
                     fixture=fixture,
@@ -1392,7 +1400,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     "VT_FP4_AUTOTUNE_CACHE_PATH": str(native),
                     "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
                 }
-                prefix = root / f"ours-{index}"
+                prefix = root / f"ours-{session_index}"
                 shutdown_fifo = pathlib.Path(f"{prefix}-shutdown.fifo")
                 profile_command = [
                     "env",
@@ -1435,7 +1443,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     "gate",
                 ]
                 command.write_text(shlex.join(profile_command) + "\n", encoding="utf-8")
-                control = root / f"ours-{index}-control.json"
+                control = root / f"ours-{session_index}-control.json"
                 record_profile_control(
                     control,
                     profile_log=profile_log,
@@ -1454,13 +1462,49 @@ class OnlineClientContractTests(unittest.TestCase):
                     server_sid=server_pid,
                     shutdown_fifo=shutdown_fifo,
                 )
-                ours_nsys_reports.append(report)
-                ours_nsys_sqlites.append(sqlite_path)
-                ours_nsys_validations.append(validation)
-                ours_kernel_summaries.append(summary)
                 ours_commands.append(command)
                 ours_profile_logs.append(profile_log)
                 ours_profile_controls.append(control)
+                session_uuid = str(uuid.uuid4())
+                session_uuids.append(session_uuid)
+                for range_index in range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1):
+                    range_prefix = pathlib.Path(f"{prefix}.{range_index}")
+                    report = pathlib.Path(f"{range_prefix}.nsys-rep")
+                    report.write_text("trace\n", encoding="utf-8")
+                    sqlite_path = pathlib.Path(f"{range_prefix}.sqlite")
+                    validation = pathlib.Path(
+                        f"{range_prefix}-validation.json"
+                    )
+                    write_nsys_sqlite(
+                        sqlite_path,
+                        capture_uuid=session_uuid,
+                        model_contract=True,
+                        range_index=range_index,
+                        report_path=report,
+                    )
+                    validation.write_text(
+                        json.dumps(
+                            validate_nsys_trace(
+                                sqlite_path,
+                                model_key="27",
+                                range_index=range_index,
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    summary = pathlib.Path(f"{range_prefix}-summary.txt")
+                    summary.write_text(
+                        json.dumps(
+                            summarize_nsys_kernels(
+                                sqlite_path, range_index=range_index
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                    ours_nsys_reports.append(report)
+                    ours_nsys_sqlites.append(sqlite_path)
+                    ours_nsys_validations.append(validation)
+                    ours_kernel_summaries.append(summary)
             vllm_profile_dir = root / "vllm-profile"
             vllm_profile_dir.mkdir()
             vllm_torch_trace = vllm_profile_dir / "vllm-trace.json.gz"
@@ -1613,6 +1657,72 @@ class OnlineClientContractTests(unittest.TestCase):
                     vllm_cpp_sha="d" * 40,
                 )
 
+            ours_nsys_reports[1], ours_nsys_reports[4] = (
+                ours_nsys_reports[4],
+                ours_nsys_reports[1],
+            )
+            with self.assertRaisesRegex(HarnessError, "indexed reports"):
+                record_trace()
+            ours_nsys_reports[1], ours_nsys_reports[4] = (
+                ours_nsys_reports[4],
+                ours_nsys_reports[1],
+            )
+
+            connection = sqlite3.connect(ours_nsys_sqlites[1])
+            try:
+                connection.execute(
+                    "UPDATE META_DATA_CAPTURE SET value = ? "
+                    "WHERE name = 'PROFILING_SESSION_UUID'",
+                    (session_uuids[1],),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            ours_nsys_validations[1].write_text(
+                json.dumps(
+                    validate_nsys_trace(
+                        ours_nsys_sqlites[1], model_key="27", range_index=2
+                    )
+                ),
+                encoding="utf-8",
+            )
+            ours_kernel_summaries[1].write_text(
+                json.dumps(
+                    summarize_nsys_kernels(
+                        ours_nsys_sqlites[1], range_index=2
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(HarnessError, "one UUID within each session"):
+                record_trace()
+            connection = sqlite3.connect(ours_nsys_sqlites[1])
+            try:
+                connection.execute(
+                    "UPDATE META_DATA_CAPTURE SET value = ? "
+                    "WHERE name = 'PROFILING_SESSION_UUID'",
+                    (session_uuids[0],),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            ours_nsys_validations[1].write_text(
+                json.dumps(
+                    validate_nsys_trace(
+                        ours_nsys_sqlites[1], model_key="27", range_index=2
+                    )
+                ),
+                encoding="utf-8",
+            )
+            ours_kernel_summaries[1].write_text(
+                json.dumps(
+                    summarize_nsys_kernels(
+                        ours_nsys_sqlites[1], range_index=2
+                    )
+                ),
+                encoding="utf-8",
+            )
+
             trace = record_trace()
             self.assertEqual(trace["ours_profiler"], "nsys")
             self.assertEqual(trace["vllm_profiler"], "torch-profiler")
@@ -1621,7 +1731,20 @@ class OnlineClientContractTests(unittest.TestCase):
                 NSYS_CUDA_GRAPH_TRACE,
             )
             self.assertEqual(trace["trace_contract"]["nsys_captures"], 3)
-            self.assertEqual(len(trace["nsys_validations"]), 3)
+            self.assertEqual(
+                trace["trace_contract"]["total_range_reports"],
+                TRACE_RANGE_REPORTS,
+            )
+            self.assertEqual(len(trace["nsys_validations"]), TRACE_RANGE_REPORTS)
+            self.assertEqual(trace["nsys_capture_session_uuids"], session_uuids)
+            self.assertEqual(
+                trace["nsys_range_report_session_uuids"],
+                [
+                    session_uuid
+                    for session_uuid in session_uuids
+                    for _ in range(TRACE_CAPTURE_GRAPH_REPLAYS)
+                ],
+            )
             self.assertEqual(
                 trace["nsys_validations"][0]["primary_graph_family_node_counts"][
                     "normal_fp4_producer"

@@ -179,8 +179,7 @@ class CudaBackend final : public Backend {
         throw std::runtime_error(
             "vt cuda: graph replay profiler counter underflow");
       }
-      Check(cudaStreamSynchronize(AsStream(q)),
-            "cudaStreamSynchronize profiler replay");
+      Check(cudaDeviceSynchronize(), "cudaDeviceSynchronize profiler replay");
       Check(cudaProfilerStop(), "cudaProfilerStop");
       --g_cuda_profile_remaining_replays;
       if (g_cuda_profile_remaining_replays == 0) {

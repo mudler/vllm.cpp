@@ -7133,6 +7133,45 @@ and amended spike, then implement/CPU-gate the repeated-range controller before
 a new pushed SHA/root. Immutable `3f256ab` remains **55/124 pass, 69 fail**;
 W3-H2, exact-grid and 35B performance remain prohibited.
 
+## 2026-07-13 — H1d schema v4 implemented, CPU-gated, and public status compacted
+
+The repair selected by the void `b2c940c` run is now implemented. Trace schema
+v4 treats Nsight's repeated-range output as **three independent sessions × four
+indexed reports**. The driver exports, hashes, validates, summarizes and records
+all 12 report/SQLite/validation/summary artifacts. Reports 1--4 within one
+session must share a profiler UUID; the three session UUIDs must differ; all 12
+reports must contain one complete launch, identical 1,107-kernel + 7-memcpy +
+1-memset node/resource signatures, zero eager CUDA work, the exact frozen plan
+lifecycle and no rejected diagnostic. Only range 1 may contain the visible
+successful `cuProfilerStart` row.
+
+Nsight now runs with `--capture-range-end=repeat:4:sync`, and the
+diagnostic-only replay controller performs `cudaDeviceSynchronize()` before
+each profiler stop. The installed DGX Nsight 2025.3.2 parser accepts that mode.
+The controller remains behind `VLLM_CPP_BENCH_PROFILE_CONTROL`; production
+builds compile it out and receive no inference-path change.
+
+Validation completed locally:
+
+- Python compilation, Bash syntax, ShellCheck and `git diff --check` pass;
+- focused online-client/trace/summary contracts pass **31/31**;
+- the CUDA-off configure/build succeeds;
+- the first full CUDA-off suite hit the known timing-sensitive C-API early-stop
+  case at **105/106**; after one isolated failure, that case passed three
+  consecutive isolated runs and the final full suite passed **106/106**.
+
+The user-facing surfaces were compacted at the same checkpoint. `README.md`
+and `docs/BENCHMARKS.md` are now current-state snapshots rather than
+attempt-by-attempt logs; `AGENTS.md` makes that lifecycle explicit. Detailed
+chronology remains here and in the append-only parity ledger. The live roadmap
+top stage was similarly reduced to the current gate and next action.
+
+This checkpoint contains **no DGX trace and no new performance result**.
+Immutable `3f256ab` remains binding at **55/124 pass, 69 fail**. Next: push the
+schema-v4 checkpoint, execute it from a fresh immutable DGX root, and require
+all 12 reports to pass before any W3-H2 implementation, component A/B, exact
+grid or 35B performance run.
+
 ## 2026-07-13 — H1d repeated single-replay ranges implemented and CPU-gated
 
 The failed/void `219f4f2` checkpoint was committed separately as `bc03594`.

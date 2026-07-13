@@ -13,6 +13,13 @@ failed or void runs, and explicit pending hardware work. Do not wait for a
 feature to land or a gate to pass. Keep its ⚠️ header, architecture /
 acceleration / quantization tables, and "Status & caveats" mutually consistent.
 The README must never lag reality and must not turn progress into support.
+It is a **current-state snapshot, not a chronological log**: keep one binding
+result, the current lifecycle state, active gaps and the next gate. At each
+checkpoint, collapse superseded attempt narratives and stale intermediate
+numbers into a concise disposition; detailed chronology belongs in the
+append-only `.agents/state.md` / `.agents/parity-ledger.md` record and feature
+specs. Do not preserve history in the README merely because an older paragraph
+already exists.
 
 **Keep [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) CURRENT at the SAME
 checkpoint.** Every feature/iteration records its benchmark disposition there
@@ -22,6 +29,10 @@ next reproduction command. Never publish a partial/contended/stale-denominator
 number as binding. `scripts/check-doc-checkpoint.py` and its CI job enforce that
 every code/test/benchmark/spike/lifecycle commit updates both public checkpoint
 surfaces; do not weaken the checker to bypass the obligation.
+`docs/BENCHMARKS.md` is likewise a **scoreboard snapshot**, not an attempt log:
+retain binding/current component results, explicit pending/failed/void
+dispositions and the current reproduction entry point, while compacting
+superseded run-by-run forensics into the append-only ledger/state record.
 
 **Keep the ROADMAP (`.agents/roadmap_v1.md`) and its AREA MATRICES CURRENT —
 same-change obligation.** The roadmap is the single top-level portfolio table;

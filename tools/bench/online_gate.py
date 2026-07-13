@@ -56,10 +56,11 @@ TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
 TRACE_CAPTURE_GRAPH_REPLAYS = 4
-TRACE_STATUS_SCHEMA_VERSION = 3
+TRACE_RANGE_REPORTS = TRACE_REPETITIONS * TRACE_CAPTURE_GRAPH_REPLAYS
+TRACE_STATUS_SCHEMA_VERSION = 4
 BUILD_CONTRACT_SCHEMA_VERSION = 2
 NSYS_CAPTURE_RANGE = "cudaProfilerApi"
-NSYS_CAPTURE_RANGE_END = f"repeat:{TRACE_CAPTURE_GRAPH_REPLAYS}"
+NSYS_CAPTURE_RANGE_END = f"repeat:{TRACE_CAPTURE_GRAPH_REPLAYS}:sync"
 NSYS_CUDA_GRAPH_TRACE = "node:host-only"
 NSYS_CUDA_FLUSH_INTERVAL_MS = 0
 NSYS_PRODUCT_VERSION = "2025.3.2.474"
@@ -772,10 +773,10 @@ def build_plan(
             "thermal/<model>/<engine>/r<rep>-{before,after}.txt",
             "cache-drop/<model>/<engine>/r<rep>-{before,after}.json",
             "memory-return/<model>/<engine>/r<rep>.json",
-            "trace/<model>/ours-r{1,2,3}.nsys-rep",
-            "trace/<model>/ours-r{1,2,3}.sqlite",
-            "trace/<model>/ours-r{1,2,3}-cuda_gpu_kern_sum.txt",
-            "trace/<model>/ours-r{1,2,3}-nsys-validation.json",
+            "trace/<model>/ours-r{1,2,3}.{1,2,3,4}.nsys-rep",
+            "trace/<model>/ours-r{1,2,3}.{1,2,3,4}.sqlite",
+            "trace/<model>/ours-r{1,2,3}.{1,2,3,4}-cuda_gpu_kern_sum.txt",
+            "trace/<model>/ours-r{1,2,3}.{1,2,3,4}-nsys-validation.json",
             "trace/<model>/ours-r{1,2,3}-profile-control.json",
             "raw/<model>/ours/c16-r1-trace{1,2,3}-probe.json",
             "trace/<model>/vllm-profile/*.pt.trace.json.gz",
@@ -924,10 +925,18 @@ def record_model_gate(
 
 
 def validate_nsys_trace(
-    sqlite_path: pathlib.Path, *, model_key: str | None = None
+    sqlite_path: pathlib.Path,
+    *,
+    model_key: str | None = None,
+    range_index: int = 1,
 ) -> dict[str, Any]:
-    """Validate one bounded H1d capture by direct runtime correlation."""
+    """Validate one bounded H1d range report by direct runtime correlation."""
 
+    if not 1 <= range_index <= TRACE_CAPTURE_GRAPH_REPLAYS:
+        raise HarnessError(
+            f"Nsight range index {range_index} is outside "
+            f"1..{TRACE_CAPTURE_GRAPH_REPLAYS}"
+        )
     if not sqlite_path.is_file() or sqlite_path.stat().st_size == 0:
         raise HarnessError(f"Nsight SQLite artifact is absent or empty: {sqlite_path}")
     connection = sqlite3.connect(str(sqlite_path))
@@ -1119,13 +1128,14 @@ def validate_nsys_trace(
                 "WHERE strings.value = 'cuProfilerStart' ORDER BY runtime.start"
             )
         ]
-        if len(profiler_start_rows) != TRACE_CAPTURE_GRAPH_REPLAYS:
+        expected_profiler_starts = 1 if range_index == 1 else 0
+        if len(profiler_start_rows) != expected_profiler_starts:
             raise HarnessError(
-                "Nsight capture has "
+                f"Nsight range {range_index} has "
                 f"{len(profiler_start_rows)} cuProfilerStart rows; expected "
-                f"{TRACE_CAPTURE_GRAPH_REPLAYS} isolated ranges"
+                f"{expected_profiler_starts}"
             )
-        if len({row[2] for row in profiler_start_rows}) != TRACE_CAPTURE_GRAPH_REPLAYS:
+        if len({row[2] for row in profiler_start_rows}) != expected_profiler_starts:
             raise HarnessError("Nsight cuProfilerStart correlation IDs are not unique")
         if any(row[3] != 0 for row in profiler_start_rows):
             raise HarnessError("Nsight cuProfilerStart returned a CUDA error")
@@ -1141,28 +1151,20 @@ def validate_nsys_trace(
                 "ORDER BY runtime.start"
             )
         ]
-        if len(launch_rows) != TRACE_CAPTURE_GRAPH_REPLAYS:
+        if len(launch_rows) != 1:
             raise HarnessError(
-                "Nsight capture has "
-                f"{len(launch_rows)} cudaGraphLaunch rows; expected "
-                f"{TRACE_CAPTURE_GRAPH_REPLAYS}"
+                f"Nsight range {range_index} has "
+                f"{len(launch_rows)} cudaGraphLaunch rows; expected 1"
             )
         launch_ids = [row[2] for row in launch_rows]
-        if len(set(launch_ids)) != TRACE_CAPTURE_GRAPH_REPLAYS:
+        if len(set(launch_ids)) != 1:
             raise HarnessError("Nsight cudaGraphLaunch correlation IDs are not unique")
         if any(row[4] != 0 for row in launch_rows):
             raise HarnessError("Nsight cudaGraphLaunch returned a CUDA error")
-        for index, (range_start, launch) in enumerate(
-            zip(profiler_start_rows, launch_rows, strict=True)
-        ):
-            if range_start[1] > launch[0]:
-                raise HarnessError(
-                    "Nsight cuProfilerStart does not precede its graph launch"
-                )
-            if index > 0 and range_start[0] <= launch_rows[index - 1][1]:
-                raise HarnessError(
-                    "Nsight graph launches do not occupy isolated profiler ranges"
-                )
+        if profiler_start_rows and profiler_start_rows[0][1] > launch_rows[0][0]:
+            raise HarnessError(
+                "Nsight cuProfilerStart does not precede its graph launch"
+            )
         launch_id_set = set(launch_ids)
 
         kernel_fields = (
@@ -1284,8 +1286,7 @@ def validate_nsys_trace(
             uneven = [
                 graph_node_id
                 for graph_node_id, (count, correlations) in replay_counts.items()
-                if count != TRACE_CAPTURE_GRAPH_REPLAYS
-                or len(correlations) != TRACE_CAPTURE_GRAPH_REPLAYS
+                if count != 1 or len(correlations) != 1
             ]
             if uneven:
                 raise HarnessError(
@@ -1401,17 +1402,21 @@ def validate_nsys_trace(
         "nsys_report_sha256": sha256_file(report_path),
         "primary_graph_node_count": len({row[1] for row in kernel_rows}),
         "primary_graph_family_node_counts": primary_family_counts,
-        "primary_graph_replay_count": TRACE_CAPTURE_GRAPH_REPLAYS,
+        "primary_graph_replay_count": 1,
         "profiler_range_start_count": len(profiler_start_rows),
+        "range_index": range_index,
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": sha256_file(sqlite_path),
     }
 
 
-def summarize_nsys_kernels(sqlite_path: pathlib.Path) -> dict[str, Any]:
-    validation = validate_nsys_trace(sqlite_path)
+def summarize_nsys_kernels(
+    sqlite_path: pathlib.Path, *, range_index: int = 1
+) -> dict[str, Any]:
+    validation = validate_nsys_trace(sqlite_path, range_index=range_index)
     return {
         **validation["kernel_summary"],
+        "range_index": range_index,
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": validation["sqlite_sha256"],
     }
@@ -2110,11 +2115,13 @@ def record_trace_status(
     trace_execution = _validated_trace_execution(
         execution_manifest, model_key=model_key, vllm_cpp_sha=vllm_cpp_sha
     )
-    ours_trace_sequences = {
+    ours_range_sequences = {
         "Nsight reports": ours_nsys_reports,
         "Nsight SQLite exports": ours_nsys_sqlites,
         "Nsight validations": ours_nsys_validations,
         "kernel summaries": ours_kernel_summaries,
+    }
+    ours_session_sequences = {
         "profile commands": ours_commands,
         "profile logs": ours_profile_logs,
         "profile controls": ours_profile_controls,
@@ -2123,7 +2130,12 @@ def record_trace_status(
         "diagnostic probe results": ours_probe_results,
         "diagnostic probe logs": ours_probe_logs,
     }
-    for label, paths in ours_trace_sequences.items():
+    for label, paths in ours_range_sequences.items():
+        if len(paths) != TRACE_RANGE_REPORTS:
+            raise HarnessError(
+                f"ours trace must retain exactly {TRACE_RANGE_REPORTS} indexed {label}"
+            )
+    for label, paths in ours_session_sequences.items():
         if len(paths) != TRACE_REPETITIONS:
             raise HarnessError(
                 f"ours trace must retain exactly three independent {label}"
@@ -2152,9 +2164,8 @@ def record_trace_status(
 
     command_environments = []
     command_shutdown_fifos = []
-    for command_path, report_path in zip(
-        ours_commands, ours_nsys_reports, strict=True
-    ):
+    expected_report_paths = []
+    for command_path in ours_commands:
         command_tokens = shlex.split(command_path.read_text(encoding="utf-8"))
         try:
             nsys_index = command_tokens.index("nsys")
@@ -2199,10 +2210,12 @@ def record_trace_status(
             raise HarnessError("ours trace native plan target is not absent")
         command_environments.append(environment)
         output_prefix = _option_value(command_tokens, "--output")
-        if output_prefix is None or pathlib.Path(
-            f"{output_prefix}.nsys-rep"
-        ).resolve() != report_path.resolve():
-            raise HarnessError("ours trace command output prefix differs from its report")
+        if output_prefix is None:
+            raise HarnessError("ours trace command omits its output prefix")
+        expected_report_paths.extend(
+            pathlib.Path(f"{output_prefix}.{range_index}.nsys-rep").resolve()
+            for range_index in range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1)
+        )
         shutdown_fifo = pathlib.Path(f"{output_prefix}-shutdown.fifo").resolve()
         command_shutdown_fifos.append(shutdown_fifo)
         expected_tail = [
@@ -2245,6 +2258,10 @@ def record_trace_status(
         ]
         if command_tokens[nsys_index:] != expected_tail:
             raise HarnessError("ours trace command tail differs from the exact H1d recipe")
+    if [path.resolve() for path in ours_nsys_reports] != expected_report_paths:
+        raise HarnessError(
+            "ours trace indexed reports do not match their session output prefixes"
+        )
 
     for result_path, log_path in zip(
         ours_client_results, ours_client_logs, strict=True
@@ -2461,14 +2478,26 @@ def record_trace_status(
 
     nsys_validations = []
     nsys_kernel_summaries = []
-    for report_path, sqlite_path, validation_path, summary_path in zip(
-        ours_nsys_reports,
-        ours_nsys_sqlites,
-        ours_nsys_validations,
-        ours_kernel_summaries,
-        strict=True,
+    for artifact_index, (
+        report_path,
+        sqlite_path,
+        validation_path,
+        summary_path,
+    ) in enumerate(
+        zip(
+            ours_nsys_reports,
+            ours_nsys_sqlites,
+            ours_nsys_validations,
+            ours_kernel_summaries,
+            strict=True,
+        )
     ):
-        validation = validate_nsys_trace(sqlite_path, model_key=model_key)
+        range_index = artifact_index % TRACE_CAPTURE_GRAPH_REPLAYS + 1
+        validation = validate_nsys_trace(
+            sqlite_path,
+            model_key=model_key,
+            range_index=range_index,
+        )
         if pathlib.Path(validation["nsys_report_path"]).resolve() != report_path.resolve():
             raise HarnessError("Nsight SQLite source report differs from its indexed artifact")
         if _load_json_object(validation_path) != validation:
@@ -2476,7 +2505,9 @@ def record_trace_status(
                 "recorded Nsight validation differs from the SQLite report"
             )
         nsys_validations.append(validation)
-        summary = summarize_nsys_kernels(sqlite_path)
+        summary = summarize_nsys_kernels(
+            sqlite_path, range_index=range_index
+        )
         if _load_json_object(summary_path) != summary:
             raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
         nsys_kernel_summaries.append(summary)
@@ -2485,9 +2516,20 @@ def record_trace_status(
     ]
     if len(set(signature_hashes)) != 1:
         raise HarnessError("ours graph node multiset differs across independent captures")
-    capture_session_uuids = [
+    range_report_session_uuids = [
         validation["capture_session_uuid"] for validation in nsys_validations
     ]
+    session_uuid_groups = [
+        range_report_session_uuids[
+            start : start + TRACE_CAPTURE_GRAPH_REPLAYS
+        ]
+        for start in range(0, TRACE_RANGE_REPORTS, TRACE_CAPTURE_GRAPH_REPLAYS)
+    ]
+    if any(len(set(group)) != 1 for group in session_uuid_groups):
+        raise HarnessError(
+            "ours indexed range reports do not share one UUID within each session"
+        )
+    capture_session_uuids = [group[0] for group in session_uuid_groups]
     if len(set(capture_session_uuids)) != TRACE_REPETITIONS:
         raise HarnessError("ours independent traces reuse an Nsight capture session UUID")
 
@@ -2536,7 +2578,10 @@ def record_trace_status(
             raise HarnessError(f"trace artifact {name} is absent or empty: {path}")
     trace_paths = [
         path
-        for paths in ours_trace_sequences.values()
+        for paths in (
+            *ours_range_sequences.values(),
+            *ours_session_sequences.values(),
+        )
         for path in paths
     ]
     resolved_paths = [path.resolve() for path in trace_paths]
@@ -2592,15 +2637,18 @@ def record_trace_status(
             "probe_num_prompts": TRACE_CONCURRENCY,
             "probe_num_warmups": 0,
             "probe_timing_binding": False,
+            "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
             "semantic_num_warmups": TRACE_CONCURRENCY,
             "repetitions": TRACE_REPETITIONS,
             "sample": "none",
             "cpu_context_switch_trace": "none",
+            "total_range_reports": TRACE_RANGE_REPORTS,
         },
         "nsys_validations": nsys_validations,
         "nsys_kernel_summaries": nsys_kernel_summaries,
         "node_multiset_sha256": signature_hashes[0],
         "nsys_capture_session_uuids": capture_session_uuids,
+        "nsys_range_report_session_uuids": range_report_session_uuids,
         "nsys_product_version": NSYS_PRODUCT_VERSION,
         "vllm_cpp_sha": vllm_cpp_sha,
         "vllm_profiler": "torch-profiler",
@@ -3124,10 +3172,22 @@ def _parser() -> argparse.ArgumentParser:
     validate_nsys.add_argument(
         "--model-key", choices=tuple(MODEL_REVISIONS), required=True
     )
+    validate_nsys.add_argument(
+        "--range-index",
+        type=int,
+        choices=range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1),
+        required=True,
+    )
     validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     summarize_nsys = commands.add_parser("summarize-nsys-kernels")
     summarize_nsys.add_argument("--sqlite", type=pathlib.Path, required=True)
+    summarize_nsys.add_argument(
+        "--range-index",
+        type=int,
+        choices=range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1),
+        required=True,
+    )
     summarize_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     profile_control = commands.add_parser("record-profile-control")
@@ -3273,12 +3333,18 @@ def main() -> int:
     elif args.command == "validate-nsys-trace":
         if args.output.exists():
             raise HarnessError(f"refusing to overwrite Nsight validation: {args.output}")
-        result = validate_nsys_trace(args.sqlite, model_key=args.model_key)
+        result = validate_nsys_trace(
+            args.sqlite,
+            model_key=args.model_key,
+            range_index=args.range_index,
+        )
         write_json_atomic(args.output, result)
     elif args.command == "summarize-nsys-kernels":
         if args.output.exists():
             raise HarnessError(f"refusing to overwrite Nsight summary: {args.output}")
-        result = summarize_nsys_kernels(args.sqlite)
+        result = summarize_nsys_kernels(
+            args.sqlite, range_index=args.range_index
+        )
         write_json_atomic(args.output, result)
     elif args.command == "record-profile-control":
         result = record_profile_control(

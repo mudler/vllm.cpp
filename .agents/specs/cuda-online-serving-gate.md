@@ -76,8 +76,8 @@ memcpys, one graph memset and zero eager CUDA rows. All four nevertheless emit
 severity-2 possible event loss. The revised contract keeps that rejection
 strict and binds three sessions x four reports under schema v4, with
 `repeat:4:sync` plus a device synchronization before every stop. That repair
-is pending implementation; no exact rerun or 35B performance command is
-authorized.
+is implemented and CPU-gated; a fresh pushed SHA/root must now prove it on the
+DGX. No exact rerun result or 35B performance command is authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
@@ -292,9 +292,9 @@ reported as a clean dependency check.
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
    attribution is complete. W3-H's repeated-range attempt at `b2c940c` is void;
-   implement its schema-v4 three-session x four-report contract and synchronous
-   flush, then execute a fresh exact-target `--trace-only` checkpoint. 35B
-   remains gated.
+   its schema-v4 three-session x four-report contract and synchronous flush are
+   implemented and CPU-gated; execute a fresh exact-target `--trace-only`
+   checkpoint. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a

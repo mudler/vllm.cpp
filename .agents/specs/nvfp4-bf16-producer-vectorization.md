@@ -4,8 +4,9 @@ Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID;
 the latest proves four isolated reports each contain exactly one complete
 1,107-kernel graph replay and zero eager CUDA work, but every report emits
 severity-2 possible event loss and the schema-v3 harness incorrectly expects
-one combined report; the 3-session x 4-report contract and synchronous flush
-repair are accepted but not implemented, and W3-H2 remains prohibited**
+one combined report; schema v4 now implements and CPU-gates the 3-session x
+4-report contract, synchronous result generation and device-wide stop flush,
+but fresh immutable DGX evidence is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -183,6 +184,20 @@ distinct. The next repair advances the status schema to v4, uses the supported
 `repeat:4:sync` generation mode so result generation blocks between ranges,
 and performs a diagnostic-only device synchronization before every profiler
 stop. No severity is whitelisted and no partial range can bind.
+
+That schema-v4 repair is now implemented. The driver records three session
+commands/logs/controls and exports all **12** indexed report/SQLite/validation/
+summary artifacts. Per-range validation requires one graph launch, one visible
+`cuProfilerStart` only in range 1, zero in ranges 2--4, exact model-family and
+node-resource signatures, zero eager CUDA rows and no rejected diagnostic. The
+status/reconstruction gates require one UUID within each group of four, three
+distinct session UUIDs and one identical canonical node multiset across all 12
+reports. Nsight uses `repeat:4:sync`; the diagnostic-only backend performs
+`cudaDeviceSynchronize()` before every stop. The installed DGX Nsight 2025.3.2
+parser accepts that mode. Focused client/summary/trace contracts pass **31/31**;
+Python/shell syntax, ShellCheck, the CUDA-off build and a final full CUDA-off
+suite **106/106** pass. This is not GPU trace evidence: a fresh pushed SHA/root
+must compile and execute the exact DGX series before H1d or W3-H2 can advance.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -672,7 +687,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID. The latest exact build/gate, clients and FIFO/zero-exit lifecycle pass; four generated reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all four emit severity-2 possible loss. Schema v3 also expects one combined report. The accepted repair is schema v4 over 3 sessions x 4 reports, `repeat:4:sync` and device synchronization; implementation and fresh immutable execution are next** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID. The latest exact build/gate, clients and FIFO/zero-exit lifecycle pass; four generated reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all four emit severity-2 possible loss. Schema v3 also expects one combined report. Schema v4 now implements and CPU-gates 3 sessions x 4 indexed reports, `repeat:4:sync`, per-stop device synchronization, grouped UUIDs and identical-node validation. Fresh immutable DGX execution is next** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

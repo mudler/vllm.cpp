@@ -420,20 +420,25 @@ run_paired_traces() {
   local trace_rep
   for trace_rep in 1 2 3; do
     local ours_prefix="${trace_dir}/ours-r${trace_rep}"
-    local ours_rep="${ours_prefix}.nsys-rep"
-    local ours_sqlite="${ours_prefix}.sqlite"
-    local ours_summary="${trace_dir}/ours-r${trace_rep}-cuda_gpu_kern_sum.txt"
-    local ours_validation="${trace_dir}/ours-r${trace_rep}-nsys-validation.json"
     local ours_log="${trace_dir}/ours-r${trace_rep}-profile.log"
     local ours_command="${trace_dir}/ours-r${trace_rep}-profile-command.txt"
     local ours_control="${trace_dir}/ours-r${trace_rep}-profile-control.json"
     local shutdown_fifo="${ours_prefix}-shutdown.fifo"
-    [[ ! -e ${ours_rep} && ! -e ${ours_sqlite} && ! -e ${ours_validation} &&
-       ! -e ${ours_summary} && ! -e ${ours_log} && ! -e ${ours_command} &&
-       ! -e ${ours_control} && ! -e ${shutdown_fifo} ]] || {
+    [[ ! -e ${ours_log} && ! -e ${ours_command} && ! -e ${ours_control} &&
+       ! -e ${shutdown_fifo} ]] || {
       echo "refusing to overwrite ours trace repetition ${trace_rep}" >&2
       return 1
     }
+    local range_index
+    for range_index in 1 2 3 4; do
+      local range_prefix="${ours_prefix}.${range_index}"
+      [[ ! -e ${range_prefix}.nsys-rep && ! -e ${range_prefix}.sqlite &&
+         ! -e ${range_prefix}-nsys-validation.json &&
+         ! -e ${range_prefix}-cuda_gpu_kern_sum.txt ]] || {
+        echo "refusing to overwrite ours trace repetition ${trace_rep} range ${range_index}" >&2
+        return 1
+      }
+    done
     mkfifo --mode=600 "${shutdown_fifo}"
     local -a server_cmd=(
       "${build_dir}/examples/server"
@@ -462,7 +467,7 @@ run_paired_traces() {
       nsys profile
       --trace=cuda
       --capture-range=cudaProfilerApi
-      --capture-range-end=repeat:4
+      --capture-range-end=repeat:4:sync
       --flush-on-cudaprofilerstop=true
       --cuda-flush-interval=0
       --cuda-graph-trace=node:host-only
@@ -612,27 +617,36 @@ run_paired_traces() {
       --server-pgid "${server_pgid}" \
       --server-sid "${server_sid}" \
       --shutdown-fifo "${shutdown_fifo}"
-    [[ -s ${ours_rep} ]] || {
-      echo "nsys did not write ${ours_rep}" >&2
-      return 1
-    }
-    nsys export --type=sqlite --lazy=false --force-overwrite=false \
-      --output "${ours_sqlite}" "${ours_rep}" >/dev/null
-    [[ -s ${ours_sqlite} ]] || {
-      echo "ours Nsight SQLite export is empty" >&2
-      return 1
-    }
-    python3 "${repo_root}/tools/bench/online_gate.py" validate-nsys-trace \
-      --sqlite "${ours_sqlite}" \
-      --model-key "${model}" \
-      --output "${ours_validation}"
-    python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
-      --sqlite "${ours_sqlite}" \
-      --output "${ours_summary}"
-    ours_reps+=("${ours_rep}")
-    ours_sqlites+=("${ours_sqlite}")
-    ours_summaries+=("${ours_summary}")
-    ours_validations+=("${ours_validation}")
+    for range_index in 1 2 3 4; do
+      local range_prefix="${ours_prefix}.${range_index}"
+      local ours_rep="${range_prefix}.nsys-rep"
+      local ours_sqlite="${range_prefix}.sqlite"
+      local ours_summary="${range_prefix}-cuda_gpu_kern_sum.txt"
+      local ours_validation="${range_prefix}-nsys-validation.json"
+      [[ -s ${ours_rep} ]] || {
+        echo "nsys did not write ${ours_rep}" >&2
+        return 1
+      }
+      nsys export --type=sqlite --lazy=false --force-overwrite=false \
+        --output "${ours_sqlite}" "${ours_rep}" >/dev/null
+      [[ -s ${ours_sqlite} ]] || {
+        echo "ours Nsight SQLite export is empty for range ${range_index}" >&2
+        return 1
+      }
+      python3 "${repo_root}/tools/bench/online_gate.py" validate-nsys-trace \
+        --sqlite "${ours_sqlite}" \
+        --model-key "${model}" \
+        --range-index "${range_index}" \
+        --output "${ours_validation}"
+      python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
+        --sqlite "${ours_sqlite}" \
+        --range-index "${range_index}" \
+        --output "${ours_summary}"
+      ours_reps+=("${ours_rep}")
+      ours_sqlites+=("${ours_sqlite}")
+      ours_summaries+=("${ours_summary}")
+      ours_validations+=("${ours_validation}")
+    done
     ours_logs+=("${ours_log}")
     ours_commands+=("${ours_command}")
     ours_controls+=("${ours_control}")
@@ -689,13 +703,17 @@ PY
     --vllm-cpp-sha "${vllm_cpp_sha}"
   )
   local trace_index
-  for trace_index in 0 1 2; do
-    trace_rep=$((trace_index + 1))
+  for trace_index in $(seq 0 11); do
     status_args+=(
       --ours-nsys-report "${ours_reps[trace_index]}"
       --ours-nsys-sqlite "${ours_sqlites[trace_index]}"
       --ours-nsys-validation "${ours_validations[trace_index]}"
       --ours-kernel-summary "${ours_summaries[trace_index]}"
+    )
+  done
+  for trace_index in 0 1 2; do
+    trace_rep=$((trace_index + 1))
+    status_args+=(
       --ours-command "${ours_commands[trace_index]}"
       --ours-profile-log "${ours_logs[trace_index]}"
       --ours-profile-control "${ours_controls[trace_index]}"

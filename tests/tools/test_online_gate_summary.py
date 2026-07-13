@@ -14,6 +14,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 from tools.bench.online_gate import (
@@ -35,6 +36,7 @@ from tools.bench.online_gate import (
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
+    TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
     TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
@@ -118,9 +120,19 @@ def _write_cache_drop(path: pathlib.Path, roots: list[str]) -> dict:
 
 
 def _write_model_nsys_sqlite(
-    path: pathlib.Path, *, report_path: pathlib.Path
+    path: pathlib.Path,
+    *,
+    capture_uuid: str,
+    range_index: int,
+    report_path: pathlib.Path,
 ) -> None:
-    write_nsys_sqlite(path, model_contract=True, report_path=report_path)
+    write_nsys_sqlite(
+        path,
+        capture_uuid=capture_uuid,
+        model_contract=True,
+        range_index=range_index,
+        report_path=report_path,
+    )
 
 
 def _write_fixture(root: pathlib.Path) -> None:
@@ -281,74 +293,99 @@ def _write_fixture(root: pathlib.Path) -> None:
     summaries = []
     plans = []
     controls = []
-    for index in range(1, TRACE_REPETITIONS + 1):
-        suffix = "" if index == 1 else f"_{index}"
-        report_name = f"ours_nsys_report{suffix}"
-        report_path = trace_root / f"{report_name}.txt"
-        report_path.write_text(f"{report_name}\n", encoding="utf-8")
-        sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
-        _write_model_nsys_sqlite(sqlite_path, report_path=report_path)
-        validation = validate_nsys_trace(sqlite_path, model_key="27")
-        validation_path = trace_root / f"ours_nsys_validation{suffix}.json"
-        validation_path.write_text(json.dumps(validation), encoding="utf-8")
-        summary = summarize_nsys_kernels(sqlite_path)
-        summary_path = trace_root / f"ours_kernel_summary{suffix}.json"
-        summary_path.write_text(json.dumps(summary), encoding="utf-8")
-        native = trace_root / f"native-{index}-must-not-exist.json"
-        profile_log = trace_root / f"ours_profile_log{suffix}.log"
+    session_uuids = []
+    for session_index in range(1, TRACE_REPETITIONS + 1):
+        session_suffix = "" if session_index == 1 else f"_{session_index}"
+        session_uuid = str(uuid.uuid4())
+        session_uuids.append(session_uuid)
+        native = trace_root / f"native-{session_index}-must-not-exist.json"
+        profile_log = trace_root / f"ours_profile_log{session_suffix}.log"
         write_profile_log(
             profile_log,
             fixture=fixture,
             native_target=native,
-            server_pid=6000 + index,
+            server_pid=6000 + session_index,
         )
-        control_path = trace_root / f"ours_profile_control{suffix}.json"
+        control_path = trace_root / f"ours_profile_control{session_suffix}.json"
         control = record_profile_control(
             control_path,
             profile_log=profile_log,
-            nsys_pid=5000 + index,
-            nsys_pgid=5000 + index,
-            nsys_sid=5000 + index,
+            nsys_pid=5000 + session_index,
+            nsys_pgid=5000 + session_index,
+            nsys_sid=5000 + session_index,
             nsys_exit_status=0,
-            launcher_pid=5500 + index,
-            launcher_ppid=5000 + index,
-            launcher_pgid=5000 + index,
-            launcher_sid=5000 + index,
+            launcher_pid=5500 + session_index,
+            launcher_ppid=5000 + session_index,
+            launcher_pgid=5000 + session_index,
+            launcher_sid=5000 + session_index,
             launcher_comm="nsys-launcher",
-            server_pid=6000 + index,
-            server_ppid=5500 + index,
-            server_pgid=6000 + index,
-            server_sid=6000 + index,
-            shutdown_fifo=trace_root / f"ours-r{index}-shutdown.fifo",
+            server_pid=6000 + session_index,
+            server_ppid=5500 + session_index,
+            server_pgid=6000 + session_index,
+            server_sid=6000 + session_index,
+            shutdown_fifo=trace_root / f"ours-r{session_index}-shutdown.fifo",
         )
         for name, path in (
-            (f"ours_nsys_sqlite{suffix}", sqlite_path),
-            (f"ours_nsys_validation{suffix}", validation_path),
-            (f"ours_kernel_summary{suffix}", summary_path),
-            (f"ours_profile_log{suffix}", profile_log),
-            (f"ours_profile_control{suffix}", control_path),
-            (report_name, report_path),
+            (f"ours_profile_log{session_suffix}", profile_log),
+            (f"ours_profile_control{session_suffix}", control_path),
         ):
             trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
-        for stem in ("ours_command",):
-            name = f"{stem}{suffix}"
-            path = trace_root / f"{name}.txt"
-            path.write_text(f"{name}\n", encoding="utf-8")
-            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+        command_name = f"ours_command{session_suffix}"
+        command_path = trace_root / f"{command_name}.txt"
+        command_path.write_text(f"{command_name}\n", encoding="utf-8")
+        trace_files[command_name] = {
+            "path": str(command_path),
+            "sha256": sha256_file(command_path),
+        }
         for stem in (
             "ours_client_result",
             "ours_client_log",
             "ours_probe_result",
             "ours_probe_log",
         ):
-            name = f"{stem}_{index}"
+            name = f"{stem}_{session_index}"
             path = trace_root / f"{name}.txt"
             path.write_text(f"{name}\n", encoding="utf-8")
             trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
-        validations.append(validation)
-        summaries.append(summary)
         plans.append(_parse_fp4_plan_log(profile_log))
         controls.append(control)
+        for range_index in range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1):
+            artifact_index = (
+                (session_index - 1) * TRACE_CAPTURE_GRAPH_REPLAYS + range_index
+            )
+            suffix = "" if artifact_index == 1 else f"_{artifact_index}"
+            report_name = f"ours_nsys_report{suffix}"
+            report_path = trace_root / f"{report_name}.txt"
+            report_path.write_text(f"{report_name}\n", encoding="utf-8")
+            sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
+            _write_model_nsys_sqlite(
+                sqlite_path,
+                capture_uuid=session_uuid,
+                range_index=range_index,
+                report_path=report_path,
+            )
+            validation = validate_nsys_trace(
+                sqlite_path, model_key="27", range_index=range_index
+            )
+            validation_path = trace_root / f"ours_nsys_validation{suffix}.json"
+            validation_path.write_text(json.dumps(validation), encoding="utf-8")
+            summary = summarize_nsys_kernels(
+                sqlite_path, range_index=range_index
+            )
+            summary_path = trace_root / f"ours_kernel_summary{suffix}.json"
+            summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            for name, path in (
+                (f"ours_nsys_sqlite{suffix}", sqlite_path),
+                (f"ours_nsys_validation{suffix}", validation_path),
+                (f"ours_kernel_summary{suffix}", summary_path),
+                (report_name, report_path),
+            ):
+                trace_files[name] = {
+                    "path": str(path),
+                    "sha256": sha256_file(path),
+                }
+            validations.append(validation)
+            summaries.append(summary)
     for name in ("vllm_command", "vllm_profile_log", "vllm_metadata", "vllm_corpus"):
         path = trace_root / f"{name}.txt"
         path.write_text(f"{name}\n", encoding="utf-8")
@@ -385,12 +422,13 @@ def _write_fixture(root: pathlib.Path) -> None:
                 "node_multiset_sha256": validations[0][
                     "canonical_node_multiset_sha256"
                 ],
-                "nsys_capture_session_uuids": [
+                "nsys_capture_session_uuids": session_uuids,
+                "nsys_kernel_summaries": summaries,
+                "nsys_product_version": NSYS_PRODUCT_VERSION,
+                "nsys_range_report_session_uuids": [
                     validation["capture_session_uuid"]
                     for validation in validations
                 ],
-                "nsys_kernel_summaries": summaries,
-                "nsys_product_version": NSYS_PRODUCT_VERSION,
                 "nsys_validations": validations,
                 "ours_profiler": "nsys",
                 "passed": True,
@@ -420,10 +458,12 @@ def _write_fixture(root: pathlib.Path) -> None:
                     "probe_num_prompts": TRACE_CONCURRENCY,
                     "probe_num_warmups": 0,
                     "probe_timing_binding": False,
+                    "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
                     "semantic_num_warmups": TRACE_CONCURRENCY,
                     "repetitions": TRACE_REPETITIONS,
                     "sample": "none",
                     "cpu_context_switch_trace": "none",
+                    "total_range_reports": TRACE_RANGE_REPORTS,
                 },
                 "vllm_cpp_sha": sha,
                 "vllm_profiler": "torch-profiler",
@@ -754,7 +794,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
 
-    def test_three_capture_trace_requires_every_hashed_artifact(self) -> None:
+    def test_three_session_trace_requires_every_hashed_range_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
@@ -763,7 +803,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
             runs, _ = self._summarize(root)
             self.assertTrue(runs["gate_pass"])
 
-            status["artifacts"].pop("ours_nsys_sqlite_2")
+            status["artifacts"].pop("ours_nsys_sqlite_8")
             status_path.write_text(json.dumps(status), encoding="utf-8")
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])

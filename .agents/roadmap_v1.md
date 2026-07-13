@@ -4,63 +4,23 @@ M0–M3 record is archived at
 [completed/roadmap_mvp_v0.md](completed/roadmap_mvp_v0.md).)*
 
 **Context:** both gate models run end-to-end and retain token-exact greedy
-correctness, but performance closure is **reopened** against vLLM v0.25.0.
-Earlier sampling/token-budget mismatches already invalidated the historical
-MVP rates; the 2026-07-12 release audit then found the DGX vLLM 0.24.0 oracle
-carried FlashInfer 0.6.12 although the source pin required 0.6.13. All prior
-end-to-end ratios are therefore diagnostic. This document is the canonical
-index of what runs next: trace the now-validated exact v0.25.0 oracle, restore
-every speed/latency/memory axis on 27B and then 35B, and only then resume the
-operational and T1/T2 portfolio. Detailed status lives in the area matrices;
-active ownership lives in `coordination.md`; closed execution blocks live under
-`completed/`.
+correctness. Exact performance closure is open against vLLM v0.25.0; the
+immutable 27B result `3f256ab` binds at **55/124 axes pass, 69 fail**. Restore
+every throughput, latency, and memory axis on 27B and then 35B before resuming
+the operational and T1/T2 portfolio. Detailed status lives in the area
+matrices, active ownership in `coordination.md`, and chronological evidence in
+the append-only state/ledger record.
 
-**Current order-0 substage (2026-07-13):** H1d's diagnostic-only SIGUSR2/four-
-replay controller, pre-GPU target-build manifest and schema-v3 ours/vLLM
-validators are implemented and CPU-gated. Clean `b2c940c` exposed that Nsight
-emits four indexed reports per `repeat:4` session and that all four retain
-severity-2 possible loss. The current pending implementation is schema v4 over
-three sessions x four reports with synchronous result generation and device
-flush; no immutable rerun is authorized yet. The attempt history begins with
-clean `7bae38a` and `2d16c68`, which failed before
-build/GPU as login `PATH` omitted Ninja and then `nvcc`; clean `5f8fab1` built
-but failed the 27B gate identically with the observer on/off because the recipe
-omitted the binding Triton-AOT GDN path and used the wrong build type. The
-repaired manifest now binds `RelWithDebInfo`, vendored Triton-AOT, FA2,
-CUTLASS and both exact tools before GPU work. Clean `d063f20` then failed
-pre-plan because corpus preceded dry-run; the repaired recipe now fixes the
-plan-first ordering. Clean `b1c7eb6` passed exact plan/configuration but then
-failed before build/GPU on the driver's pre-build server check; the driver now
-owns the recorded target build before executable validation. Clean `e1acb75`
-then completed the exact **154/154** build and passed the 27B gate **1/1 in
-17.42 s**, but stopped before trace workload/report because the harness assumed
-the target shared `nsys`'s process group. The repair records the actual
-`nsys -> nsys-launcher -> separate target session` ancestry and owns cleanup
-of both sessions. That root is void. Clean `a96e899` then repeated the exact
-**154/154** build, passed the 27B gate **1/1 in 16.85 s**, completed 48/48 plus
-16/16 clients and closed exactly four graph replays. It is also void: SIGTERM
-made Nsight propagate exit 143 before SQLite validation, captures 2/3 or vLLM.
-Clean `3c1d7b7` exercised that repair: its exact **154/154** build, 27B gate
-**1/1 in 16.83 s**, 48/48 + 16/16 clients and four-replay close passed, but
-process-directed SIGUSR1 terminated the target and made Nsight exit 138 before
-validation. That root is void. H1d now uses a per-capture named FIFO to call
-the server's graceful `stop()` and requires its exact lifecycle, removal and
-profiler exit zero. Clean `219f4f2` proves that repair: exact build/gate and
-48/48 + 16/16 clients pass, as do the FIFO lifecycle and target/Nsight zero
-exit. Its SQLite remains void because one continuous four-replay range includes
-three eager sampler/input gaps and severity-2 possible event loss. All intended
-graph children are present, so H1d now specifies four isolated synchronized
-`repeat:4` ranges while retaining the severity and zero-eager rejections.
-The repeated-range controller, command contract and four-start SQLite proof are
-implemented and CPU-gated. Clean `b2c940c` then passes the exact **154/154**
-build, 27B gate **1/1 in 17.30 s**, 48/48 + 16/16 clients, frozen plans, FIFO
-removal and zero exits. Nsight emits four indexed reports rather than schema
-v3's one combined report. Each read-only export has exactly one complete
-1,107-kernel replay and zero eager CUDA work, but every report retains
-severity-2 possible loss. That root is void. The accepted next repair is
-schema v4 over three sessions x four reports, `repeat:4:sync`, and a
-diagnostic device synchronization before each stop; it is not yet implemented.
-`3f256ab` still binds at 55/124 and no speed credit follows.
+**Current order-0 substage (2026-07-13):** W3-H1d schema v4 is implemented and
+CPU-gated. It binds three independent Nsight sessions × four indexed reports,
+`repeat:4:sync`, diagnostic device synchronization, exact frozen plans, one
+complete 1,107-kernel replay per report, zero eager work, strict diagnostics,
+and identical node/resource signatures. Focused contracts pass **31/31** and
+the final CUDA-off suite passes **106/106**. A fresh immutable DGX execution is
+the sole current checkpoint; W3-H2, the exact 27B grid, 35B performance, and
+the later portfolio remain blocked until the preceding gates pass. Earlier H1
+attempts are `VOID` and remain in `state.md` / `parity-ledger.md`, not in this
+live roadmap snapshot.
 
 ## Top-level portfolio
 
@@ -72,7 +32,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and immutable `3f256ab` binds at **55/124 axes pass, 69 fail**. W3-E/W3-F/W3-G strict-fail and earn no speed credit. [W3-H](specs/nvfp4-bf16-producer-vectorization.md) is `ACTIVE / trace-first`; H1a/H1b/H1c and H1d attempts through `b2c940c` are `VOID`. `b2c940c` proves exact build/gate, 48/48 + 16/16 clients, frozen plans, FIFO lifecycle/removal and target/Nsight zero exit. Its four reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all emit severity-2 possible loss and schema v3 expected one combined report. Binding speed stays unchanged, W3-H2 remains prohibited and SGLang remains source-audited/non-binding | `GATING` | implement schema v4 over three sessions x four reports with synchronous generation/device flush, then execute fresh correctness and require all 12 reports to be zero-eager, lossless and exact-plan. Only a later 48/48 component authorizes the exact grid. Close all 124 axes before 35B performance, then execute the distinct SGLang prefix gate |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. W3-E/W3-F/W3-G strict-fail and earn no speed credit. [W3-H](specs/nvfp4-bf16-producer-vectorization.md) is `ACTIVE / trace-first`; schema v4 is CPU-green for its 3-session × 4-report synchronous contract. No W3-H2 implementation, SGLang number, or newer speed result exists | `GATING` | execute the fresh immutable 12-report trace gate; only a later passing 48/48 component authorizes the exact grid. Close all 124 axes before 35B performance, then execute the distinct SGLang prefix gate |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |
@@ -97,7 +57,7 @@ their area matrix.
 
 | # | Track | State |
 |---|---|---|
-| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. W3-C frozen-map control passes; W3-E/W3-F/W3-G strict-fail and earn no speed credit. [W3-H normal BF16→FP4 vectorized I/O](specs/nvfp4-bf16-producer-vectorization.md) is **ACTIVE / trace-first**: H1a/H1b/H1c and H1d attempts through exact-build/gate/FIFO-zero-exit `b2c940c` are `VOID`. The latest four reports are exact and zero-eager but all retain severity-2 possible loss; schema v3 also assumed one combined report. The schema-v4 3-session x 4-report synchronous-flush repair is next, followed by a fresh immutable DGX series; every new performance ratio remains prohibited. Close every 27B axis before 35B performance; keep host-memory/teardown debt separate |
+| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. W3-C frozen-map control passes; W3-E/W3-F/W3-G strict-fail and earn no speed credit. [W3-H normal BF16→FP4 vectorized I/O](specs/nvfp4-bf16-producer-vectorization.md) is **ACTIVE / trace-first**: schema v4 is implemented and CPU-green for 3 sessions × 4 lossless, zero-eager, exact-plan reports. Fresh immutable DGX evidence is next; no new ratio exists. Close every 27B axis before 35B performance and keep host-memory/teardown debt separate |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
 | A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461; reproducibility hardening `09f1d23`) — `sm_121a` now has 48 generated C/H files + MANIFEST, including both bf16 `chunk_o` shapes; normal builds remain Python-free. Regen is explicit-target (`cuda:121:32`), line-info-disabled and byte-reproducible across source paths; the pure checker makes source/contract/artifact drift fatal and mutation-tests missing/extra/changed artifacts. A4 remains closed; fresh current-main CUDA/runtime/performance validation belongs to the two ACTIVE `CLAIM-PR3` kernel rows (evidence: porting-inventory §9). |

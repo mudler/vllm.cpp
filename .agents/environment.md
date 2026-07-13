@@ -93,7 +93,8 @@ inner 4096, state 128; context 262144.
   1,107-kernel replay and zero eager CUDA rows, but all emit severity-2 possible
   loss and schema v3 expects one combined report. The accepted repair is schema
   v4 over three sessions x four reports plus synchronous generation/device
-  flush; implementation and focused CPU gates are next. It still enforces
+  flush; it is implemented and CPU-gated, and fresh immutable DGX execution is
+  next. It still enforces
   plan-first evidence, exact
   Triton-AOT/FA2/CUTLASS/toolchain configuration, its own recorded target build
   and actual `nsys -> nsys-launcher -> target-session` ancestry plus a

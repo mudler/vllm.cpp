@@ -43,6 +43,7 @@ from tools.bench.online_gate import (
     TRACE_CONCURRENCY,
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PROMPTS,
+    TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
     TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
@@ -538,10 +539,12 @@ def _model_precondition_reasons(
             "probe_num_prompts": TRACE_CONCURRENCY,
             "probe_num_warmups": 0,
             "probe_timing_binding": False,
+            "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
             "semantic_num_warmups": TRACE_CONCURRENCY,
             "repetitions": TRACE_REPETITIONS,
             "sample": "none",
             "cpu_context_switch_trace": "none",
+            "total_range_reports": TRACE_RANGE_REPORTS,
         }
         if trace_contract != expected_trace_contract:
             reasons.append("paired trace token/concurrency contract differs")
@@ -550,18 +553,11 @@ def _model_precondition_reasons(
         if not isinstance(artifacts, dict):
             reasons.append("paired trace artifact map is absent")
         else:
-            for field in (
+            required_fields = (
                 "cache_drop_1",
                 "cache_drop_2",
                 "cache_drop_3",
                 "execution_manifest",
-                "ours_command",
-                "ours_profile_log",
-                "ours_profile_control",
-                "ours_nsys_report",
-                "ours_nsys_sqlite",
-                "ours_nsys_validation",
-                "ours_kernel_summary",
                 "ours_client_result_1",
                 "ours_client_result_2",
                 "ours_client_result_3",
@@ -580,7 +576,25 @@ def _model_precondition_reasons(
                 "vllm_corpus",
                 "vllm_torch_trace",
                 "vllm_kernel_summary",
-            ):
+            ) + tuple(
+                stem if index == 1 else f"{stem}_{index}"
+                for stem in (
+                    "ours_command",
+                    "ours_profile_log",
+                    "ours_profile_control",
+                )
+                for index in range(1, TRACE_REPETITIONS + 1)
+            ) + tuple(
+                stem if index == 1 else f"{stem}_{index}"
+                for stem in (
+                    "ours_nsys_report",
+                    "ours_nsys_sqlite",
+                    "ours_nsys_validation",
+                    "ours_kernel_summary",
+                )
+                for index in range(1, TRACE_RANGE_REPORTS + 1)
+            )
+            for field in required_fields:
                 artifact = artifacts.get(field)
                 if not isinstance(artifact, dict):
                     reasons.append(f"paired trace artifact {field} is absent")
@@ -621,39 +635,15 @@ def _model_precondition_reasons(
                 except HarnessError as error:
                     reasons.append(str(error))
             if nsys_captures == TRACE_REPETITIONS:
-                for field in (
-                    "ours_command_2",
-                    "ours_command_3",
-                    "ours_profile_log_2",
-                    "ours_profile_log_3",
-                    "ours_profile_control_2",
-                    "ours_profile_control_3",
-                    "ours_nsys_report_2",
-                    "ours_nsys_report_3",
-                    "ours_nsys_sqlite_2",
-                    "ours_nsys_sqlite_3",
-                    "ours_nsys_validation_2",
-                    "ours_nsys_validation_3",
-                    "ours_kernel_summary_2",
-                    "ours_kernel_summary_3",
-                ):
-                    artifact = artifacts.get(field)
-                    if not isinstance(artifact, dict):
-                        reasons.append(f"paired trace artifact {field} is absent")
-                        continue
-                    try:
-                        _verify_hashed_artifact(artifact, evidence_root, field)
-                    except HarnessError as error:
-                        reasons.append(str(error))
                 validations = status.get("nsys_validations")
                 summaries = status.get("nsys_kernel_summaries")
                 plans = status.get("plan_validations")
                 controls = status.get("profile_controls")
                 if (
                     not isinstance(validations, list)
-                    or len(validations) != TRACE_REPETITIONS
+                    or len(validations) != TRACE_RANGE_REPORTS
                     or not isinstance(summaries, list)
-                    or len(summaries) != TRACE_REPETITIONS
+                    or len(summaries) != TRACE_RANGE_REPORTS
                     or not isinstance(plans, list)
                     or len(plans) != TRACE_REPETITIONS
                     or not isinstance(controls, list)
@@ -661,9 +651,12 @@ def _model_precondition_reasons(
                 ):
                     reasons.append("paired trace H1d semantic validation arrays differ")
                 else:
-                    capture_session_uuids = []
+                    range_report_session_uuids = []
                     for index, validation in enumerate(validations, start=1):
                         suffix = "" if index == 1 else f"_{index}"
+                        range_index = (
+                            (index - 1) % TRACE_CAPTURE_GRAPH_REPLAYS + 1
+                        )
                         try:
                             report_artifact = artifacts[f"ours_nsys_report{suffix}"]
                             sqlite_artifact = artifacts[f"ours_nsys_sqlite{suffix}"]
@@ -672,10 +665,6 @@ def _model_precondition_reasons(
                             ]
                             summary_artifact = artifacts[
                                 f"ours_kernel_summary{suffix}"
-                            ]
-                            log_artifact = artifacts[f"ours_profile_log{suffix}"]
-                            control_artifact = artifacts[
-                                f"ours_profile_control{suffix}"
                             ]
                             sqlite_path = _artifact_path(
                                 sqlite_artifact.get("path"),
@@ -697,6 +686,93 @@ def _model_precondition_reasons(
                                 evidence_root,
                                 f"ours_kernel_summary{suffix}",
                             )
+                            actual = validate_nsys_trace(
+                                sqlite_path,
+                                model_key=model,
+                                range_index=range_index,
+                            )
+                            if pathlib.Path(
+                                actual["nsys_report_path"]
+                            ).resolve() != report_path.resolve():
+                                raise HarnessError(
+                                    "paired trace SQLite source report differs from "
+                                    f"range report {index}"
+                                )
+                            if validation != actual or _load_json(
+                                validation_path
+                            ) != actual:
+                                raise HarnessError(
+                                    "paired trace Nsight validation differs from "
+                                    f"range report {index}"
+                                )
+                            actual_summary = summarize_nsys_kernels(
+                                sqlite_path, range_index=range_index
+                            )
+                            if summaries[index - 1] != actual_summary or _load_json(
+                                summary_path
+                            ) != actual_summary:
+                                raise HarnessError(
+                                    "paired trace kernel summary differs from "
+                                    f"range report {index}"
+                                )
+                            range_report_session_uuids.append(
+                                actual["capture_session_uuid"]
+                            )
+                        except (HarnessError, KeyError, TypeError) as error:
+                            reasons.append(str(error))
+                    signature_hashes = [
+                        validation.get("canonical_node_multiset_sha256")
+                        if isinstance(validation, dict)
+                        else None
+                        for validation in validations
+                    ]
+                    if (
+                        any(not isinstance(value, str) for value in signature_hashes)
+                        or len(set(signature_hashes)) != 1
+                        or status.get("node_multiset_sha256") != signature_hashes[0]
+                    ):
+                        reasons.append("paired trace node multiset differs across ranges")
+                    session_uuid_groups = [
+                        range_report_session_uuids[
+                            start : start + TRACE_CAPTURE_GRAPH_REPLAYS
+                        ]
+                        for start in range(
+                            0, TRACE_RANGE_REPORTS, TRACE_CAPTURE_GRAPH_REPLAYS
+                        )
+                    ]
+                    valid_session_identity = (
+                        len(range_report_session_uuids) == TRACE_RANGE_REPORTS
+                        and len(session_uuid_groups) == TRACE_REPETITIONS
+                        and all(
+                            len(group) == TRACE_CAPTURE_GRAPH_REPLAYS
+                            and len(set(group)) == 1
+                            for group in session_uuid_groups
+                        )
+                    )
+                    capture_session_uuids = (
+                        [group[0] for group in session_uuid_groups]
+                        if valid_session_identity
+                        else []
+                    )
+                    if (
+                        not valid_session_identity
+                        or len(set(capture_session_uuids)) != TRACE_REPETITIONS
+                        or status.get("nsys_capture_session_uuids")
+                        != capture_session_uuids
+                        or status.get("nsys_range_report_session_uuids")
+                        != range_report_session_uuids
+                        or status.get("nsys_product_version") != NSYS_PRODUCT_VERSION
+                    ):
+                        reasons.append(
+                            "paired trace Nsight version/session identity differs"
+                        )
+                    for session_index in range(1, TRACE_REPETITIONS + 1):
+                        suffix = "" if session_index == 1 else f"_{session_index}"
+                        try:
+                            log_artifact = artifacts[f"ours_profile_log{suffix}"]
+                            control_artifact = artifacts[
+                                f"ours_profile_control{suffix}"
+                            ]
                             log_path = _artifact_path(
                                 log_artifact.get("path"),
                                 evidence_root,
@@ -707,75 +783,29 @@ def _model_precondition_reasons(
                                 evidence_root,
                                 f"ours_profile_control{suffix}",
                             )
-                            actual = validate_nsys_trace(
-                                sqlite_path, model_key=model
-                            )
-                            if pathlib.Path(
-                                actual["nsys_report_path"]
-                            ).resolve() != report_path.resolve():
-                                raise HarnessError(
-                                    "paired trace SQLite source report differs from "
-                                    f"capture {index}"
-                                )
-                            if validation != actual or _load_json(
-                                validation_path
-                            ) != actual:
-                                raise HarnessError(
-                                    "paired trace Nsight validation differs from "
-                                    f"capture {index}"
-                                )
-                            actual_summary = summarize_nsys_kernels(sqlite_path)
-                            if summaries[index - 1] != actual_summary or _load_json(
-                                summary_path
-                            ) != actual_summary:
-                                raise HarnessError(
-                                    "paired trace kernel summary differs from "
-                                    f"capture {index}"
-                                )
                             actual_plan = _parse_fp4_plan_log(log_path)
-                            if plans[index - 1] != actual_plan:
+                            if plans[session_index - 1] != actual_plan:
                                 raise HarnessError(
-                                    f"paired trace plan semantics differ for capture {index}"
+                                    "paired trace plan semantics differ for session "
+                                    f"{session_index}"
                                 )
                             markers = _parse_profile_markers(log_path)
                             control = _load_json(control_path)
-                            if controls[index - 1] != control or any(
+                            if controls[session_index - 1] != control or any(
                                 control.get(field) != value
                                 for field, value in markers.items()
                             ):
                                 raise HarnessError(
-                                    f"paired trace control differs for capture {index}"
+                                    "paired trace control differs for session "
+                                    f"{session_index}"
                                 )
                             if control.get("nsys_exit_status") != 0:
                                 raise HarnessError(
-                                    "paired trace Nsight exit status differs for "
-                                    f"capture {index}"
+                                    "paired trace Nsight exit status differs for session "
+                                    f"{session_index}"
                                 )
-                            capture_session_uuids.append(
-                                actual["capture_session_uuid"]
-                            )
                         except (HarnessError, KeyError, TypeError) as error:
                             reasons.append(str(error))
-                    signature_hashes = [
-                        validation.get("canonical_node_multiset_sha256")
-                        for validation in validations
-                    ]
-                    if (
-                        len(set(signature_hashes)) != 1
-                        or status.get("node_multiset_sha256") != signature_hashes[0]
-                    ):
-                        reasons.append("paired trace node multiset differs across captures")
-                    if (
-                        len(capture_session_uuids) != TRACE_REPETITIONS
-                        or len(set(capture_session_uuids)) != TRACE_REPETITIONS
-                        or status.get("nsys_capture_session_uuids")
-                        != capture_session_uuids
-                        or status.get("nsys_product_version")
-                        != NSYS_PRODUCT_VERSION
-                    ):
-                        reasons.append(
-                            "paired trace Nsight version/session identity differs"
-                        )
                 try:
                     vllm_trace_path = _artifact_path(
                         artifacts["vllm_torch_trace"].get("path"),

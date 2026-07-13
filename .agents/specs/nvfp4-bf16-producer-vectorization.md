@@ -2,8 +2,9 @@
 
 Status: **ACTIVE — H1a/H1b/H1c are VOID; the H1d trace-only controller,
 target-build preflight and schema-v2 validators are implemented and CPU-gated;
-the immutable three-capture DGX execution is pending and W3-H2 remains
-prohibited**
+immutable `7bae38a` failed before build/GPU because Ninja was not on the DGX
+login `PATH`; the pinned-Ninja replacement execution is pending and W3-H2
+remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -31,6 +32,12 @@ fatal confound: the detached source lacked CUTLASS, CMake disabled
 GEMMs instead of the target path. Its retained process log therefore has zero
 plan lifecycle/selection records. No runtime implementation or speed credit
 follows from any of the three void traces.
+
+The first clean H1d setup at pushed `7bae38a` also failed closed before build
+or GPU: CMake could not locate Ninja in the DGX login environment. Configure
+log SHA-256 is `ac9e4854…f616`; no model, lock or profiler ran. Its root remains
+immutable/void. The replacement recipe names the oracle environment's pinned
+`ninja` by absolute path and requires a new clean pushed SHA.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -451,8 +458,9 @@ stdout/stderr as the build-provenance input required by the driver:
 
 ```sh
 SHA=$(git rev-parse HEAD)
-ROOT="$HOME/work/vllm.cpp-executed-path-refresh/$SHA"
+ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
 cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
+  -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
   -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=ON \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
   -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
@@ -460,8 +468,8 @@ cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
 scripts/dgx-online-serving.sh --trace-only --model 27 \
   --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(readlink "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")" \
-  --source-corpus "$ROOT/evidence/corpus/27" \
-  --evidence "$ROOT/evidence" --build-dir "$ROOT/build-cuda" \
+  --source-corpus "$ROOT/evidence/$SHA/corpus/27" \
+  --evidence "$ROOT/evidence/$SHA" --build-dir "$ROOT/build-cuda" \
   --configure-log "$ROOT/configure.log" \
   --client "$HOME/venvs/vllm-oracle/bin/vllm" --vllm-cpp-sha "$SHA"
 ```

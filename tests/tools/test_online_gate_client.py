@@ -614,6 +614,11 @@ class OnlineClientContractTests(unittest.TestCase):
             plan["planned_commands"]["trace_model"][1],
             "--trace-only",
         )
+        self.assertEqual(
+            plan["planned_commands"]["trace_model"][2:6],
+            ["--model", "27", "--snapshot", "<27_MODEL_SNAPSHOT>"],
+        )
+        self.assertNotIn("<27|35>", plan["planned_commands"]["trace_model"])
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
@@ -1004,6 +1009,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     (
                         "CMAKE_BUILD_TYPE:STRING=Release",
                         "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
+                        f"CMAKE_MAKE_PROGRAM:FILEPATH={root / 'oracle-files/ninja'}",
                         f"CMAKE_HOME_DIRECTORY:INTERNAL={source}",
                         "VLLM_CPP_BENCH_PROFILE_CONTROL:BOOL=ON",
                         "VLLM_CPP_CUDA:STRING=ON",

@@ -727,11 +727,11 @@ def build_plan(
                 "scripts/dgx-online-serving.sh",
                 "--trace-only",
                 "--model",
-                "<27|35>",
+                "27",
                 "--snapshot",
-                "<MODEL_SNAPSHOT>",
+                "<27_MODEL_SNAPSHOT>",
                 "--source-corpus",
-                "<EVIDENCE>/corpus/<27|35>",
+                "<EVIDENCE>/corpus/27",
                 "--evidence",
                 "<EVIDENCE>",
                 "--build-dir",
@@ -2684,6 +2684,7 @@ def record_execution_manifest(
     oracle_client = pathlib.Path(oracle_artifacts["client"]["path"])
     if oracle_client.resolve() != client.resolve():
         raise HarnessError("execution client differs from the oracle manifest")
+    oracle_ninja = pathlib.Path(oracle_artifacts["ninja"]["path"])
 
     cutlass_source_tree = oracle.get("cutlass_source_tree")
     if not isinstance(cutlass_source_tree, dict):
@@ -2704,6 +2705,7 @@ def record_execution_manifest(
     expected_cache_values = {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_MAKE_PROGRAM": str(oracle_ninja),
         "VLLM_CPP_BENCH_PROFILE_CONTROL": "ON" if profile_control else "OFF",
         "VLLM_CPP_CUDA": "ON",
         "VLLM_CPP_CUDA_ARCHITECTURES": "121a",

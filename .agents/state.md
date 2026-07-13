@@ -6838,3 +6838,31 @@ memory ratio, W3-H2 code, exact grid or 35B performance exists. The GPU,
 `/tmp/gpu` and serving ports are idle. The next hardware action is to execute
 the clean, pushed checkpoint as a three-capture immutable H1d series under one
 uncontended GPU lock and re-rank the residual from the accepted trace.
+
+## 2026-07-13 — first immutable H1d setup failed before build/GPU; pinned Ninja repair
+
+Clean pushed `7bae38afe8f97603fec525e8a2b8833bcba983cf` was cloned into the fresh
+retained root
+`~/work/vllm.cpp-executed-path-refresh-h1d/7bae38afe8f97603fec525e8a2b8833bcba983cf`.
+Its source was detached/clean, the accepted exact corpus was copied into the
+SHA-owned evidence tree, and dry-run manifest SHA-256
+`80998cc1f452c41b6e02a845248a5e46635e7f2c146a7268d9a21be8046516fd`
+was written. CMake then stopped immediately because the DGX login shell did not
+place Ninja on `PATH`. Configure log SHA-256 is
+`ac9e48549c9398ebaf6576d2d1bf803c169b3991b447580f24283886c2d2f616`.
+
+This is **FAILED / VOID before build or GPU**: no translation unit compiled, no
+model loaded, `/tmp/gpu` was never acquired and no profiler command ran. The
+GPU remained at 0% with no compute process and the lock remained available.
+The root is retained and will not be repaired or reused. It contributes no
+correctness, trace, ratio or speed evidence; immutable `3f256ab` continues to
+bind at **55/124 pass, 69 fail**.
+
+The exact reproduction command now sets `CMAKE_MAKE_PROGRAM` to the pinned
+oracle executable `~/venvs/vllm-oracle/bin/ninja`. The dry-run plan also no
+longer advertises an invalid 35B H1d trace: its command is explicitly 27B-only,
+matching the controller and driver preflight. Focused harness tests remain
+**25/25**; Python compilation, shell syntax, ShellCheck, record and checkpoint
+policies pass. Next hardware action: create a new clean pushed-SHA root, prove
+the CUDA/CUTLASS build, then let one lock own the model gate and complete H1d
+trace series.

@@ -226,6 +226,12 @@ OpenAI-compatible server.
 > decode windows out of 1,588 generation annotations**, with exact per-window
 > family counts. The immutable H1d DGX run is still **PENDING**. No speed
 > credit, exact grid or 35B performance is accepted.
+> The first clean `7bae38a` H1d setup is **FAILED / VOID before build or GPU**:
+> CMake could not find Ninja because the DGX login shell does not expose the
+> oracle venv's pinned executable. Configure log SHA-256 is `ac9e4854…f616`;
+> no compile, model load, GPU lock or profiler command ran. The corrected exact
+> recipe now names `~/venvs/vllm-oracle/bin/ninja` explicitly and requires a
+> fresh pushed SHA/evidence root.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.

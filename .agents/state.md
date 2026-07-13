@@ -5825,3 +5825,30 @@ implementation, then upstream tests, a same-binary 27B A/B and another exact
 grid. The old byte-exact but neutral `76e9047` shared-staging experiment is
 historical evidence, not a veto on adapting the now-executed v0.25
 FlashInfer/Inductor topology. GPU, ports and lock exit idle; 35B remains held.
+
+### 2026-07-13 — generated-body audit corrects false norm+FP4 selection
+
+The required whole-chain audit supersedes the residual interpretation recorded
+in the preceding entry and pushed checkpoint `50adeb3`. The exact trace's
+**127,040 = 80 per 1,588 forwards** long names include
+`fused_add_rms_norm_scaled_fp4_quant`, but the dumped Inductor artifact performs
+only residual-add + RMSNorm and writes BF16. Its wrapper then separately calls
+`torch.ops._C.scaled_fp4_quant.out`, which produces the traced
+`cvt_fp16_to_fp4` launch. The oracle config/log says `fuse_norm_quant: False`,
+and the installed v0.25 RMSNormQuant pass is guarded by that option. Therefore
+vLLM and ours have the same two-kernel norm/FP4 topology; no
+`KERNEL-EW-NORM-QUANT` spike, claim, implementation or performance credit is
+authorized by the trace name. Historical byte-exact/neutral `76e9047` remains
+shelved.
+
+The generated computation graph SHA-256 is
+`d58f81b8c84de94ab3d19be3c3a29bbc31bb25a8a84b46af770db8bc93f49401`;
+the extracted `artifact_compile_range_1_2048_subgraph_1` SHA-256 is
+`466e359a25ab8ad9dd9cf95d2216ab21d961efb34ac4108cb21eafaae4e39dd8`.
+The installed fusion/pass-manager/config source hashes are
+`d4fc85f6…34d19` / `8ccc5463…d12a` / `caf6db4d…b05`. This is a
+documentation/decision correction only: immutable `3f256ab` remains binding at
+**55/124 pass, 69 fail**, generated texts and all accepted evidence are
+unchanged, residual selection is reopened, and 35B remains held. Continue
+body-level trace/dispatch comparison and require a clean local slice before the
+next spike or implementation.

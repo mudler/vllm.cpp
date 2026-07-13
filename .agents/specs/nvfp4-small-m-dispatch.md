@@ -550,7 +550,7 @@ Real 27B W4A4 projection classes to benchmark include:
 | 32 configs (`fp4_gemm_cutlass_template_sm120.h:47-220`) | port the dependency-owned raw template semantics into split local CUDA TUs: explicit TMA epilogue with `ElementC=void`, block-scaled cooperative mainloop, static persistent + Stream-K, both orientations and exact tactic order |
 | `swap_ab` | swap A/B and their scale streams plus M/N exactly as FlashInfer, select the column-major epilogue form, and retain user-visible row-major `[M,N]` output |
 | merged dense gate/up (`qwen3_5.py`, `qwen2_moe.py`, `linear.py`) | concatenate packed gate/up rows and linear FP8 block scales on device, swizzle the combined scale once, emit BF16 `[M,2I]`, apply `SiluAndMul`, and preserve a split diagnostic arm |
-| full-attention packed QKV (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D implemented/immutable-component/trace/exact-grid-classified:** one resident packed FP4 Q/K/V operand and concatenated linear-scale stream, compressed-tensors logical-shard maxima, one quantization, one N=14,336 GEMM and row-strided Q/K/V BF16 views consumed without copies; `VT_FP4_MERGED_QKV=0` restores three GEMMs. Clean `3f256ab` correctness passes; c16 is 1.005049× mean-positive but strict-fails at 14/20 timing + 2/4 memory. Post-pack tracing confirms 208.192 vs vLLM 208 FP4 GEMMs/forward. Exact grid binds at 55/124 and hands the next residual to norm+FP4 fusion |
+| full-attention packed QKV (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D implemented/immutable-component/trace/exact-grid-classified:** one resident packed FP4 Q/K/V operand and concatenated linear-scale stream, compressed-tensors logical-shard maxima, one quantization, one N=14,336 GEMM and row-strided Q/K/V BF16 views consumed without copies; `VT_FP4_MERGED_QKV=0` restores three GEMMs. Clean `3f256ab` correctness passes; c16 is 1.005049× mean-positive but strict-fails at 14/20 timing + 2/4 memory. Post-pack tracing confirms 208.192 vs vLLM 208 FP4 GEMMs/forward. Exact grid binds at 55/124; generated-code inspection refutes the apparent norm+FP4 follow-on, so residual selection is open |
 | fused CT globals (`compressed_tensors_w4a4_nvfp4.py:95-138`) | compute one input divisor as `max(gate,up)`, one weight multiplier as `1/max(1/gate.scale2,1/up.scale2)`, and one alpha as the product of the two reciprocals; test unequal logical-shard scalars explicitly |
 | merged SiLU+NVFP4 quant (`act_quant_fusion.py`, `activation_nvfp4_quant_fusion_kernels.cu`) | add a backend-neutral one-input op over contiguous `[M,2I]`, with CPU composite fallback and a CUDA single-pass producer; wire only the merged true-W4A4 down-projection path, preserve BF16 RN, and retain `VT_FP4_MERGED_SILU_QUANT=0` |
 | workspace (`fp4_gemm_template_sm120.h:151-195`) | compute the maximum required bytes across enabled tactics during warmup; acquire queue/device-scoped scratch before capture; no steady-state malloc/free and no undersized fallback |
@@ -577,7 +577,7 @@ wrappers.
 | `QKVParallelLinear` loader/forward (`qwen3_5.py:279-288`, `qwen3_next.py:252-270,337-387`, `linear.py:942-1050`) | **W3-D immutable component/trace/exact-grid-gated:** unequal-shard scalar unit; packed-one-GEMM versus three logical CUDA outputs (max diff 0); row-strided preamble/cache tests; clean default and `VT_FP4_MERGED_QKV=0` real 27B gates (**235/235 + 16/16 each**); focused sanitizer zero errors. The c16 A/B is 1.005049× mean-positive but strict-fails at 14/20 timing + 2/4 memory. Clean nsys proves **296,674/1,425 = 208.192** graph FP4 GEMMs/forward versus vLLM 208; exact grid completes at 55/124 and remains failed |
 | `tests/kernels/quantization/test_silu_mul_nvfp4_quant.py:16-73` | port BF16/F32-supported local cases as a byte-exact one-input fused-vs-`SiluAndMul(BF16)+ScaledFp4Quant` CUDA test, including decode, padded-M and real `I=17408` shapes; FP16 remains the declared W4 breadth leaf |
 | `tests/compile/passes/test_silu_mul_quant_fusion.py:100-145` | the eager C++ model has no graph-rewrite pass, so gate the equivalent dispatch contract directly: merged true-W4A4 selects one fused producer by default, the env fallback restores two launches, and both preserve 16/16 oracle tokens |
-| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected old-oracle trace puts FP4 kernel time within 0.63% of vLLM. `9cc7191` first completed v0.25 at 54/124 and `def5f75` selected packed QKV; post-pack `3f256ab` now binds at **55/124** and selects norm+FP4 fusion outside this row. Stale disk-version/collision rejection belongs to W3-C |
+| autotuner timing/cache behavior | **W1 ported/gated; W3-A/W3-B classified:** exact 2,048/4,096 bucket-list assertions plus maximum-M all-profile tuning and M32 capture/replay correctness live at `tests/vt/test_ops_nvfp4_fp4.cpp:92-100,882-922`; clean `d7cdf66` exact/legacy CUDA processes each pass 14/14 + 26,819/26,819; model/server prove 80/80 profiles before readiness with zero misses; memcheck passes 24,586/24,586 with zero errors. W3-B's repeated component proves 80 keys are present each startup but only 20 retain one tactic ID across all three. The corrected old-oracle trace puts FP4 kernel time within 0.63% of vLLM. `9cc7191` first completed v0.25 at 54/124 and `def5f75` selected packed QKV; post-pack `3f256ab` now binds at **55/124**. Its apparent norm+FP4 follow-on is refuted by the generated body and separate custom-op call. Stale disk-version/collision rejection belongs to W3-C |
 
 The existing 27B and 35B real-model tests remain mandatory. The 27B test uses
 the longest prefix on which vLLM production and emulation agree; it may not be
@@ -651,7 +651,7 @@ before any new FP4 GPU command begins.
 | W0 | accepted source+trace spike, exact upstream test inventory and before-state | complete in this documentation checkpoint; no runtime result |
 | W1 | exact hybrid bucket identity plus complete key and per-key single-flight/capture-miss contract; `VT_FP4_EXACT_BUCKETS=0` restores the aliased baseline | **measured complete, acceptance fail:** all safety/correctness gates pass; component is positive at c8/c32 but fails c16/memory; exact oracle improves yet remains below every-axis floor. Evidence and hashes are in “W1 measured classification” |
 | W2 | port exact 8-tile x 2-orientation x 2-scheduler template family and high-water workspace; stable forced IDs; mirror merged dense gate/up plus maximum logical-shard CT divisors; port the traced one-input SiLU+NVFP4-quant producer; `VT_FP4_MERGED_SILU_QUANT=0` restores materialized activation+quant, `VT_FP4_MERGED_GATE_UP=0` restores split W2 and `VT_FP4_FULL_TACTICS=0` restores four-candidate W1 | **measured complete, acceptance fail:** implementation/correctness/safety gates are green; clean `b5c6e4f` improves every concurrency and wins c16/c32 total throughput, but exact ratios/axes/memory remain below the strict floor. Trace proves all tactics exist and promotes selection parity to W3 |
-| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. D correctness/A-B/trace/exact grid are complete: c16 1.005049×, strict 14/20 timing +2/4 memory, post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward, and binding `3f256ab` at 55/124. C stays optional; no further W3 lever stacks before the norm+FP4 row |
+| W3 | A: production-FlashInfer eager timing; B: pre-serve all-bucket in-memory warmup; C: optional versioned persistent plan cache; D: trace-promoted full-attention packed QKV resident/one-GEMM/split-view path with `VT_FP4_MERGED_QKV=0` | **ACTIVE** under `CLAIM-NVFP4-SMALL-M-3`. D correctness/A-B/trace/exact grid are complete: c16 1.005049×, strict 14/20 timing +2/4 memory, post-pack 208.192 vs vLLM 208 FP4 GEMMs/forward, and binding `3f256ab` at 55/124. C stays optional; no further W3 lever stacks before body-level residual selection |
 | W4 | FP16 output, SM120 cross-target, permanent evidence/anchors and final row closure | after order-0 BF16 parity; no broad `DONE` until all declared modes/backends are gated |
 
 W1 and W2 are intentionally separate performance iterations. W3 cannot be
@@ -721,8 +721,9 @@ are classified and strict-failed, and W3's corrected old-oracle paired trace is
 clean and structurally classified. At that checkpoint immutable `9cc7191`
 owned the binding c1/2/4/8/16/32 three-repetition v0.25 27B oracle result at
 **54/124** axes, and accepted `def5f75` node tracing selected W3-D packed QKV.
-Post-pack `3f256ab` now supersedes it at 55/124 and selects norm+FP4 fusion
-outside this row. Keep 35B held until all 27B throughput, latency and memory
+Post-pack `3f256ab` now supersedes it at 55/124. Generated-code inspection
+refutes the apparent norm+FP4 fusion, so residual selection is open outside
+this row. Keep 35B held until all 27B throughput, latency and memory
 axes pass.
 
 ### W3-B corrected paired-trace classification (2026-07-12)
@@ -905,7 +906,8 @@ Status / ours Nsight / ours SQLite / ours kernel-summary / vLLM kernel-summary
 SHA-256 are `90350b03…9908` / `6e7e3c6c…b5f9` / `607877d2…65cd` /
 `43ae3507…44ac` / `7988b5ea…08ee`. W3-D remains `ACTIVE`, not `DONE`: its
 component strict-failed and the completed exact grid binds at 55/124. The
-paired trace selects the separate norm+FP4 row; do not run 35B.
+paired trace closes W3-D topology. Generated-body inspection refutes the
+apparent norm+FP4 mismatch; do not run 35B.
 
 ### W3-D fresh exact-grid setup checkpoint (2026-07-12)
 
@@ -930,12 +932,16 @@ memory/cache returns and the paired trace. All **124/124** axes are binding;
 all-runs/ratios/report SHA are `83b3f500…9f8` / `66d7f50e…b4bd` /
 `df3d0539…e4d7`.
 
-The paired trace passes and reconfirms the repaired FP4 topology. It also
-records vLLM's generated fused Add+RMSNorm+FP4-quant families at **127,040
-launches = 80 per 1,588 forwards**, with no equivalent local fused family.
-That residual belongs to `KERNEL-EW-NORM-QUANT`, not W3; it must receive a
-dedicated full-chain spike and same-binary A/B before implementation or speed
-credit. Trace status/ours-Nsight/ours-SQLite/ours-kernel/vLLM-kernel SHA are
+The paired trace passes and reconfirms the repaired FP4 topology. It records
+**127,040 = 80 per 1,588 forwards** kernels whose generated names contain
+`fused_add_rms_norm_scaled_fp4_quant`. Dumping the generated body shows that
+each kernel stops after residual-add + RMSNorm and stores BF16; the wrapper
+then invokes `torch.ops._C.scaled_fp4_quant.out` separately, yielding the
+traced `cvt_fp16_to_fp4`. The oracle config has `fuse_norm_quant: False`.
+Therefore vLLM and ours both use separate norm and FP4-quant launches, and no
+`KERNEL-EW-NORM-QUANT` spike is selected from the trace name. Generated
+graph/subgraph SHA are `d58f81b8…9401` / `466e359a…9dd8`. Residual
+selection is open. Trace status/ours-Nsight/ours-SQLite/ours-kernel/vLLM-kernel SHA are
 `9762c1e6…1d0c6` / `e397289d…8476` / `99cbd04d…93f8` /
 `55a1631a…d2be` / `e4e916d1…565`. GPU, ports and lock exit idle. W3-D stays
 `ACTIVE` because its component and exact every-axis gates fail; 35B remains

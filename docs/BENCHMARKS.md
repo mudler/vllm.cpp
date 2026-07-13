@@ -8,8 +8,8 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-13**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The W3-H1d schema-v4 trace repair is implemented and CPU-gated; a fresh
-immutable DGX run is pending. No newer performance number exists.
+The first schema-v4 DGX run at clean `b9beccd` is **FAILED / VOID** on an
+Nsight capture-range possible-loss diagnostic. It changes no speed number.
 
 ## Binding 27B online gate
 
@@ -56,7 +56,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
-| W3-H1d lossless trace | **ACTIVE — CPU PASS / DGX PENDING** | Schema v4 requires 3 independent sessions × 4 indexed reports, `repeat:4:sync`, device synchronization before stop, grouped/distinct UUIDs, one exact 1,107-kernel replay per report, zero eager work, exact frozen plans, and no severity-2 diagnostic. Focused contracts pass **31/31**; the final CUDA-off suite passes **106/106** | Run from a new pushed SHA and immutable evidence root; all 12 reports must pass before W3-H2 |
+| W3-H1d complete trace | **ACTIVE — LATEST DGX FAILED / VOID** | Clean `b9beccd` passed exact **154/154** build, 27B **1/1** correctness, 64/64 frozen plans, 48/48 ordinary requests, 16/16 probe, FIFO cleanup, and target/Nsight zero exit. Session 1 produced four zero-eager reports with exactly 1,107 kernels + 7 memcpys + 1 memset each, but the strict schema-v4 validator rejected Nsight's severity-2 possible-loss diagnostic and stopped before sessions 2/3 or vLLM | Reproduce that diagnostic on a minimal graph, bind any exception to the pinned tool plus exact event reconciliation, then rerun all 12 reports from a new SHA/root |
 | W3-H2 vectorized BF16→FP4 I/O | **PENDING / NOT IMPLEMENTED** | The scalar implementation remains active; retained traces are diagnostic only | Implement only if W3-H1d produces complete lossless evidence and still selects this residual |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
@@ -64,15 +64,15 @@ authorized until all 124 27B axes pass.
 | Stream-usage serialization | **PENDING / GATING** | CPU and sanitizer contracts pass; native 128-token counts are present in all binding requests | Run its serialization A/B after the model hot path closes |
 | Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
 
-The previous H1 trace attempts through clean `b2c940c` are all **VOID** and are
-intentionally not narrated here. They produced no accepted speed result. The
-latest attempt proved that each isolated report contains one complete graph
-replay and zero eager CUDA rows, but all four reports still carried Nsight's
-severity-2 possible-event-loss diagnostic and the old schema expected one
-combined report. That observation selected schema v4; it did not validate or
-reclassify the old evidence. Exact roots, hashes, and failure causes remain in
-the [parity ledger](../.agents/parity-ledger.md) and
-[state log](../.agents/state.md).
+The current failed trace root is
+`~/work/vllm.cpp-executed-path-refresh-h1d/b9beccdab23d103bcdcb950bae89e78bfeceff15`.
+Report 1 reconciles **1,118 collected events** to 1 profiler start + 1 graph
+launch + 1 device synchronization + 1,115 graph children; reports 2–4 each
+reconcile **1,117** after the first-range-only profiler-start row is removed.
+That establishes structural completeness, but schema v4 still correctly
+failed because its diagnostic policy had not been calibrated. All superseded
+attempt roots and hashes remain only in the [parity ledger](../.agents/parity-ledger.md)
+and [state log](../.agents/state.md).
 
 ## Current component dispositions
 
@@ -115,12 +115,12 @@ test "$rc" -eq 1
 sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ```
 
-## Reproduce the pending W3-H1d trace gate
+## Reproduce the current W3-H1d failure
 
-Use a clean, pushed schema-v4 commit in a new detached DGX source and a new
-SHA-owned root. Plan in an empty evidence directory before copying the frozen
-corpus. The driver owns and records the exact target build and one uncontended
-GPU lock. Never reuse an earlier H1 root.
+The command below is the exact schema-v4 recipe. At `b9beccd` it is expected to
+exit 2 after the first indexed report export because the possible-loss
+diagnostic is still rejected. Use a new SHA-owned root for any repaired retry;
+never append to the failed root.
 
 ```sh
 set -euo pipefail
@@ -171,7 +171,7 @@ export VT_FP4_PRE_SERVE_WARMUP=1
   --vllm-cpp-sha "$SHA"
 ```
 
-Acceptance requires all 12 reports to be lossless, zero-eager, exact-plan,
+Acceptance requires all 12 reports to be complete, zero-eager, exact-plan,
 launch/workload-reconciled, and mutually signature-identical. A valid trace is
 still diagnostic: only a later 48/48 same-binary component gate may authorize
 the exact 27B grid.

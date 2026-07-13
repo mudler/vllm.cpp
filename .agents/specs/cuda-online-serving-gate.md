@@ -1,101 +1,34 @@
 # Spike: CUDA online serving gate
 
 **Row:** `SERVE-GATE-ONLINE` · **state:** accepted; execution is `ACTIVE`.
-The first campaign under `~/work/vllm.cpp-latency/latres` is diagnostic only:
-both vLLM model starts failed and several 35B local arms aborted, so it supplies
-no denominator or release number. The second pre-W2 campaign supplies a complete
-27B diagnostic, but its 35B local arm completed only 1/6 c1 requests before a
-CUDA illegal-memory-access abort. Its vLLM arm completed the greedy ladder and
-default c1, then hung for more than 60 minutes in default c16/np96 rep1 with 16
-open sockets and no log progress. The owned campaign was snapshotted/hashed at
-DGX `latres2/diagnostic-vllm35-hang-20260711T0734CEST`, terminated, and released
-the GPU lock. Neither pre-W2 campaign is gate evidence.
+## Current binding checkpoint
 
-The post-W2 `31d053f` 27B grid completed 2,016 exact-count requests and all
-memory-return checks, but its 0.926–0.961× ratios remain void. The repeated ours
-trace became a prefix-cache hit while vLLM caching was off; the profiler also
-preloaded all prompts, used max-seqs 16, and forced max model length 1152 rather
-than the production contract. `ed6247d` subsequently captured a complete exact
-vLLM c16/48 trace (kernel summary SHA-256 `8213…df64`), but it has no comparable
-ours arm. The historical offline denominators are also reopened: pinned
-`vllm bench throughput` used temperature 1 while ours used temperature 0, and
-the 27B budgets were 8192 versus 2048.
+The executable oracle is pip vLLM **0.25.0** at tag commit
+`702f4814fe54fabff350d43cb753ae3e47c0c276` with FlashInfer 0.6.13.
+Immutable vllm.cpp `3f256abdbb558e162bf8a2196284deb119648560`
+completed the Qwen3.6-27B model gate, all 36 cache-off groups / 2,016 requests,
+six memory returns, paired node-level traces, and all 124 required axes. It is
+**FAILED / open at 55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
+**0.993504 / 0.954464 / 0.966438 / 0.980678 / 1.027889 / 1.039417×**; host
+PSS/RSS remain red. W3-E/W3-F/W3-G strict-failed their same-binary components
+and earn no speed credit. This result remains the only binding performance
+number, and no 35B performance command is authorized.
 
-The 2026-07-12 vLLM release audit invalidates every old-oracle denominator.
-Clean `b5c6e4f` remains useful historical W1/W2/W3 diagnosis, but it executed
-vLLM 0.24.0 with FlashInfer 0.6.12 while the source pin and v0.25.0 target use
-0.6.13. Its c1→c32 totals
-0.9933/0.9520/0.9657/0.9760/1.0213/1.0218× and all latency/memory ratios are
-non-binding. The replacement clean `3cc490c` campaign was deliberately stopped
-and is **VOID** at 28/36 groups, 1,602/2,016 requests, four memory returns and
-no paired trace; no partial rate is reusable. Its owned process group exited
-and the GPU/ports/lock returned idle.
+The active W3-H trace-first refresh is diagnostic only. Clean schema-v4
+`b9beccdab23d103bcdcb950bae89e78bfeceff15` passed exact **154/154** build,
+27B **1/1** correctness, the frozen 64-plan control, 48/48 ordinary requests,
+16/16 probe, FIFO cleanup, and target/Nsight zero exit. Its first session wrote
+four reports, each with one launch, **1,107 graph kernels + 7 memcpys + 1
+memset**, and zero eager CUDA rows. The strict validator rejected Nsight's
+severity-2 possible-loss diagnostic and stopped before sessions 2/3 or vLLM,
+so the root is **FAILED / VOID** and changes no ratio. Collected-event counters
+exactly reconcile to the visible runtime and graph activities; a pinned-tool
+minimal-graph calibration is now required before any narrowly conditional
+classification.
 
-The executable benchmark contract now pins pip vLLM 0.25.0 at tag commit
-`702f481`, with FlashInfer 0.6.13. The isolated staging environment has passed
-package/version/import/CLI checks except for a documented NVIDIA
-cuSPARSELt-wheel tag defect: PyPI supplied the correct aarch64 binary and direct
-load succeeds, while the wheel's internal `manylinux2014_sbsa` tag makes
-`pip check` report unsupported. A lock-held real 27B production-graph offline
-smoke loads the 24.57-GiB checkpoint, compiles, autotunes FlashInfer, captures
-graphs and completes exact 16-input/1-output counts; its cold rate is not a
-benchmark. Clean server smoke and atomic oracle-path activation also pass.
-
-The first v0.25 replacement campaign was immutable clean `9cc7191`, with source/build at
-`~/work/vllm.cpp-online-gate/checkpoints/9cc71918dbdc10f014c02feb9bab1d00963a16fe`
-and evidence at the matching `evidence/` path. Plan/oracle/build-log/source-
-corpus/vLLM-corpus SHA-256 are `5a04cdcf…b2`, `6d39cb90…10c`,
-`10786029…6a`, `41bd634a…7a` and `b048d789…5dc`; server/model-gate binaries
-are `ffddab5f…bd` / `a24fc776…37`. The first no-GPU metadata recorder command
-failed before output because direct script invocation omitted the repository
-module path. Its corrected `python -m tools.bench.online_gate` invocation,
-plan validation, exact-source check, corpus conversion and fresh sm_121a build
-pass. One uncontended model-wide lock then covered the passing model gate, all
-36 cache-off groups/2,016 requests, six memory returns and the first paired trace. All
-12 performance groups, both memory groups and all 124 axes are binding-eligible;
-**54 pass and 70 fail**. Median total ratios c1→c32 are
-**0.9901/0.9491/0.9633/0.9770/1.0288/1.0467×**; host PSS/RSS normalize to
-**0.5855/0.5934×**. The exact 27B gate therefore remains `ACTIVE` with a
-**FAILED/open** performance disposition. Every throughput, latency and memory
-axis must pass before any 35B performance run.
-
-Immutable post-pack `3f256ab` supersedes that denominator: all 36 groups,
-2,016 requests, six returns, paired node-level traces and 124 axes validate,
-but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
-**0.993504/0.954464/0.966438/0.980678/1.027889/1.039417×**; host PSS/RSS
-remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
-earns speed credit. The current W3-H trace-first refresh requires three
-lossless exact-plan captures before the W3-H2 kernel. H1a/H1b/H1c and clean
-H1d attempts through `b2c940c` are void. `b2c940c` completed the exact
-**154/154** build, passed the 27B gate **1/1 in 17.30 s**, completed 48/48 plus
-16/16 clients and proved FIFO graceful stop/removal with target and Nsight exit
-zero. Nsight emitted four indexed reports rather than schema v3's one combined
-report, so the driver stopped before captures 2/3 or vLLM. Read-only exports
-show each report contains exactly one launch, 1,107 graph kernels, seven graph
-memcpys, one graph memset and zero eager CUDA rows. All four nevertheless emit
-severity-2 possible event loss. The revised contract keeps that rejection
-strict and binds three sessions x four reports under schema v4, with
-`repeat:4:sync` plus a device synchronization before every stop. That repair
-is implemented and CPU-gated; a fresh pushed SHA/root must now prove it on the
-DGX. No exact rerun result or 35B performance command is authorized.
-
-The model-scoped all-runs / ratios / report SHA-256 are
-`c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
-`231ec9fd72226036f224563b1731c2c048056e9b73330b420e6ba98358167591`
-and `445e2d9be160733df6bca9b132a0c8002e229176300af8b1e9610acc3e685692`.
-Trace status / ours kernel summary / vLLM kernel summary are
-`f38b149d…d17`, `8bba1bb1…8f4` and `80999085…d2`. Generated-text and ours
-trace-output repeatability remain explicit diagnostics behind the passing
-commit-bound 16/16 gate and exact native 128-token request counts.
-
-That first trace passed the original token/lifecycle contract but is not valid
-for kernel attribution. Its Nsight command omitted `--cuda-graph-trace=node`;
-CUDA 13 therefore defaulted to whole-graph mode. The exported SQLite contains
-246,786 ordinary kernel rows / 101.832 s plus 1,226 graph activities / 154.978 s,
-but zero graph-node kernel rows, while vLLM's torch profiler expands nodes.
-Command/report SHA are `f1d4cde3…2f49` / `35fc9c4e…ad5`. The timing/memory
-grid remains accepted; actual kernel ranking is `PENDING` a fresh node-level
-paired recapture.
+Superseded campaign narratives are intentionally absent from this live spec.
+Their exact roots, hashes, and dispositions remain in the append-only state and
+parity-ledger records. The requirements below are the complete current gate.
 
 ## Scope
 
@@ -291,10 +224,11 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H's repeated-range attempt at `b2c940c` is void;
-   its schema-v4 three-session x four-report contract and synchronous flush are
-   implemented and CPU-gated; execute a fresh exact-target `--trace-only`
-   checkpoint. 35B remains gated.
+   attribution is complete. W3-H schema-v4 `b9beccd` is void after session 1:
+   all four target reports are complete and zero-eager, but Nsight emits the
+   possible-loss capture-range diagnostic. Calibrate and reconcile that pinned
+   tool behavior, then execute a fresh 12-report `--trace-only` checkpoint.
+   35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a

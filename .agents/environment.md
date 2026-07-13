@@ -80,27 +80,16 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- All old-oracle throughput baselines are non-binding after sampling,
-  token-budget and dependency drift audits. `b5c6e4f` is historical vLLM
-  0.24.0/FlashInfer 0.6.12 evidence; `3cc490c` is VOID at 28/36 groups,
-  1,602/2,016 requests, four returns and no trace. Binding immutable `3f256ab`
-  v0.25.0 evidence completes the exact 27B cache-off grid under one lock:
-  **55/124 axes pass, 69 fail**. W3-E/W3-F/W3-G strict-fail their components.
-  W3-H's exact-target H1d refresh is next: H1a/H1b/H1c and H1d attempts
-  through `b2c940c` are void. The latest exact 154-target build and 27B gate
-  pass, 48/48 + 16/16 clients complete, the frozen plans/FIFO are exact and
-  target/Nsight exit zero. Four indexed reports each contain one complete
-  1,107-kernel replay and zero eager CUDA rows, but all emit severity-2 possible
-  loss and schema v3 expects one combined report. The accepted repair is schema
-  v4 over three sessions x four reports plus synchronous generation/device
-  flush; it is implemented and CPU-gated, and fresh immutable DGX execution is
-  next. It still enforces
-  plan-first evidence, exact
-  Triton-AOT/FA2/CUTLASS/toolchain configuration, its own recorded target build
-  and actual `nsys -> nsys-launcher -> target-session` ancestry plus a
-  diagnostic-only FIFO graceful stop, FIFO removal, zero exit and zero eager
-  rows. Require three lossless exact-plan captures before implementing the
-  next lever, then close all 69 failed axes before any 35B performance run.
+- Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
+  27B cache-off grid at **55/124 axes pass, 69 fail**; W3-E/W3-F/W3-G
+  strict-fail and earn no speed credit. W3-H clean schema-v4 `b9beccd` passes
+  exact build/gate/plans/clients/FIFO/zero-exit and produces four complete
+  zero-eager reports, but strict validation rejects pinned Nsight's
+  possible-loss capture-range diagnostic before sessions 2/3 or vLLM. The run
+  is VOID. Calibrate it with a minimal graph and preserve exact event counters,
+  completion synchronization, model topology, toolchain/build provenance,
+  actual launcher ancestry, FIFO cleanup, and cross-report identity before a
+  fresh 12-report run. Close all 69 failed axes before 35B performance.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

@@ -9,9 +9,11 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The active W3-H trace gate is implemented and CPU-gated, but fresh immutable
-> DGX evidence is pending. No W3-H speed credit or 35B performance result is
-> claimed. See [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
+> The latest W3-H schema-v4 DGX trace failed closed on an Nsight capture-range
+> diagnostic and is **VOID**. Its reports contain the complete target graph,
+> but the diagnostic must be independently classified before the trace can
+> bind. No W3-H speed credit or 35B performance result is claimed. See
+> [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
 
@@ -21,7 +23,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the lossless W3-H trace, gate the selected repair, then rerun all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | Schema v4 is CPU-green: 3 profiler sessions × 4 indexed reports, synchronous result generation, device flush, exact-plan and zero-eager validation | Execute a fresh immutable DGX trace; W3-H2 implementation remains prohibited until it passes |
+| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | Clean `b9beccd` passed build, correctness, plans, clients, and one four-report session; it failed closed on Nsight's possible-loss diagnostic and is **VOID** | Calibrate the diagnostic on a minimal graph, repair the evidence rule without weakening graph completeness, then rerun all 12 reports |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -120,7 +122,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; schema-v4 W3-H trace is CPU-green and DGX-pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the latest W3-H DGX trace is void on an unresolved Nsight capture-range diagnostic |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -147,7 +149,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; W3-H trace evidence is pending and no new speed credit is claimed |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; the latest W3-H trace is void and no new speed credit is claimed |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -170,7 +172,7 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: lossless W3-H trace → selected component
+The next execution order is fixed: calibrated, complete W3-H trace → selected component
 gate → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.
@@ -192,9 +194,9 @@ The canonical project record lives under [`.agents/`](.agents/), indexed by
 - [upstream sync protocol](.agents/upstream-sync.md) and
   [v0.25.0 audit](.agents/sync/2026-07-12-702f481.md)
 
-The README and benchmark scoreboard are current-state snapshots, not
-chronological logs. Git history, the parity ledger, state log, and feature
-specs retain the detailed attempt record.
+The README, benchmark scoreboard, roadmap, matrices, and live specs are compact
+current-state surfaces, not chronological logs. Git history plus the
+append-only parity ledger and state log retain detailed attempt evidence.
 
 ## License
 

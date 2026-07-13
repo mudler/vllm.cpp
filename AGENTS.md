@@ -56,6 +56,17 @@ to cite it for current work, the relevant content belongs (summarized) in a
 live doc. Rationale: a reader of `.agents/` should see exactly what bears on
 what we are doing NOW, nothing stale mixed in.
 
+**Periodic live-document compaction (user-directed 2026-07-13).** At every
+feature/iteration checkpoint, and whenever a live narrative accumulates more
+than one superseded attempt block, rewrite it to the current binding result,
+the constraints learned, the active lifecycle state, and the next gate. Do not
+copy run-by-run chronology into README, BENCHMARKS, roadmap, matrices, or live
+spec introductions. Closed narrative that still has reference value moves to
+`.agents/completed/`; otherwise Git plus the append-only `state.md` and
+`parity-ledger.md` are the historical record. Never rewrite or truncate those
+two append-only files. Compaction must preserve every current requirement and
+evidence anchor; it removes duplicated history, not auditability.
+
 **Spec/scoping location.** All feature-specific implementation specs, scoping
 reports, semantics notes, feasibility studies, and design references live under
 `.agents/specs/`, never at the `.agents/` top level. The top level is reserved

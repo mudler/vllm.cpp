@@ -7243,3 +7243,45 @@ four and three distinct session UUIDs. The next implementation also uses
 `repeat:4:sync` and performs diagnostic-only device synchronization before
 every profiler stop. Immutable `3f256ab` remains **55/124 pass, 69 fail**;
 W3-H2, exact-grid and 35B performance remain prohibited.
+
+## 2026-07-13 — first schema-v4 H1d execution fails closed on Nsight capture-range diagnostic
+
+Clean pushed `b9beccdab23d103bcdcb950bae89e78bfeceff15` executed from
+immutable root
+`~/work/vllm.cpp-executed-path-refresh-h1d/b9beccdab23d103bcdcb950bae89e78bfeceff15`.
+Plan-first setup, the frozen binding corpus, exact GCC 13.3 / CUDA 13.0.88
+`RelWithDebInfo` Triton-AOT/FA2/external-CUTLASS/sm_121a configuration, and
+the recorded **154/154** build passed. The mandatory 27B model gate passed
+**1/1 in 17.51 s**. Configure/build/model-gate/server SHA-256 are
+`4204bf00…000f` / `40a0d6a7…b33` / `e2f50bac…95e` / `0d97e087…3ec`.
+
+Profiler session 1 loaded the exact read-only **64/64** FP4 plan map with zero
+tuning/misses and no native target. The ordinary client completed **48/48 in
+66.764586 s**, the diagnostic probe completed **16/16 in 26.370180 s**, and
+the controller recorded `prior_replays=484` / `captured_replays=4`. FIFO
+ready/requested/completed, FIFO removal, and target/Nsight zero exits passed.
+Profile/command/control SHA are `958e7e90…a99` / `20dd0a5b…97f` /
+`e493e7b0…95d`; the selected-plan SHA remains `f2d9be7f…1fa4`.
+
+Nsight wrote four synchronous reports. Their sizes / SHA-256 are **290,282** /
+`9a8c7009…96d`, **280,165** / `f6e69a9b…d76`, **279,929** /
+`46cbfeeb…c3d`, and **280,051** / `fa4210f6…6b8d`. Read-only diagnostic
+exports show every report contains exactly one `cudaGraphLaunch`, **1,107
+graph kernels, 7 graph memcpys, 1 graph memset, zero eager CUDA rows**, one
+successful device synchronization, and two synchronization activity rows.
+All four share UUID `22172b06-07f9-43bc-af18-6a74a2f5562e`. Report 1 has the
+one visible `cuProfilerStart` and records 1,118 collected / 1,129 produced
+events; reports 2–4 record 1,117 / 1,125. The collected counters exactly equal
+the visible runtime rows plus all graph children.
+
+Every report nevertheless carries severity-2 `Not all CUDA events might have
+been collected.` Schema v4 rejects it, so the driver stopped during report 1
+export before profiler sessions 2/3 or vLLM and returned 2. The root is
+**FAILED / VOID**, never reused, and changes no accepted speed number. GPU and
+`/tmp/gpu` returned idle. The selected next check is a model-free one-node CUDA
+graph calibration across repeat/synchronous/reset modes on the pinned Nsight
+2025.3.2.474. Any resulting diagnostic classification must remain conditional
+on exact event counts, completion synchronization, model-family topology,
+zero eager work, and cross-report identity. Immutable `3f256ab` remains
+**55/124 pass, 69 fail**; W3-H2, exact-grid, and 35B performance remain
+prohibited.

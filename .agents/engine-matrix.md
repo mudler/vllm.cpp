@@ -13,44 +13,16 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
-Current `SERVE-GATE-ONLINE` H1d substage: the diagnostic-only SIGUSR2/four-
-replay controller, exact CUTLASS/configure/compile/binary manifest and schema-v3
-ours/vLLM validators are implemented and CPU-gated. Clean `b2c940c` exposed
-that Nsight emits four indexed reports per `repeat:4` session and that every
-report still carries severity-2 possible loss. Schema v4 over three sessions x
-four reports with synchronous result generation and device flush is now
-implemented and CPU-gated; the fresh immutable DGX execution is pending.
-Earlier clean `7bae38a`/`2d16c68` failed before build/GPU as
-login `PATH` omitted Ninja and then `nvcc`. Clean `5f8fab1` built but failed
-the 27B gate identically with profile control on/off because its recipe omitted
-the binding Triton-AOT path and used `Release`. The replacement preflight binds
-`RelWithDebInfo`, Triton-AOT/FA2/CUTLASS and both exact tools. No performance
-ratio or support state changes. Clean `d063f20` is additionally void before
-plan/build/GPU because corpus was seeded before dry-run; the next recipe is
-explicitly plan-first. Clean `b1c7eb6` passed that configuration but failed
-before build/GPU because the driver required the server executable before its
-own build; executable validation now follows the recorded target build. Clean
-`e1acb75` then completed the exact **154/154** build and passed the 27B gate
-**1/1 in 17.42 s**, but the trace stopped before its workload/report because
-the target was incorrectly required to share `nsys`'s process group. The
-driver now records the actual `nsys -> nsys-launcher -> separate target
-session` ancestry and owns cleanup of both sessions. That root is void. Clean
-`a96e899` repeated the exact build, passed the 27B gate in 16.85 s, completed
-48/48 + 16/16 clients and closed four replays, but SIGTERM made Nsight return
-143 before validation. Clean `3c1d7b7` then passed the exact build/gate,
-clients and four-replay close but SIGUSR1 terminated the target and made Nsight
-return 138. Both roots are void. The diagnostic-only repair now uses a
-per-capture FIFO, calls graceful `stop()` and requires its exact lifecycle,
-removal and zero profiler exit.
-Clean `219f4f2` proves that FIFO/zero-exit repair but is void because its
-continuous range captures three eager sampler/input gaps and emits severity-2
-possible loss. Clean `b2c940c` then proves the repeated-range boundary: each of
-four indexed reports contains one complete 1,107-kernel graph replay and zero
-eager CUDA rows. It is also void because every report retains severity-2
-possible loss and schema v3 expects one combined report. The accepted
-schema-v4 3-session x 4-report contract, synchronous generation and device
-flush are implemented and CPU-gated; fresh DGX evidence is pending and no
-ratio or support state changes.
+Current `SERVE-GATE-ONLINE` H1d substage: clean schema-v4 `b9beccd`
+passes exact build, 27B correctness, the frozen plan map, clients, FIFO/zero
+exit, and four indexed reports containing one complete 1,107-kernel graph
+replay with zero eager rows. Pinned Nsight still emits its possible-loss
+capture-range diagnostic, so the run stops before sessions 2/3 or vLLM and is
+**VOID**. Calibrate that diagnostic on a minimal graph and require exact
+runtime/activity/completion/topology reconciliation before a fresh 12-report
+run. The binding result remains `3f256ab` at **55/124**; production code,
+support state, and performance ratios are unchanged. Detailed attempt
+chronology remains only in the append-only state/ledger record.
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -185,7 +157,7 @@ claims it.
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI (17 exported symbols; blocking and nonblocking request handles) | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143,181,207`; `src/capi/vllm_c.cpp:229,264,327,391` | `tests/capi/test_capi.cpp:320,428,505,574,606,640`; `tests/capi/test_dlopen.cpp:77,86`; `tests/capi/c_header_compile.c:1` | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries + explicit scheduler-capacity flags `examples/server/main.cpp:63,96,116,170`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | server help contract `examples/CMakeLists.txt:34`; benchmark `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
-| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); FA2 dispatch `vllm/v1/attention/backends/flash_attn.py:674-721,935-977`; normal FP4 producer `csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu:38-107,178-250`; cache lifecycle `kernel_warmup.py:133-213`; `tests/benchmarks/test_serve_cli.py:1` | Current serving/production inference remains unchanged. W3-G anchors remain. H1d adds the trace-only [controller API](../include/vt/cuda/cuda_profiler_control.h), [four-replay backend control](../src/vt/cuda/cuda_backend.cu), [dense eligibility](../src/vllm/model_executor/models/qwen3_5.cpp), diagnostic [graceful stop](../examples/server/main.cpp), exact [driver](../scripts/dgx-online-serving.sh), [schema-v4 validator](../tools/bench/online_gate.py), [reconstruction gate](../tools/bench/online_gate_summary.py) and ported [client](../tests/tools/test_online_gate_client.py)/[summary](../tests/tools/test_online_gate_summary.py) contracts; production builds compile out both diagnostic controls | Immutable `3f256ab` remains **55/124**. W3-E/W3-F/W3-G strict-fail and earn no speed credit. W3-H1a/H1b/H1c and H1d attempts through `b2c940c` are `VOID`. `b2c940c` proves exact build/gate, clients, frozen plans, FIFO lifecycle/removal and target/Nsight zero exit. Its four reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all emit severity-2 possible loss and schema v3 expects one combined report. Schema v4 now implements and CPU-gates three sessions x four indexed reports with synchronous generation/device flush, grouped UUIDs and identical-node validation; fresh DGX evidence is pending. Any new ratio, W3-H2, exact-grid and 35B performance remain blocked | [online serving gate](specs/cuda-online-serving-gate.md); [W3-C spike](specs/nvfp4-persistent-plan-cache.md); [W3-F spike](specs/nvfp4-device-alpha.md); [W3-G FA2 decode spike](specs/fa2-gqa-split-kv-decode.md); [W3-H normal-producer spike](specs/nvfp4-bf16-producer-vectorization.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
+| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); FA2 dispatch `vllm/v1/attention/backends/flash_attn.py:674-721,935-977`; normal FP4 producer `csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu:38-107,178-250`; cache lifecycle `kernel_warmup.py:133-213`; `tests/benchmarks/test_serve_cli.py:1` | Current serving/production inference remains unchanged. W3-G anchors remain. H1d adds the trace-only [controller API](../include/vt/cuda/cuda_profiler_control.h), [four-replay backend control](../src/vt/cuda/cuda_backend.cu), [dense eligibility](../src/vllm/model_executor/models/qwen3_5.cpp), diagnostic [graceful stop](../examples/server/main.cpp), exact [driver](../scripts/dgx-online-serving.sh), [schema-v4 validator](../tools/bench/online_gate.py), [reconstruction gate](../tools/bench/online_gate_summary.py) and ported [client](../tests/tools/test_online_gate_client.py)/[summary](../tests/tools/test_online_gate_summary.py) contracts; production builds compile out both diagnostic controls | Immutable `3f256ab` remains **55/124**; W3-E/W3-F/W3-G earn no speed credit. Clean schema-v4 `b9beccd` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, 48/48 + 16/16 clients, FIFO removal, zero exits, and four complete zero-eager single-replay reports. The strict validator rejects pinned Nsight's possible-loss capture-range diagnostic and stops before sessions 2/3 or vLLM, so the run is VOID. Calibrate that diagnostic with a minimal graph and require exact event/completion/model-topology reconciliation before a fresh 12-report run. W3-H2, any new ratio, the exact grid, and 35B performance remain blocked | [online serving gate](specs/cuda-online-serving-gate.md); [W3-C spike](specs/nvfp4-persistent-plan-cache.md); [W3-F spike](specs/nvfp4-device-alpha.md); [W3-G FA2 decode spike](specs/fa2-gqa-split-kv-decode.md); [W3-H normal-producer spike](specs/nvfp4-bf16-producer-vectorization.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |

@@ -1,12 +1,10 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID;
-the latest proves four isolated reports each contain exactly one complete
-1,107-kernel graph replay and zero eager CUDA work, but every report emits
-severity-2 possible event loss and the schema-v3 harness incorrectly expects
-one combined report; schema v4 now implements and CPU-gates the 3-session x
-4-report contract, synchronous result generation and device-wide stop flush,
-but fresh immutable DGX evidence is pending and W3-H2 remains prohibited**
+Status: **ACTIVE — clean schema-v4 `b9beccd` is FAILED / VOID after its first
+four-report session: build, correctness, frozen plans, clients, FIFO/zero-exit,
+complete 1,107-kernel replays and zero-eager checks pass, but pinned Nsight
+emits the possible-loss capture-range diagnostic; calibrate and reconcile that
+tool diagnostic before a fresh 12-report run; W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -20,184 +18,41 @@ the **normal** BF16 activation-to-NVFP4 producer used by the 27B direct-swizzled
 CUTLASS W4A4 path. The separate fused SiLU producer, FP4 GEMMs, GDN, attention,
 scheduler and host-weight lifetime are excluded.
 
-H1 has now completed two paired attempts from immutable `5d8af792`, but neither
-is binding. H1a used a writable native tactic cache and changed 37/64 selected
-plans. H1b restored the exact read-only 64-plan fixture and completed every
-workload/lifecycle arm, but Nsight reported dropped CUDA events and the dominant
-graph had uneven node replay counts. Immutable H1c at `d1f8e33` then passed
-the 27B model gate in 19.20 seconds and completed 48/48 capture-1 requests, but
-Nsight emitted severity-2 `Not all CUDA events might have been collected`
-after reporting 818,537 collected CUDA events. The fail-closed driver stopped
-before captures 2/3 and vLLM. A build-provenance audit found an independent
-fatal confound: the detached source lacked CUTLASS, CMake disabled
-`VT_CUTLASS_NVFP4`, and the trace executed 146,661 naive plus 10,944 WMMA FP4
-GEMMs instead of the target path. Its retained process log therefore has zero
-plan lifecycle/selection records. No runtime implementation or speed credit
-follows from any of the three void traces.
+## Current H1 trace checkpoint
 
-The first clean H1d setup at pushed `7bae38a` also failed closed before build
-or GPU: CMake could not locate Ninja in the DGX login environment. Configure
-log SHA-256 is `ac9e4854…f616`; no model, lock or profiler ran. Its root remains
-immutable/void. The replacement recipe names the oracle environment's pinned
-`ninja` by absolute path and requires a new clean pushed SHA.
+All H1a/H1b/H1c and pre-`b9beccd` H1d attempts are **VOID**. Their exact
+roots, hashes, failure causes, and the constraints each added are retained in
+`.agents/state.md` and `.agents/parity-ledger.md`; they are intentionally not
+repeated in this live spec. The resulting active contract keeps the exact
+RelWithDebInfo Triton-AOT/FA2/external-CUTLASS/sm_121a build, 27B correctness
+gate, read-only 64-plan fixture, real Nsight launcher ancestry, FIFO shutdown,
+zero target/profiler exit, and four isolated graph-replay ranges.
 
-Clean replacement `2d16c68` found pinned Ninja but then stopped at CUDA
-compiler discovery because login `PATH` also omits `nvcc`. Configure SHA-256 is
-`378fdd7a…4c3c`; it too ran no build/model/lock/GPU/profiler and remains void.
-The next manifest/recipe pins `/usr/local/cuda-13.0/bin/nvcc` at CUDA 13.0.88
-and hashes the 24,513,032-byte compiler (`fbb111f0…79e1`) before GPU work.
-
-Clean `5f8fab1` then configured and built the CUTLASS target, but its mandatory
-27B gate failed deterministically before capture: profile control ON failed
-3/3 and a same-source profile-control-OFF build failed 2/2 with the same token
-8 divergence. A retained `ae9e8ff` binary still passes the gate. The observer
-is therefore exonerated; the attempted build was not the binding execution
-path. It omitted `VLLM_CPP_TRITON=ON` and used `Release`, whereas accepted
-`3f256ab`/`ae9e8ff` use vendored Triton-AOT with regeneration disabled and
-`RelWithDebInfo`. H1d now preflights those settings plus FA2, CUTLASS and exact
-toolchain artifacts before acquiring `/tmp/gpu`. No trace or performance
-evidence follows from `5f8fab1`.
-
-Clean `d063f20` then failed even earlier: the frozen corpus was copied into the
-SHA evidence directory before `--dry-run`, whose anti-mixing guard rejected
-the non-empty directory with exit 2. No manifest, configure, build, model,
-lock or GPU command ran. Failure-log SHA is `b16476f0…de87`. That root is
-retained/void. The reproduction order is now part of G0: generate the dry-run
-plan in an empty evidence root first, then copy the frozen corpus, then
-configure/build/execute.
-
-Clean `b1c7eb6` followed that ordering and passed exact `RelWithDebInfo`,
-Triton-AOT/FA2/CUTLASS and toolchain configuration. The trace driver then
-stopped before its build because it required an existing `examples/server`
-before reaching its own provenance-recorded `server` +
-`test_qwen27_paged_engine` build. Plan/configure/corpus/driver SHA are
-`2b231695…d53` / `0d434a1e…b50` / `b048d789…5dc` / `f24c01c6…6e0a`.
-No execution manifest, compile, model, lock, GPU command or profiler ran; the
-root remains void. H1d now preflights only a configured CMake tree, performs
-the exact recorded build, and requires the executable afterward.
-
-Clean `e1acb75` is the first valid-path H1d attempt to reach profiling. The
-recorded build completed **154/154**, schema-v2 provenance proved the exact
-`RelWithDebInfo` Triton-AOT/FA2/CUTLASS/sm_121a path, and
-`test_qwen27_paged_engine` passed **1/1 in 17.42 s**. The profiled target loaded
-the read-only 64-plan map and emitted its ready marker, then the driver rejected
-it before the ordinary 48-request trace workload because it required
-`server_pgid == nsys_pid`. Nsight 2025.3.2.474 actually creates
-`nsys -> nsys-launcher -> target`, and makes the target a separate session
-leader (`server_pgid == server_sid == server_pid`). No report, SQLite, status
-or vLLM trace exists; the root is void. Driver/profile-log SHA are
-`27f39c95…b053` / `84c68501…3fc`. H1d now validates and records the complete
-PID/PPID/PGID/SID ancestry, requires `nsys-launcher`, and separately owns
-target-session and profiler-session cleanup. The focused suite passes **29/29**.
-
-Clean `a96e899` then repeated the exact **154/154** build and passed the 27B
-gate **1/1 in 16.85 s**. Capture 1 validated that ancestry, completed 48/48
-ordinary requests plus a 16/16 probe and logged one exact four-replay window
-after 484 prior replays. Nsight wrote a 394,304-byte report, SHA
-`0f8c5c24…503`, but the driver terminated the target session with SIGTERM and
-Nsight propagated exit 143. No SQLite, accepted validation, captures 2/3 or
-vLLM trace exists. Driver/profile-log/command SHA are `04cd5d5f…930` /
-`08fefb5a…360` / `516466ba…022`; every client rate is diagnostic only. The
-root is void and never reused. The next repair blocked SIGUSR1 before engine
-workers, consumed it in a diagnostic-only `sigwait` thread and retained
-profiler exit zero.
-
-Clean `3c1d7b7` exercised that repair from a new immutable root. The exact
-**154/154** build passed, as did the 27B gate **1/1 in 16.83 s**, ordinary
-**48/48** client in 66.803863 s, **16/16** probe in 23.780080 s and one exact
-four-replay window after 483 prior replays. Nsight wrote a 448,789-byte report,
-SHA `4cc9deef…0c1`. Process-directed SIGUSR1 nevertheless terminated the
-target before requested/completed lifecycle markers and propagated Nsight exit
-138. No SQLite, accepted validation, captures 2/3 or vLLM trace exists.
-Driver/profile/command/client/probe SHA are `3e936aa8…030` /
-`62c773f5…bc9` / `b9f0c465…c3f` / `4f37de0a…184` /
-`7d94fd6b…78f`. The root is void and never reused.
-
-H1d now creates a per-capture mode-0600 named FIFO. The diagnostic target opens
-and validates it read-only; the driver writes one `Q` only after the exact
-four-replay stop marker; the target calls thread-safe `ApiServer::stop()`.
-Evidence requires ready/requested/completed FIFO markers, FIFO removal and
-profiler exit zero. SIGTERM/KILL remain failure cleanup only. Focused harness
-tests pass **31/31**; Python/shell and diagnostic-macro syntax plus the
-CUDA-off server build pass. Two full CUDA-off runs are **105/106** only because
-the unrelated timing-sensitive C API early-stop test fails; it passes alone.
-
-Clean `219f4f2` exercised that FIFO repair from a new immutable root. The exact
-**154/154** build and 27B gate **1/1 in 17.22 s** passed. Capture 1 completed
-the ordinary **48/48** client in 66.910178 s and the **16/16** probe in
-23.824916 s after 484 prior replays. The FIFO ready/requested/completed
-lifecycle, removal, target exit zero and Nsight exit zero all passed. The
-395,367-byte report and 2,068,480-byte SQLite have SHA `6b8667c7…161` and
-`da637485…0c`; the validator still rejected severity-2 `Not all CUDA events
-might have been collected.` and stopped before captures 2/3 or vLLM.
-
-Read-only SQL localizes the contract error without relaxing it. All intended
-children exist exactly: four `cudaGraphLaunch` rows, **1,107 kernel + 7 memcpy
-+ 1 memset nodes x4**, uniform replay counts, and exact 208/144/64/48/16/16
-tracked family cardinalities. The continuous range also contains the three
-between-replay sample/input-build gaps: **9 eager kernels, 9 eager memcpys and
-3 eager memsets** (`ArgmaxPartial`, `ArgmaxFinal`, token D2H/input H2D and
-`EmbeddingKernel`). The root is void and never reused. H1d is therefore
-revised to four synchronized single-replay CUDA-profiler ranges under Nsight
-`--capture-range-end=repeat:4`; sampler/input work must execute between ranges
-and remain absent from SQLite. The severity and zero-eager checks stay strict.
-
-The repeated-range repair is implemented in the diagnostic-only backend and
-driver. Every eligible replay now executes `cudaProfilerStart` → one
-`cudaGraphLaunch` → stream synchronize → `cudaProfilerStop`; Nsight honors
-exactly four ranges through `repeat:4`. Trace schema v3 additionally requires
-four unique successful `cuProfilerStart` runtime rows in launch order. The
-ported client/summary/trace contracts pass **31/31**; Python and shell syntax,
-ShellCheck and the CUDA-off server build pass. This is local structural
-evidence only: a new pushed SHA/root and all three DGX captures remain pending.
-
-Clean pushed `b2c940cef40ac3d0852352d81ac5ca4448a213e5` exercised that
-repair from immutable root
-`~/work/vllm.cpp-executed-path-refresh-h1d/b2c940cef40ac3d0852352d81ac5ca4448a213e5`.
-The exact **154/154** build and 27B gate **1/1 in 17.30 s** passed. Capture 1
-completed the ordinary **48/48** workload in 67.123513 s and the **16/16**
-probe in 26.511322 s, then recorded `prior_replays=483` and
-`captured_replays=4`. The frozen plan, FIFO lifecycle/removal and target/Nsight
+Clean pushed `b9beccdab23d103bcdcb950bae89e78bfeceff15` is the first
+schema-v4 execution. Its immutable root is
+`~/work/vllm.cpp-executed-path-refresh-h1d/b9beccdab23d103bcdcb950bae89e78bfeceff15`.
+The exact build completed **154/154**, the 27B gate passed **1/1 in 17.51 s**,
+the frozen plan map loaded **64/64** with zero tuning/misses, the ordinary
+client completed **48/48 in 66.764586 s**, and the probe completed **16/16 in
+26.370180 s**. FIFO ready/requested/completed, FIFO removal, and target/Nsight
 zero exits all passed.
 
-Nsight's actual `repeat:4` contract is four reports from one profiling session,
-not the single `ours-r1.nsys-rep` assumed by schema v3. It wrote
-`ours-r1.{1,2,3,4}.nsys-rep` at **345,857 / 335,910 / 335,538 / 335,785
-bytes**. The fail-closed driver rejected the absent unsuffixed report before
-export, captures 2/3 or vLLM. Read-only exports retained as diagnostics show
-that every report has exactly **one** `cudaGraphLaunch`, **1,107 graph kernels,
-7 graph memcpys, 1 graph memset and zero eager CUDA rows**. All four share
-profiling-session UUID `1caab979-7988-47b3-96c1-df45b50042de`; only report 1
-contains the `cuProfilerStart` runtime row because subsequent range starts sit
-outside their own report. Every report still contains severity-2 `Not all CUDA
-events might have been collected.` Report 1 records 1,118 collected / 1,130
-produced CUDA/CUPTI events; reports 2--4 record 1,117 / 1,125. The root is
-**FAILED / VOID**, never reused, and changes no accepted speed result.
+Session 1 emitted four indexed reports with one `cudaGraphLaunch`, **1,107
+graph kernels, 7 graph memcpys, 1 graph memset, and zero eager CUDA rows** in
+each. They share session UUID `22172b06-07f9-43bc-af18-6a74a2f5562e`; report
+SHA-256 values are `9a8c7009…96d`, `f6e69a9b…d76`, `46cbfeeb…c3d`, and
+`fa4210f6…6b8d`. Report 1 records 1,118 collected / 1,129 produced events;
+reports 2–4 record 1,117 / 1,125. The collected counts exactly equal the
+visible CUDA runtime rows plus all graph children.
 
-H1d is therefore re-scoped around the profiler's real artifact boundary:
-three independent Nsight sessions, four indexed range reports per session,
-**12 reports/SQLite/validation/summary artifacts total**. Each range report
-must independently contain one launch, the complete per-launch node/resource
-multiset, zero eager CUDA rows and no severity>=2 diagnostic. Four reports in
-one session must share one profiler UUID; the three session UUIDs must be
-distinct. The next repair advances the status schema to v4, uses the supported
-`repeat:4:sync` generation mode so result generation blocks between ranges,
-and performs a diagnostic-only device synchronization before every profiler
-stop. No severity is whitelisted and no partial range can bind.
-
-That schema-v4 repair is now implemented. The driver records three session
-commands/logs/controls and exports all **12** indexed report/SQLite/validation/
-summary artifacts. Per-range validation requires one graph launch, one visible
-`cuProfilerStart` only in range 1, zero in ranges 2--4, exact model-family and
-node-resource signatures, zero eager CUDA rows and no rejected diagnostic. The
-status/reconstruction gates require one UUID within each group of four, three
-distinct session UUIDs and one identical canonical node multiset across all 12
-reports. Nsight uses `repeat:4:sync`; the diagnostic-only backend performs
-`cudaDeviceSynchronize()` before every stop. The installed DGX Nsight 2025.3.2
-parser accepts that mode. Focused client/summary/trace contracts pass **31/31**;
-Python/shell syntax, ShellCheck, the CUDA-off build and a final full CUDA-off
-suite **106/106** pass. This is not GPU trace evidence: a fresh pushed SHA/root
-must compile and execute the exact DGX series before H1d or W3-H2 can advance.
+Schema v4 nevertheless rejects the severity-2 `Not all CUDA events might have
+been collected.` diagnostic, so the driver stopped after report 1 export,
+before sessions 2/3 or the vLLM arm. The root is **FAILED / VOID**, changes no
+ratio, and is never reused. The next H1 step is a model-free, one-node CUDA
+graph calibration on pinned Nsight 2025.3.2.474. Any diagnostic exception must
+be version-bound and conditional on exact runtime/activity reconciliation,
+completion synchronization, zero eager work, model-family cardinalities, and
+cross-report identity; it may not become a blanket severity waiver.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -687,7 +542,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and H1d attempts through `b2c940c` are VOID. The latest exact build/gate, clients and FIFO/zero-exit lifecycle pass; four generated reports each contain one complete 1,107-kernel replay and zero eager CUDA rows, but all four emit severity-2 possible loss. Schema v3 also expects one combined report. Schema v4 now implements and CPU-gates 3 sessions x 4 indexed reports, `repeat:4:sync`, per-stop device synchronization, grouped UUIDs and identical-node validation. Fresh immutable DGX execution is next** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v4 clean `b9beccd` passes exact build/gate/plans/clients/FIFO/zero-exit and produces four complete, zero-eager, single-replay reports. It fails closed on pinned Nsight's possible-loss capture-range diagnostic before sessions 2/3 or vLLM and is VOID. Calibrate the diagnostic with a minimal graph, bind any exception to exact counters/completion/model topology, then rerun all 12 reports from a new SHA/root** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

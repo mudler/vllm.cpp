@@ -1,10 +1,12 @@
 # W3-G — FlashAttention-2 GQA split-KV decode
 
-Status: **ACTIVE** on 2026-07-13. W3-G1--G3 source and ported operator tests are
-implemented; the warning-as-error CUDA-off build and focused CTest pass. Clean
-sm_121a compile, CUDA/sanitizer/model/trace and every performance gate remain
-pending, so this is not a CUDA correctness or speed claim. The binding 27B
-result remains immutable `3f256ab` at **55/124 pass, 69 fail**.
+Status: **ACTIVE/GATING** on 2026-07-13. W3-G1--G4 are complete at immutable
+`ae9e8ff`: clean sm_121a build, CUDA operator/capture/lifecycle, strict
+zero-error/zero-leak memcheck, both frozen-plan 27B arms, correctness-only 35B
+and paired node-trace gates pass. The short-prompt trace is performance-negative
+and non-binding; W3-G5's input-1,024 c2/c16 **40 timing + 8 memory** component
+remains pending, so there is no speed credit. The binding 27B result remains
+immutable `3f256ab` at **55/124 pass, 69 fail**.
 
 ## Scope
 
@@ -237,6 +239,49 @@ The component and exact-grid driver are materialized under the immutable
 evidence root only after G0-G3 pass; they must refuse overwrite and bind their
 own SHA-256/provenance before execution.
 
+## Immutable GPU, safety, model and structural checkpoint
+
+Clean detached `ae9e8ff0576badabdda7289beeacaa1041c55d21` builds on `dgx.casa`
+with GCC 13.3, CUDA 13.0.88, sm_121a, FlashInfer's CUTLASS 4.5, vendored Triton
+AOT and pinned FA2 `2c839c33`. Focused CUDA CTest passes **1/1**; the operator
+binary passes **20/20 cases + 454,323/454,323 assertions**. Strict
+`VT_CUTLASS_NOPOOL=1 compute-sanitizer --tool memcheck --leak-check full`
+passes the same cold/capture/replay/lifecycle binary with **0 errors and 0
+bytes leaked**.
+
+From one unchanged native 64-plan fixture, default and `VT_FA2_DECODE=0` 27B
+processes each load **64/64**, tune zero, pass **235/235**, and reproduce the
+full **16/16** vLLM token stream. The correctness-only 35B test passes
+**2/2 cases + 315/315 assertions**. Its ratio-8 topology is outside the bounded
+dispatch; this is not a 35B performance result.
+
+Paired `nsys --cuda-graph-trace=node` traces close G3. Default contains
+**240** non-causal decode main and **240** combine calls (**224** graph calls
+each) and zero `PagedAttentionDecodeOptKernel`. Fallback contains **240** old
+decode calls (**224** graph) and no decode combine; both retain the same 32
+causal prefill-main calls. Both arms contain identical **3,536 FP4 GEMMs**,
+**3,536 FP4 producers**, eight CUTLASS kernel names and frozen-plan SHA-256
+`f2d9be7f...1fa4`. Capture contains no allocation/free/synchronize call; graph
+replay has zero D2H copies. Default adds exactly three eager
+`cudaMallocAsync` calls before capture for final LSE, partial LSE and partial
+output scratch.
+
+The short correctness sequence is an explicit warning, not accepted speed
+evidence: FA2 main+combine totals **3.246400 ms** versus fallback
+**1.395488 ms** across 240 decode calls, or **0.429857x** direction-normalized.
+Its prompt is only eight tokens, unlike G4's input-1,024 workload. G4 remains
+authorized because G3 is structural, but it must fail closed on any of the 48
+component axes.
+
+Evidence root:
+`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence`.
+Operator/memcheck/default-27/fallback-27/35B log SHA-256 values are
+`15843743...e2b` / `de65e263...f802` / `dd30376b...e4e4` /
+`dd30376b...e4e4` / `4b18329b...eec8`; structural summary SHA-256 is
+`c6e4c701...9649`. The first configure output is retained as **FAILED /
+ENVIRONMENT-INVALID** because noninteractive SSH omitted the CUDA compiler from
+`PATH`; the fresh compiler-pinned configure/build is binding.
+
 ## Dependencies
 
 - rows `KERNEL-ATTN-FA2`, `SERVE-GATE-ONLINE` and
@@ -257,10 +302,10 @@ this checkpoint.
 | Work ID | Files/ownership | Result and handoff |
 |---|---|---|
 | W3-G0 | this spec; kernel/engine/backend/feature/quant matrices; roadmap, coordination, inventory, README, BENCHMARKS, ledger, state | Accept the full spike, rank FA2 first/FP4 producer second, claim `KERNEL-ATTN-FA2`, publish no rate. |
-| W3-G1 | `cuda_flash_attn_fa2.cu`, FA2 internal lifecycle header, `cuda_backend.cu` | **IMPLEMENTED / CUDA RUNTIME PENDING:** exact swapped strides, upstream split heuristic, fixed per-shape scratch and queue cleanup. |
-| W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | **IMPLEMENTED / MODEL GATE PENDING:** exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path; prefill and ratio-8 unchanged. |
-| W3-G3 | `tests/vt/test_ops_paged_attn.cpp` | **PORTED / CUDA EXECUTION PENDING:** upstream 523/37/2011 fallback, ratio-6 B ladder, heuristic, toggle/window/ratio-8 fallback, capture/replay/capacity and two-queue lifecycle. CUDA-off focused CTest passes but compiles these cases out. |
-| W3-G4 | immutable DGX evidence only; same-change public/canonical status updates | G0-G3 build/operator/sanitizer/model/inertness/trace closure. Fail closed before timing. |
+| W3-G1 | `cuda_flash_attn_fa2.cu`, FA2 internal lifecycle header, `cuda_backend.cu` | **COMPLETE:** exact swapped strides, upstream split heuristic, fixed per-shape scratch and queue cleanup pass immutable CUDA/safety gates. |
+| W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | **COMPLETE:** exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path pass both 27B arms; prefill and ratio-8 remain unchanged. |
+| W3-G3 | `tests/vt/test_ops_paged_attn.cpp` | **COMPLETE:** upstream fallback, ratio-6 B ladder, heuristic, toggle/window/ratio-8 fallback, capture/replay/capacity and two-queue lifecycle pass 20/20 + 454,323 and strict memcheck. |
+| W3-G4 | immutable DGX evidence only; same-change public/canonical status updates | **COMPLETE at `ae9e8ff`:** G0-G3 build/operator/sanitizer/model/inertness/trace closure passes; short trace performance is negative/non-binding. |
 | W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | Strict 40+8-axis component; either authorize G6 or record failure and rescan. |
 | W3-G6 | existing exact online gate/evidence; same-change public/canonical status updates | Conditional 27B c1-c32 vLLM grid. Only 124/124 permits 35B performance. |
 

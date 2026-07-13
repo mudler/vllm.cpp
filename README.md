@@ -162,10 +162,17 @@ OpenAI-compatible server.
 > windows differ, so this is diagnostic attribution, not a speed ratio. The
 > cast-free BF16 adapter/model dispatch, exact split heuristic, stable
 > CUDA-graph scratch, `VT_FA2_DECODE=0` fallback and ported upstream tests are
-> now implemented in source. The warning-as-error CUDA-off build and focused
-> paged-attention test pass; the FA2-only tests are compiled out there, so the
-> clean sm_121a build, operator/capture/lifecycle runtime, sanitizers, model
-> gates, trace and every performance number remain **PENDING**.
+> now implemented in source. Immutable `ae9e8ff` clean-builds for sm_121a;
+> its CUDA operator suite passes **20/20 cases + 454,323/454,323 assertions**,
+> strict memcheck reports **0 errors / 0 leaked bytes**, both 27B arms pass
+> **235/235 + 16/16**, and the correctness-only 35B gate passes **315/315**.
+> Paired node traces prove default/fallback decode counts of **240 FA2
+> main+combine / 0 old** versus **0 decode combine / 240 old**, while both
+> retain **3,536 FP4 GEMMs**, **3,536 producers**, eight kernel identities and
+> the frozen 64-plan map. The tiny correctness prompt is performance-negative
+> (**3.246400 ms** FA2 main+combine versus **1.395488 ms** fallback over 240
+> calls), so it is structural evidence only. The cache-off input-1,024 c2/c16
+> **40 timing + 8 memory** component remains **PENDING**; no speed credit exists.
 > Vectorized normal BF16→FP4 production ranks second and is not stacked into
 > W3-G.
 > Every 27B speed, latency and memory axis must
@@ -309,7 +316,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes frozen-map control; W3-E and W3-F are mean-positive but strict-fail at **39/40 timing + 1/8 memory** and **27/40 + 3/8**, so neither earns speed credit. W3-G now implements the bounded FA2 BF16 ratio-6 split-KV adapter, model/dispatch toggle, graph-stable scratch and upstream-derived operator/capture/lifecycle tests. Only the CUDA-off compile/test checkpoint is green; all GB10 runtime evidence remains `PENDING`. The 35B ratio-8 path is explicitly inert and its performance remains held. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-C passes frozen-map control; W3-E and W3-F are mean-positive but strict-fail at **39/40 timing + 1/8 memory** and **27/40 + 3/8**, so neither earns speed credit. W3-G implements the bounded FA2 BF16 ratio-6 split-KV adapter, model/dispatch toggle, graph-stable scratch and upstream-derived operator/capture/lifecycle tests. Immutable `ae9e8ff` now passes its sm_121a operator/memcheck gates, both 27B default/fallback **235/235 + 16/16** arms, correctness-only 35B **315/315**, and paired structural trace. Its c2/c16 every-axis component remains pending, and the short correctness trace is performance-negative rather than speed evidence. The 35B ratio-8 path is explicitly inert and its performance remains held. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -319,7 +326,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. W3-C frozen-map control passes; W3-E/W3-F strict-fail their components and earn no speed credit. W3-G implements the traced ratio-6 FA2 split-KV route: cast-free BF16 model/dispatcher selection, exact upstream group-swap strides and split heuristic, per-stream/per-shape capture-stable F32 scratch with queue cleanup, `VT_FA2_DECODE=0`, and ported ratio/fallback/capture/lifecycle tests. CUDA-off warning-as-error build + focused test are green; clean sm_121a compile and every CUDA/model/sanitizer/trace/performance result remain pending. No exact rerun or 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. W3-C frozen-map control passes; W3-E/W3-F strict-fail their components and earn no speed credit. W3-G implements the traced ratio-6 FA2 split-KV route: cast-free BF16 model/dispatcher selection, exact upstream group-swap strides and split heuristic, per-stream/per-shape capture-stable F32 scratch with queue cleanup, `VT_FA2_DECODE=0`, and ported ratio/fallback/capture/lifecycle tests. Clean immutable `ae9e8ff` passes sm_121a compile, **20/20 + 454,323** operator assertions, zero-error/zero-leak memcheck, both 27B arms, 35B correctness-only inertness and the exact paired structural trace. The c2/c16 **40+8** performance component is pending and the short trace is performance-negative, so no speed credit, exact rerun or 35B performance run is authorized. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -338,7 +345,7 @@ CUDA-target inventories track unimplemented and untraced families separately.
 | MoE **W4A16** GEMM | Marlin + fp4-resident — vLLM `marlin` / `fused_moe` | ✅ ref | ✅ |
 | FP8 / bf16 projection GEMM | cuBLASLt col-major-TN → `nvjet_sm121` | ✅ ref | ✅ |
 | Prefill attention | **vendored FlashAttention-2** `flash_fwd_splitkv` (vllm-project/flash-attention @ 2c839c33, the exact kernel vLLM runs; default-on for the bf16 head-256 path, 3.7× vs our WMMA) with the flash-style WMMA kernel as the portable fallback | ✅ ref | ✅ |
-| Decode attention (paged) | current FlashInfer-style paged fallback plus W3-G vLLM-faithful FA2 BF16 ratio-6 split main+combine with exact `VT_FA2_DECODE=0` fallback | ✅ ref | 🟡 FA2 decode source/tests `ACTIVE`; CUDA-off compile green, sm_121a runtime/evidence pending |
+| Decode attention (paged) | current FlashInfer-style paged fallback plus W3-G vLLM-faithful FA2 BF16 ratio-6 split main+combine with exact `VT_FA2_DECODE=0` fallback | ✅ ref | 🟡 `ACTIVE/GATING`: sm_121a operator, memcheck, model and paired structural trace pass at `ae9e8ff`; c2/c16 every-axis performance pending |
 | GDN / linear-attn (chunk) | tensor-core WY solve — FLA `chunk_delta` | ✅ ref | ✅ |
 | RMSNorm(+residual) → fp4 quant | the **traced gate workload** dispatches Inductor `fused_add_rms_norm` + external `scaled_fp4_quant`; FlashInfer also contains fused Add/RMSNorm+FP4 kernels that remain in the upstream kernel inventory · fp8: fused `RmsNormQuantFp8` (35B) | ✅ ref | ✅ gate path |
 | Activation fp4 quant | HW `cvt.e2m1x2` PTX (vLLM `nvfp4_utils`) / software ladder | ✅ ref | ✅ ladder · HW-PTX 🚧 A/B |
@@ -451,9 +458,14 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   **23,616 / 7,061.921 ms** plus combine **23,488 / 123.245 ms**; unequal trace
   windows make this attribution only. Its cast-free BF16 selection, exact
   heuristic, capture-safe per-shape scratch, queue cleanup, fallback and
-  upstream-derived ratio/capture/lifecycle tests are implemented. The CUDA-off
-  build/test passes; sm_121a compile and all runtime evidence remain pending. Vectorized normal
-  FP4 production remains the next separate lever.
+  upstream-derived ratio/capture/lifecycle tests are implemented. Immutable
+  `ae9e8ff` passes the clean sm_121a build, CUDA operator and strict memcheck,
+  both 27B arms, correctness-only 35B gate and paired node trace. Default has
+  240 FA2 main+combine decode calls and zero old kernels; fallback has 240 old
+  calls and zero decode combine, with identical 3,536 FP4 GEMMs/producers and
+  frozen plans. The short correctness trace is 2.326x slower for FA2 and is not
+  a gate workload; the input-1,024 c2/c16 component remains pending. Vectorized
+  normal FP4 production remains the next separate lever.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.

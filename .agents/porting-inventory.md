@@ -456,9 +456,13 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     and deliberately inert. Binding diagnostics are local ratio-6 decode **22,893 calls /
     8,793.238 ms** versus vLLM FA2 main **23,616 / 7,061.921 ms** plus combine
     **23,488 / 123.245 ms**; unequal windows make this attribution, not a speed
-    ratio. The CUDA-off warning-as-error build/focused CTest pass, but FA2-only
-    cases compile out there. Clean sm_121a compile, CUDA/sanitizer/model/trace
-    and the every-axis A/B are `PENDING` under the [W3-G
+    ratio. Immutable `ae9e8ff` passes clean sm_121a compile, **20/20 +
+    454,323** CUDA assertions, zero-error/zero-leak memcheck, both 27B arms,
+    correctness-only 35B and paired node trace. Default/fallback switch exactly
+    between **240 main+combine / 0 old** and **0 decode combine / 240 old**;
+    both preserve 3,536 FP4 GEMMs/producers and all 64 plans. The short prompt
+    is performance-negative (**3.246400/1.395488 ms**) and non-binding. The
+    c2/c16 every-axis A/B remains `PENDING` under the [W3-G
     spike](specs/fa2-gqa-split-kv-decode.md).
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common

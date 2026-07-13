@@ -6471,3 +6471,58 @@ arms, correctness-only 35B inertness, paired node trace and the all-40-timing +
 all-8-memory component remain `PENDING`. No new throughput, latency, memory or
 ratio is accepted; immutable `3f256ab` remains **55/124**, the exact grid stays
 blocked, and no 35B performance command is authorized.
+
+## 2026-07-13 — W3-G immutable CUDA, safety, model and paired-trace gates pass
+
+Clean detached source `ae9e8ff0576badabdda7289beeacaa1041c55d21` under
+`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21`
+builds with GCC 13.3, CUDA 13.0.88, sm_121a, CUTLASS 4.5, vendored Triton AOT
+and the pinned FA2 dependency. The first noninteractive configure is retained
+as **FAILED / ENVIRONMENT-INVALID** because `nvcc` was absent from `PATH`; the
+fresh `build-cuda` retry explicitly prepends `/usr/local/cuda/bin` and is the
+binding build. Detached source is clean at the exact SHA.
+
+Under `/tmp/gpu`, focused paged-attention CTest passes **1/1**. The CUDA binary
+passes **20/20 cases + 454,323/454,323 assertions**, including exact split
+heuristic vectors, ratio-6 B1--16 output/layout, honest upstream ratio-2
+fallback, toggle/window/ratio-8 fallback, cold capture plus two replays,
+capacity rollover and two-queue cleanup. Strict
+`VT_CUTLASS_NOPOOL=1 compute-sanitizer --tool memcheck --leak-check full`
+passes the full binary with **0 errors and 0 bytes leaked**.
+
+One unchanged native fixture remains byte-identical and supplies all **64/64**
+plans with zero tuning. Default and `VT_FA2_DECODE=0` 27B processes each pass
+**235/235 + 16/16** against the vLLM production stream. The correctness-only
+35B ratio-8 process passes **2/2 cases + 315/315 assertions**; no 35B rate was
+measured or inferred.
+
+Paired `nsys --cuda-graph-trace=node` traces close the structural gate.
+Default contains **240** non-causal FA2 decode-main plus **240** combine calls
+(**224** graph calls each) and zero old optimized decode kernels. Fallback
+contains **240** `PagedAttentionDecodeOptKernel` calls (**224** graph) and no
+decode combine. Both retain the same 32 prefill-main calls, **3,536 FP4
+GEMMs**, **3,536 FP4 producers**, eight CUTLASS identities and exact selected-
+plan SHA `f2d9be7f...1fa4`. Capture contains no allocation, free or stream sync;
+graph replay contains zero D2H copies. The default's three extra eager
+`cudaMallocAsync` calls match the fixed final-LSE, partial-LSE and partial-
+output scratch allocations before capture.
+
+The short correctness trace is performance-negative and is recorded without
+credit: FA2 main+combine totals **3.246400 ms** versus fallback
+**1.395488 ms** across 240 calls, direction-normalized **0.429857x**. The
+prompt is eight tokens rather than the binding input-1,024 workload, so this
+does not pre-judge the component but is a material warning.
+
+Evidence root is the `evidence/` directory above. Operator/memcheck/default-
+27/fallback-27/35B/structural-summary SHA values are
+`15843743...e2b` / `de65e263...f802` / `dd30376b...e4e4` /
+`dd30376b...e4e4` / `4b18329b...eec8` / `c6e4c701...9649`; default/fallback
+SQLite SHA values are `6b9a0ddb...66dc` / `346ebd6c...0d59`. GPU and lock
+return idle/free.
+
+Disposition: W3-G G0--G3 and work item W3-G4 pass; `KERNEL-ATTN-FA2` and
+`SERVE-GATE-ONLINE` remain `ACTIVE/GATING`. Materialize the immutable
+input-1,024/output-128 cache-off c2/c16 AB/BA/AB driver and execute all **40
+timing + 8 memory** axes under one lock. Any miss gives W3-G no speed credit and
+returns to the scan. No exact grid or 35B performance command is authorized;
+binding `3f256ab` remains **55/124 pass, 69 fail**.

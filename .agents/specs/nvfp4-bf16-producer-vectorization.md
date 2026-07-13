@@ -1,8 +1,9 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c are VOID; H1d target-build and bounded
-four-replay design is frozen, harness implementation is pending and W3-H2
-remains prohibited**
+Status: **ACTIVE — H1a/H1b/H1c are VOID; the H1d trace-only controller,
+target-build preflight and schema-v2 validators are implemented and CPU-gated;
+the immutable three-capture DGX execution is pending and W3-H2 remains
+prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -143,19 +144,15 @@ The vLLM v0.25.0 raw Torch-profiler trace is
 `~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/trace/27/vllm-profile/online-gate_rank0.1783906481468807023.pt.trace.json.gz`,
 SHA-256
 `0c6f859f916ceb15970f3f6896c84bc37f4e2152c8aedef2c7b893b40e6ee0e2`.
-Geometry separates 1,484 decode forwards from 104 prefill forwards:
-
-| Normal shape | vLLM decode geometry | Decode calls | Mean | Per-forward time |
-|---|---|---:|---:|---:|
-| K=5,120 | grid 128, block 320 | 118,720 = 80 x 1,484 | 2.297265 us | 0.183781 ms |
-| K=6,144 | grid 128, block 384 | 94,976 = 64 x 1,484 | 2.496197 us | 0.159757 ms |
-| **total** | | **144 / forward** | | **0.343538 ms** |
-
-The clean diagnostic difference is therefore **0.284396 ms/decode forward**.
-The aggregate vLLM value of 2,189.809 ms / 1,588 forwards is invalid for this
-comparison because it includes exactly 8,320 + 6,656 calls from the 104 large
-prefill forwards. The profilers and capture windows still differ, so 0.284396
-ms is a candidate ceiling, not a binding ratio or accepted speed credit.
+The H1d parser now uses execution annotations rather than geometry inference.
+The exact four-run raw trace contains 1,588 generation annotations, of which
+1,476 are uncontaminated `execute_context_0(0)_generation_N(N)` windows. Every
+one has exactly 144 normal producers, yielding **212,544 calls / 505.717377 ms
+= 0.342627 ms/window**. The clean diagnostic difference is therefore
+**0.285307 ms/decode window**. The remaining 112 generation annotations mix
+prefill/chunk contexts and are excluded. The profilers and capture windows
+still differ, so 0.285307 ms is a candidate ceiling, not a binding ratio or
+accepted speed credit.
 
 Padding is not the explanation: both decode geometries launch the same total
 threads, 40,960 for K=5,120 and 49,152 for K=6,144. Both traced kernels use 30
@@ -188,7 +185,7 @@ mandatory.
 
 The observed normal-producer difference is too small to close parity alone.
 Even a zero-cost local normal producer can remove at most 0.627934 ms/decode
-forward, and the observed vLLM-shaped target removes about 0.284396 ms. Binding
+forward, and the observed vLLM-shaped target removes about 0.285307 ms. Binding
 TPOT/ITL gaps are larger on almost every point. W3-H is one ranked component,
 not a claim that the remaining gap is a ceiling. A fresh full-workload trace
 must continue ranking FP4 GEMM, GDN post-convolution/recurrence, fused SiLU and
@@ -373,7 +370,11 @@ mandated Torch profiler because nsys breaks its EngineCore on this host; its
 raw trace, selected hash, exact command/corpus/workload and clean decode-window
 family counts must be independently recomputed rather than trusted from the
 aggregate summary. Geometry/window slicing must exclude prefill, eager and
-graph-capture contamination.
+graph-capture contamination. For this exact v0.25 workload the raw trace must
+contain 1,588 generation annotations and 1,476 clean context-0 windows; every
+clean window must independently carry 208 FP4 GEMMs, 144 normal producers, 64
+fused producers, 48 recurrence and 16+16 FA2 kernels with complete launch
+geometry/resource metadata.
 
 The report must inventory current normal/fused producers, FP4 GEMMs, GDN
 post-convolution/recurrence, FA2, graph-node counts, the frozen 64-plan map,
@@ -445,7 +446,8 @@ Current local normal graph slice:
 ssh dgx.casa 'DB=$HOME/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/trace/fa2-default.sqlite; sqlite3 -header -column "$DB" "SELECT CASE WHEN k.graphNodeId IS NULL THEN '\''eager'\'' ELSE '\''graph'\'' END mode,k.gridX,k.gridY,k.blockX,COUNT(*) calls,ROUND(SUM(k.end-k.start)/1e6,6) ms,ROUND(AVG(k.end-k.start)/1e3,6) us FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON s.id=k.demangledName WHERE instr(s.value,'\''ScaledFp4QuantKernel<__nv_bfloat16'\'')>0 AND instr(s.value,'\''Silu'\'')=0 GROUP BY mode,k.gridX,k.gridY,k.blockX ORDER BY mode,k.gridX,k.blockX;"'
 ```
 
-Fresh G0 uses a new immutable pushed SHA and evidence root:
+Fresh G0 uses a new immutable pushed SHA and evidence root. Preserve the CMake
+stdout/stderr as the build-provenance input required by the driver:
 
 ```sh
 SHA=$(git rev-parse HEAD)
@@ -455,12 +457,13 @@ cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
   -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
   -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
 scripts/dgx-online-serving.sh --trace-only --model 27 \
   --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(readlink "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")" \
   --source-corpus "$ROOT/evidence/corpus/27" \
   --evidence "$ROOT/evidence" --build-dir "$ROOT/build-cuda" \
-  --client "$HOME/venvs/vllm-oracle/bin/vllm"
+  --configure-log "$ROOT/configure.log" \
+  --client "$HOME/venvs/vllm-oracle/bin/vllm" --vllm-cpp-sha "$SHA"
 ```
 
 The setup checkpoint must prepare and hash the source corpus and manifest
@@ -484,7 +487,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d exact target-build/dispatch preflight plus dormant-workload/bounded-four-replay design frozen; harness/schema implementation pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c complete but VOID; H1d controller, exact build/dispatch preflight, bounded collector and schema-v2 ours/vLLM validators are implemented and CPU-gated; immutable three-capture DGX execution pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |
@@ -492,7 +495,7 @@ before the lock is acquired. No partial trace duration or throughput binds.
 
 ## Risks and decisions
 
-- **Insufficient ceiling:** 0.284 ms/forward cannot close the gate alone. Keep
+- **Insufficient ceiling:** 0.285 ms/forward cannot close the gate alone. Keep
   scanning after this isolated leaf; never call the remaining gap diffuse.
 - **Profiler mismatch:** current ours/vLLM times identify a target but cannot
   prove a ratio. Same-binary candidate/fallback owns performance acceptance.

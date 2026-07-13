@@ -6796,3 +6796,45 @@ selected-plan SHA `f2d9be7f…1fa4`, distinct report/SQLite identities and comma
 linkage, and independent vLLM raw-trace validation. This checkpoint freezes
 design only: no code, GPU command, accepted trace, ratio or speed credit exists;
 `3f256ab` remains **55/124 pass, 69 fail**.
+
+## 2026-07-13 — H1d diagnostic controller/schema implemented; immutable DGX evidence pending
+
+The frozen W3-H1d design is now implemented without changing production
+inference. `VLLM_CPP_BENCH_PROFILE_CONTROL=ON` compiles a diagnostic-only
+SIGUSR2 controller which arms after the ordinary exact c16 workload and bounds
+collection to exactly four warmed dense CUDA-graph replays; the default build
+compiles the observer out. `--execute` deliberately fails closed during H1d so
+a trace-instrumented binary cannot be used for a timing gate; production/trace
+build separation is restored only after the structural G4 gate passes.
+
+The driver and schema-v2 record now fail before GPU work unless the exact
+external CUTLASS tree, configure log, compile command, linked server and runtime
+target family prove the intended `VT_CUTLASS_NVFP4` path. Accepted captures
+require a zero-exit unique Nsight 2025.3.2.474 session linked to its raw report,
+four exact runtime graph launches, direct correlation of every KERNEL/MEMCPY/
+MEMSET graph child, 1,107 primary nodes replayed four times with complete
+name/geometry/resource identity, zero fallback FP4 kernels, the exact 64-plan
+lifecycle and exact client/command/environment contracts. The vLLM side now
+validates the raw generation annotations rather than inferring windows from
+geometry.
+
+Read-only reaggregation of the retained accepted vLLM raw trace finds **1,588**
+generation annotations and **1,476** clean context-0 decode windows. Every
+clean window has exactly 208 FP4 GEMMs, 144 normal producers, 64 fused
+producers, 48 recurrence kernels, 16 FA2 main and 16 combine kernels with
+complete expected resource metadata. The normal producer totals **212,544 /
+505.717377 ms = 0.342627 ms per clean window**. Compared with the retained
+local diagnostic 0.627934 ms/window, the descriptive difference is 0.285307
+ms/window; unequal capture provenance means this is not a binding ratio or
+speed claim.
+
+Local validation passes Python compilation, shell syntax, focused harness tests
+**25/25** and a full CUDA-off Release build. The oversubscribed full CPU CTest
+run completed **104/106**; `test_engine_core_proc` and one OpenAI emoji
+conformance case both passed immediately in a serial rerun (**2/2**). No CUDA
+compile or GPU command ran in this checkpoint. Immutable `3f256ab` therefore
+continues to bind at **55/124 pass, 69 fail**; no new throughput, latency,
+memory ratio, W3-H2 code, exact grid or 35B performance exists. The GPU,
+`/tmp/gpu` and serving ports are idle. The next hardware action is to execute
+the clean, pushed checkpoint as a three-capture immutable H1d series under one
+uncontended GPU lock and re-rank the residual from the accepted trace.

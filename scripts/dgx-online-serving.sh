@@ -13,10 +13,10 @@ usage() {
 usage:
   dgx-online-serving.sh --dry-run [--claim-root DIR] [--client PATH] [--vllm-cpp-sha SHA]
   dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
-  dgx-online-serving.sh --trace-only --model 27|35 --snapshot DIR --source-corpus DIR \
-    --evidence DIR --build-dir DIR [--client PATH] [--port N]
+  dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
+    --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
-    --evidence DIR --build-dir DIR [--client PATH] [--port N]
+    --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
 EOF
 }
 
@@ -27,6 +27,7 @@ source_corpus=""
 claim_root="${HOME}/work/vllm.cpp-online-gate"
 evidence=""
 build_dir=""
+configure_log=""
 client="${HOME}/venvs/vllm-oracle/bin/vllm"
 vllm_cpp_sha=""
 port=8001
@@ -47,6 +48,7 @@ while (($#)); do
     --claim-root) claim_root=${2:?}; shift 2 ;;
     --evidence) evidence=${2:?}; shift 2 ;;
     --build-dir) build_dir=${2:?}; shift 2 ;;
+    --configure-log) configure_log=${2:?}; shift 2 ;;
     --client) client=${2:?}; shift 2 ;;
     --vllm-cpp-sha) vllm_cpp_sha=${2:?}; shift 2 ;;
     --port) port=${2:?}; shift 2 ;;
@@ -106,9 +108,21 @@ if [[ ${mode} == prepare-corpus ]]; then
 fi
 
 [[ ${mode} == execute || ${mode} == trace-only ]] || { usage; exit 2; }
+if [[ ${mode} == execute ]]; then
+  echo "--execute is held while H1d requires a trace-instrumented build; timing that binary would violate the production-build gate. Complete H1d/G4, then use separate production and trace builds." >&2
+  exit 2
+fi
+if [[ ${mode} == trace-only && ${model} != 27 ]]; then
+  echo "H1d trace-only control is defined only for the Qwen3.6-27B dense graph; 35B performance remains held" >&2
+  exit 2
+fi
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
 [[ -n ${build_dir} && -x ${build_dir}/examples/server ]] || {
   echo "--build-dir must contain examples/server" >&2
+  exit 2
+}
+[[ -n ${configure_log} && -s ${configure_log} ]] || {
+  echo "--configure-log must name the non-empty log from this build configuration" >&2
   exit 2
 }
 [[ -x ${client} ]] || { echo "pinned vLLM client is not executable: ${client}" >&2; exit 2; }
@@ -127,6 +141,7 @@ prepare_corpus
 
 execution_dir="${evidence}/execution"
 mkdir -p "${execution_dir}"
+execution_manifest="${execution_dir}/${model}-trace.json"
 if [[ ${model} == 27 ]]; then
   test_name=test_qwen27_paged_engine
 else
@@ -163,19 +178,21 @@ if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then
   exit 1
 fi
 python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
-  --output "${execution_dir}/${model}.json" \
+  --output "${execution_manifest}" \
   --model-key "${model}" \
   --vllm-cpp-sha "${vllm_cpp_sha}" \
   --build-dir "${build_dir}" \
   --client "${client}" \
   --snapshot "${snapshot}" \
+  --configure-log "${configure_log}" \
   --build-command "${build_command}" \
   --build-log "${build_log}" \
   --oracle-manifest "${oracle_manifest}" \
   --port "${port}" \
   --num-blocks "${num_blocks}" \
   --max-num-seqs "${max_num_seqs}" \
-  --max-num-batched-tokens "${max_num_batched_tokens}"
+  --max-num-batched-tokens "${max_num_batched_tokens}" \
+  --profile-control on
 
 spid=""
 mpid=""
@@ -364,6 +381,7 @@ run_paired_traces() {
   local -a ours_validations=()
   local -a ours_logs=()
   local -a ours_commands=()
+  local -a ours_controls=()
   mkdir -p "${trace_dir}"
   [[ ! -e ${vllm_summary} && ! -e ${status} ]] || {
     echo "refusing to overwrite paired trace evidence for ${model}" >&2
@@ -382,8 +400,10 @@ run_paired_traces() {
     local ours_validation="${trace_dir}/ours-r${trace_rep}-nsys-validation.json"
     local ours_log="${trace_dir}/ours-r${trace_rep}-profile.log"
     local ours_command="${trace_dir}/ours-r${trace_rep}-profile-command.txt"
+    local ours_control="${trace_dir}/ours-r${trace_rep}-profile-control.json"
     [[ ! -e ${ours_rep} && ! -e ${ours_sqlite} && ! -e ${ours_validation} &&
-       ! -e ${ours_summary} && ! -e ${ours_log} && ! -e ${ours_command} ]] || {
+       ! -e ${ours_summary} && ! -e ${ours_log} && ! -e ${ours_command} &&
+       ! -e ${ours_control} ]] || {
       echo "refusing to overwrite ours trace repetition ${trace_rep}" >&2
       return 1
     }
@@ -394,17 +414,34 @@ run_paired_traces() {
       --num-blocks "${num_blocks}"
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
+      --max-model-len 262144
       --no-enable-prefix-caching
+      --cuda-profile-graph-replays 4
       --served-model-name gate
     )
     local -a profile_cmd=(
+      env
+      "VT_FP4_AUTOTUNE=${VT_FP4_AUTOTUNE}"
+      "VT_FP4_AUTOTUNE_CACHE_PATH=${VT_FP4_AUTOTUNE_CACHE_PATH}"
+      "VT_FP4_AUTOTUNE_CACHE_READONLY=${VT_FP4_AUTOTUNE_CACHE_READONLY}"
+      "VT_FP4_AUTOTUNE_DELAY_US=${VT_FP4_AUTOTUNE_DELAY_US}"
+      "VT_FP4_FLASHINFER_CACHE_PATH=${VT_FP4_FLASHINFER_CACHE_PATH}"
+      "VT_FP4_FULL_TACTICS=${VT_FP4_FULL_TACTICS}"
+      "VT_FP4_PERSISTENT_CACHE=${VT_FP4_PERSISTENT_CACHE}"
+      "VT_FP4_PLAN_CACHE=${VT_FP4_PLAN_CACHE}"
+      "VT_FP4_PRE_SERVE_WARMUP=${VT_FP4_PRE_SERVE_WARMUP}"
       nsys profile
       --trace=cuda
-      --cuda-graph-trace=node
-      --cuda-flush-interval=10000
+      --capture-range=cudaProfilerApi
+      --capture-range-end=stop
+      --flush-on-cudaprofilerstop=true
+      --cuda-flush-interval=0
+      --cuda-graph-trace=node:host-only
+      --cuda-event-trace=false
       --sample=none
       --cpuctxsw=none
       --stats=false
+      --kill=none
       --force-overwrite=true
       --output "${ours_prefix}"
       "${server_cmd[@]}"
@@ -413,7 +450,28 @@ run_paired_traces() {
     printf '\n' >>"${ours_command}"
     setsid "${profile_cmd[@]}" >"${ours_log}" 2>&1 &
     spid=$!
+    local nsys_pid=${spid}
     wait_ready "${ours_log}"
+    local server_pid=""
+    for _ in $(seq 1 60); do
+      server_pid=$(sed -n 's/^\[VT_CUDA_PROFILE\] ready pid=\([0-9][0-9]*\) signal=SIGUSR2 target_replays=4$/\1/p' "${ours_log}")
+      [[ $(wc -w <<<"${server_pid}") -eq 1 ]] && break
+      sleep 1
+    done
+    [[ ${server_pid} =~ ^[0-9]+$ ]] || {
+      echo "profiled server did not emit one exact ready marker" >&2
+      return 1
+    }
+    kill -0 "${server_pid}" 2>/dev/null || {
+      echo "profiled server PID is not live" >&2
+      return 1
+    }
+    local server_pgid
+    server_pgid=$(ps -o pgid= -p "${server_pid}" | tr -d '[:space:]')
+    [[ ${server_pgid} == "${nsys_pid}" ]] || {
+      echo "profiled server process group is not owned by nsys" >&2
+      return 1
+    }
     python3 "${repo_root}/tools/bench/online_gate.py" bench \
       --client "${client}" \
       --tokenizer "${snapshot}" \
@@ -425,31 +483,61 @@ run_paired_traces() {
       --repetition 1 \
       --num-prompts 48 \
       --artifact-tag "trace${trace_rep}"
-    # Nsight 2025.3 recommends a 10-second periodic flush for collections over
-    # 30 seconds. Leave one complete idle interval before target shutdown.
-    sleep 11
-    if ! pkill -TERM -P "${spid}" 2>/dev/null; then
-      kill -INT "${spid}" 2>/dev/null || true
-    fi
-    for _ in $(seq 1 120); do
-      kill -0 "${spid}" 2>/dev/null || break
+    [[ ! -e ${VT_FP4_AUTOTUNE_CACHE_PATH} ]] || {
+      echo "forbidden native plan target was created before capture" >&2
+      return 1
+    }
+    kill -USR2 "${server_pid}"
+    python3 "${repo_root}/tools/bench/online_gate.py" bench \
+      --client "${client}" \
+      --tokenizer "${snapshot}" \
+      --evidence "${evidence}" \
+      --model-key "${model}" \
+      --engine ours \
+      --base-url "http://127.0.0.1:${port}" \
+      --concurrency 16 \
+      --repetition 1 \
+      --num-prompts 16 \
+      --num-warmups 0 \
+      --artifact-tag "trace${trace_rep}-probe"
+    grep -q '^\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}" || {
+      echo "profiled server did not close the exact four-replay window" >&2
+      return 1
+    }
+    kill -TERM "${server_pid}" 2>/dev/null || true
+    local nsys_status=0
+    local nsys_exited=0
+    for _ in $(seq 1 60); do
+      if ! kill -0 "${nsys_pid}" 2>/dev/null; then
+        nsys_exited=1
+        break
+      fi
       sleep 1
     done
-    if kill -0 "${spid}" 2>/dev/null; then
-      kill -INT "${spid}" 2>/dev/null || true
+    if ((nsys_exited == 0)); then
+      echo "nsys did not exit within 60 seconds after owned server shutdown" >&2
+      kill -INT -- "-${nsys_pid}" 2>/dev/null || true
+      return 1
     fi
-    wait "${spid}" 2>/dev/null || true
+    wait "${nsys_pid}" || nsys_status=$?
+    if ((nsys_status != 0)); then
+      echo "nsys exited ${nsys_status} for trace repetition ${trace_rep}" >&2
+      return 1
+    fi
     spid=""
+    python3 "${repo_root}/tools/bench/online_gate.py" record-profile-control \
+      --output "${ours_control}" \
+      --profile-log "${ours_log}" \
+      --nsys-pid "${nsys_pid}" \
+      --nsys-exit-status "${nsys_status}" \
+      --server-pid "${server_pid}" \
+      --server-pgid "${server_pgid}"
     [[ -s ${ours_rep} ]] || {
       echo "nsys did not write ${ours_rep}" >&2
       return 1
     }
-    nsys stats --force-export=true --report cuda_gpu_kern_sum "${ours_rep}" \
-      >"${ours_summary}"
-    [[ -s ${ours_summary} ]] || {
-      echo "ours kernel summary is empty" >&2
-      return 1
-    }
+    nsys export --type=sqlite --lazy=false --force-overwrite=false \
+      --output "${ours_sqlite}" "${ours_rep}" >/dev/null
     [[ -s ${ours_sqlite} ]] || {
       echo "ours Nsight SQLite export is empty" >&2
       return 1
@@ -458,12 +546,16 @@ run_paired_traces() {
       --sqlite "${ours_sqlite}" \
       --model-key "${model}" \
       --output "${ours_validation}"
+    python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
+      --sqlite "${ours_sqlite}" \
+      --output "${ours_summary}"
     ours_reps+=("${ours_rep}")
     ours_sqlites+=("${ours_sqlite}")
     ours_summaries+=("${ours_summary}")
     ours_validations+=("${ours_validation}")
     ours_logs+=("${ours_log}")
     ours_commands+=("${ours_command}")
+    ours_controls+=("${ours_control}")
     gpu_idle || {
       echo "GPU is not idle after ours trace repetition ${trace_rep}" >&2
       return 1
@@ -490,6 +582,7 @@ run_paired_traces() {
   "${vllm_profile_cmd[@]}" >"${vllm_log}" 2>&1
   python3 "${repo_root}/tools/bench/summarize_torch_kernels.py" \
     --profile-dir "${vllm_profile_dir}" \
+    --model-key "${model}" \
     --output "${vllm_summary}"
   local vllm_trace
   vllm_trace=$(python3 - "${vllm_summary}" <<'PY'
@@ -512,6 +605,7 @@ PY
     --cache-drop-report "${cache_before_ours}"
     --cache-drop-report "${cache_between}"
     --cache-drop-report "${cache_after_vllm}"
+    --execution-manifest "${execution_manifest}"
     --vllm-cpp-sha "${vllm_cpp_sha}"
   )
   local trace_index
@@ -524,8 +618,11 @@ PY
       --ours-kernel-summary "${ours_summaries[trace_index]}"
       --ours-command "${ours_commands[trace_index]}"
       --ours-profile-log "${ours_logs[trace_index]}"
+      --ours-profile-control "${ours_controls[trace_index]}"
       --ours-client-result "${evidence}/raw/${model}/ours/c16-r1-trace${trace_rep}.json"
       --ours-client-log "${evidence}/logs/${model}/ours/c16-r1-trace${trace_rep}.log"
+      --ours-probe-result "${evidence}/raw/${model}/ours/c16-r1-trace${trace_rep}-probe.json"
+      --ours-probe-log "${evidence}/logs/${model}/ours/c16-r1-trace${trace_rep}-probe.log"
     )
   done
   gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }

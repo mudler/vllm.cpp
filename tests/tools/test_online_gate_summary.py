@@ -8,6 +8,7 @@ acceptance rules from ``.agents/benchmark-protocol.md``.
 
 from __future__ import annotations
 
+import gzip
 import json
 import pathlib
 import sqlite3
@@ -17,23 +18,40 @@ from unittest import mock
 
 from tools.bench.online_gate import (
     CACHE_DROP_METHOD,
+    FLASHINFER_VERSION,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
     NSYS_CUDA_FLUSH_INTERVAL_MS,
+    NSYS_CAPTURE_RANGE,
+    NSYS_CUDA_GRAPH_TRACE,
+    NSYS_PRODUCT_VERSION,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
+    TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
+    TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
+    VLLM_GENERATION_WINDOW_CONTRACTS,
     validate_nsys_trace,
+    record_profile_control,
+    summarize_nsys_kernels,
+    _fingerprint_tree,
+    _parse_fp4_plan_log,
+    _summarize_torch_trace,
 )
 from tools.bench.online_gate_summary import summarize_evidence
 from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
+from tests.tools.test_online_gate_client import (
+    write_nsys_sqlite,
+    write_profile_log,
+    write_vllm_decode_trace,
+)
 
 
 def _record(*, faster: bool, repetition: int) -> dict:
@@ -98,59 +116,31 @@ def _write_cache_drop(path: pathlib.Path, roots: list[str]) -> dict:
     }
 
 
-def _write_model_nsys_sqlite(path: pathlib.Path) -> None:
-    contract = TRACE_PRIMARY_GRAPH_CONTRACTS["27"]
-    node_names = []
-    for pattern, count in contract["families"].values():
-        node_names.extend([pattern] * count)
-    node_names.extend(
-        ["unclassified-kernel"] * (contract["node_count"] - len(node_names))
-    )
-    string_ids = {
-        name: index for index, name in enumerate(sorted(set(node_names)), start=1)
-    }
-    connection = sqlite3.connect(path)
-    try:
-        connection.execute(
-            "CREATE TABLE DIAGNOSTIC_EVENT "
-            "(timestamp INTEGER, severity INTEGER, text TEXT)"
-        )
-        connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
-        connection.execute(
-            "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-            "(graphNodeId INTEGER, demangledName INTEGER)"
-        )
-        connection.execute(
-            "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
-            (
-                1,
-                3,
-                "CUDA device 0: Unified Memory trace is not supported by the "
-                "current driver version or configuration.",
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO StringIds VALUES (?, ?)",
-            [(identifier, name) for name, identifier in string_ids.items()],
-        )
-        for node_id, name in enumerate(node_names, start=1):
-            connection.executemany(
-                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?)",
-                [(node_id, string_ids[name])] * 3,
-            )
-        connection.commit()
-    finally:
-        connection.close()
+def _write_model_nsys_sqlite(
+    path: pathlib.Path, *, report_path: pathlib.Path
+) -> None:
+    write_nsys_sqlite(path, model_contract=True, report_path=report_path)
 
 
 def _write_fixture(root: pathlib.Path) -> None:
     sha = "c" * 40
+    cutlass = root / "fixture-artifacts" / "cutlass"
+    (cutlass / "include/cutlass").mkdir(parents=True)
+    (cutlass / "include/cutlass/cutlass.h").write_text(
+        "cutlass\n", encoding="utf-8"
+    )
+    native_target = root / "fixture-artifacts" / "native-must-not-exist.json"
+    source_root = root / "fixture-source"
+    source_root.mkdir()
     (root / "manifest.json").write_text(
         json.dumps(
             {
                 "client_contract_source_commit": VLLM_COMMIT,
                 "gpu_lock_acquisitions_planned": 2,
-                "vllm_oracle_bench_dependencies": {"pandas": PANDAS_VERSION},
+                "vllm_oracle_bench_dependencies": {
+                    "flashinfer": FLASHINFER_VERSION,
+                    "pandas": PANDAS_VERSION,
+                },
                 "vllm_oracle_version": VLLM_ORACLE_VERSION,
                 "vllm_cpp_sha": sha,
             }
@@ -165,6 +155,8 @@ def _write_fixture(root: pathlib.Path) -> None:
         "build_log",
         "client",
         "cmake_cache",
+        "compile_commands",
+        "configure_log",
         "model_config",
         "oracle_manifest",
         "oracle:bench_datasets",
@@ -173,6 +165,9 @@ def _write_fixture(root: pathlib.Path) -> None:
         "oracle:client",
         "oracle:distribution_metadata",
         "oracle:distribution_record",
+        "oracle:flashinfer_distribution_metadata",
+        "oracle:flashinfer_distribution_record",
+        "oracle:flashinfer_package_init",
         "oracle:ninja",
         "oracle:package_init",
         "oracle:python",
@@ -196,21 +191,53 @@ def _write_fixture(root: pathlib.Path) -> None:
         "path": str(weight),
         "sha256": sha256_file(weight),
     }
+    pathlib.Path(execution_artifacts["cmake_cache"]["path"]).write_text(
+        f"CMAKE_HOME_DIRECTORY:INTERNAL={source_root}\n", encoding="utf-8"
+    )
+    execution_artifacts["cmake_cache"]["sha256"] = sha256_file(
+        pathlib.Path(execution_artifacts["cmake_cache"]["path"])
+    )
+    production_execution = {
+        "artifacts": execution_artifacts,
+        "bench_dependencies": {
+            "flashinfer": FLASHINFER_VERSION,
+            "pandas": PANDAS_VERSION,
+        },
+        "build_contract": {
+            "compile_command_sha256": "a" * 64,
+            "cutlass_source_tree": _fingerprint_tree(cutlass),
+            "native_plan_target": str(native_target),
+            "native_plan_target_absent": True,
+            "profile_control": False,
+            "sm_architecture": "121a",
+            "target_compile_definitions": ["VT_CUTLASS_NVFP4=1"],
+        },
+        "cache_drop_roots": _fixture_cache_roots(root),
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
+        "max_num_seqs": MAX_NUM_SEQS,
+        "model_key": "27",
+        "num_blocks": 4736,
+        "port": 8001,
+        "vllm_oracle_version": VLLM_ORACLE_VERSION,
+        "vllm_cpp_sha": sha,
+        "vllm_source_sha": VLLM_COMMIT,
+        "snapshot_files": [],
+        "weight_files": [weight_name],
+    }
     (execution_root / "27.json").write_text(
+        json.dumps(production_execution),
+        encoding="utf-8",
+    )
+    trace_execution = json.loads(json.dumps(production_execution))
+    trace_execution["build_contract"]["profile_control"] = True
+    trace_execution["build_contract"]["target_compile_definitions"] = [
+        "VT_BENCH_PROFILE_CONTROL=1",
+        "VT_CUTLASS_NVFP4=1",
+    ]
+    trace_execution_path = execution_root / "27-trace.json"
+    trace_execution_path.write_text(
         json.dumps(
-            {
-                "artifacts": execution_artifacts,
-                "bench_dependencies": {"pandas": PANDAS_VERSION},
-                "cache_drop_roots": _fixture_cache_roots(root),
-                "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
-                "max_num_seqs": MAX_NUM_SEQS,
-                "model_key": "27",
-                "vllm_oracle_version": VLLM_ORACLE_VERSION,
-                "vllm_cpp_sha": sha,
-                "vllm_source_sha": VLLM_COMMIT,
-                "snapshot_files": [],
-                "weight_files": [weight_name],
-            }
+            trace_execution
         ),
         encoding="utf-8",
     )
@@ -234,27 +261,95 @@ def _write_fixture(root: pathlib.Path) -> None:
     trace_root = root / "trace" / "27"
     trace_root.mkdir(parents=True)
     trace_files = {}
-    for name in (
-        "ours_command",
-        "ours_profile_log",
-        "ours_nsys_report",
-        "ours_kernel_summary",
-        "ours_client_result_1",
-        "ours_client_result_2",
-        "ours_client_result_3",
-        "ours_client_log_1",
-        "ours_client_log_2",
-        "ours_client_log_3",
-        "vllm_command",
-        "vllm_profile_log",
-        "vllm_metadata",
-        "vllm_corpus",
-        "vllm_torch_trace",
-        "vllm_kernel_summary",
-    ):
+    fixture = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+    )
+    validations = []
+    summaries = []
+    plans = []
+    controls = []
+    for index in range(1, TRACE_REPETITIONS + 1):
+        suffix = "" if index == 1 else f"_{index}"
+        report_name = f"ours_nsys_report{suffix}"
+        report_path = trace_root / f"{report_name}.txt"
+        report_path.write_text(f"{report_name}\n", encoding="utf-8")
+        sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
+        _write_model_nsys_sqlite(sqlite_path, report_path=report_path)
+        validation = validate_nsys_trace(sqlite_path, model_key="27")
+        validation_path = trace_root / f"ours_nsys_validation{suffix}.json"
+        validation_path.write_text(json.dumps(validation), encoding="utf-8")
+        summary = summarize_nsys_kernels(sqlite_path)
+        summary_path = trace_root / f"ours_kernel_summary{suffix}.json"
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        native = trace_root / f"native-{index}-must-not-exist.json"
+        profile_log = trace_root / f"ours_profile_log{suffix}.log"
+        write_profile_log(
+            profile_log,
+            fixture=fixture,
+            native_target=native,
+            server_pid=6000 + index,
+        )
+        control_path = trace_root / f"ours_profile_control{suffix}.json"
+        control = record_profile_control(
+            control_path,
+            profile_log=profile_log,
+            nsys_pid=5000 + index,
+            nsys_exit_status=0,
+            server_pid=6000 + index,
+            server_pgid=5000 + index,
+        )
+        for name, path in (
+            (f"ours_nsys_sqlite{suffix}", sqlite_path),
+            (f"ours_nsys_validation{suffix}", validation_path),
+            (f"ours_kernel_summary{suffix}", summary_path),
+            (f"ours_profile_log{suffix}", profile_log),
+            (f"ours_profile_control{suffix}", control_path),
+            (report_name, report_path),
+        ):
+            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+        for stem in ("ours_command",):
+            name = f"{stem}{suffix}"
+            path = trace_root / f"{name}.txt"
+            path.write_text(f"{name}\n", encoding="utf-8")
+            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+        for stem in (
+            "ours_client_result",
+            "ours_client_log",
+            "ours_probe_result",
+            "ours_probe_log",
+        ):
+            name = f"{stem}_{index}"
+            path = trace_root / f"{name}.txt"
+            path.write_text(f"{name}\n", encoding="utf-8")
+            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+        validations.append(validation)
+        summaries.append(summary)
+        plans.append(_parse_fp4_plan_log(profile_log))
+        controls.append(control)
+    for name in ("vllm_command", "vllm_profile_log", "vllm_metadata", "vllm_corpus"):
         path = trace_root / f"{name}.txt"
         path.write_text(f"{name}\n", encoding="utf-8")
         trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
+    vllm_trace = trace_root / "vllm-trace.json.gz"
+    write_vllm_decode_trace(vllm_trace)
+    vllm_summary = trace_root / "vllm-kernel-summary.json"
+    vllm_summary.write_text(
+        json.dumps(_summarize_torch_trace(vllm_trace, model_key="27")),
+        encoding="utf-8",
+    )
+    trace_files["vllm_torch_trace"] = {
+        "path": str(vllm_trace),
+        "sha256": sha256_file(vllm_trace),
+    }
+    trace_files["vllm_kernel_summary"] = {
+        "path": str(vllm_summary),
+        "sha256": sha256_file(vllm_summary),
+    }
+    trace_files["execution_manifest"] = {
+        "path": str(trace_execution_path),
+        "sha256": sha256_file(trace_execution_path),
+    }
     for index in range(1, 4):
         trace_files[f"cache_drop_{index}"] = _write_cache_drop(
             trace_root / f"cache-drop-{index}.json",
@@ -265,19 +360,48 @@ def _write_fixture(root: pathlib.Path) -> None:
             {
                 "artifacts": trace_files,
                 "model_key": "27",
+                "node_multiset_sha256": validations[0][
+                    "canonical_node_multiset_sha256"
+                ],
+                "nsys_capture_session_uuids": [
+                    validation["capture_session_uuid"]
+                    for validation in validations
+                ],
+                "nsys_kernel_summaries": summaries,
+                "nsys_product_version": NSYS_PRODUCT_VERSION,
+                "nsys_validations": validations,
                 "ours_profiler": "nsys",
                 "passed": True,
+                "plan_validations": plans,
+                "profile_controls": controls,
+                "schema_version": TRACE_STATUS_SCHEMA_VERSION,
                 "trace_contract": {
                     "admission_mode": "closed-loop",
+                    "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
+                    "capture_range": NSYS_CAPTURE_RANGE,
+                    "capture_range_end": "stop",
                     "concurrency": TRACE_CONCURRENCY,
-                    "cuda_graph_trace": "node",
+                    "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
+                    "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
+                    "cuda_event_trace": False,
                     "enable_prefix_caching": False,
+                    "force_overwrite": True,
+                    "flush_on_cudaprofilerstop": True,
                     "input_len": INPUT_LEN,
                     "max_model_len": MAX_MODEL_LEN["27"],
                     "max_num_seqs": MAX_NUM_SEQS,
+                    "nsys_captures": TRACE_REPETITIONS,
+                    "nsys_kill": "none",
+                    "nsys_stats": False,
                     "num_prompts": TRACE_PROMPTS,
                     "output_len": OUTPUT_LEN,
+                    "probe_num_prompts": TRACE_CONCURRENCY,
+                    "probe_num_warmups": 0,
+                    "probe_timing_binding": False,
+                    "semantic_num_warmups": TRACE_CONCURRENCY,
                     "repetitions": TRACE_REPETITIONS,
+                    "sample": "none",
+                    "cpu_context_switch_trace": "none",
                 },
                 "vllm_cpp_sha": sha,
                 "vllm_profiler": "torch-profiler",
@@ -425,6 +549,14 @@ def _write_fixture(root: pathlib.Path) -> None:
 
 
 class OnlineGateSummaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        window_patch = mock.patch.dict(
+            VLLM_GENERATION_WINDOW_CONTRACTS,
+            {"27": {"all": 1, "clean": 1}},
+        )
+        window_patch.start()
+        self.addCleanup(window_patch.stop)
+
     def _summarize(self, root: pathlib.Path):
         patches = (
             mock.patch("tools.bench.online_gate.POINTS", ((1, 2),)),
@@ -466,7 +598,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
                 any("35" in reason for reason in runs["campaign_reasons"])
             )
 
-    def test_legacy_graph_level_trace_keeps_completed_timing_evidence(self) -> None:
+    def test_legacy_graph_level_trace_cannot_bind_schema_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
@@ -475,7 +607,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
             status["trace_contract"].pop("cuda_graph_trace")
             path.write_text(json.dumps(status), encoding="utf-8")
             runs, _ = self._summarize_model(root)
-            self.assertTrue(runs["gate_pass"])
+            self.assertFalse(runs["gate_pass"])
 
     def test_explicit_whole_graph_trace_cannot_pass_new_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -578,7 +710,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
-            (root / "trace" / "27" / "ours_kernel_summary.txt").write_text(
+            (root / "trace" / "27" / "ours_kernel_summary.json").write_text(
                 "tampered\n", encoding="utf-8"
             )
             runs, _ = self._summarize(root)
@@ -590,48 +722,6 @@ class OnlineGateSummaryTests(unittest.TestCase):
             _write_fixture(root)
             status_path = root / "trace" / "27" / "status.json"
             status = json.loads(status_path.read_text(encoding="utf-8"))
-            trace_root = status_path.parent
-            for field in (
-                "ours_command_2",
-                "ours_command_3",
-                "ours_profile_log_2",
-                "ours_profile_log_3",
-                "ours_nsys_report_2",
-                "ours_nsys_report_3",
-                "ours_kernel_summary_2",
-                "ours_kernel_summary_3",
-            ):
-                path = trace_root / f"{field}.txt"
-                path.write_text(f"{field}\n", encoding="utf-8")
-                status["artifacts"][field] = {
-                    "path": str(path),
-                    "sha256": sha256_file(path),
-                }
-            validations = []
-            for index in range(1, TRACE_REPETITIONS + 1):
-                suffix = "" if index == 1 else f"_{index}"
-                sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
-                _write_model_nsys_sqlite(sqlite_path)
-                validation = validate_nsys_trace(sqlite_path, model_key="27")
-                validation_path = (
-                    trace_root / f"ours_nsys_validation{suffix}.json"
-                )
-                validation_path.write_text(json.dumps(validation), encoding="utf-8")
-                status["artifacts"][f"ours_nsys_sqlite{suffix}"] = {
-                    "path": str(sqlite_path),
-                    "sha256": sha256_file(sqlite_path),
-                }
-                status["artifacts"][f"ours_nsys_validation{suffix}"] = {
-                    "path": str(validation_path),
-                    "sha256": sha256_file(validation_path),
-                }
-                validations.append(validation)
-            status["trace_contract"]["nsys_captures"] = TRACE_REPETITIONS
-            status["trace_contract"][
-                "cuda_flush_interval_ms"
-            ] = NSYS_CUDA_FLUSH_INTERVAL_MS
-            status["nsys_validations"] = validations
-            status_path.write_text(json.dumps(status), encoding="utf-8")
             runs, _ = self._summarize(root)
             self.assertTrue(runs["gate_pass"])
 

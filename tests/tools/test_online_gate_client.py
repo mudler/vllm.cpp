@@ -8,14 +8,19 @@ Upstream sources at vLLM e24d1b24:
 
 from __future__ import annotations
 
+import ast
+import gzip
 import json
+import os
 import pathlib
+import shlex
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+import uuid
 from unittest import mock
 
 from tools.bench.online_gate import (
@@ -24,14 +29,21 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
+    FLASHINFER_VERSION,
+    NSYS_CAPTURE_RANGE,
     NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
+    NSYS_PRODUCT_VERSION,
     OUTPUT_LEN,
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
+    TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
+    TRACE_REQUIRED_ENV,
+    VLLM_DECODE_FAMILY_CONTRACTS,
+    VLLM_GENERATION_WINDOW_CONTRACTS,
     VLLM_ORACLE_VERSION,
     OnlineRun,
     build_client_command,
@@ -41,10 +53,14 @@ from tools.bench.online_gate import (
     record_memory_return,
     record_model_gate,
     record_oracle_manifest,
+    record_profile_control,
     record_trace_status,
+    summarize_nsys_kernels,
     validate_nsys_trace,
     validate_plan,
     validate_raw_result,
+    _fingerprint_tree,
+    _summarize_torch_trace,
 )
 from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
 
@@ -82,11 +98,18 @@ def valid_record(*, requests: int = 6, concurrency: int = 1) -> dict:
 def write_nsys_sqlite(
     path: pathlib.Path,
     *,
+    report_path: pathlib.Path | None = None,
     family_drift: bool = False,
     lost_events: bool = False,
     model_contract: bool = False,
+    orphan_child: bool = False,
+    signature_drift: bool = False,
     uneven_replays: bool = False,
 ) -> None:
+    report_path = report_path or path.with_suffix(".nsys-rep")
+    if not report_path.exists():
+        report_path.write_text("synthetic Nsight report\n", encoding="utf-8")
+    capture_uuid = str(uuid.uuid4())
     connection = sqlite3.connect(path)
     try:
         connection.execute(
@@ -96,7 +119,60 @@ def write_nsys_sqlite(
         connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
         connection.execute(
             "CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL "
-            "(graphNodeId INTEGER, demangledName INTEGER)"
+            "(start INTEGER, end INTEGER, deviceId INTEGER, contextId INTEGER, "
+            "greenContextId INTEGER, streamId INTEGER, correlationId INTEGER, "
+            "globalPid INTEGER, demangledName INTEGER, shortName INTEGER, "
+            "mangledName INTEGER, launchType INTEGER, cacheConfig INTEGER, "
+            "registersPerThread INTEGER, gridX INTEGER, gridY INTEGER, gridZ INTEGER, "
+            "blockX INTEGER, blockY INTEGER, blockZ INTEGER, staticSharedMemory INTEGER, "
+            "dynamicSharedMemory INTEGER, localMemoryPerThread INTEGER, "
+            "localMemoryTotal INTEGER, gridId INTEGER, sharedMemoryExecuted INTEGER, "
+            "graphNodeId INTEGER, sharedMemoryLimitConfig INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME "
+            "(start INTEGER, end INTEGER, eventClass INTEGER, globalTid INTEGER, "
+            "correlationId INTEGER, nameId INTEGER, returnValue INTEGER, callchainId INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY "
+            "(start INTEGER, end INTEGER, deviceId INTEGER, contextId INTEGER, "
+            "greenContextId INTEGER, streamId INTEGER, correlationId INTEGER, "
+            "globalPid INTEGER, bytes INTEGER, copyKind INTEGER, deprecatedSrcId INTEGER, "
+            "srcKind INTEGER, dstKind INTEGER, srcDeviceId INTEGER, srcContextId INTEGER, "
+            "dstDeviceId INTEGER, dstContextId INTEGER, migrationCause INTEGER, "
+            "graphNodeId INTEGER, virtualAddress INTEGER, copyCount INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET "
+            "(start INTEGER, end INTEGER, deviceId INTEGER, contextId INTEGER, "
+            "greenContextId INTEGER, streamId INTEGER, correlationId INTEGER, "
+            "globalPid INTEGER, value INTEGER, bytes INTEGER, graphNodeId INTEGER, "
+            "memKind INTEGER)"
+        )
+        connection.execute("CREATE TABLE META_DATA_CAPTURE (name TEXT, value TEXT)")
+        connection.execute("CREATE TABLE META_DATA_EXPORT (name TEXT, value TEXT)")
+        connection.execute(
+            "CREATE TABLE TARGET_INFO_SESSION_START_TIME "
+            "(utcEpochNs INTEGER, utcTime TEXT, localTime TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO META_DATA_CAPTURE VALUES (?, ?)",
+            ("PROFILING_SESSION_UUID", capture_uuid),
+        )
+        connection.executemany(
+            "INSERT INTO META_DATA_EXPORT VALUES (?, ?)",
+            [
+                ("EXPORT_PRODUCT_NAME", "NVIDIA Nsight Systems"),
+                ("EXPORT_PRODUCT_VERSION", NSYS_PRODUCT_VERSION),
+                ("EXPORT_PARAM_LAZY", "false"),
+                ("EXPORT_PARAM_INPUT_PATH_ABS", str(report_path.resolve())),
+                ("EXPORT_PARAM_OUTPUT_PATH_ABS", str(path.resolve())),
+            ],
+        )
+        connection.execute(
+            "INSERT INTO TARGET_INFO_SESSION_START_TIME VALUES (?, ?, ?)",
+            (1_783_950_501_877_615_336, "2026-07-13T13:48:21", "2026-07-13T15:48:21"),
         )
         connection.execute(
             "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
@@ -123,23 +199,110 @@ def write_nsys_sqlite(
                 ["unclassified-kernel"]
                 * (contract["node_count"] - len(node_names))
             )
-            replay_counts = [3] * len(node_names)
+            memcpy_nodes = 7
         else:
             node_names = ["kernel-a", "kernel-b"]
-            replay_counts = [3, 2 if uneven_replays else 3]
+            memcpy_nodes = 1
+        launch_name = "cudaGraphLaunch_v10000"
         string_ids = {
-            name: index for index, name in enumerate(sorted(set(node_names)), start=1)
+            name: index
+            for index, name in enumerate(
+                sorted(set(node_names + [launch_name])), start=1
+            )
         }
         connection.executemany(
             "INSERT INTO StringIds VALUES (?, ?)",
             [(identifier, name) for name, identifier in string_ids.items()],
         )
-        for graph_node_id, (name, replay_count) in enumerate(
-            zip(node_names, replay_counts, strict=True), start=1
-        ):
-            connection.executemany(
-                "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?, ?)",
-                [(graph_node_id, string_ids[name])] * replay_count,
+        launch_ids = [1001, 1002, 1003, 1004]
+        for launch_index, correlation_id in enumerate(launch_ids):
+            connection.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    launch_index * 100_000,
+                    launch_index * 100_000 + 100,
+                    0,
+                    1,
+                    correlation_id,
+                    string_ids[launch_name],
+                    0,
+                    None,
+                ),
+            )
+            for graph_node_id, name in enumerate(node_names, start=1):
+                if uneven_replays and graph_node_id == len(node_names) and launch_index == 3:
+                    continue
+                row_correlation = 9999 if orphan_child and graph_node_id == 1 else correlation_id
+                grid_x = 2 if signature_drift and graph_node_id == 1 and launch_index == 3 else 1
+                connection.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ("
+                    + ",".join("?" for _ in range(28))
+                    + ")",
+                    (
+                        launch_index * 100_000 + graph_node_id * 10,
+                        launch_index * 100_000 + graph_node_id * 10 + 5,
+                        0,
+                        1,
+                        None,
+                        7,
+                        row_correlation,
+                        1,
+                        string_ids[name],
+                        string_ids[name],
+                        None,
+                        0,
+                        0,
+                        32,
+                        grid_x,
+                        1,
+                        1,
+                        256,
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        graph_node_id,
+                        None,
+                        graph_node_id,
+                        None,
+                    ),
+                )
+            for node_index in range(memcpy_nodes):
+                connection.execute(
+                    "INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES ("
+                    + ",".join("?" for _ in range(21))
+                    + ")",
+                    (
+                        1,
+                        2,
+                        0,
+                        1,
+                        None,
+                        7,
+                        correlation_id,
+                        1,
+                        4096 + node_index,
+                        1,
+                        None,
+                        1,
+                        2,
+                        0,
+                        1,
+                        0,
+                        1,
+                        None,
+                        2001 + node_index,
+                        None,
+                        1,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_MEMSET VALUES ("
+                + ",".join("?" for _ in range(12))
+                + ")",
+                (1, 2, 0, 1, None, 7, correlation_id, 1, 0, 4096, 3001, 1),
             )
         connection.commit()
     finally:
@@ -161,6 +324,142 @@ def write_cache_drop_report(path: pathlib.Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def write_profile_log(
+    path: pathlib.Path,
+    *,
+    fixture: pathlib.Path,
+    native_target: pathlib.Path,
+    server_pid: int,
+) -> None:
+    document = json.loads(fixture.read_text(encoding="utf-8"))
+    plans = []
+    for key, value in document.items():
+        if key == "_metadata":
+            continue
+        shapes = ast.literal_eval(key)[2]
+        m, packed_k = shapes[0]
+        _, n = shapes[1]
+        plans.append((m, n, packed_k * 2, value[1]))
+    plans.sort()
+    lines = [
+        "[VT_FP4_CACHE] prepared mode=read-only "
+        f"native={native_target} flashinfer={fixture} loaded=64 "
+        "(flashinfer=64 native=0) rejected=0 delay_us=5000 "
+        "metadata=2e429d4cd3977f0f selected=64",
+        "[VT_FP4_CACHE] complete mode=read-only loaded=64 tuned=0 "
+        "rejected=0 saved=0 selected=64 metadata=2e429d4cd3977f0f",
+        *[
+            f"[VT_FP4_CACHE] selected M={m} N={n} K={k} tactic={tactic}"
+            for m, n, k, tactic in plans
+        ],
+        "[VT_FP4_AUTOTUNE] pre-serve warmup complete max_tokens=2048 "
+        "profiles_requested=0 profiles_tuned=0 cached_plans=64",
+        f"[VT_CUDA_PROFILE] ready pid={server_pid} signal=SIGUSR2 target_replays=4",
+        "[VT_CUDA_PROFILE] started target_replays=4 graph=0x1234 "
+        "real_batch=16 padded_batch=16 prior_replays=128",
+        "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_client_command_log(
+    path: pathlib.Path,
+    *,
+    client: pathlib.Path,
+    corpus: pathlib.Path,
+    result: pathlib.Path,
+    prompts: int,
+    warmups: int,
+) -> None:
+    command = [
+        str(client),
+        "bench",
+        "serve",
+        "--backend",
+        "openai",
+        "--base-url",
+        "http://127.0.0.1:8001",
+        "--endpoint",
+        "/v1/completions",
+        "--model",
+        "gate",
+        "--tokenizer",
+        str(corpus.parent),
+        "--dataset-name",
+        "custom",
+        "--dataset-path",
+        str(corpus),
+        "--custom-output-len",
+        str(OUTPUT_LEN),
+        "--skip-chat-template",
+        "--disable-shuffle",
+        "--num-prompts",
+        str(prompts),
+        "--max-concurrency",
+        str(TRACE_CONCURRENCY),
+        "--request-rate",
+        "inf",
+        "--num-warmups",
+        str(warmups),
+        "--ready-check-timeout-sec",
+        "0",
+        "--seed",
+        "0",
+        "--ignore-eos",
+        "--temperature",
+        "0",
+        "--save-result",
+        "--save-detailed",
+        "--result-dir",
+        str(result.parent),
+        "--result-filename",
+        result.name,
+        "--disable-tqdm",
+    ]
+    path.write_text(f"command: {shlex.join(command)}\npassed\n", encoding="utf-8")
+
+
+def write_vllm_decode_trace(path: pathlib.Path, *, model_key: str = "27") -> None:
+    events = [
+        {
+            "ph": "X",
+            "cat": "gpu_user_annotation",
+            "name": "execute_context_0(0)_generation_16(16)",
+            "pid": 0,
+            "tid": 7,
+            "ts": 1_000.0,
+            "dur": 100_000.0,
+        }
+    ]
+    timestamp = 2_000.0
+    for _, (name, count) in VLLM_DECODE_FAMILY_CONTRACTS[model_key].items():
+        for _ in range(count):
+            events.append(
+                {
+                    "ph": "X",
+                    "cat": "kernel",
+                    "name": name,
+                    "pid": 0,
+                    "tid": 7,
+                    "ts": timestamp,
+                    "dur": 1.0,
+                    "args": {
+                        "block": [256, 1, 1],
+                        "grid": [128, 1, 1],
+                        "registers per thread": 32,
+                        "shared memory": 0,
+                    },
+                }
+            )
+            timestamp += 2.0
+    document = {"traceEvents": events}
+    if path.suffix == ".gz":
+        with gzip.open(path, "wt", encoding="utf-8") as output:
+            json.dump(document, output)
+    else:
+        path.write_text(json.dumps(document), encoding="utf-8")
 
 
 class OnlineClientContractTests(unittest.TestCase):
@@ -190,6 +489,9 @@ class OnlineClientContractTests(unittest.TestCase):
             self.assertEqual(command[command.index("--num-prompts") + 1], "96")
             self.assertEqual(command[command.index("--max-concurrency") + 1], "16")
             self.assertEqual(command[command.index("--num-warmups") + 1], "16")
+            self.assertEqual(
+                command[command.index("--ready-check-timeout-sec") + 1], "0"
+            )
             self.assertIn("--disable-shuffle", command)
             self.assertIn("--skip-chat-template", command)
             self.assertIn("--save-detailed", command)
@@ -302,7 +604,7 @@ class OnlineClientContractTests(unittest.TestCase):
         )
         self.assertEqual(
             plan["vllm_oracle_bench_dependencies"],
-            {"pandas": PANDAS_VERSION},
+            {"flashinfer": FLASHINFER_VERSION, "pandas": PANDAS_VERSION},
         )
         self.assertIn(
             "summary-<model>/{all-runs,ratios}.json",
@@ -367,7 +669,9 @@ class OnlineClientContractTests(unittest.TestCase):
             result = validate_nsys_trace(clean)
             self.assertTrue(result["lossless"])
             self.assertEqual(result["primary_graph_node_count"], 2)
-            self.assertEqual(result["primary_graph_replay_count"], 3)
+            self.assertEqual(
+                result["primary_graph_replay_count"], TRACE_CAPTURE_GRAPH_REPLAYS
+            )
 
             lost = root / "lost.sqlite"
             write_nsys_sqlite(lost, lost_events=True)
@@ -378,6 +682,16 @@ class OnlineClientContractTests(unittest.TestCase):
             write_nsys_sqlite(uneven, uneven_replays=True)
             with self.assertRaisesRegex(HarnessError, "uneven replay counts"):
                 validate_nsys_trace(uneven)
+
+            orphan = root / "orphan.sqlite"
+            write_nsys_sqlite(orphan, orphan_child=True)
+            with self.assertRaisesRegex(HarnessError, "direct cudaGraphLaunch"):
+                validate_nsys_trace(orphan)
+
+            signature_drift = root / "signature-drift.sqlite"
+            write_nsys_sqlite(signature_drift, signature_drift=True)
+            with self.assertRaisesRegex(HarnessError, "signature differs"):
+                validate_nsys_trace(signature_drift)
 
             model_contract = root / "model-contract.sqlite"
             write_nsys_sqlite(model_contract, model_contract=True)
@@ -486,6 +800,14 @@ class OnlineClientContractTests(unittest.TestCase):
             pandas_dist_info = (
                 root / "venv" / "site-packages" / f"pandas-{PANDAS_VERSION}.dist-info"
             )
+            flashinfer_package = root / "venv" / "site-packages" / "flashinfer"
+            flashinfer_dist_info = (
+                root
+                / "venv"
+                / "site-packages"
+                / f"flashinfer_python-{FLASHINFER_VERSION}.dist-info"
+            )
+            cutlass = flashinfer_package / "data" / "cutlass"
             for directory in (
                 bin_dir,
                 package / "benchmarks" / "datasets",
@@ -493,6 +815,10 @@ class OnlineClientContractTests(unittest.TestCase):
                 dist_info,
                 pandas_package,
                 pandas_dist_info,
+                flashinfer_package,
+                flashinfer_dist_info,
+                cutlass / "include" / "cutlass",
+                cutlass / "tools" / "util" / "include",
             ):
                 directory.mkdir(parents=True, exist_ok=True)
             client = bin_dir / "vllm"
@@ -512,6 +838,11 @@ class OnlineClientContractTests(unittest.TestCase):
                 pandas_package / "__init__.py",
                 pandas_dist_info / "METADATA",
                 pandas_dist_info / "RECORD",
+                flashinfer_package / "__init__.py",
+                flashinfer_dist_info / "METADATA",
+                flashinfer_dist_info / "RECORD",
+                cutlass / "include" / "cutlass" / "cutlass.h",
+                cutlass / "tools" / "util" / "include" / "helper.h",
             ):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
             ninja.chmod(0o755)
@@ -523,6 +854,10 @@ class OnlineClientContractTests(unittest.TestCase):
                 version=PANDAS_VERSION,
                 _path=pandas_dist_info,
             )
+            flashinfer_distribution = types.SimpleNamespace(
+                version=FLASHINFER_VERSION,
+                _path=flashinfer_dist_info,
+            )
             module = types.SimpleNamespace(
                 __version__=VLLM_ORACLE_VERSION,
                 __file__=str(package_init),
@@ -531,7 +866,12 @@ class OnlineClientContractTests(unittest.TestCase):
                 __version__=PANDAS_VERSION,
                 __file__=str(pandas_package / "__init__.py"),
             )
+            flashinfer_module = types.SimpleNamespace(
+                __version__=FLASHINFER_VERSION,
+                __file__=str(flashinfer_package / "__init__.py"),
+            )
             distributions = {
+                "flashinfer-python": flashinfer_distribution,
                 "pandas": pandas_distribution,
                 "vllm": distribution,
             }
@@ -539,7 +879,11 @@ class OnlineClientContractTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     "sys.modules",
-                    {"pandas": pandas_module, "vllm": module},
+                    {
+                        "flashinfer": flashinfer_module,
+                        "pandas": pandas_module,
+                        "vllm": module,
+                    },
                 ),
                 mock.patch(
                     "tools.bench.online_gate.importlib.metadata.distribution",
@@ -550,8 +894,12 @@ class OnlineClientContractTests(unittest.TestCase):
                 result = record_oracle_manifest(output, client=client)
             self.assertEqual(result["oracle_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(result["runtime_version"], VLLM_ORACLE_VERSION)
-            self.assertEqual(result["bench_dependencies"], {"pandas": PANDAS_VERSION})
-            self.assertEqual(len(result["artifacts"]), 12)
+            self.assertEqual(
+                result["bench_dependencies"],
+                {"flashinfer": FLASHINFER_VERSION, "pandas": PANDAS_VERSION},
+            )
+            self.assertEqual(len(result["artifacts"]), 15)
+            self.assertEqual(result["cutlass_source_tree"]["file_count"], 2)
             self.assertEqual(
                 result["artifacts"]["bench_serve"]["sha256"],
                 sha256_file(package / "benchmarks" / "serve.py"),
@@ -564,7 +912,11 @@ class OnlineClientContractTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     "sys.modules",
-                    {"pandas": pandas_module, "vllm": module},
+                    {
+                        "flashinfer": flashinfer_module,
+                        "pandas": pandas_module,
+                        "vllm": module,
+                    },
                 ),
                 mock.patch(
                     "tools.bench.online_gate.importlib.metadata.distribution",
@@ -577,22 +929,54 @@ class OnlineClientContractTests(unittest.TestCase):
             with (
                 mock.patch.dict(
                     "sys.modules",
-                    {"pandas": None, "vllm": module},
+                    {
+                        "flashinfer": flashinfer_module,
+                        "pandas": None,
+                        "vllm": module,
+                    },
                 ),
                 mock.patch(
                     "tools.bench.online_gate.importlib.metadata.distribution",
-                    return_value=distribution,
+                    side_effect=distributions.__getitem__,
                 ),
                 mock.patch("tools.bench.online_gate.sys.executable", str(python)),
                 self.assertRaisesRegex(HarnessError, "pinned pandas"),
             ):
                 record_oracle_manifest(root / "missing-pandas.json", client=client)
 
+    @mock.patch.dict(
+        VLLM_GENERATION_WINDOW_CONTRACTS,
+        {"27": {"all": 1, "clean": 1}},
+    )
     def test_execution_model_and_trace_records_hash_their_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             build = root / "build"
             (build / "examples").mkdir(parents=True)
+            source = root / "source"
+            (source / "src/vt/cuda").mkdir(parents=True)
+            (source / "src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu").write_text(
+                "// fixture\n", encoding="utf-8"
+            )
+            fixture = source / (
+                "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+            )
+            fixture.parent.mkdir(parents=True)
+            fixture.write_bytes(
+                (
+                    pathlib.Path(__file__).resolve().parents[2]
+                    / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+                ).read_bytes()
+            )
+            cutlass = root / "oracle-cutlass"
+            (cutlass / "include/cutlass").mkdir(parents=True)
+            (cutlass / "tools/util/include").mkdir(parents=True)
+            (cutlass / "include/cutlass/cutlass.h").write_text(
+                "cutlass\n", encoding="utf-8"
+            )
+            (cutlass / "tools/util/include/helper.h").write_text(
+                "helper\n", encoding="utf-8"
+            )
             snapshot = root / "890bdef7a42feba6d83b6e17a03315c694112f2a"
             snapshot.mkdir()
             bin_dir = root / "oracle-bin"
@@ -600,17 +984,61 @@ class OnlineClientContractTests(unittest.TestCase):
             client = bin_dir / "vllm"
             build_command = root / "build-command.txt"
             build_log = root / "build.log"
+            configure_log = root / "configure.log"
             for path in (
-                build / "CMakeCache.txt",
-                build / "examples" / "server",
                 build_command,
                 build_log,
+                configure_log,
                 snapshot / "config.json",
                 snapshot / "tokenizer.json",
                 snapshot / "model-00001-of-00001.safetensors",
                 client,
             ):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
+            configure_log.write_text(
+                f"-- CUTLASS found at {cutlass}; enabling sm120a NVFP4 cutlass GEMM\n",
+                encoding="utf-8",
+            )
+            (build / "CMakeCache.txt").write_text(
+                "\n".join(
+                    (
+                        "CMAKE_BUILD_TYPE:STRING=Release",
+                        "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
+                        f"CMAKE_HOME_DIRECTORY:INTERNAL={source}",
+                        "VLLM_CPP_BENCH_PROFILE_CONTROL:BOOL=ON",
+                        "VLLM_CPP_CUDA:STRING=ON",
+                        "VLLM_CPP_CUDA_ARCHITECTURES:STRING=121a",
+                        f"VLLM_CPP_CUTLASS_DIR:PATH={cutlass}",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            compile_command = (
+                "nvcc -DVT_CUTLASS_NVFP4=1 -DVT_BENCH_PROFILE_CONTROL=1 "
+                '"--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]" '
+                f"-isystem {cutlass / 'include'} "
+                f"-isystem {cutlass / 'tools/util/include'} -c "
+                f"{source / 'src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu'}"
+            )
+            (build / "compile_commands.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "command": compile_command,
+                            "directory": str(build),
+                            "file": str(
+                                source / "src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu"
+                            ),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (build / "examples/server").write_bytes(
+                b"MatmulNvfp4Cutlass\0[VT_FP4_CACHE] prepared\0"
+                b"[VT_CUDA_PROFILE] started\0"
+            )
             oracle_files = {}
             for name in (
                 "bench_datasets",
@@ -619,6 +1047,9 @@ class OnlineClientContractTests(unittest.TestCase):
                 "client",
                 "distribution_metadata",
                 "distribution_record",
+                "flashinfer_distribution_metadata",
+                "flashinfer_distribution_record",
+                "flashinfer_package_init",
                 "ninja",
                 "package_init",
                 "python",
@@ -636,32 +1067,48 @@ class OnlineClientContractTests(unittest.TestCase):
                 json.dumps(
                     {
                         "artifacts": oracle_files,
-                        "bench_dependencies": {"pandas": PANDAS_VERSION},
+                        "bench_dependencies": {
+                            "flashinfer": FLASHINFER_VERSION,
+                            "pandas": PANDAS_VERSION,
+                        },
                         "client_contract_source_commit": VLLM_COMMIT,
+                        "cutlass_source_tree": _fingerprint_tree(cutlass),
                         "oracle_version": VLLM_ORACLE_VERSION,
                         "runtime_version": VLLM_ORACLE_VERSION,
                     }
                 ),
                 encoding="utf-8",
             )
-            execution = record_execution_manifest(
-                root / "execution.json",
-                model_key="27",
-                vllm_cpp_sha="d" * 40,
-                build_dir=build,
-                client=client,
-                snapshot=snapshot,
-                build_command=build_command,
-                build_log=build_log,
-                oracle_manifest=oracle_manifest,
-                port=8001,
-                num_blocks=4736,
-                max_num_seqs=MAX_NUM_SEQS,
-                max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS["27"],
-            )
+            native_target = root / "native-must-not-exist.json"
+            trace_environment = {
+                **TRACE_REQUIRED_ENV,
+                "VT_FP4_AUTOTUNE_CACHE_PATH": str(native_target),
+                "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
+            }
+            with mock.patch.dict(os.environ, trace_environment, clear=False):
+                execution = record_execution_manifest(
+                    root / "execution.json",
+                    model_key="27",
+                    vllm_cpp_sha="d" * 40,
+                    build_dir=build,
+                    client=client,
+                    snapshot=snapshot,
+                    configure_log=configure_log,
+                    build_command=build_command,
+                    build_log=build_log,
+                    oracle_manifest=oracle_manifest,
+                    port=8001,
+                    num_blocks=4736,
+                    max_num_seqs=MAX_NUM_SEQS,
+                    max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS["27"],
+                    profile_control=True,
+                )
             self.assertEqual(execution["model_key"], "27")
             self.assertEqual(execution["vllm_oracle_version"], VLLM_ORACLE_VERSION)
-            self.assertEqual(execution["bench_dependencies"], {"pandas": PANDAS_VERSION})
+            self.assertEqual(execution["bench_dependencies"], {
+                "flashinfer": FLASHINFER_VERSION,
+                "pandas": PANDAS_VERSION,
+            })
             self.assertIn("oracle:bench_serve", execution["artifacts"])
             self.assertIn("build_command", execution["artifacts"])
 
@@ -682,6 +1129,9 @@ class OnlineClientContractTests(unittest.TestCase):
             ours_kernel_summaries = []
             ours_commands = []
             ours_profile_logs = []
+            ours_profile_controls = []
+            vllm_corpus = root / "vllm-corpus.jsonl"
+            vllm_corpus.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
             for index in range(TRACE_REPETITIONS):
                 report = root / f"ours-{index}.nsys-rep"
                 report.write_text("trace\n", encoding="utf-8")
@@ -693,22 +1143,94 @@ class OnlineClientContractTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 summary = root / f"ours-{index}-summary.txt"
-                summary.write_text("summary\n", encoding="utf-8")
+                summary.write_text(
+                    json.dumps(summarize_nsys_kernels(sqlite_path)), encoding="utf-8"
+                )
                 command = root / f"ours-{index}-command.txt"
                 profile_log = root / f"ours-{index}-profile.log"
-                profile_log.write_text("profile\n", encoding="utf-8")
+                native = root / f"native-{index}-must-not-exist.json"
+                server_pid = 6000 + index
+                nsys_pid = 5000 + index
+                write_profile_log(
+                    profile_log,
+                    fixture=fixture,
+                    native_target=native,
+                    server_pid=server_pid,
+                )
+                command_environment = {
+                    **TRACE_REQUIRED_ENV,
+                    "VT_FP4_AUTOTUNE_CACHE_PATH": str(native),
+                    "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
+                }
+                prefix = root / f"ours-{index}"
+                profile_command = [
+                    "env",
+                    *[f"{name}={value}" for name, value in command_environment.items()],
+                    "nsys",
+                    "profile",
+                    "--trace=cuda",
+                    f"--capture-range={NSYS_CAPTURE_RANGE}",
+                    "--capture-range-end=stop",
+                    "--flush-on-cudaprofilerstop=true",
+                    f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}",
+                    f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}",
+                    "--cuda-event-trace=false",
+                    "--sample=none",
+                    "--cpuctxsw=none",
+                    "--stats=false",
+                    "--kill=none",
+                    "--force-overwrite=true",
+                    "--output",
+                    str(prefix),
+                    str(build / "examples/server"),
+                    "--model",
+                    str(snapshot),
+                    "--port",
+                    "8001",
+                    "--num-blocks",
+                    "4736",
+                    "--max-num-seqs",
+                    str(MAX_NUM_SEQS),
+                    "--max-num-batched-tokens",
+                    str(MAX_NUM_BATCHED_TOKENS["27"]),
+                    "--max-model-len",
+                    str(MAX_MODEL_LEN["27"]),
+                    "--no-enable-prefix-caching",
+                    "--cuda-profile-graph-replays",
+                    str(TRACE_CAPTURE_GRAPH_REPLAYS),
+                    "--served-model-name",
+                    "gate",
+                ]
+                command.write_text(shlex.join(profile_command) + "\n", encoding="utf-8")
+                control = root / f"ours-{index}-control.json"
+                record_profile_control(
+                    control,
+                    profile_log=profile_log,
+                    nsys_pid=nsys_pid,
+                    nsys_exit_status=0,
+                    server_pid=server_pid,
+                    server_pgid=nsys_pid,
+                )
                 ours_nsys_reports.append(report)
                 ours_nsys_sqlites.append(sqlite_path)
                 ours_nsys_validations.append(validation)
                 ours_kernel_summaries.append(summary)
                 ours_commands.append(command)
                 ours_profile_logs.append(profile_log)
-            vllm_torch_trace = root / "vllm-trace.json.gz"
+                ours_profile_controls.append(control)
+            vllm_profile_dir = root / "vllm-profile"
+            vllm_profile_dir.mkdir()
+            vllm_torch_trace = vllm_profile_dir / "vllm-trace.json.gz"
             vllm_kernel_summary = root / "vllm-kernels.json"
-            vllm_torch_trace.write_text("trace\n", encoding="utf-8")
-            vllm_kernel_summary.write_text("summary\n", encoding="utf-8")
+            write_vllm_decode_trace(vllm_torch_trace)
+            vllm_kernel_summary.write_text(
+                json.dumps(_summarize_torch_trace(vllm_torch_trace, model_key="27")),
+                encoding="utf-8",
+            )
             ours_client_results = []
             ours_client_logs = []
+            ours_probe_results = []
+            ours_probe_logs = []
             for index in range(TRACE_REPETITIONS):
                 result_path = root / f"ours-client-{index}.json"
                 result_path.write_text(
@@ -721,15 +1243,71 @@ class OnlineClientContractTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 log_path = root / f"ours-client-{index}.log"
-                log_path.write_text("client passed\n", encoding="utf-8")
+                write_client_command_log(
+                    log_path,
+                    client=client,
+                    corpus=vllm_corpus,
+                    result=result_path,
+                    prompts=TRACE_PROMPTS,
+                    warmups=TRACE_CONCURRENCY,
+                )
                 ours_client_results.append(result_path)
                 ours_client_logs.append(log_path)
+                probe_result = root / f"ours-probe-{index}.json"
+                probe_result.write_text(
+                    json.dumps(
+                        valid_record(
+                            requests=TRACE_CONCURRENCY,
+                            concurrency=TRACE_CONCURRENCY,
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                probe_log = root / f"ours-probe-{index}.log"
+                write_client_command_log(
+                    probe_log,
+                    client=client,
+                    corpus=vllm_corpus,
+                    result=probe_result,
+                    prompts=TRACE_CONCURRENCY,
+                    warmups=0,
+                )
+                ours_probe_results.append(probe_result)
+                ours_probe_logs.append(probe_log)
             vllm_command = root / "vllm-command.txt"
             vllm_profile_log = root / "vllm-profile.log"
-            vllm_corpus = root / "vllm-corpus.jsonl"
-            for path in (vllm_command, vllm_profile_log, vllm_corpus):
-                path.write_text(f"{path.name}\n", encoding="utf-8")
+            vllm_profile_log.write_text("profile passed\n", encoding="utf-8")
             vllm_metadata = root / "vllm-metadata.json"
+            oracle_python = pathlib.Path(
+                execution["artifacts"]["oracle:python"]["path"]
+            )
+            vllm_profile_command = [
+                "env",
+                f"PATH={oracle_python.parent}",
+                str(oracle_python),
+                str(source / "tools/bench/profile_vllm_online_gate.py"),
+                "--model",
+                str(snapshot),
+                "--corpus",
+                str(vllm_corpus),
+                "--profile-dir",
+                str(vllm_profile_dir),
+                "--metadata",
+                str(vllm_metadata),
+                "--num-prompts",
+                str(TRACE_PROMPTS),
+                "--max-concurrency",
+                str(TRACE_CONCURRENCY),
+                "--max-num-seqs",
+                str(MAX_NUM_SEQS),
+                "--max-num-batched-tokens",
+                str(MAX_NUM_BATCHED_TOKENS["27"]),
+                "--repetitions",
+                str(TRACE_REPETITIONS),
+            ]
+            vllm_command.write_text(
+                shlex.join(vllm_profile_command) + "\n", encoding="utf-8"
+            )
             vllm_metadata.write_text(
                 json.dumps(
                     {
@@ -742,6 +1320,7 @@ class OnlineClientContractTests(unittest.TestCase):
                         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS["27"],
                         "max_model_len": MAX_MODEL_LEN["27"],
                         "max_num_seqs": MAX_NUM_SEQS,
+                        "model": str(snapshot),
                         "num_prompts": TRACE_PROMPTS,
                         "output_digest": "a" * 64,
                         "output_digests": [
@@ -753,6 +1332,7 @@ class OnlineClientContractTests(unittest.TestCase):
                         "output_digests_equal": False,
                         "output_len": OUTPUT_LEN,
                         "profiled_warmup_prompts": TRACE_PROMPTS,
+                        "profile_dir": str(vllm_profile_dir),
                         "repetitions": TRACE_REPETITIONS,
                     }
                 ),
@@ -764,10 +1344,6 @@ class OnlineClientContractTests(unittest.TestCase):
                 write_cache_drop_report(path)
                 cache_drop_reports.append(path)
 
-            def write_ours_commands(value: str) -> None:
-                for path in ours_commands:
-                    path.write_text(value, encoding="utf-8")
-
             def record_trace():
                 return record_trace_status(
                     root / "trace.json",
@@ -778,8 +1354,11 @@ class OnlineClientContractTests(unittest.TestCase):
                     ours_kernel_summaries=ours_kernel_summaries,
                     ours_commands=ours_commands,
                     ours_profile_logs=ours_profile_logs,
+                    ours_profile_controls=ours_profile_controls,
                     ours_client_results=ours_client_results,
                     ours_client_logs=ours_client_logs,
+                    ours_probe_results=ours_probe_results,
+                    ours_probe_logs=ours_probe_logs,
                     vllm_torch_trace=vllm_torch_trace,
                     vllm_kernel_summary=vllm_kernel_summary,
                     vllm_command=vllm_command,
@@ -787,53 +1366,9 @@ class OnlineClientContractTests(unittest.TestCase):
                     vllm_metadata=vllm_metadata,
                     vllm_corpus=vllm_corpus,
                     cache_drop_reports=cache_drop_reports,
+                    execution_manifest=root / "execution.json",
                     vllm_cpp_sha="d" * 40,
                 )
-
-            write_ours_commands("nsys server\n")
-            with self.assertRaisesRegex(HarnessError, "disable prefix caching"):
-                record_trace()
-            write_ours_commands(
-                "nsys server --max-num-seqs 32 --max-num-batched-tokens 2048 "
-                "--no-enable-prefix-caching\n"
-            )
-            with self.assertRaisesRegex(HarnessError, "node-level CUDA graph"):
-                record_trace()
-            write_ours_commands(
-                "nsys --cuda-graph-trace=node server --max-num-seqs 32 "
-                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n"
-            )
-            with self.assertRaisesRegex(HarnessError, "periodically flush"):
-                record_trace()
-            write_ours_commands(
-                "nsys --cuda-graph-trace=node --cuda-flush-interval=10000 "
-                "server --max-num-seqs 32 --max-num-batched-tokens 2048 "
-                "--no-enable-prefix-caching\n"
-            )
-            with self.assertRaisesRegex(HarnessError, "context-switch"):
-                record_trace()
-            write_ours_commands(
-                "nsys --cuda-graph-trace=node --cuda-flush-interval=10000 "
-                "--cpuctxsw=none server --max-num-seqs 32 "
-                "--max-num-batched-tokens 2048 --no-enable-prefix-caching\n"
-            )
-            slow = valid_record(
-                requests=TRACE_PROMPTS,
-                concurrency=TRACE_CONCURRENCY,
-            )
-            slow["duration"] = 15.0
-            ours_client_results[-1].write_text(json.dumps(slow), encoding="utf-8")
-            with self.assertRaisesRegex(HarnessError, "duration by more than 20%"):
-                record_trace()
-            ours_client_results[-1].write_text(
-                json.dumps(
-                    valid_record(
-                        requests=TRACE_PROMPTS,
-                        concurrency=TRACE_CONCURRENCY,
-                    )
-                ),
-                encoding="utf-8",
-            )
 
             trace = record_trace()
             self.assertEqual(trace["ours_profiler"], "nsys")

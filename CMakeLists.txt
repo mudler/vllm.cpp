@@ -35,6 +35,9 @@ if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httpl
 endif()
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_121)")
+option(VLLM_CPP_BENCH_PROFILE_CONTROL
+  "Compile trace-only SIGUSR2/cudaProfiler graph replay control (never for production timing builds)"
+  OFF)
 
 # Resolve the tri-state VLLM_CPP_CUDA into a plain ON/OFF. The normal variable
 # set below intentionally shadows the cache entry so later if(VLLM_CPP_CUDA)
@@ -263,6 +266,9 @@ target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)
+  if(VLLM_CPP_BENCH_PROFILE_CONTROL)
+    target_compile_definitions(vllm PUBLIC VT_BENCH_PROFILE_CONTROL=1)
+  endif()
   target_sources(vllm PRIVATE
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/cuda_dropin.cu

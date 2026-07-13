@@ -176,10 +176,11 @@ def main() -> int:
     measured_digests = []
     llm.start_profile("online-gate")
     try:
-        # Ours is captured from server start and its three client invocations
-        # each include a full c16 warmup wave. Profile the equivalent 48-prompt
-        # (three-wave) warmup here so both traces contain 192 prompt executions
-        # before comparing runtime-resolved kernel families.
+        # Keep the exact four-run semantic workload used by the accepted vLLM
+        # trace: one 48-prompt warmup plus three measured 48-prompt repetitions.
+        # H1d compares only the clean pure-decode GPU annotation windows from
+        # this raw trace; its local four-replay probe remains structural and is
+        # never treated as an equal-duration timing window.
         warmup = run_closed_loop(
             llm,
             prompts,

@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import gzip
 import hashlib
 import importlib.metadata
 import json
+import mmap
 import os
 import pathlib
 import platform
@@ -30,6 +32,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -47,14 +50,36 @@ from tools.bench.serve_low_common import (
 INPUT_LEN = 1024
 OUTPUT_LEN = 128
 VLLM_ORACLE_VERSION = "0.25.0"
+FLASHINFER_VERSION = "0.6.13"
 PANDAS_VERSION = "2.2.3"
 TRACE_CONCURRENCY = 16
 TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
-NSYS_CUDA_GRAPH_TRACE = "node"
-NSYS_CUDA_FLUSH_INTERVAL_MS = 10_000
+TRACE_CAPTURE_GRAPH_REPLAYS = 4
+TRACE_STATUS_SCHEMA_VERSION = 2
+NSYS_CAPTURE_RANGE = "cudaProfilerApi"
+NSYS_CUDA_GRAPH_TRACE = "node:host-only"
+NSYS_CUDA_FLUSH_INTERVAL_MS = 0
+NSYS_PRODUCT_VERSION = "2025.3.2.474"
+NVFP4_PLAN_FIXTURE_SHA256 = (
+    "e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd"
+)
+NVFP4_SELECTED_PLAN_SHA256 = (
+    "f2d9be7fc4a89de1cfa994ab9be08a423e0c4f6981fe46cb808cef485f4c1fa4"
+)
+NVFP4_PLAN_METADATA = "2e429d4cd3977f0f"
+TRACE_REQUIRED_ENV = {
+    "VT_FP4_AUTOTUNE": "1",
+    "VT_FP4_AUTOTUNE_CACHE_READONLY": "1",
+    "VT_FP4_AUTOTUNE_DELAY_US": "5000",
+    "VT_FP4_FULL_TACTICS": "1",
+    "VT_FP4_PERSISTENT_CACHE": "1",
+    "VT_FP4_PLAN_CACHE": "1",
+    "VT_FP4_PRE_SERVE_WARMUP": "1",
+}
 TRACE_PRIMARY_GRAPH_CONTRACTS = {
     "27": {
+        "graph_child_nodes": {"kernel": 1_107, "memcpy": 7, "memset": 1},
         "node_count": 1_107,
         "families": {
             "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
@@ -68,6 +93,22 @@ TRACE_PRIMARY_GRAPH_CONTRACTS = {
             "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
         },
     }
+}
+VLLM_DECODE_FAMILY_CONTRACTS = {
+    "27": {
+        "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
+        "fa2_main": ("flash_fwd_splitkv_kernel", 16),
+        "fp4_gemm": ("MainloopSm120TmaWarpSpecializedBlockScaled", 208),
+        "fused_fp4_producer": ("silu_mul_cvt_fp16_to_fp4", 64),
+        "gdn_recurrence": (
+            "fused_recurrent_gated_delta_rule_packed_decode_kernel",
+            48,
+        ),
+        "normal_fp4_producer": ("cvt_fp16_to_fp4<__nv_bfloat16, false>", 144),
+    }
+}
+VLLM_GENERATION_WINDOW_CONTRACTS = {
+    "27": {"all": 1_588, "clean": 1_476},
 }
 REPETITIONS = (1, 2, 3)
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
@@ -93,6 +134,35 @@ _NSYS_ALLOWED_DIAGNOSTIC = re.compile(
     r"driver version or configuration\."
 )
 
+_PLAN_PREPARED_RE = re.compile(
+    r"^\[VT_FP4_CACHE\] prepared mode=(\S+) native=(\S+) flashinfer=(\S+) "
+    r"loaded=(\d+) \(flashinfer=(\d+) native=(\d+)\) rejected=(\d+) "
+    r"delay_us=(\d+) metadata=([0-9a-f]+) selected=(\d+)$"
+)
+_PLAN_COMPLETE_RE = re.compile(
+    r"^\[VT_FP4_CACHE\] complete mode=(\S+) loaded=(\d+) tuned=(\d+) "
+    r"rejected=(\d+) saved=(\d+) selected=(\d+) metadata=([0-9a-f]+)$"
+)
+_PLAN_SELECTED_RE = re.compile(
+    r"^\[VT_FP4_CACHE\] selected M=(\d+) N=(\d+) K=(\d+) tactic=(\d+)$"
+)
+_PLAN_WARMUP_RE = re.compile(
+    r"^\[VT_FP4_AUTOTUNE\] pre-serve warmup complete max_tokens=(\d+) "
+    r"profiles_requested=(\d+) profiles_tuned=(\d+) cached_plans=(\d+)$"
+)
+_CUDA_PROFILE_READY_RE = re.compile(
+    r"^\[VT_CUDA_PROFILE\] ready pid=(\d+) signal=SIGUSR2 target_replays=(\d+)$"
+)
+_CUDA_PROFILE_STARTED_RE = re.compile(
+    r"^\[VT_CUDA_PROFILE\] started target_replays=(\d+) "
+    r"graph=(0x[0-9a-f]+) real_batch=(\d+) padded_batch=(\d+) "
+    r"prior_replays=(\d+)$"
+)
+_CUDA_PROFILE_STOPPED_RE = re.compile(
+    r"^\[VT_CUDA_PROFILE\] stopped captured_replays=(\d+) "
+    r"graph=(0x[0-9a-f]+)$"
+)
+
 
 def prompts_for(concurrency: int) -> int:
     try:
@@ -113,6 +183,7 @@ class OnlineRun:
     repetition: int
     artifact_tag: str = ""
     num_prompts_override: int | None = None
+    num_warmups_override: int | None = None
 
     def __post_init__(self) -> None:
         if self.model_key not in MODEL_REVISIONS:
@@ -125,6 +196,8 @@ class OnlineRun:
             raise HarnessError(f"invalid artifact tag: {self.artifact_tag}")
         if self.num_prompts_override is not None and self.num_prompts_override <= 0:
             raise HarnessError("num-prompts override must be positive")
+        if self.num_warmups_override is not None and self.num_warmups_override < 0:
+            raise HarnessError("num-warmups override must be non-negative")
         prompts_for(self.concurrency)
 
     @property
@@ -138,6 +211,14 @@ class OnlineRun:
             self.num_prompts_override
             if self.num_prompts_override is not None
             else prompts_for(self.concurrency)
+        )
+
+    @property
+    def num_warmups(self) -> int:
+        return (
+            self.num_warmups_override
+            if self.num_warmups_override is not None
+            else self.concurrency
         )
 
     @property
@@ -163,6 +244,85 @@ def _require_full_sha(value: str, field: str) -> str:
     if _SHA_RE.fullmatch(value) is None:
         raise HarnessError(f"{field} must be a full lowercase commit ID")
     return value
+
+
+def _sha256_canonical(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _fingerprint_tree(root: pathlib.Path) -> dict[str, Any]:
+    """Hash a dependency tree by relative path, byte size, and file content."""
+
+    if not root.is_dir():
+        raise HarnessError(f"dependency source tree is absent: {root}")
+    inventory = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.is_symlink():
+            raise HarnessError(f"dependency source tree contains a symlink: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        inventory.append(
+            {
+                "path": relative,
+                "sha256": sha256_file(path),
+                "size": path.stat().st_size,
+            }
+        )
+    if not inventory:
+        raise HarnessError(f"dependency source tree contains no files: {root}")
+    return {
+        "file_count": len(inventory),
+        "logical_bytes": sum(item["size"] for item in inventory),
+        "path": str(root.absolute()),
+        "sha256": _sha256_canonical(inventory),
+    }
+
+
+def _file_contains(path: pathlib.Path, needle: bytes) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    with path.open("rb") as source, mmap.mmap(
+        source.fileno(), 0, access=mmap.ACCESS_READ
+    ) as mapped:
+        return mapped.find(needle) >= 0
+
+
+def _require_sqlite_columns(
+    connection: sqlite3.Connection,
+    table: str,
+    expected: set[str],
+) -> None:
+    actual = {
+        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    missing = sorted(expected - actual)
+    if missing:
+        raise HarnessError(
+            f"Nsight SQLite table {table} omits required columns: "
+            + ", ".join(missing)
+        )
+
+
+def _option_value(tokens: Sequence[str], flag: str) -> str | None:
+    matches = []
+    prefix = f"{flag}="
+    for index, token in enumerate(tokens):
+        if token.startswith(prefix):
+            matches.append(token[len(prefix) :])
+        elif token == flag:
+            if index + 1 >= len(tokens):
+                raise HarnessError(f"command option {flag} has no value")
+            matches.append(tokens[index + 1])
+    if len(matches) > 1:
+        raise HarnessError(f"command option {flag} is repeated")
+    return matches[0] if matches else None
+
+
+def _require_option(tokens: Sequence[str], flag: str, expected: str) -> None:
+    actual = _option_value(tokens, flag)
+    if actual != expected:
+        raise HarnessError(f"command {flag}={actual!r}; expected {expected!r}")
 
 
 def build_client_command(run: OnlineRun) -> list[str]:
@@ -203,7 +363,9 @@ def build_client_command(run: OnlineRun) -> list[str]:
         "--request-rate",
         "inf",
         "--num-warmups",
-        str(run.concurrency),
+        str(run.num_warmups),
+        "--ready-check-timeout-sec",
+        "0",
         "--seed",
         "0",
         "--ignore-eos",
@@ -559,22 +721,7 @@ def build_plan(
                 str(len(REPETITIONS)),
             ],
             "execute_model": [
-                "scripts/dgx-online-serving.sh",
-                "--execute",
-                "--model",
-                "<27|35>",
-                "--snapshot",
-                "<MODEL_SNAPSHOT>",
-                "--source-corpus",
-                "<EVIDENCE>/corpus/<27|35>",
-                "--evidence",
-                "<EVIDENCE>",
-                "--build-dir",
-                "<CURRENT_MAIN_BUILD>",
-                "--client",
-                str(client),
-                "--vllm-cpp-sha",
-                vllm_cpp_sha,
+                "BLOCKED_UNTIL_H1D_G4_AND_SEPARATE_PRODUCTION_TRACE_BUILDS"
             ],
             "trace_model": [
                 "scripts/dgx-online-serving.sh",
@@ -588,7 +735,9 @@ def build_plan(
                 "--evidence",
                 "<EVIDENCE>",
                 "--build-dir",
-                "<CURRENT_MAIN_BUILD>",
+                "<H1D_TRACE_BUILD>",
+                "--configure-log",
+                "<H1D_TRACE_CONFIGURE_LOG>",
                 "--client",
                 str(client),
                 "--vllm-cpp-sha",
@@ -598,7 +747,8 @@ def build_plan(
         "required_artifacts": [
             "manifest.json",
             "corpus/<model>/vllm/manifest.json",
-            "execution/<model>.json",
+            "execution/<model>.json (production timing only)",
+            "execution/<model>-trace.json (H1d diagnostic only)",
             "execution/<model>-oracle.json",
             "execution/<model>-build-command.txt",
             "execution/<model>-build.log",
@@ -613,6 +763,8 @@ def build_plan(
             "trace/<model>/ours-r{1,2,3}.sqlite",
             "trace/<model>/ours-r{1,2,3}-cuda_gpu_kern_sum.txt",
             "trace/<model>/ours-r{1,2,3}-nsys-validation.json",
+            "trace/<model>/ours-r{1,2,3}-profile-control.json",
+            "raw/<model>/ours/c16-r1-trace{1,2,3}-probe.json",
             "trace/<model>/vllm-profile/*.pt.trace.json.gz",
             "trace/<model>/vllm-kernels.json",
             "trace/<model>/cache-{before-ours,between-engines,after-vllm}.json",
@@ -630,7 +782,10 @@ def build_plan(
             "warmups_per_client_invocation": "equals configured concurrency",
         },
         "series_order": "one whole-model flock; rep1 ours/vllm, rep2 ours/vllm, rep3 ours/vllm",
-        "vllm_oracle_bench_dependencies": {"pandas": PANDAS_VERSION},
+        "vllm_oracle_bench_dependencies": {
+            "flashinfer": FLASHINFER_VERSION,
+            "pandas": PANDAS_VERSION,
+        },
         "vllm_oracle_version": VLLM_ORACLE_VERSION,
         "vllm_cpp_sha": vllm_cpp_sha,
     }
@@ -645,7 +800,10 @@ def validate_plan(path: pathlib.Path, *, vllm_cpp_sha: str) -> dict[str, Any]:
         raise HarnessError("campaign plan client source differs from the parity pin")
     if value.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
         raise HarnessError("campaign plan oracle version differs from the pinned pip oracle")
-    if value.get("vllm_oracle_bench_dependencies") != {"pandas": PANDAS_VERSION}:
+    if value.get("vllm_oracle_bench_dependencies") != {
+        "flashinfer": FLASHINFER_VERSION,
+        "pandas": PANDAS_VERSION,
+    }:
         raise HarnessError("campaign plan benchmark dependencies differ from the pin")
     if value.get("gpu_lock_acquisitions_planned") != 2:
         raise HarnessError("campaign plan must contain one GPU lock per model")
@@ -755,12 +913,7 @@ def record_model_gate(
 def validate_nsys_trace(
     sqlite_path: pathlib.Path, *, model_key: str | None = None
 ) -> dict[str, Any]:
-    """Reject incomplete node-level CUDA traces before using their attribution.
-
-    Nsight can still exit successfully after dropping CUDA activity.  Its SQLite
-    diagnostics and the replay multiplicity of nodes in the dominant graph are
-    the authoritative completeness checks.
-    """
+    """Validate one bounded H1d capture by direct runtime correlation."""
 
     if not sqlite_path.is_file() or sqlite_path.stat().st_size == 0:
         raise HarnessError(f"Nsight SQLite artifact is absent or empty: {sqlite_path}")
@@ -773,14 +926,157 @@ def validate_nsys_trace(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        required_tables = {"CUPTI_ACTIVITY_KIND_KERNEL", "DIAGNOSTIC_EVENT"}
-        if model_key is not None:
-            required_tables.add("StringIds")
+        required_tables = {
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "CUPTI_ACTIVITY_KIND_MEMCPY",
+            "CUPTI_ACTIVITY_KIND_MEMSET",
+            "CUPTI_ACTIVITY_KIND_RUNTIME",
+            "DIAGNOSTIC_EVENT",
+            "META_DATA_CAPTURE",
+            "META_DATA_EXPORT",
+            "StringIds",
+            "TARGET_INFO_SESSION_START_TIME",
+        }
         missing_tables = sorted(required_tables - tables)
         if missing_tables:
             raise HarnessError(
                 "Nsight SQLite omits required tables: " + ", ".join(missing_tables)
             )
+        _require_sqlite_columns(
+            connection,
+            "DIAGNOSTIC_EVENT",
+            {"severity", "text", "timestamp"},
+        )
+        _require_sqlite_columns(connection, "StringIds", {"id", "value"})
+        _require_sqlite_columns(
+            connection,
+            "CUPTI_ACTIVITY_KIND_RUNTIME",
+            {"correlationId", "nameId", "returnValue", "start"},
+        )
+        _require_sqlite_columns(
+            connection,
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            {
+                "blockX",
+                "blockY",
+                "blockZ",
+                "cacheConfig",
+                "correlationId",
+                "demangledName",
+                "dynamicSharedMemory",
+                "graphNodeId",
+                "gridX",
+                "gridY",
+                "gridZ",
+                "launchType",
+                "localMemoryPerThread",
+                "localMemoryTotal",
+                "mangledName",
+                "registersPerThread",
+                "sharedMemoryExecuted",
+                "sharedMemoryLimitConfig",
+                "shortName",
+                "staticSharedMemory",
+            },
+        )
+        _require_sqlite_columns(
+            connection,
+            "CUPTI_ACTIVITY_KIND_MEMCPY",
+            {
+                "bytes",
+                "copyCount",
+                "copyKind",
+                "correlationId",
+                "dstContextId",
+                "dstDeviceId",
+                "dstKind",
+                "graphNodeId",
+                "migrationCause",
+                "srcContextId",
+                "srcDeviceId",
+                "srcKind",
+            },
+        )
+        _require_sqlite_columns(
+            connection,
+            "CUPTI_ACTIVITY_KIND_MEMSET",
+            {"bytes", "correlationId", "graphNodeId", "memKind", "value"},
+        )
+        _require_sqlite_columns(connection, "META_DATA_CAPTURE", {"name", "value"})
+        _require_sqlite_columns(connection, "META_DATA_EXPORT", {"name", "value"})
+        _require_sqlite_columns(
+            connection,
+            "TARGET_INFO_SESSION_START_TIME",
+            {"localTime", "utcEpochNs", "utcTime"},
+        )
+
+        def unique_metadata_value(table: str, name: str) -> str:
+            values = [
+                str(row[0])
+                for row in connection.execute(
+                    f"SELECT value FROM {table} WHERE name = ?", (name,)
+                )
+            ]
+            if len(values) != 1 or not values[0]:
+                raise HarnessError(
+                    f"Nsight SQLite {table}.{name} is absent or non-unique"
+                )
+            return values[0]
+
+        capture_uuid = unique_metadata_value(
+            "META_DATA_CAPTURE", "PROFILING_SESSION_UUID"
+        )
+        if re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            capture_uuid,
+        ) is None:
+            raise HarnessError("Nsight profiling-session UUID is invalid")
+        product_name = unique_metadata_value(
+            "META_DATA_EXPORT", "EXPORT_PRODUCT_NAME"
+        )
+        product_version = unique_metadata_value(
+            "META_DATA_EXPORT", "EXPORT_PRODUCT_VERSION"
+        )
+        if (
+            product_name != "NVIDIA Nsight Systems"
+            or product_version != NSYS_PRODUCT_VERSION
+        ):
+            raise HarnessError(
+                "Nsight export product/version differs from the H1d pin"
+            )
+        if unique_metadata_value("META_DATA_EXPORT", "EXPORT_PARAM_LAZY") != "false":
+            raise HarnessError("Nsight SQLite export was not materialized with --lazy=false")
+        report_path = pathlib.Path(
+            unique_metadata_value("META_DATA_EXPORT", "EXPORT_PARAM_INPUT_PATH_ABS")
+        )
+        exported_sqlite_path = pathlib.Path(
+            unique_metadata_value("META_DATA_EXPORT", "EXPORT_PARAM_OUTPUT_PATH_ABS")
+        )
+        if (
+            not report_path.is_absolute()
+            or not report_path.is_file()
+            or report_path.stat().st_size == 0
+        ):
+            raise HarnessError("Nsight source report linked by SQLite is absent")
+        if (
+            not exported_sqlite_path.is_absolute()
+            or exported_sqlite_path.resolve() != sqlite_path.resolve()
+        ):
+            raise HarnessError("Nsight SQLite export output path differs from its artifact")
+        session_rows = list(
+            connection.execute(
+                "SELECT utcEpochNs, utcTime, localTime "
+                "FROM TARGET_INFO_SESSION_START_TIME"
+            )
+        )
+        if (
+            len(session_rows) != 1
+            or not isinstance(session_rows[0][0], int)
+            or session_rows[0][0] <= 0
+            or any(not str(value) for value in session_rows[0][1:])
+        ):
+            raise HarnessError("Nsight session start metadata is absent or invalid")
 
         diagnostics = [
             {"severity": int(severity), "text": str(text)}
@@ -801,53 +1097,206 @@ def validate_nsys_trace(
                 f"severity={first['severity']} text={first['text']}"
             )
 
-        node_replays = [
-            (int(graph_node_id), int(replays))
-            for graph_node_id, replays in connection.execute(
-                "SELECT graphNodeId, COUNT(*) "
-                "FROM CUPTI_ACTIVITY_KIND_KERNEL "
-                "WHERE graphNodeId IS NOT NULL "
-                "GROUP BY graphNodeId"
+        launch_rows = [
+            (int(correlation_id), str(name), int(return_value))
+            for correlation_id, name, return_value in connection.execute(
+                "SELECT runtime.correlationId, strings.value, runtime.returnValue "
+                "FROM CUPTI_ACTIVITY_KIND_RUNTIME AS runtime "
+                "JOIN StringIds AS strings ON strings.id = runtime.nameId "
+                "WHERE strings.value GLOB 'cudaGraphLaunch*' "
+                "ORDER BY runtime.start"
             )
         ]
-        if not node_replays:
-            raise HarnessError("Nsight SQLite has no CUDA graph-node kernel rows")
-        max_replays = max(replays for _, replays in node_replays)
-        primary_floor = max(1, (max_replays * 9) // 10)
-        primary_replays = [
-            replays for _, replays in node_replays if replays >= primary_floor
-        ]
-        primary_replay_counts = sorted(set(primary_replays))
-        if len(primary_replay_counts) != 1:
+        if len(launch_rows) != TRACE_CAPTURE_GRAPH_REPLAYS:
             raise HarnessError(
-                "Nsight primary graph has uneven replay counts: "
-                + ", ".join(str(value) for value in primary_replay_counts)
+                "Nsight capture has "
+                f"{len(launch_rows)} cudaGraphLaunch rows; expected "
+                f"{TRACE_CAPTURE_GRAPH_REPLAYS}"
             )
+        launch_ids = [row[0] for row in launch_rows]
+        if len(set(launch_ids)) != TRACE_CAPTURE_GRAPH_REPLAYS:
+            raise HarnessError("Nsight cudaGraphLaunch correlation IDs are not unique")
+        if any(return_value != 0 for _, _, return_value in launch_rows):
+            raise HarnessError("Nsight cudaGraphLaunch returned a CUDA error")
+        launch_id_set = set(launch_ids)
+
+        kernel_fields = (
+            "gridX",
+            "gridY",
+            "gridZ",
+            "blockX",
+            "blockY",
+            "blockZ",
+            "registersPerThread",
+            "staticSharedMemory",
+            "dynamicSharedMemory",
+            "localMemoryPerThread",
+            "localMemoryTotal",
+            "cacheConfig",
+            "launchType",
+            "sharedMemoryExecuted",
+            "sharedMemoryLimitConfig",
+        )
+        kernel_rows = []
+        for row in connection.execute(
+            "SELECT kernel.correlationId, kernel.graphNodeId, demangled.value, "
+            "short.value, mangled.value, "
+            + ", ".join(f"kernel.{field}" for field in kernel_fields)
+            + " FROM CUPTI_ACTIVITY_KIND_KERNEL AS kernel "
+            "JOIN StringIds AS demangled ON demangled.id = kernel.demangledName "
+            "JOIN StringIds AS short ON short.id = kernel.shortName "
+            "LEFT JOIN StringIds AS mangled ON mangled.id = kernel.mangledName "
+            "WHERE kernel.graphNodeId IS NOT NULL"
+        ):
+            correlation_id, graph_node_id, name, short_name, mangled_name, *values = row
+            kernel_rows.append(
+                (
+                    int(correlation_id),
+                    int(graph_node_id),
+                    {
+                        "kind": "kernel",
+                        "mangled_name": (
+                            str(mangled_name) if mangled_name is not None else None
+                        ),
+                        "name": str(name),
+                        "short_name": str(short_name),
+                        **dict(zip(kernel_fields, values, strict=True)),
+                    },
+                )
+            )
+        if not kernel_rows:
+            raise HarnessError("Nsight SQLite has no CUDA graph-node kernel rows")
+
+        memcpy_fields = (
+            "bytes",
+            "copyKind",
+            "srcKind",
+            "dstKind",
+            "srcDeviceId",
+            "srcContextId",
+            "dstDeviceId",
+            "dstContextId",
+            "migrationCause",
+            "copyCount",
+        )
+        memcpy_rows = [
+            (
+                int(row[0]),
+                int(row[1]),
+                {
+                    "kind": "memcpy",
+                    **dict(zip(memcpy_fields, row[2:], strict=True)),
+                },
+            )
+            for row in connection.execute(
+                "SELECT correlationId, graphNodeId, "
+                + ", ".join(memcpy_fields)
+                + " FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE graphNodeId IS NOT NULL"
+            )
+        ]
+        memset_fields = ("bytes", "value", "memKind")
+        memset_rows = [
+            (
+                int(row[0]),
+                int(row[1]),
+                {
+                    "kind": "memset",
+                    **dict(zip(memset_fields, row[2:], strict=True)),
+                },
+            )
+            for row in connection.execute(
+                "SELECT correlationId, graphNodeId, "
+                + ", ".join(memset_fields)
+                + " FROM CUPTI_ACTIVITY_KIND_MEMSET WHERE graphNodeId IS NOT NULL"
+            )
+        ]
+        child_rows = {
+            "kernel": kernel_rows,
+            "memcpy": memcpy_rows,
+            "memset": memset_rows,
+        }
+        for kind, rows in child_rows.items():
+            outside = [row for row in rows if row[0] not in launch_id_set]
+            if outside:
+                raise HarnessError(
+                    f"Nsight {kind} graph children lack direct cudaGraphLaunch correlation"
+                )
+            ungraphed = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_{kind.upper()} "
+                    "WHERE graphNodeId IS NULL"
+                ).fetchone()[0]
+            )
+            if ungraphed != 0:
+                raise HarnessError(
+                    f"Nsight bounded range contains {ungraphed} ungraphed {kind} rows"
+                )
+            replay_counts: dict[int, tuple[int, set[int]]] = {}
+            for correlation_id, graph_node_id, _ in rows:
+                count, correlations = replay_counts.get(graph_node_id, (0, set()))
+                correlations.add(correlation_id)
+                replay_counts[graph_node_id] = (count + 1, correlations)
+            uneven = [
+                graph_node_id
+                for graph_node_id, (count, correlations) in replay_counts.items()
+                if count != TRACE_CAPTURE_GRAPH_REPLAYS
+                or len(correlations) != TRACE_CAPTURE_GRAPH_REPLAYS
+            ]
+            if uneven:
+                raise HarnessError(
+                    f"Nsight {kind} graph nodes have uneven replay counts"
+                )
+            per_node_signatures: dict[int, list[str]] = {}
+            for _, graph_node_id, signature in rows:
+                per_node_signatures.setdefault(graph_node_id, []).append(
+                    canonical_json(signature)
+                )
+            if any(
+                len(set(signatures)) != 1
+                for signatures in per_node_signatures.values()
+            ):
+                raise HarnessError(
+                    f"Nsight {kind} graph-node signature differs across launches"
+                )
+
+        per_launch_signatures: list[list[dict[str, Any]]] = []
+        per_launch_counts = []
+        for launch_id in launch_ids:
+            signature = sorted(
+                [
+                    value
+                    for rows in child_rows.values()
+                    for correlation_id, _, value in rows
+                    if correlation_id == launch_id
+                ],
+                key=canonical_json,
+            )
+            per_launch_signatures.append(signature)
+            per_launch_counts.append(
+                {
+                    kind: sum(row[0] == launch_id for row in rows)
+                    for kind, rows in child_rows.items()
+                }
+            )
+        first_signature = canonical_json(per_launch_signatures[0])
+        if any(canonical_json(value) != first_signature for value in per_launch_signatures[1:]):
+            raise HarnessError("Nsight graph child node multiset differs across launches")
+        if any(value != per_launch_counts[0] for value in per_launch_counts[1:]):
+            raise HarnessError("Nsight graph child counts differ across launches")
 
         primary_family_counts: dict[str, int] = {}
         contract = TRACE_PRIMARY_GRAPH_CONTRACTS.get(model_key) if model_key else None
         if contract is not None:
-            expected_node_count = int(contract["node_count"])
-            if len(primary_replays) != expected_node_count:
+            expected_counts = contract["graph_child_nodes"]
+            if per_launch_counts[0] != expected_counts:
                 raise HarnessError(
-                    "Nsight primary graph node count differs from the model contract: "
-                    f"got {len(primary_replays)}, expected {expected_node_count}"
+                    "Nsight graph child counts differ from the model contract: "
+                    f"got {per_launch_counts[0]}, expected {expected_counts}"
                 )
             primary_node_names = [
-                str(name)
-                for (name,) in connection.execute(
-                    "SELECT strings.value "
-                    "FROM ("
-                    "  SELECT graphNodeId, MIN(demangledName) AS demangledName, "
-                    "         COUNT(*) AS replays "
-                    "  FROM CUPTI_ACTIVITY_KIND_KERNEL "
-                    "  WHERE graphNodeId IS NOT NULL "
-                    "  GROUP BY graphNodeId"
-                    ") AS nodes "
-                    "JOIN StringIds AS strings ON strings.id = nodes.demangledName "
-                    "WHERE nodes.replays >= ?",
-                    (primary_floor,),
-                )
+                value["name"]
+                for value in per_launch_signatures[0]
+                if value["kind"] == "kernel"
             ]
             for family, (pattern, expected_count) in contract["families"].items():
                 actual_count = sum(pattern in name for name in primary_node_names)
@@ -857,18 +1306,637 @@ def validate_nsys_trace(
                         f"Nsight primary graph {family} node count differs: "
                         f"got {actual_count}, expected {expected_count}"
                     )
+            for forbidden in ("MatmulNvfp4Fp4Naive", "MatmulNvfp4Fp4Wmma"):
+                if any(forbidden in name for name in primary_node_names):
+                    raise HarnessError(
+                        f"Nsight trace dispatched forbidden fallback kernel {forbidden}"
+                    )
+
+        kernel_summary_rows = [
+            {
+                "count": int(count),
+                "name": str(name),
+                "total_duration_ns": int(duration),
+            }
+            for name, count, duration in connection.execute(
+                "SELECT strings.value, COUNT(*), SUM(kernel.end-kernel.start) "
+                "FROM CUPTI_ACTIVITY_KIND_KERNEL AS kernel "
+                "JOIN StringIds AS strings ON strings.id=kernel.demangledName "
+                "WHERE kernel.graphNodeId IS NOT NULL GROUP BY strings.value"
+            )
+        ]
+        kernel_summary_rows.sort(
+            key=lambda item: (-item["total_duration_ns"], item["name"])
+        )
     finally:
         connection.close()
 
     return {
         "allowed_diagnostics": diagnostics,
-        "graph_node_count": len(node_replays),
+        "capture_session_uuid": capture_uuid,
+        "canonical_node_multiset_sha256": hashlib.sha256(
+            first_signature.encode("utf-8")
+        ).hexdigest(),
+        "graph_child_rows": {
+            kind: len(rows) for kind, rows in child_rows.items()
+        },
+        "graph_launch_count": len(launch_rows),
+        "graph_launch_names": [row[1] for row in launch_rows],
+        "graph_node_count": len({row[1] for row in kernel_rows}),
+        "kernel_summary": {
+            "kernel_count": len(kernel_rows),
+            "kernel_time_ns": sum(
+                item["total_duration_ns"] for item in kernel_summary_rows
+            ),
+            "kernels": kernel_summary_rows,
+        },
         "lossless": True,
-        "primary_graph_node_count": len(primary_replays),
+        "nsys_product_version": product_version,
+        "nsys_report_path": str(report_path),
+        "nsys_report_sha256": sha256_file(report_path),
+        "primary_graph_node_count": len({row[1] for row in kernel_rows}),
         "primary_graph_family_node_counts": primary_family_counts,
-        "primary_graph_replay_count": primary_replay_counts[0],
+        "primary_graph_replay_count": TRACE_CAPTURE_GRAPH_REPLAYS,
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": sha256_file(sqlite_path),
+    }
+
+
+def summarize_nsys_kernels(sqlite_path: pathlib.Path) -> dict[str, Any]:
+    validation = validate_nsys_trace(sqlite_path)
+    return {
+        **validation["kernel_summary"],
+        "sqlite_path": str(sqlite_path),
+        "sqlite_sha256": validation["sqlite_sha256"],
+    }
+
+
+def _parse_client_command_log(
+    log_path: pathlib.Path,
+    *,
+    result_path: pathlib.Path,
+    corpus_path: pathlib.Path,
+    num_prompts: int,
+    num_warmups: int,
+) -> list[str]:
+    try:
+        first_line = log_path.read_text(encoding="utf-8").splitlines()[0]
+    except (FileNotFoundError, IndexError) as error:
+        raise HarnessError(f"client command log is absent or empty: {log_path}") from error
+    prefix = "command: "
+    if not first_line.startswith(prefix):
+        raise HarnessError(f"client log does not begin with its exact command: {log_path}")
+    tokens = shlex.split(first_line[len(prefix) :])
+    if len(tokens) < 3 or tokens[1:3] != ["bench", "serve"]:
+        raise HarnessError("trace client is not the pinned vllm bench serve command")
+    for flag, expected in (
+        ("--backend", "openai"),
+        ("--endpoint", "/v1/completions"),
+        ("--model", "gate"),
+        ("--dataset-name", "custom"),
+        ("--custom-output-len", str(OUTPUT_LEN)),
+        ("--num-prompts", str(num_prompts)),
+        ("--max-concurrency", str(TRACE_CONCURRENCY)),
+        ("--request-rate", "inf"),
+        ("--num-warmups", str(num_warmups)),
+        ("--ready-check-timeout-sec", "0"),
+        ("--seed", "0"),
+        ("--temperature", "0"),
+    ):
+        _require_option(tokens, flag, expected)
+    for flag in (
+        "--skip-chat-template",
+        "--disable-shuffle",
+        "--ignore-eos",
+        "--save-result",
+        "--save-detailed",
+        "--disable-tqdm",
+    ):
+        if tokens.count(flag) != 1:
+            raise HarnessError(f"trace client command must contain {flag} exactly once")
+    dataset_value = _option_value(tokens, "--dataset-path")
+    if dataset_value is None or pathlib.Path(dataset_value).resolve() != corpus_path.resolve():
+        raise HarnessError("trace client command corpus path differs")
+    result_dir = _option_value(tokens, "--result-dir")
+    result_filename = _option_value(tokens, "--result-filename")
+    if result_dir is None or result_filename is None:
+        raise HarnessError("trace client command omits its result path")
+    if (pathlib.Path(result_dir) / result_filename).resolve() != result_path.resolve():
+        raise HarnessError("trace client command result path differs")
+    return tokens
+
+
+def _parse_fp4_plan_log(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as error:
+        raise HarnessError(f"profile log is absent: {path}") from error
+    prepared = [match for line in lines if (match := _PLAN_PREPARED_RE.fullmatch(line))]
+    complete = [match for line in lines if (match := _PLAN_COMPLETE_RE.fullmatch(line))]
+    warmup = [match for line in lines if (match := _PLAN_WARMUP_RE.fullmatch(line))]
+    selected = [
+        (line, match)
+        for line in lines
+        if (match := _PLAN_SELECTED_RE.fullmatch(line))
+    ]
+    if len(prepared) != 1 or len(complete) != 1 or len(warmup) != 1:
+        raise HarnessError("profile log does not contain one exact FP4 plan lifecycle")
+    if len(selected) != 64:
+        raise HarnessError(f"profile log contains {len(selected)} selected plans; expected 64")
+    recognized = {
+        line
+        for line in lines
+        if _PLAN_PREPARED_RE.fullmatch(line)
+        or _PLAN_COMPLETE_RE.fullmatch(line)
+        or _PLAN_SELECTED_RE.fullmatch(line)
+        or _PLAN_WARMUP_RE.fullmatch(line)
+    }
+    unexpected = [
+        line
+        for line in lines
+        if line.startswith("[VT_FP4_CACHE]")
+        or line.startswith("[VT_FP4_AUTOTUNE]")
+        if line not in recognized
+    ]
+    if unexpected:
+        raise HarnessError(f"profile log has an unexpected FP4 lifecycle record: {unexpected[0]}")
+
+    prepared_match = prepared[0]
+    complete_match = complete[0]
+    (
+        mode,
+        native_value,
+        flashinfer_value,
+        loaded,
+        flashinfer_loaded,
+        native_loaded,
+        prepared_rejected,
+        delay_us,
+        prepared_metadata,
+        prepared_selected,
+    ) = prepared_match.groups()
+    if (
+        mode != "read-only"
+        or int(loaded) != 64
+        or int(flashinfer_loaded) != 64
+        or int(native_loaded) != 0
+        or int(prepared_rejected) != 0
+        or int(delay_us) != 5000
+        or int(prepared_selected) != 64
+        or prepared_metadata != NVFP4_PLAN_METADATA
+    ):
+        raise HarnessError("profile log FP4 prepared semantics differ from H1d")
+    (
+        complete_mode,
+        complete_loaded,
+        tuned,
+        complete_rejected,
+        saved,
+        complete_selected,
+        complete_metadata,
+    ) = complete_match.groups()
+    if (
+        complete_mode != "read-only"
+        or int(complete_loaded) != 64
+        or int(tuned) != 0
+        or int(complete_rejected) != 0
+        or int(saved) != 0
+        or int(complete_selected) != 64
+        or complete_metadata != prepared_metadata
+    ):
+        raise HarnessError("profile log FP4 completion semantics differ from H1d")
+    max_tokens, profiles_requested, profiles_tuned, cached_plans = warmup[0].groups()
+    if (
+        int(max_tokens) != MAX_NUM_BATCHED_TOKENS["27"]
+        or int(profiles_requested) != 0
+        or int(profiles_tuned) != 0
+        or int(cached_plans) != 64
+    ):
+        raise HarnessError("profile log FP4 pre-serve warmup semantics differ from H1d")
+
+    flashinfer_path = pathlib.Path(flashinfer_value)
+    if (
+        not flashinfer_path.is_absolute()
+        or not flashinfer_path.is_file()
+        or sha256_file(flashinfer_path) != NVFP4_PLAN_FIXTURE_SHA256
+    ):
+        raise HarnessError("profile log FlashInfer plan fixture differs from H1d")
+    native_path = pathlib.Path(native_value)
+    if not native_path.is_absolute() or native_path.exists():
+        raise HarnessError("profile log native plan target is not absent")
+
+    selected_lines = [line for line, _ in selected]
+    selected_sha = hashlib.sha256(
+        "".join(f"{line}\n" for line in selected_lines).encode("utf-8")
+    ).hexdigest()
+    if selected_sha != NVFP4_SELECTED_PLAN_SHA256:
+        raise HarnessError("profile log selected FP4 plan map differs from H1d")
+    selected_keys = [tuple(int(value) for value in match.groups()[:3]) for _, match in selected]
+    if len(set(selected_keys)) != 64:
+        raise HarnessError("profile log selected FP4 plan keys are not unique")
+    return {
+        "flashinfer_path": str(flashinfer_path),
+        "flashinfer_sha256": sha256_file(flashinfer_path),
+        "loaded_flashinfer": 64,
+        "loaded_native": 0,
+        "metadata": NVFP4_PLAN_METADATA,
+        "mode": "read-only",
+        "native_path": str(native_path),
+        "native_target_absent": True,
+        "selected_count": 64,
+        "selected_sha256": selected_sha,
+        "tuned": 0,
+    }
+
+
+def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as error:
+        raise HarnessError(f"profile log is absent: {path}") from error
+    ready = [match for line in lines if (match := _CUDA_PROFILE_READY_RE.fullmatch(line))]
+    started = [match for line in lines if (match := _CUDA_PROFILE_STARTED_RE.fullmatch(line))]
+    stopped = [match for line in lines if (match := _CUDA_PROFILE_STOPPED_RE.fullmatch(line))]
+    if len(ready) != 1 or len(started) != 1 or len(stopped) != 1:
+        raise HarnessError("profile log does not contain one complete CUDA profile window")
+    ready_pid, ready_target = ready[0].groups()
+    start_target, start_graph, real_batch, padded_batch, prior_replays = started[0].groups()
+    stopped_replays, stopped_graph = stopped[0].groups()
+    if (
+        int(ready_target) != TRACE_CAPTURE_GRAPH_REPLAYS
+        or int(start_target) != TRACE_CAPTURE_GRAPH_REPLAYS
+        or int(stopped_replays) != TRACE_CAPTURE_GRAPH_REPLAYS
+        or int(real_batch) != TRACE_CONCURRENCY
+        or int(padded_batch) != TRACE_CONCURRENCY
+        or int(prior_replays) <= 0
+        or stopped_graph != start_graph
+    ):
+        raise HarnessError("CUDA profile markers differ from the eligible four-replay contract")
+    return {
+        "captured_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
+        "graph": start_graph,
+        "padded_batch": TRACE_CONCURRENCY,
+        "prior_replays": int(prior_replays),
+        "ready_pid": int(ready_pid),
+        "real_batch": TRACE_CONCURRENCY,
+        "target_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
+    }
+
+
+def record_profile_control(
+    output: pathlib.Path,
+    *,
+    profile_log: pathlib.Path,
+    nsys_pid: int,
+    nsys_exit_status: int,
+    server_pid: int,
+    server_pgid: int,
+) -> dict[str, Any]:
+    if output.exists():
+        raise HarnessError(f"refusing to overwrite profile control evidence: {output}")
+    if min(nsys_pid, server_pid, server_pgid) <= 0:
+        raise HarnessError("profile control PIDs must be positive")
+    if nsys_exit_status != 0:
+        raise HarnessError("Nsight profiler exit status is not zero")
+    if server_pgid != nsys_pid:
+        raise HarnessError("profiled server process group is not owned by nsys")
+    markers = _parse_profile_markers(profile_log)
+    if markers["ready_pid"] != server_pid:
+        raise HarnessError("profile ready marker PID differs from the signaled server")
+    result = {
+        **markers,
+        "nsys_pid": nsys_pid,
+        "nsys_exit_status": nsys_exit_status,
+        "profile_log": str(profile_log),
+        "profile_log_sha256": sha256_file(profile_log),
+        "server_pgid": server_pgid,
+        "server_pid": server_pid,
+        "signal": "SIGUSR2",
+        "plan_validation": _parse_fp4_plan_log(profile_log),
+    }
+    write_json_atomic(output, result)
+    return result
+
+
+def _summarize_torch_trace(
+    path: pathlib.Path, *, model_key: str | None = None
+) -> dict[str, Any]:
+    opener = gzip.open if path.suffix == ".gz" else pathlib.Path.open
+    try:
+        if path.suffix == ".gz":
+            with opener(path, "rt", encoding="utf-8") as source:
+                value = json.load(source)
+        else:
+            with opener(path, "r", encoding="utf-8") as source:
+                value = json.load(source)
+    except (OSError, json.JSONDecodeError) as error:
+        raise HarnessError(f"{path}: invalid torch-profiler trace: {error}") from error
+    events = value.get("traceEvents") if isinstance(value, dict) else None
+    if not isinstance(events, list):
+        raise HarnessError(f"{path}: torch-profiler traceEvents array is absent")
+    grouped: dict[str, list[float]] = {}
+    kernel_events: list[dict[str, Any]] = []
+    decode_windows: list[tuple[float, float, str]] = []
+    generation_window_count = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        category = str(event.get("cat", "")).lower()
+        if category == "gpu_user_annotation" and model_key is not None:
+            annotation_name = event.get("name")
+            if isinstance(annotation_name, str) and re.fullmatch(
+                r"execute_context_\d+\(\d+\)_generation_\d+\(\d+\)",
+                annotation_name,
+            ):
+                generation_window_count += 1
+            match = (
+                re.fullmatch(
+                    r"execute_context_0\(0\)_generation_(\d+)\((\d+)\)",
+                    annotation_name,
+                )
+                if isinstance(annotation_name, str)
+                else None
+            )
+            if match is not None:
+                generation, repeated_generation = (int(value) for value in match.groups())
+                if generation != repeated_generation or not 1 <= generation <= TRACE_CONCURRENCY:
+                    raise HarnessError(
+                        "vLLM pure-decode annotation has an invalid generation batch"
+                    )
+                start = require_number(event.get("ts"), f"{path}:decode annotation ts")
+                duration = require_number(
+                    event.get("dur"), f"{path}:decode annotation duration"
+                )
+                if event.get("ph") != "X" or start < 0.0 or duration <= 0.0:
+                    raise HarnessError("vLLM pure-decode annotation is not a complete range")
+                decode_windows.append((start, start + duration, annotation_name))
+            continue
+        if "kernel" not in category:
+            continue
+        name = event.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        duration = require_number(event.get("dur"), f"{path}:kernel duration")
+        if duration >= 0.0:
+            grouped.setdefault(name, []).append(duration)
+            if model_key is None:
+                continue
+            start = require_number(event.get("ts"), f"{path}:kernel timestamp")
+            if start < 0.0:
+                raise HarnessError("torch-profiler kernel timestamp is negative")
+            kernel_events.append(
+                {
+                    "args": event.get("args"),
+                    "duration": duration,
+                    "end": start + duration,
+                    "name": name,
+                    "start": start,
+                }
+            )
+    total = sum(sum(values) for values in grouped.values())
+    if total <= 0.0 or not grouped:
+        raise HarnessError("torch-profiler output contains no positive-duration kernels")
+    kernels = sorted(
+        (
+            {
+                "count": len(values),
+                "name": name,
+                "percent": sum(values) / total * 100.0,
+                "total_duration_us": sum(values),
+            }
+            for name, values in grouped.items()
+        ),
+        key=lambda item: (-item["total_duration_us"], item["name"]),
+    )
+    result = {
+        "kernel_count": sum(item["count"] for item in kernels),
+        "kernel_time_us": total,
+        "kernels": kernels,
+        "selected_trace": str(path),
+        "selected_trace_sha256": sha256_file(path),
+    }
+    if model_key is None:
+        return result
+    family_contract = VLLM_DECODE_FAMILY_CONTRACTS.get(model_key)
+    if family_contract is None:
+        raise HarnessError(f"no clean vLLM decode contract exists for model {model_key}")
+    window_contract = VLLM_GENERATION_WINDOW_CONTRACTS.get(model_key)
+    if window_contract is None:
+        raise HarnessError(f"no vLLM generation-window contract exists for model {model_key}")
+    if generation_window_count != window_contract["all"]:
+        raise HarnessError(
+            "vLLM generation annotation count differs: "
+            f"got {generation_window_count}, expected {window_contract['all']}"
+        )
+    if len(decode_windows) != window_contract["clean"]:
+        raise HarnessError(
+            "vLLM clean decode annotation count differs: "
+            f"got {len(decode_windows)}, expected {window_contract['clean']}"
+        )
+    if not decode_windows:
+        raise HarnessError("vLLM trace contains no pure-decode GPU annotation windows")
+    decode_windows.sort()
+    for previous, current in zip(decode_windows, decode_windows[1:]):
+        if current[0] < previous[1]:
+            raise HarnessError("vLLM pure-decode GPU annotation windows overlap")
+
+    def family_for(name: str) -> str | None:
+        matches = [
+            family
+            for family, (needle, _) in family_contract.items()
+            if needle in name
+            and not (
+                family == "normal_fp4_producer"
+                and "silu_mul_cvt_fp16_to_fp4" in name
+            )
+        ]
+        if len(matches) > 1:
+            raise HarnessError(f"vLLM kernel matches multiple decode families: {name}")
+        return matches[0] if matches else None
+
+    kernel_events.sort(key=lambda event: (event["start"], event["end"], event["name"]))
+    cursor = 0
+    decode_grouped: dict[str, list[float]] = {}
+    family_totals = Counter()
+    family_signatures = Counter()
+    for window_index, (window_start, window_end, _) in enumerate(
+        decode_windows, start=1
+    ):
+        while cursor < len(kernel_events) and kernel_events[cursor]["end"] <= window_start:
+            cursor += 1
+        scan = cursor
+        window_families = Counter()
+        while scan < len(kernel_events) and kernel_events[scan]["start"] < window_end:
+            event = kernel_events[scan]
+            family = family_for(event["name"])
+            if event["start"] >= window_start and event["end"] <= window_end:
+                decode_grouped.setdefault(event["name"], []).append(event["duration"])
+                if family is not None:
+                    args = event["args"]
+                    if not isinstance(args, dict):
+                        raise HarnessError("vLLM decode kernel has no launch metadata")
+                    signature = {
+                        "block": args.get("block"),
+                        "grid": args.get("grid"),
+                        "name": event["name"],
+                        "registers_per_thread": args.get("registers per thread"),
+                        "shared_memory": args.get("shared memory"),
+                    }
+                    if (
+                        not isinstance(signature["block"], list)
+                        or len(signature["block"]) != 3
+                        or any(not isinstance(value, int) for value in signature["block"])
+                        or not isinstance(signature["grid"], list)
+                        or len(signature["grid"]) != 3
+                        or any(not isinstance(value, int) for value in signature["grid"])
+                        or not isinstance(signature["registers_per_thread"], int)
+                        or not isinstance(signature["shared_memory"], int)
+                    ):
+                        raise HarnessError(
+                            "vLLM decode kernel launch geometry/resource metadata is incomplete"
+                        )
+                    window_families[family] += 1
+                    family_totals[family] += 1
+                    family_signatures[canonical_json(signature)] += 1
+            elif family is not None:
+                raise HarnessError(
+                    "vLLM decode-family kernel crosses a pure-decode annotation boundary"
+                )
+            scan += 1
+        expected_window_counts = {
+            family: expected for family, (_, expected) in family_contract.items()
+        }
+        if dict(window_families) != expected_window_counts:
+            raise HarnessError(
+                "vLLM pure-decode family counts differ in window "
+                f"{window_index}: got {dict(window_families)}, "
+                f"expected {expected_window_counts}"
+            )
+        cursor = scan
+
+    decode_total = sum(sum(values) for values in decode_grouped.values())
+    decode_kernels = sorted(
+        (
+            {
+                "count": len(values),
+                "name": name,
+                "percent": sum(values) / decode_total * 100.0,
+                "total_duration_us": sum(values),
+            }
+            for name, values in decode_grouped.items()
+        ),
+        key=lambda item: (-item["total_duration_us"], item["name"]),
+    )
+    signature_multiset = [
+        {"count": count, "signature": json.loads(signature)}
+        for signature, count in sorted(family_signatures.items())
+    ]
+    result["clean_decode"] = {
+        "annotation": "execute_context_0(0)_generation_N(N)",
+        "family_counts": dict(sorted(family_totals.items())),
+        "family_counts_per_window": {
+            family: expected for family, (_, expected) in family_contract.items()
+        },
+        "family_signature_multiset_sha256": _sha256_canonical(signature_multiset),
+        "kernel_count": sum(item["count"] for item in decode_kernels),
+        "kernel_time_us": decode_total,
+        "kernels": decode_kernels,
+        "generation_window_count": generation_window_count,
+        "window_count": len(decode_windows),
+    }
+    return result
+
+
+def _validated_trace_execution(
+    path: pathlib.Path, *, model_key: str, vllm_cpp_sha: str
+) -> dict[str, Any]:
+    execution = _load_json_object(path)
+    if execution.get("model_key") != model_key:
+        raise HarnessError("trace execution manifest model differs from H1d")
+    if execution.get("vllm_cpp_sha") != vllm_cpp_sha:
+        raise HarnessError("trace execution manifest source SHA differs from H1d")
+    build_contract = execution.get("build_contract")
+    if (
+        not isinstance(build_contract, dict)
+        or build_contract.get("profile_control") is not True
+        or build_contract.get("sm_architecture") != "121a"
+        or build_contract.get("target_compile_definitions")
+        != ["VT_BENCH_PROFILE_CONTROL=1", "VT_CUTLASS_NVFP4=1"]
+    ):
+        raise HarnessError("trace execution manifest is not the exact H1d build")
+    artifacts = execution.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise HarnessError("trace execution manifest artifact map is absent")
+    required = {
+        "cmake_cache",
+        "model_config",
+        "oracle:python",
+        "server",
+    }
+    if not required.issubset(artifacts):
+        raise HarnessError("trace execution manifest omits command-link artifacts")
+    resolved = {}
+    for name, artifact in artifacts.items():
+        if not isinstance(artifact, dict):
+            raise HarnessError(f"trace execution artifact {name} has no hash record")
+        path_value = artifact.get("path")
+        expected_sha = artifact.get("sha256")
+        if not isinstance(path_value, str) or not pathlib.Path(path_value).is_absolute():
+            raise HarnessError(f"trace execution artifact {name} path is not absolute")
+        artifact_path = pathlib.Path(path_value)
+        if (
+            not artifact_path.is_file()
+            or not isinstance(expected_sha, str)
+            or sha256_file(artifact_path) != expected_sha
+        ):
+            raise HarnessError(f"trace execution artifact {name} drifted")
+        resolved[name] = artifact_path
+    if not required.issubset(resolved):
+        raise HarnessError("trace execution manifest omits command-link artifacts")
+    if execution.get("vllm_source_sha") != VLLM_COMMIT:
+        raise HarnessError("trace execution manifest vLLM source differs from H1d")
+    if execution.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
+        raise HarnessError("trace execution manifest oracle version differs from H1d")
+    if execution.get("bench_dependencies") != {
+        "flashinfer": FLASHINFER_VERSION,
+        "pandas": PANDAS_VERSION,
+    }:
+        raise HarnessError("trace execution benchmark dependencies differ from H1d")
+    if (
+        execution.get("max_num_seqs") != MAX_NUM_SEQS
+        or execution.get("max_num_batched_tokens")
+        != MAX_NUM_BATCHED_TOKENS[model_key]
+    ):
+        raise HarnessError("trace execution scheduler contract differs from H1d")
+    cutlass_tree = build_contract.get("cutlass_source_tree")
+    if (
+        not isinstance(cutlass_tree, dict)
+        or not isinstance(cutlass_tree.get("path"), str)
+        or _fingerprint_tree(pathlib.Path(cutlass_tree["path"])) != cutlass_tree
+    ):
+        raise HarnessError("trace execution CUTLASS source-tree fingerprint drifted")
+    native_target = build_contract.get("native_plan_target")
+    if (
+        build_contract.get("native_plan_target_absent") is not True
+        or not isinstance(native_target, str)
+        or not pathlib.Path(native_target).is_absolute()
+        or pathlib.Path(native_target).exists()
+    ):
+        raise HarnessError("trace execution native plan target is not absent")
+    cache_values = {}
+    for line in resolved["cmake_cache"].read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"([^#/:]+):[^=]*=(.*)", line)
+        if match:
+            cache_values[match.group(1)] = match.group(2)
+    source_value = cache_values.get("CMAKE_HOME_DIRECTORY")
+    if not isinstance(source_value, str) or not pathlib.Path(source_value).is_dir():
+        raise HarnessError("trace execution source root is absent")
+    return {
+        "execution": execution,
+        "model_snapshot": resolved["model_config"].parent,
+        "oracle_python": resolved["oracle:python"],
+        "server": resolved["server"],
+        "source_root": pathlib.Path(source_value),
     }
 
 
@@ -882,8 +1950,11 @@ def record_trace_status(
     ours_kernel_summaries: Sequence[pathlib.Path],
     ours_commands: Sequence[pathlib.Path],
     ours_profile_logs: Sequence[pathlib.Path],
+    ours_profile_controls: Sequence[pathlib.Path],
     ours_client_results: Sequence[pathlib.Path],
     ours_client_logs: Sequence[pathlib.Path],
+    ours_probe_results: Sequence[pathlib.Path],
+    ours_probe_logs: Sequence[pathlib.Path],
     vllm_torch_trace: pathlib.Path,
     vllm_kernel_summary: pathlib.Path,
     vllm_command: pathlib.Path,
@@ -891,6 +1962,7 @@ def record_trace_status(
     vllm_metadata: pathlib.Path,
     vllm_corpus: pathlib.Path,
     cache_drop_reports: Sequence[pathlib.Path],
+    execution_manifest: pathlib.Path,
     vllm_cpp_sha: str,
 ) -> dict[str, Any]:
     """Hash the mandatory paired execution-trace artifacts.
@@ -904,11 +1976,9 @@ def record_trace_status(
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
-    if (
-        len(ours_client_results) != TRACE_REPETITIONS
-        or len(ours_client_logs) != TRACE_REPETITIONS
-    ):
-        raise HarnessError("ours trace must retain exactly three client results and logs")
+    trace_execution = _validated_trace_execution(
+        execution_manifest, model_key=model_key, vllm_cpp_sha=vllm_cpp_sha
+    )
     ours_trace_sequences = {
         "Nsight reports": ours_nsys_reports,
         "Nsight SQLite exports": ours_nsys_sqlites,
@@ -916,6 +1986,11 @@ def record_trace_status(
         "kernel summaries": ours_kernel_summaries,
         "profile commands": ours_commands,
         "profile logs": ours_profile_logs,
+        "profile controls": ours_profile_controls,
+        "semantic client results": ours_client_results,
+        "semantic client logs": ours_client_logs,
+        "diagnostic probe results": ours_probe_results,
+        "diagnostic probe logs": ours_probe_logs,
     }
     for label, paths in ours_trace_sequences.items():
         if len(paths) != TRACE_REPETITIONS:
@@ -929,7 +2004,6 @@ def record_trace_status(
         for index, path in enumerate(cache_drop_reports, start=1)
     }
     generated_texts = []
-    ours_durations = []
     for path in ours_client_results:
         record = _load_json_object(path)
         validate_raw_result(
@@ -938,48 +2012,166 @@ def record_trace_status(
             expected_requests=TRACE_PROMPTS,
         )
         generated_texts.append(record.get("generated_texts"))
-        ours_durations.append(require_number(record.get("duration"), "duration"))
-    for command_path in ours_commands:
+    for path in ours_probe_results:
+        validate_raw_result(
+            _load_json_object(path),
+            concurrency=TRACE_CONCURRENCY,
+            expected_requests=TRACE_CONCURRENCY,
+        )
+
+    command_environments = []
+    for command_path, report_path in zip(
+        ours_commands, ours_nsys_reports, strict=True
+    ):
         command_tokens = shlex.split(command_path.read_text(encoding="utf-8"))
-        if "--no-enable-prefix-caching" not in command_tokens:
-            raise HarnessError("ours trace must explicitly disable prefix caching")
-        graph_trace_flag = f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}"
-        if graph_trace_flag not in command_tokens:
-            raise HarnessError("ours trace must capture node-level CUDA graph activity")
-        flush_flag = f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}"
-        if flush_flag not in command_tokens:
-            raise HarnessError("ours trace must periodically flush buffered CUDA activity")
-        if "--cpuctxsw=none" not in command_tokens:
-            raise HarnessError(
-                "ours trace must disable unrelated CPU context-switch tracing"
-            )
-        for flag, expected in (
-            ("--max-num-seqs", MAX_NUM_SEQS),
-            ("--max-num-batched-tokens", MAX_NUM_BATCHED_TOKENS[model_key]),
+        try:
+            nsys_index = command_tokens.index("nsys")
+        except ValueError as error:
+            raise HarnessError("ours trace command does not invoke nsys") from error
+        if command_tokens[nsys_index : nsys_index + 2] != ["nsys", "profile"]:
+            raise HarnessError("ours trace command does not invoke nsys profile")
+        if command_tokens[:1] != ["env"]:
+            raise HarnessError("ours trace command must use an explicit env prefix")
+        environment_tokens = command_tokens[1:nsys_index]
+        if any("=" not in token for token in environment_tokens):
+            raise HarnessError("ours trace command env prefix is malformed")
+        environment_names = [token.split("=", 1)[0] for token in environment_tokens]
+        expected_environment_names = set(TRACE_REQUIRED_ENV) | {
+            "VT_FP4_AUTOTUNE_CACHE_PATH",
+            "VT_FP4_FLASHINFER_CACHE_PATH",
+        }
+        if (
+            len(set(environment_names)) != len(environment_names)
+            or set(environment_names) != expected_environment_names
         ):
-            if flag not in command_tokens:
-                raise HarnessError(f"ours trace command omits {flag}")
-            value_index = command_tokens.index(flag) + 1
-            if value_index >= len(command_tokens):
-                raise HarnessError(f"ours trace command omits the value for {flag}")
-            if command_tokens[value_index] != str(expected):
-                raise HarnessError(f"ours trace command {flag} differs from the gate")
-        if "--max-model-len" in command_tokens:
-            value_index = command_tokens.index("--max-model-len") + 1
-            if value_index >= len(command_tokens):
-                raise HarnessError(
-                    "ours trace command omits the value for --max-model-len"
-                )
-            if command_tokens[value_index] != str(MAX_MODEL_LEN[model_key]):
-                raise HarnessError(
-                    "ours trace command --max-model-len differs from the gate"
-                )
-    if max(ours_durations) > min(ours_durations) * 1.20:
-        raise HarnessError("ours trace repetitions differ in duration by more than 20%")
+            raise HarnessError("ours trace command env inventory differs from H1d")
+        environment: dict[str, str] = {}
+        for token in environment_tokens:
+            name, value = token.split("=", 1)
+            environment[name] = value
+        for name, expected in TRACE_REQUIRED_ENV.items():
+            if environment.get(name) != expected:
+                raise HarnessError(f"ours trace environment {name} differs from H1d")
+        for name in ("VT_FP4_FLASHINFER_CACHE_PATH", "VT_FP4_AUTOTUNE_CACHE_PATH"):
+            if name not in environment:
+                raise HarnessError(f"ours trace environment omits {name}")
+        fixture = pathlib.Path(environment["VT_FP4_FLASHINFER_CACHE_PATH"])
+        if (
+            not fixture.is_absolute()
+            or not fixture.is_file()
+            or sha256_file(fixture) != NVFP4_PLAN_FIXTURE_SHA256
+        ):
+            raise HarnessError("ours trace environment plan fixture differs from H1d")
+        native_target = pathlib.Path(environment["VT_FP4_AUTOTUNE_CACHE_PATH"])
+        if not native_target.is_absolute() or native_target.exists():
+            raise HarnessError("ours trace native plan target is not absent")
+        command_environments.append(environment)
+        output_prefix = _option_value(command_tokens, "--output")
+        if output_prefix is None or pathlib.Path(
+            f"{output_prefix}.nsys-rep"
+        ).resolve() != report_path.resolve():
+            raise HarnessError("ours trace command output prefix differs from its report")
+        expected_tail = [
+            "nsys",
+            "profile",
+            "--trace=cuda",
+            f"--capture-range={NSYS_CAPTURE_RANGE}",
+            "--capture-range-end=stop",
+            "--flush-on-cudaprofilerstop=true",
+            f"--cuda-flush-interval={NSYS_CUDA_FLUSH_INTERVAL_MS}",
+            f"--cuda-graph-trace={NSYS_CUDA_GRAPH_TRACE}",
+            "--cuda-event-trace=false",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--stats=false",
+            "--kill=none",
+            "--force-overwrite=true",
+            "--output",
+            output_prefix,
+            str(trace_execution["server"]),
+            "--model",
+            str(trace_execution["model_snapshot"]),
+            "--port",
+            str(trace_execution["execution"]["port"]),
+            "--num-blocks",
+            str(trace_execution["execution"]["num_blocks"]),
+            "--max-num-seqs",
+            str(MAX_NUM_SEQS),
+            "--max-num-batched-tokens",
+            str(MAX_NUM_BATCHED_TOKENS[model_key]),
+            "--max-model-len",
+            str(MAX_MODEL_LEN[model_key]),
+            "--no-enable-prefix-caching",
+            "--cuda-profile-graph-replays",
+            str(TRACE_CAPTURE_GRAPH_REPLAYS),
+            "--served-model-name",
+            "gate",
+        ]
+        if command_tokens[nsys_index:] != expected_tail:
+            raise HarnessError("ours trace command tail differs from the exact H1d recipe")
+
+    for result_path, log_path in zip(
+        ours_client_results, ours_client_logs, strict=True
+    ):
+        _parse_client_command_log(
+            log_path,
+            result_path=result_path,
+            corpus_path=vllm_corpus,
+            num_prompts=TRACE_PROMPTS,
+            num_warmups=TRACE_CONCURRENCY,
+        )
+    for result_path, log_path in zip(ours_probe_results, ours_probe_logs, strict=True):
+        _parse_client_command_log(
+            log_path,
+            result_path=result_path,
+            corpus_path=vllm_corpus,
+            num_prompts=TRACE_CONCURRENCY,
+            num_warmups=0,
+        )
     ours_output_digests = [
         hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
         for value in generated_texts
     ]
+    if len(set(ours_output_digests)) != 1:
+        raise HarnessError("ours semantic trace workloads are not output-repeatable")
+
+    plan_validations = []
+    profile_controls = []
+    for index, (log_path, control_path, environment) in enumerate(
+        zip(ours_profile_logs, ours_profile_controls, command_environments, strict=True),
+        start=1,
+    ):
+        plan = _parse_fp4_plan_log(log_path)
+        if pathlib.Path(plan["flashinfer_path"]).resolve() != pathlib.Path(
+            environment["VT_FP4_FLASHINFER_CACHE_PATH"]
+        ).resolve():
+            raise HarnessError(f"capture {index} plan fixture differs from its command")
+        if pathlib.Path(plan["native_path"]).resolve() != pathlib.Path(
+            environment["VT_FP4_AUTOTUNE_CACHE_PATH"]
+        ).resolve():
+            raise HarnessError(f"capture {index} native plan target differs from its command")
+        plan_validations.append(plan)
+        markers = _parse_profile_markers(log_path)
+        control = _load_json_object(control_path)
+        expected_marker_fields = {
+            **markers,
+            "profile_log": str(log_path),
+            "profile_log_sha256": sha256_file(log_path),
+            "signal": "SIGUSR2",
+        }
+        if any(control.get(field) != value for field, value in expected_marker_fields.items()):
+            raise HarnessError(f"capture {index} profile control differs from its log")
+        for field in ("nsys_pid", "server_pid", "server_pgid"):
+            if not isinstance(control.get(field), int) or control[field] <= 0:
+                raise HarnessError(f"capture {index} profile control {field} is invalid")
+        if control.get("nsys_exit_status") != 0:
+            raise HarnessError(f"capture {index} Nsight exit status is not zero")
+        if control["server_pgid"] != control["nsys_pid"]:
+            raise HarnessError(f"capture {index} server process group is not nsys-owned")
+        if control["server_pid"] != markers["ready_pid"]:
+            raise HarnessError(f"capture {index} signaled server PID differs")
+        profile_controls.append(control)
+
     metadata = _load_json_object(vllm_metadata)
     expected_metadata = {
         "admission_mode": "closed-loop",
@@ -1003,6 +2195,20 @@ def record_trace_status(
         raise HarnessError("vLLM trace metadata corpus hash differs")
     if pathlib.Path(str(metadata.get("corpus"))).resolve() != vllm_corpus.resolve():
         raise HarnessError("vLLM trace metadata corpus path differs")
+    if pathlib.Path(str(metadata.get("model"))).resolve() != trace_execution[
+        "model_snapshot"
+    ].resolve():
+        raise HarnessError("vLLM trace metadata model snapshot differs")
+    profile_dir_value = metadata.get("profile_dir")
+    if not isinstance(profile_dir_value, str) or not pathlib.Path(
+        profile_dir_value
+    ).is_absolute():
+        raise HarnessError("vLLM trace metadata profile directory is absent")
+    vllm_profile_dir = pathlib.Path(profile_dir_value)
+    try:
+        vllm_torch_trace.resolve().relative_to(vllm_profile_dir.resolve())
+    except ValueError as error:
+        raise HarnessError("vLLM raw trace is outside its profile directory") from error
     output_digests = metadata.get("output_digests")
     if (
         not isinstance(output_digests, list)
@@ -1019,20 +2225,107 @@ def record_trace_status(
     output_digests_equal = len(set(output_digests)) == 1
     if metadata.get("output_digests_equal") is not output_digests_equal:
         raise HarnessError("vLLM trace output-repeatability flag differs")
+
+    vllm_tokens = shlex.split(vllm_command.read_text(encoding="utf-8"))
+    if len(vllm_tokens) < 4 or vllm_tokens[0] != "env":
+        raise HarnessError("vLLM trace command omits its explicit environment")
+    if vllm_tokens[1].split("=", 1)[0] != "PATH" or "=" not in vllm_tokens[1]:
+        raise HarnessError("vLLM trace command PATH prefix differs")
+    path_value = vllm_tokens[1].split("=", 1)[1]
+    if not path_value or pathlib.Path(path_value.split(os.pathsep)[0]).resolve() != (
+        trace_execution["oracle_python"].parent.resolve()
+    ):
+        raise HarnessError("vLLM trace command PATH does not select the oracle environment")
+    if pathlib.Path(vllm_tokens[2]).resolve() != trace_execution[
+        "oracle_python"
+    ].resolve():
+        raise HarnessError("vLLM trace command Python differs from the oracle manifest")
+    expected_profile_script = (
+        trace_execution["source_root"]
+        / "tools"
+        / "bench"
+        / "profile_vllm_online_gate.py"
+    )
+    if pathlib.Path(vllm_tokens[3]).resolve() != expected_profile_script.resolve():
+        raise HarnessError("vLLM trace command script differs from the source manifest")
+    expected_vllm_tokens = [
+        "env",
+        vllm_tokens[1],
+        str(trace_execution["oracle_python"]),
+        str(expected_profile_script),
+        "--model",
+        str(trace_execution["model_snapshot"]),
+        "--corpus",
+        str(vllm_corpus),
+        "--profile-dir",
+        str(vllm_profile_dir),
+        "--metadata",
+        str(vllm_metadata),
+        "--num-prompts",
+        str(TRACE_PROMPTS),
+        "--max-concurrency",
+        str(TRACE_CONCURRENCY),
+        "--max-num-seqs",
+        str(MAX_NUM_SEQS),
+        "--max-num-batched-tokens",
+        str(MAX_NUM_BATCHED_TOKENS[model_key]),
+        "--repetitions",
+        str(TRACE_REPETITIONS),
+    ]
+    if vllm_tokens != expected_vllm_tokens:
+        raise HarnessError("vLLM trace command differs from the exact H1d recipe")
+
+    vllm_summary = _load_json_object(vllm_kernel_summary)
+    recomputed_vllm_summary = _summarize_torch_trace(
+        vllm_torch_trace, model_key=model_key
+    )
+    for field, expected in recomputed_vllm_summary.items():
+        actual = vllm_summary.get(field)
+        if field == "selected_trace":
+            if not isinstance(actual, str) or pathlib.Path(actual).resolve() != pathlib.Path(
+                expected
+            ).resolve():
+                raise HarnessError("vLLM selected trace path differs from its summary")
+        elif actual != expected:
+            raise HarnessError(f"vLLM kernel summary field {field} was not recomputed")
+
     nsys_validations = []
-    for sqlite_path, validation_path in zip(
-        ours_nsys_sqlites, ours_nsys_validations, strict=True
+    nsys_kernel_summaries = []
+    for report_path, sqlite_path, validation_path, summary_path in zip(
+        ours_nsys_reports,
+        ours_nsys_sqlites,
+        ours_nsys_validations,
+        ours_kernel_summaries,
+        strict=True,
     ):
         validation = validate_nsys_trace(sqlite_path, model_key=model_key)
+        if pathlib.Path(validation["nsys_report_path"]).resolve() != report_path.resolve():
+            raise HarnessError("Nsight SQLite source report differs from its indexed artifact")
         if _load_json_object(validation_path) != validation:
             raise HarnessError(
                 "recorded Nsight validation differs from the SQLite report"
             )
         nsys_validations.append(validation)
+        summary = summarize_nsys_kernels(sqlite_path)
+        if _load_json_object(summary_path) != summary:
+            raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
+        nsys_kernel_summaries.append(summary)
+    signature_hashes = [
+        validation["canonical_node_multiset_sha256"] for validation in nsys_validations
+    ]
+    if len(set(signature_hashes)) != 1:
+        raise HarnessError("ours graph node multiset differs across independent captures")
+    capture_session_uuids = [
+        validation["capture_session_uuid"] for validation in nsys_validations
+    ]
+    if len(set(capture_session_uuids)) != TRACE_REPETITIONS:
+        raise HarnessError("ours independent traces reuse an Nsight capture session UUID")
+
     indexed_trace_artifacts: dict[str, pathlib.Path] = {}
     for name, paths in (
         ("ours_command", ours_commands),
         ("ours_profile_log", ours_profile_logs),
+        ("ours_profile_control", ours_profile_controls),
         ("ours_nsys_report", ours_nsys_reports),
         ("ours_nsys_sqlite", ours_nsys_sqlites),
         ("ours_nsys_validation", ours_nsys_validations),
@@ -1052,16 +2345,36 @@ def record_trace_status(
             f"ours_client_log_{index}": path
             for index, path in enumerate(ours_client_logs, start=1)
         },
+        **{
+            f"ours_probe_result_{index}": path
+            for index, path in enumerate(ours_probe_results, start=1)
+        },
+        **{
+            f"ours_probe_log_{index}": path
+            for index, path in enumerate(ours_probe_logs, start=1)
+        },
         "vllm_command": vllm_command,
         "vllm_profile_log": vllm_profile_log,
         "vllm_metadata": vllm_metadata,
         "vllm_corpus": vllm_corpus,
         "vllm_torch_trace": vllm_torch_trace,
         "vllm_kernel_summary": vllm_kernel_summary,
+        "execution_manifest": execution_manifest,
     }
     for name, path in artifacts.items():
         if not path.is_file() or path.stat().st_size == 0:
             raise HarnessError(f"trace artifact {name} is absent or empty: {path}")
+    trace_paths = [
+        path
+        for paths in ours_trace_sequences.values()
+        for path in paths
+    ]
+    resolved_paths = [path.resolve() for path in trace_paths]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise HarnessError("independent trace artifacts reuse a path")
+    inode_keys = [(path.stat().st_dev, path.stat().st_ino) for path in trace_paths]
+    if len(set(inode_keys)) != len(inode_keys):
+        raise HarnessError("independent trace artifacts reuse an inode")
     result = {
         "artifacts": {
             **{
@@ -1083,21 +2396,42 @@ def record_trace_status(
             },
         },
         "passed": True,
+        "plan_validations": plan_validations,
+        "profile_controls": profile_controls,
+        "schema_version": TRACE_STATUS_SCHEMA_VERSION,
         "trace_contract": {
             "admission_mode": "closed-loop",
+            "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
+            "capture_range": NSYS_CAPTURE_RANGE,
+            "capture_range_end": "stop",
             "concurrency": TRACE_CONCURRENCY,
             "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
             "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
+            "cuda_event_trace": False,
             "enable_prefix_caching": False,
+            "force_overwrite": True,
+            "flush_on_cudaprofilerstop": True,
             "input_len": INPUT_LEN,
             "max_model_len": MAX_MODEL_LEN[model_key],
             "max_num_seqs": MAX_NUM_SEQS,
             "nsys_captures": TRACE_REPETITIONS,
+            "nsys_kill": "none",
+            "nsys_stats": False,
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
+            "probe_num_prompts": TRACE_CONCURRENCY,
+            "probe_num_warmups": 0,
+            "probe_timing_binding": False,
+            "semantic_num_warmups": TRACE_CONCURRENCY,
             "repetitions": TRACE_REPETITIONS,
+            "sample": "none",
+            "cpu_context_switch_trace": "none",
         },
         "nsys_validations": nsys_validations,
+        "nsys_kernel_summaries": nsys_kernel_summaries,
+        "node_multiset_sha256": signature_hashes[0],
+        "nsys_capture_session_uuids": capture_session_uuids,
+        "nsys_product_version": NSYS_PRODUCT_VERSION,
         "vllm_cpp_sha": vllm_cpp_sha,
         "vllm_profiler": "torch-profiler",
     }
@@ -1138,6 +2472,24 @@ def record_oracle_manifest(
             "vLLM oracle version drift: "
             f"metadata={metadata_version!r}, runtime={runtime_version!r}, "
             f"expected={VLLM_ORACLE_VERSION!r}"
+        )
+    try:
+        import flashinfer  # Delayed so CPU contract tests can provide a stub.
+        flashinfer_distribution = importlib.metadata.distribution("flashinfer-python")
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise HarnessError(
+            f"pinned FlashInfer {FLASHINFER_VERSION} is required by the oracle"
+        ) from error
+    flashinfer_runtime_version = getattr(flashinfer, "__version__", None)
+    if (
+        flashinfer_distribution.version != FLASHINFER_VERSION
+        or flashinfer_runtime_version != FLASHINFER_VERSION
+    ):
+        raise HarnessError(
+            "FlashInfer oracle dependency drift: "
+            f"metadata={flashinfer_distribution.version!r}, "
+            f"runtime={flashinfer_runtime_version!r}, "
+            f"expected={FLASHINFER_VERSION!r}"
         )
     try:
         import pandas  # Delayed so CPU contract tests can provide a stub.
@@ -1181,6 +2533,14 @@ def record_oracle_manifest(
         raise HarnessError("pandas benchmark dependency has no filesystem metadata")
     pandas_init = pathlib.Path(pandas_init_value).absolute()
     pandas_dist_info = pathlib.Path(pandas_dist_info_value).absolute()
+    flashinfer_init_value = getattr(flashinfer, "__file__", None)
+    flashinfer_dist_info_value = getattr(flashinfer_distribution, "_path", None)
+    if not isinstance(flashinfer_init_value, str) or flashinfer_dist_info_value is None:
+        raise HarnessError("FlashInfer oracle dependency has no filesystem metadata")
+    flashinfer_init = pathlib.Path(flashinfer_init_value).absolute()
+    flashinfer_root = flashinfer_init.parent
+    flashinfer_dist_info = pathlib.Path(flashinfer_dist_info_value).absolute()
+    cutlass_tree = _fingerprint_tree(flashinfer_root / "data" / "cutlass")
     artifacts = {
         "bench_datasets": package_root / "benchmarks" / "datasets" / "datasets.py",
         "bench_serve": package_root / "benchmarks" / "serve.py",
@@ -1188,6 +2548,9 @@ def record_oracle_manifest(
         "client": client,
         "distribution_metadata": dist_info / "METADATA",
         "distribution_record": dist_info / "RECORD",
+        "flashinfer_distribution_metadata": flashinfer_dist_info / "METADATA",
+        "flashinfer_distribution_record": flashinfer_dist_info / "RECORD",
+        "flashinfer_package_init": flashinfer_init,
         "ninja": ninja,
         "package_init": package_init,
         "python": python,
@@ -1203,8 +2566,12 @@ def record_oracle_manifest(
             name: {"path": str(path), "sha256": sha256_file(path)}
             for name, path in artifacts.items()
         },
-        "bench_dependencies": {"pandas": PANDAS_VERSION},
+        "bench_dependencies": {
+            "flashinfer": FLASHINFER_VERSION,
+            "pandas": PANDAS_VERSION,
+        },
         "client_contract_source_commit": VLLM_COMMIT,
+        "cutlass_source_tree": cutlass_tree,
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "oracle_version": metadata_version,
         "runtime_version": runtime_version,
@@ -1221,6 +2588,7 @@ def record_execution_manifest(
     build_dir: pathlib.Path,
     client: pathlib.Path,
     snapshot: pathlib.Path,
+    configure_log: pathlib.Path,
     build_command: pathlib.Path,
     build_log: pathlib.Path,
     oracle_manifest: pathlib.Path,
@@ -1228,6 +2596,7 @@ def record_execution_manifest(
     num_blocks: int,
     max_num_seqs: int,
     max_num_batched_tokens: int,
+    profile_control: bool,
 ) -> dict[str, Any]:
     if output.exists():
         raise HarnessError(f"refusing to overwrite execution manifest: {output}")
@@ -1256,9 +2625,11 @@ def record_execution_manifest(
     )
     artifacts = {
         "client": client,
+        "configure_log": configure_log,
         "build_command": build_command,
         "build_log": build_log,
         "cmake_cache": build_dir / "CMakeCache.txt",
+        "compile_commands": build_dir / "compile_commands.json",
         "model_config": snapshot / "config.json",
         "oracle_manifest": oracle_manifest,
         "server": build_dir / "examples" / "server",
@@ -1271,7 +2642,11 @@ def record_execution_manifest(
         raise HarnessError("oracle runtime version differs from the pinned pip oracle")
     if oracle.get("client_contract_source_commit") != VLLM_COMMIT:
         raise HarnessError("oracle client contract source differs from the parity pin")
-    if oracle.get("bench_dependencies") != {"pandas": PANDAS_VERSION}:
+    expected_bench_dependencies = {
+        "flashinfer": FLASHINFER_VERSION,
+        "pandas": PANDAS_VERSION,
+    }
+    if oracle.get("bench_dependencies") != expected_bench_dependencies:
         raise HarnessError("oracle benchmark dependency inventory differs from the pin")
     oracle_artifacts = oracle.get("artifacts")
     required_oracle_artifacts = {
@@ -1281,6 +2656,9 @@ def record_execution_manifest(
         "client",
         "distribution_metadata",
         "distribution_record",
+        "flashinfer_distribution_metadata",
+        "flashinfer_distribution_record",
+        "flashinfer_package_init",
         "ninja",
         "package_init",
         "python",
@@ -1306,6 +2684,123 @@ def record_execution_manifest(
     oracle_client = pathlib.Path(oracle_artifacts["client"]["path"])
     if oracle_client.resolve() != client.resolve():
         raise HarnessError("execution client differs from the oracle manifest")
+
+    cutlass_source_tree = oracle.get("cutlass_source_tree")
+    if not isinstance(cutlass_source_tree, dict):
+        raise HarnessError("oracle CUTLASS source-tree fingerprint is absent")
+    cutlass_path_value = cutlass_source_tree.get("path")
+    if not isinstance(cutlass_path_value, str):
+        raise HarnessError("oracle CUTLASS source-tree path is absent")
+    cutlass_path = pathlib.Path(cutlass_path_value)
+    if _fingerprint_tree(cutlass_path) != cutlass_source_tree:
+        raise HarnessError("oracle CUTLASS source tree drifted before execution")
+
+    cmake_cache_path = build_dir / "CMakeCache.txt"
+    cache_values: dict[str, str] = {}
+    for line in cmake_cache_path.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(r"([^#/:]+):[^=]*=(.*)", line)
+        if match:
+            cache_values[match.group(1)] = match.group(2)
+    expected_cache_values = {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VLLM_CPP_BENCH_PROFILE_CONTROL": "ON" if profile_control else "OFF",
+        "VLLM_CPP_CUDA": "ON",
+        "VLLM_CPP_CUDA_ARCHITECTURES": "121a",
+    }
+    for name, expected in expected_cache_values.items():
+        if cache_values.get(name) != expected:
+            raise HarnessError(f"CMake cache {name} differs from the H1d build contract")
+    source_root_value = cache_values.get("CMAKE_HOME_DIRECTORY")
+    configured_cutlass_value = cache_values.get("VLLM_CPP_CUTLASS_DIR")
+    if not isinstance(source_root_value, str) or not pathlib.Path(source_root_value).is_dir():
+        raise HarnessError("CMake cache source root is absent")
+    source_root = pathlib.Path(source_root_value)
+    if (
+        not isinstance(configured_cutlass_value, str)
+        or pathlib.Path(configured_cutlass_value).resolve() != cutlass_path.resolve()
+    ):
+        raise HarnessError("CMake CUTLASS path differs from the oracle dependency tree")
+
+    configure_text = configure_log.read_text(encoding="utf-8")
+    if (
+        "CUTLASS found at " not in configure_text
+        or "enabling sm120a NVFP4 cutlass GEMM" not in configure_text
+        or "cutlass NVFP4 GEMM disabled" in configure_text
+    ):
+        raise HarnessError("configure log does not prove CUTLASS NVFP4 enablement")
+
+    try:
+        compile_entries = json.loads(
+            (build_dir / "compile_commands.json").read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as error:
+        raise HarnessError("compile_commands.json is invalid") from error
+    if not isinstance(compile_entries, list):
+        raise HarnessError("compile_commands.json is not an array")
+    target_source = (source_root / "src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu").resolve()
+    target_entries = [
+        entry
+        for entry in compile_entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("file"), str)
+        and pathlib.Path(entry["file"]).resolve() == target_source
+    ]
+    if len(target_entries) != 1:
+        raise HarnessError("compile commands do not contain exactly one CUTLASS NVFP4 TU")
+    target_entry = target_entries[0]
+    command_value = target_entry.get("command")
+    arguments_value = target_entry.get("arguments")
+    if isinstance(command_value, str):
+        compile_tokens = shlex.split(command_value)
+    elif isinstance(arguments_value, list) and all(
+        isinstance(value, str) for value in arguments_value
+    ):
+        compile_tokens = list(arguments_value)
+    else:
+        raise HarnessError("CUTLASS NVFP4 compile command has no token stream")
+    compile_text = " ".join(compile_tokens)
+    for required in (
+        "-DVT_CUTLASS_NVFP4=1",
+        "arch=compute_121a",
+        "sm_121a",
+        str(cutlass_path / "include"),
+        str(cutlass_path / "tools" / "util" / "include"),
+    ):
+        if required not in compile_text:
+            raise HarnessError(f"CUTLASS NVFP4 compile command omits {required}")
+    has_profile_definition = "-DVT_BENCH_PROFILE_CONTROL=1" in compile_tokens
+    if has_profile_definition is not profile_control:
+        raise HarnessError(
+            "CUTLASS NVFP4 compile command profile-control definition differs"
+        )
+
+    server_path = build_dir / "examples" / "server"
+    for marker in (b"MatmulNvfp4Cutlass", b"[VT_FP4_CACHE] prepared"):
+        if not _file_contains(server_path, marker):
+            raise HarnessError(f"server binary omits target marker {marker!r}")
+    has_profile_marker = _file_contains(server_path, b"[VT_CUDA_PROFILE] started")
+    if has_profile_marker is not profile_control:
+        raise HarnessError("server binary profile-control marker differs from its build")
+
+    fixture_path = source_root / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+    if (
+        os.environ.get("VT_FP4_FLASHINFER_CACHE_PATH") is None
+        or pathlib.Path(os.environ["VT_FP4_FLASHINFER_CACHE_PATH"]).resolve()
+        != fixture_path.resolve()
+        or sha256_file(fixture_path) != NVFP4_PLAN_FIXTURE_SHA256
+    ):
+        raise HarnessError("execution FlashInfer plan fixture differs from H1d")
+    for name, expected in TRACE_REQUIRED_ENV.items():
+        if os.environ.get(name) != expected:
+            raise HarnessError(f"execution environment {name} differs from H1d")
+    native_target_value = os.environ.get("VT_FP4_AUTOTUNE_CACHE_PATH")
+    if native_target_value is None:
+        raise HarnessError("execution environment omits native plan target")
+    native_target = pathlib.Path(native_target_value)
+    if not native_target.is_absolute() or native_target.exists():
+        raise HarnessError("execution native plan target must be absent")
+
     artifacts.update({f"weight:{path.name}": path for path in weight_files})
     artifacts.update({f"snapshot:{path.name}": path for path in snapshot_files})
     for name, path in artifacts.items():
@@ -1328,7 +2823,20 @@ def record_execution_manifest(
             str((build_dir / "examples" / "server").absolute()),
             str(client.absolute()),
         ],
-        "bench_dependencies": {"pandas": PANDAS_VERSION},
+        "bench_dependencies": expected_bench_dependencies,
+        "build_contract": {
+            "compile_command_sha256": _sha256_canonical(compile_tokens),
+            "cutlass_source_tree": cutlass_source_tree,
+            "native_plan_target": str(native_target),
+            "native_plan_target_absent": True,
+            "profile_control": profile_control,
+            "sm_architecture": "121a",
+            "target_compile_definitions": (
+                ["VT_BENCH_PROFILE_CONTROL=1", "VT_CUTLASS_NVFP4=1"]
+                if profile_control
+                else ["VT_CUTLASS_NVFP4=1"]
+            ),
+        },
         "model_key": model_key,
         "model_revision": MODEL_REVISIONS[model_key],
         "max_num_batched_tokens": max_num_batched_tokens,
@@ -1408,6 +2916,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
+    summarize_nsys = commands.add_parser("summarize-nsys-kernels")
+    summarize_nsys.add_argument("--sqlite", type=pathlib.Path, required=True)
+    summarize_nsys.add_argument("--output", type=pathlib.Path, required=True)
+
+    profile_control = commands.add_parser("record-profile-control")
+    profile_control.add_argument("--output", type=pathlib.Path, required=True)
+    profile_control.add_argument("--profile-log", type=pathlib.Path, required=True)
+    profile_control.add_argument("--nsys-pid", type=int, required=True)
+    profile_control.add_argument("--nsys-exit-status", type=int, required=True)
+    profile_control.add_argument("--server-pid", type=int, required=True)
+    profile_control.add_argument("--server-pgid", type=int, required=True)
+
     trace = commands.add_parser("record-trace-status")
     trace.add_argument("--output", type=pathlib.Path, required=True)
     trace.add_argument("--model-key", choices=tuple(MODEL_REVISIONS), required=True)
@@ -1429,8 +2949,13 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument(
         "--ours-profile-log", action="append", type=pathlib.Path, required=True
     )
+    trace.add_argument(
+        "--ours-profile-control", action="append", type=pathlib.Path, required=True
+    )
     trace.add_argument("--ours-client-result", action="append", type=pathlib.Path, required=True)
     trace.add_argument("--ours-client-log", action="append", type=pathlib.Path, required=True)
+    trace.add_argument("--ours-probe-result", action="append", type=pathlib.Path, required=True)
+    trace.add_argument("--ours-probe-log", action="append", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-torch-trace", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-kernel-summary", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-command", type=pathlib.Path, required=True)
@@ -1440,6 +2965,7 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument(
         "--cache-drop-report", action="append", type=pathlib.Path, required=True
     )
+    trace.add_argument("--execution-manifest", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-cpp-sha", required=True)
 
     oracle = commands.add_parser("record-oracle")
@@ -1453,6 +2979,7 @@ def _parser() -> argparse.ArgumentParser:
     execution.add_argument("--build-dir", type=pathlib.Path, required=True)
     execution.add_argument("--client", type=pathlib.Path, required=True)
     execution.add_argument("--snapshot", type=pathlib.Path, required=True)
+    execution.add_argument("--configure-log", type=pathlib.Path, required=True)
     execution.add_argument("--build-command", type=pathlib.Path, required=True)
     execution.add_argument("--build-log", type=pathlib.Path, required=True)
     execution.add_argument("--oracle-manifest", type=pathlib.Path, required=True)
@@ -1460,6 +2987,7 @@ def _parser() -> argparse.ArgumentParser:
     execution.add_argument("--num-blocks", type=int, required=True)
     execution.add_argument("--max-num-seqs", type=int, required=True)
     execution.add_argument("--max-num-batched-tokens", type=int, required=True)
+    execution.add_argument("--profile-control", choices=("on", "off"), required=True)
 
     bench = commands.add_parser("bench")
     bench.add_argument("--client", type=pathlib.Path, required=True)
@@ -1472,6 +3000,7 @@ def _parser() -> argparse.ArgumentParser:
     bench.add_argument("--repetition", type=int, required=True)
     bench.add_argument("--artifact-tag", default="")
     bench.add_argument("--num-prompts", type=int)
+    bench.add_argument("--num-warmups", type=int)
     return parser
 
 
@@ -1526,6 +3055,20 @@ def main() -> int:
             raise HarnessError(f"refusing to overwrite Nsight validation: {args.output}")
         result = validate_nsys_trace(args.sqlite, model_key=args.model_key)
         write_json_atomic(args.output, result)
+    elif args.command == "summarize-nsys-kernels":
+        if args.output.exists():
+            raise HarnessError(f"refusing to overwrite Nsight summary: {args.output}")
+        result = summarize_nsys_kernels(args.sqlite)
+        write_json_atomic(args.output, result)
+    elif args.command == "record-profile-control":
+        result = record_profile_control(
+            args.output,
+            profile_log=args.profile_log,
+            nsys_pid=args.nsys_pid,
+            nsys_exit_status=args.nsys_exit_status,
+            server_pid=args.server_pid,
+            server_pgid=args.server_pgid,
+        )
     elif args.command == "record-trace-status":
         result = record_trace_status(
             args.output,
@@ -1536,8 +3079,11 @@ def main() -> int:
             ours_kernel_summaries=args.ours_kernel_summary,
             ours_commands=args.ours_command,
             ours_profile_logs=args.ours_profile_log,
+            ours_profile_controls=args.ours_profile_control,
             ours_client_results=args.ours_client_result,
             ours_client_logs=args.ours_client_log,
+            ours_probe_results=args.ours_probe_result,
+            ours_probe_logs=args.ours_probe_log,
             vllm_torch_trace=args.vllm_torch_trace,
             vllm_kernel_summary=args.vllm_kernel_summary,
             vllm_command=args.vllm_command,
@@ -1545,6 +3091,7 @@ def main() -> int:
             vllm_metadata=args.vllm_metadata,
             vllm_corpus=args.vllm_corpus,
             cache_drop_reports=args.cache_drop_report,
+            execution_manifest=args.execution_manifest,
             vllm_cpp_sha=args.vllm_cpp_sha,
         )
     elif args.command == "record-oracle":
@@ -1557,6 +3104,7 @@ def main() -> int:
             build_dir=args.build_dir,
             client=args.client,
             snapshot=args.snapshot,
+            configure_log=args.configure_log,
             build_command=args.build_command,
             build_log=args.build_log,
             oracle_manifest=args.oracle_manifest,
@@ -1564,6 +3112,7 @@ def main() -> int:
             num_blocks=args.num_blocks,
             max_num_seqs=args.max_num_seqs,
             max_num_batched_tokens=args.max_num_batched_tokens,
+            profile_control=args.profile_control == "on",
         )
     else:
         result = run_benchmark(
@@ -1578,6 +3127,7 @@ def main() -> int:
                 repetition=args.repetition,
                 artifact_tag=args.artifact_tag,
                 num_prompts_override=args.num_prompts,
+                num_warmups_override=args.num_warmups,
             )
         )
     print(canonical_json(result))

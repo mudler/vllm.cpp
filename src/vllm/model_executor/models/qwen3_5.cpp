@@ -29,6 +29,9 @@
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
+#ifdef VT_BENCH_PROFILE_CONTROL
+#include "vt/cuda/cuda_profiler_control.h"
+#endif
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #ifdef VT_MARLIN_NVFP4
@@ -4876,6 +4879,11 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // persistent hidden buffer, then relaunch the captured dense layer region.
   if (s.captured) {
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+#ifdef VT_BENCH_PROFILE_CONTROL
+    vt::cuda::MarkCudaGraphReplayProfilerEligible(
+        s.graph, static_cast<uint32_t>(B), static_cast<uint32_t>(S),
+        static_cast<uint64_t>(s.replays));
+#endif
     b.ReplayGraph(impl_->queue, s.graph);
     ++s.replays;
     ++impl_->replays;

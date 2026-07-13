@@ -1,10 +1,18 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include <cuda_runtime.h>
+#ifdef VT_BENCH_PROFILE_CONTROL
+#include <cuda_profiler_api.h>
+#endif
 
+#include <csignal>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
 #include "vt/backend.h"
+#ifdef VT_BENCH_PROFILE_CONTROL
+#include "vt/cuda/cuda_profiler_control.h"
+#endif
 #ifdef VLLM_CPP_FLASH_ATTN
 #include "vt/cuda/cuda_flash_attn_fa2_internal.h"
 #endif
@@ -14,6 +22,22 @@
 
 namespace vt::cuda {
 namespace {
+
+#ifdef VT_BENCH_PROFILE_CONTROL
+volatile std::sig_atomic_t g_cuda_profile_arm_requested = 0;
+uint32_t g_cuda_profile_target_replays = 0;
+uint32_t g_cuda_profile_remaining_replays = 0;
+void* g_cuda_profile_pending_graph = nullptr;
+void* g_cuda_profile_graph = nullptr;
+uint64_t g_cuda_profile_prior_replays = 0;
+bool g_cuda_profile_eligible_pending = false;
+bool g_cuda_profile_active = false;
+bool g_cuda_profile_completed = false;
+
+extern "C" void CudaProfilerArmSignalHandler(int signal) {
+  if (signal == SIGUSR2) g_cuda_profile_arm_requested = 1;
+}
+#endif
 
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -115,8 +139,55 @@ class CudaBackend final : public Backend {
     return reinterpret_cast<void*>(exec);
   }
   void ReplayGraph(Queue& q, void* graph) override {
+#ifdef VT_BENCH_PROFILE_CONTROL
+    const bool eligible =
+        g_cuda_profile_eligible_pending && graph == g_cuda_profile_pending_graph;
+    g_cuda_profile_eligible_pending = false;
+    g_cuda_profile_pending_graph = nullptr;
+    if (g_cuda_profile_arm_requested != 0 && eligible) {
+      g_cuda_profile_arm_requested = 0;
+      if (g_cuda_profile_target_replays == 0 || g_cuda_profile_active ||
+          g_cuda_profile_completed) {
+        throw std::runtime_error(
+            "vt cuda: invalid or duplicate graph replay profiler arm");
+      }
+      Check(cudaProfilerStart(), "cudaProfilerStart");
+      g_cuda_profile_remaining_replays = g_cuda_profile_target_replays;
+      g_cuda_profile_graph = graph;
+      g_cuda_profile_active = true;
+      std::fprintf(stderr,
+                   "[VT_CUDA_PROFILE] started target_replays=%u graph=%p "
+                   "real_batch=16 padded_batch=16 prior_replays=%llu\n",
+                   g_cuda_profile_target_replays, graph,
+                   static_cast<unsigned long long>(g_cuda_profile_prior_replays));
+    }
+    if (g_cuda_profile_active &&
+        (!eligible || graph != g_cuda_profile_graph)) {
+      throw std::runtime_error(
+          "vt cuda: graph replay profiler encountered an ineligible graph");
+    }
+#endif
     Check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph), AsStream(q)),
           "cudaGraphLaunch");
+#ifdef VT_BENCH_PROFILE_CONTROL
+    if (g_cuda_profile_active) {
+      if (g_cuda_profile_remaining_replays == 0) {
+        throw std::runtime_error(
+            "vt cuda: graph replay profiler counter underflow");
+      }
+      --g_cuda_profile_remaining_replays;
+      if (g_cuda_profile_remaining_replays == 0) {
+        Check(cudaStreamSynchronize(AsStream(q)),
+              "cudaStreamSynchronize profiler tail");
+        Check(cudaProfilerStop(), "cudaProfilerStop");
+        g_cuda_profile_active = false;
+        g_cuda_profile_completed = true;
+        std::fprintf(stderr,
+                     "[VT_CUDA_PROFILE] stopped captured_replays=%u graph=%p\n",
+                     g_cuda_profile_target_replays, g_cuda_profile_graph);
+      }
+    }
+#endif
   }
   void DestroyGraph(void* graph) override {
     if (graph != nullptr) cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(graph));
@@ -146,4 +217,38 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+#ifdef VT_BENCH_PROFILE_CONTROL
+void ConfigureCudaGraphReplayProfiler(uint32_t replays) {
+  if (replays == 0) {
+    throw std::invalid_argument(
+        "CUDA graph replay profiler requires a positive replay count");
+  }
+  if (g_cuda_profile_target_replays != 0) {
+    throw std::logic_error("CUDA graph replay profiler is already configured");
+  }
+  g_cuda_profile_target_replays = replays;
+  if (std::signal(SIGUSR2, CudaProfilerArmSignalHandler) == SIG_ERR) {
+    g_cuda_profile_target_replays = 0;
+    throw std::runtime_error("could not install CUDA profiler SIGUSR2 handler");
+  }
+}
+
+void MarkCudaGraphReplayProfilerEligible(void* graph, uint32_t real_batch,
+                                         uint32_t padded_batch,
+                                         uint64_t prior_replays) {
+  if (g_cuda_profile_completed || graph == nullptr || real_batch != 16 ||
+      padded_batch != 16 || prior_replays == 0) {
+    return;
+  }
+  if (g_cuda_profile_eligible_pending) {
+    throw std::logic_error(
+        "CUDA graph replay profiler eligibility was not consumed");
+  }
+  g_cuda_profile_pending_graph = graph;
+  g_cuda_profile_prior_replays = prior_replays;
+  g_cuda_profile_eligible_pending = true;
+}
+#endif
+
 }  // namespace vt::cuda

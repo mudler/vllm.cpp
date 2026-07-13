@@ -25,24 +25,35 @@ from typing import Any
 from tools.bench.online_gate import (
     CACHE_DROP_METHOD,
     ENGINES,
+    FLASHINFER_VERSION,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
     MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
+    NSYS_CAPTURE_RANGE,
     NSYS_CUDA_FLUSH_INTERVAL_MS,
     NSYS_CUDA_GRAPH_TRACE,
+    NSYS_PRODUCT_VERSION,
     OUTPUT_LEN,
     PANDAS_VERSION,
     POINTS,
     REPETITIONS,
     TRACE_CONCURRENCY,
+    TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PROMPTS,
     TRACE_REPETITIONS,
+    TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
     precise_max_concurrent_requests,
+    summarize_nsys_kernels,
     validate_nsys_trace,
     validate_raw_result,
+    _fingerprint_tree,
+    _parse_fp4_plan_log,
+    _parse_profile_markers,
+    _summarize_torch_trace,
+    _validated_trace_execution,
 )
 from tools.bench.serve_low_common import (
     HarnessError,
@@ -337,7 +348,10 @@ def _model_precondition_reasons(
             reasons.append("execution manifest vLLM source SHA differs from the pin")
         if execution.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
             reasons.append("execution manifest pip-vLLM oracle version differs")
-        if execution.get("bench_dependencies") != {"pandas": PANDAS_VERSION}:
+        if execution.get("bench_dependencies") != {
+            "flashinfer": FLASHINFER_VERSION,
+            "pandas": PANDAS_VERSION,
+        }:
             reasons.append("execution benchmark dependency inventory differs")
         if execution.get("max_num_seqs") != MAX_NUM_SEQS:
             reasons.append("execution manifest max-num-seqs differs from the gate")
@@ -352,6 +366,8 @@ def _model_precondition_reasons(
                 "build_log",
                 "client",
                 "cmake_cache",
+                "compile_commands",
+                "configure_log",
                 "model_config",
                 "oracle_manifest",
                 "oracle:bench_datasets",
@@ -360,6 +376,9 @@ def _model_precondition_reasons(
                 "oracle:client",
                 "oracle:distribution_metadata",
                 "oracle:distribution_record",
+                "oracle:flashinfer_distribution_metadata",
+                "oracle:flashinfer_distribution_record",
+                "oracle:flashinfer_package_init",
                 "oracle:ninja",
                 "oracle:package_init",
                 "oracle:python",
@@ -406,6 +425,37 @@ def _model_precondition_reasons(
                 reasons.append(f"execution cache-drop roots cannot be derived: {error}")
             if execution.get("cache_drop_roots") != expected_cache_roots:
                 reasons.append("execution cache-drop root inventory differs")
+            build_contract = execution.get("build_contract")
+            if not isinstance(build_contract, dict):
+                reasons.append("execution H1d build contract is absent")
+            else:
+                if build_contract.get("profile_control") is not False:
+                    reasons.append("binding timing build contains trace profile control")
+                if build_contract.get("sm_architecture") != "121a":
+                    reasons.append("execution CUDA architecture differs from H1d")
+                if build_contract.get("target_compile_definitions") != [
+                    "VT_CUTLASS_NVFP4=1"
+                ]:
+                    reasons.append("production target compile definitions differ")
+                native_target = build_contract.get("native_plan_target")
+                if (
+                    build_contract.get("native_plan_target_absent") is not True
+                    or not isinstance(native_target, str)
+                    or not pathlib.Path(native_target).is_absolute()
+                    or pathlib.Path(native_target).exists()
+                ):
+                    reasons.append("execution native plan target is not absent")
+                cutlass_tree = build_contract.get("cutlass_source_tree")
+                try:
+                    if (
+                        not isinstance(cutlass_tree, dict)
+                        or not isinstance(cutlass_tree.get("path"), str)
+                        or _fingerprint_tree(pathlib.Path(cutlass_tree["path"]))
+                        != cutlass_tree
+                    ):
+                        reasons.append("execution CUTLASS source-tree fingerprint differs")
+                except HarnessError as error:
+                    reasons.append(str(error))
     except HarnessError as error:
         reasons.append(str(error))
 
@@ -439,39 +489,40 @@ def _model_precondition_reasons(
             reasons.append("ours trace is not an nsys capture")
         if status.get("vllm_profiler") != "torch-profiler":
             reasons.append("vLLM trace is not the required torch-profiler fallback")
+        if status.get("schema_version") != TRACE_STATUS_SCHEMA_VERSION:
+            reasons.append("paired trace schema is not binding H1d schema v2")
         trace_contract = status.get("trace_contract")
         expected_trace_contract = {
             "admission_mode": "closed-loop",
+            "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
+            "capture_range": NSYS_CAPTURE_RANGE,
+            "capture_range_end": "stop",
             "concurrency": TRACE_CONCURRENCY,
+            "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
+            "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
+            "cuda_event_trace": False,
             "enable_prefix_caching": False,
+            "force_overwrite": True,
+            "flush_on_cudaprofilerstop": True,
             "input_len": INPUT_LEN,
             "max_model_len": MAX_MODEL_LEN[model],
             "max_num_seqs": MAX_NUM_SEQS,
+            "nsys_captures": TRACE_REPETITIONS,
+            "nsys_kill": "none",
+            "nsys_stats": False,
             "num_prompts": TRACE_PROMPTS,
             "output_len": OUTPUT_LEN,
+            "probe_num_prompts": TRACE_CONCURRENCY,
+            "probe_num_warmups": 0,
+            "probe_timing_binding": False,
+            "semantic_num_warmups": TRACE_CONCURRENCY,
             "repetitions": TRACE_REPETITIONS,
+            "sample": "none",
+            "cpu_context_switch_trace": "none",
         }
-        if not isinstance(trace_contract, dict) or any(
-            trace_contract.get(field) != expected
-            for field, expected in expected_trace_contract.items()
-        ):
+        if trace_contract != expected_trace_contract:
             reasons.append("paired trace token/concurrency contract differs")
-        elif trace_contract.get("cuda_graph_trace") not in (
-            None,
-            NSYS_CUDA_GRAPH_TRACE,
-        ):
-            reasons.append("paired trace CUDA-graph granularity differs")
-        nsys_captures = (
-            trace_contract.get("nsys_captures")
-            if isinstance(trace_contract, dict)
-            else None
-        )
-        if nsys_captures is not None and nsys_captures != TRACE_REPETITIONS:
-            reasons.append("paired trace independent Nsight capture count differs")
-        if nsys_captures == TRACE_REPETITIONS and trace_contract.get(
-            "cuda_flush_interval_ms"
-        ) != NSYS_CUDA_FLUSH_INTERVAL_MS:
-            reasons.append("paired trace CUDA flush interval differs")
+        nsys_captures = TRACE_REPETITIONS if trace_contract == expected_trace_contract else None
         artifacts = status.get("artifacts")
         if not isinstance(artifacts, dict):
             reasons.append("paired trace artifact map is absent")
@@ -480,9 +531,13 @@ def _model_precondition_reasons(
                 "cache_drop_1",
                 "cache_drop_2",
                 "cache_drop_3",
+                "execution_manifest",
                 "ours_command",
                 "ours_profile_log",
+                "ours_profile_control",
                 "ours_nsys_report",
+                "ours_nsys_sqlite",
+                "ours_nsys_validation",
                 "ours_kernel_summary",
                 "ours_client_result_1",
                 "ours_client_result_2",
@@ -490,6 +545,12 @@ def _model_precondition_reasons(
                 "ours_client_log_1",
                 "ours_client_log_2",
                 "ours_client_log_3",
+                "ours_probe_result_1",
+                "ours_probe_result_2",
+                "ours_probe_result_3",
+                "ours_probe_log_1",
+                "ours_probe_log_2",
+                "ours_probe_log_3",
                 "vllm_command",
                 "vllm_profile_log",
                 "vllm_metadata",
@@ -513,14 +574,37 @@ def _model_precondition_reasons(
                         _verify_hashed_artifact(artifact, evidence_root, field)
                 except HarnessError as error:
                     reasons.append(str(error))
+            execution_artifact = artifacts.get("execution_manifest")
+            if isinstance(execution_artifact, dict):
+                try:
+                    linked_execution = _artifact_path(
+                        execution_artifact.get("path"),
+                        evidence_root,
+                        "execution_manifest",
+                    )
+                    expected_trace_execution = (
+                        evidence_root / "execution" / f"{model}-trace.json"
+                    )
+                    if linked_execution.resolve() != expected_trace_execution.resolve():
+                        reasons.append(
+                            "paired trace execution manifest is not the diagnostic build"
+                        )
+                    else:
+                        _validated_trace_execution(
+                            linked_execution,
+                            model_key=model,
+                            vllm_cpp_sha=vllm_cpp_sha,
+                        )
+                except HarnessError as error:
+                    reasons.append(str(error))
             if nsys_captures == TRACE_REPETITIONS:
                 for field in (
-                    "ours_nsys_sqlite",
-                    "ours_nsys_validation",
                     "ours_command_2",
                     "ours_command_3",
                     "ours_profile_log_2",
                     "ours_profile_log_3",
+                    "ours_profile_control_2",
+                    "ours_profile_control_3",
                     "ours_nsys_report_2",
                     "ours_nsys_report_3",
                     "ours_nsys_sqlite_2",
@@ -539,32 +623,77 @@ def _model_precondition_reasons(
                     except HarnessError as error:
                         reasons.append(str(error))
                 validations = status.get("nsys_validations")
+                summaries = status.get("nsys_kernel_summaries")
+                plans = status.get("plan_validations")
+                controls = status.get("profile_controls")
                 if (
                     not isinstance(validations, list)
                     or len(validations) != TRACE_REPETITIONS
+                    or not isinstance(summaries, list)
+                    or len(summaries) != TRACE_REPETITIONS
+                    or not isinstance(plans, list)
+                    or len(plans) != TRACE_REPETITIONS
+                    or not isinstance(controls, list)
+                    or len(controls) != TRACE_REPETITIONS
                 ):
-                    reasons.append("paired trace lossless Nsight validations differ")
+                    reasons.append("paired trace H1d semantic validation arrays differ")
                 else:
+                    capture_session_uuids = []
                     for index, validation in enumerate(validations, start=1):
                         suffix = "" if index == 1 else f"_{index}"
                         try:
+                            report_artifact = artifacts[f"ours_nsys_report{suffix}"]
                             sqlite_artifact = artifacts[f"ours_nsys_sqlite{suffix}"]
                             validation_artifact = artifacts[
                                 f"ours_nsys_validation{suffix}"
+                            ]
+                            summary_artifact = artifacts[
+                                f"ours_kernel_summary{suffix}"
+                            ]
+                            log_artifact = artifacts[f"ours_profile_log{suffix}"]
+                            control_artifact = artifacts[
+                                f"ours_profile_control{suffix}"
                             ]
                             sqlite_path = _artifact_path(
                                 sqlite_artifact.get("path"),
                                 evidence_root,
                                 f"ours_nsys_sqlite{suffix}",
                             )
+                            report_path = _artifact_path(
+                                report_artifact.get("path"),
+                                evidence_root,
+                                f"ours_nsys_report{suffix}",
+                            )
                             validation_path = _artifact_path(
                                 validation_artifact.get("path"),
                                 evidence_root,
                                 f"ours_nsys_validation{suffix}",
                             )
+                            summary_path = _artifact_path(
+                                summary_artifact.get("path"),
+                                evidence_root,
+                                f"ours_kernel_summary{suffix}",
+                            )
+                            log_path = _artifact_path(
+                                log_artifact.get("path"),
+                                evidence_root,
+                                f"ours_profile_log{suffix}",
+                            )
+                            control_path = _artifact_path(
+                                control_artifact.get("path"),
+                                evidence_root,
+                                f"ours_profile_control{suffix}",
+                            )
                             actual = validate_nsys_trace(
                                 sqlite_path, model_key=model
                             )
+                            if pathlib.Path(
+                                actual["nsys_report_path"]
+                            ).resolve() != report_path.resolve():
+                                raise HarnessError(
+                                    "paired trace SQLite source report differs from "
+                                    f"capture {index}"
+                                )
                             if validation != actual or _load_json(
                                 validation_path
                             ) != actual:
@@ -572,8 +701,90 @@ def _model_precondition_reasons(
                                     "paired trace Nsight validation differs from "
                                     f"capture {index}"
                                 )
+                            actual_summary = summarize_nsys_kernels(sqlite_path)
+                            if summaries[index - 1] != actual_summary or _load_json(
+                                summary_path
+                            ) != actual_summary:
+                                raise HarnessError(
+                                    "paired trace kernel summary differs from "
+                                    f"capture {index}"
+                                )
+                            actual_plan = _parse_fp4_plan_log(log_path)
+                            if plans[index - 1] != actual_plan:
+                                raise HarnessError(
+                                    f"paired trace plan semantics differ for capture {index}"
+                                )
+                            markers = _parse_profile_markers(log_path)
+                            control = _load_json(control_path)
+                            if controls[index - 1] != control or any(
+                                control.get(field) != value
+                                for field, value in markers.items()
+                            ):
+                                raise HarnessError(
+                                    f"paired trace control differs for capture {index}"
+                                )
+                            if control.get("nsys_exit_status") != 0:
+                                raise HarnessError(
+                                    "paired trace Nsight exit status differs for "
+                                    f"capture {index}"
+                                )
+                            capture_session_uuids.append(
+                                actual["capture_session_uuid"]
+                            )
                         except (HarnessError, KeyError, TypeError) as error:
                             reasons.append(str(error))
+                    signature_hashes = [
+                        validation.get("canonical_node_multiset_sha256")
+                        for validation in validations
+                    ]
+                    if (
+                        len(set(signature_hashes)) != 1
+                        or status.get("node_multiset_sha256") != signature_hashes[0]
+                    ):
+                        reasons.append("paired trace node multiset differs across captures")
+                    if (
+                        len(capture_session_uuids) != TRACE_REPETITIONS
+                        or len(set(capture_session_uuids)) != TRACE_REPETITIONS
+                        or status.get("nsys_capture_session_uuids")
+                        != capture_session_uuids
+                        or status.get("nsys_product_version")
+                        != NSYS_PRODUCT_VERSION
+                    ):
+                        reasons.append(
+                            "paired trace Nsight version/session identity differs"
+                        )
+                try:
+                    vllm_trace_path = _artifact_path(
+                        artifacts["vllm_torch_trace"].get("path"),
+                        evidence_root,
+                        "vllm_torch_trace",
+                    )
+                    vllm_summary_path = _artifact_path(
+                        artifacts["vllm_kernel_summary"].get("path"),
+                        evidence_root,
+                        "vllm_kernel_summary",
+                    )
+                    recomputed = _summarize_torch_trace(
+                        vllm_trace_path, model_key=model
+                    )
+                    recorded = _load_json(vllm_summary_path)
+                    for field, expected in recomputed.items():
+                        actual = recorded.get(field)
+                        if field == "selected_trace":
+                            if (
+                                not isinstance(actual, str)
+                                or pathlib.Path(actual).resolve()
+                                != pathlib.Path(expected).resolve()
+                            ):
+                                raise HarnessError(
+                                    "vLLM selected trace path differs from summary"
+                                )
+                        elif actual != expected:
+                            raise HarnessError(
+                                f"vLLM kernel summary field {field} differs"
+                            )
+                except (HarnessError, KeyError, TypeError) as error:
+                    reasons.append(str(error))
     except HarnessError as error:
         reasons.append(str(error))
     return reasons
@@ -754,7 +965,10 @@ def summarize_evidence(
             campaign_reasons.append("campaign manifest client source commit differs from the pin")
         if manifest.get("vllm_oracle_version") != VLLM_ORACLE_VERSION:
             campaign_reasons.append("campaign manifest pip-vLLM oracle version differs")
-        if manifest.get("vllm_oracle_bench_dependencies") != {"pandas": PANDAS_VERSION}:
+        if manifest.get("vllm_oracle_bench_dependencies") != {
+            "flashinfer": FLASHINFER_VERSION,
+            "pandas": PANDAS_VERSION,
+        }:
             campaign_reasons.append("campaign manifest benchmark dependencies differ")
         if manifest.get("gpu_lock_acquisitions_planned") != 2:
             campaign_reasons.append("campaign manifest does not plan one lock per model")

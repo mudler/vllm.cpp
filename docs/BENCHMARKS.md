@@ -17,7 +17,9 @@ frozen-map correctness pass; immutable `d211b8f` passes six-process 64/64
 stability; C3's first component remains void, while C3R proves 6/6 x 128-token
 direct/fallback equality under identical sequential batch shape and reproduces
 default-mode batch-shape dependence in both ours and vLLM, correcting the old
-cross-run equality predicate).
+cross-run equality predicate; the local branch rebase onto upstream `69a5c45`
+builds with Triton AOT and passes the complete sm_120 CUDA suite **107/107**,
+with no new benchmark result or parity transition).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -836,3 +838,15 @@ in all three fresh runs per arm; that file matches the current vLLM reference
 different hashes in five fresh candidate runs. No throughput, TTFT, or memory
 number is binding; rerun the 128-request gate only after the GDN recurrence
 discrepancy is repaired.
+
+## 2026-07-13 local latest-main rebase integration
+
+**NOT APPLICABLE / NO BENCHMARK RUN.** The local series and integration repair
+were rebased onto upstream `69a5c45`. Upstream's packed-QKV helper and the local plain-BF16
+fused-preamble policy conflicted structurally: the helper retained FP4 mode but
+not FP8 mode, leaving stale one-argument calls and undefined `fp8` references.
+The merged helper now carries both modes and applies the existing policy in the
+eager and paged paths. The native sm_120 Triton-AOT build succeeds and the full
+CUDA CTest suite passes **107/107 in 35.66 seconds**. This is an integration
+repair only; the 15/16 natural-corpus result, cross-process exact-1024 variance,
+and all diagnostic throughput, memory, and TTFT numbers remain open.

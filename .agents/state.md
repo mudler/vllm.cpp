@@ -7331,3 +7331,21 @@ is 166 MiB / 0% / 42 C and the campaign kernel journal has no entries.
   only the CUDA unit failure is closed; repeated 128/128 model correctness and
   all prior performance/memory/TTFT metrics remain open/diagnostic. Evidence:
   `/tmp/qwen35-correctness-8a021a3`.
+
+## 2026-07-13 — latest-main rebase integration
+
+- Fetched upstream `main` at `69a5c45` (17 commits beyond the prior rebase base)
+  and replayed 33 existing local commits plus the integration repair.
+  Documentation conflicts retain the newer v0.25 W3-C status while preserving
+  dated local RTX diagnostics.
+- Upstream packed QKV centralized Q/K/V projection after the local fused-
+  preamble work. The initial merge retained only FP4 mode in the helper, causing
+  stale one-argument `FuseAttnPreambleOn` calls and undefined `fp8` references.
+  `FullAttnQkvOutput` now carries FP4 and FP8 mode, and eager/paged callers use
+  the existing two-mode policy. No dispatch policy or benchmark workload changed.
+- `nix develop .#cuda -c cmake --build build-nix-cuda-triton-sm120-debug -j 8`
+  passes with regenerated Triton 3.6 AOT kernels. One `/tmp/gpu` lock covers the
+  complete CUDA CTest run: **107/107 pass in 35.66 seconds**.
+- No performance run was made. Local full-model correctness remains open at
+  15/16 on the natural corpus with exact-1024 cross-process variance; all prior
+  throughput, memory, and TTFT numbers remain diagnostic.

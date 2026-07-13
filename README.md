@@ -603,6 +603,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   stable in 6/6 fresh runs but remains 15/16
   versus the current vLLM file, and the 1024-token stress reproducer still
   varies across processes. The 128-request metrics above remain diagnostic.
+  After rebasing the local series onto upstream `69a5c45`, the packed-QKV
+  projection helper now carries both FP4 and FP8 mode into the local fused-
+  preamble policy. This resolves the merge-only build failure without changing
+  dispatch policy; the native sm_120 Triton-AOT build and full CUDA CTest suite
+  pass **107/107**. No benchmark disposition or model-parity claim changes.
   Request-level follow-up shows the P99 gap is not random scheduler fragility.
   The worst project requests are always initial admissions 30/31, and the
   32-request fill advances by **215.3 ms per two-prompt step** versus

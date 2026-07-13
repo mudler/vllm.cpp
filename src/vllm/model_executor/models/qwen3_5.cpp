@@ -1403,6 +1403,7 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w);
 // diagnostic/non-FP4 paths own three ordinary contiguous allocations.
 struct FullAttnQkvOutput {
   bool fp4 = false;
+  bool fp8 = false;
   std::optional<DBuf> packed_owner;
   std::optional<DBuf> q_owner;
   std::optional<DBuf> k_owner;
@@ -1418,7 +1419,7 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                                      [[maybe_unused]] bool packed_consumers) {
   FullAttnQkvOutput out;
   out.fp4 = !w.q_proj_fp4.Empty();
-  const bool fp8 = !w.q_proj_fp8.Empty();
+  out.fp8 = !w.q_proj_fp8.Empty();
 #ifdef VT_CUTLASS_NVFP4
   if (out.fp4 && MergedQkvEligible(w, d, packed_consumers)) {
     out.packed_owner.emplace(MergedQkvCutlassD(d, h, w));
@@ -1488,7 +1489,7 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
       return MatmulNvfp4Fp4DirectD(d, qkv_ap->t(), qkv_as->t(),
                                     fp4_weight, q_out_dt, qkv_sf_sw_p);
     }
-    if (fp8) {
+    if (out.fp8) {
       return h_fp8 != nullptr
                  ? MatmulFp8CutlassPreQuantD(d, *h_fp8, fp8_weight,
                                               DType::kF32)
@@ -2576,12 +2577,14 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   const bool fp4_attn = !w.q_proj_fp4.Empty();
+  const bool fp8_attn = !w.q_proj_fp8.Empty();
   const bool packed_consumers =
-      FuseAttnPreambleOn(fp4_attn) && rot > 0 &&
+      FuseAttnPreambleOn(fp4_attn, fp8_attn) && rot > 0 &&
       d.q.device.type == vt::DeviceType::kCUDA;
   FullAttnQkvOutput qkv =
       ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
   const bool fp4 = qkv.fp4;
+  const bool fp8 = qkv.fp8;
   Tensor qgate = qkv.qgate;  // [T,2*Hq*Dh], possibly row-strided packed view
   Tensor kf = qkv.key;       // [T,Hkv*Dh], possibly row-strided packed view
   Tensor vf = qkv.value;     // [T,Hkv*Dh], possibly row-strided packed view
@@ -2677,12 +2680,14 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
            "full-attn paged: KV cache head dims mismatch config");
 
   const bool fp4_attn = !w.q_proj_fp4.Empty();
+  const bool fp8_attn = !w.q_proj_fp8.Empty();
   const bool packed_consumers =
-      FuseAttnPreambleOn(fp4_attn) && sdi.has_attn_cos_sin &&
+      FuseAttnPreambleOn(fp4_attn, fp8_attn) && sdi.has_attn_cos_sin &&
       d.q.device.type == vt::DeviceType::kCUDA;
   FullAttnQkvOutput qkv_out =
       ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
   const bool fp4 = qkv_out.fp4;
+  const bool fp8 = qkv_out.fp8;
   Tensor qgate = qkv_out.qgate;
   Tensor kf = qkv_out.key;
   Tensor vf = qkv_out.value;

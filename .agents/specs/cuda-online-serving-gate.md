@@ -66,10 +66,13 @@ but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
 remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
 earns speed credit. The current W3-H trace-first refresh requires three
 lossless exact-plan captures before implementation. H1a/H1b/H1c and clean
-setup roots through `b1c7eb6` are void; the latest passed exact plan/configure
-but exposed a pre-build driver bootstrap check. The driver now performs its
-recorded target build before requiring `examples/server`. Fresh evidence is
-pending; no exact rerun or 35B performance command is authorized.
+attempts through `e1acb75` are void. The latest completed the exact **154/154**
+build and passed the 27B gate **1/1 in 17.42 s**, then stopped before trace
+workload/report because the target was incorrectly required to share the
+`nsys` process group. The driver now records and validates the actual
+`nsys -> nsys-launcher -> separate target session` ancestry and owns cleanup
+of both sessions. Fresh evidence is pending; no exact rerun or 35B performance
+command is authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,

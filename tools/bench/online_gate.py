@@ -1591,29 +1591,74 @@ def record_profile_control(
     *,
     profile_log: pathlib.Path,
     nsys_pid: int,
+    nsys_pgid: int,
+    nsys_sid: int,
     nsys_exit_status: int,
+    launcher_pid: int,
+    launcher_ppid: int,
+    launcher_pgid: int,
+    launcher_sid: int,
+    launcher_comm: str,
     server_pid: int,
+    server_ppid: int,
     server_pgid: int,
+    server_sid: int,
 ) -> dict[str, Any]:
     if output.exists():
         raise HarnessError(f"refusing to overwrite profile control evidence: {output}")
-    if min(nsys_pid, server_pid, server_pgid) <= 0:
+    process_ids = (
+        nsys_pid,
+        nsys_pgid,
+        nsys_sid,
+        launcher_pid,
+        launcher_ppid,
+        launcher_pgid,
+        launcher_sid,
+        server_pid,
+        server_ppid,
+        server_pgid,
+        server_sid,
+    )
+    if min(process_ids) <= 0:
         raise HarnessError("profile control PIDs must be positive")
     if nsys_exit_status != 0:
         raise HarnessError("Nsight profiler exit status is not zero")
-    if server_pgid != nsys_pid:
-        raise HarnessError("profiled server process group is not owned by nsys")
+    if len({nsys_pid, launcher_pid, server_pid}) != 3:
+        raise HarnessError("profile control process identities are not distinct")
+    if nsys_pgid != nsys_pid or nsys_sid != nsys_pid:
+        raise HarnessError("Nsight profiler is not its setsid process-group leader")
+    if launcher_comm != "nsys-launcher":
+        raise HarnessError("profile target parent is not nsys-launcher")
+    if (
+        launcher_ppid != nsys_pid
+        or launcher_pgid != nsys_pid
+        or launcher_sid != nsys_pid
+    ):
+        raise HarnessError("nsys-launcher is not owned by the Nsight session")
+    if server_ppid != launcher_pid:
+        raise HarnessError("profiled server is not a direct nsys-launcher child")
+    if server_pgid != server_pid or server_sid != server_pid:
+        raise HarnessError("profiled server is not the Nsight target-session leader")
     markers = _parse_profile_markers(profile_log)
     if markers["ready_pid"] != server_pid:
         raise HarnessError("profile ready marker PID differs from the signaled server")
     result = {
         **markers,
+        "launcher_comm": launcher_comm,
+        "launcher_pgid": launcher_pgid,
+        "launcher_pid": launcher_pid,
+        "launcher_ppid": launcher_ppid,
+        "launcher_sid": launcher_sid,
         "nsys_pid": nsys_pid,
+        "nsys_pgid": nsys_pgid,
+        "nsys_sid": nsys_sid,
         "nsys_exit_status": nsys_exit_status,
         "profile_log": str(profile_log),
         "profile_log_sha256": sha256_file(profile_log),
         "server_pgid": server_pgid,
         "server_pid": server_pid,
+        "server_ppid": server_ppid,
+        "server_sid": server_sid,
         "signal": "SIGUSR2",
         "plan_validation": _parse_fp4_plan_log(profile_log),
     }
@@ -2173,13 +2218,36 @@ def record_trace_status(
         }
         if any(control.get(field) != value for field, value in expected_marker_fields.items()):
             raise HarnessError(f"capture {index} profile control differs from its log")
-        for field in ("nsys_pid", "server_pid", "server_pgid"):
+        for field in (
+            "nsys_pid",
+            "nsys_pgid",
+            "nsys_sid",
+            "launcher_pid",
+            "launcher_ppid",
+            "launcher_pgid",
+            "launcher_sid",
+            "server_pid",
+            "server_ppid",
+            "server_pgid",
+            "server_sid",
+        ):
             if not isinstance(control.get(field), int) or control[field] <= 0:
                 raise HarnessError(f"capture {index} profile control {field} is invalid")
         if control.get("nsys_exit_status") != 0:
             raise HarnessError(f"capture {index} Nsight exit status is not zero")
-        if control["server_pgid"] != control["nsys_pid"]:
-            raise HarnessError(f"capture {index} server process group is not nsys-owned")
+        if control.get("launcher_comm") != "nsys-launcher":
+            raise HarnessError(f"capture {index} parent is not nsys-launcher")
+        if (
+            control["nsys_pgid"] != control["nsys_pid"]
+            or control["nsys_sid"] != control["nsys_pid"]
+            or control["launcher_ppid"] != control["nsys_pid"]
+            or control["launcher_pgid"] != control["nsys_pid"]
+            or control["launcher_sid"] != control["nsys_pid"]
+            or control["server_ppid"] != control["launcher_pid"]
+            or control["server_pgid"] != control["server_pid"]
+            or control["server_sid"] != control["server_pid"]
+        ):
+            raise HarnessError(f"capture {index} does not have the recorded Nsight ancestry")
         if control["server_pid"] != markers["ready_pid"]:
             raise HarnessError(f"capture {index} signaled server PID differs")
         profile_controls.append(control)
@@ -2970,9 +3038,18 @@ def _parser() -> argparse.ArgumentParser:
     profile_control.add_argument("--output", type=pathlib.Path, required=True)
     profile_control.add_argument("--profile-log", type=pathlib.Path, required=True)
     profile_control.add_argument("--nsys-pid", type=int, required=True)
+    profile_control.add_argument("--nsys-pgid", type=int, required=True)
+    profile_control.add_argument("--nsys-sid", type=int, required=True)
     profile_control.add_argument("--nsys-exit-status", type=int, required=True)
+    profile_control.add_argument("--launcher-pid", type=int, required=True)
+    profile_control.add_argument("--launcher-ppid", type=int, required=True)
+    profile_control.add_argument("--launcher-pgid", type=int, required=True)
+    profile_control.add_argument("--launcher-sid", type=int, required=True)
+    profile_control.add_argument("--launcher-comm", required=True)
     profile_control.add_argument("--server-pid", type=int, required=True)
+    profile_control.add_argument("--server-ppid", type=int, required=True)
     profile_control.add_argument("--server-pgid", type=int, required=True)
+    profile_control.add_argument("--server-sid", type=int, required=True)
 
     trace = commands.add_parser("record-trace-status")
     trace.add_argument("--output", type=pathlib.Path, required=True)
@@ -3111,9 +3188,18 @@ def main() -> int:
             args.output,
             profile_log=args.profile_log,
             nsys_pid=args.nsys_pid,
+            nsys_pgid=args.nsys_pgid,
+            nsys_sid=args.nsys_sid,
             nsys_exit_status=args.nsys_exit_status,
+            launcher_pid=args.launcher_pid,
+            launcher_ppid=args.launcher_ppid,
+            launcher_pgid=args.launcher_pgid,
+            launcher_sid=args.launcher_sid,
+            launcher_comm=args.launcher_comm,
             server_pid=args.server_pid,
+            server_ppid=args.server_ppid,
             server_pgid=args.server_pgid,
+            server_sid=args.server_sid,
         )
     elif args.command == "record-trace-status":
         result = record_trace_status(

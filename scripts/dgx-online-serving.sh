@@ -200,10 +200,32 @@ python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
 
 spid=""
 mpid=""
+profiled_pid=""
+profiled_pgid=""
 cleanup_server() {
+  if [[ -n ${profiled_pid} ]] && kill -0 "${profiled_pid}" 2>/dev/null; then
+    if [[ -n ${profiled_pgid} && ${profiled_pgid} == "${profiled_pid}" ]]; then
+      kill -TERM -- "-${profiled_pgid}" 2>/dev/null || true
+    else
+      kill -TERM "${profiled_pid}" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 30); do
+      kill -0 "${profiled_pid}" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "${profiled_pid}" 2>/dev/null; then
+      if [[ -n ${profiled_pgid} && ${profiled_pgid} == "${profiled_pid}" ]]; then
+        kill -KILL -- "-${profiled_pgid}" 2>/dev/null || true
+      else
+        kill -KILL "${profiled_pid}" 2>/dev/null || true
+      fi
+    fi
+  fi
+  profiled_pid=""
+  profiled_pgid=""
   if [[ -n ${spid} ]] && kill -0 "${spid}" 2>/dev/null; then
     kill -TERM -- "-${spid}" 2>/dev/null || true
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 30); do
       kill -0 "${spid}" 2>/dev/null || break
       sleep 1
     done
@@ -466,16 +488,32 @@ run_paired_traces() {
       echo "profiled server did not emit one exact ready marker" >&2
       return 1
     }
+    profiled_pid=${server_pid}
     kill -0 "${server_pid}" 2>/dev/null || {
       echo "profiled server PID is not live" >&2
       return 1
     }
-    local server_pgid
-    server_pgid=$(ps -o pgid= -p "${server_pid}" | tr -d '[:space:]')
-    [[ ${server_pgid} == "${nsys_pid}" ]] || {
-      echo "profiled server process group is not owned by nsys" >&2
+    local server_identity launcher_identity nsys_identity
+    local server_ppid server_pgid server_sid
+    local launcher_pid launcher_ppid launcher_pgid launcher_sid launcher_comm
+    local nsys_pgid nsys_sid
+    server_identity=$(ps -o ppid=,pgid=,sid= -p "${server_pid}")
+    read -r server_ppid server_pgid server_sid <<<"${server_identity}"
+    launcher_pid=${server_ppid}
+    launcher_identity=$(ps -o ppid=,pgid=,sid=,comm= -p "${launcher_pid}")
+    read -r launcher_ppid launcher_pgid launcher_sid launcher_comm <<<"${launcher_identity}"
+    nsys_identity=$(ps -o pgid=,sid= -p "${nsys_pid}")
+    read -r nsys_pgid nsys_sid <<<"${nsys_identity}"
+    [[ ${nsys_pgid} == "${nsys_pid}" && ${nsys_sid} == "${nsys_pid}" &&
+       ${launcher_ppid} == "${nsys_pid}" && ${launcher_pgid} == "${nsys_pid}" &&
+       ${launcher_sid} == "${nsys_pid}" && ${launcher_comm} == nsys-launcher &&
+       ${server_ppid} == "${launcher_pid}" && ${server_pgid} == "${server_pid}" &&
+       ${server_sid} == "${server_pid}" ]] || {
+      echo "profiled server does not have the expected nsys -> nsys-launcher -> target ancestry" >&2
+      echo "nsys pid=${nsys_pid} pgid=${nsys_pgid} sid=${nsys_sid}; launcher pid=${launcher_pid} ppid=${launcher_ppid} pgid=${launcher_pgid} sid=${launcher_sid} comm=${launcher_comm}; server pid=${server_pid} ppid=${server_ppid} pgid=${server_pgid} sid=${server_sid}" >&2
       return 1
     }
+    profiled_pgid=${server_pgid}
     python3 "${repo_root}/tools/bench/online_gate.py" bench \
       --client "${client}" \
       --tokenizer "${snapshot}" \
@@ -508,7 +546,7 @@ run_paired_traces() {
       echo "profiled server did not close the exact four-replay window" >&2
       return 1
     }
-    kill -TERM "${server_pid}" 2>/dev/null || true
+    kill -TERM -- "-${server_pgid}" 2>/dev/null || true
     local nsys_status=0
     local nsys_exited=0
     for _ in $(seq 1 60); do
@@ -519,7 +557,7 @@ run_paired_traces() {
       sleep 1
     done
     if ((nsys_exited == 0)); then
-      echo "nsys did not exit within 60 seconds after owned server shutdown" >&2
+      echo "nsys did not exit within 60 seconds after owned target shutdown" >&2
       kill -INT -- "-${nsys_pid}" 2>/dev/null || true
       return 1
     fi
@@ -529,13 +567,24 @@ run_paired_traces() {
       return 1
     fi
     spid=""
+    profiled_pid=""
+    profiled_pgid=""
     python3 "${repo_root}/tools/bench/online_gate.py" record-profile-control \
       --output "${ours_control}" \
       --profile-log "${ours_log}" \
       --nsys-pid "${nsys_pid}" \
+      --nsys-pgid "${nsys_pgid}" \
+      --nsys-sid "${nsys_sid}" \
       --nsys-exit-status "${nsys_status}" \
+      --launcher-pid "${launcher_pid}" \
+      --launcher-ppid "${launcher_ppid}" \
+      --launcher-pgid "${launcher_pgid}" \
+      --launcher-sid "${launcher_sid}" \
+      --launcher-comm "${launcher_comm}" \
       --server-pid "${server_pid}" \
-      --server-pgid "${server_pgid}"
+      --server-ppid "${server_ppid}" \
+      --server-pgid "${server_pgid}" \
+      --server-sid "${server_sid}"
     [[ -s ${ours_rep} ]] || {
       echo "nsys did not write ${ours_rep}" >&2
       return 1

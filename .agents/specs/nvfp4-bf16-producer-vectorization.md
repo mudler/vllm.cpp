@@ -1,13 +1,9 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — H1a/H1b/H1c are VOID; clean `7bae38a`/`2d16c68` failed
-before build/GPU on missing login-PATH tools; clean `5f8fab1` built but is VOID
-because its H1d recipe omitted the binding Triton-AOT GDN path, used the wrong
-build type and failed correctness before capture; clean `d063f20` is also VOID
-before plan because corpus preceded dry-run; clean `b1c7eb6` passed exact
-plan/configuration but is VOID before build on a repaired driver bootstrap
-check; the repaired exact-path execution is pending and W3-H2 remains
-prohibited**
+Status: **ACTIVE — H1a/H1b/H1c and clean attempts through `e1acb75` are VOID;
+the latest completed the exact build and passed the 27B gate but stopped before
+trace workload/report on a repaired Nsight target-session ownership check; the
+repaired exact-path execution is pending and W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -76,6 +72,20 @@ before reaching its own provenance-recorded `server` +
 No execution manifest, compile, model, lock, GPU command or profiler ran; the
 root remains void. H1d now preflights only a configured CMake tree, performs
 the exact recorded build, and requires the executable afterward.
+
+Clean `e1acb75` is the first valid-path H1d attempt to reach profiling. The
+recorded build completed **154/154**, schema-v2 provenance proved the exact
+`RelWithDebInfo` Triton-AOT/FA2/CUTLASS/sm_121a path, and
+`test_qwen27_paged_engine` passed **1/1 in 17.42 s**. The profiled target loaded
+the read-only 64-plan map and emitted its ready marker, then the driver rejected
+it before the ordinary 48-request trace workload because it required
+`server_pgid == nsys_pid`. Nsight 2025.3.2.474 actually creates
+`nsys -> nsys-launcher -> target`, and makes the target a separate session
+leader (`server_pgid == server_sid == server_pid`). No report, SQLite, status
+or vLLM trace exists; the root is void. Driver/profile-log SHA are
+`27f39c95…b053` / `84c68501…3fc`. H1d now validates and records the complete
+PID/PPID/PGID/SID ancestry, requires `nsys-launcher`, and separately owns
+target-session and profiler-session cleanup. The focused suite passes **29/29**.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -546,7 +556,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c are VOID; H1d `7bae38a`/`2d16c68` failed pre-build, `5f8fab1` failed correctness on a non-binding build path, `d063f20` failed pre-plan on corpus/plan ordering, and `b1c7eb6` failed pre-build on the now-fixed bootstrap check. The repaired plan-first exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS driver-owned build and three-capture execution is pending** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: H1a/H1b/H1c and clean attempts through `e1acb75` are VOID. The latest exact build/gate passed before a repaired Nsight ancestry check stopped without a report. The plan-first exact `RelWithDebInfo` + Triton-AOT/FA2/CUTLASS driver-owned build, explicit launcher/target-session ownership and three-capture execution is pending** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

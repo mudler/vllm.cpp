@@ -6980,3 +6980,37 @@ the focused client/summary/trace suite pass **27/27**. README, benchmark record,
 roadmap, owning matrices, inventory, coordination and spike all retain the void
 attempt and new fresh-SHA requirement. No inference implementation, accepted
 ratio, exact grid or 35B performance changes.
+
+## 2026-07-13 — sixth H1d attempt reached exact profiling path; Nsight ancestry repaired
+
+Clean pushed `e1acb7563cb444b1378245f096031a1ea7ce3bcf` used a new immutable
+DGX root and is the first H1d attempt to complete every build/correctness
+precondition. Plan-first setup, frozen corpus and exact `RelWithDebInfo`
+Triton-AOT/FA2/external-CUTLASS/sm_121a configuration passed. The driver's
+recorded server + model-gate build completed **154/154**. Schema-v2 execution
+provenance passed with plan/configure/build/execution/server/compile-command
+SHA-256 `b0ac54d8…8731` / `c138c814…f22e` / `7e0475cd…1289` /
+`6946c60e…83aa` / `96494749…b0d0` / `0906d32a…f08`. The mandatory
+`test_qwen27_paged_engine` passed **1/1 in 17.42 s** (log SHA
+`163418b44ac8d379562f76f5b365a1b9bddd23ad23d093b4f8d3c6a795fe456d`).
+
+Under one uncontended lock, the profiled server loaded the exact read-only
+FlashInfer 64/native 0 plan set and emitted its exact profile-ready marker. The
+driver then failed closed before the ordinary 48-request trace workload because
+it asserted `server_pgid == nsys_pid`. A controlled `/bin/sleep` Nsight probe
+showed the real 2025.3.2.474 topology: `nsys` leads one session,
+`nsys-launcher` is its direct child, and the target is launched as a distinct
+session leader with `server_pgid == server_sid == server_pid`. Driver/profile
+log SHA-256 are `27f39c95…b053` / `84c68501…3fc`; Nsight generated no report,
+so no SQLite, accepted status, vLLM trace, performance or speed credit exists.
+The root is **FAILED / VOID** and cannot be reused. GPU, lock and ports returned
+idle.
+
+The harness now validates and records every PID/PPID/PGID/SID edge in the
+actual `nsys -> nsys-launcher -> target` ancestry, rejects a flattened or
+unowned topology, tracks the target independently and explicitly terminates its
+session before profiler cleanup. The record/final status contract carries the
+same checks. Shell syntax, Python compilation and the focused
+client/summary/trace suite pass **29/29**. Immutable `3f256ab` therefore still
+binds at **55/124 pass, 69 fail**. A fresh pushed SHA/root must repeat the exact
+build and correctness gate and complete three valid traces before W3-H2.

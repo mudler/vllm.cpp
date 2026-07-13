@@ -663,6 +663,56 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertLess(configured_preflight, build)
         self.assertLess(build, executable_postflight)
 
+    def test_trace_driver_tracks_the_actual_nsys_target_ancestry(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("${launcher_ppid} == \"${nsys_pid}\"", script)
+        self.assertIn("${launcher_comm} == nsys-launcher", script)
+        self.assertIn("${server_ppid} == \"${launcher_pid}\"", script)
+        self.assertIn("${server_pgid} == \"${server_pid}\"", script)
+        self.assertIn("${server_sid} == \"${server_pid}\"", script)
+        self.assertIn('kill -TERM -- "-${server_pgid}"', script)
+        self.assertNotIn("server_pgid} == \"${nsys_pid}", script)
+
+    def test_profile_control_rejects_a_flattened_nsys_process_group(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            with self.assertRaisesRegex(
+                HarnessError, "profiled server is not the Nsight target-session leader"
+            ):
+                record_profile_control(
+                    root / "control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=5000,
+                    server_sid=5000,
+                )
+
     def test_campaign_writes_a_model_summary_before_cross_model_summary(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
@@ -1212,6 +1262,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 native = root / f"native-{index}-must-not-exist.json"
                 server_pid = 6000 + index
                 nsys_pid = 5000 + index
+                launcher_pid = 5500 + index
                 write_profile_log(
                     profile_log,
                     fixture=fixture,
@@ -1268,9 +1319,18 @@ class OnlineClientContractTests(unittest.TestCase):
                     control,
                     profile_log=profile_log,
                     nsys_pid=nsys_pid,
+                    nsys_pgid=nsys_pid,
+                    nsys_sid=nsys_pid,
                     nsys_exit_status=0,
+                    launcher_pid=launcher_pid,
+                    launcher_ppid=nsys_pid,
+                    launcher_pgid=nsys_pid,
+                    launcher_sid=nsys_pid,
+                    launcher_comm="nsys-launcher",
                     server_pid=server_pid,
-                    server_pgid=nsys_pid,
+                    server_ppid=launcher_pid,
+                    server_pgid=server_pid,
+                    server_sid=server_pid,
                 )
                 ours_nsys_reports.append(report)
                 ours_nsys_sqlites.append(sqlite_path)

@@ -178,7 +178,7 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124** and W3-E strict-fails. W3-C installs exact plans before warmup and completes frozen-plan reproduction control. W3-F implements and gates the device-alpha API/ownership/fallback and paired zero-versus-3,536-stage trace with identical FP4 topology/plans. Its completed strict c2/c16 component is **1.001967×/1.000144×** but fails **27/40 timing + 3/8 memory**, so it earns no speed credit and triggers no exact grid/35B performance. A fresh multi-lens executed-path scan is active. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md) and [W3-F spike](specs/nvfp4-device-alpha.md) |
+| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124** and W3-E strict-fails. W3-C installs exact plans before warmup and completes frozen-plan reproduction control. W3-F implements and gates device alpha plus the zero-versus-3,536-stage trace, but its strict c2/c16 component fails **27/40 timing + 3/8 memory** and earns no credit. The completed multi-lens scan selects the separate W3-G FA2 ratio-6 decode repair and ranks vectorized normal BF16→FP4 production second; neither has a new benchmark result. No exact grid/35B performance is authorized. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md), [W3-F spike](specs/nvfp4-device-alpha.md) and [W3-G spike](specs/fa2-gqa-split-kv-decode.md) |
 | **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. The llama.cpp-derived CPU threadpool/chunked-op prerequisite is implemented and correctness-gated (1/3/20 full suites + TSAN), but its B4 speed/RSS gate is pending. All weights still expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
@@ -422,31 +422,37 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     `nvfp4_marlin_process_scales`/`_global_scale`), the `moe_align_block_size`
     port, the 35B forward wiring, 16/16 parity, and the A/B TFLOPS measurement.
 
-11. **Vendored FlashAttention-2 (the full-attn PREFILL kernel — both gate models'
-    head_dim-256 GQA attention)**: `src/vt/cuda/flash_attn/` is a byte-identical,
-    torch-free vendor of vllm-project/flash-attention @ 2c839c33 (the exact
-    source vLLM 0.24.0 builds as `_vllm_fa2_C`; its
-    `flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<256,64,64,4,...>>` is what
-    vLLM's own profile shows for prefill on GB10). 3 stub headers replace the
-    ATen/c10 surface (PhiloxCudaState POD + C10_CUDA_CHECK) and
-    `fa2_compat_prelude.h` is force-included; the FA sources stay pristine.
-    `flash_api.cpp` (torch-heavy) is replaced by the torch-free launcher
-    `src/vt/cuda/cuda_flash_attn_fa2.cu` (fills `Flash_fwd_params` from
-    `vt::Tensor` views; paged block_table + varlen cu_seqlens_q/seqused_k;
-    num_splits pinned 1 = vLLM's FA-2 varlen behavior,
-    flash_attn_interface.py:309-310). Engaged by the LaunchPaged dispatch for
-    the natively-bf16 prefill combo only (bf16 q from the fused preamble + bf16
-    KV + bf16 out, head_dim 256); decode + every other combo stay on the
-    hand-written WMMA/decode kernels, and the CPU reference is untouched. CMake
-    `VLLM_CPP_FLASH_ATTN` (default ON with CUTLASS, sm_12xa), runtime
-    `VT_FA2_PREFILL` (default ON when compiled; =0 → WMMA for same-binary A/B).
-    **Verified GB10 sm_121a (2026-07-10): kernel 3.68× vs our WMMA (475.3→129.2
-    ms per profile window), with same-binary 27B e2e +1.52%/+0.54%
-    (conc16/conc32); token-exact greedy gates PASS ON and OFF. The historical
-    claim that this reached ≥1.0× vs vLLM is non-binding after the 2026-07-11
-    sampling/token-budget audit; the component A/B remains valid. The earlier
-    −4.3% attempt was the f32↔bf16 cast glue + a per-layer D2H sync, both removed
-    (see parity-ledger 2026-07-10).**
+11. **Vendored FlashAttention-2 (head-dim-256 GQA prefill implemented; ratio-6
+    split-KV decode `ACTIVE`)**: `src/vt/cuda/flash_attn/` is a byte-identical,
+    torch-free vendor of vllm-project/flash-attention @ `2c839c33`, still the
+    exact FA2 dependency pinned by vLLM v0.25.0 `702f481`. Three stub headers
+    replace the ATen/c10 surface (PhiloxCudaState POD + C10_CUDA_CHECK) and
+    `fa2_compat_prelude.h` is force-included; tuned FA sources stay pristine.
+    The current torch-free `src/vt/cuda/cuda_flash_attn_fa2.cu` fills
+    `Flash_fwd_params` from `vt::Tensor` views for paged varlen prefill. Its
+    `num_splits=1` statement is correct for ordinary ragged paged varlen, but
+    was incorrectly generalized to pure decode: upstream `flash_api.cpp`
+    separately performs `seqlenq_ngroups_swapped`, then applies the split-count
+    heuristic and emits split main + combine. The exact v0.25 27B trace proves
+    that path executes.
+
+    Prefill remains implemented for the natively-BF16 combination only, under
+    CMake `VLLM_CPP_FLASH_ATTN` and runtime `VT_FA2_PREFILL`; every other
+    combination retains its fallback. **Verified GB10 sm_121a (2026-07-10):
+    prefill kernel 3.68× vs our WMMA (475.3→129.2 ms per profile window), with
+    same-binary 27B e2e +1.52%/+0.54% at c16/c32 and token-exact ON/OFF gates.**
+    Those component values remain valid but are not the current v0.25 binding
+    grid.
+
+    W3-G now owns the missing Qwen3.6-27B pure-decode specialization: BF16,
+    Hq/Hkv 24/4, D256, paged KV, capture-safe exact split heuristic and
+    `VT_FA2_DECODE=0` fallback. Qwen3.6-35B-A3B is ratio 8 and deliberately
+    inert. Binding diagnostics are local ratio-6 decode **22,893 calls /
+    8,793.238 ms** versus vLLM FA2 main **23,616 / 7,061.921 ms** plus combine
+    **23,488 / 123.245 ms**; unequal windows make this attribution, not a speed
+    ratio. Implementation, ported upstream paged-decode/capture tests and the
+    every-axis A/B are `PENDING` under the
+    [W3-G spike](specs/fa2-gqa-split-kv-decode.md).
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common
     `vt::` surface now carries upstream-compatible semantic scalar IDs separate

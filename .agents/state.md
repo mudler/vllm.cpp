@@ -6394,3 +6394,46 @@ run, and its dedicated claim is released. Immutable `3f256ab` stays binding at
 **55/124 pass, 69 fail**; every 35B performance command remains prohibited.
 The mandated multi-lens trace/source/dependency scan is active under
 `CLAIM-SERVE-GATE-1` to select one new bounded lever before any implementation.
+
+## 2026-07-13 — W3-G FA2 ratio-6 split-KV decode spike accepted
+
+The post-W3-F scan has closed. Independent engine and kernel-trace comparisons
+converged on the same highest-ranked executed mismatch: Qwen3.6-27B is
+Hq/Hkv=24/4 (GQA ratio 6), while our fused decode specialization is hard-coded
+to ratio 8. The exact binding trace therefore executes
+`PagedAttentionDecodeOptKernel<float,bfloat16,float>` **22,893 times for
+8,793.238 ms**, averaging **384.102 us** and consuming **3.083%** of local GPU
+kernel time. The retained vLLM export executes FA2 BF16 split main **23,616
+times / 7,061.921 ms** and combine **23,488 / 123.245 ms**. Trace windows and
+counts differ, so this is diagnostic attribution only; the approximate
+80-us/layer or 1.28-ms/16-layer gap is not an accepted speed ratio.
+
+Whole-chain source inspection corrects the old local adapter comment. Ordinary
+paged varlen FA2 rejects explicit `num_splits>1`, but pure decode takes a
+separate `seqlenq_ngroups_swapped` route in the pinned dependency: it
+reinterprets `[B,Hkv,G,D]` as `[B,G,Hkv,D]`, sets query length to G, selects an
+exact 80%/85% wave-efficiency split count, allocates F32 partial LSE/output, and
+runs split main plus combine. vLLM v0.25.0 pins the same FA2 commit `2c839c33`
+already vendored locally; no dependency update is required.
+
+The accepted [W3-G spike](specs/fa2-gqa-split-kv-decode.md) moves
+`KERNEL-ATTN-FA2` from `PARTIAL` to `ACTIVE` under
+`CLAIM-SERVE-GATE-1`. The first implementation is deliberately bounded to
+CUDA BF16 paged pure decode, D256, ratio 6, no window/ALiBi/softcap/dropout. It
+requires cast-free model-side BF16 Q/output, exact split arithmetic,
+capture-stable per-shape scratch with queue cleanup, and
+`VT_FA2_DECODE=0` as the exact F32 fallback. Prefill remains unchanged and the
+35B ratio-8 route is inert.
+
+All implementation and runtime evidence is `PENDING`: ported upstream
+ratio-2/ratio-6 paged vectors, fallback/invalid eligibility, capture/replay and
+lifecycle tests; local/CUDA/sanitizer gates; 27B default/fallback **235/235 +
+16/16**; correctness-only 35B inertness; paired node traces; then one-lock
+c2/c16 AB/BA/AB. The component must pass **40/40 timing + 8/8 memory** axes
+before the exact vLLM grid may run. Immutable `3f256ab` remains binding at
+**55/124 pass, 69 fail**, and all 35B performance remains prohibited.
+
+The normal BF16→FP4 producer is ranked second (vLLM vector loads/stores versus
+our scalar path, about 0.50 ms/forward diagnostic gap) and is not stacked into
+W3-G. Host weight release remains the separate leading PSS/RSS repair. GPU,
+port and `/tmp/gpu` are idle at this documentation checkpoint.

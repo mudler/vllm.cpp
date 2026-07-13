@@ -462,7 +462,9 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     between **240 main+combine / 0 old** and **0 decode combine / 240 old**;
     both preserve 3,536 FP4 GEMMs/producers and all 64 plans. The short prompt
     is performance-negative (**3.246400/1.395488 ms**) and non-binding. The
-    c2/c16 every-axis A/B remains `PENDING` under the [W3-G
+    c2/c16 every-axis A/B is `ACTIVE` under one uninterrupted lock from
+    immutable `ae9e8ff`; both model arms passed before timing and every partial
+    leg remains non-binding under the [W3-G
     spike](specs/fa2-gqa-split-kv-decode.md).
 
 12. **Additive drop-in adapter ABI W0 (`BACKEND-ABI-VT`, GATING):** the common

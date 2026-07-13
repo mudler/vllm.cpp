@@ -4,8 +4,11 @@ Status: **ACTIVE/GATING** on 2026-07-13. W3-G1--G4 are complete at immutable
 `ae9e8ff`: clean sm_121a build, CUDA operator/capture/lifecycle, strict
 zero-error/zero-leak memcheck, both frozen-plan 27B arms, correctness-only 35B
 and paired node-trace gates pass. The short-prompt trace is performance-negative
-and non-binding; W3-G5's input-1,024 c2/c16 **40 timing + 8 memory** component
-remains pending, so there is no speed credit. The binding 27B result remains
+and non-binding. W3-G5's input-1,024 c2/c16 **40 timing + 8 memory** component
+started at `2026-07-13T10:44:49Z` under driver SHA `04cc3d63…66c` and one
+uninterrupted `/tmp/gpu` lock. Both model arms passed **235/235 + 16/16** before
+timing; partial legs remain non-binding, so there is no speed credit yet. The
+binding 27B result remains
 immutable `3f256ab` at **55/124 pass, 69 fail**.
 
 ## Scope
@@ -306,7 +309,7 @@ this checkpoint.
 | W3-G2 | `cuda_paged_attn.cu`, `qwen3_5.cpp` | **COMPLETE:** exact ratio-6 eligibility, default/fallback dispatch and cast-free BF16 model path pass both 27B arms; prefill and ratio-8 remain unchanged. |
 | W3-G3 | `tests/vt/test_ops_paged_attn.cpp` | **COMPLETE:** upstream fallback, ratio-6 B ladder, heuristic, toggle/window/ratio-8 fallback, capture/replay/capacity and two-queue lifecycle pass 20/20 + 454,323 and strict memcheck. |
 | W3-G4 | immutable DGX evidence only; same-change public/canonical status updates | **COMPLETE at `ae9e8ff`:** G0-G3 build/operator/sanitizer/model/inertness/trace closure passes; short trace performance is negative/non-binding. |
-| W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | Strict 40+8-axis component; either authorize G6 or record failure and rescan. |
+| W3-G5 | immutable c2/c16 driver/evidence; same-change public/canonical status updates | **ACTIVE:** strict 40+8-axis component started from `ae9e8ff` under one lock after both model arms passed; partial legs remain non-binding. Either authorize G6 on 48/48 or record failure and rescan. |
 | W3-G6 | existing exact online gate/evidence; same-change public/canonical status updates | Conditional 27B c1-c32 vLLM grid. Only 124/124 permits 35B performance. |
 
 The work is intentionally serial because W3-G2 consumes W3-G1's ABI and W3-G4

@@ -6526,3 +6526,22 @@ input-1,024/output-128 cache-off c2/c16 AB/BA/AB driver and execute all **40
 timing + 8 memory** axes under one lock. Any miss gives W3-G no speed credit and
 returns to the scan. No exact grid or 35B performance command is authorized;
 binding `3f256ab` remains **55/124 pass, 69 fail**.
+
+## 2026-07-13 — W3-G frozen c2/c16 component active under one lock
+
+Immutable source `ae9e8ff0576badabdda7289beeacaa1041c55d21` and gate-definition
+checkpoint `95f9f649795e9ce2c4c1ef67d62430c61a974223` now drive the exact
+same-binary FA2-default versus `VT_FA2_DECODE=0` fallback component at
+cache-off input-1,024/output-128, c2/c16 AB/BA/AB. Driver SHA is
+`04cc3d63674c22dc9db135e5bcb60e81020561b965cfc76469db273c02f2866c`;
+the evidence root is
+`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/component-ab-c2-c16-fa2-vs-fallback`.
+PID `3143509` started at `2026-07-13T10:44:49Z` and holds `/tmp/gpu` across
+both model gates and every leg.
+
+Both FA2-on and fallback model gates pass **235/235 assertions + 16/16
+token-exact** before performance begins. W3-G5 is `ACTIVE`; all partial timing
+or memory observations are non-binding until the driver emits a complete
+summary and selection summary. Only **40/40 timing + 8/8 memory** authorizes
+W3-G6. Until then immutable `3f256ab` remains **55/124 pass, 69 fail**, and no
+exact vLLM grid or 35B performance command is authorized.

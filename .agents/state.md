@@ -7285,3 +7285,45 @@ on exact event counts, completion synchronization, model-family topology,
 zero eager work, and cross-report identity. Immutable `3f256ab` remains
 **55/124 pass, 69 fail**; W3-H2, exact-grid, and 35B performance remain
 prohibited.
+
+## 2026-07-13 — pinned Nsight calibration closes schema-v5 capture-boundary rule
+
+The committed-form one-kernel CUDA-graph probe has source SHA-256
+`0d56a238b8bec12435666cb77f32d8d6001425b20a97dfc5bc242bd75742739b`
+and immutable DGX root
+`~/work/vllm.cpp-nsys-calibration/0d56a238b8bec12435666cb77f32d8d6001425b20a97dfc5bc242bd75742739b`.
+It compiled with CUDA 13.0.88 to binary SHA
+`f2491834cf1642395bcc26dbb46fe10d4dadf745b1aa38f97048807a17372d80`
+and ran under one `/tmp/gpu` lock with pinned Nsight 2025.3.2.474.
+
+The exact H1d `repeat:4:sync` capture emitted the possible-loss warning both
+with and without a final `cudaDeviceReset`. Range 1 contains exactly three
+runtime rows, one graph kernel and two synchronization rows and reports **4
+CUDA events collected / 13 CUPTI events produced**. Ranges 2–4 contain two
+runtime rows, one graph kernel and two synchronization rows and report **3 / 11**.
+The no-reset report-1 / SQLite SHA are `e7ea3c3b…37d5e` /
+`4de65c02…9da2`; reset report-1 SHA is `04eb5139…531b`. The identical probe
+under full-process tracing contains 32 runtime rows, four kernels and eight
+synchronization rows with **zero** possible-loss diagnostics; report / SQLite
+SHA are `b6dc8a09…119a` / `7591dec7…1efc`. This isolates the warning to the
+pinned profiler-API capture boundary rather than missing graph activity.
+
+Trace schema v5 remains fail-closed. It accepts only source 3, severity 2 and
+the exact warning text under the pinned product version, and only after exact
+runtime inventory, one successful device completion, two synchronization
+activities, all graph children ending before completion, zero eager rows, the
+1,107-kernel + 7-memcpy + 1-memset model/family contract, collected-event
+reconciliation, positive CUPTI surplus, and cross-report identities pass. A
+synthetic warning without the model contract and a collected-count drift both
+fail. The final validator re-checks all four retained `b9beccd` SQLite exports:
+report 1 reconciles 1,118 collected / 1,129 produced, and reports 2–4 reconcile
+1,117 / 1,125. This does **not** reclassify the incomplete schema-v4 root.
+
+Focused client/summary/trace contracts pass **31/31**, the full CUDA-off CTest
+suite passes **106/106**, and agent-record/doc mutation contracts pass **18/18**.
+Live README, BENCHMARKS, roadmap, matrices, coordination and specs now present
+this compact current checkpoint; superseded narratives remain only in
+append-only history.
+No performance number changes: `3f256ab` remains **55/124**, and a fresh
+immutable 12-report schema-v5 DGX run plus paired vLLM trace is next before
+W3-H2, the exact grid, or 35B performance.

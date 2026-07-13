@@ -110,6 +110,7 @@ def write_nsys_sqlite(
     range_index: int = 1,
     signature_drift: bool = False,
     uneven_replays: bool = False,
+    collected_event_delta: int = 0,
 ) -> None:
     if not 1 <= range_index <= TRACE_CAPTURE_GRAPH_REPLAYS:
         raise ValueError("synthetic Nsight range index is invalid")
@@ -125,7 +126,8 @@ def write_nsys_sqlite(
     try:
         connection.execute(
             "CREATE TABLE DIAGNOSTIC_EVENT "
-            "(timestamp INTEGER, severity INTEGER, text TEXT)"
+            "(timestamp INTEGER, timestampType INTEGER, source INTEGER, "
+            "severity INTEGER, text TEXT, globalPid INTEGER)"
         )
         connection.execute("CREATE TABLE StringIds (id INTEGER, value TEXT)")
         connection.execute(
@@ -144,6 +146,13 @@ def write_nsys_sqlite(
             "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME "
             "(start INTEGER, end INTEGER, eventClass INTEGER, globalTid INTEGER, "
             "correlationId INTEGER, nameId INTEGER, returnValue INTEGER, callchainId INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_SYNCHRONIZATION "
+            "(start INTEGER, end INTEGER, deviceId INTEGER, contextId INTEGER, "
+            "greenContextId INTEGER, streamId INTEGER, correlationId INTEGER, "
+            "globalPid INTEGER, deprecatedSyncType INTEGER, syncType INTEGER, "
+            "eventId INTEGER, eventSyncId INTEGER)"
         )
         connection.execute(
             "CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY "
@@ -186,19 +195,17 @@ def write_nsys_sqlite(
             (1_783_950_501_877_615_336, "2026-07-13T13:48:21", "2026-07-13T15:48:21"),
         )
         connection.execute(
-            "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
+            "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?, ?, ?, ?)",
             (
+                1,
+                1,
                 1,
                 3,
                 "CUDA device 0: Unified Memory trace is not supported by the "
                 "current driver version or configuration.",
+                1,
             ),
         )
-        if lost_events:
-            connection.execute(
-                "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?)",
-                (2, 2, "Not all CUDA events might have been collected."),
-            )
         if model_contract:
             contract = TRACE_PRIMARY_GRAPH_CONTRACTS["27"]
             node_names = []
@@ -215,11 +222,18 @@ def write_nsys_sqlite(
             node_names = ["kernel-a", "kernel-b"]
             memcpy_nodes = 1
         launch_name = "cudaGraphLaunch_v10000"
+        device_sync_name = "cudaDeviceSynchronize_v3020"
         profiler_start_name = "cuProfilerStart"
         string_ids = {
             name: index
             for index, name in enumerate(
-                sorted(set(node_names + [launch_name, profiler_start_name])), start=1
+                sorted(
+                    set(
+                        node_names
+                        + [launch_name, device_sync_name, profiler_start_name]
+                    )
+                ),
+                start=1,
             )
         }
         connection.executemany(
@@ -336,6 +350,89 @@ def write_nsys_sqlite(
                 + ",".join("?" for _ in range(12))
                 + ")",
                 (1, 2, 0, 1, None, 7, correlation_id, 1, 0, 4096, 3001, 1),
+            )
+            sync_correlation_id = 3000 + range_index
+            connection.execute(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    50_000,
+                    60_000,
+                    0,
+                    1,
+                    sync_correlation_id,
+                    string_ids[device_sync_name],
+                    0,
+                    None,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO CUPTI_ACTIVITY_KIND_SYNCHRONIZATION VALUES ("
+                + ",".join("?" for _ in range(12))
+                + ")",
+                [
+                    (
+                        50_010,
+                        59_990,
+                        0,
+                        1,
+                        None,
+                        0xFFFFFFFF,
+                        sync_correlation_id,
+                        1,
+                        None,
+                        4,
+                        0xFFFFFFFF,
+                        0xFFFFFFFF,
+                    ),
+                    (
+                        60_010,
+                        60_020,
+                        0,
+                        1,
+                        None,
+                        0xFFFFFFFF,
+                        sync_correlation_id + 1,
+                        1,
+                        None,
+                        4,
+                        0xFFFFFFFF,
+                        0xFFFFFFFF,
+                    ),
+                ],
+            )
+        if lost_events:
+            runtime_count = profiler_start_count + 2
+            activity_count = runtime_count + len(node_names) + memcpy_nodes + 1
+            collected_count = activity_count + collected_event_delta
+            connection.executemany(
+                "INSERT INTO DIAGNOSTIC_EVENT VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        2,
+                        2,
+                        3,
+                        2,
+                        "Not all CUDA events might have been collected.",
+                        1,
+                    ),
+                    (
+                        3,
+                        2,
+                        3,
+                        1,
+                        f"Number of CUDA events collected: \t{collected_count}.",
+                        1,
+                    ),
+                    (
+                        4,
+                        1,
+                        1,
+                        1,
+                        "Number of CUPTI events produced: "
+                        f"\t{collected_count + 8}, CUPTI buffers: 50.",
+                        1,
+                    ),
+                ],
             )
         connection.commit()
     finally:
@@ -872,6 +969,27 @@ class OnlineClientContractTests(unittest.TestCase):
             write_nsys_sqlite(lost, lost_events=True)
             with self.assertRaisesRegex(HarnessError, "not lossless"):
                 validate_nsys_trace(lost)
+
+            reconciled = root / "reconciled.sqlite"
+            write_nsys_sqlite(reconciled, lost_events=True, model_contract=True)
+            result = validate_nsys_trace(reconciled, model_key="27")
+            self.assertTrue(result["lossless"])
+            self.assertEqual(result["lossless_basis"], "exact-event-reconciliation")
+            self.assertTrue(result["capture_boundary_diagnostic"]["acknowledged"])
+            self.assertEqual(
+                result["capture_boundary_diagnostic"]["collected_cuda_events"],
+                1_118,
+            )
+
+            unreconciled = root / "unreconciled.sqlite"
+            write_nsys_sqlite(
+                unreconciled,
+                lost_events=True,
+                model_contract=True,
+                collected_event_delta=-1,
+            )
+            with self.assertRaisesRegex(HarnessError, "does not reconcile"):
+                validate_nsys_trace(unreconciled, model_key="27")
 
             uneven = root / "uneven.sqlite"
             write_nsys_sqlite(uneven, uneven_replays=True)

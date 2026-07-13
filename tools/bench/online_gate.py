@@ -57,7 +57,7 @@ TRACE_PROMPTS = 48
 TRACE_REPETITIONS = 3
 TRACE_CAPTURE_GRAPH_REPLAYS = 4
 TRACE_RANGE_REPORTS = TRACE_REPETITIONS * TRACE_CAPTURE_GRAPH_REPLAYS
-TRACE_STATUS_SCHEMA_VERSION = 4
+TRACE_STATUS_SCHEMA_VERSION = 5
 BUILD_CONTRACT_SCHEMA_VERSION = 2
 NSYS_CAPTURE_RANGE = "cudaProfilerApi"
 NSYS_CAPTURE_RANGE_END = f"repeat:{TRACE_CAPTURE_GRAPH_REPLAYS}:sync"
@@ -137,6 +137,15 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _NSYS_ALLOWED_DIAGNOSTIC = re.compile(
     r"CUDA device \d+: Unified Memory trace is not supported by the current "
     r"driver version or configuration\."
+)
+_NSYS_CAPTURE_BOUNDARY_DIAGNOSTIC = (
+    "Not all CUDA events might have been collected."
+)
+_NSYS_COLLECTED_EVENTS_RE = re.compile(
+    r"Number of CUDA events collected:\s+(\d+)\."
+)
+_NSYS_PRODUCED_EVENTS_RE = re.compile(
+    r"Number of CUPTI events produced:\s+(\d+), CUPTI buffers:\s+(\d+)\."
 )
 
 _PLAN_PREPARED_RE = re.compile(
@@ -953,6 +962,7 @@ def validate_nsys_trace(
             "CUPTI_ACTIVITY_KIND_MEMCPY",
             "CUPTI_ACTIVITY_KIND_MEMSET",
             "CUPTI_ACTIVITY_KIND_RUNTIME",
+            "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION",
             "DIAGNOSTIC_EVENT",
             "META_DATA_CAPTURE",
             "META_DATA_EXPORT",
@@ -967,13 +977,18 @@ def validate_nsys_trace(
         _require_sqlite_columns(
             connection,
             "DIAGNOSTIC_EVENT",
-            {"severity", "text", "timestamp"},
+            {"severity", "source", "text", "timestamp"},
         )
         _require_sqlite_columns(connection, "StringIds", {"id", "value"})
         _require_sqlite_columns(
             connection,
             "CUPTI_ACTIVITY_KIND_RUNTIME",
-            {"correlationId", "nameId", "returnValue", "start"},
+            {"correlationId", "end", "nameId", "returnValue", "start"},
+        )
+        _require_sqlite_columns(
+            connection,
+            "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION",
+            {"correlationId", "end", "start", "syncType"},
         )
         _require_sqlite_columns(
             connection,
@@ -1100,17 +1115,34 @@ def validate_nsys_trace(
         ):
             raise HarnessError("Nsight session start metadata is absent or invalid")
 
-        diagnostics = [
-            {"severity": int(severity), "text": str(text)}
-            for severity, text in connection.execute(
-                "SELECT severity, text FROM DIAGNOSTIC_EVENT "
-                "WHERE severity >= 2 ORDER BY timestamp"
+        all_diagnostics = [
+            {
+                "severity": int(severity),
+                "source": int(source),
+                "text": str(text),
+            }
+            for severity, source, text in connection.execute(
+                "SELECT severity, source, text FROM DIAGNOSTIC_EVENT "
+                "ORDER BY timestamp"
             )
+        ]
+        diagnostics = [
+            diagnostic
+            for diagnostic in all_diagnostics
+            if diagnostic["severity"] >= 2
+        ]
+        capture_boundary_diagnostics = [
+            diagnostic
+            for diagnostic in diagnostics
+            if diagnostic["severity"] == 2
+            and diagnostic["source"] == 3
+            and diagnostic["text"] == _NSYS_CAPTURE_BOUNDARY_DIAGNOSTIC
         ]
         rejected_diagnostics = [
             diagnostic
             for diagnostic in diagnostics
             if _NSYS_ALLOWED_DIAGNOSTIC.fullmatch(diagnostic["text"]) is None
+            and diagnostic not in capture_boundary_diagnostics
         ]
         if rejected_diagnostics:
             first = rejected_diagnostics[0]
@@ -1118,6 +1150,23 @@ def validate_nsys_trace(
                 "Nsight CUDA collection is not lossless: "
                 f"severity={first['severity']} text={first['text']}"
             )
+        if len(capture_boundary_diagnostics) > 1:
+            raise HarnessError(
+                "Nsight CUDA collection has repeated capture-boundary diagnostics"
+            )
+
+        collected_event_messages = [
+            match
+            for diagnostic in all_diagnostics
+            if (match := _NSYS_COLLECTED_EVENTS_RE.fullmatch(diagnostic["text"]))
+            is not None
+        ]
+        produced_event_messages = [
+            match
+            for diagnostic in all_diagnostics
+            if (match := _NSYS_PRODUCED_EVENTS_RE.fullmatch(diagnostic["text"]))
+            is not None
+        ]
 
         profiler_start_rows = [
             (int(start), int(end), int(correlation_id), int(return_value))
@@ -1166,6 +1215,54 @@ def validate_nsys_trace(
                 "Nsight cuProfilerStart does not precede its graph launch"
             )
         launch_id_set = set(launch_ids)
+
+        device_sync_rows = [
+            (int(start), int(end), int(correlation_id), str(name), int(return_value))
+            for start, end, correlation_id, name, return_value in connection.execute(
+                "SELECT runtime.start, runtime.end, runtime.correlationId, "
+                "strings.value, runtime.returnValue "
+                "FROM CUPTI_ACTIVITY_KIND_RUNTIME AS runtime "
+                "JOIN StringIds AS strings ON strings.id = runtime.nameId "
+                "WHERE strings.value GLOB 'cudaDeviceSynchronize*' "
+                "ORDER BY runtime.start"
+            )
+        ]
+        if len(device_sync_rows) != 1 or device_sync_rows[0][4] != 0:
+            raise HarnessError(
+                "Nsight range must contain one successful cudaDeviceSynchronize"
+            )
+        if launch_rows[0][1] > device_sync_rows[0][0]:
+            raise HarnessError(
+                "Nsight cudaDeviceSynchronize does not follow its graph launch"
+            )
+        expected_runtime_count = expected_profiler_starts + 2
+        runtime_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM CUPTI_ACTIVITY_KIND_RUNTIME"
+            ).fetchone()[0]
+        )
+        if runtime_count != expected_runtime_count:
+            raise HarnessError(
+                "Nsight bounded range has unexpected CUDA runtime rows: "
+                f"got {runtime_count}, expected {expected_runtime_count}"
+            )
+        synchronization_rows = [
+            (int(start), int(end), int(correlation_id), int(sync_type))
+            for start, end, correlation_id, sync_type in connection.execute(
+                "SELECT start, end, correlationId, syncType "
+                "FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION ORDER BY start"
+            )
+        ]
+        if len(synchronization_rows) != 2:
+            raise HarnessError(
+                "Nsight bounded range must contain exactly two synchronization rows"
+            )
+        if sum(
+            row[2] == device_sync_rows[0][2] for row in synchronization_rows
+        ) != 1:
+            raise HarnessError(
+                "Nsight device synchronization lacks one correlated activity row"
+            )
 
         kernel_fields = (
             "gridX",
@@ -1330,6 +1427,19 @@ def validate_nsys_trace(
         if any(value != per_launch_counts[0] for value in per_launch_counts[1:]):
             raise HarnessError("Nsight graph child counts differ across launches")
 
+        child_end_ns = max(
+            int(
+                connection.execute(
+                    f"SELECT MAX(end) FROM CUPTI_ACTIVITY_KIND_{kind.upper()}"
+                ).fetchone()[0]
+            )
+            for kind in child_rows
+        )
+        if child_end_ns > device_sync_rows[0][1]:
+            raise HarnessError(
+                "Nsight graph child activity extends beyond cudaDeviceSynchronize"
+            )
+
         primary_family_counts: dict[str, int] = {}
         contract = TRACE_PRIMARY_GRAPH_CONTRACTS.get(model_key) if model_key else None
         if contract is not None:
@@ -1358,6 +1468,41 @@ def validate_nsys_trace(
                         f"Nsight trace dispatched forbidden fallback kernel {forbidden}"
                     )
 
+        activity_count = runtime_count + sum(len(rows) for rows in child_rows.values())
+        capture_boundary_diagnostic = None
+        if capture_boundary_diagnostics:
+            if contract is None:
+                raise HarnessError(
+                    "Nsight CUDA collection is not lossless: the capture-boundary "
+                    "diagnostic requires an exact model graph contract"
+                )
+            if len(collected_event_messages) != 1 or len(produced_event_messages) != 1:
+                raise HarnessError(
+                    "Nsight capture-boundary diagnostic lacks unique event counters"
+                )
+            collected_event_count = int(collected_event_messages[0].group(1))
+            produced_event_count = int(produced_event_messages[0].group(1))
+            cupti_buffer_count = int(produced_event_messages[0].group(2))
+            if collected_event_count != activity_count:
+                raise HarnessError(
+                    "Nsight collected-event counter does not reconcile with the "
+                    f"exact bounded range: got {collected_event_count}, "
+                    f"expected {activity_count}"
+                )
+            if produced_event_count <= collected_event_count or cupti_buffer_count <= 0:
+                raise HarnessError(
+                    "Nsight CUPTI producer counters are invalid for the "
+                    "capture-boundary diagnostic"
+                )
+            capture_boundary_diagnostic = {
+                "acknowledged": True,
+                "collected_cuda_events": collected_event_count,
+                "cupti_buffers": cupti_buffer_count,
+                "produced_cupti_events": produced_event_count,
+                "surplus_cupti_events": produced_event_count - collected_event_count,
+                "text": _NSYS_CAPTURE_BOUNDARY_DIAGNOSTIC,
+            }
+
         kernel_summary_rows = [
             {
                 "count": int(count),
@@ -1379,6 +1524,7 @@ def validate_nsys_trace(
 
     return {
         "allowed_diagnostics": diagnostics,
+        "capture_boundary_diagnostic": capture_boundary_diagnostic,
         "capture_session_uuid": capture_uuid,
         "canonical_node_multiset_sha256": hashlib.sha256(
             first_signature.encode("utf-8")
@@ -1397,6 +1543,11 @@ def validate_nsys_trace(
             "kernels": kernel_summary_rows,
         },
         "lossless": True,
+        "lossless_basis": (
+            "exact-event-reconciliation"
+            if capture_boundary_diagnostic is not None
+            else "no-cuda-loss-diagnostic"
+        ),
         "nsys_product_version": product_version,
         "nsys_report_path": str(report_path),
         "nsys_report_sha256": sha256_file(report_path),

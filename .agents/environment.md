@@ -82,14 +82,13 @@ inner 4096, state 128; context 262144.
 
 - Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
   27B cache-off grid at **55/124 axes pass, 69 fail**; W3-E/W3-F/W3-G
-  strict-fail and earn no speed credit. W3-H clean schema-v4 `b9beccd` passes
-  exact build/gate/plans/clients/FIFO/zero-exit and produces four complete
-  zero-eager reports, but strict validation rejects pinned Nsight's
-  possible-loss capture-range diagnostic before sessions 2/3 or vLLM. The run
-  is VOID. Calibrate it with a minimal graph and preserve exact event counters,
-  completion synchronization, model topology, toolchain/build provenance,
-  actual launcher ancestry, FIFO cleanup, and cross-report identity before a
-  fresh 12-report run. Close all 69 failed axes before 35B performance.
+  strict-fail and earn no speed credit. W3-H schema-v4 `b9beccd` remains VOID
+  after four complete zero-eager reports. The committed one-kernel probe
+  isolates its warning to pinned Nsight 2025.3.2.474's profiler-API boundary;
+  the identical full-process trace is clean. Schema-v5 exact version,
+  event-counter, completion, synchronization, model-family, zero-eager, and
+  cross-report reconciliation is CPU-green. Execute a fresh immutable
+  12-report DGX run. Close all 69 failed axes before 35B performance.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

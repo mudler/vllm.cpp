@@ -22,9 +22,17 @@ four reports, each with one launch, **1,107 graph kernels + 7 memcpys + 1
 memset**, and zero eager CUDA rows. The strict validator rejected Nsight's
 severity-2 possible-loss diagnostic and stopped before sessions 2/3 or vLLM,
 so the root is **FAILED / VOID** and changes no ratio. Collected-event counters
-exactly reconcile to the visible runtime and graph activities; a pinned-tool
-minimal-graph calibration is now required before any narrowly conditional
-classification.
+exactly reconcile to the visible runtime and graph activities.
+
+The committed one-kernel calibration probe reproduces the exact warning for
+every profiler-API stop/repeat/synchronous/reset variant on pinned Nsight
+2025.3.2.474 while all bounded activities remain present; an identical
+full-process trace is clean. Schema v5 therefore records this exact
+capture-boundary diagnostic only after version, runtime inventory, device
+completion, synchronization rows, collected/produced counters, complete model
+graph/family counts, zero eager work, and cross-report identity reconcile. Any
+other diagnostic or mismatch still fails closed. Fresh 12-report DGX evidence
+is pending; `b9beccd` is not reclassified.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -224,11 +232,10 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H schema-v4 `b9beccd` is void after session 1:
-   all four target reports are complete and zero-eager, but Nsight emits the
-   possible-loss capture-range diagnostic. Calibrate and reconcile that pinned
-   tool behavior, then execute a fresh 12-report `--trace-only` checkpoint.
-   35B remains gated.
+   attribution is complete. W3-H schema-v4 `b9beccd` remains void. The
+   pinned-tool calibration and schema-v5 exact reconciliation are implemented
+   and CPU-gated; execute a fresh 12-report `--trace-only` checkpoint plus the
+   paired vLLM trace. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a

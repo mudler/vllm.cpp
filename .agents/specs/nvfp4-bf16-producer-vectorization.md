@@ -1,10 +1,10 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — clean schema-v4 `b9beccd` is FAILED / VOID after its first
-four-report session: build, correctness, frozen plans, clients, FIFO/zero-exit,
-complete 1,107-kernel replays and zero-eager checks pass, but pinned Nsight
-emits the possible-loss capture-range diagnostic; calibrate and reconcile that
-tool diagnostic before a fresh 12-report run; W3-H2 remains prohibited**
+Status: **ACTIVE — clean schema-v4 `b9beccd` remains FAILED / VOID; a committed
+one-kernel probe isolates its warning to pinned Nsight's profiler-API capture
+boundary; schema v5 now CPU-gates an exact, version-bound event/completion/model
+topology reconciliation; fresh immutable 12-report DGX evidence is next and
+W3-H2 remains prohibited**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -48,11 +48,26 @@ visible CUDA runtime rows plus all graph children.
 Schema v4 nevertheless rejects the severity-2 `Not all CUDA events might have
 been collected.` diagnostic, so the driver stopped after report 1 export,
 before sessions 2/3 or the vLLM arm. The root is **FAILED / VOID**, changes no
-ratio, and is never reused. The next H1 step is a model-free, one-node CUDA
-graph calibration on pinned Nsight 2025.3.2.474. Any diagnostic exception must
-be version-bound and conditional on exact runtime/activity reconciliation,
-completion synchronization, zero eager work, model-family cardinalities, and
-cross-report identity; it may not become a blanket severity waiver.
+ratio, and is never reused.
+
+The committed [calibration probe](../../tools/bench/nsys_cuda_profiler_probe.cu)
+then executed one graph kernel in four profiler ranges on the same GB10 and
+Nsight 2025.3.2.474. `stop`, `repeat:4`, and `repeat:4:sync` all emit the exact
+warning, with and without a final `cudaDeviceReset`; every indexed SQLite still
+contains one kernel, the exact 3/2 then 2/2 runtime/synchronization rows, and
+reports **4 collected / 13 produced** events. Tracing the identical process
+without a profiler-API capture boundary is clean. The warning is therefore a
+pinned-tool capture-boundary diagnostic, not evidence that a target graph child
+is absent.
+
+Schema v5 does not broadly whitelist it. It permits only source 3, severity 2,
+and the exact text under the pinned product version, and only after one exact
+runtime inventory, one successful device synchronization, two synchronization
+activities, all graph children ending before completion, zero eager rows, exact
+1,107+7+1 model counts/families, a collected-event counter equal to runtime +
+graph activities, a positive produced-CUPTI surplus, and cross-report identity.
+Missing/extra activity, a counter mismatch, another diagnostic, or any version
+drift still fails closed. Focused client/summary/trace contracts pass **31/31**.
 
 The first implementation leaf is intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
@@ -101,50 +116,14 @@ inventoried and spiked separately.
 
 ### H1 attempts and lossless-trace contract
 
-H1a at
-`~/work/vllm.cpp-executed-path-refresh/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b/evidence/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b`
-is **VOID**. It ran the tactic cache read-write, loaded/saved 64 native plans and
-selected 37/64 tactics differently from the accepted v0.25 fixture, including
-M=16/N=34,816/K=5,120 tactic 4 instead of tactic 14. Its Nsight report SHA is
-`471e30d620236789cfafa6d5ca52a98272e0e93161c3aafe29262ec4f7deb7fb`;
-a later SQLite audit also finds the CUDA-event-loss warning. The corrected
-manual plan validator passes; an earlier invocation without the required
-`PYTHONPATH` and a separate fail-closed precreated-evidence dry-run are setup
-diagnostics, not benchmarks.
-
-H1b at
-`~/work/vllm.cpp-executed-path-refresh-frozen-h1b/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b/evidence/5d8af792a0010434fa9681a9cf46b6a5cdbfc77b`
-is also **VOID**. It loaded 64 FlashInfer and zero native plans in read-only
-mode, tuned/rejected/saved zero, reproduced selected-plan SHA
-`f2d9be7fc4a89de1cfa994ab9be08a423e0c4f6981fe46cb808cef485f4c1fa4`,
-and left the forbidden native-cache target absent. The model gate, three local
-48/48-request legs, vLLM Torch trace and all cache drops completed. Ours Nsight
-report/SQLite SHA are `a76a6ed30239eab52587700f73267ab9be70788ae2f012761c5637228c7bfd11`
-and `b6dcd5d69900010d953d817db612083ffc92d94b17177b9348f8d99fc0485165`.
-The SQLite contains severity-2 `Not all CUDA events might have been collected.`
-Its dominant 1,107-node graph has 930 nodes replayed 1,372 times and 177 nodes
-replayed 1,373 times, proving at least 930 missing graph-node events. The old
-status `passed:true` did not inspect SQLite and is a historical harness false
-positive.
-
-Retained H1b events diagnose normal production at 0.638331 versus 0.342777
-ms/decode forward, fused production at about 0.543321 versus 0.257276 ms, and
-the frozen FP4 GEMM set at about 54.676 versus 54.792 ms. These cross-profiler
-values cannot bind or authorize H2; they only leave W3-H as the leading
-eligible candidate because no verified larger residual displaced it.
-
-H1c attempted three independent Nsight reports, one 48-request repetition
-each, while retaining one uninterrupted GPU lock. Capture 1 failed closed on
-possible event loss, so r2/r3/vLLM did not run. Configure log SHA
-`7d510aa43faee799f07fb2e5797be697ec8508904c8571917d59233326cbed5d`
-also states `CUTLASS not found / arch not sm_12xa; cutlass NVFP4 GEMM
-disabled`; CMakeCache and compile-commands SHA are
-`6a34a146d33e07f1289009ddbfbf982d46f5f74e075280c8bf7bacf566ee80de`
-and `a834cfc65253f1129139306e6e486c17f3916973e1fcc1f364797efc7f51a855`.
-The kernel summary's 146,661 naive and 10,944 WMMA FP4 calls, with no CUTLASS
-device kernel, prove fallback runtime dispatch. The model gate proves only
-that fallback build's correctness. H1c is **VOID** for both event loss and
-invalid build provenance.
+All pre-H1d attempts are `VOID`; exact roots and hashes remain in the
+append-only record. Three constraints survive: H1a changed 37/64 tactics under
+a writable cache, so every process must use the frozen read-only map; H1b's
+uneven 1,107-node replay counts proved genuine missing graph activities, so
+cardinality/identity checks remain mandatory; H1c executed naive/WMMA fallback
+because its build lacked the target CUTLASS path, so compile/binary/runtime
+provenance precedes every trace. Their cross-profiler timings are attribution
+only and authorize neither H2 nor a speed claim.
 
 ### Executed topology and clean diagnostic slice
 
@@ -329,13 +308,10 @@ Before implementation, run current pushed source and the validated vLLM
 v0.25.0 oracle under one `/tmp/gpu` lock using the exact 27B cache-off c16,
 input-1,024/output-128, 48-prompt x three-repetition contract in
 `scripts/dgx-online-serving.sh --trace-only`. Ours uses **three independent**
-Nsight Systems captures, one repetition each. H1c used
-`--cuda-graph-trace=node --cuda-flush-interval=10000 --sample=none
---cpuctxsw=none` plus a final 11-second drain and still lost events, so those
-flags are now a failed constraint rather than an H1d recipe. H1d must retain
-lossless node-level attribution while bounding the capture range and/or trace
-buffers enough to avoid loss, and must record the exact profiler version,
-flags, exit status and capture-range markers.
+Nsight Systems sessions, four indexed single-replay reports each. H1d records
+the exact profiler version, flags, exit status, capture-range markers, raw
+reports, and SQLite exports. Schema v5 may classify only the calibrated
+capture-boundary diagnostic under the complete reconciliation contract below.
 
 Before the GPU lock or any model load, H1d must fail closed unless the detached
 build records the exact external CUTLASS source tree, sm_121a architecture,
@@ -385,7 +361,7 @@ thousands. One Nsight session therefore yields four reports; the three required
 independent sessions yield 12.
 
 Export and validate every one of the 12 SQLite files before starting the vLLM
-arm. Any non-whitelisted severity>=2 diagnostic, absent graph-node row,
+arm. Any unclassified severity>=2 diagnostic, absent graph-node row,
 missing indexed artifact or hash drift voids the attempt. H1d must also
 reconcile graph-node events against the exact one runtime graph launch in each
 report and the exact 16-warmup/48-measured workload; require distinct capture
@@ -407,7 +383,14 @@ name/geometry/resource multiset hash and must match across all 12 reports.
 The four reports in one capture share one non-empty profiling-session UUID;
 the three capture UUIDs are pairwise distinct. Do not require
 `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`: Nsight node mode intentionally omits
-whole-graph activity. vLLM uses the
+whole-graph activity. If the exact calibrated diagnostic appears, require the
+pinned Nsight version, source/severity/text, exact runtime row inventory, one
+successful `cudaDeviceSynchronize`, exactly two synchronization activities,
+all graph work ending before that completion, and unique collected/produced
+counters. The collected count must equal runtime + kernel + memcpy + memset
+rows, and produced CUPTI events must exceed it with a positive buffer count.
+This condition is evaluated only after the complete 27B model graph contract;
+it never waives a missing event. vLLM uses the
 mandated Torch profiler because nsys breaks its EngineCore on this host; its
 raw trace, selected hash, exact command/corpus/workload and clean decode-window
 family counts must be independently recomputed rather than trusted from the
@@ -542,7 +525,7 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v4 clean `b9beccd` passes exact build/gate/plans/clients/FIFO/zero-exit and produces four complete, zero-eager, single-replay reports. It fails closed on pinned Nsight's possible-loss capture-range diagnostic before sessions 2/3 or vLLM and is VOID. Calibrate the diagnostic with a minimal graph, bind any exception to exact counters/completion/model topology, then rerun all 12 reports from a new SHA/root** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: `b9beccd` remains VOID. The one-kernel pinned-Nsight calibration is complete; schema-v5 exact version/event/synchronization/model-topology reconciliation is implemented and focused contracts pass 31/31. Execute a fresh immutable 3-session × 4-report gate plus paired vLLM trace; W3-H2 remains prohibited** |
 | W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
 | W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
 | W3-H4 | frozen c2/c16 40+8 strict component | **pending** |

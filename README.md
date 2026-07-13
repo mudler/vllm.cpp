@@ -9,10 +9,11 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The latest W3-H schema-v4 DGX trace failed closed on an Nsight capture-range
-> diagnostic and is **VOID**. Its reports contain the complete target graph,
-> but the diagnostic must be independently classified before the trace can
-> bind. No W3-H speed credit or 35B performance result is claimed. See
+> The latest W3-H DGX trace is **VOID**, but a minimal graph calibration now
+> isolates its warning to pinned Nsight's `cudaProfilerStop` capture boundary.
+> Schema v5 accepts that one diagnostic only after exact event, completion, and
+> model-topology reconciliation; the fresh 12-report DGX gate is pending. No
+> W3-H speed credit or 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -23,7 +24,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Finish the lossless W3-H trace, gate the selected repair, then rerun all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | Clean `b9beccd` passed build, correctness, plans, clients, and one four-report session; it failed closed on Nsight's possible-loss diagnostic and is **VOID** | Calibrate the diagnostic on a minimal graph, repair the evidence rule without weakening graph completeness, then rerun all 12 reports |
+| W3-H normal BF16→FP4 producer | 🚧 `ACTIVE` / trace-first | Minimal one-kernel probes reproduce the warning in every `cudaProfilerApi` capture-range mode while all events are present; full-process traces are clean. Schema v5 adds pinned-version exact reconciliation and is CPU-green | Execute a fresh immutable 12-report DGX trace; W3-H2 stays prohibited until all reports and the paired vLLM arm pass |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -122,7 +123,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; the latest W3-H DGX trace is void on an unresolved Nsight capture-range diagnostic |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; schema-v5 W3-H trace validation is CPU-green and DGX-pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |

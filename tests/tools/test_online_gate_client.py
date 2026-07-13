@@ -648,6 +648,21 @@ class OnlineClientContractTests(unittest.TestCase):
         )[0]
         self.assertIn('env "PATH=$(dirname "${client}"):${PATH}"', block)
 
+    def test_trace_driver_builds_before_requiring_the_server_binary(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        configured_preflight = script.index(
+            '[[ -n ${build_dir} && -f ${build_dir}/CMakeCache.txt ]]'
+        )
+        build = script.index('if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then')
+        executable_postflight = script.index(
+            '[[ -x ${build_dir}/examples/server ]]'
+        )
+        self.assertLess(configured_preflight, build)
+        self.assertLess(build, executable_postflight)
+
     def test_campaign_writes_a_model_summary_before_cross_model_summary(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(

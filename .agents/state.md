@@ -6951,3 +6951,32 @@ part of the fail-closed contract: create a fresh empty SHA evidence root,
 generate its dry-run plan first, copy the frozen corpus second, then configure
 and execute the exact `RelWithDebInfo` Triton-AOT/FA2/CUTLASS build. The next
 hardware action requires another pushed SHA and new immutable root.
+
+## 2026-07-13 — fifth H1d setup exposed pre-build bootstrap check; driver order repaired
+
+Clean pushed `b1c7eb6a605df754a958799c42010b2342636354` used a new SHA-owned
+DGX root and successfully followed the repaired order: dry-run plan in empty
+evidence, frozen 27B corpus copy, then exact `RelWithDebInfo` configuration with
+Triton-AOT, FA2, external FlashInfer CUTLASS, oracle Ninja, CUDA 13.0.88 and
+sm_121a. Plan/configure/corpus-manifest SHA-256 are
+`2b231695b24345251b656a6ec68bc0d527efee20290205fddfddaf47ffad2d53` /
+`0d434a1e56f29c5a9e736691518c18dd2fb7d788f16b10650117eadaa2171b50` /
+`b048d789f85914aa8c9334eca2c62a2af0f3bbf78eab0eb200cabfcd7a90e5dc`.
+
+The trace driver then exited 2 before build because its initial preflight
+required `${build_dir}/examples/server`, even though the driver's immediately
+following provenance step owns the exact `server` +
+`test_qwen27_paged_engine` build. Driver-log SHA-256 is
+`f24c01c64caa4df08b79fb6beb4739690b781cea35c33c4908ebf47791236e0a`.
+There is no execution directory, target compilation, model load, GPU lock or
+profiler command. The GPU remained idle and `/tmp/gpu` free. The retained root
+is **FAILED / VOID before build/GPU** and cannot be reused; `3f256ab` remains
+binding at **55/124 pass, 69 fail**.
+
+The driver now preflights a configured `CMakeCache.txt`, performs and records
+the exact target build, then requires the server executable before recording
+execution provenance. A regression test fixes this ordering; shell syntax and
+the focused client/summary/trace suite pass **27/27**. README, benchmark record,
+roadmap, owning matrices, inventory, coordination and spike all retain the void
+attempt and new fresh-SHA requirement. No inference implementation, accepted
+ratio, exact grid or 35B performance changes.

@@ -8,7 +8,8 @@ pin delta is classified (94 `INVENTORY`, 51 `IGNORE`, no trace-independent
 until target goldens/model behavior gates are re-run and exact 27B→35B
 performance closes. The executable v0.25.0/FlashInfer 0.6.13 oracle is already
 validated and active with a preserved v0.24.0 rollback; immutable `9cc7191`
-establishes the new 27B denominator but fails parity at 54/124 axes.
+established the first new 27B denominator, while immutable `3f256ab` supersedes
+it and remains failed/open at **55/124 axes pass, 69 fail**.
 
 - **Reference checkout:** `/home/mudler/_git/vllm`, branch `main`
   (https://github.com/vllm-project/vllm).

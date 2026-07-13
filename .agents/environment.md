@@ -83,13 +83,15 @@ inner 4096, state 128; context 262144.
 - All old-oracle throughput baselines are non-binding after sampling,
   token-budget and dependency drift audits. `b5c6e4f` is historical vLLM
   0.24.0/FlashInfer 0.6.12 evidence; `3cc490c` is VOID at 28/36 groups,
-  1,602/2,016 requests, four returns and no trace. Binding immutable `9cc7191`
-  v0.25.0 evidence now completes the exact 27B cache-off grid under one lock:
-  54/124 axes pass. Its first ours Nsight trace used the CUDA-13 default whole-
-  graph granularity (1,226 graph activities, zero child-node kernels), so run
-  the new one-lock `--trace-only` node-level paired recapture before ranking an
-  implementation. Then modernize only trace-proven paths and close all 70
-  failed axes before any 35B run.
+  1,602/2,016 requests, four returns and no trace. Binding immutable `3f256ab`
+  v0.25.0 evidence completes the exact 27B cache-off grid under one lock:
+  **55/124 axes pass, 69 fail**. W3-E/W3-F/W3-G strict-fail their components.
+  W3-H's exact-target H1d refresh is next: H1a/H1b/H1c and clean setup roots
+  through `b1c7eb6` are void; the repaired driver now enforces plan-first
+  evidence, exact Triton-AOT/FA2/CUTLASS/toolchain configuration and its own
+  recorded target build before executable validation. Require three lossless
+  exact-plan captures before implementing the next lever, then close all 69
+  failed axes before any 35B performance run.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

@@ -41,7 +41,7 @@ smoke loads the 24.57-GiB checkpoint, compiles, autotunes FlashInfer, captures
 graphs and completes exact 16-input/1-output counts; its cold rate is not a
 benchmark. Clean server smoke and atomic oracle-path activation also pass.
 
-The replacement campaign is immutable clean `9cc7191`, with source/build at
+The first v0.25 replacement campaign was immutable clean `9cc7191`, with source/build at
 `~/work/vllm.cpp-online-gate/checkpoints/9cc71918dbdc10f014c02feb9bab1d00963a16fe`
 and evidence at the matching `evidence/` path. Plan/oracle/build-log/source-
 corpus/vLLM-corpus SHA-256 are `5a04cdcf…b2`, `6d39cb90…10c`,
@@ -58,6 +58,18 @@ pass. One uncontended model-wide lock then covered the passing model gate, all
 **0.5855/0.5934×**. The exact 27B gate therefore remains `ACTIVE` with a
 **FAILED/open** performance disposition. Every throughput, latency and memory
 axis must pass before any 35B performance run.
+
+Immutable post-pack `3f256ab` supersedes that denominator: all 36 groups,
+2,016 requests, six returns, paired node-level traces and 124 axes validate,
+but only **55/124 pass, 69 fail**. Total-throughput ratios c1→c32 are
+**0.993504/0.954464/0.966438/0.980678/1.027889/1.039417×**; host PSS/RSS
+remain red. W3-E/W3-F/W3-G strict-failed their same-binary components, so none
+earns speed credit. The current W3-H trace-first refresh requires three
+lossless exact-plan captures before implementation. H1a/H1b/H1c and clean
+setup roots through `b1c7eb6` are void; the latest passed exact plan/configure
+but exposed a pre-build driver bootstrap check. The driver now performs its
+recorded target build before requiring `examples/server`. Fresh evidence is
+pending; no exact rerun or 35B performance command is authorized.
 
 The model-scoped all-runs / ratios / report SHA-256 are
 `c46595b886cc4c6d17251bf0f0a665cad5cf54579475244e86dcb65c8ec1a894`,
@@ -266,13 +278,14 @@ reported as a clean dependency check.
    (**implemented and CPU-gated**).
 4. Run interleaved vllm.cpp/vLLM repetitions for both models and all points with
    explicit cache-off, identical sampling, scheduler settings, and model length.
-   The immutable `9cc7191` 27B model gate, 36 timed groups and six returns are
-   complete; 54/124 axes pass. Hold 35B.
+   Immutable `3f256ab` supersedes `9cc7191`: the 27B model gate, 36 timed groups
+   and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
-   old-oracle W3-B trace is lifecycle-clean and diagnostic. The `9cc7191`
-   v0.25 trace is hash-valid but captured ours at whole-graph granularity;
-   execute the new node-level paired `--trace-only` checkpoint. 35B remains gated.
+   old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
+   attribution is complete; execute W3-H's fresh exact-target three-capture
+   `--trace-only` checkpoint after the repaired driver-owned target build. 35B
+   remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. W3-B
    already closes the original wide FP4 tactic-family mismatch; do not infer a

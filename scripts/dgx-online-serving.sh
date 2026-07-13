@@ -117,8 +117,8 @@ if [[ ${mode} == trace-only && ${model} != 27 ]]; then
   exit 2
 fi
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
-[[ -n ${build_dir} && -x ${build_dir}/examples/server ]] || {
-  echo "--build-dir must contain examples/server" >&2
+[[ -n ${build_dir} && -f ${build_dir}/CMakeCache.txt ]] || {
+  echo "--build-dir must name a configured CMake build tree" >&2
   exit 2
 }
 [[ -n ${configure_log} && -s ${configure_log} ]] || {
@@ -177,6 +177,10 @@ if ! "${build_cmd[@]}" >"${build_log}" 2>&1; then
   cat "${build_log}" >&2
   exit 1
 fi
+[[ -x ${build_dir}/examples/server ]] || {
+  echo "provenance-recorded build did not produce examples/server" >&2
+  exit 1
+}
 python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
   --output "${execution_manifest}" \
   --model-key "${model}" \

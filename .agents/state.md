@@ -7462,3 +7462,46 @@ binding `3f256ab` remains **55/124 pass, 69 fail**. Live README, BENCHMARKS,
 roadmap, matrices, coordination, environment, inventory, and feature specs now
 show only this current snapshot; older attempt narratives remain here and in
 the append-only ledger.
+
+## 2026-07-13 — schema-v5 H1d status passes and selects fused FP4 production
+
+Pushed validator `71128642ce04c191f559ea4ccabe4b7e33a66b0f` was checked out
+detached at
+`~/work/vllm.cpp-trace-validator/71128642ce04c191f559ea4ccabe4b7e33a66b0f/source`
+and revalidated the complete immutable `c498a413` artifacts without GPU work or
+an engine rerun. `record-trace-status` exits zero and writes
+`trace/27/status.json`, SHA-256
+`84d15970d5a68e8a6307949a78eb33fbe5db3104c70129abd3d2ae0bb3696e66`,
+with schema v5 and `passed=true`. All 12 report/SQLite/validation/summary
+links, three plan/control sessions, cache drops, build/execution identity, raw
+paired vLLM trace, and exact hashes reconstruct successfully. Canonical node
+multiset SHA is `c357867c…68b`; capture UUIDs are
+`1f84d92d-7054-4e4d-94f5-6911ef91f3b0`,
+`7c54de15-0159-42ee-9501-7af2c496c4f5`, and
+`82e29c2a-a221-4dae-ac3a-87d429835046`.
+
+The status records local output digests `573a6db8…4ea`, `c02fcc16…7c7`, and
+`b0d336bd…df10` with `all_equal=false`; vLLM records four identical
+`e89e00f6…3b60` digests with `all_equal=true`. The mandatory 27B token gate
+remains the correctness precondition. The earlier append-only shorthand
+calling all 1,588 vLLM annotations “clean windows” was imprecise: the accepted
+summary has **1,588 generation annotations and 1,476 clean decode windows**.
+
+A canonical derived ranking was written outside the immutable run root at
+`~/work/vllm.cpp-trace-validator/71128642ce04c191f559ea4ccabe4b7e33a66b0f/c498a413-residual-ranking.json`,
+SHA-256 `7c3232487e414d5d0087d310c4189c7c8ab356399bba1f640af4c07478c32456`.
+Ours is the median of 12 single-replay reports; vLLM is the mean across 1,476
+clean windows. Mapped ours − vLLM times are fused SiLU→FP4 **+0.357354
+ms/window**, normal BF16→FP4 **+0.313930**, FA2 main **+0.130975**, FA2
+combine **−0.000255**, FP4 GEMMs **−0.310067**, GDN recurrence **−6.296971**,
+and all kernels **−3.578894**. The fused delta exceeds normal in **12/12**
+reports. Under W3-H's precommitted G0 rule, this displaces normal H2 and makes a
+dedicated fused-producer whole-chain spike the next work.
+
+These are cross-profiler attribution values, not a same-binary benchmark or
+speed credit. Binding `3f256ab` remains **55/124 pass, 69 fail**; normal H2,
+the exact grid, and 35B performance remain unexecuted. GPU, `/tmp/gpu`, and
+ports stay idle. Agent-record/doc mutation contracts pass **18/18** and the
+diff check is clean; no production code changed. Live README, BENCHMARKS,
+roadmap, matrices, coordination, environment, inventory, and specs now contain
+only this accepted current checkpoint.

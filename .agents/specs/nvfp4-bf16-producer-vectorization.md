@@ -1,21 +1,20 @@
 # NVFP4 BF16 normal-producer vectorized I/O (W3-H)
 
-Status: **ACTIVE — schema-v5 `c498a413` has complete exact-build,
-correctness, 12-report local, and paired-vLLM artifacts but remains VOID until
-final-status revalidation under the corrected diagnostic-repeatability
-contract; W3-H2 remains prohibited**
+Status: **ACTIVE — W3-H1 COMPLETE at schema-v5 status `84d15970…6e66`;
+fused SiLU→FP4 is the larger positive mapped residual in 12/12 reports, so
+normal-producer W3-H2 is displaced and remains unimplemented**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
 Claim: `CLAIM-SERVE-GATE-1`
 
-This spike selects one bounded CUDA execution difference after W3-G's
-correctness-faithful FA2 path strict-failed its c2/c16 component. It does not
-claim an end-to-end win, change the binding `3f256ab` result of 55/124 axes,
-authorize an exact grid or authorize any 35B performance command. W3-H is only
-the **normal** BF16 activation-to-NVFP4 producer used by the 27B direct-swizzled
-CUTLASS W4A4 path. The separate fused SiLU producer, FP4 GEMMs, GDN, attention,
-scheduler and host-weight lifetime are excluded.
+This spike scoped one bounded CUDA execution difference after W3-G's
+correctness-faithful FA2 path strict-failed its c2/c16 component. H1's accepted
+fresh trace now displaces that implementation leaf with the larger fused
+SiLU→FP4 residual. W3-H therefore remains the complete normal-producer design
+and evidence record but authorizes no H2 code. It does not claim an end-to-end
+win, change binding `3f256ab` at 55/124 axes, authorize an exact grid, or
+authorize any 35B performance command.
 
 ## Current H1 trace checkpoint
 
@@ -31,20 +30,18 @@ Clean pushed `c498a4131af7e6cf0ac678841212af80f4f12d53` passes exact
 tuning/misses. Three independent sessions each complete ordinary **48/48** and
 probe **16/16** clients. All **12/12** reports export, validate, and summarize
 losslessly: each contains one 1,107-node graph replay and zero eager work. The
-paired vLLM trace also completes with 1,588 clean decode windows. The immutable
-root is
+paired vLLM trace also completes with 1,588 generation annotations and 1,476
+clean decode windows. The immutable root is
 `~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
 
-Final status creation rejected unequal generated-text-array digests across the
-three local scheduling shapes. That check contradicted this gate's existing
-contract: after the mandatory token-exact model gate passes, production-default
-batch invariance remains visible as a diagnostic and does not void otherwise
-complete exact-count evidence. The validator now records the exact digests and
-`all_equal` state without making them fatal; all artifact, identity, topology,
-counter, zero-eager, plan, profile, and lifecycle checks still fail closed.
-Focused client/summary/trace contracts pass **31/31**. Until the immutable
-artifacts create and pass corrected final status, the root remains **VOID**, no
-kernel timing or residual ranking is accepted, and no performance ratio changes.
+Validator `71128642ce04c191f559ea4ccabe4b7e33a66b0f` reconstructs those
+immutable artifacts and writes schema-v5 passing status SHA
+`84d15970d5a68e8a6307949a78eb33fbe5db3104c70129abd3d2ae0bb3696e66`.
+It records the three unequal local output digests diagnostically after the
+mandatory token gate; all artifact, identity, topology, counter, zero-eager,
+plan, profile, and lifecycle checks still fail closed. Focused
+client/summary/trace contracts pass **31/31**. This accepts H1 attribution but
+changes no performance ratio.
 
 Schema v5 remains version-bound and fail-closed. The committed
 [calibration probe](../../tools/bench/nsys_cuda_profiler_probe.cu) establishes
@@ -55,12 +52,11 @@ event-counter, graph-family/topology, zero-eager, and cross-report
 reconciliation. The driver also polls the unchanged exact stop marker for at
 most 60 seconds while requiring the server to remain live.
 
-The first implementation leaf is intentionally narrower than vLLM's whole
+The deferred H2 design remains intentionally narrower than vLLM's whole
 kernel: one aligned 256-bit BF16 load and one packed 64-bit FP4 store while
-retaining the current scalar max, scale, reciprocal selection, E2M1 bucket
-semantics, flat launch geometry and padding behavior. This isolates I/O and
-instruction-count changes from arithmetic and scheduling changes. A scalar
-same-binary fallback remains present, and the candidate begins default-off.
+retaining scalar max, scale, reciprocal selection, E2M1 bucket semantics, flat
+launch geometry, and padding behavior. It may be reconsidered only after the
+larger fused-producer leaf is independently spiked and gated.
 
 ## Scope
 
@@ -82,8 +78,9 @@ same-binary fallback remains present, and the candidate begins default-off.
 
 ### Out of scope
 
-- `SiluAndMulFp4QuantKernel`, `SiluMulFp4QuantKernel`, their model dispatch or
-  their diagnostic 0.154-ms/decode-forward opportunity.
+- `SiluAndMulFp4QuantKernel`, `SiluMulFp4QuantKernel`, and their model dispatch.
+  Accepted H1d now ranks that separate leaf first at +0.357354 ms/window; it
+  requires its own spike rather than being stacked into W3-H.
 - Changing exact division to vLLM's `rcp.approx.ftz`, changing FP4 bucket
   semantics, changing the two-pass arithmetic order, or combining arithmetic
   and I/O into one acceptance result.
@@ -98,7 +95,7 @@ These exclusions are independent leaves, not statements that the upstream
 modes are unnecessary. Feature-parity policy still requires them to be
 inventoried and spiked separately.
 
-## Why W3-H is selected
+## Why W3-H was selected and why H2 is deferred
 
 ### H1 attempts and lossless-trace contract
 
@@ -113,38 +110,32 @@ only and authorize neither H2 nor a speed claim.
 
 ### Executed topology and clean diagnostic slice
 
-Current immutable local evidence is the W3-G default node trace at
-`~/work/vllm.cpp-fa2-decode/ae9e8ff0576badabdda7289beeacaa1041c55d21/evidence/trace`.
-Its SQLite SHA-256 is
-`6b9a0ddbbf33b2f3b152f5d1f95428958ebd04d16cf28d968dde589627a766dc`.
-The normal producer summary SHA-256 is
-`910bd8df71118c2c2f7081c9f4f70c6a697c1316a904ee37636f6b8497d956f7`.
-Graph-node rows, excluding eager/capture work, contain:
+Current immutable evidence is the accepted `c498a413` root above. Its 12 local
+reports have aggregate report / SQLite / validation / summary hashes
+`75b25ae3…3de8` / `a97d9d22…886e` / `4a5ada88…981c` / `1c351e7f…5728`.
+The paired vLLM trace / kernel-summary hashes are `6a312b08…018f` /
+`3f4ef158…6bc`; canonical local node-multiset SHA is `c357867c…68b`.
+The canonical derived ranking lives at
+`~/work/vllm.cpp-trace-validator/71128642ce04c191f559ea4ccabe4b7e33a66b0f/c498a413-residual-ranking.json`,
+SHA-256 `7c323248…2456`.
 
-| Normal shape | Current geometry | Calls / graph forwards | Mean | Per-forward time |
-|---|---|---:|---:|---:|
-| K=5,120 | grid 160, block 256 | 1,120 / 14 = 80 | 4.349314 us | 0.347945 ms |
-| K=6,144 | grid 192, block 256 | 896 / 14 = 64 | 4.374821 us | 0.279988 ms |
-| **total** | | **144 / forward** | | **0.627934 ms** |
+Cross-profiler values are attribution only. Ours is the median of 12 exact
+single-replay reports; vLLM is the clean 1,476-window mean:
 
-The vLLM v0.25.0 raw Torch-profiler trace is
-`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/trace/27/vllm-profile/online-gate_rank0.1783906481468807023.pt.trace.json.gz`,
-SHA-256
-`0c6f859f916ceb15970f3f6896c84bc37f4e2152c8aedef2c7b893b40e6ee0e2`.
-The H1d parser now uses execution annotations rather than geometry inference.
-The exact four-run raw trace contains 1,588 generation annotations, of which
-1,476 are uncontaminated `execute_context_0(0)_generation_N(N)` windows. Every
-one has exactly 144 normal producers, yielding **212,544 calls / 505.717377 ms
-= 0.342627 ms/window**. The clean diagnostic difference is therefore
-**0.285307 ms/decode window**. The remaining 112 generation annotations mix
-prefill/chunk contexts and are excluded. The profilers and capture windows
-still differ, so 0.285307 ms is a candidate ceiling, not a binding ratio or
-accepted speed credit.
+| Mapped family | Ours ms/window | vLLM ms/window | Ours − vLLM |
+|---|---:|---:|---:|
+| Fused SiLU→FP4 producer | 0.595536 | 0.238182 | **+0.357354** |
+| Normal BF16→FP4 producer | 0.655728 | 0.341798 | **+0.313930** |
+| FA2 main | 4.816544 | 4.685569 | **+0.130975** |
+| FA2 combine | 0.082480 | 0.082735 | −0.000255 |
+| FP4 GEMMs | 54.120144 | 54.430211 | −0.310067 |
+| GDN recurrence | 12.969872 | 19.266843 | −6.296971 |
+| All GPU kernels | 124.574592 | 128.153486 | −3.578894 |
 
-Padding is not the explanation: both decode geometries launch the same total
-threads, 40,960 for K=5,120 and 49,152 for K=6,144. Both traced kernels use 30
-registers/thread and no shared memory. The separate fused producer is excluded
-from every W3-H estimate.
+The fused-producer delta exceeds the normal delta in **12/12** local reports,
+so the G0 rule displaces normal H2. The negative whole-window delta is
+consistent with the binding c16 total-throughput axis already passing and does
+not close low-concurrency latency or host memory.
 
 ### Executed SASS difference
 
@@ -170,13 +161,10 @@ mandatory.
 
 ### Defensible ceiling
 
-The observed normal-producer difference is too small to close parity alone.
-Even a zero-cost local normal producer can remove at most 0.627934 ms/decode
-forward, and the observed vLLM-shaped target removes about 0.285307 ms. Binding
-TPOT/ITL gaps are larger on almost every point. W3-H is one ranked component,
-not a claim that the remaining gap is a ceiling. A fresh full-workload trace
-must continue ranking FP4 GEMM, GDN post-convolution/recurrence, fused SiLU and
-the rest of the executed path.
+The accepted normal-producer residual is too small to close parity alone and is
+not the first-ranked leaf. W3-H is therefore retained but not implemented.
+Neither the fused nor normal diagnostic delta is a benchmark ratio; the next
+spike must earn its own same-binary component result before any speed credit.
 
 ## Prior negative experiment and why this is not a repeat
 
@@ -511,16 +499,17 @@ throughput binds.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-H0 | whole-chain source/SASS/trace/history/test/gate inventory | **complete in this spike** |
-| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **ACTIVE: schema-v5 `c498a413` completes exact build/correctness, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. It remains VOID pending final-status revalidation under the corrected diagnostic-repeatability contract. No GPU rerun, timing acceptance, residual ranking, or W3-H2 is authorized yet** |
-| W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **pending; prohibited until H1** |
-| W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **pending** |
-| W3-H4 | frozen c2/c16 40+8 strict component | **pending** |
-| W3-H5 | conditional default flip, exact v0.25 27B 124-axis grid and lifecycle classification | **blocked on 48/48 H4** |
+| W3-H1 | fresh exact-workload current ours/vLLM paired trace and residual re-ranking | **COMPLETE: schema-v5 `c498a413` passes status `84d15970…6e66`; fused production ranks above normal in 12/12 reports** |
+| W3-H2 | I/O-only BF16/direct vector kernel, host toggle/eligibility and scalar fallback | **DEFERRED / NOT IMPLEMENTED: displaced by the larger fused-producer residual** |
+| W3-H3 | ported byte/alignment/capture tests, sanitizer, SASS, microbench/NCU, model and paired structure gates | **deferred with H2** |
+| W3-H4 | frozen c2/c16 40+8 strict component | **deferred with H2** |
+| W3-H5 | conditional default flip, exact v0.25 27B 124-axis grid and lifecycle classification | **deferred with H2; exact grid remains blocked** |
 
 ## Risks and decisions
 
-- **Insufficient ceiling:** 0.285 ms/forward cannot close the gate alone. Keep
-  scanning after this isolated leaf; never call the remaining gap diffuse.
+- **Insufficient and displaced residual:** accepted normal attribution is
+  +0.313930 ms/window and trails fused production in 12/12 reports. Do not
+  implement H2 first or call the remaining gap diffuse.
 - **Profiler mismatch:** current ours/vLLM times identify a target but cannot
   prove a ratio. Same-binary candidate/fallback owns performance acceptance.
 - **Alignment:** CUDA allocations and K%16 normally preserve 32-byte group

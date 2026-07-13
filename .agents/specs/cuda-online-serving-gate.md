@@ -14,23 +14,19 @@ PSS/RSS remain red. W3-E/W3-F/W3-G strict-failed their same-binary components
 and earn no speed credit. This result remains the only binding performance
 number, and no 35B performance command is authorized.
 
-The active W3-H trace-first refresh is diagnostic only. Clean schema-v5
+The W3-H trace-first refresh is diagnostic only. Clean schema-v5
 `c498a4131af7e6cf0ac678841212af80f4f12d53` passes exact **154/154** build,
 27B **1/1** correctness, frozen plans, three independent ordinary **48/48** +
 probe **16/16** sessions, all **12/12** lossless single-replay report exports,
-validations and summaries, and the paired vLLM trace. Final status creation
-then rejected unequal generated-text-array digests across local scheduling
-shapes. That was a harness-policy contradiction: this spec already requires
-those exact-match counts and digests to remain visible without voiding an
-otherwise exact-count, correctness-preconditioned trace arm.
-
-The validator now records local repeatability diagnostically while retaining
+validations and summaries, and the paired vLLM trace. Validator `7112864`
+records local repeatability diagnostically while retaining
 strict pinned-Nsight, runtime, synchronization, completion, event-counter,
 graph-family/topology, zero-eager, cross-report, plan, profile, identity, and
-lifecycle validation. Focused client/summary/trace contracts pass **31/31**.
-The complete immutable root remains **VOID** until corrected final-status
-revalidation; no timing, residual ranking, ratio, W3-H2 implementation, or 35B
-performance is authorized meanwhile.
+lifecycle validation. Passing status SHA is `84d15970…6e66`. Cross-profiler
+attribution ranks fused SiLU→FP4 at +0.357354 ms/window, normal BF16→FP4 at
++0.313930, and FA2 main at +0.130975; fused exceeds normal in all 12 reports.
+Normal W3-H2 is displaced pending a dedicated fused-producer spike. No ratio,
+speed credit, exact grid, or 35B performance is authorized meanwhile.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -230,15 +226,16 @@ reported as a clean dependency check.
 5. Capture one representative paired execution trace per model (`nsys` ours,
    torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
    old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H schema-v5 `c498a413` has complete 12-report
-   local and paired-vLLM artifacts but remains VOID pending corrected
-   final-status revalidation. Reuse only those immutable artifacts for
-   post-processing; do not rerun or append. 35B remains gated.
+   attribution is complete. W3-H schema-v5 `c498a413` passes final status
+   `84d15970…6e66`; retain it as the diagnostic baseline and never append to
+   its immutable root. 35B remains gated.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
-   gain÷effort, and drive the top traced lever through its owning row. W3-B
-   already closes the original wide FP4 tactic-family mismatch; do not infer a
-   new lever from source or aggregate category time while exact TPOT/ITL and
-   host-memory axes remain red.
+   gain÷effort, and drive the top traced lever through its owning row. H1d
+   selects fused SiLU→FP4 ahead of normal production in 12/12 reports; write
+   its whole-chain spike before implementation. W3-B already closes the
+   original wide FP4 tactic-family mismatch; do not infer speed credit from
+   cross-profiler attribution while exact TPOT/ITL and host-memory axes remain
+   red.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

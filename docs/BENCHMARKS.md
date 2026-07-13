@@ -8,14 +8,13 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-13**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The latest schema-v5 DGX run at clean `c498a413` is **FAILED / VOID pending
-status revalidation**. Exact build and 27B correctness pass; three independent
-local sessions complete 48/48 + 16/16 requests and all 12 lossless reports;
-the paired vLLM trace also completes. Final status creation then rejects
-unequal local output digests, contradicting the owning contract that records
-production-default batch invariance diagnostically after the mandatory model
-gate. The corrected validator and regression are CPU-green. No speed number
-changed.
+The latest schema-v5 DGX run at clean `c498a413` is **accepted diagnostic
+evidence**. Validator `7112864` revalidates exact build/correctness provenance,
+three independent 48/48 + 16/16 local sessions, all 12 lossless reports, and
+the paired vLLM trace. Final status SHA is `84d15970…6e66` with `passed=true`;
+local output non-repeatability remains explicit and non-fatal after the model
+gate. The fused SiLU→FP4 producer is the largest positive mapped residual, so
+normal-producer W3-H2 is displaced. No binding speed number changed.
 
 ## Binding 27B online gate
 
@@ -62,23 +61,23 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
-| W3-H1d complete trace | **ACTIVE — ARTIFACTS COMPLETE / STATUS PENDING** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, all three 48/48 + 16/16 local sessions, all 12 lossless report exports/validations/summaries, and the paired vLLM trace. The final status file is absent because diagnostic output-repeatability was incorrectly fatal; the corrected contract is CPU-green | Revalidate the immutable artifacts with the pushed corrected validator. Any counter, topology, diagnostic, identity, summary, or lifecycle drift still fails closed before W3-H2 |
-| W3-H2 vectorized BF16→FP4 I/O | **PENDING / NOT IMPLEMENTED** | The scalar implementation remains active; retained traces are diagnostic only | Implement only if W3-H1d produces complete lossless evidence and still selects this residual |
+| W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
+| W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
+| Fused SiLU→FP4 producer | **PENDING / SPIKE REQUIRED** | Largest positive mapped residual at **+0.357354 ms/window**; no implementation or same-binary result exists | Inventory the complete upstream/dependency/SASS/test chain, then gate one bounded candidate |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
 | Stream-usage serialization | **PENDING / GATING** | CPU and sanitizer contracts pass; native 128-token counts are present in all binding requests | Run its serialization A/B after the model hot path closes |
 | Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
 
-The current failed trace root is
+The accepted trace root is
 `~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
 It contains three distinct Nsight sessions and 12/12 lossless single-replay
 reports, each with the exact 1,107-node graph and zero eager work, plus the
 paired vLLM trace. The three local semantic output-array digests differ; the
 model gate still passes and the gate spec explicitly keeps batch-invariance
-digests diagnostic. Until the corrected validator creates and validates final
-status, the root remains VOID and no retained kernel time is accepted.
-Superseded attempts and detailed hashes remain only in the
+digests diagnostic. Passing status SHA is `84d15970…6e66`; canonical node
+multiset SHA is `c357867c…68b`. Superseded attempts and detailed hashes remain only in the
 [parity ledger](../.agents/parity-ledger.md) and [state log](../.agents/state.md).
 
 The exact calibration evidence is
@@ -86,6 +85,30 @@ The exact calibration evidence is
 the probe source SHA is `0d56a238…39b`, bounded no-reset report/SQLite SHA are
 `e7ea3c3b…37d5e` / `4de65c02…9da2`, and clean full-process report/SQLite SHA
 are `b6dc8a09…119a` / `7591dec7…1efc`.
+
+### Executed-path diagnostic ranking
+
+These are cross-profiler attribution values, not a benchmark ratio or speed
+credit. Ours is the median of 12 exact one-replay reports; vLLM is the clean
+1,476-window mean from the paired Torch trace. The canonical derived ranking
+is `~/work/vllm.cpp-trace-validator/71128642ce04c191f559ea4ccabe4b7e33a66b0f/c498a413-residual-ranking.json`,
+SHA-256 `7c323248…2456`.
+
+| Mapped family | Ours ms/window | vLLM ms/window | Ours − vLLM |
+|---|---:|---:|---:|
+| Fused SiLU→FP4 producer | 0.595536 | 0.238182 | **+0.357354** |
+| Normal BF16→FP4 producer | 0.655728 | 0.341798 | **+0.313930** |
+| FA2 main | 4.816544 | 4.685569 | **+0.130975** |
+| FA2 combine | 0.082480 | 0.082735 | −0.000255 |
+| FP4 GEMMs | 54.120144 | 54.430211 | −0.310067 |
+| GDN recurrence | 12.969872 | 19.266843 | −6.296971 |
+| All GPU kernels | 124.574592 | 128.153486 | −3.578894 |
+
+The fused-producer delta exceeds the normal-producer delta in every one of the
+12 reports, so the W3-H contract requires a fused-producer spike before normal
+W3-H2. The negative whole-window delta is consistent with c16 total throughput
+already passing; it does not explain or close the binding low-concurrency and
+host-memory failures.
 
 ## Current component dispositions
 
@@ -128,12 +151,13 @@ test "$rc" -eq 1
 sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ```
 
-## Reproduce the pending schema-v5 W3-H1d status
+## Reproduce the accepted schema-v5 W3-H1d trace
 
-Immediate work revalidates the complete `c498a413` artifacts without rerunning
-or changing the engine. If any artifact cannot satisfy the corrected status
-contract, use a clean pushed SHA and a new SHA-owned root with the full command
-below; never append a new execution to `c498a413`.
+The accepted status was reconstructed from the immutable `c498a413` artifacts
+with validator `71128642ce04c191f559ea4ccabe4b7e33a66b0f`; its SHA-256 is
+`84d15970d5a68e8a6307949a78eb33fbe5db3104c70129abd3d2ae0bb3696e66`.
+The full fresh-run recipe below creates a new SHA-owned root; never append a
+new execution to `c498a413`.
 
 ```sh
 set -euo pipefail

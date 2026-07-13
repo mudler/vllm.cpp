@@ -5852,3 +5852,34 @@ documentation/decision correction only: immutable `3f256ab` remains binding at
 unchanged, residual selection is reopened, and 35B remains held. Continue
 body-level trace/dispatch comparison and require a clean local slice before the
 next spike or implementation.
+
+### 2026-07-13 — W3-E direct swizzled activation scales selected and spiked
+
+The continued whole-chain scan now supplies the required clean local slice.
+Exact ours SQLite `99cbd04d…93f8` contains **320,099**
+`SwizzleBlockscaleKernel` launches totaling **1.238881054 s**: 23,524 eager /
+506.032544 ms and 296,575 graph-child / 732.848510 ms. Normalized by 1,425
+local forward markers, the standalone reorder costs **224.631 launches and
+0.869390 ms/forward**. Exact vLLM kernel summary `e4e916d1…565` has zero
+standalone kernels named `SwizzleBlockscaleKernel` or `swizzle_blockscale`.
+
+Body/source inspection confirms why. vLLM v0.25.0 tag `702f481` normal and
+fused FP4 quant producers compute the `[numMTiles,numKTiles,32,4,4]`
+tensor-core scale address before the E4M3 byte store. Ours writes
+`scale[row*groups+g]` and then launches the standalone reorder. Exact upstream
+entry/kernel/utils/fused source SHA are `be6a1ce8…d5bb` /
+`e1adb5fa…fd7e` / `f0449d81…0854` / `11b32e30…8ace`; upstream normal/fused
+test SHA are `e54ddf1d…9221` / `838e13e6…b9c9`.
+
+The accepted [W3-E spike](specs/nvfp4-direct-swizzled-scales.md) inventories
+the complete dispatch, files, upstream tests and gates. It specifies an
+explicit linear/direct-swizzled layout API, in-kernel zero coverage for padded
+scale slots, true-W4A4 CUDA CUTLASS selection only, and
+`VT_FP4_DIRECT_SF=0` as the exact linear+standalone-swizzle fallback. CPU,
+emulation, non-W4A4 and 35B W4A16 behavior stay linear/inert. W3-E is
+**READY**, not implemented: no code, test, sanitizer, model, trace, component
+A/B, speed or memory result exists yet. The next checkpoint is W3-E1 API +
+normal producer + ported padded/layout tests, followed by fused/model wiring;
+then c2/c16 same-binary A/B precedes any exact grid. GPU compute is idle,
+`/tmp/gpu` is free, the unrelated long-lived waiting shell owns no GPU, and
+35B performance remains held.

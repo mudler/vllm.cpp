@@ -1,7 +1,7 @@
 # NVFP4 persistent FlashInfer-compatible plan cache (W3-C)
 
-Status: **ACTIVE; W3-C2 implemented and correctness-gated, W3-C3
-fresh-process/same-plan performance pending**
+Status: **ACTIVE; W3-C2 and six-process stability pass, W3-C3 same-plan
+long-output gate failed; fixed-plan localization ready**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -171,10 +171,50 @@ current C-API test passes an isolated rerun. This is recorded as a pre-existing
 flake, not rewritten into 103/103 and not attributed to W3-C2.
 
 C2 changes no accepted performance ratio: immutable `3f256ab` remains 55/124.
-W3-C3 must now run from the pushed commit, prove the same 64/64 map in six fresh
-processes, establish 6/6 paired long-output equality, and execute the frozen
-c2/c16 all-axis component before any exact grid. No 35B performance run is
-authorized.
+W3-C3 ran from pushed `d211b8f`; its result is recorded below. No 35B
+performance run is authorized.
+
+## W3-C3 immutable stability and failed same-plan checkpoint (2026-07-13)
+
+Clean detached `d211b8f80fff831a712f0bfafa4f65f1abe1892d` was configured on
+GB10 with CUDA 13.0.88, sm_121a, CUTLASS 4.5 from the vLLM 0.25 FlashInfer
+environment, vendored Triton AOT and FA2. The focused persistent-runtime smoke
+passes. One read/write 27B seed imports the checked-in oracle fixture, passes
+235/235 plus 16/16, and publishes native cache SHA
+`2590fc94e0d7f1dc4a59c968b1944c1b8249178cf10a56428b2ab7602653199d`.
+
+Under one `/tmp/gpu` lock, six fresh native-only read-only processes run in
+alternating direct/`VT_FP4_DIRECT_SF=0` order. All six logs are byte-identical
+(SHA `523c2478...95f2` each); each loads 64/64 from native and zero from
+FlashInfer, tunes/rejects/saves 0/0/0, records no lazy miss, selects map SHA
+`f2d9be7f...1fa4`, and passes **235/235 assertions + 16/16 oracle tokens**.
+This closes the fresh-process plan-stability part of G2.
+
+The strict c2/c16 driver then runs both frozen model gates successfully and
+completes its first c2 direct/fallback pair. Both arms use the exact same 64
+selected lines, complete 6/6 requests with 6,144 input and 768 output tokens,
+and report zero tuning/misses. Their long generated texts nevertheless match
+for only **2/6** requests; zero-based request indices 0--3 differ. Direct and
+fallback raw SHA are `42047046...842f` / `5bb0e70a...7296`, while compact
+generated-text SHA are `900f6134...ec7` / `b34a17e8...437`.
+
+That is a decisive G2/G4 correctness failure, not a timing result. The driver
+was intentionally stopped, its active process group cleaned up, and GPU, lock
+and port 8001 verified idle/free. All partial or unpaired timing/memory values
+are **VOID**; c16, G3 tracing, G5 exact vLLM grid and every 35B performance
+command did not run. Evidence is
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence`;
+failure-summary/driver/driver-log SHA are `01c9faf6...bd74`,
+`fd76dd8b...b886` and `67307adc...b5b`.
+
+The cache implementation is stable; the open failure is the direct versus
+composed scale path under one fixed executable plan map. Before rerunning C3,
+localize the first divergent request/token and then the first divergent
+layer/GEMM or producer byte under the loaded tactic. Repair the implementation
+if the direct path is not byte-equivalent, or reclassify W3-E if concurrent
+long-output equality is not a valid equivalence property only after grounding
+that conclusion against vLLM's determinism tests. The acceptance rule itself
+is not weakened speculatively.
 
 ## Cache schema, identity and lifecycle
 
@@ -384,7 +424,8 @@ and 11,947 bytes.
 | W3-C0 | whole-chain v0.25/dependency/runtime audit, exact cache fixture contract, files/tests/gates | **complete in this spike** |
 | W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | **complete: Release/ASan+UBSan/TSan 6/6 + 174/174; full CPU 103/103** |
 | W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | **complete: CPU/sanitizers + CUDA runtime/save/memcheck + both frozen 27B arms pass** |
-| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | `READY` after pushed C2 checkpoint |
+| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | **FAILED:** six-process stability passes; first same-plan c2 pair has only 2/6 equal long outputs, so the series stops and performance is void |
+| W3-C3R | fixed-plan direct/fallback localization at request/token, layer/GEMM and producer-byte boundaries; repair or evidence-backed reclassification, then complete G4 rerun | `READY` under this spike; no acceptance relaxation |
 | W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | blocked on C3 acceptance |
 
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and

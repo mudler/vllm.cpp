@@ -98,9 +98,18 @@ OpenAI-compatible server.
 > Release/ASan+UBSan/TSan pass **7/7 + 189/189**. The current full CPU attempts
 > are **102/103 FAILED** only on the unchanged C-API early-stop timing flake,
 > reproduced by the baseline binary; the other **102/102** and an isolated C-API
-> rerun pass. Six fresh-process stability and the frozen same-plan c2/c16
-> component remain **PENDING**. This is mandatory reproduction control, not an
-> accepted steady-state speedup.
+> rerun pass. Immutable `d211b8f` then passes the six-fresh-process stability
+> gate: three direct-scale and three composed-fallback processes are
+> byte-identical, each loads the same **64/64** native plans with zero tuning /
+> misses / writes and passes **235/235 + 16/16**. C3 nevertheless **FAILS** at
+> the first frozen same-plan c2 pair: both arms use the exact same selected-map
+> SHA, complete 6/6 requests and 768/768 output tokens, but only **2/6**
+> generated texts are equal (request indices 0--3 differ). The remaining
+> component was intentionally stopped, so every partial timing/memory value is
+> **VOID**; c16, the exact grid and 35B performance did not run. The next gate
+> is fixed-plan direct-versus-composed numerical localization and repair before
+> repeating C3. This is mandatory reproduction control, not an accepted
+> steady-state speedup.
 > Every 27B speed, latency and memory axis must
 > pass before 35B performance runs; broader roadmap work—including newly explicit
 > **DSpark** support—waits behind parity.
@@ -241,7 +250,7 @@ nonblocking concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|---|---|---|
-| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-E removes 624 hot swizzles but strict-fails its component. W3-C C2 now loads the exact oracle map before warmup (**64/64, 0 tuned**) and both frozen default/fallback 27B gates pass **235/235 + 16/16**; six-process stability and same-plan performance remain pending. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
+| Qwen3.5/3.6 hybrid (GDN + gated attention, MoE + dense) | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ **text submodels** run end-to-end on GB10 and retain token-exact greedy correctness. The binding v0.25.0 `3f256ab` 27B cache-off gate completed all 36 groups but failed strict parity at **55/124 axes**; c16/c32 total throughput pass while low-concurrency decode latency and host PSS/RSS remain open. Packed QKV closes at **208.192 vs 208 FP4 GEMMs/forward**. W3-E removes 624 hot swizzles but strict-fails its component. W3-C passes six-process frozen-map stability (**6/6**, identical 64/64 plans, zero tuning), but its first same-plan c2 pair fails long-output equality at **2/6**; the remaining component is void/stopped pending numerical localization. The upstream wrappers are multimodal; their vision path is not implemented. | ✅ 35B text path from real APEX k-quant `.gguf` on GB10 (greedy parity vs same-file llama.cpp oracle); 27B GGUF pending (no file exists) | 🟡 paged-KV text engine + basic server/tool/grammar subsets; correctness gated, v0.25.0 27B production performance `FAILED/GATING`; 35B performance held |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 planned (post-MVP T1) |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 planned (post-MVP T1) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 planned (post-MVP T1) |
@@ -251,7 +260,7 @@ nonblocking concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference (correctness/CI grade) | 🟡 gate-model text engine + basic serving path end-to-end; multithreaded op dispatch (ggml-threadpool port, `VLLM_CPP_CPU_THREADS`) is 1/3/20-thread bit-identical and TSAN-clean. Its B4 real-file speed/RSS gate is pending an idle-host rerun; compute-in-quant GGUF speed remains open |
-| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. Packed QKV closes at **208.192 vs vLLM 208 FP4 GEMMs/forward**; W3-E removes 624 swizzles but strict-fails its component. W3-C C2 now imports/publishes the v0.25 64-plan map before warmup, uses the 5,000-us miss ABI, freezes misses, saves only completed warmups and passes CUDA/cache/model safety gates. Six fresh processes and the same-plan c2/c16 component remain `PENDING`; no performance ratio changes. No 35B performance run is authorized before every 27B axis passes. |
+| CUDA | NVIDIA (first target: GB10 / DGX Spark, sm_121a) | 🟡 **gate-model paged-KV stack running on GB10** with both greedy correctness gates passing. Immutable `3f256ab` binds at **55/124**. Packed QKV closes at **208.192 vs vLLM 208 FP4 GEMMs/forward**; W3-E removes 624 swizzles but strict-fails its component. W3-C imports/publishes the v0.25 64-plan map before warmup, uses the 5,000-us miss ABI, freezes misses, and passes six fresh processes with identical 64/64 plans and zero tuning. Its first same-plan c2 direct/fallback pair fails long-output equality at **2/6**, so the rest of C3 is stopped/void pending fixed-plan localization; no performance ratio changes. No 35B performance run is authorized before every 27B axis passes. |
 | Other CUDA targets | vLLM's sm70/75/80/86/87/89/90/100/101/103/110/120 targets | 🗓 inventoried, **not yet built or validated here**; per-target kernel dispatch/AOT/build/correctness/trace/performance gates remain |
 | Metal | Apple Silicon via MLX; custom MSL/MLX primitives for paged ops | 🗓 planned (M4 bring-up host available) |
 | Vulkan | Portable GPU | 🗓 planned (post-MVP) |
@@ -288,7 +297,7 @@ correctness, trace and performance block passes. Non-CUDA backends
 
 | Format | Status |
 |---|---|
-| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-E removes 624 activation swizzles but strict-fails its component. W3-C C2 wires the pure-C++ native/FlashInfer cache into CUDA startup: exact 64-plan import is a zero-tune capture-safe hit, frozen misses fail, completed warmups publish atomically and default/fallback 27B correctness is exact. Fresh-process stability and performance are still pending. The `3f256ab` grid still fails **69/124** axes; no speed or support expansion is claimed. |
+| NVFP4 (W4A16 MoE / W4A4 dense, Blackwell) | ✅ **both running on GB10** with token-exact greedy gates passing. The W4A4 path includes all 32 SM12 tactics, merged/fused projections, pre-serve tuning and packed QKV. W3-E removes 624 activation swizzles but strict-fails its component. W3-C wires the pure-C++ native/FlashInfer cache into CUDA startup: exact 64-plan import is a zero-tune capture-safe hit, frozen misses fail, completed warmups publish atomically, and six fresh processes load one identical map. The first same-plan c2 direct/fallback pair still produces only **2/6** equal long texts, so performance evidence is void and localization is open. The `3f256ab` grid still fails **69/124** axes; no speed or support expansion is claimed. |
 | GGUF materialization (F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K) | 🟡 load-time bf16 materialization; synthetic layout tests plus real 35B APEX Q3/Q4/Q5/Q6/Q8 greedy parity vs same-file llama.cpp. CPU ops now use correctness-gated multithreaded dispatch, but its real-file speed/RSS gate and direct compute-in-quant path remain open; F16/BF16, Q2_K, IQ/TQ/Q1, MXFP4 and NVFP4 execution remain open. |
 | FP8 | 🟡 the 35B ModelOpt static per-tensor W8A8 projection slice is native and gate-passing; generic FP8 modes/dispatch and FP8 KV remain planned |
 | MXFP4 / MXFP8 | 🗓 planned, including MLX-native modes on Apple |
@@ -351,8 +360,11 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   an exact-grid or 35B performance run.
   The follow-up scan proves v0.25 loaded a persistent 64-plan cache whereas
   ours retuned each process. W3-C remains `ACTIVE` as mandatory same-plan
-  reproduction control: C2 runtime publication and frozen-map correctness now
-  pass, while six-process stability and the c2/c16 component remain pending.
+  reproduction control: C2 runtime publication and frozen-map correctness pass,
+  and immutable `d211b8f` proves six-process **64/64** stability. Its first
+  paired c2 arm then uses the same tactic map but fails long-output equality
+  (**2/6** equal), so C3 is failed/stopped and all partial rates are void.
+  Fixed-plan direct-versus-composed numerical localization precedes a rerun.
   No path is modernized or removed from a trace name alone. Every 27B throughput, latency and
   memory axis must close before 35B; DSpark and the rest of roadmap_v1 stay
   queued behind speed parity.
@@ -521,8 +533,9 @@ Legend: ✅ supported & tested · 🚧 in development · 🗓 planned.
   mandatory against v0.25.0. The binding v0.25 log corrects that historical
   cache classification: its 64-entry file cache is active, and W3-C now owns
   the persistent/frozen-plan parity control before another sensitive A/B. C2
-  runtime/frozen-map correctness passes; commit-bound six-process stability
-  and same-plan performance remain open.
+  runtime/frozen-map correctness and six-process stability pass. The first
+  same-plan c2 pair fails the required long-output equality at 2/6, so the
+  component and exact grid remain blocked on numerical localization.
   W0 is
   merged at `7d29e0c`; its clean GB10 build,
   default/fallback

@@ -6121,3 +6121,54 @@ checkpoint is pushed, run at least six fresh processes for 64/64 selected-ID
 stability, require 6/6 paired long-output equality, then run the immutable
 read-only c2/c16 same-plan component under one lock. No exact grid or 35B
 performance is authorized before that component passes every axis.
+
+## 2026-07-13 — W3-C3 six-process stability passes; same-plan long-output gate fails closed
+
+The pushed C2 checkpoint was rebuilt from clean detached
+`d211b8f80fff831a712f0bfafa4f65f1abe1892d` at
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/source`.
+The first configure attempt stopped before generation because non-interactive
+SSH did not expose Ninja; the corrected command names
+`/home/mudler/.local/bin/ninja` and `/usr/local/cuda/bin/nvcc`. The resulting
+RelWithDebInfo build uses CUDA 13.0.88, sm_121a, CUTLASS 4.5 from the vLLM
+0.25 FlashInfer environment, vendored Triton AOT and FA2, and builds the
+focused NVFP4 test, 27B model gate and server. The persistent-runtime smoke
+passes 1/1.
+
+One lock-held read/write 27B seed imports the checked-in v0.25 oracle fixture,
+passes **235/235 + 16/16**, and publishes native cache SHA
+`2590fc94e0d7f1dc4a59c968b1944c1b8249178cf10a56428b2ab7602653199d`.
+One subsequent lock covers six fresh native-only read-only processes, alternating
+default and `VT_FP4_DIRECT_SF=0`. All six logs are byte-identical at
+`523c2478...95f2`; each loads **64 native / 0 FlashInfer**, tunes/rejects/saves
+**0/0/0**, records no lazy miss, passes **235/235 + 16/16**, and emits selected
+map SHA `f2d9be7fc4a89de1cfa994ab9be08a423e0c4f6981fe46cb808cef485f4c1fa4`.
+The fresh-process/cache-stability part of C3 therefore passes.
+
+The strict c2/c16 AB/BA/AB driver (SHA `fd76dd8b...b886`) then acquires one
+whole-series lock. Both frozen direct/fallback model gates again pass. The
+first c2 direct/fallback pair uses exactly the same 64 selected lines and zero
+tuning/misses; each completes **6/6** requests with **6,144 input and 768
+output tokens**. Generated-text equality nevertheless fails: only **2/6**
+requests are equal and zero-based indices 0--3 differ. Raw SHA are
+`42047046...842f` / `5bb0e70a...7296`; compact text SHA are
+`900f6134...ec7` / `b34a17e8...437`.
+
+This fails the G2/G4 correctness precondition before performance can bind.
+The remaining series was intentionally interrupted; the active server/client
+were terminated and GPU, `/tmp/gpu` and port 8001 verified idle/free. The
+unpaired partial artifacts and every observed timing/memory value are
+**VOID**. c16, the exact v0.25 grid and 35B performance did not run. Evidence
+root is `~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence`;
+failure-summary SHA is `01c9faf6...bd74` and driver-log SHA is
+`67307adc...b5b`.
+
+Disposition: W3-C runtime and cache stability remain green, but C3 is
+**FAILED**, not pending, and immutable `3f256ab` remains binding at **55/124**.
+Next, under the existing W3-C spike/claim, localize the first divergent
+request/token and then the first divergent layer/GEMM or scale-producer byte
+while forcing the loaded plan map. Repair the direct path if it violates the
+byte-equivalence contract, or reclassify W3-E only with grounded vLLM
+determinism evidence; do not weaken 6/6 equality speculatively. Rerun the full
+C3 gate from a new immutable evidence root before any exact grid or 35B
+performance.

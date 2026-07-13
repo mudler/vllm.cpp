@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -139,6 +140,33 @@ class SingleFlightPlanCache {
   static_assert(std::is_copy_constructible_v<Value>);
 
  public:
+  // Install a validated persistent result without exposing an intermediate
+  // tuning state. Existing live/loaded ready results retain priority, matching
+  // FlashInfer's in-memory-before-file lookup order. Importing over an active
+  // tuner is a lifecycle error: persistent plans must be loaded before warmup.
+  bool InsertReadyIfAbsent(const PlanKey& key, Value value) {
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    const auto it = entries_.find(key);
+    if (it == entries_.end()) {
+      auto entry = std::make_shared<Entry>();
+      entry->value.emplace(std::move(value));
+      entry->state = State::kReady;
+      entries_.emplace(key, std::move(entry));
+      return true;
+    }
+
+    std::lock_guard<std::mutex> entry_lock(it->second->mutex);
+    if (it->second->state == State::kTuning) {
+      throw std::logic_error(
+          "NVFP4 persistent plan import collided with active tuning");
+    }
+    if (it->second->state != State::kReady) {
+      throw std::logic_error(
+          "NVFP4 persistent plan import found a failed cache entry");
+    }
+    return false;
+  }
+
   std::optional<Value> FindReady(const PlanKey& key) const {
     std::shared_ptr<Entry> entry;
     {
@@ -150,6 +178,28 @@ class SingleFlightPlanCache {
     std::lock_guard<std::mutex> lock(entry->mutex);
     if (entry->state != State::kReady) return std::nullopt;
     return entry->value;
+  }
+
+  // Snapshot only executable ready entries. Holding the map lock while each
+  // entry is copied preserves the global->entry lock order used by failure and
+  // import paths. Sorting makes persistence deterministic despite unordered_map.
+  std::vector<std::pair<PlanKey, Value>> SnapshotReady() const {
+    std::vector<std::pair<PlanKey, Value>> result;
+    std::lock_guard<std::mutex> map_lock(map_mutex_);
+    result.reserve(entries_.size());
+    for (const auto& [key, entry] : entries_) {
+      std::lock_guard<std::mutex> entry_lock(entry->mutex);
+      if (entry->state == State::kReady) result.emplace_back(key, *entry->value);
+    }
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+      const PlanKey& a = lhs.first;
+      const PlanKey& b = rhs.first;
+      return std::tie(a.m_bucket, a.n, a.k, a.device_ordinal, a.architecture,
+                      a.output_dtype, a.tactic_set_version) <
+             std::tie(b.m_bucket, b.n, b.k, b.device_ordinal, b.architecture,
+                      b.output_dtype, b.tactic_set_version);
+    });
+    return result;
   }
 
   template <typename Tune>

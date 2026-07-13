@@ -241,7 +241,7 @@ void LoadedEngine::WarmupKernels() {
   std::cerr << "vllm.cpp: warming FlashInfer-parity NVFP4 profiles at "
             << max_num_batched_tokens_ << " tokens before serving\n";
   vt::cuda::Nvfp4AutotuneWarmupScope warmup(
-      static_cast<uint32_t>(max_num_batched_tokens_));
+      static_cast<uint32_t>(max_num_batched_tokens_), runner_.device().index);
   engine_core_.add_request(std::make_unique<vllm::v1::Request>(
       "_vllm_cpp_nvfp4_warmup", std::move(prompt), std::move(sampling),
       /*arrival_time=*/0.0, /*block_hasher=*/nullptr));

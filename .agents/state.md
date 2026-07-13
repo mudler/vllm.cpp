@@ -6072,3 +6072,52 @@ misses with the resolved 5,000-us default, publish a native file only after
 successful `Complete()`, extend counters/diagnostics and fail a frozen miss
 before readiness. Immutable `3f256ab` remains binding at 55/124; no exact grid
 or 35B performance is authorized.
+
+## 2026-07-13 — W3-C2 persistent plans wired into CUDA startup; correctness green, performance pending
+
+W3-C2 now closes the runtime integration selected by the v0.25 execution
+audit. `SingleFlightPlanCache` can install validated ready plans before tuning
+and snapshot only ready entries deterministically. CUDA startup constructs
+runtime/driver/GPU/CUTLASS/dtype/layout/tactic/build metadata; CMake derives the
+build identity from SHA-256 over the exact dispatcher/tactic ABI inputs so a
+source edit changes the default cache namespace without relying on git.
+FlashInfer plans load before compatible native plans and before the maximum-
+token dummy request. Stable IDs become executable candidate/workspace plans;
+loaded hits never profile. Misses use three warmups, the resolved 5,000-us
+stream delay and ten timed repeats. Frozen misses fail before tuning. Only a
+successful `Complete()` snapshots/merges/atomically publishes native plans.
+Diagnostics report mode, paths, metadata fingerprint, loaded/rejected/saved
+counts and every selected `(M,N,K,tactic)`.
+
+CPU Release, ASan+UBSan and TSan each pass **7/7 cases, 189/189 assertions**.
+Fresh CUDA 13.0.88/sm_121a/CUTLASS 4.5 compiles. The existing focused CUDA
+suite passes **20/20, 26,874/26,874**. The dedicated read-only process passes
+**20/20**: it imports all **64/64** binding plans, tunes zero, captures/replays
+a loaded hit and rejects an uncovered shape before readiness. The lifecycle
+process passes **14/14**: cancelling after tuning five profiles leaves no file;
+the next successful completion publishes exactly five. The first memcheck
+command was command-invalid because non-interactive SSH omitted CUDA tools from
+`PATH`; the absolute `/usr/local/cuda/bin/compute-sanitizer` rerun reports
+**0 errors**. No GPU process or lock remains.
+
+The real frozen 27B default and `VT_FP4_DIRECT_SF=0` arms each pass **235/235
+assertions plus 16/16 vLLM tokens**. Both logs contain metadata fingerprint
+`330e0b811014741f`, the same 64 selected IDs and **0 tuned / 0 rejected / 0
+saved**. Evidence is `~/work/vllm.cpp-nvfp4-persistent-c2-staging/evidence`;
+default/fallback/runtime/save SHA-256 are `a29ebbee…11cf2`,
+`dcdc0bcd…9342`, `a5f65a6e…9c68` and `35982886…f02`.
+
+Two full CPU attempts are retained as **FAILED 102/103**: unchanged
+`test_capi` early-stop intermittently received one delta instead of two. The
+old baseline binary reproduces the identical failure after five passes, and
+the C2 diff has no C API/engine/executor change. The remaining suite passes
+**102/102** and the current isolated C-API rerun passes. This is an existing
+flake, not rewritten into 103/103 and not assigned to the cache path.
+
+Disposition: C2 implementation/correctness is complete and C3 is `READY`, but
+W3-C remains `ACTIVE`. No throughput, latency or memory command ran and no
+ratio changes: immutable `3f256ab` stays binding at **55/124**. After this
+checkpoint is pushed, run at least six fresh processes for 64/64 selected-ID
+stability, require 6/6 paired long-output equality, then run the immutable
+read-only c2/c16 same-plan component under one lock. No exact grid or 35B
+performance is authorized before that component passes every axis.

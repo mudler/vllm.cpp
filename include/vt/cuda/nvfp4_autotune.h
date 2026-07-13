@@ -8,8 +8,17 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace vt::cuda {
+
+struct Nvfp4AutotuneSelectedPlan {
+  uint32_t m_bucket = 0;
+  int32_t n = 0;
+  int32_t k = 0;
+  int tactic_id = -1;
+};
 
 struct Nvfp4AutotuneWarmupStats {
   uint64_t scopes_started = 0;
@@ -17,11 +26,23 @@ struct Nvfp4AutotuneWarmupStats {
   uint64_t profiles_requested = 0;
   uint64_t profiles_tuned = 0;
   uint64_t lazy_misses = 0;
+  uint64_t profiles_loaded = 0;
+  uint64_t cache_documents_rejected = 0;
+  uint64_t profiles_saved = 0;
+  uint32_t delay_microseconds = 5000;
+  bool persistent_cache_enabled = false;
+  bool read_only = false;
+  std::string mode;
+  std::string native_path;
+  std::string flashinfer_path;
+  std::string metadata_fingerprint;
+  std::vector<Nvfp4AutotuneSelectedPlan> selected_plans;
 };
 
 class Nvfp4AutotuneWarmupScope {
  public:
   explicit Nvfp4AutotuneWarmupScope(uint32_t max_num_tokens);
+  Nvfp4AutotuneWarmupScope(uint32_t max_num_tokens, int device_ordinal);
   ~Nvfp4AutotuneWarmupScope();
 
   Nvfp4AutotuneWarmupScope(const Nvfp4AutotuneWarmupScope&) = delete;
@@ -37,6 +58,7 @@ class Nvfp4AutotuneWarmupScope {
   uint64_t tuned_before_ = 0;
   bool active_ = false;
   bool completed_ = false;
+  bool persistent_session_ = false;
 };
 
 Nvfp4AutotuneWarmupStats GetNvfp4AutotuneWarmupStats();

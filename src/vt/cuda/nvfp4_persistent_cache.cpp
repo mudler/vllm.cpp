@@ -525,6 +525,20 @@ std::string Nvfp4TacticDescriptorDigest() {
   return result.str();
 }
 
+std::string PersistentCacheMetadataFingerprint(
+    const PersistentCacheMetadata& metadata) {
+  ValidateMetadataSelf(metadata);
+  const std::string canonical = MetadataToJson(metadata).dump();
+  uint64_t digest = 14695981039346656037ULL;
+  for (const unsigned char ch : canonical) {
+    digest ^= ch;
+    digest *= 1099511628211ULL;
+  }
+  std::ostringstream result;
+  result << std::hex << std::setfill('0') << std::setw(16) << digest;
+  return result.str();
+}
+
 PersistentCacheOptions ResolvePersistentCacheOptions(
     const PersistentCacheMetadata& metadata) {
   ValidateMetadataSelf(metadata);
@@ -583,7 +597,7 @@ PersistentCacheOptions ResolvePersistentCacheOptions(
        PathComponent(metadata.scale_layout)) /
       ("timing_w" + std::to_string(metadata.warmups) + "-r" +
        std::to_string(metadata.repeats) + "-d" +
-       std::to_string(metadata.delay_microseconds) + "-bucket_" +
+       std::to_string(options.delay_microseconds) + "-bucket_" +
        std::to_string(metadata.hybrid_bucket_version)) /
       ("build_" + PathComponent(metadata.build_id)) /
       "autotune_configs.json";

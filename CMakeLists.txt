@@ -299,10 +299,33 @@ if(VLLM_CPP_CUDA)
       src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu
       src/vt/cuda/cuda_nvfp4_tactics_w1.cu
       ${_NVFP4_FLASHINFER_TACTIC_SOURCES})
+    # Persistent tactic caches must become incompatible whenever executable
+    # tactic source/ABI changes, including a dirty/source-archive build with no
+    # meaningful git revision. Hash the exact compile inputs deterministically.
+    set(_NVFP4_CACHE_ABI_SOURCES
+      ${_NVFP4_CUTLASS_SOURCES}
+      src/vt/cuda/nvfp4_cutlass_tactics.h
+      src/vt/cuda/nvfp4_plan_cache.h
+      src/vt/cuda/nvfp4_tactic_ids.h)
+    set(_NVFP4_CACHE_BUILD_INPUT
+      "cutlass=${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH};")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${_NVFP4_CACHE_ABI_SOURCES})
+    foreach(_NVFP4_CACHE_ABI_SOURCE IN LISTS _NVFP4_CACHE_ABI_SOURCES)
+      file(SHA256
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_NVFP4_CACHE_ABI_SOURCE}"
+        _NVFP4_CACHE_ABI_SHA)
+      string(APPEND _NVFP4_CACHE_BUILD_INPUT
+        "${_NVFP4_CACHE_ABI_SOURCE}=${_NVFP4_CACHE_ABI_SHA};")
+    endforeach()
+    string(SHA256 _NVFP4_CACHE_BUILD_ID "${_NVFP4_CACHE_BUILD_INPUT}")
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}
       src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
     target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1 VT_CUTLASS_FP8=1)
+    target_compile_definitions(vllm PRIVATE
+      VT_CUTLASS_VERSION_STRING="${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH}"
+      VT_NVFP4_CACHE_BUILD_ID="${_NVFP4_CACHE_BUILD_ID}")
     # cutlass headers reach via -isystem so their internal deprecation warnings
     # are exempt from the global -Werror=all-warnings (the general build stays
     # strict). --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.

@@ -171,6 +171,18 @@ if(VLLM_CPP_CUTLASS)
       ENVIRONMENT
         "VT_FP4_FORCE_TACTIC=${_NVFP4_TACTIC};VT_FP4_FULL_TACTICS=1;VT_FP4_AUTOTUNE=1")
   endforeach()
+  add_test(NAME test_ops_nvfp4_persistent_runtime
+    COMMAND test_ops_nvfp4_fp4
+      "--test-case=NVFP4 persistent runtime loads frozen plans before warmup")
+  set_tests_properties(test_ops_nvfp4_persistent_runtime PROPERTIES
+    ENVIRONMENT
+      "VT_FP4_TEST_PERSISTENT_RUNTIME=1;VT_FP4_PERSISTENT_CACHE=1;VT_FP4_AUTOTUNE_CACHE_READONLY=1;VT_FP4_FLASHINFER_CACHE_PATH=${CMAKE_SOURCE_DIR}/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json;VT_FP4_AUTOTUNE_CACHE_PATH=${CMAKE_CURRENT_BINARY_DIR}/nvfp4-runtime-readonly-unused.json;VT_FP4_AUTOTUNE_DELAY_US=5000;VT_FP4_PLAN_CACHE=1;VT_FP4_AUTOTUNE=1;VT_FP4_FULL_TACTICS=1")
+  add_test(NAME test_ops_nvfp4_persistent_save_lifecycle
+    COMMAND test_ops_nvfp4_fp4
+      "--test-case=NVFP4 persistent runtime publishes only completed warmup")
+  set_tests_properties(test_ops_nvfp4_persistent_save_lifecycle PROPERTIES
+    ENVIRONMENT
+      "VT_FP4_TEST_PERSISTENT_SAVE=1;VT_FP4_PERSISTENT_CACHE=1;VT_FP4_AUTOTUNE_CACHE_READONLY=0;VT_FP4_AUTOTUNE_CACHE_PATH=${CMAKE_CURRENT_BINARY_DIR}/nvfp4-runtime-save-lifecycle.json;VT_FP4_AUTOTUNE_DELAY_US=0;VT_FP4_PLAN_CACHE=1;VT_FP4_AUTOTUNE=1;VT_FP4_FULL_TACTICS=1")
 endif()
 vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)

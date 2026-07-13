@@ -1,7 +1,7 @@
 # NVFP4 persistent FlashInfer-compatible plan cache (W3-C)
 
-Status: **ACTIVE; W3-C1 implemented and CPU/sanitizer-gated, W3-C2 runtime
-integration pending**
+Status: **ACTIVE; W3-C2 implemented and correctness-gated, W3-C3
+fresh-process/same-plan performance pending**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -75,7 +75,7 @@ Exact tag-source SHA-256 values for the four vLLM control files are:
 `flashinfer_autotune_cache.py=fcdaf113...b7b7`,
 `vllm.py=caf6db4d...b05`, and `kernel.py=421cec43...d32`.
 
-## Current local baseline and gaps
+## Pre-C2 local baseline and gaps
 
 | Local concern | Current anchor | Gap W3-C closes |
 |---|---|---|
@@ -127,6 +127,54 @@ C1 has no runtime behavior, plan-cache publication, model load, GPU command or
 performance result. C2 must still import ready plans into the single-flight
 map, switch miss timing to the resolved 5,000-us default, add lifecycle/stats,
 load before warmup and save only after `Complete()`.
+
+## W3-C2 runtime integration checkpoint (2026-07-13)
+
+C2 now closes the runtime half of the accepted port map. The generic
+single-flight cache has checked ready insertion and a deterministic ready-only
+snapshot at `src/vt/cuda/nvfp4_plan_cache.h:147-208`. The CUDA dispatcher builds
+real runtime/driver/GPU/CUTLASS/tactic metadata, imports FlashInfer before
+native plans, translates tactic IDs into executable candidate/workspace plans,
+publishes them before the dummy request, applies the resolved 5,000-us default
+to misses, rejects a frozen miss before any tuning, snapshots/saves only after
+a successful warmup and exposes mode/path/fingerprint/loaded/rejected/saved plus
+the complete selected-plan map. CMake hashes the exact tactic/dispatcher ABI
+sources so an implementation edit invalidates the default namespace even in a
+source archive or dirty build. `LoadedEngine` passes its real device ordinal at
+`src/vllm/entrypoints/model_loader.cpp:243`.
+
+CPU source-contract coverage is now **7/7 cases, 189/189 assertions** in each
+of Release, ASan+UBSan and TSan (TSan under the already-recorded ASLR-disabled
+launcher). CUDA 13.0.88/sm_121a/CUTLASS 4.5 compiles cleanly. The existing
+focused CUDA binary passes **20/20, 26,874/26,874**; the new frozen-import case
+passes **20/20** with 64/64 loaded, zero tuning, capture/replay and a fail-closed
+uncovered shape; the cancelled/completed lifecycle case passes **14/14** and
+proves no file before `Complete()` versus five atomically saved plans after it.
+The loaded-map compute-sanitizer rerun reports **0 errors**. Its first command
+was command-invalid because non-interactive SSH did not put
+`compute-sanitizer` on `PATH`; the exact absolute-path rerun is the result.
+
+The real 27B default and `VT_FP4_DIRECT_SF=0` gates each pass **235/235
+assertions + 16/16 vLLM tokens** under one immutable read-only fixture. Both
+logs report the same metadata fingerprint `330e0b811014741f`, the same 64/64
+selected IDs and **0 tuned / 0 rejected / 0 saved**. Staging evidence is
+`~/work/vllm.cpp-nvfp4-persistent-c2-staging/evidence`; default/fallback/runtime/
+save log SHA-256 values are `a29ebbee...cf2`, `dcdc0bcd...342`,
+`a5f65a6e...9c68` and `35982886...f02`.
+
+Two complete current CPU attempts are **FAILED at 102/103** only because the
+unchanged `test_capi` early-stop case intermittently observes one callback
+delta rather than two. The old baseline binary reproduces the same failure
+after five isolated passes; the C2-relevant implementation diff does not touch
+C API/engine/executor sources. The remaining suite passes **102/102**, and the
+current C-API test passes an isolated rerun. This is recorded as a pre-existing
+flake, not rewritten into 103/103 and not attributed to W3-C2.
+
+C2 changes no accepted performance ratio: immutable `3f256ab` remains 55/124.
+W3-C3 must now run from the pushed commit, prove the same 64/64 map in six fresh
+processes, establish 6/6 paired long-output equality, and execute the frozen
+c2/c16 all-axis component before any exact grid. No 35B performance run is
+authorized.
 
 ## Cache schema, identity and lifecycle
 
@@ -335,8 +383,8 @@ and 11,947 bytes.
 |---|---|---|
 | W3-C0 | whole-chain v0.25/dependency/runtime audit, exact cache fixture contract, files/tests/gates | **complete in this spike** |
 | W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | **complete: Release/ASan+UBSan/TSan 6/6 + 174/174; full CPU 103/103** |
-| W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | `READY` |
-| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | blocked on C2 |
+| W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | **complete: CPU/sanitizers + CUDA runtime/save/memcheck + both frozen 27B arms pass** |
+| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | `READY` after pushed C2 checkpoint |
 | W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | blocked on C3 acceptance |
 
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and

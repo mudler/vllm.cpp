@@ -12,8 +12,9 @@ cache-off every-axis result and paired trace; strict parity remains failed at
 then W3-E direct swizzled activation scales reaches implementation,
 correctness, sanitizer and structural-trace gates; immutable `53ab149` c2/c16
 A/B strict-fails at 32/40 timing + 6/8 memory; the post-failure scan promotes
-v0.25 persistent/frozen FP4 tactic caching to W3-C; C1 document/import tests
-pass while C2 runtime integration and same-plan performance remain `PENDING`).
+v0.25 persistent/frozen FP4 tactic caching to W3-C; C2 runtime integration and
+frozen-map correctness pass while fresh-process/same-plan performance remains
+`PENDING`).
 
 The official v0.25.0 tag is `702f4814fe54fabff350d43cb753ae3e47c0c276`.
 Of its advertised 558 commits, 413 were already ancestors of our
@@ -32,12 +33,17 @@ the completed every-axis component fails, so no performance number is accepted.
 The subsequent execution audit corrects a v0.24-era assumption: the binding
 v0.25 log loads 64 persistent FlashInfer FP4 configs and reports a config-file
 hit. Ours retuned each W3-E process and shared only 18--33/64 paired tactic IDs.
-W3-C is therefore spiked as mandatory benchmark-reproduction control. It has
-no accepted number. C1's CUDA-free cache layer now passes focused Release,
-ASan+UBSan and TSan at **6/6 cases + 174/174 assertions** each and a fresh full
-CPU suite at **103/103**; all 64 binding oracle plans import exactly. C2 runtime
-publication, stable 64/64 fresh-process plans, same-plan output hashes,
-component axes and any conditional exact grid are all **PENDING**.
+W3-C is therefore mandatory benchmark-reproduction control, not speed credit.
+C2 now publishes loaded plans into the live ready map before warmup, freezes
+misses, uses the 5,000-us miss ABI and saves only successful warmups. The exact
+fixture loads **64/64 with 0 tuned / 0 rejected / 0 saved**, cache-hit capture
+and save/cancel lifecycle tests pass, compute-sanitizer reports **0 errors**,
+and frozen default/fallback 27B each pass **235/235 + 16/16**. Focused Release,
+ASan+UBSan and TSan pass **7/7 + 189/189**. Two current full CPU attempts are
+**102/103 FAILED** on the unchanged C-API early-stop timing flake; an older
+baseline binary reproduces it, while the remaining **102/102** and an isolated
+C-API rerun pass. Stable six-process evidence, same-plan output hashes,
+component axes and any conditional exact grid remain **PENDING**.
 
 The current binding result is the immutable clean
 `3f256abdbb558e162bf8a2196284deb119648560` 27B campaign against executable
@@ -276,8 +282,9 @@ recorded as non-path evidence and the frozen oracle was not mutated.
 
 Next: do not run the conditional W3-E exact grid; its component failed. The
 completed scan selects W3-C persistent/frozen plan parity as the next bounded
-control. Implement and gate it, require identical 64/64 plans and a same-plan
-c2/c16 component, then run an exact grid only after every component axis passes.
+control. C2 implementation/correctness is complete; require identical 64/64
+plans across six fresh processes and a same-plan c2/c16 component, then run an
+exact grid only after every component axis passes.
 Every 27B throughput, latency and memory axis must pass before 35B performance;
 broader roadmap work, including DSpark, remains queued behind speed parity.
 Detailed release classification:
@@ -288,11 +295,11 @@ Detailed release classification:
 | Track | Disposition | Evidence now | Next binding gate |
 |---|---|---|---|
 | `SERVE-STREAM-USAGE` | **PENDING — GATING** | Completion and chat parse `stream_options`, emit final/continuous usage from native token IDs, validate non-stream requests, and expose force-usage mode. CPU/sanitizer gates pass. At `31d053f`, all 2,016 standard timed 27B requests across three complete paired ladders retained exact native 128-token counts, closing the prior missing-usage symptom; this does not close its performance/A-B gate. | Complete the serialization A/B and fresh 27B+35B every-axis campaigns after the online hot-path gap is repaired. |
-| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124** | Immutable `3f256ab` remains **55/124**. W3-E removes 624 swizzles but strict-fails **32/40 timing + 6/8 memory**. Binding v0.25 loads 64 persistent plans while ours is tactic-unstable. W3-C C1 implements native/import JSON, metadata/tactic validation, merge, atomic replace and path/frozen options; Release/ASan+UBSan/TSan **6/6 + 174/174**, full CPU **103/103**, exact oracle import **64/64**. This code is not wired to serving, so no ratio changes. The 35B correctness-only inertness gate ran; no 35B performance run occurred. | Implement C2 ready-map/startup/load-save integration and 5,000-us miss timing; then require 64/64 identical fresh-process plans and same-plan c2/c16 every-axis acceptance before any exact grid. 35B performance remains held. |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING — `3f256ab` BINDS 55/124** | Immutable `3f256ab` remains **55/124**. W3-E strict-fails **32/40 timing + 6/8 memory**. W3-C C2 now loads/publishes the exact v0.25 map before serving: frozen default/fallback 27B each pass **235/235 + 16/16**, with **64/64 loaded, 0 tuned/rejected/saved** and identical metadata/map diagnostics. No serving performance command ran, so ratios remain unchanged. The 35B correctness-only inertness gate is historical; no 35B performance run occurred. | Run the commit-bound six-process 64/64 stability gate and frozen same-plan c2/c16 every-axis component before any exact grid. 35B performance remains held. |
 | `SERVE-ASYNC-LLM` HTTP capacity | **GPU-CLASSIFIED — HEALTHY / STEADY-STATE NEUTRAL; ROW GATING** | Production replaces cpp-httplib's racy 19→76 dynamic pool with a fixed **`max_num_seqs + 4`** floor (36 workers at c32); `VLLM_CPP_HTTP_FIXED_POOL=0` selects the legacy arm in the same binary. The c32 fixed/legacy AB/BA/AB means are **1097.031/1097.290 tok/s = 0.999764×**, with **0.541%/0.311% CV** and 8/20 fixed axes. All **1,152/1,152** requests and six memory returns pass; neither arm reproduces the rare historical stall. The fresh exact fixed ladder completes all three c32 legs without a queued/unread socket and narrows the current c32 oracle ratio to 0.9910×. Fixed/legacy mean GPU peaks are **39,198/38,993 MiB**; fixed PSS/RSS are slightly lower. CPU evidence remains Release/help, API **100/100**, ASan+UBSan **1/1**, and TSan **1/1**. Summary/artifact hashes are `3ce27a16…18ee9` / `27bc7f7d…53df6d`. | The bounded A/B proves no steady-state speed win and did not sample the legacy rare tail, so the broader row remains `GATING`. No more HTTP tuning is inferred: repair the confirmed FP4 path and use the exact full-grid gate to classify the remaining performance gap. |
 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | **PENDING — SOURCE/CONFIG AUDIT COMPLETE; NO NUMBER ACCEPTED** | The cited recipe at `03253ef` withdraws its original 10--40x claim because it compared identical-prefix SGLang cache-on with vLLM cache-off. Its residual 35B-only cache-on cells report SGLang/vLLM 0.23.1 output throughput of **324.4/261.6** at 64k/c32, **85.3/63.8** at 256k/c2 and **133.8/92.6** at 256k/c8, but only 1--2 runs. They do not bind: vLLM 0.25 cache-on is absent; the checked-in arms mismatch BF16/FP8 KV, capacity and MTP frontend; and token-ID correctness, full axes, hit/no-eviction proof, memory and paired traces are missing. Cache-off data slightly favors vLLM and corroborates that the huge gap was configuration. | Distinct row/spike now pins SGLang v0.5.15 `f63458b` and specifies exact BF16/no-spec 64k and 256k reset→seed→timed-branch workloads, vLLM explicit `mamba_cache_mode=align`, native hit/eviction counters, equal byte capacity, three reps, full latency/throughput/memory axes and paired traces. Implement PX1/PX2 plus `KV-MAMBA-ALIGN` after the priority 27B cache-off closure; the faster equivalent reference binds per axis, 27B before 35B. |
 | `KV-EXTERNAL-CACHE` / LMCache | **ROADMAP INVENTORY — NOT BENCHMARKED** | Pinned vLLM's config roles, scheduler/worker connector lifecycle, dynamic module override, load-failure policy and built-in LMCache MP/in-process connectors are now explicit source inventory, along with the official LMCache shared-prefix quickstart. vllm.cpp has no connector ABI or LMCache execution path yet, so no hit rate, TTFT, transfer-throughput, memory or reliability result exists. | Write the full spike, port a deterministic fake-provider conformance seam, then gate LMCache MP two-engine store/retrieve and Qwen3.6 hybrid behavior before the in-process leaf. Required axes: token correctness, hit/recompute behavior, TTFT, transfer GB/s, host/GPU memory, failures and metrics. |
-| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — W3-C1 IMPLEMENTED/GATED; C2 + BENCHMARK PENDING** | W3-E remains strict-failed. W3-C1 adds the CUDA-free pure-C++ cache document/import layer at `nvfp4_persistent_cache.{h,cpp}` plus the immutable 64-plan fixture. It covers native round-trip/merge, exact FlashInfer tuple keys, metadata/layout/dtype/device/tactic rejection, environment/frozen paths and same-directory atomic publication. Release, ASan+UBSan and TSan each pass **6/6 + 174/174**; corrected full CPU is **103/103**. The initial full run was **101/103 FAILED** because the fixture sat under op-golden discovery; relocation to `tests/fixtures` and a fresh rerun close it. No CUDA/model/performance command ran; `3f256ab` remains 55/124. | Implement C2 ready-map snapshot/import, resolved 5,000-us timing, lifecycle/stats and load-before-warmup/save-after-complete. Then run six-process 64/64 and same-plan gates; exact grid/35B performance remain held. |
+| `KERNEL-GEMM-NVFP4-W4A4` small-M dispatch | **ACTIVE — W3-C2 IMPLEMENTED/CORRECTNESS-GATED; C3 PERFORMANCE PENDING** | Ready-map import/snapshot, source-hashed build identity, real CUDA metadata, loaded-plan priority, resolved 5,000-us timing, frozen misses, lifecycle stats and load-before-warmup/save-after-complete are wired. Release/ASan+UBSan/TSan **7/7 + 189/189**; CUDA focused **20/20 + 26,874/26,874**, frozen runtime **20/20**, save lifecycle **14/14**, memcheck **0 errors**, and both 27B arms **235/235 + 16/16**. Full CPU is **102/103 FAILED** only on the baseline-reproduced C-API timing flake; other 102/102 pass. No performance ratio changes; `3f256ab` remains 55/124. | Run commit-bound six-process 64/64 stability, 6/6 long-output equality and frozen same-plan c2/c16 component. Exact grid/35B performance remain held. |
 | `KERNEL-EW-NORM-QUANT` | **PARTIAL — FALSE TRACE-NAME LEVER REFUTED** | vLLM's 127,040 long-named kernels stop after residual-add + RMSNorm to BF16; a separate `scaled_fp4_quant.out`/`cvt_fp16_to_fp4` follows, matching our two-kernel topology. `fuse_norm_quant` is false. Existing FP8 fusion remains gated and historical byte-exact/neutral `76e9047` stays shelved. | No spike/implementation is promoted from this trace. Revisit only if a future body/dispatch difference or surpass-track measurement justifies it independently. |
 | `KERNEL-GDN-AOT-BF16` 27B output dtype | **27B DEFAULT / CORRECTNESS-GREEN; STRICT GATE OPEN** | The BF16 `chunk_o` path carries the 27B recurrence output, z projection and gated-norm weight by default, matching vLLM and restoring the native 16/16 stream; `VT_GDN_OUT_BF16=0` restores f32 and every 35B path retains f32. Its BF16/f32 component remains **1.007989×**, **16/20** timing and **2/4** memory. Binding `3f256ab` has c16 total throughput **1.027889×** but normalized mean TPOT/ITL **0.987450×**. Cross-profiler GDN totals remain diagnostic only; no new GDN lever is selected yet. | Keep correctness-faithful BF16 for 27B and retain the row `ACTIVE`; revisit only after body-level residual ranking. Do not infer any 35B result. |
 | `KV-DEVICE-RESIDENCY` | **ACTIVE — W0+W1 A/B/TRACE/CORRECTNESS PASS; ZERO-LEAK FAIL** | W0/W1 same-binary gains, copy reduction and correctness/safety evidence remain valid. Inherited pools still fail strict teardown (27B **47,290,056 B/101**, 35B **36,822,413,188 B/1,236**); old-oracle host-memory ratios are historical. | Keep W2 scoped until the v0.25.0 grid re-ranks the residual; separately repair model/pool/queue teardown. |

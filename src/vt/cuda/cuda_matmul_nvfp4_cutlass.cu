@@ -8,7 +8,7 @@
 // This TU owns vt::Tensor validation/registration, exact hybrid-bucket tuning,
 // high-water workspace reuse, forced-tactic diagnostics and scale swizzling.
 // W3 mirrors FlashInfer's eager autotune timing window: after three warmups,
-// synchronize the stream and enqueue a one-thread 1 ms GPU delay before the
+// synchronize the stream and enqueue a one-thread 5 ms GPU delay before the
 // start event so host dispatch latency cannot bias near-tied tactic choices.
 
 #include <cuda_bf16.h>
@@ -20,18 +20,30 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_cutlass_tactics.h"
+#include "vt/cuda/nvfp4_persistent_cache.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/ops.h"
+
+#ifndef VT_CUTLASS_VERSION_STRING
+#define VT_CUTLASS_VERSION_STRING "unknown"
+#endif
+
+#ifndef VT_NVFP4_CACHE_BUILD_ID
+#define VT_NVFP4_CACHE_BUILD_ID "unknown"
+#endif
 
 namespace vt::cuda {
 namespace {
@@ -45,6 +57,12 @@ std::atomic<uint64_t> g_fp4_warmup_scopes_completed{0};
 std::atomic<uint64_t> g_fp4_warmup_profiles_requested{0};
 std::atomic<uint64_t> g_fp4_warmup_profiles_tuned{0};
 std::atomic<uint64_t> g_fp4_lazy_misses{0};
+std::atomic<uint64_t> g_fp4_profiles_loaded{0};
+std::atomic<uint64_t> g_fp4_cache_documents_rejected{0};
+std::atomic<uint64_t> g_fp4_profiles_saved{0};
+std::atomic<uint32_t> g_fp4_autotune_delay_microseconds{
+    nvfp4::kFlashInferDelayMicroseconds};
+std::atomic<bool> g_fp4_persistent_read_only{false};
 
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -149,14 +167,6 @@ bool Fp4AutotuneVerbose() {
   static const bool on = [] {
     const char* value = std::getenv("VT_FP4_AUTOTUNE_VERBOSE");
     return value != nullptr && value[0] == '1';
-  }();
-  return on;
-}
-
-bool Fp4AutotuneDelayEnabled() {
-  static const bool on = [] {
-    const char* value = std::getenv("VT_FP4_AUTOTUNE_DELAY");
-    return value == nullptr || value[0] != '0';
   }();
   return on;
 }
@@ -302,8 +312,6 @@ __global__ void Fp4AutotuneDelayStreamKernel(long long delay_microseconds) {
   for (long long i = 0; i < delay_microseconds; ++i) __nanosleep(1000);
 }
 
-constexpr long long kFp4AutotuneDelayMicroseconds = 1000;
-
 float TimeCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams params,
                     WorkspaceLease workspace, size_t workspace_bytes) {
   constexpr int kWarmupIterations = 3;
@@ -316,14 +324,16 @@ float TimeCandidate(const nvfp4::Candidate& candidate, nvfp4::LaunchParams param
     }
     Check(cudaEventCreate(&begin), "autotune event create begin");
     Check(cudaEventCreate(&end), "autotune event create end");
-    if (Fp4AutotuneDelayEnabled()) {
+    const uint32_t delay_microseconds =
+        g_fp4_autotune_delay_microseconds.load(std::memory_order_acquire);
+    if (delay_microseconds != 0) {
       // FlashInfer synchronizes before its delay launch. Without this boundary,
       // rapid host enqueue can systematically favor a different near-tied
       // tactic family even though CUDA events exclude the warmup kernels.
       Check(cudaStreamSynchronize(params.stream),
             "autotune pre-profile stream synchronize");
       Fp4AutotuneDelayStreamKernel<<<1, 1, 0, params.stream>>>(
-          kFp4AutotuneDelayMicroseconds);
+          static_cast<long long>(delay_microseconds));
       Check(cudaGetLastError(), "autotune delay kernel launch");
     }
     Check(cudaEventRecord(begin, params.stream), "autotune event record begin");
@@ -358,6 +368,314 @@ SelectedPlanCache& PlanCache() {
   return plans;
 }
 
+struct PersistentRuntimeSession {
+  nvfp4::PersistentCacheMetadata metadata;
+  nvfp4::PersistentCacheOptions options;
+  nvfp4::PersistentCacheDocument prior_native;
+  bool enabled = false;
+  bool save_allowed = true;
+};
+
+struct PersistentRuntimeDiagnostics {
+  bool enabled = false;
+  bool read_only = false;
+  uint32_t delay_microseconds = nvfp4::kFlashInferDelayMicroseconds;
+  std::string mode = "not-prepared";
+  std::string native_path;
+  std::string flashinfer_path;
+  std::string metadata_fingerprint;
+  std::vector<Nvfp4AutotuneSelectedPlan> selected_plans;
+};
+
+std::mutex g_fp4_persistent_mutex;
+std::optional<PersistentRuntimeSession> g_fp4_persistent_session;
+PersistentRuntimeDiagnostics g_fp4_persistent_diagnostics;
+
+std::string FormatCudaVersion(int version) {
+  const int major = version / 1000;
+  const int minor = (version % 1000) / 10;
+  const int patch = version % 10;
+  std::string result = std::to_string(major) + "." + std::to_string(minor);
+  if (patch != 0) result += "." + std::to_string(patch);
+  return result;
+}
+
+nvfp4::PersistentCacheMetadata MakePersistentMetadata(int device_ordinal) {
+  int runtime_version = 0;
+  int driver_version = 0;
+  cudaDeviceProp properties{};
+  Check(cudaRuntimeGetVersion(&runtime_version), "query CUDA runtime version");
+  Check(cudaDriverGetVersion(&driver_version), "query CUDA driver version");
+  Check(cudaGetDeviceProperties(&properties, device_ordinal),
+        "query device properties for persistent cache");
+
+  nvfp4::PersistentCacheMetadata metadata;
+  metadata.cuda_runtime = FormatCudaVersion(runtime_version);
+  metadata.cuda_driver = FormatCudaVersion(driver_version);
+  metadata.cutlass_version = VT_CUTLASS_VERSION_STRING;
+  metadata.gpu = properties.name;
+  metadata.device_ordinal = device_ordinal;
+  metadata.architecture = Fp4DeviceArchitecture(device_ordinal);
+  metadata.output_dtype = Name(DType::kBF16);
+  metadata.output_dtype_id = static_cast<uint8_t>(DType::kBF16);
+  metadata.tactic_descriptor_digest = nvfp4::Nvfp4TacticDescriptorDigest();
+  metadata.build_id = VT_NVFP4_CACHE_BUILD_ID;
+  return metadata;
+}
+
+nvfp4::FlashInferImportTarget MakeFlashInferImportTarget(
+    const nvfp4::PersistentCacheMetadata& metadata) {
+  nvfp4::FlashInferImportTarget target;
+  // This seam intentionally accepts the exact dependency environment that
+  // produced the binding vLLM v0.25.0 denominator. Native vllm.cpp caches use
+  // the live CUDA/CUTLASS/build identity above.
+  target.expected_metadata = nvfp4::FlashInferCacheMetadata{
+      "0.6.13", metadata.cuda_runtime, "13.1.0", "91900", "1.26.0",
+      metadata.gpu};
+  target.device_ordinal = metadata.device_ordinal;
+  target.architecture = metadata.architecture;
+  target.output_dtype = metadata.output_dtype_id;
+  target.tactic_set_version = metadata.tactic_set_version;
+  target.fp4_layout = metadata.fp4_layout;
+  target.scale_layout = metadata.scale_layout;
+  return target;
+}
+
+std::vector<std::pair<nvfp4::PlanKey, SelectedPlan>> PreparePersistentPlans(
+    const std::vector<nvfp4::PersistentPlan>& plans) {
+  const auto& candidates = FullCandidates();
+  std::vector<std::pair<nvfp4::PlanKey, SelectedPlan>> prepared;
+  prepared.reserve(plans.size());
+  for (const nvfp4::PersistentPlan& plan : plans) {
+    const int index = CandidateIndexForId(candidates, plan.tactic_id);
+    if (index < 0) {
+      throw std::runtime_error(
+          "NVFP4 persistent tactic is absent from the active tactic ABI");
+    }
+    nvfp4::LaunchParams params;
+    params.m = static_cast<int>(plan.key.m_bucket);
+    params.n = plan.key.n;
+    params.k = plan.key.k;
+    const size_t workspace_bytes = WorkspaceHighWater(candidates, params);
+    prepared.emplace_back(
+        plan.key, SelectedPlan{index, plan.tactic_id, workspace_bytes});
+  }
+  return prepared;
+}
+
+uint64_t InstallPersistentPlans(
+    const std::vector<nvfp4::PersistentPlan>& plans) {
+  const auto prepared = PreparePersistentPlans(plans);
+  uint64_t installed = 0;
+  for (const auto& [key, plan] : prepared) {
+    if (PlanCache().InsertReadyIfAbsent(key, plan)) ++installed;
+  }
+  g_fp4_profiles_loaded.fetch_add(installed, std::memory_order_relaxed);
+  return installed;
+}
+
+std::vector<nvfp4::PersistentPlan> SnapshotPersistentPlans(
+    const nvfp4::PersistentCacheMetadata& metadata) {
+  std::vector<nvfp4::PersistentPlan> result;
+  for (const auto& [key, selected] : PlanCache().SnapshotReady()) {
+    if (key.device_ordinal != metadata.device_ordinal ||
+        key.architecture != metadata.architecture ||
+        key.output_dtype != metadata.output_dtype_id ||
+        key.tactic_set_version != metadata.tactic_set_version) {
+      continue;
+    }
+    const int index = CandidateIndexForId(FullCandidates(), selected.tactic_id);
+    if (index < 0 || index != selected.candidate_index) {
+      throw std::runtime_error(
+          "NVFP4 ready plan does not match the persistent tactic ABI");
+    }
+    nvfp4::PersistentPlan plan;
+    plan.key = key;
+    plan.fp4_layout = metadata.fp4_layout;
+    plan.scale_layout = metadata.scale_layout;
+    plan.tactic_id = selected.tactic_id;
+    result.push_back(std::move(plan));
+  }
+  return result;
+}
+
+std::vector<Nvfp4AutotuneSelectedPlan> MakeSelectedPlanDiagnostics(
+    const std::vector<nvfp4::PersistentPlan>& plans) {
+  std::vector<Nvfp4AutotuneSelectedPlan> result;
+  result.reserve(plans.size());
+  for (const nvfp4::PersistentPlan& plan : plans) {
+    result.push_back(Nvfp4AutotuneSelectedPlan{
+        plan.key.m_bucket, plan.key.n, plan.key.k, plan.tactic_id});
+  }
+  return result;
+}
+
+bool PathExists(const std::filesystem::path& path) {
+  if (path.empty()) return false;
+  std::error_code error;
+  const bool exists = std::filesystem::exists(path, error);
+  if (error) {
+    throw std::runtime_error("could not inspect NVFP4 cache path: " +
+                             path.string());
+  }
+  return exists;
+}
+
+bool BeginPersistentRuntime(int device_ordinal) {
+  std::lock_guard<std::mutex> lock(g_fp4_persistent_mutex);
+  if (g_fp4_persistent_session.has_value()) {
+    throw std::logic_error("overlapping NVFP4 persistent-cache sessions");
+  }
+
+  PersistentRuntimeSession session;
+  session.metadata = MakePersistentMetadata(device_ordinal);
+  session.options = nvfp4::ResolvePersistentCacheOptions(session.metadata);
+  session.metadata.delay_microseconds = session.options.delay_microseconds;
+  session.enabled = session.options.enabled;
+
+  g_fp4_autotune_delay_microseconds.store(
+      session.options.delay_microseconds, std::memory_order_release);
+  g_fp4_persistent_read_only.store(
+      session.enabled && session.options.read_only, std::memory_order_release);
+
+  PersistentRuntimeDiagnostics diagnostics;
+  diagnostics.enabled = session.enabled;
+  diagnostics.read_only = session.enabled && session.options.read_only;
+  diagnostics.delay_microseconds = session.options.delay_microseconds;
+  diagnostics.mode = !session.enabled
+                         ? "disabled"
+                         : (session.options.read_only ? "read-only"
+                                                      : "read-write");
+  diagnostics.native_path = session.options.native_path.string();
+  diagnostics.flashinfer_path = session.options.flashinfer_path.string();
+  diagnostics.metadata_fingerprint =
+      nvfp4::PersistentCacheMetadataFingerprint(session.metadata);
+
+  uint64_t flashinfer_loaded = 0;
+  uint64_t native_loaded = 0;
+  if (session.enabled && !session.options.flashinfer_path.empty()) {
+    try {
+      const nvfp4::FlashInferImportResult imported =
+          nvfp4::LoadFlashInferCache(session.options.flashinfer_path,
+                                     MakeFlashInferImportTarget(session.metadata));
+      flashinfer_loaded = InstallPersistentPlans(imported.plans);
+    } catch (...) {
+      g_fp4_cache_documents_rejected.fetch_add(1, std::memory_order_relaxed);
+      g_fp4_persistent_read_only.store(false, std::memory_order_release);
+      throw;
+    }
+  }
+
+  session.prior_native.metadata = session.metadata;
+  if (session.enabled && PathExists(session.options.native_path)) {
+    try {
+      session.prior_native = nvfp4::LoadNativeCache(
+          session.options.native_path, session.metadata);
+      native_loaded = InstallPersistentPlans(session.prior_native.plans);
+    } catch (const std::exception& error) {
+      g_fp4_cache_documents_rejected.fetch_add(1, std::memory_order_relaxed);
+      if (session.options.read_only &&
+          session.options.flashinfer_path.empty()) {
+        g_fp4_persistent_read_only.store(false, std::memory_order_release);
+        throw;
+      }
+      session.save_allowed = false;
+      diagnostics.mode = session.options.read_only
+                             ? "read-only-native-rejected"
+                             : "read-write-native-rejected";
+      std::fprintf(stderr,
+                   "[VT_FP4_CACHE] rejected native cache path=%s error=%s; "
+                   "%s\n",
+                   session.options.native_path.string().c_str(), error.what(),
+                   session.options.read_only
+                       ? "using the explicit imported map; frozen misses fail"
+                       : "tuning misses without overwriting it");
+    }
+  }
+
+  const std::vector<nvfp4::PersistentPlan> selected =
+      SnapshotPersistentPlans(session.metadata);
+  diagnostics.selected_plans = MakeSelectedPlanDiagnostics(selected);
+  g_fp4_persistent_diagnostics = std::move(diagnostics);
+  g_fp4_persistent_session.emplace(std::move(session));
+
+  std::fprintf(stderr,
+               "[VT_FP4_CACHE] prepared mode=%s native=%s flashinfer=%s "
+               "loaded=%llu (flashinfer=%llu native=%llu) rejected=%llu "
+               "delay_us=%u metadata=%s selected=%zu\n",
+               g_fp4_persistent_diagnostics.mode.c_str(),
+               g_fp4_persistent_diagnostics.native_path.c_str(),
+               g_fp4_persistent_diagnostics.flashinfer_path.c_str(),
+               static_cast<unsigned long long>(flashinfer_loaded + native_loaded),
+               static_cast<unsigned long long>(flashinfer_loaded),
+               static_cast<unsigned long long>(native_loaded),
+               static_cast<unsigned long long>(
+                   g_fp4_cache_documents_rejected.load(std::memory_order_relaxed)),
+               g_fp4_persistent_diagnostics.delay_microseconds,
+               g_fp4_persistent_diagnostics.metadata_fingerprint.c_str(),
+               g_fp4_persistent_diagnostics.selected_plans.size());
+  return true;
+}
+
+void CompletePersistentRuntime() {
+  std::lock_guard<std::mutex> lock(g_fp4_persistent_mutex);
+  if (!g_fp4_persistent_session.has_value()) return;
+  PersistentRuntimeSession& session = *g_fp4_persistent_session;
+  const std::vector<nvfp4::PersistentPlan> selected =
+      SnapshotPersistentPlans(session.metadata);
+  g_fp4_persistent_diagnostics.selected_plans =
+      MakeSelectedPlanDiagnostics(selected);
+
+  if (session.enabled && !session.options.read_only &&
+      session.save_allowed && !session.options.native_path.empty()) {
+    nvfp4::PersistentCacheDocument current;
+    current.metadata = session.metadata;
+    current.plans = selected;
+    const nvfp4::PersistentCacheDocument merged =
+        nvfp4::MergeNativeCaches(session.prior_native, current);
+    try {
+      nvfp4::WriteNativeCacheAtomically(session.options.native_path, merged);
+      g_fp4_profiles_saved.fetch_add(merged.plans.size(),
+                                     std::memory_order_relaxed);
+    } catch (const std::exception& error) {
+      g_fp4_persistent_diagnostics.mode = "read-write-save-failed";
+      std::fprintf(stderr,
+                   "[VT_FP4_CACHE] could not publish native cache path=%s "
+                   "error=%s; serving with the in-memory ready map\n",
+                   session.options.native_path.string().c_str(), error.what());
+    }
+  }
+
+  std::fprintf(stderr,
+               "[VT_FP4_CACHE] complete mode=%s loaded=%llu tuned=%llu "
+               "rejected=%llu saved=%llu selected=%zu metadata=%s\n",
+               g_fp4_persistent_diagnostics.mode.c_str(),
+               static_cast<unsigned long long>(
+                   g_fp4_profiles_loaded.load(std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_fp4_cache_documents_rejected.load(std::memory_order_relaxed)),
+               static_cast<unsigned long long>(
+                   g_fp4_profiles_saved.load(std::memory_order_relaxed)),
+               g_fp4_persistent_diagnostics.selected_plans.size(),
+               g_fp4_persistent_diagnostics.metadata_fingerprint.c_str());
+  for (const Nvfp4AutotuneSelectedPlan& plan :
+       g_fp4_persistent_diagnostics.selected_plans) {
+    std::fprintf(stderr,
+                 "[VT_FP4_CACHE] selected M=%u N=%d K=%d tactic=%d\n",
+                 plan.m_bucket, plan.n, plan.k, plan.tactic_id);
+  }
+}
+
+void EndPersistentRuntime(bool keep_frozen_mode) {
+  std::lock_guard<std::mutex> lock(g_fp4_persistent_mutex);
+  g_fp4_persistent_session.reset();
+  if (!keep_frozen_mode) {
+    g_fp4_persistent_read_only.store(false, std::memory_order_release);
+  }
+}
+
 uint32_t PlanMBucket(const nvfp4::LaunchParams& params) {
   return Fp4ExactBucketsEnabled()
              ? nvfp4::HybridMBucket(static_cast<uint32_t>(params.m))
@@ -387,6 +705,14 @@ SelectedPlan ResolveSelectedPlan(nvfp4::LaunchParams params,
   if (const std::optional<SelectedPlan> ready = plans.FindReady(key);
       ready.has_value()) {
     return *ready;
+  }
+  if (g_fp4_persistent_read_only.load(std::memory_order_acquire)) {
+    std::ostringstream message;
+    message << "NVFP4 frozen persistent cache miss before readiness: M="
+            << params.m << " bucket=" << key.m_bucket << " N=" << params.n
+            << " K=" << params.k << " device=" << device_ordinal
+            << " sm=" << key.architecture;
+    throw std::runtime_error(message.str());
   }
   if (report_lazy_miss &&
       g_fp4_warmup_active_scopes.load(std::memory_order_acquire) == 0 &&
@@ -444,10 +770,11 @@ SelectedPlan ResolveSelectedPlan(nvfp4::LaunchParams params,
       if (Fp4AutotuneVerbose()) {
         std::fprintf(stderr,
                      "[VT_FP4_AUTOTUNE] set=%s M=%d(bucket=%u) N=%d K=%d device=%d sm=%d "
-                     "delay=%s -> id=%d %s (%.1f us), workspace=%zu\n",
+                     "delay_us=%u -> id=%d %s (%.1f us), workspace=%zu\n",
                      full_tactics ? "full" : "w1", params.m, key.m_bucket, params.n, params.k,
                      device_ordinal, key.architecture,
-                     Fp4AutotuneDelayEnabled() ? "1000us" : "off",
+                     g_fp4_autotune_delay_microseconds.load(
+                         std::memory_order_relaxed),
                      candidates[static_cast<size_t>(chosen)].descriptor.id,
                      candidates[static_cast<size_t>(chosen)].descriptor.name,
                      timings[static_cast<size_t>(chosen)] * 1000.0F, high_water);
@@ -657,6 +984,10 @@ Registrar g_registrar;
 
 Nvfp4AutotuneWarmupScope::Nvfp4AutotuneWarmupScope(
     uint32_t max_num_tokens)
+    : Nvfp4AutotuneWarmupScope(max_num_tokens, -1) {}
+
+Nvfp4AutotuneWarmupScope::Nvfp4AutotuneWarmupScope(
+    uint32_t max_num_tokens, int device_ordinal)
     : max_num_tokens_(max_num_tokens) {
   if (max_num_tokens == 0) {
     throw std::invalid_argument(
@@ -664,6 +995,9 @@ Nvfp4AutotuneWarmupScope::Nvfp4AutotuneWarmupScope(
   }
   if (g_fp4_warmup_max_tokens != 0) {
     throw std::logic_error("nested NVFP4 pre-serve warmup scopes are unsupported");
+  }
+  if (device_ordinal >= 0 && Fp4FullTacticsEnabled()) {
+    persistent_session_ = BeginPersistentRuntime(device_ordinal);
   }
   requested_before_ =
       g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed);
@@ -684,6 +1018,7 @@ Nvfp4AutotuneWarmupScope::~Nvfp4AutotuneWarmupScope() {
   if (!completed_) {
     g_fp4_warmup_complete.store(false, std::memory_order_release);
   }
+  if (persistent_session_) EndPersistentRuntime(completed_);
 }
 
 void Nvfp4AutotuneWarmupScope::Complete() {
@@ -700,6 +1035,7 @@ void Nvfp4AutotuneWarmupScope::Complete() {
       requested_before_;
   const uint64_t tuned =
       g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed) - tuned_before_;
+  if (persistent_session_) CompletePersistentRuntime();
   completed_ = true;
   g_fp4_warmup_scopes_completed.fetch_add(1, std::memory_order_relaxed);
   g_fp4_warmup_complete.store(true, std::memory_order_release);
@@ -712,12 +1048,34 @@ void Nvfp4AutotuneWarmupScope::Complete() {
 }
 
 Nvfp4AutotuneWarmupStats GetNvfp4AutotuneWarmupStats() {
-  return Nvfp4AutotuneWarmupStats{
-      g_fp4_warmup_scopes_started.load(std::memory_order_relaxed),
-      g_fp4_warmup_scopes_completed.load(std::memory_order_relaxed),
-      g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed),
-      g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed),
-      g_fp4_lazy_misses.load(std::memory_order_relaxed)};
+  Nvfp4AutotuneWarmupStats stats;
+  stats.scopes_started =
+      g_fp4_warmup_scopes_started.load(std::memory_order_relaxed);
+  stats.scopes_completed =
+      g_fp4_warmup_scopes_completed.load(std::memory_order_relaxed);
+  stats.profiles_requested =
+      g_fp4_warmup_profiles_requested.load(std::memory_order_relaxed);
+  stats.profiles_tuned =
+      g_fp4_warmup_profiles_tuned.load(std::memory_order_relaxed);
+  stats.lazy_misses = g_fp4_lazy_misses.load(std::memory_order_relaxed);
+  stats.profiles_loaded =
+      g_fp4_profiles_loaded.load(std::memory_order_relaxed);
+  stats.cache_documents_rejected =
+      g_fp4_cache_documents_rejected.load(std::memory_order_relaxed);
+  stats.profiles_saved =
+      g_fp4_profiles_saved.load(std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_fp4_persistent_mutex);
+  stats.delay_microseconds =
+      g_fp4_persistent_diagnostics.delay_microseconds;
+  stats.persistent_cache_enabled = g_fp4_persistent_diagnostics.enabled;
+  stats.read_only = g_fp4_persistent_diagnostics.read_only;
+  stats.mode = g_fp4_persistent_diagnostics.mode;
+  stats.native_path = g_fp4_persistent_diagnostics.native_path;
+  stats.flashinfer_path = g_fp4_persistent_diagnostics.flashinfer_path;
+  stats.metadata_fingerprint =
+      g_fp4_persistent_diagnostics.metadata_fingerprint;
+  stats.selected_plans = g_fp4_persistent_diagnostics.selected_plans;
+  return stats;
 }
 
 }  // namespace vt::cuda

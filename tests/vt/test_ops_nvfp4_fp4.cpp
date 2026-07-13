@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <random>
@@ -1655,6 +1656,229 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
   }
 
   for (void* pointer : {dx, dw, dws, da, das, dasw, dwsw, dout}) backend.Free(pointer);
+  backend.DestroyQueue(queue);
+}
+
+// Port of vLLM v0.25 kernel_warmup.py:133-213 plus FlashInfer 0.6.13's
+// user-loaded-config priority and tune_mode=False miss contract. CMake runs
+// this case alone in a fresh process against the immutable 64-plan GB10 cache.
+TEST_CASE("NVFP4 persistent runtime loads frozen plans before warmup") {
+  if (std::getenv("VT_FP4_TEST_PERSISTENT_RUNTIME") == nullptr || !HasCuda()) {
+    return;
+  }
+  const char* native_path = std::getenv("VT_FP4_AUTOTUNE_CACHE_PATH");
+  REQUIRE(native_path != nullptr);
+  std::error_code remove_error;
+  std::filesystem::remove(native_path, remove_error);
+  REQUIRE_FALSE(remove_error);
+
+  auto& backend = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = backend.CreateQueue();
+  constexpr int64_t kM = 16;
+  constexpr int64_t kN = 5120;
+  constexpr int64_t kK = 6144;
+  constexpr int64_t kMp = 128;
+  constexpr int64_t kNp = 5120;
+  constexpr int64_t kKp = 384;
+  constexpr float kAlpha = 1.0F;
+
+  void* a = backend.Alloc(static_cast<size_t>(kM * kK / 2));
+  void* a_sf = backend.Alloc(static_cast<size_t>(kMp * kKp));
+  void* b = backend.Alloc(static_cast<size_t>(kN * kK / 2));
+  void* b_sf = backend.Alloc(static_cast<size_t>(kNp * kKp));
+  void* out = backend.Alloc(static_cast<size_t>(kM * kN) * sizeof(uint16_t));
+  for (const auto& [pointer, bytes] :
+       std::array<std::pair<void*, size_t>, 5>{
+           std::pair{a, static_cast<size_t>(kM * kK / 2)},
+           std::pair{a_sf, static_cast<size_t>(kMp * kKp)},
+           std::pair{b, static_cast<size_t>(kN * kK / 2)},
+           std::pair{b_sf, static_cast<size_t>(kNp * kKp)},
+           std::pair{out,
+                     static_cast<size_t>(kM * kN) * sizeof(uint16_t)}}) {
+    backend.Memset(queue, pointer, 0, bytes);
+  }
+  backend.Synchronize(queue);
+
+  Tensor ta = GpuTensor({kM, kK / 2});
+  ta.data = a;
+  ta.dtype = DType::kI8;
+  Tensor ta_sf = GpuTensor({kMp, kKp});
+  ta_sf.data = a_sf;
+  ta_sf.dtype = DType::kI8;
+  Tensor tb = GpuTensor({kN, kK / 2});
+  tb.data = b;
+  tb.dtype = DType::kI8;
+  Tensor tb_sf = GpuTensor({kNp, kKp});
+  tb_sf.data = b_sf;
+  tb_sf.dtype = DType::kI8;
+  Tensor tout = GpuTensor({kM, kN});
+  tout.data = out;
+  tout.dtype = DType::kBF16;
+
+  const vt::cuda::Nvfp4AutotuneWarmupStats before =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  {
+    vt::cuda::Nvfp4AutotuneWarmupScope warmup(
+        static_cast<uint32_t>(kM), queue.device.index);
+    const vt::cuda::Nvfp4AutotuneWarmupStats loaded =
+        vt::cuda::GetNvfp4AutotuneWarmupStats();
+    CHECK(loaded.persistent_cache_enabled);
+    CHECK(loaded.read_only);
+    CHECK(loaded.mode == "read-only");
+    CHECK(loaded.delay_microseconds == 5000);
+    CHECK(loaded.profiles_loaded == before.profiles_loaded + 64);
+    CHECK(loaded.selected_plans.size() == 64);
+    vt::MatmulNvfp4Cutlass(queue, tout, ta, ta_sf, tb, tb_sf, kAlpha);
+    warmup.Complete();
+  }
+  backend.Synchronize(queue);
+
+  const vt::cuda::Nvfp4AutotuneWarmupStats complete =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  CHECK(complete.scopes_completed == before.scopes_completed + 1);
+  CHECK(complete.profiles_requested == before.profiles_requested);
+  CHECK(complete.profiles_tuned == before.profiles_tuned);
+  CHECK(complete.profiles_saved == before.profiles_saved);
+  CHECK(complete.lazy_misses == before.lazy_misses);
+  CHECK(complete.selected_plans.size() == 64);
+  CHECK_FALSE(std::filesystem::exists(native_path));
+  bool found_binding_plan = false;
+  for (const vt::cuda::Nvfp4AutotuneSelectedPlan& plan :
+       complete.selected_plans) {
+    if (plan.m_bucket == 16 && plan.n == 5120 && plan.k == 6144) {
+      CHECK(plan.tactic_id == 0);
+      found_binding_plan = true;
+    }
+  }
+  CHECK(found_binding_plan);
+
+  Tensor ta_hit = ta;
+  ta_hit.shape[0] = 8;
+  Tensor tout_hit = tout;
+  tout_hit.shape[0] = 8;
+  backend.BeginCapture(queue);
+  vt::MatmulNvfp4Cutlass(queue, tout_hit, ta_hit, ta_sf, tb, tb_sf, kAlpha);
+  void* graph = backend.EndCaptureGraph(queue);
+  REQUIRE(graph != nullptr);
+  backend.ReplayGraph(queue, graph);
+  backend.Synchronize(queue);
+  backend.DestroyGraph(graph);
+
+  Tensor ta_miss = GpuTensor({1, 256});
+  ta_miss.data = a;
+  ta_miss.dtype = DType::kI8;
+  Tensor ta_sf_miss = GpuTensor({128, 32});
+  ta_sf_miss.data = a_sf;
+  ta_sf_miss.dtype = DType::kI8;
+  Tensor tb_miss = GpuTensor({256, 256});
+  tb_miss.data = b;
+  tb_miss.dtype = DType::kI8;
+  Tensor tb_sf_miss = GpuTensor({256, 32});
+  tb_sf_miss.data = b_sf;
+  tb_sf_miss.dtype = DType::kI8;
+  Tensor tout_miss = GpuTensor({1, 256});
+  tout_miss.data = out;
+  tout_miss.dtype = DType::kBF16;
+  CHECK_THROWS_WITH_AS(
+      vt::MatmulNvfp4Cutlass(queue, tout_miss, ta_miss, ta_sf_miss,
+                             tb_miss, tb_sf_miss, kAlpha),
+      "NVFP4 frozen persistent cache miss before readiness: M=1 bucket=1 "
+      "N=256 K=512 device=0 sm=121",
+      std::runtime_error);
+  backend.Synchronize(queue);
+  CHECK(vt::cuda::GetNvfp4AutotuneWarmupStats().lazy_misses ==
+        before.lazy_misses);
+
+  for (void* pointer : {a, a_sf, b, b_sf, out}) backend.Free(pointer);
+  backend.DestroyQueue(queue);
+}
+
+TEST_CASE("NVFP4 persistent runtime publishes only completed warmup") {
+  if (std::getenv("VT_FP4_TEST_PERSISTENT_SAVE") == nullptr || !HasCuda()) {
+    return;
+  }
+  const char* native_path = std::getenv("VT_FP4_AUTOTUNE_CACHE_PATH");
+  REQUIRE(native_path != nullptr);
+  std::error_code file_error;
+  std::filesystem::remove(native_path, file_error);
+  REQUIRE_FALSE(file_error);
+
+  auto& backend = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = backend.CreateQueue();
+  constexpr int64_t kM = 16;
+  constexpr int64_t kN = 256;
+  constexpr int64_t kK = 512;
+  constexpr int64_t kMp = 128;
+  constexpr int64_t kNp = 256;
+  constexpr int64_t kKp = 32;
+  void* a = backend.Alloc(static_cast<size_t>(kM * kK / 2));
+  void* a_sf = backend.Alloc(static_cast<size_t>(kMp * kKp));
+  void* b = backend.Alloc(static_cast<size_t>(kN * kK / 2));
+  void* b_sf = backend.Alloc(static_cast<size_t>(kNp * kKp));
+  void* out = backend.Alloc(static_cast<size_t>(kM * kN) * sizeof(uint16_t));
+  for (const auto& [pointer, bytes] :
+       std::array<std::pair<void*, size_t>, 5>{
+           std::pair{a, static_cast<size_t>(kM * kK / 2)},
+           std::pair{a_sf, static_cast<size_t>(kMp * kKp)},
+           std::pair{b, static_cast<size_t>(kN * kK / 2)},
+           std::pair{b_sf, static_cast<size_t>(kNp * kKp)},
+           std::pair{out,
+                     static_cast<size_t>(kM * kN) * sizeof(uint16_t)}}) {
+    backend.Memset(queue, pointer, 0, bytes);
+  }
+  backend.Synchronize(queue);
+
+  Tensor ta = GpuTensor({kM, kK / 2});
+  ta.data = a;
+  ta.dtype = DType::kI8;
+  Tensor ta_sf = GpuTensor({kMp, kKp});
+  ta_sf.data = a_sf;
+  ta_sf.dtype = DType::kI8;
+  Tensor tb = GpuTensor({kN, kK / 2});
+  tb.data = b;
+  tb.dtype = DType::kI8;
+  Tensor tb_sf = GpuTensor({kNp, kKp});
+  tb_sf.data = b_sf;
+  tb_sf.dtype = DType::kI8;
+  Tensor tout = GpuTensor({kM, kN});
+  tout.data = out;
+  tout.dtype = DType::kBF16;
+
+  const vt::cuda::Nvfp4AutotuneWarmupStats before =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  {
+    vt::cuda::Nvfp4AutotuneWarmupScope cancelled(
+        static_cast<uint32_t>(kM), queue.device.index);
+    vt::MatmulNvfp4Cutlass(queue, tout, ta, ta_sf, tb, tb_sf, 1.0F);
+  }
+  backend.Synchronize(queue);
+  CHECK_FALSE(std::filesystem::exists(native_path));
+  const vt::cuda::Nvfp4AutotuneWarmupStats after_cancel =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  CHECK(after_cancel.scopes_started == before.scopes_started + 1);
+  CHECK(after_cancel.scopes_completed == before.scopes_completed);
+  CHECK(after_cancel.profiles_tuned == before.profiles_tuned + 5);
+  CHECK(after_cancel.profiles_saved == before.profiles_saved);
+
+  {
+    vt::cuda::Nvfp4AutotuneWarmupScope completed(
+        static_cast<uint32_t>(kM), queue.device.index);
+    vt::MatmulNvfp4Cutlass(queue, tout, ta, ta_sf, tb, tb_sf, 1.0F);
+    completed.Complete();
+  }
+  backend.Synchronize(queue);
+  const vt::cuda::Nvfp4AutotuneWarmupStats after_complete =
+      vt::cuda::GetNvfp4AutotuneWarmupStats();
+  CHECK(after_complete.scopes_completed == before.scopes_completed + 1);
+  CHECK(after_complete.profiles_tuned == after_cancel.profiles_tuned);
+  CHECK(after_complete.profiles_saved == before.profiles_saved + 5);
+  CHECK(after_complete.selected_plans.size() == 5);
+  CHECK(std::filesystem::is_regular_file(native_path));
+  CHECK(std::filesystem::file_size(native_path) > 0);
+
+  std::filesystem::remove(native_path, file_error);
+  CHECK_FALSE(file_error);
+  for (void* pointer : {a, a_sf, b, b_sf, out}) backend.Free(pointer);
   backend.DestroyQueue(queue);
 }
 #endif  // VT_CUTLASS_NVFP4

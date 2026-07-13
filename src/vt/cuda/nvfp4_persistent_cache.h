@@ -102,6 +102,11 @@ struct PersistentCacheOptions {
 // Stable digest of the complete 0--31 local tactic ABI.
 std::string Nvfp4TacticDescriptorDigest();
 
+// Stable non-secret identity used by startup diagnostics. This fingerprints
+// every compatibility field, not the cache path or its plan contents.
+std::string PersistentCacheMetadataFingerprint(
+    const PersistentCacheMetadata& metadata);
+
 // Resolve the default cache namespace and the W3-C environment overrides.
 // Environment values are read on every call so isolated tests can exercise the
 // configuration contract in one process.

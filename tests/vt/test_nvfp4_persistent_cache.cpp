@@ -10,6 +10,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -195,6 +196,8 @@ TEST_CASE("NVFP4 persistent cache resolves deterministic modes and paths") {
         std::string::npos);
   CHECK(options.native_path.string().find("build_test-build") !=
         std::string::npos);
+  CHECK(vt::cuda::nvfp4::PersistentCacheMetadataFingerprint(metadata).size() ==
+        16);
 
   {
     ScopedEnv override("VT_FP4_AUTOTUNE_CACHE_PATH",
@@ -208,6 +211,11 @@ TEST_CASE("NVFP4 persistent cache resolves deterministic modes and paths") {
     CHECK(options.delay_microseconds == 0);
     CHECK(options.native_path == temp.path() / "override.json");
     CHECK(options.flashinfer_path == temp.path() / "flashinfer.json");
+  }
+  {
+    ScopedEnv delay_zero("VT_FP4_AUTOTUNE_DELAY_US", "0");
+    options = vt::cuda::nvfp4::ResolvePersistentCacheOptions(metadata);
+    CHECK(options.native_path.string().find("-d0-") != std::string::npos);
   }
   {
     ScopedEnv disabled("VT_FP4_PERSISTENT_CACHE", "0");
@@ -234,6 +242,70 @@ TEST_CASE("NVFP4 persistent cache resolves deterministic modes and paths") {
         "read-only NVFP4 cache requested without a cache path/root",
         std::runtime_error);
   }
+}
+
+TEST_CASE("NVFP4 ready-map import preserves live priority and snapshots deterministically") {
+  using vt::cuda::nvfp4::ResolvePlan;
+  using vt::cuda::nvfp4::SingleFlightPlanCache;
+
+  SingleFlightPlanCache<int> cache;
+  const PlanKey high{16, 5120, 17408, 0, 121, 2,
+                     vt::cuda::nvfp4::kFullTacticSetVersion};
+  const PlanKey low{1, 5120, 6144, 0, 121, 2,
+                    vt::cuda::nvfp4::kFullTacticSetVersion};
+  CHECK(cache.InsertReadyIfAbsent(high, 14));
+  CHECK(cache.InsertReadyIfAbsent(low, 4));
+  CHECK_FALSE(cache.InsertReadyIfAbsent(high, 31));
+
+  int can_tune_queries = 0;
+  int tune_calls = 0;
+  CHECK(ResolvePlan(
+            cache, high,
+            [&] {
+              ++can_tune_queries;
+              return true;
+            },
+            [&] {
+              ++tune_calls;
+              return 31;
+            }) == 14);
+  CHECK(can_tune_queries == 0);
+  CHECK(tune_calls == 0);
+
+  const auto snapshot = cache.SnapshotReady();
+  REQUIRE(snapshot.size() == 2);
+  CHECK((snapshot[0] == std::pair<PlanKey, int>{low, 4}));
+  CHECK((snapshot[1] == std::pair<PlanKey, int>{high, 14}));
+
+  const PlanKey tuning{8, 14336, 5120, 0, 121, 2,
+                       vt::cuda::nvfp4::kFullTacticSetVersion};
+  std::promise<void> started;
+  auto started_future = started.get_future();
+  std::promise<void> release;
+  auto release_future = release.get_future().share();
+  int owner_result = -1;
+  std::exception_ptr owner_error;
+  std::thread owner([&] {
+    try {
+      owner_result = ResolvePlan(cache, tuning, [] { return true; }, [&] {
+        started.set_value();
+        release_future.wait();
+        return 12;
+      });
+    } catch (...) {
+      owner_error = std::current_exception();
+    }
+  });
+  started_future.wait();
+  CHECK_THROWS_WITH_AS(
+      cache.InsertReadyIfAbsent(tuning, 7),
+      "NVFP4 persistent plan import collided with active tuning",
+      std::logic_error);
+  release.set_value();
+  owner.join();
+  CHECK(owner_error == nullptr);
+  CHECK(owner_result == 12);
+  CHECK(cache.FindReady(tuning) == std::optional<int>{12});
 }
 
 TEST_CASE("NVFP4 native cache round trips deterministically and rejects stale data") {

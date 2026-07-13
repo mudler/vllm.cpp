@@ -1,8 +1,8 @@
 # NVFP4 persistent FlashInfer-compatible plan cache (W3-C)
 
-Status: **ACTIVE; W3-C2 and six-process stability pass; W3-C3R proves the
-cross-run long-output predicate invalid and the corrected same-plan component
-is ready**
+Status: **ACTIVE owning row; W3-C implementation/reproduction control is
+complete; corrected same-plan execution strict-fails W3-E at 39/40 timing +
+1/8 memory, so C4 is blocked**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -260,6 +260,43 @@ memory observations are **NOT APPLICABLE**, immutable `3f256ab` remains
 is inventoried separately as unsupported parity breadth; it is not enabled for
 the production speed gate.
 
+## W3-C3 corrected frozen-plan component result (2026-07-13)
+
+The replacement component runs immutable runtime
+`d211b8f80fff831a712f0bfafa4f65f1abe1892d` under the corrected gate committed
+at `69a5c4538aa78716d49f544cd7ab49b4e9451957`. Evidence is
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45`.
+One uninterrupted `/tmp/gpu` lock covers both fixed model gates and all c2/c16
+AB/BA/AB legs.
+
+Both direct and `VT_FP4_DIRECT_SF=0` model gates pass **235/235 assertions +
+16/16 oracle tokens**. All **12/12** timed legs complete **612/612** requests
+with exact input/output counts and **12/12** memory returns. Every process
+loads the same frozen 64-plan document, every paired repetition has **64/64**
+equal tactic IDs, metadata and whole plan maps are identical, and logs report
+zero tuning or lazy misses. All 24 before/after cache-drop reports succeed with
+zero resident bytes after drop; temperature samples span 49--66 C; GPU, lock
+and port 8001 exit idle/free.
+
+At c2, direct/fallback mean total throughput is
+**150.992608120/150.318657387 = 1.004483480x**. All **20/20 timing** axes pass;
+only GPU peak passes memory (**1/4**). At c16, means are
+**812.541436430/808.463406765 = 1.005044173x**. Timing passes **19/20**; the
+only miss is p99 TPOT at **0.997683064x**. Memory passes **0/4**. The combined
+strict component is therefore **FAILED: 39/40 timing + 1/8 memory**. The
+memory misses are peak measurements despite successful lifecycle return, not
+leaks or a cache-drop failure. Online output hashes match 2/6 paired legs and
+remain diagnostic under the corrected production-default batch-invariance
+contract.
+
+Summary/selection/driver-log/provenance SHA-256 values are
+`3a3707cb...1249`, `6761a3a7...ef9`, `bc83594d...c4` and
+`f5b55d30...2ef`; driver SHA is `3c9c5771...e21`. This closes W3-C's scoped
+cache reproduction/control: the frozen plan map is stable and removes tactic
+selection as a confounder. It does **not** pass W3-E's all-axis performance
+gate. No exact vLLM grid or 35B performance command ran; immutable `3f256ab`
+remains binding at 55/124.
+
 ## Cache schema, identity and lifecycle
 
 ### Native schema
@@ -474,9 +511,9 @@ and 11,947 bytes.
 | W3-C0 | whole-chain v0.25/dependency/runtime audit, exact cache fixture contract, files/tests/gates | **complete in this spike** |
 | W3-C1 | CUDA-free native JSON schema, metadata/path/modes, atomic load/save/merge, FlashInfer importer and CPU/sanitizer tests | **complete: Release/ASan+UBSan/TSan 6/6 + 174/174; full CPU 103/103** |
 | W3-C2 | ready-map import/snapshot, 5,000-us timing parity, warmup lifecycle/stats and model-loader integration | **complete: CPU/sanitizers + CUDA runtime/save/memcheck + both frozen 27B arms pass** |
-| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | **PARTIAL:** six-process stability passes; first component was stopped by the now-invalid cross-run exact-text predicate and all partial performance remains void |
+| W3-C3 | fresh-process 64/64 stability, direct/fallback correctness, read-only same-plan c2/c16 component | **complete:** stability and cache-control contracts pass; the stopped predecessor remains void; corrected 12-leg execution uses identical plans and completes exact counts, but the W3-E all-axis component fails at 39/40 timing + 1/8 memory |
 | W3-C3R | fixed-plan direct/fallback localization at request/token and batch-shape boundaries; repair or evidence-backed reclassification, then complete G4 rerun | **complete:** sequential arms are 6/6 x 128 equal; each batched arm is 0/6 equal to itself sequentially; production-default vLLM is also 0/6, so cross-run equality is reclassified and the corrected G4 is ready |
-| W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | blocked on C3 acceptance |
+| W3-C4 | conditional exact v0.25 27B grid/trace and lifecycle classification | **not run / blocked:** corrected component fails W3-E's every-axis gate |
 
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and
 owning matrices in the same checkpoint. A failed component stops before the

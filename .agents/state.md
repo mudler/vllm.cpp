@@ -6218,3 +6218,44 @@ Every C3R timing/memory observation is **NOT APPLICABLE**, the stopped C3
 partial performance remains **VOID**, and immutable `3f256ab` remains binding
 at **55/124**. Corrected C3 c2/c16 is next. No exact grid or 35B performance
 command ran or is authorized before that component passes.
+
+## 2026-07-13 — corrected W3-C3 frozen-plan component completes; W3-E still fails
+
+The replacement c2/c16 component is complete from immutable runtime
+`d211b8f80fff831a712f0bfafa4f65f1abe1892d` under the corrected gate committed
+at `69a5c4538aa78716d49f544cd7ab49b4e9451957`. One uninterrupted `/tmp/gpu`
+lock covers both fixed model arms and all 12 AB/BA/AB legs. Direct and
+`VT_FP4_DIRECT_SF=0` each pass **235/235 assertions + 16/16 oracle tokens**;
+the timed series completes **612/612 requests** with exact input/output counts
+and **12/12 memory returns**.
+
+Every process loads the same frozen 64-plan document. All plan maps and
+metadata are equal, every paired repetition matches **64/64 tactic IDs**, and
+logs report zero tuning or lazy misses. All 24 before/after cache-drop reports
+succeed with zero resident bytes after drop. Thermal samples span 49--66 C;
+GPU, `/tmp/gpu` and port 8001 exit idle/free.
+
+c2 direct/fallback mean total throughput is
+**150.992608120/150.318657387 = 1.004483480x** with **20/20 timing + 1/4
+memory** axes. c16 is **812.541436430/808.463406765 = 1.005044173x** with
+**19/20 timing + 0/4 memory**. The only timing miss is c16 p99 TPOT at
+**0.997683064x**. The combined strict result is therefore **FAILED: 39/40
+timing + 1/8 memory**. Successful lifecycle return means the memory failures
+are measured peak regressions rather than leaks. Paired online output hashes
+match 2/6 and remain diagnostic under the corrected production-default
+batch-invariance contract.
+
+Evidence is
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45`.
+Summary/selection/driver-log/provenance SHA are `3a3707cb...1249`,
+`6761a3a7...ef9`, `bc83594d...c4` and `f5b55d30...2ef`; driver SHA is
+`3c9c5771...e21`.
+
+Disposition: W3-C's persistent-cache implementation and scoped reproduction
+control are complete—the frozen map removes tactic selection as a confounder.
+W3-E remains `GATING` and receives no speed credit because its every-axis
+component failed. Immutable `3f256ab` remains the binding vLLM v0.25 result at
+**55/124 pass, 69 fail**. The conditional exact grid and all 35B performance
+remain blocked. Next, attribute the direct-scale peak-memory/c16 p99-TPOT
+misses and resume the trace-grounded vLLM-vs-ours residual scan before another
+bounded component.

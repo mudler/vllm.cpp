@@ -1,7 +1,7 @@
 # NVFP4 direct swizzled activation-scale emission (W3-E)
 
-Status: **IMPLEMENTED / GATING; component strict gate FAILED (32/40 timing,
-6/8 memory)**
+Status: **IMPLEMENTED / GATING; corrected frozen-plan component strict gate
+FAILED (39/40 timing, 1/8 memory)**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -183,6 +183,24 @@ are therefore diagnostic, not a correctness predicate; the component still
 fails independently at **32/40 timing + 6/8 memory** and receives no speed
 credit. Reclassification summary SHA is `a1c500b3...41de`.
 
+The corrected same-plan rerun removes tactic selection as a confounder. It
+uses immutable runtime `d211b8f80fff831a712f0bfafa4f65f1abe1892d`, corrected
+gate `69a5c4538aa78716d49f544cd7ab49b4e9451957`, one frozen 64-plan map and one
+whole-series lock. Both fixed model gates pass **235/235 + 16/16**; all 12
+c2/c16 legs complete **612/612** requests and 12/12 memory returns. Every
+process and paired repetition uses identical 64/64 tactic IDs with zero
+tuning/misses.
+
+c2 direct/fallback mean total throughput is
+**150.992608120/150.318657387 = 1.004483480x** with **20/20 timing + 1/4
+memory**. c16 is **812.541436430/808.463406765 = 1.005044173x** with **19/20
+timing + 0/4 memory**; only p99 TPOT misses at **0.997683064x**. Therefore the
+better-controlled disposition remains **FAILED: 39/40 timing + 1/8 memory**.
+The prior 32/40 + 6/8 result remains historical only. Evidence root is
+`~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45`;
+summary/selection SHA are `3a3707cb...1249` / `6761a3a7...ef9`. W3-E receives
+no speed credit and G5 remains blocked.
+
 ### G5 — oracle grid
 
 If G1-G4 pass, run the full immutable vLLM v0.25.0 27B c1/2/4/8/16/32
@@ -214,6 +232,13 @@ contract and performs no GPU/model execution. Reproduce only the summary with:
 SUMMARY_ONLY=1 ~/work/vllm.cpp-direct-sf/53ab1492983282a9858cc301d4f7e9aad4784c48/summary-driver-corrected.sh
 ```
 
+That result is historical because plan selection was not frozen. Read-only
+inspection of the corrected component is:
+
+```sh
+ssh dgx.casa 'ROOT=~/work/vllm.cpp-nvfp4-persistent/d211b8f80fff831a712f0bfafa4f65f1abe1892d/evidence/component-ab-c2-c16-corrected-gate-69a5c45; jq . "$ROOT/summary.json"; jq "{gate_pass,all_process_plan_maps_equal,all_process_metadata_equal,paired}" "$ROOT/selection-summary.json"; sha256sum "$ROOT/summary.json" "$ROOT/selection-summary.json"'
+```
+
 ## Work breakdown
 
 | Work | Deliverable | State |
@@ -221,7 +246,7 @@ SUMMARY_ONLY=1 ~/work/vllm.cpp-direct-sf/53ab1492983282a9858cc301d4f7e9aad4784c4
 | W3-E0 | whole-chain source/body audit, upstream tests, dispatch, files and gates | **complete in this spike** |
 | W3-E1 | explicit layout API + CPU/direct CUDA normal quant + ported padded/layout tests | **complete** |
 | W3-E2 | fused producer layouts + true-W4A4 model dispatch + fallback + model tests | **complete** |
-| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | **complete; strict A/B failed at 32/40 timing + 6/8 memory** |
+| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | **complete; corrected frozen-plan A/B failed at 39/40 timing + 1/8 memory** |
 | W3-E4 | exact v0.25 27B grid/trace and lifecycle classification | **not run because E3 failed** |
 
 Any negative or neutral result is recorded honestly. A failed W3-E component

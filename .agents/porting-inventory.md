@@ -178,7 +178,7 @@ long-context uses it). T2: the rest.
 
 | Method | Upstream | Tier |
 |---|---|---|
-| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124** and W3-E strict-fails. W3-C installs exact plans before warmup, validates identity, freezes misses and mirrors 3/5,000-us/10 timing. Immutable `d211b8f` passes six fresh native-only processes with byte-identical 64/64 maps, zero tuning/misses and both 27B arms exact. C3R proves direct/fallback 6/6 x 128-token equality under identical sequential batch shape and reproduces 0/6 sequential-vs-c2 equality in both ours and production-default vLLM. The stopped partial performance remains void; corrected C3 precedes any exact grid/35B performance. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md) |
+| **NVFP4 gate slices** — ModelOpt W4A16 experts (35B) + compressed-tensors W4A4 dense (27B) | `quantization/modelopt.py`, `compressed_tensors/` | **T0 ✅ correctness/support; performance W3 ACTIVE** — existing CUDA paths remain gated; `3f256ab` binds at **55/124** and W3-E strict-fails. W3-C installs exact plans before warmup, validates identity, freezes misses and mirrors 3/5,000-us/10 timing. Immutable `d211b8f` passes six fresh native-only processes and the corrected 12-leg component with byte-identical 64/64 maps, zero tuning/misses and fixed 27B gates. C3R proves direct/fallback 6/6 x 128-token equality under identical sequential batch shape and reproduces 0/6 sequential-vs-c2 equality in both ours and production-default vLLM. Corrected W3-E gains 1.004483×/1.005044× c2/c16 mean throughput but fails **39/40 timing + 1/8 memory**. The stopped predecessor remains void; no exact grid/35B performance follows. See [W3-C spike](specs/nvfp4-persistent-plan-cache.md) |
 | **GGUF materialization** — F32/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K | **vllm.cpp deviation**: pinned vLLM has no GGUF load format; llama.cpp is the container/quant reference | **T0 🟡** loader + synthetic per-layout tests + real APEX Q3/Q4/Q5/Q6/Q8 greedy parity pass. The llama.cpp-derived CPU threadpool/chunked-op prerequisite is implemented and correctness-gated (1/3/20 full suites + TSAN), but its B4 speed/RSS gate is pending. All weights still expand to bf16; no compute-in-quant/llama.cpp speed parity. F16 is reader-only, not executable; BF16/Q2_K/IQ/TQ/Q1/MXFP4/NVFP4 execution remains open. |
 | fp8 (W8A8, e4m3) | `quantization/fp8.py`, ModelOpt | **T0 gate slice ✅ / generic T1 🟡** — 35B static per-tensor W8A8 projections are native and gated; other scale/activation/config/KV modes remain open |
 | MXFP4 / MXFP8 | `quantization/mxfp4.py`, modelopt | T1 |
@@ -388,10 +388,13 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    linear producer plus this standalone swizzle. CPU/CUDA bytes, focused
    sanitizer, 27B direct/fallback and 35B inertness gates pass; paired tracing
    removes 624 activation swizzles. Immutable `53ab149` completes all 12
-   c2/c16 component legs: direct gains 1.002108x/1.006222x mean total
-   throughput, but strict acceptance fails at 32/40 timing + 6/8 memory. No
-   conditional exact grid or 35B performance run followed; the performance row
-   remains `ACTIVE` without speed credit.
+   c2/c16 component legs, but its 32/40 timing + 6/8 memory result is
+   plan-selection-confounded. The corrected frozen-map run from runtime
+   `d211b8f` plus gate `69a5c45` completes another 12 legs with identical 64/64
+   plans: direct gains 1.004483x/1.005044x mean total throughput, but strict
+   acceptance still fails at 39/40 timing + 1/8 memory. No conditional exact
+   grid or 35B performance run followed; the performance row remains `ACTIVE`
+   without speed credit.
 
 10. **Vendored Marlin (NVFP4 W4A16 grouped-MoE GEMM — the 35B experts)**:
     `src/vt/cuda/marlin/` is a torch-free 1:1 vendor of vLLM's

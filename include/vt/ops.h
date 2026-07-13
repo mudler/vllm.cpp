@@ -61,6 +61,15 @@ enum class KernelLayout : uint8_t {
   kMarlinInterleaved,
 };
 
+// Explicit output layout for dynamic NVFP4 activation block scales. Keep this
+// separate from KernelLayout: it is an op argument which selects how a producer
+// addresses its output, not metadata inferred from a Tensor's shape. Aligned
+// linear and CUTLASS-swizzled buffers can have the same dimensions.
+enum class Fp4ScaleLayout : uint8_t {
+  kLinear = 0,
+  kCutlassSwizzled,
+};
+
 struct KernelTensorDesc {
   void* data = nullptr;
   DType storage_dtype = DType::kF32;
@@ -312,11 +321,12 @@ using MatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MatmulNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using ScaledFp4QuantFn =
-    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float, Fp4ScaleLayout);
 using SiluMulFp4QuantFn =
-    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, float,
+             Fp4ScaleLayout);
 using SiluAndMulFp4QuantFn =
-    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float);
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float, Fp4ScaleLayout);
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
@@ -511,25 +521,30 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
 // group quantizes a bf16/f32 activation [M,K] to fp4, emitting the two streams
 // the fp4xfp4 GEMM consumes:
 //   out_packed [M, K/2]  i8  low-nibble-first E2M1 (a_fp4)
-//   out_scale  [M, K/16] i8  fp8-e4m3fn block scales (a_scale_fp8, RAW — the GEMM
-//                            folds 1/input_global_scale into `alpha`)
+//   out_scale  linear [M,K/16], or CUTLASS-swizzled
+//              [round_up(M,128),round_up(K/16,4)] i8 fp8-e4m3fn block scales
+//              (a_scale_fp8, RAW — the GEMM folds 1/input_global_scale into
+//              `alpha`). The swizzled producer zeroes every padded byte.
 // `input_global_scale_inv` is the ON-DISK activation divisor (2688/amax_act) used
 // DIRECTLY. K a multiple of 16. Math = vllm cvt_warp_fp16_to_fp4 (notes §7.2) /
 // the CPU vllm::RefScaledFp4Quant. CPU + CUDA.
 void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
-                    float input_global_scale_inv);
+                    float input_global_scale_inv,
+                    Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
 
 // SiluMulFp4Quant (mirror vllm ActivationQuantFusionPass / silu_and_mul_nvfp4_quant):
 // FUSES silu(gate)*up with the NVFP4 activation quant into one kernel, removing the
 // bf16 intermediate that the unfused MoeSiluMul(->bf16 [M,I]) + ScaledFp4Quant path
 // writes+reads (a memory-traffic win on the prefill). gate/up are [M,I] (our
-// two-input MoeSiluMul form). Outputs match ScaledFp4Quant's contract:
-//   out_packed [M, I/2]  i8   out_scale [M, I/16] i8
+// two-input MoeSiluMul form). Outputs match ScaledFp4Quant's selected linear or
+// CUTLASS-swizzled scale-layout contract:
+//   out_packed [M, I/2] i8
 // BIT-IDENTICAL to MoeSiluMul(gate,up -> bf16) then ScaledFp4Quant(bf16): the
 // silu*up value is rounded through bf16 before quant. I a multiple of 16. CPU+CUDA
 // (CPU fallback = the composite sequence).
 void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
-                     const Tensor& up, float input_global_scale_inv);
+                     const Tensor& up, float input_global_scale_inv,
+                     Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
 
 // SiluAndMulFp4Quant is the exact one-input vLLM custom-op form. `gate_up` is
 // contiguous [M,2I], with gate then up along the inner dimension. It fuses the
@@ -537,7 +552,8 @@ void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tens
 // packed/scale streams as SiluMulFp4Quant, without materializing [M,I]. CPU +
 // CUDA; FP16 is tracked as the separate NVFP4 W4 breadth leaf.
 void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
-                        const Tensor& gate_up, float input_global_scale_inv);
+                        const Tensor& gate_up, float input_global_scale_inv,
+                        Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
 
 // MatmulNvfp4Fp4 (mirror vllm cutlass_scaled_fp4_mm / ..._sm120a; notes §7.3):
 //   out[m,n] = alpha * Σ_k ( a_fp4[m,k]·a_scale_fp8[m,k/16] )

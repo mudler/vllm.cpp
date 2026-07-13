@@ -521,6 +521,13 @@ Nvfp4Dev ResidentNvfp4(Dev d, const Nvfp4Weight& w) {
   return r;
 }
 
+std::vector<int64_t> CutlassFp4ScaleShape(int64_t rows, int64_t k) {
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  return {round_up(rows, 128), round_up(k / 16, 4)};
+}
+
 #ifdef VT_CUTLASS_NVFP4
 // Resident SWIZZLED weight block scale for the cutlass fp4 GEMM. Computed ONCE
 // (lazily) from the resident linear d_scale via vt::SwizzleBlockscale and kept
@@ -1039,6 +1046,24 @@ bool NvfpCutlassEnabled() {
   return on;
 }
 
+// vLLM v0.25's normal and fused NVFP4 quant producers write activation block
+// scales directly in the CUTLASS tensor-core atom layout. Default to that
+// topology only on the compiled CUDA CUTLASS W4A4 path; the opt-out preserves
+// the exact former linear producer -> standalone SwizzleBlockscale sequence for
+// same-binary A/B and rollback.
+bool DirectFp4ScaleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP4_DIRECT_SF");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+bool DirectFp4ScaleEligible(Dev d) {
+  return DirectFp4ScaleEnabled() && NvfpCutlassEnabled() &&
+         d.q.device.type == vt::DeviceType::kCUDA;
+}
+
 // SWIZZLE-ONCE dedup (prefill-gap-scan quant-hw-swizzle lever). The fused qkv/
 // gate-up projections share ONE ScaledFp4Quant activation + its LINEAR fp8 block
 // scale, but each MatmulNvfp4Fp4DirectD re-runs the identical internal
@@ -1137,19 +1162,24 @@ DBuf MergedGateUpCutlassD(Dev d, const Tensor& x, const DenseMlpWeights& w) {
   Nvfp4GateUpDev gate_up = ResidentNvfp4GateUp(d, w);
 
   DBuf a_packed(d, DType::kI8, {m, k / 2});
-  DBuf a_scale(d, DType::kI8, {m, k / 16});
+  const bool direct_scale = DirectFp4ScaleEligible(d);
+  DBuf a_scale(d, DType::kI8,
+               direct_scale ? CutlassFp4ScaleShape(m, k)
+                            : std::vector<int64_t>{m, k / 16});
   vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x,
-                     gate_up.globals.input_global_scale_inv);
-
-  const auto round_up = [](int64_t value, int64_t multiple) {
-    return (value + multiple - 1) / multiple * multiple;
-  };
-  DBuf a_scale_sw(d, DType::kI8,
-                  {round_up(m, 128), round_up(k / 16, 4)});
-  vt::SwizzleBlockscale(d.q, a_scale_sw.t(), a_scale.t());
+                     gate_up.globals.input_global_scale_inv,
+                     direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                                  : vt::Fp4ScaleLayout::kLinear);
+  std::optional<DBuf> composed_scale;
+  const Tensor* scale_for_gemm = &a_scale.t();
+  if (!direct_scale) {
+    composed_scale.emplace(d, DType::kI8, CutlassFp4ScaleShape(m, k));
+    vt::SwizzleBlockscale(d.q, composed_scale->t(), a_scale.t());
+    scale_for_gemm = &composed_scale->t();
+  }
 
   DBuf out(d, DType::kBF16, {m, 2 * n});
-  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), a_scale_sw.t(),
+  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), *scale_for_gemm,
                          gate_up.packed, gate_up.scale_sw,
                          gate_up.globals.alpha);
   return out;
@@ -1166,19 +1196,25 @@ DBuf MergedQkvCutlassD(Dev d, const Tensor& x,
   const int64_t total_n = qkv.qn + qkv.kn + qkv.vn;
 
   DBuf a_packed(d, DType::kI8, {m, inner_k / 2});
-  DBuf a_scale(d, DType::kI8, {m, inner_k / 16});
+  const bool direct_scale = DirectFp4ScaleEligible(d);
+  DBuf a_scale(d, DType::kI8,
+               direct_scale ? CutlassFp4ScaleShape(m, inner_k)
+                            : std::vector<int64_t>{m, inner_k / 16});
   vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x,
-                     qkv.globals.input_global_scale_inv);
-
-  const auto round_up = [](int64_t value, int64_t multiple) {
-    return (value + multiple - 1) / multiple * multiple;
-  };
-  DBuf a_scale_sw(d, DType::kI8,
-                  {round_up(m, 128), round_up(inner_k / 16, 4)});
-  vt::SwizzleBlockscale(d.q, a_scale_sw.t(), a_scale.t());
+                     qkv.globals.input_global_scale_inv,
+                     direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                                  : vt::Fp4ScaleLayout::kLinear);
+  std::optional<DBuf> composed_scale;
+  const Tensor* scale_for_gemm = &a_scale.t();
+  if (!direct_scale) {
+    composed_scale.emplace(d, DType::kI8,
+                           CutlassFp4ScaleShape(m, inner_k));
+    vt::SwizzleBlockscale(d.q, composed_scale->t(), a_scale.t());
+    scale_for_gemm = &composed_scale->t();
+  }
 
   DBuf out(d, DType::kBF16, {m, total_n});
-  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), a_scale_sw.t(),
+  vt::MatmulNvfp4Cutlass(d.q, out.t(), a_packed.t(), *scale_for_gemm,
                          qkv.packed, qkv.scale_sw, qkv.globals.alpha);
   return out;
 }
@@ -1193,11 +1229,10 @@ DBuf MergedQkvCutlassD(Dev d, const Tensor& x,
 // [M,K/16], the ScaledFp4Quant outputs). Factored out of MatmulNvfp4Fp4D so a
 // fused producer (SiluMulFp4Quant / RmsNormResFp4Quant) can feed the GEMM directly
 // without the bf16 intermediate. out_dtype f32 or bf16.
-// `a_sf_sw_pre` (VT_SWIZZLE_IN_QUANT dedup, default nullptr): a fused qkv/gate-up
-// caller may swizzle the SHARED activation SF once and pass the already-swizzled
-// buffer here, so this projection reuses it instead of re-running the identical
-// internal SwizzleBlockscale. When null (the default / every non-fused caller) the
-// per-projection swizzle path below is unchanged (byte-identical).
+// `a_sf_sw_pre` may be produced directly by the v0.25-style quant kernel or by
+// the older VT_SWIZZLE_IN_QUANT dedup. In either case it is already in CUTLASS
+// layout and bypasses the standalone swizzle. When null, `a_scale` is linear
+// and the former composition remains byte-identical.
 DBuf MatmulNvfp4Fp4DirectD(Dev d, const Tensor& a_packed, const Tensor& a_scale,
                            const Nvfp4Weight& w, DType out_dtype,
                            [[maybe_unused]] const Tensor* a_sf_sw_pre = nullptr) {
@@ -1248,6 +1283,16 @@ DBuf SwizzleActScaleOnce(Dev d, const Tensor& a_scale) {
 DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dtype) {
   const int64_t M = x.shape[0], K = x.shape[1];
   DBuf a_packed(d, DType::kI8, {M, K / 2});
+#ifdef VT_CUTLASS_NVFP4
+  if (DirectFp4ScaleEligible(d)) {
+    DBuf a_scale(d, DType::kI8, CutlassFp4ScaleShape(M, K));
+    vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x,
+                       w.input_global_scale_inv,
+                       vt::Fp4ScaleLayout::kCutlassSwizzled);
+    return MatmulNvfp4Fp4DirectD(d, a_packed.t(), a_scale.t(), w,
+                                 out_dtype, &a_scale.t());
+  }
+#endif
   DBuf a_scale(d, DType::kI8, {M, K / 16});
   vt::ScaledFp4Quant(d.q, a_packed.t(), a_scale.t(), x, w.input_global_scale_inv);
   return MatmulNvfp4Fp4DirectD(d, a_packed.t(), a_scale.t(), w, out_dtype);
@@ -1308,19 +1353,33 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
           w.v_proj_fp4.input_global_scale_inv;
   std::optional<DBuf> qkv_ap;
   std::optional<DBuf> qkv_as;
+#ifdef VT_CUTLASS_NVFP4
+  const bool qkv_direct_scale =
+      fuse_qkv && DirectFp4ScaleEligible(d);
+#else
+  const bool qkv_direct_scale = false;
+#endif
   if (fuse_qkv) {
     const int64_t hidden = h.shape[1];
     qkv_ap.emplace(d, DType::kI8,
                    std::vector<int64_t>{t, hidden / 2});
     qkv_as.emplace(d, DType::kI8,
-                   std::vector<int64_t>{t, hidden / 16});
+                   qkv_direct_scale
+                       ? CutlassFp4ScaleShape(t, hidden)
+                       : std::vector<int64_t>{t, hidden / 16});
     vt::ScaledFp4Quant(d.q, qkv_ap->t(), qkv_as->t(), h,
-                       w.q_proj_fp4.input_global_scale_inv);
+                       w.q_proj_fp4.input_global_scale_inv,
+                       qkv_direct_scale
+                           ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                           : vt::Fp4ScaleLayout::kLinear);
   }
   const Tensor* qkv_sf_sw_p = nullptr;
 #ifdef VT_CUTLASS_NVFP4
   std::optional<DBuf> qkv_sf_sw;
-  if (fuse_qkv && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+  if (qkv_direct_scale) {
+    qkv_sf_sw_p = &qkv_as->t();
+  } else if (fuse_qkv && SwizzleInQuantEnabled() &&
+             NvfpCutlassEnabled()) {
     qkv_sf_sw.emplace(SwizzleActScaleOnce(d, qkv_as->t()));
     qkv_sf_sw_p = &qkv_sf_sw->t();
   }
@@ -3304,18 +3363,27 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     if (FuseSiluQuantEnabled() &&
         w.down_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
       DBuf ap(d, DType::kI8, {T, I / 2});
-      DBuf as(d, DType::kI8, {T, I / 16});
+      const bool direct_scale = DirectFp4ScaleEligible(d);
+      DBuf as(d, DType::kI8,
+              direct_scale ? CutlassFp4ScaleShape(T, I)
+                           : std::vector<int64_t>{T, I / 16});
+      const vt::Fp4ScaleLayout scale_layout =
+          direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                       : vt::Fp4ScaleLayout::kLinear;
       if (MergedSiluQuantEnabled()) {
         vt::SiluAndMulFp4Quant(d.q, ap.t(), as.t(), gate_up.t(),
-                               w.down_proj_fp4.input_global_scale_inv);
+                               w.down_proj_fp4.input_global_scale_inv,
+                               scale_layout);
       } else {
         DBuf act(d, DType::kBF16, {T, I});
         vt::SiluAndMul(d.q, act.t(), gate_up.t());
         vt::ScaledFp4Quant(d.q, ap.t(), as.t(), act.t(),
-                           w.down_proj_fp4.input_global_scale_inv);
+                           w.down_proj_fp4.input_global_scale_inv,
+                           scale_layout);
       }
       return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.down_proj_fp4,
-                                   DType::kBF16);
+                                   DType::kBF16,
+                                   direct_scale ? &as.t() : nullptr);
     }
     DBuf act(d, DType::kBF16, {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
@@ -3329,11 +3397,23 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
       w.gate_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
       w.gate_proj_fp4.input_global_scale_inv == w.up_proj_fp4.input_global_scale_inv;
   std::optional<DBuf> gu_ap, gu_as;
+#ifdef VT_CUTLASS_NVFP4
+  const bool gu_direct_scale = fuse_gu && DirectFp4ScaleEligible(d);
+#else
+  const bool gu_direct_scale = false;
+#endif
   if (fuse_gu) {
     const int64_t H = dh.shape[1];
     gu_ap.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 2});
-    gu_as.emplace(d, DType::kI8, std::vector<int64_t>{T, H / 16});
-    vt::ScaledFp4Quant(d.q, gu_ap->t(), gu_as->t(), dh, w.gate_proj_fp4.input_global_scale_inv);
+    gu_as.emplace(d, DType::kI8,
+                  gu_direct_scale
+                      ? CutlassFp4ScaleShape(T, H)
+                      : std::vector<int64_t>{T, H / 16});
+    vt::ScaledFp4Quant(
+        d.q, gu_ap->t(), gu_as->t(), dh,
+        w.gate_proj_fp4.input_global_scale_inv,
+        gu_direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                        : vt::Fp4ScaleLayout::kLinear);
   }
   // SWIZZLE-ONCE (VT_SWIZZLE_IN_QUANT): swizzle the shared gate/up activation SF
   // ONCE and feed the already-swizzled SF to both GEMMs (skipping each one's
@@ -3342,7 +3422,9 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   const Tensor* gu_sf_sw_p = nullptr;
 #ifdef VT_CUTLASS_NVFP4
   std::optional<DBuf> gu_sf_sw;
-  if (fuse_gu && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
+  if (gu_direct_scale) {
+    gu_sf_sw_p = &gu_as->t();
+  } else if (fuse_gu && SwizzleInQuantEnabled() && NvfpCutlassEnabled()) {
     gu_sf_sw.emplace(SwizzleActScaleOnce(d, gu_as->t()));
     gu_sf_sw_p = &gu_sf_sw->t();
   }
@@ -3366,10 +3448,23 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.
   if (fp4 && FuseSiluQuantEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
       w.down_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
-    DBuf ap(d, DType::kI8, {T, I / 2}), as(d, DType::kI8, {T, I / 16});
+    DBuf ap(d, DType::kI8, {T, I / 2});
+#ifdef VT_CUTLASS_NVFP4
+    const bool direct_scale = DirectFp4ScaleEligible(d);
+#else
+    const bool direct_scale = false;
+#endif
+    DBuf as(d, DType::kI8,
+            direct_scale ? CutlassFp4ScaleShape(T, I)
+                         : std::vector<int64_t>{T, I / 16});
     vt::SiluMulFp4Quant(d.q, ap.t(), as.t(), gate.t(), up.t(),
-                        w.down_proj_fp4.input_global_scale_inv);
-    return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16);
+                        w.down_proj_fp4.input_global_scale_inv,
+                        direct_scale
+                            ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                            : vt::Fp4ScaleLayout::kLinear);
+    return MatmulNvfp4Fp4DirectD(
+        d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16,
+        direct_scale ? &as.t() : nullptr);
   }
   DBuf act(d, DType::kBF16, {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16

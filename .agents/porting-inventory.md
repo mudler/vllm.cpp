@@ -373,14 +373,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    is the lift of vLLM `swizzle_blockscale` (`nvfp4_utils.py:13-53`). This is the
    "vendor a CUTLASS kernel only when a benchmark proves we can't match it" clause
    of §9.1: our hand-written fp4 GEMM ran ~15% of peak, cutlass ~300 TFLOPS on the
-   27B prefill projections (measured GB10). CUTLASS v4.4.2 is header-only (torch-free),
+   27B prefill projections (measured GB10). CUTLASS v4.5.0 is header-only (torch-free),
    provided via `-DVLLM_CPP_CUTLASS_DIR` (default `third_party/cutlass`), mirroring
-   vLLM's own FetchContent(v4.4.2). The TU is isolated (own `-isystem` cutlass tree
+   the current v0.25 FlashInfer dependency. The TU is isolated (own `-isystem` cutlass tree
    + `--expt-relaxed-constexpr`, sm_12xa only, ~37s compile) and gated by
    `VT_CUTLASS_NVFP4`; the op is opt-in (`VT_NVFP4_CUTLASS`) so no existing path
    changes. Only the 27B (compressed-tensors W4A4) uses it; the 35B is FP8 + Marlin
    W4A16 (never the sm120a fp4xfp4 kernel — grounded in `modelopt.py` MIXED_PRECISION
-   per-layer resolve).
+   per-layer resolve). W3-E now also ports v0.25's direct activation-scale
+   address emission: `Fp4ScaleLayout` selects linear or padded CUTLASS layout,
+   normal and both fused quant producers zero/write the latter directly, and
+   true-W4A4 model dispatch defaults direct. `VT_FP4_DIRECT_SF=0` preserves the
+   linear producer plus this standalone swizzle. CPU/CUDA bytes, focused
+   sanitizer, 27B direct/fallback and 35B inertness gates pass; paired tracing
+   removes 624 activation swizzles. Its c2/c16 performance gate is pending.
 
 10. **Vendored Marlin (NVFP4 W4A16 grouped-MoE GEMM — the 35B experts)**:
     `src/vt/cuda/marlin/` is a torch-free 1:1 vendor of vLLM's

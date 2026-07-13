@@ -1,6 +1,6 @@
 # NVFP4 direct swizzled activation-scale emission (W3-E)
 
-Status: **SPIKE ACCEPTED / READY; implementation and benchmark PENDING**
+Status: **IMPLEMENTED / GATING; component benchmark PENDING**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -178,9 +178,9 @@ driver contract rather than inventing a new workload.
 | Work | Deliverable | State |
 |---|---|---|
 | W3-E0 | whole-chain source/body audit, upstream tests, dispatch, files and gates | **complete in this spike** |
-| W3-E1 | explicit layout API + CPU/direct CUDA normal quant + ported padded/layout tests | `READY` |
-| W3-E2 | fused producer layouts + true-W4A4 model dispatch + fallback + model tests | after E1 |
-| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | after E2 |
+| W3-E1 | explicit layout API + CPU/direct CUDA normal quant + ported padded/layout tests | **complete** |
+| W3-E2 | fused producer layouts + true-W4A4 model dispatch + fallback + model tests | **complete** |
+| W3-E3 | sanitizer, real-model gates, node trace and c2/c16 same-binary A/B | correctness/sanitizer/trace complete; A/B pending |
 | W3-E4 | exact v0.25 27B grid/trace and lifecycle classification | only if E3 accepts |
 
 Any negative or neutral result is recorded honestly. A failed W3-E component

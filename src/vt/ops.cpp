@@ -171,15 +171,27 @@ void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_
 }
 
 void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
-                    float input_global_scale_inv) {
+                    float input_global_scale_inv, Fp4ScaleLayout scale_layout) {
   VT_CHECK(x.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
            "scaled_fp4_quant: x/out_packed/out_scale must be rank-2");
   const int64_t m = x.shape[0], k = x.shape[1];
   VT_CHECK(k % 16 == 0, "scaled_fp4_quant: K (inner dim) must be a multiple of 16");
   VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == k / 2,
            "scaled_fp4_quant: out_packed must be [M, K/2]");
-  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == k / 16,
-           "scaled_fp4_quant: out_scale must be [M, K/16]");
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  if (scale_layout == Fp4ScaleLayout::kLinear) {
+    VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == k / 16,
+             "scaled_fp4_quant: linear out_scale must be [M, K/16]");
+  } else {
+    VT_CHECK(scale_layout == Fp4ScaleLayout::kCutlassSwizzled,
+             "scaled_fp4_quant: invalid scale layout");
+    VT_CHECK(out_scale.shape[0] == round_up(m, 128) &&
+                 out_scale.shape[1] == round_up(k / 16, 4),
+             "scaled_fp4_quant: swizzled out_scale must be "
+             "[round_up(M,128), round_up(K/16,4)]");
+  }
   VT_CHECK(IsFloat(x.dtype), "scaled_fp4_quant: float x required");
   VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
            "scaled_fp4_quant: out_packed/out_scale must be i8 (raw fp4/fp8 bytes)");
@@ -188,11 +200,12 @@ void ScaledFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tenso
   VT_CHECK(x.device == q.device && out_packed.device == q.device && out_scale.device == q.device,
            "scaled_fp4_quant: device mismatch (x/out_packed/out_scale/queue)");
   reinterpret_cast<ScaledFp4QuantFn>(GetOp(OpId::kScaledFp4Quant, q.device.type))(
-      q, out_packed, out_scale, x, input_global_scale_inv);
+      q, out_packed, out_scale, x, input_global_scale_inv, scale_layout);
 }
 
 void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
-                     const Tensor& up, float input_global_scale_inv) {
+                     const Tensor& up, float input_global_scale_inv,
+                     Fp4ScaleLayout scale_layout) {
   VT_CHECK(gate.rank == 2 && up.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
            "silu_mul_fp4_quant: gate/up/out_packed/out_scale must be rank-2");
   const int64_t m = gate.shape[0], i = gate.shape[1];
@@ -200,8 +213,20 @@ void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tens
   VT_CHECK(i % 16 == 0, "silu_mul_fp4_quant: I (inner dim) must be a multiple of 16");
   VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == i / 2,
            "silu_mul_fp4_quant: out_packed must be [M, I/2]");
-  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
-           "silu_mul_fp4_quant: out_scale must be [M, I/16]");
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  if (scale_layout == Fp4ScaleLayout::kLinear) {
+    VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
+             "silu_mul_fp4_quant: linear out_scale must be [M, I/16]");
+  } else {
+    VT_CHECK(scale_layout == Fp4ScaleLayout::kCutlassSwizzled,
+             "silu_mul_fp4_quant: invalid scale layout");
+    VT_CHECK(out_scale.shape[0] == round_up(m, 128) &&
+                 out_scale.shape[1] == round_up(i / 16, 4),
+             "silu_mul_fp4_quant: swizzled out_scale must be "
+             "[round_up(M,128), round_up(I/16,4)]");
+  }
   VT_CHECK(IsFloat(gate.dtype) && gate.dtype == up.dtype,
            "silu_mul_fp4_quant: gate/up must be the same float dtype");
   VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
@@ -213,11 +238,12 @@ void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tens
                out_scale.device == q.device,
            "silu_mul_fp4_quant: device mismatch");
   reinterpret_cast<SiluMulFp4QuantFn>(GetOp(OpId::kSiluMulFp4Quant, q.device.type))(
-      q, out_packed, out_scale, gate, up, input_global_scale_inv);
+      q, out_packed, out_scale, gate, up, input_global_scale_inv, scale_layout);
 }
 
 void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
-                        const Tensor& gate_up, float input_global_scale_inv) {
+                        const Tensor& gate_up, float input_global_scale_inv,
+                        Fp4ScaleLayout scale_layout) {
   VT_CHECK(gate_up.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
            "silu_and_mul_fp4_quant: gate_up/out_packed/out_scale must be rank-2");
   const int64_t m = gate_up.shape[0];
@@ -228,8 +254,20 @@ void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
            "silu_and_mul_fp4_quant: I (half inner dim) must be a multiple of 16");
   VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == i / 2,
            "silu_and_mul_fp4_quant: out_packed must be [M, I/2]");
-  VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
-           "silu_and_mul_fp4_quant: out_scale must be [M, I/16]");
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  if (scale_layout == Fp4ScaleLayout::kLinear) {
+    VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
+             "silu_and_mul_fp4_quant: linear out_scale must be [M, I/16]");
+  } else {
+    VT_CHECK(scale_layout == Fp4ScaleLayout::kCutlassSwizzled,
+             "silu_and_mul_fp4_quant: invalid scale layout");
+    VT_CHECK(out_scale.shape[0] == round_up(m, 128) &&
+                 out_scale.shape[1] == round_up(i / 16, 4),
+             "silu_and_mul_fp4_quant: swizzled out_scale must be "
+             "[round_up(M,128), round_up(I/16,4)]");
+  }
   VT_CHECK(gate_up.dtype == DType::kF32 || gate_up.dtype == DType::kBF16,
            "silu_and_mul_fp4_quant: gate_up must be f32 or bf16");
   VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
@@ -242,7 +280,7 @@ void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
            "silu_and_mul_fp4_quant: device mismatch");
   reinterpret_cast<SiluAndMulFp4QuantFn>(
       GetOp(OpId::kSiluAndMulFp4Quant, q.device.type))(
-      q, out_packed, out_scale, gate_up, input_global_scale_inv);
+      q, out_packed, out_scale, gate_up, input_global_scale_inv, scale_layout);
 }
 
 void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,

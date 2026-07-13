@@ -333,13 +333,18 @@ inline float Nibble(uint8_t nib) {
 // ScaledFp4Quant CPU kernel: x [M,K] float -> out_packed [M,K/2] i8 + out_scale
 // [M,K/16] i8. Per-token, per-16-group; equals vllm::RefScaledFp4Quant.
 void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
-                          float input_global_scale_inv) {
+                          float input_global_scale_inv,
+                          Fp4ScaleLayout scale_layout) {
   const int64_t m = x.shape[0], k = x.shape[1];
   constexpr int kBS = 16;
   const int64_t groups = k / kBS;
   const float gs_recip = RecipF(input_global_scale_inv);
   auto* packed = out_packed.Ptr<uint8_t>();
   auto* scale = out_scale.Ptr<uint8_t>();
+  const int64_t scale_cols = out_scale.shape[1];
+  if (scale_layout == Fp4ScaleLayout::kCutlassSwizzled) {
+    std::fill_n(scale, out_scale.Numel(), uint8_t{0});
+  }
   ForRows(m, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     for (int64_t g = 0; g < groups; ++g) {
@@ -348,7 +353,21 @@ void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const T
       for (int j = 0; j < kBS; ++j) vec_max = std::fmax(vec_max, std::fabs(LoadF32(x, i * k + base + j)));
       float sc = ClampF(input_global_scale_inv * (vec_max * (1.0F / kFp4Max)), -kFp8Max, kFp8Max);
       const uint8_t sc_f8 = F32ToFp8(sc);
-      scale[i * groups + g] = sc_f8;
+      if (scale_layout == Fp4ScaleLayout::kLinear) {
+        scale[i * groups + g] = sc_f8;
+      } else {
+        const int64_t m_tile = i / 128;
+        const int64_t outer_m = i % 32;
+        const int64_t inner_m = (i % 128) / 32;
+        const int64_t k_tile = g / 4;
+        const int64_t inner_k = g % 4;
+        const int64_t scale_offset =
+            ((((m_tile * (scale_cols / 4) + k_tile) * 32 + outer_m) * 4 +
+               inner_m) *
+                  4 +
+              inner_k);
+        scale[scale_offset] = sc_f8;
+      }
       const float block_scale = Fp8ToF32(sc_f8) * gs_recip;
       const float out_scale_v = RecipF(block_scale);
       for (int j = 0; j < kBS; j += 2) {
@@ -366,12 +385,14 @@ void ScaledFp4QuantKernel(Queue&, Tensor& out_packed, Tensor& out_scale, const T
 // quant) — which IS the definition of correctness for the CUDA fused kernel. The
 // bf16 scratch reproduces the round-through-bf16 the CUDA kernel folds in.
 void SiluMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& gate,
-                           const Tensor& up, float input_global_scale_inv) {
+                           const Tensor& up, float input_global_scale_inv,
+                           Fp4ScaleLayout scale_layout) {
   const int64_t m = gate.shape[0], i = gate.shape[1];
   std::vector<uint16_t> tmp(static_cast<size_t>(m) * static_cast<size_t>(i));
   Tensor act = Tensor::Contiguous(tmp.data(), DType::kBF16, gate.device, {m, i});
   MoeSiluMulKernel(q, act, gate, up);
-  ScaledFp4QuantKernel(q, out_packed, out_scale, act, input_global_scale_inv);
+  ScaledFp4QuantKernel(q, out_packed, out_scale, act, input_global_scale_inv,
+                       scale_layout);
 }
 
 // CPU definition of vLLM's one-input silu_and_mul_nvfp4_quant custom op. Keep
@@ -379,13 +400,14 @@ void SiluMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale, cons
 // producer and preserves the BF16 store/load boundary exactly.
 void SiluAndMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale,
                               const Tensor& gate_up,
-                              float input_global_scale_inv) {
+                              float input_global_scale_inv,
+                              Fp4ScaleLayout scale_layout) {
   const int64_t m = gate_up.shape[0], i = gate_up.shape[1] / 2;
   std::vector<uint16_t> tmp(static_cast<size_t>(m) * static_cast<size_t>(i));
   Tensor act = Tensor::Contiguous(tmp.data(), DType::kBF16, gate_up.device, {m, i});
   SiluAndMulKernel(q, act, gate_up);
   ScaledFp4QuantKernel(q, out_packed, out_scale, act,
-                       input_global_scale_inv);
+                       input_global_scale_inv, scale_layout);
 }
 
 // MatmulNvfp4Fp4 CPU kernel: out[m,n] = alpha * Σ_k (a_fp4·f8(a_scale))·(b_fp4·

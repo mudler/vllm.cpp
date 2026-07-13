@@ -69,6 +69,38 @@ float DecodeActElem(const uint8_t* packed, const uint8_t* scale, int64_t k, int6
   const float sf = vllm::F8E4M3ToF32(scale[row * groups + col / 16]);
   return mag * sf / input_global_scale;  // block_scale = sf/global
 }
+
+int64_t RoundUpTo(int64_t value, int64_t multiple) {
+  return (value + multiple - 1) / multiple * multiple;
+}
+
+int64_t CutlassScaleOffset(int64_t row, int64_t col, int64_t padded_cols) {
+  const int64_t m_tile = row / 128;
+  const int64_t outer_m = row % 32;
+  const int64_t inner_m = (row % 128) / 32;
+  const int64_t k_tile = col / 4;
+  const int64_t inner_k = col % 4;
+  return ((((m_tile * (padded_cols / 4) + k_tile) * 32 + outer_m) * 4 +
+            inner_m) *
+               4 +
+           inner_k);
+}
+
+std::vector<uint8_t> SwizzleScaleReference(const std::vector<uint8_t>& linear,
+                                           int64_t rows, int64_t cols) {
+  const int64_t padded_rows = RoundUpTo(rows, 128);
+  const int64_t padded_cols = RoundUpTo(cols, 4);
+  std::vector<uint8_t> swizzled(
+      static_cast<size_t>(padded_rows * padded_cols), uint8_t{0});
+  for (int64_t row = 0; row < rows; ++row) {
+    for (int64_t col = 0; col < cols; ++col) {
+      swizzled[static_cast<size_t>(
+          CutlassScaleOffset(row, col, padded_cols))] =
+          linear[static_cast<size_t>(row * cols + col)];
+    }
+  }
+  return swizzled;
+}
 }  // namespace
 
 TEST_CASE("FlashInfer NVFP4 hybrid M buckets preserve small decode shapes") {
@@ -372,6 +404,76 @@ TEST_CASE("scaled_fp4_quant CPU == vllm::RefScaledFp4Quant (byte-exact) + decode
     }
 }
 
+// Ports vllm@v0.25.0
+// tests/kernels/quantization/test_nvfp4_quant.py::
+//   test_python_util_matches_cpp_allocation,
+//   test_quantize_to_fp4_with_padded_output, and
+//   test_quantize_to_fp4_padded{,_no_sf_swizzled}.
+// The direct producer must be byte-identical to linear production followed by
+// the standalone swizzle, including every zero-filled padded scale slot.
+TEST_CASE("scaled_fp4_quant direct CUTLASS scales match linear swizzle on CPU") {
+  Queue queue = CpuQueue();
+  constexpr float kInputGlobalScale = 7.3F;
+  const std::array<std::pair<int64_t, int64_t>, 6> shapes{{
+      {1, 64}, {32, 4096}, {127, 1024}, {128, 4096},
+      {256, 16384}, {32, 14336},
+  }};
+  for (const auto& [m, k] : shapes) {
+    CAPTURE(m);
+    CAPTURE(k);
+    std::vector<float> input(static_cast<size_t>(m * k));
+    for (int64_t index = 0; index < m * k; ++index) {
+      input[static_cast<size_t>(index)] =
+          static_cast<float>((index * 37) % 257 - 128) / 19.0F;
+    }
+    std::vector<uint8_t> linear_packed(static_cast<size_t>(m * k / 2));
+    std::vector<uint8_t> direct_packed(linear_packed.size(), uint8_t{0xA5});
+    std::vector<uint8_t> linear_scale(static_cast<size_t>(m * k / 16));
+    const int64_t padded_rows = RoundUpTo(m, 128);
+    const int64_t padded_cols = RoundUpTo(k / 16, 4);
+    std::vector<uint8_t> direct_scale(
+        static_cast<size_t>(padded_rows * padded_cols), uint8_t{0xA5});
+
+    Tensor x = Tensor::Contiguous(input.data(), DType::kF32, Cpu(), {m, k});
+    Tensor linear_packed_tensor = Tensor::Contiguous(
+        linear_packed.data(), DType::kI8, Cpu(), {m, k / 2});
+    Tensor direct_packed_tensor = Tensor::Contiguous(
+        direct_packed.data(), DType::kI8, Cpu(), {m, k / 2});
+    Tensor linear_scale_tensor = Tensor::Contiguous(
+        linear_scale.data(), DType::kI8, Cpu(), {m, k / 16});
+    Tensor direct_scale_tensor = Tensor::Contiguous(
+        direct_scale.data(), DType::kI8, Cpu(), {padded_rows, padded_cols});
+
+    vt::ScaledFp4Quant(queue, linear_packed_tensor, linear_scale_tensor, x,
+                       kInputGlobalScale);
+    vt::ScaledFp4Quant(queue, direct_packed_tensor, direct_scale_tensor, x,
+                       kInputGlobalScale,
+                       vt::Fp4ScaleLayout::kCutlassSwizzled);
+
+    CHECK(direct_packed == linear_packed);
+    CHECK(direct_scale ==
+          SwizzleScaleReference(linear_scale, m, k / 16));
+  }
+}
+
+TEST_CASE("direct CUTLASS scale layout is explicit and validates exact shape") {
+  Queue queue = CpuQueue();
+  constexpr int64_t kM = 1;
+  constexpr int64_t kK = 64;
+  std::vector<float> input(static_cast<size_t>(kM * kK), 1.0F);
+  std::vector<uint8_t> packed(static_cast<size_t>(kM * kK / 2));
+  std::vector<uint8_t> ambiguous_scale(static_cast<size_t>(kM * kK / 16));
+  Tensor x = Tensor::Contiguous(input.data(), DType::kF32, Cpu(), {kM, kK});
+  Tensor packed_tensor = Tensor::Contiguous(
+      packed.data(), DType::kI8, Cpu(), {kM, kK / 2});
+  Tensor ambiguous_tensor = Tensor::Contiguous(
+      ambiguous_scale.data(), DType::kI8, Cpu(), {kM, kK / 16});
+  CHECK_THROWS_AS(
+      vt::ScaledFp4Quant(queue, packed_tensor, ambiguous_tensor, x, 7.3F,
+                         vt::Fp4ScaleLayout::kCutlassSwizzled),
+      std::runtime_error);
+}
+
 TEST_CASE("matmul_nvfp4_fp4 CPU == vllm::RunNvfp4Emulation") {
   const int64_t M = 4, K = 96, N = 7;
   std::mt19937 rng(99);
@@ -522,6 +624,109 @@ TEST_CASE("scaled_fp4_quant + matmul_nvfp4_fp4 CUDA == CPU") {
   b.DestroyQueue(gq);
 }
 
+TEST_CASE("scaled_fp4_quant CUDA direct scales match linear swizzle") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = b.CreateQueue();
+  constexpr float kInputGlobalScale = 8.2F;
+
+  auto run_check = [&](int64_t m, int64_t k, DType dtype) {
+    CAPTURE(m);
+    CAPTURE(k);
+    CAPTURE(static_cast<int>(dtype));
+    std::vector<float> input_f32(static_cast<size_t>(m * k));
+    for (int64_t index = 0; index < m * k; ++index) {
+      input_f32[static_cast<size_t>(index)] =
+          static_cast<float>((index * 37) % 257 - 128) / 19.0F;
+    }
+    std::vector<uint16_t> input_bf16;
+    const void* input_host = input_f32.data();
+    size_t input_bytes = input_f32.size() * sizeof(float);
+    if (dtype == DType::kBF16) {
+      input_bf16.resize(input_f32.size());
+      std::transform(input_f32.begin(), input_f32.end(), input_bf16.begin(),
+                     FloatToBf16);
+      input_host = input_bf16.data();
+      input_bytes = input_bf16.size() * sizeof(uint16_t);
+    }
+    const int64_t padded_rows = RoundUpTo(m, 128);
+    const int64_t padded_cols = RoundUpTo(k / 16, 4);
+    auto allocate = [&](size_t bytes) { return b.Alloc(bytes); };
+    void* input_device = allocate(input_bytes);
+    b.Copy(queue, input_device, input_host, input_bytes);
+    void* linear_packed_device =
+        allocate(static_cast<size_t>(m * k / 2));
+    void* direct_packed_device =
+        allocate(static_cast<size_t>(m * k / 2));
+    void* linear_scale_device =
+        allocate(static_cast<size_t>(m * k / 16));
+    void* direct_scale_device =
+        allocate(static_cast<size_t>(padded_rows * padded_cols));
+    b.Memset(queue, direct_scale_device, 0xA5,
+             static_cast<size_t>(padded_rows * padded_cols));
+
+    Tensor input = GpuTensor({m, k});
+    input.data = input_device;
+    input.dtype = dtype;
+    input.device = Gpu();
+    Tensor linear_packed = GpuTensor({m, k / 2});
+    linear_packed.data = linear_packed_device;
+    linear_packed.dtype = DType::kI8;
+    linear_packed.device = Gpu();
+    Tensor direct_packed = GpuTensor({m, k / 2});
+    direct_packed.data = direct_packed_device;
+    direct_packed.dtype = DType::kI8;
+    direct_packed.device = Gpu();
+    Tensor linear_scale = GpuTensor({m, k / 16});
+    linear_scale.data = linear_scale_device;
+    linear_scale.dtype = DType::kI8;
+    linear_scale.device = Gpu();
+    Tensor direct_scale = GpuTensor({padded_rows, padded_cols});
+    direct_scale.data = direct_scale_device;
+    direct_scale.dtype = DType::kI8;
+    direct_scale.device = Gpu();
+
+    vt::ScaledFp4Quant(queue, linear_packed, linear_scale, input,
+                       kInputGlobalScale);
+    vt::ScaledFp4Quant(queue, direct_packed, direct_scale, input,
+                       kInputGlobalScale,
+                       vt::Fp4ScaleLayout::kCutlassSwizzled);
+
+    std::vector<uint8_t> linear_packed_host(
+        static_cast<size_t>(m * k / 2));
+    std::vector<uint8_t> direct_packed_host(linear_packed_host.size());
+    std::vector<uint8_t> linear_scale_host(
+        static_cast<size_t>(m * k / 16));
+    std::vector<uint8_t> direct_scale_host(
+        static_cast<size_t>(padded_rows * padded_cols));
+    b.Copy(queue, linear_packed_host.data(), linear_packed_device,
+           linear_packed_host.size());
+    b.Copy(queue, direct_packed_host.data(), direct_packed_device,
+           direct_packed_host.size());
+    b.Copy(queue, linear_scale_host.data(), linear_scale_device,
+           linear_scale_host.size());
+    b.Copy(queue, direct_scale_host.data(), direct_scale_device,
+           direct_scale_host.size());
+    b.Synchronize(queue);
+
+    CHECK(direct_packed_host == linear_packed_host);
+    CHECK(direct_scale_host ==
+          SwizzleScaleReference(linear_scale_host, m, k / 16));
+    for (void* pointer : {input_device, linear_packed_device,
+                          direct_packed_device, linear_scale_device,
+                          direct_scale_device}) {
+      b.Free(pointer);
+    }
+  };
+
+  run_check(1, 64, DType::kF32);
+  run_check(127, 1024, DType::kF32);
+  run_check(1, 5120, DType::kBF16);
+  run_check(32, 14336, DType::kBF16);
+  run_check(9, 17408, DType::kBF16);
+  b.DestroyQueue(queue);
+}
+
 TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)") {
   if (!HasCuda()) return;
   auto& b = vt::GetBackend(DeviceType::kCUDA);
@@ -558,12 +763,36 @@ TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)")
     Tensor tfu_as = GpuTensor({M, I / 16}); tfu_as.data = dfu_as; tfu_as.dtype = DType::kI8; tfu_as.device = Gpu();
     vt::SiluMulFp4Quant(gq, tfu_ap, tfu_as, tgate, tup, input_global_scale);
 
+    const int64_t padded_rows = RoundUpTo(M, 128);
+    const int64_t padded_cols = RoundUpTo(I / 16, 4);
+    void* ddir_ap = b.Alloc(static_cast<size_t>(M * I / 2));
+    void* ddir_as =
+        b.Alloc(static_cast<size_t>(padded_rows * padded_cols));
+    b.Memset(gq, ddir_as, 0xA5,
+             static_cast<size_t>(padded_rows * padded_cols));
+    Tensor tdir_ap = GpuTensor({M, I / 2});
+    tdir_ap.data = ddir_ap;
+    tdir_ap.dtype = DType::kI8;
+    tdir_ap.device = Gpu();
+    Tensor tdir_as = GpuTensor({padded_rows, padded_cols});
+    tdir_as.data = ddir_as;
+    tdir_as.dtype = DType::kI8;
+    tdir_as.device = Gpu();
+    vt::SiluMulFp4Quant(gq, tdir_ap, tdir_as, tgate, tup,
+                        input_global_scale,
+                        vt::Fp4ScaleLayout::kCutlassSwizzled);
+
     std::vector<uint8_t> ref_ap(static_cast<size_t>(M * I / 2)), ref_as(static_cast<size_t>(M * I / 16));
     std::vector<uint8_t> fu_ap(static_cast<size_t>(M * I / 2)), fu_as(static_cast<size_t>(M * I / 16));
+    std::vector<uint8_t> dir_ap(fu_ap.size());
+    std::vector<uint8_t> dir_as(
+        static_cast<size_t>(padded_rows * padded_cols));
     b.Copy(gq, ref_ap.data(), dref_ap, ref_ap.size());
     b.Copy(gq, ref_as.data(), dref_as, ref_as.size());
     b.Copy(gq, fu_ap.data(), dfu_ap, fu_ap.size());
     b.Copy(gq, fu_as.data(), dfu_as, fu_as.size());
+    b.Copy(gq, dir_ap.data(), ddir_ap, dir_ap.size());
+    b.Copy(gq, dir_as.data(), ddir_as, dir_as.size());
     b.Synchronize(gq);
 
     size_t pmis = 0, smis = 0;
@@ -571,8 +800,13 @@ TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)")
     for (size_t i = 0; i < ref_as.size(); ++i) smis += (fu_as[i] != ref_as[i]);
     CHECK(pmis == 0);  // fused packed fp4 == unfused, byte-for-byte
     CHECK(smis == 0);  // fused fp8 block scales == unfused, byte-for-byte
+    CHECK(dir_ap == fu_ap);
+    CHECK(dir_as == SwizzleScaleReference(fu_as, M, I / 16));
 
-    for (void* p : {dgate, dup, dact, dref_ap, dref_as, dfu_ap, dfu_as}) b.Free(p);
+    for (void* p : {dgate, dup, dact, dref_ap, dref_as, dfu_ap, dfu_as,
+                    ddir_ap, ddir_as}) {
+      b.Free(p);
+    }
   };
 
   run_check(1, 64);      // decode single-row
@@ -635,6 +869,90 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CPU is BYTE-EXACT") {
       CHECK(fused_scale == reference_scale);
     }
   }
+}
+
+TEST_CASE("fused SiLU NVFP4 producers emit direct CUTLASS scales on CPU") {
+  Queue queue = CpuQueue();
+  constexpr int64_t kM = 37;
+  constexpr int64_t kI = 128;
+  constexpr float kInputGlobalScale = 6.7F;
+  std::vector<float> gate(static_cast<size_t>(kM * kI));
+  std::vector<float> up(gate.size());
+  for (int64_t index = 0; index < kM * kI; ++index) {
+    gate[static_cast<size_t>(index)] =
+        static_cast<float>((index * 17) % 193 - 96) / 23.0F;
+    up[static_cast<size_t>(index)] =
+        static_cast<float>((index * 29) % 181 - 90) / 17.0F;
+  }
+  std::vector<float> gate_up(static_cast<size_t>(kM * 2 * kI));
+  for (int64_t row = 0; row < kM; ++row) {
+    std::copy_n(gate.data() + row * kI, kI,
+                gate_up.data() + row * 2 * kI);
+    std::copy_n(up.data() + row * kI, kI,
+                gate_up.data() + row * 2 * kI + kI);
+  }
+
+  const int64_t padded_rows = RoundUpTo(kM, 128);
+  const int64_t padded_cols = RoundUpTo(kI / 16, 4);
+  auto check_scale = [&](const std::vector<uint8_t>& linear_scale,
+                         const std::vector<uint8_t>& direct_scale) {
+    CHECK(direct_scale ==
+          SwizzleScaleReference(linear_scale, kM, kI / 16));
+  };
+
+  std::vector<uint8_t> two_linear_packed(static_cast<size_t>(kM * kI / 2));
+  std::vector<uint8_t> two_direct_packed(two_linear_packed.size());
+  std::vector<uint8_t> two_linear_scale(static_cast<size_t>(kM * kI / 16));
+  std::vector<uint8_t> two_direct_scale(
+      static_cast<size_t>(padded_rows * padded_cols), uint8_t{0xA5});
+  Tensor gate_tensor =
+      Tensor::Contiguous(gate.data(), DType::kF32, Cpu(), {kM, kI});
+  Tensor up_tensor =
+      Tensor::Contiguous(up.data(), DType::kF32, Cpu(), {kM, kI});
+  Tensor two_linear_packed_tensor = Tensor::Contiguous(
+      two_linear_packed.data(), DType::kI8, Cpu(), {kM, kI / 2});
+  Tensor two_direct_packed_tensor = Tensor::Contiguous(
+      two_direct_packed.data(), DType::kI8, Cpu(), {kM, kI / 2});
+  Tensor two_linear_scale_tensor = Tensor::Contiguous(
+      two_linear_scale.data(), DType::kI8, Cpu(), {kM, kI / 16});
+  Tensor two_direct_scale_tensor = Tensor::Contiguous(
+      two_direct_scale.data(), DType::kI8, Cpu(),
+      {padded_rows, padded_cols});
+  vt::SiluMulFp4Quant(queue, two_linear_packed_tensor,
+                      two_linear_scale_tensor, gate_tensor, up_tensor,
+                      kInputGlobalScale);
+  vt::SiluMulFp4Quant(queue, two_direct_packed_tensor,
+                      two_direct_scale_tensor, gate_tensor, up_tensor,
+                      kInputGlobalScale,
+                      vt::Fp4ScaleLayout::kCutlassSwizzled);
+  CHECK(two_direct_packed == two_linear_packed);
+  check_scale(two_linear_scale, two_direct_scale);
+
+  std::vector<uint8_t> one_linear_packed(two_linear_packed.size());
+  std::vector<uint8_t> one_direct_packed(two_linear_packed.size());
+  std::vector<uint8_t> one_linear_scale(two_linear_scale.size());
+  std::vector<uint8_t> one_direct_scale(
+      static_cast<size_t>(padded_rows * padded_cols), uint8_t{0xA5});
+  Tensor gate_up_tensor = Tensor::Contiguous(
+      gate_up.data(), DType::kF32, Cpu(), {kM, 2 * kI});
+  Tensor one_linear_packed_tensor = Tensor::Contiguous(
+      one_linear_packed.data(), DType::kI8, Cpu(), {kM, kI / 2});
+  Tensor one_direct_packed_tensor = Tensor::Contiguous(
+      one_direct_packed.data(), DType::kI8, Cpu(), {kM, kI / 2});
+  Tensor one_linear_scale_tensor = Tensor::Contiguous(
+      one_linear_scale.data(), DType::kI8, Cpu(), {kM, kI / 16});
+  Tensor one_direct_scale_tensor = Tensor::Contiguous(
+      one_direct_scale.data(), DType::kI8, Cpu(),
+      {padded_rows, padded_cols});
+  vt::SiluAndMulFp4Quant(queue, one_linear_packed_tensor,
+                         one_linear_scale_tensor, gate_up_tensor,
+                         kInputGlobalScale);
+  vt::SiluAndMulFp4Quant(queue, one_direct_packed_tensor,
+                         one_direct_scale_tensor, gate_up_tensor,
+                         kInputGlobalScale,
+                         vt::Fp4ScaleLayout::kCutlassSwizzled);
+  CHECK(one_direct_packed == one_linear_packed);
+  check_scale(one_linear_scale, one_direct_scale);
 }
 
 TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
@@ -705,10 +1023,32 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
     vt::SiluAndMulFp4Quant(gq, fused_packed, fused_scale, input,
                            input_global_scale);
 
+    const int64_t padded_rows = RoundUpTo(m, 128);
+    const int64_t padded_cols = RoundUpTo(i / 16, 4);
+    void* ddirect_packed = b.Alloc(static_cast<size_t>(m * i / 2));
+    void* ddirect_scale =
+        b.Alloc(static_cast<size_t>(padded_rows * padded_cols));
+    b.Memset(gq, ddirect_scale, 0xA5,
+             static_cast<size_t>(padded_rows * padded_cols));
+    Tensor direct_packed = GpuTensor({m, i / 2});
+    direct_packed.data = ddirect_packed;
+    direct_packed.dtype = DType::kI8;
+    direct_packed.device = Gpu();
+    Tensor direct_scale = GpuTensor({padded_rows, padded_cols});
+    direct_scale.data = ddirect_scale;
+    direct_scale.dtype = DType::kI8;
+    direct_scale.device = Gpu();
+    vt::SiluAndMulFp4Quant(gq, direct_packed, direct_scale, input,
+                           input_global_scale,
+                           vt::Fp4ScaleLayout::kCutlassSwizzled);
+
     std::vector<uint8_t> reference_packed(static_cast<size_t>(m * i / 2));
     std::vector<uint8_t> reference_scale(static_cast<size_t>(m * i / 16));
     std::vector<uint8_t> fused_packed_host(reference_packed.size());
     std::vector<uint8_t> fused_scale_host(reference_scale.size());
+    std::vector<uint8_t> direct_packed_host(reference_packed.size());
+    std::vector<uint8_t> direct_scale_host(
+        static_cast<size_t>(padded_rows * padded_cols));
     b.Copy(gq, reference_packed.data(), dref_packed,
            reference_packed.size());
     b.Copy(gq, reference_scale.data(), dref_scale, reference_scale.size());
@@ -716,12 +1056,20 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
            fused_packed_host.size());
     b.Copy(gq, fused_scale_host.data(), dfused_scale,
            fused_scale_host.size());
+    b.Copy(gq, direct_packed_host.data(), ddirect_packed,
+           direct_packed_host.size());
+    b.Copy(gq, direct_scale_host.data(), ddirect_scale,
+           direct_scale_host.size());
     b.Synchronize(gq);
 
     CHECK(fused_packed_host == reference_packed);
     CHECK(fused_scale_host == reference_scale);
+    CHECK(direct_packed_host == fused_packed_host);
+    CHECK(direct_scale_host ==
+          SwizzleScaleReference(fused_scale_host, m, i / 16));
     for (void* pointer : {dinput, dact, dref_packed, dref_scale,
-                          dfused_packed, dfused_scale}) {
+                          dfused_packed, dfused_scale, ddirect_packed,
+                          ddirect_scale}) {
       b.Free(pointer);
     }
   };
@@ -804,30 +1152,55 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   void* dbp = up(w_packed.data(), w_packed.size());
   void* dbs = up(w_scale.data(), w_scale.size());
   void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
+  void* dap_direct = b.Alloc(static_cast<size_t>(M * K / 2));
   void* das = b.Alloc(static_cast<size_t>(M * K / 16));
   void* dasw = b.Alloc(static_cast<size_t>(Mp * Kp));
+  void* das_direct = b.Alloc(static_cast<size_t>(Mp * Kp));
   void* dbsw = b.Alloc(static_cast<size_t>(Np * Kp));
   void* dout = b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));  // bf16
+  void* dout_direct =
+      b.Alloc(static_cast<size_t>(M * N) * sizeof(uint16_t));
   b.Memset(gq, dasw, 0, static_cast<size_t>(Mp * Kp));
   b.Memset(gq, dbsw, 0, static_cast<size_t>(Np * Kp));
 
   Tensor tx = GpuTensor({M, K}); tx.data = dx; tx.dtype = DType::kF32; tx.device = Gpu();
   Tensor tap = GpuTensor({M, K / 2}); tap.data = dap; tap.dtype = DType::kI8; tap.device = Gpu();
+  Tensor tap_direct = GpuTensor({M, K / 2}); tap_direct.data = dap_direct; tap_direct.dtype = DType::kI8; tap_direct.device = Gpu();
   Tensor tas = GpuTensor({M, K / 16}); tas.data = das; tas.dtype = DType::kI8; tas.device = Gpu();
   Tensor tasw = GpuTensor({Mp, Kp}); tasw.data = dasw; tasw.dtype = DType::kI8; tasw.device = Gpu();
+  Tensor tas_direct = GpuTensor({Mp, Kp}); tas_direct.data = das_direct; tas_direct.dtype = DType::kI8; tas_direct.device = Gpu();
   Tensor tbp = GpuTensor({N, K / 2}); tbp.data = dbp; tbp.dtype = DType::kI8; tbp.device = Gpu();
   Tensor tbs = GpuTensor({N, K / 16}); tbs.data = dbs; tbs.dtype = DType::kI8; tbs.device = Gpu();
   Tensor tbsw = GpuTensor({Np, Kp}); tbsw.data = dbsw; tbsw.dtype = DType::kI8; tbsw.device = Gpu();
   Tensor to = GpuTensor({M, N}); to.data = dout; to.dtype = DType::kBF16; to.device = Gpu();
+  Tensor to_direct = GpuTensor({M, N}); to_direct.data = dout_direct; to_direct.dtype = DType::kBF16; to_direct.device = Gpu();
 
   vt::ScaledFp4Quant(gq, tap, tas, tx, input_global_scale);
+  vt::ScaledFp4Quant(gq, tap_direct, tas_direct, tx, input_global_scale,
+                     vt::Fp4ScaleLayout::kCutlassSwizzled);
   vt::SwizzleBlockscale(gq, tasw, tas);
   vt::SwizzleBlockscale(gq, tbsw, tbs);
   vt::MatmulNvfp4Cutlass(gq, to, tap, tasw, tbp, tbsw, alpha);
+  vt::MatmulNvfp4Cutlass(gq, to_direct, tap_direct, tas_direct, tbp, tbsw,
+                         alpha);
 
   std::vector<uint16_t> g_out(static_cast<size_t>(M * N));
+  std::vector<uint16_t> direct_out(g_out.size());
+  std::vector<uint8_t> composed_packed(static_cast<size_t>(M * K / 2));
+  std::vector<uint8_t> direct_packed(composed_packed.size());
+  std::vector<uint8_t> composed_scale(static_cast<size_t>(Mp * Kp));
+  std::vector<uint8_t> direct_scale(composed_scale.size());
   b.Copy(gq, g_out.data(), dout, g_out.size() * sizeof(uint16_t));
+  b.Copy(gq, direct_out.data(), dout_direct,
+         direct_out.size() * sizeof(uint16_t));
+  b.Copy(gq, composed_packed.data(), dap, composed_packed.size());
+  b.Copy(gq, direct_packed.data(), dap_direct, direct_packed.size());
+  b.Copy(gq, composed_scale.data(), dasw, composed_scale.size());
+  b.Copy(gq, direct_scale.data(), das_direct, direct_scale.size());
   b.Synchronize(gq);
+  CHECK(direct_packed == composed_packed);
+  CHECK(direct_scale == composed_scale);
+  CHECK(direct_out == g_out);
 
   double max_abs = 0.0, ref_absmax = 0.0;
   for (size_t i = 0; i < g_out.size(); ++i) {
@@ -926,7 +1299,10 @@ TEST_CASE("matmul_nvfp4_cutlass (swizzled) == emulation reference CUDA") {
   }
   b.DestroyGraph(prewarmed_graph);
 
-  for (void* p : {dx, dbp, dbs, dap, das, dasw, dbsw, dout}) b.Free(p);
+  for (void* p : {dx, dbp, dbs, dap, dap_direct, das, dasw, das_direct,
+                  dbsw, dout, dout_direct}) {
+    b.Free(p);
+  }
   b.DestroyQueue(gq);
 }
 
@@ -1098,6 +1474,8 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
     return static_cast<int64_t>(value);
   };
   const bool real_projection = std::getenv("VT_FP4_TEST_REAL_SHAPE") != nullptr;
+  const bool direct_scale =
+      std::getenv("VT_FP4_TEST_DIRECT_SF") != nullptr;
   const int64_t m = dimension("VT_FP4_TEST_M", 1 + tactic % 3);
   const int64_t n = dimension("VT_FP4_TEST_N", real_projection ? 1024 : 256);
   const int64_t k = dimension("VT_FP4_TEST_K", real_projection ? 5120 : 512);
@@ -1196,8 +1574,13 @@ TEST_CASE("matmul_nvfp4_cutlass every forced SM12 tactic matches reference and c
   tout.dtype = DType::kBF16;
   tout.device = Gpu();
 
-  vt::ScaledFp4Quant(queue, ta, tas, tx, kInputGlobalScale);
-  vt::SwizzleBlockscale(queue, tasw, tas);
+  if (direct_scale) {
+    vt::ScaledFp4Quant(queue, ta, tasw, tx, kInputGlobalScale,
+                       vt::Fp4ScaleLayout::kCutlassSwizzled);
+  } else {
+    vt::ScaledFp4Quant(queue, ta, tas, tx, kInputGlobalScale);
+    vt::SwizzleBlockscale(queue, tasw, tas);
+  }
   vt::SwizzleBlockscale(queue, twsw, tws);
   vt::MatmulNvfp4Cutlass(queue, tout, ta, tasw, tw, twsw, kAlpha);
   std::vector<uint16_t> first(static_cast<size_t>(m * n));

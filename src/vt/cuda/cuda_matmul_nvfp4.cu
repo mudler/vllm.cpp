@@ -955,18 +955,53 @@ inline bool NativeFp4MmaEnabled() {
   return e && e[0] == '1';
 }
 
-// ScaledFp4Quant: one thread per (row, 16-group). Emits packed fp4 [M,K/2] +
-// fp8 block scale [M,K/16]. Reciprocal selected by approx_recip (notes §7.2).
-// Tin f32/bf16.
-template <typename Tin>
+__device__ __forceinline__ int64_t CutlassScaleOffset(int64_t row, int64_t col,
+                                                      int64_t padded_cols) {
+  const int64_t m_tile = row / 128;
+  const int64_t outer_m = row % 32;
+  const int64_t inner_m = (row % 128) / 32;
+  const int64_t k_tile = col / 4;
+  const int64_t inner_k = col % 4;
+  return ((((m_tile * (padded_cols / 4) + k_tile) * 32 + outer_m) * 4 +
+            inner_m) *
+               4 +
+           inner_k);
+}
+
+template <bool kSwizzled>
+__device__ __forceinline__ void StoreFp4Scale(uint8_t* scale, int64_t row,
+                                              int64_t col, int64_t groups,
+                                              int64_t padded_cols,
+                                              uint8_t value) {
+  if constexpr (kSwizzled) {
+    scale[CutlassScaleOffset(row, col, padded_cols)] = value;
+  } else {
+    scale[row * groups + col] = value;
+  }
+}
+
+// ScaledFp4Quant: one thread per linear or padded (row, 16-group) scale slot.
+// The swizzled specialization writes the CUTLASS scale-factor atom address
+// directly and zeroes padded rows/columns in this same launch. Reciprocal is
+// selected by approx_recip (notes §7.2). Tin f32/bf16.
+template <typename Tin, bool kSwizzled>
 __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin* x,
                                      float input_global_scale, int64_t m_rows, int64_t k_dim,
+                                     int64_t scale_rows, int64_t scale_cols,
                                      bool approx_recip) {
   const int64_t groups = k_dim / 16;
   const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (gid >= m_rows * groups) return;
-  const int64_t row = gid / groups;
-  const int64_t g = gid % groups;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
   const int64_t base = row * k_dim + g * 16;
   float vmax = 0.0f;
 #pragma unroll
@@ -976,22 +1011,7 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   float sc = input_global_scale * (vmax * inverse_six);
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
-  scale[row * groups + g] = sc8;  // LINEAR store; a separate SwizzleBlockscaleKernel reorders.
-  // PART B (VT_SWIZZLE_IN_QUANT direct-emit, FOLLOW-UP — not yet shipped): store sc8
-  // DIRECTLY at vLLM's swizzled offset here, eliminating the separate
-  // SwizzleBlockscaleKernel pass. Verified bit-identical to
-  // cuda_matmul_nvfp4_cutlass.cu SwizzleBlockscaleKernel:
-  //   numKTiles = round_up(groups,4)/4;  Kp = numKTiles*4  (swizzled cols)
-  //   mTileIdx=row>>7; outerMIdx=row&31; innerMIdx=(row>>5)&3; kTileIdx=g>>2; innerKIdx=g&3;
-  //   sfOff = ((mTileIdx*numKTiles + kTileIdx)*32 + outerMIdx)*16 + innerMIdx*4 + innerKIdx;
-  //   scale[sfOff] = sc8;   // scale buffer must be the swizzled [round_up(M,128), Kp] shape
-  // (row&31 == (row%128)%32 and (row>>5)&3 == (row%128)/32 since 128 is a multiple of 32, so
-  // this equals SwizzleBlockscaleKernel's ((((a0*(Kp/4)+a3)*32+a2)*4+a1)*4+a4) exactly.)
-  // STRUCTURAL WORK REQUIRED (why it is a follow-up, not shipped here): the padding slots
-  // rows[M,round_up(M,128)) / cols[groups,Kp) must be pre-zeroed (SwizzleBlockscaleKernel
-  // zero-fills them) and this must be a SEPARATE quant mode — the linear scale is still
-  // consumed by the non-cutlass WMMA MatmulNvfp4Fp4 path — so the ScaledFp4Quant op gains a
-  // swizzled-output variant used ONLY on the cutlass fuse sites. GPU-validate against the gate.
+  StoreFp4Scale<kSwizzled>(scale, row, g, groups, scale_cols, sc8);
   // outputScale = SFScaleVal / SFValue. In native mode (approx_recip) this uses
   // the fast approximate reciprocal, mirroring the NATIVE vllm cvt_warp_fp16_to_fp4
   // (nvfp4_utils.cuh:283-286 reciprocal_approximate_ftz) — the sub-bucket delta
@@ -1017,11 +1037,15 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
 }
 
 void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
-                              float input_global_scale_inv) {
+                              float input_global_scale_inv,
+                              Fp4ScaleLayout scale_layout) {
   const int64_t m = x.shape[0], k = x.shape[1];
   if (m == 0 || k == 0) return;
   cudaStream_t s = AsStream(q);
-  const int64_t total = m * (k / 16);
+  const bool swizzled = scale_layout == Fp4ScaleLayout::kCutlassSwizzled;
+  const int64_t scale_rows = out_scale.shape[0];
+  const int64_t scale_cols = out_scale.shape[1];
+  const int64_t total = swizzled ? out_scale.Numel() : m * (k / 16);
   constexpr int kBlock = 256;
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
@@ -1029,12 +1053,26 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
   const bool approx = NativeFp4MmaEnabled();  // native path -> fast-reciprocal quant
   switch (x.dtype) {
     case DType::kF32:
-      ScaledFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(pk, sc, x.Ptr<float>(),
-                                                          input_global_scale_inv, m, k, approx);
+      if (swizzled) {
+        ScaledFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+            scale_cols, approx);
+      } else {
+        ScaledFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+            scale_cols, approx);
+      }
       break;
     case DType::kBF16:
-      ScaledFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
-          pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k, approx);
+      if (swizzled) {
+        ScaledFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+            scale_rows, scale_cols, approx);
+      } else {
+        ScaledFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+            scale_rows, scale_cols, approx);
+      }
       break;
     default: VT_CHECK(false, "cuda scaled_fp4_quant: unsupported x dtype (f32/bf16 only)");
   }
@@ -1049,15 +1087,24 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
 // two-input MoeSiluMul form, qwen3_5.cpp DenseMlpBlock). BIT-IDENTICAL to
 // MoeSiluMul(->bf16) then ScaledFp4Quant: silu(gate)*up is ROUNDED THROUGH bf16
 // (MoeSiluMul stores bf16) before quant, reusing the exact ScaledFp4Quant epilogue.
-template <typename Tin>
+template <typename Tin, bool kSwizzled>
 __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin* gate,
                                       const Tin* up, float input_global_scale, int64_t m_rows,
-                                      int64_t i_dim, bool approx_recip) {
+                                      int64_t i_dim, int64_t scale_rows,
+                                      int64_t scale_cols, bool approx_recip) {
   const int64_t groups = i_dim / 16;
   const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (gid >= m_rows * groups) return;
-  const int64_t row = gid / groups;
-  const int64_t g = gid % groups;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
   const int64_t base = row * i_dim + g * 16;
   // silu(gate)*up, rounded through bf16 (== MoeSiluMul store to bf16, cuda_ops.cu:149).
   float v[16];
@@ -1077,7 +1124,7 @@ __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin
   float sc = input_global_scale * (vmax * inverse_six);
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
-  scale[row * groups + g] = sc8;
+  StoreFp4Scale<kSwizzled>(scale, row, g, groups, scale_cols, sc8);
   const float sfv = F8E4M3ToF32Dev(sc8);
   float out_scale = 0.0f;
   if (sfv != 0.0f) {
@@ -1099,11 +1146,15 @@ __global__ void SiluMulFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin
 
 void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
                                const Tensor& gate, const Tensor& up,
-                               float input_global_scale_inv) {
+                               float input_global_scale_inv,
+                               Fp4ScaleLayout scale_layout) {
   const int64_t m = gate.shape[0], i = gate.shape[1];
   if (m == 0 || i == 0) return;
   cudaStream_t s = AsStream(q);
-  const int64_t total = m * (i / 16);
+  const bool swizzled = scale_layout == Fp4ScaleLayout::kCutlassSwizzled;
+  const int64_t scale_rows = out_scale.shape[0];
+  const int64_t scale_cols = out_scale.shape[1];
+  const int64_t total = swizzled ? out_scale.Numel() : m * (i / 16);
   constexpr int kBlock = 256;
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
@@ -1111,13 +1162,26 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
   const bool approx = NativeFp4MmaEnabled();  // pair fused/unfused reciprocal choice
   switch (gate.dtype) {
     case DType::kF32:
-      SiluMulFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(
-          pk, sc, gate.Ptr<float>(), up.Ptr<float>(), input_global_scale_inv, m, i, approx);
+      if (swizzled) {
+        SiluMulFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<float>(), up.Ptr<float>(), input_global_scale_inv,
+            m, i, scale_rows, scale_cols, approx);
+      } else {
+        SiluMulFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<float>(), up.Ptr<float>(), input_global_scale_inv,
+            m, i, scale_rows, scale_cols, approx);
+      }
       break;
     case DType::kBF16:
-      SiluMulFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
-          pk, sc, gate.Ptr<__nv_bfloat16>(), up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m,
-          i, approx);
+      if (swizzled) {
+        SiluMulFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<__nv_bfloat16>(), up.Ptr<__nv_bfloat16>(),
+            input_global_scale_inv, m, i, scale_rows, scale_cols, approx);
+      } else {
+        SiluMulFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate.Ptr<__nv_bfloat16>(), up.Ptr<__nv_bfloat16>(),
+            input_global_scale_inv, m, i, scale_rows, scale_cols, approx);
+      }
       break;
     default: VT_CHECK(false, "cuda silu_mul_fp4_quant: unsupported dtype (f32/bf16 only)");
   }
@@ -1133,17 +1197,25 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
 // output boundary before ScaledFp4Quant while avoiding the intermediate write
 // and read. The quant epilogue is kept identical to the existing two-input
 // fused producer above.
-template <typename Tin>
+template <typename Tin, bool kSwizzled>
 __global__ void SiluAndMulFp4QuantKernel(
     uint8_t* packed, uint8_t* scale, const Tin* gate_up,
     float input_global_scale, int64_t m_rows, int64_t i_dim,
-    bool approx_recip) {
+    int64_t scale_rows, int64_t scale_cols, bool approx_recip) {
   const int64_t groups = i_dim / 16;
   const int64_t gid =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (gid >= m_rows * groups) return;
-  const int64_t row = gid / groups;
-  const int64_t g = gid % groups;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
   const int64_t output_base = row * i_dim + g * 16;
   const int64_t input_row_base = row * (2 * i_dim);
   const int64_t gate_base = input_row_base + g * 16;
@@ -1166,7 +1238,7 @@ __global__ void SiluAndMulFp4QuantKernel(
   float sc = input_global_scale * (vmax * inverse_six);
   sc = fminf(fmaxf(sc, -448.0f), 448.0f);
   const uint8_t sc8 = F32ToFp8Dev(sc);
-  scale[row * groups + g] = sc8;
+  StoreFp4Scale<kSwizzled>(scale, row, g, groups, scale_cols, sc8);
   const float sfv = F8E4M3ToF32Dev(sc8);
   float out_scale = 0.0f;
   if (sfv != 0.0f) {
@@ -1190,11 +1262,15 @@ __global__ void SiluAndMulFp4QuantKernel(
 
 void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
                                   Tensor& out_scale, const Tensor& gate_up,
-                                  float input_global_scale_inv) {
+                                  float input_global_scale_inv,
+                                  Fp4ScaleLayout scale_layout) {
   const int64_t m = gate_up.shape[0], i = gate_up.shape[1] / 2;
   if (m == 0 || i == 0) return;
   cudaStream_t s = AsStream(q);
-  const int64_t total = m * (i / 16);
+  const bool swizzled = scale_layout == Fp4ScaleLayout::kCutlassSwizzled;
+  const int64_t scale_rows = out_scale.shape[0];
+  const int64_t scale_cols = out_scale.shape[1];
+  const int64_t total = swizzled ? out_scale.Numel() : m * (i / 16);
   constexpr int kBlock = 256;
   const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
   auto* pk = out_packed.Ptr<uint8_t>();
@@ -1202,13 +1278,26 @@ void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
   const bool approx = NativeFp4MmaEnabled();
   switch (gate_up.dtype) {
     case DType::kF32:
-      SiluAndMulFp4QuantKernel<float><<<grid, kBlock, 0, s>>>(
-          pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i, approx);
+      if (swizzled) {
+        SiluAndMulFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      } else {
+        SiluAndMulFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      }
       break;
     case DType::kBF16:
-      SiluAndMulFp4QuantKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
-          pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
-          approx);
+      if (swizzled) {
+        SiluAndMulFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      } else {
+        SiluAndMulFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      }
       break;
     default:
       VT_CHECK(false,

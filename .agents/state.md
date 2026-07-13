@@ -5883,3 +5883,45 @@ normal producer + ported padded/layout tests, followed by fused/model wiring;
 then c2/c16 same-binary A/B precedes any exact grid. GPU compute is idle,
 `/tmp/gpu` is free, the unrelated long-lived waiting shell owns no GPU, and
 35B performance remains held.
+
+### 2026-07-13 — W3-E direct scales implemented; correctness/safety/trace pass, A/B pending
+
+W3-E now mirrors vLLM v0.25's executed activation-scale topology. Public
+`Fp4ScaleLayout::{kLinear,kCutlassSwizzled}` makes the output contract explicit
+instead of guessing from shape. The CPU oracle and CUDA normal, two-input SiLU
+and one-input SiLU producers write the tensor-core byte offset directly and
+zero every padded row/column in the same launch. CUDA true-W4A4 CUTLASS model
+sites default direct; `VT_FP4_DIRECT_SF=0` restores the exact former linear
+producer → `SwizzleBlockscale` sequence. CPU, emulation, non-W4A4 and 35B W4A16
+remain inert/linear, and the standalone swizzle op is retained.
+
+Ported upstream padded/layout coverage now includes M=1/32/127/128/256 and
+K=64/1,024/4,096/5,120/14,336/16,384/17,408 plus both fused producers and
+CUTLASS consumption. Local Release CPU passes **16/16 cases, 905/905**. Fresh
+CUDA 13.0.88/sm_121a with FlashInfer's CUTLASS 4.5 compiles. Four focused CUDA
+processes pass **24,647/24,647 assertions**; direct packed bytes and scale bytes
+equal the linear+swizzle composition, padding is zero and direct/composed BF16
+GEMM output is byte-identical. Producer memchecks are zero-error/zero-leak. The
+first production-pool packed-QKV memcheck reports the intentionally persistent
+4-byte alpha plus 8,389,120-byte workspace caches at exit and is **FAILED for
+leak checking only**, with no access error; exact `VT_CUTLASS_NOPOOL=1`
+reproduction passes **14/14, zero errors, zero leaks**. Pool teardown remains
+the separate known device-residency debt.
+
+Real 27B direct and fallback each pass **235/235 assertions + 16/16 oracle
+tokens**. The required correctness-only 35B run passes **2/2 cases, 315/315**,
+proving W4A16 is inert; no 35B performance command ran. One-lock paired
+real-model Nsight reports standalone swizzles **208 direct / 832 fallback**:
+the 208 direct calls are one-time weight layout, while all **624** activation
+swizzles disappear. Normal producer counts remain 432/432 and one-input fused
+counts 192/192. Direct/fallback report SHA are `ad87631e…c022` /
+`c3063f90…e1f8`; kernel-summary SHA are `aee5220e…0779` /
+`eb4d5713…1369`. Profile durations are structural/non-binding. Mutable evidence
+is `~/work/vllm.cpp-nvfp4-direct-sf-evidence`; GPU and lock exit idle.
+
+This checkpoint advances W3-E from `READY` to implemented/`GATING`, not `DONE`.
+No throughput, latency or memory ratio is accepted and immutable `3f256ab`
+remains binding at **55/124**. Next: commit/push, rebuild the clean SHA, then run
+the specified c2/c16 AB/BA/AB same-binary component under one lock. Only an
+every-axis accepted component permits the exact v0.25 27B grid; 35B performance
+remains held.

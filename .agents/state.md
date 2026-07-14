@@ -7999,3 +7999,43 @@ passes. Binding `3f256ab` remains **55/124**. `ENG-ASYNC-SCHED` stays
 unowned `READY` as later parity work with no speed credit. The active order-0
 task is exact c2 ours/vLLM RMSNorm/generated-partition and resolved FP4-tactic
 mapping, followed by a spike and gate for the highest complete lever.
+
+## 2026-07-14 — c2 oracle topology fixed; local trace observer becomes batch-exact
+
+Read-only reconstruction of the accepted async-ON Torch trace at
+`~/work/vllm-async-credit/3812d8d2b4a68d2e501007d01fe10cdf17751d02`
+now fixes the oracle side of the low-batch executed-path comparison. Selected
+trace SHA `57413dd1407f4b6901d5124a16297b81a4ac7b71cd45449d78d8f7235b1d1cba`
+contains 1,536 generation annotations and exactly **1,524** non-overlapping
+`execute_context_0(0)_generation_2(2)` windows. Every window contains exactly
+**1,160 kernels**. Ordered-name and full launch-signature sequences are
+identical across all windows, with SHA-256 `858915dd…fad0` and
+`b5c6fcac…dd7b`.
+
+The oracle's 208 FP4 GEMMs per window resolve to **128** Stream-K
+128x64x256 calls (name SHA `2f402444…0237`, 44.275586 ms/window) plus **80**
+static-persistent 128x32x256 calls (name SHA `4fe399b3…2616`, 8.579975
+ms/window). Seven generated RMSNorm/quant partition names total **177 calls /
+0.442805 ms per window**. These are structural cross-profiler targets, not a
+speed ratio or evidence that a local leaf is slower.
+
+The trace-build-only CUDA observer previously admitted only B=S=16. It now
+records an explicitly configured exact batch; the server keeps 16 as the
+default accepted H1d contract and exposes `--cuda-profile-graph-batch` only
+with the existing trace controls. The online driver adds
+`--trace-concurrency 2`, which preserves the model gate, frozen 64-plan map,
+three independent local Nsight sessions/four ranges each, c2/6 closed-loop
+corpus, fresh vLLM trace, one whole-series lock, cache eviction and lifecycle.
+It deliberately writes no accepted c2 status yet: zero-exit raw capture is
+still `PENDING` until a separate fail-closed low-batch finalizer reconstructs
+all artifacts.
+
+No DGX workload ran in this checkpoint; read-only inspection found no compute
+owner. The complete CPU CTest passes **106/106**, the benchmark-tool discovery
+suite passes **57/57**, the focused trace/client/summary suite passes **35/35**,
+and the agent-record + mutation/doc suites pass **18/18**; shell/Python syntax
+and diff checks also pass. Production builds contain no observer, the binding result remains
+`3f256ab` at **55/124**, and neither `KERNEL-EW-NORM-ACT` nor a new FP4 lever
+is promoted. Next: commit/push this trace contract, execute the fresh c2 paired
+capture under one lock, finalize it, then write the spike for the highest
+complete measured residual.

@@ -11,13 +11,13 @@ OpenAI-compatible server.
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
 > The post-W3-I residual scan is complete. At c2 our TTFT is already better,
 > but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
-> binding diagnostic is now complete: the clean `3812d8` async ON/OFF c2
-> series measures **160.347697 / 160.003134 tok/s = 1.002153×** total
-> throughput. ON improves TPOT by only about **1.0%** while increasing TTFT by
-> about **16.0%**; its Torch trace has **0.2% more** aggregate GPU-kernel time.
-> Async scheduling is therefore neutral for the missing 6.1% and earns no
-> speed credit or implementation claim. The speed track has returned to exact
-> low-batch RMSNorm/generated-partition and FP4-tactic mapping. Separately, the
+> binding diagnostic is complete: `3812d8` shows async scheduling adds only
+> **0.215%** total throughput and cannot explain the gap. The accepted oracle
+> trace now fixes the c2 target at **1,524** clean batch-2 windows and **1,160
+> kernels/window**, including a 128 Stream-K + 80 static-persistent FP4 tactic
+> split. The trace-only local observer is batch-2 capable; its fresh paired
+> capture/final status is **PENDING**, so no RMSNorm residual or next kernel
+> lever is claimed yet. Separately, the
 > host-memory gap is traced to a persistent **22.92 GiB CPU weight mirror**
 > plus load-time safetensors residency. The binding result remains **55/124**, W3-I stays
 > default-off, and no 35B performance result is claimed. See
@@ -28,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; async credit is closed at only **1.002153×** | Map the exact c2 ours/vLLM low-batch kernels, then gate the selected RMSNorm/FP4 lever |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; the c2 oracle topology is fixed but the local paired capture is pending | Finalize the exact c2 ours/vLLM map, then spike and gate the selected RMSNorm/FP4 lever |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -57,7 +57,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
 | Closed scheduler diagnostic | Accepted `3812d8` c2 ON/OFF: total **160.347697 / 160.003134 tok/s = 1.002153×**; TPOT **106.642 / 107.740 ms**, TTFT **807.658 / 696.330 ms**. Traces total **170.820 / 170.478 s** GPU-kernel time. Async is neutral for speed; W3 remains later parity work |
-| Selected GPU work | Map the c2 ours/vLLM RMSNorm/generated partitions and resolved FP4 tactics, then gate the highest complete lever; the already-grounded normal BF16→FP4 residual is only about 0.25% end to end |
+| Selected GPU work | Oracle side fixed: 1,524 clean c2 windows, 1,160 kernels/window, 177 generated RMSNorm/quant calls, and a 128+80 FP4 tactic split. Capture/finalize the equivalent local batch-2 graph before selecting a lever |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 
@@ -179,7 +179,7 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: map and gate the c2 low-batch kernel
+The next execution order is fixed: finalize and gate the c2 low-batch kernel
 residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate →
 the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external
 KV cache / LMCache support.

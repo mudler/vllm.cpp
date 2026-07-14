@@ -462,6 +462,7 @@ def write_profile_log(
     fixture: pathlib.Path,
     native_target: pathlib.Path,
     server_pid: int,
+    batch: int = TRACE_CONCURRENCY,
 ) -> None:
     document = json.loads(fixture.read_text(encoding="utf-8"))
     plans = []
@@ -489,7 +490,7 @@ def write_profile_log(
         f"[VT_CUDA_PROFILE] ready pid={server_pid} signal=SIGUSR2 target_replays=4",
         f"[VT_BENCH_SHUTDOWN] ready pid={server_pid} control=fifo",
         "[VT_CUDA_PROFILE] started target_replays=4 graph=0x1234 "
-        "real_batch=16 padded_batch=16 prior_replays=128",
+        f"real_batch={batch} padded_batch={batch} prior_replays=128",
         "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234",
         "[VT_BENCH_SHUTDOWN] requested control=fifo",
         "[VT_BENCH_SHUTDOWN] completed control=fifo",
@@ -856,6 +857,66 @@ class OnlineClientContractTests(unittest.TestCase):
                     shutdown_fifo=root / "shutdown.fifo",
                 )
 
+    def test_profile_control_accepts_only_the_requested_low_batch(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+                batch=2,
+            )
+            result = record_profile_control(
+                root / "control.json",
+                profile_log=profile_log,
+                nsys_pid=5000,
+                nsys_pgid=5000,
+                nsys_sid=5000,
+                nsys_exit_status=0,
+                launcher_pid=5500,
+                launcher_ppid=5000,
+                launcher_pgid=5000,
+                launcher_sid=5000,
+                launcher_comm="nsys-launcher",
+                server_pid=6000,
+                server_ppid=5500,
+                server_pgid=6000,
+                server_sid=6000,
+                shutdown_fifo=root / "shutdown.fifo",
+                expected_batch=2,
+            )
+            self.assertEqual(result["real_batch"], 2)
+            self.assertEqual(result["padded_batch"], 2)
+
+            with self.assertRaisesRegex(HarnessError, "four-replay contract"):
+                record_profile_control(
+                    root / "wrong-control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=6000,
+                    server_sid=6000,
+                    shutdown_fifo=root / "shutdown.fifo",
+                    expected_batch=16,
+                )
+
     def test_profile_control_rejects_a_flattened_nsys_process_group(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         fixture = (
@@ -967,6 +1028,24 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertLess(probe_index, wait_index)
         self.assertLess(wait_index, shutdown_index)
         self.assertIn("--trace-only", script)
+
+    def test_trace_driver_keeps_c2_staging_non_binding(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--trace-concurrency 2|16", script)
+        self.assertIn("server_cmd+=(--cuda-profile-graph-batch 2)", script)
+        self.assertIn('--expected-batch "${trace_concurrency}"', script)
+        self.assertIn(
+            "c2 raw paired trace capture complete; status remains PENDING",
+            script,
+        )
+        pending = script.index(
+            "c2 raw paired trace capture complete; status remains PENDING"
+        )
+        accepted_status = script.index("record-trace-status", pending)
+        self.assertLess(pending, accepted_status)
 
     def test_nsys_range_validation_rejects_loss_replays_and_start_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -88,6 +88,7 @@ struct Args {
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
+  int cuda_profile_graph_batch = 0;  // 0 => accepted c16 trace contract.
   std::string benchmark_shutdown_fifo;  // paired trace-only control path.
   std::optional<bool> enable_prefix_caching = std::nullopt;
   bool enable_force_include_usage = false;
@@ -105,6 +106,7 @@ struct Args {
          "               [--max-num-seqs N] "
          "[--max-num-batched-tokens N]\n"
          "               [--cuda-profile-graph-replays N]\n"
+         "               [--cuda-profile-graph-batch N]\n"
          "               [--benchmark-shutdown-fifo F]\n"
          "               [--enable-force-include-usage]\n"
          "               [--[no-]enable-prefix-caching]\n"
@@ -144,6 +146,9 @@ Args ParseArgs(int argc, char** argv) {
     } else if (flag == "--cuda-profile-graph-replays") {
       a.cuda_profile_graph_replays =
           std::stoi(NextArg(argc, argv, i, argv[0]));
+    } else if (flag == "--cuda-profile-graph-batch") {
+      a.cuda_profile_graph_batch =
+          std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--benchmark-shutdown-fifo") {
       a.benchmark_shutdown_fifo = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--enable-force-include-usage") {
@@ -169,7 +174,7 @@ Args ParseArgs(int argc, char** argv) {
     Usage(argv[0], 2);
   }
   if (a.max_num_seqs <= 0 || a.max_num_batched_tokens < 0 ||
-      a.cuda_profile_graph_replays < 0) {
+      a.cuda_profile_graph_replays < 0 || a.cuda_profile_graph_batch < 0) {
     std::cerr << "server: scheduler capacities must be positive "
                  "(--max-num-batched-tokens may be 0 for auto)\n";
     Usage(argv[0], 2);
@@ -178,6 +183,18 @@ Args ParseArgs(int argc, char** argv) {
       !a.benchmark_shutdown_fifo.empty()) {
     std::cerr << "server: --cuda-profile-graph-replays and "
                  "--benchmark-shutdown-fifo must be specified together\n";
+    Usage(argv[0], 2);
+  }
+  if (a.cuda_profile_graph_replays == 0 && a.cuda_profile_graph_batch != 0) {
+    std::cerr << "server: --cuda-profile-graph-batch requires "
+                 "--cuda-profile-graph-replays\n";
+    Usage(argv[0], 2);
+  }
+  if (a.cuda_profile_graph_replays > 0 && a.cuda_profile_graph_batch == 0) {
+    a.cuda_profile_graph_batch = 16;
+  }
+  if (a.cuda_profile_graph_batch > a.max_num_seqs) {
+    std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
   }
   return a;
@@ -232,7 +249,8 @@ int main(int argc, char** argv) {
     if (args.cuda_profile_graph_replays > 0) {
 #ifdef VT_BENCH_PROFILE_CONTROL
       vt::cuda::ConfigureCudaGraphReplayProfiler(
-          static_cast<uint32_t>(args.cuda_profile_graph_replays));
+          static_cast<uint32_t>(args.cuda_profile_graph_replays),
+          static_cast<uint32_t>(args.cuda_profile_graph_batch));
       std::cerr << "[VT_CUDA_PROFILE] ready pid=" << getpid()
                 << " signal=SIGUSR2 target_replays="
                 << args.cuda_profile_graph_replays << "\n";

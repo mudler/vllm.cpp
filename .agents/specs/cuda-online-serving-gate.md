@@ -23,12 +23,25 @@ vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path has now
 been measured directly. Accepted `3812d8` completes six c2 timing legs and two
 shape-neutral traces: ON/OFF total **1.002153×**, direction-normalized TPOT
 **1.010291×**, TTFT **0.862159×**, and aggregate GPU time **1.002004×**. It is
-neutral for the 6.1% gap and earns no speed credit; exact low-batch RMSNorm/
-generated-partition and FP4-tactic mapping is the next gate.
-If the provisional neutral result repeats, the speed
-track moves to low-batch kernel traces and exact RMSNorm/generated-partition
-mapping. Host PSS/RSS is independently grounded in a persistent **22.920 GiB**
-CPU weight mirror plus load-time source-page residency.
+neutral for the 6.1% gap and earns no speed credit.
+
+Read-only reconstruction of its accepted async-ON raw trace now fixes the
+oracle side of the next gate. Selected trace SHA `57413dd1…1cba` contains
+**1,536** generation annotations, **1,524** non-overlapping clean batch-2
+decode windows and exactly **1,160 kernels/window**. All windows have identical
+ordered-name and launch-signature SHA values `858915dd…fad0` and
+`b5c6fcac…dd7b`. Per window, vLLM resolves its 208 FP4 GEMMs to **128**
+Stream-K 128x64x256 calls plus **80** static-persistent 128x32x256 calls. Its
+seven RMSNorm/generated-quant partitions total **177 calls / 0.442805 ms** per
+window. This is a structural oracle contract, not a cross-profiler speed ratio.
+
+The trace-only local observer and driver now accept an explicit exact batch-2
+target while retaining batch 16 as the accepted H1d default. Production builds
+contain neither observer. The fresh three-session local c2 capture and paired
+oracle rerun are **PENDING**, as is their fail-closed final status; no local
+RMSNorm residual, tactic mismatch or selected implementation is claimed yet.
+Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
+weight mirror plus load-time source-page residency.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -46,9 +59,9 @@ and peak host/GPU memory. The same prompts, tokenizer output, arrival policy,
 sampling parameters, warmup, and request count are mandatory.
 Each timed invocation first issues one full-concurrency warmup wave so lazy
 capture/JIT work cannot contaminate the reported request set.
-The paired profiler keeps only 16 requests resident and admits one replacement
-per completion, matching the online closed-loop client instead of preloading all
-48 prompts.
+The accepted c16 profiler keeps 16 of 48 requests resident. The active c2
+diagnostic keeps two of six resident. Both admit one replacement per completion,
+matching the online closed-loop client instead of preloading all prompts.
 
 ## Upstream chain
 
@@ -103,7 +116,7 @@ can be re-aggregated; it cannot satisfy attribution.
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
-| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py` |
+| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16/48 or c2/6 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py`. The trace-build-only server/controller accepts an exact graph batch; production builds do not |
 
 ## Tests to port
 
@@ -120,6 +133,9 @@ can be re-aggregated; it cannot satisfy attribution.
   `tests/tools/test_online_gate_trace.py`; output-repeatability metadata and
   project every-axis/void propagation are covered by
   `tests/tools/test_online_gate_{client,summary}.py`.
+- Client contracts require the recorded local profile batch to equal the
+  requested diagnostic batch and reject reinterpreting a batch-2 trace as the
+  accepted batch-16 H1d contract.
 - The profiler test drives a fake engine through closed-loop replacement
   admission and proves the resident request count never exceeds c16. Client and
   summary cases reject missing cache-off flags or drifted cache/admission/
@@ -158,10 +174,14 @@ warmup, all interleaved repetitions, shutdown, memory sampling, and paired
 traces. The c32 client point is backed by an explicit 32-sequence scheduler on
 both arms rather than the local server's historical default of eight. Both
 servers explicitly disable prefix caching, and the paired trace uses closed-loop
-c16 admission, max-seqs 32, production max model length, and three cache-off
-repetitions whose durations differ by no more than 20%. Ours must run Nsight
+c16/48 or c2/6 admission, max-seqs 32, production max model length, and three
+cache-off repetitions. Ours must run Nsight
 with `--cuda-graph-trace=node`; whole-graph activities without child kernels
-fail attribution. Each
+fail attribution. A c2 capture is not accepted merely because all raw profilers
+exit zero: its three local sessions, twelve exact batch-2 graph ranges, fresh
+oracle trace, ordered topology, plan map, lifecycle, hashes and final status
+must all reconcile. Until that finalizer lands and passes, the local arm is
+explicitly `PENDING`. Each
 model/point has
 at least three valid repetitions and a fresh pinned-vLLM denominator. The
 commit-bound model gate is the correctness precondition before performance is
@@ -227,9 +247,11 @@ reported as a clean dependency check.
    and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
    Accepted c2 async control `3812d8` is neutral at **1.002153×** total and
-   **1.002004×** traced GPU time, so do not claim W3 for speed. Capture
-   equivalent low-batch ours/vLLM traces and map RMSNorm/generated partitions
-   plus resolved FP4 tactics before coding the next lever.
+   **1.002004×** traced GPU time, so do not claim W3 for speed. The accepted
+   oracle trace now pins 1,524 clean c2 windows, 1,160 kernels/window, seven
+   generated partitions and the 128+80 FP4 tactic split. Capture/finalize the
+   equivalent batch-2 local and fresh oracle arms before mapping a residual or
+   coding the next lever.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
    and gate the smallest grounded kernel leaf. Host-weight ownership is a

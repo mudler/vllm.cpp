@@ -1758,7 +1758,11 @@ def _parse_fp4_plan_log(path: pathlib.Path) -> dict[str, Any]:
     }
 
 
-def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
+def _parse_profile_markers(
+    path: pathlib.Path, *, expected_batch: int = TRACE_CONCURRENCY
+) -> dict[str, Any]:
+    if expected_batch <= 0:
+        raise HarnessError("CUDA profile marker batch must be positive")
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError as error:
@@ -1797,8 +1801,8 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
         int(ready_target) != TRACE_CAPTURE_GRAPH_REPLAYS
         or int(start_target) != TRACE_CAPTURE_GRAPH_REPLAYS
         or int(stopped_replays) != TRACE_CAPTURE_GRAPH_REPLAYS
-        or int(real_batch) != TRACE_CONCURRENCY
-        or int(padded_batch) != TRACE_CONCURRENCY
+        or int(real_batch) != expected_batch
+        or int(padded_batch) != expected_batch
         or int(prior_replays) <= 0
         or stopped_graph != start_graph
         or shutdown_ready_pid != ready_pid
@@ -1807,10 +1811,10 @@ def _parse_profile_markers(path: pathlib.Path) -> dict[str, Any]:
     return {
         "captured_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
         "graph": start_graph,
-        "padded_batch": TRACE_CONCURRENCY,
+        "padded_batch": expected_batch,
         "prior_replays": int(prior_replays),
         "ready_pid": int(ready_pid),
-        "real_batch": TRACE_CONCURRENCY,
+        "real_batch": expected_batch,
         "shutdown_completed": True,
         "shutdown_control": "fifo",
         "shutdown_ready_pid": int(shutdown_ready_pid),
@@ -1837,6 +1841,7 @@ def record_profile_control(
     server_pgid: int,
     server_sid: int,
     shutdown_fifo: pathlib.Path,
+    expected_batch: int = TRACE_CONCURRENCY,
 ) -> dict[str, Any]:
     if output.exists():
         raise HarnessError(f"refusing to overwrite profile control evidence: {output}")
@@ -1875,7 +1880,9 @@ def record_profile_control(
         raise HarnessError("profiled server is not the Nsight target-session leader")
     if not shutdown_fifo.is_absolute() or shutdown_fifo.exists():
         raise HarnessError("profile shutdown FIFO is not an absent absolute path")
-    markers = _parse_profile_markers(profile_log)
+    markers = _parse_profile_markers(
+        profile_log, expected_batch=expected_batch
+    )
     if markers["ready_pid"] != server_pid:
         raise HarnessError("profile ready marker PID differs from the controlled server")
     result = {
@@ -3370,6 +3377,9 @@ def _parser() -> argparse.ArgumentParser:
     profile_control.add_argument("--server-pgid", type=int, required=True)
     profile_control.add_argument("--server-sid", type=int, required=True)
     profile_control.add_argument("--shutdown-fifo", type=pathlib.Path, required=True)
+    profile_control.add_argument(
+        "--expected-batch", type=int, default=TRACE_CONCURRENCY
+    )
 
     trace = commands.add_parser("record-trace-status")
     trace.add_argument("--output", type=pathlib.Path, required=True)
@@ -3529,6 +3539,7 @@ def main() -> int:
             server_pgid=args.server_pgid,
             server_sid=args.server_sid,
             shutdown_fifo=args.shutdown_fifo,
+            expected_batch=args.expected_batch,
         )
     elif args.command == "record-trace-status":
         result = record_trace_status(

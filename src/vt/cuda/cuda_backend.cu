@@ -27,9 +27,12 @@ namespace {
 volatile std::sig_atomic_t g_cuda_profile_arm_requested = 0;
 uint32_t g_cuda_profile_target_replays = 0;
 uint32_t g_cuda_profile_remaining_replays = 0;
+uint32_t g_cuda_profile_target_batch = 0;
 void* g_cuda_profile_pending_graph = nullptr;
 void* g_cuda_profile_graph = nullptr;
 uint64_t g_cuda_profile_prior_replays = 0;
+uint32_t g_cuda_profile_real_batch = 0;
+uint32_t g_cuda_profile_padded_batch = 0;
 bool g_cuda_profile_eligible_pending = false;
 bool g_cuda_profile_active = false;
 bool g_cuda_profile_completed = false;
@@ -165,8 +168,9 @@ class CudaBackend final : public Backend {
       if (g_cuda_profile_remaining_replays == g_cuda_profile_target_replays) {
         std::fprintf(stderr,
                      "[VT_CUDA_PROFILE] started target_replays=%u graph=%p "
-                     "real_batch=16 padded_batch=16 prior_replays=%llu\n",
+                     "real_batch=%u padded_batch=%u prior_replays=%llu\n",
                      g_cuda_profile_target_replays, graph,
+                     g_cuda_profile_real_batch, g_cuda_profile_padded_batch,
                      static_cast<unsigned long long>(g_cuda_profile_prior_replays));
       }
     }
@@ -222,17 +226,19 @@ struct Registrar {
 }  // namespace
 
 #ifdef VT_BENCH_PROFILE_CONTROL
-void ConfigureCudaGraphReplayProfiler(uint32_t replays) {
-  if (replays == 0) {
+void ConfigureCudaGraphReplayProfiler(uint32_t replays, uint32_t batch_size) {
+  if (replays == 0 || batch_size == 0) {
     throw std::invalid_argument(
-        "CUDA graph replay profiler requires a positive replay count");
+        "CUDA graph replay profiler requires positive replay and batch counts");
   }
   if (g_cuda_profile_target_replays != 0) {
     throw std::logic_error("CUDA graph replay profiler is already configured");
   }
   g_cuda_profile_target_replays = replays;
+  g_cuda_profile_target_batch = batch_size;
   if (std::signal(SIGUSR2, CudaProfilerArmSignalHandler) == SIG_ERR) {
     g_cuda_profile_target_replays = 0;
+    g_cuda_profile_target_batch = 0;
     throw std::runtime_error("could not install CUDA profiler SIGUSR2 handler");
   }
 }
@@ -240,8 +246,9 @@ void ConfigureCudaGraphReplayProfiler(uint32_t replays) {
 void MarkCudaGraphReplayProfilerEligible(void* graph, uint32_t real_batch,
                                          uint32_t padded_batch,
                                          uint64_t prior_replays) {
-  if (g_cuda_profile_completed || graph == nullptr || real_batch != 16 ||
-      padded_batch != 16 || prior_replays == 0) {
+  if (g_cuda_profile_completed || graph == nullptr ||
+      real_batch != g_cuda_profile_target_batch ||
+      padded_batch != g_cuda_profile_target_batch || prior_replays == 0) {
     return;
   }
   if (g_cuda_profile_eligible_pending) {
@@ -250,6 +257,8 @@ void MarkCudaGraphReplayProfilerEligible(void* graph, uint32_t real_batch,
   }
   g_cuda_profile_pending_graph = graph;
   g_cuda_profile_prior_replays = prior_replays;
+  g_cuda_profile_real_batch = real_batch;
+  g_cuda_profile_padded_batch = padded_batch;
   g_cuda_profile_eligible_pending = true;
 }
 #endif

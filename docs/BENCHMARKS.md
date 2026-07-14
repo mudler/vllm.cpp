@@ -15,7 +15,11 @@ ON/OFF median total throughput is **160.347697 / 160.003134 tok/s =
 1.002153×**. ON improves TPOT only **1.0%** and increases TTFT **16.0%**;
 shape-neutral ON/OFF traces total **170.820 / 170.478 s** of GPU-kernel time.
 It is neutral against the predeclared 1.04× minimum, so W3 remains an unmet
-parity obligation rather than a speed lever. Host PSS/RSS is independently
+parity obligation rather than a speed lever. Its accepted ON trace now pins
+the oracle c2 topology at **1,524 clean batch-2 windows / 1,160 kernels per
+window**, with identical ordered signatures across every window. The local
+trace-only seam is now batch-2 capable, but its fresh paired capture and final
+status are **PENDING**. Host PSS/RSS is independently
 traced to a persistent **22.920 GiB** CPU weight mirror plus source-page
 residency during load. W3-I
 remains default-off after its **30/48** component failure.
@@ -64,8 +68,9 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Map the exact c2 ours/vLLM RMSNorm/generated partitions and FP4 tactics, gate the selected lever, then rerun the exact grid |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Finalize the exact c2 ours/vLLM kernel map, gate the selected lever, then rerun the exact grid |
 | vLLM async-scheduler credit | **COMPLETE DIAGNOSTIC / NEUTRAL FOR SPEED** | Clean `3812d8`, six timing legs plus two shape-neutral traces under one lock. ON/OFF medians: total **160.347697 / 160.003134 tok/s = 1.002153×**, TPOT **106.642 / 107.740 ms** (ON ~1.0% better), TTFT **807.658 / 696.330 ms** (ON ~16.0% slower). Trace count/time: **1,798,044 / 170.819890 s** ON and **1,810,902 / 170.478267 s** OFF; tactic/batch mix changes, aggregate GPU time does not improve. Summary/manifest/artifact SHA `35b7344a…c323` / `e757b4ad…86c6` / `ead68397…8e56`; cleanup returned lock/GPU/port idle | Keep `ENG-ASYNC-SCHED` as later parity work; move the speed-critical path to low-batch kernel mapping |
+| Exact c2 executed path | **ACTIVE / LOCAL CAPTURE PENDING** | Accepted oracle trace SHA `57413dd1…1cba`: **1,536** annotations, **1,524** clean B=2 windows, **1,160 kernels/window**, ordered-name/signature SHA `858915dd…fad0` / `b5c6fcac…dd7b`. Per window: **177 generated RMSNorm/quant calls / 0.442805 ms**; FP4 GEMMs resolve to **128 Stream-K 128x64x256 + 80 static-persistent 128x32x256**. This is structural, not a speed ratio | Run the fresh three-session local batch-2 Nsight capture plus paired oracle trace, then fail-closed finalize before selecting a lever |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -86,7 +91,7 @@ scan ranks the live evidence as follows:
 | Finding | Binding interpretation |
 |---|---|
 | vLLM depth-2 async scheduling + GPU-resident sampled-token path | Complete ON/OFF timing gives only **+0.215%** total throughput, ~1.0% better TPOT and ~16.0% worse TTFT; ON has **0.200% more** aggregate traced GPU time. It cannot close the 6.1% gap and leaves the speed-critical path |
-| RMSNorm/generated partitions | Largest unmapped GPU candidate; ours spends **2.094864 ms/window** across 129 RMSNorm nodes, but oracle partitions need exact node/adjacency mapping before a speed claim |
+| RMSNorm/generated partitions | Oracle c2 side is now exact: seven generated families total **177 calls / 0.442805 ms per window**. The old local c16 baseline is **129 calls / 2.094864 ms**; only the pending local c2 capture can establish a comparable structural residual |
 | Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
 | Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
 
@@ -105,6 +110,38 @@ still completed exact 1,024→128 lengths with no errors. This is diagnostic
 evidence for the already inventoried default batch non-invariance, not a new
 correctness or support claim; the separate token-exact correctness gate remains
 the precondition for performance work.
+
+## Reproduce the pending c2 executed-path capture
+
+Use the clean source/corpus/configure setup in the schema-v5 reproduction below,
+but invoke the paired trace at exact concurrency two. This command intentionally
+produces raw, per-range-validated evidence without an accepted status; the
+low-batch finalizer is the next checkpoint, so no partial trace may bind:
+
+```sh
+SHA=$(git rev-parse HEAD)
+ROOT="$HOME/work/vllm.cpp-executed-path-c2/$SHA"
+export VT_FP4_AUTOTUNE=1
+export VT_FP4_AUTOTUNE_CACHE_PATH="$ROOT/evidence/$SHA/readonly-native-must-not-exist.json"
+export VT_FP4_AUTOTUNE_CACHE_READONLY=1
+export VT_FP4_AUTOTUNE_DELAY_US=5000
+export VT_FP4_FLASHINFER_CACHE_PATH="$ROOT/source/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+export VT_FP4_FULL_TACTICS=1 VT_FP4_PERSISTENT_CACHE=1
+export VT_FP4_PLAN_CACHE=1 VT_FP4_PRE_SERVE_WARMUP=1
+
+"$ROOT/source/scripts/dgx-online-serving.sh" --trace-only \
+  --trace-concurrency 2 --model 27 \
+  --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a" \
+  --source-corpus "$ROOT/evidence/$SHA/corpus/27" \
+  --evidence "$ROOT/evidence/$SHA" --build-dir "$ROOT/build-cuda" \
+  --configure-log "$ROOT/configure.log" \
+  --client "$HOME/venvs/vllm-oracle/bin/vllm" --vllm-cpp-sha "$SHA"
+```
+
+The driver holds one lock across the 27B model gate, three independent local
+Nsight sessions with four exact B=2 graph ranges each, and a fresh six-prompt,
+three-repetition vLLM Torch trace. Batch 16 remains the default accepted H1d
+contract when `--trace-concurrency` is omitted.
 
 ## Reproduce the accepted async-credit diagnostic
 

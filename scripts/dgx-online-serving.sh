@@ -14,7 +14,8 @@ usage:
   dgx-online-serving.sh --dry-run [--claim-root DIR] [--client PATH] [--vllm-cpp-sha SHA]
   dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
   dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
-    --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
+    --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N] \
+    [--trace-concurrency 2|16]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
 EOF
@@ -34,6 +35,7 @@ port=8001
 num_blocks=4736
 max_num_seqs=32
 max_num_batched_tokens=""
+trace_concurrency=16
 
 while (($#)); do
   case "$1" in
@@ -53,6 +55,7 @@ while (($#)); do
     --vllm-cpp-sha) vllm_cpp_sha=${2:?}; shift 2 ;;
     --port) port=${2:?}; shift 2 ;;
     --num-blocks) num_blocks=${2:?}; shift 2 ;;
+    --trace-concurrency) trace_concurrency=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -114,6 +117,10 @@ if [[ ${mode} == execute ]]; then
 fi
 if [[ ${mode} == trace-only && ${model} != 27 ]]; then
   echo "H1d trace-only control is defined only for the Qwen3.6-27B dense graph; 35B performance remains held" >&2
+  exit 2
+fi
+if [[ ${mode} == trace-only && ${trace_concurrency} != 2 && ${trace_concurrency} != 16 ]]; then
+  echo "--trace-concurrency must be 2 or 16" >&2
   exit 2
 fi
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
@@ -391,13 +398,20 @@ run_leg() {
 
 run_paired_traces() {
   local trace_dir="${evidence}/trace/${model}"
+  local trace_prompts=48
+  if [[ ${trace_concurrency} == 2 ]]; then
+    trace_prompts=6
+  fi
   local vllm_profile_dir="${trace_dir}/vllm-profile"
   local vllm_metadata="${trace_dir}/vllm-profile-metadata.json"
-  local vllm_corpus="${evidence}/corpus/${model}/vllm/c16-r1.jsonl"
+  local vllm_corpus="${evidence}/corpus/${model}/vllm/c${trace_concurrency}-r1.jsonl"
   local vllm_summary="${trace_dir}/vllm-kernels.json"
   local vllm_log="${trace_dir}/vllm-profile.log"
   local vllm_command="${trace_dir}/vllm-profile-command.txt"
   local status="${trace_dir}/status.json"
+  if [[ ${trace_concurrency} == 2 ]]; then
+    status="${trace_dir}/status-c2.json"
+  fi
   local cache_before_ours="${trace_dir}/cache-before-ours.json"
   local cache_between="${trace_dir}/cache-between-engines.json"
   local cache_after_vllm="${trace_dir}/cache-after-vllm.json"
@@ -450,6 +464,11 @@ run_paired_traces() {
       --max-model-len 262144
       --no-enable-prefix-caching
       --cuda-profile-graph-replays 4
+    )
+    if [[ ${trace_concurrency} == 2 ]]; then
+      server_cmd+=(--cuda-profile-graph-batch 2)
+    fi
+    server_cmd+=(
       --benchmark-shutdown-fifo "${shutdown_fifo}"
       --served-model-name gate
     )
@@ -539,9 +558,9 @@ run_paired_traces() {
       --model-key "${model}" \
       --engine ours \
       --base-url "http://127.0.0.1:${port}" \
-      --concurrency 16 \
+      --concurrency "${trace_concurrency}" \
       --repetition 1 \
-      --num-prompts 48 \
+      --num-prompts "${trace_prompts}" \
       --artifact-tag "trace${trace_rep}"
     [[ ! -e ${VT_FP4_AUTOTUNE_CACHE_PATH} ]] || {
       echo "forbidden native plan target was created before capture" >&2
@@ -555,9 +574,9 @@ run_paired_traces() {
       --model-key "${model}" \
       --engine ours \
       --base-url "http://127.0.0.1:${port}" \
-      --concurrency 16 \
+      --concurrency "${trace_concurrency}" \
       --repetition 1 \
-      --num-prompts 16 \
+      --num-prompts "${trace_concurrency}" \
       --num-warmups 0 \
       --artifact-tag "trace${trace_rep}-probe"
     local capture_closed=0
@@ -625,7 +644,8 @@ run_paired_traces() {
       --server-ppid "${server_ppid}" \
       --server-pgid "${server_pgid}" \
       --server-sid "${server_sid}" \
-      --shutdown-fifo "${shutdown_fifo}"
+      --shutdown-fifo "${shutdown_fifo}" \
+      --expected-batch "${trace_concurrency}"
     for range_index in 1 2 3 4; do
       local range_prefix="${ours_prefix}.${range_index}"
       local ours_rep="${range_prefix}.nsys-rep"
@@ -675,8 +695,8 @@ run_paired_traces() {
     --corpus "${vllm_corpus}"
     --profile-dir "${vllm_profile_dir}"
     --metadata "${vllm_metadata}"
-    --num-prompts 48
-    --max-concurrency 16
+    --num-prompts "${trace_prompts}"
+    --max-concurrency "${trace_concurrency}"
     --max-num-seqs "${max_num_seqs}"
     --max-num-batched-tokens "${max_num_batched_tokens}"
     --repetitions 3
@@ -684,10 +704,16 @@ run_paired_traces() {
   printf '%q ' "${vllm_profile_cmd[@]}" >"${vllm_command}"
   printf '\n' >>"${vllm_command}"
   "${vllm_profile_cmd[@]}" >"${vllm_log}" 2>&1
-  python3 "${repo_root}/tools/bench/summarize_torch_kernels.py" \
-    --profile-dir "${vllm_profile_dir}" \
-    --model-key "${model}" \
-    --output "${vllm_summary}"
+  if [[ ${trace_concurrency} == 16 ]]; then
+    python3 "${repo_root}/tools/bench/summarize_torch_kernels.py" \
+      --profile-dir "${vllm_profile_dir}" \
+      --model-key "${model}" \
+      --output "${vllm_summary}"
+  else
+    python3 "${repo_root}/tools/bench/summarize_torch_kernels.py" \
+      --profile-dir "${vllm_profile_dir}" \
+      --output "${vllm_summary}"
+  fi
   local vllm_trace
   vllm_trace=$(python3 - "${vllm_summary}" <<'PY'
 import json
@@ -735,6 +761,10 @@ PY
   done
   gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }
   drop_caches "${cache_after_vllm}"
+  if [[ ${trace_concurrency} == 2 ]]; then
+    echo "c2 raw paired trace capture complete; status remains PENDING until low-batch finalization" >&2
+    return 0
+  fi
   python3 "${repo_root}/tools/bench/online_gate.py" record-trace-status \
     "${status_args[@]}"
 }

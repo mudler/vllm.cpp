@@ -96,8 +96,8 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 | Real models | `tests/parity/test_qwen27_paged_engine.cpp:116`; `tests/parity/test_qwen36_paged_engine.cpp:108` | Clean pushed `581d335` merged/split 27B logs are identical at 235/235 + 16/16; native 35B is 315/315. A BF16-output preflight fails 233/235 and exactly selects the rejected emulation continuation. |
 | Immutable W1 safety | `~/work/vllm.cpp-gdn-ba/immutable-581d335…`; status `3895e658…4cf6` | Exact CUDA build and focused 4/4 pass; packed-view compute-sanitizer is 590/590 with 0 errors/leaks; frozen fixture is 64/64 and no native cache is created. |
 | W1 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_ba_trace.py` | Historical no-mode c2 stays at 1,011 nodes. Explicit merged/split modes require 963/145 versus 1,011/193, record `VT_GDN_MERGED_BA`, run both paired arms under one lock and accept only a 48-BF16-only delta. Immutable `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural`: 24/24 exact local ranges, exact 48-BF16-only removal, unchanged selected non-BF16 families and `benchmark_binding=false`. The tool suite passes 69/69. |
-| W1C projection + inertness | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; `tests/parity/test_op_parity.cpp`; `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | vLLM 0.25.0 GB10 M=1/2/4/16/32 outputs are bit-stable across 3 repetitions and full-output digests are frozen. The local exact-digest test plus default-off BF16 output compile; synthetic GGUF zero-selection is 97/97 and CPU parity is 123/123. Local CUDA digest, native/legacy 35B and real GGUF hardware gates remain pending; the retained continuation is still 233/235 failed. |
-| Remaining W1 evidence | component tools | Close the local projection/model/hardware gates, then run the 40+8-axis c2/c16 component. Capture lifecycle and exact structure are already closed by `0091cd1`. |
+| W1C projection + inertness | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; `tests/parity/test_op_parity.cpp`; `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | Immutable `f925294` passes local exact projection 14/14, loader 73/73, native 35B 315/315, real GGUF 28/28 and default 27B 235/235. BF16 27B remains 233/235 and exactly equals emulation. Since the projection bits match vLLM, the open gap is downstream of GEMM. |
+| Remaining W1 evidence | downstream differential + component tools | Compare packed BA output, vLLM-contiguous versus local strided b/a, and both consumer outputs at the first GDN layer; restore the native continuation, then run the 40+8-axis c2/c16 component. Capture lifecycle and exact structure are already closed by `0091cd1`. |
 
 The completed evidence root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
@@ -184,8 +184,9 @@ finalizer SHA-256 values are `03601168…54d5` / `b203f0d2…5412` /
 `72328c48…63e` / `b93fd633…70a2` / `57395e99…b146`. The result proves merged
 963/145 versus split 1,011/193, exact 48/48 deltas, unchanged selected non-BF16
 families and `benchmark_binding=false`.
-This checkpoint still does not close projection-level BF16 rounding,
-GGUF/legacy-35B selection, memory accounting or component performance.
+Immutable `f925294` subsequently closes projection-level BF16 parity and
+GGUF/legacy-35B selection. It does not close downstream BF16 consumer
+semantics, memory accounting or component performance.
 
 ## Gates
 
@@ -206,9 +207,13 @@ GGUF/legacy-35B selection, memory accounting or component performance.
   from one frozen plan map. 35B/GGUF gates prove zero selection.
 - No b/a cast, split-copy or materialization kernel is introduced.
 - The token-correct F32 compatibility output may enter G2, but W1 does not
-  claim exact upstream dtype parity until a BF16 projection oracle and the
-  native continuation both pass. The observed 233/235 BF16 failure is binding
-  as an open correctness gap, not waived by the F32 result.
+  claim exact upstream dtype parity until the native continuation passes.
+  `f925294` proves the BF16 projection itself exact; the observed 233/235
+  downstream failure is binding and is not waived by the F32 result.
+- Before component timing, capture one deterministic layer boundary on both
+  sides: packed BA output, post-slice contiguous b/a, and `GdnPostConv` /
+  `GdnGBeta` outputs. The first unequal boundary selects one minimal hypothesis;
+  no copy or consumer change is permitted before that evidence exists.
 
 ### G2 — W1 exact structure and component performance
 
@@ -285,8 +290,8 @@ frozen fixture are recorded before execution.
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
-| W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16. Default-off W1C BF16 selection is implemented; its retained model result is 233/235 until rerun. |
-| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Immutable safety/model gates pass at `581d335`; finalized `0091cd1` closes exact structure. Exact five-shape vLLM oracle and local/inertness tests are implemented; oracle 3×, synthetic GGUF 97/97 and CPU parity 123/123 pass. Local CUDA/model/hardware gates and component remain pending. G2 must close before W2. |
+| W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16. Default-off W1C BF16 selection remains 233/235. |
+| W1C | Repeat immutable safety/model gates, close BF16 semantics, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | `581d335` closes safety and `0091cd1` closes structure. `f925294` closes exact projection plus native/legacy/GGUF inertness but BF16 end-to-end remains 233/235. Downstream first-divergence and component remain pending. G2 must close before W2. |
 | W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
 | W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |
@@ -297,11 +302,12 @@ an ungated W1.
 
 ## Risks/decisions
 
-- **BF16 BA changes a rounding point.** The first real-model preflight
-  deterministically selected the rejected emulation stream at token 7
-  (233/235), while merged F32 and split F32 are byte-identical logs at 235/235
-  + 16/16. W1 therefore uses the correct F32 compatibility arm while exact
-  upstream BF16 algorithm/rounding remains a named gate; no failure is hidden.
+- **BF16 BA changes downstream arithmetic.** `f925294` proves the packed BF16
+  projection bit-identical to vLLM for all five real shapes, yet the full model
+  deterministically selects the rejected emulation stream at token 7
+  (233/235). The discrepancy therefore lies after GEMM. Merged F32 and split
+  F32 remain token-exact; the shipping compatibility arm stays F32 while the
+  first divergent b/a/consumer boundary is localized.
 - **Views can erase the launch win if materialized.** Consumers must honor
   strides directly. A cast/split-copy kernel fails the structural gate even if
   output is correct.

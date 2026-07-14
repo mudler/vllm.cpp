@@ -24,12 +24,14 @@ qkv+z+b+a while vLLM issues qkvz+ba, totaling **193 vs 97** BF16 projection
 GEMMs. The accepted
 [merged-projection spike](gdn-merged-input-projections.md) makes
 `KERNEL-GEMM-BF16` W1 `GATING`. Its one-owner F32-output BA merge passes
-clean pushed `581d335` core model/safety gates, but the BF16-output arm fails the
-known near-tie. Immutable `0091cd1`, finalized by pushed `8a1f923`, is
+clean pushed `581d335` core model/safety gates. Immutable `f925294` proves the
+local BF16 BA projection bit-exact and closes native/legacy/GGUF inertness, but
+the BF16-output full model still fails the known near-tie at 233/235. The open
+gap is downstream of GEMM. Immutable `0091cd1`, finalized by pushed `8a1f923`, is
 `complete-structural`: 12/12 merged ranges are 963/145, 12/12 split ranges are
 1,011/193, exactly 48 BF16 launches disappear, and every selected non-BF16
-family remains unchanged. `benchmark_binding=false`; GGUF/legacy inertness,
-BF16 rounding and c2/c16 performance remain pending. qkvz is still excluded.
+family remains unchanged. `benchmark_binding=false`; downstream first-divergence
+and c2/c16 performance remain pending. qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
@@ -249,12 +251,13 @@ reported as a clean dependency check.
    and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
-   core correctness/safety; BF16 rounding remains open.
+   core correctness/safety; `f925294` closes exact projection/inertness while
+   downstream BF16 semantics remain open at 233/235.
 6. The exact-c2 mode-aware harness is implemented and CPU-gated. Immutable
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
-   24 local range contracts with `benchmark_binding=false`. Close GGUF/legacy
-   inertness, BF16 rounding and c2/c16 component disposition; only then claim
-   qkvz. Host-weight ownership
+   24 local range contracts with `benchmark_binding=false`. Localize and repair
+   the first divergent b/a consumer boundary, then close c2/c16 component
+   disposition; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.

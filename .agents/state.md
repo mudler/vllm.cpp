@@ -8415,3 +8415,51 @@ model result is still **233/235 FAILED**. Binding stays **55/124**,
 `benchmark_binding=false`, no timing/memory/speed result exists, and qkvz
 remains prohibited until the W1C model/inertness and 40+8 component disposition
 close.
+
+## 2026-07-14 — W1C projection/inertness passes; BF16 failure localizes downstream of GEMM
+
+Clean pushed `f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3` was cloned into
+`~/work/vllm.cpp-gdn-ba-rounding/f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3`.
+Its source is detached/clean at the exact SHA. The production RelWithDebInfo
+build uses CUDA 13.0, sm_121a, FlashInfer's CUTLASS tree, vendored Triton AOT
+and FA2; all five required test binaries link. Binary SHA-256 values are frozen
+in the evidence `provenance.txt`. An earlier setup command expanded the short
+SHA incorrectly as `f9252946989942e128c6a1a8e35c305fd0572c8f`; the exact-SHA
+preflight stopped before checkout/build/GPU work and left only its plan file.
+That root is void setup residue and carries no evidence.
+
+One uncontended `/tmp/gpu` lock covered the prescribed W1C series. The exact
+local BA projection digest passes **14/14** at M=1/2/4/16/32, matching the
+official vLLM 0.25.0 fixture bit-for-bit. Native/legacy 35B loader selection
+passes **73/73**; the full native 35B gate passes **315/315**, including its
+six-request graph case; both real APEX-Compact and APEX-Balanced GGUF gates pass
+**28/28**; and the default F32-output 27B arm passes **235/235** with the native
+16-token continuation.
+
+The final `VT_GDN_BA_OUT_BF16=1` 27B arm deterministically fails **233/235**.
+Its 16 output IDs exactly equal `greedy_ids_emulation.npy` and differ from the
+native stream beginning at token 7. Because the isolated real-shape packed BA
+projection is exact, the old label "projection rounding" is refuted: the first
+open discrepancy is downstream of GEMM, across vLLM's contiguous b/a split or
+the local stride-aware `GdnPostConv` / `GdnGBeta` consumer chain. Systematic
+debugging now requires a boundary differential—packed BA output, post-slice
+b/a, and both consumer outputs—before any code fix or component timing.
+
+The fail-closed shell exits 1 on that final model assertion, so it intentionally
+writes no terminal event, `sha256sum.txt`, or `status.txt`. The immutable
+evidence root is
+`.../evidence/w1c-correctness-inertness`. Projection / loader / native-35B /
+real-GGUF / default-27B / BF16-27B log SHA-256 values are
+`a791c5676ab4ed6d0ad3521e212fff5cc94e07ee58b11b37e1b7d2957de837d1` /
+`d455b8fc6c754336893e39662a4c994b761f7bd6e87976988334b8aaaa405f6a` /
+`72caeca92ec75657374b1be3bee6eba05c6052551224b95780e60106f940406c` /
+`87833f224b21748c70579689bf8fd2c0d74a882b585aa3d7c4f2c6940baeaf8d` /
+`da5dd8361a5de7a5fe0caabdd493b434e94f832bef04e75a0bfa096aa57b091e` /
+`148d743fe9867d2f902dca908744ed2ab6c87289ea7290162206a56700d8486a`;
+provenance/events are `93f1b385…da79` / `6be614dd…1a40`. GPU, lock and compute
+processes return idle.
+
+This closes projection and native/legacy/GGUF inertness only. W1C remains
+`ACTIVE`, BF16 end-to-end correctness remains failed, the 40+8 component is
+prohibited, qkvz remains excluded, and binding `3f256ab` stays **55/124** with
+`benchmark_binding=false` and no timing, memory or speed credit.

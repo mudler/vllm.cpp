@@ -14,13 +14,15 @@ our 48 GDN layers issue four BF16 input projections each, while vLLM packs them
 into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) has
 a `GATING` BA-only W1 implementation. Clean pushed `581d335` closes its core
-correctness/safety repetition; BF16 output still fails the known near-tie.
-W1C now carries a default-off BF16-output path and an exact projection fixture
-generated through vLLM 0.25.0's `default_unquantized_gemm` on GB10. M=1/2/4/16/32
-are bit-stable across three oracle repetitions; the local CUDA digest and real
-model continuation have not yet passed, so this is `PENDING`, not a support or
-performance claim. Synthetic GGUF zero-selection is **97/97** and CPU parity is
-**123/123**; native/legacy 35B and real GGUF hardware repetition remain pending.
+correctness/safety repetition. Immutable `f925294` now closes the local
+projection and inertness subgates under one lock: the five-shape local CUDA
+digest passes **14/14**, native/legacy loader checks pass **73/73**, native 35B
+passes **315/315**, both real APEX GGUF models pass **28/28**, and the default
+27B arm passes **235/235**. The final BF16-output 27B arm remains **FAILED at
+233/235** and exactly equals the rejected emulation stream. Because the packed
+projection itself is bit-identical to vLLM, this is a downstream b/a boundary
+or consumer-semantics gap, not GEMM rounding. The fail-closed run has no
+completion marker and earns no support or performance claim.
 Immutable trace `0091cd1`, finalized by pushed `8a1f923`, now has durable
 status **`complete-structural`**. All 12 merged ranges are exactly
 **963 / 145 BF16** and all 12 split ranges are **1,011 / 193**; every selected
@@ -74,7 +76,7 @@ performance command is authorized until the 27B result reaches 124/124.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **ACTIVE W1C / ORACLE IMPLEMENTED, CUDA PENDING** | `0091cd1` remains `complete-structural`. The vLLM 0.25.0 GB10 oracle is bit-stable 3× at M=1/2/4/16/32; default-off `VT_GDN_BA_OUT_BF16=1`, full-output digest comparison and explicit 35B/GGUF zero-selection tests compile. Synthetic GGUF is 97/97 and CPU parity 123/123. Local CUDA/model gates are pending; the retained BF16 model result is still **FAILED at 233/235** and `benchmark_binding=false` | Run the exact projection test plus native/legacy 35B and real GGUF under one lock; only then run c2/c16 AB/BA/AB before qkvz |
+| `KERNEL-GEMM-BF16` | **ACTIVE W1C / DOWNSTREAM CORRECTNESS FAILED** | `0091cd1` remains `complete-structural`. Immutable `f925294` passes local CUDA projection **14/14**, loader **73/73**, native 35B **315/315**, real GGUF **28/28**, and default 27B **235/235**. Its BF16-output arm is still **233/235**, exactly the emulation stream; `benchmark_binding=false` | Compare the first GDN layer at packed BA output, contiguous b/a, and both consumers against vLLM; restore token-exact BF16 semantics before c2/c16 AB/BA/AB or qkvz |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -108,6 +110,18 @@ finalizer SHA-256 values are `03601168…54d5` / `b203f0d2…5412` /
 `72328c48…63e` / `b93fd633…70a2` / `57395e99…b146`. The summary proves merged
 963/145 versus split 1,011/193, exact 48/48 deltas, unchanged non-BF16 family
 counts and `benchmark_binding=false`; it grants no speed ratio.
+
+The current W1C hardware root is
+`~/work/vllm.cpp-gdn-ba-rounding/f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3/evidence/w1c-correctness-inertness`.
+The source is clean at exact `f925294`, and the binary SHA-256 values are frozen
+in `provenance.txt`. Projection / loader / native-35B / real-GGUF / default-27B /
+BF16-27B log SHA-256 values are
+`a791c567…37d1` / `d455b8fc…05f6` / `72caeca9…06c` /
+`87833f22…af8d` / `da5dd836…091e` / `148d743f…86a`.
+The final BF16 assertion failure intentionally prevents `status.txt`,
+`sha256sum.txt`, and the terminal event from being written. GPU and lock were
+verified idle afterward. This is a valid **FAILED** correctness checkpoint,
+not a partial performance number.
 
 ## Evidence selecting merged GDN projections
 
@@ -176,9 +190,20 @@ sha256sum "$TRACE"/{gdn-ba-summary.json,gdn-ba-manifest.json,status-gdn-ba.json}
 # Expected: 03601168…54d5 / b203f0d2…5412 / 72328c48…63e
 ```
 
-The next W1C reproduction, after creating and configuring the SHA-owned source
-and `build-cuda` directory shown below, is the following single-lock
-correctness/inertness series. Any partial or unlocked execution is void:
+Verify the current fail-closed W1C checkpoint without rerunning the GPU:
+
+```sh
+SHA=f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3
+ROOT="$HOME/work/vllm.cpp-gdn-ba-rounding/$SHA"
+E="$ROOT/evidence/w1c-correctness-inertness"
+test "$(git -C "$ROOT/source" rev-parse HEAD)" = "$SHA"
+test -z "$(git -C "$ROOT/source" status --porcelain)"
+test ! -e "$E/status.txt"
+sha256sum "$E"/{01-projection.log,02-qwen36-weights.log,03-qwen36-native.log,04-qwen36-gguf.log,05-qwen27-default.log,06-qwen27-bf16.log}
+```
+
+The exact single-lock command below reproduces the accepted subgates and final
+233/235 failure. Any partial or unlocked execution is void:
 
 ```sh
 SHA=$(git rev-parse HEAD)
@@ -197,6 +222,17 @@ flock /tmp/gpu bash -lc "
   '$BUILD/tests/test_qwen27_paged_engine'
   VT_GDN_BA_OUT_BF16=1 '$BUILD/tests/test_qwen27_paged_engine'
 "
+```
+
+Until the first-divergence harness is committed, the smallest exact failure
+reproduction is:
+
+```sh
+SHA=f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3
+BUILD="$HOME/work/vllm.cpp-gdn-ba-rounding/$SHA/build-cuda"
+flock /tmp/gpu env VT_GDN_BA_OUT_BF16=1 \
+  "$BUILD/tests/test_qwen27_paged_engine"
+# Expected current disposition: 233/235; got == greedy_ids_emulation.npy
 ```
 
 For a fresh reproduction, create a new SHA-owned root, write the plan before

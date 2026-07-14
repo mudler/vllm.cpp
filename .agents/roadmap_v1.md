@@ -42,6 +42,22 @@ the DGX `--diagnostic-c16` reproduction from the pushed SHA in a fresh
 excluded. Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 
+**Order-0 re-ranking (2026-07-14
+[parity rescan](specs/parity-rescan-2026-07-14.md), diagnostic only):** the
+failing mass is **host-side, not kernel compute** — TTFT passes 24/24, our GPU
+kernels are collectively net faster than vLLM's on the only per-kernel window
+(−3.579 ms), and the 69 failing axes decompose into c2–c8 decode latency
+(52.2% + 24.3% coupled) plus host memory (23.6%). Consequences: (a) the c16
+diagnostic → component chain stays first; (b) two kernel-independent host
+workstreams start in parallel — **TCP_NODELAY on the SSE server** (confirmed
+unset in cpp-httplib while vLLM's uvicorn enables it; spike required before
+ACTIVE) and the **memory precheck → weight-streaming loader** track; (c) the
+nsys full-step c2 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 before
+W3 is implemented; (d) FP4-producer/PDL/fused-norm-quant micro-levers are
+deprioritized — the recorded "fused RMSNorm→NVFP4" gap is **disproven** (vLLM's
+fusion pass is FP8-only) and the H1d fused-producer ranking is off-axis. qkvz
+stays real-but-small (~0.476 ms/window) behind the component gate.
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live

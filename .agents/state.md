@@ -9332,3 +9332,34 @@ NEW root whose basename contains `diagnostic-c16` (full recipe in
 log and the persisted `r{rep}-error-body.json`, then repair test-first and rerun
 the full one-lock component from a fresh SHA/root. The `d82d282` root stays
 untouched. qkvz/exact-grid/35B performance remain blocked.
+
+## 2026-07-14 — parity rescan grounds the gap as host-side; lever queue re-ranked
+
+A 30-agent dynamic scan/challenge workflow (grounding + nine subsystem scans of
+pinned vLLM and deps vs ours + adversarial per-lever verification + strategy
+and completeness critics) was accepted as a diagnostic record:
+[specs/parity-rescan-2026-07-14.md](specs/parity-rescan-2026-07-14.md). Six of
+its lanes were lost (four placeholder structured outputs, two retry-cap
+deaths) and are owed a re-run; conclusions rest on the grounded lanes.
+
+Verified headline: binding `3f256ab` is **27B-only** (zero 35B artifacts);
+TTFT passes 24/24; the 69 failing axes decompose into c2–c8 decode latency
+(52.2% + 24.3% coupled) and host memory (23.6%); on the only per-kernel window
+our kernels are collectively **net faster** than vLLM (−3.579 ms/window, GDN
+recurrence −6.297) while wall decode is 4–6% slower at c2–c8 — the open mass
+is host-side. Record corrections applied in the same change: the
+RMSNorm/generated-partitions residual and the "fused RMSNorm→NVFP4" lever are
+DISPROVEN (vLLM's `RmsNormQuantFusionPass` is FP8-only; the +1.81 ms was a
+cross-profiler artifact) — the scoreboard row is closed; the qkvz
+de-prioritization premise was sign-inverted (+2.865 ms family deficit, mostly
+closed by the landed BA merge, ~0.476 ms remaining); the H1d fused-producer
+selected-candidate ranking is off-axis and no longer drives order-0
+sequencing; the 35B "W4A4 auto-select gap" is refuted (W4A16 → Marlin both
+sides). New parallel host workstreams recorded in the roadmap: TCP_NODELAY on
+the SSE server (source-confirmed unset vs uvicorn default-on; spike required
+before ACTIVE), memory precheck → weight-streaming loader, and an nsys
+full-step c2 gap attribution before `ENG-ASYNC-SCHED` W3. The
+`SERVE-GATE-ONLINE` matrix row test counts were refreshed to the diagnostic
+checkpoint's 49/49 + 132/132. No lifecycle state, benchmark ratio, or speed
+credit changed; `benchmark_binding=false` and the c16 diagnostic reproduction
+remains the active first track (driver running on dgx at this checkpoint).

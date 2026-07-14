@@ -68,7 +68,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
 | Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. Clean `d82d282` completed both model gates and all c2 legs, then failed incomplete at c16 packed r1: preflight/warmups passed, 0/96 timed requests returned HTTP 500, and no status was sealed. Diagnostic instrumentation landed (four `std::cerr` error-path channels restoring vLLM's dropped fatal logs, `VT_GDN_DIAG_STEP_LOG` geometry, and a packed-only `--diagnostic-c16` mode isolated to `component-diagnostic.json`); the DGX diagnostic reproduction is pending. No partial number binds |
-| Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
+| Remaining gap diagnosis | The 2026-07-14 [parity rescan](.agents/specs/parity-rescan-2026-07-14.md) grounds the failing mass as **host-side**: TTFT passes 24/24, our GPU kernels are net faster on the measured window, and the open axes are c2–c8 decode latency plus host memory. The prior RMSNorm/generated-partitions residual is **disproven** (vLLM's norm-quant fusion is FP8-only; cross-profiler artifact). Parallel host workstreams: TCP_NODELAY on the SSE server (spike pending), memory precheck → weight streaming, and nsys c2 attribution before async-sched W3 |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
 ## What is implemented

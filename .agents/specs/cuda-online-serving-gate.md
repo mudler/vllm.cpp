@@ -37,14 +37,18 @@ window. This is a structural oracle contract, not a cross-profiler speed ratio.
 
 The trace-only local observer and driver accept an explicit exact batch-2 target
 while retaining batch 16 as the accepted H1d default. Production builds contain
-neither observer. First root `ad8b58f` passed the 27B model gate and one local
-session: four exact ranges each contain **1,011 kernels, 7 memcpy and 1 memset**,
-are lossless, and share node-multiset SHA `6b75bcff…1ce3`. The run then failed
-closed because the validator selected the batch-16 1,107-kernel contract.
-Sessions 2/3 and the fresh oracle arm are absent, making the run **VOID**. The
-validator is now keyed by model and requested batch; a fresh complete retry and
-fail-closed final status are **PENDING**, so no local RMSNorm residual, tactic
-mismatch or selected implementation is claimed yet.
+neither observer. Complete raw root `179a0fc` passes the 27B model gate and all
+three local sessions: **12/12** exact ranges each contain **1,011 kernels, 7
+memcpy and 1 memset**, are lossless, and share node-multiset SHA
+`44fcf31f…b93d`. Fresh oracle SHA `2b3bf412…785c` has **1,522** exact B=2
+windows at 1,160 kernels plus two classified B=1 drain windows; its B=2 ordered
+names retain `858915dd…fad0`, while five generated partitions use 50 rather than
+48 registers. Full read-only finalizer preflight passes. Diagnostic medians are
+local/oracle **111.076528 / 105.520831 ms**; BF16 CUTLASS GEMMs lead at +96
+launches/+2.864630 ms, RMSNorm/generated partitions add +1.810237 ms, and FP4
+GEMM is already non-positive with the same 128+80 tactics. The durable
+summary/manifest/status marker remains **PENDING**; no implementation or speed
+credit is claimed yet.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -257,12 +261,11 @@ reported as a clean dependency check.
 5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
    Accepted c2 async control `3812d8` is neutral at **1.002153×** total and
    **1.002004×** traced GPU time, so do not claim W3 for speed. The accepted
-   oracle trace now pins 1,524 clean c2 windows, 1,160 kernels/window, seven
-   generated partitions and the 128+80 FP4 tactic split. First local `ad8b58f`
-   is void after one valid four-range session exposed a stale c16 validator
-   assertion. Repeat all three batch-2 local sessions and the fresh oracle arm
-   with the batch-keyed contract before mapping a residual or coding the next
-   lever.
+   oracle trace pins the accepted all-B=2 topology. Complete raw `179a0fc`
+   reproduces 12/12 local ranges and 1,522 steady fresh-oracle B=2 windows plus
+   two drains; read-only finalizer preflight maps BF16 GEMM launch structure and
+   RMSNorm/generated partitions above an already-matched 128+80 FP4 family.
+   Write the durable finalizer marker before spiking or coding the next lever.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
    and gate the smallest grounded kernel leaf. Host-weight ownership is a

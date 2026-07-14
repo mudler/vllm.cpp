@@ -15,16 +15,20 @@ ON/OFF median total throughput is **160.347697 / 160.003134 tok/s =
 1.002153×**. ON improves TPOT only **1.0%** and increases TTFT **16.0%**;
 shape-neutral ON/OFF traces total **170.820 / 170.478 s** of GPU-kernel time.
 It is neutral against the predeclared 1.04× minimum, so W3 remains an unmet
-parity obligation rather than a speed lever. Its accepted ON trace now pins
-the oracle c2 topology at **1,524 clean batch-2 windows / 1,160 kernels per
-window**, with identical ordered signatures across every window. The local
-trace-only seam is now batch-2 capable. Its first local run passed correctness
-and captured four lossless identical ranges, then failed closed on a stale
-batch-16 graph-size assertion; that run is **VOID** and the repaired full retry
-is **PENDING**. Host PSS/RSS is independently
-traced to a persistent **22.920 GiB** CPU weight mirror plus source-page
-residency during load. W3-I
-remains default-off after its **30/48** component failure.
+parity obligation rather than a speed lever. The repaired `179a0fc` exact-c2
+raw capture is now complete under one uncontended lock: the model gate passes,
+all **12/12** local ranges are lossless and topology-identical at **1,011
+kernels + 7 memcpy + 1 memset**, and the fresh oracle trace has **1,522** exact
+B=2 windows at **1,160 kernels** plus two bounded B=1 drain windows. The B=2
+ordered-name hash remains `858915dd…fad0`; both engines use **128 Stream-K + 80
+static-persistent** FP4 GEMMs. A full read-only finalizer preflight passes and
+reports local/oracle median per-window kernel time **111.076528 / 105.520831
+ms = 1.052650×**. That comparison is diagnostic only because it crosses Nsight
+and Torch profiler domains; the committed durable marker is still **PENDING**,
+so no speed credit or implementation lever binds yet. Host PSS/RSS is
+independently traced to a persistent **22.920 GiB** CPU weight mirror plus
+source-page residency during load. W3-I remains default-off after its
+**30/48** component failure.
 
 ## Binding 27B online gate
 
@@ -70,9 +74,9 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repeat/finalize the repaired c2 ours/vLLM kernel map, gate the selected lever, then rerun the exact grid |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; complete `179a0fc` raw c2 evidence is diagnostic and does not supersede it | Durably finalize the c2 map, spike/gate the highest complete residual, then rerun the exact grid |
 | vLLM async-scheduler credit | **COMPLETE DIAGNOSTIC / NEUTRAL FOR SPEED** | Clean `3812d8`, six timing legs plus two shape-neutral traces under one lock. ON/OFF medians: total **160.347697 / 160.003134 tok/s = 1.002153×**, TPOT **106.642 / 107.740 ms** (ON ~1.0% better), TTFT **807.658 / 696.330 ms** (ON ~16.0% slower). Trace count/time: **1,798,044 / 170.819890 s** ON and **1,810,902 / 170.478267 s** OFF; tactic/batch mix changes, aggregate GPU time does not improve. Summary/manifest/artifact SHA `35b7344a…c323` / `e757b4ad…86c6` / `ead68397…8e56`; cleanup returned lock/GPU/port idle | Keep `ENG-ASYNC-SCHED` as later parity work; move the speed-critical path to low-batch kernel mapping |
-| Exact c2 executed path | **FAILED / VOID; REPAIRED RETRY PENDING** | Oracle SHA `57413dd1…1cba`: **1,524** clean B=2 windows, **1,160 kernels/window**. First local root `ad8b58f`: model gate pass; one session/four exact ranges each have **1,011 kernels + 7 memcpy + 1 memset**, lossless, identical node-multiset SHA `6b75bcff…1ce3`, and the same **128+80 FP4** split. The driver then rejected 1,011 against the stale c16 contract of 1,107; sessions 2/3 and fresh oracle are absent, so no ratio binds | Repeat all three local sessions and the fresh oracle with the batch-aware validator, then fail-closed finalize before selecting a lever |
+| Exact c2 executed path | **RAW COMPLETE / FINALIZER PENDING** | Root `~/work/vllm.cpp-executed-path-c2/179a0fc2…`: model gate pass; **12/12** lossless local B=2 ranges, invariant node multiset `44fcf31f…b93d`, 1,011 kernels/range; fresh oracle SHA `2b3bf412…785c`, **1,522×1,160** steady B=2 windows + two B=1 drains. Full read-only finalizer preflight passes; no durable status/manifest exists yet | Run the pushed fail-closed finalizer, publish its hashes, then spike the highest complete residual |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -93,7 +97,9 @@ scan ranks the live evidence as follows:
 | Finding | Binding interpretation |
 |---|---|
 | vLLM depth-2 async scheduling + GPU-resident sampled-token path | Complete ON/OFF timing gives only **+0.215%** total throughput, ~1.0% better TPOT and ~16.0% worse TTFT; ON has **0.200% more** aggregate traced GPU time. It cannot close the 6.1% gap and leaves the speed-critical path |
-| RMSNorm/generated partitions | Oracle c2: seven generated families total **177 calls / 0.442805 ms per window**. The void first local session also has **177 RMSNorm-family calls / 2.237944 ms mean** across four ranges. This cross-profiler, incomplete observation is structural only; the repaired complete capture must reproduce it before any residual or speed claim |
+| BF16 CUTLASS GEMMs | Complete raw c2 map: local has **193 calls / 51.662672 ms median** versus oracle **97 / 48.798042 ms**, a diagnostic **+2.864630 ms** and 96-launch structural residual. Source-chain inspection and a committed spike are still required before implementation |
+| RMSNorm/generated partitions | Complete raw c2 map: both sides have **177 calls**; local median is **2.249728 ms** versus oracle **0.439491 ms**, a diagnostic **+1.810237 ms**. Cross-profiler timing is non-binding; durable finalization and whole-chain source verification come first |
+| FP4 GEMM tactics | Both sides execute **208 calls = 128 Stream-K + 80 static-persistent**. Local/oracle diagnostic medians are **52.508720 / 52.734326 ms**; this family is not the present positive residual |
 | Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
 | Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
 
@@ -113,17 +119,24 @@ evidence for the already inventoried default batch non-invariance, not a new
 correctness or support claim; the separate token-exact correctness gate remains
 the precondition for performance work.
 
-## Reproduce the pending c2 executed-path capture
+## Finalize or reproduce the current c2 executed-path capture
 
-Use the clean source/corpus/configure setup in the schema-v5 reproduction below,
-but invoke the paired trace at exact concurrency two. This command intentionally
-produces raw, per-range-validated evidence without an accepted status; the
-low-batch finalizer is the next checkpoint, so no partial trace may bind:
+The immutable raw root is
+`~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
+After this finalizer checkpoint is pushed, run its CPU-only command against the
+raw source SHA. It revalidates every immutable artifact and writes the summary,
+manifest, then `status-c2.json` last; until that marker exists, the result stays
+pending:
 
-The immutable failed first attempt is
-`~/work/vllm.cpp-executed-path-c2/ad8b58f8708ce9bdf32aa9043611b3f6049be7fd`.
-Its report/control/evidence-set SHA values are `9f285fd6…0aec` /
-`ee1589df…c719` / `0da532ac…ac35`; cleanup returned GPU, lock, and port idle.
+```sh
+RAW_SHA=179a0fc2afc1c33b63d14de8e50d3fde976c7356
+ROOT="$HOME/work/vllm.cpp-executed-path-c2/$RAW_SHA"
+python3 tools/bench/finalize_low_batch_trace.py \
+  --evidence "$ROOT/evidence/$RAW_SHA" \
+  --source-commit "$RAW_SHA" --run-log "$ROOT/c2-run.log"
+```
+
+To reproduce the raw capture from a new clean SHA, use:
 
 ```sh
 SHA=$(git rev-parse HEAD)

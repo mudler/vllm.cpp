@@ -1621,6 +1621,7 @@ def _parse_client_command_log(
     corpus_path: pathlib.Path,
     num_prompts: int,
     num_warmups: int,
+    max_concurrency: int = TRACE_CONCURRENCY,
 ) -> list[str]:
     try:
         first_line = log_path.read_text(encoding="utf-8").splitlines()[0]
@@ -1639,7 +1640,7 @@ def _parse_client_command_log(
         ("--dataset-name", "custom"),
         ("--custom-output-len", str(OUTPUT_LEN)),
         ("--num-prompts", str(num_prompts)),
-        ("--max-concurrency", str(TRACE_CONCURRENCY)),
+        ("--max-concurrency", str(max_concurrency)),
         ("--request-rate", "inf"),
         ("--num-warmups", str(num_warmups)),
         ("--ready-check-timeout-sec", "0"),
@@ -2299,6 +2300,9 @@ def record_trace_status(
     cache_drop_reports: Sequence[pathlib.Path],
     execution_manifest: pathlib.Path,
     vllm_cpp_sha: str,
+    expected_batch: int = TRACE_CONCURRENCY,
+    trace_prompts: int = TRACE_PROMPTS,
+    write_output: bool = True,
 ) -> dict[str, Any]:
     """Hash the mandatory paired execution-trace artifacts.
 
@@ -2306,7 +2310,15 @@ def record_trace_status(
     fallback because nsys breaks its GB10 startup.  Ours remains an nsys trace.
     """
 
-    if output.exists():
+    if expected_batch <= 0:
+        raise HarnessError("trace batch must be positive")
+    if (
+        trace_prompts <= 0
+        or trace_prompts < expected_batch
+        or trace_prompts % expected_batch != 0
+    ):
+        raise HarnessError("trace prompts must cover the requested batch")
+    if write_output and output.exists():
         raise HarnessError(f"refusing to overwrite trace status: {output}")
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
@@ -2350,15 +2362,15 @@ def record_trace_status(
         record = _load_json_object(path)
         validate_raw_result(
             record,
-            concurrency=TRACE_CONCURRENCY,
-            expected_requests=TRACE_PROMPTS,
+            concurrency=expected_batch,
+            expected_requests=trace_prompts,
         )
         generated_texts.append(record.get("generated_texts"))
     for path in ours_probe_results:
         validate_raw_result(
             _load_json_object(path),
-            concurrency=TRACE_CONCURRENCY,
-            expected_requests=TRACE_CONCURRENCY,
+            concurrency=expected_batch,
+            expected_requests=expected_batch,
         )
 
     command_environments = []
@@ -2450,11 +2462,19 @@ def record_trace_status(
             "--no-enable-prefix-caching",
             "--cuda-profile-graph-replays",
             str(TRACE_CAPTURE_GRAPH_REPLAYS),
-            "--benchmark-shutdown-fifo",
-            str(shutdown_fifo),
-            "--served-model-name",
-            "gate",
         ]
+        if expected_batch != TRACE_CONCURRENCY:
+            expected_tail.extend(
+                ["--cuda-profile-graph-batch", str(expected_batch)]
+            )
+        expected_tail.extend(
+            [
+                "--benchmark-shutdown-fifo",
+                str(shutdown_fifo),
+                "--served-model-name",
+                "gate",
+            ]
+        )
         if command_tokens[nsys_index:] != expected_tail:
             raise HarnessError("ours trace command tail differs from the exact H1d recipe")
     if [path.resolve() for path in ours_nsys_reports] != expected_report_paths:
@@ -2469,16 +2489,18 @@ def record_trace_status(
             log_path,
             result_path=result_path,
             corpus_path=vllm_corpus,
-            num_prompts=TRACE_PROMPTS,
-            num_warmups=TRACE_CONCURRENCY,
+            num_prompts=trace_prompts,
+            num_warmups=expected_batch,
+            max_concurrency=expected_batch,
         )
     for result_path, log_path in zip(ours_probe_results, ours_probe_logs, strict=True):
         _parse_client_command_log(
             log_path,
             result_path=result_path,
             corpus_path=vllm_corpus,
-            num_prompts=TRACE_CONCURRENCY,
+            num_prompts=expected_batch,
             num_warmups=0,
+            max_concurrency=expected_batch,
         )
     ours_output_digests = [
         hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
@@ -2509,7 +2531,7 @@ def record_trace_status(
         ).resolve():
             raise HarnessError(f"capture {index} native plan target differs from its command")
         plan_validations.append(plan)
-        markers = _parse_profile_markers(log_path)
+        markers = _parse_profile_markers(log_path, expected_batch=expected_batch)
         control = _load_json_object(control_path)
         expected_marker_fields = {
             **markers,
@@ -2563,13 +2585,13 @@ def record_trace_status(
         "admission_mode": "closed-loop",
         "enable_prefix_caching": False,
         "input_len": INPUT_LEN,
-        "max_concurrency": TRACE_CONCURRENCY,
+        "max_concurrency": expected_batch,
         "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS[model_key],
         "max_num_seqs": MAX_NUM_SEQS,
         "max_model_len": MAX_MODEL_LEN[model_key],
-        "num_prompts": TRACE_PROMPTS,
+        "num_prompts": trace_prompts,
         "output_len": OUTPUT_LEN,
-        "profiled_warmup_prompts": TRACE_PROMPTS,
+        "profiled_warmup_prompts": trace_prompts,
         "repetitions": TRACE_REPETITIONS,
     }
     for field, expected in expected_metadata.items():
@@ -2648,9 +2670,9 @@ def record_trace_status(
         "--metadata",
         str(vllm_metadata),
         "--num-prompts",
-        str(TRACE_PROMPTS),
+        str(trace_prompts),
         "--max-concurrency",
-        str(TRACE_CONCURRENCY),
+        str(expected_batch),
         "--max-num-seqs",
         str(MAX_NUM_SEQS),
         "--max-num-batched-tokens",
@@ -2663,7 +2685,8 @@ def record_trace_status(
 
     vllm_summary = _load_json_object(vllm_kernel_summary)
     recomputed_vllm_summary = _summarize_torch_trace(
-        vllm_torch_trace, model_key=model_key
+        vllm_torch_trace,
+        model_key=(model_key if expected_batch == TRACE_CONCURRENCY else None),
     )
     for field, expected in recomputed_vllm_summary.items():
         actual = vllm_summary.get(field)
@@ -2696,6 +2719,7 @@ def record_trace_status(
             sqlite_path,
             model_key=model_key,
             range_index=range_index,
+            expected_batch=expected_batch,
         )
         if pathlib.Path(validation["nsys_report_path"]).resolve() != report_path.resolve():
             raise HarnessError("Nsight SQLite source report differs from its indexed artifact")
@@ -2708,6 +2732,7 @@ def record_trace_status(
             sqlite_path,
             model_key=model_key,
             range_index=range_index,
+            expected_batch=expected_batch,
         )
         if _load_json_object(summary_path) != summary:
             raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
@@ -2820,7 +2845,7 @@ def record_trace_status(
             "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
             "capture_range": NSYS_CAPTURE_RANGE,
             "capture_range_end": NSYS_CAPTURE_RANGE_END,
-            "concurrency": TRACE_CONCURRENCY,
+            "concurrency": expected_batch,
             "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
             "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
             "cuda_event_trace": False,
@@ -2833,13 +2858,13 @@ def record_trace_status(
             "nsys_captures": TRACE_REPETITIONS,
             "nsys_kill": "none",
             "nsys_stats": False,
-            "num_prompts": TRACE_PROMPTS,
+            "num_prompts": trace_prompts,
             "output_len": OUTPUT_LEN,
-            "probe_num_prompts": TRACE_CONCURRENCY,
+            "probe_num_prompts": expected_batch,
             "probe_num_warmups": 0,
             "probe_timing_binding": False,
             "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
-            "semantic_num_warmups": TRACE_CONCURRENCY,
+            "semantic_num_warmups": expected_batch,
             "repetitions": TRACE_REPETITIONS,
             "sample": "none",
             "cpu_context_switch_trace": "none",
@@ -2854,7 +2879,8 @@ def record_trace_status(
         "vllm_cpp_sha": vllm_cpp_sha,
         "vllm_profiler": "torch-profiler",
     }
-    write_json_atomic(output, result)
+    if write_output:
+        write_json_atomic(output, result)
     return result
 
 

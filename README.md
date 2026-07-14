@@ -9,21 +9,16 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The post-W3-I residual scan is complete. At c2 our TTFT is already better,
-> but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
-> binding diagnostic is complete: `3812d8` shows async scheduling adds only
-> **0.215%** total throughput and cannot explain the gap. The accepted oracle
-> trace now fixes the c2 target at **1,524** clean batch-2 windows and **1,160
-> kernels/window**, including a 128 Stream-K + 80 static-persistent FP4 tactic
-> split. The first local attempt (`ad8b58f`) passed the model gate and captured
-> four lossless, identical batch-2 ranges, but failed closed because the
-> validator still required the batch-16 graph size (1,107 rather than the
-> observed 1,011 kernels). The batch-aware repair is ready and a fresh complete
-> retry is **PENDING**; no RMSNorm residual or next kernel lever is claimed yet.
-> Separately, the
-> host-memory gap is traced to a persistent **22.92 GiB CPU weight mirror**
-> plus load-time safetensors residency. The binding result remains **55/124**, W3-I stays
-> default-off, and no 35B performance result is claimed. See
+> At c2 our TTFT is better, but decode TPOT is **114.841 vs 108.274 ms**
+> (**6.1% slower**). The repaired `179a0fc` raw trace is complete: all **12/12**
+> local B=2 ranges are lossless and topology-identical at **1,011 kernels**, and
+> the fresh oracle contains **1,522** exact B=2 windows at **1,160 kernels** plus
+> two classified B=1 drain windows. Both sides select the same **128 Stream-K +
+> 80 static-persistent** FP4 split. A read-only finalizer preflight maps the
+> remaining diagnostic time chiefly to BF16 CUTLASS GEMMs and RMSNorm/generated
+> partitions, but its durable marker is still **PENDING**; these cross-profiler
+> times are not a binding speed result. Separately, host memory retains a
+> **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -31,7 +26,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; first c2 local capture is void on a batch-contract validator mismatch | Repeat/finalize the repaired c2 ours/vLLM map, then spike and gate the selected RMSNorm/FP4 lever |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; complete `179a0fc` raw c2 evidence is awaiting its durable finalizer marker | Finalize the c2 map, spike the highest complete residual, then gate it before rerunning the exact grid |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -60,7 +55,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
 | Closed scheduler diagnostic | Accepted `3812d8` c2 ON/OFF: total **160.347697 / 160.003134 tok/s = 1.002153×**; TPOT **106.642 / 107.740 ms**, TTFT **807.658 / 696.330 ms**. Traces total **170.820 / 170.478 s** GPU-kernel time. Async is neutral for speed; W3 remains later parity work |
-| Selected GPU work | Oracle: 1,160 kernels/window. First local session: four lossless identical 1,011-kernel ranges, 177 RMSNorm calls and the same 128+80 FP4 split; attempt is void because sessions 2/3 and fresh oracle never ran. Repeat/finalize before selecting a lever |
+| Selected GPU work | `179a0fc` raw capture: **12/12** local ranges at 1,011 kernels and **1,522** steady oracle B=2 windows at 1,160 kernels; both use the same 128+80 FP4 tactics. Read-only preflight medians are **111.077 / 105.521 ms**, diagnostic only. Durable finalization is pending before a lever is claimed |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 
@@ -182,10 +177,10 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: finalize and gate the c2 low-batch kernel
-residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate →
-the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external
-KV cache / LMCache support.
+The next execution order is fixed: durably finalize and gate the c2 low-batch
+kernel residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix
+gate → the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and
+external KV cache / LMCache support.
 
 ## Project record
 

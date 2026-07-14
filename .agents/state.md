@@ -8079,3 +8079,54 @@ mutation tests pass **18/18**, and the record/doc checkers are green. Cleanup
 returned GPU, lock and port 8001 idle.
 Binding `3f256ab` remains **55/124**; next is a fresh commit/root repeating all
 three local sessions plus the oracle trace before finalization or lever choice.
+
+## 2026-07-14 — repaired exact-c2 raw capture completes; durable finalizer staged
+
+Clean pushed `179a0fc2afc1c33b63d14de8e50d3fde976c7356` completed the
+entire repaired low-batch series at
+`~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`
+under one uninterrupted `/tmp/gpu` lock. The exact CUDA 13.0.88/sm_121a
+trace build, vLLM 0.25.0 oracle provenance and real 27B paged-engine model gate
+all pass. Three independent local sessions each export four exact B=2 graph
+ranges: **12/12** are lossless and invariant at **1,011 kernels + 7 memcpy +
+1 memset**, canonical node-multiset SHA
+`44fcf31fde6a52246f9cc22dbb45e9f3ca5c9cd649c10d8d3ef648a5007bd93d`.
+They retain the exact 208-call FP4 split of **128 Stream-K 128x64x256 + 80
+static-persistent 128x32x256**. Local per-range kernel time has median
+**111.076528 ms**, mean **111.053034 ms**, and CV **0.688%**.
+
+The fresh vLLM trace SHA
+`2b3bf41269fd19ef65c5c3e06f067af73d7d997de3b6be17a2af785b6a86785c`
+contains 1,801,820 kernel events / 172.085341 seconds and **1,522** invariant
+steady B=2 generation windows at exactly 1,160 kernels, plus two bounded B=1
+drain windows. All steady ordered-name sequences hash to
+`858915dd…fad0`; the fresh launch signature differs from the earlier accepted
+trace only because five generated RMSNorm partitions use 50 rather than 48
+registers. Its B=2 median kernel time is **105.520831 ms**. The resulting
+**1.052650×** local/oracle time ratio and inverse-throughput proxy
+**0.949983×** are cross-profiler diagnostics only and do not supersede the
+binding online grid.
+
+Family medians local/oracle identify the complete structural residual:
+BF16 CUTLASS GEMMs are **193 / 51.662672 ms** versus **97 / 48.798042 ms**
+(+96 launches, +2.864630 ms); RMSNorm/generated partitions are **177 /
+2.249728 ms** versus **177 / 0.439491 ms** (+1.810237 ms); GDN recurrence is
++0.373690 ms and the fused/normal producers are +0.316367/+0.296223 ms.
+FP4 GEMM is already non-positive at **52.508720 / 52.734326 ms** with matching
+tactics, and FA2 is effectively equal. These values rank the next whole-chain
+source spike; they are not binding performance credit.
+
+`tools/bench/finalize_low_batch_trace.py` now reconstructs this raw series
+fail-closed: it revalidates every command, source/build/cache/client/control
+contract, all SQLite exports, local invariance, exact oracle B=2 topology,
+bounded drains, launch-signature allowlist, family counts, resolved tactics,
+model gate and lifecycle. It hashes the artifact set and writes summary,
+manifest, then `status-c2.json` last, while refusing overwrite. Four ported
+tests cover acceptance and topology/name/signature/drain/boundary/range/marker
+failures. A full read-only preflight of the committed candidate against the DGX
+raw root passes without writing evidence. The durable marker remains
+**PENDING** until this checkpoint is pushed and those exact committed bytes run
+once against the immutable root. Cleanup confirms no compute process, port
+8001 free and `/tmp/gpu` free. Binding `3f256ab` remains **55/124**; next is the
+CPU-only durable finalization, followed by a spike and gate for the largest
+complete BF16-GEMM/RMSNorm residual.

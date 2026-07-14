@@ -9199,3 +9199,47 @@ execute the complete driver-owned one-lock series. Do not reuse `593996d`.
 Binding remains **55/124**, `benchmark_binding=false`, and qkvz, exact-grid,
 35B performance and speed credit remain blocked until the verified component
 terminal disposition.
+
+## 2026-07-14 — session handoff: repaired W1D3 component exits incomplete at c16 HTTP 500
+
+Clean pushed `d82d282f9efd1a5b97e7c6f1ac7a55b949849d09` was checked out
+detached and clean at
+`~/work/vllm.cpp-gdn-packed-component/d82d282f9efd1a5b97e7c6f1ac7a55b949849d09/source`.
+The byte-identical binding `3f256ab` 27B corpus and exact Qwen3.6-27B NVFP4
+snapshot `890bdef7a42feba6d83b6e17a03315c694112f2a` are bound in the new
+evidence root. Production RelWithDebInfo configuration uses CUDA 13.0.88,
+sm_121a, FlashInfer CUTLASS, FA2, vendored Triton AOT and profile control OFF;
+configure SHA-256 is
+`c30f850dbd5248a6f1453b2abba43de7741f9d89104510214c32a52a5d09260d`,
+and the requested build completed **154/154**.
+
+Detached driver PID `3866199` (parent PID 1) successfully crossed the repaired
+execution-manifest boundary: `execution/27-component.json` records
+`profile_control=false`, the corpus validated, and the driver acquired one
+`/tmp/gpu` lock for the entire series. Packed and rollback direct model gates
+both completed at **235/235 + 16/16** before timing. All six c2 AB/BA/AB legs,
+raw files and memory returns completed. At c16 packed repetition 1, the
+streaming preflight, initial request and 16 warmups passed, then the 96-request
+timed batch completed **0/96**: every request returned HTTP 500 in 0.062 s. The
+driver exited before `leg_end` and without `component-status.json`, summary or
+manifest. Cleanup succeeded: source is clean, no compute process remains, GPU
+is 0%/P8, `/tmp/gpu` and port 8001 are free.
+
+The exact engine exception is absent. Local `ApiServer::handle_completions`
+catches it and serializes `e.what()` into the JSON error body, while pinned
+vLLM's OpenAI request function stores only `response.reason`; the retained
+client log therefore says only `Internal Server Error`, and the server log has
+no exception line. This bounds the next diagnostic but does not justify a
+runtime-fix hypothesis. Order/run/execution/c16 raw/client/server SHA-256 values
+are `a2de5b07…6de0` / `297e3c62…a6fb` / `ff71c9f0…0684` /
+`f8571d48…945c` / `8b9526f4…63a9` / `7b05e066…7dfe`.
+
+The replace-in-place [cold-resume handoff](../HANDSOFF.md) records the exact
+root/hashes and safe next sequence. Preserve this root unchanged. First add a
+bounded test-first diagnostic that retains the non-2xx JSON body and/or logs the
+caught server exception; reproduce only the exact c16 boundary under a new
+pushed SHA/root, then trace the exposed exception before proposing a runtime
+fix. A subsequent full series also uses another fresh SHA/root and accepts only
+marker-last `complete-pass`, `complete-failed` or `complete-void`. Binding stays
+**55/124**, c2 TPOT stays **114.841 vs 108.274 ms (6.1% slower)**,
+`benchmark_binding=false`, and no speed credit is granted.

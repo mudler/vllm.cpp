@@ -17,9 +17,12 @@ the exact 48-for-96 GDN substitution and invariant remaining topology. The
 production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
 finalizer are hardened. A test-first repair now requires the real production
 invocation to include exactly one `record-execution --profile-control off`;
-focused tests pass **45/45** and all tools **127/127**. Its fresh-SHA **40
-timing + 8 memory** DGX execution remains **PENDING**, so no accepted
-performance number changes.
+focused tests pass **45/45** and all tools **127/127**. Clean source `d82d282`
+completed both direct model gates and all six c2 legs, then **FAILED /
+INCOMPLETE** at c16 packed repetition 1. The streaming preflight, initial
+request and 16 warmups passed, but all 96 timed requests returned HTTP 500 in
+0.062 s. The driver exited without a marker-last status. Partial c2/c16 files
+are nonbinding, so no accepted performance number changes.
 
 ## Binding 27B online gate
 
@@ -64,9 +67,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The repaired component runner is focused **45/45**, all tools **127/127**, with no timing credit | Push and execute the repaired fresh-SHA one-lock component; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `d82d282` component stopped at c16 packed r1 with 96/96 HTTP 500 responses and no terminal marker or timing credit | Capture the underlying server exception, repair test-first, and rerun the full component from a new SHA/root; the exact grid remains unauthorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 DGX PENDING** | Structural evidence is accepted. The production invocation now has an exact test-first `--profile-control off` contract; focused **45/45**, all tools **127/127**, shell and dry-run gates pass | Push the repair, then run once from its new immutable root under the single driver-owned lock |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FAILED INCOMPLETE** | Structural evidence is accepted. Clean `d82d282` passed both model gates and all c2 legs, then the first c16 packed timed batch returned 96/96 HTTP 500. Driver PID `3866199` exited; no terminal marker exists; GPU/lock/port are clean/free | Preserve the root. Add bounded diagnostics for the discarded HTTP error body/server exception, reproduce the c16 boundary under a new SHA/root, then rerun all twelve legs |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -89,8 +92,16 @@ state log. The current checkpoint is W1D3 component gating:
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
-| Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | Corrected implementation: focused **45/45 PASS**, all tools **127/127 PASS**, Bash/ShellCheck/Python and exact dry-run PASS. Fresh DGX execution **PENDING** |
-| Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and all **144** paired run axes, ≤4% per-run deviation, fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **NO SPEED CREDIT; c2/c16 PENDING** |
+| Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | Clean `d82d282` root `~/work/vllm.cpp-gdn-packed-component/d82d282f9efd1a5b97e7c6f1ac7a55b949849d09` is **FAILED / INCOMPLETE**: model gates and c2 6/6 complete; c16 packed r1 main batch 0/96 complete, 96/96 HTTP 500; no terminal marker |
+| Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and all **144** paired run axes, ≤4% per-run deviation, fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **FAILED / INCOMPLETE; NO SPEED CREDIT; every partial axis is nonbinding** |
+
+Failure evidence is immutable. Order/run/execution/c16 raw/client/server SHA-256
+values are `a2de5b07…6de0` / `297e3c62…a6fb` / `ff71c9f0…0684` /
+`f8571d48…945c` / `8b9526f4…63a9` / `7b05e066…7dfe`. The C++ API wraps the
+engine exception text into its JSON error body, but pinned vLLM's OpenAI
+benchmark stores only `response.reason`; therefore the retained client evidence
+says only `Internal Server Error`. Exact exception capture is the next
+diagnostic, not a guessed runtime fix.
 
 The current raw root is
 `~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
@@ -119,17 +130,19 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 and W1D3 structural evidence are closed. After pushing the repaired source,
-the fresh repaired-SHA reproduction entry point is:
+G2 and W1D3 structural evidence are closed. The repaired source has been pushed
+and launched exactly once at `d82d282`; that incomplete root must never be
+reused or appended. The failure inspection and next diagnostic entry point are
+in [HANDSOFF.md](../HANDSOFF.md). The failed launch provenance is:
 
 ```sh
 set -euo pipefail
 SOURCE_REPO="$HOME/work/vllm.cpp"
 git -C "$SOURCE_REPO" fetch origin main
-SHA=$(git -C "$SOURCE_REPO" rev-parse origin/main)
+SHA=d82d282f9efd1a5b97e7c6f1ac7a55b949849d09
 ROOT="$HOME/work/vllm.cpp-gdn-packed-component/$SHA"
 BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
-SNAPSHOT="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(cat "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")"
+SNAPSHOT="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
 test ! -e "$ROOT"
 mkdir -p "$(dirname "$ROOT")"
 git -C "$SOURCE_REPO" worktree add --detach "$ROOT/source" "$SHA"

@@ -19,8 +19,12 @@ OpenAI-compatible server.
 > AB/BA/AB component runner and marker-last every-axis finalizer are
 > CPU-gated **45/45**. The pre-GPU invocation defect is now repaired with an
 > exact test requiring `record-execution --profile-control off`; all tool tests
-> pass **127/127**. A fresh-SHA DGX rerun is pending, so no model, timing,
-> memory, binding, or speed result changes. Host
+> pass **127/127**. The clean pushed `d82d282` series is **FAILED / INCOMPLETE**:
+> both direct model gates and all six c2 legs completed, then the first c16
+> packed leg passed its streaming preflight and 16 warmups but all 96 timed
+> requests returned HTTP 500. The driver exited without a marker-last status;
+> GPU, lock and port returned clean. Partial artifacts change no model, timing,
+> memory, binding, or speed result. Host
 > memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
 > performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
@@ -30,7 +34,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the corrected component runner is CPU-green **45/45** and all tools pass **127/127** | Push this repair and run its fresh-SHA one-lock component before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the `d82d282` component stopped at c16 packed r1 with 96/96 HTTP 500 responses and no terminal marker | Capture the hidden server exception at the same c16 boundary, repair test-first, then rerun from a new SHA/root before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -58,7 +62,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. A test-first contract now parses the real production invocation and requires exactly one `--profile-control off`; focused tests pass **45/45**, all tools **127/127**, Bash/ShellCheck/Python and dry-run gates pass. Fresh-SHA DGX execution remains pending |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. Clean `d82d282` completed both model gates and all c2 legs, then failed incomplete at c16 packed r1: preflight/warmups passed, 96/96 timed requests returned HTTP 500, and no status was sealed. The root is preserved; no partial number binds |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -130,7 +134,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the repaired c2/c16 runner is CPU-green **45/45**, with fresh DGX execution pending and qkvz blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the `d82d282` component failed incomplete at c16 HTTP 500 with no marker, and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -149,7 +153,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The corrected c2/c16 runner is CPU-green **45/45**; fresh every-axis DGX attribution remains open |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The `d82d282` c2/c16 run stopped at its first c16 timed batch with no terminal status; completed c2 legs are nonbinding |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 
@@ -180,7 +184,7 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: execute the landed packed-GDN c2/c16 runner → implement/gate
+The next execution order is fixed: expose/diagnose the c16 HTTP 500 and rerun the packed-GDN component → implement/gate
 merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
@@ -192,6 +196,7 @@ The canonical project record lives under [`.agents/`](.agents/), indexed by
 [AGENTS.md](AGENTS.md):
 
 - [roadmap v1](.agents/roadmap_v1.md)
+- [current cold-resume handoff](HANDSOFF.md)
 - [benchmark scoreboard](docs/BENCHMARKS.md)
 - [gates](.agents/gates.md) and [benchmark protocol](.agents/benchmark-protocol.md)
 - [engine](.agents/engine-matrix.md), [model](.agents/model-matrix.md),

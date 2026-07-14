@@ -90,8 +90,9 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 | Dense + paged forward | `src/vllm/model_executor/models/qwen3_5.cpp:2053-2204,2386-2511` | CUDA default issues one F32-output BA GEMM; `VT_GDN_MERGED_BA=0` restores two F32 calls from the same owner. |
 | BA consumers | `src/vt/ops.cpp:1466-1580`; CPU/CUDA implementations in `src/vt/{cpu/cpu_ops.cpp,cuda/cuda_glue.cu,cuda/cuda_gdn.cu}` | Fused and unfused consumers accept F32/BF16 inner-contiguous row views without materialization. |
 | Ported tests | `tests/vllm/models/test_qwen27_dense_forward.cpp:185-314`; `tests/vt/test_ops_gdn.cpp:1259-1445` | Exact loader bytes/one-owner rules plus F32/BF16 B=1/2/4/16/32 eager/capture/two-replay/canary coverage pass; strict memcheck is clean. |
-| Real models | `tests/parity/test_qwen27_paged_engine.cpp:116`; `tests/parity/test_qwen36_paged_engine.cpp:108` | Frozen-fixture merged/split 27B logs are identical at 235/235 + 16/16; 35B is 315/315. A BF16-output preflight fails 233/235 and exactly selects the rejected emulation continuation. |
-| Remaining W1 evidence | existing trace/finalizer and online-gate tools | Pushed-SHA repetition, exact 145-vs-193 structure, projection-level rounding oracle, capture lifecycle trace, and 40+8-axis component remain pending. |
+| Real models | `tests/parity/test_qwen27_paged_engine.cpp:116`; `tests/parity/test_qwen36_paged_engine.cpp:108` | Clean pushed `581d335` merged/split 27B logs are identical at 235/235 + 16/16; native 35B is 315/315. A BF16-output preflight fails 233/235 and exactly selects the rejected emulation continuation. |
+| Immutable W1 safety | `~/work/vllm.cpp-gdn-ba/immutable-581d335…`; status `3895e658…4cf6` | Exact CUDA build and focused 4/4 pass; packed-view compute-sanitizer is 590/590 with 0 errors/leaks; frozen fixture is 64/64 and no native cache is created. |
+| Remaining W1 evidence | existing trace/finalizer and online-gate tools | Exact-c2 validator/driver must add explicit merged/split contracts; 145-vs-193 structure, projection-level rounding oracle, capture lifecycle trace, and 40+8-axis component remain pending. |
 
 The completed evidence root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
@@ -159,11 +160,11 @@ Local mandatory regressions also include:
   W1/W2 dispatch inertness;
 - exact graph node-family/count assertions and zero new copy/cast nodes.
 
-Current mutable-source preflight closes the loader, focused ASan/UBSan,
-F32/BF16 packed-view, capture/two-replay, memcheck, default/fallback 27B and
+Clean pushed `581d335` closes the loader, focused ASan/UBSan, F32/BF16
+packed-view, capture/two-replay, strict memcheck, default/fallback 27B and
 native 35B cases. Leak-enabled CPU diagnostics retain the known process-lifetime
-buffer pool; they do not identify a W1 allocation. The preflight does not close
-projection-level BF16 rounding, GGUF/legacy-35B selection, immutable capture
+buffer pool; they do not identify a W1 allocation. The checkpoint does not
+close projection-level BF16 rounding, GGUF/legacy-35B selection, exact capture
 lifecycle, graph counts, memory accounting or component performance.
 
 ## Gates
@@ -258,7 +259,7 @@ commit SHA, toggle arm and frozen fixture recorded before execution.
 |---|---|---|
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
 | W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16, BF16 output is 233/235 and open. |
-| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Pending; G2 disposition must be committed before W2. |
+| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Immutable safety/model gates pass at `581d335`; exact-c2 harness, rounding, trace and component remain pending. G2 must close before W2. |
 | W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
 | W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |

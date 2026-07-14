@@ -15,11 +15,11 @@ OpenAI-compatible server.
 > while vLLM's merged qkvz/ba topology launches **97**. The accepted
 > [implementation spike](.agents/specs/gdn-merged-input-projections.md) now has
 > a `GATING` BA-only W1 implementation: one weight owner and one F32-output BA
-> GEMM pass the merged/split 27B gates **235/235 + 16/16**, packed-view CUDA
-> replay/memcheck, and 35B inertness. An upstream-dtype BF16-output preflight
-> instead reproduced the rejected emulation stream (**233/235**), so exact
-> rounding parity, immutable trace, and component performance remain open; no
-> speed credit exists yet. Host memory also retains
+> GEMM pass the clean pushed-SHA merged/split 27B gates **235/235 + 16/16**,
+> packed-view CUDA replay/memcheck, and native-35B inertness. An upstream-dtype
+> BF16-output experiment instead reproduced the rejected emulation stream
+> (**233/235**), so exact rounding parity, the 145-vs-193 trace, and component
+> performance remain open; no speed credit exists yet. Host memory also retains
 > a **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
@@ -28,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; BA W1 is implemented and preflight-correct with F32 output, but immutable structure/performance and exact BF16-output parity are pending | Trace and component-gate merged BA, resolve its output rounding, then claim merged qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; pushed `581d335` closes BA W1 core correctness/safety with F32 output, but exact structure/performance and BF16-output parity are pending | Trace and component-gate merged BA, resolve its output rounding, then claim merged qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -56,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: one merged BA owner/projection, split rollback, and F32/BF16 strided consumers are implemented; F32 output is 16/16, BF16 output failed the near-tie gate, and immutable trace/component evidence is pending. qkvz remains excluded |
+| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes the merged-owner, split rollback, F32/BF16 strided-consumer, 27B/native-35B, and strict-safety gates. BF16 output failed the near-tie gate; exact trace/component evidence is pending and qkvz remains excluded |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 

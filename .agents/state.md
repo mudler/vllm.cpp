@@ -8241,3 +8241,29 @@ repeat its build/safety/model gates from the immutable SHA, then capture exact
 default **145** versus fallback **193** BF16-family GEMMs and run the c2/c16
 40+8-axis component. W2 qkvz remains prohibited until W1's rounding, structure
 and component disposition close.
+
+## 2026-07-14 — merged GDN BA W1 immutable correctness/safety complete
+
+Clean pushed `581d335fec2e5a96d9ccbb38c1ec001c39ac1789` was checked out as a
+detached, clean DGX worktree under
+`~/work/vllm.cpp-gdn-ba/immutable-581d335fec2e5a96d9ccbb38c1ec001c39ac1789`.
+The production build uses RelWithDebInfo, CUDA 13.0.88, sm_121a, the oracle
+FlashInfer CUTLASS tree, vendored Triton AOT with a verified manifest, FA2 and
+the read-only 64-plan fixture. Configure/build hashes are
+`4837c9fa…5b1` / `d4b333c9…c68`.
+
+Under one uncontended lock, the focused CUDA suite passes **4/4**. Default
+merged and `VT_GDN_MERGED_BA=0` split 27B processes each pass **235/235 +
+16/16** and their full logs are byte-identical (`c2a6f93f…cf96`). The 35B
+native/batched graph remains **315/315** (`b926716e…9875`). A separate strict
+packed-view compute-sanitizer run passes **590/590, 0 errors and 0 leaks**
+(`a3d61cb9…fb87`). The forbidden native plan target remains absent; GPU and
+lock return idle.
+
+Status / artifact-list hashes are `3895e658…4cf6` / `ed2bf8d8…895b`.
+This closes W1's immutable F32-output correctness/safety repetition only. The
+BF16-output 233/235 rounding gap, exact 145-vs-193 trace and c2/c16 40+8-axis
+component remain open, so binding `3f256ab` stays **55/124** and no speed credit
+exists. Inspection identifies the next harness leaf: exact-c2 validation still
+binds the 1,011-node before-state and the driver lacks an explicit split arm.
+Extend those fail-closed contracts before any W1 trace; qkvz remains prohibited.

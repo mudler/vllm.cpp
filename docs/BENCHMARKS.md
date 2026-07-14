@@ -11,10 +11,11 @@ Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
 our 48 GDN layers issue four BF16 input projections each, while vLLM packs them
 into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) has
-a `GATING` BA-only W1 implementation. Its F32-output merged and split arms are
-token-identical, while a BF16-output preflight fails the known near-tie. The
-immutable trace and 40+8-axis component remain **PENDING**, so no accepted
-number changes.
+a `GATING` BA-only W1 implementation. Clean pushed `581d335` closes its
+core correctness/safety repetition: F32-output merged and split arms are
+token-identical, strict memcheck is clean, and native 35B stays inert. A BF16-output
+experiment fails the known near-tie. The exact trace and 40+8-axis component
+remain **PENDING**, so no accepted number changes.
 
 ## Binding 27B online gate
 
@@ -60,7 +61,7 @@ performance command is authorized until the 27B result reaches 124/124.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **GATING / W1 BA IMPLEMENTED** | One raw-NK `[b,a]` owner, split rollback views, one merged F32-output GEMM, and stride-aware F32/BF16 consumers are production-build green. Frozen-fixture merged/split 27B logs are byte-identical at **235/235 + 16/16**; packed-view capture/replay memcheck is **590/590, 0 errors/leaks**; 35B is **315/315**. The BF16-output arm is **FAILED at 233/235** and selects the rejected emulation continuation | Repeat from the pushed SHA; prove 145-vs-193 structure, resolve exact BF16 rounding parity, then run c2/c16 AB/BA/AB before qkvz |
+| `KERNEL-GEMM-BF16` | **GATING / W1 BA CORE CORRECTNESS+SAFETY PASS** | Clean pushed `581d335` builds on CUDA 13.0.88/sm_121a with the exact Triton-AOT/FA2/CUTLASS path. Focused CUDA is **4/4**; frozen-fixture merged/split 27B logs are byte-identical at **235/235 + 16/16**; packed-view memcheck is **590/590, 0 errors/leaks**; native 35B is **315/315**. The BF16-output experiment remains **FAILED at 233/235** | Extend the exact-c2 harness for merged/split topology; finish GGUF/legacy inertness, 145-vs-193 structure and BF16 rounding; then run c2/c16 AB/BA/AB before qkvz |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -72,17 +73,15 @@ for speed, and the prior fused-producer candidate remains default-off after its
 strict component failure. Their exact results and reproduction history remain
 in the append-only record rather than this live scoreboard.
 
-The current implementation evidence is a mutable-source preflight, not binding
-performance evidence. It lives under
-`~/work/vllm.cpp-gdn-ba/evidence/precommit-final-{focused-20260714T071303Z,models-20260714T071327Z}`.
-The focused CTest/memcheck hashes are `5fd62a85…f461` / `a3d61cb9…fb87`;
-merged 27B, split 27B, and 35B logs are `e7c243cd…e7c8` /
-`e7c243cd…e7c8` / `328e02e9…d348`, using frozen fixture
-`e81e9181…7edd`. The rejected BF16-output log is `09078b76…b050`.
-Focused ASan+UBSan is **2/2** with the existing process-lifetime CPU pool
-excluded; a leak-enabled diagnostic attributes **16,960 B / 30 allocations**
-to that inherited pool and finds no invalid access.
-These results authorize an immutable rerun; they earn no speed ratio.
+The completed core correctness/safety root is
+`~/work/vllm.cpp-gdn-ba/immutable-581d335fec2e5a96d9ccbb38c1ec001c39ac1789`.
+Status / artifact-list SHA-256 values are `3895e658…4cf6` / `ed2bf8d8…895b`.
+Focused CTest, merged/split 27B, 35B, and memcheck log hashes are
+`4cf699ad…759b`, `c2a6f93f…cf96` (both arms), `b926716e…9875`, and
+`a3d61cb9…fb87`; fixture `e81e9181…7edd` loaded 64 plans and the forbidden
+native cache stayed absent. The rejected BF16-output preflight log remains
+`09078b76…b050`. This closes immutable core correctness/safety only and earns no
+speed ratio.
 
 ## Evidence selecting merged GDN projections
 
@@ -130,29 +129,25 @@ sha256sum "$ROOT"/{c2-summary.json,c2-manifest.json,status-c2.json}
 # Expected prefixes: 0ef6a124…0273 / 2556cfd0…2f21 / 9e0143fa…7b57
 ```
 
-Repeat the implementation gate from the pushed SHA before tracing; this is not
-a benchmark claim:
+Verify the pushed-SHA core correctness/safety checkpoint without rerunning the GPU:
 
 ```sh
-cmake -S . -B build-gdn-merge -G Ninja \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_SERVER=ON \
-  -DVLLM_CPP_CUDA_ARCHITECTURES=121a
-cmake --build build-gdn-merge --target test_ops_gdn \
-  test_qwen27_dense_forward test_qwen27_paged_forward \
-  test_qwen27_paged_engine test_qwen36_paged_engine server --parallel
-flock /tmp/gpu -c '
-  ctest --test-dir build-gdn-merge \
-    -R "(test_ops_gdn|test_qwen27|test_qwen36_paged_engine)" \
-    --output-on-failure &&
-  VT_GDN_MERGED_BA=0 ./build-gdn-merge/tests/test_qwen27_paged_engine
-'
+SHA=581d335fec2e5a96d9ccbb38c1ec001c39ac1789
+ROOT="$HOME/work/vllm.cpp-gdn-ba/immutable-$SHA"
+test "$(git -C "$ROOT/src" rev-parse HEAD)" = "$SHA"
+test -z "$(git -C "$ROOT/src" status --porcelain)"
+sha256sum "$ROOT/evidence"/{status.txt,sha256sums.txt}
+# Expected: 3895e658…4cf6 / ed2bf8d8…895b
 ```
 
-The first trace must use `nsys --cuda-graph-trace=node`. BA default must show
-145 BF16 GEMMs per B=2 window and BA-off 193, with no new cast/copy node; after
-qkvz, the corresponding target is 97. Exact immutable trace and AB/BA/AB
-commands, toggles, model fixture, hashes, and acceptance rules are in the
+The next GPU trace is **PENDING** a fail-closed harness update: the current c2
+validator still binds the 1,011-node before-state and the driver does not yet
+carry the split toggle. After that update, the trace-only driver with model 27
+and concurrency 2 must run default and `VT_GDN_MERGED_BA=0` as separate
+immutable arms under one lock. Both use
+`nsys --cuda-graph-trace=node`; default must show 145 BF16 GEMMs per B=2 window
+and split 193, with no new cast/copy node. After qkvz, the target is 97. Exact
+acceptance rules are in the
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md).
 
 Re-aggregate the binding result without GPU work; exit **1** is expected for a

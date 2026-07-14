@@ -83,11 +83,12 @@ inner 4096, state 128; context 262144.
 - Binding immutable `3f256ab` remains **55/124 axes pass, 69 fail** against
   vLLM v0.25.0. Finalized c2 root `179a0fc` already maps the executed path and
   selects the complete **193 vs 97** GDN projection mismatch. W1 merged BA is
-  implemented/`GATING` in `~/work/vllm.cpp-gdn-ba`: production CUTLASS 4.5
-  build, packed F32/BF16 capture/replay, strict memcheck, merged/split 27B and
-  inert 35B preflights pass; BF16 projection output fails the token near-tie.
-  Rebuild the pushed SHA, close exact 145-vs-193 trace, rounding parity and the
-  c2/c16 component before qkvz. Independently remove the measured **22.920
+  implemented/`GATING`. Clean pushed `581d335` under
+  `~/work/vllm.cpp-gdn-ba/immutable-581d335…` passes the exact CUDA 13.0.88 /
+  CUTLASS / Triton-AOT build, packed F32/BF16 capture/replay, strict memcheck,
+  merged/split 27B and inert native-35B gates; BF16 projection output fails the token
+  near-tie. Extend the exact-c2 harness, then close 145-vs-193 trace, rounding
+  parity and the c2/c16 component before qkvz. Independently remove **22.920
   GiB** host-weight mirror and overlapping source pages. No 35B performance
   command runs before all 27B axes pass.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct

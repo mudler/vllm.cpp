@@ -1,0 +1,204 @@
+{
+ "args": {
+  "Dk": 128,
+  "Dv": 128,
+  "Hk": 1,
+  "Hv": 3,
+  "batch": 2,
+  "scale": 0.08838834764831845,
+  "softplus_threshold": 20.0,
+  "use_qk_l2norm_in_kernel": true
+ },
+ "op": "gdn_packed_decode_bf16",
+ "oracle": {
+  "cuda_runtime": "13.0",
+  "device": "NVIDIA GB10",
+  "full_f32_beta_reference": {
+   "out": {
+    "bit_identical": false,
+    "bitdiff": 46,
+    "max_abs": 0.000244140625,
+    "mean_abs": 1.5012919902801514e-06
+   },
+   "state": {
+    "bit_identical": false,
+    "bitdiff": 5834,
+    "max_abs": 0.00390625,
+    "mean_abs": 1.354584310320206e-05
+   }
+  },
+  "packed_callable": "vllm.model_executor.layers.fla.ops.fused_recurrent_gated_delta_rule_packed_decode",
+  "reference_callable": "vllm.model_executor.layers.fla.ops.fused_recurrent_gated_delta_rule",
+  "repetitions": 3,
+  "rounded_beta_reference": {
+   "out": {
+    "bit_identical": true,
+    "bitdiff": 0,
+    "max_abs": 0.0,
+    "mean_abs": 0.0
+   },
+   "state": {
+    "bit_identical": false,
+    "bitdiff": 1,
+    "max_abs": 1.9073486328125e-06,
+    "mean_abs": 1.2935035854921839e-11
+   }
+  },
+  "semantic_boundary": "sigmoid(b.float()).to(torch.bfloat16) before recurrence; q/k L2 normalization remains in-kernel",
+  "torch_version": "2.11.0+cu130",
+  "upstream_test": "tests/kernels/test_fused_recurrent_packed_decode.py::test_fused_recurrent_packed_decode_matches_reference",
+  "vllm_target_commit": "702f4814fe54fabff350d43cb753ae3e47c0c276",
+  "vllm_version": "0.25.0"
+ },
+ "tensors": {
+  "A_log": {
+   "dtype": "f32",
+   "file": "A_log.npy",
+   "sha256": "4e785d0de5cd651394bb70441bb3543d1d72333aaafd88025e488ef67acbc9ad",
+   "shape": [
+    3
+   ]
+  },
+  "a": {
+   "dtype": "bf16",
+   "file": "a.npy",
+   "sha256": "effe6e4b1255359eb0b832bcd9010e890a1b1116abb52d9906c157c94f8808f7",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "b": {
+   "dtype": "bf16",
+   "file": "b.npy",
+   "sha256": "b1560a271c83ef60535d5157afa2cec55c1d436dbc76da66f8b4bd953bb1e01f",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "beta_full_f32": {
+   "dtype": "f32",
+   "file": "beta_full_f32.npy",
+   "sha256": "873fbbed95f8fc1b890dadb113f1bb69b44632dd91e2bb7a2ce398295431b2e8",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "beta_packed_bf16": {
+   "dtype": "bf16",
+   "file": "beta_packed_bf16.npy",
+   "sha256": "ef8ce96ce61dca43a253247f7d157638598715c5f3103a03870d842e9015bd9f",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "beta_packed_f32": {
+   "dtype": "f32",
+   "file": "beta_packed_f32.npy",
+   "sha256": "0aabd0f598e998b32a8eca552b995537e5bed5ef73a226d67923c0e5ebfb00ab",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "dt_bias": {
+   "dtype": "f32",
+   "file": "dt_bias.npy",
+   "sha256": "7150aaad304be38ce160784eb2c4a1d487667e9689dcec1ac14b66f8ab538c0c",
+   "shape": [
+    3
+   ]
+  },
+  "g": {
+   "dtype": "f32",
+   "file": "g.npy",
+   "sha256": "87439d8adbf20f249f91ec3242293ae3e3cde0bb9c25de65cfacbb415ce381ed",
+   "shape": [
+    2,
+    3
+   ]
+  },
+  "k": {
+   "dtype": "bf16",
+   "file": "k.npy",
+   "sha256": "581452896ca91c97885459ad28a4a19673b4c6859db24b6ee5fef725345ce81e",
+   "shape": [
+    2,
+    1,
+    128
+   ]
+  },
+  "mixed_qkv": {
+   "dtype": "bf16",
+   "file": "mixed_qkv.npy",
+   "sha256": "ef11efc6be99f6343b41bf6e99059a519d72cc1c5cfcb1d8a2ee9c000eeab175",
+   "shape": [
+    2,
+    640
+   ]
+  },
+  "out": {
+   "dtype": "bf16",
+   "file": "out.npy",
+   "sha256": "5f3b7ba14c5a5a0593f9b875383dfc26ee164c2a31391f43e09dbeccea9d1b5a",
+   "shape": [
+    2,
+    3,
+    128
+   ]
+  },
+  "q": {
+   "dtype": "bf16",
+   "file": "q.npy",
+   "sha256": "84268615ca7cd9d6ff21e1b85ad5947f7757f23b40684c4576c278725bf860c8",
+   "shape": [
+    2,
+    1,
+    128
+   ]
+  },
+  "state_in": {
+   "dtype": "bf16",
+   "file": "state_in.npy",
+   "sha256": "2f4854d3514f3176f62633ebec57c15036f964048f6649497d2332551757d811",
+   "shape": [
+    3,
+    3,
+    128,
+    128
+   ]
+  },
+  "state_indices": {
+   "dtype": "i32",
+   "file": "state_indices.npy",
+   "sha256": "34fb5c825de7ca4aea6e712f19d439c1da0c92c37b423936c5f618545ca4fa1f",
+   "shape": [
+    2
+   ]
+  },
+  "state_out": {
+   "dtype": "bf16",
+   "file": "state_out.npy",
+   "sha256": "a1baf74547cfb33a13cd3680fca281907ace8af448e044f341d213ce27d54043",
+   "shape": [
+    3,
+    3,
+    128,
+    128
+   ]
+  },
+  "v": {
+   "dtype": "bf16",
+   "file": "v.npy",
+   "sha256": "8f73db538dbda86be3cce27e31bedfe5bb37b70812d712340c14e2d9b93db35a",
+   "shape": [
+    2,
+    3,
+    128
+   ]
+  }
+ }
+}

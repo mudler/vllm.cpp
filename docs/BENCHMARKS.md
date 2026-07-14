@@ -9,28 +9,16 @@ append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 
 Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
-**FAILED / open at 55/124 axes**. The active implementation leaf is now exact:
-our 48 GDN layers issue four BF16 input projections each, while vLLM packs them
-into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
-[merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) has
-a `GATING` BA-only W1 implementation. Clean pushed `581d335` closes its core
-correctness/safety repetition. Immutable `f925294` now closes the local
-projection and inertness subgates under one lock: the five-shape local CUDA
-digest passes **14/14**, native/legacy loader checks pass **73/73**, native 35B
-passes **315/315**, both real APEX GGUF models pass **28/28**, and the default
-27B arm passes **235/235**. The final BF16-output 27B arm remains **FAILED at
-233/235** and exactly equals the rejected emulation stream. Because the packed
-projection itself is bit-identical to vLLM, this is a downstream b/a boundary
-or consumer-semantics gap, not GEMM rounding. The fail-closed run has no
-completion marker and earns no support or performance claim.
-Immutable trace `0091cd1`, finalized by pushed `8a1f923`, now has durable
-status **`complete-structural`**. All 12 merged ranges are exactly
-**963 / 145 BF16** and all 12 split ranges are **1,011 / 193**; every selected
-non-BF16 family is unchanged. The fresh vLLM controls retain 1,522/1,521
-internally invariant steady windows, accepted names/geometry/families/tactics,
-and the two exact inspected Torch/Inductor register signatures. This proves an
-exact 48-BF16-only removal but remains non-binding. The 40+8-axis component is
-**PENDING**, so no accepted performance number changes.
+**FAILED / open at 55/124 axes**. BA packing is structurally closed at
+**963 / 145 BF16** versus the rollback's **1,011 / 193**, and its five real
+BF16 projection shapes are bit-exact. End-to-end BF16 remains **233/235**.
+The active [packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md)
+now identifies the exact downstream contract: vLLM normalizes q/k in F32
+inside recurrence and rounds sigmoid beta through BF16. Mutable local replay
+is current **306/7552**, beta-only **308/6558**, and both upstream semantics
+**0/1** output/state BF16 differences. This is diagnostic, not a benchmark:
+immutable replay, production implementation, 235/235 and the 40+8-axis c2/c16
+component are **PENDING**, so no accepted performance number changes.
 
 ## Binding 27B online gate
 
@@ -75,13 +63,46 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **ACTIVE W1C / DOWNSTREAM CORRECTNESS FAILED** | `0091cd1` remains `complete-structural`. Immutable `f925294` passes local CUDA projection **14/14**, loader **73/73**, native 35B **315/315**, real GGUF **28/28**, and default 27B **235/235**. Its BF16-output arm is still **233/235**, exactly the emulation stream; `benchmark_binding=false` | Compare the first GDN layer at packed BA output, contiguous b/a, and both consumers against vLLM; restore token-exact BF16 semantics before c2/c16 AB/BA/AB or qkvz |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Close packed decode and its c2/c16 component; rerun the exact grid only if authorized |
+| `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness; BF16 remains **233/235**, `benchmark_binding=false` | Depends on `KERNEL-GDN-PACKED-DECODE`; qkvz stays blocked |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / PERFORMANCE PENDING** | Official v0.25 fixture: rounded-beta reference is output-exact with one state-element delta; mutable local current/beta-only/full-semantic differences are **306/7552**, **308/6558**, **0/1** | Commit/push, immutably replay, implement the full FP16/BF16/F32 op, restore 235/235, then run node trace and c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | No equivalent cache-on vllm.cpp/vLLM/SGLang campaign exists | After cache-off parity, gate equivalent vLLM v0.25.0 and SGLang v0.5.15; the faster reference binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI and two-engine store/retrieve remain roadmap inventory | Spike fake-provider semantics, then gate LMCache MP before in-process mode |
+
+### Active packed-decode semantic checkpoint
+
+The committed fixture is generated by the official vLLM v0.25.0 environment
+and calls `fused_recurrent_gated_delta_rule_packed_decode` directly. Three
+identical calls are bit-stable. Against the packed result:
+
+| Reference/local boundary | Output BF16 differences | State BF16 differences | Disposition |
+|---|---:|---:|---|
+| vLLM explicit recurrence, BF16-rounded beta + in-kernel q/k norm | 0 | 1 | Oracle-valid; max state delta `1.9073486328125e-06` |
+| vLLM explicit recurrence, full-F32 beta | 46 | 5,834 | Rejects full-F32 beta semantics |
+| Current local `GdnPostConv + GdnDecode` | 306 | 7,552 | Rejects the current decomposed BF16 consumer |
+| Local beta rounding only | 308 | 6,558 | Rejects the beta-only hypothesis |
+| Local beta rounding + F32 q/k norm | 0 | 1 | Selects the complete packed port |
+
+The local rows are a mutable DGX preflight and have
+`benchmark_binding=false`. They neither close correctness nor earn a speed
+ratio. The next reproduction is the pushed-SHA immutable G0 sequence:
+
+```sh
+/home/mudler/venvs/vllm-oracle/bin/python \
+  tools/bench/gdn_packed_decode_oracle.py \
+  --out tests/parity/goldens/gdn-packed-decode-oracle
+
+flock /tmp/gpu build-cuda/tests/test_op_parity \
+  -tc='qwen27 GDN packed decode boundary*'
+```
+
+Acceptance requires an exact clean commit, official vLLM version/target guard,
+unchanged fixture hashes, local output/state `0/1` or better, and recorded
+source/binary/log provenance. Production and performance commands remain
+unauthorized until this replay closes.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its
@@ -224,15 +245,15 @@ flock /tmp/gpu bash -lc "
 "
 ```
 
-Until the first-divergence harness is committed, the smallest exact failure
-reproduction is:
+The prior end-to-end failure remains reproducible and is the model-level RED
+precondition for the packed implementation:
 
 ```sh
 SHA=f9252943d1e96dbfa43e3b8f2d06dec1aa5f20d3
 BUILD="$HOME/work/vllm.cpp-gdn-ba-rounding/$SHA/build-cuda"
 flock /tmp/gpu env VT_GDN_BA_OUT_BF16=1 \
   "$BUILD/tests/test_qwen27_paged_engine"
-# Expected current disposition: 233/235; got == greedy_ids_emulation.npy
+# Current disposition: 233/235; got == greedy_ids_emulation.npy
 ```
 
 For a fresh reproduction, create a new SHA-owned root, write the plan before

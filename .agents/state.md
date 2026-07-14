@@ -8463,3 +8463,49 @@ This closes projection and native/legacy/GGUF inertness only. W1C remains
 `ACTIVE`, BF16 end-to-end correctness remains failed, the 40+8 component is
 prohibited, qkvz remains excluded, and binding `3f256ab` stays **55/124** with
 `benchmark_binding=false` and no timing, memory or speed credit.
+
+## 2026-07-14 — packed pure-decode oracle closes the W1C first divergence
+
+After conversation compaction, `AGENTS.md`, the order-0 roadmap row, active
+claim and relevant GDN specs were reread before continuing. No `HANDSOFF.md`
+exists in this worktree. The existing dynamic sweep evidence was reconciled
+with current source: async scheduling is neutral, FP4 tactics and FA2 structure
+are already accounted for, and the remaining selected BF16 path is the GDN
+pure-decode consumer. `CLAIM-GDN-BA-ROUNDING-1` now explicitly leads new row
+`KERNEL-GDN-PACKED-DECODE`; qkvz, mixed/spec/prefill changes, the binding grid,
+host-memory repair and 35B performance stay excluded.
+
+Source inspection at both parity pin `e24d1b24` and v0.25.0 target `702f481`
+finds the packed path default-on (`envs.py:117,1123-1125`) and selected only
+for non-spec pure decode (`qwen_gdn_linear_attn.py:1286-1298,1644-1695`). Its
+Triton body (`fused_recurrent.py:255-336`) loads raw mixed q/k/v, normalizes q
+and k in F32 inside recurrence, and computes
+`sigmoid(float(b)) -> b.dtype -> float`. The mixed/spec fallback in
+`fused_sigmoid_gating.py:123-154` instead keeps beta F32. This corrects the
+stale live semantics note that called packed decode optional/default-off.
+
+`tools/bench/gdn_packed_decode_oracle.py` executes the official v0.25 packed
+callable three times, requires bit stability, and compares it with both
+rounded-beta and full-F32-beta explicit recurrence. The committed deterministic
+BF16 fixture has manifest SHA-256 `4c828e3a…a18d`, generator SHA
+`002a55ae…4ead`, and full ordered file-set SHA `7d3834c1…7579`. The rounded-beta
+reference matches packed output exactly and differs in one state element by
+`1.9073486328125e-06`; full-F32 beta differs at 46 output and 5,834 state BF16
+elements.
+
+The focused local CUDA differential replays the existing production chain.
+Mutable DGX preflight under `/tmp/gpu` reports current local output/state BF16
+differences **306/7552**, beta-only **308/6558**, and beta rounding plus F32
+q/k normalization **0/1**. Therefore beta-only is disproven and the complete
+packed operation is selected. The generic all-goldens CPU scan was first
+observed RED on the new unowned manifest, then the focused CUDA ownership arm
+was added without weakening the anti-stale-golden guard.
+
+This checkpoint adds the accepted full spike, stable kernel row, oracle,
+fixture and test only. Production op/API/model dispatch remain absent. The
+preflight is mutable and non-binding; pushed-SHA regeneration/replay with
+source/binary/log hashes is **PENDING** and precedes implementation. BF16 27B
+remains **233/235**, binding remains **55/124**, `benchmark_binding=false`, and
+no timing, memory or speed credit exists. After immutable G0, port the full
+FP16/BF16/F32 CPU+CUDA operation test-first, restore 235/235, prove 48 packed
+calls replace the post-conv/decode pairs, then run c2/c16 before qkvz.

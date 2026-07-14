@@ -31,7 +31,11 @@ gap is downstream of GEMM. Immutable `0091cd1`, finalized by pushed `8a1f923`, i
 `complete-structural`: 12/12 merged ranges are 963/145, 12/12 split ranges are
 1,011/193, exactly 48 BF16 launches disappear, and every selected non-BF16
 family remains unchanged. `benchmark_binding=false`; downstream first-divergence
-and c2/c16 performance remain pending. qkvz is still excluded.
+is now closed by the accepted [packed-decode spike](gdn-packed-decode.md): the
+complete F32 in-kernel q/k normalization plus dtype-rounded beta reaches `0/1`
+output/state differences, while beta-only does not. Immutable replay,
+production implementation, 235/235 and c2/c16 performance remain pending.
+qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
@@ -252,11 +256,12 @@ reported as a clean dependency check.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
    core correctness/safety; `f925294` closes exact projection/inertness while
-   downstream BF16 semantics remain open at 233/235.
+   the BF16 model remains open at 233/235. The packed-decode oracle selects the
+   exact downstream implementation and awaits pushed-SHA replay.
 6. The exact-c2 mode-aware harness is implemented and CPU-gated. Immutable
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
-   24 local range contracts with `benchmark_binding=false`. Localize and repair
-   the first divergent b/a consumer boundary, then close c2/c16 component
+   24 local range contracts with `benchmark_binding=false`. Port and gate
+   `KERNEL-GDN-PACKED-DECODE`, restore 235/235, then close c2/c16 component
    disposition; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.

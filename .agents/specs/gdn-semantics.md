@@ -1,9 +1,11 @@
 # GDN (Gated DeltaNet) semantics — pinned oracle notes
 
 Recorded from the pinned upstream checkout `/home/mudler/_git/vllm` @
-`e24d1b24` (see .agents/upstream-sync.md). Every formula below was read from
-source, not memory. Cites are `file:line` relative to `vllm/` in that tree.
-This is the M0.7 op contract reference AND the M0.9 layer-assembly reference.
+`e24d1b24` (see .agents/upstream-sync.md), with the packed-decode disposition
+rechecked against the active vLLM v0.25.0 target `702f481`. Every formula below
+was read from source, not memory. Cites are `file:line` relative to `vllm/` in
+those trees. This is the M0.7 op contract, M0.9 layer-assembly reference and
+current packed-pure-decode semantic record.
 
 Pinned sources read:
 
@@ -185,7 +187,7 @@ qwen_gdn_linear_attn.py:1781-1789):
     sp    = softplus(x) = log(1 + exp(x)),  numerically stabilized;
             sp = x where x > threshold (threshold = 20.0)
     g     = -exp(A_log) * sp                     (f32, <= 0; "log-space decay")
-    beta  = sigmoid(b)                           (f32, in (0,1))
+    beta  = sigmoid(b)                           (f32 for prefill/mixed decode)
 
 `fused_post_conv_prep` (fla/ops/fused_gdn_prefill_post_conv.py:152-248) is
 the prefill packager: takes conv output `[T, conv_dim]` + a/b + A_log/dt_bias
@@ -193,6 +195,14 @@ and emits contiguous `q [T,Hk,Dk]`, `k [T,Hk,Dk]` (both l2-normalized when
 `apply_l2norm=True`), `v [T,Hv,Dv]` (copied, model dtype), `g [T,Hv] f32`,
 `beta [T,Hv] f32`. `output_g_exp=False` on the Triton/FLA path (g stays in
 log space; True only for FlashInfer).
+
+The default packed **pure non-spec decode** path has a distinct rounding point
+(`fused_recurrent.py:318-325`): it loads `b` to F32, computes sigmoid, casts
+the result back through `b.dtype`, then upcasts to F32 for recurrence. Thus a
+BF16 BA projection uses
+`beta = float(bfloat16(sigmoid(float(b))))`. Mixed decode/spec execution uses
+`fused_sigmoid_gating.py:123-149` and retains beta in F32. This difference is
+intentional upstream behavior and dispatch is part of the numeric contract.
 
 **Oracle caveat:** pinned fused_post_conv_prep only compiles when
 next_pow2(Dk)==next_pow2(Dv) — use equal-pow2 dims for any M0.9 layer-golden
@@ -237,18 +247,22 @@ at this pin (all five sub-ops are Triton-only); the sequential Triton kernel
 pinned sequential statement of the same recurrence and is what the M0.7 C++
 implements directly.
 
-**Decode**: `fused_sigmoid_gating_delta_rule_update` (fused_sigmoid_gating.py:
-181-279) = the recurrence above with g/beta computed in-kernel from
-A_log/a/b/dt_bias (§6) and `use_qk_l2norm_in_kernel=True`. Call site
-(qwen_gdn_linear_attn.py:1540-1559): q/k/v `[1, B, H*, D*]` (B single-token
-seqs), `initial_state = ssm_state` (whole cache), `inplace_final_state=True`,
-`cu_seqlens = non_spec_query_start_loc [B+1]`, `ssm_state_indices [B]`
-(cache-line per seq; index 0 = NULL block → skipped, fused_sigmoid_gating.py:
-110-115), scale default `Dk^-0.5`. Output `o [1, B, Hv, Dv]` in q.dtype.
-An optional packed fast path (`VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE`,
-off by default, envs) calls `fused_recurrent_gated_delta_rule_packed_decode`
-(fused_recurrent.py:339-478) — same single-token math (lines 313-336)
-reading q/k/v straight out of packed mixed_qkv.
+**Decode**: the default `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1`
+(`envs.py:117,1123-1125`) selects
+`fused_recurrent_gated_delta_rule_packed_decode` only for pure non-spec decode
+(`qwen_gdn_linear_attn.py:1286-1298,1644-1695`). The kernel reads q/k/v
+directly from packed mixed_qkv, normalizes q and k in F32 without materializing
+them through the model dtype, derives g, applies the dtype-rounded beta from
+§6, and performs the same single-token recurrence
+(`fused_recurrent.py:255-336,339-478`). Mixed decode+prefill, speculative
+decode and the explicit packed-disabled fallback instead use
+`fused_sigmoid_gating_delta_rule_update` (`fused_sigmoid_gating.py:181-279`),
+which normalizes q/k in-kernel but keeps beta in F32. Both use the whole state
+cache, in-place state updates and `Dk^-0.5`; upstream cache index 0 is the null
+block (`fused_sigmoid_gating.py:110-115`, packed `fused_recurrent.py:292-299`).
+The local cache ABI translates that convention because local slot 0 is valid
+and negative indices are padding; see
+[gdn-packed-decode.md](gdn-packed-decode.md).
 
 ## 8. Prefill/decode segmentation (v1/attention/backends/gdn_attn.py)
 
@@ -258,7 +272,9 @@ sequences with query_len == 1 are decodes, the rest prefills. Batch is
 reordered decode-first (`reorder_batch_threshold = 1`, line 85). Per layer
 (`_forward_core`, qwen_gdn_linear_attn.py:1260-1576):
 
-- decode-only → `causal_conv1d_update` + `fused_sigmoid_gating_delta_rule_update`.
+- pure non-spec decode-only with packed decode enabled →
+  `causal_conv1d_update` + `fused_recurrent_gated_delta_rule_packed_decode`.
+  Packed-disabled decode-only uses `fused_sigmoid_gating_delta_rule_update`.
 - any prefill → `causal_conv1d_fn` over the whole non-spec token stream, then
   decodes (if mixed) are peeled off the front through
   `fused_sigmoid_gating_delta_rule_update` (lines 1480-1499) and the prefill
@@ -308,6 +324,16 @@ FLA chunk metadata (`chunk_indices/offsets`) is precomputed on CPU
 ## 10. Tests to port
 
 Pinned executable-spec inventory for the chunked prefill path:
+
+- `tests/kernels/test_fused_recurrent_packed_decode.py::
+  test_fused_recurrent_packed_decode_matches_reference` (lines 13-98):
+  **ACTIVE under `KERNEL-GDN-PACKED-DECODE`**. Its FP16/BF16/F32 x
+  contiguous/row-strided matrix, grouped heads, negative pad slots, output and
+  state checks are inventoried in
+  [gdn-packed-decode.md](gdn-packed-decode.md). The committed BF16 boundary
+  oracle proves beta-only is insufficient and that packed q/k normalization
+  plus dtype-rounded beta reproduces the oracle at `0/1` output/state BF16
+  differences; pushed-SHA replay and production implementation remain open.
 
 - `tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness`
   (lines 33-199): **ported in substance** to `tests/vt/test_ops_gdn.cpp`.

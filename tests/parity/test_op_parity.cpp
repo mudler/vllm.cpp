@@ -1576,6 +1576,14 @@ int RunGoldenPass(Device dev) {
                           << entry.path().filename().string()
                           << "': owned by focused Qwen3.5 MTP head parity test");
       continue;
+    } else if (op == "gdn_packed_decode_bf16") {
+      // This diagnostic replays several alternative consumer boundaries and
+      // requires CUDA. Keep it in the focused test below instead of making the
+      // generic CPU/CUDA golden pass execute the same fixture twice.
+      MESSAGE("SKIP op '" << op << "' case '"
+                          << entry.path().filename().string()
+                          << "': owned by focused GDN packed-decode boundary test");
+      continue;
     } else if (PendingRunnerOps().count(op)) {
       MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
                           << "': runner pending (see PendingRunnerOps)");
@@ -1797,6 +1805,166 @@ TEST_CASE("qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle (dgx-only, CUD
         vllm::v1::CborValue::Bytes(raw)));
     CHECK(got == c.at("output_cbor_sha256").get<std::string>());
   }
+  backend.DestroyQueue(queue);
+}
+
+// Ported from vLLM v0.25.0
+// tests/kernels/test_fused_recurrent_packed_decode.py::
+// test_fused_recurrent_packed_decode_matches_reference.  This is the W1D0
+// first-boundary diagnostic: the BA projection is already exact, so replay the
+// immediately downstream BF16 b/a consumer and show which packed-decode
+// semantics differ before changing production code.
+TEST_CASE("qwen27 GDN packed decode boundary matches vLLM 0.25 semantics (dgx-only, CUDA)") {
+  bool has_cuda = true;
+  try {
+    vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    has_cuda = false;
+  }
+  if (!has_cuda) {
+    MESSAGE("no CUDA backend; skipping GDN packed-decode boundary oracle");
+    return;
+  }
+
+  const fs::path dir =
+      fs::path(PARITY_GOLDENS_DIR) / "gdn-packed-decode-oracle";
+  const fs::path manifest_path = dir / "manifest.json";
+  REQUIRE(fs::exists(manifest_path));
+  const json manifest = json::parse(std::ifstream(manifest_path));
+  REQUIRE(manifest.at("op") == "gdn_packed_decode_bf16");
+  REQUIRE(manifest.at("oracle").at("vllm_version") == "0.25.0");
+  REQUIRE(manifest.at("oracle").at("vllm_target_commit") ==
+          "702f4814fe54fabff350d43cb753ae3e47c0c276");
+
+  auto load = [&](const char* name) {
+    return LoadTensor(dir, manifest.at("tensors").at(name));
+  };
+  auto mixed = load("mixed_qkv");
+  auto q_raw = load("q");
+  auto k_raw = load("k");
+  auto v_raw = load("v");
+  auto a = load("a");
+  auto b = load("b");
+  auto a_log = load("A_log");
+  auto dt_bias = load("dt_bias");
+  auto state_indices = load("state_indices");
+  auto state_in = load("state_in");
+  auto g_want = load("g");
+  auto beta_full_want = load("beta_full_f32");
+  auto beta_packed_want = load("beta_packed_f32");
+  auto out_want = load("out");
+  auto state_want = load("state_out");
+
+  const int64_t batch = manifest.at("args").at("batch").get<int64_t>();
+  const int64_t hk = manifest.at("args").at("Hk").get<int64_t>();
+  const int64_t hv = manifest.at("args").at("Hv").get<int64_t>();
+  const int64_t dk = manifest.at("args").at("Dk").get<int64_t>();
+  const int64_t dv = manifest.at("args").at("Dv").get<int64_t>();
+  const float scale = manifest.at("args").at("scale").get<float>();
+
+  Backend& backend = vt::GetBackend(DeviceType::kCUDA);
+  Queue queue = backend.CreateQueue();
+  DeviceBuf dmixed(backend, queue, mixed.dtype, ShapeOf(mixed.tensor),
+                   mixed.raw.data.data());
+  DeviceBuf da(backend, queue, a.dtype, ShapeOf(a.tensor), a.raw.data.data());
+  DeviceBuf db(backend, queue, b.dtype, ShapeOf(b.tensor), b.raw.data.data());
+  DeviceBuf da_log(backend, queue, a_log.dtype, ShapeOf(a_log.tensor),
+                   a_log.raw.data.data());
+  DeviceBuf ddt_bias(backend, queue, dt_bias.dtype, ShapeOf(dt_bias.tensor),
+                     dt_bias.raw.data.data());
+  DeviceBuf didx(backend, queue, state_indices.dtype,
+                 ShapeOf(state_indices.tensor), state_indices.raw.data.data());
+
+  DeviceBuf dq_local(backend, queue, DType::kBF16, {batch, hk, dk});
+  DeviceBuf dk_local(backend, queue, DType::kBF16, {batch, hk, dk});
+  DeviceBuf dv_local(backend, queue, DType::kBF16, {batch, hv, dv});
+  DeviceBuf dg_local(backend, queue, DType::kF32, {batch, hv});
+  DeviceBuf dbeta_local(backend, queue, DType::kF32, {batch, hv});
+  vt::GdnPostConv(queue, dq_local.tensor(), dk_local.tensor(), dv_local.tensor(),
+                  dg_local.tensor(), dbeta_local.tensor(), dmixed.tensor(),
+                  da.tensor(), db.tensor(), da_log.tensor(), ddt_bias.tensor(),
+                  vt::L2NormArgs{1e-6F});
+
+  std::vector<uint8_t> g_host, beta_host, v_host;
+  const Tensor g_local = dg_local.Download(queue, g_host);
+  const Tensor beta_local = dbeta_local.Download(queue, beta_host);
+  const Tensor v_local = dv_local.Download(queue, v_host);
+  RequireMatch("packed-boundary g", g_local, g_want.tensor, 1e-5, 1e-5);
+  RequireMatch("packed-boundary beta-full", beta_local,
+               beta_full_want.tensor, 1e-6, 1e-6);
+  RequireMatch("packed-boundary v", v_local, v_raw.tensor, 0.0, 0.0);
+  REQUIRE(CompareTensors(beta_local, beta_packed_want.tensor, 0.0, 0.0)
+              .has_value());
+
+  auto bf16_bitdiff = [](const Tensor& got, const Tensor& want) {
+    VT_CHECK(got.dtype == DType::kBF16 && want.dtype == DType::kBF16 &&
+                 got.Numel() == want.Numel(),
+             "packed-boundary bitdiff requires equal BF16 tensors");
+    int64_t count = 0;
+    for (int64_t i = 0; i < got.Numel(); ++i) {
+      if (got.Ptr<uint16_t>()[i] != want.Ptr<uint16_t>()[i]) ++count;
+    }
+    return count;
+  };
+
+  auto run_decode = [&](const Tensor& q_in, const Tensor& k_in,
+                        const Tensor& v_in, const Tensor& g_in,
+                        const Tensor& beta_in) {
+    DeviceBuf state(backend, queue, state_in.dtype, ShapeOf(state_in.tensor),
+                    state_in.raw.data.data());
+    DeviceBuf out(backend, queue, DType::kBF16, {batch, hv, dv});
+    vt::GdnDecode(queue, out.tensor(), q_in, k_in, v_in, g_in, beta_in,
+                  state.tensor(), vt::GdnArgs{scale}, &didx.tensor());
+    std::vector<uint8_t> out_host, state_host;
+    Tensor out_result = out.Download(queue, out_host);
+    Tensor state_result = state.Download(queue, state_host);
+    const int64_t out_diff = bf16_bitdiff(out_result, out_want.tensor);
+    const int64_t state_diff = bf16_bitdiff(state_result, state_want.tensor);
+    RequireMatch("packed-boundary out tolerance", out_result, out_want.tensor,
+                 2e-2, 1e-2);
+    RequireMatch("packed-boundary state tolerance", state_result,
+                 state_want.tensor, 2e-2, 1e-2);
+    return std::pair<int64_t, int64_t>{out_diff, state_diff};
+  };
+
+  const auto current =
+      run_decode(dq_local.tensor(), dk_local.tensor(), dv_local.tensor(),
+                 dg_local.tensor(), dbeta_local.tensor());
+  DeviceBuf dbeta_packed(backend, queue, beta_packed_want.dtype,
+                         ShapeOf(beta_packed_want.tensor),
+                         beta_packed_want.raw.data.data());
+  const auto beta_only =
+      run_decode(dq_local.tensor(), dk_local.tensor(), dv_local.tensor(),
+                 dg_local.tensor(), dbeta_packed.tensor());
+
+  DeviceBuf dq_raw(backend, queue, q_raw.dtype, ShapeOf(q_raw.tensor),
+                   q_raw.raw.data.data());
+  DeviceBuf dk_raw(backend, queue, k_raw.dtype, ShapeOf(k_raw.tensor),
+                   k_raw.raw.data.data());
+  DeviceBuf dv_raw(backend, queue, v_raw.dtype, ShapeOf(v_raw.tensor),
+                   v_raw.raw.data.data());
+  DeviceBuf dq_f32(backend, queue, DType::kF32, ShapeOf(q_raw.tensor));
+  DeviceBuf dk_f32(backend, queue, DType::kF32, ShapeOf(k_raw.tensor));
+  DeviceBuf dv_f32(backend, queue, DType::kF32, ShapeOf(v_raw.tensor));
+  vt::L2Norm(queue, dq_f32.tensor(), dq_raw.tensor(), vt::L2NormArgs{1e-6F});
+  vt::L2Norm(queue, dk_f32.tensor(), dk_raw.tensor(), vt::L2NormArgs{1e-6F});
+  vt::CastF32(queue, dv_f32.tensor(), dv_raw.tensor());
+  DeviceBuf dg_oracle(backend, queue, g_want.dtype, ShapeOf(g_want.tensor),
+                      g_want.raw.data.data());
+  const auto no_norm_round =
+      run_decode(dq_f32.tensor(), dk_f32.tensor(), dv_f32.tensor(),
+                 dg_oracle.tensor(), dbeta_packed.tensor());
+
+  MESSAGE("packed decode exact BF16 bit differences: current out/state="
+          << current.first << "/" << current.second
+          << ", beta-rounded=" << beta_only.first << "/" << beta_only.second
+          << ", beta-rounded + F32 q/k norm=" << no_norm_round.first << "/"
+          << no_norm_round.second);
+  CHECK(current.first > 0);
+  CHECK(current.second > 0);
+  CHECK(beta_only.second <= current.second);
+  CHECK(no_norm_round.first == 0);
+  CHECK(no_norm_round.second <= 1);
   backend.DestroyQueue(queue);
 }
 

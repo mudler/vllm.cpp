@@ -15,22 +15,19 @@ their exact code/test evidence. Fixed HTTP delivery capacity is retained and
 steady-state neutral. W3 `ENG-ASYNC-SCHED` is the only unimplemented leaf and
 remains `READY`, unowned, and uncredited.
 
-W3 is both an unmet mirror obligation and a current speed hypothesis. vLLM
+W3 is an unmet mirror obligation whose speed hypothesis is now closed. vLLM
 resolves `async_scheduling=None` to **True** when compatible
 (`vllm/config/vllm.py:990-1038`), and the binding v0.25.0 server log confirms
 that resolution. The 27B gate has better local TTFT at c2 but local TPOT is
-**114.841 vs 108.274 ms** (**6.1% slower**). The post-W3-I scan finds no known
-GPU-only leaf with a comparable end-to-end budget, so the next decision is an
+**114.841 vs 108.274 ms** (**6.1% slower**). The post-W3-I scan selected an
 exact vLLM async ON/OFF c2 timing + Torch-trace control on the binding corpus.
-The profiler can force `default`/`on`/`off` and records the resolved mode.
-Current root `9b1774c` is `VOID`: all six timing legs completed with
-provisional ON/OFF total ratio **1.000464×**, TPOT 0.89% better ON, and TTFT
-13.8% worse ON. ON trace capture completed, but the driver applied the
-48-prompt H1d exact-count validator to the six-prompt c2 trace and stopped
-before shape-neutral summary/OFF. Shape-neutral re-read passes and a fresh
-complete series is `PENDING`. A positive 4–6% complete result promotes
-W3 for an explicit claim. If the provisional neutral result repeats, W3 stays
-later parity work and the speed track returns to low-batch kernel mapping.
+That control is complete at accepted root `3812d8`: ON/OFF total throughput is
+**1.002153×**, direction-normalized TPOT is **1.010291×**, TTFT is
+**0.862159×**, and aggregate traced GPU time is **1.002004×**. The tactic/batch
+mix changes, but total work does not improve; async-ON digests are stable while
+OFF varies across default batch shapes. This is neutral against the
+predeclared 1.04× speed-credit floor. W3 stays later parity work, `READY` and
+unclaimed, while the immediate speed track returns to low-batch kernel mapping.
 
 ## Scope
 
@@ -78,14 +75,15 @@ on unresolved tokens (`pending_structured_output_tokens`,
 `vllm/v1/core/sched/async_scheduler.py:31-33` → `vllm/v1/engine/core.py:559-570`).
 Porting W1+W3 structurally yields this; no separate grammar work item.
 
-**Runtime trace plan** (dispatch is dynamic): first run the selected c2
-binding-corpus timing series with vLLM async explicitly ON/OFF, then capture
-both arms with `tools/bench/profile_vllm_online_gate.py --async-scheduling
-on|off --num-prompts 6 --max-concurrency 2`. vLLM's Torch-profiler path is the
-accepted GB10 alternative where nsys breaks EngineCore startup. The trace must
-show whether schedule N+1/output copy overlaps step N's GPU tail and freeze the
-maximum W3 credit before implementation. If positive, repeat c4/c8 and retain
-the default-ON trace as the port target.
+**Runtime trace result** (dispatch is dynamic): accepted `3812d8` runs the c2
+binding corpus with vLLM async explicitly ON/OFF and captures both arms through
+`tools/bench/profile_vllm_online_gate.py --async-scheduling on|off
+--num-prompts 6 --max-concurrency 2`. vLLM's Torch-profiler path is the GB10
+alternative where nsys breaks EngineCore startup. It freezes W3's maximum c2
+speed credit at **1.002153×** total with no aggregate GPU-time reduction, so no
+c4/c8 speed promotion follows. When W3 is later claimed for parity, retain the
+default-ON trace as its execution target and repeat correctness/every-axis
+gates without treating this neutral control as implementation evidence.
 
 ## Our baseline and current W3 delta
 
@@ -95,7 +93,7 @@ the default-ON trace as the port target.
 | Scheduler | Output placeholders are fixed at zero (`src/vllm/v1/core/sched/scheduler.cpp:143-145,587-600`) | `AsyncScheduler` placeholder/stale-frame/cache accounting |
 | Sampled token | Greedy allocates a transient device buffer, copies into pageable `std::vector`, synchronizes the main queue, then CPU-writes the next token (`src/vllm/v1/sample/sampler.cpp:30-53,90-99`; `src/vllm/v1/worker/gpu/runner.cpp:688-723`) | Persistent GPU `last_sampled_tokens`, on-device combine/post-update, and pinned nonblocking output copy |
 | Runtime seam | `vt::Backend` exposes queue creation/copy/synchronize but no public event or pinned-host allocation API (`include/vt/backend.h:15-34`) | Add backend-neutral event/wait and pinned-output ownership, with synchronous CPU degeneration; current graph-stream code proves streams only, not events |
-| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode and bootstraps repository imports when invoked by absolute path; unit contract is green | `9b1774c` VOID after six timing legs and ON capture because the H1d exact-count model key stopped before shape-neutral summary/OFF; provisional total ratio **1.000464×**; fresh no-model-key timing and traces `PENDING` |
+| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; `tools/bench/finalize_async_credit.py` validates six legs/two traces and writes the hashed marker last; CPU contracts are green | accepted `3812d8` completes timing + traces at **1.002153×** total and **1.002004×** traced GPU time; neutral for speed, digest/batch-shape sensitivity explicit, no W3 implementation claim |
 
 ## Port map
 

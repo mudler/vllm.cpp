@@ -19,14 +19,12 @@ The accepted c16 schema-v5 trace remains `c498a413` (status
 complete component at **27/40 timing + 3/8 memory**; it remains default-off and
 earns no speed credit. The mandated post-I1 scan is now complete. At c2 ours
 has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1% slower**).
-vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path is the only
-unmeasured structural difference with a 4–6% budget. The next gate is therefore
-an exact vLLM async ON/OFF c2 timing + Torch-trace control. Profiler mode and
-direct-script bootstrap are CPU-tested. Current `9b1774c` is `VOID`: all six
-timing legs completed with provisional ON/OFF total ratio **1.000464×** and ON
-capture completed, but the driver applied the 48-prompt H1d exact-count model
-key to this six-prompt c2 trace and stopped before shape-neutral summary/OFF.
-The fresh no-model-key series is `PENDING`.
+vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path has now
+been measured directly. Accepted `3812d8` completes six c2 timing legs and two
+shape-neutral traces: ON/OFF total **1.002153×**, direction-normalized TPOT
+**1.010291×**, TTFT **0.862159×**, and aggregate GPU time **1.002004×**. It is
+neutral for the 6.1% gap and earns no speed credit; exact low-batch RMSNorm/
+generated-partition and FP4-tactic mapping is the next gate.
 If the provisional neutral result repeats, the speed
 track moves to low-batch kernel traces and exact RMSNorm/generated-partition
 mapping. Host PSS/RSS is independently grounded in a persistent **22.920 GiB**
@@ -228,11 +226,10 @@ reported as a clean dependency check.
    Immutable `3f256ab` supersedes `9cc7191`: the 27B model gate, 36 timed groups
    and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
-   Run the selected c2 vLLM async ON/OFF timing + Torch-trace control before
-   claiming W3; current `9b1774c` timings/ON trace are provisional/VOID because
-   H1d exact-count validation stopped before shape-neutral summary/OFF. If
-   neutral in a complete run, capture equivalent
-   low-batch ours/vLLM traces.
+   Accepted c2 async control `3812d8` is neutral at **1.002153×** total and
+   **1.002004×** traced GPU time, so do not claim W3 for speed. Capture
+   equivalent low-batch ours/vLLM traces and map RMSNorm/generated partitions
+   plus resolved FP4 tactics before coding the next lever.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
    and gate the smallest grounded kernel leaf. Host-weight ownership is a

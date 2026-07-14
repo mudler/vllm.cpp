@@ -7946,3 +7946,56 @@ repeats in that complete series, W3 remains a parity obligation but leaves the
 speed-critical path, which moves to low-batch RMSNorm/generated-partition
 mapping. Live surfaces contain only this checkpoint; all earlier async attempts
 remain in this append-only record, the parity ledger, Git, and immutable roots.
+
+## 2026-07-14 — fifth async-credit execution completes; W3 is neutral for speed
+
+Clean pushed `3812d8d2b4a68d2e501007d01fe10cdf17751d02` ran from
+`~/work/vllm-async-credit/3812d8d2b4a68d2e501007d01fe10cdf17751d02`.
+One uncontended `/tmp/gpu` lock covered the prescribed ON-r1/OFF-r1/OFF-r2/
+ON-r2/ON-r3/OFF-r3 fresh-server order and both shape-neutral Torch traces.
+All six timing legs resolved the requested mode and completed **36/36
+requests**, 36,864 input and 4,608 output tokens with no failures.
+
+| Mode | Total tok/s | Output tok/s | Mean TPOT | Mean TTFT | Total CV |
+|---|---:|---:|---:|---:|---:|
+| async ON | 160.347697 | 17.816411 | 106.642353 ms | 807.657803 ms | 0.109739% |
+| async OFF | 160.003134 | 17.778126 | 107.739836 ms | 696.329685 ms | 0.026296% |
+
+Direction-normalized ON/OFF ratios are **1.002153×** total/output/request
+throughput, **1.010291×** TPOT/ITL, **0.862159×** TTFT, and **1.002150×**
+E2EL. Async therefore adds only **0.215%** aggregate throughput, improves TPOT
+about 1.0%, and increases TTFT about 16.0%; it does not meet the predeclared
+**1.04×** speed-credit floor.
+
+Both traces completed one warmup plus three closed-loop c2 repetitions and
+used the vLLM v0.25.0 MRV2/FlashInfer/FA2/full-CUDA-graph path. Shape-neutral
+summaries contain **1,798,044 kernels / 170,819,890.207 µs** ON and
+**1,810,902 / 170,478,266.554 µs** OFF. ON executes 0.71% fewer events but
+has **1.002004×** aggregate GPU time; 63 kernel names are shared, with three
+ON-only and 15 OFF-only names dominated by FP4 tactic/batch-shape selection.
+Selected trace SHA values are `57413dd1…1cba` ON and `89bb9900…3c4` OFF.
+The trace digests are stable 4/4 ON and non-equal 0/4 OFF; corresponding online
+generated-text arrays differ in all three ON/OFF pairs while every request
+keeps exact 1,024→128 lengths. This is retained as production-default batch-
+shape non-invariance evidence, not a correctness/support claim.
+
+The original inline CPU aggregator hit an unterminated-string syntax error
+after every GPU artifact and both kernel summaries were complete. No raw file
+was missing or mutated, so a GPU rerun would add no information. The new
+`tools/bench/finalize_async_credit.py` validates all six raw legs, both mode
+metadata contracts, both kernel summaries and their per-name totals; records
+digest instability rather than hiding it; hashes the immutable artifact set;
+and writes summary, manifest, then the completion marker atomically. Its exact
+executed bytes hash to `b3082a6e…1633`. The resulting marker is
+`complete-diagnostic`; summary / manifest / marker / artifact-set / series-log
+SHA values are `35b7344a…c323` / `e757b4ad…86c6` / `aa1e410b…369c` /
+`ead68397…8e56` / `a21f1d65…5245`. Raw/log/trace category SHA values are
+`1d858f0f…514f` / `30c644c8…650` / `258e93ac…1d7d`.
+
+Cleanup confirms no compute process, port 8001 free, and `/tmp/gpu` free.
+Focused profiler/finalizer/client contracts pass **26/26** and the complete
+CPU benchmark-tool discovery suite passes **55/55**; the agent-record checker
+passes. Binding `3f256ab` remains **55/124**. `ENG-ASYNC-SCHED` stays
+unowned `READY` as later parity work with no speed credit. The active order-0
+task is exact c2 ours/vLLM RMSNorm/generated-partition and resolved FP4-tactic
+mapping, followed by a spike and gate for the highest complete lever.

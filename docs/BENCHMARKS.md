@@ -10,13 +10,14 @@ Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 The post-W3-I scan is complete: the largest binding low-concurrency symptom is
 c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
-better TTFT. The current exact async-control root (`9b1774c`) is **VOID**: all
-six timing legs completed, with provisional ON/OFF median total throughput
-**160.288 / 160.213 tok/s = 1.000464×**, and the ON trace completed. Its
-summarizer then applied the 48-prompt H1d exact-count contract to this six-prompt
-c2 trace and stopped before OFF. Shape-neutral aggregation is verified and a
-fresh complete root is **PENDING**, so W3 has no speed credit yet. Host PSS/RSS is independently traced to a persistent
-**22.920 GiB** CPU weight mirror plus source-page residency during load. W3-I
+better TTFT. The accepted `3812d8` async-control root closes that hypothesis:
+ON/OFF median total throughput is **160.347697 / 160.003134 tok/s =
+1.002153×**. ON improves TPOT only **1.0%** and increases TTFT **16.0%**;
+shape-neutral ON/OFF traces total **170.820 / 170.478 s** of GPU-kernel time.
+It is neutral against the predeclared 1.04× minimum, so W3 remains an unmet
+parity obligation rather than a speed lever. Host PSS/RSS is independently
+traced to a persistent **22.920 GiB** CPU weight mirror plus source-page
+residency during load. W3-I
 remains default-off after its **30/48** component failure.
 
 ## Binding 27B online gate
@@ -63,8 +64,8 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Complete the repaired c2 async ON/OFF timing + trace control, then gate the selected lever before rerunning the grid |
-| vLLM async-scheduler credit | **FAILED / VOID; CORRECTED RUN PENDING** | Clean `9b1774c` completed all six timing legs. Provisional medians: ON/OFF total **160.287860 / 160.213485 tok/s = 1.000464×**, TPOT **106.649 / 107.594 ms** (ON 0.89% better), TTFT **809.941 / 697.928 ms** (ON 13.8% worse). ON trace capture completed; shape-neutral re-read passes at **1,803,708 kernels / 171.130066 s**, but the driver passed `--model-key 27`, invoking the incompatible H1d 1,588-annotation contract against c2's 1,539. No OFF trace or completion marker exists. Series/raw-set/trace-set SHA `0d204e91…0310` / `9ce64024…4bc` / `acb402a9…d419`; cleanup returned lock/GPU/port idle | Repeat all six timing legs plus both traces under one lock and summarize c2 without `--model-key`; no provisional timing or one-arm trace earns credit |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Map the exact c2 ours/vLLM RMSNorm/generated partitions and FP4 tactics, gate the selected lever, then rerun the exact grid |
+| vLLM async-scheduler credit | **COMPLETE DIAGNOSTIC / NEUTRAL FOR SPEED** | Clean `3812d8`, six timing legs plus two shape-neutral traces under one lock. ON/OFF medians: total **160.347697 / 160.003134 tok/s = 1.002153×**, TPOT **106.642 / 107.740 ms** (ON ~1.0% better), TTFT **807.658 / 696.330 ms** (ON ~16.0% slower). Trace count/time: **1,798,044 / 170.819890 s** ON and **1,810,902 / 170.478267 s** OFF; tactic/batch mix changes, aggregate GPU time does not improve. Summary/manifest/artifact SHA `35b7344a…c323` / `e757b4ad…86c6` / `ead68397…8e56`; cleanup returned lock/GPU/port idle | Keep `ENG-ASYNC-SCHED` as later parity work; move the speed-critical path to low-batch kernel mapping |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -84,7 +85,7 @@ scan ranks the live evidence as follows:
 
 | Finding | Binding interpretation |
 |---|---|
-| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Current VOID timings provisionally bound total-throughput credit to **+0.05%** and show a TTFT regression; repeat with both shape-neutral traces before classifying it neutral and returning the speed track to kernels |
+| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Complete ON/OFF timing gives only **+0.215%** total throughput, ~1.0% better TPOT and ~16.0% worse TTFT; ON has **0.200% more** aggregate traced GPU time. It cannot close the 6.1% gap and leaves the speed-critical path |
 | RMSNorm/generated partitions | Largest unmapped GPU candidate; ours spends **2.094864 ms/window** across 129 RMSNorm nodes, but oracle partitions need exact node/adjacency mapping before a speed claim |
 | Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
 | Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
@@ -97,7 +98,15 @@ remain in the [parity ledger](../.agents/parity-ledger.md),
 [state log](../.agents/state.md), and linked feature specs rather than this
 scoreboard.
 
-## Run the pending async-credit traces
+The trace output itself also records the mode's batch-shape sensitivity: all
+four async-ON digests match, async-OFF's four digests differ, and corresponding
+online ON/OFF generated-text arrays differ in all three pairs. Every request
+still completed exact 1,024→128 lengths with no errors. This is diagnostic
+evidence for the already inventoried default batch non-invariance, not a new
+correctness or support claim; the separate token-exact correctness gate remains
+the precondition for performance work.
+
+## Reproduce the accepted async-credit diagnostic
 
 Run both oracle modes under one uncontended lock; the online AB/BA/AB timing
 series uses the same c2 corpus and server flags before either trace is
@@ -105,10 +114,13 @@ interpreted. These commands create diagnostic traces, not binding speed credit:
 
 ```sh
 MODEL="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
-CORPUS="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27/vllm/c2-r1.jsonl"
+CORPUS_DIR="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27/vllm"
 SOURCE="$(git rev-parse --show-toplevel)"
 SOURCE_SHA="$(git -C "$SOURCE" rev-parse HEAD)"
 OUT="$HOME/work/vllm-async-credit/$SOURCE_SHA"
+EVIDENCE="$OUT/evidence"
+mkdir -p "$EVIDENCE"/{corpus,raw,logs,traces}
+cp "$CORPUS_DIR"/c2-r{1,2,3}.jsonl "$EVIDENCE/corpus/"
 
 # The timing lifecycle starts a fresh server for each leg in this exact order:
 # on-r1, off-r1, off-r2, on-r2, on-r3, off-r3. Each server uses:
@@ -119,13 +131,13 @@ OUT="$HOME/work/vllm-async-credit/$SOURCE_SHA"
 # After /health and the matching enabled/disabled log assertion, each client is:
 #   vllm bench serve --backend openai --base-url http://127.0.0.1:8001 \
 #     --endpoint /v1/completions --model gate --tokenizer "$MODEL" \
-#     --dataset-name custom --dataset-path c2-rN.jsonl \
+#     --dataset-name custom --dataset-path "$EVIDENCE/corpus/c2-rN.jsonl" \
 #     --custom-output-len 128 --skip-chat-template --disable-shuffle \
 #     --num-prompts 6 --max-concurrency 2 --request-rate inf \
 #     --num-warmups 2 --seed 0 --ignore-eos --temperature 0 \
 #     --percentile-metrics ttft,tpot,itl,e2el \
 #     --metric-percentiles 50,90,99 --save-result --save-detailed \
-#     --result-dir "$OUT/raw" --result-filename MODE-rN.json --disable-tqdm
+#     --result-dir "$EVIDENCE/raw" --result-filename MODE-rN.json --disable-tqdm
 # Validation requires completed=6, failed=0, and six falsey error strings;
 # a one-arm or otherwise incomplete series is VOID even when that arm succeeds.
 
@@ -135,9 +147,9 @@ flock /tmp/gpu bash -c '
   for mode in on off; do
     "$HOME/venvs/vllm-oracle/bin/python" \
       "'$SOURCE'/tools/bench/profile_vllm_online_gate.py" \
-      --model "'$MODEL'" --corpus "'$CORPUS'" \
-      --profile-dir "'$OUT'/trace-$mode" \
-      --metadata "'$OUT'/trace-$mode.json" \
+      --model "'$MODEL'" --corpus "'$EVIDENCE'/corpus/c2-r1.jsonl" \
+      --profile-dir "'$EVIDENCE'/traces/$mode" \
+      --metadata "'$EVIDENCE'/traces/$mode-metadata.json" \
       --num-prompts 6 --max-concurrency 2 \
       --max-num-seqs 32 --max-num-batched-tokens 2048 \
       --repetitions 3 --async-scheduling "$mode"
@@ -146,10 +158,17 @@ flock /tmp/gpu bash -c '
     # that option enforces the accepted 48-prompt H1d annotation counts.
     PYTHONPATH="'$SOURCE'" "$HOME/venvs/vllm-oracle/bin/python" \
       "'$SOURCE'/tools/bench/summarize_torch_kernels.py" \
-      --profile-dir "'$OUT'/trace-$mode" \
-      --output "'$OUT'/trace-$mode-kernels.json"
+      --profile-dir "'$EVIDENCE'/traces/$mode" \
+      --output "'$EVIDENCE'/traces/$mode-kernel-summary.json"
   done
 '
+
+# After all six timing JSONs and both trace summaries exist, finalize them
+# offline. The marker is written last; any missing/malformed artifact fails.
+PYTHONPATH="$SOURCE" python3 \
+  "$SOURCE/tools/bench/finalize_async_credit.py" \
+  --evidence "$EVIDENCE" \
+  --source-commit "$SOURCE_SHA"
 ```
 
 ## Reproduce the binding result

@@ -9363,3 +9363,43 @@ full-step c2 gap attribution before `ENG-ASYNC-SCHED` W3. The
 checkpoint's 49/49 + 132/132. No lifecycle state, benchmark ratio, or speed
 credit changed; `benchmark_binding=false` and the c16 diagnostic reproduction
 remains the active first track (driver running on dgx at this checkpoint).
+
+## 2026-07-14 — c16 root cause CAPTURED: duplicate live GDN state slot (3/3 deterministic)
+
+The bounded `--diagnostic-c16` reproduction ran once from clean pushed
+`4a450f9` in the fresh preserved root
+`~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9fcd886f4fb814dc7021eb46c83b39f000`
+(production RelWithDebInfo, profile control off, build **154/154**, byte-copied
+binding corpus, exact snapshot). All three fresh-server packed c16 reps under
+one `/tmp/gpu` lock failed identically and the order log sealed marker-last
+`diagnostic_complete`; GPU/lock/port returned idle/free and the `d82d282` root
+was not touched.
+
+Every diagnostic channel produced its designed evidence. Primary:
+`engine-fatal: EngineCore busy loop threw: vt: qwen3_5: duplicate live GDN
+state index at .../src/vllm/model_executor/models/qwen3_5.cpp:73` — the host
+state-index validator `detail::ValidateGdnStateIndices` (uniqueness loop).
+`async-llm:` pinned the poisoning instant; ~80-94 `api-server: 500` lines per
+rep carry only the generic `[request submitted to a stopped AsyncLLM]` wrapper
+(engine-dead fast-fail, as designed); five `sse:` mid-flight witnesses carry
+the propagated root cause; the persisted error bodies confirm the wrapper.
+Geometry: the lead-up steps are mixed batches (`packed_decode=0 nd=2 np=2
+np_tok=2046 T=2048`) and the death step logs `num_reqs=6 gdn_free_slots=27
+gdn_live_slots=5` — 5 live + 27 free accounts for the full 32-slot pool while
+6 requests are scheduled, so the runner's block→slot remap resolved two live
+requests to one GDN state slot. Determinism 3/3 indicates an ordering defect in
+the slot lifecycle (free/reuse under request churn), not a race; the packed
+kernel itself never executed in the failing steps.
+
+Core SHA-256: `component-diagnostic.json` `42de1323…13ea`; r1/r2/r3 server
+logs `f26f0030…8bc0` / `8ecba873…02a3` / `e68411cf…6f3f`; r1 error body
+`c5aa0933…7fc3`. This is diagnostic evidence only: no marker, summary or
+manifest exists, `benchmark_binding=false`, and no partial number binds.
+
+Next (owner `CLAIM-GDN-BA-ROUNDING-1`): trace the exact duplicate-assignment
+mechanism in `runner.cpp` `remap_gdn_state_slots`/slot bookkeeping against the
+scheduler's free/admission ordering, reproduce it in a test-first CPU-tier
+case, make the minimal repair, pass CPU/CUDA correctness gates (both model
+gates included), then create another fresh SHA/root and rerun the entire
+twelve-leg one-lock component accepting only a verified marker-last terminal
+status.

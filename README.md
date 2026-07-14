@@ -29,17 +29,21 @@ OpenAI-compatible server.
 > packed-only `--diagnostic-c16` driver mode kept fully separate from the gating
 > component (`component-diagnostic.json`; the finalizer refuses diagnostic
 > evidence). Six RED→GREEN tests land it; all tool tests pass **132/132**. The
-> packed component still `GATING`, no speed credit, and the DGX `--diagnostic-c16`
-> reproduction is the next step. Host memory still retains a **22.92 GiB CPU
-> weight mirror**, and no 35B performance result is claimed. See
-> [Benchmarks](docs/BENCHMARKS.md).
+> DGX reproduction then **captured the root cause deterministically 3/3**:
+> `vt: qwen3_5: duplicate live GDN state index` thrown by the host state-index
+> validator (`qwen3_5.cpp:73`) — two concurrent requests resolved to the same
+> GDN state slot under c16 request churn, poisoning the engine so all timed
+> requests fast-failed with the generic wrapper. A test-first slot-lifecycle
+> fix is next; the packed component stays `GATING`, no speed credit. Host
+> memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
+> performance result is claimed. See [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
 
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the `d82d282` component stopped at c16 packed r1 with 0/96 HTTP 500 and no terminal marker. A bounded test-first diagnostic checkpoint landed (four error-path log channels + `VT_GDN_DIAG_STEP_LOG` + `--diagnostic-c16` mode) to expose the dropped root cause | Run the DGX `--diagnostic-c16` reproduction from the pushed SHA in a fresh `diagnostic-c16` root, read the captured engine-fatal cause, repair test-first, then rerun the component before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `--diagnostic-c16` reproduction at `4a450f9` captured the c16 root cause deterministically **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`) — a runner GDN state-slot lifecycle defect under request churn (last step: 6 requests, 5 live + 27 free of 32 slots) | Trace the slot-lifecycle defect, fix test-first with CPU/CUDA gates, then rerun the full 12-leg component from a fresh SHA/root before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |

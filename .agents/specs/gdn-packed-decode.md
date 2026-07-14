@@ -16,6 +16,15 @@ our port dropped two upstream fatal log lines; a bounded test-first diagnostic
 checkpoint now restores them (four `std::cerr` error-path channels +
 `VT_GDN_DIAG_STEP_LOG` geometry + a packed-only `--diagnostic-c16` driver mode;
 see the W1D3 component-harness row and G3 below). Partial legs are nonbinding.
+The DGX reproduction at `4a450f9` (root
+`~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…`) then **captured the root
+cause deterministically 3/3**: `vt: qwen3_5: duplicate live GDN state index`
+from `detail::ValidateGdnStateIndices` (`qwen3_5.cpp:73`) during a mixed-batch
+step of the c16 burst — the runner's GDN state-slot lifecycle assigned one slot
+to two live requests (death-step geometry `num_reqs=6, gdn_free_slots=27,
+gdn_live_slots=5` of the 32-slot pool), poisoning the engine so timed requests
+fast-failed with the generic wrapper. The active W1D3 work is the test-first
+slot-lifecycle repair, then a fresh SHA/root full 12-leg component rerun.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -276,7 +285,7 @@ scripts/dgx-gdn-packed-component.sh --diagnostic-c16 \
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **CLOSED / immutable G2 PASS at clean `f344dec`:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Evidence root `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`. |
-| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE; diagnostic instrumentation landed.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 0/96 HTTP 500 with no marker. A test-first diagnostic checkpoint now exposes the dropped root cause (four `std::cerr` error-path channels + `VT_GDN_DIAG_STEP_LOG` + a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`; six RED→GREEN tests, tools 132/132). Next: run the DGX `--diagnostic-c16` reproduction from the pushed SHA in a fresh `diagnostic-c16` root, then repair/rerun; qkvz stays blocked. |
+| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE; diagnostic instrumentation landed.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 0/96 HTTP 500 with no marker. A test-first diagnostic checkpoint exposed the dropped root cause (four `std::cerr` error-path channels + `VT_GDN_DIAG_STEP_LOG` + a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`; six RED→GREEN tests, tools 132/132), and the `4a450f9` DGX reproduction captured it **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`), a runner slot-lifecycle defect (6 requests on 5 live slots). Next: test-first slot-lifecycle repair with CPU/CUDA gates, then a fresh SHA/root full 12-leg rerun; qkvz stays blocked. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is
 recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.

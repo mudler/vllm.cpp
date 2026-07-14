@@ -29,9 +29,16 @@ adds an opt-in `VT_GDN_DIAG_STEP_LOG` geometry trace, and adds a packed-only
 (`component-diagnostic.json`; the finalizer refuses diagnostic evidence). Six
 RED→GREEN tests land it; all tools pass **132/132**, focused
 `test_gdn_packed_component` **49/49**, and CPU `test_async_llm`/`test_openai_api_server`
-are green. The c16 component stays **FAILED / INCOMPLETE** with the
-`--diagnostic-c16` reproduction (below) as the next entry point; partial c2/c16
-files are nonbinding and `benchmark_binding=false`.
+are green. The `--diagnostic-c16` reproduction at `4a450f9` then **captured the
+root cause deterministically 3/3**: `vt: qwen3_5: duplicate live GDN state
+index` thrown by the host state-index validator (`qwen3_5.cpp:73`) during a
+mixed-batch step of the c16 burst — the runner's GDN state-slot lifecycle
+assigned one slot to two live requests (last healthy step: `num_reqs=6,
+gdn_free_slots=27, gdn_live_slots=5` of the 32-slot pool), poisoning the
+engine so every timed request fast-failed with the generic stopped-AsyncLLM
+wrapper. The c16 component stays **FAILED / INCOMPLETE** with the test-first
+slot-lifecycle repair as the next entry point; partial c2/c16 files are
+nonbinding and `benchmark_binding=false`.
 
 ## Binding 27B online gate
 
@@ -76,9 +83,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `d82d282` component stopped at c16 packed r1 with 0/96 HTTP 500 responses and no terminal marker or timing credit. A test-first diagnostic checkpoint (four error-path log channels + `VT_GDN_DIAG_STEP_LOG` + `--diagnostic-c16` mode) landed to expose the dropped server exception | Run the DGX `--diagnostic-c16` reproduction from the pushed SHA, read the captured engine-fatal cause, repair test-first, and rerun the full component from a new SHA/root; the exact grid remains unauthorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `4a450f9` `--diagnostic-c16` reproduction captured the c16 root cause **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`), a runner GDN state-slot lifecycle defect under request churn that poisons the engine | Repair the slot lifecycle test-first with CPU/CUDA gates, then rerun the full component from a new SHA/root; the exact grid remains unauthorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FAILED INCOMPLETE; diagnostic instrumentation landed** | Structural evidence is accepted. Clean `d82d282` passed both model gates and all c2 legs, then the first c16 packed timed batch returned 0/96 HTTP 500 with no terminal marker. Bounded diagnostics for the discarded server exception now landed (four `std::cerr` error-path channels restoring vLLM's dropped fatal logs, `VT_GDN_DIAG_STEP_LOG` geometry, and a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`) | Run the DGX `--diagnostic-c16` reproduction under a fresh `diagnostic-c16` root, read the captured engine-fatal cause, repair test-first, then rerun all twelve legs |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 root cause CAPTURED** | Structural evidence is accepted. Diagnostic root `~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…` reproduced the c16 failure on all three fresh-server reps: the engine-fatal channel names `ValidateGdnStateIndices` (`qwen3_5.cpp:73`, duplicate live slot), the api-server/body channels prove poisoned-engine fast-fail, and the geometry trace shows 6 requests holding only 5 live slots (+27 free = full 32 pool) at the death step; mixed prefill+decode lead-up steps ran with `packed_decode=0` | Trace the runner slot-remap defect, fix test-first, then rerun all twelve legs from a fresh SHA/root |
 | RMSNorm/generated partitions | **CLOSED / DISPROVEN as a parity gap** | The 2026-07-14 [parity rescan](../.agents/specs/parity-rescan-2026-07-14.md) verified vLLM's `RmsNormQuantFusionPass` is FP8-only (no nvfp4 keys); the nvfp4 path runs standalone `scaled_fp4_quant` exactly like ours, and the +1.81 ms residual was a cross-profiler artifact | None — removed from the lever queue |
 | Serving transport (TCP_NODELAY) | **PENDING / SPIKE** | Rescan-confirmed source diff: `CPPHTTPLIB_TCP_NODELAY` defaults false and we never call `set_tcp_nodelay(true)`, while vLLM's uvicorn enables it; per-token SSE frames fit the Nagle pattern and the c2–c8-fail/c16–c32-pass shape. Magnitude unmeasured | Spike + test-first mirror fix + one non-binding localhost sizing; credit only via the authorized exact-grid rerun |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
@@ -212,6 +219,17 @@ ROOT="$HOME/work/vllm.cpp-gdn-packed-diagnostic-c16/$SHA"
 The mode asserts the evidence basename contains `diagnostic-c16` and holds no
 `component-*.json`; it runs no model gates, no 2/16 sweep, and never calls
 `finalize`. `benchmark_binding` stays `false` throughout.
+
+This reproduction has been executed once at `4a450f9` (root
+`~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…`, build **154/154**,
+marker-last `diagnostic_complete`, GPU/lock returned idle/free). All three
+fresh-server reps failed identically with
+`engine-fatal: … duplicate live GDN state index at qwen3_5.cpp:73`.
+Core SHA-256: `component-diagnostic.json` `42de1323…13ea`; r1/r2/r3 server
+logs `f26f0030…8bc0` / `8ecba873…02a3` / `e68411cf…6f3f`; r1 error body
+`c5aa0933…7fc3`. The root is diagnostic evidence only and is preserved
+unchanged; the repair checkpoint and a fresh SHA/root full component rerun
+are next.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its

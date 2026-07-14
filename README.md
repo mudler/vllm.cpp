@@ -13,11 +13,12 @@ OpenAI-compatible server.
 > but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
 > binding diagnostic therefore measures vLLM v0.25.0 with its default async
 > scheduler explicitly on and off on the identical c2 corpus. The current
-> `b8681ac` series is **VOID**: all six timing legs passed and provisionally put
-> async ON at only **1.001345×** total throughput versus OFF, but the first
-> trace failed to import the repository-local harness before either trace was
-> captured. The direct-script bootstrap is repaired and a fresh complete run
-> is pending, with no async speed credit or implementation claim. Separately, the host-memory gap
+> `9b1774c` series is **VOID**: all six timing legs passed and provisionally put
+> async ON at only **1.000464×** total throughput versus OFF. The ON trace also
+> completed, but its summarizer was given the 48-prompt H1d exact-count
+> contract rather than shape-neutral c2 aggregation, so execution stopped
+> before the OFF trace. The corrected fresh run is pending, with no async speed
+> credit or implementation claim. Separately, the host-memory gap
 > is traced to a persistent **22.92 GiB CPU weight mirror** plus load-time
 > safetensors residency. The binding result remains **55/124**, W3-I stays
 > default-off, and no 35B performance result is claimed. See
@@ -28,7 +29,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Complete the repaired c2 async ON/OFF timing + trace control; if its provisional neutral result repeats, trace low-batch kernels |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Complete the c2 async ON/OFF timing + shape-neutral trace control; if its neutral result repeats, trace low-batch kernels |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -56,7 +57,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus. `b8681ac` completed 6/6 timing legs with provisional medians **160.799 / 160.583 tok/s = 1.001345×** ON/OFF, but is **VOID** because direct trace startup lacked the source root on `sys.path`. Bootstrap repaired; a fresh complete series is **PENDING** and earns no credit |
+| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus. `9b1774c` completed six timing legs with provisional medians **160.288 / 160.213 tok/s = 1.000464×** ON/OFF and captured ON, but is **VOID** because H1d exact-count validation stopped before OFF. Shape-neutral aggregation is verified; a fresh complete series is **PENDING** and earns no credit |
 | GPU fallback if async is neutral | Map the 129 RMSNorm and 144 normal-FP4 nodes, then gate vectorized residual-add RMSNorm; W3-H2's measured ceiling is only about 0.25% end to end |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |

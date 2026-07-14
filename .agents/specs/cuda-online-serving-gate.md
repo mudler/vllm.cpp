@@ -22,10 +22,11 @@ has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1% slower**).
 vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path is the only
 unmeasured structural difference with a 4–6% budget. The next gate is therefore
 an exact vLLM async ON/OFF c2 timing + Torch-trace control. Profiler mode and
-direct-script bootstrap are CPU-tested. Current `b8681ac` is `VOID`: all six
-timing legs completed with provisional ON/OFF total ratio **1.001345×**, but
-direct trace startup lacked the source root on `sys.path`, so neither trace or
-completion marker exists. The fresh bootstrap-repaired series is `PENDING`.
+direct-script bootstrap are CPU-tested. Current `9b1774c` is `VOID`: all six
+timing legs completed with provisional ON/OFF total ratio **1.000464×** and ON
+capture completed, but the driver applied the 48-prompt H1d exact-count model
+key to this six-prompt c2 trace and stopped before shape-neutral summary/OFF.
+The fresh no-model-key series is `PENDING`.
 If the provisional neutral result repeats, the speed
 track moves to low-batch kernel traces and exact RMSNorm/generated-partition
 mapping. Host PSS/RSS is independently grounded in a persistent **22.920 GiB**
@@ -228,8 +229,9 @@ reported as a clean dependency check.
    and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
    Run the selected c2 vLLM async ON/OFF timing + Torch-trace control before
-   claiming W3; current `b8681ac` timings are provisional/VOID because both
-   traces are absent. If neutral in a complete run, capture equivalent
+   claiming W3; current `9b1774c` timings/ON trace are provisional/VOID because
+   H1d exact-count validation stopped before shape-neutral summary/OFF. If
+   neutral in a complete run, capture equivalent
    low-batch ours/vLLM traces.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions

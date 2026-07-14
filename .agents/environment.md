@@ -82,11 +82,12 @@ inner 4096, state 128; context 262144.
 
 - Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
   27B cache-off grid at **55/124 axes pass, 69 fail**. The post-W3-I scan is
-  complete: current root `b8681ac` completes all six timing legs with
-  provisional ON/OFF total ratio **1.001345×**, but the series is VOID because
-  direct trace startup lacked the source root on `sys.path` and neither trace
-  exists. Run a fresh root with the direct-script bootstrap repair under one
-  lock; W3 stays uncredited. If the provisional neutral result repeats,
+  complete: current root `9b1774c` completes all six timing legs with
+  provisional ON/OFF total ratio **1.000464×** and captures ON, but the series
+  is VOID because the driver applied the 48-prompt H1d exact-count validator
+  and stopped before shape-neutral summary/OFF. Run a fresh root without a
+  model-key constraint under one lock; W3 stays uncredited. If the provisional
+  neutral result repeats,
   capture low-batch kernels and map the RMSNorm/generated partitions before
   coding. The independent host-memory repair must remove the measured
   **22.920 GiB** persistent CPU weight mirror and overlapping load-time source

@@ -7889,3 +7889,60 @@ that complete series, the speed track moves to exact low-batch kernel and
 RMSNorm/generated-partition mapping. Live documents contain only this current
 checkpoint; the two earlier async failures remain only in this append-only
 record, the parity ledger, Git, and their immutable roots.
+
+## 2026-07-14 — fourth async-credit execution voids after ON trace capture
+
+Clean pushed `9b1774c014880a0039545ea1be0fa01426cbd900` ran from
+`~/work/vllm-async-credit/9b1774c014880a0039545ea1be0fa01426cbd900`
+under one uncontended `/tmp/gpu` lock. Exact source/corpus/toolchain, vLLM
+0.25.0, absolute-path profiler with `PYTHONPATH` removed, idle GPU, free lock,
+and port 8001 preflights passed. The prescribed ON-r1/OFF-r1/OFF-r2/ON-r2/
+ON-r3/OFF-r3 sequence completed **36/36 requests**, 36,864 input and 4,608
+output tokens with zero failed requests and clean GPU/port returns after every
+fresh server.
+
+The complete timing-only medians are diagnostic because the later trace series
+did not complete:
+
+| Mode | Total tok/s | Mean TPOT | Mean TTFT | Total CV |
+|---|---:|---:|---:|---:|
+| async ON | 160.287860 | 106.648618 ms | 809.941298 ms | 0.249954% |
+| async OFF | 160.213485 | 107.594484 ms | 697.928448 ms | 0.104693% |
+
+Direction-normalized ON/OFF medians are **1.000464×** total/output/request
+throughput, **1.008869×** TPOT/ITL, **0.861703×** TTFT and **1.000414×** E2EL.
+Paired total ratios are **1.003953 / 1.000398 / 1.001732×**. This independently
+repeats the prior void signal: async adds only about **0.05%** median total
+throughput, improves TPOT about 0.89%, and regresses TTFT about 13.8%—far below
+the binding 4–6% deficit.
+
+The repaired absolute-path ON profiler then completed one warmup plus three
+closed-loop repetitions. It resolved async ON, loaded the v0.25.0 MRV2 /
+FlashInfer / FA2 path, hit the 64-config FlashInfer cache, captured full decode
+graphs and wrote an 85,296,623-byte gzip trace plus metadata. One of four
+output digests differs, retained diagnostically under the accepted
+batch-invariance rule.
+
+The subsequent summarizer incorrectly received `--model-key 27`. That option
+enforces the accepted 48-prompt H1d trace contract, including exactly 1,588
+generation annotations; this six-prompt c2 trace contains 1,539. It therefore
+failed closed before writing the ON kernel summary or starting OFF. A read-only
+shape-neutral re-read of the immutable trace (no model key) succeeds with
+**1,803,708 kernel events / 171,130,065.744 µs** and selected-trace SHA
+`ad071f36…bf1`, proving the trace is valid and the failure is driver scoping.
+
+The whole root is **FAILED / VOID**: no OFF trace, aggregate summary, manifest,
+or completion marker exists, so no timing or one-arm trace earns credit.
+Series / raw-set / log-set / trace-set SHA-256 values are
+`0d204e91…0310` / `9ce64024…4bc` / `6956cb19…7cf0` /
+`acb402a9…d419`. Cleanup reports no compute process, port 8001 free and
+`/tmp/gpu` free.
+
+The corrected c2 driver calls `summarize_torch_kernels.py` without
+`--model-key`; model-key validation remains unchanged for the 48-prompt H1d
+gate. The next run must use a new pushed commit/root and repeat all six timing
+legs plus both shape-neutral trace arms under one lock. If the neutral signal
+repeats in that complete series, W3 remains a parity obligation but leaves the
+speed-critical path, which moves to low-batch RMSNorm/generated-partition
+mapping. Live surfaces contain only this checkpoint; all earlier async attempts
+remain in this append-only record, the parity ledger, Git, and immutable roots.

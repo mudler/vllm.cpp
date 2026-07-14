@@ -10,12 +10,12 @@ Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 The post-W3-I scan is complete: the largest binding low-concurrency symptom is
 c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
-better TTFT. The current exact async-control root (`b8681ac`) is **VOID**: all
+better TTFT. The current exact async-control root (`9b1774c`) is **VOID**: all
 six timing legs completed, with provisional ON/OFF median total throughput
-**160.799 / 160.583 tok/s = 1.001345×**, but the first direct trace invocation
-could not import the repository-local harness and no trace exists. The script
-bootstrap is repaired and a fresh complete root is **PENDING**, so W3 has no
-speed credit yet. Host PSS/RSS is independently traced to a persistent
+**160.288 / 160.213 tok/s = 1.000464×**, and the ON trace completed. Its
+summarizer then applied the 48-prompt H1d exact-count contract to this six-prompt
+c2 trace and stopped before OFF. Shape-neutral aggregation is verified and a
+fresh complete root is **PENDING**, so W3 has no speed credit yet. Host PSS/RSS is independently traced to a persistent
 **22.920 GiB** CPU weight mirror plus source-page residency during load. W3-I
 remains default-off after its **30/48** component failure.
 
@@ -64,7 +64,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Complete the repaired c2 async ON/OFF timing + trace control, then gate the selected lever before rerunning the grid |
-| vLLM async-scheduler credit | **FAILED / VOID; REPAIRED RUN PENDING** | Clean `b8681ac` completed all six timing legs. Provisional medians: ON/OFF total **160.798982 / 160.582996 tok/s = 1.001345×**, TPOT **106.280 / 107.333 ms** (ON 0.99% better), TTFT **812.002 / 696.264 ms** (ON 16.6% worse). The first trace failed at direct-script import, so there are zero traces and no completion marker. Series/raw-set SHA `e8c7a4b7…86b0` / `65bff32f…6e51`; cleanup returned lock/GPU/port idle | Use the direct-script bootstrap repair in a new commit-owned root and repeat all six timing legs plus both traces under one lock; no provisional timing earns credit |
+| vLLM async-scheduler credit | **FAILED / VOID; CORRECTED RUN PENDING** | Clean `9b1774c` completed all six timing legs. Provisional medians: ON/OFF total **160.287860 / 160.213485 tok/s = 1.000464×**, TPOT **106.649 / 107.594 ms** (ON 0.89% better), TTFT **809.941 / 697.928 ms** (ON 13.8% worse). ON trace capture completed; shape-neutral re-read passes at **1,803,708 kernels / 171.130066 s**, but the driver passed `--model-key 27`, invoking the incompatible H1d 1,588-annotation contract against c2's 1,539. No OFF trace or completion marker exists. Series/raw-set/trace-set SHA `0d204e91…0310` / `9ce64024…4bc` / `acb402a9…d419`; cleanup returned lock/GPU/port idle | Repeat all six timing legs plus both traces under one lock and summarize c2 without `--model-key`; no provisional timing or one-arm trace earns credit |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -84,7 +84,7 @@ scan ranks the live evidence as follows:
 
 | Finding | Binding interpretation |
 |---|---|
-| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Current VOID timings provisionally bound total-throughput credit to **+0.13%** and show a TTFT regression; repeat with both required traces before classifying it neutral and returning the speed track to kernels |
+| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Current VOID timings provisionally bound total-throughput credit to **+0.05%** and show a TTFT regression; repeat with both shape-neutral traces before classifying it neutral and returning the speed track to kernels |
 | RMSNorm/generated partitions | Largest unmapped GPU candidate; ours spends **2.094864 ms/window** across 129 RMSNorm nodes, but oracle partitions need exact node/adjacency mapping before a speed claim |
 | Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
 | Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
@@ -141,6 +141,13 @@ flock /tmp/gpu bash -c '
       --num-prompts 6 --max-concurrency 2 \
       --max-num-seqs 32 --max-num-batched-tokens 2048 \
       --repetitions 3 --async-scheduling "$mode"
+
+    # This six-prompt c2 diagnostic is shape-neutral. Do not pass --model-key:
+    # that option enforces the accepted 48-prompt H1d annotation counts.
+    PYTHONPATH="'$SOURCE'" "$HOME/venvs/vllm-oracle/bin/python" \
+      "'$SOURCE'/tools/bench/summarize_torch_kernels.py" \
+      --profile-dir "'$OUT'/trace-$mode" \
+      --output "'$OUT'/trace-$mode-kernels.json"
   done
 '
 ```

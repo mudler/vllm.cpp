@@ -124,7 +124,10 @@ rumor; a reproducible run is evidence.
   Someone must be able to paste it and get the same number.
 - **Re-run to confirm.** A claimed win or a gate number must be reproduced —
   re-run it (≥2–3×) and confirm it lands within run-noise (this campaign saw
-  ±2–4%; report the spread). A number that doesn't reproduce is void, not a win.
+  ±2–4%; report the spread). For an interleaved same-binary A/B series, every
+  direction-normalized paired repetition must be at least 1.0 on every binding
+  axis; a passing median may not hide a reversed pair. A number that doesn't
+  reproduce is void, not a win.
 - **Same-binary A/B** (toggle ON vs OFF) so the delta is attributable to the
   change, not to build/config drift.
 - **Guard against contamination with the shared mutex** — wrap the complete
@@ -138,10 +141,14 @@ rumor; a reproducible run is evidence.
   re-base it without re-running vLLM on the new config).
 - **Thermal/power + memory-return disclosure for multi-arm series** (adopted
   from spark-bench `matrix_driver.sh`; GB10 is a compact unified-memory box):
-  snapshot `nvidia-smi -q -d TEMPERATURE,POWER` before/after each measured leg
-  and record it with the results; between engine legs, verify available memory
+  fail closed if the pinned absolute `nvidia-smi` probe exits nonzero; snapshot
+  `nvidia-smi -q -d PERFORMANCE,TEMPERATURE,POWER` before/after each
+  measured leg, require thermal/power-brake event reasons inactive and require
+  the SW/HW thermal plus HW power-braking counters not to increase; record the
+  parsed values and raw snapshots with the results. Between engine legs, verify available memory
   returns to the recorded baseline (leak check) and drop page caches before the
-  next leg. A leg run on a throttling or memory-leaking box voids the
+  next leg. The allowed memory-return tolerance is fixed by the committed
+  harness, never read from mutable evidence. A leg run on a throttling or memory-leaking box voids the
   cross-leg comparison, same as contention. On a non-root benchmark host, the
   complete enumerated set of benchmark-owned checkpoint, corpus, client and
   server files may instead be evicted with `POSIX_FADV_DONTNEED` only when a

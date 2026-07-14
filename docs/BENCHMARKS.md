@@ -10,23 +10,16 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 
 Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
 **FAILED / open at 55/124 axes**. The active
-[packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md) retains its
-immutable W1D2/G2 correctness and safety closure at `f344dec`. Fresh clean
-`7ff713e` completed the entire one-lock W1D3 raw capture: the real-model gate
-passed; all 12 packed ranges contain exactly **915** nodes and all 12 rollback
-ranges **963**; the only structural delta is the intended 48 packed calls
-replacing 48 decomposed-recurrence plus 48 post-conv calls. Both oracle traces
-retain **1,160** ordered kernels per steady B=2 window over **1,523 / 1,522**
-windows, including identical **128 Stream-K + 80 static-persistent** FP4
-tactics. Initial finalization failed closed on two unseen launch fingerprints.
-Exact comparison with both prior accepted controls proves that only cached
-Torch/Inductor RMSNorm partitions redistributed between 48 and 50 registers;
-kernel names/order, grids, blocks, shared memory, family counts and tactics are
-unchanged. The two exact fingerprints now have a test-first validator entry.
-Pushed finalizer `24cea4f` revalidated the complete root and wrote the
-marker-last `complete-structural` summary/manifest/status artifacts; every
-artifact, finalizer and validator hash verifies. c2/c16 **40 timing + 8
-memory** remain **PENDING**, and no accepted performance number changes.
+[packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md) retains
+immutable correctness at `f344dec` and accepted structure from `7ff713e`,
+finalized by `24cea4f`: packed has **915** nodes versus rollback's **963**, with
+the exact 48-for-96 GDN substitution and invariant remaining topology. The
+production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
+finalizer are now hardened and focused CPU tests pass **44/44**. Exact corpus
+manifests/partitions and detailed timing samples are revalidated rather than
+trusted, and symlinked evidence is rejected before sealing. Its **40
+timing + 8 memory** DGX execution remains **PENDING**, so no accepted
+performance number changes.
 
 ## Binding 27B online gate
 
@@ -71,9 +64,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; clean `7ff713e`, finalized by pushed `24cea4f`, is accepted `complete-structural` packed/rollback evidence with no timing credit | Execute c2/c16; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted and the c2/c16 runner is CPU-green **44/44**, with no timing credit | Execute the one-lock c2/c16 runner; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 COMPONENT GATING** | Clean `7ff713e` completed 12/12 packed + 12/12 rollback ranges and both full oracle traces. Pushed `24cea4f` bounds the only drift to generated-RMSNorm 48/50-register redistribution and writes accepted marker-last `complete-structural` evidence | Run c2/c16 AB/BA/AB |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 COMPONENT GATING** | Structural evidence is accepted. [`dgx-gdn-packed-component.sh`](../scripts/dgx-gdn-packed-component.sh) and its fail-closed finalizer implement the production-only c2/c16 AB/BA/AB contract; focused CPU tests pass **44/44** | Run the pushed SHA once under its single GPU lock |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -96,7 +89,8 @@ state log. The current checkpoint is W1D3 component gating:
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
-| Performance | Packed/rollback oracle windows are **1,523 / 1,522**, each with 1,160 kernels and invariant signatures. Only generated RMSNorm register allocation differs from prior controls; pushed `24cea4f` finalizes the exact root | **STRUCTURAL PASS; no speed credit; c2/c16 PENDING** |
+| Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | Hardened implementation and focused CPU validation **44/44 PASS**; DGX execution **PENDING** |
+| Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and all **144** paired run axes, ≤4% per-run deviation, fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **NO SPEED CREDIT; c2/c16 PENDING** |
 
 The current raw root is
 `~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
@@ -125,8 +119,47 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 and W1D3 structural evidence are closed. The c2/c16 40+8 same-binary series
-is next. Until that component gate passes, `benchmark_binding=false`.
+G2 and W1D3 structural evidence are closed. The next reproduction entry point,
+after pushing the exact source SHA and creating its production build, is:
+
+```sh
+set -euo pipefail
+SOURCE_REPO="$HOME/work/vllm.cpp"
+git -C "$SOURCE_REPO" fetch origin main
+SHA=$(git -C "$SOURCE_REPO" rev-parse origin/main)
+ROOT="$HOME/work/vllm.cpp-gdn-packed-component/$SHA"
+BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
+SNAPSHOT="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/$(cat "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/refs/main")"
+test ! -e "$ROOT"
+mkdir -p "$(dirname "$ROOT")"
+git -C "$SOURCE_REPO" worktree add --detach "$ROOT/source" "$SHA"
+mkdir -p "$ROOT/evidence/corpus"
+cp -a "$BINDING/corpus/27" "$ROOT/evidence/corpus/27"
+cmake -S "$ROOT/source" -B "$ROOT/build-production" -G Ninja \
+  -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_SERVER=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+  -DVLLM_CPP_FLASH_ATTN=ON \
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=OFF \
+  -DVLLM_CPP_BENCH_PROFILE_CONTROL=OFF \
+  -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
+"$ROOT/source/scripts/dgx-gdn-packed-component.sh" --execute \
+  --snapshot "$SNAPSHOT" \
+  --source-corpus "$ROOT/evidence/corpus/27" \
+  --evidence "$ROOT/evidence" \
+  --build-dir "$ROOT/build-production" \
+  --configure-log "$ROOT/configure.log" \
+  --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA"
+```
+
+`$ROOT/source` is the clean detached worktree at `$SHA`. The request corpus is
+copied byte-for-byte from the binding `3f256ab` evidence; the separate 64-plan
+fixture is committed under `tests/fixtures/` and the runner requires it in
+read-only mode. Until the component gate passes, `benchmark_binding=false`.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its

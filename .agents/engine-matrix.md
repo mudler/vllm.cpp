@@ -14,22 +14,12 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `READY`.
 
 Current `SERVE-GATE-ONLINE` substage: binding `3f256ab` remains **55/124**.
-FP4 tactics and merged BA topology are matched. W1D2 now implements vLLM's
-exact packed pure-non-spec 27B decode branch, ordered BF16-conv/FP32-SSM cache
-allocation, complete metadata preflight, graph-padding safety and process-cached
-rollback. Clean pushed `f344dec` closes immutable W1D2/G2: both real 27B arms pass **235/235 +
-16/16**, full CUDA GDN **43/43**, native/batched 35B zero-selection **315/315**
-and isolated GGUF **14/14 + 14/14**. The W1D3 packed/rollback trace harness has
-exact 915/963-node contracts, cross-arm mode-invariant signature equality after
-isolating exactly 48 coupled BA projection nodes, deterministic H1d plan setup,
-and marker-last finalization. Fresh clean `7ff713e` completed all **12/12 +
-12/12** exact packed/rollback ranges and both full vLLM traces. The first
-finalizer attempt failed closed on unseen launch signatures; exhaustive diff
-proves only cached generated-RMSNorm 48/50-register redistribution, with names,
-order, geometry, shared memory, family counts and FP4 tactics unchanged. The
-two exact fingerprints and validator-file provenance are test-covered. Pushed
-`24cea4f` revalidates the immutable root and writes accepted marker-last
-`complete-structural` evidence. c2/c16 component evidence remains pending;
+FP4 tactics and merged BA topology are matched. Packed correctness is accepted
+at `f344dec`, and clean `7ff713e`, finalized by `24cea4f`, accepts the exact
+915/963-node structural substitution. The production-build-only c2/c16
+AB/BA/AB runner and marker-last every-axis finalizer are implemented and
+focused CPU tests pass **44/44**. Its one-lock **40 timing + 8 memory** DGX
+execution remains pending;
 qkvz stays excluded and
 `benchmark_binding=false`. Host PSS/RSS separately retains a **22.920 GiB**
 CPU weight mirror plus source mmap residency.
@@ -167,7 +157,7 @@ claims it.
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI (17 exported symbols; blocking and nonblocking request handles) | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143,181,207`; `src/capi/vllm_c.cpp:229,264,327,391` | `tests/capi/test_capi.cpp:320,428,505,574,606,640`; `tests/capi/test_dlopen.cpp:77,86`; `tests/capi/c_header_compile.c:1` | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries + explicit scheduler-capacity flags `examples/server/main.cpp:63,96,116,170`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | server help contract `examples/CMakeLists.txt:34`; benchmark `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
-| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), one-lock packed/rollback [driver](../scripts/dgx-online-serving.sh), explicit [validator contracts](../tools/bench/online_gate.py#L155), and fail-closed [packed finalizer](../tools/bench/finalize_gdn_packed_trace.py#L218) | Immutable `3f256ab` remains **55/124**. Clean `7ff713e`, finalized by pushed `24cea4f`, closes W1D3 structural evidence as marker-last `complete-structural`: 12/12 packed + 12/12 rollback ranges and both exact steady-window oracles. c2/c16, host-memory repair and the exact grid remain open. `benchmark_binding=false`; no speed credit exists | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
+| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), [production component driver](../scripts/dgx-gdn-packed-component.sh), and fail-closed [component finalizer](../tools/bench/gdn_packed_component.py) | Immutable `3f256ab` remains **55/124**. Packed correctness/structure is accepted; [component tests](../tests/tools/test_gdn_packed_component.py) pass **44/44** for the exact c2/c16 **40+8** contract, including exact corpus/build/oracle provenance, exact raw throughput/TTFT/ITL recomputation, bounded E2E/TPOT clock-skew and duration validation, exact commands, all paired axes, stability, health and symlink-safe sealing. DGX execution, host-memory repair and the exact grid remain open. `benchmark_binding=false`; no speed credit exists | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |

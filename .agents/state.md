@@ -8979,3 +8979,118 @@ and `/tmp/gpu` is free. This closes W1D3 structural evidence only:
 and c2 TPOT remains **6.1% slower**. Next: c2/c16 **40 timing + 8 memory**
 same-binary packed-default versus rollback in AB/BA/AB order; qkvz stays
 blocked until that component disposition.
+
+## 2026-07-14 — W1D3 production c2/c16 component harness implemented and CPU-gated
+
+The packed-default versus rollback checkpoint now has a repository-owned
+production runner rather than an ad-hoc remote script. The test-first
+`scripts/dgx-gdn-packed-component.sh` and
+`tools/bench/gdn_packed_component.py` freeze the exact G3 contract: profile
+control OFF; clean pushed source and matching production build; vLLM v0.25.0;
+the accepted 64-plan FlashInfer fixture with no native-plan fallback; packed
+and rollback correctness gates; c2=6 and c16=96 requests; AB/BA/AB across three
+repetitions; one `/tmp/gpu` lock across both gates and all 12 fresh-server
+legs; cache eviction/return, thermal and process-memory records; and isolated
+model commands from `/usr/bin/env -i`.
+
+The finalizer validates all **40 timing + 8 memory** axes plus exact order,
+commands, hashes, outputs, lifecycle and correctness prerequisites. Review
+hardening closes six fail-open classes before hardware: the run log is closed
+before sealing and reverified afterward; both direct model binaries must show
+the exact recorded checkpoint, **235/235 + 16/16** and no skip before the first
+timing leg; the clean environment key/value set is exact; every per-arm axis
+records mean/median/range/CV and stays within 4% of its median; live GB10
+performance/temperature/power snapshots are parsed for inactive throttling and
+non-increasing counters; and memory-return booleans are recomputed from the
+recorded baseline/final/tolerance and hashed cache reports. A stable regression
+is a valid `complete-failed`; incomplete, unstable, malformed or post-seal
+mutated evidence has no marker. Summary, manifest and status are written in
+that order with status last.
+
+Focused red/green cycles now pass **27/27**; the complete tools suite passes
+**109/109**. Bash syntax, ShellCheck and Python compilation pass. A read-only
+live `nvidia-smi` query confirmed the parser against the GB10's exact schema;
+the GPU was idle and no CUDA model, timing or memory workload ran. Next:
+independent re-review, commit/push, create the exact SHA-owned DGX root and
+production build, then execute the complete one-lock series. Binding remains
+**55/124**, c2 TPOT remains **6.1% slower**, `benchmark_binding=false`, no
+speed credit exists, and qkvz stays blocked.
+
+## 2026-07-14 — W1D3 component adversarial review fixes close seven fail-closed gaps
+
+The first independent re-review withheld DGX authorization on seven Important
+findings. Test-first fixes now bind the complete execution manifest rather than
+two artifacts: exact model revision and weight/snapshot inventory, vLLM source
+and dependency versions, oracle manifest and every oracle file, CUDA/CUTLASS
+toolchain fingerprints, CMake/compile/build contracts, production server and
+all hashes are revalidated. The benchmark `HOME` is derived from the common
+evidence/client/model/build root; every server command is an exact token list;
+every pinned-client log is parsed and compared with `build_client_command`; and
+each streaming preflight has an exact isolated command plus semantic result.
+
+The fixed **1,048,576-KiB** memory-return tolerance is no longer evidence
+controlled. GPU-idle checks execute the pinned `/usr/bin/nvidia-smi` through a
+fail-closed validator, thermal snapshots use the same absolute binary, and
+INT/TERM traps now exit 130/143 before the EXIT cleanup. Acceptance now requires
+all **40 timing + 8 memory** median axes and every one of the **144 paired**
+run axes; a reversal hidden by passing medians fails. A complete unstable or
+otherwise sealable invalid root now writes a marker-last `complete-void` with
+the validation reason, manifest and immutable artifact set; a stable measured
+regression remains `complete-failed`.
+
+The focused suite passes **37/37** and the complete tools suite **119/119**.
+Bash syntax, ShellCheck, Python compilation, whitespace and agent-record checks
+pass. No GPU/model/timing/memory workload ran. A third independent adversarial
+re-review is in progress; until it is clean, commit/push and the one-lock DGX
+series remain pending. Binding remains **55/124**, c2 TPOT remains
+**6.1% slower**, `benchmark_binding=false`, and qkvz/exact-grid/35B performance stay
+blocked.
+
+## 2026-07-14 — session handoff: W1D3 component harness sealed locally; DGX execution pending
+
+This session stops at a CPU-only, independently reviewed handoff. The
+production c2/c16 packed-default-versus-rollback driver and marker-last
+finalizer now bind the exact accepted source and vLLM corpus manifests plus
+every partition hash before acquiring `/tmp/gpu`; bind the full
+source/oracle/dependency/toolchain/build/artifact chain and both direct
+**235/235 + 16/16** model gates; execute the exact AB/BA/AB twelve-leg order;
+and disposition all **40 timing + 8 memory** median axes plus all **144 paired**
+axes. Evidence sealing rejects symlinks before file filtering.
+
+The final adversarial review exposed and closed three last evidence-integrity
+gaps. Throughput, TTFT and ITL summaries are recomputed exactly from detailed
+raw samples. Pinned vLLM does not export per-request latency and samples TTFT
+with a second adjacent `perf_counter()` call, so E2E and TPOT are validated
+directionally within a fixed 2-ms request-latency skew bound rather than
+falsely claimed bit-exact; impossible total duration versus the reconstructed
+request span is rejected. Upstream-legal merged-delta rows with no retained
+ITL remain accepted. Corpus drift, coherent raw-summary forgery, impossible
+duration, clock-skew boundaries and symlinked evidence all have test-first
+regressions. Independent final review reports no remaining Critical or
+Important issue in these repairs.
+
+Local verification is green: focused component tests **44/44**, complete tools
+suite **126/126**, Bash syntax, ShellCheck and Python compilation. The final
+agent-record, mutation, documentation-checkpoint and whitespace gates are the
+commit preconditions. No CUDA model, timing or memory workload ran in this
+checkpoint; no new performance number exists.
+
+Binding truth is unchanged: immutable 27B `3f256ab` remains **55/124**, c2
+TPOT remains **114.841 vs 108.274 ms (6.1% slower)**, host PSS/RSS retains the
+**22.920 GiB** CPU weight mirror, and 35B performance remains blocked. GGUF is
+additive rather than a replacement for safetensors: 35B Compact and Balanced
+correctness remain **14/14** each and loader coverage **98/98**, while
+compute-in-quant and performance parity remain open. `benchmark_binding=false`
+and no speed credit is granted.
+
+Resume exactly at W1D3/G3: use the pushed checkpoint SHA to create
+`~/work/vllm.cpp-gdn-packed-component/<sha>`, copy the byte-identical binding
+corpus from
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27`,
+configure the production profile-control-off build, and execute the complete
+command block in `docs/BENCHMARKS.md` under its single driver-owned GPU lock.
+Accept only marker-last `complete-pass`, `complete-failed`, or
+`complete-void` evidence. Disposition all 40+8 and 144 paired axes before any
+qkvz work; do not rerun the binding grid, start 35B performance, or claim speed
+credit first. The active claim remains `CLAIM-GDN-BA-ROUNDING-1` in worktree
+`/home/mudler/_git/vllm.cpp-gdn-ba-rounding`.

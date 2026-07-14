@@ -9165,3 +9165,37 @@ Binding truth is unchanged: `3f256ab` remains **55/124**, c2 TPOT remains
 GiB**, and 35B performance stays blocked. `benchmark_binding=false`; qkvz,
 the exact grid, and any speed credit remain prohibited until the component
 gate has a verified terminal disposition.
+
+## 2026-07-14 — W1D3 pre-GPU invocation defect repaired test-first
+
+The resumed worktree was already isolated and clean on
+`7c3faac6e983e20b6a0bd0d3aea41ee3cca3d6b2`, exactly matching
+`origin/main`; focused component baseline was **44/44**. DGX preflight remained
+idle at 0%/P8, with no compute process, free `/tmp/gpu`, free port 8001 and
+226 GB available. The immutable failed `593996d` root was not modified.
+
+The new regression
+`test_driver_records_profile_control_off_in_execution_manifest` parses the
+actual production `record-execution` command from
+`scripts/dgx-gdn-packed-component.sh` with `shlex`. It requires exactly one
+`--profile-control` token and the adjacent value `off`. RED failed as intended:
+the parsed command contained neither token. The minimal production change adds
+only `--profile-control off` after `--max-num-batched-tokens`, matching the
+profile-control-disabled production build and the mandatory parser contract in
+`tools/bench/online_gate.py`.
+
+GREEN evidence: the new focused case passes **1/1**; the complete component
+suite passes **45/45**; the complete tools suite passes **127/127**. Bash
+syntax, ShellCheck and Python compilation pass. The exact dry-run plan remains
+valid with SHA-256
+`6727ab784b7efff0891320912734e9f224e9a105ffbe12844aacb38585ac77ff`.
+No CUDA model, timing, memory, vLLM, or component leg ran in this checkpoint.
+
+Current disposition is repaired/`ACTIVE`, hardware pending. After the required
+record/mutation/document checks, commit and push this checkpoint directly to
+`main`, then create
+`~/work/vllm.cpp-gdn-packed-component/<repair-sha>` as a new detached root and
+execute the complete driver-owned one-lock series. Do not reuse `593996d`.
+Binding remains **55/124**, `benchmark_binding=false`, and qkvz, exact-grid,
+35B performance and speed credit remain blocked until the verified component
+terminal disposition.

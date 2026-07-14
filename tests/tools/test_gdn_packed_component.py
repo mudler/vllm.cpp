@@ -1396,6 +1396,23 @@ class GdnPackedComponentTest(unittest.TestCase):
             text.index("for concurrency in 2 16"),
         )
 
+    def test_driver_records_profile_control_off_in_execution_manifest(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        command_start = text.index(
+            'python3 "${repo_root}/tools/bench/online_gate.py" record-execution'
+        )
+        command_end = text.index("\nvllm_corpus=", command_start)
+        command = text[command_start:command_end].replace("\\\n", " ")
+        tokens = shlex.split(command)
+
+        self.assertIn("--profile-control", tokens)
+        profile_control = tokens.index("--profile-control")
+        self.assertEqual(
+            tokens[profile_control : profile_control + 2],
+            ["--profile-control", "off"],
+        )
+        self.assertEqual(tokens.count("--profile-control"), 1)
+
     def test_gpu_idle_probe_failure_is_not_idle(self) -> None:
         failed = subprocess.CompletedProcess(
             args=["/usr/bin/nvidia-smi"], returncode=1, stdout="", stderr="failed"

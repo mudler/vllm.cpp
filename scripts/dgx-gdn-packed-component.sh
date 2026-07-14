@@ -186,7 +186,8 @@ execution_manifest="${execution_dir}/27-component.json"
   --port "${port}" \
   --num-blocks "${num_blocks}" \
   --max-num-seqs "${max_num_seqs}" \
-  --max-num-batched-tokens "${max_num_batched_tokens}"
+  --max-num-batched-tokens "${max_num_batched_tokens}" \
+  --profile-control off
 
 vllm_corpus="${source_corpus}/vllm"
 if [[ ! -f ${vllm_corpus}/manifest.json ]]; then

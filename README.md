@@ -9,22 +9,18 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production parity is still open: the binding 27B
 > comparison against vLLM v0.25.0 passes **55/124** required axes, and c2 TPOT
-> is **114.841 vs 108.274 ms** (**6.1% slower**). The BA projection is now
-> bit-exact and structurally verified, but its BF16 model arm is **233/235**.
-> The active [packed-decode port](.agents/specs/gdn-packed-decode.md) closes the
-> first divergence: vLLM normalizes q/k in F32 inside recurrence and rounds
-> sigmoid beta through BF16. Our current path differs at **306/7552**
-> output/state elements; beta-only is **308/6558**, while both upstream
-> semantics reach **0/1** in the diagnostic fixture. Clean `f18ca23` has now
-> regenerated the official fixture byte-for-byte and passed the focused CUDA
-> boundary test **10/10** under one uncontended lock. Clean pushed `9ad8fb7`
-> now closes W1D1/G1 for the public FP16/BF16/F32 CPU/CUDA operator and full
-> stride/index matrix: focused packed CUDA is **5/5**, the direct fixture is
-> **0/1**, full CUDA GDN is **41/41**, and strict memcheck is **2/2 with zero
-> errors/leaks**. Production model dispatch, 235/235 and c2/c16 remain
-> pending, so no speed credit is claimed. The token-correct F32 rollback
-> remains the shipping default. Host memory also retains a **22.92 GiB CPU
-> weight mirror**, and no 35B performance result is claimed. See
+> is **114.841 vs 108.274 ms** (**6.1% slower**). The active
+> [packed-decode port](.agents/specs/gdn-packed-decode.md) now mirrors vLLM's
+> exact pure non-spec branch and the gate cache ABI: BF16 conv state plus FP32
+> SSM state. On the final mutable source, default and
+> `VT_GDN_PACKED_DECODE=0` rollback both pass the real 27B gate **235/235 +
+> 16/16**; default selects 48 packed calls on the first decode and zero during
+> prefill, while rollback selects zero. Full CUDA GDN is **43/43**, 35B remains
+> packed-inert at **315/315**, and isolated Compact/Balanced GGUF each pass
+> **14/14**. A clean pushed-SHA replay and W1D3 node trace plus c2/c16 timing
+> remain pending, so the binding result and speed credit do not change. Host
+> memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
+> performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
@@ -32,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. BA projection/structure and packed W1D1/G1 are closed; no model or speed credit follows yet | Wire pure-decode dispatch, restore 235/235 in default and rollback arms, then run trace plus c2/c16 before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. W1D2 dispatch is implemented and mutable correctness/selection gates pass; no speed credit follows | Commit/push and repeat G2 from the immutable SHA, then run paired node traces plus c2/c16 before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -60,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `9ad8fb7` closes W1D1/G1 for the public CPU/CUDA op, full FP16/BF16/F32 × stride matrix, local slot-zero adapter, capture/canaries and strict memcheck. Direct packed semantics remain **0/1**; W1D2 model dispatch is next. End-to-end BF16 remains **233/235** |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: W1D2 default/rollback dispatch, independent BF16-conv/FP32-SSM allocation, complete metadata preflight and graph-padding safety are implemented. Mutable G2 passes 27B **235/235** in both arms, 35B **315/315**, GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, and strict focused memcheck |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -132,7 +128,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D1/G1 is immutable-green, but model dispatch and c2/c16 are pending; qkvz remains blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D2 is mutable-green; clean-SHA G2 and c2/c16 are pending, and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -151,7 +147,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT is gated; vLLM's default packed pure-decode operator is implemented and immutable operator-gated for FP16/BF16/F32 at `9ad8fb7`, with model selection still open |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT is gated; vLLM's packed pure-decode operator is immutable operator-gated at `9ad8fb7` and W1D2 model selection is mutable G2-green, with clean-SHA replay and performance attribution still open |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 
@@ -182,8 +178,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: wire packed-GDN pure-decode dispatch and
-restore 235/235 in its default and rollback arms, then close trace plus c2/c16 → implement/gate merged qkvz →
+The next execution order is fixed: commit/push packed-GDN W1D2 and repeat its
+immutable G2, then close paired node traces plus c2/c16 → implement/gate merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
 LMCache support.

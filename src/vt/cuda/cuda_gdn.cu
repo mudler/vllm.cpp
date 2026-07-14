@@ -84,6 +84,14 @@ constexpr int kChunk = 64;
 // sequential scan (which strides arbitrary dims).
 constexpr int64_t kChunkMaxDim = 128;
 
+std::atomic<bool> g_gdn_packed_debug_enabled{false};
+std::atomic<uint64_t> g_gdn_packed_launches{0};
+
+void RecordGdnPackedDecodeLaunch() {
+  if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))
+    g_gdn_packed_launches.fetch_add(1, std::memory_order_relaxed);
+}
+
 void Check(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("vt cuda: ") + what + ": " + cudaGetErrorString(err));
@@ -145,6 +153,11 @@ unsigned GridFor(int64_t n) {
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
+__device__ inline float LoadFloating(const void* p, DType dtype, int64_t i) {
+  if (dtype == DType::kF32) return Load(static_cast<const float*>(p), i);
+  if (dtype == DType::kF16) return Load(static_cast<const __half*>(p), i);
+  return Load(static_cast<const __nv_bfloat16*>(p), i);
+}
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void Store(__half* p, int64_t i, float v) { p[i] = __float2half_rn(v); }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
@@ -224,6 +237,10 @@ void GdnStateGatherKernelCuda(Queue& q, Tensor& working, const Tensor& cache,
     GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
         working.Ptr<float>(), cache.Ptr<__nv_bfloat16>(), state_idx.Ptr<int32_t>(),
         has_i8, has_i32, row_elems, n);
+  } else if (cache.dtype == DType::kF16) {
+    GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
+        working.Ptr<float>(), cache.Ptr<__half>(), state_idx.Ptr<int32_t>(),
+        has_i8, has_i32, row_elems, n);
   } else {
     GdnStateGatherKernel<<<GridFor(n), kBlock, 0, s>>>(
         working.Ptr<float>(), cache.Ptr<float>(), state_idx.Ptr<int32_t>(),
@@ -244,6 +261,10 @@ void GdnStateScatterKernelCuda(Queue& q, Tensor& cache,
     GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
         cache.Ptr<__nv_bfloat16>(), working.Ptr<float>(),
         state_idx.Ptr<int32_t>(), row_elems, n);
+  } else if (cache.dtype == DType::kF16) {
+    GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
+        cache.Ptr<__half>(), working.Ptr<float>(), state_idx.Ptr<int32_t>(),
+        row_elems, n);
   } else {
     GdnStateScatterKernel<<<GridFor(n), kBlock, 0, s>>>(
         cache.Ptr<float>(), working.Ptr<float>(), state_idx.Ptr<int32_t>(),
@@ -864,18 +885,29 @@ void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor
 // Upstream counterpart: layers/fla/ops/{fused_recurrent,fused_sigmoid_gating}.py
 // Triton kernels (chunked variant: chunk.py, lands M2.3) — align post-MVP.
 
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tout, typename TState>
 __global__ void GdnScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
-                              const float* g, const float* beta, float* state,
-                              const int32_t* qsl, int64_t hk_n, int64_t dk, int64_t hv_n,
-                              int64_t dv, float scale) {
+                              const float* g, const float* beta, TState* state,
+                              const int32_t* qsl, const int32_t* state_idx,
+                              int64_t state_slots, int64_t hk_n, int64_t dk,
+                              int64_t hv_n, int64_t dv, float scale) {
   const int64_t s = blockIdx.y;   // sequence (prefill) or token (decode)
   const int64_t hv = blockIdx.x;  // v-head
   const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t state_slot = state_idx != nullptr ? state_idx[s] : s;
+  if (state_slot < 0 || state_slot >= state_slots) {
+    const int64_t begin = qsl != nullptr ? qsl[s] : s;
+    const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+    for (int64_t t = begin; t < end; ++t)
+      for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x)
+        Store(out, (t * hv_n + hv) * dv + vi, 0.0f);
+    return;
+  }
   extern __shared__ float smem[];  // [dk] q' then [dk] k
   float* q_sh = smem;
   float* k_sh = smem + dk;
-  float* s_head = state + (s * hv_n + hv) * dv * dk;  // [Dv, Dk]
+  TState* s_head =
+      state + (state_slot * hv_n + hv) * dv * dk;  // [Dv, Dk]
   const int64_t begin = qsl != nullptr ? qsl[s] : s;
   const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
   for (int64_t t = begin; t < end; ++t) {
@@ -887,17 +919,18 @@ __global__ void GdnScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* 
     const float decay = expf(g[t * hv_n + hv]);
     const float beta_t = beta[t * hv_n + hv];
     for (int64_t vi = threadIdx.x; vi < dv; vi += blockDim.x) {
-      float* s_row = s_head + vi * dk;
+      TState* s_row = s_head + vi * dk;
       float dot = 0.0f;  // (S * exp(g)) @ k, fused with the decay pass
       for (int64_t ki = 0; ki < dk; ++ki) {
-        s_row[ki] *= decay;
-        dot += s_row[ki] * k_sh[ki];
+        const float decayed = Load(s_row, ki) * decay;
+        dot += decayed * k_sh[ki];
       }
       const float vp = (Load(v, (t * hv_n + hv) * dv + vi) - dot) * beta_t;
       float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
       for (int64_t ki = 0; ki < dk; ++ki) {
-        s_row[ki] += vp * k_sh[ki];
-        o += s_row[ki] * q_sh[ki];
+        const float updated = Load(s_row, ki) * decay + vp * k_sh[ki];
+        Store(s_row, ki, updated);
+        o += updated * q_sh[ki];
       }
       Store(out, (t * hv_n + hv) * dv + vi, o);
     }
@@ -905,23 +938,45 @@ __global__ void GdnScanKernel(Tout* out, const Tin* q, const Tin* k, const Tin* 
   }
 }
 
-template <typename Tin, typename Tout>
+template <typename Tin, typename Tout, typename TState>
 void LaunchGdnScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                    const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                   const int32_t* qsl, int64_t n, const GdnArgs& args) {
+                   const int32_t* qsl, const int32_t* state_idx, int64_t n,
+                   const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
   const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
-  GdnScanKernel<Tin, Tout><<<grid, kBlock, shmem, s>>>(
+  GdnScanKernel<Tin, Tout, TState><<<grid, kBlock, shmem, s>>>(
       out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
-      beta.Ptr<float>(), state.Ptr<float>(), qsl, hk_n, dk, hv_n, dv, args.scale);
+      beta.Ptr<float>(), state.Ptr<TState>(), qsl, state_idx, state.shape[0],
+      hk_n, dk, hv_n, dv, args.scale);
   Check(cudaGetLastError(), "gdn scan launch");
 }
 
+template <typename Tin, typename Tout>
+void LaunchGdnScanState(cudaStream_t s, Tensor& out, const Tensor& q_in,
+                        const Tensor& k, const Tensor& v, const Tensor& g,
+                        const Tensor& beta, Tensor& state, const int32_t* qsl,
+                        const int32_t* state_idx, int64_t n,
+                        const GdnArgs& args) {
+  if (state.dtype == DType::kF16) {
+    LaunchGdnScan<Tin, Tout, __half>(s, out, q_in, k, v, g, beta, state,
+                                     qsl, state_idx, n, args);
+  } else if (state.dtype == DType::kBF16) {
+    LaunchGdnScan<Tin, Tout, __nv_bfloat16>(
+        s, out, q_in, k, v, g, beta, state, qsl, state_idx, n, args);
+  } else {
+    LaunchGdnScan<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state,
+                                    qsl, state_idx, n, args);
+  }
+}
+
 void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
-                 const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
-                 const GdnArgs& args, const char* name);  // fwd decl (corner-dim fallback)
+                 const Tensor& g, const Tensor& beta, Tensor& state,
+                 const int32_t* qsl_ptr, const int32_t* state_idx,
+                 const GdnArgs& args,
+                 const char* name);  // fwd decl (corner-dim fallback)
 
 // ---------------------------------------------------------------------------
 // Packed pure-decode port of vLLM v0.25.0
@@ -929,13 +984,15 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
 // Raw packed q/k/v and row-strided a/b are consumed directly. q/k reduction
 // matches the existing L2NormRowKernel tree at the real Dk=128 shape; the
 // recurrence reuses the proven NW-split fused decode ordering. All state math
-// is f32 and only final state/output stores round to T. beta deliberately
-// rounds through b.dtype before recurrence; this is distinct from mixed/spec
-// decode, which keeps beta f32.
-template <typename T, typename TAux, int NW>
+// is f32; output stores round to T and persistent-state stores independently
+// round to TState. A_log and dt_bias also carry independent storage dtypes.
+// beta deliberately rounds through b.dtype before recurrence; this is distinct
+// from mixed/spec decode, which keeps beta f32.
+template <typename T, typename TState, int NW>
 __global__ void GdnPackedDecodeKernel(
     T* out, const T* mixed_qkv, const T* a, const T* b,
-    const TAux* a_log, const TAux* dt_bias, T* state,
+    const void* a_log, DType a_log_dtype, const void* dt_bias,
+    DType dt_bias_dtype, TState* state,
     const int32_t* state_idx, int64_t state_slots, int64_t mixed_stride,
     int64_t a_stride, int64_t b_stride, int64_t hk_n, int64_t dk,
     int64_t hv_n, int64_t dv, int64_t bv, float scale) {
@@ -994,9 +1051,9 @@ __global__ void GdnPackedDecodeKernel(
     scalars[1] = 1.0f / sqrtf(k_partial[0] + 1e-6f);
     const float av = Load(a, i_n * a_stride + hv);
     const float bv_raw = Load(b, i_n * b_stride + hv);
-    const float x = av + Load(dt_bias, hv);
+    const float x = av + LoadFloating(dt_bias, dt_bias_dtype, hv);
     const float softplus = x <= 20.0f ? log1pf(expf(x)) : x;
-    const float g = -expf(Load(a_log, hv)) * softplus;
+    const float g = -expf(LoadFloating(a_log, a_log_dtype, hv)) * softplus;
     scalars[2] = expf(g);
     scalars[3] = RoundToStorage<T>(1.0f / (1.0f + expf(-bv_raw)));
   }
@@ -1009,9 +1066,9 @@ __global__ void GdnPackedDecodeKernel(
   const int64_t sdk = dk + 1;
   const int64_t vrows = (dv - vbase) < bv ? (dv - vbase) : bv;
   const int64_t tile = vrows * dk;
-  T* s_head = state +
-              (static_cast<int64_t>(slot) * hv_n + hv) * dv * dk +
-              vbase * dk;
+  TState* s_head = state +
+                   (static_cast<int64_t>(slot) * hv_n + hv) * dv * dk +
+                   vbase * dk;
   for (int64_t e = tid; e < bv * dk; e += blockDim.x)
     sbh[(e / dk) * sdk + e % dk] = e < tile ? Load(s_head, e) : 0.0f;
   __syncthreads();
@@ -1048,7 +1105,7 @@ __global__ void GdnPackedDecodeKernel(
     Store(s_head, e, sbh[(e / dk) * sdk + e % dk]);
 }
 
-template <typename T, typename TAux, int NW>
+template <typename T, typename TState, int NW>
 void LaunchGdnPackedDecode(cudaStream_t stream, Tensor& out,
                            const Tensor& mixed_qkv, const Tensor& a,
                            const Tensor& b, const Tensor& a_log,
@@ -1067,16 +1124,17 @@ void LaunchGdnPackedDecode(cudaStream_t stream, Tensor& out,
   const size_t shmem =
       (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) *
       sizeof(float);
-  GdnPackedDecodeKernel<T, TAux, NW>
+  GdnPackedDecodeKernel<T, TState, NW>
       <<<grid, static_cast<unsigned>(bv * NW), shmem, stream>>>(
           out.Ptr<T>(), mixed_qkv.Ptr<T>(), a.Ptr<T>(), b.Ptr<T>(),
-          a_log.Ptr<TAux>(), dt_bias.Ptr<TAux>(), state.Ptr<T>(),
+          a_log.data, a_log.dtype, dt_bias.data, dt_bias.dtype,
+          state.Ptr<TState>(),
           state_idx.Ptr<int32_t>(), state.shape[0], mixed_qkv.stride[0],
           a.stride[0], b.stride[0], hk_n, dk, hv_n, dv, bv, args.scale);
   Check(cudaGetLastError(), "gdn packed decode launch");
 }
 
-template <typename T, typename TAux>
+template <typename T, typename TState>
 void DispatchGdnPackedDecode(cudaStream_t stream, Tensor& out,
                              const Tensor& mixed_qkv, const Tensor& a,
                              const Tensor& b, const Tensor& a_log,
@@ -1085,11 +1143,11 @@ void DispatchGdnPackedDecode(cudaStream_t stream, Tensor& out,
                              const GdnArgs& args) {
   const int64_t dv = state.shape[2];
   if (dv >= 32) {
-    LaunchGdnPackedDecode<T, TAux, 8>(stream, out, mixed_qkv, a, b, a_log,
-                                      dt_bias, state, state_idx, bv, args);
+    LaunchGdnPackedDecode<T, TState, 8>(stream, out, mixed_qkv, a, b, a_log,
+                                        dt_bias, state, state_idx, bv, args);
   } else {
-    LaunchGdnPackedDecode<T, TAux, 1>(stream, out, mixed_qkv, a, b, a_log,
-                                      dt_bias, state, state_idx, bv, args);
+    LaunchGdnPackedDecode<T, TState, 1>(stream, out, mixed_qkv, a, b, a_log,
+                                        dt_bias, state, state_idx, bv, args);
   }
 }
 
@@ -1117,14 +1175,15 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
            "cuda gdn_packed_decode: dimensions exceed shared-memory limit");
   VT_CHECK(bv * nw <= kBlock,
            "cuda gdn_packed_decode: invalid block geometry");
+  RecordGdnPackedDecodeLaunch();
   cudaStream_t stream = AsStream(q);
 
-  auto dispatch_aux = [&](auto value_tag) {
+  auto dispatch_state = [&](auto value_tag) {
     using T = decltype(value_tag);
-    if (a_log.dtype == DType::kF32) {
+    if (state.dtype == DType::kF32) {
       DispatchGdnPackedDecode<T, float>(stream, out, mixed_qkv, a, b, a_log,
                                         dt_bias, state, state_idx, bv, args);
-    } else if (a_log.dtype == DType::kF16) {
+    } else if (state.dtype == DType::kF16) {
       DispatchGdnPackedDecode<T, __half>(stream, out, mixed_qkv, a, b, a_log,
                                          dt_bias, state, state_idx, bv, args);
     } else {
@@ -1133,14 +1192,12 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
           args);
     }
   };
-  VT_CHECK(a_log.dtype == dt_bias.dtype,
-           "cuda gdn_packed_decode: A_log/dt_bias dtypes must match");
   if (mixed_qkv.dtype == DType::kF32)
-    dispatch_aux(float{});
+    dispatch_state(float{});
   else if (mixed_qkv.dtype == DType::kF16)
-    dispatch_aux(__half{});
+    dispatch_state(__half{});
   else
-    dispatch_aux(__nv_bfloat16{});
+    dispatch_state(__nv_bfloat16{});
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,7 +1312,8 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   if (vrow < dv && wk == 0) Store(out, (i_n * hv_n + hv) * dv + vrow, o);
   __syncthreads();
 
-  // Coalesced write-back of the updated slice (f32 register state → bf16 cache).
+  // Coalesced write-back of the updated slice from f32 registers to the
+  // configured fp16/bf16/fp32 temporal cache.
   for (int64_t e = tid; e < tile; e += blockDim.x)
     Store(s_head, e, sbh[(e / dk) * sdk + e % dk]);
 }
@@ -1306,8 +1364,8 @@ void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const
   }
 }
 
-// Pick the persistent-state dtype (bf16 cache = vLLM default; f32 = unit test)
-// then forward to the (Tin,Tout)-typed launcher.
+// Pick the independent persistent temporal-state dtype, then forward to the
+// (Tin,Tout)-typed launcher. Arithmetic remains f32 inside every variant.
 template <typename Tin, typename Tout>
 void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
@@ -1315,6 +1373,9 @@ void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, cons
   if (state.dtype == DType::kBF16)
     LaunchGdnDecodeFused<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
                                                    n, args, nw);
+  else if (state.dtype == DType::kF16)
+    LaunchGdnDecodeFused<Tin, Tout, __half>(s, out, q_in, k, v, g, beta,
+                                           state, state_idx, n, args, nw);
   else
     LaunchGdnDecodeFused<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
                                            nw);
@@ -1338,9 +1399,8 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
   const size_t shmem =
       (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
   if (shmem > 48 * 1024) {  // corner-dim fallback (no decode test hits this; real dims are 128)
-    VT_CHECK(state.dtype == DType::kF32,
-             "cuda gdn_decode: bf16 state cache unsupported on the corner-dim scan fallback");
-    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
+    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, state_idx,
+                args, "gdn_decode");
     return;
   }
   // Warps-per-block for the Dk-split occupancy lever (default 8 — measured best
@@ -1375,13 +1435,15 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
 // ops.cpp validated state.shape[0] == T for decode / query_start_loc [N+1] on
 // the queue's device for prefill).
 void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
-                 const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
+                 const Tensor& g, const Tensor& beta, Tensor& state,
+                 const int32_t* qsl_ptr, const int32_t* state_idx,
                  const GdnArgs& args, const char* name) {
   VT_CHECK(q_in.dtype == DType::kF32 || q_in.dtype == DType::kBF16,
            std::string("cuda ") + name + ": unsupported q dtype (f32/bf16 only)");
   VT_CHECK(k.dtype == q_in.dtype && v.dtype == q_in.dtype,
            std::string("cuda ") + name + ": q/k/v dtypes must match");
-  const int64_t n = state.shape[0], hv_n = state.shape[1], dv = state.shape[2],
+  const int64_t n = qsl_ptr != nullptr ? state.shape[0] : q_in.shape[0];
+  const int64_t hv_n = state.shape[1], dv = state.shape[2],
                 dk = state.shape[3];
   if (n == 0 || hv_n == 0 || dv == 0) return;
   VT_CHECK(n <= kMaxGridY, std::string("cuda ") + name + ": too many sequences (grid.y limit)");
@@ -1390,18 +1452,19 @@ void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, con
   cudaStream_t s = AsStream(q);
   if (q_in.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      LaunchGdnScan<float, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n, args);
+      LaunchGdnScanState<float, float>(s, out, q_in, k, v, g, beta, state,
+                                       qsl_ptr, state_idx, n, args);
     } else {
-      LaunchGdnScan<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
-                                          args);
+      LaunchGdnScanState<float, __nv_bfloat16>(
+          s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx, n, args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      LaunchGdnScan<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, qsl_ptr, n,
-                                          args);
+      LaunchGdnScanState<__nv_bfloat16, float>(
+          s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx, n, args);
     } else {
-      LaunchGdnScan<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, qsl_ptr,
-                                                  n, args);
+      LaunchGdnScanState<__nv_bfloat16, __nv_bfloat16>(
+          s, out, q_in, k, v, g, beta, state, qsl_ptr, state_idx, n, args);
     }
   }
 }
@@ -3940,7 +4003,8 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
     GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
     return;
   }
-  GdnScanCuda(q, out, q_in, k, v, g, beta, state, qsl.Ptr<int32_t>(), args, "gdn_prefill");
+  GdnScanCuda(q, out, q_in, k, v, g, beta, state, qsl.Ptr<int32_t>(),
+              nullptr, args, "gdn_prefill");
 }
 
 void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
@@ -3956,7 +4020,8 @@ void GdnDecodeKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor
   // has no ssm_state_indices indirection), so the indexed path always uses fused.
   const char* e = std::getenv("VT_GDN_FUSED_DECODE");
   if (si == nullptr && e != nullptr && e[0] == '0') {
-    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, args, "gdn_decode");
+    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, nullptr,
+                args, "gdn_decode");
     return;
   }
   GdnDecodeFusedCuda(q, out, q_in, k, v, g, beta, state, si, args);
@@ -4108,5 +4173,22 @@ void DisableGdnTritonDebugStats() {
 }
 }  // namespace testing
 #endif
+
+namespace testing {
+void ResetGdnPackedDecodeDebugStats() {
+  g_gdn_packed_launches.store(0, std::memory_order_relaxed);
+  g_gdn_packed_debug_enabled.store(true, std::memory_order_release);
+}
+
+GdnPackedDecodeDebugStats GetGdnPackedDecodeDebugStats() {
+  GdnPackedDecodeDebugStats out;
+  out.launches = g_gdn_packed_launches.load(std::memory_order_relaxed);
+  return out;
+}
+
+void DisableGdnPackedDecodeDebugStats() {
+  g_gdn_packed_debug_enabled.store(false, std::memory_order_release);
+}
+}  // namespace testing
 
 }  // namespace vt::cuda

@@ -254,15 +254,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Full-attention KV is bf16 by default, or f32 under VT_KV_CACHE_F32.
   bool kv_cache_backend_resident_ = false;
   std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
-  // GDN recurrent + conv state caches. On CUDA they are bf16 (gdn_cache_dtype_),
-  // mirroring vLLM's default mamba_cache_dtype/mamba_ssm_cache_dtype="auto" →
-  // model dtype (bf16 for Qwen3-Next): fla fused_recurrent reads bf16 → f32
-  // registers → writes bf16, which the CUDA GDN decode/conv kernels replicate.
-  // This halves the decode recurrent-state read/write traffic and the resident
-  // state-cache footprint. On CPU (the unit tests) they stay f32 — the CPU GDN
-  // ops are f32-only and the exact-value tests assume f32. Storage is raw bytes
-  // sized by gdn_cache_dtype_ (0 bytes == +0.0f in both f32 and bf16).
-  vt::DType gdn_cache_dtype_ = vt::DType::kF32;
+  // GDN convolution and recurrent caches have independent dtypes. This mirrors
+  // MambaStateDtypeCalculator::_mamba_state_dtype: mamba_cache_dtype="auto"
+  // makes conv state use model dtype (BF16 for the gate models), while Qwen3.5's
+  // verify hook copies config.json mamba_ssm_dtype into the temporal/SSM cache
+  // dtype (FP32 for both gate checkpoints). Kernels accumulate in FP32 and store
+  // each cache through its own declared dtype. Allocation consumes the
+  // MambaSpec directly on every backend; raw storage is sized independently and
+  // all-zero bytes represent +0.0 in each supported floating type.
+  vt::DType gdn_conv_cache_dtype_ = vt::DType::kF32;
+  vt::DType gdn_ssm_cache_dtype_ = vt::DType::kF32;
   std::vector<std::unique_ptr<CacheBuffer>> ssm_buf_;
   std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;

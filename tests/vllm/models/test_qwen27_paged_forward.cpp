@@ -26,6 +26,7 @@
 
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -346,6 +347,260 @@ GDNAttentionMetadata ChunkGdnMeta(int64_t qlen, int32_t sidx, bool has_initial) 
 }
 
 }  // namespace
+
+// Mirrors vLLM v0.25.0
+// qwen_gdn_linear_attn.py::_forward_core:1286-1298. The packed branch is
+// selected only for enabled, pure non-spec decode; every prefill/mixed/spec
+// shape remains on the standard recurrence. Local W1D2 additionally scopes the
+// first model consumer to the real dense packed-BA path and requires compatible
+// BF16 storage plus persistent device indices.
+TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
+  vllm::detail::GdnPackedDecodeEligibility e;
+  e.runtime_enabled = true;
+  e.cuda = true;
+  e.dense_model = true;
+  e.has_packed_ba = true;
+  e.merged_ba_enabled = true;
+  e.dtype_compatible = true;
+  e.has_state_indices = true;
+  e.num_actual_tokens = 4;
+  e.num_decodes = 4;
+  e.num_decode_tokens = 4;
+
+  CHECK(vllm::detail::ShouldUsePackedGdnDecode(e));
+
+  auto rejects = [&](const vllm::detail::GdnPackedDecodeEligibility& candidate) {
+    CHECK_FALSE(vllm::detail::ShouldUsePackedGdnDecode(candidate));
+  };
+  {
+    auto x = e;
+    x.runtime_enabled = false;
+    rejects(x);  // VT_GDN_PACKED_DECODE=0 rollback.
+  }
+  {
+    auto x = e;
+    x.cuda = false;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.dense_model = false;
+    rejects(x);  // 35B/MoE is deliberately inert in W1D2.
+  }
+  {
+    auto x = e;
+    x.has_packed_ba = false;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.merged_ba_enabled = false;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.dtype_compatible = false;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.has_state_indices = false;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.num_prefills = 4;
+    x.num_prefill_tokens = 4;
+    x.num_decodes = 0;
+    x.num_decode_tokens = 0;
+    rejects(x);  // prefill only.
+  }
+  {
+    auto x = e;
+    x.num_prefills = 1;
+    x.num_prefill_tokens = 3;
+    x.num_decodes = 1;
+    x.num_decode_tokens = 1;
+    rejects(x);  // mixed decode + prefill.
+  }
+  {
+    auto x = e;
+    x.num_spec_decodes = 1;
+    x.num_spec_decode_tokens = 2;
+    rejects(x);
+  }
+  {
+    auto x = e;
+    x.num_decode_tokens = 3;
+    rejects(x);  // not one token per decode request.
+  }
+  {
+    auto x = e;
+    x.num_actual_tokens = 5;
+    rejects(x);  // padded/non-actual rows are never consumed as live tokens.
+  }
+}
+
+TEST_CASE("qwen27 packed GDN validates engine state slots before upload") {
+  CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
+      std::vector<int32_t>{0, 1, -1}, /*required=*/3, /*slots=*/2));
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{0, 0}, /*required=*/2, /*slots=*/2),
+      doctest::Contains("duplicate live GDN state index"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{0, 2}, /*required=*/2, /*slots=*/2),
+      doctest::Contains("GDN state index out of range"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{0}, /*required=*/2, /*slots=*/2),
+      doctest::Contains("GDN state index metadata is too short"),
+      std::runtime_error);
+}
+
+TEST_CASE("qwen27 GDN metadata validates complete prefill suffixes before I/O") {
+  GDNAttentionMetadata gm;
+  gm.num_decodes = 1;
+  gm.num_decode_tokens = 1;
+  gm.num_prefills = 2;
+  gm.num_prefill_tokens = 5;
+  gm.num_actual_tokens = 6;
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 1, 2};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1, 3, 6};
+  gm.has_initial_state = std::vector<uint8_t>{1, 0, 1};
+  gm.prefill_state_indices = std::vector<int32_t>{1, 2};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, 2, 5};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0, 1};
+
+  CHECK_NOTHROW(vllm::detail::ValidateGdnAttentionMetadata(
+      gm, /*state_slots=*/3, /*allow_inert_padding=*/false));
+
+  auto bad = gm;
+  (*bad.non_spec_state_indices_tensor)[2] = 3;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnAttentionMetadata(
+          bad, /*state_slots=*/3, /*allow_inert_padding=*/false),
+      doctest::Contains("GDN state index out of range"), std::runtime_error);
+
+  bad = gm;
+  (*bad.prefill_state_indices)[0] = 2;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnAttentionMetadata(
+          bad, /*state_slots=*/3, /*allow_inert_padding=*/false),
+      doctest::Contains("prefill state indices must match"),
+      std::runtime_error);
+
+  bad = gm;
+  (*bad.prefill_query_start_loc)[1] = 3;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnAttentionMetadata(
+          bad, /*state_slots=*/3, /*allow_inert_padding=*/false),
+      doctest::Contains("prefill query offsets must match"),
+      std::runtime_error);
+
+  bad = gm;
+  (*bad.prefill_has_initial_state)[0] = 1;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnAttentionMetadata(
+          bad, /*state_slots=*/3, /*allow_inert_padding=*/false),
+      doctest::Contains("prefill initial-state mask must match"),
+      std::runtime_error);
+}
+
+TEST_CASE("qwen27 GDN graph padding requires indexed state I/O") {
+  CHECK(vllm::detail::CanUseGdnDecodeGraphSize(
+      /*real_batch=*/3, /*capture_batch=*/3, /*indexed_state_io=*/false));
+  CHECK_FALSE(vllm::detail::CanUseGdnDecodeGraphSize(
+      /*real_batch=*/3, /*capture_batch=*/4, /*indexed_state_io=*/false));
+  CHECK(vllm::detail::CanUseGdnDecodeGraphSize(
+      /*real_batch=*/3, /*capture_batch=*/4, /*indexed_state_io=*/true));
+
+  GDNAttentionMetadata padded;
+  padded.num_decodes = 4;
+  padded.num_decode_tokens = 4;
+  padded.num_actual_tokens = 4;
+  padded.non_spec_state_indices_tensor = std::vector<int32_t>{0, 1, 2, -1};
+  CHECK_NOTHROW(vllm::detail::ValidateGdnAttentionMetadata(
+      padded, /*state_slots=*/3, /*allow_inert_padding=*/true));
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnAttentionMetadata(
+          padded, /*state_slots=*/3, /*allow_inert_padding=*/false),
+      doctest::Contains("live GDN state index must be non-negative"),
+      std::runtime_error);
+}
+
+TEST_CASE("qwen27 decode graph preflights every GDN cache before replay") {
+  const HfConfig c = MakeConfig();
+  CachePool pool(c, /*num_blocks=*/3, /*block_size=*/8);
+  GDNAttentionMetadata gm;
+  gm.num_prefills = 0;
+  gm.num_prefill_tokens = 0;
+  gm.num_decodes = 2;
+  gm.num_decode_tokens = 2;
+  gm.num_actual_tokens = 2;
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 2};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1, 2};
+
+  CHECK_NOTHROW(vllm::detail::ValidateGdnDecodeGraphState(
+      gm, pool.gdn_state, /*real_batch=*/2));
+
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{1, 1};
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnDecodeGraphState(
+          gm, pool.gdn_state, /*real_batch=*/2),
+      doctest::Contains("duplicate live GDN state index"), std::runtime_error);
+
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 3};
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnDecodeGraphState(
+          gm, pool.gdn_state, /*real_batch=*/2),
+      doctest::Contains("GDN state index out of range"), std::runtime_error);
+
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 2};
+  std::vector<GdnStateCache> inconsistent = pool.gdn_state;
+  inconsistent.back().conv_state.shape[0] = 2;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnDecodeGraphState(
+          gm, inconsistent, /*real_batch=*/2),
+      doctest::Contains("conv/SSM state slot counts must match"),
+      std::runtime_error);
+
+  inconsistent = pool.gdn_state;
+  inconsistent.back().ssm_state.shape[0] = 2;
+  inconsistent.back().conv_state.shape[0] = 2;
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnDecodeGraphState(
+          gm, inconsistent, /*real_batch=*/2),
+      doctest::Contains("all GDN layers must use the same state slot count"),
+      std::runtime_error);
+
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 1, 2};
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnDecodeGraphState(
+          gm, pool.gdn_state, /*real_batch=*/2),
+      doctest::Contains("state index count must equal the real decode batch"),
+      std::runtime_error);
+}
+
+TEST_CASE("qwen27 eager forward preflights every GDN cache layer") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5DenseWeights w = MakeWeights(c);
+  CachePool pool(c, /*num_blocks=*/3, /*block_size=*/8);
+  std::vector<GdnStateCache> inconsistent = pool.gdn_state;
+  REQUIRE(inconsistent.size() >= 2);
+  inconsistent.back().ssm_state.shape[0] = 2;
+  inconsistent.back().conv_state.shape[0] = 2;
+
+  const CommonAttentionMetadata am = PrefillAttnMeta(1, {0}, 8, 0);
+  const GDNAttentionMetadata gm = PrefillGdnMeta(1, 0);
+  vt::Queue q = Q();
+  CHECK_THROWS_WITH_AS(
+      Qwen3_5DenseModel::Forward({5}, {0}, am, gm, pool.attn_kv,
+                                 inconsistent, w, c, q),
+      doctest::Contains("all GDN layers must use the same state slot count"),
+      std::runtime_error);
+}
 
 // Port of the fused logical-scale processing contract in pinned vLLM
 // compressed_tensors_w4a4_nvfp4.py:95-138. Gate/up checkpoint scalars are

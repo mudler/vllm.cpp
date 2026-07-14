@@ -22,12 +22,15 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 
 #ifdef VLLM_CPP_CUDA
 #include <cuda_runtime_api.h>
+#include "vt/cuda/cuda_gdn_internal.h"
 #endif
 
 #include "npy.h"
@@ -56,6 +59,12 @@ void CheckDeviceCacheResidency(
     check_device_pointer(cache.data);
   }
   for (const vllm::GdnStateCache& cache : loaded.runner().gdn_state()) {
+    if (std::getenv("VT_GDN_STATE_BF16") == nullptr &&
+        (cache.ssm_state.dtype != vt::DType::kF32 ||
+         cache.conv_state.dtype != vt::DType::kBF16)) {
+      throw std::runtime_error(
+          "qwen27 default GDN cache ABI must be FP32 SSM + BF16 conv");
+    }
     check_device_pointer(cache.ssm_state.data);
     check_device_pointer(cache.conv_state.data);
   }
@@ -147,8 +156,49 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
 
   MESSAGE("qwen27_paged_engine: greedy-decoding "
           << kMaxTokens << " tokens through the PAGED dense engine...");
-  const vllm::RequestOutput out =
-      loaded->engine().generate(kPrompt, Greedy(kMaxTokens), "gate");
+  loaded->engine().add_request("gate", kPrompt, Greedy(kMaxTokens));
+  std::optional<vllm::RequestOutput> final;
+  auto consume = [&](std::vector<vllm::RequestOutput> batch) {
+    for (vllm::RequestOutput& item : batch)
+      if (item.finished) final = std::move(item);
+  };
+
+#ifdef VLLM_CPP_CUDA
+  // First model step is prefill and must never select packed recurrence.
+  vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+#endif
+  consume(loaded->engine().step());
+#ifdef VLLM_CPP_CUDA
+  const uint64_t prefill_packed_launches =
+      vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
+  if (prefill_packed_launches != 0) {
+    vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+    throw std::runtime_error(
+        "qwen27 packed GDN decode selected during prefill");
+  }
+  // The next model step is one-token pure non-spec decode. Qwen3.6-27B has 48
+  // GDN layers, so default selection is exactly 48 calls; the process-cached
+  // rollback arm must issue none.
+  vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+#endif
+  consume(loaded->engine().step());
+#ifdef VLLM_CPP_CUDA
+  const uint64_t packed_launches =
+      vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
+  const char* packed_env = std::getenv("VT_GDN_PACKED_DECODE");
+  const bool rollback = packed_env != nullptr && packed_env[0] == '0';
+  const uint64_t expected_packed_launches = rollback ? 0U : 48U;
+  vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+  if (packed_launches != expected_packed_launches) {
+    throw std::runtime_error(
+        "qwen27 packed GDN decode dispatch count mismatch");
+  }
+#endif
+  while (loaded->engine().has_unfinished_requests())
+    consume(loaded->engine().step());
+  if (!final.has_value())
+    throw std::runtime_error("qwen27 paged engine produced no final output");
+  const vllm::RequestOutput& out = *final;
 
   REQUIRE(out.finished);
   REQUIRE(out.outputs.size() == 1);

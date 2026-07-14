@@ -93,6 +93,11 @@ struct HfConfig {
   int64_t linear_key_head_dim = 0;
   int64_t linear_value_head_dim = 0;
   int64_t linear_conv_kernel_dim = 0;
+  // Qwen3.5/3.6 checkpoint contract for the recurrent (SSM) cache. Upstream's
+  // verify hook copies this into mamba_ssm_cache_dtype when the CLI setting is
+  // "auto"; an absent value leaves the recurrent cache at the convolution-cache
+  // dtype. Known checkpoint values are float16/bfloat16/float32.
+  std::string mamba_ssm_dtype;
   // RoPE:
   double rope_theta = 10000.0;
   int64_t rotary_dim = 0;  // partial_rotary_factor * head_dim, rounded

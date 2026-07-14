@@ -65,8 +65,11 @@ struct PagedKvCache {
 // (qwen_gdn_linear_attn.py:1513-1514: zero the ssm rows whose
 // prefill_has_initial_state==0 before vt::GdnPrefill).
 struct GdnStateCache {
-  vt::Tensor ssm_state;   // [num_state_blocks, Hv, Dv, Dk] f32, in/out
-  vt::Tensor conv_state;  // [num_state_blocks, conv_dim, K-1] f32, in/out
+  // Dtypes are independent, mirroring upstream MambaStateDtypeCalculator.
+  // Gate checkpoints use FP32 SSM state and BF16 convolution state on CUDA;
+  // every model boundary honors the declared F16/BF16/F32 dtype independently.
+  vt::Tensor ssm_state;   // [num_state_blocks, Hv, Dv, Dk], in/out
+  vt::Tensor conv_state;  // [num_state_blocks, conv_dim, K-1], in/out
 };
 
 // Forward result carrier (M-logits-on-device). The default hot path keeps the

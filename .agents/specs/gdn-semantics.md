@@ -52,15 +52,19 @@ spare). Derived (qwen_gdn_linear_attn.py:443-449,
 - **Conv state**: per sequence `[conv_dim, K-1]` (mamba_utils.py:223-227);
   DS layout = (dim, state_len) directly, SD layout needs transpose
   (qwen_gdn_linear_attn.py:1309-1315, mamba_utils.py:46-48).
-- **State dtypes** (mamba_utils.py:84-96): with the default
-  `mamba_cache_dtype="auto"`/`mamba_ssm_cache_dtype="auto"`, BOTH conv state
-  and ssm state are the **model dtype** (bf16 for our gates); ssm dtype is
-  independently overridable to f32. Kernels always *compute* the state in
-  f32 (`b_h` is `tl.float32`, fused_recurrent.py:102) and round to the cache
-  dtype on store (fused_recurrent.py:161; qwen_gdn_linear_attn.py:1532
-  `.to(ssm_state.dtype)`). M0.7 C++ ops keep caller-allocated **f32 states**;
-  the bf16-state rounding point is an M0.9 assembly concern — recorded here
-  so it is not lost.
+- **State dtypes and order** (`model_executor/models/config.py:736-759`,
+  `mamba_utils.py:84-96`): `MambaSpec` lists **conv first, temporal/SSM
+  second**. Conv `auto` resolves to the model dtype. The Qwen3.5 verification
+  hook copies nested HF `text_config.mamba_ssm_dtype` into
+  `mamba_ssm_cache_dtype`; both DGX gate configs declare `float32`, so their
+  binding cache ABI is **BF16 conv + FP32 SSM**, not BF16 for both. Explicit
+  `float16`, `bfloat16`, and `float32` SSM caches remain valid. Kernels compute
+  recurrence state in F32 (`b_h` is `tl.float32`,
+  fused_recurrent.py:102) and round only at the declared cache boundary
+  (fused_recurrent.py:161; qwen_gdn_linear_attn.py:1532
+  `.to(ssm_state.dtype)`). The C++ model boundary mirrors that split: runner
+  allocation consumes the ordered spec, compressed state is gathered to F32
+  and scattered back, and direct `GdnPrefill` remains F32-only.
 - **Scale**: everywhere `scale = Dk ** -0.5` (chunk.py:228-229 default;
   fused_sigmoid_gating.py:220-221 default; passed explicitly as
   `self.head_k_dim**-0.5` in the packed decode path,
@@ -335,7 +339,8 @@ Pinned executable-spec inventory for the chunked prefill path:
   plus dtype-rounded beta reproduces the oracle at `0/1` output/state BF16
   differences. Clean `f18ca23` closes semantic G0; clean `9ad8fb7` closes
   W1D1/G1 for the CPU/CUDA operator, upstream matrix, capture/canaries and
-  strict memcheck. Production model dispatch and 235/235 remain open.
+  strict memcheck. W1D2 production dispatch/rollback and mutable 235/235 gates
+  pass; immutable G2 plus trace/component evidence remain open.
 
 - `tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness`
   (lines 33-199): **ported in substance** to `tests/vt/test_ops_gdn.cpp`.

@@ -57,6 +57,7 @@ constexpr const char* kHybridJson = R"({
   "linear_key_head_dim": 128,
   "linear_value_head_dim": 128,
   "linear_conv_kernel_dim": 4,
+  "mamba_ssm_dtype": "float32",
   "rope_theta": 5000000.0,
   "partial_rotary_factor": 0.25,
   "rms_norm_eps": 1e-06,
@@ -124,6 +125,7 @@ constexpr const char* kNestedWrapperJson = R"({
     "linear_key_head_dim": 128,
     "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4,
+    "mamba_ssm_dtype": "float32",
     "rope_theta": 5000000.0,
     "rms_norm_eps": 1e-06,
     "max_position_embeddings": 32768
@@ -161,6 +163,7 @@ TEST_CASE("LoadHfConfig resolves nested text_config for a wrapper config") {
   CHECK(cfg.linear_key_head_dim == 128);
   CHECK(cfg.linear_value_head_dim == 128);
   CHECK(cfg.linear_conv_kernel_dim == 4);
+  CHECK(cfg.mamba_ssm_dtype == "float32");
   CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
   CHECK(cfg.rms_norm_eps == doctest::Approx(1e-6));
   CHECK(cfg.max_position_embeddings == 32768);
@@ -254,6 +257,7 @@ TEST_CASE("LoadHfConfig parses a Qwen3-Next-like hybrid MoE config") {
   CHECK(cfg.linear_key_head_dim == 128);
   CHECK(cfg.linear_value_head_dim == 128);
   CHECK(cfg.linear_conv_kernel_dim == 4);
+  CHECK(cfg.mamba_ssm_dtype == "float32");
 
   CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
   CHECK(cfg.rotary_dim == 64);  // 0.25 * 256

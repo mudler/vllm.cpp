@@ -6,6 +6,7 @@
 // which has no direct upstream test at this commit.
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 
 #include <doctest/doctest.h>
 
@@ -81,6 +82,64 @@ TEST_CASE("runtime quant capability distinguishes true W4A4 from dense BF16") {
   std::unique_ptr<vllm::LoadedModel> w4a4_model =
       vllm::MakeQwen3_5DenseLoadedModel(std::move(w4a4));
   CHECK(w4a4_model->uses_nvfp4_w4a4());
+}
+
+TEST_CASE("Qwen3.5 KV spec mirrors independent conv and SSM cache dtypes") {
+  HfConfig config = Config({"Qwen3_5ForConditionalGeneration"});
+  config.num_key_value_heads = 2;
+  config.head_dim = 8;
+  config.linear_num_key_heads = 2;
+  config.linear_num_value_heads = 4;
+  config.linear_key_head_dim = 8;
+  config.linear_value_head_dim = 8;
+  config.linear_conv_kernel_dim = 4;
+  config.mamba_ssm_dtype = "float32";
+
+  vllm::Qwen3_5DenseWeights weights;
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::MakeQwen3_5DenseLoadedModel(std::move(weights));
+  const vllm::v1::KVCacheConfig kv =
+      ModelRegistry::MakeKVCache(*model, config, /*block_size=*/16,
+                                 /*num_blocks=*/8);
+  REQUIRE(kv.kv_cache_groups.size() == 2);
+  const auto* mamba = dynamic_cast<const vllm::v1::MambaSpec*>(
+      kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(mamba != nullptr);
+  REQUIRE(mamba->shapes.size() == 2);
+  REQUIRE(mamba->dtypes.size() == 2);
+
+  // Upstream MambaStateShape/DtypeCalculator order is conv, then temporal.
+  CHECK(mamba->shapes[0] == std::vector<int64_t>{64, 3});
+  CHECK(mamba->shapes[1] == std::vector<int64_t>{4, 8, 8});
+  CHECK(mamba->dtypes[0] == vt::DType::kBF16);
+  CHECK(mamba->dtypes[1] == vt::DType::kF32);
+
+  // The runner allocates exactly one conv row plus one temporal row per state
+  // slot. Keep external-cache page planning byte-identical to that layout.
+  const int64_t runtime_row_bytes =
+      64 * 3 * static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16)) +
+      4 * 8 * 8 * static_cast<int64_t>(vt::SizeOf(vt::DType::kF32));
+  CHECK(mamba->page_size_bytes() == runtime_row_bytes);
+}
+
+TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
+  HfConfig config;
+  const auto resolve = [&](const char* value) {
+    config.mamba_ssm_dtype = value;
+    return vllm::detail::ResolveMambaSsmCacheDType(
+        config, vt::DType::kBF16);
+  };
+
+  CHECK(resolve("") == vt::DType::kBF16);
+  CHECK(resolve("auto") == vt::DType::kBF16);
+  CHECK(resolve("float32") == vt::DType::kF32);
+  CHECK(resolve("float") == vt::DType::kF32);
+  CHECK(resolve("float16") == vt::DType::kF16);
+  CHECK(resolve("half") == vt::DType::kF16);
+  CHECK(resolve("bfloat16") == vt::DType::kBF16);
+  CHECK_THROWS_WITH_AS(resolve("fp16"),
+                       doctest::Contains("unsupported mamba_ssm_dtype"),
+                       std::runtime_error);
 }
 
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {

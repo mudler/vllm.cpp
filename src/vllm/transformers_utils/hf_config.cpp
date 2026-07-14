@@ -353,6 +353,7 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.linear_key_head_dim = GetInt(text, "linear_key_head_dim", 0);
     cfg.linear_value_head_dim = GetInt(text, "linear_value_head_dim", 0);
     cfg.linear_conv_kernel_dim = GetInt(text, "linear_conv_kernel_dim", 0);
+    cfg.mamba_ssm_dtype = GetString(text, "mamba_ssm_dtype");
 
     // Partial rotary factor. When the key is absent, upstream Qwen-family
     // config classes default it to 0.25 (qwen3_next.py:240, qwen3_5_moe.py:92);

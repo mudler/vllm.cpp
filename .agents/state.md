@@ -5641,6 +5641,71 @@ trace-only root/build/corpus, run it under one lock, and diff node-level kernel
 names/calls/time. Only then select the first same-binary repair. 35B remains
 prohibited.
 
+## 2026-07-14 — W1D2 packed model dispatch passes final mutable G2
+
+W1D2 now ports vLLM v0.25.0's default pure non-spec decode selection into the
+27B CUDA dense path before decomposed q/k/v/g/beta buffers are allocated. The
+default couples the bit-exact BF16 BA projection to `GdnPackedDecode`; the
+process-cached `VT_GDN_PACKED_DECODE=0` rollback restores the prior F32 BA plus
+decomposed recurrence from the same binary. Prefill, mixed/speculative, CPU and
+35B execution remain on their existing branches. This checkpoint also repairs
+the cache ABI to match the actual nested HF configuration: `MambaSpec` is conv
+then temporal, the 27B conv state is BF16, and its SSM state plus `A_log` are
+FP32 while `dt_bias` remains BF16. Earlier append-only entries that described
+the temporal cache as auto-selected BF16 are historical and are superseded by
+this source/config/runtime verification.
+
+The dispatch was driven test-first. New model, runner and registry tests first
+failed at link time on the absent helpers, then covered independent cache
+dtypes, exact page bytes, default/rollback selection, full metadata preflight,
+prefill zero-selection, the first-decode count of 48, compressed indexed state
+I/O, FP16 temporal storage and 35B inertness. A CPU failure exposed that the
+fixed-capacity metadata vectors had been copied into the live row buffer rather
+than sliced to the active token count; the adapter now constructs exact live
+views. The final review found two additional safety gaps and both have focused
+regressions: row-copy state I/O cannot pad a captured graph with `-1` indices,
+so it falls back before padding unless the capture size is exact; and eager as
+well as graphed execution now validates token counts, spec count, complete
+non-spec indices, range/uniqueness, prefill suffix/rebase/mask and strict
+query-start spans before upload. Inert graph padding alone may use `-1`.
+
+Fresh local Debug CTest passes **103/103** in **38.16 s**. The final
+ASan+UBSan build passes the paged-forward suite **14/14, 65/65** and the
+explicit two-request engine case **1/1, 5/5** with leak detection disabled only
+for the process-lifetime arena cache. The mutable DGX source/build root is
+`~/work/vllm.cpp-gdn-packed-decode/w1d2-preflight`; one uninterrupted
+`/tmp/gpu` lock covered the post-review evidence root
+`evidence-w1d2-final-mutable-20260714-postreview`. Registry **14/14, 131/131**,
+runner **6/6, 132/132**, paged-forward **14/14, 65/65**, full CUDA GDN
+**43/43, 1,707/1,707**, and the direct official boundary **1/1, 12/12** at
+output/state differences **0/1** all pass. Default and rollback real 27B each
+pass **235/235 + 16/16**; default records zero packed calls in prefill and
+exactly 48 on the first decode, while rollback records zero. Native plus
+batched 35B pass **315/315** with zero selection. A combined two-GGUF process
+was discarded as **VOID** after overlapping model residency forced CPU
+fallback; isolated Compact and Balanced processes each pass **14/14**, and the
+loader passes **98/98**. OpenAI API/server and conformance suites pass
+**21/21, 250/250** and **23/23, 252/252**.
+
+Strict compute-sanitizer independently passes the packed matrix **2/2,
+137/137**, the compressed-indexed corner **1/1, 18/18**, and FP16 SSM storage
+**1/1, 13/13**, each with zero errors and zero leaks. Their log SHA-256 values
+are `fe4a3dce…9f48`, `95d72eee…89e6`, and `ff7ebf1f…9101`; default/rollback
+27B logs are both `efb143d6…86dc`, 35B is `9ec0d83d…02c9`, Compact/Balanced
+are `8ffff708…611b` / `a75a40cd…445`, CUDA GDN is `c9600303…ec82`, and the
+direct boundary is `b18847c2…ffe5`. GPU, lock and benchmark port are idle.
+
+This is deliberately a **mutable correctness/selection checkpoint**, not a
+binding result. `KERNEL-GDN-PACKED-DECODE` remains `ACTIVE`, immutable G2 is
+`PENDING`, binding `3f256ab` remains **55/124**, and
+`benchmark_binding=false`; no timing, memory or speed credit is claimed. Next:
+commit/push this implementation and live record, clone the exact pushed SHA on
+the DGX and repeat G2. Only then run W1D3 paired vLLM/local Nsight traces (local
+with `--cuda-graph-trace=node`) and the c2/c16 AB/BA/AB **40 timing + 8
+memory** component. If parity remains open after those execution-grounded
+results, launch a fresh multi-lens sub-agent scan; qkvz and the exact grid stay
+blocked until this checkpoint is recorded.
+
 ## 2026-07-12 — accepted v0.25 node trace selects packed full-attention QKV
 
 Immutable clean `def5f752896036d9b35841a278578fd812f75a0d` completed the

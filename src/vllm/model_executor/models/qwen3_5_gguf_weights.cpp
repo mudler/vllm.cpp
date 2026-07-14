@@ -250,6 +250,11 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
   c.linear_key_head_dim = ssm_state;
   c.linear_value_head_dim = ssm_state;
   c.linear_conv_kernel_dim = OptInt(gguf, p + "ssm.conv_kernel", 0);
+  // The GGUF metadata does not currently carry HF's mamba_ssm_dtype, but this
+  // loader is specific to the Qwen3.5/3.6 family whose recurrent cache contract
+  // is FP32. Preserve it when reconstructing HfConfig so safetensors and GGUF
+  // allocate the same BF16-conv/FP32-SSM state pair.
+  c.mamba_ssm_dtype = "float32";
 
   // RoPE / norm / context.
   const GgufValue* freq = gguf.FindKv(p + "rope.freq_base");

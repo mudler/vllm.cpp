@@ -34,9 +34,11 @@ vllm_cpp_add_test(test_qwen36_weights vllm/test_qwen36_weights.cpp)
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
+target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
+target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 vllm_cpp_add_test(test_bpe vllm/test_bpe.cpp)
@@ -227,7 +229,8 @@ target_include_directories(test_op_parity PRIVATE ${CMAKE_SOURCE_DIR}/tests/pari
 vllm_cpp_add_test(test_qwen36_paged_engine parity/test_qwen36_paged_engine.cpp)
 target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
-target_include_directories(test_qwen36_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
+target_include_directories(test_qwen36_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # GGUF 35B greedy acceptance gate (checkpoint-gated, dgx-only; skips when the
 # APEX k-quant GGUFs are absent). Loads the REAL .gguf single-file path
@@ -245,4 +248,5 @@ target_include_directories(test_qwen36_gguf_engine PRIVATE ${CMAKE_SOURCE_DIR}/t
 vllm_cpp_add_test(test_qwen27_paged_engine parity/test_qwen27_paged_engine.cpp)
 target_compile_definitions(test_qwen27_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
-target_include_directories(test_qwen27_paged_engine PRIVATE ${CMAKE_SOURCE_DIR}/tests/parity)
+target_include_directories(test_qwen27_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)

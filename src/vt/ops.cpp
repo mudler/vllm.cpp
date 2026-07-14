@@ -809,11 +809,14 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
   }
 }
 
-// Shared validation for the two delta-rule ops. q_in/k [T,Hk,Dk], v [T,Hv,Dv],
-// g/beta [T,Hv] f32, state [N,Hv,Dv,Dk] f32, out [T,Hv,Dv].
+// Shared validation for the two decomposed delta-rule ops. q_in/k
+// [T,Hk,Dk], v [T,Hv,Dv], g/beta [T,Hv] f32, state [N,Hv,Dv,Dk]
+// fp16/bf16/fp32 on CUDA (independent Mamba temporal-cache dtype), out
+// [T,Hv,Dv]. CPU keeps the f32 recurrence reference.
 void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const Tensor& k,
                     const Tensor& v, const Tensor& g, const Tensor& beta, const Tensor& state,
-                    const GdnArgs& args, const char* name) {
+                    const GdnArgs& args, const char* name,
+                    bool allow_compressed_state) {
   VT_CHECK(q_in.rank == 3 && k.rank == 3 && v.rank == 3 && out.rank == 3 && g.rank == 2 &&
                beta.rank == 2 && state.rank == 4,
            std::string(name) +
@@ -836,11 +839,19 @@ void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const
            std::string(name) + ": float q/k/v, f32/bf16 out");
   VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
            std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
-  VT_CHECK(state.dtype == DType::kF32 ||
-               (state.dtype == DType::kBF16 && q.device.type == DeviceType::kCUDA),
-           std::string(name) +
-               ": state must be f32, or bf16 on CUDA (in/out, in place; bf16 = vLLM "
-               "default mamba_ssm_cache_dtype, read/written in f32 registers)");
+  if (allow_compressed_state) {
+    VT_CHECK(state.dtype == DType::kF32 ||
+                 ((state.dtype == DType::kF16 ||
+                   state.dtype == DType::kBF16) &&
+                  q.device.type == DeviceType::kCUDA),
+             std::string(name) +
+                 ": state must be f32, or fp16/bf16 on CUDA (in/out, in place; "
+                 "read/written in f32 registers)");
+  } else {
+    VT_CHECK(state.dtype == DType::kF32,
+             std::string(name) +
+                 ": state must be f32; gather compressed cache rows first");
+  }
   VT_CHECK(q_in.IsContiguous() && k.IsContiguous() && v.IsContiguous() && out.IsContiguous() &&
                g.IsContiguous() && beta.IsContiguous() && state.IsContiguous(),
            std::string(name) + ": contiguous required");
@@ -934,7 +945,8 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                 const Tensor& g, const Tensor& beta, Tensor& state,
                 const Tensor& query_start_loc, const GdnArgs& args) {
-  CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_prefill");
+  CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_prefill",
+                 /*allow_compressed_state=*/false);
   CheckI32Meta(q, query_start_loc, state.shape[0] + 1, "gdn_prefill", "query_start_loc");
   reinterpret_cast<GdnPrefillFn>(GetOp(OpId::kGdnPrefill, q.device.type))(
       q, out, q_in, k, v, g, beta, state, query_start_loc, args);
@@ -943,7 +955,8 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {
-  CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_decode");
+  CheckGdnCommon(q, out, q_in, k, v, g, beta, state, args, "gdn_decode",
+                 /*allow_compressed_state=*/true);
   if (state_idx == nullptr) {
     VT_CHECK(state.shape[0] == q_in.shape[0],
              "gdn_decode: one state row per token required (single-token sequences)");
@@ -991,11 +1004,12 @@ void GdnPackedDecode(Queue& q, Tensor& out, const Tensor& mixed_qkv,
            "gdn_packed_decode: Hv must be a multiple of inferred Hk");
 
   VT_CHECK(IsFloat(mixed_qkv.dtype) && a.dtype == mixed_qkv.dtype &&
-               b.dtype == mixed_qkv.dtype && out.dtype == mixed_qkv.dtype &&
-               state.dtype == mixed_qkv.dtype,
-           "gdn_packed_decode: mixed_qkv/a/b/out/state must share FP16/BF16/F32 dtype");
-  VT_CHECK(IsFloat(a_log.dtype) && dt_bias.dtype == a_log.dtype,
-           "gdn_packed_decode: A_log/dt_bias must share a floating dtype");
+               b.dtype == mixed_qkv.dtype && out.dtype == mixed_qkv.dtype,
+           "gdn_packed_decode: mixed_qkv/a/b/out must share FP16/BF16/F32 dtype");
+  VT_CHECK(IsFloat(state.dtype),
+           "gdn_packed_decode: state must use an independent FP16/BF16/F32 dtype");
+  VT_CHECK(IsFloat(a_log.dtype) && IsFloat(dt_bias.dtype),
+           "gdn_packed_decode: A_log/dt_bias must each use a floating dtype");
   VT_CHECK(mixed_qkv.stride[1] == 1 &&
                mixed_qkv.stride[0] >= mixed_qkv.shape[1] && a.stride[1] == 1 &&
                a.stride[0] >= hv && b.stride[1] == 1 && b.stride[0] >= hv,
@@ -1051,8 +1065,9 @@ void CheckGdnStateIo(const Queue& q, const Tensor& working,
   }
   VT_CHECK(working.dtype == DType::kF32,
            std::string(name) + ": working state must be f32");
-  VT_CHECK(cache.dtype == DType::kF32 || cache.dtype == DType::kBF16,
-           std::string(name) + ": cache must be f32 or bf16");
+  VT_CHECK(cache.dtype == DType::kF32 || cache.dtype == DType::kF16 ||
+               cache.dtype == DType::kBF16,
+           std::string(name) + ": cache must be fp16, bf16, or f32");
   VT_CHECK(working.IsContiguous() && cache.IsContiguous(),
            std::string(name) + ": working/cache must be contiguous");
   VT_CHECK(working.device == q.device && cache.device == q.device &&

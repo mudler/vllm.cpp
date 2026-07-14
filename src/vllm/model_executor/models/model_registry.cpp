@@ -18,6 +18,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -305,6 +306,21 @@ v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
   const int value_dim = num_value_heads * value_head_dim;
   const int conv_dim = 2 * key_dim + value_dim;
 
+  // Diagnostic state-storage overrides belong to planning, not allocation:
+  // the MambaSpec must describe the exact bytes the runner will consume.
+  vt::DType conv_dtype = vt::DType::kBF16;
+  vt::DType ssm_dtype =
+      detail::ResolveMambaSsmCacheDType(config, conv_dtype);
+  if (const char* state_dtype = std::getenv("VT_GDN_STATE_BF16")) {
+    if (state_dtype[0] == '0') {
+      conv_dtype = vt::DType::kF32;
+      ssm_dtype = vt::DType::kF32;
+    } else if (state_dtype[0] == '1') {
+      conv_dtype = vt::DType::kBF16;
+      ssm_dtype = vt::DType::kBF16;
+    }
+  }
+
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;
   kv.kv_cache_groups.emplace_back(
@@ -316,9 +332,9 @@ v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
       std::make_shared<v1::MambaSpec>(
           block_size,
           std::vector<std::vector<int64_t>>{
-              {num_value_heads, value_head_dim, key_head_dim},
-              {conv_dim, conv_kernel - 1}},
-          std::vector<vt::DType>{vt::DType::kF32, vt::DType::kF32}));
+              {conv_dim, conv_kernel - 1},
+              {num_value_heads, value_head_dim, key_head_dim}},
+          std::vector<vt::DType>{conv_dtype, ssm_dtype}));
   return kv;
 }
 

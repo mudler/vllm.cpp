@@ -513,6 +513,19 @@ TEST_CASE("gdn decode: bf16 q/k/v in, bf16 out, f32 state enforced") {
   Tensor tbad = Tensor::Contiguous(bad_state.data(), DType::kBF16, Cpu(), {1, 1, 2, 2});
   CHECK_THROWS_AS(vt::GdnDecode(q, to, tq, tk, tv, tg, tb, tbad, GdnArgs{0.5f}),
                   std::runtime_error);
+
+  // Direct prefill has an F32-state kernel ABI on every backend. Persistent
+  // compressed cache rows are gathered to F32 by the model boundary before
+  // entering this op; accepting the cache tensor directly would make CUDA use
+  // four-byte state accesses over two-byte storage.
+  std::vector<int32_t> qsl = {0, 1};
+  Tensor tqsl = Ti(qsl);
+  CHECK_THROWS_WITH_AS(
+      vt::GdnPrefill(q, to, tq, tk, tv, tg, tb, tbad, tqsl,
+                     GdnArgs{0.5f}),
+      doctest::Contains(
+          "gdn_prefill: state must be f32; gather compressed cache rows first"),
+      std::runtime_error);
 }
 
 // ===========================================================================
@@ -841,11 +854,23 @@ PackedCase MakePackedCase(DType dtype, bool strided, int64_t batch,
                     std::move(indices)};
 }
 
-void RunPackedCpuCase(DType dtype, bool strided) {
+void RunPackedCpuCase(DType dtype, bool strided,
+                      DType state_dtype = DType::kI8,
+                      DType a_log_dtype = DType::kI8,
+                      DType dt_bias_dtype = DType::kI8) {
   PackedCase c = MakePackedCase(dtype, strided, 6, 2, 4, 8, 8, 8400);
+  if (state_dtype == DType::kI8) state_dtype = dtype;
+  if (a_log_dtype == DType::kI8) a_log_dtype = dtype;
+  if (dt_bias_dtype == DType::kI8) dt_bias_dtype = dtype;
+  std::vector<uint8_t> a_log =
+      Pack(Unpack(c.a_log, dtype), a_log_dtype);
+  std::vector<uint8_t> dt_bias =
+      Pack(Unpack(c.dt_bias, dtype), dt_bias_dtype);
+  const std::vector<uint8_t> initial_state =
+      Pack(Unpack(c.state, dtype), state_dtype);
   const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
-  std::vector<uint8_t> state_want = c.state;
-  std::vector<uint8_t> state_got = c.state;
+  std::vector<uint8_t> state_want = initial_state;
+  std::vector<uint8_t> state_got = initial_state;
   std::vector<uint8_t> out_want(
       static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
   std::vector<uint8_t> out_got(out_want.size());
@@ -853,11 +878,13 @@ void RunPackedCpuCase(DType dtype, bool strided) {
                          c.mixed_cols, c.mixed_stride);
   Tensor ta = RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
   Tensor tb = RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
-  Tensor tal = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
-  Tensor tdt = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor tal = MakeT(a_log.data(), a_log_dtype, Cpu(), {c.hv});
+  Tensor tdt = MakeT(dt_bias.data(), dt_bias_dtype, Cpu(), {c.hv});
   Tensor tidx = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
-  Tensor sw = MakeT(state_want.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
-  Tensor sg = MakeT(state_got.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor sw = MakeT(state_want.data(), state_dtype, Cpu(),
+                    {c.slots, c.hv, c.dv, c.dk});
+  Tensor sg = MakeT(state_got.data(), state_dtype, Cpu(),
+                    {c.slots, c.hv, c.dv, c.dk});
   Tensor ow = MakeT(out_want.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
   Tensor og = MakeT(out_got.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
   PackedDecodeReference(ow, mixed, ta, tb, tal, tdt, sw, tidx, args);
@@ -865,27 +892,42 @@ void RunPackedCpuCase(DType dtype, bool strided) {
   vt::GdnPackedDecode(queue, og, mixed, ta, tb, tal, tdt, sg, tidx, args);
   const float tol = dtype == DType::kF32 ? 1e-5f : 2e-2f;
   CheckClose(Unpack(out_got, dtype), Unpack(out_want, dtype), tol, tol);
-  CheckClose(Unpack(state_got, dtype), Unpack(state_want, dtype), tol, tol);
+  CheckClose(Unpack(state_got, state_dtype), Unpack(state_want, state_dtype),
+             tol, tol);
 }
 
-void RunPackedCudaCase(DType dtype, bool strided) {
+void RunPackedCudaCase(DType dtype, bool strided,
+                       DType state_dtype = DType::kI8,
+                       DType a_log_dtype = DType::kI8,
+                       DType dt_bias_dtype = DType::kI8) {
   PackedCase c = MakePackedCase(dtype, strided, 32, 4, 8, 128, 128, 8500);
+  if (state_dtype == DType::kI8) state_dtype = dtype;
+  if (a_log_dtype == DType::kI8) a_log_dtype = dtype;
+  if (dt_bias_dtype == DType::kI8) dt_bias_dtype = dtype;
+  std::vector<uint8_t> a_log =
+      Pack(Unpack(c.a_log, dtype), a_log_dtype);
+  std::vector<uint8_t> dt_bias =
+      Pack(Unpack(c.dt_bias, dtype), dt_bias_dtype);
+  const std::vector<uint8_t> initial_state =
+      Pack(Unpack(c.state, dtype), state_dtype);
   const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
 
   // The portable CPU operation is the explicit reference for the full upstream
   // B=32/H=4/HV=8/K=V=128 matrix.
-  std::vector<uint8_t> state_cpu = c.state;
+  std::vector<uint8_t> state_cpu = initial_state;
   std::vector<uint8_t> out_cpu(
       static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
   Tensor mixed_cpu = RowView(c.mixed.data(), dtype, Cpu(), c.batch,
                              c.mixed_cols, c.mixed_stride);
   Tensor a_cpu = RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
   Tensor b_cpu = RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
-  Tensor al_cpu = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
-  Tensor dt_cpu = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor al_cpu = MakeT(a_log.data(), a_log_dtype, Cpu(), {c.hv});
+  Tensor dt_cpu =
+      MakeT(dt_bias.data(), dt_bias_dtype, Cpu(), {c.hv});
   Tensor idx_cpu = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
   Tensor state_cpu_t =
-      MakeT(state_cpu.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+      MakeT(state_cpu.data(), state_dtype, Cpu(),
+            {c.slots, c.hv, c.dv, c.dk});
   Tensor out_cpu_t = MakeT(out_cpu.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
   Queue cpu_q = Q();
   vt::GdnPackedDecode(cpu_q, out_cpu_t, mixed_cpu, a_cpu, b_cpu, al_cpu,
@@ -896,10 +938,11 @@ void RunPackedCudaCase(DType dtype, bool strided) {
   DeviceTensor d_mixed(gpu, guard.q, dtype, {c.batch, c.mixed_stride}, c.mixed.data());
   DeviceTensor d_a(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.a.data());
   DeviceTensor d_b(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.b.data());
-  DeviceTensor d_al(gpu, guard.q, dtype, {c.hv}, c.a_log.data());
-  DeviceTensor d_dt(gpu, guard.q, dtype, {c.hv}, c.dt_bias.data());
+  DeviceTensor d_al(gpu, guard.q, a_log_dtype, {c.hv}, a_log.data());
+  DeviceTensor d_dt(gpu, guard.q, dt_bias_dtype, {c.hv}, dt_bias.data());
   DeviceTensor d_idx(gpu, guard.q, DType::kI32, {c.batch}, c.indices.data());
-  DeviceTensor d_state(gpu, guard.q, dtype, {c.slots, c.hv, c.dv, c.dk}, c.state.data());
+  DeviceTensor d_state(gpu, guard.q, state_dtype,
+                       {c.slots, c.hv, c.dv, c.dk}, initial_state.data());
   DeviceTensor d_out(gpu, guard.q, dtype, {c.batch, c.hv, c.dv});
   Tensor mixed_gpu = d_mixed.tensor();
   mixed_gpu.shape[1] = c.mixed_cols;
@@ -911,13 +954,14 @@ void RunPackedCudaCase(DType dtype, bool strided) {
                       d_al.tensor(), d_dt.tensor(), d_state.tensor(),
                       d_idx.tensor(), args);
   std::vector<uint8_t> out_gpu(out_cpu.size());
-  std::vector<uint8_t> state_gpu(c.state.size());
+  std::vector<uint8_t> state_gpu(initial_state.size());
   d_out.Download(guard.q, out_gpu.data());
   d_state.Download(guard.q, state_gpu.data());
   const float tol = dtype == DType::kF32 ? 1e-4f : 2e-2f;
   const float rtol = dtype == DType::kF32 ? 1e-4f : 1e-2f;
   CheckClose(Unpack(out_gpu, dtype), Unpack(out_cpu, dtype), tol, rtol);
-  CheckClose(Unpack(state_gpu, dtype), Unpack(state_cpu, dtype), tol, rtol);
+  CheckClose(Unpack(state_gpu, state_dtype), Unpack(state_cpu, state_dtype),
+             tol, rtol);
 }
 
 TEST_CASE("gdn packed decode CPU reference matches explicit recurrence") {
@@ -925,6 +969,10 @@ TEST_CASE("gdn packed decode CPU reference matches explicit recurrence") {
     RunPackedCpuCase(dtype, false);
     RunPackedCpuCase(dtype, true);
   }
+  // Real Qwen3.6 boundary: BF16 activations/output, FP32 SSM cache and A_log,
+  // BF16 dt_bias. These types are independent in upstream's Triton kernel.
+  RunPackedCpuCase(DType::kBF16, true, DType::kF32, DType::kF32,
+                   DType::kBF16);
 }
 
 TEST_CASE("gdn packed decode rejects duplicate and out-of-range live slots") {
@@ -997,6 +1045,8 @@ TEST_CASE("CUDA gdn packed decode matches CPU across upstream dtype and stride m
     RunPackedCudaCase(dtype, false);
     RunPackedCudaCase(dtype, true);
   }
+  RunPackedCudaCase(DType::kBF16, true, DType::kF32, DType::kF32,
+                    DType::kBF16);
 }
 
 TEST_CASE("CUDA gdn packed decode capture replays preserve padding state and canaries") {
@@ -1270,8 +1320,10 @@ void RunRmsNormGatedCudaCase(int64_t t, int64_t d, bool sigmoid_gate, const Comb
 
 // Gdn prefill/decode CPU-vs-CUDA. qsl empty => decode (batch single-token
 // sequences); otherwise varlen prefill with batch ignored.
-void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, int64_t hv,
-                    int64_t dk, int64_t dv, const Combo& cb, uint32_t seed) {
+void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch,
+                    int64_t hk, int64_t hv, int64_t dk, int64_t dv,
+                    const Combo& cb, uint32_t seed,
+                    DType state_dtype = DType::kF32) {
   // Pin this CPU-vs-CUDA case to the SEQUENTIAL prefill scan (tight tol): the
   // chunk-parallel path reassociates the accumulation and is validated
   // separately against the sequential kernel below. Decode is always sequential.
@@ -1288,10 +1340,16 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, 
   const auto qb = Pack(qf, cb.in);
   const auto kb = Pack(kf, cb.in);
   const auto vb = Pack(vf, cb.in);
+  REQUIRE((state_dtype == DType::kF32 ||
+           (decode && (state_dtype == DType::kF16 ||
+                       state_dtype == DType::kBF16))));
+  const std::vector<uint8_t> state_initial_bytes = Pack(stf, state_dtype);
+  const std::vector<float> state_initial =
+      Unpack(state_initial_bytes, state_dtype);
   const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
 
   std::vector<uint8_t> out_cpu(static_cast<size_t>(t * hv * dv) * vt::SizeOf(cb.out));
-  std::vector<float> st_cpu = stf, g_cpu = gf, beta_cpu = betaf;
+  std::vector<float> st_cpu = state_initial, g_cpu = gf, beta_cpu = betaf;
   std::vector<int32_t> qsl_cpu = qsl;
   Tensor tq = MakeT(const_cast<uint8_t*>(qb.data()), cb.in, Cpu(), {t, hk, dk});
   Tensor tk = MakeT(const_cast<uint8_t*>(kb.data()), cb.in, Cpu(), {t, hk, dk});
@@ -1315,7 +1373,8 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, 
   DeviceTensor dvt(gpu, gq.q, cb.in, {t, hv, dv}, vb.data());
   DeviceTensor dg(gpu, gq.q, DType::kF32, {t, hv}, gf.data());
   DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, hv}, betaf.data());
-  DeviceTensor dst(gpu, gq.q, DType::kF32, {n, hv, dv, dk}, stf.data());
+  DeviceTensor dst(gpu, gq.q, state_dtype, {n, hv, dv, dk},
+                   state_initial_bytes.data());
   DeviceTensor dout(gpu, gq.q, cb.out, {t, hv, dv});
   if (decode) {
     vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkt.tensor(), dvt.tensor(), dg.tensor(),
@@ -1326,14 +1385,16 @@ void RunGdnCudaCase(const std::vector<int32_t>& qsl, int64_t batch, int64_t hk, 
                    dbeta.tensor(), dst.tensor(), dqsl.tensor(), args);
   }
   std::vector<uint8_t> out_gpu(out_cpu.size());
-  std::vector<float> st_gpu(st_cpu.size());
+  std::vector<uint8_t> st_gpu_bytes(state_initial_bytes.size());
   dout.Download(gq.q, out_gpu.data());
-  dst.Download(gq.q, st_gpu.data());
+  dst.Download(gq.q, st_gpu_bytes.data());
+  const std::vector<float> st_gpu = Unpack(st_gpu_bytes, state_dtype);
 
-  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out), cb.atol, cb.rtol);
-  // The state is f32 on both sides in every combo (bf16 inputs are the same
-  // bytes for CPU and CUDA), so it always compares at the f32 tolerance.
-  CheckClose(st_gpu, st_cpu, 1e-5f, 1e-5f);
+  const float state_tol =
+      state_dtype == DType::kF32 ? 1e-5f : 3e-2f;
+  CheckClose(Unpack(out_gpu, cb.out), Unpack(out_cpu, cb.out),
+             std::max(cb.atol, state_tol), std::max(cb.rtol, state_tol));
+  CheckClose(st_gpu, st_cpu, state_tol, state_tol);
 }
 
 // Chunk-parallel prefill (VT_GDN_CHUNKED, default) vs the sequential scan
@@ -1466,7 +1527,7 @@ TEST_CASE("gdn indexed state I/O: dtype conversion, fresh zero, untouched slots"
   for (int64_t i = 0; i < static_cast<int64_t>(master.size()); ++i)
     master[static_cast<size_t>(i)] = static_cast<float>(i) * 0.125f - 2.0f;
 
-  for (DType cache_dtype : {DType::kF32, DType::kBF16}) {
+  for (DType cache_dtype : {DType::kF32, DType::kF16, DType::kBF16}) {
     CAPTURE(static_cast<int>(cache_dtype));
     std::vector<uint8_t> cache_bytes = Pack(master, cache_dtype);
     const std::vector<float> cache_initial = Unpack(cache_bytes, cache_dtype);
@@ -1530,45 +1591,124 @@ TEST_CASE("CUDA gdn indexed state I/O matches CPU") {
   const std::vector<int8_t> has = {1, 0, 1};
   const std::vector<float> master =
       RandomF32(static_cast<size_t>(kSlots * kRowElems), 8120);
-  const std::vector<uint8_t> packed = Pack(master, DType::kBF16);
-  const std::vector<float> initial = Unpack(packed, DType::kBF16);
-  std::vector<float> want_work(static_cast<size_t>(kRows * kRowElems), 0.0f);
-  for (int64_t r = 0; r < kRows; ++r) {
-    if (has[static_cast<size_t>(r)] == 0) continue;
-    for (int64_t e = 0; e < kRowElems; ++e)
-      want_work[static_cast<size_t>(r * kRowElems + e)] =
-          initial[static_cast<size_t>(idx[static_cast<size_t>(r)] * kRowElems + e)];
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  for (DType cache_dtype : {DType::kF16, DType::kBF16}) {
+    CAPTURE(static_cast<int>(cache_dtype));
+    const std::vector<uint8_t> packed = Pack(master, cache_dtype);
+    const std::vector<float> initial = Unpack(packed, cache_dtype);
+    std::vector<float> want_work(static_cast<size_t>(kRows * kRowElems),
+                                 0.0f);
+    for (int64_t r = 0; r < kRows; ++r) {
+      if (has[static_cast<size_t>(r)] == 0) continue;
+      for (int64_t e = 0; e < kRowElems; ++e)
+        want_work[static_cast<size_t>(r * kRowElems + e)] =
+            initial[static_cast<size_t>(
+                idx[static_cast<size_t>(r)] * kRowElems + e)];
+    }
+
+    DeviceTensor dcache(gpu, gq.q, cache_dtype, {kSlots, 2, 3, 4},
+                        packed.data());
+    DeviceTensor didx(gpu, gq.q, DType::kI32, {kRows}, idx.data());
+    DeviceTensor dhas(gpu, gq.q, DType::kI8, {kRows}, has.data());
+    DeviceTensor dwork(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4});
+    vt::GdnStateGather(gq.q, dwork.tensor(), dcache.tensor(), didx.tensor(),
+                       &dhas.tensor());
+    std::vector<float> got_work(want_work.size());
+    dwork.Download(gq.q, got_work.data());
+    CHECK(got_work == want_work);
+
+    const std::vector<float> replacement = RandomF32(want_work.size(), 8130);
+    DeviceTensor dreplacement(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4},
+                              replacement.data());
+    vt::GdnStateScatter(gq.q, dcache.tensor(), dreplacement.tensor(),
+                        didx.tensor());
+    std::vector<uint8_t> got_cache(packed.size());
+    dcache.Download(gq.q, got_cache.data());
+    std::vector<float> want_cache = initial;
+    const std::vector<float> stored =
+        Unpack(Pack(replacement, cache_dtype), cache_dtype);
+    for (int64_t r = 0; r < kRows; ++r) {
+      for (int64_t e = 0; e < kRowElems; ++e)
+        want_cache[static_cast<size_t>(
+            idx[static_cast<size_t>(r)] * kRowElems + e)] =
+            stored[static_cast<size_t>(r * kRowElems + e)];
+    }
+    CHECK(Unpack(got_cache, cache_dtype) == want_cache);
   }
+}
+
+TEST_CASE("CUDA gdn decode corner fallback supports indexed compressed state") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+
+  constexpr int64_t n = 2, slots = 3, hk = 1, hv = 1, dk = 512,
+                    dv = 32;
+  constexpr float scale = 0.0441941738f;  // 1/sqrt(512)
+  const std::vector<int32_t> idx = {2, 0};
+  const std::vector<float> qv = RandomF32(n * hk * dk, 8191, -0.2f, 0.2f);
+  const std::vector<float> kv = RandomF32(n * hk * dk, 8192, -0.2f, 0.2f);
+  const std::vector<float> vv = RandomF32(n * hv * dv, 8193, -0.5f, 0.5f);
+  const std::vector<float> gv = RandomF32(n * hv, 8194, -0.3f, -0.01f);
+  const std::vector<float> bv = RandomF32(n * hv, 8195, 0.1f, 0.9f);
+  const std::vector<float> state_master =
+      RandomF32(slots * hv * dv * dk, 8196, -0.25f, 0.25f);
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
-  DeviceTensor dcache(gpu, gq.q, DType::kBF16, {kSlots, 2, 3, 4},
-                      packed.data());
-  DeviceTensor didx(gpu, gq.q, DType::kI32, {kRows}, idx.data());
-  DeviceTensor dhas(gpu, gq.q, DType::kI8, {kRows}, has.data());
-  DeviceTensor dwork(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4});
-  vt::GdnStateGather(gq.q, dwork.tensor(), dcache.tensor(), didx.tensor(),
-                     &dhas.tensor());
-  std::vector<float> got_work(want_work.size());
-  dwork.Download(gq.q, got_work.data());
-  CHECK(got_work == want_work);
+  for (DType state_dtype : {DType::kF16, DType::kBF16}) {
+    CAPTURE(static_cast<int>(state_dtype));
+    const std::vector<uint8_t> state_bytes = Pack(state_master, state_dtype);
+    const std::vector<float> state_initial = Unpack(state_bytes, state_dtype);
+    const int64_t row_elems = hv * dv * dk;
 
-  const std::vector<float> replacement = RandomF32(want_work.size(), 8130);
-  DeviceTensor dreplacement(gpu, gq.q, DType::kF32, {kRows, 2, 3, 4},
-                            replacement.data());
-  vt::GdnStateScatter(gq.q, dcache.tensor(), dreplacement.tensor(),
-                      didx.tensor());
-  std::vector<uint8_t> got_cache(packed.size());
-  dcache.Download(gq.q, got_cache.data());
-  std::vector<float> want_cache = initial;
-  const std::vector<float> stored =
-      Unpack(Pack(replacement, DType::kBF16), DType::kBF16);
-  for (int64_t r = 0; r < kRows; ++r) {
-    for (int64_t e = 0; e < kRowElems; ++e)
-      want_cache[static_cast<size_t>(idx[static_cast<size_t>(r)] * kRowElems + e)] =
-          stored[static_cast<size_t>(r * kRowElems + e)];
+    std::vector<float> compact(static_cast<size_t>(n * row_elems));
+    for (int64_t row = 0; row < n; ++row) {
+      const int64_t slot = idx[static_cast<size_t>(row)];
+      std::copy_n(state_initial.begin() + slot * row_elems, row_elems,
+                  compact.begin() + row * row_elems);
+    }
+    std::vector<float> ref_out(static_cast<size_t>(n * hv * dv), 0.0f);
+    std::vector<float> q_copy = qv, k_copy = kv, v_copy = vv, g_copy = gv,
+                       b_copy = bv;
+    Tensor tq = T3(q_copy, n, hk, dk), tk = T3(k_copy, n, hk, dk),
+           tv = T3(v_copy, n, hv, dv), tg = T2(g_copy, n, hv),
+           tb = T2(b_copy, n, hv), ts = T4(compact, n, hv, dv, dk),
+           to = T3(ref_out, n, hv, dv);
+    Queue cpu_q = Q();
+    vt::GdnDecode(cpu_q, to, tq, tk, tv, tg, tb, ts, GdnArgs{scale});
+
+    DeviceTensor dq(gpu, gq.q, DType::kF32, {n, hk, dk}, qv.data());
+    DeviceTensor dkv(gpu, gq.q, DType::kF32, {n, hk, dk}, kv.data());
+    DeviceTensor dvv(gpu, gq.q, DType::kF32, {n, hv, dv}, vv.data());
+    DeviceTensor dg(gpu, gq.q, DType::kF32, {n, hv}, gv.data());
+    DeviceTensor db(gpu, gq.q, DType::kF32, {n, hv}, bv.data());
+    DeviceTensor ds(gpu, gq.q, state_dtype, {slots, hv, dv, dk},
+                    state_bytes.data());
+    DeviceTensor dout(gpu, gq.q, DType::kF32, {n, hv, dv});
+    DeviceTensor didx(gpu, gq.q, DType::kI32, {n}, idx.data());
+    vt::GdnDecode(gq.q, dout.tensor(), dq.tensor(), dkv.tensor(), dvv.tensor(),
+                  dg.tensor(), db.tensor(), ds.tensor(), GdnArgs{scale},
+                  &didx.tensor());
+
+    std::vector<float> got_out(ref_out.size());
+    std::vector<uint8_t> got_state(state_bytes.size());
+    dout.Download(gq.q, got_out.data());
+    ds.Download(gq.q, got_state.data());
+    CheckClose(got_out, ref_out, 3e-2f, 3e-2f);
+
+    std::vector<float> want_state = state_initial;
+    const std::vector<float> rounded_compact =
+        Unpack(Pack(compact, state_dtype), state_dtype);
+    for (int64_t row = 0; row < n; ++row) {
+      const int64_t slot = idx[static_cast<size_t>(row)];
+      std::copy_n(rounded_compact.begin() + row * row_elems, row_elems,
+                  want_state.begin() + slot * row_elems);
+    }
+    CheckClose(Unpack(got_state, state_dtype), want_state, 3e-2f, 3e-2f);
   }
-  CHECK(Unpack(got_cache, DType::kBF16) == want_cache);
 }
 
 TEST_CASE("CUDA causal_conv1d_fwd matches CPU (varlen, bias, dtypes)") {
@@ -1977,12 +2117,26 @@ TEST_CASE("CUDA gdn decode matches CPU (real dims, batched multi-seq)") {
   RunGdnCudaCase({}, 5, 2, 2, 128, 128, kCudaCombos[0], 6320);    // GQA ratio 1, odd batch
 }
 
-// bf16 persistent state cache (vLLM default mamba_cache_dtype=auto→bf16) vs the
-// f32 cache, SAME f32 q/k/v/g/beta and SAME initial state (the f32 master packed
-// to bf16). The decode kernel reads bf16 → f32 registers → writes bf16 (mirrors
-// fla fused_recurrent). This quantifies the one-step read/compute/write-back
-// drift the bf16 cache introduces relative to the f32 cache. Real gate dims
-// (Dk=Dv=128, Hv=32, GQA 2). Nsim decode steps chained to expose accumulation.
+// vLLM's public mamba_ssm_cache_dtype accepts float16 independently of the
+// model activation dtype. Preserve the decomposed rollback path for that
+// configuration as well as the packed path; otherwise disabling packed decode
+// would turn an accepted cache configuration into a runtime validation error.
+TEST_CASE("CUDA gdn decode accepts independent fp16 SSM cache") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  RunGdnCudaCase({}, 4, 2, 4, 16, 8, kCudaCombos[2], 6330,
+                 DType::kF16);
+}
+
+// bf16 persistent state cache (an accepted explicit cache dtype) vs the f32
+// gate-model cache, SAME f32 q/k/v/g/beta and SAME initial state (the f32 master
+// packed to bf16). The decode kernel reads bf16 → f32 registers → writes bf16
+// (mirrors fla fused_recurrent). This quantifies the one-step
+// read/compute/write-back drift the bf16 cache introduces relative to the f32
+// cache. Real gate dims (Dk=Dv=128, Hv=32, GQA 2). Nsim decode steps chained to
+// expose accumulation.
 TEST_CASE("CUDA gdn decode: bf16 state cache drift vs f32 (real dims, chained steps)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");

@@ -184,7 +184,9 @@ constexpr int kNumBlocks = 8;
 
 // A fake KVCacheConfig with the gate group structure: one full-attn group + one
 // mamba (GDN) group, sharing kNumBlocks blocks.
-KVCacheConfig MakeKvConfig(const HfConfig& c) {
+KVCacheConfig MakeKvConfig(const HfConfig& c,
+                           DType conv_dtype = DType::kF32,
+                           DType ssm_dtype = DType::kF32) {
   const int Hkv = static_cast<int>(c.num_key_value_heads);
   const int Dh = static_cast<int>(c.head_dim);
   const int Hv = static_cast<int>(c.linear_num_value_heads);
@@ -204,8 +206,9 @@ KVCacheConfig MakeKvConfig(const HfConfig& c) {
       std::vector<std::string>{"gdn0", "gdn1", "gdn2"},
       std::make_shared<MambaSpec>(
           kMaxModelLen,
-          std::vector<std::vector<int64_t>>{{Hv, Dv, Dk}, {conv_dim, Kw - 1}},
-          std::vector<DType>{DType::kF32, DType::kF32}));
+          std::vector<std::vector<int64_t>>{{conv_dim, Kw - 1},
+                                            {Hv, Dv, Dk}},
+          std::vector<DType>{conv_dtype, ssm_dtype}));
   return kv;
 }
 
@@ -301,6 +304,8 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   // One GdnStateCache per GDN layer (config has exactly 3).
   REQUIRE(runner.gdn_state().size() == 3);
   const GdnStateCache& gs = runner.gdn_state()[0];
+  CHECK(gs.ssm_state.dtype == DType::kF32);
+  CHECK(gs.conv_state.dtype == DType::kF32);
   // ssm_state [num_blocks, Hv, Dv, Dk].
   CHECK(gs.ssm_state.shape[0] == kNumBlocks);
   CHECK(gs.ssm_state.shape[1] == c.linear_num_value_heads);
@@ -313,6 +318,38 @@ TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {
   CHECK(gs.conv_state.shape[0] == kNumBlocks);
   CHECK(gs.conv_state.shape[1] == conv_dim);
   CHECK(gs.conv_state.shape[2] == c.linear_conv_kernel_dim - 1);
+}
+
+TEST_CASE("runner: MambaSpec is the allocation source of truth") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv =
+      MakeKvConfig(c, DType::kBF16, DType::kF16);
+  const auto* spec = dynamic_cast<const MambaSpec*>(
+      kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(spec != nullptr);
+
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+  REQUIRE(runner.gdn_state().size() == 3);
+  const GdnStateCache& state = runner.gdn_state()[0];
+
+  REQUIRE(spec->shapes.size() == 2);
+  REQUIRE(spec->dtypes.size() == 2);
+  CHECK(state.conv_state.dtype == spec->dtypes[0]);
+  CHECK(state.ssm_state.dtype == spec->dtypes[1]);
+  CHECK(std::vector<int64_t>{state.conv_state.shape[1],
+                             state.conv_state.shape[2]} == spec->shapes[0]);
+  CHECK(std::vector<int64_t>{state.ssm_state.shape[1], state.ssm_state.shape[2],
+                             state.ssm_state.shape[3]} == spec->shapes[1]);
+
+  const int64_t runtime_row_bytes =
+      state.conv_state.shape[1] * state.conv_state.shape[2] *
+          static_cast<int64_t>(vt::SizeOf(state.conv_state.dtype)) +
+      state.ssm_state.shape[1] * state.ssm_state.shape[2] *
+          state.ssm_state.shape[3] *
+          static_cast<int64_t>(vt::SizeOf(state.ssm_state.dtype));
+  CHECK(runtime_row_bytes == spec->page_size_bytes());
 }
 
 // ─── 2. THE ORDERING IDENTITY GATE (mandatory de-risk) ───────────────────────
@@ -511,7 +548,12 @@ TEST_CASE("runner: 3-request reorder keeps every per-slot field self-consistent"
 TEST_CASE("runner: single-request greedy decode over N steps (KV grows, feedback)") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
-  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+  // Production Qwen3.5 planning publishes BF16 conv + FP32 temporal state.
+  // Exercise that exact MambaSpec on the CPU reference runner as well: its
+  // model boundary must gather/downcast compressed cache rows without relying
+  // on a CUDA-only cast kernel.
+  GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32),
+                        Q(), 8, kMaxModelLen, 64);
 
   const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
   const int P = static_cast<int>(prompt.size());

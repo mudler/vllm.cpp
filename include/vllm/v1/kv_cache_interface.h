@@ -240,8 +240,9 @@ struct ChunkedLocalAttentionSpec : AttentionSpec {
 };
 
 // The mamba/GDN recurrent-state spec. `shapes`/`dtypes` describe each state
-// tensor (e.g. the SSM state and the conv state); page_size_bytes is the sum of
-// their byte sizes — NOT the K+V paged formula. (Upstream MambaSpec.)
+// tensor in upstream order (e.g. conv state, then temporal/SSM state);
+// page_size_bytes is the sum of their byte sizes — NOT the K+V paged formula.
+// (Upstream MambaSpec.)
 struct MambaSpec : KVCacheSpec {
   MambaSpec(int block_size, std::vector<std::vector<int64_t>> shapes,
             std::vector<vt::DType> dtypes,

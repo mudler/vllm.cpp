@@ -246,7 +246,8 @@ KVCacheConfig MakeKvConfig(const HfConfig& c) {
       std::vector<std::string>{"gdn0", "gdn1", "gdn2"},
       std::make_shared<MambaSpec>(
           kBlockSize,
-          std::vector<std::vector<int64_t>>{{Hv, Dv, Dk}, {conv_dim, Kw - 1}},
+          std::vector<std::vector<int64_t>>{{conv_dim, Kw - 1},
+                                            {Hv, Dv, Dk}},
           std::vector<DType>{DType::kF32, DType::kF32}));
   return kv;
 }

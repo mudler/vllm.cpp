@@ -20,12 +20,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 
 #ifdef VLLM_CPP_CUDA
 #include <cuda_runtime_api.h>
+#include "vt/cuda/cuda_gdn_internal.h"
 #endif
 
 #include "npy.h"
@@ -54,6 +56,12 @@ void CheckDeviceCacheResidency(
     check_device_pointer(cache.data);
   }
   for (const vllm::GdnStateCache& cache : loaded.runner().gdn_state()) {
+    if (std::getenv("VT_GDN_STATE_BF16") == nullptr &&
+        (cache.ssm_state.dtype != vt::DType::kF32 ||
+         cache.conv_state.dtype != vt::DType::kBF16)) {
+      throw std::runtime_error(
+          "qwen36 default GDN cache ABI must be FP32 SSM + BF16 conv");
+    }
     check_device_pointer(cache.ssm_state.data);
     check_device_pointer(cache.conv_state.data);
   }
@@ -135,8 +143,18 @@ TEST_CASE("qwen36 paged-engine greedy acceptance gate (dgx-only, 35B)") {
 
   MESSAGE("qwen36_paged_engine: greedy-decoding "
           << kMaxTokens << " tokens through the PAGED engine...");
+#ifdef VLLM_CPP_CUDA
+  vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+#endif
   const vllm::RequestOutput out =
       loaded->engine().generate(kPrompt, Greedy(kMaxTokens), "gate");
+#ifdef VLLM_CPP_CUDA
+  const uint64_t packed_launches =
+      vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
+  vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+  if (packed_launches != 0)
+    throw std::runtime_error("qwen36 selected dense-only packed GDN decode");
+#endif
 
   REQUIRE(out.finished);
   REQUIRE(out.outputs.size() == 1);

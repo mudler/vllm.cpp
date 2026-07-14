@@ -1826,8 +1826,12 @@ TEST_CASE("qwen27 GDN packed decode boundary matches vLLM 0.25 semantics (dgx-on
     return;
   }
 
+  const char* model_boundary_case =
+      std::getenv("VLLM_GDN_PACKED_MODEL_BOUNDARY_CASE");
   const fs::path dir =
-      fs::path(PARITY_GOLDENS_DIR) / "gdn-packed-decode-oracle";
+      model_boundary_case != nullptr
+          ? fs::path(model_boundary_case)
+          : fs::path(PARITY_GOLDENS_DIR) / "gdn-packed-decode-oracle";
   const fs::path manifest_path = dir / "manifest.json";
   REQUIRE(fs::exists(manifest_path));
   const json manifest = json::parse(std::ifstream(manifest_path));
@@ -1874,6 +1878,58 @@ TEST_CASE("qwen27 GDN packed decode boundary matches vLLM 0.25 semantics (dgx-on
                      dt_bias.raw.data.data());
   DeviceBuf didx(backend, queue, state_indices.dtype,
                  ShapeOf(state_indices.tensor), state_indices.raw.data.data());
+
+  // A real Qwen3.6-27B decode capture exercises the production mixed-dtype
+  // contract omitted by the small upstream-style fixture: BF16 activations and
+  // output with an F32 recurrent cache (config.json mamba_ssm_dtype=float32),
+  // plus independently typed A_log/dt_bias. Replay it directly before the
+  // decomposed diagnostics, which intentionally require an F32 state.
+  if (model_boundary_case != nullptr) {
+    DeviceBuf model_state(backend, queue, state_in.dtype,
+                          ShapeOf(state_in.tensor), state_in.raw.data.data());
+    DeviceBuf model_out(backend, queue, out_want.dtype,
+                        ShapeOf(out_want.tensor));
+    vt::GdnPackedDecode(queue, model_out.tensor(), dmixed.tensor(), da.tensor(),
+                        db.tensor(), da_log.tensor(), ddt_bias.tensor(),
+                        model_state.tensor(), didx.tensor(),
+                        vt::GdnArgs{scale});
+    std::vector<uint8_t> model_out_host, model_state_host;
+    const Tensor model_out_result =
+        model_out.Download(queue, model_out_host);
+    const Tensor model_state_result =
+        model_state.Download(queue, model_state_host);
+    auto element_bitdiff = [](const Tensor& got, const Tensor& want) {
+      VT_CHECK(got.dtype == want.dtype && got.Numel() == want.Numel(),
+               "model packed boundary requires equal typed tensors");
+      const size_t element_bytes = vt::SizeOf(got.dtype);
+      int64_t count = 0;
+      const auto* got_bytes = static_cast<const uint8_t*>(got.data);
+      const auto* want_bytes = static_cast<const uint8_t*>(want.data);
+      for (int64_t i = 0; i < got.Numel(); ++i) {
+        if (std::memcmp(got_bytes + static_cast<size_t>(i) * element_bytes,
+                        want_bytes + static_cast<size_t>(i) * element_bytes,
+                        element_bytes) != 0) {
+          ++count;
+        }
+      }
+      return count;
+    };
+    const int64_t out_diff =
+        element_bitdiff(model_out_result, out_want.tensor);
+    const int64_t state_diff =
+        element_bitdiff(model_state_result, state_want.tensor);
+    MESSAGE("real model packed boundary exact element differences: out/state="
+            << out_diff << "/" << state_diff);
+    // The public vLLM test compares FP32 state at atol=rtol=1e-4: the Triton
+    // packed kernel and the reference recurrence use different reduction
+    // orders, so bitwise FP32 state equality is not its contract. The BF16
+    // emitted output is exact at this real boundary; retain that stronger gate.
+    CHECK(out_diff == 0);
+    RequireMatch("real model packed state", model_state_result,
+                 state_want.tensor, 1e-4, 1e-4);
+    backend.DestroyQueue(queue);
+    return;
+  }
 
   DeviceBuf dq_local(backend, queue, DType::kBF16, {batch, hk, dk});
   DeviceBuf dk_local(backend, queue, DType::kBF16, {batch, hk, dk});

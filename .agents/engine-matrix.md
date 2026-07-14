@@ -14,32 +14,15 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `READY`.
 
 Current `SERVE-GATE-ONLINE` substage: binding `3f256ab` remains **55/124**.
-Finalized exact-c2 root `179a0fc` (status `9e0143fa…7b57`) proves matching FP4
-tactics and explains all 96 extra BF16 projection launches: qkv+z+b+a versus
-vLLM qkvz+ba across 48 GDN layers. The accepted
-[merged-projection spike](specs/gdn-merged-input-projections.md) makes
-`KERNEL-GEMM-BF16` W1 `GATING`. Clean pushed `581d335` closes the one-owner
-F32-output BA core correctness/safety gate; BF16 output fails the token near-tie.
-Immutable `0091cd1`, finalized by pushed `8a1f923`, is
-`complete-structural`: 24/24 exact local ranges at merged 963/145 versus split
-1,011/193, exactly 48 BF16-only removals, unchanged selected non-BF16 families,
-and invariant fresh vLLM controls. `benchmark_binding=false`. W1C now records
-an exact five-shape vLLM BF16 oracle and implements the default-off local arm
-plus explicit 35B/GGUF selection assertions. Immutable `f925294` passes local
-projection **14/14**, loader **73/73**, native 35B **315/315**, real GGUF
-**28/28**, and default 27B **235/235**. BF16 end-to-end remains **233/235**
-and exactly equals emulation, localizing the open gap downstream of GEMM.
-The accepted [packed-decode spike](specs/gdn-packed-decode.md) now closes the
-first divergence: only vLLM's combined F32 in-kernel q/k normalization and
-dtype-rounded beta reaches `0/1` output/state differences; beta-only does not.
-Clean pushed `f18ca23` regenerates the official fixture byte-for-byte and
-passes the focused CUDA replay **10/10**, closing immutable G0. Clean pushed
-`9ad8fb7` closes W1D1/G1 for the public FP16/BF16/F32 CPU/CUDA operator,
-upstream matrix, capture/canaries and strict memcheck. Production model
-dispatch, end-to-end correctness and c2/c16 component evidence remain pending. qkvz stays
-excluded. No diagnostic earns speed credit.
-Host PSS/RSS separately retains a
-**22.920 GiB** CPU weight mirror plus source mmap residency.
+FP4 tactics and merged BA topology are matched. W1D2 now implements vLLM's
+exact packed pure-non-spec 27B decode branch, ordered BF16-conv/FP32-SSM cache
+allocation, complete metadata preflight, graph-padding safety and process-cached
+rollback. Final mutable-source gates pass both real 27B arms **235/235 +
+16/16**, full CUDA GDN **43/43**, native/batched 35B zero-selection **315/315**
+and isolated GGUF **14/14 + 14/14**. Immutable pushed-SHA G2, paired node traces
+and c2/c16 component evidence remain pending; qkvz stays excluded and
+`benchmark_binding=false`. Host PSS/RSS separately retains a **22.920 GiB**
+CPU weight mirror plus source mmap residency.
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -174,7 +157,7 @@ claims it.
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI (17 exported symbols; blocking and nonblocking request handles) | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143,181,207`; `src/capi/vllm_c.cpp:229,264,327,391` | `tests/capi/test_capi.cpp:320,428,505,574,606,640`; `tests/capi/test_dlopen.cpp:77,86`; `tests/capi/c_header_compile.c:1` | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries + explicit scheduler-capacity flags `examples/server/main.cpp:63,96,116,170`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | server help contract `examples/CMakeLists.txt:34`; benchmark `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
-| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), one-lock mode-aware [driver](../scripts/dgx-online-serving.sh#L405), explicit [validator contracts](../tools/bench/online_gate.py#L113), and fail-closed [GDN BA finalizer](../tools/bench/finalize_gdn_ba_trace.py#L1) | Immutable `3f256ab` remains **55/124**. `179a0fc` proves the 193-vs-97 before-state and matching FP4 tactics; `0091cd1` closes BA structure; `f925294` closes projection/inertness, but BF16 remains **233/235**. Clean `f18ca23` closes packed semantic G0 and clean `9ad8fb7` closes W1D1/G1 operator parity/safety. W1D2 235/235, trace/component evidence, host-memory repair and exact grid remain open. `benchmark_binding=false`; no speed credit exists | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
+| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), one-lock mode-aware [driver](../scripts/dgx-online-serving.sh#L405), explicit [validator contracts](../tools/bench/online_gate.py#L113), and fail-closed [GDN BA finalizer](../tools/bench/finalize_gdn_ba_trace.py#L1) | Immutable `3f256ab` remains **55/124**. FP4/BA prerequisites are closed; packed W1D2 dispatch is implemented and mutable G2 passes default+rollback 27B, 35B/GGUF inertness and safety. Immutable G2, node trace/component evidence, host-memory repair and exact grid remain open. `benchmark_binding=false`; no speed credit exists | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |

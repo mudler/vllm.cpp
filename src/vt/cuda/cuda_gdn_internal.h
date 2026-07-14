@@ -25,6 +25,18 @@ void WarmGdnTritonAotModules(int device);
 // zero-filled fresh allocations. Returns the number of poisoned buffers.
 size_t PoisonGdnTritonScratch(Queue& queue, unsigned char value);
 
+struct GdnPackedDecodeDebugStats {
+  uint64_t launches = 0;
+};
+
+// Model-selection instrumentation: counts host dispatches into the packed CUDA
+// operator (one per GDN layer). It is independent of Triton AOT and remains
+// valid during eager execution or graph capture; graph replay itself has no
+// host dispatch, so W1D3 uses nsys node counts for steady-state structure.
+void ResetGdnPackedDecodeDebugStats();
+GdnPackedDecodeDebugStats GetGdnPackedDecodeDebugStats();
+void DisableGdnPackedDecodeDebugStats();
+
 struct GdnTritonDebugStats {
   uint64_t chunk_o_f32_launches = 0;
   uint64_t chunk_o_bf16_launches = 0;

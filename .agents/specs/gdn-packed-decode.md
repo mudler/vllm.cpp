@@ -3,7 +3,8 @@
 **Row:** `KERNEL-GDN-PACKED-DECODE` · **consumers:**
 `KERNEL-GEMM-BF16`, `SERVE-GATE-ONLINE` · **status:** spike complete,
 implementation `ACTIVE` under `CLAIM-GDN-BA-ROUNDING-1`; W1D1/G1 closed at
-clean `9ad8fb7`, W1D2 model dispatch current · **priority:** roadmap order 0.
+clean `9ad8fb7`; W1D2 model dispatch and mutable G2 are green, immutable
+pushed-SHA G2 is pending · **priority:** roadmap order 0.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -22,7 +23,10 @@ pure-decode operation, not a beta-only approximation.
   and a CUDA implementation grounded in vLLM's Triton kernel.
 - Raw row-strided `mixed_qkv [B, 2*Hk*Dk + Hv*Dv]`, `a/b [B,Hv]`,
   `A_log/dt_bias [Hv]`, output `[B,Hv,Dv]`, persistent state
-  `[slots,Hv,Dv,Dk]`, and one state index per decode token.
+  `[slots,Hv,Dv,Dk]`, and one state index per decode token. Activation/output,
+  state, `A_log`, and `dt_bias` storage dtypes are independently validated;
+  the real 27B boundary is BF16 activation/output + FP32 SSM/`A_log` + BF16
+  `dt_bias`.
 - The upstream FP16, BF16 and F32 activation/input modes. Gate-model execution
   is BF16; F32 remains the compatibility/reference mode. All arithmetic is
   F32, with output and state rounded to their declared storage dtype.
@@ -86,13 +90,13 @@ window and show the old post-conv/decode pair absent on pure decode.
 
 | Surface | Current anchor | Gap/evidence |
 |---|---|---|
-| Model assembly | `src/vllm/model_executor/models/qwen3_5.cpp:2498-2551` | Every branch allocates q/k/v/g/beta intermediates, runs `GdnPostConv`, then `GdnDecode`; there is no pure-decode dispatch. |
-| Post-conv CUDA | `src/vt/cuda/cuda_gdn.cu:647-709` | q/k normalization is stored through the output dtype (BF16 for the 27B arm), while beta is stored as F32. |
-| Recurrent CUDA | same file `:936-1133` | The fused recurrence consumes already-materialized q/k and F32 beta. Its recurrence is otherwise the correct baseline/fallback. |
+| Model assembly | `src/vllm/model_executor/models/qwen3_5.cpp`; `src/vllm/model_executor/models/qwen3_5_internal.h` | Exact CUDA dense pure-non-spec decode selects packed recurrence before decomposed q/k/v/g/beta allocation. Prefill, mixed, spec, CPU and 35B retain their existing branches. Complete host metadata validation precedes upload; padded graphs fall back when row-copy state I/O is selected. |
+| State ABI | `src/vllm/model_executor/models/model_registry.cpp`; `src/vllm/v1/worker/gpu/runner.cpp` | Upstream `MambaSpec` order is conv then temporal. Gate allocation is independent BF16 conv + FP32 SSM from nested `mamba_ssm_dtype=float32`; F16/BF16/F32 temporal aliases remain supported. |
+| Rollback/default | `src/vllm/model_executor/models/qwen3_5.cpp` | Default 27B path couples BF16 BA to packed recurrence. Process-cached `VT_GDN_PACKED_DECODE=0` restores F32 BA plus decomposed recurrence; prefill remains packed-call zero. |
 | Projection proof | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/` | Immutable `f925294` passes all five real BA shapes exactly; the divergence is not the GEMM. |
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
-| W1D1 packed operator | `include/vt/ops.h`; `src/vt/{ops.cpp,cpu/cpu_ops.cpp,cuda/cuda_gdn.cu}`; `tests/vt/test_ops_gdn.cpp` | Clean pushed `9ad8fb7` closes G1 for public validation, portable recurrence, FP16/BF16/F32 CUDA kernel and registrations. Focused CUDA **5/5**, direct fixture `0/1`, full GDN **41/41**, capture/canaries and strict memcheck **2/2 with zero errors/leaks** pass. This carries immutable operator/safety credit but no model or speed credit. |
+| W1D2 mutable G2 | model/runner/registry tests plus real 27B/35B/GGUF gates | Final mutable-source replay passes default and rollback 27B **235/235 + 16/16**, default selects exactly 48 packed calls on the first decode and zero on prefill, rollback selects zero, native/batched 35B selects zero at **315/315**, Compact/Balanced GGUF each pass **14/14**, and full CUDA GDN passes **43/43, 1,707/1,707**. Clean pushed-SHA repetition remains mandatory; no speed credit exists. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -105,8 +109,8 @@ them also removes the pure-decode post-conv intermediate launch and buffers.
 | Packed op ABI and validation | `include/vt/ops.h`, `src/vt/ops.cpp` | W1D1 adds typed shape/stride/device validation and one operation preserving the local negative-pad state-index ABI. CPU validates live values; CUDA consumes engine-validated device metadata and bounds-checks slots without synchronizing. |
 | Portable recurrence | `src/vt/cpu/cpu_ops.cpp` plus CPU registration | W1D1 transcribes the exact F32 arithmetic and dtype-rounding points for FP16/BF16/F32 as the cross-backend reference. |
 | CUDA packed kernel | `src/vt/cuda/cuda_gdn.cu` plus CUDA registration | W1D1 hand-ports the Triton body, grid, GQA mapping and storage rounding; no Triton runtime or generated cubin is introduced. CUDA maps each value row across an 8-lane group at Dv≥32 instead of exposing Triton's compiler-private one-warp tensor mapping. |
-| Pure-decode selection | `src/vllm/model_executor/models/qwen3_5.cpp` | Select before post-conv intermediate allocation when the local batch metadata proves non-spec pure decode; otherwise use the existing branch. |
-| Rollback/default | same model file | Process-cache `VT_GDN_PACKED_DECODE`; keep F32 BA/decomposed fallback, flip BF16 BA+packed only after G1-G3 pass. |
+| Pure-decode selection | `src/vllm/model_executor/models/qwen3_5.cpp` | Implemented before post-conv intermediate allocation when host-validated metadata proves exact CUDA dense pure non-spec decode; every other branch keeps the existing path. |
+| Rollback/default | same model file | Implemented process-cached `VT_GDN_PACKED_DECODE`; default couples BF16 BA+packed for 27B and `=0` restores F32 BA/decomposed execution from the same binary. |
 | Oracle generation | `tools/bench/gdn_packed_decode_oracle.py` | Maintainer-only official-v0.25 generator with version/commit guard, repeated bit-stability and reference-tolerance checks. |
 | Test port | `tests/parity/test_op_parity.cpp`, `tests/vt/test_ops_gdn.cpp`, model tests | Port the upstream dtype/stride/state cases and retain the small exact boundary fixture. |
 
@@ -209,7 +213,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 |---|---|---|
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
-| W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | G2 real-model and zero-selection gates green. |
+| W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **IMPLEMENTED / mutable G2 PASS:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Immutable clean-SHA replay is **PENDING**. |
 | W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is
@@ -232,9 +236,11 @@ recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.
   engine silently.
 - **Device index values cannot be synchronously rejected inside a captured
   CUDA op.** CPU calls reject duplicates/out-of-range values directly. The
-  W1D2 host adapter must reject them before upload; the CUDA kernel separately
-  bounds-checks every slot to prevent an invalid read/write without adding a
-  D2H synchronization. Duplicate live slots remain an adapter precondition.
+  W1D2 host adapter now validates the complete non-spec vector, live range,
+  uniqueness and exact prefill suffix/rebase/mask contract before upload; the
+  CUDA kernel separately bounds-checks every slot without adding a D2H sync.
+  Graph padding uses `-1` only with indexed state I/O; row-copy mode falls back
+  before padding.
 - **CUDA thread decomposition is a recorded mechanical adaptation.** The grid,
   value tiling, F32 arithmetic and storage boundaries mirror Triton. The hand
   kernel uses one 8-lane group per value row at Dv≥32 so all 32 rows of a tile

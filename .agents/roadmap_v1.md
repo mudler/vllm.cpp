@@ -12,38 +12,19 @@ matrices, active ownership in `coordination.md`, and chronological evidence in
 the append-only state/ledger record.
 
 **Current order-0 substage (2026-07-14):** binding `3f256ab` remains 55/124.
-At c2 ours has better TTFT but **6.1% slower TPOT**. Finalized exact trace
-`179a0fc` (status `9e0143fa…7b57`) proves the FP4 tactics match and explains
-the complete +96 BF16-GEMM launch residual: our 48 GDN layers issue
-qkv+z+b+a, while vLLM issues qkvz+ba (**193 vs 97** calls). The accepted
-[merged-projection spike](specs/gdn-merged-input-projections.md) now has a
-`GATING` BA-only W1 implementation. Clean pushed `581d335` closes its
-one-owner F32-output merged/split 27B correctness, packed-view safety and native-35B
-inertness gates; the upstream-dtype BF16-output arm fails the known near-tie.
-Immutable `0091cd1`, finalized by pushed `8a1f923`, is now
-`complete-structural`: all 24 local ranges are exact at merged 963/145 versus
-split 1,011/193, every selected non-BF16 family is unchanged, and the two fresh
-vLLM controls retain 1,522/1,521 invariant steady windows with accepted
-names, geometry, families and FP4 tactics. This proves exactly 48 fewer BF16
-launches but has `benchmark_binding=false`. W1C now implements a default-off
-BF16-output arm, an exact vLLM-0.25/GB10 full-output oracle at M=1/2/4/16/32,
-and explicit 35B/GGUF zero-selection tests. Immutable `f925294` passes the
-five-shape local digest **14/14**, loader **73/73**, native 35B **315/315**,
-real GGUF **28/28**, and default 27B **235/235**. Its BF16-output 27B arm still
-fails **233/235** and exactly equals the emulation stream, proving the open gap
-is downstream of the bit-exact BA GEMM. The accepted
-[packed-decode spike](specs/gdn-packed-decode.md) closes that first boundary:
-vLLM keeps q/k normalization in F32 inside its default pure-decode recurrence
-and rounds sigmoid beta through BF16, while our decomposed path does neither.
-Clean pushed `f18ca23` regenerates the official fixture byte-for-byte and its
-focused CUDA replay passes **10/10**, reproducing current `306/7552`, beta-only
-`308/6558`, and both semantics `0/1` output/state BF16 differences. Immutable
-G0 is closed. Clean pushed `9ad8fb7` now closes W1D1/G1: focused packed CUDA
-passes **5/5**, the direct fixture remains `0/1`, the full CUDA GDN suite passes
-**41/41**, and strict memcheck passes **2/2 with zero errors/leaks**. W1D2
-model dispatch and 235/235 now precede trace plus c2/c16. qkvz stays excluded
-and no diagnostic earns speed credit.
-Host PSS/RSS separately retains a
+At c2 ours has better TTFT but **6.1% slower TPOT**. FP4 tactics and merged BA
+topology are already matched; the active leaf is
+[packed GDN decode](specs/gdn-packed-decode.md). W1D2 now implements the exact
+27B CUDA pure-non-spec dispatch, BF16-conv/FP32-SSM cache ABI, complete metadata
+preflight and `VT_GDN_PACKED_DECODE=0` rollback. Final mutable-source gates pass
+default+rollback 27B **235/235 + 16/16**, full CUDA GDN **43/43**, 35B
+zero-selection **315/315**, and isolated Compact/Balanced GGUF **14/14 +
+14/14**. Clean pushed-SHA G2 remains pending; this state has
+`benchmark_binding=false` and earns no speed credit.
+
+Next: commit/push, repeat G2 from the immutable SHA, then run paired vLLM/ours
+node-level Nsight traces and the c2/c16 **40 timing + 8 memory** component. qkvz
+stays excluded until that disposition. Host PSS/RSS separately retains a
 **22.920 GiB** CPU weight mirror plus source mmap residency.
 
 ## Top-level portfolio
@@ -56,7 +37,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. Finalized `179a0fc` proves matching FP4 tactics and exact **193 vs 97** BF16 projection launches. `581d335`/`0091cd1`/`f925294` close BA safety, structure and exact projection/inertness, but BF16 end-to-end remains **233/235**. Clean `f18ca23` closes packed-decode G0 at `0/1`; clean `9ad8fb7` closes W1D1/G1 for the FP16/BF16/F32 CPU/CUDA op, upstream stride/index matrix, capture/canaries and strict memcheck. Model dispatch and 235/235 remain pending. `benchmark_binding=false`; component timing, qkvz, host-memory repair, SGLang and a newer binding result remain open | `GATING` | wire W1D2 and restore 235/235 in default/rollback arms, then run trace plus c2/c16 before qkvz |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. FP4 tactics and merged BA topology are matched. W1D2 packed decode is implemented; mutable G2 passes both 27B arms, 35B/GGUF inertness and safety, but immutable G2 plus W1D3 trace/component remain pending. `benchmark_binding=false`; qkvz, host-memory repair, SGLang and a newer binding result remain open | `GATING` | commit/push and repeat immutable G2, then run paired node traces plus c2/c16 before qkvz |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |
@@ -81,7 +62,7 @@ their area matrix.
 
 | # | Track | State |
 |---|---|---|
-| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. BA safety/structure/projection and packed-decode W1D1/G1 are closed at clean `9ad8fb7`; BF16 model dispatch and end-to-end 235/235 remain open. W1D2 and trace/c2/c16 precede qkvz. Repair the 22.920 GiB host mirror before 35B performance |
+| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. W1D2 packed dispatch is mutable G2-green; clean-SHA G2 and trace/c2/c16 precede qkvz. Repair the 22.920 GiB host mirror before 35B performance |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
 | A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461; reproducibility hardening `09f1d23`) — `sm_121a` now has 48 generated C/H files + MANIFEST, including both bf16 `chunk_o` shapes; normal builds remain Python-free. Regen is explicit-target (`cuda:121:32`), line-info-disabled and byte-reproducible across source paths; the pure checker makes source/contract/artifact drift fatal and mutation-tests missing/extra/changed artifacts. A4 remains closed; fresh current-main CUDA/runtime/performance validation belongs to the two ACTIVE `CLAIM-PR3` kernel rows (evidence: porting-inventory §9). |

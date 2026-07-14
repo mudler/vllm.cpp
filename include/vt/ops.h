@@ -908,10 +908,13 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
 // vllm/model_executor/layers/fla/ops/fused_recurrent.py:255-478 @ 702f4814.
 // mixed_qkv [B, 2*Hk*Dk + Hv*Dv] and a/b [B,Hv] are last-dimension
 // contiguous and may have padded outer row strides. A_log/dt_bias [Hv], out
-// [B,Hv,Dv], state [slots,Hv,Dv,Dk], state_idx [B]. FP16/BF16/F32 primary
-// tensors share one dtype; A_log/dt_bias may use any floating dtype. The op
-// normalizes raw q/k in F32, rounds sigmoid(b) through b.dtype, applies
-// args.scale to q, and updates state in place. Local cache ABI: state_idx < 0
+// [B,Hv,Dv], state [slots,Hv,Dv,Dk], state_idx [B]. mixed_qkv/a/b/out share
+// one FP16/BF16/F32 activation dtype. State has an independent floating cache
+// dtype, and A_log/dt_bias may independently use any floating dtype; this is
+// the real Qwen3.6 contract (BF16 activations/output, FP32 SSM state, FP32
+// A_log, BF16 dt_bias). The op normalizes raw q/k in F32, rounds sigmoid(b)
+// through b.dtype, applies args.scale to q, and updates state in place. Local
+// cache ABI: state_idx < 0
 // zeros/skips the row; slot 0 is valid. Live CUDA indices are engine metadata
 // and must be unique and in range before upload; the kernel also bounds-checks
 // every slot without adding a capture-breaking host synchronization. CPU calls

@@ -8,6 +8,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 
 #include <algorithm>
@@ -39,6 +40,203 @@
 #endif
 
 namespace vllm {
+
+bool detail::ShouldUsePackedGdnDecode(
+    const GdnPackedDecodeEligibility& e) {
+  return e.runtime_enabled && e.cuda && e.dense_model && e.has_packed_ba &&
+         e.merged_ba_enabled && e.dtype_compatible && e.has_state_indices &&
+         e.num_prefills == 0 && e.num_prefill_tokens == 0 &&
+         e.num_spec_decodes == 0 && e.num_spec_decode_tokens == 0 &&
+         e.num_decodes > 0 && e.num_decode_tokens == e.num_decodes &&
+         e.num_actual_tokens == e.num_decode_tokens;
+}
+
+void detail::ValidateGdnStateIndices(const std::vector<int32_t>& indices,
+                                     int64_t required,
+                                     int64_t state_slots) {
+  VT_CHECK(required >= 0 &&
+               required <= static_cast<int64_t>(indices.size()),
+           "qwen3_5: GDN state index metadata is too short");
+  VT_CHECK(state_slots >= 0,
+           "qwen3_5: GDN state cache has invalid slot count");
+  for (int64_t i = 0; i < required; ++i) {
+    const int32_t slot = indices[static_cast<size_t>(i)];
+    if (slot < 0) {
+      VT_CHECK(slot == -1,
+               "qwen3_5: invalid negative GDN state index");
+      continue;
+    }
+    VT_CHECK(slot < state_slots,
+             "qwen3_5: GDN state index out of range");
+    for (int64_t j = 0; j < i; ++j) {
+      VT_CHECK(indices[static_cast<size_t>(j)] != slot,
+               "qwen3_5: duplicate live GDN state index");
+    }
+  }
+}
+
+void detail::ValidateGdnAttentionMetadata(
+    const v1::GDNAttentionMetadata& metadata, int64_t state_slots,
+    bool allow_inert_padding) {
+  const int64_t nd = metadata.num_decodes;
+  const int64_t np = metadata.num_prefills;
+  const int64_t nd_tok = metadata.num_decode_tokens;
+  const int64_t np_tok = metadata.num_prefill_tokens;
+  const int64_t nreq = nd + np;
+
+  VT_CHECK(nd >= 0 && np >= 0 && nd_tok >= 0 && np_tok >= 0 &&
+               metadata.num_actual_tokens >= 0,
+           "qwen3_5: negative GDN metadata count");
+  VT_CHECK(metadata.num_spec_decodes == 0 &&
+               metadata.num_spec_decode_tokens == 0,
+           "qwen3_5: speculative GDN metadata is not implemented");
+  VT_CHECK(nd_tok == nd,
+           "qwen3_5: non-spec decode requires one token per request");
+  VT_CHECK(metadata.num_actual_tokens == nd_tok + np_tok,
+           "qwen3_5: GDN decode+prefill tokens must equal actual tokens");
+
+  if (nreq == 0) {
+    VT_CHECK(metadata.num_actual_tokens == 0,
+             "qwen3_5: GDN tokens require state metadata");
+    return;
+  }
+
+  VT_CHECK(metadata.non_spec_state_indices_tensor.has_value(),
+           "qwen3_5: missing non-spec GDN state indices");
+  const std::vector<int32_t>& indices =
+      *metadata.non_spec_state_indices_tensor;
+  VT_CHECK(static_cast<int64_t>(indices.size()) == nreq,
+           "qwen3_5: non-spec GDN state index count must equal request count");
+  detail::ValidateGdnStateIndices(indices, nreq, state_slots);
+  if (!allow_inert_padding) {
+    for (int32_t slot : indices) {
+      VT_CHECK(slot >= 0,
+               "qwen3_5: live GDN state index must be non-negative");
+    }
+  }
+
+  if (np == 0) return;
+
+  VT_CHECK(metadata.non_spec_query_start_loc.has_value() &&
+               metadata.has_initial_state.has_value() &&
+               metadata.prefill_state_indices.has_value() &&
+               metadata.prefill_query_start_loc.has_value() &&
+               metadata.prefill_has_initial_state.has_value(),
+           "qwen3_5: incomplete GDN prefill metadata");
+  const std::vector<int32_t>& full_qsl =
+      *metadata.non_spec_query_start_loc;
+  const std::vector<uint8_t>& full_initial = *metadata.has_initial_state;
+  const std::vector<int32_t>& prefill_indices =
+      *metadata.prefill_state_indices;
+  const std::vector<int32_t>& prefill_qsl =
+      *metadata.prefill_query_start_loc;
+  const std::vector<uint8_t>& prefill_initial =
+      *metadata.prefill_has_initial_state;
+
+  VT_CHECK(static_cast<int64_t>(full_qsl.size()) == nreq + 1 &&
+               static_cast<int64_t>(full_initial.size()) == nreq,
+           "qwen3_5: non-spec GDN prefill metadata has invalid shape");
+  VT_CHECK(static_cast<int64_t>(prefill_indices.size()) == np &&
+               static_cast<int64_t>(prefill_qsl.size()) == np + 1 &&
+               static_cast<int64_t>(prefill_initial.size()) == np,
+           "qwen3_5: prefill-only GDN metadata has invalid shape");
+  VT_CHECK(full_qsl.front() == 0 &&
+               full_qsl.back() == metadata.num_actual_tokens,
+           "qwen3_5: non-spec GDN query offsets must span actual tokens");
+  for (int64_t i = 0; i < nreq; ++i) {
+    VT_CHECK(full_qsl[static_cast<size_t>(i + 1)] >
+                 full_qsl[static_cast<size_t>(i)],
+             "qwen3_5: non-spec GDN query offsets must be strictly increasing");
+  }
+  VT_CHECK(full_qsl[static_cast<size_t>(nd)] == nd_tok,
+           "qwen3_5: non-spec GDN decode prefix does not match token count");
+
+  for (int64_t i = 0; i < np; ++i) {
+    const size_t prefill_row = static_cast<size_t>(i);
+    const size_t full_row = static_cast<size_t>(nd + i);
+    VT_CHECK(prefill_indices[prefill_row] == indices[full_row],
+             "qwen3_5: prefill state indices must match non-spec suffix");
+    VT_CHECK(prefill_indices[prefill_row] >= 0,
+             "qwen3_5: prefill GDN state index must be non-negative");
+    VT_CHECK(prefill_qsl[prefill_row] ==
+                 full_qsl[full_row] - nd_tok,
+             "qwen3_5: prefill query offsets must match rebased non-spec suffix");
+    VT_CHECK(prefill_initial[prefill_row] == full_initial[full_row],
+             "qwen3_5: prefill initial-state mask must match non-spec suffix");
+  }
+  VT_CHECK(prefill_qsl.back() == np_tok,
+           "qwen3_5: prefill query offsets must span prefill tokens");
+}
+
+bool detail::CanUseGdnDecodeGraphSize(int64_t real_batch,
+                                      int64_t capture_batch,
+                                      bool indexed_state_io) {
+  return real_batch > 0 && capture_batch >= real_batch &&
+         (capture_batch == real_batch || indexed_state_io);
+}
+
+int64_t detail::ValidateGdnStateCacheLayout(
+    const std::vector<GdnStateCache>& state_caches) {
+  if (state_caches.empty()) return 0;
+  int64_t state_slots = -1;
+  for (const GdnStateCache& cache : state_caches) {
+    VT_CHECK(cache.ssm_state.rank == 4 && cache.conv_state.rank == 3,
+             "qwen3_5: GDN SSM/conv state ranks must be 4/3");
+    VT_CHECK(cache.ssm_state.shape[0] == cache.conv_state.shape[0],
+             "qwen3_5: GDN conv/SSM state slot counts must match");
+    if (state_slots < 0) {
+      state_slots = cache.ssm_state.shape[0];
+    } else {
+      VT_CHECK(cache.ssm_state.shape[0] == state_slots,
+               "qwen3_5: all GDN layers must use the same state slot count");
+    }
+  }
+  return state_slots;
+}
+
+vt::DType detail::ResolveMambaSsmCacheDType(const HfConfig& config,
+                                            vt::DType conv_dtype) {
+  const std::string& dtype = config.mamba_ssm_dtype;
+  if (dtype.empty() || dtype == "auto") return conv_dtype;
+  if (dtype == "float32" || dtype == "float") return vt::DType::kF32;
+  if (dtype == "float16" || dtype == "half") return vt::DType::kF16;
+  if (dtype == "bfloat16") return vt::DType::kBF16;
+  throw std::runtime_error(
+      "qwen3_5: unsupported mamba_ssm_dtype '" + dtype +
+      "' (expected float16/half, bfloat16, float32/float, or auto)");
+}
+
+void detail::ValidateGdnDecodeGraphState(
+    const v1::GDNAttentionMetadata& metadata,
+    const std::vector<GdnStateCache>& state_caches, int64_t real_batch) {
+  VT_CHECK(real_batch > 0,
+           "qwen3_5 decode graph: real batch must be positive");
+  VT_CHECK(metadata.num_prefills == 0 && metadata.num_prefill_tokens == 0 &&
+               metadata.num_spec_decodes == 0 &&
+               metadata.num_spec_decode_tokens == 0 &&
+               metadata.num_decodes == real_batch &&
+               metadata.num_decode_tokens == real_batch &&
+               metadata.num_actual_tokens == real_batch,
+           "qwen3_5 decode graph: metadata must describe exact pure non-spec "
+           "decode");
+  VT_CHECK(metadata.non_spec_state_indices_tensor.has_value(),
+           "qwen3_5 decode graph: missing GDN state indices");
+  const std::vector<int32_t>& indices =
+      *metadata.non_spec_state_indices_tensor;
+  VT_CHECK(static_cast<int64_t>(indices.size()) == real_batch,
+           "qwen3_5 decode graph: state index count must equal the real decode "
+           "batch");
+  VT_CHECK(!state_caches.empty(),
+           "qwen3_5 decode graph: missing GDN state caches");
+
+  const int64_t state_slots =
+      detail::ValidateGdnStateCacheLayout(state_caches);
+  for (int64_t i = 0; i < real_batch; ++i) {
+    VT_CHECK(indices[static_cast<size_t>(i)] >= 0,
+             "qwen3_5 decode graph: live GDN state index must be non-negative");
+  }
+  ValidateGdnStateIndices(indices, real_batch, state_slots);
+}
 
 DenseGateUpGlobals MergeDenseGateUpGlobals(const Nvfp4Weight& gate,
                                            const Nvfp4Weight& up) {
@@ -1897,33 +2095,40 @@ void ScatterRows(Dev d, const Tensor& dst, const void* src,
 }
 
 // Gather idx-indexed rows of a persistent GDN state cache into a fresh f32
-// working buffer. On CUDA the cache is bf16 (vLLM default mamba_cache_dtype
-// auto → model dtype): gather the raw bf16 rows then upcast — fla reads the
-// bf16 cache into f32 registers (fused_recurrent.py:102). On CPU the cache is
-// f32: gather directly. The f32 buffer is what the f32 GdnPrefill/CausalConv1dFwd
-// consume; the bf16 round-trip lives only at the cache boundary.
+// working buffer. Compressed cache dtypes round-trip at the cache boundary;
+// the temporal state may independently be fp16/bf16/fp32 while the conv cache
+// follows mamba_cache_dtype. The f32 buffer is what GdnPrefill consumes.
 DBuf GatherStateF32(Dev d, const Tensor& cache, const std::vector<int32_t>& idx,
                     int64_t row_elems, const std::vector<int64_t>& shape) {
+  VT_CHECK(!shape.empty() && shape[0] == static_cast<int64_t>(idx.size()),
+           "qwen3_5: gathered state row count " +
+               std::to_string(shape.empty() ? -1 : shape[0]) +
+               " must match index count " + std::to_string(idx.size()));
   DBuf f32buf(d, DType::kF32, shape);
-  if (cache.dtype == DType::kBF16) {
-    DBuf bf(d, DType::kBF16, shape);
-    GatherRows(d, bf.ptr(), cache, idx, row_elems);
-    vt::CastF32(d.q, f32buf.t(), bf.t());
+  if (cache.dtype == DType::kF16 || cache.dtype == DType::kBF16) {
+    DBuf didx(d, DType::kI32,
+              {static_cast<int64_t>(idx.size())}, idx.data());
+    vt::GdnStateGather(d.q, f32buf.t(), cache, didx.t());
   } else {
     GatherRows(d, f32buf.ptr(), cache, idx, row_elems);
   }
   return f32buf;
 }
 
-// Inverse of GatherStateF32: downcast the f32 working buffer to the cache dtype
-// (bf16 on CUDA / f32 on CPU) and scatter it back to the idx-indexed slots.
+// Inverse of GatherStateF32: downcast to the independent cache dtype and
+// scatter back to the indexed slots.
 void ScatterStateF32(Dev d, const Tensor& cache, DBuf& f32buf,
-                     const std::vector<int32_t>& idx, int64_t row_elems,
-                     const std::vector<int64_t>& shape) {
-  if (cache.dtype == DType::kBF16) {
-    DBuf bf(d, DType::kBF16, shape);
-    vt::CastBf16(d.q, bf.t(), f32buf.t());
-    ScatterRows(d, cache, bf.ptr(), idx, row_elems);
+                     const std::vector<int32_t>& idx, int64_t row_elems) {
+  VT_CHECK(f32buf.t().rank > 0 &&
+               f32buf.t().shape[0] == static_cast<int64_t>(idx.size()),
+           "qwen3_5: scattered state row count " +
+               std::to_string(f32buf.t().rank > 0 ? f32buf.t().shape[0] : -1) +
+               " must match index count " + std::to_string(idx.size()));
+  if (cache.dtype == DType::kF16 || cache.dtype == DType::kBF16) {
+    DBuf didx(d, DType::kI32,
+              {static_cast<int64_t>(idx.size())}, idx.data());
+    Tensor mutable_cache = cache;
+    vt::GdnStateScatter(d.q, mutable_cache, f32buf.t(), didx.t());
   } else {
     ScatterRows(d, cache, f32buf.ptr(), idx, row_elems);
   }
@@ -2055,13 +2260,14 @@ DType ResidualDType() {
 // 27B loader, which is the only path that populates `in_proj_ba`. The resident
 // owner is shared by both arms: fallback slices its output rows and issues the
 // two legacy F32 GEMMs, never retaining duplicate split weights.
-// The merged GEMM emits F32 by default: this preserves the already-gated local
-// gate arithmetic (see GdnInDType) and passes the native 16-token stream. vLLM
-// emits BF16 from torch.nn.functional.linear. VT_GDN_BA_OUT_BF16=1 selects that
-// exact output contract in the same binary while W1C grounds its projection
-// bits and downstream continuation; it cannot become the default until both
-// gates pass. The earlier BF16-output attempt reproduced the rejected
-// emulation stream at token 7, so this remains correctness-significant.
+// The decomposed fallback emits F32 by default, preserving the already-gated
+// token-correct stream. vLLM emits BF16 from torch.nn.functional.linear; W1D2
+// couples that exact dtype to the packed pure-decode branch. Packed activations
+// and output are BF16 while temporal state, A_log, and dt_bias retain their
+// independent upstream dtypes. VT_GDN_BA_OUT_BF16 remains an explicit
+// diagnostic override. With
+// VT_GDN_PACKED_DECODE=0 and no dtype override, rollback is therefore the
+// legacy F32 BA + decomposed consumer from the same resident owner.
 bool MergedGdnBaEnabled(Dev d) {
   static const bool enabled = [] {
     const char* master = std::getenv("VT_GDN_MERGED_PROJ");
@@ -2072,12 +2278,25 @@ bool MergedGdnBaEnabled(Dev d) {
   return enabled && d.q.device.type == vt::DeviceType::kCUDA;
 }
 
-DType MergedGdnBaOutputDType() {
-  static const bool bf16 = [] {
+DType MergedGdnBaOutputDType(bool packed_decode) {
+  static const int override = [] {
     const char* e = std::getenv("VT_GDN_BA_OUT_BF16");
-    return e != nullptr && e[0] != '0';
+    if (e == nullptr) return -1;
+    return e[0] == '0' ? 0 : 1;
   }();
+  const bool bf16 = override >= 0 ? override != 0 : packed_decode;
   return bf16 ? DType::kBF16 : DType::kF32;
+}
+
+// Mirrors vLLM's VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE default-on process
+// configuration (envs.py:1123-1125 @ 702f4814). Cached once: a process is one
+// production or rollback arm, never a per-request mixture.
+bool PackedGdnDecodeRuntimeEnabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_GDN_PACKED_DECODE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return enabled;
 }
 
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
@@ -2100,7 +2319,8 @@ struct GdnBaOutput {
 };
 
 GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
-                         const Tensor& hidden, int64_t value_heads) {
+                         const Tensor& hidden, int64_t value_heads,
+                         bool packed_decode = false) {
   GdnBaOutput out;
   if (!weights.in_proj_ba.Empty()) {
     VT_CHECK(weights.in_proj_ba.nk && weights.in_proj_ba.rank == 2 &&
@@ -2110,7 +2330,8 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
     Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
     if (MergedGdnBaEnabled(d)) {
       out.packed_owner.emplace(
-          MatmulBTRawD(d, hidden, packed_weight, MergedGdnBaOutputDType()));
+          MatmulBTRawD(d, hidden, packed_weight,
+                       MergedGdnBaOutputDType(packed_decode)));
       Tensor packed = out.packed_owner->t();
       out.b = packed.Slice(1, 0, value_heads);
       out.a = packed.Slice(1, value_heads, 2 * value_heads);
@@ -2289,9 +2510,29 @@ struct StepDevInputs {
 
 StepDevInputs BuildStepDevInputs(Dev d, const std::vector<int32_t>& positions,
                                  const CommonAttentionMetadata& am,
-                                 const GDNAttentionMetadata& gm) {
+                                 const GDNAttentionMetadata& gm,
+                                 int64_t gdn_state_slots) {
   const int64_t T = static_cast<int64_t>(positions.size());
   const bool indexed_state_io = IndexedGdnStateIoEnabled(d.q.device);
+  VT_CHECK(gm.num_actual_tokens == T,
+           "qwen3_5: GDN metadata token count must match step input");
+  // Internal graph calls may append -1 sentinel rows; eager entry points have
+  // already rejected them. Every other shape/suffix/range invariant is checked
+  // here immediately before upload so no state-I/O branch can bypass it.
+  detail::ValidateGdnAttentionMetadata(
+      gm, gdn_state_slots, /*allow_inert_padding=*/true);
+  // Engine-owned state indices are validated on their host representation
+  // before any DBuf upload. Packed CUDA then needs no capture-breaking D2H flag
+  // or stream synchronization; its kernel retains an independent bounds guard.
+  if (gm.non_spec_state_indices_tensor.has_value() &&
+      (indexed_state_io || gm.num_decodes > 0)) {
+    const int64_t index_count =
+        indexed_state_io
+            ? static_cast<int64_t>(gm.non_spec_state_indices_tensor->size())
+            : static_cast<int64_t>(gm.num_decodes);
+    detail::ValidateGdnStateIndices(*gm.non_spec_state_indices_tensor,
+                                    index_count, gdn_state_slots);
+  }
   StepDevInputs s{
       DBuf(d, DType::kI32, {T}, positions.data()),
       DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
@@ -2401,6 +2642,29 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(meta.num_actual_tokens == T, "gdn paged: num_actual_tokens != T");
   VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
 
+  const DType indt = GdnInDType();
+  const DType outdt = GdnOutDType(cfg.num_experts == 0);
+  const bool packed_decode = detail::ShouldUsePackedGdnDecode(
+      detail::GdnPackedDecodeEligibility{
+          PackedGdnDecodeRuntimeEnabled(),
+          d.q.device.type == vt::DeviceType::kCUDA,
+          cfg.num_experts == 0,
+          !w.in_proj_ba.Empty(),
+          MergedGdnBaEnabled(d),
+          indt == DType::kBF16 && outdt == DType::kBF16 &&
+              MergedGdnBaOutputDType(true) == DType::kBF16 &&
+              (state.ssm_state.dtype == DType::kF32 ||
+               state.ssm_state.dtype == DType::kF16 ||
+               state.ssm_state.dtype == DType::kBF16),
+          sdi.has_gdn_idx,
+          np,
+          np_tok,
+          nd,
+          nd_tok,
+          meta.num_spec_decodes,
+          meta.num_spec_decode_tokens,
+          T});
+
   // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
   // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.
   // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
@@ -2409,7 +2673,6 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight branch, halves
   // the conv-input traffic); the fp8-cutlass branch (35B) keeps f32. See
   // GdnInDType().
-  const DType indt = GdnInDType();
   DBuf mixed = !w.in_proj_qkv_fp8.Empty()
                    ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
                             : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
@@ -2418,13 +2681,12 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
   // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
   // byte-identical f32 path.
-  const DType outdt = GdnOutDType(cfg.num_experts == 0);
   DBuf z = !w.in_proj_z_fp8.Empty()
                ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
-  GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv);
+  GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv, packed_decode);
   Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
   Tensor araw = ba.a;
 
@@ -2440,6 +2702,14 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dconv(d, convdt, {T, conv_dim});
   const int64_t conv_row_elems = conv_dim * (Kw - 1);
   const bool indexed_state_io = sdi.indexed_gdn_state_io;
+  std::vector<int32_t> row_copy_decode_indices;
+  if (!indexed_state_io && nd > 0) {
+    const auto& all_indices = *meta.non_spec_state_indices_tensor;
+    VT_CHECK(static_cast<int64_t>(all_indices.size()) >= nd,
+             "row-copy GDN decode state index metadata is too short");
+    row_copy_decode_indices.assign(all_indices.begin(),
+                                   all_indices.begin() + nd);
+  }
   if (np > 0) {
     // Any prefill: conv over the WHOLE non-spec stream (decodes lead, each with
     // has_initial_state=1). qwen_gdn_linear_attn.py:1360-1375.
@@ -2473,8 +2743,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr,
                           dcs.t(), dqsl.t(), dhis.t(),
                           vt::CausalConv1dArgs{true});
-      ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems,
-                      cs_shape);
+      ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
     }
   } else {
     // Pure decode: single-token conv step per sequence, IN PLACE on the persistent
@@ -2489,10 +2758,22 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // re-read this H2D copy from a fixed host address across replays.
     // State slot indices from the PERSISTENT per-step buffer (uploaded once,
     // shared by conv-update + the ssm recurrence across all GDN layers).
-    Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
-    Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
-    vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr, conv_cache,
-                           vt::CausalConv1dArgs{true}, &gidx);
+    if (indexed_state_io) {
+      Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
+      Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
+      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+                             conv_cache, vt::CausalConv1dArgs{true}, &gidx);
+    } else {
+      VT_CHECK(nd_tok == nd,
+               "row-copy GDN conv decode requires one token per request");
+      const auto& sidx = row_copy_decode_indices;
+      const std::vector<int64_t> cs_shape = {nd, conv_dim, Kw - 1};
+      DBuf dcs = GatherStateF32(d, state.conv_state, sidx, conv_row_elems,
+                                cs_shape);
+      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+                             dcs.t(), vt::CausalConv1dArgs{true});
+      ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
+    }
   }
 
   // Post-conv prep (§1 layout, §4 l2norm, §6 g/beta): split q|k|v, l2-normalize
@@ -2501,105 +2782,128 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // launches when disabled. g/beta uniform over all tokens; recurrence segments.
   Tensor a_log_dev = ResidentWeight(d, w.a_log, {Hv});
   Tensor dt_bias_dev = ResidentWeight(d, w.dt_bias, {Hv});
-  // Coupled bf16 (VT_GDN_BF16, default ON): matmul-input activations q/k/v are
-  // bf16 (native WMMA fragments + halved traffic); g/beta/state f32 (FLA split).
-  const DType actdt = GdnActDType();
-  DBuf vf(d, actdt, {T, Hv, Dv});
-  DBuf dg(d, DType::kF32, {T, Hv});
-  DBuf dbeta(d, DType::kF32, {T, Hv});
-  DBuf dql2(d, actdt, {T, Hk, Dk});
-  DBuf dkl2(d, actdt, {T, Hk, Dk});
-  if (GlueFuseEnabled()) {
-    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw,
-                    braw, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
-  } else {
-    DBuf qf(d, actdt, {T, Hk, Dk});
-    DBuf kf(d, actdt, {T, Hk, Dk});
-    Tensor q2 = Reshape(qf.t(), {T, key_dim});
-    Tensor k2 = Reshape(kf.t(), {T, key_dim});
-    Tensor v2 = Reshape(vf.t(), {T, value_dim});
-    vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw, braw, a_log_dev, dt_bias_dev);
-    vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
-    vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
-  }
-  // scale = Dk^-0.5 (q only, inside the recurrence). dcore (recurrence output /
-  // core_attn_out) is bf16 under VT_GDN_OUT_BF16 — GdnDecode/GdnPrefill store the
-  // Tout=bf16 path directly (mirror FLA chunk_o.py o bf16); else the f32 arm.
+  // dcore is common to both branches. The packed branch consumes raw dconv and
+  // row-strided a/b directly, selecting before any normalized q/k/v/g/beta
+  // intermediates are allocated. This mirrors vLLM v0.25.0
+  // _forward_core_decode_non_spec:1644-1695.
   DBuf dcore(d, outdt, {T, Hv, Dv});
   const float scale = 1.0F / std::sqrt(SizeF(Dk));
-  const int64_t ssm_row_elems = Hv * Dv * Dk;
-
-  // Recurrence — decode segment first (leading nd_tok tokens), then prefill.
-  if (nd > 0) {
-    // Decode recurrence IN PLACE on the persistent ssm_state at each sequence's
-    // slot (mirrors fla fused_recurrent ssm_state_indices) — no per-request
-    // gather+scatter (the other two host<->device copies per sequence per layer).
-    // Persistent metadata source (see the conv branch) for graph-replay safety.
-    // The persistent W1 buffer covers every non-spec request. A turnover step
-    // may have a leading decode subset followed by prefills, so both decode
-    // consumers must narrow the view to exactly `nd` state slots.
+  if (packed_decode) {
     Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
-    Tensor ssm_cache = state.ssm_state;  // mutable view over the shared buffer
-    Tensor q_dec = SubView(dql2.t(), 0, nd_tok);
-    Tensor k_dec = SubView(dkl2.t(), 0, nd_tok);
-    Tensor v_dec = SubView(vf.t(), 0, nd_tok);
-    Tensor g_dec = SubView(dg.t(), 0, nd_tok);
-    Tensor b_dec = SubView(dbeta.t(), 0, nd_tok);
-    Tensor o_dec = SubView(dcore.t(), 0, nd_tok);
-    vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec, ssm_cache,
-                  vt::GdnArgs{scale}, &gidx);
-  }
-  if (np > 0) {
-    const auto& pidx = *meta.prefill_state_indices;
-    const auto& p_qsl = *meta.prefill_query_start_loc;
-    // Gather the persistent ssm_state rows into an f32 working buffer (bf16 cache
-    // on CUDA → upcast; f32 cache on CPU → direct), run the f32 chunked GdnPrefill
-    // (fla reads the initial_state in f32, writes the final_state), then downcast +
-    // scatter back to the cache.
-    const std::vector<int64_t> ss_shape = {np, Hv, Dv, Dk};
-    DBuf dss(d, DType::kF32, ss_shape);
-    if (indexed_state_io) {
-      VT_CHECK(sdi.has_gdn_prefill_meta,
-               "indexed GDN prefill requires persistent prefill metadata");
-      // Fuses indexing, BF16->F32, and the fresh-request zeroing obligation.
-      vt::GdnStateGather(d.q, dss.t(), state.ssm_state,
-                         sdi.gdn_prefill_state_idx.t(),
-                         &sdi.gdn_prefill_has_initial.t());
+    Tensor ssm_cache = state.ssm_state;
+    vt::GdnPackedDecode(d.q, dcore.t(), dconv.t(), araw, braw,
+                        a_log_dev, dt_bias_dev, ssm_cache, gidx,
+                        vt::GdnArgs{scale});
+  } else {
+    // Coupled bf16 (VT_GDN_BF16, default ON): matmul-input activations q/k/v
+    // are bf16 (native WMMA fragments + halved traffic); g/beta and recurrence
+    // arithmetic stay f32.
+    const DType actdt = GdnActDType();
+    DBuf vf(d, actdt, {T, Hv, Dv});
+    DBuf dg(d, DType::kF32, {T, Hv});
+    DBuf dbeta(d, DType::kF32, {T, Hv});
+    DBuf dql2(d, actdt, {T, Hk, Dk});
+    DBuf dkl2(d, actdt, {T, Hk, Dk});
+    if (GlueFuseEnabled()) {
+      vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(),
+                      dconv.t(), araw, braw, a_log_dev, dt_bias_dev,
+                      vt::L2NormArgs{1e-6F});
     } else {
-      dss = GatherStateF32(d, state.ssm_state, pidx, ssm_row_elems,
-                           ss_shape);
-      const auto& p_his = *meta.prefill_has_initial_state;
-      const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
-      for (size_t s = 0; s < p_his.size(); ++s)
-        if (p_his[s] == 0)
-          d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
+      DBuf qf(d, actdt, {T, Hk, Dk});
+      DBuf kf(d, actdt, {T, Hk, Dk});
+      Tensor q2 = Reshape(qf.t(), {T, key_dim});
+      Tensor k2 = Reshape(kf.t(), {T, key_dim});
+      Tensor v2 = Reshape(vf.t(), {T, value_dim});
+      vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
+      vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw, braw, a_log_dev,
+                   dt_bias_dev);
+      vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
+      vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
     }
-    Tensor q_pre = SubView(dql2.t(), nd_tok, np_tok);
-    Tensor k_pre = SubView(dkl2.t(), nd_tok, np_tok);
-    Tensor v_pre = SubView(vf.t(), nd_tok, np_tok);
-    Tensor g_pre = SubView(dg.t(), nd_tok, np_tok);
-    Tensor b_pre = SubView(dbeta.t(), nd_tok, np_tok);
-    Tensor o_pre = SubView(dcore.t(), nd_tok, np_tok);
-    // Hand the CUDA chunked-prefill path the HOST query_start_loc (p_qsl, already
-    // materialized on the host by the GDN attention metadata build) so it skips
-    // the per-layer D2H copy + cudaStreamSynchronize that forced host↔GPU
-    // lockstep every GDN prefill layer (~67% GPU-idle in prefill). p_qsl outlives
-    // this call. Device-resident metadata, mirroring the decode StepDevInputs fix.
-    vt::GdnArgs gdn_args{scale};
-    gdn_args.query_start_loc_host = p_qsl.data();
-    if (indexed_state_io) {
-      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                     sdi.gdn_prefill_qsl.t(), gdn_args);
-      Tensor ssm_cache = state.ssm_state;
-      vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
-                          sdi.gdn_prefill_state_idx.t());
-    } else {
-      DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
-      vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre, dss.t(),
-                     dpqsl.t(), gdn_args);
-      ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems,
-                      ss_shape);
+    // scale = Dk^-0.5 (q only, inside the recurrence). dcore (recurrence
+    // output / core_attn_out) is bf16 under VT_GDN_OUT_BF16 —
+    // GdnDecode/GdnPrefill store Tout directly; otherwise use the f32 arm.
+    const int64_t ssm_row_elems = Hv * Dv * Dk;
+
+    // Recurrence — decode segment first (leading nd_tok tokens), then prefill.
+    if (nd > 0) {
+      // Decode recurrence IN PLACE on the persistent ssm_state at each sequence's
+      // slot (mirrors fla fused_recurrent ssm_state_indices) — no per-request
+      // gather+scatter (the other two host<->device copies per sequence per layer).
+      // Persistent metadata source (see the conv branch) for graph-replay safety.
+      // The persistent W1 buffer covers every non-spec request. A turnover step
+      // may have a leading decode subset followed by prefills, so both decode
+      // consumers must narrow the view to exactly `nd` state slots.
+      Tensor q_dec = SubView(dql2.t(), 0, nd_tok);
+      Tensor k_dec = SubView(dkl2.t(), 0, nd_tok);
+      Tensor v_dec = SubView(vf.t(), 0, nd_tok);
+      Tensor g_dec = SubView(dg.t(), 0, nd_tok);
+      Tensor b_dec = SubView(dbeta.t(), 0, nd_tok);
+      Tensor o_dec = SubView(dcore.t(), 0, nd_tok);
+      if (indexed_state_io) {
+        Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
+        Tensor ssm_cache = state.ssm_state;  // mutable view over the shared buffer
+        vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec,
+                      ssm_cache, vt::GdnArgs{scale}, &gidx);
+      } else {
+        VT_CHECK(nd_tok == nd,
+                 "row-copy GDN recurrence decode requires one token per request");
+        const auto& sidx = row_copy_decode_indices;
+        const std::vector<int64_t> ss_shape = {nd, Hv, Dv, Dk};
+        DBuf dss = GatherStateF32(d, state.ssm_state, sidx, ssm_row_elems,
+                                  ss_shape);
+        vt::GdnDecode(d.q, o_dec, q_dec, k_dec, v_dec, g_dec, b_dec,
+                      dss.t(), vt::GdnArgs{scale});
+        ScatterStateF32(d, state.ssm_state, dss, sidx, ssm_row_elems);
+      }
+    }
+    if (np > 0) {
+      const auto& pidx = *meta.prefill_state_indices;
+      const auto& p_qsl = *meta.prefill_query_start_loc;
+      // Gather the persistent ssm_state rows into an f32 working buffer
+      // (fp16/bf16 cache on CUDA → upcast; f32 cache → direct), run the f32
+      // chunked GdnPrefill, then downcast + scatter to the configured cache.
+      const std::vector<int64_t> ss_shape = {np, Hv, Dv, Dk};
+      DBuf dss(d, DType::kF32, ss_shape);
+      if (indexed_state_io) {
+        VT_CHECK(sdi.has_gdn_prefill_meta,
+                 "indexed GDN prefill requires persistent prefill metadata");
+        // Fuses indexing, compressed->F32, and fresh-request zeroing.
+        vt::GdnStateGather(d.q, dss.t(), state.ssm_state,
+                           sdi.gdn_prefill_state_idx.t(),
+                           &sdi.gdn_prefill_has_initial.t());
+      } else {
+        dss = GatherStateF32(d, state.ssm_state, pidx, ssm_row_elems,
+                             ss_shape);
+        const auto& p_his = *meta.prefill_has_initial_state;
+        const size_t rb = static_cast<size_t>(ssm_row_elems) * sizeof(float);
+        for (size_t s = 0; s < p_his.size(); ++s)
+          if (p_his[s] == 0)
+            d.b.Memset(d.q, static_cast<char*>(dss.ptr()) + s * rb, 0, rb);
+      }
+      Tensor q_pre = SubView(dql2.t(), nd_tok, np_tok);
+      Tensor k_pre = SubView(dkl2.t(), nd_tok, np_tok);
+      Tensor v_pre = SubView(vf.t(), nd_tok, np_tok);
+      Tensor g_pre = SubView(dg.t(), nd_tok, np_tok);
+      Tensor b_pre = SubView(dbeta.t(), nd_tok, np_tok);
+      Tensor o_pre = SubView(dcore.t(), nd_tok, np_tok);
+      // Hand the CUDA chunked-prefill path the HOST query_start_loc (p_qsl,
+      // already materialized by the GDN metadata build) so it skips the
+      // per-layer D2H copy + synchronization. p_qsl outlives this call.
+      vt::GdnArgs gdn_args{scale};
+      gdn_args.query_start_loc_host = p_qsl.data();
+      if (indexed_state_io) {
+        vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
+                       dss.t(), sdi.gdn_prefill_qsl.t(), gdn_args);
+        Tensor ssm_cache = state.ssm_state;
+        vt::GdnStateScatter(d.q, ssm_cache, dss.t(),
+                            sdi.gdn_prefill_state_idx.t());
+      } else {
+        DBuf dpqsl(d, DType::kI32, {np + 1}, p_qsl.data());
+        vt::GdnPrefill(d.q, o_pre, q_pre, k_pre, v_pre, g_pre, b_pre,
+                       dss.t(), dpqsl.t(), gdn_args);
+        ScatterStateF32(d, state.ssm_state, dss, pidx, ssm_row_elems);
+      }
     }
   }
 
@@ -3829,7 +4133,10 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
   // state indices) into persistent device buffers all layers read — replaces the
   // per-layer H2D re-uploads (the decode host-stall root; see StepDevInputs).
-  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+  const int64_t gdn_state_slots =
+      gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
+  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
+                                         gdn_state_slots);
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
   const bool fp4_attn = [&] {
@@ -3901,6 +4208,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
 static void CheckPagedForward(const std::vector<int32_t>& token_ids,
                               const std::vector<int32_t>& positions,
                               const CommonAttentionMetadata& attn_meta,
+                              const GDNAttentionMetadata& gdn_meta,
                               const std::vector<PagedKvCache>& attn_kv,
                               const std::vector<GdnStateCache>& gdn_state,
                               const Qwen3_5MoeWeights& weights,
@@ -3913,6 +4221,8 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: weights.layers size must equal num_hidden_layers");
   VT_CHECK(attn_meta.num_actual_tokens == T,
            "qwen3_5 paged forward: attn_meta.num_actual_tokens must equal T");
+  VT_CHECK(gdn_meta.num_actual_tokens == T,
+           "qwen3_5 paged forward: gdn_meta.num_actual_tokens must equal T");
   int64_t n_full = 0, n_gdn = 0;
   for (const auto& l : weights.layers)
     (l.is_linear_attention ? n_gdn : n_full) += 1;
@@ -3920,6 +4230,10 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: attn_kv count must equal full-attn layer count");
   VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
            "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
+  const int64_t state_slots =
+      detail::ValidateGdnStateCacheLayout(gdn_state);
+  detail::ValidateGdnAttentionMetadata(
+      gdn_meta, state_slots, /*allow_inert_padding=*/false);
 }
 
 // Transfer a freshly-produced [rows, vocab] device logits DBuf into an OWNING
@@ -3999,8 +4313,8 @@ std::vector<float> Qwen3_5Model::Forward(
     const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
     const HfConfig& config, vt::Queue& queue,
     const std::vector<int32_t>& logits_indices) {
-  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
-                    config);
+  CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                    gdn_state, weights, config);
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                              gdn_state, weights, config, logits_indices);
@@ -4019,8 +4333,8 @@ ForwardLogits Qwen3_5Model::ForwardDevice(
     const std::vector<GdnStateCache>& gdn_state, const Qwen3_5MoeWeights& weights,
     const HfConfig& config, vt::Queue& queue,
     const std::vector<int32_t>& logits_indices) {
-  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state, weights,
-                    config);
+  CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                    gdn_state, weights, config);
   Dev d{vt::GetBackend(queue.device.type), queue};
   DBuf dlogits = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                              gdn_state, weights, config, logits_indices);
@@ -4273,6 +4587,7 @@ std::vector<float> Qwen3_5MTPModel::ForwardLogitsHost(
 static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
                                    const std::vector<int32_t>& positions,
                                    const CommonAttentionMetadata& attn_meta,
+                                   const GDNAttentionMetadata& gdn_meta,
                                    const std::vector<PagedKvCache>& attn_kv,
                                    const std::vector<GdnStateCache>& gdn_state,
                                    const Qwen3_5DenseWeights& weights,
@@ -4286,12 +4601,18 @@ static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
            "num_hidden_layers");
   VT_CHECK(attn_meta.num_actual_tokens == T,
            "qwen3_5 dense paged forward: attn_meta.num_actual_tokens must equal T");
+  VT_CHECK(gdn_meta.num_actual_tokens == T,
+           "qwen3_5 dense paged forward: gdn_meta.num_actual_tokens must equal T");
   int64_t n_full = 0, n_gdn = 0;
   for (const auto& l : weights.layers) (l.is_linear_attention ? n_gdn : n_full) += 1;
   VT_CHECK(static_cast<int64_t>(attn_kv.size()) == n_full,
            "qwen3_5 dense paged forward: attn_kv count must equal full-attn layers");
   VT_CHECK(static_cast<int64_t>(gdn_state.size()) == n_gdn,
            "qwen3_5 dense paged forward: gdn_state count must equal GDN layers");
+  const int64_t state_slots =
+      detail::ValidateGdnStateCacheLayout(gdn_state);
+  detail::ValidateGdnAttentionMetadata(
+      gdn_meta, state_slots, /*allow_inert_padding=*/false);
 }
 
 // Dense embed (27B): hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident
@@ -4349,7 +4670,10 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
-  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta);
+  const int64_t gdn_state_slots =
+      gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
+  StepDevInputs sdi = BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
+                                         gdn_state_slots);
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (the real 27B W4A4 => ON; bf16/GGUF dense => OFF; env overrides).
   const bool fp4_attn = [&] {
@@ -4406,8 +4730,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const Qwen3_5DenseWeights& weights,
                              const HfConfig& config,
                              const std::vector<int32_t>& logits_indices) {
-  CheckDensePagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
-                         weights, config);
+  CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                         gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
   DBuf hidden(d, DType::kBF16, {T, H});
@@ -4691,6 +5015,8 @@ struct Qwen3_5DecodeGraph::Impl {
       gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
       gdn_meta.num_decodes = gm.num_decodes;
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
+      gdn_meta.num_spec_decodes = gm.num_spec_decodes;
+      gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
       gdn_meta.num_actual_tokens = gm.num_actual_tokens;
     }
   };
@@ -4722,11 +5048,12 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state) {
-  CheckPagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
-                    impl_->weights, impl_->config);
+  CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                    gdn_state, impl_->weights, impl_->config);
+  const int64_t B = static_cast<int64_t>(token_ids.size());
+  detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
-  const int64_t B = static_cast<int64_t>(token_ids.size());
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -4737,7 +5064,9 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // guarantees the sampler's later reads see the replay's writes; the next
   // same-size replay overwrites the buffer, so in-place sampler mutation is safe.
   const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0) {
+  if (!impl_->enabled || S < 0 ||
+      !detail::CanUseGdnDecodeGraphSize(
+          B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                           gdn_state, impl_->weights, impl_->config);
     // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
@@ -4888,6 +5217,8 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       gdn_meta.num_prefill_tokens = gm.num_prefill_tokens;
       gdn_meta.num_decodes = gm.num_decodes;
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
+      gdn_meta.num_spec_decodes = gm.num_spec_decodes;
+      gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
       gdn_meta.num_actual_tokens = gm.num_actual_tokens;
     }
   };
@@ -4920,11 +5251,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     const v1::GDNAttentionMetadata& gdn_meta,
     const std::vector<PagedKvCache>& attn_kv,
     const std::vector<GdnStateCache>& gdn_state) {
-  CheckDensePagedForward(token_ids, positions, attn_meta, attn_kv, gdn_state,
-                         impl_->weights, impl_->config);
+  CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
+                         gdn_state, impl_->weights, impl_->config);
+  const int64_t B = static_cast<int64_t>(token_ids.size());
+  detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
-  const int64_t B = static_cast<int64_t>(token_ids.size());
   const int64_t vocab = impl_->config.vocab_size;
   const int64_t H = impl_->config.hidden_size;
 
@@ -4933,7 +5265,9 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // (first B rows are the real requests). Stream ordering guarantees the sampler
   // sees the replay's writes; the next same-size replay overwrites the buffer.
   const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
-  if (!impl_->enabled || S < 0) {
+  if (!impl_->enabled || S < 0 ||
+      !detail::CanUseGdnDecodeGraphSize(
+          B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
     DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
                                gdn_state, impl_->weights, impl_->config, {});
     return WrapDeviceLogits(d, std::move(lg), vocab);

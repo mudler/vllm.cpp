@@ -171,6 +171,7 @@ TEST_CASE("HfConfigFromGguf reads the qwen35moe hparams") {
   CHECK(c.shared_expert_intermediate_size == 6);
   CHECK(c.linear_num_key_heads == 2);
   CHECK(c.linear_num_value_heads == 2);
+  CHECK(c.mamba_ssm_dtype == "float32");
   CHECK(c.linear_key_head_dim == 4);
   CHECK(c.linear_value_head_dim == 4);
   CHECK(c.linear_conv_kernel_dim == 3);

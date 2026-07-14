@@ -28,10 +28,12 @@ attribution ranks fused SiLU→FP4 at +0.357354 ms/window, normal BF16→FP4 at
 Normal W3-H2 is displaced. The dedicated
 [W3-I spike](nvfp4-fused-silu-producer.md) is now accepted: generated compiler
 zeroing, executed launch geometry and local/vLLM 1,480/384-instruction SASS
-bodies are grounded. Default-off I1 now passes dirty-root correctness, safety,
-both-model and SASS preflight; immutable paired trace and its complete c2/c16
-component remain mandatory. No ratio, speed credit, exact grid, or 35B
-performance is authorized meanwhile.
+bodies are grounded. Default-off I1 is structurally accepted at clean
+`15c6b89`: exact CUDA/operator/memcheck/model/SASS and paired 27B/35B traces
+pass. Its packed graph body plus required zeroing takes **3.839808 ms** versus
+fallback **6.064064 ms**, down **36.68%**. The complete c2/c16 component remains
+mandatory. No ratio, speed credit, exact grid, or 35B performance is authorized
+meanwhile.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -237,8 +239,8 @@ reported as a clean dependency check.
 6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
    gain÷effort, and drive the top traced lever through its owning row. H1d
    selects fused SiLU→FP4 ahead of normal production in 12/12 reports. W3-I0
-   completes its whole-chain spike; default-off I1 is implemented and must now
-   pass immutable paired trace plus all 48 component axes.
+   completes its whole-chain spike; default-off I1 passes immutable structural
+   gates and must now pass all 48 component axes.
    W3-B already closes the original wide FP4 tactic-family mismatch; do not
    infer speed credit from cross-profiler attribution while exact TPOT/ITL and
    host-memory axes remain red.

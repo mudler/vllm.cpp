@@ -1,8 +1,7 @@
 # NVFP4 fused SiLU→FP4 producer (W3-I)
 
-Status: **ACTIVE — W3-I1 implemented behind a default-off rollback toggle;
-dirty-root correctness/safety/model/SASS preflight passes, immutable trace and
-performance remain pending**
+Status: **ACTIVE — W3-I1 is structurally accepted at clean `15c6b89` behind a
+default-off rollback toggle; the complete c2/c16 component remains pending**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -145,7 +144,7 @@ in the accepted production trace and do not block the first specialization.
 | Leaf | Deliverable | State |
 |---|---|---|
 | W3-I0 | source, generated-code, SASS, executed-trace, dispatch, test, dependency and gate inventory | **COMPLETE in this spike** |
-| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **IMPLEMENTED / PREFLIGHT PASS; IMMUTABLE TRACE + COMPONENT PENDING** |
+| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **IMPLEMENTED / IMMUTABLE STRUCTURE PASS; 48-AXIS COMPONENT PENDING** |
 | W3-I2 | if a post-I1 trace shows per-call zeroing is material, aggregate/fuse scale initialization at the model/graph lifecycle seam to mirror the generated vLLM zero kernel | **INVENTORIED; prohibited before I1 classification** |
 | W3-I3 | upstream approximate-reciprocal numeric mode plus FP16 packed input, independently correctness/performance-gated | **INVENTORIED** |
 | W3-I4 | two-input and expert-offset packed breadth, each with the matching upstream tests | **INVENTORIED** |
@@ -156,29 +155,28 @@ producer matches Inductor's multi-buffer fusion. The trace must count those
 nodes explicitly. W3-I2 exists only if that measured topology is the next
 largest local residual.
 
-## W3-I1 preflight checkpoint
+## W3-I1 current checkpoint
 
-This is dirty-root development evidence at
-`~/work/vllm.cpp-w3i-preflight/29a30eb-dirty`, not immutable benchmark credit.
-It permits publication and a clean commit-bound rerun only.
+The immutable source/build/trace root is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2`.
+It is detached at exact clean commit `15c6b8933d982019aa8965d218deb0eb1d9dc3f4`.
+All CUDA series below ran uncontended under GPU ownership.
 
 | Gate | Result |
 |---|---|
-| CUDA-off build and suite | **PASS — 106/106 CTest** |
-| CUDA candidate OFF / ON | **PASS — 22/22 cases and 26,916/26,916 assertions per arm**; logs are byte-identical, SHA `1681b723…90e7` |
+| Build provenance | **PASS — 158/158 CUDA targets** with CUDA 13.0.88, sm_121a, external FlashInfer CUTLASS, vendored Triton AOT and FA2; configure/build log SHA `c8e131d4…0d1c` / `f1d76f28…8f07` |
+| CUDA candidate OFF / ON | **PASS — 22/22 cases and 26,916/26,916 assertions per arm**; immutable logs are byte-identical, SHA `d51911e6…5aca` |
 | Capture, poisoned padding, production M classes, alignment fallback | **PASS** in the focused operator suite |
-| Strict memcheck | **PASS — 22/22, 26,916/26,916, zero errors, zero leaks** with `VT_CUTLASS_NOPOOL=1`; log SHA `cca0b0d8…173c` |
-| 27B candidate / fallback | **PASS — 235/235 + 16/16 each**, one frozen 64/64 plan map; identical log SHA `468ea71b…7346` |
-| 35B candidate-on correctness-only inertness | **PASS — 2/2 + 315/315**; log SHA `953eb932…d7ba`; dispatch-zero proof remains a trace obligation |
-| Packed compiled body | object SHA `7a620f4e…206`: **816 instructions, 36 registers, zero stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte store, eight packed E2M1 conversions** |
-| Paired graph trace / c2+c16 component | **PENDING — no rate or lifecycle credit** |
+| Strict memcheck | **PASS — 22/22, 26,916/26,916, zero errors, zero leaks** with `VT_CUTLASS_NOPOOL=1`; log SHA `3aebdc8c…6964` |
+| 27B candidate / fallback | **PASS — 235/235 + 16/16 each**, one frozen 64/64 plan map; immutable logs are byte-identical, SHA `8b150a2f…8670` |
+| 35B candidate-on correctness + inertness | **PASS — 2/2 + 315/315**; log SHA `fba79fbb…65f1`; paired trace contains **zero** W3-I calls |
+| Packed compiled body | object/SASS SHA `d6ca771b…65bb` / `662f2c54…4102`: **816 instructions, 36 registers, zero stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte store, eight packed E2M1 conversions** |
+| Paired 27B graph trace | **PASS — 896/896** eligible graph calls use the packed body, with **896** explicit 139,264-byte zero nodes and no scalar call. Fallback fused slice is **6.064064 ms**; candidate body + zero is **3.839808 ms**, down **36.68%**. Allocation/free/sync/capture/copy counts are identical |
+| c2+c16 component | **PENDING — no rate or speed credit**; immutable driver SHA `0f08750f…ae1b` |
 
-The first candidate run exposed the one intentional local semantic delta from
-raw Blackwell conversion: hardware E2M1 preserves negative zero while the
-established exact-mode reference canonicalizes it. I1 retains packed hardware
-conversion and clears only sign bits on zero-magnitude nibbles branch-free;
-candidate and fallback bytes then match exactly. The failed pre-fix run is
-diagnostic only and contributes no correctness or speed evidence.
+Negative zero is part of the byte-exact semantic contract: packed hardware
+conversion is retained, then zero-magnitude nibbles have their sign bit cleared
+branch-free to match the established exact-mode fallback.
 
 ## Tests to port and extend
 
@@ -239,11 +237,13 @@ A positive mean with any red axis is a failed component. A passing component
 authorizes the exact vLLM v0.25.0 27B 124-axis grid; it does not itself replace
 the binding result. Only **124/124** closes 27B and authorizes 35B performance.
 
-The handoff command is the existing online-gate driver with the binding
-environment from `docs/BENCHMARKS.md`, once with
-`VT_FP4_FUSED_VEC=0` and once with `VT_FP4_FUSED_VEC=1`, under the same binary,
-plan fixture, corpus, port allocation, lock, and interleaving manifest. The
-result root is SHA-owned and immutable; partial or contended output is `VOID`.
+The preflighted driver is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver.sh`,
+SHA-256 `0f08750f540c456d8e1487f63a9367fc2f66584194a89aafb41202efcab9ae1b`.
+It runs `VT_FP4_FUSED_VEC=1` versus `0` against frozen native-plan document
+SHA `2590fc94…199d`, under the same binary, corpus, port allocation, one GPU
+lock, and AB/BA/AB manifest. The result root is SHA-owned and immutable;
+partial or contended output is `VOID`.
 
 ## Dependencies and risks
 

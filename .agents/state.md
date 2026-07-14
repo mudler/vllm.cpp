@@ -7589,3 +7589,78 @@ checkpoint, clean-build its exact SHA, then require paired candidate/fallback
 graph traces before the complete c2/c16 **40 timing + 8 memory** component.
 Binding `3f256ab` remains **55/124 pass, 69 fail**; no rate, exact-grid
 authorization or 35B performance result exists, and W3-I2+ remains prohibited.
+
+## 2026-07-13 — W3-I1 immutable structural gate passes; component staged
+
+The first publication setup root,
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4`,
+is **VOID / setup-only**: cloning from the dirty preflight tree rewrote its
+origin to that local source and left it at stale `c498a413`. It has no build
+tree and no GPU command ran. The retained immutable root is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2`,
+detached and clean at exact published commit
+`15c6b8933d982019aa8965d218deb0eb1d9dc3f4`.
+
+CUDA 13.0.88, GCC 13.3, sm_121a, RelWithDebInfo, external FlashInfer CUTLASS,
+vendored Triton AOT, FA2 and profile-control configuration passes; all **158/158
+targets** build. Configure/build log SHA-256 values are
+`c8e131d4d2b08bc95eb114a4614be6b894d7fa16d0779bf18aa207ed005f0d1c` /
+`f1d76f281ed5b99461a49a73bd6e1cd957d240284a077c811f1a4e47706a8f07`.
+Under one uncontended `/tmp/gpu` window, fallback and candidate operator suites
+each pass **22/22 + 26,916/26,916** with byte-identical log SHA
+`d51911e6e523c05e31628f16589fe6ddb09fb99fb987d57c78dade807e2c5aca`.
+Candidate strict full memcheck with `VT_CUTLASS_NOPOOL=1` passes the same suite
+with **zero errors / zero leaks** (SHA
+`3aebdc8ca75ffef78a91cd958b142f331e7f410b12e37abfc195bf3e90726964`).
+Both 27B arms load the same 64 FlashInfer plans, tune/save zero and pass
+**235/235 + 16/16** with identical log SHA
+`8b150a2fa6cba21bca8bf9981d054767d4221c70c7177c1279287100f3b28670`.
+Candidate-on 35B passes **2/2 + 315/315** (SHA
+`fba79fbb730bf2964b878f61d32d175b25b21378db43256687baf1ab0dbb65f1`).
+
+The commit-bound CUDA object SHA is
+`d6ca771b3f00922d13d76eba0ab270bce90ef03cb9030591fdf5e1498a0565bb`.
+Exact packed-body SASS SHA
+`662f2c54aba5fc79e6a795d16d153524540cf46817226f7220aeb67a7d7a4102`
+contains **816 instructions, 36 registers, zero stack/local/shared, two 256-bit
+loads, one 64-bit output store, one scale-byte store and eight E2M1
+conversions**.
+
+Paired full-process 27B Nsight traces pass the same **235/235 + 16/16** model
+gate. Fallback report/SQLite SHA are `488770b15ee6924b25bbd9d9a6b6ad52e58651e2200f42c5f092ca2b2fab5b6b` /
+`fa81299016dd2ff17782f0f47d2768995e6cc64554dccf008e55ab4eddcb454e`;
+candidate SHA are `a1621e3c697faea7a7c153203a73ed9be1cb2f6fb5b17b3e27a22b0f082a47e3` /
+`1310981c4f23cfd6d5fbbb0606719f36717aae9173e7bb9197bde9050d15f9c6`.
+Fallback executes 1,088 scalar fused calls: 896 graph calls total **6.064064
+ms** plus 192 eager/prewarm calls. Candidate executes 1,088 packed calls and
+zero scalar calls: 896 graph calls total **2.747840 ms**, plus exactly 896
+graph scale memsets totaling **1.091968 ms**. The comparable graph slice is
+therefore **3.839808 vs 6.064064 ms**, down **2.224256 ms / 36.68%**, or about
+**0.158875 ms per each of 14 graph forwards**. Candidate geometry is 960 calls
+at grid `(1,3)` / block 512 (896 graphed), 64 at `(9,3)`, and 64 at `(48,3)`;
+every scale memset byte count matches its shape.
+
+Both 27B traces have identical runtime lifecycle counts: 14 graph launches,
+1,564/1,445 synchronous allocations/frees, 17/1 async allocations/frees, 34
+stream synchronizations and one begin/end capture. During capture each has only
+the same seven expected async copies and zero allocation/free/synchronization;
+graph copies are 84 H2D + 14 D2D and zero D2H. The only severity-3 diagnostic
+in either full-process trace is the identical known unsupported Unified Memory
+trace notice; there is no missing-event diagnostic. The 35B candidate trace
+passes **2/2 + 315/315**, has 28 graph launches and **zero** fused W3-I kernel
+rows. Its report/SQLite/log SHA are
+`dd92270b2bc6f2fded8ea71fe4d63acdc7c8bc38e3c32b8093e7affd2ac19ca7` /
+`7a4abf1c5207acf8f3aaaf62c150a35a2a5ea8e55c7a50b70db15d66c61f8fab` /
+`3d2d4e689da8203afb21420d4c78137399e45075ec9ab1aea8e79d8c822f1b25`.
+
+This closes W3-I1 correctness, safety, SASS, dispatch, capture/lifecycle and
+35B-inertness gates. It is diagnostic structural evidence only: profiler
+whole-process time is warmup/prefill contaminated and no throughput, latency or
+memory ratio binds. The c2/c16 AB/BA/AB driver is staged at the immutable root,
+SHA `0f08750f540c456d8e1487f63a9367fc2f66584194a89aafb41202efcab9ae1b`,
+with frozen native plan document SHA `2590fc94…199d`; syntax, clean source,
+idle port/GPU and free lock preflights pass. It will run both model gates and
+all **40 timing + 8 memory** axes under one lock. Binding `3f256ab` remains
+**55/124**; no exact grid, W3-I2, or 35B performance is authorized. Live
+surfaces replace the preflight checkpoint with this current snapshot; detailed
+chronology remains only here and in the ledger.

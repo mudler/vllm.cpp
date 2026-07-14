@@ -8,16 +8,13 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-13**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The latest schema-v5 DGX run at clean `c498a413` is **accepted diagnostic
-evidence**. Validator `7112864` revalidates exact build/correctness provenance,
-three independent 48/48 + 16/16 local sessions, all 12 lossless reports, and
-the paired vLLM trace. Final status SHA is `84d15970…6e66` with `passed=true`;
-local output non-repeatability remains explicit and non-fatal after the model
-gate. The fused SiLU→FP4 producer is the largest positive mapped residual, so
-normal-producer W3-H2 is displaced. W3-I1 is now implemented behind default-off
-`VT_FP4_FUSED_VEC=1`. Dirty-root operator, sanitizer and both-model correctness
-preflight passes, but commit-bound trace and the c2/c16 component have not run;
-no binding speed number changed.
+W3-H's accepted trace selects fused SiLU→FP4 as the largest positive mapped
+residual. W3-I1 is now **structurally accepted** at clean `15c6b89`: the exact
+CUDA build, operator/sanitizer/model gates, commit-bound SASS, and paired
+27B/35B traces pass. Its packed graph body plus required scale zeroing is
+**36.68% shorter** than the fallback fused slice. That is diagnostic evidence,
+not an end-to-end ratio; the complete c2/c16 component is still pending and no
+binding speed number changed.
 
 ## Binding 27B online gate
 
@@ -66,7 +63,7 @@ authorized until all 124 27B axes pass.
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
 | W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
-| W3-I fused SiLU→FP4 producer | **ACTIVE / PREFLIGHT PASS; TRACE + PERFORMANCE PENDING** | Default-off [W3-I1](../.agents/specs/nvfp4-fused-silu-producer.md) ports the BF16/direct-swizzled packed body with explicit scale pre-zero and scalar fallback. Dirty-root preflight: CPU **106/106**; candidate OFF/ON CUDA **22/22 + 26,916/26,916** each; strict no-pool memcheck **0 errors / 0 leaks**; both 27B arms **235/235 + 16/16** with identical 64/64 plans; 35B correctness **2/2 + 315/315**. Candidate SASS is **816 instructions / 36 registers / two 256-bit loads / one 64-bit store**. No same-binary rate exists | Publish and rebuild the immutable commit; paired graph trace must prove 64 eligible packed calls, explicit zero nodes, no scalar fallback/capture lifecycle regression, then run all c2/c16 **40 timing + 8 memory** axes |
+| W3-I fused SiLU→FP4 producer | **ACTIVE / STRUCTURE PASS; PERFORMANCE PENDING** | Clean `15c6b89`: CUDA build **158/158 targets**; candidate OFF/ON operator **22/22 + 26,916/26,916** each; strict no-pool memcheck **0 errors / 0 leaks**; both 27B arms **235/235 + 16/16**; 35B **2/2 + 315/315**. SASS is **816 instructions / 36 registers / two 256-bit loads / one 64-bit output store**. Paired trace proves **896/896** eligible graph calls use the packed body, **896** matching zero nodes, unchanged capture/runtime lifecycle, and zero W3-I calls on 35B. No same-binary rate exists | Run all c2/c16 **40 timing + 8 memory** axes with the immutable driver below |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
@@ -83,11 +80,41 @@ digests diagnostic. Passing status SHA is `84d15970…6e66`; canonical node
 multiset SHA is `c357867c…68b`. Superseded attempts and detailed hashes remain only in the
 [parity ledger](../.agents/parity-ledger.md) and [state log](../.agents/state.md).
 
-The exact calibration evidence is
-`~/work/vllm.cpp-nsys-calibration/0d56a238b8bec12435666cb77f32d8d6001425b20a97dfc5bc242bd75742739b`;
-the probe source SHA is `0d56a238…39b`, bounded no-reset report/SQLite SHA are
-`e7ea3c3b…37d5e` / `4de65c02…9da2`, and clean full-process report/SQLite SHA
-are `b6dc8a09…119a` / `7591dec7…1efc`.
+### W3-I1 immutable structural result
+
+The current root is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2`.
+The fallback/candidate Nsight report SHA-256 values are `488770b1…5b6b` /
+`a1621e3c…47e3`; their SQLite SHA-256 values are `fa812990…454e` /
+`1310981c…f9c6`. The commit-bound object/SASS SHA-256 values are
+`d6ca771b…65bb` / `662f2c54…4102`.
+
+| Graph slice across 14 forwards | Fallback | Packed candidate |
+|---|---:|---:|
+| Logical fused-producer calls | 896 | 896 |
+| Fused body | 6.064064 ms | 2.747840 ms |
+| Required explicit scale zeroing | integrated in scalar body | 1.091968 ms / 896 nodes |
+| Comparable fused slice | **6.064064 ms** | **3.839808 ms** |
+
+The comparable slice falls by **2.224256 ms / 36.68%**, or about
+**0.158875 ms per forward**. Both traces record 14 graph launches, identical
+allocation/free/synchronization counts, and only the same seven expected
+`cudaMemcpyAsync` calls during capture; graph copies are identical and contain
+no D2H. The 35B candidate trace (report/SQLite SHA `dd92270b…9ca7` /
+`7a4abf1c…f8fa`) passes correctness and contains zero W3-I kernel calls.
+Whole-process profiler duration is intentionally not treated as a rate.
+
+Run the pending component with the preflighted immutable driver. It owns one
+`/tmp/gpu` lock for both model gates and all 12 AB/BA/AB legs; exit 0 means all
+48 axes pass, while exit 1 after a complete evidence tree means strict failure.
+
+```sh
+ssh dgx.casa \
+  '$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver.sh'
+```
+
+Driver SHA-256 is `0f08750f…ae1b`; its frozen native-plan document is
+`2590fc94…199d`. Partial output is never binding.
 
 ### Executed-path diagnostic ranking
 
@@ -109,10 +136,10 @@ SHA-256 `7c323248…2456`.
 
 The fused-producer delta exceeds the normal-producer delta in every one of the
 12 reports, so the W3-H contract displaced normal W3-H2. W3-I0 completed the
-required source/generated-code/SASS/test inventory and W3-I1 now has a
-preflight-green default-off implementation; it still contributes no benchmark
-ratio. The negative whole-window
-delta is consistent with c16 total throughput already passing; it does not
+required source/generated-code/SASS/test inventory and W3-I1 now passes its
+immutable structural gate; it still contributes no benchmark ratio. The
+negative whole-window delta is consistent with c16 total throughput already
+passing; it does not
 explain or close the binding low-concurrency and host-memory failures.
 
 ## Current component dispositions

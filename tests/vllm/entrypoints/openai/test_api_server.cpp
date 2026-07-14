@@ -29,6 +29,21 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
+// SERVE-HTTP-TRANSPORT: the behavioral TCP_NODELAY assertion reads the accepted
+// server socket's options in-process via /proc/self/fd (Linux only; the CPU
+// test tier runs on Linux).
+#if defined(__linux__)
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#include <cstring>
+#endif
+
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
@@ -352,6 +367,53 @@ struct ServerHarness {
   OpenAIServingChat chat;
   ApiServer server;
 };
+
+#if defined(__linux__)
+// Locate the ApiServer's accepted connection socket in this process and read its
+// TCP_NODELAY. The test client and the server share one process (the server runs
+// on a background thread over loopback), so the accepted socket fd is
+// discoverable: it is the AF_INET socket whose local port is the server's listen
+// port and whose peer port is the client's ephemeral port. That pair uniquely
+// distinguishes it from the listening socket (which has no peer → getpeername
+// fails) and from the client socket (whose local port is the client port).
+// Returns the getsockopt TCP_NODELAY value, or -1 if the socket is not found.
+int AcceptedSocketTcpNoDelay(int server_port, int client_port) {
+  DIR* dir = opendir("/proc/self/fd");
+  if (dir == nullptr) return -1;
+  int result = -1;
+  for (struct dirent* entry; (entry = readdir(dir)) != nullptr;) {
+    char* end = nullptr;
+    const long fd = std::strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0') continue;
+
+    sockaddr_in local{};
+    socklen_t local_len = sizeof(local);
+    if (getsockname(static_cast<int>(fd),
+                    reinterpret_cast<sockaddr*>(&local), &local_len) != 0)
+      continue;
+    if (local.sin_family != AF_INET) continue;
+    if (static_cast<int>(ntohs(local.sin_port)) != server_port) continue;
+
+    sockaddr_in peer{};
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(static_cast<int>(fd),
+                    reinterpret_cast<sockaddr*>(&peer), &peer_len) != 0)
+      continue;  // listening socket has no peer
+    if (peer.sin_family != AF_INET) continue;
+    if (static_cast<int>(ntohs(peer.sin_port)) != client_port) continue;
+
+    int nodelay = -1;
+    socklen_t opt_len = sizeof(nodelay);
+    if (getsockopt(static_cast<int>(fd), IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                   &opt_len) == 0) {
+      result = nodelay;
+    }
+    break;
+  }
+  closedir(dir);
+  return result;
+}
+#endif  // defined(__linux__)
 
 }  // namespace
 
@@ -999,4 +1061,65 @@ TEST_CASE("api_server: legacy worker pool is an explicit diagnostic mode") {
       ApiServer::kDefaultMaxConcurrentStreams,
       ApiServer::HttpWorkerPoolMode::kLegacyDynamic);
   CHECK(legacy.http_worker_count() == 0);
+}
+
+// SERVE-HTTP-TRANSPORT: mirror uvicorn/asyncio's default TCP_NODELAY on the
+// accepted SSE-serving socket. vLLM serves through uvicorn over asyncio
+// (`vllm/entrypoints/launcher.py:71,76`), and CPython asyncio disables Nagle on
+// every accepted TCP stream socket (`asyncio/base_events.py:192-197`
+// `_set_nodelay`, called from `asyncio/selector_events.py:950`). cpp-httplib
+// defaults it off (`third_party/httplib/httplib.h:142`) and applies it to the
+// accepted socket only when `tcp_nodelay_` is set (`httplib.h:12083`). This
+// asserts the observable server-side transport effect, not the presence of the
+// production call.
+TEST_CASE(
+    "api_server: accepted SSE socket has TCP_NODELAY (mirror uvicorn/asyncio)") {
+#if defined(__linux__)
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  const int port = h.server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&h]() { h.server.serve(); });
+  for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(h.server.is_running());
+
+  // A raw client socket (not httplib::Client) so the accepted server socket is
+  // discoverable by matching the client's ephemeral peer port.
+  const int client_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(client_fd >= 0);
+  sockaddr_in server_addr{};
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(static_cast<uint16_t>(port));
+  REQUIRE(inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) == 1);
+  REQUIRE(::connect(client_fd, reinterpret_cast<sockaddr*>(&server_addr),
+                    sizeof(server_addr)) == 0);
+
+  // Drive one keep-alive request: the server accepts, applies its socket
+  // options, answers, and parks the accepted socket in its keep-alive read loop
+  // (the fd stays open for the scan below).
+  const std::string request =
+      "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n";
+  REQUIRE(::send(client_fd, request.data(), request.size(), 0) ==
+          static_cast<ssize_t>(request.size()));
+  char buf[512];
+  const ssize_t got = ::recv(client_fd, buf, sizeof(buf), 0);
+  REQUIRE(got > 0);  // a served response proves the accept already happened
+
+  sockaddr_in client_local{};
+  socklen_t client_local_len = sizeof(client_local);
+  REQUIRE(getsockname(client_fd, reinterpret_cast<sockaddr*>(&client_local),
+                      &client_local_len) == 0);
+  const int client_port = static_cast<int>(ntohs(client_local.sin_port));
+
+  const int nodelay = AcceptedSocketTcpNoDelay(port, client_port);
+  REQUIRE(nodelay >= 0);  // accepted socket was located
+  CHECK(nodelay == 1);    // RED until ApiServer calls set_tcp_nodelay(true)
+
+  ::close(client_fd);
+  h.server.stop();
+  server_thread.join();
+#endif  // defined(__linux__)
 }

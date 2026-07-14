@@ -57,6 +57,16 @@ struct ApiServer::Impl {
         return new httplib::ThreadPool(workers);
       };
     }
+    // Mirror vLLM's serving transport: vLLM serves through uvicorn over asyncio
+    // (entrypoints/launcher.py:71,76), and asyncio disables Nagle on every
+    // accepted TCP stream socket by default (CPython asyncio/base_events.py
+    // _set_nodelay → setsockopt(IPPROTO_TCP, TCP_NODELAY, 1), invoked from
+    // selector_events.py _SelectorSocketTransport). cpp-httplib defaults it off
+    // (third_party/httplib/httplib.h:142) and applies it to the accepted socket
+    // only when tcp_nodelay_ is set (httplib.h:12083). Per-token SSE frames are
+    // tiny writes, so enabling TCP_NODELAY here puts each streamed frame on the
+    // wire immediately instead of coalescing it under Nagle/delayed-ACK.
+    server.set_tcp_nodelay(true);
   }
 
   httplib::Server server;

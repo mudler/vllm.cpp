@@ -9403,3 +9403,56 @@ case, make the minimal repair, pass CPU/CUDA correctness gates (both model
 gates included), then create another fresh SHA/root and rerun the entire
 twelve-leg one-lock component accepting only a verified marker-last terminal
 status.
+
+## 2026-07-14 — SERVE-HTTP-TRANSPORT: mirror uvicorn/asyncio TCP_NODELAY on the SSE transport
+
+Landed lever #1 of the 2026-07-14 parity rescan (kernel-independent host
+workstream, in parallel with the c16 diagnostic track). New engine-matrix row
+`SERVE-HTTP-TRANSPORT` + spike `specs/serve-tcp-nodelay.md` +
+`CLAIM-SERVE-TRANSPORT-1`.
+
+Grounding (verified locally, not inferred): vLLM serves the OpenAI API through
+uvicorn over asyncio (`vllm/entrypoints/launcher.py:71,76`,
+`vllm/entrypoints/openai/api_server.py:591,630`). uvicorn does NOT set
+TCP_NODELAY itself — it calls `loop.create_server` (`uvicorn/server.py:144`,
+uvicorn 0.49.0 local) — and CPython asyncio disables Nagle on every accepted TCP
+stream socket: `asyncio/base_events.py:192-197` `_set_nodelay(sock)` →
+`setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)`, called from
+`asyncio/selector_events.py:950` `_SelectorSocketTransport.__init__` (CPython
+3.12.3 local; version-invariant). Our cpp-httplib defaulted Nagle on
+(`third_party/httplib/httplib.h:142` `CPPHTTPLIB_TCP_NODELAY false`; applied on
+accept only when `tcp_nodelay_` is set, `httplib.h:12083`) and no
+`set_tcp_nodelay(true)` call existed. MIRROR policy → we now call it.
+
+Test approach chosen: (a) BEHAVIORAL socket-level assertion, not the (b)
+source-text contract pin. The test client and the loopback `ApiServer` share one
+process, so the accepted server socket fd is discoverable in-process via
+`/proc/self/fd` by matching (server local port, client ephemeral peer port);
+`getsockopt(fd, IPPROTO_TCP, TCP_NODELAY)` then reads the observable effect. No
+vendored-httplib change and no test-only production hook.
+`tests/vllm/entrypoints/openai/test_api_server.cpp:1076` (helper `:380`).
+
+RED evidence (before the one-liner): the new case located the accepted socket
+(`REQUIRE(nodelay >= 0)` passed) and `CHECK(nodelay == 1)` failed with
+`values: CHECK( 0 == 1 )` — accepted-socket TCP_NODELAY was 0 (Nagle on).
+Implementation: `server.set_tcp_nodelay(true)` in the ApiServer setup
+(`src/vllm/entrypoints/openai/api_server.cpp:69`). GREEN: the same case passes
+(`0` → `1`) and the full `test_openai_api_server` target is 22/22 cases (all
+green; the assertion total is SSE/concurrency data-dependent, ~242-272); clean
+`-Werror` build (`build-tcpnodelay-cpu`,
+`-DVLLM_CPP_SERVER=ON`). Record gates: `scripts/check-agent-record.py`,
+`tests/scripts/test_agent_record.py`, `tests/scripts/test_doc_checkpoint.py`,
+and `scripts/check-doc-checkpoint.py` pass; `ENGINE_ROWS` bumped 104→105 and the
+engine summary refreshed (Serving Rows 18→19 / ACTIVE 1→2; Total 104→105 /
+ACTIVE 2→3) to keep the invariant accurate (not weakened).
+
+PENDING (not done, deliberately): the single non-binding localhost SSE A/B
+sizing — the GPU is held by the c16 diagnostic; nothing was run on dgx. Binding
+parity-axis credit comes ONLY from the authorized exact-grid rerun under
+`CLAIM-SERVE-GATE-1`. DEVIATION: the checkpoint brief asked for state `GATING`,
+but the record checker forbids a coordination claim from referencing a
+non-SPIKE/ACTIVE row; since `CLAIM-SERVE-TRANSPORT-1` is required and open (the
+sizing is pending), the row is `ACTIVE` and converges to `GATING` on release.
+Substance is exactly "implemented + CPU-tested, GPU sizing pending". No
+lifecycle state of any other row, benchmark ratio, or speed credit changed;
+`benchmark_binding=false`.

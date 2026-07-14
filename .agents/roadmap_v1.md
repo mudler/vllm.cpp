@@ -53,9 +53,14 @@ kernels are collectively net faster than vLLM's on the only per-kernel window
 (−3.579 ms), and the 69 failing axes decompose into c2–c8 decode latency
 (52.2% + 24.3% coupled) plus host memory (23.6%). Consequences: (a) the c16
 diagnostic → component chain stays first; (b) two kernel-independent host
-workstreams start in parallel — **TCP_NODELAY on the SSE server** (confirmed
-unset in cpp-httplib while vLLM's uvicorn enables it; spike required before
-ACTIVE) and the **memory precheck → weight-streaming loader** track; (c) the
+workstreams start in parallel — **TCP_NODELAY on the SSE server** (now
+IMPLEMENTED + CPU-tested under `SERVE-HTTP-TRANSPORT` / `CLAIM-SERVE-TRANSPORT-1`:
+cpp-httplib defaulted Nagle on while vLLM serves via uvicorn over asyncio, which
+disables Nagle on every accepted socket, so we now call `set_tcp_nodelay(true)`;
+a behavioral accepted-socket test pins it RED→GREEN. The one non-binding
+localhost GPU sizing is PENDING while the GPU is held by c16, and axis credit
+comes only from the authorized exact-grid rerun) and the **memory precheck →
+weight-streaming loader** track; (c) the
 nsys full-step c2 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 before
 W3 is implemented; (d) FP4-producer/PDL/fused-norm-quant micro-levers are
 deprioritized — the recorded "fused RMSNorm→NVFP4" gap is **disproven** (vLLM's

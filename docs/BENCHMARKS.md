@@ -22,11 +22,11 @@ tactics. Initial finalization failed closed on two unseen launch fingerprints.
 Exact comparison with both prior accepted controls proves that only cached
 Torch/Inductor RMSNorm partitions redistributed between 48 and 50 registers;
 kernel names/order, grids, blocks, shared memory, family counts and tactics are
-unchanged. The two exact fingerprints now have a test-first validator entry,
-and complete dry finalization returns `complete-structural`. The pushed
-finalizer still must write the marker-last summary/manifest/status artifacts;
-c2/c16 **40 timing + 8 memory** remain **PENDING**, and no accepted performance
-number changes.
+unchanged. The two exact fingerprints now have a test-first validator entry.
+Pushed finalizer `24cea4f` revalidated the complete root and wrote the
+marker-last `complete-structural` summary/manifest/status artifacts; every
+artifact, finalizer and validator hash verifies. c2/c16 **40 timing + 8
+memory** remain **PENDING**, and no accepted performance number changes.
 
 ## Binding 27B online gate
 
@@ -71,9 +71,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; clean `7ff713e` completed the full packed/rollback raw trace and exact dry finalization is `complete-structural`, with no timing credit | Push the bounded finalizer update, write the immutable marker, then execute c2/c16; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; clean `7ff713e`, finalized by pushed `24cea4f`, is accepted `complete-structural` packed/rollback evidence with no timing credit | Execute c2/c16; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FINALIZER GATING** | Clean `7ff713e` completed 12/12 packed + 12/12 rollback ranges and both full oracle traces. The first marker-last attempt failed closed on unseen RMSNorm register allocation; exact analysis found only 48/50-register redistribution and the two fingerprint regressions pass within the focused validator suites. Full dry finalization is `complete-structural` | Push the validator checkpoint, finalize the immutable raw root, then run c2/c16 AB/BA/AB |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 COMPONENT GATING** | Clean `7ff713e` completed 12/12 packed + 12/12 rollback ranges and both full oracle traces. Pushed `24cea4f` bounds the only drift to generated-RMSNorm 48/50-register redistribution and writes accepted marker-last `complete-structural` evidence | Run c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -84,7 +84,7 @@ performance command is authorized until the 27B result reaches 124/124.
 
 The semantic and operator gates are retained at clean `f18ca23` and
 `9ad8fb7`; their complete hashes and attempt chronology live in the ledger and
-state log. The current checkpoint is W1D3 finalizer gating:
+state log. The current checkpoint is W1D3 component gating:
 
 | Surface | Current evidence | Disposition |
 |---|---|---|
@@ -96,7 +96,7 @@ state log. The current checkpoint is W1D3 finalizer gating:
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
-| Performance | Packed/rollback oracle windows are **1,523 / 1,522**, each with 1,160 kernels and invariant signatures. Only generated RMSNorm register allocation differs from prior controls; bounded fingerprints are test-covered and full dry finalization is `complete-structural` | **STRUCTURAL ONLY; pushed marker PENDING; no speed credit; c2/c16 PENDING** |
+| Performance | Packed/rollback oracle windows are **1,523 / 1,522**, each with 1,160 kernels and invariant signatures. Only generated RMSNorm register allocation differs from prior controls; pushed `24cea4f` finalizes the exact root | **STRUCTURAL PASS; no speed credit; c2/c16 PENDING** |
 
 The current raw root is
 `~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
@@ -105,8 +105,10 @@ Execution / configure / model-gate / run-log SHA-256 values are
 `6c0c2cae…2235`; packed/rollback oracle trace hashes are
 `4448c549…c293` / `9d918979…a420`. The first finalizer log
 (`a71ac6e4…7e67`) records the expected fail-closed unknown-signature error.
-No summary, manifest or completion marker has yet been written. Source, GPU
-and lock returned clean/idle/free; the complete raw artifacts are retained.
+Accepted summary / manifest / marker / pushed-finalizer-log hashes are
+`bf5c04b7…702f` / `2e92b3a2…55c0` / `e1314019…8c1` /
+`626c6844…8211`; artifact-set SHA is `ea286db4…c3dc`. Source, GPU and lock
+returned clean/idle/free; the complete artifacts are retained.
 
 Immutable evidence root:
 `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`.
@@ -123,9 +125,8 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 is closed. W1D3 raw capture is complete and awaits only pushed-finalizer
-marker-last closure before the c2/c16 40+8 same-binary series. Until that
-component gate passes, `benchmark_binding=false`.
+G2 and W1D3 structural evidence are closed. The c2/c16 40+8 same-binary series
+is next. Until that component gate passes, `benchmark_binding=false`.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its
@@ -279,25 +280,30 @@ flock /tmp/gpu env VT_GDN_BA_OUT_BF16=1 \
 # Current disposition: 233/235; got == greedy_ids_emulation.npy
 ```
 
-The complete W1D3 raw capture is immutable. The next checkpoint is CPU-only:
-finalize that root from the pushed validator commit, whose marker records both
-the finalizer and imported launch-validator hashes. Do not recapture the GPU
-series:
+The accepted W1D3 finalization is reproducible without recapturing the GPU
+series. Its marker records both the finalizer and imported launch-validator
+hashes:
 
 ```sh
 set -o pipefail
 RAW_SHA=7ff713e377457130db4ed15929133d1b463aff96
-FINALIZER_SHA=$(git rev-parse HEAD)
+FINALIZER_SHA=24cea4f1fe28c89968cad1ed845fbfbd64514b0c
 ROOT="$HOME/work/vllm.cpp-gdn-packed-trace/$RAW_SHA"
 EVIDENCE="$ROOT/evidence/$RAW_SHA"
 SOURCE="$HOME/work/vllm.cpp-gdn-packed-finalizer/$FINALIZER_SHA/source"
+VERIFY="$ROOT/finalizer-replay-$FINALIZER_SHA"
 test -z "$(git status --porcelain)"
-git worktree add --detach "$SOURCE" "$FINALIZER_SHA"
+test "$(git -C "$SOURCE" rev-parse HEAD)" = "$FINALIZER_SHA"
+test ! -e "$VERIFY"
+cp -a --reflink=auto "$EVIDENCE" "$VERIFY"
+rm "$VERIFY/trace/27/gdn-packed-summary.json" \
+  "$VERIFY/trace/27/gdn-packed-manifest.json" \
+  "$VERIFY/trace/27/status-gdn-packed.json"
 PYTHONPATH="$SOURCE" python3 \
   "$SOURCE/tools/bench/finalize_gdn_packed_trace.py" \
-  --evidence "$EVIDENCE" --source-commit "$RAW_SHA" \
+  --evidence "$VERIFY" --source-commit "$RAW_SHA" \
   --run-log "$ROOT/gdn-packed-run.log" \
-  2>&1 | tee "$ROOT/gdn-packed-finalizer-pushed.log"
+  2>&1 | tee "$ROOT/gdn-packed-finalizer-replay.log"
 ```
 
 Acceptance requires packed **915** versus rollback **963** total nodes, 145

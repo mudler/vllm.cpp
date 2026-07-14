@@ -8949,3 +8949,33 @@ Next: commit/push this bounded validator checkpoint, run marker-last
 finalization against the immutable raw root without recapturing GPU evidence,
 then execute c2/c16 **40 timing + 8 memory**. Binding remains **55/124**, c2
 TPOT remains **6.1% slower**, and qkvz stays blocked.
+
+## 2026-07-14 — W1D3 marker-last structural evidence accepted
+
+The bounded validator/provenance checkpoint landed and was pushed directly to
+main as `24cea4f1fe28c89968cad1ed845fbfbd64514b0c`. A clean detached copy on the
+DGX first passed the focused finalizer suites **13/13**, then revalidated the
+existing immutable `7ff713e` root without acquiring `/tmp/gpu` or starting a
+model process. It wrote `gdn-packed-summary.json`,
+`gdn-packed-manifest.json`, and `status-gdn-packed.json` marker-last. Status is
+`complete-structural`; summary / manifest / marker / finalizer-log SHA-256 are
+`bf5c04b71f05661f0d00ffa05342323cac9485044d7cdc74058cc1f6bc18702f` /
+`2e92b3a259bf38925d0d9a8d6d46e34be188e65eb5c9b3b6e9425eb78ab455c0` /
+`e13140191d843444597a2a5ae29f8d76bb6790d3f9d9b485de63f83a8b3798c1` /
+`626c6844023c1292754887a71abf51fb277a819a45716d423fcbe4d5b0ba8211`.
+Artifact-set SHA is `ea286db44f94371acffe62fe64e2eecc1d040c1fcee54a06e0669978d159c3dc`;
+the bound entry-finalizer and launch-validator SHA values are
+`a3232c554794e1223bf8c71e6c75a61a530ae541cf650263cb1f5bc581c1bb4d`
+and `7993c4790fcf15c14a96522c1b2f7c9eee4809df0a57cdf6d540a6ecc2167dbf`.
+All recomputed hashes match the marker.
+
+The accepted summary retains packed **915** versus rollback **963** nodes,
+exactly 48 packed calls replacing 48 decomposed plus 48 post-conv calls, and
+invariant unrelated topology. Packed/rollback oracle signatures remain
+invariant over **1,523 / 1,522** steady B=2 windows. The finalizer worktree and
+raw source are clean, no compute application remains, GPU utilization is 0%,
+and `/tmp/gpu` is free. This closes W1D3 structural evidence only:
+`benchmark_binding=false`, `speed_credit=false`, binding remains **55/124**,
+and c2 TPOT remains **6.1% slower**. Next: c2/c16 **40 timing + 8 memory**
+same-binary packed-default versus rollback in AB/BA/AB order; qkvz stays
+blocked until that component disposition.

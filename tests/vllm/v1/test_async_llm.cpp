@@ -17,10 +17,13 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <thread>
 #include <vector>
@@ -99,6 +102,39 @@ class RunnerStub : public ModelRunnerBase {
  private:
   SchedulerOutput stashed_output_;
   std::chrono::microseconds delay_;
+};
+
+// A runner whose engine-thread sampling hook throws, so the busy-loop fatal
+// guard (core_client.cpp) is the only place holding the true root-cause string.
+class ThrowingRunnerStub : public ModelRunnerBase {
+ public:
+  std::optional<ModelRunnerOutput> execute_model(
+      const SchedulerOutput& scheduler_output) override {
+    (void)scheduler_output;
+    return std::nullopt;
+  }
+
+  ModelRunnerOutput sample_tokens(
+      const std::optional<vllm::v1::GrammarOutput>& /*grammar_output*/) override {
+    throw std::runtime_error(
+        "vt: DIAG_ROOT_CAUSE_SENTINEL at qwen3_5.cpp:0");
+  }
+};
+
+// Scope-guarded process-wide std::cerr redirect. Installed BEFORE the engine
+// starts and restored only when this object is destroyed; sequencing the
+// restore after the engine (and its joined threads) guarantees no engine-thread
+// write races the rdbuf swap.
+class CerrRedirect {
+ public:
+  explicit CerrRedirect(std::streambuf* target)
+      : previous_(std::cerr.rdbuf(target)) {}
+  ~CerrRedirect() { std::cerr.rdbuf(previous_); }
+  CerrRedirect(const CerrRedirect&) = delete;
+  CerrRedirect& operator=(const CerrRedirect&) = delete;
+
+ private:
+  std::streambuf* previous_;
 };
 
 std::unique_ptr<Scheduler> CreateScheduler() {
@@ -427,4 +463,63 @@ TEST_CASE("async_llm concurrent submission cannot publish after shutdown sweep")
     }
     CHECK_FALSE(output.has_unfinished_requests());
   }
+}
+
+TEST_CASE(
+    "async_llm engine-thread guard logs the raw root cause before poisoning") {
+  InitHash();
+  Tokenizer tokenizer = BuildFixture();
+  HfConfig config = MakeConfig();
+
+  // Capture everything the engine thread emits, but assert only after the
+  // engine (and both its joined threads) are gone so the rdbuf restore cannot
+  // race an in-flight write and so no doctest failure text is swallowed.
+  std::ostringstream captured;
+  bool saw_engine_dead = false;
+  std::string second_add_what;
+  bool second_add_threw = false;
+  {
+    CerrRedirect redirect(captured.rdbuf());
+    auto scheduler = CreateScheduler();
+    ThrowingRunnerStub runner;
+    Executor executor(runner);
+    InputProcessor input(tokenizer, config);
+    OutputProcessor output(&tokenizer);
+    AsyncLLM engine(input, *scheduler, executor, output,
+                    get_request_block_hasher(16, sha256_cbor));
+
+    AsyncRequest request = engine.add_request(
+        "diag", "hello", Params(128, RequestOutputKind::kDelta));
+
+    // Drive the consumer until the poisoned engine surfaces EngineDeadError.
+    for (int i = 0; i < 2000 && !saw_engine_dead; ++i) {
+      try {
+        (void)engine.get_output(request);
+      } catch (const vllm::v1::EngineDeadError&) {
+        saw_engine_dead = true;
+      } catch (...) {
+        // Any other terminal exception also ends the drive loop.
+        saw_engine_dead = true;
+      }
+    }
+
+    // A subsequent submission must fast-fail with the generic wrapper, never
+    // leaking the raw root cause into the client-facing error.
+    try {
+      (void)engine.add_request("diag-after", "hello",
+                               Params(1, RequestOutputKind::kDelta));
+    } catch (const vllm::v1::EngineDeadError& e) {
+      second_add_threw = true;
+      second_add_what = e.what();
+    }
+  }
+
+  const std::string log = captured.str();
+  CHECK(saw_engine_dead);
+  CHECK(log.find("engine-fatal:") != std::string::npos);
+  CHECK(log.find("DIAG_ROOT_CAUSE_SENTINEL") != std::string::npos);
+  CHECK(second_add_threw);
+  CHECK(second_add_what.find("EngineCore encountered an issue") !=
+        std::string::npos);
+  CHECK(second_add_what.find("DIAG_ROOT_CAUSE_SENTINEL") == std::string::npos);
 }

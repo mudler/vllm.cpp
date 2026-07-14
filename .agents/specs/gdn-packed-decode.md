@@ -8,12 +8,14 @@ immutable G2; W1D3 finalizer/component is gating · **priority:** roadmap order 
 Fresh clean `7ff713e`, finalized by pushed `24cea4f`, closes exact marker-last
 structural evidence. The production-build-only c2/c16 AB/BA/AB driver and
 marker-last every-axis finalizer are implemented and focused CPU tests pass
-**45/45**, with all tool tests **127/127**. The pre-GPU defect is test-first
-repaired: the production command must contain exactly one
-`record-execution --profile-control off`. Clean pushed `d82d282` completed both
+**49/49**, with all tool tests **132/132**. Clean pushed `d82d282` completed both
 direct model gates and all six c2 legs, then failed incomplete at c16 packed r1:
-preflight and 16 warmups passed, all 96 timed requests returned HTTP 500, and
-no marker-last status was sealed. Partial legs are nonbinding.
+preflight and 16 warmups passed, all **0/96** timed requests returned HTTP 500,
+and no marker-last status was sealed. The root cause was unrecoverable because
+our port dropped two upstream fatal log lines; a bounded test-first diagnostic
+checkpoint now restores them (four `std::cerr` error-path channels +
+`VT_GDN_DIAG_STEP_LOG` geometry + a packed-only `--diagnostic-c16` driver mode;
+see the W1D3 component-harness row and G3 below). Partial legs are nonbinding.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -107,7 +109,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
 | W1D2 immutable G2 | model/runner/registry tests plus real 27B/35B/GGUF gates | Clean pushed `f344dec` passes default and rollback 27B **235/235 + 16/16**; default selects exactly 48 packed calls on the first decode and zero on prefill, rollback selects zero; native/batched 35B selects zero at **315/315**; Compact/Balanced GGUF each pass **14/14**; full CUDA GDN passes **43/43, 1,707/1,707**; three strict memcheck slices report zero errors/leaks. G2 is closed; no speed credit exists. |
 | W1D3 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_packed_trace.py` | Explicit packed/rollback modes preserve historical contracts, require exact `VT_GDN_PACKED_DECODE=1/0`, launch record/model/ours/vLLM commands from `/usr/bin/env -i` plus the fixed host/H1d inventories, and validate those recorded prefixes before accepting evidence. Both complete ours/vLLM arms run under one lock and finalize marker-last only at 915/963 nodes with the exact 48-for-96 GDN replacement. Each arm must contain exactly 48 BA projection nodes at `(8,1,1)`; those mode-coupled signatures are hashed separately because BF16-vs-F32 output may change cuBLASLt selection, while every remaining kernel/memcpy/memset signature must match cross-arm. Clean `7ff713e`, finalized by pushed `24cea4f`, closes marker-last `complete-structural` evidence. |
-| W1D3 component harness | `scripts/dgx-gdn-packed-component.sh`; `tools/bench/gdn_packed_component.py`; `tests/tools/test_gdn_packed_component.py` | Production profile-control-off build only; exact source/vLLM corpus manifest and partition binding; full oracle/dependency/toolchain/artifact inventory; exact detailed-sample recomputation for throughput/TTFT/ITL, bounded validation for pinned vLLM's unexported-latency E2E/TPOT skew, and duration-span consistency; exact frozen 64-plan lifecycle and `/usr/bin/env -i` commands; direct packed/rollback **235/235 + 16/16** gates bound to the recorded snapshot and binary before timing; one lock across both gates and 12 fresh-server legs; c2=6 requests and c16=96; AB/BA/AB; all 40 timing + 8 memory median axes plus all 144 paired axes; ≤4% maximum per-run deviation; fixed 1-GiB recomputed memory return; pinned GPU/thermal probes; closed run log plus marker-last summary/manifest/status; symlinked evidence rejected. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void`; post-seal mutation fails verification. The real production invocation has a test-first exact `--profile-control off` contract. Focused CPU contracts pass **45/45**, all tools **127/127**, and shell/dry-run gates pass. Clean `d82d282` failed incomplete at c16 packed r1 after both model gates/all c2 legs: 96/96 timed requests returned HTTP 500, no marker was sealed, and partial legs are nonbinding. |
+| W1D3 component harness | `scripts/dgx-gdn-packed-component.sh`; `tools/bench/gdn_packed_component.py`; `tests/tools/test_gdn_packed_component.py` | Production profile-control-off build only; exact source/vLLM corpus manifest and partition binding; full oracle/dependency/toolchain/artifact inventory; exact detailed-sample recomputation for throughput/TTFT/ITL, bounded validation for pinned vLLM's unexported-latency E2E/TPOT skew, and duration-span consistency; exact frozen 64-plan lifecycle and `/usr/bin/env -i` commands; direct packed/rollback **235/235 + 16/16** gates bound to the recorded snapshot and binary before timing; one lock across both gates and 12 fresh-server legs; c2=6 requests and c16=96; AB/BA/AB; all 40 timing + 8 memory median axes plus all 144 paired axes; ≤4% maximum per-run deviation; fixed 1-GiB recomputed memory return; pinned GPU/thermal probes; closed run log plus marker-last summary/manifest/status; symlinked evidence rejected. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void`; post-seal mutation fails verification. The real production invocation has a test-first exact `--profile-control off` contract. Focused CPU contracts pass **49/49**, all tools **132/132**, and shell/dry-run gates pass. Clean `d82d282` failed incomplete at c16 packed r1 after both model gates/all c2 legs: 0/96 timed requests returned HTTP 500, no marker was sealed, and partial legs are nonbinding. A bounded `--diagnostic-c16` mode (mutually exclusive with `--dry-run`/`--execute`) reproduces ONLY the packed c16 boundary — reps 1-3, three fresh servers under ONE `/tmp/gpu` lock, each carrying `VT_GDN_DIAG_STEP_LOG=1`; it runs no model gates, no 2/16 sweep, never calls `finalize`, asserts the evidence basename contains `diagnostic-c16` with no pre-existing `component-*.json`, wraps the failure-tolerant c16 bench (`\|\| bench_failed=1`) and on failure replays corpus row 0 into `diagnostic/c16/packed/r{rep}-error-body.json`, and writes status ONLY to `component-diagnostic.json`. `summarize_evidence`/`finalize_evidence` fail closed on a `component-diagnostic.json` marker or a `diagnostic/` subtree ("refusing to finalize component from diagnostic evidence"). Four unconditional `std::cerr` error-path channels restore the dropped root cause: `engine-fatal:` at the busy-loop guard (`core_client.cpp`, restoring vLLM `core.py:1233`), `async-llm:` at the output handler (`async_llm.cpp`, restoring `async_llm.py:703-705`), `api-server:` at both 500 sites (`api_server.cpp`), and `sse:` mid-flight. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -125,7 +127,7 @@ them also removes the pure-decode post-conv intermediate launch and buffers.
 | Oracle generation | `tools/bench/gdn_packed_decode_oracle.py` | Maintainer-only official-v0.25 generator with version/commit guard, repeated bit-stability and reference-tolerance checks. |
 | Test port | `tests/parity/test_op_parity.cpp`, `tests/vt/test_ops_gdn.cpp`, model tests | Port the upstream dtype/stride/state cases and retain the small exact boundary fixture. |
 | Trace provenance/finalization | `tools/bench/online_gate.py`, `scripts/dgx-online-serving.sh`, `tools/bench/finalize_gdn_packed_trace.py` | W1D3 adds mode-keyed graph contracts without reinterpreting historical evidence, disjoint arm artifacts, one-lock ordering, environment validation and completion-marker-last structural finalization. |
-| Component execution/finalization | `scripts/dgx-gdn-packed-component.sh`, `tools/bench/gdn_packed_component.py` | W1D3 adds a separate production-build execution path. It validates the exact source/build/oracle, command environments, frozen plan, correctness, raw metrics, memory return and one-lock order; derived summary/manifest/status artifacts are written marker-last and never change the binding denominator. |
+| Component execution/finalization | `scripts/dgx-gdn-packed-component.sh`, `tools/bench/gdn_packed_component.py`, `tools/bench/run_serve_low.py` | W1D3 adds a separate production-build execution path. It validates the exact source/build/oracle, command environments, frozen plan, correctness, raw metrics, memory return and one-lock order; derived summary/manifest/status artifacts are written marker-last and never change the binding denominator. A separate bounded `--diagnostic-c16` mode (with `run_serve_low.py diagnostic-error-body`) reproduces only the packed c16 boundary, writes only `component-diagnostic.json`, and is refused by the finalizer. |
 
 Every implementation file cites the exact upstream source and commit. The
 Triton kernel is a porting reference only; the runtime stays pure C++/CUDA.
@@ -206,6 +208,27 @@ Additional mandatory local gates:
   Correctness is a precondition and no stable regression is accepted.
 - Only after this checkpoint closes may qkvz begin. A passing component
   authorizes the fresh exact grid; a failure resumes the trace-driven scan.
+- The `d82d282` c16 packed failure (0/96 HTTP 500, no marker) is diagnosed
+  through a bounded `--diagnostic-c16` driver mode, mutually exclusive with
+  `--dry-run`/`--execute` and never a component: it shares execute's provenance
+  guards, additionally asserts the evidence basename contains `diagnostic-c16`
+  with no pre-existing `component-*.json`, then under ONE `/tmp/gpu` lock runs
+  the packed arm ONLY at concurrency 16 for reps 1-3, each on a fresh server
+  spliced with `VT_GDN_DIAG_STEP_LOG=1` before the binary token (rebuilt array,
+  not string substitution, because `env -i` stops consuming assignments at the
+  first non-assignment token). It runs no model gates and no 2/16 sweep. The
+  failure-tolerant c16 bench (`|| bench_failed=1`, required because the harness
+  is `set -euo pipefail` and `online_gate.py` exits non-zero on a partial set)
+  is followed on failure by a `run_serve_low.py diagnostic-error-body` replay of
+  corpus row 0 into `diagnostic/c16/packed/r{rep}-error-body.json`, then
+  `cleanup_server`. Status is written ONLY to `component-diagnostic.json`; it
+  never calls `finalize`, and `summarize_evidence`/`finalize_evidence` fail
+  closed on that marker or a `diagnostic/` subtree. Four unconditional
+  `std::cerr` error-path channels surface the previously-dropped root cause —
+  `engine-fatal:` (busy-loop guard, vLLM `core.py:1233`), `async-llm:` (output
+  handler, `async_llm.py:703-705`), `api-server:` (both 500 sites), and `sse:`
+  (mid-flight) — none containing the `#ifdef VT_BENCH_PROFILE_CONTROL`
+  marker bytes.
 
 The initial reproduction entry points are:
 
@@ -223,6 +246,14 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 # docs/BENCHMARKS.md after the source SHA is pushed.
 scripts/dgx-gdn-packed-component.sh --dry-run \
   --vllm-cpp-sha "$(git rev-parse HEAD)"
+
+# Bounded c16 packed diagnostic reproduction (next step); evidence basename must
+# contain 'diagnostic-c16' and hold no component-*.json. Full recipe in
+# docs/BENCHMARKS.md.
+scripts/dgx-gdn-packed-component.sh --diagnostic-c16 \
+  --snapshot "$SNAPSHOT" --source-corpus "$ROOT/evidence-diagnostic-c16/corpus/27" \
+  --evidence "$ROOT/evidence-diagnostic-c16" --build-dir "$ROOT/build-production" \
+  --configure-log "$ROOT/configure.log" --vllm-cpp-sha "$SHA"
 ```
 
 ## Dependencies
@@ -245,7 +276,7 @@ scripts/dgx-gdn-packed-component.sh --dry-run \
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **CLOSED / immutable G2 PASS at clean `f344dec`:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Evidence root `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`. |
-| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 96/96 HTTP 500 with no marker. Capture the hidden exception and rerun from a new SHA/root; qkvz stays blocked. |
+| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE; diagnostic instrumentation landed.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 0/96 HTTP 500 with no marker. A test-first diagnostic checkpoint now exposes the dropped root cause (four `std::cerr` error-path channels + `VT_GDN_DIAG_STEP_LOG` + a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`; six RED→GREEN tests, tools 132/132). Next: run the DGX `--diagnostic-c16` reproduction from the pushed SHA in a fresh `diagnostic-c16` root, then repair/rerun; qkvz stays blocked. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is
 recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.

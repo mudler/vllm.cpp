@@ -9265,3 +9265,70 @@ no evidence, hashes, or dispositions changed). Historical mentions of
 benchmark, or lifecycle state changed; binding remains **55/124**,
 `benchmark_binding=false`, and the c16 diagnostic sequence recorded above is
 unchanged and next.
+
+## 2026-07-14 — Packed c16 diagnostic checkpoint (test-first, diagnostic-only)
+
+Facts. The `d82d282` W1D3 component failed incomplete at the c16 packed leg:
+after preflight + initial request + 16 warmups, all **0/96** timed requests
+returned HTTP 500 in 0.062 s and the driver exited with no marker. The true
+root cause was unrecoverable because our port dropped two upstream fatal-log
+lines: `vllm/v1/engine/core.py:1233`
+(`logger.exception("EngineCore encountered a fatal error.")` before
+`_send_engine_dead`) whose mirror is the busy-loop guard at
+`src/vllm/v1/engine/core_client.cpp:21-27`, and
+`vllm/v1/engine/async_llm.py:703-705`
+(`logger.exception("AsyncLLM output_handler failed.")` before
+`propagate_error`) whose mirror is `RunOutputHandler`'s catch at
+`src/vllm/v1/engine/async_llm.cpp:152-158`. After engine death every
+`add_request` fast-fails with the generic `EngineDeadError` wrapper, so all 96
+requests only ever saw "Internal Server Error". This checkpoint is diagnostic
+only: no runtime-fix speculation, no benchmark-semantics change, pinned client
+untouched.
+
+What landed. Four unconditional `std::cerr` error-path channels (none containing
+the `#ifdef VT_BENCH_PROFILE_CONTROL` marker bytes): `engine-fatal:` at the
+busy-loop guard (before `send_engine_dead`, kept at the guard so clean shutdown
+does not log), `async-llm:` at the output handler (before `propagate_error`),
+`api-server:` at both 500 sites (endpoint + model + `e.what()`), and `sse:`
+mid-flight (rethrow-to-inspect before `stream->abort()`). An opt-in
+`VT_GDN_DIAG_STEP_LOG` step-geometry trace (read once, default off) in
+`runner.cpp` (after `remap_gdn_state_slots`: `num_reqs`, free/live GDN slots) and
+in `qwen3_5.cpp` (after the packed-decode decision: `packed_decode`, `nd`, `np`,
+`nd_tok`, `np_tok`, `T`). A bounded packed-only `--diagnostic-c16` driver mode
+(mutually exclusive with `--dry-run`/`--execute`): reps 1-3, three fresh servers
+under one `/tmp/gpu` lock each spliced with `VT_GDN_DIAG_STEP_LOG=1` before the
+binary token (rebuilt array), failure-tolerant c16 bench (`|| bench_failed=1`) +
+`run_serve_low.py diagnostic-error-body` replay of corpus row 0 into
+`diagnostic/c16/packed/r{rep}-error-body.json`, status only in
+`component-diagnostic.json`; no model gates, no 2/16 sweep, no `finalize`.
+`summarize_evidence`/`finalize_evidence` fail closed on a `component-diagnostic.json`
+marker or a `diagnostic/` subtree.
+
+RED evidence (each observed failing for the right reason). (A) `test_async_llm`
+"engine-thread guard logs the raw root cause" — `saw_engine_dead` passed but
+`log.find("engine-fatal:")` and `log.find("DIAG_ROOT_CAUSE_SENTINEL")` both
+returned `npos` (the guard dropped the log). (B) `test_diagnostic_marker_refuses_finalize`
+— "HarnessError not raised" (no guard). (C) `test_diagnostic_error_body_captures_500_body`
+— `AttributeError: module 'tools.bench.run_serve_low' has no attribute
+'capture_diagnostic_error_body'`. (D) `test_driver_defines_diagnostic_c16_mode`
+— case-arm regex not found. (E)/(F) `test_driver_diagnostic_runs_only_packed_c16_boundary`
+/`..._wraps_bench_to_survive_set_e` — `ValueError: substring not found` (no
+`# >>> diagnostic-c16 flow` region).
+
+GREEN evidence. Focused `test_gdn_packed_component` **49/49**; full tools
+**132/132** (127 baseline + 5 new); CPU `test_async_llm` **8 cases / 343
+assertions**; CPU `test_openai_api_server` **21 / 272** (clean server build
+`build-diag-cpu`, `VLLM_CPP_SERVER=ON`). Touched objects were removed and
+rebuilt so `-Werror` was not masked.
+
+Gates. `bash -n` + ShellCheck clean; `py_compile` of the three tools clean;
+`check-agent-record.py` (`ENGINE=104 MODEL=326 QUANT=81 KERNEL=31 BACKEND=52`),
+`test_agent_record.py` **13**, `test_doc_checkpoint.py` **5** all pass. Binding
+stays **55/124**, `benchmark_binding=false`, no speed credit.
+
+Next step. Run the DGX `--diagnostic-c16` reproduction from the pushed SHA in a
+NEW root whose basename contains `diagnostic-c16` (full recipe in
+`docs/BENCHMARKS.md`); read the restored `engine-fatal:` cause from the server
+log and the persisted `r{rep}-error-body.json`, then repair test-first and rerun
+the full one-lock component from a fresh SHA/root. The `d82d282` root stays
+untouched. qkvz/exact-grid/35B performance remain blocked.

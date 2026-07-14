@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2664,6 +2665,19 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
           meta.num_spec_decodes,
           meta.num_spec_decode_tokens,
           T});
+
+  // GDN packed-decode geometry diagnostic (default OFF; read ONCE). Gated on the
+  // same VT_GDN_DIAG_STEP_LOG toggle as the runner's step log so a c16 packed
+  // reproduction can attribute the decision that selects the packed leg.
+  static const bool gdn_diag_step_log = [] {
+    const char* e = std::getenv("VT_GDN_DIAG_STEP_LOG");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  if (gdn_diag_step_log) {
+    std::cerr << "[VT_GDN_DIAG] packed_decode=" << (packed_decode ? 1 : 0)
+              << " nd=" << nd << " np=" << np << " nd_tok=" << nd_tok
+              << " np_tok=" << np_tok << " T=" << T << "\n";
+  }
 
   // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
   // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.

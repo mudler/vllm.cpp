@@ -10,6 +10,9 @@ usage:
   dgx-gdn-packed-component.sh --execute --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE --vllm-cpp-sha SHA \
     [--client PATH] [--port N]
+  dgx-gdn-packed-component.sh --diagnostic-c16 --snapshot DIR --source-corpus DIR \
+    --evidence DIR --build-dir DIR --configure-log FILE --vllm-cpp-sha SHA \
+    [--client PATH] [--port N]
 EOF
 }
 
@@ -28,7 +31,7 @@ max_num_batched_tokens=2048
 
 while (($#)); do
   case "$1" in
-    --dry-run|--execute)
+    --dry-run|--execute|--diagnostic-c16)
       [[ -z ${mode} ]] || { echo "choose exactly one mode" >&2; exit 2; }
       mode=${1#--}
       shift
@@ -56,7 +59,7 @@ if [[ ${mode} == dry-run ]]; then
     --vllm-cpp-sha "${vllm_cpp_sha}"
 fi
 
-[[ ${mode} == execute ]] || { usage; exit 2; }
+[[ ${mode} == execute || ${mode} == diagnostic-c16 ]] || { usage; exit 2; }
 [[ -n ${evidence} ]] || { echo "--evidence is required" >&2; exit 2; }
 [[ -n ${snapshot} && -d ${snapshot} ]] || {
   echo "--snapshot must name the pinned Qwen3.6-27B directory" >&2
@@ -98,6 +101,16 @@ grep -Fxq 'VLLM_CPP_BENCH_PROFILE_CONTROL:BOOL=OFF' "${build_dir}/CMakeCache.txt
   echo "component timing requires VLLM_CPP_BENCH_PROFILE_CONTROL=OFF" >&2
   exit 2
 }
+if [[ ${mode} == diagnostic-c16 ]]; then
+  [[ $(basename "${evidence}") == *diagnostic-c16* ]] || {
+    echo "--evidence basename must contain diagnostic-c16" >&2
+    exit 2
+  }
+  if compgen -G "${evidence}/component-*.json" >/dev/null 2>&1; then
+    echo "diagnostic mode refuses a directory holding component-*.json" >&2
+    exit 2
+  fi
+fi
 
 mkdir -p "${evidence}"
 plan="${evidence}/component-plan.json"
@@ -386,6 +399,100 @@ run_leg() {
     --after-cache-drop-report "${after_cache}" --gpu-idle
   record_order "leg_end concurrency=${concurrency} arm=${arm} repetition=${repetition}"
 }
+
+# >>> diagnostic-c16 flow (bounded reproduction of the c16 packed HTTP 500).
+# Packed arm ONLY, concurrency 16, three fresh servers under one GPU lock. No
+# model gates, no 2/16 sweep, no component finalization: this checkpoint only
+# captures the engine-fatal root cause the timed component leg drops. The
+# server carries VT_GDN_DIAG_STEP_LOG=1 so its step geometry is on the record.
+diagnostic_server_command() {
+  local arm=$1
+  local -n diag_out=$2
+  local -a base_command
+  server_command "${arm}" base_command
+  # env -i only consumes VAR=val up to the first non-assignment token, so splice
+  # VT_GDN_DIAG_STEP_LOG=1 in immediately BEFORE the server binary by rebuilding
+  # the array (never string-substituting the assembled command line).
+  diag_out=()
+  local spliced=0 token
+  for token in "${base_command[@]}"; do
+    if [[ ${spliced} -eq 0 && ${token} == "${build_dir}/examples/server" ]]; then
+      diag_out+=("VT_GDN_DIAG_STEP_LOG=1")
+      spliced=1
+    fi
+    diag_out+=("${token}")
+  done
+}
+
+run_diagnostic_leg() {
+  local diag_root="${evidence}/diagnostic/c16/packed"
+  local log_dir="${diag_root}/logs"
+  local thermal_dir="${diag_root}/thermal"
+  local preflight_dir="${diag_root}/preflight"
+  mkdir -p "${diag_root}" "${log_dir}" "${thermal_dir}" "${preflight_dir}"
+  local -a rep_outcomes=()
+  local rep
+  for rep in 1 2 3; do
+    local bench_failed=0
+    local log="${log_dir}/r${rep}-server.log"
+    local -a command
+    gpu_idle || { echo "GPU busy before diagnostic r${rep}" >&2; return 1; }
+    drop_caches "${diag_root}/r${rep}-before-cache.json"
+    diagnostic_server_command packed command
+    printf '%q ' "${command[@]}" >"${log_dir}/r${rep}-server-command.txt"
+    printf '\n' >>"${log_dir}/r${rep}-server-command.txt"
+    record_order "diagnostic_leg_begin repetition=${rep}"
+    setsid "${command[@]}" >"${log}" 2>&1 &
+    spid=$!
+    wait_ready "${log}"
+    /usr/bin/nvidia-smi -q -d PERFORMANCE,TEMPERATURE,POWER \
+      >"${thermal_dir}/r${rep}-before.txt"
+    "${benchmark_clean_env[@]}" python3 \
+      "${repo_root}/tools/bench/run_serve_low.py" stream \
+      --url "http://127.0.0.1:${port}/v1/completions" \
+      --corpus "${source_corpus}/c1-r${rep}.jsonl" \
+      --output-len 128 --minimum-spread 0.05 \
+      --output "${preflight_dir}/r${rep}-stream.json"
+    "${benchmark_clean_env[@]}" python3 \
+      "${repo_root}/tools/bench/online_gate.py" bench \
+      --client "${client}" --tokenizer "${snapshot}" --evidence "${evidence}" \
+      --model-key 27 --engine ours --base-url "http://127.0.0.1:${port}" \
+      --concurrency 16 --repetition "${rep}" --artifact-tag "gdn-packed" \
+      || bench_failed=1
+    /usr/bin/nvidia-smi -q -d PERFORMANCE,TEMPERATURE,POWER \
+      >"${thermal_dir}/r${rep}-after.txt"
+    if [[ ${bench_failed} -eq 1 ]]; then
+      "${benchmark_clean_env[@]}" python3 \
+        "${repo_root}/tools/bench/run_serve_low.py" diagnostic-error-body \
+        --url "http://127.0.0.1:${port}/v1/completions" \
+        --corpus "${source_corpus}/c16-r${rep}.jsonl" \
+        --output "${diag_root}/r${rep}-error-body.json"
+      rep_outcomes+=("{\"repetition\":${rep},\"bench_failed\":true}")
+    else
+      rep_outcomes+=("{\"repetition\":${rep},\"bench_failed\":false}")
+    fi
+    cleanup_server
+    wait_gpu_idle
+    record_order "diagnostic_leg_end repetition=${rep}"
+  done
+  diagnostic_reps=$(IFS=,; echo "${rep_outcomes[*]}")
+}
+
+if [[ ${mode} == diagnostic-c16 ]]; then
+  exec 9>/tmp/gpu
+  flock 9
+  record_order "gpu_lock_acquired path=/tmp/gpu"
+  gpu_idle || { echo "GPU is busy despite acquiring /tmp/gpu" >&2; exit 1; }
+  diagnostic_reps=""
+  run_diagnostic_leg
+  flock -u 9
+  record_order "gpu_lock_released path=/tmp/gpu"
+  printf '{"diagnostic":true,"mode":"diagnostic-c16","repetitions":[%s]}\n' \
+    "${diagnostic_reps}" >"${evidence}/component-diagnostic.json"
+  record_order "diagnostic_complete"
+  exit 0
+fi
+# <<< diagnostic-c16 flow
 
 python3 "${repo_root}/tools/bench/gdn_packed_component.py" validate-corpus \
   --evidence "${evidence}" --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null

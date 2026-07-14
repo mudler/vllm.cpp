@@ -1819,9 +1819,26 @@ def _validate_stream_preflight(
     }
 
 
+def _reject_diagnostic_evidence(evidence: pathlib.Path) -> None:
+    """Fail closed if the root carries diagnostic-checkpoint markers.
+
+    The bounded ``--diagnostic-c16`` mode writes ``component-diagnostic.json``
+    and a ``diagnostic/`` subtree instead of a component result; neither may
+    ever be sealed as a binding packed-vs-rollback component.
+    """
+
+    if (evidence / "component-diagnostic.json").exists() or (
+        evidence / "diagnostic"
+    ).exists():
+        raise HarnessError(
+            "refusing to finalize component from diagnostic evidence"
+        )
+
+
 def summarize_evidence(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, Any]:
     """Load an on-disk component root and return its validated summary."""
 
+    _reject_diagnostic_evidence(evidence)
     _require_source_sha(vllm_cpp_sha)
     plan = _load_json(evidence / "component-plan.json")
     if plan != build_component_plan(vllm_cpp_sha):
@@ -2021,6 +2038,9 @@ def verify_finalized_evidence(
 def finalize_evidence(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, Any]:
     """Revalidate the complete root and write the completion marker last."""
 
+    # Refuse before the summarize try/except (which converts HarnessError into a
+    # VOID summary) so a diagnostic root can never be sealed even as VOID.
+    _reject_diagnostic_evidence(evidence)
     derived = {name: evidence / name for name in DERIVED_ARTIFACTS}
     existing = sorted(name for name, path in derived.items() if path.exists())
     if existing:

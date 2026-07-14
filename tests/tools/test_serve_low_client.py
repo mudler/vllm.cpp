@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 
+from tools.bench import run_serve_low
 from tools.bench.run_serve_low import (
     BenchRun,
     build_bench_command,
@@ -49,6 +50,22 @@ class _CompletionHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"error":"fixture"}')
+                return
+            if self.path == "/diagnostic-error":
+                body = json.dumps(
+                    {
+                        "error": {
+                            "message": "vt: sentinel root cause",
+                            "type": "InternalServerError",
+                            "code": 500,
+                        }
+                    }
+                ).encode()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if payload.get("stream"):
                 self.send_response(200)
@@ -187,6 +204,49 @@ class ClientTests(unittest.TestCase):
                     vllm_cpp_sha="a" * 40,
                     image="sglang:latest",
                 )
+
+    def test_diagnostic_error_body_captures_500_body(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            corpus = root / "corpus.jsonl"
+            corpus.write_text(
+                json.dumps({"conversations": [{"content": "prompt zero"}]}) + "\n"
+            )
+            output = root / "r1-error-body.json"
+            record = run_serve_low.capture_diagnostic_error_body(
+                self.base + "/diagnostic-error",
+                corpus,
+                output,
+            )
+            self.assertEqual(record["status"], 500)
+            self.assertTrue(record["diagnostic"])
+            self.assertEqual(record["mode"], "diagnostic-c16")
+            self.assertEqual(
+                record["body"]["error"]["message"], "vt: sentinel root cause"
+            )
+
+            written = json.loads(output.read_text())
+            self.assertEqual(written["status"], 500)
+            self.assertEqual(
+                written["body"]["error"]["message"], "vt: sentinel root cause"
+            )
+            self.assertTrue(written["diagnostic"])
+            self.assertEqual(written["mode"], "diagnostic-c16")
+
+            # Fail-closed: refuse to overwrite an existing capture.
+            with self.assertRaises(HarnessError):
+                run_serve_low.capture_diagnostic_error_body(
+                    self.base + "/diagnostic-error",
+                    corpus,
+                    output,
+                )
+
+            # The non-streaming completion payload is what the server saw.
+            sent = _CompletionHandler.payloads[-1]
+            self.assertFalse(sent["stream"])
+            self.assertEqual(sent["max_tokens"], 128)
+            self.assertTrue(sent["ignore_eos"])
+            self.assertEqual(sent["temperature"], 0.0)
 
     def test_campaign_shell_dry_run_creates_manifest_without_gpu_work(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]

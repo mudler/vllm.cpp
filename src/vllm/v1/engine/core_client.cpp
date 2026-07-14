@@ -4,6 +4,7 @@
 // See core_client.h for scope, deviations and deferrals.
 #include "vllm/v1/engine/core_client.h"
 
+#include <iostream>
 #include <utility>
 
 namespace vllm::v1 {
@@ -21,8 +22,19 @@ InprocClient::InprocClient(Scheduler& scheduler, Executor& executor,
     try {
       proc_.run_busy_loop();
     } catch (const std::exception& e) {
+      // Restore the upstream fatal log (vllm/v1/engine/core.py:1233:
+      // logger.exception("EngineCore encountered a fatal error.") emitted
+      // immediately before _send_engine_dead). This is the ONLY place that
+      // holds the true root-cause string: the client-facing EngineDeadError
+      // wrapper (core_client.h) deliberately hides it. std::cerr is
+      // unit-buffered so the line survives the driver's SIGKILL escalation;
+      // std::cout / buffered loggers must never be used here.
+      std::cerr << "engine-fatal: EngineCore busy loop threw: " << e.what()
+                << "\n";
       proc_.send_engine_dead(e.what());
     } catch (...) {
+      std::cerr << "engine-fatal: EngineCore busy loop threw an unknown fatal "
+                   "error\n";
       proc_.send_engine_dead("unknown fatal error in the engine busy loop");
     }
   });

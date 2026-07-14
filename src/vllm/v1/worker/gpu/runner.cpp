@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -51,6 +52,18 @@ static bool GpuSampleEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_GPU_SAMPLE");
     return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
+// execute_model step prints the request count and the live/free recurrent-state
+// slot geometry to std::cerr. Read ONCE (never per-step getenv); bounded to the
+// packed-GDN c16 diagnostic checkpoint (see .agents/specs/gdn-packed-decode.md).
+static bool GdnDiagStepLogEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_DIAG_STEP_LOG");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
   }();
   return on;
 }
@@ -564,6 +577,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // sized by max_num_reqs (one recurrent state per sequence) rather than the
   // attention num_blocks. Only col 0 (state indices) is read downstream.
   remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs);
+  if (GdnDiagStepLogEnabled()) {
+    std::cerr << "[VT_GDN_DIAG] step num_reqs=" << num_reqs
+              << " gdn_free_slots=" << gdn_free_slots_.size()
+              << " gdn_live_slots=" << gdn_slot_of_block_.size() << "\n";
+  }
   const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
       step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);
   GDNAttentionMetadataBuilder gdn_builder;

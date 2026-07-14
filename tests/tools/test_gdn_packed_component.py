@@ -54,6 +54,10 @@ from tests.tools.test_online_gate_client import (
 SOURCE_SHA = "c" * 40
 SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+# Text anchors bounding the diagnostic-c16 flow inside the driver script.
+DIAG_BEGIN = "# >>> diagnostic-c16 flow"
+DIAG_END = "# <<< diagnostic-c16 flow"
+
 
 def _isolated_environment(
     *, arm: str, fixture: pathlib.Path, native: pathlib.Path, home: pathlib.Path
@@ -1444,6 +1448,74 @@ class GdnPackedComponentTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 2)
         self.assertIn("--evidence is required", completed.stderr)
+
+    def test_diagnostic_marker_refuses_finalize(self) -> None:
+        # A component-diagnostic.json marker makes both the summary and the
+        # finalizer refuse to seal a component from diagnostic evidence.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            (root / "component-diagnostic.json").write_text(
+                json.dumps({"diagnostic": True, "mode": "diagnostic-c16"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(HarnessError, "diagnostic"):
+                summarize_evidence(root, SOURCE_SHA)
+            with self.assertRaisesRegex(HarnessError, "diagnostic"):
+                finalize_evidence(root, SOURCE_SHA)
+
+        # A diagnostic/ subtree is equally disqualifying.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            subtree = root / "diagnostic" / "c16" / "packed"
+            subtree.mkdir(parents=True)
+            (subtree / "r1-error-body.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(HarnessError, "diagnostic"):
+                summarize_evidence(root, SOURCE_SHA)
+            with self.assertRaisesRegex(HarnessError, "diagnostic"):
+                finalize_evidence(root, SOURCE_SHA)
+
+    def test_driver_defines_diagnostic_c16_mode(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        # --diagnostic-c16 shares the single-mode case arm with the others.
+        self.assertRegex(text, r"--dry-run\|--execute\|--diagnostic-c16")
+        start = text.index(DIAG_BEGIN)
+        end = text.index(DIAG_END)
+        self.assertLess(start, end)
+        branch = text[start:end]
+        self.assertIn("component-diagnostic.json", branch)
+        self.assertNotIn("component-summary.json", branch)
+        self.assertNotIn("component-status.json", branch)
+        self.assertNotIn('gdn_packed_component.py" finalize', branch)
+
+    def test_driver_diagnostic_runs_only_packed_c16_boundary(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        branch = text[text.index(DIAG_BEGIN) : text.index(DIAG_END)]
+        self.assertIn("for rep in 1 2 3", branch)
+        self.assertIn("--concurrency 16", branch)
+        self.assertIn("VT_GDN_DIAG_STEP_LOG=1", branch)
+        self.assertIn("packed", branch)
+        self.assertNotIn("for concurrency in 2 16", branch)
+        self.assertNotIn("rollback", branch)
+        self.assertNotIn("run_model_gate", branch)
+        # Exactly one GPU lock across the whole diagnostic series.
+        self.assertEqual(branch.count("flock 9"), 1)
+
+    def test_driver_diagnostic_wraps_bench_to_survive_set_e(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        branch = text[text.index(DIAG_BEGIN) : text.index(DIAG_END)]
+        self.assertIn("|| bench_failed=1", branch)
+        self.assertIn("diagnostic-error-body", branch)
+        # The error-body capture and cleanup follow the failure-tolerant bench.
+        self.assertLess(
+            branch.index("|| bench_failed=1"), branch.index("diagnostic-error-body")
+        )
+        self.assertLess(
+            branch.index("diagnostic-error-body"), branch.index("cleanup_server")
+        )
+        # The evidence directory basename must carry the diagnostic-c16 marker.
+        self.assertRegex(text, r"basename[^\n]*diagnostic-c16")
 
 
 if __name__ == "__main__":

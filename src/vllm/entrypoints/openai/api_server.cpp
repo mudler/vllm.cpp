@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <exception>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -130,6 +131,11 @@ ApiServer::DispatchResult ApiServer::handle_completions(
     if (!completion_.uses_async_engine()) legacy_lock.lock();
     result = completion_.create_completion(request);
   } catch (const std::exception& e) {
+    // DISCRIMINATOR: attribute a 500 to its endpoint + model + raw cause so a
+    // benchmark driver that only sees the generic HTTP body can still recover
+    // the true failure. std::cerr only (survives SIGKILL escalation).
+    std::cerr << "api-server: 500 endpoint=/v1/completions model="
+              << request.model.value_or("") << " what=" << e.what() << "\n";
     return MakeError(500, "InternalServerError", e.what());
   }
 
@@ -177,6 +183,8 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
     if (!chat_.uses_async_engine()) legacy_lock.lock();
     result = chat_.create_chat_completion(request);
   } catch (const std::exception& e) {
+    std::cerr << "api-server: 500 endpoint=/v1/chat/completions model="
+              << request.model.value_or("") << " what=" << e.what() << "\n";
     return MakeError(500, "InternalServerError", e.what());
   }
 
@@ -251,6 +259,18 @@ void ApiServer::register_routes() {
                 }
                 return true;
               } catch (...) {
+                // MID-FLIGHT WITNESS: a provider exception here means the live
+                // stream died after headers were already sent (the client sees
+                // a truncated body, not a 500). Rethrow-to-inspect so the raw
+                // cause reaches stderr before the abort.
+                try {
+                  std::rethrow_exception(std::current_exception());
+                } catch (const std::exception& e) {
+                  std::cerr << "sse: stream aborted mid-flight: " << e.what()
+                            << "\n";
+                } catch (...) {
+                  std::cerr << "sse: stream aborted mid-flight: unknown error\n";
+                }
                 stream->abort();
                 return false;
               }

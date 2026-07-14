@@ -15,14 +15,23 @@ immutable correctness at `f344dec` and accepted structure from `7ff713e`,
 finalized by `24cea4f`: packed has **915** nodes versus rollback's **963**, with
 the exact 48-for-96 GDN substitution and invariant remaining topology. The
 production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
-finalizer are hardened. A test-first repair now requires the real production
-invocation to include exactly one `record-execution --profile-control off`;
-focused tests pass **45/45** and all tools **127/127**. Clean source `d82d282`
+finalizer are hardened. Clean source `d82d282`
 completed both direct model gates and all six c2 legs, then **FAILED /
 INCOMPLETE** at c16 packed repetition 1. The streaming preflight, initial
-request and 16 warmups passed, but all 96 timed requests returned HTTP 500 in
-0.062 s. The driver exited without a marker-last status. Partial c2/c16 files
-are nonbinding, so no accepted performance number changes.
+request and 16 warmups passed, but all **0/96** timed requests returned HTTP 500
+in 0.062 s. The driver exited without a marker-last status. The root cause was
+unrecoverable because our port dropped two upstream fatal log lines
+(`vllm/v1/engine/core.py:1233`, `async_llm.py:703-705`). A bounded **test-first
+diagnostic checkpoint** restores them as four unconditional `std::cerr`
+error-path channels (`engine-fatal:`, `async-llm:`, `api-server:`, `sse:`),
+adds an opt-in `VT_GDN_DIAG_STEP_LOG` geometry trace, and adds a packed-only
+`--diagnostic-c16` driver mode isolated from the gating component
+(`component-diagnostic.json`; the finalizer refuses diagnostic evidence). Six
+RED→GREEN tests land it; all tools pass **132/132**, focused
+`test_gdn_packed_component` **49/49**, and CPU `test_async_llm`/`test_openai_api_server`
+are green. The c16 component stays **FAILED / INCOMPLETE** with the
+`--diagnostic-c16` reproduction (below) as the next entry point; partial c2/c16
+files are nonbinding and `benchmark_binding=false`.
 
 ## Binding 27B online gate
 
@@ -67,9 +76,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `d82d282` component stopped at c16 packed r1 with 96/96 HTTP 500 responses and no terminal marker or timing credit | Capture the underlying server exception, repair test-first, and rerun the full component from a new SHA/root; the exact grid remains unauthorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `d82d282` component stopped at c16 packed r1 with 0/96 HTTP 500 responses and no terminal marker or timing credit. A test-first diagnostic checkpoint (four error-path log channels + `VT_GDN_DIAG_STEP_LOG` + `--diagnostic-c16` mode) landed to expose the dropped server exception | Run the DGX `--diagnostic-c16` reproduction from the pushed SHA, read the captured engine-fatal cause, repair test-first, and rerun the full component from a new SHA/root; the exact grid remains unauthorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FAILED INCOMPLETE** | Structural evidence is accepted. Clean `d82d282` passed both model gates and all c2 legs, then the first c16 packed timed batch returned 96/96 HTTP 500. Driver PID `3866199` exited; no terminal marker exists; GPU/lock/port are clean/free | Preserve the root. Add bounded diagnostics for the discarded HTTP error body/server exception, reproduce the c16 boundary under a new SHA/root, then rerun all twelve legs |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FAILED INCOMPLETE; diagnostic instrumentation landed** | Structural evidence is accepted. Clean `d82d282` passed both model gates and all c2 legs, then the first c16 packed timed batch returned 0/96 HTTP 500 with no terminal marker. Bounded diagnostics for the discarded server exception now landed (four `std::cerr` error-path channels restoring vLLM's dropped fatal logs, `VT_GDN_DIAG_STEP_LOG` geometry, and a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`) | Run the DGX `--diagnostic-c16` reproduction under a fresh `diagnostic-c16` root, read the captured engine-fatal cause, repair test-first, then rerun all twelve legs |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -174,6 +183,34 @@ cmake -S "$ROOT/source" -B "$ROOT/build-production" -G Ninja \
 copied byte-for-byte from the binding `3f256ab` evidence; the separate 64-plan
 fixture is committed under `tests/fixtures/` and the runner requires it in
 read-only mode. Until the component gate passes, `benchmark_binding=false`.
+
+The **next entry point** is the bounded `--diagnostic-c16` reproduction from the
+pushed diagnostic SHA (the `d82d282` component root is immutable and must never
+be reused). It reruns the packed c16 boundary three times under one GPU lock,
+captures the now-restored `engine-fatal:` root cause on stderr (server log), and
+replays the failing corpus row into a persisted HTTP error body — writing only
+`component-diagnostic.json` and a `diagnostic/` subtree, never a sealable
+component. Provision `SNAPSHOT`/corpus/build exactly as above, then, with a new
+root whose basename contains `diagnostic-c16`:
+
+```sh
+SHA=<pushed diagnostic SHA>
+ROOT="$HOME/work/vllm.cpp-gdn-packed-diagnostic-c16/$SHA"
+# ... provision $ROOT/source, $ROOT/evidence-diagnostic-c16/corpus/27,
+#     $ROOT/build-production, $ROOT/configure.log exactly as the --execute recipe
+"$ROOT/source/scripts/dgx-gdn-packed-component.sh" --diagnostic-c16 \
+  --snapshot "$SNAPSHOT" \
+  --source-corpus "$ROOT/evidence-diagnostic-c16/corpus/27" \
+  --evidence "$ROOT/evidence-diagnostic-c16" \
+  --build-dir "$ROOT/build-production" \
+  --configure-log "$ROOT/configure.log" \
+  --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA"
+```
+
+The mode asserts the evidence basename contains `diagnostic-c16` and holds no
+`component-*.json`; it runs no model gates, no 2/16 sweep, and never calls
+`finalize`. `benchmark_binding` stays `false` throughout.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its

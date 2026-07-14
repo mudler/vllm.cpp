@@ -596,6 +596,48 @@ def _load_corpus_prompts(path: pathlib.Path, limit: int) -> list[str]:
     return prompts
 
 
+def capture_diagnostic_error_body(
+    url: str,
+    corpus: pathlib.Path,
+    output: pathlib.Path,
+    *,
+    output_len: int = 128,
+    model: str = "gate",
+    timeout: float = 60.0,
+) -> dict[str, Any]:
+    """Replay corpus row 0 as a non-streaming completion and persist the body.
+
+    Bounded ``--diagnostic-c16`` reproduction: unlike every timed path this
+    keeps the raw response even when the server answers HTTP 500, so the
+    root-cause error body of the packed c16 boundary is captured verbatim.
+    """
+
+    if output.exists():
+        raise HarnessError(f"refusing to overwrite diagnostic error body: {output}")
+    prompt = _load_corpus_prompts(corpus, 1)[0]
+    result = post_json(
+        url,
+        {
+            "ignore_eos": True,
+            "max_tokens": output_len,
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.0,
+            "top_p": 1.0,
+        },
+        timeout,
+    )
+    record = {
+        "status": result.status,
+        "body": result.body,
+        "diagnostic": True,
+        "mode": "diagnostic-c16",
+    }
+    write_json_atomic(output, record)
+    return record
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -640,6 +682,12 @@ def _parser() -> argparse.ArgumentParser:
     stream.add_argument("--output-len", type=int, default=128)
     stream.add_argument("--minimum-spread", type=float, default=0.05)
     stream.add_argument("--output", type=pathlib.Path, required=True)
+
+    diagnostic = subparsers.add_parser("diagnostic-error-body")
+    diagnostic.add_argument("--url", required=True)
+    diagnostic.add_argument("--corpus", type=pathlib.Path, required=True)
+    diagnostic.add_argument("--output-len", type=int, default=128)
+    diagnostic.add_argument("--output", type=pathlib.Path, required=True)
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--claim-root", type=pathlib.Path, required=True)
@@ -719,6 +767,13 @@ def main() -> int:
         )
         result = dataclasses.asdict(stream_result)
         write_json_atomic(args.output, result)
+    elif args.command == "diagnostic-error-body":
+        result = capture_diagnostic_error_body(
+            args.url,
+            args.corpus,
+            args.output,
+            output_len=args.output_len,
+        )
     else:
         if args.output.exists():
             raise HarnessError(f"refusing to overwrite dry-run manifest: {args.output}")

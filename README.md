@@ -17,16 +17,21 @@ OpenAI-compatible server.
 > 48 decomposed recurrence plus 48 post-conv calls with 48 packed calls while
 > leaving the remaining topology invariant. A production-build-only c2/c16
 > AB/BA/AB component runner and marker-last every-axis finalizer are
-> CPU-gated **45/45**. The pre-GPU invocation defect is now repaired with an
-> exact test requiring `record-execution --profile-control off`; all tool tests
-> pass **127/127**. The clean pushed `d82d282` series is **FAILED / INCOMPLETE**:
-> both direct model gates and all six c2 legs completed, then the first c16
-> packed leg passed its streaming preflight and 16 warmups but all 96 timed
-> requests returned HTTP 500. The driver exited without a marker-last status;
-> GPU, lock and port returned clean. Partial artifacts change no model, timing,
-> memory, binding, or speed result. Host
-> memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
-> performance result is claimed. See
+> CPU-gated **45/45**. The clean pushed `d82d282` series is
+> **FAILED / INCOMPLETE**: both direct model gates and all six c2 legs
+> completed, then the first c16 packed leg passed its streaming preflight and 16
+> warmups but all **0/96** timed requests returned HTTP 500. The root cause was
+> unrecoverable because our port dropped two upstream fatal log lines. A bounded
+> **test-first diagnostic checkpoint** now restores them: four unconditional
+> `std::cerr` error-path channels (`engine-fatal:` at the busy-loop guard,
+> `async-llm:` at the output handler, `api-server:` at both 500 sites, `sse:`
+> mid-flight) plus an opt-in `VT_GDN_DIAG_STEP_LOG` geometry trace, and a
+> packed-only `--diagnostic-c16` driver mode kept fully separate from the gating
+> component (`component-diagnostic.json`; the finalizer refuses diagnostic
+> evidence). Six RED→GREEN tests land it; all tool tests pass **132/132**. The
+> packed component still `GATING`, no speed credit, and the DGX `--diagnostic-c16`
+> reproduction is the next step. Host memory still retains a **22.92 GiB CPU
+> weight mirror**, and no 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
@@ -34,7 +39,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the `d82d282` component stopped at c16 packed r1 with 96/96 HTTP 500 responses and no terminal marker | Capture the hidden server exception at the same c16 boundary, repair test-first, then rerun from a new SHA/root before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the `d82d282` component stopped at c16 packed r1 with 0/96 HTTP 500 and no terminal marker. A bounded test-first diagnostic checkpoint landed (four error-path log channels + `VT_GDN_DIAG_STEP_LOG` + `--diagnostic-c16` mode) to expose the dropped root cause | Run the DGX `--diagnostic-c16` reproduction from the pushed SHA in a fresh `diagnostic-c16` root, read the captured engine-fatal cause, repair test-first, then rerun the component before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -62,7 +67,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. Clean `d82d282` completed both model gates and all c2 legs, then failed incomplete at c16 packed r1: preflight/warmups passed, 96/96 timed requests returned HTTP 500, and no status was sealed. The root is preserved; no partial number binds |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. Clean `d82d282` completed both model gates and all c2 legs, then failed incomplete at c16 packed r1: preflight/warmups passed, 0/96 timed requests returned HTTP 500, and no status was sealed. Diagnostic instrumentation landed (four `std::cerr` error-path channels restoring vLLM's dropped fatal logs, `VT_GDN_DIAG_STEP_LOG` geometry, and a packed-only `--diagnostic-c16` mode isolated to `component-diagnostic.json`); the DGX diagnostic reproduction is pending. No partial number binds |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -134,7 +139,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the `d82d282` component failed incomplete at c16 HTTP 500 with no marker, and qkvz remains blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the `d82d282` component failed incomplete at c16 HTTP 500 with no marker. A bounded test-first diagnostic checkpoint landed to expose the dropped root cause; the DGX `--diagnostic-c16` reproduction is pending, and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -153,7 +158,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The `d82d282` c2/c16 run stopped at its first c16 timed batch with no terminal status; completed c2 legs are nonbinding |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The `d82d282` c2/c16 run stopped at its first c16 timed batch (0/96 HTTP 500) with no terminal status; completed c2 legs are nonbinding. A test-first diagnostic checkpoint (error-path log channels + `--diagnostic-c16` mode) now targets the dropped root cause |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 
@@ -184,7 +189,9 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: expose/diagnose the c16 HTTP 500 and rerun the packed-GDN component → implement/gate
+The next execution order is fixed: run the DGX `--diagnostic-c16` reproduction to
+read the now-exposed c16 HTTP 500 root cause, repair test-first, rerun the
+packed-GDN component → implement/gate
 merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /

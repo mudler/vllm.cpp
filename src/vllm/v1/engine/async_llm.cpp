@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/async_llm.h"
 
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -151,6 +152,17 @@ void AsyncLLM::RunOutputHandler() {
     }
   } catch (...) {
     if (!stopping_.load()) {
+      // Restore the upstream fatal log (vllm/v1/engine/async_llm.py:703-705:
+      // logger.exception("AsyncLLM output_handler failed.") before
+      // output_processor.propagate_error(e)). std::cerr only, so the witness
+      // survives a SIGKILL escalation.
+      try {
+        std::rethrow_exception(std::current_exception());
+      } catch (const std::exception& e) {
+        std::cerr << "async-llm: output handler saw engine death: " << e.what()
+                  << "\n";
+      } catch (...) {
+      }
       errored_.store(true);
       std::lock_guard<std::mutex> lock(output_processor_mutex_);
       output_processor_.propagate_error(std::current_exception());

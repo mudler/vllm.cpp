@@ -2,8 +2,8 @@
 
 **Row:** `KERNEL-GDN-PACKED-DECODE` · **consumers:**
 `KERNEL-GEMM-BF16`, `SERVE-GATE-ONLINE` · **status:** spike complete,
-implementation `ACTIVE` under `CLAIM-GDN-BA-ROUNDING-1` · **priority:**
-roadmap order 0.
+implementation `ACTIVE` under `CLAIM-GDN-BA-ROUNDING-1`; W1D1/G1 closed at
+clean `9ad8fb7`, W1D2 model dispatch current · **priority:** roadmap order 0.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -92,7 +92,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Projection proof | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/` | Immutable `f925294` passes all five real BA shapes exactly; the divergence is not the GEMM. |
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
-| W1D1 packed operator | `include/vt/ops.h`; `src/vt/{ops.cpp,cpu/cpu_ops.cpp,cuda/cuda_gdn.cu}`; `tests/vt/test_ops_gdn.cpp` | Public validation, portable recurrence, FP16/BF16/F32 CUDA kernel and registrations are implemented. Mutable local/CUDA/capture/canary/memcheck preflight is green and the direct fixture remains `0/1`; clean pushed-SHA G1 is pending, so this carries no immutable or speed credit. |
+| W1D1 packed operator | `include/vt/ops.h`; `src/vt/{ops.cpp,cpu/cpu_ops.cpp,cuda/cuda_gdn.cu}`; `tests/vt/test_ops_gdn.cpp` | Clean pushed `9ad8fb7` closes G1 for public validation, portable recurrence, FP16/BF16/F32 CUDA kernel and registrations. Focused CUDA **5/5**, direct fixture `0/1`, full GDN **41/41**, capture/canaries and strict memcheck **2/2 with zero errors/leaks** pass. This carries immutable operator/safety credit but no model or speed credit. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -143,8 +143,8 @@ Additional mandatory local gates:
   implementation.
 - On the pushed SHA, regenerate the fixture in the official v0.25 environment
   and replay the focused CUDA test under one `/tmp/gpu` lock.
-- Record source/binary/fixture/log hashes. The current mutable preflight is
-  diagnostic only and cannot close G0.
+- Record source/binary/fixture/log hashes. Clean `f18ca23` closes this gate;
+  the earlier mutable preflight remains diagnostic only.
 
 ### G1 — operator parity and safety
 
@@ -208,7 +208,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
-| W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **IMPLEMENTED / MUTABLE GREEN:** local full GDN **39/39**, focused ASan+UBSan **5/5**, CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Commit/push and clean immutable G1 remain pending. |
+| W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | G2 real-model and zero-selection gates green. |
 | W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |
 

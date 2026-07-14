@@ -8593,3 +8593,51 @@ BF16 end-to-end at **233/235**, and `benchmark_binding=false`; it earns no
 speed credit. Next: commit/push this code and live record, create a fresh
 SHA-owned detached DGX root, rebuild, and repeat the complete G1 matrix,
 official `0/1` replay, capture/canaries and strict memcheck before W1D2 starts.
+
+## 2026-07-14 — clean pushed `9ad8fb7` closes packed-decode W1D1/G1
+
+The W1D1 implementation and its same-change live record were committed as
+`9ad8fb76940e68737d2a13ad8ddd97d649bb577c` and pushed to `main`. A fresh
+DGX root at
+`~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`
+then cloned the remote commit, detached at that exact SHA, remained source
+clean, and configured a Release CUDA 13.0.88 / sm_121a build with Triton AOT,
+FlashAttention and the server enabled. One uninterrupted `/tmp/gpu` lock
+covered the complete G1 sequence. LocalAI remained `exited` with
+`restart=no`; GPU and lock were empty before and after.
+
+The official vLLM v0.25 oracle regenerated the committed fixture byte for
+byte: before/after ordered fixture-list SHA-256 values are both
+`03b3c2a4640bff33d4c5a5c3bc5c48ac37dfc6c45e0d2bf5656c419f9ca201ab`,
+and the fixture diff plus final source status are empty
+(`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+Focused packed CUDA passes **5/5 cases, 167/167 assertions**; the direct
+official boundary passes **1/1, 12/12** and remains **0/1** output/state BF16
+differences; strict compute-sanitizer passes **2/2, 97/97 with zero errors and
+zero leaks**; the full CUDA GDN suite passes **41/41, 1,570/1,570**. The prior
+fresh local **39/39, 434/434** and clean ASan+UBSan **5/5, 70/70** results
+remain the host-side gates.
+
+The terminal status is `complete-g1`, with `status.txt` SHA-256
+`0960defeb96c3dc51d5b6568e433a6a4b03ba8d06db7b49e69e8272b4b88bb26`.
+Configure/build/oracle/focused/boundary/memcheck/full-GDN log hashes are
+`2e4d8119910aecfe6bf9c5c6e10868de705a91d08eedb1ea1475d12d5d2aedff`,
+`8502e2d4f8c9a28e17eb785dfca4fe985161217616366f3ace670a07941b144f`,
+`44e0fe8e2226fe224335eedfde41d4a62a9ff8f36f3a729ba1bd21fd1a8acff1`,
+`d9bd7082f34187026a7ad413b06960bac4025d6aa751f543979e64a193ea2bb3`,
+`9ea54714f6a52721a51c729f307c53e1bcd6671012f6f21ef0fbb469978cab87`,
+`47231b51c7e80e3cfb519b372938fed0de3ca8b4eaf7d7581b3439fee9b04059`,
+and `89a1fadca1787af999132b422ecb8e843dc9c88b342d35fbb3c54a0cf1ea72cd`.
+The focused/full test binaries are
+`b819c0dd6913951f898b69a5df62228a463b0b843be3f1592628aa830ecbbd1a` and
+`ce279543411fb72b005bbc0d6e227ff29babbe62dfa7631fe5a839172b5dcb71`.
+
+This closes operator parity/safety only. `KERNEL-GDN-PACKED-DECODE` remains
+`ACTIVE`, BF16 end-to-end remains **233/235**, binding remains **55/124**, and
+`benchmark_binding=false`; no model-selection, timing, memory or speed credit
+is claimed. W1D2 is next: select the packed path only for exact pure non-spec
+decode before decomposed intermediates are allocated, add the process-cached
+`VT_GDN_PACKED_DECODE=0` rollback, validate host indices before upload, and
+prove default plus rollback **235/235 + 16/16** with zero selection for
+prefill/mixed/spec/35B. qkvz, the exact grid and 35B performance remain
+prohibited.

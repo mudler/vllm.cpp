@@ -333,9 +333,9 @@ Pinned executable-spec inventory for the chunked prefill path:
   [gdn-packed-decode.md](gdn-packed-decode.md). The committed BF16 boundary
   oracle proves beta-only is insufficient and that packed q/k normalization
   plus dtype-rounded beta reproduces the oracle at `0/1` output/state BF16
-  differences. Clean `f18ca23` closes semantic G0; the W1D1 CPU/CUDA operator
-  and upstream matrix are implemented with mutable safety green, while clean
-  pushed-SHA G1 and production model dispatch remain open.
+  differences. Clean `f18ca23` closes semantic G0; clean `9ad8fb7` closes
+  W1D1/G1 for the CPU/CUDA operator, upstream matrix, capture/canaries and
+  strict memcheck. Production model dispatch and 235/235 remain open.
 
 - `tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness`
   (lines 33-199): **ported in substance** to `tests/vt/test_ops_gdn.cpp`.

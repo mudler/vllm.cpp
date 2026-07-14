@@ -18,13 +18,14 @@ recurrence and rounds sigmoid beta through BF16. Clean pushed `f18ca23`
 regenerated the official v0.25 fixture byte-for-byte and its focused CUDA test
 passed **10/10**, reproducing current **306/7552**, beta-only **308/6558**, and
 both upstream semantics **0/1** output/state BF16 differences. This closes
-immutable semantic gate G0. W1D1 now implements the public FP16/BF16/F32 CPU
-reference and CUDA packed operation plus the upstream contiguous/strided and
-state-index matrix. Its mutable preflight passes full local GDN **39/39**,
-focused ASan+UBSan **5/5**, full CUDA GDN **41/41**, direct packed **0/1**, and
-strict memcheck with zero errors/leaks. These dirty-tree results are
-non-binding: clean pushed-SHA G1, model dispatch, 235/235 and the 40+8-axis
-c2/c16 component are **PENDING**, so no accepted performance number changes.
+immutable semantic gate G0. Clean pushed `9ad8fb7` now closes W1D1/G1 for the
+public FP16/BF16/F32 CPU reference, CUDA packed operation, and full upstream
+contiguous/strided state-index matrix. The immutable DGX replay passes focused
+packed **5/5, 167 assertions**, full CUDA GDN **41/41, 1,570 assertions**,
+direct packed **0/1**, and strict memcheck **2/2, 97 assertions, zero
+errors/leaks**; fixture regeneration is byte-identical. Model dispatch,
+235/235 and the 40+8-axis c2/c16 component are **PENDING**, so no accepted
+performance number changes.
 
 ## Binding 27B online gate
 
@@ -71,7 +72,7 @@ performance command is authorized until the 27B result reaches 124/124.
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Close packed decode and its c2/c16 component; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness; BF16 remains **233/235**, `benchmark_binding=false` | Depends on `KERNEL-GDN-PACKED-DECODE`; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / IMMUTABLE G1 PENDING** | W1D1 public CPU/CUDA op and full upstream dtype/stride matrix are implemented. Mutable preflight: CUDA **5/5, 167 assertions**, direct fixture **0/1**, full GDN **41/41**, memcheck **2/2, 97 assertions, 0 errors/leaks** | Commit/push and replay clean G1; then wire W1D2, restore 235/235, and run node trace plus c2/c16 AB/BA/AB |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D1-G1 PASSED** | Clean pushed `9ad8fb7`: CUDA **5/5, 167 assertions**, direct fixture **0/1**, full GDN **41/41, 1,570 assertions**, memcheck **2/2, 97 assertions, 0 errors/leaks**; fixture regeneration is byte-identical | Wire W1D2, restore 235/235 in default and rollback arms, then run node trace plus c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -91,9 +92,9 @@ identical calls are bit-stable. Against the packed result:
 | Current local `GdnPostConv + GdnDecode` | 306 | 7,552 | Rejects the current decomposed BF16 consumer |
 | Local beta rounding only | 308 | 6,558 | Rejects the beta-only hypothesis |
 | Local beta rounding + F32 q/k norm | 0 | 1 | Selects the complete packed port |
-| W1D1 direct packed operator, dirty-tree preflight | 0 | 1 | Implementation agrees; non-binding until clean pushed-SHA G1 |
+| W1D1 direct packed operator, clean `9ad8fb7` G1 | 0 | 1 | Immutable operator agreement; model selection and performance remain unproven |
 
-The local rows are now reproduced from clean pushed `f18ca23` and retain
+The G0 semantic rows are reproduced from clean pushed `f18ca23` and retain
 `benchmark_binding=false`. Evidence root:
 `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`.
 The fixture hash lists are identical at SHA-256 `03b3c2a4…01ab`; both diff
@@ -115,12 +116,19 @@ G0 satisfies the exact-clean-commit, vLLM version/target, unchanged-fixture,
 `0/1`, and provenance requirements. W1D1 adds public validation, portable CPU
 recurrence, the CUDA packed kernel, FP16 storage conversion, the full upstream
 3-dtype × 2-stride matrix, local slot-zero/negative-padding coverage, capture
-with two replays, allocation canaries and strict memcheck. The mutable exact
-checkpoint is local **39/39, 434 assertions**, ASan+UBSan **5/5, 70
-assertions**, CUDA focused **5/5, 167 assertions**, full CUDA GDN **41/41,
-1,570 assertions**, direct boundary **1/1, 12 assertions** at `0/1`, and
-compute-sanitizer **2/2, 97 assertions, 0 errors/leaks**. The next reproduction
-must rebuild those exact committed bytes from a clean pushed SHA:
+with two replays, allocation canaries and strict memcheck. Clean pushed
+`9ad8fb76940e68737d2a13ad8ddd97d649bb577c` closes G1 from
+`~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`:
+local precommit **39/39, 434 assertions** and clean ASan+UBSan **5/5, 70
+assertions** are retained; the immutable DGX build passes focused CUDA **5/5,
+167 assertions**, full CUDA GDN **41/41, 1,570 assertions**, direct boundary
+**1/1, 12 assertions** at `0/1`, and compute-sanitizer **2/2, 97 assertions,
+0 errors/leaks**. `status.txt` is `0960defe…b26`, fixture before/after lists
+are both `03b3c2a4…01ab`, and the empty fixture diff/source status are
+`e3b0c442…b855`. Configure/build/oracle/focused/boundary/memcheck/full-GDN logs
+are `2e4d8119…dff` / `8502e2d4…4f` / `44e0fe8e…ff1` /
+`d9bd7082…bb3` / `9ea54714…b87` / `47231b51…059` / `89a1fadc…72cd`.
+The exact immutable reproduction commands are:
 
 ```sh
 flock /tmp/gpu build-cuda/tests/test_ops_gdn \
@@ -132,8 +140,8 @@ flock /tmp/gpu /usr/local/cuda-13.0/bin/compute-sanitizer \
   build-cuda/tests/test_ops_gdn -tc='CUDA gdn packed decode*'
 ```
 
-Model and performance commands remain unauthorized until clean G1 and W1D2
-close their correctness/selection gates.
+Model and performance commands remain unauthorized until W1D2 closes its
+correctness and selection gates.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its

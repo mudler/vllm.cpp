@@ -12,8 +12,10 @@ OpenAI-compatible server.
 > The post-W3-I residual scan is complete. At c2 our TTFT is already better,
 > but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
 > binding diagnostic therefore measures vLLM v0.25.0 with its default async
-> scheduler explicitly on and off on the identical c2 corpus; no async speed
-> credit or implementation claim exists yet. Separately, the host-memory gap
+> scheduler explicitly on and off on the identical c2 corpus. Its first clean
+> attempt is **VOID before measurement** because the non-login EngineCore
+> `PATH` omitted the oracle venv's `ninja`; the fresh repaired run is pending,
+> with no async speed credit or implementation claim. Separately, the host-memory gap
 > is traced to a persistent **22.92 GiB CPU weight mirror** plus load-time
 > safetensors residency. The binding result remains **55/124**, W3-I stays
 > default-off, and no 35B performance result is claimed. See
@@ -52,7 +54,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus; the trace harness now records requested and resolved scheduler modes. Result **PENDING** |
+| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus. First attempt `4d85ead` is **VOID before requests** on missing `ninja`; the repaired fresh-root run prepends the oracle venv/CUDA tools. Result remains **PENDING** |
 | GPU fallback if async is neutral | Map the 129 RMSNorm and 144 normal-FP4 nodes, then gate vectorized residual-add RMSNorm; W3-H2's measured ceiling is only about 0.25% end to end |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |

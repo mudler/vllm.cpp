@@ -21,8 +21,10 @@ earns no speed credit. The mandated post-I1 scan is now complete. At c2 ours
 has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1% slower**).
 vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path is the only
 unmeasured structural difference with a 4–6% budget. The next gate is therefore
-an exact vLLM async ON/OFF c2 timing + Torch-trace control; profiler mode
-selection is CPU-tested and the GPU result is `PENDING`. If neutral, the speed
+an exact vLLM async ON/OFF c2 timing + Torch-trace control. Profiler mode
+selection is CPU-tested; first clean setup `4d85ead` is `VOID` before requests
+because FlashInfer JIT could not find `ninja` in spawned EngineCore's `PATH`.
+The fresh venv/CUDA-PATH repair is `PENDING`. If neutral, the speed
 track moves to low-batch kernel traces and exact RMSNorm/generated-partition
 mapping. Host PSS/RSS is independently grounded in a persistent **22.920 GiB**
 CPU weight mirror plus load-time source-page residency.

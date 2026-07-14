@@ -10,9 +10,10 @@ Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 The post-W3-I scan is complete: the largest binding low-concurrency symptom is
 c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
-better TTFT. The next checkpoint is an exact vLLM async-scheduler ON/OFF c2
-control on the same corpus; its timing and paired trace are **PENDING**, so W3
-has no speed credit yet. Host PSS/RSS is independently traced to a persistent
+better TTFT. The first exact async-scheduler control attempt (`4d85ead`) is
+**VOID before any request**: FlashInfer JIT reached warmup but could not find
+`ninja` on the spawned EngineCore `PATH`. A fresh root with the oracle venv and
+CUDA tools prepended is **PENDING**, so W3 has no speed credit yet. Host PSS/RSS is independently traced to a persistent
 **22.920 GiB** CPU weight mirror plus source-page residency during load. W3-I
 remains default-off after its **30/48** component failure.
 
@@ -61,7 +62,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Run the exact c2 async ON/OFF oracle control, then gate the selected lever before rerunning the grid |
-| vLLM async-scheduler credit | **PENDING / DIAGNOSTIC PREPARED** | Binding logs confirm v0.25.0 resolved async ON. The profiler supports explicit `default`/`on`/`off` modes and records the resolved mode; local contract tests pass | Paired c2 timing plus Torch traces under one uncontended GPU lock; promote W3 only if the credit explains the decode gap |
+| vLLM async-scheduler credit | **FAILED / VOID SETUP; REPAIRED RUN PENDING** | Clean `4d85ead` reached the first ON arm's FlashInfer JIT warmup, then failed on missing `ninja`; zero client requests, raw results, or traces exist. Series/server SHA `a6113854…60e0` / `1c5a2009…0a3f`; cleanup returned lock/GPU/port idle | Use a new commit-owned root and prepend `$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin` before the same six timing legs and two traces |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -105,8 +106,26 @@ MODEL="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots
 CORPUS="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27/vllm/c2-r1.jsonl"
 OUT="$HOME/work/vllm-async-credit/702f4814fe54/c2"
 
+# The timing lifecycle starts a fresh server for each leg in this exact order:
+# on-r1, off-r1, off-r2, on-r2, on-r3, off-r3. Each server uses:
+#   vllm serve "$MODEL" --served-model-name gate --port 8001 \
+#     --gpu-memory-utilization 0.6 --max-num-seqs 32 \
+#     --max-num-batched-tokens 2048 --no-enable-prefix-caching \
+#     {--async-scheduling|--no-async-scheduling}
+# After /health and the matching enabled/disabled log assertion, each client is:
+#   vllm bench serve --backend openai --base-url http://127.0.0.1:8001 \
+#     --endpoint /v1/completions --model gate --tokenizer "$MODEL" \
+#     --dataset-name custom --dataset-path c2-rN.jsonl \
+#     --custom-output-len 128 --skip-chat-template --disable-shuffle \
+#     --num-prompts 6 --max-concurrency 2 --request-rate inf \
+#     --num-warmups 2 --seed 0 --ignore-eos --temperature 0 \
+#     --percentile-metrics ttft,tpot,itl,e2el \
+#     --metric-percentiles 50,90,99 --save-result --save-detailed \
+#     --result-dir "$OUT/raw" --result-filename MODE-rN.json --disable-tqdm
+
 flock /tmp/gpu bash -c '
   set -e
+  export PATH="$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin:$PATH"
   for mode in on off; do
     "$HOME/venvs/vllm-oracle/bin/python" \
       tools/bench/profile_vllm_online_gate.py \

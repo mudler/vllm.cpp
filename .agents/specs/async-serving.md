@@ -22,8 +22,10 @@ that resolution. The 27B gate has better local TTFT at c2 but local TPOT is
 **114.841 vs 108.274 ms** (**6.1% slower**). The post-W3-I scan finds no known
 GPU-only leaf with a comparable end-to-end budget, so the next decision is an
 exact vLLM async ON/OFF c2 timing + Torch-trace control on the binding corpus.
-The profiler can now force `default`/`on`/`off` and records the resolved mode;
-the GPU result is `PENDING`. A positive 4–6% credit promotes W3 for an explicit
+The profiler can force `default`/`on`/`off` and records the resolved mode.
+First clean GPU setup `4d85ead` is `VOID` before requests because FlashInfer
+JIT could not find `ninja` in spawned EngineCore's `PATH`; the fresh
+venv/CUDA-PATH repair is `PENDING`. A positive 4–6% credit promotes W3 for an explicit
 claim. A neutral control keeps W3 as later parity work and returns the speed
 track to low-batch kernel mapping.
 
@@ -90,7 +92,7 @@ the default-ON trace as the port target.
 | Scheduler | Output placeholders are fixed at zero (`src/vllm/v1/core/sched/scheduler.cpp:143-145,587-600`) | `AsyncScheduler` placeholder/stale-frame/cache accounting |
 | Sampled token | Greedy allocates a transient device buffer, copies into pageable `std::vector`, synchronizes the main queue, then CPU-writes the next token (`src/vllm/v1/sample/sampler.cpp:30-53,90-99`; `src/vllm/v1/worker/gpu/runner.cpp:688-723`) | Persistent GPU `last_sampled_tokens`, on-device combine/post-update, and pinned nonblocking output copy |
 | Runtime seam | `vt::Backend` exposes queue creation/copy/synchronize but no public event or pinned-host allocation API (`include/vt/backend.h:15-34`) | Add backend-neutral event/wait and pinned-output ownership, with synchronous CPU degeneration; current graph-stream code proves streams only, not events |
-| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; unit contract is green | Uncontended c2 ON/OFF timing and Torch traces remain `PENDING` |
+| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; unit contract is green | First `4d85ead` setup `VOID` before requests on missing EngineCore `ninja`; fresh venv/CUDA-PATH c2 timing and traces `PENDING` |
 
 ## Port map
 

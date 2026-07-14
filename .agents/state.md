@@ -7802,3 +7802,21 @@ README, BENCHMARKS, roadmap, matrices, coordination, environment, and the two
 live serving specs were compacted to this binding snapshot. Superseded W3-I and
 trace-attempt narratives remain only in this append-only log, the parity
 ledger, Git, and immutable evidence roots, per the periodic compaction rule.
+
+## 2026-07-14 — first async-credit execution is void before requests
+
+Clean pushed `4d85ead5e4d9c8eaa72698813869f5ac226474f3` was cloned into
+`~/work/vllm-async-credit/4d85ead5e4d9c8eaa72698813869f5ac226474f3`
+and the exact binding c2 corpora passed SHA checks. One `/tmp/gpu` lock covered
+the attempted series. The first explicit-ON server resolved vLLM 0.25.0 and
+loaded the 24.6 GiB checkpoint, but FlashInfer JIT warmup failed before server
+readiness because spawned EngineCore could not execute bare `ninja`; the
+non-login shell omitted `$HOME/venvs/vllm-oracle/bin` from `PATH`.
+
+No warmup request, timed request, raw result, or Torch trace exists. The root
+is **FAILED / VOID** and cannot be reused. Series/server-log SHA values are
+`a6113854…60e0` / `1c5a2009…0a3f`. Cleanup returned the GPU, `/tmp/gpu`, and
+port 8001 idle. Binding `3f256ab` remains **55/124** and W3 stays unowned
+`READY` with no credit. The repaired recipe creates a new commit-owned root
+and prepends `$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin` before all
+six AB/BA/AB timing legs and both profiler arms under one lock.

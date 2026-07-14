@@ -250,8 +250,8 @@ _CUDA_PROFILE_STARTED_RE = re.compile(
     r"prior_replays=(\d+)$"
 )
 _CUDA_PROFILE_STOPPED_RE = re.compile(
-    r"^\[VT_CUDA_PROFILE\] stopped captured_replays=(\d+) "
-    r"graph=(0x[0-9a-f]+)$"
+    r"\[VT_CUDA_PROFILE\] stopped captured_replays=(\d+) "
+    r"graph=(0x[0-9a-f]+)"
 )
 _BENCH_SHUTDOWN_READY_RE = re.compile(
     r"^\[VT_BENCH_SHUTDOWN\] ready pid=(\d+) control=fifo$"
@@ -2079,7 +2079,14 @@ def _parse_profile_markers(
         raise HarnessError(f"profile log is absent: {path}") from error
     ready = [match for line in lines if (match := _CUDA_PROFILE_READY_RE.fullmatch(line))]
     started = [match for line in lines if (match := _CUDA_PROFILE_STARTED_RE.fullmatch(line))]
-    stopped = [match for line in lines if (match := _CUDA_PROFILE_STOPPED_RE.fullmatch(line))]
+    stopped_candidates = [
+        (line, match)
+        for line in lines
+        for match in _CUDA_PROFILE_STOPPED_RE.finditer(line)
+    ]
+    stopped = [
+        match for line, match in stopped_candidates if match.end() == len(line)
+    ]
     shutdown_ready = [
         match for line in lines if (match := _BENCH_SHUTDOWN_READY_RE.fullmatch(line))
     ]
@@ -2093,7 +2100,12 @@ def _parse_profile_markers(
         for line in lines
         if (match := _BENCH_SHUTDOWN_COMPLETED_RE.fullmatch(line))
     ]
-    if len(ready) != 1 or len(started) != 1 or len(stopped) != 1:
+    if (
+        len(ready) != 1
+        or len(started) != 1
+        or len(stopped_candidates) != 1
+        or len(stopped) != 1
+    ):
         raise HarnessError("profile log does not contain one complete CUDA profile sequence")
     if (
         len(shutdown_ready) != 1

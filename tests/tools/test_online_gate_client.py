@@ -914,6 +914,146 @@ class OnlineClientContractTests(unittest.TestCase):
                     shutdown_fifo=root / "shutdown.fifo",
                 )
 
+    def test_profile_control_accepts_nsys_progress_before_stopped_marker(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            marker = "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234"
+            profile_log.write_text(
+                profile_log.read_text(encoding="utf-8").replace(
+                    marker,
+                    "\r[4/4] [========================100%] ours-r3.4.nsys-rep"
+                    + marker,
+                ),
+                encoding="utf-8",
+            )
+
+            result = record_profile_control(
+                root / "control.json",
+                profile_log=profile_log,
+                nsys_pid=5000,
+                nsys_pgid=5000,
+                nsys_sid=5000,
+                nsys_exit_status=0,
+                launcher_pid=5500,
+                launcher_ppid=5000,
+                launcher_pgid=5000,
+                launcher_sid=5000,
+                launcher_comm="nsys-launcher",
+                server_pid=6000,
+                server_ppid=5500,
+                server_pgid=6000,
+                server_sid=6000,
+                shutdown_fifo=root / "shutdown.fifo",
+            )
+
+            self.assertEqual(result["captured_replays"], 4)
+            self.assertEqual(result["graph"], "0x1234")
+
+    def test_profile_control_rejects_duplicate_stopped_marker_on_one_line(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            marker = "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234"
+            profile_log.write_text(
+                profile_log.read_text(encoding="utf-8").replace(
+                    marker, marker + marker
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                HarnessError, "complete CUDA profile sequence"
+            ):
+                record_profile_control(
+                    root / "control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=6000,
+                    server_sid=6000,
+                    shutdown_fifo=root / "shutdown.fifo",
+                )
+
+    def test_profile_control_rejects_suffix_after_stopped_marker(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        fixture = (
+            repo
+            / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            profile_log = root / "profile.log"
+            native = root / "native-must-not-exist.json"
+            write_profile_log(
+                profile_log,
+                fixture=fixture,
+                native_target=native,
+                server_pid=6000,
+            )
+            marker = "[VT_CUDA_PROFILE] stopped captured_replays=4 graph=0x1234"
+            profile_log.write_text(
+                profile_log.read_text(encoding="utf-8").replace(
+                    marker, marker + " trailing-garbage"
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                HarnessError, "complete CUDA profile sequence"
+            ):
+                record_profile_control(
+                    root / "control.json",
+                    profile_log=profile_log,
+                    nsys_pid=5000,
+                    nsys_pgid=5000,
+                    nsys_sid=5000,
+                    nsys_exit_status=0,
+                    launcher_pid=5500,
+                    launcher_ppid=5000,
+                    launcher_pgid=5000,
+                    launcher_sid=5000,
+                    launcher_comm="nsys-launcher",
+                    server_pid=6000,
+                    server_ppid=5500,
+                    server_pgid=6000,
+                    server_sid=6000,
+                    shutdown_fifo=root / "shutdown.fifo",
+                )
+
     def test_profile_control_accepts_only_the_requested_low_batch(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         fixture = (
@@ -1079,6 +1219,15 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("for _ in $(seq 1 60); do", script)
         self.assertIn("((capture_closed == 1))", script)
         self.assertIn('kill -0 "${server_pid}" 2>/dev/null || break', script)
+        self.assertIn(
+            "grep -q '\\[VT_CUDA_PROFILE\\] stopped captured_replays=4 "
+            "graph=0x[0-9a-f][0-9a-f]*$'",
+            script,
+        )
+        self.assertNotIn(
+            "grep -q '^\\[VT_CUDA_PROFILE\\] stopped captured_replays=4",
+            script,
+        )
         probe_index = script.index(
             '--artifact-tag "${artifact_prefix}trace${trace_rep}-probe"'
         )

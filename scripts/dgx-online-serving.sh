@@ -677,7 +677,7 @@ run_paired_traces() {
       --artifact-tag "${artifact_prefix}trace${trace_rep}-probe"
     local capture_closed=0
     for _ in $(seq 1 60); do
-      if grep -q '^\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}"; then
+      if grep -q '\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}"; then
         capture_closed=1
         break
       fi

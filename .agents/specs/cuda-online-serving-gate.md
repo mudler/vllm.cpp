@@ -41,16 +41,17 @@ implements the CPU/CUDA operator and upstream matrix; clean `9ad8fb7` closes
 G1 with focused **5/5**, full GDN **41/41**, direct `0/1` and strict memcheck
 **2/2 with zero errors/leaks**. Clean `f344dec` closes W1D2 model dispatch and
 immutable G2; paired node traces and c2/c16 remain pending.
-The W1D3 packed/rollback extension is now implemented and CPU-gated **79/79**:
-it records exact toggle provenance, preserves historical graph contracts,
-requires 915/963 nodes under one lock and writes its structural marker last.
-The clean `8fbb950` attempt built 154/154, then failed before the GPU lock
-because the driver inherited an absent H1d plan environment. All model-bearing
-commands now use `/usr/bin/env -i`, an explicit source-root `PYTHONPATH`, a
-fixed host allowlist and source/evidence-derived plan settings; trace
-finalization validates the exact recorded command environments. No immutable
-W1D3 trace or speed
-result exists yet.
+The W1D3 packed/rollback extension records exact toggle provenance, preserves
+historical graph contracts, requires 915/963 nodes under one lock and writes
+its structural marker last. Clean `4804ee4` built 154/154, passed the model
+gate, and validated packed repetitions 1–2 as eight exact 915-node ranges.
+Repetition 3 captured four raw reports, but Nsight prefixed progress text to
+the intact stop marker; the line-anchored poll rejected the attempt before
+repetition-3 export, packed-vLLM, or rollback. That root is FAILED/VOID. The
+parser now permits a prefix before the stop marker while retaining a
+line-ending marker, exact one-occurrence, four-replay, and graph-identity
+validation; the full tool suite passes **82/82**. No immutable W1D3 trace or speed result exists
+yet.
 qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
@@ -285,8 +286,9 @@ reported as a clean dependency check.
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
    24 local range contracts with `benchmark_binding=false`. Close paired node
    traces plus c2/c16
-   component disposition. The packed/rollback extension and deterministic plan
-   repair pass **79/79** tools and await replacement immutable DGX capture; only
+   component disposition. Clean `4804ee4` validated eight packed ranges before
+   the marker-prefix race voided the incomplete attempt; the parser repair
+   passes **82/82** tools and awaits fresh immutable DGX capture. Only
    then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.

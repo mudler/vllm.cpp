@@ -8857,3 +8857,55 @@ requirement. Independent final re-review repeated the focused 2/2, complete
 Critical/Important finding. Next: commit/push the repair, create a fresh
 repair-SHA root, rerun the exact one-lock trace, then finalize marker-last.
 Binding stays **55/124**, `benchmark_binding=false`, and qkvz remains blocked.
+
+### 2026-07-14 — W1D3 replacement reaches packed trace; shared-log marker race voids it
+
+Clean pushed `4804ee44357e7e38819aca141c4c9e9d33a2ebfa` executed from the fresh
+detached DGX root
+`~/work/vllm.cpp-gdn-packed-trace/4804ee44357e7e38819aca141c4c9e9d33a2ebfa`.
+The exact RelWithDebInfo CUDA 13.0.88/sm_121a, FlashInfer CUTLASS, Marlin,
+vendored Triton AOT, FA2 and profile-control build completed **154/154**. The
+clean `/usr/bin/env -i` execution manifest passed, and the real 27B model gate
+passed **1/1 in 18.84 s**. Manifest / execution / configure / build /
+model-gate / run-log SHA-256 values are `1bea839a…8ba7` / `79087688…c399` /
+`2abd017c…a15` / `5e76d6d9…e77` / `634873d8…b727` / `da44ec34…c49`.
+
+Packed repetitions 1 and 2 each completed the 6-request semantic workload and
+2-request probe, shut down cleanly, exported all four ranges, and validated
+**8/8** exact primary graphs. Every graph has **915 nodes**, **145 BF16 GEMMs**,
+**208 FP4 GEMMs**, **64 fused + 144 normal FP4 producers**, **48 packed GDN
+recurrences**, zero decomposed/post-conv GDN nodes, and **16 + 16** FA2
+main/combine nodes. Repetition 3 also completed both client workloads and
+Nsight wrote four raw reports. Its intact
+`[VT_CUDA_PROFILE] stopped captured_replays=4` marker was emitted once, but
+Nsight's carriage-return progress text immediately preceded the marker on the
+same newline-delimited record. The driver's start-and-end anchored `grep`
+therefore timed out and returned `profiled server did not close the exact
+four-replay window` before graceful FIFO shutdown, repetition-3 export,
+packed-vLLM, the rollback arm, or finalization. Repetition-3 profile-log SHA is
+`486315bf…6b45`; its four raw report SHAs are `a01015f4…45f` /
+`338e06f8…0c3` / `0adf65ca…ba2` / `00f8a667…18a`.
+
+The whole root is **FAILED / VOID**. Repetitions 1–2 and the raw repetition-3
+reports are forensic evidence only and will not be combined with a later arm.
+No packed oracle result, rollback artifact, summary, manifest, completion
+marker, timing, memory, speed ratio or binding change exists. Cleanup returned
+source, GPU and `/tmp/gpu` clean/idle/free.
+
+Systematic debugging compared the three byte streams: repetitions 1–2 happened
+to place the stop marker after Nsight's newline, while repetition 3 placed the
+same intact marker after its progress prefix. The false assumption was that
+the profiler and target sharing one redirected descriptor preserve
+beginning-of-line boundaries. Test-first coverage reproduces the exact
+carriage-return/progress prefix and initially fails the production profile
+parser. The minimal repair removes only the beginning-of-line requirement from
+the bounded poll and stopped-marker extraction. It retains the line-ending
+anchor, counts exact marker occurrences, requires four replays, and requires
+the stopped graph to equal the started graph; ready/start/shutdown lifecycle
+markers remain full-line exact. Independent review added the missing malformed
+suffix contract; prefix, duplicate-marker and suffix regressions pass **3/3**.
+The complete tools suite is **82/82**, and Bash syntax, ShellCheck, Python
+compilation and diff checks pass. Next: commit/push, create a new SHA-owned root,
+and rerun both complete packed/rollback arms from scratch before c2/c16.
+Binding remains **55/124**, c2 TPOT remains **6.1% slower**,
+`benchmark_binding=false`, and qkvz remains blocked.

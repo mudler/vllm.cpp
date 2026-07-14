@@ -8909,3 +8909,43 @@ compilation and diff checks pass. Next: commit/push, create a new SHA-owned root
 and rerun both complete packed/rollback arms from scratch before c2/c16.
 Binding remains **55/124**, c2 TPOT remains **6.1% slower**,
 `benchmark_binding=false`, and qkvz remains blocked.
+
+## 2026-07-14 — W1D3 fresh raw capture complete; exact finalizer repair gating
+
+Clean pushed `7ff713e` was checked out into the SHA-owned DGX root
+`~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
+Two configure attempts failed before GPU ownership because the sanitized SSH
+path did not expose Ninja and then nvcc; the accepted configuration pins both
+absolute tools and builds **371/371**. The driver then held one `/tmp/gpu` lock
+across the real-model gate and the complete packed ours/vLLM plus rollback
+ours/vLLM series. The model gate passed. All 12 packed ranges validate at
+exactly **915** nodes; all 12 rollback ranges validate at exactly **963**.
+Packed contains 48 packed recurrence calls and no decomposed/post-conv calls;
+rollback contains 48 decomposed plus 48 post-conv calls and no packed calls.
+Both retain 145 BF16 GEMMs, 208 FP4 GEMMs, 64 fused and 144 normal producers,
+16+16 FA2 nodes and 48 separately hashed mode-coupled BA nodes. Source, GPU,
+lock and processes returned clean/idle/free.
+
+The first CPU-only finalizer correctly failed closed on packed-oracle launch
+signature `b3045f78…c101`. Adversarial analysis with that candidate admitted
+shows all **1,523** packed steady B=2 windows share it and pass every remaining
+contract; rollback likewise has **1,522** invariant windows under
+`c9fba70a…59ef`. Comparing the first exact 1,160-kernel window of each trace
+against both accepted `0091cd1` controls finds no kernel name/order, grid,
+block, shared-memory, family-count or FP4-tactic difference. Only generated
+Torch/Inductor RMSNorm partitions move between 48 and 50 registers. Packed's
+complete register distribution is `1x26, 48x28, 64x40, 1x44, 22x48, 41x50`;
+rollback's is `1x26, 48x28, 64x40, 1x44, 4x48, 59x50`. This is the same bounded
+resource-allocation class already admitted for prior controls.
+
+Test-first coverage fails on the absent exact fingerprints, then passes after
+adding only those two immutable signatures. A second regression makes the
+marker hash the imported `finalize_low_batch_trace.py` validator as well as the
+entry finalizer, closing provenance for the file that owns the allowlist.
+Focused finalizer suites pass **13/13**. A complete no-write dry finalization
+revalidates all local ranges and both oracle traces and returns
+`complete-structural`; `benchmark_binding=false`, `speed_credit=false`.
+Next: commit/push this bounded validator checkpoint, run marker-last
+finalization against the immutable raw root without recapturing GPU evidence,
+then execute c2/c16 **40 timing + 8 memory**. Binding remains **55/124**, c2
+TPOT remains **6.1% slower**, and qkvz stays blocked.

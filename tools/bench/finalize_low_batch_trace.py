@@ -84,6 +84,19 @@ ALLOWED_B2_SIGNATURES = {
     "f7a3ca1f31d7d5dd672fc3def715cbd025b771d552601a8521fb3768b3adcadf": (
         "gdn-ba-split-rmsnorm-register-allocation"
     ),
+    # Immutable 7ff713e packed-GDN oracle control.  All 1,523 steady windows
+    # preserve the accepted kernel names, geometry and shared memory.  The
+    # cached Torch/Inductor RMSNorm partitions use 1x26, 48x28, 64x40, 1x44,
+    # 22x48 and 41x50 registers.
+    "b3045f7858ebcd55085e6192ec98c5d7d1912af8c953c33418f9a4ee956fc101": (
+        "gdn-packed-rmsnorm-register-allocation"
+    ),
+    # Its paired rollback oracle control has the same exact structural
+    # contract across all 1,522 steady windows.  Only the generated RMSNorm
+    # allocation differs: 1x26, 48x28, 64x40, 1x44, 4x48 and 59x50.
+    "c9fba70a66b08e4894cfe0e5d1bcbf97c7c63ea10556504a286708e6929859ef": (
+        "gdn-packed-rollback-rmsnorm-register-allocation"
+    ),
 }
 EXPECTED_B2_FP4_TACTICS = {"static_persistent": 80, "stream_k": 128}
 EXPECTED_B2_GENERATED_RMSNORM_QUANT = 177

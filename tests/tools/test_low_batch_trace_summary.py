@@ -130,6 +130,18 @@ class LowBatchTraceSummaryTests(unittest.TestCase):
             ],
             "gdn-ba-split-rmsnorm-register-allocation",
         )
+        self.assertEqual(
+            finalizer.ALLOWED_B2_SIGNATURES[
+                "b3045f7858ebcd55085e6192ec98c5d7d1912af8c953c33418f9a4ee956fc101"
+            ],
+            "gdn-packed-rmsnorm-register-allocation",
+        )
+        self.assertEqual(
+            finalizer.ALLOWED_B2_SIGNATURES[
+                "c9fba70a66b08e4894cfe0e5d1bcbf97c7c63ea10556504a286708e6929859ef"
+            ],
+            "gdn-packed-rollback-rmsnorm-register-allocation",
+        )
 
     def test_accepts_invariant_b2_windows_and_one_bounded_drain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

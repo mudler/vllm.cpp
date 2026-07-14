@@ -409,6 +409,7 @@ def finalize(
     source_commit: str,
     run_log: pathlib.Path,
     finalizer: pathlib.Path,
+    validator: pathlib.Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     trace = evidence / "trace" / MODEL_KEY
     summary_path = trace / "gdn-packed-summary.json"
@@ -429,6 +430,7 @@ def finalize(
         "evidence_source_commit": source_commit,
         "artifact_set_sha256": manifest["artifact_set_sha256"],
         "finalizer_sha256": sha256_file(finalizer),
+        "validator_sha256": sha256_file(validator),
         "manifest_sha256": sha256_file(manifest_path),
         "summary_sha256": sha256_file(summary_path),
     }
@@ -450,6 +452,7 @@ def main() -> int:
         source_commit=args.source_commit,
         run_log=run_log,
         finalizer=pathlib.Path(__file__),
+        validator=pathlib.Path(__file__).with_name("finalize_low_batch_trace.py"),
     )
     print(
         canonical_json(

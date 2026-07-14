@@ -10,28 +10,23 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 
 Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
 **FAILED / open at 55/124 axes**. The active
-[packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md) has advanced
-through immutable W1D2/G2 at clean pushed `f344dec`: vLLM's exact pure non-spec dispatch,
-independent BF16-conv/FP32-SSM cache ABI, complete host metadata preflight and
-process-cached rollback are implemented. Local CTest passes **103/103**. The
-DGX replay passes default and rollback 27B **235/235 + 16/16**, full CUDA GDN
-**43/43, 1,707 assertions**, direct packed semantics **0/1**, native/batched
-35B **315/315** with zero packed selection, and isolated Compact/Balanced GGUF
-**14/14 + 14/14**. Focused strict memcheck covers the packed matrix,
-compressed indexed corner and FP16 SSM rollback with zero errors/leaks.
-Immutable G2 is **PASSED**. The fail-closed W1D3 harness records explicit
-packed/rollback environment provenance, enforces 915/963-node contracts under
-one lock, and writes its structural completion marker last. Clean `4804ee4`
-built **154/154**, passed the real 27B gate, and validated packed repetitions
-1–2 as eight exact 915-node ranges. Repetition 3 captured four raw reports, but
-Nsight placed progress text before the intact stop marker; the line-anchored
-poll rejected the attempt before repetition-3 export, packed-vLLM, or rollback.
-The whole root is **FAILED / VOID**. The parser repair allows a shared-stream
-prefix before the stop marker while retaining one-marker, line-ending,
-replay-count and graph-identity checks; the complete tool suite passes
-**82/82**. A fresh
-immutable DGX trace plus c2/c16 **40 timing + 8 memory** remain **PENDING**, so
-no accepted performance number changes.
+[packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md) retains its
+immutable W1D2/G2 correctness and safety closure at `f344dec`. Fresh clean
+`7ff713e` completed the entire one-lock W1D3 raw capture: the real-model gate
+passed; all 12 packed ranges contain exactly **915** nodes and all 12 rollback
+ranges **963**; the only structural delta is the intended 48 packed calls
+replacing 48 decomposed-recurrence plus 48 post-conv calls. Both oracle traces
+retain **1,160** ordered kernels per steady B=2 window over **1,523 / 1,522**
+windows, including identical **128 Stream-K + 80 static-persistent** FP4
+tactics. Initial finalization failed closed on two unseen launch fingerprints.
+Exact comparison with both prior accepted controls proves that only cached
+Torch/Inductor RMSNorm partitions redistributed between 48 and 50 registers;
+kernel names/order, grids, blocks, shared memory, family counts and tactics are
+unchanged. The two exact fingerprints now have a test-first validator entry,
+and complete dry finalization returns `complete-structural`. The pushed
+finalizer still must write the marker-last summary/manifest/status artifacts;
+c2/c16 **40 timing + 8 memory** remain **PENDING**, and no accepted performance
+number changes.
 
 ## Binding 27B online gate
 
@@ -76,9 +71,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; clean `4804ee4` reached the packed trace but failed/voided on the stop-marker prefix race before a complete dual-arm result | Push the parser repair, execute a fresh packed/rollback trace and c2/c16; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; clean `7ff713e` completed the full packed/rollback raw trace and exact dry finalization is `complete-structural`, with no timing credit | Push the bounded finalizer update, write the immutable marker, then execute c2/c16; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 REPAIR READY** | Clean `f344dec` retains immutable G2. Exact packed/rollback contracts, mode-invariant signature equality with exactly 48 coupled BA nodes isolated per arm, one-lock driver, `/usr/bin/env -i` model environment, matching command-inventory validation and marker-last finalizer pass **82/82** tool tests. `4804ee4` validated eight packed ranges before the shared-log parser race voided the incomplete attempt | Push and run a fresh paired node trace plus c2/c16 AB/BA/AB |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 FINALIZER GATING** | Clean `7ff713e` completed 12/12 packed + 12/12 rollback ranges and both full oracle traces. The first marker-last attempt failed closed on unseen RMSNorm register allocation; exact analysis found only 48/50-register redistribution and the two fingerprint regressions pass within the focused validator suites. Full dry finalization is `complete-structural` | Push the validator checkpoint, finalize the immutable raw root, then run c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -89,7 +84,7 @@ performance command is authorized until the 27B result reaches 124/124.
 
 The semantic and operator gates are retained at clean `f18ca23` and
 `9ad8fb7`; their complete hashes and attempt chronology live in the ledger and
-state log. The current checkpoint is W1D3 parser-repair ready:
+state log. The current checkpoint is W1D3 finalizer gating:
 
 | Surface | Current evidence | Disposition |
 |---|---|---|
@@ -100,18 +95,18 @@ state log. The current checkpoint is W1D3 parser-repair ready:
 | 35B native/batched | **315/315**, 0 packed calls | Immutable inertness PASS |
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
-| W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | CPU/tool PASS **82/82**; Nsight-prefix, duplicate-marker and trailing-suffix regressions covered |
-| Performance | `4804ee4` built **154/154**, passed the model gate, and validated packed repetitions 1–2 (8/8 ranges). Repetition 3 has four raw reports but was not exported/finalized; packed-vLLM, rollback and c2/c16 did not run | **FAILED / VOID; no speed credit; fresh run PENDING** |
+| W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
+| Performance | Packed/rollback oracle windows are **1,523 / 1,522**, each with 1,160 kernels and invariant signatures. Only generated RMSNorm register allocation differs from prior controls; bounded fingerprints are test-covered and full dry finalization is `complete-structural` | **STRUCTURAL ONLY; pushed marker PENDING; no speed credit; c2/c16 PENDING** |
 
-The current failed/void root is
-`~/work/vllm.cpp-gdn-packed-trace/4804ee44357e7e38819aca141c4c9e9d33a2ebfa`.
-Manifest / execution / configure / build / model-gate / run-log SHA-256 values
-are `1bea839a…8ba7` / `79087688…c399` / `2abd017c…a15` /
-`5e76d6d9…e77` / `634873d8…b727` / `da44ec34…c49`. Repetition-3 profile-log
-SHA is `486315bf…6b45`; its four raw report SHAs are `a01015f4…45f` /
-`338e06f8…0c3` / `0adf65ca…ba2` / `00f8a667…18a`. No summary, manifest or
-completion marker exists. Source, GPU and lock returned clean/idle. These
-partial artifacts are forensic only, not benchmark evidence.
+The current raw root is
+`~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
+Execution / configure / model-gate / run-log SHA-256 values are
+`253ff089…a4bb` / `903d10a1…5c12` / `3ebdd9f9…bfca` /
+`6c0c2cae…2235`; packed/rollback oracle trace hashes are
+`4448c549…c293` / `9d918979…a420`. The first finalizer log
+(`a71ac6e4…7e67`) records the expected fail-closed unknown-signature error.
+No summary, manifest or completion marker has yet been written. Source, GPU
+and lock returned clean/idle/free; the complete raw artifacts are retained.
 
 Immutable evidence root:
 `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`.
@@ -128,9 +123,9 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 is closed. W1D3 tooling is ready; it now requires paired ours/vLLM Nsight
-traces (ours with `--cuda-graph-trace=node`) before the c2/c16 40+8 same-binary
-series. Until then `benchmark_binding=false`.
+G2 is closed. W1D3 raw capture is complete and awaits only pushed-finalizer
+marker-last closure before the c2/c16 40+8 same-binary series. Until that
+component gate passes, `benchmark_binding=false`.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its
@@ -284,44 +279,25 @@ flock /tmp/gpu env VT_GDN_BA_OUT_BF16=1 \
 # Current disposition: 233/235; got == greedy_ids_emulation.npy
 ```
 
-For the next W1D3 hardware checkpoint, create a new SHA-owned root, write the
-plan before copying the frozen corpus, configure the exact trace build, then
-run the packed/rollback arms under the driver's single lock and finalize them:
+The complete W1D3 raw capture is immutable. The next checkpoint is CPU-only:
+finalize that root from the pushed validator commit, whose marker records both
+the finalizer and imported launch-validator hashes. Do not recapture the GPU
+series:
 
 ```sh
 set -o pipefail
-SHA=$(git rev-parse HEAD)
-ROOT="$HOME/work/vllm.cpp-gdn-packed-trace/$SHA"
-SOURCE="$ROOT/source"
-EVIDENCE="$ROOT/evidence/$SHA"
-BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
-SNAPSHOT="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
+RAW_SHA=7ff713e377457130db4ed15929133d1b463aff96
+FINALIZER_SHA=$(git rev-parse HEAD)
+ROOT="$HOME/work/vllm.cpp-gdn-packed-trace/$RAW_SHA"
+EVIDENCE="$ROOT/evidence/$RAW_SHA"
+SOURCE="$HOME/work/vllm.cpp-gdn-packed-finalizer/$FINALIZER_SHA/source"
 test -z "$(git status --porcelain)"
-git worktree add --detach "$SOURCE" "$SHA"
-"$SOURCE/scripts/dgx-online-serving.sh" --dry-run \
-  --claim-root "$ROOT" --client "$HOME/venvs/vllm-oracle/bin/vllm" \
-  --vllm-cpp-sha "$SHA"
-mkdir -p "$EVIDENCE/corpus"
-cp -a "$BINDING/corpus/27" "$EVIDENCE/corpus/27"
-cmake -S "$SOURCE" -B "$ROOT/build-cuda" -G Ninja \
-  -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_SERVER=ON \
-  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_FLASH_ATTN=ON \
-  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=OFF \
-  -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
-  -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
-"$SOURCE/scripts/dgx-online-serving.sh" --trace-only --model 27 \
-  --snapshot "$SNAPSHOT" --source-corpus "$EVIDENCE/corpus/27" \
-  --evidence "$EVIDENCE" --build-dir "$ROOT/build-cuda" \
-  --configure-log "$ROOT/configure.log" --trace-concurrency 2 \
-  --gdn-packed-mode both --client "$HOME/venvs/vllm-oracle/bin/vllm" \
-  --vllm-cpp-sha "$SHA" 2>&1 | tee "$ROOT/gdn-packed-run.log"
-python3 "$SOURCE/tools/bench/finalize_gdn_packed_trace.py" \
-  --evidence "$EVIDENCE" --source-commit "$SHA" \
-  --run-log "$ROOT/gdn-packed-run.log"
+git worktree add --detach "$SOURCE" "$FINALIZER_SHA"
+PYTHONPATH="$SOURCE" python3 \
+  "$SOURCE/tools/bench/finalize_gdn_packed_trace.py" \
+  --evidence "$EVIDENCE" --source-commit "$RAW_SHA" \
+  --run-log "$ROOT/gdn-packed-run.log" \
+  2>&1 | tee "$ROOT/gdn-packed-finalizer-pushed.log"
 ```
 
 Acceptance requires packed **915** versus rollback **963** total nodes, 145

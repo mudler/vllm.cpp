@@ -21,18 +21,18 @@ immutable W1D2/G2: gates pass
 default+rollback 27B **235/235 + 16/16**, full CUDA GDN **43/43**, 35B
 zero-selection **315/315**, and isolated Compact/Balanced GGUF **14/14 +
 14/14**. This state has `benchmark_binding=false` and earns no speed credit.
-The W1D3 fail-closed trace harness is implemented: explicit packed/rollback
-toggle provenance, 915/963-node contracts, one-lock ordering, exact
-mode-invariant signature equality after isolating the 48 coupled BA projection
-nodes, and completion-marker-last finalization. Clean `4804ee4` built 154/154,
-passed the 27B gate, and validated packed repetitions 1–2 as eight exact
-915-node ranges. Nsight then prefixed progress text to repetition 3's intact
-stop marker; the line-anchored poll rejected the attempt before repetition-3
-export, packed-vLLM, or rollback. The root is FAILED/VOID. The prefix-tolerant,
-exact-marker regressions pass within the full **82/82** tool suite; a fresh trace is
+The W1D3 fail-closed trace harness is implemented. Fresh clean `7ff713e`
+completed the complete one-lock packed/rollback capture: **12/12** exact
+915-node packed ranges, **12/12** exact 963-node rollback ranges and both full
+vLLM oracle traces. Across **1,523 / 1,522** steady B=2 windows, kernel order,
+geometry, shared memory, family counts and FP4 tactics are invariant. Initial
+finalization failed closed on two new signatures; whole-trace comparison proved
+that only cached Torch/Inductor RMSNorm partitions redistributed 48/50-register
+launches. A test-first exact-fingerprint update plus validator-hash provenance
+now passes full dry finalization as `complete-structural`; the pushed marker is
 pending.
 
-Next: execute/finalize the paired vLLM/ours node-level Nsight traces, then run
+Next: write the pushed-finalizer marker for the immutable raw trace, then run
 the c2/c16 **40 timing + 8 memory** component. qkvz
 stays excluded until that disposition. Host PSS/RSS separately retains a
 **22.920 GiB** CPU weight mirror plus source mmap residency.
@@ -47,7 +47,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. Clean `f344dec` closes W1D2/G2. Clean `4804ee4` reached the packed trace but failed/voided on a shared-log marker-prefix race after eight validated ranges and before a complete dual-arm result. The parser repair is CPU-green **82/82**; fresh trace/component evidence is pending. `benchmark_binding=false`; qkvz, host-memory repair, SGLang and a newer binding result remain open | `GATING` | push parser repair, execute/finalize a fresh node trace, then c2/c16 before qkvz |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. Clean `7ff713e` completed the full packed/rollback raw trace. Exact analysis bounds two unseen oracle fingerprints to cached RMSNorm 48/50-register allocation only; test-first validation and complete dry finalization pass as `complete-structural`. The pushed marker and c2/c16 component remain pending. `benchmark_binding=false`; qkvz, host-memory repair, SGLang and a newer binding result remain open | `GATING` | push the bounded finalizer update, write the immutable marker, then c2/c16 before qkvz |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |
@@ -72,7 +72,7 @@ their area matrix.
 
 | # | Track | State |
 |---|---|---|
-| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. Clean `f344dec` closes W1D2/G2; `4804ee4` trace is FAILED/VOID on the marker-prefix race and the 82/82 parser repair awaits a fresh paired trace/c2/c16 before qkvz. Repair the 22.920 GiB host mirror before 35B performance |
+| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. Clean `7ff713e` completed both raw W1D3 arms; exact dry structural finalization passes after the bounded RMSNorm fingerprint update. The pushed marker and c2/c16 remain before qkvz. Repair the 22.920 GiB host mirror before 35B performance |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
 | A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461; reproducibility hardening `09f1d23`) — `sm_121a` now has 48 generated C/H files + MANIFEST, including both bf16 `chunk_o` shapes; normal builds remain Python-free. Regen is explicit-target (`cuda:121:32`), line-info-disabled and byte-reproducible across source paths; the pure checker makes source/contract/artifact drift fatal and mutation-tests missing/extra/changed artifacts. A4 remains closed; fresh current-main CUDA/runtime/performance validation belongs to the two ACTIVE `CLAIM-PR3` kernel rows (evidence: porting-inventory §9). |

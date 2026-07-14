@@ -17,22 +17,19 @@ OpenAI-compatible server.
 > 16/16**; default selects 48 packed calls on the first decode and zero during
 > prefill, while rollback selects zero. Full CUDA GDN is **43/43**, 35B remains
 > packed-inert at **315/315**, and isolated Compact/Balanced GGUF each pass
-> **14/14**. Immutable G2 is closed. The fail-closed W1D3 packed/rollback
-> node-trace harness and marker-last finalizer are implemented. Cross-arm
-> equality covers every
-> mode-invariant node signature after excluding only the three GDN structural
-> families and the exact 48 coupled BA projection nodes whose output dtype
-> intentionally changes. The replacement run at clean `4804ee4` built
-> **154/154**, passed the real 27B gate, and validated packed repetitions 1–2
-> as eight exact 915-node ranges. Repetition 3 also captured four raw ranges,
-> but Nsight prefixed progress text to the intact stop marker; the
-> line-anchored driver rejected the run before export, packed-vLLM, or the
-> rollback arm. That root is **FAILED / VOID**. The parser now permits a
-> shared-stream prefix before the stop marker while still requiring exactly
-> one line-ending marker,
-> four replays, and the matching graph; the complete tool suite passes
-> **82/82**. A fresh immutable DGX trace plus c2/c16 timing remain
-> pending, so the binding result and speed credit do not change. Host
+> **14/14**. Immutable G2 is closed. Fresh clean `7ff713e` then completed the
+> full one-lock W1D3 packed/rollback capture: all 12 packed ranges contain
+> exactly **915** nodes and all 12 rollback ranges exactly **963**, with the
+> intended 48-call packed-for-(decomposed+post-conv) substitution and invariant
+> remaining topology. Both vLLM traces retain **1,160** ordered kernels per
+> steady B=2 window across **1,523 / 1,522** windows. The marker-last finalizer
+> initially failed closed because cached Torch/Inductor RMSNorm partitions
+> redistributed only 48- versus 50-register launches. Exact inspection found
+> no kernel-name, order, grid, block, shared-memory, family, or FP4-tactic
+> drift. Those two immutable fingerprints are now covered by a test-first
+> allowlist extension; full dry finalization returns `complete-structural`.
+> The pushed-finalizer completion marker and c2/c16 timing remain pending, so
+> the binding result and speed credit do not change. Host
 > memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
 > performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
@@ -42,7 +39,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Clean `f344dec` closes W1D2/G2. Clean `4804ee4` reached the packed trace but failed/voided on a shared-log marker-prefix race before a complete dual-arm result; the parser repair is CPU-gated **82/82** and has no speed credit | Push the parser repair, execute a fresh packed/rollback node trace, then c2/c16 before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Clean `7ff713e` completed the full packed/rollback raw trace; exact dry finalization is `complete-structural`, with only two inspected RMSNorm register-allocation fingerprints added to the fail-closed validator. No timing credit follows | Push the finalizer checkpoint, write its immutable completion marker, then run c2/c16 before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -70,7 +67,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `f344dec` closes W1D2/G2. W1D3 has explicit 915-node packed and 963-node rollback contracts, toggle provenance, exact mode-invariant signature equality with a 48-node coupled-BA allowance, one-lock ordering and a completion-marker-last finalizer. Clean `4804ee4` validated eight packed ranges, then failed/voided when Nsight progress prefixed repetition 3's intact stop marker; packed-vLLM and rollback did not run. The prefix, duplicate-marker and trailing-suffix regressions plus the fail-closed parser pass **82/82** tools. Fresh DGX trace and c2/c16 component remain pending |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `7ff713e` completed all 24 exact packed/rollback ranges and both vLLM oracle traces. A test-first validator update admits the two inspected, trace-invariant RMSNorm 48/50-register distributions; dry finalization is `complete-structural`. The pushed-finalizer marker and c2/c16 component remain pending |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -142,7 +139,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D2/G2 is immutable-green at `f344dec`; the W1D3 trace harness is CPU-green, but DGX traces and c2/c16 are pending and qkvz remains blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D2/G2 is immutable-green at `f344dec`; clean `7ff713e` completed W1D3 raw traces and passes exact dry structural finalization after the bounded validator update. The final marker and c2/c16 are pending; qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -192,8 +189,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: execute and finalize packed-GDN W1D3 paired
-node traces, then c2/c16 → implement/gate merged qkvz →
+The next execution order is fixed: write the pushed-finalizer marker for the
+completed packed-GDN W1D3 raw traces, then c2/c16 → implement/gate merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
 LMCache support.

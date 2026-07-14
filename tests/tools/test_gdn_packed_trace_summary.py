@@ -20,7 +20,7 @@ from tools.bench.finalize_gdn_packed_trace import (
     finalize,
     summarize_gdn_packed_topology,
 )
-from tools.bench.serve_low_common import HarnessError
+from tools.bench.serve_low_common import HarnessError, sha256_file
 
 
 def arm(
@@ -179,6 +179,8 @@ class GdnPackedTraceSummaryTests(unittest.TestCase):
             run_log.write_text("complete\n", encoding="utf-8")
             finalizer = evidence / "finalizer.py"
             finalizer.write_text("# fixture\n", encoding="utf-8")
+            validator = evidence / "validator.py"
+            validator.write_text("# validator fixture\n", encoding="utf-8")
             with (
                 mock.patch(
                     "tools.bench.finalize_gdn_packed_trace.build_summary",
@@ -194,8 +196,10 @@ class GdnPackedTraceSummaryTests(unittest.TestCase):
                     source_commit="e" * 40,
                     run_log=run_log,
                     finalizer=finalizer,
+                    validator=validator,
                 )
                 self.assertEqual(marker["status"], STATUS)
+                self.assertEqual(marker["validator_sha256"], sha256_file(validator))
                 self.assertTrue(
                     (evidence / "trace/27/gdn-packed-summary.json").is_file()
                 )
@@ -211,6 +215,7 @@ class GdnPackedTraceSummaryTests(unittest.TestCase):
                         source_commit="e" * 40,
                         run_log=run_log,
                         finalizer=finalizer,
+                        validator=validator,
                     )
 
 

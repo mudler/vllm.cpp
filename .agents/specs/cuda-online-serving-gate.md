@@ -35,11 +35,16 @@ Stream-K 128x64x256 calls plus **80** static-persistent 128x32x256 calls. Its
 seven RMSNorm/generated-quant partitions total **177 calls / 0.442805 ms** per
 window. This is a structural oracle contract, not a cross-profiler speed ratio.
 
-The trace-only local observer and driver now accept an explicit exact batch-2
-target while retaining batch 16 as the accepted H1d default. Production builds
-contain neither observer. The fresh three-session local c2 capture and paired
-oracle rerun are **PENDING**, as is their fail-closed final status; no local
-RMSNorm residual, tactic mismatch or selected implementation is claimed yet.
+The trace-only local observer and driver accept an explicit exact batch-2 target
+while retaining batch 16 as the accepted H1d default. Production builds contain
+neither observer. First root `ad8b58f` passed the 27B model gate and one local
+session: four exact ranges each contain **1,011 kernels, 7 memcpy and 1 memset**,
+are lossless, and share node-multiset SHA `6b75bcff…1ce3`. The run then failed
+closed because the validator selected the batch-16 1,107-kernel contract.
+Sessions 2/3 and the fresh oracle arm are absent, making the run **VOID**. The
+validator is now keyed by model and requested batch; a fresh complete retry and
+fail-closed final status are **PENDING**, so no local RMSNorm residual, tactic
+mismatch or selected implementation is claimed yet.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -136,6 +141,10 @@ can be re-aggregated; it cannot satisfy attribution.
 - Client contracts require the recorded local profile batch to equal the
   requested diagnostic batch and reject reinterpreting a batch-2 trace as the
   accepted batch-16 H1d contract.
+- Nsight contracts are keyed by `(model, batch)`: 27B/c16 retains **1,107+7+1**
+  graph children, while 27B/c2 requires **1,011+7+1** and the same 208 FP4,
+  144 normal producer, 64 fused producer, 48 GDN recurrence and 16+16 FA2
+  family counts. Synthetic loss/reconciliation tests cover both contracts.
 - The profiler test drives a fake engine through closed-loop replacement
   admission and proves the resident request count never exceeds c16. Client and
   summary cases reject missing cache-off flags or drifted cache/admission/
@@ -249,9 +258,11 @@ reported as a clean dependency check.
    Accepted c2 async control `3812d8` is neutral at **1.002153×** total and
    **1.002004×** traced GPU time, so do not claim W3 for speed. The accepted
    oracle trace now pins 1,524 clean c2 windows, 1,160 kernels/window, seven
-   generated partitions and the 128+80 FP4 tactic split. Capture/finalize the
-   equivalent batch-2 local and fresh oracle arms before mapping a residual or
-   coding the next lever.
+   generated partitions and the 128+80 FP4 tactic split. First local `ad8b58f`
+   is void after one valid four-range session exposed a stale c16 validator
+   assertion. Repeat all three batch-2 local sessions and the fresh oracle arm
+   with the batch-keyed contract before mapping a residual or coding the next
+   lever.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
    and gate the smallest grounded kernel leaf. Host-weight ownership is a

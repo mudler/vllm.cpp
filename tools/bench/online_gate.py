@@ -99,6 +99,24 @@ TRACE_PRIMARY_GRAPH_CONTRACTS = {
         },
     }
 }
+TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH = {
+    ("27", TRACE_CONCURRENCY): TRACE_PRIMARY_GRAPH_CONTRACTS["27"],
+    ("27", 2): {
+        "graph_child_nodes": {"kernel": 1_011, "memcpy": 7, "memset": 1},
+        "node_count": 1_011,
+        "families": {
+            "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
+            "fa2_main": ("flash_fwd_splitkv_kernel", 16),
+            "fp4_gemm": (
+                "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal",
+                208,
+            ),
+            "fused_fp4_producer": ("SiluAndMulFp4QuantKernel", 64),
+            "gdn_recurrence": ("GdnDecodeFusedKernel", 48),
+            "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
+        },
+    },
+}
 VLLM_DECODE_FAMILY_CONTRACTS = {
     "27": {
         "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
@@ -938,9 +956,12 @@ def validate_nsys_trace(
     *,
     model_key: str | None = None,
     range_index: int = 1,
+    expected_batch: int = TRACE_CONCURRENCY,
 ) -> dict[str, Any]:
     """Validate one bounded H1d range report by direct runtime correlation."""
 
+    if expected_batch <= 0:
+        raise HarnessError("Nsight graph contract batch must be positive")
     if not 1 <= range_index <= TRACE_CAPTURE_GRAPH_REPLAYS:
         raise HarnessError(
             f"Nsight range index {range_index} is outside "
@@ -1441,7 +1462,18 @@ def validate_nsys_trace(
             )
 
         primary_family_counts: dict[str, int] = {}
-        contract = TRACE_PRIMARY_GRAPH_CONTRACTS.get(model_key) if model_key else None
+        contract = (
+            TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH.get(
+                (model_key, expected_batch)
+            )
+            if model_key
+            else None
+        )
+        if model_key and contract is None:
+            raise HarnessError(
+                "no exact Nsight graph contract for "
+                f"model {model_key} at batch {expected_batch}"
+            )
         if contract is not None:
             expected_counts = contract["graph_child_nodes"]
             if per_launch_counts[0] != expected_counts:
@@ -1566,11 +1598,13 @@ def summarize_nsys_kernels(
     *,
     model_key: str,
     range_index: int = 1,
+    expected_batch: int = TRACE_CONCURRENCY,
 ) -> dict[str, Any]:
     validation = validate_nsys_trace(
         sqlite_path,
         model_key=model_key,
         range_index=range_index,
+        expected_batch=expected_batch,
     )
     return {
         **validation["kernel_summary"],
@@ -3345,6 +3379,9 @@ def _parser() -> argparse.ArgumentParser:
         choices=range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1),
         required=True,
     )
+    validate_nsys.add_argument(
+        "--expected-batch", type=int, default=TRACE_CONCURRENCY
+    )
     validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     summarize_nsys = commands.add_parser("summarize-nsys-kernels")
@@ -3357,6 +3394,9 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         choices=range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1),
         required=True,
+    )
+    summarize_nsys.add_argument(
+        "--expected-batch", type=int, default=TRACE_CONCURRENCY
     )
     summarize_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
@@ -3510,6 +3550,7 @@ def main() -> int:
             args.sqlite,
             model_key=args.model_key,
             range_index=args.range_index,
+            expected_batch=args.expected_batch,
         )
         write_json_atomic(args.output, result)
     elif args.command == "summarize-nsys-kernels":
@@ -3519,6 +3560,7 @@ def main() -> int:
             args.sqlite,
             model_key=args.model_key,
             range_index=args.range_index,
+            expected_batch=args.expected_batch,
         )
         write_json_atomic(args.output, result)
     elif args.command == "record-profile-control":

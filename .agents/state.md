@@ -8039,3 +8039,43 @@ and diff checks also pass. Production builds contain no observer, the binding re
 is promoted. Next: commit/push this trace contract, execute the fresh c2 paired
 capture under one lock, finalize it, then write the spike for the highest
 complete measured residual.
+
+## 2026-07-14 — first exact local c2 capture fails closed on c16 validator
+
+Clean pushed `ad8b58f8708ce9bdf32aa9043611b3f6049be7fd` ran from
+`~/work/vllm.cpp-executed-path-c2/ad8b58f8708ce9bdf32aa9043611b3f6049be7fd`
+under one uninterrupted `/tmp/gpu` lock. The exact CUDA 13.0.88/sm_121a trace
+build and vLLM 0.25.0 oracle provenance passed. The real 27B paged-engine gate
+passed **1/1** in 17.85 seconds. The first local session loaded exactly 64
+frozen FlashInfer plans, tuned/saved no native plans, completed the six-prompt
+closed-loop arm **6/6**, and closed the signaled probe at exactly four warmed
+`real_batch=2 / padded_batch=2` graph replays after 504 prior replays.
+
+The driver then failed closed while validating the first exported range: the
+validator still selected the accepted c16 graph contract and rejected the
+batch-2 graph's **1,011 kernels** against c16's **1,107**. Sessions 2/3 and the
+fresh oracle trace never ran, so the entire attempt is **FAILED / VOID** and no
+throughput, latency, residual or cross-engine ratio binds. Run-log, execution,
+model-gate, control, raw-report-set and evidence-set SHA values are
+`9f285fd6…0aec`, `2a3d326f…6b56`, `bc9dc95b…da17`, `ee1589df…c719`,
+`f3aa3ca9…64c6`, and `0da532ac…ac35`.
+
+Read-only reconstruction of all four preserved reports proves the observation
+is not a partial/corrupt range: each is lossless with **1,011 kernels + 7 memcpy
++ 1 memset**, and all share canonical node-multiset SHA `6b75bcff…1ce3`.
+Kernel times are 109.897408 / 109.061952 / 109.397055 / 110.533408 ms per
+range (109.722456 ms mean). Every range retains 208 FP4 GEMMs split exactly as
+the oracle's 128 Stream-K + 80 static-persistent tactics. Local RMSNorm-family
+structure is **177 calls / 2.237944 ms mean**; this is incomplete cross-profiler
+evidence, not a claimed 1.795-ms residual.
+
+The repair keeps the immutable c16 contract and adds a separate `(27, 2)`
+contract at **1,011+7+1**, with unchanged 208 FP4, 144 normal producer, 64 fused
+producer, 48 GDN recurrence and 16+16 FA2 counts. The validator, summarizer and
+driver now pass the explicit requested batch; synthetic loss/reconciliation
+coverage proves B=2 cannot be reinterpreted as B=16. Focused trace/client/
+summary tests pass **35/35**; the complete tool suite passes **57/57**, policy
+mutation tests pass **18/18**, and the record/doc checkers are green. Cleanup
+returned GPU, lock and port 8001 idle.
+Binding `3f256ab` remains **55/124**; next is a fresh commit/root repeating all
+three local sessions plus the oracle trace before finalization or lever choice.

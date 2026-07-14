@@ -40,6 +40,7 @@ from tools.bench.online_gate import (
     TRACE_CONCURRENCY,
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
+    TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH,
     TRACE_PROMPTS,
     TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
@@ -105,6 +106,7 @@ def write_nsys_sqlite(
     family_drift: bool = False,
     lost_events: bool = False,
     model_contract: bool = False,
+    model_batch: int = TRACE_CONCURRENCY,
     orphan_child: bool = False,
     profiler_start_count: int | None = None,
     range_index: int = 1,
@@ -207,7 +209,7 @@ def write_nsys_sqlite(
             ),
         )
         if model_contract:
-            contract = TRACE_PRIMARY_GRAPH_CONTRACTS["27"]
+            contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH[("27", model_batch)]
             node_names = []
             for family, (pattern, count) in contract["families"].items():
                 if family_drift and family == "normal_fp4_producer":
@@ -1036,7 +1038,10 @@ class OnlineClientContractTests(unittest.TestCase):
         )
         self.assertIn("--trace-concurrency 2|16", script)
         self.assertIn("server_cmd+=(--cuda-profile-graph-batch 2)", script)
-        self.assertIn('--expected-batch "${trace_concurrency}"', script)
+        self.assertEqual(
+            script.count('--expected-batch "${trace_concurrency}"'),
+            3,
+        )
         self.assertIn(
             "c2 raw paired trace capture complete; status remains PENDING",
             script,
@@ -1080,6 +1085,38 @@ class OnlineClientContractTests(unittest.TestCase):
                 range_index=1,
             )
             self.assertEqual(summary["kernel_count"], 1_107)
+
+            low_batch = root / "low-batch.sqlite"
+            write_nsys_sqlite(
+                low_batch,
+                lost_events=True,
+                model_contract=True,
+                model_batch=2,
+            )
+            result = validate_nsys_trace(
+                low_batch,
+                model_key="27",
+                expected_batch=2,
+            )
+            self.assertEqual(result["graph_child_rows"]["kernel"], 1_011)
+            self.assertEqual(result["primary_graph_node_count"], 1_011)
+            self.assertEqual(
+                result["primary_graph_family_node_counts"]["fp4_gemm"], 208
+            )
+            summary = summarize_nsys_kernels(
+                low_batch,
+                model_key="27",
+                expected_batch=2,
+            )
+            self.assertEqual(summary["kernel_count"], 1_011)
+            with self.assertRaisesRegex(HarnessError, "model contract"):
+                validate_nsys_trace(low_batch, model_key="27")
+            with self.assertRaisesRegex(HarnessError, "no exact Nsight"):
+                validate_nsys_trace(
+                    low_batch,
+                    model_key="27",
+                    expected_batch=4,
+                )
 
             unreconciled = root / "unreconciled.sqlite"
             write_nsys_sqlite(

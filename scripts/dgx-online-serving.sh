@@ -666,11 +666,13 @@ run_paired_traces() {
         --sqlite "${ours_sqlite}" \
         --model-key "${model}" \
         --range-index "${range_index}" \
+        --expected-batch "${trace_concurrency}" \
         --output "${ours_validation}"
       python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
         --sqlite "${ours_sqlite}" \
         --model-key "${model}" \
         --range-index "${range_index}" \
+        --expected-batch "${trace_concurrency}" \
         --output "${ours_summary}"
       ours_reps+=("${ours_rep}")
       ours_sqlites+=("${ours_sqlite}")

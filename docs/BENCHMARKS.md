@@ -18,8 +18,10 @@ It is neutral against the predeclared 1.04× minimum, so W3 remains an unmet
 parity obligation rather than a speed lever. Its accepted ON trace now pins
 the oracle c2 topology at **1,524 clean batch-2 windows / 1,160 kernels per
 window**, with identical ordered signatures across every window. The local
-trace-only seam is now batch-2 capable, but its fresh paired capture and final
-status are **PENDING**. Host PSS/RSS is independently
+trace-only seam is now batch-2 capable. Its first local run passed correctness
+and captured four lossless identical ranges, then failed closed on a stale
+batch-16 graph-size assertion; that run is **VOID** and the repaired full retry
+is **PENDING**. Host PSS/RSS is independently
 traced to a persistent **22.920 GiB** CPU weight mirror plus source-page
 residency during load. W3-I
 remains default-off after its **30/48** component failure.
@@ -68,9 +70,9 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Finalize the exact c2 ours/vLLM kernel map, gate the selected lever, then rerun the exact grid |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repeat/finalize the repaired c2 ours/vLLM kernel map, gate the selected lever, then rerun the exact grid |
 | vLLM async-scheduler credit | **COMPLETE DIAGNOSTIC / NEUTRAL FOR SPEED** | Clean `3812d8`, six timing legs plus two shape-neutral traces under one lock. ON/OFF medians: total **160.347697 / 160.003134 tok/s = 1.002153×**, TPOT **106.642 / 107.740 ms** (ON ~1.0% better), TTFT **807.658 / 696.330 ms** (ON ~16.0% slower). Trace count/time: **1,798,044 / 170.819890 s** ON and **1,810,902 / 170.478267 s** OFF; tactic/batch mix changes, aggregate GPU time does not improve. Summary/manifest/artifact SHA `35b7344a…c323` / `e757b4ad…86c6` / `ead68397…8e56`; cleanup returned lock/GPU/port idle | Keep `ENG-ASYNC-SCHED` as later parity work; move the speed-critical path to low-batch kernel mapping |
-| Exact c2 executed path | **ACTIVE / LOCAL CAPTURE PENDING** | Accepted oracle trace SHA `57413dd1…1cba`: **1,536** annotations, **1,524** clean B=2 windows, **1,160 kernels/window**, ordered-name/signature SHA `858915dd…fad0` / `b5c6fcac…dd7b`. Per window: **177 generated RMSNorm/quant calls / 0.442805 ms**; FP4 GEMMs resolve to **128 Stream-K 128x64x256 + 80 static-persistent 128x32x256**. This is structural, not a speed ratio | Run the fresh three-session local batch-2 Nsight capture plus paired oracle trace, then fail-closed finalize before selecting a lever |
+| Exact c2 executed path | **FAILED / VOID; REPAIRED RETRY PENDING** | Oracle SHA `57413dd1…1cba`: **1,524** clean B=2 windows, **1,160 kernels/window**. First local root `ad8b58f`: model gate pass; one session/four exact ranges each have **1,011 kernels + 7 memcpy + 1 memset**, lossless, identical node-multiset SHA `6b75bcff…1ce3`, and the same **128+80 FP4** split. The driver then rejected 1,011 against the stale c16 contract of 1,107; sessions 2/3 and fresh oracle are absent, so no ratio binds | Repeat all three local sessions and the fresh oracle with the batch-aware validator, then fail-closed finalize before selecting a lever |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -91,7 +93,7 @@ scan ranks the live evidence as follows:
 | Finding | Binding interpretation |
 |---|---|
 | vLLM depth-2 async scheduling + GPU-resident sampled-token path | Complete ON/OFF timing gives only **+0.215%** total throughput, ~1.0% better TPOT and ~16.0% worse TTFT; ON has **0.200% more** aggregate traced GPU time. It cannot close the 6.1% gap and leaves the speed-critical path |
-| RMSNorm/generated partitions | Oracle c2 side is now exact: seven generated families total **177 calls / 0.442805 ms per window**. The old local c16 baseline is **129 calls / 2.094864 ms**; only the pending local c2 capture can establish a comparable structural residual |
+| RMSNorm/generated partitions | Oracle c2: seven generated families total **177 calls / 0.442805 ms per window**. The void first local session also has **177 RMSNorm-family calls / 2.237944 ms mean** across four ranges. This cross-profiler, incomplete observation is structural only; the repaired complete capture must reproduce it before any residual or speed claim |
 | Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
 | Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
 
@@ -117,6 +119,11 @@ Use the clean source/corpus/configure setup in the schema-v5 reproduction below,
 but invoke the paired trace at exact concurrency two. This command intentionally
 produces raw, per-range-validated evidence without an accepted status; the
 low-batch finalizer is the next checkpoint, so no partial trace may bind:
+
+The immutable failed first attempt is
+`~/work/vllm.cpp-executed-path-c2/ad8b58f8708ce9bdf32aa9043611b3f6049be7fd`.
+Its report/control/evidence-set SHA values are `9f285fd6…0aec` /
+`ee1589df…c719` / `0da532ac…ac35`; cleanup returned GPU, lock, and port idle.
 
 ```sh
 SHA=$(git rev-parse HEAD)

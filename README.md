@@ -15,9 +15,12 @@ OpenAI-compatible server.
 > **0.215%** total throughput and cannot explain the gap. The accepted oracle
 > trace now fixes the c2 target at **1,524** clean batch-2 windows and **1,160
 > kernels/window**, including a 128 Stream-K + 80 static-persistent FP4 tactic
-> split. The trace-only local observer is batch-2 capable; its fresh paired
-> capture/final status is **PENDING**, so no RMSNorm residual or next kernel
-> lever is claimed yet. Separately, the
+> split. The first local attempt (`ad8b58f`) passed the model gate and captured
+> four lossless, identical batch-2 ranges, but failed closed because the
+> validator still required the batch-16 graph size (1,107 rather than the
+> observed 1,011 kernels). The batch-aware repair is ready and a fresh complete
+> retry is **PENDING**; no RMSNorm residual or next kernel lever is claimed yet.
+> Separately, the
 > host-memory gap is traced to a persistent **22.92 GiB CPU weight mirror**
 > plus load-time safetensors residency. The binding result remains **55/124**, W3-I stays
 > default-off, and no 35B performance result is claimed. See
@@ -28,7 +31,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; the c2 oracle topology is fixed but the local paired capture is pending | Finalize the exact c2 ours/vLLM map, then spike and gate the selected RMSNorm/FP4 lever |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; first c2 local capture is void on a batch-contract validator mismatch | Repeat/finalize the repaired c2 ours/vLLM map, then spike and gate the selected RMSNorm/FP4 lever |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -57,7 +60,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
 | Closed scheduler diagnostic | Accepted `3812d8` c2 ON/OFF: total **160.347697 / 160.003134 tok/s = 1.002153×**; TPOT **106.642 / 107.740 ms**, TTFT **807.658 / 696.330 ms**. Traces total **170.820 / 170.478 s** GPU-kernel time. Async is neutral for speed; W3 remains later parity work |
-| Selected GPU work | Oracle side fixed: 1,524 clean c2 windows, 1,160 kernels/window, 177 generated RMSNorm/quant calls, and a 128+80 FP4 tactic split. Capture/finalize the equivalent local batch-2 graph before selecting a lever |
+| Selected GPU work | Oracle: 1,160 kernels/window. First local session: four lossless identical 1,011-kernel ranges, 177 RMSNorm calls and the same 128+80 FP4 split; attempt is void because sessions 2/3 and fresh oracle never ran. Repeat/finalize before selecting a lever |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 

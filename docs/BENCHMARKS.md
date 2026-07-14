@@ -9,14 +9,12 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 W3-H's accepted trace selects fused SiLU→FP4 as the largest positive mapped
-residual. W3-I1 is now **structurally accepted** at clean `15c6b89`: the exact
-CUDA build, operator/sanitizer/model gates, commit-bound SASS, and paired
-27B/35B traces pass. Its packed graph body plus required scale zeroing is
-**36.68% shorter** than the fallback fused slice. That is diagnostic evidence,
-not an end-to-end ratio. The first component launch is **VOID before
-measurement**: an older native plan document failed exact build-ID validation
-at the candidate model gate. The repaired driver uses the commit's accepted
-v0.25 FlashInfer fixture; no binding speed number changed.
+residual. W3-I1 is **structurally accepted but performance-failed** at clean
+`15c6b89`: its packed graph slice is **36.68% shorter**, yet the complete
+same-binary component passes only **27/40 timing + 3/8 memory axes**. Mean total
+throughput ratios are **1.002457× at c2** and **0.999771× at c16**. The
+candidate remains default-off, earns no speed credit, and does not authorize
+the exact vLLM grid. The next checkpoint is a cross-stack residual re-ranking.
 
 ## Binding 27B online gate
 
@@ -62,10 +60,10 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Re-rank engine, memory, and executed-kernel residuals; gate the highest-value isolated lever before rerunning the exact 27B grid |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
 | W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
-| W3-I fused SiLU→FP4 producer | **ACTIVE / STRUCTURE PASS; PERFORMANCE PENDING** | Clean `15c6b89` passes all structural gates. First component start: **VOID before timing**, candidate model gate rejected stale native-cache `build_id`; GPU/lock/port returned clean and no raw rate exists. Repaired driver binds the exact accepted v0.25 FlashInfer fixture and a guaranteed-absent read-only native path | Run all c2/c16 **40 timing + 8 memory** axes with the repaired immutable driver below |
+| W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; exact-fixture component completes 12/12 legs and 612/612 requests with zero failures, identical 64/64 plans, **27/40 timing + 3/8 memory**. c2/c16 total ratios: **1.002457× / 0.999771×** | Keep default-off; no exact grid. Use the result in the next residual re-ranking |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
@@ -82,7 +80,7 @@ digests diagnostic. Passing status SHA is `84d15970…6e66`; canonical node
 multiset SHA is `c357867c…68b`. Superseded attempts and detailed hashes remain only in the
 [parity ledger](../.agents/parity-ledger.md) and [state log](../.agents/state.md).
 
-### W3-I1 immutable structural result
+### W3-I1 immutable result
 
 The current root is
 `~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2`.
@@ -106,22 +104,42 @@ no D2H. The 35B candidate trace (report/SQLite SHA `dd92270b…9ca7` /
 `7a4abf1c…f8fa`) passes correctness and contains zero W3-I kernel calls.
 Whole-process profiler duration is intentionally not treated as a rate.
 
-The first driver (`0f08750f…ae1b`) stopped at the candidate model gate before
-any server leg because native-plan document `2590fc94…199d` belongs to an older
-build fingerprint. Its evidence root is retained `VOID`; driver/model-gate log
-SHA are `898ee3c7…5edb` / `dd747a44…90e7`.
+The complete component root is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2`.
+It uses the exact v0.25 FlashInfer 64-plan fixture, one `/tmp/gpu` lock, fresh
+servers, cold page residency, and the prescribed candidate/fallback
+`AB/BA/AB` order.
 
-Run the pending component with the repaired immutable driver. It owns one
-`/tmp/gpu` lock for both model gates and all 12 AB/BA/AB legs; exit 0 means all
-48 axes pass, while exit 1 after a complete evidence tree means strict failure.
+| Component point | Timing axes | Memory axes | Candidate / fallback total tok/s | Ratio | Result |
+|---:|---:|---:|---:|---:|---|
+| c2 | 18/20 | 3/4 | 154.499922 / 154.121285 | **1.002457×** | FAIL |
+| c16 | 9/20 | 0/4 | 819.912423 / 820.100597 | **0.999771×** | FAIL |
+| **Total** | **27/40** | **3/8** | — | — | **FAILED: 30/48** |
+
+All 12 timed legs, 612 requests, and 12 memory returns complete; request
+failures are zero. Both arms pass **235/235 assertions + 16/16 token-exact**,
+all process metadata and plan maps match, every process loads 64 FlashInfer /
+zero native plans, and tuning/rejection/save counts are zero. Candidate and
+fallback total-throughput CVs are at most **0.1223%**. At c16 the candidate
+also increases mean peak GPU memory by **247 MiB**, PSS/RSS by about **32 MiB**,
+and `MemAvailable` drop by about **181 MiB**. These are binding component
+failures under the all-axis rule.
+
+Read-only result verification:
 
 ```sh
-ssh dgx.casa \
-  '$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver-r2.sh'
+ssh dgx.casa '
+  root=$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2
+  sha256sum "$root/summary.json" "$root/selection-summary.json" "$root/driver.sh"
+  jq . "$root/summary.json"
+'
 ```
 
-Repaired driver SHA-256 is `06a5f72e…488d`; its exact v0.25 fixture SHA is
-`e81e9181…7edd`. Partial output is never binding.
+Summary / plan-selection / driver SHA-256 values are `b7cfa029…7c17` /
+`f196274b…6753` / `06a5f72e…488d`; exact fixture SHA is `e81e9181…7edd`.
+The completed driver's exit 1 is the expected strict-gate result, not a
+harness failure. Detailed attempt chronology remains in the append-only
+record rather than this scoreboard.
 
 ### Executed-path diagnostic ranking
 
@@ -161,6 +179,7 @@ none substitutes for the end-to-end 124-axis gate.
 | Direct swizzled activation scales | c2/c16 mean ratios **1.004483× / 1.005044×**; 39/40 timing + 1/8 memory | Correctness/trace pass; strict component **FAILED**, no speed credit |
 | Model-owned device alpha | c2/c16 mean ratios **1.001967× / 1.000144×**; 27/40 timing + 3/8 memory | Correctness/trace pass; strict component **FAILED**, no speed credit |
 | FA2 ratio-6 split-KV decode | c2/c16 mean ratios **1.017668× / 1.006548×**; 35/40 timing + 5/8 memory | Correctness/dispatch pass; strict component **FAILED**, no speed credit |
+| Packed fused SiLU→FP4 producer | c2/c16 mean ratios **1.002457× / 0.999771×**; 27/40 timing + 3/8 memory | Correctness/structure pass; strict component **FAILED**, default remains off and no speed credit exists |
 | 27B BF16 GDN output | Mean ratio **1.007989×**; 16/20 timing + 2/4 memory | Retained for vLLM/token correctness; strict gate open |
 | Fixed HTTP worker floor | Fixed/legacy ratio **0.999764×**; 8/20 axes | Safety/capacity fix retained; performance neutral |
 | Device-resident indexed GDN state | Indexed/fallback mean +0.6246%, 20/20 timing axes, large copy reduction | Correctness/A-B/trace pass; strict zero-leak lifecycle still open |

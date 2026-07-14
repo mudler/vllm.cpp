@@ -1,7 +1,7 @@
 # NVFP4 fused SiLU→FP4 producer (W3-I)
 
-Status: **ACTIVE — W3-I1 is structurally accepted at clean `15c6b89` behind a
-default-off rollback toggle; the complete c2/c16 component remains pending**
+Status: **ACTIVE — W3-I1 is structurally accepted at clean `15c6b89`, but its
+complete c2/c16 component FAILED 27/40 timing + 3/8 memory; default remains off**
 
 Owning row: `KERNEL-GEMM-NVFP4-W4A4`
 
@@ -144,8 +144,8 @@ in the accepted production trace and do not block the first specialization.
 | Leaf | Deliverable | State |
 |---|---|---|
 | W3-I0 | source, generated-code, SASS, executed-trace, dispatch, test, dependency and gate inventory | **COMPLETE in this spike** |
-| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **IMPLEMENTED / IMMUTABLE STRUCTURE PASS; 48-AXIS COMPONENT PENDING** |
-| W3-I2 | if a post-I1 trace shows per-call zeroing is material, aggregate/fuse scale initialization at the model/graph lifecycle seam to mirror the generated vLLM zero kernel | **INVENTORIED; prohibited before I1 classification** |
+| W3-I1 | opt-in `VT_FP4_FUSED_VEC=1` dense BF16/swizzled specialization: explicit async scale pre-zero, 16-value packed body, 256-bit gate/up loads, BF16x2 max, packed 64-bit output, 512-thread 2-D row-loop launch; cached eligibility and scalar fallback | **IMPLEMENTED / STRUCTURE PASS / COMPONENT FAILED 30/48; DEFAULT OFF** |
+| W3-I2 | if post-I1 re-ranking selects per-call zeroing as the highest-value residual, aggregate/fuse scale initialization at the model/graph lifecycle seam to mirror the generated vLLM zero kernel | **INVENTORIED; not selected—cross-stack re-ranking required** |
 | W3-I3 | upstream approximate-reciprocal numeric mode plus FP16 packed input, independently correctness/performance-gated | **INVENTORIED** |
 | W3-I4 | two-input and expert-offset packed breadth, each with the matching upstream tests | **INVENTORIED** |
 | W3-I5 | conditional default flip, exact v0.25.0 27B 124-axis grid, then lifecycle classification | **BLOCKED on a passing I1 component** |
@@ -172,7 +172,7 @@ All CUDA series below ran uncontended under GPU ownership.
 | 35B candidate-on correctness + inertness | **PASS — 2/2 + 315/315**; log SHA `fba79fbb…65f1`; paired trace contains **zero** W3-I calls |
 | Packed compiled body | object/SASS SHA `d6ca771b…65bb` / `662f2c54…4102`: **816 instructions, 36 registers, zero stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte store, eight packed E2M1 conversions** |
 | Paired 27B graph trace | **PASS — 896/896** eligible graph calls use the packed body, with **896** explicit 139,264-byte zero nodes and no scalar call. Fallback fused slice is **6.064064 ms**; candidate body + zero is **3.839808 ms**, down **36.68%**. Allocation/free/sync/capture/copy counts are identical |
-| c2+c16 component | **PENDING — no rate or speed credit**. First start is **VOID before measurement** on stale native-cache build ID; repaired exact-fixture driver SHA `06a5f72e…488d` |
+| c2+c16 component | **FAILED — 27/40 timing + 3/8 memory, 30/48 total**. c2/c16 mean total-throughput ratios are **1.002457× / 0.999771×**; 12/12 legs, 612/612 requests, zero failures, 12/12 memory returns, and identical 64/64 plan maps pass. Candidate remains default-off |
 
 Negative zero is part of the byte-exact semantic contract: packed hardware
 conversion is retained, then zero-magnitude nibbles have their sign bit cleared
@@ -237,15 +237,32 @@ A positive mean with any red axis is a failed component. A passing component
 authorizes the exact vLLM v0.25.0 27B 124-axis grid; it does not itself replace
 the binding result. Only **124/124** closes 27B and authorizes 35B performance.
 
-The repaired driver is
+The completed driver is
 `~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver-r2.sh`,
 SHA-256 `06a5f72eaecc0d7d3300be75b6589c7bdcc4590203296926bd1dae0acc89488d`.
 It runs `VT_FP4_FUSED_VEC=1` versus `0` against the exact accepted v0.25
 FlashInfer fixture (SHA `e81e9181…7edd`) and a guaranteed-absent read-only
 native path, under the same binary, corpus, port allocation, one GPU lock, and
-AB/BA/AB manifest. The first driver/root remains `VOID`: its reused native
-document failed build-ID validation before timing. The repaired result root is
-SHA-owned and immutable; partial or contended output is `VOID`.
+AB/BA/AB manifest. The immutable result root is
+`.../evidence/component-ab-c2-c16-fused-vec-flashinfer-r2`; summary /
+selection-summary / driver-log SHA-256 values are `b7cfa029…7c17` /
+`f196274b…6753` / `77e948ea…29a1`.
+
+The completed strict result is **FAILED**:
+
+| Point | Timing | Memory | Candidate / fallback total tok/s | Ratio |
+|---:|---:|---:|---:|---:|
+| c2 | 18/20 | 3/4 | 154.499922 / 154.121285 | **1.002457×** |
+| c16 | 9/20 | 0/4 | 819.912423 / 820.100597 | **0.999771×** |
+
+Both model gates pass **235/235 + 16/16** with byte-identical logs; all 12
+processes load 64 FlashInfer / zero native plans and tune/reject/save zero.
+Every timed request and memory-return contract completes, and maximum total-
+throughput CV is **0.1223%**. At c16 the candidate additionally uses 247 MiB
+more peak GPU memory and about 32 MiB more peak PSS/RSS. Exit 1 is therefore the
+expected all-axis verdict, not a harness failure. No speed credit, default flip,
+exact grid, or 35B performance follows. Detailed attempt chronology is kept in
+the append-only state/ledger record rather than this live spec.
 
 ## Dependencies and risks
 

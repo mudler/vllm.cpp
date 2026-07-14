@@ -84,13 +84,13 @@ inner 4096, state 128; context 262144.
   27B cache-off grid at **55/124 axes pass, 69 fail**; W3-E/W3-F/W3-G
   strict-fail and earn no speed credit. W3-H schema-v5 `c498a413` passes final
   status `84d15970…6e66` under validator `7112864`. Fused SiLU→FP4 is the
-  largest positive mapped residual in all 12 local reports, displacing normal
-  W3-H2. W3-I1 is default-off and structurally accepted at clean `15c6b89`:
-  CUDA/operator/memcheck/model/SASS and paired 27B/35B trace gates pass, with a
-  **36.68%** smaller comparable graph slice. Its first component start is
-  `VOID` before timing on stale native-cache metadata; run the repaired
-  exact-fixture 48-axis component, then close all 69 failed axes before 35B
-  performance.
+  largest positive mapped residual in all 12 local reports. W3-I1 is
+  default-off and structurally accepted at clean `15c6b89`, but its complete
+  exact-fixture component fails **27/40 timing + 3/8 memory**; c2/c16 total
+  ratios are **1.002457× / 0.999771×** over 612/612 successful requests.
+  It earns no speed credit. Re-run the mandated cross-stack residual scan,
+  isolate and gate the next lever, then close all 69 failed binding axes before
+  35B performance.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

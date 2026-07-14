@@ -9,27 +9,24 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The current [W3-I](.agents/specs/nvfp4-fused-silu-producer.md) candidate is
-> commit-bound and structurally accepted at `15c6b89`: clean CUDA build,
-> operator/sanitizer/model gates, packed SASS, and paired 27B/35B traces pass.
-> In the 27B graph, the packed producer plus required scale zeroing takes
-> **3.839808 ms** versus **6.064064 ms** for the old fused slice (**36.68%**
-> less across 14 forwards). This is diagnostic—not benchmark credit. The
-> first component launch stopped before measurement on a stale native-cache
-> build fingerprint; that attempt is `VOID`. The repaired c2/c16 **48-axis**
-> driver uses the exact accepted v0.25 fixture and is the next gate. The binding
-> result remains **55/124**, and no 35B performance result is claimed. See
-> [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
+> The current [W3-I](.agents/specs/nvfp4-fused-silu-producer.md) packed
+> SiLU→FP4 candidate passes correctness, safety, SASS, and structural trace
+> gates, but its complete same-binary component **fails at 30/48 axes**. Mean
+> total throughput is **1.002457× at c2** and **0.999771× at c16** versus
+> the scalar fallback; all 612 requests complete, but c16 timing and memory
+> regressions keep the candidate default-off and earn no speed credit. The
+> binding result therefore remains **55/124**, and no 35B performance result
+> is claimed. See [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
 
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Run W3-I1's repaired fixture-bound 48-axis component; only a pass authorizes all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Re-rank the cross-stack residual after W3-I1's failed component, then gate the next isolated lever before rerunning all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-I fused SiLU→FP4 producer | 🚧 `ACTIVE` / structure PASS | Clean `15c6b89` passes structural gates. The first component start is `VOID` before measurement because an older native plan document failed build-ID validation; no rate exists | Run the repaired exact-fixture c2/c16 40-timing + 8-memory component |
+| W3-I fused SiLU→FP4 producer | ❌ component FAILED / default off | Clean `15c6b89` passes structural gates; complete exact-fixture A/B passes **27/40 timing + 3/8 memory**. c2/c16 total ratios are **1.002457× / 0.999771×** | Retain as an opt-in structural port; do not run the exact vLLM grid from this candidate |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -59,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
 | Vectorized normal BF16→FP4 I/O | Not implemented. Accepted H1d attribution ranks its diagnostic residual at **+0.313930 ms/window**, below the fused producer in 12/12 reports; W3-H2 is displaced |
-| Fused SiLU→FP4 producer | Default-off W3-I1 is structurally green at clean `15c6b89`; its traced slice falls **36.68%**. A stale native-cache fingerprint voided the first component start before measurement; the repaired exact-fixture 48-axis run is pending, so no speed credit exists |
+| Fused SiLU→FP4 producer | Default-off W3-I1 is structurally green at clean `15c6b89`, but the complete component **FAILED at 27/40 timing + 3/8 memory**. c2 improves 0.246%; c16 regresses 0.023%, so no speed credit or exact grid follows |
 
 ## What is implemented
 
@@ -129,7 +126,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; W3-I's packed candidate is structurally accepted at `15c6b89`, with its 48-axis performance gate pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; W3-I's packed candidate is structurally accepted but strict component-failed and remains default-off |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -156,7 +153,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; W3-I1's packed fused producer passes immutable structural gates but not yet its 48-axis speed gate |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; W3-I1's packed fused producer passes structural gates but strict component-fails at 30/48 and remains default-off |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -179,8 +176,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: W3-I's 48-axis component gate → all-axis
-27B parity → 35B
+The next execution order is fixed: post-W3-I cross-stack residual scan →
+isolated gate for the highest-value lever → all-axis 27B parity → 35B
 parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.

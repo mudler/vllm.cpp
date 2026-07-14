@@ -7696,3 +7696,61 @@ shell syntax, optional ShellCheck, exact clean source, fixture/native-path,
 GPU/lock and port preflights pass. W3-I1 remains `ACTIVE / structure PASS`, the
 complete **40 timing + 8 memory** component is pending, binding `3f256ab`
 remains **55/124**, and no exact grid, W3-I2 or 35B performance is authorized.
+
+## 2026-07-14 — W3-I1 complete exact-fixture component fails 30/48
+
+The repaired W3-I1 series started at `2026-07-14T00:21:03Z` and retained one
+uncontended `/tmp/gpu` lock across both model gates and every fresh-server leg.
+Immutable result root:
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2`.
+It is tied to clean implementation commit
+`15c6b8933d982019aa8965d218deb0eb1d9dc3f4`, server SHA
+`47b9d62b…0fe1`, driver SHA `06a5f72e…488d`, and exact v0.25 FlashInfer fixture
+SHA `e81e9181…7edd`. Summary / selection-summary / driver-log / provenance SHA
+values are `b7cfa029…7c17` / `f196274b…6753` / `77e948ea…29a1` /
+`16b20ca0…be3d`.
+
+Both candidate and fallback model gates pass **235/235 assertions + 16/16
+token-exact** with byte-identical log SHA `6dbae524…3363`. Every one of the 12
+server processes loads **64 FlashInfer / zero native** plans from the immutable
+fixture, selects the same 64/64 map, and tunes/rejects/saves zero. Process
+metadata and plan maps are identical. The prescribed order at both c2 and c16
+is candidate-r1, fallback-r1, fallback-r2, candidate-r2, candidate-r3,
+fallback-r3. All **12/12 raw runs, 612/612 requests, and 12/12 memory returns**
+complete with zero request failures; cold-page drops and post-leg idle/memory
+return checks pass.
+
+The strict component result is **FAILED**:
+
+| Point | Timing pass | Memory pass | Candidate total tok/s | Fallback total tok/s | Normalized ratio |
+|---:|---:|---:|---:|---:|---:|
+| c2 | 18/20 | 3/4 | 154.499921993 | 154.121284730 | **1.002456749×** |
+| c16 | 9/20 | 0/4 | 819.912423108 | 820.100596572 | **0.999770548×** |
+| **Total** | **27/40** | **3/8** | — | — | **30/48 axes** |
+
+Candidate/fallback total-throughput CVs are **0.122250% / 0.043344%** at c2
+and **0.091944% / 0.070347%** at c16. The c2 red timing axes are median and p90
+TTFT; its red memory axis is mean peak `MemAvailable` drop. At c16 only mean/
+median/p90 ITL and TPOT, median and p99 E2EL, and p99 TTFT pass. Candidate c16
+mean peak GPU memory is **38,026.333 vs 37,779.333 MiB**; peak PSS is
+**48,179,158.333 vs 48,146,566.333 KiB**; RSS is **48,181,497.333 vs
+48,148,896.000 KiB**; available-memory drop is **65,303,772 vs 65,118,708
+KiB**. Thus all four c16 memory axes fail. Independent online generated-text
+digests match in 2/6 paired runs, which remains diagnostic by W3-C3R; both
+mandatory fixed model gates pass before measurement.
+
+The driver exits 1 only after producing both complete summaries, so this is a
+valid strict failure rather than `VOID` or a harness error. Post-run
+`nvidia-smi` reports no compute process, `/tmp/gpu` is free, and port 8000 is
+free. W3-I1 remains an opt-in structural port behind `VT_FP4_FUSED_VEC=1`; the
+production default stays scalar. It earns no speed credit and does not
+authorize the exact 124-axis grid, W3-I2, or 35B performance. Binding
+`3f256ab` remains **55/124**. The next action returns to the standing
+cross-stack scan across low-concurrency engine/host overhead, host-memory
+ownership, and executed-kernel residuals; a new implementation requires the
+scan to select a bounded lever and the live spike/claim to be updated first.
+
+This checkpoint also compacts all live status surfaces to the current result.
+The earlier stale-cache pre-measurement attempt remains discoverable only in
+this append-only log and the parity ledger, not in README, BENCHMARKS, roadmap,
+matrices, coordination handoff, or the live W3-I spec.

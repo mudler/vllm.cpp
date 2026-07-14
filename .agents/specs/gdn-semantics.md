@@ -339,8 +339,8 @@ Pinned executable-spec inventory for the chunked prefill path:
   plus dtype-rounded beta reproduces the oracle at `0/1` output/state BF16
   differences. Clean `f18ca23` closes semantic G0; clean `9ad8fb7` closes
   W1D1/G1 for the CPU/CUDA operator, upstream matrix, capture/canaries and
-  strict memcheck. W1D2 production dispatch/rollback and mutable 235/235 gates
-  pass; immutable G2 plus trace/component evidence remain open.
+  strict memcheck. Clean `f344dec` closes W1D2/G2 production
+  dispatch/rollback at 235/235; trace/component evidence remains open.
 
 - `tests/kernels/mamba/test_gdn_prefill_cutedsl.py::test_gdn_chunk_cutedsl_correctness`
   (lines 33-199): **ported in substance** to `tests/vt/test_ops_gdn.cpp`.

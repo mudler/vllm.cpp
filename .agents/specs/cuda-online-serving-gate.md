@@ -28,8 +28,8 @@ clean pushed `581d335` core model/safety gates. Immutable `f925294` proves the
 local BF16 BA projection bit-exact and closes native/legacy/GGUF inertness, but
 the isolated BF16-BA plus decomposed control fails the known near-tie at
 233/235, proving the gap is downstream of GEMM. W1D2 now couples that exact
-projection to packed recurrence and passes mutable default and rollback
-**235/235**. Immutable `0091cd1`, finalized by pushed `8a1f923`, is
+projection to packed recurrence; clean `f344dec` closes immutable default and
+rollback at **235/235**. Immutable `0091cd1`, finalized by pushed `8a1f923`, is
 `complete-structural`: 12/12 merged ranges are 963/145, 12/12 split ranges are
 1,011/193, exactly 48 BF16 launches disappear, and every selected non-BF16
 family remains unchanged. `benchmark_binding=false`; downstream first-divergence
@@ -39,8 +39,8 @@ output/state differences, while beta-only does not. Clean `f18ca23` closes
 immutable G0 with byte-identical regeneration and CUDA **10/10**. W1D1 now
 implements the CPU/CUDA operator and upstream matrix; clean `9ad8fb7` closes
 G1 with focused **5/5**, full GDN **41/41**, direct `0/1` and strict memcheck
-**2/2 with zero errors/leaks**. W1D2 model dispatch and mutable G2 are green;
-clean-SHA G2 plus paired node traces and c2/c16 remain pending.
+**2/2 with zero errors/leaks**. Clean `f344dec` closes W1D2 model dispatch and
+immutable G2; paired node traces and c2/c16 remain pending.
 qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
@@ -262,12 +262,12 @@ reported as a clean dependency check.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
    core correctness/safety; `f925294` closes exact projection/inertness. Clean
-   `f18ca23`/`9ad8fb7` close packed G0/G1, and W1D2 now restores mutable
-   default+rollback 27B **235/235** with 35B/GGUF inertness.
+   `f18ca23`/`9ad8fb7` close packed G0/G1, and clean `f344dec` closes W1D2/G2
+   at default+rollback 27B **235/235** with 35B/GGUF inertness.
 6. The exact-c2 mode-aware harness is implemented and CPU-gated. Immutable
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
-   24 local range contracts with `benchmark_binding=false`. Commit/push and
-   repeat immutable W1D2 G2, then close paired node traces plus c2/c16
+   24 local range contracts with `benchmark_binding=false`. Close paired node
+   traces plus c2/c16
    component disposition; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.

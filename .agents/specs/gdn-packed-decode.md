@@ -3,8 +3,8 @@
 **Row:** `KERNEL-GDN-PACKED-DECODE` · **consumers:**
 `KERNEL-GEMM-BF16`, `SERVE-GATE-ONLINE` · **status:** spike complete,
 implementation `ACTIVE` under `CLAIM-GDN-BA-ROUNDING-1`; W1D1/G1 closed at
-clean `9ad8fb7`; W1D2 model dispatch and mutable G2 are green, immutable
-pushed-SHA G2 is pending · **priority:** roadmap order 0.
+clean `9ad8fb7`; clean pushed `f344dec` closes W1D2 model dispatch and
+immutable G2; W1D3 trace/component is pending · **priority:** roadmap order 0.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -96,7 +96,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Projection proof | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/` | Immutable `f925294` passes all five real BA shapes exactly; the divergence is not the GEMM. |
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
-| W1D2 mutable G2 | model/runner/registry tests plus real 27B/35B/GGUF gates | Final mutable-source replay passes default and rollback 27B **235/235 + 16/16**, default selects exactly 48 packed calls on the first decode and zero on prefill, rollback selects zero, native/batched 35B selects zero at **315/315**, Compact/Balanced GGUF each pass **14/14**, and full CUDA GDN passes **43/43, 1,707/1,707**. Clean pushed-SHA repetition remains mandatory; no speed credit exists. |
+| W1D2 immutable G2 | model/runner/registry tests plus real 27B/35B/GGUF gates | Clean pushed `f344dec` passes default and rollback 27B **235/235 + 16/16**; default selects exactly 48 packed calls on the first decode and zero on prefill, rollback selects zero; native/batched 35B selects zero at **315/315**; Compact/Balanced GGUF each pass **14/14**; full CUDA GDN passes **43/43, 1,707/1,707**; three strict memcheck slices report zero errors/leaks. G2 is closed; no speed credit exists. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -213,7 +213,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 |---|---|---|
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
-| W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **IMPLEMENTED / mutable G2 PASS:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Immutable clean-SHA replay is **PENDING**. |
+| W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **CLOSED / immutable G2 PASS at clean `f344dec`:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Evidence root `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`. |
 | W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is

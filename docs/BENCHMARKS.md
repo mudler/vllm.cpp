@@ -11,16 +11,16 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
 **FAILED / open at 55/124 axes**. The active
 [packed-decode checkpoint](../.agents/specs/gdn-packed-decode.md) has advanced
-through W1D2 on the final mutable source: vLLM's exact pure non-spec dispatch,
+through immutable W1D2/G2 at clean pushed `f344dec`: vLLM's exact pure non-spec dispatch,
 independent BF16-conv/FP32-SSM cache ABI, complete host metadata preflight and
 process-cached rollback are implemented. Local CTest passes **103/103**. The
 DGX replay passes default and rollback 27B **235/235 + 16/16**, full CUDA GDN
 **43/43, 1,707 assertions**, direct packed semantics **0/1**, native/batched
 35B **315/315** with zero packed selection, and isolated Compact/Balanced GGUF
 **14/14 + 14/14**. Focused strict memcheck covers the packed matrix,
-compressed indexed corner and FP16 SSM rollback with zero errors/leaks. These
-are mutable correctness/selection results: immutable pushed-SHA G2 and W1D3
-node trace plus c2/c16 **40 timing + 8 memory** remain **PENDING**, so no
+compressed indexed corner and FP16 SSM rollback with zero errors/leaks.
+Immutable G2 is **PASSED**; W1D3 node trace plus c2/c16 **40 timing + 8
+memory** remain **PENDING**, so no
 accepted performance number changes.
 
 ## Binding 27B online gate
@@ -67,8 +67,8 @@ performance command is authorized until the 27B result reaches 124/124.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Close packed decode and its c2/c16 component; rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; W1D2's exact coupled BF16-BA + packed path is mutable **235/235**, `benchmark_binding=false` | Depends on immutable packed G2 plus its component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D2 MUTABLE G2 PASS** | Default+rollback 27B **235/235**, 35B **315/315** zero-selection, GGUF **14/14 + 14/14**, CUDA GDN **43/43**, direct **0/1**, focused memcheck zero errors/leaks | Commit/push and repeat from the immutable SHA, then run node trace plus c2/c16 AB/BA/AB |
+| `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D2 IMMUTABLE G2 PASS** | Clean `f344dec`: default+rollback 27B **235/235**, 35B **315/315** zero-selection, GGUF **14/14 + 14/14**, CUDA GDN **43/43**, direct **0/1**, focused memcheck zero errors/leaks | Run paired node trace plus c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -85,16 +85,17 @@ state log. The current checkpoint is W1D2:
 |---|---|---|
 | Exact vLLM boundary | Direct packed output/state BF16 differences **0/1** | PASS; upstream explicit reference has the same one-element state delta |
 | Cache ABI | `MambaSpec` conv then temporal; gate allocation BF16 conv + FP32 SSM | PASS on registry/runner production-like tests |
-| 27B default | **235/235 + 16/16**; prefill 0 packed calls, first decode exactly 48 | Mutable G2 PASS |
-| 27B rollback | `VT_GDN_PACKED_DECODE=0`, **235/235 + 16/16**, 0 packed calls | Mutable G2 PASS |
-| 35B native/batched | **315/315**, 0 packed calls | Mutable inertness PASS |
-| 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Mutable isolated-process PASS |
-| Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Mutable PASS |
+| 27B default | **235/235 + 16/16**; prefill 0 packed calls, first decode exactly 48 | Immutable G2 PASS at `f344dec` |
+| 27B rollback | `VT_GDN_PACKED_DECODE=0`, **235/235 + 16/16**, 0 packed calls | Immutable G2 PASS at `f344dec` |
+| 35B native/batched | **315/315**, 0 packed calls | Immutable inertness PASS |
+| 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
+| Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | Performance | No W1D3 trace or c2/c16 A/B exists | **PENDING; no speed credit** |
 
-Mutable evidence root:
-`~/work/vllm.cpp-gdn-packed-decode/w1d2-preflight/evidence-w1d2-final-mutable-20260714-postreview`.
-The next immutable reproduction starts from the pushed SHA and repeats:
+Immutable evidence root:
+`~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`.
+Status is `complete-g2`; the complete one-lock order is frozen in
+`run-plan.txt`, and its core entry points are:
 
 ```sh
 flock /tmp/gpu build-cuda/tests/test_ops_gdn
@@ -106,7 +107,7 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-Only the clean-SHA replay can close G2. W1D3 then requires paired ours/vLLM
+G2 is closed. W1D3 now requires paired ours/vLLM
 Nsight traces (ours with `--cuda-graph-trace=node`) before the c2/c16 40+8
 same-binary series; until then `benchmark_binding=false`.
 

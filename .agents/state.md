@@ -8706,3 +8706,55 @@ decode before decomposed intermediates are allocated, add the process-cached
 prove default plus rollback **235/235 + 16/16** with zero selection for
 prefill/mixed/spec/35B. qkvz, the exact grid and 35B performance remain
 prohibited.
+
+## 2026-07-14 — clean pushed `f344dec` closes W1D2/G2
+
+The complete W1D2 implementation, tests and same-change live checkpoint were
+committed as `f344decf457a4d50c3bcae78a2903d7fe176a511` and pushed directly to
+`main`. The mutable W1D2 entry introduced by that commit was accidentally
+inserted earlier in this append-only file rather than at EOF; it remains
+untouched as historical content, and this entry restores chronological
+continuation without rewriting the record.
+
+A fresh DGX clone at
+`~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511`
+detached at the exact pushed SHA and remained source-clean. Two configure
+preflights are explicitly **VOID** and retained as diagnostics: non-login SSH
+first failed to discover `nvcc`, then an explicit-compiler retry configured
+without CUTLASS. No test or GPU command ran in either attempt. The accepted
+fresh configure uses Release, CUDA 13.0.88 via
+`/usr/local/cuda/bin/nvcc`, sm_121a, FlashInfer 0.6.13's CUTLASS 4.5 source,
+Marlin, vendored Triton AOT, FlashAttention and the server. Configuration and
+binary-list SHA-256 values are `0922cc12…f7a` and `c1e8de87…2590`.
+
+One uninterrupted `/tmp/gpu` lock then executed the complete G2 sequence.
+Registry **14/14, 131/131**, runner **6/6, 132/132**, paged-forward **14/14,
+65/65**, full CUDA GDN **43/43, 1,707/1,707**, and the direct official
+boundary **1/1, 12/12** at output/state differences **0/1** pass. Default and
+`VT_GDN_PACKED_DECODE=0` rollback real 27B each pass **235/235 + 16/16**;
+default proves zero packed calls during prefill and exactly 48 on the first
+decode, while rollback proves zero. Native plus batched 35B pass **315/315**
+with zero packed selection. Isolated Compact and Balanced GGUF each pass
+**14/14**, the synthetic loader passes **98/98**, OpenAI API-server passes
+**21/21, 237/237**, and conformance passes **23/23, 252/252**.
+
+Strict compute-sanitizer passes packed **2/2, 137/137**, compressed indexed
+corner **1/1, 18/18**, and FP16 SSM **1/1, 13/13**, every process at zero
+errors and zero leaks. Status is `complete-g2` with SHA-256
+`45443955…c7a6`; the artifact manifest is `1a26f3a4…0c5c`. Key log hashes are
+CUDA GDN `954400c1…8864`, boundary `302ec760…faaa`, default/rollback 27B both
+`30325c56…502a`, 35B `230845c4…7e66`, Compact/Balanced
+`7a206fc1…e3df` / `acdf911b…1a31`, API/conformance `0e2c087d…3c41` /
+`88a7ce2e…b209`, and packed/corner/FP16-SSM memcheck
+`fe4a3dce…9f48` / `95d72eee…89e6` / `ff7ebf1f…9101`. Source, GPU, lock and
+server ports return clean/idle; LocalAI remains exited with `restart=no`.
+
+W1D2/G2 is now closed, but `KERNEL-GDN-PACKED-DECODE` remains `ACTIVE` for
+W1D3. Binding `3f256ab` stays **55/124**, c2 TPOT remains **6.1% slower**, and
+`benchmark_binding=false`; correctness closure does not earn timing, memory or
+speed credit. Next is one uncontended paired ours/vLLM Nsight series, with
+local `--cuda-graph-trace=node`, followed by same-binary default/rollback
+c2/c16 AB/BA/AB covering **40 timing + 8 memory** axes. qkvz stays blocked
+until that disposition. If parity remains open after the execution-grounded
+component, launch the fresh multi-lens sub-agent lever scan requested by the
+standing protocol.

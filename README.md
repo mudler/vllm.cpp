@@ -13,10 +13,11 @@ OpenAI-compatible server.
 > but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
 > binding diagnostic therefore measures vLLM v0.25.0 with its default async
 > scheduler explicitly on and off on the identical c2 corpus. The current
-> `2ec6dda` series is **VOID after only the first ON arm**: 6/6 requests passed,
-> but the post-run validator rejected vLLM's six empty error strings before an
-> OFF arm existed. A fresh validator-repaired run is pending,
-> with no async speed credit or implementation claim. Separately, the host-memory gap
+> `b8681ac` series is **VOID**: all six timing legs passed and provisionally put
+> async ON at only **1.001345×** total throughput versus OFF, but the first
+> trace failed to import the repository-local harness before either trace was
+> captured. The direct-script bootstrap is repaired and a fresh complete run
+> is pending, with no async speed credit or implementation claim. Separately, the host-memory gap
 > is traced to a persistent **22.92 GiB CPU weight mirror** plus load-time
 > safetensors residency. The binding result remains **55/124**, W3-I stays
 > default-off, and no 35B performance result is claimed. See
@@ -27,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Measure the exact c2 async ON/OFF oracle control; promote W3 only if it explains the decode gap, otherwise trace low-batch kernels |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Complete the repaired c2 async ON/OFF timing + trace control; if its provisional neutral result repeats, trace low-batch kernels |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -55,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus. `2ec6dda` is **VOID after ON-r1 only**: 6/6 succeeded, then validation rejected the valid six-empty-string error vector. Fresh corrected series **PENDING**; no one-arm speed credit |
+| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus. `b8681ac` completed 6/6 timing legs with provisional medians **160.799 / 160.583 tok/s = 1.001345×** ON/OFF, but is **VOID** because direct trace startup lacked the source root on `sys.path`. Bootstrap repaired; a fresh complete series is **PENDING** and earns no credit |
 | GPU fallback if async is neutral | Map the 129 RMSNorm and 144 normal-FP4 nodes, then gate vectorized residual-add RMSNorm; W3-H2's measured ceiling is only about 0.25% end to end |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
@@ -178,8 +179,9 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: exact vLLM async ON/OFF c2 control →
-selected isolated lever gate → all-axis 27B parity → 35B
+The next execution order is fixed: complete the repaired vLLM async ON/OFF c2
+control → if neutral, map and gate the low-batch kernel residual → all-axis
+27B parity → 35B
 parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.

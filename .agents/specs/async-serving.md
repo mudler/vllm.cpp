@@ -23,11 +23,13 @@ that resolution. The 27B gate has better local TTFT at c2 but local TPOT is
 GPU-only leaf with a comparable end-to-end budget, so the next decision is an
 exact vLLM async ON/OFF c2 timing + Torch-trace control on the binding corpus.
 The profiler can force `default`/`on`/`off` and records the resolved mode.
-Current root `2ec6dda` is `VOID` after ON-r1 6/6 because post-run validation
-rejected vLLM's six empty error strings before OFF; a fresh validator-repaired
-series is `PENDING`. A positive 4–6% credit promotes W3 for an explicit
-claim. A neutral control keeps W3 as later parity work and returns the speed
-track to low-batch kernel mapping.
+Current root `b8681ac` is `VOID`: all six timing legs completed with
+provisional ON/OFF total ratio **1.001345×**, TPOT 0.99% better ON, and TTFT
+16.6% worse ON, but direct trace startup lacked the source root on `sys.path`
+and neither required trace exists. The direct-script bootstrap is repaired and
+a fresh complete series is `PENDING`. A positive 4–6% complete result promotes
+W3 for an explicit claim. If the provisional neutral result repeats, W3 stays
+later parity work and the speed track returns to low-batch kernel mapping.
 
 ## Scope
 
@@ -92,7 +94,7 @@ the default-ON trace as the port target.
 | Scheduler | Output placeholders are fixed at zero (`src/vllm/v1/core/sched/scheduler.cpp:143-145,587-600`) | `AsyncScheduler` placeholder/stale-frame/cache accounting |
 | Sampled token | Greedy allocates a transient device buffer, copies into pageable `std::vector`, synchronizes the main queue, then CPU-writes the next token (`src/vllm/v1/sample/sampler.cpp:30-53,90-99`; `src/vllm/v1/worker/gpu/runner.cpp:688-723`) | Persistent GPU `last_sampled_tokens`, on-device combine/post-update, and pinned nonblocking output copy |
 | Runtime seam | `vt::Backend` exposes queue creation/copy/synchronize but no public event or pinned-host allocation API (`include/vt/backend.h:15-34`) | Add backend-neutral event/wait and pinned-output ownership, with synchronous CPU degeneration; current graph-stream code proves streams only, not events |
-| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; unit contract is green | `2ec6dda` VOID after ON-r1 6/6 on error-vector validation before OFF; fresh completed/failed/all-falsey validation timing and traces `PENDING` |
+| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode and bootstraps repository imports when invoked by absolute path; unit contract is green | `b8681ac` VOID after six timing legs because both traces are absent; provisional total ratio **1.001345×**; fresh bootstrap-repaired timing and traces `PENDING` |
 
 ## Port map
 

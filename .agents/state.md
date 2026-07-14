@@ -7838,3 +7838,54 @@ validation passes `completed=6`, `failed=0`, exact token totals, and
 `len(errors)=6 && all(falsey)`. Cleanup returned GPU, lock, and port idle.
 The next run uses a new commit/root and repeats every arm; prior `4d85ead`
 setup failure remains only in this append-only record and the ledger.
+
+## 2026-07-14 — third async-credit execution voids after timings, before traces
+
+Clean pushed `b8681ac80b3f84af71955cf3a20cece2a118ea1f` ran from
+`~/work/vllm-async-credit/b8681ac80b3f84af71955cf3a20cece2a118ea1f`
+with the repaired venv/CUDA `PATH`. One uncontended `/tmp/gpu` lock covered the
+prescribed ON-r1, OFF-r1, OFF-r2, ON-r2, ON-r3, OFF-r3 fresh-server sequence
+and the attempted traces. Every timing leg logged its explicit resolved mode
+and completed **6/6 requests**, 6,144 input and 768 output tokens with zero
+failed requests.
+
+The six raw timing files give these diagnostic-only medians:
+
+| Mode | Total tok/s | Mean TPOT | Mean TTFT | Total CV |
+|---|---:|---:|---:|---:|
+| async ON | 160.798982 | 106.279834 ms | 812.002454 ms | 0.137978% |
+| async OFF | 160.582996 | 107.333011 ms | 696.263685 ms | 0.052767% |
+
+Direction-normalized ON/OFF ratios are **1.001345×** total/output/request
+throughput, **1.009909×** TPOT/ITL, **0.857465×** TTFT, and **1.001329×**
+E2EL. Paired total-throughput ratios are **1.003383 / 1.000695 / 1.001143×**.
+Thus the provisional timing signal bounds async scheduling to about +0.13%
+aggregate throughput, improves TPOT about 0.99%, and regresses TTFT about
+16.6%; it cannot receive credit because the series did not complete.
+
+After all timings, the first Torch-profiler arm invoked
+`profile_vllm_online_gate.py` by absolute path from the commit-owned source
+tree without adding that root to `sys.path`. Python failed immediately with
+`ModuleNotFoundError: No module named 'tools'`. Neither ON nor OFF trace,
+metadata, kernel summary, aggregate summary, manifest, or completion marker
+exists. The whole root is therefore **FAILED / VOID** under the fail-closed
+series rule; no timing above is binding and W3 remains `READY`, unowned, and
+uncredited.
+
+Series / raw-set / log-set / corpus-set SHA-256 values are
+`e8c7a4b7…86b0` / `65bff32f…6e51` / `79fd3836…f9c8` /
+`9fb8027a…d30`. Individual raw SHA values are ON
+`e77c3452…b81`, `fff6e668…730`, `d55bb51f…15e` and OFF
+`16e9583d…b5ce`, `26fa1e04…d5ce`, `fa7bafdc…e5b7`. Post-failure cleanup
+reports no GPU compute process, port 8001 free, and `/tmp/gpu` free.
+
+The repair makes direct script execution prepend its repository root before
+local imports while leaving module execution unchanged. A regression invokes
+the absolute profiler path from a temporary directory and requires successful
+`--help` parsing including `--async-scheduling`; focused tests pass **6/6**.
+The next run must use a new pushed commit/root and repeat all six timing legs
+plus both traces under one lock. If the provisional neutral result repeats in
+that complete series, the speed track moves to exact low-batch kernel and
+RMSNorm/generated-partition mapping. Live documents contain only this current
+checkpoint; the two earlier async failures remain only in this append-only
+record, the parity ledger, Git, and their immutable roots.

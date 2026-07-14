@@ -14,7 +14,15 @@ import argparse
 import copy
 import hashlib
 import pathlib
+import sys
 import time
+
+# Keep the committed reproduction command valid when this file is invoked by
+# absolute path from a commit-owned evidence directory.  Module execution
+# already has the repository root on sys.path; direct script execution does
+# not.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from tools.bench.online_gate import (
     INPUT_LEN,

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -24,6 +27,27 @@ from tools.bench.summarize_torch_kernels import summarize
 
 
 class OnlineGateTraceTests(unittest.TestCase):
+    def test_profiler_help_runs_by_absolute_path_outside_repository(self) -> None:
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "tools"
+            / "bench"
+            / "profile_vllm_online_gate.py"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run(
+                [sys.executable, str(script), "--help"],
+                cwd=temporary,
+                capture_output=True,
+                check=False,
+                env=environment,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--async-scheduling", result.stdout)
+
     def test_async_scheduling_override_preserves_default_resolution(self) -> None:
         self.assertEqual(async_scheduling_override("default"), {})
         self.assertEqual(async_scheduling_override("on"), {"async_scheduling": True})

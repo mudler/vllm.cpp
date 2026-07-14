@@ -82,10 +82,11 @@ inner 4096, state 128; context 262144.
 
 - Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
   27B cache-off grid at **55/124 axes pass, 69 fail**. The post-W3-I scan is
-  complete: current root `2ec6dda` proves the venv/CUDA `PATH` repair and ON-r1
-  passes 6/6, but the series is VOID because validation rejected six empty
-  error strings before OFF. Run a fresh root accepting exactly six falsey
-  entries with completed=6/failed=0 under one lock; W3 stays uncredited. If neutral,
+  complete: current root `b8681ac` completes all six timing legs with
+  provisional ON/OFF total ratio **1.001345×**, but the series is VOID because
+  direct trace startup lacked the source root on `sys.path` and neither trace
+  exists. Run a fresh root with the direct-script bootstrap repair under one
+  lock; W3 stays uncredited. If the provisional neutral result repeats,
   capture low-batch kernels and map the RMSNorm/generated partitions before
   coding. The independent host-memory repair must remove the measured
   **22.920 GiB** persistent CPU weight mirror and overlapping load-time source

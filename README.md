@@ -13,8 +13,13 @@ OpenAI-compatible server.
 > (**6.1% slower**). Exact trace plus source inspection finds one complete
 > structural gap: our 48 GDN layers launch **193** BF16 GEMMs per B=2 window,
 > while vLLM's merged qkvz/ba topology launches **97**. The accepted
-> [implementation spike](.agents/specs/gdn-merged-input-projections.md) gates BA
-> first, then qkvz; no code or speed credit exists yet. Host memory also retains
+> [implementation spike](.agents/specs/gdn-merged-input-projections.md) now has
+> a `GATING` BA-only W1 implementation: one weight owner and one F32-output BA
+> GEMM pass the merged/split 27B gates **235/235 + 16/16**, packed-view CUDA
+> replay/memcheck, and 35B inertness. An upstream-dtype BF16-output preflight
+> instead reproduced the rejected emulation stream (**233/235**), so exact
+> rounding parity, immutable trace, and component performance remain open; no
+> speed credit exists yet. Host memory also retains
 > a **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
@@ -23,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; finalized `179a0fc` proves the 193-vs-97 GDN BF16 topology gap but does not supersede the grid | Implement and gate merged BA, then merged qkvz; rerun the exact grid only after their component gates |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; BA W1 is implemented and preflight-correct with F32 output, but immutable structure/performance and exact BF16-output parity are pending | Trace and component-gate merged BA, resolve its output rounding, then claim merged qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -51,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GEMM-BF16` is `READY`: vLLM physically packs qkvz and ba; ours launches four projections per GDN layer. BA is the first isolated implementation/component gate, qkvz the second |
+| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: one merged BA owner/projection, split rollback, and F32/BF16 strided consumers are implemented; F32 output is 16/16, BF16 output failed the near-tie gate, and immutable trace/component evidence is pending. qkvz remains excluded |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -123,7 +128,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; merged GDN BA/qkvz implementation is pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; merged GDN BA is implemented/correctness-gating and qkvz remains pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -173,10 +178,11 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: implement/gate merged BA → implement/gate
-merged qkvz → all-axis 27B parity → 35B parity → the SGLang shared-prefix
-gate → the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and
-external KV cache / LMCache support.
+The next execution order is fixed: immutable trace/component-gate merged BA and
+resolve its BF16 rounding gap → implement/gate merged qkvz → all-axis 27B
+parity → 35B parity → the SGLang shared-prefix gate → the rest of
+[roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
+LMCache support.
 
 ## Project record
 

@@ -2050,6 +2050,77 @@ DType ResidualDType() {
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
+// vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_ba` and invokes it once,
+// then exposes logical [b,a] views. W1 enables that topology only for the real
+// 27B loader, which is the only path that populates `in_proj_ba`. The resident
+// owner is shared by both arms: fallback slices its output rows and issues the
+// two legacy F32 GEMMs, never retaining duplicate split weights.
+// The merged GEMM also emits F32: this preserves the already-gated local gate
+// arithmetic (see GdnInDType) and passes the native 16-token stream. The
+// BF16-output gate reproduced the rejected emulation stream at token 7, so
+// exact upstream output-dtype parity remains a separate correctness gate.
+bool MergedGdnBaEnabled(Dev d) {
+  static const bool enabled = [] {
+    const char* master = std::getenv("VT_GDN_MERGED_PROJ");
+    if (master != nullptr && master[0] == '0') return false;
+    const char* leaf = std::getenv("VT_GDN_MERGED_BA");
+    return leaf == nullptr || leaf[0] != '0';
+  }();
+  return enabled && d.q.device.type == vt::DeviceType::kCUDA;
+}
+
+DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
+                  DType out_dtype) {
+  VT_CHECK(x.rank == 2 && weight.rank == 2,
+           "qwen3_5 merged GDN BA: input/weight must be rank-2");
+  VT_CHECK(weight.shape[1] == x.shape[1],
+           "qwen3_5 merged GDN BA: input/weight K mismatch");
+  DBuf out(d, out_dtype, {x.shape[0], weight.shape[0]});
+  vt::MatmulBT(d.q, out.t(), x, weight);
+  return out;
+}
+
+struct GdnBaOutput {
+  std::optional<DBuf> packed_owner;
+  std::optional<DBuf> b_owner;
+  std::optional<DBuf> a_owner;
+  Tensor b;
+  Tensor a;
+};
+
+GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
+                         const Tensor& hidden, int64_t value_heads) {
+  GdnBaOutput out;
+  if (!weights.in_proj_ba.Empty()) {
+    VT_CHECK(weights.in_proj_ba.nk && weights.in_proj_ba.rank == 2 &&
+                 weights.in_proj_ba.shape[0] == 2 * value_heads &&
+                 weights.in_proj_ba.shape[1] == hidden.shape[1],
+             "qwen3_5 merged GDN BA: invalid packed owner");
+    Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
+    if (MergedGdnBaEnabled(d)) {
+      out.packed_owner.emplace(
+          MatmulBTRawD(d, hidden, packed_weight, DType::kF32));
+      Tensor packed = out.packed_owner->t();
+      out.b = packed.Slice(1, 0, value_heads);
+      out.a = packed.Slice(1, value_heads, 2 * value_heads);
+      return out;
+    }
+
+    Tensor b_weight = packed_weight.Slice(0, 0, value_heads);
+    Tensor a_weight = packed_weight.Slice(0, value_heads, 2 * value_heads);
+    out.b_owner.emplace(MatmulBTRawD(d, hidden, b_weight, DType::kF32));
+    out.a_owner.emplace(MatmulBTRawD(d, hidden, a_weight, DType::kF32));
+  } else {
+    VT_CHECK(!weights.in_proj_b.Empty() && !weights.in_proj_a.Empty(),
+             "qwen3_5 GDN BA: packed or both split weights are required");
+    out.b_owner.emplace(MatmulF32D(d, hidden, weights.in_proj_b));
+    out.a_owner.emplace(MatmulF32D(d, hidden, weights.in_proj_a));
+  }
+  out.b = out.b_owner->t();
+  out.a = out.a_owner->t();
+  return out;
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -2066,7 +2137,8 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
+  // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
+  // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.
   // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
   // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
@@ -2084,8 +2156,9 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
-  DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
-  DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
+  GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv);
+  Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
+  Tensor araw = ba.a;
 
   // Causal conv1d over the token stream (silu activation), fresh zero state. conv
   // in/out dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16); f32
@@ -2119,8 +2192,8 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dql2(d, actdt, {T, Hk, Dk});
   DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
-    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw.t(),
-                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(), dconv.t(), araw,
+                    braw, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
     DBuf qf(d, actdt, {T, Hk, Dk});
     DBuf kf(d, actdt, {T, Hk, Dk});
@@ -2128,7 +2201,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});
     vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-    vt::GdnGBeta(d.q, g.t(), beta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::GdnGBeta(d.q, g.t(), beta.t(), araw, braw, a_log_dev, dt_bias_dev);
     vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
     vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
   }
@@ -2317,7 +2390,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   VT_CHECK(meta.num_actual_tokens == T, "gdn paged: num_actual_tokens != T");
   VT_CHECK(nd_tok + np_tok == T, "gdn paged: decode+prefill tokens != T");
 
-  // Input projections (mixed_qkv | z | b | a); kept separate at TP=1 (§6).
+  // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
+  // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.
   // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
   // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
   // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
@@ -2339,8 +2413,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                         : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
            : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
                                    : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
-  DBuf braw = MatmulF32D(d, h, w.in_proj_b);      // [T,Hv]
-  DBuf araw = MatmulF32D(d, h, w.in_proj_a);      // [T,Hv]
+  GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv);
+  Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
+  Tensor araw = ba.a;
 
   // Causal conv1d over the token stream, PERSISTENT conv_state (gathered by the
   // per-request state indices, updated in place, scattered back). conv in/out
@@ -2424,8 +2499,8 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dql2(d, actdt, {T, Hk, Dk});
   DBuf dkl2(d, actdt, {T, Hk, Dk});
   if (GlueFuseEnabled()) {
-    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw.t(),
-                    braw.t(), a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
+    vt::GdnPostConv(d.q, dql2.t(), dkl2.t(), vf.t(), dg.t(), dbeta.t(), dconv.t(), araw,
+                    braw, a_log_dev, dt_bias_dev, vt::L2NormArgs{1e-6F});
   } else {
     DBuf qf(d, actdt, {T, Hk, Dk});
     DBuf kf(d, actdt, {T, Hk, Dk});
@@ -2433,7 +2508,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     Tensor k2 = Reshape(kf.t(), {T, key_dim});
     Tensor v2 = Reshape(vf.t(), {T, value_dim});
     vt::GdnConvSplit(d.q, q2, k2, v2, dconv.t());
-    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw.t(), braw.t(), a_log_dev, dt_bias_dev);
+    vt::GdnGBeta(d.q, dg.t(), dbeta.t(), araw, braw, a_log_dev, dt_bias_dev);
     vt::L2Norm(d.q, dql2.t(), qf.t(), vt::L2NormArgs{1e-6F});
     vt::L2Norm(d.q, dkl2.t(), kf.t(), vt::L2NormArgs{1e-6F});
   }

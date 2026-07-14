@@ -142,6 +142,12 @@ struct GdnLayerWeights {
   OwnedTensor in_proj_z;      // bf16 [H, value_dim] (FP8 dequant + T)
   OwnedTensor in_proj_b;      // bf16 [H, Hv]        (bf16 + T)
   OwnedTensor in_proj_a;      // bf16 [H, Hv]        (bf16 + T)
+  // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear
+  // `in_proj_ba`: raw torch Linear orientation [2*Hv,H], rows [b,a], nk=true.
+  // The real dense loader populates this and leaves in_proj_b/a empty. The
+  // split rollback slices this owner; 35B/GGUF/synthetic paths retain the
+  // legacy fields above and leave this empty.
+  OwnedTensor in_proj_ba;
   OwnedTensor conv1d_weight;  // bf16 [conv_dim, K]  (bf16, NOT transposed)
   OwnedTensor a_log;          // f32  [Hv]
   OwnedTensor dt_bias;        // f32  [Hv]

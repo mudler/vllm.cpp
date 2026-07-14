@@ -1,7 +1,7 @@
 # Qwen3.5/3.6 GDN merged BF16 input projections
 
 **Row:** `KERNEL-GEMM-BF16` · **consumer:** `SERVE-GATE-ONLINE` ·
-**status:** spike complete, `READY` · **priority:** roadmap order 0.
+**status:** spike complete, W1 BA `GATING` · **priority:** roadmap order 0.
 
 The finalized exact-c2 trace identifies one complete model-topology mismatch:
 the 27B path launches four BF16 input projections in each of 48 GDN layers,
@@ -21,9 +21,10 @@ only same-binary and fresh-oracle gates can earn performance credit.
 - Exact logical row order `[q,k,v,z]` and `[b,a]`, matching the vLLM mapper.
 - One resident owner per merged weight. The rollback path uses non-owning row
   views of that owner; it never retains packed and split copies together.
-- BF16 merged outputs and inner-contiguous row-strided logical views:
-  `mixed_qkv [T,10240]` and `z [T,6144]` with stride 16384; `b/a [T,48]`
-  with stride 96.
+- Inner-contiguous row-strided logical views: W1's token-correct compatibility
+  path emits F32 `b/a [T,48]` with stride 96; consumers also accept the
+  upstream BF16 dtype, whose exact projection rounding remains an open gate.
+  W2 targets BF16 `mixed_qkv [T,10240]` and `z [T,6144]` with stride 16384.
 - Stride-aware CPU/CUDA consumers where required: causal convolution for
   `mixed_qkv`, gated RMSNorm for `z`, and GDN post-conv / g-beta preparation
   for BF16 `b/a`. Loads upcast to F32 in registers as upstream does.
@@ -40,9 +41,9 @@ value_dim=6144, conv_dim=10240, qkvz width=16384 and ba width=96.
 
 | Mode | qkv/z | b/a | Required behavior |
 |---|---|---|---|
-| 27B CUDA default, W1 | existing split BF16 | merged BF16 `ba` | One BA GEMM; qkv/z unchanged. |
-| 27B CUDA default, W2 | merged BF16 `qkvz` | merged BF16 `ba` | Two total input GEMMs per GDN layer. |
-| 27B CUDA master/sub-toggle off | split logical views from the merged owner | split logical views from the merged owner | Four legacy GEMMs, no duplicated resident weights. |
+| 27B CUDA default, W1 | existing split BF16 | merged F32-output `ba` | One BF16-input BA GEMM; qkv/z unchanged. This arm passes 16/16 while exact BF16 output remains a failed/open rounding gate. |
+| 27B CUDA default, W2 | merged BF16 `qkvz` | selected gated `ba` path | Two total input GEMMs per GDN layer only after W1's dtype disposition closes. |
+| 27B CUDA master/sub-toggle off | split logical views from the merged owner | split F32 logical views from the merged owner | Four legacy GEMMs, no duplicated resident weights. |
 | 27B CPU | split logical views initially | split logical views initially | Preserve the reference arithmetic; a CPU merged default needs its own benchmark checkpoint. |
 | 35B native | existing FP8 qkv/z | existing BF16 b/a | Inert in W1/W2; qkv/z have quant scales and belong to `KERNEL-GEMM-FP8`. |
 | 35B `VT_DENSE_NATIVE=0`, GGUF, synthetic fixtures | existing split fields | existing split fields | Inert; correctness tests prove no accidental selection. |
@@ -80,18 +81,17 @@ local structural regression.
 
 ## Our baseline
 
-| Surface | Current anchor | Exact gap |
+This table is the current W1 checkpoint plus the immutable before-state needed
+by its structural gate; superseded attempt chronology is intentionally absent.
+
+| Surface | Current anchor | Disposition |
 |---|---|---|
-| Weight ownership | `include/vllm/model_executor/models/qwen3_5_weights.h:138-166` | Four independent qkv/z/b/a owners. |
-| Real 27B loader | `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:159-179` | Loads four raw-NK BF16 tensors separately. |
-| Dense forward | `src/vllm/model_executor/models/qwen3_5.cpp:2057-2124` | Four independent GEMMs; comment incorrectly says separation is retained at TP=1. |
-| Paged forward | same file `:2299-2343` | The binding path also issues qkv, z, b and a separately. |
-| BF16 GEMM | same file `:781-805`; `include/vt/ops.h:476-488`; `src/vt/cuda/cuda_matmul.cu:183-255` | Each raw-NK owner reaches a distinct cuBLASLt TN call. |
-| Strided tensors | `include/vt/tensor.h:14-31`; `src/vt/tensor.cpp:70-79` | Slices retain real strides, but current GDN consumers reject or ignore them. |
-| Causal-conv consumer | `src/vt/ops.cpp:780-811`; `src/vt/cuda/cuda_gdn.cu:248-503` | Requires contiguous x and indexes rows as `row*C`. |
-| BA consumer | `src/vt/ops.cpp:1466-1487,1516-1569`; `src/vt/cuda/cuda_gdn.cu:646-728` | Requires separate contiguous F32 a/b although vLLM's merged projection emits model-dtype BF16. |
-| z consumer | `src/vt/ops.cpp:912-929`; `src/vt/cuda/cuda_gdn.cu:753-805` | Gated RMSNorm requires a contiguous rank-2 gate and cannot express `[T,Hv,Dv]` with a wider outer stride. |
-| Packed-view precedent | `src/vllm/model_executor/models/qwen3_5.cpp:1423-1458`; `src/vt/ops.cpp:760-779` | Full-attention merged QKV already owns one output and teaches its fused consumer to honor row strides. |
+| Weight ownership / loader | `include/vllm/model_executor/models/qwen3_5_weights.h:146`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:165-257` | Real 27B owns one raw-NK `[b,a]` tensor; split b/a owners stay empty and rollback slices the merged owner. qkv/z remain split for W2. |
+| Dense + paged forward | `src/vllm/model_executor/models/qwen3_5.cpp:2053-2204,2386-2511` | CUDA default issues one F32-output BA GEMM; `VT_GDN_MERGED_BA=0` restores two F32 calls from the same owner. |
+| BA consumers | `src/vt/ops.cpp:1466-1580`; CPU/CUDA implementations in `src/vt/{cpu/cpu_ops.cpp,cuda/cuda_glue.cu,cuda/cuda_gdn.cu}` | Fused and unfused consumers accept F32/BF16 inner-contiguous row views without materialization. |
+| Ported tests | `tests/vllm/models/test_qwen27_dense_forward.cpp:185-314`; `tests/vt/test_ops_gdn.cpp:1259-1445` | Exact loader bytes/one-owner rules plus F32/BF16 B=1/2/4/16/32 eager/capture/two-replay/canary coverage pass; strict memcheck is clean. |
+| Real models | `tests/parity/test_qwen27_paged_engine.cpp:116`; `tests/parity/test_qwen36_paged_engine.cpp:108` | Frozen-fixture merged/split 27B logs are identical at 235/235 + 16/16; 35B is 315/315. A BF16-output preflight fails 233/235 and exactly selects the rejected emulation continuation. |
+| Remaining W1 evidence | existing trace/finalizer and online-gate tools | Pushed-SHA repetition, exact 145-vs-193 structure, projection-level rounding oracle, capture lifecycle trace, and 40+8-axis component remain pending. |
 
 The completed evidence root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
@@ -126,7 +126,7 @@ weights. That design is prohibited. BA-only duplication is also prohibited.
 | One qkvz and one ba physical parameter | `include/vllm/model_executor/models/qwen3_5_weights.h`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp` | Add merged raw-NK owners; 27B loader concatenates checkpoint rows once and leaves corresponding split owners empty. |
 | Merged loader shard order | dense-loader helpers plus focused loader test | Copy exact `[q,k,v,z]` and `[b,a]` row ranges; validate shapes/dtypes/nk flag and fail on missing/mismatched shards. |
 | Rollback without duplicate storage | `src/vllm/model_executor/models/qwen3_5.cpp` | Resident merged weight is sliced on output rows for legacy GEMMs. Dim-0 raw-NK slices remain contiguous. |
-| BA projection | dense and paged GDN blocks | W1 emits one BF16 `[T,2Hv]`, exposes b then a views, and passes them to the fused or unfused downstream path. |
+| BA projection | dense and paged GDN blocks | W1 currently emits one F32 `[T,2Hv]`, exposes b then a views, and passes them to the fused or unfused downstream path. This preserves the accepted local gate arithmetic while exact BF16 output is repaired. |
 | BF16/strided b/a | `include/vt/ops.h`, `src/vt/ops.cpp`, `src/vt/cpu/cpu_ops.cpp`, `src/vt/cuda/cuda_gdn.cu`, `src/vt/cuda/cuda_glue.cu` | Accept F32 or BF16 inner-contiguous b/a with explicit row strides; upcast per element. Avoid cast and split-copy launches. |
 | qkvz projection | dense and paged GDN blocks | W2 emits one BF16 `[T,conv_dim+value_dim]` and exposes mixed/z logical views. |
 | Strided mixed/z consumers | causal-conv and gated-RMSNorm files above | Honor element strides. Gated RMSNorm accepts a rank-3 `[T,Hv,Dv]` gate so token-boundary padding is representable; output/core semantics stay unchanged. |
@@ -159,6 +159,13 @@ Local mandatory regressions also include:
   W1/W2 dispatch inertness;
 - exact graph node-family/count assertions and zero new copy/cast nodes.
 
+Current mutable-source preflight closes the loader, focused ASan/UBSan,
+F32/BF16 packed-view, capture/two-replay, memcheck, default/fallback 27B and
+native 35B cases. Leak-enabled CPU diagnostics retain the known process-lifetime
+buffer pool; they do not identify a W1 allocation. The preflight does not close
+projection-level BF16 rounding, GGUF/legacy-35B selection, immutable capture
+lifecycle, graph counts, memory accounting or component performance.
+
 ## Gates
 
 ### G0 — record, build and CPU safety
@@ -177,6 +184,10 @@ Local mandatory regressions also include:
 - Real 27B default and `VT_GDN_MERGED_BA=0` each pass 235/235 plus 16/16 tokens
   from one frozen plan map. 35B/GGUF gates prove zero selection.
 - No b/a cast, split-copy or materialization kernel is introduced.
+- The token-correct F32 compatibility output may enter G2, but W1 does not
+  claim exact upstream dtype parity until a BF16 projection oracle and the
+  native continuation both pass. The observed 233/235 BF16 failure is binding
+  as an open correctness gap, not waived by the F32 result.
 
 ### G2 — W1 exact structure and component performance
 
@@ -245,9 +256,9 @@ commit SHA, toggle arm and frozen fixture recorded before execution.
 
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
-| W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | No duplicate bytes; CPU/split behavior green. |
-| W1B | Add BF16/strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | G0/G1 green. |
-| W1C | Run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | G2 disposition committed before W2. |
+| W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
+| W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16, BF16 output is 233/235 and open. |
+| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Pending; G2 disposition must be committed before W2. |
 | W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
 | W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |
@@ -258,9 +269,11 @@ an ungated W1.
 
 ## Risks/decisions
 
-- **BF16 BA changes a rounding point.** This is intentional upstream parity,
-  not a free numerical substitution. Oracle/operator and 16/16 token gates
-  decide adoption; any failure leaves W1 default-off.
+- **BF16 BA changes a rounding point.** The first real-model preflight
+  deterministically selected the rejected emulation stream at token 7
+  (233/235), while merged F32 and split F32 are byte-identical logs at 235/235
+  + 16/16. W1 therefore uses the correct F32 compatibility arm while exact
+  upstream BF16 algorithm/rounding remains a named gate; no failure is hidden.
 - **Views can erase the launch win if materialized.** Consumers must honor
   strides directly. A cast/split-copy kernel fails the structural gate even if
   output is correct.
@@ -275,8 +288,9 @@ an ungated W1.
 - **35B qkv/z is FP8.** It stays outside this BF16 leaf; forcing it into the
   same representation would lose quantization-scale semantics.
 - **Upstream CUDA copies b/a after slicing.** Our direct strided consumption is
-  a deliberate surpass-side deviation, recorded because it removes work while
-  preserving the same BF16 values and formulas.
+  a deliberate surpass-side deviation that removes work. F32 and BF16 view
+  semantics are operator-gated independently; only the F32 model arm currently
+  passes the native continuation.
 - **Rollback boundary:** `VT_GDN_MERGED_PROJ=0`; leaf toggles isolate BA and
   qkvz. Any correctness, sanitizer, graph, memory or component regression keeps
   the affected leaf off and records the failed disposition.

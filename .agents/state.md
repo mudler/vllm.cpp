@@ -8193,3 +8193,51 @@ ledger and Git, per the periodic-compaction policy. No production code or GPU
 command ran. Next: transition `KERNEL-GEMM-BF16` to an explicit BA-only
 `ACTIVE` claim, implement W1, and run its correctness/safety/structure/component
 checkpoint before touching qkvz.
+
+## 2026-07-14 — merged GDN BA W1 implemented; F32 path correct, BF16 rounding gap exposed
+
+`KERNEL-GEMM-BF16` W1 now has production code and moves from `ACTIVE` to
+`GATING`. The real 27B dense loader concatenates checkpoint `in_proj_b` then
+`in_proj_a` into one checked raw-NK BF16 owner and leaves both legacy owners
+empty. Dense and paged CUDA forwards issue one BA GEMM by default; the leaf or
+master rollback slices that same resident owner and issues the two former
+calls, so the implementation adds no packed-plus-split weight duplicate.
+`GdnPostConv` and `GdnGBeta` accept F32/BF16 inner-contiguous row-strided views
+on CPU and CUDA and upcast at the load, avoiding cast/split-copy nodes.
+
+The real-model gate found a correctness-significant dtype boundary. A first
+merged BF16-output build produced the known emulation continuation beginning at
+token 7: **233/235 assertions**, `got == want_emu`, log SHA
+`09078b76…b050`. Changing only the merged output to F32 preserves the already
+accepted local gate arithmetic. From the final staged source and one frozen
+64-plan fixture (`e81e9181…7edd`), default merged and
+`VT_GDN_MERGED_BA=0` split processes each pass **235/235 + 16/16**, and their
+complete logs are byte-identical (`e7c243cd…e7c8`). The 35B native plus batched
+graph cases remain inert at **315/315** (`328e02e9…d348`). Exact upstream BF16
+output/algorithm parity remains open; it is recorded rather than waived by the
+token-correct F32 compatibility path.
+
+Focused CPU CTest is **3/3**. The complete CPU CTest sweep is **104/106** under
+`-j4`: only the unrelated API-server and conformance socket cases time out
+while the long server suites overlap; those exact two tests then pass **2/2**
+serially in 0.52 s. Focused ASan+UBSan passes **2/2** with the repository's
+established process-lifetime-pool exclusion. Leak-enabled diagnostics still
+pass the test logic (**302/302** for the dense test) and report only the
+inherited CPU buffer pool (**16,960 B in 30 allocations**), not an invalid
+access or W1-owned allocation. The production CUTLASS 4.5/sm_121a build passes
+the four focused CUDA tests. The ported packed-view matrix covers F32 and BF16,
+B=1/2/4/16/32, non-zero offsets, padded row strides, canaries, fused/unfused
+consumers, capture and two replays; strict compute-sanitizer passes **590/590,
+0 errors and 0 leaks**. Focused CTest/memcheck hashes are
+`5fd62a85…f461` / `a3d61cb9…fb87` under
+`~/work/vllm.cpp-gdn-ba/evidence/precommit-final-focused-20260714T071303Z`.
+These are mutable-source preflights and earn no performance credit.
+
+Live README, BENCHMARKS, roadmap, matrices, coordination, environment,
+inventory and specs are compact current-state snapshots; chronology stays in
+this log and the ledger per the user-directed compaction rule. Binding
+`3f256ab` remains **55/124**. Next: commit/push this implementation checkpoint,
+repeat its build/safety/model gates from the immutable SHA, then capture exact
+default **145** versus fallback **193** BF16-family GEMMs and run the c2/c16
+40+8-axis component. W2 qkvz remains prohibited until W1's rounding, structure
+and component disposition close.

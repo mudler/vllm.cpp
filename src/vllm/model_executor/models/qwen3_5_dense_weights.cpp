@@ -5,6 +5,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -160,11 +161,13 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base)
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
-  // (nk=true -> vt::MatmulBT TN fast path; see LoadBf16RawNK).
+  // (nk=true -> vt::MatmulBT TN fast path; see LoadBf16RawNK). Mirror vLLM's
+  // physical in_proj_ba owner in exact [b,a] row order; the rollback path takes
+  // non-owning row slices, so the split fields deliberately stay empty.
   g.in_proj_qkv = LoadBf16RawNK(get, la + "in_proj_qkv.weight");
   g.in_proj_z = LoadBf16RawNK(get, la + "in_proj_z.weight");
-  g.in_proj_b = LoadBf16RawNK(get, la + "in_proj_b.weight");
-  g.in_proj_a = LoadBf16RawNK(get, la + "in_proj_a.weight");
+  g.in_proj_ba = LoadMergedBf16RawNK(
+      get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
   // out_proj: W4A4-quantized -> fp4-resident (throughput path, notes §5 step-6a).
   g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
@@ -204,6 +207,63 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const std::string& base)
 }
 
 }  // namespace
+
+OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
+                                const std::vector<std::string>& names) {
+  VT_CHECK(!names.empty(),
+           "qwen3_5 dense: merged BF16 projection requires at least one shard");
+  int64_t in_dim = -1;
+  int64_t out_dim = 0;
+  std::vector<const StTensor*> shards;
+  shards.reserve(names.size());
+  for (const std::string& name : names) {
+    const StTensor& tensor = get(name);
+    VT_CHECK(tensor.dtype == "BF16",
+             "qwen3_5 dense: expected BF16 for " + name);
+    VT_CHECK(tensor.shape.size() == 2,
+             "qwen3_5 dense: expected 2-D weight for " + name);
+    VT_CHECK(tensor.shape[0] > 0 && tensor.shape[1] > 0,
+             "qwen3_5 dense: merged BF16 shard has an empty dimension: " +
+                 name);
+    VT_CHECK(tensor.data != nullptr,
+             "qwen3_5 dense: merged BF16 shard has null data: " + name);
+    if (in_dim < 0) in_dim = tensor.shape[1];
+    VT_CHECK(tensor.shape[1] == in_dim,
+             "qwen3_5 dense: merged BF16 shards must share input width");
+    VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() - tensor.shape[0],
+             "qwen3_5 dense: merged BF16 output width overflow");
+    out_dim += tensor.shape[0];
+    shards.push_back(&tensor);
+  }
+
+  VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() / in_dim,
+           "qwen3_5 dense: merged BF16 element count overflow");
+  const auto elements = static_cast<uint64_t>(out_dim) *
+                        static_cast<uint64_t>(in_dim);
+  VT_CHECK(elements <=
+               std::numeric_limits<size_t>::max() / sizeof(uint16_t),
+           "qwen3_5 dense: merged BF16 byte count overflow");
+  OwnedTensor merged = MakeOwned(vt::DType::kBF16, {out_dim, in_dim});
+  size_t offset = 0;
+  for (size_t i = 0; i < shards.size(); ++i) {
+    const StTensor& shard = *shards[i];
+    const size_t expected = static_cast<size_t>(shard.shape[0]) *
+                            static_cast<size_t>(in_dim) * sizeof(uint16_t);
+    VT_CHECK(shard.nbytes == expected,
+             "qwen3_5 dense: byte-size mismatch for " + names[i]);
+    std::memcpy(merged.bytes.data() + offset, shard.data, expected);
+    offset += expected;
+  }
+  VT_CHECK(offset == merged.bytes.size(),
+           "qwen3_5 dense: merged BF16 byte accounting mismatch");
+  merged.nk = true;
+  return merged;
+}
+
+GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
+                                    const std::string& layer_base) {
+  return LoadGdnDense(get, layer_base);
+}
 
 bool IsQwen27QuantizedLinear(const std::string& name) {
   // Never quantized regardless of suffix (notes §3.6 `ignore`).
@@ -271,7 +331,7 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
       LoadBf16Direct(get, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
-    layer.gdn = LoadGdnDense(get, base);
+    layer.gdn = LoadQwen3_5DenseGdn(get, base);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
     layer.attn = LoadAttnDense(get, base);

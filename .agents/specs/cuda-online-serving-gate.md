@@ -23,8 +23,11 @@ arithmetic explain the complete BF16 residual: our 48 GDN layers issue
 qkv+z+b+a while vLLM issues qkvz+ba, totaling **193 vs 97** BF16 projection
 GEMMs. The accepted
 [merged-projection spike](gdn-merged-input-projections.md) makes
-`KERNEL-GEMM-BF16` `READY`, with merged BA first and qkvz second. No
-cross-profiler duration or launch reduction earns speed credit by itself.
+`KERNEL-GEMM-BF16` W1 `GATING`. Its one-owner F32-output BA merge passes
+preflight model/safety gates, but the BF16-output arm fails the known near-tie
+and immutable 145-vs-193 structure plus c2/c16 performance remain pending.
+qkvz is still excluded. No cross-profiler duration or launch reduction earns
+speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -235,11 +238,12 @@ reported as a clean dependency check.
    Immutable `3f256ab` supersedes `9cc7191`: the 27B model gate, 36 timed groups
    and six returns are complete; 55/124 axes pass. Hold 35B.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
-   executed-path baselines. The merged-projection spike is committed and
-   selects BA as the next isolated component checkpoint.
-6. Claim, implement and gate merged BA; only after its complete disposition,
-   repeat for qkvz. Host-weight ownership remains a separate all-axis repair.
-   Cross-profiler attribution never earns speed credit by itself.
+   executed-path baselines. The merged-projection spike is committed; BA W1
+   code is preflight-correct with F32 output and BF16 rounding remains open.
+6. Repeat BA from its pushed SHA, close 145-vs-193 structure, BF16 rounding and
+   c2/c16 component disposition; only then claim qkvz. Host-weight ownership
+   remains a separate all-axis repair. Cross-profiler attribution never earns
+   speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

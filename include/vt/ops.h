@@ -1169,7 +1169,9 @@ void SigmoidGateBf16(Queue& q, Tensor& out, const Tensor& attn, const Tensor& ga
 //   sp = softplus(x) = (x > 20) ? x : log1p(exp(x))    (threshold 20)
 //   g_out[idx]    = -exp(a_log[hv]) * sp
 //   beta_out[idx] = sigmoid(braw[idx])
-// T/Hv inferred from g_out's shape. All f32.
+// T/Hv inferred from g_out's shape. g/beta/a_log/dt_bias are f32. araw/braw
+// share either f32 or bf16 dtype and may be inner-contiguous row-strided views
+// (the merged `[b,a]` projection has row stride 2*Hv); kernels upcast on load.
 void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, const Tensor& braw,
               const Tensor& a_log, const Tensor& dt_bias);
 
@@ -1193,7 +1195,8 @@ void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
 //   v_out       = v                                      (copy)
 //   g_out,beta_out from araw/braw + a_log/dt_bias        (GdnGBeta, §6)
 // q_out/k_out [T,Hk,Dk] (l2-normed), v_out [T,Hv,Dv], g_out/beta_out [T,Hv];
-// conv [T, 2*Hk*Dk + Hv*Dv]; araw/braw [T,Hv]; a_log/dt_bias [Hv]. All f32.
+// conv [T, 2*Hk*Dk + Hv*Dv]; araw/braw [T,Hv]; a_log/dt_bias [Hv]. araw/braw
+// share f32 or bf16 dtype and may have a padded row stride; all gate math is f32.
 void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
                  Tensor& beta_out, const Tensor& conv, const Tensor& araw, const Tensor& braw,
                  const Tensor& a_log, const Tensor& dt_bias, const L2NormArgs& args);

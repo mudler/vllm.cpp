@@ -114,6 +114,20 @@ bool IsQwen27QuantizedLinear(const std::string& name);
 OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
                                              const std::string& proj);
 
+// Load and concatenate raw BF16 torch-Linear weights `[N_i,K]` along their
+// output rows, preserving the exact listed order and setting `nk=true` for
+// vt::MatmulBT. This is vLLM MergedColumnParallelLinear's physical ownership
+// rule for GDN `in_proj_ba` now and `in_proj_qkvz` in the separately gated W2.
+// Exposed for the focused loader contract.
+OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
+                                const std::vector<std::string>& names);
+
+// Load the dense checkpoint's GDN block. Exposed so the loader regression can
+// assert the one-owner invariant (`in_proj_ba` populated, split b/a empty)
+// without manufacturing unrelated attention/MLP tensors.
+GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
+                                    const std::string& layer_base);
+
 // Load one dense decoder layer. `layer_type` is "linear_attention" or
 // "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". Routes
 // each Linear to bf16 vs W4A4-materialized-to-bf16 per IsQwen27QuantizedLinear.

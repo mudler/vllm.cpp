@@ -1170,7 +1170,7 @@ TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {
 }
 
 // gdn_post_conv: (1) CPU fused == CPU composed (GdnConvSplit + GdnGBeta +
-// L2Norm x2), bit-exact; (2) CUDA fused == CPU fused, within tol. All f32.
+// L2Norm x2), bit-exact; (2) CUDA fused == CPU fused, within tol. Baseline f32.
 void RunGdnPostConvCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t dv, uint32_t seed) {
   const int64_t key_dim = hk * dk, value_dim = hv * dv, conv_dim = 2 * key_dim + value_dim;
   const auto conv = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
@@ -1253,6 +1253,196 @@ TEST_CASE("gdn_post_conv fused == composed (CPU) and CUDA matches (real dims, st
   RunGdnPostConvCase(5, 2, 6, 128, 128, 7100);   // GQA ratio 3, Dk==blockDim/2
   RunGdnPostConvCase(3, 4, 4, 300, 128, 7200);   // Dk 300 > blockDim(256): strided
   RunGdnPostConvCase(1, 1, 2, 64, 64, 7300);     // T==1 (decode-shaped)
+}
+
+// Ported from tests/kernels/test_fused_gdn_post_conv.py and the packed
+// `in_proj_ba` slicing in qwen_gdn_linear_attn.py:908-943. vLLM projects BA in
+// model dtype, then b/a are logical views with a wider parent row stride. Pin
+// both the accepted local F32 gate arithmetic and upstream BF16 load/upcast
+// semantics, non-zero view offsets, padding canaries and the decode/online
+// batch sizes used by the W1 gate.
+void RunGdnPackedBaCase(int64_t t, DType gate_dtype, uint32_t seed) {
+  constexpr int64_t kHk = 2;
+  constexpr int64_t kHv = 6;
+  constexpr int64_t kDk = 8;
+  constexpr int64_t kDv = 8;
+  constexpr int64_t kPrefix = 1;
+  constexpr int64_t kSuffix = 3;
+  constexpr int64_t kParentWidth = kPrefix + 2 * kHv + kSuffix;
+  const int64_t key_dim = kHk * kDk;
+  const int64_t value_dim = kHv * kDv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+
+  const auto conv = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
+  const auto araw_src = RandomF32(static_cast<size_t>(t * kHv), seed + 1, -1.0f, 1.0f);
+  const auto braw_src = RandomF32(static_cast<size_t>(t * kHv), seed + 2, -1.0f, 1.0f);
+  const auto alog = RandomF32(static_cast<size_t>(kHv), seed + 3, -1.0f, 1.0f);
+  const auto dtb = RandomF32(static_cast<size_t>(kHv), seed + 4, -1.0f, 1.0f);
+
+  std::vector<float> parent(static_cast<size_t>(t * kParentWidth), 7.5f);
+  for (int64_t row = 0; row < t; ++row) {
+    for (int64_t h = 0; h < kHv; ++h) {
+      parent[static_cast<size_t>(row * kParentWidth + kPrefix + h)] =
+          braw_src[static_cast<size_t>(row * kHv + h)];
+      parent[static_cast<size_t>(row * kParentWidth + kPrefix + kHv + h)] =
+          araw_src[static_cast<size_t>(row * kHv + h)];
+    }
+  }
+  const std::vector<uint8_t> parent_bytes = Pack(parent, gate_dtype);
+  const std::vector<float> parent_rounded = Unpack(parent_bytes, gate_dtype);
+  std::vector<float> araw(static_cast<size_t>(t * kHv));
+  std::vector<float> braw(static_cast<size_t>(t * kHv));
+  for (int64_t row = 0; row < t; ++row) {
+    for (int64_t h = 0; h < kHv; ++h) {
+      braw[static_cast<size_t>(row * kHv + h)] =
+          parent_rounded[static_cast<size_t>(row * kParentWidth + kPrefix + h)];
+      araw[static_cast<size_t>(row * kHv + h)] =
+          parent_rounded[static_cast<size_t>(row * kParentWidth + kPrefix + kHv + h)];
+    }
+  }
+
+  const vt::L2NormArgs args{1e-6f};
+  Queue cq = Q();
+  Tensor tconv = MakeT(const_cast<float*>(conv.data()), DType::kF32, Cpu(),
+                       {t, conv_dim});
+  Tensor talog = MakeT(const_cast<float*>(alog.data()), DType::kF32, Cpu(), {kHv});
+  Tensor tdtb = MakeT(const_cast<float*>(dtb.data()), DType::kF32, Cpu(), {kHv});
+  Tensor taraw = MakeT(araw.data(), DType::kF32, Cpu(), {t, kHv});
+  Tensor tbraw = MakeT(braw.data(), DType::kF32, Cpu(), {t, kHv});
+
+  std::vector<float> rq(static_cast<size_t>(t * key_dim));
+  std::vector<float> rk(static_cast<size_t>(t * key_dim));
+  std::vector<float> rv(static_cast<size_t>(t * value_dim));
+  std::vector<float> rg(static_cast<size_t>(t * kHv));
+  std::vector<float> rb(static_cast<size_t>(t * kHv));
+  Tensor trq = MakeT(rq.data(), DType::kF32, Cpu(), {t, kHk, kDk});
+  Tensor trk = MakeT(rk.data(), DType::kF32, Cpu(), {t, kHk, kDk});
+  Tensor trv = MakeT(rv.data(), DType::kF32, Cpu(), {t, kHv, kDv});
+  Tensor trg = MakeT(rg.data(), DType::kF32, Cpu(), {t, kHv});
+  Tensor trb = MakeT(rb.data(), DType::kF32, Cpu(), {t, kHv});
+  vt::GdnPostConv(cq, trq, trk, trv, trg, trb, tconv, taraw, tbraw,
+                  talog, tdtb, args);
+
+  std::vector<uint8_t> cpu_parent = parent_bytes;
+  Tensor tcp = MakeT(cpu_parent.data(), gate_dtype, Cpu(), {t, kParentWidth});
+  Tensor tcb = tcp.Slice(1, kPrefix, kPrefix + kHv);
+  Tensor tca = tcp.Slice(1, kPrefix + kHv, kPrefix + 2 * kHv);
+  std::vector<float> cqv(rq.size()), ckv(rk.size()), cvv(rv.size());
+  std::vector<float> cgv(rg.size()), cbv(rb.size());
+  Tensor tcq = MakeT(cqv.data(), DType::kF32, Cpu(), {t, kHk, kDk});
+  Tensor tck = MakeT(ckv.data(), DType::kF32, Cpu(), {t, kHk, kDk});
+  Tensor tcv = MakeT(cvv.data(), DType::kF32, Cpu(), {t, kHv, kDv});
+  Tensor tcg = MakeT(cgv.data(), DType::kF32, Cpu(), {t, kHv});
+  Tensor tcbeta = MakeT(cbv.data(), DType::kF32, Cpu(), {t, kHv});
+  vt::GdnPostConv(cq, tcq, tck, tcv, tcg, tcbeta, tconv, tca, tcb,
+                  talog, tdtb, args);
+  CheckClose(cqv, rq, 0.0f, 0.0f);
+  CheckClose(ckv, rk, 0.0f, 0.0f);
+  CheckClose(cvv, rv, 0.0f, 0.0f);
+  CheckClose(cgv, rg, 0.0f, 0.0f);
+  CheckClose(cbv, rb, 0.0f, 0.0f);
+  CHECK(cpu_parent == parent_bytes);  // const inputs and padding canaries untouched
+
+  std::vector<float> direct_g(rg.size()), direct_b(rb.size());
+  Tensor tdg = MakeT(direct_g.data(), DType::kF32, Cpu(), {t, kHv});
+  Tensor tdb = MakeT(direct_b.data(), DType::kF32, Cpu(), {t, kHv});
+  vt::GdnGBeta(cq, tdg, tdb, tca, tcb, talog, tdtb);
+  CheckClose(direct_g, rg, 0.0f, 0.0f);
+  CheckClose(direct_b, rb, 0.0f, 0.0f);
+
+  if (!HasCuda()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dconv(gpu, gq.q, DType::kF32, {t, conv_dim}, conv.data());
+  DeviceTensor dparent(gpu, gq.q, gate_dtype, {t, kParentWidth},
+                       parent_bytes.data());
+  Tensor dbview = dparent.tensor().Slice(1, kPrefix, kPrefix + kHv);
+  Tensor daview = dparent.tensor().Slice(1, kPrefix + kHv,
+                                         kPrefix + 2 * kHv);
+  DeviceTensor dalog(gpu, gq.q, DType::kF32, {kHv}, alog.data());
+  DeviceTensor ddtb(gpu, gq.q, DType::kF32, {kHv}, dtb.data());
+  DeviceTensor dq(gpu, gq.q, DType::kF32, {t, kHk, kDk});
+  DeviceTensor dk(gpu, gq.q, DType::kF32, {t, kHk, kDk});
+  DeviceTensor dv(gpu, gq.q, DType::kF32, {t, kHv, kDv});
+  DeviceTensor dg(gpu, gq.q, DType::kF32, {t, kHv});
+  DeviceTensor dbeta(gpu, gq.q, DType::kF32, {t, kHv});
+  vt::GdnPostConv(gq.q, dq.tensor(), dk.tensor(), dv.tensor(), dg.tensor(),
+                  dbeta.tensor(), dconv.tensor(), daview, dbview,
+                  dalog.tensor(), ddtb.tensor(), args);
+  std::vector<float> gqv(rq.size()), gkv(rk.size()), gvv(rv.size());
+  std::vector<float> ggv(rg.size()), gbv(rb.size());
+  dq.Download(gq.q, gqv.data());
+  dk.Download(gq.q, gkv.data());
+  dv.Download(gq.q, gvv.data());
+  dg.Download(gq.q, ggv.data());
+  dbeta.Download(gq.q, gbv.data());
+  CheckClose(gqv, rq, 1e-5f, 1e-5f);
+  CheckClose(gkv, rk, 1e-5f, 1e-5f);
+  CheckClose(gvv, rv, 1e-6f, 0.0f);
+  CheckClose(ggv, rg, 1e-5f, 1e-5f);
+  CheckClose(gbv, rb, 1e-5f, 1e-5f);
+  DeviceTensor ddg(gpu, gq.q, DType::kF32, {t, kHv});
+  DeviceTensor ddb(gpu, gq.q, DType::kF32, {t, kHv});
+  vt::GdnGBeta(gq.q, ddg.tensor(), ddb.tensor(), daview, dbview,
+               dalog.tensor(), ddtb.tensor());
+  std::vector<float> dggv(rg.size()), dgbv(rb.size());
+  ddg.Download(gq.q, dggv.data());
+  ddb.Download(gq.q, dgbv.data());
+  CheckClose(dggv, rg, 1e-5f, 1e-5f);
+  CheckClose(dgbv, rb, 1e-5f, 1e-5f);
+
+  // Both production consumers must remain allocation-free and preserve the
+  // packed views through graph capture. Poison every output before both
+  // replays so an eager result cannot make this pass accidentally.
+  gpu.BeginCapture(gq.q);
+  vt::GdnPostConv(gq.q, dq.tensor(), dk.tensor(), dv.tensor(), dg.tensor(),
+                  dbeta.tensor(), dconv.tensor(), daview, dbview,
+                  dalog.tensor(), ddtb.tensor(), args);
+  vt::GdnGBeta(gq.q, ddg.tensor(), ddb.tensor(), daview, dbview,
+               dalog.tensor(), ddtb.tensor());
+  void* graph = gpu.EndCaptureGraph(gq.q);
+  for (int replay = 0; replay < 2; ++replay) {
+    gpu.Memset(gq.q, dq.tensor().data, 0xA5, rq.size() * sizeof(float));
+    gpu.Memset(gq.q, dk.tensor().data, 0xA5, rk.size() * sizeof(float));
+    gpu.Memset(gq.q, dv.tensor().data, 0xA5, rv.size() * sizeof(float));
+    gpu.Memset(gq.q, dg.tensor().data, 0xA5, rg.size() * sizeof(float));
+    gpu.Memset(gq.q, dbeta.tensor().data, 0xA5,
+               rb.size() * sizeof(float));
+    gpu.Memset(gq.q, ddg.tensor().data, 0xA5, rg.size() * sizeof(float));
+    gpu.Memset(gq.q, ddb.tensor().data, 0xA5, rb.size() * sizeof(float));
+    gpu.ReplayGraph(gq.q, graph);
+    dq.Download(gq.q, gqv.data());
+    dk.Download(gq.q, gkv.data());
+    dv.Download(gq.q, gvv.data());
+    dg.Download(gq.q, ggv.data());
+    dbeta.Download(gq.q, gbv.data());
+    ddg.Download(gq.q, dggv.data());
+    ddb.Download(gq.q, dgbv.data());
+    CheckClose(gqv, rq, 1e-5f, 1e-5f);
+    CheckClose(gkv, rk, 1e-5f, 1e-5f);
+    CheckClose(gvv, rv, 1e-6f, 0.0f);
+    CheckClose(ggv, rg, 1e-5f, 1e-5f);
+    CheckClose(gbv, rb, 1e-5f, 1e-5f);
+    CheckClose(dggv, rg, 1e-5f, 1e-5f);
+    CheckClose(dgbv, rb, 1e-5f, 1e-5f);
+  }
+  gpu.DestroyGraph(graph);
+
+  std::vector<uint8_t> got_parent(parent_bytes.size());
+  dparent.Download(gq.q, got_parent.data());
+  CHECK(got_parent == parent_bytes);
+}
+
+TEST_CASE("gdn BA accepts F32/BF16 row-strided packed views on CPU and CUDA") {
+  uint32_t seed = 7400;
+  for (DType gate_dtype : {DType::kF32, DType::kBF16}) {
+    for (int64_t batch : {1, 2, 4, 16, 32}) {
+      CAPTURE(gate_dtype);
+      CAPTURE(batch);
+      RunGdnPackedBaCase(batch, gate_dtype, seed);
+      seed += 10;
+    }
+  }
 }
 
 TEST_CASE("CUDA rmsnorm_gated matches CPU (silu and sigmoid gates)") {

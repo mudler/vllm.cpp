@@ -80,17 +80,16 @@ inner 4096, state 128; context 262144.
 
 ## TODO
 
-- Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
-  27B cache-off grid at **55/124 axes pass, 69 fail**. The post-W3-I scan is
-  complete: accepted async root `3812d8` contains all six timing legs and both
-  shape-neutral traces. ON/OFF total ratio is **1.002153×**, direction-
-  normalized TPOT/TTFT are **1.010291× / 0.862159×**, and traced GPU time is
-  **1.002004×**; W3 stays uncredited and leaves the immediate speed path.
-  Capture exact c2 ours/vLLM kernels and map the RMSNorm/generated partitions
-  plus resolved FP4 tactics before coding. The independent host-memory repair must remove the measured
-  **22.920 GiB** persistent CPU weight mirror and overlapping load-time source
-  pages without increasing final GPU allocations. Close all 69 failed axes
-  before 35B performance.
+- Binding immutable `3f256ab` remains **55/124 axes pass, 69 fail** against
+  vLLM v0.25.0. Finalized c2 root `179a0fc` already maps the executed path and
+  selects the complete **193 vs 97** GDN projection mismatch. W1 merged BA is
+  implemented/`GATING` in `~/work/vllm.cpp-gdn-ba`: production CUTLASS 4.5
+  build, packed F32/BF16 capture/replay, strict memcheck, merged/split 27B and
+  inert 35B preflights pass; BF16 projection output fails the token near-tie.
+  Rebuild the pushed SHA, close exact 145-vs-193 trace, rounding parity and the
+  c2/c16 component before qkvz. Independently remove the measured **22.920
+  GiB** host-weight mirror and overlapping source pages. No 35B performance
+  command runs before all 27B axes pass.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

@@ -149,17 +149,24 @@ void SigmoidGateBf16KernelCuda(Queue& q, Tensor& out, const Tensor& attn, const 
 // ---------------------------------------------------------------------------
 // gdn_g_beta (gdn-semantics.md §6): g/beta from raw a/b/A_log/dt_bias. Thread
 // per output element (flat idx over T*Hv); hv = idx % Hv indexes a_log/dt_bias.
-__global__ void GdnGBetaKernel(float* g_out, float* beta_out, const float* araw, const float* braw,
-                               const float* a_log, const float* dt_bias, int64_t t, int64_t hv) {
+template <typename Tgate>
+__global__ void GdnGBetaKernel(float* g_out, float* beta_out,
+                               const Tgate* araw, const Tgate* braw,
+                               const float* a_log, const float* dt_bias,
+                               int64_t t, int64_t hv, int64_t a_row_stride,
+                               int64_t b_row_stride) {
   const int64_t n = t * hv;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
        idx += step) {
     const int64_t h = idx % hv;
-    const float x = araw[idx] + dt_bias[h];
+    const int64_t row = idx / hv;
+    const float av = Load(araw, row * a_row_stride + h);
+    const float bv = Load(braw, row * b_row_stride + h);
+    const float x = av + dt_bias[h];
     const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
     g_out[idx] = -expf(a_log[h]) * sp;
-    beta_out[idx] = SigmoidF(braw[idx]);
+    beta_out[idx] = SigmoidF(bv);
   }
 }
 
@@ -168,9 +175,18 @@ void GdnGBetaKernelCuda(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor&
   const int64_t t = g_out.shape[0], hv = g_out.shape[1];
   const int64_t n = t * hv;
   if (n == 0) return;
-  GdnGBetaKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
-      g_out.Ptr<float>(), beta_out.Ptr<float>(), araw.Ptr<float>(), braw.Ptr<float>(),
-      a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hv);
+  if (araw.dtype == DType::kBF16) {
+    GdnGBetaKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        g_out.Ptr<float>(), beta_out.Ptr<float>(),
+        araw.Ptr<__nv_bfloat16>(), braw.Ptr<__nv_bfloat16>(),
+        a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hv, araw.stride[0],
+        braw.stride[0]);
+  } else {
+    GdnGBetaKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        g_out.Ptr<float>(), beta_out.Ptr<float>(), araw.Ptr<float>(),
+        braw.Ptr<float>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hv,
+        araw.stride[0], braw.stride[0]);
+  }
   Check(cudaGetLastError(), "gdn_g_beta launch");
 }
 

@@ -1474,12 +1474,15 @@ void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, con
   VT_CHECK(a_log.rank == 1 && a_log.shape[0] == hv && dt_bias.rank == 1 && dt_bias.shape[0] == hv,
            "gdn_g_beta: a_log/dt_bias must be [Hv]");
   VT_CHECK(g_out.dtype == DType::kF32 && beta_out.dtype == DType::kF32 &&
-               araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
-               a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
-           "gdn_g_beta: all tensors must be f32");
-  VT_CHECK(g_out.IsContiguous() && beta_out.IsContiguous() && araw.IsContiguous() &&
-               braw.IsContiguous() && a_log.IsContiguous() && dt_bias.IsContiguous(),
-           "gdn_g_beta: contiguous required");
+               (araw.dtype == DType::kF32 || araw.dtype == DType::kBF16) &&
+               braw.dtype == araw.dtype && a_log.dtype == DType::kF32 &&
+               dt_bias.dtype == DType::kF32,
+           "gdn_g_beta: g/beta/a_log/dt_bias f32; a/b must share f32 or bf16");
+  VT_CHECK(g_out.IsContiguous() && beta_out.IsContiguous() &&
+               araw.stride[1] == 1 && braw.stride[1] == 1 &&
+               araw.stride[0] >= hv && braw.stride[0] >= hv &&
+               a_log.IsContiguous() && dt_bias.IsContiguous(),
+           "gdn_g_beta: outputs/vectors contiguous; a/b inner-contiguous row views required");
   VT_CHECK(g_out.device == q.device && beta_out.device == q.device && araw.device == q.device &&
                braw.device == q.device && a_log.device == q.device && dt_bias.device == q.device,
            "gdn_g_beta: device mismatch (g_out/beta_out/araw/braw/a_log/dt_bias/queue)");
@@ -1543,23 +1546,26 @@ void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& 
   // q/k/v activations may be f32 OR bf16 (coupled GDN bf16 path, VT_GDN_BF16):
   // bf16 feeds the WMMA chunk-scan as native bf16 fragments. All three must share
   // one dtype (the scan requires q.dtype==k.dtype==v.dtype). g/beta and the
-  // araw/braw/a_log/dt_bias inputs stay f32 — FLA keeps the gates f32. conv may
-  // be f32 OR bf16 (input-side bf16 GDN path, VT_GDN_IN_BF16): the conv-output
-  // activation halves its read traffic; the kernel upcasts to f32 (Load()).
+  // araw/braw may share f32 OR bf16 dtype. vLLM's packed BA projection emits
+  // model-dtype bf16 and slicing it produces row-strided inner-contiguous
+  // views; kernels upcast those loads while g/beta remain f32. conv may be f32
+  // OR bf16 (input-side bf16 GDN path, VT_GDN_IN_BF16).
   VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
                k_out.dtype == q_out.dtype && v_out.dtype == q_out.dtype,
            "gdn_post_conv: q_out/k_out/v_out must be f32 or bf16, same dtype");
   VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
            "gdn_post_conv: conv must be f32 or bf16");
   VT_CHECK(g_out.dtype == DType::kF32 && beta_out.dtype == DType::kF32 &&
-               araw.dtype == DType::kF32 && braw.dtype == DType::kF32 &&
-               a_log.dtype == DType::kF32 && dt_bias.dtype == DType::kF32,
-           "gdn_post_conv: g/beta/araw/braw/a_log/dt_bias must be f32");
+               (araw.dtype == DType::kF32 || araw.dtype == DType::kBF16) &&
+               braw.dtype == araw.dtype && a_log.dtype == DType::kF32 &&
+               dt_bias.dtype == DType::kF32,
+           "gdn_post_conv: g/beta/a_log/dt_bias f32; a/b must share f32 or bf16");
   VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
                g_out.IsContiguous() && beta_out.IsContiguous() && conv.IsContiguous() &&
-               araw.IsContiguous() && braw.IsContiguous() && a_log.IsContiguous() &&
-               dt_bias.IsContiguous(),
-           "gdn_post_conv: contiguous required");
+               araw.stride[1] == 1 && braw.stride[1] == 1 &&
+               araw.stride[0] >= hv && braw.stride[0] >= hv &&
+               a_log.IsContiguous() && dt_bias.IsContiguous(),
+           "gdn_post_conv: outputs/conv/vectors contiguous; a/b inner-contiguous row views required");
   VT_CHECK(q_out.device == q.device && k_out.device == q.device && v_out.device == q.device &&
                g_out.device == q.device && beta_out.device == q.device && conv.device == q.device &&
                araw.device == q.device && braw.device == q.device && a_log.device == q.device &&

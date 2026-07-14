@@ -638,15 +638,19 @@ void L2NormKernelCuda(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& 
 // coupled GDN bf16 path (VT_GDN_BF16) — mirrors FLA keeping the matmul-input
 // activations (q/k/v) in bf16 while g/beta stay f32 (they gate the recurrence,
 // FLA holds them f32). The l2norm reduction math is f32; only the store rounds
-// to Tqkv. g_out/beta_out are always f32. Tconv = the conv-output activation
+// to Tqkv. g_out/beta_out are always f32. Tgate is f32 for the legacy split
+// projections or bf16 for vLLM's packed BA output; each row may be padded by
+// the sibling logical view and is upcast on load. Tconv = the conv-output activation
 // dtype: f32 (default) or bf16 under the input-side bf16 GDN path (VT_GDN_IN_BF16),
 // which mirrors FLA carrying the post-conv activations in bf16 (halved conv-read
 // traffic); the reads upcast to f32 via Load() so the norm math is unchanged.
-template <typename Tqkv, typename Tconv>
+template <typename Tqkv, typename Tconv, typename Tgate>
 __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out,
-                                  float* beta_out, const Tconv* conv, const float* araw,
-                                  const float* braw, const float* a_log, const float* dt_bias,
-                                  int64_t hk, int64_t dk, int64_t hv, int64_t dv, float eps) {
+                                  float* beta_out, const Tconv* conv, const Tgate* araw,
+                                  const Tgate* braw, const float* a_log,
+                                  const float* dt_bias, int64_t hk, int64_t dk,
+                                  int64_t hv, int64_t dv, int64_t a_row_stride,
+                                  int64_t b_row_stride, float eps) {
   const int64_t key_dim = hk * dk, value_dim = hv * dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const int64_t tok = blockIdx.x;
@@ -694,10 +698,12 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
     for (int64_t j = threadIdx.x; j < value_dim; j += kBlock) Store(vo, j, Load(vin, j));
     for (int64_t h = threadIdx.x; h < hv; h += kBlock) {
       const int64_t idx = tok * hv + h;
-      const float x = araw[idx] + dt_bias[h];
+      const float av = Load(araw, tok * a_row_stride + h);
+      const float bv = Load(braw, tok * b_row_stride + h);
+      const float x = av + dt_bias[h];
       const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
       g_out[idx] = -expf(a_log[h]) * sp;
-      beta_out[idx] = 1.0f / (1.0f + expf(-braw[idx]));
+      beta_out[idx] = 1.0f / (1.0f + expf(-bv));
     }
   }
 }
@@ -720,24 +726,32 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
   // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
-  auto launch = [&](auto qkv_tag, auto conv_tag) {
+  auto launch = [&](auto qkv_tag, auto conv_tag, auto gate_tag) {
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
-    GdnPostConvKernel<Tqkv, Tconv><<<grid, kBlock, 0, s>>>(
+    using Tgate = decltype(gate_tag);
+    GdnPostConvKernel<Tqkv, Tconv, Tgate><<<grid, kBlock, 0, s>>>(
         q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
-        beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<float>(), braw.Ptr<float>(),
-        a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, args.eps);
+        beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(),
+        braw.Ptr<Tgate>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk,
+        hv, dv, araw.stride[0], braw.stride[0], args.eps);
+  };
+  auto launch_gate = [&](auto qkv_tag, auto conv_tag) {
+    if (araw.dtype == DType::kBF16)
+      launch(qkv_tag, conv_tag, __nv_bfloat16{});
+    else
+      launch(qkv_tag, conv_tag, float{});
   };
   const bool qkv_f32 = q_out.dtype == DType::kF32;
   const bool conv_f32 = conv.dtype == DType::kF32;
   if (qkv_f32 && conv_f32) {
-    launch(float{}, float{});
+    launch_gate(float{}, float{});
   } else if (qkv_f32) {
-    launch(float{}, __nv_bfloat16{});
+    launch_gate(float{}, __nv_bfloat16{});
   } else if (conv_f32) {
-    launch(__nv_bfloat16{}, float{});
+    launch_gate(__nv_bfloat16{}, float{});
   } else {
-    launch(__nv_bfloat16{}, __nv_bfloat16{});
+    launch_gate(__nv_bfloat16{}, __nv_bfloat16{});
   }
   Check(cudaGetLastError(), "gdn_post_conv launch");
 }

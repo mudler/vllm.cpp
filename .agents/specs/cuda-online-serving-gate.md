@@ -43,12 +43,15 @@ memcpy and 1 memset**, are lossless, and share node-multiset SHA
 `44fcf31f…b93d`. Fresh oracle SHA `2b3bf412…785c` has **1,522** exact B=2
 windows at 1,160 kernels plus two classified B=1 drain windows; its B=2 ordered
 names retain `858915dd…fad0`, while five generated partitions use 50 rather than
-48 registers. Full read-only finalizer preflight passes. Diagnostic medians are
+48 registers. Committed finalizer `fe28003` records `complete-diagnostic`.
+Diagnostic medians are
 local/oracle **111.076528 / 105.520831 ms**; BF16 CUTLASS GEMMs lead at +96
 launches/+2.864630 ms, RMSNorm/generated partitions add +1.810237 ms, and FP4
-GEMM is already non-positive with the same 128+80 tactics. The durable
-summary/manifest/status marker remains **PENDING**; no implementation or speed
-credit is claimed yet.
+GEMM is already non-positive with the same 128+80 tactics. Summary / manifest /
+status / artifact-set SHA values are `0ef6a124…0273` / `2556cfd0…2f21` /
+`9e0143fa…7b57` / `cc248ad2…823a`. No implementation or speed credit is
+claimed; the exact +96-launch structure selects the BF16-GEMM whole-chain
+spike.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -193,8 +196,8 @@ with `--cuda-graph-trace=node`; whole-graph activities without child kernels
 fail attribution. A c2 capture is not accepted merely because all raw profilers
 exit zero: its three local sessions, twelve exact batch-2 graph ranges, fresh
 oracle trace, ordered topology, plan map, lifecycle, hashes and final status
-must all reconcile. Until that finalizer lands and passes, the local arm is
-explicitly `PENDING`. Each
+must all reconcile. Finalized c2 evidence must carry `complete-diagnostic` or a
+stronger explicitly defined state before it can select a spike. Each
 model/point has
 at least three valid repetitions and a fresh pinned-vLLM denominator. The
 commit-bound model gate is the correctness precondition before performance is
@@ -263,9 +266,10 @@ reported as a clean dependency check.
    **1.002004×** traced GPU time, so do not claim W3 for speed. The accepted
    oracle trace pins the accepted all-B=2 topology. Complete raw `179a0fc`
    reproduces 12/12 local ranges and 1,522 steady fresh-oracle B=2 windows plus
-   two drains; read-only finalizer preflight maps BF16 GEMM launch structure and
-   RMSNorm/generated partitions above an already-matched 128+80 FP4 family.
-   Write the durable finalizer marker before spiking or coding the next lever.
+   two drains; finalizer status `9e0143fa…7b57` maps BF16 GEMM launch structure
+   and RMSNorm/generated partitions above an already-matched 128+80 FP4 family.
+   The next checkpoint is the complete BF16-GEMM whole-chain spike; do not code
+   the lever before that spec is committed.
 6. Drive only the lever selected by that control. A positive 4–6% async credit
    activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
    and gate the smallest grounded kernel leaf. Host-weight ownership is a

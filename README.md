@@ -14,10 +14,11 @@ OpenAI-compatible server.
 > local B=2 ranges are lossless and topology-identical at **1,011 kernels**, and
 > the fresh oracle contains **1,522** exact B=2 windows at **1,160 kernels** plus
 > two classified B=1 drain windows. Both sides select the same **128 Stream-K +
-> 80 static-persistent** FP4 split. A read-only finalizer preflight maps the
-> remaining diagnostic time chiefly to BF16 CUTLASS GEMMs and RMSNorm/generated
-> partitions, but its durable marker is still **PENDING**; these cross-profiler
-> times are not a binding speed result. Separately, host memory retains a
+> 80 static-persistent** FP4 split. The committed finalizer now records
+> `complete-diagnostic` (summary `0ef6a124…0273`) and maps the remaining
+> diagnostic time chiefly to BF16 CUTLASS GEMMs and RMSNorm/generated
+> partitions. These cross-profiler times are not a binding speed result;
+> they select the next whole-chain spike only. Separately, host memory retains a
 > **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
@@ -26,7 +27,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; complete `179a0fc` raw c2 evidence is awaiting its durable finalizer marker | Finalize the c2 map, spike the highest complete residual, then gate it before rerunning the exact grid |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; finalized `179a0fc` c2 evidence is `complete-diagnostic` and does not supersede the grid | Spike and gate the BF16-GEMM launch residual, then rerun the exact grid |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
@@ -55,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
 | Closed scheduler diagnostic | Accepted `3812d8` c2 ON/OFF: total **160.347697 / 160.003134 tok/s = 1.002153×**; TPOT **106.642 / 107.740 ms**, TTFT **807.658 / 696.330 ms**. Traces total **170.820 / 170.478 s** GPU-kernel time. Async is neutral for speed; W3 remains later parity work |
-| Selected GPU work | `179a0fc` raw capture: **12/12** local ranges at 1,011 kernels and **1,522** steady oracle B=2 windows at 1,160 kernels; both use the same 128+80 FP4 tactics. Read-only preflight medians are **111.077 / 105.521 ms**, diagnostic only. Durable finalization is pending before a lever is claimed |
+| Selected GPU work | Finalized `179a0fc` c2 map: **12/12** local ranges at 1,011 kernels and **1,522** steady oracle B=2 windows at 1,160 kernels; both use the same 128+80 FP4 tactics. Diagnostic medians are **111.077 / 105.521 ms**. BF16 GEMM launch structure is the next spike; no speed credit exists yet |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 | Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 
@@ -177,8 +178,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: durably finalize and gate the c2 low-batch
-kernel residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix
+The next execution order is fixed: spike and gate the c2 BF16-GEMM launch
+residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix
 gate → the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and
 external KV cache / LMCache support.
 

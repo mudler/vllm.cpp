@@ -8130,3 +8130,38 @@ once against the immutable root. Cleanup confirms no compute process, port
 8001 free and `/tmp/gpu` free. Binding `3f256ab` remains **55/124**; next is the
 CPU-only durable finalization, followed by a spike and gate for the largest
 complete BF16-GEMM/RMSNorm residual.
+
+## 2026-07-14 — exact-c2 evidence durably finalized as complete diagnostic
+
+The exact bytes committed and pushed at
+`fe280032fe00457f946dbe24dbd79b6e32cf00d5` ran once against immutable raw
+root `179a0fc2afc1c33b63d14de8e50d3fde976c7356`. The CPU-only finalizer
+revalidated the complete model/build/corpus/cache/client/control/lifecycle
+chain, every local SQLite export and the fresh oracle trace, then wrote summary,
+manifest and `status-c2.json` last. It returned `complete-diagnostic` with
+summary / manifest / status / artifact-set / finalizer SHA values
+`0ef6a1240d33c16410cd4e43b30ca8667a6d92e6eee8506d7bd03388fe010273` /
+`2556cfd032fae2201d9f8deb818343731b7dc99d9f8e6329da9b793262712f21` /
+`9e0143fa1b9c74e218e486fedd0606850708619a0e859dafe94957e24a507b57` /
+`cc248ad2b5bf08f85b0d6b178de70682a104917e16c59c9adf34d661217f823a` /
+`45dbf28ae5634d364f68176d7ed36c6dca1a82a175fbcd8f2b600b9a84d03311`.
+The series log SHA is
+`362f0f1ea0f0fccee29f2dab7b719756a62c69dfaafa8f4e54893403bd3c1cef`.
+
+The finalized classification is unchanged: **12/12** invariant local B=2
+ranges, **1,522×1,160** steady oracle B=2 windows plus two bounded B=1 drains,
+and matching **128 Stream-K + 80 static-persistent** FP4 tactics. Diagnostic
+median kernel time remains **111.076528 / 105.520831 ms = 1.052650×**.
+BF16 CUTLASS GEMMs carry the largest complete structural difference at
+**193 vs 97 calls** and +2.864630 ms, followed by RMSNorm/generated partitions
+at equal 177 calls and +1.810237 ms; FP4 GEMM is non-positive. Because Nsight
+and Torch-profiler durations cross measurement domains, none of these values
+supersedes binding `3f256ab` at **55/124** or earns speed credit. The +96-launch
+BF16-GEMM structure selects the next whole dependency-chain spike only.
+
+No GPU command or lock was needed for finalization. Post-run inspection finds
+no compute process, `/tmp/gpu` free and port 8001 unused. Live README,
+BENCHMARKS, roadmap, matrices, coordination and serving-gate spec now collapse
+the prior pending narrative to this single durable disposition. Next: commit
+the BF16-GEMM launch-parity spike before any implementation, then gate its
+smallest grounded leaf against the same c2 and exact online workloads.

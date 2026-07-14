@@ -87,8 +87,10 @@ inner 4096, state 128; context 262144.
   `~/work/vllm.cpp-gdn-ba/immutable-581d335…` passes the exact CUDA 13.0.88 /
   CUTLASS / Triton-AOT build, packed F32/BF16 capture/replay, strict memcheck,
   merged/split 27B and inert native-35B gates; BF16 projection output fails the token
-  near-tie. Extend the exact-c2 harness, then close 145-vs-193 trace, rounding
-  parity and the c2/c16 component before qkvz. Independently remove **22.920
+  near-tie. The exact-c2 harness now carries explicit merged/split contracts,
+  runs both paired arms under one lock and passes 68/68 local tool tests. Execute
+  and finalize it from the pushed SHA, then close rounding parity and the c2/c16
+  component before qkvz. Independently remove **22.920
   GiB** host-weight mirror and overlapping source pages. No 35B performance
   command runs before all 27B axes pass.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct

@@ -18,8 +18,10 @@ OpenAI-compatible server.
 > GEMM pass the clean pushed-SHA merged/split 27B gates **235/235 + 16/16**,
 > packed-view CUDA replay/memcheck, and native-35B inertness. An upstream-dtype
 > BF16-output experiment instead reproduced the rejected emulation stream
-> (**233/235**), so exact rounding parity, the 145-vs-193 trace, and component
-> performance remain open; no speed credit exists yet. Host memory also retains
+> (**233/235**). The fail-closed trace harness now has explicit merged/split
+> contracts and a one-lock dual-arm finalizer, with all 68 tooling tests green;
+> pushed-SHA execution, exact rounding, and component performance remain open,
+> so no speed credit exists yet. Host memory also retains
 > a **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
@@ -28,7 +30,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; pushed `581d335` closes BA W1 core correctness/safety with F32 output, but exact structure/performance and BF16-output parity are pending | Trace and component-gate merged BA, resolve its output rounding, then claim merged qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; pushed `581d335` closes BA W1 core correctness/safety, and the explicit 145/193-node trace harness is locally green but not yet executed from its pushed SHA | Run/finalize the merged/split trace, resolve BF16 rounding, then component-gate BA before claiming qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -56,7 +58,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes the merged-owner, split rollback, F32/BF16 strided-consumer, 27B/native-35B, and strict-safety gates. BF16 output failed the near-tie gate; exact trace/component evidence is pending and qkvz remains excluded |
+| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes core correctness/safety. The mode-aware c2 harness keeps historical evidence on its 1,011-node contract, explicitly gates merged **963 / 145 BF16** versus split **1,011 / 193 BF16**, and runs both paired arms under one lock; immutable execution and the c2/c16 component remain pending |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 

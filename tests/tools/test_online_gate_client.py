@@ -39,8 +39,11 @@ from tools.bench.online_gate import (
     PANDAS_VERSION,
     TRACE_CONCURRENCY,
     TRACE_CAPTURE_GRAPH_REPLAYS,
+    TRACE_GDN_BA_ENV,
+    TRACE_GDN_BA_MODES,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH,
+    TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE,
     TRACE_PROMPTS,
     TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
@@ -59,6 +62,7 @@ from tools.bench.online_gate import (
     record_profile_control,
     record_trace_status,
     summarize_nsys_kernels,
+    trace_primary_graph_contract,
     validate_nsys_trace,
     validate_plan,
     validate_raw_result,
@@ -104,6 +108,7 @@ def write_nsys_sqlite(
     capture_uuid: str | None = None,
     report_path: pathlib.Path | None = None,
     family_drift: bool = False,
+    gdn_ba_mode: str | None = None,
     lost_events: bool = False,
     model_contract: bool = False,
     model_batch: int = TRACE_CONCURRENCY,
@@ -209,7 +214,9 @@ def write_nsys_sqlite(
             ),
         )
         if model_contract:
-            contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH[("27", model_batch)]
+            contract = trace_primary_graph_contract(
+                "27", model_batch, gdn_ba_mode=gdn_ba_mode
+            )
             node_names = []
             for family, (pattern, count) in contract["families"].items():
                 if family_drift and family == "normal_fp4_producer":
@@ -755,6 +762,14 @@ class OnlineClientContractTests(unittest.TestCase):
             ["--model", "27", "--snapshot", "<27_MODEL_SNAPSHOT>"],
         )
         self.assertNotIn("<27|35>", plan["planned_commands"]["trace_model"])
+        self.assertEqual(
+            plan["planned_commands"]["trace_gdn_ba"][-4:],
+            ["--trace-concurrency", "2", "--gdn-ba-mode", "both"],
+        )
+        self.assertIn(
+            "trace/27/{gdn-ba-summary,gdn-ba-manifest,status-gdn-ba}.json",
+            plan["required_artifacts"],
+        )
         corpus_command = plan["planned_commands"]["corpus"]
         self.assertEqual(
             corpus_command[:3],
@@ -1024,12 +1039,33 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn("for _ in $(seq 1 60); do", script)
         self.assertIn("((capture_closed == 1))", script)
         self.assertIn('kill -0 "${server_pid}" 2>/dev/null || break', script)
-        probe_index = script.index('--artifact-tag "trace${trace_rep}-probe"')
+        probe_index = script.index(
+            '--artifact-tag "${artifact_prefix}trace${trace_rep}-probe"'
+        )
         wait_index = script.index("local capture_closed=0", probe_index)
         shutdown_index = script.index("printf 'Q'", wait_index)
         self.assertLess(probe_index, wait_index)
         self.assertLess(wait_index, shutdown_index)
         self.assertIn("--trace-only", script)
+
+    def test_trace_driver_records_gdn_ba_arms_under_one_lock(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[--gdn-ba-mode both]", script)
+        self.assertIn('trace_env+=("VT_GDN_MERGED_BA=${gdn_ba_env_value}")', script)
+        self.assertIn('gdn_ba_validation_args=(--gdn-ba-mode "${trace_arm}")', script)
+        lock_index = script.index("flock 9")
+        merged_index = script.index("run_paired_traces merged", lock_index)
+        split_index = script.index("run_paired_traces split", merged_index)
+        self.assertLess(lock_index, merged_index)
+        self.assertLess(merged_index, split_index)
+        self.assertEqual(script.count("flock 9"), 1)
+        self.assertIn(
+            "model ${model} GDN BA merged/split node-level paired traces complete",
+            script,
+        )
 
     def test_trace_driver_keeps_c2_staging_non_binding(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
@@ -1098,6 +1134,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 model_key="27",
                 expected_batch=2,
             )
+            self.assertNotIn("gdn_ba_mode", result)
             self.assertEqual(result["graph_child_rows"]["kernel"], 1_011)
             self.assertEqual(result["primary_graph_node_count"], 1_011)
             self.assertEqual(
@@ -1117,6 +1154,59 @@ class OnlineClientContractTests(unittest.TestCase):
                     model_key="27",
                     expected_batch=4,
                 )
+
+            self.assertEqual(TRACE_GDN_BA_MODES, ("merged", "split"))
+            self.assertEqual(TRACE_GDN_BA_ENV, {"merged": "1", "split": "0"})
+            self.assertEqual(
+                TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE[
+                    ("27", 2, "merged")
+                ]["node_count"],
+                963,
+            )
+            for mode, expected_nodes, expected_bf16 in (
+                ("merged", 963, 145),
+                ("split", 1_011, 193),
+            ):
+                mode_trace = root / f"gdn-ba-{mode}.sqlite"
+                write_nsys_sqlite(
+                    mode_trace,
+                    lost_events=True,
+                    model_contract=True,
+                    model_batch=2,
+                    gdn_ba_mode=mode,
+                )
+                mode_result = validate_nsys_trace(
+                    mode_trace,
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_ba_mode=mode,
+                )
+                self.assertEqual(mode_result["gdn_ba_mode"], mode)
+                self.assertEqual(mode_result["primary_graph_node_count"], expected_nodes)
+                self.assertEqual(
+                    mode_result["primary_graph_family_node_counts"]["bf16_gemm"],
+                    expected_bf16,
+                )
+                mode_summary = summarize_nsys_kernels(
+                    mode_trace,
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_ba_mode=mode,
+                )
+                self.assertEqual(mode_summary["gdn_ba_mode"], mode)
+                self.assertEqual(mode_summary["kernel_count"], expected_nodes)
+
+            with self.assertRaisesRegex(HarnessError, "model contract"):
+                validate_nsys_trace(
+                    root / "gdn-ba-split.sqlite",
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_ba_mode="merged",
+                )
+            with self.assertRaisesRegex(HarnessError, "requires an exact model"):
+                validate_nsys_trace(clean, gdn_ba_mode="merged")
+            with self.assertRaisesRegex(HarnessError, "unknown GDN BA"):
+                trace_primary_graph_contract("27", 2, gdn_ba_mode="unknown")
 
             unreconciled = root / "unreconciled.sqlite"
             write_nsys_sqlite(

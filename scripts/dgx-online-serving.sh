@@ -15,7 +15,7 @@ usage:
   dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
   dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N] \
-    [--trace-concurrency 2|16]
+    [--trace-concurrency 2|16] [--gdn-ba-mode both]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
 EOF
@@ -36,6 +36,7 @@ num_blocks=4736
 max_num_seqs=32
 max_num_batched_tokens=""
 trace_concurrency=16
+gdn_ba_mode=""
 
 while (($#)); do
   case "$1" in
@@ -56,6 +57,7 @@ while (($#)); do
     --port) port=${2:?}; shift 2 ;;
     --num-blocks) num_blocks=${2:?}; shift 2 ;;
     --trace-concurrency) trace_concurrency=${2:?}; shift 2 ;;
+    --gdn-ba-mode) gdn_ba_mode=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -67,6 +69,11 @@ export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ -z ${vllm_cpp_sha} ]]; then
   vllm_cpp_sha=$(git -C "${repo_root}" rev-parse HEAD)
+fi
+if [[ -n ${gdn_ba_mode} &&
+      ( ${mode} != trace-only || ${gdn_ba_mode} != both ) ]]; then
+  echo "--gdn-ba-mode currently accepts only 'both' with --trace-only" >&2
+  exit 2
 fi
 
 if [[ ${mode} == dry-run ]]; then
@@ -121,6 +128,11 @@ if [[ ${mode} == trace-only && ${model} != 27 ]]; then
 fi
 if [[ ${mode} == trace-only && ${trace_concurrency} != 2 && ${trace_concurrency} != 16 ]]; then
   echo "--trace-concurrency must be 2 or 16" >&2
+  exit 2
+fi
+if [[ -n ${gdn_ba_mode} &&
+      ( ${model} != 27 || ${trace_concurrency} != 2 ) ]]; then
+  echo "--gdn-ba-mode both is defined only for the 27B c2 trace-only gate" >&2
   exit 2
 fi
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
@@ -397,7 +409,27 @@ run_leg() {
 }
 
 run_paired_traces() {
+  local trace_arm=${1:-}
   local trace_dir="${evidence}/trace/${model}"
+  local artifact_prefix=""
+  local gdn_ba_env_value=""
+  case "${trace_arm}" in
+    "") ;;
+    merged)
+      trace_dir="${evidence}/trace/${model}/gdn-ba-merged"
+      artifact_prefix="gdn-ba-merged-"
+      gdn_ba_env_value=1
+      ;;
+    split)
+      trace_dir="${evidence}/trace/${model}/gdn-ba-split"
+      artifact_prefix="gdn-ba-split-"
+      gdn_ba_env_value=0
+      ;;
+    *)
+      echo "unknown internal GDN BA trace arm: ${trace_arm}" >&2
+      return 2
+      ;;
+  esac
   local trace_prompts=48
   if [[ ${trace_concurrency} == 2 ]]; then
     trace_prompts=6
@@ -472,8 +504,7 @@ run_paired_traces() {
       --benchmark-shutdown-fifo "${shutdown_fifo}"
       --served-model-name gate
     )
-    local -a profile_cmd=(
-      env
+    local -a trace_env=(
       "VT_FP4_AUTOTUNE=${VT_FP4_AUTOTUNE}"
       "VT_FP4_AUTOTUNE_CACHE_PATH=${VT_FP4_AUTOTUNE_CACHE_PATH}"
       "VT_FP4_AUTOTUNE_CACHE_READONLY=${VT_FP4_AUTOTUNE_CACHE_READONLY}"
@@ -483,6 +514,13 @@ run_paired_traces() {
       "VT_FP4_PERSISTENT_CACHE=${VT_FP4_PERSISTENT_CACHE}"
       "VT_FP4_PLAN_CACHE=${VT_FP4_PLAN_CACHE}"
       "VT_FP4_PRE_SERVE_WARMUP=${VT_FP4_PRE_SERVE_WARMUP}"
+    )
+    if [[ -n ${trace_arm} ]]; then
+      trace_env+=("VT_GDN_MERGED_BA=${gdn_ba_env_value}")
+    fi
+    local -a profile_cmd=(
+      env
+      "${trace_env[@]}"
       nsys profile
       --trace=cuda
       --capture-range=cudaProfilerApi
@@ -561,7 +599,7 @@ run_paired_traces() {
       --concurrency "${trace_concurrency}" \
       --repetition 1 \
       --num-prompts "${trace_prompts}" \
-      --artifact-tag "trace${trace_rep}"
+      --artifact-tag "${artifact_prefix}trace${trace_rep}"
     [[ ! -e ${VT_FP4_AUTOTUNE_CACHE_PATH} ]] || {
       echo "forbidden native plan target was created before capture" >&2
       return 1
@@ -578,7 +616,7 @@ run_paired_traces() {
       --repetition 1 \
       --num-prompts "${trace_concurrency}" \
       --num-warmups 0 \
-      --artifact-tag "trace${trace_rep}-probe"
+      --artifact-tag "${artifact_prefix}trace${trace_rep}-probe"
     local capture_closed=0
     for _ in $(seq 1 60); do
       if grep -q '^\[VT_CUDA_PROFILE\] stopped captured_replays=4 graph=0x[0-9a-f][0-9a-f]*$' "${ours_log}"; then
@@ -662,17 +700,23 @@ run_paired_traces() {
         echo "ours Nsight SQLite export is empty for range ${range_index}" >&2
         return 1
       }
+      local -a gdn_ba_validation_args=()
+      if [[ -n ${trace_arm} ]]; then
+        gdn_ba_validation_args=(--gdn-ba-mode "${trace_arm}")
+      fi
       python3 "${repo_root}/tools/bench/online_gate.py" validate-nsys-trace \
         --sqlite "${ours_sqlite}" \
         --model-key "${model}" \
         --range-index "${range_index}" \
         --expected-batch "${trace_concurrency}" \
+        "${gdn_ba_validation_args[@]}" \
         --output "${ours_validation}"
       python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
         --sqlite "${ours_sqlite}" \
         --model-key "${model}" \
         --range-index "${range_index}" \
         --expected-batch "${trace_concurrency}" \
+        "${gdn_ba_validation_args[@]}" \
         --output "${ours_summary}"
       ours_reps+=("${ours_rep}")
       ours_sqlites+=("${ours_sqlite}")
@@ -764,7 +808,11 @@ PY
   gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }
   drop_caches "${cache_after_vllm}"
   if [[ ${trace_concurrency} == 2 ]]; then
-    echo "c2 raw paired trace capture complete; status remains PENDING until low-batch finalization" >&2
+    if [[ -n ${trace_arm} ]]; then
+      echo "c2 GDN BA ${trace_arm} raw paired trace capture complete; status remains PENDING until GDN BA finalization" >&2
+    else
+      echo "c2 raw paired trace capture complete; status remains PENDING until low-batch finalization" >&2
+    fi
     return 0
   fi
   python3 "${repo_root}/tools/bench/online_gate.py" record-trace-status \
@@ -798,8 +846,14 @@ python3 "${repo_root}/tools/bench/online_gate.py" record-model-gate \
   --vllm-cpp-sha "${vllm_cpp_sha}"
 
 if [[ ${mode} == trace-only ]]; then
-  run_paired_traces
-  echo "model ${model} node-level paired trace complete" >&2
+  if [[ ${gdn_ba_mode} == both ]]; then
+    run_paired_traces merged
+    run_paired_traces split
+    echo "model ${model} GDN BA merged/split node-level paired traces complete" >&2
+  else
+    run_paired_traces
+    echo "model ${model} node-level paired trace complete" >&2
+  fi
   exit 0
 fi
 

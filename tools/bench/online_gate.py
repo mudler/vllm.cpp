@@ -82,21 +82,24 @@ TRACE_REQUIRED_ENV = {
     "VT_FP4_PLAN_CACHE": "1",
     "VT_FP4_PRE_SERVE_WARMUP": "1",
 }
+TRACE_GDN_BA_MODES = ("merged", "split")
+TRACE_GDN_BA_ENV = {"merged": "1", "split": "0"}
+_TRACE_27_COMMON_FAMILIES = {
+    "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
+    "fa2_main": ("flash_fwd_splitkv_kernel", 16),
+    "fp4_gemm": (
+        "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal",
+        208,
+    ),
+    "fused_fp4_producer": ("SiluAndMulFp4QuantKernel", 64),
+    "gdn_recurrence": ("GdnDecodeFusedKernel", 48),
+    "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
+}
 TRACE_PRIMARY_GRAPH_CONTRACTS = {
     "27": {
         "graph_child_nodes": {"kernel": 1_107, "memcpy": 7, "memset": 1},
         "node_count": 1_107,
-        "families": {
-            "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
-            "fa2_main": ("flash_fwd_splitkv_kernel", 16),
-            "fp4_gemm": (
-                "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal",
-                208,
-            ),
-            "fused_fp4_producer": ("SiluAndMulFp4QuantKernel", 64),
-            "gdn_recurrence": ("GdnDecodeFusedKernel", 48),
-            "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
-        },
+        "families": dict(_TRACE_27_COMMON_FAMILIES),
     }
 }
 TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH = {
@@ -104,16 +107,24 @@ TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH = {
     ("27", 2): {
         "graph_child_nodes": {"kernel": 1_011, "memcpy": 7, "memset": 1},
         "node_count": 1_011,
+        "families": dict(_TRACE_27_COMMON_FAMILIES),
+    },
+}
+TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE = {
+    ("27", 2, "merged"): {
+        "graph_child_nodes": {"kernel": 963, "memcpy": 7, "memset": 1},
+        "node_count": 963,
         "families": {
-            "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
-            "fa2_main": ("flash_fwd_splitkv_kernel", 16),
-            "fp4_gemm": (
-                "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal",
-                208,
-            ),
-            "fused_fp4_producer": ("SiluAndMulFp4QuantKernel", 64),
-            "gdn_recurrence": ("GdnDecodeFusedKernel", 48),
-            "normal_fp4_producer": ("ScaledFp4QuantKernel", 144),
+            **_TRACE_27_COMMON_FAMILIES,
+            "bf16_gemm": ("gemm_bf16", 145),
+        },
+    },
+    ("27", 2, "split"): {
+        "graph_child_nodes": {"kernel": 1_011, "memcpy": 7, "memset": 1},
+        "node_count": 1_011,
+        "families": {
+            **_TRACE_27_COMMON_FAMILIES,
+            "bf16_gemm": ("gemm_bf16", 193),
         },
     },
 }
@@ -210,6 +221,33 @@ def prompts_for(concurrency: int) -> int:
         return dict(POINTS)[concurrency]
     except KeyError as error:
         raise HarnessError(f"unsupported online-gate concurrency: {concurrency}") from error
+
+
+def trace_primary_graph_contract(
+    model_key: str,
+    expected_batch: int,
+    *,
+    gdn_ba_mode: str | None = None,
+) -> Mapping[str, Any]:
+    """Resolve an exact graph contract without reinterpreting old evidence."""
+
+    if gdn_ba_mode is None:
+        contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH.get(
+            (model_key, expected_batch)
+        )
+    else:
+        if gdn_ba_mode not in TRACE_GDN_BA_MODES:
+            raise HarnessError(f"unknown GDN BA trace mode: {gdn_ba_mode}")
+        contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE.get(
+            (model_key, expected_batch, gdn_ba_mode)
+        )
+    if contract is None:
+        suffix = f" in GDN BA mode {gdn_ba_mode}" if gdn_ba_mode else ""
+        raise HarnessError(
+            "no exact Nsight graph contract for "
+            f"model {model_key} at batch {expected_batch}{suffix}"
+        )
+    return contract
 
 
 @dataclasses.dataclass(frozen=True)
@@ -706,6 +744,26 @@ def build_plan(
     client: pathlib.Path,
 ) -> dict[str, Any]:
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
+    trace_model_command = [
+        "scripts/dgx-online-serving.sh",
+        "--trace-only",
+        "--model",
+        "27",
+        "--snapshot",
+        "<27_MODEL_SNAPSHOT>",
+        "--source-corpus",
+        "<EVIDENCE>/corpus/27",
+        "--evidence",
+        "<EVIDENCE>",
+        "--build-dir",
+        "<H1D_TRACE_BUILD>",
+        "--configure-log",
+        "<H1D_TRACE_CONFIGURE_LOG>",
+        "--client",
+        str(client),
+        "--vllm-cpp-sha",
+        vllm_cpp_sha,
+    ]
     return {
         "artifact_root": str(claim_root / "evidence" / vllm_cpp_sha),
         "client": str(client),
@@ -764,25 +822,13 @@ def build_plan(
             "execute_model": [
                 "BLOCKED_UNTIL_H1D_G4_AND_SEPARATE_PRODUCTION_TRACE_BUILDS"
             ],
-            "trace_model": [
-                "scripts/dgx-online-serving.sh",
-                "--trace-only",
-                "--model",
-                "27",
-                "--snapshot",
-                "<27_MODEL_SNAPSHOT>",
-                "--source-corpus",
-                "<EVIDENCE>/corpus/27",
-                "--evidence",
-                "<EVIDENCE>",
-                "--build-dir",
-                "<H1D_TRACE_BUILD>",
-                "--configure-log",
-                "<H1D_TRACE_CONFIGURE_LOG>",
-                "--client",
-                str(client),
-                "--vllm-cpp-sha",
-                vllm_cpp_sha,
+            "trace_model": trace_model_command,
+            "trace_gdn_ba": [
+                *trace_model_command,
+                "--trace-concurrency",
+                "2",
+                "--gdn-ba-mode",
+                "both",
             ],
         },
         "required_artifacts": [
@@ -810,6 +856,9 @@ def build_plan(
             "trace/<model>/vllm-kernels.json",
             "trace/<model>/cache-{before-ours,between-engines,after-vllm}.json",
             "trace/<model>/status.json",
+            "trace/27/gdn-ba-{merged,split}/ours-r{1,2,3}.{1,2,3,4}.nsys-rep",
+            "trace/27/gdn-ba-{merged,split}/vllm-profile/*.pt.trace.json.gz",
+            "trace/27/{gdn-ba-summary,gdn-ba-manifest,status-gdn-ba}.json",
             "summary-<model>/{all-runs,ratios}.json",
             "summary/{all-runs,ratios}.json",
         ],
@@ -957,6 +1006,7 @@ def validate_nsys_trace(
     model_key: str | None = None,
     range_index: int = 1,
     expected_batch: int = TRACE_CONCURRENCY,
+    gdn_ba_mode: str | None = None,
 ) -> dict[str, Any]:
     """Validate one bounded H1d range report by direct runtime correlation."""
 
@@ -1462,18 +1512,17 @@ def validate_nsys_trace(
             )
 
         primary_family_counts: dict[str, int] = {}
+        if gdn_ba_mode is not None and model_key is None:
+            raise HarnessError("GDN BA trace mode requires an exact model contract")
         contract = (
-            TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH.get(
-                (model_key, expected_batch)
+            trace_primary_graph_contract(
+                model_key,
+                expected_batch,
+                gdn_ba_mode=gdn_ba_mode,
             )
             if model_key
             else None
         )
-        if model_key and contract is None:
-            raise HarnessError(
-                "no exact Nsight graph contract for "
-                f"model {model_key} at batch {expected_batch}"
-            )
         if contract is not None:
             expected_counts = contract["graph_child_nodes"]
             if per_launch_counts[0] != expected_counts:
@@ -1554,7 +1603,7 @@ def validate_nsys_trace(
     finally:
         connection.close()
 
-    return {
+    result = {
         "allowed_diagnostics": diagnostics,
         "capture_boundary_diagnostic": capture_boundary_diagnostic,
         "capture_session_uuid": capture_uuid,
@@ -1591,6 +1640,9 @@ def validate_nsys_trace(
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": sha256_file(sqlite_path),
     }
+    if gdn_ba_mode is not None:
+        result["gdn_ba_mode"] = gdn_ba_mode
+    return result
 
 
 def summarize_nsys_kernels(
@@ -1599,19 +1651,24 @@ def summarize_nsys_kernels(
     model_key: str,
     range_index: int = 1,
     expected_batch: int = TRACE_CONCURRENCY,
+    gdn_ba_mode: str | None = None,
 ) -> dict[str, Any]:
     validation = validate_nsys_trace(
         sqlite_path,
         model_key=model_key,
         range_index=range_index,
         expected_batch=expected_batch,
+        gdn_ba_mode=gdn_ba_mode,
     )
-    return {
+    result = {
         **validation["kernel_summary"],
         "range_index": range_index,
         "sqlite_path": str(sqlite_path),
         "sqlite_sha256": validation["sqlite_sha256"],
     }
+    if gdn_ba_mode is not None:
+        result["gdn_ba_mode"] = gdn_ba_mode
+    return result
 
 
 def _parse_client_command_log(
@@ -2302,6 +2359,7 @@ def record_trace_status(
     vllm_cpp_sha: str,
     expected_batch: int = TRACE_CONCURRENCY,
     trace_prompts: int = TRACE_PROMPTS,
+    gdn_ba_mode: str | None = None,
     write_output: bool = True,
 ) -> dict[str, Any]:
     """Hash the mandatory paired execution-trace artifacts.
@@ -2322,6 +2380,11 @@ def record_trace_status(
         raise HarnessError(f"refusing to overwrite trace status: {output}")
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
+    trace_primary_graph_contract(
+        model_key,
+        expected_batch,
+        gdn_ba_mode=gdn_ba_mode,
+    )
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
     trace_execution = _validated_trace_execution(
         execution_manifest, model_key=model_key, vllm_cpp_sha=vllm_cpp_sha
@@ -2394,6 +2457,8 @@ def record_trace_status(
             "VT_FP4_AUTOTUNE_CACHE_PATH",
             "VT_FP4_FLASHINFER_CACHE_PATH",
         }
+        if gdn_ba_mode is not None:
+            expected_environment_names.add("VT_GDN_MERGED_BA")
         if (
             len(set(environment_names)) != len(environment_names)
             or set(environment_names) != expected_environment_names
@@ -2406,6 +2471,14 @@ def record_trace_status(
         for name, expected in TRACE_REQUIRED_ENV.items():
             if environment.get(name) != expected:
                 raise HarnessError(f"ours trace environment {name} differs from H1d")
+        if (
+            gdn_ba_mode is not None
+            and environment.get("VT_GDN_MERGED_BA")
+            != TRACE_GDN_BA_ENV[gdn_ba_mode]
+        ):
+            raise HarnessError(
+                "ours trace GDN BA environment differs from its declared mode"
+            )
         for name in ("VT_FP4_FLASHINFER_CACHE_PATH", "VT_FP4_AUTOTUNE_CACHE_PATH"):
             if name not in environment:
                 raise HarnessError(f"ours trace environment omits {name}")
@@ -2720,6 +2793,7 @@ def record_trace_status(
             model_key=model_key,
             range_index=range_index,
             expected_batch=expected_batch,
+            gdn_ba_mode=gdn_ba_mode,
         )
         if pathlib.Path(validation["nsys_report_path"]).resolve() != report_path.resolve():
             raise HarnessError("Nsight SQLite source report differs from its indexed artifact")
@@ -2733,6 +2807,7 @@ def record_trace_status(
             model_key=model_key,
             range_index=range_index,
             expected_batch=expected_batch,
+            gdn_ba_mode=gdn_ba_mode,
         )
         if _load_json_object(summary_path) != summary:
             raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
@@ -2879,6 +2954,11 @@ def record_trace_status(
         "vllm_cpp_sha": vllm_cpp_sha,
         "vllm_profiler": "torch-profiler",
     }
+    if gdn_ba_mode is not None:
+        result["trace_contract"]["gdn_ba_mode"] = gdn_ba_mode
+        result["trace_contract"]["gdn_ba_env"] = {
+            "VT_GDN_MERGED_BA": TRACE_GDN_BA_ENV[gdn_ba_mode]
+        }
     if write_output:
         write_json_atomic(output, result)
     return result
@@ -3408,6 +3488,7 @@ def _parser() -> argparse.ArgumentParser:
     validate_nsys.add_argument(
         "--expected-batch", type=int, default=TRACE_CONCURRENCY
     )
+    validate_nsys.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
     validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     summarize_nsys = commands.add_parser("summarize-nsys-kernels")
@@ -3424,6 +3505,7 @@ def _parser() -> argparse.ArgumentParser:
     summarize_nsys.add_argument(
         "--expected-batch", type=int, default=TRACE_CONCURRENCY
     )
+    summarize_nsys.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
     summarize_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     profile_control = commands.add_parser("record-profile-control")
@@ -3486,6 +3568,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     trace.add_argument("--execution-manifest", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-cpp-sha", required=True)
+    trace.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
 
     oracle = commands.add_parser("record-oracle")
     oracle.add_argument("--output", type=pathlib.Path, required=True)
@@ -3577,6 +3660,7 @@ def main() -> int:
             model_key=args.model_key,
             range_index=args.range_index,
             expected_batch=args.expected_batch,
+            gdn_ba_mode=args.gdn_ba_mode,
         )
         write_json_atomic(args.output, result)
     elif args.command == "summarize-nsys-kernels":
@@ -3587,6 +3671,7 @@ def main() -> int:
             model_key=args.model_key,
             range_index=args.range_index,
             expected_batch=args.expected_batch,
+            gdn_ba_mode=args.gdn_ba_mode,
         )
         write_json_atomic(args.output, result)
     elif args.command == "record-profile-control":
@@ -3633,6 +3718,7 @@ def main() -> int:
             cache_drop_reports=args.cache_drop_report,
             execution_manifest=args.execution_manifest,
             vllm_cpp_sha=args.vllm_cpp_sha,
+            gdn_ba_mode=args.gdn_ba_mode,
         )
     elif args.command == "record-oracle":
         result = record_oracle_manifest(args.output, client=args.client)

@@ -26,8 +26,10 @@ GEMMs. The accepted
 `KERNEL-GEMM-BF16` W1 `GATING`. Its one-owner F32-output BA merge passes
 clean pushed `581d335` core model/safety gates, but the BF16-output arm fails the
 known near-tie. Exact 145-vs-193 structure plus c2/c16 performance remain
-pending. qkvz is still excluded. No cross-profiler duration or launch
-reduction earns speed credit by itself.
+pending. Their explicit mode-aware validator/driver/finalizer is locally green
+at 68/68 tool tests and preserves the historical no-mode contract; pushed-SHA
+GPU execution is next. qkvz is still excluded. No cross-profiler duration or
+launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -104,7 +106,7 @@ can be re-aggregated; it cannot satisfy attribution.
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
-| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16/48 or c2/6 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py`. The trace-build-only server/controller accepts an exact graph batch; production builds do not |
+| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16/48 or c2/6 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py`. `--gdn-ba-mode both` runs explicit `VT_GDN_MERGED_BA=1/0` paired arms inside one outer lock; `finalize_gdn_ba_trace.py` revalidates both and writes the structural marker last. The trace-build-only server/controller accepts an exact graph batch; production builds do not |
 
 ## Tests to port
 
@@ -128,6 +130,11 @@ can be re-aggregated; it cannot satisfy attribution.
   graph children, while 27B/c2 requires **1,011+7+1** and the same 208 FP4,
   144 normal producer, 64 fused producer, 48 GDN recurrence and 16+16 FA2
   family counts. Synthetic loss/reconciliation tests cover both contracts.
+- GDN BA contracts add an explicit mode key without changing the historical
+  `(27,2)` meaning: merged requires **963 kernels / 145 BF16 GEMMs**, split
+  **1,011 / 193**, unchanged 7 memcpy + 1 memset and all non-BF16 families.
+  Driver/finalizer tests prove one-lock ordering, exact toggle provenance,
+  a 48-BF16-only delta, completion-marker-last and overwrite refusal.
 - The profiler test drives a fake engine through closed-loop replacement
   admission and proves the resident request count never exceeds c16. Client and
   summary cases reject missing cache-off flags or drifted cache/admission/
@@ -173,7 +180,9 @@ fail attribution. A c2 capture is not accepted merely because all raw profilers
 exit zero: its three local sessions, twelve exact batch-2 graph ranges, fresh
 oracle trace, ordered topology, plan map, lifecycle, hashes and final status
 must all reconcile. Finalized c2 evidence must carry `complete-diagnostic` or a
-stronger explicitly defined state before it can select a spike. Each
+stronger explicitly defined state before it can select a spike. The GDN BA
+dual-arm extension requires `complete-structural` after both independent paired
+chains revalidate and the exact 48-BF16-only delta closes. Each
 model/point has
 at least three valid repetitions and a fresh pinned-vLLM denominator. The
 commit-bound model gate is the correctness precondition before performance is
@@ -240,8 +249,9 @@ reported as a clean dependency check.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
    core correctness/safety; BF16 rounding remains open.
-6. Extend exact-c2 contracts for default/split, close 145-vs-193 structure,
-   BF16 rounding and c2/c16 component disposition; only then claim qkvz. Host-weight ownership
+6. The exact-c2 mode-aware harness is implemented and CPU-gated. Run/finalize
+   its pushed SHA to close 145-vs-193 structure, then close BF16 rounding and
+   c2/c16 component disposition; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.

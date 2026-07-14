@@ -8267,3 +8267,26 @@ component remain open, so binding `3f256ab` stays **55/124** and no speed credit
 exists. Inspection identifies the next harness leaf: exact-c2 validation still
 binds the 1,011-node before-state and the driver lacks an explicit split arm.
 Extend those fail-closed contracts before any W1 trace; qkvz remains prohibited.
+
+## 2026-07-14 — merged GDN BA exact-c2 harness implemented
+
+The serving harness now keeps the historical `(27,2)` no-mode contract fixed at
+1,011 kernels while adding explicit `merged` and `split` modes. They require
+**963 kernels / 145 BF16 GEMMs** and **1,011 / 193** respectively, with the
+same 7 memcpy, 1 memset and non-BF16 family counts. The recorded Nsight command
+must carry `VT_GDN_MERGED_BA=1/0`; a wrong or omitted declared mode fails.
+
+`scripts/dgx-online-serving.sh --trace-concurrency 2 --gdn-ba-mode both` runs
+complete merged and split local/vLLM pairs sequentially inside one outer GPU
+lock, using disjoint raw paths. `finalize_gdn_ba_trace.py` revalidates all 24
+local range reports, both fresh oracle chains, controls, plan maps, semantic
+clients, cache drops and source/build provenance, then accepts only an exact
+48-BF16-only graph delta and writes `complete-structural` last. That state is
+diagnostic and deliberately grants no throughput credit.
+
+Shell syntax and ShellCheck pass; Python compilation passes; the focused
+structural suite is **6/6** and the complete tools suite is **68/68**. No GPU
+or performance command ran, so binding `3f256ab` remains **55/124**. Next:
+commit/push this harness checkpoint, create its clean exact DGX trace build,
+run/finalize both arms under the driver's one lock, then close BF16 rounding
+and the c2/c16 component before qkvz.

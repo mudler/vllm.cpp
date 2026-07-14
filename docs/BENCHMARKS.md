@@ -3,8 +3,10 @@
 This is the public current-state scoreboard for vllm.cpp. It contains the
 binding result, the active performance diagnosis, pending gates, and current
 reproduction entry points. Attempt chronology and failure forensics live in the
-[append-only parity ledger](../.agents/parity-ledger.md),
-[state log](../.agents/state.md), linked specs, and Git.
+[parity ledger](../.agents/parity-ledger.md),
+[state log](../.agents/state.md), linked specs, and Git. Those raw records are
+append-only within the current era and are frozen under `.agents/completed/`
+when the era is rolled up; this page never accumulates their run-by-run history.
 
 Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
 **FAILED / open at 55/124 axes**. The active implementation leaf is now exact:

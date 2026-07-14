@@ -198,14 +198,16 @@ The canonical project record lives under [`.agents/`](.agents/), indexed by
   [quantization](.agents/quantization-matrix.md),
   [kernel](.agents/kernel-matrix.md), and
   [backend](.agents/backend-matrix.md) matrices
-- [append-only parity ledger](.agents/parity-ledger.md) and
-  [state log](.agents/state.md) for detailed chronology and evidence
+- [parity ledger](.agents/parity-ledger.md) and
+  [state log](.agents/state.md) for the current record era's detailed
+  chronology and evidence
 - [upstream sync protocol](.agents/upstream-sync.md) and
   [v0.25.0 audit](.agents/sync/2026-07-12-702f481.md)
 
 The README, benchmark scoreboard, roadmap, matrices, and live specs are compact
-current-state surfaces, not chronological logs. Git history plus the
-append-only parity ledger and state log retain detailed attempt evidence.
+current-state surfaces, not chronological logs. Detailed state/ledger records
+are append-only within an open era, then frozen under `.agents/completed/` and
+replaced by a concise carry-forward when that era closes.
 
 ## License
 

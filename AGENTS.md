@@ -56,16 +56,24 @@ to cite it for current work, the relevant content belongs (summarized) in a
 live doc. Rationale: a reader of `.agents/` should see exactly what bears on
 what we are doing NOW, nothing stale mixed in.
 
-**Periodic live-document compaction (user-directed 2026-07-13).** At every
+**Periodic live-document compaction (user-directed 2026-07-13, extended
+2026-07-14).** At every
 feature/iteration checkpoint, and whenever a live narrative accumulates more
 than one superseded attempt block, rewrite it to the current binding result,
 the constraints learned, the active lifecycle state, and the next gate. Do not
 copy run-by-run chronology into README, BENCHMARKS, roadmap, matrices, or live
 spec introductions. Closed narrative that still has reference value moves to
 `.agents/completed/`; otherwise Git plus the append-only `state.md` and
-`parity-ledger.md` are the historical record. Never rewrite or truncate those
-two append-only files. Compaction must preserve every current requirement and
-evidence anchor; it removes duplicated history, not auditability.
+`parity-ledger.md` are the historical record. Those two files are append-only
+**within the current record era**. At a roadmap-version boundary or the close
+of a long benchmark campaign, freeze them under `.agents/completed/` with
+era-stamped names, create new live files containing a concise carry-forward
+summary plus the still-active entries, and repair every live evidence link in
+the same change. Frozen records are immutable and never deleted. Do not defer
+this rollover once the raw history has become burdensome cold-session context;
+the point is to preserve auditability without making old attempts load-bearing.
+Compaction preserves every current requirement and evidence anchor; it removes
+duplicated context, not evidence.
 
 **Spec/scoping location.** All feature-specific implementation specs, scoping
 reports, semantics notes, feasibility studies, and design references live under

@@ -8290,3 +8290,18 @@ or performance command ran, so binding `3f256ab` remains **55/124**. Next:
 commit/push this harness checkpoint, create its clean exact DGX trace build,
 run/finalize both arms under the driver's one lock, then close BF16 rounding
 and the c2/c16 component before qkvz.
+
+## 2026-07-14 — long-history rollover is part of the record lifecycle
+
+The live-document compaction rule now covers the raw audit record without
+discarding it. README, BENCHMARKS, roadmap, matrices and live specs continue to
+replace superseded narratives at every checkpoint. `state.md` and
+`parity-ledger.md` remain append-only during an open record era, but a closed
+roadmap version or long benchmark campaign freezes them under
+`.agents/completed/`, seeds concise live carry-forward files, and repairs all
+current links atomically. Frozen evidence is immutable; it is no longer
+load-bearing cold-session context. Session orientation now searches the active
+row ID and newest state entries instead of reading either raw history from the
+beginning. This policy-only checkpoint changes no implementation, benchmark or
+lifecycle state: binding 27B remains **55/124**, and the pushed-SHA merged/split
+GDN BA trace remains the next GPU action.

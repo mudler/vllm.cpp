@@ -5,9 +5,12 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
-1. **Orient**: read `AGENTS.md` (index), [state.md](state.md), the top-level
-   [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row, and
-   [coordination.md](coordination.md).
+1. **Orient**: read `AGENTS.md` (index), the top-level
+   [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row,
+   [coordination.md](coordination.md), and only the current carry-forward plus
+   newest/relevant entries in [state.md](state.md). Search by stable row ID and
+   inspect the tail; do not load the append-only state or parity ledger from
+   beginning to end merely because it exists.
 2. **Claim one stable row ID**: add the sub-agent/worktree/branch and owned files
    to the coordination table before editing. One focused row or explicitly
    listed row block per PR; split oversized rows in the area matrix first.
@@ -66,7 +69,9 @@ and continue. Follow this protocol every session.
      accumulated superseded narratives to the binding result, exact present
      evidence/caveat, and next action. Detailed attempt history belongs only in
      append-only `state.md` / `parity-ledger.md`, Git, or an era-closed
-     `completed/` document; never rewrite old append-only entries;
+     `completed/` document. Never rewrite entries inside an open era; at a
+     roadmap/campaign boundary atomically freeze the raw files in `completed/`,
+     seed concise live carry-forward files, and repair all live links;
    - [state.md](state.md) entry appended (what landed, what's next);
    - commit + push to `main` (user-authorized, for now).
 

@@ -1,37 +1,18 @@
 # Benchmarks
 
-This is the public, current-state benchmark scoreboard for vllm.cpp. It keeps
-only binding results, current component dispositions, pending gates, and exact
-reproduction entry points. Detailed attempt history, artifact hashes, and
-failure forensics live in the [append-only parity ledger](../.agents/parity-ledger.md),
-[state log](../.agents/state.md), and linked feature specs.
+This is the public current-state scoreboard for vllm.cpp. It contains the
+binding result, the active performance diagnosis, pending gates, and current
+reproduction entry points. Attempt chronology and failure forensics live in the
+[append-only parity ledger](../.agents/parity-ledger.md),
+[state log](../.agents/state.md), linked specs, and Git.
 
-Last updated: **2026-07-14**. The binding 27B result remains immutable
-`3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-The post-W3-I scan is complete: the largest binding low-concurrency symptom is
-c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
-better TTFT. The accepted `3812d8` async-control root closes that hypothesis:
-ON/OFF median total throughput is **160.347697 / 160.003134 tok/s =
-1.002153×**. ON improves TPOT only **1.0%** and increases TTFT **16.0%**;
-shape-neutral ON/OFF traces total **170.820 / 170.478 s** of GPU-kernel time.
-It is neutral against the predeclared 1.04× minimum, so W3 remains an unmet
-parity obligation rather than a speed lever. The repaired `179a0fc` exact-c2
-raw capture is now complete under one uncontended lock: the model gate passes,
-all **12/12** local ranges are lossless and topology-identical at **1,011
-kernels + 7 memcpy + 1 memset**, and the fresh oracle trace has **1,522** exact
-B=2 windows at **1,160 kernels** plus two bounded B=1 drain windows. The B=2
-ordered-name hash remains `858915dd…fad0`; both engines use **128 Stream-K + 80
-static-persistent** FP4 GEMMs. Committed finalizer `fe28003` records
-`complete-diagnostic`; summary / manifest / status / artifact-set SHA values
-are `0ef6a124…0273` / `2556cfd0…2f21` / `9e0143fa…7b57` /
-`cc248ad2…823a`. It reports local/oracle median per-window kernel time
-**111.076528 / 105.520831 ms = 1.052650×**. That comparison is diagnostic only
-because it crosses Nsight and Torch profiler domains, so no speed credit or
-implementation binds. The structural result selects BF16-GEMM launch parity
-for the next whole-chain spike. Host PSS/RSS is
-independently traced to a persistent **22.920 GiB** CPU weight mirror plus
-source-page residency during load. W3-I remains default-off after its
-**30/48** component failure.
+Last updated: **2026-07-14**. Qwen3.6-27B parity against vLLM v0.25.0 is
+**FAILED / open at 55/124 axes**. The active implementation leaf is now exact:
+our 48 GDN layers issue four BF16 input projections each, while vLLM packs them
+into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
+[merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) is
+`READY`; implementation and performance remain **PENDING**, so no accepted
+number changes.
 
 ## Binding 27B online gate
 
@@ -47,9 +28,9 @@ source-page residency during load. W3-I remains default-off after its
 | Stability | Maximum total-throughput CV **0.189%** |
 | Disposition | **FAILED: 55/124 pass, 69/124 fail** |
 
-All ratios are direction-normalized: throughput is ours/vLLM, while latency
-ratios are vLLM/ours, so **1.0 or higher passes**. Values are medians of the
-three interleaved repetitions.
+Ratios are direction-normalized: throughput is ours/vLLM, latency is
+vLLM/ours, and **1.0 or higher passes**. Values are medians of three
+interleaved repetitions.
 
 | Concurrency | Axes passing | Total tok/s ours / vLLM (ratio) | Output tok/s ours / vLLM (ratio) | Mean TTFT | Mean TPOT / ITL | Mean E2EL |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -67,257 +48,117 @@ three interleaved repetitions.
 | Peak GPU memory | 38,561 MiB | 70,531 MiB | 1.829076× | PASS |
 | Peak `MemAvailable` drop | 65,901,992 KiB | 80,911,844 KiB | 1.227760× | PASS |
 
-Total throughput passes at c16/c32, but the project gate requires every total
-and output throughput, request-rate, TTFT, TPOT/ITL, E2EL, and memory axis to
-match or beat vLLM. The low-concurrency and host-memory gaps are therefore
-binding failures, not noise or “near parity.” No 35B performance command is
-authorized until all 124 27B axes pass.
+Total throughput passes at c16/c32, but every throughput, request-rate,
+TTFT, TPOT/ITL, E2EL, and memory axis must pass. At c2, ours has better TTFT
+but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). No 35B
+performance command is authorized until the 27B result reaches 124/124.
 
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; finalized `179a0fc` c2 evidence is diagnostic and does not supersede it | Spike/gate BF16-GEMM launch parity, then rerun the exact grid |
-| vLLM async-scheduler credit | **COMPLETE DIAGNOSTIC / NEUTRAL FOR SPEED** | Clean `3812d8`, six timing legs plus two shape-neutral traces under one lock. ON/OFF medians: total **160.347697 / 160.003134 tok/s = 1.002153×**, TPOT **106.642 / 107.740 ms** (ON ~1.0% better), TTFT **807.658 / 696.330 ms** (ON ~16.0% slower). Trace count/time: **1,798,044 / 170.819890 s** ON and **1,810,902 / 170.478267 s** OFF; tactic/batch mix changes, aggregate GPU time does not improve. Summary/manifest/artifact SHA `35b7344a…c323` / `e757b4ad…86c6` / `ead68397…8e56`; cleanup returned lock/GPU/port idle | Keep `ENG-ASYNC-SCHED` as later parity work; move the speed-critical path to low-batch kernel mapping |
-| Exact c2 executed path | **COMPLETE DIAGNOSTIC** | Root `~/work/vllm.cpp-executed-path-c2/179a0fc2…`: model gate pass; **12/12** lossless local B=2 ranges, invariant node multiset `44fcf31f…b93d`, 1,011 kernels/range; fresh oracle SHA `2b3bf412…785c`, **1,522×1,160** steady B=2 windows + two B=1 drains. Status `9e0143fa…7b57`; artifact set `cc248ad2…823a` | Whole-chain spike the +96-launch BF16-GEMM residual; do not treat cross-profiler timing as speed credit |
-| Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
-| W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
-| W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
-| Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
-| SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
-| External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
-| Stream-usage serialization | **PENDING / GATING** | CPU and sanitizer contracts pass; native 128-token counts are present in all binding requests | Run its serialization A/B after the model hot path closes |
-| Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
+| `KERNEL-GEMM-BF16` | **READY / PENDING IMPLEMENTATION** | Finalized `179a0fc` plus v0.25.0 source prove 193 local vs 97 oracle BF16 GEMMs: qkv+z+b+a versus qkvz+ba across 48 GDN layers | Implement/gate merged BA first; record its c2/c16 AB/BA/AB before qkvz |
+| RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
+| Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
+| Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
+| SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | No equivalent cache-on vllm.cpp/vLLM/SGLang campaign exists | After cache-off parity, gate equivalent vLLM v0.25.0 and SGLang v0.5.15; the faster reference binds each axis |
+| External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI and two-engine store/retrieve remain roadmap inventory | Spike fake-provider semantics, then gate LMCache MP before in-process mode |
 
-## Current diagnostic context
+Closed controls do not remain active leaves: async scheduling measured neutral
+for speed, and the prior fused-producer candidate remains default-off after its
+strict component failure. Their exact results and reproduction history remain
+in the append-only record rather than this live scoreboard.
 
-The accepted c16 execution baseline remains
-`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`
-(status `84d15970…6e66`). It shows ours already faster in aggregate GPU-kernel
-time at c16, so it cannot explain the c2 decode gap. The completed residual
-scan ranks the live evidence as follows:
-
-| Finding | Binding interpretation |
-|---|---|
-| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Complete ON/OFF timing gives only **+0.215%** total throughput, ~1.0% better TPOT and ~16.0% worse TTFT; ON has **0.200% more** aggregate traced GPU time. It cannot close the 6.1% gap and leaves the speed-critical path |
-| BF16 CUTLASS GEMMs | Complete raw c2 map: local has **193 calls / 51.662672 ms median** versus oracle **97 / 48.798042 ms**, a diagnostic **+2.864630 ms** and 96-launch structural residual. Source-chain inspection and a committed spike are still required before implementation |
-| RMSNorm/generated partitions | Finalized c2 map: both sides have **177 calls**; local median is **2.249728 ms** versus oracle **0.439491 ms**, a diagnostic **+1.810237 ms**. Cross-profiler timing is non-binding; whole-chain source verification remains required after the larger BF16-GEMM launch residual |
-| FP4 GEMM tactics | Both sides execute **208 calls = 128 Stream-K + 80 static-persistent**. Local/oracle diagnostic medians are **52.508720 / 52.734326 ms**; this family is not the present positive residual |
-| Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
-| Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
-
-W3-I's immutable component remains under
-`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2`.
-It completed 12/12 legs and 612/612 requests but failed **30/48** axes; summary
-SHA is `b7cfa029…7c17`. Full per-attempt forensics and prior component results
-remain in the [parity ledger](../.agents/parity-ledger.md),
-[state log](../.agents/state.md), and linked feature specs rather than this
-scoreboard.
-
-The trace output itself also records the mode's batch-shape sensitivity: all
-four async-ON digests match, async-OFF's four digests differ, and corresponding
-online ON/OFF generated-text arrays differ in all three pairs. Every request
-still completed exact 1,024→128 lengths with no errors. This is diagnostic
-evidence for the already inventoried default batch non-invariance, not a new
-correctness or support claim; the separate token-exact correctness gate remains
-the precondition for performance work.
-
-## Verify or reproduce the completed c2 executed-path capture
+## Evidence selecting merged GDN projections
 
 The immutable completed root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
-Its fail-closed finalizer wrote the status marker last and refuses overwrite.
-Verify the durable outputs with:
+Its status is `complete-diagnostic`.
+
+| Artifact | SHA-256 |
+|---|---|
+| c2 summary | `0ef6a1240d33c16410cd4e43b30ca8667a6d92e6eee8506d7bd03388fe010273` |
+| c2 manifest | `2556cfd032fae2201d9f8deb818343731b7dc99d9f8e6329da9b793262712f21` |
+| status | `9e0143fa1b9c74e218e486fedd0606850708619a0e859dafe94957e24a507b57` |
+| artifact set | `cc248ad2b5bf08f85b0d6b178de70682a104917e16c59c9adf34d661217f823a` |
+| fresh oracle trace | `2b3bf41269fd19ef65c5c3e06f067af73d7d997de3b6be17a2af785b6a86785c` |
+
+All **12/12** local B=2 graph ranges are invariant at 1,011 kernels + 7
+memcpy + 1 memset. The oracle contains **1,522** invariant steady B=2 windows
+at 1,160 kernels plus two bounded B=1 drains. Both engines execute the same
+**128 Stream-K + 80 static-persistent** FP4 tactic split.
+
+| BF16 projection structure per B=2 window | vllm.cpp | vLLM v0.25.0 |
+|---|---:|---:|
+| qkv / packed qkvz | 48 | 48 |
+| z | 48 | included in qkvz |
+| b+a / packed ba | 96 | 48 |
+| lm_head | 1 | 1 |
+| Total | **193** | **97** |
+
+The source arithmetic independently gives `(4-2) × 48 = 96`; this is not a
+profiler-name classification artifact. Diagnostic family medians are
+**51.662672 vs 48.798042 ms** (+2.864630 ms), with a shape-level decomposition
+ranking BA at about 1.882 ms and qkvz at about 0.476 ms. These durations cross
+Nsight/Torch-profiler domains and are not a speed ratio. The accepted spike
+therefore gates BA and qkvz separately and forbids duplicate weight owners or
+split-copy kernels.
+
+## Verify or reproduce the current checkpoint
+
+Verify the durable diagnostic without GPU work:
 
 ```sh
 RAW_SHA=179a0fc2afc1c33b63d14de8e50d3fde976c7356
-ROOT="$HOME/work/vllm.cpp-executed-path-c2/$RAW_SHA"
-sha256sum "$ROOT/evidence/$RAW_SHA/trace/27/"{c2-summary.json,c2-manifest.json,status-c2.json}
-# Expected: 0ef6a124…0273 / 2556cfd0…2f21 / 9e0143fa…7b57
+ROOT="$HOME/work/vllm.cpp-executed-path-c2/$RAW_SHA/evidence/$RAW_SHA/trace/27"
+sha256sum "$ROOT"/{c2-summary.json,c2-manifest.json,status-c2.json}
+# Expected prefixes: 0ef6a124…0273 / 2556cfd0…2f21 / 9e0143fa…7b57
 ```
 
-To reproduce the raw capture from a new clean SHA, use:
+The next reproduction is an implementation gate, not a benchmark claim. From
+the pushed implementation SHA on DGX:
 
 ```sh
-SHA=$(git rev-parse HEAD)
-ROOT="$HOME/work/vllm.cpp-executed-path-c2/$SHA"
-export VT_FP4_AUTOTUNE=1
-export VT_FP4_AUTOTUNE_CACHE_PATH="$ROOT/evidence/$SHA/readonly-native-must-not-exist.json"
-export VT_FP4_AUTOTUNE_CACHE_READONLY=1
-export VT_FP4_AUTOTUNE_DELAY_US=5000
-export VT_FP4_FLASHINFER_CACHE_PATH="$ROOT/source/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
-export VT_FP4_FULL_TACTICS=1 VT_FP4_PERSISTENT_CACHE=1
-export VT_FP4_PLAN_CACHE=1 VT_FP4_PRE_SERVE_WARMUP=1
-
-"$ROOT/source/scripts/dgx-online-serving.sh" --trace-only \
-  --trace-concurrency 2 --model 27 \
-  --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a" \
-  --source-corpus "$ROOT/evidence/$SHA/corpus/27" \
-  --evidence "$ROOT/evidence/$SHA" --build-dir "$ROOT/build-cuda" \
-  --configure-log "$ROOT/configure.log" \
-  --client "$HOME/venvs/vllm-oracle/bin/vllm" --vllm-cpp-sha "$SHA"
+cmake -S . -B build-gdn-merge -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON \
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_SERVER=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+cmake --build build-gdn-merge --target test_ops_gdn \
+  test_qwen27_dense_forward test_qwen27_paged_forward \
+  test_qwen27_paged_engine test_qwen36_paged_engine server --parallel
+flock /tmp/gpu -c 'ctest --test-dir build-gdn-merge \
+  -R "(test_ops_gdn|test_qwen27|test_qwen36_paged_engine)" \
+  --output-on-failure'
 ```
 
-The driver holds one lock across the 27B model gate, three independent local
-Nsight sessions with four exact B=2 graph ranges each, and a fresh six-prompt,
-three-repetition vLLM Torch trace. Batch 16 remains the default accepted H1d
-contract when `--trace-concurrency` is omitted.
+The first trace must use `nsys --cuda-graph-trace=node`. BA default must show
+145 BF16 GEMMs per B=2 window and BA-off 193, with no new cast/copy node; after
+qkvz, the corresponding target is 97. Exact immutable trace and AB/BA/AB
+commands, toggles, model fixture, hashes, and acceptance rules are in the
+[merged-projection spike](../.agents/specs/gdn-merged-input-projections.md).
 
-## Reproduce the accepted async-credit diagnostic
-
-Run both oracle modes under one uncontended lock; the online AB/BA/AB timing
-series uses the same c2 corpus and server flags before either trace is
-interpreted. These commands create diagnostic traces, not binding speed credit:
-
-```sh
-MODEL="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
-CORPUS_DIR="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27/vllm"
-SOURCE="$(git rev-parse --show-toplevel)"
-SOURCE_SHA="$(git -C "$SOURCE" rev-parse HEAD)"
-OUT="$HOME/work/vllm-async-credit/$SOURCE_SHA"
-EVIDENCE="$OUT/evidence"
-mkdir -p "$EVIDENCE"/{corpus,raw,logs,traces}
-cp "$CORPUS_DIR"/c2-r{1,2,3}.jsonl "$EVIDENCE/corpus/"
-
-# The timing lifecycle starts a fresh server for each leg in this exact order:
-# on-r1, off-r1, off-r2, on-r2, on-r3, off-r3. Each server uses:
-#   vllm serve "$MODEL" --served-model-name gate --port 8001 \
-#     --gpu-memory-utilization 0.6 --max-num-seqs 32 \
-#     --max-num-batched-tokens 2048 --no-enable-prefix-caching \
-#     {--async-scheduling|--no-async-scheduling}
-# After /health and the matching enabled/disabled log assertion, each client is:
-#   vllm bench serve --backend openai --base-url http://127.0.0.1:8001 \
-#     --endpoint /v1/completions --model gate --tokenizer "$MODEL" \
-#     --dataset-name custom --dataset-path "$EVIDENCE/corpus/c2-rN.jsonl" \
-#     --custom-output-len 128 --skip-chat-template --disable-shuffle \
-#     --num-prompts 6 --max-concurrency 2 --request-rate inf \
-#     --num-warmups 2 --seed 0 --ignore-eos --temperature 0 \
-#     --percentile-metrics ttft,tpot,itl,e2el \
-#     --metric-percentiles 50,90,99 --save-result --save-detailed \
-#     --result-dir "$EVIDENCE/raw" --result-filename MODE-rN.json --disable-tqdm
-# Validation requires completed=6, failed=0, and six falsey error strings;
-# a one-arm or otherwise incomplete series is VOID even when that arm succeeds.
-
-flock /tmp/gpu bash -c '
-  set -e
-  export PATH="$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin:$PATH"
-  for mode in on off; do
-    "$HOME/venvs/vllm-oracle/bin/python" \
-      "'$SOURCE'/tools/bench/profile_vllm_online_gate.py" \
-      --model "'$MODEL'" --corpus "'$EVIDENCE'/corpus/c2-r1.jsonl" \
-      --profile-dir "'$EVIDENCE'/traces/$mode" \
-      --metadata "'$EVIDENCE'/traces/$mode-metadata.json" \
-      --num-prompts 6 --max-concurrency 2 \
-      --max-num-seqs 32 --max-num-batched-tokens 2048 \
-      --repetitions 3 --async-scheduling "$mode"
-
-    # This six-prompt c2 diagnostic is shape-neutral. Do not pass --model-key:
-    # that option enforces the accepted 48-prompt H1d annotation counts.
-    PYTHONPATH="'$SOURCE'" "$HOME/venvs/vllm-oracle/bin/python" \
-      "'$SOURCE'/tools/bench/summarize_torch_kernels.py" \
-      --profile-dir "'$EVIDENCE'/traces/$mode" \
-      --output "'$EVIDENCE'/traces/$mode-kernel-summary.json"
-  done
-'
-
-# After all six timing JSONs and both trace summaries exist, finalize them
-# offline. The marker is written last; any missing/malformed artifact fails.
-PYTHONPATH="$SOURCE" python3 \
-  "$SOURCE/tools/bench/finalize_async_credit.py" \
-  --evidence "$EVIDENCE" \
-  --source-commit "$SOURCE_SHA"
-```
-
-## Reproduce the binding result
-
-The immutable evidence can be re-aggregated without GPU work. Exit **1** is
-expected because the evidence is complete but the every-axis gate fails. Exit
-2 indicates malformed evidence or a harness error.
+Re-aggregate the binding result without GPU work; exit **1** is expected for a
+complete every-axis failure, while exit 2 means malformed evidence:
 
 ```sh
 SOURCE="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
 CHECK="/tmp/vllm-cpp-3f256ab-summary-$USER"
 cp -a --reflink=auto "$SOURCE" "$CHECK"
 rm -rf "$CHECK/summary-27"
-
 set +e
 PYTHONPATH="$PWD" python3 tools/bench/online_gate_summary.py \
   --evidence "$CHECK" --model 27
 rc=$?
 set -e
 test "$rc" -eq 1
-sha256sum "$CHECK"/summary-27/{all-runs.json,ratios.json,report.md}
 ```
-
-## Reproduce the accepted schema-v5 W3-H1d trace
-
-The accepted status was reconstructed from the immutable `c498a413` artifacts
-with validator `71128642ce04c191f559ea4ccabe4b7e33a66b0f`; its SHA-256 is
-`84d15970d5a68e8a6307949a78eb33fbe5db3104c70129abd3d2ae0bb3696e66`.
-The full fresh-run recipe below creates a new SHA-owned root; never append a
-new execution to `c498a413`.
-
-```sh
-set -euo pipefail
-SHA=$(git rev-parse HEAD)
-ROOT="$HOME/work/vllm.cpp-executed-path-refresh-h1d/$SHA"
-BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
-
-"$ROOT/source/scripts/dgx-online-serving.sh" --dry-run \
-  --claim-root "$ROOT" \
-  --client "$HOME/venvs/vllm-oracle/bin/vllm" \
-  --vllm-cpp-sha "$SHA"
-
-mkdir -p "$ROOT/evidence/$SHA/corpus"
-cp -a "$BINDING/corpus/27" "$ROOT/evidence/$SHA/corpus/27"
-
-cmake -S "$ROOT/source" -B "$ROOT/build-cuda" -G Ninja \
-  -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_BUILD_TESTS=ON \
-  -DVLLM_CPP_SERVER=ON \
-  -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
-  -DVLLM_CPP_FLASH_ATTN=ON \
-  -DVLLM_CPP_TRITON=ON \
-  -DVLLM_CPP_TRITON_REGEN=OFF \
-  -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
-  -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
-
-export VT_FP4_PERSISTENT_CACHE=1
-export VT_FP4_FLASHINFER_CACHE_PATH="$ROOT/source/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
-export VT_FP4_AUTOTUNE_CACHE_READONLY=1
-export VT_FP4_AUTOTUNE_CACHE_PATH="$ROOT/evidence/$SHA/readonly-native-must-not-exist.json"
-export VT_FP4_AUTOTUNE_DELAY_US=5000
-export VT_FP4_PLAN_CACHE=1
-export VT_FP4_AUTOTUNE=1
-export VT_FP4_FULL_TACTICS=1
-export VT_FP4_PRE_SERVE_WARMUP=1
-
-"$ROOT/source/scripts/dgx-online-serving.sh" --trace-only --model 27 \
-  --snapshot "$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a" \
-  --source-corpus "$ROOT/evidence/$SHA/corpus/27" \
-  --evidence "$ROOT/evidence/$SHA" \
-  --build-dir "$ROOT/build-cuda" \
-  --configure-log "$ROOT/configure.log" \
-  --client "$HOME/venvs/vllm-oracle/bin/vllm" \
-  --vllm-cpp-sha "$SHA"
-```
-
-Acceptance requires all 12 reports to be complete, zero-eager, exact-plan,
-launch/workload/event-counter-reconciled, completion-ordered, and mutually
-signature-identical. The exact capture-boundary warning may be recorded only
-under that complete pinned-version contract; every other severity-2 diagnostic
-still fails. A valid trace is diagnostic: only a later 48/48 same-binary
-component gate may authorize the exact 27B grid.
 
 ## Benchmark policy
 
 - Correctness is a precondition and cannot be traded for speed.
-- Ours and the reference use the same model, requests, sampling, token budget,
-  cache policy, concurrency, and hardware.
+- Ours and every reference use the same model, requests, sampling, token
+  budget, cache policy, concurrency, and hardware.
 - A benchmark series runs on an idle GPU under one ownership window and is
   repeated enough to distinguish signal from run noise.
 - Partial, contended, stale-denominator, or diagnostically incomplete results

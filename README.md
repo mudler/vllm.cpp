@@ -10,16 +10,12 @@ OpenAI-compatible server.
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
 > At c2 our TTFT is better, but decode TPOT is **114.841 vs 108.274 ms**
-> (**6.1% slower**). The repaired `179a0fc` raw trace is complete: all **12/12**
-> local B=2 ranges are lossless and topology-identical at **1,011 kernels**, and
-> the fresh oracle contains **1,522** exact B=2 windows at **1,160 kernels** plus
-> two classified B=1 drain windows. Both sides select the same **128 Stream-K +
-> 80 static-persistent** FP4 split. The committed finalizer now records
-> `complete-diagnostic` (summary `0ef6a124…0273`) and maps the remaining
-> diagnostic time chiefly to BF16 CUTLASS GEMMs and RMSNorm/generated
-> partitions. These cross-profiler times are not a binding speed result;
-> they select the next whole-chain spike only. Separately, host memory retains a
-> **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
+> (**6.1% slower**). Exact trace plus source inspection finds one complete
+> structural gap: our 48 GDN layers launch **193** BF16 GEMMs per B=2 window,
+> while vLLM's merged qkvz/ba topology launches **97**. The accepted
+> [implementation spike](.agents/specs/gdn-merged-input-projections.md) gates BA
+> first, then qkvz; no code or speed credit exists yet. Host memory also retains
+> a **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -27,10 +23,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0; finalized `179a0fc` c2 evidence is `complete-diagnostic` and does not supersede the grid | Spike and gate the BF16-GEMM launch residual, then rerun the exact grid |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; finalized `179a0fc` proves the 193-vs-97 GDN BF16 topology gap but does not supersede the grid | Implement and gate merged BA, then merged qkvz; rerun the exact grid only after their component gates |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
+| Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -55,10 +51,9 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Closed scheduler diagnostic | Accepted `3812d8` c2 ON/OFF: total **160.347697 / 160.003134 tok/s = 1.002153×**; TPOT **106.642 / 107.740 ms**, TTFT **807.658 / 696.330 ms**. Traces total **170.820 / 170.478 s** GPU-kernel time. Async is neutral for speed; W3 remains later parity work |
-| Selected GPU work | Finalized `179a0fc` c2 map: **12/12** local ranges at 1,011 kernels and **1,522** steady oracle B=2 windows at 1,160 kernels; both use the same 128+80 FP4 tactics. Diagnostic medians are **111.077 / 105.521 ms**. BF16 GEMM launch structure is the next spike; no speed credit exists yet |
+| Selected GPU work | `KERNEL-GEMM-BF16` is `READY`: vLLM physically packs qkvz and ba; ours launches four projections per GDN layer. BA is the first isolated implementation/component gate, qkvz the second |
+| Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
-| Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 
 ## What is implemented
 
@@ -128,7 +123,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; W3-I's packed candidate is structurally accepted but strict component-failed and remains default-off |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; merged GDN BA/qkvz implementation is pending |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -155,7 +150,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; W3-I1's packed fused producer passes structural gates but strict component-fails at 30/48 and remains default-off |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; exact c2 evidence shows FP4 tactic parity, so the active speed leaf is the separate BF16 GDN projection topology |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -178,8 +173,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: spike and gate the c2 BF16-GEMM launch
-residual → all-axis 27B parity → 35B parity → the SGLang shared-prefix
+The next execution order is fixed: implement/gate merged BA → implement/gate
+merged qkvz → all-axis 27B parity → 35B parity → the SGLang shared-prefix
 gate → the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and
 external KV cache / LMCache support.
 

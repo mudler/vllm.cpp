@@ -12,15 +12,14 @@ is explicit. `INVENTORIED` is source knowledge only. Runtime-selected kernels
 remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
-Current `KERNEL-GEMM-NVFP4-W4A4` substage: default-off W3-I1 at clean
-`15c6b89` remains structure-green but component-failed/default-off. The
-cross-stack scan and async control are complete: accepted `3812d8` gives only
-**1.002153×** async ON/OFF total throughput and **1.002004×** traced GPU time.
-The active diagnostic is therefore exact c2 ours/vLLM mapping of the 129-node
-RMSNorm/generated-partition family and resolved FP4 tactics. W3-H2's already
-grounded **+0.313930 ms/window** residual has only about a 0.25% end-to-end
-ceiling. Binding `3f256ab` remains **55/124** and no kernel speed credit or
-exact-grid authorization follows yet.
+Current order-0 kernel leaf: finalized `179a0fc` proves the FP4 tactic family
+already matches, while the local GDN path issues **193** BF16 GEMMs per B=2
+window versus vLLM's **97**. Source inspection explains all 96 extra launches:
+48 layers each run qkv+z and b+a separately instead of qkvz+ba. The accepted
+[merged-projection spike](specs/gdn-merged-input-projections.md) makes
+`KERNEL-GEMM-BF16` `READY`, with BA first and qkvz second. Binding `3f256ab`
+remains **55/124**; trace timing is diagnostic and no speed credit or exact-grid
+authorization exists yet.
 
 The C1 implementation spike is accepted at
 [dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Its additive
@@ -35,7 +34,7 @@ performance, and memory checkpoint before the next migration stacks.
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `KERNEL-CUDA-DISPATCH-AOT` | CUDA runtime, streams, graphs, per-arch dispatch, and generated/AOT artifact selection | platform selection `vllm/platforms/cuda.py:205-493`; gencode handling `CMakeLists.txt:201-220`; JIT packages `cmake/external_projects/triton_kernels.cmake:1-28` | [cuda_backend.cu:20](../src/vt/cuda/cuda_backend.cu#L20), [CMakeLists.txt:37](../CMakeLists.txt#L37), [TritonAOT.cmake:57](../cmake/TritonAOT.cmake#L57) | [CUDA backend tests](../tests/vt/test_cuda_backend.cpp#L31); only SM121 AOT artifacts are evidenced | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
-| `KERNEL-GEMM-BF16` | BF16 dense GEMM, including torch-Linear/TN-equivalent layout | unquantized apply `vllm/model_executor/layers/linear.py:182-224`; runtime cuBLASLt heuristic | [cuda_matmul.cu:188](../src/vt/cuda/cuda_matmul.cu#L188), [cuda_matmul.cu:342](../src/vt/cuda/cuda_matmul.cu#L342) | [cuBLASLt tests](../tests/vt/test_cuda_ops.cpp#L370); finalized `179a0fc` c2 map and [finalizer](../tools/bench/finalize_low_batch_trace.py#L1) show local **193 calls / 51.662672 ms median** versus oracle **97 / 48.798042 ms**, a diagnostic +96 launches / +2.864630 ms. Status `9e0143fa…7b57` is `complete-diagnostic`; the whole dependency-chain source spike is next, and cross-profiler timing is not speed credit | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
+| `KERNEL-GEMM-BF16` | BF16 dense GEMM, including torch-Linear/TN-equivalent layout and Qwen GDN merged input projections | Qwen mapper/packing `vllm/model_executor/models/qwen3_5.py:200-210,278-288`; merged linear `vllm/model_executor/layers/linear.py:580-808`; GDN calls `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:908-943`; runtime cuBLASLt heuristic | Existing split path [qwen3_5.cpp:2320](../src/vllm/model_executor/models/qwen3_5.cpp#L2320), [dense loader:159](../src/vllm/model_executor/models/qwen3_5_dense_weights.cpp#L159), [cuda_matmul.cu:188](../src/vt/cuda/cuda_matmul.cu#L188) | [cuBLASLt tests](../tests/vt/test_cuda_ops.cpp#L370); finalized `179a0fc` [finalizer](../tools/bench/finalize_low_batch_trace.py#L1) proves **193 vs 97** calls and exact `(4-2)×48=96` topology gap. Diagnostic median delta is +2.864630 ms, not speed credit. Spike accepted; implementation/tests and BA/qkvz gates are pending | [merged GDN projections](specs/gdn-merged-input-projections.md) | `READY` | - |
 | `KERNEL-GEMM-FP8` | FP8/INT8 scaled-mm plus static activation quant | C2x/C3x dispatch `CMakeLists.txt:737-863`; stable quant sources `:383-388` | [cuda_matmul_fp8_cutlass.cu:312](../src/vt/cuda/cuda_matmul_fp8_cutlass.cu#L312), [cuda_matmul.cu:342](../src/vt/cuda/cuda_matmul.cu#L342) | [FP8 tests](../tests/vt/test_ops_fp8_cutlass.cpp#L188); 35B gate | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
 | `KERNEL-GEMM-NVFP4-W4A4` | NVFP4 W4A4 dense quant, merged/fused projections, runtime bucketing, SM12 tactics, v0.25 persistent plan selection and model-owned alpha | SM10/11/12 FP4 families `CMakeLists.txt:940-1002`; CT alpha parameter `compressed_tensors_w4a4_nvfp4.py:95-141`; executed FlashInfer pass-through `kernels/linear/nvfp4/flashinfer.py:97-176`; fused selection `act_quant_fusion.py:36-40,128-181,283-300`; stable fused body `activation_nvfp4_quant_fusion_kernels.cu:30-163`, packed helpers `nvfp4_utils.cuh:25-36,118-329`, vector loads `cuda_vec_utils.cuh:123-175,264-288`; FlashInfer 0.6.13 device pointer `gemm_base.py:1307-1350`, `fp4_gemm_cutlass_sm120.cu:52-77,82-105,135-175`; v0.25 cache lifecycle sources retained | Existing W3-C/W3-F anchors remain. W3-I1 adds the default-off packed [fused producer and dispatch](../src/vt/cuda/cuda_matmul_nvfp4.cu#L1207), public zero-lifecycle [contract](../include/vt/ops.h#L518), and candidate/fallback/graph/alignment [tests](../tests/vt/test_ops_nvfp4_fp4.cpp#L959). The trace-only [controller](../include/vt/cuda/cuda_profiler_control.h#L13), [driver](../scripts/dgx-online-serving.sh#L14), batch-keyed [validator](../tools/bench/online_gate.py#L99), fail-closed [c2 finalizer](../tools/bench/finalize_low_batch_trace.py#L1), and [finalizer tests](../tests/tools/test_low_batch_trace_summary.py#L1) support exact c2 without changing production builds | Clean W3-I1 remains default-off after **27/40 timing + 3/8 memory**. Finalized `179a0fc` proves all 12 local ranges and 1,522 steady oracle windows resolve the same **128 Stream-K 128x64x256 + 80 static-persistent 128x32x256** split. Diagnostic local/oracle FP4 medians are **52.508720 / 52.734326 ms**, so FP4 GEMM is not the positive c2 residual. Status `9e0143fa…7b57` is `complete-diagnostic`; `3f256ab` stays 55/124 and no new speed credit exists | [small-M spike](specs/nvfp4-small-m-dispatch.md); [W3-E spike](specs/nvfp4-direct-swizzled-scales.md); [W3-C spike](specs/nvfp4-persistent-plan-cache.md); [W3-F device-alpha spike](specs/nvfp4-device-alpha.md); [W3-G spike](specs/fa2-gqa-split-kv-decode.md); [W3-H normal-producer spike](specs/nvfp4-bf16-producer-vectorization.md); [W3-I fused-producer spike](specs/nvfp4-fused-silu-producer.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `KERNEL-GEMM-MARLIN-W4A16` | FP4 W4A16 Marlin dense/grouped GEMM and repack | Marlin generation/targets `CMakeLists.txt:548-679,1168-1274`; capability floor `marlin_utils_fp4.py:29-35` | [cuda_marlin_repack.cu:129](../src/vt/cuda/cuda_marlin_repack.cu#L129), [cuda_moe_marlin.cu:156](../src/vt/cuda/cuda_moe_marlin.cu#L156) | [dense tests](../tests/vt/test_ops_nvfp4_matmul.cpp#L201), [MoE tests](../tests/vt/test_ops_moe_grouped.cpp#L453); 35B gate | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
@@ -68,8 +67,8 @@ performance, and memory checkpoint before the next migration stacks.
 ## Count invariants
 
 - This table has exactly 30 practical kernel-family rows.
-- Baseline lifecycle counts are 10 `ANCHOR-BACKFILL`, 4 `PARTIAL`, 3 `ACTIVE`,
-  and 13 `INVENTORIED`.
+- Baseline lifecycle counts are 9 `ANCHOR-BACKFILL`, 1 `READY`, 4 `PARTIAL`,
+  3 `ACTIVE`, and 13 `INVENTORIED`.
 - The GDN `ACTIVE` rows are valid only while `CLAIM-PR3` remains active; the
   FA2 row is valid only while `CLAIM-SERVE-GATE-1` claims it in
   `.agents/coordination.md`. Integration must reconcile a row if its claim

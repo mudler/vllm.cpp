@@ -14,44 +14,17 @@ PSS/RSS remain red. W3-E/W3-F/W3-G strict-failed their same-binary components
 and earn no speed credit. This result remains the only binding performance
 number, and no 35B performance command is authorized.
 
-The accepted c16 schema-v5 trace remains `c498a413` (status
-`84d15970…6e66`). W3-I subsequently passed its structural gates but failed the
-complete component at **27/40 timing + 3/8 memory**; it remains default-off and
-earns no speed credit. The mandated post-I1 scan is now complete. At c2 ours
-has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1% slower**).
-vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path has now
-been measured directly. Accepted `3812d8` completes six c2 timing legs and two
-shape-neutral traces: ON/OFF total **1.002153×**, direction-normalized TPOT
-**1.010291×**, TTFT **0.862159×**, and aggregate GPU time **1.002004×**. It is
-neutral for the 6.1% gap and earns no speed credit.
-
-Read-only reconstruction of its accepted async-ON raw trace now fixes the
-oracle side of the next gate. Selected trace SHA `57413dd1…1cba` contains
-**1,536** generation annotations, **1,524** non-overlapping clean batch-2
-decode windows and exactly **1,160 kernels/window**. All windows have identical
-ordered-name and launch-signature SHA values `858915dd…fad0` and
-`b5c6fcac…dd7b`. Per window, vLLM resolves its 208 FP4 GEMMs to **128**
-Stream-K 128x64x256 calls plus **80** static-persistent 128x32x256 calls. Its
-seven RMSNorm/generated-quant partitions total **177 calls / 0.442805 ms** per
-window. This is a structural oracle contract, not a cross-profiler speed ratio.
-
-The trace-only local observer and driver accept an explicit exact batch-2 target
-while retaining batch 16 as the accepted H1d default. Production builds contain
-neither observer. Complete raw root `179a0fc` passes the 27B model gate and all
-three local sessions: **12/12** exact ranges each contain **1,011 kernels, 7
-memcpy and 1 memset**, are lossless, and share node-multiset SHA
-`44fcf31f…b93d`. Fresh oracle SHA `2b3bf412…785c` has **1,522** exact B=2
-windows at 1,160 kernels plus two classified B=1 drain windows; its B=2 ordered
-names retain `858915dd…fad0`, while five generated partitions use 50 rather than
-48 registers. Committed finalizer `fe28003` records `complete-diagnostic`.
-Diagnostic medians are
-local/oracle **111.076528 / 105.520831 ms**; BF16 CUTLASS GEMMs lead at +96
-launches/+2.864630 ms, RMSNorm/generated partitions add +1.810237 ms, and FP4
-GEMM is already non-positive with the same 128+80 tactics. Summary / manifest /
-status / artifact-set SHA values are `0ef6a124…0273` / `2556cfd0…2f21` /
-`9e0143fa…7b57` / `cc248ad2…823a`. No implementation or speed credit is
-claimed; the exact +96-launch structure selects the BF16-GEMM whole-chain
-spike.
+At c2 ours has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1%
+slower**). Finalized exact trace `179a0fc` (status `9e0143fa…7b57`) passes the
+model gate, has **12/12** invariant local B=2 ranges, and contains a fresh
+oracle with 1,522 steady B=2 windows plus two bounded drains. Both sides use
+the same **128 Stream-K + 80 static-persistent** FP4 tactics. Source and trace
+arithmetic explain the complete BF16 residual: our 48 GDN layers issue
+qkv+z+b+a while vLLM issues qkvz+ba, totaling **193 vs 97** BF16 projection
+GEMMs. The accepted
+[merged-projection spike](gdn-merged-input-projections.md) makes
+`KERNEL-GEMM-BF16` `READY`, with merged BA first and qkvz second. No
+cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
 
@@ -261,20 +234,12 @@ reported as a clean dependency check.
    explicit cache-off, identical sampling, scheduler settings, and model length.
    Immutable `3f256ab` supersedes `9cc7191`: the 27B model gate, 36 timed groups
    and six returns are complete; 55/124 axes pass. Hold 35B.
-5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
-   Accepted c2 async control `3812d8` is neutral at **1.002153×** total and
-   **1.002004×** traced GPU time, so do not claim W3 for speed. The accepted
-   oracle trace pins the accepted all-B=2 topology. Complete raw `179a0fc`
-   reproduces 12/12 local ranges and 1,522 steady fresh-oracle B=2 windows plus
-   two drains; finalizer status `9e0143fa…7b57` maps BF16 GEMM launch structure
-   and RMSNorm/generated partitions above an already-matched 128+80 FP4 family.
-   The next checkpoint is the complete BF16-GEMM whole-chain spike; do not code
-   the lever before that spec is committed.
-6. Drive only the lever selected by that control. A positive 4–6% async credit
-   activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
-   and gate the smallest grounded kernel leaf. Host-weight ownership is a
-   separate all-axis repair. Cross-profiler attribution never earns speed
-   credit by itself.
+5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
+   executed-path baselines. The merged-projection spike is committed and
+   selects BA as the next isolated component checkpoint.
+6. Claim, implement and gate merged BA; only after its complete disposition,
+   repeat for qkvz. Host-weight ownership remains a separate all-axis repair.
+   Cross-profiler attribution never earns speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

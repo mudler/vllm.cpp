@@ -8165,3 +8165,31 @@ BENCHMARKS, roadmap, matrices, coordination and serving-gate spec now collapse
 the prior pending narrative to this single durable disposition. Next: commit
 the BF16-GEMM launch-parity spike before any implementation, then gate its
 smallest grounded leaf against the same c2 and exact online workloads.
+
+## 2026-07-14 — merged GDN projection spike accepted; live records compacted
+
+The whole vLLM/dependency/local chain now explains the exact BF16 launch gap.
+Qwen3.6-27B has 48 GDN layers. Our path owns and executes qkv, z, b and a as
+four BF16 projections per layer; vLLM v0.25.0 owns qkvz and ba as two. Including
+lm_head, the finalized B=2 trace therefore has **193 local vs 97 oracle** BF16
+GEMMs, and `(4-2)×48=96` explains the entire count residual. Both sides already
+use the same **128 Stream-K + 80 static-persistent** FP4 tactics. Cross-profiler
+durations remain diagnostic and do not alter binding `3f256ab` at **55/124**.
+
+Accepted [gdn-merged-input-projections.md](specs/gdn-merged-input-projections.md)
+makes `KERNEL-GEMM-BF16` `READY` and unclaimed. It forbids a packed-plus-split
+duplicate design (which would retain about 7.545 GiB), uses one merged owner
+with non-owning fallback views, and requires BF16 stride-aware consumers with
+no materialization/cast node. W1 merges BA and must reach the exact 145-BF16-
+GEMM structure plus its c2/c16 AB/BA/AB disposition before W2 qkvz begins; W2
+targets 97 BF16 GEMMs. 35B, GGUF, FP8 qkv/z, LoRA and TP modes stay inert or
+explicitly deferred.
+
+README, BENCHMARKS, roadmap, engine/kernel/feature matrices, coordination,
+porting inventory and the live online-gate spec now retain only the binding
+snapshot, selected leaf, durable evidence and next gate. Closed async/W3-I and
+precursor trace narratives remain only in this append-only log, the parity
+ledger and Git, per the periodic-compaction policy. No production code or GPU
+command ran. Next: transition `KERNEL-GEMM-BF16` to an explicit BA-only
+`ACTIVE` claim, implement W1, and run its correctness/safety/structure/component
+checkpoint before touching qkvz.

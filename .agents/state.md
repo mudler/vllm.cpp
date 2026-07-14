@@ -7820,3 +7820,21 @@ port 8001 idle. Binding `3f256ab` remains **55/124** and W3 stays unowned
 `READY` with no credit. The repaired recipe creates a new commit-owned root
 and prepends `$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin` before all
 six AB/BA/AB timing legs and both profiler arms under one lock.
+
+## 2026-07-14 — second async-credit execution voids after ON-r1
+
+Clean pushed `2ec6ddac20bb742db2aa8987d2177d89d90bf3c5` ran from a fresh
+SHA-owned root under one lock with both `ninja` and CUDA 13 `nvcc` preflighted.
+The first explicit-ON server became healthy, logged async enabled, and its c2-r1
+client completed **6/6 requests**, 6,144 input and 768 output tokens at
+**160.342521 total tok/s**, **811.607 ms TTFT**, and **106.615 ms TPOT**.
+
+The post-run shell validator then failed because vLLM 0.25 serializes successful
+request errors as six empty strings rather than an empty list. No OFF arm or
+Torch trace ran, so the whole series is **FAILED / VOID** and ON-r1 earns no
+credit. Series/server/client/raw SHA values are `5dde4e05…de36` /
+`f509088a…e47d` / `71df0559…bdfa` / `d9009408…30d0`. Corrected read-only
+validation passes `completed=6`, `failed=0`, exact token totals, and
+`len(errors)=6 && all(falsey)`. Cleanup returned GPU, lock, and port idle.
+The next run uses a new commit/root and repeats every arm; prior `4d85ead`
+setup failure remains only in this append-only record and the ledger.

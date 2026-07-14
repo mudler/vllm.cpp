@@ -10,10 +10,10 @@ Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 The post-W3-I scan is complete: the largest binding low-concurrency symptom is
 c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
-better TTFT. The first exact async-scheduler control attempt (`4d85ead`) is
-**VOID before any request**: FlashInfer JIT reached warmup but could not find
-`ninja` on the spawned EngineCore `PATH`. A fresh root with the oracle venv and
-CUDA tools prepended is **PENDING**, so W3 has no speed credit yet. Host PSS/RSS is independently traced to a persistent
+better TTFT. The current exact async-control root (`2ec6dda`) is **VOID after
+only ON-r1**: its 6/6 requests completed, but post-run validation treated
+vLLM's six empty error strings as failures and stopped before any OFF arm or
+trace. A fresh corrected root is **PENDING**, so W3 has no speed credit yet. Host PSS/RSS is independently traced to a persistent
 **22.920 GiB** CPU weight mirror plus source-page residency during load. W3-I
 remains default-off after its **30/48** component failure.
 
@@ -62,7 +62,7 @@ authorized until all 124 27B axes pass.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Run the exact c2 async ON/OFF oracle control, then gate the selected lever before rerunning the grid |
-| vLLM async-scheduler credit | **FAILED / VOID SETUP; REPAIRED RUN PENDING** | Clean `4d85ead` reached the first ON arm's FlashInfer JIT warmup, then failed on missing `ninja`; zero client requests, raw results, or traces exist. Series/server SHA `a6113854…60e0` / `1c5a2009…0a3f`; cleanup returned lock/GPU/port idle | Use a new commit-owned root and prepend `$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin` before the same six timing legs and two traces |
+| vLLM async-scheduler credit | **FAILED / VOID INCOMPLETE SERIES; REPAIRED RUN PENDING** | Clean `2ec6dda` ON-r1 completed **6/6** at 160.343 total tok/s / 106.615 ms TPOT, then the validator rejected `errors=["",…]`; no OFF arm or trace, so the one-arm number is non-binding. Series/raw SHA `5dde4e05…de36` / `d9009408…30d0`; cleanup returned lock/GPU/port idle | Use a new commit-owned root and accept only an exact six-entry all-empty error vector with completed=6/failed=0; repeat all six timing legs and two traces under one lock |
 | Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
 | W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
@@ -122,6 +122,8 @@ OUT="$HOME/work/vllm-async-credit/702f4814fe54/c2"
 #     --percentile-metrics ttft,tpot,itl,e2el \
 #     --metric-percentiles 50,90,99 --save-result --save-detailed \
 #     --result-dir "$OUT/raw" --result-filename MODE-rN.json --disable-tqdm
+# Validation requires completed=6, failed=0, and six falsey error strings;
+# a one-arm or otherwise incomplete series is VOID even when that arm succeeds.
 
 flock /tmp/gpu bash -c '
   set -e

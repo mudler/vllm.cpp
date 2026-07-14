@@ -82,10 +82,10 @@ inner 4096, state 128; context 262144.
 
 - Binding immutable `3f256ab` vLLM v0.25.0 evidence completes the exact
   27B cache-off grid at **55/124 axes pass, 69 fail**. The post-W3-I scan is
-  complete: first clean control root `4d85ead` is VOID before requests because
-  spawned EngineCore lacked `ninja`. Run a fresh root with
-  `$HOME/venvs/vllm-oracle/bin:/usr/local/cuda-13.0/bin` prepended under one
-  lock; W3 stays `READY`/uncredited until that result. If neutral,
+  complete: current root `2ec6dda` proves the venv/CUDA `PATH` repair and ON-r1
+  passes 6/6, but the series is VOID because validation rejected six empty
+  error strings before OFF. Run a fresh root accepting exactly six falsey
+  entries with completed=6/failed=0 under one lock; W3 stays uncredited. If neutral,
   capture low-batch kernels and map the RMSNorm/generated partitions before
   coding. The independent host-memory repair must remove the measured
   **22.920 GiB** persistent CPU weight mirror and overlapping load-time source

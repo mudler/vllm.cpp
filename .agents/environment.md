@@ -87,11 +87,11 @@ inner 4096, state 128; context 262144.
   `~/work/vllm.cpp-gdn-ba/immutable-581d335…` passes the exact CUDA 13.0.88 /
   CUTLASS / Triton-AOT build, packed F32/BF16 capture/replay, strict memcheck,
   merged/split 27B and inert native-35B gates; BF16 projection output fails the token
-  near-tie. Raw `0091cd1` ran both exact-c2 arms under one lock and passes all
-  24 local range contracts. Its first finalizer rejected two new internally
-  invariant vLLM Inductor RMSNorm register signatures and wrote no marker; the
-  exact two-hash repair passes 69/69 tool tests. Push that repair and re-finalize
-  the raw set, then close rounding parity and the c2/c16 component before qkvz.
+  near-tie. Immutable `0091cd1`, finalized by pushed `8a1f923`, is
+  `complete-structural`: both exact-c2 arms pass all 24 local range contracts at
+  merged 963/145 versus split 1,011/193, with 48 BF16-only removals and unchanged
+  selected non-BF16 families. `benchmark_binding=false`. Close GGUF/legacy
+  inertness, rounding parity and the c2/c16 component before qkvz.
   Independently remove **22.920
   GiB** host-weight mirror and overlapping source pages. No 35B performance
   command runs before all 27B axes pass.

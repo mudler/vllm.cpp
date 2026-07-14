@@ -8340,3 +8340,30 @@ returns `complete-structural` with `benchmark_binding=false`. This checkpoint re
 immutable raw set is re-finalized. It earns no speed credit: binding
 `3f256ab` remains **55/124**, BF16 output remains 233/235, c2/c16 component and
 qkvz remain prohibited, and no 35B performance command ran.
+
+## 2026-07-14 — GDN BA structural trace durably completes
+
+The CPU-only finalizer from exact pushed
+`8a1f923a72f7ab45d4db005d737ac86806204c0d` revalidated immutable raw source
+`0091cd192d9a6baa2197a4f3bdb0561bd859baf5` and wrote the completion marker
+last. The durable root remains
+`~/work/vllm.cpp-gdn-ba-trace/0091cd192d9a6baa2197a4f3bdb0561bd859baf5`.
+Summary / manifest / marker / artifact-set / finalizer SHA-256 values are
+`03601168…54d5` / `b203f0d2…5412` / `72328c48…63e` /
+`b93fd633…70a2` / `57395e99…b146`.
+
+Status is **`complete-structural`**. All 12 merged windows are exactly
+**963 total / 145 BF16** and all 12 split windows are **1,011 / 193**. The
+delta is exactly 48 total and 48 BF16 launches; FA2 main/combine, FP4 GEMM,
+fused/normal producers, recurrence, RMSNorm, other, memcpy and memset counts
+are unchanged. The fresh merged/split vLLM controls retain 1,522/1,521
+invariant steady windows at 1,160 kernels and the accepted ordered-name,
+geometry, family and tactic contracts. The marker records
+`benchmark_binding=false` and no speed ratio.
+
+This closes W1 BA capture lifecycle and structural evidence only. Binding
+`3f256ab` remains **55/124**; BF16 output remains **233/235**; GGUF/legacy
+inertness, projection rounding and the c2/c16 **40 timing + 8 memory** component
+remain open. qkvz stays prohibited until those gates close, and no 35B
+performance command ran. Next: close the two remaining correctness/inertness
+checks, then run the same-binary BA component under one uncontended lock.

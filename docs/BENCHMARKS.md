@@ -15,16 +15,14 @@ into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) has
 a `GATING` BA-only W1 implementation. Clean pushed `581d335` closes its core
 correctness/safety repetition; BF16 output still fails the known near-tie.
-Raw pushed-SHA trace `0091cd1` completed both arms under one lock and proves
-12/12 merged ranges at **963 / 145 BF16** plus 12/12 split ranges at
-**1,011 / 193**. Its first finalizer invocation correctly wrote no marker: the
-fresh vLLM controls had two previously unseen, internally invariant
-Torch/Inductor RMSNorm register-allocation signatures. Exact whole-chain diff
-found no name, block, grid, shared-memory, family or tactic change. The narrow
-two-signature repair passes **69/69** tooling tests, and a no-write full-chain
-preflight validates the exact 48-BF16-only delta. Pushed-source re-finalization
-and the 40+8-axis component remain **PENDING**, so no accepted
-number changes.
+Immutable trace `0091cd1`, finalized by pushed `8a1f923`, now has durable
+status **`complete-structural`**. All 12 merged ranges are exactly
+**963 / 145 BF16** and all 12 split ranges are **1,011 / 193**; every selected
+non-BF16 family is unchanged. The fresh vLLM controls retain 1,522/1,521
+internally invariant steady windows, accepted names/geometry/families/tactics,
+and the two exact inspected Torch/Inductor register signatures. This proves an
+exact 48-BF16-only removal but remains non-binding. The 40+8-axis component is
+**PENDING**, so no accepted performance number changes.
 
 ## Binding 27B online gate
 
@@ -70,7 +68,7 @@ performance command is authorized until the 27B result reaches 124/124.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **GATING / RAW TRACE PASS; FINALIZER FAILED** | `0091cd1` completed 24/24 exact local ranges under one lock, but the first finalizer exited 2 on new vLLM register-allocation signatures and wrote no completion marker. Both oracle traces retain 1,160 kernels and the accepted ordered-name/geometry/family/tactic contract across 1,522/1,521 steady windows; only generated RMSNorm register metadata differs. The exact two-hash repair passes **69/69** and its no-write full-chain preflight accepts exactly 48 BF16-only removals; no speed credit. BF16 output remains **FAILED at 233/235** | Push the fail-closed signature repair and re-finalize the immutable raw set; finish GGUF/legacy inertness and BF16 rounding, then run c2/c16 AB/BA/AB before qkvz |
+| `KERNEL-GEMM-BF16` | **GATING / W1 BA STRUCTURE PASS** | `0091cd1` is durably `complete-structural`: 24/24 exact local ranges, merged **963 / 145 BF16** versus split **1,011 / 193**, exactly 48 BF16-only removals, unchanged non-BF16 families, and 1,522/1,521 invariant vLLM control windows. `benchmark_binding=false`; BF16 output remains **FAILED at 233/235** | Finish GGUF/legacy inertness and BF16 rounding, then run c2/c16 AB/BA/AB before qkvz |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -92,20 +90,18 @@ native cache stayed absent. The rejected BF16-output preflight log remains
 `09078b76…b050`. This closes immutable core correctness/safety only and earns no
 speed ratio.
 
-The current raw structural root is
+The completed structural root is
 `~/work/vllm.cpp-gdn-ba-trace/0091cd192d9a6baa2197a4f3bdb0561bd859baf5`.
 All 24 local ranges pass their exact contracts. The merged/split oracle traces
 have SHA-256 `b8d26d4c…fc59` / `cef841ce…ede5`; they contain 1,522 / 1,521
 internally invariant steady B=2 windows at 1,160 kernels and ordered-name SHA
 `858915dd…fad0`. Their full launch signatures are `17e1037e…14ed` /
-`f7a3ca1f…cadf`. The first finalizer exited 2 on the former signature and wrote
-none of `gdn-ba-summary.json`, `gdn-ba-manifest.json`, or
-`status-gdn-ba.json`. This is **FAILED / incomplete derived evidence**, not a
-partial structural pass; the exact-signature repair must be pushed and the raw
-set re-finalized before `complete-structural` can be claimed. An in-memory,
-no-write `build_summary` preflight already validates merged 963/145 versus
-split 1,011/193, exact 48/48 deltas, and unchanged non-BF16 family counts with
-`benchmark_binding=false`.
+`f7a3ca1f…cadf`. Pushed finalizer commit `8a1f923` wrote the marker last with
+status `complete-structural`. Summary / manifest / marker / artifact-set /
+finalizer SHA-256 values are `03601168…54d5` / `b203f0d2…5412` /
+`72328c48…63e` / `b93fd633…70a2` / `57395e99…b146`. The summary proves merged
+963/145 versus split 1,011/193, exact 48/48 deltas, unchanged non-BF16 family
+counts and `benchmark_binding=false`; it grants no speed ratio.
 
 ## Evidence selecting merged GDN projections
 
@@ -164,28 +160,59 @@ sha256sum "$ROOT/evidence"/{status.txt,sha256sums.txt}
 # Expected: 3895e658…4cf6 / ed2bf8d8…895b
 ```
 
-The GPU capture is complete; re-finalization is **PENDING a pushed exact-
-signature repair**. Verify the raw source/root and run the CPU-only finalizer
-from that pushed repair:
+Verify the durable structural checkpoint without GPU work:
 
 ```sh
 RAW_SHA=0091cd192d9a6baa2197a4f3bdb0561bd859baf5
-FINALIZER_SHA=$(git rev-parse HEAD)
-test -z "$(git status --porcelain)"
 ROOT="$HOME/work/vllm.cpp-gdn-ba-trace/$RAW_SHA"
-EVIDENCE="$ROOT/evidence/$RAW_SHA"
-test ! -e "$EVIDENCE/trace/27/status-gdn-ba.json"
-python3 tools/bench/finalize_gdn_ba_trace.py \
-  --evidence "$EVIDENCE" --source-commit "$RAW_SHA" \
+TRACE="$ROOT/evidence/$RAW_SHA/trace/27"
+sha256sum "$TRACE"/{gdn-ba-summary.json,gdn-ba-manifest.json,status-gdn-ba.json}
+# Expected: 03601168…54d5 / b203f0d2…5412 / 72328c48…63e
+```
+
+For a fresh reproduction, create a new SHA-owned root, write the plan before
+copying the frozen corpus, configure the exact trace build, then run the
+same one-lock driver and finalizer:
+
+```sh
+set -o pipefail
+SHA=$(git rev-parse HEAD)
+ROOT="$HOME/work/vllm.cpp-gdn-ba-trace/$SHA"
+SOURCE="$ROOT/source"
+EVIDENCE="$ROOT/evidence/$SHA"
+BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
+SNAPSHOT="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
+test -z "$(git status --porcelain)"
+git worktree add --detach "$SOURCE" "$SHA"
+"$SOURCE/scripts/dgx-online-serving.sh" --dry-run \
+  --claim-root "$ROOT" --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA"
+mkdir -p "$EVIDENCE/corpus"
+cp -a "$BINDING/corpus/27" "$EVIDENCE/corpus/27"
+cmake -S "$SOURCE" -B "$ROOT/build-cuda" -G Ninja \
+  -DCMAKE_MAKE_PROGRAM="$HOME/venvs/vllm-oracle/bin/ninja" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_SERVER=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_FLASH_ATTN=ON \
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_REGEN=OFF \
+  -DVLLM_CPP_BENCH_PROFILE_CONTROL=ON \
+  -DVLLM_CPP_CUTLASS_DIR="$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass" \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON 2>&1 | tee "$ROOT/configure.log"
+"$SOURCE/scripts/dgx-online-serving.sh" --trace-only --model 27 \
+  --snapshot "$SNAPSHOT" --source-corpus "$EVIDENCE/corpus/27" \
+  --evidence "$EVIDENCE" --build-dir "$ROOT/build-cuda" \
+  --configure-log "$ROOT/configure.log" --trace-concurrency 2 \
+  --gdn-ba-mode both --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA" 2>&1 | tee "$ROOT/gdn-ba-run.log"
+python3 "$SOURCE/tools/bench/finalize_gdn_ba_trace.py" \
+  --evidence "$EVIDENCE" --source-commit "$SHA" \
   --run-log "$ROOT/gdn-ba-run.log"
 ```
 
-The raw dry-run manifest records the original GPU command and exact artifacts;
-the derived marker separately hashes the finalizer. Finalization requires 145
-versus 193 BF16 GEMMs, total nodes 963 versus 1,011, unchanged non-BF16
-families and memcpy/memset counts, and writes
-`complete-structural`; that status is diagnostic and earns no speed ratio.
-Exact build/corpus requirements and acceptance rules are in the
+Acceptance requires 145 versus 193 BF16 GEMMs, total nodes 963 versus 1,011,
+unchanged non-BF16 families and memcpy/memset counts. Exact build/corpus
+requirements and acceptance rules are in the
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md).
 
 Re-aggregate the binding result without GPU work; exit **1** is expected for a

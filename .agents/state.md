@@ -8367,3 +8367,51 @@ inertness, projection rounding and the c2/c16 **40 timing + 8 memory** component
 remain open. qkvz stays prohibited until those gates close, and no 35B
 performance command ran. Next: close the two remaining correctness/inertness
 checks, then run the same-binary BA component under one uncontended lock.
+
+## 2026-07-14 — W1C exact BF16 projection oracle and inertness tests implemented
+
+After conversation compaction, `AGENTS.md` and the W1C claim/spec were reread
+before source edits. `CLAIM-GDN-BA-ROUNDING-1` owns only BA output grounding,
+projection evidence, 35B/GGUF selection and the later c2/c16 BA component in
+the isolated `vllm.cpp-gdn-ba-rounding` worktree. qkvz, host-weight repair,
+the binding grid and 35B performance remain excluded.
+
+Whole-chain grounding confirms vLLM v0.25.0 target
+`702f4814fe54fabff350d43cb753ae3e47c0c276` dispatches the unquantized packed
+BA through `default_unquantized_gemm` to `torch.nn.functional.linear`, yielding
+BF16. The existing trace shows that runtime BA call resolves to the BF16-output
+`...128x2_tn_align8` family, while our token-correct F32-output merge resolves
+to a different `...128x1_tn_align8` family. The production default remains F32;
+new process-cached `VT_GDN_BA_OUT_BF16=1` selects the exact upstream output
+contract in the same binary for W1C validation.
+
+`tools/bench/gdn_ba_projection_oracle.py` now generates a deterministic
+real-shape `[M,5120] @ [96,5120]^T` oracle using mixed BF16 bit patterns. Under
+one `/tmp/gpu` lock, official vLLM 0.25.0 / Torch 2.11.0+cu130 on NVIDIA GB10
+was bit-stable across three repetitions for each M=1/2/4/16/32. Full raw and
+canonical-CBOR SHA-256 digests are frozen in
+`tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; the CUDA test
+recreates inputs and compares the complete output through the project's
+SHA-256 implementation. The first locked attempt failed before evidence due a
+2-D serializer bug. A succeeding short-period fixture was deliberately VOIDed
+because K=5120 aligned with its period and repeated rows; the final mixed
+fixture above supersedes it. A metadata-only wrong expanded commit hash was
+caught, corrected to the audited tag, and the exact oracle rerun unchanged.
+
+The same checkpoint adds explicit assertions that 35B native and
+`VT_DENSE_NATIVE=0` loaders retain split b/a and leave `in_proj_ba` empty, and
+that GGUF does the same. CPU builds of `test_op_parity`,
+`test_qwen36_weights`, and `test_gguf_qwen36_loader` pass. Synthetic GGUF is
+**3/3 cases, 97/97 assertions** and the broad CPU parity executable is **9/9
+cases, 123/123 assertions**; the local real-35B test correctly skips without
+the checkpoint. The original broad run's generic-manifest misclassification
+failed once; renaming the dedicated fixture to `oracle.json` repaired the
+dispatcher and the full focused rerun passed.
+
+This is an implementation/oracle checkpoint, not a completed correctness or
+performance gate. The local GB10 digest test, native/legacy 35B and real GGUF
+hardware repetition, and BF16 27B continuation remain **PENDING**; the retained
+model result is still **233/235 FAILED**. Binding stays **55/124**,
+`benchmark_binding=false`, no timing/memory/speed result exists, and qkvz
+remains prohibited until the W1C model/inertness and 40+8 component disposition
+close.

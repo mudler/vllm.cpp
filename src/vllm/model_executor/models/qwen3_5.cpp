@@ -2055,10 +2055,13 @@ DType ResidualDType() {
 // 27B loader, which is the only path that populates `in_proj_ba`. The resident
 // owner is shared by both arms: fallback slices its output rows and issues the
 // two legacy F32 GEMMs, never retaining duplicate split weights.
-// The merged GEMM also emits F32: this preserves the already-gated local gate
-// arithmetic (see GdnInDType) and passes the native 16-token stream. The
-// BF16-output gate reproduced the rejected emulation stream at token 7, so
-// exact upstream output-dtype parity remains a separate correctness gate.
+// The merged GEMM emits F32 by default: this preserves the already-gated local
+// gate arithmetic (see GdnInDType) and passes the native 16-token stream. vLLM
+// emits BF16 from torch.nn.functional.linear. VT_GDN_BA_OUT_BF16=1 selects that
+// exact output contract in the same binary while W1C grounds its projection
+// bits and downstream continuation; it cannot become the default until both
+// gates pass. The earlier BF16-output attempt reproduced the rejected
+// emulation stream at token 7, so this remains correctness-significant.
 bool MergedGdnBaEnabled(Dev d) {
   static const bool enabled = [] {
     const char* master = std::getenv("VT_GDN_MERGED_PROJ");
@@ -2067,6 +2070,14 @@ bool MergedGdnBaEnabled(Dev d) {
     return leaf == nullptr || leaf[0] != '0';
   }();
   return enabled && d.q.device.type == vt::DeviceType::kCUDA;
+}
+
+DType MergedGdnBaOutputDType() {
+  static const bool bf16 = [] {
+    const char* e = std::getenv("VT_GDN_BA_OUT_BF16");
+    return e != nullptr && e[0] != '0';
+  }();
+  return bf16 ? DType::kBF16 : DType::kF32;
 }
 
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
@@ -2099,7 +2110,7 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
     Tensor packed_weight = ResidentWeight(d, weights.in_proj_ba);
     if (MergedGdnBaEnabled(d)) {
       out.packed_owner.emplace(
-          MatmulBTRawD(d, hidden, packed_weight, DType::kF32));
+          MatmulBTRawD(d, hidden, packed_weight, MergedGdnBaOutputDType()));
       Tensor packed = out.packed_owner->t();
       out.b = packed.Slice(1, 0, value_heads);
       out.a = packed.Slice(1, value_heads, 2 * value_heads);

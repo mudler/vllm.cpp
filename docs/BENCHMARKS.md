@@ -15,6 +15,12 @@ into qkvz and ba. That explains all **96** extra BF16 GEMM launches. The
 [merged-projection spike](../.agents/specs/gdn-merged-input-projections.md) has
 a `GATING` BA-only W1 implementation. Clean pushed `581d335` closes its core
 correctness/safety repetition; BF16 output still fails the known near-tie.
+W1C now carries a default-off BF16-output path and an exact projection fixture
+generated through vLLM 0.25.0's `default_unquantized_gemm` on GB10. M=1/2/4/16/32
+are bit-stable across three oracle repetitions; the local CUDA digest and real
+model continuation have not yet passed, so this is `PENDING`, not a support or
+performance claim. Synthetic GGUF zero-selection is **97/97** and CPU parity is
+**123/123**; native/legacy 35B and real GGUF hardware repetition remain pending.
 Immutable trace `0091cd1`, finalized by pushed `8a1f923`, now has durable
 status **`complete-structural`**. All 12 merged ranges are exactly
 **963 / 145 BF16** and all 12 split ranges are **1,011 / 193**; every selected
@@ -68,7 +74,7 @@ performance command is authorized until the 27B result reaches 124/124.
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Complete the two merged-projection component checkpoints, then rerun the exact grid only if authorized |
-| `KERNEL-GEMM-BF16` | **GATING / W1 BA STRUCTURE PASS** | `0091cd1` is durably `complete-structural`: 24/24 exact local ranges, merged **963 / 145 BF16** versus split **1,011 / 193**, exactly 48 BF16-only removals, unchanged non-BF16 families, and 1,522/1,521 invariant vLLM control windows. `benchmark_binding=false`; BF16 output remains **FAILED at 233/235** | Finish GGUF/legacy inertness and BF16 rounding, then run c2/c16 AB/BA/AB before qkvz |
+| `KERNEL-GEMM-BF16` | **ACTIVE W1C / ORACLE IMPLEMENTED, CUDA PENDING** | `0091cd1` remains `complete-structural`. The vLLM 0.25.0 GB10 oracle is bit-stable 3× at M=1/2/4/16/32; default-off `VT_GDN_BA_OUT_BF16=1`, full-output digest comparison and explicit 35B/GGUF zero-selection tests compile. Synthetic GGUF is 97/97 and CPU parity 123/123. Local CUDA/model gates are pending; the retained BF16 model result is still **FAILED at 233/235** and `benchmark_binding=false` | Run the exact projection test plus native/legacy 35B and real GGUF under one lock; only then run c2/c16 AB/BA/AB before qkvz |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -168,6 +174,29 @@ ROOT="$HOME/work/vllm.cpp-gdn-ba-trace/$RAW_SHA"
 TRACE="$ROOT/evidence/$RAW_SHA/trace/27"
 sha256sum "$TRACE"/{gdn-ba-summary.json,gdn-ba-manifest.json,status-gdn-ba.json}
 # Expected: 03601168…54d5 / b203f0d2…5412 / 72328c48…63e
+```
+
+The next W1C reproduction, after creating and configuring the SHA-owned source
+and `build-cuda` directory shown below, is the following single-lock
+correctness/inertness series. Any partial or unlocked execution is void:
+
+```sh
+SHA=$(git rev-parse HEAD)
+ROOT="$HOME/work/vllm.cpp-gdn-ba-rounding/$SHA"
+SOURCE="$ROOT/source"
+BUILD="$ROOT/build-cuda"
+test "$(git -C "$SOURCE" rev-parse HEAD)" = "$SHA"
+test -z "$(git -C "$SOURCE" status --porcelain)"
+flock /tmp/gpu bash -lc "
+  set -euo pipefail
+  '$BUILD/tests/test_op_parity' \
+    -tc='qwen27 GDN BA BF16 projection matches vLLM 0.25 oracle*'
+  '$BUILD/tests/test_qwen36_weights'
+  '$BUILD/tests/test_qwen36_paged_engine'
+  '$BUILD/tests/test_qwen36_gguf_engine'
+  '$BUILD/tests/test_qwen27_paged_engine'
+  VT_GDN_BA_OUT_BF16=1 '$BUILD/tests/test_qwen27_paged_engine'
+"
 ```
 
 For a fresh reproduction, create a new SHA-owned root, write the plan before

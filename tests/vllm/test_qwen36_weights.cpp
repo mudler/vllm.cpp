@@ -25,6 +25,31 @@ namespace fs = std::filesystem;
 
 namespace {
 
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* name, const char* value) : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      had_old_ = true;
+      old_ = old;
+    }
+    setenv(name, value, 1);
+  }
+  ~ScopedEnv() {
+    if (had_old_) {
+      setenv(name_.c_str(), old_.c_str(), 1);
+    } else {
+      unsetenv(name_.c_str());
+    }
+  }
+  ScopedEnv(const ScopedEnv&) = delete;
+  ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+ private:
+  std::string name_;
+  std::string old_;
+  bool had_old_ = false;
+};
+
 // Resolve the pinned 35B snapshot's shard 1, or "" if unavailable.
 std::string FindShard1() {
   const char* home = std::getenv("HOME");
@@ -162,6 +187,11 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(gdn.gdn.in_proj_qkv_fp8.weight_scale > 0.0F);
     CHECK(gdn.gdn.in_proj_qkv_fp8.input_scale > 0.0F);
     CHECK(gdn.gdn.in_proj_qkv_fp8.alpha > 0.0F);
+    // W1 merged BA is a 27B-dense-only owner. The 35B native path keeps both
+    // split projections and must never make VT_GDN_MERGED_BA selectable.
+    CHECK(gdn.gdn.in_proj_ba.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
     // conv1d collapsed to [conv_dim, K].
     CHECK(gdn.gdn.conv1d_weight.shape[0] == 8192);
     CHECK(gdn.gdn.conv1d_weight.shape[1] == 4);
@@ -208,5 +238,15 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     REQUIRE_FALSE(attn.attn.o_proj_fp8.Empty());
     CHECK(attn.attn.o_proj_fp8.n == 2048);
     CHECK(attn.attn.o_proj_fp8.k == 4096);
+  }
+
+  SUBCASE("35B legacy dense path also keeps BA split") {
+    ScopedEnv legacy_dense("VT_DENSE_NATIVE", "0");
+    const vllm::Qwen3_5MoeLayerWeights gdn =
+        vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, 1);
+    REQUIRE(gdn.is_linear_attention);
+    CHECK(gdn.gdn.in_proj_ba.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
   }
 }

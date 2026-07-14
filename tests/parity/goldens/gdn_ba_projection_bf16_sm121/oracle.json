@@ -1,0 +1,56 @@
+{
+  "cases": [
+    {
+      "input_sha256": "e2fb1e960874d0624264eaac324c976d08dfcf71e57b9077058e8be296d34c3d",
+      "m": 1,
+      "output_cbor_sha256": "e5c2dae04b2d0628afb38645e32bd3bee69f6eeb206e69bd335c224fcee450c8",
+      "output_sha256": "808513769eb7c2c135badf79f7af854695b9c317cae6feb0666242655a01acfb"
+    },
+    {
+      "input_sha256": "8f9b8462891825d599db4328327326ca6f2198bc992c9e12b78e583b2c4d71cf",
+      "m": 2,
+      "output_cbor_sha256": "7dbdc3a36366a5648309d02b86ca7d745b02c1dad86fd226ced05cd39f5e7daa",
+      "output_sha256": "84607c7c1f129d503b06a27b337bf96091e23277057b7597f697d82f48e4b07e"
+    },
+    {
+      "input_sha256": "0314b18a06edddd3d88228fea4081bc079ce59428c4624d1fcd26f57282641e3",
+      "m": 4,
+      "output_cbor_sha256": "8dc097833ab354eef6382733fe965d6d24324fd98b3de4d3e58268c05e8d0054",
+      "output_sha256": "0c3ba8437011a2b1fb143055aa17f3ad49e2f07f7028cffb05a46c135624b3d6"
+    },
+    {
+      "input_sha256": "4b2261c688c4fd9fc2f0a14526d74992b38720190e41acdae332a2cced39ffb9",
+      "m": 16,
+      "output_cbor_sha256": "a287a68127687e05fddc3fcdf13b29c94c4f34596488af07ecd16607cac05571",
+      "output_sha256": "6fe8951f92a3576601c1393666426b95cefeab07983c8b3b86600144f7f0b720"
+    },
+    {
+      "input_sha256": "3674686b04a83ba31186bab352b627580748ec77eb1ca144ad278e9601449a2a",
+      "m": 32,
+      "output_cbor_sha256": "c67658a89b5123912be14338a949a41a7b96ce9d495a4d4063b673745ea7650c",
+      "output_sha256": "379f1c9f83182533bce6e809aabd1f4de84b635e3d03d31416a33f72cc86c870"
+    }
+  ],
+  "op": "gdn_ba_projection_bf16",
+  "oracle": {
+    "compute_capability": "12.1",
+    "cuda_runtime": "13.0",
+    "device": "NVIDIA GB10",
+    "dispatch": "vllm.model_executor.layers.utils.default_unquantized_gemm",
+    "implementation": "torch.nn.functional.linear",
+    "repetitions": 3,
+    "torch_version": "2.11.0+cu130",
+    "vllm_target_commit": "702f4814fe54fabff350d43cb753ae3e47c0c276",
+    "vllm_version": "0.25.0"
+  },
+  "pattern": {
+    "formula": "x=u32(i+seed*0x9e3779b9); x=(x^(x>>16))*0x7feb352d; x=(x^(x>>15))*0x846ca68b; x^=x>>16; sign=(x&1)<<15; exponent=(124+((x>>1)%5))<<7; mantissa=(x>>8)&127",
+    "input_seed": 7,
+    "weight_seed": 19
+  },
+  "shape": {
+    "k": 5120,
+    "n": 96
+  },
+  "weight_sha256": "cd852e470c5563ac72090cd547970d361bce682bebb1972853a57835819769f5"
+}

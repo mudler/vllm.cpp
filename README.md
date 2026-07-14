@@ -16,9 +16,16 @@ OpenAI-compatible server.
 > [implementation spike](.agents/specs/gdn-merged-input-projections.md) now has
 > a `GATING` BA-only W1 implementation: one weight owner and one F32-output BA
 > GEMM pass the clean pushed-SHA merged/split 27B gates **235/235 + 16/16**,
-> packed-view CUDA replay/memcheck, and native-35B inertness. An upstream-dtype
-> BF16-output experiment instead reproduced the rejected emulation stream
-> (**233/235**). Immutable trace `0091cd1`, finalized by pushed `8a1f923`, is
+> packed-view CUDA replay/memcheck, and native-35B inertness. A prior
+> upstream-dtype BF16-output experiment reproduced the rejected emulation
+> stream (**233/235**). W1C now has a default-off
+> `VT_GDN_BA_OUT_BF16=1` path plus an exact GB10/vLLM-0.25 projection oracle:
+> all five real BA shapes (M=1/2/4/16/32) are bit-stable across three oracle
+> repetitions. Synthetic GGUF proves the packed owner stays absent (**97/97**),
+> and the CPU parity suite is **123/123**. Local CUDA bit parity, native/legacy
+> 35B execution and the BF16 model continuation are still pending, so the
+> shipping F32 default and the 233/235 failure remain binding. Immutable trace
+> `0091cd1`, finalized by pushed `8a1f923`, is
 > now **`complete-structural`**: all 12 merged ranges are exactly
 > **963 / 145 BF16**, all 12 split ranges are **1,011 / 193**, and every
 > selected non-BF16 family is unchanged. The two fresh vLLM controls retain
@@ -35,7 +42,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. `0091cd1` is `complete-structural`: merged 963/145 versus split 1,011/193, exact 48-BF16-only removal, no speed credit | Finish GGUF/legacy inertness and BF16 rounding, then run the c2/c16 BA component before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. `0091cd1` is `complete-structural`; W1C's five-shape vLLM BF16 projection oracle is recorded, but local CUDA/model gates are pending | Run the exact local projection plus native/legacy-35B and GGUF gates, then c2/c16 BA component before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -63,7 +70,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes core correctness/safety; finalized `0091cd1` closes exact merged **963 / 145 BF16** versus split **1,011 / 193 BF16** structure. BF16 rounding, GGUF/legacy inertness and c2/c16 component remain open |
+| Selected GPU work | `KERNEL-GEMM-BF16` W1C is `ACTIVE` inside the open performance gate: pushed `581d335` closes core safety and finalized `0091cd1` closes exact **963 / 145** versus **1,011 / 193** structure. W1C adds the exact five-shape vLLM BF16 oracle and explicit 35B/GGUF zero-selection tests; local CUDA/model validation and c2/c16 remain open |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -135,7 +142,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; merged GDN BA is implemented/correctness-gating and qkvz remains pending |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124; merged GDN BA has an exact oracle but its BF16 local/model gate is pending, and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |

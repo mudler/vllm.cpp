@@ -1,7 +1,7 @@
 # Qwen3.5/3.6 GDN merged BF16 input projections
 
 **Row:** `KERNEL-GEMM-BF16` · **consumer:** `SERVE-GATE-ONLINE` ·
-**status:** spike complete, W1 BA `GATING` · **priority:** roadmap order 0.
+**status:** spike complete, W1C `ACTIVE` inside the open BA gate · **priority:** roadmap order 0.
 
 The finalized exact-c2 trace identifies one complete model-topology mismatch:
 the 27B path launches four BF16 input projections in each of 48 GDN layers,
@@ -30,6 +30,9 @@ only same-binary and fresh-oracle gates can earn performance credit.
   for BF16 `b/a`. Loads upcast to F32 in registers as upstream does.
 - Independent process-cached toggles `VT_GDN_MERGED_BA` and
   `VT_GDN_MERGED_QKVZ`, plus master rollback `VT_GDN_MERGED_PROJ=0`.
+- W1C's diagnostic `VT_GDN_BA_OUT_BF16=1` selects vLLM's BF16 BA output in
+  the same binary. It remains default-off until exact projection and native
+  continuation gates both pass; `0`/unset preserves the accepted F32 output.
 - Dense and paged forwards, CUDA-graph capture/replay, loader/storage tests,
   token correctness, memory accounting, exact node traces, and performance.
 
@@ -87,13 +90,14 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 | Surface | Current anchor | Disposition |
 |---|---|---|
 | Weight ownership / loader | `include/vllm/model_executor/models/qwen3_5_weights.h:146`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:165-257` | Real 27B owns one raw-NK `[b,a]` tensor; split b/a owners stay empty and rollback slices the merged owner. qkv/z remain split for W2. |
-| Dense + paged forward | `src/vllm/model_executor/models/qwen3_5.cpp:2053-2204,2386-2511` | CUDA default issues one F32-output BA GEMM; `VT_GDN_MERGED_BA=0` restores two F32 calls from the same owner. |
+| Dense + paged forward | `src/vllm/model_executor/models/qwen3_5.cpp:2053-2215,2397-2522` | CUDA default issues one F32-output BA GEMM; `VT_GDN_BA_OUT_BF16=1` selects exact upstream output dtype and `VT_GDN_MERGED_BA=0` restores two F32 calls from the same owner. |
 | BA consumers | `src/vt/ops.cpp:1466-1580`; CPU/CUDA implementations in `src/vt/{cpu/cpu_ops.cpp,cuda/cuda_glue.cu,cuda/cuda_gdn.cu}` | Fused and unfused consumers accept F32/BF16 inner-contiguous row views without materialization. |
 | Ported tests | `tests/vllm/models/test_qwen27_dense_forward.cpp:185-314`; `tests/vt/test_ops_gdn.cpp:1259-1445` | Exact loader bytes/one-owner rules plus F32/BF16 B=1/2/4/16/32 eager/capture/two-replay/canary coverage pass; strict memcheck is clean. |
 | Real models | `tests/parity/test_qwen27_paged_engine.cpp:116`; `tests/parity/test_qwen36_paged_engine.cpp:108` | Clean pushed `581d335` merged/split 27B logs are identical at 235/235 + 16/16; native 35B is 315/315. A BF16-output preflight fails 233/235 and exactly selects the rejected emulation continuation. |
 | Immutable W1 safety | `~/work/vllm.cpp-gdn-ba/immutable-581d335…`; status `3895e658…4cf6` | Exact CUDA build and focused 4/4 pass; packed-view compute-sanitizer is 590/590 with 0 errors/leaks; frozen fixture is 64/64 and no native cache is created. |
 | W1 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_ba_trace.py` | Historical no-mode c2 stays at 1,011 nodes. Explicit merged/split modes require 963/145 versus 1,011/193, record `VT_GDN_MERGED_BA`, run both paired arms under one lock and accept only a 48-BF16-only delta. Immutable `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural`: 24/24 exact local ranges, exact 48-BF16-only removal, unchanged selected non-BF16 families and `benchmark_binding=false`. The tool suite passes 69/69. |
-| Remaining W1 evidence | projection oracle and component tools | Projection-level BF16 rounding, GGUF/legacy inertness, and the 40+8-axis c2/c16 component remain pending. Capture lifecycle and exact structure are closed by `0091cd1`. |
+| W1C projection + inertness | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; `tests/parity/test_op_parity.cpp`; `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | vLLM 0.25.0 GB10 M=1/2/4/16/32 outputs are bit-stable across 3 repetitions and full-output digests are frozen. The local exact-digest test plus default-off BF16 output compile; synthetic GGUF zero-selection is 97/97 and CPU parity is 123/123. Local CUDA digest, native/legacy 35B and real GGUF hardware gates remain pending; the retained continuation is still 233/235 failed. |
+| Remaining W1 evidence | component tools | Close the local projection/model/hardware gates, then run the 40+8-axis c2/c16 component. Capture lifecycle and exact structure are already closed by `0091cd1`. |
 
 The completed evidence root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
@@ -281,8 +285,8 @@ frozen fixture are recorded before execution.
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
-| W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16, BF16 output is 233/235 and open. |
-| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Immutable safety/model gates pass at `581d335`; finalized `0091cd1` closes exact structure with `benchmark_binding=false`. GGUF/legacy inertness, BF16 rounding and component remain pending. G2 must close before W2. |
+| W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16. Default-off W1C BF16 selection is implemented; its retained model result is 233/235 until rerun. |
+| W1C | Repeat immutable safety/model gates, close BF16 rounding, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Immutable safety/model gates pass at `581d335`; finalized `0091cd1` closes exact structure. Exact five-shape vLLM oracle and local/inertness tests are implemented; oracle 3×, synthetic GGUF 97/97 and CPU parity 123/123 pass. Local CUDA/model/hardware gates and component remain pending. G2 must close before W2. |
 | W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
 | W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |

@@ -16,9 +16,12 @@ OpenAI-compatible server.
 > substitution: packed has **915** nodes versus rollback's **963**, replacing
 > 48 decomposed recurrence plus 48 post-conv calls with 48 packed calls while
 > leaving the remaining topology invariant. A production-build-only c2/c16
-> AB/BA/AB component runner and marker-last every-axis finalizer are now
-> implemented and CPU-gated **44/44**; DGX execution is **PENDING**, so the
-> binding result and speed credit do not change. Host
+> AB/BA/AB component runner and marker-last every-axis finalizer are
+> CPU-gated **44/44**. Its first clean DGX attempt at `593996d` built
+> **154/154** but failed before the GPU lock because the driver omitted the
+> mandatory `record-execution --profile-control off` argument. No model,
+> timing, or memory workload ran; a corrected fresh-SHA rerun is pending, so
+> the binding result and speed credit do not change. Host
 > memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
 > performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
@@ -28,7 +31,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the hardened production c2/c16 component runner is CPU-green **44/44** but not yet executed on DGX | Run the one-lock c2/c16 component before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted; the first component attempt at `593996d` failed pre-GPU on a missing required CLI argument after a **154/154** build | Add/test `--profile-control off`, push a fresh SHA, and rerun the one-lock component before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -56,7 +59,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted, and the production-build-only c2/c16 AB/BA/AB runner/finalizer is implemented with **44/44** focused CPU tests. It binds the exact source/vLLM corpus, full build/oracle and both direct model gates before timing; exactly recomputes throughput/TTFT/ITL and bounds pinned-clock E2E/TPOT reconstruction; rejects impossible duration, command/environment drift, failed GPU probes, unstable repetitions, throttling, memory-return drift and symlinked evidence; and remains DGX-pending |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted, and the production c2/c16 runner/finalizer is CPU-green **44/44**. Clean `593996d` built **154/154**, then failed before GPU ownership because its `record-execution` call omitted required `--profile-control off`; no corpus/model/timing/memory result exists. The next checkpoint is a test-first CLI repair and fresh-SHA one-lock rerun |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -147,7 +150,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The exact c2/c16 AB/BA/AB runner/finalizer is CPU-green **44/44**; every-axis DGX performance attribution remains open |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The c2/c16 runner is CPU-green **44/44**; its first DGX invocation failed pre-GPU on a missing required CLI argument, so every-axis attribution remains open |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 

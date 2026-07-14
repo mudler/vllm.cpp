@@ -15,11 +15,12 @@ immutable correctness at `f344dec` and accepted structure from `7ff713e`,
 finalized by `24cea4f`: packed has **915** nodes versus rollback's **963**, with
 the exact 48-for-96 GDN substitution and invariant remaining topology. The
 production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
-finalizer are now hardened and focused CPU tests pass **44/44**. Exact corpus
-manifests/partitions and detailed timing samples are revalidated rather than
-trusted, and symlinked evidence is rejected before sealing. Its **40
-timing + 8 memory** DGX execution remains **PENDING**, so no accepted
-performance number changes.
+finalizer are hardened and focused CPU tests pass **44/44**. The first clean
+DGX attempt at `593996d` built **154/154** but stopped before corpus validation,
+model loading, the GPU lock, or a timed leg: the driver omitted the required
+`record-execution --profile-control off` argument. This is **FAILED / PRE-GPU**
+rather than benchmark evidence. Its **40 timing + 8 memory** disposition stays
+pending and no accepted performance number changes.
 
 ## Binding 27B online gate
 
@@ -64,9 +65,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted and the c2/c16 runner is CPU-green **44/44**, with no timing credit | Execute the one-lock c2/c16 runner; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `593996d` component attempt failed pre-GPU after a **154/154** build, with no timing credit | Repair/test the missing profile-control argument and execute a fresh-SHA one-lock component; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 COMPONENT GATING** | Structural evidence is accepted. [`dgx-gdn-packed-component.sh`](../scripts/dgx-gdn-packed-component.sh) and its fail-closed finalizer implement the production-only c2/c16 AB/BA/AB contract; focused CPU tests pass **44/44** | Run the pushed SHA once under its single GPU lock |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 PRE-GPU REPAIR** | Structural evidence and **44/44** CPU contracts are accepted. Clean `593996d` built **154/154**, then `record-execution` rejected the driver's missing required `--profile-control off`; no GPU lock or component artifact was reached | Add a test-first CLI contract, patch the driver, push, and run from a new immutable root |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -89,8 +90,16 @@ state log. The current checkpoint is W1D3 component gating:
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
-| Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | Hardened implementation and focused CPU validation **44/44 PASS**; DGX execution **PENDING** |
+| Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | CPU validation **44/44 PASS**. First DGX attempt `593996d`: **FAILED / PRE-GPU** after build **154/154** because the driver omitted required `--profile-control off`; no `27-component.json`, order log, summary, manifest, or status exists |
 | Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and all **144** paired run axes, ≤4% per-run deviation, fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **NO SPEED CREDIT; c2/c16 PENDING** |
+
+The retained failed root is
+`~/work/vllm.cpp-gdn-packed-component/593996d7a40ad323834a96eaa542c943142f788e`.
+Configure / plan / oracle / build / run-log SHA-256 values are
+`53b641c5…e81` / `fa706ad4…ac7` / `fafba500…aa2` /
+`44dad8a3…89a2` / `9af78f60…3995`. The detached source is clean; GPU,
+`/tmp/gpu`, and port 8001 are idle/free. Preserve this root as pre-GPU failure
+evidence and never append a replacement run to it.
 
 The current raw root is
 `~/work/vllm.cpp-gdn-packed-trace/7ff713e377457130db4ed15929133d1b463aff96`.
@@ -119,8 +128,9 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 and W1D3 structural evidence are closed. The next reproduction entry point,
-after pushing the exact source SHA and creating its production build, is:
+G2 and W1D3 structural evidence are closed. First add a test-first contract for
+the mandatory `record-execution --profile-control off` argument and push that
+repair. The fresh repaired-SHA reproduction entry point is then:
 
 ```sh
 set -euo pipefail

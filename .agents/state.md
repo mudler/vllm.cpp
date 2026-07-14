@@ -9094,3 +9094,74 @@ Accept only marker-last `complete-pass`, `complete-failed`, or
 qkvz work; do not rerun the binding grid, start 35B performance, or claim speed
 credit first. The active claim remains `CLAIM-GDN-BA-ROUNDING-1` in worktree
 `/home/mudler/_git/vllm.cpp-gdn-ba-rounding`.
+
+## 2026-07-14 — session handoff: first component attempt fails before GPU ownership
+
+The prior handoff was resumed from clean pushed
+`593996d7a40ad323834a96eaa542c943142f788e` in isolated local worktree
+`/home/mudler/_git/vllm.cpp-gdn-ba-rounding` on branch
+`codex/gdn-ba-rounding-w1c`. `origin/main` points to that exact commit. The
+corresponding GitHub Actions run `29367367122` was still queued when this
+handoff was recorded.
+
+DGX preflight found no compute process, 0% utilization, free `/tmp/gpu`, free
+port 8001, and 227 GB available. The dirty shared checkout
+`~/work/vllm.cpp` was not modified; only its refs were fetched. A detached,
+clean source was created at
+`~/work/vllm.cpp-gdn-packed-component/593996d7a40ad323834a96eaa542c943142f788e/source`,
+the binding corpus was copied byte-for-byte from
+`~/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27`,
+and the exact RelWithDebInfo CUDA 13.0.88/sm_121a production configuration
+completed. The driver built its requested targets **154/154**; server and
+`test_qwen27_paged_engine` binaries exist.
+
+The detached driver PID 3859911 then exited before corpus validation, model
+loading, `/tmp/gpu` acquisition, or the first component leg. Systematic
+debugging found the exact cause in
+`scripts/dgx-gdn-packed-component.sh:175-189`: its `online_gate.py
+record-execution` invocation does not supply the parser's mandatory
+`--profile-control` argument (`tools/bench/online_gate.py:3867`). The production
+build is intentionally profile-control OFF, so the missing token must be
+`--profile-control off`. The run log ends with argparse's exact error:
+`the following arguments are required: --profile-control`.
+
+This root is **FAILED / PRE-GPU**, not a benchmark and not a sealable component
+result. `execution/27-component.json`, `component-order.log`, summary,
+manifest, and status are all absent. Configure / plan / oracle / build / run
+SHA-256 values are
+`53b641c5dbd29daa45b26d1d2d18c8e6276c01e2eafb2c65b3636ceeb16c4e81` /
+`fa706ad4426647027349810ad0b58994d43553a899222949b2a537ec3dbabac7` /
+`fafba500b26102d50d8e99bec913d3bc6844c7cccd1aeb0238d41de66fc81aa2` /
+`44dad8a38f1aca4915a08bba6737ec10458185f2b49bbb5a8a2c3edbfdeb89a2` /
+`9af78f602b572f412bb124765f0a960448a8e47d86ed8e341e6fea3543ac3995`.
+Server / model-test binary SHA-256 values are
+`665bfd3889d58b6c696880597ef2b8f2f9cf26ebca6d97aebedf6e21fb4e401d` /
+`aa119f90aebf606000ee28d4d583c4198fd39d100d300aaa4febb3a344b40ac9`.
+The detached source remains clean. Post-failure the GPU is 0%/P8 with no
+compute application; `/tmp/gpu` and port 8001 are free. Preserve this root and
+never append the replacement run to it.
+
+Exact resume sequence:
+
+1. Add a failing contract in `tests/tools/test_gdn_packed_component.py` that
+   exercises or inspects the production `record-execution` command and requires
+   the explicit `--profile-control off` pair.
+2. Make the single source repair in `scripts/dgx-gdn-packed-component.sh`, then
+   run the focused component suite, all tool tests, Bash syntax, ShellCheck,
+   Python compilation, record/mutation and documentation-checkpoint gates.
+3. Update every snapshot surface from this pre-GPU failure to the repaired
+   pending state, append the ledger/state evidence, commit with the required
+   trailers, and push directly to `main`.
+4. Create a **new**
+   `~/work/vllm.cpp-gdn-packed-component/<repair-sha>` detached source/evidence
+   root. Do not reuse `593996d`. Reuse only the byte-identical binding corpus
+   and exact production configure recipe in `docs/BENCHMARKS.md`.
+5. Execute the entire driver-owned one-lock series. Accept only a verified
+   marker-last `complete-pass`, `complete-failed`, or `complete-void` and
+   disposition all **40 timing + 8 memory** medians plus **144 paired** axes.
+
+Binding truth is unchanged: `3f256ab` remains **55/124**, c2 TPOT remains
+**114.841 vs 108.274 ms (6.1% slower)**, the host mirror remains **22.920
+GiB**, and 35B performance stays blocked. `benchmark_binding=false`; qkvz,
+the exact grid, and any speed credit remain prohibited until the component
+gate has a verified terminal disposition.

@@ -18,10 +18,16 @@ OpenAI-compatible server.
 > GEMM pass the clean pushed-SHA merged/split 27B gates **235/235 + 16/16**,
 > packed-view CUDA replay/memcheck, and native-35B inertness. An upstream-dtype
 > BF16-output experiment instead reproduced the rejected emulation stream
-> (**233/235**). The fail-closed trace harness now has explicit merged/split
-> contracts and a one-lock dual-arm finalizer, with all 68 tooling tests green;
-> pushed-SHA execution, exact rounding, and component performance remain open,
-> so no speed credit exists yet. Host memory also retains
+> (**233/235**). Immutable raw trace `0091cd1` now proves all 12 merged ranges
+> at **963 / 145 BF16** and all 12 split ranges at **1,011 / 193**. Its first
+> finalization failed closed before writing a marker because the two fresh vLLM
+> controls selected previously unseen Torch/Inductor RMSNorm register-allocation
+> signatures. Their 1,522/1,521 steady windows retain identical names, geometry,
+> shared memory, family counts and FP4 tactics; the exact two-signature repair is
+> green at **69/69** tool tests, and a no-write full-chain preflight validates
+> the exact 48-BF16-only delta. It awaits pushed-source re-finalization. Exact
+> rounding and component performance remain open, so no speed credit exists yet.
+> Host memory also retains
 > a **22.92 GiB CPU weight mirror**. No 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
@@ -30,7 +36,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**; pushed `581d335` closes BA W1 core correctness/safety, and the explicit 145/193-node trace harness is locally green but not yet executed from its pushed SHA | Run/finalize the merged/split trace, resolve BF16 rounding, then component-gate BA before claiming qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Raw `0091cd1` has 24/24 exact merged/split local ranges; finalization rejected two new exact vLLM Inductor register signatures and wrote no marker. The narrow repair passes 69/69 and a no-write full-chain preflight | Push the finalizer repair and re-finalize the immutable raw set; then resolve BF16 rounding and component-gate BA before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -58,7 +64,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes core correctness/safety. The mode-aware c2 harness keeps historical evidence on its 1,011-node contract, explicitly gates merged **963 / 145 BF16** versus split **1,011 / 193 BF16**, and runs both paired arms under one lock; immutable execution and the c2/c16 component remain pending |
+| Selected GPU work | `KERNEL-GEMM-BF16` W1 is `GATING`: pushed `581d335` closes core correctness/safety. Raw `0091cd1` completed the one-lock paired capture and has exact merged **963 / 145 BF16** versus split **1,011 / 193 BF16** local topology. Finalization is pending after its fail-closed vLLM-signature rejection; c2/c16 component remains unrun |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -180,8 +186,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: immutable trace/component-gate merged BA and
-resolve its BF16 rounding gap → implement/gate merged qkvz → all-axis 27B
+The next execution order is fixed: re-finalize the immutable raw merged-BA
+trace, component-gate it and resolve its BF16 rounding gap → implement/gate merged qkvz → all-axis 27B
 parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
 LMCache support.

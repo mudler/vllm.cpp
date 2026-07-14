@@ -25,10 +25,12 @@ GEMMs. The accepted
 [merged-projection spike](gdn-merged-input-projections.md) makes
 `KERNEL-GEMM-BF16` W1 `GATING`. Its one-owner F32-output BA merge passes
 clean pushed `581d335` core model/safety gates, but the BF16-output arm fails the
-known near-tie. Exact 145-vs-193 structure plus c2/c16 performance remain
-pending. Their explicit mode-aware validator/driver/finalizer is locally green
-at 68/68 tool tests and preserves the historical no-mode contract; pushed-SHA
-GPU execution is next. qkvz is still excluded. No cross-profiler duration or
+known near-tie. Raw `0091cd1` completes 12/12 merged 145-BF16 and 12/12 split
+193-BF16 local ranges. Its first finalizer rejected two new internally invariant
+vLLM Inductor RMSNorm register signatures and wrote no marker. The exact
+two-hash repair passes 69/69 tool tests and preserves the full-signature and
+historical no-mode contracts; pushed-source re-finalization plus c2/c16
+performance remain pending. qkvz is still excluded. No cross-profiler duration or
 launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
 weight mirror plus load-time source-page residency.
@@ -249,9 +251,11 @@ reported as a clean dependency check.
 5. Retain c16 schema-v5 `c498a413` and finalized c2 `179a0fc` as the immutable
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
    core correctness/safety; BF16 rounding remains open.
-6. The exact-c2 mode-aware harness is implemented and CPU-gated. Run/finalize
-   its pushed SHA to close 145-vs-193 structure, then close BF16 rounding and
-   c2/c16 component disposition; only then claim qkvz. Host-weight ownership
+6. The exact-c2 mode-aware harness is implemented and CPU-gated. Raw `0091cd1`
+   passes all 24 local range contracts but has no completion marker after a
+   fail-closed oracle-signature rejection. Push the exact repair and re-finalize,
+   then close BF16 rounding and c2/c16 component disposition; only then claim
+   qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.

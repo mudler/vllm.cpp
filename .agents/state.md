@@ -8305,3 +8305,38 @@ row ID and newest state entries instead of reading either raw history from the
 beginning. This policy-only checkpoint changes no implementation, benchmark or
 lifecycle state: binding 27B remains **55/124**, and the pushed-SHA merged/split
 GDN BA trace remains the next GPU action.
+
+## 2026-07-14 — GDN BA raw dual trace passes local structure; first finalizer rejects oracle signatures
+
+Clean pushed `0091cd192d9a6baa2197a4f3bdb0561bd859baf5` ran from detached root
+`~/work/vllm.cpp-gdn-ba-trace/0091cd192d9a6baa2197a4f3bdb0561bd859baf5`.
+Its exact RelWithDebInfo CUDA 13.0.88/sm_121a build completed **154/154**, the
+27B model gate passed **1/1**, and one uncontended `/tmp/gpu` lock covered both
+complete local/vLLM arms. All **12/12** merged ranges are invariant at
+**963 kernels / 145 BF16 GEMMs**; all **12/12** split ranges are invariant at
+**1,011 / 193**. Each retains 7 memcpy, 1 memset and every selected non-BF16
+family count. GPU, lock and ports returned idle.
+
+The fresh merged/split vLLM traces have SHA-256 `b8d26d4c…fc59` /
+`cef841ce…ede5`. They contain 1,522 / 1,521 internally invariant steady B=2
+windows at 1,160 kernels and accepted ordered-name SHA `858915dd…fad0`.
+The first CPU finalizer nevertheless exited 2 on a previously unseen full
+launch-signature hash and wrote no summary, manifest or marker. Reproduction
+with each candidate hash proves complete within-trace invariance at
+`17e1037e…14ed` / `f7a3ca1f…cadf`. Exact launch comparison against accepted
+`179a0fc` and between the two controls finds no name, block, grid, shared-memory,
+family-count or FP4-tactic change. Only cached Torch/Inductor generated-RMSNorm
+register allocation differs. The complete merged distribution is 1×26,
+48×28, 64×40, 1×44, 19×48 and 44×50 registers; split is 1×26, 48×28, 64×40,
+1×44, 35×48 and 28×50.
+
+The repair adds only those two exact complete-signature hashes to the existing
+allowlist and a contract test; it does not introduce a per-field tolerance.
+The complete tools suite passes **69/69**. A no-write in-memory full-chain
+preflight then validates all 24 local ranges, both complete oracle chains,
+exact **48 total / 48 BF16** deltas and unchanged non-BF16 family counts; it
+returns `complete-structural` with `benchmark_binding=false`. This checkpoint remains
+**FAILED / incomplete derived evidence** until the repair is pushed and the
+immutable raw set is re-finalized. It earns no speed credit: binding
+`3f256ab` remains **55/124**, BF16 output remains 233/235, c2/c16 component and
+qkvz remain prohibited, and no 35B performance command ran.

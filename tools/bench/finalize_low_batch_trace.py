@@ -69,6 +69,20 @@ ALLOWED_B2_SIGNATURES = {
     "8de0b7fef06d88d9ea023d9ddb55b172ca92b3ae27b3a351bb14536e904da894": (
         "generated-rmsnorm-registers-50"
     ),
+    # Immutable 0091cd1 GDN-BA merged oracle control.  All 1,522 steady
+    # windows retain the accepted names, blocks, grids and shared memory;
+    # only cached Torch/Inductor RMSNorm partitions redistribute registers:
+    # 1x26, 48x28, 64x40, 1x44, 19x48 and 44x50.
+    "17e1037ec3918420faf2ed4a004e10c9b0c1165504a67939e784578f3d1c14ed": (
+        "gdn-ba-merged-rmsnorm-register-allocation"
+    ),
+    # The paired 0091cd1 split oracle control has the same exact structural
+    # contract across all 1,521 steady windows, with 35 generated RMSNorm
+    # launches at 48 registers and 28 at 50; its complete distribution is
+    # 1x26, 48x28, 64x40, 1x44, 35x48 and 28x50.
+    "f7a3ca1f31d7d5dd672fc3def715cbd025b771d552601a8521fb3768b3adcadf": (
+        "gdn-ba-split-rmsnorm-register-allocation"
+    ),
 }
 EXPECTED_B2_FP4_TACTICS = {"static_persistent": 80, "stream_k": 128}
 EXPECTED_B2_GENERATED_RMSNORM_QUANT = 177

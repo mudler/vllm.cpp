@@ -117,6 +117,20 @@ def summarize(path: pathlib.Path, batches: list[int], signature_sha256: str):
 
 
 class LowBatchTraceSummaryTests(unittest.TestCase):
+    def test_production_signature_allowlist_keeps_exact_gdn_ba_controls(self) -> None:
+        self.assertEqual(
+            finalizer.ALLOWED_B2_SIGNATURES[
+                "17e1037ec3918420faf2ed4a004e10c9b0c1165504a67939e784578f3d1c14ed"
+            ],
+            "gdn-ba-merged-rmsnorm-register-allocation",
+        )
+        self.assertEqual(
+            finalizer.ALLOWED_B2_SIGNATURES[
+                "f7a3ca1f31d7d5dd672fc3def715cbd025b771d552601a8521fb3768b3adcadf"
+            ],
+            "gdn-ba-split-rmsnorm-register-allocation",
+        )
+
     def test_accepts_invariant_b2_windows_and_one_bounded_drain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "trace.json.gz"

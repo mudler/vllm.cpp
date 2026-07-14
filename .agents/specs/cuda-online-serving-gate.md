@@ -34,8 +34,9 @@ family remains unchanged. `benchmark_binding=false`; downstream first-divergence
 is now closed by the accepted [packed-decode spike](gdn-packed-decode.md): the
 complete F32 in-kernel q/k normalization plus dtype-rounded beta reaches `0/1`
 output/state differences, while beta-only does not. Clean `f18ca23` closes
-immutable G0 with byte-identical regeneration and CUDA **10/10**. Production
-implementation, 235/235 and c2/c16 performance remain pending.
+immutable G0 with byte-identical regeneration and CUDA **10/10**. W1D1 now
+implements the CPU/CUDA operator and upstream matrix with mutable safety green;
+clean G1, production model dispatch, 235/235 and c2/c16 remain pending.
 qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
@@ -258,12 +259,13 @@ reported as a clean dependency check.
    executed-path baselines. Pushed `581d335` closes BA W1 F32-output
    core correctness/safety; `f925294` closes exact projection/inertness while
    the BF16 model remains open at 233/235. Clean `f18ca23` closes the selected
-   packed-decode semantic replay; production implementation is next.
+   packed-decode semantic replay; W1D1 operator preflight is green and clean
+   pushed-SHA G1 is next.
 6. The exact-c2 mode-aware harness is implemented and CPU-gated. Immutable
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
    24 local range contracts with `benchmark_binding=false`. Port and gate
-   `KERNEL-GDN-PACKED-DECODE`, restore 235/235, then close c2/c16 component
-   disposition; only then claim qkvz. Host-weight ownership
+   clean G1 for `KERNEL-GDN-PACKED-DECODE`, wire W1D2 and restore 235/235, then
+   close c2/c16 component disposition; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.

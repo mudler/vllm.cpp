@@ -1955,16 +1955,37 @@ TEST_CASE("qwen27 GDN packed decode boundary matches vLLM 0.25 semantics (dgx-on
       run_decode(dq_f32.tensor(), dk_f32.tensor(), dv_f32.tensor(),
                  dg_oracle.tensor(), dbeta_packed.tensor());
 
+  DeviceBuf packed_state(backend, queue, state_in.dtype,
+                         ShapeOf(state_in.tensor), state_in.raw.data.data());
+  DeviceBuf packed_out(backend, queue, DType::kBF16, {batch, hv, dv});
+  vt::GdnPackedDecode(queue, packed_out.tensor(), dmixed.tensor(), da.tensor(),
+                      db.tensor(), da_log.tensor(), ddt_bias.tensor(),
+                      packed_state.tensor(), didx.tensor(), vt::GdnArgs{scale});
+  std::vector<uint8_t> packed_out_host, packed_state_host;
+  const Tensor packed_out_result = packed_out.Download(queue, packed_out_host);
+  const Tensor packed_state_result =
+      packed_state.Download(queue, packed_state_host);
+  const std::pair<int64_t, int64_t> packed{
+      bf16_bitdiff(packed_out_result, out_want.tensor),
+      bf16_bitdiff(packed_state_result, state_want.tensor)};
+  RequireMatch("packed-boundary direct out", packed_out_result, out_want.tensor,
+               2e-2, 1e-2);
+  RequireMatch("packed-boundary direct state", packed_state_result,
+               state_want.tensor, 2e-2, 1e-2);
+
   MESSAGE("packed decode exact BF16 bit differences: current out/state="
           << current.first << "/" << current.second
           << ", beta-rounded=" << beta_only.first << "/" << beta_only.second
           << ", beta-rounded + F32 q/k norm=" << no_norm_round.first << "/"
-          << no_norm_round.second);
+          << no_norm_round.second << ", direct packed=" << packed.first << "/"
+          << packed.second);
   CHECK(current.first > 0);
   CHECK(current.second > 0);
   CHECK(beta_only.second <= current.second);
   CHECK(no_norm_round.first == 0);
   CHECK(no_norm_round.second <= 1);
+  CHECK(packed.first == 0);
+  CHECK(packed.second <= 1);
   backend.DestroyQueue(queue);
 }
 

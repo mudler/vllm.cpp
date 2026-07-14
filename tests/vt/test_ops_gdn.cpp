@@ -1,6 +1,8 @@
 // vllm.cpp original vt runtime with GDN cases ported from pinned upstream
 // tests/kernels/mamba/test_gdn_prefill_cutedsl.py @ e24d1b24 (multi-sequence
-// varlen, bf16 output-buffer parity, state parity). Formula reference:
+// varlen, bf16 output-buffer parity, state parity) and vLLM v0.25.0
+// tests/kernels/test_fused_recurrent_packed_decode.py @ 702f4814 (FP16/BF16/
+// F32, row-strided packed input, indexed persistent state). Formula reference:
 // .agents/specs/gdn-semantics.md (§2-§7 and Tests to port).
 // Golden coverage lives in tests/parity/test_op_parity.cpp; these tests pin
 // hand-computed values and the corners the goldens do not cover (conv bias,
@@ -559,15 +561,16 @@ std::vector<float> RandomF32(size_t n, uint32_t seed, float lo = -2.0f, float hi
   return v;
 }
 
-// Packs an f32 master vector into the byte representation of dt (f32 or bf16).
+// Packs an f32 master vector into the byte representation of dt.
 std::vector<uint8_t> Pack(const std::vector<float>& f, DType dt) {
   std::vector<uint8_t> out(f.size() * vt::SizeOf(dt));
   if (dt == DType::kF32) {
     std::memcpy(out.data(), f.data(), out.size());
   } else {
-    REQUIRE(dt == DType::kBF16);
+    REQUIRE((dt == DType::kF16 || dt == DType::kBF16));
     auto* p = reinterpret_cast<uint16_t*>(out.data());
-    for (size_t i = 0; i < f.size(); ++i) p[i] = vt::F32ToBF16(f[i]);
+    for (size_t i = 0; i < f.size(); ++i)
+      p[i] = dt == DType::kF16 ? vt::F32ToF16(f[i]) : vt::F32ToBF16(f[i]);
   }
   return out;
 }
@@ -578,9 +581,10 @@ std::vector<float> Unpack(const std::vector<uint8_t>& b, DType dt) {
   if (dt == DType::kF32) {
     std::memcpy(out.data(), b.data(), b.size());
   } else {
-    REQUIRE(dt == DType::kBF16);
+    REQUIRE((dt == DType::kF16 || dt == DType::kBF16));
     const auto* p = reinterpret_cast<const uint16_t*>(b.data());
-    for (size_t i = 0; i < n; ++i) out[i] = vt::BF16ToF32(p[i]);
+    for (size_t i = 0; i < n; ++i)
+      out[i] = dt == DType::kF16 ? vt::F16ToF32(p[i]) : vt::BF16ToF32(p[i]);
   }
   return out;
 }
@@ -655,6 +659,461 @@ constexpr Combo kCudaCombos[] = {
     {DType::kBF16, DType::kF32, 2e-3f, 2e-3f},
     {DType::kBF16, DType::kBF16, 4e-3f, 8e-3f},
 };
+
+// ---------------------------------------------------------------------------
+// Packed pure-decode port of vLLM v0.25.0
+// tests/kernels/test_fused_recurrent_packed_decode.py. The production op keeps
+// q/k normalization in f32, rounds sigmoid(b) through b.dtype, and reads/writes
+// persistent state in its declared FP16/BF16/F32 storage dtype.
+
+Tensor RowView(void* data, DType dtype, Device device, int64_t rows,
+               int64_t cols, int64_t row_stride) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dtype;
+  t.device = device;
+  t.rank = 2;
+  t.shape[0] = rows;
+  t.shape[1] = cols;
+  t.stride[0] = row_stride;
+  t.stride[1] = 1;
+  return t;
+}
+
+float ReadPacked(const Tensor& t, int64_t offset) {
+  switch (t.dtype) {
+    case DType::kF32: return t.Ptr<float>()[offset];
+    case DType::kF16: return vt::F16ToF32(t.Ptr<uint16_t>()[offset]);
+    case DType::kBF16: return vt::BF16ToF32(t.Ptr<uint16_t>()[offset]);
+    default: throw std::runtime_error("packed reference requires a float tensor");
+  }
+}
+
+void WritePacked(const Tensor& t, int64_t offset, float value) {
+  switch (t.dtype) {
+    case DType::kF32: t.Ptr<float>()[offset] = value; break;
+    case DType::kF16: t.Ptr<uint16_t>()[offset] = vt::F32ToF16(value); break;
+    case DType::kBF16: t.Ptr<uint16_t>()[offset] = vt::F32ToBF16(value); break;
+    default: throw std::runtime_error("packed reference requires a float tensor");
+  }
+}
+
+float RoundPacked(float value, DType dtype) {
+  if (dtype == DType::kF16) return vt::F16ToF32(vt::F32ToF16(value));
+  if (dtype == DType::kBF16) return vt::BF16ToF32(vt::F32ToBF16(value));
+  return value;
+}
+
+void PackedDecodeReference(Tensor& out, const Tensor& mixed_qkv,
+                           const Tensor& a, const Tensor& b,
+                           const Tensor& a_log, const Tensor& dt_bias,
+                           Tensor& state, const Tensor& state_idx,
+                           const GdnArgs& args) {
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv_n = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  const int64_t qk_dim = mixed_qkv.shape[1] - hv_n * dv;
+  const int64_t hk_n = qk_dim / (2 * dk);
+  const int64_t ratio = hv_n / hk_n;
+  const auto* indices = state_idx.Ptr<int32_t>();
+  std::vector<float> qv(static_cast<size_t>(dk));
+  std::vector<float> kv(static_cast<size_t>(dk));
+  std::vector<float> state_row(static_cast<size_t>(dk));
+
+  for (int64_t bt = 0; bt < batch; ++bt) {
+    const int32_t slot = indices[bt];
+    if (slot < 0) {
+      for (int64_t i = 0; i < hv_n * dv; ++i)
+        WritePacked(out, bt * hv_n * dv + i, 0.0f);
+      continue;
+    }
+    for (int64_t hv = 0; hv < hv_n; ++hv) {
+      const int64_t hk = hv / ratio;
+      float q_sumsq = 0.0f;
+      float k_sumsq = 0.0f;
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        qv[static_cast<size_t>(ki)] =
+            ReadPacked(mixed_qkv, bt * mixed_qkv.stride[0] + hk * dk + ki);
+        kv[static_cast<size_t>(ki)] = ReadPacked(
+            mixed_qkv, bt * mixed_qkv.stride[0] + hk_n * dk + hk * dk + ki);
+        q_sumsq += qv[static_cast<size_t>(ki)] * qv[static_cast<size_t>(ki)];
+        k_sumsq += kv[static_cast<size_t>(ki)] * kv[static_cast<size_t>(ki)];
+      }
+      const float q_inv = 1.0f / std::sqrt(q_sumsq + 1e-6f);
+      const float k_inv = 1.0f / std::sqrt(k_sumsq + 1e-6f);
+      for (int64_t ki = 0; ki < dk; ++ki) {
+        qv[static_cast<size_t>(ki)] *= q_inv * args.scale;
+        kv[static_cast<size_t>(ki)] *= k_inv;
+      }
+
+      const float av = ReadPacked(a, bt * a.stride[0] + hv);
+      const float bv = ReadPacked(b, bt * b.stride[0] + hv);
+      const float x = av + ReadPacked(dt_bias, hv);
+      const float softplus =
+          x <= 20.0f ? std::log1p(std::exp(std::min(x, 20.0f))) : x;
+      const float decay =
+          std::exp(-std::exp(ReadPacked(a_log, hv)) * softplus);
+      const float beta =
+          RoundPacked(1.0f / (1.0f + std::exp(-bv)), b.dtype);
+
+      for (int64_t vi = 0; vi < dv; ++vi) {
+        const int64_t state_base =
+            ((static_cast<int64_t>(slot) * hv_n + hv) * dv + vi) * dk;
+        float dot = 0.0f;
+        for (int64_t ki = 0; ki < dk; ++ki) {
+          state_row[static_cast<size_t>(ki)] =
+              ReadPacked(state, state_base + ki) * decay;
+          dot += state_row[static_cast<size_t>(ki)] * kv[static_cast<size_t>(ki)];
+        }
+        const int64_t v_offset = bt * mixed_qkv.stride[0] + 2 * hk_n * dk + hv * dv + vi;
+        const float vp = (ReadPacked(mixed_qkv, v_offset) - dot) * beta;
+        float output = 0.0f;
+        for (int64_t ki = 0; ki < dk; ++ki) {
+          const float updated = state_row[static_cast<size_t>(ki)] +
+                                vp * kv[static_cast<size_t>(ki)];
+          WritePacked(state, state_base + ki, updated);
+          output += updated * qv[static_cast<size_t>(ki)];
+        }
+        WritePacked(out, (bt * hv_n + hv) * dv + vi, output);
+      }
+    }
+  }
+}
+
+struct PackedCase {
+  int64_t batch;
+  int64_t hk;
+  int64_t hv;
+  int64_t dk;
+  int64_t dv;
+  int64_t slots;
+  int64_t mixed_cols;
+  int64_t mixed_stride;
+  int64_t gate_stride;
+  DType dtype;
+  std::vector<uint8_t> mixed;
+  std::vector<uint8_t> a;
+  std::vector<uint8_t> b;
+  std::vector<uint8_t> a_log;
+  std::vector<uint8_t> dt_bias;
+  std::vector<uint8_t> state;
+  std::vector<int32_t> indices;
+};
+
+PackedCase MakePackedCase(DType dtype, bool strided, int64_t batch,
+                          int64_t hk, int64_t hv, int64_t dk, int64_t dv,
+                          uint32_t seed) {
+  const int64_t mixed_cols = 2 * hk * dk + hv * dv;
+  const int64_t mixed_stride = mixed_cols + (strided ? 64 : 0);
+  const int64_t gate_stride = hv + (strided ? 5 : 0);
+  const int64_t slots = batch;
+  auto mixed_f = RandomF32(static_cast<size_t>(batch * mixed_stride), seed);
+  auto a_f = RandomF32(static_cast<size_t>(batch * gate_stride), seed + 1);
+  auto b_f = RandomF32(static_cast<size_t>(batch * gate_stride), seed + 2);
+  auto a_log_f = RandomF32(static_cast<size_t>(hv), seed + 3, -1.0f, 0.5f);
+  auto dt_bias_f = RandomF32(static_cast<size_t>(hv), seed + 4, -0.5f, 0.5f);
+  auto state_f =
+      RandomF32(static_cast<size_t>(slots * hv * dv * dk), seed + 5, -0.25f, 0.25f);
+  std::vector<int32_t> indices(static_cast<size_t>(batch));
+  for (int64_t i = 0; i < batch; ++i) indices[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  if (batch >= 3) {
+    indices[static_cast<size_t>(batch - 3)] = -1;
+    indices[static_cast<size_t>(batch - 2)] = -1;
+    indices[static_cast<size_t>(batch - 1)] = -1;
+  }
+  return PackedCase{batch,
+                    hk,
+                    hv,
+                    dk,
+                    dv,
+                    slots,
+                    mixed_cols,
+                    mixed_stride,
+                    gate_stride,
+                    dtype,
+                    Pack(mixed_f, dtype),
+                    Pack(a_f, dtype),
+                    Pack(b_f, dtype),
+                    Pack(a_log_f, dtype),
+                    Pack(dt_bias_f, dtype),
+                    Pack(state_f, dtype),
+                    std::move(indices)};
+}
+
+void RunPackedCpuCase(DType dtype, bool strided) {
+  PackedCase c = MakePackedCase(dtype, strided, 6, 2, 4, 8, 8, 8400);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
+  std::vector<uint8_t> state_want = c.state;
+  std::vector<uint8_t> state_got = c.state;
+  std::vector<uint8_t> out_want(
+      static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
+  std::vector<uint8_t> out_got(out_want.size());
+  Tensor mixed = RowView(c.mixed.data(), dtype, Cpu(), c.batch,
+                         c.mixed_cols, c.mixed_stride);
+  Tensor ta = RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor tb = RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor tal = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
+  Tensor tdt = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor tidx = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
+  Tensor sw = MakeT(state_want.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor sg = MakeT(state_got.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor ow = MakeT(out_want.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
+  Tensor og = MakeT(out_got.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
+  PackedDecodeReference(ow, mixed, ta, tb, tal, tdt, sw, tidx, args);
+  Queue queue = Q();
+  vt::GdnPackedDecode(queue, og, mixed, ta, tb, tal, tdt, sg, tidx, args);
+  const float tol = dtype == DType::kF32 ? 1e-5f : 2e-2f;
+  CheckClose(Unpack(out_got, dtype), Unpack(out_want, dtype), tol, tol);
+  CheckClose(Unpack(state_got, dtype), Unpack(state_want, dtype), tol, tol);
+}
+
+void RunPackedCudaCase(DType dtype, bool strided) {
+  PackedCase c = MakePackedCase(dtype, strided, 32, 4, 8, 128, 128, 8500);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
+
+  // The portable CPU operation is the explicit reference for the full upstream
+  // B=32/H=4/HV=8/K=V=128 matrix.
+  std::vector<uint8_t> state_cpu = c.state;
+  std::vector<uint8_t> out_cpu(
+      static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
+  Tensor mixed_cpu = RowView(c.mixed.data(), dtype, Cpu(), c.batch,
+                             c.mixed_cols, c.mixed_stride);
+  Tensor a_cpu = RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor b_cpu = RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor al_cpu = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
+  Tensor dt_cpu = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor idx_cpu = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
+  Tensor state_cpu_t =
+      MakeT(state_cpu.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor out_cpu_t = MakeT(out_cpu.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
+  Queue cpu_q = Q();
+  vt::GdnPackedDecode(cpu_q, out_cpu_t, mixed_cpu, a_cpu, b_cpu, al_cpu,
+                      dt_cpu, state_cpu_t, idx_cpu, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor d_mixed(gpu, guard.q, dtype, {c.batch, c.mixed_stride}, c.mixed.data());
+  DeviceTensor d_a(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.a.data());
+  DeviceTensor d_b(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.b.data());
+  DeviceTensor d_al(gpu, guard.q, dtype, {c.hv}, c.a_log.data());
+  DeviceTensor d_dt(gpu, guard.q, dtype, {c.hv}, c.dt_bias.data());
+  DeviceTensor d_idx(gpu, guard.q, DType::kI32, {c.batch}, c.indices.data());
+  DeviceTensor d_state(gpu, guard.q, dtype, {c.slots, c.hv, c.dv, c.dk}, c.state.data());
+  DeviceTensor d_out(gpu, guard.q, dtype, {c.batch, c.hv, c.dv});
+  Tensor mixed_gpu = d_mixed.tensor();
+  mixed_gpu.shape[1] = c.mixed_cols;
+  Tensor a_gpu = d_a.tensor();
+  a_gpu.shape[1] = c.hv;
+  Tensor b_gpu = d_b.tensor();
+  b_gpu.shape[1] = c.hv;
+  vt::GdnPackedDecode(guard.q, d_out.tensor(), mixed_gpu, a_gpu, b_gpu,
+                      d_al.tensor(), d_dt.tensor(), d_state.tensor(),
+                      d_idx.tensor(), args);
+  std::vector<uint8_t> out_gpu(out_cpu.size());
+  std::vector<uint8_t> state_gpu(c.state.size());
+  d_out.Download(guard.q, out_gpu.data());
+  d_state.Download(guard.q, state_gpu.data());
+  const float tol = dtype == DType::kF32 ? 1e-4f : 2e-2f;
+  const float rtol = dtype == DType::kF32 ? 1e-4f : 1e-2f;
+  CheckClose(Unpack(out_gpu, dtype), Unpack(out_cpu, dtype), tol, rtol);
+  CheckClose(Unpack(state_gpu, dtype), Unpack(state_cpu, dtype), tol, rtol);
+}
+
+TEST_CASE("gdn packed decode CPU reference matches explicit recurrence") {
+  for (DType dtype : {DType::kF16, DType::kBF16, DType::kF32}) {
+    RunPackedCpuCase(dtype, false);
+    RunPackedCpuCase(dtype, true);
+  }
+}
+
+TEST_CASE("gdn packed decode rejects duplicate and out-of-range live slots") {
+  PackedCase c = MakePackedCase(DType::kF32, false, 2, 1, 1, 4, 4, 8600);
+  const GdnArgs args{0.5f};
+  std::vector<float> out(8);
+  Tensor mixed = RowView(c.mixed.data(), c.dtype, Cpu(), 2, c.mixed_cols,
+                         c.mixed_stride);
+  Tensor ta = RowView(c.a.data(), c.dtype, Cpu(), 2, 1, c.gate_stride);
+  Tensor tb = RowView(c.b.data(), c.dtype, Cpu(), 2, 1, c.gate_stride);
+  Tensor tal = MakeT(c.a_log.data(), c.dtype, Cpu(), {1});
+  Tensor tdt = MakeT(c.dt_bias.data(), c.dtype, Cpu(), {1});
+  Tensor state = MakeT(c.state.data(), c.dtype, Cpu(), {2, 1, 4, 4});
+  Tensor tout = MakeT(out.data(), DType::kF32, Cpu(), {2, 1, 4});
+  Queue queue = Q();
+  std::vector<int32_t> duplicate = {0, 0};
+  Tensor dup = MakeT(duplicate.data(), DType::kI32, Cpu(), {2});
+  CHECK_THROWS_AS(vt::GdnPackedDecode(queue, tout, mixed, ta, tb, tal, tdt,
+                                     state, dup, args),
+                  std::runtime_error);
+  std::vector<int32_t> out_of_range = {0, 2};
+  Tensor oor = MakeT(out_of_range.data(), DType::kI32, Cpu(), {2});
+  CHECK_THROWS_AS(vt::GdnPackedDecode(queue, tout, mixed, ta, tb, tal, tdt,
+                                     state, oor, args),
+                  std::runtime_error);
+}
+
+TEST_CASE("gdn packed decode permits fewer live state slots than padded batch rows") {
+  PackedCase c = MakePackedCase(DType::kF32, false, 3, 1, 1, 4, 4, 8650);
+  c.slots = 2;
+  c.state.resize(static_cast<size_t>(c.slots * c.hv * c.dv * c.dk) *
+                 vt::SizeOf(c.dtype));
+  c.indices = {0, 1, -1};
+  const GdnArgs args{0.5f};
+  std::vector<uint8_t> state_want = c.state;
+  std::vector<uint8_t> state_got = c.state;
+  std::vector<float> out_want(static_cast<size_t>(c.batch * c.hv * c.dv));
+  std::vector<float> out_got(out_want.size());
+  Tensor mixed = RowView(c.mixed.data(), c.dtype, Cpu(), c.batch,
+                         c.mixed_cols, c.mixed_stride);
+  Tensor ta = RowView(c.a.data(), c.dtype, Cpu(), c.batch, c.hv,
+                      c.gate_stride);
+  Tensor tb = RowView(c.b.data(), c.dtype, Cpu(), c.batch, c.hv,
+                      c.gate_stride);
+  Tensor tal = MakeT(c.a_log.data(), c.dtype, Cpu(), {c.hv});
+  Tensor tdt = MakeT(c.dt_bias.data(), c.dtype, Cpu(), {c.hv});
+  Tensor tidx = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
+  Tensor sw = MakeT(state_want.data(), c.dtype, Cpu(),
+                    {c.slots, c.hv, c.dv, c.dk});
+  Tensor sg = MakeT(state_got.data(), c.dtype, Cpu(),
+                    {c.slots, c.hv, c.dv, c.dk});
+  Tensor ow = MakeT(out_want.data(), c.dtype, Cpu(),
+                    {c.batch, c.hv, c.dv});
+  Tensor og = MakeT(out_got.data(), c.dtype, Cpu(),
+                    {c.batch, c.hv, c.dv});
+  PackedDecodeReference(ow, mixed, ta, tb, tal, tdt, sw, tidx, args);
+  Queue queue = Q();
+  vt::GdnPackedDecode(queue, og, mixed, ta, tb, tal, tdt, sg, tidx, args);
+  CheckClose(out_got, out_want, 1e-5f, 1e-5f);
+  CheckClose(Unpack(state_got, c.dtype), Unpack(state_want, c.dtype), 1e-5f,
+             1e-5f);
+}
+
+TEST_CASE("CUDA gdn packed decode matches CPU across upstream dtype and stride matrix") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  for (DType dtype : {DType::kF16, DType::kBF16, DType::kF32}) {
+    RunPackedCudaCase(dtype, false);
+    RunPackedCudaCase(dtype, true);
+  }
+}
+
+TEST_CASE("CUDA gdn packed decode capture replays preserve padding state and canaries") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr DType dtype = DType::kBF16;
+  PackedCase c = MakePackedCase(dtype, true, 6, 2, 4, 32, 32, 8700);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
+
+  std::vector<uint8_t> state_cpu = c.state;
+  std::vector<uint8_t> out_cpu(
+      static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
+  Tensor mixed_cpu = RowView(c.mixed.data(), dtype, Cpu(), c.batch,
+                             c.mixed_cols, c.mixed_stride);
+  Tensor a_cpu =
+      RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor b_cpu =
+      RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor al_cpu = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
+  Tensor dt_cpu = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor idx_cpu = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
+  Tensor state_cpu_t =
+      MakeT(state_cpu.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor out_cpu_t = MakeT(out_cpu.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
+  Queue cpu_q = Q();
+  vt::GdnPackedDecode(cpu_q, out_cpu_t, mixed_cpu, a_cpu, b_cpu, al_cpu,
+                      dt_cpu, state_cpu_t, idx_cpu, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor d_mixed(gpu, guard.q, dtype, {c.batch, c.mixed_stride},
+                       c.mixed.data());
+  DeviceTensor d_a(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.a.data());
+  DeviceTensor d_b(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.b.data());
+  DeviceTensor d_al(gpu, guard.q, dtype, {c.hv}, c.a_log.data());
+  DeviceTensor d_dt(gpu, guard.q, dtype, {c.hv}, c.dt_bias.data());
+  DeviceTensor d_idx(gpu, guard.q, DType::kI32, {c.batch}, c.indices.data());
+  constexpr size_t kGuardBytes = 256;
+  std::vector<uint8_t> state_storage(2 * kGuardBytes + c.state.size(), 0xA5);
+  std::copy(c.state.begin(), c.state.end(),
+            state_storage.begin() + static_cast<ptrdiff_t>(kGuardBytes));
+  std::vector<uint8_t> out_storage(2 * kGuardBytes + out_cpu.size(), 0xA5);
+  DeviceTensor d_state_storage(
+      gpu, guard.q, DType::kI8,
+      {static_cast<int64_t>(state_storage.size())}, state_storage.data());
+  DeviceTensor d_out_storage(
+      gpu, guard.q, DType::kI8,
+      {static_cast<int64_t>(out_storage.size())}, out_storage.data());
+  Tensor state_gpu = MakeT(
+      static_cast<uint8_t*>(d_state_storage.tensor().data) + kGuardBytes,
+      dtype, Gpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor out_gpu = MakeT(
+      static_cast<uint8_t*>(d_out_storage.tensor().data) + kGuardBytes,
+      dtype, Gpu(), {c.batch, c.hv, c.dv});
+  Tensor mixed_gpu = d_mixed.tensor();
+  mixed_gpu.shape[1] = c.mixed_cols;
+  Tensor a_gpu = d_a.tensor();
+  a_gpu.shape[1] = c.hv;
+  Tensor b_gpu = d_b.tensor();
+  b_gpu.shape[1] = c.hv;
+
+  gpu.BeginCapture(guard.q);
+  vt::GdnPackedDecode(guard.q, out_gpu, mixed_gpu, a_gpu, b_gpu,
+                      d_al.tensor(), d_dt.tensor(), state_gpu,
+                      d_idx.tensor(), args);
+  void* graph = gpu.EndCaptureGraph(guard.q);
+  std::vector<uint8_t> out_result(out_cpu.size());
+  std::vector<uint8_t> state_result(c.state.size());
+  std::vector<uint8_t> out_storage_after(out_storage.size());
+  std::vector<uint8_t> state_storage_after(state_storage.size());
+  for (int replay = 0; replay < 2; ++replay) {
+    gpu.Copy(guard.q, state_gpu.data, c.state.data(), c.state.size());
+    gpu.Memset(guard.q, out_gpu.data, 0xA5, out_result.size());
+    gpu.ReplayGraph(guard.q, graph);
+    d_out_storage.Download(guard.q, out_storage_after.data());
+    d_state_storage.Download(guard.q, state_storage_after.data());
+    std::copy_n(out_storage_after.begin() +
+                    static_cast<ptrdiff_t>(kGuardBytes),
+                out_result.size(), out_result.begin());
+    std::copy_n(state_storage_after.begin() +
+                    static_cast<ptrdiff_t>(kGuardBytes),
+                state_result.size(), state_result.begin());
+    CheckClose(Unpack(out_result, dtype), Unpack(out_cpu, dtype), 2e-2f,
+               1e-2f);
+    CheckClose(Unpack(state_result, dtype), Unpack(state_cpu, dtype), 2e-2f,
+               1e-2f);
+    CHECK(std::all_of(out_storage_after.begin(),
+                      out_storage_after.begin() +
+                          static_cast<ptrdiff_t>(kGuardBytes),
+                      [](uint8_t v) { return v == 0xA5; }));
+    CHECK(std::all_of(out_storage_after.end() -
+                          static_cast<ptrdiff_t>(kGuardBytes),
+                      out_storage_after.end(),
+                      [](uint8_t v) { return v == 0xA5; }));
+    CHECK(std::all_of(state_storage_after.begin(),
+                      state_storage_after.begin() +
+                          static_cast<ptrdiff_t>(kGuardBytes),
+                      [](uint8_t v) { return v == 0xA5; }));
+    CHECK(std::all_of(state_storage_after.end() -
+                          static_cast<ptrdiff_t>(kGuardBytes),
+                      state_storage_after.end(),
+                      [](uint8_t v) { return v == 0xA5; }));
+  }
+  gpu.DestroyGraph(graph);
+
+  std::vector<uint8_t> mixed_after(c.mixed.size());
+  std::vector<uint8_t> a_after(c.a.size());
+  std::vector<uint8_t> b_after(c.b.size());
+  d_mixed.Download(guard.q, mixed_after.data());
+  d_a.Download(guard.q, a_after.data());
+  d_b.Download(guard.q, b_after.data());
+  CHECK(mixed_after == c.mixed);
+  CHECK(a_after == c.a);
+  CHECK(b_after == c.b);
+}
 
 // causal_conv1d_fwd CPU-vs-CUDA on one varlen batch.
 void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,

@@ -2,6 +2,7 @@
 #include "vt/ops.h"
 
 #include <array>
+#include <vector>
 
 namespace vt {
 
@@ -954,6 +955,81 @@ void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const
   }
   reinterpret_cast<GdnDecodeFn>(GetOp(OpId::kGdnDecode, q.device.type))(
       q, out, q_in, k, v, g, beta, state, state_idx, args);
+}
+
+void GdnPackedDecode(Queue& q, Tensor& out, const Tensor& mixed_qkv,
+                     const Tensor& a, const Tensor& b, const Tensor& a_log,
+                     const Tensor& dt_bias, Tensor& state,
+                     const Tensor& state_idx, const GdnArgs& args) {
+  constexpr const char* name = "gdn_packed_decode";
+  VT_CHECK(mixed_qkv.rank == 2 && a.rank == 2 && b.rank == 2 &&
+               a_log.rank == 1 && dt_bias.rank == 1 && out.rank == 3 &&
+               state.rank == 4,
+           "gdn_packed_decode: mixed_qkv/a/b rank-2, A_log/dt_bias rank-1, "
+           "out rank-3, state rank-4 required");
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  VT_CHECK(a.shape[0] == batch && b.shape[0] == batch && a.shape[1] == hv &&
+               b.shape[1] == hv,
+           "gdn_packed_decode: a/b must be [B,Hv]");
+  VT_CHECK(a_log.shape[0] == hv && dt_bias.shape[0] == hv,
+           "gdn_packed_decode: A_log/dt_bias must be [Hv]");
+  VT_CHECK(out.shape[0] == batch && out.shape[1] == hv && out.shape[2] == dv,
+           "gdn_packed_decode: out must be [B,Hv,Dv]");
+  CheckI32Meta(q, state_idx, batch, name, "state_idx");
+
+  const int64_t qk_dim = mixed_qkv.shape[1] - hv * dv;
+  VT_CHECK(qk_dim > 0 && qk_dim % 2 == 0,
+           "gdn_packed_decode: invalid packed mixed_qkv width");
+  const int64_t q_dim = qk_dim / 2;
+  VT_CHECK(dk > 0 && q_dim % dk == 0,
+           "gdn_packed_decode: packed Q width must be divisible by Dk");
+  const int64_t hk = q_dim / dk;
+  VT_CHECK(hk > 0 && hv % hk == 0,
+           "gdn_packed_decode: Hv must be a multiple of inferred Hk");
+
+  VT_CHECK(IsFloat(mixed_qkv.dtype) && a.dtype == mixed_qkv.dtype &&
+               b.dtype == mixed_qkv.dtype && out.dtype == mixed_qkv.dtype &&
+               state.dtype == mixed_qkv.dtype,
+           "gdn_packed_decode: mixed_qkv/a/b/out/state must share FP16/BF16/F32 dtype");
+  VT_CHECK(IsFloat(a_log.dtype) && dt_bias.dtype == a_log.dtype,
+           "gdn_packed_decode: A_log/dt_bias must share a floating dtype");
+  VT_CHECK(mixed_qkv.stride[1] == 1 &&
+               mixed_qkv.stride[0] >= mixed_qkv.shape[1] && a.stride[1] == 1 &&
+               a.stride[0] >= hv && b.stride[1] == 1 && b.stride[0] >= hv,
+           "gdn_packed_decode: mixed_qkv/a/b require inner-contiguous non-overlapping rows");
+  VT_CHECK(a_log.IsContiguous() && dt_bias.IsContiguous() && out.IsContiguous() &&
+               state.IsContiguous(),
+           "gdn_packed_decode: A_log/dt_bias/out/state must be contiguous");
+  VT_CHECK(mixed_qkv.device == q.device && a.device == q.device &&
+               b.device == q.device && a_log.device == q.device &&
+               dt_bias.device == q.device && out.device == q.device &&
+               state.device == q.device,
+           "gdn_packed_decode: device mismatch");
+  VT_CHECK(args.scale > 0.0f,
+           "gdn_packed_decode: args.scale must be set (> 0)");
+
+  // CPU can validate the index values without synchronization. CUDA metadata
+  // is engine-owned and remains device-resident; its kernel independently
+  // bounds-checks each slot before dereferencing it.
+  if (q.device.type == DeviceType::kCPU) {
+    std::vector<uint8_t> seen(static_cast<size_t>(state.shape[0]), 0);
+    const int32_t* idx = state_idx.Ptr<int32_t>();
+    for (int64_t i = 0; i < batch; ++i) {
+      if (idx[i] < 0) continue;
+      VT_CHECK(idx[i] < state.shape[0],
+               "gdn_packed_decode: state_idx out of range");
+      VT_CHECK(seen[static_cast<size_t>(idx[i])] == 0,
+               "gdn_packed_decode: duplicate live state_idx");
+      seen[static_cast<size_t>(idx[i])] = 1;
+    }
+  }
+
+  reinterpret_cast<GdnPackedDecodeFn>(
+      GetOp(OpId::kGdnPackedDecode, q.device.type))(
+      q, out, mixed_qkv, a, b, a_log, dt_bias, state, state_idx, args);
 }
 
 namespace {

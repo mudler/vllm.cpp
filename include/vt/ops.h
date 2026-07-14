@@ -96,6 +96,7 @@ enum class OpId : uint8_t {
   kRmsNormGated,
   kGdnPrefill,
   kGdnDecode,
+  kGdnPackedDecode,
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
@@ -405,6 +406,10 @@ using GdnPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, con
 using GdnDecodeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const Tensor&, const Tensor&, Tensor&, const Tensor*,
                              const GdnArgs&);
+using GdnPackedDecodeFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+             const Tensor&, const Tensor&, Tensor&, const Tensor&,
+             const GdnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -898,6 +903,23 @@ void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, cons
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx = nullptr);
+
+// Pure non-spec packed decode, ported from vLLM v0.25.0
+// vllm/model_executor/layers/fla/ops/fused_recurrent.py:255-478 @ 702f4814.
+// mixed_qkv [B, 2*Hk*Dk + Hv*Dv] and a/b [B,Hv] are last-dimension
+// contiguous and may have padded outer row strides. A_log/dt_bias [Hv], out
+// [B,Hv,Dv], state [slots,Hv,Dv,Dk], state_idx [B]. FP16/BF16/F32 primary
+// tensors share one dtype; A_log/dt_bias may use any floating dtype. The op
+// normalizes raw q/k in F32, rounds sigmoid(b) through b.dtype, applies
+// args.scale to q, and updates state in place. Local cache ABI: state_idx < 0
+// zeros/skips the row; slot 0 is valid. Live CUDA indices are engine metadata
+// and must be unique and in range before upload; the kernel also bounds-checks
+// every slot without adding a capture-breaking host synchronization. CPU calls
+// validate both properties directly.
+void GdnPackedDecode(Queue& q, Tensor& out, const Tensor& mixed_qkv,
+                     const Tensor& a, const Tensor& b, const Tensor& a_log,
+                     const Tensor& dt_bias, Tensor& state,
+                     const Tensor& state_idx, const GdnArgs& args);
 
 // Indexed persistent-state cache boundary used by GDN mixed prefill. `cache`
 // is [num_slots,...] f32 or bf16, `state_idx` is i32 [N], and `working` is the

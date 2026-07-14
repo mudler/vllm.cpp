@@ -33,10 +33,11 @@ float LoadF32(const Tensor& t, int64_t elem_offset) {
   }
 }
 
-// Mirror of LoadF32 for outputs: f32 stores directly, bf16 rounds via F32ToBF16.
+// Mirror of LoadF32 for outputs: reduced-width formats round to storage dtype.
 void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
   switch (t.dtype) {
     case DType::kF32: t.Ptr<float>()[elem_offset] = v; break;
+    case DType::kF16: t.Ptr<uint16_t>()[elem_offset] = F32ToF16(v); break;
     case DType::kBF16: t.Ptr<uint16_t>()[elem_offset] = F32ToBF16(v); break;
     default: VT_CHECK(false, "StoreF32: unsupported dtype");
   }
@@ -896,6 +897,94 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, c
   });
 }
 
+// Pure packed decode ported from vLLM v0.25.0
+// vllm/model_executor/layers/fla/ops/fused_recurrent.py:255-336 @ 702f4814.
+// Unlike GdnDecodeKernel, raw q/k are normalized here in f32 and never
+// materialized through the activation dtype. sigmoid(b) is rounded through
+// b.dtype before recurrence, exactly at the upstream store/load boundary.
+void GdnPackedDecodeKernel(Queue&, Tensor& out, const Tensor& mixed_qkv,
+                           const Tensor& a, const Tensor& b,
+                           const Tensor& a_log, const Tensor& dt_bias,
+                           Tensor& state, const Tensor& state_idx,
+                           const GdnArgs& args) {
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv_n = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  const int64_t qk_dim = mixed_qkv.shape[1] - hv_n * dv;
+  const int64_t hk_n = qk_dim / (2 * dk);
+  const int64_t ratio = hv_n / hk_n;
+  const int32_t* indices = state_idx.Ptr<int32_t>();
+
+  ForRows(batch, [&](int64_t r0, int64_t r1) {
+    std::vector<float> qv(static_cast<size_t>(dk));
+    std::vector<float> kv(static_cast<size_t>(dk));
+    std::vector<float> state_row(static_cast<size_t>(dk));
+    for (int64_t bt = r0; bt < r1; ++bt) {
+      const int32_t slot = indices[bt];
+      if (slot < 0) {
+        for (int64_t i = 0; i < hv_n * dv; ++i)
+          StoreF32(out, bt * hv_n * dv + i, 0.0f);
+        continue;
+      }
+      for (int64_t hv = 0; hv < hv_n; ++hv) {
+        const int64_t hk = hv / ratio;
+        float q_sumsq = 0.0f;
+        float k_sumsq = 0.0f;
+        for (int64_t ki = 0; ki < dk; ++ki) {
+          qv[static_cast<size_t>(ki)] =
+              LoadF32(mixed_qkv, bt * mixed_qkv.stride[0] + hk * dk + ki);
+          kv[static_cast<size_t>(ki)] =
+              LoadF32(mixed_qkv, bt * mixed_qkv.stride[0] + hk_n * dk + hk * dk + ki);
+          q_sumsq += qv[static_cast<size_t>(ki)] * qv[static_cast<size_t>(ki)];
+          k_sumsq += kv[static_cast<size_t>(ki)] * kv[static_cast<size_t>(ki)];
+        }
+        const float q_inv = 1.0f / std::sqrt(q_sumsq + 1e-6f);
+        const float k_inv = 1.0f / std::sqrt(k_sumsq + 1e-6f);
+        for (int64_t ki = 0; ki < dk; ++ki) {
+          qv[static_cast<size_t>(ki)] *= q_inv * args.scale;
+          kv[static_cast<size_t>(ki)] *= k_inv;
+        }
+
+        const float av = LoadF32(a, bt * a.stride[0] + hv);
+        const float bv = LoadF32(b, bt * b.stride[0] + hv);
+        const float x = av + LoadF32(dt_bias, hv);
+        const float softplus =
+            x <= 20.0f ? std::log1p(std::exp(std::min(x, 20.0f))) : x;
+        const float g = -std::exp(LoadF32(a_log, hv)) * softplus;
+        float beta = 1.0f / (1.0f + std::exp(-bv));
+        if (b.dtype == DType::kF16)
+          beta = F16ToF32(F32ToF16(beta));
+        else if (b.dtype == DType::kBF16)
+          beta = BF16ToF32(F32ToBF16(beta));
+        const float decay = std::exp(g);
+
+        for (int64_t vi = 0; vi < dv; ++vi) {
+          const int64_t state_base =
+              ((static_cast<int64_t>(slot) * hv_n + hv) * dv + vi) * dk;
+          float dot = 0.0f;
+          for (int64_t ki = 0; ki < dk; ++ki) {
+            state_row[static_cast<size_t>(ki)] =
+                LoadF32(state, state_base + ki) * decay;
+            dot += state_row[static_cast<size_t>(ki)] * kv[static_cast<size_t>(ki)];
+          }
+          const int64_t v_offset = bt * mixed_qkv.stride[0] +
+                                   2 * hk_n * dk + hv * dv + vi;
+          const float vp = (LoadF32(mixed_qkv, v_offset) - dot) * beta;
+          float output = 0.0f;
+          for (int64_t ki = 0; ki < dk; ++ki) {
+            const float updated = state_row[static_cast<size_t>(ki)] +
+                                  vp * kv[static_cast<size_t>(ki)];
+            StoreF32(state, state_base + ki, updated);
+            output += updated * qv[static_cast<size_t>(ki)];
+          }
+          StoreF32(out, (bt * hv_n + hv) * dv + vi, output);
+        }
+      }
+    }
+  });
+}
+
 // Indexed cache boundary for mixed GDN prefill. This is the CPU executable
 // reference for the fused CUDA gather/scatter kernels: cache rows may be f32 or
 // bf16, while the compact recurrence/conv working state is always f32.
@@ -1390,6 +1479,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
+    RegisterOp(
+        OpId::kGdnPackedDecode, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
+            &GdnPackedDecodeKernel)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(

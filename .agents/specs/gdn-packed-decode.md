@@ -92,6 +92,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Projection proof | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/` | Immutable `f925294` passes all five real BA shapes exactly; the divergence is not the GEMM. |
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
+| W1D1 packed operator | `include/vt/ops.h`; `src/vt/{ops.cpp,cpu/cpu_ops.cpp,cuda/cuda_gdn.cu}`; `tests/vt/test_ops_gdn.cpp` | Public validation, portable recurrence, FP16/BF16/F32 CUDA kernel and registrations are implemented. Mutable local/CUDA/capture/canary/memcheck preflight is green and the direct fixture remains `0/1`; clean pushed-SHA G1 is pending, so this carries no immutable or speed credit. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -101,9 +102,9 @@ them also removes the pure-decode post-conv intermediate launch and buffers.
 
 | Upstream behavior | Local destination | Port/deviation |
 |---|---|---|
-| Packed op ABI and validation | `include/vt/ops.h`, `src/vt/ops.cpp` | Add typed shape/stride/device validation and a single operation preserving the local negative-pad state-index ABI. |
-| Portable recurrence | `src/vt/cpu/cpu_ops.cpp` plus CPU registration | Transcribe the exact F32 arithmetic and dtype-rounding points for FP16/BF16/F32; this is the cross-backend reference. |
-| CUDA packed kernel | `src/vt/cuda/cuda_gdn.cu` plus CUDA registration | Hand-port the Triton body, layout, GQA mapping and launch geometry; no Triton runtime or generated cubin is introduced. |
+| Packed op ABI and validation | `include/vt/ops.h`, `src/vt/ops.cpp` | W1D1 adds typed shape/stride/device validation and one operation preserving the local negative-pad state-index ABI. CPU validates live values; CUDA consumes engine-validated device metadata and bounds-checks slots without synchronizing. |
+| Portable recurrence | `src/vt/cpu/cpu_ops.cpp` plus CPU registration | W1D1 transcribes the exact F32 arithmetic and dtype-rounding points for FP16/BF16/F32 as the cross-backend reference. |
+| CUDA packed kernel | `src/vt/cuda/cuda_gdn.cu` plus CUDA registration | W1D1 hand-ports the Triton body, grid, GQA mapping and storage rounding; no Triton runtime or generated cubin is introduced. CUDA maps each value row across an 8-lane group at Dv≥32 instead of exposing Triton's compiler-private one-warp tensor mapping. |
 | Pure-decode selection | `src/vllm/model_executor/models/qwen3_5.cpp` | Select before post-conv intermediate allocation when the local batch metadata proves non-spec pure decode; otherwise use the existing branch. |
 | Rollback/default | same model file | Process-cache `VT_GDN_PACKED_DECODE`; keep F32 BA/decomposed fallback, flip BF16 BA+packed only after G1-G3 pass. |
 | Oracle generation | `tools/bench/gdn_packed_decode_oracle.py` | Maintainer-only official-v0.25 generator with version/commit guard, repeated bit-stability and reference-tolerance checks. |
@@ -207,7 +208,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
-| W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | G1 green with no skipped declared dtype. |
+| W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **IMPLEMENTED / MUTABLE GREEN:** local full GDN **39/39**, focused ASan+UBSan **5/5**, CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Commit/push and clean immutable G1 remain pending. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | G2 real-model and zero-selection gates green. |
 | W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |
 
@@ -229,6 +230,16 @@ recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.
 - **Slot zero differs from vLLM.** Preserve the local cache ABI at the adapter
   and test it explicitly; do not copy vLLM's null-block convention into the
   engine silently.
+- **Device index values cannot be synchronously rejected inside a captured
+  CUDA op.** CPU calls reject duplicates/out-of-range values directly. The
+  W1D2 host adapter must reject them before upload; the CUDA kernel separately
+  bounds-checks every slot to prevent an invalid read/write without adding a
+  D2H synchronization. Duplicate live slots remain an adapter precondition.
+- **CUDA thread decomposition is a recorded mechanical adaptation.** The grid,
+  value tiling, F32 arithmetic and storage boundaries mirror Triton. The hand
+  kernel uses one 8-lane group per value row at Dv≥32 so all 32 rows of a tile
+  execute in eight warps; Triton's `num_warps=1` tensor-to-lane mapping is a
+  compiler detail rather than a callable CUDA launch ABI.
 - **A launch reduction is not a speed claim.** The expected 48-node reduction
   is structural evidence only. G3 must measure every axis and memory.
 - **Portable fallback stays.** The CPU/decomposed recurrence is required by the

@@ -13,6 +13,7 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -139,12 +140,30 @@ unsigned GridFor(int64_t n) {
   return static_cast<unsigned>(blocks < 4096 ? blocks : 4096);
 }
 
-// f32 load/store overloads: bf16 converts on the way in/out, math is f32.
+// f32 load/store overloads: reduced-width formats convert on the way in/out,
+// while kernel arithmetic remains f32.
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
+__device__ inline float Load(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
 __device__ inline void Store(float* p, int64_t i, float v) { p[i] = v; }
+__device__ inline void Store(__half* p, int64_t i, float v) { p[i] = __float2half_rn(v); }
 __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);  // round-to-nearest-even, same as host F32ToBF16
+}
+
+template <typename T>
+__device__ inline float RoundToStorage(float v);
+template <>
+__device__ inline float RoundToStorage<float>(float v) {
+  return v;
+}
+template <>
+__device__ inline float RoundToStorage<__half>(float v) {
+  return __half2float(__float2half_rn(v));
+}
+template <>
+__device__ inline float RoundToStorage<__nv_bfloat16>(float v) {
+  return __bfloat162float(__float2bfloat16(v));
 }
 
 __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
@@ -903,6 +922,226 @@ void LaunchGdnScan(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor
 void GdnScanCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                  const Tensor& g, const Tensor& beta, Tensor& state, const int32_t* qsl_ptr,
                  const GdnArgs& args, const char* name);  // fwd decl (corner-dim fallback)
+
+// ---------------------------------------------------------------------------
+// Packed pure-decode port of vLLM v0.25.0
+// vllm/model_executor/layers/fla/ops/fused_recurrent.py:255-478 @ 702f4814.
+// Raw packed q/k/v and row-strided a/b are consumed directly. q/k reduction
+// matches the existing L2NormRowKernel tree at the real Dk=128 shape; the
+// recurrence reuses the proven NW-split fused decode ordering. All state math
+// is f32 and only final state/output stores round to T. beta deliberately
+// rounds through b.dtype before recurrence; this is distinct from mixed/spec
+// decode, which keeps beta f32.
+template <typename T, typename TAux, int NW>
+__global__ void GdnPackedDecodeKernel(
+    T* out, const T* mixed_qkv, const T* a, const T* b,
+    const TAux* a_log, const TAux* dt_bias, T* state,
+    const int32_t* state_idx, int64_t state_slots, int64_t mixed_stride,
+    int64_t a_stride, int64_t b_stride, int64_t hk_n, int64_t dk,
+    int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  const int64_t i_v = blockIdx.x;
+  const int64_t i_nh = blockIdx.y;
+  const int64_t i_n = i_nh / hv_n;
+  const int64_t hv = i_nh % hv_n;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t vbase = i_v * bv;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int vi = tid / NW;
+  const int wk = tid % NW;
+  const int64_t vrow = vbase + vi;
+
+  const int32_t slot = state_idx[i_n];
+  if (slot < 0 || slot >= state_slots) {
+    if (vrow < dv && wk == 0)
+      Store(out, (i_n * hv_n + hv) * dv + vrow, 0.0f);
+    return;
+  }
+
+  __shared__ float q_partial[kBlock];
+  __shared__ float k_partial[kBlock];
+  __shared__ float scalars[4];  // q_inv, k_inv, decay, rounded beta
+  extern __shared__ float smem[];
+  float* bq = smem;
+  float* bk = bq + dk;
+  float* sbh = bk + dk;
+
+  const int64_t mixed_row = i_n * mixed_stride;
+  const int64_t qbase = mixed_row + hk * dk;
+  const int64_t kbase = mixed_row + hk_n * dk + hk * dk;
+  float q_sumsq = 0.0f;
+  float k_sumsq = 0.0f;
+  for (int64_t ki = tid; ki < dk; ki += blockDim.x) {
+    const float qv = Load(mixed_qkv, qbase + ki);
+    const float kv = Load(mixed_qkv, kbase + ki);
+    bq[ki] = qv;
+    bk[ki] = kv;
+    q_sumsq += qv * qv;
+    k_sumsq += kv * kv;
+  }
+  q_partial[tid] = q_sumsq;
+  k_partial[tid] = k_sumsq;
+  __syncthreads();
+  for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0;
+       stride /= 2) {
+    if (tid < stride) {
+      q_partial[tid] += q_partial[tid + stride];
+      k_partial[tid] += k_partial[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    scalars[0] = 1.0f / sqrtf(q_partial[0] + 1e-6f);
+    scalars[1] = 1.0f / sqrtf(k_partial[0] + 1e-6f);
+    const float av = Load(a, i_n * a_stride + hv);
+    const float bv_raw = Load(b, i_n * b_stride + hv);
+    const float x = av + Load(dt_bias, hv);
+    const float softplus = x <= 20.0f ? log1pf(expf(x)) : x;
+    const float g = -expf(Load(a_log, hv)) * softplus;
+    scalars[2] = expf(g);
+    scalars[3] = RoundToStorage<T>(1.0f / (1.0f + expf(-bv_raw)));
+  }
+  __syncthreads();
+  for (int64_t ki = tid; ki < dk; ki += blockDim.x) {
+    bq[ki] *= scalars[0] * scale;
+    bk[ki] *= scalars[1];
+  }
+
+  const int64_t sdk = dk + 1;
+  const int64_t vrows = (dv - vbase) < bv ? (dv - vbase) : bv;
+  const int64_t tile = vrows * dk;
+  T* s_head = state +
+              (static_cast<int64_t>(slot) * hv_n + hv) * dv * dk +
+              vbase * dk;
+  for (int64_t e = tid; e < bv * dk; e += blockDim.x)
+    sbh[(e / dk) * sdk + e % dk] = e < tile ? Load(s_head, e) : 0.0f;
+  __syncthreads();
+
+  const int64_t ck = (dk + NW - 1) / NW;
+  const int64_t c0 = static_cast<int64_t>(wk) * ck;
+  const int64_t c1 = (c0 + ck) < dk ? (c0 + ck) : dk;
+  float* row = sbh + static_cast<int64_t>(vi) * sdk;
+  float partial_dot = 0.0f;
+  for (int64_t ki = c0; ki < c1; ++ki) {
+    row[ki] *= scalars[2];
+    partial_dot += row[ki] * bk[ki];
+  }
+  float dot = partial_dot;
+#pragma unroll
+  for (int off = 1; off < NW; off <<= 1)
+    dot += __shfl_xor_sync(0xffffffffu, dot, off);
+  const int64_t v_offset = mixed_row + 2 * hk_n * dk + hv * dv + vrow;
+  const float vv = vrow < dv ? Load(mixed_qkv, v_offset) : 0.0f;
+  const float vp = (vv - dot) * scalars[3];
+  float partial_out = 0.0f;
+  for (int64_t ki = c0; ki < c1; ++ki) {
+    row[ki] += vp * bk[ki];
+    partial_out += row[ki] * bq[ki];
+  }
+  float output = partial_out;
+#pragma unroll
+  for (int off = 1; off < NW; off <<= 1)
+    output += __shfl_xor_sync(0xffffffffu, output, off);
+  if (vrow < dv && wk == 0)
+    Store(out, (i_n * hv_n + hv) * dv + vrow, output);
+  __syncthreads();
+  for (int64_t e = tid; e < tile; e += blockDim.x)
+    Store(s_head, e, sbh[(e / dk) * sdk + e % dk]);
+}
+
+template <typename T, typename TAux, int NW>
+void LaunchGdnPackedDecode(cudaStream_t stream, Tensor& out,
+                           const Tensor& mixed_qkv, const Tensor& a,
+                           const Tensor& b, const Tensor& a_log,
+                           const Tensor& dt_bias, Tensor& state,
+                           const Tensor& state_idx, int64_t bv,
+                           const GdnArgs& args) {
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv_n = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  const int64_t hk_n =
+      (mixed_qkv.shape[1] - hv_n * dv) / (2 * dk);
+  const int64_t nv = (dv + bv - 1) / bv;
+  const dim3 grid(static_cast<unsigned>(nv),
+                  static_cast<unsigned>(batch * hv_n));
+  const size_t shmem =
+      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) *
+      sizeof(float);
+  GdnPackedDecodeKernel<T, TAux, NW>
+      <<<grid, static_cast<unsigned>(bv * NW), shmem, stream>>>(
+          out.Ptr<T>(), mixed_qkv.Ptr<T>(), a.Ptr<T>(), b.Ptr<T>(),
+          a_log.Ptr<TAux>(), dt_bias.Ptr<TAux>(), state.Ptr<T>(),
+          state_idx.Ptr<int32_t>(), state.shape[0], mixed_qkv.stride[0],
+          a.stride[0], b.stride[0], hk_n, dk, hv_n, dv, bv, args.scale);
+  Check(cudaGetLastError(), "gdn packed decode launch");
+}
+
+template <typename T, typename TAux>
+void DispatchGdnPackedDecode(cudaStream_t stream, Tensor& out,
+                             const Tensor& mixed_qkv, const Tensor& a,
+                             const Tensor& b, const Tensor& a_log,
+                             const Tensor& dt_bias, Tensor& state,
+                             const Tensor& state_idx, int64_t bv,
+                             const GdnArgs& args) {
+  const int64_t dv = state.shape[2];
+  if (dv >= 32) {
+    LaunchGdnPackedDecode<T, TAux, 8>(stream, out, mixed_qkv, a, b, a_log,
+                                      dt_bias, state, state_idx, bv, args);
+  } else {
+    LaunchGdnPackedDecode<T, TAux, 1>(stream, out, mixed_qkv, a, b, a_log,
+                                      dt_bias, state, state_idx, bv, args);
+  }
+}
+
+void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
+                               const Tensor& mixed_qkv, const Tensor& a,
+                               const Tensor& b, const Tensor& a_log,
+                               const Tensor& dt_bias, Tensor& state,
+                               const Tensor& state_idx,
+                               const GdnArgs& args) {
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv_n = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  if (batch == 0 || hv_n == 0 || dv == 0) return;
+  VT_CHECK(batch * hv_n <= kMaxGridY,
+           "cuda gdn_packed_decode: too many (batch*head) blocks");
+  int64_t bv = 1;
+  while (bv < dv && bv < 32) bv *= 2;
+  const int nw = dv >= 32 ? 8 : 1;
+  const size_t total_smem =
+      (2 * static_cast<size_t>(kBlock) + 4 +
+       2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) *
+      sizeof(float);
+  VT_CHECK(total_smem <= 48 * 1024,
+           "cuda gdn_packed_decode: dimensions exceed shared-memory limit");
+  VT_CHECK(bv * nw <= kBlock,
+           "cuda gdn_packed_decode: invalid block geometry");
+  cudaStream_t stream = AsStream(q);
+
+  auto dispatch_aux = [&](auto value_tag) {
+    using T = decltype(value_tag);
+    if (a_log.dtype == DType::kF32) {
+      DispatchGdnPackedDecode<T, float>(stream, out, mixed_qkv, a, b, a_log,
+                                        dt_bias, state, state_idx, bv, args);
+    } else if (a_log.dtype == DType::kF16) {
+      DispatchGdnPackedDecode<T, __half>(stream, out, mixed_qkv, a, b, a_log,
+                                         dt_bias, state, state_idx, bv, args);
+    } else {
+      DispatchGdnPackedDecode<T, __nv_bfloat16>(
+          stream, out, mixed_qkv, a, b, a_log, dt_bias, state, state_idx, bv,
+          args);
+    }
+  };
+  VT_CHECK(a_log.dtype == dt_bias.dtype,
+           "cuda gdn_packed_decode: A_log/dt_bias dtypes must match");
+  if (mixed_qkv.dtype == DType::kF32)
+    dispatch_aux(float{});
+  else if (mixed_qkv.dtype == DType::kF16)
+    dispatch_aux(__half{});
+  else
+    dispatch_aux(__nv_bfloat16{});
+}
 
 // ---------------------------------------------------------------------------
 // Fused single-step DECODE recurrence — the (batch × Hv × value-tile) parallel
@@ -3744,6 +3983,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelCuda)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelCuda)));
+    RegisterOp(
+        OpId::kGdnPackedDecode, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<GdnPackedDecodeFn>(
+            &GdnPackedDecodeKernelCuda)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCUDA,
         reinterpret_cast<void*>(

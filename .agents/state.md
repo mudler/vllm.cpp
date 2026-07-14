@@ -8539,3 +8539,57 @@ remains **233/235**, binding remains **55/124**, and `benchmark_binding=false`.
 W1D1 is now unblocked: add the public FP16/BF16/F32 packed op, portable CPU
 reference, CUDA implementation and contiguous/strided/negative-index test
 matrix test-first. qkvz, exact grid and 35B performance remain prohibited.
+
+## 2026-07-14 — W1D1 packed operator implemented; immutable G1 pending
+
+After goal continuation and context recovery, `AGENTS.md`, the active claim,
+roadmap order 0 and the complete packed-decode spike were reread before edits.
+The isolated `codex/gdn-ba-rounding-w1c` worktree remains the sole owner. W1D1
+is limited to the public operation, portable reference, CUDA kernel,
+registrations and operator tests; model dispatch/defaults, qkvz, mixed/spec/
+prefill changes, the binding grid, host-weight repair and 35B performance remain
+excluded.
+
+The upstream FP16/BF16/F32 × contiguous/row-strided matrix and local slot ABI
+were written before the production API; the clean RED failed because
+`vt::GdnPackedDecode` did not exist. Review then found one overconstraint:
+`state_slots >= batch` rejected a valid padded batch with two live slots and
+one negative row. A focused regression reproduced that exact exception before
+the check was removed and now passes. Slot 0 remains valid, negative rows zero
+output/skip state, and CPU calls reject duplicate/out-of-range live indices.
+CUDA device metadata cannot be synchronously scanned inside capture: W1D2 must
+validate host indices before upload, while the kernel independently
+bounds-checks every slot and requires unique live indices.
+
+W1D1 adds `OpId::kGdnPackedDecode`, public shape/stride/dtype/device validation,
+FP16 CPU storage conversion, an F32-arithmetic CPU recurrence, and a registered
+CUDA kernel consuming raw row-strided mixed q/k/v plus a/b. The kernel performs
+q/k normalization in F32, rounds sigmoid beta through the primary storage
+dtype, applies the threshold-20 softplus gate, updates FP16/BF16/F32 state in
+place and stores output in the same dtype. Its grid mirrors upstream
+`(ceil(Dv/BV), B*Hv)` and `BV=min(nextpow2(Dv),32)`; the hand CUDA mapping uses
+an eight-lane group per value row at Dv>=32 rather than Triton's compiler-
+private one-warp tensor mapping. Tests cover the full upstream B32/H4/Hv8/
+K128/V128 matrix, padded mixed/a/b rows, F32 auxiliary gate parameters through
+the official fixture, fewer slots than padded rows, slot 0, negative padding,
+two graph replays, input padding, unused state and allocation-edge canaries.
+
+Fresh local Debug CPU verification passes the full GDN binary **39/39 cases,
+434/434 assertions**. A clean ASan+UBSan build passes the focused packed cases
+**5/5, 70/70**; an earlier overlapping CPU-only build attempt was discarded
+and its directory rebuilt from scratch before this result. The CUDA mutable
+scratch is
+`~/work/vllm.cpp-gdn-packed-decode/w1d1-preflight` on the DGX. With LocalAI
+still `exited/restart=no`, one uncontended lock covers focused operator,
+official boundary and sanitizer execution: packed cases pass **5/5,
+167/167**; the direct operator reports **0/1** output/state differences and
+passes **1/1, 12/12**; compute-sanitizer passes **2/2, 97/97**, zero errors and
+zero leaks. The widened CUDA GDN binary passes **41/41, 1,570/1,570**. GPU,
+lock and port return idle.
+
+These are mutable implementation results only. This checkpoint intentionally
+keeps `KERNEL-GDN-PACKED-DECODE` `ACTIVE`, binding `3f256ab` at **55/124**,
+BF16 end-to-end at **233/235**, and `benchmark_binding=false`; it earns no
+speed credit. Next: commit/push this code and live record, create a fresh
+SHA-owned detached DGX root, rebuild, and repeat the complete G1 matrix,
+official `0/1` replay, capture/canaries and strict memcheck before W1D2 starts.

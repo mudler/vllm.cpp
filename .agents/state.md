@@ -8758,3 +8758,47 @@ c2/c16 AB/BA/AB covering **40 timing + 8 memory** axes. qkvz stays blocked
 until that disposition. If parity remains open after the execution-grounded
 component, launch the fresh multi-lens sub-agent lever scan requested by the
 standing protocol.
+
+### 2026-07-14 — W1D3 packed/rollback trace harness implemented and CPU-gated
+
+The W1D3 structural checkpoint now has a fail-closed execution path instead of
+reusing the older GDN-BA labels. `tools/bench/online_gate.py` adds explicit
+`packed` / `rollback` modes and `VT_GDN_PACKED_DECODE=1/0` provenance while
+leaving the historical no-mode and merged/split contracts unchanged. The exact
+B=2 packed contract is **915 kernels, 145 BF16 GEMMs, 48 packed recurrence, 0
+decomposed recurrence and 0 post-conv**; rollback is **963, 145, 0, 48 and 48**.
+Zero-count families are part of the contract rather than omitted evidence.
+
+`scripts/dgx-online-serving.sh --gdn-packed-mode both` stages disjoint packed
+and rollback artifacts and executes both complete ours/vLLM trace chains under
+the existing single outer `/tmp/gpu` lock. The new
+`finalize_gdn_packed_trace.py` independently revalidates both arms, fresh
+oracles, toggle environments and invariant local ranges; it accepts only the
+exact 48-node net reduction. Each arm must also contain exactly 48 BA
+projection nodes at the accepted `(8,1,1)` geometry. Those signatures are
+hashed per arm because the intentional BF16-vs-F32 output transition may alter
+cuBLASLt selection; after excluding them and the exact mode-specific GDN nodes,
+every remaining kernel/memcpy/memset signature must match cross-arm. The
+finalizer refuses overwrites and writes `status-gdn-packed.json` last.
+
+Test-first RED was the missing packed-mode import plus an exact-zero family
+failure. Independent review then exposed that family counts alone admitted
+same-count unrelated name/geometry substitution; a test-first normalized-node
+invariant closed that hole. Re-review exposed that treating the intentionally
+mode-coupled BA projection as invariant would falsely reject valid hardware
+evidence because its output layout participates in cuBLASLt heuristic
+selection. A second RED fixture now gives the 48 BA nodes mode-specific names,
+and a 47/48 geometry mutation fails closed; the remaining invariant multiset
+still rejects same-count name/geometry substitution. Independent re-review
+reports no remaining Critical or Important harness finding. Bash syntax,
+ShellCheck, Python compilation, focused packed/BA/low-batch/client tests
+**39/39**, and the complete tools suite **78/78** now pass.
+
+This checkpoint runs no GPU, timing, memory, exact-grid or 35B performance
+command. It is therefore **PENDING** for hardware evidence and earns no speed
+credit: binding `3f256ab` remains **55/124**, c2 TPOT remains **6.1% slower**,
+and `benchmark_binding=false`. Next: push a clean SHA, create
+`~/work/vllm.cpp-gdn-packed-trace/<sha>`, execute the documented one-lock
+packed/rollback node trace, finalize it marker-last, then run the c2/c16
+default/rollback **40 timing + 8 memory** component. qkvz stays blocked until
+that disposition.

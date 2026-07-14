@@ -216,7 +216,7 @@ class LowBatchTraceSummaryTests(unittest.TestCase):
             ],
         }
         graph_contract = {
-            "families": FAMILY_CONTRACT,
+            "families": {**FAMILY_CONTRACT, "absent_family": ("not-present", 0)},
             "node_count": 9,
         }
         result = finalizer.summarize_local_c2(

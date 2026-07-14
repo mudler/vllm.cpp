@@ -4,7 +4,9 @@
 `KERNEL-GEMM-BF16`, `SERVE-GATE-ONLINE` · **status:** spike complete,
 implementation `ACTIVE` under `CLAIM-GDN-BA-ROUNDING-1`; W1D1/G1 closed at
 clean `9ad8fb7`; clean pushed `f344dec` closes W1D2 model dispatch and
-immutable G2; W1D3 trace/component is pending · **priority:** roadmap order 0.
+immutable G2; W1D3 hardware trace/component is pending · **priority:** roadmap order 0.
+The fail-closed W1D3 trace harness is implemented and CPU-gated **78/78**;
+immutable DGX capture and c2/c16 performance evidence remain pending.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -97,6 +99,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
 | Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
 | W1D2 immutable G2 | model/runner/registry tests plus real 27B/35B/GGUF gates | Clean pushed `f344dec` passes default and rollback 27B **235/235 + 16/16**; default selects exactly 48 packed calls on the first decode and zero on prefill, rollback selects zero; native/batched 35B selects zero at **315/315**; Compact/Balanced GGUF each pass **14/14**; full CUDA GDN passes **43/43, 1,707/1,707**; three strict memcheck slices report zero errors/leaks. G2 is closed; no speed credit exists. |
+| W1D3 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_packed_trace.py` | Explicit packed/rollback modes preserve historical contracts, require exact `VT_GDN_PACKED_DECODE=1/0`, run both complete ours/vLLM chains under one lock and finalize marker-last only at 915/963 nodes with the exact 48-for-96 GDN replacement. Each arm must contain exactly 48 BA projection nodes at `(8,1,1)`; those mode-coupled signatures are hashed separately because BF16-vs-F32 output may change cuBLASLt selection, while every remaining kernel/memcpy/memset signature must match cross-arm. Full tool suite **78/78** passes; no immutable DGX trace exists yet. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -113,6 +116,7 @@ them also removes the pure-decode post-conv intermediate launch and buffers.
 | Rollback/default | same model file | Implemented process-cached `VT_GDN_PACKED_DECODE`; default couples BF16 BA+packed for 27B and `=0` restores F32 BA/decomposed execution from the same binary. |
 | Oracle generation | `tools/bench/gdn_packed_decode_oracle.py` | Maintainer-only official-v0.25 generator with version/commit guard, repeated bit-stability and reference-tolerance checks. |
 | Test port | `tests/parity/test_op_parity.cpp`, `tests/vt/test_ops_gdn.cpp`, model tests | Port the upstream dtype/stride/state cases and retain the small exact boundary fixture. |
+| Trace provenance/finalization | `tools/bench/online_gate.py`, `scripts/dgx-online-serving.sh`, `tools/bench/finalize_gdn_packed_trace.py` | W1D3 adds mode-keyed graph contracts without reinterpreting historical evidence, disjoint arm artifacts, one-lock ordering, environment validation and completion-marker-last structural finalization. |
 
 Every implementation file cites the exact upstream source and commit. The
 Triton kernel is a porting reference only; the runtime stays pure C++/CUDA.
@@ -138,6 +142,9 @@ Additional mandatory local gates:
   legacy and GGUF 35B zero-selection regressions;
 - node-level trace with `--cuda-graph-trace=node`, no capture allocation,
   synchronization, D2H or new copy/cast nodes.
+- fail-closed tool tests cover exact zero-count legacy families, wrong-mode
+  topology rejection, mutual exclusion with BA-mode traces, one-lock arm order,
+  fresh-oracle agreement, overwrite refusal and completion-marker-last.
 
 ## Gates
 
@@ -214,7 +221,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **CLOSED / immutable G2 PASS at clean `f344dec`:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Evidence root `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`. |
-| W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |
+| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Harness implemented / CPU PASS 78/78.** Immutable 915-vs-963 DGX trace and c2/c16 40+8 remain pending; qkvz stays blocked until the G3 disposition. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is
 recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.

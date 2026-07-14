@@ -32,6 +32,7 @@ from tools.bench.online_gate import (
     MAX_NUM_BATCHED_TOKENS,
     MAX_NUM_SEQS,
     TRACE_CAPTURE_GRAPH_REPLAYS,
+    TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT,
     TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH,
     TRACE_REPETITIONS,
     VLLM_DECODE_FAMILY_CONTRACTS,
@@ -477,6 +478,45 @@ def summarize_local_c2(
         isinstance(value, str) for value in topology_hashes
     ):
         raise HarnessError("local low-batch topology is not invariant")
+    invariant_topology_hashes = {
+        item.get("gdn_packed_invariant_node_multiset_sha256")
+        for item in validations
+    }
+    invariant_topology_hash = None
+    if invariant_topology_hashes != {None}:
+        if len(invariant_topology_hashes) != 1 or not all(
+            isinstance(value, str) for value in invariant_topology_hashes
+        ):
+            raise HarnessError("local mode-invariant GDN topology is not invariant")
+        invariant_topology_hash = next(iter(invariant_topology_hashes))
+    coupled_ba_topology_hashes = {
+        item.get("gdn_packed_coupled_ba_node_multiset_sha256")
+        for item in validations
+    }
+    coupled_ba_topology_hash = None
+    if coupled_ba_topology_hashes != {None}:
+        if len(coupled_ba_topology_hashes) != 1 or not all(
+            isinstance(value, str) for value in coupled_ba_topology_hashes
+        ):
+            raise HarnessError("local coupled BA topology is not invariant")
+        coupled_ba_topology_hash = next(iter(coupled_ba_topology_hashes))
+    coupled_ba_node_counts = {
+        item.get("gdn_packed_coupled_ba_node_count") for item in validations
+    }
+    coupled_ba_node_count = None
+    if coupled_ba_node_counts != {None}:
+        if coupled_ba_node_counts != {TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT}:
+            raise HarnessError("local coupled BA node count is not invariant")
+        coupled_ba_node_count = next(iter(coupled_ba_node_counts))
+    optional_packed_fields = (
+        invariant_topology_hash,
+        coupled_ba_topology_hash,
+        coupled_ba_node_count,
+    )
+    if any(value is None for value in optional_packed_fields) and any(
+        value is not None for value in optional_packed_fields
+    ):
+        raise HarnessError("local packed GDN topology metadata is incomplete")
     range_records = []
     expected_family_counts = {
         family: expected
@@ -525,7 +565,10 @@ def summarize_local_c2(
                 fp4_tactics[tactic] += count
         if total_count != expected_graph_contract["node_count"]:
             raise HarnessError(f"local range {index} per-kernel counts do not sum")
-        if dict(broad_counts) != expected_family_counts:
+        actual_family_counts = {
+            family: broad_counts[family] for family in expected_family_counts
+        }
+        if actual_family_counts != expected_family_counts:
             raise HarnessError(f"local range {index} family counts drifted")
         if dict(fp4_tactics) != dict(expected_fp4_tactics):
             raise HarnessError(f"local range {index} FP4 tactics drifted")
@@ -559,7 +602,7 @@ def summarize_local_c2(
                 [item["family_time_us"][family] for item in range_records]
             ),
         }
-    return {
+    result = {
         "family_summary": family_summary,
         "kernel_count_per_window": expected_graph_contract["node_count"],
         "kernel_time_us": _stats(
@@ -568,6 +611,15 @@ def summarize_local_c2(
         "node_multiset_sha256": next(iter(topology_hashes)),
         "range_count": len(range_records),
     }
+    if invariant_topology_hash is not None:
+        result["gdn_packed_invariant_node_multiset_sha256"] = (
+            invariant_topology_hash
+        )
+        result["gdn_packed_coupled_ba_node_multiset_sha256"] = (
+            coupled_ba_topology_hash
+        )
+        result["gdn_packed_coupled_ba_node_count"] = coupled_ba_node_count
+    return result
 
 
 def _validate_model_gate(path: pathlib.Path, source_commit: str) -> dict[str, Any]:

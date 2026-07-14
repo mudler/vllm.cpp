@@ -15,7 +15,7 @@ usage:
   dgx-online-serving.sh --prepare-corpus --model 27|35 --source-corpus DIR --evidence DIR
   dgx-online-serving.sh --trace-only --model 27 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N] \
-    [--trace-concurrency 2|16] [--gdn-ba-mode both]
+    [--trace-concurrency 2|16] [--gdn-ba-mode both] [--gdn-packed-mode both]
   dgx-online-serving.sh --execute --model 27|35 --snapshot DIR --source-corpus DIR \
     --evidence DIR --build-dir DIR --configure-log FILE [--client PATH] [--port N]
 EOF
@@ -37,6 +37,7 @@ max_num_seqs=32
 max_num_batched_tokens=""
 trace_concurrency=16
 gdn_ba_mode=""
+gdn_packed_mode=""
 
 while (($#)); do
   case "$1" in
@@ -58,6 +59,7 @@ while (($#)); do
     --num-blocks) num_blocks=${2:?}; shift 2 ;;
     --trace-concurrency) trace_concurrency=${2:?}; shift 2 ;;
     --gdn-ba-mode) gdn_ba_mode=${2:?}; shift 2 ;;
+    --gdn-packed-mode) gdn_packed_mode=${2:?}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -73,6 +75,15 @@ fi
 if [[ -n ${gdn_ba_mode} &&
       ( ${mode} != trace-only || ${gdn_ba_mode} != both ) ]]; then
   echo "--gdn-ba-mode currently accepts only 'both' with --trace-only" >&2
+  exit 2
+fi
+if [[ -n ${gdn_packed_mode} &&
+      ( ${mode} != trace-only || ${gdn_packed_mode} != both ) ]]; then
+  echo "--gdn-packed-mode currently accepts only 'both' with --trace-only" >&2
+  exit 2
+fi
+if [[ -n ${gdn_ba_mode} && -n ${gdn_packed_mode} ]]; then
+  echo "--gdn-ba-mode and --gdn-packed-mode are mutually exclusive" >&2
   exit 2
 fi
 
@@ -133,6 +144,11 @@ fi
 if [[ -n ${gdn_ba_mode} &&
       ( ${model} != 27 || ${trace_concurrency} != 2 ) ]]; then
   echo "--gdn-ba-mode both is defined only for the 27B c2 trace-only gate" >&2
+  exit 2
+fi
+if [[ -n ${gdn_packed_mode} &&
+      ( ${model} != 27 || ${trace_concurrency} != 2 ) ]]; then
+  echo "--gdn-packed-mode both is defined only for the 27B c2 trace-only gate" >&2
   exit 2
 fi
 [[ -n ${snapshot} && -d ${snapshot} ]] || { echo "--snapshot directory is required" >&2; exit 2; }
@@ -413,6 +429,7 @@ run_paired_traces() {
   local trace_dir="${evidence}/trace/${model}"
   local artifact_prefix=""
   local gdn_ba_env_value=""
+  local gdn_packed_env_value=""
   case "${trace_arm}" in
     "") ;;
     merged)
@@ -425,8 +442,18 @@ run_paired_traces() {
       artifact_prefix="gdn-ba-split-"
       gdn_ba_env_value=0
       ;;
+    packed)
+      trace_dir="${evidence}/trace/${model}/gdn-packed"
+      artifact_prefix="gdn-packed-"
+      gdn_packed_env_value=1
+      ;;
+    rollback)
+      trace_dir="${evidence}/trace/${model}/gdn-rollback"
+      artifact_prefix="gdn-rollback-"
+      gdn_packed_env_value=0
+      ;;
     *)
-      echo "unknown internal GDN BA trace arm: ${trace_arm}" >&2
+      echo "unknown internal GDN trace arm: ${trace_arm}" >&2
       return 2
       ;;
   esac
@@ -515,8 +542,11 @@ run_paired_traces() {
       "VT_FP4_PLAN_CACHE=${VT_FP4_PLAN_CACHE}"
       "VT_FP4_PRE_SERVE_WARMUP=${VT_FP4_PRE_SERVE_WARMUP}"
     )
-    if [[ -n ${trace_arm} ]]; then
+    if [[ -n ${gdn_ba_env_value} ]]; then
       trace_env+=("VT_GDN_MERGED_BA=${gdn_ba_env_value}")
+    fi
+    if [[ -n ${gdn_packed_env_value} ]]; then
+      trace_env+=("VT_GDN_PACKED_DECODE=${gdn_packed_env_value}")
     fi
     local -a profile_cmd=(
       env
@@ -701,8 +731,12 @@ run_paired_traces() {
         return 1
       }
       local -a gdn_ba_validation_args=()
-      if [[ -n ${trace_arm} ]]; then
+      local -a gdn_validation_args=()
+      if [[ -n ${gdn_ba_env_value} ]]; then
         gdn_ba_validation_args=(--gdn-ba-mode "${trace_arm}")
+      fi
+      if [[ -n ${gdn_packed_env_value} ]]; then
+        gdn_validation_args=(--gdn-packed-mode "${trace_arm}")
       fi
       python3 "${repo_root}/tools/bench/online_gate.py" validate-nsys-trace \
         --sqlite "${ours_sqlite}" \
@@ -710,6 +744,7 @@ run_paired_traces() {
         --range-index "${range_index}" \
         --expected-batch "${trace_concurrency}" \
         "${gdn_ba_validation_args[@]}" \
+        "${gdn_validation_args[@]}" \
         --output "${ours_validation}"
       python3 "${repo_root}/tools/bench/online_gate.py" summarize-nsys-kernels \
         --sqlite "${ours_sqlite}" \
@@ -717,6 +752,7 @@ run_paired_traces() {
         --range-index "${range_index}" \
         --expected-batch "${trace_concurrency}" \
         "${gdn_ba_validation_args[@]}" \
+        "${gdn_validation_args[@]}" \
         --output "${ours_summary}"
       ours_reps+=("${ours_rep}")
       ours_sqlites+=("${ours_sqlite}")
@@ -808,8 +844,10 @@ PY
   gpu_idle || { echo "GPU did not return after paired traces" >&2; return 1; }
   drop_caches "${cache_after_vllm}"
   if [[ ${trace_concurrency} == 2 ]]; then
-    if [[ -n ${trace_arm} ]]; then
+    if [[ -n ${gdn_ba_env_value} ]]; then
       echo "c2 GDN BA ${trace_arm} raw paired trace capture complete; status remains PENDING until GDN BA finalization" >&2
+    elif [[ -n ${gdn_packed_env_value} ]]; then
+      echo "c2 GDN packed ${trace_arm} raw paired trace capture complete; status remains PENDING until GDN packed finalization" >&2
     else
       echo "c2 raw paired trace capture complete; status remains PENDING until low-batch finalization" >&2
     fi
@@ -850,6 +888,10 @@ if [[ ${mode} == trace-only ]]; then
     run_paired_traces merged
     run_paired_traces split
     echo "model ${model} GDN BA merged/split node-level paired traces complete" >&2
+  elif [[ ${gdn_packed_mode} == both ]]; then
+    run_paired_traces packed
+    run_paired_traces rollback
+    echo "model ${model} GDN packed/rollback node-level paired traces complete" >&2
   else
     run_paired_traces
     echo "model ${model} node-level paired trace complete" >&2

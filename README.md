@@ -17,8 +17,13 @@ OpenAI-compatible server.
 > 16/16**; default selects 48 packed calls on the first decode and zero during
 > prefill, while rollback selects zero. Full CUDA GDN is **43/43**, 35B remains
 > packed-inert at **315/315**, and isolated Compact/Balanced GGUF each pass
-> **14/14**. Immutable G2 is closed; W1D3 paired node traces plus c2/c16 timing
-> remain pending, so the binding result and speed credit do not change. Host
+> **14/14**. Immutable G2 is closed. The fail-closed W1D3 packed/rollback
+> node-trace harness and marker-last finalizer are implemented and pass the
+> complete **78/78** tool suite. Cross-arm equality covers every
+> mode-invariant node signature after excluding only the three GDN structural
+> families and the exact 48 coupled BA projection nodes whose output dtype
+> intentionally changes; immutable DGX traces plus c2/c16 timing remain
+> pending, so the binding result and speed credit do not change. Host
 > memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
 > performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md).
@@ -28,7 +33,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Clean `f344dec` closes W1D2/G2 correctness and selection; no speed credit follows | Run paired node traces plus c2/c16 before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Clean `f344dec` closes W1D2/G2; the W1D3 trace harness is CPU-gated but has no hardware evidence or speed credit | Execute packed/rollback node traces, then c2/c16 before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -56,7 +61,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `f344dec` closes W1D2/G2 for default/rollback dispatch, independent BF16-conv/FP32-SSM allocation, complete metadata preflight and graph-padding safety. Immutable gates pass 27B **235/235** in both arms, 35B **315/315**, GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, and strict focused memcheck; W1D3 performance evidence is next |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `f344dec` closes W1D2/G2. W1D3 now has explicit 915-node packed and 963-node rollback contracts, toggle provenance, exact mode-invariant signature equality with a 48-node coupled-BA allowance, one-lock ordering and a completion-marker-last finalizer; all **78/78** tool tests pass. The DGX trace and c2/c16 component remain pending |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -128,7 +133,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D2/G2 is immutable-green at `f344dec`; paired traces and c2/c16 are pending, and qkvz remains blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN W1D2/G2 is immutable-green at `f344dec`; the W1D3 trace harness is CPU-green, but DGX traces and c2/c16 are pending and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -147,7 +152,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT is gated; vLLM's packed pure-decode operator is immutable operator-gated at `9ad8fb7`, and clean `f344dec` closes W1D2/G2 model selection. Paired trace and performance attribution remain open |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT is gated; clean `f344dec` closes packed W1D2/G2. Exact packed/rollback node contracts and finalization are CPU-gated; immutable trace and every-axis performance attribution remain open |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 
@@ -178,8 +183,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: close packed-GDN W1D3 paired node traces
-plus c2/c16 → implement/gate merged qkvz →
+The next execution order is fixed: execute and finalize packed-GDN W1D3 paired
+node traces, then c2/c16 → implement/gate merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
 LMCache support.

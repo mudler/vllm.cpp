@@ -41,9 +41,12 @@ from tools.bench.online_gate import (
     TRACE_CAPTURE_GRAPH_REPLAYS,
     TRACE_GDN_BA_ENV,
     TRACE_GDN_BA_MODES,
+    TRACE_GDN_PACKED_ENV,
+    TRACE_GDN_PACKED_MODES,
     TRACE_PRIMARY_GRAPH_CONTRACTS,
     TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH,
     TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE,
+    TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_PACKED_MODE,
     TRACE_PROMPTS,
     TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
@@ -109,6 +112,7 @@ def write_nsys_sqlite(
     report_path: pathlib.Path | None = None,
     family_drift: bool = False,
     gdn_ba_mode: str | None = None,
+    gdn_packed_mode: str | None = None,
     lost_events: bool = False,
     model_contract: bool = False,
     model_batch: int = TRACE_CONCURRENCY,
@@ -118,6 +122,8 @@ def write_nsys_sqlite(
     signature_drift: bool = False,
     uneven_replays: bool = False,
     collected_event_delta: int = 0,
+    gdn_packed_ba_drift: bool = False,
+    unrelated_drift: bool = False,
 ) -> None:
     if not 1 <= range_index <= TRACE_CAPTURE_GRAPH_REPLAYS:
         raise ValueError("synthetic Nsight range index is invalid")
@@ -215,17 +221,29 @@ def write_nsys_sqlite(
         )
         if model_contract:
             contract = trace_primary_graph_contract(
-                "27", model_batch, gdn_ba_mode=gdn_ba_mode
+                "27",
+                model_batch,
+                gdn_ba_mode=gdn_ba_mode,
+                gdn_packed_mode=gdn_packed_mode,
             )
             node_names = []
             for family, (pattern, count) in contract["families"].items():
                 if family_drift and family == "normal_fp4_producer":
                     count -= 1
+                if family == "bf16_gemm" and gdn_packed_mode is not None:
+                    node_names.extend(
+                        [f"{pattern}_gdn_ba_{gdn_packed_mode}"] * 48
+                    )
+                    count -= 48
                 node_names.extend([pattern] * count)
             node_names.extend(
                 ["unclassified-kernel"]
                 * (contract["node_count"] - len(node_names))
             )
+            if unrelated_drift:
+                node_names[node_names.index("unclassified-kernel")] = (
+                    "unclassified-kernel-drift"
+                )
             memcpy_nodes = 7
         else:
             node_names = ["kernel-a", "kernel-b"]
@@ -281,7 +299,14 @@ def write_nsys_sqlite(
             )
             for graph_node_id, name in enumerate(node_names, start=1):
                 row_correlation = 9999 if orphan_child and graph_node_id == 1 else correlation_id
-                grid_x = 2 if signature_drift and graph_node_id == 1 else 1
+                if "_gdn_ba_" in name:
+                    drift_this_ba = (
+                        gdn_packed_ba_drift
+                        and graph_node_id == node_names.index(name) + 1
+                    )
+                    grid_x = 7 if drift_this_ba else 8
+                else:
+                    grid_x = 2 if signature_drift and graph_node_id == 1 else 1
                 kernel_row = (
                     launch_index * 100_000 + graph_node_id * 10,
                     launch_index * 100_000 + graph_node_id * 10 + 5,
@@ -766,8 +791,16 @@ class OnlineClientContractTests(unittest.TestCase):
             plan["planned_commands"]["trace_gdn_ba"][-4:],
             ["--trace-concurrency", "2", "--gdn-ba-mode", "both"],
         )
+        self.assertEqual(
+            plan["planned_commands"]["trace_gdn_packed"][-4:],
+            ["--trace-concurrency", "2", "--gdn-packed-mode", "both"],
+        )
         self.assertIn(
             "trace/27/{gdn-ba-summary,gdn-ba-manifest,status-gdn-ba}.json",
+            plan["required_artifacts"],
+        )
+        self.assertIn(
+            "trace/27/{gdn-packed-summary,gdn-packed-manifest,status-gdn-packed}.json",
             plan["required_artifacts"],
         )
         corpus_command = plan["planned_commands"]["corpus"]
@@ -1067,6 +1100,31 @@ class OnlineClientContractTests(unittest.TestCase):
             script,
         )
 
+    def test_trace_driver_records_gdn_packed_arms_under_one_lock(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[--gdn-packed-mode both]", script)
+        self.assertIn(
+            'trace_env+=("VT_GDN_PACKED_DECODE=${gdn_packed_env_value}")',
+            script,
+        )
+        self.assertIn(
+            'gdn_validation_args=(--gdn-packed-mode "${trace_arm}")',
+            script,
+        )
+        lock_index = script.index("flock 9")
+        packed_index = script.index("run_paired_traces packed", lock_index)
+        rollback_index = script.index("run_paired_traces rollback", packed_index)
+        self.assertLess(lock_index, packed_index)
+        self.assertLess(packed_index, rollback_index)
+        self.assertEqual(script.count("flock 9"), 1)
+        self.assertIn(
+            "model ${model} GDN packed/rollback node-level paired traces complete",
+            script,
+        )
+
     def test_trace_driver_keeps_c2_staging_non_binding(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
@@ -1207,6 +1265,138 @@ class OnlineClientContractTests(unittest.TestCase):
                 validate_nsys_trace(clean, gdn_ba_mode="merged")
             with self.assertRaisesRegex(HarnessError, "unknown GDN BA"):
                 trace_primary_graph_contract("27", 2, gdn_ba_mode="unknown")
+
+            self.assertEqual(TRACE_GDN_PACKED_MODES, ("packed", "rollback"))
+            self.assertEqual(TRACE_GDN_PACKED_ENV, {"packed": "1", "rollback": "0"})
+            self.assertEqual(
+                TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_PACKED_MODE[
+                    ("27", 2, "packed")
+                ]["node_count"],
+                915,
+            )
+            invariant_hashes = {}
+            coupled_ba_hashes = {}
+            for mode, expected_nodes, packed_count, decomposed_count in (
+                ("packed", 915, 48, 0),
+                ("rollback", 963, 0, 48),
+            ):
+                mode_trace = root / f"gdn-{mode}.sqlite"
+                write_nsys_sqlite(
+                    mode_trace,
+                    lost_events=True,
+                    model_contract=True,
+                    model_batch=2,
+                    gdn_packed_mode=mode,
+                )
+                mode_result = validate_nsys_trace(
+                    mode_trace,
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_packed_mode=mode,
+                )
+                self.assertEqual(mode_result["gdn_packed_mode"], mode)
+                invariant_hashes[mode] = mode_result[
+                    "gdn_packed_invariant_node_multiset_sha256"
+                ]
+                coupled_ba_hashes[mode] = mode_result[
+                    "gdn_packed_coupled_ba_node_multiset_sha256"
+                ]
+                self.assertEqual(mode_result["primary_graph_node_count"], expected_nodes)
+                self.assertEqual(
+                    mode_result["primary_graph_family_node_counts"][
+                        "gdn_packed_recurrence"
+                    ],
+                    packed_count,
+                )
+                self.assertEqual(
+                    mode_result["primary_graph_family_node_counts"][
+                        "gdn_decomposed_recurrence"
+                    ],
+                    decomposed_count,
+                )
+                mode_summary = summarize_nsys_kernels(
+                    mode_trace,
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_packed_mode=mode,
+                )
+                self.assertEqual(mode_summary["gdn_packed_mode"], mode)
+                self.assertEqual(mode_summary["kernel_count"], expected_nodes)
+            self.assertEqual(invariant_hashes["packed"], invariant_hashes["rollback"])
+            self.assertNotEqual(coupled_ba_hashes["packed"], coupled_ba_hashes["rollback"])
+
+            unrelated_drift = root / "gdn-packed-unrelated-drift.sqlite"
+            write_nsys_sqlite(
+                unrelated_drift,
+                lost_events=True,
+                model_contract=True,
+                model_batch=2,
+                gdn_packed_mode="packed",
+                unrelated_drift=True,
+            )
+            drift_result = validate_nsys_trace(
+                unrelated_drift,
+                model_key="27",
+                expected_batch=2,
+                gdn_packed_mode="packed",
+            )
+            self.assertNotEqual(
+                drift_result["gdn_packed_invariant_node_multiset_sha256"],
+                invariant_hashes["packed"],
+            )
+
+            unrelated_geometry_drift = root / "gdn-packed-geometry-drift.sqlite"
+            write_nsys_sqlite(
+                unrelated_geometry_drift,
+                lost_events=True,
+                model_contract=True,
+                model_batch=2,
+                gdn_packed_mode="packed",
+                signature_drift=True,
+            )
+            geometry_result = validate_nsys_trace(
+                unrelated_geometry_drift,
+                model_key="27",
+                expected_batch=2,
+                gdn_packed_mode="packed",
+            )
+            self.assertNotEqual(
+                geometry_result["gdn_packed_invariant_node_multiset_sha256"],
+                invariant_hashes["packed"],
+            )
+
+            coupled_ba_drift = root / "gdn-packed-ba-drift.sqlite"
+            write_nsys_sqlite(
+                coupled_ba_drift,
+                lost_events=True,
+                model_contract=True,
+                model_batch=2,
+                gdn_packed_mode="packed",
+                gdn_packed_ba_drift=True,
+            )
+            with self.assertRaisesRegex(HarnessError, "coupled BA node count"):
+                validate_nsys_trace(
+                    coupled_ba_drift,
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_packed_mode="packed",
+                )
+
+            with self.assertRaisesRegex(HarnessError, "model contract"):
+                validate_nsys_trace(
+                    root / "gdn-rollback.sqlite",
+                    model_key="27",
+                    expected_batch=2,
+                    gdn_packed_mode="packed",
+                )
+            with self.assertRaisesRegex(HarnessError, "requires an exact model"):
+                validate_nsys_trace(clean, gdn_packed_mode="packed")
+            with self.assertRaisesRegex(HarnessError, "unknown GDN packed"):
+                trace_primary_graph_contract("27", 2, gdn_packed_mode="unknown")
+            with self.assertRaisesRegex(HarnessError, "mutually exclusive"):
+                trace_primary_graph_contract(
+                    "27", 2, gdn_ba_mode="merged", gdn_packed_mode="packed"
+                )
 
             unreconciled = root / "unreconciled.sqlite"
             write_nsys_sqlite(

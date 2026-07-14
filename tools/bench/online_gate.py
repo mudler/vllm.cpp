@@ -84,6 +84,15 @@ TRACE_REQUIRED_ENV = {
 }
 TRACE_GDN_BA_MODES = ("merged", "split")
 TRACE_GDN_BA_ENV = {"merged": "1", "split": "0"}
+TRACE_GDN_PACKED_MODES = ("packed", "rollback")
+TRACE_GDN_PACKED_ENV = {"packed": "1", "rollback": "0"}
+TRACE_GDN_PACKED_STRUCTURAL_FAMILIES = (
+    "gdn_packed_recurrence",
+    "gdn_decomposed_recurrence",
+    "gdn_post_conv",
+)
+TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT = 48
+TRACE_GDN_PACKED_COUPLED_BA_GRID = (8, 1, 1)
 _TRACE_27_COMMON_FAMILIES = {
     "fa2_combine": ("flash_fwd_splitkv_combine_kernel", 16),
     "fa2_main": ("flash_fwd_splitkv_kernel", 16),
@@ -125,6 +134,35 @@ TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE = {
         "families": {
             **_TRACE_27_COMMON_FAMILIES,
             "bf16_gemm": ("gemm_bf16", 193),
+        },
+    },
+}
+_TRACE_27_NON_GDN_FAMILIES = {
+    family: contract
+    for family, contract in _TRACE_27_COMMON_FAMILIES.items()
+    if family != "gdn_recurrence"
+}
+TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_PACKED_MODE = {
+    ("27", 2, "packed"): {
+        "graph_child_nodes": {"kernel": 915, "memcpy": 7, "memset": 1},
+        "node_count": 915,
+        "families": {
+            **_TRACE_27_NON_GDN_FAMILIES,
+            "bf16_gemm": ("gemm_bf16", 145),
+            "gdn_packed_recurrence": ("GdnPackedDecodeKernel", 48),
+            "gdn_decomposed_recurrence": ("GdnDecodeFusedKernel", 0),
+            "gdn_post_conv": ("GdnPostConvKernel", 0),
+        },
+    },
+    ("27", 2, "rollback"): {
+        "graph_child_nodes": {"kernel": 963, "memcpy": 7, "memset": 1},
+        "node_count": 963,
+        "families": {
+            **_TRACE_27_NON_GDN_FAMILIES,
+            "bf16_gemm": ("gemm_bf16", 145),
+            "gdn_packed_recurrence": ("GdnPackedDecodeKernel", 0),
+            "gdn_decomposed_recurrence": ("GdnDecodeFusedKernel", 48),
+            "gdn_post_conv": ("GdnPostConvKernel", 48),
         },
     },
 }
@@ -228,21 +266,34 @@ def trace_primary_graph_contract(
     expected_batch: int,
     *,
     gdn_ba_mode: str | None = None,
+    gdn_packed_mode: str | None = None,
 ) -> Mapping[str, Any]:
     """Resolve an exact graph contract without reinterpreting old evidence."""
 
-    if gdn_ba_mode is None:
+    if gdn_ba_mode is not None and gdn_packed_mode is not None:
+        raise HarnessError("GDN BA and packed trace modes are mutually exclusive")
+    if gdn_ba_mode is None and gdn_packed_mode is None:
         contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_BATCH.get(
             (model_key, expected_batch)
         )
-    else:
+    elif gdn_ba_mode is not None:
         if gdn_ba_mode not in TRACE_GDN_BA_MODES:
             raise HarnessError(f"unknown GDN BA trace mode: {gdn_ba_mode}")
         contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_BA_MODE.get(
             (model_key, expected_batch, gdn_ba_mode)
         )
+    else:
+        if gdn_packed_mode not in TRACE_GDN_PACKED_MODES:
+            raise HarnessError(f"unknown GDN packed trace mode: {gdn_packed_mode}")
+        contract = TRACE_PRIMARY_GRAPH_CONTRACTS_BY_GDN_PACKED_MODE.get(
+            (model_key, expected_batch, gdn_packed_mode)
+        )
     if contract is None:
-        suffix = f" in GDN BA mode {gdn_ba_mode}" if gdn_ba_mode else ""
+        suffix = ""
+        if gdn_ba_mode:
+            suffix = f" in GDN BA mode {gdn_ba_mode}"
+        elif gdn_packed_mode:
+            suffix = f" in GDN packed mode {gdn_packed_mode}"
         raise HarnessError(
             "no exact Nsight graph contract for "
             f"model {model_key} at batch {expected_batch}{suffix}"
@@ -830,6 +881,13 @@ def build_plan(
                 "--gdn-ba-mode",
                 "both",
             ],
+            "trace_gdn_packed": [
+                *trace_model_command,
+                "--trace-concurrency",
+                "2",
+                "--gdn-packed-mode",
+                "both",
+            ],
         },
         "required_artifacts": [
             "manifest.json",
@@ -859,6 +917,9 @@ def build_plan(
             "trace/27/gdn-ba-{merged,split}/ours-r{1,2,3}.{1,2,3,4}.nsys-rep",
             "trace/27/gdn-ba-{merged,split}/vllm-profile/*.pt.trace.json.gz",
             "trace/27/{gdn-ba-summary,gdn-ba-manifest,status-gdn-ba}.json",
+            "trace/27/gdn-{packed,rollback}/ours-r{1,2,3}.{1,2,3,4}.nsys-rep",
+            "trace/27/gdn-{packed,rollback}/vllm-profile/*.pt.trace.json.gz",
+            "trace/27/{gdn-packed-summary,gdn-packed-manifest,status-gdn-packed}.json",
             "summary-<model>/{all-runs,ratios}.json",
             "summary/{all-runs,ratios}.json",
         ],
@@ -1007,6 +1068,7 @@ def validate_nsys_trace(
     range_index: int = 1,
     expected_batch: int = TRACE_CONCURRENCY,
     gdn_ba_mode: str | None = None,
+    gdn_packed_mode: str | None = None,
 ) -> dict[str, Any]:
     """Validate one bounded H1d range report by direct runtime correlation."""
 
@@ -1512,13 +1574,17 @@ def validate_nsys_trace(
             )
 
         primary_family_counts: dict[str, int] = {}
-        if gdn_ba_mode is not None and model_key is None:
-            raise HarnessError("GDN BA trace mode requires an exact model contract")
+        gdn_packed_invariant_node_multiset_sha256 = None
+        gdn_packed_coupled_ba_node_multiset_sha256 = None
+        gdn_packed_coupled_ba_node_count = None
+        if (gdn_ba_mode is not None or gdn_packed_mode is not None) and model_key is None:
+            raise HarnessError("GDN trace mode requires an exact model contract")
         contract = (
             trace_primary_graph_contract(
                 model_key,
                 expected_batch,
                 gdn_ba_mode=gdn_ba_mode,
+                gdn_packed_mode=gdn_packed_mode,
             )
             if model_key
             else None
@@ -1548,6 +1614,85 @@ def validate_nsys_trace(
                     raise HarnessError(
                         f"Nsight trace dispatched forbidden fallback kernel {forbidden}"
                     )
+            if gdn_packed_mode is not None:
+                structural_patterns = tuple(
+                    contract["families"][family][0]
+                    for family in TRACE_GDN_PACKED_STRUCTURAL_FAMILIES
+                )
+                bf16_pattern = contract["families"]["bf16_gemm"][0]
+                coupled_ba_nodes = [
+                    value
+                    for value in per_launch_signatures[0]
+                    if value["kind"] == "kernel"
+                    and bf16_pattern in value["name"]
+                    and (
+                        value.get("gridX"),
+                        value.get("gridY"),
+                        value.get("gridZ"),
+                    )
+                    == TRACE_GDN_PACKED_COUPLED_BA_GRID
+                ]
+                gdn_packed_coupled_ba_node_count = len(coupled_ba_nodes)
+                if (
+                    gdn_packed_coupled_ba_node_count
+                    != TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT
+                ):
+                    raise HarnessError(
+                        "Nsight packed GDN coupled BA node count differs: "
+                        f"got {gdn_packed_coupled_ba_node_count}, expected "
+                        f"{TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT}"
+                    )
+                invariant_nodes = [
+                    value
+                    for value in per_launch_signatures[0]
+                    if not (
+                        value["kind"] == "kernel"
+                        and (
+                            any(
+                                pattern in value["name"]
+                                for pattern in structural_patterns
+                            )
+                            or (
+                                bf16_pattern in value["name"]
+                                and (
+                                    value.get("gridX"),
+                                    value.get("gridY"),
+                                    value.get("gridZ"),
+                                )
+                                == TRACE_GDN_PACKED_COUPLED_BA_GRID
+                            )
+                        )
+                    )
+                ]
+                removed_structural_nodes = sum(
+                    value["kind"] == "kernel"
+                    and any(
+                        pattern in value["name"] for pattern in structural_patterns
+                    )
+                    for value in per_launch_signatures[0]
+                )
+                expected_removed_nodes = sum(
+                    contract["families"][family][1]
+                    for family in TRACE_GDN_PACKED_STRUCTURAL_FAMILIES
+                )
+                if removed_structural_nodes != expected_removed_nodes:
+                    raise HarnessError(
+                        "Nsight packed GDN structural-node normalization differs"
+                    )
+                if (
+                    len(per_launch_signatures[0]) - len(invariant_nodes)
+                    != expected_removed_nodes
+                    + TRACE_GDN_PACKED_COUPLED_BA_NODE_COUNT
+                ):
+                    raise HarnessError(
+                        "Nsight packed GDN mode-variant node normalization differs"
+                    )
+                gdn_packed_invariant_node_multiset_sha256 = hashlib.sha256(
+                    canonical_json(invariant_nodes).encode("utf-8")
+                ).hexdigest()
+                gdn_packed_coupled_ba_node_multiset_sha256 = hashlib.sha256(
+                    canonical_json(coupled_ba_nodes).encode("utf-8")
+                ).hexdigest()
 
         activity_count = runtime_count + sum(len(rows) for rows in child_rows.values())
         capture_boundary_diagnostic = None
@@ -1642,6 +1787,17 @@ def validate_nsys_trace(
     }
     if gdn_ba_mode is not None:
         result["gdn_ba_mode"] = gdn_ba_mode
+    if gdn_packed_mode is not None:
+        result["gdn_packed_mode"] = gdn_packed_mode
+        result["gdn_packed_invariant_node_multiset_sha256"] = (
+            gdn_packed_invariant_node_multiset_sha256
+        )
+        result["gdn_packed_coupled_ba_node_multiset_sha256"] = (
+            gdn_packed_coupled_ba_node_multiset_sha256
+        )
+        result["gdn_packed_coupled_ba_node_count"] = (
+            gdn_packed_coupled_ba_node_count
+        )
     return result
 
 
@@ -1652,6 +1808,7 @@ def summarize_nsys_kernels(
     range_index: int = 1,
     expected_batch: int = TRACE_CONCURRENCY,
     gdn_ba_mode: str | None = None,
+    gdn_packed_mode: str | None = None,
 ) -> dict[str, Any]:
     validation = validate_nsys_trace(
         sqlite_path,
@@ -1659,6 +1816,7 @@ def summarize_nsys_kernels(
         range_index=range_index,
         expected_batch=expected_batch,
         gdn_ba_mode=gdn_ba_mode,
+        gdn_packed_mode=gdn_packed_mode,
     )
     result = {
         **validation["kernel_summary"],
@@ -1668,6 +1826,8 @@ def summarize_nsys_kernels(
     }
     if gdn_ba_mode is not None:
         result["gdn_ba_mode"] = gdn_ba_mode
+    if gdn_packed_mode is not None:
+        result["gdn_packed_mode"] = gdn_packed_mode
     return result
 
 
@@ -2360,6 +2520,7 @@ def record_trace_status(
     expected_batch: int = TRACE_CONCURRENCY,
     trace_prompts: int = TRACE_PROMPTS,
     gdn_ba_mode: str | None = None,
+    gdn_packed_mode: str | None = None,
     write_output: bool = True,
 ) -> dict[str, Any]:
     """Hash the mandatory paired execution-trace artifacts.
@@ -2384,6 +2545,7 @@ def record_trace_status(
         model_key,
         expected_batch,
         gdn_ba_mode=gdn_ba_mode,
+        gdn_packed_mode=gdn_packed_mode,
     )
     _require_full_sha(vllm_cpp_sha, "vllm.cpp SHA")
     trace_execution = _validated_trace_execution(
@@ -2459,6 +2621,8 @@ def record_trace_status(
         }
         if gdn_ba_mode is not None:
             expected_environment_names.add("VT_GDN_MERGED_BA")
+        if gdn_packed_mode is not None:
+            expected_environment_names.add("VT_GDN_PACKED_DECODE")
         if (
             len(set(environment_names)) != len(environment_names)
             or set(environment_names) != expected_environment_names
@@ -2478,6 +2642,14 @@ def record_trace_status(
         ):
             raise HarnessError(
                 "ours trace GDN BA environment differs from its declared mode"
+            )
+        if (
+            gdn_packed_mode is not None
+            and environment.get("VT_GDN_PACKED_DECODE")
+            != TRACE_GDN_PACKED_ENV[gdn_packed_mode]
+        ):
+            raise HarnessError(
+                "ours trace GDN packed environment differs from its declared mode"
             )
         for name in ("VT_FP4_FLASHINFER_CACHE_PATH", "VT_FP4_AUTOTUNE_CACHE_PATH"):
             if name not in environment:
@@ -2794,6 +2966,7 @@ def record_trace_status(
             range_index=range_index,
             expected_batch=expected_batch,
             gdn_ba_mode=gdn_ba_mode,
+            gdn_packed_mode=gdn_packed_mode,
         )
         if pathlib.Path(validation["nsys_report_path"]).resolve() != report_path.resolve():
             raise HarnessError("Nsight SQLite source report differs from its indexed artifact")
@@ -2808,6 +2981,7 @@ def record_trace_status(
             range_index=range_index,
             expected_batch=expected_batch,
             gdn_ba_mode=gdn_ba_mode,
+            gdn_packed_mode=gdn_packed_mode,
         )
         if _load_json_object(summary_path) != summary:
             raise HarnessError("recorded Nsight kernel summary differs from its SQLite")
@@ -2958,6 +3132,11 @@ def record_trace_status(
         result["trace_contract"]["gdn_ba_mode"] = gdn_ba_mode
         result["trace_contract"]["gdn_ba_env"] = {
             "VT_GDN_MERGED_BA": TRACE_GDN_BA_ENV[gdn_ba_mode]
+        }
+    if gdn_packed_mode is not None:
+        result["trace_contract"]["gdn_packed_mode"] = gdn_packed_mode
+        result["trace_contract"]["gdn_packed_env"] = {
+            "VT_GDN_PACKED_DECODE": TRACE_GDN_PACKED_ENV[gdn_packed_mode]
         }
     if write_output:
         write_json_atomic(output, result)
@@ -3489,6 +3668,7 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-batch", type=int, default=TRACE_CONCURRENCY
     )
     validate_nsys.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
+    validate_nsys.add_argument("--gdn-packed-mode", choices=TRACE_GDN_PACKED_MODES)
     validate_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     summarize_nsys = commands.add_parser("summarize-nsys-kernels")
@@ -3506,6 +3686,7 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-batch", type=int, default=TRACE_CONCURRENCY
     )
     summarize_nsys.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
+    summarize_nsys.add_argument("--gdn-packed-mode", choices=TRACE_GDN_PACKED_MODES)
     summarize_nsys.add_argument("--output", type=pathlib.Path, required=True)
 
     profile_control = commands.add_parser("record-profile-control")
@@ -3569,6 +3750,7 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument("--execution-manifest", type=pathlib.Path, required=True)
     trace.add_argument("--vllm-cpp-sha", required=True)
     trace.add_argument("--gdn-ba-mode", choices=TRACE_GDN_BA_MODES)
+    trace.add_argument("--gdn-packed-mode", choices=TRACE_GDN_PACKED_MODES)
 
     oracle = commands.add_parser("record-oracle")
     oracle.add_argument("--output", type=pathlib.Path, required=True)
@@ -3661,6 +3843,7 @@ def main() -> int:
             range_index=args.range_index,
             expected_batch=args.expected_batch,
             gdn_ba_mode=args.gdn_ba_mode,
+            gdn_packed_mode=args.gdn_packed_mode,
         )
         write_json_atomic(args.output, result)
     elif args.command == "summarize-nsys-kernels":
@@ -3672,6 +3855,7 @@ def main() -> int:
             range_index=args.range_index,
             expected_batch=args.expected_batch,
             gdn_ba_mode=args.gdn_ba_mode,
+            gdn_packed_mode=args.gdn_packed_mode,
         )
         write_json_atomic(args.output, result)
     elif args.command == "record-profile-control":
@@ -3719,6 +3903,7 @@ def main() -> int:
             execution_manifest=args.execution_manifest,
             vllm_cpp_sha=args.vllm_cpp_sha,
             gdn_ba_mode=args.gdn_ba_mode,
+            gdn_packed_mode=args.gdn_packed_mode,
         )
     elif args.command == "record-oracle":
         result = record_oracle_manifest(args.output, client=args.client)

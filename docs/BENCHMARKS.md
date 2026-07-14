@@ -19,7 +19,13 @@ DGX replay passes default and rollback 27B **235/235 + 16/16**, full CUDA GDN
 35B **315/315** with zero packed selection, and isolated Compact/Balanced GGUF
 **14/14 + 14/14**. Focused strict memcheck covers the packed matrix,
 compressed indexed corner and FP16 SSM rollback with zero errors/leaks.
-Immutable G2 is **PASSED**; W1D3 node trace plus c2/c16 **40 timing + 8
+Immutable G2 is **PASSED**. The fail-closed W1D3 harness now records explicit
+packed/rollback environment provenance, enforces 915/963-node contracts under
+one lock, and writes its structural completion marker last; the complete tool
+suite passes **78/78**, including exact cross-arm equality of every normalized
+mode-invariant node signature. Normalization excludes only the mode's GDN
+structural nodes and exactly 48 coupled BA projections, whose output dtype
+intentionally changes between arms. Immutable DGX traces plus c2/c16 **40 timing + 8
 memory** remain **PENDING**, so no
 accepted performance number changes.
 
@@ -66,9 +72,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124** | Close packed decode and its c2/c16 component; rerun the exact grid only if authorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed W1D3 trace tooling is CPU-gated only | Execute packed/rollback traces and c2/c16; rerun the exact grid only if authorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D2 IMMUTABLE G2 PASS** | Clean `f344dec`: default+rollback 27B **235/235**, 35B **315/315** zero-selection, GGUF **14/14 + 14/14**, CUDA GDN **43/43**, direct **0/1**, focused memcheck zero errors/leaks | Run paired node trace plus c2/c16 AB/BA/AB |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 HARNESS READY** | Clean `f344dec` retains immutable G2. Exact packed/rollback contracts, mode-invariant signature equality with exactly 48 coupled BA nodes isolated per arm, one-lock driver, provenance validation and marker-last finalizer pass **78/78** tool tests; no DGX W1D3 artifact exists | Run paired node trace plus c2/c16 AB/BA/AB |
 | RMSNorm/generated partitions | **PENDING / QUEUED** | Equal 177-call structure remains the next positive diagnostic residual after the merge | Whole-chain spike only after the merged-projection checkpoints |
 | Host-weight ownership | **FAILED / DIAGNOSED** | **24,610,136,064 B / 22.920 GiB** retained in host weight tensors plus overlapping source mmap pages | Direct-to-final-device streaming design and all-axis memory A/B |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes; no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
@@ -79,7 +85,7 @@ performance command is authorized until the 27B result reaches 124/124.
 
 The semantic and operator gates are retained at clean `f18ca23` and
 `9ad8fb7`; their complete hashes and attempt chronology live in the ledger and
-state log. The current checkpoint is W1D2:
+state log. The current checkpoint is W1D3 pre-execution:
 
 | Surface | Current evidence | Disposition |
 |---|---|---|
@@ -90,7 +96,8 @@ state log. The current checkpoint is W1D2:
 | 35B native/batched | **315/315**, 0 packed calls | Immutable inertness PASS |
 | 35B GGUF | Compact **14/14**, Balanced **14/14**, loader **98/98** | Immutable isolated-process PASS |
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
-| Performance | No W1D3 trace or c2/c16 A/B exists | **PENDING; no speed credit** |
+| W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | CPU/tool PASS **78/78**; immutable DGX evidence PENDING |
+| Performance | No immutable W1D3 trace or c2/c16 A/B exists | **PENDING; no speed credit** |
 
 Immutable evidence root:
 `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`.
@@ -107,9 +114,9 @@ flock /tmp/gpu env VT_GDN_PACKED_DECODE=0 \
 flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 ```
 
-G2 is closed. W1D3 now requires paired ours/vLLM
-Nsight traces (ours with `--cuda-graph-trace=node`) before the c2/c16 40+8
-same-binary series; until then `benchmark_binding=false`.
+G2 is closed. W1D3 tooling is ready; it now requires paired ours/vLLM Nsight
+traces (ours with `--cuda-graph-trace=node`) before the c2/c16 40+8 same-binary
+series. Until then `benchmark_binding=false`.
 
 Closed controls do not remain active leaves: async scheduling measured neutral
 for speed, and the prior fused-producer candidate remains default-off after its
@@ -263,14 +270,14 @@ flock /tmp/gpu env VT_GDN_BA_OUT_BF16=1 \
 # Current disposition: 233/235; got == greedy_ids_emulation.npy
 ```
 
-For a fresh reproduction, create a new SHA-owned root, write the plan before
-copying the frozen corpus, configure the exact trace build, then run the
-same one-lock driver and finalizer:
+For the next W1D3 hardware checkpoint, create a new SHA-owned root, write the
+plan before copying the frozen corpus, configure the exact trace build, then
+run the packed/rollback arms under the driver's single lock and finalize them:
 
 ```sh
 set -o pipefail
 SHA=$(git rev-parse HEAD)
-ROOT="$HOME/work/vllm.cpp-gdn-ba-trace/$SHA"
+ROOT="$HOME/work/vllm.cpp-gdn-packed-trace/$SHA"
 SOURCE="$ROOT/source"
 EVIDENCE="$ROOT/evidence/$SHA"
 BINDING="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560"
@@ -296,17 +303,21 @@ cmake -S "$SOURCE" -B "$ROOT/build-cuda" -G Ninja \
   --snapshot "$SNAPSHOT" --source-corpus "$EVIDENCE/corpus/27" \
   --evidence "$EVIDENCE" --build-dir "$ROOT/build-cuda" \
   --configure-log "$ROOT/configure.log" --trace-concurrency 2 \
-  --gdn-ba-mode both --client "$HOME/venvs/vllm-oracle/bin/vllm" \
-  --vllm-cpp-sha "$SHA" 2>&1 | tee "$ROOT/gdn-ba-run.log"
-python3 "$SOURCE/tools/bench/finalize_gdn_ba_trace.py" \
+  --gdn-packed-mode both --client "$HOME/venvs/vllm-oracle/bin/vllm" \
+  --vllm-cpp-sha "$SHA" 2>&1 | tee "$ROOT/gdn-packed-run.log"
+python3 "$SOURCE/tools/bench/finalize_gdn_packed_trace.py" \
   --evidence "$EVIDENCE" --source-commit "$SHA" \
-  --run-log "$ROOT/gdn-ba-run.log"
+  --run-log "$ROOT/gdn-packed-run.log"
 ```
 
-Acceptance requires 145 versus 193 BF16 GEMMs, total nodes 963 versus 1,011,
-unchanged non-BF16 families and memcpy/memset counts. Exact build/corpus
-requirements and acceptance rules are in the
-[merged-projection spike](../.agents/specs/gdn-merged-input-projections.md).
+Acceptance requires packed **915** versus rollback **963** total nodes, 145
+BF16 GEMMs in both arms, 48 packed recurrence calls replacing 48 decomposed +
+48 post-conv calls, exactly 48 BA projection nodes at the accepted `(8,1,1)`
+geometry in each arm (hashed separately because BF16-vs-F32 output may change
+the cuBLASLt tactic), and an identical normalized signature multiset for every
+remaining kernel/memcpy/memset node.
+Exact requirements are in the
+[packed-decode spike](../.agents/specs/gdn-packed-decode.md).
 
 Re-aggregate the binding result without GPU work; exit **1** is expected for a
 complete every-axis failure, while exit 2 means malformed evidence:

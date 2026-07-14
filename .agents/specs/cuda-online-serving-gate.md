@@ -41,6 +41,10 @@ implements the CPU/CUDA operator and upstream matrix; clean `9ad8fb7` closes
 G1 with focused **5/5**, full GDN **41/41**, direct `0/1` and strict memcheck
 **2/2 with zero errors/leaks**. Clean `f344dec` closes W1D2 model dispatch and
 immutable G2; paired node traces and c2/c16 remain pending.
+The W1D3 packed/rollback extension is now implemented and CPU-gated **78/78**:
+it records exact toggle provenance, preserves historical graph contracts,
+requires 915/963 nodes under one lock and writes its structural marker last.
+No immutable W1D3 trace or speed result exists yet.
 qkvz is still excluded.
 No cross-profiler duration or launch reduction earns speed credit by itself.
 Host PSS/RSS is independently grounded in a persistent **22.920 GiB** CPU
@@ -119,7 +123,7 @@ can be re-aggregated; it cannot satisfy attribution.
 | exact corpus | `tools/bench/make_serve_low_corpus.py` source corpus via the dry-run-recorded `<pinned-vLLM-bin>/python -m tools.bench.make_serve_low_corpus` command + hash-preserving vLLM CustomDataset view in `online_gate.py` |
 | build/oracle provenance | clean exact-HEAD CMake refresh + hashed command/log/binary; hashed pip launcher, Python, venv `ninja`, benchmark modules, dist metadata/RECORD, plus exact pandas 2.2.3 runtime/package/METADATA/RECORD preflight in `online_gate.py` |
 | lifecycle/resources | `scripts/dgx-online-serving.sh`; process-tree/GPU sampling in `tools/bench/sample_process_memory.py`; rootless enumerated `POSIX_FADV_DONTNEED` + `mincore` proof in `tools/bench/drop_file_cache.py` |
-| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16/48 or c2/6 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions; kernel-event aggregation in `summarize_torch_kernels.py`. `--gdn-ba-mode both` runs explicit `VT_GDN_MERGED_BA=1/0` paired arms inside one outer lock; `finalize_gdn_ba_trace.py` revalidates both and writes the structural marker last. The trace-build-only server/controller accepts an exact graph batch; production builds do not |
+| GPU/runtime trace | ours under `nsys`; vLLM LLM-API torch profile via the closed-loop `tools/bench/profile_vllm_online_gate.py`; metadata fixes c16/48 or c2/6 admission, max-seqs 32, production model length, cache-off, corpus hash, and three repetitions. `--gdn-packed-mode both` runs explicit `VT_GDN_PACKED_DECODE=1/0` arms inside one outer lock; `finalize_gdn_packed_trace.py` revalidates both and writes the structural marker last. Historical no-mode and GDN-BA contracts remain unchanged. The trace-build-only server/controller accepts an exact graph batch; production builds do not |
 
 ## Tests to port
 
@@ -148,6 +152,13 @@ can be re-aggregated; it cannot satisfy attribution.
   **1,011 / 193**, unchanged 7 memcpy + 1 memset and all non-BF16 families.
   Driver/finalizer tests prove one-lock ordering, exact toggle provenance,
   a 48-BF16-only delta, completion-marker-last and overwrite refusal.
+- Packed GDN contracts independently require packed **915/145/48/0/0** versus
+  rollback **963/145/0/48/48** for total/BF16/packed/decomposed/post-conv
+  nodes. Tool tests prove zero-family handling, mode/env provenance, one-lock
+  ordering, exactly 48 separately hashed BA projections per arm, identical
+  normalized signatures for every remaining kernel/memcpy/memset node, and
+  marker-last finalization; same-count name or geometry substitutions outside
+  the intentional BF16-vs-F32 BA transition fail closed.
 - The profiler test drives a fake engine through closed-loop replacement
   admission and proves the resident request count never exceeds c16. Client and
   summary cases reject missing cache-off flags or drifted cache/admission/
@@ -268,7 +279,8 @@ reported as a clean dependency check.
    `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural` across all
    24 local range contracts with `benchmark_binding=false`. Close paired node
    traces plus c2/c16
-   component disposition; only then claim qkvz. Host-weight ownership
+   component disposition. The packed/rollback extension passes **78/78** tools
+   and awaits immutable DGX capture; only then claim qkvz. Host-weight ownership
    remains a separate all-axis repair. Cross-profiler attribution never earns
    speed credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.

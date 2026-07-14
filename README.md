@@ -15,8 +15,10 @@ OpenAI-compatible server.
 > first divergence: vLLM normalizes q/k in F32 inside recurrence and rounds
 > sigmoid beta through BF16. Our current path differs at **306/7552**
 > output/state elements; beta-only is **308/6558**, while both upstream
-> semantics reach **0/1** in the diagnostic fixture. Immutable replay,
-> implementation, 235/235 and c2/c16 are pending, so no speed credit is
+> semantics reach **0/1** in the diagnostic fixture. Clean `f18ca23` has now
+> regenerated the official fixture byte-for-byte and passed the focused CUDA
+> boundary test **10/10** under one uncontended lock. Production implementation,
+> 235/235 and c2/c16 are pending, so no speed credit is
 > claimed. The token-correct F32 rollback remains the shipping default. Host
 > memory also retains a **22.92 GiB CPU weight mirror**, and no 35B performance
 > result is claimed. See [Benchmarks](docs/BENCHMARKS.md).
@@ -26,7 +28,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. BA projection/structure are closed; the packed oracle selects F32 in-kernel q/k normalization plus BF16 beta rounding and reaches **0/1** | Replay immutably, implement packed pure decode, restore 235/235, then run c2/c16 before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. BA projection/structure are closed; clean `f18ca23` immutably reproduces the packed boundary at **0/1** | Implement packed pure decode, restore 235/235, then run c2/c16 before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
@@ -54,7 +56,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: the official v0.25 oracle disproves beta-only and identifies the complete pure-decode semantic/fusion port. Immutable replay precedes production code; end-to-end BF16 remains **233/235** |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: clean `f18ca23` closes immutable G0 with a byte-identical official-v0.25 fixture and focused CUDA **10/10**. W1D1 production op/tests are next; end-to-end BF16 remains **233/235** |
 | Remaining kernel queue | Finalized c2 evidence ranks equal-count RMSNorm/generated partitions after the merge; FP4 tactics already match **128 Stream-K + 80 static-persistent** and are not the positive residual |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
 
@@ -176,8 +178,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: immutably replay and implement packed GDN
-pure decode, restore 235/235, then close c2/c16 → implement/gate merged qkvz →
+The next execution order is fixed: implement packed GDN pure decode, restore
+235/235, then close c2/c16 → implement/gate merged qkvz →
 all-axis 27B parity → 35B parity → the SGLang shared-prefix gate → the rest of
 [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
 LMCache support.

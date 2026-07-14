@@ -97,7 +97,7 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 | Immutable W1 safety | `~/work/vllm.cpp-gdn-ba/immutable-581d335…`; status `3895e658…4cf6` | Exact CUDA build and focused 4/4 pass; packed-view compute-sanitizer is 590/590 with 0 errors/leaks; frozen fixture is 64/64 and no native cache is created. |
 | W1 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_ba_trace.py` | Historical no-mode c2 stays at 1,011 nodes. Explicit merged/split modes require 963/145 versus 1,011/193, record `VT_GDN_MERGED_BA`, run both paired arms under one lock and accept only a 48-BF16-only delta. Immutable `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural`: 24/24 exact local ranges, exact 48-BF16-only removal, unchanged selected non-BF16 families and `benchmark_binding=false`. The tool suite passes 69/69. |
 | W1C projection + inertness | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; `tests/parity/test_op_parity.cpp`; `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | Immutable `f925294` passes local exact projection 14/14, loader 73/73, native 35B 315/315, real GGUF 28/28 and default 27B 235/235. BF16 27B remains 233/235 and exactly equals emulation. Since the projection bits match vLLM, the open gap is downstream of GEMM. |
-| W1C first boundary | [packed-decode spike](gdn-packed-decode.md), `tools/bench/gdn_packed_decode_oracle.py`, `tests/parity/goldens/gdn-packed-decode-oracle/`, focused `test_op_parity.cpp` case | Official v0.25 proves packed pure decode normalizes q/k in F32 in-kernel and rounds sigmoid beta through `b.dtype`. Mutable local preflight is current `306/7552`, beta-only `308/6558`, both semantics `0/1` output/state BF16 differences. The first divergence is closed; pushed-SHA replay is pending. |
+| W1C first boundary | [packed-decode spike](gdn-packed-decode.md), `tools/bench/gdn_packed_decode_oracle.py`, `tests/parity/goldens/gdn-packed-decode-oracle/`, focused `test_op_parity.cpp` case | Official v0.25 proves packed pure decode normalizes q/k in F32 in-kernel and rounds sigmoid beta through `b.dtype`. Clean `f18ca23` regenerates the fixture byte-for-byte and passes CUDA **10/10**: current `306/7552`, beta-only `308/6558`, both semantics `0/1`. The first divergence and immutable G0 are closed. |
 | Remaining W1 evidence | packed implementation + component tools | Port the complete pure-decode operation, restore 235/235 BF16 continuation, prove 48 packed calls replace the post-conv/decode pairs, then run the 40+8-axis c2/c16 component. Capture lifecycle and BA structure remain closed by `0091cd1`; qkvz stays blocked. |
 
 The completed evidence root is
@@ -214,8 +214,8 @@ semantics, memory accounting or component performance.
 - The deterministic boundary oracle now selects the complete
   `KERNEL-GDN-PACKED-DECODE` port: beta-only is disproven, while dtype-rounded
   beta plus F32 in-kernel q/k normalization reproduces the official packed
-  output/state at `0/1` BF16 differences. Its pushed-SHA replay and production
-  gates must close before component timing.
+  output/state at `0/1` BF16 differences. Clean pushed `f18ca23` closes its
+  immutable replay; production gates must close before component timing.
 
 ### G2 — W1 exact structure and component performance
 
@@ -293,7 +293,7 @@ frozen fixture are recorded before execution.
 |---|---|---|
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
 | W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32 output is 235/235 + 16/16. Default-off W1C BF16 selection remains 233/235. |
-| W1C | Repeat immutable safety/model gates, close BF16 semantics, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | `581d335` closes safety, `0091cd1` closes BA structure and `f925294` closes exact projection plus native/legacy/GGUF inertness. The first-boundary oracle now proves the remaining 233/235 failure is the missing packed pure-decode q/k-normalization + beta-rounding contract. `KERNEL-GDN-PACKED-DECODE` implementation, immutable replay and component remain pending. G2 must close before W2. |
+| W1C | Repeat immutable safety/model gates, close BF16 semantics, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | `581d335` closes safety, `0091cd1` closes BA structure and `f925294` closes exact projection plus native/legacy/GGUF inertness. Clean `f18ca23` closes the packed first-boundary semantic replay. `KERNEL-GDN-PACKED-DECODE` implementation and component remain pending. G2 must close before W2. |
 | W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
 | W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |

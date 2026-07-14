@@ -8509,3 +8509,33 @@ remains **233/235**, binding remains **55/124**, `benchmark_binding=false`, and
 no timing, memory or speed credit exists. After immutable G0, port the full
 FP16/BF16/F32 CPU+CUDA operation test-first, restore 235/235, prove 48 packed
 calls replace the post-conv/decode pairs, then run c2/c16 before qkvz.
+
+## 2026-07-14 — clean packed-decode G0 replay passes; W1D1 is unblocked
+
+The machine restart restored Docker `local-ai-worker` with `restart=always` and
+an unhealthy `llama-cpp-fallback` child occupying 7,430 MiB. The canonical
+benchmark-campaign directive keeps that worker stopped with restart disabled,
+so it was returned to `restart=no` / `exited` before GPU work. The first replay
+attempt had already failed closed before taking `/tmp/gpu` or writing result
+artifacts. After the worker stopped, the complete series ran under one lock and
+returned the GPU and lock idle.
+
+Clean detached source `f18ca23691bc7e38adbf04912da92f819154379e` at
+`~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e/source`
+configured with CUDA 13.0.88, sm_121a, FlashAttention and Triton AOT, then built
+`test_op_parity` successfully. The official vLLM 0.25.0 oracle ran three packed
+repetitions and regenerated every committed fixture byte exactly: committed and
+regenerated ordered hash-list SHA-256 values are both
+`03b3c2a4640bff33d4c5a5c3bc5c48ac37dfc6c45e0d2bf5656c419f9ca201ab`;
+byte/hash diffs and final Git status are empty (`e3b0c442…b855`). Generator,
+manifest and CUDA test binary hashes are `002a55ae…4ead`, `4c828e3a…a18d` and
+`56c30162…8aaf`; oracle/test logs are `44e0fe8e…e2f` and `0c2b6a40…53ab`.
+
+The focused CUDA boundary gate passes **1/1 case, 10/10 assertions** and
+reproduces current **306/7552**, beta-only **308/6558**, and complete packed
+semantics **0/1** output/state BF16 differences. This closes W1D0/G0 only; it
+does not close end-to-end correctness or earn performance credit. BF16 27B
+remains **233/235**, binding remains **55/124**, and `benchmark_binding=false`.
+W1D1 is now unblocked: add the public FP16/BF16/F32 packed op, portable CPU
+reference, CUDA implementation and contiguous/strided/negative-index test
+matrix test-first. qkvz, exact grid and 35B performance remain prohibited.

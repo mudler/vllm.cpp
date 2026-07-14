@@ -91,7 +91,7 @@ window and show the old post-conv/decode pair absent on pure decode.
 | Recurrent CUDA | same file `:936-1133` | The fused recurrence consumes already-materialized q/k and F32 beta. Its recurrence is otherwise the correct baseline/fallback. |
 | Projection proof | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/` | Immutable `f925294` passes all five real BA shapes exactly; the divergence is not the GEMM. |
 | Packed oracle | `tools/bench/gdn_packed_decode_oracle.py`; `tests/parity/goldens/gdn-packed-decode-oracle/` | Official v0.25 packed output is bit-stable. Its rounded-beta explicit reference is output-exact and differs by one state element (`1.9073486328125e-06`); full-F32 beta differs at 46 output and 5,834 state BF16 elements. |
-| Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Mutable DGX preflight: current local output/state differ at `306/7552`; beta-only is `308/6558`; beta rounding plus F32 q/k normalization is `0/1`. Immutable pushed-SHA replay is pending. |
+| Local boundary replay | `tests/parity/test_op_parity.cpp` focused packed-decode case | Clean pushed `f18ca23`: regenerated official fixture is byte-identical and CUDA **10/10**; current local output/state differ at `306/7552`, beta-only is `308/6558`, and beta rounding plus F32 q/k normalization is `0/1`. Immutable G0 is closed. |
 
 The beta-only hypothesis is disproven: it improves state agreement but does not
 restore output agreement. Both upstream semantics are required, and fusing
@@ -206,7 +206,7 @@ flock /tmp/gpu build-cuda/tests/test_op_parity \
 
 | Leaf | Owned work | Entry/exit |
 |---|---|---|
-| W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | Current checkpoint: mutable preflight proves `306/7552 -> 0/1`; commit/push then immutable replay closes G0. |
+| W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | G1 green with no skipped declared dtype. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | G2 real-model and zero-selection gates green. |
 | W1D3 | Run node trace and c2/c16 component, update every status surface. | G3 disposition committed; qkvz either unblocks or the scan resumes. |

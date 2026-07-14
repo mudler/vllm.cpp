@@ -196,7 +196,6 @@ The canonical project record lives under [`.agents/`](.agents/), indexed by
 [AGENTS.md](AGENTS.md):
 
 - [roadmap v1](.agents/roadmap_v1.md)
-- [current cold-resume handoff](HANDSOFF.md)
 - [benchmark scoreboard](docs/BENCHMARKS.md)
 - [gates](.agents/gates.md) and [benchmark protocol](.agents/benchmark-protocol.md)
 - [engine](.agents/engine-matrix.md), [model](.agents/model-matrix.md),

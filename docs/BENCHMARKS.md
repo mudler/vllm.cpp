@@ -133,7 +133,8 @@ flock /tmp/gpu build-cuda/tests/test_qwen36_paged_engine
 G2 and W1D3 structural evidence are closed. The repaired source has been pushed
 and launched exactly once at `d82d282`; that incomplete root must never be
 reused or appended. The failure inspection and next diagnostic entry point are
-in [HANDSOFF.md](../HANDSOFF.md). The failed launch provenance is:
+in the newest [state record](../.agents/state.md) entry and the
+[spike](../.agents/specs/gdn-packed-decode.md). The failed launch provenance is:
 
 ```sh
 set -euo pipefail

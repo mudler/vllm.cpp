@@ -9234,7 +9234,8 @@ runtime-fix hypothesis. Order/run/execution/c16 raw/client/server SHA-256 values
 are `a2de5b07…6de0` / `297e3c62…a6fb` / `ff71c9f0…0684` /
 `f8571d48…945c` / `8b9526f4…63a9` / `7b05e066…7dfe`.
 
-The replace-in-place [cold-resume handoff](../HANDSOFF.md) records the exact
+The replace-in-place cold-resume handoff (surface retired 2026-07-14,
+user-directed; content carried in this entry) records the exact
 root/hashes and safe next sequence. Preserve this root unchanged. First add a
 bounded test-first diagnostic that retains the non-2xx JSON body and/or logs the
 caught server exception; reproduce only the exact c16 boundary under a new
@@ -9243,3 +9244,24 @@ fix. A subsequent full series also uses another fresh SHA/root and accepts only
 marker-last `complete-pass`, `complete-failed` or `complete-void`. Binding stays
 **55/124**, c2 TPOT stays **114.841 vs 108.274 ms (6.1% slower)**,
 `benchmark_binding=false`, and no speed credit is granted.
+
+## 2026-07-14 — HANDSOFF.md surface retired (user-directed)
+
+The user directed removal of the separate replace-in-place `HANDSOFF.md`
+cold-resume surface now that its content is fully carried by the canonical
+record: the two newest 2026-07-14 entries above hold the exact preserved-root
+paths, SHA-256 evidence, prohibitions and resume sequence for the incomplete
+`d82d282` c16 boundary, and the `CLAIM-GDN-BA-ROUNDING-1` row in
+`coordination.md` holds the live claim state. `AGENTS.md` now defines session
+handoff as recording cold-resume context in the newest state entries plus the
+live claim row in the same checkpoint change; `HANDSOFF.md` must not be
+recreated. Live links were repaired in the same change: `README.md` drops its
+handoff bullet, `docs/BENCHMARKS.md` points its diagnostic entry point at the
+newest state entry and the packed-decode spike, the newest ledger row's anchor
+now cites `state.md`, and the immediately preceding state entry's link was
+replaced with equivalent prose (recorded here for append-only transparency;
+no evidence, hashes, or dispositions changed). Historical mentions of
+`HANDSOFF.md` in older append-only entries remain verbatim. No code, test,
+benchmark, or lifecycle state changed; binding remains **55/124**,
+`benchmark_binding=false`, and the c16 diagnostic sequence recorded above is
+unchanged and next.

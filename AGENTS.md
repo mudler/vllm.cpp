@@ -5,12 +5,13 @@ read this first, follow the links that matter for your task, and keep the
 record updated (append to the state log) — commit it with your changes.
 Push directly to `main`.
 
-**Session handoff.** After this index, read [`HANDSOFF.md`](HANDSOFF.md). It is
-the replace-in-place cold-resume snapshot for unfinished work: active claim,
-exact source/evidence roots, owned long-running processes, last safe
-observation, prohibitions, and first resume/verification commands. Before
-ending a session with work in flight, refresh it in the same checkpoint change;
-never use it as benchmark evidence or as a chronological log.
+**Session handoff.** Cold-resume context for unfinished work lives in the
+newest [`.agents/state.md`](.agents/state.md) entries plus the live claim row
+in [`.agents/coordination.md`](.agents/coordination.md): active claim, exact
+source/evidence roots, prohibitions, and the first resume/verification
+commands. Before ending a session with work in flight, record them there in
+the same checkpoint change. (User-directed 2026-07-14: the separate
+`HANDSOFF.md` replace-in-place surface is retired; do not recreate it.)
 
 **Keep `README.md` (the user-facing status) CURRENT at EVERY feature/iteration
 checkpoint.** In the SAME change that advances a spike, implementation, test,
@@ -367,9 +368,6 @@ submitting AI-assisted code, read
 
 ## Canonical documents (outside .agents/)
 
-- [HANDSOFF.md](HANDSOFF.md) — replace-in-place cold-resume snapshot for the
-  current unfinished session; canonical evidence remains in the matrices,
-  scoreboard, state, ledger, and immutable evidence roots.
 - [docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md](docs/superpowers/specs/2026-07-02-vllm-cpp-core-design.md)
   — core architecture design (vt:: tensor runtime, engine mirroring,
   performance plan for the parity gate, milestones M0–M3).

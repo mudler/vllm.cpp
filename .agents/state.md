@@ -8802,3 +8802,58 @@ and `benchmark_binding=false`. Next: push a clean SHA, create
 packed/rollback node trace, finalize it marker-last, then run the c2/c16
 default/rollback **40 timing + 8 memory** component. qkvz stays blocked until
 that disposition.
+
+### 2026-07-14 — first W1D3 immutable attempt fails pre-GPU; plan setup repaired
+
+Clean pushed `8fbb9502f8cb04a9d781f5a0fe0213953433219a` was checked out in a
+fresh detached DGX worktree at
+`~/work/vllm.cpp-gdn-packed-trace/8fbb9502f8cb04a9d781f5a0fe0213953433219a`.
+The exact CUDA 13.0.88/sm_121a, FlashInfer CUTLASS, Marlin, vendored Triton
+AOT, FA2, profile-control build completed **154/154**. Before acquiring
+`/tmp/gpu`, `record-execution` failed closed with `execution FlashInfer plan
+fixture differs from H1d`: the documented clean SSH command did not export
+`VT_FP4_FLASHINFER_CACHE_PATH`, `VT_FP4_AUTOTUNE_CACHE_PATH`, or the other H1d
+plan variables, while the driver merely inherited and later dereferenced them.
+The previous accepted BA trace had received them from its operator shell, so
+the reproduction recipe was not self-contained.
+
+This is **FAILED / PRE-GPU**, not benchmark evidence. No execution manifest,
+model gate, packed/rollback trace directory, timing, memory or speed result
+exists. Manifest/configure/build/run-log SHA-256 values are
+`c498d0a0…55f5` / `18539519…824b` / `406bd4b4…bb7a` / `46cde8ee…5185`.
+The immutable source is clean and the GPU/lock are idle.
+
+The initial repair exported the exact read-only 64-plan environment before
+execution-manifest validation, but independent review found that this still
+left every unrelated caller control live: for example
+`VT_FP4_EXACT_BUCKETS`, `VT_FP4_FORCE_TACTIC`, `VT_GDN_PACKED_DECODE`, or
+`VLLM_CPP_CUDAGRAPH` could silently alter the supposedly frozen execution.
+The final repair launches every model-bearing step from `/usr/bin/env -i` with
+a fixed host allowlist, an explicit source-root `PYTHONPATH`, then only the
+source/evidence-derived H1d plan settings and the explicit arm control. This
+covers execution-manifest capture, the model CTest, both local Nsight arms and
+the vLLM profile; oracle provenance also uses the clean host environment. The
+frozen fixture derives from `repo_root`; the forbidden native-plan target
+derives from the evidence root and must remain absent. Review also found two
+failures in the first clean-env draft: without explicit `PYTHONPATH`, direct
+`online_gate.py` execution raised `ModuleNotFoundError: tools`; and the trace
+finalizer still parsed only the historical `env KEY=...` prefix. The source
+path is now allowlisted, and finalization requires the exact recorded
+`/usr/bin/env -i` host/plan/arm inventory for ours plus the clean oracle PATH
+inventory for vLLM.
+
+The regression test extracts and executes the production allowlist/plan arrays
+under a deliberately polluted parent environment, imports
+`tools.bench.online_gate` inside that environment, requires every H1d value and
+rejects all four hostile controls above. The full trace-record integration
+fixture now uses the production clean prefix and mutates away `-i`, injects a
+forced tactic, and removes the vLLM `-i`; every mutation fails closed. The
+original test-first contract failed on the missing deterministic setup; these
+strengthened tests close both review findings. The complete tools suite is
+**79/79**; Bash syntax, ShellCheck and diff checks pass. README, BENCHMARKS,
+roadmap and every owning matrix record the failed attempt and replacement
+requirement. Independent final re-review repeated the focused 2/2, complete
+79/79, shell, Python, import-probe and diff checks and reports no
+Critical/Important finding. Next: commit/push the repair, create a fresh
+repair-SHA root, rerun the exact one-lock trace, then finalize marker-last.
+Binding stays **55/124**, `benchmark_binding=false`, and qkvz remains blocked.

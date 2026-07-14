@@ -174,6 +174,42 @@ python3 "${repo_root}/tools/bench/online_gate.py" validate-plan \
   --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null
 prepare_corpus
 
+# The execution manifest validates this environment before the GPU lock.  Run
+# every model-bearing command from a fixed allowlist instead of inheriting an
+# operator shell: hidden VT_*/VLLM_CPP_* controls must not alter the graph.
+benchmark_system_path=/usr/local/cuda-13.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+benchmark_common_env=(
+  "HOME=${HOME}"
+  "PYTHONPATH=${repo_root}"
+  "LANG=C.UTF-8"
+  "LC_ALL=C.UTF-8"
+  "TMPDIR=/tmp"
+  "TZ=UTC"
+)
+benchmark_clean_prefix=(/usr/bin/env -i "${benchmark_common_env[@]}")
+benchmark_clean_env=("${benchmark_clean_prefix[@]}" "PATH=${benchmark_system_path}")
+h1d_plan_env=(
+  "VT_FP4_AUTOTUNE=1"
+  "VT_FP4_AUTOTUNE_CACHE_PATH=${evidence}/native-plan-must-not-exist.json"
+  "VT_FP4_AUTOTUNE_CACHE_READONLY=1"
+  "VT_FP4_AUTOTUNE_DELAY_US=5000"
+  "VT_FP4_FLASHINFER_CACHE_PATH=${repo_root}/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+  "VT_FP4_FULL_TACTICS=1"
+  "VT_FP4_PERSISTENT_CACHE=1"
+  "VT_FP4_PLAN_CACHE=1"
+  "VT_FP4_PRE_SERVE_WARMUP=1"
+)
+flashinfer_plan_fixture="${repo_root}/tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
+native_plan_target="${evidence}/native-plan-must-not-exist.json"
+[[ -f ${flashinfer_plan_fixture} ]] || {
+  echo "frozen FlashInfer plan fixture is absent" >&2
+  exit 2
+}
+[[ ! -e ${native_plan_target} ]] || {
+  echo "native plan target must be absent before execution" >&2
+  exit 2
+}
+
 execution_dir="${evidence}/execution"
 mkdir -p "${execution_dir}"
 execution_manifest="${execution_dir}/${model}-trace.json"
@@ -190,7 +226,8 @@ cmake_home=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${build_dir}/CMakeCa
 vllm_python="$(dirname "${client}")/python"
 [[ -x ${vllm_python} ]] || { echo "vLLM oracle Python is absent" >&2; exit 2; }
 oracle_manifest="${execution_dir}/${model}-oracle.json"
-"${vllm_python}" "${repo_root}/tools/bench/online_gate.py" record-oracle \
+"${benchmark_clean_env[@]}" "${vllm_python}" \
+  "${repo_root}/tools/bench/online_gate.py" record-oracle \
   --output "${oracle_manifest}" \
   --client "${client}"
 
@@ -216,7 +253,8 @@ fi
   echo "provenance-recorded build did not produce examples/server" >&2
   exit 1
 }
-python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
+"${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
+  python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
   --output "${execution_manifest}" \
   --model-key "${model}" \
   --vllm-cpp-sha "${vllm_cpp_sha}" \
@@ -531,17 +569,7 @@ run_paired_traces() {
       --benchmark-shutdown-fifo "${shutdown_fifo}"
       --served-model-name gate
     )
-    local -a trace_env=(
-      "VT_FP4_AUTOTUNE=${VT_FP4_AUTOTUNE}"
-      "VT_FP4_AUTOTUNE_CACHE_PATH=${VT_FP4_AUTOTUNE_CACHE_PATH}"
-      "VT_FP4_AUTOTUNE_CACHE_READONLY=${VT_FP4_AUTOTUNE_CACHE_READONLY}"
-      "VT_FP4_AUTOTUNE_DELAY_US=${VT_FP4_AUTOTUNE_DELAY_US}"
-      "VT_FP4_FLASHINFER_CACHE_PATH=${VT_FP4_FLASHINFER_CACHE_PATH}"
-      "VT_FP4_FULL_TACTICS=${VT_FP4_FULL_TACTICS}"
-      "VT_FP4_PERSISTENT_CACHE=${VT_FP4_PERSISTENT_CACHE}"
-      "VT_FP4_PLAN_CACHE=${VT_FP4_PLAN_CACHE}"
-      "VT_FP4_PRE_SERVE_WARMUP=${VT_FP4_PRE_SERVE_WARMUP}"
-    )
+    local -a trace_env=("${h1d_plan_env[@]}")
     if [[ -n ${gdn_ba_env_value} ]]; then
       trace_env+=("VT_GDN_MERGED_BA=${gdn_ba_env_value}")
     fi
@@ -549,7 +577,7 @@ run_paired_traces() {
       trace_env+=("VT_GDN_PACKED_DECODE=${gdn_packed_env_value}")
     fi
     local -a profile_cmd=(
-      env
+      "${benchmark_clean_env[@]}"
       "${trace_env[@]}"
       nsys profile
       --trace=cuda
@@ -630,7 +658,7 @@ run_paired_traces() {
       --repetition 1 \
       --num-prompts "${trace_prompts}" \
       --artifact-tag "${artifact_prefix}trace${trace_rep}"
-    [[ ! -e ${VT_FP4_AUTOTUNE_CACHE_PATH} ]] || {
+    [[ ! -e ${native_plan_target} ]] || {
       echo "forbidden native plan target was created before capture" >&2
       return 1
     }
@@ -771,7 +799,8 @@ run_paired_traces() {
   gpu_idle || { echo "GPU is not idle before vLLM trace" >&2; return 1; }
   drop_caches "${cache_between}"
   local -a vllm_profile_cmd=(
-    env "PATH=$(dirname "${client}"):${PATH}"
+    "${benchmark_clean_prefix[@]}"
+    "PATH=$(dirname "${client}"):${benchmark_system_path}"
     "${vllm_python}" "${repo_root}/tools/bench/profile_vllm_online_gate.py"
     --model "${snapshot}"
     --corpus "${vllm_corpus}"
@@ -870,7 +899,8 @@ mkdir -p "${gate_dir}"
   echo "refusing to overwrite model-gate evidence for ${model}" >&2
   exit 1
 }
-if ! ctest --test-dir "${build_dir}" -R "^${test_name}$" --output-on-failure \
+if ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
+  ctest --test-dir "${build_dir}" -R "^${test_name}$" --output-on-failure \
   >"${gate_log}" 2>&1; then
   cat "${gate_log}" >&2
   exit 1

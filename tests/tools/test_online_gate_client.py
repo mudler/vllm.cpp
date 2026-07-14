@@ -50,7 +50,9 @@ from tools.bench.online_gate import (
     TRACE_PROMPTS,
     TRACE_RANGE_REPORTS,
     TRACE_REPETITIONS,
+    TRACE_CLEAN_FIXED_ENV,
     TRACE_REQUIRED_ENV,
+    TRACE_SYSTEM_PATH,
     VLLM_DECODE_FAMILY_CONTRACTS,
     VLLM_GENERATION_WINDOW_CONTRACTS,
     VLLM_ORACLE_VERSION,
@@ -822,7 +824,7 @@ class OnlineClientContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_vllm_profiler_exports_the_oracle_venv_path(self) -> None:
+    def test_vllm_profiler_uses_clean_oracle_venv_path(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
             encoding="utf-8"
@@ -830,7 +832,12 @@ class OnlineClientContractTests(unittest.TestCase):
         block = script.split("local -a vllm_profile_cmd=(", 1)[1].split(
             "\n  )", 1
         )[0]
-        self.assertIn('env "PATH=$(dirname "${client}"):${PATH}"', block)
+        self.assertIn('"${benchmark_clean_prefix[@]}"', block)
+        self.assertIn(
+            '"PATH=$(dirname "${client}"):${benchmark_system_path}"',
+            block,
+        )
+        self.assertNotIn("${PATH}", block)
 
     def test_trace_driver_builds_before_requiring_the_server_binary(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
@@ -1122,6 +1129,110 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertEqual(script.count("flock 9"), 1)
         self.assertIn(
             "model ${model} GDN packed/rollback node-level paired traces complete",
+            script,
+        )
+
+    def test_trace_driver_sets_h1d_plan_environment_before_manifest(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        clean_start = script.index("benchmark_system_path=")
+        plan_start = script.index("h1d_plan_env=(", clean_start)
+        clean_end = plan_start
+        plan_end = script.index("\n)", plan_start) + 2
+        required = TRACE_REQUIRED_ENV | {
+            "VT_FP4_AUTOTUNE_CACHE_PATH": "/evidence/native-plan-must-not-exist.json",
+            "VT_FP4_FLASHINFER_CACHE_PATH": (
+                f"{repo}/tests/fixtures/nvfp4_flashinfer_v025_gb10/"
+                "autotune_configs.json"
+            ),
+        }
+        polluted = {
+            **os.environ,
+            "PYTHONPATH": "/polluted",
+            "VT_FP4_EXACT_BUCKETS": "0",
+            "VT_FP4_FORCE_TACTIC": "31",
+            "VT_GDN_PACKED_DECODE": "0",
+            "VLLM_CPP_CUDAGRAPH": "0",
+        }
+        definitions = (
+            "set -euo pipefail\n"
+            "evidence=/evidence\n"
+            f"repo_root={shlex.quote(str(repo))}\n"
+            f"{script[clean_start:clean_end]}\n"
+            f"{script[plan_start:plan_end]}\n"
+        )
+        probe = subprocess.run(
+            [
+                "bash",
+                "-c",
+                definitions
+                + '"${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" env',
+            ],
+            env=polluted,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        actual = dict(
+            line.split("=", 1)
+            for line in probe.stdout.splitlines()
+            if "=" in line
+        )
+        for name, value in required.items():
+            self.assertEqual(actual.get(name), value)
+        self.assertEqual(actual.get("PYTHONPATH"), str(repo))
+        self.assertNotEqual(actual.get("PYTHONPATH"), polluted["PYTHONPATH"])
+        self.assertEqual(actual.get("PATH"), TRACE_SYSTEM_PATH)
+        for name, value in TRACE_CLEAN_FIXED_ENV.items():
+            self.assertEqual(actual.get(name), value)
+        for forbidden in (
+            "VT_FP4_EXACT_BUCKETS",
+            "VT_FP4_FORCE_TACTIC",
+            "VT_GDN_PACKED_DECODE",
+            "VLLM_CPP_CUDAGRAPH",
+        ):
+            self.assertNotIn(forbidden, actual)
+        subprocess.run(
+            [
+                "bash",
+                "-c",
+                definitions
+                + '"${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" '
+                "python3 -c 'import tools.bench.online_gate'",
+            ],
+            env=polluted,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        environment_index = min(clean_start, plan_start)
+        manifest_index = script.index('record-execution \\', environment_index)
+        self.assertLess(environment_index, manifest_index)
+        self.assertIn(
+            '[[ ! -e ${native_plan_target} ]]',
+            script[environment_index:manifest_index],
+        )
+        self.assertIn(
+            '"${benchmark_clean_env[@]}"',
+            script[manifest_index - 160 : manifest_index],
+        )
+        self.assertIn(
+            'local -a trace_env=("${h1d_plan_env[@]}")',
+            script,
+        )
+        self.assertIn(
+            '"${benchmark_clean_env[@]}"\n      "${trace_env[@]}"\n      nsys profile',
+            script,
+        )
+        self.assertIn(
+            'local -a vllm_profile_cmd=(\n    "${benchmark_clean_prefix[@]}"',
+            script,
+        )
+        self.assertIn(
+            'if ! "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \\\n'
+            '  ctest --test-dir',
             script,
         )
 
@@ -1698,6 +1809,8 @@ class OnlineClientContractTests(unittest.TestCase):
             (build / "examples").mkdir(parents=True)
             source = root / "source"
             (source / "src/vt/cuda").mkdir(parents=True)
+            home = root / "home"
+            home.mkdir()
             (source / "src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu").write_text(
                 "// fixture\n", encoding="utf-8"
             )
@@ -1915,6 +2028,13 @@ class OnlineClientContractTests(unittest.TestCase):
             ours_profile_logs = []
             ours_profile_controls = []
             session_uuids = []
+            system_path = TRACE_SYSTEM_PATH
+            clean_command_environment = {
+                "HOME": str(home),
+                "PATH": system_path,
+                "PYTHONPATH": str(source),
+                **TRACE_CLEAN_FIXED_ENV,
+            }
             vllm_corpus = root / "vllm-corpus.jsonl"
             vllm_corpus.write_text('{"prompt":"fixture"}\n', encoding="utf-8")
             for session_index in range(TRACE_REPETITIONS):
@@ -1931,6 +2051,7 @@ class OnlineClientContractTests(unittest.TestCase):
                     server_pid=server_pid,
                 )
                 command_environment = {
+                    **clean_command_environment,
                     **TRACE_REQUIRED_ENV,
                     "VT_FP4_AUTOTUNE_CACHE_PATH": str(native),
                     "VT_FP4_FLASHINFER_CACHE_PATH": str(fixture),
@@ -1938,7 +2059,8 @@ class OnlineClientContractTests(unittest.TestCase):
                 prefix = root / f"ours-{session_index}"
                 shutdown_fifo = pathlib.Path(f"{prefix}-shutdown.fifo")
                 profile_command = [
-                    "env",
+                    "/usr/bin/env",
+                    "-i",
                     *[f"{name}={value}" for name, value in command_environment.items()],
                     "nsys",
                     "profile",
@@ -2106,8 +2228,15 @@ class OnlineClientContractTests(unittest.TestCase):
                 execution["artifacts"]["oracle:python"]["path"]
             )
             vllm_profile_command = [
-                "env",
-                f"PATH={oracle_python.parent}",
+                "/usr/bin/env",
+                "-i",
+                *[
+                    f"{name}={value}"
+                    for name, value in {
+                        **clean_command_environment,
+                        "PATH": f"{oracle_python.parent}:{system_path}",
+                    }.items()
+                ],
                 str(oracle_python),
                 str(source / "tools/bench/profile_vllm_online_gate.py"),
                 "--model",
@@ -2263,6 +2392,33 @@ class OnlineClientContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+
+            original_ours_command = ours_commands[0].read_text(encoding="utf-8")
+            ours_tokens = shlex.split(original_ours_command)
+            del ours_tokens[1]
+            ours_commands[0].write_text(
+                shlex.join(ours_tokens) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(HarnessError, "/usr/bin/env -i"):
+                record_trace()
+            ours_tokens = shlex.split(original_ours_command)
+            ours_tokens.insert(ours_tokens.index("nsys"), "VT_FP4_FORCE_TACTIC=31")
+            ours_commands[0].write_text(
+                shlex.join(ours_tokens) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(HarnessError, "env inventory"):
+                record_trace()
+            ours_commands[0].write_text(original_ours_command, encoding="utf-8")
+
+            original_vllm_command = vllm_command.read_text(encoding="utf-8")
+            vllm_tokens = shlex.split(original_vllm_command)
+            del vllm_tokens[1]
+            vllm_command.write_text(
+                shlex.join(vllm_tokens) + "\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(HarnessError, "/usr/bin/env -i"):
+                record_trace()
+            vllm_command.write_text(original_vllm_command, encoding="utf-8")
 
             nonrepeatable = json.loads(
                 ours_client_results[1].read_text(encoding="utf-8")

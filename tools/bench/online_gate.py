@@ -82,6 +82,16 @@ TRACE_REQUIRED_ENV = {
     "VT_FP4_PLAN_CACHE": "1",
     "VT_FP4_PRE_SERVE_WARMUP": "1",
 }
+TRACE_SYSTEM_PATH = (
+    "/usr/local/cuda-13.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:"
+    "/usr/bin:/sbin:/bin:/snap/bin"
+)
+TRACE_CLEAN_FIXED_ENV = {
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "TMPDIR": "/tmp",
+    "TZ": "UTC",
+}
 TRACE_GDN_BA_MODES = ("merged", "split")
 TRACE_GDN_BA_ENV = {"merged": "1", "split": "0"}
 TRACE_GDN_PACKED_MODES = ("packed", "rollback")
@@ -447,6 +457,54 @@ def _option_value(tokens: Sequence[str], flag: str) -> str | None:
     if len(matches) > 1:
         raise HarnessError(f"command option {flag} is repeated")
     return matches[0] if matches else None
+
+
+def _parse_clean_environment_prefix(
+    tokens: Sequence[str], stop_index: int, *, label: str
+) -> dict[str, str]:
+    if list(tokens[:2]) != ["/usr/bin/env", "-i"]:
+        raise HarnessError(
+            f"{label} command must start with the exact /usr/bin/env -i prefix"
+        )
+    environment_tokens = list(tokens[2:stop_index])
+    if not environment_tokens or any(
+        "=" not in token or not token.split("=", 1)[0]
+        for token in environment_tokens
+    ):
+        raise HarnessError(f"{label} command clean environment is malformed")
+    environment_names = [token.split("=", 1)[0] for token in environment_tokens]
+    if len(set(environment_names)) != len(environment_names):
+        raise HarnessError(f"{label} command clean environment repeats a variable")
+    return dict(token.split("=", 1) for token in environment_tokens)
+
+
+def _validate_clean_host_environment(
+    environment: Mapping[str, str],
+    *,
+    source_root: pathlib.Path,
+    expected_path: str,
+    label: str,
+) -> None:
+    for name, expected in TRACE_CLEAN_FIXED_ENV.items():
+        if environment.get(name) != expected:
+            raise HarnessError(
+                f"{label} command clean environment {name} differs from H1d"
+            )
+    if environment.get("PATH") != expected_path:
+        raise HarnessError(f"{label} command clean PATH differs from H1d")
+    home_value = environment.get("HOME")
+    if home_value is None:
+        raise HarnessError(f"{label} command clean environment omits HOME")
+    home = pathlib.Path(home_value)
+    if not home.is_absolute() or not home.is_dir():
+        raise HarnessError(f"{label} command HOME is not an existing absolute directory")
+    pythonpath_value = environment.get("PYTHONPATH")
+    if (
+        pythonpath_value is None
+        or os.pathsep in pythonpath_value
+        or pathlib.Path(pythonpath_value).resolve() != source_root.resolve()
+    ):
+        raise HarnessError(f"{label} command PYTHONPATH differs from the source root")
 
 
 def _require_option(tokens: Sequence[str], flag: str, expected: str) -> None:
@@ -2609,29 +2667,32 @@ def record_trace_status(
             raise HarnessError("ours trace command does not invoke nsys") from error
         if command_tokens[nsys_index : nsys_index + 2] != ["nsys", "profile"]:
             raise HarnessError("ours trace command does not invoke nsys profile")
-        if command_tokens[:1] != ["env"]:
-            raise HarnessError("ours trace command must use an explicit env prefix")
-        environment_tokens = command_tokens[1:nsys_index]
-        if any("=" not in token for token in environment_tokens):
-            raise HarnessError("ours trace command env prefix is malformed")
-        environment_names = [token.split("=", 1)[0] for token in environment_tokens]
-        expected_environment_names = set(TRACE_REQUIRED_ENV) | {
-            "VT_FP4_AUTOTUNE_CACHE_PATH",
-            "VT_FP4_FLASHINFER_CACHE_PATH",
-        }
+        environment = _parse_clean_environment_prefix(
+            command_tokens, nsys_index, label="ours trace"
+        )
+        expected_environment_names = (
+            set(TRACE_REQUIRED_ENV)
+            | set(TRACE_CLEAN_FIXED_ENV)
+            | {
+                "HOME",
+                "PATH",
+                "PYTHONPATH",
+                "VT_FP4_AUTOTUNE_CACHE_PATH",
+                "VT_FP4_FLASHINFER_CACHE_PATH",
+            }
+        )
         if gdn_ba_mode is not None:
             expected_environment_names.add("VT_GDN_MERGED_BA")
         if gdn_packed_mode is not None:
             expected_environment_names.add("VT_GDN_PACKED_DECODE")
-        if (
-            len(set(environment_names)) != len(environment_names)
-            or set(environment_names) != expected_environment_names
-        ):
+        if set(environment) != expected_environment_names:
             raise HarnessError("ours trace command env inventory differs from H1d")
-        environment: dict[str, str] = {}
-        for token in environment_tokens:
-            name, value = token.split("=", 1)
-            environment[name] = value
+        _validate_clean_host_environment(
+            environment,
+            source_root=trace_execution["source_root"],
+            expected_path=TRACE_SYSTEM_PATH,
+            label="ours trace",
+        )
         for name, expected in TRACE_REQUIRED_ENV.items():
             if environment.get(name) != expected:
                 raise HarnessError(f"ours trace environment {name} differs from H1d")
@@ -2880,16 +2941,31 @@ def record_trace_status(
         raise HarnessError("vLLM trace output-repeatability flag differs")
 
     vllm_tokens = shlex.split(vllm_command.read_text(encoding="utf-8"))
-    if len(vllm_tokens) < 4 or vllm_tokens[0] != "env":
-        raise HarnessError("vLLM trace command omits its explicit environment")
-    if vllm_tokens[1].split("=", 1)[0] != "PATH" or "=" not in vllm_tokens[1]:
-        raise HarnessError("vLLM trace command PATH prefix differs")
-    path_value = vllm_tokens[1].split("=", 1)[1]
-    if not path_value or pathlib.Path(path_value.split(os.pathsep)[0]).resolve() != (
-        trace_execution["oracle_python"].parent.resolve()
-    ):
-        raise HarnessError("vLLM trace command PATH does not select the oracle environment")
-    if pathlib.Path(vllm_tokens[2]).resolve() != trace_execution[
+    oracle_python_value = str(trace_execution["oracle_python"])
+    try:
+        oracle_python_index = vllm_tokens.index(oracle_python_value, 2)
+    except ValueError as error:
+        raise HarnessError("vLLM trace command omits the oracle Python") from error
+    vllm_environment = _parse_clean_environment_prefix(
+        vllm_tokens, oracle_python_index, label="vLLM trace"
+    )
+    expected_vllm_environment_names = set(TRACE_CLEAN_FIXED_ENV) | {
+        "HOME",
+        "PATH",
+        "PYTHONPATH",
+    }
+    if set(vllm_environment) != expected_vllm_environment_names:
+        raise HarnessError("vLLM trace command clean env inventory differs from H1d")
+    expected_vllm_path = (
+        f"{trace_execution['oracle_python'].parent}{os.pathsep}{TRACE_SYSTEM_PATH}"
+    )
+    _validate_clean_host_environment(
+        vllm_environment,
+        source_root=trace_execution["source_root"],
+        expected_path=expected_vllm_path,
+        label="vLLM trace",
+    )
+    if pathlib.Path(vllm_tokens[oracle_python_index]).resolve() != trace_execution[
         "oracle_python"
     ].resolve():
         raise HarnessError("vLLM trace command Python differs from the oracle manifest")
@@ -2899,11 +2975,16 @@ def record_trace_status(
         / "bench"
         / "profile_vllm_online_gate.py"
     )
-    if pathlib.Path(vllm_tokens[3]).resolve() != expected_profile_script.resolve():
+    if (
+        oracle_python_index + 1 >= len(vllm_tokens)
+        or pathlib.Path(vllm_tokens[oracle_python_index + 1]).resolve()
+        != expected_profile_script.resolve()
+    ):
         raise HarnessError("vLLM trace command script differs from the source manifest")
     expected_vllm_tokens = [
-        "env",
-        vllm_tokens[1],
+        "/usr/bin/env",
+        "-i",
+        *vllm_tokens[2:oracle_python_index],
         str(trace_execution["oracle_python"]),
         str(expected_profile_script),
         "--model",

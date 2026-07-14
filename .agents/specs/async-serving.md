@@ -7,67 +7,25 @@ split), `ENG-ASYNC-SCHED` (async/overlap scheduling), `ENG-PRIORITY-SCHED`
 `ROAD-V1-A` (see priority justification). Upstream pin:
 `/home/mudler/_git/vllm` @ `e24d1b24`.
 
-## Priority justification (why this outranks its old T1 slot)
+## Current checkpoint and priority
 
-1. **The order-0 gate is structurally blocked on this work.** The
-   `SERVE-GATE-ONLINE` campaign found our example server executes the engine
-   **synchronously per request** under a server-wide mutex
-   (`src/vllm/entrypoints/openai/api_server.cpp:18-27,86,130`) and the
-   "streaming" path collects every delta after generation completes, then
-   replays precomputed SSE chunks
-   (`include/vllm/entrypoints/openai/serving_completion.h:9-12`,
-   `src/vllm/entrypoints/openai/api_server.cpp:185-202`). `vllm bench serve`
-   measures TTFT at first-SSE-chunk arrival and ITL per subsequent chunk
-   (`vllm/benchmarks/lib/endpoint_request_func.py:96-98,231-242`; TPOT derived
-   as `(latency-ttft)/(output_len-1)`, `vllm/benchmarks/serve.py:608-611`), so
-   against our server TTFT ≈ full completion latency and ITL ≈ 0:
-   **TTFT/TPOT/ITL are structurally unmeasurable**, and the every-axis online
-   comparison (benchmark-protocol.md) cannot even run, let alone pass.
-   `SERVE-ASYNC-LLM` is therefore a blocking dependency of roadmap order 0
-   (`ROAD-V1-A`) — the edge is recorded in the roadmap portfolio rows in the
-   same change as this spike.
-2. **Unmet mirror obligation.** The B3 research finding (archived at
-   `completed/roadmap_v1_research_spikes_2026-07-10.md` row B3) established
-   that async/overlap scheduling is vLLM's **DEFAULT** at our pin: a `None`
-   `async_scheduling` resolves to **True** unless an incompatibility forces it
-   off (`vllm/config/vllm.py:990-1038`; config field
-   `vllm/config/scheduler.py:158-162`). Our engine is synchronous end to end,
-   so every A/B we run compares our sync loop against vLLM's overlapped
-   default — a mirror gap on the denominator itself.
+W1 `ENG-CORE-BUSY-LOOP`, W2 `SERVE-ASYNC-LLM`, and W4
+`ENG-PRIORITY-SCHED` are implemented and `GATING`; the engine matrix carries
+their exact code/test evidence. Fixed HTTP delivery capacity is retained and
+steady-state neutral. W3 `ENG-ASYNC-SCHED` is the only unimplemented leaf and
+remains `READY`, unowned, and uncredited.
 
-### 2026-07-11 execution update: live SSE works; HTTP capacity is now binding
-
-W1/W2/W4 subsequently landed and the exact pushed-`a531e05` online campaign
-proves live/native-count streaming at every standard point. It also turns D3
-from a hypothetical risk into a reproduced defect. On the 20-CPU DGX,
-cpp-httplib starts 19 workers and grows only when `idle_thread_count_ == 0` at
-the enqueue instant (`third_party/httplib/httplib.h:161-169,10359-10377`). A
-streaming socket owns that worker through collector waits and keepalive. At c32,
-repetitions 1 and 3 each left one accepted connection with 2,131 unread request
-bytes and zero response bytes for roughly 205–207 seconds while the other 31
-streams completed normally; the healthy repetition grew enough workers and
-reached 1087.15 tok/s. `CLAIM-SERVE-HTTP-POOL-1` therefore owns a bounded W2
-repair: deterministic worker capacity for the configured concurrent-stream
-floor, a persistent-client regression, disconnect/teardown checks, and exact
-c32/full-ladder evidence. This repair does not authorize W3 scheduler overlap.
-
-The host implementation is now present: `ApiServer` replaces the default pool
-with exactly `max_concurrent_streams + 4` fixed workers, production passes
-`max_num_seqs`, and `VLLM_CPP_HTTP_FIXED_POOL=0` preserves cpp-httplib's legacy
-dynamic pool for same-binary A/B only. The real-socket regression parks 32
-keep-alive connections and proves a bounded control request remains readable;
-it passes 100 consecutive Release executions plus ASan+UBSan and TSan.
-
-The exact GPU handoff is now classified. A same-binary c32 AB/BA/AB series
-measures **1097.031 fixed versus 1097.290 legacy tok/s = 0.999764×**, with
-0.541%/0.311% CV, 8/20 fixed axes, all 1,152 requests and six memory returns.
-Neither arm samples the rare historical stall, so this is steady-state-neutral
-evidence, not a measured tail-probability improvement. The fresh exact
-`4e1d8ca` fixed ladder nevertheless completes all three c32 legs without a
-queued/unread socket and raises the current c32 oracle ratio to 0.9910×. The
-bounded capacity claim is released and `SERVE-ASYNC-LLM` returns to `GATING`:
-broader every-axis parity remains open, but no additional HTTP tuning is
-inferred before the confirmed FP4 repair.
+W3 is both an unmet mirror obligation and a current speed hypothesis. vLLM
+resolves `async_scheduling=None` to **True** when compatible
+(`vllm/config/vllm.py:990-1038`), and the binding v0.25.0 server log confirms
+that resolution. The 27B gate has better local TTFT at c2 but local TPOT is
+**114.841 vs 108.274 ms** (**6.1% slower**). The post-W3-I scan finds no known
+GPU-only leaf with a comparable end-to-end budget, so the next decision is an
+exact vLLM async ON/OFF c2 timing + Torch-trace control on the binding corpus.
+The profiler can now force `default`/`on`/`off` and records the resolved mode;
+the GPU result is `PENDING`. A positive 4–6% credit promotes W3 for an explicit
+claim. A neutral control keeps W3 as later parity work and returns the speed
+track to low-batch kernel mapping.
 
 ## Scope
 
@@ -115,34 +73,24 @@ on unresolved tokens (`pending_structured_output_tokens`,
 `vllm/v1/core/sched/async_scheduler.py:31-33` → `vllm/v1/engine/core.py:559-570`).
 Porting W1+W3 structurally yields this; no separate grammar work item.
 
-**Runtime trace plan** (dispatch is dynamic): before gating W3, capture one
-steady-state nsys/torch-profile of `vllm serve` (async default ON) and one
-with `--no-async-scheduling` at c=16 on GB10, per parity-lever-protocol.md
-§Verify-the-whole-chain, to confirm the overlap pattern the port must
-reproduce (schedule N+1 host work concurrent with step N GPU tail) and to
-freeze the A/B denominators.
+**Runtime trace plan** (dispatch is dynamic): first run the selected c2
+binding-corpus timing series with vLLM async explicitly ON/OFF, then capture
+both arms with `tools/bench/profile_vllm_online_gate.py --async-scheduling
+on|off --num-prompts 6 --max-concurrency 2`. vLLM's Torch-profiler path is the
+accepted GB10 alternative where nsys breaks EngineCore startup. The trace must
+show whether schedule N+1/output copy overlaps step N's GPU tail and freeze the
+maximum W3 credit before implementation. If positive, repeat c4/c8 and retain
+the default-ON trace as the port target.
 
-## Our baseline (captured at spike acceptance)
+## Our baseline and current W3 delta
 
-This table freezes the gaps that justified the work breakdown. Current
-lifecycle truth lives in `engine-matrix.md`: W1, W2 and W4 are now implemented
-and `GATING`; W3 remains `READY`. In particular, the synchronous/fake-SSE
-statements below describe the archived pre-W2 diagnostic binary, not the new
-production server path or the current online campaign.
-
-| Area | Anchor | Honest state |
+| Area | Current local behavior | Missing mirror behavior |
 |---|---|---|
-| Engine API | `include/vllm/v1/engine/llm_engine.h:70-120`; `src/vllm/v1/engine/llm_engine.cpp:21,45,71,81` | Synchronous `LLMEngine` only: `add_request`/`step`/`generate` on the caller's thread; deferred list in header names EngineCoreClient/async explicitly (`llm_engine.h:45-52`) |
-| Engine core | `include/vllm/v1/engine/core.h:65-100`; `src/vllm/v1/engine/core.cpp:37` | `EngineCore::step()` mirrors `core.py:479-508` minus futures/batch queue; header records `step_with_batch_queue`, `async_scheduling`, queues as deferred (`core.h:38-45`) |
-| Threading | repo-wide grep | **No engine threading exists**: the only mutexes are the server request-serializer (`src/vllm/entrypoints/openai/api_server.cpp:26`) and lazy-init locks in `src/vllm/model_executor/models/qwen3_5.cpp:109-1084`; no `std::thread` in engine/serving code |
-| Server | `src/vllm/entrypoints/openai/api_server.cpp:18-27` (engine mutex), `:86,130` (per-request lock), `:185-206` (precomputed-chunk provider) | One request at a time; SSE is replayed after the fact (the fake-SSE finding); conformance test asserts frame shape only, not arrival timing (`tests/vllm/entrypoints/openai/test_conformance.cpp:502`) |
-| Serving handlers | `include/vllm/entrypoints/openai/serving_completion.h:9-12,40-46`; `include/vllm/entrypoints/openai/serving_chat.h:47`; `src/vllm/entrypoints/openai/serving_completion.cpp:19` | `create_completion` drives the engine to completion and returns `sse_chunks` as a vector; chunk **content/cadence already matches** upstream's generator — only the transport is synchronous |
-| Detokenize/stream content | `src/vllm/v1/engine/detokenizer.cpp:409`; `src/vllm/v1/engine/output_processor.cpp:68,101-114` | Incremental detokenization + DELTA/FINAL_ONLY + `stream_interval` hold-back already ported (`ENG-SCHED-KNOBS` row); what is missing is only the per-request queue (`RequestOutputCollector`) — listed as deferred in `include/vllm/v1/engine/output_processor.h:39` |
-| C ABI | `include/vllm.h:166-194` (`vllm_token_callback` + `vllm_complete_stream`); `src/capi/vllm_c.cpp:262-325` | Per-delta callback exists but the call is **blocking** and single-request; no submit/poll surface, `include/vllm.h:23` scopes streaming-callback as-is |
-| Scheduler seam | `include/vllm/v1/core/sched/scheduler.h:83` (non-virtual class), `:201-205` (`update_after_schedule` private) | No subclass seam for `AsyncScheduler`'s two overrides; needs protected-virtual hooks (W3) |
-| Request queue | `include/vllm/v1/core/sched/request_queue.h:26-27,41-44,99-100` | FCFS complete; `create_request_queue(kPriority)` deliberately throws — priority is a marked T1 hole (W4) |
-| Runner | `src/vllm/v1/worker/gpu/runner.cpp:645-730`; `include/vllm/v1/worker/gpu/runner.h:141-144` | `execute_model`/`sample_tokens` split already mirrored (MRV2); sampled ids D2H synchronously + host write-back into `token_ids_cpu` each step (`runner.cpp:706-730`); no GPU-resident `last_sampled_tokens`, no copy stream/event |
-| Bench harness | `examples/bench/bench_core.h:96,468`; `examples/server/main.cpp:60,121` | Offline throughput modes exist; the online serve A/B harness lives with `CLAIM-SERVE-GATE-1` (DGX evidence root `~/work/vllm.cpp-online-gate`) and consumes this work |
+| Engine core | `EngineCore::step()` synchronously schedules, executes, samples, then updates (`src/vllm/v1/engine/core.cpp:37-85`); `EngineCoreProc` constructs one concurrent batch and rejects depth >1 (`src/vllm/v1/engine/core_proc.cpp:18-35`) | `step_with_batch_queue` depth 2, schedule N+1 before consuming N |
+| Scheduler | Output placeholders are fixed at zero (`src/vllm/v1/core/sched/scheduler.cpp:143-145,587-600`) | `AsyncScheduler` placeholder/stale-frame/cache accounting |
+| Sampled token | Greedy allocates a transient device buffer, copies into pageable `std::vector`, synchronizes the main queue, then CPU-writes the next token (`src/vllm/v1/sample/sampler.cpp:30-53,90-99`; `src/vllm/v1/worker/gpu/runner.cpp:688-723`) | Persistent GPU `last_sampled_tokens`, on-device combine/post-update, and pinned nonblocking output copy |
+| Runtime seam | `vt::Backend` exposes queue creation/copy/synchronize but no public event or pinned-host allocation API (`include/vt/backend.h:15-34`) | Add backend-neutral event/wait and pinned-output ownership, with synchronous CPU degeneration; current graph-stream code proves streams only, not events |
+| Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; unit contract is green | Uncontended c2 ON/OFF timing and Torch traces remain `PENDING` |
 
 ## Port map
 
@@ -171,7 +119,7 @@ Leaf W3 — `ENG-ASYNC-SCHED` (overlap scheduling, mirror default ON):
 |---|---|---|
 | `vllm/v1/core/sched/async_scheduler.py:12-75` | new `src/vllm/v1/core/sched/async_scheduler.cpp` + header; make `Scheduler::update_after_schedule` and the per-request output update protected-virtual in `include/vllm/v1/core/sched/scheduler.h:201-205` (extract `_update_request_with_output` analog from `update_from_output`) | Placeholder counting (`num_output_placeholders` on `vllm/v1/request.py:141` → our `include/vllm/v1/request.h`), `async_tokens_to_discard` stale-frame drop, cache-blocks-minus-placeholders |
 | `vllm/v1/engine/core.py:519-611` (`step_with_batch_queue`) | extend `src/vllm/v1/engine/core.cpp` (`EngineCore::step_with_batch_queue`, depth = `max_concurrent_batches` = 2) | Grammar deferral branch (`core.py:559-570`) ported as-is; futures become a small result-slot struct (no `concurrent.futures`) |
-| `vllm/v1/worker/gpu/async_utils.py:12-70`; `vllm/v1/outputs.py:298-307` | new `AsyncOutput` in `src/vllm/v1/worker/gpu/runner.cpp`: sampled-ids D2H enqueued on a second `vt::` stream + CUDA event; `get_output()` waits the event | Uses existing vt:: stream/event primitives (`src/vt/cuda/cuda_backend.cu:76-105` graph/stream machinery proves the seam); CPU backend degenerates to sync copy |
+| `vllm/v1/worker/gpu/async_utils.py:12-70`; `vllm/v1/outputs.py:298-307` | extend `vt::Backend` with event record/wait/synchronize plus pinned-host allocation; add `AsyncOutput` in `src/vllm/v1/worker/gpu/runner.cpp` with sampled-id D2H on a second queue and `get_output()` waiting only its event | Queue creation already exists, but no public event or pinned-host primitive exists today. CUDA implements them; CPU degenerates to synchronous copy. The copy queue waits the main queue/event and stays outside graph capture |
 | `vllm/v1/worker/gpu/input_batch.py:304-406,457-543`; `model_runner.py:613,954,1423-1445` | extend `src/vllm/v1/worker/gpu/input_batch.cpp` + `runner.cpp`: GPU-resident `last_sampled_tokens`, `combine_sampled_and_draft_tokens`-style gather of next-step decode input ids on device, `post_update` writes on device; delete the host write-back at `runner.cpp:719-730` for the async path | The only device-code delta of this spike: one small combine/post-update kernel pair ported 1:1 from the cited Triton kernels (goldens per test-porting); draft-token lane degenerates to width 1 until `SPEC-MTP` |
 | `vllm/config/vllm.py:952,959-1038`; `vllm/config/scheduler.py:158-162,180-189` | extend `include/vllm/config/scheduler.h` / `src/vllm/config/scheduler.cpp` (+ engine wiring): `async_scheduling` tri-state with default-ON resolution and the compat fallbacks relevant to us (pooling n/a, spec-decode method gate recorded for `SPEC-MTP`) | Mirror the log line "Asynchronous scheduling is enabled/disabled" for A/B auditability |
 

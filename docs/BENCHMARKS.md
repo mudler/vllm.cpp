@@ -8,13 +8,13 @@ failure forensics live in the [append-only parity ledger](../.agents/parity-ledg
 
 Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
-W3-H's accepted trace selects fused SiLU→FP4 as the largest positive mapped
-residual. W3-I1 is **structurally accepted but performance-failed** at clean
-`15c6b89`: its packed graph slice is **36.68% shorter**, yet the complete
-same-binary component passes only **27/40 timing + 3/8 memory axes**. Mean total
-throughput ratios are **1.002457× at c2** and **0.999771× at c16**. The
-candidate remains default-off, earns no speed credit, and does not authorize
-the exact vLLM grid. The next checkpoint is a cross-stack residual re-ranking.
+The post-W3-I scan is complete: the largest binding low-concurrency symptom is
+c2 decode TPOT (**114.841 vs 108.274 ms**, ours **6.1% slower**) while ours has
+better TTFT. The next checkpoint is an exact vLLM async-scheduler ON/OFF c2
+control on the same corpus; its timing and paired trace are **PENDING**, so W3
+has no speed credit yet. Host PSS/RSS is independently traced to a persistent
+**22.920 GiB** CPU weight mirror plus source-page residency during load. W3-I
+remains default-off after its **30/48** component failure.
 
 ## Binding 27B online gate
 
@@ -60,133 +60,65 @@ authorized until all 124 27B axes pass.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Re-rank engine, memory, and executed-kernel residuals; gate the highest-value isolated lever before rerunning the exact 27B grid |
-| W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
-| W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
-| W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; exact-fixture component completes 12/12 legs and 612/612 requests with zero failures, identical 64/64 plans, **27/40 timing + 3/8 memory**. c2/c16 total ratios: **1.002457× / 0.999771×** | Keep default-off; no exact grid. Use the result in the next residual re-ranking |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Run the exact c2 async ON/OFF oracle control, then gate the selected lever before rerunning the grid |
+| vLLM async-scheduler credit | **PENDING / DIAGNOSTIC PREPARED** | Binding logs confirm v0.25.0 resolved async ON. The profiler supports explicit `default`/`on`/`off` modes and records the resolved mode; local contract tests pass | Paired c2 timing plus Torch traces under one uncontended GPU lock; promote W3 only if the credit explains the decode gap |
+| Host-weight ownership | **FAILED / ROOT CAUSE DIAGNOSED** | Exact selected-tensor accounting finds **24,610,136,064 B / 22.920 GiB** retained in host `OwnedTensor` storage; mmap pages overlap that copy during load | Direct-to-final-device streaming design and all-axis memory A/B after the speed lever is selected |
+| W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413`, 12/12 lossless local reports and paired vLLM trace; status SHA `84d15970…6e66` | Retain as the c16 executed-path baseline; low-batch traces supersede it only under the same fail-closed contract |
+| W3-I fused SiLU→FP4 producer | **STRUCTURE PASS / COMPONENT FAILED** | Clean `15c6b89`; 612/612 requests, **27/40 timing + 3/8 memory**, c2/c16 totals **1.002457× / 0.999771×** | Keep default-off; no speed credit or exact grid |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
 | Stream-usage serialization | **PENDING / GATING** | CPU and sanitizer contracts pass; native 128-token counts are present in all binding requests | Run its serialization A/B after the model hot path closes |
 | Async HTTP capacity | **IMPLEMENTED / STEADY-STATE NEUTRAL** | Fixed/legacy c32 mean ratio **0.999764×**, 8/20 axes; 1,152/1,152 requests and all lifecycles pass | Keep the safe fixed worker floor; do not treat it as a speed lever |
 
-The accepted trace root is
-`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`.
-It contains three distinct Nsight sessions and 12/12 lossless single-replay
-reports, each with the exact 1,107-node graph and zero eager work, plus the
-paired vLLM trace. The three local semantic output-array digests differ; the
-model gate still passes and the gate spec explicitly keeps batch-invariance
-digests diagnostic. Passing status SHA is `84d15970…6e66`; canonical node
-multiset SHA is `c357867c…68b`. Superseded attempts and detailed hashes remain only in the
-[parity ledger](../.agents/parity-ledger.md) and [state log](../.agents/state.md).
+## Current diagnostic context
 
-### W3-I1 immutable result
+The accepted c16 execution baseline remains
+`~/work/vllm.cpp-executed-path-refresh-h1d/c498a4131af7e6cf0ac678841212af80f4f12d53`
+(status `84d15970…6e66`). It shows ours already faster in aggregate GPU-kernel
+time at c16, so it cannot explain the c2 decode gap. The completed residual
+scan ranks the live evidence as follows:
 
-The current root is
-`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2`.
-The fallback/candidate Nsight report SHA-256 values are `488770b1…5b6b` /
-`a1621e3c…47e3`; their SQLite SHA-256 values are `fa812990…454e` /
-`1310981c…f9c6`. The commit-bound object/SASS SHA-256 values are
-`d6ca771b…65bb` / `662f2c54…4102`.
+| Finding | Binding interpretation |
+|---|---|
+| vLLM depth-2 async scheduling + GPU-resident sampled-token path | Only unmeasured structural difference large enough to explain 4–6%; exact ON/OFF control is next |
+| RMSNorm/generated partitions | Largest unmapped GPU candidate; ours spends **2.094864 ms/window** across 129 RMSNorm nodes, but oracle partitions need exact node/adjacency mapping before a speed claim |
+| Normal BF16→FP4 | Grounded **+0.313930 ms/window** residual; estimated end-to-end ceiling is only about **0.25%** |
+| Host weight ownership | **22.920 GiB** persistent host mirror plus load-time mmap residency; independent memory repair, not a decode-speed hypothesis |
 
-| Graph slice across 14 forwards | Fallback | Packed candidate |
-|---|---:|---:|
-| Logical fused-producer calls | 896 | 896 |
-| Fused body | 6.064064 ms | 2.747840 ms |
-| Required explicit scale zeroing | integrated in scalar body | 1.091968 ms / 896 nodes |
-| Comparable fused slice | **6.064064 ms** | **3.839808 ms** |
-
-The comparable slice falls by **2.224256 ms / 36.68%**, or about
-**0.158875 ms per forward**. Both traces record 14 graph launches, identical
-allocation/free/synchronization counts, and only the same seven expected
-`cudaMemcpyAsync` calls during capture; graph copies are identical and contain
-no D2H. The 35B candidate trace (report/SQLite SHA `dd92270b…9ca7` /
-`7a4abf1c…f8fa`) passes correctness and contains zero W3-I kernel calls.
-Whole-process profiler duration is intentionally not treated as a rate.
-
-The complete component root is
+W3-I's immutable component remains under
 `~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2`.
-It uses the exact v0.25 FlashInfer 64-plan fixture, one `/tmp/gpu` lock, fresh
-servers, cold page residency, and the prescribed candidate/fallback
-`AB/BA/AB` order.
+It completed 12/12 legs and 612/612 requests but failed **30/48** axes; summary
+SHA is `b7cfa029…7c17`. Full per-attempt forensics and prior component results
+remain in the [parity ledger](../.agents/parity-ledger.md),
+[state log](../.agents/state.md), and linked feature specs rather than this
+scoreboard.
 
-| Component point | Timing axes | Memory axes | Candidate / fallback total tok/s | Ratio | Result |
-|---:|---:|---:|---:|---:|---|
-| c2 | 18/20 | 3/4 | 154.499922 / 154.121285 | **1.002457×** | FAIL |
-| c16 | 9/20 | 0/4 | 819.912423 / 820.100597 | **0.999771×** | FAIL |
-| **Total** | **27/40** | **3/8** | — | — | **FAILED: 30/48** |
+## Run the pending async-credit traces
 
-All 12 timed legs, 612 requests, and 12 memory returns complete; request
-failures are zero. Both arms pass **235/235 assertions + 16/16 token-exact**,
-all process metadata and plan maps match, every process loads 64 FlashInfer /
-zero native plans, and tuning/rejection/save counts are zero. Candidate and
-fallback total-throughput CVs are at most **0.1223%**. At c16 the candidate
-also increases mean peak GPU memory by **247 MiB**, PSS/RSS by about **32 MiB**,
-and `MemAvailable` drop by about **181 MiB**. These are binding component
-failures under the all-axis rule.
-
-Read-only result verification:
+Run both oracle modes under one uncontended lock; the online AB/BA/AB timing
+series uses the same c2 corpus and server flags before either trace is
+interpreted. These commands create diagnostic traces, not binding speed credit:
 
 ```sh
-ssh dgx.casa '
-  root=$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec-flashinfer-r2
-  sha256sum "$root/summary.json" "$root/selection-summary.json" "$root/driver.sh"
-  jq . "$root/summary.json"
+MODEL="$HOME/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/890bdef7a42feba6d83b6e17a03315c694112f2a"
+CORPUS="$HOME/work/vllm.cpp-online-gate/evidence/3f256abdbb558e162bf8a2196284deb119648560/corpus/27/vllm/c2-r1.jsonl"
+OUT="$HOME/work/vllm-async-credit/702f4814fe54/c2"
+
+flock /tmp/gpu bash -c '
+  set -e
+  for mode in on off; do
+    "$HOME/venvs/vllm-oracle/bin/python" \
+      tools/bench/profile_vllm_online_gate.py \
+      --model "'$MODEL'" --corpus "'$CORPUS'" \
+      --profile-dir "'$OUT'/trace-$mode" \
+      --metadata "'$OUT'/trace-$mode.json" \
+      --num-prompts 6 --max-concurrency 2 \
+      --max-num-seqs 32 --max-num-batched-tokens 2048 \
+      --repetitions 3 --async-scheduling "$mode"
+  done
 '
 ```
-
-Summary / plan-selection / driver SHA-256 values are `b7cfa029…7c17` /
-`f196274b…6753` / `06a5f72e…488d`; exact fixture SHA is `e81e9181…7edd`.
-The completed driver's exit 1 is the expected strict-gate result, not a
-harness failure. Detailed attempt chronology remains in the append-only
-record rather than this scoreboard.
-
-### Executed-path diagnostic ranking
-
-These are cross-profiler attribution values, not a benchmark ratio or speed
-credit. Ours is the median of 12 exact one-replay reports; vLLM is the clean
-1,476-window mean from the paired Torch trace. The canonical derived ranking
-is `~/work/vllm.cpp-trace-validator/71128642ce04c191f559ea4ccabe4b7e33a66b0f/c498a413-residual-ranking.json`,
-SHA-256 `7c323248…2456`.
-
-| Mapped family | Ours ms/window | vLLM ms/window | Ours − vLLM |
-|---|---:|---:|---:|
-| Fused SiLU→FP4 producer | 0.595536 | 0.238182 | **+0.357354** |
-| Normal BF16→FP4 producer | 0.655728 | 0.341798 | **+0.313930** |
-| FA2 main | 4.816544 | 4.685569 | **+0.130975** |
-| FA2 combine | 0.082480 | 0.082735 | −0.000255 |
-| FP4 GEMMs | 54.120144 | 54.430211 | −0.310067 |
-| GDN recurrence | 12.969872 | 19.266843 | −6.296971 |
-| All GPU kernels | 124.574592 | 128.153486 | −3.578894 |
-
-The fused-producer delta exceeds the normal-producer delta in every one of the
-12 reports, so the W3-H contract displaced normal W3-H2. W3-I0 completed the
-required source/generated-code/SASS/test inventory and W3-I1 now passes its
-immutable structural gate; it still contributes no benchmark ratio. The
-negative whole-window delta is consistent with c16 total throughput already
-passing; it does not
-explain or close the binding low-concurrency and host-memory failures.
-
-## Current component dispositions
-
-These same-binary components explain which implementations are retained, but
-none substitutes for the end-to-end 124-axis gate.
-
-| Component | Current result | Disposition |
-|---|---|---|
-| Frozen NVFP4 plan cache | Exact vLLM v0.25.0 fixture loads 64/64 plans with zero tuning/misses in read-only benchmark mode | **PASS as benchmark control**, not a speed claim |
-| Packed full-attention QKV | Closes the trace topology at **208.192 vs 208 FP4 GEMMs/forward**; isolated c16 mean total throughput +0.5049%, 14/20 timing + 2/4 memory | Retained for structural parity; strict component **FAILED** |
-| Direct swizzled activation scales | c2/c16 mean ratios **1.004483× / 1.005044×**; 39/40 timing + 1/8 memory | Correctness/trace pass; strict component **FAILED**, no speed credit |
-| Model-owned device alpha | c2/c16 mean ratios **1.001967× / 1.000144×**; 27/40 timing + 3/8 memory | Correctness/trace pass; strict component **FAILED**, no speed credit |
-| FA2 ratio-6 split-KV decode | c2/c16 mean ratios **1.017668× / 1.006548×**; 35/40 timing + 5/8 memory | Correctness/dispatch pass; strict component **FAILED**, no speed credit |
-| Packed fused SiLU→FP4 producer | c2/c16 mean ratios **1.002457× / 0.999771×**; 27/40 timing + 3/8 memory | Correctness/structure pass; strict component **FAILED**, default remains off and no speed credit exists |
-| 27B BF16 GDN output | Mean ratio **1.007989×**; 16/20 timing + 2/4 memory | Retained for vLLM/token correctness; strict gate open |
-| Fixed HTTP worker floor | Fixed/legacy ratio **0.999764×**; 8/20 axes | Safety/capacity fix retained; performance neutral |
-| Device-resident indexed GDN state | Indexed/fallback mean +0.6246%, 20/20 timing axes, large copy reduction | Correctness/A-B/trace pass; strict zero-leak lifecycle still open |
-
-Historical vLLM 0.24.0 grids and workload-mismatched direct-library numbers
-are omitted from this snapshot. They remain reproducible history, but cannot
-establish current production-vLLM parity. See the ledger for those values.
 
 ## Reproduce the binding result
 

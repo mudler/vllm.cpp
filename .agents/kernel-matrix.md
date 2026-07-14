@@ -13,12 +13,13 @@ remain unverified until an nsys trace on the declared workload identifies the
 actual family.
 
 Current `KERNEL-GEMM-NVFP4-W4A4` substage: default-off W3-I1 at clean
-`15c6b89` passes exact CUDA/operator/memcheck/model/SASS and paired structural
-traces, but its complete exact-fixture component fails **27/40 timing + 3/8
-memory**. c2/c16 total-throughput ratios are **1.002457× / 0.999771×**;
-all 612 requests and 64/64 plan controls pass. The candidate earns no speed
-credit, stays off, and does not authorize the exact grid. Binding `3f256ab`
-remains **55/124** while the cross-stack residual is re-ranked.
+`15c6b89` remains structure-green but component-failed/default-off. The
+cross-stack scan is complete: the next speed diagnostic is the exact c2 vLLM
+async ON/OFF control, not another FP4 leaf. If async is neutral, the leading
+unmapped GPU candidate is the 129-node RMSNorm/generated-partition family;
+W3-H2's grounded **+0.313930 ms/window** residual has only about a 0.25%
+end-to-end ceiling. Binding `3f256ab` remains **55/124** and no kernel speed
+credit or exact-grid authorization follows from the scan.
 
 The C1 implementation spike is accepted at
 [dropin-kernel-abi.md](specs/dropin-kernel-abi.md). Its additive
@@ -41,7 +42,7 @@ performance, and memory checkpoint before the next migration stacks.
 | `KERNEL-GEMM-W4A8` | CUTLASS W4A8 dense/MoE | `CMakeLists.txt:1004-1035`; upstream test `tests/kernels/quantization/test_cutlass_w4a8_moe.py` | - | - | [inventory](specs/kernel-family-inventory.md) | `INVENTORIED` | - |
 | `KERNEL-GEMM-QUTLASS-MX` | QuTLASS NVFP4/MXFP4 block-scaled GEMM | `cmake/external_projects/qutlass.cmake:56-147`; upstream tests `test_mxfp4_qutlass.py`, `test_nvfp4_qutlass.py` | - | - | [inventory](specs/kernel-family-inventory.md) | `INVENTORIED` | - |
 | `KERNEL-GEMM-DEEPGEMM` | DeepGEMM dense, batched, and MoE JIT paths | `cmake/external_projects/deepgemm.cmake:61-105`; upstream `tests/kernels/moe/test_deepgemm.py` | - | - | [inventory](specs/kernel-family-inventory.md) | `INVENTORIED` | - |
-| `KERNEL-EW-NORM-ACT` | Activations, RMS/layer norm, embedding, casts, and glue | stable sources `CMakeLists.txt:383-397` | [cuda_ops.cu:889](../src/vt/cuda/cuda_ops.cu#L889), [cuda_glue.cu:262](../src/vt/cuda/cuda_glue.cu#L262) | [RMSNorm](../tests/vt/test_ops_rmsnorm.cpp#L23), [glue](../tests/vt/test_ops_glue.cpp#L39), [CUDA ops](../tests/vt/test_cuda_ops.cpp#L206) | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
+| `KERNEL-EW-NORM-ACT` | Activations, RMS/layer norm, embedding, casts, and glue | stable sources `CMakeLists.txt:383-397`; vLLM vectorized/CUB reference `csrc/libtorch_stable/layernorm_kernels.cu:54-173,251-360`; actual oracle uses generated Triton partitions | [cuda_ops.cu:889](../src/vt/cuda/cuda_ops.cu#L889), [cuda_glue.cu:262](../src/vt/cuda/cuda_glue.cu#L262) | [RMSNorm correctness contracts](../tests/vt/test_ops_rmsnorm.cpp#L23) remain green. Residual scan finds 129 local RMSNorm calls / **2.094864 ms per c16 window**; oracle generated partitions are not yet adjacency-mapped, so this is a spike candidate, not a benchmark ratio or speed credit | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |
 | `KERNEL-EW-NORM-QUANT` | Fused norm/add/activation plus FP8/FP4 quant | vLLM sources `CMakeLists.txt:394-397`; generated v0.25 trace families `triton_red_fused_*fused_add_rms_norm_scaled_fp4_quant*`; installed fusion pass `compilation/passes/fusion/rms_quant_fusion.py:97-98,634-674`; pass guard `compilation/pass_manager.py:162-167`; FlashInfer Add+RMSNorm+FP4 `flashinfer-ref/cute_dsl/add_rmsnorm_fp4quant.py:16-30,91-182` and RMSNorm+FP4 `rmsnorm_fp4quant.py:16-24,78-87` | FP8 fusion [cuda_ops.cu:891](../src/vt/cuda/cuda_ops.cu#L891); current FP4 model path remains separate norm and quant launches; historical `76e9047` shared-staging experiment is not present | [FP8 fusion test](../tests/vt/test_ops_fp8_cutlass.cpp#L268); exact `3f256ab` trace records 127,040 long-named kernels, but the dumped body stores BF16 after add+RMSNorm and the wrapper separately invokes `scaled_fp4_quant.out`/`cvt_fp16_to_fp4`, matching ours. Oracle `fuse_norm_quant` is false. Generated graph/subgraph SHA `d58f81b8…9401` / `466e359a…9dd8`; status/vLLM-kernel SHA `9762c1e6…1d0c6` / `e4e916d1…565` | [inventory](specs/kernel-family-inventory.md); no FP4 spike is promoted from a misleading trace name | `PARTIAL` | - |
 | `KERNEL-ROPE-QKNORM` | RoPE/MRoPE and fused QK-norm/RoPE/KV insertion | `CMakeLists.txt:391-406`; upstream core tests `test_fused_qk_norm_rope.py`, `test_mrope.py` | [cuda_ops.cu:900](../src/vt/cuda/cuda_ops.cu#L900) | [RoPE tests](../tests/vt/test_ops_rope.cpp#L22), [CUDA RoPE](../tests/vt/test_cuda_ops.cpp#L506) | [inventory](specs/kernel-family-inventory.md) | `PARTIAL` | - |
 | `KERNEL-KV-CACHE` | KV reshape, insert, copy, and cache maintenance | `CMakeLists.txt:402-404`; upstream `tests/kernels/test_cache_kernels.py` | [cuda_cache.cu:97](../src/vt/cuda/cuda_cache.cu#L97) | [cache tests](../tests/vt/test_ops_reshape_cache.cpp#L76) | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |

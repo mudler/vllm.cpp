@@ -14,28 +14,18 @@ PSS/RSS remain red. W3-E/W3-F/W3-G strict-failed their same-binary components
 and earn no speed credit. This result remains the only binding performance
 number, and no 35B performance command is authorized.
 
-The W3-H trace-first refresh is diagnostic only. Clean schema-v5
-`c498a4131af7e6cf0ac678841212af80f4f12d53` passes exact **154/154** build,
-27B **1/1** correctness, frozen plans, three independent ordinary **48/48** +
-probe **16/16** sessions, all **12/12** lossless single-replay report exports,
-validations and summaries, and the paired vLLM trace. Validator `7112864`
-records local repeatability diagnostically while retaining
-strict pinned-Nsight, runtime, synchronization, completion, event-counter,
-graph-family/topology, zero-eager, cross-report, plan, profile, identity, and
-lifecycle validation. Passing status SHA is `84d15970…6e66`. Cross-profiler
-attribution ranks fused SiLU→FP4 at +0.357354 ms/window, normal BF16→FP4 at
-+0.313930, and FA2 main at +0.130975; fused exceeds normal in all 12 reports.
-Normal W3-H2 is displaced. The dedicated
-[W3-I spike](nvfp4-fused-silu-producer.md) is now accepted: generated compiler
-zeroing, executed launch geometry and local/vLLM 1,480/384-instruction SASS
-bodies are grounded. Default-off I1 is structurally accepted at clean
-`15c6b89`: exact CUDA/operator/memcheck/model/SASS and paired 27B/35B traces
-pass. Its packed graph body plus required zeroing takes **3.839808 ms** versus
-fallback **6.064064 ms**, down **36.68%**. The complete c2/c16 component remains
-mandatory. Its first start is `VOID` before timing because an older native plan
-document failed exact build-ID validation; the repaired driver binds the exact
-accepted v0.25 FlashInfer fixture. No ratio, speed credit, exact grid, or 35B
-performance is authorized meanwhile.
+The accepted c16 schema-v5 trace remains `c498a413` (status
+`84d15970…6e66`). W3-I subsequently passed its structural gates but failed the
+complete component at **27/40 timing + 3/8 memory**; it remains default-off and
+earns no speed credit. The mandated post-I1 scan is now complete. At c2 ours
+has better TTFT but TPOT is **114.841 vs 108.274 ms** (**6.1% slower**).
+vLLM's default-ON depth-2 scheduler/GPU-resident sampled-token path is the only
+unmeasured structural difference with a 4–6% budget. The next gate is therefore
+an exact vLLM async ON/OFF c2 timing + Torch-trace control; profiler mode
+selection is CPU-tested and the GPU result is `PENDING`. If neutral, the speed
+track moves to low-batch kernel traces and exact RMSNorm/generated-partition
+mapping. Host PSS/RSS is independently grounded in a persistent **22.920 GiB**
+CPU weight mirror plus load-time source-page residency.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and
@@ -232,20 +222,14 @@ reported as a clean dependency check.
    explicit cache-off, identical sampling, scheduler settings, and model length.
    Immutable `3f256ab` supersedes `9cc7191`: the 27B model gate, 36 timed groups
    and six returns are complete; 55/124 axes pass. Hold 35B.
-5. Capture one representative paired execution trace per model (`nsys` ours,
-   torch-profiler vLLM on the identical 48-prompt/c16 token shape). The prior
-   old-oracle W3-B trace is lifecycle-clean and diagnostic. Node-level paired
-   attribution is complete. W3-H schema-v5 `c498a413` passes final status
-   `84d15970…6e66`; retain it as the diagnostic baseline and never append to
-   its immutable root. 35B remains gated.
-6. Diff the node-level ours/vLLM kernel lists, rank executed differences by
-   gain÷effort, and drive the top traced lever through its owning row. H1d
-   selects fused SiLU→FP4 ahead of normal production in 12/12 reports. W3-I0
-   completes its whole-chain spike; default-off I1 passes immutable structural
-   gates and must now pass all 48 component axes.
-   W3-B already closes the original wide FP4 tactic-family mismatch; do not
-   infer speed credit from cross-profiler attribution while exact TPOT/ITL and
-   host-memory axes remain red.
+5. Retain c16 schema-v5 `c498a413` as the immutable executed-path baseline.
+   Run the selected c2 vLLM async ON/OFF timing + Torch-trace control before
+   claiming W3; if neutral, capture equivalent low-batch ours/vLLM traces.
+6. Drive only the lever selected by that control. A positive 4–6% async credit
+   activates `ENG-ASYNC-SCHED`; otherwise map the RMSNorm/generated partitions
+   and gate the smallest grounded kernel leaf. Host-weight ownership is a
+   separate all-axis repair. Cross-profiler attribution never earns speed
+   credit by itself.
 7. Append commands, raw artifact hashes, results, and ratios to the ledger.
 
 Claims may split diagnosis/client hardening from execution, but only one claim

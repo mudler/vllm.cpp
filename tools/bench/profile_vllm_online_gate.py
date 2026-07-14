@@ -65,6 +65,23 @@ def _output_digest(outputs) -> str:
     return digest.hexdigest()
 
 
+def async_scheduling_override(mode: str) -> dict[str, bool]:
+    """Translate the diagnostic CLI mode without changing the binding default.
+
+    Omitting ``async_scheduling`` is important for the accepted H1d recipe: it
+    exercises vLLM's own default resolution.  Explicit ``on``/``off`` modes are
+    reserved for paired denominator probes.
+    """
+
+    if mode == "default":
+        return {}
+    if mode == "on":
+        return {"async_scheduling": True}
+    if mode == "off":
+        return {"async_scheduling": False}
+    raise HarnessError(f"unknown async scheduling mode: {mode}")
+
+
 def run_closed_loop(
     llm,
     prompts,
@@ -127,6 +144,15 @@ def main() -> int:
     parser.add_argument("--max-num-seqs", type=int, required=True)
     parser.add_argument("--max-num-batched-tokens", type=int, required=True)
     parser.add_argument("--repetitions", type=int, default=TRACE_REPETITIONS)
+    parser.add_argument(
+        "--async-scheduling",
+        choices=("default", "on", "off"),
+        default="default",
+        help=(
+            "keep vLLM's default resolution or explicitly force the paired "
+            "async-scheduler diagnostic arm"
+        ),
+    )
     args = parser.parse_args()
     if not args.model.is_dir():
         raise HarnessError(f"model snapshot is absent: {args.model}")
@@ -171,6 +197,7 @@ def main() -> int:
             torch_profiler_dir=str(args.profile_dir.resolve()),
             torch_profiler_with_stack=False,
         ),
+        **async_scheduling_override(args.async_scheduling),
     )
 
     measured_digests = []
@@ -212,6 +239,10 @@ def main() -> int:
         time.sleep(1.0)
     result = {
         "admission_mode": "closed-loop",
+        "async_scheduling_requested": args.async_scheduling,
+        "async_scheduling_resolved": (
+            llm.llm_engine.vllm_config.scheduler_config.async_scheduling
+        ),
         "enable_prefix_caching": False,
         "max_concurrency": args.max_concurrency,
         "max_num_seqs": args.max_num_seqs,

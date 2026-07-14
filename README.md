@@ -9,24 +9,25 @@ OpenAI-compatible server.
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
 > gates on NVIDIA GB10. Production performance parity is still open: the
 > binding 27B comparison against vLLM v0.25.0 passes **55/124** required axes.
-> The current [W3-I](.agents/specs/nvfp4-fused-silu-producer.md) packed
-> SiLU→FP4 candidate passes correctness, safety, SASS, and structural trace
-> gates, but its complete same-binary component **fails at 30/48 axes**. Mean
-> total throughput is **1.002457× at c2** and **0.999771× at c16** versus
-> the scalar fallback; all 612 requests complete, but c16 timing and memory
-> regressions keep the candidate default-off and earn no speed credit. The
-> binding result therefore remains **55/124**, and no 35B performance result
-> is claimed. See [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
+> The post-W3-I residual scan is complete. At c2 our TTFT is already better,
+> but decode TPOT is **114.841 vs 108.274 ms** (**6.1% slower**). The next
+> binding diagnostic therefore measures vLLM v0.25.0 with its default async
+> scheduler explicitly on and off on the identical c2 corpus; no async speed
+> credit or implementation claim exists yet. Separately, the host-memory gap
+> is traced to a persistent **22.92 GiB CPU weight mirror** plus load-time
+> safetensors residency. The binding result remains **55/124**, W3-I stays
+> default-off, and no 35B performance result is claimed. See
+> [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
 
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Re-rank the cross-stack residual after W3-I1's failed component, then gate the next isolated lever before rerunning all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Measure the exact c2 async ON/OFF oracle control; promote W3 only if it explains the decode gap, otherwise trace low-batch kernels |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-I fused SiLU→FP4 producer | ❌ component FAILED / default off | Clean `15c6b89` passes structural gates; complete exact-fixture A/B passes **27/40 timing + 3/8 memory**. c2/c16 total ratios are **1.002457× / 0.999771×** | Retain as an opt-in structural port; do not run the exact vLLM grid from this candidate |
+| Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the speed lever is selected, stream weights into final device storage and re-run all memory axes |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -50,13 +51,11 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | Work item | Present disposition |
 |---|---|
-| Frozen 64-plan NVFP4 tactic map | Control gate passes; all component comparisons use the same vLLM v0.25.0 plan map |
-| Packed full-attention QKV | Structural target closed at **208.192 vs 208** FP4 GEMMs/forward; retained, but its isolated strict component did not pass every axis |
-| Direct swizzled activation scales | Correctness and trace pass; component **FAILED** at 39/40 timing + 1/8 memory axes, so no independent speed credit |
-| Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
-| FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
-| Vectorized normal BF16→FP4 I/O | Not implemented. Accepted H1d attribution ranks its diagnostic residual at **+0.313930 ms/window**, below the fused producer in 12/12 reports; W3-H2 is displaced |
-| Fused SiLU→FP4 producer | Default-off W3-I1 is structurally green at clean `15c6b89`, but the complete component **FAILED at 27/40 timing + 3/8 memory**. c2 improves 0.246%; c16 regresses 0.023%, so no speed credit or exact grid follows |
+| Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
+| Selected speed diagnostic | vLLM async ON/OFF at c2, paired on the binding corpus; the trace harness now records requested and resolved scheduler modes. Result **PENDING** |
+| GPU fallback if async is neutral | Map the 129 RMSNorm and 144 normal-FP4 nodes, then gate vectorized residual-add RMSNorm; W3-H2's measured ceiling is only about 0.25% end to end |
+| Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
+| Retained default-off experiment | W3-I is structurally green but component-failed at **30/48**; it earns no speed credit and remains off |
 
 ## What is implemented
 
@@ -176,8 +175,8 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: post-W3-I cross-stack residual scan →
-isolated gate for the highest-value lever → all-axis 27B parity → 35B
+The next execution order is fixed: exact vLLM async ON/OFF c2 control →
+selected isolated lever gate → all-axis 27B parity → 35B
 parity → the SGLang shared-prefix gate → the
 rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
 cache / LMCache support.

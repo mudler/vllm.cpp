@@ -14,12 +14,23 @@ import unittest
 from types import SimpleNamespace
 
 from tools.bench.online_gate import INPUT_LEN
-from tools.bench.profile_vllm_online_gate import load_prompts, run_closed_loop
+from tools.bench.profile_vllm_online_gate import (
+    async_scheduling_override,
+    load_prompts,
+    run_closed_loop,
+)
 from tools.bench.serve_low_common import HarnessError
 from tools.bench.summarize_torch_kernels import summarize
 
 
 class OnlineGateTraceTests(unittest.TestCase):
+    def test_async_scheduling_override_preserves_default_resolution(self) -> None:
+        self.assertEqual(async_scheduling_override("default"), {})
+        self.assertEqual(async_scheduling_override("on"), {"async_scheduling": True})
+        self.assertEqual(async_scheduling_override("off"), {"async_scheduling": False})
+        with self.assertRaisesRegex(HarnessError, "unknown async scheduling mode"):
+            async_scheduling_override("invalid")
+
     def test_closed_loop_never_preloads_beyond_concurrency(self) -> None:
         class FakeEngine:
             def __init__(self) -> None:

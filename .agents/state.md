@@ -7754,3 +7754,51 @@ This checkpoint also compacts all live status surfaces to the current result.
 The earlier stale-cache pre-measurement attempt remains discoverable only in
 this append-only log and the parity ledger, not in README, BENCHMARKS, roadmap,
 matrices, coordination handoff, or the live W3-I spec.
+
+## 2026-07-14 — residual scan selects the c2 async-credit control
+
+The mandatory post-W3-I cross-stack scan is complete. It changes no binding
+number: immutable `3f256ab` remains **55/124** against vLLM v0.25.0, W3-I
+remains default-off after its **30/48** component failure, and no exact-grid or
+35B performance run is authorized. The binding low-concurrency symptom is now
+localized: at c2 our TTFT already passes, while TPOT is **114.841 vs 108.274
+ms**, a **6.1% decode deficit**.
+
+The engine scan found one unmeasured structural difference large enough to
+explain that gap. vLLM v0.25.0 resolves async scheduling on by default, uses a
+depth-2 batch queue, scheduler placeholders, GPU-resident sampled-token state,
+and a copy-stream/event path. Our engine remains depth-1 and synchronous; its
+sampled IDs cross a transient device allocation and pageable-host D2H before
+main-stream synchronization. The binding trace contains 1,400 128-byte D2H
+calls and 4,627 stream synchronizations. Their GPU copy time is only **4.026
+ms**, so copy removal alone is not credited; an exact vLLM async ON/OFF control
+must measure the whole overlap benefit.
+
+The executed-kernel scan supplies the fallback if that control is neutral.
+Across the accepted c16 window ours has 129 RMSNorm nodes totaling **2.094864
+ms**; the oracle's generated Triton partitions still need exact adjacency and
+semantic mapping before comparison. The already grounded normal BF16→FP4
+residual is only **+0.313930 ms/window**, about a **0.25%** end-to-end ceiling.
+Further W3-I zeroing or GDN/FP4 GEMM work is therefore not selected.
+
+The independent memory scan explains the binding host gap. The 27B loader
+retains 1,155 selected tensors totaling **24,610,136,064 bytes (22.920 GiB)**
+in CPU-owned vectors after uploading them, while all safetensors mappings stay
+live and resident through load. vLLM streams each yielded tensor into its final
+CUDA parameter. Direct-to-final-device streaming is the complete repair;
+source-page eviction alone fixes load peak only, and releasing host vectors
+after prepare fixes steady state only. This is recorded as a separate memory
+track, not a decode-speed hypothesis.
+
+The diagnostic profiler now accepts `--async-scheduling default|on|off`, omits
+the override for the accepted default recipe, and records both requested and
+resolved modes. Its CPU contract covers all modes and rejects unknown values.
+No engine behavior or default changes. The next checkpoint is one uncontended
+paired c2 vLLM ON/OFF timing series plus Torch traces on the binding corpus. A
+positive 4–6% result permits a separate claim of `ENG-ASYNC-SCHED`; a neutral
+result returns the speed track to low-batch kernel/RMSNorm mapping.
+
+README, BENCHMARKS, roadmap, matrices, coordination, environment, and the two
+live serving specs were compacted to this binding snapshot. Superseded W3-I and
+trace-attempt narratives remain only in this append-only log, the parity
+ledger, Git, and immutable evidence roots, per the periodic compaction rule.

@@ -172,7 +172,7 @@ All CUDA series below ran uncontended under GPU ownership.
 | 35B candidate-on correctness + inertness | **PASS — 2/2 + 315/315**; log SHA `fba79fbb…65f1`; paired trace contains **zero** W3-I calls |
 | Packed compiled body | object/SASS SHA `d6ca771b…65bb` / `662f2c54…4102`: **816 instructions, 36 registers, zero stack/local/shared, two 256-bit loads, one 64-bit output store, one scale-byte store, eight packed E2M1 conversions** |
 | Paired 27B graph trace | **PASS — 896/896** eligible graph calls use the packed body, with **896** explicit 139,264-byte zero nodes and no scalar call. Fallback fused slice is **6.064064 ms**; candidate body + zero is **3.839808 ms**, down **36.68%**. Allocation/free/sync/capture/copy counts are identical |
-| c2+c16 component | **PENDING — no rate or speed credit**; immutable driver SHA `0f08750f…ae1b` |
+| c2+c16 component | **PENDING — no rate or speed credit**. First start is **VOID before measurement** on stale native-cache build ID; repaired exact-fixture driver SHA `06a5f72e…488d` |
 
 Negative zero is part of the byte-exact semantic contract: packed hardware
 conversion is retained, then zero-magnitude nibbles have their sign bit cleared
@@ -237,13 +237,15 @@ A positive mean with any red axis is a failed component. A passing component
 authorizes the exact vLLM v0.25.0 27B 124-axis grid; it does not itself replace
 the binding result. Only **124/124** closes 27B and authorizes 35B performance.
 
-The preflighted driver is
-`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver.sh`,
-SHA-256 `0f08750f540c456d8e1487f63a9367fc2f66584194a89aafb41202efcab9ae1b`.
-It runs `VT_FP4_FUSED_VEC=1` versus `0` against frozen native-plan document
-SHA `2590fc94…199d`, under the same binary, corpus, port allocation, one GPU
-lock, and AB/BA/AB manifest. The result root is SHA-owned and immutable;
-partial or contended output is `VOID`.
+The repaired driver is
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver-r2.sh`,
+SHA-256 `06a5f72eaecc0d7d3300be75b6589c7bdcc4590203296926bd1dae0acc89488d`.
+It runs `VT_FP4_FUSED_VEC=1` versus `0` against the exact accepted v0.25
+FlashInfer fixture (SHA `e81e9181…7edd`) and a guaranteed-absent read-only
+native path, under the same binary, corpus, port allocation, one GPU lock, and
+AB/BA/AB manifest. The first driver/root remains `VOID`: its reused native
+document failed build-ID validation before timing. The repaired result root is
+SHA-owned and immutable; partial or contended output is `VOID`.
 
 ## Dependencies and risks
 

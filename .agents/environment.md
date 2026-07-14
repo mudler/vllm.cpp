@@ -87,8 +87,10 @@ inner 4096, state 128; context 262144.
   largest positive mapped residual in all 12 local reports, displacing normal
   W3-H2. W3-I1 is default-off and structurally accepted at clean `15c6b89`:
   CUDA/operator/memcheck/model/SASS and paired 27B/35B trace gates pass, with a
-  **36.68%** smaller comparable graph slice. Run its complete 48-axis component,
-  then close all 69 failed axes before 35B performance.
+  **36.68%** smaller comparable graph slice. Its first component start is
+  `VOID` before timing on stale native-cache metadata; run the repaired
+  exact-fixture 48-axis component, then close all 69 failed axes before 35B
+  performance.
 - Keep the existing SGLang v0.5.13 P1 evidence immutable. The distinct
   shared-prefix gate pins v0.5.15 `f63458b` and image digest `d0a667e`; its PX1
   deterministic 64k/256k harness/counter work is ready after the priority

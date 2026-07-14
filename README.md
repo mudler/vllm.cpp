@@ -15,8 +15,10 @@ OpenAI-compatible server.
 > In the 27B graph, the packed producer plus required scale zeroing takes
 > **3.839808 ms** versus **6.064064 ms** for the old fused slice (**36.68%**
 > less across 14 forwards). This is diagnostic—not benchmark credit. The
-> complete c2/c16 **48-axis** component is the next gate; the binding result
-> remains **55/124**, and no 35B performance result is claimed. See
+> first component launch stopped before measurement on a stale native-cache
+> build fingerprint; that attempt is `VOID`. The repaired c2/c16 **48-axis**
+> driver uses the exact accepted v0.25 fixture and is the next gate. The binding
+> result remains **55/124**, and no 35B performance result is claimed. See
 > [Benchmarks](docs/BENCHMARKS.md) for the exact checkpoint.
 
 ## Current status
@@ -24,10 +26,10 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Run W3-I1's complete 48-axis component; only a pass authorizes all 124 axes |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail** against vLLM v0.25.0 | Run W3-I1's repaired fixture-bound 48-axis component; only a pass authorizes all 124 axes |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| W3-I fused SiLU→FP4 producer | 🚧 `ACTIVE` / structure PASS | Clean `15c6b89` passes CUDA/model/sanitizer/SASS gates. Paired trace proves 896/896 packed graph calls, explicit zero nodes, unchanged capture lifecycle, and zero 35B dispatch; no accepted end-to-end ratio | Run the complete c2/c16 40-timing + 8-memory component |
+| W3-I fused SiLU→FP4 producer | 🚧 `ACTIVE` / structure PASS | Clean `15c6b89` passes structural gates. The first component start is `VOID` before measurement because an older native plan document failed build-ID validation; no rate exists | Run the repaired exact-fixture c2/c16 40-timing + 8-memory component |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -57,7 +59,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Model-owned device alpha | Correctness and trace pass; component **FAILED** at 27/40 timing + 3/8 memory axes, so no independent speed credit |
 | FA2 ratio-6 split-KV decode | Correctness and structural dispatch pass; component **FAILED** at 35/40 timing + 5/8 memory axes despite positive mean throughput |
 | Vectorized normal BF16→FP4 I/O | Not implemented. Accepted H1d attribution ranks its diagnostic residual at **+0.313930 ms/window**, below the fused producer in 12/12 reports; W3-H2 is displaced |
-| Fused SiLU→FP4 producer | Default-off W3-I1 is correctness-, safety-, SASS-, and trace-green at clean `15c6b89`. All 896 eligible graph calls use the packed body; packed body + zeroing reduces the traced slice by **36.68%**. The 48-axis component remains pending, so no speed credit exists |
+| Fused SiLU→FP4 producer | Default-off W3-I1 is structurally green at clean `15c6b89`; its traced slice falls **36.68%**. A stale native-cache fingerprint voided the first component start before measurement; the repaired exact-fixture 48-axis run is pending, so no speed credit exists |
 
 ## What is implemented
 

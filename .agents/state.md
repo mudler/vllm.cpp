@@ -7664,3 +7664,35 @@ all **40 timing + 8 memory** axes under one lock. Binding `3f256ab` remains
 **55/124**; no exact grid, W3-I2, or 35B performance is authorized. Live
 surfaces replace the preflight checkpoint with this current snapshot; detailed
 chronology remains only here and in the ledger.
+
+## 2026-07-14 — W3-I1 component start voided before measurement; fixture repair staged
+
+The first component driver started at `2026-07-14T00:14:31Z` under its whole-
+series `/tmp/gpu` lock, validated W3-C3R and exact source/binary provenance,
+then stopped at the first candidate model gate. The test loaded four initial
+assertions and threw `NVFP4 cache metadata mismatch for build_id`. Evidence root
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/evidence/component-ab-c2-c16-fused-vec`
+is **VOID / pre-measurement**: no server leg, request, timing, memory sample, or
+partial rate exists. Driver/driver-log/model-gate/provenance SHA-256 values are
+`0f08750f…ae1b` / `898ee3c7…5edb` / `dd747a44…90e7` / `208b8df3…5d8a`.
+Cleanup returned the GPU, lock and port idle/free.
+
+The cause is control-plane provenance, not inference correctness: that driver
+reused native plan document `2590fc94…199d` from older build `d211b8f`, while
+the runtime intentionally hashes its build/tactic ABI and rejects mismatched
+native documents. The exact `15c6b89` correctness and trace series instead
+loaded the repository's v0.25 FlashInfer fixture 64/64 and already passed.
+
+Repaired driver
+`~/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver-r2.sh`
+uses fixture SHA
+`e81e9181db20d0537a43a101fe4f93aa57df9e42900e8a21c91cafa61e107edd`,
+requires its read-only native target to be absent, and validates every process
+as loaded 64 `(flashinfer=64, native=0)`, tuned/rejected/saved zero with equal
+plan maps. It writes a new immutable `component-ab-c2-c16-fused-vec-flashinfer-r2`
+root. Driver SHA is
+`06a5f72eaecc0d7d3300be75b6589c7bdcc4590203296926bd1dae0acc89488d`;
+shell syntax, optional ShellCheck, exact clean source, fixture/native-path,
+GPU/lock and port preflights pass. W3-I1 remains `ACTIVE / structure PASS`, the
+complete **40 timing + 8 memory** component is pending, binding `3f256ab`
+remains **55/124**, and no exact grid, W3-I2 or 35B performance is authorized.

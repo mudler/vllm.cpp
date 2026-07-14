@@ -6,15 +6,17 @@ reproduction entry points. Detailed attempt history, artifact hashes, and
 failure forensics live in the [append-only parity ledger](../.agents/parity-ledger.md),
 [state log](../.agents/state.md), and linked feature specs.
 
-Last updated: **2026-07-13**. The binding 27B result remains immutable
+Last updated: **2026-07-14**. The binding 27B result remains immutable
 `3f256ab`; parity against vLLM v0.25.0 is **FAILED / open at 55/124 axes**.
 W3-H's accepted trace selects fused SiLU→FP4 as the largest positive mapped
 residual. W3-I1 is now **structurally accepted** at clean `15c6b89`: the exact
 CUDA build, operator/sanitizer/model gates, commit-bound SASS, and paired
 27B/35B traces pass. Its packed graph body plus required scale zeroing is
 **36.68% shorter** than the fallback fused slice. That is diagnostic evidence,
-not an end-to-end ratio; the complete c2/c16 component is still pending and no
-binding speed number changed.
+not an end-to-end ratio. The first component launch is **VOID before
+measurement**: an older native plan document failed exact build-ID validation
+at the candidate model gate. The repaired driver uses the commit's accepted
+v0.25 FlashInfer fixture; no binding speed number changed.
 
 ## Binding 27B online gate
 
@@ -63,7 +65,7 @@ authorized until all 124 27B axes pass.
 | `SERVE-GATE-ONLINE` | **FAILED / GATING** | `3f256ab` binds at **55/124**; no later result supersedes it | Repair the selected hot path and rerun the exact 27B grid |
 | W3-H1d complete trace | **PASS — DIAGNOSTIC TRACE ACCEPTED** | Clean `c498a413` passes exact 154/154 build, 27B 1/1 correctness, frozen plans, three 48/48 + 16/16 local sessions, 12/12 lossless reports, and the paired vLLM trace. Validator `7112864` writes passing status SHA `84d15970…6e66` | Retain as the executed-path attribution baseline; any later trace must meet the same fail-closed contract |
 | W3-H2 vectorized normal BF16→FP4 I/O | **DEFERRED / NOT IMPLEMENTED** | Diagnostic residual is **+0.313930 ms/window**, but the fused producer is larger in 12/12 reports | Do not implement W3-H2 first |
-| W3-I fused SiLU→FP4 producer | **ACTIVE / STRUCTURE PASS; PERFORMANCE PENDING** | Clean `15c6b89`: CUDA build **158/158 targets**; candidate OFF/ON operator **22/22 + 26,916/26,916** each; strict no-pool memcheck **0 errors / 0 leaks**; both 27B arms **235/235 + 16/16**; 35B **2/2 + 315/315**. SASS is **816 instructions / 36 registers / two 256-bit loads / one 64-bit output store**. Paired trace proves **896/896** eligible graph calls use the packed body, **896** matching zero nodes, unchanged capture/runtime lifecycle, and zero W3-I calls on 35B. No same-binary rate exists | Run all c2/c16 **40 timing + 8 memory** axes with the immutable driver below |
+| W3-I fused SiLU→FP4 producer | **ACTIVE / STRUCTURE PASS; PERFORMANCE PENDING** | Clean `15c6b89` passes all structural gates. First component start: **VOID before timing**, candidate model gate rejected stale native-cache `build_id`; GPU/lock/port returned clean and no raw rate exists. Repaired driver binds the exact accepted v0.25 FlashInfer fixture and a guaranteed-absent read-only native path | Run all c2/c16 **40 timing + 8 memory** axes with the repaired immutable driver below |
 | Qwen3.6-35B-A3B performance | **BLOCKED / NOT RUN** | Correctness passes, but no current v0.25.0 performance denominator exists | Run only after 27B reaches 124/124 |
 | SGLang shared-prefix floor | **PENDING / NO ACCEPTED NUMBER** | The cited external comparison mismatched prefix-cache, KV dtype/capacity, MTP, repetitions, and required axes. Its large headline gap does not bind | After cache-off parity, compare equivalent vllm.cpp, vLLM v0.25.0, and SGLang v0.5.15 cache-on workloads; the faster equivalent engine binds each axis |
 | External KV / LMCache | **NOT IMPLEMENTED / NOT BENCHMARKED** | Connector ABI, two-engine store/retrieve, hybrid-cache behavior, metrics, and failure policy are roadmap inventory only | Write the spike, port a deterministic fake provider, then gate LMCache MP before in-process mode |
@@ -104,17 +106,22 @@ no D2H. The 35B candidate trace (report/SQLite SHA `dd92270b…9ca7` /
 `7a4abf1c…f8fa`) passes correctness and contains zero W3-I kernel calls.
 Whole-process profiler duration is intentionally not treated as a rate.
 
-Run the pending component with the preflighted immutable driver. It owns one
+The first driver (`0f08750f…ae1b`) stopped at the candidate model gate before
+any server leg because native-plan document `2590fc94…199d` belongs to an older
+build fingerprint. Its evidence root is retained `VOID`; driver/model-gate log
+SHA are `898ee3c7…5edb` / `dd747a44…90e7`.
+
+Run the pending component with the repaired immutable driver. It owns one
 `/tmp/gpu` lock for both model gates and all 12 AB/BA/AB legs; exit 0 means all
 48 axes pass, while exit 1 after a complete evidence tree means strict failure.
 
 ```sh
 ssh dgx.casa \
-  '$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver.sh'
+  '$HOME/work/vllm.cpp-nvfp4-fused/15c6b8933d982019aa8965d218deb0eb1d9dc3f4-r2/w3i-component-driver-r2.sh'
 ```
 
-Driver SHA-256 is `0f08750f…ae1b`; its frozen native-plan document is
-`2590fc94…199d`. Partial output is never binding.
+Repaired driver SHA-256 is `06a5f72e…488d`; its exact v0.25 fixture SHA is
+`e81e9181…7edd`. Partial output is never binding.
 
 ### Executed-path diagnostic ranking
 

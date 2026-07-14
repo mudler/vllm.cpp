@@ -32,8 +32,10 @@ bodies are grounded. Default-off I1 is structurally accepted at clean
 `15c6b89`: exact CUDA/operator/memcheck/model/SASS and paired 27B/35B traces
 pass. Its packed graph body plus required zeroing takes **3.839808 ms** versus
 fallback **6.064064 ms**, down **36.68%**. The complete c2/c16 component remains
-mandatory. No ratio, speed credit, exact grid, or 35B performance is authorized
-meanwhile.
+mandatory. Its first start is `VOID` before timing because an older native plan
+document failed exact build-ID validation; the repaired driver binds the exact
+accepted v0.25 FlashInfer fixture. No ratio, speed credit, exact grid, or 35B
+performance is authorized meanwhile.
 
 Superseded campaign narratives are intentionally absent from this live spec.
 Their exact roots, hashes, and dispositions remain in the append-only state and

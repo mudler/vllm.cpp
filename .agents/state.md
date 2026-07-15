@@ -9785,3 +9785,87 @@ divergence is confirmed; explicit honest note that mirroring may LOSE the
 TTFT lottery win) was dispatched; the component pauses until its verdict —
 no fourth blind rerun. Binding stays **55/124**, `benchmark_binding=false`,
 no speed credit; qkvz/exact-grid/35B remain blocked on `complete-pass`.
+
+## 2026-07-15 — Scheduler prefill co-schedule PARITY verdict (c2 TTFT-family voids explained; NO scheduler change)
+
+**Task.** Ground (and, if confirmed, fix test-first) a suspected scheduler
+divergence behind the three `complete-void` c2 TTFT-family voids at `c172336`,
+`c172336…-r2`, and `d19e0916` (run 3). The measured c2 per-request TTFTs are
+bimodal (~0.45 s a 1024-prefill alone vs ~0.9 s waiting for another in-flight
+prefill); the 3/3-vs-6/0 mixture flips leg-to-leg, swinging the c2 TTFT-family
+axes 4–24% while every throughput/TPOT axis stays stable ≤0.5%. Two 1024-token
+prefills fit the 2048 budget EXACTLY, so a budget-filling scheduler co-schedules
+them. Worktree `.claude/worktrees/agent-a6c91660d9b61f592`; component roots
+read-only on dgx.
+
+**Grounding (both sides, file:line).** Our V1 waiting-queue admission +
+token-budget accounting (`src/vllm/v1/core/sched/scheduler.cpp:234-298`) is a
+faithful 1:1 mirror of pinned vLLM's (`vllm/v1/core/sched/scheduler.py:640-1013`,
+both pins `e24d1b24` and v0.25.0 `702f481`). Budget init `scheduler.cpp:127` ↔
+`scheduler.py:416`; `max_num_seqs` break `:235` ↔ `:643-645`; `num_new =
+num_tokens − num_computed` `:259` ↔ `:810`; long-prefill cap `:260-263` ↔
+`:828-830` (threshold 0 → inert; `max_num_partial_prefills` default 1 gates the
+`int(max_model_len*0.04)` derivation OFF — `src/vllm/config/scheduler.cpp:40,46-47`
+↔ `vllm/config/scheduler.py:70,80,257-259`); chunked-disabled break `:265-267` ↔
+`:834-840` (chunked ON → skipped); `min(num_new, token_budget)` `:268` ↔ `:842`;
+allocate + `token_budget −= num_new` `:271,295` ↔ `:905-917,989`. The engine busy
+loop drains ALL pending inputs before `schedule()` on both sides
+(`src/vllm/v1/engine/core_proc.cpp:62-89` ↔ `vllm/v1/engine/core.py:1269-1298`),
+so there is no systematic co-schedule-rate bias. Neither side has a decode-budget
+reservation, a one-waiting-request-per-step rule, or an active partial-prefill
+cap. Arithmetic for the c2 pattern: both-in-queue → A 1024 (2048→1024) + B 1024
+(1024→0) in one 2048 forward → both TTFT ≈ 0.9 s; staggered → A alone (0.45 s),
+then A's 1-token decode co-scheduled with B's full 1024 prefill (1+1024 ≤ 2048,
+NOT refused) → B ≈ 0.9 s. Co-schedule vs staggered is decided ONLY by whether
+both reqs are enqueued at `schedule()` time — arrival phasing, identical logic on
+both sides. A deterministic code difference would bias every leg the same way;
+the leg-to-leg FLIP is the fingerprint of timing jitter, not policy.
+
+**Verdict: NO co-schedule divergence. Scheduler UNCHANGED.** The 3/3-vs-6/0 flip
+and all three TTFT-family voids are the arrival-phasing co-schedule lottery, a
+faithful vLLM mirror — an unmet mirror obligation does NOT exist here.
+
+**Server-log check (task 2).** No server-side per-step scheduling logs exist
+(VT_GDN_DIAG off in component runs; `driver.log` is a one-line status JSON).
+Client-side corroboration: the c2 preflight `first_chunk_s` samples are bimodal —
+most ~0.48–0.52 s with elevated first-request samples (0.954/1.29/0.58 s across
+the three roots). Step composition is established from the code trace, as
+anticipated.
+
+**Test-first evidence (GREEN parity, no code change).** Added two regressions to
+`tests/vllm/v1/test_scheduler.cpp`: `:205` "two budget-filling prefills
+co-schedule (c2 parity)" (two 1024 prompts, budget 2048 → both fully scheduled
+in ONE step, total 2048, both `scheduled_new_reqs`, neither chunked) and `:241`
+"a late prefill co-schedules with a running decode" (documents the arrival-phasing
+mechanism). Both GREEN (would be RED only if we serialized budget-fitting
+prefills — we do not); mirrors upstream `test_schedule` budget-fill semantics
+(`tests/v1/core/test_scheduler.py:86`).
+
+**Harness recommendation for the orchestrator (NOT implemented — a
+benchmark-statistics decision).** The tail-only 15% relaxation already covers
+p90/p99, but the c2 MEAN/MEDIAN TTFT still flips 4–24% on the co-schedule
+lottery. Recommend gating the c2 TTFT-family on the pooled 3-rep (18-sample)
+distribution instead of per-run, OR dropping per-run c2 TTFT-family stability
+(keeping throughput/TPOT/ITL/memory), since the split is arrival-phasing noise
+present identically in vLLM. Honesty: the binding-grid c2 mean TTFT ≈ 697 ms
+ours vs ≈ 833 ms vLLM (1.196×) is a LOTTERY ARTIFACT, not a durable edge — it
+swings leg-to-leg and must not count as a binding TTFT advantage; the pooled
+comparison is the honest denominator. Because the scheduler is unchanged, the
+expected TTFT profile is UNCHANGED (still bimodal, arrival-phased) — we do NOT
+lose the "win" by any code change; it simply was never a reproducible win.
+
+**Run-3 void linkage.** This verdict explains the three TTFT-family voids
+(`c172336`/`-r2`/`d19e0916`) as the same arrival-phasing co-schedule lottery, not
+a regression or divergence. The tail relaxation is the correct treatment;
+extending it to the c2 mean/median per the recommendation removes the remaining
+false-void surface.
+
+**Gates (CPU only; orchestrator owns any GPU rerun).** `test_scheduler` 31/31
+(261 assertions), `test_scheduler_config` 7/7, `test_sched_output` 8/8,
+`test_request_queue` 26/26; full tools; clean `-Werror` rebuild; `check-agent-record.py`
+/ `test_agent_record.py` / `test_doc_checkpoint.py` / `check-doc-checkpoint.py`
+pass. No scheduler code changed; no GPU work. Binding stays **55/124**,
+`benchmark_binding=false`, no speed credit. Spike:
+[scheduler-prefill-coschedule.md](specs/scheduler-prefill-coschedule.md);
+recorded under `CLAIM-GDN-BA-ROUNDING-1`'s component investigation on the
+`ENG-SCHED-CORE` row.

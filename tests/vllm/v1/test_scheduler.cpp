@@ -189,6 +189,88 @@ TEST_CASE("Scheduler.schedule: two requests share max_num_batched_tokens") {
 }
 
 // ---------------------------------------------------------------------------
+// Budget-filling co-schedule (SERVE-GATE c2 parity). Two prompts that EXACTLY
+// fill the per-step token budget (2 x 1024 == 2048, the online-gate workload's
+// in1024/--max-num-batched-tokens 2048) are BOTH scheduled in a SINGLE step:
+// each gets its full 1024 tokens, neither is chunked, and the budget lands at 0.
+// This mirrors upstream scheduler.py:640-1013 (the waiting loop keeps admitting
+// while token_budget > 0 with no per-step / partial-prefill cap — default
+// max_num_partial_prefills == 1, long_prefill_token_threshold == 0), so our
+// waiting loop (scheduler.cpp:234-298) co-schedules identically. RED if we ever
+// serialized budget-filling prefills; GREEN proves we mirror vLLM's co-schedule.
+// Ledger: the component's bimodal c2 TTFT (~0.45 s vs ~0.9 s) is therefore pure
+// ARRIVAL phasing (whether both reqs are enqueued at the same schedule() call),
+// not a scheduler divergence — see the next case for the staggered arrival.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: two budget-filling prefills co-schedule (c2 parity)") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/32,
+                                   /*max_num_batched_tokens=*/2048);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/1024,
+                                 {"a", "b"});
+  Request* a = AddRequest(*scheduler, std::move(requests[0]));
+  Request* b = AddRequest(*scheduler, std::move(requests[1]));
+
+  auto output = scheduler->schedule();
+
+  // Both prefills run in ONE step, each at its full 1024 tokens (no chunk).
+  CHECK(output.num_scheduled_tokens.at("a") == 1024);
+  CHECK(output.num_scheduled_tokens.at("b") == 1024);
+  CHECK(output.total_num_scheduled_tokens == 2048);  // budget filled exactly.
+  CHECK(output.scheduled_new_reqs.size() == 2);      // neither serialized.
+  CHECK(output.scheduled_cached_reqs.num_reqs() == 0);
+  CHECK(scheduler->waiting->empty());
+  REQUIRE(scheduler->running.size() == 2);
+  CHECK(scheduler->running[0] == a);
+  CHECK(scheduler->running[1] == b);
+  // Both completed prefill this step -> neither is a lingering prefill chunk.
+  CHECK_FALSE(a->is_prefill_chunk);
+  CHECK_FALSE(b->is_prefill_chunk);
+}
+
+// ---------------------------------------------------------------------------
+// Staggered arrival (c2 TTFT lottery mechanism). If the second 1024-token
+// request is not yet enqueued when the first is scheduled, the first prefills
+// ALONE this step (the ~0.45 s TTFT mode). On the next step the first request's
+// single decode token co-schedules with the second request's full 1024-token
+// prefill inside the same 2048 budget (1 + 1024 <= 2048) — the late prefill is
+// NOT refused/serialized, it simply landed one step later (the ~0.9 s mode).
+// This is the arrival-phasing "lottery" behind the component's bimodal c2 TTFT;
+// it is identical to upstream, so the leg-to-leg 3/3-vs-6/0 mixture is timing,
+// not a scheduler policy difference (no scheduler change is warranted).
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: a late prefill co-schedules with a running decode") {
+  auto scheduler = CreateScheduler(/*max_num_seqs=*/32,
+                                   /*max_num_batched_tokens=*/2048);
+  auto requests = CreateRequests(/*num_requests=*/2, /*num_tokens=*/1024,
+                                 {"a", "b"});
+  Request* a = AddRequest(*scheduler, std::move(requests[0]));
+
+  // Step 1: only "a" is enqueued -> it prefills ALONE (the fast TTFT mode).
+  auto out0 = scheduler->schedule();
+  CHECK(out0.num_scheduled_tokens.at("a") == 1024);
+  CHECK(out0.num_scheduled_tokens.size() == 1);
+  CHECK(out0.total_num_scheduled_tokens == 1024);  // half the budget unused.
+  REQUIRE(a->num_computed_tokens == 1024);
+
+  // "a" samples its first token (runner would return one on the next step).
+  a->AppendOutputToken(0);
+  // "b" arrives after "a" was already dispatched.
+  Request* b = AddRequest(*scheduler, std::move(requests[1]));
+
+  // Step 2: "a" decodes 1 token AND "b" prefills its full 1024 in the SAME step.
+  auto out1 = scheduler->schedule();
+  CHECK(out1.num_scheduled_tokens.at("a") == 1);      // running decode.
+  CHECK(out1.num_scheduled_tokens.at("b") == 1024);   // late prefill co-scheduled.
+  CHECK(out1.total_num_scheduled_tokens == 1025);
+  CHECK(out1.scheduled_new_reqs.size() == 1);         // only "b" is new.
+  CHECK(out1.scheduled_new_reqs[0].req_id == "b");
+  CHECK(out1.scheduled_cached_reqs.num_reqs() == 1);  // "a" as a cached diff.
+  REQUIRE(scheduler->running.size() == 2);
+  CHECK(scheduler->waiting->empty());
+  (void)b;
+}
+
+// ---------------------------------------------------------------------------
 // Chunked prefill split across steps: a long prompt (80) with budget 30 is
 // scheduled 30 / 30 / 20 over three steps, num_computed advancing each step.
 // ---------------------------------------------------------------------------

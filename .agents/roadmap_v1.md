@@ -78,10 +78,23 @@ tail_band: 0.15}`) — a comparison axis (median, gated paired, memory) fails on
 when the packed deficit exceeds run noise (0.5% non-tail/memory, 15% tail);
 packed≥rollback always passes; stability/correctness/one-lock/memory-return/
 thermal unchanged. RED sub-0.5%→accepted / 1%-non-tail→fail / 12%-tail→accepted /
-20%-tail→fail / packed-better→pass (focused **62/62**, tools **145/145**). Next:
-the orchestrator runs the deciding **fifth** full **40+8**-median-axis component
-(under the noise band) from the pushed SHA; the `c172336`, `d82d282`, `d19e091`,
-`2dbe892` and diagnostic roots stay untouched. qkvz stays excluded.
+20%-tail→fail / packed-better→pass (focused **62/62**, tools **145/145**). The
+**fifth** seal (`da05444`) then reached **38/40** with **ZERO failing c16 axes**
+and packed WINNING c16 throughput — REFUTING run 4's −0.8% as unreproduced
+cross-run drift (five-run c16 arm delta within ±0.83%, equivalence). The 2
+remaining fails were the c2 pooled mean/median TTFT (0.909/0.814), a two-mode
+arrival-mixture artifact (pooled aggregates flip ±9.10%/±18.65% run-to-run). So
+**this checkpoint** adds a fourth test-first revision: MODE-CONDITIONAL c2 TTFT
+gating (pooled mean/median → diagnostic; compare fast/slow mode means split at
+675 ms, per-mode bands 8.7%/3.14%; <3-sample modes skipped; pooled p90/p99 stay
+15%-tail-gated) plus GPU-memory band recalibration (`peak_gpu_memory_mib` 3.37%,
+`peak_mem_available_drop_kib` 2%; PSS/RSS keep 0.5%), calibrated from the five
+sealed roots. RED run-5-mixture-flip(38/40)→accepted / 5%-slow-regression→fail /
+1%-gpu-mem→accepted & >band→fail / lottery-extreme→skipped (focused **66/66**,
+tools **149/149**). Next: the orchestrator runs the **sixth** full **40+8**
+component (under the mode-conditional gate) from the pushed SHA; the `c172336`,
+`d82d282`, `d19e091`, `2dbe892`, `da05444` and diagnostic roots stay untouched.
+qkvz stays excluded.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 

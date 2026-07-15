@@ -10084,3 +10084,97 @@ test-first implementation, CPU gates, measured VmHWM A/B — is complete). Row
 `LOAD-SAFETENSORS` returns to `PARTIAL` unclaimed: remaining scope is the
 direct-to-final-device streaming redesign (removes the 22.92 GiB steady mirror;
 wanted for 35B). Rollback stays `VT_LOAD_WINDOWED_RELEASE=0`.
+
+- **2026-07-15 (mode-conditional c2 TTFT gating + GPU-memory band recalibration,
+  `CLAIM-GDN-BA-ROUNDING-1`, worktree `.claude/worktrees/agent-a2dc9631f982d2501`)** —
+  The **FIFTH** 12-leg component sealed **`complete-failed`** at `da05444`,
+  reaching **38/40**. c16 has ZERO failing axes and packed WON c16 throughput
+  this run (`[804.58, 805.56, 806.79]` vs rollback `[801.74, 805.21, 804.74]`),
+  REFUTING run 4's −0.8% as unreproduced cross-run drift: the five-run c16 packed
+  arm delta is −0.06/−0.13/−0.02/−0.83/+0.35% → equivalence. The only 2 failing
+  axes were the c2 pooled **mean/median** TTFT (ratios 0.909/0.814), a two-mode
+  prefill-arrival mixture whose pooled aggregates flip with the fast/slow SAMPLE
+  COUNT, not with any engine difference. Extracted the full calibration read-only
+  over ssh dgx.casa from all five sealed roots (`c172336`, `c172336…-r2`,
+  `d19e0916`, `2dbe892`, `da05444`; roots read-only, untouched).
+
+  **c2 TTFT mode means (split at 675 ms) — per run per arm:**
+
+  ```
+  run   arm       fast_ms  slow_ms  nf  ns   |rb/pk−1| fast  slow
+  run1  packed     507.4    889.3    9   9        0.90%    0.69%
+  run1  rollback   502.9    895.4    9   9
+  run2  packed     512.2    892.8    9   9        0.92%    0.44%
+  run2  rollback   516.9    896.7    9   9
+  run3  packed     496.2    881.5    8  10        1.99%    1.42%
+  run3  rollback   486.3    869.0    5  13
+  run4  packed     505.6    886.9    9   9        2.23%    1.25%
+  run4  rollback   494.3    875.9    9   9
+  run5  packed     484.5    877.5    5  13        4.35%    1.57%
+  run5  rollback   505.6    891.3    9   9
+  ```
+
+  Mode split 675 ms is clean: worst max-fast 534.4 ms, tightest min-slow 844.6 ms
+  across all roots/arms → 675 sits in the empty gap of every run. Pooled-axis
+  mixture noise (max |ratio−1| over 5 runs): mean **9.10%**, median **18.65%**
+  (exceeds the 15% tail band), p90 **1.54%**, p99 **5.85%** (both < 15%). So
+  pooled mean/median → DIAGNOSTIC-only; the gate MODE-CONDITIONALLY compares
+  fast/slow mode means separately; pooled p90/p99 stay 15%-tail-gated. Per-mode
+  bands = `max(2%, 2×` the largest within-run cross-arm mode-mean deviation `)` =
+  **fast 8.7%** (2×4.35%, run 5), **slow 3.14%** (2×1.57%, run 5) — both clear all
+  observed noise with a 2× margin, and 3.14% slow still fails a genuine ≥5% slow
+  regression. A mode with <3 samples in either arm is SKIPPED (recorded reason),
+  dropping that run to 39 gated axes.
+
+  **c16 memory (median-of-3 reps) — per run packed-vs-rollback delta:**
+
+  ```
+  run   gpu_pk_p  gpu_pk_r  Δgpu%    memav_p    memav_r    Δmav%
+  run1   39566     40244    −1.685   66975448   67576116   −0.889
+  run2   39918     40211    −0.729   67320520   67534948   −0.318
+  run3   40244     40211    +0.082   67558156   67517080   +0.061
+  run4   39566     40211    −1.604   66949840   67591740   −0.950
+  run5   39918     39566    +0.890   67373540   67030496   +0.512
+  ```
+
+  Both `peak_gpu_memory_mib` and `peak_mem_available_drop_kib` sign-flip beyond
+  the 0.5% band. Recalibrated `max(2%, 2×` max-abs-Δ `)`: gpu-mem 2×1.685% =
+  **3.37%**, memavail 2×0.95% = **2.0%** (floor); PSS/RSS stay stable (±0.02%)
+  and keep 0.5%.
+
+  **DEVIATION recorded:** the design's suggested "2× the same-arm cross-run
+  spread of mode means" (range/median: fast 6.09%/slow 3.11% → bands fast
+  12.18%/slow 6.22%) OVER-estimates the comparison noise because it double-counts
+  common-mode run-to-run drift that cancels in the within-run packed-vs-rollback
+  comparison, and its 6.22% slow band could NOT catch a genuine 5% slow
+  regression (test b). Implemented the data-supported band instead — 2× the
+  directly-measured within-run cross-arm mode deviation — which both clears all
+  observed noise and fails a 5% slow regression; the same-arm spreads are
+  recorded above as corroboration.
+
+  Landed test-first in `tools/bench/gdn_packed_component.py` (`C2_TTFT_MODE_SPLIT_MS=675`,
+  `C2_TTFT_MODE_MIN_SAMPLES=3`, `C2_TTFT_FAST_MODE_BAND=0.087`,
+  `C2_TTFT_SLOW_MODE_BAND=0.0314`, `MEMORY_ACCEPTANCE_BANDS`, per-mode gating in
+  `summarize_component_records`, `_pooled_ttft_mode_means`, unified
+  `_acceptance_band`, and `ttft_mode`/`ttft_mode_gate` output + `contract`
+  records). RED evidence: the run-5-shaped mixture-flip fixture measured
+  **38/40** (gate FAIL, mean_ttft 0.958 / median_ttft 0.857) on the pre-change
+  code → **40/40** ACCEPTED after (per-mode ratios 1.0). New RED→GREEN tests:
+  (a) mixture-flip→accepted, (b) 5%-slow-regression→fail (slow-mode band catches
+  it; the 15% tail band on p90/p99 does not), (c) 1%-gpu-mem→accepted & 5%→fail,
+  (d) lottery-extreme-2-slow→slow-mode skipped with recorded reason (39 axes).
+  Honest existing-test updates: `test_every_axis_win_passes_40` now injects a
+  bimodal at-parity c2 so both modes gate (genuine 40); `test_one_percent_non_tail_deficit_still_fails`
+  now asserts 1% fails PSS/RSS (0.5%) but passes the widened gpu-mem/memavail
+  bands; `test_contract_records_the_acceptance_noise_band` asserts the new bands.
+  Focused `test_gdn_packed_component` **66/66** (62 baseline + 4 new), all tools
+  **149/149** (145 baseline + 4), `py_compile` clean, `check-agent-record.py` +
+  `check-doc-checkpoint.py` OK. No GPU/production-code change. Binding stays
+  **55/124**, `benchmark_binding=false`, no speed credit. Next: the orchestrator
+  runs the SIXTH 12-leg component from the pushed SHA under the mode-conditional
+  gate; qkvz/exact-grid/35B stay blocked on a verified `complete-pass`.
+
+  Process note: read-only evidence extraction (ssh dgx.casa), gates, commit, and
+  the post-commit `check-doc-checkpoint.py` were each run as separate steps with
+  exit status verified; no `git commit`/`push` was chained after a doc-editing
+  script.

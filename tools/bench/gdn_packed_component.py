@@ -166,6 +166,63 @@ POOLED_CONCURRENCY = 2
 # per-run median-deviation rule (4% non-tail / 15% tail) for the c2 TTFT-family
 # axes ONLY; all other axes keep those rules.
 C2_TTFT_POOLED_SANITY_BOUND = 0.50
+# --- c2 TTFT MODE-CONDITIONAL acceptance (CLAIM-GDN-BA-ROUNDING-1) ------------
+# The pooled c2 TTFT mean/median are a two-mode mixture (prefill-immediate
+# ~0.5 s vs prefill-queued ~0.9 s — the arrival lottery of
+# ``.agents/specs/scheduler-prefill-coschedule.md``).  Their pooled aggregates
+# swing with the fast/slow SAMPLE COUNT, not with any engine difference: across
+# the five sealed roots the pooled mean flips +/-9.10% and the pooled median
+# +/-18.65% (the median exceeds even the 15% tail band), sign-flipping run to run
+# (run 3 packed +5%, runs 4-5 packed worse).  No blanket band fixes a mixture
+# flip, so the two pooled mean/median axes move to DIAGNOSTIC-only and the gate
+# instead compares packed-vs-rollback FAST-mode means and SLOW-mode means
+# SEPARATELY, cancelling the mixture-composition noise (like-mode to like-mode).
+#
+# Mode split: a fixed 675 ms threshold.  Across all five roots and both arms the
+# fast cluster tops out at 534.4 ms and the slow cluster bottoms at 844.6 ms, so
+# 675 ms sits in the empty [534.4, 844.6] gap of every run (it is the rounded
+# midpoint of the ~0.5 s and ~0.9 s cluster centres).
+C2_TTFT_MODE_SPLIT_MS = 675.0
+# A mode whose either arm holds fewer than this many pooled samples is a lottery
+# extreme: its mode mean is too few-sample-noisy to gate, so that mode's
+# comparison is SKIPPED with a recorded reason (never failed).  The gated modes
+# in a run drop from two to one when this fires.
+C2_TTFT_MODE_MIN_SAMPLES = 3
+# Per-mode acceptance bands.  Calibrated max(2%, 2x the largest observed
+# within-run packed-vs-rollback mode-mean deviation across the five roots): the
+# within-run cross-arm deviation is the exact quantity the gate compares (its
+# run-to-run common-mode drift cancels, unlike a single arm's cross-run spread).
+# Observed within-run |rollback/packed - 1|: fast <= 4.35% (run 5), slow <= 1.57%
+# (run 5); 2x gives 8.7% / 3.14%.  Both clear all five runs' observed noise with
+# a 2x margin, and the 3.14% slow band still fails a genuine >=5% slow regression.
+# (The literal "2x same-arm cross-run spread" reading — fast 12.18%, slow 6.22%
+# by range/median — overestimates: it double-counts common-mode run drift and
+# could not catch a 5% slow regression; recorded as a grounded deviation.)
+C2_TTFT_FAST_MODE_BAND = 0.087
+C2_TTFT_SLOW_MODE_BAND = 0.0314
+C2_TTFT_MODE_AXES = ("fast_mode_ttft_ms", "slow_mode_ttft_ms")
+C2_TTFT_MODE_BANDS = {
+    "fast_mode_ttft_ms": C2_TTFT_FAST_MODE_BAND,
+    "slow_mode_ttft_ms": C2_TTFT_SLOW_MODE_BAND,
+}
+# The pooled c2 mean/median TTFT are reported but NOT gated (mixture noise
+# 9.10%/18.65% across five runs).  The pooled p90/p99 STAY gated under the 15%
+# tail band: their mixture noise is 1.54%/5.85% (both < 15%), because p90/p99 sit
+# in the slow tail regardless of the fast/slow count.
+C2_TTFT_DIAGNOSTIC_AXES = frozenset({"mean_ttft_ms", "median_ttft_ms"})
+# --- Memory acceptance bands (CLAIM-GDN-BA-ROUNDING-1) ------------------------
+# peak_gpu_memory_mib and peak_mem_available_drop_kib are band-edge sign-flippers
+# whose cross-run noise exceeds the 0.5% band (run 4 packed -656 MiB BETTER on
+# gpu-mem, run 5 packed +215 MiB/+0.54% worse; memavail +/-0.3-0.5% both ways).
+# Recalibrated max(2%, 2x the largest |packed/rollback - 1| across the five runs):
+# gpu-mem max|delta|=1.685% -> 3.37%; memavail max|delta|=0.95% -> 2% (floor).
+# PSS/RSS are stable (+/-0.02%) and keep the 0.5% band.
+MEMORY_ACCEPTANCE_BANDS = {
+    "peak_gpu_memory_mib": 0.0337,
+    "peak_mem_available_drop_kib": 0.02,
+    "peak_pss_kib": NON_TAIL_ACCEPTANCE_BAND,
+    "peak_rss_kib": NON_TAIL_ACCEPTANCE_BAND,
+}
 MEMORY_RETURN_TOLERANCE_KIB = 1048576
 # Pinned vLLM records the first-token timestamp, then calls perf_counter() a
 # second time for TTFT.  Consequently TTFT + sum(ITLs) exceeds its retained
@@ -403,15 +460,22 @@ def _metric_stability_tolerance(axis: str) -> float:
 def _acceptance_band(axis: str) -> float:
     """Return the packed-deficit acceptance band for a comparison axis.
 
+    Memory axes carry per-axis calibrated bands (gpu-mem 3.37%, memavail 2%,
+    PSS/RSS 0.5%) — the ``memory/`` prefix on the paired axes is stripped first.
+    The c2 fast/slow TTFT mode-mean axes carry their per-mode bands (8.7%/3.14%).
     Tail order statistics (p90/p99 of every timed latency, including the pooled
     c2 TTFT tails) carry the wide ``TAIL_ACCEPTANCE_BAND``; every other timing
-    axis and every memory axis (memory keys are never in ``TAIL_AXES``) carries
-    ``NON_TAIL_ACCEPTANCE_BAND``.  An axis passes when its normalized
+    axis carries ``NON_TAIL_ACCEPTANCE_BAND``.  An axis passes when its normalized
     (>=1-is-packed-better) ratio is at least ``1 - band``, so packed at-or-better
     (ratio >= 1) always passes and only the deficit side is band-limited.
     """
 
-    return TAIL_ACCEPTANCE_BAND if axis in TAIL_AXES else NON_TAIL_ACCEPTANCE_BAND
+    name = axis[len("memory/"):] if axis.startswith("memory/") else axis
+    if name in MEMORY_ACCEPTANCE_BANDS:
+        return MEMORY_ACCEPTANCE_BANDS[name]
+    if name in C2_TTFT_MODE_BANDS:
+        return C2_TTFT_MODE_BANDS[name]
+    return TAIL_ACCEPTANCE_BAND if name in TAIL_AXES else NON_TAIL_ACCEPTANCE_BAND
 
 
 def _axis_accepts(ratio: float, axis: str) -> bool:
@@ -437,6 +501,30 @@ def _pooled_ttft_distribution(samples: list[float]) -> dict[str, float]:
         "median_ttft_ms": statistics.median(samples),
         "p90_ttft_ms": percentile(samples, 90),
         "p99_ttft_ms": percentile(samples, 99),
+    }
+
+
+def _pooled_ttft_mode_means(samples: list[float]) -> dict[str, dict[str, Any]]:
+    """Split the pooled c2 TTFT samples at the fixed mode threshold.
+
+    Returns each mode's arithmetic mean and sample count.  The fast
+    (prefill-immediate) and slow (prefill-queued) clusters are compared
+    arm-to-arm SEPARATELY so the mixture-composition noise of the pooled
+    mean/median (which swings with the fast/slow COUNT) cancels: like-mode to
+    like-mode.  A mode with no samples reports a ``None`` mean and count 0.
+    """
+
+    fast = [value for value in samples if value < C2_TTFT_MODE_SPLIT_MS]
+    slow = [value for value in samples if value >= C2_TTFT_MODE_SPLIT_MS]
+    return {
+        "fast": {
+            "mean": statistics.fmean(fast) if fast else None,
+            "count": len(fast),
+        },
+        "slow": {
+            "mean": statistics.fmean(slow) if slow else None,
+            "count": len(slow),
+        },
     }
 
 
@@ -488,6 +576,10 @@ def summarize_component_records(
                 "c2_ttft_pooled_concurrency": POOLED_CONCURRENCY,
                 "c2_ttft_pooled_axes": sorted(TTFT_FAMILY_AXES),
                 "c2_ttft_pooled_sanity_bound": C2_TTFT_POOLED_SANITY_BOUND,
+                "c2_ttft_mode_split_ms": C2_TTFT_MODE_SPLIT_MS,
+                "c2_ttft_mode_min_samples": C2_TTFT_MODE_MIN_SAMPLES,
+                "c2_ttft_mode_axes": list(C2_TTFT_MODE_AXES),
+                "c2_ttft_diagnostic_axes": sorted(C2_TTFT_DIAGNOSTIC_AXES),
             },
             # G3 accepts no STABLE regression: a comparison axis (median
             # axis_pass, the gated per-rep paired axes, and every memory axis)
@@ -497,12 +589,23 @@ def summarize_component_records(
                 "non_tail_band": NON_TAIL_ACCEPTANCE_BAND,
                 "tail_band": TAIL_ACCEPTANCE_BAND,
                 "tail_axes": sorted(TAIL_AXES),
+                "c2_ttft_mode_bands": dict(C2_TTFT_MODE_BANDS),
+                "memory_bands": dict(MEMORY_ACCEPTANCE_BANDS),
                 "grounding": (
                     "no STABLE regression is accepted: an axis fails only when "
-                    "the packed deficit exceeds run noise.  The 0.5% non-tail/"
-                    "memory band clears the <=0.45% idle-box per-rep deviation "
-                    "ceiling across the four sealed runs; the 15% tail band "
-                    "clears the <=10.58% idle-box order-statistic noise."
+                    "the packed deficit exceeds run noise, calibrated from five "
+                    "sealed roots.  Non-tail and PSS/RSS band 0.5% (<=0.45% "
+                    "idle-box per-rep ceiling); tail band 15% (<=10.58% "
+                    "order-statistic noise).  c2 TTFT is a two-mode arrival "
+                    "mixture: pooled mean/median are diagnostic-only (mixture "
+                    "noise 9.10%/18.65%), and the gate compares fast-mode (band "
+                    "8.7%) and slow-mode (band 3.14%) means separately, "
+                    "max(2%, 2x the <=4.35%/1.57% within-run cross-arm mode-mean "
+                    "deviation); pooled p90/p99 stay tail-gated (mixture noise "
+                    "1.54%/5.85% < 15%).  peak_gpu_memory_mib band 3.37% and "
+                    "peak_mem_available_drop_kib band 2% are max(2%, 2x the "
+                    "1.685%/0.95% cross-run |delta|) — both sign-flip across runs "
+                    "beyond 0.5%."
                 ),
             },
         },
@@ -566,11 +669,14 @@ def summarize_component_records(
             for arm in ARMS
         }
         pooled_ttft: dict[str, dict[str, float]] = {}
+        pooled_mode: dict[str, dict[str, dict[str, Any]]] = {}
         if concurrency == POOLED_CONCURRENCY:
             for arm in ARMS:
-                pooled_ttft[arm] = _pooled_ttft_distribution(
-                    [sample for rep in ttft_samples[arm] for sample in rep]
-                )
+                pooled_samples = [
+                    sample for rep in ttft_samples[arm] for sample in rep
+                ]
+                pooled_ttft[arm] = _pooled_ttft_distribution(pooled_samples)
+                pooled_mode[arm] = _pooled_ttft_mode_means(pooled_samples)
         unstable: list[str] = []
         for arm in ARMS:
             for axis, distribution in metric_distributions[arm].items():
@@ -667,12 +773,60 @@ def summarize_component_records(
                 for axis in LOWER_AXES
             },
         }
+        # c2 mode-conditional TTFT gating (CLAIM-GDN-BA-ROUNDING-1): compare the
+        # fast-mode and slow-mode pooled means arm-to-arm, which cancels the
+        # mixture-composition noise of the pooled mean/median.  A mode with fewer
+        # than C2_TTFT_MODE_MIN_SAMPLES in EITHER arm is a lottery extreme and is
+        # SKIPPED with a recorded reason (never failed).  The pooled mean/median
+        # become DIAGNOSTIC-only; pooled p90/p99 stay tail-gated.
+        mode_ratios: dict[str, float] = {}
+        mode_gate: dict[str, dict[str, Any]] = {}
+        if pooled_mode:
+            for mode, axis in zip(("fast", "slow"), C2_TTFT_MODE_AXES):
+                packed_mode = pooled_mode["packed"][mode]
+                rollback_mode = pooled_mode["rollback"][mode]
+                if (
+                    packed_mode["count"] < C2_TTFT_MODE_MIN_SAMPLES
+                    or rollback_mode["count"] < C2_TTFT_MODE_MIN_SAMPLES
+                ):
+                    mode_gate[axis] = {
+                        "gated": False,
+                        "packed_samples": packed_mode["count"],
+                        "rollback_samples": rollback_mode["count"],
+                        "reason": (
+                            f"lottery-extreme: fewer than "
+                            f"{C2_TTFT_MODE_MIN_SAMPLES} {mode}-mode samples "
+                            f"(packed={packed_mode['count']}, "
+                            f"rollback={rollback_mode['count']}); comparison "
+                            "skipped, not failed"
+                        ),
+                    }
+                    continue
+                ratio = _normalized_ratio(
+                    rollback_mode["mean"],
+                    packed_mode["mean"],
+                    label=f"c{concurrency}/{axis}",
+                )
+                mode_ratios[axis] = ratio
+                mode_gate[axis] = {
+                    "gated": True,
+                    "band": _acceptance_band(axis),
+                    "packed_mode_mean_ms": packed_mode["mean"],
+                    "rollback_mode_mean_ms": rollback_mode["mean"],
+                    "packed_samples": packed_mode["count"],
+                    "rollback_samples": rollback_mode["count"],
+                    "ratio_ge_1_is_packed_better": ratio,
+                }
+        normalized_ratios.update(mode_ratios)
         # An axis FAILS only when the packed deficit exceeds the acceptance noise
-        # band (0.5% non-tail, 15% tail): a deficit inside run noise is not a
-        # stable regression.  packed >= rollback (ratio >= 1) always passes.
+        # band (0.5% non-tail, 15% tail, per-mode c2 TTFT, per-axis memory): a
+        # deficit inside run noise is not a stable regression.  packed >= rollback
+        # (ratio >= 1) always passes.  At c2 the pooled mean/median TTFT are
+        # DIAGNOSTIC-only (mixture noise); the fast/slow mode means gate instead.
         axis_pass = {
             axis: _axis_accepts(ratio, axis)
             for axis, ratio in normalized_ratios.items()
+            if not (pooled_mode and axis in C2_TTFT_DIAGNOSTIC_AXES)
         }
         memory_normalized_ratios = {
             axis: _normalized_ratio(
@@ -682,8 +836,9 @@ def summarize_component_records(
             )
             for axis in MEMORY_AXES
         }
-        # Memory axes are never tail: the 0.5% band applies (packed uses less
-        # memory => ratio >= 1 => passes; a >0.5% growth fails).
+        # Memory axes carry per-axis calibrated bands (gpu-mem 3.37%, memavail
+        # 2%, PSS/RSS 0.5%): packed uses less memory => ratio >= 1 => passes; a
+        # deficit beyond the axis band fails.
         memory_axis_pass = {
             axis: _axis_accepts(ratio, axis)
             for axis, ratio in memory_normalized_ratios.items()
@@ -723,7 +878,7 @@ def summarize_component_records(
         # or advantage.  They stay in ``paired_ratios`` as a diagnostic but are
         # excluded from the gated ``paired_axis_pass`` at c2 only.
         # Each paired axis carries the SAME acceptance band as its median axis
-        # (memory/* keys are never tail, so they take the 0.5% non-tail band).
+        # (memory/* keys take their per-axis calibrated band via _acceptance_band).
         paired_axis_pass = {
             repetition: {
                 axis: _axis_accepts(ratio, axis)
@@ -748,6 +903,8 @@ def summarize_component_records(
             "means": metric_means,
             "medians": metric_medians,
             "ttft_pooled": pooled_ttft,
+            "ttft_mode": pooled_mode,
+            "ttft_mode_gate": mode_gate,
             "memory": memory_medians,
             "memory_means": memory_means,
             "memory_spread": memory_distributions,

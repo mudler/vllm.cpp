@@ -209,6 +209,78 @@ def _apply_ttft_ms(record: dict, ttfts_ms: list[float]) -> None:
         record[axis] = metrics[axis]
 
 
+# c2 mode-conditional TTFT fixtures (CLAIM-GDN-BA-ROUNDING-1).  A c2 leg has six
+# requests at closed-loop concurrency 2.  The real c2 decode (~13.7 s) dwarfs the
+# ~0.4 s ttft mode gap, so E2EL is effectively flat and the arrival-mode mixture
+# is the only moving distribution.  This helper mirrors that with a CONSTANT total
+# latency L (decode = L - ttft per request), which keeps E2EL exactly flat, and
+# start_times honour concurrency 2 (each pair starts when the previous pair ends).
+_C2_MODE_LATENCY_MS = 14000.0
+_C2_MODE_LATENCY_S = 14.0
+_C2_MODE_DURATION_S = 42.0
+
+
+def _apply_c2_ttft_modes(record: dict, ttfts_ms: list[float]) -> None:
+    """Set a c2 leg's six per-request TTFTs (ms) at a constant total latency.
+
+    Decode is ``_C2_MODE_LATENCY_MS - ttft`` per request, so E2EL is flat and only
+    the TTFT distribution (its fast/slow arrival-mode mixture) moves.  This is the
+    fixture the mode-conditional c2 gate is calibrated against.
+    """
+
+    if len(ttfts_ms) != 6:
+        raise AssertionError("a c2 leg has six requests")
+    record["duration"] = _C2_MODE_DURATION_S
+    record["request_throughput"] = 6 / _C2_MODE_DURATION_S
+    record["output_throughput"] = 6 * 128 / _C2_MODE_DURATION_S
+    record["total_token_throughput"] = 6 * (1024 + 128) / _C2_MODE_DURATION_S
+    record["start_times"] = [float(index // 2) * _C2_MODE_LATENCY_S for index in range(6)]
+    record["ttfts"] = [value / 1000.0 for value in ttfts_ms]
+    record["itls"] = [
+        [(_C2_MODE_LATENCY_MS - value) / 127 / 1000.0] * 127 for value in ttfts_ms
+    ]
+    metrics = gdn_component._recompute_timing_metrics(record)
+    for axis in gdn_component.LOWER_AXES:
+        record[axis] = metrics[axis]
+
+
+# Mode split at 675 ms: fast (prefill-immediate) ~600 ms, slow (prefill-queued)
+# ~700 ms; both straddle the fixed threshold.
+# (a) run-5-shaped mixture flip: IDENTICAL per-mode values, but packed pools to
+#     8 fast/10 slow while rollback pools to 13 fast/5 slow.  The pooled mean/
+#     median flip below the retired 0.5% band (the fifth-seal 38/40 signature),
+#     yet the per-mode ratios are exactly 1.0.
+_C2_MODE_FLIP_PACKED = {
+    1: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0],   # 3 fast / 3 slow
+    2: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0],   # 3 fast / 3 slow
+    3: [600.0, 600.0, 700.0, 700.0, 700.0, 700.0],   # 2 fast / 4 slow  -> 8/10
+}
+_C2_MODE_FLIP_ROLLBACK = {
+    1: [600.0, 600.0, 600.0, 600.0, 600.0, 700.0],   # 5 fast / 1 slow
+    2: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # 4 fast / 2 slow
+    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # 4 fast / 2 slow  -> 13/5
+}
+# (b) genuine slow-mode regression: fast modes equal, packed slow-mode mean 5%
+#     worse (735 vs 700).  Counts equal (9 fast / 9 slow both arms).
+_C2_MODE_SLOW_REGRESS_PACKED = {rep: [600.0, 600.0, 600.0, 735.0, 735.0, 735.0] for rep in (1, 2, 3)}
+_C2_MODE_SLOW_REGRESS_ROLLBACK = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in (1, 2, 3)}
+# (d) lottery extreme: packed draws only 2 slow samples (16 fast); rollback keeps
+#     6 slow.  The slow-mode comparison is SKIPPED, never failed.
+_C2_MODE_LOTTERY_PACKED = {
+    1: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
+    2: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
+    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # -> 16 fast / 2 slow
+}
+_C2_MODE_LOTTERY_ROLLBACK = {
+    1: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],
+    2: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],
+    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # -> 12 fast / 6 slow
+}
+# Both arms at parity per mode (used to prove the full 40-axis gate: both modes
+# gated + c16 packed-better).
+_C2_MODE_PARITY = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in (1, 2, 3)}
+
+
 # --- c2 TTFT phase-lottery fixtures (ms) -------------------------------------
 # Bimodal per-request TTFTs from the upstream-mirrored prefill co-schedule
 # arrival lottery: a 1024-token prefill runs alone (~fast) or co-schedules
@@ -969,15 +1041,29 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertFalse(plan["production_build"]["profile_control"])
 
     def test_every_axis_win_passes_40_timing_and_8_memory_axes(self) -> None:
-        summary = summarize_component_records(
-            _records(packed_better=True), _memory(packed_better=True)
-        )
+        # The 40-axis gate = 20 c16 + 20 c2 (HIGHER 4 + LOWER 16, with the two
+        # diagnostic pooled mean/median TTFT axes replaced by the fast/slow
+        # mode-mean axes).  Give c2 a genuinely bimodal at-parity TTFT (both modes
+        # populated) so both mode axes are gated, and keep c16 packed-better.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for arm in ARMS:
+            for repetition in (1, 2, 3):
+                _apply_c2_ttft_modes(records[(2, arm, repetition)], _C2_MODE_PARITY[repetition])
+
+        summary = summarize_component_records(records, memory)
 
         self.assertTrue(summary["gate_pass"])
         self.assertEqual(summary["axis_pass_count"], 40)
         self.assertEqual(summary["axis_total"], 40)
         self.assertEqual(summary["memory_axis_pass_count"], 8)
         self.assertEqual(summary["memory_axis_total"], 8)
+        # Both c2 TTFT modes are gated; the pooled mean/median are diagnostic-only.
+        c2 = summary["by_concurrency"]["2"]
+        self.assertIn("fast_mode_ttft_ms", c2["axis_pass"])
+        self.assertIn("slow_mode_ttft_ms", c2["axis_pass"])
+        self.assertNotIn("mean_ttft_ms", c2["axis_pass"])
+        self.assertNotIn("median_ttft_ms", c2["axis_pass"])
 
     def test_valid_regression_is_a_completed_failed_gate(self) -> None:
         summary = summarize_component_records(
@@ -1018,9 +1104,12 @@ class GdnPackedComponentTest(unittest.TestCase):
 
     def test_one_percent_non_tail_deficit_still_fails(self) -> None:
         # A 1% deficit exceeds the 0.5% non-tail band, so every non-tail timing
-        # and memory axis fails and the gate is FAILED — the band did not blunt
-        # the non-tail contention detector.  The same 1% is inside the 15% tail
-        # band, so the tail axes still pass (proving the two bands are distinct).
+        # axis fails and the gate is FAILED — the band did not blunt the non-tail
+        # contention detector.  The same 1% is inside the 15% tail band, so the
+        # tail axes still pass (proving the two bands are distinct).  On memory it
+        # exceeds the 0.5% PSS/RSS band (fail) but is now INSIDE the recalibrated
+        # 3.37% gpu-mem and 2% memavail bands (pass) — the sign-flipping GPU-memory
+        # axes were widened, PSS/RSS were not.
         records = _uniform_records(deficit=0.01)
         memory = _uniform_memory(deficit=0.01)
 
@@ -1031,7 +1120,10 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertFalse(c16["axis_pass"]["request_throughput"])
         self.assertFalse(c16["axis_pass"]["mean_tpot_ms"])
         self.assertFalse(c16["axis_pass"]["median_itl_ms"])
-        self.assertFalse(c16["memory_axis_pass"]["peak_gpu_memory_mib"])
+        self.assertFalse(c16["memory_axis_pass"]["peak_pss_kib"])
+        self.assertFalse(c16["memory_axis_pass"]["peak_rss_kib"])
+        self.assertTrue(c16["memory_axis_pass"]["peak_gpu_memory_mib"])
+        self.assertTrue(c16["memory_axis_pass"]["peak_mem_available_drop_kib"])
         self.assertTrue(c16["axis_pass"]["p99_tpot_ms"])
         self.assertTrue(c16["axis_pass"]["p99_itl_ms"])
 
@@ -1108,6 +1200,165 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertEqual(acceptance["non_tail_band"], 0.005)
         self.assertEqual(acceptance["tail_band"], 0.15)
         self.assertEqual(acceptance["tail_axes"], sorted(gdn_component.TAIL_AXES))
+        # The mode-conditional c2 TTFT bands and the recalibrated memory bands are
+        # recorded against their calibration (CLAIM-GDN-BA-ROUNDING-1).
+        self.assertEqual(
+            acceptance["c2_ttft_mode_bands"],
+            {"fast_mode_ttft_ms": 0.087, "slow_mode_ttft_ms": 0.0314},
+        )
+        self.assertEqual(
+            acceptance["memory_bands"],
+            {
+                "peak_gpu_memory_mib": 0.0337,
+                "peak_mem_available_drop_kib": 0.02,
+                "peak_pss_kib": 0.005,
+                "peak_rss_kib": 0.005,
+            },
+        )
+        stability = summary["contract"]["stability"]
+        self.assertEqual(stability["c2_ttft_mode_split_ms"], 675.0)
+        self.assertEqual(stability["c2_ttft_mode_min_samples"], 3)
+        self.assertEqual(
+            stability["c2_ttft_mode_axes"],
+            ["fast_mode_ttft_ms", "slow_mode_ttft_ms"],
+        )
+        self.assertEqual(
+            stability["c2_ttft_diagnostic_axes"],
+            ["mean_ttft_ms", "median_ttft_ms"],
+        )
+
+    def test_c2_ttft_mixture_flip_is_mode_gated_and_accepted(self) -> None:
+        # RED case (a): a run-5-shaped mixture flip.  packed pools to 8 fast/10
+        # slow, rollback to 13 fast/5 slow, with IDENTICAL per-mode values.  The
+        # pooled mean/median TTFT ratios flip below the retired 0.5% band — under
+        # the pre-change gate this was a FAILED component (the fifth-seal 38/40
+        # signature) — but the per-mode ratios are exactly 1.0, so after the mode
+        # split the component is ACCEPTED.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_c2_ttft_modes(
+                records[(2, "packed", repetition)], _C2_MODE_FLIP_PACKED[repetition]
+            )
+            _apply_c2_ttft_modes(
+                records[(2, "rollback", repetition)],
+                _C2_MODE_FLIP_ROLLBACK[repetition],
+            )
+
+        summary = summarize_component_records(records, memory)
+        c2 = summary["by_concurrency"]["2"]
+        ratios = c2["normalized_ratios_ge_1_is_packed_better"]
+        # The pooled mean/median really do flip below the retired 0.5% band...
+        self.assertLess(ratios["mean_ttft_ms"], 0.995)
+        self.assertLess(ratios["median_ttft_ms"], 0.995)
+        # ...but they are diagnostic-only now (excluded from the gated axis set)...
+        self.assertNotIn("mean_ttft_ms", c2["axis_pass"])
+        self.assertNotIn("median_ttft_ms", c2["axis_pass"])
+        # ...while the per-mode comparison ties (identical per-mode values)...
+        gate = c2["ttft_mode_gate"]
+        self.assertAlmostEqual(
+            gate["fast_mode_ttft_ms"]["ratio_ge_1_is_packed_better"], 1.0
+        )
+        self.assertAlmostEqual(
+            gate["slow_mode_ttft_ms"]["ratio_ge_1_is_packed_better"], 1.0
+        )
+        self.assertTrue(c2["axis_pass"]["fast_mode_ttft_ms"])
+        self.assertTrue(c2["axis_pass"]["slow_mode_ttft_ms"])
+        # ...and the pooled p90/p99 stay gated (slow-tail, ratio ~1.0) and pass.
+        self.assertTrue(c2["axis_pass"]["p90_ttft_ms"])
+        self.assertTrue(c2["axis_pass"]["p99_ttft_ms"])
+        # So the mixture-flip component is ACCEPTED at the full 40 axes.
+        self.assertTrue(summary["gate_pass"])
+        self.assertEqual(summary["axis_pass_count"], 40)
+        self.assertEqual(summary["axis_total"], 40)
+
+    def test_c2_ttft_slow_mode_regression_fails(self) -> None:
+        # RED case (b): a genuine slow-mode regression — packed slow-mode mean 5%
+        # worse than rollback's (735 vs 700), fast modes equal.  The slow-mode
+        # band (3.14%) FAILS it, while the pooled p90/p99 tail band (15%) does not
+        # — the mode gate is the sensitive detector the tail band cannot be.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_c2_ttft_modes(
+                records[(2, "packed", repetition)],
+                _C2_MODE_SLOW_REGRESS_PACKED[repetition],
+            )
+            _apply_c2_ttft_modes(
+                records[(2, "rollback", repetition)],
+                _C2_MODE_SLOW_REGRESS_ROLLBACK[repetition],
+            )
+
+        summary = summarize_component_records(records, memory)
+        c2 = summary["by_concurrency"]["2"]
+        gate = c2["ttft_mode_gate"]
+        self.assertAlmostEqual(
+            gate["slow_mode_ttft_ms"]["ratio_ge_1_is_packed_better"],
+            700.0 / 735.0,
+            places=4,
+        )
+        self.assertFalse(c2["axis_pass"]["slow_mode_ttft_ms"])
+        self.assertTrue(c2["axis_pass"]["fast_mode_ttft_ms"])
+        # The same 5% deficit rides the 15% tail band on the pooled p90/p99, so
+        # only the slow-mode gate catches it.
+        self.assertTrue(c2["axis_pass"]["p90_ttft_ms"])
+        self.assertTrue(c2["axis_pass"]["p99_ttft_ms"])
+        self.assertFalse(summary["gate_pass"])
+
+    def test_gpu_memory_delta_within_recalibrated_band(self) -> None:
+        # (c): a 1% packed gpu-mem deficit is inside the recalibrated 3.37% band
+        # (retired 0.5% band FAILED it), so it is ACCEPTED; a deficit beyond the
+        # band still FAILS.  PSS/RSS stay packed-better throughout.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            rollback_gpu = memory[(16, "rollback", repetition)]["peak_gpu_memory_mib"]
+            memory[(16, "packed", repetition)]["peak_gpu_memory_mib"] = rollback_gpu * 1.01
+
+        summary = summarize_component_records(records, memory)
+        c16 = summary["by_concurrency"]["16"]
+        self.assertTrue(c16["memory_axis_pass"]["peak_gpu_memory_mib"])
+        self.assertTrue(c16["memory_axis_pass"]["peak_pss_kib"])
+        self.assertTrue(summary["gate_pass"])
+
+        for repetition in (1, 2, 3):
+            rollback_gpu = memory[(16, "rollback", repetition)]["peak_gpu_memory_mib"]
+            memory[(16, "packed", repetition)]["peak_gpu_memory_mib"] = rollback_gpu * 1.05
+
+        failed = summarize_component_records(records, memory)
+        c16_failed = failed["by_concurrency"]["16"]
+        self.assertFalse(c16_failed["memory_axis_pass"]["peak_gpu_memory_mib"])
+        self.assertFalse(failed["gate_pass"])
+
+    def test_c2_ttft_lottery_extreme_skips_slow_mode(self) -> None:
+        # (d): packed draws only 2 slow-mode samples (a lottery extreme).  The
+        # slow-mode comparison is SKIPPED with a recorded reason (never failed);
+        # the fast mode is still gated, so c2 gates 19 axes (total 39) and the
+        # component is ACCEPTED.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_c2_ttft_modes(
+                records[(2, "packed", repetition)],
+                _C2_MODE_LOTTERY_PACKED[repetition],
+            )
+            _apply_c2_ttft_modes(
+                records[(2, "rollback", repetition)],
+                _C2_MODE_LOTTERY_ROLLBACK[repetition],
+            )
+
+        summary = summarize_component_records(records, memory)
+        c2 = summary["by_concurrency"]["2"]
+        slow_gate = c2["ttft_mode_gate"]["slow_mode_ttft_ms"]
+        self.assertFalse(slow_gate["gated"])
+        self.assertEqual(slow_gate["packed_samples"], 2)
+        self.assertIn("lottery-extreme", slow_gate["reason"])
+        self.assertNotIn("slow_mode_ttft_ms", c2["axis_pass"])
+        self.assertTrue(c2["axis_pass"]["fast_mode_ttft_ms"])
+        # The fast mode is still gated; the slow mode's skip drops c2 to 19 axes.
+        self.assertEqual(c2["axis_total"], 19)
+        self.assertEqual(summary["axis_total"], 39)
+        self.assertTrue(summary["gate_pass"])
 
     def test_stable_paired_reversal_cannot_pass_on_medians(self) -> None:
         records = _records(packed_better=True)

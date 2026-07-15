@@ -15,7 +15,11 @@ immutable correctness at `f344dec` and accepted structure from `7ff713e`,
 finalized by `24cea4f`: packed has **915** nodes versus rollback's **963**, with
 the exact 48-for-96 GDN substitution and invariant remaining topology. The
 production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
-finalizer are hardened. Clean source `d82d282`
+finalizer are hardened; five 12-leg components have sealed, the latest
+(`da05444`) `complete-failed` at **38/40** with c16 axes at equivalence (packed
+won c16 throughput; see the component section below), and MODE-CONDITIONAL c2
+TTFT gating plus GPU-memory band recalibration have landed test-first from the
+five sealed roots (all tools **149/149**). Clean source `d82d282`
 completed both direct model gates and all six c2 legs, then **FAILED /
 INCOMPLETE** at c16 packed repetition 1. The streaming preflight, initial
 request and 16 warmups passed, but all **0/96** timed requests returned HTTP 500
@@ -75,27 +79,30 @@ flipping 3/3-vs-6/0 leg-to-leg. Two per-run stability revisions landed test-firs
 arm's pooled 18-per-request distribution, STABILITY-gated on a 50% pooled sanity
 bound, and EXCLUDED from the gated per-rep paired axes; c16 and every non-TTFT
 axis keep 4%/15%, and E2EL is unchanged (measured c2 E2EL per-rep deviation
-≤0.30% across the three sealed roots). The fourth component then SEALED
-**`complete-failed`** at `2dbe892` — the first VALID terminal disposition
-(stable, correct, `validation_error=None`; axis 8/40, paired 41/132, memory
-6/8). Decomposition: every c2 throughput/TPOT/ITL/E2EL ratio is 0.9998–1.0008
-and the memory fails are 0.023% PSS/RSS epsilons (packed uses 656 MiB LESS
-GPU memory) — ties failing a strict ≥1.0 rule that does not implement the
-spec's "no STABLE regression" contract; the one substantive candidate is a
-c16 packed −0.8% (packed 793.3–795.8 vs rollback 798.3–800.6 tok/s) that
-contradicts three same-code prior runs (arm deltas ≤0.13%) with run-4
-rollback above every prior measurement of either arm. With windowed-load
-default-ON, component peak PSS is **24.86 GB** (binding era 48.18; vLLM
-28.5). The acceptance NOISE BAND has now LANDED test-first (this checkpoint):
-a comparison axis (median, gated paired, memory) fails only when the packed
-deficit exceeds run noise — **0.5%** for non-tail timing and all memory axes
-(clears the ≤0.45% idle-box per-rep ceiling; the run-4 c2 0.9998–1.0008 ties
-and 0.023% memory epsilons now accept), **15%** for tail axes (clears ≤10.58%
-idle-box order-statistic noise), while the substantive c16 −0.8% still fails.
-`contract.acceptance={non_tail_band:0.005,tail_band:0.15}`; stability rules,
-correctness, one-lock, memory-return and thermal validation are unchanged.
-Next: the deciding fifth run from the pushed SHA, which must reach a verified
-terminal status before any axis binds.
+≤0.30% across the sealed roots). The fourth and fifth components then SEALED
+**`complete-failed`** — the first VALID terminal dispositions (stable, correct).
+The acceptance NOISE BAND landed at the fourth (`2dbe892`), accepting its c2
+0.9998–1.0008 ties and 0.023% PSS/RSS epsilons while one c16 packed −0.8%
+(1-of-4) stayed the open question. The fifth (`da05444`) reached **38/40** and
+REFUTED it: ZERO failing c16 axes, packed WON c16 throughput this run
+([804.58, 805.56, 806.79] vs [801.74, 805.21, 804.74]); the five-run c16 arm
+delta (−0.06/−0.13/−0.02/−0.83/+0.35%) is equivalence, so run 4's −0.8% is
+unreproduced cross-run drift. The remaining 2 failing axes are the c2 pooled
+**mean/median** TTFT (0.909/0.814) — a two-mode prefill-arrival-mixture artifact
+whose pooled aggregates flip ±9.10%/±18.65% run-to-run (the median exceeds even
+the 15% tail band). **Mode-conditional calibration has now LANDED test-first
+(this checkpoint):** the pooled mean/median become diagnostic-only and the gate
+compares fast/slow TTFT mode means separately (split 675 ms; bands 8.7%/3.14% =
+`max(2%, 2×` the ≤4.35%/1.57% within-run cross-arm deviation `)`; <3-sample modes
+skipped; pooled p90/p99 stay 15%-tail-gated at 1.54%/5.85% noise), and the
+sign-flipping GPU-memory axes are recalibrated (`peak_gpu_memory_mib` 3.37%,
+`peak_mem_available_drop_kib` 2%; PSS/RSS keep 0.5%) — all from the five sealed
+roots. With windowed-load default-ON, component peak PSS is **24.86 GB** (binding
+era 48.18; vLLM 28.5). `contract.acceptance={non_tail_band:0.005,tail_band:0.15,
+c2_ttft_mode_bands,memory_bands}`; stability, correctness, one-lock,
+memory-return and thermal validation are unchanged. Next: the orchestrator runs
+the sixth component from the pushed SHA under the mode-conditional gate, which
+must reach a verified terminal status before any axis binds.
 
 ## Binding 27B online gate
 

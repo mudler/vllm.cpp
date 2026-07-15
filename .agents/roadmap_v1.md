@@ -59,8 +59,7 @@ non-binding localhost A/B is NEUTRAL within noise at c1/c2, because µs loopback
 ACKs mean Nagle never held our ~100 ms-cadence token frames; the mirror stays
 for real-network parity but earns no gate-axis expectation, so the c2–c8
 decode-gap attribution concentrates on the nsys full-step diff and
-`ENG-ASYNC-SCHED` W3) and the **memory precheck →
-weight-streaming loader** track; (c) the
+`ENG-ASYNC-SCHED` W3) and the **memory track** (precheck DONE 2026-07-15: arena retention ruled out; the failing peak is load-time double-residency — steady RSS 24.75 GB already beats vLLM's 28.5 GB peak, so a windowed-load page-release fix is the first shot before the full streaming redesign); (c) the
 nsys full-step c2 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 before
 W3 is implemented; (d) FP4-producer/PDL/fused-norm-quant micro-levers are
 deprioritized — the recorded "fused RMSNorm→NVFP4" gap is **disproven** (vLLM's

@@ -9482,3 +9482,26 @@ appended, summary gains a DONE column) and `CLAIM-SERVE-TRANSPORT-1` leaves
 the live claim table. No benchmark ratio changes; binding stays **55/124**
 and `benchmark_binding=false`. The GDN slot-lifecycle repair remains the
 active first track.
+
+## 2026-07-15 — memory precheck: failing peak is LOAD-TIME double-residency; allocator ruled out
+
+A bounded read-only precheck ran on dgx under one lock
+(`~/work/vllm.cpp-memory-precheck-20260715`): the `ff915e8` production server
+loaded the 27B snapshot and idled (zero requests) while `/proc/<pid>/smaps_rollup`
+and `status` were captured. Measured: steady RSS **24,750,612 kB (24.75 GB)**
+with anonymous **24,575,824 kB** ≈ exactly the diagnosed 24,610,136,064 B
+(22.920 GiB) persistent weight mirror, file-backed PSS only **129,144 kB**, and
+shmem 43,200 kB — so glibc arena retention is bounded by ≈0.5 GB and allocator
+tweaks (malloc_trim/MALLOC_ARENA_MAX) are RULED OUT as a lever (the in-process
+gdb malloc_trim call was blocked by ptrace_scope, but the anonymous≈mirror
+identity already bounds the trimmable share). Decisive: **VmHWM 48,285,920 kB
+(48.29 GB) ≈ the binding grid's failing 48.17 GB peak**, reached before any
+request was served — the failing Peak PSS/RSS axes are produced at LOAD TIME by
+double-residency (mirror build overlapping full resident source mmap), not by
+serving. Steady RSS is already BELOW vLLM's binding 28.5 GB peak. Revised plan
+recorded on the scoreboard: first a windowed source-read + progressive
+`madvise(DONTNEED)` load path (small change; projected peak ≈ steady ≈ 25 GB
+would flip both memory axes), verified by a VmHWM A/B; the direct-to-device
+streaming redesign remains the deeper follow-up and stays desirable for 35B.
+Diagnostic only: no ratio, lifecycle, or binding change; binding stays
+**55/124**, `benchmark_binding=false`.

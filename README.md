@@ -46,7 +46,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `--diagnostic-c16` reproduction at `4a450f9` captured the c16 root cause deterministically **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`) — a runner GDN state-slot lifecycle defect under request churn (last step: 6 requests, 5 live + 27 free of 32 slots) | Trace the slot-lifecycle defect, fix test-first with CPU/CUDA gates, then rerun the full 12-leg component from a fresh SHA/root before qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| Host-memory parity | ❌ FAILED / diagnosed | Persistent host tensors account for **22.92 GiB**; source mmap pages overlap them during load | After the merged-projection component gates, stream weights into final device storage and re-run all memory axes |
+| Host-memory parity | ❌ FAILED / diagnosed | The failing **peak** (48.3 GB) is load-time double-residency: the 22.92 GiB host mirror is built while the full source mmap stays resident; steady RSS afterwards is 24.75 GB — already below vLLM's 28.5 GB peak. Allocator retention is ruled out (≤0.5 GB) | Windowed source reading + progressive page release during load first (VmHWM A/B); direct-to-device streaming remains the deeper fix |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so

@@ -9751,3 +9751,37 @@ third full 12-leg component from the pushed SHA; the `c172336`, `…-r2`,
 `d82d282` and diagnostic roots stay untouched. Binding stays **55/124**,
 `benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain blocked
 on a verified `complete-pass`.
+
+## 2026-07-15 — third component seal void on c2 mean TTFT; bimodal prefill phase lottery identified; scheduler grounding dispatched
+
+The third sealed 12-leg component (clean pushed `d19e091`, fresh root
+`~/work/vllm.cpp-gdn-packed-component/d19e0916ce343546461a487c73e70c16e515d6a7`,
+status artifact-set `754b807b…5b29`, manifest `efd0952a…c8beb`, summary
+`ef042a46…f2ac`) reached marker-last **`complete-void`** under the revised
+rule — this time on **non-tail** axes, correctly caught by the retained 4%
+rule: `component c2 repetitions are unstable: packed/mean_ttft_ms=0.067492,
+packed/median_ttft_ms=0.237356, rollback/mean_ttft_ms=0.168498,
+rollback/median_ttft_ms=0.171611`. Throughput/TPOT axes remained stable
+(≤0.45%/≤1.13%) in both arms at both concurrencies. A concurrent-host-work
+hypothesis was ruled out: the windowed-load root holds only `source/` (no
+build ran) and the box showed no other processes.
+
+Per-request forensics across all three sealed runs explain every TTFT-family
+void with one mechanism: at c2 the client-recorded per-request `ttfts` are
+BIMODAL — ≈0.45 s when a request's 1024-token prefill is scheduled
+immediately and ≈0.9 s when it queues behind another in-flight prefill. Most
+legs mix 3/3; run-3's worst leg was 6/6 slow
+(`[0.9,0.9,0.9,0.9,0.9,0.9]` vs the typical `[0.5,0.9,…]` alternation), so
+leg means/medians swing 7–24% while decode axes hold at ~0.2%. This is a
+scheduling PHASE LOTTERY, not run noise: no per-run tolerance can stabilize a
+flipping mixture. Two 1024-token prefills fit exactly inside
+`--max-num-batched-tokens 2048`, so a budget-filling scheduler (pinned vLLM's
+waiting loop) is expected to co-schedule them, producing uniform ≈0.9 s TTFT
+— consistent with vLLM's binding-era c2 mean TTFT ≈833 ms versus our 697 ms
+lottery mean: our recorded c2 TTFT "win" (1.196×) is suspected to be the
+serialize-half-the-time artifact of an unmet scheduler mirror obligation. A
+grounding investigation (both schedulers, file:line; test-first fix if the
+divergence is confirmed; explicit honest note that mirroring may LOSE the
+TTFT lottery win) was dispatched; the component pauses until its verdict —
+no fourth blind rerun. Binding stays **55/124**, `benchmark_binding=false`,
+no speed credit; qkvz/exact-grid/35B remain blocked on `complete-pass`.

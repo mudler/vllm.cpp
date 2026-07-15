@@ -103,20 +103,35 @@ or TTFT/ITL parity. `tools/bench/online_gate.py` now constructs the unmodified
 vLLM v0.25.0 oracle command audited against target `702f481`, freezes
 exact-token corpus views and rejects partial results while accepting pinned-
 vLLM's producer-ahead DELTA aggregation;
-`online_gate_summary.py` makes any missing/mismatched model, stream,
-memory-return, trace or every-axis artifact non-binding. It now accepts an
+`online_gate_summary.py` is the TIMED-GRID (`--execute`) summary: it makes any
+missing/mismatched model, stream, memory-return or every-axis artifact
+non-binding, requires the production profile-control-OFF build
+(`build_contract.profile_control` False), and **fails closed** on any H1d
+profile-control/paired-trace artifact found in a timed root — no build mixing.
+It now accepts an
 explicit single-model scope and writes immutable `summary-<model>/` evidence,
 so a completed failed 27B gate can bind and block 35B without manufacturing
 missing-35B voids; the no-argument `summary/` remains the final two-model gate. The
 failed pre-W2 campaigns remain diagnostics; partial rows are never reused as
 successful repetitions. W0 of `KV-PREFIX-CACHE` now supplies the pinned hybrid
-default-off policy and an explicit server override. The trace contract rejects
-cache-policy, admission, max-sequence, model-length, repeated-duration drift,
-and any newly recorded ours trace without explicit node-level CUDA-graph
-activity. `--trace-only` performs the model gate plus both profilers under one
-lock without creating or rerunning the performance grid. Legacy graph-level
-absence remains accepted only so the already-complete timing/memory evidence
-can be re-aggregated; it cannot satisfy attribution.
+default-off policy and an explicit server override. The trace contract — which
+rejects cache-policy, admission, max-sequence, model-length, repeated-duration
+drift, and any newly recorded ours trace without explicit node-level CUDA-graph
+activity, while accepting legacy graph-level absence for attribution-only
+re-aggregation — now lives solely in the `--trace-only` path
+(`online_gate.py`), not the timed-grid summary. `--execute` is a PURE timed
+production grid — the model gate, the interleaved ours/vLLM timed legs with
+memory/memory-return/thermal/cache-drop capture, and the summary — recorded
+entirely from the production profile-control-OFF build, running no H1d
+profile-control machinery. `--trace-only` (unchanged) performs the model gate
+plus both profilers under one lock against the instrumented profile-control-ON
+build, without creating or rerunning the grid. Three H1d-era pre-GPU blockers
+gated the authorized relaunch and were repaired test-first: the unconditional
+`--execute` hold; record-execution's hard-coded `--profile-control on` (made
+mode-conditional); and the `--execute` path itself still running the
+paired-trace legs — the production server refuses `--cuda-profile-graph-replays`,
+which killed the `e9fb522` attempt at its trailing trace leg after ~95 min of
+healthy timed legs; that root holds no binding data and is superseded.
 
 ## Port map
 
@@ -200,8 +215,8 @@ can be re-aggregated; it cannot satisfy attribution.
 ## Gates
 
 One `flock /tmp/gpu` per model holds its model gate, server start, readiness,
-warmup, all interleaved repetitions, shutdown, memory sampling, and paired
-traces. The c32 client point is backed by an explicit 32-sequence scheduler on
+warmup, all interleaved repetitions, shutdown, memory sampling, and — in
+`--trace-only` — the paired traces (the timed `--execute` grid runs no traces). The c32 client point is backed by an explicit 32-sequence scheduler on
 both arms rather than the local server's historical default of eight. Both
 servers explicitly disable prefix caching, and the paired trace uses closed-loop
 c16/48 or c2/6 admission, max-seqs 32, production max model length, and three
@@ -229,11 +244,12 @@ observed half-open `[start_time, start_time + ttft + sum(itls))` interval.
 Pinned vLLM's
 inclusive one-second `max_concurrent_requests` remains hashed diagnostic data
 but is not a saturation oracle because it can overcount sequential boundaries.
-The committed summary exits zero only when every detailed result,
+The committed timed-grid summary exits zero only when every detailed result,
 generated-text diagnostic pair/count, stream probe, process/GPU-memory sample,
-thermal snapshot, cache/memory-return record, clean-HEAD build provenance,
-exact pip-oracle runtime inventory, model gate and paired trace is present,
-hash-valid, and every axis passes. Exit 1 means complete evidence with an
+thermal snapshot, cache/memory-return record, clean-HEAD production
+(profile-control-OFF) build provenance, exact pip-oracle runtime inventory and
+model gate is present, hash-valid, carries no H1d profile-control/paired-trace
+artifact in the timed root, and every axis passes. Exit 1 means complete evidence with an
 every-axis failure; exit 2 means invalid/incomplete evidence or harness misuse.
 
 DGX does not delegate global `/proc/sys/vm/drop_caches` to the benchmark user.

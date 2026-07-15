@@ -10987,3 +10987,72 @@ first-launch pre-GPU refusals (the unconditional hold, the plan-first
 provisioning order, and this flag) are all recorded; no GPU work ran in the
 superseded 641f259 evidence root. The grid relaunches from this SHA via
 dry-run plan → byte-identical binding corpus copy → --execute.
+
+## 2026-07-15 — third H1d-era grid blocker repaired: `--execute` is now a PURE timed production grid (`CLAIM-SERVE-GATE-1`, worktree `.claude/worktrees/agent-addf40da18e56f4bb`)
+
+The relaunched grid at `e9fb522` ran **~95 minutes of healthy interleaved
+timed legs** and then DIED at a trailing leg that started OUR server with
+`--cuda-profile-graph-replays`: the production (`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`)
+build correctly refuses it (`server: fatal: --cuda-profile-graph-replays
+requires VLLM_CPP_BENCH_PROFILE_CONTROL=ON`), and the nsys output ("Processing
+events... No reports were generated") confirmed the `--execute` flow was still
+running the H1d profile/trace machinery. Root cause: the `--execute` path fell
+through to `run_paired_traces` after the timed grid — the paired-trace flow was
+built for the instrumented H1d campaign, exactly what the original hold message
+required be separated ("Complete H1d/G4, then use separate production and trace
+builds"). This is the THIRD H1d-era pre-GPU/early blocker after the
+unconditional hold (`641f259`) and the hard-coded `--profile-control on`
+(`e9fb522`).
+
+Rework (test-first): (1) DRIVER `scripts/dgx-online-serving.sh` — the
+`--execute` path no longer calls `run_paired_traces`; it is now
+model gate + interleaved timed legs (memory/memory-return/thermal/cache-drop
+capture) + summary ONLY, all from the production profile-control-OFF build.
+The execution manifest is now mode-conditional — `--execute` writes
+`execution/<model>.json` (the production manifest the summary reads),
+`--trace-only` writes `execution/<model>-trace.json` (the diagnostic manifest
+linked from its status). `--trace-only` KEEPS all its machinery unchanged
+(nsys wrapping, `--cuda-profile-graph-replays`, `record-profile-control`,
+`record-trace-status`), since it requires the instrumented build. (2) SUMMARY
+`tools/bench/online_gate_summary.py` — the timed-grid `_model_precondition_reasons`
+dropped the entire H1d paired-trace-status validation (was ~345 lines checking
+`profile_controls`, `ours_profile_control{suffix}`, nsys ranges, plan/trace
+contract) and now (a) keeps requiring `build_contract.profile_control` False
+and the production build contract, and (b) **fails closed** on any H1d
+profile-control artifact in the timed root — a new `_forbidden_profile_artifacts`
+rejects anything under `trace/<model>/` (`*profile-control*.json`,
+`status.json`, `*.nsys-rep`, `*.sqlite`) and the diagnostic
+`execution/<model>-trace.json` manifest (no build mixing). All
+timing/memory/interleaving/stability/axis validation is unchanged. No emitted
+artifact schema changed (record-execution still emits build-contract schema 2),
+so no schema bump was needed.
+
+TEST-FIRST RED→GREEN: (a) driver text
+`test_execute_path_is_a_pure_timed_grid_without_h1d_profile_machinery` observed
+RED (`run_paired_traces`/`nsys`/`--cuda-profile-graph-replays` present in the
+`--execute` tail; the production manifest name absent), GREEN after the driver
+edit. (b) A production-build timed root WITHOUT profile artifacts now validates
+(`test_complete_exact_outputs_and_better_axes_pass` and siblings observed RED
+against the old summary that demanded the trace status, GREEN after the summary
+rework — the fixture `_write_fixture` no longer builds any trace). (c) A root
+WITH a stray profile-control artifact (or `profile_control=true`, or the
+diagnostic `-trace.json` manifest) is REJECTED
+(`test_profile_control_artifacts_in_a_timed_root_are_rejected`; the fail-closed
+sub-case observed genuine RED against an intermediate stub before
+`_forbidden_profile_artifacts` was implemented). Existing H1d trace-contract
+tests were retired honestly: removed
+`test_legacy_graph_level_trace_cannot_bind_schema_v2`,
+`test_explicit_whole_graph_trace_cannot_pass_new_evidence`,
+`test_three_session_trace_requires_every_hashed_range_artifact`, and trimmed
+`test_missing_or_hash_drifted_execution_trace_cannot_pass` (which pinned trace
+artifacts) to `test_hash_drifted_execution_artifact_cannot_pass` (execution
+artifact hash drift only). All trace-only driver-text pins (`gdn_ba`/`gdn_packed`
+arms, nsys ancestry, profile-control lifecycle) are untouched and green.
+
+Gates: full tools suite **164/164** (baseline 165; −3 obsolete H1d trace tests
+and −1 consolidated subtest-set, +2 new = 164), `bash -n` + `shellcheck` clean,
+`py_compile` clean, `check-agent-record.py` + `check-doc-checkpoint.py` green.
+NO GPU work — the orchestrator relaunches the grid from the pushed SHA
+(dry-run plan → binding-corpus copy → `--execute`). Binding stays **55/124**,
+`benchmark_binding=false`. The `e9fb522` attempt produced NO binding data (died
+before any summary; the ~95 min of timed legs sit in a superseded root).

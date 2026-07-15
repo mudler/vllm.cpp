@@ -843,6 +843,56 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertIn('profile_control_flag=', script)
         self.assertIn('trace-only', script.split("profile_control_flag=", 1)[1].split("\n", 1)[0])
 
+    def test_execute_path_is_a_pure_timed_grid_without_h1d_profile_machinery(
+        self,
+    ) -> None:
+        """--execute runs the production timed grid only; no H1d profiling.
+
+        The instrumented paired trace (nsys wrapping,
+        ``--cuda-profile-graph-replays`` on the server, and
+        ``record-profile-control`` legs) requires the profile-control-ON
+        build and belongs solely to ``--trace-only``. It must not appear in the
+        ``--execute`` tail: the production (profile-control-OFF) server refuses
+        ``--cuda-profile-graph-replays`` ("requires
+        VLLM_CPP_BENCH_PROFILE_CONTROL=ON"), which is the third H1d-era blocker
+        that killed the relaunched grid at its trailing trace leg. ``--execute``
+        also records the production manifest ``execution/<model>.json`` (read by
+        the timed-grid summary), while the diagnostic ``<model>-trace.json``
+        manifest is recorded only by ``--trace-only``.
+        """
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        # The --execute tail begins after the trace-only dispatch returns via
+        # exit 0: it is the interleaved timed grid loop plus the summary.
+        execute_tail = script.split("for repetition in 1 2 3; do", 1)[1]
+        self.assertNotIn("run_paired_traces", execute_tail)
+        self.assertNotIn("--cuda-profile-graph-replays", execute_tail)
+        self.assertNotIn("nsys", execute_tail)
+        self.assertNotIn("record-profile-control", execute_tail)
+        self.assertNotIn("record-trace-status", execute_tail)
+        # The timed grid still interleaves ours/vLLM legs and summarizes.
+        self.assertIn("run_leg ours", execute_tail)
+        self.assertIn("run_leg vllm", execute_tail)
+        self.assertIn("online_gate_summary.py", execute_tail)
+        # --execute records the production manifest; the diagnostic
+        # -trace.json manifest belongs only to --trace-only.
+        self.assertIn(
+            'execution_manifest="${execution_dir}/${model}.json"', script
+        )
+        self.assertIn(
+            'execution_manifest="${execution_dir}/${model}-trace.json"', script
+        )
+        # The trace-only dispatch still runs the full paired-trace machinery.
+        trace_only_block = script.split(
+            "if [[ ${mode} == trace-only ]]; then", 1
+        )[1].split("for repetition in 1 2 3; do", 1)[0]
+        self.assertIn("run_paired_traces", trace_only_block)
+        self.assertIn("run_paired_traces() {", script)
+        self.assertIn("--cuda-profile-graph-replays", script)
+        self.assertIn("record-profile-control", script)
+
     def test_execute_grid_is_unheld_after_w1d3_closure_authorization(self) -> None:
         """The H1d-era unconditional --execute hold must be lifted.
 

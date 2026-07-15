@@ -8,6 +8,11 @@ complete grid, retains cross-engine output differences as diagnostics,
 aggregates repeated runs, and applies the repository's direction-aware
 every-axis rule. Correctness is a separate commit-bound model gate because
 production FP4 accumulation variants may select different greedy near-ties.
+
+This is the TIMED-GRID (``--execute``) summary: it binds only production
+(profile-control-OFF) evidence and fails closed on any H1d paired-trace
+capture in the root (no build mixing). The instrumented paired trace has its
+own ``--trace-only`` contract in ``online_gate.py`` and is not summarized here.
 """
 
 from __future__ import annotations
@@ -26,36 +31,16 @@ from tools.bench.online_gate import (
     CACHE_DROP_METHOD,
     ENGINES,
     FLASHINFER_VERSION,
-    INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
-    MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
-    NSYS_CAPTURE_RANGE,
-    NSYS_CAPTURE_RANGE_END,
-    NSYS_CUDA_FLUSH_INTERVAL_MS,
-    NSYS_CUDA_GRAPH_TRACE,
-    NSYS_PRODUCT_VERSION,
-    OUTPUT_LEN,
     PANDAS_VERSION,
     POINTS,
     REPETITIONS,
-    TRACE_CONCURRENCY,
-    TRACE_CAPTURE_GRAPH_REPLAYS,
-    TRACE_PROMPTS,
-    TRACE_RANGE_REPORTS,
-    TRACE_REPETITIONS,
-    TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
     precise_max_concurrent_requests,
-    summarize_nsys_kernels,
-    validate_nsys_trace,
     validate_raw_result,
     _fingerprint_tree,
-    _parse_fp4_plan_log,
-    _parse_profile_markers,
-    _summarize_torch_trace,
-    _validated_trace_execution,
 )
 from tools.bench.serve_low_common import (
     HarnessError,
@@ -332,6 +317,60 @@ def _verify_cache_drop_artifact(
             raise HarnessError(f"{field} {metadata_field} differs from its report")
 
 
+def _forbidden_profile_artifacts(
+    evidence_root: pathlib.Path, model: str
+) -> list[str]:
+    """Fail closed on any H1d profile-control capture in a timed grid root.
+
+    ``--execute`` is a pure timed production grid recorded from the
+    profile-control-OFF build; the instrumented paired-trace machinery
+    (nsys capture, ``--cuda-profile-graph-replays``, ``record-profile-control``)
+    runs only under ``--trace-only`` against the profile-control-ON build. Its
+    outputs — anything under ``trace/<model>/`` and the diagnostic
+    ``execution/<model>-trace.json`` manifest — must be absent from a timed
+    evidence root. Their PRESENCE means an instrumented leg contaminated
+    binding timing evidence, so we reject rather than silently mix builds. The
+    matching ``profile_control is not False`` build-contract check owns the
+    manifest itself.
+    """
+    reasons: list[str] = []
+    trace_root = evidence_root / "trace" / model
+    if trace_root.exists():
+        captures = sorted(
+            {
+                path
+                for pattern in (
+                    "*profile-control*.json",
+                    "*profile_control*.json",
+                    "status.json",
+                    "status-c2.json",
+                    "*.nsys-rep",
+                    "*.sqlite",
+                )
+                for path in trace_root.rglob(pattern)
+            }
+        )
+        if captures:
+            reasons.extend(
+                "timed grid root contains an H1d profile-control artifact "
+                f"(no mixing): {path.relative_to(evidence_root)}"
+                for path in captures
+            )
+        else:
+            reasons.append(
+                "timed grid root contains an unexpected paired-trace directory "
+                f"(no mixing): {trace_root.relative_to(evidence_root)}"
+            )
+    diagnostic_manifest = evidence_root / "execution" / f"{model}-trace.json"
+    if diagnostic_manifest.exists():
+        reasons.append(
+            "timed grid root contains the diagnostic profile-control-ON "
+            "execution manifest (no mixing): "
+            f"{diagnostic_manifest.relative_to(evidence_root)}"
+        )
+    return reasons
+
+
 def _model_precondition_reasons(
     evidence_root: pathlib.Path,
     model: str,
@@ -429,12 +468,15 @@ def _model_precondition_reasons(
                 reasons.append("execution cache-drop root inventory differs")
             build_contract = execution.get("build_contract")
             if not isinstance(build_contract, dict):
-                reasons.append("execution H1d build contract is absent")
+                reasons.append("execution build contract is absent")
             else:
                 if build_contract.get("profile_control") is not False:
-                    reasons.append("binding timing build contains trace profile control")
+                    reasons.append(
+                        "binding timing build is not the production "
+                        "profile-control-OFF build"
+                    )
                 if build_contract.get("sm_architecture") != "121a":
-                    reasons.append("execution CUDA architecture differs from H1d")
+                    reasons.append("execution CUDA architecture differs from the gate")
                 build_schema = build_contract.get("schema_version")
                 if build_schema is None:
                     # Accepted pre-H1d production evidence predates the exact
@@ -497,351 +539,7 @@ def _model_precondition_reasons(
     except HarnessError as error:
         reasons.append(str(error))
 
-    trace_path = evidence_root / "trace" / model / "status.json"
-    try:
-        status = _load_json(trace_path)
-        if status.get("passed") is not True:
-            reasons.append("paired trace status is not passed")
-        if status.get("model_key") != model:
-            reasons.append("paired trace model key differs")
-        if status.get("vllm_cpp_sha") != vllm_cpp_sha:
-            reasons.append("paired trace vllm.cpp SHA differs from the campaign")
-        if status.get("ours_profiler") != "nsys":
-            reasons.append("ours trace is not an nsys capture")
-        if status.get("vllm_profiler") != "torch-profiler":
-            reasons.append("vLLM trace is not the required torch-profiler fallback")
-        if status.get("schema_version") != TRACE_STATUS_SCHEMA_VERSION:
-            reasons.append(
-                f"paired trace schema is not binding H1d schema "
-                f"v{TRACE_STATUS_SCHEMA_VERSION}"
-            )
-        trace_contract = status.get("trace_contract")
-        expected_trace_contract = {
-            "admission_mode": "closed-loop",
-            "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
-            "capture_range": NSYS_CAPTURE_RANGE,
-            "capture_range_end": NSYS_CAPTURE_RANGE_END,
-            "concurrency": TRACE_CONCURRENCY,
-            "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
-            "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
-            "cuda_event_trace": False,
-            "enable_prefix_caching": False,
-            "force_overwrite": True,
-            "flush_on_cudaprofilerstop": True,
-            "input_len": INPUT_LEN,
-            "max_model_len": MAX_MODEL_LEN[model],
-            "max_num_seqs": MAX_NUM_SEQS,
-            "nsys_captures": TRACE_REPETITIONS,
-            "nsys_kill": "none",
-            "nsys_stats": False,
-            "num_prompts": TRACE_PROMPTS,
-            "output_len": OUTPUT_LEN,
-            "probe_num_prompts": TRACE_CONCURRENCY,
-            "probe_num_warmups": 0,
-            "probe_timing_binding": False,
-            "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
-            "semantic_num_warmups": TRACE_CONCURRENCY,
-            "repetitions": TRACE_REPETITIONS,
-            "sample": "none",
-            "cpu_context_switch_trace": "none",
-            "total_range_reports": TRACE_RANGE_REPORTS,
-        }
-        if trace_contract != expected_trace_contract:
-            reasons.append("paired trace token/concurrency contract differs")
-        nsys_captures = TRACE_REPETITIONS if trace_contract == expected_trace_contract else None
-        artifacts = status.get("artifacts")
-        if not isinstance(artifacts, dict):
-            reasons.append("paired trace artifact map is absent")
-        else:
-            required_fields = (
-                "cache_drop_1",
-                "cache_drop_2",
-                "cache_drop_3",
-                "execution_manifest",
-                "ours_client_result_1",
-                "ours_client_result_2",
-                "ours_client_result_3",
-                "ours_client_log_1",
-                "ours_client_log_2",
-                "ours_client_log_3",
-                "ours_probe_result_1",
-                "ours_probe_result_2",
-                "ours_probe_result_3",
-                "ours_probe_log_1",
-                "ours_probe_log_2",
-                "ours_probe_log_3",
-                "vllm_command",
-                "vllm_profile_log",
-                "vllm_metadata",
-                "vllm_corpus",
-                "vllm_torch_trace",
-                "vllm_kernel_summary",
-            ) + tuple(
-                stem if index == 1 else f"{stem}_{index}"
-                for stem in (
-                    "ours_command",
-                    "ours_profile_log",
-                    "ours_profile_control",
-                )
-                for index in range(1, TRACE_REPETITIONS + 1)
-            ) + tuple(
-                stem if index == 1 else f"{stem}_{index}"
-                for stem in (
-                    "ours_nsys_report",
-                    "ours_nsys_sqlite",
-                    "ours_nsys_validation",
-                    "ours_kernel_summary",
-                )
-                for index in range(1, TRACE_RANGE_REPORTS + 1)
-            )
-            for field in required_fields:
-                artifact = artifacts.get(field)
-                if not isinstance(artifact, dict):
-                    reasons.append(f"paired trace artifact {field} is absent")
-                    continue
-                try:
-                    if field.startswith("cache_drop_"):
-                        _verify_cache_drop_artifact(
-                            artifact,
-                            evidence_root,
-                            field,
-                            expected_roots=expected_cache_roots,
-                        )
-                    else:
-                        _verify_hashed_artifact(artifact, evidence_root, field)
-                except HarnessError as error:
-                    reasons.append(str(error))
-            execution_artifact = artifacts.get("execution_manifest")
-            if isinstance(execution_artifact, dict):
-                try:
-                    linked_execution = _artifact_path(
-                        execution_artifact.get("path"),
-                        evidence_root,
-                        "execution_manifest",
-                    )
-                    expected_trace_execution = (
-                        evidence_root / "execution" / f"{model}-trace.json"
-                    )
-                    if linked_execution.resolve() != expected_trace_execution.resolve():
-                        reasons.append(
-                            "paired trace execution manifest is not the diagnostic build"
-                        )
-                    else:
-                        _validated_trace_execution(
-                            linked_execution,
-                            model_key=model,
-                            vllm_cpp_sha=vllm_cpp_sha,
-                        )
-                except HarnessError as error:
-                    reasons.append(str(error))
-            if nsys_captures == TRACE_REPETITIONS:
-                validations = status.get("nsys_validations")
-                summaries = status.get("nsys_kernel_summaries")
-                plans = status.get("plan_validations")
-                controls = status.get("profile_controls")
-                if (
-                    not isinstance(validations, list)
-                    or len(validations) != TRACE_RANGE_REPORTS
-                    or not isinstance(summaries, list)
-                    or len(summaries) != TRACE_RANGE_REPORTS
-                    or not isinstance(plans, list)
-                    or len(plans) != TRACE_REPETITIONS
-                    or not isinstance(controls, list)
-                    or len(controls) != TRACE_REPETITIONS
-                ):
-                    reasons.append("paired trace H1d semantic validation arrays differ")
-                else:
-                    range_report_session_uuids = []
-                    for index, validation in enumerate(validations, start=1):
-                        suffix = "" if index == 1 else f"_{index}"
-                        range_index = (
-                            (index - 1) % TRACE_CAPTURE_GRAPH_REPLAYS + 1
-                        )
-                        try:
-                            report_artifact = artifacts[f"ours_nsys_report{suffix}"]
-                            sqlite_artifact = artifacts[f"ours_nsys_sqlite{suffix}"]
-                            validation_artifact = artifacts[
-                                f"ours_nsys_validation{suffix}"
-                            ]
-                            summary_artifact = artifacts[
-                                f"ours_kernel_summary{suffix}"
-                            ]
-                            sqlite_path = _artifact_path(
-                                sqlite_artifact.get("path"),
-                                evidence_root,
-                                f"ours_nsys_sqlite{suffix}",
-                            )
-                            report_path = _artifact_path(
-                                report_artifact.get("path"),
-                                evidence_root,
-                                f"ours_nsys_report{suffix}",
-                            )
-                            validation_path = _artifact_path(
-                                validation_artifact.get("path"),
-                                evidence_root,
-                                f"ours_nsys_validation{suffix}",
-                            )
-                            summary_path = _artifact_path(
-                                summary_artifact.get("path"),
-                                evidence_root,
-                                f"ours_kernel_summary{suffix}",
-                            )
-                            actual = validate_nsys_trace(
-                                sqlite_path,
-                                model_key=model,
-                                range_index=range_index,
-                            )
-                            if pathlib.Path(
-                                actual["nsys_report_path"]
-                            ).resolve() != report_path.resolve():
-                                raise HarnessError(
-                                    "paired trace SQLite source report differs from "
-                                    f"range report {index}"
-                                )
-                            if validation != actual or _load_json(
-                                validation_path
-                            ) != actual:
-                                raise HarnessError(
-                                    "paired trace Nsight validation differs from "
-                                    f"range report {index}"
-                                )
-                            actual_summary = summarize_nsys_kernels(
-                                sqlite_path,
-                                model_key=model,
-                                range_index=range_index,
-                            )
-                            if summaries[index - 1] != actual_summary or _load_json(
-                                summary_path
-                            ) != actual_summary:
-                                raise HarnessError(
-                                    "paired trace kernel summary differs from "
-                                    f"range report {index}"
-                                )
-                            range_report_session_uuids.append(
-                                actual["capture_session_uuid"]
-                            )
-                        except (HarnessError, KeyError, TypeError) as error:
-                            reasons.append(str(error))
-                    signature_hashes = [
-                        validation.get("canonical_node_multiset_sha256")
-                        if isinstance(validation, dict)
-                        else None
-                        for validation in validations
-                    ]
-                    if (
-                        any(not isinstance(value, str) for value in signature_hashes)
-                        or len(set(signature_hashes)) != 1
-                        or status.get("node_multiset_sha256") != signature_hashes[0]
-                    ):
-                        reasons.append("paired trace node multiset differs across ranges")
-                    session_uuid_groups = [
-                        range_report_session_uuids[
-                            start : start + TRACE_CAPTURE_GRAPH_REPLAYS
-                        ]
-                        for start in range(
-                            0, TRACE_RANGE_REPORTS, TRACE_CAPTURE_GRAPH_REPLAYS
-                        )
-                    ]
-                    valid_session_identity = (
-                        len(range_report_session_uuids) == TRACE_RANGE_REPORTS
-                        and len(session_uuid_groups) == TRACE_REPETITIONS
-                        and all(
-                            len(group) == TRACE_CAPTURE_GRAPH_REPLAYS
-                            and len(set(group)) == 1
-                            for group in session_uuid_groups
-                        )
-                    )
-                    capture_session_uuids = (
-                        [group[0] for group in session_uuid_groups]
-                        if valid_session_identity
-                        else []
-                    )
-                    if (
-                        not valid_session_identity
-                        or len(set(capture_session_uuids)) != TRACE_REPETITIONS
-                        or status.get("nsys_capture_session_uuids")
-                        != capture_session_uuids
-                        or status.get("nsys_range_report_session_uuids")
-                        != range_report_session_uuids
-                        or status.get("nsys_product_version") != NSYS_PRODUCT_VERSION
-                    ):
-                        reasons.append(
-                            "paired trace Nsight version/session identity differs"
-                        )
-                    for session_index in range(1, TRACE_REPETITIONS + 1):
-                        suffix = "" if session_index == 1 else f"_{session_index}"
-                        try:
-                            log_artifact = artifacts[f"ours_profile_log{suffix}"]
-                            control_artifact = artifacts[
-                                f"ours_profile_control{suffix}"
-                            ]
-                            log_path = _artifact_path(
-                                log_artifact.get("path"),
-                                evidence_root,
-                                f"ours_profile_log{suffix}",
-                            )
-                            control_path = _artifact_path(
-                                control_artifact.get("path"),
-                                evidence_root,
-                                f"ours_profile_control{suffix}",
-                            )
-                            actual_plan = _parse_fp4_plan_log(log_path)
-                            if plans[session_index - 1] != actual_plan:
-                                raise HarnessError(
-                                    "paired trace plan semantics differ for session "
-                                    f"{session_index}"
-                                )
-                            markers = _parse_profile_markers(log_path)
-                            control = _load_json(control_path)
-                            if controls[session_index - 1] != control or any(
-                                control.get(field) != value
-                                for field, value in markers.items()
-                            ):
-                                raise HarnessError(
-                                    "paired trace control differs for session "
-                                    f"{session_index}"
-                                )
-                            if control.get("nsys_exit_status") != 0:
-                                raise HarnessError(
-                                    "paired trace Nsight exit status differs for session "
-                                    f"{session_index}"
-                                )
-                        except (HarnessError, KeyError, TypeError) as error:
-                            reasons.append(str(error))
-                try:
-                    vllm_trace_path = _artifact_path(
-                        artifacts["vllm_torch_trace"].get("path"),
-                        evidence_root,
-                        "vllm_torch_trace",
-                    )
-                    vllm_summary_path = _artifact_path(
-                        artifacts["vllm_kernel_summary"].get("path"),
-                        evidence_root,
-                        "vllm_kernel_summary",
-                    )
-                    recomputed = _summarize_torch_trace(
-                        vllm_trace_path, model_key=model
-                    )
-                    recorded = _load_json(vllm_summary_path)
-                    for field, expected in recomputed.items():
-                        actual = recorded.get(field)
-                        if field == "selected_trace":
-                            if (
-                                not isinstance(actual, str)
-                                or pathlib.Path(actual).resolve()
-                                != pathlib.Path(expected).resolve()
-                            ):
-                                raise HarnessError(
-                                    "vLLM selected trace path differs from summary"
-                                )
-                        elif actual != expected:
-                            raise HarnessError(
-                                f"vLLM kernel summary field {field} differs"
-                            )
-                except (HarnessError, KeyError, TypeError) as error:
-                    reasons.append(str(error))
-    except HarnessError as error:
-        reasons.append(str(error))
+    reasons.extend(_forbidden_profile_artifacts(evidence_root, model))
     return reasons
 
 

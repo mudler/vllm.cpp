@@ -8,13 +8,10 @@ acceptance rules from ``.agents/benchmark-protocol.md``.
 
 from __future__ import annotations
 
-import gzip
 import json
 import pathlib
-import sqlite3
 import tempfile
 import unittest
-import uuid
 from unittest import mock
 
 from tools.bench.online_gate import (
@@ -22,39 +19,16 @@ from tools.bench.online_gate import (
     FLASHINFER_VERSION,
     INPUT_LEN,
     MAX_NUM_BATCHED_TOKENS,
-    MAX_MODEL_LEN,
     MAX_NUM_SEQS,
     MODEL_REVISIONS,
-    NSYS_CUDA_FLUSH_INTERVAL_MS,
-    NSYS_CAPTURE_RANGE,
-    NSYS_CAPTURE_RANGE_END,
-    NSYS_CUDA_GRAPH_TRACE,
-    NSYS_PRODUCT_VERSION,
     OUTPUT_LEN,
     PANDAS_VERSION,
-    TRACE_CONCURRENCY,
-    TRACE_CAPTURE_GRAPH_REPLAYS,
-    TRACE_PRIMARY_GRAPH_CONTRACTS,
-    TRACE_PROMPTS,
-    TRACE_RANGE_REPORTS,
-    TRACE_REPETITIONS,
-    TRACE_STATUS_SCHEMA_VERSION,
     VLLM_ORACLE_VERSION,
     VLLM_GENERATION_WINDOW_CONTRACTS,
-    validate_nsys_trace,
-    record_profile_control,
-    summarize_nsys_kernels,
     _fingerprint_tree,
-    _parse_fp4_plan_log,
-    _summarize_torch_trace,
 )
 from tools.bench.online_gate_summary import summarize_evidence
 from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
-from tests.tools.test_online_gate_client import (
-    write_nsys_sqlite,
-    write_profile_log,
-    write_vllm_decode_trace,
-)
 
 
 def _record(*, faster: bool, repetition: int) -> dict:
@@ -119,20 +93,18 @@ def _write_cache_drop(path: pathlib.Path, roots: list[str]) -> dict:
     }
 
 
-def _write_model_nsys_sqlite(
-    path: pathlib.Path,
-    *,
-    capture_uuid: str,
-    range_index: int,
-    report_path: pathlib.Path,
-) -> None:
-    write_nsys_sqlite(
-        path,
-        capture_uuid=capture_uuid,
-        model_contract=True,
-        range_index=range_index,
-        report_path=report_path,
-    )
+def _write_forbidden_trace_artifact(root: pathlib.Path, model: str = "27") -> pathlib.Path:
+    """Drop a single H1d profile-control capture into a timed evidence root.
+
+    A pure timed production grid never runs the paired-trace machinery, so any
+    profile-control artifact under ``trace/<model>/`` proves an instrumented
+    (profile-control-ON) leg contaminated binding timing evidence. The summary
+    must fail closed on its mere presence (no mixing)."""
+    trace_root = root / "trace" / model
+    trace_root.mkdir(parents=True, exist_ok=True)
+    artifact = trace_root / "ours_profile_control.json"
+    artifact.write_text(json.dumps({"stopped": True}), encoding="utf-8")
+    return artifact
 
 
 def _write_fixture(root: pathlib.Path) -> None:
@@ -245,24 +217,12 @@ def _write_fixture(root: pathlib.Path) -> None:
         "snapshot_files": [],
         "weight_files": [weight_name],
     }
+    # A pure timed production grid records ONLY the production manifest
+    # (execution/27.json, profile_control False). The diagnostic
+    # execution/27-trace.json manifest and the paired trace/ capture belong to
+    # --trace-only and must be absent here; their presence is a mixing error.
     (execution_root / "27.json").write_text(
         json.dumps(production_execution),
-        encoding="utf-8",
-    )
-    trace_execution = json.loads(json.dumps(production_execution))
-    trace_execution["build_contract"]["profile_control"] = True
-    trace_execution["build_contract"]["target_compile_definitions"] = [
-        "VLLM_CPP_FLASH_ATTN",
-        "VLLM_CPP_TRITON=1",
-        "VLLM_CPP_TRITON_CHUNKO_BF16=1",
-        "VT_BENCH_PROFILE_CONTROL=1",
-        "VT_CUTLASS_NVFP4=1",
-    ]
-    trace_execution_path = execution_root / "27-trace.json"
-    trace_execution_path.write_text(
-        json.dumps(
-            trace_execution
-        ),
         encoding="utf-8",
     )
     model_gate = root / "preflight" / "model-gate"
@@ -282,198 +242,6 @@ def _write_fixture(root: pathlib.Path) -> None:
         ),
         encoding="utf-8",
     )
-    trace_root = root / "trace" / "27"
-    trace_root.mkdir(parents=True)
-    trace_files = {}
-    fixture = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "tests/fixtures/nvfp4_flashinfer_v025_gb10/autotune_configs.json"
-    )
-    validations = []
-    summaries = []
-    plans = []
-    controls = []
-    session_uuids = []
-    for session_index in range(1, TRACE_REPETITIONS + 1):
-        session_suffix = "" if session_index == 1 else f"_{session_index}"
-        session_uuid = str(uuid.uuid4())
-        session_uuids.append(session_uuid)
-        native = trace_root / f"native-{session_index}-must-not-exist.json"
-        profile_log = trace_root / f"ours_profile_log{session_suffix}.log"
-        write_profile_log(
-            profile_log,
-            fixture=fixture,
-            native_target=native,
-            server_pid=6000 + session_index,
-        )
-        control_path = trace_root / f"ours_profile_control{session_suffix}.json"
-        control = record_profile_control(
-            control_path,
-            profile_log=profile_log,
-            nsys_pid=5000 + session_index,
-            nsys_pgid=5000 + session_index,
-            nsys_sid=5000 + session_index,
-            nsys_exit_status=0,
-            launcher_pid=5500 + session_index,
-            launcher_ppid=5000 + session_index,
-            launcher_pgid=5000 + session_index,
-            launcher_sid=5000 + session_index,
-            launcher_comm="nsys-launcher",
-            server_pid=6000 + session_index,
-            server_ppid=5500 + session_index,
-            server_pgid=6000 + session_index,
-            server_sid=6000 + session_index,
-            shutdown_fifo=trace_root / f"ours-r{session_index}-shutdown.fifo",
-        )
-        for name, path in (
-            (f"ours_profile_log{session_suffix}", profile_log),
-            (f"ours_profile_control{session_suffix}", control_path),
-        ):
-            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
-        command_name = f"ours_command{session_suffix}"
-        command_path = trace_root / f"{command_name}.txt"
-        command_path.write_text(f"{command_name}\n", encoding="utf-8")
-        trace_files[command_name] = {
-            "path": str(command_path),
-            "sha256": sha256_file(command_path),
-        }
-        for stem in (
-            "ours_client_result",
-            "ours_client_log",
-            "ours_probe_result",
-            "ours_probe_log",
-        ):
-            name = f"{stem}_{session_index}"
-            path = trace_root / f"{name}.txt"
-            path.write_text(f"{name}\n", encoding="utf-8")
-            trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
-        plans.append(_parse_fp4_plan_log(profile_log))
-        controls.append(control)
-        for range_index in range(1, TRACE_CAPTURE_GRAPH_REPLAYS + 1):
-            artifact_index = (
-                (session_index - 1) * TRACE_CAPTURE_GRAPH_REPLAYS + range_index
-            )
-            suffix = "" if artifact_index == 1 else f"_{artifact_index}"
-            report_name = f"ours_nsys_report{suffix}"
-            report_path = trace_root / f"{report_name}.txt"
-            report_path.write_text(f"{report_name}\n", encoding="utf-8")
-            sqlite_path = trace_root / f"ours_nsys_sqlite{suffix}.sqlite"
-            _write_model_nsys_sqlite(
-                sqlite_path,
-                capture_uuid=session_uuid,
-                range_index=range_index,
-                report_path=report_path,
-            )
-            validation = validate_nsys_trace(
-                sqlite_path, model_key="27", range_index=range_index
-            )
-            validation_path = trace_root / f"ours_nsys_validation{suffix}.json"
-            validation_path.write_text(json.dumps(validation), encoding="utf-8")
-            summary = summarize_nsys_kernels(
-                sqlite_path,
-                model_key="27",
-                range_index=range_index,
-            )
-            summary_path = trace_root / f"ours_kernel_summary{suffix}.json"
-            summary_path.write_text(json.dumps(summary), encoding="utf-8")
-            for name, path in (
-                (f"ours_nsys_sqlite{suffix}", sqlite_path),
-                (f"ours_nsys_validation{suffix}", validation_path),
-                (f"ours_kernel_summary{suffix}", summary_path),
-                (report_name, report_path),
-            ):
-                trace_files[name] = {
-                    "path": str(path),
-                    "sha256": sha256_file(path),
-                }
-            validations.append(validation)
-            summaries.append(summary)
-    for name in ("vllm_command", "vllm_profile_log", "vllm_metadata", "vllm_corpus"):
-        path = trace_root / f"{name}.txt"
-        path.write_text(f"{name}\n", encoding="utf-8")
-        trace_files[name] = {"path": str(path), "sha256": sha256_file(path)}
-    vllm_trace = trace_root / "vllm-trace.json.gz"
-    write_vllm_decode_trace(vllm_trace)
-    vllm_summary = trace_root / "vllm-kernel-summary.json"
-    vllm_summary.write_text(
-        json.dumps(_summarize_torch_trace(vllm_trace, model_key="27")),
-        encoding="utf-8",
-    )
-    trace_files["vllm_torch_trace"] = {
-        "path": str(vllm_trace),
-        "sha256": sha256_file(vllm_trace),
-    }
-    trace_files["vllm_kernel_summary"] = {
-        "path": str(vllm_summary),
-        "sha256": sha256_file(vllm_summary),
-    }
-    trace_files["execution_manifest"] = {
-        "path": str(trace_execution_path),
-        "sha256": sha256_file(trace_execution_path),
-    }
-    for index in range(1, 4):
-        trace_files[f"cache_drop_{index}"] = _write_cache_drop(
-            trace_root / f"cache-drop-{index}.json",
-            _fixture_cache_roots(root),
-        )
-    (trace_root / "status.json").write_text(
-        json.dumps(
-            {
-                "artifacts": trace_files,
-                "model_key": "27",
-                "node_multiset_sha256": validations[0][
-                    "canonical_node_multiset_sha256"
-                ],
-                "nsys_capture_session_uuids": session_uuids,
-                "nsys_kernel_summaries": summaries,
-                "nsys_product_version": NSYS_PRODUCT_VERSION,
-                "nsys_range_report_session_uuids": [
-                    validation["capture_session_uuid"]
-                    for validation in validations
-                ],
-                "nsys_validations": validations,
-                "ours_profiler": "nsys",
-                "passed": True,
-                "plan_validations": plans,
-                "profile_controls": controls,
-                "schema_version": TRACE_STATUS_SCHEMA_VERSION,
-                "trace_contract": {
-                    "admission_mode": "closed-loop",
-                    "capture_graph_replays": TRACE_CAPTURE_GRAPH_REPLAYS,
-                    "capture_range": NSYS_CAPTURE_RANGE,
-                    "capture_range_end": NSYS_CAPTURE_RANGE_END,
-                    "concurrency": TRACE_CONCURRENCY,
-                    "cuda_flush_interval_ms": NSYS_CUDA_FLUSH_INTERVAL_MS,
-                    "cuda_graph_trace": NSYS_CUDA_GRAPH_TRACE,
-                    "cuda_event_trace": False,
-                    "enable_prefix_caching": False,
-                    "force_overwrite": True,
-                    "flush_on_cudaprofilerstop": True,
-                    "input_len": INPUT_LEN,
-                    "max_model_len": MAX_MODEL_LEN["27"],
-                    "max_num_seqs": MAX_NUM_SEQS,
-                    "nsys_captures": TRACE_REPETITIONS,
-                    "nsys_kill": "none",
-                    "nsys_stats": False,
-                    "num_prompts": TRACE_PROMPTS,
-                    "output_len": OUTPUT_LEN,
-                    "probe_num_prompts": TRACE_CONCURRENCY,
-                    "probe_num_warmups": 0,
-                    "probe_timing_binding": False,
-                    "ranges_per_nsys_capture": TRACE_CAPTURE_GRAPH_REPLAYS,
-                    "semantic_num_warmups": TRACE_CONCURRENCY,
-                    "repetitions": TRACE_REPETITIONS,
-                    "sample": "none",
-                    "cpu_context_switch_trace": "none",
-                    "total_range_reports": TRACE_RANGE_REPORTS,
-                },
-                "vllm_cpp_sha": sha,
-                "vllm_profiler": "torch-profiler",
-            }
-        ),
-        encoding="utf-8",
-    )
-
     corpus_root = root / "corpus" / "27"
     corpus_view = corpus_root / "vllm"
     corpus_view.mkdir(parents=True)
@@ -678,25 +446,52 @@ class OnlineGateSummaryTests(unittest.TestCase):
                 any("35" in reason for reason in runs["campaign_reasons"])
             )
 
-    def test_legacy_graph_level_trace_cannot_bind_schema_v2(self) -> None:
+    def test_profile_control_artifacts_in_a_timed_root_are_rejected(self) -> None:
+        """The timed grid is a pure production build; no H1d trace mixing.
+
+        A production (profile-control-OFF) evidence root that also carries the
+        paired-trace machinery's output — a profile-control capture under
+        ``trace/<model>/``, the diagnostic profile-control-ON execution
+        manifest ``execution/<model>-trace.json``, or a ``build_contract`` whose
+        ``profile_control`` is not ``False`` — proves an instrumented leg
+        contaminated binding timing evidence. The summary fails closed on each.
+        """
+        # Baseline: the production fixture carries no trace artifacts and binds.
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
-            path = root / "trace" / "27" / "status.json"
-            status = json.loads(path.read_text(encoding="utf-8"))
-            status["trace_contract"].pop("cuda_graph_trace")
-            path.write_text(json.dumps(status), encoding="utf-8")
+            self.assertFalse((root / "trace").exists())
+            self.assertFalse((root / "execution" / "27-trace.json").exists())
+            runs, _ = self._summarize_model(root)
+            self.assertTrue(runs["gate_pass"])
+
+        # A stray profile-control capture under trace/<model>/ is a mixing error.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _write_forbidden_trace_artifact(root)
             runs, _ = self._summarize_model(root)
             self.assertFalse(runs["gate_pass"])
 
-    def test_explicit_whole_graph_trace_cannot_pass_new_evidence(self) -> None:
+        # The diagnostic profile-control-ON execution manifest must not coexist.
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
-            path = root / "trace" / "27" / "status.json"
-            status = json.loads(path.read_text(encoding="utf-8"))
-            status["trace_contract"]["cuda_graph_trace"] = "graph"
-            path.write_text(json.dumps(status), encoding="utf-8")
+            (root / "execution" / "27-trace.json").write_text(
+                json.dumps({"build_contract": {"profile_control": True}}),
+                encoding="utf-8",
+            )
+            runs, _ = self._summarize_model(root)
+            self.assertFalse(runs["gate_pass"])
+
+        # profile_control=true in the production manifest is refused directly.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            path = root / "execution" / "27.json"
+            execution = json.loads(path.read_text(encoding="utf-8"))
+            execution["build_contract"]["profile_control"] = True
+            path.write_text(json.dumps(execution), encoding="utf-8")
             runs, _ = self._summarize_model(root)
             self.assertFalse(runs["gate_pass"])
 
@@ -770,43 +565,13 @@ class OnlineGateSummaryTests(unittest.TestCase):
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
 
-    def test_missing_or_hash_drifted_execution_trace_cannot_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            _write_fixture(root)
-            (root / "trace" / "27" / "status.json").unlink()
-            runs, _ = self._summarize(root)
-            self.assertFalse(runs["gate_pass"])
-
+    def test_hash_drifted_execution_artifact_cannot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             _write_fixture(root)
             (root / "fixture-artifacts" / "oracle-bench_serve").write_text(
                 "tampered\n", encoding="utf-8"
             )
-            runs, _ = self._summarize(root)
-            self.assertFalse(runs["gate_pass"])
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            _write_fixture(root)
-            (root / "trace" / "27" / "ours_kernel_summary.json").write_text(
-                "tampered\n", encoding="utf-8"
-            )
-            runs, _ = self._summarize(root)
-            self.assertFalse(runs["gate_pass"])
-
-    def test_three_session_trace_requires_every_hashed_range_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            _write_fixture(root)
-            status_path = root / "trace" / "27" / "status.json"
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-            runs, _ = self._summarize(root)
-            self.assertTrue(runs["gate_pass"])
-
-            status["artifacts"].pop("ours_nsys_sqlite_8")
-            status_path.write_text(json.dumps(status), encoding="utf-8")
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
 

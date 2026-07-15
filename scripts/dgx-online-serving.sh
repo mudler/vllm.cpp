@@ -213,7 +213,14 @@ native_plan_target="${evidence}/native-plan-must-not-exist.json"
 
 execution_dir="${evidence}/execution"
 mkdir -p "${execution_dir}"
-execution_manifest="${execution_dir}/${model}-trace.json"
+# Timed grids record the production manifest the grid summary reads
+# (execution/<model>.json); the H1d trace campaign records the instrumented
+# diagnostic manifest (execution/<model>-trace.json) linked from its status.
+if [[ ${mode} == trace-only ]]; then
+  execution_manifest="${execution_dir}/${model}-trace.json"
+else
+  execution_manifest="${execution_dir}/${model}.json"
+fi
 if [[ ${model} == 27 ]]; then
   test_name=test_qwen27_paged_engine
 else
@@ -935,11 +942,16 @@ if [[ ${mode} == trace-only ]]; then
   exit 0
 fi
 
+# --execute is a PURE TIMED production grid: model gate + interleaved timed
+# legs (memory/memory-return/thermal/cache-drop capture) + summary, all from
+# the production profile-control-OFF build. The H1d paired-trace machinery
+# (nsys wrapping, --cuda-profile-graph-replays, record-profile-control) runs
+# ONLY under --trace-only, which requires the instrumented build; mixing it
+# into --execute is what the production server correctly refuses.
 for repetition in 1 2 3; do
   run_leg ours "${repetition}"
   run_leg vllm "${repetition}"
 done
-run_paired_traces
 
 model_summary_status=0
 python3 "${repo_root}/tools/bench/online_gate_summary.py" \

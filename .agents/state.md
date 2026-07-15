@@ -9654,3 +9654,41 @@ requests, plus one c1 6-request serving smoke on the ON arm; expect (a) ≈48.3 
 (b) ≈25 GB. Then a second docs checkpoint records the measured numbers. **No axis
 credit** from the A/B — the binding Peak PSS/RSS axes stay FAILED until an
 authorized exact-grid rerun; binding remains **55/124**, `benchmark_binding=false`.
+
+## 2026-07-15 — fix proven on DGX; first sealed component is complete-void on c2 TTFT tails; rerun executing
+
+All DGX validation at clean pushed `c172336` succeeded in sequence. (1) A fresh
+`--diagnostic-c16` root (`~/work/vllm.cpp-gdn-packed-diagnostic-c16/c172336…-r2`)
+completed **all three** previously-deterministic-fatal c16 packed reps with
+`bench_failed=false` and zero `engine-fatal`/`async-llm` lines; marker-last
+`diagnostic_complete` sealed. An earlier `-r1` root at the same SHA failed
+PRE-GPU because the orchestrator's configure omitted
+`CMAKE_EXPORT_COMPILE_COMMANDS=ON`; the harness build contract rejected it
+fail-closed before any GPU work — recorded as an orchestration recipe drift,
+root preserved. (2) Both direct model gates pass from the `-r2` build under one
+lock: packed and rollback each **235/235 SUCCESS**. (3) The first execution of
+the full 12-leg one-lock component ever to seal ran from the fresh SHA-owned
+root `~/work/vllm.cpp-gdn-packed-component/c172336…`: all 12 legs completed
+(order log 12/12 `leg_end`, SHA-256 `a8bd81d7…dc91`; run log `ff4259cf…211d`)
+and the finalizer wrote marker-last **`complete-void`** with
+`benchmark_binding=false`, `speed_credit=false` (status artifact-set SHA
+`e43963c9…40ab`). Void cause: `component c2 repetitions are unstable:
+packed/p99_ttft_ms=0.040977, rollback/p90_ttft_ms=0.055722,
+rollback/p99_ttft_ms=0.105773` — TTFT tail axes only, which at c2 are
+max-of-6-sample statistics against the ≤4% per-run rule. Forensic (nonbinding)
+reads: every throughput/mean/median axis is stable across repetitions (max
+deviation 2.34%) and packed does not regress — c2 medians packed/rollback
+tput 158.707/158.197 (+0.32%), TPOT 108.736/109.100 ms, p99_itl
+110.713/111.092; c16 tput 791.763/792.256, TPOT 166.660/166.621 (ties). A
+rerun from fresh root `…-component/c172336…-r2` at the same SHA is executing
+under its own lock. Precommitment: if the rerun voids again solely on
+6-sample TTFT tail axes while all means remain stable, the component's
+tail-axis stability rule gets a test-first statistically-grounded revision
+(binding-grid protocol gates CV on throughput; vLLM's bench serve has no
+per-tail stability gate) before any third run — recorded now to avoid
+post-hoc tolerance shopping. Diagnostic context: our c2 TPOT median is now
+108.7 ms versus the binding-era 114.8 (and vLLM's binding-era 108.3) — the
+c2 decode gap has substantially closed on this workload, pending fresh
+denominators via the authorized exact grid. Binding stays **55/124**,
+`benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain
+blocked on a verified `complete-pass`.

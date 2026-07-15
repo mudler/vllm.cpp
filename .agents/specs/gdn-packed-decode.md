@@ -37,8 +37,25 @@ the pool on the request identity — each live sequence owns exactly one slot fo
 its whole lifetime, released only when it leaves the batch and reused only after
 (mirrors vLLM's per-sequence recurrent-state ownership). A RED `test_runner`
 case threw the exact fatal; it is GREEN after the fix (`test_runner` 8/8, tools
-132/132). See the blast-radius record below. Next: the DGX correctness gates and
-a fresh SHA/root full 12-leg component rerun.
+132/132). See the blast-radius record below. The DGX gates then passed at
+`c172336`: the fresh `--diagnostic-c16` reproduction (root
+`…-diagnostic-c16/c172336…-r2`) completed **all three** previously-fatal c16
+reps with `bench_failed=false` and zero `engine-fatal` lines, and both direct
+model gates pass (packed and rollback each **235/235 SUCCESS**). The first
+sealed full component (root `…-gdn-packed-component/c172336…`) ran all 12 legs
+to a marker-last terminal status — **`complete-void`**: every
+throughput/mean/median axis is stable (max deviation ≤2.34%) and forensic
+medians show packed non-regressing (c2 tput +0.32%, TPOT 108.736 vs 109.100
+ms; c16 tie), but the ≤4% per-run rule tripped on TTFT tail axes
+(c2 packed p99 4.10%, rollback p90 5.57%/p99 10.58%) — max-of-6-sample
+statistics at c2. A rerun from fresh root `…-r2` at the same SHA is executing;
+if it voids again on 6-sample tails while means stay stable, the tail-axis
+stability rule needs a test-first, statistically-grounded revision (not a
+gate-weakening: the binding-grid protocol gates CV on throughput, and vLLM's
+bench has no per-tail stability gate). An earlier `-r1` diagnostic root at
+`c172336` failed PRE-GPU on a configure-recipe drift (missing
+`CMAKE_EXPORT_COMPILE_COMMANDS=ON`) and was correctly rejected fail-closed by
+the build contract; it is preserved untouched.
 
 **Blast radius (recorded honestly).** The compact slot pool landed at `66715e1`
 (2026-07-05); the uniqueness validator only at `f344dec` (2026-07-14). (a) The

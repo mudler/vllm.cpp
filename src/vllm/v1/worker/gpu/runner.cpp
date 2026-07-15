@@ -349,7 +349,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // sequence), decoupled from the attention num_blocks. Guard against a 0 (e.g.
   // a test path that skipped the ctor arg) by falling back to num_blocks.
   gdn_state_slots_ = max_num_reqs_ > 0 ? max_num_reqs_ : num_blocks_;
-  gdn_slot_of_block_.clear();
+  gdn_slot_of_req_.clear();
   gdn_free_slots_.clear();
   gdn_free_slots_.reserve(static_cast<size_t>(gdn_state_slots_));
   for (int64_t s = gdn_state_slots_ - 1; s >= 0; --s)
@@ -501,38 +501,51 @@ std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
                               dev.begin() + static_cast<std::ptrdiff_t>(n));
 }
 
-void GPUModelRunner::remap_gdn_state_slots(std::vector<int32_t>& gdn_bt,
-                                           int gdn_cols, int num_reqs) {
+void GPUModelRunner::remap_gdn_state_slots(
+    std::vector<int32_t>& gdn_bt, int gdn_cols, int num_reqs,
+    const std::vector<std::optional<std::string>>& req_ids) {
   if (gdn_cols <= 0 || num_reqs <= 0) return;
-  // The persistent batch holds EVERY live sequence, so col 0 over [0, num_reqs)
-  // is exactly the set of alive mamba-state pool block-ids this step.
-  std::unordered_set<int32_t> alive;
+  // The persistent batch holds EVERY live sequence in its [0, num_reqs) prefix.
+  // Key the compact state slot on the sequence IDENTITY (req_id), never the
+  // block-table col-0 block-id: once a sequence exceeds one mamba block that
+  // column collapses to the shared null block-id 0 (MambaManager skips all but
+  // the last block), so block-id keying maps every long concurrent sequence to
+  // ONE slot — the captured c16 "duplicate live GDN state index" fatal and,
+  // pre-validator, silent cross-request recurrent-state corruption.
+  std::unordered_set<std::string> alive;
   alive.reserve(static_cast<size_t>(num_reqs));
-  for (int r = 0; r < num_reqs; ++r)
-    alive.insert(gdn_bt[static_cast<size_t>(r) * static_cast<size_t>(gdn_cols)]);
-  // Reclaim slots of sequences that have finished (their block-id is gone).
-  for (auto it = gdn_slot_of_block_.begin(); it != gdn_slot_of_block_.end();) {
+  for (int r = 0; r < num_reqs; ++r) {
+    // req_ids[r] is populated for every active [0, num_reqs) row after condense.
+    VT_CHECK(req_ids[static_cast<size_t>(r)].has_value(),
+             "GDN remap: active batch row is missing its request id");
+    alive.insert(*req_ids[static_cast<size_t>(r)]);
+  }
+  // Reclaim slots of sequences no longer in the batch (finished / preempted):
+  // a slot is released only after its owning request leaves.
+  for (auto it = gdn_slot_of_req_.begin(); it != gdn_slot_of_req_.end();) {
     if (alive.find(it->first) == alive.end()) {
       gdn_free_slots_.push_back(it->second);
-      it = gdn_slot_of_block_.erase(it);
+      it = gdn_slot_of_req_.erase(it);
     } else {
       ++it;
     }
   }
-  // Assign/reuse a compact slot per live sequence and rewrite col 0 in place.
+  // Assign/reuse a compact slot per live sequence and write it into col 0 (the
+  // only column the GDN metadata builder reads as the state index). Distinct
+  // req_ids get distinct slots, so no two live sequences ever share a slot.
   for (int r = 0; r < num_reqs; ++r) {
+    const std::string& rid = *req_ids[static_cast<size_t>(r)];
     const size_t off = static_cast<size_t>(r) * static_cast<size_t>(gdn_cols);
-    const int32_t blk = gdn_bt[off];
-    auto it = gdn_slot_of_block_.find(blk);
+    auto it = gdn_slot_of_req_.find(rid);
     int32_t slot;
-    if (it != gdn_slot_of_block_.end()) {
+    if (it != gdn_slot_of_req_.end()) {
       slot = it->second;
     } else {
       VT_CHECK(!gdn_free_slots_.empty(),
                "GDN state slots exhausted: live sequences exceed max_num_reqs");
       slot = gdn_free_slots_.back();
       gdn_free_slots_.pop_back();
-      gdn_slot_of_block_.emplace(blk, slot);
+      gdn_slot_of_req_.emplace(rid, slot);
     }
     gdn_bt[off] = slot;
   }
@@ -572,15 +585,16 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   int gdn_cols = 0;
   std::vector<int32_t> gdn_bt =
       gather_block_table(gdn_group_id_, num_reqs, &gdn_cols);
-  // Remap the scattered mamba-state pool block-ids (col 0) to compact per-
-  // sequence state slots in [0, gdn_state_slots_), so the GDN state cache is
-  // sized by max_num_reqs (one recurrent state per sequence) rather than the
-  // attention num_blocks. Only col 0 (state indices) is read downstream.
-  remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs);
+  // Remap col 0 to a compact per-sequence state slot in [0, gdn_state_slots_),
+  // keyed on the request identity so the GDN state cache is sized by
+  // max_num_reqs (one recurrent state per sequence) rather than the attention
+  // num_blocks, and no two live sequences ever collide on one slot. Only col 0
+  // (state indices) is read downstream.
+  remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs, input_batch_.req_ids);
   if (GdnDiagStepLogEnabled()) {
     std::cerr << "[VT_GDN_DIAG] step num_reqs=" << num_reqs
               << " gdn_free_slots=" << gdn_free_slots_.size()
-              << " gdn_live_slots=" << gdn_slot_of_block_.size() << "\n";
+              << " gdn_live_slots=" << gdn_slot_of_req_.size() << "\n";
   }
   const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
       step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);

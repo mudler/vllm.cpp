@@ -9505,3 +9505,89 @@ would flip both memory axes), verified by a VmHWM A/B; the direct-to-device
 streaming redesign remains the deeper follow-up and stays desirable for 35B.
 Diagnostic only: no ratio, lifecycle, or binding change; binding stays
 **55/124**, `benchmark_binding=false`.
+
+## 2026-07-15 — c16 duplicate-GDN-slot root cause FIXED test-first (runner slot lifecycle)
+
+**Mechanism (hand-simulated, then reproduced).** The runner's compact GDN
+state-slot pool (`remap_gdn_state_slots`, `src/vllm/v1/worker/gpu/runner.cpp`,
+introduced at `66715e1`) keyed each per-sequence recurrent-state slot on the
+mamba pool **block-id** read from block-table column 0 (`gdn_bt[r*gdn_cols]`).
+That is only valid when every live sequence has exactly one mamba block. But the
+27B GDN group is built with a **sub-sequence `block_size`** — `MakeQwen3_5KVCache`
+(`src/vllm/model_executor/models/model_registry.cpp:326-337`) passes the
+attention `block_size` (default 32) to the `MambaSpec` while its cache mode is
+the default `"none"`. So a sequence longer than one block accumulates
+`cdiv(seq_len, block_size)` mamba blocks and `MambaManager::remove_skipped_blocks`
+(`src/vllm/v1/core/single_type_kv_cache_manager.cpp:728` + base `:262`, with
+`get_num_skipped_tokens = num_computed-1`) frees every block but the last,
+setting the freed front blocks — **including column 0** — to the null block
+(block-id **0**). Once ≥2 concurrent sequences are each past their first mamba
+block, they all present column 0 == 0, and the block-id-keyed pool maps them
+onto **one** slot → `non_spec_state_indices_tensor` carries a duplicate →
+`detail::ValidateGdnStateIndices` fatals (`qwen3_5.cpp:73`). This exactly
+reproduces the death-step geometry (`num_reqs=6, gdn_live_slots=5` → two of six
+share block-0's slot; the c16 burst uses ~2048-token prompts, so multiple
+sequences are past block 0). c2 with short/few concurrent long sequences never
+collides, matching the evidence.
+
+**vLLM grounding.** vLLM keys the mamba state index on the CURRENT state block,
+not raw column 0: `mamba_get_block_table_tensor`
+(`/home/mudler/_git/vllm/vllm/v1/attention/backends/utils.py:947-965`) gathers
+`block_table[req, (seq_len-1)//block_size]` before `gdn_attn.py:219` takes
+`[:, 0]`; and in `"none"` mode vLLM sets `mamba_block_size = max_model_len`
+(one block per sequence, `config.py:585-594`). Semantically vLLM owns **one
+recurrent state per live sequence**. Because our compact per-sequence state
+cache stores the state at the compact slot (the physical mamba block content is
+unused for the recurrence), the correct, minimal, ABI-preserving mirror is to
+key the slot on the **sequence identity**.
+
+**Fix.** `remap_gdn_state_slots` now keys `gdn_slot_of_req_` on the request id
+(from `input_batch_.req_ids`) instead of the block-id: a live sequence owns
+exactly one slot for its whole lifetime, released only when it leaves the batch,
+reused only after. Column 0 is still overwritten with the compact slot for the
+GDN builder; the local slot-0-valid/negative-pad ABI is unchanged. This also
+fixes latent **silent cross-request GDN state corruption** (below).
+
+**Blast radius (honest).** (a) The defect is independent of
+`VT_GDN_PACKED_DECODE`: `remap_gdn_state_slots` and the validator (via
+`BuildStepDevInputs` → `ValidateGdnAttentionMetadata`, `qwen3_5.cpp:2523`) both
+run on the common decode path, so the rollback arm (`=0`) hits the same
+duplicate. (b) The compact pool landed at `66715e1` (2026-07-05); the uniqueness
+validator only at `f344dec` (2026-07-14). Binaries in between — including the
+`3f256ab` binding grid and earlier c16/c32 campaigns — ran two or more long
+concurrent sequences on ONE recurrent-state slot **silently** (cross-request
+state corruption) rather than crashing. Low-concurrency 16/16 correctness gates
+(few concurrent sequences and/or prompts within one mamba block) do not surface
+it; high-concurrency runs measure throughput, not token correctness. No binding
+throughput number changes, but per-token output correctness of any prior
+c16/c32 run from those binaries is suspect (caveated in `docs/BENCHMARKS.md`).
+
+**RED→GREEN.** Two new `test_runner` cases drive it (`tests/vllm/v1/worker/test_runner.cpp`):
+(5) two long decode sequences both presenting column 0 == 0, and (6) a
+completion→admission churn where a sequence finishes, its pool block-id is
+recycled to a new admission, and a third continues. Observed RED against a
+block-id-keyed remap: both threw
+`vt: qwen3_5: duplicate live GDN state index at ...qwen3_5.cpp:73` (the exact
+captured fatal). GREEN after the fix: distinct slots per live sequence, a
+finished sequence's slot released and reusable, a continuing sequence's slot
+stable, and `detail::ValidateGdnStateIndices` accepts the metadata.
+
+**Gates (CPU/host only; no GPU run here).** `test_runner` **8/8 (155
+assertions)**; touched CPU suites green — `test_prepare_inputs` 6/6,
+`test_model_registry` 14/14, `test_kv_cache_manager` 9/9,
+`test_single_type_kv_cache_manager` 26/26, `test_kv_cache_coordinator` 16/16,
+`test_scheduler` 29/29, `test_block_pool` 13/13, `test_qwen27_paged_forward`
+14/14, `test_qwen35_paged_forward` 4/4, `test_engine_core` 6/6,
+`test_engine_core_proc` 9/9, `test_llm_engine` 5/5, `test_async_llm` 8/8; all
+tools **132/132**; clean `-Wall -Wextra -Werror` rebuild of the `vllm` library
+with no warnings; `check-agent-record.py`, `test_agent_record.py`,
+`test_doc_checkpoint.py` pass. Files: `src/vllm/v1/worker/gpu/runner.cpp`,
+`include/vllm/v1/worker/gpu/runner.h`, `tests/vllm/v1/worker/test_runner.cpp`,
+`tests/CMakeLists.txt`, plus record surfaces.
+
+**Next (orchestrator).** Run the DGX correctness gates on the pushed SHA —
+default+rollback 27B **235/235 + 16/16** direct model gates, plus the focused
+`--diagnostic-c16` reproduction (must now pass all three c16 reps instead of
+throwing) — then a fresh SHA/root full twelve-leg one-lock `--execute` component
+rerun, accepting only a verified marker-last terminal status. The `d82d282` and
+`4a450f9` roots stay untouched. qkvz/exact-grid/35B stay blocked on the gate.

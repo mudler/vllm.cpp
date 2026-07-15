@@ -158,6 +158,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   const InputBatch& input_batch() const { return input_batch_; }
   const std::vector<PagedKvCache>& attn_kv() const { return attn_kv_; }
   const std::vector<GdnStateCache>& gdn_state() const { return gdn_state_; }
+  // The compact GDN state-slot pool size (== max_num_reqs). Exposed for the
+  // state-slot uniqueness regression tests.
+  int64_t gdn_state_slots() const { return gdn_state_slots_; }
   // The step inputs / metadata built for the most recent execute_model (the four
   // consumers the ordering identity test aligns).
   const StepInputs& last_step() const { return exec_state_.step; }
@@ -212,18 +215,27 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Build the [num_reqs, num_cols] committed block-table slice for a KV group.
   std::vector<int32_t> gather_block_table(int group_id, int num_reqs,
                                           int* num_cols) const;
-  // Rewrite the GDN group's block-table col 0 (the mamba-state pool block-id,
-  // scattered over the shared [0, num_blocks) attention pool) into a COMPACT
-  // per-sequence state slot in [0, gdn_state_slots_). The GDN mamba state is one
-  // recurrent state per SEQUENCE (vLLM MambaSpec "none": block_table is
-  // (#reqs, 1); max_memory_usage_bytes == 1 page/seq), so the state cache is
-  // sized by max_num_reqs — NOT the attention num_blocks (which grows with
-  // concurrency×seq_len and made the f32 ssm_state the dominant memory
-  // consumer). The map is keyed on the pool block-id (stable per sequence across
-  // steps + condense), so states persist correctly; slots of finished sequences
-  // are reclaimed. Only col 0 is read by the GDN builder (state indices).
+  // Rewrite the GDN group's block-table col 0 into a COMPACT per-sequence state
+  // slot in [0, gdn_state_slots_). The GDN mamba state is one recurrent state
+  // per SEQUENCE, kept in a compact cache sized by max_num_reqs — NOT the
+  // attention num_blocks (which grows with concurrency×seq_len and made the f32
+  // ssm_state the dominant memory consumer). The pool is keyed on the request's
+  // stable IDENTITY (req_id), NOT the mamba pool block-id: under our MambaSpec
+  // "none" config the group uses a sub-sequence block_size, so once a sequence
+  // exceeds one block MambaManager::remove_skipped_blocks nulls every block but
+  // the last and block-table col 0 collapses to the shared null block-id 0 —
+  // block-id keying then maps every long sequence to ONE slot (a duplicate live
+  // state index / cross-request state corruption). vLLM reaches the same
+  // per-sequence state index via mamba_get_block_table_tensor (gathering the
+  // CURRENT state block); because our compact per-sequence cache makes the
+  // physical block-id irrelevant, the sequence identity is the correct key: each
+  // live request owns exactly one slot for its whole lifetime, freed only when
+  // it leaves the batch and reused only after. Only col 0 is read by the GDN
+  // builder (state indices).
   void remap_gdn_state_slots(std::vector<int32_t>& gdn_bt, int gdn_cols,
-                             int num_reqs);
+                             int num_reqs,
+                             const std::vector<std::optional<std::string>>&
+                                 req_ids);
 
   const HfConfig& config_;
   // Production: model_ borrows LoadedEngine::model_. Direct runner tests use a
@@ -243,9 +255,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   // the attention num_blocks. See remap_gdn_state_slots.
   int max_num_reqs_ = 0;
   int64_t gdn_state_slots_ = 0;
-  // Compact GDN state-slot allocator: pool block-id (block_table col 0) -> slot
-  // in [0, gdn_state_slots_); free list of unused slots.
-  std::unordered_map<int32_t, int32_t> gdn_slot_of_block_;
+  // Compact GDN state-slot allocator: request identity (req_id) -> slot in
+  // [0, gdn_state_slots_); free list of unused slots. Keyed on the sequence, not
+  // the mamba pool block-id (see remap_gdn_state_slots for why block-id keying
+  // collapsed long concurrent sequences onto one slot).
+  std::unordered_map<std::string, int32_t> gdn_slot_of_req_;
   std::vector<int32_t> gdn_free_slots_;
 
   // Owned persistent cache storage plus the non-owning views used by forward.

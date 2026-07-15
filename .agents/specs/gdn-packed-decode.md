@@ -17,14 +17,43 @@ checkpoint now restores them (four `std::cerr` error-path channels +
 `VT_GDN_DIAG_STEP_LOG` geometry + a packed-only `--diagnostic-c16` driver mode;
 see the W1D3 component-harness row and G3 below). Partial legs are nonbinding.
 The DGX reproduction at `4a450f9` (root
-`~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…`) then **captured the root
+`~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…`) **captured the root
 cause deterministically 3/3**: `vt: qwen3_5: duplicate live GDN state index`
 from `detail::ValidateGdnStateIndices` (`qwen3_5.cpp:73`) during a mixed-batch
-step of the c16 burst — the runner's GDN state-slot lifecycle assigned one slot
-to two live requests (death-step geometry `num_reqs=6, gdn_free_slots=27,
-gdn_live_slots=5` of the 32-slot pool), poisoning the engine so timed requests
-fast-failed with the generic wrapper. The active W1D3 work is the test-first
-slot-lifecycle repair, then a fresh SHA/root full 12-leg component rerun.
+step of the c16 burst (death-step geometry `num_reqs=6, gdn_free_slots=27,
+gdn_live_slots=5` of the 32-slot pool). **Root cause and test-first repair are
+now landed.** The runner keyed its compact GDN state-slot pool
+(`remap_gdn_state_slots`, `src/vllm/v1/worker/gpu/runner.cpp`) on the mamba
+block-id (block-table column 0). Because the 27B GDN group is configured with a
+sub-sequence `block_size` (`MakeQwen3_5KVCache`), once a sequence exceeds one
+mamba block `MambaManager::remove_skipped_blocks` nulls every block but the last
+and column 0 collapses to the shared null block-id 0 — so two long concurrent
+c16 sequences both presented block-id 0 and were remapped onto one recurrent
+state slot. vLLM reaches the same per-sequence state index via
+`mamba_get_block_table_tensor` (gathering the current state block,
+`vllm/v1/attention/backends/utils.py:947-965`; `gdn_attn.py:219`); our compact
+per-sequence state cache makes the physical block-id irrelevant, so the fix keys
+the pool on the request identity — each live sequence owns exactly one slot for
+its whole lifetime, released only when it leaves the batch and reused only after
+(mirrors vLLM's per-sequence recurrent-state ownership). A RED `test_runner`
+case threw the exact fatal; it is GREEN after the fix (`test_runner` 8/8, tools
+132/132). See the blast-radius record below. Next: the DGX correctness gates and
+a fresh SHA/root full 12-leg component rerun.
+
+**Blast radius (recorded honestly).** The compact slot pool landed at `66715e1`
+(2026-07-05); the uniqueness validator only at `f344dec` (2026-07-14). (a) The
+defect is independent of `VT_GDN_PACKED_DECODE`: the runner remap and
+`ValidateGdnAttentionMetadata` both run on the common decode path (via
+`BuildStepDevInputs`), so the rollback arm (`=0`) hits the same duplicate. (b)
+Binaries between `66715e1` and `f344dec` — including the `3f256ab` binding grid
+and earlier c16/c32 campaigns — had the pool WITHOUT the validator, so two or
+more long concurrent sequences would silently share one GDN recurrent-state slot
+(cross-request state corruption) instead of crashing. Low-concurrency 16/16
+correctness gates (few concurrent sequences and/or prompts within one mamba
+block) do not surface it; high-concurrency runs measure throughput, not token
+correctness. No binding throughput number changes, but any prior c16/c32
+per-token output correctness is suspect and is caveated in
+`docs/BENCHMARKS.md`.
 
 The W1C projection oracle proved that the 27B BF16 `in_proj_ba` output is
 bit-identical to vLLM, but the existing decomposed consumer still produces a
@@ -285,7 +314,7 @@ scripts/dgx-gdn-packed-component.sh --diagnostic-c16 \
 | W1D0 | Generator, official packed fixture, focused boundary differential and this spike. | **CLOSED at clean `f18ca23`:** byte-identical regeneration, CUDA **10/10**, `306/7552 -> 0/1`; evidence root `~/work/vllm.cpp-gdn-packed-decode/f18ca23691bc7e38adbf04912da92f819154379e`. |
 | W1D1 | Add public op, CPU reference, CUDA packed kernel, registrations and the full upstream dtype/stride/state-index test matrix. | **CLOSED / G1 PASSED at clean `9ad8fb7`:** local full GDN **39/39**, focused ASan+UBSan **5/5**, immutable CUDA full GDN **41/41**, focused packed **5/5**, direct fixture `0/1`, and strict memcheck **2/2 with 0 errors/leaks**. Evidence root `~/work/vllm.cpp-gdn-packed-decode/9ad8fb76940e68737d2a13ad8ddd97d649bb577c`. |
 | W1D2 | Add exact pure-decode dispatch, process-cached rollback and BF16 BA default coupling; retain other branches. | **CLOSED / immutable G2 PASS at clean `f344dec`:** local **103/103**; DGX default+rollback 27B **235/235**, 35B **315/315**, isolated GGUF **14/14 + 14/14**, full CUDA GDN **43/43**, boundary `0/1`, and three strict memcheck cases have zero errors/leaks. Evidence root `~/work/vllm.cpp-gdn-packed-decode/f344decf457a4d50c3bcae78a2903d7fe176a511/evidence-g2`. |
-| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE; diagnostic instrumentation landed.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 0/96 HTTP 500 with no marker. A test-first diagnostic checkpoint exposed the dropped root cause (four `std::cerr` error-path channels + `VT_GDN_DIAG_STEP_LOG` + a packed-only `--diagnostic-c16` mode → `component-diagnostic.json`; six RED→GREEN tests, tools 132/132), and the `4a450f9` DGX reproduction captured it **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`), a runner slot-lifecycle defect (6 requests on 5 live slots). Next: test-first slot-lifecycle repair with CPU/CUDA gates, then a fresh SHA/root full 12-leg rerun; qkvz stays blocked. |
+| W1D3 | Add the fail-closed packed/rollback trace harness; run node trace and c2/c16 component; update every status surface. | **Structural PASS / component FAILED INCOMPLETE; root cause CAPTURED and REPAIRED test-first.** Clean `7ff713e`, finalized by `24cea4f`, closes structure. Clean `d82d282` passed model gates/all c2 legs, then c16 packed r1 returned 0/96 HTTP 500 with no marker; the `4a450f9` DGX reproduction captured it **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`). Root cause: `remap_gdn_state_slots` keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 once a sequence exceeds one mamba block (sub-sequence `block_size`), so two long c16 sequences shared one slot. **Fix (this checkpoint):** the pool now keys on the request identity (each live sequence owns one slot for its lifetime); a RED `test_runner` case threw the exact fatal, GREEN after the fix (`test_runner` 8/8, tools 132/132, touched CPU suites green, clean -Werror rebuild). Also removes latent silent cross-request GDN state corruption (blast radius recorded). Next: DGX correctness gates + a fresh SHA/root full 12-leg rerun; qkvz stays blocked. |
 
 No later leaf starts before the previous performance-sensitive checkpoint is
 recorded. qkvz and the exact grid remain unauthorized during W1D0-W1D2.

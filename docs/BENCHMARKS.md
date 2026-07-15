@@ -29,16 +29,45 @@ adds an opt-in `VT_GDN_DIAG_STEP_LOG` geometry trace, and adds a packed-only
 (`component-diagnostic.json`; the finalizer refuses diagnostic evidence). Six
 RED→GREEN tests land it; all tools pass **132/132**, focused
 `test_gdn_packed_component` **49/49**, and CPU `test_async_llm`/`test_openai_api_server`
-are green. The `--diagnostic-c16` reproduction at `4a450f9` then **captured the
+are green. The `--diagnostic-c16` reproduction at `4a450f9` **captured the
 root cause deterministically 3/3**: `vt: qwen3_5: duplicate live GDN state
-index` thrown by the host state-index validator (`qwen3_5.cpp:73`) during a
-mixed-batch step of the c16 burst — the runner's GDN state-slot lifecycle
-assigned one slot to two live requests (last healthy step: `num_reqs=6,
-gdn_free_slots=27, gdn_live_slots=5` of the 32-slot pool), poisoning the
-engine so every timed request fast-failed with the generic stopped-AsyncLLM
-wrapper. The c16 component stays **FAILED / INCOMPLETE** with the test-first
-slot-lifecycle repair as the next entry point; partial c2/c16 files are
-nonbinding and `benchmark_binding=false`.
+index` (`qwen3_5.cpp:73`) during a mixed-batch step of the c16 burst — the
+runner's GDN state-slot lifecycle assigned one slot to two live requests (last
+healthy step: `num_reqs=6, gdn_free_slots=27, gdn_live_slots=5` of the 32-slot
+pool).
+
+**Root cause + test-first repair (landed).** The runner keyed its compact GDN
+state-slot pool (`remap_gdn_state_slots`, `runner.cpp`) on the mamba **block-id**
+(block-table column 0). The 27B GDN group is configured with a sub-sequence
+`block_size` (`MakeQwen3_5KVCache`), so once a sequence exceeds one mamba block
+`MambaManager::remove_skipped_blocks` nulls every block but the last and column
+0 collapses to the shared null block-id **0**. Two long concurrent c16 sequences
+therefore both presented block-id 0 and were remapped onto **one** recurrent
+state slot → the duplicate the validator (added at `f344dec`) rejects. vLLM
+reaches the same per-sequence state index via `mamba_get_block_table_tensor`
+(gathering the current state block); because our compact per-sequence state
+cache makes the physical block-id irrelevant, the fix keys the pool on the
+**request identity** so each live sequence owns exactly one slot for its whole
+lifetime, released only when it leaves the batch. A RED `test_runner` case
+threw the exact fatal; it is GREEN after the fix (`test_runner` **8/8**).
+
+**Blast-radius caveat (correctness).** The defect predates the validator. (a) It
+is independent of `VT_GDN_PACKED_DECODE`: the remap and the validator both run
+on the common decode path, so the rollback arm (`=0`) hits the same duplicate.
+(b) The compact slot pool was introduced at `66715e1` (2026-07-05); the
+uniqueness validator only at `f344dec` (2026-07-14). Binaries in between —
+including the `3f256ab` binding grid and earlier c16/c32 campaigns — would have
+**silently** run two or more long concurrent sequences on ONE GDN recurrent
+state slot (cross-request state corruption) rather than crashing. Low-concurrency
+16/16 correctness gates (few concurrent sequences and/or short prompts that stay
+within one mamba block) would not surface it; high-concurrency runs measure
+throughput, not token correctness, so any such prior c16/c32 numbers are
+throughput-valid but their per-token output correctness at concurrency is
+**suspect**. No binding throughput number changes; recorded here for honesty.
+
+The c16 component stays **FAILED / INCOMPLETE** until the DGX correctness gates
+and a fresh 12-leg component rerun pass; partial c2/c16 files are nonbinding and
+`benchmark_binding=false`.
 
 ## Binding 27B online gate
 
@@ -83,9 +112,9 @@ performance command is authorized until the 27B result reaches 124/124.
 
 | Track | Disposition | Current evidence | Next binding gate |
 |---|---|---|---|
-| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `4a450f9` `--diagnostic-c16` reproduction captured the c16 root cause **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`), a runner GDN state-slot lifecycle defect under request churn that poisons the engine | Repair the slot lifecycle test-first with CPU/CUDA gates, then rerun the full component from a new SHA/root; the exact grid remains unauthorized |
+| `SERVE-GATE-ONLINE` | **FAILED / GATING** | Immutable `3f256ab` remains **55/124**; packed correctness/structure is accepted. The `4a450f9` reproduction captured the c16 `duplicate live GDN state index` **3/3**. **Test-first repair landed**: the runner's compact GDN state-slot pool now keys on the request identity (was the mamba block-id, which collapsed long concurrent sequences onto one slot); RED `test_runner` threw the exact fatal → GREEN, tools **132/132** | DGX correctness gates + a fresh full 12-leg component rerun from the pushed SHA/root; the exact grid remains unauthorized |
 | `KERNEL-GEMM-BF16` | **GATING W1C** | `0091cd1` closes BA structure and `f925294` closes projection/inertness. The isolated BF16-BA + decomposed control remains **233/235**; clean `f344dec` closes W1D2/G2 for the exact coupled BF16-BA + packed path at **235/235**, `benchmark_binding=false` | Depends on the packed W1D3 component gate; qkvz stays blocked |
-| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 root cause CAPTURED** | Structural evidence is accepted. Diagnostic root `~/work/vllm.cpp-gdn-packed-diagnostic-c16/4a450f9…` reproduced the c16 failure on all three fresh-server reps: the engine-fatal channel names `ValidateGdnStateIndices` (`qwen3_5.cpp:73`, duplicate live slot), the api-server/body channels prove poisoned-engine fast-fail, and the geometry trace shows 6 requests holding only 5 live slots (+27 free = full 32 pool) at the death step; mixed prefill+decode lead-up steps ran with `packed_decode=0` | Trace the runner slot-remap defect, fix test-first, then rerun all twelve legs from a fresh SHA/root |
+| `KERNEL-GDN-PACKED-DECODE` | **ACTIVE / W1D3 repair LANDED** | Root cause captured 3/3 at `4a450f9` (6 requests, 5 live + 27 free of 32 slots; `packed_decode=0` lead-up). **Fixed test-first**: `remap_gdn_state_slots` keyed the compact slot pool on the mamba block-id, which collapses to the shared null block-id 0 once a sequence exceeds one mamba block (sub-sequence `block_size`), so two long c16 sequences shared one slot; the pool now keys on the request identity. RED runner test threw `duplicate live GDN state index`, GREEN after fix (`test_runner` 8/8; tools 132/132) | Rerun all twelve legs from the pushed SHA/root after the DGX correctness gates |
 | RMSNorm/generated partitions | **CLOSED / DISPROVEN as a parity gap** | The 2026-07-14 [parity rescan](../.agents/specs/parity-rescan-2026-07-14.md) verified vLLM's `RmsNormQuantFusionPass` is FP8-only (no nvfp4 keys); the nvfp4 path runs standalone `scaled_fp4_quant` exactly like ours, and the +1.81 ms residual was a cross-profiler artifact | None — removed from the lever queue |
 | Serving transport (TCP_NODELAY) | **DONE / MEASURED NEUTRAL on the gate workload** | Mirror landed (`SERVE-HTTP-TRANSPORT`): `set_tcp_nodelay(true)` matches vLLM's uvicorn/asyncio default; behavioral accepted-socket test RED **0** → GREEN **1**, 22/22 cases. The non-binding one-lock localhost A/B (`~/work/vllm.cpp-tcpnodelay-sizing/ff915e8…`, 4a450f9 Nagle-ON vs ff915e8 Nagle-OFF, c1/c2 ×2 reps, identical pinned-client workload; raw-set SHA `f5b52900…2128`) is **neutral within noise** on every ITL/TPOT/throughput metric (c1 mean ITL ~102.7 both arms; c2 ~108–109; first cold-start leg excluded). Mechanism: ~100 ms per-token write cadence vs µs loopback ACKs means Nagle never coalesces — the rescan's rank-1 gain hypothesis is REFUTED for the loopback gate; the mirror stays for real-network parity | None for the gate — decode-gap attribution moves to the nsys c2 full-step diff (transport is ruled out) |
 | Host-weight ownership | **FAILED / DIAGNOSED — peak is LOAD-TIME double-residency** | The 2026-07-15 precheck (idle loaded server, `~/work/vllm.cpp-memory-precheck-20260715`) measures steady RSS **24.75 GB** (anonymous 24.58 GB ≈ exactly the 22.920 GiB mirror; file pages 129 MB; glibc arena retention ≤0.5 GB, allocator tweaks ruled out) while **VmHWM 48.29 GB ≈ the binding 48.17 GB peak** with zero requests served — the failing peak is the load-time overlap of the mirror build with full resident source mmap. Steady RSS is already below vLLM's 28.5 GB peak | First shot: windowed source reading + progressive `madvise(DONTNEED)` during load (small change, peak→~25 GB would flip both axes), verified by a VmHWM A/B; the full direct-to-device streaming redesign remains the deeper fix and is still wanted for 35B |
@@ -192,11 +221,15 @@ copied byte-for-byte from the binding `3f256ab` evidence; the separate 64-plan
 fixture is committed under `tests/fixtures/` and the runner requires it in
 read-only mode. Until the component gate passes, `benchmark_binding=false`.
 
-The **next entry point** is the bounded `--diagnostic-c16` reproduction from the
-pushed diagnostic SHA (the `d82d282` component root is immutable and must never
-be reused). It reruns the packed c16 boundary three times under one GPU lock,
-captures the now-restored `engine-fatal:` root cause on stderr (server log), and
-replays the failing corpus row into a persisted HTTP error body — writing only
+The **next entry point** (repair now landed) is the DGX correctness gates on the
+pushed fix SHA — the default+rollback 27B **235/235 + 16/16** direct model gates
+plus the `--diagnostic-c16` reproduction (which must now pass all three c16 reps
+instead of throwing) — followed by a full fresh 12-leg `--execute` component
+rerun from a NEW root (the `d82d282` component root is immutable and must never
+be reused). The `--diagnostic-c16` recipe below is retained as the focused
+regression check: it reruns the packed c16 boundary three times under one GPU
+lock, captures any `engine-fatal:` root cause on stderr (server log), and
+replays the corpus row into a persisted HTTP body — writing only
 `component-diagnostic.json` and a `diagnostic/` subtree, never a sealable
 component. Provision `SNAPSHOT`/corpus/build exactly as above, then, with a new
 root whose basename contains `diagnostic-c16`:

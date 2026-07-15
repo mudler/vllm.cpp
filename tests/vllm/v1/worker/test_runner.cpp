@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -646,4 +647,117 @@ TEST_CASE("runner: 2-request greedy batch samples each from its own logits row")
 
   CHECK(mro.sampled_token_ids[0][0] == a_expect);
   CHECK(mro.sampled_token_ids[1][0] == b_expect);
+}
+
+// ─── 5. GDN state-slot uniqueness under multi-block sequences (c16 regression) ─
+// Captured engine-fatal reproduction: "vt: qwen3_5: duplicate live GDN state
+// index" (ValidateGdnStateIndices, qwen3_5.cpp:73), deterministic 3/3 on the
+// c16 96-request burst.
+//
+// Root cause: the 27B GDN/mamba KV group is configured with a sub-sequence
+// block_size (MakeQwen3_5KVCache passes the attention block_size while the
+// MambaSpec default cache mode is "none"). Once a sequence exceeds one block it
+// accumulates cdiv(seq_len, block_size) mamba blocks and
+// MambaManager::remove_skipped_blocks nulls every block but the last, so
+// block-table column 0 collapses to the shared null block-id 0. The runner's
+// compact GDN state pool used to key on that block-id, so two live "long"
+// sequences both presenting col-0 == 0 were mapped onto ONE state slot — a
+// duplicate live state index (and, before the W1D2 validator, silent
+// cross-request recurrent-state corruption). vLLM instead gathers the CURRENT
+// state block (mamba_get_block_table_tensor) and, semantically, owns one
+// recurrent state per SEQUENCE. The fix keys the compact slot on the request
+// identity, so each live sequence owns exactly one slot regardless of the
+// physical block layout.
+//
+// These requests present col-0 == 0 exactly as the cache manager produces it
+// after skipping the front blocks of a multi-block sequence.
+TEST_CASE("runner: GDN state slots stay unique when col-0 collapses to null block") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  // Two decode requests, each already past its first mamba block: the cache
+  // manager has nulled column 0 to the shared null block-id 0 for both.
+  NewRequestData a = MakeNewReq("A", {5, 9, 2}, {7}, /*num_computed=*/3,
+                                /*fa_blocks=*/{0, 1}, /*gdn_block=*/0, Greedy());
+  NewRequestData b = MakeNewReq("B", {1, 4, 8}, {6}, /*num_computed=*/3,
+                                /*fa_blocks=*/{2, 3}, /*gdn_block=*/0, Greedy());
+  SchedulerOutput so = NewStep({a, b}, {{"A", 1}, {"B", 1}});
+
+  // BEFORE the fix this remaps both sequences onto ONE slot -> the GDN metadata
+  // carries a duplicate live state index and the validator fatals.
+  CHECK_NOTHROW(runner.execute_model(so));
+
+  const auto& gm = runner.last_gdn_meta();
+  REQUIRE(gm.non_spec_state_indices_tensor.has_value());
+  const std::vector<int32_t>& idx = *gm.non_spec_state_indices_tensor;
+  REQUIRE(idx.size() == 2);
+  // The two live sequences must occupy DIFFERENT state slots.
+  CHECK(idx[0] != idx[1]);
+  CHECK(idx[0] >= 0);
+  CHECK(idx[1] >= 0);
+  // The validator (the exact check that fatally fired on dgx) must accept it.
+  CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
+      idx, /*required=*/2, runner.gdn_state_slots()));
+}
+
+// ─── 6. GDN state slots stay unique across completion→admission churn ─────────
+// Drives the ordering the c16 burst exercised: long sequences decode while
+// others complete and new ones are admitted (recycling pool block-ids). Every
+// step's live sequences must hold pairwise-distinct GDN state slots, a finished
+// sequence's slot must be released and reusable, and a continuing sequence must
+// keep its slot (so its recurrent state persists).
+TEST_CASE("runner: GDN state slots unique across completion/admission churn") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  auto slots_unique = [&](int expect_n) {
+    const auto& gm = runner.last_gdn_meta();
+    REQUIRE(gm.non_spec_state_indices_tensor.has_value());
+    const std::vector<int32_t>& idx = *gm.non_spec_state_indices_tensor;
+    REQUIRE(static_cast<int>(idx.size()) == expect_n);
+    for (size_t i = 0; i < idx.size(); ++i) {
+      CHECK(idx[i] >= 0);
+      for (size_t j = i + 1; j < idx.size(); ++j) CHECK(idx[i] != idx[j]);
+    }
+    CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
+        idx, expect_n, runner.gdn_state_slots()));
+    return idx;
+  };
+  auto slot_of = [&](const std::string& rid) -> int32_t {
+    const auto& ib = runner.input_batch();
+    const auto& gm = runner.last_gdn_meta();
+    const int r = ib.req_id_to_index.at(rid);
+    return (*gm.non_spec_state_indices_tensor)[static_cast<size_t>(r)];
+  };
+
+  // Step 1: admit A, B — both multi-block sequences (col-0 == 0).
+  NewRequestData a = MakeNewReq("A", {5, 9, 2}, {7}, 3, {0, 1}, /*gdn=*/0, Greedy());
+  NewRequestData b = MakeNewReq("B", {1, 4, 8}, {6}, 3, {2, 3}, /*gdn=*/0, Greedy());
+  CHECK_NOTHROW(runner.execute_model(NewStep({a, b}, {{"A", 1}, {"B", 1}})));
+  slots_unique(2);
+  const int32_t b_slot = slot_of("B");
+
+  // Step 2: A completes; new sequence C admitted (also col-0 == 0, the block-id
+  // A freed is recycled); B continues its decode. The pool must release A's slot
+  // and hand C a slot distinct from B's, while B keeps its own slot.
+  NewRequestData cc = MakeNewReq("C", {3, 3, 3}, {9}, 3, {0, 1}, /*gdn=*/0, Greedy());
+  SchedulerOutput s2;
+  s2.finished_req_ids = {"A"};
+  CachedRequestData cached;
+  cached.req_ids = {"B"};
+  cached.num_computed_tokens = {4};
+  cached.num_output_tokens = {1};
+  cached.new_block_ids.emplace_back(std::nullopt);
+  s2.scheduled_cached_reqs = std::move(cached);
+  s2.scheduled_new_reqs = {cc};
+  s2.num_scheduled_tokens = {{"B", 1}, {"C", 1}};
+  s2.total_num_scheduled_tokens = 2;
+  CHECK_NOTHROW(runner.execute_model(s2));
+  slots_unique(2);
+  CHECK(slot_of("B") == b_slot);  // B's recurrent state slot is stable.
+  CHECK(slot_of("C") != slot_of("B"));
 }

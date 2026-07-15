@@ -28,22 +28,28 @@ OpenAI-compatible server.
 > mid-flight) plus an opt-in `VT_GDN_DIAG_STEP_LOG` geometry trace, and a
 > packed-only `--diagnostic-c16` driver mode kept fully separate from the gating
 > component (`component-diagnostic.json`; the finalizer refuses diagnostic
-> evidence). Six RED→GREEN tests land it; all tool tests pass **132/132**. The
-> DGX reproduction then **captured the root cause deterministically 3/3**:
-> `vt: qwen3_5: duplicate live GDN state index` thrown by the host state-index
-> validator (`qwen3_5.cpp:73`) — two concurrent requests resolved to the same
-> GDN state slot under c16 request churn, poisoning the engine so all timed
-> requests fast-failed with the generic wrapper. A test-first slot-lifecycle
-> fix is next; the packed component stays `GATING`, no speed credit. Host
-> memory still retains a **22.92 GiB CPU weight mirror**, and no 35B
-> performance result is claimed. See [Benchmarks](docs/BENCHMARKS.md).
+> evidence). The DGX reproduction **captured the root cause deterministically
+> 3/3**: `vt: qwen3_5: duplicate live GDN state index` (`qwen3_5.cpp:73`) — the
+> runner keyed its compact GDN state-slot pool on the mamba block-id, which
+> collapses to the shared null block-id 0 once a sequence exceeds one mamba
+> block (the group is configured with a sub-sequence `block_size`), so two long
+> concurrent sequences under c16 churn shared ONE recurrent-state slot. The
+> **test-first repair** now keys the slot on the request identity so each live
+> sequence owns exactly one slot for its lifetime (a RED runner test threw the
+> exact fatal, GREEN after the fix; `test_runner` **8/8**, all tools
+> **132/132**). This also fixes latent silent cross-request GDN state corruption
+> that pre-validator binaries could hit at high concurrency (see
+> [Benchmarks](docs/BENCHMARKS.md)). The packed component stays `GATING` (no
+> speed credit) until the DGX correctness gates and a fresh 12-leg component
+> rerun pass. Host memory still retains a **22.92 GiB CPU weight mirror**, and
+> no 35B performance result is claimed.
 
 ## Current status
 
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `--diagnostic-c16` reproduction at `4a450f9` captured the c16 root cause deterministically **3/3**: `duplicate live GDN state index` (`qwen3_5.cpp:73`) — a runner GDN state-slot lifecycle defect under request churn (last step: 6 requests, 5 live + 27 free of 32 slots) | Trace the slot-lifecycle defect, fix test-first with CPU/CUDA gates, then rerun the full 12-leg component from a fresh SHA/root before qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `4a450f9` `--diagnostic-c16` reproduction captured the c16 root cause **3/3** (`duplicate live GDN state index`, `qwen3_5.cpp:73`): the runner keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 for any sequence past its first mamba block, so 2 long c16 sequences shared 1 slot (last step: 6 requests, 5 live + 27 free of 32). **Test-first repair landed**: the slot pool now keys on request identity (RED runner test threw the exact fatal → GREEN; `test_runner` 8/8, tools 132/132) | DGX correctness gates + a fresh 12-leg component rerun from the pushed SHA/root, then qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / diagnosed | The failing **peak** (48.3 GB) is load-time double-residency: the 22.92 GiB host mirror is built while the full source mmap stays resident; steady RSS afterwards is 24.75 GB — already below vLLM's 28.5 GB peak. Allocator retention is ruled out (≤0.5 GB) | Windowed source reading + progressive page release during load first (VmHWM A/B); direct-to-device streaming remains the deeper fix |
@@ -71,7 +77,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Work item | Present disposition |
 |---|---|
 | Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. Clean `d82d282` completed both model gates and all c2 legs, then failed incomplete at c16 packed r1: preflight/warmups passed, 0/96 timed requests returned HTTP 500, and no status was sealed. Diagnostic instrumentation landed (four `std::cerr` error-path channels restoring vLLM's dropped fatal logs, `VT_GDN_DIAG_STEP_LOG` geometry, and a packed-only `--diagnostic-c16` mode isolated to `component-diagnostic.json`); the DGX diagnostic reproduction is pending. No partial number binds |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. The `d82d282` c16 packed leg died with `duplicate live GDN state index`; the `4a450f9` diagnostic reproduction captured it 3/3. Root cause: the runner keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 for any sequence past its first mamba block, so 2 long c16 sequences shared 1 recurrent-state slot. **Test-first repair landed** — the pool now keys on the request identity (each live sequence owns one slot for its lifetime). This also removes latent silent cross-request GDN state corruption. DGX correctness gates + a fresh 12-leg component rerun are the next step; no partial number binds |
 | Remaining gap diagnosis | The 2026-07-14 [parity rescan](.agents/specs/parity-rescan-2026-07-14.md) grounds the failing mass as **host-side**: TTFT passes 24/24, our GPU kernels are net faster on the measured window, and the open axes are c2–c8 decode latency plus host memory. The prior RMSNorm/generated-partitions residual is **disproven** (vLLM's norm-quant fusion is FP8-only; cross-profiler artifact). Parallel host workstreams: TCP_NODELAY (DONE, measured neutral on loopback — ruled out as the decode-gap cause), memory precheck → weight streaming, and nsys c2 attribution before async-sched W3 |
 | Serving transport (TCP_NODELAY) | **DONE; measured NEUTRAL on the gate workload** (`SERVE-HTTP-TRANSPORT`). We mirror vLLM's uvicorn/asyncio default (`set_tcp_nodelay(true)`), pinned by a behavioral accepted-socket test (RED 0 → GREEN 1, 22/22). The non-binding localhost A/B sizing is neutral within noise at c1/c2 — µs loopback ACKs mean Nagle never held our ~100 ms-cadence token frames — so the mirror stays for real-network parity and the decode-gap attribution moves to the nsys c2 full-step diff |
 | Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
@@ -144,7 +150,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the `d82d282` component failed incomplete at c16 HTTP 500 with no marker. A bounded test-first diagnostic checkpoint landed to expose the dropped root cause; the DGX `--diagnostic-c16` reproduction is pending, and qkvz remains blocked |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN correctness/structure are accepted; the `d82d282` c16 leg died on `duplicate live GDN state index`, captured 3/3 at `4a450f9`. A test-first repair keys the runner's compact GDN state-slot pool on the request identity (was the mamba block-id, which collapsed to the shared null block for long sequences); DGX correctness gates + a fresh 12-leg component rerun are pending, and qkvz remains blocked |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -163,7 +169,7 @@ performance gates pass.
 | BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path |
 | Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
 | Paged decode attention | ✅ ref | 🟡 | FA2 ratio-6 route is correctness/structure-green but strict performance-failed |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The `d82d282` c2/c16 run stopped at its first c16 timed batch (0/96 HTTP 500) with no terminal status; completed c2 legs are nonbinding. A test-first diagnostic checkpoint (error-path log channels + `--diagnostic-c16` mode) now targets the dropped root cause |
+| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT and packed correctness/structure are gated. The `d82d282` c16 leg died on `duplicate live GDN state index` (captured 3/3 at `4a450f9`): the runner's compact GDN state-slot pool, keyed on the mamba block-id, collapsed two long c16 sequences onto one recurrent-state slot. A test-first repair keys the pool on the request identity; a fresh 12-leg component rerun after DGX gates is next |
 | RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open |
 | CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
 

@@ -10278,3 +10278,38 @@ stale pre-session uncommitted edits to `porting-inventory.md`/`roadmap_v1.md`
 (an older draft of the Triton-AOT reproducibility note, superseded by the
 committed record) were found in the main worktree and discarded in favor of
 HEAD. No lifecycle, ratio, or binding change.
+
+## 2026-07-15 — seventh seal complete-failed: the c16 packed deficit is INTERMITTENT but real; trace-driven scan resumes
+
+The seventh sealed component (clean pushed `495ba78`, root
+`~/work/vllm.cpp-gdn-packed-component/495ba780b5a403ac8cdcdb598ec32ca593e38280`,
+status artifact-set `2e529e5a…d105`, manifest `0a089224…7f91`, summary
+`d03071cc…77b1`) ran under the fully-calibrated gate (stability 4%/15% +
+pooled-50%; acceptance bands 0.5%/15%/calibrated memory; mode-conditional c2
+TTFT; majority-consistency pairing) and sealed **`complete-failed`** with
+**32/40** axes, **8/8** memory, stability/correctness clean and
+`validation_error=None`. The failing axes are all c16: throughput family and
+mean TPOT/ITL/E2EL at **0.9935–0.9941** plus median TTFT 0.9812 — packed
+[803.53, 806.44, 802.60] vs rollback [808.79, 808.83, 805.53] tok/s,
+consistent across all three interleaved reps. c2 passes entirely.
+
+Across the four post-fix sealed runs the c16 arm delta is now: run 4
+**−0.83%** (consistent 3/3), run 5 **+0.35%**, run 6 pass/tie, run 7
+**−0.65%** (consistent 3/3) — a BIMODAL cross-run pattern (either ≈0 or
+≈−0.7%, never in between), each mode internally consistent under AB/BA/AB
+interleaving. This is not sampling noise (interleaving would wash it out) and
+not a fixed engine property (two runs show none of it): the signature of a
+run-scoped state difference that lands on one arm per process start —
+candidate mechanisms: per-process cuBLASLt/BF16-GEMM heuristic selection
+(the packed arm's BF16 BA output was already known to potentially change
+cuBLASLt selection; the trace harness hashes those signatures separately),
+clock/thermal regime, or allocator/layout luck. Harness iteration is DONE —
+the gate is correct and is reporting a real intermittent deficit. Per the
+G3 contract a failure resumes the trace-driven scan: the next step is a
+read-only forensic diff of the sealed deficit runs (4, 7) against the tie
+runs (5, 6) — per-request ITL/TTFT distribution shapes (uniform per-token
+slowdown vs episodic stalls), server-log tactic/selection lines
+(`VT_FP4_AUTOTUNE_VERBOSE=1` output), graph-capture counts, thermal probes —
+to localize what distinguishes a deficit run before any code hypothesis.
+Binding stays **55/124**, `benchmark_binding=false`, no speed credit;
+qkvz/exact-grid/35B remain blocked on a `complete-pass`.

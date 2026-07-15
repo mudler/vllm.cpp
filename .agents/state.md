@@ -10248,3 +10248,33 @@ wanted for 35B). Rollback stays `VT_LOAD_WINDOWED_RELEASE=0`.
   `check-doc-checkpoint.py` were each run as separate steps with exit status
   verified individually; no `git commit`/`push` was chained after a doc-editing
   script.
+
+## 2026-07-15 — benchmark workload-equivalence audit accepted (binding 3f256ab arms are apples-to-apples)
+
+A user-directed read-only audit of the binding 27B online gate verified, from
+the immutable evidence root and both engines' source, that the two arms ran an
+equivalent workload: [specs/benchmark-equivalence-audit-2026-07-15.md](specs/benchmark-equivalence-audit-2026-07-15.md).
+Matched (both arms): max_num_seqs=32 (explicit, confirmed in vLLM's runtime
+config dump; zero preemption either arm), max_num_batched_tokens=2048 +
+chunked prefill, prefix caching OFF, max_model_len=262144, attention KV BF16,
+GDN conv BF16 + SSM FP32, CUTLASS FP4 W4A4 with 64 tactics, FA2, decode
+graphs at every grid concurrency, production-graphed vLLM (not eager), and a
+byte-identical client/corpus (verbatim c16 commands differ in exactly one
+token — the result directory; dataset sha256 identical). An intermediate
+audit lane's claim that vLLM allocates BF16 SSM state was REFUTED at source:
+vLLM's `Qwen3_5ForConditionalGenerationConfig.verify_and_update_config`
+promotes `mamba_ssm_cache_dtype` to float32 from the same nested HF field we
+read (silently — no log line), so FP32 SSM is a MATCH and our spec record was
+correct; `VT_GDN_STATE_BF16` must stay diagnostic-only. The one material
+engine difference is vLLM's Inductor prefill fusion + piecewise cudagraphs —
+the protocol-correct production denominator, already the recorded parity
+front. Recommendations recorded for the next authorized grid: pass
+`--mamba-ssm-cache-dtype float32` explicitly so the resolved dtype is in the
+evidence; cite vLLM claims against the run SHA `702f481`. Audit provenance:
+the workflow's two extract lanes and adjudicator died at the
+structured-output retry cap (the known failure mode); the surviving resolver
+lane plus a plain-text finisher produced the corrected verdict. Housekeeping:
+stale pre-session uncommitted edits to `porting-inventory.md`/`roadmap_v1.md`
+(an older draft of the Triton-AOT reproducibility note, superseded by the
+committed record) were found in the main worktree and discarded in favor of
+HEAD. No lifecycle, ratio, or binding change.

@@ -122,6 +122,16 @@ reach a verified terminal status before any axis binds.
 
 ## Binding 27B online gate
 
+Workload equivalence of the two arms is AUDITED and accepted
+([audit report](../.agents/specs/benchmark-equivalence-audit-2026-07-15.md)):
+batch cap (max_num_seqs=32, zero preemption), token budget (2048 + chunked
+prefill), context, greedy sampling, corpus bytes, KV/conv/SSM dtypes (SSM is
+FP32 on BOTH arms — vLLM's Qwen3.5 config hook promotes it silently), FP4
+kernel family, FA2, and graphed decode all match; the client commands differ
+in exactly one token (result directory). The one material engine difference
+is vLLM's Inductor prefill fusion + piecewise cudagraphs — its production
+config, i.e. the protocol-correct denominator.
+
 | Item | Binding value |
 |---|---|
 | Model | Qwen3.6-27B NVFP4 |

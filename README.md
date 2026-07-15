@@ -94,7 +94,10 @@ OpenAI-compatible server.
 | Host-memory parity | ❌ FAILED on the binding grid / fix MEASURED | The failing **peak** was load-time double-residency (22.92 GiB mirror built while the full source mmap stayed resident). The `LOAD-SAFETENSORS` windowed release (default on; `VT_LOAD_WINDOWED_RELEASE=0` rollback) is now **measured on GB10**: 27B load-to-ready VmHWM **48.29 GB off vs 24.75 GB on (−23.54 GB, −48.7%)** — the load transient is fully eliminated and the ON peak equals steady RSS, below vLLM's 28.5 GB binding peak; ON-arm serving smoke 6/6 | Binding Peak PSS/RSS axes flip only at the next authorized exact-grid rerun (projected PASS). Direct-to-device streaming remains the deeper fix (still wanted for 35B) |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
-loop, with three interleaved repetitions. Ratios are direction-normalized so
+loop, with three interleaved repetitions. Arm equivalence is audited: batch
+cap, token budget, sampling, corpus, cache dtypes and kernel families all
+match, and the client commands are identical to one token — see the
+[equivalence audit](.agents/specs/benchmark-equivalence-audit-2026-07-15.md). Ratios are direction-normalized so
 **1.0 or higher passes**.
 
 | Concurrency | Axes passing | Total throughput: ours / vLLM | Ratio |

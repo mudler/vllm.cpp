@@ -10797,3 +10797,66 @@ spec → the AUTHORIZED exact-grid rerun (fresh vLLM denominators mandatory;
 explicit `--mamba-ssm-cache-dtype float32` on the vLLM arm; cite run SHA
 `702f481`). 35B stays blocked until 27B reaches 124/124. Binding stays
 55/124, `benchmark_binding=false`, NO speed credit is claimed for qkvz.
+
+## 2026-07-15 — qkvz W2A DGX gates: 1/2a/3 PASS; 2b was a TEST-contract gap (engine correct) — fixed test-first (`CLAIM-GDN-BA-ROUNDING-1`, worktree `.claude/worktrees/agent-a09357edca6886385`)
+
+**DGX outcomes at `baea3ec`** (orchestrator-run; suites at
+`~/work/vllm.cpp-gdn-qkvz/baea3ec…/`):
+- Job 1 (default CUDA suites incl. 27B + 35B engine gates + loaders):
+  **PASS 8/8**.
+- Job 2a (`VT_GDN_MERGED_QKVZ=0` leaf rollback, 27B engine): **PASS** —
+  confirming the qkvz leaf is NOT coupled to packed decode (BA stays merged,
+  48 packed launches).
+- Job 2b (`VT_GDN_MERGED_PROJ=0` MASTER rollback, 27B engine): **FAIL — in
+  the TEST contract only.** 229/229 token assertions passed; the case THREW
+  `qwen27 packed GDN decode dispatch count mismatch`
+  (test_qwen27_paged_engine.cpp).
+- Job 3 (35B native + `VT_DENSE_NATIVE=0`): **PASS**.
+- Job 4 (memcheck): first run failed on PATH only
+  (`compute-sanitizer: command not found`); re-run with
+  `/usr/local/cuda-13.0/bin/compute-sanitizer` pending — not an engine
+  finding.
+
+**2b root cause — the ENGINE IS CORRECT; the gate expectation was not
+mode-aware.** Verified in source: `ShouldUsePackedGdnDecode`
+(qwen3_5.cpp:45-53) requires `merged_ba_enabled` (wired from
+`MergedGdnBaEnabled`, which the MASTER `VT_GDN_MERGED_PROJ=0` disables) plus
+the coupled BF16 dtypes. Master-off therefore runs the full legacy pipeline —
+split projections, F32 BA, DECOMPOSED recurrence, zero packed launches —
+exactly the spec dispatch-matrix "four legacy GEMMs" row and the W1D2
+coupling ("BF16 BA output is coupled to exact packed recurrence; split BA
+reverts to F32 + decomposed"). The gate test hard-coded
+`expected = VT_GDN_PACKED_DECODE=='0' ? 0 : 48`, ignoring the master/leaf/
+dtype couplings. Pre-existing gap (since the f344dec-era dispatch-count
+contract; any `VT_GDN_MERGED_BA=0` or `VT_GDN_IN_BF16=0` engine arm would
+have failed identically) — first exposed because `baea3ec`'s gate list added
+the master arm. **No engine change in this fix; DGX 2b just needs
+re-running from the fixed SHA.**
+
+**Fix (test-first).**
+- RED: new CPU truth-table case `qwen27 packed GDN env selection mirrors
+  every coupled rollback` (tests/vllm/models/test_qwen27_paged_forward.cpp)
+  fails to compile against baseline (`PackedGdnDecodeEnvSelected` absent);
+  the genuine runtime RED is the DGX 2b throw itself.
+- Implementation: `detail::PackedGdnDecodeEnvSelected(GdnPackedDecodeEnvConfig)`
+  (qwen3_5_internal.h + qwen3_5.cpp) — a pure, field-for-field mirror of the
+  process-cached env couplings the model wires into
+  `GdnPackedDecodeEligibility` (`VT_GDN_PACKED_DECODE`, master
+  `VT_GDN_MERGED_PROJ` + leaf `VT_GDN_MERGED_BA`, `VT_GDN_IN_BF16`,
+  `VT_GDN_OUT_BF16` dense default, `VT_GDN_BA_OUT_BF16`). The 27B engine
+  gate now computes `expected = selected ? 48 : 0` from this shared truth
+  table (`VT_GDN_MERGED_QKVZ` deliberately absent — not coupled, per 2a).
+- GREEN: `test_qwen27_paged_forward` **16/16** (truth table: default→48-arm;
+  each of packed=0 / MERGED_PROJ=0 / MERGED_BA=0 / IN_BF16=0 / OUT_BF16=0 /
+  BA_OUT_BF16=0 → zero-arm; explicit "1"s → 48-arm; master dominates leaf).
+  `test_qwen27_paged_engine` compiles + CPU-skips cleanly. Clean full
+  -Werror rebuild + full serial CTest + record/doc checkers re-run green
+  (this checkpoint's gate battery).
+
+**Orchestrator next (no GPU on my side).** Re-run 2b
+(`flock /tmp/gpu -c "VT_GDN_MERGED_PROJ=0 ctest --test-dir $B -R
+'test_qwen27_paged_engine' --output-on-failure"`) and memcheck (absolute
+`/usr/local/cuda-13.0/bin/compute-sanitizer`) from THIS pushed SHA; expected
+2b: 235/235 + 16/16 with zero packed launches accepted by the mode-aware
+contract. Then the structural trace (145→97 BF16/window, packed total
+915→867) and the W2B component per the prior entry's commands.

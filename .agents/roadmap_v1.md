@@ -53,9 +53,13 @@ W2A) is **implemented test-first (2026-07-15)** under
 `CLAIM-GDN-BA-ROUNDING-1`: one `in_proj_qkvz` owner + ONE BF16 GEMM with
 strided mixed/z views on the CUDA default, split rollback from the same owner
 (`VT_GDN_MERGED_QKVZ=0`), 35B/GGUF inert; CPU gates green (CTest 107/107,
-tools 162/162, clean -Werror). Next: the orchestrator's DGX gates (27B
-default+rollback model gates, GDN suite, memcheck, the 145→97 BF16 structural
-trace), then the **AUTHORIZED** exact-grid rerun (fresh vLLM denominators
+tools 162/162, clean -Werror). DGX gates at `baea3ec`: default/qkvz-rollback/
+35B-inertness arms **PASS**; the `VT_GDN_MERGED_PROJ=0` arm exposed a
+non-mode-aware gate-test expectation (engine correct — master-off deselects
+packed decode by the designed BA coupling) → fixed test-first
+(`PackedGdnDecodeEnvSelected` truth table). Next: 2b re-run + memcheck
+(first run PATH-only) + the 145→97 BF16 structural
+trace, then the **AUTHORIZED** exact-grid rerun (fresh vLLM denominators
 mandatory; explicit `--mamba-ssm-cache-dtype float32` on the vLLM arm; cite run
 SHA `702f481`); 35B stays blocked until 27B reaches 124/124.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus

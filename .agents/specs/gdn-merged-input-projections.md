@@ -306,7 +306,7 @@ frozen fixture are recorded before execution.
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
 | W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32/decomposed rollback is 235/235 + 16/16. The isolated BF16/decomposed control remains 233/235, while clean `f344dec` closes W1D2/G2 for the coupled BF16/packed default at 235/235. |
 | W1C | Repeat immutable safety/model gates, close BF16 semantics, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Safety/structure/projection and packed G0/G1/G2 are closed through clean `f344dec`; W1D3 marker-last structural evidence closes at `7ff713e` + `24cea4f`. The c2/c16 component remains pending and must close before W2. |
-| W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | **Implemented/`GATING` (2026-07-15).** CPU tier green: loader row-order/one-owner, dispatch eligibility, strided-consumer + merged-view F32/BF16 B=1/2/4/16/32 batteries, CPU merged-owner == split bit-exact model forward, 35B/GGUF inertness; clean -Werror rebuild, full CTest 107/107, tools 162/162. DGX gates (CUDA suites, 27B default+both rollbacks 235/235+16/16, 35B/GGUF inertness, memcheck slices) are the orchestrator's next step from the pushed SHA. |
+| W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | **Implemented/`GATING` (2026-07-15).** CPU tier green: loader row-order/one-owner, dispatch eligibility, strided-consumer + merged-view F32/BF16 B=1/2/4/16/32 batteries, CPU merged-owner == split bit-exact model forward, 35B/GGUF inertness; clean -Werror rebuild, full CTest 107/107, tools 162/162. **DGX gates at `baea3ec`: job 1 (default suites incl. both engine gates + loaders) PASS 8/8; 2a (`VT_GDN_MERGED_QKVZ=0` 27B engine) PASS; 3 (35B native + `VT_DENSE_NATIVE=0`) PASS. 2b (`VT_GDN_MERGED_PROJ=0`) FAILED in the TEST contract only — the engine is correct (zero packed launches per the designed BA coupling; 229/229 token asserts green); fixed test-first via the shared `PackedGdnDecodeEnvSelected` truth table (see Risks). 2b re-run + memcheck (first run was a PATH-only `compute-sanitizer: command not found`) pending from the fixed SHA.** |
 | W2B | Run exact 97-BF16-family trace (packed default 915→867 total, −48 BF16-only) and the c2/c16 qkvz 22-leg component. | Pending the orchestrator; G3 disposition committed afterwards. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |
 
@@ -342,3 +342,19 @@ an ungated W1.
 - **Rollback boundary:** `VT_GDN_MERGED_PROJ=0`; leaf toggles isolate BA and
   qkvz. Any correctness, sanitizer, graph, memory or component regression keeps
   the affected leaf off and records the failed disposition.
+- **Master-off (and BA-leaf-off) also deselects packed pure-decode — by
+  design.** `ShouldUsePackedGdnDecode` requires `merged_ba_enabled` plus the
+  coupled BF16 dtypes, so `VT_GDN_MERGED_PROJ=0`, `VT_GDN_MERGED_BA=0`, or any
+  of `VT_GDN_IN_BF16=0`/`VT_GDN_OUT_BF16=0`/`VT_GDN_BA_OUT_BF16=0` runs the
+  full legacy pipeline: split projections, F32 BA, decomposed recurrence,
+  ZERO packed launches (this is exactly the dispatch-matrix "four legacy
+  GEMMs" row — the pre-W1 shipping arithmetic). `VT_GDN_MERGED_QKVZ=0` is NOT
+  coupled: BA stays merged and packed decode still selects 48 (DGX arm 2a at
+  `baea3ec` passed with exactly that split). Gate contracts must therefore be
+  mode-aware: the 27B engine gate's dispatch-count expectation consumes the
+  shared env truth table `detail::PackedGdnDecodeEnvSelected`
+  (CPU-pinned in `test_qwen27_paged_forward.cpp`), after the first
+  `VT_GDN_MERGED_PROJ=0` DGX arm (2b at `baea3ec`) exposed the old
+  `VT_GDN_PACKED_DECODE`-only expectation: the engine correctly issued zero
+  packed launches with all 229 token assertions green, and only the test's
+  hard-coded 48 threw.

@@ -479,6 +479,60 @@ TEST_CASE("qwen27 merged qkvz selection requires CUDA, owner, toggle, one dtype"
   }
 }
 
+// The 27B gate's packed-dispatch-count contract must agree with the engine's
+// process-cached env couplings: ShouldUsePackedGdnDecode requires
+// merged_ba_enabled (master VT_GDN_MERGED_PROJ + leaf VT_GDN_MERGED_BA) and
+// the coupled BF16 dtypes (VT_GDN_IN_BF16 / VT_GDN_OUT_BF16 /
+// VT_GDN_BA_OUT_BF16), not just VT_GDN_PACKED_DECODE. DGX gate arm 2b
+// (VT_GDN_MERGED_PROJ=0 at baea3ec) proved the old expectation wrong at run
+// time: the engine correctly ran the decomposed recurrence (zero packed
+// launches, 229/229 token assertions green) while the test still demanded 48.
+// This truth table pins the shared helper the gate test now consumes.
+TEST_CASE("qwen27 packed GDN env selection mirrors every coupled rollback") {
+  using vllm::detail::GdnPackedDecodeEnvConfig;
+  using vllm::detail::PackedGdnDecodeEnvSelected;
+
+  // Default production env (all unset): packed is selected (48 launches).
+  CHECK(PackedGdnDecodeEnvSelected(GdnPackedDecodeEnvConfig{}));
+
+  auto with = [](const char* packed, const char* proj, const char* ba,
+                 const char* in, const char* out, const char* ba_out) {
+    GdnPackedDecodeEnvConfig env;
+    env.packed_decode = packed;
+    env.merged_proj = proj;
+    env.merged_ba = ba;
+    env.in_bf16 = in;
+    env.out_bf16 = out;
+    env.ba_out_bf16 = ba_out;
+    return env;
+  };
+
+  // Direct rollback.
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with("0", nullptr, nullptr, nullptr, nullptr, nullptr)));
+  // Master merged-projection rollback splits BA -> decomposed recurrence.
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, "0", nullptr, nullptr, nullptr, nullptr)));
+  // Leaf merged-BA rollback likewise.
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, nullptr, "0", nullptr, nullptr, nullptr)));
+  // Coupled-dtype overrides break dtype_compatible.
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, nullptr, nullptr, "0", nullptr, nullptr)));
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, nullptr, nullptr, nullptr, "0", nullptr)));
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, nullptr, nullptr, nullptr, nullptr, "0")));
+
+  // Explicit "1" (and non-"0") values keep the default selection.
+  CHECK(PackedGdnDecodeEnvSelected(with("1", "1", "1", "1", "1", "1")));
+  // The qkvz leaf is NOT coupled to packed decode (DGX arm 2a passed with 48
+  // packed launches under VT_GDN_MERGED_QKVZ=0) — no qkvz field exists here.
+  // Master off dominates even with the leaf explicitly on.
+  CHECK_FALSE(PackedGdnDecodeEnvSelected(
+      with(nullptr, "0", "1", nullptr, nullptr, nullptr)));
+}
+
 TEST_CASE("qwen27 packed GDN validates engine state slots before upload") {
   CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
       std::vector<int32_t>{0, 1, -1}, /*required=*/3, /*slots=*/2));

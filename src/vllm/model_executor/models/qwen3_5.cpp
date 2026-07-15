@@ -56,6 +56,25 @@ bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
 
+bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
+  // Mirror PackedGdnDecodeRuntimeEnabled: enabled unless first char is '0'.
+  const bool runtime_enabled =
+      env.packed_decode == nullptr || env.packed_decode[0] != '0';
+  // Mirror MergedGdnBaEnabled's env core: master '0' wins; leaf default-on.
+  const bool merged_ba =
+      !(env.merged_proj != nullptr && env.merged_proj[0] == '0') &&
+      (env.merged_ba == nullptr || env.merged_ba[0] != '0');
+  // Mirror the dtype_compatible expression on the real 27B dense gate:
+  // GdnInDType (default BF16), GdnOutDType dense default (BF16; override
+  // '0' -> F32), MergedGdnBaOutputDType(packed) (default BF16 under packed;
+  // override '0' -> F32). The SSM cache dtype term is always a float dtype.
+  const bool in_bf16 = env.in_bf16 == nullptr || env.in_bf16[0] != '0';
+  const bool out_bf16 = env.out_bf16 == nullptr || env.out_bf16[0] != '0';
+  const bool ba_out_bf16 =
+      env.ba_out_bf16 == nullptr || env.ba_out_bf16[0] != '0';
+  return runtime_enabled && merged_ba && in_bf16 && out_bf16 && ba_out_bf16;
+}
+
 void detail::ValidateGdnStateIndices(const std::vector<int32_t>& indices,
                                      int64_t required,
                                      int64_t state_slots) {

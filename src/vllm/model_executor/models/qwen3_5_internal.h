@@ -42,6 +42,30 @@ struct GdnPackedDecodeEligibility {
 
 bool ShouldUsePackedGdnDecode(const GdnPackedDecodeEligibility& eligibility);
 
+// Process-level ENV resolution of the packed pure-decode arm for the real 27B
+// dense CUDA gate (owner resident, pure non-spec one-token decode assumed).
+// Mirrors, field for field, the exact process-cached env couplings the model
+// wires into GdnPackedDecodeEligibility (qwen3_5.cpp GdnBlockPaged):
+// PackedGdnDecodeRuntimeEnabled (VT_GDN_PACKED_DECODE), MergedGdnBaEnabled
+// (master VT_GDN_MERGED_PROJ + leaf VT_GDN_MERGED_BA), and dtype_compatible —
+// GdnInDType (VT_GDN_IN_BF16) == BF16, GdnOutDType dense default
+// (VT_GDN_OUT_BF16) == BF16, MergedGdnBaOutputDType(packed)
+// (VT_GDN_BA_OUT_BF16) == BF16. Splitting BA (master OR leaf) or reverting any
+// coupled dtype therefore deselects packed and runs the decomposed recurrence:
+// the gate's dispatch-count contract must expect ZERO packed launches on those
+// arms, exactly like VT_GDN_PACKED_DECODE=0. Fields carry the raw getenv
+// values (nullptr = unset) so the CPU tier can pin the truth table.
+struct GdnPackedDecodeEnvConfig {
+  const char* packed_decode = nullptr;  // VT_GDN_PACKED_DECODE
+  const char* merged_proj = nullptr;    // VT_GDN_MERGED_PROJ (master)
+  const char* merged_ba = nullptr;      // VT_GDN_MERGED_BA (leaf)
+  const char* in_bf16 = nullptr;        // VT_GDN_IN_BF16
+  const char* out_bf16 = nullptr;       // VT_GDN_OUT_BF16
+  const char* ba_out_bf16 = nullptr;    // VT_GDN_BA_OUT_BF16
+};
+
+bool PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env);
+
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
 // selected only on CUDA with the packed 27B owner resident, the runtime

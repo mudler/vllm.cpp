@@ -35,6 +35,7 @@
 
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/sampling_params.h"
 
 namespace fs = std::filesystem;
@@ -185,9 +186,25 @@ TEST_CASE("qwen27 paged-engine greedy acceptance gate (dgx-only, 27B W4A4)") {
 #ifdef VLLM_CPP_CUDA
   const uint64_t packed_launches =
       vt::cuda::testing::GetGdnPackedDecodeDebugStats().launches;
-  const char* packed_env = std::getenv("VT_GDN_PACKED_DECODE");
-  const bool rollback = packed_env != nullptr && packed_env[0] == '0';
-  const uint64_t expected_packed_launches = rollback ? 0U : 48U;
+  // Packed pure-decode selection is process-coupled to the merged BF16 BA
+  // projection (ShouldUsePackedGdnDecode requires merged_ba_enabled + the
+  // coupled BF16 dtypes), so EVERY arm that splits BA or reverts a coupled
+  // dtype — VT_GDN_PACKED_DECODE=0, master VT_GDN_MERGED_PROJ=0, leaf
+  // VT_GDN_MERGED_BA=0, VT_GDN_IN_BF16=0 / VT_GDN_OUT_BF16=0 /
+  // VT_GDN_BA_OUT_BF16=0 — runs the decomposed recurrence and must issue
+  // ZERO packed launches. (VT_GDN_MERGED_QKVZ is NOT coupled: the qkvz-off
+  // arm keeps merged BA and still selects 48.) The env truth table is
+  // detail::PackedGdnDecodeEnvSelected, CPU-pinned by
+  // test_qwen27_paged_forward.cpp; the DGX VT_GDN_MERGED_PROJ=0 arm at
+  // baea3ec proved the old VT_GDN_PACKED_DECODE-only expectation wrong.
+  const bool packed_selected = vllm::detail::PackedGdnDecodeEnvSelected(
+      vllm::detail::GdnPackedDecodeEnvConfig{
+          std::getenv("VT_GDN_PACKED_DECODE"),
+          std::getenv("VT_GDN_MERGED_PROJ"),
+          std::getenv("VT_GDN_MERGED_BA"), std::getenv("VT_GDN_IN_BF16"),
+          std::getenv("VT_GDN_OUT_BF16"),
+          std::getenv("VT_GDN_BA_OUT_BF16")});
+  const uint64_t expected_packed_launches = packed_selected ? 48U : 0U;
   vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
   if (packed_launches != expected_packed_launches) {
     throw std::runtime_error(

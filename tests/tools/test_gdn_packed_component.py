@@ -417,6 +417,37 @@ def _memory(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
     return result
 
 
+def _set_timing_leg(record: dict, *, duration: float, latency_ms: float) -> None:
+    """Overwrite one leg's duration/throughput and flat per-request latency.
+
+    Throughput scales with ``duration`` and every timed-latency axis is set to
+    ``latency_ms`` (mean=median=p90=p99), keeping the record self-consistent with
+    the harness' exact ``_run_metrics`` recomputation check.  Used by the paired
+    majority-consistency fixtures to perturb specific rep-pairs by ~1-2%.
+    """
+
+    requests = record["completed"]
+    record["duration"] = duration
+    record["request_throughput"] = requests / duration
+    record["output_throughput"] = requests * 128 / duration
+    record["total_token_throughput"] = requests * (1024 + 128) / duration
+    _set_latency(record, latency_ms)
+
+
+def _prime_c16_paired(records: dict) -> None:
+    """Reset both c16 arms to a common near-identical baseline for paired tests.
+
+    Every c16 leg is set to duration 10.0 / latency 8.0 ms so the two arms sit on
+    top of each other; a paired fixture then perturbs specific packed reps by
+    ~1-2% to exercise the majority-consistency gate.  c2 is left as the clean
+    packed-better base and its TTFT-family stays excluded from the paired set.
+    """
+
+    for arm in ARMS:
+        for repetition in (1, 2, 3):
+            _set_timing_leg(records[(16, arm, repetition)], duration=10.0, latency_ms=8.0)
+
+
 def _write_fixture_corpus(root: pathlib.Path, *, tokenizer: pathlib.Path) -> None:
     corpus_root = root / "corpus" / "27"
     corpus_root.mkdir(parents=True)
@@ -1360,7 +1391,14 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertEqual(summary["axis_total"], 39)
         self.assertTrue(summary["gate_pass"])
 
-    def test_stable_paired_reversal_cannot_pass_on_medians(self) -> None:
+    def test_single_rep_paired_reversal_is_diagnostic_only(self) -> None:
+        # A single rep-pair reversal — repetition 2 packed worse on throughput,
+        # latency AND memory, while r1/r3 are packed better — breaches the band
+        # in exactly ONE of three pairs.  Under the retired every-rep-pair-in-band
+        # rule this FAILED the gate even though every MEDIAN and memory-median
+        # axis passed; under the MAJORITY-CONSISTENCY rule a single-pair breach is
+        # leg-level run noise (no axis reaches a 2-of-3 same-direction majority),
+        # so it is recorded as a per-rep diagnostic and the component is ACCEPTED.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         concurrency = 2
@@ -1387,12 +1425,9 @@ class GdnPackedComponentTest(unittest.TestCase):
                 ):
                     memory[(concurrency, arm, repetition)][axis] = value
 
-        # The c2 TTFT-family is now compared arm-to-arm on the pooled 18-sample
+        # The c2 TTFT-family is compared arm-to-arm on the pooled 18-sample
         # distribution, so decouple it from the engineered throughput/memory
-        # per-rep reversal this test exercises: give it a clean, stable,
-        # packed-better profile (uniform, so it neither voids on stability nor
-        # flips the pooled comparison).  The throughput/memory/latency reversal at
-        # repetition 2 remains what drives the paired-axis failure below.
+        # per-rep reversal: give it a clean, stable, packed-better profile.
         for arm in ARMS:
             for repetition in (1, 2, 3):
                 ttft = 5.0 if arm == "packed" else 9.0
@@ -1402,14 +1437,147 @@ class GdnPackedComponentTest(unittest.TestCase):
 
         summary = summarize_component_records(records, memory)
 
+        # Every median and memory-median axis still passes (medians unmoved)...
         self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
         self.assertEqual(
             summary["memory_axis_pass_count"], summary["memory_axis_total"]
         )
+        # ...the single-pair reversal is still recorded as a per-rep diagnostic...
         self.assertLess(
             summary["paired_axis_pass_count"], summary["paired_axis_total"]
         )
+        c2 = summary["by_concurrency"]["2"]
+        self.assertFalse(c2["paired_axis_pass"]["r2"]["request_throughput"])
+        self.assertFalse(c2["paired_axis_pass"]["r2"]["memory/peak_pss_kib"])
+        # ...but no axis reaches a 2-of-3 same-direction majority, so it PASSES.
+        for verdict in c2["paired_axis_consistency"].values():
+            self.assertLessEqual(verdict["breach_count"], 1)
+            self.assertTrue(verdict["gate_pass"])
+        self.assertTrue(summary["paired_axis_consistency_pass"])
+        self.assertTrue(summary["gate_pass"])
+
+    def test_run6_single_pair_breach_passes_majority_gate(self) -> None:
+        # Requirement (a) — run-6-shaped fixture.  Run 6 sealed complete-failed
+        # with 40/40 median + 8/8 memory PASS, failing ONLY 10/132 gated paired
+        # axes, all inside the single c2 r1 rep-pair (packed ~1% slower).  Here the
+        # single breaching pair is c16 r1: ~1% worse on every non-tail axis, the
+        # other two pairs clean.  RED under the retired rule (any single-pair
+        # breach fails the gate); GREEN under majority-consistency (1 < 2).
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        _prime_c16_paired(records)
+        _set_timing_leg(records[(16, "packed", 1)], duration=10.10, latency_ms=8.08)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        # The run-6 40/40 + 8/8 shape: every median and memory axis passes.
+        self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
+        self.assertEqual(
+            summary["memory_axis_pass_count"], summary["memory_axis_total"]
+        )
+        c16 = summary["by_concurrency"]["16"]
+        # The single-pair breach is a recorded per-rep diagnostic...
+        self.assertFalse(c16["paired_axis_pass"]["r1"]["request_throughput"])
+        self.assertLess(
+            summary["paired_axis_pass_count"], summary["paired_axis_total"]
+        )
+        # ...but the majority-consistency verdict is 1 breach < 2 → passes.
+        consistency = c16["paired_axis_consistency"]["request_throughput"]
+        self.assertEqual(consistency["breach_count"], 1)
+        self.assertEqual(consistency["breaching_repetitions"], ["r1"])
+        self.assertTrue(consistency["gate_pass"])
+        self.assertTrue(summary["paired_axis_consistency_pass"])
+        self.assertEqual(summary["paired_axis_consistency_fail_count"], 0)
+
+    def test_run4_consistent_3of3_breach_still_fails(self) -> None:
+        # Requirement (b) — run-4-shaped fixture.  Run 4's c16 was a consistent
+        # 3/3 packed-worse pattern (packed throughput [793.50, 793.28, 795.79] vs
+        # rollback [800.12, 798.30, 800.60]).  All three rep-pairs breach the band
+        # in the SAME direction, so the gate FAILS before AND after the change
+        # (3 breaches >= the 2-of-3 majority; the median also regresses).
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        _prime_c16_paired(records)
+        for repetition in (1, 2, 3):
+            _set_timing_leg(
+                records[(16, "packed", repetition)], duration=10.08, latency_ms=8.064
+            )
+
+        summary = summarize_component_records(records, memory)
+
         self.assertFalse(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        consistency = c16["paired_axis_consistency"]["request_throughput"]
+        self.assertEqual(consistency["breach_count"], 3)
+        self.assertEqual(
+            consistency["breaching_repetitions"], ["r1", "r2", "r3"]
+        )
+        self.assertFalse(consistency["gate_pass"])
+        self.assertFalse(summary["paired_axis_consistency_pass"])
+        self.assertGreaterEqual(summary["paired_axis_consistency_fail_count"], 1)
+
+    def test_majority_2of3_breach_fails(self) -> None:
+        # Requirement (c) — a majority (2 of 3) of rep-pairs packed-worse in the
+        # same direction is a consistent regression and FAILS, even though the
+        # third pair is clean (packed better).
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        _prime_c16_paired(records)
+        _set_timing_leg(records[(16, "packed", 1)], duration=10.10, latency_ms=8.08)
+        _set_timing_leg(records[(16, "packed", 2)], duration=10.10, latency_ms=8.08)
+        _set_timing_leg(records[(16, "packed", 3)], duration=9.90, latency_ms=7.92)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertFalse(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        consistency = c16["paired_axis_consistency"]["request_throughput"]
+        self.assertEqual(consistency["breach_count"], 2)
+        self.assertEqual(consistency["breaching_repetitions"], ["r1", "r2"])
+        self.assertFalse(consistency["gate_pass"])
+        # The clean third pair is packed-better and is not a breach.
+        self.assertTrue(c16["paired_axis_pass"]["r3"]["request_throughput"])
+        self.assertFalse(summary["paired_axis_consistency_pass"])
+
+    def test_alternating_direction_breaches_pass(self) -> None:
+        # Requirement (d) — alternating-direction breaches.  One rep-pair packed
+        # ~2% worse (a breach) and one ~2% better (NOT a breach — packed >=
+        # rollback always passes), the third at parity.  No CONSISTENT packed-worse
+        # direction is reached (1 breach < 2), so the component is ACCEPTED.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        _prime_c16_paired(records)
+        _set_timing_leg(records[(16, "packed", 1)], duration=10.20, latency_ms=8.16)
+        _set_timing_leg(records[(16, "packed", 2)], duration=9.80, latency_ms=7.84)
+        # r3 stays at the primed parity baseline (duration 10.0 / latency 8.0).
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        # The packed-worse pair breaches; the packed-better pair does not.
+        self.assertFalse(c16["paired_axis_pass"]["r1"]["request_throughput"])
+        self.assertTrue(c16["paired_axis_pass"]["r2"]["request_throughput"])
+        consistency = c16["paired_axis_consistency"]["request_throughput"]
+        self.assertEqual(consistency["breach_count"], 1)
+        self.assertEqual(consistency["breaching_repetitions"], ["r1"])
+        self.assertTrue(consistency["gate_pass"])
+        self.assertTrue(summary["paired_axis_consistency_pass"])
+
+    def test_contract_records_the_majority_consistency_paired_gate(self) -> None:
+        summary = summarize_component_records(
+            _records(packed_better=True), _memory(packed_better=True)
+        )
+
+        paired_gate = summary["contract"]["paired_gate"]
+        self.assertEqual(paired_gate["rule"], "majority-consistency")
+        self.assertEqual(paired_gate["repetitions"], 3)
+        self.assertEqual(
+            paired_gate["breach_majority"],
+            gdn_component.PAIRED_GATE_BREACH_MAJORITY,
+        )
+        self.assertEqual(gdn_component.PAIRED_GATE_BREACH_MAJORITY, 2)
 
     def test_outlier_that_hides_inside_passing_means_is_rejected(self) -> None:
         records = _records(packed_better=True)

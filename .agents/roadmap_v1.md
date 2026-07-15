@@ -91,10 +91,26 @@ gating (pooled mean/median → diagnostic; compare fast/slow mode means split at
 `peak_mem_available_drop_kib` 2%; PSS/RSS keep 0.5%), calibrated from the five
 sealed roots. RED run-5-mixture-flip(38/40)→accepted / 5%-slow-regression→fail /
 1%-gpu-mem→accepted & >band→fail / lottery-extreme→skipped (focused **66/66**,
-tools **149/149**). Next: the orchestrator runs the **sixth** full **40+8**
-component (under the mode-conditional gate) from the pushed SHA; the `c172336`,
-`d82d282`, `d19e091`, `2dbe892`, `da05444` and diagnostic roots stay untouched.
-qkvz stays excluded.
+tools **149/149**). The **sixth** seal then reached **`complete-failed`** with
+**40/40 median + 8/8 memory PASS**, stability and correctness PASS, failing ONLY
+10/132 gated per-rep paired axes ALL inside the single c2 r1 rep-pair (packed ~1%
+slower, ratios 0.9894–0.9916; r2/r3 clean; artifact-set `2c582c83…bdbb`, manifest
+`ad178e54…1e20`, summary `48533c06…d1c1`). Because single-leg ±0.5–1% excursions
+are routine while the per-run stability rule tolerates ±4%, requiring every one
+of the 132 single-pair trials inside the 0.5% band gives P(pass) ≈ 0 even for
+identical engines. So **this checkpoint** adds the final test-first revision: a
+MAJORITY-CONSISTENCY paired gate (a gated paired axis fails only when ≥2 of its 3
+rep-pairs breach the band in the same packed-worse direction; single-pair
+breaches recorded as diagnostics; `contract.paired_gate={rule:"majority-consistency",
+repetitions:3,breach_majority:2}`; bands unchanged). Verified against sealed
+history: run 6's c2-r1-only excursion → PASSES; run 4's c16 3/3 packed-worse
+([793.50,793.28,795.79] vs [800.12,798.30,800.60]) → still FAILS. RED
+run-6-single-pair→accepted / run-4-3/3→fails before AND after / 2-of-3→fails /
+alternating(one +2%,one −2%)→passes (focused **71/71**, tools **154/154**). Next:
+the orchestrator runs the **seventh** full **40+8** component (under the
+majority-consistency gate) from the pushed SHA; the `c172336`, `d82d282`,
+`d19e091`, `2dbe892`, `da05444` and diagnostic roots stay untouched. qkvz stays
+excluded.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 

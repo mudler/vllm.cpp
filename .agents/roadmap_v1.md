@@ -50,10 +50,19 @@ while preserving the local slot ABI. A RED `test_runner` case threw the exact
 fatal, GREEN after the fix (`test_runner` 8/8, tools 132/132, touched CPU suites
 green, clean -Werror rebuild). Also removes latent silent cross-request GDN
 state corruption in pre-validator binaries (blast radius recorded in
-`docs/BENCHMARKS.md`). Next: DGX correctness gates + a fresh SHA/root full
-**40+8 / 144 paired**-axis component rerun; the `d82d282` and diagnostic roots
-stay untouched. qkvz stays excluded. Host PSS/RSS separately retains a
-**22.920 GiB** CPU weight mirror plus
+`docs/BENCHMARKS.md`). The slot fix is now proven on DGX at `c172336` (model
+gates **235/235 + 16/16**, `--diagnostic-c16` 3/3), but the first two sealed
+12-leg components both reached marker-last **`complete-void`** with every
+throughput/mean/median axis stable and packed non-regressing on forensic medians
+(run 1 c2, run 2 c16), voided **only** by max-dominated TTFT tail axes; those two
+voids proved the uniform ≤4% per-run rule mis-fits tail order statistics (p99 at
+c2 ≈ max of 6 samples, at c16 ≈ the 95th/96th), so the component's tail-axis
+stability tolerance was **revised test-first this checkpoint** — tails (p90/p99
+of ttft/tpot/itl/e2el) get 15% while non-tail timing and all memory axes keep 4%
+(focused **52/52**, tools **135/135**). Next: the orchestrator runs the third
+fresh SHA/root full **40+8 / 144 paired**-axis component from the pushed SHA; the
+`c172336`, `d82d282` and diagnostic roots stay untouched. qkvz stays excluded.
+Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 
 **Order-0 re-ranking (2026-07-14

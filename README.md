@@ -37,11 +37,15 @@ OpenAI-compatible server.
 > **test-first repair** now keys the slot on the request identity so each live
 > sequence owns exactly one slot for its lifetime (a RED runner test threw the
 > exact fatal, GREEN after the fix; `test_runner` **8/8**, all tools
-> **132/132**). This also fixes latent silent cross-request GDN state corruption
+> **135/135**). This also fixes latent silent cross-request GDN state corruption
 > that pre-validator binaries could hit at high concurrency (see
-> [Benchmarks](docs/BENCHMARKS.md)). The packed component stays `GATING` (no
-> speed credit) until the DGX correctness gates and a fresh 12-leg component
-> rerun pass. On the memory axis, the failing binding **peak** (48.3 GB) was
+> [Benchmarks](docs/BENCHMARKS.md)). The slot fix is proven on DGX at `c172336`,
+> but the first two sealed 12-leg components both reached `complete-void` with
+> stable means/medians, voided only by max-dominated TTFT tails; the per-run
+> tail stability tolerance was therefore revised test-first (tails 15%,
+> non-tail/memory 4%). The packed component stays `GATING` (no speed credit)
+> until a third 12-leg component from the pushed SHA reaches a verified terminal
+> status. On the memory axis, the failing binding **peak** (48.3 GB) was
 > localized to LOAD-time double-residency (the 22.92 GiB host mirror built while
 > the full source mmap stayed resident); a **windowed-load** change now releases
 > each copied-then-dead source range during the copy loop (`madvise(MADV_DONTNEED)`,
@@ -55,7 +59,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `4a450f9` `--diagnostic-c16` reproduction captured the c16 root cause **3/3** (`duplicate live GDN state index`, `qwen3_5.cpp:73`): the runner keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 for any sequence past its first mamba block, so 2 long c16 sequences shared 1 slot (last step: 6 requests, 5 live + 27 free of 32). **Repair proven on DGX** at `c172336`: the previously-fatal c16 boundary passes **3/3**, both model gates pass **235/235**, and the first-ever sealed 12-leg component reached marker-last **`complete-void`** — every throughput/mean axis stable and packed non-regressing on forensic medians (c2 TPOT 108.7 vs rollback 109.1 ms), voided only by c2 TTFT max-of-6-sample tail wobble | Component rerun (executing) to a verified terminal status, then qkvz |
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted, and the c16 slot defect (`duplicate live GDN state index`, captured 3/3 at `4a450f9`) is **repaired and proven on DGX** at `c172336`: the previously-fatal c16 boundary passes **3/3** and both model gates pass **235/235**. The first two sealed 12-leg components both reached marker-last **`complete-void`** — every throughput/mean/median axis stable and packed non-regressing on forensic medians (run 1 c2 TPOT 108.7 vs 109.1 ms; run 2 c16 tput 793.1/794.1, TPOT 166.5/166.2), voided **only** by max-dominated TTFT tail wobble (c2 max-of-6, c16 last-order-statistic). Those two voids show the uniform 4% per-run rule mis-fits tail order statistics, so the tail stability tolerance was revised test-first (tails 15%, non-tail/memory stay 4%) | Third 12-leg component from the pushed SHA to a verified terminal status, then qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED / windowed-load landed, A/B pending | The failing **peak** (48.3 GB) is load-time double-residency: the 22.92 GiB host mirror is built while the full source mmap stays resident; steady RSS afterwards is 24.75 GB — already below vLLM's 28.5 GB peak. Allocator retention is ruled out (≤0.5 GB). The `LOAD-SAFETENSORS` windowed release now drops each copied-then-dead source range during load (default on; `VT_LOAD_WINDOWED_RELEASE=0` rollback), CPU RED→GREEN tests green | Run the DGX VmHWM A/B (expect ~48.3 GB off vs ~25 GB on); axes stay FAILED until the authorized exact-grid rerun. Direct-to-device streaming remains the deeper fix (still wanted for 35B) |

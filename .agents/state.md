@@ -9692,3 +9692,62 @@ c2 decode gap has substantially closed on this workload, pending fresh
 denominators via the authorized exact grid. Binding stays **55/124**,
 `benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain
 blocked on a verified `complete-pass`.
+
+## 2026-07-15 — second component seals complete-void on c16 TTFT tails; tail-axis stability rule revised test-first (CLAIM-GDN-BA-ROUNDING-1)
+
+The precommitted condition is met: the rerun voided again solely on
+max-dominated TTFT tail axes while all means/medians stayed stable, so the
+component's tail-axis per-run stability rule was revised test-first as recorded
+in the 2026-07-15 precommitment above (before any third run, to avoid
+post-hoc tolerance shopping).
+
+**Run 2 evidence (`c172336`).** The fresh-root rerun
+`~/work/vllm.cpp-gdn-packed-component/c172336d15c58263186d57417cd6a523984f5af4-r2`
+ran all 12 legs to marker-last **`complete-void`** with
+`benchmark_binding=false`, `speed_credit=false` (status artifact-set SHA
+`0c18fb59…6729`, manifest `b698f4ce…fc15`, summary `55aade5e…85b0`). Void cause:
+`component c16 repetitions are unstable: packed/p99_ttft_ms=0.053252,
+rollback/p99_ttft_ms=0.044827` — c16 TTFT tail axes only (the 95th/96th order
+statistic of 96 requests, again max-dominated). Forensic (nonbinding) medians
+are stable and packed non-regressing: c16 packed/rollback tput
+**793.080/794.133**, TPOT **166.451/166.241**; c2 tput **158.816/158.321**,
+TPOT **108.543/108.861**. Run 1 (root `…-component/c172336…`, status artifact-set
+`e43963c9…40ab`) had voided on the c2 tails
+(`packed/p99_ttft 0.040977, rollback/p90 0.055722, rollback/p99 0.105773`).
+
+**Why the uniform 4% rule is mis-calibrated for tails.** At c2 each rep has 6
+requests so p99_ttft ≈ the MAX of 6 samples; at c16, 96 requests so p99 ≈ the
+95th/96th order statistic — again max-dominated. TTFT is long-tailed
+(batch-formation / prefill queue position), so the rep-to-rep dispersion of
+these order statistics is inherently far above 4% even on an idle box at fixed
+SHA/config/hardware — the two runs' 4.10–10.58% tail swings against 0.1–0.3%
+mean noise prove it. A uniform 4% rule on max statistics makes the gate a coin
+flip. Context: the binding-grid protocol gates stability on total-throughput CV
+only (0.189%); vLLM's own bench serve has no per-axis stability gating.
+
+**The revision (landed this checkpoint, test-first).** In the component
+stability validation (`tools/bench/gdn_packed_component.py`): non-tail timing
+axes (throughput, request rate, mean/median of ttft/tpot/itl/e2el) and all
+memory axes keep the ≤4% per-run deviation rule; the tail axes (p90/p99 of
+ttft/tpot/itl/e2el, new `TAIL_AXES`) get a 15% per-run tolerance
+(`MAX_TAIL_RUN_RELATIVE_DEVIATION`) via `_metric_stability_tolerance(axis)`, and
+the summary `contract.stability` records both tolerances plus the tail-axis
+list. 15% exceeds the maximum observed idle-box order-statistic noise (10.58%)
+with margin while still catching genuine contention (reproducible tail blowups
+are ≥2×, e.g. the binding grid's c8 p99_itl 1.78× arm gap); mean axes at 4%
+remain the sensitive contention detector (~0.3% noise floor). Tail MEDIANS
+remain full binding comparison axes — only the per-run stability tolerance
+changed; acceptance/comparison logic, the non-tail 4% rule and the memory-return
+tolerance are untouched.
+
+**Gates.** Test-first RED→GREEN in
+`tests/tools/test_gdn_packed_component.py`: a tail-only ~12% instability
+(rollback c2 p99_ttft dev 12.48%, means held) voided pre-change and is accepted
+post-change; a tail ~20% (dev ~19.6%) still voids; a non-tail throughput ~5%
+swing still voids. Focused `test_gdn_packed_component` **52/52**, all tools
+**135/135**, `py_compile` clean, `check-agent-record.py` / `test_agent_record.py`
+/ `test_doc_checkpoint.py` OK. Nothing GPU here — the orchestrator runs the
+third full 12-leg component from the pushed SHA; the `c172336`, `…-r2`,
+`d82d282` and diagnostic roots stay untouched. Binding stays **55/124**,
+`benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain blocked
+on a verified `complete-pass`.

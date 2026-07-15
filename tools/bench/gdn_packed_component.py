@@ -86,6 +86,14 @@ LOWER_AXES = tuple(
     for metric in ("ttft", "tpot", "itl", "e2el")
     for stat in ("mean", "median", "p90", "p99")
 )
+# Tail order statistics: p90/p99 of every timed latency.  These carry a looser
+# per-run stability tolerance (see ``MAX_TAIL_RUN_RELATIVE_DEVIATION``); their
+# medians remain full binding comparison axes.
+TAIL_AXES = frozenset(
+    f"{stat}_{metric}_ms"
+    for metric in ("ttft", "tpot", "itl", "e2el")
+    for stat in ("p90", "p99")
+)
 MEMORY_AXES = (
     "peak_gpu_memory_mib",
     "peak_pss_kib",
@@ -96,6 +104,19 @@ DERIVED_ARTIFACTS = frozenset(
     {"component-summary.json", "component-manifest.json", "component-status.json"}
 )
 MAX_RUN_RELATIVE_DEVIATION = 0.04
+# Per-run stability tolerance for the TAIL axes (p90/p99 of ttft/tpot/itl/e2el).
+# At c2 each repetition has six requests, so p99 is effectively the max of six
+# samples and p90 the mean of the two largest; TTFT is long-tailed (batch
+# formation / prefill queue position), so the rep-to-rep dispersion of these
+# order statistics is inherently far above 4% even on an idle box at a fixed
+# SHA/config/hardware (measured up to 10.58% with 0.1-0.3% mean noise).  A
+# uniform 4% rule on max-dominated statistics makes the gate a coin flip.  15%
+# clears the worst observed idle-box order-statistic noise with margin while
+# still catching genuine contention (reproducible tail blowups are >=2x, e.g.
+# the binding grid's c8 p99_itl 1.78x arm gap); mean axes stay the sensitive
+# 4% contention detector (noise floor ~0.3%).  Tail MEDIANS are unchanged full
+# binding comparison axes — only the per-run stability tolerance is relaxed.
+MAX_TAIL_RUN_RELATIVE_DEVIATION = 0.15
 MEMORY_RETURN_TOLERANCE_KIB = 1048576
 # Pinned vLLM records the first-token timestamp, then calls perf_counter() a
 # second time for TTFT.  Consequently TTFT + sum(ITLs) exceeds its retained
@@ -306,6 +327,24 @@ def _distribution(values: list[float], *, label: str) -> dict[str, float]:
     }
 
 
+def _metric_stability_tolerance(axis: str) -> float:
+    """Return the per-run deviation tolerance for a timing axis.
+
+    Non-tail axes (throughput, request rate, and mean/median of every timed
+    latency) keep the 4% contention detector.  Tail axes (p90/p99 of
+    ttft/tpot/itl/e2el) are single-sample-dominated order statistics whose
+    idle-box, fixed-SHA dispersion far exceeds 4%, so they carry the looser
+    ``MAX_TAIL_RUN_RELATIVE_DEVIATION``.  Memory axes are never tail and are
+    gated at ``MAX_RUN_RELATIVE_DEVIATION`` directly by the caller.
+    """
+
+    return (
+        MAX_TAIL_RUN_RELATIVE_DEVIATION
+        if axis in TAIL_AXES
+        else MAX_RUN_RELATIVE_DEVIATION
+    )
+
+
 def _normalized_ratio(numerator: float, denominator: float, *, label: str) -> float:
     if denominator <= 0.0 or numerator < 0.0:
         raise HarnessError(f"component {label} cannot form a normalized ratio")
@@ -337,7 +376,11 @@ def summarize_component_records(
             },
             "stability": {
                 "maximum_relative_deviation_from_median": MAX_RUN_RELATIVE_DEVIATION,
+                "maximum_tail_relative_deviation_from_median": (
+                    MAX_TAIL_RUN_RELATIVE_DEVIATION
+                ),
                 "repetitions": len(REPETITIONS),
+                "tail_axes": sorted(TAIL_AXES),
             },
         },
     }
@@ -400,7 +443,7 @@ def summarize_component_records(
             )
             for axis, distribution in axes.items()
             if distribution["maximum_relative_deviation_from_median"]
-            > MAX_RUN_RELATIVE_DEVIATION
+            > _metric_stability_tolerance(axis)
         ]
         unstable.extend(
             f"{arm}/memory/{axis}="

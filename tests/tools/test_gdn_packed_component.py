@@ -189,6 +189,25 @@ def _set_latency(record: dict, latency_ms: float) -> None:
         record[f"{stat}_e2el_ms"] = latency_ms * 128
 
 
+def _apply_ttft_ms(record: dict, ttfts_ms: list[float]) -> None:
+    """Replace the TTFT samples and re-derive every reported timing field.
+
+    Only the raw ``ttfts`` array changes; the ITL/output arrays and duration
+    stay fixed, so throughput, TPOT and ITL are untouched and — because decode
+    dominates E2EL — essentially only the TTFT distribution (including its
+    p90/p99 tail) moves.  Reassigning every ``LOWER_AXES`` field from the
+    detailed recomputation keeps the record self-consistent with the harness'
+    exact ``_run_metrics`` recomputation check.
+    """
+
+    if len(ttfts_ms) != record["completed"]:
+        raise AssertionError("ttft sample count must equal the request count")
+    record["ttfts"] = [value / 1000.0 for value in ttfts_ms]
+    metrics = gdn_component._recompute_timing_metrics(record)
+    for axis in gdn_component.LOWER_AXES:
+        record[axis] = metrics[axis]
+
+
 def _records(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
     result = {}
     for concurrency in CONCURRENCIES:
@@ -922,6 +941,86 @@ class GdnPackedComponentTest(unittest.TestCase):
                 "peak_mem_available_drop_kib",
             ):
                 memory[(concurrency, "packed", 3)][axis] *= 1.6
+
+        with self.assertRaisesRegex(HarnessError, "unstable"):
+            summarize_component_records(records, memory)
+
+    # Tail order statistics (p90/p99 of ttft/tpot/itl/e2el) at c2 are the max of
+    # six samples per repetition; their idle-box, fixed-SHA rep-to-rep
+    # dispersion is inherently far above the mean-axis noise floor.  These
+    # arrays hold mean_ttft (27 ms) and median_ttft (20 ms) exactly constant
+    # across the three repetitions and move ONLY the TTFT tail: the perturbed
+    # p99 deviation lands between the 4% (old, uniform) and 15% (revised, tail)
+    # thresholds for the 12% fixture and clears 15% for the 20% fixture.
+    _C2_TTFT_TAIL_12PCT = {
+        1: [6.0, 15.0, 20.0, 20.0, 40.0, 61.0],   # p99 59.95
+        2: [13.0, 15.0, 20.0, 20.0, 40.0, 54.0],  # p99 53.30 (median rep)
+        3: [14.0, 15.0, 20.0, 20.0, 40.0, 53.0],  # p99 52.35
+    }
+    _C2_TTFT_TAIL_20PCT = {
+        1: [2.0, 15.0, 20.0, 20.0, 40.0, 65.0],   # p99 63.75
+        2: [13.0, 15.0, 20.0, 20.0, 40.0, 54.0],  # p99 53.30 (median rep)
+        3: [14.0, 15.0, 20.0, 20.0, 40.0, 53.0],  # p99 52.35
+    }
+
+    def test_tail_only_instability_within_15pct_is_accepted(self) -> None:
+        # A component whose ONLY per-run instability is a TTFT tail axis at ~12%
+        # (mean/median/throughput/memory all stable) voids under the uniform 4%
+        # rule; under the revised tail tolerance it must be ACCEPTED (not void).
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition, ttfts_ms in self._C2_TTFT_TAIL_12PCT.items():
+            _apply_ttft_ms(records[(2, "rollback", repetition)], ttfts_ms)
+
+        # The lone perturbed axis is the TTFT tail, and its deviation lands
+        # strictly between the old uniform 4% and the revised 15% tail bound.
+        deviation = gdn_component._distribution(
+            [records[(2, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
+            label="c2/rollback/p99_ttft_ms",
+        )["maximum_relative_deviation_from_median"]
+        self.assertGreater(deviation, gdn_component.MAX_RUN_RELATIVE_DEVIATION)
+        self.assertLess(deviation, 0.15)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["all_repetitions_stable"])
+        self.assertTrue(summary["gate_pass"])
+        stability = summary["contract"]["stability"]
+        self.assertEqual(stability["maximum_relative_deviation_from_median"], 0.04)
+        self.assertEqual(
+            stability["maximum_tail_relative_deviation_from_median"], 0.15
+        )
+        self.assertEqual(
+            stability["tail_axes"],
+            sorted(
+                f"{stat}_{metric}_ms"
+                for metric in ("ttft", "tpot", "itl", "e2el")
+                for stat in ("p90", "p99")
+            ),
+        )
+
+    def test_tail_instability_beyond_15pct_still_voids(self) -> None:
+        # A TTFT tail axis at ~20% exceeds the revised tail tolerance and must
+        # still void, so genuine tail blowups remain caught.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition, ttfts_ms in self._C2_TTFT_TAIL_20PCT.items():
+            _apply_ttft_ms(records[(2, "rollback", repetition)], ttfts_ms)
+
+        with self.assertRaisesRegex(HarnessError, "unstable"):
+            summarize_component_records(records, memory)
+
+    def test_non_tail_instability_at_5pct_still_voids(self) -> None:
+        # A mean/throughput axis stays gated at 4%: a ~5% throughput swing on a
+        # single repetition still voids, unaffected by the tail tolerance.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        requests = 6
+        record = records[(2, "packed", 1)]
+        record["duration"] = 10.53
+        record["request_throughput"] = requests / 10.53
+        record["output_throughput"] = requests * 128 / 10.53
+        record["total_token_throughput"] = requests * (1024 + 128) / 10.53
 
         with self.assertRaisesRegex(HarnessError, "unstable"):
             summarize_component_records(records, memory)

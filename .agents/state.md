@@ -10313,3 +10313,39 @@ slowdown vs episodic stalls), server-log tactic/selection lines
 to localize what distinguishes a deficit run before any code hypothesis.
 Binding stays **55/124**, `benchmark_binding=false`, no speed credit;
 qkvz/exact-grid/35B remain blocked on a `complete-pass`.
+
+## 2026-07-15 — forensic verdict: packed carries a constant ~0.2% per-token tax; deficit intermittency is tail draw; clocks ruled out
+
+The read-only forensic diff of the four post-fix sealed component runs
+(deficit `2dbe892e`/`495ba780` vs tie `da05444f`/`69a3c03`) decomposed the
+c16 intermittency into two superposed effects. (1) A UNIFORM, RUN-INDEPENDENT
+per-token tax on the packed arm: the steady-decode median ITL (the sharp
+~129 ms mode, ~95% of tokens) is higher for packed in ALL FOUR runs by
++0.14–0.16% at c16 and +0.25–0.31% at c2 — including both runs packed won —
+so the BF16-BA + packed-recurrence path is genuinely ~0.2% slower steady-state
+than F32-BA + decomposed, constant across processes and runs. (2) The
+deficit/tie OUTCOME lives entirely in the prefill-stall tail (~4.5% of tokens,
+~800–900 ms scheduler stalls, ~24–25% of wall time): the tail contribution
+swings ±0.3–0.5% and flips sign run-to-run (p99 delta flips perfectly with
+the throughput outcome), with inconsistent spike signatures between the two
+deficit runs — a run-scoped alignment draw, stable across a run's three
+fresh-server reps yet varying between runs. Thermal/clock regime is
+DECISIVELY ruled out: P0 in every leg, arms matched within ~1 °C, zero SW/HW
+throttle accrual in every leg. FP4 tactics are pinned byte-identical (frozen
+64-plan cache, same hash all arms/runs) and are not a variable; the one
+un-instrumented per-process variable is the cuBLASLt algo selection for the
+BF16 BA GEMM (no algo/heuristic lines exist in any server log). Cross-run
+medians are confounded by a ~1.5–2% both-arms warm-up drift (cold→optimum→
+afternoon), which also explains why absolute throughputs rose across the day.
+
+Precommitted next measurement (the forensic report's single decisive step):
+one GPU-locked interleaved high-rep (≥8 AB/BA) c16 A/B adding env-gated
+cuBLASLt algo-ID/tile logging on the BF16-BA GEMM path, plus a mid-run
+steady-window `nsys --cuda-graph-trace=node` capture of one packed and one
+rollback leg — localizing the constant tax (BA-GEMM algo vs recurrence kernel
+vs host) and establishing whether the algo choice is process-stable. If the
+tax is a slower deterministic cuBLASLt algo pick for the BF16 BA shape, that
+is the fixable lever; if intrinsic, the packed-default decision gets made on
+recorded evidence (exact-upstream semantics + 48-launch reduction vs a
+~0.2% steady cost). Analysis scripts are retained in the session scratchpad;
+no roots were modified. Binding stays **55/124**, `benchmark_binding=false`.

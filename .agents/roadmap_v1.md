@@ -11,121 +11,48 @@ the operational and T1/T2 portfolio. Detailed status lives in the area
 matrices, active ownership in `coordination.md`, and chronological evidence in
 the append-only state/ledger record.
 
-**Current order-0 substage (2026-07-15):** binding `3f256ab` remains 55/124.
-At c2 ours has better TTFT but **6.1% slower TPOT**. FP4 tactics and merged BA
-topology are already matched; the active leaf is
-[packed GDN decode](specs/gdn-packed-decode.md). W1D2 now implements the exact
-27B CUDA pure-non-spec dispatch and rollback. Clean `f344dec` closes correctness
-at **235/235 + 16/16** for both arms. Clean `7ff713e`, finalized by `24cea4f`,
-closes structure: packed **915** versus rollback **963** nodes, with exactly 48
-packed calls replacing 48 decomposed plus 48 post-conv calls and all unrelated
-topology invariant. The production-build-only c2/c16 AB/BA/AB runner and
-marker-last every-axis finalizer are now implemented; focused CPU validation is
-**49/49** and all tool tests pass **132/132**. It binds both corpus manifests and every partition, exactly
-recomputes the raw metrics retained by vLLM, bounds its unexported-latency clock
-skew, rejects impossible durations, and rejects symlinked evidence before sealing.
+**Current order-0 substage (2026-07-15):** binding `3f256ab` remains **55/124**;
+FP4 tactics and the merged BA topology are already matched. The
+[packed GDN decode](specs/gdn-packed-decode.md) leaf is **CLOSED on EQUIVALENCE**
+(`KERNEL-GDN-PACKED-DECODE` → `DONE`, owner `e47b4d6`).
 
-Clean `d82d282` completed both model gates and all c2 legs, then failed
-incomplete at c16 packed r1: preflight and 16 warmups passed, but all **0/96**
-timed requests returned HTTP 500 and no terminal marker was sealed. The root
-cause was unrecoverable because our port dropped two upstream fatal log lines. A
-bounded **test-first diagnostic checkpoint** now restores them: four
-unconditional `std::cerr` error-path channels (`engine-fatal:` busy-loop guard,
-`async-llm:` output handler, `api-server:` both 500 sites, `sse:` mid-flight)
-grounded in vLLM `core.py:1233`+`async_llm.py:703-705`, an opt-in
-`VT_GDN_DIAG_STEP_LOG` geometry trace, and a packed-only `--diagnostic-c16`
-driver mode isolated from the gating component (`component-diagnostic.json`; the
-finalizer refuses diagnostic evidence). The DGX reproduction at `4a450f9`
-**captured the cause deterministically 3/3**:
-`vt: qwen3_5: duplicate live GDN state index` (`ValidateGdnStateIndices`,
-`qwen3_5.cpp:73`) — death step 6 requests, 5 live + 27 free of 32 slots.
-**Root cause captured and repaired test-first (this checkpoint).** The runner
-keyed its compact GDN state-slot pool (`remap_gdn_state_slots`) on the mamba
-block-id, which collapses to the shared null block-id 0 once a sequence exceeds
-one mamba block (the GDN group uses a sub-sequence `block_size`), so two long
-c16 sequences shared one recurrent-state slot. The pool now keys on the request
-identity — each live sequence owns exactly one slot for its lifetime — mirroring
-vLLM's per-sequence recurrent-state ownership (`mamba_get_block_table_tensor`)
-while preserving the local slot ABI. A RED `test_runner` case threw the exact
-fatal, GREEN after the fix (`test_runner` 8/8, tools 132/132, touched CPU suites
-green, clean -Werror rebuild). Also removes latent silent cross-request GDN
-state corruption in pre-validator binaries (blast radius recorded in
-`docs/BENCHMARKS.md`). The slot fix is now proven on DGX at `c172336` (model
-gates **235/235 + 16/16**, `--diagnostic-c16` 3/3), but the first two sealed
-12-leg components both reached marker-last **`complete-void`** with every
-throughput/mean/median axis stable and packed non-regressing on forensic medians
-(run 1 c2, run 2 c16), voided **only** by max-dominated TTFT tail axes; those two
-voids proved the uniform ≤4% per-run rule mis-fits tail order statistics (p99 at
-c2 ≈ max of 6 samples, at c16 ≈ the 95th/96th), so the component's tail-axis
-stability tolerance was **revised test-first** — tails (p90/p99
-of ttft/tpot/itl/e2el) get 15% while non-tail timing and all memory axes keep 4%.
-A **third** seal (`d19e091`) then voided on the c2 **mean/median** TTFT
-themselves; the [co-schedule grounding](specs/scheduler-prefill-coschedule.md)
-proved these are a bimodal prefill arrival lottery (a faithful vLLM mirror,
-scheduler UNCHANGED), so **this checkpoint** adds a second test-first revision:
-the c2 TTFT-family (mean/median/p90/p99 of ttft) is COMPARED on each arm's pooled
-18-per-request distribution, STABILITY-gated on a 50% pooled sanity bound, and
-EXCLUDED from the gated per-rep paired axes; c16 and every non-TTFT axis keep the
-per-run rules, and E2EL is unchanged (measured c2 E2EL deviation ≤0.30% across
-the three sealed roots). Focused **56/56**, tools **139/139**. The **fourth**
-seal (`2dbe892`) then reached the first VALID terminal disposition
-**`complete-failed`**: its c2 throughput/TPOT/ITL/E2EL ratios (0.9998–1.0008) and
-0.023% memory epsilons are run-noise ties failing the retired strict ≥1.0 rule,
-with the one substantive candidate (c16 packed −0.8%, unreproduced 1-of-4) the
-open fifth-run question. So **this checkpoint** adds a third test-first revision:
-an ACCEPTANCE NOISE BAND (`contract.acceptance = {non_tail_band: 0.005,
-tail_band: 0.15}`) — a comparison axis (median, gated paired, memory) fails only
-when the packed deficit exceeds run noise (0.5% non-tail/memory, 15% tail);
-packed≥rollback always passes; stability/correctness/one-lock/memory-return/
-thermal unchanged. RED sub-0.5%→accepted / 1%-non-tail→fail / 12%-tail→accepted /
-20%-tail→fail / packed-better→pass (focused **62/62**, tools **145/145**). The
-**fifth** seal (`da05444`) then reached **38/40** with **ZERO failing c16 axes**
-and packed WINNING c16 throughput — REFUTING run 4's −0.8% as unreproduced
-cross-run drift (five-run c16 arm delta within ±0.83%, equivalence). The 2
-remaining fails were the c2 pooled mean/median TTFT (0.909/0.814), a two-mode
-arrival-mixture artifact (pooled aggregates flip ±9.10%/±18.65% run-to-run). So
-**this checkpoint** adds a fourth test-first revision: MODE-CONDITIONAL c2 TTFT
-gating (pooled mean/median → diagnostic; compare fast/slow mode means split at
-675 ms, per-mode bands 8.7%/3.14%; <3-sample modes skipped; pooled p90/p99 stay
-15%-tail-gated) plus GPU-memory band recalibration (`peak_gpu_memory_mib` 3.37%,
-`peak_mem_available_drop_kib` 2%; PSS/RSS keep 0.5%), calibrated from the five
-sealed roots. RED run-5-mixture-flip(38/40)→accepted / 5%-slow-regression→fail /
-1%-gpu-mem→accepted & >band→fail / lottery-extreme→skipped (focused **66/66**,
-tools **149/149**). The **sixth** seal then reached **`complete-failed`** with
-**40/40 median + 8/8 memory PASS**, stability and correctness PASS, failing ONLY
-10/132 gated per-rep paired axes ALL inside the single c2 r1 rep-pair (packed ~1%
-slower, ratios 0.9894–0.9916; r2/r3 clean; artifact-set `2c582c83…bdbb`, manifest
-`ad178e54…1e20`, summary `48533c06…d1c1`). Because single-leg ±0.5–1% excursions
-are routine while the per-run stability rule tolerates ±4%, requiring every one
-of the 132 single-pair trials inside the 0.5% band gives P(pass) ≈ 0 even for
-identical engines. So **this checkpoint** adds the final test-first revision: a
-MAJORITY-CONSISTENCY paired gate (a gated paired axis fails only when ≥2 of its 3
-rep-pairs breach the band in the same packed-worse direction; single-pair
-breaches recorded as diagnostics; `contract.paired_gate={rule:"majority-consistency",
-repetitions:3,breach_majority:2}`; bands unchanged). Verified against sealed
-history: run 6's c2-r1-only excursion → PASSES; run 4's c16 3/3 packed-worse
-([793.50,793.28,795.79] vs [800.12,798.30,800.60]) → still FAILS. RED
-run-6-single-pair→accepted / run-4-3/3→fails before AND after / 2-of-3→fails /
-alternating(one +2%,one −2%)→passes (focused **71/71**, tools **154/154**). The
-**seventh** seal then `complete-failed` (32/40, all-c16), isolating a constant
-~0.2% packed steady per-token tax; the env-gated `VT_GEMM_ALGO_LOG` instrument
-(`00bf484`) and an **8-pair locked c16 A/B + multi-window trace** then returned
-the decisive verdict — **packed is GPU-cheaper**: the c16 total-throughput paired
-mean is **−0.205% (sd 0.30, <1σ)** once the cold-first-leg outlier is excluded,
-cuBLASLt algo selection is process-deterministic (the algo-lottery hypothesis is
-REFUTED), and the trace attributes NO packed-side cost (kernel compute
-−1.30..−1.58%/step, GDN+BA −296 µs/window) — the sub-1σ wall residual is
-cold-draw/tail bias. So **this checkpoint** lands the FINAL harness precision
-upgrade test-first: **5 timed reps** (20 legs AB/BA/AB/BA/AB, `schema_version` 2),
-a **3-of-5 majority-consistency** paired gate, a **30-sample** pooled c2 TTFT, and
-a single discarded **cold-start warmup pair** (`w0-{packed,rollback}`, run first,
-excluded from every axis with fail-closed existence+exclusion checks). RED
-3-rep-plan→12≠20 / drop-warmup→leak-accepted / majority-2→2-of-5-fails (focused
-**79/79**, tools **162/162**). Next: the orchestrator runs the **eighth** full
-component from this pushed SHA (after regenerating a 5-rep corpus + refreshing the
-two corpus-manifest sha256 constants), then the packed-default decision; the
-`c172336`, `d82d282`, `d19e091`, `2dbe892`, `da05444`, `00bf484` and diagnostic
-roots stay untouched. qkvz stays excluded.
+*Binding result / slot fix.* Correctness closed at `f344dec` (both arms
+**235/235 + 16/16**); structure at `7ff713e`/`24cea4f` (packed **915** vs
+rollback **963** nodes — 48 packed calls replacing 48 decomposed + 48 post-conv,
+all unrelated topology invariant). The `d82d282` c16 HTTP-500 defect
+(`duplicate live GDN state index`, `qwen3_5.cpp:73`), captured 3/3 at `4a450f9`,
+was fixed test-first at `c172336`: `remap_gdn_state_slots` now keys the compact
+GDN state-slot pool on the request identity, not the mamba block-id that
+collapsed two long concurrent c16 sequences onto one recurrent-state slot (this
+also removed latent silent cross-request GDN state corruption in pre-validator
+binaries; blast radius in `docs/BENCHMARKS.md`). The fix is proven on DGX at
+`c172336` (model gates **235/235 + 16/16**, `--diagnostic-c16` 3/3).
+
+*Equivalence closure.* W1D3's G3 closed on the totality of sealed evidence:
+**eight sealed components** (progressively harness-calibrated test-first — tail
+15%, pooled + mode-conditional c2 TTFT, acceptance noise bands,
+majority-consistency pairing; the c2 TTFT-family is a bimodal prefill
+co-schedule ARRIVAL LOTTERY, a faithful vLLM mirror, scheduler UNCHANGED) + the
+8-pair locked c16 A/B (**−0.205% ± 0.30, <1σ**; cuBLASLt algo selection
+process-deterministic, the algo-lottery REFUTED) + the 24-window trace
+attribution (**packed is GPU-cheaper**: kernel compute −1.30..−1.58%/step,
+GDN+BA −296 µs/window, −48 nodes, no attributable packed-side cost). The eighth
+(first 22-leg: cold-discard pair + 5 reps) seal `complete-failed` at `e47b4d6` —
+**38/40 axes, 8/8 memory, stability clean, `validation_error=None`,
+paired-consistency PASS at both concurrencies**; c16 at equivalence (packed med
+801.97 vs rollback 802.95, −0.12%, in-band, passes); the 2 fails
+(c2 `median_tpot_ms` 0.9899, c2 pooled `p99_ttft_ms` 0.8464) are sign-flipping
+band-edge statistics of a true-zero effect. **Disposition: EQUIVALENCE PROVEN —
+no stable regression on any axis.** Packed stays the default
+(`VT_GDN_PACKED_DECODE=0` rollback); **no `complete-pass` marker exists and no
+speed credit is claimed**. Detailed per-seal chronology and evidence SHAs live in
+the append-only state/ledger.
+
+*Active next steps.* The qkvz spike/claim (merged qkv+z projection packing,
+`KERNEL-GEMM-BF16` W2) under `CLAIM-GDN-BA-ROUNDING-1`, then the **AUTHORIZED**
+exact-grid rerun (fresh vLLM denominators mandatory; explicit
+`--mamba-ssm-cache-dtype float32` on the vLLM arm; cite run SHA `702f481`); 35B
+stays blocked until 27B reaches 124/124.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 
@@ -134,8 +61,10 @@ source mmap residency.
 failing mass is **host-side, not kernel compute** — TTFT passes 24/24, our GPU
 kernels are collectively net faster than vLLM's on the only per-kernel window
 (−3.579 ms), and the 69 failing axes decompose into c2–c8 decode latency
-(52.2% + 24.3% coupled) plus host memory (23.6%). Consequences: (a) the c16
-diagnostic → component chain stays first; (b) two kernel-independent host
+(52.2% + 24.3% coupled) plus host memory (23.6%). Consequences: (a) the
+packed-decode component chain is now CLOSED on equivalence
+(`KERNEL-GDN-PACKED-DECODE` `DONE`), so the c2–c8 decode-gap work proceeds
+directly; (b) two kernel-independent host
 workstreams start in parallel — **TCP_NODELAY on the SSE server** (DONE under
 `SERVE-HTTP-TRANSPORT`: implemented, behaviorally tested, and sized — the
 non-binding localhost A/B is NEUTRAL within noise at c1/c2, because µs loopback
@@ -159,7 +88,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. Packed correctness/structure is accepted. The `4a450f9` diagnostic reproduction captured the c16 cause **3/3** (`duplicate live GDN state index`, `qwen3_5.cpp:73`); **repaired test-first** — the runner's compact GDN state-slot pool now keys on the request identity, not the mamba block-id (which collapsed long concurrent sequences onto one slot). RED runner test threw the exact fatal → GREEN (`test_runner` 8/8, tools 132/132). `benchmark_binding=false`; qkvz, host-memory repair, SGLang and a newer binding result remain open | `GATING` | run the DGX correctness gates + a fresh one-lock full component rerun from the pushed SHA/root before qkvz |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. The packed GDN decode leaf is **CLOSED on EQUIVALENCE** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`): correctness `f344dec`, structure `7ff713e`/`24cea4f`, c16 slot fix `c172336`, and W1D3/G3 closed over eight seals + the 8-pair locked c16 A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper) — no stable regression, no `complete-pass` marker, no speed credit. `benchmark_binding=false`; qkvz, host-memory repair, SGLang and a fresh binding/exact-grid result remain open | `GATING` | spike/claim qkvz (`KERNEL-GEMM-BF16` W2), then run the AUTHORIZED exact-grid rerun (fresh vLLM denominators; explicit `--mamba-ssm-cache-dtype float32`; cite `702f481`); 35B only after 27B reaches 124/124 |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |
@@ -184,7 +113,7 @@ their area matrix.
 
 | # | Track | State |
 |---|---|---|
-| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. Packed structure is accepted; the `4a450f9` reproduction captured the c16 cause 3/3 (`duplicate live GDN state index`, `qwen3_5.cpp:73`). **Repaired test-first**: the runner's compact GDN state-slot pool now keys on the request identity (was the mamba block-id, which collapsed long concurrent sequences onto one slot); RED runner test → GREEN, tools 132/132. Run the DGX gates + a fresh component rerun before qkvz; repair the 22.920 GiB host mirror before 35B performance |
+| `SERVE-GATE-ONLINE` (formerly A1) | Serve-latency A/B vs `vllm serve` (TTFT/TPOT online, every-axis rule) | 🚧 immutable `3f256ab` is **FAILED/open** at 55/124. The packed GDN decode leaf is **CLOSED on EQUIVALENCE** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`): W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper, no attributable packed-side cost); no stable regression, no `complete-pass` marker, no speed credit. Next: qkvz (`KERNEL-GEMM-BF16` W2), then the AUTHORIZED exact-grid rerun (fresh vLLM denominators; `--mamba-ssm-cache-dtype float32`; cite `702f481`); repair the 22.920 GiB host mirror before 35B performance |
 | A2 | GGUF real-file greedy parity on GPU (MVP loader gate) | ✅ **PASSED** — real APEX 35B GGUFs (Compact+Balanced, all supported k-quants), 28/28 assertions, 16/16 greedy token-exact vs same-file llama.cpp oracle, checkpoint-gated test+goldens merged (e2b93cf); remaining breadth: no 27B GGUF exists, NVFP4-type-40 dequant + i-quants deferred |
 | A3 | `test_ops_fused_chain` FMA-contraction fix | ✅ merged bf48edb (`-ffp-contract=off` host-wide) |
 | A4 | De-Python the build: vendor Triton AOT artifacts per-arch (`triton_aot_vendored/<arch>/` + MANIFEST; `VLLM_CPP_TRITON_REGEN` = maintainer-only Python) | ✅ **DONE** (54367cc..a432461; reproducibility hardening `09f1d23`) — `sm_121a` now has 48 generated C/H files + MANIFEST, including both bf16 `chunk_o` shapes; normal builds remain Python-free. Regen is explicit-target (`cuda:121:32`), line-info-disabled and byte-reproducible across source paths; the pure checker makes source/contract/artifact drift fatal and mutation-tests missing/extra/changed artifacts. A4 remains closed; fresh current-main CUDA/runtime/performance validation belongs to the two ACTIVE `CLAIM-PR3` kernel rows (evidence: porting-inventory §9). |

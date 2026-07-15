@@ -9456,3 +9456,29 @@ sizing is pending), the row is `ACTIVE` and converges to `GATING` on release.
 Substance is exactly "implemented + CPU-tested, GPU sizing pending". No
 lifecycle state of any other row, benchmark ratio, or speed credit changed;
 `benchmark_binding=false`.
+
+## 2026-07-15 — TCP_NODELAY sized NEUTRAL on loopback; SERVE-HTTP-TRANSPORT closed DONE
+
+The deferred non-binding sizing for the `ff915e8` TCP_NODELAY mirror ran as a
+one-lock localhost A/B on dgx in
+`~/work/vllm.cpp-tcpnodelay-sizing/ff915e8f6287133e2f13422ea082940a43cf5bfd`:
+arm Nagle-ON = the preserved `4a450f9` diagnostic build (read-only binary use;
+no writes to that root), arm Nagle-OFF = a fresh `ff915e8` production build
+(the arms differ by docs plus the one-line mirror only), c1 and c2 × two reps
+per arm, identical pinned-client workload (c16-r1 corpus rows, 128 output
+tokens, greedy). Result: NEUTRAL within noise on every metric — c1 mean ITL
+≈102.6–102.9 ms and c2 ≈107.8–109.2 ms in both arms, with p99s and throughput
+equal; the sole outlier is the series' first cold-start leg (nagle-on-c1-r1)
+and is excluded. Raw-set SHA-256 `f5b52900…2128` (8 files). Mechanism: the
+per-token SSE write cadence (~100 ms) is far slower than loopback ACKs (µs),
+so a prior frame is always acknowledged before the next write and Nagle never
+coalesces; this extends mechanistically to every grid concurrency on
+loopback. The parity rescan's rank-1 loopback gain hypothesis is therefore
+REFUTED by measurement; the mirror remains as real-network transport parity
+with no expected gate-axis credit, and the c2–c8 decode-gap attribution
+concentrates on the nsys full-step c2 diff and `ENG-ASYNC-SCHED` W3.
+`SERVE-HTTP-TRANSPORT` is closed `DONE` (closing commit `ff915e8`, ledger row
+appended, summary gains a DONE column) and `CLAIM-SERVE-TRANSPORT-1` leaves
+the live claim table. No benchmark ratio changes; binding stays **55/124**
+and `benchmark_binding=false`. The GDN slot-lifecycle repair remains the
+active first track.

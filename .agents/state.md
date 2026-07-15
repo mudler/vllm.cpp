@@ -10952,3 +10952,22 @@ SATISFIED with anchors), BENCHMARKS/README repro text, this entry, the ledger
 row, and the `CLAIM-SERVE-GATE-1` last-update. Binding stays **55/124**,
 `benchmark_binding=false`; the authorized exact-grid rerun remains the active
 order-0 item.
+
+## 2026-07-15 — H1d-era --execute hold lifted; the authorized grid launch was blocked by it and now proceeds
+
+The first launch attempt of the authorized exact-grid rerun (fresh root at
+`a195f54`) exited pre-GPU: `scripts/dgx-online-serving.sh` carried an
+UNCONDITIONAL `--execute` hold from the H1d trace era ("held while H1d
+requires a trace-instrumented build … Complete H1d/G4, then use separate
+production and trace builds"). The hold's stated precondition has been met
+since 2026-07-13 (H1d/G4 accepted; production and trace builds are separate
+throughout the current era), and the W1D3 closure (`b80663a`) explicitly
+authorized this rerun — the hold was simply never lifted. Lifted test-first:
+RED `test_execute_grid_is_unheld_after_w1d3_closure_authorization` observed
+failing against the held driver, GREEN after removing the hold block (a
+comment records the lift + grounds); full tools suite green, bash -n +
+shellcheck clean. No timing/gate semantics change — timed grids still
+require the production profile-control-OFF build via the recorded configure
+contract. The grid relaunches from the new pushed SHA in a fresh root; the
+a195f54 evidence root holds only the corpus copy (no GPU work ran) and is
+superseded.

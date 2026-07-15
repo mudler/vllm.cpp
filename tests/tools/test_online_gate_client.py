@@ -824,6 +824,23 @@ class OnlineClientContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+
+    def test_execute_grid_is_unheld_after_w1d3_closure_authorization(self) -> None:
+        """The H1d-era unconditional --execute hold must be lifted.
+
+        The hold's stated precondition (complete H1d/G4; separate production
+        and trace builds) was met on 2026-07-13, and the W1D3 closure
+        (b80663a) explicitly AUTHORIZED the fresh binding/exact-grid rerun.
+        The driver must not carry the unconditional hold, and --execute must
+        remain a recognized mode.
+        """
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("is held while H1d", script)
+        self.assertIn("--dry-run|--prepare-corpus|--trace-only|--execute", script)
+
     def test_vllm_profiler_uses_clean_oracle_venv_path(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(

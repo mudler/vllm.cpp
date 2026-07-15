@@ -129,10 +129,11 @@ if [[ ${mode} == prepare-corpus ]]; then
 fi
 
 [[ ${mode} == execute || ${mode} == trace-only ]] || { usage; exit 2; }
-if [[ ${mode} == execute ]]; then
-  echo "--execute is held while H1d requires a trace-instrumented build; timing that binary would violate the production-build gate. Complete H1d/G4, then use separate production and trace builds." >&2
-  exit 2
-fi
+# The H1d-era unconditional --execute hold was LIFTED 2026-07-15: its stated
+# precondition (H1d/G4 complete; separate production and trace builds) was met
+# on 2026-07-13, and the W1D3 closure (b80663a) authorized the fresh
+# binding/exact-grid rerun. Timed grids still require a production
+# (profile-control-OFF) build via the recorded configure contract.
 if [[ ${mode} == trace-only && ${model} != 27 ]]; then
   echo "H1d trace-only control is defined only for the Qwen3.6-27B dense graph; 35B performance remains held" >&2
   exit 2

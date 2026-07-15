@@ -7,51 +7,43 @@ OpenAI-compatible server.
 
 > ⚠️ **Pre-release, under heavy development.** The text paths for
 > **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
-> gates on NVIDIA GB10. Production parity is still open: the binding 27B
-> comparison against vLLM v0.25.0 passes **55/124** required axes, and c2 TPOT
-> is **114.841 vs 108.274 ms** (**6.1% slower**). The order-0
-> [packed-decode port](.agents/specs/gdn-packed-decode.md) (the GDN decode
-> kernel) is now **CLOSED on equivalence**: correctness-green at clean `f344dec`
-> (default and rollback each **235/235 + 16/16**), structurally proven at
-> `7ff713e`/`24cea4f` (packed **915** nodes vs rollback's **963**, 48 packed
-> calls replacing 48 decomposed + 48 post-conv), and the earlier c16 HTTP-500
-> slot defect fixed and proven at `c172336` (the runner's compact GDN
-> state-slot pool now keys on the request identity, not the mamba block-id that
-> collapsed two long concurrent sequences onto one recurrent-state slot — this
-> also removes latent silent cross-request GDN state corruption in pre-validator
-> binaries; see [Benchmarks](docs/BENCHMARKS.md)). The W1D3 performance/component
-> gate is resolved over **eight sealed components** plus an **8-pair locked c16
-> A/B** and a **24-window trace**: **packed is GPU-cheaper** (c16 paired mean
-> **−0.205%, sd 0.30, <1σ**; cuBLASLt algo selection process-deterministic; the
-> trace attributes no packed-side cost — kernel compute −1.30..−1.58%/step). The
-> eighth seal (`e47b4d6`, `complete-failed`) reached **38/40 axes + 8/8 memory**,
-> stable, `validation_error=None`, paired-consistency PASS at both concurrencies,
-> with c16 at equivalence (packed med 801.97 vs rollback 802.95, −0.12%); the two
-> failing axes (c2 `median_tpot_ms` 0.9899, c2 pooled `p99_ttft_ms` 0.8464) are
-> sign-flipping band-edge statistics of a true-zero effect. **Disposition:
-> EQUIVALENCE PROVEN — no stable regression on any axis.** The packed path stays
-> the default (`VT_GDN_PACKED_DECODE=0` rollback); there is **no `complete-pass`
-> marker and no speed credit**. **qkvz** (merged qkv+z projection packing) is now
-> **implemented** (one BF16 in_proj_qkvz GEMM per GDN layer, `VT_GDN_MERGED_QKVZ=0`
-> rollback from the same owner; CPU gates green) and **`GATING` on its DGX gates**,
-> followed by the authorized **fresh binding/exact-grid rerun**. On the memory axis, the
-> failing binding **peak** (48.3 GB) was localized to LOAD-time double-residency;
-> the **windowed-load** release (`madvise(MADV_DONTNEED)` on each copied-then-dead
-> source range, default on, `VT_LOAD_WINDOWED_RELEASE=0` rollback) is **measured
-> on GB10**: 27B load-to-ready VmHWM **48.29 GB off vs 24.75 GB on (−23.54 GB)**,
-> load transient fully eliminated, ON-arm serving smoke 6/6 — the binding memory
-> axes flip only at the authorized exact-grid rerun (projected PASS). No 35B
-> performance result is claimed. See [Benchmarks](docs/BENCHMARKS.md).
+> gates on NVIDIA GB10. Production parity is still open. The **new binding 27B
+> result** is the fresh, fully-interleaved exact-grid rerun at `246a23c`:
+> **49/124** required axes pass against vLLM v0.25.0. It **supersedes** the
+> `3f256ab` grid (**55/124**, retained immutable). The nominal 49 < 55 is a
+> **structural recomposition**, not a plain regression: **memory (4/4)**, **c1
+> (20/20)** and **every TTFT axis** now sweep clean for the first time, and the
+> entire remaining failure mass is the decode-coupled family at c2–c32
+> (TPOT/ITL/E2EL **2.2–6.5% slower**) plus two ITL tail anomalies (c8 p99, c32
+> p90). **Honest regression:** ours lost **−2.67% total throughput at c16** and
+> **−3.64% at c32** vs `3f256ab` while vLLM held, so the old c16/c32 wins are
+> gone. **Hypothesis (labeled, unproven):** `3f256ab` silently carried the GDN
+> slot-sharing defect (two long requests could share one recurrent-state slot at
+> high concurrency), which the `c172336` correctness fix removed and may have
+> traded that inflated throughput away, alongside every other change between the
+> SHAs; an **era A/B** (`3f256ab` vs `246a23c` binary, interleaved c16) is running
+> now as the diagnostic. The `246a23c` binary carries the correctness slot-fix
+> (`c172336`), the **windowed-load** release (`cb2d310`, which flips both memory
+> axes to PASS — ours peak PSS 24.88 GB vs vLLM 28.18 GB), merged **qkvz**
+> (`45f9e6d`, DGX gates green), and packed GDN decode as the default. The order-0
+> [packed-decode port](.agents/specs/gdn-packed-decode.md) is **CLOSED on
+> equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`): correctness
+> immutable at `f344dec` (default and rollback each **235/235 + 16/16**),
+> structure at `7ff713e`/`24cea4f`, W1D3/G3 closed over eight sealed components +
+> the 8-pair locked c16 A/B (**−0.205% ± 0.30, <1σ**) + the 24-window trace
+> (**packed is GPU-cheaper**), with **no `complete-pass` marker and no packed
+> speed credit**. No 35B performance result is claimed until 27B reaches 124/124.
+> See [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
 
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass**. The order-0 packed GDN decode leaf is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`): c2 decode and ALL memory axes at packed-rollback equivalence (component peak PSS **24.86 GB**; c2 TPOT ~108.5 ms). W1D3/G3 closed over **eight sealed components** + the `00bf484` **8-pair locked c16 A/B** (paired mean **−0.205%, sd 0.30, <1σ**; cuBLASLt algo selection process-deterministic → algo-lottery REFUTED) + the 24-window trace (**packed is GPU-cheaper**; no attributable packed-side cost). The eighth seal (`e47b4d6`, `complete-failed`) reached **38/40 + 8/8 memory**, stable, paired-consistency PASS at both concurrencies; the 2 fails are band-edge statistics of a true-zero effect. **Disposition: EQUIVALENCE PROVEN — no stable regression**; no `complete-pass` marker, no speed credit. **qkvz** (`KERNEL-GEMM-BF16` W2 merged qkv+z packing) is **implemented** (one BF16 GEMM/layer, strided mixed/z views, `VT_GDN_MERGED_QKVZ=0` rollback; CPU gates green: CTest 107/107, tools 162/162). DGX gates at `baea3ec`: default suites, qkvz-rollback and 35B-inertness arms **PASS**; the `VT_GDN_MERGED_PROJ=0` arm exposed a non-mode-aware TEST expectation (engine correct: master-off runs the decomposed recurrence by design) — fixed test-first via a shared env truth table; the fixed arm's re-run then **PASSED**, memcheck is **0 errors/0 leaks**, and the one-lock structural traces confirm the exact **−48 BF16 GEMMs/window** (wmma-per-packed-window 1.959≈2.0 merged vs 2.980≈3.0 split; 97-vs-145 contract). **W2A is green end-to-end** | The authorized **fresh binding/exact-grid rerun** is LAUNCHING (audit pins wired into the vLLM arm; all **three** stale H1d-era pre-GPU blockers repaired test-first per the W1D3-closure authorization — the last stripped the `--execute` path of the H1d paired-trace machinery so it is a PURE timed production grid summarized against a profile-control-OFF contract) → all-axis 27B parity → 35B
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | **NEW BINDING `246a23c`: 49/124 pass** (fresh interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124, retained immutable). Per concurrency: c1 **20/20**, c2 4, c4 5, c8 4, c16 6, c32 6, memory **4/4**. Memory + c1 + every TTFT axis sweep clean; failure mass is the decode-coupled family at c2–c32 (mean TPOT 2.2–6.5% slower) + two ITL tail anomalies (c8 p99_itl 0.5599, c32 p90_itl 0.7925). HONEST regression: ours c16/c32 total throughput −2.67%/−3.64% vs `3f256ab` while vLLM held; old c16/c32 wins gone. The binary carries slot-fix `c172336`, windowed-load `cb2d310` (memory now PASS), qkvz `45f9e6d` (DGX gates green), packed-decode default. The order-0 packed leaf is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`; eight seals + 8-pair A/B −0.205% ± 0.30 <1σ + 24-window trace, packed GPU-cheaper); no `complete-pass` marker, no packed speed credit | HYPOTHESIS (labeled, unproven): `3f256ab`'s high-concurrency throughput was inflated by the silent slot-sharing defect removed by `c172336`. The **era A/B** (`3f256ab` vs `246a23c` binary, interleaved c16) is **running now** as the diagnostic. Next levers (order-0): era-A/B verdict + nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED` W3 if confirmed → the c8 p99 / c32 p90 ITL tail mechanism. 35B only after 27B 124/124
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| Host-memory parity | ❌ FAILED on the binding grid / fix MEASURED | The failing **peak** was load-time double-residency (22.92 GiB mirror built while the full source mmap stayed resident). The `LOAD-SAFETENSORS` windowed release (default on; `VT_LOAD_WINDOWED_RELEASE=0` rollback) is now **measured on GB10**: 27B load-to-ready VmHWM **48.29 GB off vs 24.75 GB on (−23.54 GB, −48.7%)** — the load transient is fully eliminated and the ON peak equals steady RSS, below vLLM's 28.5 GB binding peak; ON-arm serving smoke 6/6 | Binding Peak PSS/RSS axes flip only at the next authorized exact-grid rerun (projected PASS). Direct-to-device streaming remains the deeper fix (still wanted for 35B) |
+| Host-memory parity | ✅ PASS on the new binding grid | All four memory axes now PASS at `246a23c` (windowed-load `cb2d310` binding): ours peak PSS/RSS 24,879,201/24,881,800 KiB vs vLLM 28,184,400/28,563,020 KiB (1.1329×/1.1479×), GPU 40,996 vs 70,531 MiB, MemAvailable-drop 68,346,844 vs 80,660,556 KiB. The prior `3f256ab` peak (48.3 GB) was load-time double-residency, eliminated by the windowed release (−23.54 GB load-to-ready VmHWM) | Memory parity holds; direct-to-device streaming remains the deeper fix (removes the 22.92 GiB steady mirror, wanted for 35B) |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Arm equivalence is audited: batch
@@ -62,27 +54,29 @@ match, and the client commands are identical to one token — see the
 
 | Concurrency | Axes passing | Total throughput: ours / vLLM | Ratio |
 |---:|---:|---:|---:|
-| 1 | 5/20 | 81.645 / 82.179 tok/s | **0.993504×** |
-| 2 | 4/20 | 150.561 / 157.744 tok/s | **0.954464×** |
-| 4 | 5/20 | 280.291 / 290.025 tok/s | **0.966438×** |
-| 8 | 4/20 | 495.700 / 505.466 tok/s | **0.980678×** |
-| 16 | 17/20 | 812.303 / 790.264 tok/s | **1.027889×** |
-| 32 | 18/20 | 1121.955 / 1079.407 tok/s | **1.039417×** |
+| 1 | **20/20** | 84.149 / 82.779 tok/s | **1.016543×** |
+| 2 | 4/20 | 156.325 / 158.977 tok/s | **0.983320×** |
+| 4 | 5/20 | 286.896 / 292.396 tok/s | **0.981189×** |
+| 8 | 4/20 | 499.150 / 508.958 tok/s | **0.980730×** |
+| 16 | 6/20 | 790.625 / 794.356 tok/s | **0.995303×** |
+| 32 | 6/20 | 1081.098 / 1082.750 tok/s | **0.998474×** |
 
-Total throughput beats vLLM at c16/c32, but parity requires every throughput,
-latency, and memory axis to pass. Host PSS/RSS remain large open gaps; sampled
-GPU memory and available-memory drop pass. The full per-axis table and exact
-reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+All four memory axes and every TTFT axis now pass, and c1 sweeps 20/20; the
+remaining gaps are the decode-coupled family (throughput, TPOT/ITL/E2EL) at
+c2–c32, where decode is 2.2–6.5% slower, plus two ITL tail anomalies. The old
+c16/c32 total-throughput wins are gone (see the honest regression above). The
+full per-axis table, memory table, and exact reproduction recipe are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ### Current performance track
 
 | Work item | Present disposition |
 |---|---|
-| Binding gate | `3f256ab` remains **55/124**; c1–c8 decode-shaped axes and host PSS/RSS are open |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is **`DONE`** — W1D3 **CLOSED on equivalence** (owner `e47b4d6`). The c16 HTTP-500 slot defect (the runner keyed the compact GDN state-slot pool on the mamba block-id, collapsing 2 long c16 sequences onto 1 recurrent-state slot; also latent silent cross-request corruption) was fixed test-first (request-identity keying) and proven at `c172336`. G3 closed over eight sealed components + the 8-pair A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper): no stable regression, no `complete-pass` marker, no speed credit. **qkvz** (`KERNEL-GEMM-BF16` W2) is implemented CPU-side; selected next GPU work is its DGX gate battery (model gates both arms, memcheck, 145→97 BF16 trace) + the authorized exact-grid rerun |
-| Remaining gap diagnosis | The 2026-07-14 [parity rescan](.agents/specs/parity-rescan-2026-07-14.md) grounds the failing mass as **host-side**: TTFT passes 24/24, our GPU kernels are net faster on the measured window, and the open axes are c2–c8 decode latency plus host memory. The prior RMSNorm/generated-partitions residual is **disproven** (vLLM's norm-quant fusion is FP8-only; cross-profiler artifact). Parallel host workstreams: TCP_NODELAY (DONE, measured neutral on loopback — ruled out as the decode-gap cause), memory precheck → weight streaming, and nsys c2 attribution before async-sched W3 |
+| Binding gate | **NEW BINDING `246a23c`: 49/124** (supersedes `3f256ab`'s 55/124). Memory (4/4), c1 (20/20) and every TTFT axis now pass; the open axes are the decode-coupled family at c2–c32 (2.2–6.5% slower) plus two ITL tail anomalies |
+| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is **`DONE`** — W1D3 **CLOSED on equivalence** (owner `e47b4d6`). The c16 HTTP-500 slot defect (the runner keyed the compact GDN state-slot pool on the mamba block-id, collapsing 2 long c16 sequences onto 1 recurrent-state slot; also latent silent cross-request corruption) was fixed test-first (request-identity keying) and proven at `c172336`. G3 closed over eight sealed components + the 8-pair A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper): no stable regression, no `complete-pass` marker, no speed credit. **qkvz** (`KERNEL-GEMM-BF16` W2) DGX gates closed green at `45f9e6d` (−48 BF16 GEMMs/window confirmed) and is in the `246a23c` binding binary. The authorized exact-grid rerun has now RUN (new binding, 49/124); selected next GPU work is the c2/c8 decode-gap nsys attribution + the era A/B verdict |
+| Remaining gap diagnosis | With memory now passing, the failing mass is the **c2–c32 decode-coupled family** (throughput inversely coupled to TPOT/ITL). The 2026-07-14 [parity rescan](.agents/specs/parity-rescan-2026-07-14.md) already grounded decode as host-side (TTFT passes, our GPU kernels net faster on the measured window). The prior RMSNorm/generated-partitions residual is **disproven** (vLLM's norm-quant fusion is FP8-only). Open questions this binding raises: the labeled c16/c32 throughput regression vs `3f256ab` (era A/B in-flight) and the c8 p99 / c32 p90 ITL tail mechanism; nsys c2/c8 full-step attribution precedes async-sched W3 |
 | Serving transport (TCP_NODELAY) | **DONE; measured NEUTRAL on the gate workload** (`SERVE-HTTP-TRANSPORT`). We mirror vLLM's uvicorn/asyncio default (`set_tcp_nodelay(true)`), pinned by a behavioral accepted-socket test (RED 0 → GREEN 1, 22/22). The non-binding localhost A/B sizing is neutral within noise at c1/c2 — µs loopback ACKs mean Nagle never held our ~100 ms-cadence token frames — so the mirror stays for real-network parity and the decode-gap attribution moves to the nsys c2 full-step diff |
-| Host-memory repair | **MEASURED**: the `LOAD-SAFETENSORS` windowed release (progressive `madvise(MADV_DONTNEED)` on each copied-then-dead source range; default on, `VT_LOAD_WINDOWED_RELEASE=0` rollback) cuts the 27B load-to-ready VmHWM from **48.29 GB to 24.75 GB (−48.7%)** on GB10 — the load transient is fully eliminated (peak = steady RSS) and serving stays healthy (smoke 6/6). Projected to flip both binding memory axes at the next authorized exact-grid rerun (vLLM peaks 28.17/28.53 GB); no credit until then. Direct-to-final-device streaming stays the complete fix (also removes the steady mirror, wanted for 35B) |
+| Host-memory repair | **BINDING PASS**: the `LOAD-SAFETENSORS` windowed release (progressive `madvise(MADV_DONTNEED)` on each copied-then-dead source range; default on, `VT_LOAD_WINDOWED_RELEASE=0` rollback) is now in the `246a23c` binding binary — all four memory axes PASS (ours peak PSS 24.88 GB vs vLLM 28.18 GB). Direct-to-final-device streaming stays the complete fix (also removes the steady mirror, wanted for 35B) |
 
 ## What is implemented
 
@@ -142,7 +136,7 @@ concurrent streams.
 
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|:---:|:---:|---|
-| Qwen3.5/3.6 hybrid text | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ | 35B only | 🟡 Token-exact correctness passes on GB10; 27B performance is `GATING` at 55/124 axes; vision paths are not implemented |
+| Qwen3.5/3.6 hybrid text | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ | 35B only | 🟡 Token-exact correctness passes on GB10; 27B performance is `GATING` at 49/124 axes (new binding `246a23c`); vision paths are not implemented |
 | Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 Post-parity roadmap |
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 Post-parity roadmap |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 Post-parity roadmap |
@@ -152,7 +146,7 @@ concurrent streams.
 | Backend | Hardware | Status |
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance remains `GATING` at 55/124. Packed GDN decode is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`): the c16 slot defect was fixed test-first (request-identity keying) and proven at `c172336`, and W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ) + a trace showing packed is GPU-cheaper. qkvz is implemented and most DGX gate arms PASS at `baea3ec` (2b test-contract fixed; re-run + memcheck + trace pending); then the authorized exact-grid rerun |
+| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance is `GATING` at **49/124** (new binding `246a23c`; memory + c1 + TTFT clean, decode c2–c32 open). Packed GDN decode is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`): the c16 slot defect was fixed test-first (request-identity keying) and proven at `c172336`, and W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ) + a trace showing packed is GPU-cheaper. qkvz DGX gates closed green at `45f9e6d` and ride this binding |
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
@@ -179,7 +173,7 @@ performance gates pass.
 
 | Format | Status |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The current 27B performance gate fails 69/124 axes; FP4 tactics match, the non-quantized packed GDN decode leaf is now closed on equivalence, and the active speed leaf — merged qkvz (`KERNEL-GEMM-BF16` W2) — is implemented (one BF16 in_proj_qkvz GEMM per GDN layer, DGX gates pending) |
+| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The new-binding 27B performance gate (`246a23c`) fails 75/124 axes (memory + c1 + TTFT now pass; decode c2–c32 open); FP4 tactics match, the non-quantized packed GDN decode leaf is closed on equivalence, and merged qkvz (`KERNEL-GEMM-BF16` W2, one BF16 in_proj_qkvz GEMM per GDN layer) is DGX-green and in the binding binary |
 | GGUF F32, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported 35B files load through BF16 materialization and pass same-file llama.cpp greedy checks; direct compute-in-quant and several formats remain open |
 | FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
 | MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
@@ -202,12 +196,13 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
   scaled long-context RoPE consumers are not supported yet.
 
-The next execution order is fixed: with the packed-GDN decode leaf now CLOSED on
-equivalence and merged **qkvz** implemented, run the qkvz DGX gates → the
-authorized fresh binding/exact-grid rerun → all-axis 27B parity → 35B parity → the SGLang
-shared-prefix gate → the rest of
-[roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV cache /
-LMCache support.
+The next execution order is fixed: with the packed-GDN decode leaf CLOSED on
+equivalence, merged **qkvz** DGX-green, and the authorized exact-grid rerun now
+RUN (new binding `246a23c`, 49/124), the open front is the c2–c32 decode gap →
+the in-flight era A/B verdict + nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED`
+W3 if confirmed → all-axis 27B parity → 35B parity → the SGLang shared-prefix gate →
+the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
+cache / LMCache support.
 
 ## Project record
 

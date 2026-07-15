@@ -13,18 +13,19 @@ known to omit upstream behavior. Neither state is protocol-complete. A plain
 `planned: specs/...` entry is not an accepted spike and cannot make a row
 `READY`.
 
-Current `SERVE-GATE-ONLINE` substage: binding `3f256ab` remains **55/124**.
-FP4 tactics and merged BA topology are matched. Packed correctness is accepted
-at `f344dec`, and clean `7ff713e`, finalized by `24cea4f`, accepts the exact
-915/963-node structural substitution. The production-build-only c2/c16
-AB/BA/AB runner and marker-last every-axis finalizer are implemented and
-focused CPU tests pass **45/45** and all tool tests **127/127**. The driver now
-has an exact test-first `record-execution --profile-control off` contract. Clean
-`d82d282` completed both model gates and all c2 legs, then failed incomplete at
-c16 packed r1 with **96/96 HTTP 500** responses and no terminal marker;
-qkvz stays excluded and
-`benchmark_binding=false`. Host PSS/RSS separately retains a **22.920 GiB**
-CPU weight mirror plus source mmap residency.
+Current `SERVE-GATE-ONLINE` substage: **NEW BINDING `246a23c`: 49/124** (fresh
+interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124, retained immutable).
+Per concurrency c1 **20/20**, c2 4, c4 5, c8 4, c16 6, c32 6, memory **4/4** —
+memory + c1 + every TTFT axis sweep clean for the first time (windowed-load
+`cb2d310` binding). The remaining 75 failing axes are the decode-coupled family at
+c2–c32 (TPOT/ITL/E2EL 2.2–6.5% slower, throughput inversely coupled) + two ITL tail
+anomalies (c8 p99_itl 0.5599, c32 p90_itl 0.7925). HONEST regression: ours c16/c32
+total throughput dropped −2.67%/−3.64% vs `3f256ab` while vLLM held (hypothesis:
+the silent slot-sharing defect removed by `c172336`; era A/B in-flight). The
+binding binary carries the slot-fix (`c172336`), windowed-load (`cb2d310`), qkvz
+(`45f9e6d`, DGX-green), and packed-decode default. Next: the era-A/B verdict +
+nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED` W3 → the tail mechanism.
+A **22.920 GiB** steady CPU weight mirror remains (deeper streaming fix, for 35B).
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `DONE` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -160,7 +161,7 @@ claims it.
 | `SERVE-C-ABI` | Stable LocalAI-style C FFI (17 exported symbols; blocking and nonblocking request handles) | T0 | Original project ABI; pinned vLLM has no C ABI | `include/vllm.h:143,181,207`; `src/capi/vllm_c.cpp:229,264,327,391` | `tests/capi/test_capi.cpp:320,428,505,574,606,640`; `tests/capi/test_dlopen.cpp:77,86`; `tests/capi/c_header_compile.c:1` | `planned: specs/c-api-library.md` | `ANCHOR-BACKFILL` | - |
 | `SERVE-CPP-API` | Rich `LLM` and `AsyncLLM` C++ API | T1 | `vllm/entrypoints/llm.py:66,422`; `vllm/v1/engine/async_llm.py:70` | - | - | `planned: specs/cpp-api.md` | `INVENTORIED` | - |
 | `SERVE-CLI-BENCH` | Serve and latency/throughput/serve benchmark modes | T0 | `vllm/entrypoints/cli/serve.py:44`; `vllm/entrypoints/cli/benchmark/main.py:29` | separate binaries + explicit scheduler-capacity flags `examples/server/main.cpp:63,96,116,170`; `examples/bench/main.cpp:40,109`; `examples/bench/bench_core.h:96,468` | server help contract `examples/CMakeLists.txt:34`; benchmark `tests/examples/test_bench.cpp:15,48` | `planned: specs/cli-serve-bench.md` | `PARTIAL` | - |
-| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), [production component driver](../scripts/dgx-gdn-packed-component.sh), and fail-closed [component finalizer](../tools/bench/gdn_packed_component.py) | Immutable `3f256ab` remains **55/124**. Packed correctness/structure is accepted. [Component tests](../tests/tools/test_gdn_packed_component.py) pass **49/49** and all tools **132/132** after the test-first diagnostic checkpoint (four `std::cerr` error-path channels, `VT_GDN_DIAG_STEP_LOG`, packed-only `--diagnostic-c16` mode; finalizer refuses diagnostic evidence). Clean `d82d282` failed incomplete at c16 packed r1 (0/96 HTTP 500); the `4a450f9` reproduction captured `duplicate live GDN state index` (`qwen3_5.cpp:73`) 3/3. **Root cause fixed test-first**: the runner's compact GDN state-slot pool now keys on the request identity (was the mamba block-id, which collapsed long concurrent sequences onto one slot); RED runner test → GREEN, tools 132/132. The DGX correctness gates + a fresh full component rerun are the next entry point. Host-memory repair and the exact grid remain open. `benchmark_binding=false`; partial legs earn no speed credit | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
+| `SERVE-GATE-ONLINE` | Same-corpus online correctness, TTFT/TPOT/ITL, throughput and peak-memory gate vs vLLM v0.25.0 | T0 | `vllm/benchmarks/serve.py:1,581-615`; [v0.25 audit](sync/2026-07-12-702f481.md); `tests/benchmarks/test_serve_cli.py:1` | Schema-v5 harness plus [trace controller](../include/vt/cuda/cuda_profiler_control.h#L13), [production component driver](../scripts/dgx-gdn-packed-component.sh), and fail-closed [component finalizer](../tools/bench/gdn_packed_component.py) | **NEW BINDING `246a23c`: 49/124** (fresh interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124, retained immutable). c1 **20/20**, c2 4, c4 5, c8 4, c16 6, c32 6, memory **4/4** — memory + c1 + every TTFT axis sweep clean (windowed-load `cb2d310` binding). Failure mass is the decode-coupled family at c2–c32 (2.2–6.5% slower) + two ITL tails (c8 p99, c32 p90). HONEST regression: ours c16/c32 total throughput −2.67%/−3.64% vs `3f256ab` while vLLM held; hypothesis (labeled) = the silent slot-sharing defect removed by `c172336`, era A/B in-flight. Evidence root `~/work/vllm.cpp-online-gate/evidence/246a23c…`; ratios.json `f784ba01…e046`. This root is the binding grid (`benchmark_binding` now refers here, superseding `3f256ab`); no packed speed credit | [online serving gate](specs/cuda-online-serving-gate.md); [merged GDN projections](specs/gdn-merged-input-projections.md); [packed decode](specs/gdn-packed-decode.md) | `ACTIVE` | CLAIM-SERVE-GATE-1 |
 | `SERVE-E2E-NIGHTLY` | Server conformance and real-model nightly suites for all release gates | T0 | `tests/entrypoints/openai/`; `tests/v1/e2e/`; `.buildkite/test-pipeline.yaml` | current unit/conformance tests only; no scheduled DGX suite | `tests/vllm/entrypoints/openai/test_conformance.cpp:1`; `tests/parity/test_qwen36_paged_engine.cpp:78`; `tests/parity/test_qwen27_paged_engine.cpp:110` | `planned: specs/server-e2e-nightly.md` | `INVENTORIED` | - |
 | `SERVE-CLI-CHAT` | Interactive chat and complete commands | T1 | `vllm/entrypoints/cli/main.py:18-34` has no direct chat/complete command at the pin; project extension | - | - | `planned: specs/cli-chat-complete.md` | `INVENTORIED` | - |
 | `SERVE-POOLING-ENDPOINTS` | Embeddings, pooling, score, rerank | T2 | `vllm/entrypoints/pooling/embed/api_router.py:25`; `vllm/entrypoints/pooling/scoring/api_router.py:1` | - | - | `planned: specs/pooling-endpoints.md` | `INVENTORIED` | - |

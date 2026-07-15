@@ -11056,3 +11056,104 @@ NO GPU work — the orchestrator relaunches the grid from the pushed SHA
 (dry-run plan → binding-corpus copy → `--execute`). Binding stays **55/124**,
 `benchmark_binding=false`. The `e9fb522` attempt produced NO binding data (died
 before any summary; the ~95 min of timed legs sit in a superseded root).
+
+## 2026-07-15 — NEW BINDING 27B grid recorded: `246a23c` **49/124** (supersedes `3f256ab`); `CLAIM-SERVE-GATE-1`, worktree `.claude/worktrees/agent-a7f8c47d081d10ed0`
+
+The authorized fresh exact-grid rerun RAN and sealed cleanly. This is the **new
+binding 27B online-serving result**; `benchmark_binding` now refers to its root and
+`3f256ab` becomes the immutable superseded prior binding. Record-only checkpoint —
+NO engine/kernel/harness code changed, NO GPU work; every number below was verified
+read-only over ssh from the evidence root (root left untouched). A concurrent GPU
+A/B (the era A/B, below) is running on dgx; no other agent edits the repo.
+
+**Provenance (verified).** Evidence root
+`dgx:~/work/vllm.cpp-online-gate/evidence/246a23cfa423e8e50c65b0ff067be55f3a3c7bf9`.
+`vllm_cpp_sha` `246a23c`; `vllm_source_sha`/`client_contract_source_commit`
+`702f4814fe54fabff350d43cb753ae3e47c0c276` (vLLM v0.25.0, FlashInfer 0.6.13,
+pandas 2.2.3). Pure timed production grid: `execution/27.json`
+`build_contract.profile_control=false`, `native_plan_target_absent=true`, sm_121a,
+RelWithDebInfo, `max_num_batched_tokens=2048`, `max_num_seqs=32`. vLLM arm carries
+the audited `--mamba-ssm-cache-dtype float32` (confirmed in the serve command and
+in the `non-default args: {… 'mamba_ssm_cache_dtype': 'float32' …}` startup log).
+Correctness preflight `preflight/model-gate/27.json` `passed=true`
+(`test_qwen27_paged_engine`). All 36 raw legs present (6 concurrencies × 3 reps ×
+2 engines), interleaved rep1 ours/vLLM, rep2 ours/vLLM, rep3 ours/vLLM under one
+whole-model flock. `report.md`: `Gate pass: NO`, `Binding-eligible performance
+groups: 12/12`, `Every-axis ratios failing or void: 75/124` (⇒ 49 pass; 0 void —
+all 124 axes `binding_eligible` with non-null ratios). The binding **binary**
+carries the slot-fix (`c172336`), windowed-load release (`cb2d310`), merged qkvz
+(`45f9e6d`), and packed GDN decode as default — all four confirmed ancestors of
+`246a23c`; this is a substantially different binary from `3f256ab`, i.e. the
+authorized rerun the roadmap sequenced, not a re-measurement.
+
+**Artifact SHA-256 (computed locally, byte-identical to the remote):**
+- `summary-27/ratios.json` `f784ba01866074651a0f320b8a751dc30c54ecf7f3e883284d66bb9fdf0ee046`
+- `summary-27/all-runs.json` `b7ef34425ba2e6589b94592217902eaf940be0d0ccd3c7b2072111dd0e053240`
+- `manifest.json` `7f25c614afb8096684381dab627553527162661982d48d9cd5271dea1cdd83e8`
+
+**Composition (49/124 pass).** Per concurrency: c1 **20/20**, c2 4/20, c4 5/20,
+c8 4/20, c16 6/20, c32 6/20, memory **4/4**. **Structural recomposition vs the prior
+55/124:** memory (all four axes), c1 (all 20), and **every TTFT axis**
+(mean/median/p90/p99, all six concurrencies) sweep clean for the first time (zero
+failing TTFT). The 75 failing axes are entirely the decode-coupled family at c2–c32
+(throughput total/output/request/input share one ratio; TPOT, ITL, E2EL means and
+most tails).
+
+**Memory — all four PASS (medians of 3 reps; direction lower-is-better):**
+| Axis | Ours | vLLM | Ratio | Result |
+|---|---:|---:|---:|---|
+| Peak PSS (KiB) | 24,879,201 | 28,184,400 | 1.132850× | PASS |
+| Peak RSS (KiB) | 24,881,800 | 28,563,020 | 1.147948× | PASS |
+| Peak GPU (MiB) | 40,996 | 70,531 | 1.720436× | PASS |
+| Peak MemAvailable drop (KiB) | 68,346,844 | 80,660,556 | 1.180165× | PASS |
+
+Per-rep confirms the medians: ours PSS 24,879,201/24,878,331/24,879,361; vLLM PSS
+28,195,941/28,177,677/28,184,400; ours RSS …,881,636/…,882,032/…,881,800; vLLM RSS
+28,574,116/28,555,852/28,563,020; ours memavail 67,582,260/68,346,844/68,422,324;
+vLLM memavail 80,821,304/80,660,556/80,635,492. The windowed-load fix (`cb2d310`),
+now binding, is why both host-memory axes flipped from FAIL to PASS.
+
+**Total throughput (ours/vLLM tok/s, ratio, pass):** c1 84.148626/82.779183
+(1.016543×, PASS); c2 156.325223/158.977034 (0.983320×, FAIL); c4
+286.895689/292.395879 (0.981189×, FAIL); c8 499.150507/508.957975 (0.980730×,
+FAIL); c16 790.625040/794.356368 (0.995303×, FAIL); c32 1081.098068/1082.750127
+(0.998474×, FAIL). Output/request/input throughput share the total ratio exactly.
+
+**Decode means fail c2–c32.** Mean TPOT ratios 0.9779/0.9694/0.9445/0.9532/0.9597
+(ours 109.85/116.35/131.41/167.46/245.58 ms vs vLLM
+107.42/112.79/124.12/159.63/235.68); worst non-tail is median TPOT 0.9348 at c8
+(⇒ 6.5% deepest). ITL means track TPOT (identical ratios). E2EL means
+0.982/0.980/0.980/0.995/0.998.
+
+**Tail anomalies reproduce.** c8 `p99_itl` 0.5599 (853.34 vs 477.81 ms) and c32
+`p90_itl` 0.7925 (706.80 vs 560.15). Other tails fail modestly in line with the
+decode band (some pass: c4 p99_itl 1.951, c16 p99_itl 1.024, c32 p99_itl 1.040,
+c16 p99_e2el 1.001, c32 p90_e2el 1.002).
+
+**HONEST throughput regression vs `3f256ab`.** Ours dropped **−2.669% at c16**
+(790.625 vs 812.302839 tok/s) and **−3.642% at c32** (1081.098 vs 1121.954512)
+while vLLM held (+0.518% c16: 794.356 vs 790.263558; +0.310% c32: 1082.750 vs
+1079.407095). The prior c16/c32 total-throughput WINS (1.027889×/1.039417×) are
+GONE. **HYPOTHESIS (clearly labeled, unproven):** the `3f256ab` binary silently
+carried the GDN slot-sharing defect — two concurrent long requests could share ONE
+recurrent-state slot at high concurrency, reducing effective per-request state
+bandwidth — which the `c172336` correctness fix removed; the fix may have traded
+that inflated high-concurrency throughput away, alongside every other change
+between the SHAs (qkvz, windowed-load, packed-default). The blast-radius record
+(BENCHMARKS.md) is the same defect. An **era A/B** (`3f256ab` binary vs `246a23c`
+binary, interleaved c16 legs, same corpus/box) is **RUNNING now on dgx** as the
+diagnostic to isolate it; it is in-flight and this record does not wait on it.
+
+**Next levers (roadmap order-0, precommitted).** (a) the era-A/B verdict + the nsys
+full-step c2/c8 attribution (async-sched W3 vs residual kernel vs slot-fix state
+bandwidth); (b) `ENG-ASYNC-SCHED` W3 if the attribution confirms it; (c) the c8 p99
+/ c32 p90 ITL tail mechanism — reconstruct the stall cadence from this root's
+per-request `itls[]`. 35B stays blocked until 27B reaches 124/124.
+
+**Gates:** `check-agent-record.py` + `check-doc-checkpoint.py` green expected
+(record/decision only; README + docs/BENCHMARKS.md both updated this change). No
+build/test/GPU. Surfaces updated same-change: docs/BENCHMARKS.md (binding-section
+rewrite), README (⚠️ header + status/throughput/memory tables), roadmap_v1.md
+(order-0 substage + portfolio row), engine-matrix (`SERVE-GATE-ONLINE` substage +
+row), backend-matrix (`BACKEND-GATE-CUDA-VLLM` row), coordination
+(`CLAIM-SERVE-GATE-1` last-update), this state entry, and the parity-ledger row.

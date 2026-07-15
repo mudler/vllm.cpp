@@ -5,14 +5,37 @@ M0–M3 record is archived at
 
 **Context:** both gate models run end-to-end and retain token-exact greedy
 correctness. Exact performance closure is open against vLLM v0.25.0; the
-immutable 27B result `3f256ab` binds at **55/124 axes pass, 69 fail**. Restore
-every throughput, latency, and memory axis on 27B and then 35B before resuming
-the operational and T1/T2 portfolio. Detailed status lives in the area
-matrices, active ownership in `coordination.md`, and chronological evidence in
-the append-only state/ledger record.
+**new binding 27B result `246a23c`** (fresh interleaved exact-grid rerun) binds at
+**49/124 axes pass, 75 fail**, superseding the immutable `3f256ab` grid
+(**55/124**, retained). Restore every throughput, latency, and memory axis on 27B
+and then 35B before resuming the operational and T1/T2 portfolio. Detailed status
+lives in the area matrices, active ownership in `coordination.md`, and
+chronological evidence in the append-only state/ledger record.
 
-**Current order-0 substage (2026-07-15):** binding `3f256ab` remains **55/124**;
-FP4 tactics and the merged BA topology are already matched. The
+**Current order-0 substage (2026-07-15):** the **new binding `246a23c`** (fresh
+interleaved exact-grid rerun — the authorized rerun this substage sequenced) binds
+at **49/124**, superseding `3f256ab`'s 55/124 (retained immutable). It is a
+STRUCTURAL RECOMPOSITION: memory (**4/4**), c1 (**20/20**) and every TTFT axis
+sweep clean for the first time; the entire failure mass is the decode-coupled
+family at c2–c32 (TPOT/ITL/E2EL means 2.2–6.5% slower, throughput inversely
+coupled) plus two ITL tail anomalies (c8 p99_itl 0.5599, c32 p90_itl 0.7925). The
+binding binary carries the slot-fix (`c172336`), windowed-load (`cb2d310`, memory
+now PASS), qkvz (`45f9e6d`, DGX-green), and packed-decode default. Evidence root
+`~/work/vllm.cpp-online-gate/evidence/246a23c…`; ratios.json `f784ba01…e046`,
+all-runs.json `b7ef3442…3240`, manifest.json `7f25c614…83e8`.
+
+**HONEST regression + two active fronts.** Ours lost **−2.67% / −3.64%** total
+throughput at c16/c32 vs `3f256ab` (790.63/1081.10 vs 812.30/1121.95) while vLLM
+held; the old c16/c32 wins (1.0279/1.0394) are GONE. **HYPOTHESIS (labeled,
+unproven):** `3f256ab` silently carried the GDN slot-sharing defect (two long
+requests could share one recurrent-state slot at high concurrency), removed by the
+`c172336` correctness fix, which may have traded that inflated throughput away
+alongside every other change between the SHAs. **Front 1 — the c2–c32 decode gap:**
+the in-flight **era A/B** (`3f256ab` vs `246a23c` binary, interleaved c16, running
+now on dgx) + the **nsys full-step c2/c8 attribution** (async-sched W3 vs residual
+kernel vs the slot-fix state-bandwidth trade) → **`ENG-ASYNC-SCHED` W3** if
+confirmed. **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
+stall cadence from this root's per-request `itls[]`. The
 [packed GDN decode](specs/gdn-packed-decode.md) leaf is **CLOSED on EQUIVALENCE**
 (`KERNEL-GDN-PACKED-DECODE` → `DONE`, owner `e47b4d6`).
 
@@ -48,22 +71,16 @@ no stable regression on any axis.** Packed stays the default
 speed credit is claimed**. Detailed per-seal chronology and evidence SHAs live in
 the append-only state/ledger.
 
-*Active next steps.* qkvz (merged qkv+z projection packing, `KERNEL-GEMM-BF16`
-W2A) is **implemented test-first (2026-07-15)** under
-`CLAIM-GDN-BA-ROUNDING-1`: one `in_proj_qkvz` owner + ONE BF16 GEMM with
-strided mixed/z views on the CUDA default, split rollback from the same owner
-(`VT_GDN_MERGED_QKVZ=0`), 35B/GGUF inert; CPU gates green (CTest 107/107,
-tools 162/162, clean -Werror). DGX gates at `baea3ec`: default/qkvz-rollback/
-35B-inertness arms **PASS**; the `VT_GDN_MERGED_PROJ=0` arm exposed a
-non-mode-aware gate-test expectation (engine correct — master-off deselects
-packed decode by the designed BA coupling) → fixed test-first
-(`PackedGdnDecodeEnvSelected` truth table). Next: 2b re-run + memcheck
-(first run PATH-only) + the 145→97 BF16 structural
-trace, then the **AUTHORIZED** exact-grid rerun (fresh vLLM denominators
-mandatory; explicit `--mamba-ssm-cache-dtype float32` on the vLLM arm; cite run
-SHA `702f481`); 35B stays blocked until 27B reaches 124/124.
-Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
-source mmap residency.
+*Completed since the last substage.* qkvz (merged qkv+z projection packing,
+`KERNEL-GEMM-BF16` W2A) closed its DGX gates GREEN at `45f9e6d` (default suites
+8/8, both rollback arms, 35B inert, memcheck 0/0, structural −48 BF16 GEMMs/window
+confirmed; `VT_GDN_MERGED_QKVZ=0` rollback). With packed-default, qkvz, and the
+windowed-load release all in the binary, the **AUTHORIZED exact-grid rerun has now
+RUN** with fresh vLLM denominators and the explicit `--mamba-ssm-cache-dtype
+float32` audit pin on the vLLM arm (cite run SHA `702f481`) — this is the new
+binding `246a23c` above. 35B stays blocked until 27B reaches 124/124. Host PSS/RSS
+memory now PASSES in the binding; a **22.920 GiB** steady CPU weight mirror remains
+(the deeper direct-to-device streaming fix, wanted for 35B).
 
 **Order-0 re-ranking (2026-07-14
 [parity rescan](specs/parity-rescan-2026-07-14.md), diagnostic only):** the
@@ -80,8 +97,8 @@ non-binding localhost A/B is NEUTRAL within noise at c1/c2, because µs loopback
 ACKs mean Nagle never held our ~100 ms-cadence token frames; the mirror stays
 for real-network parity but earns no gate-axis expectation, so the c2–c8
 decode-gap attribution concentrates on the nsys full-step diff and
-`ENG-ASYNC-SCHED` W3) and the **memory track** (windowed-load fix `cb2d310` **MEASURED** 2026-07-15: 27B load-to-ready VmHWM 48.29 GB off vs **24.75 GB on (−23.54 GB)**, load transient eliminated (peak = steady RSS), ON-arm smoke 6/6; evidence `~/work/vllm.cpp-windowed-load/cb2d310c…518/evidence`; claim `CLAIM-LOAD-WINDOWED-1` released, row back to `PARTIAL`. The binding memory axes stay FAILED until the authorized exact-grid rerun — projected PASS vs vLLM's 28.17/28.53 GB. The full streaming redesign remains the deeper follow-up, wanted for 35B); (c) the
-nsys full-step c2 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 before
+`ENG-ASYNC-SCHED` W3) and the **memory track** (windowed-load fix `cb2d310` **MEASURED** 2026-07-15: 27B load-to-ready VmHWM 48.29 GB off vs **24.75 GB on (−23.54 GB)**, load transient eliminated (peak = steady RSS), ON-arm smoke 6/6; evidence `~/work/vllm.cpp-windowed-load/cb2d310c…518/evidence`; claim `CLAIM-LOAD-WINDOWED-1` released, row back to `PARTIAL`. The binding memory axes now PASS at the `246a23c` exact-grid rerun (ours peak PSS 24.88 GB vs vLLM 28.18 GB), as projected. The full streaming redesign remains the deeper follow-up, wanted for 35B); (c) the
+nsys full-step c2/c8 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 vs the slot-fix state-bandwidth trade before
 W3 is implemented; (d) FP4-producer/PDL/fused-norm-quant micro-levers are
 deprioritized — the recorded "fused RMSNorm→NVFP4" gap is **disproven** (vLLM's
 fusion pass is FP8-only) and the H1d fused-producer ranking is off-axis. qkvz
@@ -97,7 +114,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited and `3f256ab` binds at **55/124**. The packed GDN decode leaf is **CLOSED on EQUIVALENCE** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`): correctness `f344dec`, structure `7ff713e`/`24cea4f`, c16 slot fix `c172336`, and W1D3/G3 closed over eight seals + the 8-pair locked c16 A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper) — no stable regression, no `complete-pass` marker, no speed credit. `benchmark_binding=false`; qkvz W2A is implemented/`GATING` (2026-07-15, CPU gates green); host-memory repair, SGLang and a fresh binding/exact-grid result remain open | `GATING` | run the qkvz DGX gates (model 235/235 both arms, 35B/GGUF inertness, memcheck, 145→97 BF16 trace), then the AUTHORIZED exact-grid rerun (fresh vLLM denominators; explicit `--mamba-ssm-cache-dtype float32`; cite `702f481`); 35B only after 27B reaches 124/124 |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited. **NEW BINDING `246a23c`: 49/124** (fresh interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124). Memory (4/4), c1 (20/20) and every TTFT axis now pass; failure mass is the decode-coupled family at c2–c32 (2.2–6.5% slower) + two ITL tail anomalies. Honest regression: ours c16/c32 total throughput −2.67%/−3.64% vs `3f256ab` while vLLM held. The packed GDN decode leaf is **CLOSED on EQUIVALENCE** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`); qkvz W2A DGX-green (`45f9e6d`); windowed-load binding (memory PASS). SGLang remains open | `GATING` | close the c2–c32 decode gap: the in-flight era A/B (`3f256ab` vs `246a23c` binary) + nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED` W3 if confirmed → the c8 p99 / c32 p90 ITL tail mechanism; 35B only after 27B reaches 124/124 |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |

@@ -9869,3 +9869,68 @@ pass. No scheduler code changed; no GPU work. Binding stays **55/124**,
 [scheduler-prefill-coschedule.md](specs/scheduler-prefill-coschedule.md);
 recorded under `CLAIM-GDN-BA-ROUNDING-1`'s component investigation on the
 `ENG-SCHED-CORE` row.
+
+## 2026-07-15 — c2 TTFT-family pooled test-first (final component-harness statistics revision; CLAIM-GDN-BA-ROUNDING-1)
+
+**Task.** Land the final component-harness statistics revision under
+`CLAIM-GDN-BA-ROUNDING-1`: the three sealed 12-leg components all reached
+`complete-void` on TTFT-family axes only, proven (spec
+[scheduler-prefill-coschedule.md](specs/scheduler-prefill-coschedule.md)) to be a
+bimodal prefill co-schedule ARRIVAL LOTTERY — a faithful 1:1 mirror of pinned
+vLLM's budget-filling waiting loop, NOT a scheduler divergence. At c2 each rep's
+six per-request TTFTs are bimodal (~0.45 s prefill-alone vs ~0.9 s co-scheduled);
+leg mixes flip 3/3-vs-6/0, so the c2 TTFT-family per-rep aggregates (mean/median
+AND p90/p99) swing 4–24% while every throughput/TPOT/ITL/memory axis is stable
+≤1.13%. Both the per-run stability check AND the packed-vs-rollback comparison
+(median-of-3 AND per-rep paired) are lottery-unstable on the c2 TTFT-family; c16
+(96/rep) is fine under the 15% tail rule from `d19e091`.
+
+**E2EL verdict (requirement 3).** Read-only ssh `dgx.casa` measured the c2 E2EL
+per-rep deviation from the three sealed roots' raw JSONs: max **0.30%** in both
+arms across `c172336`/`-r2`/`d19e0916` — even in run 3 where c2 rollback mean
+TTFT swung 16.85%, its E2EL moved 0.23%. The ~0.7 s TTFT is only ~5% of the
+~14.5 s E2EL, so E2EL does NOT inherit the bimodality (and all three
+`validation_error`s were pure TTFT axes, never E2EL). **E2EL is left unchanged.**
+
+**Revision landed test-first** in `tools/bench/gdn_packed_component.py`, for the
+c2 TTFT-family axes (mean/median/p90/p99 of ttft) ONLY — never c16, never
+tpot/itl/e2el/throughput/memory: (1) COMPARISON uses each arm's POOLED
+18-per-request distribution (`_pooled_ttft_distribution`; the convergent,
+arm-symmetric mixture estimator) instead of the median-of-3-per-rep aggregate,
+via a new `comparison_values` map that overrides only the c2 TTFT-family entries;
+(2) STABILITY replaces the 4%/15% per-run median-deviation rule with a generous
+`C2_TTFT_POOLED_SANITY_BOUND=0.50` bound on each rep vs the pooled value (a legit
+all-slow 6/0 rep sits ~22% above a 3/3 pooled mean — well inside 50%; a hung
+5–10× leg still voids); (3) per-rep PAIRING is undefined for a pooled mixture, so
+the c2 TTFT-family is EXCLUDED from the gated `paired_axis_pass` (still reported
+in `paired_normalized_ratios` as a diagnostic — a flipped rep would otherwise
+manufacture a spurious packed-vs-rollback TTFT regression/advantage, which the
+task's mechanism statement explicitly calls out). The recomputation is extended
+(`_recompute_timing_metrics` now exposes the raw per-request `_request_ttft_ms`);
+`contract.stability` records `c2_ttft_pooled=true` plus the pooled concurrency,
+axis list and sanity bound; the c2 `by_concurrency` block adds `ttft_pooled` and
+`comparison_values`. c16 and every non-TTFT axis keep the 4%/15% per-run rules.
+
+**Test-first RED→GREEN.** New `tests/tools/test_gdn_packed_component.py` cases:
+`test_c2_ttft_bimodal_phase_lottery_is_pooled_and_accepted` (bimodal 3/3-vs-6/0
+fixture — RED-verified to VOID pre-change on `packed/mean_ttft_ms=0.333333,
+packed/median_ttft_ms=0.333333`; ACCEPTED post-change with the c2 TTFT axes equal
+to the pooled-sample statistics), `test_broken_c2_ttft_leg_beyond_pooled_bound_still_voids`
+(a 5× hung leg still voids), `test_c2_ttft_per_rep_flip_is_excluded_from_paired_gate`
+(a per-rep flip shows a <1 diagnostic ratio yet the axis is absent from the gated
+paired set and the pooled arm comparison ties), and `test_c16_ttft_mean_is_not_pooled_and_voids_beyond_4pct`
+(c16 mean TTFT >4% still voids — a pooled 50% bound would wrongly accept it).
+Honest updates to existing tests: the two c2 tail-15% cases were retargeted to
+c16 TTFT tails (`test_c16_ttft_tail_only_instability_within_15pct_is_accepted` /
+`..._beyond_15pct_still_voids`) because the 15% tail rule now governs c16 TTFT
+tails, not c2 TTFT (which is pooled); and `test_stable_paired_reversal_cannot_pass_on_medians`
+decouples its c2 TTFT from the engineered throughput/memory reversal so the pooled
+comparison stays clean. The non-tail-5%-throughput→void guard is unchanged.
+
+**Gates (CPU only; no GPU — the orchestrator runs the fourth component from the
+pushed SHA).** Focused `test_gdn_packed_component` **56/56**, all tools
+**139/139** (baseline 135 + 4 net new), `py_compile` clean, `check-agent-record.py`
+/ `test_agent_record.py` / `test_doc_checkpoint.py` / `check-doc-checkpoint.py`
+pass. No production/CUDA code changed; binding stays **55/124**,
+`benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain blocked on
+a verified `complete-pass`.

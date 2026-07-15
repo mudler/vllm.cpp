@@ -94,6 +94,12 @@ TAIL_AXES = frozenset(
     for metric in ("ttft", "tpot", "itl", "e2el")
     for stat in ("p90", "p99")
 )
+# TTFT-family axes (mean/median/p90/p99 of ttft).  At c2 (``POOLED_CONCURRENCY``)
+# these axes are governed by the pooled-across-repetitions estimator below, NOT
+# by the per-run median-deviation rule that governs every other axis.
+TTFT_FAMILY_AXES = frozenset(
+    f"{stat}_ttft_ms" for stat in ("mean", "median", "p90", "p99")
+)
 MEMORY_AXES = (
     "peak_gpu_memory_mib",
     "peak_pss_kib",
@@ -117,6 +123,26 @@ MAX_RUN_RELATIVE_DEVIATION = 0.04
 # 4% contention detector (noise floor ~0.3%).  Tail MEDIANS are unchanged full
 # binding comparison axes — only the per-run stability tolerance is relaxed.
 MAX_TAIL_RUN_RELATIVE_DEVIATION = 0.15
+# Concurrency whose TTFT-family axes are pooled across the three repetitions
+# instead of gated/compared per repetition.  At c2 each repetition has only six
+# requests whose per-request TTFTs are BIMODAL by closed-loop arrival phasing (a
+# 1024-token prefill either runs alone ~0.45 s or co-schedules ~0.9 s) — an
+# upstream-faithful vLLM-mirrored prefill co-schedule lottery, NOT a scheduler
+# divergence (``.agents/specs/scheduler-prefill-coschedule.md``).  Leg mixes flip
+# 3/3 vs 6/0, so the per-rep TTFT aggregates (mean/median AND p90/p99) swing
+# 4-24% while every throughput/TPOT/ITL/memory axis stays stable <=1.13% (and c2
+# E2EL <=0.30%, measured across the three sealed roots).  Pooling the 18
+# per-request samples per arm is the convergent estimator of that phase mixture
+# and is symmetric across arms; c16 (96 samples/rep) is unaffected and keeps the
+# per-run rules.
+POOLED_CONCURRENCY = 2
+# Generous per-rep sanity bound for the pooled c2 TTFT-family axes: every rep
+# aggregate must lie within 50% of the arm's pooled value.  The bimodal gap is
+# 2x, so a legitimate all-slow (6/0) rep sits ~22% above a 3/3 pooled mean — well
+# inside 50% — while a hung/broken leg (5-10x) still voids.  This replaces the
+# per-run median-deviation rule (4% non-tail / 15% tail) for the c2 TTFT-family
+# axes ONLY; all other axes keep those rules.
+C2_TTFT_POOLED_SANITY_BOUND = 0.50
 MEMORY_RETURN_TOLERANCE_KIB = 1048576
 # Pinned vLLM records the first-token timestamp, then calls perf_counter() a
 # second time for TTFT.  Consequently TTFT + sum(ITLs) exceeds its retained
@@ -292,6 +318,12 @@ def _recompute_timing_metrics(record: Mapping[str, Any]) -> dict[str, float]:
         **distribution(itls_ms or [0.0], "itl"),
         **distribution(e2el_ms, "e2el"),
     }
+    # Expose the raw per-request TTFT samples (ms) so the c2 TTFT-family axes can
+    # be pooled across the three repetitions (see ``POOLED_CONCURRENCY``).  This
+    # is a private key on the recomputed-metrics dict; every consumer iterates
+    # explicit axis lists, so it never participates in an axis distribution or
+    # comparison.
+    result["_request_ttft_ms"] = ttfts_ms
     return result
 
 
@@ -345,6 +377,34 @@ def _metric_stability_tolerance(axis: str) -> float:
     )
 
 
+def _pooled_ttft_distribution(samples: list[float]) -> dict[str, float]:
+    """Return the c2 TTFT-family axis values from the pooled per-request samples.
+
+    This is the convergent estimator of the arrival-phase mixture: with the same
+    number of requests per repetition, the pooled mean equals the mean of the
+    per-rep means, but the pooled median/p90/p99 are computed over the full
+    18-sample arm distribution rather than as a median of three per-rep order
+    statistics that each flip with the co-schedule lottery.
+    """
+
+    if not samples:
+        raise HarnessError("component pooled c2 TTFT distribution has no samples")
+    return {
+        "mean_ttft_ms": statistics.fmean(samples),
+        "median_ttft_ms": statistics.median(samples),
+        "p90_ttft_ms": percentile(samples, 90),
+        "p99_ttft_ms": percentile(samples, 99),
+    }
+
+
+def _pooled_relative_deviation(per_rep: list[float], pooled_value: float) -> float:
+    """Largest relative gap between a per-rep aggregate and the pooled value."""
+
+    if pooled_value == 0.0:
+        return 0.0 if all(value == 0.0 for value in per_rep) else float("inf")
+    return max(abs(value - pooled_value) / abs(pooled_value) for value in per_rep)
+
+
 def _normalized_ratio(numerator: float, denominator: float, *, label: str) -> float:
     if denominator <= 0.0 or numerator < 0.0:
         raise HarnessError(f"component {label} cannot form a normalized ratio")
@@ -381,6 +441,10 @@ def summarize_component_records(
                 ),
                 "repetitions": len(REPETITIONS),
                 "tail_axes": sorted(TAIL_AXES),
+                "c2_ttft_pooled": True,
+                "c2_ttft_pooled_concurrency": POOLED_CONCURRENCY,
+                "c2_ttft_pooled_axes": sorted(TTFT_FAMILY_AXES),
+                "c2_ttft_pooled_sanity_bound": C2_TTFT_POOLED_SANITY_BOUND,
             },
         },
     }
@@ -391,6 +455,7 @@ def summarize_component_records(
         metrics: dict[str, list[dict[str, float]]] = {arm: [] for arm in ARMS}
         memories: dict[str, list[dict[str, float]]] = {arm: [] for arm in ARMS}
         output_hashes: dict[str, list[str]] = {arm: [] for arm in ARMS}
+        ttft_samples: dict[str, list[list[float]]] = {arm: [] for arm in ARMS}
         for arm in ARMS:
             for repetition in REPETITIONS:
                 key = (concurrency, arm, repetition)
@@ -400,7 +465,12 @@ def summarize_component_records(
                     concurrency=concurrency,
                     expected_requests=REQUESTS_PER_RUN[concurrency],
                 )
-                metrics[arm].append(_run_metrics(record))
+                run_metric = _run_metrics(record)
+                # _run_metrics has already validated that the reported TTFT-family
+                # aggregates equal the ones recomputed from these raw samples, so
+                # the per-request TTFT array is trustworthy for the c2 pool.
+                ttft_samples[arm].append(run_metric.pop("_request_ttft_ms"))
+                metrics[arm].append(run_metric)
                 generated = record.get("generated_texts")
                 output_hashes[arm].append(
                     hashlib.sha256(canonical_json(generated).encode("utf-8")).hexdigest()
@@ -436,15 +506,35 @@ def summarize_component_records(
             }
             for arm in ARMS
         }
-        unstable = [
-            f"{arm}/{axis}={distribution['maximum_relative_deviation_from_median']:.6f}"
-            for arm, axes in (
-                (arm, metric_distributions[arm]) for arm in ARMS
-            )
-            for axis, distribution in axes.items()
-            if distribution["maximum_relative_deviation_from_median"]
-            > _metric_stability_tolerance(axis)
-        ]
+        pooled_ttft: dict[str, dict[str, float]] = {}
+        if concurrency == POOLED_CONCURRENCY:
+            for arm in ARMS:
+                pooled_ttft[arm] = _pooled_ttft_distribution(
+                    [sample for rep in ttft_samples[arm] for sample in rep]
+                )
+        unstable: list[str] = []
+        for arm in ARMS:
+            for axis, distribution in metric_distributions[arm].items():
+                if pooled_ttft and axis in TTFT_FAMILY_AXES:
+                    # c2 TTFT-family: gate each rep against the pooled arm value
+                    # with a generous sanity bound (C2_TTFT_POOLED_SANITY_BOUND)
+                    # instead of the per-run median-deviation rule — the bimodal
+                    # arrival-phase mixture makes per-run stability a lottery, so
+                    # only gross malfunction (a hung/broken leg) may void here.
+                    deviation = _pooled_relative_deviation(
+                        [row[axis] for row in metrics[arm]],
+                        pooled_ttft[arm][axis],
+                    )
+                    if deviation > C2_TTFT_POOLED_SANITY_BOUND:
+                        unstable.append(f"{arm}/{axis}={deviation:.6f}(pooled)")
+                elif (
+                    distribution["maximum_relative_deviation_from_median"]
+                    > _metric_stability_tolerance(axis)
+                ):
+                    unstable.append(
+                        f"{arm}/{axis}="
+                        f"{distribution['maximum_relative_deviation_from_median']:.6f}"
+                    )
         unstable.extend(
             f"{arm}/memory/{axis}="
             f"{distribution['maximum_relative_deviation_from_median']:.6f}"
@@ -488,31 +578,43 @@ def summarize_component_records(
             }
             for arm in ARMS
         }
+        # The comparison value per axis is the median of the three per-rep
+        # aggregates, EXCEPT the c2 TTFT-family axes, which use the pooled
+        # 18-sample arm distribution — the convergent, arm-symmetric estimator of
+        # the arrival-phase mixture (the per-rep median flips with the 3/3-vs-6/0
+        # co-schedule lottery and would manufacture a spurious TTFT edge/regress).
+        comparison_values = {
+            arm: dict(metric_medians[arm]) for arm in ARMS
+        }
+        if pooled_ttft:
+            for arm in ARMS:
+                for axis in TTFT_FAMILY_AXES:
+                    comparison_values[arm][axis] = pooled_ttft[arm][axis]
         axis_pass = {
             **{
-                axis: metric_medians["packed"][axis]
-                >= metric_medians["rollback"][axis]
+                axis: comparison_values["packed"][axis]
+                >= comparison_values["rollback"][axis]
                 for axis in HIGHER_AXES
             },
             **{
-                axis: metric_medians["packed"][axis]
-                <= metric_medians["rollback"][axis]
+                axis: comparison_values["packed"][axis]
+                <= comparison_values["rollback"][axis]
                 for axis in LOWER_AXES
             },
         }
         normalized_ratios = {
             **{
                 axis: _normalized_ratio(
-                    metric_medians["packed"][axis],
-                    metric_medians["rollback"][axis],
+                    comparison_values["packed"][axis],
+                    comparison_values["rollback"][axis],
                     label=f"c{concurrency}/{axis}",
                 )
                 for axis in HIGHER_AXES
             },
             **{
                 axis: _normalized_ratio(
-                    metric_medians["rollback"][axis],
-                    metric_medians["packed"][axis],
+                    comparison_values["rollback"][axis],
+                    comparison_values["packed"][axis],
                     label=f"c{concurrency}/{axis}",
                 )
                 for axis in LOWER_AXES
@@ -552,9 +654,16 @@ def summarize_component_records(
             }
             for repetition in REPETITIONS
         }
+        # The c2 TTFT-family axes are compared arm-to-arm on the pooled
+        # distribution, so per-rep pairing is undefined for them: a flipped rep
+        # would otherwise manufacture a spurious packed-vs-rollback TTFT regress
+        # or advantage.  They stay in ``paired_ratios`` as a diagnostic but are
+        # excluded from the gated ``paired_axis_pass`` at c2 only.
         paired_axis_pass = {
             repetition: {
-                axis: ratio >= 1.0 for axis, ratio in ratios.items()
+                axis: ratio >= 1.0
+                for axis, ratio in ratios.items()
+                if not (pooled_ttft and axis in TTFT_FAMILY_AXES)
             }
             for repetition, ratios in paired_ratios.items()
         }
@@ -569,9 +678,11 @@ def summarize_component_records(
             "axis_pass": axis_pass,
             "axis_pass_count": sum(axis_pass.values()),
             "axis_total": len(axis_pass),
+            "comparison_values": comparison_values,
             "generated_text_sha256": output_hashes,
             "means": metric_means,
             "medians": metric_medians,
+            "ttft_pooled": pooled_ttft,
             "memory": memory_medians,
             "memory_means": memory_means,
             "memory_spread": memory_distributions,

@@ -57,11 +57,21 @@ throughput/mean/median axis stable and packed non-regressing on forensic medians
 (run 1 c2, run 2 c16), voided **only** by max-dominated TTFT tail axes; those two
 voids proved the uniform ≤4% per-run rule mis-fits tail order statistics (p99 at
 c2 ≈ max of 6 samples, at c16 ≈ the 95th/96th), so the component's tail-axis
-stability tolerance was **revised test-first this checkpoint** — tails (p90/p99
-of ttft/tpot/itl/e2el) get 15% while non-tail timing and all memory axes keep 4%
-(focused **52/52**, tools **135/135**). Next: the orchestrator runs the third
-fresh SHA/root full **40+8 / 144 paired**-axis component from the pushed SHA; the
-`c172336`, `d82d282` and diagnostic roots stay untouched. qkvz stays excluded.
+stability tolerance was **revised test-first** — tails (p90/p99
+of ttft/tpot/itl/e2el) get 15% while non-tail timing and all memory axes keep 4%.
+A **third** seal (`d19e091`) then voided on the c2 **mean/median** TTFT
+themselves; the [co-schedule grounding](specs/scheduler-prefill-coschedule.md)
+proved these are a bimodal prefill arrival lottery (a faithful vLLM mirror,
+scheduler UNCHANGED), so **this checkpoint** adds a second test-first revision:
+the c2 TTFT-family (mean/median/p90/p99 of ttft) is COMPARED on each arm's pooled
+18-per-request distribution, STABILITY-gated on a 50% pooled sanity bound, and
+EXCLUDED from the gated per-rep paired axes; c16 and every non-TTFT axis keep the
+per-run rules, and E2EL is unchanged (measured c2 E2EL deviation ≤0.30% across
+the three sealed roots). Focused **56/56**, tools **139/139**. Next: the
+orchestrator runs the **fourth** fresh SHA/root full **40+8**-median-axis
+component (c2 TTFT-family pooled, excluded from the gated paired set) from the
+pushed SHA; the `c172336`, `d82d282`, `d19e091` and diagnostic roots stay
+untouched. qkvz stays excluded.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 

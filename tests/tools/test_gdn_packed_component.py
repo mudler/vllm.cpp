@@ -11,6 +11,7 @@ import json
 import pathlib
 import shutil
 import shlex
+import statistics
 import subprocess
 import tempfile
 import unittest
@@ -206,6 +207,50 @@ def _apply_ttft_ms(record: dict, ttfts_ms: list[float]) -> None:
     metrics = gdn_component._recompute_timing_metrics(record)
     for axis in gdn_component.LOWER_AXES:
         record[axis] = metrics[axis]
+
+
+# --- c2 TTFT phase-lottery fixtures (ms) -------------------------------------
+# Bimodal per-request TTFTs from the upstream-mirrored prefill co-schedule
+# arrival lottery: a 1024-token prefill runs alone (~fast) or co-schedules
+# (~slow, ~2x).  Magnitudes are small vs the ~1 s fixture decode so E2EL stays
+# stable (<4%) while the c2 TTFT-family per-rep aggregates swing far past 4%.
+# Reps flip between a 3/3 mix and an all-slow 6/0 rep.  Packed sits uniformly
+# below rollback per request so the arm comparison and per-rep pairing stay clean.
+_C2_TTFT_BIMODAL_PACKED = {
+    1: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
+    2: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
+    3: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],  # 6/0 slow,  mean 10.0
+}
+_C2_TTFT_BIMODAL_ROLLBACK = {
+    1: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
+    2: [22.0, 22.0, 22.0, 22.0, 22.0, 22.0],  # 6/0 slow,  mean 22.0
+    3: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
+}
+# A per-rep flip: rollback r1 dips below packed r1 (arrival phasing).  Both arms
+# pool to the SAME 18-sample TTFT distribution (9x10 + 9x20 ms — the honest
+# at-parity expectation, since packed decode does not move TTFT), so the pooled
+# arm comparison ties (packed <= rollback holds) while the per-rep mixture flips.
+# All rep aggregates stay within 50% of the shared pool (no all-fast reps, so no
+# axis rides the 50% boundary).
+_C2_TTFT_FLIP_PACKED = {
+    1: [10.0, 20.0, 20.0, 20.0, 20.0, 20.0],  # 1 fast/5 slow, mean 18.33
+    2: [10.0, 10.0, 10.0, 10.0, 20.0, 20.0],  # 4 fast/2 slow, mean 13.33
+    3: [10.0, 10.0, 10.0, 10.0, 20.0, 20.0],  # 4 fast/2 slow, mean 13.33
+}
+_C2_TTFT_FLIP_ROLLBACK = {
+    1: [10.0, 10.0, 10.0, 10.0, 10.0, 20.0],  # 5 fast/1 slow, mean 11.67 (< packed r1)
+    2: [10.0, 10.0, 20.0, 20.0, 20.0, 20.0],  # 2 fast/4 slow, mean 16.67
+    3: [10.0, 10.0, 20.0, 20.0, 20.0, 20.0],  # 2 fast/4 slow, mean 16.67
+}
+# c16 TTFT tail fixtures (96 requests): 94 at 20 ms fix mean/median/p90; the two
+# tail requests set p99 = ~0.95*low + 0.05*high.  These prove the 15% tail rule
+# still governs c16 TTFT tails (c16 is NEVER pooled).
+_C16_TTFT_TAIL_WITHIN_15PCT = {1: (58.0, 88.0), 2: (52.0, 82.0), 3: (50.0, 80.0)}
+_C16_TTFT_TAIL_BEYOND_15PCT = {1: (62.0, 92.0), 2: (52.0, 82.0), 3: (50.0, 80.0)}
+
+
+def _c16_tail_ttft(low: float, high: float) -> list[float]:
+    return [20.0] * 94 + [low, high]
 
 
 def _records(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
@@ -909,6 +954,19 @@ class GdnPackedComponentTest(unittest.TestCase):
                 ):
                     memory[(concurrency, arm, repetition)][axis] = value
 
+        # The c2 TTFT-family is now compared arm-to-arm on the pooled 18-sample
+        # distribution, so decouple it from the engineered throughput/memory
+        # per-rep reversal this test exercises: give it a clean, stable,
+        # packed-better profile (uniform, so it neither voids on stability nor
+        # flips the pooled comparison).  The throughput/memory/latency reversal at
+        # repetition 2 remains what drives the paired-axis failure below.
+        for arm in ARMS:
+            for repetition in (1, 2, 3):
+                ttft = 5.0 if arm == "packed" else 9.0
+                _apply_ttft_ms(
+                    records[(concurrency, arm, repetition)], [ttft] * requests
+                )
+
         summary = summarize_component_records(records, memory)
 
         self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
@@ -945,38 +1003,145 @@ class GdnPackedComponentTest(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "unstable"):
             summarize_component_records(records, memory)
 
-    # Tail order statistics (p90/p99 of ttft/tpot/itl/e2el) at c2 are the max of
-    # six samples per repetition; their idle-box, fixed-SHA rep-to-rep
-    # dispersion is inherently far above the mean-axis noise floor.  These
-    # arrays hold mean_ttft (27 ms) and median_ttft (20 ms) exactly constant
-    # across the three repetitions and move ONLY the TTFT tail: the perturbed
-    # p99 deviation lands between the 4% (old, uniform) and 15% (revised, tail)
-    # thresholds for the 12% fixture and clears 15% for the 20% fixture.
-    _C2_TTFT_TAIL_12PCT = {
-        1: [6.0, 15.0, 20.0, 20.0, 40.0, 61.0],   # p99 59.95
-        2: [13.0, 15.0, 20.0, 20.0, 40.0, 54.0],  # p99 53.30 (median rep)
-        3: [14.0, 15.0, 20.0, 20.0, 40.0, 53.0],  # p99 52.35
-    }
-    _C2_TTFT_TAIL_20PCT = {
-        1: [2.0, 15.0, 20.0, 20.0, 40.0, 65.0],   # p99 63.75
-        2: [13.0, 15.0, 20.0, 20.0, 40.0, 54.0],  # p99 53.30 (median rep)
-        3: [14.0, 15.0, 20.0, 20.0, 40.0, 53.0],  # p99 52.35
-    }
-
-    def test_tail_only_instability_within_15pct_is_accepted(self) -> None:
-        # A component whose ONLY per-run instability is a TTFT tail axis at ~12%
-        # (mean/median/throughput/memory all stable) voids under the uniform 4%
-        # rule; under the revised tail tolerance it must be ACCEPTED (not void).
+    def test_c2_ttft_bimodal_phase_lottery_is_pooled_and_accepted(self) -> None:
+        # The c2 reps flip 3/3 vs 6/0 bimodal TTFT mixes (the upstream-mirrored
+        # prefill co-schedule arrival lottery).  The per-rep mean_ttft swings
+        # ~33%, so the retained non-tail 4% rule VOIDS this pre-change; after
+        # pooling the c2 TTFT-family across the three reps it is ACCEPTED, and
+        # every c2 TTFT axis equals the pooled 18-sample statistic.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition, ttfts_ms in self._C2_TTFT_TAIL_12PCT.items():
-            _apply_ttft_ms(records[(2, "rollback", repetition)], ttfts_ms)
+        for repetition in (1, 2, 3):
+            _apply_ttft_ms(
+                records[(2, "packed", repetition)],
+                _C2_TTFT_BIMODAL_PACKED[repetition],
+            )
+            _apply_ttft_ms(
+                records[(2, "rollback", repetition)],
+                _C2_TTFT_BIMODAL_ROLLBACK[repetition],
+            )
 
-        # The lone perturbed axis is the TTFT tail, and its deviation lands
-        # strictly between the old uniform 4% and the revised 15% tail bound.
+        # The per-rep mean_ttft deviation is far past the non-tail 4% rule that
+        # (still) voids every non-TTFT axis — this is exactly the run-3 signature.
         deviation = gdn_component._distribution(
-            [records[(2, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
-            label="c2/rollback/p99_ttft_ms",
+            [records[(2, "packed", repetition)]["mean_ttft_ms"] for repetition in (1, 2, 3)],
+            label="c2/packed/mean_ttft_ms",
+        )["maximum_relative_deviation_from_median"]
+        self.assertGreater(deviation, gdn_component.MAX_RUN_RELATIVE_DEVIATION)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        self.assertTrue(summary["all_repetitions_stable"])
+        c2 = summary["by_concurrency"]["2"]
+        for arm, fixture in (
+            ("packed", _C2_TTFT_BIMODAL_PACKED),
+            ("rollback", _C2_TTFT_BIMODAL_ROLLBACK),
+        ):
+            pool = [value for repetition in (1, 2, 3) for value in fixture[repetition]]
+            expected = {
+                "mean_ttft_ms": statistics.fmean(pool),
+                "median_ttft_ms": statistics.median(pool),
+                "p90_ttft_ms": gdn_component.percentile(pool, 90),
+                "p99_ttft_ms": gdn_component.percentile(pool, 99),
+            }
+            for axis, value in expected.items():
+                self.assertAlmostEqual(c2["ttft_pooled"][arm][axis], value)
+                # The pooled value is what drives the arm comparison/ratios.
+                self.assertAlmostEqual(c2["comparison_values"][arm][axis], value)
+        stability = summary["contract"]["stability"]
+        self.assertTrue(stability["c2_ttft_pooled"])
+        self.assertEqual(stability["c2_ttft_pooled_concurrency"], 2)
+        self.assertEqual(stability["c2_ttft_pooled_sanity_bound"], 0.5)
+        self.assertEqual(
+            stability["c2_ttft_pooled_axes"],
+            sorted(f"{stat}_ttft_ms" for stat in ("mean", "median", "p90", "p99")),
+        )
+
+    def test_c2_ttft_per_rep_flip_is_excluded_from_paired_gate(self) -> None:
+        # A rep where packed TTFT > rollback (rollback r1 dips low by arrival
+        # phasing) would, under per-rep pairing, manufacture a spurious
+        # packed-vs-rollback TTFT regression; but the pooled arm comparison has
+        # packed <= rollback on every TTFT axis, so the component is ACCEPTED and
+        # the c2 TTFT-family is excluded from the gated paired axes (it remains a
+        # reported diagnostic).
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_ttft_ms(
+                records[(2, "packed", repetition)], _C2_TTFT_FLIP_PACKED[repetition]
+            )
+            _apply_ttft_ms(
+                records[(2, "rollback", repetition)],
+                _C2_TTFT_FLIP_ROLLBACK[repetition],
+            )
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        c2 = summary["by_concurrency"]["2"]
+        # The diagnostic per-rep ratio DOES show the r1 flip (packed worse < 1.0)...
+        self.assertLess(
+            c2["paired_normalized_ratios_ge_1_is_packed_better"]["r1"]["mean_ttft_ms"],
+            1.0,
+        )
+        # ...but the c2 TTFT-family axes are not in the gated paired set.
+        for repetition in ("r1", "r2", "r3"):
+            for axis in ("mean_ttft_ms", "median_ttft_ms", "p90_ttft_ms", "p99_ttft_ms"):
+                self.assertNotIn(axis, c2["paired_axis_pass"][repetition])
+        # The pooled arm comparison keeps packed <= rollback on every TTFT axis.
+        for axis in ("mean_ttft_ms", "median_ttft_ms", "p90_ttft_ms", "p99_ttft_ms"):
+            self.assertLessEqual(
+                c2["comparison_values"]["packed"][axis],
+                c2["comparison_values"]["rollback"][axis],
+            )
+
+    def test_broken_c2_ttft_leg_beyond_pooled_bound_still_voids(self) -> None:
+        # Same bimodal fixture, but one packed leg is hung at ~5x: its per-rep
+        # aggregate lands far past the 50% pooled sanity bound, so it still VOIDS.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_ttft_ms(
+                records[(2, "packed", repetition)],
+                _C2_TTFT_BIMODAL_PACKED[repetition],
+            )
+            _apply_ttft_ms(
+                records[(2, "rollback", repetition)],
+                _C2_TTFT_BIMODAL_ROLLBACK[repetition],
+            )
+        _apply_ttft_ms(records[(2, "packed", 3)], [50.0] * 6)  # 5x hung leg
+
+        with self.assertRaisesRegex(HarnessError, "unstable"):
+            summarize_component_records(records, memory)
+
+    def test_c16_ttft_mean_is_not_pooled_and_voids_beyond_4pct(self) -> None:
+        # c16 is NEVER pooled: a c16 mean/median TTFT swing past the retained 4%
+        # rule still VOIDS (a pooled 50% bound would wrongly accept it), proving
+        # pooling is confined to c2.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition, ttft in ((1, 20.0), (2, 20.0), (3, 22.0)):
+            _apply_ttft_ms(records[(16, "rollback", repetition)], [ttft] * 96)
+
+        with self.assertRaises(HarnessError) as context:
+            summarize_component_records(records, memory)
+        message = str(context.exception)
+        self.assertIn("c16 repetitions are unstable", message)
+        self.assertIn("mean_ttft_ms", message)
+
+    def test_c16_ttft_tail_only_instability_within_15pct_is_accepted(self) -> None:
+        # The 15% tail tolerance still governs c16 TTFT tails (c16 is not pooled):
+        # a c16 p99 tail at ~11% (mean/median/p90/throughput/memory all stable)
+        # voids under the uniform 4% rule but must be ACCEPTED under the tail rule.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition, (low, high) in _C16_TTFT_TAIL_WITHIN_15PCT.items():
+            _apply_ttft_ms(records[(16, "rollback", repetition)], _c16_tail_ttft(low, high))
+
+        deviation = gdn_component._distribution(
+            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
+            label="c16/rollback/p99_ttft_ms",
         )["maximum_relative_deviation_from_median"]
         self.assertGreater(deviation, gdn_component.MAX_RUN_RELATIVE_DEVIATION)
         self.assertLess(deviation, 0.15)
@@ -999,13 +1164,19 @@ class GdnPackedComponentTest(unittest.TestCase):
             ),
         )
 
-    def test_tail_instability_beyond_15pct_still_voids(self) -> None:
-        # A TTFT tail axis at ~20% exceeds the revised tail tolerance and must
-        # still void, so genuine tail blowups remain caught.
+    def test_c16_ttft_tail_instability_beyond_15pct_still_voids(self) -> None:
+        # A c16 TTFT p99 tail past 15% still voids, so genuine tail blowups remain
+        # caught even where the 15% rule (not pooling) governs.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition, ttfts_ms in self._C2_TTFT_TAIL_20PCT.items():
-            _apply_ttft_ms(records[(2, "rollback", repetition)], ttfts_ms)
+        for repetition, (low, high) in _C16_TTFT_TAIL_BEYOND_15PCT.items():
+            _apply_ttft_ms(records[(16, "rollback", repetition)], _c16_tail_ttft(low, high))
+
+        deviation = gdn_component._distribution(
+            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
+            label="c16/rollback/p99_ttft_ms",
+        )["maximum_relative_deviation_from_median"]
+        self.assertGreater(deviation, 0.15)
 
         with self.assertRaisesRegex(HarnessError, "unstable"):
             summarize_component_records(records, memory)

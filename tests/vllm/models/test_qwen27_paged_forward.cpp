@@ -441,6 +441,44 @@ TEST_CASE("qwen27 packed GDN selection is pure non-spec decode only") {
   }
 }
 
+// W2 merged-qkvz dispatch: ONE in_proj_qkvz GEMM is selected only on CUDA, with
+// the packed owner resident, the runtime toggles on (VT_GDN_MERGED_PROJ master,
+// VT_GDN_MERGED_QKVZ leaf) and one uniform output dtype (mixed_qkv and z come
+// out of one GEMM, so GdnInDType must equal GdnOutDType — the 27B default BF16/
+// BF16). Every other combination stays on the exact two split GEMMs sliced from
+// the same owner. 35B (fp8 qkv/z, no packed owner) and GGUF/synthetic (split
+// bf16) are inert by has_packed_qkvz.
+TEST_CASE("qwen27 merged qkvz selection requires CUDA, owner, toggle, one dtype") {
+  vllm::detail::GdnMergedQkvzEligibility e;
+  e.runtime_enabled = true;
+  e.cuda = true;
+  e.has_packed_qkvz = true;
+  e.uniform_dtype = true;
+
+  CHECK(vllm::detail::ShouldUseMergedGdnQkvz(e));
+
+  {
+    auto x = e;
+    x.runtime_enabled = false;  // VT_GDN_MERGED_QKVZ=0 / VT_GDN_MERGED_PROJ=0.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnQkvz(x));
+  }
+  {
+    auto x = e;
+    x.cuda = false;  // CPU keeps the reference split arithmetic.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnQkvz(x));
+  }
+  {
+    auto x = e;
+    x.has_packed_qkvz = false;  // 35B fp8 / GGUF / synthetic split owners.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnQkvz(x));
+  }
+  {
+    auto x = e;
+    x.uniform_dtype = false;  // diagnostic VT_GDN_IN_BF16 != VT_GDN_OUT_BF16.
+    CHECK_FALSE(vllm::detail::ShouldUseMergedGdnQkvz(x));
+  }
+}
+
 TEST_CASE("qwen27 packed GDN validates engine state slots before upload") {
   CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
       std::vector<int32_t>{0, 1, -1}, /*required=*/3, /*slots=*/2));

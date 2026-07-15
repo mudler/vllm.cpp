@@ -42,6 +42,22 @@ struct GdnPackedDecodeEligibility {
 
 bool ShouldUsePackedGdnDecode(const GdnPackedDecodeEligibility& eligibility);
 
+// W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
+// (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is
+// selected only on CUDA with the packed 27B owner resident, the runtime
+// toggles on (VT_GDN_MERGED_PROJ master, VT_GDN_MERGED_QKVZ leaf) and one
+// uniform output dtype (mixed_qkv and z leave one GEMM, so GdnInDType must
+// equal GdnOutDType — the 27B default is BF16/BF16). Every other combination
+// issues the exact two split GEMMs sliced from the same resident owner.
+struct GdnMergedQkvzEligibility {
+  bool runtime_enabled = false;
+  bool cuda = false;
+  bool has_packed_qkvz = false;
+  bool uniform_dtype = false;
+};
+
+bool ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& eligibility);
+
 // Validate the exact prefix that will be uploaded. Negative rows are inert
 // padding; every live slot must be unique and in range. This runs on host
 // metadata before the device buffer is constructed, keeping CUDA capture free

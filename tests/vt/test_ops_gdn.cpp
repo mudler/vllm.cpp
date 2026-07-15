@@ -1422,6 +1422,114 @@ std::pair<float, double> AbsoluteDiffStats(const std::vector<float>& got,
   return {max_error, got.empty() ? 0.0 : sum_error / static_cast<double>(got.size())};
 }
 
+// ---------------------------------------------------------------------------
+// W2 merged-qkvz strided consumers. vLLM's Qwen3.5/3.6 GDN issues ONE
+// in_proj_qkvz GEMM and splits its [T, key*2+value*2] output into mixed_qkv and
+// z last-dimension slices (qwen_gdn_linear_attn.py:929-936). Our merge feeds the
+// conv (mixed_qkv) and the gated RMSNorm (z) padded-row (inner-contiguous, outer
+// stride > width) views of that single output without any copy. These pin that
+// the strided views are bit-identical to the contiguous split-projection inputs.
+
+// A rank-3 [T,Hv,Dv] gate view with a padded per-token (outer) stride; the inner
+// [Hv,Dv] block stays contiguous, exactly as z = mixed_qkvz[:, conv_dim:] views.
+Tensor Rank3RowView(void* data, DType dtype, Device device, int64_t t, int64_t hv,
+                    int64_t dv, int64_t row_stride) {
+  Tensor x;
+  x.data = data;
+  x.dtype = dtype;
+  x.device = device;
+  x.rank = 3;
+  x.shape[0] = t;
+  x.shape[1] = hv;
+  x.shape[2] = dv;
+  x.stride[0] = row_stride;
+  x.stride[1] = dv;
+  x.stride[2] = 1;
+  return x;
+}
+
+TEST_CASE("causal_conv1d_fwd: padded-row strided x matches contiguous") {
+  constexpr int64_t kT = 5, kC = 6, kK = 4, kPad = 7;  // stride = kC + kPad
+  const auto xf = RandomF32(static_cast<size_t>(kT * kC), 4242);
+  std::vector<float> w = RandomF32(static_cast<size_t>(kC * kK), 4243);
+  std::vector<float> st0 = RandomF32(static_cast<size_t>(kC * (kK - 1)), 4244);
+  std::vector<int32_t> qsl = {0, kT}, his = {1};
+  Queue q = Q();
+  // Contiguous reference.
+  std::vector<float> x_c(xf), st_c(st0), out_c(static_cast<size_t>(kT * kC), 0.0f);
+  Tensor txc = T2(x_c, kT, kC), tw = T2(w, kC, kK), tsc = T3(st_c, 1, kC, kK - 1);
+  Tensor toc = T2(out_c, kT, kC), tqsl = Ti(qsl), this_ = Ti(his);
+  vt::CausalConv1dFwd(q, toc, txc, tw, nullptr, tsc, tqsl, this_, CausalConv1dArgs{true});
+  // Padded-row strided x: each token row lands in the first kC cols of a wider
+  // buffer; the tail columns are canaries that must stay untouched.
+  const int64_t stride = kC + kPad;
+  std::vector<float> x_p(static_cast<size_t>(kT) * stride, -12345.0f);
+  for (int64_t t = 0; t < kT; ++t)
+    for (int64_t c = 0; c < kC; ++c) x_p[t * stride + c] = xf[static_cast<size_t>(t * kC + c)];
+  std::vector<float> st_p(st0), out_p(static_cast<size_t>(kT * kC), 0.0f);
+  Tensor txp = RowView(x_p.data(), DType::kF32, Cpu(), kT, kC, stride);
+  Tensor tsp = T3(st_p, 1, kC, kK - 1), top = T2(out_p, kT, kC);
+  vt::CausalConv1dFwd(q, top, txp, tw, nullptr, tsp, tqsl, this_, CausalConv1dArgs{true});
+  for (size_t i = 0; i < out_c.size(); ++i) CHECK(out_p[i] == out_c[i]);
+  for (size_t i = 0; i < st_c.size(); ++i) CHECK(st_p[i] == st_c[i]);
+  for (int64_t t = 0; t < kT; ++t)
+    for (int64_t c = kC; c < stride; ++c) CHECK(x_p[t * stride + c] == -12345.0f);
+}
+
+TEST_CASE("causal_conv1d_update: padded-row strided x matches contiguous") {
+  // B=4 single-token sequences, C=8, K=4, padded-row x view.
+  constexpr int64_t kB = 4, kC = 8, kK = 4, kPad = 5;
+  const auto xf = RandomF32(static_cast<size_t>(kB * kC), 7001);
+  std::vector<float> w = RandomF32(static_cast<size_t>(kC * kK), 7002);
+  std::vector<float> st0 = RandomF32(static_cast<size_t>(kB * kC * (kK - 1)), 7003);
+  Queue q = Q();
+  std::vector<float> x_c(xf), st_c(st0), out_c(static_cast<size_t>(kB * kC), 0.0f);
+  Tensor txc = T2(x_c, kB, kC), tw = T2(w, kC, kK), tsc = T3(st_c, kB, kC, kK - 1);
+  Tensor toc = T2(out_c, kB, kC);
+  vt::CausalConv1dUpdate(q, toc, txc, tw, nullptr, tsc, CausalConv1dArgs{true});
+  const int64_t stride = kC + kPad;
+  std::vector<float> x_p(static_cast<size_t>(kB) * stride, -777.0f);
+  for (int64_t b = 0; b < kB; ++b)
+    for (int64_t c = 0; c < kC; ++c) x_p[b * stride + c] = xf[static_cast<size_t>(b * kC + c)];
+  std::vector<float> st_p(st0), out_p(static_cast<size_t>(kB * kC), 0.0f);
+  Tensor txp = RowView(x_p.data(), DType::kF32, Cpu(), kB, kC, stride);
+  Tensor tsp = T3(st_p, kB, kC, kK - 1), top = T2(out_p, kB, kC);
+  vt::CausalConv1dUpdate(q, top, txp, tw, nullptr, tsp, CausalConv1dArgs{true});
+  for (size_t i = 0; i < out_c.size(); ++i) CHECK(out_p[i] == out_c[i]);
+  for (size_t i = 0; i < st_c.size(); ++i) CHECK(st_p[i] == st_c[i]);
+  for (int64_t b = 0; b < kB; ++b)
+    for (int64_t c = kC; c < stride; ++c) CHECK(x_p[b * stride + c] == -777.0f);
+}
+
+TEST_CASE("rmsnorm_gated: rank-3 padded-row strided gate matches contiguous") {
+  // Real z geometry: T tokens, Hv heads, Dv per head; the gate is the padded-row
+  // z slice of the merged [T, qkvz_width] projection output.
+  constexpr int64_t kT = 4, kHv = 3, kDv = 5, kPad = 11;
+  const int64_t rows = kT * kHv, gate_cols = kHv * kDv;
+  const auto xf = RandomF32(static_cast<size_t>(rows * kDv), 9101);
+  const auto zf = RandomF32(static_cast<size_t>(kT * gate_cols), 9102);
+  std::vector<float> w = RandomF32(static_cast<size_t>(kDv), 9103);
+  Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {kDv});
+  Queue q = Q();
+  // Contiguous rank-2 [rows, Dv] reference.
+  std::vector<float> x_c(xf), z_c(zf), out_c(static_cast<size_t>(rows * kDv), 0.0f);
+  Tensor txc = T2(x_c, rows, kDv), tzc = T2(z_c, rows, kDv), toc = T2(out_c, rows, kDv);
+  vt::RmsNormGated(q, toc, txc, tzc, tw, RmsNormGatedArgs{0.0f, false});
+  // Rank-3 [T,Hv,Dv] with x/out contiguous and the gate a padded-token view.
+  const int64_t stride = gate_cols + kPad;
+  std::vector<float> z_p(static_cast<size_t>(kT) * stride, -3.5f);
+  for (int64_t t = 0; t < kT; ++t)
+    for (int64_t j = 0; j < gate_cols; ++j)
+      z_p[t * stride + j] = zf[static_cast<size_t>(t * gate_cols + j)];
+  std::vector<float> x_p(xf), out_p(static_cast<size_t>(rows * kDv), 0.0f);
+  Tensor txp = T3(x_p, kT, kHv, kDv), top = T3(out_p, kT, kHv, kDv);
+  Tensor tzp = Rank3RowView(z_p.data(), DType::kF32, Cpu(), kT, kHv, kDv, stride);
+  vt::RmsNormGated(q, top, txp, tzp, tw, RmsNormGatedArgs{0.0f, false});
+  for (size_t i = 0; i < out_c.size(); ++i) CHECK(out_p[i] == out_c[i]);
+  for (int64_t t = 0; t < kT; ++t)
+    for (int64_t j = gate_cols; j < stride; ++j) CHECK(z_p[t * stride + j] == -3.5f);
+}
+
 #ifdef VLLM_CPP_TRITON_CHUNKO_BF16
 void CheckUpstreamCutedslTolerances(const GdnDiffStats& stats) {
   CAPTURE(stats.output_max);
@@ -2039,6 +2147,230 @@ TEST_CASE("gdn BA accepts F32/BF16 row-strided packed views on CPU and CUDA") {
       CAPTURE(gate_dtype);
       CAPTURE(batch);
       RunGdnPackedBaCase(batch, gate_dtype, seed);
+      seed += 10;
+    }
+  }
+}
+
+// Ported from the packed `in_proj_qkvz` slicing in qwen_gdn_linear_attn.py:
+// 929-936: vLLM projects qkvz in model dtype once, then mixed_qkv and z are
+// logical last-dim views with the packed parent row stride. The two W2
+// consumers (causal conv over mixed_qkv, gated RMSNorm over z as [T,Hv,Dv])
+// must produce bit-identical results from the strided views and the contiguous
+// copies, leave the parent (canary prefix/suffix included) untouched, and
+// survive CUDA graph capture/replay without materialization.
+void RunGdnMergedQkvzCase(int64_t t, DType dtype, uint32_t seed) {
+  constexpr int64_t kHk = 2;
+  constexpr int64_t kHv = 6;
+  constexpr int64_t kDk = 8;
+  constexpr int64_t kDv = 8;
+  constexpr int64_t kKw = 4;
+  constexpr int64_t kPrefix = 1;
+  constexpr int64_t kSuffix = 3;
+  const int64_t key_dim = kHk * kDk;
+  const int64_t value_dim = kHv * kDv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t parent_w = kPrefix + conv_dim + value_dim + kSuffix;
+
+  const auto parent_f = RandomF32(static_cast<size_t>(t * parent_w), seed, -1.5f, 1.5f);
+  const std::vector<uint8_t> parent_bytes = Pack(parent_f, dtype);
+  const std::vector<float> parent_rounded = Unpack(parent_bytes, dtype);
+  // Contiguous copies of the two logical slices (identical rounded values).
+  std::vector<float> mixed_f(static_cast<size_t>(t * conv_dim));
+  std::vector<float> z_f(static_cast<size_t>(t * value_dim));
+  for (int64_t row = 0; row < t; ++row) {
+    for (int64_t c = 0; c < conv_dim; ++c)
+      mixed_f[static_cast<size_t>(row * conv_dim + c)] =
+          parent_rounded[static_cast<size_t>(row * parent_w + kPrefix + c)];
+    for (int64_t c = 0; c < value_dim; ++c)
+      z_f[static_cast<size_t>(row * value_dim + c)] =
+          parent_rounded[static_cast<size_t>(row * parent_w + kPrefix + conv_dim + c)];
+  }
+  const std::vector<uint8_t> mixed_bytes = Pack(mixed_f, dtype);
+  const std::vector<uint8_t> z_bytes = Pack(z_f, dtype);
+  const auto wconv_f = RandomF32(static_cast<size_t>(conv_dim * kKw), seed + 1);
+  const std::vector<uint8_t> wconv_bytes = Pack(wconv_f, dtype);
+  const auto st_fwd0 = RandomF32(static_cast<size_t>(conv_dim * (kKw - 1)), seed + 2);
+  const auto st_upd0 = RandomF32(static_cast<size_t>(t * conv_dim * (kKw - 1)), seed + 3);
+  const auto core_f = RandomF32(static_cast<size_t>(t * kHv * kDv), seed + 4);
+  const std::vector<uint8_t> core_bytes = Pack(core_f, dtype);
+  const auto nw_f = RandomF32(static_cast<size_t>(kDv), seed + 5, -1.0f, 1.0f);
+  const std::vector<uint8_t> nw_bytes = Pack(nw_f, dtype);
+  std::vector<int32_t> qsl = {0, static_cast<int32_t>(t)}, his = {1};
+  const CausalConv1dArgs conv_args{true};
+  const RmsNormGatedArgs norm_args{1e-6f, false};
+  const size_t out_conv_bytes = static_cast<size_t>(t * conv_dim) * vt::SizeOf(dtype);
+  const size_t out_norm_bytes = static_cast<size_t>(t * value_dim) * vt::SizeOf(dtype);
+
+  Queue cq = Q();
+  Tensor tw = MakeT(const_cast<uint8_t*>(wconv_bytes.data()), dtype, Cpu(), {conv_dim, kKw});
+  Tensor tnw = MakeT(const_cast<uint8_t*>(nw_bytes.data()), dtype, Cpu(), {kDv});
+  Tensor tqsl = Ti(qsl), this_ = Ti(his);
+
+  // --- CPU contiguous reference. ---
+  std::vector<uint8_t> conv_ref(out_conv_bytes);
+  std::vector<float> st_fwd_ref = st_fwd0;
+  {
+    Tensor tx = MakeT(const_cast<uint8_t*>(mixed_bytes.data()), dtype, Cpu(), {t, conv_dim});
+    Tensor ts = MakeT(st_fwd_ref.data(), DType::kF32, Cpu(), {1, conv_dim, kKw - 1});
+    Tensor to = MakeT(conv_ref.data(), dtype, Cpu(), {t, conv_dim});
+    vt::CausalConv1dFwd(cq, to, tx, tw, nullptr, ts, tqsl, this_, conv_args);
+  }
+  std::vector<uint8_t> upd_ref(out_conv_bytes);
+  std::vector<float> st_upd_ref = st_upd0;
+  {
+    Tensor tx = MakeT(const_cast<uint8_t*>(mixed_bytes.data()), dtype, Cpu(), {t, conv_dim});
+    Tensor ts = MakeT(st_upd_ref.data(), DType::kF32, Cpu(), {t, conv_dim, kKw - 1});
+    Tensor to = MakeT(upd_ref.data(), dtype, Cpu(), {t, conv_dim});
+    vt::CausalConv1dUpdate(cq, to, tx, tw, nullptr, ts, conv_args);
+  }
+  std::vector<uint8_t> norm_ref(out_norm_bytes);
+  {
+    Tensor txc = MakeT(const_cast<uint8_t*>(core_bytes.data()), dtype, Cpu(),
+                       {t * kHv, kDv});
+    Tensor tz = MakeT(const_cast<uint8_t*>(z_bytes.data()), dtype, Cpu(), {t * kHv, kDv});
+    Tensor to = MakeT(norm_ref.data(), dtype, Cpu(), {t * kHv, kDv});
+    vt::RmsNormGated(cq, to, txc, tz, tnw, norm_args);
+  }
+
+  // --- CPU strided views over the packed parent: bit-identical, no writes. ---
+  std::vector<uint8_t> cpu_parent = parent_bytes;
+  Tensor tparent = MakeT(cpu_parent.data(), dtype, Cpu(), {t, parent_w});
+  Tensor tmixed = tparent.Slice(1, kPrefix, kPrefix + conv_dim);
+  Tensor tzs = tparent.Slice(1, kPrefix + conv_dim, kPrefix + conv_dim + value_dim);
+  Tensor tz3 = Rank3RowView(tzs.data, dtype, Cpu(), t, kHv, kDv, parent_w);
+  {
+    std::vector<uint8_t> got(out_conv_bytes);
+    std::vector<float> st = st_fwd0;
+    Tensor ts = MakeT(st.data(), DType::kF32, Cpu(), {1, conv_dim, kKw - 1});
+    Tensor to = MakeT(got.data(), dtype, Cpu(), {t, conv_dim});
+    vt::CausalConv1dFwd(cq, to, tmixed, tw, nullptr, ts, tqsl, this_, conv_args);
+    CHECK(got == conv_ref);
+    CHECK(st == st_fwd_ref);
+  }
+  {
+    std::vector<uint8_t> got(out_conv_bytes);
+    std::vector<float> st = st_upd0;
+    Tensor ts = MakeT(st.data(), DType::kF32, Cpu(), {t, conv_dim, kKw - 1});
+    Tensor to = MakeT(got.data(), dtype, Cpu(), {t, conv_dim});
+    vt::CausalConv1dUpdate(cq, to, tmixed, tw, nullptr, ts, conv_args);
+    CHECK(got == upd_ref);
+    CHECK(st == st_upd_ref);
+  }
+  {
+    std::vector<uint8_t> got(out_norm_bytes);
+    std::vector<uint8_t> core3 = core_bytes;
+    Tensor txc = MakeT(core3.data(), dtype, Cpu(), {t, kHv, kDv});
+    Tensor to = MakeT(got.data(), dtype, Cpu(), {t, kHv, kDv});
+    vt::RmsNormGated(cq, to, txc, tz3, tnw, norm_args);
+    CHECK(got == norm_ref);
+  }
+  CHECK(cpu_parent == parent_bytes);  // canaries + const packed input untouched
+
+  if (!HasCuda()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dparent(gpu, gq.q, dtype, {t, parent_w}, parent_bytes.data());
+  DeviceTensor dmixed_c(gpu, gq.q, dtype, {t, conv_dim}, mixed_bytes.data());
+  DeviceTensor dz_c(gpu, gq.q, dtype, {t * kHv, kDv}, z_bytes.data());
+  DeviceTensor dw(gpu, gq.q, dtype, {conv_dim, kKw}, wconv_bytes.data());
+  DeviceTensor dnw(gpu, gq.q, dtype, {kDv}, nw_bytes.data());
+  DeviceTensor dcore2(gpu, gq.q, dtype, {t * kHv, kDv}, core_bytes.data());
+  DeviceTensor dcore3(gpu, gq.q, dtype, {t, kHv, kDv}, core_bytes.data());
+  DeviceTensor dqsl(gpu, gq.q, DType::kI32, {2}, qsl.data());
+  DeviceTensor dhis(gpu, gq.q, DType::kI32, {1}, his.data());
+  Tensor dmix_v = dparent.tensor().Slice(1, kPrefix, kPrefix + conv_dim);
+  Tensor dz_slice =
+      dparent.tensor().Slice(1, kPrefix + conv_dim, kPrefix + conv_dim + value_dim);
+  Tensor dz3 = Rank3RowView(dz_slice.data, dtype, Gpu(), t, kHv, kDv, parent_w);
+
+  // CUDA contiguous reference arms.
+  DeviceTensor dconv_ref(gpu, gq.q, dtype, {t, conv_dim});
+  DeviceTensor dst_fwd_ref(gpu, gq.q, DType::kF32, {1, conv_dim, kKw - 1}, st_fwd0.data());
+  vt::CausalConv1dFwd(gq.q, dconv_ref.tensor(), dmixed_c.tensor(), dw.tensor(), nullptr,
+                      dst_fwd_ref.tensor(), dqsl.tensor(), dhis.tensor(), conv_args);
+  DeviceTensor dupd_ref(gpu, gq.q, dtype, {t, conv_dim});
+  DeviceTensor dst_upd_ref(gpu, gq.q, DType::kF32, {t, conv_dim, kKw - 1}, st_upd0.data());
+  vt::CausalConv1dUpdate(gq.q, dupd_ref.tensor(), dmixed_c.tensor(), dw.tensor(), nullptr,
+                         dst_upd_ref.tensor(), conv_args);
+  DeviceTensor dnorm_ref(gpu, gq.q, dtype, {t * kHv, kDv});
+  vt::RmsNormGated(gq.q, dnorm_ref.tensor(), dcore2.tensor(), dz_c.tensor(), dnw.tensor(),
+                   norm_args);
+  std::vector<uint8_t> conv_ref_gpu(out_conv_bytes), upd_ref_gpu(out_conv_bytes),
+      norm_ref_gpu(out_norm_bytes);
+  std::vector<float> st_fwd_ref_gpu(st_fwd0.size()), st_upd_ref_gpu(st_upd0.size());
+  dconv_ref.Download(gq.q, conv_ref_gpu.data());
+  dst_fwd_ref.Download(gq.q, st_fwd_ref_gpu.data());
+  dupd_ref.Download(gq.q, upd_ref_gpu.data());
+  dst_upd_ref.Download(gq.q, st_upd_ref_gpu.data());
+  dnorm_ref.Download(gq.q, norm_ref_gpu.data());
+
+  // CUDA strided arms: bit-identical to the CUDA contiguous arms.
+  DeviceTensor dconv(gpu, gq.q, dtype, {t, conv_dim});
+  DeviceTensor dst_fwd(gpu, gq.q, DType::kF32, {1, conv_dim, kKw - 1}, st_fwd0.data());
+  DeviceTensor dupd(gpu, gq.q, dtype, {t, conv_dim});
+  DeviceTensor dst_upd(gpu, gq.q, DType::kF32, {t, conv_dim, kKw - 1}, st_upd0.data());
+  DeviceTensor dnorm(gpu, gq.q, dtype, {t, kHv, kDv});
+  Tensor dnorm3 = dnorm.tensor();
+  auto run_strided = [&] {
+    vt::CausalConv1dFwd(gq.q, dconv.tensor(), dmix_v, dw.tensor(), nullptr,
+                        dst_fwd.tensor(), dqsl.tensor(), dhis.tensor(), conv_args);
+    vt::CausalConv1dUpdate(gq.q, dupd.tensor(), dmix_v, dw.tensor(), nullptr,
+                           dst_upd.tensor(), conv_args);
+    vt::RmsNormGated(gq.q, dnorm3, dcore3.tensor(), dz3, dnw.tensor(), norm_args);
+  };
+  auto check_strided = [&] {
+    std::vector<uint8_t> got_conv(out_conv_bytes), got_upd(out_conv_bytes),
+        got_norm(out_norm_bytes);
+    std::vector<float> got_st_fwd(st_fwd0.size()), got_st_upd(st_upd0.size());
+    dconv.Download(gq.q, got_conv.data());
+    dst_fwd.Download(gq.q, got_st_fwd.data());
+    dupd.Download(gq.q, got_upd.data());
+    dst_upd.Download(gq.q, got_st_upd.data());
+    dnorm.Download(gq.q, got_norm.data());
+    CHECK(got_conv == conv_ref_gpu);
+    CHECK(got_st_fwd == st_fwd_ref_gpu);
+    CHECK(got_upd == upd_ref_gpu);
+    CHECK(got_st_upd == st_upd_ref_gpu);
+    CHECK(got_norm == norm_ref_gpu);
+  };
+  auto reset_states = [&] {
+    gpu.Copy(gq.q, dst_fwd.tensor().data, st_fwd0.data(),
+             st_fwd0.size() * sizeof(float));
+    gpu.Copy(gq.q, dst_upd.tensor().data, st_upd0.data(),
+             st_upd0.size() * sizeof(float));
+  };
+  run_strided();
+  check_strided();
+
+  // Capture the three strided consumers; poison outputs and restore the conv
+  // states before each replay so an eager result cannot pass accidentally.
+  reset_states();
+  gpu.BeginCapture(gq.q);
+  run_strided();
+  void* graph = gpu.EndCaptureGraph(gq.q);
+  for (int replay = 0; replay < 2; ++replay) {
+    gpu.Memset(gq.q, dconv.tensor().data, 0xA5, out_conv_bytes);
+    gpu.Memset(gq.q, dupd.tensor().data, 0xA5, out_conv_bytes);
+    gpu.Memset(gq.q, dnorm.tensor().data, 0xA5, out_norm_bytes);
+    reset_states();
+    gpu.ReplayGraph(gq.q, graph);
+    check_strided();
+  }
+  gpu.DestroyGraph(graph);
+
+  std::vector<uint8_t> got_parent(parent_bytes.size());
+  dparent.Download(gq.q, got_parent.data());
+  CHECK(got_parent == parent_bytes);
+}
+
+TEST_CASE("gdn merged qkvz strided mixed/z views feed conv + gated norm exactly") {
+  uint32_t seed = 8600;
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    for (int64_t batch : {1, 2, 4, 16, 32}) {
+      CAPTURE(dtype);
+      CAPTURE(batch);
+      RunGdnMergedQkvzCase(batch, dtype, seed);
       seed += 10;
     }
   }

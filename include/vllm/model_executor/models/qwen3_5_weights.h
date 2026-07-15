@@ -148,6 +148,15 @@ struct GdnLayerWeights {
   // split rollback slices this owner; 35B/GGUF/synthetic paths retain the
   // legacy fields above and leave this empty.
   OwnedTensor in_proj_ba;
+  // Qwen3.6-27B production owner for vLLM's MergedColumnParallelLinear
+  // `in_proj_qkvz` (W2): raw torch Linear orientation [conv_dim+value_dim, H],
+  // rows in exact [q,k,v,z] order (the checkpoint's in_proj_qkv already stacks
+  // q|k|v per vLLM's stacked mapping (0,1,2) qwen3_5.py:203-207; in_proj_z
+  // appends the z rows as shard 3), nk=true. The real dense loader populates
+  // this and leaves in_proj_qkv/in_proj_z empty; the split rollback slices
+  // this owner. 35B (FP8 qkv/z) / GGUF / synthetic paths retain the legacy
+  // fields above and leave this empty.
+  OwnedTensor in_proj_qkvz;
   OwnedTensor conv1d_weight;  // bf16 [conv_dim, K]  (bf16, NOT transposed)
   OwnedTensor a_log;          // f32  [Hv]
   OwnedTensor dt_bias;        // f32  [Hv]

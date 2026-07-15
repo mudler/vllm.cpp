@@ -796,9 +796,15 @@ void CheckConvCommon(const Queue& q, const Tensor& out, const Tensor& x, const T
            std::string(name) +
                ": conv_state must be f32, or bf16 on CUDA (in/out, in place; bf16 = "
                "vLLM default mamba_cache_dtype, read/written in f32 registers)");
-  VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
-               conv_state.IsContiguous(),
-           std::string(name) + ": contiguous required");
+  // out/weight/conv_state stay fully contiguous. x may be a padded-row
+  // (inner-contiguous, outer stride >= C) view: the merged qkvz projection feeds
+  // the conv its mixed_qkv = mixed_qkvz[:, :conv_dim] slice without any copy
+  // (qwen_gdn_linear_attn.py:929-936). The kernels honor x.stride[0] directly.
+  VT_CHECK(x.stride[1] == 1 && x.stride[0] >= c && out.IsContiguous() &&
+               weight.IsContiguous() && conv_state.IsContiguous(),
+           std::string(name) +
+               ": out/weight/conv_state contiguous; x rows inner-contiguous "
+               "(padded outer stride allowed)");
   VT_CHECK(x.device == q.device && out.device == q.device && weight.device == q.device &&
                conv_state.device == q.device,
            std::string(name) + ": device mismatch (x/out/weight/conv_state/queue)");
@@ -923,18 +929,36 @@ void L2Norm(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& args) {
 
 void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                   const Tensor& weight, const RmsNormGatedArgs& args) {
-  VT_CHECK(x.rank == 2 && gate.rank == 2 && out.rank == 2 && weight.rank == 1,
-           "rmsnorm_gated: x/gate/out rank-2, weight rank-1");
-  VT_CHECK(gate.shape[0] == x.shape[0] && gate.shape[1] == x.shape[1] &&
-               out.shape[0] == x.shape[0] && out.shape[1] == x.shape[1],
-           "rmsnorm_gated: x/gate/out shapes must match");
-  VT_CHECK(weight.shape[0] == x.shape[1], "rmsnorm_gated: weight size mismatch");
+  // Rank-2 [rows, D] (contiguous split path) OR rank-3 [T, Hv, D] (merged qkvz
+  // path): the gate is the padded-row z = mixed_qkvz[:, conv_dim:] slice viewed
+  // as [T, Hv, Dv], so its inner [Hv,Dv] block stays contiguous while the token
+  // stride may exceed Hv*Dv (qwen_gdn_linear_attn.py:929-936). Normalization is
+  // always over the LAST dim; rows = numel/D either way.
+  VT_CHECK((x.rank == 2 || x.rank == 3) && gate.rank == x.rank &&
+               out.rank == x.rank && weight.rank == 1,
+           "rmsnorm_gated: x/gate/out rank-2 or rank-3, weight rank-1");
+  for (int dd = 0; dd < x.rank; ++dd)
+    VT_CHECK(gate.shape[dd] == x.shape[dd] && out.shape[dd] == x.shape[dd],
+             "rmsnorm_gated: x/gate/out shapes must match");
+  const int64_t d = x.shape[x.rank - 1];
+  VT_CHECK(weight.shape[0] == d, "rmsnorm_gated: weight size mismatch");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(gate.dtype) && IsFloat(weight.dtype) &&
                IsOutFloat(out.dtype),
            "rmsnorm_gated: float in, f32/bf16 out");
-  VT_CHECK(x.IsContiguous() && gate.IsContiguous() && weight.IsContiguous() &&
-               out.IsContiguous(),
-           "rmsnorm_gated: contiguous required");
+  // x/out/weight stay contiguous; the gate may carry a padded outer (token)
+  // stride with all inner dims contiguous.
+  VT_CHECK(x.IsContiguous() && weight.IsContiguous() && out.IsContiguous(),
+           "rmsnorm_gated: x/out/weight contiguous required");
+  bool gate_inner = true;
+  int64_t gate_span = 1;
+  for (int dd = gate.rank - 1; dd >= 1; --dd) {
+    gate_inner = gate_inner && gate.stride[dd] == gate_span;
+    gate_span *= gate.shape[dd];
+  }
+  gate_inner = gate_inner && gate.stride[0] >= gate_span;
+  VT_CHECK(gate_inner,
+           "rmsnorm_gated: gate rows inner-contiguous (padded outer stride "
+           "allowed)");
   VT_CHECK(x.device == q.device && gate.device == q.device && weight.device == q.device &&
                out.device == q.device,
            "rmsnorm_gated: device mismatch (x/gate/weight/out/queue)");

@@ -52,6 +52,10 @@ bool detail::ShouldUsePackedGdnDecode(
          e.num_actual_tokens == e.num_decode_tokens;
 }
 
+bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
+  return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
+}
+
 void detail::ValidateGdnStateIndices(const std::vector<int32_t>& indices,
                                      int64_t required,
                                      int64_t state_slots) {
@@ -2303,9 +2307,9 @@ bool PackedGdnDecodeRuntimeEnabled() {
 DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
                   DType out_dtype) {
   VT_CHECK(x.rank == 2 && weight.rank == 2,
-           "qwen3_5 merged GDN BA: input/weight must be rank-2");
+           "qwen3_5 merged GDN proj: input/weight must be rank-2");
   VT_CHECK(weight.shape[1] == x.shape[1],
-           "qwen3_5 merged GDN BA: input/weight K mismatch");
+           "qwen3_5 merged GDN proj: input/weight K mismatch");
   DBuf out(d, out_dtype, {x.shape[0], weight.shape[0]});
   vt::MatmulBT(d.q, out.t(), x, weight);
   return out;
@@ -2354,6 +2358,102 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   return out;
 }
 
+// vLLM's Qwen3.5/3.6 GDN owns one physical `in_proj_qkvz` and invokes it once,
+// then exposes logical [mixed_qkv, z] last-dim views
+// (qwen_gdn_linear_attn.py:923-936 @ 702f4814). W2 enables that topology only
+// for the real 27B loader — the only path that populates `in_proj_qkvz`. The
+// resident owner is shared by both arms: the fallback slices its output ROWS
+// (dim-0 raw-NK slices stay contiguous) and issues the two legacy GEMMs at
+// their independent dtypes, never retaining duplicate split weights. The
+// merged arm requires one uniform output dtype (GdnInDType == GdnOutDType; the
+// 27B default is BF16/BF16, matching vLLM's model-dtype projection).
+// VT_GDN_MERGED_QKVZ=0 (or master VT_GDN_MERGED_PROJ=0) restores the split
+// GEMMs from the same binary and the same resident owner.
+bool MergedGdnQkvzEnabled(Dev d) {
+  static const bool enabled = [] {
+    const char* master = std::getenv("VT_GDN_MERGED_PROJ");
+    if (master != nullptr && master[0] == '0') return false;
+    const char* leaf = std::getenv("VT_GDN_MERGED_QKVZ");
+    return leaf == nullptr || leaf[0] != '0';
+  }();
+  return enabled && d.q.device.type == vt::DeviceType::kCUDA;
+}
+
+struct GdnQkvzOutput {
+  std::optional<DBuf> packed_owner;
+  std::optional<DBuf> mixed_owner;
+  std::optional<DBuf> z_owner;
+  Tensor mixed;  // [T, conv_dim]; inner-contiguous, row stride may be padded
+  Tensor z;      // [T, value_dim]; inner-contiguous, row stride may be padded
+};
+
+// Input projections (mixed_qkv | z), shared by the dense and paged GDN blocks.
+// Packed 27B owner: ONE BF16 GEMM + logical views when merged is selected,
+// else two split GEMMs sliced from the same owner. Legacy owners: W8A8 cutlass
+// fp8 (35B) when populated — qkv/z read the shared pre-quantized fp8
+// activation (h_fp8, quantize-once) when supplied — else bf16 (GGUF/synthetic;
+// mixed at GdnInDType, z at GdnOutDType).
+GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
+                             int64_t conv_dim, int64_t value_dim, DType indt,
+                             DType outdt, const Tensor* h_fp8) {
+  GdnQkvzOutput out;
+  if (!w.in_proj_qkvz.Empty()) {
+    VT_CHECK(w.in_proj_qkvz.nk && w.in_proj_qkvz.rank == 2 &&
+                 w.in_proj_qkvz.shape[0] == conv_dim + value_dim &&
+                 w.in_proj_qkvz.shape[1] == h.shape[1],
+             "qwen3_5 merged GDN qkvz: invalid packed owner");
+    Tensor packed_weight = ResidentWeight(d, w.in_proj_qkvz);
+    if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
+            MergedGdnQkvzEnabled(d), d.q.device.type == vt::DeviceType::kCUDA,
+            true, indt == outdt})) {
+      out.packed_owner.emplace(MatmulBTRawD(d, h, packed_weight, indt));
+      Tensor packed = out.packed_owner->t();
+      out.mixed = packed.Slice(1, 0, conv_dim);
+      out.z = packed.Slice(1, conv_dim, conv_dim + value_dim);
+      return out;
+    }
+    Tensor qkv_weight = packed_weight.Slice(0, 0, conv_dim);
+    Tensor z_weight = packed_weight.Slice(0, conv_dim, conv_dim + value_dim);
+    out.mixed_owner.emplace(MatmulBTRawD(d, h, qkv_weight, indt));
+    out.z_owner.emplace(MatmulBTRawD(d, h, z_weight, outdt));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
+  out.mixed_owner.emplace(
+      !w.in_proj_qkv_fp8.Empty()
+          ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
+                                               DType::kF32)
+                   : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
+      : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
+                             : MatmulF32D(d, h, w.in_proj_qkv));
+  out.z_owner.emplace(
+      !w.in_proj_z_fp8.Empty()
+          ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
+                   : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
+      : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
+                              : MatmulF32D(d, h, w.in_proj_z));
+  out.mixed = out.mixed_owner->t();
+  out.z = out.z_owner->t();
+  return out;
+}
+
+// Rank-3 [T,Hv,Dv] gate view over a (possibly padded-row) [T, value_dim] z
+// slice for the gated RMSNorm — the inner [Hv,Dv] block is contiguous while
+// the token stride follows the packed parent (upstream z.reshape(T,-1,Dv) on
+// the mixed_qkvz slice, qwen_gdn_linear_attn.py:934).
+Tensor GdnGateView3(const Tensor& z, int64_t T, int64_t hv, int64_t dv) {
+  Tensor g = z;
+  g.rank = 3;
+  g.shape[0] = T;
+  g.shape[1] = hv;
+  g.shape[2] = dv;
+  g.stride[0] = z.stride[0];
+  g.stride[1] = dv;
+  g.stride[2] = 1;
+  return g;
+}
+
 // --- GDN (linear_attention) block. gdn-semantics.md §1 (layout), §6 (g/beta),
 // §7 (recurrence); qwen_gdn_linear_attn.py forward. Device-resident (M2.5
 // Phase 1): h [T,H] bf16 (device) -> DBuf [T,H] bf16 (device); no host round-
@@ -2370,33 +2470,29 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const int64_t conv_dim = 2 * key_dim + value_dim;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
-  // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
-  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
-  // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
-  // mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight branch); the
-  // fp8-cutlass branch (35B) keeps f32. See GdnInDType().
+  // Input projections (mixed_qkvz | ba). The 27B loader mirrors vLLM's TWO
+  // physical BF16 projections (one qkvz + one ba, qwen_gdn_linear_attn.py:
+  // 923-936); 35B/GGUF/synthetic paths retain the split legacy owners. W8A8
+  // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
+  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
+  // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
+  // branch); the fp8-cutlass branch (35B) keeps f32. See GdnInDType().
   const DType indt = GdnInDType();
-  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
-                            : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
-               : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
-                                      : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
   const DType outdt = GdnOutDType(cfg.num_experts == 0);
-  DBuf z = !w.in_proj_z_fp8.Empty()
-               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
-                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
-           : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
-                                   : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  GdnQkvzOutput qkvz =
+      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
+  Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
+  Tensor z = qkvz.z;          // [T,value_dim], contiguous or row-strided view
   GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv);
   Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
   Tensor araw = ba.a;
 
   // Causal conv1d over the token stream (silu activation), fresh zero state. conv
   // in/out dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16); f32
-  // conv_state + f32-accumulated math unchanged.
-  const DType convdt = mixed.t().dtype;
+  // conv_state + f32-accumulated math unchanged. The conv reads the merged
+  // mixed_qkv view's padded row stride directly — no materialization.
+  const DType convdt = mixed.dtype;
   Tensor dcw = convdt == DType::kBF16 ? ResidentWeight(d, w.conv1d_weight, {conv_dim, Kw})
                                       : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dstate(d, DType::kF32, {1, conv_dim, Kw - 1});
@@ -2406,7 +2502,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   DBuf dqsl(d, DType::kI32, {2}, qsl);
   DBuf dhis(d, DType::kI32, {1}, his);
   DBuf dconv(d, convdt, {T, conv_dim});
-  vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr, dstate.t(),
+  vt::CausalConv1dFwd(d.q, dconv.t(), mixed, dcw, nullptr, dstate.t(),
                       dqsl.t(), dhis.t(), vt::CausalConv1dArgs{true});
 
   // Post-conv prep (gdn-semantics.md §1 layout, §4 l2norm, §6 g/beta): split the
@@ -2446,22 +2542,28 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   vt::GdnPrefill(d.q, dcore.t(), dql2.t(), dkl2.t(), vf.t(), g.t(), beta.t(),
                  dssm.t(), dqsl.t(), vt::GdnArgs{scale});
 
-  // Gated RMSNorm over Dv with the z gate (gdn-semantics.md §5), viewing the
-  // core output and z as [T*Hv, Dv]; cast to bf16, flatten heads, out-project.
+  // Gated RMSNorm over Dv with the z gate (gdn-semantics.md §5): the split arm
+  // keeps the byte-identical rank-2 [T*Hv, Dv] views; the merged arm passes
+  // rank-3 [T,Hv,Dv] so the z gate's padded packed-row stride is representable
+  // (same kernel and grid — only the gate addressing changes). Cast to bf16,
+  // flatten heads, out-project.
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
-  Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
-  Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
+  const bool z_strided = z.stride[0] != value_dim;
+  Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
+  Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
   // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
   // keeps the f32 RmsNormGated + separate CastBf16 pair.
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   if (GlueFuseEnabled()) {
-    Tensor gated2 = Reshape(gated_bf16.t(), {T * Hv, Dv});
+    Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
+                              : Reshape(gated_bf16.t(), {T * Hv, Dv});
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
-    vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
@@ -2679,27 +2781,20 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
               << " np_tok=" << np_tok << " T=" << T << "\n";
   }
 
-  // Input projections (mixed_qkv | z | ba). The 27B loader mirrors vLLM's one
-  // physical BF16 ba projection; 35B/GGUF/synthetic paths retain split b/a.
-  // W8A8 cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
-  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when supplied;
-  // a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h for them).
-  // mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight branch, halves
-  // the conv-input traffic); the fp8-cutlass branch (35B) keeps f32. See
-  // GdnInDType().
-  DBuf mixed = !w.in_proj_qkv_fp8.Empty()
-                   ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8, DType::kF32)
-                            : MatmulFp8CutlassD(d, h, w.in_proj_qkv_fp8, DType::kF32))
-               : indt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_qkv)
-                                      : MatmulF32D(d, h, w.in_proj_qkv);  // [T,conv_dim]
-  // z gate follows the recurrence-output dtype (VT_GDN_OUT_BF16): bf16 when the
-  // core is bf16 (the gated-RMSNorm requires gate.dtype == core.dtype), else the
-  // byte-identical f32 path.
-  DBuf z = !w.in_proj_z_fp8.Empty()
-               ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_z_fp8, outdt)
-                        : MatmulFp8CutlassD(d, h, w.in_proj_z_fp8, outdt))
-           : outdt == DType::kBF16 ? MatmulBf16D(d, h, w.in_proj_z)
-                                   : MatmulF32D(d, h, w.in_proj_z);  // [T,value_dim]
+  // Input projections (mixed_qkvz | ba). The 27B loader mirrors vLLM's TWO
+  // physical BF16 projections (one qkvz + one ba, qwen_gdn_linear_attn.py:
+  // 923-936); 35B/GGUF/synthetic paths retain the split legacy owners. W8A8
+  // cutlass fp8 (35B) when populated, else bf16 (default / GGUF). qkv/z read
+  // the shared pre-quantized fp8 activation (h_fp8, quantize-once) when
+  // supplied; a/b stay bf16 GEMMs on h (so h_fp8's producer also emits bf16 h
+  // for them). mixed_qkv: bf16 output under VT_GDN_IN_BF16 (27B bf16-weight
+  // branch, halves the conv-input traffic); the fp8-cutlass branch (35B) keeps
+  // f32 (GdnInDType()). The z gate follows the recurrence-output dtype
+  // (VT_GDN_OUT_BF16): the gated-RMSNorm requires gate.dtype == core.dtype.
+  GdnQkvzOutput qkvz =
+      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
+  Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
+  Tensor z = qkvz.z;          // [T,value_dim], contiguous or row-strided view
   GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv, packed_decode);
   Tensor braw = ba.b;  // [T,Hv], F32 contiguous or row-strided merged view
   Tensor araw = ba.a;
@@ -2709,8 +2804,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // dtype follows the in_proj output (bf16 under VT_GDN_IN_BF16 → bf16 weight +
   // bf16 dconv halve the conv read/write); the f32 conv_state and the
   // f32-accumulated conv math are unchanged. The post-conv split reads dconv's
-  // dtype (GdnPostConv/GdnConvSplit are templated on it).
-  const DType convdt = mixed.t().dtype;
+  // dtype (GdnPostConv/GdnConvSplit are templated on it). The conv reads the
+  // merged mixed_qkv view's padded row stride directly — no materialization.
+  const DType convdt = mixed.dtype;
   Tensor dcw = convdt == DType::kBF16 ? ResidentWeight(d, w.conv1d_weight, {conv_dim, Kw})
                                       : ResidentWeightF32(d, w.conv1d_weight, {conv_dim, Kw});
   DBuf dconv(d, convdt, {T, conv_dim});
@@ -2739,7 +2835,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       DBuf dcs(d, DType::kF32, cs_shape);
       vt::GdnStateGather(d.q, dcs.t(), state.conv_state,
                          sdi.gdn_state_idx.t());
-      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed, dcw, nullptr,
                           dcs.t(), sdi.gdn_non_spec_qsl.t(),
                           sdi.gdn_has_initial.t(),
                           vt::CausalConv1dArgs{true});
@@ -2754,7 +2850,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       std::vector<int32_t> his(his_u8.begin(), his_u8.end());
       DBuf dqsl(d, DType::kI32, {nreq + 1}, qsl_full.data());
       DBuf dhis(d, DType::kI32, {nreq}, his.data());
-      vt::CausalConv1dFwd(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+      vt::CausalConv1dFwd(d.q, dconv.t(), mixed, dcw, nullptr,
                           dcs.t(), dqsl.t(), dhis.t(),
                           vt::CausalConv1dArgs{true});
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
@@ -2775,7 +2871,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     if (indexed_state_io) {
       Tensor gidx = SubView(sdi.gdn_state_idx.t(), 0, nd);
       Tensor conv_cache = state.conv_state;  // mutable view over the shared buffer
-      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed, dcw, nullptr,
                              conv_cache, vt::CausalConv1dArgs{true}, &gidx);
     } else {
       VT_CHECK(nd_tok == nd,
@@ -2784,7 +2880,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       const std::vector<int64_t> cs_shape = {nd, conv_dim, Kw - 1};
       DBuf dcs = GatherStateF32(d, state.conv_state, sidx, conv_row_elems,
                                 cs_shape);
-      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed.t(), dcw, nullptr,
+      vt::CausalConv1dUpdate(d.q, dconv.t(), mixed, dcw, nullptr,
                              dcs.t(), vt::CausalConv1dArgs{true});
       ScatterStateF32(d, state.conv_state, dcs, sidx, conv_row_elems);
     }
@@ -2925,20 +3021,26 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // Weight follows core/z dtype (RmsNormGated requires w.dtype == x.dtype): native
   // bf16 under VT_GDN_OUT_BF16 (the norm still accumulates variance in f32), else
   // the f32 upcast. Mirrors the q_norm/k_norm resident-weight dtype gate.
+  // The split arm keeps the byte-identical rank-2 [T*Hv, Dv] views; the merged
+  // arm passes rank-3 [T,Hv,Dv] so the z gate's padded packed-row stride is
+  // representable (same kernel and grid — only the gate addressing changes).
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
-  Tensor core2 = Reshape(dcore.t(), {T * Hv, Dv});
-  Tensor z2 = Reshape(z.t(), {T * Hv, Dv});
+  const bool z_strided = z.stride[0] != value_dim;
+  Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
+  Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
   // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
   // keeps the f32 RmsNormGated + separate CastBf16 pair.
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   if (GlueFuseEnabled()) {
-    Tensor gated2 = Reshape(gated_bf16.t(), {T * Hv, Dv});
+    Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
+                              : Reshape(gated_bf16.t(), {T * Hv, Dv});
     vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
-    vt::RmsNormGated(d.q, dgated.t(), core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes

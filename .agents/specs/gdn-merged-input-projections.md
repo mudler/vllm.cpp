@@ -1,7 +1,10 @@
 # Qwen3.5/3.6 GDN merged BF16 input projections
 
 **Row:** `KERNEL-GEMM-BF16` · **consumer:** `SERVE-GATE-ONLINE` ·
-**status:** spike complete, W1C `ACTIVE` inside the open BA gate · **priority:** roadmap order 0.
+**status:** W1 (BA) closed through the packed-decode equivalence closure
+(`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`); **W2A (qkvz) implemented,
+`GATING` on the orchestrator's DGX gates**; W2B (trace + component) pending ·
+**priority:** roadmap order 0.
 
 The finalized exact-c2 trace identifies one complete model-topology mismatch:
 the 27B path launches four BF16 input projections in each of 48 GDN layers,
@@ -89,7 +92,10 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 
 | Surface | Current anchor | Disposition |
 |---|---|---|
-| Weight ownership / loader | `include/vllm/model_executor/models/qwen3_5_weights.h:146`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:165-257` | Real 27B owns one raw-NK `[b,a]` tensor; split b/a owners stay empty and rollback slices the merged owner. qkv/z remain split for W2. |
+| Weight ownership / loader | `include/vllm/model_executor/models/qwen3_5_weights.h:146-169`; `src/vllm/model_executor/models/qwen3_5_dense_weights.cpp:165-180` | Real 27B owns one raw-NK `[b,a]` tensor AND (W2A) one raw-NK `[q,k,v,z]` tensor (`in_proj_qkvz`, [conv_dim+value_dim, H]); split qkv/z/b/a owners stay empty and both rollbacks slice their merged owner. |
+| W2A qkvz forward | `src/vllm/model_executor/models/qwen3_5.cpp:2372-2460` (`MergedGdnQkvzEnabled`, `ProjectGdnQkvz`, `GdnGateView3`); dispatch seam `src/vllm/model_executor/models/qwen3_5_internal.h:52-60` | Merged arm: ONE BF16 `[T,16384]` GEMM; mixed/z are last-dim views. Selected only on CUDA + owner + toggles + `GdnInDType()==GdnOutDType()` (27B default BF16/BF16). Rollback (`VT_GDN_MERGED_QKVZ=0` / master `VT_GDN_MERGED_PROJ=0` / CPU / mixed dtypes) slices the owner rows into the exact two legacy GEMMs. 35B fp8 and GGUF/synthetic split owners take the legacy branch untouched. |
+| W2A strided consumers | `src/vt/ops.cpp:781-810,930-976` (validation); `src/vt/cpu/cpu_ops.cpp` conv/rmsnorm kernels; `src/vt/cuda/cuda_gdn.cu` conv fwd/tiled/update + `RmsNormGatedRowKernel` | CausalConv1dFwd/Update accept a padded-row inner-contiguous `x`; RmsNormGated accepts rank-3 `[T,Hv,Dv]` with a padded-token gate stride (contiguous rank-2 unchanged, byte-identical). No cast/copy/materialization node is added on either arm. |
+| W2A tests | `tests/vt/test_ops_gdn.cpp:1451-1533,2162-2378` (strided consumer + merged-qkvz F32/BF16 B=1/2/4/16/32 eager/capture/two-replay/canary battery); `tests/vllm/models/test_qwen27_dense_forward.cpp:315-334,456-497` (loader row order/one owner; CPU merged-owner == split bit-exact); `tests/vllm/models/test_qwen27_paged_forward.cpp:451-487` (dispatch eligibility); 35B/GGUF inertness in `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | CPU tier green (RED→GREEN evidence in the 2026-07-15 state entry); the CUDA arms of the same cases plus model/trace/component gates are the orchestrator's DGX work from the pushed SHA. |
 | Dense + paged forward | `src/vllm/model_executor/models/qwen3_5.cpp:2053-2215,2397-2522` | CUDA pure non-spec decode defaults to one BF16-output BA GEMM only when exact packed recurrence is selected. Prefill/dense fallback and `VT_GDN_PACKED_DECODE=0` use F32 BA; `VT_GDN_BA_OUT_BF16` remains an explicit diagnostic override and `VT_GDN_MERGED_BA=0` restores two calls from the same owner. |
 | BA consumers | `src/vt/ops.cpp:1466-1580`; CPU/CUDA implementations in `src/vt/{cpu/cpu_ops.cpp,cuda/cuda_glue.cu,cuda/cuda_gdn.cu}` | Fused and unfused consumers accept F32/BF16 inner-contiguous row views without materialization. |
 | Ported tests | `tests/vllm/models/test_qwen27_dense_forward.cpp:185-314`; `tests/vt/test_ops_gdn.cpp:1259-1445` | Exact loader bytes/one-owner rules plus F32/BF16 B=1/2/4/16/32 eager/capture/two-replay/canary coverage pass; strict memcheck is clean. |
@@ -98,7 +104,7 @@ by its structural gate; superseded attempt chronology is intentionally absent.
 | W1 trace harness | `tools/bench/online_gate.py`; `scripts/dgx-online-serving.sh`; `tools/bench/finalize_gdn_ba_trace.py` | Historical no-mode c2 stays at 1,011 nodes. Explicit merged/split modes require 963/145 versus 1,011/193, record `VT_GDN_MERGED_BA`, run both paired arms under one lock and accept only a 48-BF16-only delta. Immutable `0091cd1`, finalized by pushed `8a1f923`, is `complete-structural`: 24/24 exact local ranges, exact 48-BF16-only removal, unchanged selected non-BF16 families and `benchmark_binding=false`. The tool suite passes 69/69. |
 | W1C projection + inertness | `tools/bench/gdn_ba_projection_oracle.py`; `tests/parity/goldens/gdn_ba_projection_bf16_sm121/oracle.json`; `tests/parity/test_op_parity.cpp`; `tests/vllm/{test_qwen36_weights.cpp,test_gguf_qwen36_loader.cpp}` | Immutable `f925294` proves the BA bits and inertness. Clean `f344dec` closes W1D2/G2 by coupling BF16 BA to exact packed recurrence at default+rollback 27B **235/235** while 35B/GGUF remain inert. |
 | W1C first boundary | [packed-decode spike](gdn-packed-decode.md), `tools/bench/gdn_packed_decode_oracle.py`, `tests/parity/goldens/gdn-packed-decode-oracle/`, focused `test_op_parity.cpp` case | Official v0.25 proves packed pure decode normalizes q/k in F32 in-kernel and rounds sigmoid beta through `b.dtype`. Clean `f18ca23` regenerates the fixture byte-for-byte and passes CUDA **10/10**: current `306/7552`, beta-only `308/6558`, both semantics `0/1`. The first divergence and immutable G0 are closed. |
-| Remaining W1 evidence | packed W1D3 trace + component tools | Clean `7ff713e`, finalized by pushed `24cea4f`, closes marker-last packed/rollback structure at exact 915/963 nodes. Run the 40+8-axis c2/c16 component. Capture lifecycle and BA structure remain closed by `0091cd1`; qkvz stays blocked. |
+| Remaining W1 evidence | packed W1D3 trace + component tools | Clean `7ff713e`, finalized by pushed `24cea4f`, closes marker-last packed/rollback structure at exact 915/963 nodes. W1D3 then closed on EQUIVALENCE at the eighth component seal (`e47b4d6`); capture lifecycle and BA structure remain closed by `0091cd1`. qkvz W2A is UNBLOCKED and implemented (this checkpoint). |
 
 The completed evidence root is
 `~/work/vllm.cpp-executed-path-c2/179a0fc2afc1c33b63d14de8e50d3fde976c7356`.
@@ -241,9 +247,14 @@ even if negative. W2 may not start until this checkpoint is complete.
 
 - Repeat G1 for qkvz strided causal-conv and gated-RMSNorm consumers.
 - Exact default B=2 structure becomes **97** BF16 GEMMs: 48 qkvz + 48 ba +
-  1 lm_head. With no new copy/cast nodes local total becomes **915**. Do not
+  1 lm_head. With no new copy/cast nodes the local total drops by exactly the
+  48 removed z GEMMs. (This section's original **915** total predates the
+  packed-decode structural change: the shipping packed default already traces
+  at 915 total / 145 BF16 with rollback 963/193 — `7ff713e`+`24cea4f` — so the
+  W2 expectation is **867 total / 97 BF16** on the packed default; verify the
+  −48 BF16-only delta with unchanged other families on the DGX trace.) Do not
   require equality with vLLM's 1,160 total kernels.
-- Run the same c2/c16 AB/BA/AB 40+8-axis component against
+- Run the same c2/c16 component (now the 22-leg 5-rep harness) against
   `VT_GDN_MERGED_QKVZ=0`; record a passing or failed checkpoint before stacking
   another speed-sensitive change.
 
@@ -295,8 +306,8 @@ frozen fixture are recorded before execution.
 | W1A | Add the 27B `in_proj_ba` owner, exact loader packing and split weight views; port loader/storage tests. | Implemented; focused CPU/production-CUDA loader and one-owner tests green. |
 | W1B | Add F32/BF16 strided b/a consumers and one merged BA GEMM in dense/paged forwards with master/leaf fallback. | Implemented/`GATING`; F32/decomposed rollback is 235/235 + 16/16. The isolated BF16/decomposed control remains 233/235, while clean `f344dec` closes W1D2/G2 for the coupled BF16/packed default at 235/235. |
 | W1C | Repeat immutable safety/model gates, close BF16 semantics, run exact 145-node-family trace and c2/c16 BA AB/BA/AB. | Safety/structure/projection and packed G0/G1/G2 are closed through clean `f344dec`; W1D3 marker-last structural evidence closes at `7ff713e` + `24cea4f`. The c2/c16 component remains pending and must close before W2. |
-| W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | G0/G1-equivalent tests green. |
-| W2B | Run exact 97-node-family trace and c2/c16 qkvz AB/BA/AB. | G3 disposition committed. |
+| W2A | Add `in_proj_qkvz` owner/loader and strided causal-conv/gated-RMSNorm consumers with fallback. | **Implemented/`GATING` (2026-07-15).** CPU tier green: loader row-order/one-owner, dispatch eligibility, strided-consumer + merged-view F32/BF16 B=1/2/4/16/32 batteries, CPU merged-owner == split bit-exact model forward, 35B/GGUF inertness; clean -Werror rebuild, full CTest 107/107, tools 162/162. DGX gates (CUDA suites, 27B default+both rollbacks 235/235+16/16, 35B/GGUF inertness, memcheck slices) are the orchestrator's next step from the pushed SHA. |
+| W2B | Run exact 97-BF16-family trace (packed default 915→867 total, −48 BF16-only) and the c2/c16 qkvz 22-leg component. | Pending the orchestrator; G3 disposition committed afterwards. |
 | W3 | Conditional fresh vLLM grid and host/GPU memory campaign. | 124/124 closes 27B; otherwise select the next trace-grounded lever. |
 
 Each performance-sensitive leaf is isolated in one same-binary toggle and gets

@@ -845,6 +845,9 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
 //   tokens before the sequence start. w[:,K-1] multiplies the current token.
 // State write-back: last K-1 RAW x tokens (pre-activation), left-padded with
 // zeros (no init state) or shifted old state when T < K-1.
+// x [T,C] may be a padded-row (inner-contiguous, outer stride >= C) view — the
+// merged qkvz projection feeds mixed_qkv = mixed_qkvz[:, :conv_dim] without a
+// copy; out/weight/conv_state stay contiguous.
 void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      const Tensor* bias, Tensor& conv_state, const Tensor& query_start_loc,
                      const Tensor& has_initial_state, const CausalConv1dArgs& args);
@@ -858,7 +861,8 @@ void CausalConv1dFwd(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
 // cache_indices): when non-null, row bt reads/writes the persistent cache slot
 // conv_state_indices[bt] (conv_state is then the FULL [num_slots,C,K-1] cache), so the
 // caller need not gather/scatter per-request rows. When null, conv_state is compact
-// [batch,C,K-1] and row == bt.
+// [batch,C,K-1] and row == bt. x [B,C] may be a padded-row (inner-contiguous)
+// view of the merged qkvz output; out stays contiguous.
 void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                         const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
                         const Tensor* conv_state_indices = nullptr);
@@ -871,7 +875,11 @@ void L2Norm(Queue& q, Tensor& out, const Tensor& x, const L2NormArgs& args);
 // Gated rmsnorm (gdn-semantics.md §5, upstream RMSNormGated with
 // norm_before_gate=True, group_size=None, no bias):
 //   var = mean(x^2 over last dim);  out = x * rsqrt(var + eps) * w * act(z)
-// x/gate/out [T,D], weight [D]; act = silu (or sigmoid, args.sigmoid_gate).
+// x/gate/out rank-2 [rows,D] or rank-3 [T,Hv,D], weight [D]; normalization is
+// over the LAST dim either way; act = silu (or sigmoid, args.sigmoid_gate).
+// x/out stay contiguous; the gate may carry a padded outer (token) stride with
+// contiguous inner dims — the merged qkvz projection's z = mixed_qkvz[:,
+// conv_dim:] slice viewed as [T,Hv,Dv] (qwen_gdn_linear_attn.py:929-936).
 void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                   const Tensor& weight, const RmsNormGatedArgs& args);
 

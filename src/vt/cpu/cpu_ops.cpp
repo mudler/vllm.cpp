@@ -676,6 +676,9 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
                            const Tensor& his, const CausalConv1dArgs& args) {
   const int64_t total = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
   const int64_t n = conv_state.shape[0];
+  // x may be a padded-row (inner-contiguous) view of the merged qkvz output;
+  // out/conv_state stay contiguous so they keep the c_dim row stride.
+  const int64_t x_rs = x.stride[0];
   const int32_t* qslp = qsl.Ptr<int32_t>();
   VT_CHECK(qslp[0] == 0 && qslp[n] == total, "causal_conv1d_fwd: bad query_start_loc bounds");
   for (int64_t s = 0; s < n; ++s) {
@@ -702,7 +705,7 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
           const int64_t ti = t - (k - 1 - j);  // token index of window[j]
           float v = 0.0f;
           if (ti >= 0) {
-            v = LoadF32(x, (begin + ti) * c_dim + c);
+            v = LoadF32(x, (begin + ti) * x_rs + c);
           } else if (init) {
             v = old_row[static_cast<size_t>(width + ti)];  // state col (K-1)+(t-i)
           }
@@ -714,7 +717,7 @@ void CausalConv1dFwdKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
         const int64_t tj = t_len - width + j;  // new state col j holds token tj
         float v = 0.0f;
         if (tj >= 0) {
-          v = LoadF32(x, (begin + tj) * c_dim + c);
+          v = LoadF32(x, (begin + tj) * x_rs + c);
         } else if (init) {
           v = old_row[static_cast<size_t>(width + tj)];  // shifted old state
         }
@@ -733,6 +736,8 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                               const Tensor* conv_state_indices,
                               const CausalConv1dArgs& args) {
   const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1], width = k - 1;
+  // x may be a padded-row view of the merged qkvz output; out is contiguous.
+  const int64_t x_rs = x.stride[0];
   const int32_t* cache_idx =
       conv_state_indices != nullptr ? conv_state_indices->Ptr<int32_t>() : nullptr;
   // Row-chunked over (batch, channel) pairs: each pair owns its out element and
@@ -748,7 +753,7 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
     float* srow_base = conv_state.Ptr<float>() + srow_row * c_dim * width;
     {
       float* srow = srow_base + c * width;
-      const float xt = LoadF32(x, bt * c_dim + c);
+      const float xt = LoadF32(x, bt * x_rs + c);
       float acc = bias != nullptr ? LoadF32(*bias, c) : 0.0f;
       for (int64_t j = 0; j < width; ++j) acc += LoadF32(w, c * k + j) * srow[j];
       acc += LoadF32(w, c * k + width) * xt;
@@ -781,7 +786,14 @@ void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) 
 // out = x * rsqrt(mean(x^2) + eps) * w * act(gate); act = silu or sigmoid.
 void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
                         const Tensor& w, const RmsNormGatedArgs& args) {
-  const int64_t t = x.shape[0], d = x.shape[1];
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t t = x.Numel() / d;
+  // x/out are contiguous (flat row i at i*d). The gate may be a padded-row
+  // rank-3 [T,Hv,D] view of the merged qkvz z slice: map super-row i to
+  // (token=i/Hv, head=i%Hv) and honor the token stride. Contiguous rank-2 gate
+  // degenerates to i*gate.stride[0] == i*d (group == 1), byte-identical.
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     float sumsq = 0.0f;
@@ -790,8 +802,9 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
       sumsq += v * v;
     }
     const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(d) + args.eps);
+    const int64_t gbase = (i / gate_group) * gate_outer + (i % gate_group) * d;
     for (int64_t j = 0; j < d; ++j) {
-      const float z = LoadF32(gate, i * d + j);
+      const float z = LoadF32(gate, gbase + j);
       const float act = args.sigmoid_gate ? 1.0f / (1.0f + std::exp(-z)) : Silu(z);
       StoreF32(out, i * d + j, LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
     }

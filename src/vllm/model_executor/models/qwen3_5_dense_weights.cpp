@@ -80,19 +80,13 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   return o;
 }
 
-// BF16 [out, in] kept RAW in the on-disk torch Linear orientation (nk=true),
-// consumed via vt::MatmulBT — the cuBLASLt TN fast path (K contiguous in both
-// operands, the layout vLLM's F.linear hits; nvjet TNNN on GB10). Measured
-// 2026-07-10: the transposed [K,N] Matmul-B orientation forces cuBLASLt onto
-// NNNN/sm80-cutlass kernels — 27B GDN in_proj site 2.29 vs vLLM 1.80 us/tok.
-// Also skips the load-time host transpose.
-OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
-  const StTensor& t = get(name);
-  VT_CHECK(t.shape.size() == 2, "qwen3_5 dense: expected 2-D weight for " + name);
-  OwnedTensor o = LoadBf16Direct(get, name);
-  o.nk = true;
-  return o;
-}
+// The GDN in-projections stay RAW in the on-disk torch Linear [out, in]
+// orientation (nk=true, via LoadMergedBf16RawNK), consumed by vt::MatmulBT —
+// the cuBLASLt TN fast path (K contiguous in both operands, the layout vLLM's
+// F.linear hits; nvjet TNNN on GB10). Measured 2026-07-10: the transposed
+// [K,N] Matmul-B orientation forces cuBLASLt onto NNNN/sm80-cutlass kernels —
+// 27B GDN in_proj site 2.29 vs vLLM 1.80 us/tok. Raw NK also skips the
+// load-time host transpose.
 
 // BF16 [n] -> owned f32 [n] (A_log / dt_bias; upcast is lossless).
 OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
@@ -168,11 +162,14 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base)
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
-  // (nk=true -> vt::MatmulBT TN fast path; see LoadBf16RawNK). Mirror vLLM's
-  // physical in_proj_ba owner in exact [b,a] row order; the rollback path takes
-  // non-owning row slices, so the split fields deliberately stay empty.
-  g.in_proj_qkv = LoadBf16RawNK(get, la + "in_proj_qkv.weight");
-  g.in_proj_z = LoadBf16RawNK(get, la + "in_proj_z.weight");
+  // (nk=true -> vt::MatmulBT TN fast path). Mirror vLLM's TWO physical
+  // MergedColumnParallelLinear owners (qwen3_5.py:203-210 stacked mapping +
+  // qwen_gdn_linear_attn.py:481-496): in_proj_qkvz in exact [q,k,v,z] row
+  // order (the checkpoint's in_proj_qkv already stacks q|k|v; z appended) and
+  // in_proj_ba in exact [b,a] row order. The rollback paths take non-owning
+  // row slices of these owners, so the split fields deliberately stay empty.
+  g.in_proj_qkvz = LoadMergedBf16RawNK(
+      get, {la + "in_proj_qkv.weight", la + "in_proj_z.weight"});
   g.in_proj_ba = LoadMergedBf16RawNK(
       get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
   // out_proj: W4A4-quantized -> fp4-resident (throughput path, notes §5 step-6a).

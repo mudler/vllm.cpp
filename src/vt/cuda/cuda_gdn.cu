@@ -287,8 +287,8 @@ void GdnStateScatterKernelCuda(Queue& q, Tensor& cache,
 template <typename Tin, typename Tout, typename THas>
 __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, const Tin* bias,
                                       float* conv_state, const int32_t* qsl,
-                                      const THas* his, int64_t c_dim, int64_t k,
-                                      bool silu) {
+                                      const THas* his, int64_t c_dim, int64_t x_row_stride,
+                                      int64_t k, bool silu) {
   const int64_t s = blockIdx.y;
   const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (c >= c_dim) return;
@@ -304,7 +304,7 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
       const int64_t ti = t - (k - 1 - j);  // token index of window[j]
       float v = 0.0f;
       if (ti >= 0) {
-        v = Load(x, (begin + ti) * c_dim + c);
+        v = Load(x, (begin + ti) * x_row_stride + c);
       } else if (init) {
         v = srow[width + ti];  // old state col (K-1)+(t-i); not yet overwritten
       }
@@ -318,7 +318,7 @@ __global__ void CausalConv1dFwdKernel(Tout* out, const Tin* x, const Tin* w, con
     const int64_t tj = t_len - width + j;  // new state col j holds token tj
     float v = 0.0f;
     if (tj >= 0) {
-      v = Load(x, (begin + tj) * c_dim + c);
+      v = Load(x, (begin + tj) * x_row_stride + c);
     } else if (init) {
       v = srow[width + tj];  // shifted old state; index t_len+j >= j (unwritten)
     }
@@ -355,7 +355,7 @@ template <typename Tin, typename Tout, typename THas>
 __global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w,
                                            const Tin* bias, float* conv_state,
                                            const int32_t* qsl, const THas* his, int64_t c_dim,
-                                           int64_t k, bool silu) {
+                                           int64_t x_row_stride, int64_t k, bool silu) {
   const int64_t width = k - 1;
   const int64_t s = blockIdx.y;  // sequence
   const int tx = static_cast<int>(threadIdx.x);
@@ -380,7 +380,7 @@ __global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w
       float val = 0.0f;
       if (active) {
         if (tok >= 0 && tok < t_len) {
-          val = Load(x, (begin + tok) * c_dim + c);
+          val = Load(x, (begin + tok) * x_row_stride + c);
         } else if (tok < 0 && init) {
           val = srow[width + tok];  // old conv_state col (K-1)+tok, in [0,width)
         }
@@ -410,7 +410,7 @@ __global__ void CausalConv1dFwdTiledKernel(Tout* out, const Tin* x, const Tin* w
       const int64_t tj = t_len - width + j;
       float val = 0.0f;
       if (tj >= 0) {
-        val = Load(x, (begin + tj) * c_dim + c);
+        val = Load(x, (begin + tj) * x_row_stride + c);
       } else if (init) {
         val = srow[width + tj];
       }
@@ -440,17 +440,18 @@ void LaunchConvFwd(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
                    const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
                    const Tensor& his, const CausalConv1dArgs& args) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
+  const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock), static_cast<unsigned>(n));
   if (his.dtype == DType::kI8) {
     CausalConv1dFwdKernel<Tin, Tout, int8_t><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, k, args.silu_activation);
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation);
   } else {
     CausalConv1dFwdKernel<Tin, Tout, int32_t><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k, args.silu_activation);
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd launch");
 }
@@ -465,6 +466,7 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
                         const Tensor& his, const CausalConv1dArgs& args) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
   const int64_t width = k - 1;
+  const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   const dim3 grid(static_cast<unsigned>((c + kConvTileN - 1) / kConvTileN),
                   static_cast<unsigned>(n));
   const dim3 block(kConvTileN, kConvTileM);
@@ -473,12 +475,12 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
     CausalConv1dFwdTiledKernel<Tin, Tout, int8_t><<<grid, block, shmem, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, k, args.silu_activation);
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation);
   } else {
     CausalConv1dFwdTiledKernel<Tin, Tout, int32_t><<<grid, block, shmem, s>>>(
         out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
         bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
-        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, k, args.silu_activation);
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd(tiled) launch");
 }
@@ -509,7 +511,7 @@ template <typename Tin, typename Tout, typename TState>
 __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
                                          const Tin* bias, TState* conv_state,
                                          const int32_t* cache_idx, int64_t n, int64_t c_dim,
-                                         int64_t k, bool silu) {
+                                         int64_t x_row_stride, int64_t k, bool silu) {
   const int64_t width = k - 1;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -523,9 +525,10 @@ __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
       srow_off = static_cast<int64_t>(slot) * c_dim + c;
     }
     // Persistent conv_state cache is bf16 (vLLM default) or f32 (unit test);
-    // Load()/Store() upcast/downcast, the convolution accumulates in f32.
+    // Load()/Store() upcast/downcast, the convolution accumulates in f32. x may
+    // be a padded-row (merged qkvz) view; out stays contiguous at idx.
     TState* srow = conv_state + srow_off * width;  // row [K-1]
-    const float xt = Load(x, idx);
+    const float xt = Load(x, bt * x_row_stride + c);
     float acc = bias != nullptr ? Load(bias, c) : 0.0f;
     for (int64_t j = 0; j < width; ++j) acc += Load(w, c * k + j) * Load(srow, j);
     acc += Load(w, c * k + width) * xt;
@@ -540,9 +543,10 @@ void LaunchConvUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
                       const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
                       const CausalConv1dArgs& args) {
   const int64_t n = x.shape[0] * x.shape[1], c = x.shape[1], k = w.shape[1];
+  const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   CausalConv1dUpdateKernel<Tin, Tout, TState><<<GridFor(n), kBlock, 0, s>>>(
       out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), bias != nullptr ? bias->Ptr<Tin>() : nullptr,
-      conv_state.Ptr<TState>(), cache_idx, n, c, k, args.silu_activation);
+      conv_state.Ptr<TState>(), cache_idx, n, c, x_rs, k, args.silu_activation);
   Check(cudaGetLastError(), "causal_conv1d_update launch");
 }
 
@@ -803,12 +807,17 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
 // Upstream counterpart: layers/fla/ops/layernorm_guard.py
 // (layer_norm_fwd_kernel via RMSNormGated) — align post-MVP.
 
+// x/out are contiguous ([rows, D] flat). The gate may be a padded-row rank-3
+// [T,Hv,D] view of the merged qkvz z slice: super-row `row` maps to
+// (token=row/gate_group, head=row%gate_group) with gate_outer the token stride.
+// Contiguous rank-2 gate uses gate_group=1, gate_outer=D (zrow = gate + row*D).
 template <typename Tin, typename Tout>
 __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, const Tin* w,
-                                      int64_t d, float eps, bool sigmoid_gate) {
+                                      int64_t d, int64_t gate_group, int64_t gate_outer,
+                                      float eps, bool sigmoid_gate) {
   const int64_t row = blockIdx.x;
   const Tin* xrow = x + row * d;
-  const Tin* zrow = gate + row * d;
+  const Tin* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
   Tout* orow = out + row * d;
   __shared__ float partial[kBlock];
   float acc = 0.0f;
@@ -836,29 +845,34 @@ void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor
            "cuda rmsnorm_gated: unsupported input dtype (f32/bf16 only)");
   VT_CHECK(gate.dtype == x.dtype && w.dtype == x.dtype,
            "cuda rmsnorm_gated: gate/weight dtype must match x");
-  const int64_t t = x.shape[0], d = x.shape[1];
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t t = d == 0 ? 0 : x.Numel() / d;
   if (t == 0 || d == 0) return;
+  // Padded-row rank-3 [T,Hv,D] gate: super-row -> (token, head). Contiguous
+  // rank-2 gate degenerates to gate_group=1, gate_outer=gate.stride[0]==d.
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
   cudaStream_t s = AsStream(q);
   const unsigned grid = static_cast<unsigned>(t);
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
       RmsNormGatedRowKernel<float, float><<<grid, kBlock, 0, s>>>(
-          out.Ptr<float>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), d, args.eps,
-          args.sigmoid_gate);
+          out.Ptr<float>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), d, gate_group,
+          gate_outer, args.eps, args.sigmoid_gate);
     } else {
       RmsNormGatedRowKernel<float, __nv_bfloat16><<<grid, kBlock, 0, s>>>(
           out.Ptr<__nv_bfloat16>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), d,
-          args.eps, args.sigmoid_gate);
+          gate_group, gate_outer, args.eps, args.sigmoid_gate);
     }
   } else {
     if (out.dtype == DType::kF32) {
       RmsNormGatedRowKernel<__nv_bfloat16, float><<<grid, kBlock, 0, s>>>(
           out.Ptr<float>(), x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(),
-          w.Ptr<__nv_bfloat16>(), d, args.eps, args.sigmoid_gate);
+          w.Ptr<__nv_bfloat16>(), d, gate_group, gate_outer, args.eps, args.sigmoid_gate);
     } else {
       RmsNormGatedRowKernel<__nv_bfloat16, __nv_bfloat16><<<grid, kBlock, 0, s>>>(
           out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(),
-          w.Ptr<__nv_bfloat16>(), d, args.eps, args.sigmoid_gate);
+          w.Ptr<__nv_bfloat16>(), d, gate_group, gate_outer, args.eps, args.sigmoid_gate);
     }
   }
   Check(cudaGetLastError(), "rmsnorm_gated launch");

@@ -10661,3 +10661,139 @@ substage compacted + portfolio row 0 + MVP track + re-ranking clause),
 **Gates (each verified as a separate step; no chaining of commit/push after doc
 scripts).** `scripts/check-agent-record.py` and `scripts/check-doc-checkpoint.py`
 run and verified green independently; no build/test/GPU (record/decision only).
+
+## 2026-07-15 — qkvz W2A IMPLEMENTED test-first: merged `in_proj_qkvz`, ONE BF16 GEMM + strided views, rollback from one owner (`CLAIM-GDN-BA-ROUNDING-1`, `KERNEL-GEMM-BF16` W2, worktree `.claude/worktrees/agent-a09357edca6886385`)
+
+**What landed (CPU-tier complete; NO GPU ran).** The W2 leaf of
+[gdn-merged-input-projections.md](specs/gdn-merged-input-projections.md):
+merge the 27B GDN q/k/v/z input projections into ONE physical BF16
+`in_proj_qkvz` per layer, mirroring vLLM's `MergedColumnParallelLinear`
+exactly.
+
+**Upstream mirrored (both pins e24d1b24 / 702f481).**
+- Weight fusion: `vllm/model_executor/models/qwen3_5.py:203-210` — stacked
+  mapping `.in_proj_qkv → (.in_proj_qkvz, (0,1,2))`, `.in_proj_z →
+  (.in_proj_qkvz, 3)` (the checkpoint's `in_proj_qkv` already stacks q|k|v
+  rows; z appends), + `packed_modules_mapping` `qwen3_5.py:281-287`; physical
+  parameter `vllm/model_executor/layers/linear.py:580-808`
+  (`MergedColumnParallelLinear.weight_loader` exact row ranges).
+- Construction/output sizes: `qwen_gdn_linear_attn.py:481-496`
+  (`create_qkvz_proj`, Qwen3.5 non-interleaved `output_sizes=[key, key,
+  value, value]`).
+- Execution + downstream split: `qwen_gdn_linear_attn.py:923-936` — ONE
+  `in_proj_qkvz(hidden)` call; `mixed_qkv, z = mixed_qkvz.split([qkv_size,
+  z_size], dim=-1)`; `z = z.reshape(T, -1, head_v_dim)` (CPU `:1025-1043`
+  identical).
+
+**Implementation (follows the landed BA-merge pattern 1:1).**
+- Loader (`qwen3_5_dense_weights.cpp:171`): `LoadMergedBf16RawNK({in_proj_qkv,
+  in_proj_z})` → one raw-NK owner `[conv_dim+value_dim, H]` = `[16384, 5120]`
+  real, rows exact `[q,k,v,z]`; split fields left EMPTY (one-owner rule — no
+  duplicate residents; the prohibited 7.545 GiB dual-layout is impossible by
+  construction).
+- Forward (`qwen3_5.cpp:2372-2460`): `ProjectGdnQkvz` shared by dense + paged
+  blocks. Merged arm (CUDA default): ONE `MatmulBT` GEMM emitting
+  `[T, 16384]`; `mixed_qkv`/`z` are zero-copy last-dim SLICES. Dispatch seam
+  `detail::ShouldUseMergedGdnQkvz` (`qwen3_5_internal.h:52-60`): runtime
+  toggles (`VT_GDN_MERGED_QKVZ` leaf, `VT_GDN_MERGED_PROJ` master,
+  process-cached) + CUDA + owner + `GdnInDType()==GdnOutDType()` (one GEMM
+  emits one dtype; the 27B default is BF16/BF16 = vLLM's model-dtype
+  projection). Rollback/CPU/mixed-dtype arm: slice the SAME resident owner
+  rows into the exact two legacy GEMMs (dim-0 raw-NK slices stay contiguous).
+  35B (fp8 qkv/z + scales) and GGUF/synthetic keep their legacy owners — the
+  packed owner is never populated there (loader tests pin it).
+- Strided consumers (no cast/copy/materialization anywhere):
+  `CausalConv1dFwd`/`CausalConv1dUpdate` accept padded-row inner-contiguous
+  `x` (CPU + CUDA scalar/tiled/update kernels take an `x_row_stride`);
+  `RmsNormGated` accepts rank-3 `[T,Hv,Dv]` with a padded-token gate stride
+  (contiguous rank-2 arms byte-identical — same kernel/grid, only gate
+  addressing). `GdnPackedDecode` is UNTOUCHED: it consumes the conv OUTPUT
+  (`dconv`, its own contiguous buffer), so the packed pure-decode path
+  consumes the merged projection output directly through the strided conv
+  read — no additional copy exists to remove between projection and conv.
+
+**RED→GREEN evidence.**
+- RED (runtime): the three strided-consumer op tests threw on baseline —
+  `causal_conv1d_*: contiguous required` ×2, `rmsnorm_gated: x/gate/out
+  rank-2` (test_ops_gdn 3 failed / 1 passed on the new cases).
+- RED (interface): loader/model/dispatch tests fail to compile on baseline
+  (`GdnLayerWeights has no member in_proj_qkvz`, no `ShouldUseMergedGdnQkvz`)
+  — verified by stashing src/include and rebuilding.
+- GREEN (all CPU): `test_ops_gdn` 45/45 (912 asserts; incl. the merged-qkvz
+  F32/BF16 B=1/2/4/16/32 eager+capture/two-replay+canary battery mirroring
+  the BA battery — CUDA arms self-skip locally, run on DGX),
+  `test_qwen27_dense_forward` 7/7 (loader `[q,k,v,z]` row order/byte
+  equality/one-owner; CPU merged-owner vs split raw-NK fields BIT-IDENTICAL
+  logits maxd==0.0), `test_qwen27_paged_forward` 15/15 (dispatch
+  eligibility), `test_qwen36_weights` + `test_gguf_qwen36_loader` inertness
+  assertions green.
+
+**CPU gates (each exit status verified separately).** Clean full `-Werror`
+rebuild from an empty build dir: exit 0, zero warnings. Full SERIAL CTest:
+**107/107** (a `-j8`/`-j4` run flaked `test_openai_conformance` /
+`test_engine_core_proc` — port/IPC contention; each passes standalone in
+<0.5 s and the serial suite is fully green; unrelated to this change). Tools
+suite: **162/162** (`python3 -m unittest discover -s tests/tools`).
+`check-agent-record.py` OK; `check-doc-checkpoint.py` covered by the commit
+containing README + BENCHMARKS updates.
+
+**Record surfaces (this same commit).** Spec W2 leaf → implemented/`GATING`
+(+ corrected G3 totals: the pre-packed-decode "915" is now "packed default
+915→**867** total / 145→**97** BF16"), kernel-matrix `KERNEL-GEMM-BF16` row,
+roadmap order-0 + `ROAD-V1-A`, coordination claim last-update + handoff row,
+README (header + 27B row + performance track + CUDA/GDN/NVFP4 rows + order),
+BENCHMARKS (active tracks + `KERNEL-GEMM-BF16` checkpoint row), this state
+entry + parity-ledger row.
+
+**EXACT DGX gate commands for the orchestrator (from the pushed SHA; one
+`flock /tmp/gpu` per GPU job; idle box).**
+
+```sh
+SHA=<this commit>
+git -C ~/work/vllm.cpp-src fetch origin && git -C ~/work/vllm.cpp-src checkout "$SHA"
+cmake -S ~/work/vllm.cpp-src -B ~/work/vllm.cpp-src/build-gdn-qkvz -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_SERVER=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+cmake --build ~/work/vllm.cpp-src/build-gdn-qkvz --clean-first --parallel
+B=~/work/vllm.cpp-src/build-gdn-qkvz
+
+# 1) GDN + loader + model CUDA suites (default arm).
+flock /tmp/gpu -c "ctest --test-dir $B \
+  -R 'test_ops_gdn|test_qwen27_dense_forward|test_qwen27_paged_forward|test_qwen27_paged_engine|test_qwen36_weights|test_qwen36_paged_engine|test_gguf_qwen36_loader' \
+  --output-on-failure"
+
+# 2) Rollback model gates from the same binary (leaf, then master):
+#    each must be 235/235 + 16/16 from the frozen 64-plan fixture.
+flock /tmp/gpu -c "VT_GDN_MERGED_QKVZ=0 ctest --test-dir $B \
+  -R 'test_qwen27_paged_engine' --output-on-failure"
+flock /tmp/gpu -c "VT_GDN_MERGED_PROJ=0 ctest --test-dir $B \
+  -R 'test_qwen27_paged_engine' --output-on-failure"
+
+# 3) 35B inertness (native + legacy fallback) — byte-inert dispatch:
+flock /tmp/gpu -c "ctest --test-dir $B -R 'test_qwen36_paged_engine' \
+  --output-on-failure"
+flock /tmp/gpu -c "VT_DENSE_NATIVE=0 ctest --test-dir $B \
+  -R 'test_qwen36_paged_engine' --output-on-failure"
+
+# 4) Memcheck slices (strict; zero errors/leaks; no capture alloc/sync/D2H):
+flock /tmp/gpu -c "compute-sanitizer --tool memcheck --leak-check full \
+  $B/tests/test_ops_gdn \
+  -tc='gdn merged qkvz*,causal_conv1d*padded-row*,rmsnorm_gated*padded-row*'"
+
+# 5) Structural trace (W2B/G3): the c2 B=2 node trace, default arm vs
+#    VT_GDN_MERGED_QKVZ=0 arm, BOTH under one lock window, nsys
+#    --cuda-graph-trace=node (per scripts/dgx-online-serving.sh --trace-only
+#    protocol; the finalizer's qkvz mode contract is W2B work — until it
+#    lands, diff the per-window kernel families manually via
+#    `nsys stats --report cuda_gpu_kern_sum`).
+#    CONTRACT: default BF16 GEMM family 97/window (48 qkvz + 48 ba +
+#    1 lm_head), rollback 145; packed default total 915 -> 867 (-48
+#    BF16-only); every other family (FP4=208, recurrence, FA2, producers,
+#    memcpy/memset) unchanged; ZERO new copy/cast nodes.
+```
+
+**Next.** DGX gates above → W2B trace/component disposition committed to the
+spec → the AUTHORIZED exact-grid rerun (fresh vLLM denominators mandatory;
+explicit `--mamba-ssm-cache-dtype float32` on the vLLM arm; cite run SHA
+`702f481`). 35B stays blocked until 27B reaches 124/124. Binding stays
+55/124, `benchmark_binding=false`, NO speed credit is claimed for qkvz.

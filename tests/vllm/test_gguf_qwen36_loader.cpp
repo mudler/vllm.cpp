@@ -222,8 +222,9 @@ TEST_CASE("LoadQwen3_5MoeFromGguf: names, transposes, expert split, transforms")
     // in_proj_z [H, value_dim=8]; in_proj_a/b [H, num_v=2].
     CHECK(L.gdn.in_proj_z.shape[1] == 8);
     // GGUF retains its transformed [H,Hv] split owners; the 27B safetensors
-    // packed BA path must remain unselectable for every GGUF model.
+    // packed BA and QKVZ paths must remain unselectable for every GGUF model.
     CHECK(L.gdn.in_proj_ba.Empty());
+    CHECK(L.gdn.in_proj_qkvz.Empty());
     REQUIRE_FALSE(L.gdn.in_proj_b.Empty());
     REQUIRE_FALSE(L.gdn.in_proj_a.Empty());
     CHECK(L.gdn.in_proj_b.shape[0] == 8);

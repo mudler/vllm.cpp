@@ -192,6 +192,9 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(gdn.gdn.in_proj_ba.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
+    // W2 merged QKVZ is likewise 27B-dense-only. The 35B qkv/z are FP8 with
+    // quant scales and must never populate the packed BF16 owner.
+    CHECK(gdn.gdn.in_proj_qkvz.Empty());
     // conv1d collapsed to [conv_dim, K].
     CHECK(gdn.gdn.conv1d_weight.shape[0] == 8192);
     CHECK(gdn.gdn.conv1d_weight.shape[1] == 4);
@@ -240,7 +243,7 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(attn.attn.o_proj_fp8.k == 4096);
   }
 
-  SUBCASE("35B legacy dense path also keeps BA split") {
+  SUBCASE("35B legacy dense path also keeps BA and QKVZ split") {
     ScopedEnv legacy_dense("VT_DENSE_NATIVE", "0");
     const vllm::Qwen3_5MoeLayerWeights gdn =
         vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, 1);
@@ -248,5 +251,8 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     CHECK(gdn.gdn.in_proj_ba.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_b.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_a.Empty());
+    CHECK(gdn.gdn.in_proj_qkvz.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_qkv.Empty());
+    REQUIRE_FALSE(gdn.gdn.in_proj_z.Empty());
   }
 }

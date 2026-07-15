@@ -311,6 +311,25 @@ TEST_CASE("qwen27 GDN loader retains one merged BA owner and no split copies") {
                     b.size() * sizeof(uint16_t)) == 0);
   CHECK(std::memcmp(gdn.in_proj_ba.bytes.data() + b.size() * sizeof(uint16_t),
                     a.data(), a.size() * sizeof(uint16_t)) == 0);
+
+  // W2: one physical in_proj_qkvz owner in exact [q,k,v,z] row order — the
+  // checkpoint's in_proj_qkv already stacks q|k|v rows (vLLM stacked mapping
+  // (0,1,2), qwen3_5.py:203-207); in_proj_z appends the z rows (shard 3). The
+  // split fields stay empty (one-owner rule, no duplicate resident weights).
+  CHECK(gdn.in_proj_qkv.Empty());
+  CHECK(gdn.in_proj_z.Empty());
+  REQUIRE_FALSE(gdn.in_proj_qkvz.Empty());
+  CHECK(gdn.in_proj_qkvz.nk);
+  CHECK(gdn.in_proj_qkvz.rank == 2);
+  CHECK(gdn.in_proj_qkvz.shape[0] == 16 + 16);  // conv_dim + value_dim rows
+  CHECK(gdn.in_proj_qkvz.shape[1] == kHidden);
+  CHECK(gdn.in_proj_qkvz.bytes.size() ==
+        (qkv.size() + z.size()) * sizeof(uint16_t));
+  CHECK(std::memcmp(gdn.in_proj_qkvz.bytes.data(), qkv.data(),
+                    qkv.size() * sizeof(uint16_t)) == 0);
+  CHECK(std::memcmp(gdn.in_proj_qkvz.bytes.data() +
+                        qkv.size() * sizeof(uint16_t),
+                    z.data(), z.size() * sizeof(uint16_t)) == 0);
 }
 
 TEST_CASE("qwen27 W4A4 materialize: CT dequant + bf16 + transpose to [in,out]") {
@@ -389,4 +408,82 @@ TEST_CASE("qwen27 dense forward: the dense MLP is wired into the forward path") 
     maxd = std::max(maxd, std::abs(static_cast<double>(base[i]) - moved[i]));
   MESSAGE("dense-MLP perturbation moved logits by max|diff| = " << maxd);
   CHECK(maxd > 0.0);
+}
+
+namespace {
+
+// [in,out] Matmul-B bf16 -> raw torch Linear [out,in] with nk=true (the real
+// 27B loader orientation; consumed via vt::MatmulBT).
+OwnedTensor ToRawNK(const OwnedTensor& w) {
+  OwnedTensor r;
+  r.dtype = w.dtype;
+  r.rank = 2;
+  r.shape[0] = w.shape[1];
+  r.shape[1] = w.shape[0];
+  r.bytes.resize(w.bytes.size());
+  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  auto* dst = reinterpret_cast<uint16_t*>(r.bytes.data());
+  for (int64_t i = 0; i < w.shape[0]; ++i)
+    for (int64_t o = 0; o < w.shape[1]; ++o)
+      dst[o * w.shape[0] + i] = src[i * w.shape[1] + o];
+  r.nk = true;
+  return r;
+}
+
+// Concatenate raw-NK owners along their output rows (the merged owner layout).
+OwnedTensor ConcatRawNK(const OwnedTensor& top, const OwnedTensor& bottom) {
+  OwnedTensor r;
+  r.dtype = top.dtype;
+  r.rank = 2;
+  r.shape[0] = top.shape[0] + bottom.shape[0];
+  r.shape[1] = top.shape[1];
+  r.bytes.resize(top.bytes.size() + bottom.bytes.size());
+  std::memcpy(r.bytes.data(), top.bytes.data(), top.bytes.size());
+  std::memcpy(r.bytes.data() + top.bytes.size(), bottom.bytes.data(),
+              bottom.bytes.size());
+  r.nk = true;
+  return r;
+}
+
+}  // namespace
+
+// The merged in_proj_qkvz owner must be a pure ownership change: on CPU (and
+// with VT_GDN_MERGED_QKVZ=0 on CUDA) the forward slices the one owner into the
+// exact q|k|v and z row ranges and issues the same two MatmulBT GEMMs as the
+// split raw-NK fields — bit-identical logits, no duplicate resident weights.
+// Mirrors qwen_gdn_linear_attn.py:929-936 (one physical projection, logical
+// mixed_qkv/z views) with the split arm as the byte-exact reference.
+TEST_CASE("qwen27 dense forward: merged qkvz owner equals split raw-NK fields") {
+  const HfConfig c = MakeConfig();
+  vt::Queue q = Q();
+  std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+
+  // Split arm: the same bytes as the packed arm, in raw-NK split fields.
+  Qwen3_5DenseWeights split = MakeWeights(c);
+  for (auto& layer : split.layers) {
+    if (!layer.is_linear_attention) continue;
+    layer.gdn.in_proj_qkv = ToRawNK(layer.gdn.in_proj_qkv);
+    layer.gdn.in_proj_z = ToRawNK(layer.gdn.in_proj_z);
+  }
+  const std::vector<float> base =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, split, c, q);
+
+  // Packed arm: one owner per layer, split fields EMPTY (one-owner rule).
+  Qwen3_5DenseWeights packed = MakeWeights(c);
+  for (auto& layer : packed.layers) {
+    if (!layer.is_linear_attention) continue;
+    layer.gdn.in_proj_qkvz = ConcatRawNK(ToRawNK(layer.gdn.in_proj_qkv),
+                                         ToRawNK(layer.gdn.in_proj_z));
+    layer.gdn.in_proj_qkv = OwnedTensor{};
+    layer.gdn.in_proj_z = OwnedTensor{};
+  }
+  const std::vector<float> got =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, packed, c, q);
+
+  REQUIRE(got.size() == base.size());
+  double maxd = 0.0;
+  for (size_t i = 0; i < base.size(); ++i)
+    maxd = std::max(maxd, std::abs(static_cast<double>(base[i]) - got[i]));
+  CHECK(maxd == 0.0);
 }

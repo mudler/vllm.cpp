@@ -253,6 +253,68 @@ def _c16_tail_ttft(low: float, high: float) -> list[float]:
     return [20.0] * 94 + [low, high]
 
 
+# --- packed-vs-rollback ACCEPTANCE noise-band fixtures (ms) -------------------
+# These drive the G3 acceptance band (contract.acceptance): an axis FAILS only
+# when the packed deficit exceeds run noise (0.5% non-tail/memory, 15% tail).
+# A c16 packed-vs-rollback TTFT tail-ONLY deficit (96 samples, never pooled):
+# both arms share the 94x20 ms bulk AND the same tail sum (a+b=80), so the
+# mean/median/p90 ratios are exactly 1.0 and only p99 (0.95*ordered[94] +
+# 0.05*ordered[95]) moves.  rollback p99 = 0.95*30 + 0.05*50 = 31.0.
+_C16_TAIL_ROLLBACK_TTFT = [20.0] * 94 + [30.0, 50.0]        # p99 = 31.0
+_C16_TAIL_PACKED_TTFT_WITHIN = [20.0] * 94 + [34.70, 45.30]  # p99 35.235 -> ratio 0.88
+_C16_TAIL_PACKED_TTFT_BEYOND = [20.0] * 94 + [38.75, 41.25]  # p99 38.875 -> ratio 0.80
+
+
+def _uniform_records(*, deficit: float) -> dict[tuple[int, str, int], dict]:
+    """Records where packed is uniformly ``deficit`` worse than rollback.
+
+    Every timing axis is uniform per request (mean=median=p90=p99), identical
+    across the three repetitions, so each axis is perfectly stable and the
+    packed/rollback normalized ratio is exactly ``1 - deficit`` on every axis
+    (throughput, request rate, and every mean/median/p90/p99 latency).
+    """
+
+    result: dict[tuple[int, str, int], dict] = {}
+    worse = 1.0 / (1.0 - deficit)
+    for concurrency in CONCURRENCIES:
+        requests = {2: 6, 16: 96}[concurrency]
+        for arm in ARMS:
+            duration = 10.0 * (worse if arm == "packed" else 1.0)
+            latency = 8.0 * (worse if arm == "packed" else 1.0)
+            for repetition in (1, 2, 3):
+                record = _record(
+                    concurrency=concurrency,
+                    packed_better=True,
+                    repetition=repetition,
+                )
+                record["duration"] = duration
+                record["request_throughput"] = requests / duration
+                record["output_throughput"] = requests * 128 / duration
+                record["total_token_throughput"] = requests * (1024 + 128) / duration
+                _set_latency(record, latency)
+                result[(concurrency, arm, repetition)] = record
+    return result
+
+
+def _uniform_memory(*, deficit: float) -> dict[tuple[int, str, int], dict]:
+    """Memory where packed is uniformly ``deficit`` worse than rollback."""
+
+    result: dict[tuple[int, str, int], dict] = {}
+    worse = 1.0 / (1.0 - deficit)
+    for concurrency in CONCURRENCIES:
+        for arm in ARMS:
+            base = 100.0 * (worse if arm == "packed" else 1.0)
+            for repetition in (1, 2, 3):
+                result[(concurrency, arm, repetition)] = {
+                    "peak_gpu_memory_mib": base,
+                    "peak_pss_kib": base * 1024,
+                    "peak_rss_kib": base * 2048,
+                    "peak_mem_available_drop_kib": base * 4096,
+                    "returned": True,
+                }
+    return result
+
+
 def _records(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
     result = {}
     for concurrency in CONCURRENCIES:
@@ -926,6 +988,126 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertEqual(summary["disposition"], "FAILED")
         self.assertEqual(summary["axis_pass_count"], 0)
         self.assertEqual(summary["memory_axis_pass_count"], 0)
+
+    def test_sub_half_percent_deficit_on_every_axis_is_accepted(self) -> None:
+        # Run 4's signature: every c2 throughput/TPOT/ITL/E2EL and memory axis
+        # sits a hair below rollback (0.2% deficit).  Under the retired strict
+        # >=1.0-per-axis rule this was a FAILED gate; under the G3 acceptance
+        # NOISE BAND (0.5% non-tail/memory, 15% tail) a deficit inside run noise
+        # is not a stable regression, so the component is ACCEPTED.
+        records = _uniform_records(deficit=0.002)
+        memory = _uniform_memory(deficit=0.002)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
+        self.assertEqual(
+            summary["memory_axis_pass_count"], summary["memory_axis_total"]
+        )
+        self.assertEqual(
+            summary["paired_axis_pass_count"], summary["paired_axis_total"]
+        )
+        # The deficit really is present: every normalized ratio is ~0.998 (<1).
+        ratios = summary["by_concurrency"]["16"][
+            "normalized_ratios_ge_1_is_packed_better"
+        ]
+        for ratio in ratios.values():
+            self.assertLess(ratio, 1.0)
+            self.assertAlmostEqual(ratio, 0.998, places=6)
+
+    def test_one_percent_non_tail_deficit_still_fails(self) -> None:
+        # A 1% deficit exceeds the 0.5% non-tail band, so every non-tail timing
+        # and memory axis fails and the gate is FAILED — the band did not blunt
+        # the non-tail contention detector.  The same 1% is inside the 15% tail
+        # band, so the tail axes still pass (proving the two bands are distinct).
+        records = _uniform_records(deficit=0.01)
+        memory = _uniform_memory(deficit=0.01)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertFalse(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        self.assertFalse(c16["axis_pass"]["request_throughput"])
+        self.assertFalse(c16["axis_pass"]["mean_tpot_ms"])
+        self.assertFalse(c16["axis_pass"]["median_itl_ms"])
+        self.assertFalse(c16["memory_axis_pass"]["peak_gpu_memory_mib"])
+        self.assertTrue(c16["axis_pass"]["p99_tpot_ms"])
+        self.assertTrue(c16["axis_pass"]["p99_itl_ms"])
+
+    def test_tail_axis_deficit_within_band_is_accepted(self) -> None:
+        # A c16 p99 TTFT deficit of ~12% (mean/median/p90 tied by construction,
+        # every other axis packed-better) is inside the 15% tail band, so it is
+        # ACCEPTED.  c16 is never pooled, so this exercises the tail band alone.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_ttft_ms(
+                records[(16, "rollback", repetition)], _C16_TAIL_ROLLBACK_TTFT
+            )
+            _apply_ttft_ms(
+                records[(16, "packed", repetition)], _C16_TAIL_PACKED_TTFT_WITHIN
+            )
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        ratio = c16["normalized_ratios_ge_1_is_packed_better"]["p99_ttft_ms"]
+        self.assertLess(ratio, 1.0)
+        self.assertGreater(ratio, 1.0 - 0.15)
+        for axis in ("mean_ttft_ms", "median_ttft_ms", "p90_ttft_ms"):
+            self.assertTrue(c16["axis_pass"][axis])
+
+    def test_tail_axis_deficit_beyond_band_still_fails(self) -> None:
+        # A c16 p99 TTFT deficit of ~20% exceeds the 15% tail band and FAILS,
+        # while the tied non-tail TTFT axes still pass — the tail band still
+        # catches a genuine (reproducible) tail regression.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        for repetition in (1, 2, 3):
+            _apply_ttft_ms(
+                records[(16, "rollback", repetition)], _C16_TAIL_ROLLBACK_TTFT
+            )
+            _apply_ttft_ms(
+                records[(16, "packed", repetition)], _C16_TAIL_PACKED_TTFT_BEYOND
+            )
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertFalse(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        ratio = c16["normalized_ratios_ge_1_is_packed_better"]["p99_ttft_ms"]
+        self.assertLess(ratio, 1.0 - 0.15)
+        self.assertFalse(c16["axis_pass"]["p99_ttft_ms"])
+        for axis in ("mean_ttft_ms", "median_ttft_ms", "p90_ttft_ms"):
+            self.assertTrue(c16["axis_pass"][axis])
+
+    def test_genuine_pass_with_packed_better_everywhere_still_passes(self) -> None:
+        # The band applies ONLY to the deficit side: packed better on every axis
+        # remains a clean pass on every median, paired and memory axis.
+        summary = summarize_component_records(
+            _records(packed_better=True), _memory(packed_better=True)
+        )
+
+        self.assertTrue(summary["gate_pass"])
+        self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
+        self.assertEqual(
+            summary["memory_axis_pass_count"], summary["memory_axis_total"]
+        )
+        self.assertEqual(
+            summary["paired_axis_pass_count"], summary["paired_axis_total"]
+        )
+
+    def test_contract_records_the_acceptance_noise_band(self) -> None:
+        summary = summarize_component_records(
+            _records(packed_better=True), _memory(packed_better=True)
+        )
+
+        acceptance = summary["contract"]["acceptance"]
+        self.assertEqual(acceptance["non_tail_band"], 0.005)
+        self.assertEqual(acceptance["tail_band"], 0.15)
+        self.assertEqual(acceptance["tail_axes"], sorted(gdn_component.TAIL_AXES))
 
     def test_stable_paired_reversal_cannot_pass_on_medians(self) -> None:
         records = _records(packed_better=True)

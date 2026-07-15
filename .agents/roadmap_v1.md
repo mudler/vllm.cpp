@@ -67,11 +67,21 @@ the c2 TTFT-family (mean/median/p90/p99 of ttft) is COMPARED on each arm's poole
 18-per-request distribution, STABILITY-gated on a 50% pooled sanity bound, and
 EXCLUDED from the gated per-rep paired axes; c16 and every non-TTFT axis keep the
 per-run rules, and E2EL is unchanged (measured c2 E2EL deviation ≤0.30% across
-the three sealed roots). Focused **56/56**, tools **139/139**. Next: the
-orchestrator runs the **fourth** fresh SHA/root full **40+8**-median-axis
-component (c2 TTFT-family pooled, excluded from the gated paired set) from the
-pushed SHA; the `c172336`, `d82d282`, `d19e091` and diagnostic roots stay
-untouched. qkvz stays excluded.
+the three sealed roots). Focused **56/56**, tools **139/139**. The **fourth**
+seal (`2dbe892`) then reached the first VALID terminal disposition
+**`complete-failed`**: its c2 throughput/TPOT/ITL/E2EL ratios (0.9998–1.0008) and
+0.023% memory epsilons are run-noise ties failing the retired strict ≥1.0 rule,
+with the one substantive candidate (c16 packed −0.8%, unreproduced 1-of-4) the
+open fifth-run question. So **this checkpoint** adds a third test-first revision:
+an ACCEPTANCE NOISE BAND (`contract.acceptance = {non_tail_band: 0.005,
+tail_band: 0.15}`) — a comparison axis (median, gated paired, memory) fails only
+when the packed deficit exceeds run noise (0.5% non-tail/memory, 15% tail);
+packed≥rollback always passes; stability/correctness/one-lock/memory-return/
+thermal unchanged. RED sub-0.5%→accepted / 1%-non-tail→fail / 12%-tail→accepted /
+20%-tail→fail / packed-better→pass (focused **62/62**, tools **145/145**). Next:
+the orchestrator runs the deciding **fifth** full **40+8**-median-axis component
+(under the noise band) from the pushed SHA; the `c172336`, `d82d282`, `d19e091`,
+`2dbe892` and diagnostic roots stay untouched. qkvz stays excluded.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 

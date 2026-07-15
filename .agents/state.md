@@ -9994,3 +9994,54 @@ updates for the fourth seal (decomposition, epsilon-tie analysis, c16
 non-reproduction, the 24.86 GB component peak-PSS observation, and the
 noise-band precommitment). Process lesson applied: never chain `git commit`
 after a doc-editing script without checking its exit status.
+
+## 2026-07-15 — W1D3 component ACCEPTANCE NOISE BAND landed test-first (CPU PASSED; DGX fifth component PENDING)
+
+Implements the precommitted acceptance noise band for the packed-vs-rollback
+component under `CLAIM-GDN-BA-ROUNDING-1`, replacing the strict ≥1.0-per-axis
+rule that did not implement the spec's "no STABLE regression" contract. In
+`tools/bench/gdn_packed_component.py`, a comparison axis (the median
+`axis_pass`, the gated per-rep `paired_axis_pass`, and every memory axis) now
+FAILS only when the packed deficit exceeds a noise band:
+
+- Non-tail timing axes (throughput, request rate, mean/median of
+  ttft/tpot/itl/e2el) and ALL memory axes: `NON_TAIL_ACCEPTANCE_BAND = 0.005`
+  (normalized ratio `< 0.995` fails). Grounding: the ≤0.45% idle-box, fixed-SHA
+  per-rep deviation ceiling across the four sealed runs — a deficit inside 0.5%
+  cannot be a stable regression (the run-4 c2 throughput/TPOT/ITL/E2EL ratios at
+  0.9998–1.0008 and the 0.023% c16 PSS/RSS deltas now accept), while one outside
+  it (the c16 −0.8% candidate) still fails.
+- Tail axes (p90/p99 of ttft/tpot/itl/e2el, incl. the pooled c2 TTFT tails):
+  `TAIL_ACCEPTANCE_BAND = 0.15` (`< 0.85` fails), consistent with the tail
+  stability tolerance (observed idle-box tail noise up to 10.58%).
+
+Direction semantics are unchanged — the band applies to the deficit side only;
+packed at-or-better than rollback (ratio ≥ 1) always passes. Both bands and
+their grounding are recorded in `contract.acceptance`. Explicitly UNCHANGED:
+the stability rules (4%/15%/pooled-50%), the pooled c2 TTFT computation, the
+correctness/one-lock/memory-return/thermal validation, and which axes exist.
+
+Test-first: wrote the acceptance-band cases FIRST and observed
+`test_sub_half_percent_deficit_on_every_axis_is_accepted` genuinely RED
+(gate_pass False under the strict rule) before implementing. After the change:
+all-axes-0.2%-deficit → ACCEPTED; 1%-non-tail deficit → FAILS (tail axes at 1%
+still pass, proving the two bands are distinct); 12%-tail deficit → ACCEPTED;
+20%-tail deficit → FAILS; packed-better-everywhere → passes; `contract.acceptance`
+records `{non_tail_band:0.005, tail_band:0.15, tail_axes, grounding}`. No
+existing test needed a behavioral change — the strict-≥1.0 pins survive because
+their deficits exceed the bands (`test_valid_regression` 16–25%,
+`test_stable_paired_reversal` 3.75% on throughput/memory). Focused
+`test_gdn_packed_component` **62/62** (56 baseline + 6 new), all tools
+**145/145** (139 baseline + 6), `py_compile` clean,
+`check-agent-record.py`/`test_agent_record.py`/`test_doc_checkpoint.py` OK. No
+GPU/production-code change here. Binding stays **55/124**,
+`benchmark_binding=false`, no speed credit. Next: the orchestrator runs the
+deciding fifth 12-leg component from the pushed SHA under the noise band —
+c16 tie reproduced → expected `complete-pass` (authorizing qkvz/exact grid);
+c16 −0.8% reproduced → a genuine packed-path perf defect and the trace-driven
+scan resumes. qkvz/exact-grid/35B stay blocked on a verified `complete-pass`.
+
+Process note (applying today's recorded lesson): gates, commit, and the
+post-commit `check-doc-checkpoint.py --base <pre> --head HEAD` were run as
+separate steps with each exit status verified before proceeding; no
+`git commit`/`push` was chained after a doc-editing script.

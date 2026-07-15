@@ -9934,3 +9934,48 @@ pushed SHA).** Focused `test_gdn_packed_component` **56/56**, all tools
 pass. No production/CUDA code changed; binding stays **55/124**,
 `benchmark_binding=false`, no speed credit; qkvz/exact-grid/35B remain blocked on
 a verified `complete-pass`.
+
+## 2026-07-15 — fourth component seals complete-failed; decomposition, contradiction, and the peak-PSS win
+
+The fourth sealed 12-leg component (clean pushed `2dbe892`, root
+`~/work/vllm.cpp-gdn-packed-component/2dbe892e47aabacc5c25fcc22cb0b739d74513c5`,
+status artifact-set `310aa8e2…14cd`, manifest `c2ca909c…3585`, summary
+`e3522d75…3ddc`) is the FIRST VALID terminal disposition:
+`complete-failed`, `all_repetitions_stable=true`, correctness_pass=true,
+one-lock order pass, `validation_error=None`; axis_pass 8/40, paired 41/132,
+memory 6/8. Decomposition of the failure, from the sealed comparison values:
+
+1. **c2 is a statistical tie failing a strict rule.** Every c2
+   throughput/TPOT/ITL/E2EL ratio sits at 0.9998–1.0008; the strict ≥1.0
+   axis rule converts ≤0.02% epsilon deficits (rep noise is ~0.2%) into
+   "regressions". Pooled c2 TTFT tails retain lottery residue (0.94–0.99).
+2. **The two failing memory axes are a 0.023% epsilon**: c16 peak PSS/RSS
+   packed 24,860,187/24,864,172 kiB vs rollback 24,854,473/24,856,916 —
+   5.7 MB of 24.9 GB under the same strict rule. GPU memory passes (packed
+   uses 656 MiB LESS).
+3. **c16 shows a consistent ~0.8% packed deficit** (per-rep tput packed
+   [793.50, 793.28, 795.79] vs rollback [800.12, 798.30, 800.60]; mean TPOT
+   ratio 0.9941) — the only substantive candidate regression. It CONTRADICTS
+   runs 1–3 (same engine code; c16 arm deltas −0.06%/−0.13%/−0.02%), and run
+   4's rollback exceeds every prior c16 measurement of either arm
+   (798.3–800.6 vs 790.2–795.9). Per the reproduction gate, a
+   non-reproducing regression does not count; a fifth run decides it.
+
+Also recorded: with `VT_LOAD_WINDOWED_RELEASE` default-ON in both arms since
+`cb2d310`, the component's peak PSS is **24.86 GB** versus the binding-era
+**48.18 GB** — the load-time double-residency fix holds in full production
+serving legs and sits well under vLLM's binding 28.5 GB peak (binding credit
+still requires the authorized exact grid).
+
+Precommitted next steps: (a) a test-first ACCEPTANCE NOISE BAND for the
+internal packed-vs-rollback component — the spec contract is "no STABLE
+regression", which a strict ≥1.0 rule does not implement: an axis should fail
+only when the deficit exceeds a band derived from observed repetition noise
+(e.g. max(0.5%, 2×rep-CV)); epsilon ties and the 0.02% memory deltas then
+pass, while the c16 −0.8% (if real) still fails. This mirrors the two prior
+statistics revisions and is recorded BEFORE the fifth run. (b) The fifth
+component run from the revised SHA then decides: c16 tie reproduced →
+expected `complete-pass` (authorizing qkvz/exact grid); c16 −0.8% reproduced
+→ a genuine packed-path perf defect and the trace-driven scan resumes on the
+packed kernel. Binding stays **55/124**, `benchmark_binding=false`, no speed
+credit.

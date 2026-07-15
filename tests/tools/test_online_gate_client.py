@@ -1281,6 +1281,34 @@ class OnlineClientContractTests(unittest.TestCase):
             script,
         )
 
+    def test_vllm_arm_server_pins_mamba_ssm_cache_dtype_float32(self) -> None:
+        # Equivalence-audit recommendation 3
+        # (.agents/specs/benchmark-equivalence-audit-2026-07-15.md): pin the
+        # resolved GDN SSM cache dtype in the recorded vLLM server evidence.
+        # ``--mamba-ssm-cache-dtype float32`` is a valid ``vllm serve`` flag
+        # (vllm/engine/arg_utils.py:687,1182,1882; type MambaDType accepts
+        # 'float32' at vllm/config/cache.py:37,130) and, differing from the
+        # 'auto' default, appears in the ``non-default args:`` startup log line
+        # (vllm/entrypoints/openai/api_server.py:553 ->
+        # vllm/entrypoints/serve/utils/api_utils.py:209,271-273). It is a
+        # record-visibility no-op matching the value the Qwen3.5 config hook
+        # resolves anyway, so it lands only on the vLLM arm.
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        start_server = script.split("start_server() {", 1)[1].split(
+            "\n}\n", 1
+        )[0]
+        ours_block = start_server.split(
+            "if [[ ${engine} == ours ]]; then", 1
+        )[1].split("\n  else", 1)[0]
+        vllm_block = start_server.split(
+            '"${client}" serve "${snapshot}"', 1
+        )[1].split("\n    )", 1)[0]
+        self.assertIn("--mamba-ssm-cache-dtype float32", vllm_block)
+        self.assertNotIn("--mamba-ssm-cache-dtype", ours_block)
+
     def test_trace_driver_sets_h1d_plan_environment_before_manifest(self) -> None:
         repo = pathlib.Path(__file__).resolve().parents[2]
         script = (repo / "scripts" / "dgx-online-serving.sh").read_text(

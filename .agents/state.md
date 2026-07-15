@@ -10900,3 +10900,55 @@ arms fresh, one lock; expected movers: both host-memory axes
 (windowed-load: 24.9 vs vLLM 28.5 GB) and the c2 decode cluster (component
 c2 TPOT ≈108.5 ms vs binding-era 114.8); open risks: c4/c8 decode axes and
 the c8 p99 ITL tail. 35B stays blocked until 27B reaches 124/124.
+
+## 2026-07-15 — equivalence-audit pins wired into the binding-grid harness before the authorized exact grid (`CLAIM-SERVE-GATE-1`, worktree `.claude/worktrees/agent-a7765b54bad94fcc5`)
+
+Bounded checkpoint (no GPU): pre-wire the two actionable pins from the
+[benchmark-equivalence audit](specs/benchmark-equivalence-audit-2026-07-15.md)
+into the binding-grid harness so the AUTHORIZED exact-grid rerun records them
+automatically. No engine/kernel change.
+
+1. **Pin — `--mamba-ssm-cache-dtype float32` on the vLLM arm (audit rec 2).**
+   The only vLLM `serve` construction in the binding grid is
+   `scripts/dgx-online-serving.sh` `start_server` (else/vLLM branch; the same
+   command the `3f256ab` evidence recorded as `r{rep}-server-command.txt`). Added
+   the flag there (grouped with `--no-enable-prefix-caching`). The GDN packed
+   component driver (`dgx-gdn-packed-component.sh`) has NO vLLM arm
+   (packed-vs-rollback are both `examples/server`), so it is correctly untouched.
+   TEST-FIRST: RED→GREEN command-contract test
+   `tests/tools/test_online_gate_client.py::test_vllm_arm_server_pins_mamba_ssm_cache_dtype_float32`
+   extracts the `start_server` else-branch and pins the flag present on the vLLM
+   arm and ABSENT from the `ours` arm (RED confirmed pre-change: flag not found;
+   GREEN post-change).
+2. **Source verification (pinned vLLM `e24d1b24`, oracle-era `702f481`).** Flag
+   is valid `vllm serve` at v0.25 (`vllm/engine/arg_utils.py:687` field, `:1182`
+   registration, `:1882` → CacheConfig); `float32` is an accepted `MambaDType`
+   (`vllm/config/cache.py:37`, field `:130`, default `"auto"`). Because the value
+   differs from the default it appears in the `non-default args:` startup log
+   (`vllm/entrypoints/openai/api_server.py:553` → `log_non_default_args` →
+   `vllm/entrypoints/serve/utils/api_utils.py:209,271-273`). It equals what the
+   Qwen3.5 config hook already resolves (audit §SSM dtype), so it is a
+   record-visibility no-op, NOT a behavior change to the allocated SSM dtype.
+3. **Pin — cite run SHA `702f481` (audit rec 3): ALREADY captured, assert only.**
+   `VLLM_COMMIT = 702f4814…c276` (`tools/bench/serve_low_common.py:28`) is
+   already recorded+validated as `client_contract_source_commit` in the plan and
+   oracle manifests (`tools/bench/online_gate.py:900,1029,3391,3461`) and as
+   `vllm_source_sha` in the execution manifest (`:2540,3708`). No code change.
+4. **Historical-evidence validation kept honest.** The only recorded-command
+   validation of the grid vLLM server command is
+   `tools/bench/online_gate_summary.py:218-235` — a POSITIVE-PRESENCE check
+   (`--max-num-seqs`, `--max-num-batched-tokens`, `--served-model-name gate`,
+   `--no-enable-prefix-caching`), NOT an exact/prefix match. Adding a new token is
+   transparent: the binding `3f256ab` evidence (no flag) still validates and a
+   future flagged run validates too. No era-awareness change was needed; making
+   it era-aware by REQUIRING the flag would newly break `3f256ab` validation and
+   wrongly demand it on the `ours` arm, so that was deliberately not done.
+
+Gates: focused test RED→GREEN; full tools suite **163/163** (baseline 162 + 1
+new, zero regressions); `bash -n` + `shellcheck` clean on the driver;
+`py_compile` on the changed test; `check-agent-record.py` + `check-doc-checkpoint.py`
+green. Records updated same commit: audit spec (rec 2 IMPLEMENTED, rec 3
+SATISFIED with anchors), BENCHMARKS/README repro text, this entry, the ledger
+row, and the `CLAIM-SERVE-GATE-1` last-update. Binding stays **55/124**,
+`benchmark_binding=false`; the authorized exact-grid rerun remains the active
+order-0 item.

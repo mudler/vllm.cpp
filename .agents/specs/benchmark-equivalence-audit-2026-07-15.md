@@ -93,11 +93,30 @@ oracle).
 
 1. Keep FP32 SSM as the default (mirror-correct); `VT_GDN_STATE_BF16` stays
    diagnostic-only.
-2. Pass `--mamba-ssm-cache-dtype float32` explicitly on the vLLM arm (or dump
-   the resolved cache config) so the resolved dtype is IN the evidence and no
-   future audit needs source inference.
-3. Cite vLLM claims against the actually-run SHA `702f481` (the oracle records
-   `client_contract_source_commit`).
+2. **IMPLEMENTED (2026-07-15, harness pre-wire — not yet run).** Pass
+   `--mamba-ssm-cache-dtype float32` explicitly on the vLLM arm so the resolved
+   dtype is IN the evidence and no future audit needs source inference. The
+   binding-grid driver now emits the flag on the vLLM `serve` arm
+   (`scripts/dgx-online-serving.sh` `start_server`, else/vLLM branch), pinned
+   by a command-contract test
+   (`tests/tools/test_online_gate_client.py::test_vllm_arm_server_pins_mamba_ssm_cache_dtype_float32`).
+   Verified a record-visibility no-op, NOT a behavior change: `float32` is a
+   valid `MambaDType` (`vllm/config/cache.py:37,130`), the flag exists on
+   `vllm serve` at v0.25 (`vllm/engine/arg_utils.py:687,1182,1882`), and it
+   equals the value the Qwen3.5 config hook already resolves (this file
+   §SSM dtype), so it only surfaces in the `non-default args:` startup log
+   (`vllm/entrypoints/openai/api_server.py:553` →
+   `vllm/entrypoints/serve/utils/api_utils.py:209,271-273`) without changing the
+   allocated SSM cache dtype. Only the vLLM arm carries it; the `ours` arm does
+   not.
+3. **SATISFIED (already captured — assert only).** Cite vLLM claims against the
+   actually-run SHA `702f481` (the oracle records `client_contract_source_commit`).
+   The grid execution manifest already pins it: `VLLM_COMMIT =
+   702f4814fe54fabff350d43cb753ae3e47c0c276` (`tools/bench/serve_low_common.py:28`)
+   is recorded and validated as `client_contract_source_commit` in the plan and
+   oracle manifests (`tools/bench/online_gate.py:900,1029,3391,3461`) and as
+   `vllm_source_sha` in the execution manifest (`online_gate.py:2540,3708`). No
+   code change needed; the citation anchor is these manifest fields.
 4. The parity effort's one true front on this surface remains vLLM's
    prefill fusion; state dtypes and capacity methods are settled.
 5. Optional cleanliness (no expected throughput change at this workload): pin

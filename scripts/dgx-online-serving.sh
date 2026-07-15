@@ -381,6 +381,7 @@ start_server() {
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
       --no-enable-prefix-caching
+      --mamba-ssm-cache-dtype float32
       --port "${port}"
     )
   fi

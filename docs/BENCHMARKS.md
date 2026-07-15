@@ -14,13 +14,17 @@ Last updated: **2026-07-15**. Qwen3.6-27B parity against vLLM v0.25.0 is
 immutable correctness at `f344dec` and accepted structure from `7ff713e`,
 finalized by `24cea4f`: packed has **915** nodes versus rollback's **963**, with
 the exact 48-for-96 GDN substitution and invariant remaining topology. The
-production-build-only c2/c16 AB/BA/AB runner and marker-last every-axis
-finalizer are hardened; six 12-leg components have sealed, the latest
-`complete-failed` with **40/40 median + 8/8 memory axes PASS**, stability and
-correctness PASS, failing ONLY 10/132 gated per-rep paired axes all inside the
-single c2 r1 rep-pair (packed ~1% slower; see the component section below), and a
-MAJORITY-CONSISTENCY paired gate has now landed test-first (all tools
-**154/154**). Clean source `d82d282`
+production-build-only runner and marker-last every-axis finalizer are hardened;
+seven components have sealed. An 8-pair locked c16 A/B + multi-window trace at
+`00bf484` returned the verdict — **packed is GPU-cheaper** (c16 total-throughput
+paired mean **−0.205%, sd 0.30, <1σ** excluding the cold-first-leg outlier;
+cuBLASLt algo selection process-deterministic → algo-lottery REFUTED; trace
+attributes no packed-side cost). A final harness precision upgrade has now landed
+test-first: **5 timed reps** (20 legs AB/BA/AB/BA/AB), a **3-of-5
+majority-consistency** paired gate, a **30-sample** pooled c2 TTFT, and a single
+discarded **cold-start warmup pair** (`w0-{packed,rollback}`, run first,
+excluded); all tools **162/162** (see the component section below). Clean source
+`d82d282`
 completed both direct model gates and all six c2 legs, then **FAILED /
 INCOMPLETE** at c16 packed repetition 1. The streaming preflight, initial
 request and 16 warmups passed, but all **0/96** timed requests returned HTTP 500
@@ -107,17 +111,27 @@ correctness PASS, failing ONLY 10/132 gated per-rep paired axes ALL inside the
 single c2 r1 rep-pair (packed ~1% slower on the correlated
 throughput/tpot/itl/e2el axes, ratios 0.9894–0.9916; r2/r3 passed those same
 axes; artifact-set `2c582c83…bdbb`, manifest `ad178e54…1e20`, summary
-`48533c06…d1c1`). Because single-leg ±0.5–1% excursions are routine while the
-per-run stability rule tolerates ±4%, the retired every-rep-pair-in-band paired
-gate gives P(pass) ≈ 0 even for identical engines. **A MAJORITY-CONSISTENCY
-paired gate has now LANDED test-first (this checkpoint):** a gated paired axis
-fails only when ≥2 of its 3 rep-pairs breach the band in the same (packed-worse)
-direction; single-pair breaches are recorded as diagnostics
-(`contract.paired_gate={rule:"majority-consistency",repetitions:3,breach_majority:2}`;
-bands unchanged). Verified against sealed history — run 6's c2-r1-only excursion
-now PASSES; run 4's c16 3/3 packed-worse ([793.50,793.28,795.79] vs
-[800.12,798.30,800.60]) still FAILS. Next: the orchestrator runs the seventh
-component from the pushed SHA under the majority-consistency gate, which must
+`48533c06…d1c1`). The seventh seal then `complete-failed` (32/40, all-c16),
+isolating a constant ~0.2% packed steady per-token tax. The env-gated
+`VT_GEMM_ALGO_LOG` instrument (`00bf484`) plus an **8-pair locked c16 A/B and a
+multi-window trace** then returned the decisive verdict: **packed is
+GPU-cheaper.** The c16 total-throughput paired mean is **−0.205% (sd 0.30, <1σ
+from zero)** once the cold-first-leg outlier is excluded (that first packed leg
+drew 760 tok/s vs 809–814 later); cuBLASLt algo selection is
+process-deterministic on every GEMM shape including the BF16-vs-F32 BA decode
+shapes (**the algo-lottery hypothesis is REFUTED**); and the 24-window trace
+attributes **no** packed-side cost (kernel compute −1.30..−1.58%/step, GDN+BA
+block −296 µs/window, LM-head equal warm-to-warm). The residual wall tax is
+cold-draw/tail bias. **A final component-harness precision upgrade has now LANDED
+test-first (this checkpoint):** **5 timed repetitions** (20 legs AB/BA/AB/BA/AB,
+`schema_version` 2), a **3-of-5 majority-consistency** paired gate
+(`contract.paired_gate={rule:"majority-consistency",repetitions:5,breach_majority:3}`;
+2-of-5 passes, 3-of-5 fails), a **30-sample** pooled c2 TTFT, and a single
+discarded **cold-start warmup pair** (`w0-{packed,rollback}`, run first, excluded
+from every axis with fail-closed existence + timed-raw exclusion checks;
+`contract.cold_discard`). Focused **79/79**, tools **162/162**. Next: the
+orchestrator runs the eighth component from the pushed SHA (after regenerating a
+5-rep corpus and refreshing the two corpus-manifest sha256 constants), which must
 reach a verified terminal status before any axis binds.
 
 ## Binding 27B online gate

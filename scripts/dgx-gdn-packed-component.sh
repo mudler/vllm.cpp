@@ -28,6 +28,7 @@ port=8001
 num_blocks=4736
 max_num_seqs=32
 max_num_batched_tokens=2048
+warmup_label=w0
 
 while (($#)); do
   case "$1" in
@@ -206,7 +207,8 @@ vllm_corpus="${source_corpus}/vllm"
 if [[ ! -f ${vllm_corpus}/manifest.json ]]; then
   "${benchmark_clean_env[@]}" python3 \
     "${repo_root}/tools/bench/online_gate.py" prepare-corpus \
-    --source "${source_corpus}" --output "${vllm_corpus}" --model-key 27
+    --source "${source_corpus}" --output "${vllm_corpus}" --model-key 27 \
+    --repetitions 1 2 3 4 5
 fi
 
 spid=""
@@ -400,6 +402,40 @@ run_leg() {
   record_order "leg_end concurrency=${concurrency} arm=${arm} repetition=${repetition}"
 }
 
+# Single discarded cold-start warmup leg (one per arm), run FIRST before the
+# whole timed series at the smallest concurrency. Its bench output is thrown
+# away — the leg exists only to absorb the one-time whole-series cold-first-leg
+# draw so it never lands on a timed leg. The bench is failure-tolerant (the
+# cold-start HTTP 500 is exactly what we are absorbing).
+run_warmup_leg() {
+  local arm=$1
+  local concurrency=2
+  local warmup_dir="${evidence}/warmup/27"
+  local log_dir="${warmup_dir}/${arm}-logs"
+  local -a command
+  mkdir -p "${warmup_dir}" "${log_dir}"
+  gpu_idle || { echo "GPU busy before warmup ${arm}" >&2; return 1; }
+  drop_caches "${warmup_dir}/${arm}-before-cache.json"
+  server_command "${arm}" command
+  record_order "warmup_leg_begin arm=${arm} label=${warmup_label}"
+  setsid "${command[@]}" >"${log_dir}/server.log" 2>&1 &
+  spid=$!
+  wait_ready "${log_dir}/server.log"
+  "${benchmark_clean_env[@]}" python3 "${repo_root}/tools/bench/online_gate.py" bench \
+    --client "${client}" --tokenizer "${snapshot}" --evidence "${evidence}" \
+    --model-key 27 --engine ours --base-url "http://127.0.0.1:${port}" \
+    --concurrency "${concurrency}" --repetition 1 \
+    --artifact-tag "gdn-${arm}-${warmup_label}" || true
+  cleanup_server
+  wait_gpu_idle
+  # The throwaway bench output must never contaminate the timed raw directory.
+  rm -f "${evidence}/raw/27/ours/c${concurrency}-r1-gdn-${arm}-${warmup_label}.json"
+  printf '{"arm":"%s","label":"%s","discarded":true,"server_log":"%s"}\n' \
+    "${arm}" "${warmup_label}" "${log_dir}/server.log" \
+    >"${warmup_dir}/w0-${arm}.json"
+  record_order "warmup_leg_end arm=${arm} label=${warmup_label}"
+}
+
 # >>> diagnostic-c16 flow (bounded reproduction of the c16 packed HTTP 500).
 # Packed arm ONLY, concurrency 16, three fresh servers under one GPU lock. No
 # model gates, no 2/16 sweep, no component finalization: this checkpoint only
@@ -507,6 +543,9 @@ run_model_gate rollback
 python3 "${repo_root}/tools/bench/gdn_packed_component.py" validate-model-gates \
   --evidence "${evidence}" --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null
 record_order "model_gates_validated"
+# One discarded cold-start warmup pair, run first before the whole timed series.
+run_warmup_leg packed
+run_warmup_leg rollback
 for concurrency in 2 16; do
   run_leg "${concurrency}" packed 1
   run_leg "${concurrency}" rollback 1
@@ -514,6 +553,10 @@ for concurrency in 2 16; do
   run_leg "${concurrency}" packed 2
   run_leg "${concurrency}" packed 3
   run_leg "${concurrency}" rollback 3
+  run_leg "${concurrency}" rollback 4
+  run_leg "${concurrency}" packed 4
+  run_leg "${concurrency}" packed 5
+  run_leg "${concurrency}" rollback 5
 done
 record_order "gpu_series_complete"
 flock -u 9

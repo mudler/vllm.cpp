@@ -193,6 +193,12 @@ VLLM_GENERATION_WINDOW_CONTRACTS = {
     "27": {"all": 1_588, "clean": 1_476},
 }
 REPETITIONS = (1, 2, 3)
+# The GDN packed-vs-rollback component runs five timed repetitions per
+# (concurrency, arm) under CLAIM-GDN-BA-ROUNDING-1, so an ``OnlineRun`` may carry
+# a repetition beyond the three-rep online-serving grid.  The online gate itself
+# never emits a repetition outside ``REPETITIONS``; this bound only widens the
+# accepted domain so the component can reuse ``OnlineRun`` / ``build_client_command``.
+MAX_ONLINE_REPETITION = 5
 POINTS = ((1, 6), (2, 6), (4, 12), (8, 24), (16, 96), (32, 192))
 MODEL_REVISIONS = {
     "27": "890bdef7a42feba6d83b6e17a03315c694112f2a",
@@ -330,7 +336,11 @@ class OnlineRun:
             raise HarnessError(f"unknown model key: {self.model_key}")
         if self.engine not in ENGINES:
             raise HarnessError(f"unknown engine arm: {self.engine}")
-        if self.repetition not in REPETITIONS:
+        if (
+            isinstance(self.repetition, bool)
+            or not isinstance(self.repetition, int)
+            or not 1 <= self.repetition <= MAX_ONLINE_REPETITION
+        ):
             raise HarnessError(f"unsupported repetition: {self.repetition}")
         if self.artifact_tag and re.fullmatch(r"[a-z0-9-]+", self.artifact_tag) is None:
             raise HarnessError(f"invalid artifact tag: {self.artifact_tag}")
@@ -769,11 +779,22 @@ def prepare_corpus_views(
     output_root: pathlib.Path,
     *,
     model_key: str,
+    repetitions: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    """Convert the exact-token shared corpus into vLLM CustomDataset rows."""
+    """Convert the exact-token shared corpus into vLLM CustomDataset rows.
 
+    ``repetitions`` defaults to the three-rep online-serving grid (resolved at
+    call time so callers/tests may patch ``REPETITIONS``); the GDN packed
+    component passes its five-rep domain so the same source corpus yields the
+    r1..r5 views its 20 timed legs consume.
+    """
+
+    if repetitions is None:
+        repetitions = tuple(REPETITIONS)
     if model_key not in MODEL_REVISIONS:
         raise HarnessError(f"unknown model key: {model_key}")
+    if sorted(repetitions) != list(range(1, len(repetitions) + 1)):
+        raise HarnessError(f"corpus repetitions must be 1..N contiguous: {repetitions}")
     source_manifest = source_root / "manifest.json"
     if not source_manifest.is_file():
         raise HarnessError(f"missing source corpus manifest: {source_manifest}")
@@ -782,7 +803,7 @@ def prepare_corpus_views(
 
     files: list[dict[str, Any]] = []
     prompt_hashes: set[str] = set()
-    for repetition in REPETITIONS:
+    for repetition in repetitions:
         for concurrency, expected in POINTS:
             source = source_root / f"c{concurrency}-r{repetition}.jsonl"
             rows = list(read_jsonl(source))
@@ -3720,6 +3741,13 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--source", type=pathlib.Path, required=True)
     prepare.add_argument("--output", type=pathlib.Path, required=True)
     prepare.add_argument("--model-key", choices=tuple(MODEL_REVISIONS), required=True)
+    prepare.add_argument(
+        "--repetitions",
+        type=int,
+        nargs="+",
+        default=list(REPETITIONS),
+        help="repetition indices to slice (default: the three-rep online grid)",
+    )
 
     validate = commands.add_parser("validate-raw")
     validate.add_argument("path", type=pathlib.Path)
@@ -3901,6 +3929,7 @@ def main() -> int:
             args.source,
             args.output,
             model_key=args.model_key,
+            repetitions=tuple(args.repetitions),
         )
     elif args.command == "validate-raw":
         result = _load_json_object(args.path)

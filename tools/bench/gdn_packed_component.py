@@ -65,8 +65,30 @@ from tools.bench.serve_low_common import (
 MODEL_KEY = "27"
 ARMS = ("packed", "rollback")
 CONCURRENCIES = (2, 16)
-REPETITIONS = (1, 2, 3)
+# Five timed repetitions per (concurrency, arm) — raised from three under
+# CLAIM-GDN-BA-ROUNDING-1.  The 8-pair locked c16 A/B at 00bf484 measured a
+# paired packed-vs-rollback total-throughput mean of −0.205% (sd 0.30, <1σ from
+# zero) once the recurring COLD-FIRST-LEG outlier (p1 packed 760 vs 809+ tok/s)
+# was excluded; the multi-window trace attribution found packed is FASTER
+# on-GPU (steady kernel compute −1.30..−1.58%/step) and could not attribute any
+# packed-side cost.  Two more reps tighten the median/paired estimator, and the
+# discarded cold-start warmup pair below keeps the recurring cold draw off every
+# timed leg.
+REPETITIONS = (1, 2, 3, 4, 5)
 REQUESTS_PER_RUN = {2: 6, 16: 96}
+# One discarded cold-start warmup leg per arm, run FIRST before the timed series
+# and EXCLUDED from every axis / stability / pairing computation.  The recurring
+# cold draw (p1 packed 760 vs 809+ tok/s at 00bf484; the trace r1 LM-head
+# inflation; prior sealed roots' first-leg artifacts) then never lands on a
+# timed leg.  Recorded as diagnostic ``warmup/27/w0-{arm}.json`` artifacts whose
+# sole harness obligation is that they EXIST and are EXCLUDED.
+WARMUP_LABEL = "w0"
+# A single discarded cold-start warmup pair (one leg per arm) runs FIRST, before
+# the whole timed series, at the smallest concurrency.  The recurring cold draw
+# is a one-time whole-series first-leg phenomenon (p1 packed 760 vs 809+ tok/s at
+# 00bf484; the trace r1 LM-head inflation confined to the packed r1 batch), so a
+# single leading pair keeps it off every timed leg: 20 timed + 2 warmup = 22.
+WARMUP_CONCURRENCY = 2
 LEG_ORDER = (
     "packed-r1",
     "rollback-r1",
@@ -74,6 +96,10 @@ LEG_ORDER = (
     "packed-r2",
     "packed-r3",
     "rollback-r3",
+    "rollback-r4",
+    "packed-r4",
+    "packed-r5",
+    "rollback-r5",
 )
 HIGHER_AXES = (
     "request_throughput",
@@ -148,23 +174,25 @@ NON_TAIL_ACCEPTANCE_BAND = 0.005
 TAIL_ACCEPTANCE_BAND = 0.15
 # --- MAJORITY-CONSISTENCY paired gate (CLAIM-GDN-BA-ROUNDING-1) ---------------
 # A gated per-rep paired axis (per concurrency, per axis name) FAILS only when
-# ``>= PAIRED_GATE_BREACH_MAJORITY`` of its 3 rep-pairs breach the acceptance
-# band in the SAME direction (packed-worse).  A single rep-pair breach is
+# ``>= PAIRED_GATE_BREACH_MAJORITY`` of its 5 rep-pairs breach the acceptance
+# band in the SAME direction (packed-worse).  With five repetitions the breach
+# majority is 3-of-5: two rep-pairs breaching is still a minority (leg-level run
+# noise), three or more is a consistent direction.  A minority breach is
 # leg-level run noise: single-leg excursions of +/-0.5-1% are routine across the
 # sealed roots (run 4's whole rollback arm +0.8%, run 5's sign flip back), while
 # the harness's own per-run stability rule tolerates +/-4% per rep — so a gate
-# requiring EVERY one of the 132 single-pair trials inside the 0.5% non-tail band
-# is internally inconsistent with the accepted per-rep variation and gives
-# P(pass) ~ 0 even for identical engines (run 6 sealed complete-failed on exactly
-# this: 40/40 median axes + 8/8 memory PASS, stability PASS, correctness PASS,
-# failing ONLY 10/132 gated paired axes, all inside the single c2 r1 rep-pair at
-# ratios 0.9894-0.9916).  The normalized ratio is >=1-is-packed-better, so every
-# recorded breach is packed-worse by construction; single-pair breaches stay in
+# requiring EVERY single-pair trial inside the 0.5% non-tail band is internally
+# inconsistent with the accepted per-rep variation and gives P(pass) ~ 0 even for
+# identical engines (run 6 sealed complete-failed on exactly this: all median
+# axes + memory PASS, stability PASS, correctness PASS, failing ONLY the gated
+# paired axes inside a single c2 r1 rep-pair at ratios 0.9894-0.9916).  The
+# normalized ratio is >=1-is-packed-better, so every recorded breach is
+# packed-worse by construction; minority breaches stay in
 # ``paired_normalized_ratios`` / ``paired_axis_pass`` as diagnostics.  Consistent
-# regressions are still caught: run 4's c16 3/3 packed-worse pattern (packed
-# throughput [793.50, 793.28, 795.79] vs rollback [800.12, 798.30, 800.60])
-# breaches all three pairs in the same direction and still FAILS.
-PAIRED_GATE_BREACH_MAJORITY = 2
+# regressions are still caught: run 4's c16 all-pairs packed-worse pattern
+# (packed throughput [793.50, 793.28, 795.79] vs rollback [800.12, 798.30,
+# 800.60]) breaches every pair in the same direction and still FAILS.
+PAIRED_GATE_BREACH_MAJORITY = 3
 # Concurrency whose TTFT-family axes are pooled across the three repetitions
 # instead of gated/compared per repetition.  At c2 each repetition has only six
 # requests whose per-request TTFTs are BIMODAL by closed-loop arrival phasing (a
@@ -173,10 +201,10 @@ PAIRED_GATE_BREACH_MAJORITY = 2
 # divergence (``.agents/specs/scheduler-prefill-coschedule.md``).  Leg mixes flip
 # 3/3 vs 6/0, so the per-rep TTFT aggregates (mean/median AND p90/p99) swing
 # 4-24% while every throughput/TPOT/ITL/memory axis stays stable <=1.13% (and c2
-# E2EL <=0.30%, measured across the three sealed roots).  Pooling the 18
-# per-request samples per arm is the convergent estimator of that phase mixture
-# and is symmetric across arms; c16 (96 samples/rep) is unaffected and keeps the
-# per-run rules.
+# E2EL <=0.30%, measured across the three sealed roots).  Pooling the 30
+# per-request samples per arm (5 reps x 6 requests) is the convergent estimator
+# of that phase mixture and is symmetric across arms; c16 (96 samples/rep) is
+# unaffected and keeps the per-run rules.
 POOLED_CONCURRENCY = 2
 # Generous per-rep sanity bound for the pooled c2 TTFT-family axes: every rep
 # aggregate must lie within 50% of the arm's pooled value.  The bimodal gap is
@@ -263,7 +291,7 @@ def _require_source_sha(value: str) -> None:
 
 
 def build_component_plan(vllm_cpp_sha: str) -> dict[str, Any]:
-    """Return the immutable twelve-leg G3 execution plan."""
+    """Return the immutable twenty-leg G3 execution plan (plus warmup discard)."""
 
     _require_source_sha(vllm_cpp_sha)
     legs = []
@@ -278,6 +306,15 @@ def build_component_plan(vllm_cpp_sha: str) -> dict[str, Any]:
                     "requests": REQUESTS_PER_RUN[concurrency],
                 }
             )
+    warmup_legs = [
+        {
+            "arm": arm,
+            "label": WARMUP_LABEL,
+            "requests": REQUESTS_PER_RUN[WARMUP_CONCURRENCY],
+            "discarded": True,
+        }
+        for arm in ARMS
+    ]
     return {
         "arms": {
             "packed": {"VT_GDN_PACKED_DECODE": "1"},
@@ -296,8 +333,18 @@ def build_component_plan(vllm_cpp_sha: str) -> dict[str, Any]:
             str(concurrency): requests
             for concurrency, requests in REQUESTS_PER_RUN.items()
         },
-        "schema_version": 1,
+        "schema_version": 2,
         "vllm_cpp_sha": vllm_cpp_sha,
+        # A single discarded cold-start warmup pair (one leg per arm) runs first,
+        # before the timed series, and is excluded from every axis / stability /
+        # pairing computation.
+        "warmup": {
+            "label": WARMUP_LABEL,
+            "discarded": True,
+            "excluded_from_axes": True,
+            "concurrency": WARMUP_CONCURRENCY,
+            "legs": warmup_legs,
+        },
     }
 
 
@@ -437,7 +484,9 @@ def _exact_keys() -> set[tuple[int, str, int]]:
 
 def _distribution(values: list[float], *, label: str) -> dict[str, float]:
     if len(values) != len(REPETITIONS):
-        raise HarnessError(f"component {label} does not have three repetitions")
+        raise HarnessError(
+            f"component {label} does not have {len(REPETITIONS)} repetitions"
+        )
     median = statistics.median(values)
     if median == 0.0:
         maximum_relative_deviation = (
@@ -509,7 +558,7 @@ def _pooled_ttft_distribution(samples: list[float]) -> dict[str, float]:
     This is the convergent estimator of the arrival-phase mixture: with the same
     number of requests per repetition, the pooled mean equals the mean of the
     per-rep means, but the pooled median/p90/p99 are computed over the full
-    18-sample arm distribution rather than as a median of three per-rep order
+    30-sample arm distribution rather than as a median of five per-rep order
     statistics that each flip with the co-schedule lottery.
     """
 
@@ -569,9 +618,9 @@ def summarize_component_records(
 
     expected = _exact_keys()
     if set(records) != expected:
-        raise HarnessError("timing records do not contain the exact twelve legs")
+        raise HarnessError("timing records do not contain the exact twenty legs")
     if set(memory_records) != expected:
-        raise HarnessError("memory records do not contain the exact twelve legs")
+        raise HarnessError("memory records do not contain the exact twenty legs")
 
     result: dict[str, Any] = {
         "by_concurrency": {},
@@ -628,11 +677,11 @@ def summarize_component_records(
                 ),
             },
             # G3 gates the per-rep paired axes on MAJORITY consistency: a paired
-            # axis fails only when a majority of its three rep-pairs breach the
-            # band in the same (packed-worse) direction.  A single-pair breach is
+            # axis fails only when a majority (>= 3 of the five rep-pairs) breach
+            # the band in the same (packed-worse) direction.  A minority breach is
             # leg-level noise (recorded as a diagnostic), so identical engines are
-            # not failed by the 132 single-pair trials each exposed to per-rep
-            # noise far above the 0.5% band.
+            # not failed by the single-pair trials each exposed to per-rep noise
+            # far above the 0.5% band.
             "paired_gate": {
                 "rule": "majority-consistency",
                 "repetitions": len(REPETITIONS),
@@ -641,15 +690,35 @@ def summarize_component_records(
                     "a gated per-rep paired axis fails only when >= "
                     f"{PAIRED_GATE_BREACH_MAJORITY} of its {len(REPETITIONS)} "
                     "rep-pairs breach the acceptance band in the same "
-                    "(packed-worse) direction.  A single rep-pair breach is "
-                    "leg-level run noise (routine +/-0.5-1% single-leg "
-                    "excursions; the per-run stability rule itself tolerates "
-                    "+/-4% per rep), so requiring every rep-pair inside the band "
-                    "gives P(pass) ~ 0 even for identical engines (run 6's "
-                    "c2-r1-only excursion).  Single-pair breaches are recorded "
-                    "as diagnostics in paired_normalized_ratios / "
-                    "paired_axis_pass; a consistent >=2/3 packed-worse pattern "
-                    "(run 4's c16 3/3) still FAILS."
+                    "(packed-worse) direction (3-of-5 is a majority; 2-of-5 is "
+                    "not).  A minority rep-pair breach is leg-level run noise "
+                    "(routine +/-0.5-1% single-leg excursions; the per-run "
+                    "stability rule itself tolerates +/-4% per rep), so requiring "
+                    "every rep-pair inside the band gives P(pass) ~ 0 even for "
+                    "identical engines (run 6's c2-r1-only excursion).  Minority "
+                    "breaches are recorded as diagnostics in "
+                    "paired_normalized_ratios / paired_axis_pass; a consistent "
+                    ">=3/5 packed-worse pattern (run 4's c16 all-pairs) still "
+                    "FAILS."
+                ),
+            },
+            # A single discarded cold-start warmup pair (one leg per arm), run
+            # first before the timed series and excluded from every axis /
+            # stability / pairing computation.
+            "cold_discard": {
+                "label": WARMUP_LABEL,
+                "discarded": True,
+                "excluded_from_axes": True,
+                "warmup_legs": len(ARMS),
+                "grounding": (
+                    "the recurring cold-first-leg draw (p1 packed 760 vs 809+ "
+                    "tok/s at 00bf484; the trace r1 LM-head inflation confined to "
+                    "the packed r1 batch) is a one-time whole-series phenomenon, "
+                    "so it is kept off every timed leg by discarding one warmup "
+                    "leg per arm before the five timed repetitions; the discards "
+                    "are recorded as diagnostic warmup/27/w0-{arm}.json artifacts "
+                    "and excluded from every axis, stability and pairing "
+                    "computation."
                 ),
             },
         },
@@ -1124,7 +1193,9 @@ def _validate_component_corpus(
         "target_input_len": INPUT_LEN,
         "tokenizer_revision": MODEL_REVISIONS[MODEL_KEY],
         "tokenizer_sha256": sha256_file(execution["_resolved_artifacts"]["tokenizer"]),
-        "total_prompts": 3457,
+        # 192 requests per (concurrency, repetition) partition over every POINTS
+        # concurrency and REPETITIONS, plus the single shared warmup partition.
+        "total_prompts": 192 * len(POINTS) * len(REPETITIONS) + 1,
         "warmup_requests": 1,
     }
     if set(source) != expected_source_keys or any(
@@ -1847,8 +1918,14 @@ def _validate_model_gates(
     return result
 
 
+_REP_MARKER = "|".join(str(repetition) for repetition in REPETITIONS)
 _LEG_MARKER_RE = re.compile(
-    r"^leg_(begin|end) concurrency=(2|16) arm=(packed|rollback) repetition=([123])$"
+    r"^leg_(begin|end) concurrency=(2|16) arm=(packed|rollback) "
+    rf"repetition=({_REP_MARKER})$"
+)
+_WARMUP_MARKER_RE = re.compile(
+    r"^warmup_leg_(begin|end) arm=(packed|rollback) "
+    rf"label={re.escape(WARMUP_LABEL)}$"
 )
 
 
@@ -1884,12 +1961,33 @@ def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
             )
     if markers != expected:
         raise HarnessError("component legs do not follow the exact AB/BA/AB order")
+    # The single discarded cold-start warmup pair (one leg per arm) must be
+    # recorded first, before ANY timed leg, and is never part of the AB/BA/AB
+    # timed sequence (it does not match _LEG_MARKER_RE).
+    warmup_markers = [
+        match.groups() for line in lines if (match := _WARMUP_MARKER_RE.fullmatch(line))
+    ]
+    expected_warmup = []
+    for arm in ARMS:
+        expected_warmup.extend([("begin", arm), ("end", arm)])
+    if warmup_markers != expected_warmup:
+        raise HarnessError(
+            "component warmup discard legs do not follow the exact per-arm order"
+        )
     acquisition = lines.index("gpu_lock_acquired path=/tmp/gpu")
     corpus_validated = lines.index("corpus_validated")
     release = lines.index("gpu_lock_released path=/tmp/gpu")
     first_marker = lines.index(
         f"leg_begin concurrency={CONCURRENCIES[0]} arm=packed repetition=1"
     )
+    first_warmup = lines.index(
+        f"warmup_leg_begin arm=packed label={WARMUP_LABEL}"
+    )
+    if not acquisition < first_warmup < first_marker < release:
+        raise HarnessError(
+            "component warmup discard pair is not inside the lock before the "
+            "first timed leg"
+        )
     terminus = lines.index("gpu_series_complete")
     packed_gate = lines.index("model_gate_complete arm=packed")
     rollback_gate = lines.index("model_gate_complete arm=rollback")
@@ -2296,6 +2394,52 @@ def _reject_diagnostic_evidence(evidence: pathlib.Path) -> None:
         )
 
 
+def _validate_warmup_discard(evidence: pathlib.Path) -> dict[str, Any]:
+    """Verify the discarded cold-start warmup legs EXIST and are EXCLUDED.
+
+    A single warmup pair (one leg per arm) is recorded as a diagnostic
+    ``warmup/27/w0-{arm}.json`` and must be excluded from every timed axis.
+    Fail closed if a warmup leg is missing/malformed, and reject any ``w0``/``r0``
+    contamination of the timed ``raw/27/ours`` directory (which must hold EXACTLY
+    the timed leg outputs) so a discarded leg can never leak into an axis.
+    """
+
+    legs: dict[str, Any] = {}
+    for arm in ARMS:
+        path = evidence / "warmup" / MODEL_KEY / f"w0-{arm}.json"
+        if not path.is_file() or path.is_symlink():
+            raise HarnessError(f"component warmup discard leg is absent: {path}")
+        record = _load_json(path)
+        if record.get("discarded") is not True:
+            raise HarnessError(
+                f"component warmup discard leg is not discarded: {path}"
+            )
+        if record.get("label") != WARMUP_LABEL or record.get("arm") != arm:
+            raise HarnessError(
+                f"component warmup discard leg is malformed: {path}"
+            )
+        legs[arm] = {"path": str(path), "sha256": sha256_file(path)}
+    raw_dir = evidence / "raw" / MODEL_KEY / "ours"
+    if not raw_dir.is_dir():
+        raise HarnessError("component timed raw directory is absent")
+    expected_raw = {
+        f"c{concurrency}-r{repetition}-gdn-{arm}.json"
+        for concurrency, arm, repetition in _exact_keys()
+    }
+    actual_raw = {item.name for item in raw_dir.iterdir() if item.is_file()}
+    if actual_raw != expected_raw:
+        raise HarnessError(
+            "component timed raw directory holds a discarded warmup (w0/r0) leg or "
+            "is missing a timed leg — warmup legs must stay excluded from the axes"
+        )
+    return {
+        "label": WARMUP_LABEL,
+        "excluded_from_axes": True,
+        "leg_count": len(legs),
+        "legs": legs,
+    }
+
+
 def summarize_evidence(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, Any]:
     """Load an on-disk component root and return its validated summary."""
 
@@ -2309,6 +2453,7 @@ def summarize_evidence(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, A
     corpus = _validate_component_corpus(evidence, execution)
     model_gates = _validate_model_gates(evidence, vllm_cpp_sha, execution)
     run_order = _validate_run_order(evidence)
+    warmup_discard = _validate_warmup_discard(evidence)
     records = {}
     memory_records = {}
     plan_records = {}
@@ -2379,6 +2524,8 @@ def summarize_evidence(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, A
     summary["correctness_pass"] = True
     summary["corpus"] = corpus
     summary["model_gates"] = model_gates
+    summary["warmup_discard"] = warmup_discard
+    summary["warmup_discard_pass"] = warmup_discard["leg_count"] == len(ARMS)
     summary["one_lock_order_pass"] = True
     summary["thermal_leg_count"] = len(thermal_records)
     summary["thermal_pass"] = len(thermal_records) == len(_exact_keys())

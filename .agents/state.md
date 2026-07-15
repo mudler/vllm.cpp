@@ -10422,3 +10422,108 @@ Process note: gates, record checkers, commit, and the post-commit
 `check-doc-checkpoint.py` are each run as separate steps with exit status
 verified individually; no `git commit`/`push` is chained after a doc-editing
 script.
+
+## 2026-07-15 — c16 A/B + algo-determinism + trace verdicts; component harness reps 5 + cold discard (`CLAIM-GDN-BA-ROUNDING-1`, worktree `.claude/worktrees/agent-a933d61d5cf4cc921`)
+
+**Evidence from the 00bf484 checkpoint (orchestrator-run, this record).**
+
+1. **8-pair locked c16 A/B at `00bf484`** (root
+   `dgx:~/work/vllm.cpp-gdn-algo-ab/00bf484fadf56a58ecc952f5af1f4a35920e32fb`):
+   paired packed-vs-rollback total-throughput deltas per pair −6.063% (p1, a
+   COLD outlier — the packed leg is first in the series at 760.21 tok/s vs its
+   own 809–814 in later legs), −0.096, −0.381, +0.151, +0.123, −0.111, −0.558,
+   −0.562 → excluding the cold p1: **mean −0.205%, sd 0.30 (<1σ from zero)**.
+2. **cuBLASLt algo determinism PROVEN** via the new `VT_GEMM_ALGO_LOG`: every
+   GEMM shape latches the identical algoId/tile/stages/splitK across all 16 legs;
+   the BA decode shapes (m=1..16, n=96, k=5120) select identical configs for
+   c=bf16 vs c=f32. **The per-process algo-lottery hypothesis is REFUTED.**
+3. **Multi-window trace attribution** (24 sqlite windows, 12/arm, from the
+   accepted `7ff713e` structural root): packed is FASTER on-GPU — steady kernel
+   compute excluding LM-head **−1.30 to −1.58%/step**; GDN+BA block −296 µs/window
+   (packed {recurrence 2566 + folded-BA} vs rollback {fused 2396 + postconv 280
+   + separate F32-BA 2126}); node count −48; GPU gap tighter (−12.9 vs +19.0 µs);
+   memcpy/memset identical; graph-launch host equal/lower; the LM-head GEMM is
+   EQUAL warm-to-warm (+0.29%) — the earlier 14.7-vs-11.3 ms anomaly was a
+   cold-capture artifact confined to the packed r1 batch. **The traces cannot
+   attribute any packed-side cost; the residual wall tax is cold-draw/tail bias
+   and/or below resolution — packed's GPU forward is the cheaper one.**
+4. Methodology lesson: `nsys` must be INSIDE `/usr/bin/env -i` (`VARS… nsys
+   profile …`) or the injection is stripped (the A/B's own captures were empty;
+   the `7ff713e` root used the correct pattern).
+5. The recurring COLD-FIRST-LEG effect (p1 packed 760 vs 809+; the trace r1
+   LM-head inflation; prior sealed roots' first-leg artifacts) is the grounding
+   for the harness change below.
+
+**VERDICT:** packed is confirmed GPU-cheaper and the mirror-correct default; the
+sub-1σ wall residual is cold-draw/tail bias, not a stable regression.
+
+**Harness precision upgrade (test-first, `tools/bench/gdn_packed_component.py` +
+`scripts/dgx-gdn-packed-component.sh` + `tests/tools/test_gdn_packed_component.py`,
+with a small backward-compatible relaxation in `tools/bench/online_gate.py`).**
+Per the attribution recommendation (option b):
+- **Repetitions 3→5** per (concurrency, arm): the frozen leg plan is now
+  2 conc × 2 arms × 5 reps = **20 timed legs**, order alternating AB/BA/AB/BA/AB
+  per concurrency (`LEG_ORDER` = packed-r1, rollback-r1, rollback-r2, packed-r2,
+  packed-r3, rollback-r3, rollback-r4, packed-r4, packed-r5, rollback-r5;
+  `schema_version` bumped 1→2). Medians/stability/paired rules extend naturally;
+  the **majority-consistency paired rule becomes 3-of-5** (`PAIRED_GATE_BREACH_MAJORITY=3`;
+  2-of-5 same-direction passes, 3-of-5 fails); the pooled c2 TTFT-family now pools
+  **30 per-request samples** (5 reps × 6 requests); mode bands and acceptance
+  bands are UNCHANGED.
+- **Cold-discard warmup pair**: a single discarded warmup pair (one leg per arm,
+  `w0-packed`/`w0-rollback`) runs FIRST before the whole timed series at the
+  smallest concurrency, recorded as diagnostic `warmup/27/w0-{arm}.json`
+  artifacts and EXCLUDED from every axis/stability/pairing. Total fresh-server
+  legs = **22** (20 timed + 2 warmup). Fail-closed: `_validate_warmup_discard`
+  verifies both w0 legs EXIST, are `discarded:true`, and are EXCLUDED (the timed
+  `raw/27/ours` directory must hold EXACTLY the 20 timed outputs — a leaked
+  `w0`/`r0` file is rejected); `_validate_run_order` requires the two
+  `warmup_leg_begin/end arm=… label=w0` markers inside the lock, before the first
+  timed leg, and never inside the AB/BA/AB timed sequence. `contract.cold_discard`
+  records it.
+- `online_gate.py`: `OnlineRun` repetition bound relaxed to accept 1..5
+  (`MAX_ONLINE_REPETITION=5`; the online-serving grid still emits only reps 1–3,
+  so its behavior is unchanged); `prepare_corpus_views` gains an optional
+  `repetitions` argument (default = the three-rep grid, resolved at CALL time so
+  tests may still patch `REPETITIONS`) and a `prepare-corpus --repetitions` CLI,
+  and the driver passes `--repetitions 1 2 3 4 5`.
+
+**RED→GREEN.** RED captured against the pre-change source: (a) reverting
+`LEG_ORDER` to three reps → `test_plan_is_exact_ab_ba_ab_at_c2_and_c16` fails
+(legs 12≠20); (b) dropping the `_validate_warmup_discard` call →
+`test_warmup_leg_leaked_into_timed_axes_is_rejected` fails; (c)
+`PAIRED_GATE_BREACH_MAJORITY=2` → `test_minority_2of5_breach_passes` fails; (d)
+inherent to `REPETITIONS=(1..5)`. Changed tests (honest): the plan test now
+asserts 20 legs + the w0 pair; `test_majority_2of3_breach_fails` split into
+`test_majority_3of5_breach_fails` + new `test_minority_2of5_breach_passes`;
+`test_run4_consistent_3of3_breach_still_fails` → `…_all_pairs_…` (5/5);
+every per-rep fixture extended to five reps and the c2 pooled fixtures to 30
+samples; new `test_legacy_twelve_leg_plan_without_warmup_is_rejected`,
+`test_missing_warmup_discard_leg_fails_closed`, `test_non_discarded_warmup_leg_is_rejected`,
+`test_warmup_leg_leaked_into_timed_axes_is_rejected`,
+`test_warmup_markers_must_precede_first_timed_leg`,
+`test_driver_runs_warmup_pair_before_five_rep_timed_legs`,
+`test_driver_prepares_five_rep_corpus`.
+
+**Gates.** Focused `test_gdn_packed_component` **79/79**; full tools suite
+**162/162** (154 baseline + 8 new, zero regressions); `py_compile` on both
+Python files; `bash -n` + `shellcheck` on the driver; `check-agent-record.py`,
+`tests/scripts/test_agent_record.py`, `tests/scripts/test_doc_checkpoint.py`
+green; post-commit `check-doc-checkpoint.py` verified as a separate step. No GPU.
+
+**Corpus follow-up for the orchestrator (blocking the eighth run).** The five-rep
+component needs a five-rep corpus. Before executing from the pushed SHA the
+orchestrator must (1) regenerate the source exact-token corpus with five reps
+(`make_serve_low_corpus --repetitions 5`, CPU-only), (2) `online_gate.py
+prepare-corpus --repetitions 1 2 3 4 5`, and (3) refresh the two committed
+`COMPONENT_SOURCE_CORPUS_MANIFEST_SHA256` / `COMPONENT_VLLM_CORPUS_MANIFEST_SHA256`
+constants (currently the three-rep values) to the new manifest sha256s. The
+harness computes every rep-derived count (`total_prompts = 192·|POINTS|·|REPETITIONS|+1`,
+partition inventories) from `REPETITIONS`, so only those two sha256 constants are
+manual. Binding stays **55/124**, `benchmark_binding=false`, no speed credit.
+The eighth component is run by the orchestrator from this pushed SHA.
+
+Process note: gates, record checkers, commit, and the post-commit
+`check-doc-checkpoint.py` are each run as separate steps with exit status
+verified individually; no `git commit`/`push` is chained after a doc-editing
+script.

@@ -106,11 +106,26 @@ repetitions:3,breach_majority:2}`; bands unchanged). Verified against sealed
 history: run 6's c2-r1-only excursion → PASSES; run 4's c16 3/3 packed-worse
 ([793.50,793.28,795.79] vs [800.12,798.30,800.60]) → still FAILS. RED
 run-6-single-pair→accepted / run-4-3/3→fails before AND after / 2-of-3→fails /
-alternating(one +2%,one −2%)→passes (focused **71/71**, tools **154/154**). Next:
-the orchestrator runs the **seventh** full **40+8** component (under the
-majority-consistency gate) from the pushed SHA; the `c172336`, `d82d282`,
-`d19e091`, `2dbe892`, `da05444` and diagnostic roots stay untouched. qkvz stays
-excluded.
+alternating(one +2%,one −2%)→passes (focused **71/71**, tools **154/154**). The
+**seventh** seal then `complete-failed` (32/40, all-c16), isolating a constant
+~0.2% packed steady per-token tax; the env-gated `VT_GEMM_ALGO_LOG` instrument
+(`00bf484`) and an **8-pair locked c16 A/B + multi-window trace** then returned
+the decisive verdict — **packed is GPU-cheaper**: the c16 total-throughput paired
+mean is **−0.205% (sd 0.30, <1σ)** once the cold-first-leg outlier is excluded,
+cuBLASLt algo selection is process-deterministic (the algo-lottery hypothesis is
+REFUTED), and the trace attributes NO packed-side cost (kernel compute
+−1.30..−1.58%/step, GDN+BA −296 µs/window) — the sub-1σ wall residual is
+cold-draw/tail bias. So **this checkpoint** lands the FINAL harness precision
+upgrade test-first: **5 timed reps** (20 legs AB/BA/AB/BA/AB, `schema_version` 2),
+a **3-of-5 majority-consistency** paired gate, a **30-sample** pooled c2 TTFT, and
+a single discarded **cold-start warmup pair** (`w0-{packed,rollback}`, run first,
+excluded from every axis with fail-closed existence+exclusion checks). RED
+3-rep-plan→12≠20 / drop-warmup→leak-accepted / majority-2→2-of-5-fails (focused
+**79/79**, tools **162/162**). Next: the orchestrator runs the **eighth** full
+component from this pushed SHA (after regenerating a 5-rep corpus + refreshing the
+two corpus-manifest sha256 constants), then the packed-default decision; the
+`c172336`, `d82d282`, `d19e091`, `2dbe892`, `da05444`, `00bf484` and diagnostic
+roots stay untouched. qkvz stays excluded.
 Host PSS/RSS separately retains a **22.920 GiB** CPU weight mirror plus
 source mmap residency.
 

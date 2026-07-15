@@ -22,6 +22,8 @@ from tools.bench.gdn_packed_component import (
     ARMS,
     CONCURRENCIES,
     LEG_ORDER,
+    REPETITIONS,
+    WARMUP_LABEL,
     build_component_plan,
     finalize_evidence,
     summarize_component_records,
@@ -245,40 +247,36 @@ def _apply_c2_ttft_modes(record: dict, ttfts_ms: list[float]) -> None:
 
 
 # Mode split at 675 ms: fast (prefill-immediate) ~600 ms, slow (prefill-queued)
-# ~700 ms; both straddle the fixed threshold.
-# (a) run-5-shaped mixture flip: IDENTICAL per-mode values, but packed pools to
-#     8 fast/10 slow while rollback pools to 13 fast/5 slow.  The pooled mean/
-#     median flip below the retired 0.5% band (the fifth-seal 38/40 signature),
-#     yet the per-mode ratios are exactly 1.0.
+# ~700 ms; both straddle the fixed threshold.  Fixtures span the FIVE timed reps
+# (30 pooled c2 TTFT samples per arm) under CLAIM-GDN-BA-ROUNDING-1.
+# (a) mixture flip: IDENTICAL per-mode values, but packed pools to 10 fast/20 slow
+#     while rollback pools to 25 fast/5 slow.  The pooled mean/median flip below
+#     the retired 0.5% band, yet the per-mode ratios are exactly 1.0.
 _C2_MODE_FLIP_PACKED = {
-    1: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0],   # 3 fast / 3 slow
-    2: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0],   # 3 fast / 3 slow
-    3: [600.0, 600.0, 700.0, 700.0, 700.0, 700.0],   # 2 fast / 4 slow  -> 8/10
+    rep: [600.0, 600.0, 700.0, 700.0, 700.0, 700.0] for rep in REPETITIONS  # 2 fast/4 slow -> 10/20
 }
 _C2_MODE_FLIP_ROLLBACK = {
-    1: [600.0, 600.0, 600.0, 600.0, 600.0, 700.0],   # 5 fast / 1 slow
-    2: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # 4 fast / 2 slow
-    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # 4 fast / 2 slow  -> 13/5
+    rep: [600.0, 600.0, 600.0, 600.0, 600.0, 700.0] for rep in REPETITIONS  # 5 fast/1 slow -> 25/5
 }
 # (b) genuine slow-mode regression: fast modes equal, packed slow-mode mean 5%
-#     worse (735 vs 700).  Counts equal (9 fast / 9 slow both arms).
-_C2_MODE_SLOW_REGRESS_PACKED = {rep: [600.0, 600.0, 600.0, 735.0, 735.0, 735.0] for rep in (1, 2, 3)}
-_C2_MODE_SLOW_REGRESS_ROLLBACK = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in (1, 2, 3)}
-# (d) lottery extreme: packed draws only 2 slow samples (16 fast); rollback keeps
-#     6 slow.  The slow-mode comparison is SKIPPED, never failed.
+#     worse (735 vs 700).  Counts equal (15 fast / 15 slow both arms).
+_C2_MODE_SLOW_REGRESS_PACKED = {rep: [600.0, 600.0, 600.0, 735.0, 735.0, 735.0] for rep in REPETITIONS}
+_C2_MODE_SLOW_REGRESS_ROLLBACK = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in REPETITIONS}
+# (d) lottery extreme: packed draws only 2 slow samples (28 fast); rollback keeps
+#     10 slow.  The slow-mode comparison is SKIPPED, never failed.
 _C2_MODE_LOTTERY_PACKED = {
     1: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
     2: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
-    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # -> 16 fast / 2 slow
+    3: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
+    4: [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
+    5: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # -> 28 fast / 2 slow
 }
 _C2_MODE_LOTTERY_ROLLBACK = {
-    1: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],
-    2: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],
-    3: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0],   # -> 12 fast / 6 slow
+    rep: [600.0, 600.0, 600.0, 600.0, 700.0, 700.0] for rep in REPETITIONS  # -> 20 fast / 10 slow
 }
 # Both arms at parity per mode (used to prove the full 40-axis gate: both modes
 # gated + c16 packed-better).
-_C2_MODE_PARITY = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in (1, 2, 3)}
+_C2_MODE_PARITY = {rep: [600.0, 600.0, 600.0, 700.0, 700.0, 700.0] for rep in REPETITIONS}
 
 
 # --- c2 TTFT phase-lottery fixtures (ms) -------------------------------------
@@ -292,33 +290,44 @@ _C2_TTFT_BIMODAL_PACKED = {
     1: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
     2: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
     3: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],  # 6/0 slow,  mean 10.0
+    4: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
+    5: [5.0, 5.0, 5.0, 10.0, 10.0, 10.0],     # 3/3 mix,   mean 7.5
 }
 _C2_TTFT_BIMODAL_ROLLBACK = {
     1: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
     2: [22.0, 22.0, 22.0, 22.0, 22.0, 22.0],  # 6/0 slow,  mean 22.0
     3: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
+    4: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
+    5: [11.0, 11.0, 11.0, 22.0, 22.0, 22.0],  # 3/3 mix,   mean 16.5
 }
 # A per-rep flip: rollback r1 dips below packed r1 (arrival phasing).  Both arms
-# pool to the SAME 18-sample TTFT distribution (9x10 + 9x20 ms — the honest
+# pool to the SAME 30-sample TTFT distribution (15x10 + 15x20 ms — the honest
 # at-parity expectation, since packed decode does not move TTFT), so the pooled
 # arm comparison ties (packed <= rollback holds) while the per-rep mixture flips.
-# All rep aggregates stay within 50% of the shared pool (no all-fast reps, so no
-# axis rides the 50% boundary).
+# All rep aggregates stay within 50% of the shared pool.
 _C2_TTFT_FLIP_PACKED = {
-    1: [10.0, 20.0, 20.0, 20.0, 20.0, 20.0],  # 1 fast/5 slow, mean 18.33
+    1: [10.0, 20.0, 20.0, 20.0, 20.0, 20.0],  # 1 fast/5 slow, mean 18.33 (> rollback r1)
     2: [10.0, 10.0, 10.0, 10.0, 20.0, 20.0],  # 4 fast/2 slow, mean 13.33
     3: [10.0, 10.0, 10.0, 10.0, 20.0, 20.0],  # 4 fast/2 slow, mean 13.33
+    4: [10.0, 10.0, 10.0, 20.0, 20.0, 20.0],  # 3 fast/3 slow, mean 15.0
+    5: [10.0, 10.0, 10.0, 20.0, 20.0, 20.0],  # 3 fast/3 slow, mean 15.0  -> 15/15
 }
 _C2_TTFT_FLIP_ROLLBACK = {
     1: [10.0, 10.0, 10.0, 10.0, 10.0, 20.0],  # 5 fast/1 slow, mean 11.67 (< packed r1)
     2: [10.0, 10.0, 20.0, 20.0, 20.0, 20.0],  # 2 fast/4 slow, mean 16.67
     3: [10.0, 10.0, 20.0, 20.0, 20.0, 20.0],  # 2 fast/4 slow, mean 16.67
+    4: [10.0, 10.0, 10.0, 20.0, 20.0, 20.0],  # 3 fast/3 slow, mean 15.0
+    5: [10.0, 10.0, 10.0, 20.0, 20.0, 20.0],  # 3 fast/3 slow, mean 15.0  -> 15/15
 }
 # c16 TTFT tail fixtures (96 requests): 94 at 20 ms fix mean/median/p90; the two
 # tail requests set p99 = ~0.95*low + 0.05*high.  These prove the 15% tail rule
-# still governs c16 TTFT tails (c16 is NEVER pooled).
-_C16_TTFT_TAIL_WITHIN_15PCT = {1: (58.0, 88.0), 2: (52.0, 82.0), 3: (50.0, 80.0)}
-_C16_TTFT_TAIL_BEYOND_15PCT = {1: (62.0, 92.0), 2: (52.0, 82.0), 3: (50.0, 80.0)}
+# still governs c16 TTFT tails (c16 is NEVER pooled).  Five reps.
+_C16_TTFT_TAIL_WITHIN_15PCT = {
+    1: (58.0, 88.0), 2: (52.0, 82.0), 3: (50.0, 80.0), 4: (51.0, 81.0), 5: (53.0, 83.0),
+}
+_C16_TTFT_TAIL_BEYOND_15PCT = {
+    1: (62.0, 92.0), 2: (52.0, 82.0), 3: (50.0, 80.0), 4: (50.0, 80.0), 5: (52.0, 82.0),
+}
 
 
 def _c16_tail_ttft(low: float, high: float) -> list[float]:
@@ -341,7 +350,7 @@ def _uniform_records(*, deficit: float) -> dict[tuple[int, str, int], dict]:
     """Records where packed is uniformly ``deficit`` worse than rollback.
 
     Every timing axis is uniform per request (mean=median=p90=p99), identical
-    across the three repetitions, so each axis is perfectly stable and the
+    across the repetitions, so each axis is perfectly stable and the
     packed/rollback normalized ratio is exactly ``1 - deficit`` on every axis
     (throughput, request rate, and every mean/median/p90/p99 latency).
     """
@@ -353,7 +362,7 @@ def _uniform_records(*, deficit: float) -> dict[tuple[int, str, int], dict]:
         for arm in ARMS:
             duration = 10.0 * (worse if arm == "packed" else 1.0)
             latency = 8.0 * (worse if arm == "packed" else 1.0)
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 record = _record(
                     concurrency=concurrency,
                     packed_better=True,
@@ -376,7 +385,7 @@ def _uniform_memory(*, deficit: float) -> dict[tuple[int, str, int], dict]:
     for concurrency in CONCURRENCIES:
         for arm in ARMS:
             base = 100.0 * (worse if arm == "packed" else 1.0)
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 result[(concurrency, arm, repetition)] = {
                     "peak_gpu_memory_mib": base,
                     "peak_pss_kib": base * 1024,
@@ -391,7 +400,7 @@ def _records(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
     result = {}
     for concurrency in CONCURRENCIES:
         for arm in ARMS:
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 result[(concurrency, arm, repetition)] = _record(
                     concurrency=concurrency,
                     packed_better=(arm == "packed") == packed_better,
@@ -404,7 +413,7 @@ def _memory(*, packed_better: bool) -> dict[tuple[int, str, int], dict]:
     result = {}
     for concurrency in CONCURRENCIES:
         for arm in ARMS:
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 preferred = (arm == "packed") == packed_better
                 base = 100.0 if preferred else 120.0
                 result[(concurrency, arm, repetition)] = {
@@ -444,7 +453,7 @@ def _prime_c16_paired(records: dict) -> None:
     """
 
     for arm in ARMS:
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _set_timing_leg(records[(16, arm, repetition)], duration=10.0, latency_ms=8.0)
 
 
@@ -454,7 +463,7 @@ def _write_fixture_corpus(root: pathlib.Path, *, tokenizer: pathlib.Path) -> Non
     source_files = []
     source_partitions = [("warmup", 1)] + [
         (f"c{concurrency}-r{repetition}", 192)
-        for repetition in (1, 2, 3)
+        for repetition in REPETITIONS
         for concurrency, _ in POINTS
     ]
     for partition, requests in source_partitions:
@@ -490,7 +499,7 @@ def _write_fixture_corpus(root: pathlib.Path, *, tokenizer: pathlib.Path) -> Non
                 "target_input_len": 1024,
                 "tokenizer_revision": MODEL_REVISIONS["27"],
                 "tokenizer_sha256": sha256_file(tokenizer),
-                "total_prompts": 3457,
+                "total_prompts": 192 * len(POINTS) * len(gdn_component.REPETITIONS) + 1,
                 "warmup_requests": 1,
             }
         ),
@@ -501,7 +510,7 @@ def _write_fixture_corpus(root: pathlib.Path, *, tokenizer: pathlib.Path) -> Non
     vllm_root.mkdir()
     vllm_files = []
     source_by_name = {item["file"]: item for item in source_files}
-    for repetition in (1, 2, 3):
+    for repetition in REPETITIONS:
         for concurrency, requests in POINTS:
             filename = f"c{concurrency}-r{repetition}.jsonl"
             path = vllm_root / filename
@@ -533,7 +542,8 @@ def _write_fixture_corpus(root: pathlib.Path, *, tokenizer: pathlib.Path) -> Non
                 "output_len": 128,
                 "source_manifest_sha256": sha256_file(source_manifest),
                 "tokenizer_revision": MODEL_REVISIONS["27"],
-                "total_prompts": sum(requests for _, requests in POINTS) * 3,
+                "total_prompts": sum(requests for _, requests in POINTS)
+                * len(gdn_component.REPETITIONS),
                 "vllm_commit": VLLM_COMMIT,
             }
         ),
@@ -820,6 +830,30 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
     for arm in ARMS:
         run_lines.append(f"model_gate_complete arm={arm}")
     run_lines.append("model_gates_validated")
+    # One discarded cold-start warmup pair, run first before the timed series.
+    warmup_base = root / "warmup" / "27"
+    warmup_base.mkdir(parents=True, exist_ok=True)
+    for arm in ARMS:
+        (warmup_base / f"{arm}-logs").mkdir(parents=True, exist_ok=True)
+        server_log = warmup_base / f"{arm}-logs" / "server.log"
+        server_log.write_text("HTTP worker pool 36 fixed\n", encoding="utf-8")
+        run_lines.append(
+            f"warmup_leg_begin arm={arm} label={gdn_component.WARMUP_LABEL}"
+        )
+        (warmup_base / f"w0-{arm}.json").write_text(
+            json.dumps(
+                {
+                    "arm": arm,
+                    "label": gdn_component.WARMUP_LABEL,
+                    "discarded": True,
+                    "server_log": str(server_log),
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_lines.append(
+            f"warmup_leg_end arm={arm} label={gdn_component.WARMUP_LABEL}"
+        )
     for concurrency in CONCURRENCIES:
         for order in LEG_ORDER:
             arm, repetition_text = order.rsplit("-r", 1)
@@ -1054,22 +1088,58 @@ class GdnPackedComponentTest(unittest.TestCase):
         cls.cuda_compiler_patch.stop()
 
     def test_plan_is_exact_ab_ba_ab_at_c2_and_c16(self) -> None:
+        # (a) 20-leg + w0 warmup plan: 2 concurrencies x 2 arms x 5 reps, order
+        # alternating AB/BA/AB/BA/AB per concurrency, plus one discarded warmup
+        # leg per arm.
         plan = build_component_plan(SOURCE_SHA)
 
         self.assertEqual(plan["concurrencies"], [2, 16])
         self.assertEqual(plan["requests_per_run"], {"2": 6, "16": 96})
+        self.assertEqual(plan["repetitions"], [1, 2, 3, 4, 5])
         self.assertEqual(plan["order_per_concurrency"], list(LEG_ORDER))
-        self.assertEqual(len(plan["legs"]), 12)
+        self.assertEqual(len(LEG_ORDER), 10)
+        self.assertEqual(len(plan["legs"]), 20)
+        self.assertEqual(plan["schema_version"], 2)
         self.assertEqual(
-            [leg["arm"] for leg in plan["legs"][:6]],
-            ["packed", "rollback", "rollback", "packed", "packed", "rollback"],
+            [leg["arm"] for leg in plan["legs"][:10]],
+            [
+                "packed", "rollback", "rollback", "packed", "packed",
+                "rollback", "rollback", "packed", "packed", "rollback",
+            ],
         )
         self.assertEqual(
-            [leg["repetition"] for leg in plan["legs"][:6]],
-            [1, 1, 2, 2, 3, 3],
+            [leg["repetition"] for leg in plan["legs"][:10]],
+            [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
         )
+        # A single discarded cold-start warmup pair (one leg per arm), run first.
+        warmup = plan["warmup"]
+        self.assertEqual(warmup["label"], WARMUP_LABEL)
+        self.assertTrue(warmup["discarded"])
+        self.assertTrue(warmup["excluded_from_axes"])
+        self.assertEqual(warmup["concurrency"], 2)
+        self.assertEqual(len(warmup["legs"]), 2)
+        self.assertEqual([leg["arm"] for leg in warmup["legs"]], ["packed", "rollback"])
+        self.assertTrue(all(leg["discarded"] for leg in warmup["legs"]))
         self.assertTrue(plan["one_gpu_lock"])
         self.assertFalse(plan["production_build"]["profile_control"])
+
+    def test_legacy_twelve_leg_plan_without_warmup_is_rejected(self) -> None:
+        # (a) a legacy 12-leg, three-rep, no-warmup plan is rejected by the new
+        # contract (exact plan equality plus the bumped schema_version).
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            legacy = build_component_plan(SOURCE_SHA)
+            legacy["legs"] = legacy["legs"][:6] + legacy["legs"][10:16]
+            legacy["repetitions"] = [1, 2, 3]
+            legacy["order_per_concurrency"] = legacy["order_per_concurrency"][:6]
+            legacy["schema_version"] = 1
+            del legacy["warmup"]
+            (root / "component-plan.json").write_text(
+                json.dumps(legacy), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(HarnessError, "component plan differs"):
+                summarize_evidence(root, SOURCE_SHA)
 
     def test_every_axis_win_passes_40_timing_and_8_memory_axes(self) -> None:
         # The 40-axis gate = 20 c16 + 20 c2 (HIGHER 4 + LOWER 16, with the two
@@ -1079,7 +1149,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         for arm in ARMS:
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 _apply_c2_ttft_modes(records[(2, arm, repetition)], _C2_MODE_PARITY[repetition])
 
         summary = summarize_component_records(records, memory)
@@ -1164,7 +1234,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # ACCEPTED.  c16 is never pooled, so this exercises the tail band alone.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_ttft_ms(
                 records[(16, "rollback", repetition)], _C16_TAIL_ROLLBACK_TTFT
             )
@@ -1188,7 +1258,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # catches a genuine (reproducible) tail regression.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_ttft_ms(
                 records[(16, "rollback", repetition)], _C16_TAIL_ROLLBACK_TTFT
             )
@@ -1267,7 +1337,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # split the component is ACCEPTED.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_c2_ttft_modes(
                 records[(2, "packed", repetition)], _C2_MODE_FLIP_PACKED[repetition]
             )
@@ -1310,7 +1380,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # — the mode gate is the sensitive detector the tail band cannot be.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_c2_ttft_modes(
                 records[(2, "packed", repetition)],
                 _C2_MODE_SLOW_REGRESS_PACKED[repetition],
@@ -1342,7 +1412,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # band still FAILS.  PSS/RSS stay packed-better throughout.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             rollback_gpu = memory[(16, "rollback", repetition)]["peak_gpu_memory_mib"]
             memory[(16, "packed", repetition)]["peak_gpu_memory_mib"] = rollback_gpu * 1.01
 
@@ -1352,7 +1422,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertTrue(c16["memory_axis_pass"]["peak_pss_kib"])
         self.assertTrue(summary["gate_pass"])
 
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             rollback_gpu = memory[(16, "rollback", repetition)]["peak_gpu_memory_mib"]
             memory[(16, "packed", repetition)]["peak_gpu_memory_mib"] = rollback_gpu * 1.05
 
@@ -1368,7 +1438,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # component is ACCEPTED.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_c2_ttft_modes(
                 records[(2, "packed", repetition)],
                 _C2_MODE_LOTTERY_PACKED[repetition],
@@ -1393,19 +1463,19 @@ class GdnPackedComponentTest(unittest.TestCase):
 
     def test_single_rep_paired_reversal_is_diagnostic_only(self) -> None:
         # A single rep-pair reversal — repetition 2 packed worse on throughput,
-        # latency AND memory, while r1/r3 are packed better — breaches the band
-        # in exactly ONE of three pairs.  Under the retired every-rep-pair-in-band
+        # latency AND memory, while every other rep is packed better — breaches the
+        # band in exactly ONE of five pairs.  Under the retired every-rep-pair-in-band
         # rule this FAILED the gate even though every MEDIAN and memory-median
         # axis passed; under the MAJORITY-CONSISTENCY rule a single-pair breach is
-        # leg-level run noise (no axis reaches a 2-of-3 same-direction majority),
+        # leg-level run noise (no axis reaches a 3-of-5 same-direction majority),
         # so it is recorded as a per-rep diagnostic and the component is ACCEPTED.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         concurrency = 2
         requests = 6
         for arm, durations in (
-            ("packed", (10.0, 10.39, 10.0)),
-            ("rollback", (10.1, 10.0, 10.1)),
+            ("packed", (10.0, 10.39, 10.0, 10.0, 10.0)),
+            ("rollback", (10.1, 10.0, 10.1, 10.1, 10.1)),
         ):
             for repetition, duration in enumerate(durations, start=1):
                 record = records[(concurrency, arm, repetition)]
@@ -1425,11 +1495,11 @@ class GdnPackedComponentTest(unittest.TestCase):
                 ):
                     memory[(concurrency, arm, repetition)][axis] = value
 
-        # The c2 TTFT-family is compared arm-to-arm on the pooled 18-sample
+        # The c2 TTFT-family is compared arm-to-arm on the pooled 30-sample
         # distribution, so decouple it from the engineered throughput/memory
         # per-rep reversal: give it a clean, stable, packed-better profile.
         for arm in ARMS:
-            for repetition in (1, 2, 3):
+            for repetition in REPETITIONS:
                 ttft = 5.0 if arm == "packed" else 9.0
                 _apply_ttft_ms(
                     records[(concurrency, arm, repetition)], [ttft] * requests
@@ -1449,7 +1519,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         c2 = summary["by_concurrency"]["2"]
         self.assertFalse(c2["paired_axis_pass"]["r2"]["request_throughput"])
         self.assertFalse(c2["paired_axis_pass"]["r2"]["memory/peak_pss_kib"])
-        # ...but no axis reaches a 2-of-3 same-direction majority, so it PASSES.
+        # ...but no axis reaches a 3-of-5 same-direction majority, so it PASSES.
         for verdict in c2["paired_axis_consistency"].values():
             self.assertLessEqual(verdict["breach_count"], 1)
             self.assertTrue(verdict["gate_pass"])
@@ -1458,11 +1528,11 @@ class GdnPackedComponentTest(unittest.TestCase):
 
     def test_run6_single_pair_breach_passes_majority_gate(self) -> None:
         # Requirement (a) — run-6-shaped fixture.  Run 6 sealed complete-failed
-        # with 40/40 median + 8/8 memory PASS, failing ONLY 10/132 gated paired
-        # axes, all inside the single c2 r1 rep-pair (packed ~1% slower).  Here the
-        # single breaching pair is c16 r1: ~1% worse on every non-tail axis, the
-        # other two pairs clean.  RED under the retired rule (any single-pair
-        # breach fails the gate); GREEN under majority-consistency (1 < 2).
+        # with all median + memory axes PASS, failing ONLY the gated paired axes
+        # inside a single c2 r1 rep-pair (packed ~1% slower).  Here the single
+        # breaching pair is c16 r1: ~1% worse on every non-tail axis, the other
+        # four pairs clean.  RED under the retired rule (any single-pair breach
+        # fails the gate); GREEN under majority-consistency (1 < 3).
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         _prime_c16_paired(records)
@@ -1471,7 +1541,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         summary = summarize_component_records(records, memory)
 
         self.assertTrue(summary["gate_pass"])
-        # The run-6 40/40 + 8/8 shape: every median and memory axis passes.
+        # The run-6 shape: every median and memory axis passes.
         self.assertEqual(summary["axis_pass_count"], summary["axis_total"])
         self.assertEqual(
             summary["memory_axis_pass_count"], summary["memory_axis_total"]
@@ -1482,7 +1552,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertLess(
             summary["paired_axis_pass_count"], summary["paired_axis_total"]
         )
-        # ...but the majority-consistency verdict is 1 breach < 2 → passes.
+        # ...but the majority-consistency verdict is 1 breach < 3 → passes.
         consistency = c16["paired_axis_consistency"]["request_throughput"]
         self.assertEqual(consistency["breach_count"], 1)
         self.assertEqual(consistency["breaching_repetitions"], ["r1"])
@@ -1490,16 +1560,16 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertTrue(summary["paired_axis_consistency_pass"])
         self.assertEqual(summary["paired_axis_consistency_fail_count"], 0)
 
-    def test_run4_consistent_3of3_breach_still_fails(self) -> None:
+    def test_run4_consistent_all_pairs_breach_still_fails(self) -> None:
         # Requirement (b) — run-4-shaped fixture.  Run 4's c16 was a consistent
-        # 3/3 packed-worse pattern (packed throughput [793.50, 793.28, 795.79] vs
-        # rollback [800.12, 798.30, 800.60]).  All three rep-pairs breach the band
-        # in the SAME direction, so the gate FAILS before AND after the change
-        # (3 breaches >= the 2-of-3 majority; the median also regresses).
+        # packed-worse pattern (packed throughput [793.50, 793.28, 795.79] vs
+        # rollback [800.12, 798.30, 800.60]).  Every rep-pair breaches the band in
+        # the SAME direction, so the gate FAILS before AND after the change
+        # (5 breaches >= the 3-of-5 majority; the median also regresses).
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         _prime_c16_paired(records)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _set_timing_leg(
                 records[(16, "packed", repetition)], duration=10.08, latency_ms=8.064
             )
@@ -1509,36 +1579,65 @@ class GdnPackedComponentTest(unittest.TestCase):
         self.assertFalse(summary["gate_pass"])
         c16 = summary["by_concurrency"]["16"]
         consistency = c16["paired_axis_consistency"]["request_throughput"]
-        self.assertEqual(consistency["breach_count"], 3)
+        self.assertEqual(consistency["breach_count"], 5)
         self.assertEqual(
-            consistency["breaching_repetitions"], ["r1", "r2", "r3"]
+            consistency["breaching_repetitions"], ["r1", "r2", "r3", "r4", "r5"]
         )
         self.assertFalse(consistency["gate_pass"])
         self.assertFalse(summary["paired_axis_consistency_pass"])
         self.assertGreaterEqual(summary["paired_axis_consistency_fail_count"], 1)
 
-    def test_majority_2of3_breach_fails(self) -> None:
-        # Requirement (c) — a majority (2 of 3) of rep-pairs packed-worse in the
+    def test_majority_3of5_breach_fails(self) -> None:
+        # Requirement (c) — a majority (3 of 5) of rep-pairs packed-worse in the
         # same direction is a consistent regression and FAILS, even though the
-        # third pair is clean (packed better).
+        # remaining two pairs are clean (packed better).
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
         _prime_c16_paired(records)
-        _set_timing_leg(records[(16, "packed", 1)], duration=10.10, latency_ms=8.08)
-        _set_timing_leg(records[(16, "packed", 2)], duration=10.10, latency_ms=8.08)
-        _set_timing_leg(records[(16, "packed", 3)], duration=9.90, latency_ms=7.92)
+        for repetition in (1, 2, 3):
+            _set_timing_leg(
+                records[(16, "packed", repetition)], duration=10.10, latency_ms=8.08
+            )
+        for repetition in (4, 5):
+            _set_timing_leg(
+                records[(16, "packed", repetition)], duration=9.90, latency_ms=7.92
+            )
 
         summary = summarize_component_records(records, memory)
 
         self.assertFalse(summary["gate_pass"])
         c16 = summary["by_concurrency"]["16"]
         consistency = c16["paired_axis_consistency"]["request_throughput"]
+        self.assertEqual(consistency["breach_count"], 3)
+        self.assertEqual(consistency["breaching_repetitions"], ["r1", "r2", "r3"])
+        self.assertFalse(consistency["gate_pass"])
+        # The two clean pairs are packed-better and are not breaches.
+        self.assertTrue(c16["paired_axis_pass"]["r4"]["request_throughput"])
+        self.assertTrue(c16["paired_axis_pass"]["r5"]["request_throughput"])
+        self.assertFalse(summary["paired_axis_consistency_pass"])
+
+    def test_minority_2of5_breach_passes(self) -> None:
+        # Requirement (c) — a MINORITY (2 of 5) of rep-pairs packed-worse is
+        # leg-level run noise (2 < 3), so the component is ACCEPTED; the two
+        # breaches stay recorded as per-rep diagnostics.
+        records = _records(packed_better=True)
+        memory = _memory(packed_better=True)
+        _prime_c16_paired(records)
+        _set_timing_leg(records[(16, "packed", 1)], duration=10.10, latency_ms=8.08)
+        _set_timing_leg(records[(16, "packed", 2)], duration=10.10, latency_ms=8.08)
+
+        summary = summarize_component_records(records, memory)
+
+        self.assertTrue(summary["gate_pass"])
+        c16 = summary["by_concurrency"]["16"]
+        consistency = c16["paired_axis_consistency"]["request_throughput"]
         self.assertEqual(consistency["breach_count"], 2)
         self.assertEqual(consistency["breaching_repetitions"], ["r1", "r2"])
-        self.assertFalse(consistency["gate_pass"])
-        # The clean third pair is packed-better and is not a breach.
-        self.assertTrue(c16["paired_axis_pass"]["r3"]["request_throughput"])
-        self.assertFalse(summary["paired_axis_consistency_pass"])
+        self.assertTrue(consistency["gate_pass"])
+        self.assertTrue(summary["paired_axis_consistency_pass"])
+        # The remaining three pairs are clean (packed == rollback after priming).
+        for repetition in ("r3", "r4", "r5"):
+            self.assertTrue(c16["paired_axis_pass"][repetition]["request_throughput"])
 
     def test_alternating_direction_breaches_pass(self) -> None:
         # Requirement (d) — alternating-direction breaches.  One rep-pair packed
@@ -1572,12 +1671,18 @@ class GdnPackedComponentTest(unittest.TestCase):
 
         paired_gate = summary["contract"]["paired_gate"]
         self.assertEqual(paired_gate["rule"], "majority-consistency")
-        self.assertEqual(paired_gate["repetitions"], 3)
+        self.assertEqual(paired_gate["repetitions"], 5)
         self.assertEqual(
             paired_gate["breach_majority"],
             gdn_component.PAIRED_GATE_BREACH_MAJORITY,
         )
-        self.assertEqual(gdn_component.PAIRED_GATE_BREACH_MAJORITY, 2)
+        self.assertEqual(gdn_component.PAIRED_GATE_BREACH_MAJORITY, 3)
+        # The cold-discard warmup contract is recorded alongside the paired gate.
+        cold_discard = summary["contract"]["cold_discard"]
+        self.assertEqual(cold_discard["label"], WARMUP_LABEL)
+        self.assertTrue(cold_discard["discarded"])
+        self.assertTrue(cold_discard["excluded_from_axes"])
+        self.assertEqual(cold_discard["warmup_legs"], 2)
 
     def test_outlier_that_hides_inside_passing_means_is_rejected(self) -> None:
         records = _records(packed_better=True)
@@ -1608,11 +1713,11 @@ class GdnPackedComponentTest(unittest.TestCase):
         # The c2 reps flip 3/3 vs 6/0 bimodal TTFT mixes (the upstream-mirrored
         # prefill co-schedule arrival lottery).  The per-rep mean_ttft swings
         # ~33%, so the retained non-tail 4% rule VOIDS this pre-change; after
-        # pooling the c2 TTFT-family across the three reps it is ACCEPTED, and
-        # every c2 TTFT axis equals the pooled 18-sample statistic.
+        # pooling the c2 TTFT-family across the five reps it is ACCEPTED, and
+        # every c2 TTFT axis equals the pooled 30-sample statistic.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_ttft_ms(
                 records[(2, "packed", repetition)],
                 _C2_TTFT_BIMODAL_PACKED[repetition],
@@ -1625,7 +1730,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # The per-rep mean_ttft deviation is far past the non-tail 4% rule that
         # (still) voids every non-TTFT axis — this is exactly the run-3 signature.
         deviation = gdn_component._distribution(
-            [records[(2, "packed", repetition)]["mean_ttft_ms"] for repetition in (1, 2, 3)],
+            [records[(2, "packed", repetition)]["mean_ttft_ms"] for repetition in REPETITIONS],
             label="c2/packed/mean_ttft_ms",
         )["maximum_relative_deviation_from_median"]
         self.assertGreater(deviation, gdn_component.MAX_RUN_RELATIVE_DEVIATION)
@@ -1639,7 +1744,9 @@ class GdnPackedComponentTest(unittest.TestCase):
             ("packed", _C2_TTFT_BIMODAL_PACKED),
             ("rollback", _C2_TTFT_BIMODAL_ROLLBACK),
         ):
-            pool = [value for repetition in (1, 2, 3) for value in fixture[repetition]]
+            pool = [value for repetition in REPETITIONS for value in fixture[repetition]]
+            # (d) the c2 TTFT-family pools 30 per-request samples (5 reps x 6).
+            self.assertEqual(len(pool), 30)
             expected = {
                 "mean_ttft_ms": statistics.fmean(pool),
                 "median_ttft_ms": statistics.median(pool),
@@ -1668,7 +1775,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # reported diagnostic).
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_ttft_ms(
                 records[(2, "packed", repetition)], _C2_TTFT_FLIP_PACKED[repetition]
             )
@@ -1702,7 +1809,7 @@ class GdnPackedComponentTest(unittest.TestCase):
         # aggregate lands far past the 50% pooled sanity bound, so it still VOIDS.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition in (1, 2, 3):
+        for repetition in REPETITIONS:
             _apply_ttft_ms(
                 records[(2, "packed", repetition)],
                 _C2_TTFT_BIMODAL_PACKED[repetition],
@@ -1722,7 +1829,9 @@ class GdnPackedComponentTest(unittest.TestCase):
         # pooling is confined to c2.
         records = _records(packed_better=True)
         memory = _memory(packed_better=True)
-        for repetition, ttft in ((1, 20.0), (2, 20.0), (3, 22.0)):
+        # One rep ~10% above the others (past the 4% non-tail rule) with no pooling.
+        for repetition in REPETITIONS:
+            ttft = 22.0 if repetition == 3 else 20.0
             _apply_ttft_ms(records[(16, "rollback", repetition)], [ttft] * 96)
 
         with self.assertRaises(HarnessError) as context:
@@ -1741,7 +1850,7 @@ class GdnPackedComponentTest(unittest.TestCase):
             _apply_ttft_ms(records[(16, "rollback", repetition)], _c16_tail_ttft(low, high))
 
         deviation = gdn_component._distribution(
-            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
+            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in REPETITIONS],
             label="c16/rollback/p99_ttft_ms",
         )["maximum_relative_deviation_from_median"]
         self.assertGreater(deviation, gdn_component.MAX_RUN_RELATIVE_DEVIATION)
@@ -1774,7 +1883,7 @@ class GdnPackedComponentTest(unittest.TestCase):
             _apply_ttft_ms(records[(16, "rollback", repetition)], _c16_tail_ttft(low, high))
 
         deviation = gdn_component._distribution(
-            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in (1, 2, 3)],
+            [records[(16, "rollback", repetition)]["p99_ttft_ms"] for repetition in REPETITIONS],
             label="c16/rollback/p99_ttft_ms",
         )["maximum_relative_deviation_from_median"]
         self.assertGreater(deviation, 0.15)
@@ -1822,6 +1931,72 @@ class GdnPackedComponentTest(unittest.TestCase):
             self.assertTrue(summary["correctness_pass"])
             self.assertTrue(summary["one_lock_order_pass"])
             self.assertTrue(summary["all_process_plan_maps_equal"])
+            # The two discarded warmup legs are recorded and excluded.
+            self.assertTrue(summary["warmup_discard_pass"])
+            self.assertEqual(summary["warmup_discard"]["leg_count"], 2)
+            self.assertTrue(summary["warmup_discard"]["excluded_from_axes"])
+
+    def test_missing_warmup_discard_leg_fails_closed(self) -> None:
+        # Fail-closed: the finalizer verifies the w0 legs EXIST.  Deleting one
+        # discarded warmup artifact voids the seal.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            (root / "warmup" / "27" / "w0-packed.json").unlink()
+
+            with self.assertRaisesRegex(HarnessError, "warmup discard leg"):
+                summarize_evidence(root, SOURCE_SHA)
+
+    def test_non_discarded_warmup_leg_is_rejected(self) -> None:
+        # A warmup leg record that claims it is NOT discarded is rejected — a
+        # warmup leg can never masquerade as a binding leg.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            path = root / "warmup" / "27" / "w0-rollback.json"
+            record = json.loads(path.read_text())
+            record["discarded"] = False
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            with self.assertRaisesRegex(HarnessError, "not discarded"):
+                summarize_evidence(root, SOURCE_SHA)
+
+    def test_warmup_leg_leaked_into_timed_axes_is_rejected(self) -> None:
+        # (b) a discarded warmup output that leaks into the timed raw directory
+        # (so it could contaminate an axis) is rejected — warmup legs must stay
+        # excluded from every axis.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            leaked = root / "raw" / "27" / "ours" / "c2-w0-gdn-packed.json"
+            template = root / "raw" / "27" / "ours" / "c2-r1-gdn-packed.json"
+            leaked.write_bytes(template.read_bytes())
+
+            with self.assertRaisesRegex(HarnessError, "discarded warmup"):
+                summarize_evidence(root, SOURCE_SHA)
+
+    def test_warmup_markers_must_precede_first_timed_leg(self) -> None:
+        # The discarded warmup pair must be recorded first (inside the lock,
+        # before the first timed leg); moving it after the timed legs is rejected.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            _write_complete_evidence(root)
+            path = root / "component-order.log"
+            lines = path.read_text().splitlines()
+            begin = lines.index(
+                f"warmup_leg_begin arm=packed label={WARMUP_LABEL}"
+            )
+            end = lines.index(
+                f"warmup_leg_end arm=packed label={WARMUP_LABEL}"
+            )
+            block = lines[begin : end + 1]
+            del lines[begin : end + 1]
+            terminus = lines.index("gpu_series_complete")
+            lines[terminus:terminus] = block
+            path.write_text("\n".join(lines) + "\n")
+
+            with self.assertRaisesRegex(HarnessError, "warmup"):
+                summarize_evidence(root, SOURCE_SHA)
 
     def test_profile_instrumented_build_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1923,7 +2098,7 @@ class GdnPackedComponentTest(unittest.TestCase):
             _write_complete_evidence(root)
             for concurrency in CONCURRENCIES:
                 for arm in ARMS:
-                    for repetition in (1, 2, 3):
+                    for repetition in REPETITIONS:
                         path = (
                             root
                             / "raw/27/ours"
@@ -2270,6 +2445,30 @@ class GdnPackedComponentTest(unittest.TestCase):
             text.index('gdn_packed_component.py" validate-model-gates'),
             text.index("for concurrency in 2 16"),
         )
+
+    def test_driver_runs_warmup_pair_before_five_rep_timed_legs(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        # The single discarded warmup pair runs first, per arm, before the loop.
+        warmup_packed = text.index("run_warmup_leg packed")
+        warmup_rollback = text.index("run_warmup_leg rollback")
+        loop_start = text.index("for concurrency in 2 16")
+        first_timed = text.index('run_leg "${concurrency}" packed 1')
+        self.assertLess(warmup_packed, warmup_rollback)
+        self.assertLess(warmup_rollback, loop_start)
+        self.assertLess(loop_start, first_timed)
+        # Exactly one warmup leg per arm (a single leading pair).
+        self.assertEqual(text.count("run_warmup_leg packed"), 1)
+        self.assertEqual(text.count("run_warmup_leg rollback"), 1)
+        # Five timed repetitions in AB/BA/AB/BA/AB order.
+        loop = text[loop_start : text.index('record_order "gpu_series_complete"')]
+        self.assertEqual(loop.count("run_leg "), 10)
+        for order in LEG_ORDER:
+            arm, rep = order.rsplit("-r", 1)
+            self.assertIn(f'run_leg "${{concurrency}}" {arm} {rep}', loop)
+
+    def test_driver_prepares_five_rep_corpus(self) -> None:
+        text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()
+        self.assertIn("--repetitions 1 2 3 4 5", text)
 
     def test_driver_records_profile_control_off_in_execution_manifest(self) -> None:
         text = (SOURCE_ROOT / "scripts/dgx-gdn-packed-component.sh").read_text()

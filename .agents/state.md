@@ -10045,3 +10045,42 @@ Process note (applying today's recorded lesson): gates, commit, and the
 post-commit `check-doc-checkpoint.py --base <pre> --head HEAD` were run as
 separate steps with each exit status verified before proceeding; no
 `git commit`/`push` was chained after a doc-editing script.
+
+## 2026-07-15 — LOAD-SAFETENSORS windowed release MEASURED: VmHWM −23.54 GB; claim released
+
+The staged bounded VmHWM A/B for `cb2d310` ran on dgx from
+`~/work/vllm.cpp-windowed-load/cb2d310c75cc922063f09a953b2458e5ca39c518`
+(production configure recipe; single 27B load-to-ready per arm; one
+`flock /tmp/gpu` for the series; GPU verified idle after the component campaign
+paused). HONEST execution note: our staged runner script exited prematurely with
+"SERVER BINARY MISSING" — its server path was WRONG (`build/examples/server/server`;
+the Ninja build links the binary at `build/examples/server`, a file) — after a
+complete 150/150 build; the orchestrator then executed the identical staged A/B
+and captured all artifacts into `$ROOT/evidence/`.
+
+MEASURED (verified firsthand from the artifacts):
+- OFF (`VT_LOAD_WINDOWED_RELEASE=0`): VmHWM **48,285,916 kB (48.29 GB)**,
+  VmRSS 24,750,696 kB — the load-time double-residency peak intact, matching the
+  precheck's 48.29 GB and the binding grid's failing 48.17 GB peak.
+- ON (default): VmHWM **24,750,704 kB (24.75 GB) = VmRSS** — the load transient
+  is FULLY eliminated: **−23,535,212 kB (−23.54 GB, −48.7%)**; the peak now
+  equals steady RSS. smaps_rollup Pss 24,748,252 / 24,748,260 kB (off/on).
+- ON-arm c1 serving smoke: **6/6 completed, 0 failed** (302.7 tok/s total,
+  health-only, non-binding).
+- Artifact SHA-256: `vmhwm-off-status.txt` `cdccc1dd…7233`,
+  `vmhwm-on-status.txt` `3fd0592c…1fc0`, `vmhwm-off-smaps.txt` `11baecd3…3881`,
+  `vmhwm-on-smaps.txt` `41837d12…65f3`, `smoke-on.json` `ed271a68…5aa8`,
+  `vmhwm-off-server.log` `772bec6b…9c49`, `vmhwm-on-server.log` `b66bb783…a81cd`.
+
+PROJECTION (recorded as projection, NOT credit): ours ≈24.75 GB load peak
+(≈24.86 GB peak PSS observed in full 12-leg production serving at `cb2d310`+)
+vs vLLM's binding 28.17/28.53 GB Peak PSS/RSS → both failing memory axes are
+projected to flip PASS at the next authorized exact-grid rerun. Until that
+rerun, the binding memory axes remain **FAILED**; binding stays **55/124**,
+`benchmark_binding=false`.
+
+Disposition: `CLAIM-LOAD-WINDOWED-1` RELEASED (its scoped work — spike,
+test-first implementation, CPU gates, measured VmHWM A/B — is complete). Row
+`LOAD-SAFETENSORS` returns to `PARTIAL` unclaimed: remaining scope is the
+direct-to-final-device streaming redesign (removes the 22.92 GiB steady mirror;
+wanted for 35B). Rollback stays `VT_LOAD_WINDOWED_RELEASE=0`.

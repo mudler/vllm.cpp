@@ -10860,3 +10860,43 @@ re-running from the fixed SHA.**
 2b: 235/235 + 16/16 with zero packed launches accepted by the mode-aware
 contract. Then the structural trace (145→97 BF16/window, packed total
 915→867) and the W2B component per the prior entry's commands.
+
+## 2026-07-15 — qkvz W2A DGX gates ALL GREEN; structural −48 BF16 GEMMs confirmed
+
+The full W2A DGX battery completed at `45f9e6d` (gate root
+`~/work/vllm.cpp-gdn-qkvz/baea3ecc02d83b3c874d7f64f6c5156f3d302d9e`, build
+`build-gdn-qkvz` reconfigured with the production toolchain):
+
+1. Default suites (test_ops_gdn, 27B dense/paged forward, 27B paged engine,
+   35B weights/engine, GGUF loader): **8/8 PASS** at `baea3ec`.
+2. Leaf rollback `VT_GDN_MERGED_QKVZ=0` 27B paged engine: **PASS**.
+3. Master rollback `VT_GDN_MERGED_PROJ=0`: initially FAILED on the gate
+   test's hard-coded packed-dispatch expectation — root-caused as a
+   PRE-EXISTING test-contract gap (master-off disables the BA merge, and
+   packed dispatch requires merged BA, so zero packed launches is the
+   designed legacy pipeline). Fixed test-first at `45f9e6d`
+   (`PackedGdnDecodeEnvSelected` shared truth table; engine unchanged);
+   the DGX re-run then **PASSES** (235/235, zero packed launches accepted).
+4. 35B native + `VT_DENSE_NATIVE=0`: **PASS** (byte-inert).
+5. Strict memcheck (merged-qkvz/conv-padded/rmsnorm-gated-padded slices):
+   **SUCCESS, 0 errors, 0 bytes leaked** (first attempt failed only on
+   `compute-sanitizer` not being on the non-interactive PATH; rerun used
+   `/usr/local/cuda-13.0/bin/compute-sanitizer`).
+6. Structural node traces (c2/B=2 steady windows, nsys INSIDE `env -i`
+   per the recorded lesson, both modes under one lock): default arm
+   wmma-BF16-per-packed-window ratio **1.959 ≈ 2.0** (48 qkvz + 48 BA)
+   vs `VT_GDN_MERGED_QKVZ=0` **2.980 ≈ 3.0** (qkv + z + BA) — the exact
+   −48 BF16-GEMM-per-window reduction (97-vs-145 family contract,
+   normalized by the 48/window packed-recurrence count; window-edge mixed
+   steps explain the ±0.02 residue). Traces retained in the gate root
+   (`trace-default.nsys-rep`, `trace-qkvzoff.nsys-rep`).
+
+W2A is correctness/safety/structure green end-to-end. NO speed credit is
+claimed (qkvz rides the authorized exact-grid rerun). NEXT (the active
+order-0 item): the AUTHORIZED exact-grid rerun — fresh vLLM v0.25.0
+denominators (cite run SHA `702f481`), explicit `--mamba-ssm-cache-dtype
+float32` on the vLLM arm per the equivalence audit, all 124 axes, both
+arms fresh, one lock; expected movers: both host-memory axes
+(windowed-load: 24.9 vs vLLM 28.5 GB) and the c2 decode cluster (component
+c2 TPOT ≈108.5 ms vs binding-era 114.8); open risks: c4/c8 decode axes and
+the c8 p99 ITL tail. 35B stays blocked until 27B reaches 124/124.

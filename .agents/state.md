@@ -10349,3 +10349,76 @@ is the fixable lever; if intrinsic, the packed-default decision gets made on
 recorded evidence (exact-upstream semantics + 48-launch reduction vs a
 ~0.2% steady cost). Analysis scripts are retained in the session scratchpad;
 no roots were modified. Binding stays **55/124**, `benchmark_binding=false`.
+
+## 2026-07-15 — CLAIM-GDN-BA-ROUNDING-1: env-gated cuBLASLt algo-selection instrumentation landed test-first (W1D3; locked A/B next)
+
+The precommitted decisive instrumentation from the forensic verdict is now
+landed in an isolated worktree (reset to `origin/main` incl. `0122a18`). The
+forensic record isolated a CONSTANT ~0.2% packed steady per-token tax whose one
+un-instrumented per-process variable is cuBLASLt algo selection for the BF16
+GEMMs (esp. the BA projection); no algo/heuristic identity appears in any server
+log. This change adds that missing observability.
+
+**The change (bounded, diagnostic-only, default OFF).** `VT_GEMM_ALGO_LOG=1`
+makes our cuBLASLt matmul paths emit ONE `std::cerr` line per unique (shape,
+dtype-combo, epilogue) selection:
+`[VT_GEMM_ALGO] backend=cublasLt m=.. n=.. k=.. a=<dtype> b=<dtype> c=<dtype>
+epilogue=.. algoId=.. tile=.. stages=.. splitK=.. wsSize=..`. The algo config is
+read via `cublasLtMatmulAlgoConfigGetAttribute` (`CUBLASLT_ALGO_CONFIG_ID`,
+`TILE_ID`, `STAGES_ID`, `SPLITK_NUM`) plus `heur.workspaceSize` from the
+heuristic result. Hooked at all three cuBLASLt heuristic-selection sites in
+`src/vt/cuda/cuda_matmul.cu` — `MatmulKernelCuda` (row-major NN), the
+`MatmulBTKernelCuda` BF16-BA TN GEMM (the forensic target), and
+`MatmulFp8CublasLtKernelCuda` (FP8 TN GEMM, only when cuBLASLt actually serves it
+and does not fall back to cutlass). Only the cuBLASLt path is routed; the line
+tags `backend=cublasLt` and an epilogue tag (`rowmajor-NN` / `TN-bt` / `TN-fp8`).
+OUR diagnostic — upstream logs the same selection under `CUBLASLT_LOG_LEVEL` /
+torch `_scaled_mm` verbose; we have no torch, so we mirror it (cited in the code
+comment) to compare arm-wise algo LATCHING per the forensic record.
+
+**Zero hot-path cost when off.** The gate is a process-cached bool
+(`GemmAlgoLogEnabled()` reads `getenv` exactly once via a function-local static;
+no per-call getenv), and the emit body is skipped entirely when unset. Log-once
+uniqueness uses a thread-safe `LogOncePerKey` (mutex-guarded `unordered_set`),
+touched only when the flag is on. Selection is computed per call (there is no
+per-shape algo cache to hook a cache-fill point), so `LogOncePerKey` bounds the
+output to one line per unique key even on the hot path. No production semantics
+change; no default flip; the hot path is byte-inert when the flag is off.
+
+**Test-first RED→GREEN (CPU tier).** The portable flag/uniqueness plumbing is
+split into a CUDA-free header `src/vt/cuda/gemm_algo_log.h` so it is
+CPU-unit-testable (the cuBLASLt emit itself stays in the `.cu`). New suite
+`tests/vt/test_gemm_algo_log.cpp` (wired in `tests/CMakeLists.txt` with `-I src`):
+`GemmAlgoLogFlagIsOn` exact-"1" contract (nullptr/unset→OFF, "0"/""/"2"/"10"/
+"1 "/" 1"/"true"/"on" all OFF), `LogOncePerKey` one-line-per-distinct-key
+(two keys differing only in the output `c` dtype both log once), and a 16-thread
+single-winner-per-key contention case. RED was observed against a deliberately
+wrong stub (`ShouldLog` always returns true → uniqueness/thread-safety cases
+fail 6/18); GREEN after the set-insert implementation (3 cases, 18/18).
+
+**Gates (CPU tier here; no GPU on this box).** Clean `-Werror` reconfigure +
+rebuild of the touched target `test_gemm_algo_log` (and adjacent
+`test_ops_matmul`), zero warnings; `test_gemm_algo_log` 18/18, `test_ops_matmul`
+16/16, full tools suite **154/154** (baseline, zero regressions);
+`check-agent-record.py` + `check-doc-checkpoint.py` green. The `cuda_matmul.cu`
+`.cu` compile (`-Werror=all-warnings`) is DGX-verified by the orchestrator; all
+cuBLASLt signatures/attribute types/`heur.workspaceSize` were verified against
+the installed `cublasLt.h` (config getter is not `[[nodiscard]]`, so the
+best-effort ignored status is warning-clean). Record surfaces updated same
+commit: spec `gdn-packed-decode.md` W1D3 row, `docs/BENCHMARKS.md`
+(`SERVE-GATE-ONLINE`/`KERNEL-GDN-PACKED-DECODE` next-gate cells), README (header
+block + 27B performance row, unchanged semantics), coordination claim last-update,
+this state entry, and a parity-ledger row.
+
+Binding stays **55/124**, `benchmark_binding=false`, no speed credit. Next: the
+orchestrator runs one GPU-locked interleaved high-rep (≥8 AB/BA) c16 A/B with
+`VT_GEMM_ALGO_LOG=1` plus a mid-run steady-window `nsys --cuda-graph-trace=node`
+capture of one packed and one rollback leg, from the pushed SHA — localizing
+whether the packed arm's BF16-BA output latches a different/slower cuBLASLt algo
+and whether the choice is process-stable; then the packed-default decision on
+recorded evidence. qkvz/exact-grid/35B stay blocked on a `complete-pass`.
+
+Process note: gates, record checkers, commit, and the post-commit
+`check-doc-checkpoint.py` are each run as separate steps with exit status
+verified individually; no `git commit`/`push` is chained after a doc-editing
+script.

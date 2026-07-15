@@ -154,6 +154,11 @@ vllm_cpp_add_test(test_backend vt/test_backend.cpp)
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
+# helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
+# emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.
+vllm_cpp_add_test(test_gemm_algo_log vt/test_gemm_algo_log.cpp)
+target_include_directories(test_gemm_algo_log PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).

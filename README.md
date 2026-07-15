@@ -74,8 +74,12 @@ OpenAI-compatible server.
 > The packed component stays `GATING` (no speed credit): seven sealed runs
 > prove c2 and memory equivalence; forensics isolate a constant ~0.2% packed
 > steady per-token tax whose per-seal outcome flips on a run-scoped
-> prefill-stall tail draw (clocks ruled out). An instrumented A/B localizes
-> the tax next; then the packed-default decision.
+> prefill-stall tail draw (clocks ruled out). The decisive instrumentation is
+> now **landed** (unchanged semantics): an env-gated `VT_GEMM_ALGO_LOG=1`
+> diagnostic logs the cuBLASLt algo selected per BF16/FP8 GEMM shape (default
+> OFF, zero hot-path cost), so a locked A/B can show whether the packed arm's
+> BF16-BA output latches a different/slower algo. The orchestrator runs that
+> A/B (algo logging + steady-window nsys) next; then the packed-default decision.
 > On the memory axis, the failing binding **peak** (48.3 GB) was
 > localized to LOAD-time double-residency (the 22.92 GiB host mirror built while
 > the full source mmap stayed resident); the **windowed-load** release
@@ -91,7 +95,7 @@ OpenAI-compatible server.
 | Gate | State | Current evidence | Next gate |
 |---|---|---|---|
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass**. The c16 crash is root-caused and fixed (`c172336`, proven on DGX). Seven sealed components + forensics establish: c2 decode and ALL memory axes at packed-rollback equivalence (component peak PSS **24.86 GB**; binding era 48.18, vLLM 28.5; c2 TPOT ~108.5 ms vs binding-era 114.8); the packed arm carries a constant **~0.2%** steady per-token tax whose seal outcome flips on a run-scoped prefill-stall tail draw; clocks ruled out. Harness statistics fully calibrated test-first (chronology in the state log) | Instrumented A/B (cuBLASLt algo logging + steady-window nsys) localizes the tax → fix or recorded packed-default decision → component rerun → qkvz
+| Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass**. The c16 crash is root-caused and fixed (`c172336`, proven on DGX). Seven sealed components + forensics establish: c2 decode and ALL memory axes at packed-rollback equivalence (component peak PSS **24.86 GB**; binding era 48.18, vLLM 28.5; c2 TPOT ~108.5 ms vs binding-era 114.8); the packed arm carries a constant **~0.2%** steady per-token tax whose seal outcome flips on a run-scoped prefill-stall tail draw; clocks ruled out. Harness statistics fully calibrated test-first (chronology in the state log). The decisive instrumentation is landed (`VT_GEMM_ALGO_LOG=1`, default OFF, semantics unchanged): env-gated per-GEMM-shape cuBLASLt algo-selection logging on the BF16/FP8 GEMM paths | Locked A/B from the pushed SHA (`VT_GEMM_ALGO_LOG` algo logging + steady-window nsys) localizes the tax → fix or recorded packed-default decision → component rerun → qkvz
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
 | Host-memory parity | ❌ FAILED on the binding grid / fix MEASURED | The failing **peak** was load-time double-residency (22.92 GiB mirror built while the full source mmap stayed resident). The `LOAD-SAFETENSORS` windowed release (default on; `VT_LOAD_WINDOWED_RELEASE=0` rollback) is now **measured on GB10**: 27B load-to-ready VmHWM **48.29 GB off vs 24.75 GB on (−23.54 GB, −48.7%)** — the load transient is fully eliminated and the ON peak equals steady RSS, below vLLM's 28.5 GB binding peak; ON-arm serving smoke 6/6 | Binding Peak PSS/RSS axes flip only at the next authorized exact-grid rerun (projected PASS). Direct-to-device streaming remains the deeper fix (still wanted for 35B) |

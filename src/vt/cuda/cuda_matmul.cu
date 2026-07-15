@@ -10,15 +10,23 @@
 // Also hosts MatmulFp8CublasLt (see the block comment near the bottom): the
 // cuBLASLt FP8 (e4m3) dense GEMM — the native equivalent of vLLM's cuBLASLt fp8
 // path (nvjet_sm121_qqtst_* kernels) — reusing this same handle + workspace.
+//
+// Env-gated diagnostic: VT_GEMM_ALGO_LOG=1 emits one std::cerr line per unique
+// (shape, dtype-combo, epilogue) cuBLASLt algo selection (see MaybeLogGemmAlgo).
+// Default OFF, zero hot-path cost when unset. It exists to compare arm-wise algo
+// latching on the packed GDN BF16-BA GEMM per the 2026-07-15 forensic record;
+// the portable flag/uniqueness plumbing lives in gemm_algo_log.h (CPU-tested).
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 
+#include "vt/cuda/gemm_algo_log.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -124,6 +132,60 @@ std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);
 }
 
+// ---- Env-gated cuBLASLt algo-selection diagnostic (VT_GEMM_ALGO_LOG) --------
+// Short tag for a cuBLASLt operand data type (the BF16-vs-F32 output type is the
+// packed-arm variable of interest).
+const char* CudaTypeTag(cudaDataType_t t) {
+  switch (t) {
+    case CUDA_R_32F: return "f32";
+    case CUDA_R_16BF: return "bf16";
+    case CUDA_R_16F: return "f16";
+    case CUDA_R_8F_E4M3: return "e4m3";
+    default: return "other";
+  }
+}
+
+// When VT_GEMM_ALGO_LOG=1, emit ONE std::cerr line per unique (shape,
+// dtype-combo, epilogue) selection naming the cuBLASLt-chosen algo config
+// (id/tile/stages/splitK) and its heuristic workspace. OUR diagnostic — upstream
+// logs the same selection under CUBLASLT_LOG_LEVEL / torch `_scaled_mm` verbose;
+// we have no torch, so we mirror it under our own flag to compare arm-wise algo
+// LATCHING on the packed GDN BF16-BA GEMM vs the F32-BA/decomposed arm, per the
+// 2026-07-15 forensic record (a constant ~0.2% packed steady per-token tax whose
+// one un-instrumented per-process variable is the BF16 GEMM algo selection; see
+// .agents/state.md and .agents/specs/gdn-packed-decode.md). Zero cost when the
+// flag is unset: GemmAlgoLogEnabled() is a cached bool and the body is skipped.
+// The reads are best-effort (a driver that does not expose an attribute leaves
+// its sentinel) and never throw — this is diagnostics, not a correctness path.
+void MaybeLogGemmAlgo(const cublasLtMatmulHeuristicResult_t& heur, int64_t m, int64_t n,
+                      int64_t k, cudaDataType_t a_t, cudaDataType_t b_t, cudaDataType_t c_t,
+                      const char* epilogue) {
+  if (!GemmAlgoLogEnabled()) return;  // cached bool; default OFF pays nothing here
+  int32_t algo_id = -1, split_k = -1;
+  uint32_t tile = 0, stages = 0;
+  size_t written = 0;
+  cublasLtMatmulAlgoConfigGetAttribute(&heur.algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id,
+                                       sizeof(algo_id), &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&heur.algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile,
+                                       sizeof(tile), &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&heur.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages,
+                                       sizeof(stages), &written);
+  cublasLtMatmulAlgoConfigGetAttribute(&heur.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split_k,
+                                       sizeof(split_k), &written);
+  // One line per unique key across every cuBLASLt GEMM site (the key embeds the
+  // backend/epilogue tag, so the three paths never collide).
+  static LogOncePerKey once;
+  std::string key = std::string("cublasLt|m=") + std::to_string(m) + " n=" + std::to_string(n) +
+                    " k=" + std::to_string(k) + "|a=" + CudaTypeTag(a_t) + " b=" +
+                    CudaTypeTag(b_t) + " c=" + CudaTypeTag(c_t) + "|" + epilogue;
+  if (!once.ShouldLog(key)) return;
+  std::cerr << "[VT_GEMM_ALGO] backend=cublasLt m=" << m << " n=" << n << " k=" << k
+            << " a=" << CudaTypeTag(a_t) << " b=" << CudaTypeTag(b_t) << " c=" << CudaTypeTag(c_t)
+            << " epilogue=" << epilogue << " algoId=" << algo_id << " tile=" << tile
+            << " stages=" << stages << " splitK=" << split_k << " wsSize=" << heur.workspaceSize
+            << std::endl;
+}
+
 void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16 &&
                        (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
@@ -171,6 +233,7 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
                              std::to_string(k) + "," + std::to_string(n) + "] " +
                              ComboName(a, b, out));
   }
+  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN");
 
   // out = 1.0 * a @ b + 0.0 * out; C and D share the same buffer and layout.
   const float alpha = 1.0f, beta = 0.0f;
@@ -247,6 +310,9 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                              std::to_string(n) + "," + std::to_string(k) + "]^T " +
                              ComboName(a, b, out));
   }
+  // The 27B GDN in_proj_ba runs through this TN path; its BF16-vs-F32 output type
+  // is the algo-latching variable the forensic record flagged.
+  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "TN-bt");
 
   const float alpha = 1.0f, beta = 0.0f;
   CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, b.data, la.v, a.data, lb.v, &beta,
@@ -328,6 +394,7 @@ void MatmulFp8CublasLtKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, con
     ::vt::MatmulFp8Cutlass(q, out, a_fp8, b_fp8, alpha);
     return;
   }
+  MaybeLogGemmAlgo(heur, m, n, k, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, out_type, "TN-fp8");
 
   // out = alpha * op(weight) @ op(act) + 0 * C; C and D share out's buffer/layout.
   const float beta = 0.0f;

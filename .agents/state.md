@@ -10527,3 +10527,24 @@ Process note: gates, record checkers, commit, and the post-commit
 `check-doc-checkpoint.py` are each run as separate steps with exit status
 verified individually; no `git commit`/`push` is chained after a doc-editing
 script.
+
+## 2026-07-15 — five-repetition corpus generated; byte-identity with the binding corpus verified
+
+The 5-rep component prerequisite is met. A fresh deterministic corpus was
+generated on dgx in `~/work/corpus-5rep-20260715` with the binding
+parameters (seed 0, target_input_len 1024, output_len 128,
+requests_per_partition 192, warmup_requests 1, concurrencies 1–32,
+repetitions 5; tokenizer revision `890bdef7…`; oracle-venv tokenizers) and
+`prepare-corpus --repetitions 1 2 3 4 5`. Byte-identity with the immutable
+binding corpus was verified on every shared partition (c1/c2/c16/c32 r1–r3 +
+warmup all MATCH), so repetitions 4–5 are a pure deterministic extension and
+cross-era comparability is preserved. The two harness manifest constants are
+refreshed to the new manifests: source
+`f9f9f38cd01108e26886f72b8a764939e111313b452e9727e0d61ad371e8462c`, vllm
+`3fb8ed5cc02d4bde369dccd36d35f6d6db9929c42f97d839dddba6a0ca0369f3`. Focused
+suite and full tools suite stay green. Two generator-recipe facts recorded
+for reproducibility: corpus generation requires the oracle venv (tokenizers)
+and the explicit binding parameters (`--requests-per-partition 192
+--warmup-requests 1 --concurrencies 1,2,4,8,16,32`) — the CLI defaults
+(80/80, no c32) do NOT reproduce the binding corpus. The eighth component
+(first 22-leg run: cold-discard pair + 5 reps) launches from this SHA.

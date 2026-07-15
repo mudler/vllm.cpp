@@ -129,9 +129,12 @@ test-first (this checkpoint):** **5 timed repetitions** (20 legs AB/BA/AB/BA/AB,
 2-of-5 passes, 3-of-5 fails), a **30-sample** pooled c2 TTFT, and a single
 discarded **cold-start warmup pair** (`w0-{packed,rollback}`, run first, excluded
 from every axis with fail-closed existence + timed-raw exclusion checks;
-`contract.cold_discard`). Focused **79/79**, tools **162/162**. Next: the
-orchestrator runs the eighth component from the pushed SHA (after regenerating a
-5-rep corpus and refreshing the two corpus-manifest sha256 constants), which must
+`contract.cold_discard`). Focused **79/79**, tools **162/162**. The 5-rep corpus is
+generated and BOUND: a deterministic extension of the binding corpus
+(byte-identity verified on every shared partition — c1/c2/c16/c32 r1–r3 and
+warmup all match; binding parameters 192/1/c1–32, seed 0), with the two
+corpus-manifest constants refreshed to source `f9f9f38c…462c` / vllm
+`3fb8ed5c…69f3`. The eighth 22-leg component runs from the pushed SHA and must
 reach a verified terminal status before any axis binds.
 
 ## Binding 27B online gate

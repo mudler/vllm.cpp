@@ -9591,3 +9591,66 @@ default+rollback 27B **235/235 + 16/16** direct model gates, plus the focused
 throwing) — then a fresh SHA/root full twelve-leg one-lock `--execute` component
 rerun, accepting only a verified marker-last terminal status. The `d82d282` and
 `4a450f9` roots stay untouched. qkvz/exact-grid/35B stay blocked on the gate.
+
+## 2026-07-15 — LOAD-SAFETENSORS windowed release: code checkpoint (VmHWM A/B pending)
+
+Claimed `CLAIM-LOAD-WINDOWED-1` (row `LOAD-SAFETENSORS` `PARTIAL`→`ACTIVE`) and
+landed the windowed source-page release the 2026-07-15 precheck pointed to. The
+failing binding memory **peak** (Peak PSS/RSS 48.18 GB vs vLLM 28.17/28.53 GB)
+is LOAD-time double-residency: the 22.920 GiB persistent host mirror is built
+while the full `MAP_PRIVATE` safetensors mmap stays resident. The precheck proved
+steady RSS is already 24.75 GB (below vLLM's 28.5 GB peak), so releasing consumed
+source pages progressively during load should cut the peak to ≈25 GB.
+
+Spike [safetensors-windowed-load.md](specs/safetensors-windowed-load.md) proves
+the page lifetime: EVERY weight tensor is copied out of the mmap into an owned
+heap buffer by the 27B (`qwen3_5_dense_weights.cpp`) and 35B
+(`qwen3_5_weights.cpp`) loaders, and NO loaded struct retains a pointer into the
+mmap after load — confirmed by `entrypoints/model_loader.cpp:310`
+`shards.clear()` munmapping the whole mapping right after `ModelRegistry::Load`.
+Referenced-live-after-load ranges: NONE; each logical tensor is copied exactly
+once. So every copied range is copied-then-dead and safe to release.
+
+Implementation (`safetensors_reader.{h,cpp}`): `ReleaseSourcePages` does
+`madvise(MADV_DONTNEED)` over the FULLY COVERED INTERIOR pages of a consumed
+range (begin rounded up, end down) — a page fully inside a tensor's
+non-overlapping span holds only that tensor's bytes, so a partially-copied
+neighbor sharing an edge page is never dropped, safe regardless of copy order.
+`MAP_PRIVATE PROT_READ` pages are clean and re-fault from the file, so release is
+always correctness-safe. Gated by a process-cached `VT_LOAD_WINDOWED_RELEASE`
+(DEFAULT ON; `=0` rollback) via `LoadWindowedReleaseEnabled` +
+`MaybeReleaseSourcePages`, with a `detail::SetLoadWindowedReleaseOverrideForTesting`
+test seam. Every copy helper in both loaders now calls `MaybeReleaseSourcePages`
+after its consume (`LoadBf16Direct/Transposed/ToF32`, `LoadFp8Raw/Transposed`,
+`LoadNvfp4Raw`, `LoadCtNvfp4Raw`, `LoadMergedBf16RawNK`,
+`MaterializeCtNvfp4Bf16Transposed`); sub-page scalars are interior-empty no-ops.
+
+Test-first (`tests/vllm/test_safetensors.cpp`, +4 cases): RED observed with a
+no-op release (3/3 residency cases fail) → GREEN after the real `madvise`
+(34/34). Residency is measured as per-VMA smaps **Rss** (process mapping RSS =
+what VmHWM tracks), NOT mincore — mincore reports page-CACHE residency for a file
+mapping and reads "resident" even after `MADV_DONTNEED`. Cases: consumed-mapping
+Rss collapses below 5% after release; `VT_LOAD_WINDOWED_RELEASE` gate ON drops /
+OFF retains (double-residency proof); byte-identity of copied bytes ON vs OFF;
+neighbor edge-page retained + bytes intact.
+
+CPU gates GREEN: clean `-Werror` library build 0/0 warnings; `test_safetensors`
+34/34; loader-exercising `test_qwen36_weights` 1/1, `test_model_registry` 14/14,
+`test_qwen35_paged_forward` 4/4, `test_qwen27_dense_forward` 6/6,
+`test_qwen27_paged_forward` 14/14 (all with release ON by default → end-to-end
+loaded-weight correctness holds); tools 132/132; `check-agent-record.py`,
+`test_agent_record.py`, `test_doc_checkpoint.py` OK (engine-matrix summary
+`PARTIAL` 17→16 / `ACTIVE` 2→3 fixed). Full clean rebuild of the giant test TUs
+was blocked by a 100%-full shared root fs (compiler `/tmp` write failure on
+`test_op_parity`/`test_openai_conformance`, unrelated to this change); the vllm
+library and all touched/loader test targets rebuilt clean under `-Werror`.
+
+Two-checkpoint pattern: this is the CODE checkpoint with the DGX VmHWM A/B
+disposition **PENDING**. Next: build the pushed SHA on dgx in
+`~/work/vllm.cpp-windowed-load/<sha>` (production configure recipe), under one
+`flock /tmp/gpu` load the 27B snapshot to ready with (a) `VT_LOAD_WINDOWED_RELEASE=0`
+and (b) default ON, capture `/proc/<pid>/status` VmHWM + `smaps_rollup`, no
+requests, plus one c1 6-request serving smoke on the ON arm; expect (a) ≈48.3 GB,
+(b) ≈25 GB. Then a second docs checkpoint records the measured numbers. **No axis
+credit** from the A/B — the binding Peak PSS/RSS axes stay FAILED until an
+authorized exact-grid rerun; binding remains **55/124**, `benchmark_binding=false`.

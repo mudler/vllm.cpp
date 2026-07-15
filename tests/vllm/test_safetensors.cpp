@@ -1,10 +1,15 @@
 #include <doctest/doctest.h>
 
+#include <unistd.h>
+
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -352,4 +357,186 @@ TEST_CASE("safetensors index: shard names with path components throw") {
   TempFile traverse(R"({"weight_map":{"a":"../../etc/passwd"}})");
   CHECK_THROWS_AS(vllm::LoadSafetensorsIndex(traverse.path()),
                   std::runtime_error);
+}
+
+// ---- Windowed source-page release (LOAD-SAFETENSORS memory checkpoint) ----
+// Exercises the real reader (MAP_PRIVATE mmap) + the progressive-release path
+// the 27B/35B loaders call after each tensor copy. See
+// .agents/specs/safetensors-windowed-load.md.
+//
+// Residency is measured as the source MAPPING's resident set (per-VMA smaps
+// Rss), NOT mincore: mincore reports page-CACHE residency for a file mapping, so
+// after MADV_DONTNEED it still reads "resident" even though the pages have left
+// the process's mapping. The process RSS (smaps Rss = what VmHWM tracks) is what
+// this checkpoint reduces, so that is what we assert.
+namespace {
+
+size_t HostPageSize() {
+  const long p = ::sysconf(_SC_PAGESIZE);
+  return p > 0 ? static_cast<size_t>(p) : 4096;
+}
+
+// Resident set (KiB) of the /proc/self/smaps VMA that contains `addr` — the
+// portion of that mapping present in this process's page tables.
+size_t MappingRssKb(const void* addr) {
+  const auto target = reinterpret_cast<uintptr_t>(addr);
+  std::ifstream smaps("/proc/self/smaps");
+  std::string line;
+  bool in_vma = false;
+  while (std::getline(smaps, line)) {
+    // A VMA header line begins with "<startHex>-<endHex> perms ...". A field
+    // line ("Rss:", "Size:", "Anonymous:", ...) never has that '-' after the
+    // leading token, so the '-' guard distinguishes them robustly.
+    if (!line.empty() && std::isxdigit(static_cast<unsigned char>(line[0]))) {
+      char* p = nullptr;
+      const auto start = static_cast<uintptr_t>(std::strtoull(line.c_str(), &p, 16));
+      if (p != nullptr && *p == '-') {
+        const auto end = static_cast<uintptr_t>(std::strtoull(p + 1, &p, 16));
+        in_vma = (target >= start && target < end);
+        continue;
+      }
+    }
+    if (in_vma && line.rfind("Rss:", 0) == 0) {
+      return static_cast<size_t>(std::strtoull(line.c_str() + 4, nullptr, 10));
+    }
+  }
+  return 0;
+}
+
+// A valid U8 safetensors byte stream: one tensor per size, tensor i filled with
+// byte value (i+1) so copies are byte-checkable. U8 keeps the header trivial.
+std::string MakeVarFile(const std::vector<size_t>& sizes,
+                        std::vector<std::pair<size_t, size_t>>* spans_out) {
+  std::string header = "{";
+  std::string data;
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    const size_t begin = data.size();
+    data.append(sizes[i], static_cast<char>(i + 1));
+    const size_t end = data.size();
+    if (i != 0) header += ",";
+    header += "\"t" + std::to_string(i) + "\":{\"dtype\":\"U8\",\"shape\":[" +
+              std::to_string(sizes[i]) + "],\"data_offsets\":[" +
+              std::to_string(begin) + "," + std::to_string(end) + "]}";
+    if (spans_out != nullptr) spans_out->emplace_back(begin, end);
+  }
+  header += "}";
+  return MakeSafetensors(header, data);
+}
+
+}  // namespace
+
+TEST_CASE("safetensors: windowed release drops consumed source mapping RSS") {
+  const size_t page = HostPageSize();
+  const size_t each = page * 512;  // multi-MB per tensor -> clear RSS signal
+  const size_t total_kb = 3 * each / 1024;
+  std::vector<std::pair<size_t, size_t>> spans;
+  TempFile f(MakeVarFile({each, each, each}, &spans));
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  REQUIRE(st.Names().size() == 3);
+
+  // Copy every tensor (faults its source pages into the mapping RSS).
+  for (const std::string& name : st.Names()) {
+    const vllm::StTensor& t = st.Get(name);
+    std::vector<uint8_t> owned(t.nbytes);
+    std::memcpy(owned.data(), t.data, t.nbytes);
+  }
+  const size_t rss_after_copy = MappingRssKb(st.Get("t0").data);
+  CHECK(rss_after_copy >= total_kb * 3 / 4);  // most of the source is resident
+
+  // Release each consumed range: the mapping RSS collapses to a small residue
+  // (header pages + <=1 edge page per tensor). RED until the real madvise lands.
+  for (const std::string& name : st.Names()) {
+    const vllm::StTensor& t = st.Get(name);
+    vllm::ReleaseSourcePages(t.data, t.nbytes);
+  }
+  const size_t rss_after_release = MappingRssKb(st.Get("t0").data);
+  CHECK(rss_after_release <= total_kb / 20);  // dropped below 5% of the source
+  CHECK(rss_after_copy - rss_after_release >= total_kb / 2);
+}
+
+TEST_CASE("safetensors: windowed release preserves copied bytes") {
+  const size_t page = HostPageSize();
+  std::vector<std::pair<size_t, size_t>> spans;
+  const std::string bytes = MakeVarFile({page * 4, page * 4, page * 4}, &spans);
+  // Copy every tensor with release ON, then OFF; both reproduce the file bytes.
+  for (const bool release : {true, false}) {
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(release);
+    TempFile f(bytes);
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    for (size_t i = 0; i < st.Names().size(); ++i) {
+      const vllm::StTensor& t = st.Get(st.Names()[i]);
+      std::vector<uint8_t> owned(t.nbytes);
+      std::memcpy(owned.data(), t.data, t.nbytes);
+      vllm::MaybeReleaseSourcePages(t.data, t.nbytes);  // gated
+      bool all_ok = !owned.empty();
+      for (uint8_t b : owned) all_ok = all_ok && (b == static_cast<uint8_t>(i + 1));
+      CHECK(all_ok);
+    }
+  }
+  vllm::detail::SetLoadWindowedReleaseOverrideForTesting(std::nullopt);
+}
+
+TEST_CASE("safetensors: VT_LOAD_WINDOWED_RELEASE gate semantics") {
+  const size_t page = HostPageSize();
+  const size_t each = page * 512;
+  const size_t each_kb = each / 1024;
+  std::vector<std::pair<size_t, size_t>> spans;
+  TempFile f(MakeVarFile({each}, &spans));
+
+  // Forced ON: MaybeReleaseSourcePages drops the source mapping RSS.
+  {
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(true);
+    CHECK(vllm::LoadWindowedReleaseEnabled());
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    const vllm::StTensor& t = st.Get("t0");
+    std::vector<uint8_t> owned(t.nbytes);
+    std::memcpy(owned.data(), t.data, t.nbytes);
+    REQUIRE(MappingRssKb(t.data) >= each_kb * 3 / 4);
+    vllm::MaybeReleaseSourcePages(t.data, t.nbytes);
+    CHECK(MappingRssKb(t.data) <= each_kb / 20);
+  }
+  // Forced OFF: inert; the source mapping stays resident (double-residency).
+  {
+    vllm::detail::SetLoadWindowedReleaseOverrideForTesting(false);
+    CHECK_FALSE(vllm::LoadWindowedReleaseEnabled());
+    vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+    const vllm::StTensor& t = st.Get("t0");
+    std::vector<uint8_t> owned(t.nbytes);
+    std::memcpy(owned.data(), t.data, t.nbytes);
+    vllm::MaybeReleaseSourcePages(t.data, t.nbytes);
+    CHECK(MappingRssKb(t.data) >= each_kb * 3 / 4);
+  }
+  vllm::detail::SetLoadWindowedReleaseOverrideForTesting(std::nullopt);
+}
+
+TEST_CASE("safetensors: interior-page release never drops a neighbor's bytes") {
+  const size_t page = HostPageSize();
+  // Tensor a ends 100 bytes into a page; tensor b begins in that same page.
+  // Releasing a's interior must keep the shared edge page, so b's leading bytes
+  // stay intact (and a clean re-fault would restore them anyway).
+  const size_t a_size = page * 512 + 100;
+  const size_t b_size = page * 512;
+  const size_t b_kb = b_size / 1024;
+  std::vector<std::pair<size_t, size_t>> spans;
+  TempFile f(MakeVarFile({a_size, b_size}, &spans));
+  vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(f.path());
+  const vllm::StTensor& a = st.Get("t0");
+  const vllm::StTensor& b = st.Get("t1");
+  std::vector<uint8_t> owned_a(a.nbytes), owned_b(b.nbytes);
+  std::memcpy(owned_a.data(), a.data, a.nbytes);
+  std::memcpy(owned_b.data(), b.data, b.nbytes);
+  const size_t rss_both = MappingRssKb(a.data);
+
+  vllm::ReleaseSourcePages(a.data, a.nbytes);
+
+  // b is fully intact (its own pages, plus the retained shared edge page).
+  bool b_ok = b.nbytes > 0;
+  for (int64_t i = 0; i < static_cast<int64_t>(b.nbytes); ++i)
+    b_ok = b_ok && (b.data[i] == static_cast<uint8_t>(2));
+  CHECK(b_ok);
+  // a's interior was dropped (mechanism active, RED until the real madvise
+  // lands) yet b's whole resident set is retained.
+  const size_t rss_after = MappingRssKb(a.data);
+  CHECK(rss_after >= b_kb * 3 / 4);          // b retained
+  CHECK(rss_both - rss_after >= b_kb / 2);   // a's interior dropped
 }

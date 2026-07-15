@@ -7,8 +7,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -275,6 +278,64 @@ std::map<std::string, std::string> LoadSafetensorsIndex(
     weight_map.emplace(tensor, std::move(shard));
   }
   return weight_map;
+}
+
+namespace {
+
+long HostPageSize() {
+  static const long page = [] {
+    const long p = ::sysconf(_SC_PAGESIZE);
+    return p > 0 ? p : 4096;
+  }();
+  return page;
+}
+
+// nullopt => env-driven; set => forced (test seam).
+std::optional<bool>& WindowedReleaseOverride() {
+  static std::optional<bool> value;
+  return value;
+}
+
+}  // namespace
+
+void detail::SetLoadWindowedReleaseOverrideForTesting(
+    std::optional<bool> value) {
+  WindowedReleaseOverride() = value;
+}
+
+bool LoadWindowedReleaseEnabled() {
+  const std::optional<bool> override_value = WindowedReleaseOverride();
+  if (override_value.has_value()) return *override_value;
+  // Process-cached: read the env once. DEFAULT ON; "=0" rolls back.
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_LOAD_WINDOWED_RELEASE");
+    return e == nullptr || e[0] != '0';
+  }();
+  return enabled;
+}
+
+void ReleaseSourcePages(const void* data, size_t nbytes) {
+  if (data == nullptr || nbytes == 0) return;
+  const auto ps = static_cast<uintptr_t>(HostPageSize());
+  const auto begin = reinterpret_cast<uintptr_t>(data);
+  const uintptr_t end = begin + nbytes;
+  // Fully-covered interior pages only: round begin UP, end DOWN to page bounds.
+  // A page fully inside a tensor's (non-overlapping) span holds only that
+  // tensor's bytes, so this never drops a partially copied neighbor sharing an
+  // edge page — safe regardless of the loader's copy order.
+  const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+  const uintptr_t page_end = end & ~(ps - 1);
+  if (page_end <= page_begin) return;  // span smaller than one whole page
+  // MAP_PRIVATE PROT_READ pages are clean and file-backed; MADV_DONTNEED drops
+  // the resident page and a later read re-faults it from disk. A failure merely
+  // leaves the page resident (a memory, not correctness, regression), so the
+  // return is deliberately ignored.
+  ::madvise(reinterpret_cast<void*>(page_begin),
+            static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+}
+
+void MaybeReleaseSourcePages(const void* data, size_t nbytes) {
+  if (LoadWindowedReleaseEnabled()) ReleaseSourcePages(data, nbytes);
 }
 
 }  // namespace vllm

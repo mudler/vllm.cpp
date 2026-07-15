@@ -58,6 +58,9 @@ OwnedTensor LoadBf16Direct(const TensorResolver& get, const std::string& name,
   VT_CHECK(t.nbytes == o.bytes.size(),
            "qwen3_5 dense: byte-size mismatch for " + name);
   std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  // LOAD-SAFETENSORS: source range now copied-then-dead; drop its resident pages
+  // so the owned mirror never double-resides with the mmap (spec §page-lifetime).
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -73,6 +76,7 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
   TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -101,6 +105,7 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   const auto* src = reinterpret_cast<const uint16_t*>(t.data);
   auto* dst = reinterpret_cast<float*>(o.bytes.data());
   for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -150,10 +155,12 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   VT_CHECK(packed.nbytes == r.packed.bytes.size(),
            "qwen3_5 dense: packed byte-size mismatch for " + proj);
   std::memcpy(r.packed.bytes.data(), packed.data, packed.nbytes);
+  MaybeReleaseSourcePages(packed.data, packed.nbytes);
   r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
   VT_CHECK(ws.nbytes == r.scale.bytes.size(),
            "qwen3_5 dense: scale byte-size mismatch for " + proj);
   std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  MaybeReleaseSourcePages(ws.data, ws.nbytes);
   return r;
 }
 
@@ -252,6 +259,7 @@ OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     VT_CHECK(shard.nbytes == expected,
              "qwen3_5 dense: byte-size mismatch for " + names[i]);
     std::memcpy(merged.bytes.data() + offset, shard.data, expected);
+    MaybeReleaseSourcePages(shard.data, expected);
     offset += expected;
   }
   VT_CHECK(offset == merged.bytes.size(),
@@ -311,6 +319,8 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
   DequantCtNvfp4WeightToF32(reinterpret_cast<const uint8_t*>(packed.data),
                             reinterpret_cast<const uint8_t*>(wscale.data),
                             wgs_disk, out_dim, in_dim, f32.data());
+  MaybeReleaseSourcePages(packed.data, packed.nbytes);
+  MaybeReleaseSourcePages(wscale.data, wscale.nbytes);
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
   auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
   for (int64_t r = 0; r < out_dim; ++r)

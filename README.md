@@ -41,8 +41,14 @@ OpenAI-compatible server.
 > that pre-validator binaries could hit at high concurrency (see
 > [Benchmarks](docs/BENCHMARKS.md)). The packed component stays `GATING` (no
 > speed credit) until the DGX correctness gates and a fresh 12-leg component
-> rerun pass. Host memory still retains a **22.92 GiB CPU weight mirror**, and
-> no 35B performance result is claimed.
+> rerun pass. On the memory axis, the failing binding **peak** (48.3 GB) was
+> localized to LOAD-time double-residency (the 22.92 GiB host mirror built while
+> the full source mmap stayed resident); a **windowed-load** change now releases
+> each copied-then-dead source range during the copy loop (`madvise(MADV_DONTNEED)`,
+> default on, `VT_LOAD_WINDOWED_RELEASE=0` rollback), CPU-gated with RED→GREEN
+> mincore/RSS tests — the DGX VmHWM A/B is PENDING and the binding memory axes
+> stay FAILED until the authorized exact-grid rerun. No 35B performance result is
+> claimed. See [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
 
@@ -52,7 +58,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B performance | ❌ FAILED / `GATING` | Immutable `3f256ab`: **55/124 pass, 69 fail**. Structural packed/rollback evidence is accepted. The `4a450f9` `--diagnostic-c16` reproduction captured the c16 root cause **3/3** (`duplicate live GDN state index`, `qwen3_5.cpp:73`): the runner keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 for any sequence past its first mamba block, so 2 long c16 sequences shared 1 slot (last step: 6 requests, 5 live + 27 free of 32). **Test-first repair landed**: the slot pool now keys on request identity (RED runner test threw the exact fatal → GREEN; `test_runner` 8/8, tools 132/132) | DGX correctness gates + a fresh 12-leg component rerun from the pushed SHA/root, then qkvz |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
 | Qwen3.6-35B-A3B performance | ⏸ BLOCKED | No current v0.25.0 performance result | Run only after all 27B axes pass |
-| Host-memory parity | ❌ FAILED / diagnosed | The failing **peak** (48.3 GB) is load-time double-residency: the 22.92 GiB host mirror is built while the full source mmap stays resident; steady RSS afterwards is 24.75 GB — already below vLLM's 28.5 GB peak. Allocator retention is ruled out (≤0.5 GB) | Windowed source reading + progressive page release during load first (VmHWM A/B); direct-to-device streaming remains the deeper fix |
+| Host-memory parity | ❌ FAILED / windowed-load landed, A/B pending | The failing **peak** (48.3 GB) is load-time double-residency: the 22.92 GiB host mirror is built while the full source mmap stays resident; steady RSS afterwards is 24.75 GB — already below vLLM's 28.5 GB peak. Allocator retention is ruled out (≤0.5 GB). The `LOAD-SAFETENSORS` windowed release now drops each copied-then-dead source range during load (default on; `VT_LOAD_WINDOWED_RELEASE=0` rollback), CPU RED→GREEN tests green | Run the DGX VmHWM A/B (expect ~48.3 GB off vs ~25 GB on); axes stay FAILED until the authorized exact-grid rerun. Direct-to-device streaming remains the deeper fix (still wanted for 35B) |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
 loop, with three interleaved repetitions. Ratios are direction-normalized so
@@ -80,7 +86,7 @@ reproduction recipe are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is `ACTIVE`: structural evidence is accepted. The `d82d282` c16 packed leg died with `duplicate live GDN state index`; the `4a450f9` diagnostic reproduction captured it 3/3. Root cause: the runner keyed the compact GDN state-slot pool on the mamba block-id, which collapses to the shared null block-id 0 for any sequence past its first mamba block, so 2 long c16 sequences shared 1 recurrent-state slot. **Test-first repair landed** — the pool now keys on the request identity (each live sequence owns one slot for its lifetime). This also removes latent silent cross-request GDN state corruption. DGX correctness gates + a fresh 12-leg component rerun are the next step; no partial number binds |
 | Remaining gap diagnosis | The 2026-07-14 [parity rescan](.agents/specs/parity-rescan-2026-07-14.md) grounds the failing mass as **host-side**: TTFT passes 24/24, our GPU kernels are net faster on the measured window, and the open axes are c2–c8 decode latency plus host memory. The prior RMSNorm/generated-partitions residual is **disproven** (vLLM's norm-quant fusion is FP8-only; cross-profiler artifact). Parallel host workstreams: TCP_NODELAY (DONE, measured neutral on loopback — ruled out as the decode-gap cause), memory precheck → weight streaming, and nsys c2 attribution before async-sched W3 |
 | Serving transport (TCP_NODELAY) | **DONE; measured NEUTRAL on the gate workload** (`SERVE-HTTP-TRANSPORT`). We mirror vLLM's uvicorn/asyncio default (`set_tcp_nodelay(true)`), pinned by a behavioral accepted-socket test (RED 0 → GREEN 1, 22/22). The non-binding localhost A/B sizing is neutral within noise at c1/c2 — µs loopback ACKs mean Nagle never held our ~100 ms-cadence token frames — so the mirror stays for real-network parity and the decode-gap attribution moves to the nsys c2 full-step diff |
-| Host-memory repair | Direct-to-final-device streaming is the complete fix; page eviction or post-prepare host release alone addresses only half of the peak/steady-state problem |
+| Host-memory repair | The binding **peak** is LOAD-time double-residency, so the first shot is the `LOAD-SAFETENSORS` windowed release (progressive `madvise(MADV_DONTNEED)` on each copied-then-dead source range during the copy loop; default on, `VT_LOAD_WINDOWED_RELEASE=0` rollback). Landed and CPU-gated (RED→GREEN mincore/RSS + byte-identity + neighbor-safety); DGX VmHWM A/B pending. Direct-to-final-device streaming stays the complete fix (also removes the steady mirror, wanted for 35B) |
 
 ## What is implemented
 

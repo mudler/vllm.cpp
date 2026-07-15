@@ -83,6 +83,9 @@ OwnedTensor LoadBf16Direct(const TensorResolver& get, const std::string& name,
   VT_CHECK(t.nbytes == o.bytes.size(),
            "qwen3_5 weights: byte-size mismatch for " + name);
   std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  // LOAD-SAFETENSORS: source range now copied-then-dead; drop its resident pages
+  // so the owned mirror never double-resides with the mmap (spec §page-lifetime).
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -98,6 +101,7 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
   TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -112,6 +116,7 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
   const auto* src = reinterpret_cast<const uint16_t*>(t.data);
   auto* dst = reinterpret_cast<float*>(o.bytes.data());
   for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
 
@@ -163,6 +168,7 @@ Fp8Weight LoadFp8Raw(const TensorResolver& get, const std::string& proj) {
   VT_CHECK(w.nbytes == r.packed.bytes.size(),
            "qwen3_5 weights: fp8 byte-size mismatch for " + proj);
   std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  MaybeReleaseSourcePages(w.data, w.nbytes);
   return r;
 }
 
@@ -181,6 +187,7 @@ OwnedTensor LoadFp8Transposed(const TensorResolver& get,
 
   std::vector<uint16_t> dq(static_cast<size_t>(out_dim) * in_dim);
   DequantFp8ToBf16(w.data, scale, out_dim * in_dim, dq.data());
+  MaybeReleaseSourcePages(w.data, w.nbytes);
 
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
   TransposeBf16(dq.data(), out_dim, in_dim,
@@ -216,10 +223,12 @@ Nvfp4Weight LoadNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   VT_CHECK(w.nbytes == r.packed.bytes.size(),
            "qwen3_5 weights: packed byte-size mismatch for " + proj);
   std::memcpy(r.packed.bytes.data(), w.data, w.nbytes);
+  MaybeReleaseSourcePages(w.data, w.nbytes);
   r.scale = MakeOwned(vt::DType::kI8, {out_dim, in_dim / 16});
   VT_CHECK(ws.nbytes == r.scale.bytes.size(),
            "qwen3_5 weights: scale byte-size mismatch for " + proj);
   std::memcpy(r.scale.bytes.data(), ws.data, ws.nbytes);
+  MaybeReleaseSourcePages(ws.data, ws.nbytes);
   return r;
 }
 

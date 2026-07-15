@@ -75,7 +75,19 @@ flipping 3/3-vs-6/0 leg-to-leg. Two per-run stability revisions landed test-firs
 arm's pooled 18-per-request distribution, STABILITY-gated on a 50% pooled sanity
 bound, and EXCLUDED from the gated per-rep paired axes; c16 and every non-TTFT
 axis keep 4%/15%, and E2EL is unchanged (measured c2 E2EL per-rep deviation
-≤0.30% across the three sealed roots). The fourth 12-leg component runs from the
+≤0.30% across the three sealed roots). The fourth component then SEALED
+**`complete-failed`** at `2dbe892` — the first VALID terminal disposition
+(stable, correct, `validation_error=None`; axis 8/40, paired 41/132, memory
+6/8). Decomposition: every c2 throughput/TPOT/ITL/E2EL ratio is 0.9998–1.0008
+and the memory fails are 0.023% PSS/RSS epsilons (packed uses 656 MiB LESS
+GPU memory) — ties failing a strict ≥1.0 rule that does not implement the
+spec's "no STABLE regression" contract; the one substantive candidate is a
+c16 packed −0.8% (packed 793.3–795.8 vs rollback 798.3–800.6 tok/s) that
+contradicts three same-code prior runs (arm deltas ≤0.13%) with run-4
+rollback above every prior measurement of either arm. With windowed-load
+default-ON, component peak PSS is **24.86 GB** (binding era 48.18; vLLM
+28.5). Next: a test-first acceptance NOISE BAND, then the deciding fifth run
+from the
 pushed SHA and must reach a verified terminal status before any axis binds.
 
 ## Binding 27B online gate
@@ -154,7 +166,7 @@ state log. The current checkpoint is W1D3 component gating:
 | Safety | CUDA GDN **43/43, 1,707/1,707**; packed/corner/FP16-SSM memcheck zero errors/leaks | Immutable PASS |
 | W1D3 trace harness | Packed **915** nodes with 48 packed recurrence calls; rollback **963** with 48 decomposed + 48 post-conv calls; both retain 145 BF16 GEMMs, isolate exactly 48 mode-coupled BA projections, and require every remaining signature to match | Raw capture PASS at `7ff713e`: **12/12 + 12/12** exact ranges; both oracle traces structurally exact |
 | Component runner | Production profile-control-off build; exact source/vLLM corpus manifests and partition hashes; full oracle/toolchain/artifact inventory; exact raw-sample throughput/TTFT/ITL recomputation plus bounded pinned-clock E2E/TPOT validation and duration-span consistency; frozen 64-plan fixture; fresh isolated server per leg; c2=6 requests and c16=96 requests; packed/rollback, rollback/packed, packed/rollback; one lock across exact-snapshot correctness and all 12 legs | Clean `d82d282` root `~/work/vllm.cpp-gdn-packed-component/d82d282f9efd1a5b97e7c6f1ac7a55b949849d09` is **FAILED / INCOMPLETE**: model gates and c2 6/6 complete; c16 packed r1 main batch 0/96 complete, 96/96 HTTP 500; no terminal marker |
-| Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and the gated paired run axes, per-run stability of ≤4% for non-tail timing and all memory axes and ≤15% for the tail axes (p90/p99 of ttft/tpot/itl/e2el — revised test-first after two `c172336` tail voids), fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. The c2 TTFT-family (mean/median/p90/p99 of ttft) is instead compared on the arm-pooled 18-per-request distribution, stability-gated on a 50% pooled sanity bound, and excluded from the gated per-rep paired axes (bimodal arrival lottery; c16/non-TTFT keep 4%/15%; E2EL unchanged). A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **VOID×3, all TTFT-family (runs 1–2 tails, run 3 c2 means via the bimodal prefill phase lottery); throughput/TPOT/ITL/memory stable ≤1.13% and c2 E2EL ≤0.30% in every run. Mechanism grounded (arrival lottery, no scheduler divergence) and the c2 TTFT-family pooled test-first; the fourth 12-leg component runs from the pushed SHA; NO SPEED CREDIT** |
+| Performance | Marker-last finalization requires all **40 timing + 8 memory** median axes and the gated paired run axes, per-run stability of ≤4% for non-tail timing and all memory axes and ≤15% for the tail axes (p90/p99 of ttft/tpot/itl/e2el — revised test-first after two `c172336` tail voids), fixed 1-GiB memory-return tolerance, parsed throttle counters, successful pinned GPU-idle probes, exact server/client/preflight commands and lifecycle markers. The c2 TTFT-family (mean/median/p90/p99 of ttft) is instead compared on the arm-pooled 18-per-request distribution, stability-gated on a 50% pooled sanity bound, and excluded from the gated per-rep paired axes (bimodal arrival lottery; c16/non-TTFT keep 4%/15%; E2EL unchanged). A stable regression is `complete-failed`; a sealable unstable/malformed run is `complete-void` | **VOID×3, all TTFT-family (runs 1–2 tails, run 3 c2 means via the bimodal prefill phase lottery); throughput/TPOT/ITL/memory stable ≤1.13% and c2 E2EL ≤0.30% in every run. Mechanism grounded (arrival lottery, no scheduler divergence) and the c2 TTFT-family pooled test-first; the fourth seal is `complete-failed` at `2dbe892` (c2/memory epsilon-ties under the strict rule; c16 −0.8% unreproduced 1-of-4); acceptance noise band next, then the deciding fifth run; NO SPEED CREDIT** |
 
 Failure evidence is immutable. Order/run/execution/c16 raw/client/server SHA-256
 values are `a2de5b07…6de0` / `297e3c62…a6fb` / `ff71c9f0…0684` /

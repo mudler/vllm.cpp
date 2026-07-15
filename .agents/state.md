@@ -9979,3 +9979,18 @@ expected `complete-pass` (authorizing qkvz/exact grid); c16 −0.8% reproduced
 → a genuine packed-path perf defect and the trace-driven scan resumes on the
 packed kernel. Binding stays **55/124**, `benchmark_binding=false`, no speed
 credit.
+
+## 2026-07-15 — checkpoint repair: d1555d5 pushed without its README/BENCHMARKS updates
+
+Orchestration slip, recorded honestly: commit `d1555d5` (fourth-seal
+decomposition) was pushed with only the state/ledger appends because its
+README edit failed to apply (stale match after the concurrent `2dbe892`
+row rewrite) and the shell chain did not stop on that failure — violating the
+same-change documentation-checkpoint rule; its CI documentation-checkpoint
+run will correctly show red. A history rewrite of pushed `main` was
+considered and rejected (not covered by the push policy). This immediate
+follow-up commit carries the required README and `docs/BENCHMARKS.md`
+updates for the fourth seal (decomposition, epsilon-tie analysis, c16
+non-reproduction, the 24.86 GB component peak-PSS observation, and the
+noise-band precommitment). Process lesson applied: never chain `git commit`
+after a doc-editing script without checking its exit status.

@@ -10971,3 +10971,19 @@ require the production profile-control-OFF build via the recorded configure
 contract. The grid relaunches from the new pushed SHA in a fresh root; the
 a195f54 evidence root holds only the corpus copy (no GPU work ran) and is
 superseded.
+
+## 2026-07-15 — second H1d-era grid blocker repaired: record-execution now records the production build for timed grids
+
+The relaunched grid failed pre-GPU at record-execution: the driver's shared
+call hard-coded `--profile-control on` (the H1d trace-era value), while the
+grid summary requires `profile_control=false` for timed evidence
+(`online_gate_summary.py:434`) and the production-build rule requires timing
+profile-control-OFF binaries. Fixed test-first
+(`test_execute_grid_records_production_profile_control_off` observed RED):
+the driver now passes the flag mode-conditionally (`trace-only` → `on`,
+`--execute` → `off`); trace-side validation (which requires the instrumented
+build) is untouched. Full tools suite, bash -n and shellcheck green. The
+first-launch pre-GPU refusals (the unconditional hold, the plan-first
+provisioning order, and this flag) are all recorded; no GPU work ran in the
+superseded 641f259 evidence root. The grid relaunches from this SHA via
+dry-run plan → byte-identical binding corpus copy → --execute.

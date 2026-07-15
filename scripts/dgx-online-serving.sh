@@ -254,6 +254,10 @@ fi
   echo "provenance-recorded build did not produce examples/server" >&2
   exit 1
 }
+# Timed grids record the production (profile-control-OFF) build; the H1d
+# trace campaign records the instrumented ON build. The grid summary
+# requires profile_control=false for timed evidence.
+profile_control_flag=$([[ ${mode} == trace-only ]] && echo on || echo off)
 "${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" \
   python3 "${repo_root}/tools/bench/online_gate.py" record-execution \
   --output "${execution_manifest}" \
@@ -270,7 +274,7 @@ fi
   --num-blocks "${num_blocks}" \
   --max-num-seqs "${max_num_seqs}" \
   --max-num-batched-tokens "${max_num_batched_tokens}" \
-  --profile-control on
+  --profile-control "${profile_control_flag}"
 
 spid=""
 mpid=""

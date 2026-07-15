@@ -825,6 +825,24 @@ class OnlineClientContractTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+
+    def test_execute_grid_records_production_profile_control_off(self) -> None:
+        """The timed grid must record a production (profile-control-OFF) build.
+
+        The shared record-execution call carried the H1d-era hard-coded
+        `--profile-control on`; the grid summary requires profile_control
+        False for timed evidence (online_gate_summary.py), and trace-only
+        keeps ON. The driver must pass the flag mode-conditionally.
+        """
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        script = (repo / "scripts" / "dgx-online-serving.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('--profile-control on\n', script)
+        self.assertIn('--profile-control "${profile_control_flag}"', script)
+        self.assertIn('profile_control_flag=', script)
+        self.assertIn('trace-only', script.split("profile_control_flag=", 1)[1].split("\n", 1)[0])
+
     def test_execute_grid_is_unheld_after_w1d3_closure_authorization(self) -> None:
         """The H1d-era unconditional --execute hold must be lifted.
 

@@ -8,6 +8,17 @@
 
 namespace vt {
 
+// Cross-stream event handle (CUDA event; no-op on synchronous backends).
+// Opaque: created by Backend::CreateEvent, released with DestroyEvent. `device`
+// records the owning backend so a holder can release it without extra state.
+// On synchronous/unified backends the handle stays null and every event op is a
+// no-op (all prior work on a queue has already completed by the time the host
+// observes it). Mirrors the `torch.Event` in vllm/v1/worker/gpu/async_utils.py.
+struct Event {
+  Device device;
+  void* handle = nullptr;
+};
+
 class Backend {
  public:
   virtual ~Backend() = default;
@@ -32,6 +43,38 @@ class Backend {
 
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
+
+  // --- Async-output primitives (ENG-ASYNC-SCHED W3, async_utils.py:12-70) ------
+  // The sampler-output overlap needs (a) page-locked host memory a copy engine
+  // can DMA into without a staging bounce and (b) cross-stream events so a copy
+  // queue can wait the main queue, record completion, and the HOST can wait ONLY
+  // that copy — never the main stream. These degenerate to synchronous host ops
+  // on CPU/unified backends (the base implementations below); CUDA overrides
+  // them with cudaHostAlloc + cudaEvent_t. Design mirrors torch's Event/pinned
+  // usage in vllm/v1/worker/gpu/async_utils.py at pin e24d1b24.
+
+  // Page-locked host allocation for a non-blocking D2H destination. Base
+  // implementation returns ordinary host memory via Alloc (correct on unified
+  // memory where the copy is already a memcpy); CUDA uses cudaHostAllocDefault.
+  // Released with FreePinned. `bytes` may be 0 (returns a valid 1-byte block).
+  virtual void* AllocPinned(size_t bytes);
+  virtual void FreePinned(void* p);
+
+  // Cross-stream event lifecycle. Base implementations are no-ops returning a
+  // null-handle Event (synchronous backends have nothing to wait on).
+  virtual Event CreateEvent();
+  virtual void DestroyEvent(Event& e);
+  // Record `e` on the queue's stream: it completes once all work submitted to
+  // `q` up to this point has finished (async_utils.py copy_event.record).
+  virtual void RecordEvent(Event& e, Queue& q);
+  // Block the HOST until `e` has completed (async_utils.py
+  // copy_event.synchronize — the ONLY blocking sync, and it waits the COPY
+  // queue's event, so the main queue never blocks).
+  virtual void SynchronizeEvent(Event& e);
+  // Make later work on `q` wait for `e` WITHOUT blocking the host — the ordering
+  // primitive behind `copy_stream.wait_stream(main_stream)` (record an event on
+  // the main queue, then QueueWaitEvent it on the copy queue).
+  virtual void QueueWaitEvent(Queue& q, Event& e);
 
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }

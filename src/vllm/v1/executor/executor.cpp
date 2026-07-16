@@ -19,4 +19,12 @@ ModelRunnerOutput Executor::sample_tokens(
   return runner_.sample_tokens(grammar_output);
 }
 
+std::unique_ptr<AsyncModelRunnerOutput> Executor::sample_tokens_async(
+    const std::optional<GrammarOutput>& grammar_output) {
+  // Upstream: collective_rpc("sample_tokens", ..., non_block=True) hands back an
+  // AsyncOutputFuture wrapping the runner's AsyncModelRunnerOutput
+  // (uniproc_executor.py:97-100). T0 single-worker: a direct call.
+  return runner_.sample_tokens_async(grammar_output);
+}
+
 }  // namespace vllm::v1

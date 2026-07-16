@@ -27,10 +27,12 @@
 // to the runner; Task 3 consumes it).
 #pragma once
 
+#include <memory>
 #include <optional>
 
-#include "vllm/v1/core/sched/output.h"          // SchedulerOutput
-#include "vllm/v1/engine/types.h"               // ModelRunnerOutput
+#include "vllm/v1/core/sched/output.h"             // SchedulerOutput
+#include "vllm/v1/engine/types.h"                  // ModelRunnerOutput
+#include "vllm/v1/worker/gpu/async_output.h"       // AsyncModelRunnerOutput
 #include "vllm/v1/worker/gpu/model_runner_base.h"  // ModelRunnerBase
 
 namespace vllm::v1 {
@@ -56,6 +58,18 @@ class Executor {
   // request is scheduled); forwarded to the runner (Task 3 consumes it).
   ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output = std::nullopt);
+
+  // sample_tokens_async (uniproc_executor.py:79-106 non_block path): the overlap
+  // variant selected by EngineCore::step_with_batch_queue under async scheduling.
+  // Forwards to runner.sample_tokens_async, whose AsyncModelRunnerOutput defers
+  // the sampled-id copy so the engine only blocks (get_output) at consume time.
+  // Degenerates to a ready output for a synchronous runner.
+  std::unique_ptr<AsyncModelRunnerOutput> sample_tokens_async(
+      const std::optional<GrammarOutput>& grammar_output = std::nullopt);
+
+  // runner_supports_async: pass-through to the runner's compat advertisement,
+  // consumed by the engine wiring's SchedulerConfig::ResolveAsyncScheduling.
+  bool runner_supports_async() const { return runner_.runner_supports_async(); }
 
  private:
   ModelRunnerBase& runner_;

@@ -199,6 +199,7 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/block_table.cpp
   src/vllm/v1/worker/gpu/input_batch.cpp
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
+  src/vllm/v1/worker/gpu/async_output.cpp
   src/vllm/v1/worker/gpu/runner.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/backends/utils.cpp

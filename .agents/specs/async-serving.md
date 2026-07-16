@@ -53,17 +53,60 @@ value → 5/7 fail), the `last_sampled_tokens`/`prefill_len` batch-lifecycle in
 reads-`last_sampled`-over-a-corrupted-host case in `test_runner.cpp`; full CPU
 ctest 110/110, tools 164/164, clean `-Werror` rebuild.
 
-**Remaining W3 leaf (DGX-gated): the sampler-OUTPUT half + the enable flip.** The
-non-blocking sampled-token-ID D2H on a copy stream + event (`async_utils.py:12-70`)
-+ the `vt::Backend` event/pinned-host primitives — the sampler-output half of the
-~3.25 ms/step GPU-idle capture — plus flipping `runner_supports_async` TRUE by
-default (so `ResolveAsyncScheduling` engages mcb=2 in production). These are the
-CUDA-only pieces that cannot be CPU-validated; they land with the DGX gate. Until
-then `runner_supports_async` resolves FALSE for the production runner (a faithful
-mirror of vLLM's compat fallback), so the production default stays synchronous and
-both model gates are byte-identical to main; `VT_ASYNC_SCHED=1` (scheduler) and
-`VT_ASYNC_RUNNER=1` (runner combine) are the bring-up opt-ins once the runner path
-is DGX-validated. The joint spike's speed hypothesis is closed below.
+**W3 runner sampler-OUTPUT half LANDED + CPU-gated (2026-07-16), `ACTIVE`.** The
+sampler-output overlap machinery now lands, mirroring `async_utils.py:12-70` /
+`gpu_model_runner.py:242-332` 1:1, CPU test-first:
+- **`vt::Backend` event + pinned-host primitives** (`include/vt/backend.h`,
+  `src/vt/backend.cpp` base impls, `src/vt/cpu/cpu_backend.cpp` inherit,
+  `src/vt/cuda/cuda_backend.cu` overrides): `AllocPinned`/`FreePinned`
+  (cudaHostAlloc) + `CreateEvent`/`DestroyEvent`/`RecordEvent`/`SynchronizeEvent`/
+  `QueueWaitEvent` (cudaEvent + cudaStreamWaitEvent). Synchronous CPU degeneration
+  (null-handle events, host alloc) is the exact contract the CUDA override honours;
+  contract-tested in `tests/vt/test_backend.cpp`.
+- **`AsyncGPUModelRunnerOutput`** (`include/vllm/v1/worker/gpu/async_output.{h,cpp}`,
+  1:1 with `AsyncOutput.__init__`/`get_output`): owns the device-resident sampled-id
+  snapshot; the ctor makes the COPY queue wait the MAIN queue, issues the
+  non-blocking D2H into an owned pinned host buffer, and records the ready event —
+  the MAIN queue is NEVER synchronized. `get_output()` blocks only that event and
+  materializes the `ModelRunnerOutput`. `ReadyModelRunnerOutput` is the
+  already-materialized sync degeneration.
+- **`Sampler::forward(..., sampled_ids_out)`** (`sampler.{h,cpp}`): device-resident
+  greedy fast path — writes ids straight into the caller's device tensor via
+  `GreedyArgmax`, NO host download / NO main-queue sync (`sampled_on_device`);
+  default `nullptr` keeps the sync path byte-identical.
+- **`GPUModelRunner::sample_tokens_async` + `runner_supports_async`** (`runner.{h,cpp}`):
+  the overlap variant produces ids device-resident, does the on-GPU post_update
+  (`last_sampled` scatter) with the host token write-back DELETED on the async path,
+  and returns the `AsyncGPUModelRunnerOutput` after issuing the D2H on the lazily-
+  created copy queue. `runner_supports_async()` advertises the compat gate
+  (`async_input_combine_`, from `VT_ASYNC_RUNNER`).
+- **Executor + depth-2 seam** (`executor.{h,cpp}`, `model_runner_base.h`, `core.{h,cpp}`):
+  `sample_tokens_async` threads through `Executor` and `EngineCore::step_with_batch_queue`;
+  `BatchQueueItem` holds an `AsyncModelRunnerOutput` whose `get_output()` is resolved
+  at CONSUME time (`update_from_output`) — off the model's critical path, so the copy
+  overlaps the next step's forward. Validated by the depth-2 cycle
+  `test_engine_core_proc.cpp:479` (mcb=2) with a synchronous runner double.
+
+Everything is behind `VT_ASYNC_RUNNER` / `set_async_input_combine`, **default OFF**:
+`runner_supports_async()` returns false and `sample_tokens_async` degenerates to the
+byte-identical sync `sample_tokens`, so production is unchanged. Tested RED→GREEN on
+CPU (RED = splice a stale value into `AsyncGPUModelRunnerOutput::get_output` → the
+async-output unit cases + the runner async-ON≡sync decode both fail): full CPU ctest
+**111/111**, tools **164/164**, clean `-Werror` rebuild 0 warnings.
+
+**Remaining W3 leaf (the DGX enable-flip): production depth-2 engagement + the
+device combine kernel.** Two pieces stay DGX-gated because they change production
+GPU behavior that cannot be CPU-validated: (1) wire `LoadedEngine` to construct an
+`AsyncScheduler` + pass `max_concurrent_batches=2` to the async engine when
+`ResolveAsyncScheduling(runner_.runner_supports_async())` resolves ON (member
+reorder so `runner_` precedes the scheduler; the seam through `step_with_batch_queue`
+is already wired + CPU-tested), and (2) port the input-half `combine` + the
+`last_sampled` scatter loops to a device kernel over GPU-resident tensors for
+discrete backends (the host-array form is correct on the CPU + GB10-unified gate
+backends). `VT_ASYNC_RUNNER=1` is the single env the DGX A/B flips to engage full W3
+(async input-combine + async output + `runner_supports_async` TRUE → depth-2);
+`VT_ASYNC_SCHED=0` is the same-binary rollback. The joint spike's speed hypothesis is
+closed below.
 
 W3 is an unmet mirror obligation whose speed hypothesis is now closed. vLLM
 resolves `async_scheduling=None` to **True** when compatible
@@ -141,8 +184,8 @@ gates without treating this neutral control as implementation evidence.
 |---|---|---|
 | Engine core | `EngineCore::step()` synchronously schedules, executes, samples, then updates (`src/vllm/v1/engine/core.cpp:37-85`); `EngineCoreProc` constructs one concurrent batch and rejects depth >1 (`src/vllm/v1/engine/core_proc.cpp:18-35`) | `step_with_batch_queue` depth 2, schedule N+1 before consuming N |
 | Scheduler | Output placeholders are fixed at zero (`src/vllm/v1/core/sched/scheduler.cpp:143-145,587-600`) | `AsyncScheduler` placeholder/stale-frame/cache accounting |
-| Sampled token | Greedy allocates a transient device buffer, copies into pageable `std::vector`, synchronizes the main queue, then CPU-writes the next token (`src/vllm/v1/sample/sampler.cpp:30-53,90-99`; `src/vllm/v1/worker/gpu/runner.cpp:688-723`) | Persistent GPU `last_sampled_tokens`, on-device combine/post-update, and pinned nonblocking output copy |
-| Runtime seam | `vt::Backend` exposes queue creation/copy/synchronize but no public event or pinned-host allocation API (`include/vt/backend.h:15-34`) | Add backend-neutral event/wait and pinned-output ownership, with synchronous CPU degeneration; current graph-stream code proves streams only, not events |
+| Sampled token | Sync path unchanged. Async path (`sample_tokens_async`): `Sampler::forward(sampled_ids_out)` writes ids device-resident (greedy `GreedyArgmax`, no download/sync), `AsyncGPUModelRunnerOutput` D2Hs on a copy queue + event, on-GPU post_update scatters `last_sampled` (host write-back deleted) — `src/vllm/v1/sample/sampler.cpp`, `src/vllm/v1/worker/gpu/async_output.cpp`, `runner.cpp::sample_tokens_async` | REMAINING (DGX device kernel): port the `last_sampled` scatter + input-half combine to a device kernel for discrete backends (host-array form is correct on CPU + GB10-unified) |
+| Runtime seam | LANDED (2026-07-16): `vt::Backend` now exposes `AllocPinned`/`FreePinned` + `CreateEvent`/`DestroyEvent`/`RecordEvent`/`SynchronizeEvent`/`QueueWaitEvent` (`include/vt/backend.h`, base sync-degeneration `src/vt/backend.cpp`, CUDA `src/vt/cuda/cuda_backend.cu`); contract-tested `tests/vt/test_backend.cpp` | — |
 | Diagnostic | `tools/bench/profile_vllm_online_gate.py` can force and record oracle async mode; `tools/bench/finalize_async_credit.py` validates six legs/two traces and writes the hashed marker last; CPU contracts are green | accepted `3812d8` completes timing + traces at **1.002153×** total and **1.002004×** traced GPU time; neutral for speed, digest/batch-shape sensitivity explicit, no W3 implementation claim |
 
 ## Port map
@@ -172,8 +215,8 @@ Leaf W3 — `ENG-ASYNC-SCHED` (overlap scheduling, mirror default ON):
 |---|---|---|
 | `vllm/v1/core/sched/async_scheduler.py:12-75` | new `src/vllm/v1/core/sched/async_scheduler.cpp` + header; make `Scheduler::update_after_schedule` and the per-request output update protected-virtual in `include/vllm/v1/core/sched/scheduler.h:201-205` (extract `_update_request_with_output` analog from `update_from_output`) | Placeholder counting (`num_output_placeholders` on `vllm/v1/request.py:141` → our `include/vllm/v1/request.h`), `async_tokens_to_discard` stale-frame drop, cache-blocks-minus-placeholders |
 | `vllm/v1/engine/core.py:519-611` (`step_with_batch_queue`) | extend `src/vllm/v1/engine/core.cpp` (`EngineCore::step_with_batch_queue`, depth = `max_concurrent_batches` = 2) | Grammar deferral branch (`core.py:559-570`) ported as-is; futures become a small result-slot struct (no `concurrent.futures`) |
-| `vllm/v1/worker/gpu/async_utils.py:12-70`; `vllm/v1/outputs.py:298-307` | extend `vt::Backend` with event record/wait/synchronize plus pinned-host allocation; add `AsyncOutput` in `src/vllm/v1/worker/gpu/runner.cpp` with sampled-id D2H on a second queue and `get_output()` waiting only its event | Queue creation already exists, but no public event or pinned-host primitive exists today. CUDA implements them; CPU degenerates to synchronous copy. The copy queue waits the main queue/event and stays outside graph capture |
-| `vllm/v1/worker/gpu/input_batch.py:304-406,457-543`; `model_runner.py:613,954,1423-1445` | **INPUT HALF LANDED (2026-07-16):** `combine_sampled_and_draft_tokens` device-neutral port (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`) + `last_sampled_tokens`/`prefill_len` on `InputBatch` (`input_batch.cpp`, seed+condense+swap) + `post_update`-style `last_sampled` write & combine wiring on the runner (`runner.cpp`, behind `VT_ASYNC_RUNNER`, default OFF). REMAINING: the DGX device kernel (loop → Triton) + delete the host write-back on the async path | The device-code delta of this spike: the combine/post-update pair. Landed as the device-neutral CPU logic (host arrays; the DGX leaf ports the loop to the cited Triton kernel over GPU-resident tensors). draft-token lane degenerates to width 1 until `SPEC-MTP`; capture-safe host-side prep (checked both sides) |
+| `vllm/v1/worker/gpu/async_utils.py:12-70`; `vllm/v1/outputs.py:298-307` | **LANDED (2026-07-16):** `vt::Backend` event/pinned primitives (`include/vt/backend.h`, `src/vt/backend.cpp`, `src/vt/cuda/cuda_backend.cu`); `AsyncGPUModelRunnerOutput` + `AsyncModelRunnerOutput`/`ReadyModelRunnerOutput` (`include/vllm/v1/worker/gpu/async_output.{h,cpp}`) with the sampled-id D2H on the copy queue + `get_output()` waiting only its event; `GPUModelRunner::sample_tokens_async` (`runner.cpp`); the `Executor`+`step_with_batch_queue` seam (`executor.{h,cpp}`, `core.{h,cpp}`, `model_runner_base.h`) resolving `get_output()` at consume time | CUDA implements the primitives; CPU degenerates to synchronous copy. The copy queue waits the main queue/event and stays outside graph capture. Contract + unit + depth-2 CPU tests: `tests/vt/test_backend.cpp`, `tests/vllm/v1/worker/test_async_output.cpp`, `test_runner.cpp` (async-ON≡sync), `test_engine_core_proc.cpp:479` |
+| `vllm/v1/worker/gpu/input_batch.py:304-406,457-543`; `model_runner.py:613,954,1423-1445` | **INPUT HALF LANDED (2026-07-16):** `combine_sampled_and_draft_tokens` device-neutral port (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`) + `last_sampled_tokens`/`prefill_len` on `InputBatch` (`input_batch.cpp`, seed+condense+swap) + `post_update`-style `last_sampled` write & combine wiring on the runner (`runner.cpp`, behind `VT_ASYNC_RUNNER`, default OFF). **OUTPUT HALF also landed (2026-07-16):** `sample_tokens_async` now does the on-GPU post_update (`last_sampled` scatter) and DELETES the host token write-back on the async path. REMAINING: the DGX device kernel (scatter + combine loop → Triton) for discrete backends | The device-code delta of this spike: the combine/post-update pair. Landed as the device-neutral CPU logic (host arrays; the DGX leaf ports the loop to the cited Triton kernel over GPU-resident tensors). draft-token lane degenerates to width 1 until `SPEC-MTP`; capture-safe host-side prep (checked both sides) |
 | `vllm/config/vllm.py:952,959-1038`; `vllm/config/scheduler.py:158-162,180-189` | extend `include/vllm/config/scheduler.h` / `src/vllm/config/scheduler.cpp` (+ engine wiring): `async_scheduling` tri-state with default-ON resolution and the compat fallbacks relevant to us (pooling n/a, spec-decode method gate recorded for `SPEC-MTP`) | Mirror the log line "Asynchronous scheduling is enabled/disabled" for A/B auditability |
 
 Leaf W4 — `ENG-PRIORITY-SCHED` (priority policy, separable sibling):

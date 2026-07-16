@@ -68,14 +68,17 @@ namespace vllm::v1 {
 class StructuredOutputManager;  // vllm/v1/structured_output/manager.h
 
 // A scheduled-and-executed batch waiting in the batch queue (core.py:197-198
-// deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]). Our
-// T0 executor resolves execute_model / sample_tokens EAGERLY (synchronous
-// single-process), so the "future" is the already-computed ModelRunnerOutput
-// carried alongside its SchedulerOutput; the separate exec_future is unnecessary
-// (a failed eager forward throws directly through the engine-fatal guard rather
-// than surfacing as a None result). See EngineCore::step_with_batch_queue.
+// deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]). The
+// "future" is an AsyncModelRunnerOutput: under async scheduling
+// (ENG-ASYNC-SCHED W3) it may defer the sampled-id D2H, so its get_output() is
+// only resolved when this batch is CONSUMED (update_from_output) — off the model's
+// critical path, letting the copy overlap the next step's forward. A synchronous
+// runner hands back a ReadyModelRunnerOutput (already materialized), so the sync
+// path is unchanged. A failed eager forward throws directly through the
+// engine-fatal guard rather than surfacing as a None result. See
+// EngineCore::step_with_batch_queue.
 struct BatchQueueItem {
-  ModelRunnerOutput model_output;
+  std::unique_ptr<AsyncModelRunnerOutput> async_output;
   SchedulerOutput scheduler_output;
 };
 

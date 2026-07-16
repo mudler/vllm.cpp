@@ -62,8 +62,21 @@ class Sampler {
   // Sampler.forward. `logits` [num_reqs, vocab] f32 is mutated in place through
   // the pipeline (upstream's logits.to(float32) is a no-op copy when already f32,
   // so upstream mutates in place too). Returns the sampled tokens (+ logprobs).
+  //
+  // `sampled_ids_out` (ENG-ASYNC-SCHED W3, default nullptr = byte-identical sync
+  // path): when non-null it must be a device-resident int64 [num_reqs] (or
+  // [num_reqs,1]) tensor. The sampler writes the final sampled ids into it so the
+  // async output D2H (AsyncGPUModelRunnerOutput) — not the sampler — owns the
+  // single host copy. On the all-greedy, no-logprobs gate path this stays FULLY
+  // device-resident (GreedyArgmax writes the tensor directly; no host download,
+  // no main-queue synchronize) and the returned SamplerOutput.sampled_on_device
+  // is true with an empty host `sampled_token_ids`. Any batch with random rows or
+  // logprobs falls back to the host `sample()` path and then copies the host ids
+  // into `sampled_ids_out` (correct, no zero-copy win — the greedy gate is the
+  // overlap target; mirrors async_utils.py keeping ids GPU-side at :31).
   SamplerOutput forward(vt::Queue& q, vt::Tensor& logits,
-                        const SamplingMetadata& sampling_metadata) const;
+                        const SamplingMetadata& sampling_metadata,
+                        vt::Tensor* sampled_ids_out = nullptr) const;
 
  private:
   // Sampler.sample. Runs steps 7a-7f; returns the [num_reqs] host token ids.

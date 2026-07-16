@@ -87,6 +87,14 @@ struct SamplerOutput {
   // logprobs_tensors upstream (LogprobsTensors | None): the sampler's
   // gather_logprobs payload, None when no logprobs were requested this step.
   std::optional<LogprobsTensors> logprobs_tensors;
+  // ENG-ASYNC-SCHED W3: set when Sampler::forward was given a device out-tensor
+  // and produced the sampled ids DEVICE-RESIDENT (all-greedy fast path) WITHOUT a
+  // host download — `sampled_token_ids` is then intentionally empty and the
+  // async-output D2H (AsyncGPUModelRunnerOutput) owns the single copy to host.
+  // Upstream keeps sampler_output.sampled_token_ids on the GPU unconditionally
+  // (async_utils.py:31); this flag records that we took the same device-resident
+  // route on our greedy gate path (sync path leaves it false, byte-identical).
+  bool sampled_on_device = false;
 };
 
 // ModelRunnerOutput (vllm/v1/outputs.py): the runner -> scheduler result,

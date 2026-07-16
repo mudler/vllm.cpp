@@ -708,14 +708,13 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   return std::nullopt;  // MRV2 split: forward done, sample separately.
 }
 
-ModelRunnerOutput GPUModelRunner::sample_tokens(
-    const std::optional<GrammarOutput>& grammar_output) {
-  ModelRunnerOutput out;
+// Assemble the [num_reqs, vocab] logits + apply the grammar bitmask. Extracted
+// verbatim from sample_tokens (same ops, same order) so sample_tokens and
+// sample_tokens_async share ONE assembly path (byte-identical sync behavior).
+vt::Tensor GPUModelRunner::assemble_sample_logits(
+    const std::optional<GrammarOutput>& grammar_output,
+    std::vector<float>& sampled_logits) {
   const int num_reqs = exec_state_.num_reqs;
-  if (num_reqs == 0) {
-    return out;  // 0-token flush step (nothing sampled).
-  }
-
   const int64_t vocab = config_.vocab_size;
 
   // Assemble the [num_reqs, vocab] logits the sampler runs on. Three cases:
@@ -729,7 +728,6 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   //  (B) HOST path (VT_LOGITS_GATHER=0): full [num_actual_tokens,vocab] host
   //      logits — re-gather the per-request rows on host via logits_indices,
   //      exactly as before.
-  std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits;
   ForwardLogits& fl = exec_state_.logits;
   if (fl.on_device()) {
@@ -778,6 +776,19 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     apply_grammar_bitmask(*grammar_output, exec_state_.req_ids, {}, queue_,
                           logits);
   }
+  return logits;
+}
+
+ModelRunnerOutput GPUModelRunner::sample_tokens(
+    const std::optional<GrammarOutput>& grammar_output) {
+  ModelRunnerOutput out;
+  const int num_reqs = exec_state_.num_reqs;
+  if (num_reqs == 0) {
+    return out;  // 0-token flush step (nothing sampled).
+  }
+
+  std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
+  vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
 
   // SamplingMetadata in the SAME dense [0, num_reqs) order (M1.7; CLOSES the
   // make_sampling_metadata wiring dep). Then Sampler.forward.
@@ -825,6 +836,101 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     }
   }
   return out;
+}
+
+GPUModelRunner::~GPUModelRunner() {
+  // Release the lazily-created async-output copy queue (gpu_model_runner.py has
+  // no explicit teardown; our vt::Queue owns a CUDA stream that must be freed).
+  if (async_copy_queue_.id != 0) {
+    vt::DestroyQueue(async_copy_queue_);
+  }
+}
+
+vt::Queue& GPUModelRunner::get_or_create_async_copy_queue() {
+  // _get_or_create_async_output_copy_stream (gpu_model_runner.py:1137-1141): a
+  // single dedicated copy stream on the runner's device, created on first use so
+  // the synchronous production path never allocates it.
+  if (async_copy_queue_.id == 0) {
+    async_copy_queue_ = vt::CreateQueue(queue_.device);
+  }
+  return async_copy_queue_;
+}
+
+std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
+    const std::optional<GrammarOutput>& grammar_output) {
+  // When async is NOT engaged (production default), degenerate to the byte-
+  // identical synchronous path wrapped as a ready output — so a caller in the
+  // depth-2 loop can always call sample_tokens_async without branching, yet the
+  // sync behavior is unchanged. The device-resident overlap path below runs only
+  // under VT_ASYNC_RUNNER / set_async_input_combine.
+  if (!async_input_combine_) {
+    return std::make_unique<ReadyModelRunnerOutput>(sample_tokens(grammar_output));
+  }
+
+  const vt::Device dev = queue_.device;
+  const int num_reqs = exec_state_.num_reqs;
+
+  ModelRunnerOutput skeleton;
+  if (num_reqs == 0) {
+    // 0-token flush step: nothing sampled. Return an already-complete async
+    // output (a 1-byte device snapshot, zero rows) so the seam is uniform.
+    void* empty = vt::Alloc(dev, 1);
+    vt::Queue& copy_q = get_or_create_async_copy_queue();
+    return std::make_unique<AsyncGPUModelRunnerOutput>(
+        std::move(skeleton), dev, empty, /*num_reqs=*/0, queue_, copy_q);
+  }
+
+  std::vector<float> sampled_logits;
+  vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+  const SamplingMetadata sm = input_batch_.make_sampling_metadata();
+
+  // Sample DEVICE-RESIDENT: the sampler writes the ids into a FRESH device buffer
+  // (owned by the async output below, so a depth-2 next step may reuse the
+  // runner's working buffers without tearing this snapshot). The sampler writes
+  // it device-resident (all-greedy: no host download inside the sampler), and the
+  // async output owns the single sampled-id copy to host. Mirrors
+  // sampler_output.sampled_token_ids staying GPU-side (async_utils.py:31).
+  void* dev_ids =
+      vt::Alloc(dev, static_cast<size_t>(num_reqs) * sizeof(int64_t));
+  vt::Tensor dev_ids_t = vt::Tensor::Contiguous(
+      dev_ids, vt::DType::kI64, dev, {static_cast<int64_t>(num_reqs)});
+  (void)sampler_.forward(queue_, logits, sm, &dev_ids_t);
+
+  // post_update (input_batch.py:457-543 post_update / states.py): record this
+  // step's last sampled id per req_state so the NEXT step's
+  // combine_sampled_and_draft_tokens builds its decode input id, and advance the
+  // write-back column counter. The token VALUE append to token_ids_cpu /
+  // req_output_token_ids is DELETED on the async path (the runner does the
+  // post_update only; host token bookkeeping for detok/penalties is fed by the
+  // scheduler's update_from_output when get_output() materializes).
+  //
+  // Because our input-half combine reads `last_sampled_tokens` as a HOST array
+  // (device-neutral, the DGX device-kernel leaf ports it), this scatter needs the
+  // sampled ids host-valid before the next step's combine. `Synchronize` makes
+  // the host read of `dev_ids` well-defined on EVERY backend (no-op on CPU where
+  // the sampler already ran synchronously; it drains the async GreedyArgmax on
+  // CUDA so there is no read-before-write race). This is the ONE ordering cost the
+  // host-array combine still pays; the DGX device-kernel leaf (last_sampled scatter
+  // + combine on GPU-resident tensors, main-stream-ordered) removes it and unlocks
+  // the full overlap — the sampled-id OUTPUT D2H below is already deferred
+  // (get_output) so detok/output processing overlaps the next forward regardless.
+  // Runs OUTSIDE any CUDA-graph capture (post-sample host-side).
+  vt::GetBackend(dev.type).Synchronize(queue_);
+  const int64_t* ids = static_cast<const int64_t*>(dev_ids);
+  skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+    skeleton.req_ids.push_back(req_id);
+    skeleton.req_id_to_index[req_id] = i;
+    input_batch_.last_sampled_tokens[static_cast<size_t>(i)] =
+        static_cast<int32_t>(ids[i]);
+    input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+  }
+
+  // Issue the non-blocking sampled-id D2H on the COPY queue + record the event.
+  vt::Queue& copy_q = get_or_create_async_copy_queue();
+  return std::make_unique<AsyncGPUModelRunnerOutput>(
+      std::move(skeleton), dev, dev_ids, num_reqs, queue_, copy_q);
 }
 
 }  // namespace vllm::v1

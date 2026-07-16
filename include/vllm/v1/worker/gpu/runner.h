@@ -72,6 +72,7 @@
 #include "vllm/v1/engine/types.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/sample/sampler.h"
+#include "vllm/v1/worker/gpu/async_output.h"
 #include "vllm/v1/worker/gpu/input_batch.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
@@ -148,11 +149,42 @@ class GPUModelRunner final : public ModelRunnerBase {
                  int max_num_reqs, int max_model_len,
                  int max_num_batched_tokens);
 
+  ~GPUModelRunner();
+
   // ModelRunnerBase (the MRV2 execute_model / sample_tokens split).
   std::optional<ModelRunnerOutput> execute_model(
       const SchedulerOutput& scheduler_output) override;
   ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output) override;
+
+  // sample_tokens_async (ENG-ASYNC-SCHED W3 sampler-OUTPUT half). The overlap
+  // variant of sample_tokens: it produces the sampled ids DEVICE-RESIDENT (the
+  // Sampler writes them into a fresh device buffer, no host download), does the
+  // on-GPU post_update (last_sampled scatter), and returns an
+  // AsyncGPUModelRunnerOutput that issued the single non-blocking sampled-id D2H
+  // on the runner's COPY queue with a completion event — the MAIN queue is never
+  // synchronized. The engine calls get_output() during output processing (off the
+  // model's critical path), which blocks only on that copy event, so the copy
+  // overlaps the next step's forward: this is the ~3.25 ms/step GPU-idle capture.
+  // Token-exact with sample_tokens by construction (same argmax, same ids); on a
+  // synchronous/unified backend the copy is a memcpy and events no-op. Only
+  // meaningful when runner_supports_async() is true (async engaged). Mirrors
+  // gpu_model_runner.py:4673-4693 (AsyncGPUModelRunnerOutput construction).
+  std::unique_ptr<AsyncModelRunnerOutput> sample_tokens_async(
+      const std::optional<GrammarOutput>& grammar_output) override;
+
+  // runner_supports_async (mirror of the vLLM compat gate feeding
+  // SchedulerConfig::ResolveAsyncScheduling — vllm/config/vllm.py:990-1038). TRUE
+  // iff the runner advertises the placeholder-aware async device path: it is
+  // engaged (async_input_combine(), from VT_ASYNC_RUNNER / set_async_input_combine)
+  // AND runs on a backend whose async-output primitives are wired (CUDA, or CPU's
+  // synchronous degeneration for the CPU gate). DEFAULT OFF: with async off this
+  // returns false, so ResolveAsyncScheduling keeps the synchronous Scheduler and
+  // the production default is byte-identical to the sync path. Setting
+  // VT_ASYNC_RUNNER=1 flips it TRUE, which is the single env the DGX A/B uses to
+  // engage full W3 (depth-2 + async output); VT_ASYNC_SCHED=0 then rolls the
+  // scheduler back to synchronous in the same binary.
+  bool runner_supports_async() const override { return async_input_combine_; }
 
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
   InputBatch& input_batch() { return input_batch_; }
@@ -292,6 +324,22 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Async-scheduling device-input opt-in (see set_async_input_combine). Default
   // from VT_ASYNC_RUNNER at construction; OFF keeps the sync host path.
   bool async_input_combine_ = false;
+  // Dedicated COPY queue for the async sampled-id D2H (async_output_copy_stream,
+  // gpu_model_runner.py:711-716,1137-1141). Created lazily on the first async
+  // sample so the sync path allocates no extra stream; destroyed in the dtor.
+  // id == 0 marks "not created". The copy runs OUTSIDE any CUDA-graph capture.
+  vt::Queue async_copy_queue_{};
+  // Lazily create + return the async-output copy queue on the runner's device.
+  vt::Queue& get_or_create_async_copy_queue();
+  // Assemble the [num_reqs, vocab] logits the sampler runs on (the three-case
+  // device/host gather from the stashed forward result) and apply the grammar
+  // bitmask, IN the exact order the sync path uses. Shared by sample_tokens and
+  // sample_tokens_async. `sampled_logits` is caller-owned scratch the returned
+  // Tensor view may alias (host / VT_GPU_SAMPLE=0 paths); it must outlive the
+  // sampler call. Requires exec_state_.num_reqs > 0.
+  vt::Tensor assemble_sample_logits(
+      const std::optional<GrammarOutput>& grammar_output,
+      std::vector<float>& sampled_logits);
   std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
   // GDN convolution and recurrent caches have independent dtypes. This mirrors
   // MambaStateDtypeCalculator::_mamba_state_dtype: mamba_cache_dtype="auto"

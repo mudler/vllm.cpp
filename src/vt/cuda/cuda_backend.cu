@@ -95,6 +95,48 @@ class CudaBackend final : public Backend {
   }
   bool UnifiedMemory() const override { return unified_memory_; }
 
+  // --- Async-output primitives (ENG-ASYNC-SCHED W3, async_utils.py:12-70) ------
+  // Page-locked host memory the copy engine DMAs into without a staging bounce
+  // (a pageable destination would force cudaMemcpyAsync to block), plus real
+  // CUDA events so the copy queue waits the main queue, records completion, and
+  // the host waits ONLY that copy — the main stream is never synchronized.
+  void* AllocPinned(size_t bytes) override {
+    void* p = nullptr;
+    Check(cudaHostAlloc(&p, bytes == 0 ? 1 : bytes, cudaHostAllocDefault),
+          "cudaHostAlloc");
+    return p;
+  }
+  void FreePinned(void* p) override {
+    if (p != nullptr) Check(cudaFreeHost(p), "cudaFreeHost");
+  }
+  Event CreateEvent() override {
+    cudaEvent_t ev = nullptr;
+    // cudaEventDisableTiming: we only ever wait on completion, never measure —
+    // this is the cheaper synchronization-only event (mirrors torch.Event()).
+    Check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+          "cudaEventCreateWithFlags");
+    return Event{Device{DeviceType::kCUDA, device_}, reinterpret_cast<void*>(ev)};
+  }
+  void DestroyEvent(Event& e) override {
+    if (e.handle == nullptr) return;
+    Check(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(e.handle)),
+          "cudaEventDestroy");
+    e.handle = nullptr;
+  }
+  void RecordEvent(Event& e, Queue& q) override {
+    Check(cudaEventRecord(reinterpret_cast<cudaEvent_t>(e.handle), AsStream(q)),
+          "cudaEventRecord");
+  }
+  void SynchronizeEvent(Event& e) override {
+    Check(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e.handle)),
+          "cudaEventSynchronize");
+  }
+  void QueueWaitEvent(Queue& q, Event& e) override {
+    Check(cudaStreamWaitEvent(AsStream(q),
+                              reinterpret_cast<cudaEvent_t>(e.handle), 0),
+          "cudaStreamWaitEvent");
+  }
+
   // --- CUDA-graph capture/replay (M2.5, gate-#1 decode-launch unlock) ---------
   // Capture the ops issued on the queue's stream between Begin/EndCapture into a
   // replayable graph, then Replay it per decode token. This collapses the whole

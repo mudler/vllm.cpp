@@ -213,11 +213,18 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
 }
 
 SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
-                               const SamplingMetadata& sm) const {
+                               const SamplingMetadata& sm,
+                               vt::Tensor* sampled_ids_out) const {
   VT_CHECK(logits.rank == 2, "sampler: logits must be [num_reqs, vocab]");
   VT_CHECK(logits.dtype == vt::DType::kF32, "sampler: logits must be f32");
   const int64_t n = logits.shape[0];
   const int64_t vocab = logits.shape[1];
+  if (sampled_ids_out != nullptr) {
+    VT_CHECK(sampled_ids_out->dtype == vt::DType::kI64,
+             "sampler: sampled_ids_out must be int64 (GreedyArgmax id dtype)");
+    VT_CHECK(sampled_ids_out->Numel() == n,
+             "sampler: sampled_ids_out must have num_reqs elements");
+  }
 
   // 1. Raw-logprobs snapshot BEFORE any mutation (raw_logprobs mode; raw_logits
   //    and the processed_* modes are deferred stubs — see the header).
@@ -259,7 +266,26 @@ SamplerOutput Sampler::forward(vt::Queue& q, vt::Tensor& logits,
   }
 
   // 7. Sample.
+  // ENG-ASYNC-SCHED W3 device-resident fast path: an all-greedy batch with no
+  // logprobs writes the sampled ids straight into the caller's device tensor via
+  // GreedyArgmax — NO host download, NO main-queue synchronize. The async output
+  // owns the single D2H later (async_utils.py:31 keeps sampled ids GPU-side).
+  if (sampled_ids_out != nullptr && sm.all_greedy && !want_logprobs) {
+    vt::GreedyArgmax(q, *sampled_ids_out, logits);
+    SamplerOutput out;
+    out.sampled_on_device = true;  // host sampled_token_ids intentionally empty
+    return out;
+  }
   const std::vector<int64_t> sampled = sample(q, logits, sm);
+  // Async path fallback (random rows or logprobs requested): the host `sample()`
+  // above already materialized the ids, so mirror them into the device out-tensor
+  // for a uniform async-output D2H. Correct, but no zero-copy win (documented; the
+  // greedy gate is the overlap target).
+  if (sampled_ids_out != nullptr) {
+    vt::GetBackend(logits.device.type)
+        .Copy(q, sampled_ids_out->data, sampled.data(),
+              static_cast<size_t>(n) * sizeof(int64_t));
+  }
 
   // 8. Gather logprobs.
   std::optional<LogprobsTensors> logprobs_tensors;

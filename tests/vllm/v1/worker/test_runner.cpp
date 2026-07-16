@@ -835,3 +835,63 @@ TEST_CASE("runner: GDN state slots unique across completion/admission churn") {
   CHECK(slot_of("B") == b_slot);  // B's recurrent state slot is stable.
   CHECK(slot_of("C") != slot_of("B"));
 }
+
+// ─── ENG-ASYNC-SCHED W3: async device-OUTPUT path (sample_tokens_async) ───────
+// The overlap output half: sample_tokens_async produces the sampled ids
+// device-resident and returns an AsyncModelRunnerOutput whose get_output()
+// materializes them off a copy queue + event. Greedy tokens must be bit-identical
+// to the synchronous sample_tokens (G1), and last_sampled_tokens must be recorded
+// at sample time (before get_output) so the next step's combine reads it.
+TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+
+  auto run = [&](bool async_output) {
+    GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
+                          kMaxModelLen, 64);
+    runner.set_async_input_combine(async_output);
+    // The runner advertises async support exactly when the async path is on.
+    CHECK(runner.runner_supports_async() == async_output);
+    std::vector<int32_t> tokens;
+
+    auto sample = [&]() -> int32_t {
+      if (async_output) {
+        std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> a =
+            runner.sample_tokens_async(std::nullopt);
+        // last_sampled is recorded at sample time (on-GPU post_update), BEFORE
+        // the host materialization — the next step's combine depends on it.
+        const int32_t recorded = runner.input_batch().last_sampled_tokens[0];
+        ModelRunnerOutput m = a->get_output();
+        CHECK(m.sampled_token_ids[0][0] == recorded);
+        return m.sampled_token_ids[0][0];
+      }
+      ModelRunnerOutput m = runner.sample_tokens(std::nullopt);
+      return m.sampled_token_ids[0][0];
+    };
+
+    SchedulerOutput s1 =
+        NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+    CHECK_FALSE(runner.execute_model(s1).has_value());
+    tokens.push_back(sample());
+
+    int computed = P, outputs = 1;
+    for (int k = 0; k < 5; ++k) {
+      SchedulerOutput sd = DecodeStep("A", computed, outputs);
+      CHECK_FALSE(runner.execute_model(sd).has_value());
+      // Under async both input-combine and output-D2H are on: the previous
+      // sampled token feeds this step's input via last_sampled_tokens.
+      CHECK(runner.last_step().input_token_ids ==
+            std::vector<int32_t>{tokens.back()});
+      tokens.push_back(sample());
+      computed += 1;
+      outputs += 1;
+    }
+    return tokens;
+  };
+
+  const std::vector<int32_t> sync = run(false);
+  const std::vector<int32_t> async_out = run(true);
+  CHECK(async_out == sync);  // token-for-token identical
+}

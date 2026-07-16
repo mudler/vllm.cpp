@@ -31,10 +31,12 @@
 //     init / profiling / LoRA / pooling RPC methods on WorkerBase.
 #pragma once
 
+#include <memory>
 #include <optional>
 
-#include "vllm/v1/core/sched/output.h"  // SchedulerOutput
-#include "vllm/v1/engine/types.h"       // ModelRunnerOutput
+#include "vllm/v1/core/sched/output.h"           // SchedulerOutput
+#include "vllm/v1/engine/types.h"                 // ModelRunnerOutput
+#include "vllm/v1/worker/gpu/async_output.h"      // AsyncModelRunnerOutput
 
 namespace vllm::v1 {
 
@@ -62,6 +64,29 @@ class ModelRunnerBase {
   // (apply_grammar_bitmask before _sample). The no-grammar path is unchanged.
   virtual ModelRunnerOutput sample_tokens(
       const std::optional<GrammarOutput>& grammar_output) = 0;
+
+  // sample_tokens_async: the overlap-scheduling variant of sample_tokens. Under
+  // async scheduling the engine's step_with_batch_queue calls this instead of
+  // sample_tokens; the returned AsyncModelRunnerOutput may defer the sampled-id
+  // D2H (issued on a copy stream with an event) so get_output() — called at batch
+  // CONSUME time, off the model's critical path — is the only host block, letting
+  // the copy overlap the next step's forward (the ~3.25 ms/step GPU-idle capture,
+  // async_utils.py:12-70). The DEFAULT implementation degenerates to the
+  // synchronous sample_tokens wrapped in a ReadyModelRunnerOutput, so a runner
+  // (or test stub) that has no async path stays correct — exactly the sync case.
+  // The real batched runner overrides this to take the device-resident route when
+  // async is engaged. runner_supports_async advertises whether a runner offers a
+  // non-degenerate path (fed to SchedulerConfig::ResolveAsyncScheduling).
+  virtual std::unique_ptr<AsyncModelRunnerOutput> sample_tokens_async(
+      const std::optional<GrammarOutput>& grammar_output) {
+    return std::make_unique<ReadyModelRunnerOutput>(sample_tokens(grammar_output));
+  }
+
+  // runner_supports_async (vllm/config/vllm.py:990-1038 compat gate): whether
+  // this runner advertises the placeholder-aware async device path. Default
+  // false — a plain runner keeps the synchronous scheduler. The batched runner
+  // overrides it to reflect the VT_ASYNC_RUNNER opt-in.
+  virtual bool runner_supports_async() const { return false; }
 };
 
 }  // namespace vllm::v1

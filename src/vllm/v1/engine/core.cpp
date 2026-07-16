@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/core.h"
 
 #include <cassert>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -114,19 +115,21 @@ EngineCore::step_with_batch_queue() {
     // (is_ec_consumer is always true for us — no EC transfer).
     model_executed = scheduler_output.total_num_scheduled_tokens > 0;
 
-    ModelRunnerOutput model_output;
-    bool have_output = false;
+    std::unique_ptr<AsyncModelRunnerOutput> async_out;
     if (!model_executed) {
-      // core.py:555-557 no sampling required — carry the (empty) forward result.
-      model_output = exec_out.value_or(ModelRunnerOutput{});
-      have_output = true;
+      // core.py:555-557 no sampling required — carry the (empty) forward result
+      // as an already-materialized async output.
+      async_out = std::make_unique<ReadyModelRunnerOutput>(
+          exec_out.value_or(ModelRunnerOutput{}));
     } else if (!scheduler_output.pending_structured_output_tokens) {
       // core.py:559-567 not waiting on any tokens — get the grammar bitmask and
-      // sample immediately.
+      // sample immediately. sample_tokens_async issues the sampled-id copy but,
+      // under async scheduling, DEFERS the host wait to get_output() at consume
+      // time (below), so the copy overlaps the next step's forward; a synchronous
+      // runner returns an already-materialized ReadyModelRunnerOutput.
       const std::optional<GrammarOutput> grammar_output =
           scheduler_.get_grammar_bitmask(scheduler_output);
-      model_output = executor_.sample_tokens(grammar_output);
-      have_output = true;
+      async_out = executor_.sample_tokens_async(grammar_output);
     } else {
       // core.py:568-571 defer sampling until the prior step's output is
       // processed (a structured request is waiting on in-flight tokens).
@@ -135,10 +138,9 @@ EngineCore::step_with_batch_queue() {
 
     if (!deferred_scheduler_output.has_value()) {
       // core.py:573-575 add this step's result to the queue (front).
-      assert(have_output);
-      (void)have_output;
+      assert(async_out != nullptr);
       batch_queue_.push_front(
-          BatchQueueItem{std::move(model_output), std::move(scheduler_output)});
+          BatchQueueItem{std::move(async_out), std::move(scheduler_output)});
       // core.py:576-581 don't block on the next result unless the queue is full
       // or there are no more requests to schedule.
       const bool more_requests =
@@ -158,9 +160,15 @@ EngineCore::step_with_batch_queue() {
   BatchQueueItem item = std::move(batch_queue_.back());
   batch_queue_.pop_back();
 
+  // core.py:589-590 future.result() → get_output(): resolve the (possibly
+  // deferred) sampled-id copy NOW — the ONE host block, and it is off the model's
+  // critical path because it overlapped the batch we just scheduled+forwarded
+  // above. A synchronous runner's output is already materialized (no wait).
+  ModelRunnerOutput model_output = item.async_output->get_output();
+
   // core.py:604-607 update the scheduler from the popped batch's output.
   EngineCoreOutputs engine_core_outputs =
-      scheduler_.update_from_output(item.scheduler_output, item.model_output);
+      scheduler_.update_from_output(item.scheduler_output, model_output);
 
   // core.py:609-630 grammar deferral: now that the prior output is processed,
   // compute the deferred batch's bitmask, sample it, and append it to the queue.
@@ -169,7 +177,8 @@ EngineCore::step_with_batch_queue() {
   if (deferred_scheduler_output.has_value()) {
     const std::optional<GrammarOutput> grammar_output =
         scheduler_.get_grammar_bitmask(*deferred_scheduler_output);
-    ModelRunnerOutput sampled = executor_.sample_tokens(grammar_output);
+    std::unique_ptr<AsyncModelRunnerOutput> sampled =
+        executor_.sample_tokens_async(grammar_output);
     batch_queue_.push_front(
         BatchQueueItem{std::move(sampled), std::move(*deferred_scheduler_output)});
   }

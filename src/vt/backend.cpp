@@ -11,6 +11,19 @@ uint64_t NextQueueId() noexcept {
   return next.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Async-output primitives (async_utils.py:12-70). The base implementations suit
+// any synchronous/unified backend: pinned host memory degenerates to ordinary
+// host memory (Copy is already a memcpy) and every event op is a no-op because
+// all work submitted to a queue has completed by the time the host observes it.
+// CUDA overrides all six with cudaHostAlloc + cudaEvent_t. (CPU inherits these.)
+void* Backend::AllocPinned(size_t bytes) { return Alloc(bytes == 0 ? 1 : bytes); }
+void Backend::FreePinned(void* p) { Free(p); }
+Event Backend::CreateEvent() { return Event{}; }
+void Backend::DestroyEvent(Event&) {}
+void Backend::RecordEvent(Event&, Queue&) {}
+void Backend::SynchronizeEvent(Event&) {}
+void Backend::QueueWaitEvent(Queue&, Event&) {}
+
 void Backend::BeginCapture(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }
 void Backend::EndCapture(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }
 void Backend::Replay(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }

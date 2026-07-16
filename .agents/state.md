@@ -2874,7 +2874,7 @@ cmake --build build-model-factory -j20
 ctest --test-dir build-model-factory -j20 --output-on-failure
 # 94/94 pass
 ./build-model-factory/tests/test_model_registry --success=0
-# 11 active cases, 112/112 assertions; one explicit
+# 11 active cases, 111/111 assertions; one explicit
 # "MODEL-FACTORY-registry: no second family yet" skip
 python3 scripts/check-agent-record.py
 python3 tests/scripts/test_agent_record.py
@@ -11609,3 +11609,111 @@ preserved. Decision next session on measured grounds. Binding stays
   either way (spec D6). `benchmark_binding=false`, no speed credit, binding stays
   49/124. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude
   Code:claude-opus-4-8 [ClaudeCode]`.
+
+- **2026-07-16** — **ENG-ASYNC-SCHED W3 runner SAMPLER-OUTPUT half LANDED +
+  CPU-gated** (`CLAIM-ASYNC-SCHED-W3`, isolated worktree
+  `.claude/worktrees/agent-ab10d9c39a0f1ff17`; reset to `origin/main` @ `f590065`
+  first). Lands the OUTPUT half of the W3 runner overlap leaf, mirroring vLLM 1:1
+  (`vllm/v1/worker/gpu/async_utils.py:12-70` + `gpu_model_runner.py:242-332` +
+  `vllm/v1/outputs.py:298-307`), CPU test-first. The synchronous production path
+  stays byte-identical (all new behavior is behind `VT_ASYNC_RUNNER` /
+  `set_async_input_combine`, default OFF; `runner_supports_async` resolves FALSE;
+  `sample_tokens_async` degenerates to `ReadyModelRunnerOutput{sample_tokens()}`
+  when async is off; the `Sampler` out-param defaults `nullptr`), so this commit
+  changes NO GPU behavior.
+  WHAT LANDED:
+  - **`vt::Backend` event + pinned-host primitives** (`include/vt/backend.h`,
+    base sync-degeneration in `src/vt/backend.cpp`, CPU inherits, CUDA overrides
+    in `src/vt/cuda/cuda_backend.cu`): `AllocPinned`/`FreePinned` (cudaHostAlloc /
+    cudaFreeHost) + `Event` + `CreateEvent`/`DestroyEvent`/`RecordEvent`/
+    `SynchronizeEvent`/`QueueWaitEvent` (cudaEventCreateWithFlags(DisableTiming) +
+    cudaEventRecord + cudaEventSynchronize + cudaStreamWaitEvent). On a
+    synchronous/unified backend (CPU, GB10) events carry a null handle and are
+    no-ops; pinned alloc is ordinary host memory. Contract-tested in
+    `tests/vt/test_backend.cpp` (pinned usable, event record/wait/synchronize
+    handoff, null-handle degeneration).
+  - **`AsyncGPUModelRunnerOutput` + `AsyncModelRunnerOutput`/`ReadyModelRunnerOutput`**
+    (`include/vllm/v1/worker/gpu/async_output.{h,cpp}`): the deferred output. The
+    ctor mirrors `AsyncOutput.__init__` — records a fork event on the MAIN queue,
+    makes the COPY queue wait it (`copy_stream.wait_stream(default_stream)`),
+    issues the NON-BLOCKING D2H of the device sampled-id snapshot into an owned
+    PINNED host buffer, and records the ready event — the MAIN queue is NEVER
+    synchronized. `get_output()` (called at output processing) blocks ONLY the
+    ready event, releases the device snapshot, and materializes the
+    `ModelRunnerOutput` (int64 → int32 per-req [1]). `ReadyModelRunnerOutput`
+    wraps an already-materialized output for the sync degeneration.
+  - **`Sampler::forward(..., sampled_ids_out)`** (`sampler.{h,cpp}` +
+    `SamplerOutput.sampled_on_device`): device-resident greedy fast path — writes
+    ids straight into the caller's device int64 tensor via `GreedyArgmax`, NO host
+    download / NO main-queue synchronize. Random/logprobs batches fall back to the
+    host path and copy the ids into the out-tensor (correct, no zero-copy win).
+    `nullptr` default keeps the sync path byte-identical.
+  - **`GPUModelRunner::sample_tokens_async` + `runner_supports_async`**
+    (`runner.{h,cpp}`): the overlap variant. Assembles logits (shared helper
+    `assemble_sample_logits`, extracted verbatim so the sync path is unchanged),
+    samples device-resident into a FRESH device buffer owned by the async output,
+    does the on-GPU post_update (`last_sampled` scatter + `num_tokens_no_spec`
+    advance; host token write-back DELETED on the async path — combine reads
+    `last_sampled`, detok/penalties are fed by the scheduler's
+    `update_from_output`), and returns the `AsyncGPUModelRunnerOutput` after
+    issuing the D2H on the lazily-created copy queue (destroyed in the new dtor).
+    `runner_supports_async()` == `async_input_combine_` (the `VT_ASYNC_RUNNER`
+    opt-in). The `last_sampled` scatter reads the device buffer host-coherently
+    (valid on CPU + GB10 unified memory; the DGX device-kernel leaf ports it +
+    the input-half combine to Triton for discrete backends).
+  - **Executor + depth-2 seam** (`executor.{h,cpp}`,
+    `model_runner_base.h`, `core.{h,cpp}`): `sample_tokens_async` threads through
+    `Executor` (`ModelRunnerBase::sample_tokens_async` default wraps
+    `sample_tokens`) and `EngineCore::step_with_batch_queue`; `BatchQueueItem` now
+    holds an `AsyncModelRunnerOutput` whose `get_output()` is resolved at CONSUME
+    time (before `update_from_output`) — off the model's critical path, so the
+    copy overlaps the next step's forward. Validated by the depth-2 cycle
+    `test_engine_core_proc.cpp:479` (mcb=2) with a synchronous runner double.
+  TEST-FIRST RED→GREEN: `tests/vllm/v1/worker/test_async_output.cpp` (3 cases —
+  materialize, zero-request flush, pre-construction snapshot), `test_backend.cpp`
+  (+3 — pinned usable, event handoff, null-handle degeneration), `test_runner.cpp`
+  (+1 — `sample_tokens_async` greedy decode ≡ sync over 6 steps, last_sampled
+  recorded at sample time). RED VERIFIED by splicing `+1` into
+  `AsyncGPUModelRunnerOutput::get_output`'s materialization → both `test_async_output`
+  and the `test_runner` async case fail (`33 == 32`, token streams diverge), then
+  reverted GREEN. CPU-only gates: clean full `-Werror` rebuild 0 warnings, full
+  ctest **111/111** (serial), tools **164/164**, record + doc-checkpoint checkers
+  green. **NO GPU ran.**
+  **PRODUCTION WIRING UNCHANGED / NO GPU BEHAVIOR CHANGE this commit** — everything
+  is default OFF; `LoadedEngine` still builds the plain `Scheduler` + sync
+  `EngineCore` at mcb=1, so both model gates on this SHA are byte-identical to
+  main.
+  REMAINING (DGX enable-flip, same row): (1) wire `LoadedEngine` to construct an
+  `AsyncScheduler` + pass `max_concurrent_batches=2` to the async engine when
+  `ResolveAsyncScheduling(runner_.runner_supports_async())` resolves ON (member
+  reorder so `runner_` precedes the scheduler; the `AsyncLLM` ctor gains an mcb
+  param → `InprocClient`; the depth-2 loop seam is already CPU-tested); (2) port
+  the `last_sampled` scatter + input-half combine loops to a device kernel over
+  GPU-resident tensors for discrete backends. Both change production GPU behavior
+  that cannot be CPU-validated, so they land with the DGX gate.
+  **ENV MATRIX**: `VT_ASYNC_RUNNER=1` engages full W3 (runner async input-combine
+  + async sampler-output D2H + `runner_supports_async` TRUE → after the flip,
+  depth-2). `VT_ASYNC_SCHED=0` forces the scheduler back to synchronous in the SAME
+  binary (the rollback arm). Production default (no env): synchronous, byte-identical.
+  **INTENDED DGX VALIDATION** (orchestrator, from the pushed SHA, one
+  `flock /tmp/gpu` per series, AFTER the enable-flip lands):
+  (1) SAFETY on THIS SHA — both model gates in the production default (all env
+      unset): `flock /tmp/gpu -c 'ctest -R qwen36_paged_engine'` +
+      `qwen27_paged_engine` = 16/16 + 235/235, byte-identical to main.
+  (2) TOKEN-EXACTNESS both model gates × both `VT_ASYNC_SCHED` arms under
+      `VT_ASYNC_RUNNER=1`: default (unset → resolved-ON depth-2) and
+      `VT_ASYNC_SCHED=0` (forced sync) each 235/235 + 16/16, bit-identical to the
+      sync arm (greedy streams sacrosanct):
+      `flock /tmp/gpu -c 'VT_ASYNC_RUNNER=1 ctest -R "qwen36_paged_engine|qwen27_paged_engine"'`
+      then the same with `VT_ASYNC_SCHED=0` prepended.
+  (3) interleaved c16 A/B W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+      (`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`), same binary, one lock, via
+      `tools/bench/profile_vllm_online_gate.py` / the `SERVE-GATE-ONLINE` harness —
+      expecting ~+3 ms/step ≈ +15 tok/s on throughput axes and ≤ on TPOT, with an
+      explicit TTFT-regression WATCH (`3812d8`'s TTFT 0.862159× ON/OFF is the
+      caution). The c2 speed budget is frozen neutral by `3812d8` (total
+      1.002153×, no GPU-time reduction), so the honest gate is "no regression +
+      mirror behavior", the measured delta recorded either way (spec D6).
+  `benchmark_binding=false`, no speed credit, binding stays 49/124. Trailers
+  `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
+  [ClaudeCode]`.

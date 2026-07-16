@@ -12186,3 +12186,48 @@ per-item full-ctest deferred to one authoritative clean run). `benchmark_binding
 =false`, NO speed credit — payoff measured by the dispatched correct-state c2/c8
 full-step probe and the next authorized exact grid. Remaining: DGX token-exactness
 gate (27B 235/235 + 16/16, 35B) on the final SHA under `flock /tmp/gpu`.
+
+## 2026-07-16 — c2+c8 full-step attribution MEASURED (task #10, the adjudicator): c2 is ENTIRELY GPU-busy (kernel glue), c8 is 39% busy + 61% wave-boundary stall; per-step host window NOT exposed (`CLAIM-C2C8-ATTRIBUTION`, worktree `vllm.cpp-c2c8-attribution`)
+
+Mirrored the a2329e1 c16 method at c2 and c8 on a fresh `beb8497` production
+build (gate 235/235 per capture; binding corpus/client params; ours nsys
+`--cuda-graph-trace=node` inside `env -i`, one flock per series; vLLM
+torch-profiler `--mamba-ssm-cache-dtype float32` resolved, digests equal,
+async-sched on; c2 1524 / c8 1508 clean decode windows vs ours 127/126-step
+pure-decode spans). Wall anchor = `246a23c` binding decode means (ours capture
+TPOT corroborates −0.6%/−1.3%). Evidence root (immutable)
+`dgx:~/work/vllm.cpp-c2c8-attribution/beb8497` (`SUMMARY.json`
+`5fa07663…e231`); full tables + four answers in
+[c2-c8-attribution-2026-07-16.md](specs/c2-c8-attribution-2026-07-16.md).
+
+**Per-step ms (ours/vLLM/Δ): c2** — busy 107.310/104.151/**+3.159**, idle
+2.540/3.269/**−0.729**, wall 109.85/107.42/+2.43; GDN recurrence
+2.548/1.617/+0.93; RMSNorm(129) 2.117/0.381/+1.74; glue total Δ +2.40; GEMM
+bundle −0.24 (parity). **c8** — busy 114.706/111.890/**+2.816**, idle
+16.704/12.230/**+4.474**, wall 131.41/124.12/+7.29; recurrence
+10.045/8.514/+1.53; RMSNorm 2.028/0.377/+1.65; glue Δ +2.45; GEMM bundle
+**−1.28 (ours faster)**.
+
+**VERDICT (revises the 07-14 "host-side" label):** (a) the c2 gap is ENTIRELY
+GPU-busy (busy Δ = 130% of the gap; idle Δ NEGATIVE — ours idles less than
+vLLM); the c8 gap is 38.6% GPU-busy + 61.4% idle, and that idle is NOT per-step
+host work — inside pure-decode waves both engines are ≥99% busy at parity
+(ours in-span idle 0.92–0.94 ms/step vs vLLM ~0.84–0.88); it accrues at wave
+boundaries (prefill-interruption handling = the attributed two-prefill stall
+mechanism, now shown to move the c8 MEAN, not just tails). (b) RMSNorm's
+per-launch delta is real, batch-independent (2.117/2.028/2.006 vs
+0.381/0.377/0.391 across c2/c8/c16), ~16 vs ~3 µs/launch in-trace
+(microbench caveat ≤~1 ms, cannot flip the verdict). (c) the block-table/
+prepare host window is bounded by the 0.116/0.186 ms/step post-sampler
+boundary hole — an order below the gaps; host plumbing is hygiene, not a
+c2–c8 lever. (d) REGIME CHANGE, not interpolation: busy Δ non-monotonic
+(3.16/2.82/4.65), idle Δ flips sign (−0.73/+4.47/+3.25); mechanisms = a
+batch-independent ~2.4 ms/step kernel-glue floor + batch-growing recurrence Δ
+(0.93/1.53/2.06), plus a wave-boundary scheduling component from c8 up.
+**Lever routing:** c2–c4 → kernel glue (`KERNEL-EW-NORM-ACT`) + recurrence
+tiling; c8+ extra mass → the W3 overlap family (`ENG-ASYNC-SCHED`; composition
+proven byte-identical by the parallel CPU discriminator);
+07-14 host-side attribution REFUTED at c2, RESHAPED at c8. Diagnostic only:
+`benchmark_binding=false`, no speed credit, binding stays 49/124. Deviations
+(binding-wall anchor, max-packed span selection, clean-session vLLM re-run
+after a GPU-memory/contention kill) recorded in the spec.

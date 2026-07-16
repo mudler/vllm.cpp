@@ -125,7 +125,6 @@ void BlockTable::swap_row(int src, int tgt) {
 void BlockTable::compute_slot_mapping(int num_reqs,
                                       const std::vector<int32_t>& query_start_loc,
                                       const std::vector<int64_t>& positions) {
-  const int num_tokens = static_cast<int>(positions.size());
   const int64_t virtual_block_size =
       static_cast<int64_t>(block_size) * total_cp_world_size_;
   // Reads the "device" buffer (upstream reads block_table.gpu) -> requires a
@@ -158,10 +157,16 @@ void BlockTable::compute_slot_mapping(int num_reqs,
       slot_mapping_[static_cast<size_t>(i)] = slot_id;
     }
   }
-  // Pad remaining slots (upstream pads for CUDA-graph compatibility).
-  for (int i = num_tokens; i < max_num_batched_tokens; ++i) {
-    slot_mapping_[static_cast<size_t>(i)] = kPadSlotId;
-  }
+  // TAIL-PAD DEVIATION (rescan-lost-lanes-2026-07-16 §1 item c): upstream's
+  // Triton kernel pads slot_mapping[num_tokens:max_num_batched_tokens] to
+  // PAD_SLOT_ID because vLLM's captured decode graph reads the persistent
+  // slot_mapping buffer's padded tail. Our port instead builds the padded
+  // decode-graph inputs explicitly (qwen3_5.cpp BuildPaddedDecode re-pads to the
+  // captured batch size with -1), and the only other consumer slices [0, total)
+  // (prepare_inputs.cpp). The tail-pad is therefore dead work — ~2×(max_num_
+  // batched_tokens − total) int64 writes/step across the two KV groups — and is
+  // dropped. The fill is bounded to [0, num_tokens); the tail keeps its prior
+  // value and is never read.
 }
 
 void BlockTable::commit_block_table(int num_reqs) {

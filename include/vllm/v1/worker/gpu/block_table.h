@@ -89,9 +89,18 @@ class BlockTable {
   void swap_row(int src, int tgt);
 
   // Fill slot_mapping()[0 .. num_tokens) with block_id*block_size+offset for
-  // every token, then pad the rest to PAD_SLOT_ID. Reads the "device" buffer
-  // (requires a prior commit_block_table). query_start_loc has num_reqs+1
-  // cumulative per-request token offsets; positions has one entry per token.
+  // every token. Reads the "device" buffer (requires a prior
+  // commit_block_table). query_start_loc has num_reqs+1 cumulative per-request
+  // token offsets; positions has one entry per token.
+  //
+  // TAIL-PAD DEVIATION (rescan-lost-lanes-2026-07-16 §1 item c): upstream's
+  // Triton kernel also pads slot_mapping[num_tokens:max_num_batched_tokens] to
+  // PAD_SLOT_ID for CUDA-graph replay, which reads the persistent buffer's
+  // padded tail. Our decode graph builds its padded inputs explicitly
+  // (qwen3_5.cpp BuildPaddedDecode re-pads to the captured batch size), and the
+  // only other consumer (prepare_inputs) slices [0, total); so the tail-pad is
+  // dead work and is NOT written. The fill is bounded to [0, num_tokens); the
+  // tail keeps its prior value and is never read downstream.
   void compute_slot_mapping(int num_reqs,
                             const std::vector<int32_t>& query_start_loc,
                             const std::vector<int64_t>& positions);

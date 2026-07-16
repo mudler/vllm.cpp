@@ -24,10 +24,6 @@
 using vllm::v1::BlockTable;
 using vllm::v1::MultiGroupBlockTable;
 
-namespace {
-constexpr int64_t kPad = -1;
-}
-
 TEST_CASE("BlockTable.add_row stores block ids for a request row") {
   BlockTable bt(/*block_size=*/16, /*max_num_reqs=*/4,
                 /*max_num_blocks_per_req=*/8, /*max_num_batched_tokens=*/32,
@@ -132,9 +128,13 @@ TEST_CASE("BlockTable.compute_slot_mapping = block_id*block_size + offset") {
   CHECK(slots[0] == 48);   // block 3 * 16 + 0
   CHECK(slots[1] == 112);  // block 7 * 16 + 0
   CHECK(slots[2] == 113);  // block 7 * 16 + 1
-  // Remaining slots padded to PAD_SLOT_ID.
-  CHECK(slots[3] == kPad);
-  CHECK(slots[static_cast<size_t>(bt.max_num_batched_tokens) - 1] == kPad);
+  // Tail-pad is NO LONGER written by compute_slot_mapping (dead work: the only
+  // consumer slices [0, num_tokens) and the decode graph re-pads via
+  // BuildPaddedDecode — see the block_table.h padding-deviation note). The fill
+  // is bounded to [0, num_tokens); the tail keeps its prior value (0 from the
+  // constructor here), NOT PAD_SLOT_ID.
+  CHECK(slots[3] == 0);
+  CHECK(slots[static_cast<size_t>(bt.max_num_batched_tokens) - 1] == 0);
 }
 
 TEST_CASE("BlockTable.compute_slot_mapping over two requests") {
@@ -154,7 +154,8 @@ TEST_CASE("BlockTable.compute_slot_mapping over two requests") {
   CHECK(slots[2] == 113);
   CHECK(slots[3] == 32);  // block 2 * 16 + 0
   CHECK(slots[4] == 33);  // block 2 * 16 + 1
-  CHECK(slots[5] == kPad);
+  // Bounded fill: the tail past num_tokens (5) is untouched (0), not PAD_SLOT_ID.
+  CHECK(slots[5] == 0);
 }
 
 TEST_CASE("BlockTable hybrid blocks expand kv-manager ids to kernel ids") {

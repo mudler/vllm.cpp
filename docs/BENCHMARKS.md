@@ -87,14 +87,7 @@ append-only [ledger](../.agents/parity-ledger.md) and
 **Register-resident decode tiling — PERF LEVER landed (2026-07-16, test-first,
 CPU-gated, DGX-pending; PENDING binding number).** The named +2.06 ms/step
 recurrence-tiling gap (correct-state c16 traces: ours 21.31 vs vLLM 19.24
-ms/step; ~83% vs ~92% of ~273 GB/s) is closed by porting vLLM FLA's
-register-resident single-warp `num_stages=3` packed-decode kernel
-(`fused_recurrent.py:256-336`) into a new `GdnPackedDecodeRegTileKernel`: one warp
-per `[BV=32,BK]` tile with the state block held in REGISTERS across the update —
-no shared-state round-trip, no cross-warp `__shfl` reduction, no `__syncthreads`.
-Default-on behind `VT_GDN_PACKED_REG_TILE` (=0 restores the legacy kernel
-bit-for-bit, same binary); boundary-fixture BF16 output stays bit-exact
-(sequential per-row Dk reduction). CPU gates GREEN (flag test 12/12, `test_ops_gdn`
+ms/step; ~83% vs ~92% of ~273 GB/s) was ATTEMPTED via a register-resident port of vLLM FLA's single-warp `num_stages=3` packed-decode kernel (`fused_recurrent.py:256-336`) — the DGX proof FAILED (bit-exact oracle boundary FAIL; same-binary c16 A/B reg-tile 700.5–701.4 vs legacy 793.6–794.5 tok/s, TPOT 190.5 vs 166.5 — register-pressure/occupancy collapse). The default is flipped OFF (legacy ships; `VT_GDN_PACKED_REG_TILE=1` keeps the experimental kernel opt-in), and the lever stays open via an occupancy-aware redesign or the sanctioned Triton-AOT vendored-cubin path (proof root `~/work/vllm.cpp-gdn-regtile/54f0541…`) CPU gates GREEN (flag test 12/12, `test_ops_gdn`
 45/45, `test_op_parity` 10/10, full CTest 105/105, tools 164/164, clean -Werror;
 `.cu` is DGX-compiled). **Expected ~+2 ms/step (~+10 tok/s) at c16** — the
 orchestrator's DGX proof (bit-exact oracle under lock, full CUDA GDN suite,

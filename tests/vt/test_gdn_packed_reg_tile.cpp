@@ -14,22 +14,19 @@
 using vt::cuda::GdnPackedRegTileFlagIsOn;
 
 TEST_CASE(
-    "VT_GDN_PACKED_REG_TILE defaults ON; only a '0'-leading value rolls back") {
-  // Default (unset) is ON: register-resident tiling is the new default.
-  CHECK(GdnPackedRegTileFlagIsOn(nullptr));
-  // Explicit enable spellings stay ON.
-  CHECK(GdnPackedRegTileFlagIsOn("1"));
-  CHECK(GdnPackedRegTileFlagIsOn(""));       // empty string -> ON (first char is not '0')
-  CHECK(GdnPackedRegTileFlagIsOn("on"));
-  CHECK(GdnPackedRegTileFlagIsOn("true"));
-  CHECK(GdnPackedRegTileFlagIsOn("2"));
-  // Rollback: any value whose FIRST character is '0' selects the legacy kernel
-  // (mirrors the house default-ON GDN A/B convention GdnTritonEnvOn).
+    "VT_GDN_PACKED_REG_TILE defaults OFF; only a '1'-leading value opts in") {
+  // Default (unset) is OFF: the legacy shared-memory kernel ships after the
+  // 2026-07-16 DGX proof failed (oracle boundary FAIL; c16 -12%).
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn(nullptr));
+  // Non-'1'-leading values stay OFF.
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn(""));
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn("on"));
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn("true"));
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn("2"));
   CHECK_FALSE(GdnPackedRegTileFlagIsOn("0"));
-  CHECK_FALSE(GdnPackedRegTileFlagIsOn("0 "));
-  CHECK_FALSE(GdnPackedRegTileFlagIsOn("00"));
-  CHECK_FALSE(GdnPackedRegTileFlagIsOn("0abc"));
-  // A '0' that is NOT the first character does not roll back.
+  CHECK_FALSE(GdnPackedRegTileFlagIsOn(" 1"));
+  // Experimental opt-in: FIRST character '1'.
+  CHECK(GdnPackedRegTileFlagIsOn("1"));
   CHECK(GdnPackedRegTileFlagIsOn("10"));
-  CHECK(GdnPackedRegTileFlagIsOn(" 0"));
+  CHECK(GdnPackedRegTileFlagIsOn("1abc"));
 }

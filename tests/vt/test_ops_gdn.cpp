@@ -1168,7 +1168,7 @@ TEST_CASE("CUDA gdn packed decode capture replays preserve padding state and can
   CHECK(b_after == c.b);
 }
 
-// VT_GDN_PACKED_REG_TILE rollback contract: the register-resident tiling is the
+// VT_GDN_PACKED_REG_TILE opt-in contract (default OFF): the legacy kernel is the
 // default; "=0" restores the legacy shared-memory kernel in the SAME binary.
 // Uses the packed-decode host-dispatch debug counters (reg-tile vs legacy
 // sub-counts) to prove which kernel each arm actually launched, and checks BOTH
@@ -1178,7 +1178,7 @@ TEST_CASE("CUDA gdn packed decode capture replays preserve padding state and can
 // by tests/vt/test_gdn_packed_reg_tile.cpp.
 #ifdef VLLM_CPP_CUDA
 TEST_CASE(
-    "CUDA gdn packed decode VT_GDN_PACKED_REG_TILE=0 selects legacy, default "
+    "CUDA gdn packed decode defaults legacy; VT_GDN_PACKED_REG_TILE=1 opts in "
     "selects reg-tile") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
@@ -1245,18 +1245,20 @@ TEST_CASE(
     d_out.Download(guard.q, out_host.data());
   };
 
-  // Rollback: VT_GDN_PACKED_REG_TILE=0 selects the legacy kernel.
+  // Default (unset) selects the LEGACY kernel (reg-tile default OFF after the
+  // failed 2026-07-16 DGX proof: oracle boundary FAIL + c16 -12%).
   uint64_t reg0 = 0, legacy0 = 0;
   std::vector<uint8_t> out_legacy;
-  run("0", reg0, legacy0, out_legacy);
+  run(nullptr, reg0, legacy0, out_legacy);
   CHECK(legacy0 == 1);
   CHECK(reg0 == 0);
   CheckClose(Unpack(out_legacy, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
 
-  // Default (unset) selects the register-resident kernel.
+  // Experimental opt-in: VT_GDN_PACKED_REG_TILE=1 selects the register-resident
+  // kernel (kept for a corrected future port attempt).
   uint64_t reg1 = 0, legacy1 = 0;
   std::vector<uint8_t> out_reg;
-  run(nullptr, reg1, legacy1, out_reg);
+  run("1", reg1, legacy1, out_reg);
   CHECK(reg1 == 1);
   CHECK(legacy1 == 0);
   CheckClose(Unpack(out_reg, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);

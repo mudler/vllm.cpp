@@ -10,9 +10,12 @@
 // block held in REGISTERS across the recurrence, replacing the legacy
 // shared-memory-staged, 8-warp NW-shuffle-reduced GdnPackedDecodeKernel.
 //
-// The flag is the SAME-BINARY rollback: default ON (register-resident is the new
-// default); VT_GDN_PACKED_REG_TILE=0 (any value whose first character is '0')
-// restores the legacy kernel bit-for-bit. This mirrors the house default-ON
+// The flag gates the EXPERIMENTAL register-resident tiling: default OFF after
+// the 2026-07-16 DGX proof FAILED both gates (bit-exact oracle boundary FAIL +
+// c16 A/B 700.5-701.4 vs legacy 793.6-794.5 tok/s, TPOT 190.5 vs 166.5 ms —
+// register-pressure/occupancy collapse from the naive lane-owns-[1,BK=128]
+// mapping). VT_GDN_PACKED_REG_TILE=1 opts in for experiments only. This
+// preserves the house same-binary
 // GDN A/B convention (GdnTritonEnvOn, VT_GDN_CHUNKED, VT_GDN_DECODE_NW): the
 // launcher reads it per call (NOT process-cached) so the coarse decode dispatch
 // pays a negligible getenv and in-process tests can flip the selection; the
@@ -24,12 +27,13 @@
 namespace vt::cuda {
 
 // Pure predicate for the VT_GDN_PACKED_REG_TILE contract: register-resident
-// tiling is ON by default; it is OFF (legacy shared-memory kernel) only when the
-// environment value is present AND its first character is '0'. nullptr (unset)
-// and every non-'0'-leading value are ON. Kept separate from the getenv call in
-// the launcher so the parse is unit-testable without touching the environment.
+// tiling is OFF by default (legacy shared-memory kernel ships); it is ON only
+// when the environment value is present AND its first character is '1'.
+// nullptr (unset) and every non-'1'-leading value are OFF. Kept separate from
+// the getenv call in the launcher so the parse is unit-testable without
+// touching the environment.
 inline bool GdnPackedRegTileFlagIsOn(const char* env_value) {
-  return env_value == nullptr || env_value[0] != '0';
+  return env_value != nullptr && env_value[0] == '1';
 }
 
 }  // namespace vt::cuda

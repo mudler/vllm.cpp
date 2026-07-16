@@ -11510,3 +11510,31 @@ Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
   neutral by `3812d8` (total 1.002153×, no GPU-time reduction), so the honest
   gate is "no regression + mirror behavior", the measured delta recorded either
   way (spec D6). `benchmark_binding=false`, no speed credit, binding stays 49/124.
+
+## 2026-07-16 — reg-tile port FAILED its DGX proof; default flipped OFF (legacy ships)
+
+The `54f0541` register-resident packed-decode port failed both proof gates in
+root `~/work/vllm.cpp-gdn-regtile/54f054145f4c6084eaf3c23445db345b61c60b81`:
+(1) the bit-exact oracle boundary fixture **FAILED** (job 1 of the battery;
+the GDN suites/model gates/memcheck jobs 2–6 passed — model-level 235/235
+held, but the strict boundary contract did not); (2) the same-binary
+interleaved c16 A/B is decisively NEGATIVE: reg-tile **700.5–701.4 tok/s /
+TPOT 190.5–190.7 ms** vs legacy **793.6–794.5 / 166.5** — ~12% SLOWER, the
+signature of register-pressure/occupancy collapse from the naive
+lane-owns-[1,BK=128] transcription (128+ live floats per lane; one warp per
+block cannot hide latency). Lesson re-confirmed (matches the recorded
+vt::tile-era finding): Triton's structure is not a line-by-line CUDA
+transcription — the codegen quality (regalloc/pipelining) IS the kernel.
+
+Response in this checkpoint: `VT_GDN_PACKED_REG_TILE` default flipped to
+**OFF** (legacy shared-memory kernel ships; the experimental kernel remains
+opt-in `=1` for a corrected future attempt), with the flag predicate, CPU
+flag tests, and the CUDA selection test all inverted accordingly. The
++2.06 ms/step recurrence lever REMAINS OPEN with two recorded paths:
+(a) an occupancy-aware hand-CUDA design (multiple tiles per block /
+cp.async pipeline via the vt::tile rungs), or (b) the SANCTIONED Triton-AOT
+exception (discipline.md, 2026-07-09): vLLM's `fused_recurrent` decode kernel
+is now a measured codegen-bound gap candidate — vendor its AOT cubin via the
+proven `triton_aot_vendored/` toolchain, gated, with the hand-CUDA fallback
+preserved. Decision next session on measured grounds. Binding stays
+**49/124**, `benchmark_binding=false`.

@@ -180,15 +180,27 @@ most tails), driven by decode being **2.2–6.5% slower** — mean TPOT ratios
 245.58 ms vs vLLM 107.42 / 112.79 / 124.12 / 159.63 / 235.68), worst median TPOT
 0.9348 at c8. Two ITL tails stand out as anomalies beyond that band: **c8 p99_itl
 0.5599** (853.34 vs 477.81 ms) and **c32 p90_itl 0.7925** (706.80 vs 560.15) —
-both now ATTRIBUTED (2026-07-16, read-only diagnostic on this root's per-request
-`itls[]`; [spec](../.agents/specs/tail-stall-analysis-2026-07-16.md)) to ONE
-mechanism: batch-wide prefill stalls at request-wave boundaries, uniformly
-~860 ms in ours (two full 1024-token prefills filling the 2048-token step
-budget; finish-in-pairs lockstep) vs graded ~500 ms single-prefill events in
-vLLM (whose arm runs async scheduling ON). The decode body (tokens 16–111) is
-at parity with ZERO mid-sequence stalls; capping the per-event stall at one
-prefill is measured-sufficient to flip both axes to PASS (counterfactual
-ratios 0.87–0.96 / 0.93–1.11). The
+both DISCRIMINATED (2026-07-16, CPU-only wave-boundary diff;
+[spec](../.agents/specs/tail-stall-analysis-2026-07-16.md)) to async-runtime
+output-timing phasing (W3), **NOT** a scheduler divergence: driving the REAL
+vLLM sync `Scheduler` and async `AsyncScheduler` through the identical
+wave-boundary script (`tools/bench/scheduler_wave_diff.py`, golden
+`tests/fixtures/scheduler_wave/wave_script_oracle.json`) yields BYTE-IDENTICAL
+per-step composition — both pack the 2048 budget as 1024 + chunk at the stall
+step (~860 ms) — and our C++ schedulers reproduce it exactly
+(`tests/vllm/v1/test_scheduler_wave.cpp`, 3 cases / 44 asserts). H-B/H-C are
+dead, H-A already dead (`89b329e`). The ~860 vs ~500 ms magnitude gap is the
+async depth-2 output-timing/overlap regime (which CPU simulation of the async
+driver does NOT reproduce — it also budget-packs to 2048), so the axes are
+expected to close only under W3-on (already implemented, `CLAIM-ASYNC-SCHED-W3`,
+default-OFF per `89b329e`'s +36 % TTFT finding); per MIRROR policy the fix IS
+async-on, no invented single-prefill cap. The empirical confirmation is a
+**c8+c32 W3-on/off ITL-tail A/B** folded into the pending W3 DGX proof (`VT_ASYNC_RUNNER=1`
+vs `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`, same binary, one flock, 3 reps),
+**PENDING** an uncontended GPU (the 2026-07-16 window had the lock held). The
+decode body (tokens 16–111) is at parity with ZERO mid-sequence stalls;
+capping the per-event stall at one prefill was measured-sufficient to flip both
+axes to PASS (counterfactual ratios 0.87–0.96 / 0.93–1.11). The
 old c16/c32 total-throughput WINS are GONE (see the honest regression above);
 c16/c32 total throughput now barely misses (0.9953 / 0.9985). No 35B performance
 command is authorized until the 27B result reaches 124/124.
@@ -255,9 +267,12 @@ cudaMalloc/cudaFree (handed to the W3-throughput owner), a missing 24 CUDA-graph
 bucket, and DOWNGRADED the c2–c8 "host-side" attribution to UNATTRIBUTED
 pending a correct-state same-profiler c2/c8 full-step split (the prior
 "ours-GPU-net-faster" pillar was measured on contamination-suspect pre-slot-fix
-binaries); (b) the **c8 p99 / c32 p90 ITL tail mechanism — ATTRIBUTED**
-(wave-boundary two-prefill stalls, see above; fix path = mirror vLLM's staggered
-admission regime, prime suspect its default-ON async scheduling = our W3). Diagnostic
+binaries); (b) the **c8 p99 / c32 p90 ITL tail mechanism — DISCRIMINATED**
+(CPU wave-boundary diff, see above): NOT a scheduler divergence (our sync
+`Scheduler` == vLLM's async `AsyncScheduler` composition, byte-identical) but
+async-runtime output-timing phasing = our W3 (default-OFF, `89b329e`); no
+sync-scheduler fix exists, per MIRROR policy the fix IS async-on. Confirmation =
+the pending c8+c32 W3-on/off ITL-tail A/B on an idle GPU. Diagnostic
 (`benchmark_binding=false`, no speed credit); binding stays 49/124.
 
 ## Current checkpoint

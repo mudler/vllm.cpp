@@ -88,3 +88,84 @@ MIRROR policy applies: the fix is whatever pinned vLLM actually does
 - Acceptance for closing the axes: interleaved c8+c32 rerun with per-event
   stall ≤1 prefill equivalents, both ratios ≥0.85, no regression to the
   passing means or the flat decode body.
+
+## Fix-owner verdict — CPU Phase-1 discriminator (2026-07-16, `CLAIM-ITL-TAIL-1`)
+
+**The stall is NOT a scheduler-policy divergence. Given identical wave-boundary
+inputs, our sync `Scheduler` and vLLM's async `AsyncScheduler` produce
+BYTE-IDENTICAL per-step composition.** The discriminator drives the REAL vLLM
+`Scheduler` (sync, depth-1) and `AsyncScheduler` (depth-2) — CPU-only, no GPU, no
+weights — through both (a) the scripted wave-boundary sequence this spec
+describes and (b) a full closed loop, at the binding shape (`max_num_seqs=32`,
+`max_num_batched_tokens=2048`, chunked prefill on, no prefix caching), and records
+`{prefill tokens per request, decode tokens, chunked?}` per step. Our C++
+`Scheduler`/`AsyncScheduler` are driven through the byte-identical script and
+reproduce the oracle exactly.
+
+Harness `tools/bench/scheduler_wave_diff.py`; golden
+`tests/fixtures/scheduler_wave/wave_script_oracle.json`; C++ parity test
+`tests/vllm/v1/test_scheduler_wave.cpp` (3 cases / 44 asserts GREEN).
+
+Measured wave-boundary composition (2 requests finish the SAME step, 2 fresh
+1024-token prefills waiting, N-2 stayers decoding — the admission "stall" step):
+
+| Arm | admission step composition | budget |
+|---|---|---|
+| c8 sync (`Scheduler`, depth-1) | 1024 + **1018 chunk** + 6 decodes | **2048** (~860 ms) |
+| c8 async (`AsyncScheduler`, depth-2) | 1024 + **1018 chunk** + 6 decodes | **2048** (identical) |
+| c32 sync | 1024 + **994 chunk** + 30 decodes | **2048** (~860 ms) |
+| c32 async | 1024 + **994 chunk** + 30 decodes | **2048** (identical) |
+
+The closed loop confirms it: 74/89 (c32) and 10/16 (c8) admission steps fill the
+budget to ~2048 in BOTH arms; the async depth-2 driver's only effect is that a
+finishing request lingers one step in `running` (skipped by the early-continue
+guard, `scheduler.cpp:148-153`, so it contributes 0 tokens) — which shifts the
+decode count by ≤2 but does NOT reduce the prefill packing. The budget-fill (1024
++ chunk) is what BOTH schedulers do at the knife-edge (prompt 1024 == half the
+2048 budget), and it is the same on both sides.
+
+**Hypotheses resolved:**
+- **H-B (decode-first budgeting) — DEAD.** Both fund running decodes first, then
+  chunk the second prefill to fill the budget identically (`scheduler.cpp:140-249`
+  running loop, `:253-319` waiting loop == `scheduler.py` running/waiting loops).
+  The async placeholder accounting (`async_scheduler.py:19-49`) does not change the
+  token budget consumed by decodes.
+- **H-C (partial-prefill policy) — DEAD.** `max_num_partial_prefills=1` and
+  `long_prefill_token_threshold=0` are the defaults on both sides
+  (`config/scheduler.py:70,80,242`; `config/scheduler.cpp:96,100`), inert here.
+- **H-A (admission ordering) — already DEAD at `89b329e`.**
+
+**Where the divergence lives.** The tables are IDENTICAL, so per the Phase-1
+decision tree the vLLM ~500 ms band ours lacks is an ARRIVAL/COMPLETION-phasing
+(async output-timing) effect, NOT a scheduler policy we can mirror in the
+synchronous path. Critically, **CPU simulation of the async driver does NOT
+reproduce it either** — the AsyncScheduler + depth-2 loop still budget-packs to
+~2048 in CPU sim. The de-phasing is therefore a WALL-CLOCK / GPU-runtime property
+of async-ON execution (depth-2 output timing + GPU/pipeline overlap; consistent
+with `89b329e`'s measured async −5.4 ms/step), which discrete CPU scheduling
+cannot reproduce. This is exactly the MIRROR-policy escape case: **the tail axes
+are expected to close only under W3-on (async scheduling), which we already
+implement (`CLAIM-ASYNC-SCHED-W3`, `AsyncScheduler` + `step_with_batch_queue` +
+runner async I/O) but keep default-OFF** because `89b329e` measured W3-on
+regresses mean TTFT +36 % (Little's-law consequence of its decode win at neutral
+throughput) — it needs a depth-2 THROUGHPUT/overlap lever before it is shippable.
+
+**No sync-scheduler fix exists** (the discriminator proves it). Per MIRROR policy
+the fix IS what vLLM does — async on — and that is the pending W3 track, not a new
+cap. Inventing a one-prefill-per-step cap would DIVERGE from vLLM (its async arm
+budget-packs too; the difference is runtime timing, not a cap) and is rejected.
+
+**Empirical confirmation gate (folds into the pending W3 DGX proof,
+`CLAIM-ASYNC-SCHED-W3`).** Whether W3-on empirically closes THESE two axes is
+unverified — `89b329e`'s A/B measured c16 means only, not the c8/c32 ITL tails.
+Add to the pending W3 DGX proof an interleaved **c8 + c32** A/B, same binary, one
+`flock /tmp/gpu`, W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+(`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`), 3 reps, via
+`tools/bench/profile_vllm_online_gate.py` / the `SERVE-GATE-ONLINE` harness,
+recording `p99_itl` (c8) and `p90_itl` (c32) and the stall-event ms distribution.
+ACCEPT (mechanism confirmed) = W3-on produces the ~500-550 ms band and flips both
+ratios ≥0.85 vs vLLM AND does not regress the c8/c32 means/TTFT; REFUTE = the
+tails persist under W3-on → the cause is a different runtime effect, reopen. Run
+only on an idle, uncontended GPU (the 2026-07-16 window had the lock held by
+another agent + a live `VLLM::EngineCore`, so no benchmark was run — a contended
+run would be void). `benchmark_binding=false`; binding stays 49/124 regardless.

@@ -12059,3 +12059,84 @@ discard, one flock, root `ab-decode-triton`): triton [817.51, 821.06, 822.55] vs
 - PORT (test-first): `RmsNormRowFastKernel` + `TryLaunchRmsNormDecodeFast` (`src/vt/cuda/cuda_ops.cu`) behind `VT_RMSNORM_DECODE_FAST` (pure predicate `src/vt/cuda/rmsnorm_decode_fast.h`, getenv-per-call, house `VT_GDN_PACKED_REG_TILE` pattern), **default OFF** — shipped kernel byte-identical when off. Selection mirrors vLLM's guard: bf16 in/out + bf16 residual + H%8==0 + 16-byte-aligned in/out/weight/residual; else `RmsNormRowKernel`. `__hadd2` residual add is bit-identical to the shipped `ResRound<bf16>(f32-add)` (both RNE-round the exact bf16 sum) ⇒ residual STREAM bit-exact; only the variance reduction is reordered ⇒ not bit-identical (documented one-bf16-ulp / token-exactness hazard).
 - TESTS: CPU flag predicate `tests/vt/test_rmsnorm_decode_fast.cpp` (default-OFF/'1'-leading, RED→GREEN — the shipped-OFF contract); CUDA parity `tests/vt/test_cuda_ops.cpp::RunRmsNormDecodeFastCase` (M∈{2,4,8,16,32}×5120 bf16 ×{gemma,plain}, fast-ON vs shipped-OFF within 1 bf16 ulp, residual bit-identical; DGX-gated).
 - NEXT — DGX proof (orchestrator, from the pushed SHA, one flock/series): CUDA parity case ON≡OFF; both model gates (27B 235/235, 35B 16/16) with `VT_RMSNORM_DECODE_FAST=1` (token-exactness — if tokens shift, keep OFF, document, do NOT re-golden); interleaved c16 A/B (3 pairs + w0) AND a c2 A/B flag on/off. Accept = TPOT reduction with no throughput regression; flip default ON only in a follow-up if BOTH token gates hold AND the A/B wins (isolated-fast ≠ in-situ-fast — the reg-tile lever proved this; a c16 null is plausible given ≤0.77 ms/step on ~168 ms TPOT, the c2 lane is the target). `benchmark_binding=false`, no speed credit until measured; binding stays 49/124.
+## 2026-07-16 — ITL tail-stall CPU wave-boundary DISCRIMINATOR (`CLAIM-ITL-TAIL-1`)
+
+Owner of the two failing binding ITL tail axes (c8 `p99_itl` 0.5599, c32
+`p90_itl` 0.7925). Ran the Phase-1 CPU-only discriminator the tail-stall analysis
+called for. Isolated worktree `.claude/worktrees/agent-a641146b241f0608a`, reset
+to `origin/main` @ `89b329e`.
+
+**What ran (CPU-only, no GPU, no weights).** `tools/bench/scheduler_wave_diff.py`
+constructs the REAL `vllm.v1.core.sched` `Scheduler` (sync, depth-1) and
+`AsyncScheduler` (depth-2) from the installed pinned oracle (vllm 0.25.0 =
+`702f481`, on dgx; `facebook/opt-125m` config only, `skip_tokenizer_init`, no
+model, no CUDA context) at the binding shape (`max_num_seqs=32`,
+`max_num_batched_tokens=2048`, chunked prefill on, `enable_prefix_caching=False`)
+and drives them through two scenarios, recording per-step
+`{prefill tokens/req, decode tokens, chunked}`:
+- `script`: the analysis scenario — N running mid-decode, 2 finish the SAME step
+  (`max_tokens=3`), 2 fresh 1024-token prefills waiting, N-2 stayers decoding.
+- `closedloop`: C clients re-issue a fresh 1024-token prompt on completion.
+
+**Result — the tables are BYTE-IDENTICAL (sync == async, ours == vLLM oracle).**
+Scripted wave-boundary admission ("stall") step (step 4), all four arms:
+
+| arm | admission-step composition | total |
+|---|---|---|
+| c8 sync / c8 async | 1024 + **1018 chunk** + 6 decodes | **2048** (~860 ms) |
+| c32 sync / c32 async | 1024 + **994 chunk** + 30 decodes | **2048** (~860 ms) |
+
+Closed loop: 74/89 (c32) and 10/16 (c8) admission steps fill the budget to ~2048
+in BOTH arms. The AsyncScheduler placeholder accounting (`async_scheduler.py:19-49`)
++ the depth-2 driver do NOT change composition — the only async effect is a
+finishing request lingering one step in `running` (skipped by the early-continue
+guard `scheduler.cpp:148-153`, contributes 0 tokens), shifting the decode count by
+≤2 without reducing the prefill packing. The budget-fill (1024 + chunk at the
+knife-edge prompt 1024 == half the 2048 budget) is what BOTH schedulers do.
+
+**Hypotheses resolved.** H-B (decode-first budgeting) DEAD — both fund decodes
+first then chunk the second prefill to fill the budget identically. H-C
+(partial-prefill) DEAD — `max_num_partial_prefills=1`/`long_prefill_token_threshold=0`
+defaults inert both sides. H-A (admission ordering) already dead at `89b329e`.
+
+**Verdict.** The two ITL tails are NOT a scheduler-policy divergence (CPU-proven).
+Per the Phase-1 decision tree, the vLLM ~500 ms band ours lacks is
+arrival/completion (async output-timing) phasing — and crucially **CPU simulation
+of the async driver does NOT reproduce it either** (the AsyncScheduler + depth-2
+loop still budget-packs to ~2048). The de-phasing is therefore a wall-clock /
+GPU-runtime property of async-ON (depth-2 output timing + GPU/pipeline overlap;
+consistent with `89b329e`'s measured async −5.4 ms/step decode win) that discrete
+CPU scheduling cannot reproduce. This is the MIRROR-policy escape case: **the tail
+axes are expected to close only under W3-on**, which we already implement
+(`CLAIM-ASYNC-SCHED-W3`) but keep default-OFF because `89b329e` measured W3-on
+regresses mean TTFT +36 %. Per MIRROR policy the fix IS async-on — NO invented
+single-prefill cap (that would diverge from vLLM, whose async arm budget-packs
+too; the difference is runtime timing).
+
+**Landed (test-first, CPU).** `tools/bench/scheduler_wave_diff.py` (oracle
+generator, lazy `vllm`/`torch` imports), golden
+`tests/fixtures/scheduler_wave/wave_script_oracle.json`, C++ parity test
+`tests/vllm/v1/test_scheduler_wave.cpp` (3 cases / 44 asserts GREEN: our
+`Scheduler`/`AsyncScheduler` reproduce the oracle composition exactly and
+sync == async). It is a GREEN parity guard, not a RED→GREEN fix — the
+discriminator's value is RULING OUT the scheduler; it would go RED if a
+single-prefill cap or budget-fill change were introduced. CMake row added. Docs
+updated in the same commit: README (Qwen3.6-27B row + remaining-gap-diagnosis),
+`docs/BENCHMARKS.md` (§ tail attribution + next-levers), engine-matrix
+`SERVE-GATE-ONLINE`, parity-ledger, coordination (`CLAIM-ITL-TAIL-1`).
+
+**PENDING empirical confirmation (folds into the W3 DGX proof,
+`CLAIM-ASYNC-SCHED-W3`).** Whether W3-on empirically closes THESE two axes is
+unverified — `89b329e`'s A/B measured c16 means only. Gate: interleaved **c8 + c32**
+A/B, same binary, one `flock /tmp/gpu`, W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+(`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`), 3 reps, via
+`tools/bench/profile_vllm_online_gate.py` / the `SERVE-GATE-ONLINE` harness,
+recording `p99_itl` (c8) / `p90_itl` (c32) + the stall-event ms distribution.
+ACCEPT = W3-on yields the ~500-550 ms band and flips both ratios ≥0.85 vs vLLM
+without regressing the c8/c32 means/TTFT; REFUTE = tails persist under W3-on →
+different runtime effect, reopen. NOT run 2026-07-16: the GPU lock was HELD by
+another agent + a live `VLLM::EngineCore` (25 GB); a contended benchmark is void.
+No engine/kernel/CUDA code changed, so the W3 binary is unchanged from `89b329e`.
+`benchmark_binding=false`, binding stays 49/124. Trailers
+`FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
+[ClaudeCode]`.

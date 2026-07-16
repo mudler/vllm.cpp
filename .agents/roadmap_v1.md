@@ -45,10 +45,13 @@ the busy part is **~2.06 ms GDN packed-recurrence tiling** (`GdnPackedDecodeKern
 21.31 vs vLLM fla `fused_recurrent` 19.24 ms/step; state r/w FUSED in-kernel on
 both sides, ~83% vs ~92% of peak BW) **+ ~2 ms unfused norm/quant glue**, with
 GEMM/MoE/attention at parity (state-I/O ≈ only 26% of the gap, NOT the dominant
-cause the premise assumed). Order-0 next: **(1)** port vLLM's register-resident
-single-warp `num_stages=3` FLA packed-decode tiling (`fused_recurrent.py:282-336`)
-into `GdnPackedDecodeKernel` (`cuda_gdn.cu:1006-1120`, replace the smem-staged
-`sbh` variant) ⇒ ~+2 ms/step; **(2)** the Inductor add+RMSNorm+FP4-quant /
+cause the premise assumed). Order-0 next: **(1) LANDED (test-first, CPU-gated,
+DGX-pending)** — vLLM's register-resident single-warp `num_stages=3` FLA
+packed-decode tiling (`fused_recurrent.py:256-336`) is ported into the new
+`GdnPackedDecodeRegTileKernel` (`cuda_gdn.cu`, one warp per `[BV=32,BK]` tile,
+state block register-resident; the legacy smem-staged `GdnPackedDecodeKernel`
+stays as the `VT_GDN_PACKED_REG_TILE=0` rollback, same binary) ⇒ expected
+~+2 ms/step, awaiting the DGX c16 A/B; **(2)** the Inductor add+RMSNorm+FP4-quant /
 SiLU+FP4-quant decode fusion ⇒ ~+2 ms/step; **(3)** `ENG-ASYNC-SCHED` W3 for the
 ~3.25 ms host/idle bubble. **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
 stall cadence from this root's per-request `itls[]`. The

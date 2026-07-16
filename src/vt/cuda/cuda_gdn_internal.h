@@ -27,6 +27,13 @@ size_t PoisonGdnTritonScratch(Queue& queue, unsigned char value);
 
 struct GdnPackedDecodeDebugStats {
   uint64_t launches = 0;
+  // Sub-counts of `launches` by the kernel actually selected inside
+  // GdnPackedDecodeKernelCuda: the register-resident tiling (new default) vs the
+  // legacy shared-memory / NW-shuffle kernel (VT_GDN_PACKED_REG_TILE=0 rollback,
+  // or a non-{32,128} geometry that stays on the legacy path). reg_tile +
+  // legacy == launches at every instrumented dispatch.
+  uint64_t reg_tile_launches = 0;
+  uint64_t legacy_launches = 0;
 };
 
 // Model-selection instrumentation: counts host dispatches into the packed CUDA

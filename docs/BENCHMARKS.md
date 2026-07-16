@@ -84,6 +84,25 @@ this run's evidence. Detailed per-seal chronology and evidence SHAs live in the
 append-only [ledger](../.agents/parity-ledger.md) and
 [state log](../.agents/state.md). 35B stays blocked until 27B reaches 124/124.
 
+**Register-resident decode tiling — PERF LEVER landed (2026-07-16, test-first,
+CPU-gated, DGX-pending; PENDING binding number).** The named +2.06 ms/step
+recurrence-tiling gap (correct-state c16 traces: ours 21.31 vs vLLM 19.24
+ms/step; ~83% vs ~92% of ~273 GB/s) is closed by porting vLLM FLA's
+register-resident single-warp `num_stages=3` packed-decode kernel
+(`fused_recurrent.py:256-336`) into a new `GdnPackedDecodeRegTileKernel`: one warp
+per `[BV=32,BK]` tile with the state block held in REGISTERS across the update —
+no shared-state round-trip, no cross-warp `__shfl` reduction, no `__syncthreads`.
+Default-on behind `VT_GDN_PACKED_REG_TILE` (=0 restores the legacy kernel
+bit-for-bit, same binary); boundary-fixture BF16 output stays bit-exact
+(sequential per-row Dk reduction). CPU gates GREEN (flag test 12/12, `test_ops_gdn`
+45/45, `test_op_parity` 10/10, full CTest 105/105, tools 164/164, clean -Werror;
+`.cu` is DGX-compiled). **Expected ~+2 ms/step (~+10 tok/s) at c16** — the
+orchestrator's DGX proof (bit-exact oracle under lock, full CUDA GDN suite,
+rollback-selection re-run, both model gates, memcheck slice, then the interleaved
+c16 A/B new-vs-`a2329e1`-era legacy) is the binding measurement; **no speed credit
+until measured**. Repro commands in
+[the packed-decode spec](../.agents/specs/gdn-packed-decode.md#register-resident-decode-tiling-perf-lever-2026-07-16--cpu-gated-dgx-pending).
+
 **Blast-radius caveat (correctness).** The c16 slot defect predated its
 validator and was independent of `VT_GDN_PACKED_DECODE` (both arms hit the same
 remap). The compact slot pool was introduced at `66715e1` (2026-07-05); the

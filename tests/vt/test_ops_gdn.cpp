@@ -26,7 +26,10 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
-#ifdef VLLM_CPP_TRITON
+#ifdef VLLM_CPP_CUDA
+// Packed-decode debug counters (reg-tile vs legacy launch sub-counts) plus the
+// Triton AOT stats used by the chunked cases. Defined in cuda_gdn.cu, available
+// whenever the CUDA backend is built (the packed counters do not require Triton).
 #include "vt/cuda/cuda_gdn_internal.h"
 #endif
 
@@ -1164,6 +1167,103 @@ TEST_CASE("CUDA gdn packed decode capture replays preserve padding state and can
   CHECK(a_after == c.a);
   CHECK(b_after == c.b);
 }
+
+// VT_GDN_PACKED_REG_TILE rollback contract: the register-resident tiling is the
+// default; "=0" restores the legacy shared-memory kernel in the SAME binary.
+// Uses the packed-decode host-dispatch debug counters (reg-tile vs legacy
+// sub-counts) to prove which kernel each arm actually launched, and checks BOTH
+// arms match the portable CPU reference (loose tol; reduction orders differ).
+// Guarded on VLLM_CPP_CUDA because it references the CUDA-only debug counters
+// (defined in cuda_gdn.cu); the portable flag parse is covered on every platform
+// by tests/vt/test_gdn_packed_reg_tile.cpp.
+#ifdef VLLM_CPP_CUDA
+TEST_CASE(
+    "CUDA gdn packed decode VT_GDN_PACKED_REG_TILE=0 selects legacy, default "
+    "selects reg-tile") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr DType dtype = DType::kBF16;
+  // Real 27B gate geometry (dk == dv == 128 => bv == 32) so the reg-tile path is
+  // eligible (the dk==32 capture case exercises the BK==32 instantiation).
+  PackedCase c = MakePackedCase(dtype, false, 32, 4, 8, 128, 128, 8900);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(c.dk))};
+
+  // Portable CPU reference for the correctness of BOTH arms.
+  std::vector<uint8_t> state_cpu = c.state;
+  std::vector<uint8_t> out_cpu(
+      static_cast<size_t>(c.batch * c.hv * c.dv) * vt::SizeOf(dtype));
+  Tensor mixed_cpu = RowView(c.mixed.data(), dtype, Cpu(), c.batch,
+                             c.mixed_cols, c.mixed_stride);
+  Tensor a_cpu = RowView(c.a.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor b_cpu = RowView(c.b.data(), dtype, Cpu(), c.batch, c.hv, c.gate_stride);
+  Tensor al_cpu = MakeT(c.a_log.data(), dtype, Cpu(), {c.hv});
+  Tensor dt_cpu = MakeT(c.dt_bias.data(), dtype, Cpu(), {c.hv});
+  Tensor idx_cpu = MakeT(c.indices.data(), DType::kI32, Cpu(), {c.batch});
+  Tensor state_cpu_t =
+      MakeT(state_cpu.data(), dtype, Cpu(), {c.slots, c.hv, c.dv, c.dk});
+  Tensor out_cpu_t = MakeT(out_cpu.data(), dtype, Cpu(), {c.batch, c.hv, c.dv});
+  Queue cpu_q = Q();
+  vt::GdnPackedDecode(cpu_q, out_cpu_t, mixed_cpu, a_cpu, b_cpu, al_cpu, dt_cpu,
+                      state_cpu_t, idx_cpu, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor d_mixed(gpu, guard.q, dtype, {c.batch, c.mixed_stride},
+                       c.mixed.data());
+  DeviceTensor d_a(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.a.data());
+  DeviceTensor d_b(gpu, guard.q, dtype, {c.batch, c.gate_stride}, c.b.data());
+  DeviceTensor d_al(gpu, guard.q, dtype, {c.hv}, c.a_log.data());
+  DeviceTensor d_dt(gpu, guard.q, dtype, {c.hv}, c.dt_bias.data());
+  DeviceTensor d_idx(gpu, guard.q, DType::kI32, {c.batch}, c.indices.data());
+  Tensor mixed_gpu = d_mixed.tensor();
+  mixed_gpu.shape[1] = c.mixed_cols;
+  Tensor a_gpu = d_a.tensor();
+  a_gpu.shape[1] = c.hv;
+  Tensor b_gpu = d_b.tensor();
+  b_gpu.shape[1] = c.hv;
+
+  auto run = [&](const char* env_value, uint64_t& reg_tile, uint64_t& legacy,
+                 std::vector<uint8_t>& out_host) {
+    if (env_value == nullptr)
+      unsetenv("VT_GDN_PACKED_REG_TILE");
+    else
+      setenv("VT_GDN_PACKED_REG_TILE", env_value, 1);
+    DeviceTensor d_state(gpu, guard.q, dtype, {c.slots, c.hv, c.dv, c.dk},
+                         c.state.data());
+    DeviceTensor d_out(gpu, guard.q, dtype, {c.batch, c.hv, c.dv});
+    vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+    vt::GdnPackedDecode(guard.q, d_out.tensor(), mixed_gpu, a_gpu, b_gpu,
+                        d_al.tensor(), d_dt.tensor(), d_state.tensor(),
+                        d_idx.tensor(), args);
+    const auto stats = vt::cuda::testing::GetGdnPackedDecodeDebugStats();
+    vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+    reg_tile = stats.reg_tile_launches;
+    legacy = stats.legacy_launches;
+    out_host.resize(out_cpu.size());
+    d_out.Download(guard.q, out_host.data());
+  };
+
+  // Rollback: VT_GDN_PACKED_REG_TILE=0 selects the legacy kernel.
+  uint64_t reg0 = 0, legacy0 = 0;
+  std::vector<uint8_t> out_legacy;
+  run("0", reg0, legacy0, out_legacy);
+  CHECK(legacy0 == 1);
+  CHECK(reg0 == 0);
+  CheckClose(Unpack(out_legacy, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
+
+  // Default (unset) selects the register-resident kernel.
+  uint64_t reg1 = 0, legacy1 = 0;
+  std::vector<uint8_t> out_reg;
+  run(nullptr, reg1, legacy1, out_reg);
+  CHECK(reg1 == 1);
+  CHECK(legacy1 == 0);
+  CheckClose(Unpack(out_reg, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
+
+  unsetenv("VT_GDN_PACKED_REG_TILE");
+}
+#endif  // VLLM_CPP_CUDA
 
 // causal_conv1d_fwd CPU-vs-CUDA on one varlen batch.
 void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,

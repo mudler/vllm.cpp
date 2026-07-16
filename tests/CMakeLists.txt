@@ -159,6 +159,11 @@ vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.
 vllm_cpp_add_test(test_gemm_algo_log vt/test_gemm_algo_log.cpp)
 target_include_directories(test_gemm_algo_log PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the register-resident packed-decode tiling A/B flag
+# (VT_GDN_PACKED_REG_TILE). Reaches the internal header under src/ (not public
+# API); the kernel it gates is CUDA-only and lives in src/vt/cuda/cuda_gdn.cu.
+vllm_cpp_add_test(test_gdn_packed_reg_tile vt/test_gdn_packed_reg_tile.cpp)
+target_include_directories(test_gdn_packed_reg_tile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).

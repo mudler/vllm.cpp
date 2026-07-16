@@ -43,9 +43,12 @@ OpenAI-compatible server.
 > ~4.65 ms GPU-busy + ~3.25 ms host/idle, and the busy part splits ~2.06 ms GDN
 > recurrence tiling (ours 21.3 vs vLLM 19.2 ms/step; state r/w FUSED in-kernel on
 > both sides — NOT separate state-I/O) + ~2 ms unfused norm/quant glue, with
-> GEMM/MoE/attention at parity. Named lever: port vLLM's register-resident
-> single-warp `num_stages=3` FLA packed-decode tiling.
-> See [Benchmarks](docs/BENCHMARKS.md).
+> GEMM/MoE/attention at parity. The ~2.06 ms recurrence-tiling lever is now
+> **ported (test-first, CPU-gated, DGX-pending)**: a register-resident
+> single-warp `num_stages=3` FLA packed-decode kernel (`GdnPackedDecodeRegTileKernel`,
+> default-on behind `VT_GDN_PACKED_REG_TILE`, =0 restores the legacy kernel
+> bit-for-bit) — expected ~+2 ms/step (~+10 tok/s) at c16 once the DGX A/B
+> confirms. See [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
 

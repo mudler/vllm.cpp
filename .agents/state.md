@@ -11359,3 +11359,93 @@ H1d `vllm-kernels.json` was captured at the default (bf16 state), a denominator
 mismatch this corrects. Evidence root is fresh (`vllm.cpp-gdn-stateio-trace`),
 never a binding root. `benchmark_binding=false` (diagnostic kernel attribution,
 no speed credit).
+
+## 2026-07-16 — register-resident packed-decode tiling PERF LEVER ported (test-first, CPU-gated, DGX-pending); `CLAIM-GDN-BA-ROUNDING-1`, worktree `.claude/worktrees/agent-a8e39ea6e7e2397f3`
+
+Ported vLLM FLA's register-resident single-warp `num_stages=3`
+`fused_recurrent_gated_delta_rule_packed_decode_kernel`
+(`vllm/model_executor/layers/fla/ops/fused_recurrent.py:256-336`, launch
+`:391-478` @ `702f4814`) into a new `GdnPackedDecodeRegTileKernel` in
+`src/vt/cuda/cuda_gdn.cu` — the named **+2.06 ms/step** recurrence-tiling lever
+from the 2026-07-16 correct-state c16 kernel comparison (ours 21.31 vs vLLM
+19.24 ms/step; ~83% vs ~92% of ~273 GB/s). Started from `git fetch origin &&
+git reset --hard origin/main` at `a2329e1` (verified present).
+
+**Ported structure (mirror 1:1).** One warp owns one `(sequence, v-head, BV=32
+value-tile)`; each lane owns ONE value-row and holds that row's whole `[1,BK]`
+state slice in REGISTERS (`float sh[BK]`, `BK` compile-time → K-loop fully
+unrolled → register-resident) across the update. This maps Triton's
+`num_warps=1` program (whose `[BV,BK]` block is distributed 1-row-per-lane, so
+`tl.sum(...,axis=1)` is lane-local) exactly. Eliminated vs the legacy
+`GdnPackedDecodeKernel` (`cuda_gdn.cu` smem-staged `sbh`, 8 warps, NW-way
+`__shfl_xor`, two `__syncthreads`): the shared-memory state round-trip, the
+cross-warp shuffle reduction (each lane's `dot=(S·decay)@k` and `o=S@q'` are
+single sequential Dk sums), and both barriers. `q'`/`k` staged in `__shared__
+float bq/bk[BK]`, one `__syncwarp` broadcast, no dynamic shared. vLLM's
+`num_stages=3` maps to the unrolled ILP-exposed register K-loop (loads issued
+together, then compute) — no cp.async ring (small decode kernel; not
+over-engineered).
+
+**Bit-exactness preserved.** F32 arithmetic throughout; in-kernel F32 q/k L2
+norm (`1/sqrtf(sumsq+1e-6)`, scale grouped `qv*(q_inv*scale)`); `decay =
+expf(-expf(A_log)*softplus(a+dt_bias))`; `beta = RoundToStorage<T>(sigmoid(b))`
+rounded through the activation dtype before the recurrence; `Store()` rounds
+output/state to `Tout`/`TState`. Because each lane owns a full row, the Dk
+reduction is the reference's SEQUENTIAL order (closer to the Triton oracle than
+the legacy 8-way butterfly) ⇒ the boundary fixture's BF16 `out_diff == 0` holds
+and F32 state within its 1e-4 contract. NULL-slot sentinel stays our `slot < 0
+|| slot >= state_slots`.
+
+**Same-binary rollback.** `VT_GDN_PACKED_REG_TILE` (default ON; any `0`-leading
+value → legacy bit-for-bit). Pure parse `GdnPackedRegTileFlagIsOn` in the new
+CPU-includable `src/vt/cuda/gdn_packed_reg_tile.h`; read per call in the launcher
+(coarse decode dispatch; mirrors `VT_GDN_DECODE_NW`/`VT_GDN_CHUNKED`, so
+in-process tests can flip it — NOT process-cached, a deliberate deviation from
+the gemm_algo_log static-cache convention because the rollback-selection test
+flips it in-process). Reg-tile selected only for `bv == 32 && dk in {32,128}`
+(128 gate dim + dk==32 capture matrix); every other geometry + the rollback stay
+on the legacy kernel. Host sub-counters `reg_tile_launches`/`legacy_launches`
+extend `GdnPackedDecodeDebugStats` to prove selection.
+
+**Tests (test-first).** CPU flag parse `tests/vt/test_gdn_packed_reg_tile.cpp`
+(RED: header absent → compile fail; GREEN 12/12). CUDA rollback-selection case
+in `tests/vt/test_ops_gdn.cpp` (`=0` → legacy launched, default → reg-tile
+launched, both arms match the CPU reference; guarded `#ifdef VLLM_CPP_CUDA`,
+which also broadened the `cuda_gdn_internal.h` include guard from
+`VLLM_CPP_TRITON` to `VLLM_CPP_CUDA`). The full existing packed matrix now runs
+reg-tile as the default: CPU↔CUDA dtype/stride matrix (dk=128) and
+capture+two-replay+canary (dk=32); the bit-exact oracle fixture
+(`tests/parity/test_op_parity.cpp` "qwen27 GDN packed decode boundary") is the
+RED/GREEN core.
+
+**CPU gates (each verified separately).** Clean `-DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_SERVER=OFF` RelWithDebInfo full `-Werror` build (0 warnings);
+`test_gdn_packed_reg_tile` 12/12; `test_ops_gdn` **45/45**; `test_op_parity`
+**10/10** (CUDA cases skip on CPU); full CTest **105/105**; tools
+`unittest discover -s tests/tools` **164/164**; `check-agent-record.py` +
+`check-doc-checkpoint.py` green. The `.cu` is DGX-compiled (no nvcc on this box);
+NO GPU work ran.
+
+**DGX validation (orchestrator, from the pushed SHA; one `flock /tmp/gpu` per
+series).** Build CUDA+Triton reg-tile-default, then:
+1. Bit-exact oracle fixture under lock: `flock /tmp/gpu -c "ctest --test-dir $B
+   -R 'test_op_parity' --output-on-failure"` (expect the packed-decode boundary
+   `out_diff == 0`, state ≤ 1e-4).
+2. Full CUDA GDN suite incl. rollback-selection + capture/replay:
+   `flock /tmp/gpu -c "ctest --test-dir $B -R 'test_ops_gdn' --output-on-failure"`.
+3. Rollback bit-for-bit legacy re-run:
+   `flock /tmp/gpu -c "VT_GDN_PACKED_REG_TILE=0 ctest --test-dir $B -R
+   'test_ops_gdn|test_op_parity' --output-on-failure"`.
+4. Both model gates: `flock /tmp/gpu -c "ctest --test-dir $B -R
+   'test_qwen27_paged_engine|test_qwen36_paged_engine' --output-on-failure"`.
+5. Strict memcheck slice: `flock /tmp/gpu -c "/usr/local/cuda-13.0/bin/compute-sanitizer
+   --tool memcheck --error-exitcode 1 $B/tests/test_ops_gdn
+   --test-case='CUDA gdn packed decode*'"`.
+6. Interleaved c16 A/B: reg-tile (default) vs `VT_GDN_PACKED_REG_TILE=0` (== the
+   `a2329e1`-era legacy kernel), steady-window nsys `--cuda-graph-trace=node`;
+   expect **~+2 ms/step (~+10 tok/s)**, packed recurrence 21.31 → ~19.2 ms/step.
+
+Diagnostic/perf lever; `benchmark_binding=false`, no speed credit until measured;
+binding stays 49/124. `CLAIM-GDN-BA-ROUNDING-1` continues (qkvz remains its W2).
+Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
+[ClaudeCode]`.

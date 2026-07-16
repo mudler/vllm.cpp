@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "vt/cuda/cuda_gdn_internal.h"
+#include "vt/cuda/gdn_packed_reg_tile.h"
 #include "vt/cuda/tile/cp_async.cuh"
 #include "vt/cuda/tile/tma_pipeline.cuh"
 #include "vt/ops.h"
@@ -86,10 +87,24 @@ constexpr int64_t kChunkMaxDim = 128;
 
 std::atomic<bool> g_gdn_packed_debug_enabled{false};
 std::atomic<uint64_t> g_gdn_packed_launches{0};
+// Sub-counters of g_gdn_packed_launches by selected kernel (see
+// GdnPackedDecodeDebugStats): register-resident tiling vs legacy fallback.
+std::atomic<uint64_t> g_gdn_packed_reg_tile_launches{0};
+std::atomic<uint64_t> g_gdn_packed_legacy_launches{0};
 
 void RecordGdnPackedDecodeLaunch() {
   if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))
     g_gdn_packed_launches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGdnPackedDecodeRegTileLaunch() {
+  if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))
+    g_gdn_packed_reg_tile_launches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordGdnPackedDecodeLegacyLaunch() {
+  if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))
+    g_gdn_packed_legacy_launches.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Check(cudaError_t err, const char* what) {
@@ -1165,6 +1180,187 @@ void DispatchGdnPackedDecode(cudaStream_t stream, Tensor& out,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Register-resident single-warp packed pure-decode — a 1:1 port of vLLM FLA's
+// fused_recurrent_gated_delta_rule_packed_decode_kernel (num_warps=1,
+// num_stages=3), vllm/model_executor/layers/fla/ops/fused_recurrent.py:256-336
+// (launch :391-478) @ 702f4814. One warp owns ONE (sequence, v-head, BV value-
+// tile) and each lane owns ONE value-row, holding that row's whole [1,BK] state
+// slice in REGISTERS across the update: the recurrence never round-trips the
+// state through shared memory, the two Dk contractions are lane-local sequential
+// sums (no cross-warp __shfl reduction), and there are no __syncthreads
+// barriers. Only q'/k are staged in shared (a [dk] broadcast each) and the L2
+// norm sums are the single warp-local reductions. This replaces the legacy
+// GdnPackedDecodeKernel (shared-staged [BV,Dk] slice, 8 warps, NW-way __shfl_xor
+// reduction, two __syncthreads), which reached ~83% of state bandwidth; the
+// register-resident structure mirrors vLLM's ~92% (see .agents/specs/
+// gdn-packed-decode.md and the 2026-07-16 correct-state kernel comparison).
+//
+// NUMERIC SEMANTICS ARE IDENTICAL to GdnPackedDecodeKernel and the CPU
+// PackedDecodeReference: F32 arithmetic throughout; in-kernel F32 q/k L2
+// normalization (1/sqrtf(sumsq+1e-6)); decay = expf(-expf(A_log)*softplus(a+
+// dt_bias)); beta = RoundToStorage<T>(sigmoid(b)) rounded THROUGH the activation
+// dtype before the recurrence; per row the state is scaled by decay, the dot
+// (S·decay)@k and the output S@q' are each a single sequential Dk sum, and the
+// output/state stores round to Tout/TState via Store(). Because each lane owns a
+// full row the Dk reduction is the reference's sequential order (closer to the
+// fixture oracle than the legacy 8-way butterfly), so the BF16 output stays
+// bit-exact and the F32 state within the fixture's 1e-4 contract. BK is a
+// compile-time constant so the [BK] register row fully unrolls and stays
+// register-resident; the launcher instantiates BK == dk (32, or the 128 gate
+// dim) and only for bv == 32 (one warp per tile), routing every other geometry
+// to the legacy kernel.
+template <typename T, typename TState, int BK>
+__global__ void GdnPackedDecodeRegTileKernel(
+    T* out, const T* mixed_qkv, const T* a, const T* b,
+    const void* a_log, DType a_log_dtype, const void* dt_bias,
+    DType dt_bias_dtype, TState* state,
+    const int32_t* state_idx, int64_t state_slots, int64_t mixed_stride,
+    int64_t a_stride, int64_t b_stride, int64_t hk_n, int64_t dk,
+    int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  const int64_t i_v = blockIdx.x;
+  const int64_t i_nh = blockIdx.y;
+  const int64_t i_n = i_nh / hv_n;
+  const int64_t hv = i_nh % hv_n;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t vbase = i_v * bv;
+  const int lane = static_cast<int>(threadIdx.x);  // one lane per value-row
+  const int64_t vrow = vbase + lane;
+
+  // Persistent-cache indirection (fla ssm_state_indices). Uniform over the block
+  // (i_n fixed by blockIdx.y), so every lane branches together — no divergence.
+  const int32_t slot = state_idx[i_n];
+  if (slot < 0 || slot >= state_slots) {
+    if (vrow < dv) Store(out, (i_n * hv_n + hv) * dv + vrow, 0.0f);
+    return;
+  }
+
+  // q' = q*q_inv*scale and k = k*k_inv, staged in shared and broadcast to every
+  // lane. All warp lanes cooperate to load, reduce the L2 sums, and normalize.
+  __shared__ float bq[BK];
+  __shared__ float bk[BK];
+  const int nthreads = static_cast<int>(blockDim.x);  // == bv (== 32 here)
+  const int64_t mixed_row = i_n * mixed_stride;
+  const int64_t qbase = mixed_row + hk * dk;
+  const int64_t kbase = mixed_row + hk_n * dk + hk * dk;
+  float q_sumsq = 0.0f;
+  float k_sumsq = 0.0f;
+  for (int64_t ki = lane; ki < dk; ki += nthreads) {
+    const float qv = Load(mixed_qkv, qbase + ki);
+    const float kv = Load(mixed_qkv, kbase + ki);
+    bq[ki] = qv;
+    bk[ki] = kv;
+    q_sumsq += qv * qv;
+    k_sumsq += kv * kv;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    q_sumsq += __shfl_xor_sync(0xffffffffu, q_sumsq, off);
+    k_sumsq += __shfl_xor_sync(0xffffffffu, k_sumsq, off);
+  }
+  // Group the scale into q's inverse-norm exactly as the legacy kernel and the
+  // CPU reference do: bq = qv * (q_inv * scale).
+  const float q_scaled_inv = (1.0f / sqrtf(q_sumsq + 1e-6f)) * scale;
+  const float k_inv = 1.0f / sqrtf(k_sumsq + 1e-6f);
+  for (int64_t ki = lane; ki < dk; ki += nthreads) {
+    bq[ki] *= q_scaled_inv;
+    bk[ki] *= k_inv;
+  }
+  __syncwarp();
+
+  // Per-(token, head) gate scalars — identical for every lane, computed once
+  // each (cheap; avoids a shared round-trip and a second barrier).
+  const float av = Load(a, i_n * a_stride + hv);
+  const float b_raw = Load(b, i_n * b_stride + hv);
+  const float x = av + LoadFloating(dt_bias, dt_bias_dtype, hv);
+  const float softplus = x <= 20.0f ? log1pf(expf(x)) : x;
+  const float g = -expf(LoadFloating(a_log, a_log_dtype, hv)) * softplus;
+  const float decay = expf(g);
+  const float beta = RoundToStorage<T>(1.0f / (1.0f + expf(-b_raw)));
+
+  // Tail lanes (vrow >= dv) helped fill/normalize bq/bk above; they own no state
+  // row, so they stop here (mirrors fla mask_v = o_v < V).
+  if (vrow >= dv) return;
+
+  // Load this lane's [1,BK] state row into registers, then run the single-step
+  // delta-rule recurrence entirely in registers.
+  const int64_t s_row =
+      ((static_cast<int64_t>(slot) * hv_n + hv) * dv + vrow) * dk;
+  float sh[BK];
+#pragma unroll
+  for (int c = 0; c < BK; ++c) sh[c] = Load(state, s_row + c);
+  float dot = 0.0f;
+#pragma unroll
+  for (int c = 0; c < BK; ++c) {
+    sh[c] *= decay;        // b_h *= exp(g)
+    dot += sh[c] * bk[c];  // dot = (S·decay) @ k
+  }
+  const int64_t v_offset = mixed_row + 2 * hk_n * dk + hv * dv + vrow;
+  const float vp = (Load(mixed_qkv, v_offset) - dot) * beta;  // (v - dot) * beta
+  float output = 0.0f;
+#pragma unroll
+  for (int c = 0; c < BK; ++c) {
+    sh[c] += vp * bk[c];     // b_h += (v-dot)*beta * k
+    output += sh[c] * bq[c];  // o = b_h @ q'
+  }
+  Store(out, (i_n * hv_n + hv) * dv + vrow, output);
+#pragma unroll
+  for (int c = 0; c < BK; ++c) Store(state, s_row + c, sh[c]);
+}
+
+template <typename T, typename TState, int BK>
+void LaunchGdnPackedDecodeRegTile(cudaStream_t stream, Tensor& out,
+                                  const Tensor& mixed_qkv, const Tensor& a,
+                                  const Tensor& b, const Tensor& a_log,
+                                  const Tensor& dt_bias, Tensor& state,
+                                  const Tensor& state_idx, int64_t bv,
+                                  const GdnArgs& args) {
+  const int64_t batch = mixed_qkv.shape[0];
+  const int64_t hv_n = state.shape[1];
+  const int64_t dv = state.shape[2];
+  const int64_t dk = state.shape[3];
+  const int64_t hk_n = (mixed_qkv.shape[1] - hv_n * dv) / (2 * dk);
+  const int64_t nv = (dv + bv - 1) / bv;
+  const dim3 grid(static_cast<unsigned>(nv),
+                  static_cast<unsigned>(batch * hv_n));
+  // One warp per tile; the [BK] q'/k broadcast is static shared, so no dynamic
+  // shared memory is requested (the register-resident state is the whole point).
+  GdnPackedDecodeRegTileKernel<T, TState, BK>
+      <<<grid, static_cast<unsigned>(bv), 0, stream>>>(
+          out.Ptr<T>(), mixed_qkv.Ptr<T>(), a.Ptr<T>(), b.Ptr<T>(),
+          a_log.data, a_log.dtype, dt_bias.data, dt_bias.dtype,
+          state.Ptr<TState>(),
+          state_idx.Ptr<int32_t>(), state.shape[0], mixed_qkv.stride[0],
+          a.stride[0], b.stride[0], hk_n, dk, hv_n, dv, bv, args.scale);
+  Check(cudaGetLastError(), "gdn packed decode reg-tile launch");
+}
+
+// Compile-time BK instantiation for the register row. Only the tested/production
+// gate dims are ported (dk == 32 for the small capture matrix, dk == 128 for the
+// real 27B/35B gate); an unsupported dk is a caller bug (the selection guard in
+// GdnPackedDecodeKernelCuda already restricts to these).
+template <typename T, typename TState>
+void DispatchGdnPackedDecodeRegTile(cudaStream_t stream, Tensor& out,
+                                    const Tensor& mixed_qkv, const Tensor& a,
+                                    const Tensor& b, const Tensor& a_log,
+                                    const Tensor& dt_bias, Tensor& state,
+                                    const Tensor& state_idx, int64_t bv,
+                                    int64_t dk, const GdnArgs& args) {
+  if (dk == 128) {
+    LaunchGdnPackedDecodeRegTile<T, TState, 128>(stream, out, mixed_qkv, a, b,
+                                                 a_log, dt_bias, state,
+                                                 state_idx, bv, args);
+  } else if (dk == 32) {
+    LaunchGdnPackedDecodeRegTile<T, TState, 32>(stream, out, mixed_qkv, a, b,
+                                                a_log, dt_bias, state,
+                                                state_idx, bv, args);
+  } else {
+    VT_CHECK(false,
+             "cuda gdn_packed_decode reg-tile: unsupported dk (expected 32 or "
+             "128)");
+  }
+}
+
 void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
                                const Tensor& mixed_qkv, const Tensor& a,
                                const Tensor& b, const Tensor& a_log,
@@ -1192,18 +1388,48 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
   RecordGdnPackedDecodeLaunch();
   cudaStream_t stream = AsStream(q);
 
+  // Register-resident tiling (VT_GDN_PACKED_REG_TILE, default ON): one warp per
+  // [BV=32, BK] tile with the state block register-resident (vLLM FLA
+  // num_warps=1 / num_stages=3). Only the bv==32, dk in {32,128} geometry is
+  // ported; a '0'-rollback OR any other shape stays on the legacy shared-memory
+  // kernel in the SAME binary. The env is read per call (coarse decode dispatch,
+  // negligible getenv — mirrors VT_GDN_DECODE_NW / VT_GDN_CHUNKED) so in-process
+  // tests can flip the selection.
+  const bool use_reg_tile =
+      GdnPackedRegTileFlagIsOn(std::getenv("VT_GDN_PACKED_REG_TILE")) &&
+      bv == 32 && (dk == 32 || dk == 128);
+  if (use_reg_tile)
+    RecordGdnPackedDecodeRegTileLaunch();
+  else
+    RecordGdnPackedDecodeLegacyLaunch();
+
   auto dispatch_state = [&](auto value_tag) {
     using T = decltype(value_tag);
     if (state.dtype == DType::kF32) {
-      DispatchGdnPackedDecode<T, float>(stream, out, mixed_qkv, a, b, a_log,
-                                        dt_bias, state, state_idx, bv, args);
+      if (use_reg_tile)
+        DispatchGdnPackedDecodeRegTile<T, float>(stream, out, mixed_qkv, a, b,
+                                                 a_log, dt_bias, state,
+                                                 state_idx, bv, dk, args);
+      else
+        DispatchGdnPackedDecode<T, float>(stream, out, mixed_qkv, a, b, a_log,
+                                          dt_bias, state, state_idx, bv, args);
     } else if (state.dtype == DType::kF16) {
-      DispatchGdnPackedDecode<T, __half>(stream, out, mixed_qkv, a, b, a_log,
-                                         dt_bias, state, state_idx, bv, args);
+      if (use_reg_tile)
+        DispatchGdnPackedDecodeRegTile<T, __half>(stream, out, mixed_qkv, a, b,
+                                                  a_log, dt_bias, state,
+                                                  state_idx, bv, dk, args);
+      else
+        DispatchGdnPackedDecode<T, __half>(stream, out, mixed_qkv, a, b, a_log,
+                                           dt_bias, state, state_idx, bv, args);
     } else {
-      DispatchGdnPackedDecode<T, __nv_bfloat16>(
-          stream, out, mixed_qkv, a, b, a_log, dt_bias, state, state_idx, bv,
-          args);
+      if (use_reg_tile)
+        DispatchGdnPackedDecodeRegTile<T, __nv_bfloat16>(
+            stream, out, mixed_qkv, a, b, a_log, dt_bias, state, state_idx, bv,
+            dk, args);
+      else
+        DispatchGdnPackedDecode<T, __nv_bfloat16>(
+            stream, out, mixed_qkv, a, b, a_log, dt_bias, state, state_idx, bv,
+            args);
     }
   };
   if (mixed_qkv.dtype == DType::kF32)
@@ -4191,12 +4417,18 @@ void DisableGdnTritonDebugStats() {
 namespace testing {
 void ResetGdnPackedDecodeDebugStats() {
   g_gdn_packed_launches.store(0, std::memory_order_relaxed);
+  g_gdn_packed_reg_tile_launches.store(0, std::memory_order_relaxed);
+  g_gdn_packed_legacy_launches.store(0, std::memory_order_relaxed);
   g_gdn_packed_debug_enabled.store(true, std::memory_order_release);
 }
 
 GdnPackedDecodeDebugStats GetGdnPackedDecodeDebugStats() {
   GdnPackedDecodeDebugStats out;
   out.launches = g_gdn_packed_launches.load(std::memory_order_relaxed);
+  out.reg_tile_launches =
+      g_gdn_packed_reg_tile_launches.load(std::memory_order_relaxed);
+  out.legacy_launches =
+      g_gdn_packed_legacy_launches.load(std::memory_order_relaxed);
   return out;
 }
 

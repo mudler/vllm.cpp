@@ -9,6 +9,15 @@ at `c172336`; W1D3's **G3 closed on the totality of sealed evidence** at the
 eighth seal (`e47b4d6`). Packed remains the default; `VT_GDN_PACKED_DECODE=0`
 the rollback; no `complete-pass` marker exists and no speed credit is claimed.
 `CLAIM-GDN-BA-ROUNDING-1` continues into qkvz (`KERNEL-GEMM-BF16` W2) · **priority:** roadmap order 0.
+
+**2026-07-16 — register-resident decode tiling PERF LEVER landed (test-first,
+CPU-gated, DGX-pending).** The named +2.06 ms/step recurrence-tiling lever is
+ported into a new `GdnPackedDecodeRegTileKernel` (one warp per `[BV=32,BK]`
+tile, state block register-resident, no shared-state round-trip / no cross-warp
+shuffle / no barriers), default-on behind `VT_GDN_PACKED_REG_TILE` (=0 restores
+the legacy kernel bit-for-bit, same binary). Bit-exactness of the boundary
+fixture is preserved (sequential per-row Dk reduction). See "Register-resident
+decode tiling" below for the full port map, rollback, tests, and DGX commands.
 **2026-07-15 verdict (`00bf484` A/B + traces):** packed is GPU-cheaper — the
 8-pair locked c16 A/B total-throughput paired mean is **−0.205% (sd 0.30, <1σ)**
 excluding the cold-first-leg outlier, cuBLASLt algo selection is
@@ -184,6 +193,107 @@ and k in F32 inside the recurrent kernel, and rounds `sigmoid(b)` through the
 input dtype before recurrence. Our path materializes normalized q/k in BF16
 and retains beta in F32. The selected fix is the complete upstream packed
 pure-decode operation, not a beta-only approximation.
+
+## Register-resident decode tiling (perf lever, 2026-07-16 — CPU-gated, DGX-pending)
+
+The `KERNEL-GDN-PACKED-DECODE` correctness row is CLOSED (`DONE`, `e47b4d6`);
+this is the named PERFORMANCE lever on top of it, from the 2026-07-16
+correct-state c16 kernel comparison: at c16 our packed recurrence spends
+**21.31 ms/step vs vLLM 19.24 (+2.06)** — ours staged the `[BV=32, BK=128]`
+state tile through SHARED memory (padded stride `dk+1`, 8 warps, NW-way
+`__shfl_xor` reduction, two `__syncthreads`) reaching ~83% of ~273 GB/s, while
+vLLM's Triton `fused_recurrent_gated_delta_rule_packed_decode_kernel`
+(`vllm/model_executor/layers/fla/ops/fused_recurrent.py:256-336`, launch
+`:391-478` @ `702f4814`, `num_warps=1`, `num_stages=3`) holds the `[BV,BK]`
+state block **register-resident** in one warp and reaches ~92%. The kernel is
+state-bandwidth-bound; the tiling difference is the named cause.
+
+**The port (mirror vLLM's structure 1:1).** New
+`GdnPackedDecodeRegTileKernel<T,TState,BK>`
+([`src/vt/cuda/cuda_gdn.cu`](../../src/vt/cuda/cuda_gdn.cu), inserted after the
+legacy `DispatchGdnPackedDecode`): one warp owns one `(sequence, v-head, BV=32
+value-tile)`; **each lane owns ONE value-row and holds that row's whole `[1,BK]`
+state slice in REGISTERS** (`float sh[BK]`, `BK` a compile-time constant so the
+K-loop fully unrolls and stays register-resident) across the update. This maps
+vLLM's Triton program granularity 1:1 (a `num_warps=1` program whose `[BV,BK]`
+tile is distributed 1-row-per-lane, so `tl.sum(..., axis=1)` is lane-local):
+
+- eliminated the shared-memory state round-trip (`sbh` staging + write-back at
+  the legacy `cuda_gdn.cu:1083-1119`);
+- eliminated the cross-warp `__shfl_xor` reduction of the two Dk contractions
+  (each lane owns a full row → both `dot=(S·decay)@k` and `o=S@q'` are single
+  sequential Dk sums, no butterfly);
+- eliminated both `__syncthreads` barriers (the only reductions left are the
+  warp-local q/k L2-norm sums; `q'`/`k` staged in `__shared__ float bq/bk[BK]`,
+  a `__syncwarp` broadcasts them — no dynamic shared memory requested).
+
+vLLM's `num_stages=3` software pipelining maps to the unrolled, ILP-exposed
+register K-loop (loads issued together, then compute) — the decode kernel is
+small, so no cp.async ring is warranted (deliberately NOT over-engineered).
+
+**Bit-exactness preserved.** F32 arithmetic throughout; in-kernel F32 q/k L2
+normalization (`1/sqrtf(sumsq+1e-6)`, scale grouped as `qv*(q_inv*scale)`
+exactly as the legacy kernel and CPU `PackedDecodeReference`); `decay =
+expf(-expf(A_log)*softplus(a+dt_bias))`; `beta = RoundToStorage<T>(sigmoid(b))`
+rounded THROUGH the activation dtype before the recurrence; per row scale by
+decay, then the two sequential Dk sums; output/state stores round to
+`Tout`/`TState` via `Store()`. Because each lane owns a full row, the Dk
+reduction is the reference's SEQUENTIAL order — closer to the Triton oracle than
+the legacy 8-way butterfly — so the boundary fixture's **BF16 output stays
+bit-exact (`out_diff == 0`)** and the F32 state within its 1e-4 contract. The
+NULL-slot sentinel stays our `slot < 0 || slot >= state_slots` convention.
+
+**Same-binary rollback.** `VT_GDN_PACKED_REG_TILE` (default ON; any `0`-leading
+value restores the legacy kernel bit-for-bit) — pure parse in
+[`src/vt/cuda/gdn_packed_reg_tile.h`](../../src/vt/cuda/gdn_packed_reg_tile.h)
+(`GdnPackedRegTileFlagIsOn`), read per call in the launcher (coarse decode
+dispatch; mirrors `VT_GDN_DECODE_NW`/`VT_GDN_CHUNKED`, so in-process tests can
+flip it). Reg-tile is selected only for the ported geometry `bv == 32 && dk in
+{32, 128}` (the 128 gate dim + the dk==32 capture matrix); every other shape and
+the rollback stay on the legacy `GdnPackedDecodeKernel`, SAME binary. Host
+debug sub-counters `reg_tile_launches`/`legacy_launches` (extend
+`GdnPackedDecodeDebugStats`) prove which kernel each dispatch selected.
+
+**Tests.** CPU-tier flag parse
+[`tests/vt/test_gdn_packed_reg_tile.cpp`](../../tests/vt/test_gdn_packed_reg_tile.cpp)
+(RED before the header existed → GREEN, 12 assertions). CUDA rollback-selection
+case in
+[`tests/vt/test_ops_gdn.cpp`](../../tests/vt/test_ops_gdn.cpp) (`=0` → legacy
+launched, default → reg-tile launched, both arms match the CPU reference). The
+full existing packed matrix now runs the reg-tile kernel as the default: the
+CPU↔CUDA dtype/stride matrix (dk=128) and the capture+two-replay+canary case
+(dk=32) both exercise it, and the bit-exact oracle fixture
+(`tests/parity/test_op_parity.cpp` "qwen27 GDN packed decode boundary") is the
+RED/GREEN core (`out_diff == 0`).
+
+**Expected result.** ~**+2 ms/step** recovered at c16 (≈ **+10 tok/s**), closing
+the recurrence-tiling component of the ~4.65 ms GPU-busy gap; the parallel ~2 ms
+unfused norm/quant glue is a separate lever.
+
+**DGX validation (orchestrator, from the pushed SHA; one `flock /tmp/gpu` per
+series):**
+
+```
+# Build (CUDA + Triton), reg-tile default.
+cmake -S <tree> -B <tree>/build-regtile -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+cmake --build <tree>/build-regtile --clean-first --parallel
+# 1) Bit-exact oracle fixture (default reg-tile) under lock.
+flock /tmp/gpu -c "ctest --test-dir <tree>/build-regtile -R 'test_op_parity' --output-on-failure"
+# 2) Full CUDA GDN suite incl. the reg-tile rollback + capture/replay battery.
+flock /tmp/gpu -c "ctest --test-dir <tree>/build-regtile -R 'test_ops_gdn' --output-on-failure"
+# 3) Rollback bit-for-bit legacy re-run (same suite, VT_GDN_PACKED_REG_TILE=0).
+flock /tmp/gpu -c "VT_GDN_PACKED_REG_TILE=0 ctest --test-dir <tree>/build-regtile -R 'test_ops_gdn|test_op_parity' --output-on-failure"
+# 4) Both model gates (27B default + 35B), reg-tile default.
+flock /tmp/gpu -c "ctest --test-dir <tree>/build-regtile -R 'test_qwen27_paged_engine|test_qwen36_paged_engine' --output-on-failure"
+# 5) Strict memcheck slice on the packed decode op.
+flock /tmp/gpu -c "/usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck --error-exitcode 1 \
+  <tree>/build-regtile/tests/test_ops_gdn --test-case='CUDA gdn packed decode*'"
+# 6) Interleaved c16 A/B: reg-tile (default) vs VT_GDN_PACKED_REG_TILE=0 (== the
+#    a2329e1-era legacy kernel), steady-window nsys --cuda-graph-trace=node.
+#    Expect ~+2 ms/step (~+10 tok/s), packed recurrence 21.31 -> ~19.2 ms/step.
+```
 
 ## Scope
 

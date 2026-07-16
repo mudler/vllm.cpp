@@ -391,3 +391,46 @@ W4 anytime after W1 merges (or before, at the queue level).
 | D5 | CUDA-graph replay vs the new copy stream | risk | The decode graph (`ENG-CUDAGRAPH`, `src/vt/cuda/cuda_backend.cu:76-105`) must not capture the copy stream; AsyncOutput copies run outside capture exactly as upstream keeps them out of graphed regions — verified by G1 with graphs ON |
 | D6 | Overlap win smaller in C++ than in Python | risk (must-measure) | vLLM's async default partly compensates Python/GIL host cost; our host step is already cheap, so G5 may show a smaller delta — the gate is "no regression + mirror behavior", the measured delta is recorded in the ledger either way |
 | D7 | vLLM-defined behavior not reopened | rule | Queue semantics, placeholder math, priority ordering, SSE frame content: mirrored 1:1 from the cited lines; no local redesign |
+
+## Addendum 2026-07-16 — the W3 THROUGHPUT lever (sampler alloc/free) : implemented, token-exact, REFUTED as the unlock
+
+**Diagnosis (Phase 1).** The depth-2 overlap was structurally defeated by
+per-step RAW device-syncing CUDA calls on the sampled-id path (each of
+`cudaMalloc`/`cudaFree`/`cudaHostAlloc`/`cudaFreeHost` implicitly
+device-synchronizes): `sample_tokens_async`'s per-step `vt::Alloc`
+(`cuda_dropin.cu:205`), the `AsyncGPUModelRunnerOutput` ctor's `AllocPinned` +
+2× event-create, **the `cudaFree(device_sampled_ids)` inside `get_output(N-1)`
+— blocking the host until step N's already-launched forward completed** (the
+direct D5-family overlap defeat), and the dtor's `cudaFreeHost`+event-destroy.
+Sync twin: `GreedyArgmaxHost` per-step `cudaMalloc` + blocking D2H + `cudaFree`.
+Corroborated by the lost-lanes rescan item #2 (`beb8497`).
+
+**Fix (Phase 2).** `AsyncOutputPool` — persistent slots {device sampled-id
+buffer, pinned host buffer, fork/ready events} allocated once, borrowed by the
+async output, released on consume — plus a persistent `Sampler` greedy-argmax
+scratch (grow-only). Zero per-step raw driver alloc/free/event-create on either
+path. Mirror: `gpu_model_runner.py:873-878` + `async_utils.py:12-70` (torch
+caching device/pinned allocators; reused events). Token-exactness preserved by
+construction (pure allocation change); RED→GREEN pool-recycling regressions in
+`test_async_output.cpp`.
+
+**Voided first measurement (recorded).** The first w3-tput build omitted
+`-DVLLM_CPP_CUTLASS_DIR`: cutlass NVFP4 GEMM disabled (slow-WMMA fallback, both
+arms ~16× slow) and FA2 silently dropped (`VLLM_CPP_FLASH_ATTN AND
+VLLM_CPP_CUTLASS`) ⇒ all 6 gates failed on `kv_cache_backend_resident()`.
+Retraction: the interim "nsys disables FP4 on GB10" inference was FALSE (same
+build defect). Remediation: configure now HARD-verified for "CUTLASS found" +
+"FlashAttention-2 … ENABLED" before any run; the A/B aborts on gate failure.
+
+**Clean re-proof + verdict.** dgx `~/work/vllm.cpp-w3-tput/ab-fix2`, build2 @
+`463737c`+diff, one flock, proof-corpus c16, w0 + 3 interleaved pairs.
+Token-exactness 6/6 PASS. W3-on tput 788.14–790.58 / meanTPOT 161.60–162.04 /
+TTFT ~2732; W3-off 790.32–792.44 / 166.69–167.00 / ~2027. **Throughput −0.32 %
+(gate ≥+1.5 % FAILS); TPOT −4.95 ms retained; TTFT +34.8 %** — statistically
+identical to the pre-fix `f086b64` proof. **Ceiling analysis:** the removed
+syncs are O(10–100 µs)/step, ≤0.1 % of a ~165 ms c16 step — the lever could
+never reach the gate at c16; D6's "overlap win smaller in C++" risk is the
+operative regime. W3 stays DEFAULT-OFF; the depth-2 throughput search moves to
+the c8+ wave/overlap family (`62d4762` attribution). The sync-path scratch is
+input to the c2–c8 re-attribution (steps there are ~10× shorter, so the same
+µs-scale syncs are a ~10× larger fraction).

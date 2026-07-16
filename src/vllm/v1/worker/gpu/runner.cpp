@@ -878,6 +878,20 @@ vt::Queue& GPUModelRunner::get_or_create_async_copy_queue() {
   return async_copy_queue_;
 }
 
+AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
+  // Persistent per-step overlap buffers, sized to the batch bound (max_num_reqs)
+  // and pre-seeded with a few slots (depth-2 in flight + grammar-deferral
+  // headroom), created on first async use. This removes ALL per-step
+  // cudaMalloc/cudaHostAlloc/cudaEventCreate from sample_tokens_async — the raw
+  // device-syncing allocator calls that serialized the depth-2 overlap.
+  if (async_output_pool_ == nullptr) {
+    const int cap = max_num_reqs_ > 0 ? max_num_reqs_ : 1;
+    async_output_pool_ =
+        std::make_unique<AsyncOutputPool>(queue_.device, cap, /*initial_slots=*/4);
+  }
+  return *async_output_pool_;
+}
+
 std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
     const std::optional<GrammarOutput>& grammar_output) {
   // When async is NOT engaged (production default), degenerate to the byte-
@@ -893,27 +907,31 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   const int num_reqs = exec_state_.num_reqs;
 
   ModelRunnerOutput skeleton;
+  AsyncOutputPool& pool = get_or_create_async_output_pool();
+  vt::Queue& copy_q = get_or_create_async_copy_queue();
   if (num_reqs == 0) {
     // 0-token flush step: nothing sampled. Return an already-complete async
-    // output (a 1-byte device snapshot, zero rows) so the seam is uniform.
-    void* empty = vt::Alloc(dev, 1);
-    vt::Queue& copy_q = get_or_create_async_copy_queue();
+    // output (zero rows) so the seam is uniform. A pool slot is borrowed and
+    // released with no copy — no per-step allocation.
+    AsyncOutputSlot* slot = pool.Acquire();
     return std::make_unique<AsyncGPUModelRunnerOutput>(
-        std::move(skeleton), dev, empty, /*num_reqs=*/0, queue_, copy_q);
+        std::move(skeleton), dev, pool, slot, /*num_reqs=*/0, queue_, copy_q);
   }
 
   std::vector<float> sampled_logits;
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
 
-  // Sample DEVICE-RESIDENT: the sampler writes the ids into a FRESH device buffer
-  // (owned by the async output below, so a depth-2 next step may reuse the
-  // runner's working buffers without tearing this snapshot). The sampler writes
-  // it device-resident (all-greedy: no host download inside the sampler), and the
-  // async output owns the single sampled-id copy to host. Mirrors
-  // sampler_output.sampled_token_ids staying GPU-side (async_utils.py:31).
-  void* dev_ids =
-      vt::Alloc(dev, static_cast<size_t>(num_reqs) * sizeof(int64_t));
+  // Sample DEVICE-RESIDENT: the sampler writes the ids into the pool slot's
+  // PERSISTENT device buffer (the pool guarantees the slot is not reused until
+  // this step's async output releases it, so a depth-2 next step cannot tear this
+  // snapshot). The sampler writes it device-resident (all-greedy: no host
+  // download inside the sampler), and the async output issues the single
+  // sampled-id copy to host on the copy queue. Mirrors sampler_output.
+  // sampled_token_ids staying GPU-side (async_utils.py:31). No per-step
+  // cudaMalloc here — the slot buffer is reused across steps.
+  AsyncOutputSlot* slot = pool.Acquire();
+  void* dev_ids = slot->device_sampled_ids;
   vt::Tensor dev_ids_t = vt::Tensor::Contiguous(
       dev_ids, vt::DType::kI64, dev, {static_cast<int64_t>(num_reqs)});
   (void)sampler_.forward(queue_, logits, sm, &dev_ids_t);
@@ -967,9 +985,10 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   }
 
   // Issue the non-blocking sampled-id D2H on the COPY queue + record the event.
-  vt::Queue& copy_q = get_or_create_async_copy_queue();
+  // The async output BORROWS the pool slot (device buffer already holds the
+  // argmax ids) and releases it on consume — no per-step free.
   return std::make_unique<AsyncGPUModelRunnerOutput>(
-      std::move(skeleton), dev, dev_ids, num_reqs, queue_, copy_q);
+      std::move(skeleton), dev, pool, slot, num_reqs, queue_, copy_q);
 }
 
 }  // namespace vllm::v1

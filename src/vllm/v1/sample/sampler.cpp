@@ -87,17 +87,6 @@ void ApplyTopKTopPFromMeta(vt::Queue& q, vt::Tensor& logits,
   }
 }
 
-// GreedyArgmax over `logits`, returned as a [num_reqs] host vector (upstream's
-// argmax returns int64; the lowest-index tie-break is bit-exact vs torch).
-std::vector<int64_t> GreedyArgmaxHost(vt::Queue& q, const vt::Tensor& logits,
-                                      int64_t n) {
-  DeviceBuffer ids(logits.device, q, vt::DType::kI64, {n});
-  vt::GreedyArgmax(q, ids.tensor(), logits);
-  std::vector<int64_t> host(static_cast<size_t>(n));
-  ids.download(host.data());
-  return host;
-}
-
 // gather_logprobs (sampler.py::Sampler.gather_logprobs). Over the raw (pre-
 // mutation) logprobs snapshot: top-k values+indices, the sampled token's
 // logprob, ranks via batched_count_greater_than, concat [sampled | topk].
@@ -149,6 +138,61 @@ LogprobsTensors GatherLogprobs(const std::vector<float>& raw_logprobs, int64_t n
 
 }  // namespace
 
+// PERSISTENT greedy-argmax scratch: a device buffer (the argmax ids) + a pinned
+// host buffer (the D2H destination), both grow-only and reused across steps, so
+// the greedy decode hot path pays NO per-step cudaMalloc/cudaFree/cudaHostAlloc
+// (each of which device-syncs). Frees ONCE in the dtor. Mirrors vLLM's
+// persistent sampled-id + pinned buffers (gpu_model_runner.py:873-878).
+struct Sampler::GreedyArgmaxScratch {
+  vt::Backend* backend = nullptr;
+  vt::Device device{};
+  void* device_ids = nullptr;  // capacity int64 elements on `device`
+  int64_t* pinned_host = nullptr;
+  int64_t capacity = 0;
+
+  ~GreedyArgmaxScratch() {
+    if (pinned_host != nullptr) backend->FreePinned(pinned_host);
+    if (device_ids != nullptr) vt::Free(device, device_ids);
+  }
+  // Ensure the buffers hold at least `n` int64 ids on `dev` (grow-only).
+  void Ensure(vt::Device dev, int64_t n) {
+    if (backend == nullptr) {
+      backend = &vt::GetBackend(dev.type);
+      device = dev;
+    }
+    if (n <= capacity) return;
+    if (pinned_host != nullptr) backend->FreePinned(pinned_host);
+    if (device_ids != nullptr) vt::Free(device, device_ids);
+    const size_t bytes = static_cast<size_t>(n) * sizeof(int64_t);
+    device_ids = vt::Alloc(device, bytes);
+    pinned_host = static_cast<int64_t*>(backend->AllocPinned(bytes));
+    capacity = n;
+  }
+};
+
+Sampler::Sampler(LogprobsMode logprobs_mode) : logprobs_mode_(logprobs_mode) {}
+Sampler::~Sampler() = default;
+
+std::vector<int64_t> Sampler::greedy_argmax_host(vt::Queue& q,
+                                                 const vt::Tensor& logits,
+                                                 int64_t n) const {
+  if (greedy_scratch_ == nullptr) {
+    greedy_scratch_ = std::make_unique<GreedyArgmaxScratch>();
+  }
+  greedy_scratch_->Ensure(logits.device, n < 1 ? 1 : n);
+  vt::Tensor ids = vt::Tensor::Contiguous(greedy_scratch_->device_ids,
+                                          vt::DType::kI64, logits.device, {n});
+  vt::GreedyArgmax(q, ids, logits);
+  vt::Backend& b = vt::GetBackend(logits.device.type);
+  if (n != 0) {
+    b.Copy(q, greedy_scratch_->pinned_host, greedy_scratch_->device_ids,
+           static_cast<size_t>(n) * sizeof(int64_t));
+  }
+  b.Synchronize(q);
+  return std::vector<int64_t>(greedy_scratch_->pinned_host,
+                              greedy_scratch_->pinned_host + n);
+}
+
 std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
                                      const SamplingMetadata& sm) const {
   const int64_t n = logits.shape[0];
@@ -161,7 +205,7 @@ std::vector<int64_t> Sampler::sample(vt::Queue& q, vt::Tensor& logits,
   std::vector<int64_t> greedy_sampled;
   const bool have_greedy = !sm.all_random;
   if (have_greedy) {
-    greedy_sampled = GreedyArgmaxHost(q, logits, n);
+    greedy_sampled = greedy_argmax_host(q, logits, n);
     if (sm.all_greedy) return greedy_sampled;
   }
 

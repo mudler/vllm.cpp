@@ -331,6 +331,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Queue async_copy_queue_{};
   // Lazily create + return the async-output copy queue on the runner's device.
   vt::Queue& get_or_create_async_copy_queue();
+  // Persistent pool of the per-step overlap resources (device sampled-id buffer +
+  // pinned host buffer + events), so sample_tokens_async does NO per-step
+  // cudaMalloc/cudaHostAlloc/cudaEventCreate (each of which device-syncs and
+  // would serialize the depth-2 overlap). Lazily created on the first async
+  // sample; freed in the dtor. Mirrors torch's caching device/pinned allocators.
+  std::unique_ptr<AsyncOutputPool> async_output_pool_;
+  AsyncOutputPool& get_or_create_async_output_pool();
   // Assemble the [num_reqs, vocab] logits the sampler runs on (the three-case
   // device/host gather from the stashed forward result) and apply the grammar
   // bitmask, IN the exact order the sync path uses. Shared by sample_tokens and

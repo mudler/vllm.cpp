@@ -12275,3 +12275,54 @@ credit; binding stays 49/124.
   mirrored in `cfgbuild_ewnorm.sh`). Remediation queued: `build-fast` +
   `gate4.sh` (A/B only, w0 sanity guard >400 tok/s else self-void), queued
   behind the W3 series on the flock. Do NOT use proof-5a53fb5 A/B numbers.
+## 2026-07-16 — `CLAIM-ASYNC-SCHED-W3` THROUGHPUT lever: per-step sampler alloc/free removed (persistent pooled buffers, token-exact 6/6) — but REFUTED as the W3 throughput unlock (−0.32 % c16, gate ≥+1.5 % FAILS); W3 stays default-OFF
+
+- **Phase 1 (named serialization point).** The async sampled-id path did per-step
+  RAW device-syncing CUDA calls: `sample_tokens_async` `vt::Alloc` = `cudaMalloc`
+  (`cuda_dropin.cu:205`); `AsyncGPUModelRunnerOutput` ctor `AllocPinned` =
+  `cudaHostAlloc` + 2× event-create; **`get_output(N-1)` freed the device
+  snapshot with raw `cudaFree`, device-syncing the host against step N's
+  already-launched forward** (the direct overlap defeat); dtor `cudaFreeHost` +
+  event-destroy. Sync twin: `GreedyArgmaxHost` per-step `cudaMalloc` + blocking
+  D2H + `cudaFree` (`sampler.cpp`). Independently corroborated by the lost-lanes
+  rescan (item #2, `beb8497`, "handed to the W3-throughput owner").
+- **Phase 2 (fix, mirror, test-first).** `AsyncOutputPool` (persistent slots:
+  device sampled-id buf + pinned host buf + fork/ready events; the async output
+  BORROWS a slot, releases on consume) + persistent `Sampler` greedy-argmax
+  scratch (grow-only device+pinned). Zero per-step raw alloc/free/event-create
+  on both paths. Mirrors vLLM persistent sampled-id/pinned buffers
+  (`gpu_model_runner.py:873-878`) + torch caching allocators in `AsyncOutput`
+  (`async_utils.py:12-70`). RED→GREEN `test_async_output.cpp` (pool recycles
+  slots across 64 depth-2 steps, no growth past seed; released-slot reuse; 80
+  asserts). CPU on the `463737c` rebase: full `-Werror` build 0 warnings, full
+  SERIAL ctest 115/115 (one `-j4` conformance fail reproduced as a
+  port-contention artifact — passes serial in 0.42 s).
+- **VOIDED first DGX attempt (no verdict drawn).** First `~/work/vllm.cpp-w3-tput`
+  configure omitted `-DVLLM_CPP_CUTLASS_DIR` → cutlass NVFP4 GEMM disabled
+  (slow-WMMA fallback, both arms ~16× slow: 50.0–50.2 tok/s) AND FA2 silently
+  dropped (`VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS`, CMakeLists:568) → all 6
+  gates failed at `REQUIRE(kv_cache_backend_resident())` — a BUILD defect, not
+  the pool change. RETRACTION: the interim "nsys disables the FP4 fast path on
+  GB10" inference was FALSE (the nsys-capture build had the same missing-CUTLASS
+  defect; those captures are void as parity evidence). Remediation:
+  `cfgbuild2.sh` HARD-verifies "CUTLASS found" + "FlashAttention-2 … ENABLED" in
+  configure.log before building; `ab.sh` aborts the A/B on any gate failure.
+- **Clean re-proof (dgx `~/work/vllm.cpp-w3-tput/ab-fix2`, build2 @ `463737c` +
+  this diff, one flock, proof-corpus c16, w0 discard + 3 interleaved pairs).**
+  Token-exactness 6/6 PASS (27B+35B × default/W3-on/rollback). A/B: **W3-on**
+  tput 788.14–790.58 (mean 789.04), meanTPOT 161.60–162.04 (mean 161.87),
+  meanTTFT ~2732; **W3-off** tput 790.32–792.44 (mean 791.57), meanTPOT
+  166.69–167.00 (mean 166.82), meanTTFT ~2027. **Throughput −0.32 % (within
+  noise), TPOT −4.95 ms (win retained), TTFT +34.8 %** — statistically identical
+  to the pre-fix `f086b64` proof (−0.3 %, −5.4 ms, +36 %). **The allocator
+  serialization was real but NOT the binding constraint**: at c16's ~162–167 ms
+  steps, O(10–100 µs)/step of driver syncs is ≤0.1 % — two orders below the
+  +1.5 % gate; the lever's ceiling never reached the bar. W3 stays DEFAULT-OFF.
+- **Dispositions.** Code lands as a structural mirror (rescan-dispatched),
+  token-exact, no speed credit, `benchmark_binding=false`. The depth-2
+  throughput lever remains OPEN — the remaining W3-on deficit is NOT sampler
+  allocation; next candidates live in the c8+ wave/overlap family (62d4762
+  attribution). Follow-on for the c2–c8 owner: the sync-path persistent greedy
+  scratch also removes per-step syncs from the PRODUCTION default path where
+  steps are ~10× shorter (c2 ~2.4 ms/step gap) — worth folding into the c2–c8
+  full-step re-attribution, not re-measurable at c16.

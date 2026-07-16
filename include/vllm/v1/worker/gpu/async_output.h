@@ -23,13 +23,75 @@
 #ifndef VLLM_V1_WORKER_GPU_ASYNC_OUTPUT_H_
 #define VLLM_V1_WORKER_GPU_ASYNC_OUTPUT_H_
 
+#include <cstdint>
+#include <memory>
 #include <utility>
+#include <vector>
 
 #include "vllm/v1/engine/types.h"  // ModelRunnerOutput
 #include "vt/backend.h"
 #include "vt/device.h"
 
 namespace vllm::v1 {
+
+// AsyncOutputSlot — one reusable set of the per-step overlap resources: the
+// device sampled-id buffer the sampler's argmax writes, the pinned host buffer
+// the D2H lands in, and the two CUDA events (fork = copy-queue-waits-main, ready
+// = D2H completion). Allocated ONCE (pool ctor / grow) and reused across steps;
+// NEVER a per-step cudaMalloc/cudaHostAlloc/cudaEventCreate.
+//
+// WHY (ENG-ASYNC-SCHED W3 throughput lever): the original AsyncGPUModelRunner
+// Output OWNED a fresh device buffer + pinned host buffer + two events per step
+// and freed them in get_output()/dtor. On CUDA cudaMalloc/cudaFree/cudaHostAlloc/
+// cudaFreeHost each SYNCHRONIZE the whole device (block the host until every
+// launched kernel — including the NEXT step's forward — finishes), which
+// serialized the depth-2 overlap the copy stream was built to deliver
+// (measured: throughput-neutral W3 despite a −5.4 ms/step TPOT visibility gain).
+// vLLM never pays this: its sampled ids come from torch's caching device
+// allocator and its pinned D2H destination from torch's caching pinned allocator
+// (both pool hits, no raw driver sync), and torch.Event objects are reused
+// (async_utils.py:12-70 + the persistent runner buffers). This pool mirrors that
+// "no per-step raw alloc/free" property.
+struct AsyncOutputSlot {
+  void* device_sampled_ids = nullptr;  // capacity int64 elements on `device`
+  int64_t* pinned_host = nullptr;      // capacity int64 pinned host elements
+  vt::Event fork_event{};              // main->copy ordering (created once)
+  vt::Event ready_event{};             // D2H completion (created once)
+  int capacity = 0;                    // element capacity (>= max_num_reqs)
+  bool in_use = false;
+};
+
+// AsyncOutputPool — owns the persistent AsyncOutputSlots. Acquire() hands out a
+// free slot (growing by one on the rare miss); Release() returns it. Everything
+// is freed ONCE in the dtor (runner teardown), never on the hot path. Single-
+// threaded by contract (the one engine thread owns the runner). Device-neutral:
+// on the CPU/synchronous backend the buffers are plain host allocations and the
+// events are null-handle no-ops (vt::Backend base impls), so the pool is inert
+// but structurally identical.
+class AsyncOutputPool {
+ public:
+  // `capacity_elems` sizes every slot's buffers (== max_num_reqs, the batch
+  // bound); `initial_slots` are pre-allocated (>= the max concurrent batches in
+  // flight = depth-2, plus grammar-deferral headroom).
+  AsyncOutputPool(vt::Device device, int capacity_elems, int initial_slots);
+  ~AsyncOutputPool();
+  AsyncOutputPool(const AsyncOutputPool&) = delete;
+  AsyncOutputPool& operator=(const AsyncOutputPool&) = delete;
+
+  AsyncOutputSlot* Acquire();
+  void Release(AsyncOutputSlot* slot);
+
+  int capacity_elems() const { return capacity_elems_; }
+  int num_slots() const { return static_cast<int>(slots_.size()); }
+
+ private:
+  std::unique_ptr<AsyncOutputSlot> MakeSlot();
+
+  vt::Device device_;
+  vt::Backend* backend_;
+  int capacity_elems_;
+  std::vector<std::unique_ptr<AsyncOutputSlot>> slots_;
+};
 
 // AsyncModelRunnerOutput (vllm/v1/outputs.py:298-307). The abstract deferred
 // result: execute_model/sample_tokens may hand one back instead of a
@@ -61,34 +123,39 @@ class ReadyModelRunnerOutput final : public AsyncModelRunnerOutput {
 };
 
 // AsyncGPUModelRunnerOutput (gpu_model_runner.py:242-332 + async_utils.py:12-70).
-// Owns the device-resident sampled-id snapshot for the in-flight window (so a
-// depth-2 next step may overwrite the runner's working buffers without tearing
-// this copy), the pinned host destination, and the completion event.
+// BORROWS a persistent AsyncOutputSlot from the runner's AsyncOutputPool for the
+// in-flight window (device sampled-id snapshot + pinned host destination + the
+// two events) and RELEASES it back on consume — it does NOT own or free any
+// device/pinned/event resource, so the hot path has NO per-step
+// cudaMalloc/cudaFree/cudaHostAlloc/cudaFreeHost/cudaEventCreate/Destroy. The
+// slot's device buffer holds the sampler's argmax ids (written on `main_q`
+// before construction); the pool guarantees it is not reused until this object
+// releases it, so a depth-2 next step can never tear this copy.
 class AsyncGPUModelRunnerOutput final : public AsyncModelRunnerOutput {
  public:
-  // Mirrors AsyncOutput.__init__ (async_utils.py:12-46). `device_sampled_ids` is
-  // a backend allocation on `device` holding `num_reqs` int64 sampled ids
-  // produced on `main_q` — this object TAKES OWNERSHIP and frees it in the dtor.
+  // Mirrors AsyncOutput.__init__ (async_utils.py:12-46). `slot` is a pool slot
+  // whose `device_sampled_ids` already holds this batch's `num_reqs` int64 argmax
+  // ids (produced on `main_q`); `pool` receives the slot back on consume/destroy.
   // `skeleton` carries the ordering fields (req_ids / req_id_to_index), known
   // before sampling; get_output() fills in sampled_token_ids. The constructor:
-  //   1. records a fork event on main_q and makes copy_q wait it
+  //   1. records the slot's fork event on main_q and makes copy_q wait it
   //      (copy_stream.wait_stream(default_stream), async_utils.py:29),
-  //   2. issues the NON-BLOCKING D2H into an owned pinned host buffer
+  //   2. issues the NON-BLOCKING D2H into the slot's pinned host buffer
   //      (async_copy_to_np, :32),
-  //   3. records the ready event on copy_q (copy_event.record, :44).
+  //   3. records the slot's ready event on copy_q (copy_event.record, :44).
   // The MAIN queue is never synchronized here.
   AsyncGPUModelRunnerOutput(ModelRunnerOutput skeleton, vt::Device device,
-                            void* device_sampled_ids, int num_reqs,
-                            vt::Queue& main_q, vt::Queue& copy_q);
+                            AsyncOutputPool& pool, AsyncOutputSlot* slot,
+                            int num_reqs, vt::Queue& main_q, vt::Queue& copy_q);
   ~AsyncGPUModelRunnerOutput() override;
 
   AsyncGPUModelRunnerOutput(const AsyncGPUModelRunnerOutput&) = delete;
   AsyncGPUModelRunnerOutput& operator=(const AsyncGPUModelRunnerOutput&) = delete;
 
   // get_output (gpu_model_runner.py:290-332 + async_utils.py:47-70). Blocks the
-  // HOST on the ready event, releases the device snapshot, materializes each
-  // request's sampled_token_ids [1] from the pinned host buffer (int64 -> int32),
-  // and returns the ModelRunnerOutput. Call exactly once.
+  // HOST on the ready event, materializes each request's sampled_token_ids [1]
+  // from the pinned host buffer (int64 -> int32), RELEASES the slot back to the
+  // pool, and returns the ModelRunnerOutput. Call exactly once.
   ModelRunnerOutput get_output() override;
 
   // Number of requests in this batch (for the runner's last_sampled scatter and
@@ -97,13 +164,14 @@ class AsyncGPUModelRunnerOutput final : public AsyncModelRunnerOutput {
   int num_reqs() const { return num_reqs_; }
 
  private:
+  void ReleaseSlot();
+
   ModelRunnerOutput output_;   // ordering fields set at construction
   vt::Backend* backend_;
   vt::Device device_;
-  void* device_sampled_ids_;   // owned: backend allocation on `device_`
-  int64_t* pinned_host_;       // owned: AllocPinned host buffer [num_reqs]
+  AsyncOutputPool* pool_;      // borrowed: returns `slot_` on consume/destroy
+  AsyncOutputSlot* slot_;      // borrowed: persistent device+pinned buffers+events
   int num_reqs_;
-  vt::Event ready_event_;      // completion of the D2H on the copy queue
   bool consumed_ = false;
 };
 

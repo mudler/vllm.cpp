@@ -34,6 +34,7 @@
 #define VLLM_V1_SAMPLE_SAMPLER_H_
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/v1/engine/types.h"     // SamplerOutput
@@ -56,8 +57,12 @@ enum class LogprobsMode {
 // forward call carries all per-step state via the SamplingMetadata.
 class Sampler {
  public:
-  explicit Sampler(LogprobsMode logprobs_mode = LogprobsMode::kRawLogprobs)
-      : logprobs_mode_(logprobs_mode) {}
+  // Out-of-line (like the dtor) so the pimpl'd GreedyArgmaxScratch is complete
+  // wherever a Sampler is constructed/destroyed.
+  explicit Sampler(LogprobsMode logprobs_mode = LogprobsMode::kRawLogprobs);
+  ~Sampler();
+  Sampler(const Sampler&) = delete;
+  Sampler& operator=(const Sampler&) = delete;
 
   // Sampler.forward. `logits` [num_reqs, vocab] f32 is mutated in place through
   // the pipeline (upstream's logits.to(float32) is a no-op copy when already f32,
@@ -83,7 +88,19 @@ class Sampler {
   std::vector<int64_t> sample(vt::Queue& q, vt::Tensor& logits,
                               const SamplingMetadata& sampling_metadata) const;
 
+  // GreedyArgmax over `logits` -> [n] host int64 ids, reusing a PERSISTENT
+  // device + pinned-host scratch (grow-only) so the greedy decode hot path does
+  // NO per-step cudaMalloc/cudaFree/cudaHostAlloc (each device-syncs). Mirrors
+  // vLLM's persistent sampled-id + pinned buffers (gpu_model_runner.py:873-878).
+  std::vector<int64_t> greedy_argmax_host(vt::Queue& q, const vt::Tensor& logits,
+                                          int64_t n) const;
+
   LogprobsMode logprobs_mode_;
+  // Persistent greedy-argmax scratch (pimpl; defined in sampler.cpp). Lazily
+  // created on the first greedy call; mutable because forward()/sample() are
+  // const and this is pure allocation state, not sampling semantics.
+  struct GreedyArgmaxScratch;
+  mutable std::unique_ptr<GreedyArgmaxScratch> greedy_scratch_;
 };
 
 }  // namespace vllm::v1

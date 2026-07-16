@@ -12264,3 +12264,14 @@ has since fixed it properly at `038970f`. `CLAIM-BLOCKTABLE-HOST-CLUSTER` is
 RELEASED (table row removed, prose release note added); `ENG-CUDAGRAPH` returns
 to `PARTIAL` unclaimed with its new capture-set anchors retained. No speed
 credit; binding stays 49/124.
+- 2026-07-16 gate3 VERDICT (`CLAIM-EW-NORM-ACT-1`): TOKEN GATES ALL PASS both
+  flags (27B 17/17+84/84 OFF and ON; 35B 4/4+8/8 OFF and ON — the fast kernel is
+  token-exact in both model gates); c16+c2 A/B legs VOID (build lacked
+  CUTLASS/FA2 fast paths — "CUTLASS not found" in recfg.log; c16 ran ~50 tok/s vs
+  production ~790; same defect class as the W3 round-1 void). LESSON (mirrors
+  honest-bar): an A/B build MUST be the production config — always hard-verify
+  "CUTLASS found" + "FlashAttention-2 sm_121a prefill/decode: ENABLED" in the
+  configure log BEFORE building (the W3 agent's cfgbuild2.sh pattern, now
+  mirrored in `cfgbuild_ewnorm.sh`). Remediation queued: `build-fast` +
+  `gate4.sh` (A/B only, w0 sanity guard >400 tok/s else self-void), queued
+  behind the W3 series on the flock. Do NOT use proof-5a53fb5 A/B numbers.

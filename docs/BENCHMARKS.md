@@ -167,12 +167,26 @@ corruption-subsidized state bandwidth in pre-fix binaries (collapsed slots =
 **~790–799 vs vLLM 794**, both model gates 235/235, and no recoverable host
 cost exists (new machinery ≤15 µs/step; O(n) validation landed). Pre-fix GDN
 kernel evidence (H1d ranking, B=2 traces) is contamination-suspect for the
-state path. Active levers now: (a) **multi-slot GDN state-I/O efficiency** —
-vLLM pays the same distinct-slot traffic yet runs c16 TPOT ~8 ms/step cheaper
-(159.6 vs 167.5); fresh correct-state kernel traces (ours nsys node trace,
-vLLM torch-profiler recipe) are the new ground truth, then port/optimize the
-difference (covers the c2–c32 decode-mean cluster); (b) the **c8 p99 / c32
-p90 ITL tail mechanism** from this root's per-request `itls[]`.
+state path. Active levers now: (a) **GDN decode kernel efficiency** — MEASURED
+2026-07-16 by fresh correct-state c16 kernel traces (ours nsys node trace of
+`build-fix2`/`6dd24df`; vLLM torch-profiler at `--mamba-ssm-cache-dtype float32`;
+root `dgx:~/work/vllm.cpp-gdn-stateio-trace/20260716`, `SUMMARY.json`). The
+~8 ms/step wall gap (c16 TPOT 159.6 vs 167.5) decomposes as **~4.65 ms GPU-busy
++ ~3.25 ms host/idle** (ours ~79.2% vs vLLM ~80.2% busy). Per-c16-decode-step
+GPU time (ms, ours/vLLM/Δ): GDN packed recurrence 21.31/19.24/**+2.06**;
+RMSNorm(129) 2.006/0.391/+1.62; RMSNorm-gated 0.403/fused/+0.40; FP4-quant
+0.641/0.342/+0.30; SiLU-mul 0.630/0.369/+0.26; GDN conv-update 0.584/0.432/+0.15;
+GEMM+MoE+attention 106.79/106.71/**+0.08 (parity)**; TOTAL busy 132.70/128.05.
+**Verdict:** state-I/O is only ~26% of the gap — decode state r/w is FUSED into
+the recurrence on BOTH sides (ours runs NO separate decode gather/scatter; those
+kernels are prefill-only), layout is identical `[slots,HV,V,K]` fp32; the busy
+gap is ~2.06 ms recurrence TILING + ~2 ms unfused norm/quant glue. Named lever:
+port vLLM's register-resident single-warp `num_stages=3` FLA packed-decode tiling
+(`fused_recurrent.py:282-336`) into `GdnPackedDecodeKernel` (ours reaches ~83%
+of ~273 GB/s peak vs vLLM ~92%) ⇒ ~+2 ms/step; parallel ~2 ms = the Inductor
+add+RMSNorm+FP4-quant / SiLU+FP4-quant decode fusion; (b) the **c8 p99 / c32
+p90 ITL tail mechanism** from this root's per-request `itls[]`. Diagnostic
+(`benchmark_binding=false`, no speed credit); binding stays 49/124.
 
 ## Current checkpoint
 

@@ -11291,3 +11291,71 @@ torch-profiler recipe) at CORRECT state is the new attribution ground truth;
 all pre-fix c16/c2 GDN kernel evidence (H1d ranking, B=2 structural traces)
 is CONTAMINATION-SUSPECT for the GDN state path (measured with collapsed
 slots) and must not drive lever decisions until re-measured.
+
+## 2026-07-16 — CORRECT-STATE GDN kernel comparison MEASURED: the ~8 ms/step gap is NOT dominated by state-I/O — it splits ~2.1 ms recurrence-tiling + ~2 ms unfused norm/quant glue + ~3.25 ms host/idle (`CLAIM-GDN-BA-ROUNDING-1`, worktree `gdn-stateio-trace`)
+
+Fresh correct-state kernel traces at c16 are now the ground truth (root
+`~/work/vllm.cpp-gdn-stateio-trace/20260716`, `SUMMARY.json`). OURS: nsys
+`--cuda-graph-trace=node --delay 110 --duration 60` of the production server
+(`build-fix2`, `6dd24df`, `VT_GDN_PACKED_DECODE=1`, packed gate **235/235**),
+c16 96p/16w client, window landed at [93 s,153 s] into a 156 s client run
+(pure steady c16 decode, TPOT median 168.1 ms). vLLM: `tools/bench/profile_vllm_online_gate.py`
+c16 48p/3rep with the **new** `--mamba-ssm-cache-dtype float32` flag (mirrors
+the binding serve arm) — resolved float32, deterministic (`output_digests_equal`),
+async-scheduling on, 1476 pure-decode annotation windows. Both normalized per
+c16 decode step (48 GDN packed-recurrence launches/step = 48 linear_attn layers;
+model = 48 GDN + 16 full-attn, hv=48 dv=128 dk=128, state fp32).
+
+**Per-family GPU time, ms per c16 decode step (ours vs vLLM, Δ=ours−vLLM):**
+
+| family | ours | vLLM | Δ |
+|---|---|---|---|
+| GEMM + MoE + attention (bundled) | 106.79 | 106.71 | **+0.08 (parity)** |
+| GDN packed recurrence (fused state r/w) | 21.31 | 19.24 | **+2.06** |
+| RMSNorm plain (129/step) | 2.006 | 0.391* | +1.62 |
+| RMSNorm gated (48/step) | 0.403 | fused* | +0.40 |
+| FP4 quant | 0.641 | 0.342 | +0.30 |
+| SiLU-mul | 0.630 | 0.369 | +0.26 |
+| GDN conv update (48/step) | 0.584 | 0.432 | +0.15 |
+| **TOTAL GPU-busy / step** | **132.70** | **128.05** | **+4.65** |
+
+*vLLM's `rms_norm` family folds add+RMSNorm+FP4-quant into single Inductor
+Triton kernels (`triton_red_fused_..._rms_norm_scaled_fp4_quant`), so its 0.391
+already includes the residual+quant our RMSNorm/ScaledFp4Quant/RmsNormGated pay
+separately.
+
+**Attribution verdict (revises the premise).** The wall gap (~8 ms/step; ours
+167.5 / vLLM 159.6 binding, confirmed fresh: ours 168.1 busy 132.70; vLLM busy
+128.05) = **~4.65 ms GPU-busy + ~3.25 ms GPU-idle** (host/async-scheduling
+bubble; ours ~79.2 % busy vs vLLM ~80.2 %). Of the busy gap: **~2.06 ms is the
+GDN packed recurrence itself, ~2.0 ms is the unfused norm/quant/activation glue
+(Inductor-fusion gap), GEMM/MoE/attention is at parity.** So state-I/O is only
+~26 % of the gap, NOT the whole story. Decode state I/O is FUSED into the
+recurrence on BOTH sides — ours runs NO separate decode gather/scatter; the
+`GdnStateGather/Scatter`/`GdnPostConv`/chunk kernels are prefill-only (count 27,
+not 289). "Layout" is not the issue: both use the identical `[slots,HV,V,K]`
+in-place slot-indexed fp32 state, same delta-rule algorithm.
+
+**Named kernel-level lever (mirror vLLM's FLA tiling).** The recurrence is
+state-bandwidth-bound; ours reaches ~83 % of the ~273 GB/s peak (4.7 GB/step ÷
+21.31 ms = 221 GB/s), vLLM ~92 % (÷19.24 ms = 245 GB/s). The difference is
+tiling: **vLLM** (`vllm/model_executor/layers/fla/ops/fused_recurrent.py:282-336`,
+launch `:448-477`) runs 1 warp/program (`num_warps=1`), keeps the `[BV=32,BK=128]`
+state block in REGISTERS (`b_h`), with `num_stages=3` software pipelining;
+**ours** (`src/vt/cuda/cuda_gdn.cu:1006-1120`, `GdnPackedDecodeKernel<bf16,float,NW=8>`,
+`bv=32`) stages the same `[32,128]` state tile through SHARED MEMORY (`sbh`,
+padded stride `dk+1`, lines 1083-1088 load / 1118-1119 store) across 8 warps
+(256 threads) with an NW-way `__shfl_xor` reduction and two `__syncthreads`
+barriers. Port target: adopt the register-resident single-warp num_stages=3
+structure to eliminate the smem round-trip + barriers; expected ~+2 ms/step
+(~10 % of the recurrence, ~26 % of the wall gap). The parallel ~2 ms glue lever
+is the known Inductor add+RMSNorm+FP4-quant / SiLU+FP4-quant fusion, now shown
+to matter in DECODE (129 unfused RMSNorm at 15.5 µs vs vLLM's fused 3.0 µs).
+
+**Deviation.** vLLM profiler mamba dtype: added an optional backward-compatible
+`--mamba-ssm-cache-dtype` flag to `profile_vllm_online_gate.py` (default None =
+prior H1d recipe unchanged); used `float32` to match the binding serve arm — the
+H1d `vllm-kernels.json` was captured at the default (bf16 state), a denominator
+mismatch this corrects. Evidence root is fresh (`vllm.cpp-gdn-stateio-trace`),
+never a binding root. `benchmark_binding=false` (diagnostic kernel attribution,
+no speed credit).

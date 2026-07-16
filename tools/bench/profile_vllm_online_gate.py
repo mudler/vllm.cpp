@@ -161,6 +161,15 @@ def main() -> int:
             "async-scheduler diagnostic arm"
         ),
     )
+    parser.add_argument(
+        "--mamba-ssm-cache-dtype",
+        default=None,
+        help=(
+            "mirror the binding vLLM serve arm's --mamba-ssm-cache-dtype "
+            "(e.g. float32); omit to keep vLLM's default 'auto' resolution. "
+            "Required to match the correct distinct-slot GDN state-I/O denominator."
+        ),
+    )
     args = parser.parse_args()
     if not args.model.is_dir():
         raise HarnessError(f"model snapshot is absent: {args.model}")
@@ -192,6 +201,11 @@ def main() -> int:
         max_tokens=OUTPUT_LEN,
         min_tokens=OUTPUT_LEN,
     )
+    mamba_override = (
+        {"mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype}
+        if args.mamba_ssm_cache_dtype is not None
+        else {}
+    )
     llm = LLM(
         model=str(args.model),
         tokenizer=str(args.model),
@@ -205,6 +219,7 @@ def main() -> int:
             torch_profiler_dir=str(args.profile_dir.resolve()),
             torch_profiler_with_stack=False,
         ),
+        **mamba_override,
         **async_scheduling_override(args.async_scheduling),
     )
 
@@ -252,6 +267,10 @@ def main() -> int:
             llm.llm_engine.vllm_config.scheduler_config.async_scheduling
         ),
         "enable_prefix_caching": False,
+        "mamba_ssm_cache_dtype_requested": args.mamba_ssm_cache_dtype,
+        "mamba_ssm_cache_dtype_resolved": str(
+            llm.llm_engine.vllm_config.cache_config.mamba_ssm_cache_dtype
+        ),
         "max_concurrency": args.max_concurrency,
         "max_num_seqs": args.max_num_seqs,
         "max_num_batched_tokens": args.max_num_batched_tokens,

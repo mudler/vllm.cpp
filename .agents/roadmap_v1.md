@@ -38,12 +38,19 @@ slots restores ~3.4 GB/step of correctness-required recurrent-state DRAM traffic
 (3 MB/slot/layer × ~16 distinct rows × ~36 layers ÷ ~273 GB/s ≈ 8–12 ms ≈ the
 regression). So `9ad8fb7`'s 825 was a silent-corruption artifact and **~790 is the
 correct floor (already 0.995× vLLM at c16); recovery to 825 is impossible without
-the bug.** **Front 1 — the c2–c32 decode gap (reframed):** the honest 790→794 residual
-is decode-**KERNEL** efficiency (our `GdnDecode`/`GdnPackedDecode` vs vLLM's fla
-`fused_recurrent`/TRT-LLM recurrent decode), NOT a recoverable host cost; the
-in-flight **era A/B** + a decode state-I/O **byte-count** nsys are the arbiter, then
-the decode-kernel lever (and `ENG-ASYNC-SCHED` W3 only if the nsys still shows host
-idle). **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
+the bug.** **Front 1 — the c2–c32 decode gap (MEASURED 2026-07-16, root
+`dgx:~/work/vllm.cpp-gdn-stateio-trace/20260716`):** correct-state c16 kernel
+traces resolve the ~8 ms/step gap into **~4.65 ms GPU-busy + ~3.25 ms host/idle**;
+the busy part is **~2.06 ms GDN packed-recurrence tiling** (`GdnPackedDecodeKernel`
+21.31 vs vLLM fla `fused_recurrent` 19.24 ms/step; state r/w FUSED in-kernel on
+both sides, ~83% vs ~92% of peak BW) **+ ~2 ms unfused norm/quant glue**, with
+GEMM/MoE/attention at parity (state-I/O ≈ only 26% of the gap, NOT the dominant
+cause the premise assumed). Order-0 next: **(1)** port vLLM's register-resident
+single-warp `num_stages=3` FLA packed-decode tiling (`fused_recurrent.py:282-336`)
+into `GdnPackedDecodeKernel` (`cuda_gdn.cu:1006-1120`, replace the smem-staged
+`sbh` variant) ⇒ ~+2 ms/step; **(2)** the Inductor add+RMSNorm+FP4-quant /
+SiLU+FP4-quant decode fusion ⇒ ~+2 ms/step; **(3)** `ENG-ASYNC-SCHED` W3 for the
+~3.25 ms host/idle bubble. **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
 stall cadence from this root's per-request `itls[]`. The
 [packed GDN decode](specs/gdn-packed-decode.md) leaf is **CLOSED on EQUIVALENCE**
 (`KERNEL-GDN-PACKED-DECODE` → `DONE`, owner `e47b4d6`).

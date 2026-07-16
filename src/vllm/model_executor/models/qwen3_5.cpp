@@ -75,14 +75,34 @@ bool detail::PackedGdnDecodeEnvSelected(const GdnPackedDecodeEnvConfig& env) {
   return runtime_enabled && merged_ba && in_bf16 && out_bf16 && ba_out_bf16;
 }
 
+// VT_GDN_VALIDATE=1 (read ONCE) forces the exhaustive O(n^2) pairwise
+// duplicate cross-verification on top of the default O(n) seen-set pass. The
+// default already fails closed on duplicate/out-of-range/negative live slots;
+// this env is a redundant paranoid verifier for debugging, never required for
+// correctness.
+static bool GdnForceFullValidationEnv() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_VALIDATE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 void detail::ValidateGdnStateIndices(const std::vector<int32_t>& indices,
                                      int64_t required,
-                                     int64_t state_slots) {
+                                     int64_t state_slots,
+                                     bool force_full_uniqueness) {
   VT_CHECK(required >= 0 &&
                required <= static_cast<int64_t>(indices.size()),
            "qwen3_5: GDN state index metadata is too short");
   VT_CHECK(state_slots >= 0,
            "qwen3_5: GDN state cache has invalid slot count");
+  // O(n) uniqueness: a live slot is in [0, state_slots) and drawn from a
+  // free-list of distinct slots by construction, so a single seen-set pass
+  // fails closed on any duplicate/out-of-range/negative slot without the former
+  // O(n^2) inner scan. `seen` is bounded by state_slots (== max_num_reqs,
+  // small) and lives only for this call; -1 is the inert padding sentinel.
+  std::vector<uint8_t> seen(static_cast<size_t>(state_slots), 0);
   for (int64_t i = 0; i < required; ++i) {
     const int32_t slot = indices[static_cast<size_t>(i)];
     if (slot < 0) {
@@ -92,9 +112,20 @@ void detail::ValidateGdnStateIndices(const std::vector<int32_t>& indices,
     }
     VT_CHECK(slot < state_slots,
              "qwen3_5: GDN state index out of range");
-    for (int64_t j = 0; j < i; ++j) {
-      VT_CHECK(indices[static_cast<size_t>(j)] != slot,
-               "qwen3_5: duplicate live GDN state index");
+    VT_CHECK(seen[static_cast<size_t>(slot)] == 0,
+             "qwen3_5: duplicate live GDN state index");
+    seen[static_cast<size_t>(slot)] = 1;
+  }
+  // Paranoid exhaustive re-verification (VT_GDN_VALIDATE=1 or an explicit
+  // caller request). Identical verdict to the seen-set pass above.
+  if (force_full_uniqueness || GdnForceFullValidationEnv()) {
+    for (int64_t i = 0; i < required; ++i) {
+      const int32_t slot = indices[static_cast<size_t>(i)];
+      if (slot < 0) continue;
+      for (int64_t j = 0; j < i; ++j) {
+        VT_CHECK(indices[static_cast<size_t>(j)] != slot,
+                 "qwen3_5: duplicate live GDN state index");
+      }
     }
   }
 }

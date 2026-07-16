@@ -551,6 +551,37 @@ TEST_CASE("qwen27 packed GDN validates engine state slots before upload") {
       std::runtime_error);
 }
 
+TEST_CASE(
+    "qwen27 GDN state-index uniqueness is O(n) and force-full re-verifies") {
+  // The default fast path is a single O(n) seen-set pass (no O(n^2) inner
+  // scan): it still fails closed on a duplicate that is NOT adjacent, on an
+  // out-of-range live slot, and on a non-(-1) negative, while accepting the
+  // inert -1 padding sentinel. state_slots (== max_num_reqs) bounds the pass.
+  CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
+      std::vector<int32_t>{3, 0, 2, 1, -1}, /*required=*/5, /*slots=*/4));
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{3, 0, 2, 3}, /*required=*/4, /*slots=*/4),
+      doctest::Contains("duplicate live GDN state index"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{0, -2}, /*required=*/2, /*slots=*/4),
+      doctest::Contains("invalid negative GDN state index"),
+      std::runtime_error);
+
+  // force_full_uniqueness=true adds the exhaustive O(n^2) pairwise
+  // cross-verification (what VT_GDN_VALIDATE=1 drives globally): identical
+  // fail-closed verdicts, a redundant paranoid check for debugging.
+  CHECK_NOTHROW(vllm::detail::ValidateGdnStateIndices(
+      std::vector<int32_t>{0, 1, 2, 3}, /*required=*/4, /*slots=*/4,
+      /*force_full_uniqueness=*/true));
+  CHECK_THROWS_WITH_AS(
+      vllm::detail::ValidateGdnStateIndices(
+          std::vector<int32_t>{1, 3, 1}, /*required=*/3, /*slots=*/4,
+          /*force_full_uniqueness=*/true),
+      doctest::Contains("duplicate live GDN state index"), std::runtime_error);
+}
+
 TEST_CASE("qwen27 GDN metadata validates complete prefill suffixes before I/O") {
   GDNAttentionMetadata gm;
   gm.num_decodes = 1;

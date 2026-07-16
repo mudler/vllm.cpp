@@ -512,7 +512,10 @@ void GPUModelRunner::remap_gdn_state_slots(
   // the last block), so block-id keying maps every long concurrent sequence to
   // ONE slot — the captured c16 "duplicate live GDN state index" fatal and,
   // pre-validator, silent cross-request recurrent-state corruption.
-  std::unordered_set<std::string> alive;
+  // Reused member scratch (buckets persist across steps) — no per-step set
+  // allocation. Cleared then refilled with this step's live request ids.
+  std::unordered_set<std::string>& alive = gdn_alive_scratch_;
+  alive.clear();
   alive.reserve(static_cast<size_t>(num_reqs));
   for (int r = 0; r < num_reqs; ++r) {
     // req_ids[r] is populated for every active [0, num_reqs) row after condense.

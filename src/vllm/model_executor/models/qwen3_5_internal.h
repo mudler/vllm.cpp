@@ -85,9 +85,16 @@ bool ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& eligibility);
 // Validate the exact prefix that will be uploaded. Negative rows are inert
 // padding; every live slot must be unique and in range. This runs on host
 // metadata before the device buffer is constructed, keeping CUDA capture free
-// of a validation synchronization.
+// of a validation synchronization. Uniqueness is an O(n) seen-set pass (a live
+// slot is drawn from a free-list of distinct slots by construction, so a single
+// pass fails closed on any duplicate/out-of-range/negative slot); it is bounded
+// by state_slots (== max_num_reqs). `force_full_uniqueness` (driven globally by
+// VT_GDN_VALIDATE=1) additionally runs the exhaustive O(n^2) pairwise
+// cross-verification — a redundant paranoid check, never needed for
+// correctness.
 void ValidateGdnStateIndices(const std::vector<int32_t>& indices,
-                             int64_t required, int64_t state_slots);
+                             int64_t required, int64_t state_slots,
+                             bool force_full_uniqueness = false);
 
 // Validate the complete eager/graph metadata contract before any state index
 // is uploaded or consumed. Prefill-only vectors must be exact suffix/rebased

@@ -59,6 +59,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -261,6 +262,10 @@ class GPUModelRunner final : public ModelRunnerBase {
   // collapsed long concurrent sequences onto one slot).
   std::unordered_map<std::string, int32_t> gdn_slot_of_req_;
   std::vector<int32_t> gdn_free_slots_;
+  // Reused per-step scratch for the live-request set in remap_gdn_state_slots:
+  // cleared and refilled each step (buckets stay allocated) so the compact
+  // slot remap does no per-step set allocation.
+  std::unordered_set<std::string> gdn_alive_scratch_;
 
   // Owned persistent cache storage plus the non-owning views used by forward.
   // CUDA uses backend allocations by default (VT_DEVICE_KV_CACHE=0 restores the

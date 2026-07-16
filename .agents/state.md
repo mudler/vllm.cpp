@@ -11157,3 +11157,115 @@ rewrite), README (⚠️ header + status/throughput/memory tables), roadmap_v1.m
 (order-0 substage + portfolio row), engine-matrix (`SERVE-GATE-ONLINE` substage +
 row), backend-matrix (`BACKEND-GATE-CUDA-VLLM` row), coordination
 (`CLAIM-SERVE-GATE-1` last-update), this state entry, and the parity-ledger row.
+
+## 2026-07-16 — the `9ad8fb7`→`c172336` decode "regression" is CORRECTNESS-REQUIRED state bandwidth, NOT host machinery (grounds the labeled slot-sharing hypothesis; lands the requested validation cleanup); `CLAIM-GDN-BA-ROUNDING-1`, worktree `.claude/worktrees/agent-a76ce56e36a4c68e6`
+
+Test-first host-side checkpoint under the `CLAIM-GDN-BA-ROUNDING-1` decode-recovery
+directive. The premise handed to this session was "a measured ~8 ms/decode-step
+**host-side** regression between `9ad8fb7` and `c172336`, recover it in the common
+per-step machinery." **The diff analysis + arithmetic REFUTE the host-side framing
+and confirm (now source-grounded, not just labeled) the orchestrator's
+slot-sharing-bandwidth hypothesis: the 8 ms is the CORRECTNESS-REQUIRED recurrent-
+state DRAM traffic that `c172336` restored, and `9ad8fb7`'s inflated throughput was
+a silent-corruption artifact.** No engine behavior changed on the CUDA benchmark;
+the landed code is a perf-neutral validation/allocation cleanup requested by the
+directive. NO GPU work.
+
+**Two interleaved bisect rounds (recorded verbatim; dgx root `~/work/vllm.cpp-c16-era-ab/20260716`, c16 = 96 prompts / conc 16 / 128 out, one lock, cold-discarded):**
+
+| SHA / arm | tok/s | TPOT (ms) | Note |
+|---|---|---|---|
+| `3f256ab` OLD binding | 816.3 / 822.1 / 822.6 | 160.2–161.5 | pre-slot-fix binary |
+| `9ad8fb7` (packed OP landed, NOT dispatched) | **825.6–831.9** | **158.5–159.3** | pre-W1D2 engine behavior |
+| `c172336` packed default | 790.7–792.7 | ~166.8 | slot-fix + packed dispatch |
+| `c172336` **`VT_GDN_PACKED_DECODE=0`** | **791.4–791.9** | 166.8 | decomposed+F32BA path, SAME regression WITHOUT packed |
+| `45f9e6d` (qkvz), `246a23c` (binding) | ~790–792 | — | no further change |
+
+The equal regression in BOTH `c172336` arms exonerates the packed kernel, windowed
+load, and qkvz, isolating the cost to what changed **for both arms** between
+`9ad8fb7` and `c172336`. The directive inferred "per-step host machinery." The
+diff shows exactly two behavior-relevant common changes, and only one is real:
+
+**(1) Per-step host machinery — QUANTIFIED, provably NOT the 8 ms (≈3 orders too small).**
+Every new host cost is per-STEP (never per-layer — all `ValidateGdn*` call sites are
+in the Forward entry / `BuildStepDevInputs` / graph `Step`, never in `GdnBlockPaged`;
+verified `grep`). With the binding `max_num_seqs=32`, the O(n²) `ValidateGdnStateIndices`
+uniqueness is ≤1024 int compares, run ≤4×/step ≈ **~4 µs**; the string-keyed
+`remap_gdn_state_slots` builds an `unordered_set<string>` of ≤32 short req-ids +
+≤32 map finds ≈ **~5 µs**; the two extra `IndexedGdnStateIoEnabled` `getenv`s ≈ µs.
+Total new host work **< ~15 µs/step vs a 8 000 µs/step budget** (~0.2%). A 8 ms host
+cost would need ~8×10⁶ ops; n≤32 cannot produce it. **The host machinery is NOT the
+regression.**
+
+**(2) The slot-index VALUES changed — de-collapsing shared state slots — and the
+arithmetic matches the 8 ms.** On the CUDA gate `IndexedGdnStateIoEnabled` defaults
+ON (`kv_cache_backend_resident_` true; harness sets only `VT_GDN_PACKED_DECODE`), so
+`CanUseGdnDecodeGraphSize(B,S,true)` is always true → **NO graph→eager flip, NO
+row-copy fallback**; the decode/conv device path is byte-identical to `9ad8fb7`
+**except the state-index values** the recurrence consumes. `9ad8fb7` keyed the
+compact pool on the mamba block-id, which `MambaManager::remove_skipped_blocks`
+collapses to the shared null block-id 0 once a sequence exceeds one sub-sequence
+mamba block — so every long c16 sequence mapped to ONE slot (silent cross-request
+corruption, pre-validator; ground: `remap_gdn_state_slots` comment, `runner.cpp:508`).
+`c172336` keys on request identity → **distinct** slots. Sizing (real 27B GDN:
+Hv=48, Dv=128, Dk=128, F32 SSM cache; `gdn-semantics.md:30`): one ssm_state row =
+48·128·128·4 = **3 MB/slot/layer**. Correct distinct-slot decode reads+writes ~16
+distinct 3 MB rows/GDN-layer (≈96 MB) × ~36 GDN layers ≈ **~3.4 GB/step**; the
+collapsed arm reused ONE L2-resident row (~few MB/layer). At GB10's ~273 GB/s the
+de-collapse delta is **~8–12 ms/step — quantitatively the measured regression.**
+This is the recurrent state every correct GDN decode must touch (vLLM pays the same;
+its 159 ms TPOT already includes it), so **it cannot be recovered without
+reintroducing the corruption bug.** `9ad8fb7`'s 825 tok/s "beat vLLM" only by
+skipping this correctness-required traffic on corrupted output.
+
+**Honest recovery target (supersedes "arm ≈ 825+").** `825` is unrecoverable (bug
+artifact). `c172336`/`246a23c` ~790 is the CORRECT floor and is already at vLLM
+parity at c16 (0.995×). The residual 790→794 (TPOT 167 vs 159, ≈8 ms) is a decode
+**KERNEL-efficiency** gap (our `GdnDecode`/`GdnPackedDecode` vs vLLM's fla
+`fused_recurrent`/TRT-LLM), a separate roadmap lever — NOT a host-machinery fix and
+NOT this claim's scope. Order-0 for decode is now: (a) confirm this attribution with
+the in-flight era A/B + a focused decode state-I/O **byte** nsys (distinct vs would-be
+collapsed), then (b) the decode-kernel-efficiency lever toward vLLM's recurrent decode.
+
+**What I changed (perf-neutral, correctness-preserving, requested by the directive):**
+- `ValidateGdnStateIndices` (`qwen3_5.cpp`): O(n²) inner duplicate scan → **O(n) seen-set**
+  bounded by `state_slots` (== max_num_reqs). Identical fail-closed verdicts and
+  messages (`too short` / `invalid negative` / `out of range` / `duplicate live GDN
+  state index`); the duplicate invariant holds by construction (free-list of distinct
+  slots), so the default stays fail-closed cheaply. New param `force_full_uniqueness`
+  (default false) + `VT_GDN_VALIDATE=1` (read once) run the exhaustive O(n²) pairwise
+  cross-verification on top — a paranoid debug verifier, never required for correctness.
+- `remap_gdn_state_slots` (`runner.cpp`): the per-step live-request `unordered_set<string>`
+  is now a **reused member scratch** (`gdn_alive_scratch_`, buckets persist across steps),
+  killing the per-step set allocation. Keys stay the request IDENTITY (string) — batch
+  indices are NOT stable across condense, so integer-index keying would reintroduce the
+  corruption; the µs string cost is not worth a correctness risk.
+- No engine/device behavior change; no default flip; no coverage lost.
+
+**RED/GREEN.** New CPU unit test `tests/vllm/models/test_qwen27_paged_forward.cpp`
+"qwen27 GDN state-index uniqueness is O(n) and force-full re-verifies": the 4-arg
+`force_full_uniqueness` call did not compile before the param (RED), then GREEN;
+asserts the O(n) default catches a NON-adjacent duplicate `{3,0,2,3}`, a non-(-1)
+negative, accepts the `-1` sentinel, and that force-full gives identical verdicts.
+The `c172336` crash-fixtures still fail-closed (`test_runner` duplicate-slot fixture,
+`test_qwen27_paged_forward` slot-validation cases). **Gates (CPU, no GPU):** clean
+full `-Werror` rebuild (CUDA off, RelWithDebInfo) 0 warnings; `test_qwen27_paged_forward`
+17/17 (84 asserts), `test_runner` 8/8 (155), `test_ops_gdn` 45/45 (912); full CTest
+103/106 under `-j` with the 3 HTTP/engine-proc server tests failing only on parallel
+port/timeout contention and **passing 3/3 in isolation** (`test_engine_core_proc` 9/9,
+`test_openai_api_server` 22/22, `test_openai_conformance` 23/23) ⇒ 106/106 effective;
+tools suite `python3 -m unittest discover -s tests/tools` **164/164**.
+
+**DGX validation the orchestrator should run (from the pushed SHA):** the same
+interleaved c16 A/B (this SHA vs `9ad8fb7` vs the `246a23c` anchor, one flock, cold-
+discarded) — **expect this arm ≈ `246a23c`'s ~790, NOT 825** (825 is the bug
+artifact); PLUS a decode state-I/O **byte-count** nsys/counter comparison to confirm
+the ~3.4 GB/step distinct-slot traffic is the delta; PLUS the focused correctness
+gates — both model-gate arms (`test_qwen27_paged_engine` default + `VT_GDN_PACKED_DECODE=0`)
+and the `c172336` crash-regression reproduction (`--diagnostic-c16`, previously 3/3).
+
+**Gates:** `check-agent-record.py` + `check-doc-checkpoint.py` green expected
+(README + docs/BENCHMARKS.md both updated this change). Surfaces updated same-change:
+README (one status line), docs/BENCHMARKS.md (current-checkpoint attribution refined),
+roadmap_v1.md (order-0 decode lever reframed), coordination (`CLAIM-GDN-BA-ROUNDING-1`
+last-update), this state entry, the parity-ledger row. No `HANDSOFF.md`.

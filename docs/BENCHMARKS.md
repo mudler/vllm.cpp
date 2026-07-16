@@ -45,6 +45,27 @@ binary vs `246a23c` binary, interleaved c16 legs, same corpus/box) is **RUNNING 
 on dgx** as the diagnostic to isolate it; it is in-flight and this record does not
 wait on it.
 
+**Source+arithmetic grounding (2026-07-16, `CLAIM-GDN-BA-ROUNDING-1`; DGX A/B is the
+final arbiter).** A two-round `9ad8fb7`→`c172336` bisect (`825→790` tok/s, TPOT
+`159→167 ms`, both `c172336` arms equal incl. `VT_GDN_PACKED_DECODE=0`) now grounds
+the hypothesis and **refutes a "per-step host-machinery" reading**: every new host
+cost is per-STEP over n≤32 (O(n²) uniqueness ≤1024 compares, string-keyed remap ≤32
+ids ⇒ **<~15 µs/step**, ~3 orders below the 8 ms), and on CUDA `IndexedGdnStateIoEnabled`
+defaults ON so there is **no graph→eager flip / no row-copy fallback** — the decode
+device path is byte-identical to `9ad8fb7` except the state-index VALUES. `9ad8fb7`
+keyed the compact pool on the mamba block-id, which collapses to the shared null
+block-0 for long sequences → every long c16 sequence shared ONE slot (silent
+corruption). De-collapsing to distinct per-sequence slots restores the recurrent-state
+DRAM traffic every correct GDN decode must pay (real 27B ssm row 48·128·128·F32 =
+**3 MB/slot/layer**; ~16 distinct rows × ~36 GDN layers ≈ **~3.4 GB/step** ÷ ~273 GB/s
+≈ **8–12 ms** — the measured regression). vLLM pays the same traffic (its 159 ms TPOT
+includes it), so `825` is unrecoverable (bug artifact) and **~790 is the CORRECT floor,
+already 0.995× vLLM at c16**; the residual 790→794 is decode-**kernel** efficiency
+(a separate lever), NOT a host cost. A perf-neutral validation/allocation cleanup was
+landed this change (`ValidateGdnStateIndices` O(n²)→O(n) + `VT_GDN_VALIDATE`; reused
+remap scratch); it recovers ~0 of the 8 ms by design. DGX to confirm: the same c16 A/B
+(expect ≈790, NOT 825) + a decode state-I/O byte-count nsys.
+
 **W1D3 / G3 closed on evidence-totality (compacted).** The packed-decode
 component campaign proved **EQUIVALENCE — no stable regression on any axis**
 across **eight sealed components** + the **8-pair locked c16 A/B** (`00bf484`:

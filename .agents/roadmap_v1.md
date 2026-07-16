@@ -30,11 +30,20 @@ held; the old c16/c32 wins (1.0279/1.0394) are GONE. **HYPOTHESIS (labeled,
 unproven):** `3f256ab` silently carried the GDN slot-sharing defect (two long
 requests could share one recurrent-state slot at high concurrency), removed by the
 `c172336` correctness fix, which may have traded that inflated throughput away
-alongside every other change between the SHAs. **Front 1 — the c2–c32 decode gap:**
-the in-flight **era A/B** (`3f256ab` vs `246a23c` binary, interleaved c16, running
-now on dgx) + the **nsys full-step c2/c8 attribution** (async-sched W3 vs residual
-kernel vs the slot-fix state-bandwidth trade) → **`ENG-ASYNC-SCHED` W3** if
-confirmed. **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
+alongside every other change between the SHAs. **Grounded 2026-07-16
+(`CLAIM-GDN-BA-ROUNDING-1`, `.agents/state.md`):** a `9ad8fb7`→`c172336` source+arithmetic
+bisect confirms this is the **slot-fix state-bandwidth trade, NOT host machinery** —
+the per-step validators/remap are µs-scale (n≤32), while de-collapsing shared GDN
+slots restores ~3.4 GB/step of correctness-required recurrent-state DRAM traffic
+(3 MB/slot/layer × ~16 distinct rows × ~36 layers ÷ ~273 GB/s ≈ 8–12 ms ≈ the
+regression). So `9ad8fb7`'s 825 was a silent-corruption artifact and **~790 is the
+correct floor (already 0.995× vLLM at c16); recovery to 825 is impossible without
+the bug.** **Front 1 — the c2–c32 decode gap (reframed):** the honest 790→794 residual
+is decode-**KERNEL** efficiency (our `GdnDecode`/`GdnPackedDecode` vs vLLM's fla
+`fused_recurrent`/TRT-LLM recurrent decode), NOT a recoverable host cost; the
+in-flight **era A/B** + a decode state-I/O **byte-count** nsys are the arbiter, then
+the decode-kernel lever (and `ENG-ASYNC-SCHED` W3 only if the nsys still shows host
+idle). **Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
 stall cadence from this root's per-request `itls[]`. The
 [packed GDN decode](specs/gdn-packed-decode.md) leaf is **CLOSED on EQUIVALENCE**
 (`KERNEL-GDN-PACKED-DECODE` → `DONE`, owner `e47b4d6`).

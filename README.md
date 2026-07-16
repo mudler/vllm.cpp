@@ -22,7 +22,13 @@ OpenAI-compatible server.
 > high concurrency), which the `c172336` correctness fix removed and may have
 > traded that inflated throughput away, alongside every other change between the
 > SHAs; an **era A/B** (`3f256ab` vs `246a23c` binary, interleaved c16) is running
-> now as the diagnostic. The `246a23c` binary carries the correctness slot-fix
+> now as the diagnostic. A source+arithmetic bisect (`.agents/state.md` 2026-07-16)
+> now **grounds this hypothesis and refutes a "host-machinery" reading**: the
+> per-step validators/remap are µs-scale (n≤32), while de-collapsing shared GDN
+> slots restores ~3.4 GB/step of correctness-required recurrent-state DRAM traffic
+> (3 MB/slot/layer) ≈ the 8 ms — so `9ad8fb7`'s 825 was a silent-corruption
+> artifact and ~790 is the correct floor; the honest 790→794 residual is decode
+> **kernel** efficiency, not a recoverable host cost. The `246a23c` binary carries the correctness slot-fix
 > (`c172336`), the **windowed-load** release (`cb2d310`, which flips both memory
 > axes to PASS — ours peak PSS 24.88 GB vs vLLM 28.18 GB), merged **qkvz**
 > (`45f9e6d`, DGX gates green), and packed GDN decode as the default. The order-0

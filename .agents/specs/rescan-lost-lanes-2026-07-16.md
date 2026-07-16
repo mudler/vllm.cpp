@@ -86,3 +86,43 @@ Attention decode: FlashInfer/TRT-LLM decode path needs no per-step plan();
 neither side builds paged-kv indptr/indices per decode step; workspace pooled;
 capture scope equivalent; reorder_batch no-op both sides. Sampling: on-GPU
 greedy path structure matches apart from finding 2.
+
+## Implementation disposition (2026-07-16, `CLAIM-BLOCKTABLE-HOST-CLUSTER`)
+
+The mechanical-mirror FIX dispatch for findings §1 (block-table host cluster),
+§5 (decode-graph capture set) and §6 (SamplingMetadata / SchedulerOutput tail)
+was executed CPU-first, test-first, bit-identical. Structured implementation
+spec: [blocktable-host-cluster-cleanup.md](blocktable-host-cluster-cleanup.md).
+
+- **§1 item c — LANDED (`8a717b2`).** `BlockTable::compute_slot_mapping` no
+  longer writes the dead `[num_tokens, max_num_batched_tokens)` tail-pad; the
+  decode graph re-pads via `BuildPaddedDecode` and the only other consumer slices
+  `[0, total)`. Recorded tail-pad deviation. RED→GREEN `test_block_table`.
+- **§5 item d — LANDED (`81afc36`).** The decode CUDA-graph capture set is
+  derived from `max_num_seqs` in `include/vllm/model_executor/models/decode_graph_sizes.h`
+  (`DecodeGraphSizes`/`PadToCaptureSize`), mirroring vLLM `_set_cudagraph_sizes`
+  reduced to the full-decode regime. Derived set for `max_num_seqs=32` =
+  `{1,2,4,8,16,24,32}` (adds the missing 24 bucket, drops the never-reachable 64;
+  batches 17–24 stop over-padding to 32; **+1 captured decode graph**). CUDA-only,
+  padding rows inert → token-exact. RED→GREEN `test_decode_graph_sizes`.
+- **§6 item e — LANDED (`0c4b41c`).** `InputBatch::make_sampling_metadata` caches
+  + rebuilds only on batch change (mirrors vLLM `refresh_metadata`; penalty path
+  rebuilds every step for output-token freshness — greedy gate gets the full win
+  bit-identically). `SchedulerOutput` `std::move`s the `num_scheduled_tokens` map
+  + `finished_req_ids` set (container plumbing only; `std::map` kept). RED→GREEN
+  `test_input_batch`.
+
+**§1 items a-runner (full-width `gather_block_table` / positions int64→int32 /
+zero-copy device views) and b (GDN group gathering the whole 8192-col table to
+read column 0 only): NOT DONE here** — they live in
+`src/vllm/v1/worker/gpu/runner.cpp`, owned by `CLAIM-ASYNC-SCHED-W3` (async
+paths) and the GDN claims. Reported for those owners; the zero-copy view refactor
+also needs a `CommonAttentionMetadata` ABI change (vector → span) spanning
+non-owned files and is NOT a mechanical bit-identical mirror. Finding §2 (sampler
+alloc, W3 owner) and §3/§4 (RMSNorm efficiency / c2–c8 attribution) are unchanged
+and remain with their dispatched owners.
+
+**Perf disposition:** `benchmark_binding=false`, NO speed credit from this change.
+The payoff is measured by the dispatched correct-state c2/c8 full-step probe and
+the next authorized exact grid. Gate: DGX token-exactness on the final SHA (27B
+235/235 + 16/16, 35B); no A/B.

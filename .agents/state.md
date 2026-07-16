@@ -12140,3 +12140,49 @@ No engine/kernel/CUDA code changed, so the W3 binary is unchanged from `89b329e`
 `benchmark_binding=false`, binding stays 49/124. Trailers
 `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
 [ClaudeCode]`.
+
+## 2026-07-16 — block-table host-cluster cleanup LANDED (items c/d/e); `CLAIM-BLOCKTABLE-HOST-CLUSTER`
+
+Executed the mechanical-mirror FIX dispatch from the lost-lanes rescan §1/§5/§6,
+CPU-first, test-first, bit-identical (spec
+[blocktable-host-cluster-cleanup.md](specs/blocktable-host-cluster-cleanup.md)).
+Three separable commits:
+
+- **c (`8a717b2`)** `BlockTable::compute_slot_mapping` no longer writes the dead
+  `[num_tokens, max_num_batched_tokens)` tail-pad (the decode graph re-pads via
+  `BuildPaddedDecode`, the only other consumer slices `[0,total)`); recorded
+  tail-pad deviation. RED→GREEN `test_block_table` (tail −1→0). Consumer output
+  bit-identical (`test_prepare_inputs` 6/6).
+- **d (`81afc36`)** decode CUDA-graph capture set DERIVED from `max_num_seqs`
+  (new `include/vllm/model_executor/models/decode_graph_sizes.h`, mirrors vLLM
+  `_set_cudagraph_sizes` reduced to the full-decode regime): `max_num_seqs=32` →
+  `{1,2,4,8,16,24,32}` (adds the missing 24 bucket, drops the never-reachable 64;
+  batches 17–24 stop over-padding to 32; **+1 captured decode graph**). CUDA-only,
+  padding rows inert → token-exact. RED→GREEN `test_decode_graph_sizes` (5/478).
+  `ENG-CUDAGRAPH` → `ACTIVE` for the duration (returns to `PARTIAL` at close).
+- **e (`0c4b41c`)** `InputBatch::make_sampling_metadata` caches + rebuilds only
+  on batch change (add/remove/condense-move/swap set a dirty flag), mirroring
+  vLLM `refresh_metadata`; deviation — penalty-active path rebuilds every step
+  (our port copies output_token_ids where vLLM holds a live ref), so the greedy
+  gate gets the full win bit-identically. `SchedulerOutput` `std::move`s the
+  `num_scheduled_tokens` map + `finished_req_ids` set (container plumbing;
+  `std::map` kept to preserve iteration order). RED→GREEN `test_input_batch` +2
+  (stale cache 1→2, demonstrated by neutering the add invalidation);
+  `test_scheduler` 31/31, `test_runner` 228/228, `test_sampling_metadata` 6/6
+  unchanged.
+
+**NOT done here (reported for owners):** rescan §1 items **a-runner** (full-width
+`gather_block_table` / positions int64→int32 / zero-copy device views) and **b**
+(GDN group gathering the whole 8192-col table to read column 0) live in
+`src/vllm/v1/worker/gpu/runner.cpp`, owned by `CLAIM-ASYNC-SCHED-W3` (async paths)
+and the GDN claims — a cross-claim ownership conflict I must not create; the
+zero-copy view refactor also needs a `CommonAttentionMetadata` ABI change
+(vector → span) spanning non-owned files and is not a mechanical bit-identical
+mirror. Finding §2 (sampler alloc) stays with the W3 owner; §3/§4 unchanged.
+
+CPU gates GREEN: clean full `-Werror` rebuild, full ctest, tools 164/164, record
++ doc-checkpoint checkers green. NO GPU (box under heavy external contention;
+per-item full-ctest deferred to one authoritative clean run). `benchmark_binding
+=false`, NO speed credit — payoff measured by the dispatched correct-state c2/c8
+full-step probe and the next authorized exact grid. Remaining: DGX token-exactness
+gate (27B 235/235 + 16/16, 35B) on the final SHA under `flock /tmp/gpu`.

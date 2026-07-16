@@ -11717,3 +11717,82 @@ preserved. Decision next session on measured grounds. Binding stays
   `benchmark_binding=false`, no speed credit, binding stays 49/124. Trailers
   `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
   [ClaudeCode]`.
+
+- **2026-07-16** — **ENG-ASYNC-SCHED W3 ENABLE-FLIP LANDED + CPU-gated** (the last
+  W3 code piece before the async-overlap DGX proof; `CLAIM-ASYNC-SCHED-W3`,
+  isolated worktree `agent-a1dbb51fd2f7a9d0a`, reset to `origin/main` @ `620a94e`).
+  The two documented remaining W3 pieces land, so the whole async stack is
+  engageable with one env; production stays byte-identical until the DGX A/B.
+  **WHAT LANDED:**
+  1. **`LoadedEngine` construction switch** (`include/vllm/entrypoints/model_loader.h`,
+     `src/vllm/entrypoints/model_loader.cpp`): the member order is reordered so
+     `runner_` precedes the scheduler, and the scheduler member becomes a
+     `std::unique_ptr<Scheduler>` built by the new `MakeScheduler(async_enabled,…)`
+     — an `AsyncScheduler` + `max_concurrent_batches=2` when the new
+     `ResolveAsyncEnabled(cfg, runner_.runner_supports_async())`
+     (= `AsyncSchedulingEnabled(cfg.ResolveAsyncScheduling(runner_supports_async))`)
+     resolves ON, else the byte-identical synchronous `Scheduler` + depth-1. The
+     resolved mcb threads through a new trailing `AsyncLLM` ctor param →
+     `InprocClient` → `EngineCoreProc` (which flips `step_fn` to
+     `step_with_batch_queue`); `async_engine()` passes it. The ctor logs
+     "Asynchronous scheduling is enabled/disabled (max_concurrent_batches=…)"
+     mirroring vLLM (`config/vllm.py:990-1038`) for A/B audit. `AsyncRunnerEnvDefault`
+     (`runner.cpp`) now reads `VT_ASYNC_RUNNER` per runner construction instead of
+     first-call-caching it, so the DGX A/B — and the CPU construction-matrix test —
+     flip it per engine.
+  2. **Device combine/scatter kernel** (`include/vt/cuda/combine_tokens.h`,
+     `src/vt/cuda/cuda_combine_tokens.cu`, added to `CMakeLists.txt`): CUDA ports of
+     `_combine_sampled_and_draft_tokens_kernel` (input_batch.py:304-406, T0 non-spec
+     subset — input_ids splice only; our logits_indices come from prepare_inputs)
+     and the `last_sampled` scatter (post_update, input_batch.py:457-543). Wired in
+     `runner.cpp` behind `#ifdef VLLM_CPP_CUDA` on the CUDA async path
+     (`async_input_combine_ && device==kCUDA`): the combine runs on the MAIN queue in
+     `execute_model` BEFORE the forward, and the scatter runs on the MAIN queue in
+     `sample_tokens_async` AFTER sampling — both main-stream-ordered with the forward
+     that embeds `input_ids`, so the sampled ids never round-trip the host. This
+     DELETES `sample_tokens_async`'s pre-scatter `Synchronize` (the ONE ordering cost
+     the host-array path paid); the CPU backend keeps the byte-identical host loop
+     (`combine_sampled_and_draft_tokens` + the host scatter, with its `Synchronize`).
+     On GB10's pageable memory the runner's host arrays are device-addressable, so
+     the kernels operate on them in place; idx_mapping is identity (condensed-dense
+     batch → nullptr). Capture-safe (host side of input prep, outside decode-graph
+     replay). **Did NOT touch `src/vt/cuda/cuda_gdn.cu`.**
+  **TEST-FIRST RED→GREEN**: the construction resolution matrix in
+  `tests/vllm/entrypoints/test_loaded_engine_dense.cpp` — a static-resolution case
+  (runner_supports_async {false,true} × VT_ASYNC_SCHED {unset,0} → async_enabled +
+  mcb) and a wired-construction case over a synthetic dense engine asserting the
+  scheduler runtime TYPE (`dynamic_cast<AsyncScheduler*>`) + mcb across the full env
+  unset/1 × VT_ASYNC_SCHED unset/0 matrix. RED VERIFIED by hardcoding the resolution
+  OFF (pre-flip state) → the 3 ON-arm asserts fail (`async_scheduling_enabled()==false`,
+  `1==2`, `nullptr!=nullptr`), then reverted GREEN. Existing async suites
+  (`test_async_scheduler`, `test_engine_core_proc` mcb=2, `test_scheduler_config`,
+  `test_async_llm`, `test_combine_tokens`, `test_runner`) stay green. The CUDA kernel
+  itself is DGX-verified by the orchestrator (the CI box is CPU-only; the `.cu` is
+  built only in the CUDA build).
+  CPU-only gates: clean full `-Werror` rebuild 0 warnings, full ctest **111/111**,
+  tools **164/164**, record + doc-checkpoint checkers green. **NO GPU ran; production
+  default (no env) resolves the flip OFF → both model gates byte-identical to main.**
+  **INTENDED DGX VALIDATION** (orchestrator, from the pushed SHA, one `flock /tmp/gpu`
+  per series):
+  (1) SAFETY on THIS SHA — both gates in the production default (all env unset):
+      `flock /tmp/gpu -c 'ctest -R qwen36_paged_engine'` + `qwen27_paged_engine`
+      = 16/16 + 235/235, byte-identical to main.
+  (2) TOKEN-EXACTNESS both gates × the three arms:
+      default (env unset), `VT_ASYNC_RUNNER=1` (resolved-ON depth-2 + device
+      combine/scatter), and `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0` (forced sync
+      rollback) — each 235/235 + 16/16, bit-identical to the sync arm:
+      `flock /tmp/gpu -c 'ctest -R "qwen36_paged_engine|qwen27_paged_engine"'`,
+      then the same with `VT_ASYNC_RUNNER=1` prepended, then with
+      `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0` prepended.
+  (3) interleaved c16 A/B W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+      (`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`), same binary, one lock, via
+      `tools/bench/profile_vllm_online_gate.py` / the `SERVE-GATE-ONLINE` harness —
+      ~+3 ms/step ≈ +15 tok/s on throughput axes and ≤ on TPOT, with an explicit
+      TTFT-regression WATCH (`3812d8`'s TTFT 0.862159× ON/OFF is the caution). The c2
+      speed budget is frozen neutral by `3812d8` (total 1.002153×), so the honest
+      gate is "no regression + mirror behavior"; the measured delta is recorded
+      either way (spec D6). Also confirm the "Asynchronous scheduling is enabled"
+      log appears in the ON arm and "disabled" in the rollback arm.
+  `benchmark_binding=false`, no speed credit, binding stays 49/124. Trailers
+  `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
+  [ClaudeCode]`.

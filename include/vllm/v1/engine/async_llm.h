@@ -48,9 +48,17 @@ class AsyncLLM {
   // LLMEngine does. InprocClient owns the EngineCoreProc + engine thread; this
   // object owns the output-handler thread. All referenced collaborators must
   // outlive AsyncLLM.
+  //
+  // max_concurrent_batches (VllmConfig.max_concurrent_batches,
+  // vllm/config/vllm.py:490-501): the EngineCoreProc batch-queue depth. 1 keeps
+  // the synchronous step(); 2 (async scheduling on a single-GPU MRV2, W3) selects
+  // step_with_batch_queue for depth-2 overlap. LoadedEngine resolves it once from
+  // SchedulerConfig::ResolveAsyncScheduling(runner_supports_async()) and passes it
+  // here; a caller that constructs AsyncLLM directly keeps the sync default.
   AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
            Executor& executor, OutputProcessor& output_processor,
-           BlockHasher block_hasher = nullptr, int shutdown_timeout_s = 0);
+           BlockHasher block_hasher = nullptr, int shutdown_timeout_s = 0,
+           int max_concurrent_batches = 1);
   ~AsyncLLM();
 
   AsyncLLM(const AsyncLLM&) = delete;

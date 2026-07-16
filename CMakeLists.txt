@@ -282,6 +282,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_glue.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_paged_attn.cu
+    src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.

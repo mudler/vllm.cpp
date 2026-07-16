@@ -153,6 +153,34 @@ vllm::SchedulerConfig LoadedEngine::MakeSchedulerConfig(
   return cfg;
 }
 
+// The construction-time async-scheduling resolution (W3 enable-flip). Mirrors
+// vLLM: async_scheduling=None resolves to True when compatible
+// (vllm/config/vllm.py:990-1038) gated on the runner advertising the async
+// device path, then the house VT_ASYNC_SCHED=0 rollback env force-disables it in
+// the same binary. `async_scheduling` stays nullopt on MakeSchedulerConfig, so
+// ResolveAsyncScheduling(runner_supports_async) yields runner_supports_async
+// (when otherwise compatible).
+bool LoadedEngine::ResolveAsyncEnabled(
+    const vllm::SchedulerConfig& scheduler_config, bool runner_supports_async) {
+  return vllm::AsyncSchedulingEnabled(
+      scheduler_config.ResolveAsyncScheduling(runner_supports_async));
+}
+
+std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
+    bool async_enabled, vllm::SchedulerConfig scheduler_config,
+    vllm::v1::KVCacheConfig kv_cache_config, int block_size,
+    bool enable_caching) {
+  if (async_enabled) {
+    // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189).
+    return std::make_unique<vllm::v1::AsyncScheduler>(
+        std::move(scheduler_config), std::move(kv_cache_config), block_size,
+        enable_caching);
+  }
+  return std::make_unique<vllm::v1::Scheduler>(
+      std::move(scheduler_config), std::move(kv_cache_config), block_size,
+      enable_caching);
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : LoadedEngine(std::move(config),
@@ -183,19 +211,38 @@ LoadedEngine::LoadedEngine(HfConfig config,
       kv_cfg_(ModelRegistry::MakeKVCache(
           *model_, config_, params.block_size > 0 ? params.block_size : 32,
           params.num_blocks > 0 ? params.num_blocks : 256)),
-      scheduler_(MakeSchedulerConfig(
-                     max_model_len_,
-                     params.max_num_seqs > 0 ? params.max_num_seqs : 8,
-                     max_num_batched_tokens_,
-                     params.policy),
-                 kv_cfg_, params.block_size > 0 ? params.block_size : 32,
-                 /*enable_caching=*/prefix_caching_enabled_),
+      // runner_ FIRST (W3): the async-scheduling flip reads
+      // runner_.runner_supports_async().
       runner_(config_, *model_, kv_cfg_, SelectQueue(),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_),
+      // Resolve the enable-flip from the now-constructed runner + VT_ASYNC_SCHED,
+      // then size the batch-queue depth (2 under async scheduling → depth-2
+      // step_with_batch_queue; 1 otherwise). Default (no VT_ASYNC_RUNNER) resolves
+      // OFF, keeping the byte-identical synchronous path.
+      async_scheduling_enabled_(ResolveAsyncEnabled(
+          MakeSchedulerConfig(
+              max_model_len_,
+              params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_num_batched_tokens_, params.policy),
+          runner_.runner_supports_async())),
+      max_concurrent_batches_(MakeSchedulerConfig(
+                                  max_model_len_,
+                                  params.max_num_seqs > 0 ? params.max_num_seqs
+                                                          : 8,
+                                  max_num_batched_tokens_, params.policy)
+                                  .MaxConcurrentBatches(async_scheduling_enabled_)),
+      // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
+      scheduler_(MakeScheduler(
+          async_scheduling_enabled_,
+          MakeSchedulerConfig(
+              max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+              max_num_batched_tokens_, params.policy),
+          kv_cfg_, params.block_size > 0 ? params.block_size : 32,
+          /*enable_caching=*/prefix_caching_enabled_)),
       executor_(runner_),
-      engine_core_(scheduler_, executor_),
+      engine_core_(*scheduler_, executor_),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_
@@ -205,6 +252,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // Mirror vLLM's "Asynchronous scheduling is enabled/disabled" resolution log
+  // (vllm/config/vllm.py:990-1038) so the DGX A/B can audit which arm is live.
+  std::cerr << "vllm.cpp: Asynchronous scheduling is "
+            << (async_scheduling_enabled_ ? "enabled" : "disabled")
+            << " (max_concurrent_batches=" << max_concurrent_batches_ << ")\n";
   WarmupKernels();
 }
 
@@ -245,14 +297,14 @@ void LoadedEngine::WarmupKernels() {
   engine_core_.add_request(std::make_unique<vllm::v1::Request>(
       "_vllm_cpp_nvfp4_warmup", std::move(prompt), std::move(sampling),
       /*arrival_time=*/0.0, /*block_hasher=*/nullptr));
-  while (scheduler_.get_num_unfinished_requests() > 0) {
+  while (scheduler_->get_num_unfinished_requests() > 0) {
     (void)engine_core_.step();
   }
-  if (scheduler_.has_finished_requests()) {
+  if (scheduler_->has_finished_requests()) {
     (void)engine_core_.step();
   }
-  if (scheduler_.get_num_unfinished_requests() != 0 ||
-      scheduler_.has_finished_requests()) {
+  if (scheduler_->get_num_unfinished_requests() != 0 ||
+      scheduler_->has_finished_requests()) {
     throw std::runtime_error(
         "NVFP4 pre-serve warmup left scheduler state behind");
   }
@@ -263,9 +315,12 @@ void LoadedEngine::WarmupKernels() {
 vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
   std::lock_guard<std::mutex> lock(async_engine_mutex_);
   if (async_engine_ == nullptr) {
+    // Thread the resolved depth-2 batch-queue size so the async frontend runs
+    // step_with_batch_queue under async scheduling (W3 enable-flip); the sync
+    // default keeps max_concurrent_batches_ == 1 (depth-1 step()).
     async_engine_ = std::make_unique<vllm::v1::AsyncLLM>(
-        input_processor_, scheduler_, executor_, output_processor_,
-        block_hasher_);
+        input_processor_, *scheduler_, executor_, output_processor_,
+        block_hasher_, /*shutdown_timeout_s=*/0, max_concurrent_batches_);
   }
   return *async_engine_;
 }

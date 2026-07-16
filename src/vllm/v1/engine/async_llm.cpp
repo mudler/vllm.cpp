@@ -15,13 +15,14 @@ namespace vllm::v1 {
 
 AsyncLLM::AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
                    Executor& executor, OutputProcessor& output_processor,
-                   BlockHasher block_hasher, int shutdown_timeout_s)
+                   BlockHasher block_hasher, int shutdown_timeout_s,
+                   int max_concurrent_batches)
     : input_processor_(input_processor),
       output_processor_(output_processor),
       block_hasher_(std::move(block_hasher)),
       engine_core_(scheduler, executor,
                    /*structured_output_manager=*/nullptr,
-                   /*max_concurrent_batches=*/1, shutdown_timeout_s),
+                   max_concurrent_batches, shutdown_timeout_s),
       output_handler_() {
   // Start only after every member (including the stop flags) is constructed;
   // the thread blocks on get_output until the first request arrives.

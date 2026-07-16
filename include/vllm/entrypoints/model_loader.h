@@ -20,6 +20,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
+#include "vllm/v1/core/sched/async_scheduler.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/engine/core.h"
 #include "vllm/v1/engine/async_llm.h"
@@ -129,6 +130,31 @@ class LoadedEngine {
   bool prefix_caching_enabled() const { return prefix_caching_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
 
+  // The async-scheduling enable-flip, resolved ONCE at construction (W3
+  // ENG-ASYNC-SCHED). `async_scheduling_enabled()` is
+  // AsyncSchedulingEnabled(SchedulerConfig::ResolveAsyncScheduling(
+  // runner_.runner_supports_async())) — i.e. vLLM's default-ON-when-compatible
+  // resolution (vllm/config/vllm.py:990-1038) gated on the MRV2 runner
+  // advertising the async device path (VT_ASYNC_RUNNER), with the house
+  // VT_ASYNC_SCHED=0 rollback applied. When ON, scheduler() is an AsyncScheduler
+  // and max_concurrent_batches() is 2 (depth-2 batch queue, step_with_batch_queue);
+  // OFF keeps the byte-identical synchronous Scheduler + depth-1. The production
+  // default (no VT_ASYNC_RUNNER) resolves OFF, so nothing changes until the DGX
+  // A/B flips that env.
+  bool async_scheduling_enabled() const { return async_scheduling_enabled_; }
+  int max_concurrent_batches() const { return max_concurrent_batches_; }
+  // The engine's scheduler (Scheduler or, under async scheduling, AsyncScheduler).
+  // Exposed for the construction-resolution gate; production drives it via
+  // engine()/async_engine().
+  const vllm::v1::Scheduler& scheduler() const { return *scheduler_; }
+
+  // ResolveAsyncEnabled: the construction-time resolution, factored out so the
+  // CPU construction-matrix test can assert it directly over the
+  // runner_supports_async x VT_ASYNC_SCHED matrix without a disk load. Applies
+  // SchedulerConfig::ResolveAsyncScheduling then the VT_ASYNC_SCHED rollback env.
+  static bool ResolveAsyncEnabled(const vllm::SchedulerConfig& scheduler_config,
+                                  bool runner_supports_async);
+
  private:
   // Type-erased constructor used by FromModelDir and the concrete-weight
   // compatibility overloads above.
@@ -138,6 +164,14 @@ class LoadedEngine {
   static vllm::SchedulerConfig MakeSchedulerConfig(
       int max_model_len, int max_num_seqs, int max_num_batched_tokens,
       vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS);
+  // Construct the concrete scheduler for the resolved mode: an AsyncScheduler
+  // (async scheduling ON) or the synchronous Scheduler. Mirrors upstream
+  // get_scheduler_cls (scheduler.py:180-189) selecting AsyncScheduler when
+  // async_scheduling. Both take the same ctor arguments.
+  static std::unique_ptr<vllm::v1::Scheduler> MakeScheduler(
+      bool async_enabled, vllm::SchedulerConfig scheduler_config,
+      vllm::v1::KVCacheConfig kv_cache_config, int block_size,
+      bool enable_caching);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -156,8 +190,18 @@ class LoadedEngine {
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
   vllm::v1::KVCacheConfig kv_cfg_;
-  vllm::v1::Scheduler scheduler_;
+  // runner_ is declared BEFORE the scheduler (W3): the async-scheduling flip is
+  // resolved from runner_.runner_supports_async(), so the runner must be fully
+  // constructed before async_scheduling_enabled_ / scheduler_ are initialized.
   vllm::v1::GPUModelRunner runner_;
+  // Resolved once, in dependency order after runner_ (see the accessors above).
+  bool async_scheduling_enabled_;
+  int max_concurrent_batches_;
+  // Polymorphic scheduler: a plain Scheduler by default, an AsyncScheduler when
+  // async_scheduling_enabled_. Heap-held so the concrete class is chosen at
+  // construction; engine_core_ / async_engine_ share this one instance by
+  // reference (*scheduler_).
+  std::unique_ptr<vllm::v1::Scheduler> scheduler_;
   vllm::v1::Executor executor_;
   vllm::v1::EngineCore engine_core_;
   vllm::v1::InputProcessor input_processor_;

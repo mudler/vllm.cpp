@@ -22,6 +22,9 @@
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
+#ifdef VLLM_CPP_CUDA
+#include "vt/cuda/combine_tokens.h"  // W3 device combine/scatter (removes the sync)
+#endif
 
 namespace vllm::v1 {
 
@@ -59,14 +62,13 @@ static bool GpuSampleEnabled() {
 // Async-scheduling device-input opt-in default (ENG-ASYNC-SCHED W3 runner leaf).
 // VT_ASYNC_RUNNER=1 turns ON the combine_sampled_and_draft_tokens device-input
 // path at runner construction (bring-up opt-in for the DGX A/B); default OFF so
-// production keeps the synchronous host path byte-identical. Read ONCE (never
-// per-step). Tests toggle the flag directly via set_async_input_combine.
+// production keeps the synchronous host path byte-identical. Read at CONSTRUCTION
+// (not per-step), honoring the env value live at each runner build so the DGX A/B
+// — and the CPU construction-matrix test — can flip it per engine. Tests may also
+// toggle the flag directly via set_async_input_combine.
 static bool AsyncRunnerEnvDefault() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_ASYNC_RUNNER");
-    return e != nullptr && e[0] == '1' && e[1] == '\0';
-  }();
-  return on;
+  const char* e = std::getenv("VT_ASYNC_RUNNER");
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
 
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
@@ -603,12 +605,32 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // host path (both give the same id, since sample_tokens writes the same token
   // to token_ids_cpu and last_sampled_tokens).
   if (async_input_combine_ && num_reqs > 0) {
-    std::vector<int32_t> idx_mapping(static_cast<size_t>(num_reqs));
-    std::iota(idx_mapping.begin(), idx_mapping.end(), 0);
-    combine_sampled_and_draft_tokens(
-        step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
-        step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
-        /*num_new_sampled_tokens=*/1);
+#ifdef VLLM_CPP_CUDA
+    if (queue_.device.type == vt::DeviceType::kCUDA) {
+      // DEVICE combine (W3 DGX leaf): splice each decode row's input id from the
+      // device-resident-analog last_sampled_tokens on the MAIN queue, BEFORE the
+      // forward (which embeds input_token_ids on the same queue → sees the patch)
+      // and OUTSIDE any decode-graph capture. idx_mapping is identity (condensed-
+      // dense batch), passed as nullptr. All inputs live in `step` (moved to
+      // exec_state_, buffer preserved) / persistent InputBatch members, so they
+      // outlive the async launch. On GB10's pageable memory the host arrays are
+      // device-addressable; this removes the sample_tokens_async pre-scatter
+      // Synchronize (see below). num_new_sampled_tokens == 1 (T0 non-spec).
+      vt::cuda::LaunchCombineSampledAndDraftTokens(
+          queue_, step.input_token_ids.data(), /*idx_mapping=*/nullptr,
+          input_batch_.last_sampled_tokens.data(), step.query_start_loc.data(),
+          step.seq_lens.data(), input_batch_.prefill_len.data(), num_reqs,
+          /*num_new_sampled_tokens=*/1);
+    } else
+#endif
+    {
+      std::vector<int32_t> idx_mapping(static_cast<size_t>(num_reqs));
+      std::iota(idx_mapping.begin(), idx_mapping.end(), 0);
+      combine_sampled_and_draft_tokens(
+          step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
+          step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
+          /*num_new_sampled_tokens=*/1);
+    }
   }
 
   // Full-attention KV group metadata (M1.6 MakeCommonAttentionMetadata).
@@ -904,27 +926,44 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // post_update only; host token bookkeeping for detok/penalties is fed by the
   // scheduler's update_from_output when get_output() materializes).
   //
-  // Because our input-half combine reads `last_sampled_tokens` as a HOST array
-  // (device-neutral, the DGX device-kernel leaf ports it), this scatter needs the
-  // sampled ids host-valid before the next step's combine. `Synchronize` makes
-  // the host read of `dev_ids` well-defined on EVERY backend (no-op on CPU where
-  // the sampler already ran synchronously; it drains the async GreedyArgmax on
-  // CUDA so there is no read-before-write race). This is the ONE ordering cost the
-  // host-array combine still pays; the DGX device-kernel leaf (last_sampled scatter
-  // + combine on GPU-resident tensors, main-stream-ordered) removes it and unlocks
-  // the full overlap — the sampled-id OUTPUT D2H below is already deferred
-  // (get_output) so detok/output processing overlaps the next forward regardless.
-  // Runs OUTSIDE any CUDA-graph capture (post-sample host-side).
-  vt::GetBackend(dev.type).Synchronize(queue_);
-  const int64_t* ids = static_cast<const int64_t*>(dev_ids);
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
-  for (int i = 0; i < num_reqs; ++i) {
-    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
-    skeleton.req_ids.push_back(req_id);
-    skeleton.req_id_to_index[req_id] = i;
-    input_batch_.last_sampled_tokens[static_cast<size_t>(i)] =
-        static_cast<int32_t>(ids[i]);
-    input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+#ifdef VLLM_CPP_CUDA
+  if (dev.type == vt::DeviceType::kCUDA) {
+    // DEVICE scatter (W3 DGX leaf): write each row's sampled id into
+    // last_sampled_tokens on the MAIN queue — main-stream-ordered with the next
+    // step's device combine, so the sampled ids NEVER round-trip the host. This
+    // DELETES the pre-scatter `Synchronize` the host-array path needed (its ONLY
+    // purpose was making the host read of dev_ids well-defined). On GB10's
+    // pageable memory last_sampled_tokens.data() is device-addressable; idx_mapping
+    // is identity (nullptr). Runs OUTSIDE any CUDA-graph capture (post-sample). The
+    // host-side bookkeeping below needs NO device read.
+    vt::cuda::LaunchScatterLastSampled(
+        queue_, input_batch_.last_sampled_tokens.data(),
+        static_cast<const int64_t*>(dev_ids), /*idx_mapping=*/nullptr, num_reqs);
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+      skeleton.req_ids.push_back(req_id);
+      skeleton.req_id_to_index[req_id] = i;
+      input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+    }
+  } else
+#endif
+  {
+    // HOST path (CPU backend): the sampler already ran synchronously, but on any
+    // non-CUDA async-degeneration backend `Synchronize` keeps the host read of
+    // `dev_ids` well-defined (no read-before-write race). This is the ONE ordering
+    // cost the host-array combine pays; the CUDA device-kernel branch above removes
+    // it. Runs OUTSIDE any CUDA-graph capture (post-sample host-side).
+    vt::GetBackend(dev.type).Synchronize(queue_);
+    const int64_t* ids = static_cast<const int64_t*>(dev_ids);
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+      skeleton.req_ids.push_back(req_id);
+      skeleton.req_id_to_index[req_id] = i;
+      input_batch_.last_sampled_tokens[static_cast<size_t>(i)] =
+          static_cast<int32_t>(ids[i]);
+      input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+    }
   }
 
   // Issue the non-blocking sampled-id D2H on the COPY queue + record the event.

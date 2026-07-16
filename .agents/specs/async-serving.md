@@ -12,8 +12,37 @@ split), `ENG-ASYNC-SCHED` (async/overlap scheduling), `ENG-PRIORITY-SCHED`
 W1 `ENG-CORE-BUSY-LOOP`, W2 `SERVE-ASYNC-LLM`, and W4
 `ENG-PRIORITY-SCHED` are implemented and `GATING`; the engine matrix carries
 their exact code/test evidence. Fixed HTTP delivery capacity is retained and
-steady-state neutral. W3 `ENG-ASYNC-SCHED` is the only unimplemented leaf and
-remains `READY`, unowned, and uncredited.
+steady-state neutral.
+
+**W3 `ENG-ASYNC-SCHED` host-side machinery LANDED + CPU-gated (2026-07-16),
+state `ACTIVE`.** The scheduler + engine-loop half of overlap scheduling is
+implemented and CPU-tested RED-first: `AsyncScheduler` output-placeholder
+accounting (`src/vllm/v1/core/sched/async_scheduler.cpp`, 1:1 with
+`async_scheduler.py:12-75`) over the base scheduler's now-placeholder-aware
+running-loop budget/`max_tokens` guard + `is_prefill_chunk` + extracted
+protected-virtual `update_after_schedule`/`update_request_with_output` hooks
+(all INERT while placeholders == 0, so the synchronous path is byte-identical);
+`EngineCore::step_with_batch_queue` depth-2 (`core.py:519-632`) + the
+`EngineCoreProc` batch-queue/step_fn selection + `has_work()` batch-queue term;
+`SchedulerConfig::ResolveAsyncScheduling` default-ON-when-compatible resolution +
+`MaxConcurrentBatches` (`vllm/config/vllm.py:490-501,990-1038`); and the
+`VT_ASYNC_SCHED` process rollback env. Token-exactness holds by construction on
+the CPU path (the eager executor materializes each batch's tokens before the
+next is scheduled; the placeholder math reconciles one step later, exactly as
+upstream).
+
+**Remaining W3 leaf (DGX-gated): the runner-side integration.** Our
+`prepare_inputs` is host-driven (`token_id(r,pos)` reads the host
+`token_ids_cpu`), so engaging async on the REAL `GPUModelRunner` needs the
+placeholder-aware device-input path (`combine_sampled_and_draft_tokens`,
+`input_batch.py:304-406,457-543`) + the non-blocking sampled-token-ID D2H on a
+copy stream + event (`async_utils.py:12-70`) + `vt::Backend` event/pinned-host
+primitives — the piece that actually captures the measured ~3.25 ms/step
+GPU-idle. Until it lands, `runner_supports_async` resolves FALSE for the
+production runner (a faithful mirror of vLLM's compat fallback), so the
+production default stays synchronous and both model gates are byte-identical to
+main; `VT_ASYNC_SCHED=1` is the bring-up opt-in once the runner path is
+DGX-validated. The joint spike's speed hypothesis is closed below.
 
 W3 is an unmet mirror obligation whose speed hypothesis is now closed. vLLM
 resolves `async_scheduling=None` to **True** when compatible

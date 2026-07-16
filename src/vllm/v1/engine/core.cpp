@@ -3,7 +3,9 @@
 // deviations and deferrals.
 #include "vllm/v1/engine/core.h"
 
+#include <cassert>
 #include <optional>
+#include <utility>
 
 #include "vllm/v1/core/sched/output.h"          // GrammarOutput
 #include "vllm/v1/structured_output/manager.h"  // StructuredOutputManager
@@ -83,6 +85,102 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // core.py:508 return outputs, scheduler_output.total_num_scheduled_tokens > 0.
   return {std::move(outputs_by_client),
           scheduler_output.total_num_scheduled_tokens > 0};
+}
+
+std::pair<std::map<int, EngineCoreOutputs>, bool>
+EngineCore::step_with_batch_queue() {
+  // core.py:519-632. Fulfilling the batch queue has priority over consuming an
+  // output: schedule + execute a new batch (if room + work), then block on the
+  // OLDEST queued batch. Our executor resolves eagerly, so "execute" here means
+  // the forward + sample ran synchronously and the ModelRunnerOutput is already
+  // in hand (the AsyncScheduler placeholder accounting is what lets step N+1 be
+  // scheduled before N's output is consumed — see core.h).
+  assert(batch_queue_.size() < static_cast<std::size_t>(batch_queue_size_) &&
+         "step_with_batch_queue called with a full batch queue");
+
+  bool model_executed = false;
+  std::optional<SchedulerOutput> deferred_scheduler_output;
+
+  const bool has_requests = scheduler_.get_num_unfinished_requests() > 0 ||
+                            scheduler_.has_finished_requests();
+  if (has_requests) {
+    // core.py:547 schedule (non-blocking; may return an empty batch).
+    SchedulerOutput scheduler_output = scheduler_.schedule();
+    // core.py:549-551 execute_model(non_block=True). MRV2: nullopt (forward
+    // done). A failed eager forward throws here, through the engine-fatal guard.
+    std::optional<ModelRunnerOutput> exec_out =
+        executor_.execute_model(scheduler_output);
+    // core.py:552-553 model_executed = total_num_scheduled_tokens > 0
+    // (is_ec_consumer is always true for us — no EC transfer).
+    model_executed = scheduler_output.total_num_scheduled_tokens > 0;
+
+    ModelRunnerOutput model_output;
+    bool have_output = false;
+    if (!model_executed) {
+      // core.py:555-557 no sampling required — carry the (empty) forward result.
+      model_output = exec_out.value_or(ModelRunnerOutput{});
+      have_output = true;
+    } else if (!scheduler_output.pending_structured_output_tokens) {
+      // core.py:559-567 not waiting on any tokens — get the grammar bitmask and
+      // sample immediately.
+      const std::optional<GrammarOutput> grammar_output =
+          scheduler_.get_grammar_bitmask(scheduler_output);
+      model_output = executor_.sample_tokens(grammar_output);
+      have_output = true;
+    } else {
+      // core.py:568-571 defer sampling until the prior step's output is
+      // processed (a structured request is waiting on in-flight tokens).
+      deferred_scheduler_output = scheduler_output;
+    }
+
+    if (!deferred_scheduler_output.has_value()) {
+      // core.py:573-575 add this step's result to the queue (front).
+      assert(have_output);
+      (void)have_output;
+      batch_queue_.push_front(
+          BatchQueueItem{std::move(model_output), std::move(scheduler_output)});
+      // core.py:576-581 don't block on the next result unless the queue is full
+      // or there are no more requests to schedule.
+      const bool more_requests =
+          scheduler_.get_num_unfinished_requests() > 0 ||
+          scheduler_.has_finished_requests();
+      if (batch_queue_.size() < static_cast<std::size_t>(batch_queue_size_) &&
+          (model_executed || more_requests)) {
+        return {{}, model_executed};
+      }
+    }
+  } else if (batch_queue_.empty()) {
+    // core.py:583-587 queue empty and no requests — nothing to do.
+    return {{}, false};
+  }
+
+  // core.py:589-590 block until the next result is available (pop the OLDEST).
+  BatchQueueItem item = std::move(batch_queue_.back());
+  batch_queue_.pop_back();
+
+  // core.py:604-607 update the scheduler from the popped batch's output.
+  EngineCoreOutputs engine_core_outputs =
+      scheduler_.update_from_output(item.scheduler_output, item.model_output);
+
+  // core.py:609-630 grammar deferral: now that the prior output is processed,
+  // compute the deferred batch's bitmask, sample it, and append it to the queue.
+  // (The runner's execute_model stash from this step is still valid — no other
+  // execute_model ran between it and here.)
+  if (deferred_scheduler_output.has_value()) {
+    const std::optional<GrammarOutput> grammar_output =
+        scheduler_.get_grammar_bitmask(*deferred_scheduler_output);
+    ModelRunnerOutput sampled = executor_.sample_tokens(grammar_output);
+    batch_queue_.push_front(
+        BatchQueueItem{std::move(sampled), std::move(*deferred_scheduler_output)});
+  }
+
+  std::map<int, EngineCoreOutputs> outputs_by_client;
+  if (!engine_core_outputs.outputs.empty()) {
+    const int client_index = engine_core_outputs.engine_index;
+    outputs_by_client.emplace(client_index, std::move(engine_core_outputs));
+  }
+  // core.py:632 return engine_core_outputs, model_executed.
+  return {std::move(outputs_by_client), model_executed};
 }
 
 }  // namespace vllm::v1

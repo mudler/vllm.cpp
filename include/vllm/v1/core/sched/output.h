@@ -26,8 +26,7 @@
 //     ported.
 //   SchedulerOutput trailing optionals, OMITTED here (a later unit slots them
 //     back in without reshaping the struct): preempted_req_ids /
-//     new_block_ids_to_zero (v2 model runner), has_structured_output_requests /
-//     pending_structured_output_tokens (grammar), num_invalid_spec_tokens /
+//     new_block_ids_to_zero (v2 model runner), num_invalid_spec_tokens /
 //     num_spec_tokens_to_schedule (spec decode), kv_connector_metadata /
 //     ec_connector_metadata (KV/EC transfer). GrammarOutput (structured output)
 //     is likewise omitted.
@@ -161,6 +160,15 @@ struct SchedulerOutput {
   // prefill (upstream SchedulerOutput.has_structured_output_requests, set in
   // _update_after_schedule scheduler.py:1186). Gates get_grammar_bitmask.
   bool has_structured_output_requests = false;
+
+  // Whether async scheduling must DEFER sampling this step because a structured
+  // request is still waiting on the previous step's (in-flight, placeholder)
+  // tokens before its grammar bitmask can be computed. Set by
+  // AsyncScheduler::update_after_schedule (async_scheduler.py:31-33); read by
+  // EngineCore::step_with_batch_queue (core.py:559-570). Always false under the
+  // synchronous Scheduler. Un-deferred from the output.h DEFERRED list for
+  // ENG-ASYNC-SCHED (spec async-serving.md W3).
+  bool pending_structured_output_tokens = false;
 
   // make_empty: an empty step output.
   static SchedulerOutput make_empty();

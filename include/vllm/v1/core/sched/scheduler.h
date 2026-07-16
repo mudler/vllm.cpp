@@ -62,6 +62,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/config/scheduler.h"
@@ -180,6 +181,30 @@ class Scheduler {
   // The KV cache manager the scheduler drives (heap-owned; non-movable).
   std::unique_ptr<KVCacheManager> kv_cache_manager;
 
+ protected:
+  // _update_after_schedule (scheduler.py:1166-1213): advance num_computed_tokens
+  // for every scheduled request, refresh is_prefill_chunk (num_computed <
+  // num_tokens + num_output_placeholders), set has_structured_output_requests,
+  // and flush the finished/preempted id sets. Takes scheduler_output by mutable
+  // ref (it writes has_structured_output_requests). protected + VIRTUAL so
+  // AsyncScheduler can extend it (add the output placeholders after super()).
+  virtual void update_after_schedule(SchedulerOutput& scheduler_output);
+
+  // _update_request_with_output (scheduler.py:1886-1902): append each generated
+  // token to the request, run check_stop after each, and trim any tokens past a
+  // stop. Returns {kept_token_ids, stopped}. Called by update_from_output only
+  // when the runner produced tokens (upstream `if new_token_ids:`). protected +
+  // VIRTUAL so AsyncScheduler can wrap it (stale-frame discard + placeholder
+  // drain + block caching, async_scheduler.py:51-75).
+  virtual std::pair<std::vector<int32_t>, bool> update_request_with_output(
+      Request& request, std::vector<int32_t> new_token_ids);
+
+  // Members the AsyncScheduler subclass reads. num_sampled_tokens_per_step_ is
+  // the per-step sampled-token count (1 at T0, 0 for diffusion); current_step_
+  // is the scheduler iteration counter (PP cadence).
+  int num_sampled_tokens_per_step() const { return num_sampled_tokens_per_step_; }
+  int current_step() const { return current_step_; }
+
  private:
   // _preempt_request: free the request's KV, mark it PREEMPTED, reset its
   // computed tokens, and re-queue it to the FRONT of waiting (FCFS retry). The
@@ -197,12 +222,6 @@ class Scheduler {
       const std::vector<Request*>& resumed_reqs,
       const std::map<std::string, int>& num_scheduled_tokens,
       const std::map<std::string, KVCacheBlocks>& req_to_new_blocks);
-
-  // _update_after_schedule: advance num_computed_tokens for every scheduled
-  // request, refresh is_prefill_chunk, set has_structured_output_requests, and
-  // flush finished/preempted id sets. Takes scheduler_output by mutable ref (it
-  // writes has_structured_output_requests, matching scheduler.py:1186).
-  void update_after_schedule(SchedulerOutput& scheduler_output);
 
   // The engine's StructuredOutputManager (upstream scheduler.py:94), or null when
   // structured output is not wired (M1.4/M1.8 tests). Non-owning.

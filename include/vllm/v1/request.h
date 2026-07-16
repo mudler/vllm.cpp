@@ -17,10 +17,11 @@
 //     lora_request, cache_salt (prefix caching salt), events /
 //     kv_transfer_params, spec_token_ids,
 //     client_index, streaming / resumable
-//     state, prefill_stats, async-scheduling counters
-//     (num_output_placeholders, async_tokens_to_discard,
-//     next_decode_eligible_step, last_sched_seq), num_nans_in_logits,
-//     num_preemptions, max_tokens (derived from sampling_params).
+//     state, prefill_stats, last_sched_seq (defer_block_free fence),
+//     num_nans_in_logits, num_preemptions.
+//     (The async-scheduling counters num_output_placeholders /
+//     async_tokens_to_discard / next_decode_eligible_step and max_tokens are
+//     un-deferred below for ENG-ASYNC-SCHED — spec async-serving.md W3.)
 //   - the read-only ConstantList views (output_token_ids / all_token_ids):
 //     here output_token_ids is a plain vector mutated only via
 //     AppendOutputToken; _all_token_ids is not materialized (NumTokens is
@@ -173,10 +174,35 @@ struct Request {
   // deferred list) because scheduler._update_after_schedule sets it 1:1.
   bool is_prefill_chunk = false;
 
+  // --- Async-scheduling counters (request.py:141-146) --------------------------
+  // Un-deferred for ENG-ASYNC-SCHED (spec async-serving.md W3). All three are
+  // INERT under the default synchronous Scheduler (they stay 0 and every site
+  // that reads them is a no-op), so the sync path is byte-identical; only the
+  // AsyncScheduler subclass mutates them.
+  //
+  // num_output_placeholders (request.py:141): the count of in-flight sampled
+  // tokens the scheduler has already reserved a slot for but not yet observed
+  // (async scheduling schedules step N+1 before N's output returns). Added in
+  // AsyncScheduler::update_after_schedule, drained in update_request_with_output.
+  int num_output_placeholders = 0;
+  // async_tokens_to_discard (request.py:142): output frames that were in flight
+  // when the request was force-preempted (reset_prefix_cache) and are now stale;
+  // each returning frame is dropped until this counter drains.
+  int async_tokens_to_discard = 0;
+  // next_decode_eligible_step (request.py:146): the earliest scheduler step in
+  // which this request may be scheduled for decode again (PP microbatching
+  // cadence). 0 at T0 (single GPU, pp_size fold is inert); read by the running
+  // loop guard, which is a no-op while it stays 0.
+  int next_decode_eligible_step = 0;
+
   // num_tokens: len(_all_token_ids) == prompt + output (no prompt_embeds in T0).
   int NumTokens() const;
   // num_output_tokens: len(_output_token_ids).
   int NumOutputTokens() const;
+  // max_tokens (request.py:106-110): the request's output-token cap. Upstream
+  // stores it as a field derived from sampling_params.max_tokens (or 1 for
+  // pooling). Read by the AsyncScheduler running-loop guard (scheduler.py:452).
+  int MaxTokens() const { return sampling_params.max_tokens.value_or(1); }
   // all_token_ids: the prompt token ids followed by the output token ids
   // (upstream _all_token_ids materialized; here concatenated on demand — no
   // prompt_embeds in T0). Used by scheduler._make_cached_request_data for the

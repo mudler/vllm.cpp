@@ -11449,3 +11449,64 @@ Diagnostic/perf lever; `benchmark_binding=false`, no speed credit until measured
 binding stays 49/124. `CLAIM-GDN-BA-ROUNDING-1` continues (qkvz remains its W2).
 Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
 [ClaudeCode]`.
+- **2026-07-16** — **ENG-ASYNC-SCHED W3 host-side machinery LANDED + CPU-gated
+  (`CLAIM-ASYNC-SCHED-W3`, isolated worktree, pushed to main).** Implemented the
+  scheduler + engine-loop half of overlap scheduling, mirroring vLLM 1:1:
+  `AsyncScheduler` (`src/vllm/v1/core/sched/async_scheduler.{h,cpp}`) output-
+  placeholder accounting over the base scheduler's now-placeholder-aware running
+  loop (budget formula `NumTokens + num_output_placeholders - num_computed`,
+  `max_tokens` early-continue guard, `next_decode_eligible_step` guard,
+  `is_prefill_chunk = num_computed < NumTokens + placeholders`) with the token-
+  append+check_stop loop extracted to a protected-virtual
+  `update_request_with_output` and `update_after_schedule` made protected-virtual
+  (all placeholder sites INERT while count 0 → the synchronous `Scheduler` path is
+  byte-identical); `EngineCore::step_with_batch_queue` depth-2 (`core.py:519-632`,
+  `src/vllm/v1/engine/core.cpp`) + a `BatchQueueItem` deque on `EngineCore` +
+  `EngineCoreProc` ctor step_fn selection (mcb>1 → step_with_batch_queue, mcb<1
+  throws) + `has_work()` batch-queue term; `SchedulerConfig::async_scheduling`
+  tri-state + `ResolveAsyncScheduling` default-ON-when-compatible (pooling /
+  incompatible-spec-decode / `runner_supports_async=false` → OFF, mirroring
+  `vllm/config/vllm.py:990-1038`) + `MaxConcurrentBatches` (`:490-501`) +
+  `SchedulerOutput::pending_structured_output_tokens` + Request async counters
+  (`request.h`); and the `VT_ASYNC_SCHED` process rollback env
+  (`AsyncSchedulingEnabled`). TEST-FIRST: `tests/vllm/v1/test_async_scheduler.cpp`
+  ports the 6 upstream `test_async_scheduler.py` cases (stop_by_max_tokens×4,
+  abort, preempt, prefix-caching dedup, prefix-caching multi-turn, structured-
+  output-fsm-abort) — 6 cases / 54 asserts GREEN, verified RED against the base
+  `Scheduler` (2/6 fail, `8==9` output-count); depth-2 async overlap cycle end to
+  end through `EngineCoreProc`/`InprocClient` (`test_engine_core_proc.cpp`); config
+  resolution + `VT_ASYNC_SCHED` + `MaxConcurrentBatches` (`test_scheduler_config.cpp`).
+  GATES (CPU, no GPU): clean full CPU `-Werror` rebuild 0 warnings; full CPU
+  **ctest 108/108**; tools suite green; record + doc-checkpoint checkers green.
+  Token-exactness holds by construction on the eager-executor CPU path (each
+  batch's tokens materialize before the next is scheduled; placeholder math
+  reconciles one step later). The engine-fatal channel (`core_client.cpp`
+  busy-loop guard, 4a450f9) still wraps `step_fn` unchanged — the depth-2 test
+  drove the `injected forward failure` ENGINE_CORE_DEAD path green.
+  **PRODUCTION WIRING UNCHANGED this commit** (`AsyncLLM` still constructs
+  mcb=1; the production `GPUModelRunner` is not placeholder-aware): our
+  `prepare_inputs` is host-driven (`token_id(r,pos)` reads host `token_ids_cpu`),
+  so engaging async on the real runner needs the device-input leaf. Hence
+  `runner_supports_async` resolves FALSE (a faithful mirror of vLLM's compat
+  fallback), the default stays synchronous, and **no GPU behavior changes** —
+  both model gates on this SHA are byte-identical to main.
+  REMAINING (DGX-gated, NEXT leaf, unclaimed): the runner-side integration —
+  placeholder-aware device-input `combine_sampled_and_draft_tokens`
+  (`input_batch.py:304-406,457-543`) reading GPU-resident `last_sampled_tokens`,
+  the non-blocking sampled-token-ID D2H on a copy stream + event
+  (`async_utils.py:12-70`), and the `vt::Backend` event/pinned-host primitives —
+  the piece that actually captures the measured ~3.25 ms/step GPU-idle.
+  **INTENDED DGX VALIDATION once the runner leaf lands** (orchestrator, from the
+  pushed SHA, one `flock /tmp/gpu` per series): (1) SAFETY on THIS SHA — both
+  model gates in the default (async-off) arm: `flock /tmp/gpu -c 'ctest -R
+  qwen36_paged_engine'` + `qwen27_paged_engine` = 16/16 + 235/235, byte-identical
+  to main (production unchanged). (2) After the runner leaf: both model gates in
+  BOTH rollback arms — default (`VT_ASYNC_SCHED` unset → resolved-ON) and
+  `VT_ASYNC_SCHED=0` (forced sync) — must each be 235/235 / 16/16 token-exact.
+  (3) interleaved c16 A/B W3-on vs W3-off (same binary, one lock) expecting
+  ~+3 ms/step ≈ +15 tok/s on throughput axes and ≤ on TPOT, with an explicit
+  TTFT-regression WATCH (the prior W1/2/4 control had a TTFT regression;
+  `3812d8`'s TTFT 0.862159× ON/OFF is the caution). The c2 speed budget is frozen
+  neutral by `3812d8` (total 1.002153×, no GPU-time reduction), so the honest
+  gate is "no regression + mirror behavior", the measured delta recorded either
+  way (spec D6). `benchmark_binding=false`, no speed credit, binding stays 49/124.

@@ -42,6 +42,7 @@
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/output.h"
+#include "vllm/v1/core/sched/async_scheduler.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/engine/core_client.h"
@@ -451,16 +452,70 @@ TEST_CASE("engine_core_client in-proc: fatal error surfaces as EngineDeadError")
 }
 
 // ---------------------------------------------------------------------------
-// step_fn selection (core.py:196-223): max_concurrent_batches > 1 requires
-// step_with_batch_queue, which is deferred to ENG-ASYNC-SCHED (spec W3) — the
-// configuration is rejected rather than silently running unbatched.
+// step_fn selection (core.py:196-223): max_concurrent_batches > 1 now selects
+// step_with_batch_queue (ENG-ASYNC-SCHED, spec W3) — depth-2 overlap. A depth
+// < 1 is rejected; depth 2 is accepted and constructs cleanly.
 // ---------------------------------------------------------------------------
-TEST_CASE("EngineCoreProc: max_concurrent_batches > 1 rejected until step_with_batch_queue lands") {
+TEST_CASE("EngineCoreProc: max_concurrent_batches selection (>=1 accepted, <1 rejected)") {
   auto scheduler = CreateScheduler();
   RunnerStub runner;
   Executor executor(runner);
 
+  // Depth 2 (async scheduling) is now supported: step_with_batch_queue.
+  CHECK_NOTHROW(EngineCoreProc(*scheduler, executor, nullptr,
+                               /*max_concurrent_batches=*/2));
+  // Depth < 1 is invalid.
   CHECK_THROWS_AS(EngineCoreProc(*scheduler, executor, nullptr,
-                                 /*max_concurrent_batches=*/2),
+                                 /*max_concurrent_batches=*/0),
                   std::invalid_argument);
+}
+
+// ---------------------------------------------------------------------------
+// Depth-2 overlap cycle (core.py:519-632, ENG-ASYNC-SCHED W3): the AsyncScheduler
+// + step_with_batch_queue busy loop drains N concurrent requests to completion.
+// Each request must still produce exactly MAX_TOKENS outputs (the placeholder
+// accounting keeps the depth-2 schedule token-exact vs the synchronous path).
+// ---------------------------------------------------------------------------
+TEST_CASE("EngineCoreProc: depth-2 async overlap cycle finishes every request exactly") {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = 16;
+  cfg.max_num_batched_tokens = 8192;
+  cfg.enable_chunked_prefill = true;
+  cfg.max_model_len = 8192;
+  cfg.watermark = 0.0;
+  cfg.async_scheduling = true;
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = 10000;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(16, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+  vllm::v1::AsyncScheduler scheduler(cfg, kv_cfg, /*block_size=*/16,
+                                     /*enable_caching=*/true);
+
+  RunnerStub runner;
+  Executor executor(runner);
+  InprocClient client(scheduler, executor, /*structured_output_manager=*/nullptr,
+                      /*max_concurrent_batches=*/2);
+
+  constexpr int kMaxTokens = 20;
+  constexpr int kNumRequests = 10;
+  std::set<std::string> ids;
+  for (int i = 0; i < kNumRequests; ++i) {
+    std::string id = std::to_string(i);
+    client.add_request_async(MakeRequest(id, kMaxTokens));
+    ids.insert(id);
+  }
+
+  std::map<std::string, std::vector<vllm::v1::EngineCoreOutput>> outputs;
+  LoopUntilDone(client, ids, outputs);
+
+  for (const std::string& id : ids) {
+    int total_tokens = 0;
+    for (const auto& out : outputs[id]) {
+      total_tokens += static_cast<int>(out.new_token_ids.size());
+    }
+    CHECK(total_tokens == kMaxTokens);
+  }
+  client.shutdown();
 }

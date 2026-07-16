@@ -35,9 +35,14 @@
 //     ownership via unique_ptr; the upstream request_id-type / pooling-task /
 //     kv_transfer validation + abort_immediately are deferred/inapplicable.
 //
+// step_with_batch_queue + batch_queue (core.py:519-632) are IMPLEMENTED for
+// ENG-ASYNC-SCHED (spec async-serving.md W3): the depth-2 overlap step selected
+// when max_concurrent_batches > 1 (async scheduling). The synchronous step()
+// path is unchanged.
+//
 // DEFERRED (marked 1:1 stubs; matches upstream structure so re-adding is
-// mechanical): step_with_batch_queue + batch_queue (pipeline parallelism),
-// grammar_output / structured_output_manager (M3), async_scheduling,
+// mechanical): PP-general batch queue depth > 2 (ENG-BATCH-QUEUE),
+// grammar_output / structured_output_manager (M3),
 // DP / EngineCoreProc / ZMQ, mm_receiver_cache (multimodal),
 // post_step / take_draft_token_ids (spec-decode), the utility handlers,
 // _process_aborts_queue / aborts_queue, log_stats / stats / iteration details,
@@ -45,20 +50,34 @@
 // __init__ config/plugin/GC-freeze setup (T0 wires refs directly).
 #pragma once
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "vllm/v1/core/sched/output.h"     // SchedulerOutput
 #include "vllm/v1/core/sched/scheduler.h"  // Scheduler
-#include "vllm/v1/engine/types.h"          // EngineCoreOutputs
+#include "vllm/v1/engine/types.h"          // EngineCoreOutputs, ModelRunnerOutput
 #include "vllm/v1/executor/executor.h"     // Executor
 #include "vllm/v1/request.h"               // Request
 
 namespace vllm::v1 {
 
 class StructuredOutputManager;  // vllm/v1/structured_output/manager.h
+
+// A scheduled-and-executed batch waiting in the batch queue (core.py:197-198
+// deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]]). Our
+// T0 executor resolves execute_model / sample_tokens EAGERLY (synchronous
+// single-process), so the "future" is the already-computed ModelRunnerOutput
+// carried alongside its SchedulerOutput; the separate exec_future is unnecessary
+// (a failed eager forward throws directly through the engine-fatal guard rather
+// than surfacing as a None result). See EngineCore::step_with_batch_queue.
+struct BatchQueueItem {
+  ModelRunnerOutput model_output;
+  SchedulerOutput scheduler_output;
+};
 
 // The inner engine loop (T0 subset). Holds non-owning references to the
 // Scheduler (M1.4) and the Executor; both outlive the EngineCore.
@@ -91,6 +110,26 @@ class EngineCore {
   // (total_num_scheduled_tokens > 0). See the file header for the full order.
   std::pair<std::map<int, EngineCoreOutputs>, bool> step();
 
+  // step_with_batch_queue (core.py:519-632): the depth-N overlap step selected
+  // when max_concurrent_batches > 1 (async scheduling → depth 2). Schedules and
+  // executes a NEW batch (if the queue is not full and there is work) BEFORE
+  // consuming the OLDEST queued batch's output, so step N+1 is scheduled while
+  // step N's output is processed. Returns ({}, model_executed) without blocking
+  // while it is still filling the queue; once the queue is full (or no more
+  // requests) it pops the oldest batch, runs update_from_output, and returns its
+  // per-client outputs. Token-exactness: our executor resolves eagerly, so the
+  // sampled tokens are materialized before the next batch is scheduled — the
+  // AsyncScheduler placeholder accounting keeps the schedule consistent and
+  // update_from_output reconciles one step later, exactly as upstream. The
+  // grammar-deferral branch (core.py:559-570,609-630) is ported for structured
+  // requests whose bitmask must wait on the prior step's tokens.
+  std::pair<std::map<int, EngineCoreOutputs>, bool> step_with_batch_queue();
+
+  // has_batch_queue_work (core.py:1247-1253 `bool(batch_queue)`): whether the
+  // batch queue still holds an un-consumed batch. The busy loop must keep
+  // stepping to drain it even after the scheduler has no more requests.
+  bool has_batch_queue_work() const { return !batch_queue_.empty(); }
+
  protected:
   // Protected (not private) because EngineCoreProc subclasses EngineCore
   // exactly as upstream (core.py:896 `class EngineCoreProc(EngineCore)`) and
@@ -100,6 +139,14 @@ class EngineCore {
   // The engine's StructuredOutputManager (null when structured output is not
   // wired). Non-owning; must outlive the EngineCore. See the ctor note.
   StructuredOutputManager* structured_output_manager_ = nullptr;
+
+  // Batch queue (core.py:196-202). batch_queue_size_ == max_concurrent_batches
+  // (1 = synchronous step(); 2 = depth-2 overlap under async scheduling). The
+  // deque holds at most batch_queue_size_ scheduled-and-executed batches;
+  // step_with_batch_queue appends to the FRONT and pops the BACK (oldest). Set
+  // by EngineCoreProc's ctor. Empty and unused on the synchronous step() path.
+  int batch_queue_size_ = 1;
+  std::deque<BatchQueueItem> batch_queue_;
 };
 
 }  // namespace vllm::v1

@@ -140,9 +140,29 @@ SchedulerOutput Scheduler::schedule() {
   while (req_index < static_cast<int>(running.size()) && token_budget > 0) {
     Request* request = running[req_index];
 
-    // num_tokens_with_spec == num_tokens at T0 (no spec tokens);
-    // num_output_placeholders == 0 (async scheduling deferred).
-    int num_new_tokens = request->NumTokens() - request->num_computed_tokens;
+    // Async scheduling (scheduler.py:445-459): avoid scheduling an extra step
+    // once we are sure the previous step reached max_tokens. `+2` is
+    // (num_computed + 1) - (num_output_placeholders - 1) — placeholders are in
+    // the computed count, so we subtract (placeholders - 1) to drop draft
+    // tokens. INERT while num_output_placeholders == 0 (synchronous Scheduler).
+    if (request->num_output_placeholders > 0 &&
+        request->num_computed_tokens + 2 - request->num_output_placeholders >=
+            request->num_prompt_tokens + request->MaxTokens()) {
+      req_index += 1;
+      continue;
+    }
+    // V2+PP+async decode cadence (scheduler.py:461-465): enforce pp_size steps
+    // between same-req decodes. INERT while next_decode_eligible_step == 0.
+    if (current_step_ < request->next_decode_eligible_step) {
+      req_index += 1;
+      continue;
+    }
+
+    // num_tokens_with_spec == num_tokens at T0 (no spec tokens). Under async
+    // scheduling num_output_placeholders reserves the in-flight sampled token(s)
+    // (0 for the synchronous Scheduler, so this is unchanged there).
+    int num_new_tokens = request->NumTokens() + request->num_output_placeholders -
+                         request->num_computed_tokens;
     if (0 < long_prefill_token_threshold_ &&
         long_prefill_token_threshold_ < num_new_tokens) {
       num_new_tokens = long_prefill_token_threshold_;
@@ -448,17 +468,15 @@ EngineCoreOutputs Scheduler::update_from_output(
     bool stopped = false;
     const RequestStatus status_before_stop = request->status;
 
-    // _update_request_with_output: append each generated token, run check_stop
-    // after each, and trim any tokens generated past the stop.
+    // _update_request_with_output (scheduler.py:1627-1630): append + check_stop +
+    // trim. Called only when the runner produced tokens (upstream `if
+    // new_token_ids:`). The virtual hook lets AsyncScheduler wrap it (stale-frame
+    // discard + placeholder drain + block caching).
     if (!new_token_ids.empty()) {
-      for (std::size_t num_new = 1; num_new <= new_token_ids.size(); ++num_new) {
-        request->AppendOutputToken(new_token_ids[num_new - 1]);
-        stopped = check_stop(*request, max_model_len);
-        if (stopped) {
-          new_token_ids.resize(num_new);  // del new_token_ids[num_new:]
-          break;
-        }
-      }
+      auto result =
+          update_request_with_output(*request, std::move(new_token_ids));
+      new_token_ids = std::move(result.first);
+      stopped = result.second;
     }
     // DEFERRED: pooling stop.
 
@@ -584,6 +602,22 @@ CachedRequestData Scheduler::make_cached_request_data(
   return data;
 }
 
+std::pair<std::vector<int32_t>, bool> Scheduler::update_request_with_output(
+    Request& request, std::vector<int32_t> new_token_ids) {
+  // scheduler.py:1886-1902: append each generated token, run check_stop after
+  // each, and trim any tokens generated past the stop.
+  bool stopped = false;
+  for (std::size_t num_new = 1; num_new <= new_token_ids.size(); ++num_new) {
+    request.AppendOutputToken(new_token_ids[num_new - 1]);
+    stopped = check_stop(request, max_model_len);
+    if (stopped) {
+      new_token_ids.resize(num_new);  // del new_token_ids[num_new:]
+      break;
+    }
+  }
+  return {std::move(new_token_ids), stopped};
+}
+
 void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   // Advance num_computed_tokens AFTER building the output so a chunked prefill
   // resumes on the next step; refresh is_prefill_chunk.
@@ -591,9 +625,12 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
        scheduler_output.num_scheduled_tokens) {
     Request* request = requests.at(req_id).get();
     request->num_computed_tokens += num_scheduled_token;
-    // num_output_placeholders == 0 at T0.
+    // Under async scheduling num_output_placeholders extends the target token
+    // count (the in-flight sampled token(s) not yet appended); 0 for the
+    // synchronous Scheduler, so this is unchanged there.
     request->is_prefill_chunk =
-        request->num_computed_tokens < request->NumTokens();
+        request->num_computed_tokens <
+        request->NumTokens() + request->num_output_placeholders;
     // scheduler.py:1186: a structured request that is past its prefill chunk
     // needs a grammar bitmask this step.
     scheduler_output.has_structured_output_requests |=

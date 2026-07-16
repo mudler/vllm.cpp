@@ -20,27 +20,30 @@ EngineCoreProc::EngineCoreProc(Scheduler& scheduler, Executor& executor,
                                int max_concurrent_batches, int shutdown_timeout_s)
     : EngineCore(scheduler, executor, structured_output_manager),
       shutdown_timeout_s_(shutdown_timeout_s) {
-  // core.py:196-223: batch_queue_size = max_concurrent_batches; the batch
-  // queue is allocated only when > 1, which flips step_fn to
-  // step_with_batch_queue. That step is DEFERRED to ENG-ASYNC-SCHED (spec W3),
-  // so reject the configuration instead of silently running without overlap.
-  if (max_concurrent_batches > 1) {
+  // core.py:196-223: batch_queue_size = max_concurrent_batches; the batch queue
+  // is enabled only when > 1, which flips step_fn to step_with_batch_queue.
+  // vllm/config/vllm.py:490-501 returns 2 under async scheduling on a single GPU
+  // (pp_size + 1). ENG-ASYNC-SCHED (spec W3) implements step_with_batch_queue,
+  // so > 1 is now accepted (was rejected at W1). Depth must be >= 1.
+  if (max_concurrent_batches < 1) {
     throw std::invalid_argument(
-        "EngineCoreProc: max_concurrent_batches > 1 needs "
-        "step_with_batch_queue (core.py:519), deferred to ENG-ASYNC-SCHED");
+        "EngineCoreProc: max_concurrent_batches must be >= 1");
   }
   batch_queue_size_ = max_concurrent_batches;
-  // core.py:221-223: step_fn = step (batch_queue is None at W1).
-  step_fn_ = &EngineCore::step;
+  // core.py:221-223: step_fn = step if batch_queue is None else
+  // step_with_batch_queue.
+  step_fn_ = (batch_queue_size_ > 1) ? &EngineCore::step_with_batch_queue
+                                     : &EngineCore::step;
 }
 
 bool EngineCoreProc::has_work() const {
   // core.py:1247-1253: engines_running (DP, deferred) or
-  // scheduler.has_requests() or bool(batch_queue) (deferred). Our Scheduler
-  // does not port interface.py has_requests(); inline its default exactly as
-  // EngineCore::step does (core.h DEVIATIONS).
+  // scheduler.has_requests() or bool(batch_queue). Our Scheduler does not port
+  // interface.py has_requests(); inline its default exactly as EngineCore::step
+  // does (core.h DEVIATIONS). The batch-queue term keeps the loop stepping to
+  // drain queued batches after the scheduler runs dry (ENG-ASYNC-SCHED W3).
   return scheduler_.get_num_unfinished_requests() > 0 ||
-         scheduler_.has_finished_requests();
+         scheduler_.has_finished_requests() || has_batch_queue_work();
 }
 
 bool EngineCoreProc::is_running() const {

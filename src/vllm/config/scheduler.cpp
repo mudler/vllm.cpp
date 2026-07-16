@@ -3,10 +3,19 @@
 // deviation notes.
 #include "vllm/config/scheduler.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace vllm {
+
+bool AsyncSchedulingEnabled(bool resolved) {
+  const char* e = std::getenv("VT_ASYNC_SCHED");
+  if (e == nullptr) {
+    return resolved;  // no override: use the config resolution.
+  }
+  return e[0] != '0';  // "0" => force off; anything else => force on.
+}
 
 const char* SchedulerPolicyToString(SchedulerPolicy policy) {
   switch (policy) {

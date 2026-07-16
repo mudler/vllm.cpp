@@ -32,9 +32,12 @@
 //     and posting the WAKEUP sentinel — the in-proc analog of the SIGTERM
 //     handler + wakeup_engine (core.py:1204-1222).
 //
-// DEFERRED (marked 1:1 so re-adding is mechanical): step_with_batch_queue +
-// batch_queue (ENG-ASYNC-SCHED, spec W3 — max_concurrent_batches > 1 is
-// rejected in the ctor), UTILITY calls + _invoke_utility_method (:1434-1452),
+// step_with_batch_queue + batch_queue are IMPLEMENTED (ENG-ASYNC-SCHED, spec W3):
+// max_concurrent_batches > 1 selects step_with_batch_queue (depth-2 overlap under
+// async scheduling); the loop's has_work() includes the batch-queue term.
+//
+// DEFERRED (marked 1:1 so re-adding is mechanical): PP-general batch queue
+// (ENG-BATCH-QUEUE, depth > 2), UTILITY calls + _invoke_utility_method (:1434-1452),
 // START_DP_WAVE / DP waves / engines_running, aborts_queue +
 // _process_aborts_queue (no in-flight-abort window in the sync step yet),
 // _notify_idle_state_callbacks (:1320-1322, pause/sleep surface), post_step
@@ -154,8 +157,8 @@ class EngineCoreProc : public EngineCore {
   //   batch_queue_size = max_concurrent_batches (vllm/config/vllm.py:490-501:
   //   pp_size, or pp_size + 1 under async scheduling on MRV2);
   //   step_fn = step if batch_queue is None else step_with_batch_queue.
-  // step_with_batch_queue is DEFERRED to ENG-ASYNC-SCHED (spec W3), so
-  // max_concurrent_batches > 1 throws std::invalid_argument here.
+  // max_concurrent_batches > 1 selects step_with_batch_queue (ENG-ASYNC-SCHED,
+  // spec W3); < 1 throws std::invalid_argument.
   // shutdown_timeout_s mirrors VllmConfig.shutdown_timeout
   // (vllm/config/vllm.py:377, default 0): 0 => "abort" shutdown mode,
   // > 0 => "drain" (core.py:1330-1358).
@@ -218,13 +221,12 @@ class EngineCoreProc : public EngineCore {
   void send_finish_outputs(const std::vector<std::string>& request_ids,
                            FinishReason reason);
 
-  // step_fn (core.py:221-223): step vs step_with_batch_queue (deferred, W3).
+  // step_fn (core.py:221-223): step vs step_with_batch_queue. Selected in the
+  // ctor from max_concurrent_batches (> 1 => step_with_batch_queue, W3). The
+  // batch_queue_size_ + batch_queue_ members live on EngineCore (core.h).
   using StepFn = std::pair<std::map<int, EngineCoreOutputs>, bool> (
       EngineCore::*)();
   StepFn step_fn_ = &EngineCore::step;
-
-  // core.py:196 batch_queue_size / :199 batch_queue (always none at W1).
-  int batch_queue_size_ = 1;
 
   // core.py:958 self.process_input_queue_block = True (the non-blocking
   // variant is a DP-wave path, DPEngineCoreProc core.py:1940).

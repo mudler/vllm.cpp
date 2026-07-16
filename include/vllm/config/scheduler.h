@@ -67,6 +67,17 @@ const char* SchedulerPolicyToString(SchedulerPolicy policy);
 // throw std::invalid_argument("Unknown scheduling policy: <value>").
 SchedulerPolicy SchedulerPolicyFromString(const std::string& value);
 
+// AsyncSchedulingEnabled: apply the house rollback convention VT_ASYNC_SCHED on
+// top of the config resolution (SchedulerConfig::ResolveAsyncScheduling). Read at
+// engine-construction time (NOT per step — engine wiring calls it once):
+//   VT_ASYNC_SCHED unset   -> `resolved` (the config resolution) is used as-is;
+//   VT_ASYNC_SCHED=0        -> force OFF (restore the synchronous depth-1 path in
+//                              the same binary — the rollback arm of the DGX A/B);
+//   VT_ASYNC_SCHED=<other>  -> force ON.
+// Mirrors vLLM defaulting async_scheduling ON when compatible plus its CLI/env
+// override (--no-async-scheduling / async_scheduling=False).
+bool AsyncSchedulingEnabled(bool resolved);
+
 struct SchedulerConfig {
   // ClassVar defaults from upstream.
   static constexpr int kDefaultMaxNumBatchedTokens = 2048;
@@ -94,6 +105,16 @@ struct SchedulerConfig {
 
   // The scheduling policy (fcfs default).
   SchedulerPolicy policy = SchedulerPolicy::kFCFS;
+
+  // async_scheduling (scheduler.py:158-162): tri-state "asynchronous scheduling"
+  // toggle. std::nullopt mirrors upstream's `async_scheduling: bool | None = None`
+  // — "resolve to the default when compatible". vLLM's VllmConfig.__post_init__
+  // resolves None -> True on a single-GPU MRV2 setup (vllm/config/vllm.py:990-1038,
+  // the "Asynchronous scheduling is enabled" log), then disables it again for the
+  // incompatible cases (pooling, non-EAGLE/MTP spec decode, unsupported runners).
+  // ResolveAsyncScheduling() below performs that resolution for the T0 subset.
+  // Set false to force it off, true to force it on.
+  std::optional<bool> async_scheduling = std::nullopt;
 
   // NOT deferred — read by the T0 schedule() core (M1.4 Task 3):
   //   watermark → passed to the KVCacheManager ctor (scheduler.py:275).
@@ -124,6 +145,48 @@ struct SchedulerConfig {
   // scheduler.py: max_num_scheduled_tokens if set else max_num_batched_tokens.
   int ResolvedMaxNumScheduledTokens() const {
     return max_num_scheduled_tokens.value_or(max_num_batched_tokens);
+  }
+
+  // ResolveAsyncScheduling: mirror vLLM's default-ON-when-compatible resolution
+  // (vllm/config/vllm.py:990-1038). Returns the effective async_scheduling for
+  // this config given the compatibility inputs relevant to our T0 subset:
+  //   * async_scheduling explicitly false  -> off (user forced it off).
+  //   * async_scheduling explicitly true   -> on  (user forced it on; upstream
+  //       still errors on hard-incompatible combos, deferred here).
+  //   * async_scheduling nullopt (default) -> ON when compatible, else off.
+  // Compatibility gates ported for T0: pooling models and spec-decode methods
+  // other than EAGLE/MTP disable async scheduling (vllm/config/vllm.py:959-1021).
+  // `runner_supports_async` gates the whole thing on the MRV2 runner advertising
+  // the placeholder-aware device-input path (our GPUModelRunner does not yet, so
+  // the production engine keeps the synchronous Scheduler until that DGX-gated
+  // leaf lands; the CPU test harness passes true). VT_ASYNC_SCHED=0 in the
+  // environment force-disables it regardless (house rollback convention), read
+  // by the engine wiring, not here.
+  bool ResolveAsyncScheduling(bool runner_supports_async = true,
+                              bool is_pooling_model = false,
+                              bool spec_decode_incompatible = false) const {
+    if (async_scheduling.has_value() && !async_scheduling.value()) {
+      return false;  // explicitly forced off.
+    }
+    const bool forced_on = async_scheduling.value_or(false);
+    if (!runner_supports_async || is_pooling_model || spec_decode_incompatible) {
+      // Incompatible: upstream logs "Asynchronous scheduling is not supported ...
+      // disabling" and turns it off even when the default would have enabled it.
+      // (A user-forced `true` on a hard-incompatible combo raises upstream; that
+      // hard-error path is deferred — we conservatively disable.)
+      (void)forced_on;
+      return false;
+    }
+    // Default (nullopt) or forced-on and compatible -> ON.
+    return true;
+  }
+
+  // max_concurrent_batches (vllm/config/vllm.py:490-501): the engine's batch
+  // queue depth. MRV2 single-GPU returns 2 under async scheduling (pp_size + 1
+  // with pp_size == 1), which enables the depth-2 batch queue + flips step_fn to
+  // step_with_batch_queue (core.py:196-223). 1 otherwise (no overlap).
+  int MaxConcurrentBatches(bool async_scheduling_effective) const {
+    return async_scheduling_effective ? 2 : 1;
   }
 };
 

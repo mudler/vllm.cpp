@@ -61,7 +61,9 @@ OpenAI-compatible server.
 > kernel is now vendored as an AOT cubin (`gdn_decode_h48`, 27B-only) behind
 > `VT_GDN_PACKED_DECODE_TRITON` (default OFF; the hand kernel stays the default),
 > **235/235 token-exact with the Triton path ON** + memcheck-clean; c16 A/B
-> **+5.48 tok/s (+0.67%), -1.26 ms TPOT, 3/3 pairs**. See [Benchmarks](docs/BENCHMARKS.md).
+> **+5.48 tok/s (+0.67%), -1.26 ms TPOT, 3/3 pairs**. A follow-up build repair
+> guards the Triton launch-counter helper so the default Triton-less CUDA build
+> stays `-Werror`-clean. See [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status
 

@@ -105,7 +105,12 @@ AOT-vs-legacy-vs-CPU op test 28/28, full `test_ops_gdn` 49/49, oracle boundary
 with the Triton decode path ON**, compute-sanitizer 0 errors/0 leaks, default-off
 gate 235/235. **c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved
 3 pairs + w0 cold discard, one flock, root `ab-decode-triton`): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded.**
-ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed. CPU gates GREEN (`test_ops_gdn` 45/45, clean -Werror). Repro
+ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed. CPU gates GREEN (`test_ops_gdn` 45/45, clean -Werror).
+Build repair (2026-07-16): the vendored-cubin landing left the launch-counter
+helper defined unconditionally while its only caller is Triton-gated, breaking
+the default Triton-less CUDA build under `-Werror` (`-Wunused-function`); the
+helper is now guarded behind `VLLM_CPP_TRITON` (no runtime change in any
+configuration; found by the block-table cleanup agent's DGX gate build). Repro
 commands in
 [the packed-decode spec](../.agents/specs/gdn-packed-decode.md#decode-recurrence-perf-lever--measured-codegen-bound-vendored-triton-cubin-2026-07-16).
 

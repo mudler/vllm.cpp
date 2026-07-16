@@ -105,10 +105,17 @@ void RecordGdnPackedDecodeLaunch() {
     g_gdn_packed_launches.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Only the VLLM_CPP_TRITON dispatch path (TryTritonPackedDecode success)
+// records vendored-cubin launches; the counter atomic above stays
+// unconditional so GdnPackedDecodeDebugStats reads 0 in non-Triton builds.
+// The guard keeps the default (Triton-less) -Werror build free of
+// -Wunused-function on this anonymous-namespace helper.
+#ifdef VLLM_CPP_TRITON
 void RecordGdnPackedDecodeTritonLaunch() {
   if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))
     g_gdn_packed_triton_launches.fetch_add(1, std::memory_order_relaxed);
 }
+#endif  // VLLM_CPP_TRITON
 
 void RecordGdnPackedDecodeRegTileLaunch() {
   if (g_gdn_packed_debug_enabled.load(std::memory_order_relaxed))

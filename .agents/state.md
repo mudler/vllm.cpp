@@ -12231,3 +12231,21 @@ proven byte-identical by the parallel CPU discriminator);
 `benchmark_binding=false`, no speed credit, binding stays 49/124. Deviations
 (binding-wall anchor, max-packed span selection, clean-session vLLM re-run
 after a GPU-memory/contention kill) recorded in the spec.
+- 2026-07-16 PROOF-QUEUE HANDOFF (`CLAIM-EW-NORM-ACT-1`, post-`5a53fb5`): the full
+  DGX proof series is QUEUED SELF-RECORDING on dgx as
+  `~/work/vllm.cpp-ewnorm-act-src/gate3.sh` (source @ `5a53fb5`; build-cuda
+  reconfigured `-DVLLM_CPP_TRITON=ON`, rebuilt green) behind the W3-tput A/B
+  marathon (4h+ holder) + a blocktable gate on the `/tmp/gpu` flock. Unattended
+  it runs: 27B+35B paged-forward token gates flag off/on → c16 A/B (fast vs
+  legacy, w0 + 3 interleaved pairs, binding c16-r1 corpus, 96 prompts, the
+  reg-tile/decode-triton harness verbatim incl. env -i + autotune pins) → c2 A/B
+  (c2-r1, 6 prompts) → per-leg summary. Outputs: `gate3.out` +
+  `proof-5a53fb5/ab-*.json` + server/client logs. Acceptance unchanged (ledger
+  row): flip `VT_RMSNORM_DECODE_FAST` default ON only if BOTH token gates hold
+  AND the A/B shows a TPOT win without a throughput loss; else record OFF-stays.
+- FOUND (belongs to `CLAIM-GDN-DECODE-TRITON`): commit `9dd7d3f` breaks the CUDA
+  build at the DEFAULT `VLLM_CPP_TRITON=OFF` — nvcc `-Werror` error #177-D in
+  `cuda_gdn.cu` (`RecordGdnPackedDecodeTritonLaunch` declared but never
+  referenced; its only call site is inside `#ifdef VLLM_CPP_TRITON` at
+  `cuda_gdn.cu:1417-1428`). Hit + worked around here with `-DVLLM_CPP_TRITON=ON`; since FIXED on main by
+  `038970f` (owner guarded the definition). Kept for the record only.

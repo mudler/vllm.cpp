@@ -11962,3 +11962,33 @@ in the same commit. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude 
   → W3 stays OFF. `benchmark_binding=false`, no speed credit, binding stays 49/124.
   Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
   [ClaudeCode]`.
+
+## 2026-07-16 — lost-lanes rescan COMPLETE (5/5 grounded): block-table host cluster, sampler per-step alloc, RMSNorm-efficiency reframe confirmed, c2–c8 attribution downgraded to "unattributed pending #10"
+
+- Re-ran the six lanes lost by the 07-14 rescan minus gdn (superseded by the
+  correct-state traces): attention, host-scheduler, kv-cache, sampling-logits,
+  strategy-challenge — all grounded this time (stub-validation harness; one
+  retry, strategy lane). Durable disposition:
+  `.agents/specs/rescan-lost-lanes-2026-07-16.md`.
+- Top mechanisms found (ours vs vLLM, file:line in the spec): (1) full-width
+  block-table re-materialized on host 4–5×/step ×2 KV groups (amplified by
+  max_model_len default 262144 ⇒ 8192 cols), GDN group copying 8192 cols to
+  read col 0, slot_mapping dead padding — vLLM mutates one persistent buffer
+  in place + on-GPU triton gather/slot kernels; (2) per-step
+  cudaMalloc/cudaFree in the sampler (+ cudaHostAlloc/FreeHost on the W3 async
+  path) vs vLLM's persistent pinned buffers; (3) RMSNorm per-launch efficiency
+  (batch-independent 129 launches/step ⇒ larger FRACTION of the c2 mean than
+  c16's) — confirms the 49983d8 reconciliation from the source side; (4)
+  decode graph capture set missing vLLM's 24 bucket (over-pads 17–31).
+- STRATEGY CORRECTION (SC1, high confidence): the c2–c8 "host-side" label
+  inherited from the 07-14 rescan rests on GPU-kernel measurements taken on
+  contamination-suspect pre-slot-fix binaries; correct-state c16 reverses the
+  sign (ours GPU-busy +4.65 ms). c2–c8 is UNATTRIBUTED until a correct-state
+  same-profiler full-step split runs (task #10, now dispatched at c2+c8).
+  Host-only levers are conditional on it; the RMSNorm lever is not (GPU-busy).
+- Dispatched: (a) RMSNorm same-profiler microbench → 1:1 port of vLLM's own
+  CUDA kernel; (b) block-table cluster + slot-pad + GDN col-0 +
+  SamplingMetadata gating + graph-bucket-24 mechanical mirrors; (c) #10 c2/c8
+  attribution; sampler-alloc handed to the W3-throughput owner. Stale lane
+  claims (missing reconcile spec; "nothing in flight on recurrence")
+  corrected in the spec. Read-only; binding stays 49/124.

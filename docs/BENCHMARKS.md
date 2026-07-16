@@ -217,7 +217,19 @@ cross-profiler-confounded (nsys node vs torch CUPTI; the 2026-07-14 rescan alrea
 called the +1.81 ms residual a cross-profiler artifact) — an isolated microbench
 shows ours' RMSNorm is 6-9 µs, not 15.5 µs, with only a non-bit-exact ≤1.5×
 headroom (~0.3-0.5 ms c16 ceiling), reassigned to `KERNEL-EW-NORM-ACT`, spike +
-in-situ-A/B-gated; (b) the **c8 p99 / c32 p90 ITL tail mechanism — ATTRIBUTED**
+in-situ-A/B-gated. The completed **lost-lanes rescan**
+([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
+angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
+gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of
+c16's — the lever is being pursued as a 1:1 port of vLLM's own CUDA kernel,
+microbench-first. The rescan also found the **block-table host cluster**
+(full-width host re-materialization 4–5×/step, 8192 cols from the
+max_model_len default; mechanical-mirror fix dispatched), sampler per-step
+cudaMalloc/cudaFree (handed to the W3-throughput owner), a missing 24 CUDA-graph
+bucket, and DOWNGRADED the c2–c8 "host-side" attribution to UNATTRIBUTED
+pending a correct-state same-profiler c2/c8 full-step split (the prior
+"ours-GPU-net-faster" pillar was measured on contamination-suspect pre-slot-fix
+binaries); (b) the **c8 p99 / c32 p90 ITL tail mechanism — ATTRIBUTED**
 (wave-boundary two-prefill stalls, see above; fix path = mirror vLLM's staggered
 admission regime, prime suspect its default-ON async scheduling = our W3). Diagnostic
 (`benchmark_binding=false`, no speed credit); binding stays 49/124.

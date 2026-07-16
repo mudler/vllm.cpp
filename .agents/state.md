@@ -12326,3 +12326,48 @@ credit; binding stays 49/124.
   scratch also removes per-step syncs from the PRODUCTION default path where
   steps are ~10× shorter (c2 ~2.4 ms/step gap) — worth folding into the c2–c8
   full-step re-attribution, not re-measurable at c16.
+
+## 2026-07-16 — `CLAIM-W3-ASYNC-DISC` W3 async TTFT-premium discriminator LAUNCHED (build @ `6ea7856` DONE, campaign queued on the `/tmp/gpu` flock; calibration REFUTES the "vLLM ~2005 ms" premise)
+
+Diagnostic sub-probe extending the async-serving campaign (spec
+[w3-async-ttft-discriminator-2026-07-16.md](specs/w3-async-ttft-discriminator-2026-07-16.md)).
+Own build @ `6ea7856` in `~/work/vllm.cpp-w3-discriminator/build` (isolated from
+other claims), configured `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_FLASH_ATTN=ON
+-DVLLM_CPP_TRITON=ON`; the configure log HARD-verified "CUTLASS found …
+enabling sm120a NVFP4 cutlass GEMM" AND "FlashAttention-2 sm_121a
+prefill/decode: ENABLED" before building (void-signature guard — the same
+missing-CUTLASS defect voided two prior A/Bs). Campaign self-recording to the
+immutable evidence root `~/work/vllm.cpp-w3-discriminator/6ea7856…`, QUEUED on
+one `flock /tmp/gpu` behind the running EW-NORM A/B.
+
+**Calibration (READ read-only from the binding evidence raw
+`~/work/vllm.cpp-online-gate/evidence/246a23c…/raw/27`) — the task's framing
+"vLLM async 2005 ms TTFT beats our sync 2027 ms" is a MIS-CITATION.** The actual
+binding per-rep numbers: at c16 vLLM async-ON mean TTFT is **2846/2861/2838 ms**
+(not 2005) while ours SYNC is **1980/2023/1968 ms** — so vLLM's async TTFT is
+~860 ms HIGHER than ours sync, not lower. On the binding gate's TTFT axis (ours
+≤ vLLM to PASS) ours already BEATS vLLM in both arms; the +705 ms W3-on premium
+is ours-INTERNAL (W3-on vs W3-off), NOT a loss vs vLLM. This reframes the puzzle:
+the premium is very likely inherent to async depth-2 overlap (Little's law), paid
+by vLLM too — the vLLM self-A/B (async ON vs OFF) tests this directly. Binding
+also shows the TTFT-vs-tail trade at every concurrency: ours (sync) LOWER mean
+TTFT but HIGHER ITL tails; vLLM (async) the reverse (c8 ours TTFT 1720 / p99_itl
+853 vs vLLM 2270 / 478; c32 ours 2740 / 707 vs vLLM 3945 / 560). Tail
+denominators for task-#2: c8 `p99_itl` vLLM 477.8 (ours 853.3, 0.560); c32
+`p90_itl` vLLM 560.2 (ours 706.8, 0.792).
+
+**Campaign (one flock, mandated-first ordering):** token gates 27B+35B ×
+{default, W3-on, W3-off}; then interleaved (w0 discard + 3 pairs) at binding
+client params (in1024/out128 greedy, POINTS prompts c8→24/c16→96/c32→192,
+warmups=concurrency, percentile-metrics ttft,tpot,itl,e2el @ 50/90/99,
+`--save-detailed` retaining per-request `itls[]`), same frozen binding vLLM
+corpus (c{C}-r1 across reps to isolate the arm delta, per ab.sh): (1) vLLM
+self-A/B c16 async ON vs OFF (`--no-async-scheduling`, arm confirmed per-server
+from the "Asynchronous scheduling is enabled/disabled." log,
+`vllm/config/vllm.py:1042`); (2) ours W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+(`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`) at c8 + c32 (pending tail confirmation);
+then extras (ours c16; vLLM c8 + c32) for the 4-arm spike-location table.
+`benchmark_binding=false`, NO speed credit, binding stays 49/124. RESULTS
+PENDING (campaign running) — the spec §Results, this state entry, the ledger
+row, README/BENCHMARKS get the four answers at completion.

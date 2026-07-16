@@ -202,7 +202,13 @@ default-OFF per `89b329e`'s +36 % TTFT finding); per MIRROR policy the fix IS
 async-on, no invented single-prefill cap. The empirical confirmation is a
 **c8+c32 W3-on/off ITL-tail A/B** folded into the pending W3 DGX proof (`VT_ASYNC_RUNNER=1`
 vs `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`, same binary, one flock, 3 reps),
-**PENDING** an uncontended GPU (the 2026-07-16 window had the lock held). The
+now **RUNNING** as the W3 async TTFT-premium discriminator (2026-07-16,
+`CLAIM-W3-ASYNC-DISC`, [spec](../.agents/specs/w3-async-ttft-discriminator-2026-07-16.md);
+adds a vLLM async-ON-vs-OFF self-A/B and c16). Calibration correction from the
+binding raw: vLLM's async c16 mean TTFT is **~2848 ms** (not the mis-cited
+~2005), HIGHER than ours sync **~1990 ms**, so ours already beats vLLM on the
+TTFT axis in both arms and the +705 ms W3-on premium is ours-internal, not a
+gate loss (full results pending). The
 decode body (tokens 16–111) is at parity with ZERO mid-sequence stalls;
 capping the per-event stall at one prefill was measured-sufficient to flip both
 axes to PASS (counterfactual ratios 0.87–0.96 / 0.93–1.11). The

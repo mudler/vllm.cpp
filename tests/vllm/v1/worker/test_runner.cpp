@@ -603,6 +603,80 @@ TEST_CASE("runner: single-request greedy decode over N steps (KV grows, feedback
   CHECK(outputs == 5);  // 1 prefill sample + 4 decodes
 }
 
+// ─── ENG-ASYNC-SCHED W3: async device-input path (combine) ───────────────────
+TEST_CASE("runner: async_input_combine decode is token-identical to the sync path") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+
+  // Run a prefill + N greedy decodes through a fresh runner with the async
+  // device-input path either off (host token_ids_cpu read) or on (combine splices
+  // the id from last_sampled_tokens). Greedy tokens must be bit-identical (G1).
+  auto run = [&](bool async_combine) {
+    GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
+                          kMaxModelLen, 64);
+    runner.set_async_input_combine(async_combine);
+    CHECK(runner.async_input_combine() == async_combine);
+    std::vector<int32_t> tokens;
+    SchedulerOutput s1 =
+        NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+    CHECK_FALSE(runner.execute_model(s1).has_value());
+    ModelRunnerOutput m1 = runner.sample_tokens(std::nullopt);
+    tokens.push_back(m1.sampled_token_ids[0][0]);
+    // sample_tokens records the last sampled id per req_state (post_update).
+    CHECK(runner.input_batch().last_sampled_tokens[0] == tokens.back());
+
+    int computed = P, outputs = 1;
+    for (int k = 0; k < 5; ++k) {
+      SchedulerOutput sd = DecodeStep("A", computed, outputs);
+      CHECK_FALSE(runner.execute_model(sd).has_value());
+      // Either path feeds the previous sampled token as this step's input.
+      CHECK(runner.last_step().input_token_ids ==
+            std::vector<int32_t>{tokens.back()});
+      ModelRunnerOutput md = runner.sample_tokens(std::nullopt);
+      tokens.push_back(md.sampled_token_ids[0][0]);
+      CHECK(runner.input_batch().last_sampled_tokens[0] == tokens.back());
+      computed += 1;
+      outputs += 1;
+    }
+    return tokens;
+  };
+
+  const std::vector<int32_t> sync = run(false);
+  const std::vector<int32_t> async_combine = run(true);
+  CHECK(async_combine == sync);  // token-for-token identical in both modes
+}
+
+TEST_CASE("runner: async device-input reads last_sampled over a stale host token") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
+                        kMaxModelLen, 64);
+  runner.set_async_input_combine(true);
+
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+  SchedulerOutput s1 =
+      NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+  CHECK_FALSE(runner.execute_model(s1).has_value());
+  ModelRunnerOutput m1 = runner.sample_tokens(std::nullopt);
+  const int32_t tok1 = m1.sampled_token_ids[0][0];
+  REQUIRE(runner.input_batch().last_sampled_tokens[0] == tok1);
+
+  // Corrupt the HOST token buffer at the next decode column (== the async
+  // D2H-skip: token_ids_cpu is stale because the sampled id never crossed back).
+  // combine must build the input id from the GPU-resident-analog last_sampled,
+  // ignoring the corrupted host value.
+  const int32_t kCorrupt = 12345;
+  runner.input_batch().token_ids_cpu[static_cast<size_t>(P)] = kCorrupt;
+
+  SchedulerOutput sd = DecodeStep("A", P, 1);
+  CHECK_FALSE(runner.execute_model(sd).has_value());
+  CHECK(runner.last_step().input_token_ids == std::vector<int32_t>{tok1});
+  CHECK(tok1 != kCorrupt);
+}
+
 // ─── 4. Two-request greedy batch step (per-request logits rows) ───────────────
 TEST_CASE("runner: 2-request greedy batch samples each from its own logits row") {
   const HfConfig c = MakeConfig();

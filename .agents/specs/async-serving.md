@@ -31,18 +31,39 @@ the CPU path (the eager executor materializes each batch's tokens before the
 next is scheduled; the placeholder math reconciles one step later, exactly as
 upstream).
 
-**Remaining W3 leaf (DGX-gated): the runner-side integration.** Our
-`prepare_inputs` is host-driven (`token_id(r,pos)` reads the host
-`token_ids_cpu`), so engaging async on the REAL `GPUModelRunner` needs the
-placeholder-aware device-input path (`combine_sampled_and_draft_tokens`,
-`input_batch.py:304-406,457-543`) + the non-blocking sampled-token-ID D2H on a
-copy stream + event (`async_utils.py:12-70`) + `vt::Backend` event/pinned-host
-primitives — the piece that actually captures the measured ~3.25 ms/step
-GPU-idle. Until it lands, `runner_supports_async` resolves FALSE for the
-production runner (a faithful mirror of vLLM's compat fallback), so the
-production default stays synchronous and both model gates are byte-identical to
-main; `VT_ASYNC_SCHED=1` is the bring-up opt-in once the runner path is
-DGX-validated. The joint spike's speed hypothesis is closed below.
+**W3 runner device-input half LANDED + CPU-gated (2026-07-16), `ACTIVE`.** The
+input half of the runner integration now lands: `combine_sampled_and_draft_tokens`
+(`src/vllm/v1/worker/gpu/prepare_inputs.cpp`, 1:1 with `input_batch.py:304-406`
+T0 non-spec subset) rebuilds each decode row's input token id from the
+GPU-resident-analog `InputBatch::last_sampled_tokens` (per-req_state, seeded on
+admission per `states.py:105-122`, threaded through condense/swap/add) instead of
+the host `token_ids_cpu` read `prepare_inputs` used — placeholder/prefill-aware
+(`seq_len <= prefill_len` rows keep the prompt), `idx_mapping` indirection for the
+abort/finish reorder, and run on the HOST side of input prep BEFORE the forward
+and OUTSIDE any CUDA-graph capture (capture-safe by construction; input prep
+always precedes the decode graph replay — checked both sides). It is device-neutral
+(the DGX leaf ports the loop to the cited Triton kernel over GPU-resident
+`input_ids`/`last_sampled_tokens`). Gated behind `VT_ASYNC_RUNNER` /
+`GPUModelRunner::set_async_input_combine`, **default OFF**. Tested RED→GREEN on
+CPU: `tests/vllm/v1/worker/test_combine_tokens.cpp` (7 cases — pure decode,
+reads-`last_sampled`-not-host, prefill/chunked-prefill-transition boundary, mixed
+batch, `idx_mapping` indirection, draft-only; RED verified by splicing the stale
+value → 5/7 fail), the `last_sampled_tokens`/`prefill_len` batch-lifecycle in
+`test_input_batch.cpp`, and a runner token-exactness async-ON≡sync case + a
+reads-`last_sampled`-over-a-corrupted-host case in `test_runner.cpp`; full CPU
+ctest 110/110, tools 164/164, clean `-Werror` rebuild.
+
+**Remaining W3 leaf (DGX-gated): the sampler-OUTPUT half + the enable flip.** The
+non-blocking sampled-token-ID D2H on a copy stream + event (`async_utils.py:12-70`)
++ the `vt::Backend` event/pinned-host primitives — the sampler-output half of the
+~3.25 ms/step GPU-idle capture — plus flipping `runner_supports_async` TRUE by
+default (so `ResolveAsyncScheduling` engages mcb=2 in production). These are the
+CUDA-only pieces that cannot be CPU-validated; they land with the DGX gate. Until
+then `runner_supports_async` resolves FALSE for the production runner (a faithful
+mirror of vLLM's compat fallback), so the production default stays synchronous and
+both model gates are byte-identical to main; `VT_ASYNC_SCHED=1` (scheduler) and
+`VT_ASYNC_RUNNER=1` (runner combine) are the bring-up opt-ins once the runner path
+is DGX-validated. The joint spike's speed hypothesis is closed below.
 
 W3 is an unmet mirror obligation whose speed hypothesis is now closed. vLLM
 resolves `async_scheduling=None` to **True** when compatible
@@ -152,7 +173,7 @@ Leaf W3 — `ENG-ASYNC-SCHED` (overlap scheduling, mirror default ON):
 | `vllm/v1/core/sched/async_scheduler.py:12-75` | new `src/vllm/v1/core/sched/async_scheduler.cpp` + header; make `Scheduler::update_after_schedule` and the per-request output update protected-virtual in `include/vllm/v1/core/sched/scheduler.h:201-205` (extract `_update_request_with_output` analog from `update_from_output`) | Placeholder counting (`num_output_placeholders` on `vllm/v1/request.py:141` → our `include/vllm/v1/request.h`), `async_tokens_to_discard` stale-frame drop, cache-blocks-minus-placeholders |
 | `vllm/v1/engine/core.py:519-611` (`step_with_batch_queue`) | extend `src/vllm/v1/engine/core.cpp` (`EngineCore::step_with_batch_queue`, depth = `max_concurrent_batches` = 2) | Grammar deferral branch (`core.py:559-570`) ported as-is; futures become a small result-slot struct (no `concurrent.futures`) |
 | `vllm/v1/worker/gpu/async_utils.py:12-70`; `vllm/v1/outputs.py:298-307` | extend `vt::Backend` with event record/wait/synchronize plus pinned-host allocation; add `AsyncOutput` in `src/vllm/v1/worker/gpu/runner.cpp` with sampled-id D2H on a second queue and `get_output()` waiting only its event | Queue creation already exists, but no public event or pinned-host primitive exists today. CUDA implements them; CPU degenerates to synchronous copy. The copy queue waits the main queue/event and stays outside graph capture |
-| `vllm/v1/worker/gpu/input_batch.py:304-406,457-543`; `model_runner.py:613,954,1423-1445` | extend `src/vllm/v1/worker/gpu/input_batch.cpp` + `runner.cpp`: GPU-resident `last_sampled_tokens`, `combine_sampled_and_draft_tokens`-style gather of next-step decode input ids on device, `post_update` writes on device; delete the host write-back at `runner.cpp:719-730` for the async path | The only device-code delta of this spike: one small combine/post-update kernel pair ported 1:1 from the cited Triton kernels (goldens per test-porting); draft-token lane degenerates to width 1 until `SPEC-MTP` |
+| `vllm/v1/worker/gpu/input_batch.py:304-406,457-543`; `model_runner.py:613,954,1423-1445` | **INPUT HALF LANDED (2026-07-16):** `combine_sampled_and_draft_tokens` device-neutral port (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`) + `last_sampled_tokens`/`prefill_len` on `InputBatch` (`input_batch.cpp`, seed+condense+swap) + `post_update`-style `last_sampled` write & combine wiring on the runner (`runner.cpp`, behind `VT_ASYNC_RUNNER`, default OFF). REMAINING: the DGX device kernel (loop → Triton) + delete the host write-back on the async path | The device-code delta of this spike: the combine/post-update pair. Landed as the device-neutral CPU logic (host arrays; the DGX leaf ports the loop to the cited Triton kernel over GPU-resident tensors). draft-token lane degenerates to width 1 until `SPEC-MTP`; capture-safe host-side prep (checked both sides) |
 | `vllm/config/vllm.py:952,959-1038`; `vllm/config/scheduler.py:158-162,180-189` | extend `include/vllm/config/scheduler.h` / `src/vllm/config/scheduler.cpp` (+ engine wiring): `async_scheduling` tri-state with default-ON resolution and the compat fallbacks relevant to us (pooling n/a, spec-decode method gate recorded for `SPEC-MTP`) | Mirror the log line "Asynchronous scheduling is enabled/disabled" for A/B auditability |
 
 Leaf W4 — `ENG-PRIORITY-SCHED` (priority policy, separable sibling):

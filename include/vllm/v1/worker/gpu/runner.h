@@ -174,6 +174,23 @@ class GPUModelRunner final : public ModelRunnerBase {
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
+
+  // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
+  // ON, execute_model rebuilds each decode row's input token id from the
+  // GPU-resident-analog InputBatch::last_sampled_tokens via
+  // combine_sampled_and_draft_tokens INSTEAD of the host token_ids_cpu read —
+  // the piece that lets step N+1 be prepared without waiting on step N's sampled
+  // token to cross to the host (the ~3.25 ms/step idle). DEFAULT OFF: the
+  // production runner keeps the synchronous host path byte-identical, so
+  // `runner_supports_async` stays FALSE until the copy-stream D2H half + the
+  // DGX token-exactness/overlap gate land. VT_ASYNC_RUNNER=1 opts in at
+  // construction (bring-up); tests toggle it directly. Greedy tokens are
+  // bit-identical in both modes (combine writes the same id sample_tokens wrote
+  // back to token_ids_cpu) — the DGX gate proves it on the real models.
+  void set_async_input_combine(bool enabled) {
+    async_input_combine_ = enabled;
+  }
+  bool async_input_combine() const { return async_input_combine_; }
   bool kv_cache_backend_resident() const {
     return kv_cache_backend_resident_;
   }
@@ -272,6 +289,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   // former host-vector storage for same-binary attribution); CPU stays host.
   // Full-attention KV is bf16 by default, or f32 under VT_KV_CACHE_F32.
   bool kv_cache_backend_resident_ = false;
+  // Async-scheduling device-input opt-in (see set_async_input_combine). Default
+  // from VT_ASYNC_RUNNER at construction; OFF keeps the sync host path.
+  bool async_input_combine_ = false;
   std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
   // GDN convolution and recurrent caches have independent dtypes. This mirrors
   // MambaStateDtypeCalculator::_mamba_state_dtype: mamba_cache_dtype="auto"

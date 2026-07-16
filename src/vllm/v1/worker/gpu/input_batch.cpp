@@ -120,6 +120,8 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len,
   num_tokens_no_spec.assign(n, 0);
   num_prompt_tokens.assign(n, 0);
   num_computed_tokens_cpu.assign(n, 0);
+  last_sampled_tokens.assign(n, 0);
+  prefill_len.assign(n, 0);
   temperature_cpu.assign(n, 0.0f);
   top_p_cpu.assign(n, 0.0f);
   top_k_cpu.assign(n, 0);
@@ -176,6 +178,23 @@ int InputBatch::add_request(const CachedRequestState& request) {
   num_computed_tokens_cpu[static_cast<size_t>(req_index)] =
       request.num_computed_tokens;
   block_table.add_row(request.block_ids, req_index);
+
+  // Async-scheduling state (states.py::add_request:105-122). prefill_len is the
+  // token count known at admission (prompt + pre-existing output), fixed for the
+  // request's life. Seed last_sampled_tokens ONLY for a resumed / PD-disagg
+  // request (0 < num_computed <= prefill_len) so its first decode step reads the
+  // correct input id via combine; a fresh prefill (num_computed == 0) never has
+  // combine read it, so it stays 0. Both are inert unless the async runner path
+  // is engaged.
+  const int prefill = request.num_tokens();
+  prefill_len[static_cast<size_t>(req_index)] = prefill;
+  if (0 < request.num_computed_tokens &&
+      request.num_computed_tokens <= prefill) {
+    last_sampled_tokens[static_cast<size_t>(req_index)] =
+        token_ids_cpu[row + static_cast<size_t>(request.num_computed_tokens - 1)];
+  } else {
+    last_sampled_tokens[static_cast<size_t>(req_index)] = 0;
+  }
 
   // Sampling metadata (pooling DEFERRED — T0 always has sampling_params).
   const SamplingParams& sp = request.sampling_params;
@@ -430,6 +449,12 @@ void InputBatch::condense() {
         num_prompt_tokens[static_cast<size_t>(last_req_index)];
     num_computed_tokens_cpu[static_cast<size_t>(empty_index)] =
         num_computed_tokens_cpu[static_cast<size_t>(last_req_index)];
+    // Async-scheduling per-slot state moves with the request (keeps it aligned
+    // to the dense req_state index combine reads).
+    last_sampled_tokens[static_cast<size_t>(empty_index)] =
+        last_sampled_tokens[static_cast<size_t>(last_req_index)];
+    prefill_len[static_cast<size_t>(empty_index)] =
+        prefill_len[static_cast<size_t>(last_req_index)];
     block_table.move_row(last_req_index, empty_index);
 
     // Sampling metadata (LoRA / generators / allowed-token-ids / bad-words
@@ -497,6 +522,12 @@ void InputBatch::swap_states(int i1, int i2) {
             num_prompt_tokens[static_cast<size_t>(i2)]);
   std::swap(num_computed_tokens_cpu[static_cast<size_t>(i1)],
             num_computed_tokens_cpu[static_cast<size_t>(i2)]);
+  // Async-scheduling per-slot state (moves with the row in the decode-first
+  // reorder, so combine's dense req_state index stays correct).
+  std::swap(last_sampled_tokens[static_cast<size_t>(i1)],
+            last_sampled_tokens[static_cast<size_t>(i2)]);
+  std::swap(prefill_len[static_cast<size_t>(i1)],
+            prefill_len[static_cast<size_t>(i2)]);
 
   // Swap the active token prefix of the two rows (upstream copies only
   // max_active_token_count columns).

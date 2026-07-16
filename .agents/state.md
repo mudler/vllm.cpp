@@ -11538,3 +11538,74 @@ is now a measured codegen-bound gap candidate — vendor its AOT cubin via the
 proven `triton_aot_vendored/` toolchain, gated, with the hand-CUDA fallback
 preserved. Decision next session on measured grounds. Binding stays
 **49/124**, `benchmark_binding=false`.
+
+- **2026-07-16** — **ENG-ASYNC-SCHED W3 runner DEVICE-INPUT half LANDED +
+  CPU-gated (`CLAIM-ASYNC-SCHED-W3`, same claim as the host-side half, isolated
+  worktree, pushed to main).** Implemented the INPUT half of the runner-side
+  overlap leaf, mirroring vLLM 1:1, CPU test-first. `combine_sampled_and_draft_tokens`
+  (`src/vllm/v1/worker/gpu/prepare_inputs.{h,cpp}`, 1:1 with
+  `vllm/v1/worker/gpu/input_batch.py:304-406` + the
+  `_combine_sampled_and_draft_tokens_kernel`, T0 non-spec subset) rebuilds each
+  DECODE row's input token id from the GPU-resident-analog
+  `InputBatch::last_sampled_tokens` (per req_state) instead of the host
+  `token_ids_cpu` round-trip `prepare_inputs` used — for each batch row with
+  `seq_len > prefill_len`, `input_ids[query_end - num_logits]` becomes
+  `last_sampled_tokens[idx_mapping[batch_idx]]`; prefill / chunked-prefill rows
+  (`seq_len <= prefill_len`, incl. the chunk that exactly completes prefill) keep
+  the prompt token; `logits_indices = query_start_loc[1:] - num_logits`
+  (== prepare_inputs' at T0). Added `last_sampled_tokens` + `prefill_len`
+  per-slot state on `InputBatch` (`input_batch.{h,cpp}`): `prefill_len` = tokens
+  known at admission (`num_tokens()`); `last_sampled_tokens` seeded on admission
+  only for a resumed/PD-disagg req (`0 < num_computed <= prefill_len` ⇒ token at
+  `num_computed-1`, mirroring `states.py:105-122`), threaded through
+  condense/swap so combine's dense req_state index stays aligned. Runner wiring
+  (`runner.{h,cpp}`): the combine runs on the HOST side of input prep, BEFORE the
+  forward and OUTSIDE any CUDA-graph capture (capture-safe — input prep always
+  precedes the decode graph replay, checked both sides); `sample_tokens` records
+  `last_sampled_tokens[i]` each step (post_update analog); gated behind
+  `VT_ASYNC_RUNNER` / `GPUModelRunner::set_async_input_combine`, **DEFAULT OFF**
+  so production keeps the synchronous host path byte-identical. Device-neutral:
+  on CPU host arrays; the DGX leaf ports the loop to the cited Triton kernel over
+  GPU-resident `input_ids`/`last_sampled_tokens` (no sampled-id D2H).
+  TEST-FIRST: `tests/vllm/v1/worker/test_combine_tokens.cpp` (7 cases / 14
+  asserts — pure decode, reads-`last_sampled`-not-host, prefill+chunked-prefill
+  transition boundary, mixed decode+prefill batch, `idx_mapping` indirection
+  (abort/finish churn), draft-only `num_new_sampled_tokens==0`) — GREEN, verified
+  RED by splicing the STALE self-value instead of `last_sampled` (5/7 cases
+  fail); `test_input_batch.cpp` +3 cases (prefill_len/last_sampled admission
+  seed, condense move, swap_states swap); `test_runner.cpp` +2 cases (runner
+  greedy-decode token-exactness async-ON ≡ sync over 6 steps, and combine reads
+  `last_sampled` over a deliberately corrupted host token). GATES (CPU, no GPU):
+  clean full CPU `-Werror` rebuild 0 warnings; full CPU **ctest 110/110** (serial;
+  the one parallel `test_serve_low_tools` blip is Python-tools resource
+  contention, passes isolated); tools **164/164**; record + doc-checkpoint
+  checkers green.
+  **PRODUCTION WIRING UNCHANGED / NO GPU BEHAVIOR CHANGE this commit** — the
+  combine path is default OFF (`VT_ASYNC_RUNNER` unset) and `runner_supports_async`
+  still resolves FALSE, so both model gates on this SHA remain byte-identical to
+  main.
+  REMAINING (DGX-gated, NEXT leaf, same row): the sampler-OUTPUT half — the
+  non-blocking sampled-token-ID D2H on a copy stream + event
+  (`async_utils.py:12-70`) + the `vt::Backend` event/pinned-host primitives — plus
+  the on-GPU combine KERNEL (loop → Triton) and flipping `runner_supports_async`
+  TRUE by default. These are CUDA-only, cannot be CPU-validated, and land with the
+  DGX gate; together with this input half they capture the measured ~3.25 ms/step
+  GPU-idle.
+  **INTENDED DGX VALIDATION** (orchestrator, from the pushed SHA, one
+  `flock /tmp/gpu` per series): (1) SAFETY on THIS SHA — both model gates in the
+  production default (combine OFF, async OFF): `flock /tmp/gpu -c 'ctest -R
+  qwen36_paged_engine'` + `qwen27_paged_engine` = 16/16 + 235/235, byte-identical
+  to main (`VT_ASYNC_RUNNER` unset). (2) TOKEN-EXACTNESS of the input half — both
+  model gates with `VT_ASYNC_RUNNER=1` (combine ON) must ALSO be 235/235 + 16/16,
+  bit-identical to the OFF arm (greedy streams sacrosanct). (3) After the
+  sampler-output half lands: both model gates × both `VT_ASYNC_SCHED` arms —
+  default (unset → resolved-ON) and `VT_ASYNC_SCHED=0` (forced sync) — each
+  235/235 + 16/16 token-exact. (4) interleaved c16 A/B W3-on vs W3-off (same
+  binary, one lock) expecting ~+3 ms/step ≈ +15 tok/s on throughput axes and ≤ on
+  TPOT, with an explicit TTFT-regression WATCH (`3812d8`'s TTFT 0.862159× ON/OFF
+  is the caution; prior W1/2/4 control had a TTFT regression). The c2 speed budget
+  is frozen neutral by `3812d8` (total 1.002153×, no GPU-time reduction), so the
+  honest gate is "no regression + mirror behavior", the measured delta recorded
+  either way (spec D6). `benchmark_binding=false`, no speed credit, binding stays
+  49/124. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude
+  Code:claude-opus-4-8 [ClaudeCode]`.

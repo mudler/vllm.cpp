@@ -175,4 +175,58 @@ StepInputs prepare_inputs(InputBatch& input_batch,
   return out;
 }
 
+// ─── combine_sampled_and_draft_tokens ───────────────────────────────────────
+// Ported from vllm/v1/worker/gpu/input_batch.py::combine_sampled_and_draft_tokens
+// + _combine_sampled_and_draft_tokens_kernel @ e24d1b24 (T0 non-spec subset).
+// See prepare_inputs.h for the async-scheduling contract, the device-neutral /
+// capture-safety note, and the deferred spec-decode draft lane.
+std::vector<int32_t> combine_sampled_and_draft_tokens(
+    std::vector<int32_t>& input_token_ids,
+    const std::vector<int32_t>& idx_mapping,
+    const std::vector<int32_t>& last_sampled_tokens,
+    const std::vector<int32_t>& query_start_loc,
+    const std::vector<int32_t>& seq_lens,
+    const std::vector<int32_t>& prefill_len, int num_new_sampled_tokens) {
+  // Upstream asserts num_new_sampled_tokens in (0, 1): the bonus token, excl.
+  // accepted draft tokens.
+  assert(num_new_sampled_tokens == 0 || num_new_sampled_tokens == 1);
+  const int num_reqs = static_cast<int>(idx_mapping.size());
+
+  // cu_num_logits is one logit per request at T0 (no draft tokens), so
+  // num_logits == num_new_sampled_tokens per row and the total == num_reqs *
+  // num_new_sampled_tokens. logits_indices[b] = query_end - num_logits (+block).
+  std::vector<int32_t> logits_indices;
+  logits_indices.reserve(
+      static_cast<size_t>(num_reqs) * static_cast<size_t>(num_new_sampled_tokens));
+
+  for (int batch_idx = 0; batch_idx < num_reqs; ++batch_idx) {
+    const int req_state_idx = idx_mapping[static_cast<size_t>(batch_idx)];
+    // num_logits == num_new_sampled_tokens (num_draft_tokens == 0 at T0).
+    const int num_logits = num_new_sampled_tokens;
+    const int32_t query_end =
+        query_start_loc[static_cast<size_t>(batch_idx) + 1];
+    const int32_t logits_start = query_end - num_logits;
+    for (int j = 0; j < num_logits; ++j) {
+      logits_indices.push_back(logits_start + j);
+    }
+
+    // seq_len <= prefill_len: still consuming the known prefill tokens (incl.
+    // the chunk that exactly completes prefill) — no sampled or draft token to
+    // splice; the prompt token in input_token_ids stays.
+    const int32_t seq_len = seq_lens[static_cast<size_t>(batch_idx)];
+    const int32_t pf = prefill_len[static_cast<size_t>(req_state_idx)];
+    if (seq_len <= pf) {
+      continue;
+    }
+    // Write the last sampled token id at the decode position (query_end -
+    // num_logits). num_new_sampled_tokens == 0 (draft-only step) writes nothing.
+    if (num_new_sampled_tokens > 0) {
+      input_token_ids[static_cast<size_t>(query_end - num_logits)] =
+          last_sampled_tokens[static_cast<size_t>(req_state_idx)];
+    }
+    // Draft tokens (num_draft_tokens > 0) are deferred with SPEC-MTP.
+  }
+  return logits_indices;
+}
+
 }  // namespace vllm::v1

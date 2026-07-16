@@ -207,6 +207,25 @@ class InputBatch {
   std::vector<int32_t> num_prompt_tokens;
   std::vector<int32_t> num_computed_tokens_cpu;
 
+  // ─── Async-scheduling (ENG-ASYNC-SCHED W3) per-slot state [max_num_reqs] ────
+  // Mirror of RequestState.last_sampled_tokens / prefill_len
+  // (vllm/v1/worker/gpu/states.py:64,105-122). Populated only on the async runner
+  // path; the synchronous path never reads them (production default).
+  //
+  // last_sampled_tokens[slot]: the last token the sampler produced for this
+  // request, kept per req_state so the next step can build its decode input id
+  // WITHOUT the sampled-id host round-trip (combine_sampled_and_draft_tokens).
+  // On CUDA this becomes the GPU-resident RequestState.last_sampled_tokens; on
+  // CPU it is a host array (the runner leaf is device-neutral). sample_tokens
+  // writes it each step; add_request seeds it for a resumed/PD-disagg request
+  // (0 < num_computed <= prefill_len) so its first decode reads the right id.
+  std::vector<int32_t> last_sampled_tokens;
+  // prefill_len[slot]: the number of tokens KNOWN at admission (prompt + any
+  // pre-existing output = num_tokens() at add_request), fixed for the request's
+  // lifetime. combine gates on seq_len > prefill_len to tell a decode row (splice
+  // the sampled token) from a prefill/chunked-prefill row (keep the prompt).
+  std::vector<int32_t> prefill_len;
+
   // The per-request KV-cache block table (one BlockTable per group).
   MultiGroupBlockTable block_table;
 

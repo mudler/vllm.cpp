@@ -104,6 +104,52 @@ void update_states(InputBatch& input_batch,
 StepInputs prepare_inputs(InputBatch& input_batch,
                           const SchedulerOutput& scheduler_output);
 
+// combine_sampled_and_draft_tokens: the async-scheduling device-input path
+// (ENG-ASYNC-SCHED W3 runner leaf). Ported from
+// vllm/v1/worker/gpu/input_batch.py::combine_sampled_and_draft_tokens (+ the
+// _combine_sampled_and_draft_tokens_kernel) @ e24d1b24, T0 non-spec subset.
+//
+// Under async/overlap scheduling step N+1 is prepared BEFORE step N's sampled
+// token has crossed to the host (the blocking D2H the whole lever removes), so
+// prepare_inputs' host read of token_ids_cpu at the decode position is stale.
+// This rebuilds the decode rows' input token ids from `last_sampled_tokens` —
+// the sampler's output, which already lives GPU-side (per req_state) — instead:
+// for each batch row whose seq_len > prefill_len (past the known prefill tokens),
+// input_token_ids[query_end - num_logits] is overwritten with
+// last_sampled_tokens[idx_mapping[batch_idx]]. Prefill / chunked-prefill rows
+// (seq_len <= prefill_len, incl. the exact chunk that completes prefill) are
+// LEFT UNTOUCHED — their input still comes from the prompt in token_ids_cpu.
+// Returns logits_indices (per-req query_start_loc[b+1] - num_logits); at T0
+// num_new_sampled_tokens == 1 and there are no draft tokens, so num_logits == 1
+// and this equals prepare_inputs' logits_indices (query_start_loc[1:] - 1).
+//
+//   input_token_ids  [total]        mutated in place (decode rows overwritten)
+//   idx_mapping      [num_reqs]     batch_idx -> req_state slot (identity for our
+//                                   already-condensed persistent batch; the
+//                                   indirection matters after an abort/finish
+//                                   reorders req_states vs the dense batch)
+//   last_sampled_tokens [>= max req_state]  per req_state, the last sampled id
+//   query_start_loc  [num_reqs + 1] cumulative token offsets (== StepInputs)
+//   seq_lens         [num_reqs]     num_computed + num_scheduled (== StepInputs)
+//   prefill_len      [>= max req_state]  per req_state, tokens known at admission
+//   num_new_sampled_tokens          0 or 1 (bonus token; excl. accepted drafts)
+//
+// DEVICE-NEUTRAL (recorded): on CPU these are host std::vectors; the DGX leaf
+// ports this loop to the cited Triton kernel over GPU-resident input_ids /
+// last_sampled_tokens so no sampled-id round-trips the host. It runs on the HOST
+// side of input prep, BEFORE the forward and OUTSIDE any CUDA-graph capture
+// (exactly as upstream keeps input prep ahead of the decode graph replay), so it
+// is capture-safe by construction. Spec-decode draft tokens (draft_tokens /
+// num_new_sampled_tokens==0 / cu_num_logits>1) are deferred with SPEC-MTP;
+// num_new_sampled_tokens is fixed at 1 here.
+std::vector<int32_t> combine_sampled_and_draft_tokens(
+    std::vector<int32_t>& input_token_ids,
+    const std::vector<int32_t>& idx_mapping,
+    const std::vector<int32_t>& last_sampled_tokens,
+    const std::vector<int32_t>& query_start_loc,
+    const std::vector<int32_t>& seq_lens,
+    const std::vector<int32_t>& prefill_len, int num_new_sampled_tokens = 1);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_PREPARE_INPUTS_H_

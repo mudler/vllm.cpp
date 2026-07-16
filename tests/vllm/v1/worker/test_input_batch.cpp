@@ -196,6 +196,75 @@ TEST_CASE("condense: remove the middle request then densify [0, num_reqs)") {
   CHECK(batch.block_table[0].cpu_block_id(0, 0) == 10);
 }
 
+// ─── async-scheduling per-slot state (ENG-ASYNC-SCHED W3 runner leaf) ────────
+TEST_CASE("add_request seeds prefill_len; last_sampled only for resumed reqs") {
+  InputBatch batch = make_batch();
+
+  // Fresh prefill (num_computed == 0): prefill_len == num_tokens (prompt+output),
+  // last_sampled stays 0 (combine never reads it during prefill).
+  CachedRequestState fresh = make_req("fresh", {10, 11, 12}, {}, {3});
+  fresh.num_computed_tokens = 0;
+  const int i0 = batch.add_request(fresh);
+  CHECK(batch.prefill_len[static_cast<size_t>(i0)] == 3);        // 3 prompt
+  CHECK(batch.last_sampled_tokens[static_cast<size_t>(i0)] == 0);
+
+  // Resumed / PD-disagg (0 < num_computed <= prefill_len): last_sampled seeded
+  // with the token at num_computed-1 so the first decode reads the right id.
+  CachedRequestState resumed = make_req("resumed", {20, 21, 22}, {23, 24}, {7});
+  resumed.num_computed_tokens = 4;  // prefill_len = 5 (prompt3 + output2)
+  const int i1 = batch.add_request(resumed);
+  CHECK(batch.prefill_len[static_cast<size_t>(i1)] == 5);
+  // token at index num_computed-1 == 3 -> the seed row is [20,21,22,23,24] -> 23.
+  CHECK(batch.last_sampled_tokens[static_cast<size_t>(i1)] == 23);
+}
+
+TEST_CASE("condense moves last_sampled_tokens + prefill_len with the request") {
+  InputBatch batch = make_batch();
+  CachedRequestState r0 = make_req("r0", {100}, {}, {10});
+  r0.num_computed_tokens = 1;
+  CachedRequestState r1 = make_req("r1", {200, 201}, {}, {20});
+  r1.num_computed_tokens = 2;
+  // r2 resumed so its last_sampled is a distinctive non-zero seed.
+  CachedRequestState r2 = make_req("r2", {300, 301}, {302}, {30});
+  r2.num_computed_tokens = 3;  // prefill_len 3 -> seed token at idx 2 == 302
+  batch.add_request(r0);
+  batch.add_request(r1);
+  batch.add_request(r2);
+  REQUIRE(batch.last_sampled_tokens[2] == 302);
+  REQUIRE(batch.prefill_len[2] == 3);
+
+  batch.remove_request("r1");
+  batch.condense();  // r2 (slot 2) slides into freed slot 1
+
+  CHECK(batch.req_id_to_index.at("r2") == 1);
+  CHECK(batch.last_sampled_tokens[1] == 302);  // moved with the request
+  CHECK(batch.prefill_len[1] == 3);
+  // Slot 0 untouched.
+  CHECK(batch.prefill_len[0] == 1);
+}
+
+TEST_CASE("swap_states swaps last_sampled_tokens + prefill_len") {
+  InputBatch batch = make_batch();
+  CachedRequestState a = make_req("a", {1, 2}, {3}, {10});
+  a.num_computed_tokens = 3;  // prefill_len 3, seed idx2 == 3
+  CachedRequestState b = make_req("b", {5}, {}, {20});
+  b.num_computed_tokens = 0;  // prefill_len 1, last_sampled 0
+  batch.add_request(a);  // slot 0
+  batch.add_request(b);  // slot 1
+  REQUIRE(batch.last_sampled_tokens[0] == 3);
+  REQUIRE(batch.prefill_len[0] == 3);
+
+  batch.swap_states(0, 1);
+
+  // The reorder primitive must carry the async state with the row.
+  CHECK(batch.req_id_to_index.at("a") == 1);
+  CHECK(batch.req_id_to_index.at("b") == 0);
+  CHECK(batch.last_sampled_tokens[1] == 3);
+  CHECK(batch.prefill_len[1] == 3);
+  CHECK(batch.last_sampled_tokens[0] == 0);
+  CHECK(batch.prefill_len[0] == 1);
+}
+
 TEST_CASE("condense is a no-op when only the last request was removed") {
   InputBatch batch = make_batch();
   batch.add_request(make_req("a", {1}, {}, {0}));

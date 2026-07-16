@@ -56,6 +56,19 @@ static bool GpuSampleEnabled() {
   return on;
 }
 
+// Async-scheduling device-input opt-in default (ENG-ASYNC-SCHED W3 runner leaf).
+// VT_ASYNC_RUNNER=1 turns ON the combine_sampled_and_draft_tokens device-input
+// path at runner construction (bring-up opt-in for the DGX A/B); default OFF so
+// production keeps the synchronous host path byte-identical. Read ONCE (never
+// per-step). Tests toggle the flag directly via set_async_input_combine.
+static bool AsyncRunnerEnvDefault() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ASYNC_RUNNER");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each
 // execute_model step prints the request count and the live/free recurrent-state
 // slot geometry to std::cerr. Read ONCE (never per-step getenv); bounded to the
@@ -276,6 +289,7 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
+  async_input_combine_ = AsyncRunnerEnvDefault();
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -294,6 +308,7 @@ GPUModelRunner::GPUModelRunner(const HfConfig& config,
                    group_block_sizes(kv_cache_config),
                    group_block_sizes(kv_cache_config)) {
   max_num_reqs_ = max_num_reqs;
+  async_input_combine_ = AsyncRunnerEnvDefault();
   initialize_kv_cache(kv_cache_config);
   ModelRegistry::Prepare(*model_, config_, queue_);
 }
@@ -576,6 +591,26 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   StepInputs step = prepare_inputs(input_batch_, scheduler_output);
   const int num_reqs = input_batch_.num_reqs();
 
+  // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
+  // engaged, overwrite each decode row's input token id with the GPU-resident-
+  // analog last_sampled_tokens (combine_sampled_and_draft_tokens) instead of the
+  // host token_ids_cpu value prepare_inputs read — so step N+1 need not wait on
+  // step N's sampled token crossing to the host. idx_mapping is identity: our
+  // persistent batch is already condensed dense (batch row == req_state slot).
+  // Runs on the HOST side of input prep, BEFORE the forward and OUTSIDE any
+  // CUDA-graph capture (input prep always precedes the decode graph replay), so
+  // it is capture-safe. Default OFF: production keeps the byte-identical sync
+  // host path (both give the same id, since sample_tokens writes the same token
+  // to token_ids_cpu and last_sampled_tokens).
+  if (async_input_combine_ && num_reqs > 0) {
+    std::vector<int32_t> idx_mapping(static_cast<size_t>(num_reqs));
+    std::iota(idx_mapping.begin(), idx_mapping.end(), 0);
+    combine_sampled_and_draft_tokens(
+        step.input_token_ids, idx_mapping, input_batch_.last_sampled_tokens,
+        step.query_start_loc, step.seq_lens, input_batch_.prefill_len,
+        /*num_new_sampled_tokens=*/1);
+  }
+
   // Full-attention KV group metadata (M1.6 MakeCommonAttentionMetadata).
   int fa_cols = 0;
   const std::vector<int32_t> fa_bt =
@@ -778,6 +813,15 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       if (out_ids.has_value()) {
         out_ids->push_back(tok);
       }
+    }
+    // Async-scheduling: record this step's last sampled id per req_state so the
+    // next step's combine_sampled_and_draft_tokens can build its decode input id
+    // without a sampled-id host round-trip (post_update / states.py, T0 non-spec:
+    // one token). Inert on the sync path; the write is cheap and keeps the async
+    // buffer coherent for the DGX A/B. (On CUDA this becomes the on-GPU
+    // last_sampled_tokens scatter — no D2H.)
+    if (!toks.empty()) {
+      input_batch_.last_sampled_tokens[static_cast<size_t>(i)] = toks.back();
     }
   }
   return out;

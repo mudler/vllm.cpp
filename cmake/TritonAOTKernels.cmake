@@ -73,6 +73,18 @@ function(vllm_triton_aot_declare_all)
       "${_gx},NT,${_H}" "${_chunko_bf16}, ${_tail}")
   endforeach()
 
+  # fused_recurrent packed pure-decode recurrence: 27B ONLY (H=16, HV=48,
+  # K=V=128, BK=128, BV=32), num_warps=1, num_stages=3, grid (cdiv(V,BV)=4, NBH).
+  # Strides/dims baked to the 27B call site and guarded in TryTritonPackedDecode.
+  set(VT_GDN_DECODE_WARPS_48  1 CACHE STRING "packed decode H=48 Triton warps")
+  set(VT_GDN_DECODE_STAGES_48 3 CACHE STRING "packed decode H=48 Triton stages")
+  _vllm_triton_aot_declare(
+    gdn_decode_h48 fused_recurrent_packed_decode.py
+    fused_recurrent_gated_delta_rule_packed_decode_kernel
+    ${VT_GDN_DECODE_WARPS_48} ${VT_GDN_DECODE_STAGES_48}
+    "4,NBH,1"
+    "*bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, i32, 10240, 96, 96, 786432, 786432, 1, 16, 48, 128, 128, 128, 32, 20, 1")
+
   # WY pipeline: chunk_scaled_dot_kkt -> solve_tril -> recompute_w_u.
   set(_kkt_head
     "*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32")

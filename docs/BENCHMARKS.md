@@ -84,17 +84,30 @@ this run's evidence. Detailed per-seal chronology and evidence SHAs live in the
 append-only [ledger](../.agents/parity-ledger.md) and
 [state log](../.agents/state.md). 35B stays blocked until 27B reaches 124/124.
 
-**Register-resident decode tiling — PERF LEVER landed (2026-07-16, test-first,
-CPU-gated, DGX-pending; PENDING binding number).** The named +2.06 ms/step
-recurrence-tiling gap (correct-state c16 traces: ours 21.31 vs vLLM 19.24
-ms/step; ~83% vs ~92% of ~273 GB/s) was ATTEMPTED via a register-resident port of vLLM FLA's single-warp `num_stages=3` packed-decode kernel (`fused_recurrent.py:256-336`) — the DGX proof FAILED (bit-exact oracle boundary FAIL; same-binary c16 A/B reg-tile 700.5–701.4 vs legacy 793.6–794.5 tok/s, TPOT 190.5 vs 166.5 — register-pressure/occupancy collapse). The default is flipped OFF (legacy ships; `VT_GDN_PACKED_REG_TILE=1` keeps the experimental kernel opt-in), and the lever stays open via an occupancy-aware redesign or the sanctioned Triton-AOT vendored-cubin path (proof root `~/work/vllm.cpp-gdn-regtile/54f0541…`) CPU gates GREEN (flag test 12/12, `test_ops_gdn`
-45/45, `test_op_parity` 10/10, full CTest 105/105, tools 164/164, clean -Werror;
-`.cu` is DGX-compiled). **Expected ~+2 ms/step (~+10 tok/s) at c16** — the
-orchestrator's DGX proof (bit-exact oracle under lock, full CUDA GDN suite,
-rollback-selection re-run, both model gates, memcheck slice, then the interleaved
-c16 A/B new-vs-`a2329e1`-era legacy) is the binding measurement; **no speed credit
-until measured**. Repro commands in
-[the packed-decode spec](../.agents/specs/gdn-packed-decode.md#register-resident-decode-tiling-perf-lever-2026-07-16--cpu-gated-dgx-pending).
+**Decode recurrence perf lever — MEASURED codegen-bound → vendored Triton cubin
+(2026-07-16).** The named +2.06 ms/step recurrence-tiling gap (correct-state c16
+traces: ours 21.31 vs vLLM 19.24 ms/step; ~83% vs ~92% of ~273 GB/s) was first
+ATTEMPTED via a register-resident hand port of vLLM FLA's single-warp
+`num_stages=3` packed-decode kernel (`fused_recurrent.py:256-336`) — the DGX
+proof FAILED (oracle boundary FAIL; c16 A/B reg-tile 700.5–701.4 vs legacy
+793.6–794.5 tok/s, TPOT 190.5 vs 166.5). **Phase-1 `cuobjdump -res-usage` on the
+compiled cubins at the c16 shape named the cause** (root
+`~/work/vllm.cpp-gdn-recurrence/phase1`): vLLM's FLA decode cubin holds the
+register-resident `[BV=32,BK=128]` fp32 state tile at **REG:205, STACK:0
+(0 spills)**; the byte-for-byte hand port hits **REG:255 (hard cap) + STACK:48
+(SPILLS)** — register allocation / codegen, not a config we mis-set (legacy hand
+kernel is REG:56/8-warp/0-spill at ~83% BW). DECISION: the sanctioned vendored
+Triton cubin (`gdn_decode_h48`, 27B-only) behind `VT_GDN_PACKED_DECODE_TRITON`
+(**default OFF**; the hand `GdnPackedDecodeKernel` stays the DEFAULT fallback).
+DGX gates (GB10 sm_121a, root `~/work/vllm.cpp-gdn-recurrence`, one flock/series):
+AOT-vs-legacy-vs-CPU op test 28/28, full `test_ops_gdn` 49/49, oracle boundary
+12/12 (legacy path bit-exact preserved), **27B model gate 235/235 token-exact
+with the Triton decode path ON**, compute-sanitizer 0 errors/0 leaks, default-off
+gate 235/235. **c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved
+3 pairs + w0 cold discard, one flock, root `ab-decode-triton`): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded.**
+ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed. CPU gates GREEN (`test_ops_gdn` 45/45, clean -Werror). Repro
+commands in
+[the packed-decode spec](../.agents/specs/gdn-packed-decode.md#decode-recurrence-perf-lever--measured-codegen-bound-vendored-triton-cubin-2026-07-16).
 
 **Blast-radius caveat (correctness).** The c16 slot defect predated its
 validator and was independent of `VT_GDN_PACKED_DECODE` (both arms hit the same

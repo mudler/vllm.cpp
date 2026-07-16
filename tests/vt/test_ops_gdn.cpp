@@ -1267,6 +1267,128 @@ TEST_CASE(
 }
 #endif  // VLLM_CPP_CUDA
 
+// Vendored Triton AOT packed-decode fast-path (VT_GDN_PACKED_DECODE_TRITON,
+// default OFF; 27B-only). MEASURED codegen-bound (dgx phase1 2026-07-16): the
+// identical register-resident [BV=32,BK=128] fp32 state tile is REG:205/0-spill
+// under Triton but REG:255+STACK:48 (spills) as hand-CUDA. Builds the EXACT 27B
+// packed-decode call site the single cubin was baked to (bf16 mixed_qkv/a/b/out,
+// f32 state/A_log/dt_bias, merged-BA a/b views of row stride 2*Hv=96, Hk=16,
+// Hv=48, Dk=Dv=128) so the launcher guards accept it, and proves (a) the default
+// stays on the legacy kernel, (b) "=1" fires the vendored cubin, and (c) both the
+// AOT and legacy outputs/state match the portable CPU reference within the BF16
+// tolerance. Guarded on VLLM_CPP_TRITON (the cubin only exists in that build).
+#if defined(VLLM_CPP_CUDA) && defined(VLLM_CPP_TRITON)
+TEST_CASE(
+    "CUDA gdn packed decode: VT_GDN_PACKED_DECODE_TRITON=1 fires the vendored "
+    "27B cubin and matches the CPU reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  constexpr DType dtype = DType::kBF16;
+  constexpr int64_t batch = 16, hk = 16, hv = 48, dk = 128, dv = 128;
+  PackedCase c = MakePackedCase(dtype, false, batch, hk, hv, dk, dv, 9310);
+  REQUIRE(c.mixed_stride == 2 * hk * dk + hv * dv);  // 10240 (baked)
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+
+  // Merged-BA buffer [batch, 2*Hv] bf16: cols [0,Hv)=b, cols [Hv,2*Hv)=a (mirrors
+  // ProjectGdnBA: out.b=Slice(0,Hv), out.a=Slice(Hv,2*Hv)); a/b are stride-96
+  // views into it, exactly what the model passes to GdnPackedDecode.
+  const int64_t ba_stride = 2 * hv;  // 96 (the baked stride_a/b_tok)
+  std::vector<uint8_t> ba(static_cast<size_t>(batch) * ba_stride *
+                          vt::SizeOf(dtype));
+  const size_t half = static_cast<size_t>(hv) * vt::SizeOf(dtype);
+  for (int64_t r = 0; r < batch; ++r) {
+    std::memcpy(ba.data() + static_cast<size_t>(r * ba_stride) * vt::SizeOf(dtype),
+                c.b.data() + static_cast<size_t>(r * hv) * vt::SizeOf(dtype), half);
+    std::memcpy(ba.data() + (static_cast<size_t>(r * ba_stride) + hv) * vt::SizeOf(dtype),
+                c.a.data() + static_cast<size_t>(r * hv) * vt::SizeOf(dtype), half);
+  }
+  // f32 SSM state, A_log and dt_bias (the real 27B resident dtypes).
+  std::vector<uint8_t> state_f32 = Pack(Unpack(c.state, dtype), DType::kF32);
+  std::vector<uint8_t> a_log_f32 = Pack(Unpack(c.a_log, dtype), DType::kF32);
+  std::vector<uint8_t> dt_bias_f32 = Pack(Unpack(c.dt_bias, dtype), DType::kF32);
+
+  // Portable CPU reference for the exact config.
+  std::vector<uint8_t> state_cpu = state_f32;
+  std::vector<uint8_t> out_cpu(
+      static_cast<size_t>(batch * hv * dv) * vt::SizeOf(dtype));
+  Tensor mixed_cpu = RowView(c.mixed.data(), dtype, Cpu(), batch, c.mixed_cols,
+                             c.mixed_stride);
+  Tensor ba_cpu = RowView(ba.data(), dtype, Cpu(), batch, ba_stride, ba_stride);
+  Tensor b_cpu = ba_cpu.Slice(1, 0, hv);       // stride 96
+  Tensor a_cpu = ba_cpu.Slice(1, hv, 2 * hv);  // stride 96
+  Tensor al_cpu = MakeT(a_log_f32.data(), DType::kF32, Cpu(), {hv});
+  Tensor dt_cpu = MakeT(dt_bias_f32.data(), DType::kF32, Cpu(), {hv});
+  Tensor idx_cpu = MakeT(c.indices.data(), DType::kI32, Cpu(), {batch});
+  Tensor state_cpu_t =
+      MakeT(state_cpu.data(), DType::kF32, Cpu(), {c.slots, hv, dv, dk});
+  Tensor out_cpu_t = MakeT(out_cpu.data(), dtype, Cpu(), {batch, hv, dv});
+  Queue cpu_q = Q();
+  vt::GdnPackedDecode(cpu_q, out_cpu_t, mixed_cpu, a_cpu, b_cpu, al_cpu, dt_cpu,
+                      state_cpu_t, idx_cpu, args);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor d_mixed(gpu, guard.q, dtype, {batch, c.mixed_stride},
+                       c.mixed.data());
+  DeviceTensor d_ba(gpu, guard.q, dtype, {batch, ba_stride}, ba.data());
+  DeviceTensor d_al(gpu, guard.q, DType::kF32, {hv}, a_log_f32.data());
+  DeviceTensor d_dt(gpu, guard.q, DType::kF32, {hv}, dt_bias_f32.data());
+  DeviceTensor d_idx(gpu, guard.q, DType::kI32, {batch}, c.indices.data());
+  Tensor mixed_gpu = d_mixed.tensor();
+  mixed_gpu.shape[1] = c.mixed_cols;
+  Tensor b_gpu = d_ba.tensor().Slice(1, 0, hv);       // stride 96 view
+  Tensor a_gpu = d_ba.tensor().Slice(1, hv, 2 * hv);  // stride 96 view
+
+  auto run = [&](const char* env_value, uint64_t& triton, uint64_t& legacy,
+                 std::vector<uint8_t>& out_host, std::vector<uint8_t>& state_host) {
+    if (env_value == nullptr)
+      unsetenv("VT_GDN_PACKED_DECODE_TRITON");
+    else
+      setenv("VT_GDN_PACKED_DECODE_TRITON", env_value, 1);
+    DeviceTensor d_state(gpu, guard.q, DType::kF32, {c.slots, hv, dv, dk},
+                         state_f32.data());
+    DeviceTensor d_out(gpu, guard.q, dtype, {batch, hv, dv});
+    vt::cuda::testing::ResetGdnPackedDecodeDebugStats();
+    vt::GdnPackedDecode(guard.q, d_out.tensor(), mixed_gpu, a_gpu, b_gpu,
+                        d_al.tensor(), d_dt.tensor(), d_state.tensor(),
+                        d_idx.tensor(), args);
+    const auto stats = vt::cuda::testing::GetGdnPackedDecodeDebugStats();
+    vt::cuda::testing::DisableGdnPackedDecodeDebugStats();
+    triton = stats.triton_launches;
+    legacy = stats.legacy_launches;
+    out_host.resize(out_cpu.size());
+    state_host.resize(state_f32.size());
+    d_out.Download(guard.q, out_host.data());
+    d_state.Download(guard.q, state_host.data());
+  };
+
+  // Default (unset): the hand kernel handles it, the vendored cubin does not fire.
+  uint64_t t0 = 0, l0 = 0;
+  std::vector<uint8_t> out_legacy, state_legacy;
+  run(nullptr, t0, l0, out_legacy, state_legacy);
+  CHECK(t0 == 0);
+  CHECK(l0 == 1);
+  CheckClose(Unpack(out_legacy, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
+
+  // Opt-in "=1": the vendored Triton cubin fires and is bit-close to the oracle
+  // (sequential per-lane reduction), so it matches the CPU reference tightly.
+  uint64_t t1 = 0, l1 = 0;
+  std::vector<uint8_t> out_aot, state_aot;
+  run("1", t1, l1, out_aot, state_aot);
+  CHECK(t1 == 1);
+  CHECK(l1 == 0);
+  CheckClose(Unpack(out_aot, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
+  CheckClose(Unpack(state_aot, DType::kF32), Unpack(state_cpu, DType::kF32),
+             2e-2f, 1e-2f);
+  // The AOT and legacy kernels implement the same semantics; agree closely.
+  CheckClose(Unpack(out_aot, dtype), Unpack(out_legacy, dtype), 2e-2f, 1e-2f);
+
+  unsetenv("VT_GDN_PACKED_DECODE_TRITON");
+}
+#endif  // VLLM_CPP_CUDA && VLLM_CPP_TRITON
+
 // causal_conv1d_fwd CPU-vs-CUDA on one varlen batch.
 void RunConvFwdCudaCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,
                         int64_t c, int64_t k, bool with_bias, bool silu, const Combo& cb,

@@ -5,7 +5,7 @@
 # 'base' lines are the exact generation parameters per dispatcher;
 # 'artifact' lines pin every generated file byte-for-byte.
 arch sm_121a
-generated 2026-07-10
+generated 2026-07-16
 triton 3.6.0
 python 3.12.3
 ptxas Build cuda_12.8.r12.8/compiler.35583870_0
@@ -16,12 +16,14 @@ generator scripts/triton-aot-compile.py sha256=eba7b92b36dc898d3dabdca462eac2363
 source chunk_delta_h.py sha256=02a5768deedc92201d4b88098aaaca31b8ea50f09b5f85dbe1279970cd0c641a
 source chunk_o.py sha256=a818ea28c0a375605ebd09b4eeca3fee172a5e6fcbf17475ad79557210a7e6c1
 source chunk_scaled_dot_kkt.py sha256=3969074950cebb99a27d14d0c615bd758439ed06217e580ea79a839ee2f7e8af
+source fused_recurrent_packed_decode.py sha256=94f98faf9ff0ca7353d5dbd1154bfaa047dd6add50ae9090be2d04561dbf25e4
 source solve_tril.py sha256=7fcb71fffb5463b57285f77a981ba40e6bcaccce5b57bb9ee798d0ad21cdfd20
 source wy_fast.py sha256=043af9d6fb1c9ab7a2bfb46a52f65b650cdabeb1cae393ac5f8d4adacef0f769
 base gdn_chunko_bf16_h32 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,32 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_chunko_bf16_h48 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,48 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *bf16:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_chunko_h32 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,32 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 64, 1, 1
 base gdn_chunko_h48 py=chunk_o.py kernel=chunk_fwd_kernel_o warps=4 stages=3 grid=2,NT,48 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 64, 1, 1
+base gdn_decode_h48 py=fused_recurrent_packed_decode.py kernel=fused_recurrent_gated_delta_rule_packed_decode_kernel warps=1 stages=3 grid=4,NBH,1 signature=*bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, i32, 10240, 96, 96, 786432, 786432, 1, 16, 48, 128, 128, 128, 32, 20, 1
 base gdn_deltah_h32 py=chunk_delta_h.py kernel=chunk_gated_delta_rule_fwd_kernel_h_blockdim64 warps=4 stages=3 grid=2,NH,1 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 128, 64, 64, 1, 0, 1, 1, 1, 1, 0
 base gdn_deltah_h48 py=chunk_delta_h.py kernel=chunk_gated_delta_rule_fwd_kernel_h_blockdim64 warps=4 stages=3 grid=2,NH,1 signature=*bf16:16, *bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32, *bf16:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 48, 16, 128, 128, 64, 64, 1, 0, 1, 1, 1, 1, 0
 base gdn_kkt_h32 py=chunk_scaled_dot_kkt.py kernel=chunk_scaled_dot_kkt_fwd_kernel warps=4 stages=3 grid=NT,32,1 signature=*bf16:16, *fp32:16, *fp32:16, *fp32:16, *i32:16, *i32:16, i32, i32, 32, 16, 128, 64, 64, 1, 1
@@ -46,6 +48,10 @@ artifact gdn_chunko_h48.6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718.c sha256=7
 artifact gdn_chunko_h48.6ce8cd41_0d1d2d3d4d5d6d7d89101112131415161718.h sha256=524a83b4dc17b6f1ba5e3e32e18de5c9c90ff1c33947b0321fe344b98df0c10c
 artifact gdn_chunko_h48.c sha256=df5703243e8cd5501c73da32a16d11f3eb9dcabc697217f6f264eb8dc5588bd7
 artifact gdn_chunko_h48.h sha256=fc815ee19d6ffbb5a7bece5de00cba2721ad473288df645339142fa5188a1fa8
+artifact gdn_decode_h48.81e5f031_0d1d2d3d4d5d6d7d8d91011121314151617181920212223.c sha256=821f3eba983d42a0fdf5b8898592cc469c3501b945ec6c0acbe56e4d8799f47c
+artifact gdn_decode_h48.81e5f031_0d1d2d3d4d5d6d7d8d91011121314151617181920212223.h sha256=a48531ae4b0f6393773fd88f4f3012b737c7cd6b1f422554e7499e1907a758b9
+artifact gdn_decode_h48.c sha256=e8c132942e93e7036e19170caabca7ba00e345e9e45b569a00eac543660189fb
+artifact gdn_decode_h48.h sha256=cdb0bf7a60263fd3c27ed42832af88553362e23af3a55fdab0ba582ddeb7210b
 artifact gdn_deltah_h32.950d2abe_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.c sha256=1be9cb066fa47fec4d10555d999a5281865d83413eb560ac4407a66807a85a5b
 artifact gdn_deltah_h32.950d2abe_0d1d2d3d4d56d7d8d9d10d111213141516171819202122232425.h sha256=7bbd50d4bc435ae752469b2849effc74947a04f89be9a588007988915d4d9e6b
 artifact gdn_deltah_h32.c sha256=f50ae31513638061d592959cbd97d81ce748dabcf5345cfbd0b60e0509d0f898

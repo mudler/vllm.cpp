@@ -142,6 +142,22 @@ exact grid (fresh vLLM denominators; `--mamba-ssm-cache-dtype float32`; cite
 `702f481`) **has now RUN — new binding `246a23c`: 49/124** (supersedes `3f256ab`'s
 55/124). 35B performance stays excluded until 27B reaches 124/124.
 
+**Decode recurrence perf lever (2026-07-16, completed follow-up on the DONE
+`KERNEL-GDN-PACKED-DECODE` row; no separate claim — a DONE row is not
+re-claimable).** The naive register-resident hand port PROOF-FAILED; Phase-1
+`cuobjdump` MEASURED the codegen cause (vLLM FLA decode cubin REG:205/0-spill vs
+the hand port REG:255+STACK:48 spill — register allocation, the sanctioned-
+exception premise), so vLLM's exact decode kernel was vendored as the AOT cubin
+`gdn_decode_h48` (27B-only) behind `VT_GDN_PACKED_DECODE_TRITON` (default OFF; the
+hand kernel stays the default). DGX-gated GREEN (AOT op test 28/28, full GDN
+49/49, oracle boundary 12/12, 27B model gate 235/235 token-exact with the Triton
+path ON, memcheck 0/0); recorded in the `KERNEL-GDN-PACKED-DECODE` row cell, the
+[spec](specs/gdn-packed-decode.md#decode-recurrence-perf-lever--measured-codegen-bound-vendored-triton-cubin-2026-07-16),
+the ledger, and porting-inventory §9. Owned files: the shim, the cmake decl, the
+vendored cubin, `TryTritonPackedDecode` + counter in `cuda_gdn.cu`, and the AOT
+test — none overlapping another active claim; GPU work ran under one
+`flock /tmp/gpu` per series.
+
 `CLAIM-LOAD-WINDOWED-1` (row `LOAD-SAFETENSORS`) is complete and released
 2026-07-15: implementation `cb2d310` plus the measured one-flock VmHWM A/B
 (OFF 48,285,916 kB vs ON 24,750,704 kB = VmRSS, −23.54 GB; ON-arm smoke 6/6;

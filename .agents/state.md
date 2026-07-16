@@ -11992,3 +11992,59 @@ in the same commit. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude 
   attribution; sampler-alloc handed to the W3-throughput owner. Stale lane
   claims (missing reconcile spec; "nothing in flight on recurrence")
   corrected in the spec. Read-only; binding stays 49/124.
+## 2026-07-16 — GDN packed-decode recurrence lever: MEASURED codegen-bound → vendored Triton cubin (`CLAIM-GDN-DECODE-TRITON`)
+
+Owned the +2.06 ms/step GDN packed-decode recurrence lever. The prior naive
+register-resident hand port (`GdnPackedDecodeRegTileKernel`) had FAILED its DGX
+proof (oracle boundary FAIL + c16 700.5 vs 793.6 tok/s; default flipped OFF at
+`309c218`). Decided on MEASURED grounds, then spiked the winner.
+
+**Phase 1 — measured the real difference (dgx `~/work/vllm.cpp-gdn-recurrence/phase1`).**
+Ran the packed-decode oracle under the vLLM 0.25.0 venv with a pinned
+`TRITON_CACHE_DIR` to compile vLLM's FLA decode kernel; extracted launch metadata
+(num_warps=1, num_stages=3, grid `(4, B·48)`, shared 1024 B, register-resident)
+and `cuobjdump -res-usage` on all three compiled cubins at the matched c16 27B
+shape (ncu GPU perf counters are admin-gated on the box — `RmProfilingAdminOnly:1`,
+sudo needs a password — so register/spill came from the cubins, which needs no GPU
+perms; effective BW from timing + analytic bytes):
+
+| Kernel (bf16 act / f32 state) | REG | STACK (spill) | SHARED | warps/block |
+|---|---|---|---|---|
+| vLLM FLA decode cubin | **205** | **0** | 1024 | 1 |
+| legacy `GdnPackedDecodeKernel` (NW=8, ships) | 56 | 0 | 3200 | 8 |
+| naive `RegTileKernel<BK=128>` (dk=128) | **255 (capped)** | **48 (SPILLS)** | 2048 | 1 |
+
+WHY Triton wins: Triton/ptxas fit the identical register-resident `[32,128]` fp32
+tile + the two axis-1 reductions in **205 registers with ZERO spills**; the
+hand-CUDA `float sh[128]` + `#pragma unroll` hits the **255-register hard ceiling
+and spills to local memory** — fatal for a bandwidth-bound decode. Register
+allocation / codegen (the structure was ported 1:1 and still spills), the exact
+PROVEN-codegen-bound case the sanctioned Triton-AOT exception covers.
+
+**Phase 2 — DECISION: sanctioned vendored Triton cubin (not a portable redesign).**
+A portable occupancy-aware redesign would fight NVCC's allocator to match ptxas's
+205/0-spill AND fix the naive port's latent correctness bug — high-risk, and the
+sibling delta_h kernel already proved this family codegen-bound. Landed:
+`triton_kernels/fused_recurrent_packed_decode.py` (FLA body verbatim; AOT
+adaptations: scale pinned `Dk^-0.5` in-kernel, constexpr dims/strides pinned to
+the 27B call site + launcher-guarded, dead grid-carrier `NBH`, state-index ABI
+adapter `state_idx < 0`), one specialization `gdn_decode_h48` (27B-only) declared
+in `cmake/TritonAOTKernels.cmake`+`CMakeLists.txt`, regenerated + vendored cubin
+at `src/vt/cuda/triton_aot_vendored/sm_121a/gdn_decode_h48.*` (+ MANIFEST),
+`TryTritonPackedDecode` in `cuda_gdn.cu` behind `VT_GDN_PACKED_DECODE_TRITON`
+(default OFF; hand kernel stays the default fallback) with a `triton_launches`
+debug sub-counter. Gotcha fixed: a float constexpr `20.0` in the AOT signature
+produced an invalid C++ symbol → pinned `SOFTPLUS_THRESHOLD` to int `20`
+(comparison-identical). 35B does NOT select packed decode; OFF/non-Triton builds
+byte-inert.
+
+**Gates (GB10 sm_121a, root `~/work/vllm.cpp-gdn-recurrence`, one flock/series).**
+AOT-vs-legacy-vs-CPU op test 28/28 (default → legacy fires, `=1` → cubin fires,
+both match the CPU reference at the exact 27B merged-BA config); full `test_ops_gdn`
+49/49 (2343 asserts); oracle boundary 12/12 (legacy path bit-exact preserved);
+**27B model gate 235/235 token-exact with `VT_GDN_PACKED_DECODE_TRITON=1`**;
+compute-sanitizer 0 errors/0 leaks; default-off gate 235/235. CPU: clean -Werror
+build, `test_ops_gdn` 45/45 (AOT case CUDA-only, skipped). c16 A/B
+(`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved 3 pairs + w0 cold
+discard, one flock, root `ab-decode-triton`): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed.
+`benchmark_binding=false`; binding stays 49/124.

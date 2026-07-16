@@ -636,6 +636,45 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     flip-to-default decision (+ the per-shape AOT-config tune to squeeze the GDN
     1.18× residual).
 
+    **IMPLEMENTED — packed pure-decode recurrence (2026-07-16;
+    `CLAIM-GDN-DECODE-TRITON`).** The GDN packed pure-decode recurrence
+    (`fused_recurrent_gated_delta_rule_packed_decode_kernel`,
+    `fla/ops/fused_recurrent.py:256-336`, launch `:439-478`, num_warps=1/
+    num_stages=3) joins the sanction as the FIRST decode-side vendored kernel, and
+    the FIRST landed under a MEASURED-not-inferred codegen proof.
+    `triton_kernels/fused_recurrent_packed_decode.py` (FLA body VERBATIM; AOT
+    adaptations: scale pinned to Dk^-0.5 in-kernel — same fp32-scalar mis-pack as
+    chunk_o; constexpr dims/strides pinned per-shape to the 27B call site; one dead
+    grid-carrier `NBH`=B*HV; state-index ABI adapter `state_idx < 0` for our
+    slot-0-valid cache ABI vs FLA's `<= 0`). One specialization gdn_decode_h48
+    (27B: H=16, HV=48, K=V=128, BK=128, BV=32; 35B does NOT select packed decode);
+    dispatch `TryTritonPackedDecode` in `cuda_gdn.cu` behind runtime toggle
+    `VT_GDN_PACKED_DECODE_TRITON` (**default OFF** — a new perf lever), guarding
+    every dtype/stride/shape and falling back to the hand `GdnPackedDecodeKernel`
+    (the DEFAULT) on any mismatch; CPU ref + hand kernel PRESERVED, OFF build
+    byte-inert.
+    WHY (MEASURED, dgx `~/work/vllm.cpp-gdn-recurrence/phase1`, GB10 sm_121a,
+    cuobjdump -res-usage on the compiled cubins at the c16 shape): the vLLM FLA
+    decode cubin holds the register-resident [BV=32,BK=128] fp32 state tile at
+    **REG:205, STACK:0, LOCAL:0 (ZERO spills)**; the byte-for-byte hand-CUDA port
+    (`GdnPackedDecodeRegTileKernel`, `float sh[128]` + `#pragma unroll`) compiles to
+    **REG:255 (the hard ceiling) + STACK:48 (SPILLS to local)** — fatal for a
+    state-bandwidth-bound decode (the naive port measured 700.5 vs 793.6 tok/s and
+    FAILED the oracle boundary on DGX 54f0541). The legacy shared-staged hand kernel
+    is REG:56 / 8-warp / 0-spill at ~83% of peak BW; vLLM ~92%. The gap is register
+    allocation / codegen (structure ported 1:1, still spills) — the sanction's
+    exact premise, MEASURED not inferred. DECISION: vendored cubin (a portable
+    occupancy-aware redesign would fight NVCC's allocator to match ptxas AND fix the
+    naive port's latent correctness bug; codegen-bound, not a config we mis-set).
+    GATES (GB10 sm_121a, `~/work/vllm.cpp-gdn-recurrence`): AOT-vs-legacy-vs-CPU op
+    test 28/28 (proves default stays legacy, `=1` fires the cubin, both match the
+    reference); full `test_ops_gdn` 49/49 (2343 assertions); oracle boundary 12/12
+    (legacy path bit-exact preserved); **27B model gate 235/235 token-exact with the
+    Triton decode path ON** (bit-identical to vLLM through the full model);
+    compute-sanitizer 0 errors / 0 leaks; default-off gate 235/235.
+    MEASURED c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved 3
+    pairs + w0 cold discard, one flock): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. Kept default-OFF ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed..
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

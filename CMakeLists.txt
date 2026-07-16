@@ -469,6 +469,36 @@ if(VLLM_CPP_CUDA)
     endforeach()
     target_compile_definitions(vllm PUBLIC VLLM_CPP_TRITON_CHUNKO_BF16=1)
 
+    # ── SANCTIONED Triton AOT: GDN packed pure-decode recurrence ────────────────
+    # FLA fused_recurrent.py:256-336 fused_recurrent_gated_delta_rule_packed_decode
+    # _kernel -> triton_kernels/fused_recurrent_packed_decode.py. Dispatch
+    # TryTritonPackedDecode (VT_GDN_PACKED_DECODE_TRITON, default OFF) in
+    # cuda_gdn.cu; the hand GdnPackedDecodeKernel stays the DEFAULT and the
+    # portable fallback. MEASURED codegen-bound (dgx phase1 2026-07-16): the
+    # register-resident [BV=32,BK=128] fp32 state tile is REG:205/0-spill under
+    # Triton but REG:255+STACK:48 (spills) as hand-CUDA. 27B ONLY (H=16, HV=48,
+    # K=V=128, BK=128, BV=32); 35B does not select packed decode. num_warps=1,
+    # num_stages=3 (FLA launch :465-466). grid.x = cdiv(V,BV) = 4 baked; grid.y =
+    # NBH (= B*HV) is the runtime carrier. scale PINNED to Dk^-0.5 in-kernel
+    # (Triton AOT mis-packs fp32 scalars). Strides/dims BAKED to the 27B call site
+    # (mixed_qkv 10240, a/b merged-view 96, state 786432, indices 1) and GUARDED in
+    # TryTritonPackedDecode. State-index ABI adapter: skip `state_idx < 0` (our
+    # cache ABI; FLA skips <= 0). Args: mixed_qkv a b A_log dt_bias o h0 ht
+    # ssm_state_indices NBH | strides... H HV K V BK BV SOFTPLUS_THRESHOLD
+    # USE_QK_L2NORM_IN_KERNEL. dtypes: mixed_qkv/a/b/o bf16, A_log/dt_bias/h0/ht
+    # fp32, indices i32.
+    set(VT_GDN_DECODE_WARPS_48  1 CACHE STRING "packed decode H=48 Triton num_warps")
+    set(VT_GDN_DECODE_STAGES_48 3 CACHE STRING "packed decode H=48 Triton num_stages")
+    set(_DECODE_KPY "${CMAKE_SOURCE_DIR}/triton_kernels/fused_recurrent_packed_decode.py")
+    set(_DECODE_KFN fused_recurrent_gated_delta_rule_packed_decode_kernel)
+    set(_DECODE_SIG "*bf16:16, *bf16:16, *bf16:16, *fp32:16, *fp32:16, *bf16:16, *fp32:16, *fp32:16, *i32:16, i32, 10240, 96, 96, 786432, 786432, 1, 16, 48, 128, 128, 128, 32, 20, 1")
+    add_triton_kernel(VT_GDN_DECODE_48_SRCS
+      "${_DECODE_KPY}" ${_DECODE_KFN} gdn_decode_h48
+      "${_DECODE_SIG}" "4,NBH,1"
+      ${VT_GDN_DECODE_WARPS_48} ${VT_GDN_DECODE_STAGES_48})
+    target_sources(vllm PRIVATE ${VT_GDN_DECODE_48_SRCS})
+    target_include_directories(vllm PRIVATE ${VT_GDN_DECODE_48_SRCS_INCLUDE_DIR})
+
     # ── SANCTIONED Triton AOT: GDN WU pipeline (kkt -> solve_tril -> recompute_w_u)
     # The 3 FLA kernels our single fused GdnChunkWUWmmaVecKernel mirrors; ported so
     # the WU (biggest ~25% GDN) share runs on Triton codegen. Dispatch TryTritonWU

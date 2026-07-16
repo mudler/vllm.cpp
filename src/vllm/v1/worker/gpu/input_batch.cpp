@@ -145,6 +145,7 @@ int InputBatch::get_active_token_count(int req_index) const {
 }
 
 int InputBatch::add_request(const CachedRequestState& request) {
+  sampling_metadata_dirty_ = true;  // batch changed -> refresh_metadata rebuild
   const int req_index = register_add_request();
   const std::string& req_id = request.req_id;
 
@@ -242,7 +243,24 @@ int InputBatch::add_request(const CachedRequestState& request) {
   return req_index;
 }
 
-SamplingMetadata InputBatch::make_sampling_metadata() const {
+const SamplingMetadata& InputBatch::make_sampling_metadata() const {
+  // Batch-change-gated rebuild (rescan §6 item e), mirroring upstream
+  // refresh_metadata (gpu_input_batch.py:812-830): rebuild the cached metadata
+  // only when a batch mutation set sampling_metadata_dirty_. Deviation: our port
+  // COPIES output_token_ids where upstream holds a live reference, so when
+  // penalties are active (!no_penalties) — the only case that embeds the
+  // per-step-growing output tokens — we rebuild every call to keep them fresh.
+  // For the greedy / no-penalties gate workload the metadata depends only on the
+  // (unchanged) request set + static sampling params, so the cache is
+  // bit-identical to a fresh build.
+  if (sampling_metadata_dirty_ || !no_penalties()) {
+    sampling_metadata_cache_ = build_sampling_metadata();
+    sampling_metadata_dirty_ = false;
+  }
+  return sampling_metadata_cache_;
+}
+
+SamplingMetadata InputBatch::build_sampling_metadata() const {
   // Port of gpu_input_batch.py::_make_sampling_metadata (@ e24d1b24). Fills the
   // dense [0, num_reqs) prefix, matching upstream's field-fill order + the
   // "skip the copy when not needed" None/[]-defaults.
@@ -355,6 +373,7 @@ std::optional<int> InputBatch::remove_request(const std::string& req_id) {
   if (it == req_id_to_index.end()) {
     return std::nullopt;
   }
+  sampling_metadata_dirty_ = true;  // batch changed -> refresh_metadata rebuild
   const int req_index = it->second;
   req_id_to_index.erase(it);
 
@@ -416,7 +435,12 @@ void InputBatch::condense() {
       break;
     }
 
-    // Move the active request at last_req_index down into empty_index.
+    // Move the active request at last_req_index down into empty_index. This
+    // reorders the dense [0,num_reqs) prefix -> the sampling metadata must be
+    // rebuilt (upstream tracks this as a batch_update_builder.moved). Set only
+    // on an actual move so the no-op condense (called every step) preserves the
+    // cache.
+    sampling_metadata_dirty_ = true;
     removed_tracker_.pop_removed();
     const std::optional<std::string> req_id =
         req_ids[static_cast<size_t>(last_req_index)];
@@ -496,6 +520,7 @@ void InputBatch::swap_states(int i1, int i2) {
   if (i1 == i2) {
     return;
   }
+  sampling_metadata_dirty_ = true;  // reorders the dense prefix -> rebuild
   const std::optional<std::string> old_id_i1 = req_ids[static_cast<size_t>(i1)];
   const std::optional<std::string> old_id_i2 = req_ids[static_cast<size_t>(i2)];
 

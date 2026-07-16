@@ -368,13 +368,20 @@ SchedulerOutput Scheduler::schedule() {
   SchedulerOutput scheduler_output;
   scheduler_output.scheduled_new_reqs = std::move(new_reqs_data);
   scheduler_output.scheduled_cached_reqs = std::move(cached_reqs_data);
-  scheduler_output.num_scheduled_tokens = num_scheduled_tokens;
+  // MOVE the num_scheduled_tokens map (dead after this) and the finished_req_ids
+  // set (member, re-assigned fresh in update_after_schedule) instead of COPYING
+  // them — vLLM passes the dicts by reference (rescan §6 item e, container
+  // plumbing only, zero policy change). The local map is not read after this;
+  // update_after_schedule reads scheduler_output.num_scheduled_tokens (the moved
+  // destination) and clears the finished_req_ids member (`= {}`) so its
+  // moved-from state is unobservable.
+  scheduler_output.num_scheduled_tokens = std::move(num_scheduled_tokens);
   scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens;
   // scheduled_spec_decode_tokens / scheduled_encoder_inputs stay empty (T0).
   scheduler_output.num_common_prefix_blocks = std::move(num_common_prefix_blocks);
   // finished_req_ids is EXISTING scheduler state (finished between the prior and
-  // current step) — copied out here, then flushed in _update_after_schedule.
-  scheduler_output.finished_req_ids = finished_req_ids;
+  // current step) — moved out here, then flushed in _update_after_schedule.
+  scheduler_output.finished_req_ids = std::move(finished_req_ids);
   // free_encoder_mm_hashes stays empty (encoder deferred).
 
   update_after_schedule(scheduler_output);

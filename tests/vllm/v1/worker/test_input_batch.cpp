@@ -335,3 +335,50 @@ TEST_CASE("CachedRequestState.get_token_id and num_tokens") {
   CHECK(state.get_token_id(2) == 12);
   CHECK(state.get_token_id(3) == -1);  // past the end
 }
+
+// ─── SamplingMetadata batch-change-gated rebuild (rescan §6 item e) ──────────
+
+TEST_CASE("make_sampling_metadata rebuild is gated on batch change") {
+  // Upstream refresh_metadata rebuilds self.sampling_metadata ONLY when the
+  // batch changes; the correctness invariant the cache must preserve is that the
+  // returned metadata always reflects the current dense [0,num_reqs) prefix.
+  // frequency_penalties is always sized num_reqs (built regardless of penalties).
+  InputBatch batch = make_batch();
+  batch.add_request(make_req("a", {1}, {}, {0}));
+  CHECK(batch.make_sampling_metadata().frequency_penalties.size() == 1);
+
+  // A second add MUST invalidate the cache -> size 2 (a non-invalidating cache
+  // would return the stale size-1 metadata here — the RED this guards).
+  batch.add_request(make_req("b", {2}, {}, {1}));
+  CHECK(batch.make_sampling_metadata().frequency_penalties.size() == 2);
+
+  // Repeated calls without a batch change return the SAME cached object with
+  // identical content (the cache hit).
+  const auto& m1 = batch.make_sampling_metadata();
+  const auto& m2 = batch.make_sampling_metadata();
+  CHECK(&m1 == &m2);
+  CHECK(m1.frequency_penalties.size() == 2);
+
+  // remove + condense MUST invalidate -> the dense prefix shrinks to 1.
+  batch.remove_request("a");
+  batch.condense();
+  CHECK(batch.make_sampling_metadata().frequency_penalties.size() == 1);
+}
+
+TEST_CASE("make_sampling_metadata stays fresh when penalties are active") {
+  // The one caching deviation: with penalties active the metadata embeds the
+  // per-step-mutable output_token_ids (a copy in our port), so make_sampling_
+  // metadata rebuilds every call. Verify the penalty branch produces a
+  // current-state result.
+  InputBatch batch = make_batch();
+  SamplingParams pen;
+  pen.repetition_penalty = 1.2;  // -> no_penalties() == false
+  batch.add_request(make_req("a", {1, 2, 3}, {4}, {0}, pen));
+
+  const auto& md = batch.make_sampling_metadata();
+  CHECK_FALSE(md.no_penalties);
+  REQUIRE(md.output_token_ids.size() == 1);
+  CHECK(md.output_token_ids[0] == std::vector<int32_t>{4});
+  // frequency/presence/repetition penalty slices are sized to the batch.
+  CHECK(md.repetition_penalties.size() == 1);
+}

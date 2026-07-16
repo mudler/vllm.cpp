@@ -165,13 +165,19 @@ class InputBatch {
   // num_reqs (property): len(req_id_to_index).
   int num_reqs() const { return static_cast<int>(req_id_to_index.size()); }
 
-  // make_sampling_metadata: build a SamplingMetadata for the current dense
-  // [0, num_reqs) prefix from the per-slot arrays + predicates. Port of
-  // gpu_input_batch.py::_make_sampling_metadata (M1.5-deferred, landed at M1.7).
-  // Upstream caches this on self.sampling_metadata and rebuilds it whenever the
-  // batch changes (add_request / condense); here it is recomputed on demand (the
-  // caching + refresh_metadata scheduling is the model runner's concern, M1.8).
-  SamplingMetadata make_sampling_metadata() const;
+  // make_sampling_metadata: return the SamplingMetadata for the current dense
+  // [0, num_reqs) prefix. Port of gpu_input_batch.py::_make_sampling_metadata
+  // (build_sampling_metadata) + refresh_metadata's batch-change gate
+  // (gpu_input_batch.py:812-830): upstream caches self.sampling_metadata and
+  // rebuilds ONLY when the batch changes (add / remove / condense / swap). We
+  // mirror that here — the result is cached and rebuilt only when
+  // sampling_metadata_dirty_ is set by a batch mutation (rescan §6 item e). The
+  // one deviation: because our port COPIES output_token_ids (upstream holds a
+  // live reference), we also rebuild every step when penalties are active
+  // (!no_penalties()), so the decode-advancing output tokens stay fresh; the
+  // greedy / no-penalties gate workload gets the full caching win bit-identically
+  // (the metadata then depends only on the request set + static sampling params).
+  const SamplingMetadata& make_sampling_metadata() const;
 
   // Sampling predicates the M1.7 sampler keys on (upstream properties).
   bool all_greedy() const { return random_reqs.empty(); }
@@ -292,7 +298,17 @@ class InputBatch {
   // _get_active_token_count: num_tokens_no_spec[i] + len(spec_token_ids[i]).
   int get_active_token_count(int req_index) const;
 
+  // The uncached SamplingMetadata builder (upstream _make_sampling_metadata).
+  SamplingMetadata build_sampling_metadata() const;
+
   RemovedTracker removed_tracker_;
+
+  // Cached sampling metadata + its batch-change dirty flag (upstream
+  // self.sampling_metadata + batch_update_builder). Mutable so the const
+  // make_sampling_metadata() can refresh the cache; the dirty flag is set by
+  // every batch mutation (add_request / remove_request / condense / swap_states).
+  mutable SamplingMetadata sampling_metadata_cache_;
+  mutable bool sampling_metadata_dirty_ = true;
 };
 
 }  // namespace vllm::v1

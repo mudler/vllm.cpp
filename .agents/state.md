@@ -11830,3 +11830,59 @@ preserved. Decision next session on measured grounds. Binding stays
   the fix is whatever pinned vLLM does.
 - Diagnostic only: `benchmark_binding=false`, binding stays 49/124, evidence
   root untouched.
+## 2026-07-16 — decode norm/quant "fusion" lever RECONCILED → REFUTED and CLOSED; residual is cross-profiler-confounded EFFICIENCY, not fusion (`CLAIM-EW-NORM-QUANT-RECONCILE`, worktree `.claude/worktrees/agent-a85c6c143542d10af`)
+
+Grounded, evidence-first reconciliation of the "~2.0 ms/step c16 decode norm/quant
+FUSION lever" (`KERNEL-EW-NORM-QUANT`). **Records-only; no src change; production
+byte-identical.** Full write-up:
+[decode-norm-quant-fusion-reconcile-2026-07-16.md](specs/decode-norm-quant-fusion-reconcile-2026-07-16.md).
+
+**VERDICT: the FUSION lever is REFUTED and CLOSED.** vLLM's production denominator
+does NOT fuse rmsnorm+fp4quant — three independent proofs:
+  1. The `3f256ab` DUMPED Inductor body of the `…fused_add_rms_norm_scaled_fp4_quant…`
+     kernels "stops after residual-add + RMSNorm and stores BF16; the wrapper then
+     invokes `torch.ops._C.scaled_fp4_quant.out` separately" (`nvfp4-small-m-dispatch.md:956-960`).
+  2. `fuse_norm_quant=False` in the oracle config (audit 2026-07-15 + the 2026-07-14
+     parity rescan, which already recorded this gap CLOSED/DISPROVEN at `BENCHMARKS.md:211`).
+  3. COUNT PARITY in the FRESH 2026-07-16 correct-state c16 trace
+     (`~/work/vllm.cpp-gdn-stateio-trace/20260716`): vLLM runs `cvt_fp16_to_fp4` at
+     **144/win == ours' 144 `ScaledFp4Quant`/step**, and both run 129 rmsnorm/step.
+Ours ALREADY has vLLM's exact structure: separate add+RMSNorm→bf16, then a separate
+FP4 quant. The `…scaled_fp4_quant…` substring in the `triton_red_*` names is the
+Inductor graph-region label, NOT a fused quant (the "misleading trace name" the records
+warn against twice). The ONE real fusion — silu+fp4quant (`fuse_act_quant=True` /
+`ActivationQuantFusionPass` → `silu_mul_cvt_fp16_to_fp4`) — is ALREADY mirrored by
+`SiluAndMulFp4QuantKernel` / `VT_FUSE_SILU_QUANT` (default ON, bit-exact).
+
+**CORRECTION:** the 2026-07-16 `SUMMARY.json` note `"vLLM fuses add+rmsnorm+fp4quant"`
+and its "named parallel lever = Inductor add+RMSNorm+FP4-quant … decode fusion"
+REGRESSED the disposition — a name-based inference contradicting the 2026-07-13
+body-dump and the 2026-07-14 rescan. The body-dump/rescan disposition STANDS; the
+README/BENCHMARKS/state text seeded from that note is corrected in this same commit.
+
+**CORRECTED ATTRIBUTION.** Fusion-attributable headroom **~0 ms/step** (nothing to
+mirror; mirroring vLLM here = keep norm and quant SEPARATE, which we do). The residual
+~2.58 µs·k glue delta (rmsnorm 391 vs 2006 µs/step; quant 342 vs 641) is per-kernel
+EFFICIENCY and cross-profiler-confounded — nsys graph-node (ours) vs torch CUPTI
+(vLLM); the 2026-07-14 rescan already called the +1.81 ms rmsnorm residual "a
+cross-profiler artifact". Fresh decode-shape RMSNorm microbench
+(`~/work/vllm.cpp-ewnorm-spike/rmsnorm_decode_spike.cu`, sm_121a, `flock /tmp/gpu`,
+graph-replay timed): the shipped `RmsNormRowKernel` is **6.35/8.50/9.18 µs isolated**
+at M=16 (H 2048/3072/4096) — NOT the 15.5 µs the in-trace number implies (the extra is
+graph-node + GEMM-bandwidth contention). A single-pass shared-staged bf16x2-vectorized
+variant is **1.27-1.49×** faster but reorders the f32 reduction ⇒ occasional 1-ULP
+(token-exactness hazard, per-arch like the attn preamble). So the real recoverable
+headroom is a NON-bit-exact ≤1.5× on a 6-9 µs kernel ⇒ **~0.3-0.5 ms/step c16 ceiling
+(~0.3% of the 168 ms TPOT)**, reassigned to `KERNEL-EW-NORM-ACT`.
+
+**DECISION (mirror-vLLM + ground-in-upstream + no-spike-from-a-misleading-name):** do
+NOT implement any rmsnorm+fp4quant fusion. The efficiency redirect is left as a spiked
+`KERNEL-EW-NORM-ACT` step gated on a 27B-fp4 token gate (35B fp8 is ULP-sensitive → OFF)
+AND an in-situ interleaved c16 A/B (isolated-fast ≠ in-situ-fast — the reg-tile lever,
+`54f0541`, proved exactly this: isolated recurrence tiling was −12% in-situ). Given the
+≤0.5 ms ceiling, a null in-situ result is the likely outcome — spike first.
+
+`KERNEL-EW-NORM-QUANT` stays `PARTIAL`; `CLAIM-EW-NORM-QUANT-RECONCILE` released.
+`benchmark_binding=false`, no speed credit, binding stays 49/124. Doc-checkpoint +
+agent-record checkers green; README/BENCHMARKS/kernel-matrix/ledger/coordination updated
+in the same commit. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]`.

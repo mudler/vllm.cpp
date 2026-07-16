@@ -162,3 +162,36 @@ recurrence lever (separate). Hardware: dgx GB10 sm_121a, one flock/series.
 Numerics-changing mirror ⇒ default OFF, gated. Product/parity: mirroring vLLM
 means the vectorized 1024-thread reduction; its 1-ULP drift is the same hazard
 already accepted per-arch for the attention preamble. No re-goldening.
+
+## DGX proof verdict + DEFAULT FLIP (2026-07-16/17, `CLAIM-EW-NORM-ACT-1`; finalized by the orchestrator after the owning agent was repeatedly killed by API-529s)
+
+Evidence root `dgx:~/work/vllm.cpp-ewnorm-act-src` (gate3.out, gate4.out,
+proof JSONs; immutable).
+
+**gate3 — token gates: ALL PASS, both flags, both models** (source `5a53fb5`,
+build `-DVLLM_CPP_TRITON=ON`): 27B paged-forward flag-off 17/17 cases + 84/84
+asserts, flag-on 17/17 + 84/84; 35B flag-off 4/4 + 8/8, flag-on 4/4 + 8/8.
+The reordered-reduction 1-ULP hazard did not surface in either greedy gate.
+gate3's c16/c2 A/B legs were **VOID** — the build lacked the CUTLASS FP4/FA2
+fast paths (c16 ~50 tok/s / TPOT ~2.6 s / TTFT ~32 s; the same defect that
+voided the W3 round-1 A/B; see the dgx build rule below).
+
+**gate4 — corrected-build A/B (CUTLASS FP4 + FA2 hard-verified in the
+configure log): the fast kernel WINS at c16.** Interleaved w0 + 3 pairs,
+binding c16-r1 corpus: fast r1/r2/r3 tput **801.71/802.37/799.48** tok/s,
+meanTPOT **164.88/164.78/165.14** ms vs legacy r1/r2 **792.97/793.15**,
+**166.56/166.68** — paired **+8.7/+9.2 tok/s (+1.1%)**, meanTPOT
+**−1.68/−1.90 ms**, matching the c2/c8 attribution's ~1.65 ms RMSNorm
+prediction (`62d4762`). Leg disposition: **c16 legacy-r3 VOID** (641.14 tok/s
+/ TPOT 193.9 / TTFT 4033 — a ~20% interference anomaly ~20:00Z, cause not
+identified; verdict rests on the 2 clean pairs + w0 sanity 800.86, majority
+rule). c2 legs show the documented small-sample arrival lottery: pooled
+medians fast ≈107.9 vs legacy ≈108.3 ms (parity-to-slightly-better; NOT
+over-claimed; the c2 in-situ credit waits for the next grid).
+
+**FLIP: `VT_RMSNORM_DECODE_FAST` default ON; `=0` rolls back** to the
+one-block-per-row `RmsNormRowKernel` (kept for bit-exact reproduction of
+pre-flip token streams). Acceptance met: both token gates hold AND the A/B
+wins (TPOT down, tput up). Flag tests inverted RED→GREEN
+(`tests/vt/test_rmsnorm_decode_fast.cpp`); launcher/header comments updated.
+The next binding grid runs the fast kernel by default.

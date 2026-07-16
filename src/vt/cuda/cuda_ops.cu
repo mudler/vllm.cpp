@@ -91,7 +91,8 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
 }
 
 // ---------------------------------------------------------------------------
-// Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST, default OFF). 1:1 port of
+// Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST, default ON; '0' rolls
+// back to RmsNormRowKernel). 1:1 port of
 // vLLM's OWN vectorized CUDA rms-norm — the CUDA embodiment of the SAME reduction
 // the production Inductor triton_red kernel runs at decode:
 //   csrc/libtorch_stable/layernorm_kernels.cu:106-173 (fused_add_rms_norm_kernel
@@ -104,7 +105,11 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
 //   ~parity (2.83 us nsys / 4.10 us event, 2.24-2.50x over V0), bf16-EXACT vs
 //   RmsNormRowKernel at c2-c16 (2/163840 elements 1-ULP at c32 on adversarial
 //   data). The variance reduction is reordered vs the 256-thread tree, so this is
-//   NOT bit-identical (token-exactness hazard) => default OFF until gated.
+//   NOT bit-identical (token-exactness hazard) => shipped OFF until the DGX
+//   proof, then flipped ON: gate3 token gates PASS both models with the fast
+//   kernel (27B 17/17+84/84, 35B 4/4+8/8) and the corrected gate4 c16 A/B wins
+//   (meanTPOT -1.68/-1.90 ms clean pairs, tput +8.7/+9.2 tok/s; evidence
+//   dgx:~/work/vllm.cpp-ewnorm-act-src, spec rmsnorm-decode-fast-2026-07-16.md).
 //
 // Scope: the bf16-in / bf16-out / bf16-residual decode path (the 129 input/
 // post-attn/final RMSNorm launches/step, all H=5120). Every other dtype/residual
@@ -235,8 +240,9 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
-  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default OFF): only meaningful for the
-  // bf16 add+RMSNorm decode launches; every other case keeps RmsNormRowKernel.
+  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default ON; '0' = rollback): only
+  // engages for the bf16 add+RMSNorm decode launches; every other case keeps
+  // RmsNormRowKernel.
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
     if (TryLaunchRmsNormDecodeFast(s, out, x, w, args, residual, rows, h)) {
       Check(cudaGetLastError(), "rmsnorm fast launch");

@@ -254,15 +254,16 @@ TEST_CASE("CUDA rmsnorm fused residual matches CPU and updates residual") {
   }
 }
 
-// VT_RMSNORM_DECODE_FAST (default OFF): the vectorized decode kernel
-// (RmsNormRowFastKernel, a 1:1 port of vLLM fused_add_rms_norm_kernel<bf16,8>,
-// csrc/libtorch_stable/layernorm_kernels.cu:106-173 @ e24d1b24) must match the
-// shipped RmsNormRowKernel at the real 27B decode shape (M x H=5120, bf16 in/out,
-// bf16 residual, gemma). The reduction is reordered (1024-thread block vs the
-// 256-thread tree), so the contract is one-bf16-ulp, NOT bit-identity — the
-// standalone spike measured bf16-EXACT at c2-c16 and 2/163840 elements 1-ulp at
-// c32. Runs both arms on the GPU (setenv per call; the launcher reads getenv per
-// call) and compares. Skips when the flag path does not engage (no CUDA).
+// VT_RMSNORM_DECODE_FAST (default ON; '0' = rollback): the vectorized decode
+// kernel (RmsNormRowFastKernel, a 1:1 port of vLLM fused_add_rms_norm_kernel
+// <bf16,8>, csrc/libtorch_stable/layernorm_kernels.cu:106-173 @ e24d1b24) must
+// match the rollback RmsNormRowKernel at the real 27B decode shape (M x H=5120,
+// bf16 in/out, bf16 residual, gemma). The reduction is reordered (1024-thread
+// block vs the 256-thread tree), so the contract is one-bf16-ulp, NOT
+// bit-identity — the standalone spike measured bf16-EXACT at c2-c16 and
+// 2/163840 elements 1-ulp at c32. Runs both arms on the GPU with EXPLICIT env
+// values ("1" fast / "0" rollback; the launcher reads getenv per call) so the
+// comparison is default-independent, and compares. Skips when no CUDA.
 void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   const auto xf = RandomF32(static_cast<size_t>(t * h), seed);
   const auto wf = RandomF32(static_cast<size_t>(h), seed + 1);
@@ -278,11 +279,7 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   DeviceTensor dw(gpu, gq.q, DType::kBF16, {h}, wb.data());
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& res_bytes) {
-    if (fast) {
-      ::setenv("VT_RMSNORM_DECODE_FAST", "1", 1);
-    } else {
-      ::unsetenv("VT_RMSNORM_DECODE_FAST");
-    }
+    ::setenv("VT_RMSNORM_DECODE_FAST", fast ? "1" : "0", 1);
     DeviceTensor dout(gpu, gq.q, DType::kBF16, {t, h});
     DeviceTensor dres(gpu, gq.q, DType::kBF16, {t, h}, rb.data());
     vt::RmsNorm(gq.q, dout.tensor(), dx.tensor(), dw.tensor(), args, &dres.tensor());
@@ -290,12 +287,12 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
     res_bytes.resize(out_bytes.size());
     dout.Download(gq.q, out_bytes.data());
     dres.Download(gq.q, res_bytes.data());
-    ::unsetenv("VT_RMSNORM_DECODE_FAST");
   };
 
   std::vector<uint8_t> out_ref, res_ref, out_fast, res_fast;
   run(/*fast=*/false, out_ref, res_ref);
   run(/*fast=*/true, out_fast, res_fast);
+  ::unsetenv("VT_RMSNORM_DECODE_FAST");
 
   // Output: one bf16 ulp (rtol 8e-3 >= 2^-7) — the reordered f32 variance can flip
   // the final bf16 rounding by one ulp.
@@ -305,15 +302,15 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   CheckClose(Unpack(res_fast, DType::kBF16), Unpack(res_ref, DType::kBF16), 0.0f, 0.0f);
 }
 
-TEST_CASE("CUDA rmsnorm decode-fast (VT_RMSNORM_DECODE_FAST) matches shipped kernel") {
+TEST_CASE("CUDA rmsnorm decode-fast (VT_RMSNORM_DECODE_FAST) matches rollback kernel") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
     return;
   }
   // The real 27B decode shape is M x 5120 (all 129 input/post-attn/final norms);
-  // gemma=true is the shipped RmsNormArgs for those launches. Sweep c2-c32.
+  // gemma=true is the shipped RmsNormArgs for those launches. Sweep c1-c32.
   uint32_t seed = 900;
-  for (int64_t m : {2, 4, 8, 16, 32}) {
+  for (int64_t m : {1, 2, 4, 8, 16, 32}) {
     for (bool gemma : {true, false}) {
       CAPTURE(m);
       CAPTURE(gemma);

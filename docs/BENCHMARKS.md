@@ -264,9 +264,17 @@ real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
 (1024-thread block, 16-byte vectorized loads, block reduce): the isolated spike
 reaches **~parity with vLLM** (nsys 2.83 µs, 2.24–2.50× over V0) and is bf16-EXACT
 vs the shipped kernel at c2–c16 (2/163840 elements 1-ULP at c32). The reordered
-reduction is not bit-identical (token-exactness hazard) ⇒ ships OFF, DGX token
-gate + in-situ c16/c2 A/B pending before any default flip (isolated-fast ≠
-in-situ-fast, per the reg-tile lever). The completed **lost-lanes rescan**
+reduction is not bit-identical (token-exactness hazard) ⇒ shipped OFF until the
+DGX proof, which PASSED (2026-07-16/17, evidence `dgx:~/work/vllm.cpp-ewnorm-act-src`):
+gate3 token gates ALL PASS with the fast kernel on both models (27B 17/17+84/84,
+35B 4/4+8/8; the 1-ULP hazard did not surface), and the corrected-build gate4
+interleaved c16 A/B wins **+8.7/+9.2 tok/s (+1.1%) / meanTPOT −1.68/−1.90 ms**
+on the 2 clean pairs (fast 801.7/802.4/799.5 vs legacy 793.0/793.2; legacy-r3
+VOID — a ~20% interference anomaly; c2 pooled medians parity, arrival-lottery
+noise). **Default FLIPPED ON** (`VT_RMSNORM_DECODE_FAST=0` rolls back); the next
+binding grid runs the fast kernel by default. gate3's own A/B legs were VOID
+(slow-path build — missing CUTLASS FP4/FA2, the same defect that voided the W3
+round-1 A/B; dgx builds now hard-verify the configure-log fast-path lines). The completed **lost-lanes rescan**
 ([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
 angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
 gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of

@@ -12371,3 +12371,23 @@ then extras (ours c16; vLLM c8 + c32) for the 4-arm spike-location table.
 `benchmark_binding=false`, NO speed credit, binding stays 49/124. RESULTS
 PENDING (campaign running) — the spec §Results, this state entry, the ledger
 row, README/BENCHMARKS get the four answers at completion.
+
+## 2026-07-17 — `KERNEL-EW-NORM-ACT` DGX proof PASSED; `VT_RMSNORM_DECODE_FAST` default FLIPPED ON (`CLAIM-EW-NORM-ACT-1`, finalized by orchestrator after repeated agent API-529 kills)
+
+- gate3 token gates ALL PASS both flags/models (27B 17/17+84/84 off AND on;
+  35B 4/4+8/8 off AND on) at `5a53fb5`. gate3's A/B legs VOID (slow-path
+  build — missing CUTLASS FP4/FA2; same defect as the W3 round-1 void; dgx
+  builds must hard-verify the configure-log fast-path lines).
+- gate4 corrected-build interleaved c16 A/B: fast **+8.7/+9.2 tok/s (+1.1%)**,
+  meanTPOT **−1.68/−1.90 ms** on the 2 clean pairs (fast 801.7/802.4/799.5 vs
+  legacy 793.0/793.2; legacy-r3 VOID — 641 tok/s ~20% interference anomaly,
+  cause unidentified; w0 sanity 800.9). Matches the `62d4762` attribution
+  prediction (~1.65 ms). c2: pooled medians 107.9 vs 108.3 (arrival-lottery
+  noise, parity-to-slightly-better, no credit claimed).
+- FLIP landed test-first: predicate default ON / '0'-rollback
+  (`src/vt/cuda/rmsnorm_decode_fast.h`), flag tests inverted RED→GREEN,
+  launcher comments updated. Rollback arm ≡ the proven flag-off gates;
+  flag-on gates already proven at gate3 ⇒ no new GPU required for the flip.
+- Evidence `dgx:~/work/vllm.cpp-ewnorm-act-src` (immutable). Diagnostic
+  only, `benchmark_binding=false`, binding stays 49/124; the fast kernel is
+  in the DEFAULT path for the next authorized grid.

@@ -7,9 +7,13 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
+#include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -86,6 +90,127 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
   }
 }
 
+// ---------------------------------------------------------------------------
+// Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST, default OFF). 1:1 port of
+// vLLM's OWN vectorized CUDA rms-norm — the CUDA embodiment of the SAME reduction
+// the production Inductor triton_red kernel runs at decode:
+//   csrc/libtorch_stable/layernorm_kernels.cu:106-173 (fused_add_rms_norm_kernel
+//   <scalar_t,width=8>), launch :310-363 (block = min(hidden,1024) for
+//   num_tokens<256, 16-byte _f16Vec loads, cub::BlockReduce<float,1024>), and the
+//   _f16Vec packed bf16 `+=` / f32 `sum_squares` of csrc/type_convert.cuh:115-194,
+//   @ vLLM pin e24d1b24. Standalone-nsys Phase-1 at the real 27B decode shape
+//   (M x H=5120) measured the shipped RmsNormRowKernel at 8.44-8.53 us/launch vs
+//   vLLM 2.37-2.68 us (3.18-3.56x, well over the 1.3x bar); this kernel reaches
+//   ~parity (2.83 us nsys / 4.10 us event, 2.24-2.50x over V0), bf16-EXACT vs
+//   RmsNormRowKernel at c2-c16 (2/163840 elements 1-ULP at c32 on adversarial
+//   data). The variance reduction is reordered vs the 256-thread tree, so this is
+//   NOT bit-identical (token-exactness hazard) => default OFF until gated.
+//
+// Scope: the bf16-in / bf16-out / bf16-residual decode path (the 129 input/
+// post-attn/final RMSNorm launches/step, all H=5120). Every other dtype/residual
+// combination keeps RmsNormRowKernel. 16-byte _f16Vec<bf16,8> = 4 packed bf162.
+struct alignas(16) RmsNormBf16x8 {
+  __nv_bfloat162 d[4];
+};
+
+// One block per row, blockDim threads (1024 at decode). Pass 1: vectorized
+// residual add (packed __hadd2, == _f16Vec::operator+=) + f32 sum_squares + store
+// residual. Two-stage warp-shuffle block reduction (sum semantics of
+// cub::BlockReduce<float,1024>; CUB is not vendored here). Pass 2: reload
+// residual, vectorized normalize (x*inv*w in f32 -> bf16), gemma folds (1+w).
+__global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
+                                     const __nv_bfloat16* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ w,
+                                     __nv_bfloat16* __restrict__ residual, int h, float eps,
+                                     bool gemma) {
+  const int row = blockIdx.x;
+  const int vh = h / 8;
+  const int64_t base = static_cast<int64_t>(row) * h;
+  const RmsNormBf16x8* xv = reinterpret_cast<const RmsNormBf16x8*>(x + base);
+  RmsNormBf16x8* rv = reinterpret_cast<RmsNormBf16x8*>(residual + base);
+  const RmsNormBf16x8* wv = reinterpret_cast<const RmsNormBf16x8*>(w);
+  RmsNormBf16x8* ov = reinterpret_cast<RmsNormBf16x8*>(out + base);
+
+  float variance = 0.0f;
+  for (int idx = threadIdx.x; idx < vh; idx += blockDim.x) {
+    RmsNormBf16x8 t = xv[idx];
+    RmsNormBf16x8 r = rv[idx];
+#pragma unroll
+    for (int k = 0; k < 4; k++) t.d[k] = __hadd2(t.d[k], r.d[k]);  // == _f16Vec::operator+=
+#pragma unroll
+    for (int k = 0; k < 4; k++) {  // == _f16Vec::sum_squares (f32 accumulate)
+      float2 z = __bfloat1622float2(t.d[k]);
+      variance += z.x * z.x + z.y * z.y;
+    }
+    rv[idx] = t;  // residual store (bf16), identical to RmsNormRowKernel's ResRound path
+  }
+
+  // Block reduction: warp-shuffle reduce, then reduce the per-warp partials in
+  // warp 0 (mirrors cub::BlockReduce<float,1024> sum without vendoring CUB).
+  for (int o = 16; o > 0; o >>= 1) variance += __shfl_down_sync(0xffffffffu, variance, o);
+  __shared__ float wsum[32];
+  const int lane = threadIdx.x & 31;
+  const int wid = threadIdx.x >> 5;
+  const int nwarp = blockDim.x >> 5;
+  if (lane == 0) wsum[wid] = variance;
+  __syncthreads();
+  __shared__ float s_variance;
+  if (wid == 0) {
+    float s = (lane < nwarp) ? wsum[lane] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) s_variance = rsqrtf(s / static_cast<float>(h) + eps);
+  }
+  __syncthreads();
+  const float inv = s_variance;
+
+  for (int idx = threadIdx.x; idx < vh; idx += blockDim.x) {
+    RmsNormBf16x8 r = rv[idx];
+    RmsNormBf16x8 wr = wv[idx];
+    RmsNormBf16x8 o;
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+      float2 rf = __bfloat1622float2(r.d[k]);
+      float2 wf = __bfloat1622float2(wr.d[k]);
+      float w0 = wf.x, w1 = wf.y;
+      if (gemma) {
+        w0 += 1.0f;
+        w1 += 1.0f;
+      }
+      o.d[k] = __floats2bfloat162_rn(rf.x * inv * w0, rf.y * inv * w1);
+    }
+    ov[idx] = o;
+  }
+}
+
+// Runtime predicate + launch for the decode-fast path. Returns true iff it ran.
+// Mirrors vLLM's alignment/width guard (layernorm_kernels.cu:336-361): needs
+// 16-byte-aligned in/out/weight/residual pointers, hidden % 8 == 0, and the
+// bf16/bf16/bf16-residual decode dtypes. Block = min(1024, 32*floor(h/32))
+// mirrors block = min(hidden, max_block_size=1024) for num_tokens<256.
+inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor& x,
+                                       const Tensor& w, const RmsNormArgs& args,
+                                       Tensor* residual, unsigned rows, int64_t h) {
+  if (!RmsNormDecodeFastFlagIsOn(std::getenv("VT_RMSNORM_DECODE_FAST"))) return false;
+  if (out.dtype != DType::kBF16 || x.dtype != DType::kBF16 || w.dtype != DType::kBF16)
+    return false;
+  if (residual == nullptr || residual->dtype != DType::kBF16) return false;
+  if (h % 8 != 0) return false;
+  auto aligned16 = [](const void* p) {
+    return (reinterpret_cast<std::uintptr_t>(p) & 0xF) == 0;
+  };
+  if (!aligned16(out.data) || !aligned16(x.data) || !aligned16(w.data) ||
+      !aligned16(residual->data))
+    return false;
+  int block = static_cast<int>(h < 1024 ? h : 1024);
+  block = (block / 32) * 32;  // whole warps for the two-stage reduction
+  if (block < 32) return false;
+  RmsNormRowFastKernel<<<rows, block, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(),
+                                              w.Ptr<__nv_bfloat16>(),
+                                              residual->Ptr<__nv_bfloat16>(),
+                                              static_cast<int>(h), args.eps, args.gemma);
+  return true;
+}
+
 // Dispatch the residual store dtype (f32 or bf16). A bf16 residual mirrors vLLM's
 // bf16 model dtype (model_config.dtype=bfloat16): the residual stream is bf16, only
 // the variance/normalize accumulation below stays f32. A f32 residual (or none)
@@ -110,6 +235,14 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
+  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default OFF): only meaningful for the
+  // bf16 add+RMSNorm decode launches; every other case keeps RmsNormRowKernel.
+  if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
+    if (TryLaunchRmsNormDecodeFast(s, out, x, w, args, residual, rows, h)) {
+      Check(cudaGetLastError(), "rmsnorm fast launch");
+      return;
+    }
+  }
   switch (out.dtype) {
     case DType::kF32:
       LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h);

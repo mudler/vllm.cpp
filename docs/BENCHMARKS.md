@@ -227,10 +227,23 @@ body stores bf16 after add+RMSNorm and calls `scaled_fp4_quant.out` separately,
 ours already matches that structure and already mirrors the ONE real fusion
 (silu+fp4quant, `VT_FUSE_SILU_QUANT`). The residual (rmsnorm 391 vs 2006 µs) is
 cross-profiler-confounded (nsys node vs torch CUPTI; the 2026-07-14 rescan already
-called the +1.81 ms residual a cross-profiler artifact) — an isolated microbench
-shows ours' RMSNorm is 6-9 µs, not 15.5 µs, with only a non-bit-exact ≤1.5×
-headroom (~0.3-0.5 ms c16 ceiling), reassigned to `KERNEL-EW-NORM-ACT`, spike +
-in-situ-A/B-gated. The completed **lost-lanes rescan**
+called the +1.81 ms residual a cross-profiler artifact). The `KERNEL-EW-NORM-ACT`
+**Phase-1 same-profiler adjudication** (2026-07-16, nsys pure-kernel BOTH sides,
+isolated, at the real 27B decode shape M×H=**5120**; evidence
+`dgx:~/work/vllm.cpp-ewnorm-phase1`, [spec](../.agents/specs/rmsnorm-decode-fast-2026-07-16.md))
+removes that confound and CONFIRMS the lever: ours `RmsNormRowKernel`
+**8.44–8.53 µs/launch** vs vLLM's `triton_red_fused…rms_norm` **2.37–2.68 µs**
+= **3.18–3.56×** (honest Δ ≈ **0.77 ms/step** at both c2 and c16; c2's is ~33% of
+the ~2.4 ms c2 decode gap). The confound was only in-situ (ours in-situ nsys 15.5
+µs is ~1.84× contention-inflated over the 8.46 µs isolated); the isolated gap is
+real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
+**default OFF**), a 1:1 port of vLLM's own CUDA `fused_add_rms_norm_kernel<bf16,8>`
+(1024-thread block, 16-byte vectorized loads, block reduce): the isolated spike
+reaches **~parity with vLLM** (nsys 2.83 µs, 2.24–2.50× over V0) and is bf16-EXACT
+vs the shipped kernel at c2–c16 (2/163840 elements 1-ULP at c32). The reordered
+reduction is not bit-identical (token-exactness hazard) ⇒ ships OFF, DGX token
+gate + in-situ c16/c2 A/B pending before any default flip (isolated-fast ≠
+in-situ-fast, per the reg-tile lever). The completed **lost-lanes rescan**
 ([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
 angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
 gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of

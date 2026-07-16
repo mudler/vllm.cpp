@@ -105,10 +105,16 @@ bool EngineCoreProc::process_engine_step() {
   // core.py:1308 post_step(model_executed) — deferred (spec-decode draft
   // tokens; the sync EngineCore has no post_step yet, core.py:510-517).
 
-  // core.py:1313-1317: if no model execution happened but there is still
-  // scheduler work, yield briefly (upstream: lets KV-connector background
-  // threads take the GIL; here it keeps a 0-token step from hot-spinning).
-  if (!model_executed && has_work()) {
+  // core.py:1314: `if not model_executed and self.scheduler.has_requests():`
+  // yield briefly (upstream: lets KV-connector background threads take the GIL;
+  // here it keeps a 0-token step from hot-spinning). Mirror vLLM EXACTLY — the
+  // guard is `scheduler.has_requests()` (unfinished || finished), NOT has_work():
+  // it must EXCLUDE the batch-queue term. A pure batch-queue drain (no scheduler
+  // requests left, only queued batches to pop) makes real progress every step
+  // (each iteration pops one batch), so it must NOT sleep — otherwise the final
+  // tokens of the last requests eat a spurious 1 ms/batch that vLLM never pays.
+  if (!model_executed && (scheduler_.get_num_unfinished_requests() > 0 ||
+                          scheduler_.has_finished_requests())) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   return model_executed;

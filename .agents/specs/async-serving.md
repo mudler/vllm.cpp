@@ -136,6 +136,62 @@ c16 on/off A/B (~+3 ms/step target, TTFT-regression watch). CPU: construction
 resolution matrix + kernel-fallback + all async suites green (ctest 111/111, tools
 164/164, clean `-Werror`). The joint spike's speed hypothesis is closed below.
 
+**W3 TTFT DIAGNOSIS — the `f086b64` DGX proof + the admission refutation
+(2026-07-16).** The orchestrator ran the FULL W3 DGX proof at `f086b64` (root
+`dgx:~/work/vllm.cpp-w3-proof/f086b64…`): all five correctness gates PASS (27B+35B
+default, both W3-on, rollback — token-exact, arm-log correct). The interleaved c16
+A/B (same binary, `VT_ASYNC_RUNNER=1` vs `+VT_ASYNC_SCHED=0`):
+- **W3-on:** tput 790.9–792.7, meanTPOT **160.9–161.2** (**−5.4 ms/step, BETTER**
+  than the +3.25 predicted), meanTTFT **2757.9–2778.1**;
+- **W3-off:** tput 793.5–794.1, meanTPOT 166.2–166.4, meanTTFT **2028.4–2032.0**.
+
+So the overlap delivers the decode win (**−5.4 ms/step**), but c16 meanTTFT
+regresses **+36 % (+730 ms ≈ 4.5 steps)** and closed-loop throughput is neutral
+(slightly −0.3 %). The `ENG-ASYNC-SCHED-W3` claim then diagnosed the cause
+CPU-first, and the "depth-2 delays prefill ADMISSION" hypothesis is **REFUTED**:
+
+1. **The admission timing is 1:1 with the synchronous path and with vLLM.** The
+   depth-2 `step_with_batch_queue` calls `schedule()` EVERY busy-loop iteration
+   (the batch queue is never full at entry — invariant `len ≤ size−1`, `core.cpp`
+   assert `:99`), and `EngineCoreProc::process_input_queue` drains new requests
+   before each step (`core_proc.cpp:65-92` ≡ `core.py:1269-1298`). New
+   regressions `tests/vllm/v1/test_async_admission_timing.cpp` drive the real
+   engine and record the step a freshly-arrived prefill is first scheduled:
+   depth-2 admits it at the **same loop iteration** as sync (one step after
+   arrival), unsaturated AND `max_num_seqs`-saturated — no waiting-queue
+   starvation. This corroborates the prior independent finding (coordination
+   `CLAIM-GDN-BA-ROUNDING-1`, 2026-07-15) that our waiting-loop admission +
+   token-budget accounting (`scheduler.cpp:140-318`) is "a faithful 1:1 mirror of
+   `scheduler.py:640-1013`" and that c-level TTFT swings are arrival phasing, not
+   scheduler policy.
+2. **vLLM's single-GPU executor is synchronous too.** `UniProcExecutor.execute_model
+   (non_block=True)` (`uniproc_executor.py:91-106`) runs the forward INLINE and
+   wraps the already-computed `AsyncModelRunnerOutput` in a resolved future —
+   structurally identical to our eager `Executor` + deferred D2H. So there is no
+   "async worker races ahead" advantage for vLLM to mirror.
+3. **The +730 ms is the closed-loop arithmetic, not a bug.** By Little's law
+   (fixed N=16, neutral throughput X), request latency W is pinned; a **−5.4 ms/step**
+   × ~127 output tokens ≈ **−686 ms** decode saving is FORCED to reappear as a
+   **+686–730 ms** TTFT increase (the ~44 ms residual = the −0.3 % throughput dip).
+   The proof's own note (`127×5.4≈686`) is exactly this cancellation. vLLM's async
+   does not regress TTFT because its overlap actually converts host/idle into
+   **throughput** (smaller W); ours is throughput-neutral at c16, so the decode
+   win only shifts time to TTFT.
+
+**Consequence for W3.** The depth-2 overlap is a real per-step decode win but is
+throughput-neutral at c16, so it CANNOT reduce TTFT in the closed-loop grid
+(Little's law). The acceptance target "TPOT win retained AND TTFT within ~2 % of
+sync" is therefore reachable ONLY via a genuine depth-2 **throughput** improvement
+— the residual host/idle recovery (`~3.25 ms/step`, per the GDN state-I/O trace
+2026-07-16) must land as fewer wall-ms/completed-token, not just tighter
+inter-token spacing. That is a runtime/overlap efficiency lever (nsys-gated,
+GPU), NOT a CPU admission change. **W3 stays default-OFF** (unchanged) until that
+throughput lever lands; the admission path is confirmed correct and locked by the
+new CPU regression tests. One CPU 1:1 alignment landed alongside: the
+`_process_engine_step` yield guard now uses `scheduler.has_requests()` (excludes
+the batch-queue term) exactly like `core.py:1314`, so a pure batch-queue drain
+no longer pays a spurious 1 ms/batch (no observable c16 effect; correctness-only).
+
 W3 is an unmet mirror obligation whose speed hypothesis is now closed. vLLM
 resolves `async_scheduling=None` to **True** when compatible
 (`vllm/config/vllm.py:990-1038`), and the binding v0.25.0 server log confirms

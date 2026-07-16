@@ -11886,3 +11886,79 @@ AND an in-situ interleaved c16 A/B (isolated-fast ≠ in-situ-fast — the reg-t
 `benchmark_binding=false`, no speed credit, binding stays 49/124. Doc-checkpoint +
 agent-record checkers green; README/BENCHMARKS/kernel-matrix/ledger/coordination updated
 in the same commit. Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]`.
+## 2026-07-16 — ENG-ASYNC-SCHED W3 TTFT REGRESSION DIAGNOSED: the +730 ms is NOT an admission delay — it is the closed-loop Little's-law reflex of a decode win at neutral throughput; admission proven 1:1 with vLLM (`CLAIM-ASYNC-SCHED-W3`, worktree `.claude/worktrees/agent-af40a50183e457ac2`, reset to `origin/main` @ `f086b64`)
+
+- **The measured DGX proof (`f086b64`, root `dgx:~/work/vllm.cpp-w3-proof/f086b64e4e6056e719d586e96327eb2ef902e830`).**
+  All five correctness gates PASS (27B+35B default, both W3-on, rollback — token-exact,
+  arm logging correct). Interleaved c16 A/B (same binary, `VT_ASYNC_RUNNER=1` vs
+  `+VT_ASYNC_SCHED=0`):
+  - **W3-on:** tput 790.9–792.7, meanTPOT **160.9–161.2 (−5.4 ms/step, BETTER than
+    the +3.25 predicted)**, meanTTFT **2757.9–2778.1**.
+  - **W3-off:** tput 793.5–794.1, meanTPOT 166.2–166.4, meanTTFT **2028.4–2032.0**.
+  So the overlap works on decode (−5.4 ms/step), but c16 meanTTFT regresses
+  **+36 % (+730 ms ≈ 4.5 steps)** and closed-loop throughput is neutral (−0.3 %).
+
+- **DIAGNOSIS — the "depth-2 delays prefill ADMISSION" hypothesis is REFUTED
+  (CPU-verified).**
+  1. **Admission is 1:1 with sync and with vLLM.** The depth-2 `step_with_batch_queue`
+     calls `schedule()` EVERY busy-loop iteration (the batch queue is never full at
+     entry: invariant `len ≤ size−1`, `core.cpp:99` assert), and
+     `EngineCoreProc::process_input_queue` drains new requests before each step
+     (`core_proc.cpp:65-92` ≡ `core.py:1269-1298`). NEW CPU regressions
+     `tests/vllm/v1/test_async_admission_timing.cpp` (2 cases / 10 asserts, GREEN)
+     drive the real engine, inject a request mid-stream, and record the step its
+     prefill is first scheduled: depth-2 admits it at the SAME loop iteration as sync
+     (one step after arrival), unsaturated AND `max_num_seqs`-saturated — no
+     waiting-queue starvation. Corroborates the prior independent finding
+     (`CLAIM-GDN-BA-ROUNDING-1`, 2026-07-15) that our waiting-loop admission +
+     token-budget accounting (`scheduler.cpp:140-318`) is "a faithful 1:1 mirror of
+     `scheduler.py:640-1013`" and that TTFT swings are arrival phasing, not policy.
+  2. **vLLM's single-GPU executor is synchronous too.** `UniProcExecutor.execute_model
+     (non_block=True)` (`uniproc_executor.py:91-106`) runs the forward INLINE and wraps
+     the already-computed `AsyncModelRunnerOutput` in a resolved future — structurally
+     identical to our eager `Executor` + deferred D2H. No async-worker advantage exists
+     for vLLM to have over us here.
+  3. **The +730 ms is arithmetic, not a bug.** Little's law (closed loop, fixed N=16,
+     neutral throughput X ⇒ fixed request latency W): a **−5.4 ms/step** × ~127 output
+     tokens ≈ **−686 ms** decode saving is FORCED to reappear as a **+686–730 ms** TTFT
+     increase (residual ≈ the −0.3 % throughput dip). The proof's own note (`127×5.4≈686`)
+     is exactly this cancellation. vLLM's async does not regress TTFT because its overlap
+     converts host/idle into **throughput** (smaller W); ours is throughput-neutral at
+     c16, so the decode win only shifts time into TTFT.
+
+- **Consequence.** The acceptance target "TPOT win retained AND TTFT within ~2 % of sync"
+  is reachable ONLY via a genuine depth-2 **throughput** improvement (turn the residual
+  ~3.25 ms/step host/idle — GDN state-I/O trace 2026-07-16 — into fewer wall-ms per
+  completed token, not just tighter inter-token spacing). That is a runtime/overlap
+  efficiency lever (nsys/GPU-gated), NOT a CPU admission change. **W3 stays default-OFF**
+  (unchanged); the admission path is confirmed correct and locked by the new regressions.
+
+- **Landed this checkpoint (CPU-only, no GPU behavior change):**
+  1. `tests/vllm/v1/test_async_admission_timing.cpp` — the depth-2 admission-timing
+     regressions (the refutation, executable).
+  2. One CPU 1:1 alignment: `EngineCoreProc::process_engine_step` yield guard now uses
+     `scheduler.has_requests()` (unfinished || finished, EXCLUDING the batch-queue term)
+     exactly like `core.py:1314`, so a pure batch-queue drain no longer pays a spurious
+     1 ms/batch (no observable c16 effect; correctness-only; covered by the existing
+     depth-2 cycle tests). Did NOT touch `src/vt/cuda/cuda_gdn.cu`.
+  CPU gates: clean full CPU `-Werror` rebuild **0 warnings**, full serial ctest GREEN,
+  tools **164/164**, record + doc-checkpoint checkers green. NO GPU ran.
+
+- **DGX RE-PROOF (orchestrator, from the pushed SHA, one `flock /tmp/gpu` per series —
+  only meaningful AFTER a depth-2 throughput lever lands; unchanged this commit it will
+  reproduce the same +730 ms).**
+  (1) SAFETY / correctness, both gates × the three arms (default, `VT_ASYNC_RUNNER=1`,
+      `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`): each 235/235 + 16/16 token-exact —
+      `flock /tmp/gpu -c 'ctest -R "qwen36_paged_engine|qwen27_paged_engine"'`, then the
+      same with `VT_ASYNC_RUNNER=1` prepended, then with
+      `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0` prepended.
+  (2) interleaved c16 A/B, same binary, one lock, W3-on (`VT_ASYNC_RUNNER=1`) vs W3-off
+      (`VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`) via `tools/bench/profile_vllm_online_gate.py`
+      / the `SERVE-GATE-ONLINE` harness. RECORD meanTPOT, meanTTFT, total/output tput on
+      both arms.
+  ACCEPTANCE = **TPOT win retained (W3-on ≤ W3-off meanTPOT) AND meanTTFT within ~2 % of
+  the W3-off (sync) arm.** Per Little's law this passes ONLY if a throughput lever has
+  made W3-on tput > W3-off; without one, TTFT stays ≈ +36 % and the gate correctly FAILS
+  → W3 stays OFF. `benchmark_binding=false`, no speed credit, binding stays 49/124.
+  Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
+  [ClaudeCode]`.

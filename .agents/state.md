@@ -11269,3 +11269,25 @@ and the `c172336` crash-regression reproduction (`--diagnostic-c16`, previously 
 README (one status line), docs/BENCHMARKS.md (current-checkpoint attribution refined),
 roadmap_v1.md (order-0 decode lever reframed), coordination (`CLAIM-GDN-BA-ROUNDING-1`
 last-update), this state entry, the parity-ledger row. No `HANDSOFF.md`.
+
+## 2026-07-16 — 6dd24df validated on DGX: attribution confirmed; correct-state floor ≈ vLLM
+
+The probe3 validation at `6dd24df` (root `~/work/vllm.cpp-c16-era-ab/20260716`)
+sealed the state-bandwidth attribution: both correctness gates pass
+(**235/235** packed and **235/235** rollback), and the interleaved c16 A/B
+reads fix2 [796.75, 798.63] vs anchor-246a23c [797.29, 794.69] tok/s
+(TPOT ~165.6–166.1 both) — statistically identical, exactly as predicted: the
+O(n) validation + scratch-reuse cleanup recovers microseconds, and there is no
+recoverable host cost. The corrected picture: 825–832 on pre-fix binaries was
+corruption-subsidized state-bandwidth savings; the honest correct-state c16
+floor is ~790–799 vs vLLM's fresh 794 (≈0.995–1.005×, run-regime dependent —
+both arms drifted +0.5–0.8% this round, consistent with the recorded box
+drift). The era-A/B raw evidence (rounds 0–3) is retained in the probe root.
+Task closure: the c16/c32 regression question is fully attributed and
+validated. ACTIVE next lever (order-0): vLLM pays the SAME distinct-slot
+state traffic yet runs c16 decode TPOT ~8 ms/step cheaper (159.6 vs 167.5) —
+fresh post-fix kernel-level comparison (ours nsys node trace; vLLM
+torch-profiler recipe) at CORRECT state is the new attribution ground truth;
+all pre-fix c16/c2 GDN kernel evidence (H1d ranking, B=2 structural traces)
+is CONTAMINATION-SUSPECT for the GDN state path (measured with collapsed
+slots) and must not drive lever decisions until re-measured.

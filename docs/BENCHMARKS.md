@@ -159,12 +159,20 @@ old c16/c32 total-throughput WINS are GONE (see the honest regression above);
 c16/c32 total throughput now barely misses (0.9953 / 0.9985). No 35B performance
 command is authorized until the 27B result reaches 124/124.
 
-**Next levers (roadmap order-0).** (a) the in-flight **era A/B** verdict (`3f256ab`
-vs `246a23c` binary, interleaved c16) + the **nsys full-step c2/c8 attribution**
-(async-sched W3 vs residual kernel vs the slot-fix state-bandwidth trade);
-(b) **`ENG-ASYNC-SCHED` W3** if the attribution confirms it; (c) the **c8 p99 /
-c32 p90 ITL tail mechanism** — reconstruct the stall cadence from this root's
-per-request `itls[]`.
+**Next levers (roadmap order-0).** The era A/B + four-round bisect is COMPLETE
+and VALIDATED (probe root `~/work/vllm.cpp-c16-era-ab/20260716`; attribution
+`6dd24df`, validation 2026-07-16): the c16/c32 "regression" vs `3f256ab` was
+corruption-subsidized state bandwidth in pre-fix binaries (collapsed slots =
+1/16th the GDN state traffic); the honest correct-state c16 floor is
+**~790–799 vs vLLM 794**, both model gates 235/235, and no recoverable host
+cost exists (new machinery ≤15 µs/step; O(n) validation landed). Pre-fix GDN
+kernel evidence (H1d ranking, B=2 traces) is contamination-suspect for the
+state path. Active levers now: (a) **multi-slot GDN state-I/O efficiency** —
+vLLM pays the same distinct-slot traffic yet runs c16 TPOT ~8 ms/step cheaper
+(159.6 vs 167.5); fresh correct-state kernel traces (ours nsys node trace,
+vLLM torch-profiler recipe) are the new ground truth, then port/optimize the
+difference (covers the c2–c32 decode-mean cluster); (b) the **c8 p99 / c32
+p90 ITL tail mechanism** from this root's per-request `itls[]`.
 
 ## Current checkpoint
 

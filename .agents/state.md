@@ -12249,3 +12249,18 @@ after a GPU-memory/contention kill) recorded in the spec.
   referenced; its only call site is inside `#ifdef VLLM_CPP_TRITON` at
   `cuda_gdn.cu:1417-1428`). Hit + worked around here with `-DVLLM_CPP_TRITON=ON`; since FIXED on main by
   `038970f` (owner guarded the definition). Kept for the record only.
+
+## 2026-07-16 — block-table host-cluster cleanup CLOSED: DGX gate PASSED, claim released
+
+The queued gate series on the `e027ad5` build completed (root
+`dgx:~/work/vllm.cpp-blocktable-gate`, `gate.done` `GATE_FINISHED=0`, one
+`flock /tmp/gpu` series): 27B default **235/235**, 27B `VT_GDN_PACKED_DECODE=0`
+rollback **235/235**, 35B **2 cases / 315/315**, all exit 0 — the items c/d/e
+mirrors are token-exact on hardware as designed. Build notes: the gate build
+needed CUTLASS ≥4.5.0 (provisioned `~/cutlass-4.5.0` as an isolated git
+worktree; 4.4.2 untouched) and `-DVLLM_CPP_TRITON=ON` to work around the
+then-unguarded `RecordGdnPackedDecodeTritonLaunch` `-Werror` break — upstream
+has since fixed it properly at `038970f`. `CLAIM-BLOCKTABLE-HOST-CLUSTER` is
+RELEASED (table row removed, prose release note added); `ENG-CUDAGRAPH` returns
+to `PARTIAL` unclaimed with its new capture-set anchors retained. No speed
+credit; binding stays 49/124.

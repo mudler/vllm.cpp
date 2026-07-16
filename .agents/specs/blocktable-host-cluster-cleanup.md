@@ -135,3 +135,24 @@ vs vLLM's reference-held `output_token_ids`); the gate workload is greedy /
 `no_penalties`, which gets the full caching win bit-identically. Decision (e2):
 `std::move` only (NOT `std::map`→`unordered_map`) to preserve any iteration-order
 behavior — the copy is the per-step waste; the container type is not reopened.
+
+## Disposition (2026-07-16) — CLOSED, gate PASSED
+
+All three items landed bit-identical (`8a717b2`/`81afc36`/`0c4b41c`, merged at
+`e027ad5`). CPU gates: clean full `-Werror` rebuild 0 warnings, ctest 115/115,
+tools 164/164, record + doc-checkpoint checkers green. **DGX token-exactness
+gate PASSED** on the `e027ad5` build (GB10 sm_121a, `-DVLLM_CPP_TRITON=ON` +
+CUTLASS 4.5.0 — both pre-existing upstream build blockers, since fixed upstream
+at `038970f`; one `flock /tmp/gpu` series; root
+`dgx:~/work/vllm.cpp-blocktable-gate`, `gate.done` = `GATE_FINISHED=0`):
+
+| Arm | Result |
+|---|---|
+| 27B default (`test_qwen27_paged_engine`) | 235/235 assertions, exit 0 |
+| 27B rollback (`VT_GDN_PACKED_DECODE=0`) | 235/235 assertions, exit 0 |
+| 35B (`test_qwen36_paged_engine`) | 2 cases, 315/315 assertions, exit 0 |
+
+Claim released; `ENG-CUDAGRAPH` returns to `PARTIAL` (broader capture/replay
+scope remains). No speed credit (`benchmark_binding=false`); the payoff is
+measured by the c2/c8 attribution probe and the next authorized exact grid.
+Out-of-scope items a-runner/b remain with the `runner.cpp` owners.

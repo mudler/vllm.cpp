@@ -166,7 +166,16 @@ most tails), driven by decode being **2.2–6.5% slower** — mean TPOT ratios
 0.9779 / 0.9694 / 0.9445 / 0.9532 / 0.9597 (ours 109.85 / 116.35 / 131.41 / 167.46 /
 245.58 ms vs vLLM 107.42 / 112.79 / 124.12 / 159.63 / 235.68), worst median TPOT
 0.9348 at c8. Two ITL tails stand out as anomalies beyond that band: **c8 p99_itl
-0.5599** (853.34 vs 477.81 ms) and **c32 p90_itl 0.7925** (706.80 vs 560.15). The
+0.5599** (853.34 vs 477.81 ms) and **c32 p90_itl 0.7925** (706.80 vs 560.15) —
+both now ATTRIBUTED (2026-07-16, read-only diagnostic on this root's per-request
+`itls[]`; [spec](../.agents/specs/tail-stall-analysis-2026-07-16.md)) to ONE
+mechanism: batch-wide prefill stalls at request-wave boundaries, uniformly
+~860 ms in ours (two full 1024-token prefills filling the 2048-token step
+budget; finish-in-pairs lockstep) vs graded ~500 ms single-prefill events in
+vLLM (whose arm runs async scheduling ON). The decode body (tokens 16–111) is
+at parity with ZERO mid-sequence stalls; capping the per-event stall at one
+prefill is measured-sufficient to flip both axes to PASS (counterfactual
+ratios 0.87–0.96 / 0.93–1.11). The
 old c16/c32 total-throughput WINS are GONE (see the honest regression above);
 c16/c32 total throughput now barely misses (0.9953 / 0.9985). No 35B performance
 command is authorized until the 27B result reaches 124/124.
@@ -197,7 +206,9 @@ port vLLM's register-resident single-warp `num_stages=3` FLA packed-decode tilin
 (`fused_recurrent.py:282-336`) into `GdnPackedDecodeKernel` (ours reaches ~83%
 of ~273 GB/s peak vs vLLM ~92%) ⇒ ~+2 ms/step; parallel ~2 ms = the Inductor
 add+RMSNorm+FP4-quant / SiLU+FP4-quant decode fusion; (b) the **c8 p99 / c32
-p90 ITL tail mechanism** from this root's per-request `itls[]`. Diagnostic
+p90 ITL tail mechanism — ATTRIBUTED** (wave-boundary two-prefill stalls, see
+above; fix path = mirror vLLM's staggered admission regime, prime suspect its
+default-ON async scheduling = our W3). Diagnostic
 (`benchmark_binding=false`, no speed credit); binding stays 49/124.
 
 ## Current checkpoint

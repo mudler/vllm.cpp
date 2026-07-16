@@ -11796,3 +11796,37 @@ preserved. Decision next session on measured grounds. Binding stays
   `benchmark_binding=false`, no speed credit, binding stays 49/124. Trailers
   `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude Code:claude-opus-4-8
   [ClaudeCode]`.
+
+## 2026-07-16 — c8 p99_itl / c32 p90_itl ATTRIBUTED: one wave-boundary two-prefill stall mechanism (read-only diagnostic on binding root `246a23c`)
+
+- Read-only analysis (Opus agent) of the binding root's per-request `itls[]` +
+  `start_times[]` + `ttfts[]`; method reproduces the gate's r1 percentiles
+  exactly (853.3 / 706.8 ms) before concluding; r2/r3 within ±1%. Full analysis:
+  `.agents/specs/tail-stall-analysis-2026-07-16.md`.
+- VERDICT: both failing tail axes are ONE mechanism — batch-wide prefill stalls
+  at request-wave boundaries. Ours: uniform ~860 ms events (two full 1024-token
+  prefills fill the 2048-token step budget; all 48 c8 spikes + 2330/2661 c32
+  spikes in the 800–1000 ms band; finish-in-pairs lockstep self-perpetuates).
+  vLLM (identical budget/server args): graded, dominated by ~500 ms
+  single-prefill events, including a 400–600 ms band ours completely lacks.
+- Decode body at parity: tokens 16–111 razor-flat (ours body p99 121.6/169.5 ms
+  c8/c32 vs vLLM 119.6/165.5), ZERO mid-sequence stalls in ours. RULED OUT:
+  per-request periodic maintenance (GDN state-pool/block-alloc/log-flush —
+  spikes hit 16 DIFFERENT token indices at one wall-clock instant, 31/32
+  requests simultaneously), CUDA-graph recapture/allocator randomness (stalls
+  recur at exactly the wave period: Δ≈18.3 s c8, Δ=34.0±0.1 s c32), client
+  artifacts (server-side cross-request correlation 96–100%).
+- COUNTERFACTUAL (gate r1, band ≥0.85): capping each stall at ONE prefill
+  (~500–550 ms) flips BOTH axes — c8 p99_itl 0.56→0.869–0.956 PASS, c32
+  p90_itl 0.79→0.927–1.112 PASS. No other axis moves.
+- Tension with `scheduler-prefill-coschedule.md` ("schedule() is a 1:1 mirror,
+  don't change it"): not contradicted — the code-level policy matches; the
+  EMERGENT regime differs. Prime suspect for vLLM's stagger: its binding arm
+  runs async scheduling ON (our W3 default OFF in the binding binary).
+  Discriminators queued for the fix owner (task: prefill/decode co-schedule
+  stall): (H-A) re-measure tails under W3-on once the admission fix lands;
+  (H-B) per-step composition probe `{prefills, prefill_tokens, decodes,
+  wall_ms}`; (H-C) partial-prefill policy defaults. MIRROR policy applies —
+  the fix is whatever pinned vLLM does.
+- Diagnostic only: `benchmark_binding=false`, binding stays 49/124, evidence
+  root untouched.

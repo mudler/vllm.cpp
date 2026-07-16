@@ -7,6 +7,8 @@
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
 #include "vllm/model_executor/models/qwen3_5.h"
 
+#include "vllm/model_executor/models/decode_graph_sizes.h"
+
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
@@ -5021,30 +5023,15 @@ void CopyInPlace(std::optional<std::vector<T>>& dst,
   CopyInPlace(*dst, *src);
 }
 
-// The SET of decode batch sizes we capture a graph for (mirrors vLLM's
-// cudagraph_capture_sizes = [1,2,4] + range(8,…) capped to max_num_seqs;
-// compilation/cuda_graph.py + config/compilation.py:678-690 @ e24d1b24). A real
-// decode batch of B requests is PADDED up to the smallest captured size >= B and
-// that size's graph is replayed; the padded rows are inert (see BuildPaddedDecode).
-constexpr std::array<int64_t, 7> kDecodeGraphSizes = {1, 2, 4, 8, 16, 32, 64};
-constexpr int64_t kMaxDecodeGraphBatch = 64;
-
-// Smallest captured size >= b, or -1 when b exceeds the largest (caller runs
-// eager). The result is CAPPED at `cap` (== max_num_seqs == the GDN state-cache
-// slot count): a decode batch is never padded beyond max_num_seqs, mirroring
-// vLLM's decode cudagraph dispatcher ("already caps batch sizes at max_num_seqs",
-// compilation.py:1438-1444 @ e24d1b24). Without this cap a batch of B requests
-// (B <= max_num_seqs) could pad up to the next fixed size (e.g. B=24 -> 32) and
-// overrun the max_num_seqs-sized conv/ssm state cache, tripping the
-// causal_conv1d_update `conv_state.shape[0] >= x.shape[0]` guard. cap is always
-// >= b here (the caller only routes num_reqs <= max_num_seqs), so the clamped
-// value still satisfies size >= b; `cap` itself becomes a captured size.
-int64_t PadToCaptureSize(int64_t b, int64_t cap) {
-  if (b > cap) return -1;  // never pad DOWN below the real batch (eager fallback)
-  for (int64_t s : kDecodeGraphSizes)
-    if (s >= b) return std::min(s, cap);
-  return -1;
-}
+// The decode-graph capture set + pad-to-capture selector live in
+// vllm/model_executor/models/decode_graph_sizes.h (DecodeGraphSizes /
+// PadToCaptureSize), derived from max_num_seqs to mirror vLLM's
+// _set_cudagraph_sizes reduced to the full-decode-cudagraph regime. A real
+// decode batch of B requests is PADDED up to PadToCaptureSize(B, max_num_seqs)
+// and that size's graph is replayed; the padded rows are inert (see
+// BuildPaddedDecode). The cap at max_num_seqs (the GDN state-cache slot count)
+// keeps a decode batch from padding beyond the conv/ssm state cache, tripping
+// the causal_conv1d_update `conv_state.shape[0] >= x.shape[0]` guard.
 
 // Build the S-padded PURE-DECODE inputs from the real B-request step (B<=S). The
 // decode forward is ROW-INDEPENDENT (paged attn is per-request causal, GDN

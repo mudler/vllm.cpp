@@ -169,3 +169,35 @@ tails persist under W3-on → the cause is a different runtime effect, reopen. R
 only on an idle, uncontended GPU (the 2026-07-16 window had the lock held by
 another agent + a live `VLLM::EngineCore`, so no benchmark was run — a contended
 run would be void). `benchmark_binding=false`; binding stays 49/124 regardless.
+
+## Empirical confirmation — RAN 2026-07-17, mechanism CONFIRMED (`CLAIM-W3-ASYNC-DISC`)
+
+The interleaved c8+c32 (+c16) W3-on/off A/B ran at `6ea7856` (one flock, token
+gates 6/6, w0 discard + 3 pairs, binding client params + per-request `itls[]`;
+full campaign incl. a vLLM async-ON/OFF self-A/B in
+[w3-async-ttft-discriminator-2026-07-16.md](w3-async-ttft-discriminator-2026-07-16.md);
+evidence `dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…`). **ACCEPT criteria all
+hold:**
+
+- **c8 `p99_itl` 856.8 → 527.4 ms** under W3-on: ratio 0.906 vs the binding
+  477.8 (0.897 vs the fresh interleaved vLLM async arm) — **≥0.85 PASS**.
+- **c32 `p90_itl` 698.7 → 534.4 ms**: ratio **1.048** vs binding 560.2 (1.034
+  fresh) — ours now BEATS vLLM on this axis.
+- **The ~500–550 ms single-prefill band appears**: ours c8 W3-on has 54 events
+  in the 500-band (W3-off: ZERO, with 131 in the uniform 800-band) — the graded
+  distribution predicted by H-A.
+- Decode means do NOT regress — they improve (mean TPOT −3.5/−4.7/−5.3 ms/step
+  at c8/c16/c32); throughput −0.45 to −0.59 % (inside vLLM's own async cost,
+  −0.66 to −0.91 %). Mean TTFT rises +32/+36/+30 % vs our own sync arm, which
+  the vLLM self-A/B proves is the SAME premium vLLM's async pays vs its own
+  sync (+26/+31/+28 %) — vs the production bar (vLLM async-ON) ours-W3on TTFT
+  is 0.995/1.042/1.103 (equal-or-better at c16/c32, −0.5 % noise-scale at c8).
+
+The four-arm spike-location table also resolves this spec's START- vs
+END-loaded fingerprint: it is a property of the SCHEDULING MODE, not the engine
+(sync concentrates START-loaded uniform stalls, async grades the magnitudes and
+shifts mass toward END, on BOTH engines; the binding pair ours-sync/vLLM-async
+reproduced it exactly). Verdict unchanged and now empirically CLOSED: no
+sync-scheduler fix exists; the tails close under W3-on, which pays the same
+TTFT premium vLLM's own async pays. Axis arithmetic and the W3-default decision
+live in the discriminator spec §4.

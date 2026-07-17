@@ -434,3 +434,32 @@ operative regime. W3 stays DEFAULT-OFF; the depth-2 throughput search moves to
 the c8+ wave/overlap family (`62d4762` attribution). The sync-path scratch is
 input to the c2–c8 re-attribution (steps there are ~10× shorter, so the same
 µs-scale syncs are a ~10× larger fraction).
+
+## Addendum 2026-07-17 — the W3 TTFT premium is vLLM's own async behavior (discriminator verdict); "throughput unlock" framing RETIRED
+
+The `CLAIM-W3-ASYNC-DISC` campaign ([spec + full tables](w3-async-ttft-discriminator-2026-07-16.md);
+evidence `dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…`; token gates 6/6, one
+flock, 42 legs) measured vLLM v0.25.0's OWN async-scheduling self-A/B
+(`--no-async-scheduling`, arm log-confirmed) next to ours at c8/c16/c32:
+
+- **vLLM async-ON vs its own sync: throughput −0.66 to −0.91 %, TPOT −2.6 to
+  −4.3 ms/step, mean TTFT +26/+31/+28 %.** The depth-2 TTFT premium is inherent
+  (Little's law on the admission→first-token path) and upstream ships it as the
+  default anyway for the TPOT/tail win. There is NO depth-2 throughput unlock to
+  find — D6's "overlap win smaller in C++" search target does not exist in the
+  reference either. The `f086b64`/`6ea7856` "TTFT +36 %" was measured against
+  OURSELVES; vs the honest bar (vLLM async-ON production) ours-W3on mean TTFT is
+  0.995/1.042/1.103 at c8/c16/c32.
+- **Ours W3-on matches the vLLM async pattern within noise** (ΔTPOT −3.5/−4.7/
+  −5.3; ΔTTFT +554/+713/+829 vs vLLM's +469/+663/+850; Δtput −0.5 % vs −0.8 %),
+  and flips both binding ITL-tail anomalies (c8 p99 0.552→0.897, c32 p90
+  0.791→1.048). No engine-loop/output-timing divergence remains
+  (`step_with_batch_queue` == `core.py:519-632`; admission `89b329e`; composition
+  `20fc0e1`; output visibility `async_output.cpp` == `async_utils.py:12-70`).
+- **Decision: flip the W3 default ON** (mirror `vllm/config/vllm.py:992-1044`,
+  which resolves async ON for this model), to be landed by
+  `CLAIM-ASYNC-SCHED-W3` with fresh token gates; the G5 gate's "async ≤ sync on
+  TTFT" clause is corrected to "≤ vLLM-async on TTFT" (the mirrored trade-off is
+  intentional upstream). The speed-credit floor for W3 as a *lever* is retired
+  with it — W3 is a parity/mirror obligation with a tails+TPOT win, not a
+  throughput lever.

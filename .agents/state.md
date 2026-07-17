@@ -12391,3 +12391,54 @@ row, README/BENCHMARKS get the four answers at completion.
 - Evidence `dgx:~/work/vllm.cpp-ewnorm-act-src` (immutable). Diagnostic
   only, `benchmark_binding=false`, binding stays 49/124; the fast kernel is
   in the DEFAULT path for the next authorized grid.
+
+## 2026-07-17 — `CLAIM-W3-ASYNC-DISC` COMPLETE: the W3 TTFT premium IS vLLM's own async behavior (self-A/B measured); both binding ITL-tail anomalies FLIP under W3-on; W3-ON nets positive as-is → default-ON decision handed to `CLAIM-ASYNC-SCHED-W3`
+
+The discriminator campaign ran to completion overnight (one `flock /tmp/gpu`,
+42 legs, 0 client failures, token gates 6/6 at `6ea7856`, every vLLM arm
+log-confirmed "Asynchronous scheduling is enabled/disabled", NO leg in the
+void signature — all 504–1108 tok/s). Full tables in
+[w3-async-ttft-discriminator-2026-07-16.md](specs/w3-async-ttft-discriminator-2026-07-16.md)
+§Results; evidence (immutable)
+`dgx:~/work/vllm.cpp-w3-discriminator/6ea785670f691b8c5a76e597ffa59fa266cfab26`.
+
+1. **vLLM self-A/B (async ON vs OFF, c8/c16/c32):** throughput **−0.66 to
+   −0.91 %** (async does NOT raise X), TPOT **−2.6/−4.0/−4.3 ms/step**, mean
+   TTFT **+26.3/+30.5/+27.6 % (+469/+663/+850 ms)**. vLLM pays the SAME
+   premium ours does and ships async-ON as default anyway — the premium is
+   inherent depth-2 admission→first-token latency, not a defect. The prior
+   "+1.5 % throughput gate" for shipping W3 is RETIRED as mis-calibrated: the
+   mirrored feature has no throughput win upstream either.
+2. **Ours W3-on/off (c8/c16/c32):** TPOT −3.5/−4.7/−5.3 ms/step, tput −0.45 to
+   −0.59 %, TTFT +32/+36/+30 % — the vLLM async pattern within noise. **Tail
+   prediction CONFIRMED:** c8 `p99_itl` 856.8→**527.4** (ratio 0.906 vs binding
+   477.8; 0.897 vs the fresh interleaved vLLM arm — in the 0.85 band), c32
+   `p90_itl` 698.7→**534.4** (**1.048** vs binding 560.2 — ours now BEATS
+   vLLM). The ~500 ms single-prefill band appears under W3-on (c8: 54 events
+   vs ZERO under W3-off). tail-stall spec ACCEPT criteria all hold — appended
+   there as CLOSED.
+3. **No divergence exists (honest absence):** the four-arm spike-location table
+   proves the binding-era "ours START-loaded vs vLLM END-loaded" fingerprint
+   was the SYNC-vs-ASYNC mode difference, not an engine difference; ours-W3on
+   reproduces vLLM-async's placement/grading. Grounding both sides:
+   `step_with_batch_queue` == `core.py:519-632`; admission timing `89b329e`;
+   composition `20fc0e1`; output visibility `async_output.cpp` ==
+   `async_utils.py:12-70`. NO fix to implement.
+4. **Axis arithmetic (18 axes × c8/c16/c32 vs vLLM async-ON = production):**
+   strict-PASS 14→15/54; FAIL→PASS: c8 p99_tpot, c16 p99_tpot, c32 p90_itl;
+   FAIL→in-band: c8 p99_itl (0.552→0.897); PASS→FAIL: c8 mean_ttft 0.9951 +
+   c8 p99_ttft 0.9940 (both −0.5 %, noise-scale); every TPOT/ITL mean ratio
+   +2.3–3.3 pp toward parity; tput ratios −0.5 pp. **W3-ON nets positive
+   AS-IS. Decision: flip W3 default ON (mirror `vllm/config/vllm.py:992-1044`,
+   ON at `:1040`).** The flip lands under `CLAIM-ASYNC-SCHED-W3` (config
+   resolution + fresh DGX token gates), NOT here (records-only claim; claim
+   RELEASED this checkpoint).
+
+Deviations: campaign binary @ `6ea7856` predates the `696a991` RMSNorm default
+flip (same binary both arms — deltas valid; absolute ours numbers ~0.5–1 %
+conservative vs new main); vLLM legs used PATH-scoped `env` like the binding
+grid, ours `env -i`; corpus r1 partition reused across reps (isolates the arm
+delta; matches the validated ab.sh recipe). Cross-era drift noted: fresh vLLM
+c16 tput ~804–810 vs binding-era 794 (+1.3 %) — internal comparisons are
+interleaved same-session, so unaffected. `benchmark_binding=false`, NO speed
+credit; binding stays 49/124.

@@ -90,8 +90,139 @@ validated ab.sh recipe), binding client params (in1024/out128 greedy,
 - Token-exactness precondition: 27B + 35B paged-engine gates × {default, W3-on,
   W3-off}.
 
-## Results — PENDING (campaign running under one flock)
+## Results (2026-07-17, campaign COMPLETE — one flock, 42 legs, 0 failures)
 
-<!-- filled at campaign completion: vLLM self-A/B table; ours W3 c8/c16/c32 table
-with tail ratios vs prediction; four-arm spike-location table; named divergence
-or its honest absence with file:line; axis arithmetic; any fix. -->
+Token-exactness precondition 6/6 PASS (27B+35B × default/W3-on/W3-off). Every
+vLLM arm log-confirmed ("Asynchronous scheduling is enabled/disabled." per
+server). No leg shows the void signature (all legs 504–1108 tok/s, production
+scale). Deviations: campaign binary @ `6ea7856` (predates the `696a991` RMSNorm
+default flip — same binary both arms, deltas internally valid); vLLM legs run
+`env` PATH-only like the binding grid (not `env -i`); corpus partition r1
+reused across reps per the validated ab.sh recipe.
+
+### (1) vLLM self-A/B — vLLM's OWN async pays the same TTFT premium
+
+Mean over 3 interleaved reps (w0 discarded):
+
+| c | arm | tok/s | mean TPOT | mean TTFT | p99 ITL | p90 ITL |
+|---|---|---|---|---|---|---|
+| 8 | async ON | 515.1 | 122.6 | 2251.9 | 473.2 | 114.9 |
+| 8 | async OFF | 519.2 | 125.2 | 1783.3 | 477.6 | 114.8 |
+| 16 | async ON | 804.3 | 157.4 | 2834.5 | 894.0 | 129.8 |
+| 16 | async OFF | 809.7 | 161.4 | 2172.0 | 875.4 | 130.2 |
+| 32 | async ON | 1097.3 | 232.2 | 3935.2 | 960.5 | 552.8 |
+| 32 | async OFF | 1107.4 | 236.5 | 3085.0 | 944.2 | 550.6 |
+
+vLLM async-ON vs its own sync: throughput **−0.66 to −0.91 %** (async does NOT
+raise X — it is slightly negative on this box/workload), TPOT **−2.6 to
+−4.3 ms/step**, **mean TTFT +26.3 % / +30.5 % / +27.6 % (+469/+663/+850 ms)**.
+So the TTFT premium IS inherent to async depth-2 scheduling and vLLM pays it
+too; the task's premise ("vLLM's async pays NO TTFT premium") is REFUTED, as the
+§Calibration mis-citation already indicated. Corollary: the prior W3 ship-gate
+"≥+1.5 % throughput" was mis-calibrated — the mirrored feature does not raise
+throughput in vLLM itself; upstream defaults it ON for the TPOT/tail win.
+
+### (2) Ours W3-on vs W3-off — the tail prediction is CONFIRMED
+
+| c | arm | tok/s | mean TPOT | mean TTFT | p99 ITL | p90 ITL |
+|---|---|---|---|---|---|---|
+| 8 | W3-on | 504.9 | 125.5 | 2263.1 | **527.4** | 117.5 |
+| 8 | W3-off | 507.9 | 128.9 | 1709.3 | 856.8 | 117.6 |
+| 16 | W3-on | 790.8 | 161.5 | 2721.4 | 877.5 | 133.2 |
+| 16 | W3-off | 794.8 | 166.2 | 2008.6 | 877.1 | 133.6 |
+| 32 | W3-on | 1084.9 | 238.2 | 3568.6 | 945.3 | **534.4** |
+| 32 | W3-off | 1089.8 | 243.5 | 2739.3 | 942.3 | 698.7 |
+
+Tail ratios (gate convention vLLM/ours, ACCEPT ≥0.85):
+
+| axis | W3-off | W3-on | vs binding denom (477.8/560.2) | verdict |
+|---|---|---|---|---|
+| c8 `p99_itl` | 0.552 | **0.897** | 0.906 | FAIL → **in-band PASS** |
+| c32 `p90_itl` | 0.791 | **1.034** | 1.048 | FAIL → **strict PASS (ours beats vLLM)** |
+
+The tail-stall spec's ACCEPT criteria hold: the ~500–550 ms single-prefill band
+APPEARS under W3-on (ours c8: 54 events in the 500-band vs ZERO under W3-off,
+which had 131/162 events in the uniform 800-band), both ratios ≥0.85, decode
+means IMPROVE (TPOT −3.5/−4.7/−5.3 ms/step), throughput −0.45 to −0.59 %
+(within the vLLM-async's own −0.66 to −0.91 % envelope). TTFT rises +32/+36/+30 %
+vs our own sync arm — the same premium vLLM pays (see §3).
+
+### (3) The two async patterns are THE SAME — no divergence exists
+
+(a) Deltas side by side (async-on minus sync, per engine):
+
+| c | engine | ΔX tok/s | ΔTPOT ms | ΔTTFT ms |
+|---|---|---|---|---|
+| 8 | vLLM | −4.1 (−0.79 %) | −2.6 | +469 (+26.3 %) |
+| 8 | ours | −3.0 (−0.59 %) | −3.5 | +554 (+32.4 %) |
+| 16 | vLLM | −5.4 (−0.66 %) | −4.0 | +663 (+30.5 %) |
+| 16 | ours | −4.0 (−0.51 %) | −4.7 | +713 (+35.5 %) |
+| 32 | vLLM | −10.1 (−0.91 %) | −4.3 | +850 (+27.6 %) |
+| 32 | ours | −4.9 (−0.45 %) | −5.3 | +829 (+30.3 %) |
+
+(b) Four-arm ITL spike-location (spikes >400 ms; first/last 15 tokens; 3 reps):
+
+| arm | spikes | START | MID | END | magnitude bands (ms:events) |
+|---|---|---|---|---|---|
+| ours c8 W3-on | 144 | 108 | 0 | 36 | 400:24 **500:54** 800:66 |
+| ours c8 W3-off | 162 | 120 | 0 | 42 | 400:31 **800:131** (no 500-band) |
+| vLLM c8 aon | 129 | 84 | 0 | 45 | graded 400–900 |
+| vLLM c8 aoff | 201 | 120 | 0 | 81 | 400:120 800:81 |
+| ours c32 W3-on | 7465 | 4380 | 5 | 3080 | graded, 900:6136 |
+| ours c32 W3-off | 7983 | 4590 | 18 | 3375 | 900:6690 |
+| vLLM c32 aon | 7965 | 3975 | 69 | 3921 | graded, 900:5236 |
+| vLLM c32 aoff | 8316 | 4227 | 99 | 3990 | 500:1785 900:6024 |
+
+The binding-era fingerprint ("ours START-loaded, vLLM END-loaded") is exactly
+reproduced by the SYNC-ours vs ASYNC-vLLM pair (w3off 4590/18/3375 ≈ binding
+ours 4608/0/3375; aon 3975/69/3921 ≈ binding vLLM 4002/54/3990) — it was a
+property of the SCHEDULING MODE, not the engine: async shifts spike mass toward
+END/graded and grades the magnitude bands on BOTH engines; sync concentrates
+START-loaded uniform two-prefill stalls on BOTH.
+
+(c) **Named divergence: HONEST ABSENCE.** Ours-W3on reproduces vLLM-async's
+X/TPOT/TTFT deltas, tail structure, spike placement and stall-magnitude grading
+within noise. Grounding: our depth-2 loop `EngineCore::step_with_batch_queue`
+(`src/vllm/v1/engine/core.cpp`) mirrors vLLM `core.py:519-632` (v0.25.0
+`vllm/v1/engine/core.py`, `step_with_batch_queue`); admission timing proven
+same-step by `tests/vllm/v1/test_async_admission_timing.cpp` (89b329e) against
+`core.py:1259-1298`; scheduler composition byte-identical
+(`tests/vllm/v1/test_scheduler_wave.cpp`, 20fc0e1); output visibility resolves
+at consume time in both (`AsyncGPUModelRunnerOutput::get_output` ==
+`async_utils.py:12-70`). Nothing measurable remains to localize: the +705 ms
+premium (fresh: +713 ms) matches vLLM's own +663 ms at c16 within one step.
+**No fix exists to implement — the premium is the mirrored behavior.**
+
+### (4) Axis arithmetic — W3-ON nets positive AS-IS
+
+Per-axis ratios vs the PRODUCTION bar (vLLM async-ON), 18 axes × c8/c16/c32,
+this campaign's interleaved arms (strict PASS = ratio ≥1.0; pass* = p90/p99
+inside the 15 % tail band):
+
+- strict-PASS count: W3-off **14**/54 → W3-on **15**/54.
+- FAIL→PASS under W3-on: `c8 p99_tpot` (1.0087), `c16 p99_tpot` (1.0036),
+  **`c32 p90_itl` (1.0344)** — one of the two binding anomalies, now beating vLLM.
+- FAIL→in-band under W3-on: **`c8 p99_itl` 0.552 → 0.897** — the other binding
+  anomaly, a 62 % tail reduction to within one prefill of vLLM.
+- PASS→FAIL under W3-on: `c8 mean_ttft` (1.3174 → **0.9951**, −0.5 %, within
+  run noise) and `c8 p99_ttft` (1.0380 → 0.9940, in-band). Every other TTFT axis
+  (10 of 12) RETAINS PASS with margin (c16 mean 1.0415, c32 mean 1.1027).
+- Every TPOT/ITL mean/median ratio improves +2.3–3.3 pp toward parity (none of
+  the already-failing decode means flips; they are the separate kernel-glue /
+  recurrence levers).
+- Throughput ratio cost: −0.5 pp (0.9859→0.9800 / 0.9882→0.9832 / 0.9932→0.9887)
+  — the same trade vLLM's own async makes (−0.7 to −0.9 %).
+
+**Verdict: W3-ON nets positive AS-IS** — +3 strict flips (incl. one binding
+anomaly) + the second anomaly into-band vs −2 marginal c8 TTFT flips (−0.5/−0.6 %,
+noise-scale), and it is the MIRROR obligation: vLLM's production default is
+async-ON paying the same premium. The "W3 needs a throughput lever before it
+ships" framing is retired — vLLM's async has no throughput win either. Decision
+for the next grid: **flip W3 default ON** (mirror `vllm/config/vllm.py:1040`),
+owned by `CLAIM-ASYNC-SCHED-W3` (config resolution + fresh token gates + grid);
+this discriminator changes no engine default itself (records only).
+
+Evidence (immutable): `dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…/`
+(42 leg JSONs with per-request `itls[]`, server/client logs, `asched-*.txt` arm
+markers, gate logs; `campaign.out` driver log; `analyze.py`/`axis_table.py`).
+`benchmark_binding=false`; binding stays 49/124.

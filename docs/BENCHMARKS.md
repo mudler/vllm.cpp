@@ -199,16 +199,26 @@ async depth-2 output-timing/overlap regime (which CPU simulation of the async
 driver does NOT reproduce — it also budget-packs to 2048), so the axes are
 expected to close only under W3-on (already implemented, `CLAIM-ASYNC-SCHED-W3`,
 default-OFF per `89b329e`'s +36 % TTFT finding); per MIRROR policy the fix IS
-async-on, no invented single-prefill cap. The empirical confirmation is a
-**c8+c32 W3-on/off ITL-tail A/B** folded into the pending W3 DGX proof (`VT_ASYNC_RUNNER=1`
-vs `VT_ASYNC_RUNNER=1 VT_ASYNC_SCHED=0`, same binary, one flock, 3 reps),
-now **RUNNING** as the W3 async TTFT-premium discriminator (2026-07-16,
-`CLAIM-W3-ASYNC-DISC`, [spec](../.agents/specs/w3-async-ttft-discriminator-2026-07-16.md);
-adds a vLLM async-ON-vs-OFF self-A/B and c16). Calibration correction from the
-binding raw: vLLM's async c16 mean TTFT is **~2848 ms** (not the mis-cited
-~2005), HIGHER than ours sync **~1990 ms**, so ours already beats vLLM on the
-TTFT axis in both arms and the +705 ms W3-on premium is ours-internal, not a
-gate loss (full results pending). The
+async-on, no invented single-prefill cap. The empirical confirmation **RAN and
+CONFIRMED the mechanism** (2026-07-17, the W3 async TTFT-premium discriminator,
+`CLAIM-W3-ASYNC-DISC`, [spec + full tables](../.agents/specs/w3-async-ttft-discriminator-2026-07-16.md);
+one flock, 42 legs, token gates 6/6 @ `6ea7856`, evidence
+`dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…`; `benchmark_binding=false`, no
+speed credit): under W3-on (`VT_ASYNC_RUNNER=1`) **both anomalies flip** — c8
+p99_itl 856.8→**527.4 ms** (ratio 0.552→**0.897**, in the 15 % band) and c32
+p90_itl 698.7→**534.4 ms** (0.791→**1.048**, ours now beats vLLM) — and the
+~500 ms single-prefill band appears (c8: 54 events vs ZERO sync). The
+campaign's vLLM v0.25.0 self-A/B (async ON vs `--no-async-scheduling`,
+arm log-confirmed) also settles the TTFT question: **vLLM's own async pays
++26/+31/+28 % mean TTFT at −0.7 to −0.9 % throughput** (−2.6 to −4.3 ms TPOT)
+vs its own sync at c8/c16/c32 — the premium is inherent to depth-2 scheduling
+and upstream ships it ON anyway; ours-W3on reproduces vLLM-async's deltas and
+spike structure within noise (no engine divergence; the mis-cited "vLLM async
+~2005 ms" was corrected — binding vLLM async c16 TTFT is ~2848 ms vs ours sync
+~1990). Axis arithmetic vs the production bar (18 axes × c8/c16/c32):
+strict-PASS 14→15/54, flips up c8/c16 p99_tpot + c32 p90_itl, flips down only
+the noise-scale c8 mean/p99 TTFT (0.9951/0.9940) ⇒ **W3-ON nets positive
+as-is; the W3 default flips ON next** (owned by `CLAIM-ASYNC-SCHED-W3`). The
 decode body (tokens 16–111) is at parity with ZERO mid-sequence stalls;
 capping the per-event stall at one prefill was measured-sufficient to flip both
 axes to PASS (counterfactual ratios 0.87–0.96 / 0.93–1.11). The

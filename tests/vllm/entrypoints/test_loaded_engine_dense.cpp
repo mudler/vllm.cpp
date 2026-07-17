@@ -341,15 +341,16 @@ TEST_CASE(
                                                  false) == 256);
 }
 
-// ─── W3 ENG-ASYNC-SCHED: the construction enable-flip ────────────────────────
-// The last code piece before the DGX async-overlap proof: LoadedEngine resolves
-// async scheduling ONCE at construction from runner_.runner_supports_async()
-// (VT_ASYNC_RUNNER) x VT_ASYNC_SCHED, then constructs an AsyncScheduler +
-// max_concurrent_batches=2 when ON (else the byte-identical synchronous Scheduler
-// + depth-1). These cases pin the full env unset/1 x VT_ASYNC_SCHED unset/0
+// ─── W3 ENG-ASYNC-SCHED: the construction enable-flip (DEFAULT ON) ────────────
+// LoadedEngine resolves async scheduling ONCE at construction from
+// runner_.runner_supports_async() (VT_ASYNC_RUNNER, DEFAULT ON since the
+// 2026-07-17 flip mirroring vLLM config/vllm.py:992-1044) x VT_ASYNC_SCHED, then
+// constructs an AsyncScheduler + max_concurrent_batches=2 when ON (else the
+// byte-identical synchronous Scheduler + depth-1). These cases pin the resolution
 // matrix: (a) the pure resolution logic (static, no disk load), and (b) the wired
 // construction outcome (scheduler runtime TYPE + mcb) over a synthetic dense
-// engine.
+// engine, across the production default and the two same-binary rollback arms
+// (VT_ASYNC_RUNNER=0 runner-level, VT_ASYNC_SCHED=0 scheduler-level).
 TEST_CASE(
     "loaded_engine: async-scheduling resolution matrix (runner x VT_ASYNC_SCHED)") {
   const vllm::SchedulerConfig cfg;  // async_scheduling == nullopt, as MakeSchedulerConfig.
@@ -374,8 +375,8 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "loaded_engine: async enable-flip constructs AsyncScheduler + mcb=2 (env "
-    "unset/1 x VT_ASYNC_SCHED unset/0)") {
+    "loaded_engine: async enable-flip constructs AsyncScheduler + mcb=2 BY "
+    "DEFAULT (rollback arms VT_ASYNC_RUNNER=0 / VT_ASYNC_SCHED=0)") {
   const HfConfig c = MakeDenseConfig();
   EngineParams params;  // defaults.
 
@@ -383,22 +384,10 @@ TEST_CASE(
   ::unsetenv("VT_ASYNC_RUNNER");
   ::unsetenv("VT_ASYNC_SCHED");
 
-  // (1) Production default (VT_ASYNC_RUNNER unset): the runner does NOT advertise
-  // async, so the flip resolves OFF — synchronous Scheduler, depth-1. Byte-identical
-  // to pre-W3 production.
-  {
-    LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
-    CHECK_FALSE(eng.runner().runner_supports_async());
-    CHECK_FALSE(eng.async_scheduling_enabled());
-    CHECK(eng.max_concurrent_batches() == 1);
-    CHECK(dynamic_cast<const vllm::v1::AsyncScheduler*>(&eng.scheduler()) ==
-          nullptr);
-  }
-
-  // (2) VT_ASYNC_RUNNER=1, VT_ASYNC_SCHED unset: the enable-flip — the runner
-  // advertises async, resolution defaults ON, so scheduler() is an AsyncScheduler
-  // and mcb is 2 (depth-2 step_with_batch_queue engaged for the async engine).
-  ::setenv("VT_ASYNC_RUNNER", "1", /*overwrite=*/1);
+  // (1) Production default (all env unset): the runner advertises async by
+  // default (VT_ASYNC_RUNNER default ON), resolution defaults ON, so scheduler()
+  // is an AsyncScheduler and mcb is 2 (depth-2 step_with_batch_queue engaged for
+  // the async engine) — mirroring vLLM's async-scheduling default-on-when-compatible.
   {
     LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
     CHECK(eng.runner().runner_supports_async());
@@ -408,9 +397,24 @@ TEST_CASE(
           nullptr);
   }
 
-  // (3) VT_ASYNC_RUNNER=1, VT_ASYNC_SCHED=0: the same-binary DGX rollback — the
-  // runner is still async-capable but the scheduler is forced back to synchronous
-  // (Scheduler + depth-1), so the A/B can compare arms without a rebuild.
+  // (2) VT_ASYNC_RUNNER=0: the runner-level rollback — the runner does NOT
+  // advertise async, so the flip resolves OFF: synchronous Scheduler, depth-1,
+  // byte-identical to the pre-flip production path.
+  ::setenv("VT_ASYNC_RUNNER", "0", /*overwrite=*/1);
+  {
+    LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+    CHECK_FALSE(eng.runner().runner_supports_async());
+    CHECK_FALSE(eng.async_scheduling_enabled());
+    CHECK(eng.max_concurrent_batches() == 1);
+    CHECK(dynamic_cast<const vllm::v1::AsyncScheduler*>(&eng.scheduler()) ==
+          nullptr);
+  }
+  ::unsetenv("VT_ASYNC_RUNNER");
+
+  // (3) VT_ASYNC_SCHED=0 (runner default ON): the scheduler-level same-binary
+  // rollback — the runner is still async-capable (runner_supports_async TRUE) but
+  // the scheduler is forced back to synchronous (Scheduler + depth-1), so the A/B
+  // can compare arms without a rebuild.
   ::setenv("VT_ASYNC_SCHED", "0", /*overwrite=*/1);
   {
     LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);

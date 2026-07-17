@@ -12442,3 +12442,72 @@ delta; matches the validated ab.sh recipe). Cross-era drift noted: fresh vLLM
 c16 tput ~804–810 vs binding-era 794 (+1.3 %) — internal comparisons are
 interleaved same-session, so unaffected. `benchmark_binding=false`, NO speed
 credit; binding stays 49/124.
+
+## 2026-07-17 — `ENG-ASYNC-SCHED` W3 async-scheduling DEFAULT FLIPPED ON (mirror vLLM) → DONE; incidental RMSNorm-fast 27B regression discovered + rolled back (`CLAIM-ASYNC-SCHED-W3`, isolated worktree, reset to `origin/main` @ `c63a1ec`)
+
+**The final W3 lever before the next binding grid: the async-scheduling default is
+flipped ON, mirroring vLLM.** Two changes landed in this one commit.
+
+**(1) Async default flip (the task).** `VT_ASYNC_RUNNER` default OFF→ON. The inline
+getenv parse in `runner.cpp` was factored into a pure, CPU-unit-tested predicate
+`AsyncRunnerFlagIsOn` (`include/vllm/v1/worker/gpu/async_runner_flag.h`, house
+default-ON / '0'-off convention mirroring `RmsNormDecodeFastFlagIsOn`). So
+`GPUModelRunner::runner_supports_async()` is TRUE by default and `LoadedEngine`
+resolves an `AsyncScheduler` + `max_concurrent_batches=2` (depth-2
+`step_with_batch_queue`) by default, mirroring `vllm/config/vllm.py:992-1044`.
+`VT_ASYNC_RUNNER=0` = runner-level rollback (sync host path); `VT_ASYNC_SCHED=0` =
+scheduler-level rollback (sync Scheduler, runner stays async-capable). Header
+comments in `runner.h`/`model_loader.{h,cpp}` updated to the new default.
+TEST-FIRST RED→GREEN: the construction matrix in `test_loaded_engine_dense.cpp`
+was inverted (default → AsyncScheduler+mcb=2; the two rollback arms `VT_ASYNC_RUNNER=0`
+and `VT_ASYNC_SCHED=0`), RED VERIFIED against the un-flipped code (5 asserts fail:
+`runner_supports_async()==false`, `async_scheduling_enabled()==false`, `1==2`,
+`nullptr!=nullptr`), then GREEN after the flip. New CPU flag test
+`tests/vllm/v1/worker/test_async_runner_flag.cpp` (11 asserts, registered in CMake).
+
+**(2) Incidental CRITICAL finding — RMSNorm-fast 27B token regression, rolled back.**
+The DGX re-confirmation ran the fuller `test_qwen27_paged_ENGINE` (the 16-token
+pip-vLLM oracle production greedy stream). It FAILED **234/235** — tokens 1–6 match
+the oracle then token 7 flips (`271` vs oracle `198`) and cascades — IDENTICALLY in
+all three async arms (async-independent). Isolation: `VT_RMSNORM_DECODE_FAST=0` →
+**235/235** with async still ON. So the divergence is the `VT_RMSNORM_DECODE_FAST`
+default-ON flip (`696a991`), NOT async: the vectorized kernel's reordered
+1024-thread reduction flips a documented 27B whitespace/near-tie greedy argmax away
+from the oracle, and vLLM's real oracle runs an Inductor-Triton rmsnorm, not the
+csrc kernel the port mirrors. The `696a991` gate used only `paged_FORWARD` (17/17),
+which does not exercise the production stream, so it shipped unnoticed. Since
+token-exactness vs the oracle is the sacrosanct precondition for the correct
+production default this flip hands to the grid, the `VT_RMSNORM_DECODE_FAST` default
+was rolled back to OFF (predicate + flag test inverted RED→GREEN; kernel stays
+opt-in via `=1`). `KERNEL-EW-NORM-ACT` stays DONE (family oracle-exact via the
+shipped kernel); the fast-kernel default-ON perf lever REOPENS (needs the
+Inductor-Triton numerics match + a `paged_ENGINE` gate).
+
+**CPU gates:** clean full `-Werror` rebuild 0 warnings, full SERIAL ctest
+**116/116**, tools `unittest discover` **164/164**, record + doc-checkpoint
+checkers green.
+
+**DGX re-confirmation** (evidence `dgx:~/work/vllm.cpp-async-flip`; fast-path build
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc
+-DVLLM_CPP_FLASH_ATTN=ON -DVLLM_CPP_TRITON=ON`, configure log HARD-verified
+"CUTLASS found … enabling sm120a NVFP4 cutlass GEMM" AND "FlashAttention-2 sm_121a
+prefill/decode: ENABLED"; one `flock /tmp/gpu` per matrix):
+- **gate1** (current-main RMSNorm-ON, async flip): default-async / `VT_ASYNC_RUNNER=0`
+  / `VT_ASYNC_SCHED=0` ALL identical **27B 234/235 + 35B 315/315** ⇒ async is
+  TOKEN-NEUTRAL; the 27B miss is RMSNorm, async-independent. Log "enabled (mcb=2)"
+  on default, "disabled (mcb=1)" on both rollbacks.
+- **isolation**: `VT_RMSNORM_DECODE_FAST=0` + async default → 27B **235/235**.
+- **gate2** (shipping default = async ON + RMSNorm-fast OFF): default-async
+  **27B 235/235 + 35B 315/315** log "enabled (mcb=2)"; `VT_ASYNC_RUNNER=0` and
+  `VT_ASYNC_SCHED=0` each **235/235 + 315/315** log "disabled (mcb=1)".
+No new A/B — the discriminator's (`6ea7856`, 42 legs) stands. TTFT means rise into
+vLLM's async envelope BY DESIGN (+26–31 %, the same trade vLLM's own async pays);
+**the next binding grid runs async by default and its TTFT readout must NOT be
+misread as a regression.**
+
+`ENG-ASYNC-SCHED` → **DONE** (owner `6ea7856`, the discriminator-proven async-code
+SHA whose async path is byte-identical to this flip; the flip is token-neutral).
+Closing ledger rows [#L502](parity-ledger.md#L502) (async) + [#L503](parity-ledger.md#L503)
+(RMSNorm rollback). `CLAIM-ASYNC-SCHED-W3` RELEASED. `benchmark_binding=false`, no
+speed credit; binding stays 49/124. Trailers `FOLLOWING_AGENTS_PROTOCOL` +
+`Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]`.

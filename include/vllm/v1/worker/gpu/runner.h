@@ -178,12 +178,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   // iff the runner advertises the placeholder-aware async device path: it is
   // engaged (async_input_combine(), from VT_ASYNC_RUNNER / set_async_input_combine)
   // AND runs on a backend whose async-output primitives are wired (CUDA, or CPU's
-  // synchronous degeneration for the CPU gate). DEFAULT OFF: with async off this
-  // returns false, so ResolveAsyncScheduling keeps the synchronous Scheduler and
-  // the production default is byte-identical to the sync path. Setting
-  // VT_ASYNC_RUNNER=1 flips it TRUE, which is the single env the DGX A/B uses to
-  // engage full W3 (depth-2 + async output); VT_ASYNC_SCHED=0 then rolls the
-  // scheduler back to synchronous in the same binary.
+  // synchronous degeneration for the CPU gate). DEFAULT ON since the 2026-07-17
+  // flip (VT_ASYNC_RUNNER default ON, async_runner_flag.h): with async on this
+  // returns true, so ResolveAsyncScheduling resolves the AsyncScheduler + mcb=2 by
+  // default, mirroring vLLM's async-scheduling default. VT_ASYNC_RUNNER=0 rolls the
+  // runner back to the synchronous host path (returns false → sync Scheduler);
+  // VT_ASYNC_SCHED=0 rolls only the scheduler back to synchronous in the same binary
+  // while the runner stays async-capable.
   bool runner_supports_async() const override { return async_input_combine_; }
 
   // ─── Accessors (for tests + the ordering identity gate) ────────────────────
@@ -212,13 +213,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   // GPU-resident-analog InputBatch::last_sampled_tokens via
   // combine_sampled_and_draft_tokens INSTEAD of the host token_ids_cpu read —
   // the piece that lets step N+1 be prepared without waiting on step N's sampled
-  // token to cross to the host (the ~3.25 ms/step idle). DEFAULT OFF: the
-  // production runner keeps the synchronous host path byte-identical, so
-  // `runner_supports_async` stays FALSE until the copy-stream D2H half + the
-  // DGX token-exactness/overlap gate land. VT_ASYNC_RUNNER=1 opts in at
-  // construction (bring-up); tests toggle it directly. Greedy tokens are
-  // bit-identical in both modes (combine writes the same id sample_tokens wrote
-  // back to token_ids_cpu) — the DGX gate proves it on the real models.
+  // token to cross to the host (the ~3.25 ms/step idle). DEFAULT ON since the
+  // 2026-07-17 flip (VT_ASYNC_RUNNER default ON): the production runner engages the
+  // async device path so `runner_supports_async` is TRUE by default; the DGX
+  // token-exactness gates + the 6ea7856 discriminator proved greedy tokens are
+  // bit-identical to the sync path. VT_ASYNC_RUNNER=0 rolls it back to the
+  // synchronous host path at construction; tests toggle it directly. Greedy tokens
+  // are bit-identical in both modes (combine writes the same id sample_tokens wrote
+  // back to token_ids_cpu).
   void set_async_input_combine(bool enabled) {
     async_input_combine_ = enabled;
   }

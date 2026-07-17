@@ -219,8 +219,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
               /*max_num_batched_tokens=*/max_num_batched_tokens_),
       // Resolve the enable-flip from the now-constructed runner + VT_ASYNC_SCHED,
       // then size the batch-queue depth (2 under async scheduling → depth-2
-      // step_with_batch_queue; 1 otherwise). Default (no VT_ASYNC_RUNNER) resolves
-      // OFF, keeping the byte-identical synchronous path.
+      // step_with_batch_queue; 1 otherwise). Since the 2026-07-17 flip the default
+      // (no env) resolves ON (VT_ASYNC_RUNNER default ON), mirroring vLLM;
+      // VT_ASYNC_RUNNER=0 / VT_ASYNC_SCHED=0 roll back to the synchronous path.
       async_scheduling_enabled_(ResolveAsyncEnabled(
           MakeSchedulerConfig(
               max_model_len_,

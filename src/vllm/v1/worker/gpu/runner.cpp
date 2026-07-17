@@ -19,6 +19,7 @@
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
+#include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
@@ -59,16 +60,20 @@ static bool GpuSampleEnabled() {
   return on;
 }
 
-// Async-scheduling device-input opt-in default (ENG-ASYNC-SCHED W3 runner leaf).
-// VT_ASYNC_RUNNER=1 turns ON the combine_sampled_and_draft_tokens device-input
-// path at runner construction (bring-up opt-in for the DGX A/B); default OFF so
-// production keeps the synchronous host path byte-identical. Read at CONSTRUCTION
-// (not per-step), honoring the env value live at each runner build so the DGX A/B
-// — and the CPU construction-matrix test — can flip it per engine. Tests may also
-// toggle the flag directly via set_async_input_combine.
+// Async-scheduling device-input default (ENG-ASYNC-SCHED W3 runner leaf).
+// VT_ASYNC_RUNNER gates the combine_sampled_and_draft_tokens device-input +
+// async sampler-output path at runner construction, which advertises
+// runner_supports_async() so LoadedEngine resolves an AsyncScheduler + mcb=2.
+// DEFAULT ON since the 2026-07-17 flip (mirror vLLM's async-scheduling default,
+// vllm/config/vllm.py:992-1044; DGX-proven token-exact); VT_ASYNC_RUNNER=0 is the
+// runner-level rollback to the synchronous host path (byte-identical pre-flip
+// streams). Read at CONSTRUCTION (not per-step), honoring the env value live at
+// each runner build so the DGX A/B — and the CPU construction-matrix test — can
+// flip it per engine. The parse is factored into the pure, CPU-unit-tested
+// AsyncRunnerFlagIsOn predicate (async_runner_flag.h). Tests may also toggle the
+// flag directly via set_async_input_combine.
 static bool AsyncRunnerEnvDefault() {
-  const char* e = std::getenv("VT_ASYNC_RUNNER");
-  return e != nullptr && e[0] == '1' && e[1] == '\0';
+  return AsyncRunnerFlagIsOn(std::getenv("VT_ASYNC_RUNNER"));
 }
 
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each

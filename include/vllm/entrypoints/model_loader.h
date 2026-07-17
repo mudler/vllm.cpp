@@ -138,9 +138,10 @@ class LoadedEngine {
   // advertising the async device path (VT_ASYNC_RUNNER), with the house
   // VT_ASYNC_SCHED=0 rollback applied. When ON, scheduler() is an AsyncScheduler
   // and max_concurrent_batches() is 2 (depth-2 batch queue, step_with_batch_queue);
-  // OFF keeps the byte-identical synchronous Scheduler + depth-1. The production
-  // default (no VT_ASYNC_RUNNER) resolves OFF, so nothing changes until the DGX
-  // A/B flips that env.
+  // OFF keeps the byte-identical synchronous Scheduler + depth-1. Since the
+  // 2026-07-17 flip the production default (no env) resolves ON (VT_ASYNC_RUNNER
+  // default ON → AsyncScheduler + mcb=2), mirroring vLLM; VT_ASYNC_RUNNER=0 or
+  // VT_ASYNC_SCHED=0 roll it back in the same binary.
   bool async_scheduling_enabled() const { return async_scheduling_enabled_; }
   int max_concurrent_batches() const { return max_concurrent_batches_; }
   // The engine's scheduler (Scheduler or, under async scheduling, AsyncScheduler).

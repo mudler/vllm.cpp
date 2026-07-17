@@ -195,3 +195,34 @@ pre-flip token streams). Acceptance met: both token gates hold AND the A/B
 wins (TPOT down, tput up). Flag tests inverted RED→GREEN
 (`tests/vt/test_rmsnorm_decode_fast.cpp`); launcher/header comments updated.
 The next binding grid runs the fast kernel by default.
+
+## 2026-07-17 — DEFAULT ROLLED BACK to OFF (27B paged_engine oracle divergence; `CLAIM-ASYNC-SCHED-W3`)
+
+The 2026-07-16 default-ON flip is REVERTED. Its gate exercised only
+`test_qwen27_paged_FORWARD` (17/17 + 84/84) and the 35B forward — NOT the full
+production greedy stream. The `CLAIM-ASYNC-SCHED-W3` async-default-flip DGX
+re-confirmation ran `test_qwen27_paged_ENGINE` (the 16-token pip-vLLM oracle
+production stream, `tests/parity/goldens/qwen36_logits_27b/greedy_ids.npy`) and
+found **fast-ON diverges from the oracle: 234/235 fast-ON vs 235/235 fast-OFF**,
+IDENTICALLY across all three async arms (async-independent). The divergence:
+tokens 1–6 match, then output token 7 flips (`271` vs oracle `198`) and cascades.
+
+Root cause: the vectorized kernel's reordered 1024-thread block reduction (vs the
+shipped 256-thread tree) produces a ~1-ULP f32 difference that flips a documented
+27B whitespace/near-tie greedy argmax; and vLLM's ACTUAL oracle rmsnorm is the
+Inductor-generated `triton_red_fused…rms_norm`, not the csrc
+`fused_add_rms_norm_kernel<bf16,8>` this kernel mirrors — so bit-parity vs the
+ORACLE token stream was never guaranteed (only vs our own shipped kernel, which is
+itself oracle-exact on this stream). Token-exactness vs the pip-vLLM oracle is the
+sacrosanct precondition, so the shipped `RmsNormRowKernel` is the default again.
+
+`VT_RMSNORM_DECODE_FAST` predicate reverted to default-OFF / '1'-opt-in
+(`src/vt/cuda/rmsnorm_decode_fast.h`); flag test inverted back RED→GREEN
+(`tests/vt/test_rmsnorm_decode_fast.cpp`, 10 asserts); launcher/parity-test
+comments updated. `RmsNormRowFastKernel` remains available via
+`VT_RMSNORM_DECODE_FAST=1`. `KERNEL-EW-NORM-ACT` stays DONE (the norm/act family is
+implemented + oracle-exact via the shipped kernel); the **fast-kernel default-ON
+perf lever REOPENS** — a re-attempt must reproduce the oracle's Inductor-Triton
+numerics (match the actual reduction), not just the csrc kernel, and must gate on
+`test_qwen27_paged_ENGINE` (the production stream), not only `paged_FORWARD`.
+Evidence `dgx:~/work/vllm.cpp-async-flip`; ledger #L503.

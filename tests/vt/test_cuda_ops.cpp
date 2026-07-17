@@ -254,7 +254,8 @@ TEST_CASE("CUDA rmsnorm fused residual matches CPU and updates residual") {
   }
 }
 
-// VT_RMSNORM_DECODE_FAST (default ON; '0' = rollback): the vectorized decode
+// VT_RMSNORM_DECODE_FAST (default OFF again since the 2026-07-17 rollback; '1' =
+// opt-in): the vectorized decode
 // kernel (RmsNormRowFastKernel, a 1:1 port of vLLM fused_add_rms_norm_kernel
 // <bf16,8>, csrc/libtorch_stable/layernorm_kernels.cu:106-173 @ e24d1b24) must
 // match the rollback RmsNormRowKernel at the real 27B decode shape (M x H=5120,

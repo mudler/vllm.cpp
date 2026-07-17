@@ -9,6 +9,13 @@ split), `ENG-ASYNC-SCHED` (async/overlap scheduling), `ENG-PRIORITY-SCHED`
 
 ## Current checkpoint and priority
 
+**W3 `ENG-ASYNC-SCHED` is DONE (2026-07-17): the async-scheduling default is
+FLIPPED ON** (`VT_ASYNC_RUNNER` default ON, mirror `vllm/config/vllm.py:992-1044`),
+DGX-re-confirmed token-neutral (235/235 + 315/315, log "enabled, mcb=2"), owner
+`6ea7856`; rollbacks `VT_ASYNC_RUNNER=0` / `VT_ASYNC_SCHED=0`. See the 2026-07-17
+addendum below. The historical W3 landing narrative (machinery → runner halves →
+enable-flip → discriminator) is retained below for reference.
+
 W1 `ENG-CORE-BUSY-LOOP`, W2 `SERVE-ASYNC-LLM`, and W4
 `ENG-PRIORITY-SCHED` are implemented and `GATING`; the engine matrix carries
 their exact code/test evidence. Fixed HTTP delivery capacity is retained and
@@ -463,3 +470,48 @@ flock, 42 legs) measured vLLM v0.25.0's OWN async-scheduling self-A/B
   intentional upstream). The speed-credit floor for W3 as a *lever* is retired
   with it — W3 is a parity/mirror obligation with a tails+TPOT win, not a
   throughput lever.
+
+## Addendum 2026-07-17 — W3 default FLIPPED ON (mirror vLLM); `ENG-ASYNC-SCHED` DONE; a discovered RMSNorm-fast 27B regression rolled back alongside
+
+`CLAIM-ASYNC-SCHED-W3` landed the default flip test-first. `VT_ASYNC_RUNNER`
+now defaults ON via the pure, CPU-unit-tested `AsyncRunnerFlagIsOn` predicate
+(`include/vllm/v1/worker/gpu/async_runner_flag.h`, house default-ON / '0'-off
+convention mirroring `RmsNormDecodeFastFlagIsOn`), so `LoadedEngine` resolves an
+`AsyncScheduler` + `max_concurrent_batches=2` by default. `VT_ASYNC_RUNNER=0`
+(runner-level) and `VT_ASYNC_SCHED=0` (scheduler-level) are the same-binary
+rollbacks. The construction matrix in `test_loaded_engine_dense.cpp` was inverted
+RED→GREEN (default now → AsyncScheduler+mcb=2; RED verified: 5 asserts fail vs the
+un-flipped engine).
+
+**DGX re-confirmation** (evidence `dgx:~/work/vllm.cpp-async-flip`, fast-path build
+CUTLASS + FA2 hard-verified, one flock/matrix):
+
+- **The flip is TOKEN-NEUTRAL.** All three async arms (default-async,
+  `VT_ASYNC_RUNNER=0`, `VT_ASYNC_SCHED=0`) produce BIT-IDENTICAL 27B/35B streams —
+  234/235 before the RMSNorm rollback, 235/235 after — so async scheduling changes
+  ZERO tokens. The "Asynchronous scheduling is enabled (max_concurrent_batches=2)"
+  log appears by default; "disabled (mcb=1)" on both rollback arms.
+- On the shipping default (async ON + RMSNorm-fast OFF): **27B 235/235 + 35B
+  315/315** in every arm.
+- No new A/B — the discriminator's stands. TTFT means rise into vLLM's async
+  envelope BY DESIGN (+26–31 %, the same trade vLLM's own async pays); the next
+  binding grid runs async by default and its TTFT readout must NOT be misread as a
+  regression.
+
+**Incidental critical finding — RMSNorm-fast 27B token regression (rolled back).**
+The DGX gate ran `test_qwen27_paged_ENGINE` (the full 16-token production greedy
+stream) and found the `VT_RMSNORM_DECODE_FAST` default-ON flip (`696a991`, whose
+gate used only `paged_FORWARD`) DIVERGES from the pip-vLLM oracle golden: tokens
+1–6 match then token 7 flips (`271` vs oracle `198`) and cascades — 234/235 fast-ON
+vs 235/235 fast-OFF, ASYNC-INDEPENDENTLY. The vectorized kernel's reordered
+1024-thread reduction flips a documented 27B whitespace/near-tie greedy argmax, and
+vLLM's real oracle runs an Inductor-generated Triton rmsnorm (not the csrc
+`fused_add_rms_norm_kernel` the port mirrors), so oracle bit-parity was never
+guaranteed. Since token-exactness vs the oracle is the sacrosanct precondition for
+a correct production default (which this flip hands to the next grid), the
+`VT_RMSNORM_DECODE_FAST` default was rolled back to OFF in the same landing
+(`RmsNormRowFastKernel` stays opt-in via `=1`). `KERNEL-EW-NORM-ACT` stays DONE
+(the family is implemented + oracle-exact via the shipped kernel); the fast-kernel
+default-ON perf lever REOPENS pending a numerical fix that reproduces the
+Inductor-Triton stream. See [rmsnorm-decode-fast-2026-07-16.md](rmsnorm-decode-fast-2026-07-16.md)
+§2026-07-17 rollback and ledger #L503.

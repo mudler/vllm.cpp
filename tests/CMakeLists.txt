@@ -65,6 +65,7 @@ vllm_cpp_add_test(test_sampler vllm/v1/sample/test_sampler.cpp)
 vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
+vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 # test_runner uses detail::ValidateGdnStateIndices from the internal header.
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)

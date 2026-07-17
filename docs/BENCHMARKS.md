@@ -9,49 +9,37 @@ append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 
 Last updated: **2026-07-17**. The binding Qwen3.6-27B parity result against vLLM
-v0.25.0 is now the **fresh, fully-interleaved exact-grid rerun at `a875397`** on
-the production default set (async scheduling ON + vendored Triton GDN decode cubin
-ON + RMSNorm-fast opt-in): **FAILED / open at 52/124 axes** (gate NO; root, tables
-and honest deltas below). It **SUPERSEDES `246a23c`** (**49/124**) and the older
-`3f256ab` grid (**55/124**), both retained immutable; `benchmark_binding` now
-refers to the `a875397` root. Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/a87539790f904373e8737007bbe1677f006a90ea`
-(immutable; ratios.json sha256 `4cb89b08…1069`, all-runs.json `f2bdda8f…a17`,
-manifest.json `47f7c787…133`), ZERO void axes, 12/12 binding-eligible; our arm ran
-pure defaults (async log-confirmed 3/3), vLLM its production async default.
+v0.25.0 is now the **fresh, fully-interleaved exact-grid rerun at `9ecd9d0`** on
+the full production default set (async scheduling + vendored Triton GDN decode
+cubin + bit-identical fast RMSNorm + bit-identical fast gated-RMSNorm):
+**FAILED / open at 114/124 axes** (gate NO — 10 remain; root, tables and honest
+deltas below). It **SUPERSEDES `a875397`** (52/124), `246a23c` (49/124) and
+`3f256ab` (55/124), all retained immutable; `benchmark_binding` now refers to the
+`9ecd9d0` root. Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/9ecd9d0d84056466f54e756800efd667098bed2c`
+(immutable; ratios.json sha256 `8c81083e…`, all-runs.json `c7e4a831…`, manifest.json
+`a3871da2…`), ZERO void axes, 12/12 binding-eligible; our arm ran pure defaults,
+vLLM its production async default.
 
-**+3 axes AND a structural improvement — the async lever flipped the ITL tails.**
-Per concurrency: mem **4/4**, c1 **20/20**, c2 3, c4 4, c8 5, c16 6, c32 **10**.
-The two ITL tail anomalies that dominated the `246a23c` failure mass are resolved:
-c16 p99_itl **1.024**, c32 p90_itl **1.020** + p99_itl **1.026**, c4 p99_itl
-**1.89** now PASS (the old catastrophic c8 p99_itl 0.56 / c32 p90_itl 0.79 are
-gone at c16/c32; c8 p99_itl improved 0.56→**0.844**, still the worst single tail).
-c32 rose 6→10 pass on the flips. The **entire remaining failure mass is a
-nearly-UNIFORM ~1–2% decode deficit** (throughput/TPOT/ITL/E2EL means + medians,
-c2–c32): of 72 failing axes, **55 are within 2% of vLLM** (21 within 1%, 34 within
-1–2%), 14 within 2–5%, and only **3 worse than 5%** (c8 p99_itl 0.844; c4
-mean/median TTFT 0.878/0.92, low-concurrency arrival-lottery noise). The gate is
-strict ≥1.0 (even 0.9999 fails), so "52" is a whisker-thin deficit, not a gap:
-c16 throughput 790.95 vs 796.99 (0.9924, −0.76%), c16 mean_tpot 161.5 vs 158.9
-(−1.6%), c32 throughput 1081.5 vs 1083.7 (0.9979, −0.2%).
+**+62 axes — a decode-kernel-efficiency close.** Per concurrency: mem **4/4**, c1
+**20/20**, c2 **20/20**, c16 **19/20**, c4 18/20, c32 18/20, c8 15/20. The lever:
+a family of **bit-identical (0-ulp) fast decode kernels** — each reproduces its
+shipped reference's exact float-op order (so the fast set yields identical logits
+and can never cross the 27B tok6 razor near-tie) while vectorizing memory access.
+`RmsNormRowFastKernel` (2.41× isolated, `348d12d`) closed the c2 lanes entirely
+(3→20); `RmsNormGatedRowFastKernel` (2.04× at c16, `9ecd9d0`) closed the uniform
+c16 floor (6→19). This CONFIRMS the measured attribution: the uniform decode
+deficit was the norm/quant/act kernel glue, and vectorizing it bit-identically
+closed it. Correctness holds — the full default set is 27B 235/235 + 35B 315/315.
 
-**Named lever to reclaim ~1% and flip a batch of c2–c8 near-misses:** the
-RMSNorm-fast kernel (its c2 preflight measured **+1.446% tput / −0.887%
-pooled-median TPOT**; c2 throughput here is 0.9816, so RMSNorm alone ≈ halves that
-gap and flips several c2 axes). Its combination-numerics blocker is now **FIXED and
-the default is flipped ON** (2026-07-17, `CLAIM-EW-NORM-ACT-3`): instead of chasing
-a Triton-faithful match, `RmsNormRowFastKernel` was made BIT-IDENTICAL (0-ulp) to
-the shipped `RmsNormRowKernel` — so `fast+cubin ≡ shipped+cubin ≡ 198` by
-construction (27B 235/235 + 35B 315/315 on the full default set; `test_cuda_ops`
-fast==shipped 0-ulp; isolated 2.41× / in-situ engine-forward 3.68× win preserved).
-A sibling batch-independent glue lever landed the SAME bit-identical way
-(2026-07-17, `CLAIM-EW-NORM-GATED-1`): the **GDN gated RMSNorm**
-(`VT_RMSNORM_GATED_FAST`, the `+0.40 ms/step` gated-norm glue term the c2/c8
-attribution measured vs vLLM's fused gated norm) now has a 0-ulp
-`RmsNormGatedRowFastKernel` — full default set 27B 235/235 + 35B 315/315,
-`test_ops_gdn` gated fast==shipped 0-ulp (140/140), **isolated nsys 2.04× at c16**
-(rows=768 3.29/6.70 µs; 1.38× c2, 1.31× c1) — also flipped ON. The 52/124 binding
-predates both flips; the next binding grid re-measures the production default
-(async ON + Triton GDN cubin ON + RMSNorm-fast ON + gated-fast ON).
+**The 10 remaining axes** are near-parity or low-concurrency noise: seven are the
+batch-independent decode floor at **0.987–0.999** (c8 mean/median itl+tpot, c16
+median_itl 0.9983, c32 median_itl 0.9879 + median_tpot 0.9989 — a whisker under the
+strict ≥1.0 bar); two are **c4 TTFT** (mean 0.906 / median 0.943, the bimodal
+low-concurrency arrival lottery); one is the real **c8 p99_itl 0.86** wave-boundary
+prefill-co-schedule tail (ours 557 vs vLLM 479 ms). Closing path: fold in the landed
+bit-identical FP4-quant/SiLU glue kernels (`861b518`, opt-in) + the GDN conv-update
+lever for the decode-floor axes; characterize the c4 TTFT lottery vs run-noise;
+address the c8 p99 tail cadence.
 
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 

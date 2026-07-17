@@ -12651,3 +12651,33 @@ Code:claude-opus-4-8 [ClaudeCode]`.
   is the perf-lever default flip on top of it. `benchmark_binding=false`, binding
   stays 49/124, no separate flip speed credit. Coordination `CLAIM-GDN-DECODE-TRITON-FLIP`
   closed at the flip commit.
+- **2026-07-17 (`VT_RMSNORM_DECODE_FAST` DEFAULT FLIP OFF→ON — c2 preflight WIN; `CLAIM-SERVE-GATE-2` Phase 0)** —
+  The authorized binding-grid rerun opened with its Phase-0 preflight: an
+  interleaved c2 RMSNorm-fast A/B on the a321d7c production build (worktree
+  `dgx:~/work/vllm.cpp-online-gate/source-a321d7c…`, configure HARD-verified
+  "CUTLASS found … enabling sm120a NVFP4 cutlass GEMM" + "FlashAttention-2
+  sm_121a prefill/decode: ENABLED", `-DVLLM_CPP_BENCH_PROFILE_CONTROL=OFF`),
+  one `flock /tmp/gpu` for the whole series, frozen FlashInfer plan fixture,
+  binding c2 corpus (`246a23c…/corpus/27/vllm/c2-r{1,2,3}.jsonl`), vLLM 0.25.0
+  bench-serve client (6 prompts / max-conc 2 / 2 warmups, greedy in1024/out128,
+  `--save-detailed`), w0-discard + 3 pairs, same binary
+  `VT_RMSNORM_DECODE_FAST=1` vs unset. Per the house mode-conditional c2
+  convention the verdict uses POOLED per-request medians (per-request TPOT =
+  mean of that request's itls; 18 req/arm), never per-leg means:
+  **pooled-median TPOT fast 101.900 vs legacy 102.812 ms = −0.912 ms (−0.887%)**
+  (paired −1.237/−1.211/−0.843, 3/3 fast-faster); **total throughput +1.446%**
+  (167.83 vs 165.43 tok/s; 3/3 pairs fast-higher); zero failed requests, no
+  void signature on any leg (all ~163–168 tok/s). Flip acceptance MET →
+  **default flipped ON** test-first: flag test inverted first and observed RED
+  against the old predicate (6/10 asserts fail), predicate inverted to
+  default-ON / `'0'`-rollback (house `gdn_packed_decode_triton.h` convention)
+  → GREEN 10/10; launcher + CUDA-parity-test comments updated. The fast-ON
+  ENGINE token gates stand at `e68c518` (`test_qwen27_paged_engine` 235/235 +
+  `test_qwen36_paged_engine` 315/315, both rollbacks green, CUDA parity
+  132/132) — cited per the preflight contract; a quick 27B engine sanity
+  re-runs on the flipped default before the grid. Evidence
+  `dgx:~/work/vllm.cpp-online-gate/preflight-rmsnorm-c2-a321d7c…/`. Production
+  default set is now **async ON + Triton GDN decode ON + RMSNorm-fast ON**;
+  the authorized exact grid (Phase 1) runs from this flip SHA with fresh vLLM
+  denominators (`--mamba-ssm-cache-dtype float32`, oracle `702f481`).
+  Ledger #L506. `benchmark_binding=false` for the preflight itself.

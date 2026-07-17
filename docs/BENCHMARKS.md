@@ -126,7 +126,8 @@ test **28/28** (default fires cubin, `=0` fires legacy); full GDN **49/49
 (2,343/2,343)**; oracle boundary **12/12**; memcheck **28/28, 0 errors**. No new
 A/B (9dd7d3f's stands). **The next binding grid runs the Triton decode path by
 default** (production-default set: async scheduling ON + Triton decode cubin ON +
-RMSNorm-fast opt-in); no separate flip speed credit is claimed. CPU gates GREEN
+RMSNorm-fast ON since the 2026-07-17 c2 preflight win); no separate flip speed
+credit is claimed. CPU gates GREEN
 (`test_ops_gdn` 45/45, `test_gdn_packed_decode_triton` 10/10, clean -Werror).
 Build repair (2026-07-16): the vendored-cubin landing left the launch-counter
 helper defined unconditionally while its only caller is Triton-gated, breaking
@@ -252,10 +253,10 @@ and its TTFT must not be misread as a regression. The same DGX gate incidentally
 caught a pre-existing RMSNorm-fast 27B token divergence (`VT_RMSNORM_DECODE_FAST`
 default-ON `696a991`, gated only on `paged_FORWARD`): fast-ON 234/235 vs fast-OFF
 235/235 vs the pip-vLLM oracle, async-independently — the `VT_RMSNORM_DECODE_FAST`
-default was rolled back to OFF and STAYS OFF (opt-in), though the 2026-07-17 numerics
-rework FIXED the token-exactness (real `cub::BlockReduce` = the eager oracle's exact
-reduction; 235/235 + 315/315 fast-ON); the c16 in-situ A/B showed no win, so the
-default flip awaits an in-situ win — see the RMSNorm decode-fast section below. The
+default was rolled back to OFF, then the 2026-07-17 numerics rework FIXED the
+token-exactness (real `cub::BlockReduce` = the eager oracle's exact reduction;
+235/235 + 315/315 fast-ON) and the 2026-07-17 c2 preflight A/B delivered the awaited
+in-situ win, so the default is now ON — see the RMSNorm decode-fast section below. The
 decode body (tokens 16–111) is at parity with ZERO mid-sequence stalls;
 capping the per-event stall at one prefill was measured-sufficient to flip both
 axes to PASS (counterfactual ratios 0.87–0.96 / 0.93–1.11). The
@@ -307,8 +308,8 @@ removes that confound and CONFIRMS the lever: ours `RmsNormRowKernel`
 the ~2.4 ms c2 decode gap). The confound was only in-situ (ours in-situ nsys 15.5
 µs is ~1.84× contention-inflated over the 8.46 µs isolated); the isolated gap is
 real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
-**default OFF / opt-in via `=1`**; the 2026-07-17 numerics rework FIXED its
-token-exactness but the c16 A/B showed no in-situ win), a TRUE 1:1 port of vLLM's
+**default ON since 2026-07-17 / `=0` rollback**; the numerics rework FIXED its
+token-exactness and the c2 preflight A/B confirmed the in-situ win), a TRUE 1:1 port of vLLM's
 csrc `fused_add_rms_norm_kernel<bf16,8>` (1024-thread block, 16-byte vectorized
 loads) using the **ACTUAL `cub::BlockReduce<float,1024>`**. History: the
 2026-07-16 kernel APPROXIMATED cub with a hand two-stage warp-shuffle; it was flipped
@@ -332,9 +333,18 @@ gate4 (+1.1%). The FAST arm matches (~804 tok/s both runs) but the shipped-kerne
 LEGACY arm swings ~2% (793 gate4 vs 809 here), so the delta is that arm's
 run-variation ⇒ the c16 effect is a NULL within noise (as this section's Gates
 anticipated: "an in-situ null at c16 is plausible … the c2 lane is the target").
-Per the flip acceptance (a confirmed c16 win / no regression) the **default STAYS OFF
-(opt-in)** — the token-exactness blocker is FIXED and the kernel is the true vLLM
-mirror, but the default flip awaits an in-situ win (c2 target). The completed **lost-lanes rescan**
+Per the flip acceptance the default initially stayed OFF pending an in-situ win at
+the documented c2 target — and the **2026-07-17 c2 preflight A/B (Phase-0 of the
+authorized binding-grid rerun, `CLAIM-SERVE-GATE-2`) DELIVERED it: DEFAULT NOW ON.**
+One flock, a321d7c hard-verified CUTLASS+FA2 production build, binding c2 corpus,
+interleaved w0-discard + 3 pairs, house pooled per-request-median convention
+(18 requests/arm): pooled-median TPOT fast 101.900 vs legacy 102.812 ms =
+**−0.912 ms (−0.887%)**, paired −1.237/−1.211/−0.843 ms **3/3 fast-faster**; total
+throughput **+1.446%** (167.83 vs 165.43 tok/s), **3/3 pairs fast-higher**; no void
+signature on any leg. Evidence
+`dgx:~/work/vllm.cpp-online-gate/preflight-rmsnorm-c2-a321d7c…/`. Flag test inverted
+RED→GREEN 10/10 (default-ON / '0'-rollback, house convention); the engine token
+gates for fast-ON stand at `e68c518` (235/235 + 315/315). The completed **lost-lanes rescan**
 ([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
 angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
 gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of

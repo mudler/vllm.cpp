@@ -29,10 +29,10 @@ struct GdnPackedDecodeDebugStats {
   uint64_t launches = 0;
   // Sub-counts of `launches` by the kernel actually selected inside
   // GdnPackedDecodeKernelCuda: the vendored Triton AOT decode cubin
-  // (VT_GDN_PACKED_DECODE_TRITON, default OFF, 27B-only) vs the register-resident
-  // tiling (VT_GDN_PACKED_REG_TILE, default OFF after its failed DGX proof) vs the
-  // legacy shared-memory / NW-shuffle kernel (the default fallback, or a
-  // non-{32,128} geometry / guard mismatch that stays on the legacy path).
+  // (VT_GDN_PACKED_DECODE_TRITON, default ON, 27B-only; =0 rolls back) vs the
+  // register-resident tiling (VT_GDN_PACKED_REG_TILE, default OFF after its failed
+  // DGX proof) vs the legacy shared-memory / NW-shuffle kernel (the rollback path,
+  // or a non-27B geometry / guard mismatch that stays on the legacy path).
   // triton + reg_tile + legacy == launches at every instrumented dispatch.
   uint64_t triton_launches = 0;
   uint64_t reg_tile_launches = 0;

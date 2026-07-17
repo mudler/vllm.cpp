@@ -1268,19 +1268,20 @@ TEST_CASE(
 #endif  // VLLM_CPP_CUDA
 
 // Vendored Triton AOT packed-decode fast-path (VT_GDN_PACKED_DECODE_TRITON,
-// default OFF; 27B-only). MEASURED codegen-bound (dgx phase1 2026-07-16): the
-// identical register-resident [BV=32,BK=128] fp32 state tile is REG:205/0-spill
-// under Triton but REG:255+STACK:48 (spills) as hand-CUDA. Builds the EXACT 27B
-// packed-decode call site the single cubin was baked to (bf16 mixed_qkv/a/b/out,
-// f32 state/A_log/dt_bias, merged-BA a/b views of row stride 2*Hv=96, Hk=16,
-// Hv=48, Dk=Dv=128) so the launcher guards accept it, and proves (a) the default
-// stays on the legacy kernel, (b) "=1" fires the vendored cubin, and (c) both the
-// AOT and legacy outputs/state match the portable CPU reference within the BF16
-// tolerance. Guarded on VLLM_CPP_TRITON (the cubin only exists in that build).
+// default ON; =0 rolls back; 27B-only). MEASURED codegen-bound (dgx phase1
+// 2026-07-16): the identical register-resident [BV=32,BK=128] fp32 state tile is
+// REG:205/0-spill under Triton but REG:255+STACK:48 (spills) as hand-CUDA. Builds
+// the EXACT 27B packed-decode call site the single cubin was baked to (bf16
+// mixed_qkv/a/b/out, f32 state/A_log/dt_bias, merged-BA a/b views of row stride
+// 2*Hv=96, Hk=16, Hv=48, Dk=Dv=128) so the launcher guards accept it, and proves
+// (a) the DEFAULT now fires the vendored cubin (it is vLLM's exact kernel), (b)
+// "=0" rolls back to the hand legacy kernel, and (c) both the AOT and legacy
+// outputs/state match the portable CPU reference within the BF16 tolerance.
+// Guarded on VLLM_CPP_TRITON (the cubin only exists in that build).
 #if defined(VLLM_CPP_CUDA) && defined(VLLM_CPP_TRITON)
 TEST_CASE(
-    "CUDA gdn packed decode: VT_GDN_PACKED_DECODE_TRITON=1 fires the vendored "
-    "27B cubin and matches the CPU reference") {
+    "CUDA gdn packed decode: VT_GDN_PACKED_DECODE_TRITON defaults ON (fires the "
+    "vendored 27B cubin), =0 rolls back, both match the CPU reference") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
     return;
@@ -1364,19 +1365,20 @@ TEST_CASE(
     d_state.Download(guard.q, state_host.data());
   };
 
-  // Default (unset): the hand kernel handles it, the vendored cubin does not fire.
+  // Rollback "=0": the hand kernel handles it, the vendored cubin does not fire.
   uint64_t t0 = 0, l0 = 0;
   std::vector<uint8_t> out_legacy, state_legacy;
-  run(nullptr, t0, l0, out_legacy, state_legacy);
+  run("0", t0, l0, out_legacy, state_legacy);
   CHECK(t0 == 0);
   CHECK(l0 == 1);
   CheckClose(Unpack(out_legacy, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);
 
-  // Opt-in "=1": the vendored Triton cubin fires and is bit-close to the oracle
-  // (sequential per-lane reduction), so it matches the CPU reference tightly.
+  // Default (unset): the vendored Triton cubin fires (it is vLLM's exact kernel)
+  // and is bit-close to the oracle (sequential per-lane reduction), so it matches
+  // the CPU reference tightly.
   uint64_t t1 = 0, l1 = 0;
   std::vector<uint8_t> out_aot, state_aot;
-  run("1", t1, l1, out_aot, state_aot);
+  run(nullptr, t1, l1, out_aot, state_aot);
   CHECK(t1 == 1);
   CHECK(l1 == 0);
   CheckClose(Unpack(out_aot, dtype), Unpack(out_cpu, dtype), 2e-2f, 1e-2f);

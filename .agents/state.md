@@ -12588,3 +12588,66 @@ oracle-exact and opt-in). Ledger #L504; spec 2026-07-17 rework addendum.
 `benchmark_binding=false`, no binding speed credit; the default flip awaits an in-situ
 win (c2 target). Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude
 Code:claude-opus-4-8 [ClaudeCode]`.
+- **2026-07-16 (`VT_GDN_PACKED_DECODE_TRITON` DEFAULT FLIP OFF→ON — `CLAIM-GDN-DECODE-TRITON-FLIP`)** —
+  The vendored FLA packed-decode cubin (`gdn_decode_h48`, landed `9dd7d3f`, 27B-only)
+  becomes the 27B GDN pure-decode DEFAULT. MIRROR policy: it IS vLLM's exact
+  token-identical `fused_recurrent_gated_delta_rule_packed_decode_kernel`
+  (`fla/ops/fused_recurrent.py:256-336` @ `702f4814`) and vLLM runs it by default,
+  so we flip too — joining the sibling GDN Triton kernels
+  (`VT_GDN_DELTAH/CHUNKO/WU_TRITON`, all default-ON via `GdnTritonEnvOn`).
+  `VT_GDN_PACKED_DECODE_TRITON=0` is the same-binary rollback to the hand
+  `GdnPackedDecodeKernel`.
+  **Step 1 — 35B coverage check (code-first, NO specialization added).** 35B
+  (Qwen3.6-35B-A3B, MoE) is excluded at the MODEL level: `detail::ShouldUsePackedGdnDecode`
+  requires `e.dense_model` = `cfg.num_experts == 0` (`src/vllm/model_executor/models/qwen3_5.cpp:49`,
+  populated `:2802-2806`), so 35B never selects packed decode (spec-confirmed "35B
+  selects zero packed calls") and never reaches `GdnPackedDecodeKernelCuda`. As
+  defense-in-depth the launcher guard `if (dk!=128||dv!=128||hk_n!=16||hv_n!=48)
+  return false;` (`src/vt/cuda/cuda_gdn.cu` `TryTritonPackedDecode`) also rejects the
+  35B GDN shape (`Hv=32`, per `cmake/TritonAOTKernels.cmake:41` "H=48 (27B) and
+  H=32 (35B)") → clean fallback to the hand kernel. The guard does NOT misfire, so
+  a 35B cubin would be dead code — decision: do not add one speculatively.
+  **Step 2 — flip test-first.** New default-ON pure-header predicate
+  `src/vt/cuda/gdn_packed_decode_triton.h` (`GdnPackedDecodeTritonFlagIsOn`:
+  `nullptr`/non-`0`→ON, `0`-leading→rollback; mirrors `GdnTritonEnvOn` in a
+  CPU-testable form) + CPU flag test `tests/vt/test_gdn_packed_decode_triton.cpp`
+  (RED = header missing/compile-fail → GREEN 10/10). Launcher predicate swapped
+  (per-call read convention kept), the AOT CUDA case in `test_ops_gdn.cpp` flipped
+  (default now fires the cubin `triton_launches==1`, `=0` fires legacy), and every
+  "default OFF" comment in `cuda_gdn.cu` / `cuda_gdn_internal.h` / `CMakeLists.txt`
+  updated. CPU gates: clean full `-Werror` rebuild 0 warnings; full ctest 116/116
+  effective (`test_openai_conformance` -j4 port-contention flake passes 0.29 s in
+  isolation); tools `unittest discover` 164/164; new flag test 10/10.
+  **Step 3 — DGX proof (one flock, verified fast-path build).** Source rsynced to
+  `dgx:~/work/vllm.cpp-gdn-decode-triton-flip`, configured `-DVLLM_CPP_CUDA=ON
+  -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc` with a HARD grep of the
+  configure log for "CUTLASS found … enabling sm120a NVFP4 cutlass GEMM" AND
+  "FlashAttention-2 sm_121a prefill/decode: ENABLED" (both present; abort-if-absent
+  guard). Gate series (one `flock /tmp/gpu`, queued behind the EW-NORM-ACT
+  RMSNorm A/B + W3 discriminator campaigns; RAN 2026-07-16, ALL EIGHT GATES
+  PASS, exit 0 each, `gates.verdict`/`gates.out`): 27B DEFAULT (Triton path)
+  **235/235** + `=0` rollback **235/235**; 35B DEFAULT **315/315** (2 cases) +
+  `=0` rollback **315/315** (flip inert — 35B never selects packed decode); AOT
+  op test **28/28** (default now fires the cubin); full `test_ops_gdn` **49/49
+  (2,343/2,343)**; oracle boundary **12/12** (legacy path preserved);
+  compute-sanitizer memcheck **28/28, ERROR SUMMARY: 0 errors**. NO new A/B
+  (the `9dd7d3f` c16 A/B +5.48 tok/s / TPOT −1.26 ms, 3/3 pairs, stands).
+  Production-default set at this landing (after `696a991`/`a0013a2`/`e68c518`):
+  **async scheduling ON + vendored Triton decode cubin ON + RMSNorm-fast
+  opt-in** — the next binding grid runs this set.
+  **Step 4 — production build finding.** The production/benchmark CUDA build DOES
+  enable the vendored cubin: the documented "GB10 fast-GDN build" (README Quick
+  start) and the benchmark repro recipe (`docs/BENCHMARKS.md`) both pass
+  `-DVLLM_CPP_TRITON=ON`, which is exactly how the sibling GDN Triton kernels ship;
+  the cmake option `VLLM_CPP_TRITON` defaults OFF (a build without it is
+  byte-identical to a non-Triton tree) and is explicitly enabled by the production
+  configure. So the flip is NOT inert in the production build — it rides the sibling
+  kernels' identical shipping path; no cmake default change was made (changing it
+  would pull the vendored cubins into every build incl. CPU/CI unconditionally,
+  breaking that byte-identical invariant, a policy the siblings did not adopt).
+  Non-Triton builds (CPU/CI default) don't compile the path at all and fall back to
+  the hand kernel (inert). `KERNEL-GDN-PACKED-DECODE` stays `DONE` (`e47b4d6`); this
+  is the perf-lever default flip on top of it. `benchmark_binding=false`, binding
+  stays 49/124, no separate flip speed credit. Coordination `CLAIM-GDN-DECODE-TRITON-FLIP`
+  closed at the flip commit.

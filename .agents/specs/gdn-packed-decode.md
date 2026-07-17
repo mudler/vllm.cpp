@@ -248,11 +248,15 @@ kernel joins the vendored AOT set:
   grid `4,NBH,1`); regenerated cubin vendored at
   `src/vt/cuda/triton_aot_vendored/sm_121a/gdn_decode_h48.*` (+ MANIFEST).
 - `TryTritonPackedDecode` in `cuda_gdn.cu`, behind runtime toggle
-  **`VT_GDN_PACKED_DECODE_TRITON` (default OFF — new perf lever)**, guards every
-  dtype/stride/shape/scale and falls back to the hand `GdnPackedDecodeKernel`
-  (the DEFAULT) on any mismatch; `triton_launches` debug sub-counter records
-  which path fired. 35B does NOT select packed decode. CPU ref + hand kernel
-  PRESERVED; OFF and non-Triton builds byte-inert.
+  **`VT_GDN_PACKED_DECODE_TRITON` (default ON since the 2026-07-16 flip — MIRROR
+  policy; `=0` rolls back to the hand `GdnPackedDecodeKernel` in the same
+  binary)**, guards every dtype/stride/shape/scale and falls back to the hand
+  kernel on any mismatch; `triton_launches` debug sub-counter records which path
+  fired. The default-ON predicate is the CPU-testable pure header
+  `src/vt/cuda/gdn_packed_decode_triton.h` (`GdnPackedDecodeTritonFlagIsOn`,
+  mirrors `GdnTritonEnvOn`), CPU-gated by `tests/vt/test_gdn_packed_decode_triton.cpp`.
+  35B does NOT select packed decode. CPU ref + hand kernel PRESERVED; `=0`
+  rollback and non-Triton builds byte-inert.
 
 **Bit-exactness / correctness.** The vendored kernel IS vLLM's exact kernel, so
 it is token-identical to vLLM. Because the tiny oracle boundary fixture (HV=3)
@@ -275,7 +279,38 @@ oracle boundary 12/12 (legacy path bit-exact preserved); **27B model gate
 errors / 0 leaks; default-off gate 235/235. c16 A/B
 (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved 3 pairs + w0 cold
 discard, one flock, root `~/work/vllm.cpp-gdn-recurrence/ab-decode-triton`):
-triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed.
+triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression).
+
+**Phase 3 — DEFAULT FLIP ON (2026-07-16, `CLAIM-GDN-DECODE-TRITON-FLIP`).** The
+vendored kernel is vLLM's exact token-identical FLA kernel, so per MIRROR policy
+(vLLM runs this exact kernel by default) the default flips OFF→ON, joining the
+sibling GDN Triton kernels (`VT_GDN_DELTAH/CHUNKO/WU_TRITON`, all default ON).
+`VT_GDN_PACKED_DECODE_TRITON=0` is the same-binary rollback to the hand kernel.
+Test-first: new default-ON pure-header predicate
+`src/vt/cuda/gdn_packed_decode_triton.h` + CPU flag test
+`tests/vt/test_gdn_packed_decode_triton.cpp` (RED→GREEN 10/10, `nullptr`/non-`0`
+→ ON, `0`-leading → rollback), launcher predicate + AOT-case + all comments
+flipped. **35B decision — NO specialization added:** 35B (Qwen3.6-35B-A3B, MoE)
+is excluded at the MODEL level — `detail::ShouldUsePackedGdnDecode` requires
+`e.dense_model` = `cfg.num_experts == 0` (`qwen3_5.cpp:49`, populated `:2802-2806`),
+so 35B never selects packed decode (spec-confirmed "35B selects zero packed
+calls") and never reaches `GdnPackedDecodeKernelCuda`. As defense-in-depth the
+launcher guard `if (dk != 128 || dv != 128 || hk_n != 16 || hv_n != 48) return
+false;` (`cuda_gdn.cu`) also rejects the 35B GDN shape (`Hv=32`, per
+`cmake/TritonAOTKernels.cmake:41` "H=48 (27B) and H=32 (35B)") → clean fallback.
+The guard does not misfire, so a 35B cubin would be dead code. **Flip gates —
+ALL EIGHT PASS, exit 0 each (GB10 sm_121a, `~/work/vllm.cpp-gdn-decode-triton-flip`
+`gates.verdict`/`gates.out`, one flock, build `-DVLLM_CPP_TRITON=ON` +
+CUTLASS-4.5.0 + nvcc-13.0, configure-log CUTLASS/FA2 lines verified):** 27B
+model gate DEFAULT (now Triton path) **235/235** token-exact + `=0` rollback
+**235/235**; 35B DEFAULT **315/315** (2 cases) + `=0` rollback **315/315** (flip
+inert — 35B never selects packed decode); AOT op test **28/28** (default now
+fires cubin, `=0` fires legacy, both match CPU ref); full `test_ops_gdn`
+**49/49 (2,343/2,343)**; oracle boundary **12/12** (legacy path preserved);
+memcheck **28/28, 0 errors**. No new A/B (9dd7d3f's +5.48 tok/s / TPOT −1.26 ms
+stands). The **next binding grid runs the Triton decode path by default** (in
+the production-default set async-ON + Triton-decode-ON + RMSNorm-fast opt-in);
+no separate binding speed credit is claimed at the flip.
 
 **Reproduce.**
 

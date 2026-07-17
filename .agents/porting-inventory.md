@@ -649,10 +649,12 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     slot-0-valid cache ABI vs FLA's `<= 0`). One specialization gdn_decode_h48
     (27B: H=16, HV=48, K=V=128, BK=128, BV=32; 35B does NOT select packed decode);
     dispatch `TryTritonPackedDecode` in `cuda_gdn.cu` behind runtime toggle
-    `VT_GDN_PACKED_DECODE_TRITON` (**default OFF** — a new perf lever), guarding
-    every dtype/stride/shape and falling back to the hand `GdnPackedDecodeKernel`
-    (the DEFAULT) on any mismatch; CPU ref + hand kernel PRESERVED, OFF build
-    byte-inert.
+    `VT_GDN_PACKED_DECODE_TRITON` (**default ON since the 2026-07-16 flip** —
+    MIRROR policy: it is vLLM's exact token-identical FLA kernel; `=0` rolls back
+    to the hand `GdnPackedDecodeKernel` in the same binary; default-ON predicate
+    `src/vt/cuda/gdn_packed_decode_triton.h` mirrors `GdnTritonEnvOn`), guarding
+    every dtype/stride/shape and falling back to the hand kernel on any mismatch;
+    CPU ref + hand kernel PRESERVED, `=0` rollback + non-Triton build byte-inert.
     WHY (MEASURED, dgx `~/work/vllm.cpp-gdn-recurrence/phase1`, GB10 sm_121a,
     cuobjdump -res-usage on the compiled cubins at the c16 shape): the vLLM FLA
     decode cubin holds the register-resident [BV=32,BK=128] fp32 state tile at

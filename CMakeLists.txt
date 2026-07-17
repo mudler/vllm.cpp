@@ -472,9 +472,10 @@ if(VLLM_CPP_CUDA)
     # ── SANCTIONED Triton AOT: GDN packed pure-decode recurrence ────────────────
     # FLA fused_recurrent.py:256-336 fused_recurrent_gated_delta_rule_packed_decode
     # _kernel -> triton_kernels/fused_recurrent_packed_decode.py. Dispatch
-    # TryTritonPackedDecode (VT_GDN_PACKED_DECODE_TRITON, default OFF) in
-    # cuda_gdn.cu; the hand GdnPackedDecodeKernel stays the DEFAULT and the
-    # portable fallback. MEASURED codegen-bound (dgx phase1 2026-07-16): the
+    # TryTritonPackedDecode (VT_GDN_PACKED_DECODE_TRITON, default ON — vLLM's exact
+    # token-identical FLA kernel, MIRROR policy; =0 rolls back to the hand
+    # GdnPackedDecodeKernel in the same binary, which also stays the portable
+    # fallback for any non-27B shape). MEASURED codegen-bound (dgx phase1 2026-07-16): the
     # register-resident [BV=32,BK=128] fp32 state tile is REG:205/0-spill under
     # Triton but REG:255+STACK:48 (spills) as hand-CUDA. 27B ONLY (H=16, HV=48,
     # K=V=128, BK=128, BV=32); 35B does not select packed decode. num_warps=1,

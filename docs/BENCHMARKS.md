@@ -84,8 +84,8 @@ this run's evidence. Detailed per-seal chronology and evidence SHAs live in the
 append-only [ledger](../.agents/parity-ledger.md) and
 [state log](../.agents/state.md). 35B stays blocked until 27B reaches 124/124.
 
-**Decode recurrence perf lever — MEASURED codegen-bound → vendored Triton cubin
-(2026-07-16).** The named +2.06 ms/step recurrence-tiling gap (correct-state c16
+**Decode recurrence perf lever — MEASURED codegen-bound → vendored Triton cubin,
+now DEFAULT ON (2026-07-16).** The named +2.06 ms/step recurrence-tiling gap (correct-state c16
 traces: ours 21.31 vs vLLM 19.24 ms/step; ~83% vs ~92% of ~273 GB/s) was first
 ATTEMPTED via a register-resident hand port of vLLM FLA's single-warp
 `num_stages=3` packed-decode kernel (`fused_recurrent.py:256-336`) — the DGX
@@ -98,14 +98,36 @@ register-resident `[BV=32,BK=128]` fp32 state tile at **REG:205, STACK:0
 (SPILLS)** — register allocation / codegen, not a config we mis-set (legacy hand
 kernel is REG:56/8-warp/0-spill at ~83% BW). DECISION: the sanctioned vendored
 Triton cubin (`gdn_decode_h48`, 27B-only) behind `VT_GDN_PACKED_DECODE_TRITON`
-(**default OFF**; the hand `GdnPackedDecodeKernel` stays the DEFAULT fallback).
-DGX gates (GB10 sm_121a, root `~/work/vllm.cpp-gdn-recurrence`, one flock/series):
+(**default ON since the 2026-07-16 flip** — MIRROR policy: it is vLLM's exact
+token-identical FLA kernel and vLLM runs it by default; `=0` rolls back to the
+hand `GdnPackedDecodeKernel` in the same binary, which also remains the fallback
+for any non-27B shape).
+DGX landing gates (GB10 sm_121a, root `~/work/vllm.cpp-gdn-recurrence`, one flock/series):
 AOT-vs-legacy-vs-CPU op test 28/28, full `test_ops_gdn` 49/49, oracle boundary
 12/12 (legacy path bit-exact preserved), **27B model gate 235/235 token-exact
 with the Triton decode path ON**, compute-sanitizer 0 errors/0 leaks, default-off
-gate 235/235. **c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved
+gate 235/235. **c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs the-then-default, interleaved
 3 pairs + w0 cold discard, one flock, root `ab-decode-triton`): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded.**
-ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed. CPU gates GREEN (`test_ops_gdn` 45/45, clean -Werror).
+ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression).
+
+**DEFAULT FLIP ON (2026-07-16, `CLAIM-GDN-DECODE-TRITON-FLIP`).** Per MIRROR
+policy the default flipped OFF→ON, joining the sibling GDN Triton kernels
+(`VT_GDN_DELTAH/CHUNKO/WU_TRITON`, all default ON). Test-first: new default-ON
+pure-header predicate `src/vt/cuda/gdn_packed_decode_triton.h` + CPU flag test
+(RED→GREEN 10/10). **35B: no specialization added** — it never selects packed
+decode (MoE, excluded by the dense-only `ShouldUsePackedGdnDecode`) and the
+launcher guard rejects its `Hv=32` shape anyway (clean fallback, so a 35B cubin
+would be dead code). **Flip gates — ALL EIGHT PASS, exit 0 each** (root
+`~/work/vllm.cpp-gdn-decode-triton-flip` `gates.verdict`/`gates.out`,
+build `-DVLLM_CPP_TRITON=ON` + CUTLASS-4.5.0/nvcc-13.0, configure-log CUTLASS/FA2
+lines verified, one flock): 27B DEFAULT (now Triton) **235/235** + `=0` rollback
+**235/235**; 35B DEFAULT **315/315** + `=0` rollback **315/315** (inert); AOT op
+test **28/28** (default fires cubin, `=0` fires legacy); full GDN **49/49
+(2,343/2,343)**; oracle boundary **12/12**; memcheck **28/28, 0 errors**. No new
+A/B (9dd7d3f's stands). **The next binding grid runs the Triton decode path by
+default** (production-default set: async scheduling ON + Triton decode cubin ON +
+RMSNorm-fast opt-in); no separate flip speed credit is claimed. CPU gates GREEN
+(`test_ops_gdn` 45/45, `test_gdn_packed_decode_triton` 10/10, clean -Werror).
 Build repair (2026-07-16): the vendored-cubin landing left the launch-counter
 helper defined unconditionally while its only caller is Triton-gated, breaking
 the default Triton-less CUDA build under `-Werror` (`-Wunused-function`); the

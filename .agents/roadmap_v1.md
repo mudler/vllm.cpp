@@ -51,9 +51,10 @@ naive register-resident hand port FAILED (oracle FAIL, ~12% slower); Phase-1
 `[BV=32,BK=128]` fp32 tile at REG:205/**0-spill**, the hand port hits
 REG:255+**spill** — register allocation, not a config we mis-set), so vLLM's exact
 `fused_recurrent.py:256-336` decode kernel is now vendored as the AOT cubin
-`gdn_decode_h48` (27B-only) behind `VT_GDN_PACKED_DECODE_TRITON` (default OFF; the
-hand `GdnPackedDecodeKernel` stays the default), **235/235 token-exact with the
-Triton path ON** + memcheck-clean; c16 A/B **+5.48 tok/s (+0.67%), -1.26 ms TPOT, 3/3 pairs**; **(2)** the Inductor add+RMSNorm+FP4-quant /
+`gdn_decode_h48` (27B-only) behind `VT_GDN_PACKED_DECODE_TRITON` (**default ON
+since the 2026-07-16 flip** — MIRROR policy, vLLM's exact kernel; `=0` rolls back
+to the hand `GdnPackedDecodeKernel` in the same binary), **235/235 token-exact
+default + rollback** + memcheck-clean; c16 A/B **+5.48 tok/s (+0.67%), -1.26 ms TPOT, 3/3 pairs**; the next binding grid runs the Triton decode path by default; **(2)** the Inductor add+RMSNorm+FP4-quant /
 SiLU+FP4-quant decode fusion ⇒ ~+2 ms/step; **(3)** `ENG-ASYNC-SCHED` W3 for the
 ~3.25 ms host/idle bubble — but the `f086b64` DGX proof (2026-07-16) shows the
 LANDED depth-2 overlap is **throughput-neutral** at c16 (meanTPOT −5.4 ms/step WIN

@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "vt/cuda/cuda_gdn_internal.h"
+#include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
 #include "vt/cuda/tile/cp_async.cuh"
 #include "vt/cuda/tile/tma_pipeline.cuh"
@@ -1383,9 +1384,10 @@ void DispatchGdnPackedDecodeRegTile(cudaStream_t stream, Tensor& out,
 
 #ifdef VLLM_CPP_TRITON
 // Vendored Triton AOT packed-decode fast-path (MEASURED codegen-bound; 27B-only,
-// default OFF behind VT_GDN_PACKED_DECODE_TRITON). Defined after the AOT module
-// loaders below; forward-declared here so GdnPackedDecodeKernelCuda (early in the
-// file) can attempt it before the hand kernels. Returns true iff it launched.
+// default ON behind VT_GDN_PACKED_DECODE_TRITON, =0 rolls back). Defined after the
+// AOT module loaders below; forward-declared here so GdnPackedDecodeKernelCuda
+// (early in the file) can attempt it before the hand kernels. Returns true iff it
+// launched.
 bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
                            const Tensor& mixed_qkv, const Tensor& a,
                            const Tensor& b, const Tensor& a_log,
@@ -1422,7 +1424,8 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
 
 #ifdef VLLM_CPP_TRITON
   // Vendored Triton AOT packed-decode cubin (VT_GDN_PACKED_DECODE_TRITON, default
-  // OFF; 27B-only). MEASURED codegen-bound: the identical register-resident
+  // ON; =0 rolls back; 27B-only). It is vLLM's exact token-identical FLA kernel
+  // (MIRROR policy). MEASURED codegen-bound: the identical register-resident
   // [BV=32,BK=128] fp32 state tile is REG:205/0-spill under Triton but
   // REG:255+STACK:48 (spills) as hand-CUDA (dgx phase1 2026-07-16). Guards every
   // dtype/stride/shape and falls back to the hand kernels below on any mismatch.
@@ -3577,23 +3580,29 @@ void EnsureAllGdnAotModulesLoaded() {
 // SANCTIONED Triton AOT fast-path dispatch for the GDN packed pure-decode
 // recurrence (fused_recurrent_gated_delta_rule packed decode). Returns true iff
 // it launched the vendored cubin (caller then skips the hand kernels). Runtime
-// toggle VT_GDN_PACKED_DECODE_TRITON: DEFAULT OFF (a new perf lever; the hand
-// GdnPackedDecodeKernel stays the default) — opt in with '1'. Fires ONLY for the
-// exact 27B gate-model packed-decode call site the single AOT specialization was
-// baked to (bf16 mixed_qkv/a/b/out, f32 A_log/dt_bias/state, dk=dv=128, hk=16,
-// hv=48, scale=Dk^-0.5, and the pinned strides mixed_qkv=10240, a/b=2*hv=96,
+// toggle VT_GDN_PACKED_DECODE_TRITON: DEFAULT ON — the vendored kernel IS vLLM's
+// exact token-identical FLA kernel (MIRROR policy; the sibling GDN Triton kernels
+// VT_GDN_DELTAH/CHUNKO/WU_TRITON are default-ON the same way). '0' rolls back to
+// the hand GdnPackedDecodeKernel in the SAME binary. Fires ONLY for the exact 27B
+// gate-model packed-decode call site the single AOT specialization was baked to
+// (bf16 mixed_qkv/a/b/out, f32 A_log/dt_bias/state, dk=dv=128, hk=16, hv=48,
+// scale=Dk^-0.5, and the pinned strides mixed_qkv=10240, a/b=2*hv=96,
 // state=hv*dv*dk, indices=1); ANY dtype/shape/stride mismatch returns false so
 // the preserved hand-C++ GdnPackedDecodeKernel (and the CPU reference) still
-// handle it — the portable contract is intact. The state-index ABI adapter lives
-// in the shim (skip `state_idx < 0`, slot 0 valid) matching our cache ABI.
+// handle it — the portable contract is intact. 35B (Hv=32, MoE) never selects
+// packed decode at all (ShouldUsePackedGdnDecode requires a dense model,
+// qwen3_5.cpp), and would fall back here on the hv_n!=48 guard even if it did.
+// The state-index ABI adapter lives in the shim (skip `state_idx < 0`, slot 0
+// valid) matching our cache ABI.
 bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
                            const Tensor& mixed_qkv, const Tensor& a,
                            const Tensor& b, const Tensor& a_log,
                            const Tensor& dt_bias, Tensor& state,
                            const Tensor& state_idx, const GdnArgs& args) {
-  // Default OFF: fire only when VT_GDN_PACKED_DECODE_TRITON leads with '1'.
-  const char* flag = std::getenv("VT_GDN_PACKED_DECODE_TRITON");
-  if (flag == nullptr || flag[0] != '1') return false;
+  // Default ON: fire unless VT_GDN_PACKED_DECODE_TRITON leads with '0' (rollback).
+  if (!GdnPackedDecodeTritonFlagIsOn(
+          std::getenv("VT_GDN_PACKED_DECODE_TRITON")))
+    return false;
 
   const int64_t batch = mixed_qkv.shape[0];
   const int64_t hv_n = state.shape[1];

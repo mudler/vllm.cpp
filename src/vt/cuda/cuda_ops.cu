@@ -244,9 +244,9 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
-  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default ON; '0' = rollback to
-  // RmsNormRowKernel): only engages for the bf16 add+RMSNorm decode launches;
-  // every other case keeps RmsNormRowKernel.
+  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default OFF; '1' = opt-in): only
+  // engages for the bf16 add+RMSNorm decode launches; every other case keeps
+  // RmsNormRowKernel.
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
     if (TryLaunchRmsNormDecodeFast(s, out, x, w, args, residual, rows, h)) {
       Check(cudaGetLastError(), "rmsnorm fast launch");

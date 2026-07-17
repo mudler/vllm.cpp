@@ -308,8 +308,14 @@ removes that confound and CONFIRMS the lever: ours `RmsNormRowKernel`
 the ~2.4 ms c2 decode gap). The confound was only in-situ (ours in-situ nsys 15.5
 µs is ~1.84× contention-inflated over the 8.46 µs isolated); the isolated gap is
 real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
-**default ON since 2026-07-17 / `=0` rollback**; the numerics rework FIXED its
-token-exactness and the c2 preflight A/B confirmed the in-situ win), a TRUE 1:1 port of vLLM's
+**OPT-IN `=1`** — flipped ON after the c2 preflight win, then REVERTED same-day
+2026-07-17 by the binding campaign's engine sanity gate: with the FULL default
+set (async + GDN cubin + RMSNorm-fast) the 27B production stream fails 233/235
+at the documented token-7 near-tie, the combined output exactly matching the
+fixture's `want_emu` pip-vLLM EAGER stream — two individually-token-exact
+kernels land together on the other side of a near-tie vLLM itself decides
+differently between graphed and eager modes; the re-flip awaits the
+combination follow-up, Triton-faithful RMSNorm + cubin), a TRUE 1:1 port of vLLM's
 csrc `fused_add_rms_norm_kernel<bf16,8>` (1024-thread block, 16-byte vectorized
 loads) using the **ACTUAL `cub::BlockReduce<float,1024>`**. History: the
 2026-07-16 kernel APPROXIMATED cub with a hand two-stage warp-shuffle; it was flipped

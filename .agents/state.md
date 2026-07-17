@@ -12681,3 +12681,33 @@ Code:claude-opus-4-8 [ClaudeCode]`.
   the authorized exact grid (Phase 1) runs from this flip SHA with fresh vLLM
   denominators (`--mamba-ssm-cache-dtype float32`, oracle `702f481`).
   Ledger #L506. `benchmark_binding=false` for the preflight itself.
+
+## 2026-07-17 — RMSNorm-fast default flip REVERTED (combination numerics): fast+cubin together match vLLM's EAGER stream, not the production stream (orchestrator, `CLAIM-SERVE-GATE-2` Phase-0 correction)
+
+- The 41134bd grid campaign's 27B engine sanity gate FAILED 233/235: with the
+  FULL default set (async + Triton GDN cubin + RMSNorm-fast) the 16-token
+  production stream diverges at the documented token-7 near-tie (271 vs 198)
+  — and the produced stream EQUALS the fixture's `want_emu` golden 16/16 (the
+  pip-vLLM EAGER-mode stream; the test pins `got == want_prod && got !=
+  want_emu`). So the combination is not corrupt — it lands on the other side
+  of a near-tie where vLLM itself emits different tokens between graphed
+  production and eager modes — but the house bar pins the PRODUCTION stream.
+- COMBINATION GAP IN THE PROOFS: each kernel was proven 235/235 only with the
+  other OFF (e68c518 fast-ON/cubin-off; a321d7c cubin-ON/fast-off). The pair
+  was never gate-tested together before the campaign sanity gate caught it.
+  Lesson: a default flip's gate battery must run the FULL prospective default
+  set, not the lever in isolation.
+- REVERT: `VT_RMSNORM_DECODE_FAST` back to opt-in ('1' enables); flag tests
+  and comments restored to the e68c518 state. The kernel remains token-exact
+  ALONE and c2-proven (+1.45% tput preflight) — the flip returns when the
+  combination matches production numerics. Named follow-up: the e68c518
+  campaign's Triton-faithful RMSNorm variant (bit-exact vs the Inductor
+  kernel) was never paired with the cubin — prod = Inductor-rmsnorm +
+  Triton-GDN, so Triton-faithful-rmsnorm + cubin is the numerics-consistent
+  candidate for 235/235-with-both.
+- The binding grid proceeds from the reverted SHA: defaults = async ON +
+  Triton GDN cubin ON + RMSNorm-fast opt-in. c2/c4 TPOT axes carry the known
+  ~0.7%/step RMSNorm residual until the follow-up lands; if the sealed grid
+  fails those axes by that margin, the record names the combination follow-up
+  as the explicit next lever (per the parity-enablers-are-defaults policy, no
+  flag-dressed binding).

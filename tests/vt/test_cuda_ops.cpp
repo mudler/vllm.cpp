@@ -254,7 +254,7 @@ TEST_CASE("CUDA rmsnorm fused residual matches CPU and updates residual") {
   }
 }
 
-// VT_RMSNORM_DECODE_FAST (default ON; '0' rollback): the vectorized decode kernel
+// VT_RMSNORM_DECODE_FAST (default OFF; '1' opt-in): the vectorized decode kernel
 // (RmsNormRowFastKernel) is a TRUE 1:1 port of vLLM's csrc
 // fused_add_rms_norm_kernel<bf16,8> using the ACTUAL cub::BlockReduce<float,1024>
 // (the reduction the pip-vLLM enforce_eager oracle runs). It must match the

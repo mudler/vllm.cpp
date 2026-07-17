@@ -5,132 +5,57 @@ M0–M3 record is archived at
 
 **Context:** both gate models run end-to-end and retain token-exact greedy
 correctness. Exact performance closure is open against vLLM v0.25.0; the
-**new binding 27B result `246a23c`** (fresh interleaved exact-grid rerun) binds at
-**49/124 axes pass, 75 fail**, superseding the immutable `3f256ab` grid
-(**55/124**, retained). Restore every throughput, latency, and memory axis on 27B
-and then 35B before resuming the operational and T1/T2 portfolio. Detailed status
-lives in the area matrices, active ownership in `coordination.md`, and
-chronological evidence in the append-only state/ledger record.
+**new binding 27B result `a875397`** (fresh interleaved exact-grid rerun on the
+production default set — async scheduling ON + vendored Triton GDN decode cubin
+ON + RMSNorm-fast opt-in) binds at **52/124 axes pass** (gate NO), superseding
+`246a23c` (49/124) and the immutable `3f256ab` grid (55/124), both retained.
+Restore every throughput, latency, and memory axis on 27B and then 35B before
+resuming the operational and T1/T2 portfolio. Detailed status lives in the area
+matrices, active ownership in `coordination.md`, and chronological evidence in
+the append-only state/ledger record.
 
-**Current order-0 substage (2026-07-15):** the **new binding `246a23c`** (fresh
-interleaved exact-grid rerun — the authorized rerun this substage sequenced) binds
-at **49/124**, superseding `3f256ab`'s 55/124 (retained immutable). It is a
-STRUCTURAL RECOMPOSITION: memory (**4/4**), c1 (**20/20**) and every TTFT axis
-sweep clean for the first time; the entire failure mass is the decode-coupled
-family at c2–c32 (TPOT/ITL/E2EL means 2.2–6.5% slower, throughput inversely
-coupled) plus two ITL tail anomalies (c8 p99_itl 0.5599, c32 p90_itl 0.7925). The
-binding binary carries the slot-fix (`c172336`), windowed-load (`cb2d310`, memory
-now PASS), qkvz (`45f9e6d`, DGX-green), and packed-decode default. Evidence root
-`~/work/vllm.cpp-online-gate/evidence/246a23c…`; ratios.json `f784ba01…e046`,
-all-runs.json `b7ef3442…3240`, manifest.json `7f25c614…83e8`.
+**Current order-0 substage (2026-07-17):** the **new binding `a875397`** binds at
+**52/124** (gate NO), superseding `246a23c` (49/124) and `3f256ab` (55/124), both
+retained immutable. Evidence `~/work/vllm.cpp-online-gate/evidence/a87539790f…`;
+ratios.json `4cb89b08…1069`, all-runs.json `f2bdda8f…a17`, manifest.json
+`47f7c787…133`. ZERO void axes, 12/12 binding-eligible; our arm ran pure defaults
+(async log-confirmed 3/3), vLLM its production async default.
 
-**HONEST regression + two active fronts.** Ours lost **−2.67% / −3.64%** total
-throughput at c16/c32 vs `3f256ab` (790.63/1081.10 vs 812.30/1121.95) while vLLM
-held; the old c16/c32 wins (1.0279/1.0394) are GONE. **HYPOTHESIS (labeled,
-unproven):** `3f256ab` silently carried the GDN slot-sharing defect (two long
-requests could share one recurrent-state slot at high concurrency), removed by the
-`c172336` correctness fix, which may have traded that inflated throughput away
-alongside every other change between the SHAs. **Grounded 2026-07-16
-(`CLAIM-GDN-BA-ROUNDING-1`, `.agents/state.md`):** a `9ad8fb7`→`c172336` source+arithmetic
-bisect confirms this is the **slot-fix state-bandwidth trade, NOT host machinery** —
-the per-step validators/remap are µs-scale (n≤32), while de-collapsing shared GDN
-slots restores ~3.4 GB/step of correctness-required recurrent-state DRAM traffic
-(3 MB/slot/layer × ~16 distinct rows × ~36 layers ÷ ~273 GB/s ≈ 8–12 ms ≈ the
-regression). So `9ad8fb7`'s 825 was a silent-corruption artifact and **~790 is the
-correct floor (already 0.995× vLLM at c16); recovery to 825 is impossible without
-the bug.** **Front 1 — the c2–c32 decode gap (MEASURED 2026-07-16, root
-`dgx:~/work/vllm.cpp-gdn-stateio-trace/20260716`):** correct-state c16 kernel
-traces resolve the ~8 ms/step gap into **~4.65 ms GPU-busy + ~3.25 ms host/idle**;
-the busy part is **~2.06 ms GDN packed-recurrence tiling** (`GdnPackedDecodeKernel`
-21.31 vs vLLM fla `fused_recurrent` 19.24 ms/step; state r/w FUSED in-kernel on
-both sides, ~83% vs ~92% of peak BW) **+ ~2 ms unfused norm/quant glue**, with
-GEMM/MoE/attention at parity (state-I/O ≈ only 26% of the gap, NOT the dominant
-cause the premise assumed). Order-0 next: **(1) RESOLVED (2026-07-16, DGX-gated)** — the
-naive register-resident hand port FAILED (oracle FAIL, ~12% slower); Phase-1
-`cuobjdump` MEASURED the codegen cause (vLLM's FLA decode cubin holds the
-`[BV=32,BK=128]` fp32 tile at REG:205/**0-spill**, the hand port hits
-REG:255+**spill** — register allocation, not a config we mis-set), so vLLM's exact
-`fused_recurrent.py:256-336` decode kernel is now vendored as the AOT cubin
-`gdn_decode_h48` (27B-only) behind `VT_GDN_PACKED_DECODE_TRITON` (**default ON
-since the 2026-07-16 flip** — MIRROR policy, vLLM's exact kernel; `=0` rolls back
-to the hand `GdnPackedDecodeKernel` in the same binary), **235/235 token-exact
-default + rollback** + memcheck-clean; c16 A/B **+5.48 tok/s (+0.67%), -1.26 ms TPOT, 3/3 pairs**; the next binding grid runs the Triton decode path by default; **(2)** the Inductor add+RMSNorm+FP4-quant /
-SiLU+FP4-quant decode fusion ⇒ ~+2 ms/step; **(3)** `ENG-ASYNC-SCHED` W3 for the
-~3.25 ms host/idle bubble — but the `f086b64` DGX proof (2026-07-16) shows the
-LANDED depth-2 overlap is **throughput-neutral** at c16 (meanTPOT −5.4 ms/step WIN
-but meanTTFT +36 %/+730 ms, the closed-loop Little's-law reflex of a decode win at
-constant throughput; admission verified 1:1 with vLLM via `test_async_admission_timing.cpp`,
-NOT a bug). W3 stays **default-OFF**; it only pays off once the host/idle recovery
-lands as fewer wall-ms/completed-token (a throughput lever), not just tighter ITL.
-**Front 2 — the tail mechanism:** reconstruct the c8 p99 / c32 p90 ITL
-stall cadence from this root's per-request `itls[]`. The
-[packed GDN decode](specs/gdn-packed-decode.md) leaf is **CLOSED on EQUIVALENCE**
-(`KERNEL-GDN-PACKED-DECODE` → `DONE`, owner `e47b4d6`).
+**+3 axes AND a structural win — the async lever flipped the ITL tails.** Per
+concurrency: mem **4/4**, c1 **20/20**, c2 3, c4 4, c8 5, c16 6, c32 **10**. The two
+ITL tail anomalies that dominated the `246a23c` failure mass are RESOLVED: c16
+p99_itl 1.024, c32 p90_itl 1.020 + p99_itl 1.026, c4 p99_itl 1.89 now PASS (old
+catastrophic c8 p99_itl 0.56 / c32 p90_itl 0.79 gone at c16/c32; c8 p99_itl
+0.56→0.844). The **entire remaining failure mass is a nearly-UNIFORM ~1–2% decode
+deficit** (throughput/TPOT/ITL/E2EL means + medians, c2–c32): of 72 failing axes,
+**55 are within 2% of vLLM** (21 within 1%), 14 within 2–5%, only **3 worse than
+5%** (c8 p99_itl 0.844; c4 mean/median TTFT, low-conc arrival lottery). Gate is
+strict ≥1.0 (0.9999 fails) — "52" is a whisker-thin deficit, not a gap: c16 tput
+790.95 vs 796.99 (0.9924), c32 tput 1081.5 vs 1083.7 (0.9979).
 
-*Binding result / slot fix.* Correctness closed at `f344dec` (both arms
-**235/235 + 16/16**); structure at `7ff713e`/`24cea4f` (packed **915** vs
-rollback **963** nodes — 48 packed calls replacing 48 decomposed + 48 post-conv,
-all unrelated topology invariant). The `d82d282` c16 HTTP-500 defect
-(`duplicate live GDN state index`, `qwen3_5.cpp:73`), captured 3/3 at `4a450f9`,
-was fixed test-first at `c172336`: `remap_gdn_state_slots` now keys the compact
-GDN state-slot pool on the request identity, not the mamba block-id that
-collapsed two long concurrent c16 sequences onto one recurrent-state slot (this
-also removed latent silent cross-request GDN state corruption in pre-validator
-binaries; blast radius in `docs/BENCHMARKS.md`). The fix is proven on DGX at
-`c172336` (model gates **235/235 + 16/16**, `--diagnostic-c16` 3/3).
+**Landed levers (all now production defaults):** the **W3 async scheduling** default
+flip (`a0013a2`, `ENG-ASYNC-SCHED` DONE — mirrors vLLM's own default; the discriminator
+`c63a1ec` proved the +26–31% TTFT premium is vLLM's OWN async trade and both arms pay
+it, and the flip is token-neutral) and the **vendored Triton GDN decode cubin**
+(`a321d7c`, `VT_GDN_PACKED_DECODE_TRITON` default ON, 8/8 gates, +0.67% tput / −1.26 ms
+TPOT). Memory PASSES via the windowed-load release (`cb2d310`); the packed GDN decode
+leaf is CLOSED on equivalence (`KERNEL-GDN-PACKED-DECODE` DONE, `e47b4d6`); qkvz merged
+projection is in the binary (`45f9e6d`).
 
-*Equivalence closure.* W1D3's G3 closed on the totality of sealed evidence:
-**eight sealed components** (progressively harness-calibrated test-first — tail
-15%, pooled + mode-conditional c2 TTFT, acceptance noise bands,
-majority-consistency pairing; the c2 TTFT-family is a bimodal prefill
-co-schedule ARRIVAL LOTTERY, a faithful vLLM mirror, scheduler UNCHANGED) + the
-8-pair locked c16 A/B (**−0.205% ± 0.30, <1σ**; cuBLASLt algo selection
-process-deterministic, the algo-lottery REFUTED) + the 24-window trace
-attribution (**packed is GPU-cheaper**: kernel compute −1.30..−1.58%/step,
-GDN+BA −296 µs/window, −48 nodes, no attributable packed-side cost). The eighth
-(first 22-leg: cold-discard pair + 5 reps) seal `complete-failed` at `e47b4d6` —
-**38/40 axes, 8/8 memory, stability clean, `validation_error=None`,
-paired-consistency PASS at both concurrencies**; c16 at equivalence (packed med
-801.97 vs rollback 802.95, −0.12%, in-band, passes); the 2 fails
-(c2 `median_tpot_ms` 0.9899, c2 pooled `p99_ttft_ms` 0.8464) are sign-flipping
-band-edge statistics of a true-zero effect. **Disposition: EQUIVALENCE PROVEN —
-no stable regression on any axis.** Packed stays the default
-(`VT_GDN_PACKED_DECODE=0` rollback); **no `complete-pass` marker exists and no
-speed credit is claimed**. Detailed per-seal chronology and evidence SHAs live in
-the append-only state/ledger.
+**Active front — close the uniform ~1% decode deficit to reach 124/124.** Measured
+attribution (correct-state c16 kernel traces, specs `c2-c8-attribution-2026-07-16.md`
+/ `rmsnorm-decode-fast-2026-07-16.md`): with async + cubin now landed, the residual is
+dominated by the **RMSNorm norm/quant glue** (129 launches/step, isolated 3.2× per-launch
+lever, ~0.5–0.7 ms/step). The RMSNorm-fast kernel is token-exact ALONE and won its c2 A/B
+(+1.446% tput / −0.887% TPOT) but was reverted from the default (`a875397`) because
+RMSNorm-fast + cubin TOGETHER cross a RAZOR near-tie at tok6 (198 production "\n" vs 271
+emulation "\n\n") — a bit-safety fix (make the fast kernel bit-identical to the shipped
+reference) is IN FLIGHT, plus a residual lever scan, then a re-grid tests the full lever
+set. 35B stays blocked until 27B reaches 124/124.
 
-*Completed since the last substage.* qkvz (merged qkv+z projection packing,
-`KERNEL-GEMM-BF16` W2A) closed its DGX gates GREEN at `45f9e6d` (default suites
-8/8, both rollback arms, 35B inert, memcheck 0/0, structural −48 BF16 GEMMs/window
-confirmed; `VT_GDN_MERGED_QKVZ=0` rollback). With packed-default, qkvz, and the
-windowed-load release all in the binary, the **AUTHORIZED exact-grid rerun has now
-RUN** with fresh vLLM denominators and the explicit `--mamba-ssm-cache-dtype
-float32` audit pin on the vLLM arm (cite run SHA `702f481`) — this is the new
-binding `246a23c` above. 35B stays blocked until 27B reaches 124/124. Host PSS/RSS
-memory now PASSES in the binding; a **22.920 GiB** steady CPU weight mirror remains
-(the deeper direct-to-device streaming fix, wanted for 35B).
-
-**Order-0 re-ranking (2026-07-14
-[parity rescan](specs/parity-rescan-2026-07-14.md), diagnostic only):** the
-failing mass is **host-side, not kernel compute** — TTFT passes 24/24, our GPU
-kernels are collectively net faster than vLLM's on the only per-kernel window
-(−3.579 ms), and the 69 failing axes decompose into c2–c8 decode latency
-(52.2% + 24.3% coupled) plus host memory (23.6%). Consequences: (a) the
-packed-decode component chain is now CLOSED on equivalence
-(`KERNEL-GDN-PACKED-DECODE` `DONE`), so the c2–c8 decode-gap work proceeds
-directly; (b) two kernel-independent host
-workstreams start in parallel — **TCP_NODELAY on the SSE server** (DONE under
-`SERVE-HTTP-TRANSPORT`: implemented, behaviorally tested, and sized — the
-non-binding localhost A/B is NEUTRAL within noise at c1/c2, because µs loopback
-ACKs mean Nagle never held our ~100 ms-cadence token frames; the mirror stays
-for real-network parity but earns no gate-axis expectation, so the c2–c8
-decode-gap attribution concentrates on the nsys full-step diff and
-`ENG-ASYNC-SCHED` W3) and the **memory track** (windowed-load fix `cb2d310` **MEASURED** 2026-07-15: 27B load-to-ready VmHWM 48.29 GB off vs **24.75 GB on (−23.54 GB)**, load transient eliminated (peak = steady RSS), ON-arm smoke 6/6; evidence `~/work/vllm.cpp-windowed-load/cb2d310c…518/evidence`; claim `CLAIM-LOAD-WINDOWED-1` released, row back to `PARTIAL`. The binding memory axes now PASS at the `246a23c` exact-grid rerun (ours peak PSS 24.88 GB vs vLLM 28.18 GB), as projected. The full streaming redesign remains the deeper follow-up, wanted for 35B); (c) the
-nsys full-step c2/c8 gap diff attributes transport vs `ENG-ASYNC-SCHED` W3 vs the slot-fix state-bandwidth trade before
-W3 is implemented; (d) FP4-producer/PDL/fused-norm-quant micro-levers are
-deprioritized — the recorded "fused RMSNorm→NVFP4" gap is **disproven** (vLLM's
-fusion pass is FP8-only) and the H1d fused-producer ranking is off-axis. qkvz
-stays real-but-small (~0.476 ms/window) behind the component gate.
+*Slot-fix / equivalence / qkvz closure detail preserved in the append-only state/ledger
+record and the packed-decode / c2-c8 / rmsnorm specs; not re-copied here per the
+compaction directive.*
 
 ## Top-level portfolio
 
@@ -142,13 +67,13 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited. **NEW BINDING `246a23c`: 49/124** (fresh interleaved exact-grid rerun; supersedes `3f256ab`'s 55/124). Memory (4/4), c1 (20/20) and every TTFT axis now pass; failure mass is the decode-coupled family at c2–c32 (2.2–6.5% slower) + two ITL tail anomalies. Honest regression: ours c16/c32 total throughput −2.67%/−3.64% vs `3f256ab` while vLLM held. The packed GDN decode leaf is **CLOSED on EQUIVALENCE** (`KERNEL-GDN-PACKED-DECODE` `DONE`, `e47b4d6`); qkvz W2A DGX-green (`45f9e6d`); windowed-load binding (memory PASS). SGLang remains open | `GATING` | close the c2–c32 decode gap: the in-flight era A/B (`3f256ab` vs `246a23c` binary) + nsys c2/c8 full-step attribution → `ENG-ASYNC-SCHED` W3 if confirmed → the c8 p99 / c32 p90 ITL tail mechanism; 35B only after 27B reaches 124/124 |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited. **NEW BINDING `a875397`: 52/124** (gate NO; production default set = async ON + Triton GDN cubin ON + RMSNorm-fast opt-in; supersedes `246a23c`'s 49/124 and `3f256ab`'s 55/124). Mem (4/4), c1 (20/20) pass; the **async default flipped the c16/c32 ITL tails to PASS** (c16 p99_itl 1.024, c32 p90_itl 1.020 + p99_itl 1.026). Remaining = a nearly-uniform ~1–2% decode deficit c2–c32 (55/72 fails within 2% of vLLM, only 3 >5%). Landed: async default (`a0013a2`, `ENG-ASYNC-SCHED` DONE), vendored Triton GDN cubin (`a321d7c`), packed-decode equivalence (`e47b4d6`), qkvz (`45f9e6d`), windowed-load memory PASS. SGLang remains open | `GATING` | close the uniform ~1% decode deficit to 124/124: RMSNorm-fast bit-safety fix (IN FLIGHT — combination near-tie) + residual lever scan → re-grid the full lever set; 35B only after 27B reaches 124/124 |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |
 | 4 | `ROAD-V1-C4` | Quantization: llama.cpp breadth/speed, NVFP4/FP8/MX, MLX native | [quantization matrix](quantization-matrix.md) | coverage spike merged; `QUANT-GGUF-CPU-THREADPOOL` W1-W3 implemented and correctness-gated, now `GATING` on its idle-host ≥10x/RSS checkpoint; [compute-in-quant GEMM](specs/gguf-compute-in-quant-gemm.md) and [keep-quant loader](specs/gguf-keep-quant-loader.md) remain `READY`; other leaf specs open | `PARTIAL` | reproduce the threadpool 1-vs-20-thread B4 gate on an exclusive idle CPU host, then claim `QUANT-GGUF-KEEPQ-LOADER` + `QUANT-GGUF-CIQ-GEMM` |
 | 5 | `ROAD-V1-C5` | Sliding window, local attention, YaRN/long context | [engine matrix](engine-matrix.md), [coverage view §§2,11](feature-matrix.md#2-kv-cache--memory), [joint spike](specs/sliding-local-yarn-long-context.md) | accepted complete KV/manager/backend/dependency and RoPE formula/cache/apply chains; all W1-W8 implementation leaves are now `GATING`; W5-W8 carry fifteen pinned-source YaRN/MRoPE/Llama 3/Phi-3 LongRoPE/dynamic-NTK fixtures plus CPU/sanitizer checkpoints | `PARTIAL` | after the serving lock releases, compile/run the shared scaled-RoPE CUDA path and gate restored feature-positive model consumers plus both unchanged Qwen3.6 regressions; retain every open G6-G9 handoff honestly |
-| 6 | `ROAD-V1-C6` | Priority and async/overlap scheduling + AsyncLLM streaming serving — RE-PRIORITIZED 2026-07-10: `SERVE-ASYNC-LLM` re-promoted T1→T0 because it blocks order 0 and async scheduling is vLLM's default at the pin (B3) | [engine matrix](engine-matrix.md), [coverage view §1](feature-matrix.md#1-engine-core--scheduling), [async-serving spike](specs/async-serving.md) | W1 `ENG-CORE-BUSY-LOOP`, W2 `SERVE-ASYNC-LLM`, W4 `ENG-PRIORITY-SCHED` implemented/`GATING`; **W3 `ENG-ASYNC-SCHED` host-side machinery + runner device-input half + sampler-OUTPUT half all LANDED + CPU-gated 2026-07-16 (`ACTIVE`, `CLAIM-ASYNC-SCHED-W3`):** `AsyncScheduler` placeholders + depth-2 `step_with_batch_queue` + `async_scheduling` config resolution + `VT_ASYNC_SCHED` rollback; the runner `combine_sampled_and_draft_tokens` device-input path; PLUS the sampler-OUTPUT half — `vt::Backend` event/pinned primitives, `AsyncGPUModelRunnerOutput` non-blocking sampled-ID D2H on a copy queue + event (`get_output()` waits only that event, MAIN queue never blocked), `Sampler::forward(sampled_ids_out)` device-resident greedy, `sample_tokens_async`/`runner_supports_async`, and the `Executor`+`step_with_batch_queue` async-output seam. All `VT_ASYNC_RUNNER` default OFF, sync path byte-identical, RED→GREEN; CPU ctest 111/111, tools 164/164. **The ENABLE-FLIP now LANDED + CPU-gated (2026-07-16, same claim):** `LoadedEngine` reorders `runner_` before the scheduler and builds `AsyncScheduler`+mcb=2 (threaded to `AsyncLLM`→`EngineCoreProc`→`step_with_batch_queue`) when `ResolveAsyncScheduling(runner_.runner_supports_async())` ON, else the byte-identical `Scheduler`+depth-1 (vLLM enable/disable log mirrored); the device combine/scatter kernel (`cuda_combine_tokens.cu`, 1:1 with `_combine_sampled_and_draft_tokens_kernel`) runs main-stream-ordered on the CUDA async path, deleting the pre-scatter `Synchronize`; construction-matrix CPU-tested RED→GREEN. Together they target the ~3.25 ms/step idle. **FULL W3 DGX proof RAN at `f086b64` (2026-07-16):** 5/5 correctness gates PASS; c16 A/B W3-on meanTPOT **−5.4 ms/step (WIN)** but meanTTFT **+36 %/+730 ms**, throughput **neutral (−0.3 %)**. The "depth-2 delays admission" hypothesis is **REFUTED** (`test_async_admission_timing.cpp`: admission 1:1 with sync/vLLM; `UniProcExecutor` is synchronous too); the +730 ms is the closed-loop Little's-law reflex of a decode win at constant throughput (`127×5.4≈686`). **W3 stays default-OFF; the real lever is a depth-2 THROUGHPUT gain (GPU/nsys), not CPU admission** | `PARTIAL` | make the depth-2 overlap improve **throughput** (turn the ~3.25 ms host/idle into fewer wall-ms/completed-token) so W3 can beat sync on TTFT too; then re-run the 5-gate + c16 A/B (ACCEPT = TPOT win retained AND TTFT within ~2 % of sync). Execute order-0 low-batch kernel mapping alongside |
+| 6 | `ROAD-V1-C6` | Priority and async/overlap scheduling + AsyncLLM streaming serving — RE-PRIORITIZED 2026-07-10: `SERVE-ASYNC-LLM` re-promoted T1→T0 because it blocks order 0 and async scheduling is vLLM's default at the pin (B3) | [engine matrix](engine-matrix.md), [coverage view §1](feature-matrix.md#1-engine-core--scheduling), [async-serving spike](specs/async-serving.md) | W1 `ENG-CORE-BUSY-LOOP`, W2 `SERVE-ASYNC-LLM`, W4 `ENG-PRIORITY-SCHED` implemented/`GATING`; **W3 `ENG-ASYNC-SCHED` host-side machinery + runner device-input half + sampler-OUTPUT half all LANDED + CPU-gated 2026-07-16 (`ACTIVE`, `CLAIM-ASYNC-SCHED-W3`):** `AsyncScheduler` placeholders + depth-2 `step_with_batch_queue` + `async_scheduling` config resolution + `VT_ASYNC_SCHED` rollback; the runner `combine_sampled_and_draft_tokens` device-input path; PLUS the sampler-OUTPUT half — `vt::Backend` event/pinned primitives, `AsyncGPUModelRunnerOutput` non-blocking sampled-ID D2H on a copy queue + event (`get_output()` waits only that event, MAIN queue never blocked), `Sampler::forward(sampled_ids_out)` device-resident greedy, `sample_tokens_async`/`runner_supports_async`, and the `Executor`+`step_with_batch_queue` async-output seam. All `VT_ASYNC_RUNNER` default OFF, sync path byte-identical, RED→GREEN; CPU ctest 111/111, tools 164/164. **The ENABLE-FLIP now LANDED + CPU-gated (2026-07-16, same claim):** `LoadedEngine` reorders `runner_` before the scheduler and builds `AsyncScheduler`+mcb=2 (threaded to `AsyncLLM`→`EngineCoreProc`→`step_with_batch_queue`) when `ResolveAsyncScheduling(runner_.runner_supports_async())` ON, else the byte-identical `Scheduler`+depth-1 (vLLM enable/disable log mirrored); the device combine/scatter kernel (`cuda_combine_tokens.cu`, 1:1 with `_combine_sampled_and_draft_tokens_kernel`) runs main-stream-ordered on the CUDA async path, deleting the pre-scatter `Synchronize`; construction-matrix CPU-tested RED→GREEN. Together they target the ~3.25 ms/step idle. **W3 async scheduling is now the DEFAULT (flipped ON `a0013a2`, 2026-07-17, `ENG-ASYNC-SCHED` DONE):** the TTFT-premium discriminator (`c63a1ec`, evidence `dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…`) proved the +26–31% TTFT premium is **vLLM's OWN async trade** — vLLM async-ON vs its own sync pays the same envelope at −0.7% throughput, and upstream defaults it ON regardless — so the old "throughput-neutral ⇒ keep OFF" framing is retired as mis-calibrated. W3-on **flips both binding ITL-tail anomalies** (c16 p99_itl 1.024, c32 p90_itl 1.020 + p99_itl 1.026, now PASS) and nets positive on the axis arithmetic; the flip is token-neutral (both models, all arms bit-identical). `VT_ASYNC_RUNNER=0` / `VT_ASYNC_SCHED=0` are the same-binary rollbacks | `DONE` | `ENG-ASYNC-SCHED` closed; residual decode-mean parity (the ~1% deficit) now rides the RMSNorm/kernel-efficiency levers, not async |
 | 7 | `ROAD-V1-C7` | Sampling/API controls and logprobs payloads | [engine matrix](engine-matrix.md), [coverage view §6](feature-matrix.md#6-sampling--generation-controls) | implementation slices exist; all audited leaf specs absent | `PARTIAL` | split sampler-core evidence from serving wiring |
 | 8 | `ROAD-V1-C8` | Tokenize/detokenize, unified streaming parsing and full metrics | [engine matrix](engine-matrix.md), [coverage views §§7,9](feature-matrix.md#7-structured-outputs--tool-calling) | v0.25.0 Streaming Parser Engine (`TOOLS-STREAMING-PARSER`) and opt-in response timing (`SERVE-RESPONSE-METRICS`) are inventoried alongside the older `/metrics`/utility debt; all remain unspiked | `INVENTORIED` | `/metrics` core spike, then Streaming Parser Engine/response timing and utility endpoints |
 | 9 | `ROAD-V1-C9` | Mechanical recurring upstream sync | [upstream sync](upstream-sync.md), [v0.25 audit](sync/2026-07-12-702f481.md), [porting inventory](porting-inventory.md) | v0.25.0 target `702f481` enumerated/classified: 145 post-pin commits, 94 inventory and 51 ignore, no unequivalent PORT-NOW runtime delta in the implemented T0 slice. The executable DGX oracle is validated/active at the target; the porting pin remains `e24d1b24` pending target goldens/behavior/model re-verification | `PARTIAL` | refresh exact performance denominators and target goldens/tests, then advance the parity pin |

@@ -53,6 +53,7 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/cuda/fp4_quant_fast.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -999,6 +1000,116 @@ __device__ __forceinline__ void StoreFp4Scale(uint8_t* scale, int64_t row,
   }
 }
 
+// --- NUMERICS-NEUTRAL vectorized-load fast path (VT_FP4_QUANT_FAST /
+//     VT_SILU_FP4_FAST) --------------------------------------------------------
+// Load the 16 consecutive Tin elements at [p, p+16) into v[16] with a SINGLE
+// 16-byte (uint4) vectorized global load when the address is naturally 16-byte
+// aligned, else the identical scalar loads. The loaded VALUES and their order are
+// bit-identical either way, so every downstream computation (fmaxf group amax,
+// F32ToFp8Dev scale, CastToFp4NibbleDev pack) is BYTE-EXACT vs the scalar kernel.
+// This mirrors upstream vLLM's own quant load — one thread loads
+// CVT_FP4_ELTS_PER_THREAD=16 elements via ld256_cg / ld128_cg into a PackedVec
+// (csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu:56-80,126-149 @
+// e24d1b24) — here as a plain aligned uint4 load (not the .cg streaming variant),
+// so the 32 threads of a warp coalesce their group spans into contiguous 128-byte
+// transactions instead of 16 strided 2-byte loads.
+__device__ __forceinline__ void LoadFp4Group16(float (&v)[16],
+                                               const __nv_bfloat16* p) {
+  if ((reinterpret_cast<uintptr_t>(p) & 0xF) == 0) {
+    // 16 bf16 = 32 bytes = two 128-bit (uint4) loads.
+    const uint4 w0 = reinterpret_cast<const uint4*>(p)[0];
+    const uint4 w1 = reinterpret_cast<const uint4*>(p)[1];
+    const uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      // Each 32-bit word packs two consecutive bf16 (little-endian: .x = elem
+      // 2k, .y = elem 2k+1). bf16->f32 is a lossless widen, byte-identical to the
+      // scalar __bfloat162float(p[j]).
+      const float2 f = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(words[k]));
+      v[2 * k] = f.x;
+      v[2 * k + 1] = f.y;
+    }
+  } else {
+#pragma unroll
+    for (int j = 0; j < 16; ++j) v[j] = __bfloat162float(p[j]);
+  }
+}
+
+__device__ __forceinline__ void LoadFp4Group16(float (&v)[16], const float* p) {
+  if ((reinterpret_cast<uintptr_t>(p) & 0xF) == 0) {
+    // 16 f32 = 64 bytes = four 128-bit (uint4) loads.
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const uint4 w = reinterpret_cast<const uint4*>(p)[c];
+      v[4 * c + 0] = __uint_as_float(w.x);
+      v[4 * c + 1] = __uint_as_float(w.y);
+      v[4 * c + 2] = __uint_as_float(w.z);
+      v[4 * c + 3] = __uint_as_float(w.w);
+    }
+  } else {
+#pragma unroll
+    for (int j = 0; j < 16; ++j) v[j] = p[j];
+  }
+}
+
+// Shared quant epilogue over an already-materialized 16-element group v[16].
+// This is the EXACT per-element math of ScaledFp4QuantKernel / SiluAndMul...Kernel
+// (fmaxf group amax -> input_global_scale scaling -> [-448,448] clamp ->
+// F32ToFp8Dev scale byte -> exact-or-approx reciprocal out_scale -> per-element
+// [-6,6] clamp -> CastToFp4NibbleDev nibble pack), factored so the fast kernels
+// reuse it verbatim and the ONLY difference vs the scalar kernels is the load
+// pattern. `out_base` is the element offset of this group's packed output row
+// (ScaledFp4Quant: row*k_dim + g*16; SiluAndMul: row*i_dim + g*16).
+template <bool kSwizzled>
+__device__ __forceinline__ void ScaledFp4QuantEpilogue(
+    uint8_t* packed, uint8_t* scale, const float (&v)[16],
+    float input_global_scale, int64_t row, int64_t g, int64_t groups,
+    int64_t scale_cols, int64_t out_base, bool approx_recip) {
+  float vmax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(v[j]));
+  const float inverse_six =
+      approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+  float sc = input_global_scale * (vmax * inverse_six);
+  sc = fminf(fmaxf(sc, -448.0f), 448.0f);
+  const uint8_t sc8 = F32ToFp8Dev(sc);
+  StoreFp4Scale<kSwizzled>(scale, row, g, groups, scale_cols, sc8);
+  const float sfv = F8E4M3ToF32Dev(sc8);
+  float out_scale = 0.0f;
+  if (sfv != 0.0f) {
+    if (approx_recip) {
+      out_scale = ReciprocalApproximateFtz(
+          sfv * ReciprocalApproximateFtz(input_global_scale));
+    } else {
+      out_scale = input_global_scale / sfv;
+    }
+  }
+  // Pack the 8 output bytes (one E2M1 nibble pair per byte), then store the whole
+  // 16-element group with ONE 64-bit write when its packed span is 8-byte aligned
+  // (numerics-neutral: byte-identical to the 8 scalar stores, one coalesced STG.64
+  // instead of eight 1-byte STG.U8 — mirrors upstream vLLM's uint64 packed store,
+  // nvfp4_quant_kernels.cu:98). out_base is even and i_dim%16==0, so out_base/2 =
+  // row*(i_dim/2)+g*8 is 8-aligned whenever the base pointer is; otherwise byte-wise.
+  uint8_t bytes[8];
+#pragma unroll
+  for (int j = 0; j < 16; j += 2) {
+    const float lo = fminf(fmaxf(v[j] * out_scale, -6.0f), 6.0f);
+    const float hi = fminf(fmaxf(v[j + 1] * out_scale, -6.0f), 6.0f);
+    bytes[j / 2] =
+        static_cast<uint8_t>(CastToFp4NibbleDev(lo) | (CastToFp4NibbleDev(hi) << 4));
+  }
+  uint8_t* out = packed + out_base / 2;
+  if ((reinterpret_cast<uintptr_t>(out) & 0x7) == 0) {
+    uint64_t word = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) word |= static_cast<uint64_t>(bytes[j]) << (8 * j);
+    *reinterpret_cast<uint64_t*>(out) = word;  // little-endian: out[j] == bytes[j]
+  } else {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out[j] = bytes[j];
+  }
+}
+
 // ScaledFp4Quant: one thread per linear or padded (row, 16-group) scale slot.
 // The swizzled specialization writes the CUTLASS scale-factor atom address
 // directly and zeroes padded rows/columns in this same launch. Reciprocal is
@@ -1055,6 +1166,38 @@ __global__ void ScaledFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tin*
   }
 }
 
+// NUMERICS-NEUTRAL fast variant of ScaledFp4QuantKernel: identical thread/group
+// mapping and the identical ScaledFp4QuantEpilogue, differing ONLY in that each
+// thread loads its 16-element group with LoadFp4Group16 (one 16-byte vectorized
+// global load) instead of 16 scalar Load()s. Selected by VT_FP4_QUANT_FAST; see
+// fp4_quant_fast.h and the byte-exact old-vs-new parity cases in
+// tests/vt/test_ops_nvfp4_fp4.cpp.
+template <typename Tin, bool kSwizzled>
+__global__ void ScaledFp4QuantFastKernel(uint8_t* packed, uint8_t* scale,
+                                         const Tin* x, float input_global_scale,
+                                         int64_t m_rows, int64_t k_dim,
+                                         int64_t scale_rows, int64_t scale_cols,
+                                         bool approx_recip) {
+  const int64_t groups = k_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
+  const int64_t base = row * k_dim + g * 16;
+  float v[16];
+  LoadFp4Group16(v, x + base);
+  ScaledFp4QuantEpilogue<kSwizzled>(packed, scale, v, input_global_scale, row, g,
+                                    groups, scale_cols, base, approx_recip);
+}
+
 void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tensor& x,
                               float input_global_scale_inv,
                               Fp4ScaleLayout scale_layout) {
@@ -1070,27 +1213,51 @@ void ScaledFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale, c
   auto* pk = out_packed.Ptr<uint8_t>();
   auto* sc = out_scale.Ptr<uint8_t>();
   const bool approx = NativeFp4MmaEnabled();  // native path -> fast-reciprocal quant
+  // NUMERICS-NEUTRAL vectorized-load fast path (opt-in, default OFF). getenv is
+  // read per call so in-process CUDA tests can flip the selection; the parse is
+  // the CPU-tested predicate in fp4_quant_fast.h.
+  const bool fast = Fp4QuantFastFlagIsOn(std::getenv("VT_FP4_QUANT_FAST"));
   switch (x.dtype) {
     case DType::kF32:
       if (swizzled) {
-        ScaledFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
-            pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
-            scale_cols, approx);
+        if (fast)
+          ScaledFp4QuantFastKernel<float, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+              scale_cols, approx);
+        else
+          ScaledFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+              scale_cols, approx);
       } else {
-        ScaledFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
-            pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
-            scale_cols, approx);
+        if (fast)
+          ScaledFp4QuantFastKernel<float, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+              scale_cols, approx);
+        else
+          ScaledFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<float>(), input_global_scale_inv, m, k, scale_rows,
+              scale_cols, approx);
       }
       break;
     case DType::kBF16:
       if (swizzled) {
-        ScaledFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
-            pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          ScaledFp4QuantFastKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+              scale_rows, scale_cols, approx);
+        else
+          ScaledFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+              scale_rows, scale_cols, approx);
       } else {
-        ScaledFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
-            pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          ScaledFp4QuantFastKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+              scale_rows, scale_cols, approx);
+        else
+          ScaledFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, x.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, k,
+              scale_rows, scale_cols, approx);
       }
       break;
     default: VT_CHECK(false, "cuda scaled_fp4_quant: unsupported x dtype (f32/bf16 only)");
@@ -1455,6 +1622,52 @@ __global__ void SiluAndMulFp4QuantKernel(
   }
 }
 
+// NUMERICS-NEUTRAL fast variant of SiluAndMulFp4QuantKernel: identical
+// thread/group mapping, identical silu(gate)*up bf16 round, and the identical
+// ScaledFp4QuantEpilogue, differing ONLY in that each thread loads its 16-element
+// gate and up spans with LoadFp4Group16 (one 16-byte vectorized global load each)
+// instead of 32 scalar Load()s. Selected by VT_SILU_FP4_FAST; see fp4_quant_fast.h
+// and the byte-exact old-vs-new parity cases in tests/vt/test_ops_nvfp4_fp4.cpp.
+template <typename Tin, bool kSwizzled>
+__global__ void SiluAndMulFp4QuantFastKernel(
+    uint8_t* packed, uint8_t* scale, const Tin* gate_up,
+    float input_global_scale, int64_t m_rows, int64_t i_dim,
+    int64_t scale_rows, int64_t scale_cols, bool approx_recip) {
+  const int64_t groups = i_dim / 16;
+  const int64_t gid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
+  const int64_t output_base = row * i_dim + g * 16;
+  const int64_t input_row_base = row * (2 * i_dim);
+  const int64_t gate_base = input_row_base + g * 16;
+  const int64_t up_base = input_row_base + i_dim + g * 16;
+
+  float gate[16];
+  float up[16];
+  LoadFp4Group16(gate, gate_up + gate_base);
+  LoadFp4Group16(up, gate_up + up_base);
+  // silu(gate)*up, rounded through bf16 (== MoeSiluMul store to bf16); identical
+  // per-element math to the scalar kernel above.
+  float v[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const float silu_mul = (gate[j] / (1.0f + expf(-gate[j]))) * up[j];
+    v[j] = __bfloat162float(__float2bfloat16(silu_mul));
+  }
+  ScaledFp4QuantEpilogue<kSwizzled>(packed, scale, v, input_global_scale, row, g,
+                                    groups, scale_cols, output_base, approx_recip);
+}
+
 void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
                                   Tensor& out_scale, const Tensor& gate_up,
                                   float input_global_scale_inv,
@@ -1495,27 +1708,53 @@ void SiluAndMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed,
     return;
   }
 #endif
+  // NUMERICS-NEUTRAL vectorized-load fast path (opt-in, default OFF). Distinct
+  // from the native packed sm120a path above (VT_FP4_FUSED_VEC, hardware cvt):
+  // this fast kernel keeps the bit-exact scalar-cvt epilogue and only vectorizes
+  // the gate/up loads. getenv is read per call so in-process CUDA tests can flip
+  // the selection; the parse is the CPU-tested predicate in fp4_quant_fast.h.
+  const bool fast = SiluFp4FastFlagIsOn(std::getenv("VT_SILU_FP4_FAST"));
   switch (gate_up.dtype) {
     case DType::kF32:
       if (swizzled) {
-        SiluAndMulFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
-            pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          SiluAndMulFp4QuantFastKernel<float, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
+        else
+          SiluAndMulFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
       } else {
-        SiluAndMulFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
-            pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          SiluAndMulFp4QuantFastKernel<float, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
+        else
+          SiluAndMulFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<float>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
       }
       break;
     case DType::kBF16:
       if (swizzled) {
-        SiluAndMulFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
-            pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          SiluAndMulFp4QuantFastKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
+        else
+          SiluAndMulFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
       } else {
-        SiluAndMulFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
-            pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
-            scale_rows, scale_cols, approx);
+        if (fast)
+          SiluAndMulFp4QuantFastKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
+        else
+          SiluAndMulFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+              pk, sc, gate_up.Ptr<__nv_bfloat16>(), input_global_scale_inv, m, i,
+              scale_rows, scale_cols, approx);
       }
       break;
     default:

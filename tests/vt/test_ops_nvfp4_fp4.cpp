@@ -1123,6 +1123,312 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
   b.DestroyQueue(gq);
 }
 
+// --- NUMERICS-NEUTRAL vectorized-load fast-path bit-identity ----------------
+// The VT_FP4_QUANT_FAST / VT_SILU_FP4_FAST fast kernels change ONLY the memory
+// access pattern (one 16-byte vectorized global load per 16-element group vs 16
+// scalar loads; upstream vLLM nvfp4_quant_kernels.cu:56-80 ld256/ld128 pattern)
+// and keep the exact per-element math. Every fp4 nibble AND per-group fp8 scale
+// byte MUST equal the shipped scalar kernel on adversarial inputs — proved here
+// by running the SAME op with the flag OFF (default scalar) then ON (fast) and
+// asserting byte-exact packed + scale. Covers both dtypes (f32/bf16), both scale
+// layouts (linear + swizzled, incl. padded rows/cols), decode + prefill shapes,
+// and a deliberately misaligned input that forces the fast kernel's scalar
+// fallback branch.
+namespace {
+// Adversarial fp4/fp8 content: random-normal background plus injected boundary
+// probes (exact +/-0, the +/-6.0 fp4 clamp edge and just past it, signed tiny
+// values that round to fp4 zero, magnitudes that clamp the group scale to 448),
+// and a forced all-zero leading group (amax==0 -> out_scale==0 branch).
+void FillAdversarialFp4(std::vector<float>& v, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> nd(0.0F, 3.0F);
+  for (auto& x : v) x = nd(rng);
+  const std::array<float, 12> probes = {0.0F,   -0.0F,   6.0F,    -6.0F,
+                                        6.5F,   -7.25F,  1e-4F,   -1e-4F,
+                                        448.0F, -600.0F, 3.0F,    -1.5F};
+  for (size_t i = 0; i + probes.size() <= v.size(); i += 97) {
+    for (size_t j = 0; j < probes.size(); ++j) v[i + j] = probes[j];
+  }
+  for (size_t j = 0; j < std::min<size_t>(16, v.size()); ++j) v[j] = 0.0F;
+}
+
+// Scoped setenv/restore so the per-call getenv in the launcher selects the fast
+// or scalar kernel deterministically and the environment is restored after.
+struct ScopedEnv {
+  const char* name;
+  std::string saved;
+  bool had;
+  ScopedEnv(const char* n, const char* value) : name(n) {
+    const char* cur = std::getenv(n);
+    had = cur != nullptr;
+    if (had) saved = cur;
+    if (value)
+      setenv(n, value, 1);
+    else
+      unsetenv(n);
+  }
+  ~ScopedEnv() {
+    if (had)
+      setenv(name, saved.c_str(), 1);
+    else
+      unsetenv(name);
+  }
+};
+
+int64_t EnvInt(const char* name, int64_t fallback) {
+  const char* v = std::getenv(name);
+  return v ? std::strtoll(v, nullptr, 10) : fallback;
+}
+}  // namespace
+
+TEST_CASE("scaled_fp4_quant CUDA fast vectorized-load == scalar (BYTE-EXACT)") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 8.2F;
+
+  auto run = [&](int64_t m, int64_t k, DType dtype, vt::Fp4ScaleLayout layout,
+                 bool misaligned) {
+    CAPTURE(m);
+    CAPTURE(k);
+    CAPTURE(static_cast<int>(dtype));
+    CAPTURE(static_cast<int>(layout));
+    CAPTURE(misaligned);
+    std::vector<float> in_f32(static_cast<size_t>(m * k));
+    FillAdversarialFp4(in_f32, static_cast<unsigned>(17 + m * 7 + k));
+    std::vector<uint16_t> in_bf16;
+    const void* host = in_f32.data();
+    size_t bytes = in_f32.size() * sizeof(float);
+    if (dtype == DType::kBF16) {
+      in_bf16.resize(in_f32.size());
+      std::transform(in_f32.begin(), in_f32.end(), in_bf16.begin(),
+                     FloatToBf16);
+      host = in_bf16.data();
+      bytes = in_bf16.size() * sizeof(uint16_t);
+    }
+    // A 2-byte-offset base is bf16-load-legal but never 16-byte aligned, so the
+    // fast kernel takes its scalar fallback (still byte-exact).
+    void* dx_alloc = b.Alloc(bytes + (misaligned ? size_t{2} : size_t{0}));
+    void* dx = misaligned
+                   ? static_cast<void*>(static_cast<uint8_t*>(dx_alloc) + 2)
+                   : dx_alloc;
+    b.Copy(gq, dx, host, bytes);
+    Tensor tx = GpuTensor({m, k});
+    tx.data = dx;
+    tx.dtype = dtype;
+    tx.device = Gpu();
+
+    const bool swizzled = layout == vt::Fp4ScaleLayout::kCutlassSwizzled;
+    const int64_t srows = swizzled ? RoundUpTo(m, 128) : m;
+    const int64_t scols = swizzled ? RoundUpTo(k / 16, 4) : k / 16;
+    auto quant = [&](const char* flag) {
+      void* dp = b.Alloc(static_cast<size_t>(m * k / 2));
+      void* ds = b.Alloc(static_cast<size_t>(srows * scols));
+      b.Memset(gq, dp, 0x5A, static_cast<size_t>(m * k / 2));
+      b.Memset(gq, ds, 0xA5, static_cast<size_t>(srows * scols));
+      Tensor tp = GpuTensor({m, k / 2});
+      tp.data = dp;
+      tp.dtype = DType::kI8;
+      tp.device = Gpu();
+      Tensor ts = GpuTensor({srows, scols});
+      ts.data = ds;
+      ts.dtype = DType::kI8;
+      ts.device = Gpu();
+      {
+        ScopedEnv env("VT_FP4_QUANT_FAST", flag);
+        vt::ScaledFp4Quant(gq, tp, ts, tx, input_global_scale, layout);
+      }
+      std::vector<uint8_t> hp(static_cast<size_t>(m * k / 2));
+      std::vector<uint8_t> hs(static_cast<size_t>(srows * scols));
+      b.Copy(gq, hp.data(), dp, hp.size());
+      b.Copy(gq, hs.data(), ds, hs.size());
+      b.Synchronize(gq);
+      b.Free(dp);
+      b.Free(ds);
+      return std::make_pair(hp, hs);
+    };
+    const auto scalar = quant(nullptr);  // default OFF (shipped scalar kernel)
+    const auto fast = quant("1");        // opt-in ON (vectorized-load kernel)
+    CHECK(fast.first == scalar.first);    // fp4 nibbles byte-exact
+    CHECK(fast.second == scalar.second);  // fp8 group scales byte-exact
+    b.Free(dx_alloc);
+  };
+
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    for (vt::Fp4ScaleLayout layout : {vt::Fp4ScaleLayout::kLinear,
+                                      vt::Fp4ScaleLayout::kCutlassSwizzled}) {
+      run(1, 128, dtype, layout, false);    // decode m=1
+      run(1, 256, dtype, layout, false);
+      run(5, 128, dtype, layout, false);    // several rows + swizzled padding
+      run(40, 512, dtype, layout, false);   // larger prefill class
+    }
+  }
+  // Force the fast kernel's scalar fallback branch (unaligned bf16 base).
+  run(3, 128, DType::kBF16, vt::Fp4ScaleLayout::kCutlassSwizzled, true);
+  b.DestroyQueue(gq);
+}
+
+TEST_CASE("silu_and_mul_fp4_quant CUDA fast vectorized-load == scalar (BYTE-EXACT)") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 6.7F;
+
+  auto run = [&](int64_t m, int64_t i, DType dtype, vt::Fp4ScaleLayout layout,
+                 bool misaligned) {
+    CAPTURE(m);
+    CAPTURE(i);
+    CAPTURE(static_cast<int>(dtype));
+    CAPTURE(static_cast<int>(layout));
+    CAPTURE(misaligned);
+    std::vector<float> in_f32(static_cast<size_t>(m * 2 * i));
+    FillAdversarialFp4(in_f32, static_cast<unsigned>(211 + m * 131 + i));
+    std::vector<uint16_t> in_bf16;
+    const void* host = in_f32.data();
+    size_t bytes = in_f32.size() * sizeof(float);
+    if (dtype == DType::kBF16) {
+      in_bf16.resize(in_f32.size());
+      std::transform(in_f32.begin(), in_f32.end(), in_bf16.begin(),
+                     FloatToBf16);
+      host = in_bf16.data();
+      bytes = in_bf16.size() * sizeof(uint16_t);
+    }
+    void* dx_alloc = b.Alloc(bytes + (misaligned ? size_t{2} : size_t{0}));
+    void* dx = misaligned
+                   ? static_cast<void*>(static_cast<uint8_t*>(dx_alloc) + 2)
+                   : dx_alloc;
+    b.Copy(gq, dx, host, bytes);
+    Tensor tx = GpuTensor({m, 2 * i});
+    tx.data = dx;
+    tx.dtype = dtype;
+    tx.device = Gpu();
+
+    const bool swizzled = layout == vt::Fp4ScaleLayout::kCutlassSwizzled;
+    const int64_t srows = swizzled ? RoundUpTo(m, 128) : m;
+    const int64_t scols = swizzled ? RoundUpTo(i / 16, 4) : i / 16;
+    auto quant = [&](const char* flag) {
+      void* dp = b.Alloc(static_cast<size_t>(m * i / 2));
+      void* ds = b.Alloc(static_cast<size_t>(srows * scols));
+      b.Memset(gq, dp, 0x5A, static_cast<size_t>(m * i / 2));
+      b.Memset(gq, ds, 0xA5, static_cast<size_t>(srows * scols));
+      Tensor tp = GpuTensor({m, i / 2});
+      tp.data = dp;
+      tp.dtype = DType::kI8;
+      tp.device = Gpu();
+      Tensor ts = GpuTensor({srows, scols});
+      ts.data = ds;
+      ts.dtype = DType::kI8;
+      ts.device = Gpu();
+      {
+        ScopedEnv env("VT_SILU_FP4_FAST", flag);
+        vt::SiluAndMulFp4Quant(gq, tp, ts, tx, input_global_scale, layout);
+      }
+      std::vector<uint8_t> hp(static_cast<size_t>(m * i / 2));
+      std::vector<uint8_t> hs(static_cast<size_t>(srows * scols));
+      b.Copy(gq, hp.data(), dp, hp.size());
+      b.Copy(gq, hs.data(), ds, hs.size());
+      b.Synchronize(gq);
+      b.Free(dp);
+      b.Free(ds);
+      return std::make_pair(hp, hs);
+    };
+    const auto scalar = quant(nullptr);  // default OFF (shipped scalar kernel)
+    const auto fast = quant("1");        // opt-in ON (vectorized-load kernel)
+    CHECK(fast.first == scalar.first);    // fp4 nibbles byte-exact
+    CHECK(fast.second == scalar.second);  // fp8 group scales byte-exact
+    b.Free(dx_alloc);
+  };
+
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    for (vt::Fp4ScaleLayout layout : {vt::Fp4ScaleLayout::kLinear,
+                                      vt::Fp4ScaleLayout::kCutlassSwizzled}) {
+      run(1, 64, dtype, layout, false);     // decode
+      run(4, 128, dtype, layout, false);    // several rows + swizzled padding
+      run(37, 512, dtype, layout, false);   // padded-M prefill class
+    }
+  }
+  run(3, 64, DType::kBF16, vt::Fp4ScaleLayout::kCutlassSwizzled, true);
+  b.DestroyQueue(gq);
+}
+
+// Env-gated ISOLATED per-launch microbench for the two vectorized-load fast
+// kernels at the real 27B swizzled decode shapes (hidden 5120, intermediate
+// 17408; M = decode batch). Runs a warmup + timed loop of the scalar kernel then
+// the fast kernel at ONE fixed (kernel, M, dim) so an nsys `cuda_gpu_kern_sum`
+// capture reports the pure-kernel average duration for each distinct kernel name
+// (…FastKernel vs its scalar sibling). Off by default (needs VT_FP4_MB_RUN=1);
+// select with VT_FP4_MB_KERNEL=scaled|silu, VT_FP4_MB_M, VT_FP4_MB_K (scaled) /
+// VT_FP4_MB_I (silu), VT_FP4_MB_ITERS.
+TEST_CASE("fp4 quant fast microbench (VT_FP4_MB_RUN)") {
+  if (!HasCuda()) return;
+  if (std::getenv("VT_FP4_MB_RUN") == nullptr) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float igs = 8.2F;
+  const int iters = static_cast<int>(EnvInt("VT_FP4_MB_ITERS", 500));
+  const int64_t m = EnvInt("VT_FP4_MB_M", 16);
+  const char* kernel = std::getenv("VT_FP4_MB_KERNEL");
+  const bool silu = kernel != nullptr && std::string(kernel) == "silu";
+  const auto layout = vt::Fp4ScaleLayout::kCutlassSwizzled;
+
+  // Input width: scaled = K; silu = 2*I (gate then up), fp4 output width I.
+  const int64_t inner = silu ? EnvInt("VT_FP4_MB_I", 17408)
+                             : EnvInt("VT_FP4_MB_K", 5120);
+  const int64_t in_cols = silu ? 2 * inner : inner;
+
+  std::vector<float> in_f32(static_cast<size_t>(m * in_cols));
+  FillAdversarialFp4(in_f32, 909);
+  std::vector<uint16_t> in_bf16(in_f32.size());
+  std::transform(in_f32.begin(), in_f32.end(), in_bf16.begin(), FloatToBf16);
+  void* dx = b.Alloc(in_bf16.size() * sizeof(uint16_t));
+  b.Copy(gq, dx, in_bf16.data(), in_bf16.size() * sizeof(uint16_t));
+  Tensor tx = GpuTensor({m, in_cols});
+  tx.data = dx;
+  tx.dtype = DType::kBF16;
+  tx.device = Gpu();
+
+  const int64_t srows = RoundUpTo(m, 128);
+  const int64_t scols = RoundUpTo(inner / 16, 4);
+  void* dp = b.Alloc(static_cast<size_t>(m * inner / 2));
+  void* ds = b.Alloc(static_cast<size_t>(srows * scols));
+  Tensor tp = GpuTensor({m, inner / 2});
+  tp.data = dp;
+  tp.dtype = DType::kI8;
+  tp.device = Gpu();
+  Tensor ts = GpuTensor({srows, scols});
+  ts.data = ds;
+  ts.dtype = DType::kI8;
+  ts.device = Gpu();
+
+  const char* flag_name = silu ? "VT_SILU_FP4_FAST" : "VT_FP4_QUANT_FAST";
+  auto loop = [&](const char* flag) {
+    ScopedEnv env(flag_name, flag);
+    for (int w = 0; w < 30; ++w) {
+      if (silu)
+        vt::SiluAndMulFp4Quant(gq, tp, ts, tx, igs, layout);
+      else
+        vt::ScaledFp4Quant(gq, tp, ts, tx, igs, layout);
+    }
+    b.Synchronize(gq);
+    for (int it = 0; it < iters; ++it) {
+      if (silu)
+        vt::SiluAndMulFp4Quant(gq, tp, ts, tx, igs, layout);
+      else
+        vt::ScaledFp4Quant(gq, tp, ts, tx, igs, layout);
+    }
+    b.Synchronize(gq);
+  };
+  MESSAGE("microbench kernel=" << (silu ? "silu" : "scaled") << " M=" << m
+                               << " inner=" << inner << " iters=" << iters);
+  loop(nullptr);  // scalar sibling
+  loop("1");      // vectorized-load fast kernel
+  CHECK(true);
+  b.Free(dx);
+  b.Free(dp);
+  b.Free(ds);
+  b.DestroyQueue(gq);
+}
+
 TEST_CASE("matmul_nvfp4_fp4 validates shapes loudly") {
   std::vector<uint8_t> buf(64, 0);
   std::vector<float> ob(16, 0);

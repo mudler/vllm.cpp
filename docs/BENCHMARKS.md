@@ -408,6 +408,29 @@ sync-scheduler fix exists, per MIRROR policy the fix IS async-on. Confirmation =
 the pending c8+c32 W3-on/off ITL-tail A/B on an idle GPU. Diagnostic
 (`benchmark_binding=false`, no speed credit); binding stays 49/124.
 
+**FP4-quant decode-glue vectorization sub-lever (2026-07-17, `CLAIM-FP4-QUANT-FAST-1`).**
+Attacks the batch-independent FP4-quant (+0.30 ms/step) + SiLU (+0.23) glue floor
+above with two NUMERICS-NEUTRAL fast kernels behind default-OFF opt-in flags
+`VT_FP4_QUANT_FAST` (`ScaledFp4QuantFastKernel`) / `VT_SILU_FP4_FAST`
+(`SiluAndMulFp4QuantFastKernel`): each thread does ONE 16-byte `uint4` vectorized
+load (vs 16 scalar) + ONE 64-bit packed store (vs eight 1-byte), memory-access
+pattern ONLY — the exact `CastToFp4NibbleDev`/`F32ToFp8Dev`/`fmaxf`-amax/bf16-SiLU
+math is unchanged (grounded 1:1 in vLLM `nvfp4_quant_kernels.cu:56-80,98`). BIT-IDENTITY
+PROVEN on DGX (byte-exact new-vs-old nibbles + fp8 scales, 60/60 adversarial parity
+asserts; full FP4 suite 24/24 = 26,976 asserts; flag test 20/20). Isolated nsys
+per-launch (swizzled bf16, median, scalar→fast): ScaledFp4Quant K=5120 **1.12–1.18×** /
+K=17408 (down_proj) **1.44–1.62×**; SiluAndMul I=17408 **1.14×** (c2/M=2) / **1.38×**
+(c16–c32/M≥16). **Verdict vs the ≥1.3× flip bar = PARTIAL**: both clear at the larger
+shapes but MISS at their dominant production shapes (ScaledFp4Quant K=5120; SiluAndMul
+c2) — swizzled small-M is padding-thread-dominated (127/128 threads at M=2 are identical
+scale-zero padding early-outs), masking the real-thread win; the residual to vLLM's
+~1.7× is the numerics-CHANGING hardware `cvt.rn.satfinite.e2m1x2` + `__hmax2` bf16
+reduction (out of scope by the hard bit-identity requirement — that is the non-bit-exact
+`VT_FP4_FUSED_VEC` native kernel). Both ship **default OFF** — NOT ready for an
+unconditional flip; bit-identical + engine-safe so the orchestrator may fold them into
+the combined in-situ A/B. `benchmark_binding=false`, no speed credit; binding 52/124.
+DGX evidence `dgx:~/work/vllm.cpp-fp4-quant-fast`.
+
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |

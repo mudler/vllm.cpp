@@ -254,17 +254,18 @@ TEST_CASE("CUDA rmsnorm fused residual matches CPU and updates residual") {
   }
 }
 
-// VT_RMSNORM_DECODE_FAST (default OFF again since the 2026-07-17 rollback; '1' =
-// opt-in): the vectorized decode
-// kernel (RmsNormRowFastKernel, a 1:1 port of vLLM fused_add_rms_norm_kernel
-// <bf16,8>, csrc/libtorch_stable/layernorm_kernels.cu:106-173 @ e24d1b24) must
-// match the rollback RmsNormRowKernel at the real 27B decode shape (M x H=5120,
-// bf16 in/out, bf16 residual, gemma). The reduction is reordered (1024-thread
-// block vs the 256-thread tree), so the contract is one-bf16-ulp, NOT
-// bit-identity — the standalone spike measured bf16-EXACT at c2-c16 and
-// 2/163840 elements 1-ulp at c32. Runs both arms on the GPU with EXPLICIT env
-// values ("1" fast / "0" rollback; the launcher reads getenv per call) so the
-// comparison is default-independent, and compares. Skips when no CUDA.
+// VT_RMSNORM_DECODE_FAST (default OFF; '1' opt-in): the vectorized decode kernel
+// (RmsNormRowFastKernel) is a TRUE 1:1 port of vLLM's csrc
+// fused_add_rms_norm_kernel<bf16,8> using the ACTUAL cub::BlockReduce<float,1024>
+// (the reduction the pip-vLLM enforce_eager oracle runs). It must match the
+// rollback RmsNormRowKernel (itself oracle-exact vs the 235/235 golden) at the
+// real 27B decode shape (M x H=5120, bf16, gemma): residual stream BIT-IDENTICAL
+// (both bf16(f32 x + f32 res)), output within one bf16 ulp (cub-1024 vs the
+// 256-thread tree legitimately differ ~1e-6 in the f32 variance). Token-exactness
+// vs the oracle STREAM is the decisive proof and is adjudicated on DGX by
+// test_qwen27_paged_engine (235/235) + test_qwen36_paged_engine (315/315).
+// Runs both arms with EXPLICIT env values ("1" fast / "0" rollback; the launcher
+// reads getenv per call) so the comparison is default-independent. Skips w/o CUDA.
 void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   const auto xf = RandomF32(static_cast<size_t>(t * h), seed);
   const auto wf = RandomF32(static_cast<size_t>(h), seed + 1);
@@ -295,8 +296,8 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   run(/*fast=*/true, out_fast, res_fast);
   ::unsetenv("VT_RMSNORM_DECODE_FAST");
 
-  // Output: one bf16 ulp (rtol 8e-3 >= 2^-7) — the reordered f32 variance can flip
-  // the final bf16 rounding by one ulp.
+  // Output: one bf16 ulp (rtol 8e-3 >= 2^-7) — cub-1024 vs the 256-thread tree can
+  // flip the final bf16 rounding by one ulp.
   CheckClose(Unpack(out_fast, DType::kBF16), Unpack(out_ref, DType::kBF16), 4e-3f, 8e-3f);
   // Residual stream: the add is packed bf16 __hadd2 == the shipped ResRound bf16
   // round on both sides, so the updated residual is bit-identical.

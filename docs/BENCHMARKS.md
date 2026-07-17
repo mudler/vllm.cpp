@@ -230,8 +230,10 @@ and its TTFT must not be misread as a regression. The same DGX gate incidentally
 caught a pre-existing RMSNorm-fast 27B token divergence (`VT_RMSNORM_DECODE_FAST`
 default-ON `696a991`, gated only on `paged_FORWARD`): fast-ON 234/235 vs fast-OFF
 235/235 vs the pip-vLLM oracle, async-independently — the `VT_RMSNORM_DECODE_FAST`
-default was rolled back to OFF (kernel opt-in via `=1`) to keep the production
-default token-exact. The
+default was rolled back to OFF and STAYS OFF (opt-in), though the 2026-07-17 numerics
+rework FIXED the token-exactness (real `cub::BlockReduce` = the eager oracle's exact
+reduction; 235/235 + 315/315 fast-ON); the c16 in-situ A/B showed no win, so the
+default flip awaits an in-situ win — see the RMSNorm decode-fast section below. The
 decode body (tokens 16–111) is at parity with ZERO mid-sequence stalls;
 capping the per-event stall at one prefill was measured-sufficient to flip both
 axes to PASS (counterfactual ratios 0.87–0.96 / 0.93–1.11). The
@@ -283,29 +285,34 @@ removes that confound and CONFIRMS the lever: ours `RmsNormRowKernel`
 the ~2.4 ms c2 decode gap). The confound was only in-situ (ours in-situ nsys 15.5
 µs is ~1.84× contention-inflated over the 8.46 µs isolated); the isolated gap is
 real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
-**default OFF**), a 1:1 port of vLLM's own CUDA `fused_add_rms_norm_kernel<bf16,8>`
-(1024-thread block, 16-byte vectorized loads, block reduce): the isolated spike
-reaches **~parity with vLLM** (nsys 2.83 µs, 2.24–2.50× over V0) and is bf16-EXACT
-vs the shipped kernel at c2–c16 (2/163840 elements 1-ULP at c32). The reordered
-reduction is not bit-identical (token-exactness hazard) ⇒ shipped OFF until the
-DGX proof, which PASSED (2026-07-16/17, evidence `dgx:~/work/vllm.cpp-ewnorm-act-src`):
-gate3 token gates ALL PASS with the fast kernel on both models (27B 17/17+84/84,
-35B 4/4+8/8; the 1-ULP hazard did not surface), and the corrected-build gate4
-interleaved c16 A/B wins **+8.7/+9.2 tok/s (+1.1%) / meanTPOT −1.68/−1.90 ms**
-on the 2 clean pairs (fast 801.7/802.4/799.5 vs legacy 793.0/793.2; legacy-r3
-VOID — a ~20% interference anomaly; c2 pooled medians parity, arrival-lottery
-noise). Was briefly flipped default-ON (`696a991`), but **ROLLED BACK to
-default-OFF on 2026-07-17**: the async-default-flip DGX gate ran the fuller
-`test_qwen27_paged_ENGINE` production greedy stream (the `696a991` gate used only
-`paged_FORWARD`) and found fast-ON DIVERGES from the pip-vLLM oracle — **234/235
-fast-ON vs 235/235 fast-OFF**, async-independently (the reordered reduction flips a
-27B greedy near-tie at token 7; vLLM's real oracle runs an Inductor-Triton rmsnorm,
-not the csrc kernel this port mirrors). Token-exactness vs the oracle is sacrosanct
-⇒ the shipped `RmsNormRowKernel` is the default again; `RmsNormRowFastKernel` is
-opt-in via `VT_RMSNORM_DECODE_FAST=1`, and the fast-kernel default-ON perf lever
-reopens pending an Inductor-Triton numerics match. gate3's own A/B legs were VOID
-(slow-path build — missing CUTLASS FP4/FA2, the same defect that voided the W3
-round-1 A/B; dgx builds now hard-verify the configure-log fast-path lines). The completed **lost-lanes rescan**
+**default OFF / opt-in via `=1`**; the 2026-07-17 numerics rework FIXED its
+token-exactness but the c16 A/B showed no in-situ win), a TRUE 1:1 port of vLLM's
+csrc `fused_add_rms_norm_kernel<bf16,8>` (1024-thread block, 16-byte vectorized
+loads) using the **ACTUAL `cub::BlockReduce<float,1024>`**. History: the
+2026-07-16 kernel APPROXIMATED cub with a hand two-stage warp-shuffle; it was flipped
+default-ON (`696a991`), then **ROLLED BACK** (a0013a2) when `test_qwen27_paged_ENGINE`
+caught fast-ON DIVERGING from the pip-vLLM oracle at output token 7 (**234/235** vs
+235/235). The rollback note WRONGLY blamed an Inductor-Triton mismatch; the oracle
+golden is generated with `enforce_eager=True` (pip-vllm:0.24.0,
+`tools/parity/dump_qwen36.py:242`), so the oracle rmsnorm is the EAGER csrc
+`cub::BlockReduce` kernel, NOT Triton — the hand reduction's reordered f32 sum was
+the culprit. **NUMERICS REWORK (2026-07-17, `CLAIM-EW-NORM-ACT-2`, evidence
+`dgx:~/work/vllm.cpp-ewnorm-numerics`):** swapping in the real `cub::BlockReduce`
+reproduces the oracle's exact reduction order. DGX proof (corrected build): the
+`ENGINE` tier that caught the regression is **235/235 fast-ON** (token 7 = 198) +
+`qwen36_paged_engine` **315/315** fast-ON; both rollback arms 235/235 + 315/315;
+`paged_forward` 84/84 + 8/8; CUDA parity 132/132; **perf nsys pure-kernel 2.66 µs
+median / 2.74 µs avg vs shipped 8.66 µs (~3.2×)**, within vLLM's own 2.37–2.68 µs
+(event-timed 4.10 µs, identical to the 2026-07-16 kernel — cub costs nothing). BUT
+the interleaved c16 in-situ A/B (w0 + 3 pairs, `ab-cub/`) shows **NO WIN**: fast
+−0.60% tput / +0.34 ms meanTPOT, 3/3 pairs fast-slower — contradicting the 2026-07-16
+gate4 (+1.1%). The FAST arm matches (~804 tok/s both runs) but the shipped-kernel
+LEGACY arm swings ~2% (793 gate4 vs 809 here), so the delta is that arm's
+run-variation ⇒ the c16 effect is a NULL within noise (as this section's Gates
+anticipated: "an in-situ null at c16 is plausible … the c2 lane is the target").
+Per the flip acceptance (a confirmed c16 win / no regression) the **default STAYS OFF
+(opt-in)** — the token-exactness blocker is FIXED and the kernel is the true vLLM
+mirror, but the default flip awaits an in-situ win (c2 target). The completed **lost-lanes rescan**
 ([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
 angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
 gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of

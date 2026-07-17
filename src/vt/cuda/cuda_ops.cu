@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <cub/cub.cuh>
+
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
@@ -91,38 +93,51 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
 }
 
 // ---------------------------------------------------------------------------
-// Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST, default ON; '0' rolls
-// back to RmsNormRowKernel). 1:1 port of
-// vLLM's OWN vectorized CUDA rms-norm — the CUDA embodiment of the SAME reduction
-// the production Inductor triton_red kernel runs at decode:
-//   csrc/libtorch_stable/layernorm_kernels.cu:106-173 (fused_add_rms_norm_kernel
-//   <scalar_t,width=8>), launch :310-363 (block = min(hidden,1024) for
-//   num_tokens<256, 16-byte _f16Vec loads, cub::BlockReduce<float,1024>), and the
-//   _f16Vec packed bf16 `+=` / f32 `sum_squares` of csrc/type_convert.cuh:115-194,
-//   @ vLLM pin e24d1b24. Standalone-nsys Phase-1 at the real 27B decode shape
-//   (M x H=5120) measured the shipped RmsNormRowKernel at 8.44-8.53 us/launch vs
-//   vLLM 2.37-2.68 us (3.18-3.56x, well over the 1.3x bar); this kernel reaches
-//   ~parity (2.83 us nsys / 4.10 us event, 2.24-2.50x over V0), bf16-EXACT vs
-//   RmsNormRowKernel at c2-c16 (2/163840 elements 1-ULP at c32 on adversarial
-//   data). The variance reduction is reordered vs the 256-thread tree, so this is
-//   NOT bit-identical (token-exactness hazard) => shipped OFF until the DGX
-//   proof, then flipped ON: gate3 token gates PASS both models with the fast
-//   kernel (27B 17/17+84/84, 35B 4/4+8/8) and the corrected gate4 c16 A/B wins
-//   (meanTPOT -1.68/-1.90 ms clean pairs, tput +8.7/+9.2 tok/s; evidence
-//   dgx:~/work/vllm.cpp-ewnorm-act-src, spec rmsnorm-decode-fast-2026-07-16.md).
+// Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST). Re-expressed 2026-07-17
+// (KERNEL-EW-NORM-ACT numerics rework, CLAIM-EW-NORM-ACT-2) to be a TRUE 1:1 port
+// of vLLM's csrc fused_add_rms_norm_kernel<bf16,8> — using the ACTUAL
+// cub::BlockReduce<float,1024> block reduction, not a hand-rolled shuffle.
 //
-// Scope: the bf16-in / bf16-out / bf16-residual decode path (the 129 input/
-// post-attn/final RMSNorm launches/step, all H=5120). Every other dtype/residual
-// combination keeps RmsNormRowKernel. 16-byte _f16Vec<bf16,8> = 4 packed bf162.
+// GROUND (corrected premise): the pip-vLLM ORACLE golden
+// (tests/parity/goldens/qwen36_logits_27b, source pip-vllm:0.24.0) was generated
+// with `LLM(..., enforce_eager=True)` (tools/parity/dump_qwen36.py:242) — so the
+// oracle rmsnorm is the EAGER custom CUDA op, NOT the Inductor-Triton kernel the
+// earlier rollback note assumed. That op is
+//   csrc/libtorch_stable/layernorm_kernels.cu:106-173 (fused_add_rms_norm_kernel
+//   <scalar_t, width=8, HasWeight>), launch :310-331 `block = min(hidden,1024)`
+//   (num_tokens<256), reduction `cub::BlockReduce<float,1024>.Reduce(variance,
+//   CubAddOp{}, blockDim.x)`, `_f16Vec` packed bf16 `+=` / f32 `sum_squares` of
+//   csrc/type_convert.cuh @ vLLM pin e24d1b24. Per element (bf16 throughout, the
+//   f32 accum stays f32):
+//     res' = bf16(x) + bf16(res)  [packed __hadd2 == _f16Vec::operator+=]
+//     var  = mean(sum_squares(res')) + eps ; inv = rsqrtf(var)
+//     out  = bf16( (f32(res') * inv) * (f32(w) + gemma) )
+// The 2026-07-16 fast kernel used the SAME per-element math but APPROXIMATED cub
+// with a hand two-stage warp-shuffle reduce, whose reordered f32 sum flipped a 27B
+// greedy near-tie at output token 7 (271 vs oracle 198; 234/235 -> rolled back
+// a0013a2). Swapping in the ACTUAL cub::BlockReduce (BLOCK_REDUCE_WARP_REDUCTIONS)
+// reproduces the oracle's exact reduction ORDER, landing token 7 on 198.
+//
+// Scope: bf16-in / bf16-out / bf16-residual, H%8==0, H>=1024 (=> csrc block=1024;
+// the 129 input/post-attn/final residual RMSNorm launches, H=5120 on the 27B /
+// H=2048 on the 35B). Other dtype/residual/small-H keep RmsNormRowKernel. The q/k
+// head norms take no residual => not this path. 16-byte load = 4 packed bf162.
 struct alignas(16) RmsNormBf16x8 {
   __nv_bfloat162 d[4];
 };
 
-// One block per row, blockDim threads (1024 at decode). Pass 1: vectorized
-// residual add (packed __hadd2, == _f16Vec::operator+=) + f32 sum_squares + store
-// residual. Two-stage warp-shuffle block reduction (sum semantics of
-// cub::BlockReduce<float,1024>; CUB is not vendored here). Pass 2: reload
-// residual, vectorized normalize (x*inv*w in f32 -> bf16), gemma folds (1+w).
+// Match csrc's `CubAddOp{}` (plain f32 add) so the cub reduction ORDER is the
+// oracle's exactly (the functor identity does not change cub's algorithm, but we
+// mirror it verbatim).
+struct CubAddOp {
+  __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
+};
+
+// One block per row, 1024 threads (== csrc `block=min(hidden,1024)` at decode).
+// Pass 1: vectorized packed bf16 residual add (== _f16Vec::operator+=) + f32
+// sum_squares + store bf16 residual. Reduction: cub::BlockReduce<float,1024> over
+// blockDim.x (the oracle's exact order). Pass 2: reload bf16 residual, vectorized
+// normalize (f32(res)*inv*w -> bf16), gemma folds (1+w). 1:1 with the csrc kernel.
 __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
                                      const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ w,
@@ -143,28 +158,20 @@ __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
 #pragma unroll
     for (int k = 0; k < 4; k++) t.d[k] = __hadd2(t.d[k], r.d[k]);  // == _f16Vec::operator+=
 #pragma unroll
-    for (int k = 0; k < 4; k++) {  // == _f16Vec::sum_squares (f32 accumulate)
+    for (int k = 0; k < 4; k++) {  // == _f16Vec::sum_squares (f32 accumulate of bf16)
       float2 z = __bfloat1622float2(t.d[k]);
       variance += z.x * z.x + z.y * z.y;
     }
     rv[idx] = t;  // residual store (bf16), identical to RmsNormRowKernel's ResRound path
   }
 
-  // Block reduction: warp-shuffle reduce, then reduce the per-warp partials in
-  // warp 0 (mirrors cub::BlockReduce<float,1024> sum without vendoring CUB).
-  for (int o = 16; o > 0; o >>= 1) variance += __shfl_down_sync(0xffffffffu, variance, o);
-  __shared__ float wsum[32];
-  const int lane = threadIdx.x & 31;
-  const int wid = threadIdx.x >> 5;
-  const int nwarp = blockDim.x >> 5;
-  if (lane == 0) wsum[wid] = variance;
-  __syncthreads();
+  // THE oracle reduction: cub::BlockReduce<float,1024> (matches the csrc kernel
+  // bit-for-bit; CUB is in the CUDA toolkit's cccl headers). num_valid = blockDim.x.
+  using BlockReduce = cub::BlockReduce<float, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduceStore;
+  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
   __shared__ float s_variance;
-  if (wid == 0) {
-    float s = (lane < nwarp) ? wsum[lane] : 0.0f;
-    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-    if (lane == 0) s_variance = rsqrtf(s / static_cast<float>(h) + eps);
-  }
+  if (threadIdx.x == 0) s_variance = rsqrtf(variance / static_cast<float>(h) + eps);
   __syncthreads();
   const float inv = s_variance;
 
@@ -188,10 +195,10 @@ __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
 }
 
 // Runtime predicate + launch for the decode-fast path. Returns true iff it ran.
-// Mirrors vLLM's alignment/width guard (layernorm_kernels.cu:336-361): needs
-// 16-byte-aligned in/out/weight/residual pointers, hidden % 8 == 0, and the
-// bf16/bf16/bf16-residual decode dtypes. Block = min(1024, 32*floor(h/32))
-// mirrors block = min(hidden, max_block_size=1024) for num_tokens<256.
+// Mirrors the csrc guard (layernorm_kernels.cu:334-361): bf16 in/out/weight/
+// residual, 16-byte-aligned pointers, H%8==0, and H>=1024 so csrc `block =
+// min(hidden,1024)` == 1024 (making cub::BlockReduce<float,1024> the full-block
+// reduction the oracle runs). Smaller H keeps RmsNormRowKernel.
 inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor& x,
                                        const Tensor& w, const RmsNormArgs& args,
                                        Tensor* residual, unsigned rows, int64_t h) {
@@ -199,20 +206,17 @@ inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor
   if (out.dtype != DType::kBF16 || x.dtype != DType::kBF16 || w.dtype != DType::kBF16)
     return false;
   if (residual == nullptr || residual->dtype != DType::kBF16) return false;
-  if (h % 8 != 0) return false;
+  if (h % 8 != 0 || h < 1024) return false;
   auto aligned16 = [](const void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) & 0xF) == 0;
   };
   if (!aligned16(out.data) || !aligned16(x.data) || !aligned16(w.data) ||
       !aligned16(residual->data))
     return false;
-  int block = static_cast<int>(h < 1024 ? h : 1024);
-  block = (block / 32) * 32;  // whole warps for the two-stage reduction
-  if (block < 32) return false;
-  RmsNormRowFastKernel<<<rows, block, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(),
-                                              w.Ptr<__nv_bfloat16>(),
-                                              residual->Ptr<__nv_bfloat16>(),
-                                              static_cast<int>(h), args.eps, args.gemma);
+  RmsNormRowFastKernel<<<rows, 1024, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(),
+                                             w.Ptr<__nv_bfloat16>(),
+                                             residual->Ptr<__nv_bfloat16>(),
+                                             static_cast<int>(h), args.eps, args.gemma);
   return true;
 }
 
@@ -240,7 +244,7 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
-  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default ON; '0' = rollback): only
+  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default OFF; '1' = opt-in): only
   // engages for the bf16 add+RMSNorm decode launches; every other case keeps
   // RmsNormRowKernel.
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {

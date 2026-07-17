@@ -12511,3 +12511,80 @@ Closing ledger rows [#L502](parity-ledger.md#L502) (async) + [#L503](parity-ledg
 (RMSNorm rollback). `CLAIM-ASYNC-SCHED-W3` RELEASED. `benchmark_binding=false`, no
 speed credit; binding stays 49/124. Trailers `FOLLOWING_AGENTS_PROTOCOL` +
 `Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]`.
+
+---
+
+## 2026-07-17 — KERNEL-EW-NORM-ACT decode-fast RMSNorm NUMERICS REWORK: real cub reduction; corrected premise; re-flipped default ON (`CLAIM-EW-NORM-ACT-2`)
+
+**The a0013a2 rollback note's premise was WRONG, and the fix is surgical.** The
+2026-07-17 rollback attributed the 27B token-7 divergence to "vLLM's real oracle
+runs an Inductor-Triton rmsnorm, not the csrc kernel this port mirrors." That is
+false: the oracle golden (`tests/parity/goldens/qwen36_logits_27b`, `source:
+pip-vllm:0.24.0`) is generated with `LLM(model, enforce_eager=True, ...)`
+(`tools/parity/dump_qwen36.py:242`) — enforce_eager DISABLES torch.compile, so the
+oracle rmsnorm is the EAGER custom CUDA op, i.e. csrc
+`fused_add_rms_norm_kernel<scalar_t,width=8>` (`csrc/libtorch_stable/
+layernorm_kernels.cu:106-173` @ e24d1b24), launched `block = min(hidden,1024)`==1024
+at decode (`:329`), reducing with `cub::BlockReduce<float,1024>.Reduce(variance,
+CubAddOp{}, blockDim.x)` (`:141`), bf16 `_f16Vec` add + f32 sum_squares, output
+`bf16(f32(res)*inv*w)`.
+
+**Diagnosis (empirical, DGX).** Rebuilt the rolled-back fast kernel: still 234/235
+(token 7 = 271, oracle 198). A first oracle-faithful REWRITE to the vLLM-0.25.0
+Inductor-Triton numerics (f32 residual-square, blocked-layout `[1,8]/32/16`
+butterfly reduction — extracted from the compiled Triton `dgx:/tmp/ind_gemma`, TTGIR
+`#blocked` + PTX, bit-verified: residual 100% bit-identical, output bit-exact vs a
+faithful reproduction, variance within 1 ULP) ALSO gave 234/235. The shipped
+`RmsNormRowKernel` (256-thread tree, bf16 square) gives 198 = oracle. So the
+distinguishing factor is NEITHER bf16-vs-f32 square NOR per-element math — it is the
+BLOCK-REDUCTION ORDER: the 2026-07-16 fast kernel APPROXIMATED `cub::BlockReduce`
+with a hand two-stage warp-shuffle whose reordered f32 sum lands on the other side of
+the near-tie. (The Inductor-Triton reproduction was itself codegen-ambiguous at 1
+ULP — two compiles of the same op differ — a dead end; the gate is the arbiter.)
+
+**Fix.** `RmsNormRowFastKernel` reverted to the csrc per-element math (packed
+`__hadd2` bf16 add, f32 sum_squares of bf16, 1024 threads / 640 active vectors,
+output `bf16(f32(res)*inv*(f32(w)+gemma))`) and swapped the hand reduction for the
+**ACTUAL `cub::BlockReduce<float,1024>.Reduce(v, CubAddOp{}, blockDim.x)`**
+(`#include <cub/cub.cuh>`; CUB is in the CUDA toolkit cccl headers). Guard: bf16
+in/out/res, H%8==0, H>=1024 (so csrc block==1024). `src/vt/cuda/cuda_ops.cu`.
+
+**DGX proof** (evidence `dgx:~/work/vllm.cpp-ewnorm-numerics`, corrected build —
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_FLASH_ATTN=ON
+-DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc`, configure
+log HARD-verified "CUTLASS found … enabling sm120a NVFP4 cutlass GEMM" AND
+"FlashAttention-2 sm_121a prefill/decode: ENABLED"; one flock/series):
+- **`test_qwen27_paged_engine` 235/235 fast-ON** (token 7 = 198; continuation
+  "…Germany is Berlin.\nThe capital of France is Paris, and the") — the tier that
+  caught the a0013a2 regression; rollback `=0` 235/235.
+- **`test_qwen36_paged_engine` 315/315 fast-ON**; rollback `=0` 315/315.
+- `test_qwen27_paged_forward` 17/17+84/84, `test_qwen35_paged_forward` 4/4+8/8, fast-ON.
+- CUDA parity `test_cuda_ops` 132/132 (fast vs oracle-exact shipped: residual
+  BIT-IDENTICAL, output ≤1 bf16 ulp, M∈{1,2,4,8,16,32}×gemma×H=5120). CPU flag test
+  10/10 inverted RED→GREEN to default-ON (`'0'`-off).
+- **Perf (nsys pure-kernel, H=5120): fast(cub) 2.66 µs median / 2.74 µs avg** vs
+  shipped 8.66 µs (**~3.2×**), within the ≲3 µs bar AND vLLM's own 2.37-2.68 µs
+  range; event-timed 4.10 µs == the 2026-07-16 kernel (cub costs nothing —
+  memory-bound).
+- **c16 in-situ A/B (w0 + 3 interleaved pairs, `ab-cub/`): NO WIN — null within
+  noise.** fast r1/r2/r3 803.93/806.40/803.18 tok/s vs legacy 807.16/812.05/808.81:
+  paired **fast −0.60 % tput / +0.34 ms meanTPOT, 3/3 pairs fast-slower**. CONTRADICTS
+  the 2026-07-16 gate4 (+1.1 %): the FAST arm matches (~804 both runs), the LEGACY
+  (shipped-kernel) arm swings ~2 % (793 gate4 vs 809 here), so the delta is dominated
+  by the shipped arm's run-variation — two controlled runs bracket zero ⇒ the c16
+  effect is a NULL, exactly as the spec's Gates section anticipated.
+
+**Decision: `VT_RMSNORM_DECODE_FAST` STAYS DEFAULT OFF (opt-in); NOT re-flipped.** The
+sacrosanct token-exactness precondition now HOLDS with the fast kernel (the rework's
+real achievement — the 234/235 blocker is fixed) and isolated perf is ~3.2×, BUT the
+flip acceptance (measurable TPOT reduction with no throughput regression / a confirmed
+c16 A/B win) is NOT met — this A/B shows no win and a small consistent regression. Per
+the honest-record rule the rework lands OPT-IN: `RmsNormRowFastKernel` is now token-safe
+to enable (`VT_RMSNORM_DECODE_FAST=1`) and is the true vLLM mirror, but the shipped
+`RmsNormRowKernel` stays the default; predicate/flag-test/launcher comments kept
+default-OFF / '1'-opt-in. `KERNEL-EW-NORM-ACT` stays DONE (the norm/act family is
+implemented + oracle-exact via the shipped kernel; the fast kernel is now ALSO
+oracle-exact and opt-in). Ledger #L504; spec 2026-07-17 rework addendum.
+`benchmark_binding=false`, no binding speed credit; the default flip awaits an in-situ
+win (c2 target). Trailers `FOLLOWING_AGENTS_PROTOCOL` + `Assisted-by: Claude
+Code:claude-opus-4-8 [ClaudeCode]`.

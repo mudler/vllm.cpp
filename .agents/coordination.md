@@ -145,6 +145,31 @@ exact grid (fresh vLLM denominators; `--mamba-ssm-cache-dtype float32`; cite
 `702f481`) **has now RUN — new binding `246a23c`: 49/124** (supersedes `3f256ab`'s
 55/124). 35B performance stays excluded until 27B reaches 124/124.
 
+**RMSNorm decode-fast NUMERICS REWORK (2026-07-17, completed follow-up on the DONE
+`KERNEL-EW-NORM-ACT` row; no separate claim — a DONE row is not re-claimable;
+`CLAIM-EW-NORM-ACT-2` used only for worktree coordination, now released).** The
+2026-07-16 `RmsNormRowFastKernel` default-ON flip was rolled back (a0013a2) after
+`test_qwen27_paged_engine` caught a 27B token-7 near-tie flip (234/235). The rollback
+note's premise was WRONG: the oracle golden is generated with `enforce_eager=True`
+(`tools/parity/dump_qwen36.py:242`, pip-vllm:0.24.0), so the oracle rmsnorm is the
+EAGER csrc `cub::BlockReduce<float,1024>` kernel, NOT Inductor-Triton (a bit-verified
+0.25.0-Triton reproduction ALSO gave 234/235 — the premise, not the reproduction, was
+the dead-end). Fix = TRUE 1:1 csrc port using the ACTUAL `cub::BlockReduce` (was a
+hand warp-shuffle approximation). DGX proof `~/work/vllm.cpp-ewnorm-numerics`:
+`test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine` 315/315 fast-ON, both
+rollback arms 235/235+315/315, paged_forward 84/84+8/8, CUDA parity 132/132, perf nsys
+2.66 µs vs shipped 8.66 µs (~3.2×, within vLLM 2.37-2.68 µs). c16 in-situ A/B (w0+3 pairs)
+= NO WIN (fast −0.60% tput / +0.34 ms meanTPOT, 3/3; contradicts gate4's +1.1% — NULL within
+noise). **`VT_RMSNORM_DECODE_FAST` STAYS DEFAULT OFF (opt-in); NOT re-flipped** — the
+token-exactness blocker is FIXED (the achievement) but the flip acceptance (a confirmed c16
+win) is not met; the kernel is now token-safe to enable (`=1`) + the true vLLM mirror, and
+the default flip awaits an in-situ win (c2 target). Recorded in the
+`KERNEL-EW-NORM-ACT` row cell, the [spec addendum](specs/rmsnorm-decode-fast-2026-07-16.md),
+the ledger (#L504), README/BENCHMARKS, and state. Owned files: `src/vt/cuda/cuda_ops.cu`
+(`RmsNormRowFastKernel` + `TryLaunchRmsNormDecodeFast`), `src/vt/cuda/rmsnorm_decode_fast.h`,
+`tests/vt/test_cuda_ops.cpp`, `tests/vt/test_rmsnorm_decode_fast.cpp` — none overlapping
+another active claim; GPU work ran under one `flock /tmp/gpu` per series.
+
 **Decode recurrence perf lever (2026-07-16, completed follow-up on the DONE
 `KERNEL-GDN-PACKED-DECODE` row; no separate claim — a DONE row is not
 re-claimable).** The naive register-resident hand port PROOF-FAILED; Phase-1

@@ -94,90 +94,130 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
 
 // ---------------------------------------------------------------------------
 // Decode-fast rmsnorm variant (VT_RMSNORM_DECODE_FAST). Re-expressed 2026-07-17
-// (KERNEL-EW-NORM-ACT numerics rework, CLAIM-EW-NORM-ACT-2) to be a TRUE 1:1 port
-// of vLLM's csrc fused_add_rms_norm_kernel<bf16,8> — using the ACTUAL
-// cub::BlockReduce<float,1024> block reduction, not a hand-rolled shuffle.
+// (KERNEL-EW-NORM-ACT numerics rework, CLAIM-EW-NORM-ACT-2) to be BIT-IDENTICAL
+// to the shipped RmsNormRowKernel above (the through-stack 235/235 bit-reference
+// that matches vLLM's production greedy stream), not merely ≤1-ulp close.
 //
-// GROUND (corrected premise): the pip-vLLM ORACLE golden
-// (tests/parity/goldens/qwen36_logits_27b, source pip-vllm:0.24.0) was generated
-// with `LLM(..., enforce_eager=True)` (tools/parity/dump_qwen36.py:242) — so the
-// oracle rmsnorm is the EAGER custom CUDA op, NOT the Inductor-Triton kernel the
-// earlier rollback note assumed. That op is
-//   csrc/libtorch_stable/layernorm_kernels.cu:106-173 (fused_add_rms_norm_kernel
-//   <scalar_t, width=8, HasWeight>), launch :310-331 `block = min(hidden,1024)`
-//   (num_tokens<256), reduction `cub::BlockReduce<float,1024>.Reduce(variance,
-//   CubAddOp{}, blockDim.x)`, `_f16Vec` packed bf16 `+=` / f32 `sum_squares` of
-//   csrc/type_convert.cuh @ vLLM pin e24d1b24. Per element (bf16 throughout, the
-//   f32 accum stays f32):
-//     res' = bf16(x) + bf16(res)  [packed __hadd2 == _f16Vec::operator+=]
-//     var  = mean(sum_squares(res')) + eps ; inv = rsqrtf(var)
-//     out  = bf16( (f32(res') * inv) * (f32(w) + gemma) )
-// The 2026-07-16 fast kernel used the SAME per-element math but APPROXIMATED cub
-// with a hand two-stage warp-shuffle reduce, whose reordered f32 sum flipped a 27B
-// greedy near-tie at output token 7 (271 vs oracle 198; 234/235 -> rolled back
-// a0013a2). Swapping in the ACTUAL cub::BlockReduce (BLOCK_REDUCE_WARP_REDUCTIONS)
-// reproduces the oracle's exact reduction ORDER, landing token 7 on 198.
+// WHY BIT-IDENTICAL (not ≤1-ulp): the 27B greedy token 6 is a RAZOR near-tie
+// (198 "\n" prod vs 271 "\n\n" emu; the logit gap is ~zero). The shipped
+// RmsNormRowKernel + GDN cubin = 235/235 (198). The prior fast kernel differed
+// from shipped by ≤1 ulp (residual-add rounding + a different variance reduction
+// ORDER + rsqrtf); accumulated over 64 layers alongside the GDN cubin's own
+// ≤1-ulp perturbation, that tipped the tie to 271 (233/235), forcing the default
+// back OFF (a875397). Making the fast output the SAME BITS as shipped removes the
+// perturbation by construction: fast+cubin ≡ shipped+cubin ≡ 198 always.
 //
-// Scope: bf16-in / bf16-out / bf16-residual, H%8==0, H>=1024 (=> csrc block=1024;
-// the 129 input/post-attn/final residual RMSNorm launches, H=5120 on the 27B /
-// H=2048 on the 35B). Other dtype/residual/small-H keep RmsNormRowKernel. The q/k
-// head norms take no residual => not this path. 16-byte load = 4 packed bf162.
+// The three divergences vs shipped RmsNormRowKernel (cuda_ops.cu:62-93) and the
+// fix that makes each bit-exact:
+//   (1) residual add. shipped:62-79 does v = ResRound<bf16>(f32(x)+f32(res)) — a
+//       f32 add of the two bf16 operands then a SINGLE round to bf16 (double
+//       rounding through f32). The prior fast used __hadd2 (single-round bf16
+//       add), which differs from the shipped double-round on rare carries. Fixed:
+//       __float2bfloat16(f32(x)+f32(res)) reproduces ResRound exactly.
+//   (2) variance sum ORDER. shipped:70-85 uses kBlock=256 threads, per-thread
+//       partial acc = Σ_m sq[tid + 256*m] (increasing m), then the shared-memory
+//       binary tree `for s=128; s>0; s>>=1`. f32 add is non-associative, so the
+//       sum's bits depend on this exact 256-partial + tree structure. The prior
+//       fast used cub::BlockReduce<float,1024> over 1024 threads (a different
+//       thread count AND a different reduction tree) => a different f32 variance.
+//       Fixed: this kernel launches with kBlock(=256) threads and reproduces
+//       shipped's scalar-strided Pass 1 and shared-tree byte-for-byte.
+//   (3) inv. shipped:86 uses `1.0f / sqrtf(...)` (correctly-rounded sqrt+div);
+//       the prior fast used rsqrtf (a ≤2-ulp reciprocal-sqrt approximation).
+//       Fixed: `1.0f / sqrtf(partial[0]/h + eps)` verbatim.
+//
+// The ONLY thing that legitimately differs from shipped — and the whole source of
+// any speedup — is Pass 2 (normalize): out = bf16((f32(res)*inv)*(f32(w)+gemma))
+// is ELEMENT-INDEPENDENT, so vectorizing it with 16-byte (4×bf162) loads/stores
+// changes memory traffic, NOT the arithmetic, and stays bit-identical. Pass 1
+// (the variance) is order-sensitive and is kept byte-for-byte shipped.
+//
+// Scope: bf16-in / bf16-out / bf16-residual, H%8==0, H>=1024 (the 129
+// input/post-attn/final residual RMSNorm launches, H=5120 on the 27B / H=2048 on
+// the 35B). Other dtype/residual/small-H keep RmsNormRowKernel. The q/k head norms
+// take no residual => not this path. 16-byte load = 4 packed bf162.
 struct alignas(16) RmsNormBf16x8 {
   __nv_bfloat162 d[4];
 };
 
-// Match csrc's `CubAddOp{}` (plain f32 add) so the cub reduction ORDER is the
-// oracle's exactly (the functor identity does not change cub's algorithm, but we
-// mirror it verbatim).
-struct CubAddOp {
-  __device__ __forceinline__ float operator()(float a, float b) const { return a + b; }
-};
+// Launch geometry. The variance REDUCTION is byte-for-byte the shipped
+// RmsNormRowKernel's (kBlock=256 partials + tree), but the memory passes run with
+// kFastBlock=1024 threads: at decode the RMSNorm launches only `rows` (= num
+// decode tokens, ~16 at c16) blocks, so the GPU is block-starved and thread-level
+// parallelism per block — not occupancy — hides the memory latency. That
+// thread-count is the ORIGINAL fast kernel's win; this rework keeps it while
+// making the arithmetic bit-identical to shipped. kFastMaxH bounds the f32
+// square-buffer below (guard rejects larger H); 8192 covers the 27B H=5120 / 35B
+// H=2048 decode norms with headroom, at 32 KB static shared (< the 48 KB no-opt-in
+// cap, and free here because only ~16 blocks are resident).
+constexpr int kFastBlock = 1024;
+constexpr int kFastMaxH = 8192;
 
-// One block per row, 1024 threads (== csrc `block=min(hidden,1024)` at decode).
-// Pass 1: vectorized packed bf16 residual add (== _f16Vec::operator+=) + f32
-// sum_squares + store bf16 residual. Reduction: cub::BlockReduce<float,1024> over
-// blockDim.x (the oracle's exact order). Pass 2: reload bf16 residual, vectorized
-// normalize (f32(res)*inv*w -> bf16), gemma folds (1+w). 1:1 with the csrc kernel.
+// One block per row. Pass 1 (vectorized, kFastBlock threads): residual =
+// bf16(f32(x)+f32(res)) [== shipped ResRound], stored bf16, with each element's
+// f32 square written to the shared buffer ssq. Reduction (kBlock=256 threads):
+// p_i = Σ_m ssq[i + 256*m] then the shared-memory binary tree — the EXACT shipped
+// summation ORDER (cuda_ops.cu:70-86), reading the same bf16-rounded squares, so
+// the f32 variance is bit-identical despite the vectorized loads. inv =
+// 1.0f/sqrtf (shipped:86, not rsqrtf). Pass 2 (vectorized): normalize — element-
+// independent, so identical bits at higher bandwidth. Every op matches shipped
+// bit-for-bit; only the memory access WIDTH and thread COUNT differ.
 __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
                                      const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ w,
                                      __nv_bfloat16* __restrict__ residual, int h, float eps,
                                      bool gemma) {
-  const int row = blockIdx.x;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * h;
   const int vh = h / 8;
-  const int64_t base = static_cast<int64_t>(row) * h;
   const RmsNormBf16x8* xv = reinterpret_cast<const RmsNormBf16x8*>(x + base);
   RmsNormBf16x8* rv = reinterpret_cast<RmsNormBf16x8*>(residual + base);
   const RmsNormBf16x8* wv = reinterpret_cast<const RmsNormBf16x8*>(w);
   RmsNormBf16x8* ov = reinterpret_cast<RmsNormBf16x8*>(out + base);
 
-  float variance = 0.0f;
-  for (int idx = threadIdx.x; idx < vh; idx += blockDim.x) {
-    RmsNormBf16x8 t = xv[idx];
-    RmsNormBf16x8 r = rv[idx];
+  __shared__ float ssq[kFastMaxH];   // per-element v^2 (v = the bf16-rounded residual)
+  __shared__ float partial[kBlock];  // 256 partials for shipped's exact tree order
+
+  // Pass 1 — vectorized residual add + store + per-element square into ssq. The
+  // residual add is bf16(f32(x)+f32(res)) (== ResRound<bf16>, shipped:75) and the
+  // square is of that bf16-rounded value (shipped:78), so ssq[j] is byte-for-byte
+  // shipped's v*v term for every element.
+  for (int vi = tid; vi < vh; vi += kFastBlock) {
+    RmsNormBf16x8 t = xv[vi];
+    RmsNormBf16x8 r = rv[vi];
+    RmsNormBf16x8 nr;
 #pragma unroll
-    for (int k = 0; k < 4; k++) t.d[k] = __hadd2(t.d[k], r.d[k]);  // == _f16Vec::operator+=
-#pragma unroll
-    for (int k = 0; k < 4; k++) {  // == _f16Vec::sum_squares (f32 accumulate of bf16)
-      float2 z = __bfloat1622float2(t.d[k]);
-      variance += z.x * z.x + z.y * z.y;
+    for (int k = 0; k < 4; k++) {
+      float2 xf = __bfloat1622float2(t.d[k]);
+      float2 rf = __bfloat1622float2(r.d[k]);
+      nr.d[k] = __floats2bfloat162_rn(xf.x + rf.x, xf.y + rf.y);  // per-lane == __float2bfloat16
+      float2 nf = __bfloat1622float2(nr.d[k]);                    // bf16 value back to f32
+      ssq[vi * 8 + 2 * k] = nf.x * nf.x;
+      ssq[vi * 8 + 2 * k + 1] = nf.y * nf.y;
     }
-    rv[idx] = t;  // residual store (bf16), identical to RmsNormRowKernel's ResRound path
+    rv[vi] = nr;  // residual store (bf16), bit-identical to shipped
   }
+  __syncthreads();  // publish ssq (and residual) before the strided reduction reads them
 
-  // THE oracle reduction: cub::BlockReduce<float,1024> (matches the csrc kernel
-  // bit-for-bit; CUB is in the CUDA toolkit's cccl headers). num_valid = blockDim.x.
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
-  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
-  __shared__ float s_variance;
-  if (threadIdx.x == 0) s_variance = rsqrtf(variance / static_cast<float>(h) + eps);
+  // Reduction — BYTE-FOR-BYTE shipped (cuda_ops.cu:80-86). Threads >=256 idle.
+  if (tid < kBlock) {
+    float acc = 0.0f;
+    for (int j = tid; j < h; j += kBlock) acc += ssq[j];  // p_i = Σ_m ssq[i+256m], increasing m
+    partial[tid] = acc;
+  }
   __syncthreads();
-  const float inv = s_variance;
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(h) + eps);
 
-  for (int idx = threadIdx.x; idx < vh; idx += blockDim.x) {
-    RmsNormBf16x8 r = rv[idx];
-    RmsNormBf16x8 wr = wv[idx];
+  // Pass 2 — vectorized normalize (bit-identical to shipped:87-92; each output
+  // element is (f32(res)*inv)*(f32(w)+gemma) rounded to bf16, independent of the
+  // others). Each thread reloads the residual vector it wrote in Pass 1.
+  for (int vi = tid; vi < vh; vi += kFastBlock) {
+    RmsNormBf16x8 r = rv[vi];
+    RmsNormBf16x8 wr = wv[vi];
     RmsNormBf16x8 o;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
@@ -190,15 +230,17 @@ __global__ void RmsNormRowFastKernel(__nv_bfloat16* __restrict__ out,
       }
       o.d[k] = __floats2bfloat162_rn(rf.x * inv * w0, rf.y * inv * w1);
     }
-    ov[idx] = o;
+    ov[vi] = o;
   }
 }
 
 // Runtime predicate + launch for the decode-fast path. Returns true iff it ran.
-// Mirrors the csrc guard (layernorm_kernels.cu:334-361): bf16 in/out/weight/
-// residual, 16-byte-aligned pointers, H%8==0, and H>=1024 so csrc `block =
-// min(hidden,1024)` == 1024 (making cub::BlockReduce<float,1024> the full-block
-// reduction the oracle runs). Smaller H keeps RmsNormRowKernel.
+// Guard: bf16 in/out/weight/residual, 16-byte-aligned pointers (vectorized loads),
+// H%8==0, 1024<=H<=kFastMaxH (H>=1024 scopes to the big residual RMSNorm launches;
+// H<=kFastMaxH bounds the f32 square-buffer shared array). The launch uses
+// kFastBlock threads for the memory passes, while the reduction reproduces the
+// shipped RmsNormRowKernel's kBlock=256 partial + tree order, so the output is
+// bit-identical. Out-of-scope shapes keep RmsNormRowKernel.
 inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor& x,
                                        const Tensor& w, const RmsNormArgs& args,
                                        Tensor* residual, unsigned rows, int64_t h) {
@@ -206,14 +248,14 @@ inline bool TryLaunchRmsNormDecodeFast(cudaStream_t s, Tensor& out, const Tensor
   if (out.dtype != DType::kBF16 || x.dtype != DType::kBF16 || w.dtype != DType::kBF16)
     return false;
   if (residual == nullptr || residual->dtype != DType::kBF16) return false;
-  if (h % 8 != 0 || h < 1024) return false;
+  if (h % 8 != 0 || h < 1024 || h > kFastMaxH) return false;
   auto aligned16 = [](const void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) & 0xF) == 0;
   };
   if (!aligned16(out.data) || !aligned16(x.data) || !aligned16(w.data) ||
       !aligned16(residual->data))
     return false;
-  RmsNormRowFastKernel<<<rows, 1024, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(),
+  RmsNormRowFastKernel<<<rows, kFastBlock, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(),
                                              w.Ptr<__nv_bfloat16>(),
                                              residual->Ptr<__nv_bfloat16>(),
                                              static_cast<int>(h), args.eps, args.gemma);
@@ -244,9 +286,9 @@ void LaunchRmsNorm(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w
   const int64_t t = x.shape[0], h = x.shape[1];
   if (t == 0 || h == 0) return;
   const unsigned rows = static_cast<unsigned>(t);
-  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default OFF; '1' = opt-in): only
+  // Decode-fast path (VT_RMSNORM_DECODE_FAST, default ON; '0' = rollback): only
   // engages for the bf16 add+RMSNorm decode launches; every other case keeps
-  // RmsNormRowKernel.
+  // RmsNormRowKernel. Output is bit-identical to RmsNormRowKernel by construction.
   if constexpr (std::is_same_v<Tin, __nv_bfloat16>) {
     if (TryLaunchRmsNormDecodeFast(s, out, x, w, args, residual, rows, h)) {
       Check(cudaGetLastError(), "rmsnorm fast launch");

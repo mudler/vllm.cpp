@@ -34,13 +34,17 @@ strict ≥1.0 (even 0.9999 fails), so "52" is a whisker-thin deficit, not a gap:
 c16 throughput 790.95 vs 796.99 (0.9924, −0.76%), c16 mean_tpot 161.5 vs 158.9
 (−1.6%), c32 throughput 1081.5 vs 1083.7 (0.9979, −0.2%).
 
-**Named lever to reclaim ~1% and flip a batch of c2–c8 near-misses:** the reverted
+**Named lever to reclaim ~1% and flip a batch of c2–c8 near-misses:** the
 RMSNorm-fast kernel (its c2 preflight measured **+1.446% tput / −0.887%
 pooled-median TPOT**; c2 throughput here is 0.9816, so RMSNorm alone ≈ halves that
-gap and flips several c2 axes), pending the combination-numerics fix
-(Triton-faithful RMSNorm + cubin — the production-numerics-consistent pair, never
-gate-tested together; it was reverted from the default because RMSNorm-fast +
-cubin together cross a token-7 near-tie vs the production oracle). Then a re-grid.
+gap and flips several c2 axes). Its combination-numerics blocker is now **FIXED and
+the default is flipped ON** (2026-07-17, `CLAIM-EW-NORM-ACT-3`): instead of chasing
+a Triton-faithful match, `RmsNormRowFastKernel` was made BIT-IDENTICAL (0-ulp) to
+the shipped `RmsNormRowKernel` — so `fast+cubin ≡ shipped+cubin ≡ 198` by
+construction (27B 235/235 + 35B 315/315 on the full default set; `test_cuda_ops`
+fast==shipped 0-ulp; isolated 2.41× / in-situ engine-forward 3.68× win preserved).
+The 52/124 binding predates the flip; the next binding grid re-measures the
+production default (async ON + Triton GDN cubin ON + RMSNorm-fast ON).
 
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 
@@ -339,49 +343,32 @@ removes that confound and CONFIRMS the lever: ours `RmsNormRowKernel`
 the ~2.4 ms c2 decode gap). The confound was only in-situ (ours in-situ nsys 15.5
 µs is ~1.84× contention-inflated over the 8.46 µs isolated); the isolated gap is
 real. PORTED test-first as `RmsNormRowFastKernel` (`VT_RMSNORM_DECODE_FAST`,
-**OPT-IN `=1`** — flipped ON after the c2 preflight win, then REVERTED same-day
-2026-07-17 by the binding campaign's engine sanity gate: with the FULL default
-set (async + GDN cubin + RMSNorm-fast) the 27B production stream fails 233/235
-at the documented token-7 near-tie, the combined output exactly matching the
-fixture's `want_emu` pip-vLLM EAGER stream — two individually-token-exact
-kernels land together on the other side of a near-tie vLLM itself decides
-differently between graphed and eager modes; the re-flip awaits the
-combination follow-up, Triton-faithful RMSNorm + cubin), a TRUE 1:1 port of vLLM's
-csrc `fused_add_rms_norm_kernel<bf16,8>` (1024-thread block, 16-byte vectorized
-loads) using the **ACTUAL `cub::BlockReduce<float,1024>`**. History: the
-2026-07-16 kernel APPROXIMATED cub with a hand two-stage warp-shuffle; it was flipped
-default-ON (`696a991`), then **ROLLED BACK** (a0013a2) when `test_qwen27_paged_ENGINE`
-caught fast-ON DIVERGING from the pip-vLLM oracle at output token 7 (**234/235** vs
-235/235). The rollback note WRONGLY blamed an Inductor-Triton mismatch; the oracle
-golden is generated with `enforce_eager=True` (pip-vllm:0.24.0,
-`tools/parity/dump_qwen36.py:242`), so the oracle rmsnorm is the EAGER csrc
-`cub::BlockReduce` kernel, NOT Triton — the hand reduction's reordered f32 sum was
-the culprit. **NUMERICS REWORK (2026-07-17, `CLAIM-EW-NORM-ACT-2`, evidence
-`dgx:~/work/vllm.cpp-ewnorm-numerics`):** swapping in the real `cub::BlockReduce`
-reproduces the oracle's exact reduction order. DGX proof (corrected build): the
-`ENGINE` tier that caught the regression is **235/235 fast-ON** (token 7 = 198) +
-`qwen36_paged_engine` **315/315** fast-ON; both rollback arms 235/235 + 315/315;
-`paged_forward` 84/84 + 8/8; CUDA parity 132/132; **perf nsys pure-kernel 2.66 µs
-median / 2.74 µs avg vs shipped 8.66 µs (~3.2×)**, within vLLM's own 2.37–2.68 µs
-(event-timed 4.10 µs, identical to the 2026-07-16 kernel — cub costs nothing). BUT
-the interleaved c16 in-situ A/B (w0 + 3 pairs, `ab-cub/`) shows **NO WIN**: fast
-−0.60% tput / +0.34 ms meanTPOT, 3/3 pairs fast-slower — contradicting the 2026-07-16
-gate4 (+1.1%). The FAST arm matches (~804 tok/s both runs) but the shipped-kernel
-LEGACY arm swings ~2% (793 gate4 vs 809 here), so the delta is that arm's
-run-variation ⇒ the c16 effect is a NULL within noise (as this section's Gates
-anticipated: "an in-situ null at c16 is plausible … the c2 lane is the target").
-Per the flip acceptance the default initially stayed OFF pending an in-situ win at
-the documented c2 target — and the **2026-07-17 c2 preflight A/B (Phase-0 of the
-authorized binding-grid rerun, `CLAIM-SERVE-GATE-2`) DELIVERED it: DEFAULT NOW ON.**
-One flock, a321d7c hard-verified CUTLASS+FA2 production build, binding c2 corpus,
-interleaved w0-discard + 3 pairs, house pooled per-request-median convention
-(18 requests/arm): pooled-median TPOT fast 101.900 vs legacy 102.812 ms =
-**−0.912 ms (−0.887%)**, paired −1.237/−1.211/−0.843 ms **3/3 fast-faster**; total
-throughput **+1.446%** (167.83 vs 165.43 tok/s), **3/3 pairs fast-higher**; no void
-signature on any leg. Evidence
-`dgx:~/work/vllm.cpp-online-gate/preflight-rmsnorm-c2-a321d7c…/`. Flag test inverted
-RED→GREEN 10/10 (default-ON / '0'-rollback, house convention); the engine token
-gates for fast-ON stand at `e68c518` (235/235 + 315/315). The completed **lost-lanes rescan**
+**DEFAULT ON / `=0`-rollback**). **BIT-SAFETY rework (2026-07-17,
+`CLAIM-EW-NORM-ACT-3`, evidence `dgx:~/work/vllm.cpp-ewnorm-bitsafe`):** the kernel's
+output is now BIT-IDENTICAL (0-ulp) to the shipped `RmsNormRowKernel` — the 235/235
+through-stack bit-reference — by reproducing its exact float op sequence: residual
+add `bf16(f32(x)+f32(res))`, variance in shipped's exact kBlock=256 strided-partial
++ shared-memory-tree ORDER (a 1024-thread vectorized Pass 1 stages each element's
+f32 square to shared memory, then 256 threads run the shipped tree), and
+`inv=1.0f/sqrtf`; only the element-independent normalize pass is vectorized. So
+`fast+cubin ≡ shipped+cubin ≡ 198` BY CONSTRUCTION — removing the ≤1-ulp near-tie
+flip that had forced two prior reverts (a0013a2 234/235; a875397 combination
+233/235 vs `want_emu`). DGX proof (clean `-Werror` build, CUTLASS sm120a NVFP4 +
+FA2 sm_121a hard-verified, one flock): `test_cuda_ops` decode-fast fast==shipped
+**0-ulp BIT-EXACT** (assertion tightened from ≤1-ulp; 132/132), full 432/432;
+production default (unset = fast+cubin+async ON) **`test_qwen27_paged_engine`
+235/235** (token 6 = 198) + **`test_qwen36_paged_engine` 315/315**, both `=0`
+rollback arms 235/235 + 315/315; flag test inverted RED→GREEN default-ON 10/10.
+**Perf — the win SURVIVES bit-identity** (the 1024-thread memory passes keep the
+decode parallelism): isolated nsys **3.55 µs vs shipped 8.58 µs (2.41×)** at
+M=16×H=5120, and in the real 27B engine forward RmsNorm median **4.38 vs 16.13 µs
+(3.68×)**, total RmsNorm GPU time 48.3 vs 55.4 ms — strictly less GPU work with
+identical bits, so it cannot regress in-situ. The perf case was already accepted
+(the predecessor's c2 preflight measured **+1.446% tput / −0.887% pooled-median
+TPOT**, `CLAIM-SERVE-GATE-2`); the revert's sole cause was the combination token
+failure, now fixed, so per the parity-enabler policy the default is flipped ON
+(gated) and the next binding grid re-measures it. `benchmark_binding=false` for this
+flip. The completed **lost-lanes rescan**
 ([spec](../.agents/specs/rescan-lost-lanes-2026-07-16.md)) adds the c2–c8
 angle: RMSNorm's ~129 launches/step are batch-INDEPENDENT, so the per-launch
 gap is a larger fraction of the small c2 mean (total gap ~2.4 ms/step) than of

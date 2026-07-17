@@ -327,3 +327,74 @@ comments updated. The ENGINE token gates for fast-ON are already proven at
 re-derived; a quick 27B engine-gate sanity re-runs on the flipped default before
 the grid. The authorized binding grid runs from this flip SHA with the full
 production-default set: **async ON + Triton GDN decode ON + RMSNorm-fast ON**.
+
+## 2026-07-17 — BIT-SAFETY rework: bit-identical output; DEFAULT FLIPPED ON (`CLAIM-EW-NORM-ACT-3`)
+
+The `CLAIM-SERVE-GATE-2` correction reverted the flip (a875397) because the
+fast+GDN-cubin PAIR failed the 27B production stream 233/235 at the token-6 razor
+near-tie: each kernel was 235/235 alone, but the two kernels' accumulated ≤1-ulp
+perturbations tipped the tie to the `want_emu` (pip-vLLM EAGER) side. The named
+follow-up was a "Triton-faithful RMSNorm + cubin" production-numerics-consistent
+pair. This rework takes a STRONGER and simpler route: make the fast kernel's output
+**BIT-IDENTICAL (0-ulp)** to OUR shipped `RmsNormRowKernel` — itself the 235/235
+through-stack bit-reference matching vLLM's production greedy stream — so the
+near-tie can never be crossed by construction (`fast+cubin ≡ shipped+cubin ≡ 198`),
+independent of any vLLM reduction tree.
+
+### The three divergences vs shipped, and the fix
+
+Grounded in the shipped kernel `src/vt/cuda/cuda_ops.cu:62-93`:
+
+1. **Residual add.** Shipped: `ResRound<bf16>(f32(x)+f32(res))` = a f32 add of the
+   two bf16 operands then a single round to bf16 (double rounding through f32). The
+   prior fast used `__hadd2` (single-round bf16 add), which differs on rare carries.
+   Fixed: `__float2bfloat16(f32(x)+f32(res))` reproduces `ResRound` exactly.
+2. **Variance summation ORDER.** Shipped (`:70-86`): kBlock=256 threads, per-thread
+   partial `p_i = Σ_m sq[i+256m]` (increasing m), then the shared-memory binary tree
+   `for s=128; s>0; s>>=1`. f32 add is non-associative, so the variance's bits depend
+   on this exact 256-partial + tree structure. The prior fast used
+   `cub::BlockReduce<float,1024>` over 1024 threads — a different thread count AND
+   reduction tree ⇒ a different f32 variance. Fixed: a 1024-thread vectorized Pass 1
+   writes each element's f32 square to a shared buffer `ssq[H]`, then kBlock=256
+   threads recompute `p_i = Σ_m ssq[i+256m]` and run shipped's exact tree. The
+   1024-thread memory passes keep decode parallelism (decode launches only ~rows≈16
+   blocks, so thread-count, not occupancy, hides latency; the 32 KB shared buffer is
+   free at that block count) while the reduction is byte-for-byte shipped.
+3. **inv.** Shipped (`:86`): `1.0f/sqrtf(...)` (correctly-rounded). The prior fast
+   used `rsqrtf` (≤2-ulp). Fixed: `1.0f/sqrtf(partial[0]/H + eps)` verbatim.
+
+Only the element-independent normalize pass is vectorized (bit-identical by
+element independence). Guard: bf16 in/out/weight/residual, 16-byte-aligned,
+H%8==0, 1024≤H≤8192 (the last bound sizes the shared square buffer).
+
+### Why the perf win survives bit-identity
+
+The dominant decode cost is thread-level parallelism with few blocks, not the
+reduction. Keeping 1024-thread vectorized memory passes retains most of the win:
+isolated nsys **3.55 µs vs shipped 8.58 µs = 2.41×** at M=16×H=5120 (the prior
+non-bit-identical cub kernel was 2.66 µs; the shared-square staging + 256-thread
+tree costs ~0.9 µs, leaving a large win). In the real 27B engine forward RmsNorm
+median **4.38 vs 16.13 µs (3.68×)**, total RmsNorm GPU time 48.3 vs 55.4 ms. The
+kernel does strictly less GPU work with identical bits ⇒ structural in-situ
+non-regression.
+
+### Gates (DGX `dgx:~/work/vllm.cpp-ewnorm-bitsafe`, clean `-Werror`, CUTLASS+FA2 hard-verified, one flock)
+
+- **Gate 1:** `test_cuda_ops` decode-fast fast==shipped **0-ulp BIT-EXACT** (output
+  AND residual; assertion tightened from ≤1-ulp; 132/132), full `test_cuda_ops`
+  432/432, CPU flag test inverted RED→GREEN default-ON 10/10, tools 164/164,
+  record+doc-checkpoint checkers green, clean full ctest.
+- **Gate 2:** production default (unset) `test_qwen27_paged_engine` **235/235**
+  (token 6 = 198) + `test_qwen36_paged_engine` **315/315**; both `VT_RMSNORM_DECODE_FAST=0`
+  rollback arms 235/235 + 315/315.
+- **Gate 3:** isolated 2.41× + in-situ engine-forward 3.68× (above); the accepted
+  predecessor c2 preflight +1.446% tput / −0.887% TPOT applies (retains ~84% of the
+  per-step saving).
+
+### Decision
+
+The revert's sole cause (combination tokens) is fixed while the accepted perf win
+is retained. Per the parity-enabler policy the `VT_RMSNORM_DECODE_FAST` default is
+**flipped ON** (default-ON / `'0'`-rollback); the next binding grid re-measures the
+production default (async ON + Triton GDN decode ON + RMSNorm-fast ON).
+`benchmark_binding=false` for the flip; `KERNEL-EW-NORM-ACT` stays DONE.

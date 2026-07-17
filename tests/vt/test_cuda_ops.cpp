@@ -254,15 +254,16 @@ TEST_CASE("CUDA rmsnorm fused residual matches CPU and updates residual") {
   }
 }
 
-// VT_RMSNORM_DECODE_FAST (default OFF; '1' opt-in): the vectorized decode kernel
-// (RmsNormRowFastKernel) is a TRUE 1:1 port of vLLM's csrc
-// fused_add_rms_norm_kernel<bf16,8> using the ACTUAL cub::BlockReduce<float,1024>
-// (the reduction the pip-vLLM enforce_eager oracle runs). It must match the
-// rollback RmsNormRowKernel (itself oracle-exact vs the 235/235 golden) at the
-// real 27B decode shape (M x H=5120, bf16, gemma): residual stream BIT-IDENTICAL
-// (both bf16(f32 x + f32 res)), output within one bf16 ulp (cub-1024 vs the
-// 256-thread tree legitimately differ ~1e-6 in the f32 variance). Token-exactness
-// vs the oracle STREAM is the decisive proof and is adjudicated on DGX by
+// VT_RMSNORM_DECODE_FAST: the vectorized decode kernel (RmsNormRowFastKernel) is
+// BIT-IDENTICAL to the shipped RmsNormRowKernel — the through-stack 235/235
+// bit-reference that matches vLLM's production greedy stream. The 2026-07-17
+// bit-safety rework replicates shipped's variance path byte-for-byte (kBlock=256
+// strided Pass 1 + shared-memory tree + 1.0f/sqrtf; residual add
+// bf16(f32(x)+f32(res))) and only vectorizes Pass 2 (normalize), which is
+// element-independent. So at the real 27B decode shape (M x H=5120, bf16, gemma)
+// BOTH the residual stream AND the output are BIT-EXACT (0-ulp) vs shipped. This
+// bit-identity guarantees fast+cubin ≡ shipped+cubin on the razor near-tie
+// (token 6 = 198); token-exactness vs the oracle STREAM is adjudicated on DGX by
 // test_qwen27_paged_engine (235/235) + test_qwen36_paged_engine (315/315).
 // Runs both arms with EXPLICIT env values ("1" fast / "0" rollback; the launcher
 // reads getenv per call) so the comparison is default-independent. Skips w/o CUDA.
@@ -296,11 +297,15 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   run(/*fast=*/true, out_fast, res_fast);
   ::unsetenv("VT_RMSNORM_DECODE_FAST");
 
-  // Output: one bf16 ulp (rtol 8e-3 >= 2^-7) — cub-1024 vs the 256-thread tree can
-  // flip the final bf16 rounding by one ulp.
-  CheckClose(Unpack(out_fast, DType::kBF16), Unpack(out_ref, DType::kBF16), 4e-3f, 8e-3f);
-  // Residual stream: the add is packed bf16 __hadd2 == the shipped ResRound bf16
-  // round on both sides, so the updated residual is bit-identical.
+  // Output: BIT-EXACT (0-ulp). The 2026-07-17 bit-safety rework makes
+  // RmsNormRowFastKernel's variance reduction (kBlock-thread strided Pass 1 +
+  // shared-memory tree) and inv (1.0f/sqrtf) byte-for-byte the shipped
+  // RmsNormRowKernel's; Pass 2 (normalize) is only vectorized, which is
+  // element-independent => identical bits. So fast==shipped exactly, guaranteeing
+  // fast+cubin ≡ shipped+cubin on the 27B greedy near-tie (token 6 = 198).
+  CheckClose(Unpack(out_fast, DType::kBF16), Unpack(out_ref, DType::kBF16), 0.0f, 0.0f);
+  // Residual stream: the add is bf16(f32(x)+f32(res)) == the shipped ResRound on
+  // both sides, so the updated residual is bit-identical.
   CheckClose(Unpack(res_fast, DType::kBF16), Unpack(res_ref, DType::kBF16), 0.0f, 0.0f);
 }
 

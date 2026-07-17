@@ -191,6 +191,12 @@ target_include_directories(test_fp4_quant_fast PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # src/vt/cuda/cuda_ops.cu (RmsNormRowFastKernel).
 vllm_cpp_add_test(test_rmsnorm_decode_fast vt/test_rmsnorm_decode_fast.cpp)
 target_include_directories(test_rmsnorm_decode_fast PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the GDN gated-RMSNorm decode kernel-efficiency A/B flag
+# (VT_RMSNORM_GATED_FAST). Reaches the internal header under src/ (not public
+# API); the bit-identical fast kernel it gates is CUDA-only and lives in
+# src/vt/cuda/cuda_gdn.cu (RmsNormGatedRowFastKernel).
+vllm_cpp_add_test(test_rmsnorm_gated_fast vt/test_rmsnorm_gated_fast.cpp)
+target_include_directories(test_rmsnorm_gated_fast PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).

@@ -33,6 +33,7 @@
 #include "vt/cuda/cuda_gdn_internal.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
+#include "vt/cuda/rmsnorm_gated_fast.h"
 #include "vt/cuda/tile/cp_async.cuh"
 #include "vt/cuda/tile/tma_pipeline.cuh"
 #include "vt/ops.h"
@@ -875,6 +876,99 @@ __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Decode-fast gated-RMSNorm variant (VT_RMSNORM_GATED_FAST). BIT-IDENTICAL (0-ulp)
+// to the shipped RmsNormGatedRowKernel above for the bf16 gated-norm decode path
+// (d==128), mirroring the RMSNorm decode-fast bit-safety technique (cuda_ops.cu
+// RmsNormRowFastKernel, 348d12d).
+//
+// WHY BIT-IDENTICAL (not <=1-ulp): the gated norm feeds the SAME 27B forward as the
+// fast plain-RMSNorm + GDN decode cubin, all converging on the greedy RAZOR near-tie
+// at token 6 (198 prod vs 271 emu). Per the a875397 lesson a <=1-ulp-close kernel can
+// accumulate over the layers and tip that tie, failing the production stream. Making
+// the fast gated output the SAME BITS as shipped removes the perturbation by
+// construction: {fast-RMSNorm + fast-gated + cubin} logits == the passing baseline.
+//
+// The shape is [T*Hv, Dv] with Dv==128 (27B Hv=48, 35B Hv=32; z gate is a padded-row
+// rank-3 [T,Hv,Dv] view or a contiguous rank-2 view — same gate_group/gate_outer
+// addressing as shipped). Unlike the plain RMSNorm decode-fast (block-starved, ~16
+// rows => 1024 threads to hide latency), the gated norm launches T*Hv (~512-768 at
+// c16) blocks and is NOT block-starved: the shipped kernel's inefficiency is that it
+// launches kBlock=256 threads for a 128-element row, so the upper half of EVERY block
+// is idle in both passes, and it reloads x in the normalize pass. This kernel fixes
+// both: 128 threads (one per element, no idle half => 2x the occupancy headroom) and
+// x cached in a register (loaded once).
+//
+// BIT-IDENTITY, term by term vs shipped RmsNormGatedRowKernel:
+//   (1) variance ORDER. shipped: 256 threads, per-thread acc = Sum_m sq[tid+256m];
+//       for d==128 that is a SINGLE term sq[tid] for tid<128 and 0 for tid>=128,
+//       then the shared-tree `for s=128; s>0; s>>=1`. Here 128 threads set
+//       partial[tid]=sq[tid] and the tree runs from s=64. shipped's extra s=128 step
+//       only does partial[i] += partial[i+128] where partial[128..255] are provably
+//       0, so omitting it is byte-for-byte identical; the remaining s=64..1 pairing
+//       is the same. f32(bf16 x)^2 is the same squared value on both sides.
+//   (2) inv. shipped: `1.0f / sqrtf(partial[0]/d + eps)` (correctly-rounded sqrt+div),
+//       reproduced verbatim (NOT rsqrtf).
+//   (3) normalize + act. shipped: `Load(xrow,j)*inv*Load(w,j)*act` == ((x*inv)*w)*act,
+//       act = sigmoid_gate ? 1/(1+exp(-z)) : Silu(z)=z/(1+exp(-z)); reproduced with
+//       the same left-to-right multiply order, same act, same __float2bfloat16 store.
+// Only the launch geometry (128 vs 256 threads) and the single register-cached x load
+// differ; the arithmetic is identical.
+//
+// Scope: bf16 in/out/gate/weight, d==128 (the only production gated-norm shape). Other
+// dtype/shape keep RmsNormGatedRowKernel.
+constexpr int kGatedFastBlock = 128;   // one thread per Dv element (Dv==128)
+
+__global__ void RmsNormGatedRowFastKernel(__nv_bfloat16* __restrict__ out,
+                                          const __nv_bfloat16* __restrict__ x,
+                                          const __nv_bfloat16* __restrict__ gate,
+                                          const __nv_bfloat16* __restrict__ w, int64_t gate_group,
+                                          int64_t gate_outer, float eps, bool sigmoid_gate) {
+  constexpr int d = kGatedFastBlock;  // 128
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t row = blockIdx.x;
+  const __nv_bfloat16* xrow = x + row * d;
+  const __nv_bfloat16* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
+  __nv_bfloat16* orow = out + row * d;
+
+  __shared__ float partial[kGatedFastBlock];
+  // Load x ONCE, cache in a register (shipped reloads it in the normalize pass).
+  const float xf = __bfloat162float(xrow[tid]);
+  partial[tid] = xf * xf;  // f32(bf16 x)^2 == shipped's per-element variance term
+  __syncthreads();
+  // shared-memory binary tree from s=64 — reproduces shipped's kBlock=256 tree for
+  // d==128 (its s=128 step only adds the provably-zero partials[128..255]).
+  for (int s = kGatedFastBlock / 2; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(d) + eps);  // NOT rsqrtf
+  const float z = __bfloat162float(zrow[tid]);
+  const float act = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : z / (1.0f + expf(-z));  // Silu
+  const float wf = __bfloat162float(w[tid]);
+  orow[tid] = __float2bfloat16(xf * inv * wf * act);  // ((x*inv)*w)*act, shipped order
+}
+
+// Runtime predicate + launch for the gated decode-fast path. Returns true iff it ran.
+// Guard: bf16 in/out/gate/weight and d==128 (the GDN Dv used by both gate models);
+// out-of-scope shapes keep RmsNormGatedRowKernel. The launch uses kGatedFastBlock
+// (=128) threads and reproduces shipped's reduction ORDER, so the output is
+// bit-identical.
+inline bool TryLaunchRmsNormGatedFast(cudaStream_t s, Tensor& out, const Tensor& x,
+                                      const Tensor& gate, const Tensor& w,
+                                      const RmsNormGatedArgs& args, int64_t d, int64_t gate_group,
+                                      int64_t gate_outer, unsigned grid) {
+  if (!RmsNormGatedFastFlagIsOn(std::getenv("VT_RMSNORM_GATED_FAST"))) return false;
+  if (d != kGatedFastBlock) return false;
+  if (out.dtype != DType::kBF16 || x.dtype != DType::kBF16 || gate.dtype != DType::kBF16 ||
+      w.dtype != DType::kBF16)
+    return false;
+  RmsNormGatedRowFastKernel<<<grid, kGatedFastBlock, 0, s>>>(
+      out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(),
+      w.Ptr<__nv_bfloat16>(), gate_group, gate_outer, args.eps, args.sigmoid_gate);
+  return true;
+}
+
 void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                             const Tensor& w, const RmsNormGatedArgs& args) {
   VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
@@ -890,6 +984,14 @@ void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor
   const int64_t gate_outer = gate.stride[0];
   cudaStream_t s = AsStream(q);
   const unsigned grid = static_cast<unsigned>(t);
+  // Gated decode-fast path (VT_RMSNORM_GATED_FAST, default ON; '0' = rollback): only
+  // engages for the bf16 d==128 gated-norm decode launches; every other case keeps
+  // RmsNormGatedRowKernel. Output is bit-identical to RmsNormGatedRowKernel by
+  // construction.
+  if (TryLaunchRmsNormGatedFast(s, out, x, gate, w, args, d, gate_group, gate_outer, grid)) {
+    Check(cudaGetLastError(), "rmsnorm_gated fast launch");
+    return;
+  }
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
       RmsNormGatedRowKernel<float, float><<<grid, kBlock, 0, s>>>(

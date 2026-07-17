@@ -43,8 +43,15 @@ a Triton-faithful match, `RmsNormRowFastKernel` was made BIT-IDENTICAL (0-ulp) t
 the shipped `RmsNormRowKernel` — so `fast+cubin ≡ shipped+cubin ≡ 198` by
 construction (27B 235/235 + 35B 315/315 on the full default set; `test_cuda_ops`
 fast==shipped 0-ulp; isolated 2.41× / in-situ engine-forward 3.68× win preserved).
-The 52/124 binding predates the flip; the next binding grid re-measures the
-production default (async ON + Triton GDN cubin ON + RMSNorm-fast ON).
+A sibling batch-independent glue lever landed the SAME bit-identical way
+(2026-07-17, `CLAIM-EW-NORM-GATED-1`): the **GDN gated RMSNorm**
+(`VT_RMSNORM_GATED_FAST`, the `+0.40 ms/step` gated-norm glue term the c2/c8
+attribution measured vs vLLM's fused gated norm) now has a 0-ulp
+`RmsNormGatedRowFastKernel` — full default set 27B 235/235 + 35B 315/315,
+`test_ops_gdn` gated fast==shipped 0-ulp (140/140), **isolated nsys 2.04× at c16**
+(rows=768 3.29/6.70 µs; 1.38× c2, 1.31× c1) — also flipped ON. The 52/124 binding
+predates both flips; the next binding grid re-measures the production default
+(async ON + Triton GDN cubin ON + RMSNorm-fast ON + gated-fast ON).
 
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 

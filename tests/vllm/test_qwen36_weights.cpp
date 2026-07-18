@@ -19,7 +19,10 @@
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vt/backend.h"
 
 namespace fs = std::filesystem;
 
@@ -255,4 +258,127 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
     REQUIRE_FALSE(gdn.gdn.in_proj_qkv.Empty());
     REQUIRE_FALSE(gdn.gdn.in_proj_z.Empty());
   }
+}
+
+// --- Marlin host-weight residency (the 35B ~16.9 GiB peak-PSS lever) ----------
+// After BuildMoeMarlinResident builds the device-resident Marlin repacked
+// experts, the per-expert fp4 HOST mirror (LoadNvfp4Raw's MakeOwned copies in
+// expert_*_fp4[e].{packed,scale}.bytes) is dead weight and is returned to the
+// OS via OwnedTensor::ReleaseHost(). These tests pin (1) the release MECHANISM
+// (CPU, always runs) and (2) the load-path INVARIANT through the public
+// PrepareMarlinResident hook (DGX): freed when the Marlin resident is the
+// committed path, RETAINED when the VT_NVFP4_MARLIN=0 wmma fallback
+// (MoeBlockFusedCuda) will re-read them.
+
+TEST_CASE("OwnedTensor::ReleaseHost frees the host buffer AND its capacity") {
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kI8;
+  t.rank = 2;
+  t.shape[0] = 64;
+  t.shape[1] = 32;
+  t.bytes.resize(64 * 32, 0x5A);
+  REQUIRE_FALSE(t.Empty());
+  REQUIRE(t.bytes.size() == 64u * 32u);
+
+  t.ReleaseHost();
+
+  CHECK(t.Empty());
+  CHECK(t.bytes.empty());
+  // swap-with-empty (not clear()) must actually deallocate the capacity.
+  CHECK(t.bytes.capacity() == 0u);
+  // Shape/dtype metadata is retained (only the host buffer is reclaimed).
+  CHECK(t.rank == 2);
+  CHECK(t.shape[0] == 64);
+}
+
+namespace {
+// The Marlin runtime gate (MarlinMoeEnabled()) caches VT_NVFP4_MARLIN on first
+// use, so it cannot be flipped mid-process; the effective gate equals the LAUNCH
+// env. Key the assertion on that so both branches are deterministic per launch:
+// a default run exercises RELEASE, a `VT_NVFP4_MARLIN=0` run exercises RETENTION.
+[[maybe_unused]] bool MarlinGateOffAtLaunch() {  // used only in VT_MARLIN_NVFP4 builds
+  const char* e = std::getenv("VT_NVFP4_MARLIN");
+  return e != nullptr && e[0] == '0';
+}
+
+bool WeightsTestHasCuda() {
+  try {
+    vt::GetBackend(vt::DeviceType::kCUDA);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+}  // namespace
+
+TEST_CASE(
+    "PrepareMarlinResident residency: routed expert host bytes freed under "
+    "Marlin, retained under the wmma fallback") {
+  const std::string shard1_path = FindShard1();
+  if (shard1_path.empty()) {
+    MESSAGE("SKIP: nvidia/Qwen3.6-35B-A3B-NVFP4 shard 1 not present");
+    return;
+  }
+  if (!WeightsTestHasCuda()) {
+    MESSAGE("SKIP: no CUDA device (this asserts the device-resident load path)");
+    return;
+  }
+#ifndef VT_MARLIN_NVFP4
+  MESSAGE("SKIP: built without VT_MARLIN_NVFP4");
+  return;
+#else
+  const vllm::SafetensorsFile shard = vllm::SafetensorsFile::Open(shard1_path);
+  const vllm::TensorResolver get =
+      [&shard](const std::string& name) -> const vllm::StTensor& {
+    return shard.Get(name);
+  };
+  const int64_t kExperts = 4;
+
+  vllm::Qwen3_5MoeWeights weights;
+  weights.layers.push_back(
+      vllm::LoadQwen3_5MoeLayer(get, "linear_attention", 0, kExperts));
+  const vllm::MoeBlockWeights& moe = weights.layers[0].moe;
+
+  // A minimal config sufficient for BuildMoeMarlinResident (E / H=K / I=N only;
+  // shapes read from the real down projection [N=H, K=I]).
+  vllm::HfConfig cfg;
+  cfg.num_experts = kExperts;
+  cfg.hidden_size = moe.expert_down_fp4[0].n;          // H
+  cfg.moe_intermediate_size = moe.expert_down_fp4[0].k;  // I
+  cfg.num_experts_per_tok = 8;  // unused by the repack; 35B value for realism
+
+  // Precondition: the raw fp4 host mirror is resident straight after load.
+  REQUIRE(moe.expert_gate_fp4.size() == static_cast<size_t>(kExperts));
+  REQUIRE_FALSE(moe.expert_gate_fp4[0].packed.bytes.empty());
+  REQUIRE_FALSE(moe.expert_down_fp4[0].scale.bytes.empty());
+
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue q = gpu.CreateQueue();
+  vllm::Qwen3_5Model::PrepareMarlinResident(weights, cfg, q);
+  gpu.DestroyQueue(q);
+
+  if (!MarlinGateOffAtLaunch()) {
+    // Marlin resident is the committed compute path → every routed expert's
+    // packed+scale host buffer is returned (the 35B peak-PSS lever).
+    for (int64_t e = 0; e < kExperts; ++e) {
+      const size_t se = static_cast<size_t>(e);
+      CHECK(moe.expert_gate_fp4[se].packed.bytes.empty());
+      CHECK(moe.expert_gate_fp4[se].scale.bytes.empty());
+      CHECK(moe.expert_up_fp4[se].packed.bytes.empty());
+      CHECK(moe.expert_up_fp4[se].scale.bytes.empty());
+      CHECK(moe.expert_down_fp4[se].packed.bytes.empty());
+      CHECK(moe.expert_down_fp4[se].scale.bytes.empty());
+    }
+  } else {
+    // VT_NVFP4_MARLIN=0: PrepareMarlinResident is a no-op and the wmma fallback
+    // (MoeBlockFusedCuda) re-reads these host bytes via ResidentNvfp4 on every
+    // first touch, so the guard MUST retain them.
+    for (int64_t e = 0; e < kExperts; ++e) {
+      const size_t se = static_cast<size_t>(e);
+      CHECK_FALSE(moe.expert_gate_fp4[se].packed.bytes.empty());
+      CHECK_FALSE(moe.expert_up_fp4[se].packed.bytes.empty());
+      CHECK_FALSE(moe.expert_down_fp4[se].scale.bytes.empty());
+    }
+  }
+#endif  // VT_MARLIN_NVFP4
 }

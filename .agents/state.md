@@ -13040,3 +13040,59 @@ Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/69f2717…/summary-35` (ratio
 ## 2026-07-18 — Platform seam DGX-CONFIRMED (`cea6829`); BACKEND-PLATFORM item-1 extraction complete
 - The Platform seam (54d6569) + the CUDA -Werror build fix (cea6829, GCC13 dangling-pointer FP in CudaPlatform registrar — the extraction agent gated CPU-only and missed it; lesson in [[incremental-build-masks-werror]]) is DGX-confirmed: production build CUDA -Werror-clean (CUTLASS sm120a + FA2 verified), `test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine` 315/315 token-exact — behavior-preserving as designed.
 - Item-1 (Platform seam extraction) DONE: next-GPU memory model = 1 additive platforms/<gpu>.cpp vs ~37 conditionals. Follow-on extensibility items under BACKEND-PLATFORM: item 2 (residency_policy() consumption — fold the qwen3_5/model_registry residency behind the capability), item 4 (attn-backend registry filling get_attn_backend_priority()), item 5 (model self-registration + qwen3_5 per-arch TU split). CLAIM-BACKEND-PLATFORM-1 stays for the follow-ons.
+
+## 2026-07-18 — 35B MoE Marlin host-free: return the ~16.9 GiB routed-expert host mirror (`ENG-MOE-HOSTFREE`, `CLAIM-MEM35-HOSTFREE`)
+
+Closes the 35B host double-store called out in the 2026-07-18 binding (memory
+0.63×, ours peak PSS 21.2 vs vLLM 13.3 GB). Root cause: `LoadNvfp4Raw` keeps a
+host `OwnedTensor` copy of every routed expert's packed fp4 codes + fp8 scales
+(`qwen3_5_weights.cpp:222-231`, retained in `m.expert_*_fp4`), and
+`BuildMoeMarlinResident` freed only the DEVICE transients (`d_packed/d_scale`),
+never the host `.bytes` → ~16.9 GiB kept resident forever after the device Marlin
+resident is built.
+
+**Fix** (`qwen3_5.cpp:3743-3781` host-free region + `OwnedTensor::ReleaseHost`
+`qwen3_5_weights.{h,cpp}`): after the repack + `Synchronize`, free each routed
+expert's `.packed`/`.scale` host bytes. GUARD: gated on `MarlinMoeEnabled()` — the
+`VT_NVFP4_MARLIN=0` wmma fallback (`MoeBlockFusedCuda`) re-reads these host bytes
+via `ResidentNvfp4`, and `MarlinMoeEnabled()` is a process-static const that is
+TRUE by construction here (reached only from `MoeBlockFusedMarlinCuda` /
+`PrepareMarlinResident`, both gated on it), so the fallback can never run in the
+same process. `VT_MOE_HOST_FREE=0` same-binary rollback.
+
+**Page-return was the non-obvious half.** The logical `std::vector().swap()` did
+NOT drop RSS/PSS (measured: 35B serving PSS stayed 20.17 GiB) — glibc raises its
+dynamic mmap threshold as large blocks are freed, so the ~0.5 MB per-expert
+allocations sit in the sbrk arena where `free()` only returns them to the
+free-list. `ReleaseHost` therefore `madvise(MADV_DONTNEED)`s the buffer's interior
+pages before the swap (same idiom as the `LOAD-SAFETENSORS` windowed release,
+`safetensors_reader.cpp:317`). WITH madvise: 35B STEADY serving PSS **20.17 →
+3.53 GiB** (−16.6 GiB; hits the 4-5 GB target, beats vLLM's 13.3).
+
+**Gates (DGX, `dgx:~/work/mem35-hostfree`, one flock series; CUDA build 0 warn):**
+35B STEADY serving PSS 3.53 GiB (sampler `sample_process_memory.py`); token-exact
+`test_qwen36_paged_engine` **315/315** + `test_qwen27_paged_engine` **235/235**
+(device resident is the compute path → token-neutral); c2 serving smoke clean
+(valid completions, no use-after-free of the freed host bytes); compute-sanitizer
+memcheck **0 errors**; load-path test `test_qwen36_weights` release 27/27 +
+`VT_NVFP4_MARLIN=0` retention 15/15 + `ReleaseHost` unit 7/7. CPU: clean -Werror
+build (0 warn), full ctest 122/122 (shard-absent = CI-equivalent), tools 164/164.
+
+**Whole-window PEAK caveat (honest).** The grid sampler's `peak_pss` (max over the
+whole window, incl. load) stays ~19.8 GiB: ALL routed-expert host copies are
+allocated during `LoadQwen3_5Moe` and coexist until `PrepareMarlinResident`
+(load-prepare) frees them, so the load-phase coexistence sets the peak. The
+STEADY serving footprint — the "kept resident forever" mirror the root cause named
+— is what drops to 3.53. Moving the PEAK below vLLM needs the load-time streaming
+interleave (upload+repack+free per expert during load; `ENG-EXPERT-STREAM` /
+direct-to-device streaming), out of this row's scope. This row is the necessary,
+validated half. 27B PSS is dominated by the separate `LOAD-SAFETENSORS` 22.9 GiB
+mirror (its experts are true-W4A4, not on this Marlin resident), so it is
+unaffected here.
+
+**Item-2 link.** This realizes `Platform::residency_policy()
+.release_host_weights_after_upload` behavior for the dominant host consumer.
+`CudaPlatform` still advertises the flag `false` and owns the platform-flag wiring
+under `BACKEND-PLATFORM`/`CLAIM-BACKEND-PLATFORM-1` (not touched here, per
+ownership); the direct free is gated on `MarlinMoeEnabled()` and the item-2 link
+is recorded in the spec. Spec: `.agents/specs/moe-marlin-host-free.md`.

@@ -3731,6 +3731,37 @@ void BuildMoeMarlinResident(Dev d, const MoeBlockWeights& w, const HfConfig& cfg
     d.b.Free(tmp_s);
   }
 
+  // The device Marlin resident (mr.w_*/s_*/g_*) is now the committed compute path
+  // for EVERY forward step. Free the per-expert fp4 device transients used only
+  // for the repack, AND — the decisive 35B host-memory lever — the ~16.9 GiB
+  // HOST mirror of the routed experts' packed fp4 codes + fp8 group scales
+  // (LoadNvfp4Raw's MakeOwned+memcpy, retained in expert_*_fp4[e].{packed,scale}
+  // .bytes). On GB10 the host .bytes and the device d_packed are DISTINCT
+  // allocations (ResidentNvfp4 Alloc+Copy), so once repacked into the Marlin
+  // resident the host copies are dead weight (they inflated peak PSS ~21GB vs
+  // vLLM 13.3GB). Returning them realizes
+  // residency_policy().release_host_weights_after_upload (BACKEND-PLATFORM
+  // item 2) for the dominant host consumer; see
+  // .agents/specs/moe-marlin-host-free.md.
+  //
+  // GUARD: the VT_NVFP4_MARLIN=0 wmma fallback (MoeBlockFusedCuda) re-reads these
+  // host bytes via ResidentNvfp4. Freeing is safe iff that path can never run in
+  // this process. MarlinMoeEnabled() is a process-static const and is TRUE here
+  // by construction (BuildMoeMarlinResident is reached only from
+  // MoeBlockFusedMarlinCuda, itself gated on MarlinMoeEnabled()); the explicit
+  // re-check enforces the invariant and gates the host free on the Marlin
+  // resident being the committed path (never the shared-expert bytes, which the
+  // forward still reads every step).
+  // Same-binary A/B rollback (default ON): VT_MOE_HOST_FREE=0 retains the host
+  // copies on the Marlin compute path, isolating exactly the host-free effect
+  // for a peak-PSS A/B without changing the device compute (unlike flipping
+  // VT_NVFP4_MARLIN, which also swaps the GEMM path). Process-static like the
+  // Marlin gate.
+  static const bool host_free_on = [] {
+    const char* e = std::getenv("VT_MOE_HOST_FREE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const bool release_host = MarlinMoeEnabled() && host_free_on;
   for (int e = 0; e < E; ++e) {
     const size_t se = static_cast<size_t>(e);
     w.expert_gate_fp4[se].d_packed.reset();
@@ -3739,6 +3770,14 @@ void BuildMoeMarlinResident(Dev d, const MoeBlockWeights& w, const HfConfig& cfg
     w.expert_up_fp4[se].d_scale.reset();
     w.expert_down_fp4[se].d_packed.reset();
     w.expert_down_fp4[se].d_scale.reset();
+    if (release_host) {
+      w.expert_gate_fp4[se].packed.ReleaseHost();
+      w.expert_gate_fp4[se].scale.ReleaseHost();
+      w.expert_up_fp4[se].packed.ReleaseHost();
+      w.expert_up_fp4[se].scale.ReleaseHost();
+      w.expert_down_fp4[se].packed.ReleaseHost();
+      w.expert_down_fp4[se].scale.ReleaseHost();
+    }
   }
   mr.ready = true;
 }

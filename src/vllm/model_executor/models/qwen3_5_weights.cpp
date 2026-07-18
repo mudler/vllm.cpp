@@ -3,11 +3,17 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/dtype.h"
@@ -19,6 +25,40 @@ int64_t OwnedTensor::Numel() const {
   int64_t n = 1;
   for (int i = 0; i < rank; ++i) n *= shape[i];
   return n;
+}
+
+void OwnedTensor::ReleaseHost() const {
+  // Free the host mirror once the device-resident copy is authoritative
+  // (residency_policy().release_host_weights_after_upload; BACKEND-PLATFORM
+  // item 2). Logically const — only the dead host buffer is reclaimed — so a
+  // narrow const_cast, consistent with the mutable lazy-device-residency design.
+  auto& self = *const_cast<OwnedTensor*>(this);
+#if defined(__unix__) || defined(__APPLE__)
+  // RETURN THE PHYSICAL PAGES TO THE OS NOW. std::vector's free() alone does not:
+  // glibc raises its dynamic mmap threshold as large blocks are freed, so the
+  // ~0.5 MB per-expert fp4 allocations end up served from the sbrk arena, where
+  // free() only returns them to the free-list — RSS/PSS stay resident (measured:
+  // the 35B serving PSS did NOT drop from the logical swap alone). madvise(
+  // MADV_DONTNEED) drops the resident anonymous pages immediately (the bytes are
+  // dead — the device Marlin resident is authoritative; a stray later read would
+  // fault fresh zero pages, but nothing reads a released host weight). Interior
+  // whole pages only, so the free()-metadata boundary words are untouched. This
+  // mirrors the LOAD-SAFETENSORS windowed release (safetensors_reader.cpp:317).
+  if (!self.bytes.empty()) {
+    const long ps_l = ::sysconf(_SC_PAGESIZE);
+    const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+    const auto begin = reinterpret_cast<uintptr_t>(self.bytes.data());
+    const uintptr_t end = begin + self.bytes.size();
+    const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+    const uintptr_t page_end = end & ~(ps - 1);
+    if (page_end > page_begin) {
+      ::madvise(reinterpret_cast<void*>(page_begin),
+                static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+    }
+  }
+#endif
+  // swap-with-empty forces the vector to deallocate its capacity.
+  std::vector<uint8_t>().swap(self.bytes);
 }
 
 vt::Tensor OwnedTensor::View() const {

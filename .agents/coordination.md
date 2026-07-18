@@ -223,6 +223,7 @@ default 235/235, 27B `VT_GDN_PACKED_DECODE=0` rollback 235/235, 35B 2 cases
 capture/replay-mode scope remains). `benchmark_binding=false`, no speed credit —
 payoff measured by the c2/c8 probe + the next authorized exact grid. Rescan §1
 items a-runner/b stay with the async/GDN `runner.cpp` owners.
+| `CLAIM-MEM35-HOSTFREE` | `ENG-MOE-HOSTFREE` | mem35 host-free agent (Opus 4.8) | `dgx:~/work/mem35-hostfree` (`source` + `build-cpu` + `build-cuda`; evidence `mem/`, `gpu-series3.log`) | worktree `agent-adaf49c4fc639d5ab` on `main` | `qwen3_5.cpp` BuildMoeMarlinResident host-free region ONLY (3743-3781) + `qwen3_5_weights.{h,cpp}` `OwnedTensor::ReleaseHost` + `tests/vllm/test_qwen36_weights.cpp` + spec/matrix/ledger/README/BENCHMARKS. Did NOT touch the sibling's MoE memset lines / `cuda_moe.cu` / `cuda_marlin_repack.cu` or the `BACKEND-PLATFORM`-owned `cuda.cpp` residency flag | `ACTIVE` | 2026-07-18 (LANDED + GATED: free the ~16.9 GiB routed-expert fp4 host mirror after the device Marlin resident is built; `madvise(MADV_DONTNEED)` returns the pages; 35B STEADY serving PSS 20.17→**3.53 GiB** clean A/B, guarded to the Marlin path, token-neutral 315/315+235/235, memcheck clean. Row stays `ACTIVE` because the memory FRONT is not closed — the whole-window PEAK (load-phase coexistence) remains, needing the load-time streaming interleave (`ENG-EXPERT-STREAM`). Item-2 residency-policy link recorded; flag left to `CLAIM-BACKEND-PLATFORM-1`) |
 
 ## Handoff queue
 

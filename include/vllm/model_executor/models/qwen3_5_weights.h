@@ -53,6 +53,17 @@ struct OwnedTensor {
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
 
+  // Return the host byte buffer to the OS once an authoritative device-resident
+  // copy exists — the platform residency behavior
+  // `residency_policy().release_host_weights_after_upload`
+  // (platforms/interface.h; BACKEND-PLATFORM item 2). Logically const: the
+  // tensor's VALUE is unchanged, only the now-dead host mirror is freed. This
+  // mirrors the existing mutable lazy-device-upload residency design (d_dev/
+  // d_packed above are populated on a const weight). swap-with-empty (not
+  // clear()) guarantees the std::vector capacity is actually deallocated. After
+  // release View()/bytes must not be read; shape/dtype metadata is retained.
+  void ReleaseHost() const;
+
   // Lazily-populated device-resident copies (CUDA forward only; null on host or
   // before first use). Uploaded ONCE and reused across every forward step so the
   // model's bf16/f32 weights (embed table, norms, attention/GDN projections,

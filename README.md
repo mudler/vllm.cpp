@@ -46,7 +46,12 @@ OpenAI-compatible server.
 > throughput basis (vLLM's own async is −0.7%) — net-negative. A literal per-run
 > 124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not by
 > any real deficit; see `.agents/specs/c8-p99-itl-tail-2026-07-18.md` and the
-> parity ledger. 35B performance closure follows the accepted 27B parity. See
+> parity ledger. **First 35B performance binding (2026-07-18): 19/124** on
+> `69f2717` (Qwen3.6-35B-A3B-NVFP4, MoE) — a fresh parity front distinct from
+> 27B: memory 0.63× (ours 21.2 vs vLLM 13.3 GB — MoE residency heavy), low-batch
+> decode (c1 tput 0.743× / TPOT 0.734×, rising to c16/c32 TPOT 1.05× — Marlin MoE
+> GEMM inefficient at batch=1), TTFT 0.80–0.86× (prefill). High-batch decode
+> already at parity. 35B correctness holds (315/315). See
 > [Benchmarks](docs/BENCHMARKS.md).
 
 ## Current status

@@ -13025,3 +13025,14 @@ doc-checkpoint checkers green. DGX behavior-preserving model gates (27B 235/235 
 deviation), backend-matrix new `BACKEND-PLATFORM` row + Metal/Vulkan/ANE
 realization anchors flipped to the Platform seam, ledger, README, BENCHMARKS
 (NOT APPLICABLE), spec status, coordination claim. Foundation for items 2/4/5/6.
+
+## 2026-07-18 — FIRST 35B performance binding: 19/124 (a fresh parity front; unblocked by the IMA fix + disk reclaim)
+
+Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/69f2717…/summary-35` (ratios.json sha256 `e7576e09…`); both arms 18/18 legs, 12/12 binding-eligible. Grid ran on `69f2717` (35B-IMA-fixed); the Platform seam `54d6569` is behavior-identical so the numbers hold. vLLM 35B oracle arm required disk-reclaim (flashinfer sm120 GEMM JIT) — see [[grid-per-sha-trees-fill-disk]].
+
+**19/124 — 35B is FAR from parity (unlike 27B's 115), THREE distinct gaps:**
+- **Memory FAILS (0.63×):** ours peak PSS 21.2 GB vs vLLM 13.3 GB — we use ~60% MORE (opposite of 27B where we win). 35B MoE weight residency is heavy; likely the steady CPU weight mirror + expert residency. Needs the direct-to-device streaming / expert-residency work.
+- **Low-batch decode (the big one):** per-concurrency total-tput ours/vLLM = c1 **0.743×**, c2 0.789, c4 0.852, c8 0.934, c16 0.973, c32 0.988. TPOT: c1 **0.734×** (18.3 vs 13.4 ms) rising to c16 **1.050×** / c32 **1.054×** (we WIN TPOT at high batch). So the MoE decode (Marlin grouped-GEMM) is inefficient at LOW batch and at parity/winning at high batch — the c1 batch=1 MoE GEMM is the dominant decode gap.
+- **TTFT FAILS everywhere (0.80–0.86×):** 35B prefill ~15–20% slower at all concurrencies — a consistent prefill gap.
+
+**35B parity attack (fresh campaign, distinct from 27B's decode-kernel close):** (1) low-batch MoE decode — nsys the c1 35B decode vs vLLM, attribute the Marlin/MoE grouped-GEMM inefficiency at batch=1; (2) TTFT/prefill — attribute the 35B prefill gap; (3) memory — the MoE expert/weight residency (ENG-EXPERT-STREAM / direct-device streaming). The high-batch decode (c16/c32) is already at parity, so the kernel scales — the problem is small-batch MoE + prefill + memory.

@@ -488,6 +488,34 @@ DGX evidence `dgx:~/work/vllm.cpp-fp4-quant-fast`.
 
 </details>
 
+## Binding 35B online gate (first, 2026-07-18)
+
+First-ever 35B (Qwen3.6-35B-A3B-NVFP4, MoE, `modelopt_mixed`) online-serving
+binding on `69f2717` (35B-IMA-fixed; Platform seam `54d6569` behavior-identical).
+Both arms 18/18 legs, 12/12 binding-eligible; evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/69f27178…/summary-35`, ratios.json
+sha256 `e7576e09…`. 35B correctness holds (315/315 token-exact throughout). The
+vLLM oracle arm required a disk reclaim (flashinfer sm120 GEMM JIT).
+
+**Disposition: 19/124 — a fresh parity front distinct from 27B's decode close.**
+
+| Concurrency | Axes | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) |
+|---:|---:|---:|---:|---:|
+| 1 | 0/20 | 453.65 / 610.53 (0.7430×) | 0.8572× | 0.7336× |
+| 2 | 0/20 | 720.55 / 913.59 (0.7887×) | 0.8635× | 0.7794× |
+| 4 | 0/20 | 1181.67 / 1386.95 (0.8520×) | 0.8141× | 0.8582× |
+| 8 | 0/20 | 1795.94 / 1922.13 (0.9344×) | 0.8139× | 0.9767× |
+| 16 | 8/20 | 2435.70 / 2502.71 (0.9732×) | 0.8006× | **1.0502×** |
+| 32 | 9/20 | 2992.89 / 3030.32 (0.9877×) | 0.8050× | **1.0544×** |
+
+Three gaps: (1) **memory** 0.63× (ours peak PSS 21.2 GB vs vLLM 13.3 GB — MoE
+weight/expert residency heavy, opposite of 27B); (2) **low-batch decode** — the
+Marlin MoE grouped-GEMM is inefficient at batch=1 (c1 TPOT 0.734×) but scales to
+WINNING at c16/c32 (TPOT 1.05×); (3) **TTFT** 0.80–0.86× at all concurrencies
+(prefill). Attack: attribute+close low-batch MoE decode, the prefill gap, and MoE
+residency memory — a distinct campaign from the 27B decode-kernel close.
+
+
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |

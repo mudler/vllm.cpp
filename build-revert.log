@@ -1,0 +1,465 @@
+[  0%] Building CXX object tests/CMakeFiles/vllm_test_main.dir/doctest_main.cpp.o
+[  0%] Building CXX object CMakeFiles/vllm.dir/src/vllm/config/scheduler.cpp.o
+[  1%] Building CXX object CMakeFiles/vllm.dir/src/vllm/sampling_params.cpp.o
+[  1%] Building CXX object CMakeFiles/vllm.dir/src/vllm/version.cpp.o
+[  1%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/model_loader/gguf_reader.cpp.o
+[  1%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/model_loader/nvfp4_dequant.cpp.o
+[  2%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/model_loader/safetensors_reader.cpp.o
+[  2%] Building CXX object CMakeFiles/vllm.dir/src/vllm/transformers_utils/hf_config.cpp.o
+[  2%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp.o
+[  2%] Building CXX object CMakeFiles/vllm.dir/src/vllm/outputs.cpp.o
+[  2%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/qwen3_5_dense_weights.cpp.o
+[  4%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/qwen3_5_weights.cpp.o
+[  4%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/model_loader/gguf_dequant.cpp.o
+[  4%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/qwen3_5_mtp.cpp.o
+[  5%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/qwen3_5.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/tokenizer/pretokenizer.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/model_registry.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/tokenizer/bpe.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/tokenizer/unicode_data.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/tokenizer/tokenizer.cpp.o
+[  6%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/request.cpp.o
+[  7%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/outputs.cpp.o
+[  7%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/sample/metadata.cpp.o
+[  7%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/sample/ops/penalties.cpp.o
+[  8%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/sample/ops/bad_words.cpp.o
+[  8%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/sample/logits_processor/builtin.cpp.o
+[  8%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/sample/sampler.cpp.o
+[  8%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/kv_cache_interface.cpp.o
+[  9%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/kv_cache_spec_registry.cpp.o
+[  9%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/kv_cache_utils.cpp.o
+[  9%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/block_pool.cpp.o
+[ 10%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/single_type_kv_cache_manager.cpp.o
+[ 10%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/kv_cache_coordinator.cpp.o
+[ 10%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/kv_cache_manager.cpp.o
+[ 11%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/sched/request_queue.cpp.o
+[ 11%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/sched/output.cpp.o
+[ 11%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/sched/scheduler.cpp.o
+[ 11%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/sched/async_scheduler.cpp.o
+[ 12%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/core/sched/utils.cpp.o
+[ 12%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/worker/gpu/block_table.cpp.o
+[ 12%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/worker/gpu/input_batch.cpp.o
+[ 13%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/worker/gpu/prepare_inputs.cpp.o
+[ 13%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/worker/gpu/async_output.cpp.o
+[ 13%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/worker/gpu/runner.cpp.o
+[ 13%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/attention/backend.cpp.o
+[ 14%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/attention/backends/utils.cpp.o
+[ 14%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/attention/backends/gdn_attn.cpp.o
+[ 14%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/structured_output/backend_types.cpp.o
+[ 15%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/structured_output/backend_native.cpp.o
+[ 15%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/structured_output/json_schema_to_gbnf.cpp.o
+[ 15%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/structured_output/request.cpp.o
+[ 15%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/structured_output/manager.cpp.o
+[ 16%] Linking CXX static library libvllm_test_main.a
+[ 17%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/types.cpp.o
+[ 17%] Built target vllm_test_main
+[ 17%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/detokenizer.cpp.o
+[ 18%] Building CXX object tests/CMakeFiles/test_dlopen.dir/capi/test_dlopen.cpp.o
+[ 18%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/core.cpp.o
+[ 18%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/core_client.cpp.o
+[ 19%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/core_proc.cpp.o
+[ 19%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/async_llm.cpp.o
+[ 20%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/input_processor.cpp.o
+[ 20%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/output_processor.cpp.o
+[ 20%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/engine/llm_engine.cpp.o
+[ 20%] Building CXX object CMakeFiles/vllm.dir/src/vllm/v1/executor/executor.cpp.o
+[ 21%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/attention/attention.cpp.o
+[ 21%] Linking CXX executable test_dlopen
+[ 21%] Built target test_dlopen
+[ 21%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/attention/chunked_local_attention.cpp.o
+[ 21%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/base.cpp.o
+[ 22%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/common.cpp.o
+[ 22%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp.o
+[ 22%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.cpp.o
+[ 22%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp.o
+[ 23%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.cpp.o
+[ 23%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp.o
+[ 23%] Building CXX object CMakeFiles/vllm.dir/src/vllm/model_executor/layers/rotary_embedding/mrope.cpp.o
+[ 24%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/chat_template.cpp.o
+[ 24%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/model_loader.cpp.o
+[ 24%] Building CXX object CMakeFiles/vllm.dir/src/capi/vllm_c.cpp.o
+[ 24%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/protocol.cpp.o
+[ 25%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/serving_utils.cpp.o
+[ 25%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/serving_completion.cpp.o
+[ 25%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/serving_chat.cpp.o
+[ 26%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/serving_models.cpp.o
+[ 26%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/tool_parsers/abstract.cpp.o
+[ 26%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/tool_parsers/hermes.cpp.o
+[ 27%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/tool_parsers/qwen3.cpp.o
+[ 27%] Building CXX object CMakeFiles/vllm.dir/src/vt/dtype.cpp.o
+[ 27%] Building CXX object CMakeFiles/vllm.dir/src/vt/backend.cpp.o
+[ 27%] Building CXX object CMakeFiles/vllm.dir/src/vt/tensor.cpp.o
+[ 28%] Building CXX object CMakeFiles/vllm.dir/src/vt/arena.cpp.o
+[ 28%] Building CXX object CMakeFiles/vllm.dir/src/vt/ops.cpp.o
+[ 28%] Building CXX object CMakeFiles/vllm.dir/src/vt/cuda/nvfp4_persistent_cache.cpp.o
+[ 29%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_backend.cpp.o
+[ 29%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_threadpool.cpp.o
+[ 29%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_ops.cpp.o
+[ 30%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_cache.cpp.o
+[ 30%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_paged_attn.cpp.o
+[ 30%] Building CXX object CMakeFiles/vllm.dir/src/vt/cpu/cpu_sample.cpp.o
+[ 30%] Building CXX object CMakeFiles/vllm.dir/src/vllm/entrypoints/openai/api_server.cpp.o
+[ 31%] Linking CXX static library libvllm.a
+[ 31%] Built target vllm
+[ 31%] Building CXX object tests/CMakeFiles/test_sampling_params.dir/vllm/test_sampling_params.cpp.o
+[ 32%] Building CXX object CMakeFiles/vllm_shared.dir/vllm_shared_stub.cpp.o
+[ 32%] Building CXX object tests/CMakeFiles/test_nvfp4_dequant.dir/vllm/test_nvfp4_dequant.cpp.o
+[ 32%] Building CXX object tests/CMakeFiles/test_version.dir/vllm/test_version.cpp.o
+[ 33%] Building CXX object tests/CMakeFiles/test_ct_nvfp4_emulation.dir/vllm/test_ct_nvfp4_emulation.cpp.o
+[ 33%] Building CXX object tests/CMakeFiles/test_safetensors.dir/vllm/test_safetensors.cpp.o
+[ 35%] Building CXX object tests/CMakeFiles/test_gguf_qwen36_loader.dir/vllm/test_gguf_qwen36_loader.cpp.o
+[ 35%] Building CXX object tests/CMakeFiles/test_model_loader_gguf.dir/vllm/test_model_loader_gguf.cpp.o
+[ 35%] Building CXX object tests/CMakeFiles/test_hf_config.dir/vllm/test_hf_config.cpp.o
+[ 36%] Building CXX object tests/CMakeFiles/test_model_registry.dir/vllm/models/test_model_registry.cpp.o
+[ 36%] Building CXX object tests/CMakeFiles/test_qwen35_paged_forward.dir/vllm/models/test_qwen35_paged_forward.cpp.o
+[ 36%] Building CXX object tests/CMakeFiles/test_decode_graph_sizes.dir/vllm/models/test_decode_graph_sizes.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_gguf.dir/vllm/test_gguf.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_gguf_dequant.dir/vllm/test_gguf_dequant.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_qwen27_paged_forward.dir/vllm/models/test_qwen27_paged_forward.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_qwen36_weights.dir/vllm/test_qwen36_weights.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_pretokenizer.dir/vllm/test_pretokenizer.cpp.o
+[ 37%] Building CXX object tests/CMakeFiles/test_unicode_data.dir/vllm/test_unicode_data.cpp.o
+[ 38%] Building CXX object tests/CMakeFiles/test_qwen27_dense_forward.dir/vllm/models/test_qwen27_dense_forward.cpp.o
+[ 39%] Building CXX object tests/CMakeFiles/test_bpe.dir/vllm/test_bpe.cpp.o
+[ 39%] Linking CXX shared library libvllm.so
+[ 39%] Built target vllm_shared
+[ 39%] Building CXX object tests/CMakeFiles/test_detokenizer.dir/vllm/test_detokenizer.cpp.o
+[ 40%] Linking CXX executable test_version
+[ 40%] Linking CXX executable test_ct_nvfp4_emulation
+[ 40%] Linking CXX executable test_nvfp4_dequant
+[ 40%] Built target test_version
+[ 41%] Building CXX object tests/CMakeFiles/test_request.dir/vllm/test_request.cpp.o
+[ 41%] Linking CXX executable test_decode_graph_sizes
+[ 41%] Built target test_ct_nvfp4_emulation
+[ 41%] Building CXX object tests/CMakeFiles/test_kv_cache_utils.dir/vllm/v1/test_kv_cache_utils.cpp.o
+[ 41%] Built target test_nvfp4_dequant
+[ 41%] Building CXX object tests/CMakeFiles/test_kv_cache_interface.dir/vllm/v1/test_kv_cache_interface.cpp.o
+[ 41%] Built target test_decode_graph_sizes
+[ 42%] Building CXX object tests/CMakeFiles/test_block_pool.dir/vllm/v1/test_block_pool.cpp.o
+[ 42%] Linking CXX executable test_gguf_dequant
+[ 42%] Linking CXX executable test_unicode_data
+[ 42%] Built target test_gguf_dequant
+[ 42%] Building CXX object tests/CMakeFiles/test_single_type_kv_cache_manager.dir/vllm/v1/test_single_type_kv_cache_manager.cpp.o
+[ 42%] Built target test_unicode_data
+[ 43%] Building CXX object tests/CMakeFiles/test_kv_cache_coordinator.dir/vllm/v1/test_kv_cache_coordinator.cpp.o
+[ 43%] Linking CXX executable test_sampling_params
+[ 43%] Linking CXX executable test_pretokenizer
+[ 43%] Linking CXX executable test_request
+[ 43%] Built target test_pretokenizer
+[ 44%] Building CXX object tests/CMakeFiles/test_kv_cache_manager.dir/vllm/v1/test_kv_cache_manager.cpp.o
+[ 44%] Linking CXX executable test_qwen36_weights
+[ 44%] Built target test_sampling_params
+[ 45%] Building CXX object tests/CMakeFiles/test_scheduler_config.dir/vllm/test_scheduler_config.cpp.o
+[ 45%] Built target test_request
+[ 45%] Building CXX object tests/CMakeFiles/test_request_queue.dir/vllm/v1/test_request_queue.cpp.o
+[ 45%] Built target test_qwen36_weights
+[ 46%] Building CXX object tests/CMakeFiles/test_sched_output.dir/vllm/v1/test_sched_output.cpp.o
+[ 46%] Linking CXX executable test_gguf
+[ 46%] Linking CXX executable test_scheduler_config
+[ 47%] Linking CXX executable test_hf_config
+[ 47%] Built target test_gguf
+[ 47%] Building CXX object tests/CMakeFiles/test_scheduler.dir/vllm/v1/test_scheduler.cpp.o
+[ 48%] Linking CXX executable test_safetensors
+[ 48%] Built target test_scheduler_config
+[ 49%] Building CXX object tests/CMakeFiles/test_async_scheduler.dir/vllm/v1/test_async_scheduler.cpp.o
+[ 49%] Built target test_hf_config
+[ 49%] Building CXX object tests/CMakeFiles/test_scheduler_wave.dir/vllm/v1/test_scheduler_wave.cpp.o
+[ 50%] Linking CXX executable test_model_registry
+[ 50%] Linking CXX executable test_block_pool
+[ 50%] Linking CXX executable test_kv_cache_interface
+[ 50%] Linking CXX executable test_bpe
+[ 50%] Built target test_block_pool
+[ 50%] Built target test_safetensors
+[ 50%] Building CXX object tests/CMakeFiles/test_block_table.dir/vllm/v1/worker/test_block_table.cpp.o
+[ 50%] Built target test_kv_cache_interface
+[ 50%] Building CXX object tests/CMakeFiles/test_input_batch.dir/vllm/v1/worker/test_input_batch.cpp.o
+[ 50%] Building CXX object tests/CMakeFiles/test_sampling_metadata.dir/vllm/v1/sample/test_metadata.cpp.o
+[ 50%] Built target test_model_registry
+[ 50%] Building CXX object tests/CMakeFiles/test_logits_processors.dir/vllm/v1/sample/test_logits_processors.cpp.o
+[ 51%] Linking CXX executable test_qwen35_paged_forward
+[ 51%] Linking CXX executable test_qwen27_dense_forward
+[ 51%] Built target test_bpe
+[ 51%] Building CXX object tests/CMakeFiles/test_sampler.dir/vllm/v1/sample/test_sampler.cpp.o
+[ 51%] Built target test_qwen27_dense_forward
+[ 52%] Building CXX object tests/CMakeFiles/test_prepare_inputs.dir/vllm/v1/worker/test_prepare_inputs.cpp.o
+[ 52%] Built target test_qwen35_paged_forward
+[ 52%] Building CXX object tests/CMakeFiles/test_combine_tokens.dir/vllm/v1/worker/test_combine_tokens.cpp.o
+[ 52%] Linking CXX executable test_gguf_qwen36_loader
+[ 52%] Built target test_gguf_qwen36_loader
+[ 52%] Building CXX object tests/CMakeFiles/test_async_output.dir/vllm/v1/worker/test_async_output.cpp.o
+[ 52%] Linking CXX executable test_kv_cache_coordinator
+[ 52%] Built target test_kv_cache_coordinator
+[ 52%] Building CXX object tests/CMakeFiles/test_async_runner_flag.dir/vllm/v1/worker/test_async_runner_flag.cpp.o
+[ 52%] Linking CXX executable test_qwen27_paged_forward
+[ 52%] Linking CXX executable test_async_runner_flag
+[ 52%] Built target test_qwen27_paged_forward
+[ 53%] Building CXX object tests/CMakeFiles/test_runner.dir/vllm/v1/worker/test_runner.cpp.o
+[ 53%] Linking CXX executable test_kv_cache_manager
+[ 53%] Linking CXX executable test_combine_tokens
+[ 53%] Built target test_async_runner_flag
+[ 54%] Linking CXX executable test_kv_cache_utils
+[ 55%] Building CXX object tests/CMakeFiles/test_common_attn_metadata.dir/vllm/v1/attention/test_common_attn_metadata.cpp.o
+[ 55%] Linking CXX executable test_block_table
+[ 55%] Linking CXX executable test_model_loader_gguf
+[ 55%] Built target test_kv_cache_manager
+[ 55%] Building CXX object tests/CMakeFiles/test_attention_window.dir/vllm/model_executor/layers/attention/test_attention.cpp.o
+[ 55%] Built target test_combine_tokens
+[ 55%] Building CXX object tests/CMakeFiles/test_chunked_local_attention.dir/vllm/v1/attention/test_chunked_local_attention.cpp.o
+[ 55%] Built target test_model_loader_gguf
+[ 55%] Built target test_kv_cache_utils
+[ 55%] Building CXX object tests/CMakeFiles/test_rotary_embedding.dir/vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp.o
+[ 55%] Building CXX object tests/CMakeFiles/test_gdn_metadata_builder.dir/vllm/v1/attention/test_gdn_metadata_builder.cpp.o
+[ 55%] Built target test_block_table
+[ 55%] Building CXX object tests/CMakeFiles/test_mtp_speculator.dir/vllm/v1/spec_decode/test_mtp_speculator.cpp.o
+[ 56%] Linking CXX executable test_request_queue
+[ 56%] Linking CXX executable test_logits_processors
+[ 56%] Linking CXX executable test_sampler
+[ 56%] Built target test_request_queue
+[ 56%] Built target test_sampler
+[ 56%] Built target test_logits_processors
+[ 57%] Building CXX object tests/CMakeFiles/test_structured_output.dir/vllm/v1/structured_output/test_structured_output.cpp.o
+[ 57%] Building CXX object tests/CMakeFiles/test_apply_grammar_bitmask.dir/vllm/v1/structured_output/test_apply_grammar_bitmask.cpp.o
+[ 57%] Building CXX object tests/CMakeFiles/test_backend_native.dir/vllm/v1/structured_output/test_backend_native.cpp.o
+[ 57%] Linking CXX executable test_sched_output
+[ 58%] Linking CXX executable test_async_output
+[ 59%] Linking CXX executable test_sampling_metadata
+[ 59%] Built target test_sched_output
+[ 59%] Building CXX object tests/CMakeFiles/test_json_schema_to_gbnf.dir/vllm/v1/structured_output/test_json_schema_to_gbnf.cpp.o
+[ 59%] Linking CXX executable test_attention_window
+[ 59%] Built target test_sampling_metadata
+[ 59%] Built target test_async_output
+[ 59%] Building CXX object tests/CMakeFiles/test_response_format_e2e.dir/vllm/v1/structured_output/test_response_format_e2e.cpp.o
+[ 60%] Building CXX object tests/CMakeFiles/test_engine_types.dir/vllm/test_engine_types.cpp.o
+[ 60%] Linking CXX executable test_prepare_inputs
+[ 60%] Built target test_attention_window
+[ 60%] Building CXX object tests/CMakeFiles/test_engine_core.dir/vllm/v1/test_engine_core.cpp.o
+[ 60%] Built target test_prepare_inputs
+[ 60%] Linking CXX executable test_common_attn_metadata
+[ 60%] Building CXX object tests/CMakeFiles/test_engine_core_proc.dir/vllm/v1/test_engine_core_proc.cpp.o
+[ 60%] Linking CXX executable test_single_type_kv_cache_manager
+[ 60%] Linking CXX executable test_async_scheduler
+[ 60%] Built target test_single_type_kv_cache_manager
+[ 60%] Building CXX object tests/CMakeFiles/test_async_admission_timing.dir/vllm/v1/test_async_admission_timing.cpp.o
+[ 60%] Built target test_common_attn_metadata
+[ 60%] Building CXX object tests/CMakeFiles/test_input_processor.dir/vllm/v1/test_input_processor.cpp.o
+[ 61%] Linking CXX executable test_scheduler_wave
+[ 61%] Built target test_async_scheduler
+[ 61%] Building CXX object tests/CMakeFiles/test_output_processor.dir/vllm/v1/test_output_processor.cpp.o
+[ 61%] Linking CXX executable test_input_batch
+[ 61%] Linking CXX executable test_gdn_metadata_builder
+[ 61%] Built target test_scheduler_wave
+[ 61%] Building CXX object tests/CMakeFiles/test_async_llm.dir/vllm/v1/test_async_llm.cpp.o
+[ 61%] Built target test_input_batch
+[ 61%] Linking CXX executable test_detokenizer
+[ 61%] Building CXX object tests/CMakeFiles/test_llm_engine.dir/vllm/v1/test_llm_engine.cpp.o
+[ 61%] Built target test_gdn_metadata_builder
+[ 62%] Building CXX object tests/CMakeFiles/test_loaded_engine_dense.dir/vllm/entrypoints/test_loaded_engine_dense.cpp.o
+[ 62%] Built target test_detokenizer
+[ 62%] Building CXX object tests/CMakeFiles/test_openai_protocol.dir/vllm/entrypoints/openai/test_protocol.cpp.o
+[ 62%] Linking CXX executable test_apply_grammar_bitmask
+[ 62%] Built target test_apply_grammar_bitmask
+[ 63%] Building CXX object tests/CMakeFiles/test_openai_serving.dir/vllm/entrypoints/openai/test_serving.cpp.o
+[ 63%] Linking CXX executable test_engine_types
+[ 63%] Built target test_engine_types
+[ 64%] Building CXX object tests/CMakeFiles/test_openai_utf8.dir/vllm/entrypoints/openai/test_utf8.cpp.o
+[ 65%] Linking CXX executable test_chunked_local_attention
+[ 65%] Linking CXX executable test_mtp_speculator
+[ 65%] Linking CXX executable test_rotary_embedding
+[ 65%] Built target test_chunked_local_attention
+[ 65%] Built target test_mtp_speculator
+[ 65%] Building CXX object tests/CMakeFiles/test_openai_tool_parsers.dir/vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp.o
+[ 65%] Building CXX object tests/CMakeFiles/test_tool_choice_grammar.dir/vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp.o
+[ 65%] Built target test_rotary_embedding
+[ 65%] Linking CXX executable test_scheduler
+[ 65%] Building CXX object tests/CMakeFiles/test_chat_template.dir/vllm/entrypoints/test_chat_template.cpp.o
+[ 65%] Built target test_scheduler
+[ 66%] Building CXX object tests/CMakeFiles/test_openai_api_server.dir/vllm/entrypoints/openai/test_api_server.cpp.o
+[ 66%] Linking CXX executable test_structured_output
+[ 67%] Linking CXX executable test_input_processor
+[ 67%] Built target test_structured_output
+[ 68%] Linking CXX executable test_engine_core
+[ 68%] Building CXX object tests/CMakeFiles/test_openai_conformance.dir/vllm/entrypoints/openai/test_conformance.cpp.o
+[ 68%] Built target test_engine_core
+[ 68%] Built target test_input_processor
+[ 68%] Building CXX object tests/CMakeFiles/test_outputs.dir/vllm/test_outputs.cpp.o
+[ 68%] Building CXX object tests/CMakeFiles/test_bench.dir/examples/test_bench.cpp.o
+[ 69%] Linking CXX executable test_async_admission_timing
+[ 69%] Built target test_async_admission_timing
+[ 69%] Building CXX object tests/CMakeFiles/test_capi.dir/capi/test_capi.cpp.o
+[ 69%] Linking CXX executable test_engine_core_proc
+[ 69%] Built target test_engine_core_proc
+[ 69%] Building C object tests/CMakeFiles/vllm_capi_c_check.dir/capi/c_header_compile.c.o
+[ 69%] Linking CXX static library libvllm_capi_c_check.a
+[ 69%] Built target vllm_capi_c_check
+[ 69%] Building CXX object tests/CMakeFiles/test_cuda_backend.dir/vt/test_cuda_backend.cpp.o
+[ 69%] Linking CXX executable test_openai_utf8
+[ 69%] Built target test_openai_utf8
+[ 69%] Building CXX object tests/CMakeFiles/test_dropin_abi.dir/vt/test_dropin_abi.cpp.o
+[ 69%] Linking CXX executable test_outputs
+[ 69%] Linking CXX executable test_runner
+[ 69%] Built target test_outputs
+[ 69%] Building CXX object tests/CMakeFiles/test_cuda_ops.dir/vt/test_cuda_ops.cpp.o
+[ 69%] Built target test_runner
+[ 69%] Building CXX object tests/CMakeFiles/test_dtype.dir/vt/test_dtype.cpp.o
+[ 70%] Linking CXX executable test_cuda_backend
+[ 70%] Linking CXX executable test_json_schema_to_gbnf
+[ 70%] Built target test_json_schema_to_gbnf
+[ 71%] Building CXX object tests/CMakeFiles/test_backend.dir/vt/test_backend.cpp.o
+[ 71%] Built target test_cuda_backend
+[ 71%] Building CXX object tests/CMakeFiles/test_tensor.dir/vt/test_tensor.cpp.o
+[ 71%] Linking CXX executable test_openai_tool_parsers
+[ 71%] Built target test_openai_tool_parsers
+[ 72%] Building CXX object tests/CMakeFiles/test_arena.dir/vt/test_arena.cpp.o
+[ 72%] Linking CXX executable test_backend
+[ 72%] Linking CXX executable test_dtype
+[ 73%] Linking CXX executable test_dropin_abi
+[ 73%] Built target test_dtype
+[ 73%] Building CXX object tests/CMakeFiles/test_ops_matmul.dir/vt/test_ops_matmul.cpp.o
+[ 73%] Built target test_backend
+[ 73%] Building CXX object tests/CMakeFiles/test_gemm_algo_log.dir/vt/test_gemm_algo_log.cpp.o
+[ 73%] Built target test_dropin_abi
+[ 73%] Linking CXX executable test_tensor
+[ 73%] Building CXX object tests/CMakeFiles/test_gdn_packed_reg_tile.dir/vt/test_gdn_packed_reg_tile.cpp.o
+[ 74%] Linking CXX executable test_output_processor
+[ 75%] Linking CXX executable test_gdn_packed_reg_tile
+[ 75%] Built target test_tensor
+[ 75%] Linking CXX executable test_arena
+[ 76%] Building CXX object tests/CMakeFiles/test_gdn_packed_decode_triton.dir/vt/test_gdn_packed_decode_triton.cpp.o
+[ 76%] Linking CXX executable test_loaded_engine_dense
+[ 76%] Built target test_arena
+[ 76%] Built target test_output_processor
+[ 76%] Linking CXX executable test_gdn_packed_decode_triton
+[ 77%] Building CXX object tests/CMakeFiles/test_rmsnorm_decode_fast.dir/vt/test_rmsnorm_decode_fast.cpp.o
+[ 77%] Building CXX object tests/CMakeFiles/test_cpu_threadpool.dir/vt/test_cpu_threadpool.cpp.o
+[ 77%] Built target test_gdn_packed_reg_tile
+[ 78%] Building CXX object tests/CMakeFiles/test_ops_nvfp4_matmul.dir/vt/test_ops_nvfp4_matmul.cpp.o
+[ 78%] Built target test_loaded_engine_dense
+[ 78%] Linking CXX executable test_rmsnorm_decode_fast
+[ 78%] Linking CXX executable test_llm_engine
+[ 78%] Building CXX object tests/CMakeFiles/test_ops_nvfp4_fp4.dir/vt/test_ops_nvfp4_fp4.cpp.o
+[ 79%] Linking CXX executable test_backend_native
+[ 79%] Built target test_gdn_packed_decode_triton
+[ 79%] Built target test_llm_engine
+[ 80%] Building CXX object tests/CMakeFiles/test_nvfp4_persistent_cache.dir/vt/test_nvfp4_persistent_cache.cpp.o
+[ 80%] Built target test_backend_native
+[ 80%] Built target test_rmsnorm_decode_fast
+[ 80%] Building CXX object tests/CMakeFiles/test_ops_fp8_cutlass.dir/vt/test_ops_fp8_cutlass.cpp.o
+[ 81%] Building CXX object tests/CMakeFiles/test_ops_moe_grouped.dir/vt/test_ops_moe_grouped.cpp.o
+[ 82%] Linking CXX executable test_ops_matmul
+[ 82%] Building CXX object tests/CMakeFiles/test_ops_rmsnorm.dir/vt/test_ops_rmsnorm.cpp.o
+[ 82%] Built target test_ops_matmul
+[ 83%] Building CXX object tests/CMakeFiles/test_ops_fused_chain.dir/vt/test_ops_fused_chain.cpp.o
+[ 83%] Linking CXX executable test_cuda_ops
+[ 83%] Linking CXX executable test_gemm_algo_log
+[ 83%] Built target test_cuda_ops
+[ 83%] Building CXX object tests/CMakeFiles/test_ops_activation.dir/vt/test_ops_activation.cpp.o
+[ 83%] Built target test_gemm_algo_log
+[ 84%] Building CXX object tests/CMakeFiles/test_ops_rope.dir/vt/test_ops_rope.cpp.o
+[ 84%] Linking CXX executable test_async_llm
+[ 84%] Built target test_async_llm
+[ 84%] Building CXX object tests/CMakeFiles/test_ops_rope_cache.dir/vt/test_ops_rope_cache.cpp.o
+[ 84%] Linking CXX executable test_ops_rmsnorm
+[ 84%] Linking CXX executable test_ops_fused_chain
+[ 85%] Linking CXX executable test_ops_activation
+[ 85%] Built target test_ops_fused_chain
+[ 85%] Linking CXX executable test_ops_rope
+[ 85%] Building CXX object tests/CMakeFiles/test_ops_gdn.dir/vt/test_ops_gdn.cpp.o
+[ 85%] Built target test_ops_activation
+[ 85%] Linking CXX executable test_ops_fp8_cutlass
+[ 85%] Building CXX object tests/CMakeFiles/test_ops_moe.dir/vt/test_ops_moe.cpp.o
+[ 85%] Built target test_ops_rmsnorm
+[ 86%] Building CXX object tests/CMakeFiles/test_ops_glue.dir/vt/test_ops_glue.cpp.o
+[ 86%] Built target test_ops_fp8_cutlass
+[ 86%] Linking CXX executable test_ops_nvfp4_matmul
+[ 86%] Building CXX object tests/CMakeFiles/test_ops_attn_preamble.dir/vt/test_ops_attn_preamble.cpp.o
+[ 86%] Built target test_ops_rope
+[ 86%] Building CXX object tests/CMakeFiles/test_ops_attention.dir/vt/test_ops_attention.cpp.o
+[ 86%] Linking CXX executable test_cpu_threadpool
+[ 86%] Built target test_ops_nvfp4_matmul
+[ 86%] Building CXX object tests/CMakeFiles/test_ops_reshape_cache.dir/vt/test_ops_reshape_cache.cpp.o
+[ 86%] Built target test_cpu_threadpool
+[ 86%] Building CXX object tests/CMakeFiles/test_ops_paged_attn.dir/vt/test_ops_paged_attn.cpp.o
+[ 86%] Linking CXX executable test_ops_moe_grouped
+[ 86%] Linking CXX executable test_ops_rope_cache
+[ 86%] Built target test_ops_rope_cache
+[ 86%] Built target test_ops_moe_grouped
+[ 87%] Building CXX object tests/CMakeFiles/test_ops_sample.dir/vt/test_ops_sample.cpp.o
+[ 87%] Building CXX object tests/CMakeFiles/test_ops_penalties.dir/vt/test_ops_penalties.cpp.o
+[ 87%] Linking CXX executable test_ops_glue
+[ 87%] Built target test_ops_glue
+[ 87%] Building CXX object tests/CMakeFiles/test_npy.dir/parity/test_npy.cpp.o
+[ 87%] Linking CXX executable test_ops_moe
+[ 87%] Linking CXX executable test_openai_protocol
+[ 88%] Linking CXX executable test_tool_choice_grammar
+[ 88%] Built target test_openai_protocol
+[ 88%] Built target test_ops_moe
+[ 89%] Building CXX object tests/CMakeFiles/test_tokenizer_parity.dir/vllm/test_tokenizer_parity.cpp.o
+[ 89%] Building CXX object tests/CMakeFiles/test_op_parity.dir/parity/test_op_parity.cpp.o
+[ 89%] Linking CXX executable test_ops_penalties
+[ 89%] Built target test_tool_choice_grammar
+[ 90%] Building CXX object tests/CMakeFiles/test_qwen36_paged_engine.dir/parity/test_qwen36_paged_engine.cpp.o
+[ 90%] Linking CXX executable test_chat_template
+[ 91%] Linking CXX executable test_ops_reshape_cache
+[ 91%] Built target test_ops_penalties
+[ 91%] Building CXX object tests/CMakeFiles/test_qwen36_gguf_engine.dir/parity/test_qwen36_gguf_engine.cpp.o
+[ 91%] Linking CXX executable test_ops_attention
+[ 92%] Linking CXX executable test_ops_attn_preamble
+[ 92%] Built target test_ops_reshape_cache
+[ 92%] Built target test_chat_template
+[ 92%] Building CXX object tests/CMakeFiles/test_qwen27_paged_engine.dir/parity/test_qwen27_paged_engine.cpp.o
+[ 93%] Building CXX object examples/CMakeFiles/dump_container.dir/dump_container/main.cpp.o
+[ 93%] Built target test_ops_attention
+[ 93%] Linking CXX executable test_ops_sample
+[ 93%] Linking CXX executable test_response_format_e2e
+[ 93%] Building CXX object examples/CMakeFiles/tokenize.dir/tokenize/main.cpp.o
+[ 93%] Built target test_ops_attn_preamble
+[ 93%] Building CXX object examples/CMakeFiles/dequant_nvfp4.dir/dequant_nvfp4/main.cpp.o
+[ 93%] Built target test_response_format_e2e
+[ 93%] Building CXX object examples/CMakeFiles/vllm-bench.dir/bench/main.cpp.o
+[ 93%] Built target test_ops_sample
+[ 93%] Building CXX object examples/CMakeFiles/vllm-cli.dir/cli/main.cpp.o
+[ 94%] Linking CXX executable test_npy
+[ 95%] Linking CXX executable test_capi
+[ 95%] Built target test_npy
+[ 96%] Building CXX object examples/CMakeFiles/server.dir/server/main.cpp.o
+[ 96%] Built target test_capi
+[ 97%] Linking CXX executable vllm-cli
+[ 97%] Built target vllm-cli
+[ 97%] Linking CXX executable dequant_nvfp4
+[ 97%] Linking CXX executable tokenize
+[ 97%] Built target dequant_nvfp4
+[ 98%] Linking CXX executable test_ops_paged_attn
+[ 98%] Linking CXX executable test_bench
+[ 98%] Built target tokenize
+[ 98%] Built target test_ops_paged_attn
+[ 98%] Built target test_bench
+[ 98%] Linking CXX executable test_ops_nvfp4_fp4
+[ 98%] Built target test_ops_nvfp4_fp4
+[ 98%] Linking CXX executable dump_container
+[ 98%] Built target dump_container
+[ 98%] Linking CXX executable test_tokenizer_parity
+[ 98%] Built target test_tokenizer_parity
+[ 98%] Linking CXX executable test_openai_serving
+[ 98%] Built target test_openai_serving
+[ 98%] Linking CXX executable test_qwen36_paged_engine
+[ 99%] Linking CXX executable test_qwen27_paged_engine
+[ 99%] Built target test_qwen36_paged_engine
+[ 99%] Linking CXX executable test_qwen36_gguf_engine
+[ 99%] Built target test_qwen27_paged_engine
+[ 99%] Built target test_qwen36_gguf_engine
+[ 99%] Linking CXX executable test_nvfp4_persistent_cache
+[ 99%] Linking CXX executable server
+[ 99%] Built target server
+[ 99%] Built target test_nvfp4_persistent_cache
+[ 99%] Linking CXX executable test_ops_gdn
+[ 99%] Built target test_ops_gdn
+[ 99%] Linking CXX executable vllm-bench
+[ 99%] Built target vllm-bench
+[ 99%] Linking CXX executable test_op_parity
+[ 99%] Built target test_op_parity
+[ 99%] Linking CXX executable test_openai_api_server
+[ 99%] Built target test_openai_api_server
+[100%] Linking CXX executable test_openai_conformance
+[100%] Built target test_openai_conformance
+REVERT-BATTERY-EXIT rc=0

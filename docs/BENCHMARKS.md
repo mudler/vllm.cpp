@@ -516,6 +516,8 @@ WINNING at c16/c32 (TPOT 1.05×); (3) **TTFT** 0.80–0.86× at all concurrencie
 residency memory — a distinct campaign from the 27B decode-kernel close.
 
 
+**Platform seam (extensibility item 1) DGX-confirmed 2026-07-18** — behavior-preserving refactor, both model gates token-exact (27B 235/235 + 35B 315/315), CUDA -Werror-clean; NOT APPLICABLE to perf (no numeric change). See the parity ledger.
+
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |

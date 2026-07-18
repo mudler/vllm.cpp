@@ -1,0 +1,239 @@
+Test project /home/mudler/_git/vllm.cpp/build-revert
+        Start   1: test_triton_aot_drift_contract
+  1/117 Test   #1: test_triton_aot_drift_contract ......   Passed    4.03 sec
+        Start   2: test_serve_low_tools
+  2/117 Test   #2: test_serve_low_tools ................   Passed   14.08 sec
+        Start   3: test_version
+  3/117 Test   #3: test_version ........................   Passed    0.00 sec
+        Start   4: test_sampling_params
+  4/117 Test   #4: test_sampling_params ................   Passed    0.00 sec
+        Start   5: test_hf_config
+  5/117 Test   #5: test_hf_config ......................   Passed    0.00 sec
+        Start   6: test_safetensors
+  6/117 Test   #6: test_safetensors ....................   Passed    0.01 sec
+        Start   7: test_gguf
+  7/117 Test   #7: test_gguf ...........................   Passed    0.00 sec
+        Start   8: test_nvfp4_dequant
+  8/117 Test   #8: test_nvfp4_dequant ..................   Passed    0.00 sec
+        Start   9: test_ct_nvfp4_emulation
+  9/117 Test   #9: test_ct_nvfp4_emulation .............   Passed    0.00 sec
+        Start  10: test_gguf_dequant
+ 10/117 Test  #10: test_gguf_dequant ...................   Passed    0.00 sec
+        Start  11: test_qwen36_weights
+ 11/117 Test  #11: test_qwen36_weights .................   Passed    0.00 sec
+        Start  12: test_gguf_qwen36_loader
+ 12/117 Test  #12: test_gguf_qwen36_loader .............   Passed    0.00 sec
+        Start  13: test_model_loader_gguf
+ 13/117 Test  #13: test_model_loader_gguf ..............   Passed    0.00 sec
+        Start  14: test_model_registry
+ 14/117 Test  #14: test_model_registry .................   Passed    0.00 sec
+        Start  15: test_decode_graph_sizes
+ 15/117 Test  #15: test_decode_graph_sizes .............   Passed    0.00 sec
+        Start  16: test_qwen35_paged_forward
+ 16/117 Test  #16: test_qwen35_paged_forward ...........   Passed    0.01 sec
+        Start  17: test_qwen27_dense_forward
+ 17/117 Test  #17: test_qwen27_dense_forward ...........   Passed    0.01 sec
+        Start  18: test_qwen27_paged_forward
+ 18/117 Test  #18: test_qwen27_paged_forward ...........   Passed    0.05 sec
+        Start  19: test_unicode_data
+ 19/117 Test  #19: test_unicode_data ...................   Passed    0.00 sec
+        Start  20: test_pretokenizer
+ 20/117 Test  #20: test_pretokenizer ...................   Passed    0.01 sec
+        Start  21: test_bpe
+ 21/117 Test  #21: test_bpe ............................   Passed    0.00 sec
+        Start  22: test_detokenizer
+ 22/117 Test  #22: test_detokenizer ....................   Passed    0.00 sec
+        Start  23: test_request
+ 23/117 Test  #23: test_request ........................   Passed    0.00 sec
+        Start  24: test_kv_cache_utils
+ 24/117 Test  #24: test_kv_cache_utils .................   Passed    0.00 sec
+        Start  25: test_kv_cache_interface
+ 25/117 Test  #25: test_kv_cache_interface .............   Passed    0.00 sec
+        Start  26: test_block_pool
+ 26/117 Test  #26: test_block_pool .....................   Passed    0.00 sec
+        Start  27: test_single_type_kv_cache_manager
+ 27/117 Test  #27: test_single_type_kv_cache_manager ...   Passed    0.01 sec
+        Start  28: test_kv_cache_coordinator
+ 28/117 Test  #28: test_kv_cache_coordinator ...........   Passed    0.00 sec
+        Start  29: test_kv_cache_manager
+ 29/117 Test  #29: test_kv_cache_manager ...............   Passed    0.01 sec
+        Start  30: test_scheduler_config
+ 30/117 Test  #30: test_scheduler_config ...............   Passed    0.00 sec
+        Start  31: test_request_queue
+ 31/117 Test  #31: test_request_queue ..................   Passed    0.00 sec
+        Start  32: test_sched_output
+ 32/117 Test  #32: test_sched_output ...................   Passed    0.00 sec
+        Start  33: test_scheduler
+ 33/117 Test  #33: test_scheduler ......................   Passed    0.00 sec
+        Start  34: test_async_scheduler
+ 34/117 Test  #34: test_async_scheduler ................   Passed    0.00 sec
+        Start  35: test_scheduler_wave
+ 35/117 Test  #35: test_scheduler_wave .................   Passed    0.02 sec
+        Start  36: test_block_table
+ 36/117 Test  #36: test_block_table ....................   Passed    0.00 sec
+        Start  37: test_input_batch
+ 37/117 Test  #37: test_input_batch ....................   Passed    0.00 sec
+        Start  38: test_sampling_metadata
+ 38/117 Test  #38: test_sampling_metadata ..............   Passed    0.00 sec
+        Start  39: test_logits_processors
+ 39/117 Test  #39: test_logits_processors ..............   Passed    0.00 sec
+        Start  40: test_sampler
+ 40/117 Test  #40: test_sampler ........................   Passed    0.00 sec
+        Start  41: test_prepare_inputs
+ 41/117 Test  #41: test_prepare_inputs .................   Passed    0.00 sec
+        Start  42: test_combine_tokens
+ 42/117 Test  #42: test_combine_tokens .................   Passed    0.00 sec
+        Start  43: test_async_output
+ 43/117 Test  #43: test_async_output ...................   Passed    0.00 sec
+        Start  44: test_async_runner_flag
+ 44/117 Test  #44: test_async_runner_flag ..............   Passed    0.00 sec
+        Start  45: test_runner
+ 45/117 Test  #45: test_runner .........................   Passed    0.03 sec
+        Start  46: test_common_attn_metadata
+ 46/117 Test  #46: test_common_attn_metadata ...........   Passed    0.00 sec
+        Start  47: test_attention_window
+ 47/117 Test  #47: test_attention_window ...............   Passed    0.00 sec
+        Start  48: test_chunked_local_attention
+ 48/117 Test  #48: test_chunked_local_attention ........   Passed    0.00 sec
+        Start  49: test_rotary_embedding
+ 49/117 Test  #49: test_rotary_embedding ...............   Passed    0.00 sec
+        Start  50: test_gdn_metadata_builder
+ 50/117 Test  #50: test_gdn_metadata_builder ...........   Passed    0.00 sec
+        Start  51: test_mtp_speculator
+ 51/117 Test  #51: test_mtp_speculator .................   Passed    0.00 sec
+        Start  52: test_structured_output
+ 52/117 Test  #52: test_structured_output ..............   Passed    0.00 sec
+        Start  53: test_apply_grammar_bitmask
+ 53/117 Test  #53: test_apply_grammar_bitmask ..........   Passed    0.00 sec
+        Start  54: test_backend_native
+ 54/117 Test  #54: test_backend_native .................   Passed    0.01 sec
+        Start  55: test_json_schema_to_gbnf
+ 55/117 Test  #55: test_json_schema_to_gbnf ............   Passed    0.00 sec
+        Start  56: test_response_format_e2e
+ 56/117 Test  #56: test_response_format_e2e ............   Passed    0.00 sec
+        Start  57: test_engine_types
+ 57/117 Test  #57: test_engine_types ...................   Passed    0.00 sec
+        Start  58: test_engine_core
+ 58/117 Test  #58: test_engine_core ....................   Passed    0.00 sec
+        Start  59: test_engine_core_proc
+ 59/117 Test  #59: test_engine_core_proc ...............   Passed    0.01 sec
+        Start  60: test_async_admission_timing
+ 60/117 Test  #60: test_async_admission_timing .........   Passed    0.01 sec
+        Start  61: test_input_processor
+ 61/117 Test  #61: test_input_processor ................   Passed    0.43 sec
+        Start  62: test_output_processor
+ 62/117 Test  #62: test_output_processor ...............   Passed    0.00 sec
+        Start  63: test_async_llm
+ 63/117 Test  #63: test_async_llm ......................   Passed    0.04 sec
+        Start  64: test_llm_engine
+ 64/117 Test  #64: test_llm_engine .....................   Passed    0.04 sec
+        Start  65: test_loaded_engine_dense
+ 65/117 Test  #65: test_loaded_engine_dense ............   Passed    0.01 sec
+        Start  66: test_openai_protocol
+ 66/117 Test  #66: test_openai_protocol ................   Passed    0.00 sec
+        Start  67: test_openai_serving
+ 67/117 Test  #67: test_openai_serving .................   Passed    0.04 sec
+        Start  68: test_openai_utf8
+ 68/117 Test  #68: test_openai_utf8 ....................   Passed    0.00 sec
+        Start  69: test_openai_tool_parsers
+ 69/117 Test  #69: test_openai_tool_parsers ............   Passed    0.00 sec
+        Start  70: test_tool_choice_grammar
+ 70/117 Test  #70: test_tool_choice_grammar ............   Passed    0.00 sec
+        Start  71: test_chat_template
+ 71/117 Test  #71: test_chat_template ..................   Passed    0.00 sec
+        Start  72: test_openai_api_server
+ 72/117 Test  #72: test_openai_api_server ..............   Passed    0.17 sec
+        Start  73: test_openai_conformance
+ 73/117 Test  #73: test_openai_conformance .............   Passed    0.41 sec
+        Start  74: test_outputs
+ 74/117 Test  #74: test_outputs ........................   Passed    0.00 sec
+        Start  75: test_bench
+ 75/117 Test  #75: test_bench ..........................   Passed    0.07 sec
+        Start  76: test_capi
+ 76/117 Test  #76: test_capi ...........................   Passed    0.34 sec
+        Start  77: test_dlopen
+ 77/117 Test  #77: test_dlopen .........................   Passed    0.00 sec
+        Start  78: capi_shared_exports_only_abi
+ 78/117 Test  #78: capi_shared_exports_only_abi ........   Passed    0.01 sec
+        Start  79: test_cuda_backend
+ 79/117 Test  #79: test_cuda_backend ...................   Passed    0.00 sec
+        Start  80: test_dropin_abi
+ 80/117 Test  #80: test_dropin_abi .....................   Passed    0.00 sec
+        Start  81: test_cuda_ops
+ 81/117 Test  #81: test_cuda_ops .......................   Passed    0.00 sec
+        Start  82: test_dtype
+ 82/117 Test  #82: test_dtype ..........................   Passed    0.00 sec
+        Start  83: test_backend
+ 83/117 Test  #83: test_backend ........................   Passed    0.00 sec
+        Start  84: test_tensor
+ 84/117 Test  #84: test_tensor .........................   Passed    0.00 sec
+        Start  85: test_arena
+ 85/117 Test  #85: test_arena ..........................   Passed    0.00 sec
+        Start  86: test_ops_matmul
+ 86/117 Test  #86: test_ops_matmul .....................   Passed    0.00 sec
+        Start  87: test_gemm_algo_log
+ 87/117 Test  #87: test_gemm_algo_log ..................   Passed    0.00 sec
+        Start  88: test_gdn_packed_reg_tile
+ 88/117 Test  #88: test_gdn_packed_reg_tile ............   Passed    0.00 sec
+        Start  89: test_gdn_packed_decode_triton
+ 89/117 Test  #89: test_gdn_packed_decode_triton .......   Passed    0.00 sec
+        Start  90: test_rmsnorm_decode_fast
+ 90/117 Test  #90: test_rmsnorm_decode_fast ............   Passed    0.00 sec
+        Start  91: test_cpu_threadpool
+ 91/117 Test  #91: test_cpu_threadpool .................   Passed    0.34 sec
+        Start  92: test_ops_nvfp4_matmul
+ 92/117 Test  #92: test_ops_nvfp4_matmul ...............   Passed    0.00 sec
+        Start  93: test_ops_nvfp4_fp4
+ 93/117 Test  #93: test_ops_nvfp4_fp4 ..................   Passed    0.02 sec
+        Start  94: test_nvfp4_persistent_cache
+ 94/117 Test  #94: test_nvfp4_persistent_cache .........   Passed    0.02 sec
+        Start  95: test_ops_fp8_cutlass
+ 95/117 Test  #95: test_ops_fp8_cutlass ................   Passed    0.00 sec
+        Start  96: test_ops_moe_grouped
+ 96/117 Test  #96: test_ops_moe_grouped ................   Passed    0.00 sec
+        Start  97: test_ops_rmsnorm
+ 97/117 Test  #97: test_ops_rmsnorm ....................   Passed    0.00 sec
+        Start  98: test_ops_fused_chain
+ 98/117 Test  #98: test_ops_fused_chain ................   Passed    0.00 sec
+        Start  99: test_ops_activation
+ 99/117 Test  #99: test_ops_activation .................   Passed    0.00 sec
+        Start 100: test_ops_rope
+100/117 Test #100: test_ops_rope .......................   Passed    0.00 sec
+        Start 101: test_ops_rope_cache
+101/117 Test #101: test_ops_rope_cache .................   Passed    0.00 sec
+        Start 102: test_ops_gdn
+102/117 Test #102: test_ops_gdn ........................   Passed    0.02 sec
+        Start 103: test_ops_moe
+103/117 Test #103: test_ops_moe ........................   Passed    0.01 sec
+        Start 104: test_ops_glue
+104/117 Test #104: test_ops_glue .......................   Passed    0.00 sec
+        Start 105: test_ops_attn_preamble
+105/117 Test #105: test_ops_attn_preamble ..............   Passed    0.00 sec
+        Start 106: test_ops_attention
+106/117 Test #106: test_ops_attention ..................   Passed    0.01 sec
+        Start 107: test_ops_reshape_cache
+107/117 Test #107: test_ops_reshape_cache ..............   Passed    0.00 sec
+        Start 108: test_ops_paged_attn
+108/117 Test #108: test_ops_paged_attn .................   Passed    0.00 sec
+        Start 109: test_ops_sample
+109/117 Test #109: test_ops_sample .....................   Passed    0.02 sec
+        Start 110: test_ops_penalties
+110/117 Test #110: test_ops_penalties ..................   Passed    0.00 sec
+        Start 111: test_npy
+111/117 Test #111: test_npy ............................   Passed    0.00 sec
+        Start 112: test_tokenizer_parity
+112/117 Test #112: test_tokenizer_parity ...............   Passed    0.42 sec
+        Start 113: test_op_parity
+113/117 Test #113: test_op_parity ......................   Passed    0.07 sec
+        Start 114: test_qwen36_paged_engine
+114/117 Test #114: test_qwen36_paged_engine ............   Passed    0.00 sec
+        Start 115: test_qwen36_gguf_engine
+115/117 Test #115: test_qwen36_gguf_engine .............   Passed    0.00 sec
+        Start 116: test_qwen27_paged_engine
+116/117 Test #116: test_qwen27_paged_engine ............   Passed    0.00 sec
+        Start 117: test_server_help
+117/117 Test #117: test_server_help ....................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 117
+
+Total Test time (real) =  20.95 sec

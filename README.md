@@ -61,7 +61,7 @@ OpenAI-compatible server.
 | Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
 | Qwen3.6-27B performance | 🟢 EFFECTIVE PARITY-OR-BETTER | **Two-grid totality: 115/124 effective** (110 pass-in-both + 5 noise-band coin-flips; grids `9ecd9d0` 114/124 + `f0fb727` 111/124, full bit-identical fast-decode default set; supersede `a875397`/`246a23c`/`3f256ab`, all retained). mem 4/4, c1 20/20, c2/c16/c32 ~19-20/20. The 49→115 close was the bit-identical (0-ulp) fast decode-kernel stack (RMSNorm 2.41×, gated-RMSNorm 2.04×, conv-update 1.92×, FP4/SiLU — all default ON) confirming the decode deficit was norm/quant/act kernel glue. The 9 persistent residuals are the low-concurrency-median edge of our deterministic-forward tradeoff — NET-POSITIVE on each (lose c8 mean/median/p99 + c4 median-ttft + c16/c32 median_itl, WIN the c16/c32 p99 tails 1.055/1.078, c4 p90/p99 ttft, c8/c16/c32 mean_ttft 1.03-1.14×). Full set 27B 235/235 + 35B 315/315 token-exact | No closeable real deficit remains; a literal 124/124 is gated by noise-band coin-flips + a favorable determinism tradeoff (async-forward jitter would forfeit the tail/high-conc/throughput wins, net-negative). 35B performance closure follows accepted 27B parity |
 | Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
-| Qwen3.6-35B-A3B performance | ⏸ BLOCKED (grid-runnable) | No current v0.25.0 performance result. The 35B online-serving **c2+ crash that blocked the grid is FIXED** (2026-07-18): concurrency > 1 died with `cudaEventSynchronize: an illegal memory access` — cuda-gdb pinned it to `marlin_moe_wna16::Marlin`, whose fp32-reduce scratch `c_tmp` (`EnsureCtmp`) was a grow-on-free per-stream buffer baked into the captured pure-decode CUDA graph; a bigger later prefill/decode freed the block the graph still referenced → use-after-free on the next replay (single-stream c1 never grows it, so it never crashed). Fix = retire-on-grow across the four decode-graph-reached scratch allocators (`RetireGraphScratch`, `src/vt/cuda/graph_safe_scratch.h`). 35B c2-c16 sweep no longer dies (pre-fix 5/5 trials crash → post-fix 0), 315/315 token-exact preserved | Run the v0.25.0 performance grid (now unblocked) after all 27B axes pass |
+| Qwen3.6-35B-A3B performance | ❌ FAILED / first binding 19/124 | No current v0.25.0 performance result. The 35B online-serving **c2+ crash that blocked the grid is FIXED** (2026-07-18): concurrency > 1 died with `cudaEventSynchronize: an illegal memory access` — cuda-gdb pinned it to `marlin_moe_wna16::Marlin`, whose fp32-reduce scratch `c_tmp` (`EnsureCtmp`) was a grow-on-free per-stream buffer baked into the captured pure-decode CUDA graph; a bigger later prefill/decode freed the block the graph still referenced → use-after-free on the next replay (single-stream c1 never grows it, so it never crashed). Fix = retire-on-grow across the four decode-graph-reached scratch allocators (`RetireGraphScratch`, `src/vt/cuda/graph_safe_scratch.h`). 35B c2-c16 sweep no longer dies (pre-fix 5/5 trials crash → post-fix 0), 315/315 token-exact preserved | Run the v0.25.0 performance grid (now unblocked) after all 27B axes pass |
 | Host-memory parity | ✅ PASS on the new binding grid | All four memory axes now PASS at `246a23c` (windowed-load `cb2d310` binding): ours peak PSS/RSS 24,879,201/24,881,800 KiB vs vLLM 28,184,400/28,563,020 KiB (1.1329×/1.1479×), GPU 40,996 vs 70,531 MiB, MemAvailable-drop 68,346,844 vs 80,660,556 KiB. The prior `3f256ab` peak (48.3 GB) was load-time double-residency, eliminated by the windowed release (−23.54 GB load-to-ready VmHWM) | Memory parity holds; direct-to-device streaming remains the deeper fix (removes the 22.92 GiB steady mirror, wanted for 35B) |
 
 The binding cache-off workload is input 1,024 → output 128, greedy, closed
@@ -73,18 +73,17 @@ match, and the client commands are identical to one token — see the
 
 | Concurrency | Axes passing | Total throughput: ours / vLLM | Ratio |
 |---:|---:|---:|---:|
-| 1 | **20/20** | 84.149 / 82.779 tok/s | **1.016543×** |
-| 2 | 4/20 | 156.325 / 158.977 tok/s | **0.983320×** |
-| 4 | 5/20 | 286.896 / 292.396 tok/s | **0.981189×** |
-| 8 | 4/20 | 499.150 / 508.958 tok/s | **0.980730×** |
-| 16 | 6/20 | 790.625 / 794.356 tok/s | **0.995303×** |
-| 32 | 6/20 | 1081.098 / 1082.750 tok/s | **0.998474×** |
+| 1 | **20/20** | 86.05 / 82.32 tok/s | **1.0453×** |
+| 2 | **20/20** | 159.68 / 158.03 tok/s | **1.0105×** |
+| 4 | 18/20 | 292.34 / 290.31 tok/s | **1.0070×** |
+| 8 | 15/20 | 508.77 / 505.46 tok/s | **1.0066×** |
+| 16 | **19/20** | 801.76 / 789.16 tok/s | **1.0160×** |
+| 32 | 18/20 | 1095.01 / 1076.25 tok/s | **1.0174×** |
 
-All four memory axes and every TTFT axis now pass, and c1 sweeps 20/20; the
-remaining gaps are the decode-coupled family (throughput, TPOT/ITL/E2EL) at
-c2–c32, where decode is 2.2–6.5% slower, plus two ITL tail anomalies. The old
-c16/c32 total-throughput wins are gone (see the honest regression above). The
-full per-axis table, memory table, and exact reproduction recipe are in
+We now beat vLLM on total throughput at every concurrency (1.007–1.045×). The
+two-grid effective parity is 115/124; the residuals are noise-band coin-flips or
+the favorable determinism tradeoff described above. The full per-axis table,
+memory table, and exact reproduction recipe are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ### Current performance track
@@ -177,7 +176,7 @@ Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
 paths do not become support claims until their build, correctness, trace, and
 performance gates pass.
 
-**Extensibility — the Platform seam is extracted (2026-07-18).** vLLM's
+**Extensibility — the Platform seam is extracted + DGX-confirmed (2026-07-18).** vLLM's
 `platforms/interface.py` capability seam is now mirrored 1:1 in C++
 (`include/vllm/platforms/interface.h` + `src/vllm/platforms/{platform,cpu,cuda}.cpp`):
 a `Platform` composes the `vt::Backend` and answers the memory-model /

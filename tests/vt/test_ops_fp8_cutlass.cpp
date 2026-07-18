@@ -383,3 +383,74 @@ TEST_CASE("fp8 cuBLASLt W8A8 GEMM f32-output path matches reference") {
   dout.Download(g.q, got.data());
   CheckClose(got, ref, 2e-2f, 3e-2f);
 }
+
+// Byte-exactness proof for the per-device fp8 cuBLASLt PLAN CACHE
+// (src/vt/cuda/fp8_plan_cache.h): the cached {desc, layouts, algo} GEMM must be
+// BYTE-for-BYTE identical to the freshly-built-plan GEMM. The cache is DEFAULT
+// OFF (opt-in VT_FP8_PLAN_CACHE=1). Under the cache-ON ctest arm
+// (`test_ops_fp8_cutlass_plan_cache_on`, VT_FP8_PLAN_CACHE=1) the FIRST
+// MatmulFp8CublasLt call on a shape builds the plan fresh (empty cache -> full
+// descriptor/layout creation + cublasLtMatmulAlgoGetHeuristic, exactly the
+// per-call path) and USES it; every later call on that shape is a cache HIT
+// reusing the same desc/algo — so a first-call-vs-later-call byte compare in one
+// process is literally fresh-plan-output == cached-plan-output. Under the DEFAULT
+// (this plain test, cache OFF) every call rebuilds the plan fresh, proving the
+// shipped production path is byte-stable across repeats. Both hold because
+// cuBLASLt algo selection is process-deterministic per shape (the algo-latching
+// record), and a shape with no fp8 heuristic falls back to the deterministic
+// cutlass GEMM. Rank/dtype coverage: bf16 and f32 output, small-M decode +
+// prefill shapes.
+namespace {
+void ByteExactReuse(int M, int N, int K, uint32_t seed, DType out_dtype) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> ub(0, 255);
+  const float alpha = 0.035f * 0.017f;
+
+  auto rand_fp8 = [&](size_t n) {
+    std::vector<uint8_t> v(n);
+    for (auto& x : v) {
+      int byte = ub(rng);
+      if ((byte & 0x7F) == 0x7F) byte &= ~0x7;  // avoid NaN encodings (0x7F/0xFF)
+      x = static_cast<uint8_t>(byte);
+    }
+    return v;
+  };
+  const std::vector<uint8_t> a_fp8 = rand_fp8(static_cast<size_t>(M) * K);
+  const std::vector<uint8_t> b_fp8 = rand_fp8(static_cast<size_t>(N) * K);
+
+  Backend& b = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(b);
+  DeviceTensor da(b, g.q, DType::kI8, {M, K}, a_fp8.data());
+  DeviceTensor dw(b, g.q, DType::kI8, {N, K}, b_fp8.data());
+
+  const size_t out_bytes = static_cast<size_t>(M) * N * vt::SizeOf(out_dtype);
+  auto run_once = [&]() {
+    DeviceTensor dout(b, g.q, out_dtype, {M, N});
+    vt::MatmulFp8CublasLt(g.q, dout.tensor(), da.tensor(), dw.tensor(), alpha);
+    std::vector<uint8_t> raw(out_bytes);
+    dout.Download(g.q, raw.data());
+    return raw;
+  };
+
+  const std::vector<uint8_t> fresh = run_once();   // cache empty -> fresh-built plan
+  const std::vector<uint8_t> cached1 = run_once();  // cache hit -> reused plan
+  const std::vector<uint8_t> cached2 = run_once();  // cache hit again
+  CHECK(cached1 == fresh);   // cached-plan GEMM == fresh-plan GEMM, byte-for-byte
+  CHECK(cached2 == fresh);   // stable across repeated hits
+}
+}  // namespace
+
+TEST_CASE("fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA device; skipping fp8 cuBLASLt plan-cache byte-exact test");
+    return;
+  }
+  // Small-M decode (c1-c4) + prefill shapes, both output dtypes. Shapes without
+  // an fp8 heuristic fall back to cutlass — still byte-identical across reuse.
+  ByteExactReuse(1, 256, 128, 11, DType::kBF16);
+  ByteExactReuse(4, 512, 256, 12, DType::kBF16);
+  ByteExactReuse(8, 6144, 2048, 13, DType::kBF16);   // 35B-family fp8 projection shape
+  ByteExactReuse(64, 256, 256, 14, DType::kF32);
+  ByteExactReuse(1024, 512, 256, 15, DType::kBF16);  // prefill
+  ByteExactReuse(8, 256, 256, 16, DType::kF32);      // f32-out path
+}

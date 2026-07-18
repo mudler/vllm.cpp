@@ -167,6 +167,13 @@ vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.
 vllm_cpp_add_test(test_gemm_algo_log vt/test_gemm_algo_log.cpp)
 target_include_directories(test_gemm_algo_log PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the cuBLASLt FP8 plan-cache pure plumbing (the
+# VT_FP8_PLAN_CACHE flag + the Fp8PlanKey equality/hash completeness). Reaches the
+# internal header under src/ (not public API); the cached cuBLASLt {desc, layouts,
+# algo} it keys is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu, with the
+# byte-exact cached-vs-fresh GEMM proof in vt/test_ops_fp8_cutlass.cpp.
+vllm_cpp_add_test(test_fp8_plan_cache vt/test_fp8_plan_cache.cpp)
+target_include_directories(test_fp8_plan_cache PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the register-resident packed-decode tiling A/B flag
 # (VT_GDN_PACKED_REG_TILE). Reaches the internal header under src/ (not public
 # API); the kernel it gates is CUDA-only and lives in src/vt/cuda/cuda_gdn.cu.
@@ -246,6 +253,16 @@ if(VLLM_CPP_CUTLASS)
       "VT_FP4_TEST_PERSISTENT_SAVE=1;VT_FP4_PERSISTENT_CACHE=1;VT_FP4_AUTOTUNE_CACHE_READONLY=0;VT_FP4_AUTOTUNE_CACHE_PATH=${CMAKE_CURRENT_BINARY_DIR}/nvfp4-runtime-save-lifecycle.json;VT_FP4_AUTOTUNE_DELAY_US=0;VT_FP4_PLAN_CACHE=1;VT_FP4_AUTOTUNE=1;VT_FP4_FULL_TACTICS=1")
 endif()
 vllm_cpp_add_test(test_ops_fp8_cutlass vt/test_ops_fp8_cutlass.cpp)
+# Opt-in arm: run the fp8 plan-cache byte-exact case with the cache ENABLED
+# (VT_FP8_PLAN_CACHE=1 -> first MatmulFp8CublasLt call builds the plan fresh,
+# later calls hit the cache). Proves the cached-plan GEMM is BYTE-identical to the
+# freshly-built one. The DEFAULT (cache OFF, every call rebuilds — the shipped
+# production path) runs inside the plain test_ops_fp8_cutlass.
+add_test(NAME test_ops_fp8_cutlass_plan_cache_on
+  COMMAND test_ops_fp8_cutlass
+    "--test-case=fp8 cuBLASLt cached-plan GEMM is BYTE-identical to the fresh-plan GEMM")
+set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
+  ENVIRONMENT "VT_FP8_PLAN_CACHE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)

@@ -61,7 +61,14 @@ struct Registrar {
     if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) != cudaSuccess) {
       return;
     }
+    // GCC 13 false-positive: -Wdangling-pointer mis-flags a static local with a
+    // vtable constructed from automatic ints, though CudaPlatform copies both
+    // into cap_ by value (no pointer/reference to major/minor is retained). The
+    // static outlives the registrar as RegisterPlatform requires.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
     static CudaPlatform platform(major, minor);  // device 0 only for now
+#pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }
 } registrar;

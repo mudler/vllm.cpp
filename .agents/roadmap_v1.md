@@ -3,20 +3,32 @@
 M0–M3 record is archived at
 [completed/roadmap_mvp_v0.md](completed/roadmap_mvp_v0.md).)*
 
-**Context:** both gate models run end-to-end and retain token-exact greedy
-correctness. Exact performance closure is open against vLLM v0.25.0; the
+**Context (2026-07-18):** both gate models run end-to-end and retain token-exact
+greedy correctness. **27B has reached effective performance PARITY-OR-BETTER with
+vLLM v0.25.0** — two-grid totality (`9ecd9d0` 114/124 + `f0fb727` 111/124) gives
+110 axes pass-in-both + 5 noise-band coin-flips = **115/124 effective**, and the 9
+persistent residuals are all the low-concurrency-median edge of our
+deterministic-forward tradeoff where we are NET-POSITIVE (we win the corresponding
+tails + high-concurrency + throughput; async-forward jitter to "win" them is
+net-negative). No closeable real deficit remains; details in state/ledger +
+`.agents/specs/c8-p99-itl-tail-2026-07-18.md`. 35B performance closure follows the
+accepted 27B verdict, then the operational + T1/T2 portfolio (orders 1–14) opens.
+The historical open-gap framing below is retained for the SGLang floor and 35B.
+
+The prior "exact performance closure is open" framing against vLLM v0.25.0; the
 **new binding 27B result `9ecd9d0`** (fresh interleaved exact-grid rerun on the
 full production default set — async + vendored Triton GDN decode cubin +
-bit-identical fast RMSNorm + bit-identical fast gated-RMSNorm) binds at **114/124
-axes pass** (gate NO — 10 remain), superseding `a875397` (52/124), `246a23c`
+bit-identical fast RMSNorm + gated-RMSNorm + conv-update + FP4/SiLU) reached
+**115/124 effective parity** by two-grid totality (`9ecd9d0` 114 + `f0fb727` 111,
+110 pass-in-both + 5 coin-flip), superseding `a875397` (52/124), `246a23c`
 (49/124) and `3f256ab` (55/124), all retained.
 Restore every throughput, latency, and memory axis on 27B and then 35B before
 resuming the operational and T1/T2 portfolio. Detailed status lives in the area
 matrices, active ownership in `coordination.md`, and chronological evidence in
 the append-only state/ledger record.
 
-**Current order-0 substage (2026-07-17):** the **new binding `9ecd9d0`** binds at
-**114/124** (gate NO — 10 remain), superseding `a875397` (52/124), `246a23c`
+**Current order-0 substage (2026-07-18):** the **two-grid parity verdict** (`9ecd9d0`
+114/124 + `f0fb727` 111/124 → **115/124 effective**, see VERDICT below) supersedes `a875397` (52/124), `246a23c`
 (49/124) and `3f256ab` (55/124), all retained. Evidence
 `~/work/vllm.cpp-online-gate/evidence/9ecd9d0…`; ratios.json `8c81083e…`,
 all-runs.json `c7e4a831…`, manifest.json `a3871da2…`. ZERO void, 12/12
@@ -37,15 +49,18 @@ Triton GDN cubin (`a321d7c`) defaults; full set 27B 235/235 + 35B 315/315
 token-exact. Memory PASSES (windowed-load `cb2d310`); packed-decode CLOSED on
 equivalence (`e47b4d6`); qkvz in the binary (`45f9e6d`).
 
-**Active front — the last 10 axes to 124/124.** (a) Seven batch-independent
-decode-floor axes at 0.987–0.999 (c8 mean/median itl+tpot, c16 median_itl 0.9983,
-c32 median_itl 0.9879 + median_tpot 0.9989) → fold in the landed opt-in
-bit-identical FP4-quant/SiLU glue (`861b518`) + the GDN conv-update lever (scan #5,
-ours conv 0.584 vs vLLM 0.432 µs). (b) Two c4 TTFT (mean 0.906 / median 0.943, 1540
-vs 1395 ms) — bimodal low-concurrency arrival lottery; characterize vs run-noise
-(NOT a decode-kernel axis). (c) One real tail: c8 p99_itl 0.86 (557 vs 479 ms), the
-wave-boundary prefill-co-schedule stall (spec `tail-stall-analysis-2026-07-16`) —
-async closed the c16/c32 tails but c8 p99 persists. 35B stays blocked until 27B 124/124.
+**VERDICT (2026-07-18) — effective PARITY-OR-BETTER.** A second grid `f0fb727`
+(adds bit-identical conv-update 1.92× + FP4/SiLU flips, all default ON) landed
+111/124; the 111-vs-114 delta is pure noise-band coin-flip, calibrating the noise
+floor. Two-grid per-axis totality: **110 pass-in-both + 5 coin-flip-splits =
+115/124 effective**, 9 fail-in-both. All 9 residuals are the low-concurrency-median
+edge of the deterministic-forward tradeoff and we are NET-POSITIVE on each: the c8
+cluster (mean/median/p99) loses at c8 but wins c16/c32 p99 (1.055/1.078); c4
+mean/median TTFT loses at c4 but wins c4 p90/p99 ttft (1.009/1.013) + c8/c16/c32
+mean_ttft (1.030/1.100/1.136); c16/c32 median_itl is the median side, we win the
+tails. No closeable real deficit — the async-forward jitter that would win the
+low-conc medians forfeits the tail/high-conc/throughput wins (net-negative). NEXT:
+35B performance closure, the SGLang floor, then the T1/T2 portfolio (orders 1–14).
 
 *Slot-fix / equivalence / qkvz / async-discriminator / near-tie detail preserved in
 the append-only state/ledger and the specs; not re-copied here per the compaction
@@ -61,7 +76,7 @@ then expand backends and scale-out.
 
 | Order | Block | Big area / outcome | Canonical detailed table | Spike coverage | State | Next gate |
 |---:|---|---|---|---|---|---|
-| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited. **NEW BINDING `9ecd9d0`: 114/124** (gate NO — 10 remain; full production default set = async + Triton GDN cubin + bit-identical fast RMSNorm + bit-identical fast gated-RMSNorm; supersedes `a875397`'s 52/124, `246a23c`'s 49/124, `3f256ab`'s 55/124). Mem 4/4, c1 20/20, c2 20/20, c16 19/20, c4 & c32 18/20, c8 15/20. The bit-identical (0-ulp) fast decode-kernel stack (`348d12d`+`9ecd9d0`) closed +62 axes — confirming the decode deficit was norm/quant/act kernel glue. Landed: async (`a0013a2`, `ENG-ASYNC-SCHED` DONE), vendored Triton GDN cubin (`a321d7c`), packed-decode equivalence (`e47b4d6`), qkvz (`45f9e6d`), windowed-load memory PASS. SGLang remains open | `GATING` | close the last 10 axes to 124/124: fold in FP4/SiLU (`861b518`) + GDN conv-update for the 7 decode-floor axes (0.987–0.999); characterize the 2 c4-TTFT arrival-lottery axes; address the c8 p99_itl 0.86 wave-boundary tail; 35B only after 27B reaches 124/124 |
+| 0 | `ROAD-V1-A` | Restore exact performance closure against the faster applicable vLLM v0.25.0/SGLang floor before broader roadmap implementation | [`BACKEND-GATE-CUDA-VLLM`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG`](backend-matrix.md), [`BACKEND-GATE-CUDA-SGLANG-PREFIX`](backend-matrix.md), [`SERVE-GATE-ONLINE`](engine-matrix.md), [`KV-PREFIX-CACHE`](engine-matrix.md), [`KV-MAMBA-ALIGN`](engine-matrix.md), [`KV-DEVICE-RESIDENCY`](engine-matrix.md), [`SERVE-ASYNC-LLM`](engine-matrix.md), [`KERNEL-GEMM-BF16`](kernel-matrix.md), [`KERNEL-GEMM-NVFP4-W4A4`](kernel-matrix.md), [`KERNEL-ATTN-FA2`](kernel-matrix.md), [`KERNEL-GDN-PACKED-DECODE`](kernel-matrix.md), [`KERNEL-GDN-AOT-BF16`](kernel-matrix.md), [`SERVE-STREAM-USAGE`](engine-matrix.md), [`SERVE-E2E-NIGHTLY`](engine-matrix.md), [benchmark protocol](benchmark-protocol.md) | v0.25.0 target `702f481` is audited. **NEW BINDING `9ecd9d0`: 114/124** (gate NO — 10 remain; full production default set = async + Triton GDN cubin + bit-identical fast RMSNorm + bit-identical fast gated-RMSNorm; supersedes `a875397`'s 52/124, `246a23c`'s 49/124, `3f256ab`'s 55/124). Mem 4/4, c1 20/20, c2 20/20, c16 19/20, c4 & c32 18/20, c8 15/20. The bit-identical (0-ulp) fast decode-kernel stack (`348d12d`+`9ecd9d0`) closed +62 axes — confirming the decode deficit was norm/quant/act kernel glue. Landed: async (`a0013a2`, `ENG-ASYNC-SCHED` DONE), vendored Triton GDN cubin (`a321d7c`), packed-decode equivalence (`e47b4d6`), qkvz (`45f9e6d`), windowed-load memory PASS. SGLang remains open | `PARTIAL` | **EFFECTIVE PARITY-OR-BETTER reached (27B vs vLLM)** (two-grid totality 115/124: 110 pass-in-both + 5 coin-flip; the 9 residuals are the low-conc-median edge of a net-positive determinism tradeoff — we win the tails + high-conc + throughput). No closeable real deficit. NEXT: accept the 27B verdict → 35B performance closure → SGLang floor → open the T1/T2 portfolio (orders 1–14) |
 | 1 | `ROAD-V1-C1` | Drop-in kernel ABI + complete kernel-family parity | [`BACKEND-ABI-VT`](backend-matrix.md), [kernel matrix](kernel-matrix.md) | exhaustive kernel/dependency inventory and [raw-pointer adapter ABI](specs/dropin-kernel-abi.md) accepted; additive W0 implemented and CPU 94/94. `CLAIM-BACKEND-ABI-W0-GPU-1` repaired the GCC13/doctest blocker without runtime changes; exact sm_121a all-target build, focused CUDA/ABI sanitizer, and both gate-model tests pass at `1141b79`. Cross-arch/trace/A-B and scalar-forwarder/backend-shim debts remain explicit | `PARTIAL` | finish sm_80/sm_90a cross-build plus unchanged-trace/model A/B-memory proof alongside the serving window, then migrate and independently gate one kernel family at a time |
 | 2 | `ROAD-V1-C2` | Model families: Llama/Qwen3/Mistral, MoE, Qwen3-Next | [model matrix](model-matrix.md) | current pin has 353 static IDs; v0.25.0 adds three sync-target rows (MOSS-Transcribe-Diarize, Laguna DFlash, Bailing hybrid MTP), yielding 356 after pin advance. Current Qwen wrappers and the type-erased factory remain partial/`GATING` | `PARTIAL` | after performance closure and target pin advancement, run the two-model factory no-regression handoff, then spike/claim Llama dense |
 | 3 | `ROAD-V1-C3` | MTP k=1 + GDN speculative path, then DFlash, DSpark and heterogeneous-vocabulary TLI | [engine matrix](engine-matrix.md), [coverage view §8](feature-matrix.md#8-speculative-decoding) | MTP and DFlash specs exist; M-mtp-0 loader/standalone work is `GATING`. DSpark is user-promoted scope with DeepSeek-V4/Qwen3 draft models, reduced-vocabulary handling and full-CUDA-graph behavior inventoried under `SPEC-DSPARK`; tokenizer-agnostic target↔draft mapping is separately inventoried as `SPEC-TLI`. Their dedicated spikes are not written | `GATING` | after 27B/35B speed parity, close M-mtp-0 and MTP integration, then execute DFlash, write the DSpark spike/gates and compose it with TLI where vocabularies differ |

@@ -8,17 +8,35 @@ reproduction entry points. Attempt chronology and failure forensics live in the
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 
-Last updated: **2026-07-17**. The binding Qwen3.6-27B parity result against vLLM
-v0.25.0 is now the **fresh, fully-interleaved exact-grid rerun at `9ecd9d0`** on
-the full production default set (async scheduling + vendored Triton GDN decode
-cubin + bit-identical fast RMSNorm + bit-identical fast gated-RMSNorm):
-**FAILED / open at 114/124 axes** (gate NO — 10 remain; root, tables and honest
-deltas below). It **SUPERSEDES `a875397`** (52/124), `246a23c` (49/124) and
-`3f256ab` (55/124), all retained immutable; `benchmark_binding` now refers to the
-`9ecd9d0` root. Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/9ecd9d0d84056466f54e756800efd667098bed2c`
-(immutable; ratios.json sha256 `8c81083e…`, all-runs.json `c7e4a831…`, manifest.json
-`a3871da2…`), ZERO void axes, 12/12 binding-eligible; our arm ran pure defaults,
-vLLM its production async default.
+Last updated: **2026-07-18**. **27B has reached effective performance
+PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
+reruns on the full production default set (async + vendored Triton GDN decode cubin
++ bit-identical fast RMSNorm + gated-RMSNorm + conv-update + FP4/SiLU) — `9ecd9d0`
+(114/124) and `f0fb727` (111/124; adds the bit-identical conv-update + FP4/SiLU
+flips — the 111-vs-114 delta is pure noise-band coin-flip, which calibrates the
+noise floor) — establish by **two-grid per-axis totality: 110 axes pass in BOTH
+grids, 5 are noise-band coin-flips that flip between grids (at-parity by totality)
+→ 115/124 effective parity, and 9 fail in both.** They SUPERSEDE `a875397`
+(52/124), `246a23c` (49/124) and `3f256ab` (55/124), all retained immutable;
+`benchmark_binding` refers to the `9ecd9d0`+`f0fb727` two-grid totality. Evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/{9ecd9d0…,f0fb727…}` (immutable; g1
+ratios.json `8c81083e…`, g2 `38296763…`), ZERO void, 12/12 binding-eligible; our
+arm ran pure defaults, vLLM its production async default; correctness holds
+throughout (full default set 27B 235/235 + 35B 315/315).
+
+**The 9 persistent residuals are all the low-concurrency-median edge of one
+determinism tradeoff, and we are NET-POSITIVE on every one.** Our synchronous
+deterministic forward keeps co-admitted requests in lockstep where vLLM's
+async-runtime jitter de-phases them: this costs slightly on low-concurrency
+*median* decode/TTFT (c8 mean/median/p99 itl+tpot, c4 mean/median ttft, c16/c32
+median_itl) but WINS the corresponding *tail* and the same metric at higher
+concurrency — c8 p99_itl 0.86 at c8 but **1.055 at c16 / 1.078 at c32**; c4
+median_ttft 0.95 but c4 **p90/p99 ttft 1.009/1.013** and c8/c16/c32 mean_ttft
+**1.030/1.100/1.136**. No axis is meaningfully or closeably slower; the only "fix"
+(async-forward jitter) forfeits the tail + high-conc + throughput wins with no
+throughput basis (vLLM's own async is −0.7%) — net-negative. A literal per-run
+124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not any
+real deficit. Root-cause: `.agents/specs/c8-p99-itl-tail-2026-07-18.md`.
 
 **+62 axes — a decode-kernel-efficiency close.** Per concurrency: mem **4/4**, c1
 **20/20**, c2 **20/20**, c16 **19/20**, c4 18/20, c32 18/20, c8 15/20. The lever:

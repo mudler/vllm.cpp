@@ -223,7 +223,6 @@ default 235/235, 27B `VT_GDN_PACKED_DECODE=0` rollback 235/235, 35B 2 cases
 capture/replay-mode scope remains). `benchmark_binding=false`, no speed credit —
 payoff measured by the c2/c8 probe + the next authorized exact grid. Rescan §1
 items a-runner/b stay with the async/GDN `runner.cpp` owners.
-| `CLAIM-MEM35-HOSTFREE` | `ENG-MOE-HOSTFREE` | mem35 host-free agent (Opus 4.8) | `dgx:~/work/mem35-hostfree` (`source` + `build-cpu` + `build-cuda`; evidence `mem/`, `gpu-series3.log`) | worktree `agent-adaf49c4fc639d5ab` on `main` | `qwen3_5.cpp` BuildMoeMarlinResident host-free region ONLY (3743-3781) + `qwen3_5_weights.{h,cpp}` `OwnedTensor::ReleaseHost` + `tests/vllm/test_qwen36_weights.cpp` + spec/matrix/ledger/README/BENCHMARKS. Did NOT touch the sibling's MoE memset lines / `cuda_moe.cu` / `cuda_marlin_repack.cu` or the `BACKEND-PLATFORM`-owned `cuda.cpp` residency flag | `ACTIVE` | 2026-07-18 (LANDED + GATED: free the ~16.9 GiB routed-expert fp4 host mirror after the device Marlin resident is built; `madvise(MADV_DONTNEED)` returns the pages; 35B STEADY serving PSS 20.17→**3.53 GiB** clean A/B, guarded to the Marlin path, token-neutral 315/315+235/235, memcheck clean. Row stays `ACTIVE` because the memory FRONT is not closed — the whole-window PEAK (load-phase coexistence) remains, needing the load-time streaming interleave (`ENG-EXPERT-STREAM`). Item-2 residency-policy link recorded; flag left to `CLAIM-BACKEND-PLATFORM-1`) |
 
 ## Handoff queue
 
@@ -258,6 +257,7 @@ change:
 This keeps `.agents/` focused on current work without losing the discoverable
 list of what the project supports.
 
+- 2026-07-18: `CLAIM-MEM35-HOSTFREE` RELEASED — `ENG-MOE-HOSTFREE` → `DONE` (closing `ac77bec`). The 35B MoE Marlin host-weight free (`OwnedTensor::ReleaseHost` = `madvise(MADV_DONTNEED)`+swap, gated on `MarlinMoeEnabled()`, `VT_MOE_HOST_FREE=0` rollback) returns the ~16.9 GiB routed-expert fp4 host mirror after the device Marlin resident is built → 35B STEADY serving PSS 20.17→**3.53 GiB** (clean same-binary A/B, DGX `~/work/mem35-hostfree`), token-neutral 315/315+235/235, c2 smoke + memcheck clean, load-path release/retention 27/27+15/15. Realizes item-2 `release_host_weights_after_upload` for the dominant host consumer (flag stays with `CLAIM-BACKEND-PLATFORM-1`). Scoped to the STEADY mirror; the whole-window load-phase PEAK remains for the streaming follow-on (`ENG-EXPERT-STREAM`). Spec [moe-marlin-host-free.md](specs/moe-marlin-host-free.md), ledger 2026-07-18 row, worktree `agent-adaf49c4fc639d5ab` released.
 - 2026-07-17: `CLAIM-EW-NORM-ACT-1` RELEASED — `KERNEL-EW-NORM-ACT` decode-fast RMSNorm proof PASSED (gate3 token gates both flags/models; gate4 corrected-build c16 A/B +1.1% tput / −1.7 ms TPOT) and `VT_RMSNORM_DECODE_FAST` default flipped ON (`=0` rollback). Verdict in [the spec](specs/rmsnorm-decode-fast-2026-07-16.md) + ledger 2026-07-17 row; row `KERNEL-EW-NORM-ACT` → `DONE`. Finalized by the orchestrator after the owning agent was repeatedly terminated by API-529 overloads (work verified, not re-done).
 
 - 2026-07-18: `CLAIM-CONV-UPDATE-FAST-1` RELEASED — the two decode-glue headroom

@@ -13096,3 +13096,5 @@ unaffected here.
 under `BACKEND-PLATFORM`/`CLAIM-BACKEND-PLATFORM-1` (not touched here, per
 ownership); the direct free is gated on `MarlinMoeEnabled()` and the item-2 link
 is recorded in the spec. Spec: `.agents/specs/moe-marlin-host-free.md`.
+
+**Closed `ac77bec`:** `ENG-MOE-HOSTFREE` → `DONE`, `CLAIM-MEM35-HOSTFREE` released. Peak/streaming remains the `ENG-EXPERT-STREAM` follow-on.

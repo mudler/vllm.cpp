@@ -31,6 +31,7 @@
 #include "core/scalar_type.hpp"
 #include "libtorch_stable/moe/marlin_moe_wna16/marlin_mm.h"
 
+#include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -82,7 +83,18 @@ float* EnsureCtmp(cudaStream_t s, size_t bytes) {
   std::lock_guard<std::mutex> lk(mu);
   Scratch& sc = pool[s];
   if (bytes > sc.cap) {
-    if (sc.p != nullptr) Check(cudaFreeAsync(sc.p, s), "cudaFreeAsync c_tmp grow");
+    // RETIRE the old block instead of freeing it: this per-stream Marlin MoE c_tmp
+    // reduce scratch pointer is baked into the captured pure-decode CUDA graph (it is
+    // passed to marlin_mm, the faulting kernel a cuda-gdb catch pinned as
+    // marlin_moe_wna16::Marlin<...>). A later, larger forward — a bigger co-scheduled
+    // prefill or a larger decode batch, only reachable at concurrency > 1 — grows
+    // c_tmp (its size is size_n * sorted_token_ids, which scales with the token
+    // count); freeing the old block here dangles the captured graph's pointer, so the
+    // next graph replay reads freed memory → Warp Illegal Address (surfaced at the
+    // next cudaEventSynchronize). This is exactly the 35B c2+ online-serving crash;
+    // single-stream (c1) never grows c_tmp after its one prefill, so it never hits it.
+    // See graph_safe_scratch.h. (Growth is O(log); retired memory is negligible.)
+    RetireGraphScratch(sc.p);
     Check(cudaMallocAsync(&sc.p, bytes, s), "cudaMallocAsync c_tmp (pool)");
     sc.cap = bytes;
   }

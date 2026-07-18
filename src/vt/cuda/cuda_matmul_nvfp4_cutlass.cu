@@ -31,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "vt/cuda/graph_safe_scratch.h"
 #include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_cutlass_tactics.h"
 #include "vt/cuda/nvfp4_persistent_cache.h"
@@ -104,7 +105,13 @@ StreamScratch& ScratchFor(cudaStream_t stream) {
 void* EnsureScratch(void** buffer, size_t* capacity, size_t required, cudaStream_t stream,
                     const char* what) {
   if (required > *capacity) {
-    if (*buffer != nullptr) Check(cudaFreeAsync(*buffer, stream), "cudaFreeAsync scratch grow");
+    // RETIRE the old block instead of freeing it: this per-stream cutlass NVFP4
+    // GEMM workspace pointer is baked into the captured pure-decode CUDA graph (its
+    // fp4 projection / expert / lm_head GEMM nodes). A later, larger forward (a
+    // bigger co-scheduled prefill or a larger decode batch — only at concurrency > 1)
+    // grows the workspace; freeing the old block would dangle the captured graph's
+    // pointer → illegal memory access on the next replay. See graph_safe_scratch.h.
+    RetireGraphScratch(*buffer);
     Check(cudaMallocAsync(buffer, required, stream), what);
     *capacity = required;
   }

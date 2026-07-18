@@ -42,6 +42,7 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
 
 using namespace cute;
@@ -93,7 +94,13 @@ StreamScratch& ScratchFor(cudaStream_t s) {
 // the (possibly new) pointer.
 void* EnsureScratch(void** buf, size_t* have, size_t need, cudaStream_t s, const char* what) {
   if (need > *have) {
-    if (*buf != nullptr) Check(cudaFreeAsync(*buf, s), "cudaFreeAsync scratch grow");
+    // RETIRE the old block instead of freeing it: this per-stream cutlass FP8 GEMM
+    // workspace pointer is baked into the captured pure-decode CUDA graph. A later,
+    // larger forward (a bigger co-scheduled prefill or a larger decode batch — only
+    // at concurrency > 1) grows the workspace; freeing the old block would dangle the
+    // captured graph's pointer → illegal memory access on the next replay. See
+    // graph_safe_scratch.h.
+    RetireGraphScratch(*buf);
     Check(cudaMallocAsync(buf, need, s), what);
     *have = need;
   }

@@ -12924,3 +12924,56 @@ entry, one append-only parity-ledger row, README kernel-coverage note,
 BENCHMARKS NOT-APPLICABLE note. No matrix/roadmap lifecycle shift
 (`KERNEL-EW-NORM-ACT` "casts and glue" is already `DONE`; this is CPU-side
 completeness within it). `benchmark_binding=false`, no speed credit.
+## 2026-07-18 — 35B online-serving c2+ crash ROOT-CAUSED + FIXED (the 35B performance-grid blocker); `CLAIM-35B-GRAPH-SCRATCH-1`
+
+The `nvidia/Qwen3.6-35B-A3B-NVFP4` MoE online-serving crash (`engine-fatal:
+EngineCore busy loop threw: vt cuda: cudaEventSynchronize: an illegal memory
+access was encountered` at concurrency > 1; c1 always fine; offline
+`test_qwen36_paged_engine` 315/315) is root-caused and fixed.
+
+**Isolation (differential, one server, concurrency sweep c1→c2→c2→c4→c8→c16):**
+production (graphs ON + async ON) crashed **5/5** trials; async OFF
+(`VT_ASYNC_RUNNER=0 VT_ASYNC_SCHED=0`) **5/5** crash (async NOT the cause);
+`VT_NVFP4_WMMA=0` **2/2** crash (cutlass WMMA-scatter NOT the cause); graphs OFF
+(`VLLM_CPP_CUDAGRAPH=0`) **CLEAN** (the decode CUDA graph IS required); eager +
+short prompts CLEAN (long, multi-KV-block context required); compute-sanitizer
+memcheck 0 errors at both c2 and c8 (it SERIALIZES → masks the bug). Repro/
+differential roots `dgx:~/work/vllm.cpp-35b-stat-{asyncON,asyncOFF,wmmaOFF,graphOFF}`.
+
+**cuda-gdb pinned the faulting kernel** (catches the device exception even inside
+a graph replay, no memcheck serialization; `dgx:~/work/vllm.cpp-35b-gdb/gdb.log`):
+`CUDA Exception: Warp Illegal Address` in
+`marlin_moe_wna16::Marlin<…,128,1,8,4,false,4,1,false>(…)<<<(144,1,1),(128,1,1)>>>`.
+
+**Root cause:** the 35B MoE runs through the **Marlin** grouped-GEMM
+(`MoeBlockFusedMarlinCuda`→`marlin_mm`). Its fp32 global-reduce scratch `c_tmp`
+comes from **`EnsureCtmp`** (`src/vt/cuda/cuda_moe_marlin.cu:75`), a per-stream
+grow-on-demand buffer that FREED (`cudaFreeAsync`) the old block on growth. The
+pure-decode forward is captured into a CUDA graph whose kernel nodes BAKE the
+`c_tmp` pointer; `c_tmp`'s size is `size_n * sorted_token_ids` (scales with the
+token count), so a bigger LATER forward — a co-scheduled prefill or a larger
+decode batch, only reachable at concurrency > 1 — grows it and frees the block the
+captured decode graph still references → the next replay's `marlin_mm` reads freed
+memory → IMA (surfaced at `cudaEventSynchronize`). c1 never grows `c_tmp` after
+its one prefill, so it never crashes. `EnsureCtmp` is one of a FAMILY of
+grow-on-free scratch allocators reached in decode graphs (`EnsureMoeScratch`
+`cuda_matmul_nvfp4.cu`; cutlass NVFP4/FP8 `EnsureScratch`
+`cuda_matmul_nvfp4_cutlass.cu`/`cuda_matmul_fp8_cutlass.cu`) — same hazard for
+other model/quant decode paths.
+
+**Fix:** new `src/vt/cuda/graph_safe_scratch.h` `RetireGraphScratch(void*)` keeps
+the old block RESIDENT (retire, never free) on growth, so any pointer a captured
+graph baked stays valid (the graph only needs the size it had at capture ≤ the
+retired block's capacity; growth is O(log) so retired memory is negligible). All
+four grow-on-free allocators replace their free-on-grow with `RetireGraphScratch`.
+Capture behaviour unchanged (growth only ever happens OUTSIDE capture). CPU
+`test_graph_safe_scratch` 4/4; clean `-Werror` CUDA build 0 warnings, CUTLASS
+sm120a + FA2 sm_121a hard-verified. DGX validation (`dgx:~/work/vllm.cpp-35b-fix`,
+gate `~/work/vllm.cpp-35b-fix-gate`, one flock): concurrency-sweep serving harness
+at async-ON production defaults — pre-fix 5/5 crash → post-fix 0; token-exact
+`test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine` 315/315; memcheck
+c2 35B 0 errors. `benchmark_binding=false` (correctness fix, no speed credit). The
+35B performance grid is UNBLOCKED. Also fixed the DGX-local `regrid35.sh` summary
+fallback (`python3 -m tools.bench.online_gate_summary` from `$SRC` with
+`PYTHONPATH` so `tools` is importable — was a path-run `ModuleNotFoundError`;
+regrid35.sh is not repo-tracked, so noted here, not committed).

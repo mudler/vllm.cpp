@@ -54,6 +54,7 @@
 #include <type_traits>
 
 #include "vt/cuda/fp4_quant_fast.h"
+#include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -764,7 +765,14 @@ int32_t* g_moe_scratch = nullptr;
 size_t g_moe_scratch_cap = 0;  // capacity in int32 elements
 int32_t* EnsureMoeScratch(int64_t elems) {
   if (static_cast<size_t>(elems) > g_moe_scratch_cap) {
-    if (g_moe_scratch) cudaFree(g_moe_scratch);
+    // RETIRE the old block instead of freeing it: the MoE grouped-GEMM index
+    // scratch pointer is baked into the captured pure-decode CUDA graph (the
+    // WMMA-scatter memset/hist/scatter/tilemap nodes). A later, larger forward
+    // (a bigger co-scheduled prefill or a larger decode batch — only at
+    // concurrency > 1) grows this buffer; freeing the old block here would dangle
+    // the captured graph's pointer → illegal memory access on the next replay.
+    // See graph_safe_scratch.h. (Growth is O(log); retired memory is negligible.)
+    RetireGraphScratch(g_moe_scratch);
     Check(cudaMalloc(&g_moe_scratch, static_cast<size_t>(elems) * sizeof(int32_t)),
           "moe grouped persistent scratch");
     g_moe_scratch_cap = static_cast<size_t>(elems);

@@ -203,6 +203,13 @@ target_include_directories(test_rmsnorm_gated_fast PRIVATE ${CMAKE_SOURCE_DIR}/s
 # src/vt/cuda/cuda_gdn.cu (CausalConv1dUpdateFastKernel).
 vllm_cpp_add_test(test_conv_update_fast vt/test_conv_update_fast.cpp)
 target_include_directories(test_conv_update_fast PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the CUDA-graph-safe grow-only device scratch bookkeeping
+# (src/vt/cuda/graph_safe_scratch.h): a grown-past scratch block is RETIRED (kept
+# resident), never freed, so a device pointer baked into a captured pure-decode CUDA
+# graph stays valid — the fix for the 35B c2+ online-serving illegal-memory-access.
+# The device proof is the DGX serving harness; this pins the never-free guarantee.
+vllm_cpp_add_test(test_graph_safe_scratch vt/test_graph_safe_scratch.cpp)
+target_include_directories(test_graph_safe_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU threadpool (QUANT-GGUF-CPU-THREADPOOL): barrier/park-wake/chunk-steal
 # stress + the n_threads 1/3/20 determinism battery. Reaches the internal
 # header under src/ (the pool is not public API).

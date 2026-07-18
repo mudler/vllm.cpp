@@ -46,9 +46,7 @@ OpenAI-compatible server.
 > throughput basis (vLLM's own async is −0.7%) — net-negative. A literal per-run
 > 124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not by
 > any real deficit; see `.agents/specs/c8-p99-itl-tail-2026-07-18.md` and the
-> parity ledger. **First 35B performance binding (2026-07-18): 19/124** on
-> `69f2717` (Qwen3.6-35B-A3B-NVFP4, MoE) — a fresh parity front distinct from
-> 27B: **MoE host double-store FIXED (2026-07-18)** — freeing the routed-expert
+> parity ledger. **35B performance: 19→39/124** (2026-07-18, re-grids `69f2717`→`6a8c5cf`; Qwen3.6-35B-A3B-NVFP4, MoE). The MoE routing/align + host-free levers closed the high-concurrency decode (c16/c32 now WIN throughput+TPOT); remaining: **MoE host double-store FIXED (2026-07-18)** — freeing the routed-expert
 > fp4 host mirror after the device Marlin resident is built (+`madvise`) drops
 > 35B STEADY serving PSS 20.17→**3.53 GiB** (beats vLLM's 13.3), token-neutral
 > 315/315+235/235; the grid's whole-window `peak_pss` (~19.8 GiB load-phase

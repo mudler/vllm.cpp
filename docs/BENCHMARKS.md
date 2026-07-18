@@ -497,16 +497,16 @@ Both arms 18/18 legs, 12/12 binding-eligible; evidence
 sha256 `e7576e09…`. 35B correctness holds (315/315 token-exact throughout). The
 vLLM oracle arm required a disk reclaim (flashinfer sm120 GEMM JIT).
 
-**Disposition: 19/124 — a fresh parity front distinct from 27B's decode close.**
+**Disposition: 39/124** (first grid `69f2717` was 19/124; re-grid `6a8c5cf` after L1 MoE routing/align + L2 host-free = **39/124**). The routing/align lever closed the high-concurrency decode (c16/c32 now WIN); **TTFT/prefill (0.79–0.88× at every concurrency) is now the dominant gap**, plus c1–c4 low-batch decode and the load-time memory peak.
 
 | Concurrency | Axes | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) |
 |---:|---:|---:|---:|---:|
-| 1 | 0/20 | 453.65 / 610.53 (0.7430×) | 0.8572× | 0.7336× |
-| 2 | 0/20 | 720.55 / 913.59 (0.7887×) | 0.8635× | 0.7794× |
-| 4 | 0/20 | 1181.67 / 1386.95 (0.8520×) | 0.8141× | 0.8582× |
-| 8 | 0/20 | 1795.94 / 1922.13 (0.9344×) | 0.8139× | 0.9767× |
-| 16 | 8/20 | 2435.70 / 2502.71 (0.9732×) | 0.8006× | **1.0502×** |
-| 32 | 9/20 | 2992.89 / 3030.32 (0.9877×) | 0.8050× | **1.0544×** |
+| 1 | 0/20 | 491.5 / 601.9 (0.8167×) | 0.8778× | 0.8132× |
+| 2 | 0/20 | 767.7 / 904.7 (0.8486×) | 0.8266× | 0.8516× |
+| 4 | 0/20 | 1236.4 / 1366.8 (0.9046×) | 0.7988× | 0.9286× |
+| 8 | 6/20 | 1855.1 / 1923.2 (0.9646×) | 0.8019× | **1.0215×** |
+| 16 | 16/20 | 2489.1 / 2464.9 (**1.0098×**) | 0.8029× | **1.1025×** |
+| 32 | 15/20 | 3030.5 / 2993.0 (**1.0125×**) | 0.7906× | **1.0971×** |
 
 Three gaps: (1) **memory** — the MoE host double-store is FIXED (2026-07-18,
 `ENG-MOE-HOSTFREE`): freeing the routed-expert fp4 host mirror after the device
